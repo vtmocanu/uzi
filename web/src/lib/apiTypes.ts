@@ -2723,6 +2723,8 @@ export interface Worker {
   // outbox_blocked describes), shown to the worker's owner. Untrusted worker text: never
   // joined to a run's title or status.
   outbox_blocked_run_id?: string | null;
+  /** Worker-global root diagnostic, distinct from per-run arbitration. */
+  outbox_root_unusable?: string | null;
   // The worker's residue-quarantine latch (issue #2213): it found an unreadable,
   // unattributed process running as its own uid, so it claims nothing and starts no
   // forge-credentialed git and no new Claude/Codex turn until its container restarts.
@@ -3151,6 +3153,22 @@ export interface RunLeadConfig {
 }
 
 export interface Run {
+  policy_hold?: {
+    preserve_required: boolean;
+    pending_fresh: boolean;
+    outcome_id: string;
+    continuation_mode: "same_conversation" | "fresh_from_saved_work";
+    resolved_at: string | null;
+    applying_worker_id: string | null;
+    applying_generation: number;
+    source_generation: number;
+    refusal_count: number;
+    policy_tag: "cyberPolicy" | "misalignmentPolicyViolation" | null;
+    phase: "planning" | "implementation" | null;
+    correlation_id: string | null;
+    published: boolean | null;
+    captured_head?: string | null;
+  };
   forge_origin_cooldown?: ForgeOriginCooldown;
   capability_provenance?: {
     hints_known: boolean;

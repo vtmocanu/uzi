@@ -17,6 +17,83 @@ import type { HarnessEffort } from "./harness.js";
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
 
+// Compact M1 transport only: this does not advertise provider_policy_hold_v1 readiness.
+export interface PolicyHoldRequest {
+  outcome_id: string;
+  source_generation: number;
+  claim_generation: number;
+  detail: "refused" | "resume_rejected";
+  continuation_mode: "same_conversation" | "fresh_from_saved_work";
+  tag?: "cyberPolicy" | "misalignmentPolicyViolation";
+  phase?: "planning" | "implementation";
+  correlation_id?: string;
+  session_id?: string;
+  head?: string;
+  published: boolean;
+  checkpoint_contains_latest?: boolean;
+}
+export interface PolicyHoldReply {
+  disposition: "applied" | "already_applied" | "resolved_newer_policy" | "pending" | "terminal";
+  outcome_id: string;
+  source_generation: number;
+  observed_status?: string;
+  hold_reason?: string;
+  observed_generation?: number;
+  applying_generation?: number;
+  reason?: string;
+}
+export const POLICY_HOLD_MAX_BYTES = 17 * 1024;
+const policyGeneration = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) > 0;
+const policyObject = (v: unknown): v is Record<string, unknown> =>
+  v !== null && typeof v === "object" && !Array.isArray(v);
+const policyKeys = new Set(["outcome_id", "source_generation", "claim_generation", "detail", "continuation_mode",
+  "tag", "phase", "correlation_id", "session_id", "head", "published", "checkpoint_contains_latest"]);
+export function validatePolicyHoldRequest(value: unknown): PolicyHoldRequest {
+  const invalid = () => { throw new Error("invalid policy hold request"); };
+  if (!policyObject(value) || Object.keys(value).some(k => !policyKeys.has(k))) return invalid();
+  // Validate the same own enumerable fields that can cross JSON. Inherited
+  // identities and serialization hooks cannot complete a closed request.
+  const v: Record<string, unknown> = Object.fromEntries(Object.entries(value));
+  if (typeof v.outcome_id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/.test(v.outcome_id) ||
+      v.outcome_id === "00000000-0000-0000-0000-000000000000" ||
+      !policyGeneration(v.source_generation) || !policyGeneration(v.claim_generation) || v.claim_generation < v.source_generation ||
+      !["refused", "resume_rejected"].includes(v.detail as string) ||
+      !["same_conversation", "fresh_from_saved_work"].includes(v.continuation_mode as string) || typeof v.published !== "boolean") return invalid();
+  if (v.detail === "refused" && (v.tag === undefined || v.phase === undefined || v.correlation_id === undefined)) return invalid();
+  if (v.tag !== undefined && v.tag !== "cyberPolicy" && v.tag !== "misalignmentPolicyViolation") return invalid();
+  if (v.phase !== undefined && v.phase !== "planning" && v.phase !== "implementation") return invalid();
+  if (v.correlation_id !== undefined && (typeof v.correlation_id !== "string" ||
+      !/^pr-[0-9a-f]{32}-[1-9][0-9]{0,15}(?![\s\S])/.test(v.correlation_id) ||
+      !policyGeneration(Number(v.correlation_id.slice(36))))) return invalid();
+  if (v.session_id !== undefined && (typeof v.session_id !== "string" || v.session_id.length > 1024 ||
+      Buffer.byteLength(v.session_id) > 1024 || v.session_id.includes("\0") || Buffer.from(v.session_id, "utf8").toString("utf8") !== v.session_id)) return invalid();
+  if (v.head !== undefined && (typeof v.head !== "string" || (v.head !== "" && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})(?![\s\S])/.test(v.head)))) return invalid();
+  if (v.checkpoint_contains_latest !== undefined && typeof v.checkpoint_contains_latest !== "boolean") return invalid();
+  if (v.checkpoint_contains_latest === true && v.published !== true) return invalid();
+  if ((v.published || v.checkpoint_contains_latest) && !v.head) return invalid();
+  if (Buffer.byteLength(JSON.stringify(v)) > POLICY_HOLD_MAX_BYTES) return invalid();
+  return JSON.parse(JSON.stringify(v)) as PolicyHoldRequest;
+}
+export function decodePolicyHoldReply(value: unknown, request: PolicyHoldRequest): PolicyHoldReply {
+  const invalid = () => { throw new Error("invalid policy hold receipt"); };
+  if (!policyObject(value)) return invalid();
+  const v = value;
+  if (Object.keys(v).some(k => !["disposition", "outcome_id", "source_generation", "observed_status",
+    "hold_reason", "observed_generation", "applying_generation", "reason"].includes(k)) ||
+      v.outcome_id !== request.outcome_id || v.source_generation !== request.source_generation ||
+      !["applied", "already_applied", "resolved_newer_policy", "pending", "terminal"].includes(v.disposition as string)) return invalid();
+  if (v.observed_status !== undefined && !["queued", "claimed", "running", "awaiting_approval", "awaiting_input", "limit_wait", "completed", "failed", "cancelled", "awaiting_followup", "pool_wait", "paused", "recovery_wait"].includes(v.observed_status as string)) return invalid();
+  for (const k of ["observed_generation", "applying_generation"]) if (v[k] !== undefined && !policyGeneration(v[k])) return invalid();
+  for (const k of ["reason", "hold_reason"]) if (v[k] !== undefined && (typeof v[k] !== "string" || v[k].length > 256)) return invalid();
+  if (v.disposition !== "pending" && (!policyGeneration(v.observed_generation) || v.observed_status === undefined)) return invalid();
+  if (v.disposition === "applied" && (v.observed_status !== "paused" || v.hold_reason !== "codex_policy_hold" ||
+      v.observed_generation !== request.claim_generation)) return invalid();
+  if (v.disposition === "resolved_newer_policy" && (!policyGeneration(v.applying_generation) ||
+      v.applying_generation <= request.source_generation || v.applying_generation > (v.observed_generation as number))) return invalid();
+  if (v.disposition === "terminal" && !["completed", "failed", "cancelled"].includes(v.observed_status as string)) return invalid();
+  return v as unknown as PolicyHoldReply;
+}
+
 /** Compile-time two-way tie between the SDK's EffortLevel and HARNESS_EFFORTS: this line fails
  *  to typecheck when either side drifts. */
 const effortSetsAligned: [EffortLevel] extends [HarnessEffort]
@@ -588,6 +665,9 @@ export interface OutboxHeartbeatEntry {
   run_id: string;
   pending_messages: number;
   pending_terminal: number;
+  /** Presentation only: newest known unsettled original policy outcome. */
+  policy_pending_outcome_id?: string;
+  policy_pending_source_generation?: number;
   stale_retired: number;
   blocked_reason?: string;
   since: number;
@@ -666,9 +746,12 @@ export interface ActiveSnapshot {
    *  Only run_id/claim_generation; excludes finalize-pending records. Empty means complete empty
    *  coverage; omission means unavailable on older workers. Requires an accepted enclosing
    *  snapshot: duplicate active run IDs still reject it and provide no pending_all coverage.
-   *  The worker sends the full list even over the API identity-count limit; the API drops the
-   *  entire pending_all list when over that limit, never truncates it. No lifecycle authority. */
+   *  With no returned identity-count ceiling, workers omit coverage above the established
+   *  256-entry default. The API also rejects coverage above its configured ceiling, never
+   *  truncates it. No lifecycle authority. */
   pending_all?: { run_id: string; claim_generation: number }[];
+  /** Negotiated separately from policy production; current fenced ownership only. */
+  pending_policy_protection?: { run_id: string; owner_generation: number }[];
   /** Issue #1742: carried ONLY on the register snapshot — each run whose executor finished at the
    *  named exact claim generation and whose authenticated finalize-pending record survived a
    *  process restart with no journaled terminal outcome. Never an outcome and never a lease: the
@@ -736,6 +819,8 @@ export interface HeartbeatRequest {
    * field and the heartbeat wire stays byte-identical to today when it is unset.
    */
   outbox?: OutboxHeartbeatEntry[];
+  /** Optional worker-global root diagnostic; never per-run arbitration evidence. */
+  outbox_root_unusable?: "symlink" | "unreadable" | null;
   /**
    * The worker's active-run snapshot (PRD #1390 M2a). Sent ONLY when the server
    * advertised `active_run_snapshot` in the current API feature cache and an original

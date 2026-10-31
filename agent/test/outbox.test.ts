@@ -1308,7 +1308,9 @@ describe("Outbox startup terminal temp cleanup (#2308)", () => {
     assert.equal(existsSync(path.join(root, ".key")), false);
     assert.deepEqual(await fs.readFile(path.join(dir, "manifest.json")), manifest);
     assert.deepEqual(await fs.readFile(path.join(dir, "terminal-1.json")), installed);
-    assert.equal(b.listPendingTerminals().length, 0);
+    assert.equal(b.listPendingTerminals().length, 1);
+    assert.equal(b.listPendingTerminals()[0]?.outcome_kind, "unknown", "unreadable evidence stays snapshot-visible");
+    assert.equal(await b.hasPendingPolicyOutcome("r1"), true);
     assert.equal(await b.hasPhysicalTerminalProtection("r1"), true);
     await b.retireRun("r1");
     assert.deepEqual(await fs.readFile(path.join(dir, "terminal-1.json")), installed);

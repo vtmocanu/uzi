@@ -12,6 +12,41 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestOutboxRootUnusableIndependentAndBounded(t *testing.T) {
+	tr := newOutboxTracker()
+	w, run := uuid.New(), uuid.New()
+	now := time.Unix(1000, 0)
+	tr.record(w, []OutboxEntry{{RunID: run, PendingMessages: 1, BlockedReason: "reserve_exhausted", Since: now}}, now)
+	tr.recordRootUnusable(w, "symlink", now)
+	if got := tr.rootUnusable(w); got == nil || *got != "symlink" {
+		t.Fatalf("missing root diagnostic: %v", got)
+	}
+	pm, _, _, blocked, _ := tr.workerAggregate(w)
+	if pm != 1 || blocked == nil || *blocked != "reserve_exhausted" {
+		t.Fatal("root diagnostic changed per-run evidence")
+	}
+	tr.recordRootUnusable(w, "not-an-enumerated-reason", now)
+	if tr.rootUnusable(w) != nil {
+		t.Fatal("invalid report did not clear")
+	}
+	if _, _, ok := tr.runDepth(run); !ok {
+		t.Fatal("clearing diagnostic removed per-run evidence")
+	}
+	tr.record(w, nil, now)
+	tr.recordRootUnusable(w, "unreadable", now)
+	tr.prune(now.Add(outboxTrackerTTL + time.Second))
+	if tr.rootUnusable(w) != nil {
+		t.Fatal("expired root diagnostic survived")
+	}
+	for range outboxTrackerMaxWorkers {
+		tr.recordRootUnusable(uuid.New(), "symlink", now)
+	}
+	tr.recordRootUnusable(w, "symlink", now)
+	if tr.rootUnusable(w) != nil || len(tr.workers) != outboxTrackerMaxWorkers {
+		t.Fatal("root diagnostic exceeded worker cap")
+	}
+}
+
 func TestOutboxTrackerRecordAndAggregate(t *testing.T) {
 	tr := newOutboxTracker()
 	w := uuid.New()

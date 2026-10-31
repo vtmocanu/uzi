@@ -434,6 +434,7 @@ func (h *Handler) overlayOutbox(dto *apitypes.WorkerDTO, workerID uuid.UUID) {
 		return
 	}
 	pm, pt, sr, blocked, blockedRunID := h.wsvc.OutboxAggregate(workerID)
+	dto.OutboxRootUnusable = h.wsvc.OutboxRootUnusable(workerID)
 	if pm == 0 && pt == 0 && sr == 0 && blocked == nil {
 		return // no tracked depth → leave the five fields null
 	}

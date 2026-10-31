@@ -362,6 +362,9 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 	if row := holdRow(r, time.Now()); row != nil {
 		rows = append(rows, row)
 	}
+	if row := policyPendingRow(r); row != nil {
+		rows = append(rows, row)
+	}
 	if r.BudgetMaxIterations != nil {
 		rows = append(rows, []string{"BUDGET_ITERATIONS", itoa(*r.BudgetMaxIterations)})
 	}
@@ -578,11 +581,16 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	if *r.HoldReason == holdProviderUnavailable && !isProviderUnavailableHold(r) {
 		return nil
 	}
+	if *r.HoldReason == holdCodexPolicy && !isCodexPolicyHold(r) {
+		return nil
+	}
 	clauses := []string{holdReasonLabel(*r.HoldReason), holdParkedClause(r, now)}
 	if done, total, _ := milestoneProgress(r); total > 0 {
 		clauses = append(clauses, fmt.Sprintf("%d/%d milestones", done, total))
 	}
 	switch *r.HoldReason {
+	case holdCodexPolicy:
+		clauses = append(clauses, policyCaptureClause(r), policyHoldAction(r))
 	case holdBudgetExhausted:
 		clauses = append(clauses, "extend: uzi run extend "+r.ID+" --by 2h")
 	case holdCredentialDisabled:
@@ -603,6 +611,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 // in unknown reasons so a newer server still gets one terminal-safe notice.
 func holdReasonLabel(reason string) string {
 	switch reason {
+	case holdCodexPolicy:
+		return "Codex policy hold confirmed by server"
 	case holdBudgetExhausted:
 		return "time limit reached"
 	case holdCompletionBlocked:
@@ -687,8 +697,16 @@ func credentialDisabledAction(r apitypes.RunDTO) string {
 // (hold_reason null), and one whose wall budget is spent into budget_exhausted, so "resumed"
 // would be false there.
 func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
+	if row := policyPendingRow(r); row != nil {
+		return row[1]
+	}
 	id := cellText(r.ID)
 	switch reason := strOr(r.HoldReason, ""); reason {
+	case holdCodexPolicy:
+		if !isCodexPolicyHold(r) {
+			return ""
+		}
+		return holdReasonLabel(reason) + "; " + policyCaptureClause(r) + "; " + policyHoldAction(r)
 	case "":
 		return pauseOriginLabel(r, false, origin...) + "; resume with uzi run resume " + id
 	case holdBudgetExhausted:

@@ -70,8 +70,16 @@ function oldestFirst(a: PendingTerminal, b: PendingTerminal): number {
  * 0 and the first build is epoch 1, under the fresh register nonce the api mints.
  */
 export class ActiveRunRegistry {
-  /** run_id → {phase, claimGeneration} for every live execution (run-lane + judge/review). */
-  private readonly runs = new Map<string, { phase: ActiveSnapshotPhase; claimGeneration: number; registrationToken: symbol; cooldowns?: Map<symbol, CodexOperationIdentity> }>();
+  /** Live executions and pending-only policy fallbacks share the existing bounded run map. */
+  private readonly runs = new Map<string, {
+    phase: ActiveSnapshotPhase;
+    claimGeneration: number;
+    registrationToken: symbol;
+    cooldowns?: Map<symbol, CodexOperationIdentity>;
+    policyPendingOnly?: boolean;
+  }>();
+  /** Ephemeral lease evidence only; never journal conversion or retirement authority. */
+  private readonly policyOwnership = new Map<string, { generation: number | null | undefined }>();
   /** The single process-monotonic snapshot epoch, shared by every build (starts at 0;
    *  the first build returns 1). */
   private epoch = 0;
@@ -100,6 +108,7 @@ export class ActiveRunRegistry {
   constructor(
     private readonly pendingLister?: PendingTerminalLister,
     private readonly capGetter?: OutboxCapGetter,
+    private readonly coverageGetter?: () => boolean,
   ) {}
 
   /** Register a run as executing at `running`, at the generation it was claimed at.
@@ -108,6 +117,10 @@ export class ActiveRunRegistry {
   add(runId: string, claimGeneration: number): symbol {
     const registrationToken = Symbol();
     this.runs.set(runId, { phase: "running", claimGeneration, registrationToken });
+    // A new claim invalidates an in-flight observation even if it later closes
+    // before that HTTP response returns (the undefined-entry ABA case).
+    if (this.policyOwnership.has(runId) || this.pendingOutcomes().some(p => p.run_id === runId && this.isPolicy(p)))
+      this.policyOwnership.set(runId, { generation: undefined });
     return registrationToken;
   }
 
@@ -125,7 +138,7 @@ export class ActiveRunRegistry {
    * when it exits. Tokens keep independent waiters and stale clears isolated. */
   setAccountCooldown(runId: string, generation: number, operation: CodexOperationIdentity, registrationToken: symbol): symbol | undefined {
     const entry = this.runs.get(runId);
-    if (!entry || entry.registrationToken !== registrationToken || !Number.isSafeInteger(generation) || generation <= 0 ||
+    if (!entry || entry.policyPendingOnly || entry.registrationToken !== registrationToken || !Number.isSafeInteger(generation) || generation <= 0 ||
         entry.claimGeneration !== generation || !validCodexOperation(operation)) return undefined;
     const token = Symbol();
     (entry.cooldowns ??= new Map()).set(token, structuredClone(operation));
@@ -139,11 +152,64 @@ export class ActiveRunRegistry {
 
   /** Drop a run once its execution settles (terminal, or parked-and-returned for a
    *  requeue — it is no longer executing). */
-  remove(runId: string): void {
+  remove(runId: string, expectedGeneration?: number, expectedRegistrationToken?: symbol): void {
+    const entry = this.runs.get(runId);
+    if (expectedGeneration !== undefined && entry?.claimGeneration !== expectedGeneration) return;
+    if (expectedRegistrationToken !== undefined && entry?.registrationToken !== expectedRegistrationToken) return;
     this.runs.delete(runId);
   }
 
-  /** Number of live executions currently tracked (test/observability helper). */
+  /** Close an already registered execution while retaining bounded pending-only fallback.
+   * Ownership is supplied independently through notePolicyOwnership. */
+  markPolicyPendingOnly(runId: string, expectedGeneration: number, expectedRegistrationToken?: symbol): boolean {
+    const entry = this.runs.get(runId);
+    if (!entry || entry.claimGeneration !== expectedGeneration) return false;
+    if (expectedRegistrationToken !== undefined && entry.registrationToken !== expectedRegistrationToken) return false;
+    entry.policyPendingOnly = true;
+    delete entry.cooldowns;
+    return true;
+  }
+
+  /** Record independently verified current ownership. Null means positively ineligible.
+   * An optional comparison fences late observations against a newer ownership proof.
+   * Only pending run IDs are retained; this grants snapshot leasing, never conversion authority. */
+  notePolicyOwnership(runId: string, generation: number | null, expectedGeneration?: number): boolean {
+    const pending = this.pendingOutcomes();
+    this.projection(pending);
+    if (expectedGeneration !== undefined && this.policyOwnership.get(runId)?.generation !== expectedGeneration) return false;
+    if (generation !== null && (!Number.isSafeInteger(generation) || generation <= 0)) return false;
+    if (!this.runs.get(runId)?.policyPendingOnly &&
+        !pending.some(p => p.run_id === runId && this.isPolicy(p))) return false;
+    this.policyOwnership.set(runId, { generation });
+    return true;
+  }
+
+  /** Bind an asynchronous ownership observation to the exact projection/execution it saw.
+   * A later claim or observation invalidates it, including the initially unknown case. */
+  beginPolicyOwnershipObservation(runId: string): (generation: number | null) => boolean {
+    const pending = this.pendingOutcomes();
+    this.projection(pending);
+    if (!this.runs.get(runId)?.policyPendingOnly &&
+        !pending.some(p => p.run_id === runId && this.isPolicy(p))) return () => false;
+    // Allocate an identity even for unknown evidence. Clearing/pruning a later
+    // proof must never recreate the identity an earlier HTTP request captured.
+    const proof = this.policyOwnership.get(runId) ?? { generation: undefined };
+    this.policyOwnership.set(runId, proof);
+    const execution = this.runs.get(runId);
+    return generation => {
+      if (this.policyOwnership.get(runId) !== proof || this.runs.get(runId) !== execution) return false;
+      return this.notePolicyOwnership(runId, generation);
+    };
+  }
+
+  /** Forget only the matching proof. Remaining unsettled sources become unknown/conservative. */
+  clearPolicyOwnership(runId: string, expectedGeneration: number): boolean {
+    if (this.policyOwnership.get(runId)?.generation !== expectedGeneration) return false;
+    this.policyOwnership.set(runId, { generation: undefined });
+    return true;
+  }
+
+  /** Number of retained executions and pending-only fallbacks (test/observability helper). */
   get size(): number {
     return this.runs.size;
   }
@@ -166,7 +232,8 @@ export class ActiveRunRegistry {
    *  id is already live is refused, never double-executed. The server-side pre-claim dedupe
    *  is the real guard; this is the loud last line of defence. */
   has(runId: string): boolean {
-    return this.runs.has(runId);
+    const entry = this.runs.get(runId);
+    return entry !== undefined && !entry.policyPendingOnly;
   }
 
   /**
@@ -175,14 +242,24 @@ export class ActiveRunRegistry {
    * every run this worker owns to every claimant AND the worker's own claim loop stays closed, so no
    * unleased pending outcome ever coexists with a new claim. Distinct from {@link isClaimPausedForE2E}
    * (the e2e drop seam): this reads the REAL pending-vs-cap state. Never advances the epoch or the
-   * rotation cursor — a gate read is not a snapshot build. Matches {@link build}'s overflow exactly:
-   * `pendingCount > effectiveCap`, where an undefined/0 cap is the cap-independent floor (overflow
-   * whenever anything is pending).
+   * rotation cursor — a gate read is not a snapshot build. Physical inventory coverage belongs to
+   * the conservative snapshot, not to this local capacity check for unrelated ordinary claims.
+   * Legacy mode retains its unknown-source gate; scoped mode counts only positively owned groups.
+   * An undefined/0 cap is the cap-independent floor for leasable pending outcomes.
    */
-  claimsPausedByPendingOverflow(): boolean {
-    const count = this.leasable(this.pendingOutcomes()).length;
-    if (count === 0) return false;
-    return count > this.effectiveCap();
+  claimsPausedByPendingOverflow(scoped = false): boolean {
+    const pending = this.pendingOutcomes();
+    const projection = this.projection(pending);
+    if (!scoped) return projection.unknown ||
+      projection.leases.length > this.effectiveCap();
+    if (this.knownPendingTuples(projection.sources) === undefined) return true;
+    const groups = new Set(pending.filter(p => {
+      const generation = this.policyOwnership.get(p.run_id)?.generation;
+      return this.isPolicy(p) && typeof generation === "number" && generation > 0;
+    }).map(p => p.run_id.toLowerCase()));
+    const ordinary = this.leasable(pending.filter(p => !this.isPolicy(p)))
+      .filter(p => !groups.has(p.run_id.toLowerCase()));
+    return groups.size + ordinary.length > this.effectiveCap();
   }
 
   /** Issue #2950: the pending terminals a snapshot can usefully lease. A `run_not_owned` journal is
@@ -193,7 +270,68 @@ export class ActiveRunRegistry {
    *  cap 0. Physical protection and custody still keep it via the outbox's listPendingTerminals /
    *  hasPendingTerminal, which are unchanged. */
   private leasable(pending: PendingTerminal[]): PendingTerminal[] {
-    return pending.filter((p) => p.blocked_reason !== "run_not_owned");
+    const tuples = new Set<string>();
+    return pending.filter(p => {
+      const key = p.run_id + "/" + p.claim_generation;
+      if (tuples.has(key)) return false;
+      tuples.add(key);
+      return p.blocked_reason !== "run_not_owned";
+    });
+  }
+
+  private isPolicy(p: PendingTerminal): boolean {
+    return p.outcome_kind === "policy_hold" || p.outcome_kind === "unknown";
+  }
+
+  /** Project the captured sources and in-memory fallbacks without I/O, retries or timers.
+   * Ordinary terminals retain their legacy duplicates; only known policy sources coalesce.
+   * Unknown kinds never grant leases. */
+  private projection(pending: PendingTerminal[]): {
+    leases: PendingTerminal[]; sources: PendingTerminal[]; unknown: boolean;
+  } {
+    const ordinary = this.leasable(pending.filter(p => !this.isPolicy(p)));
+    const groups = new Map<string, PendingTerminal[]>();
+    for (const p of pending) {
+      if (!this.isPolicy(p)) continue;
+      const group = groups.get(p.run_id) ?? [];
+      group.push(p);
+      groups.set(p.run_id, group);
+    }
+    for (const [runId, entry] of this.runs) {
+      if (entry.policyPendingOnly && !groups.has(runId)) groups.set(runId, []);
+    }
+    for (const runId of this.policyOwnership.keys()) {
+      if (!groups.has(runId)) this.policyOwnership.delete(runId);
+    }
+    const leases = [...ordinary];
+    let unknown = false;
+    for (const [runId, sources] of groups) {
+      const generation = this.policyOwnership.get(runId)?.generation;
+      if (generation === null) continue;
+      // One policy protection entry covers the current run. Retaining ordinary
+      // source leases for this SAME run would duplicate its ID and invalidate
+      // the entire snapshot (including conservative overflow). Their immutable
+      // identities remain in pending_all; ordinary-only runs are unchanged.
+      for (let i = leases.length - 1; i >= 0; i--) {
+        if (leases[i]!.run_id === runId) leases.splice(i, 1);
+      }
+      if (generation === undefined || sources.some(p => p.outcome_kind === "unknown")) {
+        unknown = true;
+        continue;
+      }
+      const first = [...sources].sort(blockedFirstOldest)[0];
+      leases.push({
+        run_id: runId, claim_generation: generation,
+        phase: first?.phase ?? this.runs.get(runId)!.phase,
+        blocked: sources.some(p => p.blocked),
+        since: sources.length ? sources.reduce((oldest, p) => Math.min(oldest, p.since), Infinity) : 0,
+      });
+    }
+    return {
+      leases,
+      sources: pending.filter(p => this.isPolicy(p) || p.blocked_reason !== "run_not_owned"),
+      unknown,
+    };
   }
 
   /** The server cap clamped to a non-negative integer, with undefined/negative/0 collapsing to 0 —
@@ -204,7 +342,32 @@ export class ActiveRunRegistry {
   }
 
   private pendingOutcomes(): PendingTerminal[] {
-    return this.pendingLister?.().filter(entry => entry.server_settled !== true) ?? [];
+    // Preserve every source of protection. Case aliases can have the same wire
+    // tuple but different authenticated/unknown evidence. Ordinary leases retain
+    // their legacy first-source rule; pending_all deduplicates only on the wire.
+    return (this.pendingLister?.() ?? []).filter(entry => entry.server_settled !== true)
+      .map(entry => ({ ...entry, run_id: entry.run_id.toLowerCase() }));
+  }
+
+  /** No ceiling is returned by the API. Use its established 256-entry default
+   * independently of the pending lease cap; custom smaller server limits still reject
+   * coverage conservatively. Omission never asserts a complete inventory. */
+  private pendingWire(sources: PendingTerminal[]): Pick<ActiveSnapshot, "pending_all"> {
+    if (this.coverageGetter?.() === false) return {};
+    const tuples = this.knownPendingTuples(sources);
+    return tuples === undefined ? {} : { pending_all: tuples };
+  }
+
+  /** Known tuples and their wire ceiling only. This does not establish physical coverage;
+   * pendingWire alone may publish them after its separate completeness check. */
+  private knownPendingTuples(sources: PendingTerminal[]): ActiveSnapshot["pending_all"] {
+    const tuples = new Map<string, { run_id: string; claim_generation: number }>();
+    for (const p of sources) {
+      tuples.set(p.run_id + "/" + p.claim_generation,
+        { run_id: p.run_id, claim_generation: p.claim_generation });
+      if (tuples.size > 256) return undefined;
+    }
+    return [...tuples.values()];
   }
 
   /**
@@ -213,19 +376,22 @@ export class ActiveRunRegistry {
    * to re-claim) every pending run this worker owns BEFORE its register-time orphan pass — regardless
    * of the cap, even cap 0, where a non-empty subset would be rejected whole when cap < count. Draws
    * the shared epoch so ordering stays monotonic with the post-register heartbeat/claim snapshots.
-   * Deliberately NOT filtered through {@link leasable} (issue #2950): the boot lease stays
-   * conservative and sets `pending_overflow` whenever ANY journal is pending, `run_not_owned` included.
+   * Ordinary journals retain the conservative boot behavior (issue #2950), including
+   * `run_not_owned`. Policy evidence with positive ineligibility is excluded; unknown ownership
+   * and pending-only fallbacks participate even before the first heartbeat.
    * Issue #1742: `finalizeResume` (the caller's once-captured offered set) rides it as
    * `finalize_resume`, on this register snapshot only.
    */
   buildRegisterSnapshot(finalizeResume: readonly FinalizeResumeEntry[] = []): ActiveSnapshot {
     this.epoch += 1;
     const pending = this.pendingOutcomes();
+    const projection = this.projection(pending);
     return {
       snapshot_epoch: this.epoch,
       active: [],
-      pending_overflow: pending.length > 0,
-      pending_all: pending.map((p) => ({ run_id: p.run_id, claim_generation: p.claim_generation })),
+      pending_overflow: this.coverageGetter?.() === false || projection.unknown || projection.leases.length > 0 ||
+        pending.some(p => !this.isPolicy(p)),
+      ...this.pendingWire(pending),
       // Issue #1742: the finalize-pending set the caller captured for this register. The key is
       // omitted when empty, and build() (heartbeat/claim) never carries it.
       ...(finalizeResume.length > 0
@@ -240,10 +406,11 @@ export class ActiveRunRegistry {
    * The `register_nonce` is NOT stamped here — the client stamps it on send from the nonce it
    * captured at register (worker.ts/client.ts).
    */
-  build(): ActiveSnapshot {
+  build(scoped = false): ActiveSnapshot {
     this.epoch += 1;
-    const pending = this.leasable(this.pendingOutcomes());
-    const pendingByRun = new Map(pending.map((p) => [p.run_id, p]));
+    const projection = this.projection(this.pendingOutcomes());
+    const pending = projection.leases;
+    const pendingIds = new Set(projection.sources.map(p => p.run_id));
 
     const active: ActiveSnapshotEntry[] = [];
     // Live executions this worker is running, EXCEPT any that also carry a LEASABLE pending terminal
@@ -252,7 +419,7 @@ export class ActiveRunRegistry {
     // run_not_owned journal is not leasable (filtered above), so a live run sharing its id is listed
     // live at its own generation: the api drops it unless it attributes the run to this worker.
     for (const [runId, entry] of this.runs) {
-      if (pendingByRun.has(runId)) continue;
+      if (entry.policyPendingOnly || pendingIds.has(runId)) continue;
       active.push({
         run_id: runId,
         claim_generation: entry.claimGeneration,
@@ -264,7 +431,8 @@ export class ActiveRunRegistry {
 
     // Pending-terminal entries, deterministically selected so the `active` array never lists more
     // than `cap` of them (the api rejects an over-cap snapshot whole).
-    for (const p of this.selectPendingForBuild(pending)) {
+    const wireRoom = Math.max(0, 256 - active.length);
+    for (const p of this.selectPendingForBuild(pending, wireRoom)) {
       active.push({
         run_id: p.run_id,
         claim_generation: p.claim_generation,
@@ -273,14 +441,20 @@ export class ActiveRunRegistry {
       });
     }
 
-    // Issue #2009: preserve active construction, including duplicate run IDs across generations.
-    // pending_all provides coverage only if the API accepts the enclosing snapshot; duplicate
-    // active runs still reject the whole snapshot and therefore provide no pending_all coverage.
+    // Issue #2009: ordinary terminals retain duplicate active run IDs across generations.
+    // Only policy leases coalesce; pending_all always retains their original source generations.
+    // Duplicate active runs still reject the whole snapshot, including its pending_all coverage.
     return {
       snapshot_epoch: this.epoch,
       active,
-      pending_overflow: pending.length > this.effectiveCap(),
-      pending_all: pending.map((p) => ({ run_id: p.run_id, claim_generation: p.claim_generation })),
+      pending_overflow: this.coverageGetter?.() === false || projection.unknown ||
+        pending.length > Math.min(this.effectiveCap(), wireRoom),
+      ...this.pendingWire(projection.sources),
+      ...(scoped && this.pendingWire(projection.sources).pending_all !== undefined ? { pending_policy_protection: [...new Set(projection.sources.filter(p => this.isPolicy(p)).map(p => p.run_id))]
+        .flatMap(run_id => {
+          const owner_generation = this.policyOwnership.get(run_id)?.generation;
+          return typeof owner_generation === "number" && owner_generation > 0 ? [{ run_id, owner_generation }] : [];
+        }) } : {}),
     };
   }
 
@@ -292,10 +466,10 @@ export class ActiveRunRegistry {
    * `omitted + 1` snapshots and no more than `cap` are ever listed. A 0/undefined cap lists NONE (the
    * cap-independent floor: the empty subset + overflow protects them all via #1390's exclusion).
    */
-  private selectPendingForBuild(pending: PendingTerminal[]): PendingTerminal[] {
+  private selectPendingForBuild(pending: PendingTerminal[], wireRoom = 256): PendingTerminal[] {
     const count = pending.length;
     if (count === 0) return [];
-    const cap = this.effectiveCap();
+    const cap = Math.min(this.effectiveCap(), wireRoom);
     if (cap === 0) return []; // overflow-only protection; nothing may be listed
     if (count <= cap) return [...pending].sort(blockedFirstOldest);
 

@@ -172,7 +172,7 @@ async function scenario(o: Options) {
   let switched = false;
   const registry = new ActiveRunRegistry();
   const removeEntry = registry.remove.bind(registry);
-  registry.remove = (runId: string) => { events.push("snapshot-remove"); return removeEntry(runId); };
+  registry.remove = (...args: Parameters<ActiveRunRegistry["remove"]>) => { events.push("snapshot-remove"); return removeEntry(...args); };
 
   const factory: ExecutorFactory = runId => {
     // The first executor built is the retained generation-2 flight; the next is generation 3.
@@ -504,7 +504,7 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
       const registry = new ActiveRunRegistry();
       const events: string[] = [];
       const removeEntry = registry.remove.bind(registry);
-      registry.remove = (runId: string) => { events.push("snapshot-remove"); return removeEntry(runId); };
+      registry.remove = (...args: Parameters<ActiveRunRegistry["remove"]>) => { events.push("snapshot-remove"); return removeEntry(...args); };
       const factory: ExecutorFactory = runId => ({ homeDir: path.join(homeDir, runId), executor: {
         joinOwnedOperations: async () => { joins++; await pending.promise; },
         run: async () => { throw new Error("fixture agent failure"); },

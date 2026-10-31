@@ -6,13 +6,14 @@ import path from "node:path";
 
 import { Worker } from "../src/worker.js";
 import { Outbox } from "../src/outbox.js";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { Config } from "../src/config.js";
 import type { WorkerClient } from "../src/client.js";
 import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
-import type { ClaimResponse, ChatClaimResponse } from "../src/protocol.js";
+import type { ActiveSnapshot, ClaimResponse, ChatClaimResponse } from "../src/protocol.js";
 import type { OutboxDepth } from "../src/outbox.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import { sleep } from "../src/util.js";
@@ -68,6 +69,124 @@ afterEach(async () => {
   for (const r of tmpRoots.splice(0)) await fs.rm(r, { recursive: true, force: true }).catch(() => undefined);
 });
 
+for (const scoped of [false, true]) for (const scenario of ["boot", "symlink", "mutation"] as const)
+it(`D1: real Worker claims ordinary work with incomplete ${scenario} coverage (scoped=${scoped})`, async t => {
+  const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "worker-coverage-"));
+  tmpRoots.push(root);
+  const outbox = new Outbox({ root, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 4e6, retentionMs: 86400000 });
+  await outbox.init();
+  t.after(() => outbox.closeTerminalObservationScan());
+  if (scenario === "symlink") {
+    const target = path.join(root, ".target");
+    await fs.mkdir(target);
+    await fs.symlink(target, path.join(root, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), "dir");
+    await outbox.scanTerminalObservationsPage();
+  } else if (scenario === "mutation") {
+    for (let i = 0; i < 260; i++) await fs.writeFile(path.join(root, `ordinary-${i}`), "");
+    assert.equal((await outbox.scanTerminalObservationsPage()).passComplete, false);
+    await fs.mkdir(path.join(root, "created-between-pages"));
+    await outbox.scanTerminalObservationsPage();
+  }
+  assert.equal(outbox.listPendingOutcomeSources().length, 0);
+  assert.equal(outbox.policyInventoryCoverageAvailable(), false, "actual physical inventory is incomplete");
+  const active = new ActiveRunRegistry(() => outbox.listPendingOutcomeSources(), () => 4,
+    () => outbox.policyInventoryCoverageAvailable());
+  const controller = new AbortController();
+  let claimed!: () => void;
+  const observed = new Promise<void>(resolve => { claimed = resolve; });
+  const client = idleClient();
+  let sent: ActiveSnapshot | undefined;
+  Object.assign(client, { hasFeature: (feature: string) => feature === "active_run_snapshot" ||
+      (scoped && feature === "pending_outcome_scoped_claim_v1"), supportsScopedPendingClaim: scoped,
+    getRunOwnership: async () => { throw new Error("ownership unavailable"); },
+    claimRun: async (snapshot?: ActiveSnapshot) => { sent = snapshot; claimed(); controller.abort(); return null; } });
+  const worker = new Worker(fakeConfig(), client, idleRunner, idleChat, noJudge, noReview,
+    nullLogger(), okPreflight, outbox, new Map(), active);
+  const running = worker.run(controller.signal);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([observed, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("ordinary claim remained blocked on unrelated inventory coverage")), 5000);
+    })]);
+    assert.ok(sent, "the production claim carries its active snapshot");
+    assert.equal(sent.pending_all, undefined, "incomplete inventory is never advertised as complete");
+    assert.equal(sent.pending_overflow, true, "the server retains conservative attributed-run protection");
+    assert.equal(outbox.listPendingOutcomeSources().length, 0);
+  } finally { clearTimeout(timer); controller.abort(); await running; }
+});
+
+for (const scenario of ["key", "impossible"] as const)
+it(`D2: ${scenario} disablement does not invent a root visibility fault`, async t => {
+  const dir = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "worker-disabled-"));
+  tmpRoots.push(dir);
+  let root = dir;
+  if (scenario === "key") await fs.writeFile(path.join(root, ".key"), "invalid");
+  else { await fs.writeFile(path.join(dir, "file"), "file"); root = path.join(dir, "file", "outbox"); }
+  const outbox = new Outbox({ root, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 4e6, retentionMs: 86400000 });
+  await outbox.init();
+  t.after(() => outbox.closeTerminalObservationScan());
+  assert.equal(outbox.isDisabled(), true);
+  assert.equal(outbox.unusableRootReason(), undefined);
+  const controller = new AbortController();
+  let observed!: () => void;
+  const claimed = new Promise<void>(resolve => { observed = resolve; });
+  const client = idleClient();
+  Object.assign(client, { hasFeature: () => false,
+    claimRun: async () => { observed(); controller.abort(); return null; } });
+  const worker = new Worker(fakeConfig(), client, idleRunner, idleChat, noJudge, noReview,
+    nullLogger(), okPreflight, outbox);
+  const running = worker.run(controller.signal);
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try { await Promise.race([claimed, running.then(() => { throw new Error("non-root disablement blocked intake"); })]); }
+  finally { clearTimeout(timer); controller.abort(); await running; }
+});
+
+for (const scoped of [false, true]) for (const reason of ["symlink", "unreadable"] as const)
+it(`D2: an unusable ${reason} root stops new claims and reports health (scoped=${scoped})`, async t => {
+  const dir = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "worker-unusable-"));
+  tmpRoots.push(dir);
+  const root = path.join(dir, "outbox");
+  await fs.mkdir(root);
+  if (reason === "symlink") {
+    await fs.rename(root, path.join(dir, "saved"));
+    await fs.symlink(path.join(dir, "saved"), root, "dir");
+  } else {
+    const readdir = fs.readdir.bind(fs);
+    t.mock.method(fs, "readdir", async (...args: Parameters<typeof fs.readdir>) => {
+      if (args[0] === root) throw Object.assign(new Error("denied"), { code: "EACCES" });
+      return readdir(...args);
+    });
+  }
+  const outbox = new Outbox({ root, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 4e6, retentionMs: 86400000 });
+  await outbox.init();
+  t.after(() => outbox.closeTerminalObservationScan());
+  assert.equal(outbox.isDisabled(), true);
+  const controller = new AbortController();
+  let claims = 0;
+  let health: unknown;
+  let ticks = 0;
+  let observed!: () => void;
+  const heartbeat = new Promise<void>(resolve => { observed = resolve; });
+  const client = idleClient();
+  Object.assign(client, {
+    hasFeature: () => false, supportsScopedPendingClaim: scoped,
+    claimRun: async () => { claims++; return null; },
+    claimCrossCheck: async () => { claims++; return null; },
+    claimChat: async () => { claims++; return null; },
+    heartbeat: async (...args: unknown[]) => { health = args[5]; if (++ticks === 2) observed(); },
+  });
+  const worker = new Worker(fakeConfig({ crossCheckSlots: 1 }), client, idleRunner, idleChat, noJudge, noReview,
+    nullLogger(), okPreflight, outbox);
+  const running = worker.run(controller.signal);
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    await Promise.race([heartbeat, running.then(() => { throw new Error("heartbeat not reached"); })]);
+    // The heartbeat has run alongside every enabled intake lane.
+    assert.equal(claims, 0, "a broken root must not manufacture new claimed runs");
+    assert.equal(health, reason);
+  } finally { clearTimeout(timer); controller.abort(); await running; }
+});
+
 describe("Worker outbox drainer (PRD #1391 M2)", () => {
   it("drain is SINGLE-FLIGHT: overlapping boot + heartbeat triggers never run the drain body concurrently", async () => {
     let release!: () => void;
@@ -80,9 +199,10 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
       isDisabled: () => false,
+      listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
-      runsWithPending: () => ["r1"],
+      unclassifiedPolicyRunIds: () => [], runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
         drainCalls += 1;
@@ -129,9 +249,10 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
       isDisabled: () => false,
+      listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
-      runsWithPending: () => (retired ? [] : ["r1"]),
+      unclassifiedPolicyRunIds: () => [], runsWithPending: () => (retired ? [] : ["r1"]),
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
         retired = true;
@@ -184,12 +305,13 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       isDisabled: () => false,
       // Empty until the drain retires the segments — mirroring a terminal journaled AFTER boot and
       // only re-resolvable once the N3 undrained-messages guard would let it through.
+      listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => (retired ? [{ run_id: "r1", claim_generation: 5 }] : []),
       // Issue #1512: the heartbeat sweep defers to the drainer for a run it reports undrained, so
       // this drainer-focused fake keeps the sweep out of the way.
       hasUndrainedMessages: () => true,
       listPendingFinalizes: () => [],
-      runsWithPending: () => (retired ? [] : ["r1"]),
+      unclassifiedPolicyRunIds: () => [], runsWithPending: () => (retired ? [] : ["r1"]),
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
         await gate; // hold the ONE (boot) drain open so boot-resolve sees an empty pending list
@@ -276,12 +398,13 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     const outbox = {
       uncleanRuns: () => [],
       isDisabled: () => false,
+      listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => (retired ? [{ run_id: "r1", claim_generation: 5 }] : []),
       // Issue #1512: the heartbeat sweep defers to the drainer for a run it reports undrained, so
       // this drainer-focused fake keeps the sweep out of the way.
       hasUndrainedMessages: () => true,
       listPendingFinalizes: () => [],
-      runsWithPending: () => (retired ? [] : ["r1"]),
+      unclassifiedPolicyRunIds: () => [], runsWithPending: () => (retired ? [] : ["r1"]),
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
         await gate;
@@ -353,9 +476,10 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
       isDisabled: () => false,
+      listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
-      runsWithPending: () => ["r1"],
+      unclassifiedPolicyRunIds: () => [], runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
         drainStarted += 1;
@@ -403,9 +527,10 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
       isDisabled: () => false,
+      listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
-      runsWithPending: () => ["r1"],
+      unclassifiedPolicyRunIds: () => [], runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
         drainCalls += 1;

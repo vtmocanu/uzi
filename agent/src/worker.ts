@@ -1,3 +1,4 @@
+import { policyOwnershipGeneration } from "./policy-resolve.js";
 import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
@@ -199,7 +200,7 @@ export class Worker {
   private readonly acceptedFinalizes = new Map<string, Readonly<object>>();
   private finalizeRegistrationAccepted = false;
   private finalizeAttemptSequence = 0;
-  private readonly finalizeAttempts = new Map<string, { identity: Readonly<object>; sequence: number }>();
+  private readonly finalizeAttempts = new Map<string, { entry: PendingFinalize; identity: Readonly<object>; sequence: number }>();
   private readonly finalizeRetries = new Map<string, FinalizeRetry>();
   private finalizeRecordSequence = 0;
 
@@ -239,12 +240,14 @@ export class Worker {
         return identity ? [[finalizeKey(entry), { entry, identity }] as const] : [];
       }));
       for (const [key, attempt] of this.finalizeAttempts) {
-        if (present.get(key)?.identity !== attempt.identity) this.finalizeAttempts.delete(key);
+        if (outbox.finalizeRecordIdentity(attempt.entry.run_id, attempt.entry.claim_generation) !== attempt.identity)
+          this.finalizeAttempts.delete(key);
       }
       for (const [key, state] of this.finalizeRetries) {
-        if (present.get(key)?.identity !== state.identity) {
+        const current = outbox.finalizeRecordIdentity(state.entry.run_id, state.entry.claim_generation);
+        if (current !== state.identity) {
           this.logFinalizeRetry(state.entry, state,
-            present.has(key) ? "replaced" : "removed");
+            current ? "replaced" : "removed");
           this.finalizeRetries.delete(key);
         }
       }
@@ -275,7 +278,7 @@ export class Worker {
           if (this.isFinalizeRunLive(entry.run_id)) continue;
           // A registration wave may outlive this identity; stale candidates own no retry or fairness state.
           if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity) continue;
-          this.finalizeAttempts.set(key, { identity, sequence: ++this.finalizeAttemptSequence });
+          this.finalizeAttempts.set(key, { entry, identity, sequence: ++this.finalizeAttemptSequence });
           const state = retry ?? { entry, identity, logId: ++this.finalizeRecordSequence, failures: 0, nextEligible: 0 };
           if (!retry) {
             this.finalizeRetries.set(key, state);
@@ -634,6 +637,7 @@ export class Worker {
   private async resolveBootTerminals(signal: AbortSignal): Promise<void> {
     const outbox = this.outbox;
     if (!outbox) return;
+    await this.observePendingPolicyOwnership(signal);
     let deps = makeTerminalOutboxDeps(outbox, this.client, {
       gapFillMax: this.config.gapFillMax,
       terminalMaxBytes: this.config.outboxTerminalMaxBytes,
@@ -708,6 +712,7 @@ export class Worker {
   private async resolveRunTerminal(runId: string, signal?: AbortSignal): Promise<void> {
     const outbox = this.outbox;
     if (!outbox) return;
+    await this.observePendingPolicyOwnership(signal, runId);
     let deps = makeTerminalOutboxDeps(outbox, this.client, {
       gapFillMax: this.config.gapFillMax,
       terminalMaxBytes: this.config.outboxTerminalMaxBytes,
@@ -740,6 +745,8 @@ export class Worker {
     if (this.sweepingTerminals) return; // single-flight
     this.sweepingTerminals = true;
     try {
+      await this.runner.retryPolicyHandoffs?.();
+      await this.observePendingPolicyOwnership(signal);
       let deps = makeTerminalOutboxDeps(outbox, this.client, {
         gapFillMax: this.config.gapFillMax,
         terminalMaxBytes: this.config.outboxTerminalMaxBytes,
@@ -775,7 +782,7 @@ export class Worker {
   private async resolveLiveTerminal(
     outbox: Outbox,
     deps: NonNullable<ReturnType<typeof makeTerminalOutboxDeps>>,
-    entry: { run_id: string; claim_generation: number; blocked: boolean },
+    entry: { run_id: string; claim_generation: number; blocked: boolean; outcome_kind?: string },
     via: "sweep" | "drain",
     signal?: AbortSignal,
   ): Promise<void> {
@@ -817,6 +824,32 @@ export class Worker {
     }
   }
 
+  /** One ownership request per pending policy run per invocation, serially.
+   * The bounded catalog limits attempts; transport bounds each request. A failed
+   * observation stays conservative and does not prevent observing sibling runs. */
+  private async observePendingPolicyOwnership(signal?: AbortSignal, onlyRun?: string): Promise<void> {
+    const seen = new Set<string>();
+    for (const entry of this.outbox?.listPendingOutcomeSources() ?? []) {
+      if (signal?.aborted) return;
+      if (entry.outcome_kind !== "policy_hold" && entry.outcome_kind !== "unknown") continue;
+      const run_id = entry.run_id.toLowerCase();
+      if (onlyRun !== undefined && run_id !== onlyRun.toLowerCase()) continue;
+      if (seen.has(run_id)) continue;
+      seen.add(run_id);
+      await this.observePolicyOwnership({ ...entry, run_id });
+    }
+  }
+
+  /** Lease evidence only: bind before HTTP so a late response cannot replace a newer claim. */
+  private async observePolicyOwnership(entry: { run_id: string; outcome_kind?: string }): Promise<void> {
+    if (entry.outcome_kind !== "policy_hold" && entry.outcome_kind !== "unknown") return;
+    const observe = this.activeRuns?.beginPolicyOwnershipObservation(entry.run_id);
+    try {
+      const generation = policyOwnershipGeneration(await this.client.getRunOwnership(entry.run_id));
+      if (generation !== undefined) observe?.(generation);
+    } catch { /* Unknown ownership keeps the conservative projection. */ }
+  }
+
   /** Whether this process is executing `runId` (the registry when wired, else the runner's own
    *  execution tracking; the typeof guard covers test fakes that lack `isExecuting`). */
   private isRunLiveHere(runId: string): boolean {
@@ -835,11 +868,12 @@ export class Worker {
     // false, `finalize_resume` set). Built ONCE before the retry loop so a re-register re-sends the
     // same snapshot. Undefined for an ordinary worker with neither (or no registry) ⇒ the register
     // wire stays byte-identical.
-    const pending = this.outbox?.listPendingTerminals() ?? [];
+    const pending = this.outbox?.listPendingTerminals().filter(p => p.outcome_kind !== "unknown") ?? [];
     // Issue #1742: the finalize-pending records offered on this register, captured ONCE with the
     // snapshot. Freeze each original identity before the request, including existing lower records.
     // Only exact offered identities gain lifetime handoff; captured lower originals gain batch-only authority.
     const offeredFinalizes = this.outbox?.listPendingFinalizes() ?? [];
+    await this.observePendingPolicyOwnership(signal);
     const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes);
     const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
     const frozenFinalizes = this.captureFinalizes().filter(({ entry }) =>
@@ -1002,6 +1036,7 @@ export class Worker {
           protocolCapabilities.push("cross_check_lane_v1");
           if (this.crossCheckRunner && this.config.codexHarness?.advertise) protocolCapabilities.push("cross_check_code_v1");
         }
+        protocolCapabilities.push("pending_outcome_scoped_claim_v1");
         if (this.dindMaintenance) protocolCapabilities.push("dind_maintenance_v1");
         const res = await this.client.register(
           this.config.workerName,
@@ -1107,6 +1142,7 @@ export class Worker {
           { sample: stats.latestDindSample, ack: this.dindMaintenance?.acknowledgement() },
           // issue #2213: the quarantine latch (the client sends it only when negotiated).
           residueQuarantine(),
+          this.outbox?.unusableRootReason?.(),
         );
         ok = true;
         // Heartbeat negotiation can grow or shrink support without a new incarnation.
@@ -1186,6 +1222,7 @@ export class Worker {
     const entries: OutboxHeartbeatEntry[] = [];
     const runIds = new Set(this.outbox.runsWithPending());
     for (const t of this.outbox.listPendingTerminals()) runIds.add(t.run_id);
+    for (const runId of this.outbox.unclassifiedPolicyRunIds()) runIds.add(runId);
     for (const runId of runIds) {
       const d = this.outbox.depthFor(runId);
       if (!d) continue;
@@ -1193,6 +1230,10 @@ export class Worker {
         run_id: d.runId,
         pending_messages: d.pendingMessages,
         pending_terminal: d.pendingTerminal,
+        ...(d.policyPendingOutcomeId !== undefined && d.policyPendingSourceGeneration !== undefined ? {
+          policy_pending_outcome_id: d.policyPendingOutcomeId,
+          policy_pending_source_generation: d.policyPendingSourceGeneration,
+        } : {}),
         stale_retired: d.staleRetired,
         since: d.since,
         ...(d.blockedReason ? { blocked_reason: d.blockedReason } : {}),
@@ -1212,7 +1253,7 @@ export class Worker {
   private buildActiveSnapshot(): ActiveSnapshot | undefined {
     if (!this.activeRuns) return undefined;
     if (!this.client.hasFeature("active_run_snapshot")) return undefined;
-    return this.activeRuns.build();
+    return this.activeRuns.build(this.client.supportsScopedPendingClaim);
   }
 
   /**
@@ -1232,7 +1273,8 @@ export class Worker {
     if (!this.outbox) return undefined;
     // Issue #1742: a pending finalize record also warrants the register snapshot (it carries
     // finalize_resume), even with no pending terminal journal.
-    if (this.outbox.listPendingTerminals().length === 0 && finalizes.length === 0) return undefined;
+    if (this.outbox.listPendingOutcomeSources().length === 0 &&
+        this.outbox.unclassifiedPolicyRunIds().length === 0 && finalizes.length === 0) return undefined;
     return this.activeRuns.buildRegisterSnapshot(finalizes);
   }
 
@@ -1322,6 +1364,10 @@ export class Worker {
     let loggedAtCapacity = false;
     let loggedQuarantined = false;
     while (!signal.aborted) {
+      if (this.outbox?.unusableRootReason?.() !== undefined) {
+        await sleep(this.config.pollIntervalMs, signal);
+        continue;
+      }
       // PRD #1390 M4 (e2e ONLY): the env-gated drop-execution seam pauses claiming (via the
       // shared registry latch) so a silently-dropped run can be observed sitting `queued`
       // before any reclaim. isClaimPausedForE2E() is a constant `false` in production (nothing
@@ -1330,16 +1376,11 @@ export class Worker {
         await sleep(this.config.pollIntervalMs, signal);
         continue;
       }
-      // PRD #1391 Run B M4 (D7/SC4) — the PRODUCTION boot gate. While the pending terminal set
-      // exceeds the server cap (`pending_overflow`), #1390's claim exclusion has already closed every
-      // run this worker owns to every claimant; keep the worker's OWN run-lane claim loop closed for
-      // the same duration too, so no unleased pending outcome ever coexists with a new claim. This is
-      // the same sleep-and-continue shape as the e2e latch above, but reads the REAL pending-vs-cap
-      // state via a DIFFERENT method — and, crucially (D9), keys on that state, NEVER on which wire
-      // features are currently negotiated, so a strict-decode rollback that clears the feature set can
-      // never reopen the loop while a terminal journal is still unresolved. A no-op when no outbox /
-      // registry is wired (the concurrency unit tests) or nothing is pending.
-      if (this.activeRuns?.claimsPausedByPendingOverflow()) {
+      // Legacy registration pauses this worker's run lane for conservative pending overflow.
+      // Scoped claims count positively owned pending groups against capacity. The conservative
+      // snapshot independently protects attributed runs when physical coverage is incomplete.
+      // Feature loss restores the legacy unknown-source gate; source protection stays active.
+      if (this.activeRuns?.claimsPausedByPendingOverflow(this.client.supportsScopedPendingClaim)) {
         await sleep(this.config.pollIntervalMs, signal);
         continue;
       }
@@ -1393,7 +1434,8 @@ export class Worker {
         // issue #2213: a latch landing while the admission await was pending must still stop this claim;
         // nothing is awaited between this recheck and claimRun. The finally releases admission and the
         // next iteration's top-of-loop gate logs and sleeps.
-        if (residueQuarantine() !== undefined) continue;
+        if (residueQuarantine() !== undefined ||
+            this.activeRuns?.claimsPausedByPendingOverflow(this.client.supportsScopedPendingClaim)) continue;
         // PRD #1390 M2a: carry the active-run snapshot on the claim (built from the SAME
         // monotonic epoch counter the heartbeat draws from) so the api's pre-claim dedupe
         // sees this worker's live runs even before the first post-outage heartbeat lands.
@@ -1544,6 +1586,10 @@ export class Worker {
     const gate = this.claimGate ?? this.dindMaintenance?.gate ?? this.dindPrune?.gate;
     let loggedQuarantined = false;
     while (!signal.aborted) {
+      if (this.outbox?.unusableRootReason?.() !== undefined) {
+        await sleep(this.config.chatPollMs, signal);
+        continue;
+      }
       // issue #2213: the same quarantine gate as the run lane (see claimLoop).
       if (residueQuarantine() !== undefined) {
         if (!loggedQuarantined) {

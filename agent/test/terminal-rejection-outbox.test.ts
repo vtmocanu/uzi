@@ -106,7 +106,8 @@ test("real computed MAC failure is content free, not trusted or adopted; ACK/sta
   const restarted = new Outbox({ root, log: log.logger, runMaxBytes: 1e6, maxBytes: 1e7, retentionMs: 1 });
   outboxes.push(restarted);
   await restarted.init();
-  assert.deepEqual(restarted.listPendingTerminals(), []);
+  assert.equal(restarted.listPendingTerminals()[0]?.outcome_kind, "unknown");
+  assert.equal(await restarted.hasPendingPolicyOutcome(run), true);
   assert.equal(await restarted.readTerminalJournal(run, 3), undefined);
   assert.equal((await restarted.observeTerminalAuthentication(run, 3)).kind, "mac_failure");
   assert.equal((await restarted.journalTerminal(run, 3, "implement", 0, { status: "completed" })).journaled, false);
@@ -172,6 +173,7 @@ test("unsafe generations stay unknown, leading-zero aliases preserve exact names
   const unsafe = all.find(o => o.fileName === "terminal-9007199254740993.json")!;
   assert.equal(unsafe.generation, undefined);
   assert.equal(unsafe.kind, "malformed");
+  assert.equal(box.policyInventoryCoverageAvailable(), false, "EOF does not certify unsafe source coverage");
   assert.ok((await box.scanTerminalObservationsPage()).observations.length > 0);
   await box.retireRun(run);
   assert.ok(await fs.stat(path.join(root, run, unsafe.fileName)));

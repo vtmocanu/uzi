@@ -1,4 +1,20 @@
 {
+  "policy_hold": {
+    "preserve_required": true,
+    "pending_fresh": true,
+    "outcome_id": "x",
+    "continuation_mode": "x",
+    "resolved_at": "2020-01-02T03:04:05Z",
+    "applying_worker_id": "x",
+    "applying_generation": 1,
+    "source_generation": 1,
+    "refusal_count": 1,
+    "policy_tag": "x",
+    "phase": "x",
+    "correlation_id": "x",
+    "published": true,
+    "captured_head": "x"
+  },
   "forge_origin_cooldown": {
     "origin": "x",
     "cooled_until": "2020-01-02T03:04:05Z",

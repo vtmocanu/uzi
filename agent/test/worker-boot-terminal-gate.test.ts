@@ -7,6 +7,7 @@ import path from "node:path";
 
 import { Worker } from "../src/worker.js";
 import { Outbox } from "../src/outbox.js";
+import type { PolicyHoldRequest } from "../src/protocol.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { Config } from "../src/config.js";
 import type { WorkerClient } from "../src/client.js";
@@ -504,3 +505,205 @@ describe("Worker boot: the ancestry-settlement sweep starts only after the boot 
     assert.equal(sweeps, after, "the sweep loop stops on abort");
   });
 });
+
+describe("Worker policy ownership reconciliation", () => {
+  const body: PolicyHoldRequest = {
+    outcome_id: "11111111-1111-4111-8111-111111111111", source_generation: 1, claim_generation: 1,
+    detail: "refused", continuation_mode: "same_conversation", published: false,
+    tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "a".repeat(32) + "-1",
+  };
+  type Driver = {
+    resolveBootTerminals(signal: AbortSignal): Promise<void>;
+    resolveRunTerminal(runId: string): Promise<void>;
+    sweepPendingTerminals(): Promise<void>;
+  };
+  for (const via of ["boot", "drain", "sweep"] as const) {
+    for (const proof of [
+      { status: "running", claim_generation: 3, claim_released: false },
+      { status: "running", claim_generation: 3, claim_released: true },
+      { status: "paused", claim_generation: 3, claim_released: false },
+      { status: "running", claim_generation: 3 },
+      { status: "surprise", claim_generation: 3, claim_released: false },
+      { status: "running", claim_generation: 0, claim_released: false },
+      null,
+    ]) it(`${via} projects only positive unreleased ownership: ${JSON.stringify(proof)}`, async () => {
+      const outbox = await mkOutbox();
+      await outbox.journalPolicyHold(RUN, body);
+      const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 10);
+      registry.add(RUN, 1);
+      registry.markPolicyPendingOnly(RUN, 1);
+      let reports = 0;
+      const client = fakeClient();
+      Object.defineProperty(client, "supportsPolicyHold", { value: true });
+      client.getRunOwnership = async () => proof as never;
+      client.reportPolicyHold = async (_runId, request) => {
+        reports++;
+        assert.deepEqual(request, body, "worker never guesses current mode or converts original");
+        return { disposition: "pending", outcome_id: body.outcome_id, source_generation: 1 };
+      };
+      const worker = new Worker(fakeConfig(), client, idleRunner, idleChat, noJudge, noReview,
+        nullLogger(), okPreflight, outbox, new Map(), registry) as unknown as Driver;
+      if (via === "boot") await worker.resolveBootTerminals(new AbortController().signal);
+      else if (via === "drain") await worker.resolveRunTerminal(RUN);
+      else await worker.sweepPendingTerminals();
+      assert.equal(reports, 1, "pending-only execution must remain replayable");
+      const snapshot = registry.build();
+      const valid = proof?.status === "running" && proof.claim_generation === 3 && proof.claim_released === false;
+      const negative = proof?.claim_generation === 3 &&
+        (proof.claim_released === true || proof.status === "paused");
+      assert.deepEqual(snapshot.active.map(e => e.claim_generation), valid ? [3] : []);
+      assert.equal(snapshot.pending_overflow, !valid && !negative);
+      assert.deepEqual(snapshot.pending_all, [{ run_id: RUN, claim_generation: 1 }]);
+      assert.deepEqual((await outbox.readTerminalJournal(RUN, 1))?.body, body);
+    });
+  }
+
+  it("heartbeat delivery facts clear after exact settlement without deleting custody evidence", async () => {
+    const outbox = await mkOutbox();
+    await outbox.journalPolicyHold(RUN, body);
+    const worker = new Worker(fakeConfig(), fakeClient(), idleRunner, idleChat, noJudge, noReview,
+      nullLogger(), okPreflight, outbox) as unknown as {
+        outboxEntries(): { pending_terminal: number; policy_pending_outcome_id?: string; policy_pending_source_generation?: number }[];
+      };
+    const pending = worker.outboxEntries()[0]!;
+    assert.equal(pending.pending_terminal, 1);
+    assert.equal(pending.policy_pending_outcome_id, body.outcome_id);
+    assert.equal(pending.policy_pending_source_generation, 1);
+    const observed = await outbox.readTerminalJournalForRetirement(RUN, 1);
+    assert.ok(observed);
+    await outbox.markTerminalServerSettled(RUN, 1, observed.context);
+    const settled = worker.outboxEntries()[0]!;
+    assert.equal(settled.pending_terminal, 0);
+    assert.equal(settled.policy_pending_outcome_id, undefined);
+    assert.equal(settled.policy_pending_source_generation, undefined);
+    assert.deepEqual((await outbox.readTerminalJournal(RUN, 1))?.body, body);
+    assert.equal(outbox.listPendingTerminals().length, 1);
+  });
+
+  it("late G3 response cannot remove the G4 lease during a sweep", async () => {
+    const outbox = await mkOutbox();
+    await outbox.journalPolicyHold(RUN, body);
+    const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 10);
+    let entered!: () => void;
+    let finish!: (proof: unknown) => void;
+    const started = new Promise<void>(r => { entered = r; });
+    const response = new Promise<unknown>(r => { finish = r; });
+    const client = fakeClient();
+    client.getRunOwnership = async () => { entered(); return await response as never; };
+    client.reportPolicyHold = async () => ({ disposition: "pending", outcome_id: body.outcome_id, source_generation: 1 });
+    const worker = new Worker(fakeConfig(), client, idleRunner, idleChat, noJudge, noReview,
+      nullLogger(), okPreflight, outbox, new Map(), registry) as unknown as Driver;
+    const sweeping = worker.sweepPendingTerminals();
+    await started;
+    registry.add(RUN, 4);
+    registry.markPolicyPendingOnly(RUN, 4);
+    registry.notePolicyOwnership(RUN, 4);
+    finish({ status: "paused", claim_generation: 3, claim_released: true });
+    await sweeping;
+    assert.deepEqual(registry.build().active.map(e => e.claim_generation), [4]);
+  });
+});
+
+
+import * as r1fs from "node:fs/promises";
+import * as r1os from "node:os";
+import * as r1path from "node:path";
+import { makeScratchRoot } from "./fixture-repo.js";
+
+const r1Modes = ["empty", "other-policy", "other-unknown", "same-policy", "same-unknown"] as const;
+async function r1DisabledStore(mode: typeof r1Modes[number]) {
+  const root = makeScratchRoot("r1-producer-", await r1fs.realpath(r1os.tmpdir()));
+  const storeRoot = r1path.join(root, "outbox");
+  const options = { root: storeRoot, log: nullLogger(), runMaxBytes: mode.endsWith("unknown") ? 1 : 1e6,
+    maxBytes: mode.endsWith("unknown") ? 1 : 1e6, retentionMs: 86400000 };
+  await new Outbox(options).init();
+  await r1fs.writeFile(r1path.join(storeRoot, ".key"), "invalid");
+  const outbox = new Outbox(options);
+  await outbox.init();
+  assert.equal(outbox.isDisabled(), true);
+  assert.deepEqual(outbox.listPendingTerminals(), [], "construct the runner with an empty disabled store");
+  return { root, outbox };
+}
+async function r1LateEvidence(outbox: Outbox, mode: typeof r1Modes[number], current: string) {
+  if (mode === "empty") return;
+  const result = await outbox.journalPolicyHold(mode.startsWith("same") ? current : "cccccccc-cccc-4ccc-8ccc-cccccccccccc", {
+    outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", source_generation: 1, claim_generation: 1,
+    detail: "refused", continuation_mode: "same_conversation", published: false,
+    tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "a".repeat(32) + "-1",
+  });
+  assert.equal(result.journaled, false);
+  assert.equal(outbox.listPendingTerminals()[0]?.outcome_kind, mode.endsWith("unknown") ? "unknown" : "policy_hold");
+}
+
+type R1ReplayDriver = {
+  resolveBootTerminals(signal: AbortSignal): Promise<void>;
+  resolveRunTerminal(runId: string, signal?: AbortSignal): Promise<void>;
+  sweepPendingTerminals(signal?: AbortSignal): Promise<void>;
+};
+for (const method of ["boot", "run", "sweep"] as const) {
+  for (const mode of r1Modes.filter(m => !m.startsWith("same"))) {
+    it("R1 replay " + method + " disabled " + mode + " invents no ordinary outcome", async () => {
+      const { root, outbox } = await r1DisabledStore(mode);
+      try {
+        let sends = 0;
+        const client = fakeClient({ reportState: async () => { sends++; return { applied: true }; } });
+        const driver = new Worker(fakeConfig(), client, idleRunner, idleChat, noJudge, noReview,
+          nullLogger(), okPreflight, outbox) as unknown as R1ReplayDriver;
+        await r1LateEvidence(outbox, mode, RUN2);
+        if (method === "boot") await driver.resolveBootTerminals(new AbortController().signal);
+        else if (method === "run") await driver.resolveRunTerminal(RUN2);
+        else await driver.sweepPendingTerminals();
+        assert.equal(sends, 0, "a replay needs an existing readable ordinary journal");
+      } finally { await r1fs.rm(root, { recursive: true, force: true }); }
+    });
+  }
+
+  for (const source of ["policy", "unknown", "unreadable-target"] as const) {
+    it("R1 replay " + method + " healthy B with retained A " + source, async () => {
+      const root = makeScratchRoot("r1-replay-", await r1fs.realpath(r1os.tmpdir()));
+      try {
+        const options = { root: r1path.join(root, "outbox"), log: nullLogger(), runMaxBytes: 4096,
+          maxBytes: 16384, retentionMs: 86400000 };
+        let outbox = new Outbox(options);
+        await outbox.init();
+        assert.equal((await outbox.journalTerminal(RUN2, 8, "running", 0, { status: "completed" })).journaled, true);
+        if (source === "unreadable-target") {
+          await r1fs.writeFile(r1path.join(options.root, ".key"), "invalid");
+          outbox = new Outbox(options);
+          await outbox.init();
+          assert.equal(outbox.isDisabled(), true);
+        } else {
+          if (source === "unknown") {
+            // A malformed physical source is unknown; B keeps its healthy body/read budget.
+            await r1fs.mkdir(r1path.join(options.root, RUN), { recursive: true });
+            await r1fs.writeFile(r1path.join(options.root, RUN, "terminal-1.json"), "{}");
+            outbox = new Outbox(options);
+            await outbox.init();
+          } else {
+            await outbox.journalPolicyHold(RUN, { outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+              source_generation: 1, claim_generation: 1, detail: "refused",
+              continuation_mode: "same_conversation", published: false, tag: "cyberPolicy",
+              phase: "implementation", correlation_id: "pr-" + "a".repeat(32) + "-1" });
+          }
+          assert.equal(outbox.listPendingTerminals().find(p => p.run_id === RUN)?.outcome_kind,
+            source === "unknown" ? "unknown" : "policy_hold");
+        }
+        const bodies: StateRequest[] = [];
+        const client = fakeClient({ reportState: async (id, body) => {
+          assert.equal(id, RUN2);
+          bodies.push(body);
+          return { applied: true, status: "completed" };
+        } });
+        const driver = new Worker(fakeConfig(), client, idleRunner, idleChat, noJudge, noReview,
+          nullLogger(), okPreflight, outbox) as unknown as R1ReplayDriver;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (method === "boot") await driver.resolveBootTerminals(new AbortController().signal);
+          else if (method === "run") await driver.resolveRunTerminal(RUN2);
+          else await driver.sweepPendingTerminals();
+        }
+        assert.equal(bodies.length, source === "unreadable-target" ? 0 : 1);
+        if (bodies.length) assert.equal(bodies[0]!.claim_generation, 8);
+      } finally { await r1fs.rm(root, { recursive: true, force: true }); }
+    });
+  }
+}

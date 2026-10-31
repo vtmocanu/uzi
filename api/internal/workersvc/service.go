@@ -2479,6 +2479,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	s.quarantine.evictIfSet(wkr.ID)
 	// A fresh incarnation reports its own memory authority (issue #3142).
 	s.memAuthority.evictIfSet(wkr.ID)
+	s.RecordOutboxRootUnusable(wkr.ID, "")
 	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 	// template is the worker's self-reported image template (PRD #18); empty →
 	// NULL (older image sends none). Soft signal only; never rejected here.
@@ -3166,6 +3167,21 @@ func (s *Service) RecordResidueQuarantine(workerID uuid.UUID, q *ResidueQuaranti
 	s.quarantine.record(workerID, q, s.now())
 }
 
+// RecordOutboxRootUnusable records bounded, restart-losing worker health telemetry.
+// Missing, invalid and healthy reports clear it; it is never transition authority.
+func (s *Service) RecordOutboxRootUnusable(workerID uuid.UUID, reason string) {
+	if s.outbox != nil {
+		s.outbox.recordRootUnusable(workerID, reason, s.now())
+	}
+}
+
+func (s *Service) OutboxRootUnusable(workerID uuid.UUID) *string {
+	if s.outbox == nil {
+		return nil
+	}
+	return s.outbox.rootUnusable(workerID)
+}
+
 // ResidueQuarantineFor returns the worker's last reported residue-quarantine latch, for
 // the DTO overlay and the fleet.quarantine health check.
 func (s *Service) ResidueQuarantineFor(workerID uuid.UUID) (ResidueQuarantine, bool) {
@@ -3544,24 +3560,30 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		return nil, ErrActiveSnapshotInvalid
 	}
 	pending := s.validatePendingAll(locked, snapshot)
+	pending.scoped = &scopedPendingClaim{}
 	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{}, pending.ids)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks, pending); err != nil {
+	applied, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks, pending)
+	if err != nil {
 		return nil, err
 	}
 	// (d) Claimant guard (snapshot-replace BEFORE overflow, blocker 2). The replace just set/cleared
 	// pending_overflow_until from the snapshot's pending_overflow flag; re-read the row to see the
-	// CURRENT value. If the worker is under an unexpired overflow closure it is refused every claim,
-	// unassigned runs included — but the replace is valid info that must persist, so COMMIT and
-	// report idle. An UNFLAGGED valid snapshot cleared the closure here, so the claim proceeds in
+	// CURRENT value. An unexpired overflow closure refuses snapshot claims unless this transaction
+	// proves scoped pending coverage; that refusal includes unassigned runs. The valid replacement
+	// must persist, so COMMIT and report idle. An UNFLAGGED valid snapshot cleared the closure here,
+	// so the claim proceeds in
 	// this SAME tx below.
 	reread, err := qtx.GetWorkerByID(ctx, wkr.ID)
 	if err != nil {
 		return nil, err
 	}
-	if reread.PendingOverflowUntil.Valid && reread.PendingOverflowUntil.Time.After(s.now()) {
+	// Only fresh, applied evidence from this transaction can exempt this claimant.
+	// The persisted overflow closure still excludes its owned candidates for everyone.
+	scopedClaim := applied && locked.ID == wkr.ID && pending.scoped.allowed
+	if reread.PendingOverflowUntil.Valid && reread.PendingOverflowUntil.Time.After(s.now()) && !scopedClaim {
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
@@ -4454,6 +4476,11 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return store.Run{}, false, err
+	}
+	// Compact policy episodes have no generic continuation authority. Cancel remains
+	// the ordinary terminal action; the dedicated report reconciles its own replay.
+	if activePolicyHold(owned) && req.State != "cancelled" {
+		return owned, false, nil
 	}
 	if err := validateCappedReportOnly(owned, req); err != nil {
 		return owned, false, err
