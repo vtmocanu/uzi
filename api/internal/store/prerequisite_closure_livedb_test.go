@@ -685,12 +685,15 @@ func TestPrerequisiteClosureMigrationRoundTripLiveDB(t *testing.T) {
 		t.Run(state, func(t *testing.T) {
 			// A fresh database prevents an earlier pending row masking later states.
 			ctx, dsn, pool := prerequisiteMigratedPool(t, "prereq_down_state_")
+			// Fixture transitions use the current DAO's run projection. Seed at head,
+			// then isolate 00387 before testing its Down guard; later run columns may
+			// be absent at that historical version, but the closure evidence remains.
+			f := prerequisiteNew(t, ctx, pool)
+			prerequisiteSetState(t, ctx, f, state)
 			// Isolate 00387: later migrations roll back first and are not this test's subject.
 			if err := store.MigrateDownTo(ctx, dsn, 387); err != nil {
 				t.Fatal(err)
 			}
-			f := prerequisiteNew(t, ctx, pool)
-			prerequisiteSetState(t, ctx, f, state)
 			prerequisiteSchemaVersion(t, ctx, pool, 387)
 			if err := store.MigrateDownTo(ctx, dsn, 386); err == nil {
 				t.Fatalf("Down forgot %s evidence", state)
