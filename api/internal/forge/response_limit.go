@@ -3,6 +3,7 @@ package forge
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -99,6 +100,7 @@ type responseLimitState struct {
 	failure                atomic.Pointer[ResponseTooLargeError]
 	unsupportedEncoding    atomic.Bool
 	continuationValidation bool
+	projectLookup          bool
 }
 
 // GetIssueBounded validates a continuation issue using the direct-issue ceiling
@@ -212,7 +214,7 @@ type responseLimitKey struct{}
 // withResponseLimit marks ctx so responseLimitTransport bounds the response
 // bodies of the requests made under it. Unmarked requests pass through unchanged.
 func withResponseLimit(ctx context.Context, state *responseLimitState) context.Context {
-	if state.ledger != nil {
+	if state.ledger != nil || state.projectLookup {
 		ctx = context.WithValue(ctx, ciRepairJSONKey{}, false)
 	}
 	return context.WithValue(ctx, responseLimitKey{}, state)
@@ -407,6 +409,11 @@ func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, er
 				return nil, state.recordOverflow(code)
 			}
 			return nil, newBodyReadError(err)
+		}
+		// Project metadata must be one complete JSON value. Some SDK decoders
+		// accept an object prefix and silently ignore trailing malformed content.
+		if state.projectLookup && !json.Valid(data) {
+			return nil, errors.New("forge: get project: malformed JSON response")
 		}
 		setBuffered(resp, data)
 	case statusRetriedBySDK(code):

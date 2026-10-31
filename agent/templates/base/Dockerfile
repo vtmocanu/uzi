@@ -382,7 +382,7 @@ RUN chmod -R a+rX /nix \
 # manifest field or an unsupported arch BEFORE installing. assert-codex.sh is the
 # build-time runner-uid guard: it execs `codex --version` as the cap-less `runner` uid
 # (setpriv --reuid runner, fresh throwaway HOME, replaced env, bounded timeout), asserting EXACTLY
-# `codex-cli 0.163.0` + exit 0 AND the fake-GNU-ldd PATH case AND the code-mode host
+# `codex-cli 0.164.0` + exit 0 AND the fake-GNU-ldd PATH case AND the code-mode host
 # sibling — so a broken binary/loader or a missing host fails the BUILD, not a run. The
 # helpers + lock are removed after (no residue); NO auth/config/session state is baked.
 # MIRRORED in templates/jvm (jvm is NOT `FROM base`) — keep the two in lockstep.
