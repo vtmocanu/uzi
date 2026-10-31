@@ -3089,14 +3089,14 @@ the displayed gate revision, not historical findings. See
 For a run [checked before your review](./cross-check.md#checked-before-your-review),
 `uzi run get <id>` adds these rows. `PLAN_CHECK_MODE` and the `passed` /
 `not checked` / `checked an earlier version of this plan` results are specific
-to that mode; the `PLAN_CHECK_ROUNDS`, `PLAN_CHECK_DEADLINE` and
-`PLAN_CHECK_ROUND_<n>_*` rows appear for any plan cross-check with recorded
-rounds, auto-approved runs included:
+to that mode; the `PLAN_CHECK_ROUNDS` and `PLAN_CHECK_ROUND_<n>_*` rows
+appear for any plan cross-check with recorded rounds (and `PLAN_CHECK_DEADLINE`
+while its latest round is pending), auto-approved runs included:
 
 | Row | Value |
 |---|---|
 | `PLAN_CHECK_MODE` | `checked before your review`. |
-| `PLAN_CROSS_CHECK` | The gate result, for example `plan cross-check: passed after 2 rounds`, `plan cross-check: not checked` (at the gate or on a finished run), `plan cross-check: checked an earlier version of this plan`, or `plan cross-check: unavailable, not supported on this worker`. `passed` needs no gate reason, a latest check that approved and a check of the current plan. |
+| `PLAN_CROSS_CHECK` | The gate result, for example `plan cross-check: passed after 2 rounds`, `plan cross-check: not checked` (once a plan is presented, or on a finished run), `plan cross-check: checked an earlier version of this plan`, or `plan cross-check: unavailable, not supported on this worker`. `passed` needs no gate reason, a latest check that approved and a check of the current plan. |
 | `PLAN_CHECK_ROUNDS` | The number of rounds shown (at most 5). |
 | `PLAN_CHECK_DEADLINE` | The checker deadline in RFC 3339 UTC, while the latest round is pending. |
 | `PLAN_CHECK_ROUND_<n>_RESULT` | Round n's verdict. |

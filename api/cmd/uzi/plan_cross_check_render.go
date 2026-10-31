@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // Limit hostile DTO text before the terminal renderer scans it. Plain still
@@ -62,12 +63,12 @@ func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 	}
 	s := r.PlanCrossCheckSummary
 	if s == nil {
-		// Not "not checked" while the gated run is still before its first gate.
-		switch r.Status {
-		case "awaiting_approval", "completed", "failed", "cancelled":
-			if r.PlanCrossCheckGated && r.PlanCrossCheckGateReason == nil {
-				rows = append(rows, []string{"PLAN_CROSS_CHECK", "plan cross-check: not checked"})
-			}
+		// Not "not checked" while the gated run is still before its first gate (the web's
+		// pending rule: not terminal, not at the gate, no plan presented yet).
+		presented := r.Status == "awaiting_approval" || uzicli.IsTerminalRunStatus(r.Status) ||
+			(r.PlanMd != nil && strings.TrimSpace(*r.PlanMd) != "")
+		if presented && r.PlanCrossCheckGated && r.PlanCrossCheckGateReason == nil {
+			rows = append(rows, []string{"PLAN_CROSS_CHECK", "plan cross-check: not checked"})
 		}
 		return rows
 	}

@@ -592,7 +592,7 @@ describe("gated plan cross-check: never re-checked", () => {
     assertNoCheckedStorage(c.run_id);
   });
 
-  it("a claim without the gated field never submits and opens the ordinary gate",{ skip: LINUX_CAPTURE }, async () => {
+  it("a claim without the gated field never submits and opens the ordinary gate", { skip: LINUX_CAPTURE }, async () => {
     const c = freshClaim(1, { kind: "issue", auto_approve: false });
     api.crossCheckHandler = () => { throw new Error("an ungated run is never checked"); };
     humanApproves(c.run_id);

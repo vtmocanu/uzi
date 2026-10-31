@@ -251,3 +251,15 @@ func TestRunGetGatedJSONPassesDTOThrough(t *testing.T) {
 		}
 	}
 }
+
+// Past its gate (plan presented, status running) with no check row, the CLI says "not
+// checked", matching the web's pending rule; before any plan it says nothing.
+func TestRunGetGatedNotCheckedAfterPresentation(t *testing.T) {
+	plan := "# Plan"
+	if out := gatedRunGet(t, apitypes.RunDTO{Status: "running", PlanCrossCheckGated: true, PlanMd: &plan}); !strings.Contains(out, "plan cross-check: not checked") {
+		t.Fatalf("presented plan without a check row must read not checked:\n%s", out)
+	}
+	if out := gatedRunGet(t, apitypes.RunDTO{Status: "running", PlanCrossCheckGated: true}); strings.Contains(out, "not checked") {
+		t.Fatalf("before any plan the CLI must not say not checked:\n%s", out)
+	}
+}

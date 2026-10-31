@@ -268,14 +268,16 @@ any findings:
 
 A failed check never parks the run: it presents the gate with the reason. Web,
 CLI and Slack apply the same rule for **passed**: the gate carries no reason,
-the latest check approved, and that check is of the current plan. After you
+the latest check approved, and that check is of the current plan. The run
+page additionally checks that the last listed round agrees, and shows
+**Outcome unavailable** instead when it does not. After you
 request changes, the earlier check is historical (**Earlier-plan evidence**)
 and does not certify the revised plan; no new check runs (ADR-2149 and PRD
 #2149 D16 are unchanged).
 
 **Every round, not only the last.** The run page and `uzi run get` list up to
-five rounds (for any plan cross-check with recorded rounds, auto-approved
-runs included) (the server's per-run cap): each round's verdict and findings,
+five rounds, the server's per-run cap (for any plan cross-check with recorded
+rounds, auto-approved runs included): each round's verdict and findings,
 with the lead's response beside them. The response is the "Cross-check
 dispositions" section of the **next** round's candidate, capped at 8 KiB, and
 is labelled as the lead's unverified claims: nothing infers that a finding was

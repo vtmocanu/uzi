@@ -51,8 +51,8 @@ func (s *Service) PlanCrossCheckSummary(ctx context.Context, userID, leadID uuid
 	// The per-round history is supplementary: losing it must not hide the summary
 	// (clients would otherwise read a checked gated run as "not checked").
 	if err := s.attachPlanCrossCheckRounds(ctx, userID, leadID, dto); err != nil {
-		slog.WarnContext(ctx, "plan cross-check rounds unavailable", "lead_run_id", leadID, "err", err)
-		dto.Rounds = nil
+		// No error text: a malformed legacy row can carry prose (as in the handler).
+		slog.WarnContext(ctx, "plan cross-check rounds unavailable", "lead_run_id", leadID)
 	}
 	if row.HasChild && row.CheckerRunID.Valid {
 		id := uuid.UUID(row.CheckerRunID.Bytes).String()
