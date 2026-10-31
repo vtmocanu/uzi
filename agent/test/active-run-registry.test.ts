@@ -4,6 +4,30 @@ import assert from "node:assert/strict";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { PendingTerminal } from "../src/outbox.js";
 
+for (const scoped of [false, true]) it(`D1: incomplete disk coverage does not pause an empty ordinary claim queue (scoped=${scoped})`, () => {
+  const pending: PendingTerminal[] = [];
+  const reg = new ActiveRunRegistry(() => pending, () => 0, () => false);
+  assert.equal(reg.claimsPausedByPendingOverflow(scoped), false);
+  assert.equal(reg.build(scoped).pending_all, undefined, "unknown coverage is never reported as complete");
+  assert.equal(reg.build(scoped).pending_overflow, true, "the conservative server protection remains");
+  pending.push(pt(RUN_A, 1));
+  assert.equal(reg.claimsPausedByPendingOverflow(scoped), true, "a real pending outcome still respects cap zero");
+});
+
+it("D3: unknown ownership consumes no scoped lease capacity or invented generation", () => {
+  const pending: PendingTerminal[] = [
+    { ...pt(RUN_A, 1), outcome_kind: "policy_hold" },
+    { ...pt(RUN_B, 2), outcome_kind: "policy_hold" },
+  ];
+  const reg = new ActiveRunRegistry(() => pending, () => 1);
+  reg.notePolicyOwnership(RUN_A, 3);
+  assert.deepEqual(reg.build(true).pending_policy_protection, [{ run_id: RUN_A, owner_generation: 3 }]);
+  assert.equal(reg.claimsPausedByPendingOverflow(true), false, "only the positively owned group counts against cap one");
+  assert.equal(reg.build(true).pending_all?.length, 2, "unknown source evidence is still preserved");
+  reg.notePolicyOwnership(RUN_B, 4);
+  assert.equal(reg.claimsPausedByPendingOverflow(true), true, "two known owned groups do exceed cap one");
+});
+
 // PRD #1390 M2a / #1391 Run B M4 — the worker-side active-run registry: the source of every
 // ActiveSnapshot the worker sends on the heartbeat, the run-lane claim, and the register request.
 // These prove the snapshot shape (terminal_pending / pending_overflow), the real pending-terminal

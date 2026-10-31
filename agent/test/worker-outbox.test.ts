@@ -6,13 +6,14 @@ import path from "node:path";
 
 import { Worker } from "../src/worker.js";
 import { Outbox } from "../src/outbox.js";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { Config } from "../src/config.js";
 import type { WorkerClient } from "../src/client.js";
 import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
-import type { ClaimResponse, ChatClaimResponse } from "../src/protocol.js";
+import type { ActiveSnapshot, ClaimResponse, ChatClaimResponse } from "../src/protocol.js";
 import type { OutboxDepth } from "../src/outbox.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import { sleep } from "../src/util.js";
@@ -66,6 +67,52 @@ const depth = (runId: string): OutboxDepth => ({
 const tmpRoots: string[] = [];
 afterEach(async () => {
   for (const r of tmpRoots.splice(0)) await fs.rm(r, { recursive: true, force: true }).catch(() => undefined);
+});
+
+for (const scoped of [false, true]) for (const scenario of ["boot", "symlink", "mutation"] as const)
+it(`D1: real Worker claims ordinary work with incomplete ${scenario} coverage (scoped=${scoped})`, async t => {
+  const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "worker-coverage-"));
+  tmpRoots.push(root);
+  const outbox = new Outbox({ root, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 4e6, retentionMs: 86400000 });
+  await outbox.init();
+  t.after(() => outbox.closeTerminalObservationScan());
+  if (scenario === "symlink") {
+    const target = path.join(root, ".target");
+    await fs.mkdir(target);
+    await fs.symlink(target, path.join(root, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), "dir");
+    await outbox.scanTerminalObservationsPage();
+  } else if (scenario === "mutation") {
+    for (let i = 0; i < 260; i++) await fs.writeFile(path.join(root, `ordinary-${i}`), "");
+    assert.equal((await outbox.scanTerminalObservationsPage()).passComplete, false);
+    await fs.mkdir(path.join(root, "created-between-pages"));
+    await outbox.scanTerminalObservationsPage();
+  }
+  assert.equal(outbox.listPendingOutcomeSources().length, 0);
+  assert.equal(outbox.policyInventoryCoverageAvailable(), false, "actual physical inventory is incomplete");
+  const active = new ActiveRunRegistry(() => outbox.listPendingOutcomeSources(), () => 4,
+    () => outbox.policyInventoryCoverageAvailable());
+  const controller = new AbortController();
+  let claimed!: () => void;
+  const observed = new Promise<void>(resolve => { claimed = resolve; });
+  const client = idleClient();
+  let sent: ActiveSnapshot | undefined;
+  Object.assign(client, { hasFeature: (feature: string) => feature === "active_run_snapshot" ||
+      (scoped && feature === "pending_outcome_scoped_claim_v1"), supportsScopedPendingClaim: scoped,
+    getRunOwnership: async () => { throw new Error("ownership unavailable"); },
+    claimRun: async (snapshot?: ActiveSnapshot) => { sent = snapshot; claimed(); controller.abort(); return null; } });
+  const worker = new Worker(fakeConfig(), client, idleRunner, idleChat, noJudge, noReview,
+    nullLogger(), okPreflight, outbox, new Map(), active);
+  const running = worker.run(controller.signal);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([observed, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("ordinary claim remained blocked on unrelated inventory coverage")), 5000);
+    })]);
+    assert.ok(sent, "the production claim carries its active snapshot");
+    assert.equal(sent.pending_all, undefined, "incomplete inventory is never advertised as complete");
+    assert.equal(sent.pending_overflow, true, "the server retains conservative attributed-run protection");
+    assert.equal(outbox.listPendingOutcomeSources().length, 0);
+  } finally { clearTimeout(timer); controller.abort(); await running; }
 });
 
 describe("Worker outbox drainer (PRD #1391 M2)", () => {

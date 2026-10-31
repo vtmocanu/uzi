@@ -65,6 +65,46 @@ Destroyed or unprovable identities cannot be safely evicted or treated as settle
 to recover capacity. Unrelated unnegotiated ordinary work retains its existing
 exact-target admission and unjournaled fallback where that target is positively safe.
 
+### Local claim capacity and physical coverage
+
+Physical inventory coverage does not by itself pause the local ordinary claim
+loop. A fresh boot, a symlinked run directory, or a mutation between inventory
+pages can leave coverage unavailable with zero known pending outcomes. In that
+case both legacy and scoped local claim gates stay open. Snapshots still omit
+`pending_all` and retain `pending_overflow`, preserving conservative protection
+for worker-attributed runs without falsely claiming a complete inventory.
+Actual pending capacity and the existing legacy unknown-source gate remain.
+Scoped capacity counts only positively observed owner generations, matching
+`pending_policy_protection`; unknown ownership supplies no invented lease.
+
+### Uninspectable-root recovery boundary
+
+A disabled store is not proof that a target has no earlier first writer. An
+inaccessible or symlinked root can hide an existing policy or UNKNOWN journal
+after restart or downgrade. Keep exact-target deferral unless absence is
+positively established; process-local enrollment, a first-claim assumption,
+missing server policy fields, or absent feature negotiation cannot replace
+that proof. A durable never-written witness would be a separate M2 design.
+
+The operator repair must preserve the original key and every retained journal.
+Repair the configured path or permissions, or move that intact store while the
+worker is stopped, then restart so the evidence is re-arbitrated. Replacing it
+with an empty directory or minting a new key to regain progress is not this
+recovery procedure and grants no discard authority.
+
+Restart re-arbitrates durable artifacts only. It does not make a memory-only
+selection crash-durable or prove it delivered or settled. Preserve recoverable
+work and diagnostic evidence before stopping; the existing loss boundary for an
+intent that could never be journaled remains explicit.
+
+The existing pre-factory admission refusal can leave the server row `claimed`.
+Snapshot-absence requeue targets running/awaiting states; claimed-never-started
+requeue is separately suppressed while heartbeat overflow protection remains
+live. A continuously inaccessible root can therefore retain the claimed row
+until storage repair. This is an open review disposition, not an automatic
+requeue guarantee. An actionable worker diagnostic and the final admission/
+already-claimed behavior must be decided before publication.
+
 ### Bounded demand and recovery, without a startup rewrite
 
 Boot content budgets and per-record authentication remain. A record marked internally

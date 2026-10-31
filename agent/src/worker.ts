@@ -1372,9 +1372,9 @@ export class Worker {
         continue;
       }
       // Legacy registration pauses this worker's run lane for conservative pending overflow.
-      // Negotiated scoped claims may continue for unrelated runs with complete coverage
-      // and available capacity; the server still excludes protected runs. Feature loss restores
-      // the legacy pause. Source protection remains independent of feature negotiation.
+      // Scoped claims count positively owned pending groups against capacity. The conservative
+      // snapshot independently protects attributed runs when physical coverage is incomplete.
+      // Feature loss restores the legacy unknown-source gate; source protection stays active.
       if (this.activeRuns?.claimsPausedByPendingOverflow(this.client.supportsScopedPendingClaim)) {
         await sleep(this.config.pollIntervalMs, signal);
         continue;

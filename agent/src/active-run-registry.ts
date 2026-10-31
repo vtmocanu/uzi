@@ -242,18 +242,21 @@ export class ActiveRunRegistry {
    * every run this worker owns to every claimant AND the worker's own claim loop stays closed, so no
    * unleased pending outcome ever coexists with a new claim. Distinct from {@link isClaimPausedForE2E}
    * (the e2e drop seam): this reads the REAL pending-vs-cap state. Never advances the epoch or the
-   * rotation cursor — a gate read is not a snapshot build. Matches {@link build}'s overflow:
-   * unknown policy evidence always blocks; otherwise projected lease count must exceed the cap.
+   * rotation cursor — a gate read is not a snapshot build. Physical inventory coverage belongs to
+   * the conservative snapshot, not to this local capacity check for unrelated ordinary claims.
+   * Legacy mode retains its unknown-source gate; scoped mode counts only positively owned groups.
    * An undefined/0 cap is the cap-independent floor for leasable pending outcomes.
    */
   claimsPausedByPendingOverflow(scoped = false): boolean {
     const pending = this.pendingOutcomes();
     const projection = this.projection(pending);
-    if (!scoped) return this.coverageGetter?.() === false || projection.unknown ||
+    if (!scoped) return projection.unknown ||
       projection.leases.length > this.effectiveCap();
-    if (this.pendingWire(projection.sources).pending_all === undefined) return true;
-    const groups = new Set(pending.filter(p => this.isPolicy(p) &&
-      this.policyOwnership.get(p.run_id)?.generation !== null).map(p => p.run_id.toLowerCase()));
+    if (this.knownPendingTuples(projection.sources) === undefined) return true;
+    const groups = new Set(pending.filter(p => {
+      const generation = this.policyOwnership.get(p.run_id)?.generation;
+      return this.isPolicy(p) && typeof generation === "number" && generation > 0;
+    }).map(p => p.run_id.toLowerCase()));
     const ordinary = this.leasable(pending.filter(p => !this.isPolicy(p)))
       .filter(p => !groups.has(p.run_id.toLowerCase()));
     return groups.size + ordinary.length > this.effectiveCap();
@@ -351,13 +354,20 @@ export class ActiveRunRegistry {
    * coverage conservatively. Omission never asserts a complete inventory. */
   private pendingWire(sources: PendingTerminal[]): Pick<ActiveSnapshot, "pending_all"> {
     if (this.coverageGetter?.() === false) return {};
+    const tuples = this.knownPendingTuples(sources);
+    return tuples === undefined ? {} : { pending_all: tuples };
+  }
+
+  /** Known tuples and their wire ceiling only. This does not establish physical coverage;
+   * pendingWire alone may publish them after its separate completeness check. */
+  private knownPendingTuples(sources: PendingTerminal[]): ActiveSnapshot["pending_all"] {
     const tuples = new Map<string, { run_id: string; claim_generation: number }>();
     for (const p of sources) {
       tuples.set(p.run_id + "/" + p.claim_generation,
         { run_id: p.run_id, claim_generation: p.claim_generation });
-      if (tuples.size > 256) return {};
+      if (tuples.size > 256) return undefined;
     }
-    return { pending_all: [...tuples.values()] };
+    return [...tuples.values()];
   }
 
   /**
