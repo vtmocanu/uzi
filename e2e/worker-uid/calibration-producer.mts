@@ -47,7 +47,7 @@ export async function runProducer(control: string, diskDir: string, shmemDir: st
     resourceLimits: { maxOldGenerationSizeMb: 16, maxYoungGenerationSizeMb: 4, stackSizeMb: 1 },
   });
   let failure: Error | undefined, pending: (() => void) | undefined;
-  worker.on("error", (error) => { failure = error; pending?.(); });
+  worker.on("error", (error) => { failure = error instanceof Error ? error : new Error(String(error)); pending?.(); });
   worker.on("exit", (code) => { failure = new Error("unexpected load worker exit " + code); pending?.(); });
   worker.on("message", (message) => {
     if (message !== "step" || !pending) failure = new Error("unexpected producer reply");

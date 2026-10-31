@@ -311,7 +311,7 @@ describe("A-core: a setsid'd agent tool survives killAgentTree; quiesce + retire
         },
         { reap: { viaHelper: false }, docker: { intervalMs: 100 } },
       );
-      assert.equal(out.process?.state, "quiescent", out.process?.detail);
+      assert.equal(out.process?.state, "quiescent", out.process?.detail ?? "no process detail reported");
       assert.ok(out.process?.killed.includes(ownAgent.toolPid), "the tool was reaped by pid");
       assert.equal(out.docker.state, "docker_unconfirmed");
       fs.rmSync(own.clonePath, { recursive: true, force: true });
@@ -348,8 +348,8 @@ describe("A-concurrent: two unrelated healthy runs reap at the same time", { ski
         { reap: { viaHelper: false } },
       );
     const [ra, rb] = await Promise.all([req(a), req(b)]);
-    assert.equal(ra.process?.state, "quiescent", ra.process?.detail);
-    assert.equal(rb.process?.state, "quiescent", rb.process?.detail);
+    assert.equal(ra.process?.state, "quiescent", ra.process?.detail ?? "no process detail reported");
+    assert.equal(rb.process?.state, "quiescent", rb.process?.detail ?? "no process detail reported");
     assert.deepEqual(ra.process?.killed, [pa.pid]);
     assert.deepEqual(rb.process?.killed, [pb.pid]);
     assert.equal(ra.docker.state, "not_wired");

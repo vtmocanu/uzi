@@ -131,7 +131,7 @@ describe("the archival capture over a real bare (issue #2213)", () => {
     git(topo.bare, ["update-ref", `refs/uzi-recovery-pin/${topo.runId}/1`, topo.baseSha]);
     const refsBefore = git(topo.bare, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-recovery-pin", "refs/uzi-runner"]);
     const r = await capture(topo, wrapped(topo));
-    assert.equal(r.outcome, "archived", r.detail);
+    assert.equal(r.outcome, "archived", r.detail ?? "no capture detail reported");
     assert.equal(r.head, topo.head);
     assert.equal(refOf(topo, archiveRef(topo)), topo.head, "the archive ref is H");
     assert.equal(git(topo.bare, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-recovery-pin", "refs/uzi-runner"]), refsBefore);
@@ -192,7 +192,7 @@ describe("the archival capture over a real bare (issue #2213)", () => {
       },
     });
     const r = await capture(topo, g);
-    assert.equal(r.outcome, "archived", r.detail);
+    assert.equal(r.outcome, "archived", r.detail ?? "no capture detail reported");
     assert.equal(r.head, topo.head, "H as resolved, not H'");
     assert.equal(refOf(topo, archiveRef(topo)), topo.head);
     assert.equal(git(topo.bare, ["cat-file", "-t", topo.head]), "commit", "H survived the prune");
@@ -264,7 +264,7 @@ describe("the archival capture over a real bare (issue #2213)", () => {
 
   it("the published bundle is exactly the reported sha256 and unbundles to H", async () => {
     const r = await capture(topo, wrapped(topo));
-    assert.equal(r.outcome, "archived", r.detail);
+    assert.equal(r.outcome, "archived", r.detail ?? "no capture detail reported");
     const published = fs.readFileSync(path.join(runDir(topo), "g1.bundle"));
     assert.equal(createHash("sha256").update(published).digest("hex"), r.sha256);
     assert.equal(published.length, r.size);
@@ -320,7 +320,7 @@ describe("the archival capture over a real bare (issue #2213)", () => {
     for (const c of cases) {
       it(c.name, async () => {
         const r = await capture(topo, wrapped(topo, c.hooks(topo)), c.extra ?? {});
-        assert.equal(r.outcome, c.outcome, r.detail);
+        assert.equal(r.outcome, c.outcome, r.detail ?? "no capture detail reported");
         assert.ok(!listRunDir(topo).some((f) => f === "g1.bundle" || f === "g1.manifest.json"), listRunDir(topo).join(","));
         assert.deepEqual(listRunDir(topo).filter((f) => f.endsWith(".tmp")), [], "no temp left");
         assert.equal(archiveFailureReasonSuffix(r), "");
@@ -330,7 +330,7 @@ describe("the archival capture over a real bare (issue #2213)", () => {
     it("the rename cannot complete: incomplete, no partial g1.bundle or manifest", async () => {
       fs.mkdirSync(path.join(runDir(topo), "g1.bundle", "blocker"), { recursive: true });
       const r = await capture(topo, wrapped(topo));
-      assert.equal(r.outcome, "incomplete", r.detail);
+      assert.equal(r.outcome, "incomplete", r.detail ?? "no capture detail reported");
       assert.ok(!fs.existsSync(path.join(runDir(topo), "g1.manifest.json")));
       assert.ok(!listRunDir(topo).some((f) => f.endsWith(".tmp")));
     });
@@ -611,7 +611,7 @@ describe("verifyBundleReproduces judges completeness from the bundle bytes, not 
       },
     });
     const r = await capture(topo, g);
-    assert.equal(r.outcome, "archived", r.detail);
+    assert.equal(r.outcome, "archived", r.detail ?? "no capture detail reported");
     const published = fs.readFileSync(path.join(runDir(topo), "g1.bundle"));
     assert.ok(published.equals(verified!), "the published bytes are the verified bytes");
     assert.equal(createHash("sha256").update(published).digest("hex"), r.sha256);

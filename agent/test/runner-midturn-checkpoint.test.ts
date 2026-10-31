@@ -110,7 +110,7 @@ const finalStatus = (runId: string): string | undefined =>
 
 /** The terminal contract for a run whose tick-flagged commit is still in the branch history:
  *  failed push_secret_blocked, with no preserved patch (it could carry the secret). */
-function assertPushSecretBlocked(runId: string, label?: string): void {
+function assertPushSecretBlocked(runId: string, label = `run ${runId}`): void {
   assert.equal(finalStatus(runId), "failed", label);
   const failed = api.states.find((s) => s.runId === runId && s.body.status === "failed")?.body;
   assert.equal(failed?.fail_origin, "push_secret_blocked", label);

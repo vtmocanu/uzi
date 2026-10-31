@@ -9,7 +9,7 @@
 #   docker run -d --name uzi-ux-mock -p 127.0.0.1:8081:8080 uzi-ux-mock
 
 # --- build stage ---
-FROM node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf AS build
+FROM node:26-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS build
 WORKDIR /app/web
 
 COPY web/package.json web/package-lock.json ./

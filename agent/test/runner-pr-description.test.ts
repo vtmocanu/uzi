@@ -138,7 +138,7 @@ describe("M4 owner-deferred work", () => {
     assert.equal((parsed.completion.match(/^> - \[ \]/gm) ?? []).length, 2);
     const explanation = "Not delivered or verified by this run; must be completed or verified before closing the source issue.";
     for (const id of ["m2", "m3"]) {
-      const item = parsed.completion.split("\n").find(line => line.startsWith(`> - [ ] \`${id}\` — `));
+      const item: string | undefined = parsed.completion.split("\n").find(line => line.startsWith(`> - [ ] \`${id}\` — `));
       assert.ok(item, `${id} is an unchecked item`);
       assert.ok(item.endsWith(`. ${explanation}`), `${id} carries its own explanation`);
       if (id === "m2") {

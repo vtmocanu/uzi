@@ -1071,8 +1071,8 @@ describe("round trip: the renderer's own output always parses ok", () => {
       renderRegion({ headSha: HEAD, targetBranch: "main" }).text,
       renderRegion({ sizeLine: SIZE, headSha: HEAD, targetBranch: "main" }, await mint(SANITIZED_HOSTILE)).text,
     ];
-    assert.ok(regions[3]!.includes("### What changed"), regions[3]);
-    assert.ok(regions[5]!.includes("### What changed"), regions[5]);
+    assert.ok(regions[3]!.includes("### What changed"), regions[3]!);
+    assert.ok(regions[5]!.includes("### What changed"), regions[5]!);
     for (const [kind, over] of kinds) {
       for (const completionScope of scopes) {
         for (const region of regions) {

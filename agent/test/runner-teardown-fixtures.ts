@@ -12,7 +12,7 @@ import type { CodexTransport } from "../src/codex/transport.js";
 export function uidScript(wrap: CommandWrapper, script: string, ...args: string[]): void {
   const command = wrap(process.execPath, ["-e", script, ...args]);
   const result = spawnSync(command.command, command.args, { env: { PATH: "/usr/bin:/bin" }, timeout: 10_000 });
-  assert.equal(result.status, 0, result.stderr?.toString() || result.error?.message);
+  assert.equal(result.status, 0, result.stderr?.toString() || result.error?.message || `fixture command exited ${result.status}`);
 }
 
 export async function runnerTeardownFixture(body: (root: string, victim: string, diagnostic: AdviceTeardownDiagnostic) => Promise<void>,

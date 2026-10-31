@@ -4,7 +4,7 @@ import { ensureWebStorage } from "./test-setup";
 
 // Node-independent regression test for issue #340: on Node >=26 the jsdom environment exposes
 // no `localStorage`, so a bare `localStorage.clear()` throws. We reproduce that "no Storage"
-// condition explicitly (rather than by Node version, since the repo pins Node 24 where jsdom
+// condition explicitly (rather than by Node version, so the test also holds on a Node where jsdom
 // provides one) and assert the setup guard installs a working in-memory store.
 
 const originalLocal = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
