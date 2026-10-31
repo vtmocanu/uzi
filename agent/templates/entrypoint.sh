@@ -666,10 +666,11 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
     # devbox/nix, the chat SDK CLI) use this HOME's dot state, so each dot entry (dir OR file,
     # e.g. .claude.json) is re-owned wholesale to runner. A symlink entry is skipped (`[ -L ]`
     # first; a dangling one also fails `[ -e ]`). A symlink NESTED inside a dot dir is not
-    # followed by the recursive chown on the current image: its /bin/chown is BusyBox v1.37.0
-    # on the digest-pinned node:26-alpine base (no coreutils), and a BusyBox v1.37.0 `chown -R`
+    # followed by the recursive chown on the current image: its /bin/chown is BusyBox (no
+    # coreutils). On the then-pinned node:24-alpine base, a BusyBox v1.37.0 `chown -R`
     # measured 2026-09-25 re-owned a nested dir- or file-symlink itself and left its target
-    # untouched. That is a measurement of this binary, not a claim about chown in general.
+    # untouched. That is a measurement of that binary, not a claim about chown in general; the
+    # node:26-alpine base is on the same Alpine 3.24 but was not re-measured.
     # A top-level HARDLINK (a regular file with nlink > 1, e.g. one planted to a repos/<r>.git
     # file) is skipped too, as is anything that is neither a directory nor a regular file (fifo,
     # socket, device): only a real dir or a single-link regular file is re-owned. A failed stat
