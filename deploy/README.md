@@ -980,8 +980,11 @@ and [design and implementation evidence](../prds/3430-pod-epoch-lock-shadow.md).
 
 **Runtime declaration is an operator attestation, not autodetection.**
 `workers.docker.podEpochReclaim.runtime` defaults to `""` (unset). The chart
-accepts exactly `containerd-runc` or `crio-crun` when set. Evaluation is on by
-default and keeping trees needs no declaration. Setting a value attests the
+accepts exactly `containerd-runc` or `crio-crun` when set. The pass runs by
+default, and keeping trees needs no declaration: with the value unset it keeps
+every tree, logs `deferred` / `runtime_not_declared` without waiting for evidence
+and reports no candidates, while still taking part in lifetime epoch locking.
+Candidate inventory needs a declared value. Setting a value attests the
 **full audited runtime/storage contract** below for the nodes eligible for these
 workers (a future hosted-Docker deletion under PRD #3431 will require it). The
 declaration does not verify versions or storage itself; the controller and worker
