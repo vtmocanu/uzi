@@ -84,7 +84,7 @@ jobs:
     if: |
       !cancelled() &&
       (github.event_name != 'pull_request' || needs.changes.outputs.amd64 == 'true')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 75
     strategy:
       fail-fast: false
@@ -150,7 +150,7 @@ jobs:
     if: |
       !cancelled() &&
       (github.event_name != 'pull_request' || needs.changes.outputs.arm64 == 'true')
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
@@ -186,7 +186,7 @@ jobs:
   report-failure:
     needs: [packaged-proof, arm64-package-exec]
     if: ${{ github.event_name == 'schedule' && failure() }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       issues: write
