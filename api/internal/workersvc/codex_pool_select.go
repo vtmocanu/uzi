@@ -10,11 +10,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/codexselect"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/usagereserve"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // codex_pool_select.go is the I/O half of Codex account auto-selection (issue #3719): it
@@ -98,7 +100,9 @@ func (s *Service) selectCodexPoolAlias(ctx context.Context, q *store.Queries, us
 		return codexPoolPick{}, fmt.Errorf("codex pool select: %w", err)
 	}
 	interval := s.p.CodexUsagePollInterval
-	vaultLocked := !s.codexVaultUnlocked(ctx, userID)
+	// Vault state is read on the create transaction (q), never through the pool: a second
+	// connection would wait on locks this transaction holds.
+	vaultLocked := !s.codexVaultUnlocked(vault.WithStateReader(ctx, q), userID)
 
 	cands := make([]codexselect.Candidate, 0, len(order))
 	for _, id := range order {
@@ -214,6 +218,12 @@ func (s *Service) fenceCodexPoolAlias(ctx context.Context, q *store.Queries, use
 	}
 }
 
+// codexPoolAccountUsable is the account-state half of structural usability: a present account
+// that is neither quarantined nor awaiting re-authentication.
+func codexPoolAccountUsable(coord pgtype.Text, reauth pgtype.Bool) bool {
+	return coord.Valid && coord.String != codexCoordQuarantined && reauth.Valid && !reauth.Bool
+}
+
 func codexPoolPickHolds(ctx context.Context, q *store.Queries, userID uuid.UUID, pick codexPoolPick) (bool, error) {
 	row, err := q.LockCodexPoolAliasForSelection(ctx, store.LockCodexPoolAliasForSelectionParams{ID: pick.AliasID, UserID: userID})
 	if err != nil {
@@ -222,9 +232,12 @@ func codexPoolPickHolds(ctx context.Context, q *store.Queries, userID uuid.UUID,
 		}
 		return false, fmt.Errorf("codex pool select: fence: %w", err)
 	}
+	// Quarantine and reauth are not covered by the shared secret-mutation lock (the refresher
+	// writes them without it), so they are re-read here, on the same statement as the lock.
 	return row.Kind == store.KindCodexAuth && row.AutoEligible && row.Enabled &&
 		row.Status.Valid && row.Status.String == codexStatusLinked &&
-		row.ProviderAccountID.Valid && uuid.UUID(row.ProviderAccountID.Bytes) == pick.AccountID, nil
+		row.ProviderAccountID.Valid && uuid.UUID(row.ProviderAccountID.Bytes) == pick.AccountID &&
+		codexPoolAccountUsable(row.CoordState, row.ReauthRequired), nil
 }
 
 // checkFrozenCodexAccount compares the run's frozen codex_account_key with the identity tuple

@@ -160,10 +160,14 @@ SELECT
     us.auto_eligible,
     (us.disabled_at IS NULL)::boolean AS enabled,
     cs.status,
-    cs.provider_account_id
+    cs.provider_account_id,
+    a.coord_state,
+    a.reauth_required
 FROM user_secrets us
 LEFT JOIN codex_credential_state cs
     ON cs.user_secret_id = us.id AND cs.user_id = us.user_id
+LEFT JOIN codex_provider_account a
+    ON a.id = cs.provider_account_id AND a.user_id = us.user_id
 WHERE us.id = $1 AND us.user_id = $2
 FOR SHARE OF us
 `
@@ -179,12 +183,16 @@ type LockCodexPoolAliasForSelectionRow struct {
 	Enabled           bool        `json:"enabled"`
 	Status            pgtype.Text `json:"status"`
 	ProviderAccountID pgtype.UUID `json:"provider_account_id"`
+	CoordState        pgtype.Text `json:"coord_state"`
+	ReauthRequired    pgtype.Bool `json:"reauth_required"`
 }
 
 // The consent and link fence of the selection path: a FOR SHARE lock on the chosen alias
 // row (the LockSecretForPromotion lock mode) that returns what the fence must re-validate
-// under it: the row's kind, its pool consent, whether it is enabled, and its account link.
-// pgx.ErrNoRows means no such alias for this owner.
+// under it: the row's kind, its pool consent, whether it is enabled, its account link, and
+// the account's coordination state and reauth flag (read only, no extra lock: the refresher
+// writes them outside the secret-mutation lock). pgx.ErrNoRows means no such alias for this
+// owner.
 func (q *Queries) LockCodexPoolAliasForSelection(ctx context.Context, arg LockCodexPoolAliasForSelectionParams) (LockCodexPoolAliasForSelectionRow, error) {
 	row := q.db.QueryRow(ctx, lockCodexPoolAliasForSelection, arg.ID, arg.UserID)
 	var i LockCodexPoolAliasForSelectionRow
@@ -194,6 +202,8 @@ func (q *Queries) LockCodexPoolAliasForSelection(ctx context.Context, arg LockCo
 		&i.Enabled,
 		&i.Status,
 		&i.ProviderAccountID,
+		&i.CoordState,
+		&i.ReauthRequired,
 	)
 	return i, err
 }

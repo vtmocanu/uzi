@@ -18,6 +18,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/codexselect"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/vault"
 )
 
 // codex_pool_select_livedb_test.go proves issue #3719's selection at run creation against a real
@@ -832,13 +833,15 @@ func (fx *poolFix) awaitWriter(name string, ch <-chan error) {
 	}
 }
 
-// waitBlocked waits until n advisory-lock requests are queued behind a holder.
+// waitBlocked waits until n requests for THIS user's secret-mutation advisory lock are queued
+// behind a holder (other users' and other lock classes' waiters do not count).
 func (fx *poolFix) waitBlocked(n int) {
 	fx.t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		var c int
-		if err := fx.aux.QueryRow(fx.env.ctx, `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`).Scan(&c); err != nil {
+		if err := fx.aux.QueryRow(fx.env.ctx, `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+			AND classid::bigint = ($1::bigint & 4294967295) AND objid::bigint = ($2::bigint & 4294967295)`, int64(store.SecretMutationLockClass), int64(store.SecretMutationLockObjID(fx.userID))).Scan(&c); err != nil {
 			fx.t.Fatal(err)
 		}
 		if c >= n {
@@ -847,6 +850,25 @@ func (fx *poolFix) waitBlocked(n int) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	fx.t.Fatalf("fewer than %d writers queued behind the create's shared lock", n)
+}
+
+// waitExclusiveHeld waits until some session holds THIS user's secret-mutation advisory lock in
+// exclusive mode.
+func (fx *poolFix) waitExclusiveHeld() {
+	fx.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var c int
+		if err := fx.aux.QueryRow(fx.env.ctx, `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND mode = 'ExclusiveLock'
+			AND classid::bigint = ($1::bigint & 4294967295) AND objid::bigint = ($2::bigint & 4294967295)`, int64(store.SecretMutationLockClass), int64(store.SecretMutationLockObjID(fx.userID))).Scan(&c); err != nil {
+			fx.t.Fatal(err)
+		}
+		if c > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	fx.t.Fatal("no writer took the exclusive secret-mutation lock")
 }
 
 // twoPooled is the common fixture: a default plus pooled accounts a (better) and b.
@@ -1092,5 +1114,98 @@ func TestCodexSelectLockScopeLiveDB(t *testing.T) {
 		}
 	case <-time.After(poolTestTimeout):
 		t.Fatal("pool create did not finish after the writer released")
+	}
+}
+
+// TestCodexSelectSharedLockBeforeInsertLiveDB pins the lock order: the create takes its shared
+// secret-mutation lock BEFORE the run INSERT. A real writer takes the exclusive lock first and
+// the users row (FOR UPDATE, as the credential writers do) second. If the create had already
+// INSERTed (users KEY SHARE through the foreign key) before waiting for the shared lock, the
+// two would deadlock (SQLSTATE 40P01).
+//
+// MUTATION: move the pooled lock-and-select block in createRunAtomic after insert(); the create
+// holds the users KEY SHARE while queued behind the writer, the writer's FOR UPDATE then waits
+// for it, and Postgres aborts one of them with 40P01.
+func TestCodexSelectSharedLockBeforeInsertLiveDB(t *testing.T) {
+	fx := newPoolFix(t)
+	a, _ := fx.twoPooled()
+	var writer <-chan error
+	fx.svc.codexSelectHook = func(context.Context) {
+		writer = fx.secretWriter(func(ctx context.Context, q *store.Queries) error {
+			// Hold the exclusive lock long enough for the create to reach (and queue on) its
+			// shared lock, then take the users row the way codexcred.go's writers do.
+			time.Sleep(500 * time.Millisecond)
+			_, err := q.LockUserVaultState(ctx, fx.userID)
+			return err
+		})
+		fx.waitExclusiveHeld()
+	}
+	got := fx.mustCreate()
+	assertBound(t, got, a.alias, codexselect.ReasonAuto)
+	fx.awaitWriter("lock-order writer", writer)
+}
+
+// TestCodexSelectVaultLockedLiveDB: with a real vault wired and the owner's protected vault
+// locked, selection reads the vault state on the create transaction (not through the pool),
+// treats every meter as not fresh, and binds by the pool_stale rule instead of failing.
+func TestCodexSelectVaultLockedLiveDB(t *testing.T) {
+	fx := newPoolFix(t)
+	a, b := fx.twoPooled() // a would win on headroom if its reading counted
+	vlt := vault.NewPostgres(fx.env.box, fx.env.pool)
+	fx.svc.SetVault(vlt)
+	enrollCodexProtectedVault(t, fx.env, vlt, fx.userID, codexVaultLockedTestPassword)
+	vlt.Lock(fx.userID)
+	if vlt.Unlocked(fx.userID) {
+		t.Fatal("vault still unlocked after Lock")
+	}
+	lo, _ := lowerAccount(a, b)
+	assertBound(t, fx.mustCreate(), lo.alias, codexselect.ReasonPoolStale)
+}
+
+// markUnusableBeforeFence runs update on the picked alias's account after the pick and the run
+// INSERT, the way the refresher does: a plain autocommit write that takes no secret-mutation lock.
+func (fx *poolFix) markUnusableBeforeFence(update string) {
+	fx.svc.codexSelectBeforeFenceHook = func(_ context.Context, picked uuid.UUID) {
+		fx.env.exec(update, fx.accountOf(picked))
+	}
+}
+
+// TestCodexSelectFenceDropsUnusableAccountLiveDB: an account that is quarantined or flagged
+// reauth_required between the pick and the fence is dropped; a healthy sibling is bound, or the
+// create is refused with the pool error (and no run) when none remains.
+//
+// MUTATION: delete the codexPoolAccountUsable term from codexPoolPickHolds; the unusable pick
+// is bound and every case here fails.
+func TestCodexSelectFenceDropsUnusableAccountLiveDB(t *testing.T) {
+	for name, update := range map[string]string{
+		"quarantined":     `UPDATE codex_provider_account SET coord_state = 'quarantined' WHERE id = $1`,
+		"reauth required": `UPDATE codex_provider_account SET reauth_required = true, reauth_generation = 1, reauth_credential_revision = 1 WHERE id = $1`,
+	} {
+		t.Run(name+"/healthy sibling", func(t *testing.T) {
+			fx := newPoolFix(t)
+			_, b := fx.twoPooled() // a is picked first and poisoned; b is healthy
+			fx.markUnusableBeforeFence(update)
+			got := fx.mustCreate()
+			assertBound(t, got, b.alias, codexselect.ReasonAuto)
+			if got.CodexAccountKey.String != accountKeyOf(fx, b) {
+				t.Fatalf("frozen account key %q, want b's %q", got.CodexAccountKey.String, accountKeyOf(fx, b))
+			}
+		})
+		t.Run(name+"/none left", func(t *testing.T) {
+			fx := newPoolFix(t)
+			def := fx.newAccount("def")
+			fx.makeDefault(def.alias)
+			a := fx.newAccount("a")
+			fx.pool(a.alias)
+			fx.reading(a, 10)
+			fx.mode("auto")
+			fx.markUnusableBeforeFence(update)
+			if _, err := fx.create(); !errors.Is(err, ErrCodexPoolUnavailable) {
+				t.Fatalf("err = %v, want ErrCodexPoolUnavailable", err)
+			}
+			if fx.runs() != 0 {
+				t.Fatalf("runs = %d, want 0", fx.runs())
+			}
+		})
 	}
 }

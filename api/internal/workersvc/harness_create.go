@@ -40,8 +40,8 @@ var (
 	// credential_disabled skip and the handler names Settings in the refusal.
 	ErrHarnessCredentialDisabled = errHarnessCredentialDisabled
 	// ErrCodexPoolUnavailable is the exported alias of errCodexPoolUnavailable (issue #3719): an
-	// explicit Codex harness for a user in codex_account_mode 'auto' whose configured pool has no
-	// bindable alias. It wraps ErrNoCredentialForHarness (still refused, never a fallback); the
+	// explicit Codex harness, or a pooled pick that fails under the lock, for a user in
+	// codex_account_mode 'auto' whose configured pool has no bindable alias. It wraps ErrNoCredentialForHarness (still refused, never a fallback); the
 	// scheduler maps it to the codex_pool_unavailable skip and the handlers add the typed reason.
 	ErrCodexPoolUnavailable = errCodexPoolUnavailable
 )

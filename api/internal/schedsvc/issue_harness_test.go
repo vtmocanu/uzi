@@ -63,6 +63,9 @@ func TestLabelSweepContinuesPerCandidate(t *testing.T) {
 				{"conflict", []string{"harness::codex"}, "claude", nil, SkipReason("harness_label_conflict")},
 				{"disabled", []string{"harness::codex"}, "", workersvc.ErrHarnessCredentialDisabled, SkipCredentialDisabled},
 				{"missing", []string{"harness::codex"}, "", workersvc.ErrNoCredentialForHarness, SkipNoUsableCredential},
+				// Issue #3719. MUTATION: delete the ErrCodexPoolUnavailable arm in createIssueRun's
+				// label-sweep switch; the error then maps to no_usable_credential and this fails.
+				{"pool unavailable", []string{"harness::codex"}, "", workersvc.ErrCodexPoolUnavailable, SkipCodexPoolUnavailable},
 				{"unusable", []string{"harness::codex"}, "", workersvc.ErrNoUsableCredential, SkipNoUsableCredential},
 			} {
 				t.Run(timing+"/"+tc.name+map[bool]string{true: "/auto", false: "/manual"}[auto], func(t *testing.T) {
