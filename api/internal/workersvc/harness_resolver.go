@@ -91,7 +91,8 @@ var (
 	// skip rather than a hard, non-advancing refusal.
 	errHarnessCredentialDisabled = fmt.Errorf("%w: the selected harness's credentials are all disabled; enable one in Settings", errNoCredentialForHarness)
 
-	// errCodexPoolUnavailable is errNoCredentialForHarness for an EXPLICIT Codex harness whose
+	// errCodexPoolUnavailable is errNoCredentialForHarness for an explicit Codex harness, or a
+	// pooled pick that fails under the lock, whose
 	// user runs codex_account_mode 'auto' with a configured pool in which no alias can be bound
 	// (every pooled alias is unlinked, quarantined or needs re-authentication; issue #3719). It
 	// WRAPS errNoCredentialForHarness, so every consumer keying on that keeps refusing the
@@ -492,8 +493,7 @@ func codexPoolRowStructural(r store.ListCodexPoolAliasesRow) bool {
 	return r.Enabled &&
 		r.LinkStatus.Valid && r.LinkStatus.String == codexStatusLinked &&
 		r.ProviderAccountID.Valid && r.ProviderUserID.Valid && r.WorkspaceAccountID.Valid &&
-		r.CoordState.Valid && r.CoordState.String != codexCoordQuarantined &&
-		r.ReauthRequired.Valid && !r.ReauthRequired.Bool
+		codexPoolAccountUsable(r.CoordState, r.ReauthRequired)
 }
 
 // resolveDefaultCodexCredential is the PRD #1332 D4 default-credential rule.
@@ -631,8 +631,11 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 
 	// Issue #3719: a pool choice picks its alias HERE, under the user's shared secret-mutation
 	// lock and BEFORE the run INSERT, so no run row is held while the lock is taken (the lock
-	// order migrate.go's LockSecretMutation documents). The pool rows and account links cannot
-	// change between the pick and the commit.
+	// order migrate.go's LockSecretMutation documents). The shared lock fences exactly what
+	// every credential writer takes the exclusive lock for: pool consent, enablement and the
+	// account link. Quarantine and reauth_required are written by the refresher without that
+	// lock, so the alias fence re-reads them (codexPoolPickHolds) and drops a pick that
+	// turned unusable.
 	var pick codexPoolPick
 	pooled := res.Harness == HarnessCodex && res.Codex != nil && res.Codex.Select == codexChoicePool
 	if pooled {

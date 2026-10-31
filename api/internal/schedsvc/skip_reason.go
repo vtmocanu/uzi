@@ -110,7 +110,7 @@ const (
 	SkipCredentialDisabled SkipReason = "credential_disabled" //nolint:gosec // G101: a schedule-skip-reason VOCABULARY value, not a credential (see SkipNoUsableCredential).
 
 	// SkipCodexPoolUnavailable ← workersvc.ErrCodexPoolUnavailable (issue #3719): the schedule
-	// pins the Codex harness, the owner runs codex_account_mode 'auto' with a configured pool, and
+	// pins an explicit Codex harness (or a pooled pick fails under the lock), the owner runs codex_account_mode 'auto' with a configured pool, and
 	// no pooled alias can be bound (every one is unlinked, quarantined or needs
 	// re-authentication). Handled exactly like SkipCredentialDisabled: the fire starts no run and
 	// never falls back to Claude, a recurring row advances and re-fires next cadence, and a
