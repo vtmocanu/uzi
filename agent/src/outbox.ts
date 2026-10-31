@@ -918,14 +918,30 @@ export class Outbox {
   // Runtime counterpart of the boot rank 1: an enrolled unknown entry whose own file was read
   // and rejected (MAC failure or malformed). Anything else (oversized, unreadable, never read)
   // is uncertain and is never displaced by a later authenticated alias.
-  private readonly rejectedUnknownEvidence = new WeakMap<TerminalMeta, { macBinding?: Readonly<TerminalMACBinding>; sourceBinding?: Readonly<TerminalSourceBinding> }>();
+  // The evidence is bound to the observed file lifetime and dropped by any later read of the
+  // entry's own file that is not a rejection.
+  private readonly rejectedUnknownEvidence = new WeakMap<TerminalMeta, { lifetime: string; macBinding?: Readonly<TerminalMACBinding>; sourceBinding?: Readonly<TerminalSourceBinding> }>();
 
   private noteRejectedUnknown(meta: TerminalMeta | undefined, observation: TerminalAuthenticationObservation): void {
-    if (!meta || meta.outcomeKind !== "unknown" || meta.fileName !== observation.fileName ||
-        (observation.kind !== "mac_failure" && observation.kind !== "malformed")) return;
+    if (!meta || meta.outcomeKind !== "unknown" || meta.fileName !== observation.fileName) return;
+    const sourceBinding = this.physicalSourceBindings.get(observation);
+    if ((observation.kind !== "mac_failure" && observation.kind !== "malformed") || !sourceBinding) {
+      this.rejectedUnknownEvidence.delete(meta);
+      return;
+    }
     this.rejectedUnknownEvidence.set(meta, observation.kind === "mac_failure"
-      ? { macBinding: this.copyMACBinding(observation) }
-      : { sourceBinding: this.physicalSourceBindings.get(observation) });
+      ? { lifetime: sourceBinding.lifetime, macBinding: this.copyMACBinding(observation) }
+      : { lifetime: sourceBinding.lifetime, sourceBinding });
+  }
+
+  /** Drops evidence about a file that has since been replaced or removed. */
+  private async rejectedEvidenceCurrent(runId: string, meta: TerminalMeta): Promise<boolean> {
+    const evidence = this.rejectedUnknownEvidence.get(meta);
+    if (!evidence) return false;
+    const stat = await fs.lstat(path.join(this.runDir(runId), meta.fileName), { bigint: true }).catch(() => undefined);
+    if (stat && fileLifetime(stat) === evidence.lifetime) return true;
+    this.rejectedUnknownEvidence.delete(meta);
+    return false;
   }
 
   /** Runtime scan only: a rejected unknown entry must not shadow an authenticated alias of the same
@@ -3602,6 +3618,8 @@ export class Outbox {
               const meta = generation === undefined ? undefined : this.runs.get(this.terminalScanRun.id)?.terminals.get(generation);
               if (meta?.outcomeKind === "unknown" && result.observation.kind !== "unreadable" && result.observation.kind !== "key_unavailable") meta.budgetDeferred = false;
               this.noteRejectedUnknown(meta, result.observation);
+              const own = result.record && generation !== undefined ? this.runs.get(runId)?.terminals.get(generation) : undefined;
+              if (own && own.fileName !== entry.name) await this.rejectedEvidenceCurrent(runId, own);
               const displaced = !!(token && scope && generation !== undefined && result.record &&
                 this.displaceRejectedUnknown(runId, generation, result.record, entry.name, bytes, token, scope));
               if (token && result.record && !displaced && result.record.outcome_kind !== "policy_hold")
