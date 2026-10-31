@@ -1,6 +1,6 @@
 # PRD #3708: Plan cross-check before the human plan gate
 
-**Status**: Draft
+**Status**: In progress (2026-10-31). M1 delivered in committed code; M2 in progress (capability advertisement and the Codex-lead path land with unit U5); M3 live acceptance pending. Delivered checklist under Milestones.
 **Umbrella**: #3165 (deeper, observable cross-check).
 **Priority**: Normal
 **Revisits**: PRD #2149's out-of-scope line "Human-gated runs" (deferred there; no Decision Log entry rejected it). It keeps unchanged ADR-2149's and PRD #2149 D16's contract that a human revision triggers no fresh checker pass (ADR-2149, "Consistent with D16, a human revision of the plan triggers no new cross-family checker pass").
@@ -67,6 +67,26 @@ Enrollment snapshot, version matrix, gated check path, identity and recovery, se
 ### M2: A Codex lead's gated plan is cross-checked on Claude; the capability is advertised
 Blocked by: M1.
 The Codex-lead direction with a Claude checker (`cross_check_codex_lead_v1`), the unsupported-worker path, family and capability parity tests, then advertise the new capability. Acceptance example 3.
+
+### Delivered checklist (2026-10-31)
+
+Ticked only where committed code and its tests back the item; the full agent suite is proven by exact-head PR CI, not by this list.
+
+M1:
+- [x] Enrollment snapshot: `runs.plan_cross_check_gated` (migrations 00387/00388), required predicate unchanged, INSERT parity for `CreateRun`, `ci_fix` and schedule inserts.
+- [x] Server backstop: bound human-approval arms widened, `SetRunAutopilotPlan` refuses gated runs, digest-bound "passed", trigger `enforce_gated_plan_approval`.
+- [x] Gated check path in the agent (`gated_pass`; every outcome ends at the human gate) and gated recovery rules.
+- [x] Server-recorded `worker_unsupported` for a worker without the capability, and the four-way version matrix.
+- [x] Presentation: web run page, CLI `PLAN_CHECK_MODE`/`ROUNDS`/`DEADLINE`/`ROUND_<n>_*` rows, one Slack line, per-round lead responses (`ExtractCrossCheckDispositions`).
+- [x] Rollback guard in both Downs and `scripts/gated-cross-check-drain-check.sql`, with the operator procedure in `docs/cross-check.md`.
+- [x] Docs (`docs/cross-check.md`, `docs/cli.md`, `docs/configuration.md`, `deploy/README.md`, `ARCHITECTURE.md`, ADR-2149 amendment, `specs/human.md`) and the changelog fragment.
+
+M2:
+- [x] Codex-lead direction in the gated path (Claude checker, reusing `cross_check_codex_lead_v1`) with family and capability parity tests (`agent/test/gated-plan-cross-check-codex-lead.test.ts`).
+- [x] Capability `cross_check_gated_v1` advertised by the worker (`agent/src/worker.ts`, pinned in `agent/test/worker.test.ts`).
+
+M3 (informative, human/live; the worker cannot perform it):
+- [ ] Live Kubernetes acceptance of the wait before the first gate and a rollback rehearsal of the drain procedure on a hosted deployment. Owner action; steps are in `docs/cross-check.md`.
 
 ## Decision Log
 

@@ -814,6 +814,30 @@ scope through [PRD #2150](prds/done/2150-plan-cross-check-auto-revise.md) and
 [ADR-2149's dated extension](adr/2149-cross-check.md#automatic-rounds-extension-2026-10-07-2150);
 local round/recovery proofs do not establish hosted authenticated model acceptance.
 
+**Checked before the human gate (PRD #3708).** A run that is not auto-approved
+snapshots a second mode at INSERT, `runs.plan_cross_check_gated` (owner consent,
+non-seeded, kinds `issue`, `prompt` and `ci_fix`, no isolated lane); it is
+mutually exclusive with the required mode (CHECK `runs_plan_cross_check_mode_check`,
+migrations 00387/00388). It reuses the checked-plan machinery (`cross_checks`
+rows, rounds, budget, deadlines, lane, wait banking), but every checker outcome,
+APPROVE included, presents the ordinary human gate: the agent's gated path
+returns `gated_pass`, never an approval grant. Approval authority stays with the
+bound human-approval arms of `SetRunRunning`, widened from required to required
+or gated; `SetRunAutopilotPlan` refuses a gated run; and the trigger
+`enforce_gated_plan_approval` refuses `awaiting_approval` to `running` without a
+current bound approve input, under any api binary. `SetRunAwaitingApproval`
+binds a "passed" verdict to the candidate digest and derives `interrupted` on a
+mismatch. The capability `cross_check_gated_v1` gates the mode: a gated claim
+carries `plan_cross_check_gated` only for a worker advertising it, and the
+server itself records `worker_unsupported` for one that does not (an old worker
+cannot report a new outcome). Rounds are served to clients with the lead's
+response taken from the next candidate's "Cross-check dispositions" section
+(`ExtractCrossCheckDispositions`, 8 KiB), never inferred as resolved. Rollback
+needs the drain guard in `scripts/gated-cross-check-drain-check.sql`, repeated in
+both migrations' Down. See [Cross-check](docs/cross-check.md#checked-before-your-review),
+[PRD #3708](prds/3708-gated-plan-cross-check.md) and the
+[ADR-2149 amendment](adr/2149-cross-check.md#amendment-2026-10-31-3708).
+
 Plan checker pins live in `user_cross_check_pins`, keyed by owner, stage and
 family. Model and effort resolve independently from a claim-time statement
 snapshot; delivery and recording reuse that snapshot, including independent
