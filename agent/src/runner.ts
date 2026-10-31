@@ -11357,8 +11357,9 @@ export class RunRunner {
     // by the uncertified paths below: its source is retired through the coordinator's certified chain (or kept).
     const readFence = async () => {
       try {
-        const result = await this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath,
-          this.retainedLifecycleSignal(flight));
+        const signal = this.retainedLifecycleSignal(flight);
+        const result = await this.git.withRecoveryOperation(signal, Infinity, scopeSignal =>
+          this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath, scopeSignal));
         this.retainedLifecycleGuard(flight);
         return result;
       } catch (error) {
@@ -11376,8 +11377,7 @@ export class RunRunner {
         const signal = this.retainedLifecycleSignal(flight);
         const read = (scopeSignal: AbortSignal) =>
           this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath, scopeSignal);
-        const result = handoffDeadline === undefined ? await read(signal)
-          : await this.git.withRecoveryOperation(signal, handoffDeadline, read);
+        const result = await this.git.withRecoveryOperation(signal, handoffDeadline ?? Infinity, read);
         this.retainedLifecycleGuard(flight);
         return result;
       } catch {
