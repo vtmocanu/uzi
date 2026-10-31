@@ -1,5 +1,7 @@
 -- +goose Up
 
+SET LOCAL lock_timeout = '5s';
+
 -- Validate the three CHECKs added NOT VALID in 00387 (issue #3719). VALIDATE CONSTRAINT
 -- scans each table but takes only a SHARE UPDATE EXCLUSIVE lock (write-compatible), unlike
 -- the ACCESS EXCLUSIVE lock an inline validated ADD CONSTRAINT would hold. Split from 00387
@@ -13,6 +15,8 @@ ALTER TABLE runs VALIDATE CONSTRAINT runs_codex_select_reason_check;
 ALTER TABLE user_secrets VALIDATE CONSTRAINT user_secrets_auto_eligible_kind_check;
 
 -- +goose Down
+
+SET LOCAL lock_timeout = '5s';
 
 -- There is no VALIDATE inverse, so restore the pre-00388 state (each constraint present
 -- but NOT VALID) by dropping and re-adding it NOT VALID. The bodies match 00387's Up

@@ -167,7 +167,7 @@ func utilPct(score float64) int16 {
 }
 
 // releaseLess orders pool_exhausted candidates: a known release time beats an unknown one,
-// the earlier known time wins, and the lowest account key breaks the rest.
+// the earlier known time wins, and the lowest account key, then the lowest alias id, breaks the rest.
 func releaseLess(a, b Candidate) bool {
 	ak := a.ReleaseKnown && a.ReleaseAt != nil
 	bk := b.ReleaseKnown && b.ReleaseAt != nil
@@ -177,5 +177,8 @@ func releaseLess(a, b Candidate) bool {
 	case ak && !a.ReleaseAt.Equal(*b.ReleaseAt):
 		return a.ReleaseAt.Before(*b.ReleaseAt)
 	}
-	return bytes.Compare(a.AccountKey[:], b.AccountKey[:]) < 0
+	if c := bytes.Compare(a.AccountKey[:], b.AccountKey[:]); c != 0 {
+		return c < 0
+	}
+	return bytes.Compare(a.AliasID[:], b.AliasID[:]) < 0
 }
