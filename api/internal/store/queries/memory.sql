@@ -201,3 +201,54 @@ WHERE runs.id = @id AND runs.user_id = @user_id
         AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
   ))
 RETURNING runs.id, runs.user_id, runs.status;
+
+-- name: InsertMemoryParkRelease :one
+-- Issue #3639: written in the park transaction, right after ParkWorkerMemoryPressure, from the
+-- just-parked row. DO NOTHING keeps an existing row for the same (run, generation) untouched;
+-- zero rows is an invariant failure the caller rolls back.
+INSERT INTO memory_park_releases
+(run_id, claim_generation, memory_episode, worker_id, register_nonce, released_at)
+SELECT id, claim_generation, memory_episode, released_worker_id, released_worker_nonce, claim_released_at
+FROM runs
+WHERE id = @id AND released_worker_id IS NOT NULL AND released_worker_nonce IS NOT NULL
+  AND claim_released_at IS NOT NULL AND claim_generation > 0
+ON CONFLICT DO NOTHING
+RETURNING run_id;
+
+-- name: GetMemoryParkReleaseForUpdate :one
+SELECT * FROM memory_park_releases WHERE run_id = @run_id AND claim_generation = @claim_generation
+FOR UPDATE;
+
+-- name: SettleMemoryParkRelease :execrows
+-- Write-once: a stored receipt is never replaced.
+UPDATE memory_park_releases SET settlement = @settlement, settlement_sha256 = @settlement_sha256,
+    settled_at = now()
+WHERE run_id = @run_id AND claim_generation = @claim_generation AND settlement IS NULL;
+
+-- name: LiftSettledMemoryPark :execrows
+-- Issue #3639: after ResumeMemoryEpisode (same transaction) lifts the D19 released-pair exclusion
+-- for exactly that park, and only when its settlement receipt is stored. Zero rows is not an error.
+WITH lifted AS (
+    UPDATE memory_park_releases rel SET lifted_at = now()
+    FROM runs r
+    WHERE r.id = @id AND r.user_id = @user_id AND r.status = 'queued' AND r.recovery_wait_cause IS NULL
+      AND rel.run_id = r.id AND rel.claim_generation = r.claim_generation
+      AND rel.memory_episode = r.memory_episode - 1
+      AND rel.worker_id = r.released_worker_id AND rel.register_nonce = r.released_worker_nonce
+      AND rel.released_at = r.claim_released_at
+      AND rel.settlement IS NOT NULL AND rel.lifted_at IS NULL
+    RETURNING rel.run_id
+)
+UPDATE runs SET released_worker_id = NULL, released_worker_nonce = NULL
+WHERE id IN (SELECT run_id FROM lifted);
+
+-- name: GetLatestMemoryParkRelease :one
+-- The newest release row of a run (highest claim generation), for the claim reference.
+SELECT * FROM memory_park_releases WHERE run_id = @run_id
+ORDER BY claim_generation DESC LIMIT 1
+FOR UPDATE;
+
+-- name: SupersedeMemoryParkRelease :execrows
+UPDATE memory_park_releases SET superseded_at = now()
+WHERE run_id = @run_id AND claim_generation = @claim_generation
+  AND lifted_at IS NOT NULL AND superseded_at IS NULL;

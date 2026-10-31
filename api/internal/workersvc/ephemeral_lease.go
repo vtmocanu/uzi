@@ -165,7 +165,20 @@ func (s *Service) probeLeaseClaim(admitted, rebound bool) {
 // claim then returns an error (a 500; the agent's next claim poll retries) or provisionOne errors
 // (the next provisioning pass retries). Neither corrupts state, and there is no retry here. A lease-off service, a non-ephemeral worker or an unleased one passes the
 // no-lease params (NULL columns), where ClaimRun's lease arm admits nothing.
-func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Queries, workerID uuid.UUID, reread store.Worker, params store.ClaimRunParams, report MemoryAuthorityReport) (store.Run, bool, error) {
+func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Queries, workerID uuid.UUID, reread store.Worker, params store.ClaimRunParams, report MemoryAuthorityReport) (store.Run, *MemoryParkReference, bool, error) {
+	run, claimed, err := s.claimRunInTxCore(ctx, tx, qtx, workerID, reread, params, report)
+	if err != nil || !claimed {
+		return run, nil, claimed, err
+	}
+	// Issue #3639: built in the claim transaction, so a read error fails (and rolls back) the claim.
+	ref, err := s.memoryParkClaimReference(ctx, qtx, reread, run)
+	if err != nil {
+		return store.Run{}, nil, false, err
+	}
+	return run, ref, true, nil
+}
+
+func (s *Service) claimRunInTxCore(ctx context.Context, tx pgx.Tx, qtx *store.Queries, workerID uuid.UUID, reread store.Worker, params store.ClaimRunParams, report MemoryAuthorityReport) (store.Run, bool, error) {
 	params.ClaimantDraining = !store.WorkerAcceptsNewIntake(reread)
 	if reread.MaintenanceFenced {
 		return store.Run{}, false, nil
@@ -279,7 +292,7 @@ func (s *Service) claimRunLeasedNoSnapshot(ctx context.Context, wkr store.Worker
 	if err != nil {
 		return nil, err
 	}
-	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, locked, params, report)
+	run, ref, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, locked, params, report)
 	if err != nil {
 		return nil, err
 	}
@@ -290,5 +303,5 @@ func (s *Service) claimRunLeasedNoSnapshot(ctx context.Context, wkr store.Worker
 	if !claimed {
 		return nil, nil // idle
 	}
-	return s.assembleAndFinishRunClaim(ctx, locked, run, params.RecoveryCapable)
+	return s.assembleAndFinishRunClaimRef(ctx, locked, run, params.RecoveryCapable, ref)
 }

@@ -9715,7 +9715,17 @@ SELECT id, runs.user_id, status, auto_approve,
         AND NOT fn_run_admitted_during_intake_pause(runs))::boolean AS intake_pause_held,
        -- PRD #3522 M3: the weekly-reserve hold marker of a queued run ('' otherwise; sqlc types a
        -- COALESCE column non-null); healthTargetFor reports it right after maintenance.
-       COALESCE(CASE WHEN status = 'queued' THEN reserve_hold_reason END, '')::text AS reserve_hold_reason
+       COALESCE(CASE WHEN status = 'queued' THEN reserve_hold_reason END, '')::text AS reserve_hold_reason,
+       -- Issue #3639: the released incarnation was recorded by a memory-pressure park (the release row
+       -- matches the run's CURRENT released pair and release time), so the queued arm names that cause
+       -- instead of the wall park's. A wall park after a memory park advances claim_released_at or
+       -- the generation, which makes the row stale and this false.
+       (runs.released_worker_id IS NOT NULL AND EXISTS (
+           SELECT 1 FROM memory_park_releases rel
+           WHERE rel.run_id = runs.id AND rel.claim_generation = runs.claim_generation
+             AND rel.worker_id = runs.released_worker_id
+             AND rel.register_nonce = runs.released_worker_nonce
+             AND rel.released_at = runs.claim_released_at))::boolean AS released_by_memory_park
 FROM runs
 LEFT JOIN codex_active_run_cooldown cooldown ON cooldown.run_id = runs.id
 LEFT JOIN codex_queued_run_admission admission
@@ -9769,6 +9779,7 @@ type ListActiveRunsForHealthRow struct {
 	CodexAccountGated         bool               `json:"codex_account_gated"`
 	IntakePauseHeld           bool               `json:"intake_pause_held"`
 	ReserveHoldReason         string             `json:"reserve_hold_reason"`
+	ReleasedByMemoryPark      bool               `json:"released_by_memory_park"`
 }
 
 // Run health detector (PRD #47) ----------------------------------------------
@@ -9891,6 +9902,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.CodexAccountGated,
 			&i.IntakePauseHeld,
 			&i.ReserveHoldReason,
+			&i.ReleasedByMemoryPark,
 		); err != nil {
 			return nil, err
 		}

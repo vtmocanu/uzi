@@ -436,6 +436,33 @@ func (q *Queries) FreezeMemoryPolicy(ctx context.Context, arg FreezeMemoryPolicy
 	return i, err
 }
 
+const getLatestMemoryParkRelease = `-- name: GetLatestMemoryParkRelease :one
+SELECT run_id, claim_generation, memory_episode, worker_id, register_nonce, released_at, settlement, settlement_sha256, settled_at, lifted_at, superseded_at, created_at FROM memory_park_releases WHERE run_id = $1
+ORDER BY claim_generation DESC LIMIT 1
+FOR UPDATE
+`
+
+// The newest release row of a run (highest claim generation), for the claim reference.
+func (q *Queries) GetLatestMemoryParkRelease(ctx context.Context, runID uuid.UUID) (MemoryParkRelease, error) {
+	row := q.db.QueryRow(ctx, getLatestMemoryParkRelease, runID)
+	var i MemoryParkRelease
+	err := row.Scan(
+		&i.RunID,
+		&i.ClaimGeneration,
+		&i.MemoryEpisode,
+		&i.WorkerID,
+		&i.RegisterNonce,
+		&i.ReleasedAt,
+		&i.Settlement,
+		&i.SettlementSha256,
+		&i.SettledAt,
+		&i.LiftedAt,
+		&i.SupersededAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getMemoryIntervention = `-- name: GetMemoryIntervention :one
 SELECT intervention_id, run_id, user_id, worker_id, register_nonce, claim_generation, memory_episode, admitted, allowance_used, policy, outcome, reserved_at, outcome_at FROM memory_interventions WHERE intervention_id = $1
 `
@@ -457,6 +484,36 @@ func (q *Queries) GetMemoryIntervention(ctx context.Context, interventionID uuid
 		&i.Outcome,
 		&i.ReservedAt,
 		&i.OutcomeAt,
+	)
+	return i, err
+}
+
+const getMemoryParkReleaseForUpdate = `-- name: GetMemoryParkReleaseForUpdate :one
+SELECT run_id, claim_generation, memory_episode, worker_id, register_nonce, released_at, settlement, settlement_sha256, settled_at, lifted_at, superseded_at, created_at FROM memory_park_releases WHERE run_id = $1 AND claim_generation = $2
+FOR UPDATE
+`
+
+type GetMemoryParkReleaseForUpdateParams struct {
+	RunID           uuid.UUID `json:"run_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+func (q *Queries) GetMemoryParkReleaseForUpdate(ctx context.Context, arg GetMemoryParkReleaseForUpdateParams) (MemoryParkRelease, error) {
+	row := q.db.QueryRow(ctx, getMemoryParkReleaseForUpdate, arg.RunID, arg.ClaimGeneration)
+	var i MemoryParkRelease
+	err := row.Scan(
+		&i.RunID,
+		&i.ClaimGeneration,
+		&i.MemoryEpisode,
+		&i.WorkerID,
+		&i.RegisterNonce,
+		&i.ReleasedAt,
+		&i.Settlement,
+		&i.SettlementSha256,
+		&i.SettledAt,
+		&i.LiftedAt,
+		&i.SupersededAt,
+		&i.CreatedAt,
 	)
 	return i, err
 }
@@ -736,6 +793,58 @@ func (q *Queries) InsertMemoryIntervention(ctx context.Context, arg InsertMemory
 		arg.AllowanceUsed,
 		arg.Policy,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const insertMemoryParkRelease = `-- name: InsertMemoryParkRelease :one
+INSERT INTO memory_park_releases
+(run_id, claim_generation, memory_episode, worker_id, register_nonce, released_at)
+SELECT id, claim_generation, memory_episode, released_worker_id, released_worker_nonce, claim_released_at
+FROM runs
+WHERE id = $1 AND released_worker_id IS NOT NULL AND released_worker_nonce IS NOT NULL
+  AND claim_released_at IS NOT NULL AND claim_generation > 0
+ON CONFLICT DO NOTHING
+RETURNING run_id
+`
+
+// Issue #3639: written in the park transaction, right after ParkWorkerMemoryPressure, from the
+// just-parked row. DO NOTHING keeps an existing row for the same (run, generation) untouched;
+// zero rows is an invariant failure the caller rolls back.
+func (q *Queries) InsertMemoryParkRelease(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertMemoryParkRelease, id)
+	var run_id uuid.UUID
+	err := row.Scan(&run_id)
+	return run_id, err
+}
+
+const liftSettledMemoryPark = `-- name: LiftSettledMemoryPark :execrows
+WITH lifted AS (
+    UPDATE memory_park_releases rel SET lifted_at = now()
+    FROM runs r
+    WHERE r.id = $1 AND r.user_id = $2 AND r.status = 'queued' AND r.recovery_wait_cause IS NULL
+      AND rel.run_id = r.id AND rel.claim_generation = r.claim_generation
+      AND rel.memory_episode = r.memory_episode - 1
+      AND rel.worker_id = r.released_worker_id AND rel.register_nonce = r.released_worker_nonce
+      AND rel.released_at = r.claim_released_at
+      AND rel.settlement IS NOT NULL AND rel.lifted_at IS NULL
+    RETURNING rel.run_id
+)
+UPDATE runs SET released_worker_id = NULL, released_worker_nonce = NULL
+WHERE id IN (SELECT run_id FROM lifted)
+`
+
+type LiftSettledMemoryParkParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Issue #3639: after ResumeMemoryEpisode (same transaction) lifts the D19 released-pair exclusion
+// for exactly that park, and only when its settlement receipt is stored. Zero rows is not an error.
+func (q *Queries) LiftSettledMemoryPark(ctx context.Context, arg LiftSettledMemoryParkParams) (int64, error) {
+	result, err := q.db.Exec(ctx, liftSettledMemoryPark, arg.ID, arg.UserID)
 	if err != nil {
 		return 0, err
 	}
@@ -1171,4 +1280,50 @@ func (q *Queries) ResumeMemoryEpisode(ctx context.Context, arg ResumeMemoryEpiso
 	var i ResumeMemoryEpisodeRow
 	err := row.Scan(&i.ID, &i.UserID, &i.Status)
 	return i, err
+}
+
+const settleMemoryParkRelease = `-- name: SettleMemoryParkRelease :execrows
+UPDATE memory_park_releases SET settlement = $1, settlement_sha256 = $2,
+    settled_at = now()
+WHERE run_id = $3 AND claim_generation = $4 AND settlement IS NULL
+`
+
+type SettleMemoryParkReleaseParams struct {
+	Settlement       []byte    `json:"settlement"`
+	SettlementSha256 []byte    `json:"settlement_sha256"`
+	RunID            uuid.UUID `json:"run_id"`
+	ClaimGeneration  int64     `json:"claim_generation"`
+}
+
+// Write-once: a stored receipt is never replaced.
+func (q *Queries) SettleMemoryParkRelease(ctx context.Context, arg SettleMemoryParkReleaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, settleMemoryParkRelease,
+		arg.Settlement,
+		arg.SettlementSha256,
+		arg.RunID,
+		arg.ClaimGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const supersedeMemoryParkRelease = `-- name: SupersedeMemoryParkRelease :execrows
+UPDATE memory_park_releases SET superseded_at = now()
+WHERE run_id = $1 AND claim_generation = $2
+  AND lifted_at IS NOT NULL AND superseded_at IS NULL
+`
+
+type SupersedeMemoryParkReleaseParams struct {
+	RunID           uuid.UUID `json:"run_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+func (q *Queries) SupersedeMemoryParkRelease(ctx context.Context, arg SupersedeMemoryParkReleaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, supersedeMemoryParkRelease, arg.RunID, arg.ClaimGeneration)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

@@ -412,6 +412,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		{"completion_semantic_publication_v1"}, // PRD #1230 D4: independent of completion_non_closing_v1; advertises the semantic coverage park report
 		{"dind_maintenance_v1"},
 		{"worker_memory_pressure_v1"},
+		{"memory_park_settlement_v1"},        // issue #3639: this api accepts the memory-park settlement receipt and answers the claim body's memory_park_reference
 		{"worker_memory_authority_claim_v1"}, // issue #3142: this api accepts the run-lane claim body's memory_authority member
 		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1"}, // PRD #1392 M1; issue #2625 adds the redundancy route
 		{"heartbeat_outbox"},          // PRD #1391 M5, Run A

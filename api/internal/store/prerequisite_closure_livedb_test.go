@@ -636,22 +636,26 @@ func TestPrerequisiteClosureAttemptEightLiveDB(t *testing.T) {
 	}
 }
 
+// prerequisiteSchemaHead is the newest migration; later migrations (00388 for issue #3639) sit above
+// the prerequisite closure's 00387, and these tests roll down to 386 and back up to this head.
+const prerequisiteSchemaHead = 388
+
 func prerequisiteSchemaVersion(t *testing.T, ctx context.Context, pool *pgxpool.Pool, expected int64) {
 	t.Helper()
 	applied, head, atHead, err := store.SchemaVersionStatus(ctx, pool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if applied != expected || head != 387 || atHead != (expected == 387) {
-		t.Fatalf("schema version: applied=%d head=%d atHead=%t; want applied=%d head=387 atHead=%t",
-			applied, head, atHead, expected, expected == 387)
+	if applied != expected || head != prerequisiteSchemaHead || atHead != (expected == prerequisiteSchemaHead) {
+		t.Fatalf("schema version: applied=%d head=%d atHead=%t; want applied=%d head=%d atHead=%t",
+			applied, head, atHead, expected, prerequisiteSchemaHead, expected == prerequisiteSchemaHead)
 	}
 }
 
 func TestPrerequisiteClosureMigrationRoundTripLiveDB(t *testing.T) {
 	ctx, dsn, pool := prerequisiteMigratedPool(t, "prereq_roundtrip_")
 	// Empty Down/Up, then dependent evidence blocks without CASCADE.
-	prerequisiteSchemaVersion(t, ctx, pool, 387)
+	prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
 	if err := store.MigrateDownTo(ctx, dsn, 386); err != nil {
 		t.Fatal(err)
 	}
@@ -659,12 +663,13 @@ func TestPrerequisiteClosureMigrationRoundTripLiveDB(t *testing.T) {
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
-	prerequisiteSchemaVersion(t, ctx, pool, 387)
+	prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
 	mustExec(ctx, t, pool, "CREATE VIEW prerequisite_closure_dependency AS SELECT id FROM recovery_prerequisite_closures")
-	prerequisiteSchemaVersion(t, ctx, pool, 387)
+	prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
 	if err := store.MigrateDownTo(ctx, dsn, 386); err == nil {
 		t.Fatal("Down removed dependent evidence")
 	}
+	// The newer migration above the closure rolled back first; the closure's own Down refused.
 	prerequisiteSchemaVersion(t, ctx, pool, 387)
 	mustExec(ctx, t, pool, "DROP VIEW prerequisite_closure_dependency")
 	prerequisiteSchemaVersion(t, ctx, pool, 387)
@@ -675,14 +680,14 @@ func TestPrerequisiteClosureMigrationRoundTripLiveDB(t *testing.T) {
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
-	prerequisiteSchemaVersion(t, ctx, pool, 387)
+	prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
 	for _, state := range []string{"pending", "invoked", "create_unknown", "pinned", "refused", "foreign", "lost", "deleted"} {
 		t.Run(state, func(t *testing.T) {
 			// A fresh database prevents an earlier pending row masking later states.
 			ctx, dsn, pool := prerequisiteMigratedPool(t, "prereq_down_state_")
 			f := prerequisiteNew(t, ctx, pool)
 			prerequisiteSetState(t, ctx, f, state)
-			prerequisiteSchemaVersion(t, ctx, pool, 387)
+			prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
 			if err := store.MigrateDownTo(ctx, dsn, 386); err == nil {
 				t.Fatalf("Down forgot %s evidence", state)
 			}
@@ -693,7 +698,7 @@ func TestPrerequisiteClosureMigrationRoundTripLiveDB(t *testing.T) {
 			if err := store.Migrate(ctx, dsn); err != nil {
 				t.Fatal(err)
 			}
-			prerequisiteSchemaVersion(t, ctx, pool, 387)
+			prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
 		})
 	}
 }
@@ -1104,7 +1109,7 @@ func TestPrerequisiteClosureDownConcurrentInsertLiveDB(t *testing.T) {
 	bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
-	prerequisiteSchemaVersion(t, ctx, pool, 387)
+	prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
 	go func() { done <- store.MigrateDownTo(bounded, dsn, 386) }()
 	joined := false
 	defer func() {

@@ -69,9 +69,14 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		case "codex_idle_stall":
 			_, resumeErr = h.q.ResumeCodexIdleStall(r.Context(), store.ResumeCodexIdleStallParams{ID: runID, UserID: user.ID})
 		case "worker_memory_pressure":
-			_, resumeErr = h.q.ResumeMemoryEpisode(r.Context(), store.ResumeMemoryEpisodeParams{
-				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
-			})
+			// Issue #3639: the resume and the settled-park lift commit together or not at all.
+			if h.pool != nil {
+				resumeErr = workersvc.ResumeMemoryHold(r.Context(), h.pool, runID, user.ID, int32(h.cfg.RunTimeout.Seconds()))
+			} else {
+				_, resumeErr = h.q.ResumeMemoryEpisode(r.Context(), store.ResumeMemoryEpisodeParams{
+					ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
+				})
+			}
 		default:
 			_, resumeErr = h.q.ResumeWorkerRecoveryEpisode(r.Context(), store.ResumeWorkerRecoveryEpisodeParams{
 				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),

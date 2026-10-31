@@ -3569,7 +3569,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// claimRunInTx). Not claimed: COMMIT (the snapshot replace must persist) and report idle. On
 	// success, COMMIT and then assemble OUTSIDE the tx (assembly opens credentials + builds
 	// snapshots and must not hold the DB tx), exactly as the no-snapshot path does.
-	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, reread, params, report)
+	run, memRef, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, reread, params, report)
 	if err != nil {
 		return nil, err
 	}
@@ -3584,7 +3584,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		return nil, err
 	}
 	committed = true
-	return s.assembleAndFinishRunClaim(ctx, reread, run, params.RecoveryCapable)
+	return s.assembleAndFinishRunClaimRef(ctx, reread, run, params.RecoveryCapable, memRef)
 }
 
 // requestActivePairs extracts the index-aligned (run_id, claim_generation) pairs a claim's request

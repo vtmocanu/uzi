@@ -139,10 +139,19 @@ func runClaimOpenedCustody(run store.Run, recoveryCapable bool) bool {
 // assembleAndFinishRunClaim is the run lane's single post-ClaimRun tail, shared by both
 // Claim return paths so each outcome goes through the same exact-claim transaction.
 func (s *Service) assembleAndFinishRunClaim(ctx context.Context, wkr store.Worker, run store.Run, recoveryCapable bool) (*ClaimPayload, error) {
+	return s.assembleAndFinishRunClaimRef(ctx, wkr, run, recoveryCapable, nil)
+}
+
+// assembleAndFinishRunClaimRef is assembleAndFinishRunClaim carrying the memory-park reference
+// claimRunInTx built inside the claim transaction (issue #3639); nil attaches nothing.
+func (s *Service) assembleAndFinishRunClaimRef(ctx context.Context, wkr store.Worker, run store.Run, recoveryCapable bool, ref *MemoryParkReference) (*ClaimPayload, error) {
 	if h := s.claimHooks; h != nil && h.beforeAssembly != nil {
 		h.beforeAssembly(ctx, run)
 	}
 	payload, err := s.assembleClaim(ctx, wkr, run)
+	if payload != nil {
+		payload.MemoryParkReference = ref
+	}
 	if h := s.claimHooks; h != nil && h.afterAssembly != nil {
 		h.afterAssembly(ctx, run, payload, err)
 	}

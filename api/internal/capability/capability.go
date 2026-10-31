@@ -281,6 +281,11 @@ const WorkerMemoryPressureV1 = "worker_memory_pressure_v1"
 // missing member from such a worker is treated as lost.
 const WorkerMemoryAuthorityClaimV1 = "worker_memory_authority_claim_v1"
 
+// MemoryParkSettlementV1 negotiates the memory-park settlement receipt (issue #3639): a worker that
+// registers it may POST /runs/{id}/memory/settlement and receives the claim body's
+// memory_park_reference, which lets the same worker incarnation reclaim after an owner Resume.
+const MemoryParkSettlementV1 = "memory_park_settlement_v1"
+
 // CIArtifactsV1 negotiates guarded CI artifact evidence delivery and read access.
 const CIArtifactsV1 = "ci_artifacts_v1"
 
@@ -300,6 +305,7 @@ var protocolVocabulary = map[string]struct{}{
 	TaskCheckpointCoordinatesV1:     {},
 	WorkerMemoryPressureV1:          {},
 	WorkerMemoryAuthorityClaimV1:    {},
+	MemoryParkSettlementV1:          {},
 	DindMaintenanceV1:               {},
 	CompletionInterlockV1:           {},
 	RecoveryArchiveV1:               {},
@@ -342,7 +348,7 @@ var protocolVocabulary = map[string]struct{}{
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryPrerequisiteClosureV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckSemanticPlanV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, CIArtifactsV1}
+var protocolOrder = []string{ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, MemoryParkSettlementV1, DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryPrerequisiteClosureV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckSemanticPlanV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, CIArtifactsV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

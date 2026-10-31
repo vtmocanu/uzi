@@ -30,11 +30,14 @@ type ClaimPayload struct {
 	CheckpointWriteUnresolved *bool                        `json:"checkpoint_write_unresolved,omitempty"`
 	CheckpointCoordinates     *CheckpointCoordinates       `json:"checkpoint_coordinates,omitempty"`
 	SemanticPlanning          *apitypes.SemanticEnrollment `json:"semantic_planning,omitempty"`
-	MemoryEpisode             int64                        `json:"memory_episode"`
-	MemoryInterventionCount   int32                        `json:"memory_intervention_count"`
-	MemoryPolicy              *MemoryPolicy                `json:"memory_policy"`
-	CrossCheck                *ClaimPlanCrossCheck         `json:"cross_check,omitempty"`
-	RunID                     string                       `json:"run_id"`
+	// MemoryParkReference (issue #3639) names the settled memory-pressure park an owner Resume lifted
+	// for exactly this worker incarnation; nil (omitted) for every other claim.
+	MemoryParkReference     *MemoryParkReference `json:"memory_park_reference,omitempty"`
+	MemoryEpisode           int64                `json:"memory_episode"`
+	MemoryInterventionCount int32                `json:"memory_intervention_count"`
+	MemoryPolicy            *MemoryPolicy        `json:"memory_policy"`
+	CrossCheck              *ClaimPlanCrossCheck `json:"cross_check,omitempty"`
+	RunID                   string               `json:"run_id"`
 	// Kind is the run kind (one of the runkind values; PRD #6). The worker branches on it: an
 	// issue run works IssueIID's card; a ci_fix run diagnoses + fixes Pipeline.
 	Kind string `json:"kind"`

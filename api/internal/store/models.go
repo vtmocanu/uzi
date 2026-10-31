@@ -652,6 +652,21 @@ type MemoryIntervention struct {
 	OutcomeAt       pgtype.Timestamptz `json:"outcome_at"`
 }
 
+type MemoryParkRelease struct {
+	RunID            uuid.UUID          `json:"run_id"`
+	ClaimGeneration  int64              `json:"claim_generation"`
+	MemoryEpisode    int64              `json:"memory_episode"`
+	WorkerID         uuid.UUID          `json:"worker_id"`
+	RegisterNonce    string             `json:"register_nonce"`
+	ReleasedAt       pgtype.Timestamptz `json:"released_at"`
+	Settlement       []byte             `json:"settlement"`
+	SettlementSha256 []byte             `json:"settlement_sha256"`
+	SettledAt        pgtype.Timestamptz `json:"settled_at"`
+	LiftedAt         pgtype.Timestamptz `json:"lifted_at"`
+	SupersededAt     pgtype.Timestamptz `json:"superseded_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
 type MrReviewAuthorQueue struct {
 	RepoID        uuid.UUID          `json:"repo_id"`
 	Ref           string             `json:"ref"`

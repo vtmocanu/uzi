@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -53,6 +54,46 @@ func (h *Handler) workerMemory(w http.ResponseWriter, r *http.Request, outcome b
 		httpx.ErrorReason(w, http.StatusConflict, "immutable memory binding conflict", "memory_binding_conflict")
 	case errors.Is(err, workersvc.ErrMemoryStale):
 		httpx.ErrorReason(w, http.StatusConflict, "memory claim is no longer active", "stale_claim")
+	case err != nil:
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	default:
+		httpx.JSON(w, http.StatusOK, result)
+	}
+}
+
+// WorkerMemoryParkSettlement accepts the worker's memory-park settlement receipt (issue #3639).
+// The body is the record's exact bytes, capped at workersvc.MaxMemoryParkSettlementBytes (413 over
+// the cap, nothing written); the service hashes those bytes as received and decodes them strictly.
+func (h *Handler) WorkerMemoryParkSettlement(w http.ResponseWriter, r *http.Request) {
+	worker, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	id, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, workersvc.MaxMemoryParkSettlementBytes))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			httpx.Error(w, http.StatusRequestEntityTooLarge, "memory park settlement is too large")
+			return
+		}
+		httpx.Error(w, http.StatusBadRequest, "invalid memory park settlement")
+		return
+	}
+	result, err := h.wsvc.RecordMemoryParkSettlement(r.Context(), worker, id, raw)
+	switch {
+	case errors.Is(err, workersvc.ErrInvalidState):
+		httpx.Error(w, http.StatusBadRequest, "invalid memory park settlement")
+	case errors.Is(err, workersvc.ErrRunNotOwned):
+		httpx.Error(w, http.StatusNotFound, "run not found")
+	case errors.Is(err, workersvc.ErrMemoryBinding):
+		httpx.ErrorReason(w, http.StatusConflict, "immutable memory binding conflict", "memory_binding_conflict")
+	case errors.Is(err, workersvc.ErrMemoryStale):
+		httpx.ErrorReason(w, http.StatusConflict, "memory park is no longer current", "stale_claim")
 	case err != nil:
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 	default:

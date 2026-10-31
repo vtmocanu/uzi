@@ -845,6 +845,7 @@ var wantRouteMounts = []routeMount{
 	// Worker-only transactional reservation/history writes; no forge or token spend.
 	{"POST", "/api/worker/runs/{id}/memory/reserve", noLimiter},
 	{"POST", "/api/worker/runs/{id}/memory/outcome", noLimiter},
+	{"POST", "/api/worker/runs/{id}/memory/settlement", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/refresh", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/admission-signal", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/operation-admission", noLimiter},
