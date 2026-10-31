@@ -2555,6 +2555,20 @@ describe("lead guidance routing", () => {
       assert.ok(!codexChild.includes(policy));
     }
   });
+
+  it("issue #3721: the builtin lead keeps owner-only work out of the milestones and never asks on autopilot", () => {
+    const flat = readFileSync(new URL("../../api/internal/agenttmpl/builtins/lead.md", import.meta.url), "utf8").replace(/\s+/g, " ");
+    for (const phrase of [
+      "\"Landing obligations\" plan section, not a milestone", "\"Owner acceptance\" plan section, not a milestone",
+      "already-authorized issue-specific landing fallback", "lacks time, permissions or tooling", "In a new, unfrozen plan",
+      "declare `non_closing` with a reason naming them as pending and not verified",
+      "On an auto-approved run `ask_user` reaches no human: keep each consequentially doubtful item as a required milestone",
+      "Never silently omit ambiguous work from the milestones", "formal owner partial decision",
+    ]) assert.ok(flat.includes(phrase), phrase);
+    for (const gone of ["informative milestone", "also on an auto-approved run", "Milestones hold only work"]) {
+      assert.ok(!flat.includes(gone), gone);
+    }
+  });
 });
 
 describe("issue #2593: lead gate-sequencing append", () => {
@@ -2648,7 +2662,7 @@ describe("M2 completion delivery guidance", () => {
         "\"Landing obligations\" plan section, not a milestone", "\"Owner acceptance\" plan section, not a milestone",
         "exact-head PR CI", "declare `non_closing` with a reason naming them as pending and not verified",
         "list each as a `deferred` `pr_summary` scope note", "use ask_user before the final submit_plan",
-        "and ask_user reaches a human (a gated run)",
+        "and ask_user reaches a human (the plan prompt carries no autopilot note)",
         "On an auto-approved run ask_user reaches no human: keep each consequentially doubtful item as a required milestone",
         "record the uncertainty in the plan", "Auto-approval, a checker approval and the auto-answer supply no waiver",
         "the formal owner completion decision applies",
