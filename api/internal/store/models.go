@@ -89,6 +89,7 @@ type AuthorizedForgeOrigin struct {
 	UserID       uuid.UUID `json:"user_id"`
 	ConnectionID uuid.UUID `json:"connection_id"`
 	Origin       string    `json:"origin"`
+	ApiOrigin    string    `json:"api_origin"`
 }
 
 type AutopilotTrigger struct {
@@ -440,6 +441,8 @@ type ForgeOriginCooldown struct {
 	ReservationIncarnation        pgtype.UUID        `json:"reservation_incarnation"`
 	ReservationVersion            pgtype.Int8        `json:"reservation_version"`
 	ReservationObservationVersion pgtype.Int8        `json:"reservation_observation_version"`
+	GitUnverified                 bool               `json:"git_unverified"`
+	ApiUnverified                 bool               `json:"api_unverified"`
 }
 
 type GithubProjectItem struct {
@@ -1263,14 +1266,17 @@ type RunFetchReservation struct {
 }
 
 type RunForgeOrigin struct {
-	RunID                  uuid.UUID   `json:"run_id"`
-	UserID                 uuid.UUID   `json:"user_id"`
-	WorkerID               uuid.UUID   `json:"worker_id"`
-	Generation             int64       `json:"generation"`
-	ConnectionID           uuid.UUID   `json:"connection_id"`
-	Origin                 pgtype.Text `json:"origin"`
-	ReservationIncarnation pgtype.UUID `json:"reservation_incarnation"`
-	ReservationVersion     pgtype.Int8 `json:"reservation_version"`
+	RunID                     uuid.UUID   `json:"run_id"`
+	UserID                    uuid.UUID   `json:"user_id"`
+	WorkerID                  uuid.UUID   `json:"worker_id"`
+	Generation                int64       `json:"generation"`
+	ConnectionID              uuid.UUID   `json:"connection_id"`
+	Origin                    pgtype.Text `json:"origin"`
+	ReservationIncarnation    pgtype.UUID `json:"reservation_incarnation"`
+	ReservationVersion        pgtype.Int8 `json:"reservation_version"`
+	ApiOrigin                 pgtype.Text `json:"api_origin"`
+	ApiReservationIncarnation pgtype.UUID `json:"api_reservation_incarnation"`
+	ApiReservationVersion     pgtype.Int8 `json:"api_reservation_version"`
 }
 
 type RunGatePresentation struct {

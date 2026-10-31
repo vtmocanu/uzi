@@ -52,6 +52,13 @@ func (f *publicationParkFixture) openHold(t *testing.T, run uuid.UUID, gen int64
  VALUES ($1,$2,$3,$4,'open',$5,'fixture',$5,$3,false)`, f.userID, f.repoID, run, gen, f.workerID)
 }
 
+// expireCooldown models the retry delay having elapsed. A publication park also cools the failing
+// origin on the database clock (issue #1324 D9), which the fake service clock does not move, so a
+// claim in these tests would otherwise be refused as the cooldown it really is.
+func (f *publicationParkFixture) expireCooldown() {
+	f.env.exec(`UPDATE forge_origin_cooldowns SET cooled_until=now()-interval '1 second' WHERE worker_id=$1`, f.workerID)
+}
+
 func (f *publicationParkFixture) park(gen int64, surface string) (store.Run, bool, error) {
 	return f.svc.SetState(f.env.ctx, f.wkr, f.runID, pubParkReport(gen, surface, "push"))
 }
@@ -216,6 +223,7 @@ func TestPublicationHoldResumeEpisodeLiveDB(t *testing.T) {
 	}
 	// The custodian claims it again and a new episode starts a fresh clock: the next park, even
 	// an hour after the first episode began, is a timed retry.
+	f.expireCooldown()
 	got, gen := f.claim(t)
 	if got != f.runID || gen != 2 {
 		t.Fatalf("custodian claim=%s/%d", got, gen)
@@ -600,6 +608,7 @@ func TestPublicationResumeCustodyLimitsLiveDB(t *testing.T) {
 			if ok, err := f.svc.ResumePublicationForgeHold(f.env.ctx, f.userID, f.run(t)); err != nil || !ok {
 				t.Fatalf("resume=%v/%v", ok, err)
 			}
+			f.expireCooldown()
 			got, gen := f.claim(t)
 			// The run's own open hold keeps it a continuation only while its own count is below the
 			// limit: limit 1 leaves it queued, limit 3 lets it through. Resume changed neither rule.
@@ -617,33 +626,84 @@ func TestPublicationResumeCustodyLimitsLiveDB(t *testing.T) {
 }
 
 // The API-origin seam: a git park honours the origin cooldown, an api park does not read it.
-func TestPublicationParkHonoursGitOriginCooldownLiveDB(t *testing.T) {
-	f := newPublicationParkFixture(t, 0)
-	f.env.exec(`UPDATE runs SET status='queued' WHERE id=$1`, f.runID)
-	got, gen := f.claim(t)
-	if got != f.runID {
-		t.Fatalf("claim=%s", got)
+// Issue #1324 D9: a publication park records the failure on the failing surface's origin. The git
+// surface observes the stamped Git origin, the api surface the server-derived API origin (distinct
+// here: a github connection), both with reason transient_publication_exhausted and the existing
+// backoff. The retry stamp is the later of the capped backoff and the failing origin's cooldown, and
+// the other surface's origin is neither written nor consulted.
+func TestPublicationParkObservesFailingSurfaceOriginLiveDB(t *testing.T) {
+	type row struct {
+		exists      bool
+		git, api    bool
+		step        int
+		obs         int64
+		reason      string
+		cooledUntil time.Time
 	}
-	if _, applied, err := f.svc.SetState(f.env.ctx, f.wkr, f.runID, StateRequest{State: "running", ClaimGeneration: i64Ptr(gen)}); err != nil || !applied {
-		t.Fatalf("running=%v/%v", applied, err)
-	}
-	var origin string
-	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT origin FROM run_forge_origins WHERE run_id=$1`, f.runID).Scan(&origin); err != nil {
-		t.Fatalf("claim stamped no origin: %v", err)
-	}
-	cooled := f.clock.Add(3 * time.Hour)
-	f.env.exec(`INSERT INTO forge_origin_cooldowns (user_id, worker_id, origin, failure_step, cooled_until, last_reason, observed_at)
- VALUES ($1,$2,$3,0,$4,'transient_clone_fetch_exhausted',now())`, f.userID, f.workerID, origin, cooled)
-	for surface, wantCooled := range map[string]bool{"api": false, "git": true} {
-		f.resumeFlight(t)
-		f.env.exec(`UPDATE runs SET recovery_wait_count=0 WHERE id=$1`, f.runID)
-		run, applied, err := f.svc.SetState(f.env.ctx, f.wkr, f.runID, pubParkReport(gen, surface, "push"))
-		if err != nil || !applied || !timed(run) {
-			t.Fatalf("%s park stamp=%v applied=%v err=%v", surface, run.RecoveryRetryNotBefore, applied, err)
-		}
-		if after := !run.RecoveryRetryNotBefore.Time.Before(cooled); after != wantCooled {
-			t.Fatalf("%s park stamp %v vs cooldown %v: honoured=%v want %v", surface, run.RecoveryRetryNotBefore.Time, cooled, after, wantCooled)
-		}
+	for _, surface := range []string{"git", "api"} {
+		t.Run(surface, func(t *testing.T) {
+			f := newPublicationParkFixture(t, 0)
+			f.env.exec(`UPDATE forge_connections SET forge_type='github' WHERE user_id=$1`, f.userID)
+			f.env.exec(`UPDATE runs SET status='queued' WHERE id=$1`, f.runID)
+			got, gen := f.claim(t)
+			if got != f.runID {
+				t.Fatalf("claim=%s", got)
+			}
+			if _, applied, err := f.svc.SetState(f.env.ctx, f.wkr, f.runID, StateRequest{State: "running", ClaimGeneration: i64Ptr(gen)}); err != nil || !applied {
+				t.Fatalf("running=%v/%v", applied, err)
+			}
+			var gitOrigin, apiOrigin string
+			if err := f.env.pool.QueryRow(f.env.ctx, `SELECT origin, api_origin FROM run_forge_origins WHERE run_id=$1`, f.runID).Scan(&gitOrigin, &apiOrigin); err != nil {
+				t.Fatalf("claim stamped no origins: %v", err)
+			}
+			if apiOrigin == "" || apiOrigin == gitOrigin {
+				t.Fatalf("fixture needs distinct origins: git=%q api=%q", gitOrigin, apiOrigin)
+			}
+			read := func(origin string) row {
+				var r row
+				err := f.env.pool.QueryRow(f.env.ctx, `SELECT git_unverified, api_unverified, failure_step, observation_version, last_reason, cooled_until
+					FROM forge_origin_cooldowns WHERE worker_id=$1 AND origin=$2`, f.workerID, origin).
+					Scan(&r.git, &r.api, &r.step, &r.obs, &r.reason, &r.cooledUntil)
+				if errors.Is(err, pgx.ErrNoRows) {
+					return r
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				r.exists = true
+				return r
+			}
+			// A long-failing Git origin: the next observation reaches the backoff cap.
+			f.env.exec(`INSERT INTO forge_origin_cooldowns (user_id, worker_id, origin, failure_step, observation_version, cooled_until, last_reason, observed_at)
+ VALUES ($1,$2,$3,10,5,now()+interval '3 hours','transient_clone_fetch_exhausted',now())`, f.userID, f.workerID, gitOrigin)
+			seeded := read(gitOrigin)
+			run, applied, err := f.svc.SetState(f.env.ctx, f.wkr, f.runID, pubParkReport(gen, surface, "push"))
+			if err != nil || !applied || !timed(run) {
+				t.Fatalf("%s park stamp=%v applied=%v err=%v", surface, run.RecoveryRetryNotBefore, applied, err)
+			}
+			git, api := read(gitOrigin), read(apiOrigin)
+			stamp := run.RecoveryRetryNotBefore.Time
+			if surface == "git" {
+				if !git.git || git.api || git.reason != "transient_publication_exhausted" || git.step != 11 || git.obs != 6 || api.exists {
+					t.Fatalf("git surface: git=%+v api=%+v", git, api)
+				}
+				// The cap (30m) outlasts the backoff stamp (1m plus jitter), so the stamp was raised.
+				if stamp.Before(git.cooledUntil) || !git.cooledUntil.Before(seeded.cooledUntil) {
+					t.Fatalf("stamp %v vs cooldown %v (seeded %v)", stamp, git.cooledUntil, seeded.cooledUntil)
+				}
+				return
+			}
+			if !api.exists || api.git || !api.api || api.reason != "transient_publication_exhausted" || api.step != 0 || api.obs != 1 {
+				t.Fatalf("api surface: api=%+v", api)
+			}
+			if git.step != seeded.step || git.obs != seeded.obs || git.reason != seeded.reason || git.git != seeded.git || git.api != seeded.api || !git.cooledUntil.Equal(seeded.cooledUntil) {
+				t.Fatalf("api surface disturbed the Git origin's row: %+v -> %+v", seeded, git)
+			}
+			// Only the API origin's cooldown can raise the stamp; the 3h Git cooldown must not.
+			if stamp.Before(api.cooledUntil) || !stamp.Before(seeded.cooledUntil) {
+				t.Fatalf("stamp %v vs API cooldown %v / Git cooldown %v", stamp, api.cooledUntil, seeded.cooledUntil)
+			}
+		})
 	}
 }
 

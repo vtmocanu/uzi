@@ -29,6 +29,9 @@ type ClaimPayload struct {
 	// unchanged, including credentials.
 	PublicationResume      *PublicationResumePayload `json:"publication_resume,omitempty"`
 	ForgeOriginReservation *ForgeOriginReservation   `json:"forge_origin_reservation,omitempty"`
+	// ForgeAPIOriginReservation (issue #1324 D9) is the half-open API-origin reservation of this
+	// claim, sent only to a forge_api_success_v1 worker.
+	ForgeAPIOriginReservation *ForgeOriginReservation `json:"forge_api_origin_reservation,omitempty"`
 	// CheckpointWriteUnresolved is admission-time evidence for validated enrolled tasks;
 	// nil leaves recovery status unknown for legacy claims.
 	CheckpointWriteUnresolved *bool                        `json:"checkpoint_write_unresolved,omitempty"`

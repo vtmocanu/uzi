@@ -927,7 +927,9 @@ WITH claimant AS MATERIALIZED (
 ), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id,
            fo.connection_id AS forge_connection_id, fo.origin AS forge_origin, fc.incarnation AS forge_incarnation,
-           fc.observation_version AS forge_observation_version
+           fc.observation_version AS forge_observation_version,
+           fo.api_origin AS forge_api_origin, fca.incarnation AS forge_api_incarnation,
+           fca.observation_version AS forge_api_observation_version
     FROM runs r
     LEFT JOIN authorized_forge_origins fo
       ON fo.repo_id = r.repo_id AND fo.user_id = r.user_id
@@ -938,6 +940,11 @@ WITH claimant AS MATERIALIZED (
             WHERE cc.lead_run_id = r.target_run_id AND cc.stage = 'code' AND cc.checker_run_id = r.id))
     LEFT JOIN forge_origin_cooldowns fc
       ON fc.user_id = r.user_id AND fc.worker_id = $1 AND fc.origin = fo.origin
+    -- Issue #1324 D9: the server-derived API origin is a second admission key only when it
+    -- differs from the Git origin (equal origins share fc's row). NULL is ignored.
+    LEFT JOIN forge_origin_cooldowns fca
+      ON fca.user_id = r.user_id AND fca.worker_id = $1 AND fca.origin = fo.api_origin
+        AND fo.api_origin <> fo.origin
     WHERE r.user_id = $3
       -- Hard admission even for a lone worker, an old run, or its own resume.
       AND EXISTS (SELECT 1 FROM claimant c WHERE fn_forge_origin_eligible(c, r, now()))
@@ -1642,6 +1649,32 @@ WITH claimant AS MATERIALIZED (
     FOR UPDATE OF r SKIP LOCKED
     LIMIT 1
 ),
+forge_locked AS MATERIALIZED (
+    -- Issue #1324 D9: a run can need two reservations (Git and API origin) and must take both or
+    -- neither. Lock the target's cooldown rows first, in a fixed order, after claimant and target;
+    -- under READ COMMITTED a row changed since the statement snapshot is re-read at its latest
+    -- version, so the all-or-nothing decision below sees committed state and a stale snapshot loses.
+    SELECT c.origin, c.incarnation, c.observation_version, c.cooled_until, c.reservation_run_id
+    FROM forge_origin_cooldowns c JOIN target t
+      ON c.user_id = t.user_id AND c.worker_id = $1
+        AND c.origin IN (t.forge_origin, t.forge_api_origin)
+    ORDER BY c.origin
+    FOR UPDATE OF c
+),
+forge_ok AS MATERIALIZED (
+    -- A missing snapshot row stays advisory (no origin or synthetic lock is taken for absence).
+    SELECT t.id FROM target t
+    WHERE (t.forge_incarnation IS NULL OR EXISTS (
+              SELECT 1 FROM forge_locked l
+              WHERE l.origin = t.forge_origin AND l.incarnation = t.forge_incarnation
+                AND l.observation_version = t.forge_observation_version
+                AND l.cooled_until <= now() AND l.reservation_run_id IS NULL))
+      AND (t.forge_api_incarnation IS NULL OR EXISTS (
+              SELECT 1 FROM forge_locked l
+              WHERE l.origin = t.forge_api_origin AND l.incarnation = t.forge_api_incarnation
+                AND l.observation_version = t.forge_api_observation_version
+                AND l.cooled_until <= now() AND l.reservation_run_id IS NULL))
+),
 forge_reservation AS (
     -- One conditional write, no retry. The existing row is locked only after
     -- claimant and target. A stale snapshot loses here without opening custody
@@ -1658,12 +1691,32 @@ forge_reservation AS (
       AND c.incarnation = t.forge_incarnation
       AND c.observation_version = t.forge_observation_version
       AND c.cooled_until <= now() AND c.reservation_run_id IS NULL
+      AND EXISTS (SELECT 1 FROM forge_ok ok WHERE ok.id = t.id)
+    RETURNING c.reservation_run_id AS run_id
+),
+forge_api_reservation AS (
+    -- The API origin's half-open trial, reserved in the same statement under the same CAS.
+    UPDATE forge_origin_cooldowns c SET
+        reservation_run_id = t.id,
+        reservation_generation = t.claim_generation + 1,
+        reservation_incarnation = c.incarnation,
+        reservation_version = c.observation_version,
+        reservation_observation_version = c.observation_version
+    FROM target t
+    WHERE c.user_id = t.user_id AND c.worker_id = $1 AND c.origin = t.forge_api_origin
+      AND t.forge_api_incarnation IS NOT NULL
+      AND c.incarnation = t.forge_api_incarnation
+      AND c.observation_version = t.forge_api_observation_version
+      AND c.cooled_until <= now() AND c.reservation_run_id IS NULL
+      AND EXISTS (SELECT 1 FROM forge_ok ok WHERE ok.id = t.id)
     RETURNING c.reservation_run_id AS run_id
 ),
 forge_admitted AS MATERIALIZED (
-    SELECT t.id, t.user_id, t.repo_id, t.kind, t.claim_generation, t.egress_profile_id, t.forge_connection_id, t.forge_origin, t.forge_incarnation, t.forge_observation_version FROM target t
-    WHERE t.forge_incarnation IS NULL
-       OR EXISTS (SELECT 1 FROM forge_reservation fr WHERE fr.run_id = t.id)
+    SELECT t.id, t.user_id, t.repo_id, t.kind, t.claim_generation, t.egress_profile_id, t.forge_connection_id, t.forge_origin, t.forge_incarnation, t.forge_observation_version, t.forge_api_origin, t.forge_api_incarnation, t.forge_api_observation_version FROM target t
+    WHERE (t.forge_incarnation IS NULL
+           OR EXISTS (SELECT 1 FROM forge_reservation fr WHERE fr.run_id = t.id))
+      AND (t.forge_api_incarnation IS NULL
+           OR EXISTS (SELECT 1 FROM forge_api_reservation fa WHERE fa.run_id = t.id))
 ),
 hold AS (
     -- PRD #1296 M1 (D2/D3): open the H-free custody hold atomically with the claim, for a
@@ -1692,7 +1745,8 @@ hold AS (
 )
 UPDATE runs SET
     forge_admission = jsonb_build_object('generation', runs.claim_generation + 1, 'worker_id', $1::uuid,
-        'connection_id', (SELECT forge_connection_id FROM forge_admitted), 'origin', (SELECT forge_origin FROM forge_admitted)),
+        'connection_id', (SELECT forge_connection_id FROM forge_admitted), 'origin', (SELECT forge_origin FROM forge_admitted),
+        'api_origin', (SELECT forge_api_origin FROM forge_admitted)),
     cross_check_lane = COALESCE($2::text = 'cross_check', false),
     status     = 'claimed',
     status_since = now(),
@@ -2494,7 +2548,7 @@ WITH candidates AS (
 SELECT w.id,
        fn_forge_origin_eligible(w,run,$1::timestamptz)::boolean AS forge_eligible,
        EXISTS (SELECT 1 FROM authorized_forge_origins a JOIN forge_origin_cooldowns c
-               ON c.user_id = a.user_id AND c.origin = a.origin AND c.worker_id = w.id
+               ON c.user_id = a.user_id AND c.origin IN (a.origin, a.api_origin) AND c.worker_id = w.id
                WHERE a.repo_id = run.repo_id AND a.user_id = run.user_id)::boolean AS has_cooldown,
        COALESCE(codex_admission_run_eligible_at(run.id) <= now(), true)::boolean AS admission_eligible,
        (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), $1::timestamptz, $2::timestamptz))::boolean AS strict_candidate,

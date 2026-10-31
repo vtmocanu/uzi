@@ -88,11 +88,22 @@ WHERE run_id = @run_id AND state = 'active'
 RETURNING *;
 
 -- name: GetRunForgeOriginCooldownUntil :one
--- The per-origin cooldown (issue #3585) of the origin stamped on the run's current claim. Read
--- only: a publication park never writes the cooldown. No row means no cooldown applies.
+-- The per-origin cooldown (issue #3585) of the failing origin stamped on the run's current claim:
+-- the Git origin, or for the api surface the server-derived api_origin (issue #1324 D9). Read after
+-- the park's own observation, so it includes that failure. No row means no cooldown applies.
 SELECT c.cooled_until FROM run_forge_origins m
-JOIN forge_origin_cooldowns c ON c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin = m.origin
+JOIN forge_origin_cooldowns c ON c.user_id = m.user_id AND c.worker_id = m.worker_id
+  AND c.origin = CASE WHEN @surface::text = 'api' THEN m.api_origin ELSE m.origin END
 WHERE m.run_id = @run_id::uuid AND m.worker_id = @worker_id::uuid;
+
+-- name: RaisePublicationRetryNotBefore :one
+-- Moves a timed publication park's retry stamp later when the failing origin's cooldown outlasts the
+-- backoff stamp. Never earlier, never on a run that is no longer the same parked claim.
+UPDATE runs SET recovery_retry_not_before = @retry_not_before::timestamptz
+WHERE id = @id AND worker_id = @worker_id AND status = 'recovery_wait'
+  AND claim_generation = @claim_generation::bigint
+  AND recovery_retry_not_before IS NOT NULL AND recovery_retry_not_before < @retry_not_before::timestamptz
+RETURNING *;
 
 -- name: ResumePublicationForgeHold :one
 -- Owner Resume of a publication-phase owner hold (issue #1324): one ordinary queued attempt with

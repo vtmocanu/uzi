@@ -101,30 +101,25 @@ func publicationHandoff(run store.Run, req StateRequest) []byte {
 //
 // The bound is RunProviderParkMaxDuration measured from the side row's wait_started_at (set at
 // the first park of the episode, never reset by a later park, a new generation or a new worker);
-// zero disables the hold, leaving timed retries only. The retry stamp is the later of the capped
-// backoff and the cooldown deadline of the run's origin, read for the git surface only: API-origin
-// cooldown rows arrive with the API-origin mechanism and this is its seam.
+// zero disables the hold, leaving timed retries only. The failure is also observed on the
+// advisory placement cooldown (issue #1324 D9): the stamped Git origin for the git surface, the
+// server-derived API origin for the api surface, with reason transient_publication_exhausted. The
+// retry stamp is the later of the capped backoff and the failing origin's cooldown deadline, read
+// after that observation.
 func (s *Service) parkPublicationForgeUnreachable(ctx context.Context, tx pgx.Tx, qtx *store.Queries, wkr store.Worker, run store.Run, intent store.RunPublicationResume, req StateRequest, sessionID pgtype.Text) (store.Run, int64, error) {
 	now := s.now()
 	start := now
 	if intent.WaitStartedAt.Valid {
 		start = intent.WaitStartedAt.Time
 	}
+	apiSurface := req.PublicationSurface != nil && *req.PublicationSurface == "api"
 	var retry pgtype.Timestamptz
+	var stamp time.Time
 	var holdReason pgtype.Text
 	if bound := s.p.RunProviderParkMaxDuration; bound > 0 && now.Sub(start) >= bound {
 		holdReason = pgconv.TextOrNull(publicationHoldRetryExhausted)
 	} else {
-		stamp := now.Add(s.recoveryParkFallbackFor(run.RecoveryWaitCount) + recoveryParkJitter())
-		if req.PublicationSurface != nil && *req.PublicationSurface == "git" {
-			cooled, err := s.publicationOriginCooldown(ctx, qtx, run, wkr)
-			if err != nil {
-				return store.Run{}, 0, err
-			}
-			if cooled.After(stamp) {
-				stamp = cooled
-			}
-		}
+		stamp = now.Add(s.recoveryParkFallbackFor(run.RecoveryWaitCount) + recoveryParkJitter())
 		retry = pgconv.Time(stamp)
 	}
 
@@ -145,6 +140,29 @@ func (s *Service) parkPublicationForgeUnreachable(ctx context.Context, tx pgx.Tx
 			return run, 0, ErrForgeParkCustodyUnsettled
 		}
 		return store.Run{}, 0, err
+	}
+	// The observation needs the parked row (status recovery_wait / forge_unreachable), so it follows
+	// the park; a cooldown that outlasts the provisional backoff stamp then raises the stamp.
+	if err := s.observeForgeOrigin(ctx, qtx, parked, apiSurface, forgeReasonPublicationExhaust); err != nil {
+		return store.Run{}, 0, err
+	}
+	if !stamp.IsZero() {
+		cooled, err := s.publicationOriginCooldown(ctx, qtx, run, wkr, apiSurface)
+		if err != nil {
+			return store.Run{}, 0, err
+		}
+		if cooled.After(stamp) {
+			raised, err := qtx.RaisePublicationRetryNotBefore(ctx, store.RaisePublicationRetryNotBeforeParams{
+				RetryNotBefore: pgconv.Time(cooled), ID: run.ID, WorkerID: pgconv.UUID(wkr.ID), ClaimGeneration: run.ClaimGeneration,
+			})
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return run, 0, ErrForgeParkCustodyUnsettled
+				}
+				return store.Run{}, 0, err
+			}
+			parked = raised
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.Run{}, 0, err
@@ -219,10 +237,15 @@ func (s *Service) holdPublicationRunsWithoutCustodian(ctx context.Context, now t
 	return int64(len(rows)), nil
 }
 
-// publicationOriginCooldown returns the cooldown deadline of the run's stamped origin, or the zero
-// time when none applies.
-func (s *Service) publicationOriginCooldown(ctx context.Context, q *store.Queries, run store.Run, wkr store.Worker) (time.Time, error) {
-	until, err := q.GetRunForgeOriginCooldownUntil(ctx, store.GetRunForgeOriginCooldownUntilParams{RunID: run.ID, WorkerID: wkr.ID})
+// publicationOriginCooldown returns the cooldown deadline of the run's failing origin (its stamped
+// Git origin, or its server-derived API origin for the api surface), or the zero time when none
+// applies.
+func (s *Service) publicationOriginCooldown(ctx context.Context, q *store.Queries, run store.Run, wkr store.Worker, api bool) (time.Time, error) {
+	surface := "git"
+	if api {
+		surface = "api"
+	}
+	until, err := q.GetRunForgeOriginCooldownUntil(ctx, store.GetRunForgeOriginCooldownUntilParams{RunID: run.ID, WorkerID: wkr.ID, Surface: surface})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, nil
 	}

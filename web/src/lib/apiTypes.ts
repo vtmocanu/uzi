@@ -2492,6 +2492,8 @@ export interface ForgeOriginCooldown {
   half_open_run_id: string | null;
   state: "cooling" | "half_open" | "retry_eligible_unverified" | "legacy_serialized_until_upgrade" | "reserved_unverified";
   detail: string;
+  /** Unverified evidence surfaces on this origin: "git" and/or "api". Absent on APIs predating it. */
+  surfaces?: string[];
 }
 
 export interface Worker {

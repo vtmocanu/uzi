@@ -24,55 +24,172 @@ func (q *Queries) CanonicalForgeOrigin(ctx context.Context, raw string) (string,
 	return origin, err
 }
 
-const clearForgeOriginOnCloneSuccess = `-- name: ClearForgeOriginOnCloneSuccess :execrows
+const clearForgeApiOriginOnSuccess = `-- name: ClearForgeApiOriginOnSuccess :one
 WITH mapping AS MATERIALIZED (
-    SELECT m.run_id, m.user_id, m.worker_id, m.generation, m.connection_id, m.origin, m.reservation_incarnation, m.reservation_version FROM run_forge_origins m
+    SELECT m.run_id, m.user_id, m.worker_id, m.generation, m.connection_id, m.origin, m.reservation_incarnation, m.reservation_version, m.api_origin, m.api_reservation_incarnation, m.api_reservation_version FROM run_forge_origins m
+    JOIN runs r ON r.id = m.run_id AND r.user_id = m.user_id
+        AND r.worker_id = m.worker_id AND r.claim_generation = m.generation
+    JOIN authorized_forge_origins a ON a.repo_id = r.repo_id AND a.user_id = m.user_id
+        AND a.connection_id = m.connection_id AND a.api_origin = m.api_origin
+    WHERE m.run_id = $1::uuid AND m.worker_id = $2::uuid AND m.generation = $3::bigint
+        AND r.status IN ('claimed', 'running') AND r.claim_released_at IS NULL AND r.stop_kind IS NULL
+        AND m.api_reservation_incarnation = $4::uuid AND m.api_reservation_version = $5::bigint
+    FOR SHARE OF a NOWAIT
+), removed AS (
+    DELETE FROM forge_origin_cooldowns c USING mapping m
+    WHERE c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin = m.api_origin
+        AND c.incarnation = $4::uuid AND c.reservation_incarnation = $4::uuid
+        AND c.reservation_run_id = m.run_id AND c.reservation_generation = m.generation
+        AND c.reservation_version = $5::bigint
+        AND c.reservation_observation_version = $6::bigint
+        AND c.observation_version = $6::bigint
+        AND c.api_unverified AND NOT c.git_unverified
+    RETURNING 1
+), cleared AS (
+    UPDATE forge_origin_cooldowns c SET api_unverified = false
+    FROM mapping m
+    WHERE c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin = m.api_origin
+        AND c.incarnation = $4::uuid AND c.reservation_incarnation = $4::uuid
+        AND c.reservation_run_id = m.run_id AND c.reservation_generation = m.generation
+        AND c.reservation_version = $5::bigint
+        AND c.reservation_observation_version = $6::bigint
+        AND c.observation_version = $6::bigint
+        AND c.api_unverified AND c.git_unverified
+    RETURNING 1
+)
+SELECT ((SELECT count(*) FROM removed) + (SELECT count(*) FROM cleared))::bigint AS applied
+`
+
+type ClearForgeApiOriginOnSuccessParams struct {
+	RunID              uuid.UUID `json:"run_id"`
+	WorkerID           uuid.UUID `json:"worker_id"`
+	Generation         int64     `json:"generation"`
+	Incarnation        uuid.UUID `json:"incarnation"`
+	Version            int64     `json:"version"`
+	ObservationVersion int64     `json:"observation_version"`
+}
+
+// API-surface success (issue #1324 D9). Same locking as ClearForgeOriginOnCloneSuccess.
+// Applies only to the half-open reservation captured on THIS run's claim for the
+// server-derived api_origin (exact run, generation, incarnation, reservation version and
+// unchanged observation_version); a Git success, completion, broker success, another
+// origin's row or a stale tuple never reaches it. Clears only api_unverified; deletes the
+// row only when no Git failure remains on it.
+func (q *Queries) ClearForgeApiOriginOnSuccess(ctx context.Context, arg ClearForgeApiOriginOnSuccessParams) (int64, error) {
+	row := q.db.QueryRow(ctx, clearForgeApiOriginOnSuccess,
+		arg.RunID,
+		arg.WorkerID,
+		arg.Generation,
+		arg.Incarnation,
+		arg.Version,
+		arg.ObservationVersion,
+	)
+	var applied int64
+	err := row.Scan(&applied)
+	return applied, err
+}
+
+const clearForgeOriginOnCloneSuccess = `-- name: ClearForgeOriginOnCloneSuccess :one
+WITH mapping AS MATERIALIZED (
+    SELECT m.run_id, m.user_id, m.worker_id, m.generation, m.connection_id, m.origin, m.reservation_incarnation, m.reservation_version, m.api_origin, m.api_reservation_incarnation, m.api_reservation_version FROM run_forge_origins m
     JOIN runs r ON r.id = m.run_id AND r.user_id = m.user_id
         AND r.worker_id = m.worker_id AND r.claim_generation = m.generation
     JOIN authorized_forge_origins a ON a.repo_id = r.repo_id AND a.user_id = m.user_id
         AND a.connection_id = m.connection_id AND a.origin = m.origin
-    WHERE m.run_id = $4::uuid AND m.worker_id = $5::uuid AND m.generation = $6::bigint
+    WHERE m.run_id = $1::uuid AND m.worker_id = $2::uuid AND m.generation = $3::bigint
         AND r.status IN ('claimed', 'running') AND r.claim_released_at IS NULL AND r.stop_kind IS NULL
-        AND m.reservation_incarnation = $1::uuid AND m.reservation_version = $2::bigint
+        AND m.reservation_incarnation = $4::uuid AND m.reservation_version = $5::bigint
     FOR SHARE OF a NOWAIT
+), removed AS (
+    DELETE FROM forge_origin_cooldowns c USING mapping m
+    WHERE c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin = m.origin
+        AND c.incarnation = $4::uuid AND c.reservation_incarnation = $4::uuid
+        AND c.reservation_run_id = m.run_id AND c.reservation_generation = m.generation
+        AND c.reservation_version = $5::bigint
+        AND c.reservation_observation_version = $6::bigint
+        AND c.observation_version = $6::bigint
+        AND c.git_unverified AND NOT c.api_unverified
+    RETURNING 1
+), cleared AS (
+    UPDATE forge_origin_cooldowns c SET git_unverified = false
+    FROM mapping m
+    WHERE c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin = m.origin
+        AND c.incarnation = $4::uuid AND c.reservation_incarnation = $4::uuid
+        AND c.reservation_run_id = m.run_id AND c.reservation_generation = m.generation
+        AND c.reservation_version = $5::bigint
+        AND c.reservation_observation_version = $6::bigint
+        AND c.observation_version = $6::bigint
+        AND c.git_unverified AND c.api_unverified
+    RETURNING 1
 )
-DELETE FROM forge_origin_cooldowns c USING mapping m
-WHERE c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin = m.origin
-    AND c.incarnation = $1::uuid AND c.reservation_incarnation = $1::uuid
-    AND c.reservation_run_id = m.run_id AND c.reservation_generation = m.generation
-    AND c.reservation_version = $2::bigint
-    AND c.reservation_observation_version = $3::bigint
-    AND c.observation_version = $3::bigint
+SELECT ((SELECT count(*) FROM removed) + (SELECT count(*) FROM cleared))::bigint AS applied
 `
 
 type ClearForgeOriginOnCloneSuccessParams struct {
-	Incarnation        uuid.UUID `json:"incarnation"`
-	Version            int64     `json:"version"`
-	ObservationVersion int64     `json:"observation_version"`
 	RunID              uuid.UUID `json:"run_id"`
 	WorkerID           uuid.UUID `json:"worker_id"`
 	Generation         int64     `json:"generation"`
+	Incarnation        uuid.UUID `json:"incarnation"`
+	Version            int64     `json:"version"`
+	ObservationVersion int64     `json:"observation_version"`
 }
 
-// Caller locks authenticated worker, then exact run. Lock the current authorized
-// mapping without waiting on repo deletion; a refusal rolls back this one attempt.
+// Git-surface success (issue #1324 D9). Caller locks authenticated worker, then exact run.
+// Lock the current authorized mapping without waiting on repo deletion; a refusal rolls
+// back this one attempt. Clears only git_unverified; the row is deleted only when no API
+// failure remains on it. The two branches act on disjoint rows of one snapshot.
 func (q *Queries) ClearForgeOriginOnCloneSuccess(ctx context.Context, arg ClearForgeOriginOnCloneSuccessParams) (int64, error) {
-	result, err := q.db.Exec(ctx, clearForgeOriginOnCloneSuccess,
-		arg.Incarnation,
-		arg.Version,
-		arg.ObservationVersion,
+	row := q.db.QueryRow(ctx, clearForgeOriginOnCloneSuccess,
 		arg.RunID,
 		arg.WorkerID,
 		arg.Generation,
+		arg.Incarnation,
+		arg.Version,
+		arg.ObservationVersion,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	var applied int64
+	err := row.Scan(&applied)
+	return applied, err
+}
+
+const getForgeApiOriginReservation = `-- name: GetForgeApiOriginReservation :one
+SELECT c.reservation_incarnation, c.reservation_version, c.reservation_observation_version
+FROM run_forge_origins m
+JOIN runs r ON r.id = m.run_id AND r.user_id = m.user_id
+    AND r.worker_id = m.worker_id AND r.claim_generation = m.generation
+JOIN authorized_forge_origins a ON a.repo_id = r.repo_id AND a.user_id = m.user_id
+    AND a.connection_id = m.connection_id AND a.api_origin = m.api_origin
+JOIN forge_origin_cooldowns c ON c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin = m.api_origin
+WHERE m.run_id = $1::uuid AND m.worker_id = $2::uuid AND m.generation = $3::bigint
+    AND c.reservation_run_id = m.run_id AND c.reservation_generation = m.generation
+    AND c.incarnation = m.api_reservation_incarnation AND c.reservation_incarnation = m.api_reservation_incarnation
+    AND c.reservation_version = m.api_reservation_version
+    AND c.observation_version = c.reservation_observation_version
+`
+
+type GetForgeApiOriginReservationParams struct {
+	RunID      uuid.UUID `json:"run_id"`
+	WorkerID   uuid.UUID `json:"worker_id"`
+	Generation int64     `json:"generation"`
+}
+
+type GetForgeApiOriginReservationRow struct {
+	ReservationIncarnation        pgtype.UUID `json:"reservation_incarnation"`
+	ReservationVersion            pgtype.Int8 `json:"reservation_version"`
+	ReservationObservationVersion pgtype.Int8 `json:"reservation_observation_version"`
+}
+
+// API twin of GetForgeOriginReservation: the reservation captured on the claim for the
+// server-derived api_origin. Advisory telemetry, never network or custody authority.
+func (q *Queries) GetForgeApiOriginReservation(ctx context.Context, arg GetForgeApiOriginReservationParams) (GetForgeApiOriginReservationRow, error) {
+	row := q.db.QueryRow(ctx, getForgeApiOriginReservation, arg.RunID, arg.WorkerID, arg.Generation)
+	var i GetForgeApiOriginReservationRow
+	err := row.Scan(&i.ReservationIncarnation, &i.ReservationVersion, &i.ReservationObservationVersion)
+	return i, err
 }
 
 const getForgeOriginCooldown = `-- name: GetForgeOriginCooldown :one
-SELECT c.user_id, c.worker_id, c.origin, c.incarnation, c.observation_version, c.failure_step, c.cooled_until, c.last_reason, c.observed_at, c.reservation_run_id, c.reservation_generation, c.reservation_incarnation, c.reservation_version, c.reservation_observation_version FROM forge_origin_cooldowns c
+SELECT c.user_id, c.worker_id, c.origin, c.incarnation, c.observation_version, c.failure_step, c.cooled_until, c.last_reason, c.observed_at, c.reservation_run_id, c.reservation_generation, c.reservation_incarnation, c.reservation_version, c.reservation_observation_version, c.git_unverified, c.api_unverified FROM forge_origin_cooldowns c
 JOIN workers w ON w.id = c.worker_id AND w.user_id = c.user_id
 WHERE c.user_id = $1::uuid AND c.worker_id = $2::uuid AND c.origin = $3::text
 `
@@ -103,6 +220,8 @@ func (q *Queries) GetForgeOriginCooldown(ctx context.Context, arg GetForgeOrigin
 		&i.ReservationIncarnation,
 		&i.ReservationVersion,
 		&i.ReservationObservationVersion,
+		&i.GitUnverified,
+		&i.ApiUnverified,
 	)
 	return i, err
 }
@@ -143,7 +262,7 @@ func (q *Queries) GetForgeOriginReservation(ctx context.Context, arg GetForgeOri
 }
 
 const listOwnerRunForgeOriginCooldowns = `-- name: ListOwnerRunForgeOriginCooldowns :many
-SELECT r.id AS run_id, c.origin, c.cooled_until,
+SELECT r.id AS run_id, c.origin, c.cooled_until, c.git_unverified, c.api_unverified,
        ('forge_clone_success_v1' = ANY(w.protocol_capabilities))::boolean AS success_reporting,
        (c.reservation_run_id IS NOT NULL)::boolean AS reserved,
        COALESCE((SELECT probe.id::text FROM runs probe
@@ -155,17 +274,21 @@ SELECT r.id AS run_id, c.origin, c.cooled_until,
           AND probe.worker_id = c.worker_id AND probe.claim_generation = c.reservation_generation
           AND probe.status IN ('claimed','running','awaiting_approval','awaiting_input','awaiting_followup')
           AND probe.claim_released_at IS NULL AND probe.stop_kind IS NULL
-          AND m.origin = c.origin AND m.reservation_incarnation = c.incarnation
-          AND c.reservation_incarnation = c.incarnation AND m.reservation_version = c.reservation_version
+          AND c.reservation_incarnation = c.incarnation
+          AND ((m.origin = c.origin AND m.reservation_incarnation = c.incarnation
+                AND m.reservation_version = c.reservation_version)
+            OR (m.api_origin = c.origin AND m.api_reservation_incarnation = c.incarnation
+                AND m.api_reservation_version = c.reservation_version))
        ), '')::text AS half_open_run_id
 FROM runs r
 JOIN workers w ON w.id = r.worker_id AND w.user_id = r.user_id
 JOIN authorized_forge_origins current_origin ON current_origin.repo_id = r.repo_id AND current_origin.user_id = r.user_id
-JOIN forge_origin_cooldowns c ON c.user_id = r.user_id AND c.worker_id = w.id AND c.origin = current_origin.origin
+JOIN forge_origin_cooldowns c ON c.user_id = r.user_id AND c.worker_id = w.id
+  AND c.origin IN (current_origin.origin, current_origin.api_origin)
 WHERE r.user_id = $1::uuid AND r.id = ANY($2::uuid[])
   AND r.kind <> 'chat' AND r.egress_profile_id IS NULL
   AND r.status NOT IN ('completed','failed','cancelled')
-ORDER BY r.id
+ORDER BY r.id, c.cooled_until DESC, c.origin
 `
 
 type ListOwnerRunForgeOriginCooldownsParams struct {
@@ -177,12 +300,15 @@ type ListOwnerRunForgeOriginCooldownsRow struct {
 	RunID            uuid.UUID          `json:"run_id"`
 	Origin           string             `json:"origin"`
 	CooledUntil      pgtype.Timestamptz `json:"cooled_until"`
+	GitUnverified    bool               `json:"git_unverified"`
+	ApiUnverified    bool               `json:"api_unverified"`
 	SuccessReporting bool               `json:"success_reporting"`
 	Reserved         bool               `json:"reserved"`
 	HalfOpenRunID    string             `json:"half_open_run_id"`
 }
 
-// At most one row per requested owner run. Current authorized identity only;
+// At most two rows per requested owner run (the Git and the API origin), the later
+// deadline first. Current authorized identity only;
 // repo-less, isolated and chat runs do not use this direct-forge cooldown lane.
 func (q *Queries) ListOwnerRunForgeOriginCooldowns(ctx context.Context, arg ListOwnerRunForgeOriginCooldownsParams) ([]ListOwnerRunForgeOriginCooldownsRow, error) {
 	rows, err := q.db.Query(ctx, listOwnerRunForgeOriginCooldowns, arg.UserID, arg.RunIds)
@@ -197,6 +323,8 @@ func (q *Queries) ListOwnerRunForgeOriginCooldowns(ctx context.Context, arg List
 			&i.RunID,
 			&i.Origin,
 			&i.CooledUntil,
+			&i.GitUnverified,
+			&i.ApiUnverified,
 			&i.SuccessReporting,
 			&i.Reserved,
 			&i.HalfOpenRunID,
@@ -212,7 +340,7 @@ func (q *Queries) ListOwnerRunForgeOriginCooldowns(ctx context.Context, arg List
 }
 
 const listOwnerWorkerForgeOriginCooldowns = `-- name: ListOwnerWorkerForgeOriginCooldowns :many
-SELECT w.id AS worker_id, c.origin, c.cooled_until,
+SELECT w.id AS worker_id, c.origin, c.cooled_until, c.git_unverified, c.api_unverified,
        ('forge_clone_success_v1' = ANY(w.protocol_capabilities))::boolean AS success_reporting,
        (c.reservation_run_id IS NOT NULL)::boolean AS reserved,
        COALESCE((SELECT probe.id::text FROM runs probe
@@ -224,15 +352,18 @@ SELECT w.id AS worker_id, c.origin, c.cooled_until,
           AND probe.worker_id = c.worker_id AND probe.claim_generation = c.reservation_generation
           AND probe.status IN ('claimed','running','awaiting_approval','awaiting_input','awaiting_followup')
           AND probe.claim_released_at IS NULL AND probe.stop_kind IS NULL
-          AND m.origin = c.origin AND m.reservation_incarnation = c.incarnation
-          AND c.reservation_incarnation = c.incarnation AND m.reservation_version = c.reservation_version
+          AND c.reservation_incarnation = c.incarnation
+          AND ((m.origin = c.origin AND m.reservation_incarnation = c.incarnation
+                AND m.reservation_version = c.reservation_version)
+            OR (m.api_origin = c.origin AND m.api_reservation_incarnation = c.incarnation
+                AND m.api_reservation_version = c.reservation_version))
        ), '')::text AS half_open_run_id
 FROM workers w
 CROSS JOIN LATERAL (
-    SELECT fc.user_id, fc.worker_id, fc.origin, fc.incarnation, fc.observation_version, fc.failure_step, fc.cooled_until, fc.last_reason, fc.observed_at, fc.reservation_run_id, fc.reservation_generation, fc.reservation_incarnation, fc.reservation_version, fc.reservation_observation_version FROM forge_origin_cooldowns fc
+    SELECT fc.user_id, fc.worker_id, fc.origin, fc.incarnation, fc.observation_version, fc.failure_step, fc.cooled_until, fc.last_reason, fc.observed_at, fc.reservation_run_id, fc.reservation_generation, fc.reservation_incarnation, fc.reservation_version, fc.reservation_observation_version, fc.git_unverified, fc.api_unverified FROM forge_origin_cooldowns fc
     WHERE fc.user_id = w.user_id AND fc.worker_id = w.id
       AND EXISTS (SELECT 1 FROM authorized_forge_origins a
-                  WHERE a.user_id = fc.user_id AND a.origin = fc.origin)
+                  WHERE a.user_id = fc.user_id AND (a.origin = fc.origin OR a.api_origin = fc.origin))
     ORDER BY fc.cooled_until, fc.origin LIMIT 32
 ) c
 WHERE w.user_id = $1::uuid AND w.id = ANY($2::uuid[])
@@ -249,6 +380,8 @@ type ListOwnerWorkerForgeOriginCooldownsRow struct {
 	WorkerID         uuid.UUID          `json:"worker_id"`
 	Origin           string             `json:"origin"`
 	CooledUntil      pgtype.Timestamptz `json:"cooled_until"`
+	GitUnverified    bool               `json:"git_unverified"`
+	ApiUnverified    bool               `json:"api_unverified"`
 	SuccessReporting bool               `json:"success_reporting"`
 	Reserved         bool               `json:"reserved"`
 	HalfOpenRunID    string             `json:"half_open_run_id"`
@@ -270,6 +403,8 @@ func (q *Queries) ListOwnerWorkerForgeOriginCooldowns(ctx context.Context, arg L
 			&i.WorkerID,
 			&i.Origin,
 			&i.CooledUntil,
+			&i.GitUnverified,
+			&i.ApiUnverified,
 			&i.SuccessReporting,
 			&i.Reserved,
 			&i.HalfOpenRunID,
@@ -285,7 +420,7 @@ func (q *Queries) ListOwnerWorkerForgeOriginCooldowns(ctx context.Context, arg L
 }
 
 const lockForgeOriginCooldown = `-- name: LockForgeOriginCooldown :one
-SELECT c.user_id, c.worker_id, c.origin, c.incarnation, c.observation_version, c.failure_step, c.cooled_until, c.last_reason, c.observed_at, c.reservation_run_id, c.reservation_generation, c.reservation_incarnation, c.reservation_version, c.reservation_observation_version FROM forge_origin_cooldowns c
+SELECT c.user_id, c.worker_id, c.origin, c.incarnation, c.observation_version, c.failure_step, c.cooled_until, c.last_reason, c.observed_at, c.reservation_run_id, c.reservation_generation, c.reservation_incarnation, c.reservation_version, c.reservation_observation_version, c.git_unverified, c.api_unverified FROM forge_origin_cooldowns c
 JOIN workers w ON w.id = c.worker_id AND w.user_id = c.user_id
 WHERE c.user_id = $1::uuid AND c.worker_id = $2::uuid AND c.origin = $3::text
 FOR UPDATE OF c
@@ -318,6 +453,8 @@ func (q *Queries) LockForgeOriginCooldown(ctx context.Context, arg LockForgeOrig
 		&i.ReservationIncarnation,
 		&i.ReservationVersion,
 		&i.ReservationObservationVersion,
+		&i.GitUnverified,
+		&i.ApiUnverified,
 	)
 	return i, err
 }
@@ -350,6 +487,70 @@ func (q *Queries) LockForgeOriginWorker(ctx context.Context, arg LockForgeOrigin
 	return id, err
 }
 
+const observeParkedForgeApiOrigin = `-- name: ObserveParkedForgeApiOrigin :execrows
+WITH mapping AS MATERIALIZED (
+    SELECT m.user_id, m.worker_id, m.api_origin AS origin
+    FROM run_forge_origins m
+    JOIN runs r ON r.id = m.run_id AND r.user_id = m.user_id
+        AND r.worker_id = m.worker_id AND r.claim_generation = m.generation
+    JOIN workers w ON w.id = m.worker_id AND w.user_id = m.user_id
+    JOIN authorized_forge_origins a
+      ON a.repo_id = r.repo_id AND a.connection_id = m.connection_id
+        AND a.user_id = m.user_id AND a.api_origin = m.api_origin
+    WHERE r.id = $4::uuid AND r.worker_id = $5::uuid
+      AND r.claim_generation = $6::bigint
+      AND r.status = 'recovery_wait' AND r.recovery_wait_cause = 'forge_unreachable'
+      AND r.claim_released_at IS NULL
+      AND m.api_origin IS NOT NULL
+    FOR SHARE OF a NOWAIT
+)
+INSERT INTO forge_origin_cooldowns
+    (user_id, worker_id, origin, failure_step, cooled_until, last_reason, observed_at, git_unverified, api_unverified)
+SELECT m.user_id, m.worker_id, m.origin, 0,
+       clock_timestamp() + ($1::float8 * interval '1 millisecond'),
+       $2::text, clock_timestamp(), false, true
+FROM mapping m
+ON CONFLICT (user_id, worker_id, origin) DO UPDATE SET
+    failure_step = LEAST(forge_origin_cooldowns.failure_step + 1, 30),
+    observation_version = forge_origin_cooldowns.observation_version + 1,
+    cooled_until = clock_timestamp() +
+        (LEAST($1::float8 * power(2::float8,
+            LEAST(forge_origin_cooldowns.failure_step + 1, 30)),
+            $3::float8) * interval '1 millisecond'),
+    last_reason = $2::text,
+    api_unverified = true,
+    observed_at = clock_timestamp()
+`
+
+type ObserveParkedForgeApiOriginParams struct {
+	BaseMs     float64   `json:"base_ms"`
+	Reason     string    `json:"reason"`
+	CapMs      float64   `json:"cap_ms"`
+	RunID      uuid.UUID `json:"run_id"`
+	WorkerID   uuid.UUID `json:"worker_id"`
+	Generation int64     `json:"generation"`
+}
+
+// API-surface twin of ObserveParkedForgeOrigin (issue #1324 D9): same lock order, same
+// backoff and observation_version advance, keyed on the claim snapshot's server-derived
+// api_origin (never a worker-sent URL) and checked against the current authorized
+// projection. Sets api_unverified; an equal Git and API origin share one row whose Git
+// flag is untouched. A new row starts git-verified.
+func (q *Queries) ObserveParkedForgeApiOrigin(ctx context.Context, arg ObserveParkedForgeApiOriginParams) (int64, error) {
+	result, err := q.db.Exec(ctx, observeParkedForgeApiOrigin,
+		arg.BaseMs,
+		arg.Reason,
+		arg.CapMs,
+		arg.RunID,
+		arg.WorkerID,
+		arg.Generation,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const observeParkedForgeOrigin = `-- name: ObserveParkedForgeOrigin :execrows
 WITH mapping AS MATERIALIZED (
     SELECT m.user_id, m.worker_id, m.origin
@@ -360,8 +561,8 @@ WITH mapping AS MATERIALIZED (
     JOIN authorized_forge_origins a
       ON a.repo_id = r.repo_id AND a.connection_id = m.connection_id
         AND a.user_id = m.user_id AND a.origin = m.origin
-    WHERE r.id = $3::uuid AND r.worker_id = $4::uuid
-      AND r.claim_generation = $5::bigint
+    WHERE r.id = $4::uuid AND r.worker_id = $5::uuid
+      AND r.claim_generation = $6::bigint
       AND r.status = 'recovery_wait' AND r.recovery_wait_cause = 'forge_unreachable'
       AND r.claim_released_at IS NULL
     -- OF the view locks both its repo and connection rows. NOWAIT avoids
@@ -370,10 +571,10 @@ WITH mapping AS MATERIALIZED (
     FOR SHARE OF a NOWAIT
 )
 INSERT INTO forge_origin_cooldowns
-    (user_id, worker_id, origin, failure_step, cooled_until, last_reason, observed_at)
+    (user_id, worker_id, origin, failure_step, cooled_until, last_reason, observed_at, git_unverified, api_unverified)
 SELECT m.user_id, m.worker_id, m.origin, 0,
        clock_timestamp() + ($1::float8 * interval '1 millisecond'),
-       'transient_clone_fetch_exhausted', clock_timestamp()
+       $2::text, clock_timestamp(), true, false
 FROM mapping m
 ON CONFLICT (user_id, worker_id, origin) DO UPDATE SET
     failure_step = LEAST(forge_origin_cooldowns.failure_step + 1, 30),
@@ -381,13 +582,15 @@ ON CONFLICT (user_id, worker_id, origin) DO UPDATE SET
     cooled_until = clock_timestamp() +
         (LEAST($1::float8 * power(2::float8,
             LEAST(forge_origin_cooldowns.failure_step + 1, 30)),
-            $2::float8) * interval '1 millisecond'),
-    last_reason = 'transient_clone_fetch_exhausted',
+            $3::float8) * interval '1 millisecond'),
+    last_reason = $2::text,
+    git_unverified = true,
     observed_at = clock_timestamp()
 `
 
 type ObserveParkedForgeOriginParams struct {
 	BaseMs     float64   `json:"base_ms"`
+	Reason     string    `json:"reason"`
 	CapMs      float64   `json:"cap_ms"`
 	RunID      uuid.UUID `json:"run_id"`
 	WorkerID   uuid.UUID `json:"worker_id"`
@@ -397,9 +600,13 @@ type ObserveParkedForgeOriginParams struct {
 // Caller holds the authenticated exact-generation run lock and has applied its
 // forge park in this transaction. M2 must use the same authorized projection,
 // locking claimant worker then run before any cooldown/reservation row.
+// Git-surface evidence: sets git_unverified, leaves the API flag alone. The reason
+// is a closed set the table CHECK enforces (transient_clone_fetch_exhausted for the
+// pre-clone park, transient_publication_exhausted for a publication park).
 func (q *Queries) ObserveParkedForgeOrigin(ctx context.Context, arg ObserveParkedForgeOriginParams) (int64, error) {
 	result, err := q.db.Exec(ctx, observeParkedForgeOrigin,
 		arg.BaseMs,
+		arg.Reason,
 		arg.CapMs,
 		arg.RunID,
 		arg.WorkerID,
