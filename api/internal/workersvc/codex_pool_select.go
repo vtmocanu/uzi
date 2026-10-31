@@ -100,8 +100,9 @@ func (s *Service) selectCodexPoolAlias(ctx context.Context, q *store.Queries, us
 		return codexPoolPick{}, fmt.Errorf("codex pool select: %w", err)
 	}
 	interval := s.p.CodexUsagePollInterval
-	// Vault state is read on the create transaction (q), never through the pool: a second
-	// connection would wait on locks this transaction holds.
+	// Vault state is read on the create transaction (q) so the read sees the state this
+	// transaction commits with, and no second pool connection is acquired while this one is held.
+	// A plain SELECT never waits on row locks, so lock waiting is not the reason.
 	vaultLocked := !s.codexVaultUnlocked(vault.WithStateReader(ctx, q), userID)
 
 	cands := make([]codexselect.Candidate, 0, len(order))
