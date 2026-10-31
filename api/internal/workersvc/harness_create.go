@@ -39,6 +39,11 @@ var (
 	// ErrNoCredentialForHarness (still refused, never a fallback); the scheduler maps it to the
 	// credential_disabled skip and the handler names Settings in the refusal.
 	ErrHarnessCredentialDisabled = errHarnessCredentialDisabled
+	// ErrCodexPoolUnavailable is the exported alias of errCodexPoolUnavailable (issue #3719): an
+	// explicit Codex harness for a user in codex_account_mode 'auto' whose configured pool has no
+	// bindable alias. It wraps ErrNoCredentialForHarness (still refused, never a fallback); the
+	// scheduler maps it to the codex_pool_unavailable skip and the handlers add the typed reason.
+	ErrCodexPoolUnavailable = errCodexPoolUnavailable
 )
 
 // RawCredentialOverride is an UNVALIDATED create-time credential-override request threaded from

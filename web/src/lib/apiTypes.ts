@@ -2089,6 +2089,7 @@ export type ScheduleSkipReason =
   | "schedules_paused"
   | "no_usable_credential"
   | "credential_disabled"
+  | "codex_pool_unavailable"
   | "ci_green"
   | "ci_already_handled"
   | "ci_halted_no_progress"
