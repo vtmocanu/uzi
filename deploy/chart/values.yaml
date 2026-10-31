@@ -651,8 +651,9 @@ workers:
   # `{}` does NOT clear it: Helm deep-merges maps into the default, so `{}` keeps
   # `kubernetes.io/arch: amd64`. Removing one key takes `<key>: null`.
   #
-  # Changing it re-hashes the worker pod template, so existing workers go through the
-  # normal paced drain-and-roll.
+  # Changing it re-hashes the worker pod template: persistent workers go through the
+  # normal paced drain-and-roll; run-bound (ephemeral) workers are outside the pacing
+  # pools but keep the busy-drift deferral, so a busy one is not replaced mid-run.
   nodeSelector:
     kubernetes.io/arch: amd64
   # A cluster-scoped PriorityClass for hosted worker pods (issue #1341). When enabled,

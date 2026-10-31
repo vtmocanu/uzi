@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -79,11 +80,11 @@ func enforcingClient(t *testing.T, objects ...runtime.Object) *fake.Clientset {
 		if err != nil {
 			return true, nil, err
 		}
-		obj := old.DeepCopyObject()
-		// Unmarshal into an empty annotations map: a removed merge-patch key
-		// must not survive from the previous object in the fake response.
-		fresh, _ := meta.Accessor(obj)
-		fresh.SetAnnotations(nil)
+		// Decode into a ZERO object of the same type, as the apiserver effectively does.
+		// Unmarshalling over a copy of the old object would keep every map key the merge
+		// patch removed (annotations, a pod template's nodeSelector): encoding/json only
+		// adds keys to a non-nil map.
+		obj := reflect.New(reflect.TypeOf(old).Elem()).Interface().(runtime.Object)
 		if err := json.Unmarshal(patched, obj); err != nil {
 			return true, nil, err
 		}

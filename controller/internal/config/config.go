@@ -753,33 +753,33 @@ func validateDockerTier(cfg *Config) error {
 	return nil
 }
 
-// parseQuantityEnv reads an optional k8s-quantity env var into dst, leaving dst
-// untouched when the var is unset or blank (so the render side supplies its default).
-//
-// A typo is a BOOT error rather than a silent skip, and this one earns the strictness:
-// an unparseable quantity would otherwise surface at the far end as a pod or PVC the
-// apiserver rejects, i.e. a worker that provisions and never appears, with nothing in
-// this controller's logs naming the cause.
 // parseNodeSelector reads UZI_WORKER_NODE_SELECTOR. Every key must be a valid label
 // key and every value a valid label value, checked here at boot: the API server would
 // accept neither on a Deployment, so a bad selector would otherwise surface only as
-// workers that never appear.
+// workers that never appear. A top-level null means no selector, but a null MEMBER is
+// refused: decoded into a plain string it would become "", a valid label value, and
+// every worker would then require an empty label and stay Pending.
 func parseNodeSelector(raw string) (map[string]string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || raw == "null" {
 		return nil, nil
 	}
-	var sel map[string]string
-	if err := json.Unmarshal([]byte(raw), &sel); err != nil {
+	var members map[string]*string
+	if err := json.Unmarshal([]byte(raw), &members); err != nil {
 		return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR=%q is not a JSON object of label key to string value: %w", raw, err)
 	}
-	for k, v := range sel {
+	sel := make(map[string]string, len(members))
+	for k, v := range members {
+		if v == nil {
+			return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR: key %q has a null value; give it a string value or remove the key", k)
+		}
 		if errs := validation.IsQualifiedName(k); len(errs) > 0 {
 			return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR: key %q is not a valid label key: %s", k, strings.Join(errs, "; "))
 		}
-		if errs := validation.IsValidLabelValue(v); len(errs) > 0 {
-			return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR: value %q for key %q is not a valid label value: %s", v, k, strings.Join(errs, "; "))
+		if errs := validation.IsValidLabelValue(*v); len(errs) > 0 {
+			return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR: value %q for key %q is not a valid label value: %s", *v, k, strings.Join(errs, "; "))
 		}
+		sel[k] = *v
 	}
 	if len(sel) == 0 {
 		return nil, nil
@@ -787,6 +787,13 @@ func parseNodeSelector(raw string) (map[string]string, error) {
 	return sel, nil
 }
 
+// parseQuantityEnv reads an optional k8s-quantity env var into dst, leaving dst
+// untouched when the var is unset or blank (so the render side supplies its default).
+//
+// A typo is a BOOT error rather than a silent skip, and this one earns the strictness:
+// an unparseable quantity would otherwise surface at the far end as a pod or PVC the
+// apiserver rejects, i.e. a worker that provisions and never appears, with nothing in
+// this controller's logs naming the cause.
 func parseQuantityEnv(key string, dst *string) error {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {

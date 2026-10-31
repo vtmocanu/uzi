@@ -540,6 +540,8 @@ func TestLoadParsesTheWorkerNodeSelector(t *testing.T) {
 		"{}":                             nil,
 		`{"kubernetes.io/arch":"amd64"}`: {"kubernetes.io/arch": "amd64"},
 		`{"kubernetes.io/arch":"arm64","pool":"a"}`: {"kubernetes.io/arch": "arm64", "pool": "a"},
+		// An explicit empty value is a valid label value ("label present and empty").
+		`{"pool":""}`: {"pool": ""},
 	} {
 		t.Run(raw, func(t *testing.T) {
 			setWorkerEnv(t)
@@ -565,6 +567,9 @@ func TestLoadRejectsABadWorkerNodeSelector(t *testing.T) {
 		`{"bad key!":"amd64"}`,
 		`{"kubernetes.io/arch":"not a label value"}`,
 		`{"kubernetes.io/arch":"amd64"`,
+		// A null member would decode to "" and pin every worker to an empty label.
+		`{"kubernetes.io/arch":null}`,
+		`{"pool":"a","kubernetes.io/arch":null}`,
 	} {
 		t.Run(bad, func(t *testing.T) {
 			setWorkerEnv(t)
