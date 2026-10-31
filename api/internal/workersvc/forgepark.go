@@ -172,6 +172,11 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 	// so anything but one refuses the park (rollback → 409 custody_unsettled). Holding the row
 	// lock across the release stops a concurrent reconciler release from turning a verified single
 	// hold into zero between the count and the release.
+	//
+	// Lock order note: the documented order is worker, run, side row, custody, cooldown. This
+	// custody lock precedes the side-row read and write below, but the run row lock taken above
+	// serializes every writer of an enrolled run's side row and custody holds, so no writer can
+	// hold the side row and wait on custody while this one holds custody and waits on the side row.
 	holdIDs, err := qtx.LockOpenCustodyHoldsForRunWorkerGeneration(ctx, store.LockOpenCustodyHoldsForRunWorkerGenerationParams{
 		RunID:      run.ID,
 		Generation: *req.ClaimGeneration,
@@ -187,13 +192,30 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 	if err != nil {
 		return store.Run{}, 0, err
 	}
+	// Issue #1324 D3: a run with an active publication intent has unpublished work, so it never
+	// takes the pre-clone path below. The check follows the generation and already-parked checks
+	// above (so a duplicate is still a no-op) and precedes the no_adopted_source release, which
+	// therefore never runs for an enrolled run; forge_park_count is not bumped either. A stamped
+	// stop still cancels through the existing arm, without that release.
+	intent, ierr := qtx.GetActivePublicationResume(ctx, run.ID)
+	enrolled := ierr == nil
+	if ierr != nil && !errors.Is(ierr, pgx.ErrNoRows) {
+		return store.Run{}, 0, ierr
+	}
+	stopping := run.StopKind.Valid && run.StopKind.String != ""
+	if enrolled && !stopping {
+		if err := publicationParkRefusal(wkr, req); err != nil {
+			return run, 0, err
+		}
+		return s.parkPublicationForgeUnreachable(ctx, tx, qtx, wkr, run, intent, req, sessionID)
+	}
+
 	// A delivered claim can have adopted local sources before reporting a forge failure.
 	// Retain guarded inventory through this park; only the server's pre-delivery
 	// ReleaseClaimCustodyNoAdoptedSource path supplies that final disposition.
 	maxParks := s.p.RunForgeUnreachableMaxParks
 	capHold := maxParks != 0 && int(run.ForgeParkCount) >= maxParks
-	stopping := run.StopKind.Valid && run.StopKind.String != ""
-	if !hold.InventoryGuarded && (!capHold || stopping) {
+	if !enrolled && !hold.InventoryGuarded && (!capHold || stopping) {
 		released, err := qtx.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
 			RunID: run.ID, Generation: *req.ClaimGeneration, WorkerID: wkr.ID,
 			ReleaseEvidence: pgconv.TextOrNull("no_adopted_source"),

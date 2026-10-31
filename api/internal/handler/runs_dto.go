@@ -318,6 +318,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// is the forge-only lifetime counter; ForgeParkMax is the effective cap passed in
 		// (0 = unlimited). All four surface for every run (SC5), independent of each other.
 		RecoveryWaitCause:      textPtrValue(r.RecoveryWaitCause.Valid, r.RecoveryWaitCause.String),
+		RecoveryWaitPhase:      textPtrValue(r.RecoveryWaitPhase.Valid, r.RecoveryWaitPhase.String),
 		RecoveryRetryNotBefore: timePtr(r.RecoveryRetryNotBefore.Valid, r.RecoveryRetryNotBefore.Time),
 		ForgeParkCount:         int(r.ForgeParkCount),
 		ForgeParkMax:           forgeParkMax,

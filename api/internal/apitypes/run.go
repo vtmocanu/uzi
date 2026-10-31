@@ -888,6 +888,24 @@ type RunDTO struct {
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
 	RecoveryWaitCause *string `json:"recovery_wait_cause"`
+	// RecoveryWaitPhase (issue #1324) says which part of the run the 'recovery_wait' park
+	// interrupted. "publication" is a forge outage met while publishing: the run keeps its
+	// publication intent and resumes publication only. Null for every other park (the pre-clone
+	// forge park included). Clients render an unrecognised value honestly.
+	RecoveryWaitPhase *string `json:"recovery_wait_phase"`
+	// Publication park diagnostics (issue #1324), set only while the run holds an active
+	// publication intent and omitted otherwise. WaitStartedAt is when the current owner episode's
+	// wait began (the clock the limit is measured from; absent between episodes), WaitLimitSeconds
+	// is RUN_PROVIDER_PARK_MAX_DURATION (absent when the hold is disabled), HoldReason is the
+	// reason of an owner hold ("publication_retry_exhausted", "publication_custodian_unavailable",
+	// ...), FirstWaitAt/ParkTotal are lifetime diagnostics and Episode counts owner resumes.
+	PublicationWaitStartedAt    *time.Time            `json:"publication_wait_started_at,omitempty"`
+	PublicationWaitLimitSeconds *int                  `json:"publication_wait_limit_seconds,omitempty"`
+	PublicationHoldReason       *string               `json:"publication_hold_reason,omitempty"`
+	PublicationFirstWaitAt      *time.Time            `json:"publication_first_wait_at,omitempty"`
+	PublicationParkTotal        *int                  `json:"publication_park_total,omitempty"`
+	PublicationEpisode          *int                  `json:"publication_episode,omitempty"`
+	PublicationIntent           *PublicationIntentDTO `json:"publication_intent,omitempty"`
 	// CodexAccountAction is what a run held on its Codex subscription account needs next
 	// (PRD #1590 D6). It is non-null only for a 'recovery_wait' run whose RecoveryWaitCause is
 	// "codex_account_unavailable", and is derived at read time from the run's frozen binding
@@ -1744,6 +1762,24 @@ type RunSummaryItemDTO struct {
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
 	RecoveryWaitCause *string `json:"recovery_wait_cause"`
+	// RecoveryWaitPhase (issue #1324) says which part of the run the 'recovery_wait' park
+	// interrupted. "publication" is a forge outage met while publishing: the run keeps its
+	// publication intent and resumes publication only. Null for every other park (the pre-clone
+	// forge park included). Clients render an unrecognised value honestly.
+	RecoveryWaitPhase *string `json:"recovery_wait_phase"`
+	// Publication park diagnostics (issue #1324), set only while the run holds an active
+	// publication intent and omitted otherwise. WaitStartedAt is when the current owner episode's
+	// wait began (the clock the limit is measured from; absent between episodes), WaitLimitSeconds
+	// is RUN_PROVIDER_PARK_MAX_DURATION (absent when the hold is disabled), HoldReason is the
+	// reason of an owner hold ("publication_retry_exhausted", "publication_custodian_unavailable",
+	// ...), FirstWaitAt/ParkTotal are lifetime diagnostics and Episode counts owner resumes.
+	PublicationWaitStartedAt    *time.Time            `json:"publication_wait_started_at,omitempty"`
+	PublicationWaitLimitSeconds *int                  `json:"publication_wait_limit_seconds,omitempty"`
+	PublicationHoldReason       *string               `json:"publication_hold_reason,omitempty"`
+	PublicationFirstWaitAt      *time.Time            `json:"publication_first_wait_at,omitempty"`
+	PublicationParkTotal        *int                  `json:"publication_park_total,omitempty"`
+	PublicationEpisode          *int                  `json:"publication_episode,omitempty"`
+	PublicationIntent           *PublicationIntentDTO `json:"publication_intent,omitempty"`
 	// CodexAccountAction is what a run held on its Codex subscription account needs next
 	// (PRD #1590 D6). It is non-null only for a 'recovery_wait' run whose RecoveryWaitCause is
 	// "codex_account_unavailable", and is derived at read time from the run's frozen binding
@@ -2046,6 +2082,14 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		LimitWaitCount:                item.LimitWaitCount,
 		RateLimitType:                 item.RateLimitType,
 		RecoveryWaitCause:             item.RecoveryWaitCause,
+		RecoveryWaitPhase:             item.RecoveryWaitPhase,
+		PublicationWaitStartedAt:      item.PublicationWaitStartedAt,
+		PublicationWaitLimitSeconds:   item.PublicationWaitLimitSeconds,
+		PublicationHoldReason:         item.PublicationHoldReason,
+		PublicationFirstWaitAt:        item.PublicationFirstWaitAt,
+		PublicationParkTotal:          item.PublicationParkTotal,
+		PublicationEpisode:            item.PublicationEpisode,
+		PublicationIntent:             item.PublicationIntent,
 		ForgeOriginCooldown:           item.ForgeOriginCooldown,
 		CodexAccountAction:            item.CodexAccountAction,
 		CodexSecretID:                 item.CodexSecretID,
@@ -2222,6 +2266,14 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			LimitWaitCount:                s.LimitWaitCount,
 			RateLimitType:                 s.RateLimitType,
 			RecoveryWaitCause:             s.RecoveryWaitCause,
+			RecoveryWaitPhase:             s.RecoveryWaitPhase,
+			PublicationWaitStartedAt:      s.PublicationWaitStartedAt,
+			PublicationWaitLimitSeconds:   s.PublicationWaitLimitSeconds,
+			PublicationHoldReason:         s.PublicationHoldReason,
+			PublicationFirstWaitAt:        s.PublicationFirstWaitAt,
+			PublicationParkTotal:          s.PublicationParkTotal,
+			PublicationEpisode:            s.PublicationEpisode,
+			PublicationIntent:             s.PublicationIntent,
 			ForgeOriginCooldown:           s.ForgeOriginCooldown,
 			CodexAccountAction:            s.CodexAccountAction,
 			CodexSecretID:                 s.CodexSecretID,

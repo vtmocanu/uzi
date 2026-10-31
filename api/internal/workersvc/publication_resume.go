@@ -372,6 +372,14 @@ type runFenceQueries interface {
 func optInRunFences(ctx context.Context, q runFenceQueries, workerID uuid.UUID, workerLocked bool) error {
 	if !workerLocked {
 		if _, err := q.GetWorkerForUpdate(ctx, workerID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				// The worker row is gone (deleted). Callers that tolerate that (the owner
+				// Resume and the completion-hold continue) still need the opt-ins for the side
+				// row write that follows, so set them and report the missing row.
+				if optErr := q.OptInRunFences(ctx); optErr != nil {
+					return optErr
+				}
+			}
 			return err
 		}
 	}

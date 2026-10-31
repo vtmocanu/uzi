@@ -3099,6 +3099,18 @@ export interface SemanticDriftDTO {
   contradiction: boolean;
 }
 
+/** Issue #1324: the active write-ahead publication intent of a run. No URL, path or
+ *  credential. `original_head` and `candidate` are shortened object ids; `candidate` is
+ *  null until a candidate commit exists and `mr_iid` until the merge request exists. */
+export interface PublicationIntent {
+  branch: string;
+  mr_iid: number | null;
+  original_head: string;
+  candidate: string | null;
+  state: string;
+  enrollment_seq: number;
+}
+
 export interface Run {
   forge_origin_cooldown?: ForgeOriginCooldown;
   capability_provenance?: {
@@ -3594,6 +3606,23 @@ export interface Run {
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
   recovery_wait_cause: string | null;
+  /** Issue #1324: which part of the run a `recovery_wait` park interrupted. "publication"
+   *  is a forge outage met while publishing: the run keeps its publication intent and
+   *  resumes publication only. Null for every other park. Render an unrecognised value
+   *  honestly. */
+  recovery_wait_phase?: string | null;
+  /** Issue #1324 publication park diagnostics, present only while the run holds an active
+   *  publication intent. `publication_wait_started_at` is when the current owner episode's
+   *  wait began (absent between episodes); `publication_wait_limit_seconds` is the elapsed
+   *  limit (absent when the hold is disabled); `publication_hold_reason` names an owner hold
+   *  ("publication_retry_exhausted", "publication_custodian_unavailable", ...). */
+  publication_wait_started_at?: string;
+  publication_wait_limit_seconds?: number;
+  publication_hold_reason?: string;
+  publication_first_wait_at?: string;
+  publication_park_total?: number;
+  publication_episode?: number;
+  publication_intent?: PublicationIntent;
   /** PRD #1590 D6: what a run held on its Codex subscription account needs next. Non-null
    *  only for a `recovery_wait` run whose recovery_wait_cause is "codex_account_unavailable";
    *  derived at read time from the run's frozen binding and never persisted. Known values:
