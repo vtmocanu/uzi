@@ -335,17 +335,35 @@ func TestPodEpochNegativesStayAtAdded(t *testing.T) {
 func TestPodEpochSuccessorPendingBudget(t *testing.T) {
 	h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 	before := h.session.bytes
+	negative := newEpochHarness(t, epochPod(epochA))
+	negativeBefore := negative.session.bytes
+	negative.event(watch.Added, epochPod(epochB))
+	negativeAddedDelta := negative.session.bytes - negativeBefore
+	negAttempt := negative.session.attempts[epochB]
+	negativePayload := negAttempt.negativeCost + negAttempt.issuedCost
+	if negativePayload == 0 {
+		t.Fatal("negative control did not retain payload")
+	}
 	h.event(watch.Added, epochPod(epochB))
 	r := h.session.records[epochB]
 	if r.pending == nil || r.pendingCost < 500 {
 		t.Fatalf("pending not charged or too small to discriminate: %d", r.pendingCost)
 	}
 	charged := h.session.bytes
+	positiveAddedDelta := charged - before
+	if got := positiveAddedDelta - negativeAddedDelta + negativePayload; got != r.pendingCost {
+		t.Fatalf("pending charge=%d want=%d", got, r.pendingCost)
+	}
 	d := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
 	if r = h.session.records[epochB]; r.pending == nil || r.pendingCost == 0 || h.session.bytes <= charged {
 		t.Fatal("proof and issued document must stay charged before delivery")
 	}
+	beforeDelivery := h.session.bytes
+	payload := r.pendingCost + h.session.attempts[epochB].issuedCost
 	h.assertDecision(d, true)
+	if h.session.bytes != beforeDelivery-payload {
+		t.Fatalf("payload refund=%d want=%d", beforeDelivery-h.session.bytes, payload)
+	}
 	if r.pending != nil || r.pendingCost != 0 {
 		t.Fatal("proof not released on success")
 	}

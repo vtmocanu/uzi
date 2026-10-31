@@ -420,15 +420,15 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 		s.mu.Unlock()
 		return nil, errors.New("stale or canceled session")
 	}
+	for uid, a := range s.attempts {
+		s.checkDelivery(uid, a)
+	}
 	if s.overflow {
 		s.mu.Unlock()
 		return nil, nil
 	}
 	uid := string(p.UID)
 	old := s.records[uid]
-	if a := s.attempts[uid]; a != nil {
-		s.checkDelivery(uid, a)
-	}
 	if old != nil && string(old.raw) == string(raw) && (event != watch.Deleted || old.deleted) {
 		s.mu.Unlock()
 		return nil, nil
@@ -930,6 +930,11 @@ func (s *PodEpochSession) Deliver(ctx context.Context, d *PodEpochDecision) erro
 	defer s.mu.Unlock()
 	if d == nil || d.session != s || d.generation != s.generation || s.overflow {
 		return errors.New("stale decision")
+	}
+	for uid, a := range s.attempts {
+		if uid != d.uid {
+			s.checkDelivery(uid, a)
+		}
 	}
 	a := s.attempts[d.uid]
 	if ctx.Err() != nil {

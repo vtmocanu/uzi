@@ -147,7 +147,12 @@ while regressions or changed terminal container identities refuse evidence.
 The caps are 4096 distinct pod UIDs plus claim UIDs, and 16 MiB of retained proof
 metadata (serialized pod snapshots, terminal snapshots, keys, receipts, and
 conservative per-record/membership allowances), including per-UID delivery
-bookkeeping, retained payloads and issued decisions. Pending proof survives
+bookkeeping, retained payloads and issued decisions. Observation accounting
+also reserves 64 bytes per pod/claim identity key, including baseline and
+maintenance-receipt keys, and the encoded size of each cached resolved identity.
+Those costs remain charged while cached, until Reset/invalidation. This broader
+accounting can reach overflow earlier than before #3739 without changing the
+16 MiB cap. Pending proof survives
 conflicts; success or permanent stop releases payloads. Stopped bookkeeping and
 tombstones remain until Reset/invalidation; quiet watches have no timer eviction.
 Delivery stops on deletion, terminal phase including unaudited termination,
