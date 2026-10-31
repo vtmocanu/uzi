@@ -97,6 +97,7 @@ import { followSuccessfulPush as m2FollowPush } from "./publication-fixture.js";
 import { shutdownContentProof } from "./shutdown-3101-content-fixture.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { closingDirectiveFor as m2ClosingDirective } from "../src/pr-description.js";
+import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
@@ -13979,6 +13980,52 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
         JSON.stringify(m2Runner.api.states.filter(s => s.runId === claim.run_id)));
       assert.match(pr.description, /Approved Codex follow-up remains/);
       assert.equal(m2ClosingDirective(pr.description, 2172, "org/repo"), false);
+    });
+    it("issue #3721 all-met interlocked Codex run: broker non_closing + deferred scope notes deliver an open-issue PR with no completion hold", async () => {
+      m2Runner.api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
+      await m2Runner.client.register("codex-3721-owner-acceptance");
+      const prApi = new FakePrDescApi();
+      m2Runner.api.prDescription = prApi;
+      const reason = "Owner acceptance pending: live dev-cluster rollout check";
+      const rig = makeMultiEpochRig([script("th-1", [
+        (th, tn) => [done(3721, th, tn, {
+          milestones_completed: ["m1", "m2"],
+          non_closing: { reason },
+          pr_summary: {
+            what: "Adds the thing.",
+            scope_notes: [
+              { kind: "deferred", text: "Owner acceptance: live dev-cluster rollout check" },
+              { kind: "deferred", text: "Owner acceptance: dashboard sign-off" },
+            ],
+          },
+        })],
+      ])]);
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const delivery: Executor = { run: async ctx => {
+        commitInTree(ctx.worktreePath, "m3721.txt", "delivered work\n");
+        return executor.run(ctx);
+      } };
+      const { gitlab, pr } = m2Runner.fakeGitlab();
+      m2FollowPush(m2Runner.git, pr);
+      const claim = m2Runner.gitlabClaim(3721, {
+        claim_generation: 7, issue_title: "Fixes #3721", plan_md: "Two milestones; owner acceptance is planned outside them", plan_approved: true, plan_source: "seeded",
+        milestones: [{ id: "m1", title: "Build" }, { id: "m2", title: "Wire" }],
+        config: { completion_contract_version: 1, contract_revision: 1 },
+      });
+      m2Runner.api.setPublicationState(claim.run_id, [], 1);
+      m2Runner.api.setCompletionPermitResponse(true);
+      await m2Runner.runner(delivery, gitlab).execute(claim);
+      const states = m2Runner.api.states.filter(s => s.runId === claim.run_id).map(s => s.body.status);
+      assert.ok(states.includes("completed"), JSON.stringify(states));
+      assert.ok(!states.includes("awaiting_input"), "no completion question or owner-decision park");
+      assert.equal(m2Runner.api.completionHoldRequests.length, 0, "no completion hold");
+      assert.equal(m2Runner.api.completionPermitRequests.length, 1, "the permit is still requested");
+      assert.equal(m2ClosingDirective(pr.title + "\n" + pr.description, 3721, "org/repo"), false);
+      assert.doesNotMatch(pr.description, /Closes #3721/);
+      assert.ok(pr.title.includes("#3721"));
+      assert.ok(pr.description.includes(`> **Issue remains open.** ${reason}`), pr.description);
+      assert.match(pr.description, /- Deferred: Owner acceptance: live dev-cluster rollout check/);
+      assert.match(pr.description, /- Deferred: Owner acceptance: dashboard sign-off/);
     });
     it("m2 non-closing actual broker callback retitles a closing issue title (issue #2779)", async () => {
       const rig = makeMultiEpochRig([script("th-1", [
