@@ -1376,6 +1376,7 @@ tasks:
     cmds:
       - python3 -I -B scripts/release-watch.test.py
       - python3 -I -B scripts/release-journal.test.py
+      - python3 -I -B scripts/release-smoke-recovery.test.py
 
   test:release-auto:
     desc: offline release automation orchestration regressions

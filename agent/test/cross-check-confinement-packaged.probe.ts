@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 import {
   CODEX_BIN, SUPERVISOR_BIN, PROVIDER_CHILD_ARGV, launchCodexRoot, launchCodexEffectRoot,
-  type LauncherDeps, type CodexLaunchSpec,
+  type LauncherDeps, type CodexLaunchSpec, type SupervisorProcess,
 } from "../src/codex/launcher.js";
 import { createCodexTransport } from "../src/codex/transport.js";
 import { createCodexAppServerAuth } from "../src/codex/appserver-auth.js";
@@ -116,7 +116,7 @@ test("provider direct filesystem enforcement under real launcher posture", { tim
         const index = args.indexOf(CODEX_BIN);
         assert.ok(index >= 0);
         const actual = [...args.slice(0, index), process.execPath, "--eval", filesystemProbe, checkout, state, sibling];
-        return spawn(command, actual, { ...options, stdio: [...options.stdio] });
+        return spawn(command, actual, { ...options, stdio: [...options.stdio] }) as unknown as SupervisorProcess;
       },
     });
     const line = await new Promise<string>((resolve, reject) => {

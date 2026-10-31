@@ -10,6 +10,21 @@ the full Decision Log (D1-D9), the milestone breakdown and the verified code anc
 ADR restates the invariants a future edit to a claim clause, a custody-release path or a
 cleanup guard must not silently break.
 
+## Amendment 2026-10-30 — same-issue witness policy
+
+The approved #3654 policy adds the narrow cross-run `basis = same_issue_witness` to existing
+`merged_predecessor_discard` evidence. A failed/cancelled issue run without a
+recorded MR may abandon its OPEN custody after a distinct later completed run
+of the same owner/repository/positive own issue is freshly verified merged,
+subject to locked identity, live-run, dependency and publication vetoes. This is
+intentional loss policy, including unique work, not preservation proof. Available
+archives keep bytes, prerequisites and existing TTL; no new retention window,
+source/PVC guarantee or worker deletion authority follows. Same-run Option D,
+including issue-less completions, is unchanged. See the complete
+[ADR-2506 amendment](2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654)
+for eligibility, refusals, accepted races and bounds.
+#3031/#2969/#2884 retain their separate scope.
+
 ## Amendment 2026-10-14 — merged predecessor server discard (#2506)
 
 The maintainer selected the narrow policy in [ADR-2506](2506-merged-predecessor-discard.md):
@@ -26,6 +41,26 @@ existing operator-only #1786 disposal and retention guards remain. Option D's ph
 local-source and available-archive disposal is deferred to #2823 and #1373. #2506 remains
 partial and nonclosing. ADR-2506 records polling bounds, inherited unbounded response
 decoding, migration validation/locking risk and rollback's refusal to lose audit evidence.
+
+## Amendment 2026-10-29 — C1b prerequisite pin lifecycle (#3591)
+
+[ADR-3591](3591-prerequisite-closure.md) records the API-only pin lifecycle.
+Fresh default-tip D must positively cover each declared P (ancestor/equal);
+the invocation freezes D and forge binding before one create-only send.
+Unknown creation remains listing-only indefinitely; S7 cleans a pinned ref
+after confirmed capture expiry/discard with expected-tip CAS and confirmed
+absence. Cleanup exhaustion retains the live blocker, with no reset authority.
+
+D5's thin archive FINAL refusal and local-source retention remain in force:
+C1b has no feature advertisement, agent change or release predicate. T1–T5
+is a conditional trusted-worker proof, not server parsing/verification of Git
+bundle bytes. C2 owns the release amendment and FINAL-time revalidation.
+The existing “Later user deletion or rewriting is outside the proof” residual
+also applies to external prerequisite-pin deletion/history rewrite; pins can
+retain pre-purge history. This amendment authorizes no purge, manual pin delete,
+database override or clearing of unresolved evidence. Local native restore and
+omitted-prerequisite negatives are recorded in ADR-3591; exact-head hosted
+acceptance and timing remain pending.
 
 ## Context
 

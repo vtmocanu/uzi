@@ -221,8 +221,11 @@ keeps every observed attempt and explicitly counts omitted detail when it reache
 Release-commit main CI is report-only, with one observation and no automatic reruns. Automatic
 recovery was deliberately excluded: publication uses strict inherited coverage,
 the next RC needs a newer CI-bearing tip, and rerun isolation would change main
-cancellation behavior. Tagged-KinD and targeted assertion recovery remain
-fail-closed follow-up work. First-week contention measurements remain a rollout check.
+cancellation behavior. Protected CI opts into two infrastructure-only tagged
+KinD retries and one targeted `assert-tag-smoke` rerun after real smoke succeeds.
+Build/install/readiness/product checks, mixed/unknown failures and cancellation
+are not retried. Existing publication budgets stay separate and never reset.
+First-week contention measurements remain a rollout check.
 Read-only journal lookup failures do not stop publication observation; retries
 still require fresh complete evidence. Incident audits are capped at 64 rows and
 8,192 encoded bytes with explicit counts, while the prepare summary stays full.
@@ -231,6 +234,19 @@ API request can still consume the existing watcher job ceiling; no new timeout
 or transport isolation is added.
 Terminal journal write failures preserve the publication result and label any
 surviving attempt records incomplete. Retry requests still require a saved reservation.
+KinD retries require matching tagged/controller KinD workflow definitions;
+assertion recovery requires both KinD and release definitions to match.
+Older candidates after workflow updates, or RC tips whose workflow changed during
+the wait, need manual exceptional recovery; normal watching and verification stay
+available. All writes in recovery mode, including ordinary publication retries,
+require unchanged remote tag identity and no superseding stable. A watcher-start
+monotonic 120-minute backstop forbids new writes only,
+with no remote cancellation or extra wait window. The shared 60-tick publication
+window and 125-minute job ceiling remain; transport hangs use that job ceiling.
+For deliberate local same-tag exceptional recovery, opt in with
+`--recover-tag-smoke` plus `--journal`, `--operation`, `--repository`, `--sha`,
+`--kind` and the exact remote `--tag-oid`. Finish or stop the CI operation first.
+The default local watcher remains publication-only. No recovery path cuts a tag.
 The procedures below are the local path.
 
 **Releases are cut RC-first** (ADR-1265, PRD #1265). `release-cut X.Y.Z`

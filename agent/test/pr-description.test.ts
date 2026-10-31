@@ -1002,6 +1002,54 @@ describe("m2 non-closing deterministic rendering", () => {
       } else assert.match(block, /Approved follow-up remains/);
     });
   }
+  describe("issue #3721 owner acceptance outside the milestones", () => {
+    const REASON = "Owner acceptance pending: live dev-cluster rollout check";
+    const NOTE = "Owner acceptance: live dev-cluster rollout check";
+
+    it("a deferred scope note renders as `- Deferred: <text>` under the scope and review notes heading", async () => {
+      const fields = await mint({ summary: "Adds the thing.", scope_notes: [{ kind: "deferred", text: NOTE }] });
+      const { text, withFields } = renderRegion({ sizeLine: SIZE, source: "lead_only" }, fields);
+      assert.equal(withFields, true);
+      assert.ok(text.includes(`### Scope and review notes\n- Deferred: ${NOTE}`), text);
+    });
+
+    it("renders every kind with its own label, in order, and a long note in full (the 200-byte item cap is the api sanitizer's, not the renderer's)", async () => {
+      const long = "Owner acceptance: " + "w".repeat(282); // 300 bytes, over the api's PrDescItemMaxBytes (200)
+      const fields = await mint({
+        summary: "Adds the thing.",
+        scope_notes: [
+          { kind: "added", text: "a note" },
+          { kind: "deferred", text: NOTE },
+          { kind: "dropped", text: "d note" },
+          { kind: "changed", text: "c note" },
+          { kind: "deferred", text: long },
+        ],
+      });
+      const { text } = renderRegion({ sizeLine: SIZE, source: "lead_only" }, fields);
+      const lines = text.split("\n").filter(l => l.startsWith("- "));
+      assert.deepEqual(lines, ["- Added: a note", `- Deferred: ${NOTE}`, "- Dropped: d note", "- Changed: c note", `- Deferred: ${long}`]);
+    });
+
+    it("a region over the cap drops the deferred notes, yet the completion block keeps the reason and never closes", async () => {
+      const big = await mint({
+        summary: "x".repeat(600),
+        changes: Array.from({ length: 5 }, () => "y".repeat(200)),
+        scope_notes: [{ kind: "deferred", text: NOTE }],
+        review_pointers: ["z".repeat(200)],
+        verification: Array.from({ length: 20 }, (_, i) => ({ command: `c${i}`.padEnd(200, "c"), result: "pass" as const, verified_at_sha: "abcdef1" })),
+      });
+      const region = renderRegion({ sizeLine: SIZE, headSha: HEAD, targetBranch: "main", source: "lead_only" }, big);
+      assert.equal(region.fallback, "region_cap");
+      assert.ok(!region.text.includes("Deferred"), "the prose, notes included, is dropped by the cap");
+      const body = renderBody(region.text, renderCompletionBlock({ issueIid: 3721, branch: "agent/issue-3721", closes: true, nonClosing: { reason: REASON } }));
+      assert.ok(body.includes(`> **Issue remains open.** ${REASON}`), body);
+      assert.equal(closingDirectiveFor(body, 3721, "org/repo"), false);
+      assert.doesNotMatch(body, /Closes #3721/);
+      const parsed = parseOwnedBlocks(body);
+      assert.ok(parsed.kind === "ok" && parsed.completion?.includes(REASON));
+    });
+  });
+
   it("m2 non-closing mrCompletionBlock guards ci_fix issue-arm fallback", () => {
     const issue = makeClaim({ kind: "issue", issue_iid: 7 });
     const args = [issue, "b", undefined, undefined, undefined, undefined, undefined, undefined, true, undefined, false, undefined, undefined, { reason: "Follow-up remains" }];

@@ -252,6 +252,11 @@ as the poller's fifth argument.
 
 Check these traps before every approve:
 
+- **Landing or owner-only items as milestones.** A milestone consisting only of exact-head
+  PR CI (a landing obligation) or only owner-only live/hosted acceptance is a `revise`: move it
+  to the plan's "Landing obligations" / "Owner acceptance" section. A plan with Owner acceptance
+  items must say the delivery is `non_closing`. Worker obligations hidden in either section
+  are also a `revise`.
 - **Workflow-file edits.** grep the plan for `.github/workflows`. Any edit there means the
   run **will fail at push** (see *The workflow-scope guardrail*). `revise` the plan so the
   worker wires the change everywhere it CAN reach (e.g. `Taskfile.yml`) and leaves the

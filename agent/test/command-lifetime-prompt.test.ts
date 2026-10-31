@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { assembleAgents } from "../src/agents.js";
+import { shapeGuardedGrants } from "../src/claude-command/grants.js";
 import {
   buildLeadSystemPrompt,
   CLAUDE_LONG_COMMAND_APPEND,
@@ -122,5 +123,61 @@ describe("CLAUDE_LONG_COMMAND_APPEND start and poll commands", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// Issue #3722: the CLI derives an MCP tool's isConcurrencySafe() from readOnlyHint, and the
+// guarded Bash tool declares none, so guarded shell calls run one at a time and wait for any
+// adjacent Agent batch. The guarded lead overlaps the gate by delegating it; every guarded
+// agent learns that its own calls are sequential. These read the assembled prompt text rather
+// than importing the new constant, so the base revision fails on the missing guidance itself.
+describe("guarded Claude lane: sequential shell calls and the delegated integration gate", () => {
+  const flat = (text: string) => text.replace(/\n\s*/g, " ");
+  const SEQUENTIAL = /Bash calls one agent issues together run one after another, not at once \(the 8-command cap counts all agents on the run\), each against its own deadline: size each command's `timeout` for that command alone\./;
+  const GATE_HEADING = /Integration-gate execution on this lane\./;
+  const guardedLead = flat(buildLeadSystemPrompt("LEAD BODY", { kind: "issue", harness: "claude", guardedCommand: { unavailable: [] } }).append);
+
+  it("the guard-bound lead is told guarded calls are serialized and to delegate the gate into the review batch", () => {
+    assert.match(guardedLead, GATE_HEADING);
+    assert.match(guardedLead, /The CLI runs Bash calls issued together one after another/);
+    assert.match(guardedLead, /a Bash call placed after an Agent batch waits for that whole batch/);
+    assert.match(guardedLead, /When the integration-gate sequencing policy calls for overlap, delegate the gate to one available execution-capable subagent in the same Agent batch as the read-only review wave/);
+    assert.match(guardedLead, /costly-gate repair exception still applies: do not restart full gates alongside every repair review/);
+    assert.match(guardedLead, /Name one gate owner\./);
+    assert.match(guardedLead, /Keep the worktree frozen until it reports: no implementation wave runs meanwhile/);
+    assert.match(guardedLead, /runs only the delegated integration checks, does not mutate the checkout/);
+    assert.match(guardedLead, /adds no independent mutation proof or duplicate of another validator's executable work/);
+    assert.match(guardedLead, /returns the tested revision, command, exit status and log path/);
+    assert.match(guardedLead, /This delegated run is the integration gate itself, not a validator's report, and keeps its full blocking authority/);
+    assert.match(guardedLead, /Before treating it as green, read the exit status and summary from the log it names/);
+    assert.match(guardedLead, /A missing log, a missing exit status or a different revision means the gate did not run/);
+    assert.match(guardedLead, /Do not send several long commands in one message expecting them to run together: they run in sequence, each against its own deadline/);
+    assert.match(guardedLead, /If no suitable subagent is available[^.]*run the gate yourself after the wave/);
+    assert.match(guardedLead, /it overrides no other template instruction/);
+    assert.match(guardedLead, SEQUENTIAL);
+  });
+
+  it("an unguarded Claude lead, a Codex lead and a harness-less lead get no gate-delegation guidance", () => {
+    for (const opts of [{ harness: "claude" as const }, { harness: "codex" as const }, {}]) {
+      const append = flat(buildLeadSystemPrompt("LEAD BODY", { kind: "issue", ...opts }).append);
+      assert.doesNotMatch(append, GATE_HEADING);
+      assert.doesNotMatch(append, /gate owner/);
+      assert.doesNotMatch(append, SEQUENTIAL);
+    }
+    // guardedCommand is ignored for any harness but Claude.
+    const codexGuarded = flat(buildLeadSystemPrompt("LEAD BODY", { kind: "issue", harness: "codex", guardedCommand: { unavailable: [] } }).append);
+    assert.doesNotMatch(codexGuarded, GATE_HEADING);
+  });
+
+  it("a guarded subagent carries the sequential line; an unguarded one keeps the native recipe unchanged", () => {
+    const unguarded = assembleAgents([tester]).subagents.tester;
+    assert.ok(unguarded, "tester assembled");
+    assert.ok(unguarded.prompt.includes(CLAUDE_LONG_COMMAND_APPEND));
+    assert.doesNotMatch(flat(unguarded.prompt), SEQUENTIAL);
+    assert.doesNotMatch(flat(CLAUDE_LONG_COMMAND_APPEND), SEQUENTIAL);
+    const guarded = shapeGuardedGrants(assembleAgents([tester]).subagents).agents.tester;
+    assert.ok(guarded, "tester shaped");
+    assert.match(flat(guarded.prompt), SEQUENTIAL);
+    assert.doesNotMatch(flat(guarded.prompt), GATE_HEADING, "the gate-delegation guidance is lead-only");
   });
 });

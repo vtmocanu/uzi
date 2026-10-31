@@ -124,9 +124,18 @@ The release commit's own main CI is classified in the journal and report only,
 without success polling or automatic reruns. D10(a) automatic recovery is deliberately
 excluded: publication already requires strict inherited coverage, the next RC
 needs a newer CI-bearing tip, and isolating reruns would change cancellation
-for every main rerun. `ci.yml` is unchanged. Tagged KinD infrastructure retries
-and targeted `assert-tag-smoke` recovery remain a separate PR; these gates
-still require manual recovery. Controller code is pinned to the original trusted
+for every main rerun. `ci.yml` is unchanged. Opt-in tagged smoke recovery permits
+at most two real KinD job reruns for attributable setup/checkout/cluster-create,
+image-load or Helm-tool setup failures. Build, install, readiness, product smoke,
+mixed/unknown failures and cancellations remain manual. Derived checkout names
+match the exact action identity with a variable 40-character pin; named steps
+stay exact. A cancelled rerun consumes its reservation and stops further retries.
+After the latest exact real smoke and workflow succeed, only a sole failed
+`assert-tag-smoke` job with known gate/setup evidence may be rerun, once. No other
+failed job is healed first to manufacture that condition. Job-specific requests
+also execute their dependent aggregate or chart/release jobs, recorded in the
+versioned journal. Existing per-workflow publication counters are never reset.
+Controller code is pinned to the original trusted
 workflow SHA, independently of the released tag, so older promoted candidates
 need not contain the current controller. Pre-cut CI retries already record steps,
 attempt and result.
@@ -139,6 +148,24 @@ This is not transport isolation: synchronous API requests can still occupy the
 existing watch job ceiling if a transport hangs. No new timeout or cancellation
 policy is introduced. The journal uses atomic replacement with file fsync;
 directory fsync and crash-resumable operation storage are not provided.
+All writes in recovery mode, including ordinary publication retries, require
+unchanged remote tag object/peeled SHA and, for a
+stable, no newer stable. A 120-minute monotonic backstop starts with the watcher
+and forbids new writes only; it neither limits observation nor cancels remote
+runs. The existing shared 60-tick publication loop and 125-minute job ceiling
+remain; no subprocess timeout is introduced. A hung transport is bounded only
+by that enclosing job ceiling.
+
+KinD retries require the tagged KinD workflow blob to equal the trusted
+controller's KinD blob. Assertion recovery requires both KinD and release blobs
+to match, binding step meaning and dependent scope without a runtime YAML parser.
+A metadata-only RC normally matches, but
+workflow changes during tip reselection can also produce a mismatch. An older
+candidate promoted after workflow/digest changes likewise needs manual recovery
+for these exceptions. Watching/verification and ordinary publication-role retries
+remain available. No tagged content is executed as a controller. A failed or
+uncertain POST consumes its reservation; stale/empty attempt evidence does not
+authorize another POST. All classes share one operation and journal.
 Publication/verification timestamps are recorded without claiming deployment
 health. Runner-slot and critical-path impact remain unmeasured until live use.
 

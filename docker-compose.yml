@@ -188,6 +188,8 @@ services:
       # these lines, setting them in .env is
       # inert and the API falls back to its Go defaults. (WORKER_HEARTBEAT_INTERVAL and
       # WORKER_POLL_INTERVAL are worker cadences consumed by the agent service, not here.)
+      # API prerequisite pin admission (#3591), off by default.
+      UZI_PREREQUISITE_CLOSURE_FORGES: ${UZI_PREREQUISITE_CLOSURE_FORGES:-}
       RUN_TIMEOUT: ${RUN_TIMEOUT:-6h}
       RUN_WALL_CEILING: ${RUN_WALL_CEILING:-}
       RUN_IDLE_TIMEOUT: ${RUN_IDLE_TIMEOUT:-10m}
@@ -466,7 +468,7 @@ services:
   #      (Decision 3) — not the socket mode — is the containment, so 0666 is acceptable.
   #   The loop re-applies 0666 so a `dind` restart (new socket inode) stays reachable.
   dind-init:
-    image: alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+    image: alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
     profiles: ["agent-docker"]
     # Runs as root (default) — the chown/chmod of a root-owned volume needs it.
     # SECURITY (auditor LOW): `0711` on /run/dind is deliberate, not lax — others get

@@ -628,8 +628,8 @@ it("carries the bounded unsplit stderr in rawDetail beside the one-line detail",
   try {
     const e = await refusal(cache.scratchPublicationPreflight(bare, branch));
     assert.ok(e.rawDetail !== undefined);
-    assert.ok(e.rawDetail.includes("tok\tpart"), e.rawDetail);
-    assert.ok(e.rawDetail.includes("second line carries more"), e.rawDetail);
+    assert.ok(e.rawDetail.includes("tok\tpart"), e.rawDetail ?? "no raw detail reported");
+    assert.ok(e.rawDetail.includes("second line carries more"), e.rawDetail ?? "no raw detail reported");
     const detail = assertDetail(e);
     assert.match(detail, /tok\?part/);
     assert.doesNotMatch(detail, /second line/);
@@ -645,7 +645,7 @@ it("trims leading padding before bounding rawDetail so a later token is not cut"
   const restore = failExec(["--is-shallow-repository"], err);
   try {
     const e = await refusal(cache.scratchPublicationPreflight(bare, branch));
-    assert.ok(e.rawDetail?.includes(token), e.rawDetail);
+    assert.ok(e.rawDetail?.includes(token), e.rawDetail ?? "no raw detail reported");
   } finally { restore(); }
 });
 
@@ -659,7 +659,7 @@ it("omits an oversized rawDetail rather than cutting a padding-split token to it
   try {
     const e = await refusal(cache.scratchPublicationPreflight(bare, branch));
     assert.ok(e.rawDetail !== undefined);
-    assert.ok(!e.rawDetail.includes(token.slice(0, 8)), e.rawDetail);
+    assert.ok(!e.rawDetail.includes(token.slice(0, 8)), e.rawDetail ?? "no raw detail reported");
     assert.match(e.rawDetail, /characters omitted: over the redaction bound/);
   } finally { restore(); }
 });

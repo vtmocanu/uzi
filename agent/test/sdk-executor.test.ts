@@ -7374,8 +7374,8 @@ describe("SdkExecutor skills plugin load errors (issue #1888)", () => {
     await run;
     const lines = warnings(probe.emits);
     assert.strictEqual(lines.length, 1);
-    assert.ok(!lines[0]!.includes(SECRET.slice(0, 8)), lines[0]);
-    assert.ok(!hasUnsafe(lines[0]!), lines[0]);
+    assert.ok(!lines[0]!.includes(SECRET.slice(0, 8)), lines[0]!);
+    assert.ok(!hasUnsafe(lines[0]!), lines[0]!);
     assert.ok(lines[0]!.length <= 512, `${lines[0]!.length}`);
     // No entry text anywhere in the persisted stream beyond the warning's bounded detail.
     assert.ok(!JSON.stringify(probe.emits).includes(SECRET.slice(0, 8)));

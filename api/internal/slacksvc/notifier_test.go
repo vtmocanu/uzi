@@ -465,6 +465,98 @@ func TestNotifierSuppressesSelfImproveRunState(t *testing.T) {
 	}
 }
 
+// crossCheckSuppressionCase stages one run of the given kind with a linked owner, so the
+// only reason a cross_check child sends nothing is the kind skip (#3628). anchored
+// stages an existing root DM, as for a child whose root was posted before the fix.
+func crossCheckSuppressionCase(kind, status, health string, anchored bool) (*fakeNotifStore, *fakePoster) {
+	rc := baseRun(status)
+	rc.Kind = kind
+	rc.Health = health
+	fs := &fakeNotifStore{rc: rc, delivery: txt("U123")}
+	if anchored {
+		fs.msg = store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"}
+	} else {
+		fs.msgErr = pgx.ErrNoRows
+	}
+	return fs, &fakePoster{dmChannel: "D1"}
+}
+
+func assertNoCrossCheckDM(t *testing.T, fs *fakeNotifStore, fp *fakePoster) {
+	t.Helper()
+	if len(fp.posts) != 0 || len(fp.updates) != 0 || len(fp.blocks) != 0 || len(fp.updateBlocks) != 0 {
+		t.Fatalf("a cross_check child must send no DM: posts=%v updates=%v blocks=%+v updateBlocks=%+v",
+			fp.posts, fp.updates, fp.blocks, fp.updateBlocks)
+	}
+	if len(fs.upserted) != 0 {
+		t.Fatalf("a cross_check child must record no root anchor: %+v", fs.upserted)
+	}
+}
+
+// TestNotifierSuppressesCrossCheckChildRunState: a cross_check child is repo-ful, so
+// GetSlackRunContext returns a row; its own state transitions must still never post or
+// edit a run-state DM (#3628, PRD #2149 D10: the parent's gate card carries it). The
+// issue-kind control runs the same fixture with only the kind changed.
+func TestNotifierSuppressesCrossCheckChildRunState(t *testing.T) {
+	for _, status := range []string{"queued", "running", "failed", "completed"} {
+		for _, anchored := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/anchored=%v", status, anchored), func(t *testing.T) {
+				fs, fp := crossCheckSuppressionCase("cross_check", status, "", anchored)
+				n := NewNotifier(fs, fp, fixedBase, nil)
+				n.handle(context.Background(), stateEvent{runID: fs.rc.ID, status: status})
+				assertNoCrossCheckDM(t, fs, fp)
+			})
+			t.Run(fmt.Sprintf("issue-control/%s/anchored=%v", status, anchored), func(t *testing.T) {
+				fs, fp := crossCheckSuppressionCase("issue", status, "", anchored)
+				n := NewNotifier(fs, fp, fixedBase, nil)
+				n.handle(context.Background(), stateEvent{runID: fs.rc.ID, status: status})
+				if anchored {
+					if _, ok := findUpdateBlock(fp.updateBlocks, "ts1"); !ok {
+						t.Fatalf("an issue run's existing root must be edited: %+v", fp.updateBlocks)
+					}
+					return
+				}
+				if len(fp.blocks) == 0 || fp.blocks[0].thread != "" || len(fs.upserted) != 1 {
+					t.Fatalf("an issue run must post its root: blocks=%+v upserted=%+v", fp.blocks, fs.upserted)
+				}
+			})
+		}
+	}
+}
+
+// TestNotifierHealthSuppressesCrossCheckChild: a health-flagged cross_check child is
+// swept like any non-chat run, but handleHealth must neither create nor edit its root nor
+// thread a nudge (#3628). The issue-kind control keeps the root + nudge.
+func TestNotifierHealthSuppressesCrossCheckChild(t *testing.T) {
+	ev := func(id uuid.UUID) healthEvent {
+		return healthEvent{runID: id, health: "stalled", reason: "the agent stopped sending updates", nudge: true}
+	}
+	for _, anchored := range []bool{false, true} {
+		t.Run(fmt.Sprintf("anchored=%v", anchored), func(t *testing.T) {
+			fs, fp := crossCheckSuppressionCase("cross_check", "running", "stalled", anchored)
+			n := NewNotifier(fs, fp, fixedBase, nil)
+			n.handleHealth(context.Background(), ev(fs.rc.ID))
+			assertNoCrossCheckDM(t, fs, fp)
+		})
+		t.Run(fmt.Sprintf("issue-control/anchored=%v", anchored), func(t *testing.T) {
+			fs, fp := crossCheckSuppressionCase("issue", "running", "stalled", anchored)
+			n := NewNotifier(fs, fp, fixedBase, nil)
+			n.handleHealth(context.Background(), ev(fs.rc.ID))
+			if anchored {
+				if _, ok := findUpdateBlock(fp.updateBlocks, "ts1"); !ok {
+					t.Fatalf("an issue run's root must be re-rendered: %+v", fp.updateBlocks)
+				}
+				if len(fp.blocks) != 1 || fp.blocks[0].thread != "ts1" {
+					t.Fatalf("nudge not threaded under the root: %+v", fp.blocks)
+				}
+				return
+			}
+			if len(fp.blocks) != 2 || fp.blocks[0].thread != "" || fp.blocks[1].thread != "ts1" || len(fs.upserted) != 1 {
+				t.Fatalf("an issue run must get its root + a threaded nudge: blocks=%+v upserted=%+v", fp.blocks, fs.upserted)
+			}
+		})
+	}
+}
+
 func TestNotifierPublishStateNeverBlocks(t *testing.T) {
 	// No drain goroutine: the queue fills and further calls must drop, not block.
 	n := NewNotifier(&fakeNotifStore{}, &fakePoster{}, fixedBase, nil)

@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Usage Card PRs</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: a 1000px app frame (your screenshot's CSS width) with the real sidebar width, so each option is judged at the true card width. Single dark theme, mirroring the app. */
+:root {
+  color-scheme: dark;
+  --bg: #0b0d12; --side: #0e1117; --panel: #11141b; --line: #262b36;
+  --fg: #e7e9ee; --muted: #9097a5; --dim: #6b7280;
+  --accent: #e9a24a; --ok: #7fd49a; --cancel: #4a5060; --bad: #e07a7a; --new: #7cb7ff; --warn: #ff6b6b;
+  --sans: "IBM Plex Sans", system-ui, sans-serif; --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px var(--sans); }
+.bar0 { display: flex; flex-wrap: wrap; gap: 10px 20px; align-items: center; padding: 16px; border-bottom: 1px solid var(--line); }
+.bar0 h1 { font-size: 16px; margin: 0; }
+.tabs { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; padding: 3px; gap: 2px; }
+.tabs button { font: 500 13px var(--sans); color: var(--muted); background: none; border: 0; border-radius: 999px; padding: 6px 12px; cursor: pointer; }
+.tabs button[aria-pressed="true"] { color: var(--fg); background: #1b1f29; box-shadow: inset 0 0 0 1px var(--line); }
+.tabs button:focus-visible { outline: 2px solid var(--new); outline-offset: 2px; }
+.verdict { font-size: 13px; color: var(--muted); max-width: 70ch; }
+.verdict b { color: var(--fg); }
+.scroller { overflow-x: auto; padding: 16px; }
+.frame { width: 1000px; display: grid; grid-template-columns: 176px 1fr; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.side { background: var(--side); border-right: 1px solid var(--line); padding: 14px 10px; display: grid; gap: 4px; align-content: start; font-size: 13px; color: #c9cdd6; }
+.side .brand { font-weight: 600; padding: 4px 8px 12px; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
+.side .grp { font-size: 10.5px; letter-spacing: .1em; color: var(--dim); padding: 10px 8px 2px; }
+.side span { padding: 5px 8px; border-radius: 6px; }
+.side .on { background: #1a1e27; color: var(--fg); }
+.main { padding: 14px; min-width: 0; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: grid; gap: 14px; }
+.ch { display: flex; justify-content: space-between; align-items: center; }
+.eb { font-size: 11px; letter-spacing: .12em; color: var(--muted); font-weight: 600; }
+.win { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; padding: 2px; font-size: 11px; }
+.win span { padding: 3px 9px; border-radius: 999px; color: var(--muted); }
+.win .on { color: var(--fg); box-shadow: inset 0 0 0 1px var(--line); }
+.halves { display: grid; grid-template-columns: 1fr 1fr; }
+.half { display: grid; gap: 10px; align-content: start; padding-right: 12px; min-width: 0; }
+.half + .half { padding: 0 0 0 12px; border-left: 1px solid var(--line); }
+.half h3 { margin: 0; font-size: 13px; }
+.stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); column-gap: 16px; row-gap: 12px; }
+.o4 .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.o22 .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.st { min-width: 0; }
+.st h4 { margin: 0; font-size: 11px; font-weight: 400; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.st p.v { margin: 3px 0 0; font: 600 22px/1.15 var(--mono); white-space: nowrap; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.st p.v.c { color: var(--accent); }
+.st .s { margin: 3px 0 0; font-size: 10.5px; color: var(--muted); line-height: 1.5; }
+.st .s.t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.st .s b { color: var(--fg); font: 400 10.5px var(--mono); }
+.o4 .st p.v { outline: 1px solid color-mix(in srgb, var(--warn) 60%, transparent); }
+.new { outline: 1.5px dashed var(--new); outline-offset: 3px; border-radius: 4px; }
+.rule { border-top: 1px solid var(--line); }
+.row { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 10px; font-size: 11.5px; color: var(--muted); }
+.row b { color: var(--fg); font-weight: 500; }
+.row a, a.l { color: var(--accent); text-decoration: none; }
+.bars { height: 6px; display: flex; gap: 2px; border-radius: 6px; overflow: hidden; }
+.chips { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 10.5px; color: var(--muted); }
+.chips span::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; background: var(--c); }
+.chips b { color: var(--fg); font: 400 10.5px var(--mono); margin-left: 3px; }
+.n { margin: 0; font-size: 10.5px; color: var(--muted); }
+.n b { color: var(--fg); font-weight: 500; }
+.tbl { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+th { font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); font-weight: 600; text-align: right; padding: 6px; border-bottom: 1px solid var(--line); vertical-align: bottom; }
+th:first-child, td:first-child { text-align: left; }
+td { padding: 7px 6px; text-align: right; font: 11.5px var(--mono); border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+td:first-child { font-family: var(--sans); }
+td.c { color: var(--accent); }
+tr.tot td { font-weight: 600; border-bottom: 0; }
+td small { display: block; font-size: 9px; color: var(--muted); font-weight: 400; }
+.sh { display: inline-flex; align-items: center; gap: 6px; }
+.sh i { width: 46px; height: 3px; background: var(--line); border-radius: 3px; position: relative; }
+.sh i::after { content: ""; position: absolute; inset: 0 auto 0 0; width: var(--w); background: var(--accent); border-radius: 3px; }
+[data-o="now"] .p, [data-o="now"] .pc, [data-o="now"] .p22, [data-o="now"] .pin,
+[data-o="o4"] .p22, [data-o="o4"] .pin,
+[data-o="o22"] .pc, [data-o="o22"] .pin,
+[data-o="oin"] .pc, [data-o="oin"] .p22 { display: none; }
+[data-o="oin"] .pc.keep { display: block; }
+</style>
+</head>
+<body>
+<div class="bar0">
+  <h1>PRs on the Usage card, at sidebar width (#3686)</h1>
+  <div class="tabs" role="group" aria-label="Layout">
+    <button type="button" data-k="now">Now</button>
+    <button type="button" data-k="o4">A · 4th column</button>
+    <button type="button" data-k="o22">B · 2×2 grid</button>
+    <button type="button" data-k="oin" aria-pressed="true">C · in the runs line</button>
+  </div>
+  <p class="verdict" id="verdict"></p>
+  <p class="verdict">Example numbers and placeholder users.</p>
+</div>
+
+<div class="scroller">
+<div class="frame">
+  <nav class="side" aria-label="Sidebar">
+    <div class="brand">uzi</div>
+    <span class="on">Overview</span>
+    <div class="grp">WORK</div><span>Repos</span><span>Runs</span><span>Findings</span><span>Schedules</span><span>Chat</span>
+    <div class="grp">FACTORY</div><span>Agents</span><span>Skills</span><span>Workers</span><span>Judge</span>
+    <span>Settings</span><span>Admin</span><span>Docs</span>
+  </nav>
+  <div class="main">
+    <div class="card" id="card" data-o="oin">
+      <div class="ch"><span class="eb">USAGE</span><span class="win"><span class="on">All time</span><span>Last 7 days</span></span></div>
+      <div class="halves">
+        <!-- You -->
+        <div class="half">
+          <h3>You</h3>
+          <div class="stats">
+            <div class="st"><h4>Cost (API-equivalent)</h4><p class="v c">$4,180</p><p class="s t">+ 12 runs without a cost estimate</p></div>
+            <div class="st p22 new"><h4>PRs</h4><p class="v">136</p><p class="s">$30.74 per PR</p></div>
+            <div class="st"><h4>Failed runs rate</h4><p class="v">13.2%</p></div>
+            <div class="st"><h4>Tokens</h4><p class="v">9.62B</p><p class="s">in <b>0.33B</b><br>cached <b>9.25B</b><br>out <b>45.10M</b></p></div>
+            <div class="st pc new"><h4>PRs</h4><p class="v">136</p><p class="s">$30.74 per PR</p></div>
+          </div>
+          <div class="rule"></div>
+          <div class="row"><span><b>27</b> failed of <b>204</b> finished runs</span><a href="#">Your failed runs →</a></div>
+          <div class="bars"><span style="flex:1428;background:var(--ok)"></span><span style="flex:168;background:var(--cancel)"></span><span style="flex:6;background:var(--dim)"></span><span style="flex:240;background:var(--bad)"></span></div>
+          <div class="chips"><span style="--c:var(--ok)">completed<b>158</b></span><span style="--c:var(--cancel)">cancelled<b>18</b></span><span style="--c:var(--dim)">rejected<b>1</b></span><span style="--c:var(--bad)">failed<b>27</b></span></div>
+          <p class="n">Top causes: agent failure 18 · unknown 4 · workflow scope missing 2 <a class="l" href="#">+3 more</a></p>
+          <p class="n">3 failed runs with recoverable work. May include work already landed.</p>
+          <p class="n">312 runs with token usage<span class="pin new" style="padding:0 3px;margin-left:4px">· <b>136 PRs</b> · $30.74 per PR</span></p>
+          <div class="rule"></div>
+          <div class="row"><span><b>Latest failure 14h ago</b> data volume full</span><span>11 completed since <a href="#">run 1a2b3c4d →</a></span></div>
+        </div>
+        <!-- Factory -->
+        <div class="half">
+          <h3>Factory · all users</h3>
+          <div class="stats">
+            <div class="st"><h4>Cost (API-equivalent)</h4><p class="v c">$5,940</p><p class="s t">+ 12 runs without a cost estimate</p></div>
+            <div class="st p22 new"><h4>PRs</h4><p class="v">182</p><p class="s">$32.64 per PR</p></div>
+            <div class="st"><h4>Failed runs rate</h4><p class="v">12.8%</p></div>
+            <div class="st"><h4>Tokens</h4><p class="v">13.40B</p><p class="s">in <b>0.46B</b><br>cached <b>12.88B</b><br>out <b>62.30M</b></p></div>
+            <div class="st pc new"><h4>PRs</h4><p class="v">182</p><p class="s">$32.64 per PR</p></div>
+          </div>
+          <div class="rule"></div>
+          <div class="row"><span><b>35</b> failed of <b>273</b> finished runs</span></div>
+          <div class="bars"><span style="flex:2053;background:var(--ok)"></span><span style="flex:213;background:var(--cancel)"></span><span style="flex:7;background:var(--dim)"></span><span style="flex:295;background:var(--bad)"></span></div>
+          <div class="chips"><span style="--c:var(--ok)">completed<b>215</b></span><span style="--c:var(--cancel)">cancelled<b>22</b></span><span style="--c:var(--dim)">rejected<b>1</b></span><span style="--c:var(--bad)">failed<b>35</b></span></div>
+          <p class="n">Top causes: agent failure 23 · unknown 5 · worker lost 3 +4 more</p>
+          <p class="n">3 failed runs with recoverable work. May include work already landed.</p>
+          <p class="n">401 runs with token usage by 6 users since 1 Jun 2026<span class="pin new" style="padding:0 3px;margin-left:4px">· <b>182 PRs</b> · $32.64 per PR</span></p>
+          <div class="rule"></div>
+          <div class="row"><span><b>Latest failure 13m ago</b> worker residue block…</span><span>7 completed since <a href="#">run 5e6f7a8b →</a></span></div>
+        </div>
+      </div>
+
+      <div class="rule"></div>
+      <h3 style="margin:0;font-size:13px">Per user · all time</h3>
+      <div class="tbl">
+        <table>
+          <thead><tr><th>User</th><th>Runs</th><th class="p"><span class="new" style="padding:1px 3px">PRs</span></th><th>Failed</th><th>Fail<br>rate</th><th>Since last<br>failure</th><th>Tokens</th><th>Out</th><th>Cost</th><th>Cost share</th></tr></thead>
+          <tbody>
+            <tr><td>user-a@example.com</td><td>312</td><td class="p">136</td><td>27</td><td>13.2%</td><td>14h</td><td>9.62B</td><td>45.10M</td><td class="c">$4180<small>+ 12 runs without a cost estimate and 4 unreported runs</small></td><td><span class="sh">70% <i style="--w:70%"></i></span></td></tr>
+            <tr><td>user-b@example.com</td><td>52</td><td class="p">24</td><td>4</td><td>7.7%</td><td>13m</td><td>1.10B</td><td>8.20M</td><td class="c">$820</td><td><span class="sh">14% <i style="--w:14%"></i></span></td></tr>
+            <tr><td>user-c@example.com</td><td>21</td><td class="p">13</td><td>2</td><td>9.5%</td><td>1d</td><td>1.65B</td><td>5.90M</td><td class="c">$610</td><td><span class="sh">10% <i style="--w:10%"></i></span></td></tr>
+            <tr><td>user-d@example.com</td><td>9</td><td class="p">5</td><td>1</td><td>11.1%</td><td>2d</td><td>0.62B</td><td>2.10M</td><td class="c">$162.40</td><td><span class="sh">1% <i style="--w:1%"></i></span></td></tr>
+            <tr><td>user-e@example.com</td><td>28</td><td class="p">3</td><td>1</td><td>3.6%</td><td>9d</td><td>240.00M</td><td>0.70M</td><td class="c">$98.15</td><td><span class="sh">1% <i style="--w:1%"></i></span></td></tr>
+            <tr><td>user-f@example.com</td><td>34</td><td class="p">1</td><td>6</td><td>16.7%</td><td>3d</td><td>180.00M</td><td>0.30M</td><td class="c">$79.05</td><td><span class="sh">1% <i style="--w:1%"></i></span></td></tr>
+            <tr class="tot"><td>uzi total</td><td>401</td><td class="p">182</td><td>35</td><td>12.8%</td><td>13m</td><td>13.40B</td><td>62.30M</td><td>$5940<small>+ 12 runs without a cost estimate and 4 unreported runs</small></td><td></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<script>
+(function () {
+  var card = document.getElementById("card");
+  var v = document.getElementById("verdict");
+  var text = {
+    now: "Today's card at your width: three stats per half, about 108px each.",
+    o4: "<b>Doesn't fit.</b> Four columns leave about 77px each, and the big numbers (red outline) run into each other or get clipped.",
+    o22: "<b>Fits, but taller.</b> Cost and PRs on top, failure rate and tokens below. Each half grows by about one row of numbers.",
+    oin: "<b>Fits with no layout change. Recommended.</b> PRs go into the existing runs line, and the table gets a PRs column next to Runs."
+  };
+  function set(k) {
+    card.setAttribute("data-o", k);
+    card.classList.toggle("o4", k === "o4");
+    card.classList.toggle("o22", k === "o22");
+    document.querySelectorAll(".tabs button").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.k === k)); });
+    v.innerHTML = text[k];
+  }
+  document.querySelectorAll(".tabs button").forEach(function (b) { b.addEventListener("click", function () { set(b.dataset.k); }); });
+  set("oin");
+})();
+</script>
+</body>
+</html>

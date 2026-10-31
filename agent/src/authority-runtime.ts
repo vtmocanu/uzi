@@ -86,8 +86,13 @@ export interface RetirementHandle {
 }
 
 export interface RetirementScope {
-  /** Never writes. Throws AuthorityRefusal for a source that is not published or retiring under this store. */
+  /** Never mutates a slot (reading may create the private slots directory). Throws AuthorityRefusal for a source that is not published or retiring under this store. */
   inspect(value: unknown): Promise<RetirementView>;
+  /**
+   * Writes no slot or record (it may create the private slots directory, like `inspect`). Whether ANY authority slot (in any state) covers `clonePath`, read under the active transaction A.
+   * Optional so a unit-test double need not carry it; a caller that needs the answer treats its absence as unknown.
+   */
+  slotExists?(clonePath: string): Promise<boolean>;
   /**
    * Enter retiring for `view` (published: begin; retiring: resume) and register the retiring lease with the
    * runtime, so a destructive record opened for the source's footprint (beginDestructive) is carried by it.
@@ -203,6 +208,7 @@ export class AuthorityRuntime implements AuthorityScope {
     };
     this.retirement = {
       inspect: (value) => this.#inspectRetirement(value),
+      slotExists: (clonePath) => this.#slotExists(clonePath),
       enter: (view, manifest) => this.#enterRetirement(view, manifest),
     };
   }
@@ -670,20 +676,26 @@ export class AuthorityRuntime implements AuthorityScope {
     }
   }
 
+  async #slotExists(clonePath: string): Promise<boolean> {
+    const tx = this.#requireActive("retirement");
+    const store = await this.#storeFor(tx);
+    return (await this.#slotOf(tx, store, path.resolve(clonePath))) !== null;
+  }
+
   async #inspectRetirement(value: unknown): Promise<RetirementView> {
     const tx = this.#requireActive("retirement");
     const store = await this.#storeFor(tx);
     const source = verifyCertifiedSource(tx, store, value);
     const slot = await this.#slotOf(tx, store, path.resolve(source.clonePath));
-    if (!slot) throw new AuthorityRefusal("no authority slot covers the source");
+    if (!slot) throw new AuthorityRefusal("no authority slot covers the source", "no_slot");
     const digest = sourceCoreDigest(source);
     if (slot.state === "retiring") {
       const { retiring, publication } = slot;
       if (!retiring || !publication || retiring.prior !== digest || publication.sourceCoreDigest !== digest ||
           publication.harness !== source.harness || slot.epoch !== source.sourceUseEpoch) {
-        throw new AuthorityRefusal("the retiring slot is not this source's retirement");
+        throw new AuthorityRefusal("the retiring slot is not this source's retirement", "slot_mismatch");
       }
-      if (slot.pending?.status === "running") throw new AuthorityRefusal("an operation on the retiring source is unresolved");
+      if (slot.pending?.status === "running") throw new AuthorityRefusal("an operation on the retiring source is unresolved", "operation_unresolved");
       return { source, phase: "retiring", cohort: structuredClone(publication.cohort),
         retiring: { manifest: [...retiring.manifest], deleted: retiring.deleted } };
     }
@@ -704,13 +716,13 @@ export class AuthorityRuntime implements AuthorityScope {
     } else {
       const slot = await this.#slotOf(tx, store, key);
       if (!slot || slot.state !== "retiring" || slot.epoch !== view.source.sourceUseEpoch || slot.retiring?.prior !== digest) {
-        throw new AuthorityRefusal("the retiring slot is not this source's retirement");
+        throw new AuthorityRefusal("the retiring slot is not this source's retirement", "slot_mismatch");
       }
       if (slot.owner.worker === store.workerIncarnation) {
         // Our own partial retirement: only the lease this process registered for it may continue it.
         const held = this.#leases.get(key);
         if (!held || leaseEpoch(held) !== slot.epoch) throw new AuthorityRefusal("this worker holds the retiring slot without its lease");
-        if (slot.pending?.status === "running") throw new AuthorityRefusal("an operation on the retiring source is unresolved");
+        if (slot.pending?.status === "running") throw new AuthorityRefusal("an operation on the retiring source is unresolved", "operation_unresolved");
         lease = held;
       } else {
         // A dead owner's retirement: taken over unless its helper may still be running (the store refuses that).

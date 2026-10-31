@@ -25,7 +25,7 @@
 #           agent/templates/base/Dockerfile (repo-root build context, matching
 #           docker-compose.yml's `agent` service). If that build is not
 #           attempted (see UZI_MEASURE_NO_BUILD) or fails, it falls back to a
-#           documented proxy image (node:24-alpine + git + go) and says so.
+#           documented proxy image (node:26-alpine + git + go) and says so.
 #
 # Env overrides:
 #   UZI_MEASURE_NO_BUILD=1   skip the real-image build attempt, go straight to
@@ -74,7 +74,7 @@ IMAGE_ARG="${1:-}"
 IMAGE=""
 IMAGE_SOURCE=""
 BUILT_IMAGE=0
-# IS_PROXY=1 only for the synthetic node:24-alpine fallback this script builds
+# IS_PROXY=1 only for the synthetic node:26-alpine fallback this script builds
 # itself -- every other path (a real build, or a user-supplied tag) is treated
 # as "real-worker-shaped" for the entrypoint/mount handling below, since a
 # user-supplied tag is the caller's own responsibility to be the real image.
@@ -144,12 +144,12 @@ else
 fi
 
 if [ -z "$IMAGE" ]; then
-  PROXY_IMAGE="node:24-alpine"
+  PROXY_IMAGE="node:26-alpine"
   info "Using proxy image: $PROXY_IMAGE + git + go (NOT the real worker image;" \
        "no nix/devbox/chromium/setpriv/entrypoint layers -- writable-layer and" \
        "/home numbers from this run are a LOWER BOUND, not the real figure)."
   cat >"$WORK/Dockerfile.proxy" <<'EOF'
-FROM node:24-alpine
+FROM node:26-alpine
 RUN apk add --no-cache git bash go
 ENV HOME=/home/worker
 # `worker` + a `runner` supplementary group (gid 10002), matching the real
@@ -163,7 +163,7 @@ RUN addgroup -g 10001 worker && addgroup -g 10002 runner \
 EOF
   docker build -f "$WORK/Dockerfile.proxy" -t "$BUILT_IMAGE_TAG" "$WORK" >"$WORK/proxy-build.log" 2>&1
   IMAGE="$BUILT_IMAGE_TAG"
-  IMAGE_SOURCE="proxy image (node:24-alpine + git + go), NOT the real worker image"
+  IMAGE_SOURCE="proxy image (node:26-alpine + git + go), NOT the real worker image"
   BUILT_IMAGE=1
   IS_PROXY=1
 fi

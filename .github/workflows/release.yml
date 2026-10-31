@@ -109,7 +109,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
-          node-version: "24"
+          node-version: "26"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
           go-version-file: api/go.mod
@@ -224,9 +224,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------- images ----
-  # buildx builds on the runner and pushes to GHCR. provenance:false keeps the pushed
-  # tag a single plain image manifest (no attestation index), matching the chart's
-  # simple {repo}:{tag} image references. platforms: linux/amd64 -- amd64-only for now.
+  # buildx builds on the runner and pushes to GHCR. provenance:false keeps attestation
+  # manifests out of the pushed tag, matching the chart's simple {repo}:{tag} image
+  # references. api, web and controller publish linux/amd64,linux/arm64 (one index per
+  # tag; their Dockerfiles cross-compile on $BUILDPLATFORM, so no QEMU). The agent
+  # images stay linux/amd64 only.
   #
   # SIGNING (cosign keyless / Sigstore). Every image is signed BY DIGEST after push,
   # using the job's GitHub OIDC identity (id-token: write) -- no long-lived key to
@@ -266,7 +268,7 @@ jobs:
       - uses: ./.github/actions/install-cosign
         with:
           cosign-release: 'v3.1.3'
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -277,7 +279,7 @@ jobs:
           context: api
           file: api/Dockerfile
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           provenance: false
           # Registry layer cache: a warm build reuses the `go mod download` layer instead
           # of re-fetching from proxy.golang.org, shrinking the per-release network window
@@ -331,7 +333,7 @@ jobs:
       - uses: ./.github/actions/install-cosign
         with:
           cosign-release: 'v3.1.3'
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -343,7 +345,7 @@ jobs:
           context: .
           file: web/Dockerfile
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           provenance: false
           # Registry layer cache: a warm build reuses the `npm ci` layer instead of
           # re-fetching from the npm registry, shrinking the per-release network window
@@ -386,7 +388,7 @@ jobs:
       - uses: ./.github/actions/install-cosign
         with:
           cosign-release: 'v3.1.3'
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -397,7 +399,7 @@ jobs:
           context: controller
           file: controller/Dockerfile
           push: true
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           provenance: false
           # Registry layer cache: a warm build reuses the `go mod download` layer instead
           # of re-fetching from proxy.golang.org, shrinking the per-release network window
@@ -480,7 +482,7 @@ jobs:
       # Logged in BEFORE resolving: an authenticated lookup answers `not found` for a
       # missing tag or a not-yet-created repository, whereas an anonymous one answers 403,
       # which the resolver must (and does) treat as a failure.
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -643,7 +645,7 @@ jobs:
       - uses: ./.github/actions/install-cosign
         with:
           cosign-release: 'v3.1.3'
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -692,7 +694,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
           driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -758,7 +760,7 @@ jobs:
       # cosign reads the DOCKER cred store (~/.docker/config.json), which helm login
       # does NOT populate -- so the chart job needs BOTH logins or `cosign sign` 401s
       # pushing the signature (the image jobs only worked because they log in this way).
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

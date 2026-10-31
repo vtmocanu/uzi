@@ -168,15 +168,30 @@ const LEAD_EXPORT_SLOT_RULE = [
   "Never reassign a slot until the dispatch that held it has returned.",
 ].join("\n");
 
-/** Shared across customized leads and every subagent on both harnesses. */
+/** Shared across customized leads and every subagent on both harnesses. Issue #3721: owner-only
+ *  items are plan sections, never milestones, so a run no longer parks at completion for them. */
 const COMPLETION_DELIVERY_GUIDANCE = [
   "Source issue closing directives must never go in commit messages. The worker controls issue closing via the PR body.",
-  "Plan human/live acceptance as a separate, final informative milestone: name the remaining verification,",
-  "why the worker cannot perform it, the responsible actor, and actionable steps. Coding, docs, tests,",
-  "mandatory gates, security and review remain worker obligations. Mixed or ambiguous milestones block completion.",
+  "Put checks that inherently need the PR/merge environment (for example exact-head PR CI), or an already-authorized",
+  "issue-specific landing fallback, in a \"Landing obligations\" plan section, not a milestone.",
+  "Put live, hosted or human-judgment acceptance in an \"Owner acceptance\" plan section, not a milestone: name the",
+  "remaining verification, why the worker cannot perform it, the responsible actor, and actionable steps.",
+  "Coding, docs, tests, mandatory gates, security and review remain worker obligations and never move to either section,",
+  "even if the lander repeats a check or the worker lacks time, permissions or tooling. Mixed or ambiguous milestones block completion.",
   "Environment limits, permissions and automatic approval do not waive those obligations.",
-  "Pending human/live acceptance requires a formal owner partial decision with exact kept and deferred milestone IDs",
-  "and a reason. Plan approval, ordinary answers and non_closing never change frozen scope or supply that decision.",
+  "On issue runs, when the plan has Owner acceptance items, declare `non_closing` with a reason naming them as pending and not verified,",
+  "and list each as a `deferred` `pr_summary` scope note.",
+  "Resolve classification from the issue, the repository and prior owner instructions; if consequential doubt remains",
+  "and ask_user reaches a human (the plan prompt carries no autopilot note), use ask_user before the final submit_plan,",
+  "never a question in plan prose.",
+  "On an auto-approved run ask_user reaches no human: keep each consequentially doubtful item as a required milestone",
+  "and record the uncertainty in the plan. Auto-approval, a checker approval and the auto-answer supply no waiver;",
+  "if such a milestone remains unmet, the formal owner completion decision applies.",
+  "Never silently omit ambiguous work from the milestones.",
+  "The lead owns ask_user, submit_plan and signal_done; a subagent reports classification doubt to the lead.",
+  "These sections apply to new, unfrozen plans. A frozen milestone that remains unmet still requires",
+  "a formal owner partial decision with exact kept and deferred milestone IDs and a reason.",
+  "Plan approval, ordinary answers and non_closing never change frozen scope or supply that decision.",
   "Never describe unperformed checks as accepted or done; report what remains and the actual evidence.",
 ].join("\n");
 
@@ -555,9 +570,44 @@ export const CLAUDE_GUARDED_COMMAND_APPEND = [
   "Inline output is capped at 30000 characters with a preview; the full output goes to a spill",
   "file capped at 64 MiB, and output beyond that is truncated, so the spill is bounded and not a",
   "promise of full output. At most 8 commands run at once and further calls are refused: wait for",
-  "one to finish. The Monitor tool is unavailable. If required work needs a role that is",
-  "unavailable on this run, do not substitute another role: a subagent reports it to the lead, and",
-  "the lead raises it with the owner via ask_user.",
+  "one to finish. Bash calls one agent issues together run one after another, not at once (the",
+  "8-command cap counts all agents on the run), each against its own deadline: size each",
+  "command's `timeout` for that command alone. The Monitor tool is unavailable. If required work",
+  "needs a role that is unavailable on this run, do not substitute another role: a subagent",
+  "reports it to the lead, and the lead raises it with the owner via ask_user.",
+].join("\n");
+
+/**
+ * Issue #3722: integration-gate execution for a guard-bound Claude LEAD only, pushed by
+ * buildLeadSystemPrompt right after {@link CLAUDE_GUARDED_COMMAND_APPEND}. The guarded tool
+ * (claude-command/server.ts) declares no MCP annotations, and the bundled Claude Code CLI
+ * derives an MCP tool's `isConcurrencySafe()` from `annotations.readOnlyHint ?? false`, so it
+ * runs guarded shell calls one at a time and after any adjacent Agent batch. Delegating the
+ * gate into the review Agent batch restores the gate/review overlap that
+ * LEAD_GATE_SEQUENCING_APPEND asks for. Re-check `isConcurrencySafe` for SDK MCP tools on every
+ * SDK bump, and drop this append if the SDK exposes a supported overlap option.
+ * Prompt-level guidance only; it changes no lane limit, deadline or grant.
+ */
+const CLAUDE_GUARDED_LEAD_GATE_APPEND = [
+  "Integration-gate execution on this lane. The CLI runs Bash calls issued together one after",
+  "another, and a Bash call placed after an Agent batch waits for that whole batch. When the",
+  "integration-gate sequencing policy calls for overlap, delegate the gate to one available",
+  "execution-capable subagent in the same Agent batch as the read-only review wave. The",
+  "costly-gate repair exception still applies: do not restart full gates alongside every repair",
+  "review.",
+  "- Name one gate owner. Keep the worktree frozen until it reports: no implementation wave runs",
+  "  meanwhile. The gate owner runs only the delegated integration checks, does not mutate the",
+  "  checkout, and adds no independent mutation proof or duplicate of another validator's",
+  "  executable work. It returns the tested revision, command, exit status and log path.",
+  "- This delegated run is the integration gate itself, not a validator's report, and keeps its",
+  "  full blocking authority. Before treating it as green, read the exit status and summary from",
+  "  the log it names. A missing log, a missing exit status or a different revision means the",
+  "  gate did not run.",
+  "- Do not send several long commands in one message expecting them to run together: they run",
+  "  in sequence, each against its own deadline.",
+  "- If no suitable subagent is available (for example every execution-capable role is withheld",
+  "  from this run), run the gate yourself after the wave.",
+  "This changes only who executes the gate; it overrides no other template instruction.",
 ].join("\n");
 
 /**
@@ -727,6 +777,9 @@ export function buildLeadSystemPrompt(
         ...opts.guardedCommand.unavailable.map((role) => `- ${role.name}: unavailable on this run: ${role.reason}`),
       ].join("\n"));
     }
+    // Issue #3722: guarded shell calls are serialized by the CLI, so the guarded lead
+    // overlaps the gate by delegating it. Unguarded prompts stay byte-identical.
+    if (opts.guardedCommand) parts.push(CLAUDE_GUARDED_LEAD_GATE_APPEND);
   }
   if (opts.harness === "codex") parts.push(CODEX_LONG_COMMAND_APPEND, CODEX_LEAD_DISPATCH_APPEND);
   if (resolveRunKind(opts.kind) === "issue") parts.push(PRD_LIFECYCLE_APPEND);

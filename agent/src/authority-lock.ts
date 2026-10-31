@@ -17,10 +17,36 @@ import { setTimeout as delay } from "node:timers/promises";
 // in-process by a keyed async mutex. The pod-epoch shared lock is unrelated to W.
 // st_dev/st_ino are compared in memory within one live acquisition and never persisted.
 
+/**
+ * A closed, typed reason some refusals carry so a caller never parses the message: the completion source's
+ * certificate does not verify, no authority slot covers it, the retiring slot is not this source's retirement,
+ * or an operation on the retiring source is unresolved, or the stored source is malformed or is not the
+ * published source (`source_mismatch`), or the slot is retiring and its retirement is still in flight (`retiring`).
+ */
+export type AuthorityRefusalKind = "certificate_invalid" | "no_slot" | "slot_mismatch" | "operation_unresolved" | "source_mismatch" | "retiring";
+
 export class AuthorityRefusal extends Error {
-  constructor(message: string) {
+  readonly kind: AuthorityRefusalKind | undefined;
+  constructor(message: string, kind?: AuthorityRefusalKind) {
     super(message);
     this.name = "AuthorityRefusal";
+    this.kind = kind;
+  }
+}
+
+/** The flock helper did not answer within the time it was given and was killed (message unchanged). */
+class FlockHelperTimeout extends Error {
+  constructor() { super("flock helper timeout"); }
+}
+
+/**
+ * Acquiring A (in the in-process queue or on the cross-process flock) ran out its bounded wait. Still an
+ * {@link AuthorityRefusal} with the unchanged message and name, so every existing handler and log line is
+ * unaffected; it exists only so a caller can tell a busy A from a corrupt or unsupported one without parsing text.
+ */
+export class AuthorityLockBusy extends AuthorityRefusal {
+  constructor() {
+    super("authority lock timeout");
   }
 }
 
@@ -100,7 +126,7 @@ function runFlock(flockPath: string, args: string[], fd: number | undefined,
     // Abort/timeout kills only this finite helper and joins its close event before the
     // caller may close the descriptor it was handed.
     const stop = (error: unknown): void => { failure ??= error; child.kill("SIGKILL"); };
-    const timer = setTimeout(() => stop(new Error("flock helper timeout")), Math.max(1, timeoutMs));
+    const timer = setTimeout(() => stop(new FlockHelperTimeout()), Math.max(1, timeoutMs));
     const onAbort = (): void => stop(signal?.reason ?? new Error("aborted"));
     signal?.addEventListener("abort", onAbort, { once: true });
     const collect = (chunk: Buffer): void => {
@@ -288,7 +314,9 @@ async function requireTrustedFlock(ctx: Context, signal: AbortSignal | undefined
 /**
  * Acquire an exclusive lock on the inherited descriptor. `once` makes one nonblocking
  * attempt (false on contention). Otherwise contention alone retries until the deadline,
- * at most ceil(timeout/POLL)+1 attempts; every other failure aborts.
+ * at most ceil(timeout/POLL)+1 attempts, and the deadline running out is AuthorityLockBusy:
+ * contention, or a helper given only the remaining wait that had not answered when it ended
+ * (busy is not proven then, only that the wait is spent). Every other failure aborts.
  */
 async function flockExclusive(ctx: Context, handle: fsp.FileHandle, timeoutMs: number,
   signal: AbortSignal | undefined, once: boolean): Promise<boolean> {
@@ -298,7 +326,14 @@ async function flockExclusive(ctx: Context, handle: fsp.FileHandle, timeoutMs: n
     signal?.throwIfAborted();
     if (performance.now() >= deadline) break;
     const remaining = Math.min(HELPER_TIMEOUT_MS, deadline - performance.now());
-    const result = await ctx.run(["-x", "-n", "-E", "200", "3"], handle.fd, signal, remaining);
+    let result: FlockResult;
+    try { result = await ctx.run(["-x", "-n", "-E", "200", "3"], handle.fd, signal, remaining); }
+    catch (error) {
+      if (!once && error instanceof FlockHelperTimeout && !signal?.aborted && performance.now() >= deadline) {
+        throw new AuthorityLockBusy();
+      }
+      throw error;
+    }
     if (result.code === 0) return true;
     if (result.code !== 200) throw new AuthorityRefusal(`flock failed: ${result.code}`);
     if (once) return false;
@@ -306,7 +341,7 @@ async function flockExclusive(ctx: Context, handle: fsp.FileHandle, timeoutMs: n
     if (wait <= 0) break;
     await delay(wait, undefined, { signal });
   }
-  throw new AuthorityRefusal("authority lock timeout");
+  throw new AuthorityLockBusy();
 }
 
 // ---- W: process-lifetime ownership ----------------------------------------------------
@@ -484,7 +519,7 @@ function waitFor(promise: Promise<void>, signal: AbortSignal | undefined, timeou
     if (signal?.aborted) { reject(signal.reason ?? new Error("aborted")); return; }
     const cleanup = (): void => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); };
     const onAbort = (): void => { cleanup(); reject(signal?.reason ?? new Error("aborted")); };
-    const timer = setTimeout(() => { cleanup(); reject(new AuthorityRefusal("authority lock timeout")); }, Math.max(1, timeoutMs));
+    const timer = setTimeout(() => { cleanup(); reject(new AuthorityLockBusy()); }, Math.max(1, timeoutMs));
     signal?.addEventListener("abort", onAbort, { once: true });
     void promise.then(() => { cleanup(); resolve(); });
   });

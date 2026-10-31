@@ -1326,8 +1326,17 @@ function runnerTrackingOwnerKey(branch: string): string {
 }
 
 type OrphanRetireStage = "journal_read" | "journal_validation" | "containment" | "holding_parent" | "rename" | "retained_copy" | "intra_device_rename" | "journal_clear";
-export type OrphanStage = OrphanRetireStage | "classification" | "identity" | "branch" | "path" | "quiescence" | "attempt_ledger" | "attempt_journal" | "retirement" | "complete";
-export type OrphanReason = "http" | "transport_unknown" | "nonterminal_owner" | "repo_mismatch" | "malformed_identity" | "branch_mismatch" | "path_error" | "path_mismatch" | "quiescence_blocked" | "quiescence_error" | "attempt_release_failure" | "canonical_retirement_failure" | "retained-in-place" | RunnerCloneRetireResult;
+export type OrphanStage = OrphanRetireStage | "classification" | "identity" | "branch" | "path" | "quiescence" | "attempt_ledger" | "attempt_journal" | "retirement" | "complete" | "completion_handoff";
+export type OrphanReason = "http" | "transport_unknown" | "nonterminal_owner" | "repo_mismatch" | "malformed_identity" | "branch_mismatch" | "path_error" | "path_mismatch" | "quiescence_blocked" | "quiescence_error" | "attempt_release_failure" | "canonical_retirement_failure" | "retained-in-place" | "completion_retirement_pending" | "completion_retirement_refused" | "completion-retired" | RunnerCloneRetireResult;
+/** issue #3645: the closed set of reasons an orphan retirement or completion handoff was refused or deferred.
+ *  Only these literals leave the diagnostics boundary; anything else is written as `unknown`. */
+export type OrphanRetirementSubreason =
+  | "fenced_source" | "pair_changed" | "completion_pending" | "completion_preflight_retained" | "completion_unverified"
+  | "completion_uncertain" | "completion_unsupported" | "authority_busy" | "published_source_retained" | "unknown";
+const ORPHAN_RETIREMENT_SUBREASONS: ReadonlySet<string> = Object.freeze(new Set<string>([
+  "fenced_source", "pair_changed", "completion_pending", "completion_preflight_retained", "completion_unverified",
+  "completion_uncertain", "completion_unsupported", "authority_busy", "published_source_retained", "unknown",
+]));
 export type RunnerCloneRetireResult = "quarantined" | "source-already-absent";
 export interface OrphanDiagnostics {
   logger: Logger;
@@ -1347,6 +1356,7 @@ export function emitOrphanDiagnostic(
   reason: OrphanReason,
   error?: unknown,
   httpStatus?: number,
+  subreason?: OrphanRetirementSubreason,
 ): void {
   try {
     const safeId = (id: string): string =>
@@ -1360,6 +1370,7 @@ export function emitOrphanDiagnostic(
       claimant_id: safeId(context.claimantId), owner_id: safeId(context.ownerId), repo_id: safeId(context.repoId),
       path_shape: context.pathShape === "canonical" || context.pathShape === "attempt" ? context.pathShape : "unknown", path_fingerprint: fingerprint, errno,
       ...(Number.isInteger(httpStatus) && httpStatus! >= 100 && httpStatus! <= 599 ? { http_status: httpStatus } : {}),
+      ...(subreason === undefined ? {} : { retirement_subreason: typeof subreason === "string" && ORPHAN_RETIREMENT_SUBREASONS.has(subreason) ? subreason : "unknown" }),
     });
   } catch { /* best effort, including hostile logger or error accessors */ }
 }
@@ -1488,6 +1499,11 @@ class AuthorityRefusedError extends Error {
 /** The retained journal does not carry the exact fence an install or retirement expected. */
 class CompletionSourceFenceError extends Error {
   constructor(message: string) { super(message); this.name = "CompletionSourceFenceError"; }
+}
+
+/** issue #3645: true for the refusal a non-certified retirement raises on a fenced journal. The class stays private. */
+export function isCompletionSourceFenceError(e: unknown): boolean {
+  return e instanceof CompletionSourceFenceError;
 }
 
 function recoveryCaptureKey(branch: string): string {
@@ -6917,6 +6933,32 @@ export class GitCache {
           journal.attemptId !== expected.attemptId) return undefined;
       return journal.completionSourceFence;
     });
+  }
+
+  /**
+   * issue #3645 - classify the active journal of `branch` against the terminal owner `ownerRunId` and `clonePath`
+   * in one bare-lock section. Read-only: it mirrors {@link GitCache.readCompletionSourceFence} and never rewrites
+   * the journal. `changed` means no journal names exactly this (run, path) pair; `unfenced` means a worker without
+   * authority or a journal with no completion-source fence (the baseline orphan path); `fenced` carries the exact
+   * fence and attempt id. `retained` reports an episode or retained sources on the journal.
+   * The optional claimant signal cancels a queued acquisition without advancing past the current bare-lock holder.
+   */
+  async readOrphanJournalFence(
+    barePath: string, branch: string, ownerRunId: string, clonePath: string,
+    signal?: AbortSignal,
+  ): Promise<{ state: "changed" } | { state: "unfenced"; retained: boolean } |
+    { state: "fenced"; fence: CompletionSourceFence; attemptId?: string; retained: boolean }> {
+    return this.withLock(barePath, async () => {
+      await this.assertRecoveryBare(barePath);
+      const journal = await this.readRecoveryCapture(barePath, branch);
+      if (!journal || journal.runId !== ownerRunId || journal.clonePath !== clonePath) return { state: "changed" as const };
+      const retained = !!journal.recovery || !!journal.retainedSources?.length;
+      if (!this.authorityRequired || journal.completionSourceFence === undefined) return { state: "unfenced" as const, retained };
+      return {
+        state: "fenced" as const, fence: journal.completionSourceFence, retained,
+        ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }),
+      };
+    }, signal);
   }
 
   /** fsync `<bare>/config`, fsync the bare directory, then require the journal's raw value to read back as exactly `want`. */
@@ -12635,7 +12677,11 @@ export class GitCache {
       result = await (bareLockHeld ? retire() : this.withLock(barePath, retire));
     } catch (error) {
       if (dispatched) await dispatched;
-      if (opts.orphanDiagnostics) emitOrphanDiagnostic(opts.orphanDiagnostics, clonePath, "orphan_retirement_failed", stage, "canonical_retirement_failure", error);
+      if (opts.orphanDiagnostics) {
+        const subreason: OrphanRetirementSubreason = error instanceof CompletionSourceFenceError ? "fenced_source"
+          : error instanceof CapturePathMismatchError && (stage as OrphanRetireStage) === "journal_validation" ? "pair_changed" : "unknown";
+        emitOrphanDiagnostic(opts.orphanDiagnostics, clonePath, "orphan_retirement_failed", stage, "canonical_retirement_failure", error, undefined, subreason);
+      }
       throw error;
     }
     if (!opts.completionSource) {

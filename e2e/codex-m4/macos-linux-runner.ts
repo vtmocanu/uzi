@@ -36,10 +36,12 @@ import path from "node:path";
 
 import { resolveArch, type Arch } from "./provision.js";
 
-/** The pinned multiarch runner image (verified amd64 + arm64 on 2026-09-12, PRD D7 point 3). */
-export const MACOS_LINUX_RUNNER_IMAGE = "docker.io/library/node:24-bookworm";
+/** The pinned multiarch runner image: node:26-bookworm (Node 26.12.1), manifest inspected 2026-10-31 with
+ *  `docker buildx imagetools inspect` (amd64 + arm64 present). Not yet executed through this runner; the
+ *  Node 24 image it replaces was verified 2026-09-12 (PRD D7 point 3). */
+export const MACOS_LINUX_RUNNER_IMAGE = "docker.io/library/node:26-bookworm";
 export const MACOS_LINUX_RUNNER_DIGEST =
-  "sha256:6dac556d980b7f0e5498d08f08cee0ca67798b4ad6c23964a9214920e67758d0";
+  "sha256:3b764117159bda01d2396391e7789b6a9106af9729cfd001ef55e98557868310";
 /** The exact `image@sha256:...` reference both stages run. */
 export const MACOS_LINUX_RUNNER_REF = `${MACOS_LINUX_RUNNER_IMAGE}@${MACOS_LINUX_RUNNER_DIGEST}`;
 

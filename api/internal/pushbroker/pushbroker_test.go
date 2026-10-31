@@ -703,7 +703,8 @@ func writeFile(t *testing.T, path, content string) {
 func cleanGitEnv() []string {
 	var env []string
 	for _, entry := range os.Environ() {
-		if !strings.HasPrefix(entry, "GIT_") {
+		// GIT_EXEC_PATH selects installed Git helpers, not repository configuration.
+		if !strings.HasPrefix(entry, "GIT_") || strings.HasPrefix(entry, "GIT_EXEC_PATH=") {
 			env = append(env, entry)
 		}
 	}

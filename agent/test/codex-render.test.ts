@@ -540,7 +540,9 @@ describe("renderCodexRun — prompts", () => {
     const run = renderCodexRun(runRequest({ agents: { a: agent({ prompt: "BODY" }) } }));
     const prompt = run.perRolePrompts.get("a")!;
     assert.match(prompt, /closing directives must never go in commit messages/);
-    assert.match(prompt, /separate, final informative milestone/);
+    assert.match(prompt, /"Owner acceptance" plan section, not a milestone/);
+    assert.match(prompt, /"Landing obligations" plan section, not a milestone/);
+    assert.doesNotMatch(prompt, /informative milestone/);
     assert.match(prompt, /formal owner partial decision/);
     assert.match(prompt, /Mixed or ambiguous milestones block completion/);
     assert.equal(

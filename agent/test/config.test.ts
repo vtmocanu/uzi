@@ -433,6 +433,36 @@ describe("loadConfig terminal-journal knobs (PRD #1391 M3)", () => {
   });
 });
 
+describe("loadConfig UZI_CODEX_COMMAND_CACHE_RUN_BYTES (issue #3675)", () => {
+  it("defaults to 4 GiB when unset or blank", () => {
+    assert.strictEqual(loadConfig(baseEnv()).codexCommandCacheRunBytes, 4294967296);
+    assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_CACHE_RUN_BYTES: "" })).codexCommandCacheRunBytes, 4294967296);
+    assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_CACHE_RUN_BYTES: "   " })).codexCommandCacheRunBytes, 4294967296);
+  });
+
+  it("accepts 0 (disabled) and an explicit value, trimmed", () => {
+    assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_CACHE_RUN_BYTES: "0" })).codexCommandCacheRunBytes, 0);
+    assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_CACHE_RUN_BYTES: "1048576" })).codexCommandCacheRunBytes, 1048576);
+    assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_CACHE_RUN_BYTES: " 2048 " })).codexCommandCacheRunBytes, 2048);
+    assert.strictEqual(
+      loadConfig(baseEnv({ UZI_CODEX_COMMAND_CACHE_RUN_BYTES: String(Number.MAX_SAFE_INTEGER) })).codexCommandCacheRunBytes,
+      Number.MAX_SAFE_INTEGER,
+    );
+  });
+
+  it("THROWS on anything that is not a plain non-negative safe integer", () => {
+    for (const v of ["-1", "1.5", "4GiB", "0x10", "01", "+5", "1e3", "9007199254740992", "99999999999999999999"]) {
+      assert.throws(
+        () => loadConfig(baseEnv({ UZI_CODEX_COMMAND_CACHE_RUN_BYTES: v })),
+        /invalid UZI_CODEX_COMMAND_CACHE_RUN_BYTES/,
+        `value ${JSON.stringify(v)} must throw`,
+      );
+    }
+    // A leading space is trimmed before the strict check, so " 01" still throws on the zero.
+    assert.throws(() => loadConfig(baseEnv({ UZI_CODEX_COMMAND_CACHE_RUN_BYTES: " 01" })), /invalid UZI_CODEX_COMMAND_CACHE_RUN_BYTES/);
+  });
+});
+
 describe("loadConfig UZI_CODEX_COMMAND_SANDBOX (PRD #1493 M3)", () => {
   it("defaults to off when unset or blank", () => {
     assert.strictEqual(loadConfig(baseEnv()).codexCommandSandbox, "off");

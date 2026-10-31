@@ -801,6 +801,8 @@ end
 # Execute the actual watch step with offline stand-ins. Receipt failure must be
 # owned by watch before reporting can become a successful delivery job (#3551).
 watch_script = auto_jobs.fetch('watch').fetch('steps').find { |step| step['id'] == 'watch' }.fetch('run')
+assert.call(auto_jobs.fetch('watch').fetch('env').fetch('RELEASE_TAG_OID'), '${{ needs.prepare.outputs.tag_oid }}', 'recovery pins the prepared tag object')
+assert.call(watch_script.include?('--recover-tag-smoke --tag-oid "$RELEASE_TAG_OID"'), true, 'protected watch explicitly enables bounded tag recovery')
 Dir.mktmpdir('release-watch-receipt') do |dir|
   bin = File.join(dir, 'bin')
   release_scripts = File.join(dir, '.agents/skills/uzi-release/scripts')
@@ -821,6 +823,7 @@ Dir.mktmpdir('release-watch-receipt') do |dir|
   Dir.glob(File.join(bin, '*')).concat(Dir.glob(File.join(release_scripts, '*'))).each { |path| File.chmod(0o700, path) }
   environment = {'PATH' => "#{bin}:#{ENV.fetch('PATH')}", 'RELEASE_SHA' => '1' * 40,
                  'RELEASE_TAG' => 'v0.2.0-rc.1', 'RELEASE_KIND' => 'rc', 'RUNNER_TEMP' => dir,
+                 'RELEASE_TAG_OID' => '2' * 40,
                  'GITHUB_RUN_ID' => '123', 'GITHUB_RUN_ATTEMPT' => '1', 'GITHUB_REPOSITORY' => 'vtmocanu/uzi',
                  'GITHUB_OUTPUT' => File.join(dir, 'outputs'), 'WATCH_CALLS' => File.join(dir, 'calls')}
   [[1, 0, false], [0, 1, false], [0, 0, true]].each do |receipt_rc, verify_rc, expected|

@@ -40,7 +40,7 @@ def status(value, conclusion):
 
 def validate(data):
     if (not isinstance(data, dict) or data.keys() != FIELDS or type(data['schema']) is not int
-            or data['schema'] != 1 or not isinstance(data['operation'], str)
+            or data['schema'] != 2 or not isinstance(data['operation'], str)
             or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', data['operation'])
             or not isinstance(data['repository'], str)
             or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', data['repository'])
@@ -92,14 +92,19 @@ def validate(data):
                     raise ValueError('invalid bounded step label')
                 status(step['status'], step['conclusion'])
     for decision in data['decisions']:
-        if not isinstance(decision, dict) or decision.keys() != {'workflow', 'run', 'attempt', 'reason', 'before', 'after', 'state', 'at'}:
+        if not isinstance(decision, dict) or decision.keys() != {'workflow', 'run', 'attempt', 'reason', 'before', 'after', 'state', 'at', 'target_job', 'affected_jobs'}:
             raise ValueError('invalid journal decision')
         if (decision['workflow'] not in WORKFLOWS or decision['reason'] not in
-                {'publication-role', 'gate-refused', 'budget-exhausted', 'evidence-unavailable'}
+                {'publication-role', 'gate-refused', 'budget-exhausted', 'evidence-unavailable', 'kind-infra', 'tag-smoke-assertion'}
                 or decision['state'] not in {'reserved', 'requested', 'uncertain', 'blocked', 'passed-on-retry', 'failed-on-retry'}):
             raise ValueError('invalid journal decision state')
         integer(decision['run'])
         integer(decision['attempt'])
+        if decision['target_job'] is not None:
+            integer(decision['target_job'])
+        if (not isinstance(decision['affected_jobs'], list) or len(decision['affected_jobs']) > 8
+                or any(not isinstance(name, str) or label(name) != name for name in decision['affected_jobs'])):
+            raise ValueError('invalid affected job scope')
         integer(decision['before'], 0)
         integer(decision['after'], 0)
         if decision['after'] > decision['before']:
@@ -107,12 +112,12 @@ def validate(data):
         if not isinstance(decision['at'], str) or not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', decision['at']):
             raise ValueError('invalid decision timestamp')
     reasons = {'watching': {'publication-pending'}, 'workflows-green': {'publication-workflows-green'},
-               'blocked': {'gate-refused', 'budget-exhausted', 'retry-request-unconfirmed', 'publication-refused'},
+               'blocked': {'gate-refused', 'budget-exhausted', 'retry-request-unconfirmed', 'publication-refused', 'tag-smoke-recovery-refused'},
                'pending-timeout': {'publication-timeout'}, 'instrument-error': {'evidence-unavailable'}}
     if not isinstance(data['state'], str) or data['state'] not in reasons or data['reason'] not in reasons[data['state']]:
         raise ValueError('invalid journal operation result')
     errors = data['publication_read_errors']
-    if not isinstance(errors, dict) or errors.keys() != {'release.yml', 'brew.yml'}:
+    if not isinstance(errors, dict) or errors.keys() != {'release.yml', 'brew.yml', 'kind-smoke.yml'}:
         raise ValueError('invalid publication read counters')
     for count in errors.values():
         integer(count, 0)
@@ -174,10 +179,10 @@ def read(path):
 class Journal:
     def __init__(self, path, operation, repository, tag, sha):
         self.path = Path(path)
-        self.data = dict(schema=1, operation=operation, repository=repository, tag=tag, sha=sha,
+        self.data = dict(schema=2, operation=operation, repository=repository, tag=tag, sha=sha,
                          main_ci={'policy': 'report-only', 'state': 'unavailable'},
                          attempts=[], decisions=[], truncated=False, state='watching', reason='publication-pending',
-                         publication_read_errors={'release.yml': 0, 'brew.yml': 0})
+                         publication_read_errors={'release.yml': 0, 'brew.yml': 0, 'kind-smoke.yml': 0})
         self.save()
 
     def finish(self, state, reason):
@@ -261,7 +266,8 @@ class Journal:
             existing.update(attempt)
         self.save()
 
-    def decision(self, workflow, run, attempt, reason, before, after, state):
+    def decision(self, workflow, run, attempt, reason, before, after, state, *, target_job=None, affected_jobs=None):
         self.data['decisions'].append(dict(workflow=workflow, run=run, attempt=attempt, reason=reason,
-                                           before=before, after=after, state=state, at=stamp()))
+                                           before=before, after=after, state=state, at=stamp(), target_job=target_job,
+                                           affected_jobs=[] if affected_jobs is None else list(affected_jobs)))
         self.save()

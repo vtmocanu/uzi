@@ -171,7 +171,7 @@ describe("A-codex-sibling: a concurrent Codex attempt's non-dumpable supervisor"
     registry.add(claude);
     registry.add(newRunAttempt("run-99", 1, "/data/runner/github.com+o+r/issue-99", () => [{ pid: SUP, startTime: DEFAULT_START }]));
     const out = await quiesce(registry, codexProcs());
-    assert.equal(out.process?.state, "quiescent", out.process?.detail);
+    assert.equal(out.process?.state, "quiescent", out.process?.detail ?? "no process detail reported");
   });
 
   it("control: the same supervisor with no recorded root is unverified (the pre-fix behaviour)", async () => {

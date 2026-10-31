@@ -1,7 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { ProcessQuiescence } from "./run-quiescence.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
-import type { AuthorityScope, RetirementHandle, RetirementView } from "./authority-runtime.js";
+import { AuthorityLockBusy, AuthorityRefusal } from "./authority-lock.js";
+import type { AuthorityScope, AuthorityWait, RetirementHandle, RetirementView } from "./authority-runtime.js";
 import {
   decodeCompletionSourceShape, serializeSourceFence, sourceFenceOf, type CompletionSourceFence, type CompletionSourceV2,
 } from "./completion-source.js";
@@ -574,6 +575,60 @@ export interface DurableCompletionRetirement {
   resumed: boolean;
   /** Enter `retiring` (idempotent): awaited immediately before the first destructive effect. */
   enter(): Promise<void>;
+  /**
+   * Deny-only observer: the boundary calls it (errors swallowed) with the reason immediately before it
+   * returns `"retained"`. It grants nothing and never changes what the boundary returns; it only lets the
+   * coordinator tell a transient veto from a positive identity change.
+   */
+  noteRetained?(reason: RetainedBoundaryReason): void;
+}
+
+/** Why a completion-source boundary retained the source (see {@link DurableCompletionRetirement.noteRetained}). */
+export type RetainedBoundaryReason = "vetoed" | "not_quiescent" | "identity_changed" | "unsupported_platform" | "error";
+
+/**
+ * The typed outcome of retiring one completed generation. `retired`: the source, its journal fence and its
+ * records are gone. `pending`: nothing is wrong, the retirement just cannot run now. `invalid`: a positive
+ * fact says this source is not retirable as published. `uncertain`: an I/O or boundary failure proved
+ * nothing either way. `unsupported`: this coordinator cannot retire a completed source at all.
+ */
+export type CompletedRetirement =
+  | { kind: "retired" }
+  | { kind: "pending"; why: "executing" | "quarantine" | "unresolved_operation" | "preflight" | "not_removed" | "vetoed" |
+      "not_quiescent" | "no_receipt" | "episode_bearing" | "cycle_busy" | "authority_busy" |
+      "action_failed" }
+  | { kind: "invalid"; why: "no_receipt" | "no_authority_record" | "mismatch" | "unverified" | "identity_changed" |
+      "multiple_generations" | "path_mismatch" }
+  | { kind: "uncertain"; why: "verify_error" | "boundary_error" | "unreadable_record" | "slot_present" | "classify_unavailable" |
+      "preparation_error" }
+  | { kind: "unsupported"; why: "no_boundary" | "no_cleanup" | "no_retirement_scope" | "platform" };
+
+/** What {@link RecoveryCoordinator.retireCompletedSourceForHandoff} answers: `not_completion` means no record
+ *  of the owner is this fence's completion source (and, when classifying, no authority slot covers the path). */
+export type HandoffRetirement = CompletedRetirement | { kind: "not_completion" };
+
+/** The narrow input of {@link RecoveryCoordinator.retireCompletedSourceForHandoff}. */
+export interface HandoffRetirementInput {
+  runId: string;
+  clonePath: string;
+  attemptId?: string;
+  /** The exact fence the owner's bare journal carries. */
+  fence: CompletionSourceFence;
+  /** Whether the owner run reported `completed`: a missing receipt is then still to come, not a refusal. */
+  ownerCompleted: boolean;
+  /** How long, and until what signal, acquiring A may wait. */
+  wait: AuthorityWait;
+  mode?: "retire" | "classify";
+}
+
+/** The durable authority for retiring one completed generation, or why there is none. */
+type DurableRetirementVerdict =
+  | { kind: "plan"; plan: DurableRetirementPlan }
+  | { kind: "invalid" | "pending" | "uncertain" | "unsupported" };
+
+interface DurableRetirementPlan {
+  view: RetirementView; v2: CompletionSourceV2; fence: CompletionSourceFence;
+  expected: { runId: string; clonePath: string; attemptId?: string };
 }
 
 export interface RecoveryCoordinatorOptions {
@@ -649,6 +704,11 @@ export interface RecoveryCoordinatorOptions {
     /** Schedules the redundancy abort; tests fire it at an observed boundary and return a disposer. */
     redundancyTimer?: (fire: () => void, ms: number) => () => void;
     maintenanceBudget?: () => MaintenanceBudget;
+    /** Awaited by {@link RecoveryCoordinator.retireCompletedSourceForHandoff} right after it selected the
+     *  generation (holding A only), before the cycle lock is tried. */
+    afterHandoffSelect?: () => Promise<void>;
+    /** Awaited after {@link afterHandoffSelect}, immediately before the capture cycle is entered in `skip` mode. */
+    beforeHandoffCycle?: () => Promise<void>;
   };
 }
 
@@ -4585,6 +4645,127 @@ export class RecoveryCoordinator {
       () => this.forgetGenerationWithinCycle(runId, generation)));
   }
 
+  /**
+   * issue #3645: retire a terminal owner's COMPLETED source through the certified chain on behalf of a successor
+   * claimant, or classify it without touching anything. Narrow by construction: the caller names the owner run, the
+   * clone path and attempt of the source its bare journal fences, and that fence. Nothing is synthesized; the receipt
+   * only SELECTS a generation, and every certificate, cohort, epoch, source, fence, artifact and pending-operation
+   * check is redone by {@link forgetCompletedGeneration} (`retire`) or {@link verifyDurableRetirement} (`classify`).
+   *
+   * Actual lock order: A -> J (selection only, released) -> C (tried in `skip` mode: a busy cycle is
+   * `pending`/`cycle_busy`, never queued behind) -> J (inside the cycle) -> B (inside the boundary); order-safe. It is
+   * entered holding NONE of them: A is acquired here with the caller's `wait` (the claimant passes
+   * `authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)`, so the A-queue or flock wait is bounded by that timeout and
+   * ended by the claimant's lifecycle abort).
+   * An acquisition of A that runs out its wait (a typed {@link AuthorityLockBusy}) is `pending`/`authority_busy`; an
+   * AuthorityLockBusy raised once A is held propagates, as does any AuthorityRefusal, a lifecycle abort
+   * (`wait.signal`, an AbortError) and a spent maintenance budget. Any other throw once A is held (selection, the
+   * cycle, the retirement preparation) is `uncertain`: a failed journal read in selection is `unreadable_record`,
+   * the rest `preparation_error`, so no raw I/O error text reaches the caller. The background sweep is unchanged.
+   * There is no sleep, retry or owner-tail wait here. In `classify` mode a coordinator that is disabled or has no
+   * authority scope answers `uncertain`/`classify_unavailable`; `retire` mode answers `not_completion`.
+   *
+   * Selection is by FENCE first: any record of the owner whose V2 source carries exactly this fence. A match whose
+   * path or attempt differs, or that spans several generations, is `invalid`. No match is `not_completion` (V1, a
+   * different epoch, or nothing published), except in `classify` mode, which also looks the authority slot up by clone
+   * path: a slot present with no record naming the fence is `uncertain`. `classify` never enters the boundary and
+   * deletes nothing; a source that verifies is `pending`/`episode_bearing` because the certified chain does not
+   * retire an episode-bearing journal, so the caller must treat ANY found source as retained. Its only side effect is
+   * the settlement drain every outer A acquisition already runs.
+   */
+  async retireCompletedSourceForHandoff(input: HandoffRetirementInput): Promise<HandoffRetirement> {
+    const mode = input.mode ?? "retire";
+    if (!this.enabled || !this.authority) {
+      // `classify` guards a retained journal that may be fenced (only an authority-required cache reports one): an
+      // unavailable coordinator cannot rule that out, so it must not read as the positive "no completion" that lets
+      // the caller detach. `retire` keeps `not_completion`: the caller refuses outward and nothing is touched.
+      return mode === "classify" ? { kind: "uncertain", why: "classify_unavailable" } : { kind: "not_completion" };
+    }
+    let entered = false;
+    try {
+      return await this.authority.withTransaction(async (): Promise<HandoffRetirement> => {
+        entered = true;
+        try {
+          const selection = await this.selectHandoffGeneration(input, mode);
+          if (selection.kind !== "selected") return selection;
+          const generation = selection.generation;
+          await this.testHooks?.afterHandoffSelect?.();
+          await this.testHooks?.beforeHandoffCycle?.();
+          const key = await this.cycleKey({ runId: input.runId, captureId: "", generation, inventoryGuarded: true });
+          const cycle = await runCaptureCycle(key, "skip", () => mode === "classify"
+            ? this.classifyHandoffGeneration(input.runId, generation)
+            : this.forgetCompletedGeneration(input.runId, generation, this.isExecuting));
+          return cycle.ran ? cycle.value : { kind: "pending", why: "cycle_busy" };
+        } catch (err) {
+          // A preparation I/O error is "not proven", never a raw throw carrying a path into a public failure reason.
+          // Any AuthorityRefusal, lifecycle abort and a spent maintenance budget keep propagating.
+          if (err instanceof AuthorityRefusal || input.wait.signal?.aborted ||
+              (err instanceof Error && err.name === "AbortError")) throw err;
+          MaintenanceBudget.current()?.check();
+          return { kind: "uncertain", why: "preparation_error" };
+        }
+      }, input.wait);
+    } catch (err) {
+      // Only the acquisition of A is a busy signal; a timeout raised once the transaction ran is not.
+      if (!entered && err instanceof AuthorityLockBusy) return { kind: "pending", why: "authority_busy" };
+      throw err;
+    }
+  }
+
+  private async selectHandoffGeneration(input: HandoffRetirementInput, mode: "retire" | "classify"):
+    Promise<HandoffRetirement | { kind: "selected"; generation: number }> {
+    const wanted = serializeSourceFence(input.fence);
+    let records: RecoveryRecord[];
+    try { records = await this.withJournalLock(input.runId, () => this.checkedRecords(input.runId)); }
+    catch { MaintenanceBudget.current()?.check(); return { kind: "uncertain", why: "unreadable_record" }; }
+    const matches: Array<{ record: RecoveryRecord; v2: CompletionSourceV2 }> = [];
+    for (const record of records) {
+      const stored = record.completionSource;
+      if (!stored || !("version" in stored) || stored.version !== 2) continue;
+      let fence: string;
+      try { fence = serializeSourceFence(sourceFenceOf(stored)); }
+      catch { return { kind: "uncertain", why: "unreadable_record" }; }
+      if (fence === wanted) matches.push({ record, v2: stored });
+    }
+    if (matches.length === 0) {
+      if (mode !== "classify") return { kind: "not_completion" };
+      const slotExists = this.authority!.retirement?.slotExists;
+      if (!slotExists) return { kind: "uncertain", why: "classify_unavailable" };
+      return await slotExists.call(this.authority!.retirement, input.clonePath)
+        ? { kind: "uncertain", why: "slot_present" } : { kind: "not_completion" };
+    }
+    const generations = new Set(matches.map(m => m.record.generation));
+    if (generations.size > 1) return { kind: "invalid", why: "multiple_generations" };
+    const clonePath = path.resolve(input.clonePath);
+    if (matches.some(m => path.resolve(m.v2.clonePath) !== clonePath || m.v2.attemptId !== input.attemptId)) {
+      return { kind: "invalid", why: "path_mismatch" };
+    }
+    const generation = matches[0]!.record.generation;
+    if (generation === undefined) return { kind: "invalid", why: "mismatch" };
+    if (!records.some(r => r.generation === generation && r.completionReceipt && r.completionSource)) {
+      return input.ownerCompleted ? { kind: "pending", why: "no_receipt" } : { kind: "invalid", why: "no_receipt" };
+    }
+    return { kind: "selected", generation };
+  }
+
+  /** The `classify` half: the same authority checks as the retirement, none of its effects. Runs inside the cycle. */
+  private classifyHandoffGeneration(runId: string, generation: number): Promise<CompletedRetirement> {
+    return this.withJournalLock(runId, async (): Promise<CompletedRetirement> => {
+      const records = await this.checkedRecords(runId);
+      const selected = records.filter(r => r.generation === generation);
+      const authority = selected.find(r => r.completionReceipt && r.completionSource);
+      if (!authority) return { kind: "invalid", why: "no_authority_record" };
+      const source = legacyCompletionCore(authority.completionSource!);
+      const ctx = source.context;
+      if (selected.some(r => !r.inventoryGuarded || r.branch !== ctx.branch || r.kind !== ctx.kind ||
+          (r.completionReceipt && canonicalJson(r.completionReceipt) !== canonicalJson(authority.completionReceipt)))) {
+        return { kind: "invalid", why: "mismatch" };
+      }
+      const verdict = await this.verifyDurableRetirement(runId, generation, authority, records, selected, source);
+      return verdict.kind === "plan" ? { kind: "pending", why: "episode_bearing" } : this.verdictOutcome(verdict.kind);
+    });
+  }
+
   /** Receipt cleanup visits only this authenticated generation. No archive ancestry or capture RPC
    * gates it: the issue #2625 redundancy claims are built under the journal lock from the records
    * read there, but submitted only after the lock is released, bounded by one deadline, and their
@@ -4600,28 +4781,36 @@ export class RecoveryCoordinator {
    * restarted process has none and proceeds only on the durable proof. Destruction is a retiring
    * transaction (see {@link retiringManifest}). */
   private async forgetCompletedGeneration(runId: string, generation: number, isExecuting: (runId: string) => boolean,
-    signal?: AbortSignal): Promise<void> {
-    if (!this.withCompletionSourceBoundary || isExecuting(runId) || this.isExecuting(runId)) return;
+    signal?: AbortSignal): Promise<CompletedRetirement> {
+    if (!this.withCompletionSourceBoundary) return { kind: "unsupported", why: "no_boundary" };
+    if (isExecuting(runId) || this.isExecuting(runId)) return { kind: "pending", why: "executing" };
     let claims: PendingRedundancyClaim[] = [];
     const budget = this.startRedundancyBudget(signal);
-    await this.withJournalLock(runId, async () => {
+    const outcome = await this.withJournalLock(runId, async (): Promise<CompletedRetirement> => {
       const records = await this.checkedRecords(runId);
       const selected = records.filter(r => r.generation === generation);
       const authority = selected.find(r => r.completionReceipt && r.completionSource);
-      if (!authority || !this.git.cleanupRecoveryGeneration || residueQuarantine() !== undefined) return;
+      if (!authority) return { kind: "invalid", why: "no_authority_record" };
+      if (!this.git.cleanupRecoveryGeneration) return { kind: "unsupported", why: "no_cleanup" };
+      if (residueQuarantine() !== undefined) return { kind: "pending", why: "quarantine" };
       const source = legacyCompletionCore(authority.completionSource!);
       const ctx = source.context;
       if (selected.some(r => !r.inventoryGuarded || r.branch !== ctx.branch || r.kind !== ctx.kind ||
-          (r.completionReceipt && canonicalJson(r.completionReceipt) !== canonicalJson(authority.completionReceipt)))) return;
+          (r.completionReceipt && canonicalJson(r.completionReceipt) !== canonicalJson(authority.completionReceipt)))) {
+        return { kind: "invalid", why: "mismatch" };
+      }
       // The durable authority comes BEFORE the bare resolution, the redundancy claims, the bundle checks and the
       // completion-check preflight: an unknown or unproven source never reaches any of them.
-      const plan = this.authority ? await this.verifyDurableRetirement(runId, generation, authority, records, selected, source) : undefined;
-      if (this.authority && !plan) return;
+      const verdict = this.authority ? await this.verifyDurableRetirement(runId, generation, authority, records, selected, source) : undefined;
+      if (verdict && verdict.kind !== "plan") return this.verdictOutcome(verdict.kind);
+      const plan = verdict?.plan;
       // Without an authority scope nothing can verify a V2 source, and reading it as its legacy core would turn
       // an unverified certificate into release authority: a coordinator that cannot check it retains.
-      if (!this.authority && selected.some(r => r.completionSource !== undefined && "version" in r.completionSource)) return;
+      if (!this.authority && selected.some(r => r.completionSource !== undefined && "version" in r.completionSource)) {
+        return { kind: "invalid", why: "mismatch" };
+      }
       const bare = await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(path.basename(ctx.barePath)));
-      if (bare !== ctx.barePath) return;
+      if (bare !== ctx.barePath) return { kind: "invalid", why: "mismatch" };
       claims = await this.buildRedundancyClaims(selected, generation, bare, budget, authority.completionReceipt!.final_head);
       const bundles = new Set<string>();
       const presentBundles = new Set<string>();
@@ -4629,13 +4818,15 @@ export class RecoveryCoordinator {
         if ((record.bareDir && record.bareDir !== path.basename(bare)) ||
             (record.recoveryPinBareDir && record.recoveryPinBareDir !== path.basename(bare)) ||
             (record.coverageContext && record.coverageContext!.barePath !== bare) ||
-            (record.completionSource && canonicalJson(legacyCompletionCore(record.completionSource)) !== canonicalJson(source))) return;
+            (record.completionSource && canonicalJson(legacyCompletionCore(record.completionSource)) !== canonicalJson(source))) {
+          return { kind: "invalid", why: "mismatch" };
+        }
         const canonical = path.resolve(this.bundlePath(record));
-        if (record.bundlePath && path.resolve(record.bundlePath) !== canonical) return;
-        if (path.dirname(canonical) !== path.resolve(this.runDir(runId))) return;
+        if (record.bundlePath && path.resolve(record.bundlePath) !== canonical) return { kind: "invalid", why: "mismatch" };
+        if (path.dirname(canonical) !== path.resolve(this.runDir(runId))) return { kind: "invalid", why: "mismatch" };
         try {
           const stat = await fs.lstat(canonical);
-          if (!stat.isFile() || stat.isSymbolicLink()) return;
+          if (!stat.isFile() || stat.isSymbolicLink()) return { kind: "invalid", why: "mismatch" };
           presentBundles.add(canonical);
         } catch (err) { MaintenanceBudget.current()?.check();
           if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
@@ -4649,7 +4840,8 @@ export class RecoveryCoordinator {
       const preflight = await ownedRecoveryIO(() => this.git.cleanupRecoveryGeneration!(bare, ctx, source.roots, pins,
         recoverySources, authority.completionReceipt!.final_head,
         () => residueQuarantine() === undefined && !isExecuting(runId) && !this.isExecuting(runId), "completion-check"));
-      if (preflight !== "verified") return;
+      // `preflight` reports transient and permanent refusals alike, so the outcome is only "not now".
+      if (preflight !== "verified") return { kind: "pending", why: "preflight" };
       // The retiring manifest: every artifact this retirement destroys, in deletion order. Only a fresh
       // retirement uses it; a resume is bound to the retiring record's own.
       const authorityRecord = this.recordPath(authority);
@@ -4667,12 +4859,17 @@ export class RecoveryCoordinator {
       }
       let handle: RetirementHandle | undefined;
       const expected = plan?.expected;
+      let retainedWhy: RetainedBoundaryReason | undefined;
       const durable: DurableCompletionRetirement | undefined = plan ? {
         expectedFence: plan.fence, resumed: plan.view.phase === "retiring",
         enter: async () => { handle ??= await this.authority!.retirement!.enter(plan.view, items); },
+        noteRetained: (reason) => { retainedWhy ??= reason; },
       } : undefined;
       let forgotten = false;
-      const boundary = await this.withCompletionSourceBoundary!(source, async (canDelete, quiesceSkills) => {
+      // A throw inside the action is rethrown unchanged for the boundary to retain; this flag only lets the
+      // classification below tell it from a throw of the boundary's own checks.
+      let actionThrew = false;
+      const boundary = await this.withCompletionSourceBoundary!(source, async (canDelete, quiesceSkills) => { try {
         // Idempotent: normally the clone move already entered it; a source that is already gone enters here,
         // before the first ref, bundle or record is destroyed.
         await durable?.enter();
@@ -4740,36 +4937,60 @@ export class RecoveryCoordinator {
           await handle.finish();
         }
         forgotten = true;
-      }, durable);
+      } catch (err) { actionThrew = true; throw err; } }, durable);
       // A pass whose action returned early, or any partial failure, keeps provenance.
-      if (boundary === "passed" && forgotten) this.onCompletionSourceForgotten?.(source);
+      if (boundary === "passed" && forgotten) {
+        this.onCompletionSourceForgotten?.(source);
+        return { kind: "retired" };
+      }
+      if (boundary === "passed") return { kind: "pending", why: "not_removed" };
+      const why = retainedWhy as RetainedBoundaryReason | undefined;
+      if (actionThrew && (why === undefined || why === "error")) return { kind: "pending", why: "action_failed" };
+      switch (why) {
+        case "vetoed": return { kind: "pending", why: "vetoed" };
+        case "not_quiescent": return { kind: "pending", why: "not_quiescent" };
+        case "identity_changed": return { kind: "invalid", why: "identity_changed" };
+        case "unsupported_platform": return { kind: "unsupported", why: "platform" };
+        default: return { kind: "uncertain", why: "boundary_error" };
+      }
     });
     await this.submitRedundancyClaims(claims, budget);
+    return outcome;
+  }
+
+  private verdictOutcome(kind: "invalid" | "pending" | "uncertain" | "unsupported"): CompletedRetirement {
+    switch (kind) {
+      case "unsupported": return { kind: "unsupported", why: "no_retirement_scope" };
+      case "invalid": return { kind: "invalid", why: "unverified" };
+      case "pending": return { kind: "pending", why: "unresolved_operation" };
+      case "uncertain": return { kind: "uncertain", why: "verify_error" };
+    }
   }
 
   /**
    * issue #3404 M2 U5 - the durable authority for retiring a completed generation, read under A and J.
-   * Returns the verified source, the slot view and the journal fence it must see; undefined (retain) for
-   * anything else. Nothing here inspects the source clone. FIRST retirement (slot published): the physical
-   * run directory's generation members are exactly the slot's cohort, every member carries the identical
-   * certified V2 source, and the completing bare journal carries exactly the source's fence. RESUME (slot
-   * retiring): the retiring record alone authorizes the residue cleanup, see {@link residueExplained}.
+   * Returns the verified plan (source, slot view, the journal fence it must see), or a retain verdict that says
+   * why: `invalid` for a positive fact (an unauthenticated or V1 source, a certificate, slot or retiring-slot
+   * refusal, a content mismatch), `pending` for an unresolved operation on the retiring source, `uncertain` for
+   * anything else that threw (I/O, fsync, readback). Nothing here inspects the source clone. FIRST retirement
+   * (slot published): the physical run directory's generation members are exactly the slot's cohort, every
+   * member carries the identical certified V2 source, and the completing bare journal carries exactly the
+   * source's fence. RESUME (slot retiring): the retiring record alone authorizes the residue cleanup, see
+   * {@link residueExplained}.
    */
   private async verifyDurableRetirement(runId: string, generation: number, authority: RecoveryRecord, records: RecoveryRecord[],
-    selected: RecoveryRecord[], legacy: CompletionSource): Promise<{
-    view: RetirementView; v2: CompletionSourceV2; fence: CompletionSourceFence;
-    expected: { runId: string; clonePath: string; attemptId?: string };
-  } | undefined> {
+    selected: RecoveryRecord[], legacy: CompletionSource): Promise<DurableRetirementVerdict> {
+    const invalid = { kind: "invalid" } as const;
     const scope = this.authority?.retirement;
-    if (!scope || !this.git.readCompletionSourceFence) return undefined;
+    if (!scope || !this.git.readCompletionSourceFence) return { kind: "unsupported" };
     try {
       const stored = authority.completionSource;
-      if (!stored || !("version" in stored) || stored.version !== 2) return undefined;
+      if (!stored || !("version" in stored) || stored.version !== 2) return invalid;
       const view = await scope.inspect(stored);
       const v2 = view.source;
       const ctx = v2.context;
       if (canonicalJson(legacyCompletionCore(v2)) !== canonicalJson(legacy) || ctx.runId !== runId || ctx.generation !== generation ||
-          view.cohort.runId !== runId || view.cohort.generation !== generation) return undefined;
+          view.cohort.runId !== runId || view.cohort.generation !== generation) return invalid;
       const wanted = canonicalJson(v2);
       const expected = { runId, clonePath: v2.clonePath, ...(v2.attemptId === undefined ? {} : { attemptId: v2.attemptId }) };
       const fence = sourceFenceOf(v2);
@@ -4777,11 +4998,18 @@ export class RecoveryCoordinator {
       if (view.phase === "published") {
         const physical = await this.physicalGeneration(runId, generation);
         if (physical.captureIds.join("\n") !== view.cohort.captureIds.join("\n") ||
-            physical.selected.some(r => canonicalJson(r.completionSource) !== wanted)) return undefined;
-        if (journalFence === undefined || serializeSourceFence(journalFence) !== serializeSourceFence(fence)) return undefined;
-      } else if (!await this.residueExplained(runId, view, v2, wanted, journalFence, records, selected)) return undefined;
-      return { view, v2, fence, expected };
-    } catch { MaintenanceBudget.current()?.check(); return undefined; }
+            physical.selected.some(r => canonicalJson(r.completionSource) !== wanted)) return invalid;
+        if (journalFence === undefined || serializeSourceFence(journalFence) !== serializeSourceFence(fence)) return invalid;
+      } else if (!await this.residueExplained(runId, view, v2, wanted, journalFence, records, selected)) return invalid;
+      return { kind: "plan", plan: { view, v2, fence, expected } };
+    } catch (err) {
+      MaintenanceBudget.current()?.check();
+      if (err instanceof AuthorityRefusal) {
+        if (err.kind === "operation_unresolved") return { kind: "pending" };
+        if (err.kind !== undefined) return invalid;
+      }
+      return { kind: "uncertain" };
+    }
   }
 
   /**

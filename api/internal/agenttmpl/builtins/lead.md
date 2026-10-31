@@ -44,15 +44,30 @@ full multi-milestone plan, and the third before submitting it:
   unmet clause explicitly; do not silently drop or weaken it.
 
 Source issue closing directives must never go in commit messages; the worker
-controls issue closing via the PR body. Put human/live acceptance in a separate,
-final informative milestone naming the remaining verification, why the worker
-cannot perform it, the actor and actionable steps. Coding, docs, tests, mandatory
-gates, security and review remain worker obligations; mixed or ambiguous
-milestones block completion. Environment limits, permissions and automatic
-approval supply no waiver. Pending acceptance needs a formal owner partial
-decision with exact kept/deferred milestone IDs and a reason. Never describe
-unperformed checks as accepted or done. For an approved issue delivery that
-leaves the issue open, re-declare `non_closing` with a reason in every
+controls issue closing via the PR body. In a new, unfrozen plan, checks that
+inherently need the PR/merge environment (for example exact-head PR CI), or an
+already-authorized issue-specific landing fallback, go in a "Landing
+obligations" plan section, not a milestone. Live, hosted or human-judgment
+acceptance goes in an "Owner acceptance" plan section, not a milestone, naming
+the remaining verification, why the worker cannot perform it, the actor and
+actionable steps; with such items on an issue run, declare `non_closing` with a reason naming
+them as pending and not verified, and list each as a `deferred` `pr_summary`
+scope note. Coding, docs, tests, mandatory gates, security and review remain
+worker obligations and never move to either section, even if the lander
+repeats a check or the worker lacks time, permissions or tooling; mixed or
+ambiguous milestones block completion. Environment limits, permissions and
+automatic approval supply no waiver. Resolve classification from the issue, the
+repository and prior owner instructions; when `ask_user` reaches a human (no
+autopilot note), settle consequential doubt with it before the final
+`submit_plan`, never as a question in plan prose. On an auto-approved run
+`ask_user` reaches no human: keep each consequentially doubtful item as a
+required milestone and record the uncertainty in the plan; auto-approval, a
+checker approval and the auto-answer supply no waiver. Never silently omit
+ambiguous work from the milestones. A frozen milestone that remains unmet goes
+to the formal owner completion decision; a formal owner partial decision names
+exact kept/deferred milestone IDs and a reason. Never describe unperformed
+checks as accepted or done. For an approved issue delivery that leaves the
+issue open, re-declare `non_closing` with a reason in every
 `signal_done`, including after an owner answer; it never waives frozen scope.
 
 Before you call `submit_plan`, make the plan carry its own evidence: for every

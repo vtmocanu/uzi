@@ -100,6 +100,10 @@ type runsStore struct {
 	selfUsage        store.SelfUsageRow
 	adminTotals      store.AdminUsageTotalsRow
 	adminPerUser     []store.AdminUsagePerUserRow
+	// Issue #3686 PR counts.
+	selfPRCounts    store.SelfPRCountsRow
+	factoryPRCounts store.FactoryPRCountsRow
+	prCountsPerUser []store.PRCountsPerUserRow
 	// PRD #1293 failed-run rate outcome aggregates.
 	selfRunOutcomes         store.SelfRunOutcomesRow
 	adminRunOutcomes        store.AdminRunOutcomesRow
@@ -263,6 +267,15 @@ func (s *runsStore) AdminUsageTotals(context.Context) (store.AdminUsageTotalsRow
 }
 func (s *runsStore) AdminUsagePerUser(context.Context) ([]store.AdminUsagePerUserRow, error) {
 	return s.adminPerUser, nil
+}
+func (s *runsStore) SelfPRCounts(_ context.Context, _ uuid.UUID) (store.SelfPRCountsRow, error) {
+	return s.selfPRCounts, nil
+}
+func (s *runsStore) FactoryPRCounts(context.Context) (store.FactoryPRCountsRow, error) {
+	return s.factoryPRCounts, nil
+}
+func (s *runsStore) PRCountsPerUser(context.Context) ([]store.PRCountsPerUserRow, error) {
+	return s.prCountsPerUser, nil
 }
 func (s *runsStore) SelfRunOutcomes(context.Context, store.SelfRunOutcomesParams) (store.SelfRunOutcomesRow, error) {
 	return s.selfRunOutcomes, nil

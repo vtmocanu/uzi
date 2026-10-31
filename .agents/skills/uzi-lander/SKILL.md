@@ -231,9 +231,10 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    `REARM=` line in the background in the same turn (it acks that health episode).
    Parks: `awaiting_input` → read the question (`uzi run logs RUN --json`, kind `question`),
    surface it, answer with `uzi run answer` if you can (never a wait-only answer: see `uzi-watcher`,
-   *Watching*; a completion question about a milestone
-   the plan made maintainer-owned: `uzi run decide RUN --partial <kept ids> --reason '...'`, since
-   a plain answer cannot exempt it, then open the PR); `awaiting_approval` past `SEQ` → the run re-planned
+   *Watching*; a completion question about a frozen
+   milestone on an older plan that made it maintainer-owned:
+   `uzi run decide RUN --partial KEPT_IDS --reason '...'`, since a plain answer cannot exempt it, then open the PR; new plans should list
+   owner acceptance outside the milestones and not ask); `awaiting_approval` past `SEQ` → the run re-planned
    (usually a lost worker resumed from the default branch): before steering the new gate with
    `uzi-watcher`, check `uzi run recovery RUN` for committed work worth landing instead; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
    keep polling (`limit_wait` and `pool_wait` resume on their own; a `recovery_wait` may need an owner action, so read its cause; a `data_volume_full` park is counted and exits the poller 4), except `recovery_wait` with cause
@@ -608,6 +609,18 @@ and they precede every merge (step 6):
   title and commit messages reach `main` in the squash commit and close issues there) and
   pass the expected set to `merge.sh --expect-closes` (`none` for a Refs-only PR), which
   checks all three and refuses a mismatch.
+- **Owner acceptance survives the PR body.** Before merge, compare the approved plan's "Owner
+  acceptance" list with the rendered PR; summary scope notes can be replaced or dropped, so restore
+  omitted or truncated items in an owner-maintained area of the PR body or a durable linked
+  handoff. Missing prose never means acceptance is absent; the issue stays open
+  (`--expect-closes none`). After a non-closing delivery merges, apply issue-triage's "Acceptance
+  only" disposition (`.agents/skills/issue-triage/SKILL.md`: remove `uzi`, `bug`, `Planned`,
+  `on-deck`; add `acceptance`; comment citing the landing PR; label writes need the approval the
+  triage verdict requires) only after verifying implementation is complete and only maintainer
+  acceptance remains, so label-selected nightly sweeps cannot re-pick it (the scheduler has no
+  "already delivered" skip; an assigned-issue sweep ignores labels, so also unassign the uzi bot). Unfinished worker work, mixed scope and ordinary owner scope cuts keep their
+  actual remainder and the appropriate existing triage disposition; non-closing alone does not
+  establish acceptance-only status.
 - **A code-scanning alert on the PR ref may be an old one.** When the PR only touches
   lines near a known alert, compare rule and path with `main`'s alerts
   (`gh api repos/OWNER/REPO/code-scanning/alerts?ref=refs/heads/main`). Dismiss the

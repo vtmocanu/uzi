@@ -266,7 +266,7 @@ describe("credential-free capture foundation (#2852)", () => {
       [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]);
     for (const pin of [["credential.helper", ""], ["core.askpass", ""],
       ["maintenance.auto", "false"], ["gc.auto", "0"]]) {
-      assert.equal(pairs.filter(pair => pair[0] === pin[0] && pair[1] === pin[1]).length, 1, pin[0]);
+      assert.equal(pairs.filter(pair => pair[0] === pin[0] && pair[1] === pin[1]).length, 1, pin[0]!);
     }
     assert.equal(env.GIT_OPTIONAL_LOCKS, "0");
     assert.equal(env.GIT_TERMINAL_PROMPT, "0");

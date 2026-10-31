@@ -205,9 +205,12 @@ import {
   watchStartupCleanup,
   type StartupCleanupAuthorization,
   DEFAULT_REMOVE_CACHE_TIMEOUT_MS,
+  CommandCacheStartError,
+  measureCommandCache,
   removeCommandCache,
   startCommandCacheHolder,
   type CacheCleanupResult,
+  type CacheMeasureResult,
   type CodexEffectLaunchSpec,
   type CodexRootHandle,
   type CommandCacheHolder,
@@ -1937,7 +1940,7 @@ export interface CodexExecutorDeps {
    *  {@link startCommandCacheHolder} when the uid split is active and holds no cache
    *  otherwise; a test injects a fake (which applies regardless of the split). A rejection
    *  means the run proceeds WITHOUT cache variables. */
-  readonly startCacheHolder?: (token: string) => Promise<CommandCacheHolder>;
+  readonly startCacheHolder?: (token: string, opts?: { onSpawned?(settlement: Promise<CacheCleanupResult>): void }) => Promise<CommandCacheHolder>;
   /** Issue #1598: remove a cache whose holder died mid-run (production:
    *  {@link removeCommandCache}), waiting at most `timeoutMs`. Called only when every root
    *  that used it drained. */
@@ -1946,6 +1949,14 @@ export interface CodexExecutorDeps {
   readonly cacheReleaseTimeoutMs?: number;
   /** Issue #1598: the bound on a `--remove-cache` answer (default 2 minutes). */
   readonly cacheRemoveTimeoutMs?: number;
+  /** Issue #3675: rotate the run's command cache once a measurement reaches this many bytes
+   *  (production: UZI_CODEX_COMMAND_CACHE_RUN_BYTES). Absent or 0 disables measurement and
+   *  rotation; no command is ever refused for cache size. */
+  readonly commandCacheRunBytes?: number;
+  /** Issue #3675: measure one run's cache (production: {@link measureCommandCache}). */
+  readonly measureCommandCache?: (token: string, signal: AbortSignal) => Promise<CacheMeasureResult>;
+  /** Issue #3675: the minimum spacing between two measurements of one cache (default 30 s). */
+  readonly cacheMeasureMinIntervalMs?: number;
 }
 
 export interface CodexExecutorOptions {
@@ -3589,12 +3600,28 @@ export class CodexExecutor implements Executor {
       // failure: commands then get no cache variables (Go/npm fall back to a cold cache
       // inside the per-command private tmp, which the supervisor still cleans).
       const startCacheHolder = this.deps.startCacheHolder
-        ?? (uidSplitActive() ? (token: string) => startCommandCacheHolder(token) : undefined);
+        ?? (uidSplitActive() ? (token: string, opts?: { onSpawned?(settlement: Promise<CacheCleanupResult>): void }) =>
+          startCommandCacheHolder(token, opts ?? {}) : undefined);
       if (startCacheHolder !== undefined) {
         try {
           this.assertCaptureAdmission(setupRevision);
+          // Issue #3675: measurement and rotation exist only with a positive budget.
+          const budgetBytes = this.deps.commandCacheRunBytes ?? 0;
+          const rotation: CacheRotationOptions | undefined = budgetBytes > 0 ? {
+            budgetBytes,
+            measure: this.deps.measureCommandCache ?? ((token, signal) => measureCommandCache(token, { signal })),
+            startHolder: (token, opts) => startCacheHolder(token, opts),
+            admitCapture: () => this.assertCaptureAdmission(),
+            remove: this.deps.removeCommandCache ?? ((token, timeoutMs) => removeCommandCache(token, { timeoutMs })),
+            log: this.log,
+            waits: {
+              releaseMs: this.deps.cacheReleaseTimeoutMs ?? DEFAULT_CACHE_RELEASE_TIMEOUT_MS,
+              removeMs: this.deps.cacheRemoveTimeoutMs ?? DEFAULT_REMOVE_CACHE_TIMEOUT_MS,
+            },
+            ...(this.deps.cacheMeasureMinIntervalMs === undefined ? {} : { minIntervalMs: this.deps.cacheMeasureMinIntervalMs }),
+          } : undefined;
           runCache = new HeldRunCommandCache(await this.trackEpochSetup(() => startCacheHolder(randomUUID())),
-            registry => this.completedCaptures.get(registry), this.lifetime);
+            registry => this.completedCaptures.get(registry), this.lifetime, rotation);
         } catch (error) {
           this.log.warn("codex command cache unavailable; commands run without a shared cache", {
             error: errMessage(error),
@@ -6725,126 +6752,542 @@ export function registeredRoot(
 
 type EffectLaunch = (spec: CodexEffectLaunchSpec, deadlineMs?: number, startupCleanup?: StartupCleanupAuthorization) => Promise<CodexRootHandle>;
 
+/**
+ * One command-identity launch's claim on the run's cache, taken BEFORE its spec is built.
+ * It pins the generation that was admitting at that moment: that generation cannot be
+ * retired or removed while the reservation is outstanding.
+ */
+export interface CacheReservation {
+  /** The cache directory the launch's spec must carry. */
+  readonly dir: string;
+  /** Wrap the INNERMOST real launch. The result is usable ONCE (a second `launch` call, or a
+   *  second invocation of the returned launch, throws). Invoking it converts the reservation
+   *  into an open root whose disposal outcome counts toward the drained attestation. */
+  launch(inner: EffectLaunch): EffectLaunch;
+  /** Release a reservation whose launch was never invoked (a pre-spawn abort, a refused
+   *  registry reservation, a spec that failed to build). Idempotent; a no-op once the launch
+   *  was invoked. */
+  cancel(): void;
+}
+
 /** Issue #1598: the run's command cache as a command-identity launch site sees it. */
 export interface RunCommandCache {
-  /** The cache a NEW command launch may use, or undefined: none is held, the holder
+  /** Reserve the cache a NEW command launch may use, or undefined: none is held, the holder
    *  exited or misbehaved, or the run's cache was already settled. Once undefined it stays
    *  undefined, so a command launched after holder loss never gets `--cache` (a later
-   *  `--remove-cache` could otherwise race it). */
-  current(): { readonly dir: string } | undefined;
-  /** Wrap a launch whose spec carries this cache, so its root's disposal outcome counts
-   *  toward the drained attestation. */
-  track(launch: EffectLaunch): EffectLaunch;
+   *  `--remove-cache` could otherwise race it). Never undefined for a size reason. */
+  reserve(): CacheReservation | undefined;
   /** Record a registry whose poison requires exact completed capture evidence at disposal. */
   watchRegistry(registry: ExecutionRegistry): void;
 }
 
-/** Resolve the cache for ONE command-identity launch: its directory plus the tracked
- *  launch, or no directory and the launch unchanged. */
-function cacheForLaunch(cache: RunCommandCache | undefined, launch: EffectLaunch): { readonly dir?: string; readonly launch: EffectLaunch } {
-  const current = cache?.current();
-  return current !== undefined && cache !== undefined ? { dir: current.dir, launch: cache.track(launch) } : { launch };
+/** Resolve the cache for ONE command-identity launch: its directory, the (reservation-wrapped)
+ *  launch, and the `cancel` the caller MUST run in a `finally` (a no-op once the launch ran).
+ *  Without a cache the launch is returned unchanged. */
+function cacheForLaunch(
+  cache: RunCommandCache | undefined,
+  launch: EffectLaunch,
+): { readonly dir?: string; readonly launch: EffectLaunch; readonly cancel: () => void } {
+  const reservation = cache?.reserve();
+  return reservation === undefined
+    ? { launch, cancel: () => undefined }
+    : { dir: reservation.dir, launch: reservation.launch(launch), cancel: () => reservation.cancel() };
+}
+
+/** Issue #3675: how a run's command cache is measured and rotated. Absent, or a
+ *  non-positive budget, means no measurement and no rotation. */
+export interface CacheRotationOptions {
+  /** Rotate once a complete measurement reaches this many bytes (or any measurement is unknown). */
+  readonly budgetBytes: number;
+  readonly measure: (token: string, signal: AbortSignal) => Promise<CacheMeasureResult>;
+  /** Start a replacement holder. `onSpawned` receives the helper's ACTUAL settlement. */
+  readonly startHolder: (token: string, opts: { onSpawned(settlement: Promise<CacheCleanupResult>): void }) => Promise<CommandCacheHolder>;
+  /** Throws when capture admission (or the executor lifetime) is closed. */
+  readonly admitCapture: () => void;
+  readonly remove: (token: string, timeoutMs: number) => Promise<CacheCleanupResult>;
+  readonly log: Pick<Logger, "info" | "warn">;
+  readonly waits: { readonly releaseMs: number; readonly removeMs: number };
+  /** Minimum spacing between two measurement starts of one generation (default 30 s). */
+  readonly minIntervalMs?: number;
+  readonly now?: () => number;
+}
+
+const DEFAULT_CACHE_MEASURE_MIN_INTERVAL_MS = 30 * 1000;
+
+/** One cache directory with its holder and the accounting of what still uses it. */
+interface CacheGeneration {
+  readonly holder: CommandCacheHolder;
+  /** Reservations taken and neither launched nor cancelled. */
+  reservations: number;
+  openRoots: number;
+  unclean: boolean;
+  /** No longer admitting: replaced, or the run is settling. */
+  closed: boolean;
+  rotationPending: boolean;
+  registries: ExecutionRegistry[];
+  /** The measurement's ACTUAL extent: through the helper's close, not its delivery. */
+  inFlight?: Promise<void>;
+  /** Aborts a measurement still queued (not yet spawned). */
+  queuedAbort?: AbortController;
+  again: boolean;
+  lastStartedAt?: number;
+  /** Retirement (release/remove) was started: terminal settle must not repeat it. */
+  retireStarted: boolean;
+  deferredLogged: boolean;
+  /** Removed/absent: nothing of this generation remains. */
+  finished: boolean;
+}
+
+/** The single replacement start in flight (or its latched failure). */
+interface StartupRecord {
+  readonly token: string;
+  /** The replacement helper's ACTUAL settlement, from `onSpawned`. */
+  settlement?: Promise<CacheCleanupResult>;
+}
+
+const cleanedUp = (outcome: CacheCleanupResult): boolean => outcome.state === "removed" || outcome.state === "absent";
+
+/** Resolve true if `p` settles within `ms`, false otherwise (timer unref'd and cleared). */
+async function settlesWithinMs(p: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      p.then(() => true, () => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), Math.max(0, ms));
+        if (typeof timer.unref === "function") timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**
  * Issue #1598: the run's held command cache plus the evidence for its release.
  *
- * DRAINED ATTESTATION: true iff every command-identity root launched WITH this cache
- * reported a clean disposal (its registeredRoot reap/dispose, which both go through
- * the handle's dispose) AND every poisoned provider-epoch registry is disposed with
- * its existing exact completed capture proof still accepted. A launch that threw after the spec named the
- * cache makes it false unless that invocation receives the launcher's fresh, exact-attempt
- * certificate for fully closed rejected-startup cleanup. An unclean or rejected disposal,
- * or a root never disposed by the terminal settle, also makes it false. False is the safe
- * direction: the directory is retained for the startup
- * reaper.
+ * DRAINED ATTESTATION (per generation): true iff every command-identity root launched WITH
+ * that generation's cache reported a clean disposal (its registeredRoot reap/dispose, which both
+ * go through the handle's dispose), no reservation or measurement of it is outstanding AND every
+ * poisoned provider-epoch registry is disposed with its existing exact completed capture proof
+ * still accepted. A launch that threw after the spec named the cache makes it false unless that
+ * invocation receives the launcher's fresh, exact-attempt certificate for fully closed
+ * rejected-startup cleanup. An unclean or rejected disposal, or a root never disposed by the
+ * terminal settle, also makes it false. False is the safe direction: the directory is retained for
+ * the startup reaper.
+ *
+ * ROTATION (issue #3675, opt-in through `rotation`): the current generation is measured after
+ * its roots are disposed; an over-budget or unknown measurement marks it rotation-pending and a
+ * replacement holder is started. The pending generation keeps admitting until the replacement
+ * is READY and adopted, so a failed replacement never changes what commands see. The replaced
+ * generation then retires (release or remove) once its last reservation, root and
+ * measurement helper are gone. A generation that stalls (release retained) or cannot be proven
+ * drained is not removed mid-run: it is deferred to the terminal settle.
  */
 export class HeldRunCommandCache implements RunCommandCache {
-  private readonly holder: CommandCacheHolder;
-  private readonly registries: ExecutionRegistry[] = [];
-  private openRoots = 0;
-  private unclean = false;
+  private current: CacheGeneration;
+  private retiring: CacheGeneration | undefined;
+  private startup: StartupRecord | undefined;
+  private replacementBlocked = false;
+  private terminal = false;
+  private readonly watched: ExecutionRegistry[] = [];
   private settling: Promise<void> | undefined;
 
   constructor(
     holder: CommandCacheHolder,
     private readonly completedCapture?: (registry: ExecutionRegistry) => CompletedCredentialFreeCapture | undefined,
     private readonly lifetime?: ExecutorLifetime,
+    private readonly rotation?: CacheRotationOptions,
   ) {
-    this.holder = holder;
+    this.current = this.newGeneration(holder);
   }
 
-  current(): { readonly dir: string } | undefined {
-    if (this.settling !== undefined || !this.holder.alive()) return undefined;
-    return { dir: this.holder.path };
-  }
-
-  watchRegistry(registry: ExecutionRegistry): void {
-    this.registries.push(registry);
-  }
-
-  track(launch: EffectLaunch): EffectLaunch {
-    return async (spec, deadlineMs, startupCleanup) => {
-      this.openRoots += 1;
-      let settled = false;
-      const settle = (clean: boolean): void => {
-        if (!clean) this.unclean = true;
-        if (!settled) {
-          settled = true;
-          this.openRoots -= 1;
-        }
-      };
-      const verifiedStartupCleanup = watchStartupCleanup(startupCleanup);
-      let handle: CodexRootHandle;
-      try {
-        handle = await launch(spec, deadlineMs, startupCleanup);
-      } catch (error) {
-        // Only this attempt's launcher certificate accounts for a rejected root.
-        settle(verifiedStartupCleanup(error));
-        throw error;
-      }
-      return {
-        started: handle.started,
-        supervisorPid: handle.supervisorPid,
-        transport: handle.transport,
-        snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
-        observe: (timeoutMs) => handle.observe(timeoutMs),
-        waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
-        dispose: async (timeoutMs) => {
-          let outcome: DisposeOutcome;
-          try {
-            outcome = await handle.dispose(timeoutMs);
-          } catch (error) {
-            settle(false);
-            throw error;
-          }
-          settle(outcome.clean);
-          return outcome;
-        },
-        get failed() { return handle.failed; },
-        whenFailed: handle.whenFailed,
-      };
+  private newGeneration(holder: CommandCacheHolder): CacheGeneration {
+    return {
+      holder,
+      reservations: 0,
+      openRoots: 0,
+      unclean: false,
+      closed: false,
+      rotationPending: false,
+      // A new generation answers for every registry that is still live.
+      registries: this.watched.filter((registry) => registry.state() !== "disposed"),
+      again: false,
+      retireStarted: false,
+      deferredLogged: false,
+      finished: false,
     };
   }
 
+  reserve(): CacheReservation | undefined {
+    if (this.settling !== undefined || this.terminal) return undefined;
+    const generation = this.current;
+    if (generation.closed || !generation.holder.alive()) return undefined;
+    generation.reservations += 1;
+    let state: "reserved" | "launching" | "cancelled" = "reserved";
+    let wrapped = false;
+    return {
+      dir: generation.holder.path,
+      launch: (inner) => {
+        if (wrapped) throw new Error("command cache reservation launch already wrapped");
+        wrapped = true;
+        return this.trackedLaunch(generation, inner, () => {
+          if (state !== "reserved") throw new Error("command cache reservation is no longer available");
+          state = "launching";
+          generation.reservations -= 1;
+          generation.openRoots += 1;
+        });
+      },
+      cancel: () => {
+        if (state !== "reserved") return;
+        state = "cancelled";
+        generation.reservations -= 1;
+        this.generationChanged(generation);
+      },
+    };
+  }
+
+  watchRegistry(registry: ExecutionRegistry): void {
+    this.watched.push(registry);
+    for (const generation of [this.current, this.retiring]) {
+      if (generation !== undefined && !generation.finished) generation.registries.push(registry);
+    }
+  }
+
+  /** Wrap the real launch: once invoked, the reservation becomes an open root. */
+  private trackedLaunch(generation: CacheGeneration, launch: EffectLaunch, begin: () => void): EffectLaunch {
+    return (spec, deadlineMs, startupCleanup) => {
+      begin(); // synchronous: a second use throws
+      return this.runTracked(generation, launch, spec, deadlineMs, startupCleanup);
+    };
+  }
+
+  private async runTracked(
+    generation: CacheGeneration,
+    launch: EffectLaunch,
+    spec: CodexEffectLaunchSpec,
+    deadlineMs: number | undefined,
+    startupCleanup: StartupCleanupAuthorization | undefined,
+  ): Promise<CodexRootHandle> {
+    let settled = false;
+    const settle = (clean: boolean, disposed: boolean): void => {
+      if (!clean) generation.unclean = true;
+      if (!settled) {
+        settled = true;
+        generation.openRoots -= 1;
+      }
+      if (disposed) this.rootDisposed(generation);
+      else this.generationChanged(generation);
+    };
+    const verifiedStartupCleanup = watchStartupCleanup(startupCleanup);
+    let handle: CodexRootHandle;
+    try {
+      handle = await launch(spec, deadlineMs, startupCleanup);
+    } catch (error) {
+      // Only this attempt's launcher certificate accounts for a rejected root.
+      settle(verifiedStartupCleanup(error), false);
+      throw error;
+    }
+    return {
+      started: handle.started,
+      supervisorPid: handle.supervisorPid,
+      transport: handle.transport,
+      snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+      observe: (timeoutMs) => handle.observe(timeoutMs),
+      waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
+      dispose: async (timeoutMs) => {
+        let outcome: DisposeOutcome;
+        try {
+          outcome = await handle.dispose(timeoutMs);
+        } catch (error) {
+          settle(false, true);
+          throw error;
+        }
+        settle(outcome.clean, true);
+        return outcome;
+      },
+      get failed() { return handle.failed; },
+      whenFailed: handle.whenFailed,
+    };
+  }
+
+  /** The current generation's attestation. */
   drained(): boolean {
-    return !this.unclean && this.openRoots === 0 && this.registries.every((registry) => {
-      if (!registry.isPoisoned()) return true;
-      // Read the executor-owned evidence for this exact registry at settlement;
-      // later poison invalidates it even after disposal has cleared live tables.
-      const proof = this.completedCapture?.(registry);
-      return proof !== undefined && registry.state() === "disposed" && registry.acceptsCompletedCapture(proof);
+    return this.drainedOf(this.current);
+  }
+
+  private drainedOf(generation: CacheGeneration): boolean {
+    return !generation.unclean && generation.openRoots === 0 && generation.reservations === 0
+      && generation.inFlight === undefined && generation.registries.every((registry) => {
+        if (!registry.isPoisoned()) return true;
+        // Read the executor-owned evidence for this exact registry at settlement;
+        // later poison invalidates it even after disposal has cleared live tables.
+        const proof = this.completedCapture?.(registry);
+        return proof !== undefined && registry.state() === "disposed" && registry.acceptsCompletedCapture(proof);
+      });
+  }
+
+  // ─── measurement ───────────────────────────────────────────────────────────────
+
+  private get measuring(): CacheRotationOptions | undefined {
+    return this.rotation !== undefined && this.rotation.budgetBytes > 0 ? this.rotation : undefined;
+  }
+
+  private admitting(generation: CacheGeneration): boolean {
+    return generation === this.current && !generation.closed && !this.terminal && this.settling === undefined;
+  }
+
+  /** A reservation-launched root of `generation` was disposed (clean or not). Never awaited. */
+  private rootDisposed(generation: CacheGeneration): void {
+    this.scheduleMeasure(generation);
+    this.generationChanged(generation);
+  }
+
+  /** Something that gates a generation's retirement or the next replacement changed. */
+  private generationChanged(generation: CacheGeneration): void {
+    if (generation === this.retiring) this.maybeRetire();
+  }
+
+  private scheduleMeasure(generation: CacheGeneration): void {
+    if (this.measuring === undefined || !this.admitting(generation) || generation.rotationPending) return;
+    if (generation.inFlight !== undefined) {
+      generation.again = true;
+      return;
+    }
+    this.startMeasure(generation);
+  }
+
+  private startMeasure(generation: CacheGeneration): void {
+    const options = this.measuring;
+    if (options === undefined || !this.admitting(generation) || generation.rotationPending) return;
+    const now = (options.now ?? Date.now)();
+    const interval = options.minIntervalMs ?? DEFAULT_CACHE_MEASURE_MIN_INTERVAL_MS;
+    if (generation.lastStartedAt !== undefined && now - generation.lastStartedAt < interval) {
+      // Too soon: the next root disposal after the interval starts it.
+      generation.again = true;
+      return;
+    }
+    try { options.admitCapture(); } catch { return; }
+    generation.lastStartedAt = now;
+    generation.again = false;
+    const abort = new AbortController();
+    generation.queuedAbort = abort;
+    const token = generation.holder.token;
+    const done = (async (): Promise<void> => {
+      let result: CacheMeasureResult;
+      try {
+        result = await options.measure(token, abort.signal);
+      } catch {
+        result = { state: "unknown", reason: "protocol" };
+      }
+      this.measured(generation, result);
+      if (result.state === "unknown" && result.settlement !== undefined) {
+        options.log.warn("codex command cache measurement helper unresolved", { cache: token, reason: result.reason });
+        // The helper's actual end (close, or exit plus a bounded stdout drain), never the
+        // delivery: this generation is not retired or removed while it may still be reading
+        // the directory.
+        await result.settlement.catch(() => undefined);
+      }
+    })();
+    generation.inFlight = done;
+    this.lifetime?.join(done);
+    void done.finally(() => {
+      if (generation.inFlight === done) {
+        generation.inFlight = undefined;
+        generation.queuedAbort = undefined;
+      }
+      this.measurementEnded(generation);
     });
   }
 
+  /** Apply a result to the generation that was measured, and only while it still admits. */
+  private measured(generation: CacheGeneration, result: CacheMeasureResult): void {
+    const options = this.measuring;
+    // Defensive: one measurement is in flight per generation and a rotation-pending generation
+    // starts no new one, so a result can only reach the generation it measured; adoption also
+    // aborts the replaced generation's queued measurement. `admitting` still pins it to `current`.
+    if (options === undefined || !this.admitting(generation)) return;
+    if (result.state === "cancelled") return;
+    const cache = generation.holder.token;
+    if (result.state === "complete") {
+      options.log.info("codex command cache measured", { cache, state: "complete", bytes: result.bytes });
+      if (result.bytes < options.budgetBytes) return;
+    } else {
+      options.log.info("codex command cache measured", { cache, state: "unknown", reason: result.reason });
+    }
+    generation.rotationPending = true;
+    options.log.info("codex command cache rotation pending", { cache, budgetBytes: options.budgetBytes });
+    this.tryRotate();
+  }
+
+  private measurementEnded(generation: CacheGeneration): void {
+    if (generation === this.retiring) {
+      this.maybeRetire();
+      return;
+    }
+    if (generation.again && this.admitting(generation) && !generation.rotationPending) this.scheduleMeasure(generation);
+  }
+
+  // ─── rotation ─────────────────────────────────────────────────────────────────
+
+  private tryRotate(): void {
+    const options = this.measuring;
+    const generation = this.current;
+    if (options === undefined || !generation.rotationPending || !this.admitting(generation)) return;
+    if (!generation.holder.alive() || this.retiring !== undefined || this.startup !== undefined || this.replacementBlocked) return;
+    // A refusal before anything was spawned clears the latch, so a later root disposal
+    // re-measures and retries. (A failed start that did spawn keeps `rotationPending`.)
+    try { options.admitCapture(); } catch { generation.rotationPending = false; return; }
+    let invoked = false;
+    const start = (): Promise<void> => {
+      invoked = true;
+      return this.startReplacement(generation, options);
+    };
+    if (this.lifetime === undefined) {
+      void start();
+      return;
+    }
+    // Admitted work: a lifetime that has closed refuses without invoking, so nothing spawns.
+    // Defensive: the catch is unreachable today (admitCapture already asserted the lifetime
+    // open above), kept so a future refusal here cannot leave rotationPending stuck.
+    this.lifetime.admit(start).catch(() => { if (!invoked) generation.rotationPending = false; });
+  }
+
+  private async startReplacement(generation: CacheGeneration, options: CacheRotationOptions): Promise<void> {
+    const record: StartupRecord = { token: randomUUID() };
+    this.startup = record;
+    let holder: CommandCacheHolder;
+    try {
+      holder = await options.startHolder(record.token, {
+        onSpawned: (settlement) => {
+          record.settlement = settlement;
+          // Join only: this callback judges nothing.
+          this.lifetime?.join(settlement);
+        },
+      });
+    } catch (error) {
+      // Latch the failed start. Defensive: `rotationPending` also stays set for this generation,
+      // so nothing re-calls `tryRotate` for it; the latch only guards a later generation or a
+      // future caller from starting a second replacement after a spawned failure.
+      this.replacementBlocked = true;
+      this.startup = undefined;
+      const settlement = record.settlement ?? (error instanceof CommandCacheStartError ? error.settlement : undefined);
+      this.judgeSettlement(settlement);
+      options.log.warn("codex command cache replacement failed; rotation blocked", {
+        cache: generation.holder.token, replacement: record.token, error: errMessage(error),
+      });
+      return;
+    }
+    // Adoption is one synchronous decision over the state as it is NOW.
+    if (!this.terminal && this.settling === undefined && (this.lifetime?.isOpen() ?? true)
+      && this.current === generation && !generation.closed && generation.holder.alive()) {
+      const next = this.newGeneration(holder);
+      generation.closed = true;
+      generation.queuedAbort?.abort();
+      this.current = next;
+      this.retiring = generation;
+      this.startup = undefined;
+      options.log.info("codex command cache rotated", { from: generation.holder.token, to: holder.token });
+      this.maybeRetire();
+      return;
+    }
+    // Ready too late to be used: release the never-used holder and judge ITS cleanup.
+    options.log.warn("codex command cache replacement abandoned", { cache: generation.holder.token, replacement: record.token });
+    let released: CacheCleanupResult;
+    try {
+      released = await holder.release(true, options.waits.releaseMs);
+    } catch {
+      released = { state: "error", reason: "protocol" };
+    }
+    const actual = record.settlement
+      ?? (released.state === "pending" && released.settlement !== undefined ? released.settlement : Promise.resolve(released));
+    const judged = actual.then((outcome) => {
+      if (!cleanedUp(outcome)) this.lifetime?.distrust();
+      return outcome;
+    }, () => {
+      this.lifetime?.distrust();
+      return { state: "error", reason: "protocol" } as CacheCleanupResult;
+    });
+    this.lifetime?.retain(judged);
+    void judged.then((outcome) => {
+      if (this.startup === record) this.startup = undefined;
+      if (cleanedUp(outcome)) this.tryRotate();
+      else this.replacementBlocked = true;
+    });
+  }
+
+  /** Judge a helper's ACTUAL close for an ownership-specific cleanup: anything but a removal
+   *  forbids the lifetime seal. */
+  private judgeSettlement(settlement: Promise<CacheCleanupResult> | undefined): void {
+    if (settlement === undefined || this.lifetime === undefined) return;
+    this.lifetime.retain(settlement.then((outcome) => {
+      if (!cleanedUp(outcome)) this.lifetime!.distrust();
+    }));
+  }
+
+  // ─── finite retirement of a replaced generation ────────────────────────────────
+
+  private maybeRetire(): void {
+    const generation = this.retiring;
+    const options = this.rotation;
+    if (generation === undefined || options === undefined || generation.retireStarted || this.terminal) return;
+    if (generation.reservations !== 0 || generation.openRoots !== 0 || generation.inFlight !== undefined) return;
+    const alive = generation.holder.alive();
+    if (!this.drainedOf(generation)) {
+      // Not provably drained (a live poisoned registry, an unclean root): nothing is released
+      // or removed mid-run and nothing is distrusted. The terminal settle judges it.
+      if (!generation.deferredLogged) {
+        generation.deferredLogged = true;
+        options.log.warn("codex command cache retirement deferred to terminal settle", { cache: generation.holder.token });
+      }
+      return;
+    }
+    generation.retireStarted = true;
+    const retirement = this.retire(generation, alive, options);
+    this.lifetime?.retain(retirement);
+  }
+
+  private async retire(generation: CacheGeneration, alive: boolean, options: CacheRotationOptions): Promise<void> {
+    const token = generation.holder.token;
+    const stalled = (): void => {
+      options.log.warn("codex command cache retirement stalled; rotation suppressed", { cache: token });
+    };
+    const cleared = (): void => {
+      generation.finished = true;
+      if (this.retiring === generation) this.retiring = undefined;
+      this.tryRotate();
+    };
+    try {
+      const result = alive
+        ? await generation.holder.release(true, options.waits.releaseMs)
+        : await options.remove(token, options.waits.removeMs);
+      this.observeCleanup(result);
+      logCacheOutcome(options.log, alive ? "codex command cache retired" : "codex command cache removed after holder loss", token, true, result);
+      if (cleanedUp(result)) cleared();
+      else if (result.state === "pending" && result.settlement !== undefined) {
+        void result.settlement.then((actual) => { if (cleanedUp(actual)) cleared(); else stalled(); }, stalled);
+      } else stalled();
+    } catch (error) {
+      this.lifetime?.distrust();
+      options.log.warn("codex command cache retirement failed", { cache: token, error: errMessage(error) });
+      stalled();
+    }
+  }
+
+  // ─── terminal settle ───────────────────────────────────────────────────────────
+
   /**
    * Settle the cache once, at the run's terminal registry teardown. Idempotent; never
-   * throws; logs every outcome and never changes the run's.
+   * throws; logs every outcome and never changes the run's. Each generation not yet
+   * retired (the current one, and a replaced one whose retirement did not start) is judged:
    *   - holder alive: release(drained); a retained or failed result is a warn with its reason,
    *     a slow answer is "pending" (the holder settles on its own, never killed);
    *   - holder lost and drained: `--remove-cache` (the worker's registry attests the drain),
    *     a slow answer is likewise "pending";
    *   - holder lost and not drained: retained for the startup reaper.
+   * A measurement helper still running is waited for (up to `waits.releaseMs`); past that the
+   * release is chained after its ACTUAL close and retained by the lifetime, so nothing is
+   * deleted before the helper closes.
    * `waits` bounds the release and the removal answers (ms).
    */
   settle(
@@ -6853,31 +7296,57 @@ export class HeldRunCommandCache implements RunCommandCache {
     waits: { readonly releaseMs: number; readonly removeMs: number },
   ): Promise<void> {
     if (this.settling !== undefined) return this.settling;
-    const token = this.holder.token;
-    // Compute BEFORE the flag flips current(): no launch can start past this point.
-    const alive = this.holder.alive();
-    const drained = this.drained();
+    // Reservations stop here; nothing queued may still spawn.
+    this.terminal = true;
+    const targets = [this.retiring, this.current].filter(
+      (generation): generation is CacheGeneration => generation !== undefined && !generation.retireStarted,
+    );
+    for (const generation of targets) {
+      generation.closed = true;
+      generation.queuedAbort?.abort();
+    }
     this.settling = (async () => {
-      try {
-        if (alive) {
-          const result = await this.holder.release(drained, waits.releaseMs);
-          this.observeCleanup(result);
-          logCacheOutcome(log, "codex command cache released", token, drained, result);
-        } else if (drained) {
-          const result = await remove(token, waits.removeMs);
-          this.observeCleanup(result);
-          logCacheOutcome(log, "codex command cache removed after holder loss", token, drained, result);
-        } else {
-          this.lifetime?.distrust();
-          log.warn("codex command cache retained for the startup reaper", { cache: token, drained, reason: "holder lost" });
-        }
-      } catch (error) {
-        this.lifetime?.distrust();
-        log.warn("codex command cache settle failed; retained for the startup reaper", { cache: token, error: errMessage(error) });
-      }
+      await Promise.all(targets.map((generation) => this.settleGeneration(generation, log, remove, waits)));
     })();
     this.lifetime?.retain(this.settling);
     return this.settling;
+  }
+
+  private async settleGeneration(
+    generation: CacheGeneration,
+    log: Pick<Logger, "info" | "warn">,
+    remove: (token: string, timeoutMs: number) => Promise<CacheCleanupResult>,
+    waits: { readonly releaseMs: number; readonly removeMs: number },
+  ): Promise<void> {
+    const token = generation.holder.token;
+    try {
+      const measurement = generation.inFlight;
+      if (measurement !== undefined && !await settlesWithinMs(measurement, waits.releaseMs)) {
+        log.warn("codex command cache measurement helper unresolved at settle; cleanup chained after its close", { cache: token });
+        // Chained after the helper's actual close; owned by the lifetime (no deadline) when there is one.
+        const chained = measurement.then(() => this.settleGeneration(generation, log, remove, waits));
+        this.lifetime?.retain(chained);
+        return;
+      }
+      // Compute BEFORE anything else can change the picture: no launch can start past this point.
+      const alive = generation.holder.alive();
+      const drained = this.drainedOf(generation);
+      if (alive) {
+        const result = await generation.holder.release(drained, waits.releaseMs);
+        this.observeCleanup(result);
+        logCacheOutcome(log, "codex command cache released", token, drained, result);
+      } else if (drained) {
+        const result = await remove(token, waits.removeMs);
+        this.observeCleanup(result);
+        logCacheOutcome(log, "codex command cache removed after holder loss", token, drained, result);
+      } else {
+        this.lifetime?.distrust();
+        log.warn("codex command cache retained for the startup reaper", { cache: token, drained, reason: "holder lost" });
+      }
+    } catch (error) {
+      this.lifetime?.distrust();
+      log.warn("codex command cache settle failed; retained for the startup reaper", { cache: token, error: errMessage(error) });
+    }
   }
 
   /**
@@ -7186,6 +7655,7 @@ export function makeDefaultSpawnCommand(
       }
       const deadlineAbort = new AbortController();
       let deadlineExpired = false;
+      let cancelCacheReservation: (() => void) | undefined;
       const timer = originalDeadline === undefined ? undefined : setTimeout(() => {
         deadlineExpired = true;
         deadlineAbort.abort();
@@ -7199,15 +7669,18 @@ export function makeDefaultSpawnCommand(
         && (!capturedMemory.commands.isCurrent(capturedMemory.context, capturedMemory.flight, capturedMemory.lifecycleRevision)
           || !capturedMemory.commands.admitsCommands(capturedMemory.context))) throw new Error("captured memory admission closed");
       const [cmd, ...rest] = argv;
-      const boundedLaunch: typeof launch = originalDeadline === undefined ? launch : (spec, startupMs) => {
+      // Issue #3675: the reservation wraps the REAL launch, so a launch that never reaches it (a
+      // pre-spawn abort or deadline, a refused registry reservation) ends as a cancel, not unclean.
+      const withCache = cacheForLaunch(cache, launch);
+      cancelCacheReservation = withCache.cancel;
+      const boundedLaunch: typeof launch = originalDeadline === undefined ? withCache.launch : (spec, startupMs) => {
         if (opts.signal?.aborted) throw new Error("command aborted before launch");
         if (Date.now() >= originalDeadline) throw new CommandDeadlineError(effectiveWallMs, false);
-        return launch(spec, Math.max(1, Math.min(startupMs ?? reapDeadlineMs, originalDeadline - Date.now())));
+        return withCache.launch(spec, Math.max(1, Math.min(startupMs ?? reapDeadlineMs, originalDeadline - Date.now())));
       };
-      const withCache = cacheForLaunch(cache, boundedLaunch);
       const launched = await launchRegisteredEffectRoot(
         registry,
-        withCache.launch,
+        boundedLaunch,
         commandEffectSpec(worktreePath, opts.cwd ?? worktreePath, cmd ?? "/bin/sh", rest, opts.env ?? commandEnv, mode, withCache.dir, true),
         reapDeadlineMs,
         "command",
@@ -7323,7 +7796,11 @@ export function makeDefaultSpawnCommand(
         stdout,
         stderr,
       };
-      } finally { if (timer !== undefined) clearTimeout(timer); }
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        // A no-op once the launch ran; otherwise the reservation never became a root.
+        cancelCacheReservation?.();
+      }
   };
 }
 
@@ -7372,19 +7849,27 @@ function makeBoundaryProcessSpawner(
     if (!command) throw new Error("boundary process argv is empty");
     // Issue #1598: a command-identity boundary process (a post-run durability sink) uses the
     // run's cache like any command; a worker_pat one never does.
-    const withCache = request.identity === "command" && !isCaptureRequest(request) ? cacheForLaunch(cache, launch) : { launch };
-    const spec: CodexEffectLaunchSpec = request.identity === "command"
-      ? commandEffectSpec(request.cwd, request.cwd, command, args, request.env, mode, withCache.dir)
-      : {
-          identity: "worker_pat",
-          command,
-          args,
-          cwd: request.cwd,
-          env: request.env,
-          supervisorBin: SUPERVISOR_BIN,
-        };
-    bindCaptureLaunch(request, spec, mode);
-    const handle = await withCache.launch(spec, deadlineMs, startupCleanup);
+    const withCache: { dir?: string; launch: EffectLaunch; cancel: () => void } =
+      request.identity === "command" && !isCaptureRequest(request)
+        ? cacheForLaunch(cache, launch) : { launch, cancel: () => undefined };
+    let handle: CodexRootHandle;
+    try {
+      const spec: CodexEffectLaunchSpec = request.identity === "command"
+        ? commandEffectSpec(request.cwd, request.cwd, command, args, request.env, mode, withCache.dir)
+        : {
+            identity: "worker_pat",
+            command,
+            args,
+            cwd: request.cwd,
+            env: request.env,
+            supervisorBin: SUPERVISOR_BIN,
+          };
+      bindCaptureLaunch(request, spec, mode);
+      handle = await withCache.launch(spec, deadlineMs, startupCleanup);
+    } finally {
+      // A no-op once the launch ran; otherwise the reservation never became a root.
+      withCache.cancel();
+    }
     // stderr is consumed by GitCache for all boundary processes. The provider
     // adapter below drains its otherwise-unused stderr independently.
     return {

@@ -8,7 +8,10 @@
 # NOT blanket-exclude *.md — those are the files this image bundles.
 
 # --- build stage ---
-FROM node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf AS build
+# Runs on the BUILD platform: its output (dist/) is static assets, identical for every
+# target, and `npm ci --ignore-scripts` builds no native addons. Only the nginx stage
+# below is per-target, and it has no RUN, so a multi-arch publish needs no QEMU.
+FROM --platform=$BUILDPLATFORM node:26-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS build
 WORKDIR /app/web
 
 COPY web/package.json web/package-lock.json ./

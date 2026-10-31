@@ -12,7 +12,7 @@ case "$WRAPPER" in /*) ;; *) WRAPPER="$PWD/$WRAPPER" ;; esac
 mkdir -p "$ROOT/.uzi/scratch"
 TMP="$(mktemp -d "$ROOT/.uzi/scratch/govulncheck-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
-FLOOR=32
+FLOOR=36
 cases=0
 passed=0
 TOOL=example.com/tools/govulncheck@v0.0.1
@@ -77,10 +77,11 @@ case "$*" in
     ;;
   "list ./...")
     # A govulncheck built with a newer Go still invokes PATH go for packages.
-    # Record that child's inherited toolchain separately from the install.
+    # Record that child's inherited toolchain separately from the install, one
+    # file per target GOARCH (".unset" if the gate forgot to pin it).
     printf '%s\n' "toolchain=${GOTOOLCHAIN:-unset}" \
       "os=${GOOS:-darwin}" "arch=${GOARCH:-arm64}" \
-      "cgo=${CGO_ENABLED:-1}" > "$CASE_DIR/child"
+      "cgo=${CGO_ENABLED:-1}" > "$CASE_DIR/child.${GOARCH:-unset}"
     ;;
   *) echo "fake older go: unexpected arguments: $*" >&2; exit 97 ;;
 esac
@@ -93,10 +94,12 @@ pwd > "$CASE_DIR/analysis"
 printf '[%s]\n' "$@" > "$CASE_DIR/analysis-args"
 printf '%s\n' "toolchain=${GOTOOLCHAIN:-unset}" \
   "os=${GOOS:-darwin}" "arch=${GOARCH:-arm64}" \
-  "cgo=${CGO_ENABLED:-1}" "goflags=${GOFLAGS:-}" > "$CASE_DIR/analysis-env"
+  "cgo=${CGO_ENABLED:-1}" "goflags=${GOFLAGS:-}" > "$CASE_DIR/analysis-env.${GOARCH:-unset}"
 go list ./...
 echo analysis-stdout
 echo analysis-stderr >&2
+# ANALYSIS_EXIT is every arch's result unless ANALYSIS_EXIT_ARM64 overrides arm64's.
+if [ "${GOARCH:-}" = arm64 ]; then exit "${ANALYSIS_EXIT_ARM64:-$ANALYSIS_EXIT}"; fi
 exit "$ANALYSIS_EXIT"
 STUB
 chmod +x "$TMP/bin/go"
@@ -113,10 +116,12 @@ check() {
 }
 
 contains() { grep -q -F -x -- "$2" "$1"; }
+# The GOARCHes a stub left a <stem>.<arch> record for, space-separated, sorted.
+records() { (cd "$1" && for f in "$2".*; do [ -e "$f" ] && printf '%s ' "${f#"$2".}"; done); }
 
 expect() {
-  local module="$1" mode="$2" want="$3" analysis_exit="${4:-0}"
-  local dir rc=0 ok=1 goflags='' driver='' goenv=off selected stage
+  local module="$1" mode="$2" want="$3" analysis_exit="${4:-0}" arm64_exit="${5:-${4:-0}}"
+  local dir rc=0 ok=1 goflags='' driver='' goenv=off selected stage arch analysed
   cases=$((cases + 1))
   dir="$TMP/case-$cases"
   mkdir -p "$dir/tmp"
@@ -133,7 +138,7 @@ expect() {
   (cd "$ROOT" && env -i PATH="$TMP/bin:$PATH" TMPDIR="$dir/tmp" \
     REAL_MKTEMP="$REAL_MKTEMP" MODULE_ROOT="$ROOT" API_VERSION="$API_VERSION" \
     CONTROLLER_VERSION="$CONTROLLER_VERSION" CASE_DIR="$dir" \
-    ANALYZER="$TMP/analyzer" FAKE_MODE="$mode" ANALYSIS_EXIT="$analysis_exit" \
+    ANALYZER="$TMP/analyzer" FAKE_MODE="$mode" ANALYSIS_EXIT="$analysis_exit" ANALYSIS_EXIT_ARM64="$arm64_exit" \
     GOTOOLCHAIN=auto GOFLAGS="$goflags" GOENV="$goenv" GOPACKAGESDRIVER="$driver" \
     sh "$WRAPPER" "$module" "$TOOL") > "$dir/out" 2> "$dir/err" || rc=$?
   check "exit: want $want, got $rc" test "$rc" -eq "$want"
@@ -141,9 +146,10 @@ expect() {
   case "$mode" in
     driver|env-tags|goenv-tags|persisted-tags)
       check 'guard diagnostic' grep -q -F Refused. "$dir/err"
-      for stage in selection install analysis child; do
+      for stage in selection install analysis; do
         check "guard prevented $stage" test ! -e "$dir/$stage"
       done
+      check 'guard prevented child' test -z "$(records "$dir" child)"
       ;;
     *)
       check 'module-local version selection' contains "$dir/selection" "$ROOT/$module"
@@ -171,19 +177,31 @@ expect() {
             missing|nonexecutable) check 'missing executable diagnostic' grep -q -F 'produced no' "$dir/err" ;;
             *)
               check 'analysis module directory' contains "$dir/analysis" "$ROOT/$module"
+              # amd64 runs first; arm64 runs only if amd64 was clean, since the gate
+              # stops at the first finding or instrument failure.
+              analysed='amd64 '
+              [ "$analysis_exit" -ne 0 ] || analysed='amd64 arm64 '
               for stage in analysis-env child; do
-                check "$stage toolchain" contains "$dir/$stage" "toolchain=$selected"
-                check "$stage target OS" contains "$dir/$stage" os=linux
-                check "$stage target architecture" contains "$dir/$stage" arch=amd64
-                check "$stage cgo" contains "$dir/$stage" cgo=0
+                check "$stage arches analysed: want '$analysed'" test "$(records "$dir" "$stage")" = "$analysed"
+                for arch in $analysed; do
+                  check "$stage $arch toolchain" contains "$dir/$stage.$arch" "toolchain=$selected"
+                  check "$stage $arch target OS" contains "$dir/$stage.$arch" os=linux
+                  check "$stage $arch target architecture" contains "$dir/$stage.$arch" "arch=$arch"
+                  check "$stage $arch cgo" contains "$dir/$stage.$arch" cgo=0
+                done
               done
-              check 'analysis GOFLAGS preserved' contains "$dir/analysis-env" "goflags=$goflags"
+              for arch in $analysed; do
+                check "analysis $arch GOFLAGS preserved" contains "$dir/analysis-env.$arch" "goflags=$goflags"
+              done
               printf '[-test=false]\n[-show]\n[verbose]\n[./...]\n' > "$dir/want-analysis-args"
               check 'exact analysis arguments' diff -u "$dir/want-analysis-args" "$dir/analysis-args"
               check 'analysis stdout forwarded' contains "$dir/out" analysis-stdout
               check 'analysis stderr forwarded' contains "$dir/err" analysis-stderr
               check 'stderr not merged into stdout' test "$(grep -c -F analysis-stderr "$dir/out")" -eq 0
               check 'stdout not merged into stderr' test "$(grep -c -F analysis-stdout "$dir/err")" -eq 0
+              case "$mode" in
+                arm64-*) check 'verdict names the failing arch' grep -q -F "linux/arm64" "$dir/err" ;;
+              esac
               ;;
           esac
           ;;
@@ -191,7 +209,7 @@ expect() {
       case "$mode" in
         selection-fail|selection-empty|install-fail|download-fail|missing|nonexecutable)
           check 'failure prevented analysis' test ! -e "$dir/analysis"
-          check 'failure prevented child package loading' test ! -e "$dir/child"
+          check 'failure prevented child package loading' test -z "$(records "$dir" child)"
           ;;
       esac
       ;;
@@ -213,6 +231,9 @@ for module in api controller; do
   expect "$module" loader-error 2 1
   expect "$module" usage-error 2 2
   expect "$module" unexpected-error 2 42
+  # amd64 clean, arm64 not: the gate must still fail, and with arm64's verdict.
+  expect "$module" arm64-findings 1 0 3
+  expect "$module" arm64-instrument-failure 2 0 1
   expect "$module" selection-fail 2
   expect "$module" selection-empty 2
   expect "$module" install-fail 2

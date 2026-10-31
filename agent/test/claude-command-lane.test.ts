@@ -1060,3 +1060,19 @@ test("the server description states the lane's limits and the transport timeout 
   assert.equal(server.type, "sdk");
   assert.equal(server.name, "uzi_cmd");
 });
+
+// Issue #3722: the guarded bash tool must declare no annotations. The CLI derives an MCP tool's
+// isConcurrencySafe() from readOnlyHint, so guarded calls run one at a time; readOnlyHint: true
+// would also tell the CLI a shell cannot write (write coordination, plan mode, permissions) and
+// would allow concurrent shell batches under a slot-only cap that reserves no memory per
+// command (#2127, #3118, #3384). Overlap is restored by the guarded lead delegating the gate.
+test("the guarded bash tool declares no annotations, so it is never marked read-only", { timeout: 10000 }, () => {
+  const h = harness();
+  const server = buildGuardedCommandServer(h.lane);
+  const tools = (server as unknown as { instance: { _registeredTools: Record<string, { annotations?: { readOnlyHint?: boolean } }> } })
+    .instance._registeredTools;
+  const bash = tools.bash;
+  assert.ok(bash, "bash tool registered");
+  assert.equal(bash.annotations?.readOnlyHint, undefined);
+  assert.equal(bash.annotations, undefined);
+});

@@ -130,7 +130,9 @@ prior-attempt admission requirement. User recovery steps live in
 ### Scope authority and honest delivery
 
 Plans should isolate owner/deployment acceptance in a final acceptance-only
-milestone. Implementation, docs, tests, mandatory gates, security and review
+milestone (superseded for new plans by the
+[#3721 addendum](#addendum--owner-acceptance-outside-the-milestones-2026-10-31-3721)
+below). Implementation, docs, tests, mandatory gates, security and review
 remain worker obligations. Plan approval and auto-approval do not waive them.
 An ordinary answer and a `non_closing` declaration supply no scope authority.
 Formal owner partial records the exact kept/deferred milestone IDs and reason;
@@ -421,6 +423,44 @@ source proceed with the non-closing commit-history scan.
   and identity-change failures carry no parenthetical.
 - **Negotiation unchanged.** A new worker against an old API still refuses
   affected refreshes; old workers keep their earlier behavior.
+
+## Addendum — owner acceptance outside the milestones (2026-10-31, #3721)
+
+Planning-guidance change, recorded in
+[PRD #3721](../prds/done/3721-owner-acceptance-outside-milestones.md). For new,
+unfrozen plans it supersedes the #3090 addendum's acceptance-only final
+milestone. The structural contract freezes one criterion per milestone, so an
+item a worker inherently cannot perform made the run park at completion for a
+partial decision the owner had usually already seen in the plan.
+
+- **Plan sections, not milestones.** Checks that inherently need the PR/merge
+  environment (for example exact-head PR CI), or an already-authorized
+  issue-specific landing fallback, go in a "Landing obligations" section.
+  Live, hosted or human-judgment acceptance goes in an "Owner acceptance"
+  section naming what remains, why the worker cannot do it, the actor and the
+  steps. Implementation, docs, tests, mandatory gates, security and review
+  remain worker obligations and never move to either section.
+- **Honest non-closing delivery.** With owner-acceptance items the lead
+  declares `non_closing` (honored since #2172) with a reason naming the
+  pending items, and lists each as a `deferred` `pr_summary` scope note. The
+  reason is rendered in the worker-owned completion block as "Issue remains
+  open", and the #3090 closing-commit guards engage on it. Landing obligations
+  alone keep a closing delivery.
+- **Doubt at planning.** Consequential classification doubt goes to
+  `ask_user` before the final `submit_plan` only where it reaches a human. On
+  an auto-approved run `ask_user` is auto-answered, so the item stays a
+  required milestone and the plan records the uncertainty (owner decision
+  2026-10-31, PRD D5).
+- **Mechanism: guidance only.** The shared lead guidance on both harnesses
+  carries these rules. The interlock, permit and freeze are unchanged and the
+  structural contract still enforces milestones only (PRD D2). Frozen criteria
+  keep the owner partial, accept and reconciliation paths; unfinished worker
+  work still parks at completion (PRD D4).
+- **Accepted residual (PRD D3).** The owner-acceptance list is lead prose and
+  non-closing depends on the lead declaring it; nothing structural records it.
+  The plan gate, the plan cross-check and the lander's pre-merge check are the
+  guards. Scope notes are capped, so the submitted plan keeps the complete
+  acceptance text.
 
 ## Semantic default-on amendment: semantic auditing did not ship (2026-10-17, #1230/#1231; status updated 2026-10-24)
 

@@ -33,7 +33,7 @@ uzi's current MVP is a docker-compose stack of three always-on services (`web`, 
 - **`web`** (`web/Dockerfile`) — a Vite/React SPA built at image build time and served by `nginxinc/nginx-unprivileged`. Its `nginx.conf` does two jobs: serve the built static assets, and reverse-proxy `/api/*` to `api:8080`. The SPA and API therefore share one origin (`http://127.0.0.1:8080`) — no CORS configuration exists anywhere in the stack.
 - **`api`** (`api/Dockerfile`) — a statically linked Go binary (`chi` router) on `gcr.io/distroless/static-debian12`, running as `nonroot`. Serves `/api/auth/*`, `/api/admin/*`, `/api/agent-templates/*`, `/api/me/secrets/*`, `/api/worker/*` (the worker protocol, PRD #4), `/api/ws`, `/api/health`, `/api/version` (unauthenticated build info — version, founding date, uptime, plus the source commit, build time and commit count on a release image; read by the SPA footer and by the `uzi` CLI, [PRD #175](prds/done/175-build-info-popover.md)), among others. Runs its own DB migrations and builtin-template reconciliation at startup before it starts accepting traffic (see below).
 - **`db`** — stock `postgres:17`, digest-pinned in `docker-compose.yml`. Data lives in the named volume `pgdata`; it is not a bind mount, so it survives container recreation but is bound to the Docker volume store on this host.
-- **`agent`** (`agent/templates/<name>/Dockerfile`, opt-in via `docker compose --profile agent up`) — one worker per user: a Node 24 + git + bash container (not distroless — the Claude Agent SDK's Bash tool needs a real shell) that connects *outbound only* and executes runs. The image is built from a curated **template** selected by `WORKER_TEMPLATE` (PRD #18: `base`, or heavy-dep variants like `jvm`). Its outbound reach is `api`, the forge (git clone/fetch/push over HTTPS, the PAT injected as a Basic-auth header, not a session), **plus**, when a run has tier-1 tool packages to provision, the **nix substituters** the devbox engine fetches from (`cache.nixos.org` and any configured extras) — provisioning runs before the SDK in a secret-scrubbed subprocess (PRD #18 M3, [docs/worker-setup.md](docs/worker-setup.md#tool-provisioning)). The substituters are the one NEW egress PRD #18 adds to that set; the nix store lives on its own `agentnix` volume (at `/nix`) so it is a first-run-only fetch. Every worker also ships the `docker` CLI on `PATH` (PRD #83: `docker-cli`/`-compose`/`-buildx` baked into every template; no `dockerd`, no host `docker.sock`, anywhere in the image) — inert until an optional **docker-capable** worker adds a rootless Docker-in-Docker sidecar: its own container (compose) or pod sidecar (k8s), sharing only the daemon socket. The sidecar mounts none of the worker's join token, `/data`, or `/nix`, so a container the agent launches (`docker run -v ...`) can bind-mount none of them — the universal separate-mount-namespace invariant that holds on every track. Standing the sidecar up opens one genuinely new outbound set, pulled container images from a registry, which this PRD does not filter — that is [PRD #50](prds/50-llm-egress-proxy.md)'s job. See [Agent runtime](#agent-runtime-workers-runs-live-view) below, [docs/worker-setup.md](docs/worker-setup.md) for the operator procedure, and [docs/worker-docker.md](docs/worker-docker.md) for the docker sidecar.
+- **`agent`** (`agent/templates/<name>/Dockerfile`, opt-in via `docker compose --profile agent up`) — one worker per user: a Node 26 + git + bash container (not distroless — the Claude Agent SDK's Bash tool needs a real shell) that connects *outbound only* and executes runs. The image is built from a curated **template** selected by `WORKER_TEMPLATE` (PRD #18: `base`, or heavy-dep variants like `jvm`). Its outbound reach is `api`, the forge (git clone/fetch/push over HTTPS, the PAT injected as a Basic-auth header, not a session), **plus**, when a run has tier-1 tool packages to provision, the **nix substituters** the devbox engine fetches from (`cache.nixos.org` and any configured extras) — provisioning runs before the SDK in a secret-scrubbed subprocess (PRD #18 M3, [docs/worker-setup.md](docs/worker-setup.md#tool-provisioning)). The substituters are the one NEW egress PRD #18 adds to that set; the nix store lives on its own `agentnix` volume (at `/nix`) so it is a first-run-only fetch. Every worker also ships the `docker` CLI on `PATH` (PRD #83: `docker-cli`/`-compose`/`-buildx` baked into every template; no `dockerd`, no host `docker.sock`, anywhere in the image) — inert until an optional **docker-capable** worker adds a rootless Docker-in-Docker sidecar: its own container (compose) or pod sidecar (k8s), sharing only the daemon socket. The sidecar mounts none of the worker's join token, `/data`, or `/nix`, so a container the agent launches (`docker run -v ...`) can bind-mount none of them — the universal separate-mount-namespace invariant that holds on every track. Standing the sidecar up opens one genuinely new outbound set, pulled container images from a registry, which this PRD does not filter — that is [PRD #50](prds/50-llm-egress-proxy.md)'s job. See [Agent runtime](#agent-runtime-workers-runs-live-view) below, [docs/worker-setup.md](docs/worker-setup.md) for the operator procedure, and [docs/worker-docker.md](docs/worker-docker.md) for the docker sidecar.
 
 All images are pulled/built by digest or pinned tag in `docker-compose.yml`, not floating `latest`.
 
@@ -1698,6 +1698,24 @@ chain in the diagram above, with no intervening `running`.
   nonclosing. See [ADR-2506](adr/2506-merged-predecessor-discard.md) for cursors,
   accepted tick coalescing, inherited response-byte risk, migration CHECK scans
   under ACCESS EXCLUSIVE and rollback refusal to erase audit evidence.
+  The approved 2026-10-30 #3654 policy adds cross-run `basis = same_issue_witness`
+  using that same evidence and phase. Eligible failed/cancelled issue custody
+  without a recorded MR may be discarded using a distinct later same-owner/repo/
+  own-issue completed run's freshly verified merged MR. Locked live-run,
+  dependency and publication vetoes apply; unique work may be lost intentionally.
+  Available archives keep their existing TTL; this adds no worker authority or
+  source/PVC guarantee. Same-run Option D remains unchanged, including issue-less
+  completions. See the [ADR-2506 amendment](adr/2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654)
+  for the complete policy, shared bounds and accepted races. Recovery locks
+  all-state A inventory in generation/id order with NO KEY UPDATE, then
+  publications, then non-ready
+  captures; only qualifying OPEN holds through A's terminal generation discard.
+  The 1000-row inventories plus overflow probes bound fetched work, not all SQL
+  scans: generic issue-history filtering and shared-FINAL global history scans
+  remain cost boundaries. Migration 00386 extends only the universal binding
+  guard with the 19-field witness audit; the evidence CHECK and current 00340
+  inventory guard stay unchanged. No DTO, route, CLI or worker protocol changes.
+  #3031/#2969/#2884 retain their scope.
   A completed run's guarded archive can expire early as `published_redundant`
   when the API proves through the forge that the run's published branch already
   contains everything it retains (#2625; worker claim, API proof, bytes and
@@ -1731,6 +1749,30 @@ chain in the diagram above, with no intervening `running`.
   when even reclaiming them all would not fit); the reclaim itself, of expired
   then oldest finished-job files, runs when the verified upload is recorded
   (see [adr/1909-stored-file-budget.md](adr/1909-stored-file-budget.md)).
+- **Prerequisite closure pins (C1b, #3591)** — API-only lifecycle for new
+  qualifying guarded thin captures, not thin archive custody release.
+  Recovery upload commits S0 with availability using the original authenticated
+  worker's registered capability and the reviewed GitHub.com strategy; receipts
+  and sweeps do not backfill. The worker-service lane reads fresh default D,
+  proves every declared P ancestor/equal to D, freezes binding under DB locks,
+  then creates `refs/uzi-prereq/<capture-id>` at D with an empty pack outside
+  transactions. This adds no worker credential or server bundle parser.
+  Unknown creation is listing-only indefinitely, never resent or rebound.
+  Capture-locked S7 requires expired/discarded, exact-tip CAS and confirmed
+  absence; eight exhausted cleanup attempts retain the live removal blocker
+  and continue listings with at most one-hour backoff. Unknowns, leaked pins
+  and tombstones have no total inventory bound under O10; active capture quotas
+  do not bound them. Knob-off contains incoming S0 while existing rows continue
+  through the always-registered bounded pass (one I/O slot/process, ten-second
+  pass plus absolute outcome tail up to five seconds).
+  T1–T5 is a conditional trusted-worker preservation proof; native omission
+  negatives demonstrate that pinning does not verify bundle validity.
+  External pin deletion/history rewrite remains ADR-1296's accepted residual.
+  C1b advertises no feature, changes no agent and still refuses pinned thin
+  FINALs. C2 release, C3 visibility and hosted exact-head/timing acceptance
+  remain pending. See [ADR-3591](adr/3591-prerequisite-closure.md),
+  [PRD-2506 current execution](prds/2506-prerequisite-closure.md#c1b-current-execution-2026-10-29-child-3591)
+  and the [O10 runbook](docs/run-recovery.md#operating-an-o10-backlog).
 - **Milestone tracker reconciliation** (PRD #122/#265/#390) — a milestone-structured
   `issue` run shows a *reported-complete* tracker (`runs.milestones_completed`,
   monotone union, never "verified"), fed by mid-run `report_progress` and the lead's

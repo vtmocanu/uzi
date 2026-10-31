@@ -118,6 +118,37 @@ without failing until the requeue cap, then ends in `worker_requeue_exhausted`
 accepted but before the worker finished tearing down leaves no record and
 follows the existing terminal path.
 
+A successor that meets a terminal owner whose completed source is not yet retired
+(#3645) takes the same kind of stop. The owner's journal carries a
+completion-source fence, so the worker retires it through the certified completion
+chain rather than clearing it. When that retirement is pending (a busy capture
+cycle or authority lock, a failed preflight, a live owner tail), uncertain, or the
+journal has retained sources and authority finds the fence's source or a slot for
+the path, the claim stops without a terminal report and the
+owner's source is left intact; the claim is requeued up to `RUN_MAX_REQUEUES`. A
+seed that meets a slot still `retiring` (a retirement interrupted before the claim
+arrived) is the same stop, as is an I/O error while the retirement is prepared or a
+coordinator that cannot classify a journal with retained sources. An authority
+refusal, a cancel or shutdown, or a spent maintenance budget during that
+preparation is not this stop: it ends the claim as it did before. A
+journal that changes under the call re-admits at most twice per claim, and the
+third is the same stop. The stop leaves the claim's own custody hold open, so at
+the cap the run parks `recovery_wait` with `worker_requeue_exhausted` for an owner
+Resume or Cancel. Every claim on this path opens its own custody hold and the stop leaves it open, so at
+the default cap of 3 this stop loop accrues at most 1 + `RUN_MAX_REQUEUES` (4) open holds per exhaustion episode, below the default
+`custody_hold_limit` of 8; those holds share the owner's admission count with the
+owner's other runs, so several exhausted runs can hold the owner's new claims
+queued until those holds are discarded or released (Resume and Cancel leave them open). A retained-sources journal
+where authority finds neither a record carrying the fence nor a slot for the path
+(a classify `not_completion`) still takes the unchanged detach. In retire mode, a
+source that is positively invalid or unsupported keeps the outward refusal; for a
+journal with retained sources those outcomes are retained stops instead
+(`completion_unverified` / `published_source_retained`). A same-process Codex owner without a live disposal witness, a
+permanently failing preflight, or a valid fenced source with retained sources
+stays retained until exhaustion, then owner-held. See
+[ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md) for the lock
+order and outcomes.
+
 Workers built before this change reject the new `memoryPark` journal record and
 fail closed on it: they refuse to attach, recover or discard that source. Roll
 workers back only after memory-parked runs are resolved. See the
@@ -651,6 +682,150 @@ imported history. The server receipt identifies the selected archive and
 its `coverage_digest`; it does not provide a new server-side root list or
 prove Git ancestry. Preserve the downloaded bundle while reviewing which
 original head to land.
+
+## Prerequisite pins: API lifecycle, release still disabled
+
+C1b (#3591) implements the API pin lifecycle for qualifying new thin captures.
+It does **not** advertise `recovery_prerequisite_closure_v1`, change the agent,
+or permit a thin archive FINAL. Even a `pinned` response retains the existing
+custody and local-source rules. C2 owns release; C3 owns owner/CLI pin visibility.
+The parent #2506 remains active. See [ADR-3591](../adr/3591-prerequisite-closure.md)
+for the implementation and local evidence boundaries.
+
+### When a pin can be created
+
+Admission (S0) occurs in the upload transaction after verified bytes become
+available. It requires an open inventory-guarded hold, a bound manifest with
+1–64 prerequisites, the original authenticated uploading worker's registered
+`recovery_prerequisite_closure_v1` capability, and the configured reviewed
+forge strategy. Existing available receipts, upload retries and sweeps do not
+backfill rows. The current agent does not advertise this capability.
+
+`UZI_PREREQUISITE_CLOSURE_FORGES` defaults to empty. Its parser accepts
+comma-separated `github`, `gitlab`, and `forgejo` (trimmed, lowercased,
+deduplicated; empty entries ignored); an unknown kind refuses API boot.
+Syntax acceptance is not forge support: actual S0 admission currently requires
+`github` and base URL `https://github.com` (trailing slashes normalized).
+The reviewed E2 probe covered one GitHub credential/repository configuration;
+GitHub Enterprise, other forges, rulesets and protected configurations need
+their own reviewed probe before enablement. Local synthetic driver tests do
+not establish live provider compatibility.
+
+The API reads a fresh default-tip D from the same bounded advertisement that
+proves the target ref absent, then positively proves **each declared**
+prerequisite P is an ancestor of or equal to D. It creates
+`refs/uzi-prereq/<capture-id>` at D, create-only, with no run-content pack.
+D must remain compatible with the forge's workflow/policy checks at send time;
+a workflow-tree change can cause refusal. There is no retry at a new D after
+the durable invocation marker.
+
+The marker freezes connection identity, forge kind, normalized base URL,
+project ID, default branch and pin tip, against the immutable capture/hold,
+checksum and prerequisite list. A changed binding grants no rebind or resend.
+A matching read-back establishes `pinned`; explicit refusal plus confirmed
+absence establishes `pin_refused`; ambiguity becomes `create_unknown`.
+A crash after the marker can leave an unknown even if nothing was sent.
+
+### What pinning proves
+
+This is the conditional trusted-worker T1–T5 proof:
+
+| Fact | Boundary |
+|---|---|
+| T1 | The trusted worker produces/verifies the bundle and records its actual header prerequisites. |
+| T2 | The API checks byte length/checksum and binds the immutable manifest. It does not parse, apply or verify Git bundle contents. |
+| T3 | The forge positively proves every declared P ancestor/equal to fresh D. Undeclared dependencies are outside that proof. |
+| T4 | Create-only pinning and read-back observe the ref at frozen D. |
+| T5 | Exact capture/hold binding and uzi's cleanup rules retain the pin while its archive is available. Future FINAL-time observation/revalidation belongs to C2. |
+
+A pin cannot repair an incorrect worker declaration. Native restore tests
+include an omitted second prerequisite: the declared prerequisite is fetched,
+but bundle verification/import still fails naming the omitted one. No
+independent server bundle-validity or per-capture restore claim follows.
+
+### Restoring with a confirmed pin
+
+For an exact capture whose pin has been independently identified and confirmed
+at its recorded tip, fetch that ref into the destination clone before the
+normal [bundle import](#importing-the-bundle):
+
+```sh
+git fetch origin refs/uzi-prereq/<capture-id>:refs/uzi-prereq/<capture-id>
+git bundle verify ../recovered.bundle
+git fetch ../recovered.bundle refs/heads/recovered-source:refs/heads/recovered-source
+git rev-parse recovered-source
+```
+
+Compare the restored SHA with the selected capture's recorded source, and
+inspect its original roots as above. These are native Git commands, not a new
+CLI pin-discovery or expiry command. Preserve retained source when verification
+fails or pin identity is unknown.
+
+Local tests exercise public sweep → production broker → real HTTP Git backend:
+after pinning D (a strict descendant of P), rewriting default history leaves a
+fresh `--no-local` clone missing P; fetching the pin permits verify/import and
+restores the exact source commit, tree and file. The no-pin control fails on P.
+A rewrite before preparation is refused without marker/send. These fixtures use
+fake persistence and native graph ancestry; separate LiveDB tests exercise
+upload/manifest/state/locking behavior. They are not a new live forge probe or
+a released-custody end-to-end test.
+
+### Unknown pins, cleanup and removal blockers
+
+`create_unknown` is listing-only indefinitely. Expected tip → commit `pinned`
+before any later cleanup; foreign tip → terminal `foreign`, untouched;
+absence or failed listing → retain the unknown and live removal blocker.
+Never resend, rebind, reset attempts, recreate/move the ref or clear its pointer
+because of elapsed time, archive expiry, storage pressure or owner action.
+
+S7 cleanup applies to `pinned` rows after the capture is confirmed `expired`
+or `discarded`. Under the frozen binding it lists the exact ref, CAS-deletes
+at the recorded expected tip, and confirms absence before recording `deleted`
+and clearing the live pointer. A foreign ref is untouched. An ambiguous delete
+keeps `pinned` and the pointer until a later successful absence listing.
+Settling a hold by another route does not clean an available archive's pin.
+
+After eight cleanup attempts, `cleanup_exhausted_at`/`pin_cleanup_exhausted`
+retain the pinned row and live blocker; further processing is listing-only,
+with backoff capped at one hour. A later confirmed absence can settle cleanup,
+but does not grant another delete attempt. This is a schedule cap, not a
+one-hour completion guarantee. Available-pin audits normally run at 24 hours;
+absence requires a different pass at least ten minutes later to become `lost`.
+Owner-facing pin diagnostics/CLI display remain C3 work; raw forge errors are
+not a worker status contract.
+
+The active-capture cap (default 256) excludes expired/discarded captures. It
+does not bound leaked pins, unresolved rows or permanent audit tombstones.
+Live pointers block run/repository/connection removal; terminal tombstones
+remain. O10 accepts unbounded total accumulation with bounded processing:
+one forge-work slot per API process, ten-second pass, up to five items, an
+eight-second item budget and an absolute outcome tail up to five seconds.
+These bounds do not promise production latency or eventual resolution.
+
+### Operating an O10 backlog
+
+1. Turn the prerequisite-forge knob off through normal deployment configuration
+   to contain incoming S0 admission. This does not instantly cancel in-flight
+   upload transactions. Existing rows continue through the registered pass;
+   do not disable their reconciliation/cleanup or enlarge limits to hide backlog.
+2. Preserve archive bytes and diagnostics: exact capture/hold/row identity,
+   checksum, frozen binding, pin ref/tip, state, attempts and fresh observations.
+   Repair connectivity or credentials under that **same frozen identity**.
+   A changed binding is not permission to rebind, resend or reset a ceiling.
+3. Use the existing S7 route after confirmed capture expiry/discard. Available
+   pins are not capacity-reclamation targets. For unknowns, wait for S4's
+   durable positive observation before cleanup; absent unknowns may block forever.
+4. Escalate unresolved accumulation as a separate maintainer contract decision.
+   This runbook grants no manual forge-delete procedure, database override,
+   pointer clearing, attempt reset or owner/custodian-authorization shortcut.
+   Repository-write access does not authorize product capture disposal.
+
+External history/privacy purges are outside this procedure. Pins under
+`refs/uzi-*`, including `refs/uzi-prereq/*`, can keep pre-purge history reachable.
+An external writer deleting pins or rewriting their history can defeat restore;
+this is ADR-1296's accepted external-writer residual, not authorization to purge
+or erase server evidence. No eventual-cleanup or bounded-storage guarantee is
+made.
 
 ## Limits
 
@@ -1265,7 +1440,8 @@ stays retained until compatible tooling or that discard can address it.
    the remaining maintenance budget when one is running (otherwise the lock's
    default wait of 10 minutes), and the retained-source discard waits at most
    30 seconds. When the deadline expires the operation does not run and fails
-   with an `authority lock timeout` refusal; a wait ended earlier by its
+   with an `authority lock timeout` refusal (the typed `AuthorityLockBusy`, an
+   `AuthorityRefusal` whose message is unchanged); a wait ended earlier by its
    cancel, shutdown or maintenance signal rejects with that abort instead.
    Nothing guarded runs in either case, and nothing is changed by it. The discard then ends in `internal_error` and its claim gate is
    reopened; other callers handle the refusal at their own site (for example,
@@ -1377,6 +1553,43 @@ adds no worker/PVC fence or retention guarantee. Physical local-source and
 available-archive disposal previously promised by Option D remains **deferred**
 to #2823 and #1373. This is partial, nonclosing #2506; see
 [ADR-2506](../adr/2506-merged-predecessor-discard.md) for polling and rollout limits.
+
+### Approved policy amendment: later same-issue merged run (2026-10-30)
+
+The approved #3654 policy adds a narrow exception for failed/cancelled issue runs with a
+positive own issue number, SQL-NULL recorded PR/MR and no `worker_active_runs`
+claim at any generation; `run_timeout` failures do not qualify. A distinct completed issue run
+of the same owner/repository/own issue, created strictly after the target's finite finish time,
+may serve as witness when its exact recorded PR/MR is freshly verified merged.
+Any eligible witness suffices; cached MR state does not.
+
+Locked rechecks refuse identity drift, a nonterminal run matching that issue
+(including continuations, pool-wait and task runs), uncertain/shared dependencies,
+or a `prepared`, `invoked` or `create_unknown` publication on any target hold
+at any generation.
+A valid released ancestry transfer within the terminal target stays unchanged
+and does not veto discard. Eligible OPEN holds through the target's terminal
+generation may be discarded, intentionally losing unique nonancestor, untracked
+or sibling work; this is not proof of preservation.
+
+Available archives keep bytes, prerequisites and their existing expiry, without
+a fresh retention window. A created, unacknowledged orphan with no receipt
+reference may be deleted through existing cleanup once no OPEN hold remains;
+acknowledged publications keep their existing TTL, and receipt-referenced publications keep their existing cleanup protection.
+There is no new worker deletion authority or source/PVC guarantee. Same-run
+Option D above, including issue-less runs, is unchanged.
+Generations are independent across runs:
+target A1 or A3 can qualify with witness B1. Non-ready capture settlement and
+partial-chunk cleanup commit atomically with discard. See the
+[ADR-2506 amendment](../adr/2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654)
+for complete eligibility, conservative residuals, accepted races and bounded
+polling; immediate or eventual backlog convergence is not promised. Late MR
+reconciliation or a new live run inserted after the locked recheck remain
+accepted races; observed before that check, they refuse discard. Timeout targets
+and stalled prepared publications remain protected. The shared 30-second phase
+allows 100 repository visits and 100 transaction attempts, with five-second
+fresh forge observations. Inventory limits bound fetched work, not all SQL scans
+or production cost; forge response decoding has no new byte bound.
 
 ## Automatic settlement of an older held generation
 
@@ -1597,7 +1810,7 @@ These worker events identify the failed guard or completed disposition:
 |---|---|---|
 | `orphan_reclaim_refused` | warn | Reclaim stopped at `stage` for `reason`; keep the held work and investigate that guard. |
 | `orphan_retirement_failed` | warn | Canonical retirement failed at an inner stage, with `canonical_retirement_failure`; inspect its safe `errno`. |
-| `orphan_reclaim_succeeded` | info | `stage: complete`; `reason` is exactly `quarantined`, `retained-in-place`, or `source-already-absent`. |
+| `orphan_reclaim_succeeded` | info | `stage: complete`; `reason` is exactly `quarantined`, `retained-in-place`, `source-already-absent`, or `completion-retired` (the fenced owner source was retired through the certified completion chain and the successor re-admits). |
 
 | Refusal stage | Reasons and investigation |
 |---|---|
@@ -1608,6 +1821,7 @@ These worker events identify the failed guard or completed disposition:
 | `quiescence` | `quiescence_blocked` or `quiescence_error`: the scoped capture check blocked or failed. |
 | `attempt_ledger` / `attempt_journal` | `attempt_release_failure`: recording retained attempt state or clearing its journal failed. |
 | `retirement` | `canonical_retirement_failure`, or `attempt_release_failure` when attempt validation falls through to this generic stage. |
+| `completion_handoff` | The owner's journal carried a completion-source fence. `completion_retirement_pending`: the certified retirement is not ready, so the successor stops without failing (see the retained stop above). `completion_retirement_refused`: the outward refusal for an invalid or unsupported fenced source in retire mode (a retire-mode `not_completion` carries subreason `fenced_source`), or a journal that changed under the call (`pair_changed`, the successor re-admits). |
 
 Inner retirement stages are `journal_read`, `journal_validation`, `containment`,
 `holding_parent`, `rename`, `retained_copy`, `intra_device_rename`, and
@@ -1623,7 +1837,15 @@ orphaned skills on every worker. A refusal after a move or copy need not restore
 the original layout.
 
 The new events carry `event`, `stage`, `reason`, `claimant_id`, `owner_id`,
-`repo_id`, `path_shape`, `path_fingerprint`, and `errno`. IDs are UUID strings
+`repo_id`, `path_shape`, `path_fingerprint`, and `errno`, plus an optional
+`retirement_subreason` from a closed set (anything else is written as `unknown`):
+`fenced_source` (a fence refused an uncertified clear), `pair_changed` (the
+owner/path pair changed or the re-admission bound of 2 was passed),
+`completion_pending`, `completion_preflight_retained`, `completion_uncertain`,
+`authority_busy` (the authority lock wait ran out), `published_source_retained`
+(a fenced journal with retained sources was kept, never detached),
+`completion_unverified`, `completion_unsupported`, or `unknown`. It carries no
+error text or paths. IDs are UUID strings
 or `invalid`; path shape is `canonical`, `attempt`, or `unknown`. The fingerprint
 is a 64-hex SHA-256 digest of the path, with 64 zeroes if hashing is unavailable.
 `errno` is allowlisted or `unknown`; optional `http_status` is an integer from

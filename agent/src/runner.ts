@@ -123,7 +123,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type DurableCompletionRetirement, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
+import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
@@ -197,8 +197,10 @@ import {
   type OrphanDiagnostics,
   type OrphanStage,
   type OrphanReason,
+  type OrphanRetirementSubreason,
   CHECKPOINT_SCAN_TIMEOUT_MS,
   CapturePathMismatchError,
+  isCompletionSourceFenceError,
   CloneResidueBlockedError,
   ForeignCaptureBlockedError,
   PendingRecoveryCaptureError,
@@ -1199,6 +1201,18 @@ class RetainedRecoveryStop extends Error {
 
 class RetainedRecoveryCancelled extends RetainedRecoveryStop {}
 
+/** issue #3645: thrown by {@link RunRunner.reclaimTerminalOrphan} when the terminal owner's journal changed or was
+ *  retired under it, so the claimant's admission must be re-read (see the phaseClone loop). It carries no effect:
+ *  nothing was moved, detached or released by the throw itself. */
+class OrphanHandoffReadmit extends Error {
+  constructor(readonly diagnostics: OrphanDiagnostics, readonly journaledPath: string) {
+    super("terminal owner handoff: re-admit the claimant");
+  }
+}
+
+/** The re-admissions one claimant's clone phase takes after a handoff before it stops retained. */
+const ORPHAN_HANDOFF_MAX_READMITS = 2;
+
 class RetainedRecoveryMissingJournalError extends Error {
   constructor() { super("Retained recovery blocked: required journal is missing; local work and custody retained"); }
 }
@@ -1999,6 +2013,11 @@ function checkpointErrorDiagnostic(
         case "ECONNRESET": causeClass = "connection_reset"; break;
         case "ETIMEDOUT": case "UND_ERR_CONNECT_TIMEOUT":
         case "UND_ERR_HEADERS_TIMEOUT": case "UND_ERR_BODY_TIMEOUT": causeClass = "timeout"; break;
+        case "UND_ERR_SOCKET": case "UND_ERR_CLOSED": case "ECONNABORTED": causeClass = "connection_closed"; break;
+        case "EHOSTUNREACH": case "ENETUNREACH": case "EHOSTDOWN": case "ENETDOWN": causeClass = "network_unreachable"; break;
+        case "CERT_HAS_EXPIRED": case "UNABLE_TO_VERIFY_LEAF_SIGNATURE": case "DEPTH_ZERO_SELF_SIGNED_CERT":
+        case "SELF_SIGNED_CERT_IN_CHAIN": case "UNABLE_TO_GET_ISSUER_CERT_LOCALLY":
+        case "ERR_TLS_CERT_ALTNAME_INVALID": causeClass = "tls"; break;
       }
     }
     const message = typeof current === "string" ? current : checkpointErrorField(current, "message");
@@ -2370,6 +2389,9 @@ interface RunFlight {
   barePath: string | undefined;
   worktreePath: string | undefined;
   branch: string | undefined;
+  /** issue #3645: this flight's own execution-tail promise (the one {@link RunRunner.execute} installed in
+   *  `executionTails`), so the terminal-owner handoff can tell it from a replacement tail by identity. */
+  executionTail?: Promise<ClosedSourceObservation | void>;
   active: ActiveRun | undefined;
   parked: boolean;
   /** Accepted pause ACK; delivery failures must not replace this park with a terminal. */
@@ -3054,6 +3076,9 @@ export class RunRunner {
   private readonly inventoryReservations = new Set<string>();
   private readonly commandSettlements = new WeakMap<Executor, { confirmed: boolean; failed: boolean }>();
   private readonly executionTails = new Map<string, Promise<ClosedSourceObservation | void>>();
+  /** issue #3645: terminal owner run id -> the one claimant flight currently running the coordinated handoff for it.
+   *  Set only around {@link RecoveryCoordinator.retireCompletedSourceForHandoff} (see {@link handoffClaimantId}). */
+  private readonly handoffClaimants = new Map<string, { flight: RunFlight; tail: Promise<ClosedSourceObservation | void> }>();
   // A boundary pass alone is not full cleanup. Bindings retire only on positive cleanup evidence: the
   // coordinator's completion notifications, or a binder's cleanup witness reporting full fallback cleanup.
   private readonly completionSourceBindings = new Map<string, readonly CompletionSourceBinding[]>();
@@ -3817,6 +3842,35 @@ export class RunRunner {
       binding.flight.terminalDisposal.source.safety === binding.source.safety;
   }
 
+  /**
+   * issue #3645: the id of the successor claimant whose own execution tail the completion boundary of `ownerRunId`
+   * may leave out of `otherClaimInFlight`, or undefined. Parity with {@link quiesceRun}, which excludes its own flight.
+   * It holds only while that claimant is registered for this owner's handoff AND is still the same, pre-seed,
+   * uncancelled flight: no claim fence, not shutting down, its recorded tail still the run's tail (a queued duplicate
+   * execute replaces the tail), and no clone, attempt or worktree bound yet. Anything else counts as another claim.
+   */
+  private handoffClaimantId(ownerRunId: string): string | undefined {
+    const entry = this.handoffClaimants.get(ownerRunId);
+    if (!entry) return undefined;
+    const flight = entry.flight;
+    if (flight.runId === ownerRunId) return undefined;
+    if (flight.steering.claimFence() !== undefined || flight.steering.isCancelled()) return undefined;
+    if (flight.active?.shuttingDown || this.shuttingDownGlobal) return undefined;
+    if (this.executionTails.get(flight.runId) !== entry.tail) return undefined;
+    if (flight.worktreePath !== undefined || flight.runnerClone !== undefined || flight.attempt !== undefined) return undefined;
+    return flight.runId;
+  }
+
+  /** Register `flight` as the handoff claimant of `ownerRunId`; the returned function deregisters it. Undefined (no
+   *  exclusion) when the flight has no recorded tail or another claimant is already registered for this owner. */
+  private registerHandoffClaimant(ownerRunId: string, flight: RunFlight): (() => void) | undefined {
+    const tail = flight.executionTail;
+    if (!tail || this.handoffClaimants.has(ownerRunId)) return undefined;
+    const entry = { flight, tail };
+    this.handoffClaimants.set(ownerRunId, entry);
+    return () => { if (this.handoffClaimants.get(ownerRunId) === entry) this.handoffClaimants.delete(ownerRunId); };
+  }
+
   /** Reserve execution through completion retirement's disposal under the bare lock. Successor admission
    * replaces this tail and stops any further destruction while waiting for our release. */
   private async withCompletionSourceBoundary(source: CompletionSource,
@@ -3834,7 +3888,13 @@ export class RunRunner {
       return classification.binding !== undefined && this.completionSourceProof(source, classification.binding);
     };
     // A known Codex source never falls through to legacy inspection without the live disposal witness.
-    if (!proof() || this.executionTails.has(ctx.runId) || process.platform !== "linux") return "retained";
+    // The observer only classifies a refusal for the coordinator; it grants nothing and its errors are swallowed.
+    const retain = (reason: RetainedBoundaryReason): "retained" => {
+      try { durable?.noteRetained?.(reason); } catch { /* deny-only observer */ }
+      return "retained";
+    };
+    if (process.platform !== "linux") return retain("unsupported_platform");
+    if (!proof() || this.executionTails.has(ctx.runId)) return retain("vetoed");
     let release!: () => void;
     const tail = new Promise<void>(resolve => { release = resolve; });
     this.executionTails.set(ctx.runId, tail);
@@ -3846,20 +3906,26 @@ export class RunRunner {
     // quiescence over exactly that path; Docker-wired, teardown must answer docker_unconfirmed). Only that path is
     // accepted: this is never a way to quiesce, and so delete, anything else.
     const skillsPath = join(pathDirname(source.clonePath), `.uzi-skills-${pathBasename(source.clonePath)}`);
+    // issue #3645: only a registered, still-current handoff claimant is left out of `otherClaimInFlight`; every other
+    // tail counts. The exclusion applied to a request is re-checked after the awaited quiescence it fed.
+    const otherClaim = (excluded: string | undefined): boolean =>
+      [...this.executionTails.keys()].some(id => id !== ctx.runId && id !== excluded);
     const quiesceSkills = async (paths: string[]): Promise<boolean> => {
       if (process.platform !== "linux" || !open() || paths.length === 0 || paths.some(p => p !== skillsPath)) return false;
+      const excluded = this.handoffClaimantId(ctx.runId);
       const outcome = await this.quiesceImpl({
         mode: "capture" as const, attempt: undefined, cloneKey: cloneKeyOf(source.clonePath).cloneKey, targetPaths: [skillsPath],
         processes: true, dockerHost: this.dockerHost, registry: this.liveAttempts,
-        otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== ctx.runId),
+        otherClaimInFlight: otherClaim(excluded),
         site: "completion_source:skills",
       });
+      if (excluded !== undefined && this.handoffClaimantId(ctx.runId) !== excluded) return false;
       if (outcome.process?.state !== "quiescent" || !open()) return false;
       return !this.dockerHost || outcome.docker.state === "docker_unconfirmed";
     };
     try {
       const inventory = await this.git.readInventoryCloneHeads(ctx.barePath, ctx.runId);
-      if (inventory.kind !== "verified" || !open()) return "retained";
+      if (inventory.kind !== "verified" || !open()) return retain("vetoed");
       const clone = inventory.clones.find(c => c.clonePath === source.clonePath);
       if (!clone) {
         // A resumed retirement's authenticated retiring record replaces the attempt-ledger/fence proof: the
@@ -3877,32 +3943,39 @@ export class RunRunner {
               durable.expectedFence, { ...processOpts, retiring: true })) ||
           (durable?.resumed === true && open() &&
             await this.git.completionSourceJournalAbsent(ctx.barePath, ctx.branch, ctx.runId, source.clonePath, source.attemptId));
-        if (!retired || !open()) return "retained";
+        if (!retired || !open()) return retain("vetoed");
         await action(open, quiesceSkills);
         return "passed";
       }
-      if (clone.branch !== ctx.branch || clone.runId !== ctx.runId) return "retained";
+      if (clone.branch !== ctx.branch || clone.runId !== ctx.runId) return retain("identity_changed");
+      const excluded = this.handoffClaimantId(ctx.runId);
       const request = { mode: "capture" as const, attempt: undefined,
         cloneKey: cloneKeyOf(source.clonePath).cloneKey, targetPaths: [source.clonePath],
         processes: true, dockerHost: this.dockerHost, registry: this.liveAttempts,
-        otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== ctx.runId),
+        otherClaimInFlight: otherClaim(excluded),
         site: "completion_source" };
+      const exclusionHolds = (): boolean => excluded === undefined || this.handoffClaimantId(ctx.runId) === excluded;
       const before = await this.quiesceImpl(request);
-      if (before.process?.state !== "quiescent" || !open()) return "retained";
-      if (await this.git.worktreeHead(source.clonePath) !== source.expectedHead || !open()) return "retained";
+      if (!exclusionHolds()) return retain("not_quiescent");
+      if (before.process?.state !== "quiescent") return retain("not_quiescent");
+      if (!open()) return retain("vetoed");
+      if (await this.git.worktreeHead(source.clonePath) !== source.expectedHead) return retain("identity_changed");
+      if (!open()) return retain("vetoed");
       const after = await this.quiesceImpl({ ...request, dockerHost: undefined, site: "completion_source:after_git" });
-      if (after.process?.state !== "quiescent" || !open()) return "retained";
+      if (!exclusionHolds()) return retain("not_quiescent");
+      if (after.process?.state !== "quiescent") return retain("not_quiescent");
+      if (!open()) return retain("vetoed");
       await this.git.retireRunnerClone(ctx.barePath, source.clonePath, ctx.branch, ctx.runId, {
         discard: true, attemptId: source.attemptId, completionSource: { expectedHead: source.expectedHead, canDelete: open,
           ...(durable ? { expectedFence: durable.expectedFence, beforeDestroy: durable.enter } : {}) },
         ...(classification.kind === "knownCodex" ? { processProof: open } : {}),
       });
-      if (!open()) return "retained";
+      if (!open()) return retain("vetoed");
       await action(open, quiesceSkills);
       return "passed";
     } catch (err) {
       this.log.warn("recovery: completion source retained", { run_id: ctx.runId, error: errMessage(err) });
-      return "retained";
+      return retain(err instanceof CapturePathMismatchError || isCompletionSourceFenceError(err) ? "identity_changed" : "error");
     } finally {
       this.inventoryReservations.delete(ctx.runId);
       if (this.executionTails.get(ctx.runId) === tail) this.executionTails.delete(ctx.runId);
@@ -4318,7 +4391,7 @@ export class RunRunner {
           claim = await this.refreshQueuedClaimCursor(claim);
         }
         observation = await this.executeClaim(claim, inherited || undefined, operation => { ownedMemory = operation; },
-          ready => { evidenceReady = ready; });
+          ready => { evidenceReady = ready; }, tail);
       } catch (error) {
         failed = true;
         primaryError = error;
@@ -4527,13 +4600,15 @@ export class RunRunner {
   }
 
   private async executeClaim(claim: ClaimResponse, inherited: ClosedSourceObservation | undefined,
-    ownMemory: (operation: Promise<void>) => void, evidenceSettled?: (ready: boolean) => void): Promise<ClosedSourceObservation | void> {
+    ownMemory: (operation: Promise<void>) => void, evidenceSettled?: (ready: boolean) => void,
+    executionTail?: Promise<ClosedSourceObservation | void>): Promise<ClosedSourceObservation | void> {
     let observedFlight: RunFlight | undefined;
     await MaintenanceBudget.runAttempt(`${claim.run_id}:${claim.claim_generation ?? 0}`, () => {
       if (!observedFlight) throw new Error("cancellation observed before flight initialization");
       return this.observeCancellation(observedFlight);
     }, () => this.executeClaimInAttempt(claim, flight => {
       observedFlight = flight;
+      flight.executionTail = executionTail;
       flight.sourceInherited = inherited;
       this.registerEvidenceExecutor(flight);
     }, ownMemory));
@@ -11498,7 +11573,14 @@ export class RunRunner {
    *  journal and clone UNTOUCHED (never quarantine on an unproven owner). retireRunnerClone's
    *  own pre-rename (ownerRunId, clonePath) re-validation stays authoritative. Serves BOTH
    *  Case B (ForeignCaptureBlockedError, same-slug) and Case A (CapturePathMismatchError,
-   *  cross-kind slug divergence). */
+   *  cross-kind slug divergence).
+   *
+   *  issue #3645: after those predicates the owner's journal is classified (GitCache.readOrphanJournalFence). An
+   *  unfenced journal takes the path above. A fence-carrying journal is never cleared by it: a non-retained one is
+   *  retired through RecoveryCoordinator.retireCompletedSourceForHandoff (a retired owner, or a journal that changed
+   *  under us, throws {@link OrphanHandoffReadmit}; a pending or uncertain retirement is a retained stop; a positively
+   *  invalid or unsupported one refuses with `original`); a retained one is only classified, and only a positive
+   *  `not_completion` falls through to the unchanged detach. */
   private async reclaimTerminalOrphan(
     barePath: string,
     claim: ClaimResponse,
@@ -11511,8 +11593,9 @@ export class RunRunner {
     const diagnostics: OrphanDiagnostics = {
       logger: this.log, claimantId: claim.run_id, ownerId: ownerRunId, repoId: claim.repo.id, pathShape: "unknown",
     };
-    const refuse = (stage: OrphanStage, reason: OrphanReason, error?: unknown, status?: number): never => {
-      emitOrphanDiagnostic(diagnostics, journaledPath, "orphan_reclaim_refused", stage, reason, error, status);
+    const refuse = (stage: OrphanStage, reason: OrphanReason, error?: unknown, status?: number,
+      subreason?: OrphanRetirementSubreason): never => {
+      emitOrphanDiagnostic(diagnostics, journaledPath, "orphan_reclaim_refused", stage, reason, error, status, subreason);
       throw original;
     };
     let id: RunOrphanClassificationResponse;
@@ -11572,13 +11655,137 @@ export class RunRunner {
     }
     if (!shape) return refuse("path", "path_mismatch"); // (d′)
     diagnostics.pathShape = shape;
+
+    // issue #3645: the owner's journal is classified BEFORE any effect. A fence-carrying journal is never cleared
+    // by the uncertified paths below: its source is retired through the coordinator's certified chain (or kept).
+    const readFence = async () => {
+      try {
+        const signal = this.retainedLifecycleSignal(flight);
+        const result = await this.git.withRecoveryOperation(signal, Infinity, scopeSignal =>
+          this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath, scopeSignal));
+        this.retainedLifecycleGuard(flight);
+        return result;
+      } catch (error) {
+        this.retainedLifecycleGuard(flight);
+        return refuse("path", "path_error", error);
+      }
+    };
+    let handoffDeadline: number | undefined;
+    // The optional changed-pair proof may spend only the original A allowance, never renew it.
+    // An expired or unreadable reread withholds that proof and preserves the outcome's disposition.
+    const rereadFence = async (): Promise<Awaited<ReturnType<GitCache["readOrphanJournalFence"]>> | undefined> => {
+      this.retainedLifecycleGuard(flight);
+      if (handoffDeadline !== undefined && Date.now() >= handoffDeadline) return undefined;
+      try {
+        const signal = this.retainedLifecycleSignal(flight);
+        const read = (scopeSignal: AbortSignal) =>
+          this.git.readOrphanJournalFence(barePath, branch, ownerRunId, journaledPath, scopeSignal);
+        const result = await this.git.withRecoveryOperation(signal, handoffDeadline ?? Infinity, read);
+        this.retainedLifecycleGuard(flight);
+        return result;
+      } catch {
+        this.retainedLifecycleGuard(flight);
+        return undefined;
+      }
+    };
+    const readmit = (): never => {
+      emitOrphanDiagnostic(diagnostics, journaledPath, "orphan_reclaim_refused", "completion_handoff",
+        "completion_retirement_refused", undefined, undefined, "pair_changed");
+      throw new OrphanHandoffReadmit(diagnostics, journaledPath);
+    };
+    // A nonterminal stop: custody and the owner's source stay as they are, no terminal report, no model work.
+    const stopRetained = (subreason: OrphanRetirementSubreason): never => {
+      this.retainedLifecycleGuard(flight);
+      emitOrphanDiagnostic(diagnostics, journaledPath, "orphan_reclaim_refused", "completion_handoff",
+        "completion_retirement_pending", undefined, undefined, subreason);
+      throw new RetainedRecoveryStop({ cause: original });
+    };
+    const refuseHandoff = (subreason: OrphanRetirementSubreason): never =>
+      refuse("completion_handoff", "completion_retirement_refused", undefined, undefined, subreason);
+    // The effect branches below refuse on a changed pair or a fence; a journal retired or replaced under us is a
+    // re-admission, not a terminal refusal. One re-read decides.
+    const refuseAfterReread = async (stage: OrphanStage, reason: OrphanReason, error: unknown): Promise<never> => {
+      const again = await rereadFence();
+      if (again?.state === "changed") return readmit();
+      return refuse(stage, reason, error, undefined,
+        isCompletionSourceFenceError(error) ? "fenced_source" : error instanceof CapturePathMismatchError ? "pair_changed" : "unknown");
+    };
+
+    const fenceState = await readFence();
+    if (fenceState.state === "changed") readmit();
+    if (fenceState.state === "fenced") {
+      // The one bound of the claimant's wait for the authority transaction A, shared by both fenced branches (the
+      // unfenced baseline never waits for A here, so it computes none).
+      const wait = this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS);
+      handoffDeadline = Date.now() + (wait.timeoutMs ?? CLONE_AUTHORITY_WAIT_MS);
+      const retainedSource = fenceState.retained;
+      // A retained journal (an episode or retained sources) is only classified: the certified chain cannot retire it.
+      const mode = retainedSource ? "classify" : "retire";
+      const deregister = mode === "retire" ? this.registerHandoffClaimant(ownerRunId, flight) : undefined;
+      let outcome: HandoffRetirement;
+      try {
+        outcome = await this.recovery.retireCompletedSourceForHandoff({
+          runId: ownerRunId, clonePath: journaledPath, ...(fenceState.attemptId === undefined ? {} : { attemptId: fenceState.attemptId }),
+          fence: fenceState.fence, ownerCompleted: id.status === "completed", wait, mode,
+        });
+      } catch (error) {
+        // A cancel, claim fence or shutdown ends the A wait with the lifecycle abort: surface it as the lifecycle stop.
+        if (wait.signal?.aborted) this.retainedLifecycleGuard(flight);
+        throw error;
+      } finally {
+        deregister?.();
+      }
+      if (outcome.kind === "retired" && !retainedSource) {
+        emitOrphanDiagnostic(diagnostics, journaledPath, "orphan_reclaim_succeeded", "complete", "completion-retired");
+        throw new OrphanHandoffReadmit(diagnostics, journaledPath);
+      }
+      // Any other outcome: the pair may have been retired or replaced meanwhile (a sweep racing the selection).
+      // An unreadable or expired reread only withholds the "changed" proof, so each outcome below keeps its own
+      // disposition. Lifecycle stops always propagate instead of becoming a terminal orphan refusal.
+      const reread = await rereadFence();
+      if (reread?.state === "changed") readmit();
+      if (retainedSource) {
+        // A found published source is never detached. Only a positive "no record, no slot" answer falls through,
+        // and it proceeds only when the re-read succeeded and did not report a change (a failed re-read is
+        // uncertain); the snapshot fence guard below catches a different fence.
+        if (outcome.kind !== "not_completion") stopRetained(outcome.kind === "invalid" ? "completion_unverified" : "published_source_retained");
+        if (reread === undefined) stopRetained("published_source_retained");
+      } else {
+        switch (outcome.kind) {
+          case "pending":
+            stopRetained(outcome.why === "authority_busy" ? "authority_busy"
+              : outcome.why === "preflight" ? "completion_preflight_retained" : "completion_pending");
+            break;
+          case "uncertain": stopRetained("completion_uncertain"); break;
+          case "invalid": refuseHandoff("completion_unverified"); break;
+          case "unsupported": refuseHandoff("completion_unsupported"); break;
+          default: refuseHandoff("fenced_source"); break;
+        }
+      }
+    }
+
     let retained: Awaited<ReturnType<GitCache["terminalRetainedSnapshot"]>>;
     try {
       retained = await this.git.terminalRetainedSnapshot(barePath, branch, owner.slug, {
         runId: ownerRunId, clonePath: journaledPath,
       });
     } catch (error) {
-      return refuse("path", "path_error", error);
+      return refuseAfterReread("path", "path_error", error);
+    }
+    if (retained) {
+      // The detach below must act on the journal that was classified: a fence that appeared (or changed) between the
+      // classification and the snapshot is never detached on the strength of the earlier answer.
+      const snapshotFence = retained.journal.completionSourceFence;
+      const classified = fenceState.state === "fenced" ? serializeSourceFence(fenceState.fence) : undefined;
+      if ((snapshotFence === undefined ? undefined : serializeSourceFence(snapshotFence)) !== classified) {
+        const again = await rereadFence();
+        if (again?.state === "changed") readmit();
+        // The unfenced/unfenced exemption serves workers without authority: they classify a fence-carrying journal as
+        // unfenced and keep the baseline detach. On an authority worker, an ABA race (unfenced, then a fenced snapshot,
+        // then an unfenced re-read) fails closed at detachTerminalRetained's under-lock equality check; that race is
+        // accepted.
+        if (!(fenceState.state === "unfenced" && again?.state === "unfenced")) stopRetained("completion_pending");
+      }
     }
     if (retained || (flight.effectiveAttemptPaths ?? this.attemptPaths)) {
       // The same predecessor-scoped capture-mode proof the C′ capture runs, and the same blocking
@@ -11614,7 +11821,7 @@ export class RunRunner {
         disposition = await this.git.retireRunnerClone(barePath, journaledPath, branch, ownerRunId, { discard: false, orphanDiagnostics: diagnostics });
       }
     } catch (error) {
-      return refuse(error instanceof AttemptReleaseError ? (error.stage === "ledger" ? "attempt_ledger" : "attempt_journal") : "retirement",
+      return refuseAfterReread(error instanceof AttemptReleaseError ? (error.stage === "ledger" ? "attempt_ledger" : "attempt_journal") : "retirement",
         (flight.effectiveAttemptPaths ?? this.attemptPaths) && shape === "attempt" ? "attempt_release_failure" : "canonical_retirement_failure", error);
     }
     emitOrphanDiagnostic(diagnostics, journaledPath, "orphan_reclaim_succeeded", "complete", disposition);
@@ -12123,7 +12330,48 @@ export class RunRunner {
         await this.bindFlightSource(flight, runnerClone.path);
       } catch (err) {
         if (err instanceof SourceUseHeldRefusal) stopOnHeldSource(err);
+        stopOnRetiringSlot(err);
         throw err;
+      }
+    };
+    // issue #3645: a terminal owner's journal that changed or was retired under the reclaim (OrphanHandoffReadmit) sends
+    // the claimant back through ordinary admission, which re-reads the owner, the path and the journal and raises a
+    // fresh Case A/B if a (possibly different) owner is still there. At most ORPHAN_HANDOFF_MAX_READMITS times, then a
+    // retained stop. Returns true when the loop must continue; every other error propagates untouched.
+    let handoffReadmits = 0;
+    let lastReadmit: OrphanHandoffReadmit | undefined;
+    // A seed (a fresh claim or one after a handoff re-admission) that meets a slot still `retiring` is a not-ready
+    // retirement: a retained stop, bounded by the requeue cap, never a terminal report. After a re-admission the
+    // diagnostic carries the owner's ids; a fresh claim knows no owner, so its owner id and path digest are the fixed
+    // placeholders (no path or error text leaves). A `retiring` slot with no blocking pending record is a retained stop;
+    // a slot whose pending record is still running, or whose destructive record settled failed (blocksNewOperation),
+    // raises the untyped "source has an unresolved pending footprint" refusal first and stays terminal (a recorded
+    // residual).
+    const stopOnRetiringSlot = (err: unknown): void => {
+      if (!(err instanceof AuthorityRefusal) || err.kind !== "retiring") return;
+      this.retainedLifecycleGuard(flight);
+      const context: OrphanDiagnostics = lastReadmit?.diagnostics ?? {
+        logger: this.log, claimantId: claim.run_id, ownerId: "", repoId: claim.repo.id, pathShape: "unknown",
+      };
+      emitOrphanDiagnostic(context, lastReadmit?.journaledPath ?? "", "orphan_reclaim_refused", "completion_handoff",
+        "completion_retirement_pending", undefined, undefined, "completion_pending");
+      throw new RetainedRecoveryStop({ cause: err });
+    };
+    const readmitted = async (reclaim: () => Promise<void>): Promise<boolean> => {
+      try {
+        await reclaim();
+        return false;
+      } catch (error) {
+        if (!(error instanceof OrphanHandoffReadmit)) throw error;
+        lastReadmit = error;
+        if (++handoffReadmits > ORPHAN_HANDOFF_MAX_READMITS) {
+          this.retainedLifecycleGuard(flight);
+          emitOrphanDiagnostic(error.diagnostics, error.journaledPath, "orphan_reclaim_refused", "completion_handoff",
+            "completion_retirement_pending", undefined, undefined, "pair_changed");
+          throw new RetainedRecoveryStop({ cause: error });
+        }
+        await refreshAttemptSeed();
+        return true;
       }
     };
     // issue #1786: a canonical seed refused because the key now has a kept stopped canonical source
@@ -12166,19 +12414,20 @@ export class RunRunner {
           // canonical path match the journal is reclaimed (residue quarantined, RETAINED),
           // else fail closed. Replaces the old worker-scoped getRunOwnership probe, which
           // 404'd on a worker move (Gap 2).
-          await this.reclaimTerminalOrphan(barePath, claim, flight, err.clonePath, err.branch, err.ownerRunId, err);
+          if (await readmitted(() => this.reclaimTerminalOrphan(barePath, claim, flight, err.clonePath, err.branch, err.ownerRunId, err))) continue;
           await reseedAfterReclaim();
         } else if (err instanceof CapturePathMismatchError) {
           // issue #1319 Case A: a claimant-relative clone-path mismatch (the cross-kind slug
           // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
           // The SAME owner-derived validation decides; any unmet predicate fails closed.
-          await this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err);
+          if (await readmitted(() => this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err))) continue;
           await reseedAfterReclaim();
         } else if (err instanceof SourceUseHeldRefusal) {
           // The canonical clone path is shared by every run of the issue on this worker, so an earlier flight of
           // this process can still hold it with no confirmed end (held_unended).
           stopOnHeldSource(err);
         } else {
+          stopOnRetiringSlot(err);
           throw err;
         }
       }

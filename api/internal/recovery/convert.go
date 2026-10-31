@@ -15,9 +15,10 @@ import (
 // is re-sanitized on read as defense in depth (it is already sanitized on write).
 func captureToStatus(c store.RecoveryCapture) apitypes.RecoveryCaptureStatusResponse {
 	out := apitypes.RecoveryCaptureStatusResponse{
-		CaptureID:     c.ID.String(),
-		State:         c.State,
-		ManifestBound: c.ManifestBound,
+		PrerequisiteClosure: noPrerequisiteClosure(c.ManifestBound, c.PrerequisiteShas, c.Checksum.String),
+		CaptureID:           c.ID.String(),
+		State:               c.State,
+		ManifestBound:       c.ManifestBound,
 	}
 	if c.ByteSize.Valid {
 		out.ByteSize = int64Ptr(c.ByteSize.Int64)
@@ -34,13 +35,14 @@ func captureToStatus(c store.RecoveryCapture) apitypes.RecoveryCaptureStatusResp
 	return out
 }
 
-// statusFromLocked builds the idempotent ready receipt from the row-locked snapshot the
-// upload transaction already read, so a lost-ACK retry needs no extra query.
+// statusFromLocked builds the archive facts of an idempotent ready receipt from
+// the upload's locked snapshot. withPrerequisiteStatus adds the read-only closure facts.
 func statusFromLocked(captureID uuidLike, lc lockedCapture) apitypes.RecoveryCaptureStatusResponse {
 	out := apitypes.RecoveryCaptureStatusResponse{
-		CaptureID:     captureID.String(),
-		State:         lc.state,
-		ManifestBound: true,
+		PrerequisiteClosure: noPrerequisiteClosure(lc.bound, lc.prerequisites, lc.checksum.String),
+		CaptureID:           captureID.String(),
+		State:               lc.state,
+		ManifestBound:       true,
 	}
 	if lc.byteSize.Valid {
 		out.ByteSize = int64Ptr(lc.byteSize.Int64)

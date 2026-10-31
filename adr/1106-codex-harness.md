@@ -1021,6 +1021,48 @@ agreement of pins, not execution of 0.163.0. Installed receipt/probe acceptance,
 real worker-UID and M4 execution remain separate evidence required before
 accepting the upgrade.
 
+## Runtime adoption: 0.164.0 (2026-10-31)
+
+The stable upgrade is 0.163.0 to 0.164.0; there are no intervening stable tags.
+The [release notes](https://github.com/openai/codex/releases/tag/rust-v0.164.0)
+and consumed source paths were compared between both tags. The target tag resolves
+to `6aaac694803004a63c6f393d153c96d22521a6b9`; both package SHA256 values match
+the official release asset metadata. This adoption stays at the requested version,
+although 0.166.0 was the latest stable release when checked.
+
+- Native utility registration no longer depends on a selected environment.
+  Shell and image features remain explicitly disabled by uzi. Native apply-patch
+  still resolves a selected environment before filesystem access; uzi supplies
+  `environments: []`. Registration is not execution authority. Real-binary native
+  denial and cold-resume checks remain required; pin parity alone proves neither.
+- Dynamic tool handlers now support parallel calls. The callback wire contract is
+  unchanged; worker-owned identity, role, phase and tool admission remain the
+  boundary. The full harness and packaged proof must cover this runtime change.
+- Incremental tools default on for Responses Lite, MCP OAuth refresh coordination
+  defaults on, and the Bedrock setup wizard defaults on. Uzi does not configure
+  native MCP servers or use the interactive setup wizard. Incremental declarations
+  do not replace the worker callback checks. New runtime-agent registration,
+  executor discovery V2, environment copying and message wake features default off.
+- Resume restores saved model settings, compressed rollout lookup is repaired,
+  failed compaction preserves history, and closed background-compaction receivers
+  no longer panic. Uzi continues to send its explicit thread/turn policy. These
+  are runtime fixes, not a change to uzi's retained-custody or resume guarantees.
+- Protocol additions include experimental thread sampling/cancellation, local
+  diagnostic export and optional Responses metadata patches. Image-generation
+  items can carry attachment references; no image-generation contract is adopted
+  here. The bundled model catalog is unchanged, including shell type, service
+  tier and minimum-client metadata. Removed TUI compatibility flags are not used.
+
+Adoption candidates are thread sampling and local diagnostic export; neither is
+enabled or integrated by this version-pin change. Native execution policy, tool
+grants, authentication selection and provider retries are unchanged in uzi.
+
+Local validation covers dependency freshness plus pin sync/parity/coordination,
+configuration and runtime-probe unit tests. Actual 0.164.0 binary execution is
+pending exact-head CI: M4, worker UID, strict amd64 packaged proof and the arm64
+package-exec lane. Arm64 worker images/full packaged proof, arm64 code-mode host
+execution, receipt validation and live provider entitlement were not run locally.
+
 ## Amendment: temporary account admission (#3530, 2026-10-27)
 
 The account admission policy is **no standing limit; temporary cooldown after rate-limit or repeated-overload evidence.**

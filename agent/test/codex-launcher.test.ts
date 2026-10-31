@@ -59,7 +59,7 @@ resetResidueQuarantineAfterEach();
 // Most privileged steps are injected; the worker-UID regression exercises the
 // production runner-tree creator with real setpriv and the worker image binaries.
 
-const CODEX_BIN = "/opt/uzi-codex/0.163.0/bin/codex";
+const CODEX_BIN = "/opt/uzi-codex/0.164.0/bin/codex";
 const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
 const RUNNER_UID = 10002;
 const DATA_ROOT = "/data/run/root-1";
@@ -1028,6 +1028,7 @@ describe("M1 controlled advice disposal ordering probe", () => {
             replacement = await originalStat(owned);
             ownerMetadata = t.mock.method(fs, "stat", async (...args: Parameters<typeof fs.stat>) => {
               const stat = await originalStat(...args);
+              assert.ok(stat, "fs.stat resolved without stats");
               if (/^\/proc\/self\/fd\/[0-9]+$/.test(String(args[0])) &&
                 String(stat.dev) === String(replacement!.dev) && String(stat.ino) === String(replacement!.ino)) {
                 if (typeof stat.uid === "bigint") bigintIdentityReads++;
@@ -1206,7 +1207,14 @@ describe("TMP_RETAINED_REASONS matches Go safetree.Reason", () => {
     assert.ok(returned.includes(""), "func Reason no longer returns \"\" for nil");
     const goReasons = new Set(returned.filter((r) => r !== ""));
     assert.ok(goReasons.size >= 6, `only ${goReasons.size} reasons parsed from func Reason`);
-    assert.deepEqual([...TMP_RETAINED_REASONS].sort(), [...goReasons].sort());
+    // The bounded-walk words only the read-only --measure-cache reports (issue #3675). The
+    // measure parser accepts them (codex-command-cache.test.ts, "parses incomplete <word>");
+    // the cleanup, hold and remove parsers stay strict and reject them.
+    const MEASURE_ONLY = ["entries", "depth", "bytes"];
+    const cleanupReasons = [...goReasons].filter((r): r is string => r !== undefined && !MEASURE_ONLY.includes(r));
+    assert.deepEqual(MEASURE_ONLY.filter((r) => !goReasons.has(r)), [], "Go no longer returns a measure-only word");
+    assert.deepEqual([...TMP_RETAINED_REASONS].sort(), cleanupReasons.sort());
+    for (const word of MEASURE_ONLY) assert.equal(TMP_RETAINED_REASONS.has(word), false, word);
   });
 });
 
