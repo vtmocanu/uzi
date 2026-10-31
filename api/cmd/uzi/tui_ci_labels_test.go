@@ -30,7 +30,7 @@ func runesAt(line string, c, n int) string {
 }
 
 // Every label on a CI band heading starts exactly at its cell's first column in that band's
-// rows, at widths spanning every ciColumnsFor tier; labels follow the tiers, the RUNNING band
+// rows, at widths spanning every ciColumnsFor tier (30..200, down past the right cell); labels follow the tiers, the RUNNING band
 // reads elapsed and jobs/age, finished bands took and age, and no heading overflows.
 func TestCIEyebrowLabelsAlignWithCells(t *testing.T) {
 	now := time.Now()
@@ -39,8 +39,8 @@ func TestCIEyebrowLabelsAlignWithCells(t *testing.T) {
 	for _, r := range runs {
 		byNum[r.Number] = r
 	}
-	sawAll := false
-	for w := 50; w <= 200; w++ {
+	sawAll, sawNoRight := false, false
+	for w := 30; w <= 200; w++ {
 		m := ciLabelModel(t, w, runs)
 		out := stripANSI(m.View().Content)
 		cols := ciColumnsFor(w)
@@ -98,10 +98,13 @@ func TestCIEyebrowLabelsAlignWithCells(t *testing.T) {
 				}
 				sawAll = true
 			}
+			if !cols.right {
+				sawNoRight = true // the right label's hidden-column check above covered this tier
+			}
 		}
 	}
-	if !sawAll {
-		t.Fatal("no width rendered the full column set")
+	if !sawAll || !sawNoRight {
+		t.Fatalf("sweep missed a tier: full set %t, right cell dropped %t", sawAll, sawNoRight)
 	}
 }
 
