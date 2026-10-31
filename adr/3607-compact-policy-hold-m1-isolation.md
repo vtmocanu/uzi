@@ -14,22 +14,35 @@ mandatory isolation/latch defect. Historical successful local checks and CI rema
 successful for their tested tree; their readiness inference missed this case.
 This blocker is M1, distinct from F5's deferred M2 retention-flag cleanup.
 
-The owner's explicit server-contract approval amends the PRD's former absolute
-“Do not add a second capability, readiness overlay or wire-version scheme.”
-The narrow exception is the generic protocol capability
-`pending_outcome_scoped_claim_v1`. It is independent of the single unreleased policy
-contract `provider_policy_hold_v1`; it neither replaces that contract nor advertises
-policy readiness. The API still omits the policy feature from its advertisements.
-Implementation judgment was not a prior waiver.
+Run 8d3e58c5 had no separate owner approval of the server-contract change.
+Cross-check round 1 requested revision at sequence 1302; automatic revision
+followed at 1304. Round 2 approved at 1844 but warned that the new capability
+conflicted with the PRD and required explicit approval. The plan posted at 1845
+and implementation began at 1846 under auto-approval. That automation and the
+supplied APPROVED plan-tool reports are design history, not owner consent.
 
-The owner/server-supplied APPROVED plan-tool reports at baseline 4faaec1d record the
-architect/tester/reviewer/auditor design critique and revision before implementation:
-correct F6's baseline premise, remove the proposed bodyless overflow guard, startup
-rewrite and durable placeholder, and approve this narrow protocol exception.
-These supplied reports are design history, not locally rerun design tests.
-Implementation reviews of immutable R1/R2 ranges and their focused executions are
-separately inventoried in the PRD. No new runtime architecture proof is claimed by
-this documentation turn.
+On 2026-10-31, lead and buddy accepted the narrow generic protocol capability
+`pending_outcome_scoped_claim_v1` for landing under their delegated decision
+authority. This dated acceptance amends the former absolute prohibition on a
+second capability; it does not invent a prior owner decision or waive validation.
+The lead will disclose the new wire capability and this approval history to the
+owner. It is independent of the single unreleased policy contract
+`provider_policy_hold_v1`, which remains unadvertised by the API.
+
+A worker-only relaxation cannot supply the server's scoped overflow exception;
+reusing policy readiness would couple generic pending-source protection to a
+disabled policy feature. Both sides negotiate the narrow capability. In the
+claim transaction the server revalidates worker registration, frozen run locks,
+current ownership/generation, release state and bounded pending accounting.
+Source classification and completeness remain worker attestations, not facts
+independently authenticated from worker disk. Missing capability or invalid,
+incomplete or uncertain evidence retains the legacy conservative claim guard.
+
+The historical critique corrected F6's baseline premise and removed the proposed
+bodyless overflow guard, startup rewrite and durable placeholder. Implementation
+reviews of immutable R1/R2 ranges and focused executions are separately
+inventoried in the PRD; neither those reports nor this correction claims a new
+runtime architecture proof or a prior owner waiver.
 
 ## Decision: isolate retained sources without inventing authority
 
