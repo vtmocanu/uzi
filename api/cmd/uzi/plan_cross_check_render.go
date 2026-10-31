@@ -49,6 +49,9 @@ func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 	if r.Status == "awaiting_approval" && (r.PlanCrossCheckRequired || r.PlanCrossCheckGated) && r.PlanCrossCheckGateReason != nil {
 		if reason := crossCheckPlain(*r.PlanCrossCheckGateReason); strings.TrimSpace(reason) != "" {
 			text := "plan cross-check: " + strings.ReplaceAll(reason, "_", " ")
+			if r.PlanCrossCheckGated && reason == "worker_unsupported" {
+				text = "plan cross-check: unavailable, not supported on this worker"
+			}
 			if reason == "planning_diff_refused" && r.PlanCrossCheckDiffRefusal != nil {
 				if sub := crossCheckPlain(*r.PlanCrossCheckDiffRefusal); strings.TrimSpace(sub) != "" {
 					text += " (" + strings.ReplaceAll(sub, "_", " ") + ")"
@@ -59,11 +62,14 @@ func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 	}
 	s := r.PlanCrossCheckSummary
 	if s == nil {
+		if r.PlanCrossCheckGated && r.PlanCrossCheckGateReason == nil {
+			rows = append(rows, []string{"PLAN_CROSS_CHECK", "plan cross-check: not checked"})
+		}
 		return rows
 	}
-	// Shared "passed" rule: only a gated run at the gate with no gate reason, whose
-	// latest check approved the current plan (not historical), may say it passed.
-	if r.PlanCrossCheckGated && r.Status == "awaiting_approval" && r.PlanCrossCheckGateReason == nil &&
+	// Shared "passed" rule (any status): a gated run with no gate reason, whose latest
+	// check approved the current plan (not historical), may say it passed.
+	if r.PlanCrossCheckGated && r.PlanCrossCheckGateReason == nil &&
 		!s.Historical && s.Verdict == "approve" && s.Round > 0 {
 		word := "rounds"
 		if s.Round == 1 {
@@ -122,7 +128,8 @@ func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 		rounds := s.Rounds[max(0, len(s.Rounds)-maxCrossCheckRounds):]
 		rows = append(rows, []string{label + "_ROUNDS", fmt.Sprintf("%d", len(rounds))})
 		for _, rd := range rounds {
-			rows = append(rows, planCrossCheckRoundRows(label, rd)...)
+			// The summary rows above already show the latest round's findings.
+			rows = append(rows, planCrossCheckRoundRows(label, rd, s.Findings != nil && rd.Round == s.Round)...)
 		}
 	}
 	return rows
@@ -131,10 +138,10 @@ func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 // planCrossCheckRoundRows renders one round. The lead's response is untrusted
 // prose, so it goes through crossCheckPlain like every checker string; the label
 // says it is a claim, never a verified resolution.
-func planCrossCheckRoundRows(label string, rd apitypes.PlanCrossCheckRoundDTO) [][]string {
+func planCrossCheckRoundRows(label string, rd apitypes.PlanCrossCheckRoundDTO, findingsShown bool) [][]string {
 	p := fmt.Sprintf("%s_ROUND_%d", label, rd.Round)
 	rows := [][]string{{p + "_RESULT", crossCheckPlain(rd.Verdict)}}
-	if f := rd.Findings; f != nil {
+	if f := rd.Findings; f != nil && !findingsShown {
 		rows = append(rows, []string{p + "_SUMMARY", crossCheckPlain(f.Summary)})
 		for i, item := range f.Items[:min(len(f.Items), 20)] {
 			ip := fmt.Sprintf("%s_%d", p, i+1)

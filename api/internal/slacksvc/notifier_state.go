@@ -471,12 +471,17 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 		crossCheckReason := ""
 		if run, rerr := n.store.GetRunByID(ctx, rc.ID); rerr != nil {
 			n.logf("load gate cross-check reason", rerr)
-		} else if (run.PlanCrossCheckRequired || run.PlanCrossCheckGated) && run.PlanCrossCheckGateReason.Valid {
-			crossCheckReason = run.PlanCrossCheckGateReason.String
-			// The sub-code is meaningful only for this reason; gateCrossCheckReason
-			// sanitises the combined text.
-			if crossCheckReason == "planning_diff_refused" && run.PlanCrossCheckDiffRefusal.Valid {
-				crossCheckReason += " (" + run.PlanCrossCheckDiffRefusal.String + ")"
+		} else {
+			if (run.PlanCrossCheckRequired || run.PlanCrossCheckGated) && run.PlanCrossCheckGateReason.Valid {
+				crossCheckReason = run.PlanCrossCheckGateReason.String
+				// The sub-code is meaningful only for this reason; gateCrossCheckReason
+				// sanitises the combined text.
+				if crossCheckReason == "planning_diff_refused" && run.PlanCrossCheckDiffRefusal.Valid {
+					crossCheckReason += " (" + run.PlanCrossCheckDiffRefusal.String + ")"
+				}
+			}
+			if crossCheckReason == "" && run.PlanCrossCheckGated {
+				crossCheckReason = n.gatedCrossCheckLine(ctx, run)
 			}
 		}
 		ts, err := n.poster.PostBlocks(ctx, anchor.ChannelID, anchor.RootTs, "Plan ready for review in uzi", gateBlocks(rc.ID, base, rc.RepoAgentNames, rc.RepoAgentFolder, crossCheckReason))

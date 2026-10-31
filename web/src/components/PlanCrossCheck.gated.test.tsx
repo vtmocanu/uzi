@@ -61,6 +61,22 @@ describe("gated mode line and guards", () => {
   });
 });
 
+describe("required mode with the new fields", () => {
+  // Decision: rounds render for every mode the server sends them for, required included.
+  it("renders a required run's rounds and its pending deadline, without the gated mode line", () => {
+    const deadline = "2026-10-31T15:20:00Z";
+    const s = summary({ round: 2, verdict: "pending", reason_class: null, deadline_at: deadline,
+      rounds: [round(1, "revise", { findings: { summary: "Round one concern", items: null } }), round(2, "pending")] });
+    const { region, rounds } = view({ ...awaiting, status: "running", plan_cross_check_required: true,
+      plan_cross_check_gate_reason: null, plan_cross_check_summary: s });
+    expect(rounds()).toBeTruthy();
+    expect(within(rounds()!).getByRole("listitem", { name: "Round 1: Changes requested" }).textContent).toContain("Round one concern");
+    const line = within(region).getByText((_, el) => el?.tagName === "P" && el.textContent === `Check in progress, deadline ${formatLocalTime(deadline)}`);
+    expect(line.querySelector("time")?.getAttribute("datetime")).toBe(deadline);
+    expect(region.textContent).not.toContain("Mode:");
+  });
+});
+
 describe("the shared passed rule", () => {
   const passed = summary({ round: 2, rounds: [round(1, "revise"), round(2, "approve")] });
   it("says passed only for an unrevised approval with no gate reason", () => {
@@ -101,8 +117,20 @@ describe("the shared passed rule", () => {
     expect(late.region.textContent).not.toContain("Passed after");
     cleanup();
     const skew = view(run({ plan_cross_check_summary: { ...passed, rounds: [round(1, "approve"), round(2, "revise")] } }));
-    expect(within(skew.badge).getByText("Passed")).toBeTruthy();
-    expect(skew.region.textContent).not.toContain("Passed after");
+    expect(within(skew.badge).getByText("Outcome unavailable")).toBeTruthy();
+    expect(within(skew.badge).queryByText(/Passed/)).toBeNull();
+    cleanup();
+    const outOfRange = view(run({ plan_cross_check_summary: { ...passed, round: 6 } }));
+    expect(within(outOfRange.badge).getByText("Outcome unavailable")).toBeTruthy();
+  });
+  it("treats an empty-string gate reason as no reason", () => {
+    const { region, badge } = view(run({ plan_cross_check_gate_reason: "", plan_cross_check_summary: passed }));
+    expect(within(badge).getByText("Passed after 2 rounds")).toBeTruthy();
+    expect(region.textContent).not.toContain("Current gate");
+    cleanup();
+    const pending = view(run({ status: "running", plan_md: null, plan_cross_check_gate_reason: "",
+      plan_cross_check_summary: summary({ verdict: "pending", reason_class: null }) }));
+    expect(within(pending.badge).getByText("Pending")).toBeTruthy();
   });
   it.each([
     ["timed_out", "Timed out"], ["model_timeout", "Timed out"], ["revisions_exhausted", "Revisions exhausted"],
@@ -140,6 +168,24 @@ describe("each round's response", () => {
     expect(fences[1].textContent!.includes("Lead claims fixed")).toBe(showsText);
     expect(fences[0].textContent).not.toContain("Lead claims");
     expect(region.textContent).not.toMatch(/resolved|verified fix/i);
+  });
+  it("caps response text at 8,192 characters", () => {
+    const at = (text: string) => {
+      const s = summary({ verdict: "revise", reason_class: "revise", rounds: [round(1, "revise", { response: { state: "reported", text } })] });
+      return view(run({ plan_cross_check_gate_reason: "revise", plan_cross_check_summary: s })).rounds()!.textContent!;
+    };
+    expect(at("a".repeat(8188) + "TAIL")).toContain("TAIL");
+    cleanup();
+    expect(at("a".repeat(8192) + "TAIL")).not.toContain("TAIL");
+  });
+  it("omits the response fence for a findings-free approval that no plan followed", () => {
+    const s = summary({ rounds: [round(1, "approve")] });
+    const { rounds } = view(run({ plan_cross_check_summary: s }));
+    expect(rounds()!.textContent).not.toMatch(/Lead.s response|No following plan/);
+    cleanup();
+    // Control: findings on the same approval keep the fence.
+    const withFindings = view(run({ plan_cross_check_summary: summary({ rounds: [round(1, "approve", { findings: { summary: "Fine", items: null } })] }) }));
+    expect(within(withFindings.rounds()!).getByText("No following plan")).toBeTruthy();
   });
   it("strips control and format characters from response text", () => {
     const s = summary({ verdict: "revise", reason_class: "revise", rounds: [round(1, "revise", {
@@ -185,6 +231,22 @@ describe("in-progress gated mock", () => {
     const line = within(region).getByText((_, el) => el?.tagName === "P" && el.textContent === `Check in progress, deadline ${formatLocalTime(deadline)}`);
     expect(line.querySelector("time")?.getAttribute("datetime")).toBe(deadline);
     expect(region.textContent).not.toContain("No result recorded yet.");
+  });
+  it("between rounds, a revise verdict reads as a check in progress", () => {
+    const between = run({ status: "running", plan_md: null,
+      plan_cross_check_summary: summary({ round: 2, verdict: "revise", reason_class: "revise", rounds: [round(1, "revise"), round(2, "revise")] }) });
+    const { region, badge } = view(between);
+    expect(within(badge).getByText("Check in progress")).toBeTruthy();
+    expect(within(badge).queryByText("Changes requested")).toBeNull();
+    expect(within(region).getByText("Check in progress, the lead is revising after round 2")).toBeTruthy();
+    cleanup();
+    // Controls: the same verdict at the human gate, or once a plan is presented, is not in progress.
+    for (const over of [{ status: "awaiting_approval" as const, plan_md: null, plan_cross_check_gate_reason: "revisions_exhausted" },
+      { status: "running" as const, plan_md: "# Plan" }]) {
+      const r = view({ ...between, ...over });
+      expect(r.region.textContent).not.toContain("Check in progress");
+      cleanup();
+    }
   });
   it("falls back to no-result copy without a deadline", () => {
     const checking = mockRuns.find((r) => r.id === "run-gated-checking")!;

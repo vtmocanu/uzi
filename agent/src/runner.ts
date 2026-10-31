@@ -62,7 +62,7 @@ import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 import { type CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
 import { CodexOperationAdmissionError } from "./client.js";
 import { PLAN_REVISION_RETRY_FEATURE, PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "./plan-revision-retry.js";
-import { checkPlan, type CheckedHumanGate, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
+import { checkPlan, type CheckedHumanGate, type CheckedPlanDecision, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
 import { captureSemanticSources, parseSemanticEnrollment } from "./semantic-plan.js";
 import { SemanticPlanningGate } from "./semantic-planning-gate.js";
 import { observePrdSources, hasDriftContradiction, type FrozenSource, type SemanticObservationRecord, type SemanticObservationRequest } from "./semantic-drift.js";
@@ -13707,7 +13707,7 @@ export class RunRunner {
                   plan_cross_check_diff_refusal: captured.refusal };
                 checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
               } else {
-                const decision = await checkPlan({ mode: gatedEligible ? "gated" : "required",
+                const checkOptions = {
                   client: this.client, runId, generation: flight.claimGeneration,
                   candidate: {
                     ...(semanticCompiled ? { candidate_identity_version: "semantic_v1" as const,
@@ -13717,7 +13717,12 @@ export class RunRunner {
                     required_tools: toolchainDetection?.required_tools ?? [],
                     size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
                     planning_diff: captured.diff }, batcher, signal: steering.lifecycleSignal(), timing: this.planCrossCheckTiming,
-                  round: crossCheckRound, allowAutomaticRevision: true });
+                  round: crossCheckRound, allowAutomaticRevision: true as const };
+                // Literal-mode calls select the typed overloads: the gated result excludes
+                // "approve" at compile time (the runtime throw below stays as a backstop).
+                const gatedDecision: Exclude<CheckedPlanDecision, { kind: "approve" }> | undefined =
+                  gatedEligible ? await checkPlan({ ...checkOptions, mode: "gated" }) : undefined;
+                const decision = gatedDecision ?? await checkPlan({ ...checkOptions, mode: "required" });
                 if (decision.kind === "approve") {
                   // Gated mode never mints an approval: checkPlan returns gated_pass instead.
                   if (gatedEligible) throw new Error("plan cross-check: unexpected approval in gated mode");
@@ -23711,6 +23716,11 @@ export class RunRunner {
       // non-empty (additive-optional), matching the milestones conditional above.
       // PRD #1795: a re-presentation sends the requirements the human was shown instead.
       ...(reuse ? presentedReportFields(reuse.presented) : toolchainReportFields(toolchainDetection, this.client.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE))),
+      // PRD #3708: a gated pass reports the canonical requirement set the checker read (bound to
+      // candidate_digest), so it must win over the raw detection spread above.
+      ...(checkedFields?.required_capabilities !== undefined ? { required_capabilities: checkedFields.required_capabilities } : {}),
+      ...(checkedFields?.required_tools !== undefined ? { required_tools: checkedFields.required_tools } : {}),
+      ...(checkedFields?.size_class !== undefined ? { size_class: checkedFields.size_class } : {}),
       // PRD #212 (Decision 3): ALWAYS send (empty [] when clean), NOT conditionally
       // spread — so each gate round REPLACES the server's list (M1's COALESCE clears on
       // empty), keeping a revision gate from showing a stale earlier round's writes.

@@ -8,7 +8,10 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/slack-go/slack"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Sanitize the whole bounded reason before scrubbing, then bound its display.
@@ -35,6 +38,31 @@ func gateCrossCheckReason(reason string) string {
 		n++
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// gatedCrossCheckLine is the one-line outcome for a gated run whose gate carries no
+// reason: the shared "passed" rule (latest row approve, not historical) says passed;
+// no row says not checked; a historical row says it checked an earlier plan. Fixed
+// text only, never findings or responses. A lookup failure yields no line and never
+// fails the notification.
+func (n *Notifier) gatedCrossCheckLine(ctx context.Context, run store.Run) string {
+	s, err := n.store.GetLatestPlanCrossCheckSummary(ctx, store.GetLatestPlanCrossCheckSummaryParams{LeadRunID: run.ID, UserID: run.UserID})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return "not checked"
+	case err != nil:
+		n.logf("load gate cross-check summary", err)
+		return ""
+	case s.Historical:
+		return "checked an earlier version of this plan"
+	case s.Verdict == "approve" && s.Round > 0:
+		word := "rounds"
+		if s.Round == 1 {
+			word = "round"
+		}
+		return fmt.Sprintf("passed after %d %s", s.Round, word)
+	}
+	return ""
 }
 
 // Action IDs on the approval-gate buttons (PRD #25 M4). Distinct namespace from

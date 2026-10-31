@@ -241,6 +241,90 @@ describe("gated plan cross-check: canonical text", () => {
   });
 });
 
+describe("gated plan cross-check: canonical requirement set", () => {
+  it("a gated pass reports the checker's canonical requirements, not the raw detection", { skip: LINUX_CAPTURE }, async () => {
+    const c = gatedClaim();
+    // Raw detection of the clone: a Dockerfile infers the docker capability and size class s.
+    fs.writeFileSync(path.join(fx.originPath, "Dockerfile"), "FROM alpine\n");
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const key of Object.keys(env)) if (key.startsWith("GIT_")) delete env[key];
+    env.GIT_CONFIG_GLOBAL = "/dev/null";
+    env.GIT_CONFIG_SYSTEM = "/dev/null";
+    execFileSync("git", ["-C", fx.originPath, "add", "Dockerfile"], { env, stdio: "pipe" });
+    execFileSync("git", ["-C", fx.originPath, "commit", "-m", "detector fixture"], { env, stdio: "pipe" });
+    api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "approve", "approve", {
+      candidate: { ...canonicalOf(body), required_capabilities: ["jvm"], size_class: "m" } }) });
+    humanApproves(c.run_id);
+    const { exec, verdicts } = gatedExec();
+    await start(exec, c);
+    const submitted = api.crossCheckRequests[0]!.body as { required_capabilities: string[]; size_class: string };
+    assert.deepEqual(submitted.required_capabilities, ["docker"], "the checker was shown the raw detection");
+    assert.equal(submitted.size_class, "s");
+    const [gate, ...rest] = gates(c.run_id);
+    assert.ok(gate && rest.length === 0, "exactly one human gate");
+    assert.deepEqual(gate.required_capabilities, ["jvm"], "the canonical capability set wins");
+    assert.equal(gate.size_class, "m", "the canonical size class wins");
+    assert.equal(gate.candidate_digest, digest, "bound to the checked candidate");
+    assert.equal(Object.hasOwn(gate, "plan_cross_check_gate_reason"), false, "a real pass declares no reason");
+    assert.deepEqual(passLine(c.run_id), ["plan cross-check: passed after 1 round"]);
+    assert.equal(verdicts[0]!.kind, "approve");
+  });
+});
+
+describe("gated plan cross-check: human gate settlement", () => {
+  it("the applied gate releases the transport reservation before the state barrier", { skip: LINUX_CAPTURE }, async () => {
+    const c = gatedClaim();
+    checkerSays("approve");
+    humanApproves(c.run_id);
+    type Flight = { checkedStateBarrier?: Promise<void> };
+    let flight: Flight | undefined;
+    const barrierHeldAtRelease: boolean[] = [];
+    const reserve = MessageBatcher.prototype.reserveCandidateTransport;
+    MessageBatcher.prototype.reserveCandidateTransport = function (this: MessageBatcher) {
+      const reservation = reserve.call(this);
+      const release = reservation.releaseAppliedGate.bind(reservation);
+      reservation.releaseAppliedGate = (ack) => {
+        barrierHeldAtRelease.push(flight?.checkedStateBarrier !== undefined);
+        return release(ack);
+      };
+      return reservation;
+    };
+    try {
+      const forge = fakeGitlab();
+      const run = runner(gatedExec().exec, forge.gitlab, undefined, { planCrossCheckTiming: timing, planApprovalTimeoutMs: 4000 });
+      const seam = run as unknown as { prepareGateCheckpoint: (claim: ClaimResponse, f: Flight, ...rest: unknown[]) => Promise<unknown> };
+      const prepare = seam.prepareGateCheckpoint.bind(run);
+      seam.prepareGateCheckpoint = (claim, f, ...rest) => { flight = f; return prepare(claim, f, ...rest); };
+      await run.execute(c);
+      assert.deepEqual(barrierHeldAtRelease, [true], "the barrier is still held when the reservation is released");
+      assert.equal(flight?.checkedStateBarrier, undefined, "and is released afterwards");
+    } finally { MessageBatcher.prototype.reserveCandidateTransport = reserve; }
+  });
+
+  it("an executor re-entry resumes the existing human wait without re-planning or re-submitting", { skip: LINUX_CAPTURE }, async () => {
+    const c = gatedClaim();
+    checkerSays("approve");
+    let otherwise = 0;
+    let resumed: PlanVerdict | undefined;
+    const exec: Executor = { run: async (ctx) => {
+      assert.ok(ctx.continueExistingPlanGate, "a gated run offers the re-entry hook");
+      void ctx.gatePlan!(PLAN).catch(() => undefined);
+      for (let i = 0; i < 400 && gates(c.run_id).length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+      assert.equal(gates(c.run_id).length, 1, "the gate is presented before the re-entry");
+      const pending = ctx.continueExistingPlanGate!(async () => { otherwise++; return { kind: "reject", reason: "re-planned" } as PlanVerdict; });
+      send(c.run_id, row("approve_plan"));
+      resumed = await pending;
+      return { branch: ctx.branch };
+    } };
+    await start(exec, c);
+    assert.equal(otherwise, 0, "the fallback planner was not used");
+    assert.equal(resumed?.kind, "approve");
+    assert.equal(api.crossCheckRequests.length, 1, "nothing re-submitted");
+    assert.equal(gates(c.run_id).length, 1, "the gate was not re-presented");
+    assert.equal(planMessages(c.run_id).length, 1, "the plan was not re-emitted");
+  });
+});
+
 describe("gated plan cross-check: semantic candidate", () => {
   it("a gated pass of a compiled semantic candidate binds the semantic digest and opens the human gate", { skip: LINUX_CAPTURE }, async () => {
     git.capturePlanningDiff = async () => Buffer.from("");

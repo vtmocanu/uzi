@@ -23,6 +23,9 @@ type NotifierStore interface {
 	PruneNotificationsForUser(ctx context.Context, arg store.PruneNotificationsForUserParams) (int64, error)
 	GetSlackRunContext(ctx context.Context, runID uuid.UUID) (store.GetSlackRunContextRow, error)
 	GetRunByID(ctx context.Context, runID uuid.UUID) (store.Run, error)
+	// GetLatestPlanCrossCheckSummary backs the one-line gated plan cross-check outcome
+	// on the gate card (PRD #3708). No row = not checked.
+	GetLatestPlanCrossCheckSummary(ctx context.Context, arg store.GetLatestPlanCrossCheckSummaryParams) (store.GetLatestPlanCrossCheckSummaryRow, error)
 	// GetSlackChatContext is the repo-less context for a CHAT run (PRD #191 M2b): the
 	// notifier falls back to it on the run-context ErrNoRows so a Slack-anchored chat's
 	// terminal transitions reach the DM. A non-chat id returns ErrNoRows.

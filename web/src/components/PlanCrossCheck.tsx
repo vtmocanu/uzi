@@ -176,17 +176,24 @@ function Rounds({ value, level }: { value: unknown; level: 3 | 4 }) {
           <p className="text-xs text-muted">Checker findings (untrusted, may be wrong)</p>
           {r.findings == null ? <p className="text-muted">No findings recorded.</p> : <Findings value={r.findings} />}
         </div>
-        <Response value={r.response} />
+        {!(r.verdict === "approve" && r.findings == null && record(r.response).state === "no_following_candidate")
+          && <Response value={r.response} />}
       </li>;
     })}
   </ol>;
 }
 
-// The shared "passed" rule (PRD #3708): no gate reason, the latest check approved, and that
-// check is of the current plan. Every surface (web, CLI, Slack) applies the same rule.
+// An empty-string gate reason is treated exactly like no reason, on every path here.
+function reasonless(gate: unknown): boolean {
+  return gate == null || gate === "";
+}
+
+// The shared "passed" rule (PRD #3708 plan §6): no gate reason, the latest check approved,
+// and that check is of the current plan. No run-status term. The CLI and Slack apply the
+// same rule.
 function passedRounds(run: Run): number | undefined {
   const s = run.plan_cross_check_summary;
-  if (!s || run.plan_cross_check_gate_reason != null || s.historical || planCheckOutcome(s.verdict, s.reason_class) !== "Passed") return undefined;
+  if (!s || !reasonless(run.plan_cross_check_gate_reason) || s.historical || planCheckOutcome(s.verdict, s.reason_class) !== "Passed") return undefined;
   const rounds = Array.isArray(s.rounds) ? s.rounds : [];
   const last = rounds.length > 0 ? record(rounds[rounds.length - 1]) : undefined;
   if (last && planCheckOutcome(last.verdict, last.reason_class) !== "Passed") return undefined;
@@ -196,18 +203,34 @@ function passedRounds(run: Run): number | undefined {
 function gatedResult(run: Run): string {
   const s = run.plan_cross_check_summary;
   const gate = run.plan_cross_check_gate_reason;
-  if (s && !s.historical && s.verdict === "pending" && gate == null) return "Pending";
+  if (s && !s.historical && s.verdict === "pending" && reasonless(gate)) return "Pending";
+  if (revisingAfter(run) !== undefined) return "Check in progress";
   const passed = passedRounds(run);
   if (passed !== undefined) return `Passed after ${passed} ${passed === 1 ? "round" : "rounds"}`;
   if (s?.historical) return "Checked an earlier version of this plan";
   if (typeof gate === "string" && gate !== "") return Object.prototype.hasOwnProperty.call(gatedResults, gate) ? gatedResults[gate] : "Unavailable";
-  if (s) return planCheckOutcome(s.verdict, s.reason_class);
+  if (s) {
+    // An approval the passed rule refused (rounds skew, out-of-range round) is never a pass.
+    const outcome = planCheckOutcome(s.verdict, s.reason_class);
+    return outcome === "Passed" ? "Outcome unavailable" : outcome;
+  }
   return gatedPending(run) ? "Pending" : "Not checked";
 }
 
 // A gated run before its first gate has no plan yet; its check has not had a chance to run.
 function gatedPending(run: Run): boolean {
   return !isTerminalRun(run.status) && run.status !== "awaiting_approval" && !run.plan_md;
+}
+
+// Between automatic rounds: the latest check asked for changes and the lead is writing the
+// next candidate, before any plan has been presented. Returns the finished round ("" when
+// the round number is unusable), else undefined.
+function revisingAfter(run: Run): string | undefined {
+  const s = run.plan_cross_check_summary;
+  if (run.plan_cross_check_gated !== true || !s || s.historical || !reasonless(run.plan_cross_check_gate_reason)
+    || !gatedPending(run) || planCheckOutcome(s.verdict, s.reason_class) !== reasons.revise) return undefined;
+  const n = safeRound(s.round);
+  return n === undefined ? "" : String(n);
 }
 
 export function PlanCrossCheckEvent({ payload, detail }: { payload: unknown; detail?: PlanCrossCheckSummary }) {
@@ -240,6 +263,7 @@ export function PlanCrossCheck({ run, presentation = "standalone" }: { run: Run;
     : run.plan_cross_check_required || gated ? isTerminalRun(run.status) ? "Not recorded" : "Pending" : "Outcome unavailable";
   const result = gated ? gatedResult(run) : s?.historical ? "Superseded" : outcome;
   const rounds = Array.isArray(s?.rounds) && s.rounds.length > 0;
+  const revising = revisingAfter(run);
   const deadline = s && !s.historical && s.verdict === "pending" && typeof s.deadline_at === "string" ? formatLocalTime(s.deadline_at) : null;
   const usage = s?.usage;
   const cost = usage?.cost_status === "subscription" ? costHeadline(costDisplay("subscription", 0))
@@ -260,6 +284,7 @@ export function PlanCrossCheck({ run, presentation = "standalone" }: { run: Run;
     {s && outcome === "Pending" && (deadline
       ? <p>Check in progress, deadline <time dateTime={s.deadline_at}>{deadline}</time></p>
       : <p>No result recorded yet.</p>)}
+    {revising !== undefined && <p>{`Check in progress, the lead is revising after ${revising ? `round ${revising}` : "the last round"}`}</p>}
     {s?.historical && <p>These findings concern an earlier plan; they do not certify the current plan.</p>}
     {s && <>
       {rounds ? <Rounds value={s.rounds} level={presentation === "inset" ? 4 : 3} /> : <Findings value={s.findings} />}
