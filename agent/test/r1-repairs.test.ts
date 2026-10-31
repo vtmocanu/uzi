@@ -206,13 +206,20 @@ it("R1 pending_all wire ceiling is 256 distinct tuples, independent of lease cap
       assert.equal(snapshot.pending_all?.length, count <= 256 ? count : undefined);
       assert.equal(snapshot.pending_overflow, true);
     }
-    assert.equal(registry.claimsPausedByPendingOverflow(true), cap === 0 || count > 256,
-      "scoped claims require complete coverage as well as real capacity");
+    assert.equal(registry.claimsPausedByPendingOverflow(), true, "the legacy unknown-source gate is retained");
+    assert.equal(registry.claimsPausedByPendingOverflow(true), count > 256,
+      "ADR 3607: unknown ownership supplies no lease, but the 256-tuple wire ceiling still pauses");
+    if (cap === 0 && count <= 256) {
+      assert.equal(registry.notePolicyOwnership(run, 3), true);
+      assert.equal(registry.claimsPausedByPendingOverflow(true), true,
+        "a real owned pending group still respects cap zero");
+    }
   }
   const incomplete = new ActiveRunRegistry(() => [], () => 1000, () => false);
   assert.equal(incomplete.build().pending_all, undefined);
   assert.equal(incomplete.build().pending_overflow, true);
-  assert.equal(incomplete.claimsPausedByPendingOverflow(), true);
+  assert.equal(incomplete.claimsPausedByPendingOverflow(), false,
+    "inventory coverage gates the snapshot (pending_overflow), not the local claim capacity check");
   assert.deepEqual(new ActiveRunRegistry(() => [], () => 0).build().pending_all, []);
 });
 
