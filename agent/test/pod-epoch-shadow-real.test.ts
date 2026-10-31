@@ -150,6 +150,15 @@ test("the shadow pass over a real GitCache reads a protected episode and a stric
     const plain = seen.find(s => s.runId === PLAIN_RUN)!;
     assert.deepEqual(plain.epochSettlement, { basis: "strict_plain", disposition: { kind: "local_discard" } });
     assert.equal(result.by_basis.strict_plain, 1, "the live attempt is reported under the strict-plain basis");
+    assert.equal(result.verdict, "eligible");
+    assert.equal(result.authority.result, "attested");
+    assert.equal(result.by_basis.discard, 2, "both protected-episode paths are settled-hold discard candidates");
+    assert.equal(result.would_delete, 3, "all three examined paths are present candidates");
+    assert.equal(result.would_settle, 0);
+    assert.equal(result.kept, 0);
+    assert.deepEqual(result.list.map(x => [x.run_id, x.basis, x.presence]).sort(), [
+      [PLAIN_RUN, "strict_plain", "present"], [PROTECTED_RUN, "discard", "present"], [PROTECTED_RUN, "discard", "present"],
+    ].sort());
     assert.ok(result.examined >= 3, "the strict-plain clone and both protected paths were examined");
     assert.equal(handovers, 1);
     assert.ok(d.requests.every(r => r.startsWith("GET ")), d.requests.join());

@@ -70,8 +70,10 @@ async function inspect(a: { attemptId: string }, over: { epoch?: boolean; holds?
   assert.ok(r.sources.length <= 1);
   return r.sources[0];
 }
-async function settlementOf(a: { attemptId: string }, over: Parameters<typeof inspect>[1] = {}) {
-  return (await inspect(a, over))?.epochSettlement;
+async function settlementOf(a: { attemptId: string }, over: Parameters<typeof inspect>[1] = {}, sourceExpected = true) {
+  const ev = await inspect(a, over);
+  if (sourceExpected) assert.ok(ev, "the source is still gathered, so the refusal comes from the strict-plain guard");
+  return ev?.epochSettlement;
 }
 
 describe("strict-plain epoch settlement", () => {
@@ -171,10 +173,10 @@ describe("strict-plain epoch settlement", () => {
 
   it("does not settle when holds are unknown or a hold is open", async () => {
     const a = await seed();
-    const unknown = await settlementOf(a, { holds: { state: "unknown" } });
-    assert.notEqual(unknown?.disposition.kind, "local_discard");
-    const open = await settlementOf(a, { holds: { state: "read", holds: [{ id: "h1", generation: 1 }] } });
-    assert.notEqual(open?.disposition.kind, "local_discard");
+    assert.deepEqual(await settlementOf(a, { holds: { state: "unknown" } }),
+      { basis: "strict_plain", disposition: { kind: "refused", consumers: ["holds_unknown"] } }, "unknown holds");
+    assert.deepEqual(await settlementOf(a, { holds: { state: "read", holds: [{ id: "h1", generation: 1 }] } }),
+      { basis: "strict_plain", disposition: { kind: "owner_hold_discard", holdIds: ["h1"] } }, "open hold");
   });
 
   it("requires a positive terminal lifecycle verdict", async () => {
