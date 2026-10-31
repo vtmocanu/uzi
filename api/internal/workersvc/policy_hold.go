@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"slices"
 	"strconv"
@@ -250,18 +251,46 @@ func (s *Service) ReportPolicyHold(ctx context.Context, worker store.Worker, run
 		return pending("owner_disposition_pending")
 	}
 	if r.StopKind.Valid && r.StopKind.String == "cancelled" {
-		n, e := q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{ID: runID, WorkerID: pgconv.UUID(worker.ID)})
+		n, e := q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{ID: runID, WorkerID: pgconv.UUID(currentWorker.ID)})
 		if e != nil {
 			return reply, e
 		}
 		if n != 1 {
 			return pending("cancel_pending")
 		}
+		// Read our mutation through the same transaction while the worker/run
+		// locks still protect ownership and the authoritative terminal metadata.
+		updated, e := q.GetRunOwnedByWorker(ctx, store.GetRunOwnedByWorkerParams{ID: runID, WorkerID: pgconv.UUID(currentWorker.ID)})
+		if e != nil {
+			return reply, e
+		}
+		if updated.UserID != currentWorker.UserID || !updated.WorkerID.Valid || uuid.UUID(updated.WorkerID.Bytes) != currentWorker.ID ||
+			(updated.Kind == "cross_check" && updated.ClaimGeneration == 0) || laneMismatch(runID, updated.EgressProfileID.Valid, currentWorker) {
+			return reply, ErrRunNotOwned
+		}
+		if updated.Status != "cancelled" {
+			return reply, fmt.Errorf("%w: policy cancel readback is not cancelled", ErrInvalidState)
+		}
 		if e = tx.Commit(ctx); e != nil {
 			return reply, e
 		}
+		if s.bcast != nil {
+			s.bcast.PublishState(runID, updated.Status)
+		}
+		s.notify(runID, updated.Status)
+		if updated.ScopeCeiling.Valid {
+			if _, setErr := s.q.SettleScopeInputDisposition(ctx, store.SettleScopeInputDispositionParams{
+				RunID: runID, Disposition: pgconv.TextOrNull("declined"),
+			}); setErr != nil {
+				slog.Warn("settle scope input disposition", "run", runID, "disposition", "declined", "error", setErr)
+			}
+		}
+		s.retainOrDeleteCheckpoint(ctx, runID, updated.Kind, updated.IssueIid)
+		s.maybeTeardownEphemeral(ctx, currentWorker, updated, false)
 		reply.Disposition = "terminal"
-		reply.ObservedStatus = "cancelled"
+		reply.ObservedStatus = updated.Status
+		reply.HoldReason = updated.HoldReason.String
+		reply.ObservedGeneration = updated.ClaimGeneration
 		return reply, nil
 	}
 	if !slices.Contains([]string{"issue", "task", "prompt", "self_improve"}, r.Kind) || r.Interactive || r.Harness != "codex" {
