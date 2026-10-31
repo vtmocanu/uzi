@@ -275,7 +275,7 @@ describe("publication intent: enrollment", () => {
     await outbox.init();
     const outcome = await enrollPublicationIntent(d, intent());
     assert.deepEqual([outcome.kind, outcome.kind === "uncertain" ? outcome.reason : ""], ["uncertain", "ack_not_recorded"]);
-    assert.equal((await outbox.loadPublicationRecord(RUN, 4)).kind, "ok", "the sequence-less record remains; register reconciliation decides");
+    assert.equal((await outbox.loadPublicationRecord(RUN, 4)).kind, "ok", "the sequence-less record remains; it is kept, not retired");
     assert.deepEqual(outbox.listPublicationRegisterEntries(), []);
   });
 

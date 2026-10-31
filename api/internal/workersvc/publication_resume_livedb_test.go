@@ -284,6 +284,52 @@ func TestPublicationResumeIntentValidationLiveDB(t *testing.T) {
 	}
 }
 
+// The claim carries a branch only where the run has one: an issue run's runs.branch is NULL at
+// finalize (the worker names the branch), so enrollment must accept the intent's validated branch.
+func TestPublicationResumeIssueRunWithoutBranchEnrollsLiveDB(t *testing.T) {
+	f := newPublicationResumeFixture(t)
+	f.env.exec(`UPDATE runs SET branch=NULL WHERE id=$1`, f.runID)
+	resp := f.enroll(t)
+	if resp.EnrollmentSeq != 1 || resp.State != "active" {
+		t.Fatalf("resp=%+v", resp)
+	}
+}
+
+// An mr_rework run has NULL runs.branch; its claim branch is pipeline_ref, which the intent must match.
+func TestPublicationResumeMRReworkBranchFromPipelineRefLiveDB(t *testing.T) {
+	f := newPublicationResumeFixture(t)
+	sourceID := uuid.New()
+	f.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status)
+	            VALUES ($1, $2, $3, 'issue', 9001, 't', 'd', 'completed')`, sourceID, f.userID, f.repoID)
+	f.env.exec(`UPDATE runs SET kind='mr_rework', issue_iid=NULL, branch=NULL, pipeline_ref='agent/issue-9001', mr_iid=77, target_run_id=$2 WHERE id=$1`,
+		f.runID, sourceID)
+	_, err := f.svc.RegisterPublicationIntent(f.env.ctx, f.wkr, f.runID,
+		PublicationIntentRequest{ClaimGeneration: 1, Intent: f.intent("agent/issue-1", pubHeadA, nil)})
+	if !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("different branch: err=%v, want ErrInvalidState", err)
+	}
+	resp, err := f.svc.RegisterPublicationIntent(f.env.ctx, f.wkr, f.runID,
+		PublicationIntentRequest{ClaimGeneration: 1, Intent: f.intent("agent/issue-9001", pubHeadA, nil)})
+	if err != nil || resp.EnrollmentSeq != 1 {
+		t.Fatalf("pipeline_ref branch: resp=%+v err=%v", resp, err)
+	}
+}
+
+// A task run's branch is always set (runs_kind_shape), so a different intent branch stays refused.
+func TestPublicationResumeTaskBranchMismatchRefusedLiveDB(t *testing.T) {
+	f := newPublicationResumeFixture(t)
+	f.env.exec(`UPDATE runs SET kind='task', issue_iid=NULL, branch='uzi/task/fixture' WHERE id=$1`, f.runID)
+	_, err := f.svc.RegisterPublicationIntent(f.env.ctx, f.wkr, f.runID,
+		PublicationIntentRequest{ClaimGeneration: 1, Intent: f.intent("agent/issue-1", pubHeadA, nil)})
+	if !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("err=%v, want ErrInvalidState", err)
+	}
+	if _, err = f.svc.RegisterPublicationIntent(f.env.ctx, f.wkr, f.runID,
+		PublicationIntentRequest{ClaimGeneration: 1, Intent: f.intent("uzi/task/fixture", pubHeadA, nil)}); err != nil {
+		t.Fatalf("matching branch: %v", err)
+	}
+}
+
 func TestPublicationResumeKindUnsupportedLiveDB(t *testing.T) {
 	f := newPublicationResumeFixture(t)
 	// A repo-backed kind that never publishes code: a report-only cross-check child of the run.

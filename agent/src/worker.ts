@@ -841,15 +841,18 @@ export class Worker {
     // Only exact offered identities gain lifetime handoff; captured lower originals gain batch-only authority.
     // Issue #1324 D6: a run holding a publication-intent record resumes publication only. It is attested
     // under publication_resume and NEVER also under finalize_resume (it must not consume the #1742
-    // one-shot allowance), so any run with a publication record is withheld from the finalize list.
+    // one-shot allowance), so any run with a publication record or file present is withheld from the finalize
+    // list, whether the record is ACKed or not and whether it is readable or not. The api's finalize requeue has no
+    // enrollment predicate, so withholding here is what keeps an enrolled run off the allowance when its ACK was
+    // lost or its record failed authentication. The cost: a never-enrolled run with an uncertain local record takes
+    // the ordinary orphan requeue instead of the #1742 finalize path.
     const outbox = this.outbox;
-    const offeredPublications = typeof outbox?.listPublicationRegisterEntries === "function" ? outbox.listPublicationRegisterEntries() : [];
+    const offeredPublications = outbox?.listPublicationRegisterEntries() ?? [];
     // A record that failed authentication, or is a mismatch, is not tracked in memory but still sits on
     // disk and still marks the run publication-only, so presence is judged on the directory.
     const offeredFinalizes: ReturnType<Outbox["listPendingFinalizes"]> = [];
     for (const entry of outbox?.listPendingFinalizes() ?? []) {
-      const withheld = (typeof outbox?.hasPublicationRecords === "function" && outbox.hasPublicationRecords(entry.run_id)) ||
-        (typeof outbox?.hasPublicationFile === "function" && await outbox.hasPublicationFile(entry.run_id));
+      const withheld = outbox!.hasPublicationRecords(entry.run_id) || (await outbox!.hasPublicationFile(entry.run_id));
       if (!withheld) offeredFinalizes.push(entry);
     }
     const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes, offeredPublications);

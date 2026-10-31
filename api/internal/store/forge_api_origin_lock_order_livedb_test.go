@@ -116,7 +116,7 @@ func TestForgeAPIOriginReleaseLockOrderLiveDB(t *testing.T) {
 		_, err := txB.Exec(ctx, "UPDATE runs SET claim_released_at=now() WHERE id=$1", id)
 		releaseDone <- err
 	}()
-	pidB := int32(connB.Conn().PgConn().PID())
+	pidB := int64(connB.Conn().PgConn().PID())
 	for {
 		var waiting bool
 		if err := fx.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity

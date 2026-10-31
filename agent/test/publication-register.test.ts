@@ -80,14 +80,14 @@ describe("register snapshot: publication_resume", () => {
     assert.equal(snapshot?.publication_resume?.length, 1);
   });
 
-  it("withholds a run from finalize_resume even when its record is not yet acknowledged, and attests nothing for it", async () => {
+  it("withholds a run from finalize_resume even when its record is not yet acknowledged (D6), and attests nothing for it", async () => {
     const root = tmpRoot();
     const outbox = makeOutbox(root);
     await outbox.init();
     assert.equal((await outbox.savePublicationRecord(stored())).ok, true);
     await outbox.journalFinalize(RUN, 4);
     const { snapshot } = await register(outbox);
-    assert.equal(snapshot, undefined, "no finalize_resume, no publication_resume, nothing pending");
+    assert.equal(snapshot, undefined, "no finalize_resume (an enrolled run must not use the #1742 allowance), no publication_resume");
   });
 
   it("withholds a run whose record failed authentication from finalize_resume, as the protection still holds", async () => {

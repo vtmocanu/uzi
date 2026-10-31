@@ -18,7 +18,8 @@
  *   - `not_enrolled`: provably nothing was written and nothing was sent, so ordinary finalize may
  *     run (with a `publication_resume_unavailable` diagnostic); or
  *   - `uncertain`: the intent may exist (locally or on the api). The caller makes NO external
- *     attempt; a bounded retry or the next register reconciliation decides.
+ *     attempt; the record is kept, and a bounded retry or the publication-only resume (milestone M5, not yet
+ *     present) decides.
  * Losing or failing to read a local record never implies the enrollment was retired. A local
  * record is discarded only after the api positively answers `publication_enrollment_retired` for
  * that very enrollment_seq.
@@ -39,8 +40,9 @@ export type PublicationParkRefusal = "publication_enrolled" | "publication_not_e
 
 /**
  * Typed mismatch between what a record or claim carries and what this worker can honour: an
- * unknown version, an unknown or invalid guard state, an unknown member. The runner turns it into
- * a `publication_intent_mismatch` hold. It is never swallowed and never lets a guard be skipped.
+ * unknown version, an unknown or invalid guard state, an unknown member. Today the record is only kept and
+ * nothing consumes the error; the publication-only resume (milestone M5, not yet present) is what produces
+ * the `publication_intent_mismatch` hold. It is never swallowed and never lets a guard be skipped.
  */
 export class PublicationIntentMismatchError extends Error {
   readonly code = "publication_intent_mismatch";
@@ -462,6 +464,11 @@ function samePublicationContent(a: PublicationIntentBody, b: PublicationIntentBo
   return canonicalBody(body(a)) === canonicalBody(body(b));
 }
 
+/** Whether two bodies carry the same guard snapshot and MR metadata (the parts a later flight's fresh intent may tighten). */
+export function samePublicationGuardAndMr(a: PublicationIntentBody, b: PublicationIntentBody): boolean {
+  return canonicalBody({ guard: a.guard, mr: a.mr }) === canonicalBody({ guard: b.guard, mr: b.mr });
+}
+
 /** How a local record relates to the claim's active enrollment. The claim is the api's single active row. */
 export type PublicationClaimRelation =
   | { kind: "no_active_enrollment" }
@@ -742,9 +749,14 @@ export async function enrollPublicationIntent(deps: PublicationDeps, intent: Pub
       default: return notEnrolled("local_write_failed", saved.detail ?? saved.reason);
     }
   }
-  const held = saved.record;
+  let held = saved.record;
   if (!samePublicationIdentity(held, record)) return uncertain("existing_record_conflict", held);
   if (held.enrollment_seq !== undefined) return uncertain("already_enrolled", held);
+  // An adopted, never-ACKed record of an earlier flight (same identity) may carry an older guard, closing set
+  // or title. It is POSTed UNCHANGED: the api returns its stored row on an identity match without storing a
+  // new body, so an earlier send whose ACK was lost already holds exactly this content, and sending it again is
+  // idempotent. The caller advances to its fresher guard and MR metadata once this enrollment is ACKed
+  // (advancePublicationCandidate), the same path as an already-ACKed record.
 
   const { result, earlierSent } = await postBounded(deps, held.run_id, requestFor(deps, held, false));
   switch (result.kind) {
@@ -808,7 +820,7 @@ export async function advancePublicationCandidate(
   return sendEnrolled(deps, next);
 }
 
-/** Re-send an enrolled record's current state (a lost candidate ACK, or a register reconciliation). */
+/** Re-send an enrolled record's current state (a lost candidate ACK, or a later flight re-confirming a surviving record). */
 export async function resendPublicationRecord(deps: PublicationDeps, record: EnrolledPublicationRecord): Promise<PublicationAdvanceOutcome> {
   return sendEnrolled(deps, record);
 }

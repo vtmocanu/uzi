@@ -517,8 +517,17 @@ func (s *Service) RegisterPublicationIntent(ctx context.Context, w store.Worker,
 	if _, ok := publicationKinds[run.Kind]; !ok {
 		return zero, ErrPublicationKindUnsupported
 	}
-	if !run.RepoID.Valid || uuid.UUID(run.RepoID.Bytes) != body.RepoID ||
-		!run.Branch.Valid || run.Branch.String == "" || run.Branch.String != body.Branch {
+	if !run.RepoID.Valid || uuid.UUID(run.RepoID.Bytes) != body.RepoID {
+		return zero, ErrInvalidState
+	}
+	// The branch the claim carried for this run (claim_assembly.go sources it from pipeline_ref for
+	// an mr_rework run, runs.branch otherwise). Issue runs have a NULL runs.branch until completion
+	// (the worker names the branch), so an empty claim branch accepts the already-validated body.Branch.
+	claimBranch := run.Branch
+	if run.Kind == runkind.MRRework {
+		claimBranch = run.PipelineRef
+	}
+	if claimBranch.Valid && claimBranch.String != "" && claimBranch.String != body.Branch {
 		return zero, ErrInvalidState
 	}
 	resp, err := s.applyPublicationIntent(ctx, q, run, req, body)

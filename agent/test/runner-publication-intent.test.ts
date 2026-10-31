@@ -199,7 +199,7 @@ it("an unknown enrollment outcome (lost ACK) makes no fetch, push or MR, keeps t
   assert.deepEqual(events, [], "no remote step ran on an unknown outcome");
   assert.equal(forge.all.length, 0);
   const loaded = await outbox.loadPublicationRecord(claim.run_id, GEN);
-  assert.equal(loaded.kind, "ok", "the local record is retained for the register reconciliation");
+  assert.equal(loaded.kind, "ok", "the local record is retained");
   assert.equal(failed(claim.run_id).length, 0, "no false failure");
   assert.equal(states(claim.run_id).filter(b => b.status === "completed").length, 0);
   assert.equal(parks(claim.run_id).length, 0, "no guessed park either");
@@ -637,7 +637,7 @@ function spyOnPin(r: RunRunner, failCandidates: boolean): PinSpy {
   const real = rec.pin.bind(rec);
   const spy: PinSpy = { calls: [], results: [] };
   rec.pin = async (input) => {
-    spy.calls.push({ ...(input.attemptedHeadSha ? { attemptedHeadSha: input.attemptedHeadSha } : {}) });
+    spy.calls.push(input.attemptedHeadSha ? { attemptedHeadSha: input.attemptedHeadSha } : {});
     const out = failCandidates && input.attemptedHeadSha ? undefined : await real(input);
     spy.results.push(out as PinSpy["results"][number]);
     return out;
@@ -811,4 +811,130 @@ it("a successful publication-phase park does not try to settle an unadopted guar
   const { rc, settles } = await preClonePark((body) => ({ applied: true, status: body.status }));
   assert.equal(rc.reported.filter(b => b.status === "recovery_wait").length, 1);
   assert.equal(settles, 0, "the api refuses that settle for a publication phase");
+});
+
+// ── review rework: a surviving record never outranks this flight's fresh intent; an abort is not a hold ───
+
+type EnrollSeam = {
+  enrollPublication(claim: unknown, flight: unknown, input: unknown, signal?: AbortSignal): Promise<"proceed" | "retain">;
+};
+const HEAD = "1".repeat(40);
+const frozenHeld = { version: 1 as const, blocked: false, everKnown: false, flaggedCommits: [], ciGlobs: null, extraFloors: [] };
+const secretRemediation = { attempts: 0, known: [], flagged_commits: [], flagged_findings: [], blocked: [], ever_known: false, withhold_paths: false, overflow: false };
+const intentInput = (strict: boolean, branch: string) => ({
+  branch, original_head: HEAD, source: { pin_generation: GEN, checkpoint_key: null },
+  mr: { title: strict ? "strict title" : "lax title", summary: "", closing: strict ? [] : ["#9"], contract_revision: 0 },
+  guard: {
+    frozen_held: frozenHeld, secret_remediation: secretRemediation, published_real_tips: [], landed_checkpoint: false,
+    ci_fix_human_approved: false, ci_config_guard_globs: strict ? [".github/**"] : null,
+  },
+});
+const enrollFlight = (runId: string) => ({
+  runId, claimGeneration: GEN, runKind: "issue", publicationFloor: { kind: "absent" }, publicationRecord: undefined as
+    undefined | { mr: { title: string; closing: string[] }; guard: { ci_config_guard_globs: string[] | null }; candidate_seq?: number },
+  batcher: { emit() {} }, runLog: nullLogger(), completionHoldOutcome: "none",
+});
+const seedLax = async (outbox: Outbox, claim: { run_id: string }, branch: string, seqs?: [number, number]): Promise<void> => {
+  const saved = await outbox.savePublicationRecord({
+    owner_kind: "issue", v: 1, run_id: claim.run_id, repo_id: REPO_ID, claim_generation: GEN, floor: { kind: "absent" }, candidate: HEAD,
+    ...intentInput(false, branch),
+  });
+  assert.ok(saved.ok);
+  if (seqs) assert.equal((await outbox.replacePublicationRecord({ ...saved.record, enrollment_seq: seqs[0], candidate_seq: seqs[1] }, {})).ok, true);
+};
+type WireIntent = { candidate_seq?: number; intent: { mr: { title: string; closing: string[] }; guard: { ci_config_guard_globs: string[] | null } } };
+
+/** A stateful api mirroring applyPublicationIntent: a seq-less request returns the stored row on an identity match
+ *  WITHOUT storing the body; an update at stored candidate_seq + 1 stores the whole intent. */
+function statefulIntentApi(initial?: WireIntent["intent"]): { stored: () => WireIntent["intent"] | undefined } {
+  let intent = initial;
+  let es = 1;
+  let cs = 1;
+  api.publicationIntentWire = (req) => {
+    const body = req.body as unknown as WireIntent & { enrollment_seq?: number };
+    if (body.enrollment_seq === undefined) {
+      if (!intent) intent = body.intent;
+      return { status: 200, body: { enrollment_seq: es, candidate_seq: cs, state: "active" } };
+    }
+    if (body.enrollment_seq !== es) return { status: 409, body: { error: "publication_enrollment_mismatch" } };
+    if (body.candidate_seq === cs + 1) { intent = body.intent; cs += 1; }
+    else if (body.candidate_seq !== cs) return { status: 409, body: { error: "publication_candidate_seq_mismatch" } };
+    return { status: 200, body: { enrollment_seq: es, candidate_seq: cs, state: "active" } };
+  };
+  return { stored: () => intent };
+}
+
+it("an adopted never-ACKed record (its ACK was lost) is posted as held, then advanced to this flight's stricter intent", async () => {
+  client.protocolFeatures = FEATURES;
+  const outbox = await mkOutbox();
+  const claim = claimFor(5140);
+  await seedLax(outbox, claim, "agent/issue-5140");
+  // Flight A's POST landed (the api stored the lax intent) and only its ACK was lost.
+  const lax = (await outbox.loadPublicationRecord(claim.run_id, GEN));
+  assert.equal(lax.kind, "ok");
+  const { stored } = statefulIntentApi(lax.kind === "ok" ? ({ ...lax.record, enrollment_seq: undefined, candidate_seq: undefined, owner_kind: undefined } as unknown as WireIntent["intent"]) : undefined);
+  const flight = enrollFlight(claim.run_id);
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+  const result = await (r as unknown as EnrollSeam).enrollPublication(claim, flight, intentInput(true, "agent/issue-5140"));
+  assert.equal(result, "proceed");
+  const sent = api.publicationIntentRequests.map(q => q.body as unknown as WireIntent);
+  assert.equal(sent.length, 2, "the held enrollment, then one advance");
+  assert.deepEqual([sent[0]!.intent.mr.title, sent[0]!.candidate_seq], ["lax title", undefined], "the held content is posted unchanged");
+  assert.deepEqual([sent[1]!.intent.mr.title, sent[1]!.candidate_seq], ["strict title", 2]);
+  const apiStored = stored()!;
+  assert.deepEqual([apiStored.mr.title, apiStored.mr.closing, apiStored.guard.ci_config_guard_globs], ["strict title", [], [".github/**"]], "the api ends on the strict intent");
+  assert.deepEqual([flight.publicationRecord?.mr.title, flight.publicationRecord?.guard.ci_config_guard_globs, flight.publicationRecord?.candidate_seq], ["strict title", [".github/**"], 2]);
+  const loaded = await outbox.loadPublicationRecord(claim.run_id, GEN);
+  assert.equal(loaded.kind === "ok" ? loaded.record.mr.title : loaded.kind, "strict title", "the local record equals the api's");
+  assert.equal(loaded.kind === "ok" ? loaded.record.candidate_seq : undefined, 2);
+});
+
+it("a surviving ACKed record with a laxer snapshot is advanced with this flight's stricter guard and title, never adopted as is", async () => {
+  client.protocolFeatures = FEATURES;
+  const outbox = await mkOutbox();
+  ackIntents([]);
+  const claim = claimFor(5141);
+  await seedLax(outbox, claim, "agent/issue-5141", [7, 1]);
+  const flight = enrollFlight(claim.run_id);
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+  const result = await (r as unknown as EnrollSeam).enrollPublication(claim, flight, intentInput(true, "agent/issue-5141"));
+  assert.equal(result, "proceed");
+  const last = api.publicationIntentRequests.at(-1)!.body as unknown as WireIntent;
+  assert.equal(last.candidate_seq, 2, "advanced with the CAS sequence");
+  assert.deepEqual([last.intent.mr.title, last.intent.guard.ci_config_guard_globs], ["strict title", [".github/**"]]);
+  assert.deepEqual([flight.publicationRecord?.mr.title, flight.publicationRecord?.guard.ci_config_guard_globs, flight.publicationRecord?.candidate_seq], ["strict title", [".github/**"], 2]);
+});
+
+it("an abort during enrollment is rethrown like every other publish step: no unresolved hold, the record is kept", async () => {
+  client.protocolFeatures = FEATURES;
+  const outbox = await mkOutbox();
+  ackIntents([]);
+  const claim = claimFor(5142);
+  const flight = enrollFlight(claim.run_id);
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects((r as unknown as EnrollSeam).enrollPublication(claim, flight, intentInput(false, "agent/issue-5142"), controller.signal));
+  assert.equal(flight.completionHoldOutcome, "none", "the abort must not latch the unresolved hold that skips every terminal and park");
+  assert.equal(outbox.hasPublicationRecords(claim.run_id), true, "the local record is kept");
+});
+
+it("an abort during a transformed-candidate advance is rethrown: no unresolved hold, no unconfirmed-candidate retain, the record is kept", async () => {
+  client.protocolFeatures = FEATURES;
+  const outbox = await mkOutbox();
+  ackIntents([]);
+  const claim = claimFor(5143);
+  await seedLax(outbox, claim, "agent/issue-5143", [7, 1]);
+  const loaded = await outbox.loadPublicationRecord(claim.run_id, GEN);
+  assert.equal(loaded.kind, "ok");
+  const flight = { ...enrollFlight(claim.run_id), publicationRecord: loaded.kind === "ok" ? loaded.record : undefined };
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+  const controller = new AbortController();
+  controller.abort();
+  const confirm = (r as unknown as { confirmPublicationCandidate: (f: unknown, candidate: string, signal?: AbortSignal) => Promise<void> }).confirmPublicationCandidate.bind(r);
+  await assert.rejects(confirm(flight, "9".repeat(40), controller.signal), (err: unknown) => (err as Error).name !== "PublicationUnconfirmedSignal");
+  assert.equal(flight.completionHoldOutcome, "none", "the abort must not latch the unresolved hold");
+  assert.equal(api.publicationIntentRequests.length, 0, "nothing was sent after the abort");
+  const after = await outbox.loadPublicationRecord(claim.run_id, GEN);
+  assert.equal(after.kind, "ok", "the local record is kept");
 });

@@ -148,6 +148,7 @@ import {
   enrollPublicationIntent,
   publicationParkRefusal,
   resendPublicationRecord,
+  samePublicationGuardAndMr,
   boundedPrSummaryJson,
   sliceWellFormed,
   type EnrolledPublicationRecord,
@@ -1015,7 +1016,8 @@ class PublicationRefusedSignal extends Error {
 
 /** Issue #1324: a transformed candidate could not be made durable (locally and at the api), so nothing
  *  may be pushed with it. The flight is already marked as an unresolved retain; the run neither fails
- *  nor reruns the executor, and the local record stays for the register reconciliation. */
+ *  nor reruns the executor, and the local record is kept (no reconciliation consumes it yet; the
+ *  publication-only resume, milestone M5, is not yet present). */
 class PublicationUnconfirmedSignal extends PublicationRefusedSignal {
   constructor() {
     super("publication candidate unconfirmed");
@@ -7576,7 +7578,7 @@ export class RunRunner {
     }
     if (publicationRefusal) {
       // Issue #1324: a refused publication-phase park never falls back to a source-releasing or failed
-      // path. Nothing is reported; the run stays non-terminal for the register reconciliation.
+      // path. Nothing is reported; the run stays non-terminal with its source and record kept.
       runLog.warn(`${copy.log}: publication park refused (${publicationRefusal}); retaining without a terminal report`, { run_id: flight.runId });
       this.retainForPublicationReconciliation(flight, publicationRefusal);
       await batcher.close().catch(() => undefined);
@@ -7790,7 +7792,7 @@ export class RunRunner {
   }
 
   /**
-   * Issue #1324 D2: retain the flight's source for the register reconciliation without reporting a failure.
+   * Issue #1324 D2: retain the flight's source and publication record without reporting a failure.
    * This is the API-unreachable posture of an unresolved completion hold: the run stays non-terminal, the
    * clone, session and finalize record survive, and no terminal or park is sent on a guess.
    */
@@ -7849,6 +7851,21 @@ export class RunRunner {
       outcome = await resendPublicationRecord(deps, outcome.record as EnrolledPublicationRecord);
       if (outcome.kind === "retired" && outcome.discarded) outcome = await enrollPublicationIntent(deps, intent);
     }
+    if (outcome.kind === "enrolled" && !samePublicationGuardAndMr(outcome.record, intent)) {
+      // The enrollment (a surviving ACKed record, or an adopted never-ACKed one posted as it was held) carries an
+      // older guard snapshot, closing set or title. The api's update takes the whole intent for the same
+      // identity, so advance (candidate_seq + 1, the CAS) with this flight's fresh guard and MR metadata; the
+      // older snapshot is never what this flight publishes from. A non-enrolled advance is retained below.
+      const surviving = outcome.record;
+      outcome = await advancePublicationCandidate(deps, surviving, {
+        candidate: surviving.candidate ?? intent.original_head, guard: intent.guard, mr: intent.mr,
+      });
+    }
+    if (outcome.kind === "uncertain" && outcome.reason === "aborted") {
+      // The finalize boundary deadline fired mid-enrollment. Like every other phasePublish step, surface the
+      // abort to the caller instead of holding the run as unresolved; the local record is kept.
+      signal?.throwIfAborted();
+    }
     switch (outcome.kind) {
       case "enrolled":
         flight.publicationRecord = outcome.record;
@@ -7880,6 +7897,8 @@ export class RunRunner {
       flight.publicationRecord = outcome.record;
       return;
     }
+    // An abort (the finalize boundary deadline) is rethrown like the neighbouring publish steps; the record is kept.
+    if (outcome.kind === "uncertain" && outcome.reason === "aborted") signal?.throwIfAborted();
     flight.batcher.emit({ kind: "status", agent: "worker", payload: {
       text: "the transformed publication candidate could not be confirmed; nothing was pushed and the work is retained until it is reconciled",
     } });
@@ -9204,14 +9223,6 @@ export class RunRunner {
       }
     }
 
-    // Issue #1869: a GitHub tip may carry workflow blobs from fresh default or target.
-    // Other workflow blobs cannot be pushed by the bot's repo-only PAT.
-    // Detect it here, BEFORE the doomed push, and end the run in a typed `failed` outcome
-    // that preserves the agent's diff for a human to land — instead of face-planting into
-    // GitHub's opaque "without workflow scope" rejection and discarding the committed work.
-    // Serves every forge-pushing kind (the failed path is not issue-gated).
-    // The precheck compares tip blobs per path; the overlay keeps its separate conservative
-    // changedFiles guard below.
     // Issue #1324 D2: the write-ahead publication intent. Order: the finalization pin above, the local
     // save with fsync, the acknowledged server enrollment, and only then default_fetch and every later
     // remote step. Nothing remote has run yet, and nothing below runs when the outcome is unknown.
@@ -9270,6 +9281,14 @@ export class RunRunner {
       }
     }
 
+    // Issue #1869: a GitHub tip may carry workflow blobs from fresh default or target.
+    // Other workflow blobs cannot be pushed by the bot's repo-only PAT.
+    // Detect it here, BEFORE the doomed push, and end the run in a typed `failed` outcome
+    // that preserves the agent's diff for a human to land — instead of face-planting into
+    // GitHub's opaque "without workflow scope" rejection and discarding the committed work.
+    // Serves every forge-pushing kind (the failed path is not issue-gated).
+    // The precheck compares tip blobs per path; the overlay keeps its separate conservative
+    // changedFiles guard below.
     const workflowBarePath = barePath;
     const originalWorkflowTip = await this.git.trackingTip(workflowBarePath, result.branch);
     const rethrowWorkflowAbort = (error: unknown) => {
@@ -18093,7 +18112,7 @@ export class RunRunner {
    * no local publication record of ANY generation has anything left to guard, whichever flight or replay
    * delivered the ACK. Each is removed only for the exact enrollment_seq it carries (a sequence-less record
    * for none); a record that fails to authenticate or read is kept, and so is every record on an unapplied,
-   * stale or non-terminal answer. A discard failure only logs: the register reconciliation retires it.
+   * stale or non-terminal answer. A discard failure only logs and the record is kept; nothing retires it yet.
    */
   private async discardPublicationRecordsOnTerminalAck(runId: string, body: { status: string }, ack: StateAck): Promise<void> {
     const outbox = this.outbox;
@@ -18106,7 +18125,7 @@ export class RunRunner {
         if (loaded.kind !== "ok") continue;
         await outbox.discardPublicationRecord(runId, entry.claim_generation, { enrollment_seq: loaded.record.enrollment_seq });
       } catch (error) {
-        this.log.warn("publication record discard failed; the register reconciliation retires it", { run_id: runId, error: errMessage(error) });
+        this.log.warn("publication record discard failed; the record is kept", { run_id: runId, error: errMessage(error) });
       }
     }
   }
@@ -19231,7 +19250,7 @@ export class RunRunner {
     };
     // Issue #1324: the api refused the publication park (publication_enrolled / publication_not_enrolled).
     // Never fall back to a source-releasing path and never report a failure on a refusal: log, say so, and
-    // retain the source and the local record for the register reconciliation.
+    // retain the source and the local record (the publication-only resume, milestone M5, is not yet present).
     const publicationRefused = async (reason: string): Promise<false> => {
       runLog.warn("publication park refused; retaining the source for reconciliation", { run_id: flight.runId, reason });
       await note(`the publication park was refused (${reason}); the work and the publication record are retained until it is reconciled`);
