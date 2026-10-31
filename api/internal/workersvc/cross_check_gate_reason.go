@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -34,12 +35,12 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 		// SQL may replace the declaration with its authoritative outcome. On the
 		// locked, tracked gate path, let a current-ID replay reach classifyGateReport,
 		// which still checks the approval-bearing payload before any report write.
-		active := lead.AutoApprove && (lead.Status == "claimed" || lead.Status == "running")
+		active := (lead.AutoApprove || lead.PlanCrossCheckGated) && (lead.Status == "claimed" || lead.Status == "running")
 		current := fencedGate && lead.ClaimGeneration > 0 && req.PresentationID != nil &&
 			lead.GatePresentationID.Valid && uuid.UUID(lead.GatePresentationID.Bytes) == *req.PresentationID
 		retained := lead.Status == "awaiting_approval" && !lead.AutoApprove &&
 			(lead.PlanCrossCheckGateReason.String == reason || current)
-		if !lead.PlanCrossCheckRequired || (!active && !retained) || !isCrossCheckLeadHarness(lead.Harness) ||
+		if !(lead.PlanCrossCheckRequired || lead.PlanCrossCheckGated) || (!active && !retained) || !isCrossCheckLeadHarness(lead.Harness) ||
 			req.ClaimGeneration == nil || *req.ClaimGeneration != lead.ClaimGeneration ||
 			lead.ClaimReleasedAt.Valid || lead.WorkerID != pgconv.UUID(worker.ID) || lead.UserID != worker.UserID {
 			return ErrInvalidState
@@ -129,4 +130,15 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 		}
 	}
 	return ErrInvalidState
+}
+
+// gatedPlanApprovalConstraint names the constraint the enforce_gated_plan_approval trigger
+// (migration 00387) raises, with SQLSTATE 23514, when a gated run's awaiting_approval ->
+// running edge has no current bound approval.
+const gatedPlanApprovalConstraint = "runs_gated_plan_approval"
+
+// isGatedPlanApprovalViolation reports whether err is that trigger's refusal.
+func isGatedPlanApprovalViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23514" && pgErr.ConstraintName == gatedPlanApprovalConstraint
 }

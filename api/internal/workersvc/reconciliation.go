@@ -59,7 +59,7 @@ func captureLeadReconciliation(ctx context.Context, q reconciliationReader, work
 	if err != nil {
 		return nil, err
 	}
-	if lead.UserID != worker.UserID || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid || !lead.PlanCrossCheckRequired {
+	if lead.UserID != worker.UserID || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid || !(lead.PlanCrossCheckRequired || lead.PlanCrossCheckGated) {
 		return nil, ErrCrossCheckRefused
 	}
 	pending, err := q.HasPendingPlanCrossCheck(ctx, leadID)

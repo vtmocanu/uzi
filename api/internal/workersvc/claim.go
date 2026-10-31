@@ -94,6 +94,11 @@ type ClaimPayload struct {
 	AutoApprove bool `json:"auto_approve"`
 	// PlanCrossCheckRequired is frozen on the run at creation and re-delivered on every claim.
 	PlanCrossCheckRequired bool `json:"plan_cross_check_required,omitempty"`
+	// PlanCrossCheckGated (PRD #3708) tells a worker that advertises cross_check_gated_v1 to run
+	// the checked plan loop before the human plan gate. It is set only when the run is gated AND
+	// the claiming worker advertises the capability, so an older worker (or an older api) never
+	// sees it and presents the ordinary gate.
+	PlanCrossCheckGated    bool `json:"plan_cross_check_gated,omitempty"`
 	CodeCrossCheckRequired bool `json:"code_cross_check_required,omitempty"`
 	// PlanCrossCheckCodexLead is an additive api-capability signal (PRD #2460 rework): this
 	// api accepts a Codex lead's checked-plan submission. It is deliberately redundant with

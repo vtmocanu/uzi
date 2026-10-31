@@ -4624,7 +4624,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 	}
 	// Required reconciliation cannot infer authority from an unfenced report.
-	if reconciliationOut != nil && owned.PlanCrossCheckRequired && (req.State == "running" || req.State == "awaiting_approval") && req.ClaimGeneration == nil {
+	if reconciliationOut != nil && (owned.PlanCrossCheckRequired || owned.PlanCrossCheckGated) && (req.State == "running" || req.State == "awaiting_approval") && req.ClaimGeneration == nil {
 		return owned, false, ErrClaimGenerationRequired
 	}
 	q := Store(s.q)
@@ -4961,6 +4961,18 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			}
 		}
 		rows, err = q.SetRunRunning(ctx, runningParams)
+		if isGatedPlanApprovalViolation(err) {
+			// PRD #3708: the version-independent trigger refused an awaiting_approval ->
+			// running edge with no current bound approval, a race the WHERE clause cannot see
+			// (an approval superseded between the predicate and the trigger). It is the same
+			// stale/refused outcome as 0 rows, never a 500. The failed statement aborted the
+			// fence transaction, so nothing in it may commit.
+			if fenceTx != nil {
+				_ = fenceTx.Rollback(ctx)
+				fenceTx = nil
+			}
+			rows, err = 0, nil
+		}
 	case "awaiting_approval":
 		// PRD #122 M1: the CANDIDATE milestone list rides the pre-approval report.
 		// milestonesParam validates + kind-gates it (Decision 12/13) and returns NULL
@@ -4977,7 +4989,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// as an absent-safe pgtype.Text, so an off-vocabulary or absent value is an invalid
 		// (SQL NULL) param the query's COALESCE keeps out of the column.
 		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
-		if owned.PlanCrossCheckRequired {
+		if owned.PlanCrossCheckRequired || owned.PlanCrossCheckGated {
 			if req.ClaimGeneration == nil {
 				return owned, false, ErrClaimGenerationRequired
 			}
@@ -5018,6 +5030,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return owned, false, err
 			}
 		}
+		if owned.PlanCrossCheckGated {
+			// PRD #3708: set only after validation. The digest binds a "passed" gate to the
+			// exact candidate the checker approved; both are inputs, never grants.
+			approvalParams.ServerGateReason = gatedServerGateReason(owned, wkr, req)
+			bindGatedAwaitingApproval(owned, req, semanticPresentation != nil, &approvalParams)
+		}
 		decision := gateDecision{class: gateClassUntracked}
 		if gateTracked && fenceTx != nil {
 			var witnessWorker *uuid.UUID
@@ -5056,7 +5074,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// against RUN_GATE_REFUSAL_MAX like any other refusal (issue #3081).
 		if req.ExpectedGateRevision != nil && decision.refusal == nil {
 			if req.RevisionInputID != nil && decision.class == gateClassRetain && revisionReceiptReplay(owned, req) {
-				if reconciliationOut != nil && owned.PlanCrossCheckRequired {
+				if reconciliationOut != nil && (owned.PlanCrossCheckRequired || owned.PlanCrossCheckGated) {
 					proof, err := captureLeadReconciliation(ctx, q.(*store.Queries), wkr, runID, *req.ClaimGeneration)
 					if err != nil {
 						return owned, false, err
@@ -5535,7 +5553,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// Capture after state, trigger settlement, and presentation writes, while the
 	// owning lock is still held. Early returns, refusals and zero-row writes grant no proof.
 	var reconciliation *LeadReconciliation
-	if reconciliationOut != nil && owned.PlanCrossCheckRequired && rows > 0 && gateRefusal == nil &&
+	if reconciliationOut != nil && (owned.PlanCrossCheckRequired || owned.PlanCrossCheckGated) && rows > 0 && gateRefusal == nil &&
 		(req.State == "awaiting_approval" || req.State == "running") {
 		reader, ok := q.(reconciliationReader)
 		if fenceTx == nil || req.ClaimGeneration == nil || !ok {

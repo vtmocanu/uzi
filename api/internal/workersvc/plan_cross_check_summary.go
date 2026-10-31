@@ -46,25 +46,9 @@ func (s *Service) PlanCrossCheckSummary(ctx context.Context, userID, leadID uuid
 		CheckerEffort: planCrossCheckSummaryLabel(row.CheckerEffort),
 		Historical:    row.Historical,
 	}
-	// JSONB adds insignificant whitespace. Compact before the writer's 32 KiB
-	// validation, keeping a separate 64 KiB input limit for legacy/corrupt rows.
-	if len(row.Findings) <= 64*1024 {
-		var compact bytes.Buffer
-		if json.Compact(&compact, row.Findings) == nil {
-			// An unstored approval retains its original bounded findings as history.
-			// Normalize the prose using its original outcome, without allowing the
-			// checker verdict route to submit this server-only reason.
-			verdict, reason := row.Verdict, row.ReasonClass.String
-			if verdict == "failed" && reason == "approved_not_stored" {
-				verdict, reason = "approve", "approve"
-			}
-			if clean, err := NormalizeCrossCheckFindings(verdict, reason, compact.Bytes()); err == nil {
-				var findings apitypes.PlanCrossCheckFindingsDTO
-				if json.Unmarshal(clean, &findings) == nil {
-					dto.Findings = &findings
-				}
-			}
-		}
+	dto.Findings = planCrossCheckFindings(row.Verdict, row.ReasonClass.String, row.Findings)
+	if err := s.attachPlanCrossCheckRounds(ctx, userID, leadID, dto); err != nil {
+		return nil, err
 	}
 	if row.HasChild && row.CheckerRunID.Valid {
 		id := uuid.UUID(row.CheckerRunID.Bytes).String()
@@ -90,6 +74,90 @@ func (s *Service) PlanCrossCheckSummary(ctx context.Context, userID, leadID uuid
 		}
 	}
 	return dto, nil
+}
+
+// planCrossCheckFindings bounds and normalizes one round's stored findings. JSONB adds
+// insignificant whitespace, so compact before the writer's 32 KiB validation, keeping a
+// separate 64 KiB input limit for legacy/corrupt rows. It returns nil for anything invalid.
+func planCrossCheckFindings(verdict, reason string, raw []byte) *apitypes.PlanCrossCheckFindingsDTO {
+	if len(raw) > 64*1024 {
+		return nil
+	}
+	var compact bytes.Buffer
+	if json.Compact(&compact, raw) != nil {
+		return nil
+	}
+	// An unstored approval retains its original bounded findings as history.
+	// Normalize the prose using its original outcome, without allowing the
+	// checker verdict route to submit this server-only reason.
+	if verdict == "failed" && reason == "approved_not_stored" {
+		verdict, reason = "approve", "approve"
+	}
+	clean, err := NormalizeCrossCheckFindings(verdict, reason, compact.Bytes())
+	if err != nil {
+		return nil
+	}
+	var findings apitypes.PlanCrossCheckFindingsDTO
+	if json.Unmarshal(clean, &findings) != nil {
+		return nil
+	}
+	return &findings
+}
+
+// planCrossCheckRoundsReader and planCrossCheckLeadReader are optional so Store
+// implementations used by ordinary run reads keep compiling.
+type planCrossCheckRoundsReader interface {
+	ListPlanCrossCheckRounds(context.Context, store.ListPlanCrossCheckRoundsParams) ([]store.ListPlanCrossCheckRoundsRow, error)
+	GetRunByID(context.Context, uuid.UUID) (store.Run, error)
+}
+
+// attachPlanCrossCheckRounds adds the newest five rounds (chronological) with each round's
+// own bounded response, and the pending deadline. plan_md is read only to extract the lead's
+// "Cross-check dispositions" from the FOLLOWING candidate; it never reaches the DTO.
+func (s *Service) attachPlanCrossCheckRounds(ctx context.Context, userID, leadID uuid.UUID, dto *apitypes.PlanCrossCheckSummaryDTO) error {
+	q, ok := s.q.(planCrossCheckRoundsReader)
+	if !ok {
+		return nil
+	}
+	rows, err := q.ListPlanCrossCheckRounds(ctx, store.ListPlanCrossCheckRoundsParams{LeadRunID: leadID, UserID: userID})
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	// The query is newest-first so the cap keeps the latest rounds; present oldest-first.
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+	var lead *store.Run
+	if run, err := q.GetRunByID(ctx, leadID); err == nil && run.UserID == userID {
+		lead = &run
+	}
+	dto.Rounds = make([]apitypes.PlanCrossCheckRoundDTO, 0, len(rows))
+	for i := range rows {
+		row := rows[i]
+		var following *store.ListPlanCrossCheckRoundsRow
+		if i+1 < len(rows) && rows[i+1].Round == row.Round+1 {
+			following = &rows[i+1]
+		}
+		round := apitypes.PlanCrossCheckRoundDTO{
+			Round: row.Round, Verdict: scrubThenBound(row.Verdict, 512),
+			ReasonClass: planCrossCheckSummaryLabel(row.ReasonClass),
+			Findings:    planCrossCheckFindings(row.Verdict, row.ReasonClass.String, row.Findings),
+			Response:    crossCheckRoundResponse(row, following, lead),
+		}
+		if row.DecidedAt.Valid {
+			decided := row.DecidedAt.Time
+			round.DecidedAt = &decided
+		}
+		dto.Rounds = append(dto.Rounds, round)
+	}
+	if last := rows[len(rows)-1]; last.Verdict == "pending" && last.DeadlineAt.Valid {
+		deadline := last.DeadlineAt.Time
+		dto.DeadlineAt = &deadline
+	}
+	return nil
 }
 
 func planCrossCheckSummaryLabel(text pgtype.Text) *string {
