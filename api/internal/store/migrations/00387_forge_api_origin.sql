@@ -4,6 +4,9 @@
 -- evidence surfaces keep independent flags on it so one surface's success cannot clear the other.
 
 -- +goose Up
+-- The first statement: the ALTERs below wait on forge_origin_cooldowns and run_forge_origins locks.
+-- A lock wait past the bound fails the migration, which can be rerun.
+SET LOCAL lock_timeout = '5s';
 -- The authorized API origin of a repo, mirroring agent/src/forge.ts githubRepoParts / gitlabBaseUrl /
 -- forgejoRepoParts. GitHub's API lives on a different host (api.github.com, or api.<host> with a
 -- leading www. dropped, port kept); GitLab and Forgejo serve the API from the web host, so their
@@ -36,11 +39,9 @@ ALTER TABLE forge_origin_cooldowns
     ADD COLUMN api_unverified boolean NOT NULL DEFAULT false;
 ALTER TABLE forge_origin_cooldowns DROP CONSTRAINT forge_origin_cooldowns_last_reason_check;
 ALTER TABLE forge_origin_cooldowns ADD CONSTRAINT forge_origin_cooldowns_last_reason_check
-    CHECK (last_reason IN ('transient_clone_fetch_exhausted', 'transient_publication_exhausted')) NOT VALID;
+    CHECK (last_reason IN ('transient_clone_fetch_exhausted', 'transient_publication_exhausted'));
 ALTER TABLE forge_origin_cooldowns ADD CONSTRAINT forge_origin_cooldowns_unverified_check
-    CHECK (git_unverified OR api_unverified) NOT VALID;
-ALTER TABLE forge_origin_cooldowns VALIDATE CONSTRAINT forge_origin_cooldowns_last_reason_check;
-ALTER TABLE forge_origin_cooldowns VALIDATE CONSTRAINT forge_origin_cooldowns_unverified_check;
+    CHECK (git_unverified OR api_unverified);
 
 -- The claim snapshot also records the API origin and the API reservation it captured. When the
 -- API origin equals the Git origin the reservation columns copy the shared row's reservation.
@@ -49,8 +50,7 @@ ALTER TABLE run_forge_origins
     ADD COLUMN api_reservation_incarnation uuid,
     ADD COLUMN api_reservation_version bigint;
 ALTER TABLE run_forge_origins ADD CONSTRAINT run_forge_origins_api_reservation_check
-    CHECK ((api_reservation_incarnation IS NULL) = (api_reservation_version IS NULL)) NOT VALID;
-ALTER TABLE run_forge_origins VALIDATE CONSTRAINT run_forge_origins_api_reservation_check;
+    CHECK ((api_reservation_incarnation IS NULL) = (api_reservation_version IS NULL));
 
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION forge_origin_claim_stamp() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -103,6 +103,10 @@ END $$;
 -- Completion is Git evidence only: it clears the Git flag and deletes the row only when no API
 -- failure remains. It never clears an API failure. Every reservation, API one included, is
 -- released with the claim.
+-- Lock this run's reserved rows in origin order, the order ClaimRun's forge_locked CTE takes them
+-- (GitHub's API origin sorts before its Git origin). The statements after it touch the Git row and
+-- then the API row; without it, a claim racing a release or completion deadlocks on
+-- forge_origin_cooldowns (SQLSTATE 40P01).
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION forge_origin_reservation_lifecycle() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -113,6 +117,12 @@ BEGIN
            AND NEW.kind IN ('issue', 'mr_rework', 'self_improve')
            AND NEW.completion_final_head IS NOT NULL AND NEW.claim_released_at IS NULL
            AND (NEW.worker_id, NEW.claim_generation) IS NOT DISTINCT FROM (OLD.worker_id, OLD.claim_generation) THEN
+            PERFORM 1 FROM forge_origin_cooldowns c
+            JOIN run_forge_origins m ON m.run_id = OLD.id AND m.worker_id = OLD.worker_id
+                AND m.generation = OLD.claim_generation
+            WHERE c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin IN (m.origin, m.api_origin)
+            ORDER BY c.origin
+            FOR UPDATE OF c;
             DELETE FROM forge_origin_cooldowns c USING run_forge_origins m,
                 recovery_custody_holds h, repos rp, forge_connections fc
             WHERE m.run_id = NEW.id AND m.user_id = NEW.user_id
@@ -172,6 +182,12 @@ BEGIN
            AND (NEW.worker_id, NEW.claim_generation) IS NOT DISTINCT FROM (OLD.worker_id, OLD.claim_generation)
            THEN RETURN NEW; END IF;
     END IF;
+    PERFORM 1 FROM forge_origin_cooldowns c
+    JOIN run_forge_origins m ON m.run_id = OLD.id AND m.worker_id = OLD.worker_id
+        AND m.generation = OLD.claim_generation
+    WHERE c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin IN (m.origin, m.api_origin)
+    ORDER BY c.origin
+    FOR UPDATE OF c;
     UPDATE forge_origin_cooldowns c SET
         reservation_run_id = NULL, reservation_generation = NULL,
         reservation_incarnation = NULL, reservation_version = NULL,
@@ -249,6 +265,7 @@ $$;
 -- +goose StatementEnd
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
 -- Restore 00380 to 00385 behaviour. API-only evidence has no representation there and is dropped.
 UPDATE forge_origin_cooldowns SET last_reason = 'transient_clone_fetch_exhausted'
 WHERE last_reason = 'transient_publication_exhausted';
