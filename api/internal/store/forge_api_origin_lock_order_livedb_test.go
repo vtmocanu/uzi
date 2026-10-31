@@ -9,6 +9,56 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// run_forge_origins survives a release, so an unrelated write to a released run must not lock the
+// worker's cooldown rows when this run reserves nothing: a held lock on the Git row must not block it.
+func TestForgeAPIOriginReleasedRunWriteTakesNoCooldownLockLiveDB(t *testing.T) {
+	fx := newForgeAPIFixture(t, "github")
+	w := fx.worker("claimant", 0, false)
+	id := fx.unclaimedRun()
+	apiFxRow(fx, w, apiFxGit, true, true, false)
+	apiFxRow(fx, w, apiFxAPI, true, false, true)
+	if got, err := forgeAdmissionClaim(fx, fx.q, w); err != nil || got.ID != id {
+		t.Fatalf("claim: %s %v", got.ID, err)
+	}
+	if _, err := fx.pool.Exec(fx.ctx, "UPDATE runs SET claim_released_at=now() WHERE id=$1", id); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	for _, origin := range []string{apiFxGit, apiFxAPI} {
+		if st := apiFxRead(fx, w, origin); !st.Exists || st.Reserved {
+			t.Fatalf("reservation on %s not released: %+v", origin, st)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(fx.ctx, 30*time.Second)
+	defer cancel()
+	txA, err := fx.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = txA.Rollback(context.Background()) }()
+	var one int
+	if err := txA.QueryRow(ctx, `SELECT 1 FROM forge_origin_cooldowns
+		WHERE user_id=$1 AND worker_id=$2 AND origin=$3 FOR UPDATE`, fx.userID, w, apiFxGit).Scan(&one); err != nil {
+		t.Fatalf("A locks the Git row: %v", err)
+	}
+
+	txB, err := fx.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = txB.Rollback(context.Background()) }()
+	if _, err := txB.Exec(ctx, "SET LOCAL lock_timeout='1s'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := txB.Exec(ctx, "UPDATE runs SET updated_at=now() WHERE id=$1", id); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+			t.Fatalf("unrelated write to a released run waited on a cooldown row lock: %v", err)
+		}
+		t.Fatalf("update: %v", err)
+	}
+}
+
 // ClaimRun's forge_locked CTE locks a target's cooldown rows ORDER BY origin, and for GitHub the API
 // origin sorts before the Git origin. The run-lifecycle trigger releases both of a claim's
 // reservations, so it must take the same order. Interleaving: a claimant holds the API row (its first

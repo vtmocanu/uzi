@@ -103,9 +103,11 @@ END $$;
 -- Completion is Git evidence only: it clears the Git flag and deletes the row only when no API
 -- failure remains. It never clears an API failure. Every reservation, API one included, is
 -- released with the claim.
--- Lock this run's reserved rows in origin order, the order ClaimRun's forge_locked CTE takes them
--- (GitHub's API origin sorts before its Git origin). The statements after it touch the Git row and
--- then the API row; without it, a claim racing a release or completion deadlocks on
+-- Lock this run's reserved rows in origin order, the order ClaimRun's forge_locked CTE takes them.
+-- Only rows this run still reserves are locked (the reservation filter matches every later write),
+-- because run_forge_origins survives a release and an unreserved row must not be locked by an
+-- unrelated write to the run. The statements after it touch the Git row and then the API row;
+-- without the ordered lock, a claim racing a release or completion deadlocks on
 -- forge_origin_cooldowns (SQLSTATE 40P01).
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION forge_origin_reservation_lifecycle() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -121,6 +123,7 @@ BEGIN
             JOIN run_forge_origins m ON m.run_id = OLD.id AND m.worker_id = OLD.worker_id
                 AND m.generation = OLD.claim_generation
             WHERE c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin IN (m.origin, m.api_origin)
+              AND c.reservation_run_id = OLD.id AND c.reservation_generation = OLD.claim_generation
             ORDER BY c.origin
             FOR UPDATE OF c;
             DELETE FROM forge_origin_cooldowns c USING run_forge_origins m,
@@ -186,6 +189,7 @@ BEGIN
     JOIN run_forge_origins m ON m.run_id = OLD.id AND m.worker_id = OLD.worker_id
         AND m.generation = OLD.claim_generation
     WHERE c.user_id = m.user_id AND c.worker_id = m.worker_id AND c.origin IN (m.origin, m.api_origin)
+      AND c.reservation_run_id = OLD.id AND c.reservation_generation = OLD.claim_generation
     ORDER BY c.origin
     FOR UPDATE OF c;
     UPDATE forge_origin_cooldowns c SET
@@ -217,6 +221,13 @@ END $$;
 -- +goose StatementBegin
 CREATE OR REPLACE FUNCTION prune_forge_origin_cooldowns() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+    -- Lock the doomed rows in ClaimRun's forge_locked order first: a set-based DELETE locks in scan
+    -- order and can deadlock with a claim (SQLSTATE 40P01).
+    PERFORM 1 FROM forge_origin_cooldowns c
+    WHERE NOT EXISTS (SELECT 1 FROM authorized_forge_origins a
+                      WHERE a.user_id = c.user_id AND (a.origin = c.origin OR a.api_origin = c.origin))
+    ORDER BY c.user_id, c.worker_id, c.origin
+    FOR UPDATE OF c;
     DELETE FROM forge_origin_cooldowns c
     WHERE NOT EXISTS (SELECT 1 FROM authorized_forge_origins a
                       WHERE a.user_id = c.user_id AND (a.origin = c.origin OR a.api_origin = c.origin));
