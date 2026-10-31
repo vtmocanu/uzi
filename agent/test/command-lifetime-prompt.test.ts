@@ -139,17 +139,19 @@ describe("guarded Claude lane: sequential shell calls and the delegated integrat
 
   it("the guard-bound lead is told guarded calls are serialized and to delegate the gate into the review batch", () => {
     assert.match(guardedLead, GATE_HEADING);
+    assert.match(guardedLead, /The CLI runs Bash calls issued together one after another/);
     assert.match(guardedLead, /a Bash call placed after an Agent batch waits for that whole batch/);
-    assert.match(guardedLead, /delegate the gate to one available execution-capable subagent in the same Agent batch as the read-only review wave/);
+    assert.match(guardedLead, /When the integration-gate sequencing policy calls for overlap, delegate the gate to one available execution-capable subagent in the same Agent batch as the read-only review wave/);
     assert.match(guardedLead, /costly-gate repair exception still applies: do not restart full gates alongside every repair review/);
     assert.match(guardedLead, /Name one gate owner\./);
     assert.match(guardedLead, /Keep the worktree frozen until it reports: no implementation wave runs meanwhile/);
     assert.match(guardedLead, /runs only the delegated integration checks, does not mutate the checkout/);
+    assert.match(guardedLead, /adds no independent mutation proof or duplicate of another validator's executable work/);
     assert.match(guardedLead, /returns the tested revision, command, exit status and log path/);
     assert.match(guardedLead, /This delegated run is the integration gate itself, not a validator's report, and keeps its full blocking authority/);
-    assert.match(guardedLead, /read the exit status and summary from the log it names/);
+    assert.match(guardedLead, /Before treating it as green, read the exit status and summary from the log it names/);
     assert.match(guardedLead, /A missing log, a missing exit status or a different revision means the gate did not run/);
-    assert.match(guardedLead, /Do not send several long commands in one message expecting them to run together/);
+    assert.match(guardedLead, /Do not send several long commands in one message expecting them to run together: they run in sequence, each against its own deadline/);
     assert.match(guardedLead, /If no suitable subagent is available[^.]*run the gate yourself after the wave/);
     assert.match(guardedLead, /it overrides no other template instruction/);
     assert.match(guardedLead, SEQUENTIAL);
