@@ -52,7 +52,9 @@
     "lifetime_subscription_run_count": 0,
     "lifetime_unreported_run_count": 0,
     "last7_subscription_run_count": 0,
-    "last7_unreported_run_count": 0
+    "last7_unreported_run_count": 0,
+    "lifetime_pr_count": 0,
+    "last7_pr_count": 0
   },
   "users": null,
   "earliest_run": null

@@ -1221,6 +1221,10 @@ type Store interface {
 	SelfUsage(ctx context.Context, userID uuid.UUID) (store.SelfUsageRow, error)
 	AdminUsageTotals(ctx context.Context) (store.AdminUsageTotalsRow, error)
 	AdminUsagePerUser(ctx context.Context) ([]store.AdminUsagePerUserRow, error)
+	// PR counts (issue #3686); definition on the SelfPRCounts query.
+	SelfPRCounts(ctx context.Context, userID uuid.UUID) (store.SelfPRCountsRow, error)
+	FactoryPRCounts(ctx context.Context) (store.FactoryPRCountsRow, error)
+	PRCountsPerUser(ctx context.Context) ([]store.PRCountsPerUserRow, error)
 	// Failed-run rate outcome aggregates (PRD #1293 M1), read straight from `runs`. The
 	// needs_landing sub-cut of `failed` (issue #1418) takes the human-landable fail_origin
 	// set as a bind array; the Service wrappers inject AllHumanLandableFailOrigins() so the
@@ -8150,6 +8154,22 @@ func (s *Service) AdminUsageTotals(ctx context.Context) (store.AdminUsageTotalsR
 // (PRD #40 M3); the rows sum to the factory total by construction.
 func (s *Service) AdminUsagePerUser(ctx context.Context) ([]store.AdminUsagePerUserRow, error) {
 	return s.q.AdminUsagePerUser(ctx)
+}
+
+// SelfPRCounts returns the PRs uzi runs opened that the user owns, both windows
+// (issue #3686; definition on the SelfPRCounts query).
+func (s *Service) SelfPRCounts(ctx context.Context, userID uuid.UUID) (store.SelfPRCountsRow, error) {
+	return s.q.SelfPRCounts(ctx, userID)
+}
+
+// FactoryPRCounts returns the factory-wide PR counts, both windows (issue #3686).
+func (s *Service) FactoryPRCounts(ctx context.Context) (store.FactoryPRCountsRow, error) {
+	return s.q.FactoryPRCounts(ctx)
+}
+
+// PRCountsPerUser returns the per-owner PR counts, ordered by user id (issue #3686).
+func (s *Service) PRCountsPerUser(ctx context.Context) ([]store.PRCountsPerUserRow, error) {
+	return s.q.PRCountsPerUser(ctx)
 }
 
 // SelfRunOutcomes returns the user's own run outcome counts for both windows

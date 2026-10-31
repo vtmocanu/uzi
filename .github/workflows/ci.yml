@@ -353,8 +353,10 @@ jobs:
     runs-on: ubuntu-latest
     # The job runs the bridge plus the whole store-IT sweep: 25m on main (2026-10-22),
     # 31-33m once #3120 added its LiveDB matrices (cut off at 30m twice, last package
-    # still passing). 45 leaves room for runner variance.
-    timeout-minutes: 45
+    # still passing), 23-43m on main by 2026-10-30, and a PR head cut off at 45m twice
+    # while its completed common tests took about 1.66x aggregate time. 60 leaves room for
+    # runner variance; a run nearing it is a re-measurement signal, not a reason to raise it again.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:

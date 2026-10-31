@@ -4133,6 +4133,10 @@ export interface SelfUsage {
   lifetime_unreported_run_count: number;
   last7_subscription_run_count: number;
   last7_unreported_run_count: number;
+  /** Issue #3686: PRs uzi runs opened, each counted once for its earliest run's user and
+   *  created_at window. Absent on older APIs: render no PR text, never a fabricated 0. */
+  lifetime_pr_count?: number;
+  last7_pr_count?: number;
 }
 
 // AdminUsageUser preserves lifetime figures and adds seven-day figures to the factory breakdown.
@@ -4155,6 +4159,9 @@ export interface AdminUsageUser {
    *  per-user breakdown discloses a non-metered component like the factory total. */
   subscription_run_count: number;
   unreported_run_count: number;
+  /** Issue #3686: this user's lifetime and seven-day PR counts. Absent on older APIs. */
+  pr_count?: number;
+  last7_pr_count?: number;
 }
 
 // AdminUsage is the factory-wide view (GET /api/admin/usage, admin-only): the

@@ -1,13 +1,17 @@
+//go:build unix
+
 package kube
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -33,6 +37,9 @@ def acquire(fd, mode):
         except BlockingIOError:
             return False
     wait(attempt)
+if command == os.environ.get("EPOCH_FIXTURE_STALL"):
+    event(command + "-stalled")
+    wait(lambda: os.path.exists(root + "/release"))
 if command == os.environ.get("EPOCH_FIXTURE_FAIL"):
     event(command + "-failed")
     sys.exit(1)
@@ -57,7 +64,9 @@ elif command == "prepare":
     event("prepare")
     s = os.stat(lock)
     print(str(s.st_dev) + ":" + str(s.st_ino))
-    if os.environ.get("EPOCH_FIXTURE_REMOVE_ON_PREPARE") == "1": os.unlink(lock)
+    if os.environ.get("EPOCH_FIXTURE_REMOVE_ON_PREPARE") == "1":
+        os.unlink(lock)
+        event("prepare-unlinked")
 elif command == "hold":
     event("SH-wait")
     fd = int(sys.argv[4])
@@ -182,6 +191,59 @@ func (h *epochInitHost) posture() {
 	}
 }
 
+// errEpochRaceSetup marks a missing-after-prepare run that ended before the
+// fixture proved its injected unlink: execution evidence, never race evidence.
+var errEpochRaceSetup = errors.New("missing-after-prepare race did not run")
+
+// missingAfterPrepare runs the rendered shell with the lock unlinked inside
+// prepare and classifies the outcome. The shell and every fixture process share
+// one process group, which cancellation kills whole; CombinedOutput returns only
+// after every holder of its pipe has exited, so the snapshot below cannot race a
+// surviving fixture.
+func (h *epochInitHost) missingAfterPrepare(ctx context.Context, seed bool, extraEnv ...string) error {
+	h.t.Helper()
+	script := h.script(seed)
+	// Failure precedes UID-specific writes, including on a root host.
+	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", script) //nolint:gosec // G204: only fixed rendered source and test-owned paths.
+	cmd.Env = append(append(os.Environ(), "UZI_EPOCH_LOCK=1", "UZI_POD_UID=pod-race", "EPOCH_FIXTURE_REMOVE_ON_PREPARE=1", "LC_ALL=C"), extraEnv...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	out, runErr := cmd.CombinedOutput()
+	events := h.events()
+	_, lockErr := os.Lstat(filepath.Join(h.data, ".uzi-epoch.lock"))
+	tail := out
+	if len(tail) > 4096 {
+		tail = tail[len(tail)-4096:]
+	}
+	diag := fmt.Sprintf("err=%v ctx=%v lock=%v events=%q output=%q", runErr, ctx.Err(), lockErr, events, tail)
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: context ended during execution: %s", errEpochRaceSetup, diag)
+	}
+	if !strings.Contains(events, "prepare-unlinked\n") {
+		return fmt.Errorf("%w: fixture never reached the injected unlink: %s", errEpochRaceSetup, diag)
+	}
+	if cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		return fmt.Errorf("raced open succeeded: %s", diag)
+	}
+	if !os.IsNotExist(lockErr) {
+		return fmt.Errorf("shell created a replacement before SH: %s", diag)
+	}
+	if strings.Contains(events, "SH-wait") || strings.Contains(events, "SH-acquired") || strings.Contains(events, "body-SH") {
+		return fmt.Errorf("protected initialization continued after raced open: %s", diag)
+	}
+	want := "prepare\nprepare-unlinked\n"
+	if seed {
+		want = "record-EX\n" + want
+	}
+	if events != want {
+		return fmt.Errorf("unexpected fixture events (want %q): %s", want, diag)
+	}
+	if !strings.Contains(string(out), ".uzi-epoch.lock: No such file or directory") {
+		return fmt.Errorf("shell did not refuse the missing lock: %s", diag)
+	}
+	return nil
+}
+
 func TestPodEpochInitExecMissingAfterPrepareNeverCreatesState(t *testing.T) {
 	for _, seed := range []bool{true, false} {
 		t.Run(fmt.Sprintf("seed=%v", seed), func(t *testing.T) {
@@ -189,19 +251,69 @@ func TestPodEpochInitExecMissingAfterPrepareNeverCreatesState(t *testing.T) {
 			h.posture()
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
-			// Failure precedes UID-specific writes, including on a root host.
-			cmd := exec.CommandContext(ctx, "/bin/bash", "-c", h.script(seed)) //nolint:gosec // G204: only fixed rendered source and test-owned paths.
-			cmd.Env = append(os.Environ(), "UZI_EPOCH_LOCK=1", "UZI_POD_UID=pod-race", "EPOCH_FIXTURE_REMOVE_ON_PREPARE=1")
-			if out, err := cmd.CombinedOutput(); err == nil {
-				t.Fatalf("raced open succeeded: %s", out)
-			}
-			if _, err := os.Lstat(filepath.Join(h.data, ".uzi-epoch.lock")); !os.IsNotExist(err) {
-				t.Fatalf("shell created a replacement before SH: %v", err)
-			}
-			if strings.Contains(h.events(), "SH-acquired") || strings.Contains(h.events(), "body-SH") {
-				t.Fatal("protected initialization continued after raced open")
+			if err := h.missingAfterPrepare(ctx, seed); err != nil {
+				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// An exit or cancellation before the injected unlink leaves the original lock
+// in place; it must be reported as an execution failure, never as recreation.
+func TestPodEpochInitExecMissingAfterPrepareDiagnosesEarlyExit(t *testing.T) {
+	for _, seed := range []bool{true, false} {
+		for _, fault := range []string{"fail", "cancelled", "stall"} {
+			t.Run(fmt.Sprintf("seed=%v/%s", seed, fault), func(t *testing.T) {
+				h := newEpochInitHost(t)
+				h.posture()
+				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				defer cancel()
+				var env []string
+				var want string
+				var stalled chan bool
+				switch fault {
+				case "fail":
+					env, want = []string{"EPOCH_FIXTURE_FAIL=prepare"}, "prepare-failed\n"
+				case "cancelled":
+					cancel()
+				case "stall":
+					env, want = []string{"EPOCH_FIXTURE_STALL=prepare"}, "prepare-stalled\n"
+					stalled = make(chan bool, 1)
+					// Cancel on the fixture's event, mid-run and before the unlink.
+					go func() {
+						seen := false
+						for !seen && ctx.Err() == nil {
+							b, _ := os.ReadFile(filepath.Join(h.data, "events"))
+							if seen = strings.Contains(string(b), "prepare-stalled\n"); !seen {
+								time.Sleep(10 * time.Millisecond)
+							}
+						}
+						stalled <- seen
+						cancel()
+					}()
+				}
+				if seed && want != "" {
+					want = "record-EX\n" + want
+				}
+				err := h.missingAfterPrepare(ctx, seed, env...)
+				if !errors.Is(err, errEpochRaceSetup) {
+					t.Fatalf("early exit accepted or misclassified: %v", err)
+				}
+				if !strings.Contains(err.Error(), "ctx=") || !strings.Contains(err.Error(), "events=") {
+					t.Fatalf("diagnostics lack context state or events: %v", err)
+				}
+				if stalled != nil && !<-stalled {
+					t.Fatalf("cancelled before the fixture stalled: %v", err)
+				}
+				if got := h.events(); got != want {
+					t.Fatalf("events = %q, want %q", got, want)
+				}
+				// After termination the original lock remains: nothing unlinked it late.
+				if _, err := os.Lstat(filepath.Join(h.data, ".uzi-epoch.lock")); err != nil {
+					t.Fatalf("lock changed after an early exit: %v", err)
+				}
+			})
+		}
 	}
 }
 
