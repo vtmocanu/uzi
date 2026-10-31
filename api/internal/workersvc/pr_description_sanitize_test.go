@@ -947,11 +947,18 @@ func TestSanitizePrDescriptionGenericsAndComparisons(t *testing.T) {
 
 // TestSanitizePrDescriptionFieldsScopeNoteCaps pins the two caps that shape the delivered PR's
 // scope notes: the entry count (PrDescMaxScopeNotes, first entries kept, order preserved) and the
-// per-note byte bound (PrDescItemMaxBytes, cut at a rune boundary, ending in "…").
+// per-note byte bound (PrDescItemMaxBytes, cut at a rune boundary, ending in "…"). The literals are
+// the published numbers PRD #3721 states ("at most eight notes of 200 sanitized bytes each", "No cap
+// increase"), so a raise of either constant fails here rather than moving the expectation with it.
 func TestSanitizePrDescriptionFieldsScopeNoteCaps(t *testing.T) {
+	const wantNotes, wantItemBytes = 8, 200
+	if PrDescMaxScopeNotes != wantNotes || PrDescItemMaxBytes != wantItemBytes {
+		t.Fatalf("caps = %d notes / %d bytes, want %d / %d (PRD #3721: no cap increase)",
+			PrDescMaxScopeNotes, PrDescItemMaxBytes, wantNotes, wantItemBytes)
+	}
 	long := strings.Repeat("é", 150) // 300 bytes, 2 bytes per rune, under the 1000-byte raw cap
 	var notes []apitypes.PrDescriptionScopeNote
-	for i := 1; i <= 11; i++ { // fixed count: must exceed the cap whatever its value
+	for i := 1; i <= 11; i++ { // fixed count above the 8-note cap
 		text := fmt.Sprintf("note-%d", i)
 		if i == 3 {
 			text = long
@@ -962,12 +969,12 @@ func TestSanitizePrDescriptionFieldsScopeNoteCaps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sanitize: %v", err)
 	}
-	if len(out.ScopeNotes) != PrDescMaxScopeNotes {
-		t.Fatalf("scope notes = %d, want %d (first entries kept)", len(out.ScopeNotes), PrDescMaxScopeNotes)
+	if len(out.ScopeNotes) != wantNotes {
+		t.Fatalf("scope notes = %d, want %d (first entries kept)", len(out.ScopeNotes), wantNotes)
 	}
 	for i, n := range out.ScopeNotes {
-		if len(n.Text) > PrDescItemMaxBytes {
-			t.Errorf("note %d is %d bytes, want <= %d", i, len(n.Text), PrDescItemMaxBytes)
+		if len(n.Text) > wantItemBytes {
+			t.Errorf("note %d is %d bytes, want <= %d", i, len(n.Text), wantItemBytes)
 		}
 		if !utf8.ValidString(n.Text) {
 			t.Errorf("note %d is not valid UTF-8: %q", i, n.Text)
@@ -980,7 +987,7 @@ func TestSanitizePrDescriptionFieldsScopeNoteCaps(t *testing.T) {
 		}
 	}
 	got := out.ScopeNotes[2].Text
-	if !strings.HasSuffix(got, "…") || !strings.HasPrefix(got, "éé") || len(got) < PrDescItemMaxBytes-4 {
+	if !strings.HasSuffix(got, "…") || !strings.HasPrefix(got, "éé") || len(got) < wantItemBytes-4 {
 		t.Errorf("long note = %q (%d bytes), want a rune-boundary cut ending in an ellipsis near the cap", got, len(got))
 	}
 }

@@ -84,9 +84,8 @@ describe("declared non-closing run with a closing commit message (issue #2779)",
       config: { completion_contract_version: 1, contract_revision: 1 },
     });
     api.setPublicationState(claim.run_id, [], 1);
-    // The completion permit is canned (always granted): "all milestones met" comes from this stub, so
-    // the single hold below is the agent-side history-correction hold, not a server decision.
-    api.setCompletionPermitResponse(true);
+    // The closing-commit refusal fires before any completion permit is requested, so the single hold
+    // below is the agent-side history-correction hold, not a server decision.
     const executor = committing("Closes #3721", obs, true, "closing.txt", {
       nonClosing: { reason: "Owner acceptance pending: live dev-cluster rollout check" },
     });
@@ -97,6 +96,7 @@ describe("declared non-closing run with a closing commit message (issue #2779)",
     assert.ok(!statuses(claim.run_id).includes("completed"));
     assert.ok(!statuses(claim.run_id).includes("failed"));
     assert.equal(api.completionHoldRequests.length, 1, "held for history correction exactly once");
+    assert.equal(api.completionPermitRequests.length, 0, "refused before any completion permit request");
     assert.equal(all.length, 0, "no forge request of any kind");
     assert.equal(originHasBranch(), false, "nothing was pushed");
     const feed = api.messages(claim.run_id).map(m => String((m.payload as { text?: unknown } | undefined)?.text ?? "")).join("\n");
