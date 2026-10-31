@@ -144,6 +144,8 @@ var errPodEpochReset = errors.New("pod epoch subscription reset")
 
 // consume caps each NDJSON frame before any Kubernetes or JSON decoder sees it.
 // Delivery is synchronous: rv advances only after Handle and its event-bound patch attempt.
+// Only a conflict permits another decision on a later changed same-UID event.
+// Cancellation or expiry stops submissions but cannot retract an in-flight write.
 func (w *PodEpochWatch) consume(ctx context.Context, body io.Reader, rv *string) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 4096), (2<<20)+1)

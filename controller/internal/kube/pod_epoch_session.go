@@ -923,6 +923,8 @@ func podEpochFailureReason(err error) string {
 // Deliver consumes one decision under the reset fence, held through the API
 // call and outcome classification. Only a conflict permits a later changed
 // watch object to issue another decision; the same decision never retries.
+// The budget bounds new submissions, not server commits: an already-submitted
+// request can still commit after cancellation, expiry or Reset.
 func (s *PodEpochSession) Deliver(ctx context.Context, d *PodEpochDecision) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
