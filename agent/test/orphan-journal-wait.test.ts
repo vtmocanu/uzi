@@ -229,6 +229,7 @@ it("orphan journal reread: cancellation leaves the queued read inert and owner b
   try {
     await queued.promise;
     const before = materialize.mock.callCount();
+    assert.ok(before > 0, "the spy observed the initial journal read, so an unchanged count is meaningful");
     f.cancel();
     assert.equal((await rejectedWhileHeld(attempt)).constructor.name, "RetainedRecoveryCancelled");
     assert.equal(materialize.mock.callCount(), before, "cancelled waiter never reads the journal");
@@ -266,6 +267,7 @@ it("orphan journal reread: the remaining handoff allowance bounds an already que
     assert.equal(rejected.constructor.name, "RetainedRecoveryStop");
     assert.equal(reads, 2, "the optional reread started while allowance remained");
     const before = materialize.mock.callCount();
+    assert.ok(before > 0, "the spy observed the initial journal read, so an unchanged count is meaningful");
     f.assertUnchanged();
     await f.release();
     await new Promise<void>(resolve => setImmediate(resolve));
