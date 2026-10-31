@@ -31,7 +31,7 @@ func TestPodEpochRuntimeRoll(t *testing.T) {
 				}
 				h := newEpochHarness(t, x)
 				h.event(watch.Modified, epochTerminal(x))
-				e := h.assertDecision(h.event(watch.Added, epochPod(epochB)), !runtimeClass)
+				e := h.assertDecision(h.successor(epochPod(epochB)), !runtimeClass)
 				if runtimeClass {
 					return
 				}

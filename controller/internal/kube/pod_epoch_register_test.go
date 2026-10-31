@@ -46,7 +46,7 @@ func TestPodEpochRegister(t *testing.T) {
 				t.Fatal("generation changed on registration")
 			}
 			h.event(watch.Modified, epochTerminal(x))
-			h.assertDecision(h.event(watch.Added, epochPod(epochB)), !foreign)
+			h.assertDecision(h.successor(epochPod(epochB)), !foreign)
 		})
 	}
 	t.Run("new-registration-then-A-B", func(t *testing.T) {
@@ -62,7 +62,7 @@ func TestPodEpochRegister(t *testing.T) {
 		}
 		h.assertDecision(h.event(watch.Added, epochPod(epochA)), false)
 		h.event(watch.Modified, epochTerminal(epochPod(epochA)))
-		h.assertDecision(h.event(watch.Added, epochPod(epochB)), true)
+		h.assertDecision(h.successor(epochPod(epochB)), true)
 	})
 	t.Run("ambiguous-baseline", func(t *testing.T) {
 		h := newEpochHarness(t)
@@ -100,7 +100,7 @@ func TestPodEpochResolverLists(t *testing.T) {
 		h := newEpochHarness(t, epochPod(epochA))
 		h.client.ClearActions()
 		h.event(watch.Modified, epochTerminal(epochPod(epochA)))
-		h.assertDecision(h.event(watch.Added, epochPod(epochB)), true)
+		h.assertDecision(h.successor(epochPod(epochB)), true)
 		lists := 0
 		for _, a := range h.client.Actions() {
 			if a.GetVerb() == "get" {
