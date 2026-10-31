@@ -19,3 +19,18 @@ A credential can be locally disabled without deleting its sealed material, bindi
 - D15: For a new explicit harness selection, no enabled default refuses creation. A new implicit harness selection may fall back to another usable harness. Existing runs retain their frozen harness and credential and wait when that credential is disabled.
 - D16: Reassignment is offered only on lanes that accept a per-run override.
 - D13 at dispatch (2026-09-27): a credential-specific Slack alert carries its fence (credential id, kind, enablement revision) through the notifier queue, and the notifier re-reads the credential immediately before posting, dropping the DM unless it is still the owner's, enabled, and at that revision. No lock is held across Slack I/O, so one bounded race remains: a disable that commits after that final read but before Slack accepts the post still delivers that one DM. The window is one Slack round trip, not the queue's dwell time, and nothing is re-sent.
+
+## Amendment: Codex account auto-selection (#3719, 2026-10-31)
+
+D13's closing sentence, "Codex readings feed no auto-selection", is superseded
+for users whose Codex account mode is `auto`: a run created for them scores its
+pooled accounts from the account's current Codex reading (see
+[ADR-1106](1106-codex-harness.md#amendment-codex-account-auto-selection-at-run-creation-3719-2026-10-31)).
+Everything else in D13 stands. The reading is still read only under the D13
+fence, so a reading that is not current (before a disable and re-enable, or
+after a newly linked alias) scores as unknown rather than steering the choice.
+A disabled alias is never selected (D1 and D5): pooling a disabled alias is
+refused, disabling a pooled alias removes it from the pool's candidates while
+keeping its consent flag (D8), and the creation transaction re-checks
+enablement under a share lock on the picked alias. Users in mode `default`
+are unaffected, and a run never changes account after creation (D3).
