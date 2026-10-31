@@ -12,7 +12,7 @@
 // spent the money, and a UI that reconstructed it would eventually disagree with it
 // while looking authoritative.
 
-import type { Run, SelectReason } from "./api";
+import type { CodexSelectReason, Run, SelectReason } from "./api";
 
 export interface CredentialDescription {
   /** The mode phrase shown after the label, e.g. "auto, 62% headroom". Empty for a
@@ -197,4 +197,87 @@ export function describeCredential(
   const mode = pct == null ? known.mode : `${known.mode}, ${pct}% headroom`;
   const tone = known.tone ?? "neutral";
   return { mode, hint: known.hint, tone, linked: tone !== "neutral", deleted };
+}
+
+// ── Codex (issue #3719) ───────────────────────────────────────────────────────────────
+//
+// WHY run creation bound the Codex login it bound, rendered from runs.codex_select_reason.
+// Same rules as the Anthropic map above: every string renders the server's record, the
+// map is EXHAUSTIVE over CodexSelectReason by type, and the runtime list is derived from
+// it (CODEX_SELECT_REASONS), so a guard test parsing migration 00387's CHECK reddens on a
+// reason the web cannot phrase.
+//
+// The Codex words differ from the Anthropic ones on purpose: Codex chooses at run
+// CREATION under the user's codex_account_mode (Settings → OpenAI / Codex credentials),
+// never at claim time by a worker binding, and no headroom is recorded on the run. Tones
+// follow the Anthropic rule: neutral where nothing is unusual, info where the run worked
+// and the news is worth reading, amber where auto could not rank or every login was spent.
+const CODEX_REASON_PHRASES: Record<CodexSelectReason, Phrase> = {
+  default: {
+    mode: "default",
+    hint: "Your Codex account mode is Default, so this run used your default Codex credential.",
+  },
+  pool_empty: {
+    // A fallback the user can act on (pool a login), hence info and a link.
+    mode: "default (auto: no pooled login)",
+    hint: "Your Codex account mode is Auto, but no Codex login was in the pool, so this run used your default Codex credential. Pool a login on Settings → OpenAI / Codex credentials to let uzi choose.",
+    tone: "info",
+  },
+  auto: {
+    mode: "auto",
+    hint: "When the run was created, uzi picked this pooled Codex login as the one with the most limit headroom.",
+  },
+  best_of_pool: {
+    mode: "auto (best of pool)",
+    hint: "Every pooled Codex login was low on limit headroom, so uzi picked the one with the most left. Your pool is nearly used up.",
+    tone: "info",
+  },
+  pool_stale: {
+    // Hedged like the Anthropic pool_stale: the missing reading can be the logins' (never
+    // polled yet) or the instance's (usage polling off), and this copy cannot tell which.
+    mode: "auto (no usage readings)",
+    hint: "No pooled Codex login had a current usage reading to rank on, so uzi picked one without ranking. Either uzi has not read those logins yet, or Codex usage polling is off for this instance.",
+    tone: "warning",
+  },
+  pool_exhausted: {
+    mode: "auto (every login at its limit)",
+    hint: "Every pooled Codex login was at its limit, cooling down or held by your weekly reserve, so uzi picked the one that frees up soonest. The run may wait for that login's limit to reset.",
+    tone: "warning",
+  },
+};
+
+/** CODEX_SELECT_REASONS is the Codex vocabulary at runtime, derived from the exhaustive
+ *  Record above for the same reason SELECT_REASONS is (no hand-typed mirror to forget). */
+export const CODEX_SELECT_REASONS = Object.keys(CODEX_REASON_PHRASES) as CodexSelectReason[];
+
+/** describeCodexCredential is describeCredential's Codex sibling. A NULL reason (a run
+ *  created before Codex account selection) renders the bare label with a "not recorded"
+ *  hint, the same stance the Anthropic chip takes for a run that recorded no mode: a
+ *  guessed "default" would assert something nothing knows. */
+export function describeCodexCredential(
+  run: Pick<Run, "codex_secret_id" | "codex_select_reason">,
+): CredentialDescription {
+  const deleted = run.codex_secret_id == null;
+  const reason = run.codex_select_reason;
+  if (reason == null || reason === "") {
+    return {
+      mode: "",
+      hint: "The Codex credential this run is bound to. How it was chosen was not recorded: the run predates Codex account selection.",
+      tone: "neutral",
+      linked: false,
+      deleted,
+    };
+  }
+  const known = CODEX_REASON_PHRASES[reason as CodexSelectReason];
+  if (!known) {
+    return {
+      mode: reason,
+      hint: `This uzi build does not recognise the Codex selection reason “${reason}”. It is shown as-is rather than guessed at.`,
+      tone: "neutral",
+      linked: false,
+      deleted,
+    };
+  }
+  const tone = known.tone ?? "neutral";
+  return { mode: known.mode, hint: known.hint, tone, linked: tone !== "neutral", deleted };
 }
