@@ -5722,8 +5722,9 @@ export class CodexExecutor implements Executor {
       // PRD #3244 M2: every root thread/start and thread/resume reports the thread's resolved config,
       // once its first turn/start is accepted (D30), against the entry bound here; the reporter
       // dedupes an unchanged reading per entry.
+      // An inactive or disabled reporter gets no entry and hands the harness no runtime-config callback.
       let onRuntimeConfig: RunTurnRequest["onRuntimeConfig"];
-      if (ctx.leadConfig) {
+      if (ctx.leadConfig?.enabled) {
         const reporter = ctx.leadConfig;
         const entry = await reporter.enterPhase(phase, this.leadRequestFor(ctx, phase));
         onRuntimeConfig = (obs) => {

@@ -27672,8 +27672,18 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
     const { posts, reporter } = reporterRig(config);
     const rig = makeRig();
     rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    assert.equal(reporter.enabled, false);
+    let entered = 0;
+    let observedCalls = 0;
+    const enterPhase = reporter.enterPhase.bind(reporter);
+    const observe = reporter.observe.bind(reporter);
+    reporter.enterPhase = (...args) => { entered++; return enterPhase(...args); };
+    reporter.observe = (...args) => { observedCalls++; return observe(...args); };
     const { ctx } = makeCtx({ config, leadConfig: reporter });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "inactive lead-config run");
     assert.equal(posts.length, 0);
+    // An inactive reporter gets no entry and the harness gets no runtime-config callback.
+    assert.equal(entered, 0);
+    assert.equal(observedCalls, 0);
   });
 });

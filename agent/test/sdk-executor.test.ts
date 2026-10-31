@@ -3105,6 +3105,25 @@ describe("SdkExecutor lead-config reporting (PRD #3244)", () => {
     assert.deepEqual(observed(posts[1]!), ["claude-opus-4-8", "claude_init", null, "unknown"]);
   });
 
+  it("an inactive reporter gets no phase entry and never probes getSettings", async () => {
+    const config = { default_model: "opus", default_effort: "medium" as const };
+    const { posts, make } = reporterRig();
+    const reporter = make(config);
+    assert.equal(reporter.enabled, false, "no default_effort_source: the reporter is inactive");
+    let entered = 0;
+    const enterPhase = reporter.enterPhase.bind(reporter);
+    reporter.enterPhase = (...args) => { entered++; return enterPhase(...args); };
+    const { queryFn, settingsCalls } = observedTurns(
+      [[initFrame(), submitPlan("plan"), resultSuccess()], [initFrame(), signalDone(), resultSuccess()]],
+      async () => ({ applied: { effort: "high" } }),
+    );
+    const { ctx } = makeCtx({ agents: [lead, coder], config, leadConfig: reporter }, approveWith("own"));
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(entered, 0);
+    assert.equal(settingsCalls(), 0, "a non-lead-config claim must not send the settings probe");
+    assert.equal(posts.length, 0);
+  });
+
   it("an init effort null is recorded as not sent, with claude_init evidence", async () => {
     const { posts, make } = reporterRig();
     const { queryFn } = observedTurns([[initFrame({ effort: null }), signalDone(), resultSuccess()]]);

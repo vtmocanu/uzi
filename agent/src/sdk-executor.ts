@@ -4912,9 +4912,10 @@ export class SdkExecutor implements Executor {
     // PRD #3244: record the lead's requested config for this phase before the turn starts. A new
     // entry only on a phase change (a re-driven turn of the same phase is a no-op); bounded to 3 s
     // inside the reporter, which never throws. A trip that landed meanwhile still wins below.
+    // An inactive or disabled reporter gets no entry and hands the harness no probe callback.
     let onRuntimeConfig: RunTurnRequest["onRuntimeConfig"];
     let markObserved: (() => void) | undefined;
-    if (ctx.leadConfig) {
+    if (ctx.leadConfig?.enabled) {
       const reporter = ctx.leadConfig;
       const entry: PhaseEntry = await reporter.enterPhase(phase, state.leadRequest);
       // PRD #3244 M2: only the first turn of a phase entry asks the runtime for its config, so the
