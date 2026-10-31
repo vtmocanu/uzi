@@ -1863,8 +1863,8 @@ type ProtectFinalClosureCaptureParams struct {
 
 // Closure-bearing twin of ProtectFinalInventoryCapture: requires prerequisites and an
 // exact still-pinned closure bound to this capture.
-// Precondition: the caller holds the worker, run, hold and capture rows FOR UPDATE and the
-// closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
+// Precondition: the caller holds the worker and run rows FOR UPDATE, the hold FOR NO KEY UPDATE,
+// the capture FOR UPDATE and the closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
 // serialize against closure state changes, so this query is only safe under those locks.
 func (q *Queries) ProtectFinalClosureCapture(ctx context.Context, arg ProtectFinalClosureCaptureParams) (int64, error) {
 	result, err := q.db.Exec(ctx, protectFinalClosureCapture,
@@ -2121,8 +2121,8 @@ type ReleaseFinalClosureHoldParams struct {
 
 // Archive-only release of a hold whose capture carries prerequisites, bound to its pinned closure.
 // Runs parked on an owner-only recovery_wait cause never release this way.
-// Precondition: the caller holds the worker, run, hold and capture rows FOR UPDATE and the
-// closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
+// Precondition: the caller holds the worker and run rows FOR UPDATE, the hold FOR NO KEY UPDATE,
+// the capture FOR UPDATE and the closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
 // serialize against closure state changes, so this query is only safe under those locks.
 func (q *Queries) ReleaseFinalClosureHold(ctx context.Context, arg ReleaseFinalClosureHoldParams) (int64, error) {
 	result, err := q.db.Exec(ctx, releaseFinalClosureHold,

@@ -670,6 +670,7 @@ func TestPrerequisiteClosureReleaseGuardLayersLiveDB(t *testing.T) {
 		"capture expired":            "expires_at=clock_timestamp()-interval '1 minute'",
 		"capture not manifest-bound": "manifest_bound=false",
 		"capture replica missing":    "local_replica_worker_id=NULL",
+		"capture retention unset":    "ready_retention_seconds=NULL",
 	}
 	for name, set := range captureCases {
 		t.Run(name, func(t *testing.T) {
@@ -678,6 +679,42 @@ func TestPrerequisiteClosureReleaseGuardLayersLiveDB(t *testing.T) {
 			refused(t, f, f.closure.ID)
 		})
 	}
+	// The release's own source and digest must equal the capture's; only one differs per case.
+	for name, c := range map[string][2]string{
+		"wrong final_source_sha":      {strings.Repeat("d", 40), closureDigest},
+		"wrong final_coverage_digest": {closureSource, strings.Repeat("d", 64)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := closureReady(t, ctx, prerequisiteNew(t, ctx, pool))
+			before := closureHoldSnapshot(t, ctx, f)
+			tag, err := pool.Exec(ctx, `UPDATE recovery_custody_holds SET state='released',live_worker_id=NULL,live_run_id=NULL,
+                final_disposition='archive',final_capture_id=$2,final_source_sha=$3,final_coverage_digest=$4,
+                release_evidence='prerequisite_closure',final_closure_id=$5,released_at=now() WHERE id=$1`,
+				f.hold, f.capture, c[0], c[1], f.closure.ID)
+			if err != nil || tag.RowsAffected() != 0 {
+				t.Fatalf("guard must refuse with 0 rows and no error: rows=%d err=%v", tag.RowsAffected(), err)
+			}
+			if after := closureHoldSnapshot(t, ctx, f); after != before {
+				t.Fatalf("refused write changed the hold:\n%s\n%s", before, after)
+			}
+		})
+	}
+	t.Run("closure_disposition_check on an open hold updated in place", func(t *testing.T) {
+		// The hold stays open with no disposition, so the guard returns NEW and the foreign key
+		// skips the row (final_capture_id is NULL, MATCH SIMPLE): only the CHECK refuses it.
+		f := closureReady(t, ctx, prerequisiteNew(t, ctx, pool))
+		before := closureHoldSnapshot(t, ctx, f)
+		tag, err := pool.Exec(ctx, `UPDATE recovery_custody_holds SET final_closure_id=$2,
+            release_evidence='prerequisite_closure' WHERE id=$1`, f.hold, f.closure.ID)
+		heldCheckName(t, err, "recovery_custody_holds_closure_disposition_check")
+		var p *pgconn.PgError
+		if !errors.As(err, &p) || p.Code != "23514" || tag.RowsAffected() != 0 {
+			t.Fatalf("want SQLSTATE 23514 and 0 rows: rows=%d err=%v", tag.RowsAffected(), err)
+		}
+		if after := closureHoldSnapshot(t, ctx, f); after != before {
+			t.Fatalf("refused write changed the hold:\n%s\n%s", before, after)
+		}
+	})
 	t.Run("capture never protected", func(t *testing.T) {
 		f := prerequisiteNew(t, ctx, pool)
 		prerequisitePin(t, ctx, f)

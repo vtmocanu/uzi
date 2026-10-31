@@ -950,8 +950,8 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
 -- name: ProtectFinalClosureCapture :execrows
 -- Closure-bearing twin of ProtectFinalInventoryCapture: requires prerequisites and an
 -- exact still-pinned closure bound to this capture.
--- Precondition: the caller holds the worker, run, hold and capture rows FOR UPDATE and the
--- closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
+-- Precondition: the caller holds the worker and run rows FOR UPDATE, the hold FOR NO KEY UPDATE,
+-- the capture FOR UPDATE and the closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
 -- serialize against closure state changes, so this query is only safe under those locks.
 UPDATE recovery_captures c SET local_replica_worker_id = @worker_id::uuid,
     ready_retention_seconds = @retention_seconds::bigint, updated_at = now()
@@ -968,8 +968,8 @@ WHERE c.id = @id AND c.hold_id = @hold_id AND c.original_worker_id = @worker_id:
 -- name: ReleaseFinalClosureHold :execrows
 -- Archive-only release of a hold whose capture carries prerequisites, bound to its pinned closure.
 -- Runs parked on an owner-only recovery_wait cause never release this way.
--- Precondition: the caller holds the worker, run, hold and capture rows FOR UPDATE and the
--- closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
+-- Precondition: the caller holds the worker and run rows FOR UPDATE, the hold FOR NO KEY UPDATE,
+-- the capture FOR UPDATE and the closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
 -- serialize against closure state changes, so this query is only safe under those locks.
 UPDATE recovery_custody_holds h SET state = 'released', live_worker_id = NULL, live_run_id = NULL,
     final_disposition = 'archive', final_capture_id = @final_capture_id::uuid,
