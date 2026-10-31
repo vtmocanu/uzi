@@ -1091,7 +1091,9 @@ and authority falls back to `unproven` when the pass is invalidated
   `strict_plain`. Each `list` entry (up to **32**, present first) adds `presence`
   and `basis`. `kept = examined - would_delete - would_settle`. A path seen with
   conflicting presence, run, basis or bytes, or also named by a refused group, is
-  kept.
+  kept. `journal_extra_fields` counts candidates that are marker-less canonical
+  sources whose plain journal carries fields beyond `runId` and `clonePath`; they
+  keep their existing `discard` basis and are listed for hand review before M1b.
 
 The cross-checks have limits. Matching observations never prove the
 unobservable OCI-handler, crun/conmon, NRI, attachment or ownership-walk facts,
