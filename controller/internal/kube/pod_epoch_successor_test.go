@@ -340,24 +340,17 @@ func TestPodEpochSuccessorPendingBudget(t *testing.T) {
 	if r.pending == nil || r.pendingCost < 500 {
 		t.Fatalf("pending not charged or too small to discriminate: %d", r.pendingCost)
 	}
-	// Control: the same successor Added against an unproven predecessor yields a
-	// negative with no pending proof. Everything else charged is identical, so the
-	// difference between the two session totals is exactly the pending charge.
-	neg := newEpochHarness(t, epochPod(epochA))
-	negBefore := neg.session.bytes
-	neg.event(watch.Added, epochPod(epochB))
-	if neg.session.records[epochB].pending != nil {
-		t.Fatal("control kept a pending proof")
-	}
-	if got, want := (h.session.bytes-before)-(neg.session.bytes-negBefore), r.pendingCost; got != want {
-		t.Fatalf("session total grew %d more than the control, want pending cost %d", got, want)
-	}
 	charged := h.session.bytes
-	h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
-	// The Modified status adds a few hundred bytes of raw JSON, far less than the
-	// pending proof, so the session total must fall once the entry is released.
-	if h.session.records[epochB].pending != nil || h.session.records[epochB].pendingCost != 0 || h.session.bytes >= charged {
-		t.Fatalf("pending bytes not released: before=%d charged=%d now=%d cost=%d", before, charged, h.session.bytes, r.pendingCost)
+	d := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
+	if r = h.session.records[epochB]; r.pending == nil || r.pendingCost == 0 || h.session.bytes <= charged {
+		t.Fatal("proof and issued document must stay charged before delivery")
+	}
+	h.assertDecision(d, true)
+	if r.pending != nil || r.pendingCost != 0 {
+		t.Fatal("proof not released on success")
+	}
+	if h.session.bytes >= charged {
+		t.Fatalf("payload not released: before=%d now=%d", before, h.session.bytes)
 	}
 
 	// Overflow on the pending charge invalidates the session like other retained data.
@@ -371,7 +364,7 @@ func TestPodEpochSuccessorPendingBudget(t *testing.T) {
 	}
 }
 
-func TestPodEpochSuccessorConflictConsumesSingleAttempt(t *testing.T) {
+func TestPodEpochSuccessorConflictRetriesOnlyLaterEvent(t *testing.T) {
 	h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 	h.event(watch.Added, epochPod(epochB))
 	d := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
@@ -391,7 +384,11 @@ func TestPodEpochSuccessorConflictConsumesSingleAttempt(t *testing.T) {
 	}
 	more := epochWithIDs(epochPod(epochB), "containerd://")
 	more.ResourceVersion += "/more"
-	if h.event(watch.Modified, more) != nil || requests != 1 {
-		t.Fatalf("requests=%d", requests)
+	next := h.event(watch.Modified, more)
+	if next == nil || requests != 1 {
+		t.Fatalf("later decision=%v requests=%d", next, requests)
+	}
+	if err := h.session.Deliver(context.Background(), next); !apierrors.IsConflict(err) || requests != 2 {
+		t.Fatalf("later conflict=%v requests=%d", err, requests)
 	}
 }
