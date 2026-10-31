@@ -1312,3 +1312,93 @@ test("drain receives the remaining pass deadline and is aborted when it expires"
   assert.equal(f.monitor.state.unconfirmedDrain, true);
   await f.monitor.stop();
 });
+
+async function observer(next: (id: number, time: number) => ReturnType<WorkerMemoryReader["sample"]>) {
+  const { WorkerMemoryMonitor } = await import("../src/worker-memory-guard.js");
+  const { WorkerMemoryCommands } = await import("../src/worker-memory-commands.js");
+  let time = 0;
+  let id = 0;
+  const timers = new Set<{ at: number; callback: () => void }>();
+  const unused = async (): Promise<never> => { throw new Error("no intervention expected"); };
+  const monitor = new WorkerMemoryMonitor(settings, {
+    commands: new WorkerMemoryCommands(), now: () => time, incarnation: () => undefined,
+    sample: () => next(++id, time),
+    timer: (callback, ms) => { const timer = { at: time + ms, callback }; timers.add(timer); return () => timers.delete(timer); },
+    reserve: unused, report: unused, feedback: unused, preserve: unused,
+  });
+  return { monitor, timers, advance: (ms: number) => { time += ms; for (const timer of timers) if (timer.at <= time) { timers.delete(timer); timer.callback(); } } };
+}
+
+test("observation counts every tick but advances validSeq only for a fresh available sample", async () => {
+  let mode: "ok" | "unavailable" | "stale" = "ok";
+  const o = await observer((id, time) => mode === "unavailable" ? { available: false, reason: "absent" } as never
+    : mode === "stale" ? sample(1, time) : sample(id, time));
+  const seen = () => { const { seq, validSeq } = o.monitor.observation; return { seq, validSeq }; };
+  assert.deepEqual(seen(), { seq: 0, validSeq: 0 });
+  o.monitor.tick();
+  assert.deepEqual(seen(), { seq: 1, validSeq: 1 });
+  mode = "unavailable";
+  o.advance(10); o.monitor.tick();
+  assert.deepEqual(seen(), { seq: 2, validSeq: 1 }, "unavailable sample is not a valid current sample");
+  mode = "stale"; // sampleId 1 replays: guard inhibits, so no valid sample
+  o.advance(10); o.monitor.tick();
+  assert.deepEqual(seen(), { seq: 3, validSeq: 1 }, "inhibited sample is not a valid current sample");
+  mode = "ok";
+  o.advance(10); o.monitor.tick();
+  assert.deepEqual(seen(), { seq: 4, validSeq: 4 });
+  assert.deepEqual({ armed: o.monitor.observation.armed, pending: o.monitor.observation.pendingIntervention }, { armed: true, pending: false });
+  await o.monitor.stop();
+});
+
+test("waitSample resolves on a newer tick, times out at the deadline and leaves no timer behind", async () => {
+  const o = await observer((id, time) => sample(id, time));
+  o.monitor.tick();
+  assert.equal(await o.monitor.waitSample(0, 1000), "sample", "an already newer tick resolves at once");
+  const woken = o.monitor.waitSample(1, 1000);
+  assert.equal(o.timers.size, 1);
+  o.advance(5); o.monitor.tick();
+  assert.equal(await woken, "sample");
+  assert.equal(o.timers.size, 0, "the deadline timer is released when a sample wins");
+  const late = o.monitor.waitSample(2, 100 + 5);
+  o.advance(100);
+  assert.equal(await late, "timeout");
+  assert.equal(o.timers.size, 0);
+  assert.equal(await o.monitor.waitSample(2, 0), "timeout", "an elapsed deadline times out without a timer");
+  await o.monitor.stop();
+});
+
+test("waitSample is aborted by a signal or a stopped monitor and removes its listener", async () => {
+  const o = await observer((id, time) => sample(id, time));
+  const controller = new AbortController();
+  const waiting = o.monitor.waitSample(0, 1000, controller.signal);
+  controller.abort();
+  assert.equal(await waiting, "aborted");
+  assert.equal(o.timers.size, 0);
+  assert.equal(await o.monitor.waitSample(0, 1000, controller.signal), "aborted", "an already aborted signal");
+  const pendingStop = o.monitor.waitSample(0, 1000);
+  await o.monitor.stop();
+  assert.equal(await pendingStop, "aborted");
+  assert.equal(o.timers.size, 0);
+  assert.equal(await o.monitor.waitSample(0, 1000), "aborted", "a stopped monitor");
+});
+
+test("a disarmed guard rearms only inside evaluate after the ticket resolves and the quiet dwell passes", async () => {
+  const f = await fixture({ autoReserve: true });
+  try {
+    f.monitor.tick();
+    await f.monitor.settle();
+    await until(() => f.reports.length === 1 && f.monitor.state.unresolvedOutcome === false);
+    assert.equal(f.monitor.observation.armed, false);
+    const base = f.monitor.observation;
+    f.usage(100); f.advance(1);
+    const woken = f.monitor.waitSample(base.seq, 10_000);
+    f.monitor.tick();
+    assert.equal(await woken, "sample");
+    assert.equal(f.monitor.observation.validSeq, base.seq + 1);
+    assert.equal(f.monitor.observation.armed, false, "a fresh valid sample alone never rearms");
+    f.advance(100);
+    f.monitor.tick();
+    assert.equal(f.monitor.observation.armed, true, "rearm happened inside evaluate after the dwell");
+    assert.equal(f.monitor.observation.pendingIntervention, false);
+  } finally { await f.monitor.stop(); }
+});

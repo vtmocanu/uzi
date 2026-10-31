@@ -1518,6 +1518,18 @@ export class ForeignRetainedRecoveryError extends Error {
 }
 
 /**
+ * issue #3639: why {@link GitCache.discoverRetainedRecovery} in expected-receipt mode found the retained journal is not
+ * the one a settled memory-park receipt names. Terminal for every caller: the message carries no deadline text, so
+ * the runner's retained-discovery classifier never treats it as retryable.
+ */
+export class MemoryReceiptSourceError extends Error {
+  constructor(readonly reason: "absent" | "foreign" | "changed") {
+    super(`memory receipt source ${reason}`);
+    this.name = "MemoryReceiptSourceError";
+  }
+}
+
+/**
  * issue #2886: a bare cache directory named by the bounded `uzi-sha256-<hex>.git` form does not
  * provably belong to the origin being asked for (stored origin missing, duplicated, unreadable or
  * different, or the path is not a bare). Fail closed: nothing is fetched, deleted or rewritten.
@@ -7104,6 +7116,7 @@ export class GitCache {
    * Confirmation here re-syncs and re-reads, but it is not independent of the journal: it proves only that the
    * journal's own bytes are durable and stable. An authoritative consumer (#3639) must bind `expected` to a reference
    * obtained independently of this journal (for example the server's accepted park binding).
+   * {@link GitCache.discoverRetainedRecovery} with `expected` is the read-only, non-healing form of that comparison.
    */
   async readConfirmedMemoryPark(
     barePath: string, branch: string, expected: { runId: string; clonePath: string; attemptId?: string; record: MemoryParkRecord },
@@ -7456,9 +7469,9 @@ export class GitCache {
 
   private async checkedRecovery(
     barePath: string, branch: string, key: string, expected: RecoverySource, allowMissing = false,
-    detached?: RecoveryJournalEntry,
+    detached?: RecoveryJournalEntry, allowLegacyRepair = true,
   ): Promise<RecoveryJournalEntry> {
-    const { journal, repair } = await this.attributedRecovery(barePath, branch, key, expected, detached, true);
+    const { journal, repair } = await this.attributedRecovery(barePath, branch, key, expected, detached, allowLegacyRepair);
     let missing = false;
     // One pass over the recorded sources, no retries. Any unsafe sibling refuses discovery.
     for (const source of this.recoverySources(journal)) {
@@ -7810,9 +7823,17 @@ export class GitCache {
   }
 
   /** Credential-free discovery before ensureClone/preflight. No remote reads or creation.
-   * A recorded successor is evidence only: every claim must reserve a new iteration. */
+   * A recorded successor is evidence only: every claim must reserve a new iteration.
+   *
+   * issue #3639: with `expected` (a settled memory-park receipt's source binding; `memoryPark` is the
+   * {@link serializeMemoryPark} bytes) this is strictly read-only and exact. After the origin check and the journal
+   * read, and before anything could be healed or repaired, no stored journal throws
+   * {@link MemoryReceiptSourceError} `absent`, another run's `foreign`, and a different clone path, attempt id or
+   * memory-park record `changed`. A stopped-journal heal and a legacy attribution repair (a ledger append) are never
+   * attempted; a journal that needs either throws instead. Without `expected` behaviour is unchanged. */
   async discoverRetainedRecovery(
     repoUrl: string, branch: string, key: string, runId: string,
+    expected?: { runId: string; clonePath: string; attemptId: string; memoryPark: string },
   ): Promise<{ barePath: string; journal: RecoveryJournalEntry } | undefined> {
     const barePath = this.barePathFor(repoUrl);
     if (!await this.pathPresent(barePath)) return undefined;
@@ -7820,6 +7841,19 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       await this.assertBareOriginIdentity(barePath, repoUrl);
       const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
+      if (expected) {
+        if (!stored) throw new MemoryReceiptSourceError("absent");
+        const read = stored.journal;
+        if (read.runId !== expected.runId) throw new MemoryReceiptSourceError("foreign");
+        if (read.clonePath !== expected.clonePath || read.attemptId !== expected.attemptId ||
+            read.memoryPark === undefined || serializeMemoryPark(read.memoryPark) !== expected.memoryPark) {
+          throw new MemoryReceiptSourceError("changed");
+        }
+        await this.assertNoStoppedMarker(barePath, read.clonePath, read);
+        if (read.runId !== runId) throw new ForeignRetainedRecoveryError();
+        await this.checkedRecovery(barePath, branch, key, read, false, undefined, false);
+        return { barePath, journal: read };
+      }
       if (!stored) return undefined;
       const journal = stored.journal;
       // issue #1786: a pending plain journal that a VALID marker names exactly (same run and path,

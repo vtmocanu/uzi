@@ -4,7 +4,7 @@ import type { Config } from "./config.js";
 import type { Logger } from "./log.js";
 import type { MemoryPolicy, WorkerMemoryPressureResult } from "./protocol.js";
 import { WorkerMemoryCommands } from "./worker-memory-commands.js";
-import { WorkerMemoryMonitor, isMarker, realPressure } from "./worker-memory-guard.js";
+import { WorkerMemoryMonitor, isMarker, realPressure, type SampleWait } from "./worker-memory-guard.js";
 import { WorkerMemoryReader } from "./worker-memory-reader.js";
 
 type Context = ReturnType<WorkerMemoryCommands["begin"]>;
@@ -27,6 +27,7 @@ export class WorkerMemoryRuntime {
   readonly configuredMemoryPolicy: Readonly<MemoryPolicy>;
   private readonly sinks = new WeakMap<Context, Sinks>();
   private readonly monitor: WorkerMemoryMonitor;
+  private readonly clock: () => number;
   private readonly invalidationListeners = new Set<() => void>();
 
   subscribeInvalidation(callback: () => void): () => void {
@@ -97,9 +98,10 @@ export class WorkerMemoryRuntime {
       }
       return sample;
     };
+    this.clock = options.now ?? (() => performance.now());
     this.monitor = new WorkerMemoryMonitor(settings, {
       sample: sampleWithDiagnostics,
-      now: options.now ?? (() => performance.now()),
+      now: this.clock,
       commands: this.commands,
       incarnation: () => client.memoryIncarnation,
       subscribeInvalidation: (callback) => client.subscribeMemoryInvalidation(() => {
@@ -140,6 +142,15 @@ export class WorkerMemoryRuntime {
   }
 
   run(): Promise<void> { return this.monitor.run(); }
+
+  /** Read-only guard counters for owner gates; grants no authority (see WorkerMemoryMonitor.observation). */
+  guardObservation(): WorkerMemoryMonitor["observation"] { return this.monitor.observation; }
+  /** Waits for a guard tick newer than afterSeq; holds no context, latch or authority. */
+  waitGuardSample(afterSeq: number, deadline: number, signal?: AbortSignal): Promise<SampleWait> {
+    return this.monitor.waitSample(afterSeq, deadline, signal);
+  }
+  /** The injectable monotonic clock the guard deadlines are measured against. */
+  now(): number { return this.clock(); }
   // Worker invokes stop before awaiting any runner cancellation. Monitor.stop
   // invalidates the registry synchronously, then joins its bounded work. Unsettled
   // sink receipts remain owned here after stop; abort is advisory, not settlement.

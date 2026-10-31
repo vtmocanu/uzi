@@ -217,6 +217,7 @@ type Authority = Readonly<{
   incarnation: MemoryIncarnation;
   sample: Available;
 }>;
+export type SampleWait = "sample" | "timeout" | "aborted";
 type Journal = Readonly<{ request: Readonly<MemoryReservationRequest>; status: "pending" | "ambiguous" | "admitted" | "denied"; outcome?: MemoryOutcome }>;
 
 /** Worker-owned async orchestration. Each IO races an independent deadline even
@@ -238,6 +239,9 @@ export class WorkerMemoryMonitor {
   private readonly unsubscribeDrain: () => void;
   private running: Promise<void> | undefined;
   private interruptWait: (() => void) | undefined;
+  private sampleSeq = 0;
+  private validSeq = 0;
+  private readonly sampleWaiters = new Set<(outcome: SampleWait | undefined) => void>();
 
   constructor(private readonly config: Settings, private readonly ports: {
     sample: () => Sample;
@@ -270,6 +274,36 @@ export class WorkerMemoryMonitor {
   get history(): readonly Journal[] { return Object.freeze([...this.journal]); }
   get state() { return this.guard.state; }
   get busy(): boolean { return this.pending !== undefined; }
+
+  /** Read-only view of the tick counters. `validSeq` equals `seq` only when the latest tick produced an
+   *  available, non-inhibited sample; a smaller `validSeq` means the current sample is not usable. */
+  get observation(): Readonly<{ seq: number; validSeq: number; armed: boolean; pendingIntervention: boolean }> {
+    const { armed, pendingIntervention } = this.guard.state;
+    return Object.freeze({ seq: this.sampleSeq, validSeq: this.validSeq, armed, pendingIntervention });
+  }
+
+  /** Waits for a tick newer than `afterSeq`. Holds no context, latch or authority and begins no capture;
+   *  the timer and listener are always released. A stopped monitor or an aborted signal yields "aborted". */
+  waitSample(afterSeq: number, deadline: number, signal?: AbortSignal): Promise<SampleWait> {
+    if (this.closed || signal?.aborted) return Promise.resolve("aborted");
+    if (this.sampleSeq > afterSeq) return Promise.resolve("sample");
+    const ms = Math.floor(deadline - this.ports.now());
+    if (!(ms >= 1)) return Promise.resolve("timeout");
+    return new Promise<SampleWait>((resolve) => {
+      let clear = () => {};
+      const finish = (outcome: SampleWait | undefined) => {
+        clear();
+        signal?.removeEventListener("abort", onAbort);
+        this.sampleWaiters.delete(listener);
+        resolve(outcome ?? "aborted");
+      };
+      const onAbort = () => finish("aborted");
+      const listener = (outcome: SampleWait | undefined) => finish(outcome);
+      this.sampleWaiters.add(listener);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      clear = this.timer(() => finish("timeout"), Math.min(ms, 2147483647));
+    });
+  }
 
   private timer(callback: () => void, ms: number): () => void {
     if (this.ports.timer) return this.ports.timer(callback, ms);
@@ -306,6 +340,16 @@ export class WorkerMemoryMonitor {
   /** Synchronous fast lane: never awaits network, observation, cancellation or reports. */
   tick(): void {
     if (this.closed) return;
+    let fresh = false;
+    try { this.observe(() => { fresh = true; }); }
+    finally {
+      this.sampleSeq++;
+      if (fresh) this.validSeq = this.sampleSeq;
+      for (const waiter of this.sampleWaiters) waiter("sample");
+    }
+  }
+
+  private observe(markFresh: () => void): void {
     const input = this.ports.sample();
     const now = this.ports.now();
     const pressure = this.pressure.evaluate(input, now);
@@ -313,6 +357,7 @@ export class WorkerMemoryMonitor {
     this.latest = pressure.kind !== "inhibited" && input.available ? {
       ...input, stat: { ...input.stat }, pressure: copyPressure(input.pressure),
     } : undefined;
+    if (this.latest) markFresh();
     const decision = this.guard.evaluate(input, now);
     if (decision.kind === "rearmed" && this.held) {
       this.ports.commands.releaseLatch(this.held.latch);
@@ -350,6 +395,7 @@ export class WorkerMemoryMonitor {
   async stop(): Promise<void> {
     this.closed = true;
     this.interruptWait?.();
+    for (const waiter of this.sampleWaiters) waiter(undefined);
     this.ports.commands.shutdown(); // invalidate authority before the first await
     this.unsubscribe?.();
     this.unsubscribe = undefined;
