@@ -555,9 +555,44 @@ export const CLAUDE_GUARDED_COMMAND_APPEND = [
   "Inline output is capped at 30000 characters with a preview; the full output goes to a spill",
   "file capped at 64 MiB, and output beyond that is truncated, so the spill is bounded and not a",
   "promise of full output. At most 8 commands run at once and further calls are refused: wait for",
-  "one to finish. The Monitor tool is unavailable. If required work needs a role that is",
-  "unavailable on this run, do not substitute another role: a subagent reports it to the lead, and",
-  "the lead raises it with the owner via ask_user.",
+  "one to finish. Bash calls one agent issues together run one after another, not at once (the",
+  "8-command cap counts all agents on the run), each against its own deadline: size each",
+  "command's `timeout` for that command alone. The Monitor tool is unavailable. If required work",
+  "needs a role that is unavailable on this run, do not substitute another role: a subagent",
+  "reports it to the lead, and the lead raises it with the owner via ask_user.",
+].join("\n");
+
+/**
+ * Issue #3722: integration-gate execution for a guard-bound Claude LEAD only, pushed by
+ * buildLeadSystemPrompt right after {@link CLAUDE_GUARDED_COMMAND_APPEND}. The guarded tool
+ * (claude-command/server.ts) declares no MCP annotations, and the bundled Claude Code CLI
+ * derives an MCP tool's `isConcurrencySafe()` from `annotations.readOnlyHint ?? false`, so it
+ * runs guarded shell calls one at a time and after any adjacent Agent batch. Delegating the
+ * gate into the review Agent batch restores the gate/review overlap that
+ * LEAD_GATE_SEQUENCING_APPEND asks for. Re-check `isConcurrencySafe` for SDK MCP tools on every
+ * SDK bump, and drop this append if the SDK exposes a supported overlap option.
+ * Prompt-level guidance only; it changes no lane limit, deadline or grant.
+ */
+const CLAUDE_GUARDED_LEAD_GATE_APPEND = [
+  "Integration-gate execution on this lane. The CLI runs Bash calls issued together one after",
+  "another, and a Bash call placed after an Agent batch waits for that whole batch. When the",
+  "integration-gate sequencing policy calls for overlap, delegate the gate to one available",
+  "execution-capable subagent in the same Agent batch as the read-only review wave. The",
+  "costly-gate repair exception still applies: do not restart full gates alongside every repair",
+  "review.",
+  "- Name one gate owner. Keep the worktree frozen until it reports: no implementation wave runs",
+  "  meanwhile. The gate owner runs only the delegated integration checks, does not mutate the",
+  "  checkout, and adds no independent mutation proof or duplicate of another validator's",
+  "  executable work. It returns the tested revision, command, exit status and log path.",
+  "- This delegated run is the integration gate itself, not a validator's report, and keeps its",
+  "  full blocking authority. Before treating it as green, read the exit status and summary from",
+  "  the log it names. A missing log, a missing exit status or a different revision means the",
+  "  gate did not run.",
+  "- Do not send several long commands in one message expecting them to run together: they run",
+  "  in sequence, each against its own deadline.",
+  "- If no suitable subagent is available (for example every execution-capable role is withheld",
+  "  from this run), run the gate yourself after the wave.",
+  "This changes only who executes the gate; it overrides no other template instruction.",
 ].join("\n");
 
 /**
@@ -727,6 +762,9 @@ export function buildLeadSystemPrompt(
         ...opts.guardedCommand.unavailable.map((role) => `- ${role.name}: unavailable on this run: ${role.reason}`),
       ].join("\n"));
     }
+    // Issue #3722: guarded shell calls are serialized by the CLI, so the guarded lead
+    // overlaps the gate by delegating it. Unguarded prompts stay byte-identical.
+    if (opts.guardedCommand) parts.push(CLAUDE_GUARDED_LEAD_GATE_APPEND);
   }
   if (opts.harness === "codex") parts.push(CODEX_LONG_COMMAND_APPEND, CODEX_LEAD_DISPATCH_APPEND);
   if (resolveRunKind(opts.kind) === "issue") parts.push(PRD_LIFECYCLE_APPEND);
