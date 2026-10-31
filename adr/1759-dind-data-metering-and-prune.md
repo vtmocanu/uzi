@@ -359,3 +359,34 @@ leaves #3653 open and does not establish whole-#2257 acceptance.
 #2257 terminal/custody/volume/PVC authority remains unchanged. No threshold tuning
 is proposed; the historical 85-versus-90 cause is unknown. This checkpoint promises
 neither busy-worker reclaim nor hosted reclaimed bytes.
+
+## Owner decision — #3653 parked (2026-10-31)
+
+The maintainer kept D5's custody gate unchanged and parked #3653 (label `Later`). No builder-only exception was approved, and runtime behavior is unchanged.
+
+Why: a read-only sample of three persistent hosted docker-lane workers (2026-10-30, `docker system df` categories, which are not additive unique bytes) reported:
+
+| Worker | Images | Local volumes | Build cache |
+| --- | ---: | ---: | ---: |
+| A (highest DinD usage) | 13.34 GB | 6.37 GB | 0.842 GB |
+| B | 1.372 GB | 3.166 GB | 0.833 GB |
+| C | 1.397 GB | 3.714 GB | 0 GB |
+
+All cache records on A and B were `regular`. Reported build cache was under 1 GB per sampled worker; this is not a measurement of the physical bytes a prune would release. Images and volumes were the larger categories in this snapshot. The 2026-10-25 event separately recorded about 4.5 GB of builder-cache relief versus about 22 GB of image relief.
+
+These observations support prioritizing other cleanup paths, such as attempt-scoped Docker ownership (#3387). They do not establish the fleet's long-term pressure distribution. While tracked executions or running containers are present, the proposed custody-only exception would still defer, so it would provide no relief during those active intervals. A new held-custody prune path and its race tests are not justified by this evidence.
+
+Facts this decision relies on:
+
+- Custody never guaranteed build-cache durability. BuildKit's own garbage collection is enabled by default (pinned [Moby builder config](https://github.com/moby/moby/blob/3ce5872b7950c63ba2ffbc5123101019ff3e6682/daemon/config/builder.go#L85-L95)), and the rendered DinD configuration does not disable it. D5 blocks only uzi's explicit prune. That default is verified; how much native GC actually removes on hosted workers was not measured.
+- Losing unreferenced build cache is usually a slower rebuild. It is not always: a resume can fail when an input is unreachable (registry, credential or a nondeterministic generator), or when a build kept its only useful output in a cache mount. D7 classes this as scratch, but a future exception must accept it explicitly.
+- On `docker builder prune`, `until=` filters by last use. `type=regular` is accepted, but the negated `type!=exec.cachemount` selector is buildx-only: the pinned Engine rejects it (pinned [Engine filter translation](https://github.com/moby/moby/blob/3ce5872b7950c63ba2ffbc5123101019ff3e6682/daemon/internal/builder-next/builder.go#L664-L724)).
+
+**Revisit trigger.** Revisit when eligible builder cache could materially relieve custody-blocked pressure **and** the other admission gates (no tracked execution, no running container, claims drained, fresh known custody) would permit pruning at that moment.
+
+**If revisited.** The smallest candidate is a separately gated, regular-record-only, age-filtered builder prune (a new frozen argv row, no `--all`). Every existing exclusion stays, and unknown or stale custody is still refused. Image and volume prunes and #2257 recycling stay unchanged. It needs the owner's explicit acceptance of the scratch-loss boundary above, and tests covering:
+
+- argv support on the deployed Engine in both Docker postures;
+- held and unknown custody, and active BuildKit references;
+- claim, custody-change and competing-maintenance races;
+- measured filesystem relief.
