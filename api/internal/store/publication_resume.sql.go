@@ -225,15 +225,26 @@ WITH candidates AS MATERIALIZED (
     SELECT r.id FROM runs r
     JOIN run_publication_resume p ON p.run_id = r.id AND p.state = 'active' AND p.handoff IS NULL
     WHERE r.status = 'queued'
-      AND NOT EXISTS (
-          SELECT 1 FROM workers w
-          WHERE w.id = r.worker_id AND w.user_id = r.user_id
-            AND 'publication_resume_v1' = ANY(w.protocol_capabilities)
-            AND ((w.last_heartbeat_at IS NOT NULL AND w.last_heartbeat_at >= $1::timestamptz)
-                 OR (r.stale_requeue_generation = r.claim_generation
-                     AND COALESCE(r.status_since > $2::timestamptz, false))
-                 OR ((w.draining_since IS NOT NULL OR w.maintenance_phase IN ('requested','ready','stopping','recycling') OR w.maintenance_fenced)
-                     AND r.updated_at >= $3::timestamptz)))
+      AND (
+          -- The custodian is the side row's worker_id (runs.worker_id is cleared by the resume
+          -- writers); a NULL one is held.
+          p.worker_id IS NULL
+          OR NOT EXISTS (
+              SELECT 1 FROM workers w
+              WHERE w.id = p.worker_id AND w.user_id = r.user_id
+                AND 'publication_resume_v1' = ANY(w.protocol_capabilities)
+                AND ((w.last_heartbeat_at IS NOT NULL AND w.last_heartbeat_at >= $1::timestamptz)
+                     OR (r.stale_requeue_generation = r.claim_generation
+                         AND COALESCE(r.status_since > $2::timestamptz, false))
+                     OR ((w.draining_since IS NOT NULL OR w.maintenance_phase IN ('requested','ready','stopping','recycling') OR w.maintenance_fenced)
+                         AND r.updated_at >= $3::timestamptz)))
+          -- The affinity ceiling is its own conjunct: a draining or fenced custodian past it is
+          -- held whatever its heartbeat says, because ClaimRun refuses a fenced claimant.
+          OR EXISTS (
+              SELECT 1 FROM workers w
+              WHERE w.id = p.worker_id AND w.user_id = r.user_id
+                AND (w.draining_since IS NOT NULL OR w.maintenance_phase IN ('requested','ready','stopping','recycling') OR w.maintenance_fenced)
+                AND r.updated_at < $3::timestamptz))
     ORDER BY r.id
     FOR UPDATE OF r SKIP LOCKED
 ), held AS (
@@ -362,8 +373,9 @@ UPDATE run_publication_resume SET
     first_wait_at   = COALESCE(first_wait_at, $1::timestamptz),
     park_total      = park_total + 1,
     hold_reason     = $2::text,
-    handoff         = COALESCE($3::json, handoff)
-WHERE run_id = $4 AND state = 'active'
+    handoff         = $3::json,
+    worker_id       = $4::uuid
+WHERE run_id = $5 AND state = 'active'
 RETURNING run_id, enrollment_seq, claim_generation, worker_id, intent, candidate_seq, state, retired_reason, wait_started_at, first_wait_at, park_total, episode, hold_reason, handoff, created_at, updated_at
 `
 
@@ -371,18 +383,22 @@ type MarkPublicationParkedParams struct {
 	Now        pgtype.Timestamptz `json:"now"`
 	HoldReason pgtype.Text        `json:"hold_reason"`
 	Handoff    []byte             `json:"handoff"`
+	WorkerID   uuid.UUID          `json:"worker_id"`
 	RunID      uuid.UUID          `json:"run_id"`
 }
 
 // The side-row half of a publication park: the wait clock starts at the first park and is never
 // reset by a later one, the lifetime counters grow, and the hold reason is set only on an owner
-// hold (NULL for a timed retry). A handoff, when supplied, replaces the stored one. @now comes
-// from Go so the clock is deterministic.
+// hold (NULL for a timed retry). Each park sets the handoff to the newly verified value or NULL
+// (never keeps an older one, which could let a peer claim from a stale tip), and the custodian to
+// the reporting worker, which holds the captured source. @now comes from Go so the clock is
+// deterministic.
 func (q *Queries) MarkPublicationParked(ctx context.Context, arg MarkPublicationParkedParams) (RunPublicationResume, error) {
 	row := q.db.QueryRow(ctx, markPublicationParked,
 		arg.Now,
 		arg.HoldReason,
 		arg.Handoff,
+		arg.WorkerID,
 		arg.RunID,
 	)
 	var i RunPublicationResume

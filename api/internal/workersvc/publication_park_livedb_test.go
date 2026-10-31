@@ -446,8 +446,12 @@ func TestPublicationCustodianSweepLiveDB(t *testing.T) {
 		{"healthy custodian", func(f *publicationParkFixture) { healthy(f) }, false},
 		{"no custodian", func(f *publicationParkFixture) {
 			healthy(f)
-			f.env.exec(`UPDATE runs SET worker_id=NULL WHERE id=$1`, f.runID)
+			f.env.exec(`UPDATE run_publication_resume SET worker_id=NULL WHERE run_id=$1`, f.runID)
 		}, true},
+		{"runs.worker_id cleared by a resume writer, side custodian healthy", func(f *publicationParkFixture) {
+			healthy(f)
+			f.env.exec(`UPDATE runs SET worker_id=NULL WHERE id=$1`, f.runID)
+		}, false},
 		{"custodian lacks the capability", func(f *publicationParkFixture) {
 			healthy(f)
 			f.env.exec(`UPDATE workers SET protocol_capabilities=$2 WHERE id=$1`, f.workerID, []string{capability.RecoveryArchiveV1})
@@ -462,6 +466,24 @@ func TestPublicationCustodianSweepLiveDB(t *testing.T) {
 			f.env.exec(`UPDATE workers SET draining_since=$2, last_heartbeat_at=$3 WHERE id=$1`, f.workerID, f.clock.Add(-3*time.Hour), f.clock.Add(-10*time.Minute))
 			f.env.exec(`UPDATE runs SET updated_at=$2 WHERE id=$1`, f.runID, f.clock.Add(-3*time.Hour))
 		}, true},
+		{"draining beyond the ceiling with a fresh heartbeat", func(f *publicationParkFixture) {
+			healthy(f)
+			f.env.exec(`UPDATE workers SET draining_since=$2 WHERE id=$1`, f.workerID, f.clock.Add(-3*time.Hour))
+			f.env.exec(`UPDATE runs SET updated_at=$2 WHERE id=$1`, f.runID, f.clock.Add(-3*time.Hour))
+		}, true},
+		{"fenced beyond the ceiling with a fresh heartbeat", func(f *publicationParkFixture) {
+			healthy(f)
+			f.env.exec(`UPDATE workers SET maintenance_fenced=true WHERE id=$1`, f.workerID)
+			f.env.exec(`UPDATE runs SET updated_at=$2 WHERE id=$1`, f.runID, f.clock.Add(-3*time.Hour))
+		}, true},
+		{"fenced inside the ceiling with a fresh heartbeat", func(f *publicationParkFixture) {
+			healthy(f)
+			f.env.exec(`UPDATE workers SET maintenance_fenced=true WHERE id=$1`, f.workerID)
+		}, false},
+		{"draining inside the ceiling with a fresh heartbeat", func(f *publicationParkFixture) {
+			healthy(f)
+			f.env.exec(`UPDATE workers SET draining_since=$2 WHERE id=$1`, f.workerID, f.clock)
+		}, false},
 		{"handoff recorded", func(f *publicationParkFixture) {
 			f.env.exec(`UPDATE workers SET last_heartbeat_at=$2 WHERE id=$1`, f.workerID, f.clock.Add(-10*time.Minute))
 			f.env.exec(`UPDATE run_publication_resume SET handoff='{"checkpoint_tip":"`+pubHeadC+`"}'::json WHERE run_id=$1`, f.runID)

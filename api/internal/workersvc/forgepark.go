@@ -172,6 +172,11 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 	// so anything but one refuses the park (rollback → 409 custody_unsettled). Holding the row
 	// lock across the release stops a concurrent reconciler release from turning a verified single
 	// hold into zero between the count and the release.
+	//
+	// Lock order note: the documented order is worker, run, side row, custody, cooldown. This
+	// custody lock precedes the side-row read and write below, but the run row lock taken above
+	// serializes every writer of an enrolled run's side row and custody holds, so no writer can
+	// hold the side row and wait on custody while this one holds custody and waits on the side row.
 	holdIDs, err := qtx.LockOpenCustodyHoldsForRunWorkerGeneration(ctx, store.LockOpenCustodyHoldsForRunWorkerGenerationParams{
 		RunID:      run.ID,
 		Generation: *req.ClaimGeneration,
