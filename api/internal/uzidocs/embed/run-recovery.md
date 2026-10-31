@@ -1378,6 +1378,43 @@ available-archive disposal previously promised by Option D remains **deferred**
 to #2823 and #1373. This is partial, nonclosing #2506; see
 [ADR-2506](../adr/2506-merged-predecessor-discard.md) for polling and rollout limits.
 
+### Approved policy amendment: later same-issue merged run (2026-10-30)
+
+The approved #3654 policy adds a narrow exception for failed/cancelled issue runs with a
+positive own issue number, SQL-NULL recorded PR/MR and no `worker_active_runs`
+claim at any generation; `run_timeout` failures do not qualify. A distinct completed issue run
+of the same owner/repository/own issue, created strictly after the target's finite finish time,
+may serve as witness when its exact recorded PR/MR is freshly verified merged.
+Any eligible witness suffices; cached MR state does not.
+
+Locked rechecks refuse identity drift, a nonterminal run matching that issue
+(including continuations, pool-wait and task runs), uncertain/shared dependencies,
+or a `prepared`, `invoked` or `create_unknown` publication on any target hold
+at any generation.
+A valid released ancestry transfer within the terminal target stays unchanged
+and does not veto discard. Eligible OPEN holds through the target's terminal
+generation may be discarded, intentionally losing unique nonancestor, untracked
+or sibling work; this is not proof of preservation.
+
+Available archives keep bytes, prerequisites and their existing expiry, without
+a fresh retention window. A created, unacknowledged orphan with no receipt
+reference may be deleted through existing cleanup once no OPEN hold remains;
+acknowledged publications keep their existing TTL, and receipt-referenced publications keep their existing cleanup protection.
+There is no new worker deletion authority or source/PVC guarantee. Same-run
+Option D above, including issue-less runs, is unchanged.
+Generations are independent across runs:
+target A1 or A3 can qualify with witness B1. Non-ready capture settlement and
+partial-chunk cleanup commit atomically with discard. See the
+[ADR-2506 amendment](../adr/2506-merged-predecessor-discard.md#amendment-2026-10-30--same-issue-merged-witness-3654)
+for complete eligibility, conservative residuals, accepted races and bounded
+polling; immediate or eventual backlog convergence is not promised. Late MR
+reconciliation or a new live run inserted after the locked recheck remain
+accepted races; observed before that check, they refuse discard. Timeout targets
+and stalled prepared publications remain protected. The shared 30-second phase
+allows 100 repository visits and 100 transaction attempts, with five-second
+fresh forge observations. Inventory limits bound fetched work, not all SQL scans
+or production cost; forge response decoding has no new byte bound.
+
 ## Automatic settlement of an older held generation
 
 The ancestry settlement below applies to legacy, unguarded holds. Outside the

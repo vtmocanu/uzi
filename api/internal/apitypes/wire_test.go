@@ -1042,7 +1042,9 @@ func TestSelfUsageDTOTags(t *testing.T) {
 		// PRD #1429 M1 (D7): the per-window subscription/unreported run counts, so a mixed
 		// aggregate discloses that a non-metered component makes the dollar total incomplete.
 		"lifetime_subscription_run_count", "lifetime_unreported_run_count",
-		"last7_subscription_run_count", "last7_unreported_run_count")
+		"last7_subscription_run_count", "last7_unreported_run_count",
+		// Issue #3686: PRs uzi runs opened, both windows.
+		"lifetime_pr_count", "last7_pr_count")
 }
 
 func TestAdminUserUsageDTOTags(t *testing.T) {
@@ -1051,7 +1053,9 @@ func TestAdminUserUsageDTOTags(t *testing.T) {
 		// PRD #1293: this user's lifetime failed-run rate aggregate.
 		"outcomes",
 		// PRD #1429 M1 (D7): the user's lifetime subscription/unreported run counts.
-		"subscription_run_count", "unreported_run_count")
+		"subscription_run_count", "unreported_run_count",
+		// Issue #3686: this user's owned PRs, lifetime and last 7 days.
+		"pr_count", "last7_pr_count")
 }
 
 func TestAdminUsageDTOTags(t *testing.T) {

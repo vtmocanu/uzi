@@ -121,6 +121,12 @@ func (h *Handler) SelfUsage(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	prCounts, err := h.wsvc.SelfPRCounts(r.Context(), user.ID)
+	if err != nil {
+		slog.Error("self pr counts", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	httpx.JSON(w, http.StatusOK, apitypes.SelfUsageDTO{
 		Lifetime: apitypes.UsageDTO{
 			InputTokens:         row.LifetimeInputTokens,
@@ -152,6 +158,8 @@ func (h *Handler) SelfUsage(w http.ResponseWriter, r *http.Request) {
 		LifetimeUnreportedRunCount:   row.LifetimeUnreportedRunCount,
 		Last7SubscriptionRunCount:    row.Last7SubscriptionRunCount,
 		Last7UnreportedRunCount:      row.Last7UnreportedRunCount,
+		LifetimePRCount:              prCounts.LifetimePrCount,
+		Last7PRCount:                 prCounts.Last7PrCount,
 	})
 }
 
@@ -199,6 +207,24 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	// Issue #3686: PR counts, a separate scan over `runs` independent of run_usage_totals,
+	// merged into the rows by user id.
+	factoryPRs, err := h.wsvc.FactoryPRCounts(r.Context())
+	if err != nil {
+		slog.Error("admin factory pr counts", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	perUserPRs, err := h.wsvc.PRCountsPerUser(r.Context())
+	if err != nil {
+		slog.Error("admin pr counts per user", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	prsByUser := make(map[uuid.UUID]store.PRCountsPerUserRow, len(perUserPRs))
+	for _, p := range perUserPRs {
+		prsByUser[p.UserID] = p
+	}
 
 	// Index the per-user outcome counts (and their decoded lifetime origins) by user id, so
 	// a usage row can attach its outcomes.
@@ -223,7 +249,7 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 		originsByUser[o.UserID] = origins
 	}
 
-	users := make([]apitypes.AdminUserUsageDTO, 0, len(rows)+len(perUserOutcomes))
+	users := make([]apitypes.AdminUserUsageDTO, 0, len(rows)+len(perUserOutcomes)+len(perUserPRs))
 	seen := map[uuid.UUID]bool{}
 	for _, u := range rows {
 		seen[u.UserID] = true
@@ -249,6 +275,8 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			Last7UnreportedRunCount:   u.Last7UnreportedRunCount,
 			Last7Outcomes:             runOutcomes(oc.Last7Finished, oc.Last7Completed, oc.Last7Cancelled, oc.Last7PlanRejected, oc.Last7BaseDiverged, oc.Last7Failed, oc.Last7NeedsLanding, last7OriginsByUser[u.UserID]),
 			RunCount:                  u.RunCount,
+			PRCount:                   prsByUser[u.UserID].LifetimePrCount,
+			Last7PRCount:              prsByUser[u.UserID].Last7PrCount,
 			// PRD #1429 M1 (D7): the user's lifetime subscription/unreported run counts, so the
 			// admin per-user breakdown discloses a non-metered component like the factory total.
 			SubscriptionRunCount: u.SubscriptionRunCount,
@@ -264,6 +292,7 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 		if seen[oc.UserID] {
 			continue
 		}
+		seen[oc.UserID] = true
 		users = append(users, apitypes.AdminUserUsageDTO{
 			UserID:        oc.UserID.String(),
 			Email:         oc.Email,
@@ -271,11 +300,32 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			Last7Days:     &apitypes.UsageDTO{},
 			Last7Outcomes: runOutcomes(oc.Last7Finished, oc.Last7Completed, oc.Last7Cancelled, oc.Last7PlanRejected, oc.Last7BaseDiverged, oc.Last7Failed, oc.Last7NeedsLanding, last7OriginsByUser[oc.UserID]),
 			RunCount:      0,
+			PRCount:       prsByUser[oc.UserID].LifetimePrCount,
+			Last7PRCount:  prsByUser[oc.UserID].Last7PrCount,
 			// No usage row means no run_usage_totals rows, so both non-metered counts are zero.
 			SubscriptionRunCount: 0,
 			UnreportedRunCount:   0,
 			Outcomes: withFailureRecency(runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.LifetimeBaseDiverged, oc.Failed,
 				oc.NeedsLanding, originsByUser[oc.UserID]), oc.LastFailedAt, oc.LastFailedRunID, oc.LastFailedOrigin, oc.CompletedSinceLastFailure, uuid.Nil),
+		})
+	}
+	// Issue #3686: a PR owner absent from both the usage rows and the outcomes rows (for
+	// example a user whose only run is still running) gets a zero-usage row appended in
+	// user-id order, so the per-user PR counts still sum to the factory PR count.
+	for _, p := range perUserPRs {
+		if seen[p.UserID] {
+			continue
+		}
+		seen[p.UserID] = true
+		users = append(users, apitypes.AdminUserUsageDTO{
+			UserID:        p.UserID.String(),
+			Email:         p.Email,
+			Usage:         apitypes.UsageDTO{},
+			Last7Days:     &apitypes.UsageDTO{},
+			Last7Outcomes: runOutcomes(0, 0, 0, 0, 0, 0, 0, nil),
+			Outcomes:      runOutcomes(0, 0, 0, 0, 0, 0, 0, nil),
+			PRCount:       p.LifetimePrCount,
+			Last7PRCount:  p.Last7PrCount,
 		})
 	}
 	httpx.JSON(w, http.StatusOK, apitypes.AdminUsageDTO{
@@ -310,6 +360,8 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			LifetimeUnreportedRunCount:   totals.LifetimeUnreportedRunCount,
 			Last7SubscriptionRunCount:    totals.Last7SubscriptionRunCount,
 			Last7UnreportedRunCount:      totals.Last7UnreportedRunCount,
+			LifetimePRCount:              factoryPRs.LifetimePrCount,
+			Last7PRCount:                 factoryPRs.Last7PrCount,
 		},
 		Users:       users,
 		EarliestRun: timePtr(totals.EarliestRun.Valid, totals.EarliestRun.Time),

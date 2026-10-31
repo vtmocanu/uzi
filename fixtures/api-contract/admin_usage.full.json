@@ -56,7 +56,9 @@
     "lifetime_subscription_run_count": 1,
     "lifetime_unreported_run_count": 1,
     "last7_subscription_run_count": 1,
-    "last7_unreported_run_count": 1
+    "last7_unreported_run_count": 1,
+    "lifetime_pr_count": 1,
+    "last7_pr_count": 1
   },
   "users": [
     {
@@ -117,7 +119,9 @@
         }
       },
       "subscription_run_count": 1,
-      "unreported_run_count": 1
+      "unreported_run_count": 1,
+      "pr_count": 1,
+      "last7_pr_count": 1
     }
   ],
   "earliest_run": "2020-01-02T03:04:05Z"
