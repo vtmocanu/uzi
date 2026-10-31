@@ -366,8 +366,9 @@ func TestRecoveryPrerequisiteClosureUploadIntegrityLiveDB(t *testing.T) {
 	}
 }
 
-// A pinned row is deliberately insufficient in C1b. Assert the exact Go refusal
-// to distinguish the prerequisite check from the later SQL authorization refusal.
+// A pinned closure alone releases nothing: with no FINAL port wired (C2's closure-backed release
+// disabled) the thin FINAL keeps the exact manifest-conflict refusal and custody stays open.
+// The enabled path is covered by TestRecoveryClosureFinal*LiveDB.
 func TestRecoveryPrerequisiteClosurePinnedThinFinalLiveDB(t *testing.T) {
 	e := closureUploadEnv(t)
 	id := e.reserve("pinned-final")

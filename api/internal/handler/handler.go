@@ -543,6 +543,11 @@ func (h *Handler) recovery() *recovery.Service {
 				if lim := h.heldListLimiter; lim != nil {
 					h.recoverySvc.SetHeldListAllow(heldListAllowFor(lim))
 				}
+				// Closure-backed FINAL (issue #3727): the pin listing is request-owned and
+				// gated by its own per-worker bucket on the same limiter. Without a limiter
+				// the feature stays off (a nil allow denies).
+				h.recoverySvc.SetPrerequisiteFinal(prerequisiteFinalAdapter{svc: h.wsvc})
+				h.recoverySvc.SetPrerequisiteFinalAllow(prerequisiteFinalAllowFor(h.heldListLimiter))
 			}
 		}
 	})
@@ -1175,6 +1180,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 	// RecoveryService may already have initialized the shared instance for polling.
 	if h.recoverySvc != nil {
 		h.recoverySvc.SetHeldListAllow(heldListAllowFor(proposalLimiter))
+		h.recoverySvc.SetPrerequisiteFinalAllow(prerequisiteFinalAllowFor(proposalLimiter))
 	}
 	r.Route("/worker", func(r chi.Router) {
 		r.Use(mw.RequireWorker(h.q))

@@ -171,7 +171,8 @@ func TestPrerequisiteUploadKicksBrokerOnceLiveDB(t *testing.T) {
 			if rows != 1 || markers != 1 || sends != 1 || deletes != 0 || tip != prerequisiteTestTip || kicks.Load() != 1 || admitted.Load() != 1 {
 				t.Fatalf("rows=%d markers=%d sends=%d deletes=%d tip=%s kicks=%d admitted=%d", rows, markers, sends, deletes, tip, kicks.Load(), admitted.Load())
 			}
-			// Pinning prerequisites never makes a thin archive a self-contained FINAL.
+			// Pinning prerequisites never makes a thin archive a self-contained FINAL, and with no
+			// closure FINAL port wired on this service the release stays the exact refusal.
 			if _, err := r.svc.Release(ctx, r.worker, f.m.row.RunID, r.final); !errors.Is(err, recovery.ErrManifestConflict) {
 				t.Fatalf("thin FINAL: %v", err)
 			}
