@@ -202,17 +202,21 @@ it("R1 pending_all wire ceiling is 256 distinct tuples, independent of lease cap
       run_id: run, claim_generation: i + 1, phase: "running", since: 1, blocked: false, outcome_kind: "unknown" as const,
     }));
     const registry = new ActiveRunRegistry(() => [...entries, ...entries.map(p => ({ ...p, run_id: run.toUpperCase() }))], () => cap);
+    assert.equal(registry.claimsPausedByPendingOverflow(true), count > 256,
+      "unverified owners grant no invented capacity, but the absolute wire ceiling still pauses");
+    assert.equal(registry.notePolicyOwnership(run, count + 1), true, "capacity counts a positively observed current owner");
     for (const snapshot of [registry.buildRegisterSnapshot(), registry.build(), registry.build(true)]) {
       assert.equal(snapshot.pending_all?.length, count <= 256 ? count : undefined);
       assert.equal(snapshot.pending_overflow, true);
     }
     assert.equal(registry.claimsPausedByPendingOverflow(true), cap === 0 || count > 256,
-      "scoped claims require complete coverage as well as real capacity");
+      "scoped claims retain the wire ceiling and the positively owned capacity bound");
   }
   const incomplete = new ActiveRunRegistry(() => [], () => 1000, () => false);
   assert.equal(incomplete.build().pending_all, undefined);
   assert.equal(incomplete.build().pending_overflow, true);
-  assert.equal(incomplete.claimsPausedByPendingOverflow(), true);
+  assert.equal(incomplete.claimsPausedByPendingOverflow(), false, "incomplete coverage alone is not a local claim pause");
+  assert.equal(incomplete.claimsPausedByPendingOverflow(true), false);
   assert.deepEqual(new ActiveRunRegistry(() => [], () => 0).build().pending_all, []);
 });
 
