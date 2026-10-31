@@ -66,6 +66,7 @@ for (const failure of ["none", "snapshot", "cleanup"] as const) {
     };
     const outbox = {
       isDisabled: () => false, uncleanRuns: () => [], unclassifiedPolicyRunIds: () => [], runsWithPending: () => [],
+      listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => [], listPendingFinalizes: () => [],
     } as unknown as Outbox;
     const worker = new Worker(config, client, runner, {} as ChatRunner, {} as JudgeRunner,
@@ -137,6 +138,7 @@ for (const mode of ["deadline", "shutdown"] as const) {
       const config = loadConfig({ UZI_API_URL: "http://example.com", UZI_WORKER_TOKEN: "worker-token" });
       config.pollIntervalMs = config.chatPollMs = config.heartbeatIntervalMs = 2;
       const outbox = { isDisabled: () => false, uncleanRuns: () => [], unclassifiedPolicyRunIds: () => [], runsWithPending: () => [],
+        listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
         listPendingTerminals: () => [], listPendingFinalizes: () => [], } as unknown as Outbox;
       const worker = new Worker(config, client, runner, {} as ChatRunner, {} as JudgeRunner,
         {} as ReviewRunner, nullLogger(), () => ({ ok: true, missing: [] }), outbox,

@@ -278,6 +278,13 @@ interface TerminalMACBinding {
   readonly sha256: string;
 }
 
+/** Grouping evidence only; never authentication, a lease or unlink authority. */
+interface TerminalSourceBinding {
+  readonly generation: number;
+  readonly fileName: string;
+  readonly lifetime: string;
+}
+
 interface TerminalInspectionScope {
   runId: string;
   sourceKey?: string;
@@ -285,6 +292,7 @@ interface TerminalInspectionScope {
   since: number;
   provisional?: boolean;
   macBinding?: Readonly<TerminalMACBinding>;
+  sourceBinding?: Readonly<TerminalSourceBinding>;
 }
 
 /** In-memory metadata for one pending terminal journal (the file's durable fields minus the body,
@@ -517,7 +525,8 @@ export class Outbox {
 
   /** Coverage is available only after a bounded physical pass without skipped or mutated scope. */
   policyInventoryCoverageAvailable(): boolean {
-    return this.terminalInventoryComplete && !this.scopeProtected();
+    return this.terminalInventoryComplete && [...this.policyInspections.values()].every(scope =>
+      !scope.held || (!scope.provisional && !!(scope.macBinding ?? scope.sourceBinding)));
   }
   private readonly now: () => number;
   private readonly rawWrite: RawWriteSeam;
@@ -859,6 +868,13 @@ export class Outbox {
   // generation is attributed to a scope whose filename cannot establish one.
   private readonly policyInspections = new Map<symbol, TerminalInspectionScope>();
   private readonly targetProofs = new Map<string, Promise<boolean>>();
+  private readonly physicalSourceBindings = new WeakMap<TerminalAuthenticationObservation, Readonly<TerminalSourceBinding>>();
+
+  private hasCountedPhysicalScope(runId: string, fileName: string): boolean {
+    const sourceKey = createHash("sha256").update(fileName).digest("hex");
+    return [...this.policyInspections.values()].some(scope => scope.held && !scope.provisional &&
+      scope.runId === runId && scope.sourceKey === sourceKey);
+  }
 
   private scopeProtected(runId?: string): boolean {
     return [...this.policyInspections.values()].some(scope => scope.held &&
@@ -2150,6 +2166,20 @@ export class Outbox {
     return out;
   }
 
+  /** Preserve independent installed evidence and append retained physical sources.
+   * The registry deduplicates tuples at its wire boundary, after inspecting kind
+   * and settlement. A physical source never inherits another lifetime's authority. */
+  listPendingOutcomeSources(): PendingTerminal[] {
+    const pending = this.listPendingTerminals().map(entry => ({ ...entry, run_id: entry.run_id.toLowerCase() }));
+    for (const scope of this.policyInspections.values()) {
+      const binding = scope.macBinding ?? scope.sourceBinding;
+      if (!scope.held || scope.provisional || !binding) continue;
+      pending.push({ run_id: scope.runId.toLowerCase(), claim_generation: binding.generation, outcome_kind: "unknown",
+        phase: "policy_pending", blocked: false, since: scope.since });
+    }
+    return pending;
+  }
+
   /** Retire a terminal journal (the api applied the transition on a 200, or answered a 409 whose
    *  returned status is terminal): unlink the file and drop it from the pending set (D3). */
   async retireTerminal(runId: string, claimGeneration: number, _context?: ReportRetirementContext): Promise<boolean> {
@@ -2948,8 +2978,7 @@ export class Outbox {
     }
     const initial = generation === undefined ? undefined : this.runs.get(runId)?.terminals.get(generation);
     const sourceKey = createHash("sha256").update(fileName).digest("hex");
-    const ownedScope = [...this.policyInspections.values()].some(scope =>
-      scope.held && !scope.provisional && scope.runId === runId && scope.sourceKey === sourceKey);
+    const ownedScope = this.hasCountedPhysicalScope(runId, fileName);
     let represented = initial?.fileName === fileName;
     if (represented && initial?.outcomeKind === "terminal") {
       try {
@@ -3024,10 +3053,15 @@ export class Outbox {
       return result;
     }
     scope.provisional = false;
+    // Bind only this newly reserved inspection. A later observation at the same
+    // path cannot promote an older opaque obligation.
     if (result.observation.kind === "mac_failure") {
       scope.macBinding = this.copyMACBinding(result.observation);
       return result;
     }
+    const sourceBinding = this.physicalSourceBindings.get(result.observation);
+    if (sourceBinding && Buffer.byteLength(JSON.stringify({ ...scope, sourceBinding })) <= 1024)
+      scope.sourceBinding = sourceBinding;
     // Transfer without yielding. A different filename in the selected slot is
     // independent evidence, so keep the opaque scope instead of overwriting it.
     if (result.observation.fingerprint && generation !== undefined && parseTerminalFileName(fileName) === generation && !live) {
@@ -3049,6 +3083,11 @@ export class Outbox {
       checkProofBudget(budget);
       const before = await fs.lstat(filePath, { bigint: true });
       checkProofBudget(budget);
+      // Actual leaf identity after verified parents, including a symlink leaf.
+      // This evidence groups uncertainty but never authorizes reading its target.
+      const sourceBinding = { generation, fileName, lifetime: fileLifetime(before) };
+      if (terminalRunUUID(runId) && Buffer.byteLength(fileName) <= 255 && Buffer.byteLength(sourceBinding.lifetime) <= 256)
+        this.physicalSourceBindings.set(observation, Object.freeze(sourceBinding));
       if (before.isSymbolicLink()) { observation.kind = "symlink"; return result; }
       if (!before.isFile()) { observation.kind = "unreadable"; return result; }
       fh = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
@@ -3263,7 +3302,8 @@ export class Outbox {
             }
             const generation = parseTerminalFileName(entry.name);
             if (generation === undefined) this.terminalScanIncomplete = true;
-            else if (!this.retainUnknownTerminal(this.terminalScanRun.id, generation, entry.name, true)) {
+            else if (!this.hasCountedPhysicalScope(this.terminalScanRun.id, entry.name) &&
+                !this.retainUnknownTerminal(this.terminalScanRun.id, generation, entry.name, true)) {
               this.terminalScanFrontier = entry.name;
               break;
             }

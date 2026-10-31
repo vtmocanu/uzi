@@ -534,6 +534,7 @@ describe("Worker policy ownership reconciliation", () => {
       registry.markPolicyPendingOnly(RUN, 1);
       let reports = 0;
       const client = fakeClient();
+      Object.defineProperty(client, "supportsPolicyHold", { value: true });
       client.getRunOwnership = async () => proof as never;
       client.reportPolicyHold = async (_runId, request) => {
         reports++;

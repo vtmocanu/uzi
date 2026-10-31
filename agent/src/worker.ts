@@ -200,7 +200,7 @@ export class Worker {
   private readonly acceptedFinalizes = new Map<string, Readonly<object>>();
   private finalizeRegistrationAccepted = false;
   private finalizeAttemptSequence = 0;
-  private readonly finalizeAttempts = new Map<string, { identity: Readonly<object>; sequence: number }>();
+  private readonly finalizeAttempts = new Map<string, { entry: PendingFinalize; identity: Readonly<object>; sequence: number }>();
   private readonly finalizeRetries = new Map<string, FinalizeRetry>();
   private finalizeRecordSequence = 0;
 
@@ -240,12 +240,14 @@ export class Worker {
         return identity ? [[finalizeKey(entry), { entry, identity }] as const] : [];
       }));
       for (const [key, attempt] of this.finalizeAttempts) {
-        if (present.get(key)?.identity !== attempt.identity) this.finalizeAttempts.delete(key);
+        if (outbox.finalizeRecordIdentity(attempt.entry.run_id, attempt.entry.claim_generation) !== attempt.identity)
+          this.finalizeAttempts.delete(key);
       }
       for (const [key, state] of this.finalizeRetries) {
-        if (present.get(key)?.identity !== state.identity) {
+        const current = outbox.finalizeRecordIdentity(state.entry.run_id, state.entry.claim_generation);
+        if (current !== state.identity) {
           this.logFinalizeRetry(state.entry, state,
-            present.has(key) ? "replaced" : "removed");
+            current ? "replaced" : "removed");
           this.finalizeRetries.delete(key);
         }
       }
@@ -276,7 +278,7 @@ export class Worker {
           if (this.isFinalizeRunLive(entry.run_id)) continue;
           // A registration wave may outlive this identity; stale candidates own no retry or fairness state.
           if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity) continue;
-          this.finalizeAttempts.set(key, { identity, sequence: ++this.finalizeAttemptSequence });
+          this.finalizeAttempts.set(key, { entry, identity, sequence: ++this.finalizeAttemptSequence });
           const state = retry ?? { entry, identity, logId: ++this.finalizeRecordSequence, failures: 0, nextEligible: 0 };
           if (!retry) {
             this.finalizeRetries.set(key, state);
@@ -635,6 +637,7 @@ export class Worker {
   private async resolveBootTerminals(signal: AbortSignal): Promise<void> {
     const outbox = this.outbox;
     if (!outbox) return;
+    await this.observePendingPolicyOwnership(signal);
     let deps = makeTerminalOutboxDeps(outbox, this.client, {
       gapFillMax: this.config.gapFillMax,
       terminalMaxBytes: this.config.outboxTerminalMaxBytes,
@@ -644,7 +647,6 @@ export class Worker {
     if (typeof this.runner.protectRecoveryTerminalDeps === "function") deps = this.runner.protectRecoveryTerminalDeps(deps);
     for (const entry of outbox.listPendingTerminals()) {
       if (signal.aborted) return;
-      await this.observePolicyOwnership(entry);
       const gen = entry.claim_generation;
       const finalizes = this.captureFinalizes(entry.run_id, gen);
       try {
@@ -710,6 +712,7 @@ export class Worker {
   private async resolveRunTerminal(runId: string, signal?: AbortSignal): Promise<void> {
     const outbox = this.outbox;
     if (!outbox) return;
+    await this.observePendingPolicyOwnership(signal, runId);
     let deps = makeTerminalOutboxDeps(outbox, this.client, {
       gapFillMax: this.config.gapFillMax,
       terminalMaxBytes: this.config.outboxTerminalMaxBytes,
@@ -743,6 +746,7 @@ export class Worker {
     this.sweepingTerminals = true;
     try {
       await this.runner.retryPolicyHandoffs?.();
+      await this.observePendingPolicyOwnership(signal);
       let deps = makeTerminalOutboxDeps(outbox, this.client, {
         gapFillMax: this.config.gapFillMax,
         terminalMaxBytes: this.config.outboxTerminalMaxBytes,
@@ -784,7 +788,6 @@ export class Worker {
   ): Promise<void> {
     const runId = entry.run_id;
     const gen = entry.claim_generation;
-    await this.observePolicyOwnership(entry);
     if (entry.blocked) return;
     if (via === "sweep" && outbox.hasUndrainedMessages(runId)) return;
     if (outbox.isTerminalResolveHeld(runId, gen)) {
@@ -821,6 +824,22 @@ export class Worker {
     }
   }
 
+  /** One ownership request per pending policy run per invocation, serially.
+   * The bounded catalog limits attempts; transport bounds each request. A failed
+   * observation stays conservative and does not prevent observing sibling runs. */
+  private async observePendingPolicyOwnership(signal?: AbortSignal, onlyRun?: string): Promise<void> {
+    const seen = new Set<string>();
+    for (const entry of this.outbox?.listPendingOutcomeSources() ?? []) {
+      if (signal?.aborted) return;
+      if (entry.outcome_kind !== "policy_hold" && entry.outcome_kind !== "unknown") continue;
+      const run_id = entry.run_id.toLowerCase();
+      if (onlyRun !== undefined && run_id !== onlyRun.toLowerCase()) continue;
+      if (seen.has(run_id)) continue;
+      seen.add(run_id);
+      await this.observePolicyOwnership({ ...entry, run_id });
+    }
+  }
+
   /** Lease evidence only: bind before HTTP so a late response cannot replace a newer claim. */
   private async observePolicyOwnership(entry: { run_id: string; outcome_kind?: string }): Promise<void> {
     if (entry.outcome_kind !== "policy_hold" && entry.outcome_kind !== "unknown") return;
@@ -854,6 +873,7 @@ export class Worker {
     // snapshot. Freeze each original identity before the request, including existing lower records.
     // Only exact offered identities gain lifetime handoff; captured lower originals gain batch-only authority.
     const offeredFinalizes = this.outbox?.listPendingFinalizes() ?? [];
+    await this.observePendingPolicyOwnership(signal);
     const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes);
     const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
     const frozenFinalizes = this.captureFinalizes().filter(({ entry }) =>
@@ -1252,7 +1272,8 @@ export class Worker {
     if (!this.outbox) return undefined;
     // Issue #1742: a pending finalize record also warrants the register snapshot (it carries
     // finalize_resume), even with no pending terminal journal.
-    if (this.outbox.listPendingTerminals().length === 0 && finalizes.length === 0) return undefined;
+    if (this.outbox.listPendingOutcomeSources().length === 0 &&
+        this.outbox.unclassifiedPolicyRunIds().length === 0 && finalizes.length === 0) return undefined;
     return this.activeRuns.buildRegisterSnapshot(finalizes);
   }
 

@@ -80,6 +80,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
       isDisabled: () => false,
+      listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
       unclassifiedPolicyRunIds: () => [], runsWithPending: () => ["r1"],
@@ -129,6 +130,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
       isDisabled: () => false,
+      listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
       unclassifiedPolicyRunIds: () => [], runsWithPending: () => (retired ? [] : ["r1"]),
@@ -184,6 +186,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       isDisabled: () => false,
       // Empty until the drain retires the segments — mirroring a terminal journaled AFTER boot and
       // only re-resolvable once the N3 undrained-messages guard would let it through.
+      listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => (retired ? [{ run_id: "r1", claim_generation: 5 }] : []),
       // Issue #1512: the heartbeat sweep defers to the drainer for a run it reports undrained, so
       // this drainer-focused fake keeps the sweep out of the way.
@@ -276,6 +279,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     const outbox = {
       uncleanRuns: () => [],
       isDisabled: () => false,
+      listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => (retired ? [{ run_id: "r1", claim_generation: 5 }] : []),
       // Issue #1512: the heartbeat sweep defers to the drainer for a run it reports undrained, so
       // this drainer-focused fake keeps the sweep out of the way.
@@ -353,6 +357,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
       isDisabled: () => false,
+      listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
       unclassifiedPolicyRunIds: () => [], runsWithPending: () => ["r1"],
@@ -403,6 +408,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // PRD #1391 Run B M4: the boot terminal resolve reads these; these drainer tests carry no
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
       isDisabled: () => false,
+      listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
       unclassifiedPolicyRunIds: () => [], runsWithPending: () => ["r1"],
