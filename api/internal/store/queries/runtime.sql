@@ -1232,6 +1232,8 @@ WITH claimant AS MATERIALIZED (
            OR 'milestone_reconciliation_claim_v1' = ANY(@worker_protocol_caps::text[]))
       AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(@worker_protocol_caps::text[]))
+      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian (no affinity-ceiling release).
+      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL) OR r.worker_id = @worker_id)
       -- A claim outside a transaction cannot set the publication-resume opt-in the trigger requires.
       AND (NOT @skip_publication_resume::boolean OR NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active'))
       AND (r.completion_contract_version IS NULL
@@ -1505,6 +1507,8 @@ WITH claimant AS MATERIALIZED (
                      OR 'milestone_reconciliation_claim_v1' = ANY(p.protocol_capabilities))
       AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(p.protocol_capabilities))
       AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(p.protocol_capabilities))
+      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian (no affinity-ceiling release).
+      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL) OR r.worker_id = p.id)
                 AND (r.completion_contract_version IS NULL
                      OR 'completion_interlock_v1' = ANY(p.protocol_capabilities))
                 -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -3417,6 +3421,9 @@ UPDATE runs SET
     updated_at = now()
 WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
   AND recovery_wait_cause = 'forge_unreachable' AND recovery_retry_not_before IS NULL
+  -- A publication-phase hold resumes through ResumePublicationForgeHold (issue #1324), which also
+  -- advances the side row's episode in the same transaction; this pre-clone arm never matches it.
+  AND recovery_wait_phase IS NULL
   AND COALESCE(stop_kind, '') = ''
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
@@ -10293,6 +10300,8 @@ WHERE run.id = @run_id
        OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
       AND (run.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
       AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = run.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(w.protocol_capabilities))
+      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian (no affinity-ceiling release).
+      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = run.id AND pc.state = 'active' AND pc.handoff IS NULL) OR run.worker_id = w.id)
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10764,6 +10773,8 @@ WHERE r.status = 'queued'
                       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
       AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
       AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(w.protocol_capabilities))
+      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian (no affinity-ceiling release).
+      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL) OR r.worker_id = w.id)
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10984,6 +10995,8 @@ WHERE r.status = 'queued'
                       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
       AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
       AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(w.protocol_capabilities))
+      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian (no affinity-ceiling release).
+      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL) OR r.worker_id = w.id)
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -11063,6 +11076,8 @@ WHERE r.status = 'queued'
                       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
       AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
       AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(w.protocol_capabilities))
+      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian (no affinity-ceiling release).
+      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL) OR r.worker_id = w.id)
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside

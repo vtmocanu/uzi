@@ -244,6 +244,8 @@ var runDTOKeys = []string{
 	// promotion stamp (a distinct column from retry_not_before, the limit park's); forge_park_count
 	// is the forge-only lifetime counter; forge_park_max is the effective cap (0 = unlimited).
 	"recovery_wait_cause", "recovery_retry_not_before", "forge_park_count", "forge_park_max",
+	// Issue #1324: which part of the run a recovery_wait park interrupted (null unless publication).
+	"recovery_wait_phase",
 	// PRD #1809 M5: the disk-only lifetime counter of counted data_volume_full parks.
 	"disk_park_count",
 	// PRD #1733: the open provider-park streak (count, and when it began; null when none is open).

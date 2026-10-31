@@ -1368,6 +1368,10 @@ func forgeParkRefusalReason(err error) (string, bool) {
 		return "stale_claim", true
 	case errors.Is(err, workersvc.ErrForgeParkCustodyUnsettled):
 		return "custody_unsettled", true
+	case errors.Is(err, workersvc.ErrPublicationEnrolled):
+		// Issue #1324: a legacy forge park for a run with an active publication intent. Nothing was
+		// mutated; the worker retries with recovery_phase "publication".
+		return "publication_enrolled", true
 	default:
 		return "", false
 	}

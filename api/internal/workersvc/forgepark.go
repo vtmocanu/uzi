@@ -187,13 +187,30 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 	if err != nil {
 		return store.Run{}, 0, err
 	}
+	// Issue #1324 D3: a run with an active publication intent has unpublished work, so it never
+	// takes the pre-clone path below. The check follows the generation and already-parked checks
+	// above (so a duplicate is still a no-op) and precedes the no_adopted_source release, which
+	// therefore never runs for an enrolled run; forge_park_count is not bumped either. A stamped
+	// stop still cancels through the existing arm, without that release.
+	intent, ierr := qtx.GetActivePublicationResume(ctx, run.ID)
+	enrolled := ierr == nil
+	if ierr != nil && !errors.Is(ierr, pgx.ErrNoRows) {
+		return store.Run{}, 0, ierr
+	}
+	stopping := run.StopKind.Valid && run.StopKind.String != ""
+	if enrolled && !stopping {
+		if err := publicationParkRefusal(wkr, req); err != nil {
+			return run, 0, err
+		}
+		return s.parkPublicationForgeUnreachable(ctx, tx, qtx, wkr, run, intent, req, sessionID)
+	}
+
 	// A delivered claim can have adopted local sources before reporting a forge failure.
 	// Retain guarded inventory through this park; only the server's pre-delivery
 	// ReleaseClaimCustodyNoAdoptedSource path supplies that final disposition.
 	maxParks := s.p.RunForgeUnreachableMaxParks
 	capHold := maxParks != 0 && int(run.ForgeParkCount) >= maxParks
-	stopping := run.StopKind.Valid && run.StopKind.String != ""
-	if !hold.InventoryGuarded && (!capHold || stopping) {
+	if !enrolled && !hold.InventoryGuarded && (!capHold || stopping) {
 		released, err := qtx.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
 			RunID: run.ID, Generation: *req.ClaimGeneration, WorkerID: wkr.ID,
 			ReleaseEvidence: pgconv.TextOrNull("no_adopted_source"),

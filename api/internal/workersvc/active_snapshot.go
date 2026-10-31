@@ -49,6 +49,11 @@ type ActiveSnapshot struct {
 	// claim path. Omitted by an older worker, ignored by an older api (the snapshot is parsed
 	// leniently).
 	FinalizeResume []FinalizeResumeEntry `json:"finalize_resume,omitempty"`
+	// PublicationResume (issue #1324 D6) is carried ONLY on a register snapshot: the attempts that
+	// hold a publication intent and will resume publication only. A run listed here is never
+	// treated as finalize_resume (it must not consume the #1742 one-shot allowance); it takes the
+	// ordinary orphan requeue, which keeps the intent. A malformed list is dropped.
+	PublicationResume []PublicationResumeEntry `json:"publication_resume,omitempty"`
 
 	// PendingAll is complete pending-outcome coverage independent of active rotation.
 	// nil means unavailable; a nonnil empty slice means complete empty coverage.
@@ -59,6 +64,8 @@ type ActiveSnapshot struct {
 	// and was dropped. Only the register path (validateFinalizeResume) logs it, with the worker id;
 	// heartbeat and claim snapshots stay silent about the field.
 	finalizeResumeMalformed bool
+	// publicationResumeMalformed is the same for publication_resume.
+	publicationResumeMalformed bool
 }
 
 // UnmarshalJSON decodes finalize_resume and pending_all independently from the
@@ -73,8 +80,9 @@ func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
 	type plain ActiveSnapshot
 	aux := struct {
 		*plain
-		FinalizeResume json.RawMessage `json:"finalize_resume"`
-		PendingAll     json.RawMessage `json:"pending_all"`
+		FinalizeResume    json.RawMessage `json:"finalize_resume"`
+		PublicationResume json.RawMessage `json:"publication_resume"`
+		PendingAll        json.RawMessage `json:"pending_all"`
 	}{plain: (*plain)(s)}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
@@ -98,6 +106,16 @@ func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
 				}
 				s.PendingAll = append(s.PendingAll, PendingOutcomeIdentity{RunID: *e.RunID, ClaimGeneration: *e.ClaimGeneration})
 			}
+		}
+	}
+	s.PublicationResume = nil
+	s.publicationResumeMalformed = false
+	if raw := bytes.TrimSpace(aux.PublicationResume); len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
+		var list []PublicationResumeEntry
+		if err := json.Unmarshal(raw, &list); err != nil {
+			s.publicationResumeMalformed = true
+		} else {
+			s.PublicationResume = list
 		}
 	}
 	s.FinalizeResume = nil
@@ -176,6 +194,55 @@ func (s *Service) validatePendingAll(wkr store.Worker, snap *ActiveSnapshot) val
 type FinalizeResumeEntry struct {
 	RunID           string `json:"run_id"`
 	ClaimGeneration int64  `json:"claim_generation"`
+}
+
+// PublicationResumeEntry is one publication-resume attempt a restarting worker attests on its
+// register snapshot (issue #1324 D6): the run, its claim generation and the enrollment it holds.
+type PublicationResumeEntry struct {
+	RunID           string `json:"run_id"`
+	ClaimGeneration int64  `json:"claim_generation"`
+	EnrollmentSeq   int32  `json:"enrollment_seq"`
+	CandidateSeq    int32  `json:"candidate_seq"`
+}
+
+// withoutPublicationResume removes from a validated finalize_resume list every run the snapshot
+// also lists under publication_resume (issue #1324 D6), so such a run never consumes the #1742
+// allowance and takes the ordinary orphan requeue, which keeps its intent. An invalid
+// publication_resume list is ignored with a warning (the finalize list is then unchanged); the
+// result is not ok when no finalize entry remains.
+func (s *Service) withoutPublicationResume(wkr store.Worker, snap *ActiveSnapshot, in validatedFinalizeResume, ok bool) (validatedFinalizeResume, bool) {
+	if snap == nil {
+		return in, ok
+	}
+	if snap.publicationResumeMalformed {
+		slog.Warn("publication_resume has an invalid wire shape; ignoring the list", "worker_id", wkr.ID.String())
+		return in, ok
+	}
+	if !ok || len(snap.PublicationResume) == 0 {
+		return in, ok
+	}
+	if len(snap.PublicationResume) > s.p.ActiveSnapshotMaxEntries {
+		slog.Warn("publication_resume list rejected; ignoring it", "worker_id", wkr.ID.String(), "reason", "list exceeds the absolute entry ceiling")
+		return in, ok
+	}
+	listed := make(map[uuid.UUID]bool, len(snap.PublicationResume))
+	for _, e := range snap.PublicationResume {
+		id, err := uuid.Parse(e.RunID)
+		if err != nil || e.ClaimGeneration < 0 || e.EnrollmentSeq <= 0 || e.CandidateSeq < 0 {
+			slog.Warn("publication_resume list rejected; ignoring it", "worker_id", wkr.ID.String(), "reason", "invalid entry")
+			return in, ok
+		}
+		listed[id] = true
+	}
+	var out validatedFinalizeResume
+	for i, id := range in.ids {
+		if listed[id] {
+			continue
+		}
+		out.ids = append(out.ids, id)
+		out.generations = append(out.generations, in.generations[i])
+	}
+	return out, len(out.ids) > 0
 }
 
 // ActiveRunEntry is one attempt in an ActiveSnapshot. run_id is a uuid string; claim_generation

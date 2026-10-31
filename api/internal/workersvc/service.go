@@ -2520,6 +2520,8 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	}
 	// Issue #1742: the attested finalize list, validated independently of the active list.
 	finalize, finalizeOK := s.validateFinalizeResume(wkr, snapshot)
+	// Issue #1324 D6: a run attested as a publication resume is never a finalize resume.
+	finalize, finalizeOK = s.withoutPublicationResume(wkr, snapshot, finalize, finalizeOK)
 	finalizeOffered := 0
 	if snapshot != nil {
 		finalizeOffered = len(snapshot.FinalizeResume)
@@ -4258,6 +4260,15 @@ type StateRequest struct {
 	// Absent (nil) on every non-recovery_wait report and on a legacy worker's empty-turn park. httpx.DecodeJSON rejects unknown fields, so this field MUST
 	// exist here or a new worker's report 400s.
 	RecoveryCause *string `json:"recovery_cause"`
+	// RecoveryPhase, PublicationSurface, PublicationStep and HandoffCheckpointTip (issue #1324)
+	// type a forge_unreachable park that happened while publishing: phase "publication", the
+	// surface that failed (git|api), the step (floor_refresh|push|mr_create), and optionally the
+	// published checkpoint tip a peer may resume from. Validated by validatePublicationPark;
+	// httpx.DecodeJSON rejects unknown fields, so they MUST exist here.
+	RecoveryPhase        *string `json:"recovery_phase,omitempty"`
+	PublicationSurface   *string `json:"publication_surface,omitempty"`
+	PublicationStep      *string `json:"publication_step,omitempty"`
+	HandoffCheckpointTip *string `json:"handoff_checkpoint_tip,omitempty"`
 	// PresentationID is the worker-minted identity of the gate presentation an
 	// `awaiting_approval` report publishes (PRD #1795 M1, D1). A new id allocates the run's next
 	// gate revision; the run's CURRENT id with an unchanged approval-relevant payload is an
@@ -4447,6 +4458,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		return store.Run{}, false, err
 	}
 	if err := validateProviderPark(req); err != nil {
+		return store.Run{}, false, err
+	}
+	if err := validatePublicationPark(req); err != nil {
 		return store.Run{}, false, err
 	}
 	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
@@ -8327,9 +8341,12 @@ type SweepResult struct {
 	// incapable, or unresponsive past the grace (PRD #1497 M1, D5). Set from the ParkRunsAtWall row
 	// count. These transition to paused (hold_reason='budget_exhausted') and are fanned out via
 	// publishSwept; they are NOT enqueued to the judge (the run is not finished).
-	WallParked         int64
-	StaleFailed        int64
-	StaleRequeued      int64
+	WallParked    int64
+	StaleFailed   int64
+	StaleRequeued int64
+	// PublicationHeld is the number of queued runs moved to an owner hold because their
+	// publication custodian worker cannot serve them (issue #1324 D5).
+	PublicationHeld    int64
 	ChatIdleCompleted  int64
 	ProposalsRecovered int64
 	// HealthChanged is the number of runs whose health flag the detector wrote this

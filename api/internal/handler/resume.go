@@ -63,6 +63,15 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		var resumeErr error
 		switch run.RecoveryWaitCause.String {
 		case "forge_unreachable":
+			if run.RecoveryWaitPhase.Valid {
+				// Issue #1324: a publication-phase hold has its own Resume, which also starts a new
+				// episode on the intent. It runs ahead of the pre-clone arm, which never matches it.
+				var resumed bool
+				if resumed, resumeErr = h.wsvc.ResumePublicationForgeHold(r.Context(), user.ID, run); resumeErr == nil && !resumed {
+					resumeErr = pgx.ErrNoRows
+				}
+				break
+			}
 			_, resumeErr = h.q.ResumeForgeUnreachableHold(r.Context(), store.ResumeForgeUnreachableHoldParams{
 				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
 			})

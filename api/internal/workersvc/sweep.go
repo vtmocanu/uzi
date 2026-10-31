@@ -241,6 +241,13 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 			// is about that ORDERING, not a stopwatched duration.
 			s.persistFail.evict(r.ID)
 		}
+
+		// Issue #1324 D5: a queued run whose publication intent only its custodian worker may
+		// resume is held for its owner once that worker can no longer serve it. It reads worker
+		// liveness, so it sits with the other stale-worker passes inside the boot grace.
+		if res.PublicationHeld, err = s.holdPublicationRunsWithoutCustodian(ctx, now); err != nil {
+			return res, fmt.Errorf("hold publication runs without custodian: %w", err)
+		}
 	}
 
 	// Settle plan cross-check children whose lead left its claim or generation.
