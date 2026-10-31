@@ -162,7 +162,7 @@ func (tx *scopedTargetTx) Query(ctx context.Context, sql string, args ...any) (p
 	if err != nil || !strings.Contains(sql, "name: LockFrozenWorkerSnapshotRuns ") {
 		return rows, err
 	}
-	return &scopedTargetRows{Rows: rows, after: func() error { _, err := tx.Tx.Exec(ctx, tx.mutation, tx.source); return err }}, nil
+	return &scopedTargetRows{Rows: rows, after: func() error { _, err := tx.Exec(ctx, tx.mutation, tx.source); return err }}, nil
 }
 
 type scopedTargetRows struct {
