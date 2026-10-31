@@ -225,6 +225,36 @@ making that worker's attributed candidates available. Bodyless ordinary claims,
 ephemeral claims and no-transaction compatibility paths are unchanged; there is no
 new overflow guard on those paths.
 
+### Boot terminal arbitration
+
+Boot enumerates each run directory with a bounded `opendir` stream, which yields
+raw filesystem order; the base used `readdir`, which libuv returns sorted by
+filename. Neither the enrolled file per generation nor the pending order may
+depend on that order. After a run's boot load, its terminals are reordered in
+place by ascending numeric `claim_generation` (same metadata objects), replacing
+the base's lexicographic filename order, including on the key-unavailable path.
+
+Files of one generation are ranked: 3 authenticated canonical name, 2
+authenticated alias, 1 read and rejected (MAC failure, parse error, malformed),
+0 uninspected (budget-deferred, unaffordable, unreadable) or capacity-limited.
+Within ranks 1 to 3 the higher rank wins, then the greater filename in code-unit
+order, so the enrolled winner is identical in every enumeration order. A later
+file replaces the enrolled one only if it wins, the enrolled entry is not rank 0
+and has no selection token or pending capture, and the protection transfer
+succeeds. Ranks are load-local state; nothing is persisted.
+
+The displaced file receives, before the entry switches, the held counted scope
+that reading it after the winner would have produced: source key, `since` and
+its MAC or source binding. It is admitted through the same catalog capacity
+check as an inspection reservation. If admission fails nothing changes: the
+displaced entry stays enrolled and the inventory is marked incomplete (fail
+closed). The winner's own inspection scope is released as for a first-read
+winner, so the catalog stays balanced.
+
+Rank 0 is the uncertainty exception: an uninspected file is never displaced, so
+with rank 0 present which file is enrolled may depend on order. Every file stays
+protected, either enrolled or under a held counted scope.
+
 ### Cancellation and permanent outcome precedence
 
 In `ReportPolicyHold`, an already requested owner cancel uses exactly one

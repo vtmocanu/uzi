@@ -295,6 +295,14 @@ interface TerminalInspectionScope {
   sourceBinding?: Readonly<TerminalSourceBinding>;
 }
 
+/** Load-local boot arbitration state for the file enrolled for one generation; never persisted. */
+interface BootArbitrationEntry {
+  fileName: string;
+  rank: number;
+  macBinding?: Readonly<TerminalMACBinding>;
+  sourceBinding?: Readonly<TerminalSourceBinding>;
+}
+
 /** In-memory metadata for one pending terminal journal (the file's durable fields minus the body,
  *  which the store never needs to re-read for depth/list/retire). */
 interface TerminalMeta {
@@ -1288,6 +1296,8 @@ export class Outbox {
     let directory: Dir;
     try { directory = await fs.opendir(dir); } catch { return result; }
     let readBytes = 0;
+    // Load-local arbitration state for the file currently enrolled per generation.
+    const arbitration = new Map<number, BootArbitrationEntry>();
     try {
       for (;;) {
         // Reserve before advancing the iterator, including an in-flight raw read.
@@ -1316,8 +1326,9 @@ export class Outbox {
           // Transfer without yielding or counting the source twice.
           if (token && !ownedScope && !this.runs.get(runId)?.terminals.has(gen)) {
             this.policyInspections.delete(token);
-            if (!this.retainUnknownTerminal(runId, gen, name, true) && scope)
-              this.policyInspections.set(token, scope);
+            if (!this.retainUnknownTerminal(runId, gen, name, true)) {
+              if (scope) this.policyInspections.set(token, scope);
+            } else arbitration.set(gen, { fileName: name, rank: 0 });
           }
           const enrolled = this.runs.get(runId)?.terminals.get(gen);
           if (token && enrolled?.fileName === name && enrolled.outcomeKind !== "terminal")
@@ -1333,26 +1344,45 @@ export class Outbox {
               this.terminalInventoryComplete = false;
               break; // A changed ordinary lifetime needs new capacity.
             }
+            // Only the file's own enrolled entry carries its deferral identity.
             const held = this.runs.get(runId)?.terminals.get(gen);
-            if (held) held.deferredVersion = fileVersion(stat);
+            if (held?.fileName === name) held.deferredVersion = fileVersion(stat);
           } catch { /* unknown stays pending */ }
           const affordable = bytes <= this.terminalReadMaxBytes && bytes <= this.runMaxBytes - readBytes &&
             bytes <= this.maxBytes - this.terminalLoadBytes;
           const inspected = affordable ? await this.inspectTerminal(runId, gen, name, undefined, bytes) : undefined;
-          if (token && scope && this.policyInspections.get(token) === scope && inspected) {
-            if (inspected.observation.kind === "mac_failure") scope.macBinding = this.copyMACBinding(inspected.observation);
+          // Evidence retained for this file; the arbitration may need it after its scope is released.
+          let ownMac: Readonly<TerminalMACBinding> | undefined;
+          let ownSource: Readonly<TerminalSourceBinding> | undefined;
+          if (scope && inspected) {
+            if (inspected.observation.kind === "mac_failure") ownMac = this.copyMACBinding(inspected.observation);
             else {
               const sourceBinding = this.physicalSourceBindings.get(inspected.observation);
               if (sourceBinding && Buffer.byteLength(JSON.stringify({ ...scope, sourceBinding })) <= 1024)
-                scope.sourceBinding = sourceBinding;
+                ownSource = sourceBinding;
+            }
+            if (token && this.policyInspections.get(token) === scope) {
+              if (inspected.observation.kind === "mac_failure") scope.macBinding = ownMac;
+              else if (ownSource) scope.sourceBinding = ownSource;
             }
           }
           const parsed = inspected?.record;
           if (affordable) { readBytes += bytes; this.terminalLoadBytes += bytes; }
+          const here = (): boolean => this.runs.get(runId)?.terminals.get(gen)?.fileName === name;
+          const evidence = { ownMac, ownSource };
           if (!parsed) {
             result.rejected++;
             const held = this.runs.get(runId)?.terminals.get(gen);
-            if (held) held.budgetDeferred = !affordable && bytes <= this.terminalReadMaxBytes && bytes <= this.runMaxBytes && bytes <= this.maxBytes;
+            if (held?.fileName === name) held.budgetDeferred = !affordable && bytes <= this.terminalReadMaxBytes && bytes <= this.runMaxBytes && bytes <= this.maxBytes;
+            // Rank 1 only when the file was read and rejected; anything else stays uncertain (rank 0).
+            const kind = inspected?.observation.kind;
+            const rank = kind === "mac_failure" || kind === "malformed" ? 1 : 0;
+            if (here()) arbitration.set(gen, { fileName: name, rank, macBinding: ownMac, sourceBinding: ownSource });
+            else if (rank === 1 && token && scope) {
+              const unknown: TerminalMeta = { fileName: name, claimGeneration: gen, phaseAtJournal: "policy_pending",
+                since: this.now(), blocked: false, outcomeKind: "unknown", budgetDeferred: false };
+              this.displaceBootTerminal(runId, gen, rank, unknown, evidence, token, scope, arbitration);
+            }
             continue; // physical evidence cannot establish absence
           }
           const meta = coerceTerminal(parsed, runId, gen, name);
@@ -1360,15 +1390,27 @@ export class Outbox {
             this.log.warn("outbox: malformed or misfiled terminal journal; skipping", { ...(terminalRunUUID(runId) ? { run_id: runId.toLowerCase() } : {}), claim_generation: gen, fact: "malformed" });
             result.rejected++;
             this.retainUnknownTerminal(runId, gen, name);
+            if (here()) arbitration.set(gen, { fileName: name, rank: 1, macBinding: ownMac, sourceBinding: ownSource });
+            else if (token && scope) {
+              const unknown: TerminalMeta = { fileName: name, claimGeneration: gen, phaseAtJournal: "policy_pending",
+                since: this.now(), blocked: false, outcomeKind: "unknown", budgetDeferred: false };
+              this.displaceBootTerminal(runId, gen, 1, unknown, evidence, token, scope, arbitration);
+            }
             continue;
           }
           const rs = this.ensureInMemoryRun(runId, meta.since);
-          if (rs.terminals.get(gen)?.fileName !== name) continue;
           meta.policyBytes = bytes;
           if (meta.outcomeKind === "terminal") meta.ordinaryVersion = this.authenticatedFileVersions.get(parsed);
           if (meta.outcomeKind === "policy_hold") meta.selectedLifetime = this.authenticatedLifetimes.get(parsed);
+          const rank = name === terminalFileName(gen) ? 3 : 2;
+          if (!here()) {
+            if (token && scope && this.displaceBootTerminal(runId, gen, rank, meta, evidence, token, scope, arbitration))
+              result.authenticated++;
+            continue;
+          }
           if (meta.outcomeKind === "policy_hold" && !this.admitPolicyMetadata(runId, meta)) break;
           rs.terminals.set(meta.claimGeneration, meta);
+          arbitration.set(gen, { fileName: name, rank, macBinding: ownMac, sourceBinding: ownSource });
           result.authenticated++;
           if (token && meta.outcomeKind === "terminal") this.policyInspections.delete(token);
         } finally {
@@ -1376,8 +1418,64 @@ export class Outbox {
           if (token && !this.policyInspections.get(token)?.held) this.policyInspections.delete(token);
         }
       }
-    } finally { await directory.close(); }
+    } finally {
+      await directory.close();
+      this.orderTerminalsByGeneration(runId);
+    }
     return result;
+  }
+
+  /** Boot only. Directory order is filesystem-defined, so the catalog order is made
+   *  numeric: same TerminalMeta objects are re-inserted, keeping identity-keyed WeakMaps valid. */
+  private orderTerminalsByGeneration(runId: string): void {
+    const terminals = this.runs.get(runId)?.terminals;
+    if (!terminals || terminals.size < 2) return;
+    const sorted = [...terminals.entries()].sort((a, b) => a[0] - b[0]);
+    terminals.clear();
+    for (const [generation, meta] of sorted) terminals.set(generation, meta);
+  }
+
+  /** Boot arbitration for a file read after another file of the same generation was enrolled.
+   *  Ranks: 3 authenticated canonical, 2 authenticated alias, 1 read and rejected, 0 uninspected
+   *  or uncertain. Higher rank wins, then the greater filename in code-unit order. A rank 0
+   *  entry is never displaced. The displaced file receives the held counted scope that
+   *  reading it after the winner would have left, admitted before the entry switches; if that
+   *  admission fails nothing changes and the inventory is marked incomplete. */
+  private displaceBootTerminal(
+    runId: string, generation: number, rank: number, replacement: TerminalMeta,
+    evidence: { ownMac?: Readonly<TerminalMACBinding>; ownSource?: Readonly<TerminalSourceBinding> },
+    token: symbol, scope: TerminalInspectionScope, arbitration: Map<number, BootArbitrationEntry>,
+  ): boolean {
+    const rs = this.runs.get(runId);
+    const displaced = rs?.terminals.get(generation);
+    const current = arbitration.get(generation);
+    const name = replacement.fileName;
+    if (!rs || !displaced || !current || rank < 1 || current.rank < 1 || displaced.fileName !== current.fileName ||
+        displaced.fileName === name || displaced.selectionToken || displaced.capturePending ||
+        this.policyInspections.get(token) !== scope) return false;
+    if (!(rank > current.rank || (rank === current.rank && name > current.fileName))) return false;
+    if (replacement.outcomeKind === "policy_hold" && !this.admitPolicyMetadata(runId, replacement)) {
+      this.terminalInventoryComplete = false;
+      return false;
+    }
+    const kept = this.reserveInspection(runId);
+    if (!kept) {
+      this.terminalInventoryComplete = false;
+      return false;
+    }
+    const protection = this.policyInspections.get(kept)!;
+    protection.held = true;
+    protection.sourceKey = createHash("sha256").update(displaced.fileName).digest("hex");
+    protection.since = displaced.since;
+    if (current.macBinding) protection.macBinding = current.macBinding;
+    else if (current.sourceBinding && Buffer.byteLength(JSON.stringify({ ...protection, sourceBinding: current.sourceBinding })) <= 1024)
+      protection.sourceBinding = current.sourceBinding;
+    // No await from here: the displaced entry, its scope and the winner switch together.
+    this.terminalRetirementIdentities.delete(displaced);
+    this.policyInspections.delete(token);
+    rs.terminals.set(generation, replacement);
+    arbitration.set(generation, { fileName: name, rank, macBinding: evidence.ownMac, sourceBinding: evidence.ownSource });
+    return true;
   }
 
   /** Issue #1742: adopt a run's authenticated finalize-pending records (`finalize-<generation>.json`)
