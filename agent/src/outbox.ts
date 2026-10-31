@@ -1288,6 +1288,7 @@ export class Outbox {
     let directory: Dir;
     try { directory = await fs.opendir(dir); } catch { return result; }
     let readBytes = 0;
+    const bootRejections = new Set<symbol>();
     try {
       for (;;) {
         // Reserve before advancing the iterator, including an in-flight raw read.
@@ -1352,6 +1353,24 @@ export class Outbox {
           if (!parsed) {
             result.rejected++;
             const held = this.runs.get(runId)?.terminals.get(gen);
+            const rejection = inspected && this.copyMACBinding(inspected.observation);
+            if (token && scope && rejection && held?.fileName === name && held.outcomeKind === "unknown" &&
+                !held.selectionToken && !held.policyOutcomeId && !held.capturePending) {
+              if (bootRejections.size >= this.policyCatalogLimit) {
+                for (const prior of bootRejections) if (!this.policyInspections.has(prior)) bootRejections.delete(prior);
+              }
+              if (bootRejections.size >= this.policyCatalogLimit) { held.budgetDeferred = false; continue; }
+              // Transfer the counted scheduling placeholder to the rejected file's
+              // independent MAC scope. It must protect those bytes without hiding a
+              // different authenticated alias at this generation. No selected policy
+              // identity is replaced, and the transfer has no yield or extra slot.
+              scope.macBinding = rejection;
+              scope.provisional = false;
+              this.policyInspections.set(token, scope);
+              this.runs.get(runId)!.terminals.delete(gen);
+              bootRejections.add(token);
+              continue;
+            }
             if (held) held.budgetDeferred = !affordable && bytes <= this.terminalReadMaxBytes && bytes <= this.runMaxBytes && bytes <= this.maxBytes;
             continue; // physical evidence cannot establish absence
           }
@@ -1376,7 +1395,20 @@ export class Outbox {
           if (token && !this.policyInspections.get(token)?.held) this.policyInspections.delete(token);
         }
       }
-    } finally { await directory.close(); }
+    } finally {
+      try { await directory.close(); }
+      finally {
+        for (const token of bootRejections) {
+          const scope = this.policyInspections.get(token);
+          const binding = scope?.macBinding;
+          if (!scope || !binding || this.runs.get(runId)?.terminals.has(binding.generation)) continue;
+          // Without an authenticated alias, retain the legacy UNKNOWN metadata.
+          // With a winner, its rejected sibling stays independently protected.
+          this.policyInspections.delete(token);
+          if (!this.retainUnknownTerminal(runId, binding.generation, binding.fileName)) this.policyInspections.set(token, scope);
+        }
+      }
+    }
     return result;
   }
 
