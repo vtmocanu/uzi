@@ -468,7 +468,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		{"credential_switch_hold"},
 	}
 	if activeSnapshotEnabled {
-		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
+		groups = append(groups, []string{"active_run_snapshot", capability.PendingOutcomeScopedClaimV1}) // PRD #1390 M2a
 	}
 	if heldPublicationEnabled {
 		// Issue #2545: this api accepts the step-A held-work upload. Its own group, separate from

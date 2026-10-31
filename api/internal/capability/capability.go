@@ -29,6 +29,10 @@ const (
 // Vocabulary only during M1; server readiness is withheld until M2.
 const ProviderPolicyHoldV1 = "provider_policy_hold_v1"
 
+// PendingOutcomeScopedClaimV1 negotiates bounded pending-source accounting for claims.
+// It is independent of readiness for the provider policy hold protocol.
+const PendingOutcomeScopedClaimV1 = "pending_outcome_scoped_claim_v1"
+
 // TaskCheckpointCoordinatesV1 negotiates immutable server-authorized checkpoint coordinates.
 const TaskCheckpointCoordinatesV1 = "task_checkpoint_coordinates_v1"
 
@@ -298,6 +302,7 @@ const CIConfigGuardV1 = "ci_config_guard_v1"
 
 var protocolVocabulary = map[string]struct{}{
 	ProviderPolicyHoldV1:            {},
+	PendingOutcomeScopedClaimV1:     {},
 	TaskCheckpointCoordinatesV1:     {},
 	WorkerMemoryPressureV1:          {},
 	WorkerMemoryAuthorityClaimV1:    {},
@@ -343,7 +348,7 @@ var protocolVocabulary = map[string]struct{}{
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{ProviderPolicyHoldV1, ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckSemanticPlanV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, CIArtifactsV1}
+var protocolOrder = []string{ProviderPolicyHoldV1, PendingOutcomeScopedClaimV1, ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckSemanticPlanV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, CIArtifactsV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

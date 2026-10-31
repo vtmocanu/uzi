@@ -3535,24 +3535,30 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		return nil, ErrActiveSnapshotInvalid
 	}
 	pending := s.validatePendingAll(locked, snapshot)
+	pending.scoped = &scopedPendingClaim{}
 	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{}, pending.ids)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks, pending); err != nil {
+	applied, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks, pending)
+	if err != nil {
 		return nil, err
 	}
 	// (d) Claimant guard (snapshot-replace BEFORE overflow, blocker 2). The replace just set/cleared
 	// pending_overflow_until from the snapshot's pending_overflow flag; re-read the row to see the
-	// CURRENT value. If the worker is under an unexpired overflow closure it is refused every claim,
-	// unassigned runs included — but the replace is valid info that must persist, so COMMIT and
-	// report idle. An UNFLAGGED valid snapshot cleared the closure here, so the claim proceeds in
+	// CURRENT value. An unexpired overflow closure refuses snapshot claims unless this transaction
+	// proves scoped pending coverage; that refusal includes unassigned runs. The valid replacement
+	// must persist, so COMMIT and report idle. An UNFLAGGED valid snapshot cleared the closure here,
+	// so the claim proceeds in
 	// this SAME tx below.
 	reread, err := qtx.GetWorkerByID(ctx, wkr.ID)
 	if err != nil {
 		return nil, err
 	}
-	if reread.PendingOverflowUntil.Valid && reread.PendingOverflowUntil.Time.After(s.now()) {
+	// Only fresh, applied evidence from this transaction can exempt this claimant.
+	// The persisted overflow closure still excludes its owned candidates for everyone.
+	scopedClaim := applied && locked.ID == wkr.ID && pending.scoped.allowed
+	if reread.PendingOverflowUntil.Valid && reread.PendingOverflowUntil.Time.After(s.now()) && !scopedClaim {
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
