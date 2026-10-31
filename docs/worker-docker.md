@@ -263,7 +263,7 @@ counts missing ones (metadata only, never counted in bytes); `by_basis` splits
 them. Partial or unknown bytes and incomplete inventories are marked explicitly.
 The line also carries `authority` (`undeclared`, `legacy_evidence`,
 `contradicted`, `unproven` or `attested`, with a fixed reason),
-`evidence_version` and, for version-2 evidence, the node's kernel release.
+`evidence_version` and, once version-2 binding and prefix checks pass, the node's kernel release.
 
 **This is shadow reporting:** the pass deletes no attempt trees, settles no
 records, releases no recovery holds and removes no stopped containers. Existing

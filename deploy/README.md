@@ -1058,8 +1058,8 @@ A would-delete entry requires terminal ownership, fresh empty holds and an
 eligible retained-source disposition; a verdict grants no deletion authority.
 
 **Authority and counts (PRD #3431 M1a).** The log line also carries
-`authority: {result, reason}`, `evidence_version` and, on the v2 path,
-`observations.kernel`. `authority.result` is one of `undeclared`,
+`authority: {result, reason}`, `evidence_version` and, once version-2 binding
+and prefix checks pass, `observations.kernel`. `authority.result` is one of `undeclared`,
 `legacy_evidence`, `contradicted`, `unproven` or `attested`, with a fixed reason
 token; controller free text is never logged. Only `attested` runs the inventory,
 and authority falls back to `unproven` when the pass is invalidated
@@ -1110,7 +1110,8 @@ documents when the successor pod is first seen. A positive proof is frozen at th
 point but sent once, as a version-2 document, at the first later pod update that
 carries the successor's own container IDs, so positive evidence waits for those
 IDs. If they never appear (or the pod is deleted, tainted, terminal or superseded
-first) nothing is sent and the worker defers `evidence_timeout`. The single
+first) nothing is sent and the worker reports `partial` / `evidence_timeout`
+(authority `unproven`) without an inventory. The single
 PATCH is unchanged: no retry, and a 409 conflict consumes it. No new RBAC is
 needed. `workers.image.tag` is decoupled from the controller: a new controller
 with old workers is normal until the pin moves, and an old worker refuses
