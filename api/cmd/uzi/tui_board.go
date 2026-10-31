@@ -982,6 +982,7 @@ const (
 	boardOwnerWidth      = 20 // admin owner-email cell
 	boardCredWidth       = 10 // maximum credential label width; no tone dot
 	boardCostWidth       = 6  // COST cell width (right-aligned; fits "$9999", "<$1", "n/a"; blank when usage is absent)
+	boardDurWidth        = 6  // DONE run-length cell (right-aligned; fits "23h59m"/"99d23h"; boardDurText bounds longer spans to days/years)
 	// boardMileMinWidth is the narrowest own board that shows the milestone micro-bar. Below it
 	// the column is dropped (milestone progress is still on the run-detail view) so the fixed
 	// prefix does not squeeze the title into an overflowing marker row (issue #379).
@@ -1001,7 +1002,7 @@ func (m tuiModel) boardShowMile() bool {
 	// shown) push the mile threshold up by exactly their width, so a narrow board drops the
 	// micro-bar instead of squeezing the title (issue #379). The milestone-free
 	// prefix leaves only the owner + credential + cost deltas.
-	min += boardRowPrefixWidth(m.board.admin, m.boardShowCred(), m.boardShowCost()) - boardRowPrefixWidth(false, false, false)
+	min += boardRowPrefixWidth(m.board.admin, m.boardShowDur(), m.boardShowCred(), m.boardShowCost()) - boardRowPrefixWidth(false, false, false, false)
 	return m.width >= min
 }
 
@@ -1017,8 +1018,30 @@ func (m tuiModel) boardShowCost() bool {
 	min := boardCostMinWidth
 	// The extra columns before TITLE (the credential cell when shown) push the threshold up by
 	// exactly their width; cost is false in both terms so it cancels, only the cred delta survives.
-	min += boardRowPrefixWidth(false, m.boardShowCred(), false) - boardRowPrefixWidth(false, false, false)
+	min += boardRowPrefixWidth(false, false, m.boardShowCred(), false) - boardRowPrefixWidth(false, false, false, false)
 	return m.width >= min
+}
+
+// boardShowDur gates the own-board DONE run-length column. The admin board lists non-terminal
+// runs only (AdminListRuns), so it never has a DONE row and never shows the column. On the own
+// board the cell is reserved on every row (blank outside DONE) so later columns stay aligned
+// across bands.
+//
+// Run length is the lowest-priority column: it is a retrospective signal, while the milestone
+// micro-bar, percentage and COST describe live work. So it is shown only when the whole row
+// still fits with it: the prefix with run length and COST, the micro-bar plus percentage, the
+// title floor, and the worker column counted unconditionally. Counting the worker column even
+// below its 120 breakpoint makes the threshold conservative but monotonic, so neither this
+// column nor the percentage flaps on/off across that breakpoint, and the #379 thresholds of
+// the milestone and COST columns are unchanged. Not derived from boardShowMile/boardShowProg
+// (both read this gate), so there is no visibility cycle.
+func (m tuiModel) boardShowDur() bool {
+	if m.board.admin {
+		return false
+	}
+	need := boardRowPrefixWidth(false, true, m.boardShowCred(), true) +
+		boardMileWidth + 1 + boardProgPctWidth + 2 + boardProgTitleFloor + boardWorkerColumnWidth
+	return m.width >= need
 }
 
 // boardShowCred reserves an account column when the viewer holds multiple

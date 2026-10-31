@@ -108,6 +108,7 @@ Every scene is rendered from the SHIPPED model, `-dark` and `-light`.
 | `board-populated` / `board-empty` / `board-admin` / `board-filter` | the run board: mixed statuses/health, empty state, factory-wide admin (OWNER), and the `/` filter |
 | `board-done-failures` / `board-done-failures-selected` | one dimmed red for DONE failure state tokens, their issue links and every DONE issues judge badge; full-red active issues badges and failure count; quiet human stops, with and without selection |
 | `board-done-age` | recent finishes from older runs, legacy finish fallback, and unchanged active age |
+| `board-done-run-length-160` | `board-done-age` at 160 columns: DONE rows show run length after the age (blank without a finish stamp; running row blank) |
 | `detail-running` | detail, live, crew rail focused, ⇣ following |
 | `detail-milestones-attributed` | two in-progress milestones each attributed to its subagent; the D3 unique-match lane also shows live age (PRD #1224) |
 | `detail-focus-transcript` | detail with the transcript pane focused |

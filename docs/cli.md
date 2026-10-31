@@ -1922,7 +1922,14 @@ A newer release is available.
   `subscription` or unreported run, and a blank cell for no recorded usage;
   it too is hidden on
   a narrow terminal, dropping right after the micro-bar does so the title is
-  never squeezed. `[h]` hides finished runs (completed/failed/cancelled),
+  never squeezed. On your own board, a DONE row also shows its **run length**
+  right after the AGE (which, on a DONE row, is how long ago it finished): wall
+  time from the run's first start to its finish, so approval waits, limit parks
+  and pauses count too. It is blank for a run that never started or has no
+  finish stamp, and blank on active rows (the cell is reserved so columns line
+  up). It is the lowest-priority column: it appears only at 111 columns or wider
+  (123 with the account column) and is the first to go on a narrowing terminal.
+  `[h]` hides finished runs (completed/failed/cancelled),
   leaving the active and needs-you runs. The rows are grouped into three
   triage bands (NEEDS YOU, then ON THE FLOOR, then DONE) rather than one
   flat table. Failed and `needs landing` DONE rows use one dimmed red for
@@ -1933,7 +1940,7 @@ A newer release is available.
   `▌` andon strip and
   status glyph, the run id, the status WORD in its own colour (a stalled run
   reads `▲ stalled`, because health folds into the status token rather than
-  a separate column), the AGE, the milestone micro-bar, the COST cell, and
+  a separate column), the AGE, the DONE run length, the milestone micro-bar, the COST cell, and
   the TITLE; there are no STATUS/HEALTH/MILE column headers or full-width
   rules. The list windows to the terminal height so the wordmark and key
   legend stay on screen however many runs there are, with the visible run

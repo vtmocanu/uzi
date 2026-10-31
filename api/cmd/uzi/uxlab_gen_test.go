@@ -110,7 +110,8 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"worker-rejected-cached":            func(d bool) string { return rejectedScene(d, "worker", 0, false) },
 		"board-done-failures":               func(d bool) string { return boardDoneFailures(d, false) },
 		"board-done-failures-selected":      func(d bool) string { return boardDoneFailures(d, true) },
-		"board-done-age":                    func(d bool) string { return boardDoneAge(d, now) },
+		"board-done-age":                    func(d bool) string { return boardDoneAge(d, now, frameWidth) },
+		"board-done-run-length-160":         func(d bool) string { return boardDoneAge(d, now, 160) },
 		"board-codex":                       func(d bool) string { return boardCodex(d, now) },
 		"board-empty":                       boardEmpty,
 		"board-restart-hint": func(d bool) string {
@@ -682,23 +683,27 @@ func codexMeters() []apitypes.CodexAccountRateLimitDTO {
 // shows regardless.
 func codexSidebar() []string { return []string{"cx-team", "cx-old"} }
 
-// Issue #2965: recent finishes must look recent despite old creation dates.
-func boardDoneAge(dark bool, now time.Time) string {
+// Issue #2965: recent finishes must look recent despite old creation dates. At 160 columns the
+// DONE rows also show their run length (first start to finish) after the age: 1h12m, 4h5m, and
+// blank for the legacy row with no finish stamp; the running row's cell stays blank.
+func boardDoneAge(dark bool, now time.Time, width int) string {
 	runs := []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "active01-1", Kind: "issue", Status: "running",
-			IssueTitle: "Active age still uses creation", CreatedAt: now.Add(-48*time.Hour - 30*time.Minute), UpdatedAt: now}},
+			IssueTitle: "Active age still uses creation", CreatedAt: now.Add(-48*time.Hour - 30*time.Minute), UpdatedAt: now,
+			FirstStartedAt: tp(now.Add(-47 * time.Hour))}},
 		{RunDTO: apitypes.RunDTO{ID: "recent01-2", Kind: "issue", Status: "completed",
 			IssueTitle: "Older creation, latest finish", CreatedAt: now.Add(-48 * time.Hour),
-			UpdatedAt: now, FinishedAt: tp(now.Add(-2 * time.Minute))}},
+			UpdatedAt: now, FirstStartedAt: tp(now.Add(-74 * time.Minute)), FinishedAt: tp(now.Add(-2 * time.Minute))}},
 		{RunDTO: apitypes.RunDTO{ID: "earlier1-3", Kind: "issue", Status: "failed",
 			IssueTitle: "Earlier finish sorts below recent finish", CreatedAt: now.Add(-8 * time.Hour),
-			UpdatedAt: now, FinishedAt: tp(now.Add(-3 * time.Hour))}},
+			UpdatedAt: now, FirstStartedAt: tp(now.Add(-7*time.Hour - 5*time.Minute)), FinishedAt: tp(now.Add(-3 * time.Hour))}},
 		{RunDTO: apitypes.RunDTO{ID: "legacy01-4", Kind: "issue", Status: "cancelled",
 			IssueTitle: "Legacy finish falls back to last update", CreatedAt: now.Add(-24 * time.Hour),
-			UpdatedAt: now.Add(-5 * time.Hour)}},
+			UpdatedAt: now.Add(-5 * time.Hour), FirstStartedAt: tp(now.Add(-23 * time.Hour))}},
 	}
 	fake := &uzicli.FakeClient{Runs: runs}
 	m := uxModel(fake, "", dark)
+	m.width = width
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
 	return m.View().Content
 }
