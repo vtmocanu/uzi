@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import type { Run, PlanCrossCheckSummary } from "../lib/apiTypes";
+import { formatLocalTime } from "../lib/budget";
 import { costDisplay, costHeadline } from "../lib/costStatus";
 import { formatTokens } from "../lib/formatTokens";
 import { isTerminalRun } from "../lib/runStatus";
@@ -18,7 +19,31 @@ const reasons: Record<string, string> = {
   approved_not_stored: "Approved plan not stored", revisions_exhausted: "Revisions exhausted",
   codex_lead_unsupported: "Not yet supported for a Codex lead",
   planning_diff_refused: "Planning diff refused", candidate_refused: "Candidate refused",
+  worker_unsupported: "Not supported on this worker",
 };
+
+// PRD #3708: the coarse result a checked-before-your-review run shows for its gate reason.
+// Any other recorded reason means the check could not give a verdict: "Unavailable". The
+// precise reason stays on the "Current gate" line.
+const gatedResults: Record<string, string> = {
+  worker_unsupported: "Unavailable, not supported on this worker",
+  timed_out: "Timed out", model_timeout: "Timed out",
+  block: "Blocked", revisions_exhausted: "Revisions exhausted",
+  interrupted: "Interrupted", superseded: "Interrupted",
+  revise: "Changes requested",
+};
+
+// The lead's response states (PRD #3708). None of them claims a finding was resolved.
+const responseStates: Record<string, { label: string; note?: string }> = {
+  reported: { label: "Reported" },
+  truncated: { label: "Reported, truncated", note: "The response was longer than the stored limit; the rest is omitted." },
+  not_reported: { label: "Not reported", note: "The next plan had no cross-check dispositions section." },
+  unknown: { label: "Unknown", note: "The next plan was too long to look for a response." },
+  replanned_after_interruption: { label: "Replanned after an interruption", note: "The lead started a new plan after an interruption, so no response was recorded." },
+  reported_in_presented_plan: { label: "From the presented plan; not checked" },
+  no_following_candidate: { label: "No following plan", note: "No plan followed this round." },
+};
+const responseWithText = new Set(["reported", "truncated", "reported_in_presented_plan"]);
 
 const diffRefusals: Record<string, string> = {
   base_unavailable: "Base unavailable", diff_failed: "Diff failed", diff_too_large: "Diff too large",
@@ -112,6 +137,79 @@ function Findings({ value }: { value: unknown }) {
   </div>;
 }
 
+// Parsing is capped at 8,192 source characters, the server's own response cap.
+function Response({ value }: { value: unknown }) {
+  const r = record(value);
+  const state = typeof r.state === "string" && Object.prototype.hasOwnProperty.call(responseStates, r.state) ? r.state : undefined;
+  const text = state && responseWithText.has(state) && typeof r.text === "string" ? r.text.slice(0, 8192) : "";
+  const known = state ? responseStates[state] : undefined;
+  return <div className="space-y-1.5 rounded-md border border-dashed border-edge p-3">
+    <p className="flex flex-wrap items-center gap-2 text-xs text-muted">
+      <span>Lead&rsquo;s response (unverified claims)</span>
+      <Badge wrap>{known?.label ?? "Response unavailable"}</Badge>
+    </p>
+    {text.trim() !== "" ? <div className="judge-prose break-words"><Markdown content={text} /></div>
+      : known?.note && <p className="text-muted">{known.note}</p>}
+    {text.trim() !== "" && known?.note && <p className="text-xs text-muted">{known.note}</p>}
+  </div>;
+}
+
+// Each round fences the checker's findings (untrusted, possibly wrong advice) apart from
+// the lead's response to them (untrusted claims). Rounds are a real sequence, so they are
+// numbered; the dashed fence marks text nobody verified.
+function Rounds({ value, level }: { value: unknown; level: 3 | 4 }) {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const Heading = level === 3 ? "h3" : "h4";
+  return <ol aria-label="Plan cross-check rounds" className="space-y-4 border-l border-edge pl-3 sm:pl-4">
+    {value.slice(-5).map((item, i) => {
+      const r = record(item);
+      const n = safeRound(r.round);
+      const decided = typeof r.decided_at === "string" ? formatLocalTime(r.decided_at) : null;
+      const title = `${n === undefined ? "Round" : `Round ${n}`}: ${planCheckOutcome(r.verdict, r.reason_class)}`;
+      return <li key={i} aria-label={title} className="relative space-y-2">
+        <span aria-hidden="true" className="absolute -left-[1.15rem] top-0.5 h-3 w-3 sm:-left-[1.4rem] rounded-full border-2 border-edge bg-surface" />
+        <div className="flex flex-wrap items-baseline gap-x-2">
+          <Heading className="text-sm font-semibold text-fg">{title}</Heading>
+          {decided && <time className="text-xs text-muted" dateTime={r.decided_at as string}>{decided}</time>}
+        </div>
+        <div className="space-y-1.5 rounded-md border border-edge bg-raised/40 p-3">
+          <p className="text-xs text-muted">Checker findings (untrusted, may be wrong)</p>
+          {r.findings == null ? <p className="text-muted">No findings recorded.</p> : <Findings value={r.findings} />}
+        </div>
+        <Response value={r.response} />
+      </li>;
+    })}
+  </ol>;
+}
+
+// The shared "passed" rule (PRD #3708): no gate reason, the latest check approved, and that
+// check is of the current plan. Every surface (web, CLI, Slack) applies the same rule.
+function passedRounds(run: Run): number | undefined {
+  const s = run.plan_cross_check_summary;
+  if (!s || run.plan_cross_check_gate_reason != null || s.historical || planCheckOutcome(s.verdict, s.reason_class) !== "Passed") return undefined;
+  const rounds = Array.isArray(s.rounds) ? s.rounds : [];
+  const last = rounds.length > 0 ? record(rounds[rounds.length - 1]) : undefined;
+  if (last && planCheckOutcome(last.verdict, last.reason_class) !== "Passed") return undefined;
+  return safeRound(s.round);
+}
+
+function gatedResult(run: Run): string {
+  const s = run.plan_cross_check_summary;
+  const gate = run.plan_cross_check_gate_reason;
+  if (s && !s.historical && s.verdict === "pending" && gate == null) return "Pending";
+  const passed = passedRounds(run);
+  if (passed !== undefined) return `Passed after ${passed} ${passed === 1 ? "round" : "rounds"}`;
+  if (s?.historical) return "Checked an earlier version of this plan";
+  if (typeof gate === "string" && gate !== "") return Object.prototype.hasOwnProperty.call(gatedResults, gate) ? gatedResults[gate] : "Unavailable";
+  if (s) return planCheckOutcome(s.verdict, s.reason_class);
+  return gatedPending(run) ? "Pending" : "Not checked";
+}
+
+// A gated run before its first gate has no plan yet; its check has not had a chance to run.
+function gatedPending(run: Run): boolean {
+  return !isTerminalRun(run.status) && run.status !== "awaiting_approval" && !run.plan_md;
+}
+
 export function PlanCrossCheckEvent({ payload, detail }: { payload: unknown; detail?: PlanCrossCheckSummary }) {
   const p = record(payload);
   return <section aria-label="Plan cross-check event" className="rounded-xl border-edge bg-surface">
@@ -136,27 +234,35 @@ function effortSourceLabel(source: unknown): string {
 export function PlanCrossCheck({ run, presentation = "standalone" }: { run: Run; presentation?: "standalone" | "inset" }) {
   const s = run.plan_cross_check_summary;
   const gate = run.plan_cross_check_gate_reason;
-  if (!s && !gate && !run.plan_cross_check_required) return null;
+  const gated = run.plan_cross_check_gated === true;
+  if (!s && !gate && !run.plan_cross_check_required && !gated) return null;
   const outcome = s ? planCheckOutcome(s.verdict, s.reason_class)
-    : run.plan_cross_check_required ? isTerminalRun(run.status) ? "Not recorded" : "Pending" : "Outcome unavailable";
+    : run.plan_cross_check_required || gated ? isTerminalRun(run.status) ? "Not recorded" : "Pending" : "Outcome unavailable";
+  const result = gated ? gatedResult(run) : s?.historical ? "Superseded" : outcome;
+  const rounds = Array.isArray(s?.rounds) && s.rounds.length > 0;
+  const deadline = s && !s.historical && s.verdict === "pending" && typeof s.deadline_at === "string" ? formatLocalTime(s.deadline_at) : null;
   const usage = s?.usage;
   const cost = usage?.cost_status === "subscription" ? costHeadline(costDisplay("subscription", 0))
     : usage && typeof usage.cost_usd === "number" && Number.isFinite(usage.cost_usd) && usage.cost_usd >= 0
     ? costHeadline(costDisplay(usage.cost_status, usage.cost_usd)) : "Unavailable";
   const content = <>
     <CardHeader title="Plan cross-check" level={presentation === "inset" ? 3 : 2}
-      badge={<Badge>{s?.historical ? "Superseded" : outcome}</Badge>}
+      badge={<Badge wrap>{result}</Badge>}
       subtitle={s?.historical ? "Earlier-plan evidence" : undefined} actions={
       childId(s?.checker_run_id) && <Link className="text-info underline underline-offset-2 hover:underline focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/60" to={`/runs/${s.checker_run_id}`}>Open checker run</Link>
     } />
+    {gated && <p>Mode: checked before your review</p>}
     {gate && <p>Current gate: {reasonLabel(gate) ?? "Reason unavailable"}</p>}
     {gate === "planning_diff_refused" && run.plan_cross_check_diff_refusal != null && <p>Refusal: {diffRefusalLabel(run.plan_cross_check_diff_refusal)}</p>}
     {s && <p>{`${s.historical ? "Earlier-plan evidence" : "Checked candidate"}: ${planCheckOutcome(s.verdict, s.reason_class)}`}</p>}
     {!s && run.plan_cross_check_required && <p>{isTerminalRun(run.status) ? "This run ended without a plan cross-check result." : "Runs when the plan is ready, before it can proceed."}</p>}
-    {s && outcome === "Pending" && <p>No result recorded yet.</p>}
+    {!s && !run.plan_cross_check_required && gated && <p>{gatedPending(run) ? "Runs when the plan is ready, before your review." : "No check result for this plan."}</p>}
+    {s && outcome === "Pending" && (deadline
+      ? <p>Check in progress, deadline <time dateTime={s.deadline_at}>{deadline}</time></p>
+      : <p>No result recorded yet.</p>)}
     {s?.historical && <p>These findings concern an earlier plan; they do not certify the current plan.</p>}
     {s && <>
-      <Findings value={s.findings} />
+      {rounds ? <Rounds value={s.rounds} level={presentation === "inset" ? 4 : 3} /> : <Findings value={s.findings} />}
       <p className="flex flex-wrap gap-x-1 break-all text-xs text-muted">
         <span>Model: {plain(s.checker_model) || "Unreported"} ({sourceLabel(s.checker_model_source)})</span>
         <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Effort: {plain(s.checker_effort) || "Unreported"} ({effortSourceLabel(s.checker_effort_source)})</span></span>
