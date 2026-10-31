@@ -556,7 +556,7 @@ export class Outbox {
     try {
       const stat = await fs.lstat(this.root);
       if (stat.isSymbolicLink()) this.rootUnusable = "symlink";
-      else if (stat.isDirectory()) this.rootUnusable = "unreadable";
+      else if (!stat.isFile()) this.rootUnusable = "unreadable";
       return;
     } catch (err) {
       if (!["ENOENT", "ENOTDIR"].includes((err as NodeJS.ErrnoException).code ?? "")) {
@@ -565,17 +565,18 @@ export class Outbox {
       }
     }
     // Inspect components without following aliases, like the exact-target missing-root
-    // proof. Only a proven missing/non-directory path retains the ordinary fallback.
+    // proof. Only a proven missing path or regular file retains the ordinary fallback.
     let component = path.parse(this.root).root;
     for (const name of this.root.slice(component.length).split(path.sep)) {
       component = path.join(component, name);
       try {
         const stat = await fs.lstat(component);
         if (stat.isSymbolicLink()) { this.rootUnusable = "symlink"; return; }
-        if (!stat.isDirectory()) return;
+        if (stat.isFile()) return;
+        if (!stat.isDirectory()) { this.rootUnusable = "unreadable"; return; }
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code;
-        if (code !== "ENOENT" && code !== "ENOTDIR") this.rootUnusable = "unreadable";
+        if (code !== "ENOENT") this.rootUnusable = "unreadable";
         return;
       }
     }
