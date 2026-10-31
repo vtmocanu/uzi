@@ -668,9 +668,10 @@ WHERE status = 'online'
 -- query's own "name every column" convention so an unstamped path is visible in a diff
 -- of THIS file, and guarded by a per-path test rather than the compiler (the narg trap
 -- above applies identically).
-INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, issue_saved_body, issue_raw_digest, issue_input_reason, auto_approve_blocked_reasons, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required, code_cross_check_required)
+INSERT INTO runs (user_id, repo_id, issue_iid, issue_title, issue_description, issue_saved_body, issue_raw_digest, issue_input_reason, auto_approve_blocked_reasons, origin_column, move_pending_since, auto_approve, wait_on_limit, mr_rework_enabled, plan_md, plan_source, agent_source, agent_exclusions, planned_base_commit, require_base_match, model, override_subagent_model, issue_comments, review_comments, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, completion_contract_version, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required, plan_cross_check_gated, code_cross_check_required)
 VALUES (@user_id, @repo_id::uuid, @issue_iid, @issue_title, @issue_description, sqlc.narg('issue_saved_body'), sqlc.narg('issue_raw_digest'), sqlc.narg('issue_input_reason'), COALESCE(sqlc.narg('auto_approve_blocked_reasons')::text[], '{}'), sqlc.narg('origin_column'), now(), @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('plan_md'), @plan_source, sqlc.narg('agent_source'), sqlc.narg('agent_exclusions')::jsonb, sqlc.narg('planned_base_commit'), @require_base_match, sqlc.narg('model'), @override_subagent_model, sqlc.narg('issue_comments')::jsonb, sqlc.narg('review_comments')::jsonb, COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), COALESCE((SELECT rp.ignored_inferred_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, sqlc.narg('completion_contract_version'), @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'),
-    (@auto_approve AND @plan_source <> 'seeded' AND (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id)), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id))
+    (@auto_approve AND @plan_source <> 'seeded' AND (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id)),
+    (NOT @auto_approve AND @plan_source <> 'seeded' AND (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id)), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id))
 RETURNING *;
 
 -- name: GetRunByIDForUser :one
@@ -1900,7 +1901,7 @@ SELECT r.checkpoint_tip,
                   AND i.kind = 'approve_plan'
                   AND i.applied_at IS NOT NULL
                   AND i.disposition IS DISTINCT FROM 'superseded'
-                  AND (NOT r.plan_cross_check_required OR
+                  AND (NOT (r.plan_cross_check_required OR r.plan_cross_check_gated) OR
                        (r.plan_md IS NOT NULL
                         AND i.gate_binding = 'bound'
                         AND i.gate_revision = r.gate_revision
@@ -2097,7 +2098,8 @@ UPDATE runs SET
     -- SetRunAutopilotPlan clears on canonical application; the guards below admit
     -- a stored human plan only with its bound, applied approval.
     plan_cross_check_gate_reason = CASE
-        WHEN plan_cross_check_required AND (auto_approve OR plan_md IS NULL)
+        WHEN (plan_cross_check_required AND (auto_approve OR plan_md IS NULL))
+             OR (plan_cross_check_gated AND plan_md IS NULL)
             THEN plan_cross_check_gate_reason
         ELSE NULL END,
     status           = 'running',
@@ -2203,7 +2205,7 @@ UPDATE runs SET
     -- present set adds its members, deduped; `<@` is order-independent so it stays unsorted.
     -- A required plan's capabilities belong to the presented plan once plan_md is stored.
     -- Keep ClearRunRequiredCapabilities's owner clear intact, including an empty approved set.
-    required_capabilities = CASE WHEN plan_cross_check_required AND (auto_approve OR plan_md IS NOT NULL)
+    required_capabilities = CASE WHEN (plan_cross_check_required OR plan_cross_check_gated) AND (auto_approve OR plan_md IS NOT NULL)
         THEN required_capabilities
         ELSE ARRAY(SELECT DISTINCT unnest(required_capabilities || COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}'))) END,
     -- required_tools is SET, absent-safe: a present set REPLACES (the run's single
@@ -2211,12 +2213,12 @@ UPDATE runs SET
     -- existing column. The service only passes a non-empty filtered set, so a garbled/empty
     -- report leaves the param nil rather than wiping the column.
     capability_inference_evidence = COALESCE(sqlc.narg('capability_inference_evidence')::jsonb, runs.capability_inference_evidence),
-    required_tools = CASE WHEN plan_cross_check_required AND (auto_approve OR plan_md IS NOT NULL) THEN required_tools
+    required_tools = CASE WHEN (plan_cross_check_required OR plan_cross_check_gated) AND (auto_approve OR plan_md IS NOT NULL) THEN required_tools
         ELSE COALESCE(sqlc.narg('inferred_tools')::text[], required_tools) END,
     -- size_class is SET, absent-safe like required_tools: a present (clamped s/m/l) value
     -- REPLACES, an absent (NULL) param COALESCEs back. The service clamps to {s,m,l} before
     -- passing, so a garbled report becomes a nil param (no change) rather than a bad value.
-    size_class = CASE WHEN plan_cross_check_required AND (auto_approve OR plan_md IS NOT NULL) THEN size_class
+    size_class = CASE WHEN (plan_cross_check_required OR plan_cross_check_gated) AND (auto_approve OR plan_md IS NOT NULL) THEN size_class
         ELSE COALESCE(sqlc.narg('size_class'), size_class) END,
     -- PRD #122 M1: the FROZEN milestone list an AUTOPILOT run resolved for itself,
     -- with a SAFETY-NET fallback to milestones_candidate (issue #259). Written
@@ -2391,13 +2393,13 @@ WHERE runs.id = @id AND worker_id = @worker_id
   -- re-claimed ('claimed') before its worker reports running, so a running report against a
   -- queued row is always stale.
   AND status <> 'queued'
-  AND (NOT (plan_cross_check_required AND auto_approve) OR plan_md IS NOT NULL
+  AND (NOT ((plan_cross_check_required AND auto_approve) OR plan_cross_check_gated) OR plan_md IS NOT NULL
        OR (sqlc.narg('milestones_completed')::jsonb IS NULL
            AND sqlc.narg('milestones_in_progress')::jsonb IS NULL
            AND sqlc.narg('milestones_frozen')::jsonb IS NULL))
   -- A resumed claim or heartbeat must not use an earlier plan's approval.
   -- The initial pre-plan running report remains admissible.
-  AND (NOT plan_cross_check_required OR auto_approve OR plan_md IS NULL OR
+  AND (NOT (plan_cross_check_required OR plan_cross_check_gated) OR auto_approve OR plan_md IS NULL OR
        (gate_presented_payload->>'plan_md' = plan_md
         AND gate_presented_payload->'milestones' = COALESCE(milestones_candidate, 'null'::jsonb)
         AND gate_presented_payload->'required_tools' = to_jsonb(ARRAY(
@@ -2411,7 +2413,7 @@ WHERE runs.id = @id AND worker_id = @worker_id
               AND i.gate_binding = 'bound'
               AND i.gate_revision = runs.gate_revision)))
   AND (status <> 'awaiting_approval' OR
-       (plan_cross_check_required AND NOT auto_approve AND plan_md IS NOT NULL
+       ((plan_cross_check_required OR plan_cross_check_gated) AND NOT auto_approve AND plan_md IS NOT NULL
         AND gate_presented_payload->>'plan_md' = plan_md
         AND gate_presented_payload->'milestones' = COALESCE(milestones_candidate, 'null'::jsonb)
         AND gate_presented_payload->'required_tools' = to_jsonb(ARRAY(
@@ -2424,7 +2426,7 @@ WHERE runs.id = @id AND worker_id = @worker_id
               AND i.disposition IS DISTINCT FROM 'superseded'
               AND i.gate_binding = 'bound'
               AND i.gate_revision = runs.gate_revision))
-       OR (NOT plan_cross_check_required AND EXISTS (
+       OR (NOT (plan_cross_check_required OR plan_cross_check_gated) AND EXISTS (
             SELECT 1 FROM run_user_inputs i
             WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
               AND i.applied_at IS NOT NULL
@@ -2505,7 +2507,7 @@ WHERE runs.id = @id AND worker_id = @worker_id
 -- name: SetRunAwaitingApproval :execrows
 UPDATE runs SET
     plan_cross_check_gate_reason = CASE
-        WHEN NOT plan_cross_check_required THEN NULL
+        WHEN NOT (plan_cross_check_required OR plan_cross_check_gated) THEN NULL
         -- A human revision replaces the presented candidate. Its old findings
         -- remain history; they are no longer the current gate's reason.
         WHEN runs.plan_md IS NOT NULL AND (
@@ -2516,6 +2518,18 @@ UPDATE runs SET
             OR runs.required_tools IS DISTINCT FROM COALESCE(sqlc.narg('inferred_tools')::text[], runs.required_tools)
             OR runs.size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), runs.size_class))
             THEN NULL
+        -- PRD #3708 arm (a): a gated gate that was already presented keeps its stored reason
+        -- when a requeued or reclaimed lead re-presents it. A presented gated gate is never
+        -- re-checked (D16), so nothing here may re-derive or upgrade the reason.
+        WHEN runs.plan_cross_check_gated AND runs.gate_revision > 0 AND runs.plan_md IS NOT NULL
+            THEN runs.plan_cross_check_gate_reason
+        -- PRD #3708 arm (b): server-recorded "unavailable". setStateWithTx passes
+        -- server_gate_reason only for a gated run whose claiming worker does not advertise
+        -- cross_check_gated_v1; it is never a worker-declared value and no cross-check row
+        -- exists for such a run, so the no-row rule below must not turn it into 'interrupted'.
+        WHEN runs.plan_cross_check_gated AND sqlc.narg('server_gate_reason')::text = 'worker_unsupported'
+             AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = runs.id AND cc.stage = 'plan')
+            THEN 'worker_unsupported'
         -- An exact retry of a revised human presentation must retain its cleared
         -- current reason instead of restoring dissent about the historical candidate.
         WHEN runs.status = 'awaiting_approval' AND NOT runs.auto_approve
@@ -2536,6 +2550,11 @@ UPDATE runs SET
                     AND cc.lead_claim_generation <> runs.claim_generation
                     AND NOT COALESCE(cc.decided_at < cc.deadline_at, false)
                     THEN 'timed_out'
+                  -- PRD #3708: a gated run whose check lost custody on the last allowed round never
+                  -- got a verdict; it is interrupted, not revisions_exhausted.
+                  WHEN runs.plan_cross_check_gated AND cc.verdict = 'failed'
+                    AND cc.reason_class IN ('superseded','approved_not_stored')
+                    THEN 'interrupted'
                   WHEN cc.automatic_rounds_enabled AND cc.round >= cc.automatic_revision_limit + 1
                     AND (cc.verdict = 'revise' OR (cc.verdict = 'failed'
                       AND cc.reason_class IN ('superseded','approved_not_stored')
@@ -2543,6 +2562,25 @@ UPDATE runs SET
                     THEN 'revisions_exhausted'
                   WHEN cc.lead_claim_generation <> runs.claim_generation OR cc.reason_class IN ('superseded','approved_not_stored')
                     THEN 'interrupted'
+                  -- PRD #3708: a gated APPROVE carries no authority. The gate reads "passed"
+                  -- (NULL) only when the current-generation approve row is bound to exactly the
+                  -- candidate being presented (digest, plan, milestones, requirements); a missing
+                  -- digest or any mismatch is 'interrupted'. The report is not refused.
+                  WHEN cc.verdict = 'approve' AND runs.plan_cross_check_gated THEN COALESCE(
+                    CASE WHEN sqlc.narg('plan_cross_check_gate_reason')::text IN
+                      ('interrupted','candidate_refused','checker_failed','planning_diff_refused')
+                      THEN sqlc.narg('plan_cross_check_gate_reason')::text END,
+                    CASE WHEN cc.lead_claim_generation = runs.claim_generation
+                          AND cc.checker_harness <> runs.harness
+                          AND cc.candidate_digest = sqlc.narg('candidate_digest')::bytea
+                          AND cc.plan_md = @plan_md
+                          AND cc.milestones = sqlc.narg('milestones_candidate')::jsonb
+                          AND cc.required_capabilities <@ sqlc.narg('inferred_capabilities')::text[]
+                          AND sqlc.narg('inferred_capabilities')::text[] <@ cc.required_capabilities
+                          AND cc.required_tools <@ sqlc.narg('inferred_tools')::text[]
+                          AND sqlc.narg('inferred_tools')::text[] <@ cc.required_tools
+                          AND cc.size_class = sqlc.narg('size_class')::text
+                      THEN NULL ELSE 'interrupted' END)
                   WHEN cc.verdict = 'approve' THEN COALESCE(
                     CASE WHEN sqlc.narg('plan_cross_check_gate_reason')::text IN
                       ('interrupted','candidate_refused','checker_failed','planning_diff_refused')
@@ -2607,7 +2645,7 @@ UPDATE runs SET
     auto_approve = false,
     -- Invalidate a published gate when any approval-bearing value changes. Compare
     -- the effective values written below, so an exact retry retains its snapshot.
-    gate_presentation_id = CASE WHEN plan_cross_check_required AND (
+    gate_presentation_id = CASE WHEN (plan_cross_check_required OR plan_cross_check_gated) AND (
         runs.plan_md IS DISTINCT FROM @plan_md
         OR milestones_candidate IS DISTINCT FROM sqlc.narg('milestones_candidate')::jsonb
         OR NOT (
@@ -2618,7 +2656,7 @@ UPDATE runs SET
         OR runs.size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), runs.size_class)
     )
         THEN NULL ELSE gate_presentation_id END,
-    gate_presented_payload = CASE WHEN plan_cross_check_required AND (
+    gate_presented_payload = CASE WHEN (plan_cross_check_required OR plan_cross_check_gated) AND (
         runs.plan_md IS DISTINCT FROM @plan_md
         OR milestones_candidate IS DISTINCT FROM sqlc.narg('milestones_candidate')::jsonb
         OR NOT (
@@ -2629,7 +2667,7 @@ UPDATE runs SET
         OR runs.size_class IS DISTINCT FROM COALESCE(sqlc.narg('size_class'), runs.size_class)
     )
         THEN NULL ELSE gate_presented_payload END,
-    gate_payload_digest = CASE WHEN plan_cross_check_required AND (
+    gate_payload_digest = CASE WHEN (plan_cross_check_required OR plan_cross_check_gated) AND (
         runs.plan_md IS DISTINCT FROM @plan_md
         OR milestones_candidate IS DISTINCT FROM sqlc.narg('milestones_candidate')::jsonb
         OR NOT (
@@ -2727,7 +2765,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = @id AND worker_id = @worker_id
-  AND (NOT plan_cross_check_required OR (claim_generation = sqlc.narg('claim_generation')::bigint
+  AND (NOT (plan_cross_check_required OR plan_cross_check_gated) OR (claim_generation = sqlc.narg('claim_generation')::bigint
        AND claim_released_at IS NULL))
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- Symmetric with SetRunRunning's guard (PRD #35): the negative predicate above
@@ -2900,6 +2938,8 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id
            AND sp.candidate->>'digest' = encode(sqlc.arg('candidate_digest')::bytea, 'hex')))
   AND runs.status IN ('claimed', 'running')
   AND runs.auto_approve = true
+  -- PRD #3708: a gated run (never auto_approve under the mode CHECK) is refused explicitly too.
+  AND NOT runs.plan_cross_check_gated
   AND runs.plan_source = 'agent'
   AND (runs.plan_md IS NULL OR runs.plan_md = @plan_md)
   AND (NOT runs.plan_cross_check_required OR EXISTS (
@@ -4729,7 +4769,7 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_che
   -- Compare the fields approval does not itself mutate: the owner's capability
   -- override deliberately clears required_capabilities after approval.
   -- This remains closed between a new park and publication, and after requeue/reclaim.
-  AND (NOT plan_cross_check_required OR
+  AND (NOT (plan_cross_check_required OR plan_cross_check_gated) OR
        (plan_md IS NOT NULL AND (auto_approve OR
            (gate_presented_payload->>'plan_md' = plan_md
             AND gate_presented_payload->'milestones' = COALESCE(milestones_candidate, 'null'::jsonb)
@@ -11492,7 +11532,7 @@ WITH ins AS (
       AND r.claim_released_at IS NULL
       -- Match SetRunCompleted: compare the fields approval does not mutate;
       -- the owner's capability override clears required_capabilities after approval.
-      AND (NOT r.plan_cross_check_required OR
+      AND (NOT (r.plan_cross_check_required OR r.plan_cross_check_gated) OR
            (r.plan_md IS NOT NULL AND (r.auto_approve OR
                (r.gate_presented_payload->>'plan_md' = r.plan_md
                 AND r.gate_presented_payload->'milestones' = COALESCE(r.milestones_candidate, 'null'::jsonb)
@@ -11547,7 +11587,7 @@ WHERE runs.id = @run_id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross
   -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim is
   -- rejected even for a generation-less (legacy) report; a live claim still honours a NULL generation.
   AND (sqlc.narg('completion_non_closing_reason')::text IS NULL OR runs.kind = 'issue')
-      AND (NOT runs.plan_cross_check_required OR
+      AND (NOT (runs.plan_cross_check_required OR runs.plan_cross_check_gated) OR
            (runs.plan_md IS NOT NULL AND (runs.auto_approve OR
                (runs.gate_presented_payload->>'plan_md' = runs.plan_md
                 AND runs.gate_presented_payload->'milestones' = COALESCE(runs.milestones_candidate, 'null'::jsonb)
@@ -11815,7 +11855,8 @@ WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
   AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
   -- Guarded write (PRD #2460): the child is always the OPPOSITE family of its lead.
   AND lead.harness IN ('claude', 'codex') AND lead.harness <> @child_harness::text
-  AND lead.plan_cross_check_required AND lead.auto_approve
+  AND ((lead.plan_cross_check_required AND lead.auto_approve)
+       OR (lead.plan_cross_check_gated AND NOT lead.auto_approve))
   AND COALESCE(octet_length(lead.issue_title), 0) <= 4096
   AND COALESCE(octet_length(lead.issue_description), 0) <= 262144
 RETURNING *;

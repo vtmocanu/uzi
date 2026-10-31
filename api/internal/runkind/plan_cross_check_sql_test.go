@@ -18,13 +18,17 @@ func TestPlanCrossCheckableKinds(t *testing.T) {
 }
 
 // Every production INSERT into runs is enumerated here. Only the six eligible
-// statements may set the snapshot; the other seven rely on its false default.
+// statements may set the required snapshot; the other nine rely on its false default.
+// PRD #3708: only the three statements that take a caller-supplied auto_approve (issue,
+// schedule prompt, ci_fix) may also set the gated twin; the rest hard-code auto_approve=true
+// or write no plan cross-check column, so they can never enroll as gated.
 func TestPlanCrossCheckInsertParity(t *testing.T) {
 	eligible := map[string]bool{
 		"CreateRun": true, "CreatePromptRun": true, "CreateSelfImproveRun": true,
 		"CreateCIFixRun": true, "CreateAutoMRReworkRun": true,
 		"CreateManualMRReworkRunAndAdvance": true,
 	}
+	gatedEligible := map[string]bool{"CreateRun": true, "CreatePromptRun": true, "CreateCIFixRun": true}
 	others := map[string]bool{
 		"CreateChatRun": true, "CreateChatContinueRun": true, "CreateJobRun": true,
 		"CreateJudgeRun": true, "CreateTaskRun": true, "CreateThenFixRun": true,
@@ -71,6 +75,23 @@ func TestPlanCrossCheckInsertParity(t *testing.T) {
 			}
 			if got && !strings.Contains(sql.String(), "plan_cross_check_enabled") {
 				t.Errorf("%s: snapshot does not read owner setting", name)
+			}
+			gotGated := strings.Contains(columns, "plan_cross_check_gated")
+			if gotGated != gatedEligible[name] {
+				t.Errorf("%s: gated column = %t, gated eligible = %t", name, gotGated, gatedEligible[name])
+			}
+			if gotGated {
+				// The gated twin is the exact complement of the required snapshot on
+				// auto_approve, reading the same owner setting.
+				if !strings.Contains(sql.String(), "(NOT @auto_approve") {
+					t.Errorf("%s: gated snapshot does not require NOT @auto_approve", name)
+				}
+				if strings.Count(sql.String(), "plan_cross_check_enabled") != 2 {
+					t.Errorf("%s: required and gated snapshots must each read the owner setting once", name)
+				}
+				if !got {
+					t.Errorf("%s: gated snapshot without the required snapshot", name)
+				}
 			}
 		}
 	}

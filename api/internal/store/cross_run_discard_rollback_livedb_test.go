@@ -21,6 +21,18 @@ const witnessDiscardSQL = `UPDATE recovery_custody_holds SET state='discarded',
     live_worker_id=NULL,live_run_id=NULL,release_evidence='merged_predecessor_discard',
     merged_predecessor_discard_binding=$2::jsonb WHERE id=$1`
 
+// standAtWitnessMigration rolls later migrations back so the same-issue-witness migration (00386)
+// is the head under test. A Down to 385 otherwise first commits every later migration's Down,
+// which changes the version table the refusal assertions compare and takes locks on tables the
+// writer race is not about. Later Downs have their own tests (00387/00388: the gated rollback
+// tests in gated_cross_check_rollback_livedb_test.go).
+func standAtWitnessMigration(ctx context.Context, t *testing.T, dsn string) {
+	t.Helper()
+	if err := store.MigrateDownTo(ctx, dsn, 386); err != nil {
+		t.Fatalf("roll back to the witness migration: %v", err)
+	}
+}
+
 func witnessRollbackFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (heldFixture, uuid.UUID, string) {
 	t.Helper()
 	f := heldNewHoldFixture(ctx, t, pool, true, "cancelled", nil)
@@ -132,6 +144,7 @@ func TestCrossRunDiscardRollbackRoundTripLiveDB(t *testing.T) {
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
 	}
+	standAtWitnessMigration(ctx, t, dsn)
 	f, _, binding := witnessRollbackFixture(t, ctx, pool)
 	tag, err := pool.Exec(ctx, witnessDiscardSQL, f.hold, binding)
 	if err != nil || tag.RowsAffected() != 1 {
@@ -148,6 +161,7 @@ func TestCrossRunDiscardRollbackRoundTripLiveDB(t *testing.T) {
 // Every goroutine is joined before pool closure, including failure paths.
 func TestCrossRunDiscardRollbackRefusesWitnessLiveDB(t *testing.T) {
 	ctx, dsn, pool := heldMigratedPool(t, "witness_down_race_")
+	standAtWitnessMigration(ctx, t, dsn)
 	f, _, binding := witnessRollbackFixture(t, ctx, pool)
 	bounded, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()

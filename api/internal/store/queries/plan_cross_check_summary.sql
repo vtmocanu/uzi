@@ -40,3 +40,21 @@ WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
     AND (cc.checker_effort IS NULL OR octet_length(cc.checker_effort) <= 512)
 ORDER BY cc.round DESC
 LIMIT 1;
+
+-- name: ListPlanCrossCheckRounds :many
+-- PRD #3708: the newest five plan-check rounds of one lead (the caller reverses them to
+-- chronological order). Owner detail only, like GetLatestPlanCrossCheckSummary: owner-scoped,
+-- no locks and no writes. plan_md is returned only so the server can extract the lead's
+-- bounded "Cross-check dispositions" response from the FOLLOWING round's candidate; it never
+-- reaches a client. Findings over the 64 KiB cap are dropped to NULL rather than dropping the
+-- row, so the round sequence the response extraction walks stays contiguous.
+SELECT cc.round, cc.verdict, cc.reason_class, cc.lead_claim_generation,
+    cc.plan_md, cc.decided_at, cc.deadline_at,
+    (CASE WHEN cc.findings IS NULL OR octet_length(cc.findings::text) <= 65536
+        THEN cc.findings END)::jsonb AS findings
+FROM cross_checks cc
+JOIN runs lead ON lead.id = cc.lead_run_id
+WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
+    AND lead.kind <> 'cross_check' AND cc.stage = 'plan'
+ORDER BY cc.round DESC
+LIMIT 5;

@@ -197,7 +197,8 @@ func (tx *crossCheckBoundaryTx) Exec(_ context.Context, sql string, args ...any)
 		tx.t.Fatalf("unexpected write: %s", strings.Split(sql, "\n")[0])
 	}
 	tx.writes++
-	tx.reason = args[5].(pgtype.Text).String
+	// Positional: $7 is plan_cross_check_gate_reason (server_gate_reason is $6) in SetRunAwaitingApproval.
+	tx.reason = args[6].(pgtype.Text).String
 	return pgconn.NewCommandTag("UPDATE 0"), nil
 }
 

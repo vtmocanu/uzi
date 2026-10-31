@@ -107,3 +107,67 @@ func (q *Queries) GetLatestPlanCrossCheckSummary(ctx context.Context, arg GetLat
 	)
 	return i, err
 }
+
+const listPlanCrossCheckRounds = `-- name: ListPlanCrossCheckRounds :many
+SELECT cc.round, cc.verdict, cc.reason_class, cc.lead_claim_generation,
+    cc.plan_md, cc.decided_at, cc.deadline_at,
+    (CASE WHEN cc.findings IS NULL OR octet_length(cc.findings::text) <= 65536
+        THEN cc.findings END)::jsonb AS findings
+FROM cross_checks cc
+JOIN runs lead ON lead.id = cc.lead_run_id
+WHERE lead.id = $1 AND lead.user_id = $2
+    AND lead.kind <> 'cross_check' AND cc.stage = 'plan'
+ORDER BY cc.round DESC
+LIMIT 5
+`
+
+type ListPlanCrossCheckRoundsParams struct {
+	LeadRunID uuid.UUID `json:"lead_run_id"`
+	UserID    uuid.UUID `json:"user_id"`
+}
+
+type ListPlanCrossCheckRoundsRow struct {
+	Round               int32              `json:"round"`
+	Verdict             string             `json:"verdict"`
+	ReasonClass         pgtype.Text        `json:"reason_class"`
+	LeadClaimGeneration int64              `json:"lead_claim_generation"`
+	PlanMd              pgtype.Text        `json:"plan_md"`
+	DecidedAt           pgtype.Timestamptz `json:"decided_at"`
+	DeadlineAt          pgtype.Timestamptz `json:"deadline_at"`
+	Findings            []byte             `json:"findings"`
+}
+
+// PRD #3708: the newest five plan-check rounds of one lead (the caller reverses them to
+// chronological order). Owner detail only, like GetLatestPlanCrossCheckSummary: owner-scoped,
+// no locks and no writes. plan_md is returned only so the server can extract the lead's
+// bounded "Cross-check dispositions" response from the FOLLOWING round's candidate; it never
+// reaches a client. Findings over the 64 KiB cap are dropped to NULL rather than dropping the
+// row, so the round sequence the response extraction walks stays contiguous.
+func (q *Queries) ListPlanCrossCheckRounds(ctx context.Context, arg ListPlanCrossCheckRoundsParams) ([]ListPlanCrossCheckRoundsRow, error) {
+	rows, err := q.db.Query(ctx, listPlanCrossCheckRounds, arg.LeadRunID, arg.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPlanCrossCheckRoundsRow{}
+	for rows.Next() {
+		var i ListPlanCrossCheckRoundsRow
+		if err := rows.Scan(
+			&i.Round,
+			&i.Verdict,
+			&i.ReasonClass,
+			&i.LeadClaimGeneration,
+			&i.PlanMd,
+			&i.DecidedAt,
+			&i.DeadlineAt,
+			&i.Findings,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

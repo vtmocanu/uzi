@@ -58,6 +58,16 @@ func TestPlanCrossCheckSnapshotWritersLiveDB(t *testing.T) {
 						if run.PlanCrossCheckRequired != want {
 							t.Fatalf("snapshot=%v want=%v", run.PlanCrossCheckRequired, want)
 						}
+						// PRD #3708: the gated twin is the complement on auto_approve, for the
+						// three writers that take a caller-supplied auto_approve. The two modes
+						// are never both set.
+						wantGated := consent && !auto && !seeded
+						if run.PlanCrossCheckGated != wantGated {
+							t.Fatalf("gated snapshot=%v want=%v", run.PlanCrossCheckGated, wantGated)
+						}
+						if run.PlanCrossCheckGated && run.PlanCrossCheckRequired {
+							t.Fatal("run snapshotted both required and gated")
+						}
 						mustExec(ctx, t, f.pool, "UPDATE users SET plan_cross_check_enabled=$2 WHERE id=$1", f.userID, !consent)
 						persisted, err := f.q.GetRunByID(ctx, run.ID)
 						if err != nil {
@@ -65,6 +75,9 @@ func TestPlanCrossCheckSnapshotWritersLiveDB(t *testing.T) {
 						}
 						if persisted.PlanCrossCheckRequired != want {
 							t.Fatalf("toggle rewrote snapshot=%v want=%v", persisted.PlanCrossCheckRequired, want)
+						}
+						if persisted.PlanCrossCheckGated != wantGated {
+							t.Fatalf("toggle rewrote gated snapshot=%v want=%v", persisted.PlanCrossCheckGated, wantGated)
 						}
 					})
 				}
@@ -123,7 +136,7 @@ func TestPlanCrossCheckExcludedSnapshotWritersLiveDB(t *testing.T) {
 			if run.ID == uuid.Nil {
 				t.Fatalf("%s did not insert a run", writer)
 			}
-			if run.PlanCrossCheckRequired {
+			if run.PlanCrossCheckRequired || run.PlanCrossCheckGated {
 				t.Fatalf("%s inherited snapshot", writer)
 			}
 			mustExec(ctx, t, f.pool, "UPDATE users SET plan_cross_check_enabled=false WHERE id=$1", f.userID)
@@ -131,7 +144,7 @@ func TestPlanCrossCheckExcludedSnapshotWritersLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if persisted.PlanCrossCheckRequired {
+			if persisted.PlanCrossCheckRequired || persisted.PlanCrossCheckGated {
 				t.Fatalf("%s persisted an excluded snapshot", writer)
 			}
 		})
