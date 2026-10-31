@@ -364,7 +364,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
      GUIDANCE asks only for steps the agent can do in-run. It has no network git, so never
      require fetching or merging live `main` (or any worker-, forge- or lander-only step):
      an impossible precondition spins the run into its iteration budget. Integrate `main`
-     yourself after the rework lands.
+     locally after the rework completes, then validate the integrated PR head before merging.
      On-demand rework ignores the per-run and per-user auto-rework settings, so a run
      created with `--mr-rework=false` can still be reworked and needs no toggle. A 409
      "disabled" is the admin kill-switch: report it, never downgrade a big fix to a local
