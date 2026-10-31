@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -14,7 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #3708 R3: the migration pair 00387/00388 is fail-closed on the way down and recreatable on
+// PRD #3708 R3: the gated migration pair (derived from the filenames) is fail-closed on the way down and recreatable on
 // the way up. Every test here migrates its own UUID-named database, never the shared one.
 
 type gatedSchemaFacts struct {
@@ -57,15 +58,45 @@ func requireGatedSchema(t *testing.T, stage string, got, want gatedSchemaFacts) 
 	}
 }
 
-var (
-	gatedHead = gatedSchemaFacts{version: 388, column: true, trigger: true, function: true,
+// gatedMigrationVersions derives the pair's versions from the embedded migration filenames, so
+// a landing-time renumber (task migration:renumber renames files but rewrites no Go literal)
+// cannot leave this file pinned to stale numbers. below is the version just under the pair.
+func gatedMigrationVersions(t *testing.T) (up, validate, below int64) {
+	t.Helper()
+	version := func(pattern string) int64 {
+		t.Helper()
+		matches, err := filepath.Glob(filepath.Join("migrations", pattern))
+		if err != nil || len(matches) != 1 {
+			t.Fatalf("migrations/%s: matches=%v err=%v, want exactly one", pattern, matches, err)
+		}
+		prefix, _, _ := strings.Cut(filepath.Base(matches[0]), "_")
+		v, err := strconv.ParseInt(prefix, 10, 64)
+		if err != nil {
+			t.Fatalf("%s: %v", matches[0], err)
+		}
+		return v
+	}
+	up = version("*_plan_cross_check_gated.sql")
+	validate = version("*_plan_cross_check_gated_validate.sql")
+	if validate != up+1 {
+		t.Fatalf("gated migration pair is not adjacent: %d, %d", up, validate)
+	}
+	return up, validate, up - 1
+}
+
+// gatedSchemas returns the three expected schema states for the derived versions.
+func gatedSchemas(t *testing.T) (head, between, below gatedSchemaFacts) {
+	t.Helper()
+	up, validate, lower := gatedMigrationVersions(t)
+	head = gatedSchemaFacts{version: validate, column: true, trigger: true, function: true,
 		modeCheck: true, modeValidated: true, reasonHasNew: true, reasonValidate: true}
-	// Between the pair: 00387 applied, 00388's VALIDATE not.
-	gatedBetween = gatedSchemaFacts{version: 387, column: true, trigger: true, function: true,
+	// Between the pair: the first applied, the second's VALIDATE not.
+	between = gatedSchemaFacts{version: up, column: true, trigger: true, function: true,
 		modeCheck: true, modeValidated: false, reasonHasNew: true, reasonValidate: false}
-	// After 00387's Down: the 00312 reason list, restored NOT VALID.
-	gatedBelow = gatedSchemaFacts{version: 386, reasonHasNew: false, reasonValidate: false}
-)
+	// After the first's Down: the 00312 reason list, restored NOT VALID.
+	below = gatedSchemaFacts{version: lower, reasonHasNew: false, reasonValidate: false}
+	return head, between, below
+}
 
 // rollbackOwner creates the user and repo every kind=issue row needs (runs_kind_shape).
 func rollbackOwner(ctx context.Context, t *testing.T, pool *pgxpool.Pool) rollbackIDs {
@@ -105,6 +136,8 @@ func requireRefusedDown(t *testing.T, err error) {
 }
 
 func TestGatedPlanCrossCheckMigrationDownLiveDB(t *testing.T) {
+	wantHead, wantBetween, wantBelow := gatedSchemas(t)
+	upV, _, lowerV := gatedMigrationVersions(t)
 	ctx, dsn := standIsolatedDB(t, "gated_down_")
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
@@ -115,39 +148,39 @@ func TestGatedPlanCrossCheckMigrationDownLiveDB(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 	owner := rollbackOwner(ctx, t, pool)
-	requireGatedSchema(t, "head", gatedFacts(ctx, t, pool), gatedHead)
+	requireGatedSchema(t, "head", gatedFacts(ctx, t, pool), wantHead)
 
-	// 00388's Down refuses first, including an awaiting_approval run that already carries an
+	// The second migration's Down refuses first, including an awaiting_approval run that already carries an
 	// applied approval (approval does not make it terminal).
 	approved := insertRollbackRun(ctx, t, pool, owner, "awaiting_approval", "")
 	mustExec(ctx, t, pool, `UPDATE runs SET plan_md = 'p', gate_revision = 1, gate_presented_payload = '{"plan_md":"p"}' WHERE id = $1`, approved)
 	mustExec(ctx, t, pool, `INSERT INTO run_user_inputs (run_id, kind, body, consumed_at, applied_at, disposition, gate_binding, gate_revision)
 		VALUES ($1, 'approve_plan', '{}', now(), now(), 'applied', 'bound', 1)`, approved)
-	requireRefusedDown(t, store.MigrateDownTo(ctx, dsn, 386))
-	requireGatedSchema(t, "after refused 00388 Down", gatedFacts(ctx, t, pool), gatedHead)
+	requireRefusedDown(t, store.MigrateDownTo(ctx, dsn, lowerV))
+	requireGatedSchema(t, "after refused validate-migration Down", gatedFacts(ctx, t, pool), wantHead)
 	for _, status := range []string{"queued", "running"} {
 		mustExec(ctx, t, pool, `UPDATE runs SET status = $2 WHERE id = $1`, approved, status)
-		requireRefusedDown(t, store.MigrateDownTo(ctx, dsn, 386))
-		requireGatedSchema(t, "after refused Down with a "+status+" gated run", gatedFacts(ctx, t, pool), gatedHead)
+		requireRefusedDown(t, store.MigrateDownTo(ctx, dsn, lowerV))
+		requireGatedSchema(t, "after refused Down with a "+status+" gated run", gatedFacts(ctx, t, pool), wantHead)
 	}
 
-	// 00387's Down carries the same guard: stand at 00387, add a live gated run, refuse again.
+	// The first migration's Down carries the same guard: stand at it, add a live gated run, refuse again.
 	mustExec(ctx, t, pool, `UPDATE runs SET status = 'cancelled' WHERE id = $1`, approved)
-	if err := store.MigrateDownTo(ctx, dsn, 387); err != nil {
-		t.Fatalf("Down to 00387 with only terminal gated runs: %v", err)
+	if err := store.MigrateDownTo(ctx, dsn, upV); err != nil {
+		t.Fatalf("Down to the first gated migration with only terminal gated runs: %v", err)
 	}
-	requireGatedSchema(t, "at 00387", gatedFacts(ctx, t, pool), gatedBetween)
+	requireGatedSchema(t, "between the pair", gatedFacts(ctx, t, pool), wantBetween)
 	live := insertRollbackRun(ctx, t, pool, owner, "running", "")
-	requireRefusedDown(t, store.MigrateDownTo(ctx, dsn, 386))
-	requireGatedSchema(t, "after refused 00387 Down", gatedFacts(ctx, t, pool), gatedBetween)
+	requireRefusedDown(t, store.MigrateDownTo(ctx, dsn, lowerV))
+	requireGatedSchema(t, "after refused first-migration Down", gatedFacts(ctx, t, pool), wantBetween)
 
 	// Terminal runs: worker_unsupported is remapped, everything else is removed.
 	mustExec(ctx, t, pool, `UPDATE runs SET status = 'completed' WHERE id = $1`, live)
 	unsupported := insertRollbackRun(ctx, t, pool, owner, "cancelled", "worker_unsupported")
-	if err := store.MigrateDownTo(ctx, dsn, 386); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, lowerV); err != nil {
 		t.Fatalf("Down with only terminal gated runs: %v", err)
 	}
-	requireGatedSchema(t, "at 00386", gatedFacts(ctx, t, pool), gatedBelow)
+	requireGatedSchema(t, "below the pair", gatedFacts(ctx, t, pool), wantBelow)
 	var remapped string
 	if err := pool.QueryRow(ctx, `SELECT plan_cross_check_gate_reason FROM runs WHERE id = $1`, unsupported).Scan(&remapped); err != nil || remapped != "checker_unavailable" {
 		t.Fatalf("worker_unsupported remapped to %q (err=%v), want checker_unavailable", remapped, err)
@@ -160,6 +193,8 @@ func TestGatedPlanCrossCheckMigrationDownLiveDB(t *testing.T) {
 // Up -> Down -> Up recreates the column, constraints, trigger and function (twice, so a leftover
 // object from a Down would fail the second Up), and the recreated trigger still guards the gate.
 func TestGatedPlanCrossCheckMigrationCycleLiveDB(t *testing.T) {
+	wantHead, _, wantBelow := gatedSchemas(t)
+	_, _, lowerV := gatedMigrationVersions(t)
 	ctx, dsn := standIsolatedDB(t, "gated_cycle_")
 	var owner rollbackIDs
 	for cycle := 1; cycle <= 2; cycle++ {
@@ -173,7 +208,7 @@ func TestGatedPlanCrossCheckMigrationCycleLiveDB(t *testing.T) {
 		if cycle == 1 {
 			owner = rollbackOwner(ctx, t, pool)
 		}
-		requireGatedSchema(t, "cycle Up", gatedFacts(ctx, t, pool), gatedHead)
+		requireGatedSchema(t, "cycle Up", gatedFacts(ctx, t, pool), wantHead)
 
 		// An insert-matrix row and the trigger behave again after the Up.
 		run := insertRollbackRun(ctx, t, pool, owner, "awaiting_approval", "")
@@ -189,14 +224,14 @@ func TestGatedPlanCrossCheckMigrationCycleLiveDB(t *testing.T) {
 
 		mustExec(ctx, t, pool, `UPDATE runs SET status = 'failed' WHERE plan_cross_check_gated`)
 		pool.Close()
-		if err := store.MigrateDownTo(ctx, dsn, 386); err != nil {
+		if err := store.MigrateDownTo(ctx, dsn, lowerV); err != nil {
 			t.Fatalf("cycle %d Down: %v", cycle, err)
 		}
 		pool, err = store.OpenPool(ctx, dsn)
 		if err != nil {
 			t.Fatal(err)
 		}
-		requireGatedSchema(t, "cycle Down", gatedFacts(ctx, t, pool), gatedBelow)
+		requireGatedSchema(t, "cycle Down", gatedFacts(ctx, t, pool), wantBelow)
 		pool.Close()
 	}
 	// The schema also ends where a never-downgraded database does.
@@ -208,7 +243,7 @@ func TestGatedPlanCrossCheckMigrationCycleLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	requireGatedSchema(t, "final Up", gatedFacts(ctx, t, pool), gatedHead)
+	requireGatedSchema(t, "final Up", gatedFacts(ctx, t, pool), wantHead)
 }
 
 // The operator's drain script, executed against a real database: it raises while any gated run is

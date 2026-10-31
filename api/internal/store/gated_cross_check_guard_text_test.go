@@ -53,8 +53,13 @@ func TestGatedCrossCheckGuardTextParity(t *testing.T) {
 		!strings.Contains(script, "status NOT IN ('completed', 'failed', 'cancelled')") {
 		t.Fatalf("drain script lost its lock or terminal set:\n%s", script)
 	}
-	for _, name := range []string{"00387_plan_cross_check_gated.sql", "00388_plan_cross_check_gated_validate.sql"} {
-		body := readFile(t, filepath.Join("migrations", name))
+	for _, pattern := range []string{"*_plan_cross_check_gated.sql", "*_plan_cross_check_gated_validate.sql"} {
+		matches, err := filepath.Glob(filepath.Join("migrations", pattern))
+		if err != nil || len(matches) != 1 {
+			t.Fatalf("migrations/%s: matches=%v err=%v, want exactly one", pattern, matches, err)
+		}
+		name := filepath.Base(matches[0])
+		body := readFile(t, matches[0])
 		down := body[strings.Index(body, "-- +goose Down"):]
 		if got := guardBlock(t, down); got != script {
 			t.Errorf("%s Down guard differs from the drain script:\n--- migration\n%s\n--- script\n%s", name, got, script)

@@ -255,6 +255,57 @@ func TestGatedPlanCrossCheckRunningBackstopLiveDB(t *testing.T) {
 	}
 }
 
+// SetRunRunning's resume guard: a reclaimed claim must not run on an earlier plan's approval.
+// A gated run approved plan A at revision 1, then re-presented plan B at revision 2 (unapproved);
+// after a requeue and a new claim generation, the running report is refused and the claim context
+// does not read the stale approval as a plan approval.
+func TestGatedPlanCrossCheckReclaimDoesNotReuseEarlierApprovalLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := setupGatedRun(ctx, t)
+	gatedPark(ctx, t, f, "plan A", 1, nil)
+	rev1 := publishPlanCrossCheckGate(ctx, t, f, "plan A")
+	gatedApprove(ctx, t, f, rev1)
+	gatedPark(ctx, t, f, "plan B", 1, nil)
+	if rev2 := publishPlanCrossCheckGate(ctx, t, f, "plan B"); rev2 <= rev1 {
+		t.Fatalf("revision did not advance: %d -> %d", rev1, rev2)
+	}
+	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'queued' WHERE id = $1`, f.runID)
+	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'claimed', claim_generation = 2 WHERE id = $1`, f.runID)
+	rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{ID: f.runID, WorkerID: pgU(f.workerID)})
+	if err != nil || rows != 0 {
+		t.Fatalf("reclaimed run on an earlier plan's approval: rows=%d err=%v, want 0", rows, err)
+	}
+	claim, err := f.q.GetRunClaimContext(ctx, f.runID)
+	if err != nil || claim.HumanPlanApproved {
+		t.Fatalf("claim approval=%v err=%v, want false", claim.HumanPlanApproved, err)
+	}
+}
+
+// SetRunRunning's milestone guard: a claimed gated run with no stored plan cannot report
+// milestone progress or a frozen contract (there is no plan those milestones belong to).
+func TestGatedPlanCrossCheckMilestonesRefusedWithoutPlanLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := setupGatedRun(ctx, t)
+	mustExec(ctx, t, f.pool, `UPDATE runs SET status = 'claimed', plan_md = NULL WHERE id = $1`, f.runID)
+	for name, mutate := range map[string]func(*store.SetRunRunningParams){
+		"milestones_completed":   func(p *store.SetRunRunningParams) { p.MilestonesCompleted = []byte(`[]`) },
+		"milestones_in_progress": func(p *store.SetRunRunningParams) { p.MilestonesInProgress = []byte(`[]`) },
+		"milestones_frozen":      func(p *store.SetRunRunningParams) { p.MilestonesFrozen = []byte(`[]`) },
+	} {
+		p := store.SetRunRunningParams{ID: f.runID, WorkerID: pgU(f.workerID)}
+		mutate(&p)
+		rows, err := f.q.SetRunRunning(ctx, p)
+		if err != nil || rows != 0 {
+			t.Fatalf("%s without a plan: rows=%d err=%v, want 0", name, rows, err)
+		}
+	}
+	// The initial pre-plan running report (no milestone params) stays admissible.
+	rows, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{ID: f.runID, WorkerID: pgU(f.workerID)})
+	if err != nil || rows != 1 {
+		t.Fatalf("pre-plan running report: rows=%d err=%v, want 1", rows, err)
+	}
+}
+
 // An ordinary (neither required nor gated) row keeps the any-prior-approve arm.
 func TestGatedPlanCrossCheckOrdinaryRunningUnchangedLiveDB(t *testing.T) {
 	ctx := context.Background()
@@ -333,6 +384,21 @@ func TestGatedPlanApprovalTriggerLiveDB(t *testing.T) {
 	refused("approval over a different presented plan")
 	mustExec(ctx, t, f.pool, `UPDATE runs SET gate_presented_payload = jsonb_set(gate_presented_payload, '{plan_md}', to_jsonb(plan_md)) WHERE id = $1`, f.runID)
 
+	// The same UPDATE may not also rewrite the plan, the presented payload or the gate revision
+	// the (current, bound) approval was recorded against.
+	for _, tc := range []struct{ name, set string }{
+		{"a changed plan_md", `plan_md = 'a different plan'`},
+		{"a changed presented payload", `gate_presented_payload = jsonb_set(gate_presented_payload, '{size_class}', '"l"')`},
+		{"a changed gate revision", `gate_revision = gate_revision + 1`},
+	} {
+		_, err := f.pool.Exec(ctx, `UPDATE runs SET status = 'running', `+tc.set+` WHERE id = $1`, f.runID)
+		requirePgCheckViolation(t, err, "runs_gated_plan_approval")
+		var status string
+		if err := f.pool.QueryRow(ctx, `SELECT status FROM runs WHERE id = $1`, f.runID).Scan(&status); err != nil || status != "awaiting_approval" {
+			t.Fatalf("%s: refused update changed status to %q (err=%v)", tc.name, status, err)
+		}
+	}
+
 	// Edges the trigger does not guard stay open: leaving the gate for a terminal state.
 	if _, err := f.pool.Exec(ctx, `UPDATE runs SET status = 'cancelled' WHERE id = $1`, f.runID); err != nil {
 		t.Fatalf("cancelling a gated gate: %v", err)
@@ -379,6 +445,9 @@ func TestGatedPlanCrossCheckApproveBindingLiveDB(t *testing.T) {
 		{name: "missing milestones", mutate: func(p *store.SetRunAwaitingApprovalParams) { exact(p); p.MilestonesCandidate = nil }, want: "interrupted"},
 		{name: "capabilities mismatch", mutate: func(p *store.SetRunAwaitingApprovalParams) { exact(p); p.InferredCapabilities = []string{"docker"} }, want: "interrupted"},
 		{name: "tools mismatch", mutate: func(p *store.SetRunAwaitingApprovalParams) { exact(p); p.InferredTools = []string{"go"} }, want: "interrupted"},
+		// A nil (absent) array is the empty set, not NULL: it must not turn the comparison NULL.
+		{name: "nil capabilities", mutate: func(p *store.SetRunAwaitingApprovalParams) { exact(p); p.InferredCapabilities = nil }, want: ""},
+		{name: "nil tools", mutate: func(p *store.SetRunAwaitingApprovalParams) { exact(p); p.InferredTools = nil }, want: ""},
 		{name: "size mismatch", mutate: func(p *store.SetRunAwaitingApprovalParams) { exact(p); p.SizeClass = pgT("m") }, want: "interrupted"},
 		{name: "worker refusal keeps its reason", mutate: func(p *store.SetRunAwaitingApprovalParams) {
 			exact(p)

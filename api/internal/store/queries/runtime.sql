@@ -2576,10 +2576,12 @@ UPDATE runs SET
                           AND cc.plan_md = @plan_md
                           AND (cc.milestones = sqlc.narg('milestones_candidate')::jsonb
                                OR (runs.kind <> 'issue' AND sqlc.narg('milestones_candidate')::jsonb IS NULL))
-                          AND cc.required_capabilities <@ sqlc.narg('inferred_capabilities')::text[]
-                          AND sqlc.narg('inferred_capabilities')::text[] <@ cc.required_capabilities
-                          AND cc.required_tools <@ sqlc.narg('inferred_tools')::text[]
-                          AND sqlc.narg('inferred_tools')::text[] <@ cc.required_tools
+                          -- A NULL (absent) array is the empty set: the stored candidate's arrays are
+                          -- NOT NULL, so a nil bind must not turn the comparison into NULL (interrupted).
+                          AND cc.required_capabilities <@ COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}')
+                          AND COALESCE(sqlc.narg('inferred_capabilities')::text[], '{}') <@ cc.required_capabilities
+                          AND cc.required_tools <@ COALESCE(sqlc.narg('inferred_tools')::text[], '{}')
+                          AND COALESCE(sqlc.narg('inferred_tools')::text[], '{}') <@ cc.required_tools
                           AND cc.size_class = sqlc.narg('size_class')::text
                       THEN NULL ELSE 'interrupted' END)
                   WHEN cc.verdict = 'approve' THEN COALESCE(

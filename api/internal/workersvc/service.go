@@ -4963,8 +4963,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		rows, err = q.SetRunRunning(ctx, runningParams)
 		if isGatedPlanApprovalViolation(err) {
 			// PRD #3708: the version-independent trigger refused an awaiting_approval ->
-			// running edge with no current bound approval, a race the WHERE clause cannot see
-			// (an approval superseded between the predicate and the trigger). It is the same
+			// running edge with no current bound approval. The SetRunRunning predicate already
+			// requires the same approval, so this mapping is defensive: it is not reachable via
+			// DiscardRunInputRows, which only touches unapplied rows and so cannot supersede an
+			// applied approval between the predicate and the trigger. It is the same
 			// stale/refused outcome as 0 rows, never a 500. The failed statement aborted the
 			// fence transaction, so nothing in it may commit.
 			if fenceTx != nil {
@@ -5059,9 +5061,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				planMd:             approvalParams.PlanMd,
 				milestones:         approvalParams.MilestonesCandidate,
 				milestonesReported: req.Milestones != nil,
-				caps:               inferredCaps,
-				tools:              inferredTools,
-				sizeClass:          sizeClass,
+				// approvalParams, not the pre-bind inferred values: for a gated run
+				// bindGatedAwaitingApproval rewrote them, and SetRunAwaitingApproval writes
+				// those, so the presented payload must describe the same requirements.
+				caps:      approvalParams.InferredCapabilities,
+				tools:     approvalParams.InferredTools,
+				sizeClass: approvalParams.SizeClass,
 			})
 			if err != nil {
 				return store.Run{}, false, err

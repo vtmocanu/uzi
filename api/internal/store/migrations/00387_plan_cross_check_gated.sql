@@ -38,12 +38,18 @@ ALTER TABLE runs ADD CONSTRAINT runs_plan_cross_check_gate_reason_check CHECK (
 -- Fail-closed backstop that works under any api binary: leaving a gated awaiting_approval
 -- gate for running needs an applied, bound, non-superseded approve_plan input for the
 -- current gate revision and a stored plan equal to the presented one. This is a strict
--- subset of the SetRunRunning bound arm and only guards that one edge.
+-- subset of the SetRunRunning bound arm and only guards that one edge (the same UPDATE may
+-- not also change the plan, presented payload or gate revision).
 -- +goose StatementBegin
 CREATE FUNCTION enforce_gated_plan_approval() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
     IF OLD.plan_md IS NOT NULL
+       -- The same UPDATE must not also rewrite the plan, the presented payload or the gate
+       -- revision the approval was bound to.
+       AND NEW.plan_md IS NOT DISTINCT FROM OLD.plan_md
+       AND NEW.gate_presented_payload IS NOT DISTINCT FROM OLD.gate_presented_payload
+       AND NEW.gate_revision = OLD.gate_revision
        AND OLD.gate_presented_payload->>'plan_md' = OLD.plan_md
        AND EXISTS (
            SELECT 1 FROM run_user_inputs i

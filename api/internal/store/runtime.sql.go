@@ -20676,10 +20676,12 @@ UPDATE runs SET
                           AND cc.plan_md = $1
                           AND (cc.milestones = $2::jsonb
                                OR (runs.kind <> 'issue' AND $2::jsonb IS NULL))
-                          AND cc.required_capabilities <@ $3::text[]
-                          AND $3::text[] <@ cc.required_capabilities
-                          AND cc.required_tools <@ $4::text[]
-                          AND $4::text[] <@ cc.required_tools
+                          -- A NULL (absent) array is the empty set: the stored candidate's arrays are
+                          -- NOT NULL, so a nil bind must not turn the comparison into NULL (interrupted).
+                          AND cc.required_capabilities <@ COALESCE($3::text[], '{}')
+                          AND COALESCE($3::text[], '{}') <@ cc.required_capabilities
+                          AND cc.required_tools <@ COALESCE($4::text[], '{}')
+                          AND COALESCE($4::text[], '{}') <@ cc.required_tools
                           AND cc.size_class = $5::text
                       THEN NULL ELSE 'interrupted' END)
                   WHEN cc.verdict = 'approve' THEN COALESCE(
