@@ -35,6 +35,10 @@ const (
 	commandSandboxBestEffort = "best-effort"
 )
 
+// maxSafeJSInteger is Number.MAX_SAFE_INTEGER (2^53-1): the worker parses
+// UZI_CODEX_COMMAND_CACHE_RUN_BYTES as a JS number, so a larger value would lose precision.
+const maxSafeJSInteger uint64 = 9007199254740991
+
 // Config holds the controller's runtime settings.
 type Config struct {
 	RollConcurrency   int
@@ -201,6 +205,13 @@ type Config struct {
 	// default install's pod stays byte-identical and a worker image older than the "off"
 	// mode never receives a value it would refuse to boot on.
 	WorkerCommandSandbox string
+	// WorkerCommandCacheRunBytes is the per-run Codex command-cache byte budget
+	// (UZI_CODEX_COMMAND_CACHE_RUN_BYTES), kept as the validated plain-decimal string. Empty
+	// means unset: the worker applies its own default (4 GiB); "0" disables live rotation. A
+	// set value must be a plain non-negative decimal no larger than 9007199254740991 (the
+	// worker parses it as a JS safe integer); anything else is a BOOT error. Rendered onto the
+	// worker container only when non-empty, so a default install's pod stays byte-identical.
+	WorkerCommandCacheRunBytes string
 
 	// --- drain policy (PRD #422 M5) -------------------------------------------
 	// DrainDeadline bounds busy deferral for independent NONDRIFTED pressure/nix-size
@@ -567,6 +578,16 @@ func loadWorkerSettings(cfg *Config) error {
 			return fmt.Errorf("UZI_CODEX_COMMAND_SANDBOX=%q is not a recognized mode (want %q, %q or %q)",
 				raw, commandSandboxOff, commandSandboxRequired, commandSandboxBestEffort)
 		}
+	}
+
+	// The per-run Codex command-cache byte budget: unset stays "" (worker default); a set
+	// value must be a plain decimal within the JS safe-integer range, else a BOOT error.
+	if raw := strings.TrimSpace(os.Getenv("UZI_CODEX_COMMAND_CACHE_RUN_BYTES")); raw != "" {
+		n, perr := strconv.ParseUint(raw, 10, 64)
+		if perr != nil || n > maxSafeJSInteger || (len(raw) > 1 && raw[0] == '0') {
+			return fmt.Errorf("UZI_CODEX_COMMAND_CACHE_RUN_BYTES=%q is not a plain decimal byte count between 0 and %d", raw, maxSafeJSInteger)
+		}
+		cfg.WorkerCommandCacheRunBytes = raw
 	}
 
 	// The docker tier (PRD #83 M3): namespace + sidecar image, both or neither. No

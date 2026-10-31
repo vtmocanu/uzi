@@ -192,6 +192,9 @@ export interface BuildRunExecutorDeps {
   /** PRD #1493 M3: true when the sandbox is running degraded (mode off, or
    *  best-effort on a Landlock-less kernel); the CodexExecutor writes one feed line per run. */
   codexSandboxDegraded: boolean;
+  /** Issue #3675: per-run command-cache rotation threshold in bytes (0 disables;
+   *  absent leaves the executor's rotation off). */
+  codexCommandCacheRunBytes?: number;
 }
 
 /**
@@ -311,6 +314,7 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
         // withBoundary AFTER run() returns, and executeClaim's finally calls safety.dispose
         // once the last sink settles — so run()'s finally must leave the registry ALIVE.
         deferRegistryTeardown: true,
+        ...(deps.codexCommandCacheRunBytes === undefined ? {} : { commandCacheRunBytes: deps.codexCommandCacheRunBytes }),
       },
     );
     return { executor, homeDir: runHome };
@@ -615,6 +619,7 @@ async function main(): Promise<void> {
       dockerWiring: config.dockerWiring,
       codexCommandSandbox: config.codexCommandSandbox,
       codexSandboxDegraded: config.codexHarness.degraded,
+      codexCommandCacheRunBytes: config.codexCommandCacheRunBytes,
     });
   // PRD #1429 M3: the Codex advice-harness factory judge/review thread into
   // runReadOnlyModelPass (model-pass.ts) so a Codex judge/review claim (secrets.codex

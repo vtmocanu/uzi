@@ -226,6 +226,12 @@ func Reason(err error) string {
 		return "owner"
 	case errors.Is(err, ErrDeadline):
 		return "deadline"
+	case errors.Is(err, ErrEntryLimit):
+		return "entries"
+	case errors.Is(err, ErrDepthLimit):
+		return "depth"
+	case errors.Is(err, ErrByteLimit):
+		return "bytes"
 	default:
 		return "io"
 	}
@@ -302,6 +308,11 @@ const (
 	// rootOpen maps ENOENT at the first O_PATH open, and only there, to
 	// ErrNotExist.
 	rootOpen
+	// readOnlyOpen is for a walk that must never change the tree (Measure): a
+	// directory needs only owner r+x (0500), and no mode bit is ever added.
+	// Missing r or x is ErrMismatch. It is never combined with
+	// restoreOwnerBits.
+	readOnlyOpen
 )
 
 // openDir opens name under dirfd as a readable directory owned by uid (and, when
@@ -364,7 +375,11 @@ func verifyPath(dirfd int, name string, want ident, uid int, flags openFlag, op 
 	if int(st.Uid) != uid {
 		return fail(ErrOwner)
 	}
-	if st.Mode&0o700 != 0o700 {
+	if flags&readOnlyOpen != 0 {
+		if st.Mode&0o500 != 0o500 {
+			return fail(fmt.Errorf("%w: %s: owner read/search bits missing", ErrMismatch, op))
+		}
+	} else if st.Mode&0o700 != 0o700 {
 		if flags&restoreOwnerBits == 0 {
 			return fail(fmt.Errorf("%w: %s: owner bits missing", ErrMismatch, op))
 		}
