@@ -109,6 +109,15 @@ const (
 	// A disabled stored credential override retains the schedule-wide hold/stop semantics.
 	SkipCredentialDisabled SkipReason = "credential_disabled" //nolint:gosec // G101: a schedule-skip-reason VOCABULARY value, not a credential (see SkipNoUsableCredential).
 
+	// SkipCodexPoolUnavailable ← workersvc.ErrCodexPoolUnavailable (issue #3719): the schedule
+	// pins the Codex harness, the owner runs codex_account_mode 'auto' with a configured pool, and
+	// no pooled alias can be bound (every one is unlinked, quarantined or needs
+	// re-authentication). Handled exactly like SkipCredentialDisabled: the fire starts no run and
+	// never falls back to Claude, a recurring row advances and re-fires next cadence, and a
+	// one-time row is held un-advanced with this skip recorded in last_fire
+	// (holdsOnceCredentialDisabled) until the owner fixes the pool.
+	SkipCodexPoolUnavailable SkipReason = "codex_pool_unavailable"
+
 	// The ci_watch fire path (PRD #2865). Each is benign: the schedule advances and the
 	// next cadence tries again. ci_green: every watched workflow's newest completed
 	// execution succeeded. ci_already_handled: this execution was already handled, and a
@@ -156,6 +165,7 @@ var AllSkipReasons = []SkipReason{
 	SkipSchedulesPaused,
 	SkipNoUsableCredential,
 	SkipCredentialDisabled,
+	SkipCodexPoolUnavailable,
 	SkipCIGreen,
 	SkipCIAlreadyHandled,
 	SkipCIHaltedNoProgress,
@@ -199,6 +209,12 @@ func skipReasonForErr(err error) (SkipReason, bool) {
 		// resolving to Codex. The scheduler's fire-time gate normally catches this first, but the
 		// mapping keeps the classification stable if a fire ever surfaces it via the seam.
 		return SkipCodexOverrideConflict, true
+	case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
+		// Issue #3719: an explicit Codex harness whose auto-mode pool has no bindable alias.
+		// Checked before the generic credential arms: it wraps ErrNoCredentialForHarness, which
+		// otherwise stays a hard refusal. Benign and advancing like credential_disabled, and
+		// held for a one-time row (holdsOnceCredentialDisabled).
+		return SkipCodexPoolUnavailable, true
 	case errors.Is(err, workersvc.ErrCredentialDisabled), errors.Is(err, workersvc.ErrHarnessCredentialDisabled):
 		// PRD #1732 D2/D15: a disabled stored pin, or a pinned harness with no enabled
 		// credential. Checked before any other credential arm: ErrHarnessCredentialDisabled
@@ -220,7 +236,8 @@ func skipReasonForErr(err error) (SkipReason, bool) {
 }
 
 // holdsOnceCredentialDisabled reports whether a fire error is the credential_disabled refusal
-// (a disabled stored pin, or a pinned harness with no enabled credential) on a ONE-TIME
+// (a disabled stored pin, or a pinned harness with no enabled credential) or the
+// codex_pool_unavailable refusal (issue #3719) on a ONE-TIME
 // schedule. The fire paths return such an error instead of the benign advancing skip: advancing
 // a once row marks it fired and its pinned work would never start, while PRD #1732 D2 says
 // pinned work waits. process() then holds the row quietly (holdOnceCredentialDisabled): not
@@ -233,5 +250,5 @@ func holdsOnceCredentialDisabled(sched store.RunSchedule, err error) bool {
 		return false
 	}
 	reason, ok := skipReasonForErr(err)
-	return ok && reason == SkipCredentialDisabled
+	return ok && (reason == SkipCredentialDisabled || reason == SkipCodexPoolUnavailable)
 }

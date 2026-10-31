@@ -250,6 +250,8 @@ func (h *Handler) StartRunRework(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "another run (an issue run or a CI fix) is already working this branch")
 		case errors.Is(err, workersvc.ErrActiveMRReworkExists):
 			httpx.Error(w, http.StatusConflict, "a rework is already running for this merge request")
+		case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
+			httpx.JSON(w, http.StatusUnprocessableEntity, codexPoolUnavailableBody())
 		case errors.Is(err, workersvc.ErrNoCredentialForHarness):
 			// PRD #1429 M2 (D4): the derived rework INHERITS the source run's harness explicitly; if
 			// that harness is no longer usable, creation refuses with no fallback. Surface the typed

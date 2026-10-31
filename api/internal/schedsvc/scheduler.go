@@ -157,7 +157,7 @@ type RunCreator interface {
 	CreateSelfImproveRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, title, description string, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, explicit *workersvc.Harness) (store.Run, error)
 	// ScheduleCredentialDisabled is the read-only pre-fire check of a schedule's stored pin and
 	// pinned harness (PRD #1732 D2/D15): workersvc.ErrCredentialDisabled or
-	// workersvc.ErrHarnessCredentialDisabled when one is disabled, else nil (a lookup error is nil
+	// workersvc.ErrHarnessCredentialDisabled when one is disabled, workersvc.ErrCodexPoolUnavailable when an auto-mode Codex pool has no bindable alias, else nil (a lookup error is nil
 	// too; the fire's own checks decide it). process() runs it for a one-time row before any forge
 	// call, so a held row spends no forge call per tick.
 	ScheduleCredentialDisabled(ctx context.Context, userID uuid.UUID, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) error
@@ -399,7 +399,7 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule, pc *pa
 	// (a disable landing after the pre-check) is held the same way below.
 	if sched.Timing == "once" {
 		if err := e.runs.ScheduleCredentialDisabled(ctx, sched.UserID, fireCredentialOverride(sched), scheduleHarness(sched)); holdsOnceCredentialDisabled(sched, err) {
-			e.holdOnceCredentialDisabled(ctx, sched)
+			e.holdOnceCredentialDisabled(ctx, sched, heldSkipReason(err))
 			return
 		}
 	}
@@ -418,7 +418,7 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule, pc *pa
 	// a manual fire never persists a last_fire (Decision 3).
 	out, fireErr := e.fireOne(ctx, sched)
 	if holdsOnceCredentialDisabled(sched, fireErr) {
-		e.holdOnceCredentialDisabled(ctx, sched)
+		e.holdOnceCredentialDisabled(ctx, sched, heldSkipReason(fireErr))
 		return
 	}
 	e.advance(ctx, sched, out, fireErr)
@@ -430,9 +430,9 @@ func (e *Scheduler) process(ctx context.Context, sched store.RunSchedule, pc *pa
 // pin, like the paused-once hold above. It records the credential_disabled skip in last_fire so
 // the owner sees why (journey 8), writing only when the stored last_fire is not already that
 // skip, so a long hold does not rewrite the row every tick.
-func (e *Scheduler) holdOnceCredentialDisabled(ctx context.Context, sched store.RunSchedule) {
+func (e *Scheduler) holdOnceCredentialDisabled(ctx context.Context, sched store.RunSchedule, reason SkipReason) {
 	e.logger.Debug("scheduler: credential disabled, holding once schedule", "schedule", sched.ID.String())
-	out := credentialDisabledHoldOutcome(sched)
+	out := credentialDisabledHoldOutcome(sched, reason)
 	if lastFireIsHold(sched.LastFire, out) {
 		return
 	}
@@ -446,10 +446,19 @@ func (e *Scheduler) holdOnceCredentialDisabled(ctx context.Context, sched store.
 	}
 }
 
+// heldSkipReason is the skip reason a once-hold records for an error holdsOnceCredentialDisabled
+// accepted: credential_disabled or codex_pool_unavailable, as skipReasonForErr maps it.
+func heldSkipReason(err error) SkipReason {
+	if reason, ok := skipReasonForErr(err); ok {
+		return reason
+	}
+	return SkipCredentialDisabled
+}
+
 // credentialDisabledHoldOutcome is the fire outcome a credential_disabled hold records: one
 // schedule-wide skip, carrying the pinned issue for an issue target (RunNow answers the same).
-func credentialDisabledHoldOutcome(sched store.RunSchedule) FireOutcome {
-	skip := Skip{Reason: SkipCredentialDisabled}
+func credentialDisabledHoldOutcome(sched store.RunSchedule, reason SkipReason) FireOutcome {
+	skip := Skip{Reason: reason}
 	if sched.Target == "issue" {
 		iid := sched.IssueIid.Int64
 		skip.IssueIID = &iid
@@ -510,7 +519,7 @@ func (e *Scheduler) RunNow(ctx context.Context, sched store.RunSchedule) (FireOu
 	// PRD #1732 D2: likewise the one-time credential_disabled hold. RunNow never advances, so
 	// answer with the benign skip the recurring path records.
 	if holdsOnceCredentialDisabled(sched, err) {
-		skip := Skip{Reason: SkipCredentialDisabled}
+		skip := Skip{Reason: heldSkipReason(err)}
 		if sched.Target == "issue" {
 			iid := sched.IssueIid.Int64
 			skip.IssueIID = &iid
@@ -817,7 +826,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 				return FireOutcome{}, err
 			}
 			e.logger.Info("scheduler: sweep stopped, credential disabled mid-fire", "schedule", sched.ID.String(), "issue", iid, "reason", err)
-			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Title: issue.Title, Reason: SkipCredentialDisabled, WebURL: issue.WebURL})
+			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Title: issue.Title, Reason: heldSkipReason(err), WebURL: issue.WebURL})
 			break
 		}
 		var lookupErr *storedOverrideLookupError
@@ -1112,6 +1121,8 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 	if selection.LabelSelected && sched.Target != "issue" && !errors.Is(err, workersvc.ErrCredentialDisabled) {
 		var reason SkipReason
 		switch {
+		case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
+			reason = SkipCodexPoolUnavailable
 		case errors.Is(err, workersvc.ErrHarnessCredentialDisabled):
 			reason = SkipCredentialDisabled
 		case errors.Is(err, workersvc.ErrNoCredentialForHarness), errors.Is(err, workersvc.ErrNoUsableCredential):

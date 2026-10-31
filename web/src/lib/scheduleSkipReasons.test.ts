@@ -32,6 +32,7 @@ const ALL_SCHEDULE_SKIP_REASONS: ScheduleSkipReason[] = [
   "schedules_paused",
   "no_usable_credential",
   "credential_disabled",
+  "codex_pool_unavailable",
   "config_not_supported",
   "ci_green",
   "ci_already_handled",

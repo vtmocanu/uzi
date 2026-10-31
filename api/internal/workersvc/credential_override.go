@@ -135,7 +135,7 @@ func (s *Service) ScheduleCredentialDisabled(ctx context.Context, userID uuid.UU
 	if explicit == nil {
 		return nil
 	}
-	if _, err := s.resolveRunHarness(ctx, userID, explicit); errors.Is(err, errHarnessCredentialDisabled) {
+	if _, err := s.resolveRunHarness(ctx, userID, explicit); errors.Is(err, errHarnessCredentialDisabled) || errors.Is(err, errCodexPoolUnavailable) {
 		return err
 	}
 	return nil

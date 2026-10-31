@@ -62,6 +62,8 @@ const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
   // PRD #1732 (D2): the schedule's pinned credential is disabled, or its pinned harness has no
   // enabled credential. Actionable — the owner enables it in Settings — so it reads amber.
   credential_disabled: "warning",
+  // #3719: Codex auto mode with a pool but no eligible account. Actionable in Settings.
+  codex_pool_unavailable: "warning",
   // PRD #2865 (ci_watch): self-resolving outcomes of a CI-repair fire read neutral; a halted
   // episode or a repo without a default branch needs the owner, so it reads amber.
   ci_green: "neutral",

@@ -2098,6 +2098,14 @@ type Service struct {
 	// to the real freeze — so the seam is inert unless a test sets it, matching the
 	// publishFn/deleteCheckpointFn/background seam idiom above.
 	codexFreezeFn func(ctx context.Context, q codexFreezeStore, userID, runID, secretID uuid.UUID, authMode string) error
+	// codexSelectHook / codexSelectLockedHook / codexSelectBeforeFenceHook are test seams in
+	// createRunAtomic's Codex pool selection (issue #3719): the first runs after the harness
+	// resolves and before the shared secret-mutation lock is taken, the second right after the
+	// lock is held, the third after the run INSERT and before the alias fence (it receives the
+	// picked alias). Nil in production.
+	codexSelectHook            func(ctx context.Context)
+	codexSelectLockedHook      func(ctx context.Context)
+	codexSelectBeforeFenceHook func(ctx context.Context, picked uuid.UUID)
 	// claimHooks are the run-lane claim race seams (PRD #1590 M1): a LiveDB test injects a
 	// concurrent account or claim mutation between ClaimRun and assembly, after the Codex mint,
 	// or between assembly and the final exact-claim transaction. Nil in production, so every

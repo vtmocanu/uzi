@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/codexselect"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -89,6 +90,14 @@ var (
 	// with no fallback; the scheduler alone tells it apart to record the credential_disabled
 	// skip rather than a hard, non-advancing refusal.
 	errHarnessCredentialDisabled = fmt.Errorf("%w: the selected harness's credentials are all disabled; enable one in Settings", errNoCredentialForHarness)
+
+	// errCodexPoolUnavailable is errNoCredentialForHarness for an EXPLICIT Codex harness whose
+	// user runs codex_account_mode 'auto' with a configured pool in which no alias can be bound
+	// (every pooled alias is unlinked, quarantined or needs re-authentication; issue #3719). It
+	// WRAPS errNoCredentialForHarness, so every consumer keying on that keeps refusing the
+	// request with no fallback; the scheduler and handlers alone tell it apart to say why. The
+	// message is nonsecret and points at the remedy.
+	errCodexPoolUnavailable = fmt.Errorf("%w: no pooled Codex account is available; check Codex accounts in Settings", errNoCredentialForHarness)
 )
 
 // resolveHarness is the PURE D11 harness resolver (PRD #1332 D4, parent D11). It takes
@@ -143,7 +152,28 @@ type codexCredentialChoice struct {
 	SecretID uuid.UUID
 	Label    string
 	AuthMode string
+	// Select says how createRunAtomic binds the alias (issue #3719): codexChoiceDefault and
+	// codexChoicePoolEmpty bind SecretID as today; codexChoicePool means SecretID is NOT yet
+	// chosen and the creation transaction picks a pooled alias under the secret-mutation lock.
+	Select codexChoiceKind
 }
+
+// codexChoiceKind marks how a resolved Codex choice is bound (issue #3719). The first two
+// values double as the codexselect.Reason recorded for them.
+type codexChoiceKind string
+
+const (
+	// codexChoiceDefault: users.codex_account_mode is 'default' (today's path, untouched).
+	codexChoiceDefault codexChoiceKind = "default"
+	// codexChoicePoolEmpty: mode 'auto' but no alias is pooled, so the default is bound.
+	codexChoicePoolEmpty codexChoiceKind = "pool_empty"
+	// codexChoicePool: mode 'auto' with a configured pool that has a structurally eligible alias.
+	codexChoicePool codexChoiceKind = "pool"
+)
+
+// codexAccountModeAuto is users.codex_account_mode's opt-in value; every other value reads as
+// 'default'.
+const codexAccountModeAuto = "auto"
 
 // resolvedHarness is the full result of resolveRunHarness: the chosen harness and, when
 // that harness is Codex, the selected Codex credential. Codex is nil for a Claude run.
@@ -170,6 +200,9 @@ type harnessResolverStore interface {
 	CountEnabledCodexSecrets(ctx context.Context, userID uuid.UUID) (int64, error)
 	GetDefaultUserSecretMeta(ctx context.Context, arg store.GetDefaultUserSecretMetaParams) (store.GetDefaultUserSecretMetaRow, error)
 	GetCodexCredentialState(ctx context.Context, arg store.GetCodexCredentialStateParams) (store.CodexCredentialState, error)
+	// Issue #3719: the user's Codex account mode and pooled aliases decide usability in 'auto'.
+	GetUserCodexAccountMode(ctx context.Context, id uuid.UUID) (string, error)
+	ListCodexPoolAliases(ctx context.Context, userID uuid.UUID) ([]store.ListCodexPoolAliasesRow, error)
 }
 
 // errHarnessStoreUnavailable: the service's store does not expose the resolver's read
@@ -284,6 +317,15 @@ func explicitHarnessRefusal(ctx context.Context, q harnessResolverStore, userID 
 		if total > 0 && enabled == 0 {
 			return errHarnessCredentialDisabled
 		}
+		// Issue #3719: an 'auto' user with a configured pool was refused because no pooled
+		// alias is bindable, which is a different remedy from "add a credential".
+		auto, rows, err := codexAutoPool(ctx, q, userID)
+		if err != nil {
+			return err
+		}
+		if auto && len(rows) > 0 {
+			return errCodexPoolUnavailable
+		}
 	}
 	return errNoCredentialForHarness
 }
@@ -397,6 +439,65 @@ func (s *Service) userDefaultHarness(ctx context.Context, userID uuid.UUID, q ha
 // (D4: "a failed or missing subscription never spends an API key"). It is reads only — no
 // lock or lease (D6).
 func (s *Service) resolveUsableCodexCredential(ctx context.Context, userID uuid.UUID, q harnessResolverStore) (codexCredentialChoice, bool, error) {
+	// Issue #3719: users.codex_account_mode decides which rule applies. 'default' (and anything
+	// unrecognised) is today's rule, untouched. 'auto' with no pooled alias is today's rule
+	// too, marked pool_empty. 'auto' with a configured pool is usable iff at least one pooled
+	// alias is structurally eligible; scores are never read here, and the alias itself is picked
+	// inside the creation transaction (selectCodexPoolAlias).
+	auto, rows, err := codexAutoPool(ctx, q, userID)
+	if err != nil {
+		return codexCredentialChoice{}, false, err
+	}
+	if auto && len(rows) > 0 {
+		for _, r := range rows {
+			if codexPoolRowStructural(r) {
+				return codexCredentialChoice{AuthMode: codexAuthModeSubscription, Select: codexChoicePool}, true, nil
+			}
+		}
+		return codexCredentialChoice{}, false, nil
+	}
+	choice, usable, err := s.resolveDefaultCodexCredential(ctx, userID, q)
+	if err != nil || !usable {
+		return codexCredentialChoice{}, false, err
+	}
+	choice.Select = codexChoiceDefault
+	if auto {
+		choice.Select = codexChoicePoolEmpty
+	}
+	return choice, true, nil
+}
+
+// codexAutoPool reads the user's Codex account mode and, only in 'auto', their pooled aliases
+// (disabled ones included, so "configured but all disabled" stays distinct from "empty").
+// Mode 'default' reads no pool, so its path costs one extra single-row read.
+func codexAutoPool(ctx context.Context, q harnessResolverStore, userID uuid.UUID) (auto bool, rows []store.ListCodexPoolAliasesRow, err error) {
+	mode, err := q.GetUserCodexAccountMode(ctx, userID)
+	if err != nil {
+		return false, nil, fmt.Errorf("harness resolve: read codex account mode: %w", err)
+	}
+	if mode != codexAccountModeAuto {
+		return false, nil, nil
+	}
+	rows, err = q.ListCodexPoolAliases(ctx, userID)
+	if err != nil {
+		return true, nil, fmt.Errorf("harness resolve: list codex pool: %w", err)
+	}
+	return true, rows, nil
+}
+
+// codexPoolRowStructural reports whether a pooled alias may EVER be bound: enabled, linked to
+// an account, the account not quarantined and not flagged for re-authentication. These are the
+// facts the usability rule reads; capacity (limits, cooldown, reserve) is the selector's job.
+func codexPoolRowStructural(r store.ListCodexPoolAliasesRow) bool {
+	return r.Enabled &&
+		r.LinkStatus.Valid && r.LinkStatus.String == codexStatusLinked &&
+		r.ProviderAccountID.Valid && r.ProviderUserID.Valid && r.WorkspaceAccountID.Valid &&
+		r.CoordState.Valid && r.CoordState.String != codexCoordQuarantined &&
+		r.ReauthRequired.Valid && !r.ReauthRequired.Bool
+}
+
+// resolveDefaultCodexCredential is the PRD #1332 D4 default-credential rule.
+func (s *Service) resolveDefaultCodexCredential(ctx context.Context, userID uuid.UUID, q harnessResolverStore) (codexCredentialChoice, bool, error) {
 	// Cheap "is Codex configured at all" guard. Zero ENABLED codex credentials ⇒ no default
 	// to select (PRD #1732 D4/D15: disabling the slot's last credential clears its default) ⇒
 	// Codex unusable, without the per-kind default lookups.
@@ -528,6 +629,31 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		return store.Run{}, resolvedHarness{}, err
 	}
 
+	// Issue #3719: a pool choice picks its alias HERE, under the user's shared secret-mutation
+	// lock and BEFORE the run INSERT, so no run row is held while the lock is taken (the lock
+	// order migrate.go's LockSecretMutation documents). The pool rows and account links cannot
+	// change between the pick and the commit.
+	var pick codexPoolPick
+	pooled := res.Harness == HarnessCodex && res.Codex != nil && res.Codex.Select == codexChoicePool
+	if pooled {
+		if s.codexSelectHook != nil {
+			s.codexSelectHook(ctx)
+		}
+		if lerr := store.LockSecretMutationShared(ctx, tx, userID); lerr != nil {
+			return store.Run{}, resolvedHarness{}, fmt.Errorf("codex pool select: lock: %w", lerr)
+		}
+		if s.codexSelectLockedHook != nil {
+			s.codexSelectLockedHook(ctx)
+		}
+		pick, err = s.selectCodexPoolAlias(ctx, qtx, userID, nil)
+		if err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
+		choice := *res.Codex
+		choice.SecretID = pick.AliasID
+		res.Codex = &choice
+	}
+
 	run, err := insert(qtx, res)
 	if err != nil {
 		return store.Run{}, resolvedHarness{}, err
@@ -539,6 +665,22 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		if res.Codex == nil {
 			return store.Run{}, resolvedHarness{}, errNoUsableCredential
 		}
+		if pooled {
+			if s.codexSelectBeforeFenceHook != nil {
+				s.codexSelectBeforeFenceHook(ctx, pick.AliasID)
+			}
+			// The consent and link fence: re-validate the pick under a share lock on its alias
+			// row, after the INSERT (users KEY SHARE, then the alias row, then the credential
+			// state: every writer's order). The shared advisory lock above makes a failure
+			// defensive, not expected; on one the alias is dropped and the pool re-selected.
+			pick, err = s.fenceCodexPoolAlias(ctx, qtx, userID, pick)
+			if err != nil {
+				return store.Run{}, resolvedHarness{}, err
+			}
+			choice := *res.Codex
+			choice.SecretID = pick.AliasID
+			res.Codex = &choice
+		}
 		freeze := s.freezeCodexBinding
 		if s.codexFreezeFn != nil {
 			freeze = s.codexFreezeFn
@@ -546,6 +688,21 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		if ferr := freeze(ctx, qtx, userID, run.ID, res.Codex.SecretID, res.Codex.AuthMode); ferr != nil {
 			return store.Run{}, resolvedHarness{}, ferr
 		}
+		reason := codexselect.Reason(res.Codex.Select)
+		if pooled {
+			if cerr := s.checkFrozenCodexAccount(ctx, qtx, userID, run.ID, pick); cerr != nil {
+				return store.Run{}, resolvedHarness{}, cerr
+			}
+			reason = pick.Reason
+		}
+		n, rerr := qtx.SetRunCodexSelectReason(ctx, store.SetRunCodexSelectReasonParams{Reason: string(reason), ID: run.ID, UserID: userID})
+		if rerr != nil {
+			return store.Run{}, resolvedHarness{}, fmt.Errorf("codex select reason: %w", rerr)
+		}
+		if n != 1 {
+			return store.Run{}, resolvedHarness{}, fmt.Errorf("codex select reason: wrote %d rows, want 1", n)
+		}
+		run.CodexSelectReason = pgtype.Text{String: string(reason), Valid: true}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
