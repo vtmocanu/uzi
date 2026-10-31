@@ -25,8 +25,8 @@ On 2026-10-31, lead and buddy accepted the narrow generic protocol capability
 `pending_outcome_scoped_claim_v1` for landing with the user's consent to their
 recommendation. This dated acceptance amends the former absolute prohibition on
 a second capability; it does not invent a prior owner decision or waive
-validation. The user approved after the lead disclosed the new wire capability
-and its earlier auto-approval history. It is independent of the single unreleased
+validation. The owner consented to this acceptance on 2026-10-31, conditional on
+buddy agreement, which was given. It is independent of the single unreleased
 policy contract
 `provider_policy_hold_v1`, which remains unadvertised by the API.
 
