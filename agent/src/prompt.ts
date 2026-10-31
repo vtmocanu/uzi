@@ -168,15 +168,25 @@ const LEAD_EXPORT_SLOT_RULE = [
   "Never reassign a slot until the dispatch that held it has returned.",
 ].join("\n");
 
-/** Shared across customized leads and every subagent on both harnesses. */
+/** Shared across customized leads and every subagent on both harnesses. Issue #3721: owner-only
+ *  items are plan sections, never milestones, so a run no longer parks at completion for them. */
 const COMPLETION_DELIVERY_GUIDANCE = [
   "Source issue closing directives must never go in commit messages. The worker controls issue closing via the PR body.",
-  "Plan human/live acceptance as a separate, final informative milestone: name the remaining verification,",
-  "why the worker cannot perform it, the responsible actor, and actionable steps. Coding, docs, tests,",
-  "mandatory gates, security and review remain worker obligations. Mixed or ambiguous milestones block completion.",
+  "Put checks that inherently need the PR/merge environment (for example exact-head PR CI), or an already-authorized",
+  "issue-specific landing fallback, in a \"Landing obligations\" plan section, not a milestone.",
+  "Put live, hosted or human-judgment acceptance in an \"Owner acceptance\" plan section, not a milestone: name the",
+  "remaining verification, why the worker cannot perform it, the responsible actor, and actionable steps.",
+  "Coding, docs, tests, mandatory gates, security and review remain worker obligations and never move to either section,",
+  "even if the lander repeats a check or the worker lacks time, permissions or tooling. Mixed or ambiguous milestones block completion.",
   "Environment limits, permissions and automatic approval do not waive those obligations.",
-  "Pending human/live acceptance requires a formal owner partial decision with exact kept and deferred milestone IDs",
-  "and a reason. Plan approval, ordinary answers and non_closing never change frozen scope or supply that decision.",
+  "When the plan has Owner acceptance items, declare `non_closing` with a reason naming them as pending and not verified,",
+  "and list each as a `deferred` `pr_summary` scope note.",
+  "Resolve classification from the issue, the repository and prior owner instructions; if consequential doubt remains,",
+  "use ask_user before the final submit_plan, also on an auto-approved run, never a question in plan prose,",
+  "and never silently omit ambiguous work from the milestones.",
+  "These sections apply to new, unfrozen plans. A frozen milestone that remains unmet still requires",
+  "a formal owner partial decision with exact kept and deferred milestone IDs and a reason.",
+  "Plan approval, ordinary answers and non_closing never change frozen scope or supply that decision.",
   "Never describe unperformed checks as accepted or done; report what remains and the actual evidence.",
 ].join("\n");
 

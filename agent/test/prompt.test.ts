@@ -2645,11 +2645,17 @@ describe("M2 completion delivery guidance", () => {
       const prompt = buildLeadSystemPrompt("Custom lead body", { harness }).append;
       for (const phrase of [
         "closing directives must never go in commit messages", "worker controls issue closing via the PR body",
-        "separate, final informative milestone", "remaining verification", "responsible actor", "actionable steps",
+        "\"Landing obligations\" plan section, not a milestone", "\"Owner acceptance\" plan section, not a milestone",
+        "exact-head PR CI", "declare `non_closing` with a reason naming them as pending and not verified",
+        "list each as a `deferred` `pr_summary` scope note", "use ask_user before the final submit_plan",
+        "never move to either section", "remaining verification", "responsible actor", "actionable steps",
         "mandatory gates, security and review remain worker obligations", "Mixed or ambiguous milestones block completion",
         "Environment limits, permissions and automatic approval do not waive", "formal owner partial decision",
         "exact kept and deferred milestone IDs", "Never describe unperformed checks as accepted or done",
       ]) assert.ok(prompt.includes(phrase), phrase);
+      // Issue #3721: owner-only acceptance is a plan section, never a final informative milestone.
+      assert.ok(!prompt.includes("informative milestone"), "the informative-milestone rule is gone");
+      assert.ok(!prompt.includes("Pending human/live acceptance requires"), "pending acceptance no longer asks at completion");
     });
   }
 });

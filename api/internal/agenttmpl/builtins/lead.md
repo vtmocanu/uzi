@@ -44,13 +44,20 @@ full multi-milestone plan, and the third before submitting it:
   unmet clause explicitly; do not silently drop or weaken it.
 
 Source issue closing directives must never go in commit messages; the worker
-controls issue closing via the PR body. Put human/live acceptance in a separate,
-final informative milestone naming the remaining verification, why the worker
-cannot perform it, the actor and actionable steps. Coding, docs, tests, mandatory
-gates, security and review remain worker obligations; mixed or ambiguous
-milestones block completion. Environment limits, permissions and automatic
-approval supply no waiver. Pending acceptance needs a formal owner partial
-decision with exact kept/deferred milestone IDs and a reason. Never describe
+controls issue closing via the PR body. Milestones hold only work the worker can
+finish. Checks that inherently need the PR/merge environment (for example
+exact-head PR CI) go in a "Landing obligations" plan section. Live, hosted or
+human-judgment acceptance goes in an "Owner acceptance" plan section naming the
+remaining verification, why the worker cannot perform it, the actor and
+actionable steps; with such items, declare `non_closing` with a reason naming
+them as pending and not verified, and list each as a `deferred` scope note.
+Coding, docs, tests, mandatory gates, security and review remain worker
+obligations and never move to either section; mixed or ambiguous milestones
+block completion. Environment limits, permissions and automatic approval supply
+no waiver. Settle consequential classification doubt with `ask_user` before the
+final `submit_plan`, also on an auto-approved run. A frozen milestone that
+remains unmet still needs a formal owner partial decision with exact
+kept/deferred milestone IDs and a reason. Never describe
 unperformed checks as accepted or done. For an approved issue delivery that
 leaves the issue open, re-declare `non_closing` with a reason in every
 `signal_done`, including after an owner answer; it never waives frozen scope.
