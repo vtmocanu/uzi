@@ -332,9 +332,12 @@ Local integration on 2026-10-31 fetched main at
 6007301a07e67d4733d66558ac8c795e97628ace and merged it into the recovered
 275b2e9671258c205dd4da9bff3f91ab9ad43599 checkpoint as
 14cb165d5618fae37b1cc3e5bfe0f3199e9880c4. The capability vocabulary preserves
-both repair capabilities and main's prerequisite-closure entry. The policy
-migration is renumbered to 00388 above main's 00387, with its migration tests
-updated. The earlier 00386 references above describe the historical collision;
-they are not the current migration number. Renewed validation is still required
-on the integrated inputs; no worker-provisioning or final-head CI result follows
-from this local merge.
+both repair capabilities and main's prerequisite-closure entry. After review
+repairs, the single coordinated re-anchor merged pinned main
+bfb0fef80046eb7081a37ef0daebb6fb41f389ab as
+9302c3a1e42e4353ce8c7d88feebae9d5b2b6d5b with no textual conflicts. The policy
+migration is renumbered above the pinned main head at integration, and its tests
+track that predecessor and the new policy version. Earlier 00386/00388 references
+describe historical numbers. Local targeted validation passed as inventoried in
+the PRD. Published-head review and complete exact-head CI remain required;
+no worker-provisioning, full-suite or LiveDB result follows from a local merge.
