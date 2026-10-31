@@ -274,9 +274,11 @@ case: an enrolled unknown entry whose own current file was read and rejected
 generation. Authenticated entries are never swapped for one another, and a
 selected, capture-pending or unpersisted entry is never displaced. The rejection
 evidence must come from a read of that entry's own file and is bound to the
-observed file lifetime: any later read of the same file that is not a rejection,
-or a lifetime that no longer matches, drops it, so an oversized, unreadable,
-absent or replaced file stays uninspected and is not displaced. The displaced
+file version (lifetime plus size, mtime and ctime) seen at the rejected read.
+Exactly two things invalidate it: a later page or target scan read of that
+entry's own file that is not a rejection, or any change to the file's version
+(replacement or in-place rewrite). An oversized, unreadable, absent, replaced or
+rewritten file therefore stays uninspected and is not displaced. The displaced
 file receives the alias's held scope, re-keyed to the displaced filename with the
 rejection's MAC or source binding, so it stays protected.
 

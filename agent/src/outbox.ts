@@ -918,28 +918,31 @@ export class Outbox {
   // Runtime counterpart of the boot rank 1: an enrolled unknown entry whose own file was read
   // and rejected (MAC failure or malformed). Anything else (oversized, unreadable, never read)
   // is uncertain and is never displaced by a later authenticated alias.
-  // The evidence is bound to the observed file lifetime and dropped by any later read of the
-  // entry's own file that is not a rejection.
-  private readonly rejectedUnknownEvidence = new WeakMap<TerminalMeta, { lifetime: string; macBinding?: Readonly<TerminalMACBinding>; sourceBinding?: Readonly<TerminalSourceBinding> }>();
+  // The evidence is bound to the file version (lifetime, size, mtime, ctime) seen at the
+  // rejected read. It is invalidated by a later page or target scan read of the entry's own
+  // file that is not a rejection, or by any change to that version (replacement or in-place change).
+  private readonly rejectedUnknownEvidence = new WeakMap<TerminalMeta, { version: string; macBinding?: Readonly<TerminalMACBinding>; sourceBinding?: Readonly<TerminalSourceBinding> }>();
+  private readonly physicalFileVersions = new WeakMap<TerminalAuthenticationObservation, string>();
 
   private noteRejectedUnknown(meta: TerminalMeta | undefined, observation: TerminalAuthenticationObservation): void {
     if (!meta || meta.outcomeKind !== "unknown" || meta.fileName !== observation.fileName) return;
     const sourceBinding = this.physicalSourceBindings.get(observation);
-    if ((observation.kind !== "mac_failure" && observation.kind !== "malformed") || !sourceBinding) {
+    const version = this.physicalFileVersions.get(observation);
+    if ((observation.kind !== "mac_failure" && observation.kind !== "malformed") || !sourceBinding || !version) {
       this.rejectedUnknownEvidence.delete(meta);
       return;
     }
     this.rejectedUnknownEvidence.set(meta, observation.kind === "mac_failure"
-      ? { lifetime: sourceBinding.lifetime, macBinding: this.copyMACBinding(observation) }
-      : { lifetime: sourceBinding.lifetime, sourceBinding });
+      ? { version, macBinding: this.copyMACBinding(observation) }
+      : { version, sourceBinding });
   }
 
-  /** Drops evidence about a file that has since been replaced or removed. */
+  /** Drops evidence about a file whose version changed (replaced, rewritten in place) or that is gone. */
   private async rejectedEvidenceCurrent(runId: string, meta: TerminalMeta): Promise<boolean> {
     const evidence = this.rejectedUnknownEvidence.get(meta);
     if (!evidence) return false;
     const stat = await fs.lstat(path.join(this.runDir(runId), meta.fileName), { bigint: true }).catch(() => undefined);
-    if (stat && fileLifetime(stat) === evidence.lifetime) return true;
+    if (stat && fileVersion(stat) === evidence.version) return true;
     this.rejectedUnknownEvidence.delete(meta);
     return false;
   }
@@ -3332,6 +3335,7 @@ export class Outbox {
       const sourceBinding = { generation, fileName, lifetime: fileLifetime(before) };
       if (terminalRunUUID(runId) && Buffer.byteLength(fileName) <= 255 && Buffer.byteLength(sourceBinding.lifetime) <= 256)
         this.physicalSourceBindings.set(observation, Object.freeze(sourceBinding));
+      this.physicalFileVersions.set(observation, fileVersion(before));
       if (before.isSymbolicLink()) { observation.kind = "symlink"; return result; }
       if (!before.isFile()) { observation.kind = "unreadable"; return result; }
       fh = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
