@@ -48,10 +48,12 @@ function memoryRuntime(): WorkerMemoryRuntime {
   });
 }
 
-async function setup(count = 0) {
+async function setup(count = 0, policy = false) {
   api.memoryRegisterNonce = NONCE;
-  api.setRegisterProtocolFeatures(["worker_memory_pressure_v1", "claim_generation_fence"]);
-  await client.register("memory-fixture", "base");
+  api.setRegisterProtocolFeatures(["worker_memory_pressure_v1", "claim_generation_fence",
+    ...(policy ? ["provider_policy_hold_v1"] : [])]);
+  await client.register("memory-fixture", "base", policy ? 1 : undefined, undefined, policy ? ["provider_policy_hold_v1"] : undefined,
+    undefined, policy ? 0 : undefined);
   const claim: ClaimResponse = { ...gitlabClaim(IID), claim_generation: 7,
     memory_episode: 3, memory_policy: { version: 1, max_interventions: 2 }, memory_intervention_count: count };
   api.setOwnershipStatus(claim.run_id, "running", 7);
@@ -115,8 +117,8 @@ const terminals = () => api.states.filter(s => s.body.status === "failed" || s.b
 type Kind = "sent_unconfirmed" | "not_sent" | "confirmed";
 
 /** The predecessor: a first claim (generation 7, memory episode 3) whose memory park left its slot ACTIVE. */
-async function predecessor(kind: Kind) {
-  const f = await setup(2);
+async function predecessor(kind: Kind, policy = false) {
+  const f = await setup(2, policy);
   const r = await authorityRig();
   fs.writeFileSync(homeDir + "/session-proof", "original session");
   git.worktreeStatus = async () => [];
@@ -155,13 +157,15 @@ type Counters = { reports: number; reserve: number; block: number; capture: numb
 
 /** The owner's Resume: a fresh claim of the same run at a later generation and memory episode. */
 async function resume(p: Predecessor, o: {
-  generation?: number; episode?: number; authority?: AuthorityRuntime | "same"; noMemory?: boolean; log?: Logger;
+  policy?: boolean; generation?: number; episode?: number; authority?: AuthorityRuntime | "same"; noMemory?: boolean; log?: Logger;
   extra?: Parameters<typeof runnerWith>[4]; arm?: () => void; wrap?: (rt: AuthorityRuntime) => void;
 } = {}) {
   const generation = o.generation ?? 8;
   // The owner's Resume reaches a worker registration of its own (a new nonce), as a restarted worker would.
   api.memoryRegisterNonce = `resumed-memory-registration-${generation}`;
-  await client.register("memory-fixture", "base");
+  await client.register("memory-fixture", "base", o.policy ? 1 : undefined, undefined, o.policy ? ["provider_policy_hold_v1"] : undefined,
+    undefined, o.policy ? 0 : undefined);
+  if (o.policy) assert.equal(client.supportsPolicyHold, true, "policy reconciliation is negotiated before execution");
   identity = { workerId: client.memoryIncarnation!.worker_id, nonce: api.memoryRegisterNonce };
   const claim: ClaimResponse = { ...p.f.claim, claim_generation: generation, memory_episode: o.episode ?? 4,
     memory_policy: null, memory_intervention_count: 0 };
@@ -540,7 +544,7 @@ describe("every other refused continuation keeps today's behaviour (issue #3638 
 describe("R1 policy reconciliation precedes memory continuation classification", () => {
   for (const heldSource of [false, true]) for (const cleared of [false, true])
     it(`${cleared ? "cleared" : "unresolved"} policy with ${heldSource ? "held source" : "memory parked predecessor"}`, async () => {
-      const p = await predecessor("sent_unconfirmed");
+      const p = await predecessor("sent_unconfirmed", true);
       if (heldSource) rewriteJournal(j => { delete j.memoryPark; });
       const baseline = activeJournal();
       const outbox = new Outbox({ root: path.join(fx.dataDir, "policy-memory"), log: nullLogger(),
@@ -562,8 +566,12 @@ describe("R1 policy reconciliation precedes memory continuation classification",
           : { disposition: "pending", outcome_id: body.outcome_id, source_generation: 7 };
       };
       const statesBefore = api.states.length;
-      const c = await resume(p, { authority: "same", extra: { outbox } });
+      const c = await resume(p, { policy: true, authority: "same", extra: { outbox } });
       assert.ok(packets.length > 1, "policy reconciliation ran after establishing custody, even for a held source");
+      assert.deepEqual(packets.at(-1), {
+        outcome_id: original.outcome_id, source_generation: 7, claim_generation: 8,
+        detail: "resume_rejected", continuation_mode: "fresh_from_saved_work", published: false,
+      }, "retained custody reconciles the original outcome under the current claim");
       assertNothingDone(c.counters);
       assert.equal(c.counters.reports, cleared && !heldSource ? 1 : 0);
       assert.equal(terminals().length, 0);
@@ -587,4 +595,31 @@ describe("R1 policy reconciliation precedes memory continuation classification",
       }
       assert.deepEqual(await slotOf(p.r.rt, p.clone), p.slot);
     });
+});
+
+
+it("policy feature loss sends nothing and retains memory predecessor protection", async () => {
+  const p = await predecessor("sent_unconfirmed", true);
+  const baseline = activeJournal();
+  const outbox = new Outbox({ root: path.join(fx.dataDir, "policy-feature-loss"), log: nullLogger(),
+    runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000 });
+  await outbox.init();
+  const original: PolicyHoldRequest = {
+    outcome_id: "22222222-2222-4222-8222-222222222222", source_generation: 7, claim_generation: 7,
+    detail: "refused", continuation_mode: "same_conversation", published: false,
+    tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "b".repeat(32) + "-1",
+  };
+  await outbox.journalPolicyHold(p.f.claim.run_id, original);
+  let sends = 0;
+  client.reportPolicyHold = async () => { sends++; throw new Error("feature loss must suspend delivery"); };
+  await resume(p, { policy: true, authority: "same", extra: { outbox }, arm: () => {
+    client.protocolFeatures = client.protocolFeatures.filter(feature => feature !== "provider_policy_hold_v1");
+    assert.equal(client.supportsPolicyHold, false);
+  } });
+  assert.equal(sends, 0);
+  assert.equal(terminals().length, 0);
+  assert.deepEqual((await outbox.readTerminalJournal(p.f.claim.run_id, 7))?.body, original);
+  assert.equal(await outbox.hasPendingPolicyOutcome(p.f.claim.run_id), true);
+  assert.deepEqual(activeJournal(), baseline);
+  assert.deepEqual(await slotOf(p.r.rt, p.clone), p.slot);
 });

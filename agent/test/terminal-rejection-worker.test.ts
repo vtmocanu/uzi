@@ -15,7 +15,7 @@ import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { StatsCollector } from "../src/stats.js";
 import type { ClaimResponse } from "../src/protocol.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, waitForTestEvent } from "./helpers.js";
 import { sleep } from "../src/util.js";
 import os from "node:os";
 import { realpathSync } from "node:fs";
@@ -216,9 +216,19 @@ test("claim admission holds through late response and synchronous dispatch, rele
   }
 });
 
-test("overlapping same-run worker executions keep deletion blocked when the later attempt finishes first", async () => {
+test("overlapping same-run worker executions keep deletion blocked when the later attempt finishes first", async (t) => {
   const r = await rig();
+  // Expose the rejected terminal only after both independent executions hold protection.
+  const badCandidate = await fs.readFile(r.file);
+  await fs.unlink(r.file);
   const executions = [deferred<void>(), deferred<void>()];
+  const deletion = deferred<void>();
+  const cleanup = r.outbox.cleanupRejectedTerminalFiles.bind(r.outbox);
+  t.mock.method(r.outbox, "cleanupRejectedTerminalFiles", async (...args: Parameters<typeof cleanup>) => {
+    const removed = await cleanup(...args);
+    if (removed > 0) deletion.resolve();
+    return removed;
+  });
   let started = 0;
   let claims = 0;
   let posts = 0;
@@ -234,16 +244,27 @@ test("overlapping same-run worker executions keep deletion blocked when the late
     getTerminalRejectionCustody: async () => { gets++; return settled(); },
   } as unknown as WorkerClient;
   const runner = { execute: () => executions[started++]!.promise };
-  const running = makeWorker(r, client, runner, undefined, 2).run(r.controller.signal);
+  const worker = makeWorker(r, client, runner, undefined, 2);
+  // Keep the Worker-created coordinator and its real admission/activity guard.
+  // Only the fixture retry interval changes; HTTP and assertion deadlines stay bounded.
+  const coordinator = (worker as unknown as { terminalRejections: TerminalRejectionCoordinator }).terminalRejections;
+  assert.ok(coordinator);
+  Object.defineProperty(coordinator, "intervalMs", { value: 2 });
+  const running = worker.run(r.controller.signal);
   try {
-    await until(() => started === 2 && posts > 0);
+    await until(() => started === 2);
+    await fs.writeFile(r.file, badCandidate);
+    coordinator.queueReconciliation();
+    await until(() => posts > 0);
     const before = posts;
     executions[1]!.resolve();
     await until(() => posts > before);
     assert.equal(gets, 0);
     assert.ok(await fs.stat(r.file));
     executions[0]!.resolve();
-    await until(async () => !(await fs.stat(r.file).catch(() => undefined)));
+    await waitForTestEvent(deletion.promise, "guarded cleanup completes after both executions", 5000);
+    assert.ok(gets > 0, "cleanup obtained fresh settled custody");
+    await assert.rejects(fs.stat(r.file), { code: "ENOENT" });
   } finally {
     executions.forEach(execution => execution.resolve());
     r.controller.abort(); await running;

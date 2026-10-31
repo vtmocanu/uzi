@@ -1371,15 +1371,10 @@ export class Worker {
         await sleep(this.config.pollIntervalMs, signal);
         continue;
       }
-      // PRD #1391 Run B M4 (D7/SC4) — the PRODUCTION boot gate. While the pending terminal set
-      // exceeds the server cap (`pending_overflow`), #1390's claim exclusion has already closed every
-      // run this worker owns to every claimant; keep the worker's OWN run-lane claim loop closed for
-      // the same duration too, so no unleased pending outcome ever coexists with a new claim. This is
-      // the same sleep-and-continue shape as the e2e latch above, but reads the REAL pending-vs-cap
-      // state via a DIFFERENT method — and, crucially (D9), keys on that state, NEVER on which wire
-      // features are currently negotiated, so a strict-decode rollback that clears the feature set can
-      // never reopen the loop while a terminal journal is still unresolved. A no-op when no outbox /
-      // registry is wired (the concurrency unit tests) or nothing is pending.
+      // Legacy registration pauses this worker's run lane for conservative pending overflow.
+      // Negotiated scoped claims may continue for unrelated runs with complete coverage
+      // and available capacity; the server still excludes protected runs. Feature loss restores
+      // the legacy pause. Source protection remains independent of feature negotiation.
       if (this.activeRuns?.claimsPausedByPendingOverflow(this.client.supportsScopedPendingClaim)) {
         await sleep(this.config.pollIntervalMs, signal);
         continue;

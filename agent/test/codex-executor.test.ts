@@ -3768,6 +3768,7 @@ describe("compact policy hold production producer", () => {
           ...(mode === "awaiting_approval" ? { resume_phase: "awaiting_approval" } : {}),
           ...(mode !== "unknown_gate" ? { resume_gate_revision: 1 } : {}),
         } : {}),
+        secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
         claim_generation: mode === "invalid_generation" ? 0 : 7,
         interactive: mode === "interactive", kind: kind as ClaimResponse["kind"],
         ...(mode === "guarded_cancel" ? { inventory_guarded: true } : {}),
