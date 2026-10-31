@@ -33,4 +33,4 @@ A disabled alias is never selected (D1 and D5): pooling a disabled alias is
 refused, disabling a pooled alias removes it from the pool's candidates while
 keeping its consent flag (D8), and the creation transaction re-checks
 enablement under a share lock on the picked alias. Users in mode `default`
-are unaffected, and a run never changes account after creation (D3).
+are unaffected, and a run never changes account after creation (D1–D2: a run with a frozen credential waits rather than switches).

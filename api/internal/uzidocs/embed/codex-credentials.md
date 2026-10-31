@@ -348,9 +348,12 @@ and uzi never falls back to your default login:
 - A run that explicitly asks for Codex is refused with a `422`, code
   `no_credential_for_harness` and reason `codex_pool_unavailable`
   ("link, re-authenticate or pool a Codex account in Settings"). The CLI
-  prints the reason beside the message.
+  prints the reason beside the message. If every Codex login you hold is
+  disabled, the existing disabled-credential refusal applies instead (a `422`
+  with no reason field).
 - A [schedule](scheduling.md#fire-outcomes) that needs Codex starts nothing and
-  records the skip `codex_pool_unavailable`. A recurring one tries again next
+  records the skip `codex_pool_unavailable` (or `credential_disabled` when
+  every Codex login you hold is disabled). A recurring one tries again next
   cadence; a one-time one is held, not used up, until you fix the pool.
 - An automatic MR rework of a Codex run is skipped until a pooled account is
   usable again.

@@ -3135,10 +3135,12 @@ selection never falls back to your default login. A run that did not name a
 harness starts on Claude. A run that explicitly asks for Codex, including a
 manual MR rework of a Codex run, is refused with a 422 whose code is
 `no_credential_for_harness` and whose reason is `codex_pool_unavailable`
-(the CLI prints `no pooled Codex account is available (reason:
-codex_pool_unavailable)`); link, re-authenticate or pool a Codex login in Settings. A
+(the CLI prints `no pooled Codex account is available; link, re-authenticate
+or pool a Codex account in Settings (reason: codex_pool_unavailable)`). A
 schedule skips (or, once, holds) with the skip reason `codex_pool_unavailable`,
-and an automatic MR rework is skipped. `uzi settings get` shows `Codex account
+and an automatic MR rework is skipped. When every Codex login you hold is
+disabled, the existing disabled-credential refusal applies instead (a 422 with
+no reason; a schedule records `credential_disabled`). `uzi settings get` shows `Codex account
 mode:` after the reserve line, and `--json` carries `codex_account_mode`.
 
 ### Plan cross-check evidence

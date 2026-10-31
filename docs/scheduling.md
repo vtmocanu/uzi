@@ -569,7 +569,9 @@ exceed `max_issues` once backfill walks past a skip), which ones
 - `codex_pool_unavailable` — the schedule needs Codex, your account mode is
   `auto` and you pooled Codex logins, but none can be bound (each is unlinked,
   disabled, quarantined or waiting for re-login; see [Letting uzi pick the
-  account](codex-credentials.md#letting-uzi-pick-the-account)). The fire
+  account](codex-credentials.md#letting-uzi-pick-the-account)); when every
+  Codex login you hold is disabled, the fire records `credential_disabled`
+  instead. The fire
   starts nothing and never falls back to your default login or to Claude.
   Recurring schedules advance and re-fire next cadence. A one-time schedule is
   **held** like a disabled pin: due, un-advanced, with the skip recorded as its

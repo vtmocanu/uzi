@@ -1327,14 +1327,20 @@ The user contract is
   credential freeze it compares the run's frozen account key with the scored
   account and fails creation on a mismatch. A quarantine or re-login flag
   committed between the fence and the commit can still bind; claim-time
-  admission backs up quarantine only.
+  admission backs up quarantine only. Harness usability is decided from a
+  read taken before the shared lock, so if the last bindable pooled alias is
+  un-pooled, disabled or unlinked in that window, a run with an implicit
+  harness is refused with `codex_pool_unavailable` rather than falling back to
+  Claude. The race is narrow and never binds an ineligible alias.
 - **Unusable pool.** With mode `auto` and pooled aliases but none structurally
   bindable, Codex is unusable: the default login is never used as a fallback.
   An implicit harness selection falls back to Claude (ADR-1732 D15); an
   explicit Codex selection is refused with the stable
   `no_credential_for_harness` code plus the reason `codex_pool_unavailable`,
   a schedule records the skip of the same name (held for a one-time row), and
-  an automatic MR rework is skipped.
+  an automatic MR rework is skipped. Exception: when every Codex credential
+  the user holds is disabled, the existing credential-disabled refusal wins
+  (a 422 with no reason field; a schedule records `credential_disabled`).
 
 Out of scope: pooling OpenAI API keys, Codex chat, and any change of account
 for a run that already exists.
