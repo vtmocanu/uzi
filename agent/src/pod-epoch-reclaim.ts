@@ -132,8 +132,9 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
   const decide = (outcome: Verdict["authority"]["result"], reason: string) => {
     result.authority = { result: outcome, reason }; decided = true;
   };
-  // One candidate per clone path. A path observed again with a different presence, or by any
-  // group/source in which it is not a candidate, is demoted to kept and cannot be re-added.
+  // One candidate per clone path. A path observed again with a different presence or run, by any
+  // inspected source in which it is not a candidate, or by a group refused for its run ID, is
+  // demoted to kept and cannot be re-added.
   const candidates = new Map<string, Candidate>();
   const refused = new Set<string>();
   let invalidReason = "";
@@ -287,6 +288,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
       // Keep every path in this group; continue bounded sibling work without retrying it.
       if (typeof group.selector.runId !== "string" || !RUN_ID_RE.test(group.selector.runId)) {
         partial = true;
+        for (const path of group.paths) { candidates.delete(path); refused.add(path); }
         continue;
       }
       let holds: RetainedHoldsSnapshot = { state: "unknown" };
@@ -339,7 +341,7 @@ export async function runPodEpochShadow(options: Options): Promise<Verdict | und
               candidate = { ...entry, bytes: 0, presence: "missing", basis };
           }
           const previous = candidates.get(part.clonePath);
-          if (!candidate || refused.has(part.clonePath) || (previous && previous.presence !== candidate.presence)) {
+          if (!candidate || refused.has(part.clonePath) || (previous && (previous.presence !== candidate.presence || previous.run_id !== candidate.run_id))) {
             candidates.delete(part.clonePath); refused.add(part.clonePath);
           } else candidates.set(part.clonePath, candidate);
         }
