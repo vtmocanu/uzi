@@ -471,7 +471,7 @@ func (n *Notifier) handleGate(ctx context.Context, rc store.GetSlackRunContextRo
 		crossCheckReason := ""
 		if run, rerr := n.store.GetRunByID(ctx, rc.ID); rerr != nil {
 			n.logf("load gate cross-check reason", rerr)
-		} else if run.PlanCrossCheckRequired && run.PlanCrossCheckGateReason.Valid {
+		} else if (run.PlanCrossCheckRequired || run.PlanCrossCheckGated) && run.PlanCrossCheckGateReason.Valid {
 			crossCheckReason = run.PlanCrossCheckGateReason.String
 			// The sub-code is meaningful only for this reason; gateCrossCheckReason
 			// sanitises the combined text.

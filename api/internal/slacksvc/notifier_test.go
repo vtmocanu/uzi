@@ -769,6 +769,47 @@ func TestNotifierCrossCheckGateReason(t *testing.T) {
 	}
 }
 
+// A gated run (PRD #3708) shows the same one-line reason as a required run, under the
+// shared rule: only a persisted reason is stated, never findings or lead responses, and
+// an ordinary run still shows nothing.
+func TestNotifierGatedCrossCheckGateLine(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		gated      bool
+		reason     pgtype.Text
+	}{
+		{"gated block", "blocked", true, txt("blocked")},
+		{"gated worker unsupported", "worker unsupported", true, txt("worker_unsupported")},
+		{"gated no reason (passed or revised)", "", true, pgtype.Text{}},
+		{"gated cleared after human revision", "", true, txt("")},
+		{"neither mode", "", false, txt("blocked")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := baseRun("awaiting_approval")
+			fs := &fakeNotifStore{
+				rc:            rc,
+				crossCheckRun: store.Run{ID: rc.ID, PlanCrossCheckGated: tc.gated, Harness: "claude", PlanCrossCheckGateReason: tc.reason},
+				delivery:      txt("U1"),
+				msg:           store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+				planCount:     1,
+			}
+			fp := &fakePoster{dmChannel: "D1"}
+			NewNotifier(fs, fp, fixedBase, nil).handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+			if len(fp.blocks) != 1 {
+				t.Fatalf("gate blocks = %+v", fp.blocks)
+			}
+			section := fp.blocks[0].sectionText
+			if tc.want == "" {
+				if strings.Contains(section, "Plan cross-check:") {
+					t.Fatalf("invented gate line: %q", section)
+				}
+			} else if !strings.Contains(section, "Plan cross-check: "+tc.want) {
+				t.Fatalf("section %q, want cross-check line %q", section, tc.want)
+			}
+		})
+	}
+}
+
 func TestNotifierPostsPlanInThreadAtGate(t *testing.T) {
 	rc := baseRun("awaiting_approval")
 	rc.PlanMd = txt("## Plan\n1. do a thing\n2. do another")

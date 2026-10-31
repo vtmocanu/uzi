@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -37,9 +38,15 @@ func crossCheckEffortSource(source *string) string {
 	return crossCheckSource(source)
 }
 
+// maxCrossCheckRounds bounds the rounds a client renders, matching the server's cap.
+const maxCrossCheckRounds = 5
+
 func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 	var rows [][]string
-	if r.Status == "awaiting_approval" && r.PlanCrossCheckRequired && r.PlanCrossCheckGateReason != nil {
+	if r.PlanCrossCheckGated {
+		rows = append(rows, []string{"PLAN_CHECK_MODE", "checked before your review"})
+	}
+	if r.Status == "awaiting_approval" && (r.PlanCrossCheckRequired || r.PlanCrossCheckGated) && r.PlanCrossCheckGateReason != nil {
 		if reason := crossCheckPlain(*r.PlanCrossCheckGateReason); strings.TrimSpace(reason) != "" {
 			text := "plan cross-check: " + strings.ReplaceAll(reason, "_", " ")
 			if reason == "planning_diff_refused" && r.PlanCrossCheckDiffRefusal != nil {
@@ -53,6 +60,16 @@ func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 	s := r.PlanCrossCheckSummary
 	if s == nil {
 		return rows
+	}
+	// Shared "passed" rule: only a gated run at the gate with no gate reason, whose
+	// latest check approved the current plan (not historical), may say it passed.
+	if r.PlanCrossCheckGated && r.Status == "awaiting_approval" && r.PlanCrossCheckGateReason == nil &&
+		!s.Historical && s.Verdict == "approve" && s.Round > 0 {
+		word := "rounds"
+		if s.Round == 1 {
+			word = "round"
+		}
+		rows = append(rows, []string{"PLAN_CROSS_CHECK", fmt.Sprintf("plan cross-check: passed after %d %s", s.Round, word)})
 	}
 	label := "PLAN_CHECK"
 	if s.Historical {
@@ -96,6 +113,45 @@ func planCrossCheckRows(r apitypes.RunDTO) [][]string {
 		}
 		if len(f.Items) > 20 {
 			rows = append(rows, []string{label + "_MORE", fmt.Sprintf("%d findings omitted", len(f.Items)-20)})
+		}
+	}
+	if s.DeadlineAt != nil {
+		rows = append(rows, []string{label + "_DEADLINE", s.DeadlineAt.UTC().Format(time.RFC3339)})
+	}
+	if len(s.Rounds) > 0 {
+		rounds := s.Rounds[max(0, len(s.Rounds)-maxCrossCheckRounds):]
+		rows = append(rows, []string{label + "_ROUNDS", fmt.Sprintf("%d", len(rounds))})
+		for _, rd := range rounds {
+			rows = append(rows, planCrossCheckRoundRows(label, rd)...)
+		}
+	}
+	return rows
+}
+
+// planCrossCheckRoundRows renders one round. The lead's response is untrusted
+// prose, so it goes through crossCheckPlain like every checker string; the label
+// says it is a claim, never a verified resolution.
+func planCrossCheckRoundRows(label string, rd apitypes.PlanCrossCheckRoundDTO) [][]string {
+	p := fmt.Sprintf("%s_ROUND_%d", label, rd.Round)
+	rows := [][]string{{p + "_RESULT", crossCheckPlain(rd.Verdict)}}
+	if f := rd.Findings; f != nil {
+		rows = append(rows, []string{p + "_SUMMARY", crossCheckPlain(f.Summary)})
+		for i, item := range f.Items[:min(len(f.Items), 20)] {
+			ip := fmt.Sprintf("%s_%d", p, i+1)
+			rows = append(rows,
+				[]string{ip + "_FILE", crossCheckPlain(item.File)},
+				[]string{ip + "_SEVERITY", crossCheckPlain(item.Severity)},
+				[]string{ip + "_SUMMARY", crossCheckPlain(item.Summary)},
+				[]string{ip + "_RATIONALE", crossCheckPlain(item.Rationale)})
+		}
+		if len(f.Items) > 20 {
+			rows = append(rows, []string{p + "_MORE", fmt.Sprintf("%d findings omitted", len(f.Items)-20)})
+		}
+	}
+	if rd.Response.State != "" {
+		rows = append(rows, []string{p + "_RESPONSE_STATE", crossCheckPlain(rd.Response.State)})
+		if t := crossCheckPlain(rd.Response.Text); strings.TrimSpace(t) != "" {
+			rows = append(rows, []string{p + "_RESPONSE", "lead's response (unverified claims): " + t})
 		}
 	}
 	return rows
