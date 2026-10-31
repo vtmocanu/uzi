@@ -119,7 +119,7 @@ type ClaudeReading struct {
 	SyncedAt         *time.Time
 }
 
-// PreReset reports a reading synced before a 7-day reset that has since passed: its
+// PreReset reports a reading synced before a window reset that has since passed: its
 // utilization describes the old window, so it proves nothing about the new one. A reset
 // passing only triggers reconsideration; release waits for a post-reset poll.
 func PreReset(resetsAt *time.Time, syncedAt, now time.Time) bool {

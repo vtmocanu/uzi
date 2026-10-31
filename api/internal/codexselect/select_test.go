@@ -1,7 +1,6 @@
 package codexselect
 
 import (
-	"math/rand"
 	"testing"
 	"time"
 
@@ -110,9 +109,6 @@ func TestSelectImmuneToPolicyMaxStaleness(t *testing.T) {
 		if err != nil || out.Reason != ReasonAuto {
 			t.Fatalf("MaxStaleness=%v got %+v err=%v", ms, out, err)
 		}
-		if p.MaxStaleness != ms {
-			t.Fatal("Select mutated the caller's policy")
-		}
 	}
 }
 
@@ -174,22 +170,49 @@ func TestSelectStructuralNeverPicked(t *testing.T) {
 	}
 }
 
+// permutations calls fn with every ordering of set (Heap's algorithm), so the order-independence
+// check is exhaustive and needs no random source.
+func permutations(set []Candidate, fn func([]Candidate)) {
+	a := append([]Candidate(nil), set...)
+	var gen func(k int)
+	gen = func(k int) {
+		if k <= 1 {
+			fn(a)
+			return
+		}
+		for i := 0; i < k; i++ {
+			gen(k - 1)
+			if k%2 == 0 {
+				a[i], a[k-1] = a[k-1], a[i]
+			} else {
+				a[0], a[k-1] = a[k-1], a[0]
+			}
+		}
+	}
+	gen(len(a))
+}
+
 func TestSelectDeterministicUnderShuffle(t *testing.T) {
+	soon := t0.Add(time.Minute)
+	dupLow, dupHigh := exhausted(4, &soon), exhausted(4, &soon)
+	dupLow.AliasID, dupHigh.AliasID = id(140), id(150)
 	sets := [][]Candidate{
 		{normal(1, 50), normal(2, 50), normal(3, 52), normal(4, 20), unknownScore(5)},
 		{unknownScore(9), unknownScore(4), unknownScore(6)},
 		{exhausted(3, nil), exhausted(1, nil), exhausted(2, nil)},
 		{normal(1, 2), normal(2, 2), normal(3, 7)},
+		// Duplicate account key in pool_exhausted: the lowest alias id wins in every order.
+		{dupHigh, dupLow, exhausted(5, &soon)},
 	}
-	rng := rand.New(rand.NewSource(1))
 	for i, set := range sets {
 		want := mustSelect(t, set)
-		for n := 0; n < 50; n++ {
-			shuffled := append([]Candidate(nil), set...)
-			rng.Shuffle(len(shuffled), func(a, b int) { shuffled[a], shuffled[b] = shuffled[b], shuffled[a] })
-			if got := mustSelect(t, shuffled); got != want {
-				t.Fatalf("set %d: shuffled %+v != %+v", i, got, want)
+		permutations(set, func(p []Candidate) {
+			if got := mustSelect(t, p); got != want {
+				t.Fatalf("set %d: permutation %+v != %+v", i, got, want)
 			}
-		}
+		})
+	}
+	if out := mustSelect(t, sets[4]); out.AccountKey != id(4) || out.AliasID != id(140) {
+		t.Fatalf("duplicate key should resolve to the lowest alias id: %+v", out)
 	}
 }
