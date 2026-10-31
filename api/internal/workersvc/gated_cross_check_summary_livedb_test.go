@@ -15,7 +15,6 @@ type seededRound struct {
 	verdict  string
 	plan     string
 	findings string
-	pending  bool
 }
 
 // seedRounds writes server-owned fixture rows; the summary under test reads them back through

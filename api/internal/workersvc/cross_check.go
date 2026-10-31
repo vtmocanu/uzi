@@ -316,7 +316,7 @@ func (s *Service) planCrossCheckStatus(ctx context.Context, worker store.Worker,
 	if err != nil {
 		return store.CrossCheck{}, 0, err
 	}
-	if lead.UserID != worker.UserID || !(lead.PlanCrossCheckRequired || lead.PlanCrossCheckGated) || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid ||
+	if lead.UserID != worker.UserID || (!lead.PlanCrossCheckRequired && !lead.PlanCrossCheckGated) || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid ||
 		(lead.Status != "claimed" && lead.Status != "running" && lead.Status != "awaiting_approval") {
 		return store.CrossCheck{}, 0, ErrCrossCheckRefused
 	}
@@ -646,7 +646,7 @@ type PlanCrossCheckLatestMetadata struct {
 func (s *Service) LatestPlanCrossCheck(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64) (PlanCrossCheckLatestMetadata, error) {
 	lead, err := s.runOwnedByWorker(ctx, leadID, worker)
 	if err != nil || lead.UserID != worker.UserID || lead.ClaimGeneration != generation || lead.ClaimReleasedAt.Valid ||
-		!(lead.PlanCrossCheckRequired || lead.PlanCrossCheckGated) || (lead.Status != "claimed" && lead.Status != "running" && lead.Status != "awaiting_approval") {
+		(!lead.PlanCrossCheckRequired && !lead.PlanCrossCheckGated) || (lead.Status != "claimed" && lead.Status != "running" && lead.Status != "awaiting_approval") {
 		return PlanCrossCheckLatestMetadata{}, ErrCrossCheckRefused
 	}
 	q, ok := s.q.(interface {

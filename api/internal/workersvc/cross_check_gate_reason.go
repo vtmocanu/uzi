@@ -40,7 +40,7 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 			lead.GatePresentationID.Valid && uuid.UUID(lead.GatePresentationID.Bytes) == *req.PresentationID
 		retained := lead.Status == "awaiting_approval" && !lead.AutoApprove &&
 			(lead.PlanCrossCheckGateReason.String == reason || current)
-		if !(lead.PlanCrossCheckRequired || lead.PlanCrossCheckGated) || (!active && !retained) || !isCrossCheckLeadHarness(lead.Harness) ||
+		if (!lead.PlanCrossCheckRequired && !lead.PlanCrossCheckGated) || (!active && !retained) || !isCrossCheckLeadHarness(lead.Harness) ||
 			req.ClaimGeneration == nil || *req.ClaimGeneration != lead.ClaimGeneration ||
 			lead.ClaimReleasedAt.Valid || lead.WorkerID != pgconv.UUID(worker.ID) || lead.UserID != worker.UserID {
 			return ErrInvalidState
