@@ -151,7 +151,8 @@ func TestPodEpochAnchorHTTPStartupBeyondBudget(t *testing.T) {
 	}
 	emit(&first, watch.Added, epochPod(epochB))
 	emit(&later, watch.Modified, withRV(epochPod(epochB), "/still-starting"))
-	emit(&later, watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
+	ready := epochWithIDs(epochPod(epochB), "containerd://")
+	emit(&later, watch.Modified, ready)
 	requests := 0
 	client := epochHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -162,12 +163,24 @@ func TestPodEpochAnchorHTTPStartupBeyondBudget(t *testing.T) {
 		requests++
 		var body struct {
 			Metadata struct {
-				UID         string            `json:"uid"`
-				Annotations map[string]string `json:"annotations"`
+				UID             string            `json:"uid"`
+				ResourceVersion string            `json:"resourceVersion"`
+				Annotations     map[string]string `json:"annotations"`
 			} `json:"metadata"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		payload, err := io.ReadAll(r.Body)
+		if err != nil {
 			t.Error(err)
+		}
+		if err := json.Unmarshal(payload, &body); err != nil {
+			t.Error(err)
+		}
+		var fields map[string]map[string]json.RawMessage
+		if err := json.Unmarshal(payload, &fields); err != nil {
+			t.Error(err)
+		}
+		if r.Method != http.MethodPatch || r.Header.Get("Content-Type") != "application/merge-patch+json" || len(fields) != 1 || len(fields["metadata"]) != 3 || len(body.Metadata.Annotations) != 1 || body.Metadata.ResourceVersion != ready.ResourceVersion {
+			t.Errorf("patch must contain only UID, exact resourceVersion and epoch annotation: %s", payload)
 		}
 		e, n, err := DecodePodEpochDocument([]byte(body.Metadata.Annotations[PodEpochAnnotation]))
 		if err != nil || e == nil || n != nil || body.Metadata.UID != epochB {

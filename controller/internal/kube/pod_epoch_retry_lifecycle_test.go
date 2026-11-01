@@ -97,12 +97,41 @@ func TestPodEpochRetryClockBudget(t *testing.T) {
 		h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 		now := time.Now()
 		h.session.now = func() time.Time { return now }
-		d := h.successor(epochPod(epochB))
+		var logs bytes.Buffer
+		h.session.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+		h.event(watch.Added, epochPod(epochB))
+		now = now.Add(120 * time.Second)
+		d := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
+		epochAssertPendingPositive(t, d)
 		now = now.Add(90 * time.Second)
 		if h.session.Deliver(context.Background(), d) == nil || len(h.patches) != 0 {
 			t.Fatal("expired issued decision submitted")
 		}
+		_ = h.session.Deliver(context.Background(), d)
+		epochAssertBudgetStop(t, &logs)
 	})
+}
+
+func epochAssertPendingPositive(t *testing.T, d *PodEpochDecision) {
+	t.Helper()
+	if d == nil {
+		t.Fatal("delayed IDs did not issue a decision")
+	}
+	e, negative := epochReason(t, d)
+	if e == nil || negative != nil {
+		t.Fatal("delayed IDs did not issue positive evidence")
+	}
+}
+
+func epochAssertBudgetStop(t *testing.T, logs *bytes.Buffer) {
+	t.Helper()
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &record); err != nil {
+		t.Fatalf("expected exactly one stop log: %v: %s", err, logs.String())
+	}
+	if record["msg"] != "pod epoch delivery stopped" || record["reason"] != "time_budget" || record["attempts"] != float64(0) {
+		t.Fatal(record)
+	}
 }
 
 type epochRetryTransport func(*http.Request) (*http.Response, error)
@@ -115,7 +144,10 @@ func TestPodEpochRetryDeadlineAndLastMoment(t *testing.T) {
 			h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 			now := time.Now()
 			h.session.now = func() time.Time { return now }
-			d := h.successor(epochPod(epochB))
+			h.event(watch.Added, epochPod(epochB))
+			now = now.Add(120 * time.Second)
+			d := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
+			epochAssertPendingPositive(t, d)
 			now = now.Add(90*time.Second - remaining)
 			requests := 0
 			client, err := kubernetes.NewForConfig(&rest.Config{Host: "http://example.invalid", Transport: epochRetryTransport(func(r *http.Request) (*http.Response, error) {
@@ -140,19 +172,28 @@ func TestPodEpochRetryDeadlineAndLastMoment(t *testing.T) {
 	t.Run("last-moment", func(t *testing.T) {
 		h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 		start := time.Now()
-		h.session.now = func() time.Time { return start }
-		d := h.successor(epochPod(epochB))
+		now := start
+		h.session.now = func() time.Time { return now }
+		var logs bytes.Buffer
+		h.session.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+		h.event(watch.Added, epochPod(epochB))
+		anchor := start.Add(120 * time.Second)
+		now = anchor
+		d := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
+		epochAssertPendingPositive(t, d)
 		checks := 0
 		h.session.now = func() time.Time {
 			checks++
 			if checks >= 3 {
-				return start.Add(90 * time.Second)
+				return anchor.Add(90 * time.Second)
 			}
-			return start
+			return anchor.Add(90*time.Second - time.Nanosecond)
 		}
 		if h.session.Deliver(context.Background(), d) == nil || len(h.patches) != 0 || h.session.attempts[epochB].attempts != 0 {
 			t.Fatal("last-moment expiry submitted")
 		}
+		_ = h.session.Deliver(context.Background(), d)
+		epochAssertBudgetStop(t, &logs)
 	})
 }
 

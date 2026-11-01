@@ -226,14 +226,27 @@ func TestPodEpochRetryStoppedStillTracksPredecessor(t *testing.T) {
 	h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 	now := time.Now()
 	h.session.now = func() time.Time { return now }
-	h.successor(epochPod(epochB))
-	// Expiry stops delivery, but B must still be observed as C's predecessor.
-	now = now.Add(podEpochDeliveryBudget)
+	var logs bytes.Buffer
+	h.session.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	h.event(watch.Added, epochPod(epochB))
+	now = now.Add(120 * time.Second)
+	d := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
+	epochAssertPendingPositive(t, d)
+	// Expire B while it is still live, before terminal observation can stop it.
+	now = now.Add(90 * time.Second)
+	if h.session.Deliver(context.Background(), d) == nil || len(h.patches) != 0 || !h.session.attempts[epochB].stopped || h.session.records[epochB].terminal != 0 {
+		t.Fatal("live anchored delivery did not expire without submitting")
+	}
+	epochAssertBudgetStop(t, &logs)
+	logged := logs.String()
 	h.event(watch.Modified, epochTerminal(epochPod(epochB)))
 	if !h.session.attempts[epochB].stopped || h.session.records[epochB].terminal == 0 {
 		t.Fatal("stopped delivery lost terminal observation")
 	}
-	d := h.successor(epochPod(epochC))
+	if logs.String() != logged {
+		t.Fatal("terminal observation logged another delivery stop")
+	}
+	d = h.successor(epochPod(epochC))
 	e, negative := epochReason(t, d)
 	if negative != nil || e == nil || e.Predecessor != epochB {
 		t.Fatal("stopped pod did not remain predecessor")
