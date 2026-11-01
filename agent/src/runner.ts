@@ -23257,8 +23257,10 @@ export class RunRunner {
    * issue #3639 D6 - the receipt gate, run once at the top of {@link phaseClone} (after the `running` report and steering
    * start, before discovery and so before any source admission, memory context, reservation, capture or model turn). It
    * never captures worker memory. Returns for an ordinary claim or when (a) through (d) pass, leaving
-   * `flight.memoryReceipt`; every other outcome ends in a nonterminal stop with custody retained (see
-   * {@link parkMemoryGateRefused} and {@link parkMemoryContinuationRefused}). Custody is retained before the first await.
+   * `flight.memoryReceipt`; every refusal ends in a nonterminal stop with custody retained (see
+   * {@link parkMemoryGateRefused} and {@link parkMemoryContinuationRefused}). A cancel, pause or shutdown during the gate
+   * is thrown to the existing retained-recovery arms, so a cancel reports `failed` ("run cancelled") with custody kept,
+   * as every other retained-recovery cancel does. Custody is retained before the first await.
    *
    * (a) the reference equals the entry's binding and S, the claim is the parked generation's next episode, the receipt's
    *     authority incarnation is this one, and the lock-held journal confirmation succeeds;

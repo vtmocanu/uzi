@@ -131,7 +131,7 @@ Measured, in local runs only: the M4 calibration figures in the off-CI evidence 
 
 ## Amendment 2026-10-30: cooperative memory source settlement (issue #3638)
 
-**Decision.** A memory park used to leave the parked flight's source use `active` under its worker incarnation, because the memory hold is never cleared and teardown required it to be absent before ending source use. A fresh incarnation that claimed the resumed run was then refused ("source is active under another worker incarnation") and the run failed. This amendment lets the producing flight end its own source use on positive evidence, so a fresh worker continues after Resume, and holds the run for its owner when that evidence is missing but the journal records the park; where an unsettled park's record could not be written, a different worker process fails the run as before and the same worker process stops the claim without failing until the requeue cap (see Residuals). It adds no server, status, cause or blocker: the owner hold reuses the existing `recovery_wait` / `worker_memory_pressure` park. Consuming the settlement as authority is the companion issue #3639, not built here.
+**Decision.** A memory park used to leave the parked flight's source use `active` under its worker incarnation, because the memory hold is never cleared and teardown required it to be absent before ending source use. A fresh incarnation that claimed the resumed run was then refused ("source is active under another worker incarnation") and the run failed. This amendment lets the producing flight end its own source use on positive evidence, so a fresh worker continues after Resume, and holds the run for its owner when that evidence is missing but the journal records the park; where an unsettled park's record could not be written, a different worker process fails the run as before and the same worker process stops the claim without failing until the requeue cap (see Residuals). It adds no server, status, cause or blocker: the owner hold reuses the existing `recovery_wait` / `worker_memory_pressure` park. Consuming the settlement as authority is the companion issue #3639, built afterwards (see the 2026-10-31 amendment below); this amendment alone grants no continuation authority.
 
 ### Positive-settlement contract, as built
 
@@ -163,7 +163,7 @@ A strict-parsed field of the recovery journal (`RecoveryJournalEntry.memoryPark`
 - **Metadata only.** It is not a completion certificate, a publication fence or a custody release.
 - **Two-phase durability under one lock.** `GitCache.recordMemoryPark` runs each phase's write, config fsync, directory fsync and readback under one hold of the bare lock (the lock `installCompletionSourceFence` takes). Phase 1 writes `settlement.confirmed: false`. Only after it fully succeeds does phase 2 rewrite with `confirmed: true`. A phase-1 failure never qualifies; a phase-2 failure makes a best-effort compare-and-swap revert to `confirmed: false` and reports `unconfirmed`. A strictly greater `claimGeneration` replaces a record; within one generation only an identical replay or an upgrade (`not_sent`, `sent_unconfirmed`, `confirmed`, then adding a settlement) is allowed, and a settled record is never replaced by an unsettled one.
 - **Reader-side confirmation.** `GitCache.readConfirmedMemoryPark` holds the same bare lock across read, config fsync, directory fsync and readback, and returns the record only when every step succeeds and both reads are canonically equal to the expected record. The recovering worker uses it, with the read-only `verifyEndedSlots` check of the authority, only on a continuation whose record carries a settlement (not on the re-park path), to log `predecessor cooperative settlement verified` or `unverified`. Neither authorizes anything.
-- **Not independent of the journal.** The reader's expected record is the journal itself. A phase-2 failure whose revert also fails (or a Linux fsync error that loses dirty pages) can leave a readable `confirmed: true` that the reader re-confirms. An authoritative consumer (#3639) must bind `expected` to an independent server reference and treat a phase-2 or fsync failure as disqualifying.
+- **Not independent of the journal.** The reader's expected record is the journal itself. A phase-2 failure whose revert also fails (or a Linux fsync error that loses dirty pages) can leave a readable `confirmed: true` that the reader re-confirms. An authoritative consumer must bind `expected` to an independent server reference and treat a phase-2 or fsync failure as disqualifying; #3639 does so (see the 2026-10-31 amendment).
 
 ### Rollback and older-parser behaviour
 
@@ -184,7 +184,7 @@ When a retained continuation meets a predecessor whose source use was never posi
 
 Otherwise the existing flow is unchanged, including the `preservation_failed` mapping. `parkMemoryContinuationRefused` then reports `recovery_wait` / `worker_memory_pressure` at the claim's own episode (only an owner Resume increments it), through the existing park body. Nothing is written before the ACK: no capture, admission, recovery-episode charge, model turn or publication, and it sets no `memory.hold`. At most two park report calls (each call may retry transient HTTP failures) and no terminal report are made per claim. An exact accepted binding (a 409 replay counts) marks the flight parked and stops the claim nonterminally. A credential switch is handed to the retained switch protocol. Every other outcome (a stale claim or checker-parent change, a wall-parked response, pause, cancel, claim fence, the deadline, a transport failure, a crash between report and ACK) stops nonterminally with custody retained and nothing marked `failed`; the teardown producer then records the attempt as `sent_unconfirmed`, or `confirmed` for an accepted one, preserving the slot owner and epoch.
 
-**Until #3639, Resume of an unsettled continuation re-parks immediately**, using one episode per Resume. Cancel or an operator discard of the retained source is the exit until #3639 lands. A worker restart does not release it: the slot stays active under the old incarnation (the crashed-active boundary is unchanged), so the claim classifies as `foreign_active` and Resume keeps re-parking while the record exists, or fails as before without one.
+**Resume of an unsettled continuation re-parks immediately**, using one episode per Resume. A park that was fully settled and whose receipt the server holds can instead continue on the same worker incarnation after Resume (the 2026-10-31 amendment); for every other park, Cancel or an operator discard of the retained source is the exit. A worker restart does not release it: the slot stays active under the old incarnation (the crashed-active boundary is unchanged), so the claim classifies as `foreign_active` and Resume keeps re-parking while the record exists, or fails as before without one.
 
 ### Ordering with the restart follow-up (#3644)
 
@@ -221,4 +221,53 @@ The canonical clone path `issue-N` is shared across runs of the same issue, so t
 - A successor without the memory guard or `worker_memory_pressure_v1` behaves as before. Descriptor-only sources are not continued.
 - The `sent` latch is set before `reportState`, so it can over-claim `sent_unconfirmed` if the call throws before sending; that only widens eligibility of the owner-held re-park.
 - A refused retained-source discard can still end an unowned active lease, and a quiescence-proven discard ends a key whose owner sink is live. This is accepted ("live owner").
-- Receipt consumption and server delivery (#3639), generic terminal reconciliation (#2494, #3031) and the restart follow-up (#3644) are not built. No hosted or compose acceptance of a memory park followed by a pod roll is claimed; it remains a human step.
+- Generic terminal reconciliation (#2494, #3031) and the restart follow-up (#3644) are not built (receipt delivery and consumption landed later with #3639, see the 2026-10-31 amendment). No hosted or compose acceptance of a memory park followed by a pod roll is claimed; it remains a human step.
+
+## Amendment 2026-10-31: settled memory-park continuation (#3639)
+
+**Decision.** This is a narrow exception to the released-worker exclusion of [PRD #1497](../prds/1497-park-at-wall.md) D19, authorised by the owner on 2026-10-29. A `worker_memory_pressure` park that its worker fully settled (the 2026-10-30 amendment's witnessed park and durable `ineligible` source end) can be continued by that same worker incarnation (same worker id and register nonce) after the owner's Resume. Unsettled parks are unchanged: Resume re-parks them at the same hold (D4 above). The exception covers only a settled park, only the same incarnation, and only at owner Resume. Worker restart still does not release a park (registration-once and the #3142 memory-authority gate are unchanged), different workers still never continue a memory park, and wall parks, compact, credential-switch and unknown-drain holds are unchanged.
+
+### Server contract, as built
+
+- **Reference row.** Every worker-memory park writes a `memory_park_releases` row in the park transaction, keyed by run and claim generation (migration 00388). It records the released worker id and register nonce, and later the receipt and whether Resume lifted the exclusion for that park. Parks made before the deploy have no row and can never be lifted.
+- **Receipt.** A worker whose park was fully settled `POST`s the exact journal-form bytes of its `confirmed: true` `memoryPark` record to `/api/worker/runs/{id}/memory/settlement` (feature and capability `memory_park_settlement_v1`). The body is at most 512 KiB. A strict decoder mirrors the worker's `parseMemoryPark`. Lone surrogates and records over the cap are a documented eligibility limit (such a park is simply never qualified), not a parser narrowing. The server requires exactly one source matching `origin.attemptId`; no known worker path produces two.
+- **Currency and write-once.** A receipt is accepted only while the park is current. The first stored receipt is immutable and the same bytes replay as success. A receipt arriving after Resume gets 409 and the park stays unqualified. The receipt transaction never updates `runs`.
+- **Lift at Resume.** Owner Resume of a `worker_memory_pressure` hold now runs, in one transaction, the memory-episode resume and a lift of the D19 released-pair exclusion. The lift applies only when a current settled receipt matches the park (same generation, previous episode, released pair and release time); otherwise D19 is unchanged. The `ClaimRun` predicate is unchanged.
+- **Reference on the next claim.** The next claim by that same worker incarnation carries `memory_park_reference` (claim generation, memory episode, worker id, register nonce, receipt sha256). A foreign claim supersedes it.
+- **Health text.** A run released by a memory park now reads "waiting for another worker, or restart worker %s (its previous process was released by a memory-pressure park)"; the wall text is unchanged.
+- **Storage.** Stored receipts (at most 512 KiB each) are kept until the run is deleted and are dropped by the migration's down step.
+
+### Worker own-park state
+
+The worker keeps a worker-local, in-memory table of its own settled parks, per run, created when the park is accepted. At most 1024 entries; a consumed entry is evicted oldest-first, a pending one never, and a table full of pending entries creates nothing (no receipt is then sent for that park). Entries of an older register nonce are dropped. The claim's reference is compared with the entry, never trusted alone:
+
+| Entry | Reference | Outcome |
+|---|---|---|
+| `pending` | equals the entry (binding and sha) | receipt gate, then handoff |
+| `pending` | different or none | re-park for the owner (F2) |
+| `consumed` | equal or none | ordinary flow, no new authority |
+| `consumed` | different | re-park (F2) |
+| none | present | re-park (F2) |
+| none | none | ordinary flow |
+
+An entry moves `pending` to `consumed` only after a complete handoff. A pending entry with no reference therefore re-parks, and a stuck pending entry costs at most one conservative re-park.
+
+### Gate, handoff and fallbacks
+
+The gate runs once at the top of the clone phase, before discovery, source admission, memory context, reservation, capture or any model turn, and never captures worker memory. All of these must pass:
+
+1. The reference matches the pending entry, the claim is the parked generation's next episode, the receipt's authority incarnation is this one, and the journal confirmation succeeds under the bare lock.
+2. Every settled source slot still verifies: no pending footprint and not held by another sink.
+3. The memory guard produces a fresh valid, armed sample after the gate began, with no pending intervention. This is a context-free wait that captures nothing, bounded by the guard's rearm plus twice its sample and response budget, and by shutdown and the flight lifecycle.
+4. The slot check passes again after the wait.
+
+Discovery is then bound to the receipt's expected source and never heals or repairs, and a handoff admission check runs before the existing retained-recovery admission (which re-checks under its own lock). Failure handling: a timeout of only the guard wait (with 1 and 4 intact) is F1 and re-parks through the existing D4 body; every other failure is F2 (identity, reference or corruption) or F3 and re-parks at the claim's own binding writing nothing (no journal, bare, authority, ledger or source write). A cancel during the gate reports `failed` ("run cancelled") with custody kept, like other retained-recovery cancels. Only a complete handoff consumes the entry.
+
+### Residuals and not shipped
+
+- Parks made before the deploy have no reference row and are never lifted; receipts arriving after Resume are refused and the park stays unqualified.
+- A stuck `pending` entry costs at most one conservative re-park. A guard sample ticket that never resolves makes every continuation time out to F1.
+- The window between discovery's lock release and the existing admission is unchecked (admission re-checks under its own lock).
+- Docker and unregistered writers are excluded. Descriptor-only continuation, hard-kill recovery and the restart follow-up (#3644) are not built; a worker restart still does not release a memory park.
+- Memory cost: the aggregate worker own-park registry has a raw upper bound of 1024 entries x 512 KiB = 512 MiB before overhead. It is unmeasured. Server storage is bounded per run by the 512 KiB cap.
+- No hosted or compose acceptance of a settled park continued after Resume is claimed; it remains a human step.
