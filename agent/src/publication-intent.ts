@@ -18,13 +18,14 @@
  *   - `not_enrolled`: provably nothing was written and nothing was sent, so ordinary finalize may
  *     run (with a `publication_resume_unavailable` diagnostic); or
  *   - `uncertain`: the intent may exist (locally or on the api). The caller makes NO external
- *     attempt; the record is kept, and a bounded retry or the publication-only resume (milestone M5, not yet
- *     present) decides.
+ *     attempt; the record is kept, and a bounded retry or the publication-only resume (RunRunner.phasePublicationOnly)
+ *     decides.
  * Losing or failing to read a local record never implies the enrollment was retired. A local
  * record is discarded only after the api positively answers `publication_enrollment_retired` for
  * that very enrollment_seq.
  */
 import { validFrozenHeldPolicy, type FrozenHeldPolicy } from "./frozen-held.js";
+import type { PrSummaryClaim, PrSummaryScopeNote, PrSummaryVerification } from "./signals.js";
 
 /** The intent document version. A reader of any other version refuses it (mismatch). */
 const PUBLICATION_INTENT_VERSION = 1;
@@ -40,9 +41,9 @@ export type PublicationParkRefusal = "publication_enrolled" | "publication_not_e
 
 /**
  * Typed mismatch between what a record or claim carries and what this worker can honour: an
- * unknown version, an unknown or invalid guard state, an unknown member. Today the record is only kept and
- * nothing consumes the error; the publication-only resume (milestone M5, not yet present) is what produces
- * the `publication_intent_mismatch` hold. It is never swallowed and never lets a guard be skipped.
+ * unknown version, an unknown or invalid guard state, an unknown member. The publication-only resume
+ * (RunRunner.phasePublicationOnly) turns it into the `publication_intent_mismatch` hold. It is never
+ * swallowed and never lets a guard be skipped.
  */
 export class PublicationIntentMismatchError extends Error {
   readonly code = "publication_intent_mismatch";
@@ -584,6 +585,91 @@ export function stricterGuard(
     ci_config_guard_globs: globs,
     ...(refTip !== undefined ? { last_checkpoint_ref_tip: refTip } : {}),
   };
+}
+
+/** What the publication-only resume does with the local records of a run and the claim's active enrollment. */
+export type PublicationResumeChoice =
+  /** A record cannot be trusted against the active enrollment (same sequence numbers or identity, other content). */
+  | { kind: "mismatch"; detail: string }
+  /** The local record IS the active enrollment: resume from it. */
+  | { kind: "use_local"; record: EnrolledPublicationRecord }
+  /** A saved-but-never-ACKed record whose identity and content are the active enrollment's. */
+  | { kind: "attach"; record: PublicationRecord; match: { enrollment_seq: number; candidate_seq: number } }
+  /** The local record is ahead of the api (a candidate advance whose ACK was lost): send it again, idempotently. */
+  | { kind: "resend_local"; record: EnrolledPublicationRecord }
+  /** Nothing local is the active enrollment: resume from the SERVER's intent, never an older local identity. */
+  | { kind: "adopt_server"; server: EnrolledPublicationRecord };
+
+/**
+ * Choose what a publication-only resume continues from. Pure. `locals` are every authenticated local record
+ * of the run (any enrollment generation) and `server` the strictly parsed `claim.publication_resume`.
+ * A content mismatch anywhere is never trusted and holds the run. Otherwise the order of preference is the
+ * record that is in sync, then a never-ACKed one that matches, then a local advance the api has not seen;
+ * a server-ahead, superseded or absent local record adopts the server's intent. An old local identity is
+ * never re-enrolled and the server's candidate is never overridden by an older local one.
+ */
+export function chooseResumeRecord(
+  locals: readonly PublicationRecord[],
+  claim: ClaimPublicationResume,
+  server: EnrolledPublicationRecord,
+): PublicationResumeChoice {
+  const related = locals.map((record) => ({ record, relation: relatePublicationToClaim(record, claim) }));
+  const mismatch = related.find((r) => r.relation.kind === "content_mismatch");
+  if (mismatch) return { kind: "mismatch", detail: `a local record (generation ${mismatch.record.claim_generation}) disagrees with the active enrollment` };
+  const newestFirst = (a: PublicationRecord, b: PublicationRecord) => b.claim_generation - a.claim_generation;
+  const enrolled = (r: PublicationRecord): r is EnrolledPublicationRecord => r.enrollment_seq !== undefined && r.candidate_seq !== undefined;
+  const sync = related.filter((r) => r.relation.kind === "in_sync").map((r) => r.record).sort(newestFirst)[0];
+  if (sync && enrolled(sync)) return { kind: "use_local", record: sync };
+  const unacked = related.filter((r) => r.relation.kind === "unacked_matches_active").sort((a, b) => newestFirst(a.record, b.record))[0];
+  if (unacked && unacked.relation.kind === "unacked_matches_active") {
+    return { kind: "attach", record: unacked.record, match: { enrollment_seq: unacked.relation.enrollment_seq, candidate_seq: unacked.relation.candidate_seq } };
+  }
+  const ahead = related.filter((r) => r.relation.kind === "local_ahead").map((r) => r.record).sort(newestFirst)[0];
+  if (ahead && enrolled(ahead)) return { kind: "resend_local", record: ahead };
+  return { kind: "adopt_server", server };
+}
+
+/**
+ * The lead's structured PR summary back from the intent's `mr.summary` (well-formed redacted JSON, see
+ * {@link boundedPrSummaryJson}). Every member is re-validated by shape: a malformed or unknown member is
+ * dropped, never carried. `undefined` when nothing usable remains, which sends the publisher down its
+ * deterministic-only rung.
+ */
+export function leadSummaryFromIntent(summary: string): PrSummaryClaim | undefined {
+  if (summary === "") return undefined;
+  let raw: unknown;
+  try { raw = JSON.parse(summary); } catch { return undefined; }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  const o = raw as Record<string, unknown>;
+  const str = (v: unknown): string | undefined => typeof v === "string" && v.trim() !== "" ? v : undefined;
+  const strings = (v: unknown): string[] | undefined => {
+    if (!Array.isArray(v)) return undefined;
+    const out = v.map(str).filter((s): s is string => s !== undefined);
+    return out.length > 0 ? out : undefined;
+  };
+  const out: PrSummaryClaim = {};
+  const what = str(o.what); if (what !== undefined) out.what = what;
+  const why = str(o.why); if (why !== undefined) out.why = why;
+  const changes = strings(o.changes); if (changes) out.changes = changes;
+  const pointers = strings(o.review_pointers); if (pointers) out.review_pointers = pointers;
+  if (Array.isArray(o.verification)) {
+    const verification = o.verification.flatMap((e): PrSummaryVerification[] => {
+      const r = e as { command?: unknown; result?: unknown } | null;
+      return r && str(r.command) !== undefined && (r.result === "pass" || r.result === "fail") ? [{ command: r.command as string, result: r.result }] : [];
+    });
+    if (verification.length > 0) out.verification = verification;
+  }
+  if (Array.isArray(o.scope_notes)) {
+    const kinds = new Set(["added", "changed", "dropped", "deferred"]);
+    const notes = o.scope_notes.flatMap((e): PrSummaryScopeNote[] => {
+      const r = e as { kind?: unknown; text?: unknown } | null;
+      return r && typeof r.kind === "string" && kinds.has(r.kind) && str(r.text) !== undefined
+        ? [{ kind: r.kind as PrSummaryScopeNote["kind"], text: r.text as string }] : [];
+    });
+    if (notes.length > 0) out.scope_notes = notes;
+  }
+  if (typeof o.verifiedAtSha === "string" && SHA_RE.test(o.verifiedAtSha)) out.verifiedAtSha = o.verifiedAtSha;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 // ── the api seam ─────────────────────────────────────────────────────────────

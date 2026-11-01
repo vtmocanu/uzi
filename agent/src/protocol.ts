@@ -689,6 +689,13 @@ export interface PublicationResumeEntry {
   candidate_seq: number;
 }
 
+/** Issue #1324 M5: why a publication-only resume holds the run for its owner instead of publishing (api
+ *  `validatePublicationPark`; any other value is a 400). */
+export type PublicationHoldReason =
+  | "publication_model_required"
+  | "publication_source_unavailable"
+  | "publication_intent_mismatch";
+
 /** Issue #1742: one finalize-pending attempt attested on the register snapshot. */
 export interface FinalizeResumeEntry {
   run_id: string;
@@ -2928,6 +2935,13 @@ export interface StateRequest {
   /** Issue #1324: optional 40-hex checkpoint tip a peer may claim the run from; the api records it only
    *  when it is the run's current published checkpoint tip. */
   handoff_checkpoint_tip?: string;
+  /** Issue #1324 M5: a worker-reported publication OWNER HOLD, a state report and never a failure. Sent as
+   *  `recovery_wait` + `recovery_cause: "forge_unreachable"` + `recovery_phase: "publication"` with a positive
+   *  claim_generation, and with publication_surface and publication_step ABSENT (they mark a forge outage; a
+   *  hold is not one). The api stamps it NULL (no automatic retry; an owner Resume queues one publication-only
+   *  episode), keeps custody and the active intent, and leaves the forge park count alone. Refused 409
+   *  `publication_not_enrolled` when no intent is active and 409 stale_claim on a stale generation. */
+  publication_hold_reason?: PublicationHoldReason;
   /** PRD #1733: with `recovery_cause: "provider_outage"` only (the api 400s it on any other report),
    *  the count of successful model turns completed since this flight started, so the api
    *  can tell a streak of unproductive outages from one that made progress in between. Gated on

@@ -117,6 +117,7 @@ import type {
   RunOwnershipResponse,
   StateAck,
   StateRequest,
+  PublicationHoldReason,
 } from "./protocol.js";
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
@@ -151,10 +152,19 @@ import {
   samePublicationGuardAndMr,
   boundedPrSummaryJson,
   sliceWellFormed,
+  attachServerSequence,
+  chooseResumeRecord,
+  leadSummaryFromIntent,
+  parseClaimPublicationResume,
+  stricterGuard,
+  PublicationIntentMismatchError,
   type EnrolledPublicationRecord,
   type PublicationDeps,
   type PublicationFloorRecord,
+  type PublicationGuardState,
   type PublicationIntentBody,
+  type PublicationOwnerKind,
+  type PublicationRecord,
 } from "./publication-intent.js";
 import {
   installTerminalWriteAhead,
@@ -1016,8 +1026,8 @@ class PublicationRefusedSignal extends Error {
 
 /** Issue #1324: a transformed candidate could not be made durable (locally and at the api), so nothing
  *  may be pushed with it. The flight is already marked as an unresolved retain; the run neither fails
- *  nor reruns the executor, and the local record is kept (no reconciliation consumes it yet; the
- *  publication-only resume, milestone M5, is not yet present). */
+ *  nor reruns the executor, and the local record is kept for the publication-only resume
+ *  (phasePublicationOnly) of a later claim. */
 class PublicationUnconfirmedSignal extends PublicationRefusedSignal {
   constructor() {
     super("publication candidate unconfirmed");
@@ -2583,6 +2593,11 @@ interface RunFlight {
   /** Issue #1324: this finalize's acknowledged publication enrollment. Set only after the api ACKed the
    *  write-ahead intent; the typed publication-phase park and the candidate advances read it. */
   publicationRecord?: EnrolledPublicationRecord;
+  /** Issue #1324 M5: set only on a PUBLICATION-ONLY flight (the claim carried an active `publication_resume`):
+   *  no executor run, no session, no plan summary and no description pass ever runs on it. `originalHead` is
+   *  the recorded H (the flight's runner clone sits at the candidate, so H cannot be read from it) and
+   *  `guard` the restored guard state, which only ever tightens what the live claim says. */
+  publicationOnly?: { originalHead: string; guard: PublicationGuardState };
   /** Private, immutable per flight: a published origin tip matching the seeded private HEAD.
    * Never reconstructed from recovery/checkpoint state or persisted across worker restarts. */
   trustedPublishedStart?: string;
@@ -2666,6 +2681,25 @@ const SNAPSHOT_PHASES = new Set<ActiveSnapshotPhase>([
   "awaiting_input",
   "awaiting_followup",
 ]);
+
+/**
+ * Issue #1324 M5: the executor a PUBLICATION-ONLY claim carries. The flight still needs the executor object
+ * (quiescence, the credential-free capture lane and the Codex finalize boundary all read it), but no model
+ * work may ever start on it: `run` rejects, and `closeAndSettlePlanSummary` is absent (a never-run executor
+ * has no plan summary to settle, and every capture or terminal sink that would call it skips the call).
+ * Every other member is the real executor's, bound to it. Any other claim gets its executor back unchanged.
+ */
+function publicationOnlyExecutor(claim: Pick<ClaimResponse, "publication_resume">, executor: Executor): Executor {
+  if (claim.publication_resume === undefined) return executor;
+  return new Proxy(executor, {
+    get(target, prop) {
+      if (prop === "closeAndSettlePlanSummary") return undefined;
+      if (prop === "run") return () => Promise.reject(new Error("a publication-only flight never runs the executor"));
+      const value: unknown = Reflect.get(target, prop, target);
+      return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+}
 
 /**
  * Issue #1742: is this executor result FINALIZE-BOUND, i.e. does phasePublish go on to finalize it
@@ -4662,7 +4696,9 @@ export class RunRunner {
     // per execution so nothing subprocess-scoped is shared with a concurrent run. The
     // DARK Codex selection seam reads claim.secrets.codex (absent ⇒ the literal Claude path).
     const initialExecutor = this.makeExecutor(runId, claim.secrets.codex);
-    let executor = initialExecutor.executor;
+    // Issue #1324 M5: a publication-only claim still needs its executor object (quiescence, capture and the
+    // finalize boundary read it) but no model work may ever start on it.
+    let executor = publicationOnlyExecutor(claim, initialExecutor.executor);
     const runHome = initialExecutor.homeDir;
     // Register per-run secrets with the logger so they are scrubbed from any
     // output, then never log the claim payload itself. Tracked in runScopedSecrets
@@ -5576,7 +5612,12 @@ export class RunRunner {
       this.bindWorkerMemory(claim, flight);
       await this.phaseClone(claim, flight);
       executor = flight.executor;
-      const sessionId = await this.phaseResume(claim, flight);
+      // Issue #1324 M5: a claim that carries an ACTIVE publication enrollment is a PUBLICATION-ONLY episode.
+      // The run's work is already done and recorded in the intent, so no executor runs, no session starts
+      // and no plan summary or description pass is ever created for it: phasePublicationOnly rebuilds the
+      // publish inputs from the record and the live claim and then hands to the ordinary phasePublish.
+      const publicationOnly = claim.publication_resume !== undefined;
+      const sessionId = publicationOnly ? undefined : await this.phaseResume(claim, flight);
       // PRD #1349 M2 (D1/D3): after clone/reseed and BEFORE model work, record this run's exact
       // claim generation into the durable journal (the restore point it starts from) and
       // inventory any prior open holds by exact id + generation. The early generation-evidence
@@ -5584,7 +5625,12 @@ export class RunRunner {
       // without inferring `current - 1`; the inventory is observational only (settlement is
       // deferred to the final durable head). Credential-free and best-effort.
       await this.recordRecoveryGenerationEvidence(claim, flight);
-      await this.phasePreflightHandoff(claim, flight, sessionId, executionRejection);
+      if (publicationOnly) {
+        // "stop": a hold or a retention was already reported/latched (nothing to publish, no terminal to send).
+        if ((await this.phasePublicationOnly(claim, flight)) === "stop") return;
+      } else {
+        await this.phasePreflightHandoff(claim, flight, sessionId, executionRejection);
+      }
       // PRD #1171 m4: the finalize sink. phasePreflightHandoff already ran the
       // security-boundary reap (its killAgentTree?.() — no-op for Codex); this wrapper adds the
       // Codex-ONLY finalize withBoundary so that, for a Codex run, the WHOLE phasePublish
@@ -7807,6 +7853,252 @@ export class RunRunner {
   }
 
   /**
+   * Issue #1324 M5: the PUBLICATION-ONLY resume. Runs instead of phaseResume and the executor when the claim
+   * carries an active enrollment, and finishes the recorded publication with ZERO model calls: it adopts the
+   * enrollment (the local record when it is the active one, else the SERVER's intent, never an older local
+   * identity), proves the recorded source is present and intact in the worker bare, restores the guard state
+   * through {@link stricterGuard} (it may tighten the live claim's guards, never relax them), builds the
+   * model-free publish inputs, and hands to phasePublish. "publish" means phasePublish should run; "stop" means
+   * a hold was reported or the work was retained, and there is nothing more to do in this flight.
+   *
+   * A condition this worker cannot honour without model work or a different source is a HOLD for the owner
+   * (holdPublicationOnly): never a failed run, a main fallback, an older candidate or a model replacement.
+   */
+  private async phasePublicationOnly(claim: ClaimResponse, flight: RunFlight): Promise<"publish" | "stop"> {
+    const { runLog } = flight;
+    const resume = claim.publication_resume!;
+    const ownerKind: PublicationOwnerKind = flight.runKind === "task" ? "task" : "issue";
+    const hold = (reason: PublicationHoldReason, detail: string) => this.holdPublicationOnly(flight, reason, detail);
+
+    // The owner kind comes from the run's kind, never from the body; any parse failure is a mismatch hold.
+    let server: EnrolledPublicationRecord;
+    try {
+      server = parseClaimPublicationResume(resume, ownerKind);
+      if (server.run_id !== claim.run_id || server.repo_id !== claim.repo.id) {
+        throw new PublicationIntentMismatchError("the active intent belongs to another run or repository");
+      }
+      if (flight.branch !== undefined && server.branch !== flight.branch) {
+        throw new PublicationIntentMismatchError("the active intent names another branch");
+      }
+      if (server.claim_generation > flight.claimGeneration) {
+        throw new PublicationIntentMismatchError("the active enrollment is newer than this claim");
+      }
+    } catch (error) {
+      if (error instanceof PublicationIntentMismatchError) return hold("publication_intent_mismatch", error.message);
+      throw error;
+    }
+
+    // Every later candidate advance is saved locally before it is sent; without a usable outbox that is
+    // impossible, so retain the work (reporting nothing) rather than fail a run over a local storage fault.
+    const outbox = this.outbox;
+    if (!outbox || outbox.isDisabled()) return this.retainPublicationOnly(flight, "outbox_unavailable");
+
+    // Every authenticated local record of the run, any enrollment generation. The enrollment's own
+    // generation is read even when the in-memory index does not list it, so a record this worker cannot
+    // honour (an unknown version or guard state) is a typed mismatch rather than silence.
+    const locals: PublicationRecord[] = [];
+    const generations = new Set<number>([server.claim_generation]);
+    for (const entry of outbox.listPublicationRecords()) if (entry.run_id === claim.run_id) generations.add(entry.claim_generation);
+    for (const generation of generations) {
+      const loaded = await outbox.loadPublicationRecord(claim.run_id, generation);
+      if (loaded.kind === "ok") locals.push(loaded.record);
+      else if (loaded.kind === "mismatch" && generation === server.claim_generation) {
+        return hold("publication_intent_mismatch", loaded.detail);
+      } else if (loaded.kind !== "absent") {
+        // Unauthenticated or unreadable proves nothing about the enrollment; the server's intent decides.
+        runLog.warn("publication resume: a local record was not usable", { run_id: flight.runId, claim_generation: generation, outcome: loaded.kind });
+      }
+    }
+
+    let record: EnrolledPublicationRecord;
+    const choice = chooseResumeRecord(locals, resume, server);
+    switch (choice.kind) {
+      case "mismatch":
+        return hold("publication_intent_mismatch", choice.detail);
+      case "use_local":
+        record = choice.record;
+        break;
+      case "attach": {
+        // A saved-but-never-ACKed record that IS the active enrollment: record the api's sequence numbers.
+        const attached = await attachServerSequence(outbox, choice.record, choice.match);
+        record = attached ?? server;
+        break;
+      }
+      case "resend_local": {
+        // A local candidate advance whose ACK was lost: send it again (idempotent) and continue from it only if ACKed.
+        const outcome = await resendPublicationRecord(this.publicationDeps(flight), choice.record);
+        if (outcome.kind !== "enrolled") {
+          return this.retainPublicationOnly(flight, outcome.kind === "uncertain" ? outcome.reason : "enrollment_retired");
+        }
+        record = outcome.record;
+        break;
+      }
+      case "adopt_server":
+        record = server;
+        await this.persistAdoptedPublicationRecord(flight, server, locals);
+        break;
+    }
+
+    // The source: the recorded original head H, the floor (when pinned) and the candidate C must be present
+    // in the worker bare with H and the floor both ancestors of C. They are on a restart (the bare keeps them)
+    // and on a peer (the claim's own clone fetch mirrored `refs/uzi-checkpoints/*` into the bare, best-effort).
+    // ancestry() answers "unknown" for a missing object, so a missing root or floor and a rewritten candidate
+    // that excludes H are all refused the same way: never main, an older candidate or a model replacement.
+    const bare = flight.barePath;
+    const candidate = record.candidate;
+    const floorOid = record.floor.kind === "pinned" ? record.floor.oid : undefined;
+    if (!bare || candidate === null) return hold("publication_source_unavailable", "the recorded candidate or the worker bare is unavailable");
+    const proves = async (ancestor: string, descendant: string): Promise<boolean> =>
+      (await this.git.ancestry(bare, ancestor, descendant)) === "ancestor";
+    if (!(await proves(record.original_head, candidate)) || (floorOid !== undefined && !(await proves(floorOid, candidate)))) {
+      return hold("publication_source_unavailable", "the original head, the floor or the candidate is missing from this worker's history, or the candidate does not contain them");
+    }
+
+    // The workspace must BE the candidate: the restore (the tracking ref on a restart, the mirrored
+    // checkpoint on a peer) seeds the runner clone, and a clone that is anywhere else is never published.
+    const cloneTip = flight.runnerClone ? await this.git.branchTip(flight.runnerClone.path, record.branch) : null;
+    if (cloneTip !== candidate) {
+      // Work after the candidate is a material source change that would need the agent; anything else is a source we do not hold.
+      const beyond = cloneTip !== null && await proves(candidate, cloneTip);
+      return hold(beyond ? "publication_model_required" : "publication_source_unavailable",
+        beyond ? "the workspace holds work beyond the recorded candidate" : "the restored workspace is not the recorded candidate");
+    }
+
+    // A scope-capped delivery is the one closing fact the live claim cannot restate (the cap is a run-time
+    // outcome of the executor). Its title carries the partial prefix; without a live owner deferral to explain
+    // that prefix the delivery cannot be rebuilt model-free, so hold.
+    const redactText = flight.redactText;
+    const base = sliceWellFormed(redactText(mrTitle(claim, undefined, claim.config?.completion_scope)), 1024);
+    if ((claim.config?.completion_scope?.deferred?.length ?? 0) === 0 &&
+        record.mr.title !== base && record.mr.title === sliceWellFormed(redactText(`[partial] ${mrTitle(claim)}`), 1024)) {
+      return hold("publication_model_required", "the recorded delivery was scope-capped, which only the executor can restate");
+    }
+
+    // The guard state: recorded, tightened by the live claim. A recorded floor survives only when it is
+    // proven present in the bare and an ancestor of C, so a claim-supplied floor can never shorten a scan.
+    const recorded = record.guard;
+    const floorCandidates = [recorded.frozen_held.confirmedTip, ...recorded.frozen_held.extraFloors, recorded.published_tip,
+      ...recorded.published_real_tips, recorded.last_checkpoint_ref_tip];
+    const verified = new Set<string>();
+    for (const sha of new Set(floorCandidates)) if (sha !== undefined && await proves(sha, candidate)) verified.add(sha);
+    const guard = stricterGuard(recorded, {
+      ci_config_guard_globs: claim.config?.ci_config_guard === true
+        ? [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])] : null,
+      ci_fix_human_approved: (claim.auto_approve ?? false) !== true,
+    }, sha => verified.has(sha));
+
+    flight.publicationRecord = record;
+    flight.publicationOnly = { originalHead: record.original_head, guard };
+    flight.publicationFloor = floorOid === undefined ? { kind: "absent" } : { kind: "pinned", oid: floorOid };
+    flight.publishedTip = guard.published_tip ?? floorOid;
+    flight.checkpointFloor = flight.publishedTip;
+    flight.publishedRealTips = [...guard.published_real_tips];
+    flight.landedCheckpoint = guard.landed_checkpoint;
+    if (guard.last_checkpoint_ref_tip) flight.lastCheckpointRefTip = guard.last_checkpoint_ref_tip;
+    flight.ciFixHumanApproved = guard.ci_fix_human_approved;
+    if (guard.ci_config_guard_globs) flight.ciConfigGuardGlobs = [...guard.ci_config_guard_globs];
+    // The secret remediation knowledge survives as recorded, at least as strict as it was: a recorded
+    // finding is still known (a resumed publish fails on it exactly as the original would have), a flagged
+    // commit is still checked against the candidate, and the clean tip was dropped by stricterGuard so it can
+    // never skip a scan. A finding has no recorded path, so none is ever rendered.
+    const sr = guard.secret_remediation;
+    const finding = (f: { start_line: number; commit: string; rule_id: string }) => ({ file: "", startLine: f.start_line, commit: f.commit, ruleId: f.rule_id });
+    flight.secretRemediation = {
+      attempts: sr.attempts,
+      known: sr.known.map(finding),
+      flaggedCommits: [...sr.flagged_commits],
+      flaggedFindings: sr.flagged_findings.map(finding),
+      blocked: sr.blocked.map(finding),
+      everKnown: sr.ever_known,
+      withholdPaths: true,
+      overflow: sr.overflow,
+    };
+
+    // The model-free publish inputs: the branch, and the lead's recorded claims (redacted, re-validated) for
+    // the description ladder's lead_only rung. The scope flags and every closing directive come from the live
+    // claim inside phasePublish; the recorded `closing` is never read.
+    const lead = leadSummaryFromIntent(record.mr.summary);
+    flight.result = { branch: record.branch, ...(lead ? { prSummary: lead } : {}) };
+    runLog.info("publication-only resume: continuing the recorded publication without model work", {
+      run_id: flight.runId, enrollment_seq: record.enrollment_seq, candidate_seq: record.candidate_seq, choice: choice.kind,
+    });
+    return "publish";
+  }
+
+  /**
+   * Issue #1324 M5: a publication-only resume cannot honour the record without model work or a different
+   * source. Report the owner HOLD (`recovery_wait` + `publication_hold_reason`, no surface or step) and keep the
+   * source, the record and the custody. Never a failed terminal and never a source release. A stale generation
+   * throws StaleClaimError from the flight reporter (the flight just stops); a refusal or an unconfirmed
+   * report retains the work instead, with nothing reported.
+   */
+  private async holdPublicationOnly(flight: RunFlight, reason: PublicationHoldReason, detail: string): Promise<"stop"> {
+    const { runLog, batcher } = flight;
+    runLog.warn("publication-only resume held for the owner", { run_id: flight.runId, reason, detail: sanitizeForLog(detail) });
+    const body: StateRequest = {
+      status: "recovery_wait", recovery_cause: "forge_unreachable", recovery_phase: "publication",
+      publication_hold_reason: reason, claim_generation: flight.claimGeneration,
+    };
+    let ack: StateAck;
+    try {
+      ack = await flight.reportState(body);
+    } catch (error) {
+      if (error instanceof StaleClaimError || flight.cancel.signal.aborted) throw error;
+      runLog.warn("publication hold report was not confirmed; retaining the work", { run_id: flight.runId, error: errMessage(error) });
+      return this.retainPublicationOnly(flight, "hold_unconfirmed");
+    }
+    if (ack.status === "recovery_wait") {
+      batcher.emit({ kind: "status", agent: "worker", payload: {
+        text: `publication cannot resume automatically (${reason}); the work and the publication record are kept and the run waits for its owner`,
+      } });
+      await batcher.flush().catch(() => undefined);
+      await batcher.close().catch(() => undefined);
+      // A confirmed park: the clone, the session and the custody stay for the owner's Resume.
+      flight.parked = true;
+      flight.preserveRecoveryClone = true;
+      flight.preserveSession = true;
+      flight.stoppedSourceKept = true;
+      return "stop";
+    }
+    if (ack.status !== undefined && TERMINAL_RUN_STATUSES.has(ack.status)) {
+      runLog.info("publication hold: the run is already terminal; nothing to report", { run_id: flight.runId, status: ack.status });
+      await batcher.close().catch(() => undefined);
+      return "stop";
+    }
+    // publication_not_enrolled, publication_enrolled or any other refusal: retain, report nothing.
+    return this.retainPublicationOnly(flight, publicationParkRefusal(ack) ?? ack.reason ?? "hold_refused");
+  }
+
+  private async retainPublicationOnly(flight: RunFlight, why: string): Promise<"stop"> {
+    flight.batcher.emit({ kind: "status", agent: "worker", payload: {
+      text: "the publication resume could not be confirmed; nothing was published and the work is retained until it is reconciled",
+    } });
+    this.retainForPublicationReconciliation(flight, why);
+    await flight.batcher.close().catch(() => undefined);
+    return "stop";
+  }
+
+  /** Best-effort local copy of an adopted server intent, so a later candidate advance has a record to compare
+   *  against. A failure here is logged and ignored: the server's intent is what this flight continues from. */
+  private async persistAdoptedPublicationRecord(flight: RunFlight, server: EnrolledPublicationRecord, locals: readonly PublicationRecord[]): Promise<void> {
+    const outbox = this.outbox;
+    if (!outbox || outbox.isDisabled()) return;
+    try {
+      const saved = await outbox.savePublicationRecord(server);
+      if (saved.ok && (saved.record.enrollment_seq !== server.enrollment_seq || saved.record.candidate_seq !== server.candidate_seq)) {
+        const advanced = await outbox.replacePublicationRecord(server,
+          { ...(saved.record.enrollment_seq !== undefined ? { enrollment_seq: saved.record.enrollment_seq } : {}),
+            ...(saved.record.candidate_seq !== undefined ? { candidate_seq: saved.record.candidate_seq } : {}) });
+        if (!advanced.ok) flight.runLog.warn("publication resume: the adopted intent could not replace the local record", { run_id: flight.runId, reason: advanced.reason, local: locals.length });
+      } else if (!saved.ok) {
+        flight.runLog.warn("publication resume: the adopted intent could not be saved locally", { run_id: flight.runId, reason: saved.reason });
+      }
+    } catch (error) {
+      flight.runLog.warn("publication resume: saving the adopted intent failed", { run_id: flight.runId, error: errMessage(error) });
+    }
+  }
+
+  /**
    * Issue #1324 D2: write the publication intent ahead of any remote step. Returns "retain" when the
    * enrollment outcome is unknown (no external attempt may follow, nothing is reported) and "proceed"
    * otherwise: enrolled (`flight.publicationRecord` is set) or known not enrolled (ordinary finalize,
@@ -7829,6 +8121,15 @@ export class RunRunner {
       return "proceed";
     };
     if (!isCodePublishingKind(resolveRunKind(claim.kind))) return "proceed";
+    if (flight.publicationOnly && flight.publicationRecord) {
+      // A publication-only resume continues the ADOPTED enrollment (phasePublicationOnly set it). A fresh
+      // enrollment at this generation would be a different identity the api refuses; a transformed
+      // candidate advances this one through the candidate CAS (confirmPublicationCandidate) instead.
+      runLog.info("publication intent adopted; continuing the active enrollment", {
+        run_id: flight.runId, enrollment_seq: flight.publicationRecord.enrollment_seq, candidate_seq: flight.publicationRecord.candidate_seq,
+      });
+      return "proceed";
+    }
     if (!this.publicationResumeAvailable()) {
       return unavailable(this.outbox === undefined || this.outbox.isDisabled() ? "outbox_unavailable" : "server_feature_unavailable",
         undefined, false);
@@ -8570,7 +8871,9 @@ export class RunRunner {
     const { trackingRef } = await this.fetchTracking(flight, barePath, runnerClone.path, result.branch);
 
     // The reaped run clone owns H; another run may replace shared tracking after fetch-back.
-    const publicationOriginalHead = await this.git.branchTip(runnerClone.path, result.branch);
+    // A publication-only resume has no run clone holding H (its clone sits at the candidate), so H is the
+    // recorded original head, which phasePublicationOnly proved present in the bare and an ancestor of C.
+    const publicationOriginalHead = flight.publicationOnly?.originalHead ?? await this.git.branchTip(runnerClone.path, result.branch);
 
     // PRD #1296 M3 (D1) — the protected finalization boundary. Pin the ORIGINAL committed
     // head H into the authenticated durable journal FIRST, unconditionally, and BEFORE any
@@ -8583,7 +8886,7 @@ export class RunRunner {
     // capture bundle + upload happens later, on a finalization failure, via the terminal
     // drive; a successful publication releases the hold.
     if (isCodePublishingKind(resolveRunKind(claim.kind))) {
-      const originalH = await this.git.branchTip(runnerClone.path, result.branch);
+      const originalH = flight.publicationOnly?.originalHead ?? await this.git.branchTip(runnerClone.path, result.branch);
       if (originalH) {
         recoveryRecord = await this.recovery.pin({
           runId,
@@ -9168,8 +9471,13 @@ export class RunRunner {
     // immediately before every final push attempt); checkpoint and held publication are checked
     // too (ciConfigGuardBlocksPublication), where a match skips the upload. All use the raw-path
     // matcher and the --no-renames diff; an uncomputable diff refuses too.
-    const ciConfigGuarded = claim.config?.ci_config_guard === true;
-    const ciConfigGuardGlobs = [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])];
+    // A publication-only resume unions in the globs the original flight recorded (restored through
+    // stricterGuard): a recorded guard is never switched off by a live claim that no longer asks for it.
+    const restoredCIGlobs = flight.publicationOnly?.guard.ci_config_guard_globs ?? null;
+    const ciConfigGuarded = claim.config?.ci_config_guard === true || restoredCIGlobs !== null;
+    const ciConfigGuardGlobs = restoredCIGlobs === null
+      ? [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])]
+      : [...new Set([...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? []), ...restoredCIGlobs])];
     let ciConfigGuardReported = false;
     const failCIConfigGuard = async (guardBarePath: string, ref: string, paths: string[] | null) => {
       if (ciConfigGuardReported) return;
@@ -9243,12 +9551,13 @@ export class RunRunner {
           title: sliceWellFormed(redactText(mrTitle(claim, result.scopeCapped, completionScope)), 1024),
           // The structured claim as redacted, well-formed JSON (never a cut one): the publisher's lead_only and
           // deterministic_only modes (leadFields in pr-description-publisher.ts) are built from exactly this
-          // object, so M5 parses it back with JSON.parse and feeds it to them as the lead claim.
+          // object; the publication-only resume parses it back (leadSummaryFromIntent) and feeds it to them as the lead claim.
           summary: boundedPrSummaryJson(result.prSummary, redactText),
           // The recorded closing set is only what is KNOWN to close at enrollment: a declared, owner-partial or
           // scope-capped delivery, an interlocked one (Closes is added only after the head is verified) and one
-          // decided later (pendingNonClosing, which the publication ACK supplies) record none. M5 MUST recompute
-          // closing at resume from the live claim and the delivery rules, and never trust this value to close an issue.
+          // decided later (pendingNonClosing, which the publication ACK supplies) record none. The resume
+          // (phasePublicationOnly) never reads this value: phasePublish recomputes every closing directive from
+          // the live claim and the delivery rules, so a recorded value can never close an issue.
           closing: issuePublication && typeof claim.issue_iid === "number" && !effectiveDeclared && !result.scopeCapped &&
             (completionScope?.deferred?.length ?? 0) === 0 && !interlocked ? [`#${claim.issue_iid}`] : [],
           contract_revision: claim.config?.completion_contract_version ?? 0,
@@ -10607,7 +10916,9 @@ export class RunRunner {
     const publisher = new PrDescriptionPublisher({
       forge,
       api: this.client,
-      pass: this.deliverySummaryRunner(),
+      // A publication-only resume makes no model call: no pass means the description ladder starts at lead_only
+      // (the recorded lead claims) and falls to deterministic_only.
+      pass: flight.publicationOnly ? null : this.deliverySummaryRunner(),
       log: runLog,
       emit: (text) => batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
       // Issue #2686: the PR-description editor pass's spend, emitted while the batcher is open
@@ -19250,7 +19561,7 @@ export class RunRunner {
     };
     // Issue #1324: the api refused the publication park (publication_enrolled / publication_not_enrolled).
     // Never fall back to a source-releasing path and never report a failure on a refusal: log, say so, and
-    // retain the source and the local record (the publication-only resume, milestone M5, is not yet present).
+    // retain the source and the local record for a later publication-only resume.
     const publicationRefused = async (reason: string): Promise<false> => {
       runLog.warn("publication park refused; retaining the source for reconciliation", { run_id: flight.runId, reason });
       await note(`the publication park was refused (${reason}); the work and the publication record are retained until it is reconciled`);
@@ -23627,7 +23938,7 @@ export class RunRunner {
             const disposal = await flight.executor.safety?.dispose({ boundary: "shutdown", deadlineMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())) });
             await check();
             if (flight.executor.safety && disposal?.kind !== "disposed") throw finalize;
-            flight.executor = this.makeExecutor(claim.run_id, claim.secrets.codex).executor;
+            flight.executor = publicationOnlyExecutor(claim, this.makeExecutor(claim.run_id, claim.secrets.codex).executor);
             this.registerEvidenceExecutor(flight);
           }
           // The (possibly new) executor is bound to the successor's epoch before it runs anything there.

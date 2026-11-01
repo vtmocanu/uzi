@@ -2135,9 +2135,9 @@ export class Outbox {
   }
 
   /** Load one record for a run and generation: MAC verified, size bounded, version and guard state
-   *  strictly validated. `mismatch` is the typed signal for a record this worker cannot honour; nothing
-   *  consumes it yet (the `publication_intent_mismatch` hold belongs to the publication-only resume, milestone M5,
-   *  not yet present); `unauthenticated` and `unreadable` never imply retirement. */
+   *  strictly validated. `mismatch` is the typed signal for a record this worker cannot honour; the
+   *  publication-only resume (RunRunner.phasePublicationOnly) turns it into the `publication_intent_mismatch`
+   *  hold; `unauthenticated` and `unreadable` never imply retirement. */
   async loadPublicationRecord(runId: string, claimGeneration: number): Promise<PublicationLoadResult> {
     if (this.disabled) return { kind: "unreadable" };
     return this.withRunLock(runId, () => this.readPublication(runId, claimGeneration));

@@ -10,6 +10,8 @@ import {
   advancePublicationCandidate,
   boundedPrSummaryJson,
   attachServerSequence,
+  chooseResumeRecord,
+  leadSummaryFromIntent,
   enrollPublicationIntent,
   parseClaimPublicationResume,
   parsePublicationIntent,
@@ -652,6 +654,74 @@ describe("publication intent: recorded scan floors are never trusted unverified"
     assert.equal(out.landed_checkpoint, true);
     assert.equal(stricterGuard(floored(), live, () => false).landed_checkpoint, false);
     assert.equal(stricterGuard(floored(), live, () => true).frozen_held.confirmedTip, CAND);
+  });
+});
+
+describe("publication intent: choosing what a publication-only resume continues from (M5)", () => {
+  const claimOf = (body: ReturnType<typeof intent>, enrollment_seq = 2, candidate_seq = 3) =>
+    ({ enrollment_seq, candidate_seq, intent: JSON.parse(JSON.stringify(body)) as unknown });
+  const serverOf = (claim: ReturnType<typeof claimOf>) => parseClaimPublicationResume(claim, "issue");
+
+  it("uses the local record when it is the active enrollment, newest generation first", () => {
+    const claim = claimOf(intent());
+    const local = recordWithSeqs({ enrollment_seq: 2, candidate_seq: 3 });
+    const choice = chooseResumeRecord([local], claim, serverOf(claim));
+    assert.equal(choice.kind, "use_local");
+  });
+
+  it("attaches the api's sequence numbers to a never-ACKed record that matches the active enrollment", () => {
+    const claim = claimOf(intent(), 7, 2);
+    const choice = chooseResumeRecord([stored()], claim, serverOf(claim));
+    assert.deepEqual(choice.kind === "attach" ? choice.match : choice, { enrollment_seq: 7, candidate_seq: 2 });
+  });
+
+  it("re-sends a local record that is ahead of the api, and never one that is behind", () => {
+    const ahead = recordWithSeqs({ enrollment_seq: 2, candidate_seq: 4, candidate: CAND2 });
+    const claim = claimOf(intent(), 2, 3);
+    assert.equal(chooseResumeRecord([ahead], claim, serverOf(claim)).kind, "resend_local");
+    const behind = recordWithSeqs({ enrollment_seq: 2, candidate_seq: 2 });
+    assert.equal(chooseResumeRecord([behind], claim, serverOf(claim)).kind, "adopt_server", "the api's newer candidate is adopted");
+  });
+
+  it("adopts the server's intent when nothing local is the active enrollment (superseded, or no record at all)", () => {
+    const claim = claimOf(intent(), 9, 1);
+    const old = recordWithSeqs({ enrollment_seq: 2, candidate_seq: 3 });
+    const choice = chooseResumeRecord([old], claim, serverOf(claim));
+    assert.equal(choice.kind, "adopt_server");
+    assert.equal(choice.kind === "adopt_server" ? choice.server.enrollment_seq : undefined, 9, "the old local identity is never re-enrolled");
+    assert.equal(chooseResumeRecord([], claim, serverOf(claim)).kind, "adopt_server");
+  });
+
+  it("a content mismatch anywhere is never trusted", () => {
+    const claim = claimOf(intent(), 2, 3);
+    const weaker = intent();
+    weaker.guard.ci_config_guard_globs = null;
+    const local = recordWithSeqs({ enrollment_seq: 2, candidate_seq: 3 });
+    const mismatched = chooseResumeRecord([local], claimOf(weaker, 2, 3), serverOf(claimOf(weaker, 2, 3)));
+    assert.equal(mismatched.kind, "mismatch");
+    const fine = recordWithSeqs({ enrollment_seq: 2, candidate_seq: 3 });
+    assert.equal(chooseResumeRecord([fine, local], claim, serverOf(claim)).kind, "use_local");
+  });
+});
+
+describe("publication intent: the lead summary comes back from the recorded JSON (M5)", () => {
+  it("returns the redacted structured claim, re-validated member by member", () => {
+    const json = JSON.stringify({
+      what: "w", why: "y", changes: ["a", "", 7], review_pointers: ["p"], verifiedAtSha: HEAD,
+      verification: [{ command: "task gate", result: "pass" }, { command: "x", result: "maybe" }, { result: "pass" }],
+      scope_notes: [{ kind: "added", text: "t" }, { kind: "bogus", text: "t" }],
+      unknown_member: "dropped",
+    });
+    assert.deepEqual(leadSummaryFromIntent(json), {
+      what: "w", why: "y", changes: ["a"], review_pointers: ["p"], verifiedAtSha: HEAD,
+      verification: [{ command: "task gate", result: "pass" }], scope_notes: [{ kind: "added", text: "t" }],
+    });
+  });
+
+  it("answers nothing for an empty, malformed or non-object summary, which sends the publisher to deterministic_only", () => {
+    for (const bad of ["", "{", "[]", "null", "\"s\"", "{}", JSON.stringify({ verifiedAtSha: "nope" })]) {
+      assert.equal(leadSummaryFromIntent(bad), undefined, bad);
+    }
   });
 });
 

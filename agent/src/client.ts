@@ -1223,6 +1223,10 @@ export const CREDENTIAL_SWITCH_HOLD_FEATURE = "credential_switch_hold";
 
 /** Issue #1324: the api accepts NEW publication intents and the typed publication-phase park. */
 const PUBLICATION_RESUME_FEATURE = "publication_resume_v1";
+/** Issue #1324 M5: the owner-hold reasons the api accepts on a publication-phase report (anything else is a 400). */
+const PUBLICATION_HOLD_REASONS: ReadonlySet<string> = new Set([
+  "publication_model_required", "publication_source_unavailable", "publication_intent_mismatch",
+]);
 
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
@@ -2514,13 +2518,20 @@ export class WorkerClient {
       // nor drop its generation fence: it is sent exactly as given, once, or not at all.
       // Not gated on the advertised feature: the api accepts a typed publication park whatever its
       // switch says, and refuses an enrolled run's untyped park, so a park must never be withheld.
+      // Issue #1324 M5: an owner HOLD is the same report with a hold reason and NO surface or step (the api
+      // refuses a hold that names either, and a park that names neither).
+      const hold = body.publication_hold_reason !== undefined;
+      const forgeOutage = !hold &&
+        (body.publication_surface === "git" || body.publication_surface === "api") &&
+        (body.publication_step === "floor_refresh" || body.publication_step === "push" || body.publication_step === "mr_create");
+      const validHold = hold && PUBLICATION_HOLD_REASONS.has(body.publication_hold_reason!) &&
+        body.publication_surface === undefined && body.publication_step === undefined;
       if (body.status !== "recovery_wait" ||
           body.recovery_cause !== "forge_unreachable" || body.recovery_phase !== "publication" ||
-          (body.publication_surface !== "git" && body.publication_surface !== "api") ||
-          (body.publication_step !== "floor_refresh" && body.publication_step !== "push" && body.publication_step !== "mr_create") ||
+          !(forgeOutage || validHold) ||
           !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) < 1 ||
           (body.handoff_checkpoint_tip !== undefined && !/^[0-9a-f]{40}$/.test(body.handoff_checkpoint_tip)))
-        throw new Error("publication park requires a forge_unreachable recovery_wait, a surface, a step and a positive generation");
+        throw new Error("publication park requires a forge_unreachable recovery_wait, a surface and a step (or a hold reason and neither) and a positive generation");
       const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
       try {
         return await this.reportStateOnce(runId, path, Object.freeze({ ...body }), signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
