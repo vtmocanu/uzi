@@ -129,7 +129,9 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 		{"HEALTH", displayHealth(r.Health)},
 	}
 	for _, line := range harnessDecisionLines(r.HarnessDecision) {
-		rows = append(rows, []string{"HARNESS_AT_CREATION", "at creation: " + line})
+		// Keep this key within the existing table width so the unattributed
+		// milestone/NOW region retains its byte-for-byte baseline.
+		rows = append(rows, []string{"HARNESS_PICK", "at creation: " + line})
 	}
 	rows = append(rows, leadConfigRows(r)...)
 	if len(r.AutoApproveBlockedReasons) > 0 {

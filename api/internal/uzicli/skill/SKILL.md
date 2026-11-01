@@ -188,6 +188,7 @@ uzi settings
 uzi settings get
 uzi settings reserve
 uzi settings codex-mode default|auto
+uzi settings harness-overflow on|off
 uzi context list
 uzi context current
 uzi context use <name>
@@ -356,9 +357,10 @@ uzi version
   server reports inactive is still shown; its stored pin remains visible. Table rendering inspects at most twenty response cells and
   displays each harness once. `uzi settings get --json` returns the settings
   object at the top level, including `cross_check_pins` and source fields.
-  The table output ends with a `Weekly usage reserve:` line (`off`, or the threshold
-  and whether running runs are paused); `--json` carries `weekly_reserve_pct` (null =
-  off) and `weekly_reserve_pause_running`.
+  The table also shows `Weekly usage reserve:` (`off`, or the threshold and whether
+  running runs are paused), `Codex account mode:`, and `Harness overflow:`.
+  `--json` carries `weekly_reserve_pct` (null = off), `weekly_reserve_pause_running`,
+  `codex_account_mode`, and `harness_overflow_enabled`.
 - `uzi settings codex-mode default|auto` — choose how a NEW Codex run picks its login:
   `default` binds your default Codex login (today's behaviour), `auto` picks, at run
   creation, the pooled login with the most limit headroom (pool logins with `uzi token
@@ -366,6 +368,13 @@ uzi version
   `uzi settings get` shows it as `Codex account mode:`; `uzi run get` explains the pick on
   the `CODEX_ALIAS` row. When `auto` cannot bind any pooled login the run start is refused
   with a 422 whose reason is `codex_pool_unavailable`.
+- `uzi settings harness-overflow on|off` — opt in to overflow when your preferred
+  harness is near its limits. Off by default. Applies only at creation to implicit
+  issue runs started manually, by autopilot, or by a schedule, with both harnesses
+  usable. Explicit harnesses, model pins, Anthropic credential overrides, and either
+  cross-check setting prevent overflow. Existing runs never switch. `--json` returns
+  `harness_overflow_enabled`; `uzi run get` shows the stored decision at creation,
+  including unknown scores and measured headroom versus capacity holds.
 - `uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]` — set
   your weekly usage reserve, the 7-day utilization percent at which uzi stops starting
   runs on your subscription (and, with pausing on, pauses running runs at their next

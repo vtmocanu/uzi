@@ -78,7 +78,12 @@ func TestRailHarnessDecisionHostileWidth(t *testing.T) {
 			m.renderer, _ = newTUIRenderer(m.transcriptWidth(), dark)
 			hostile := "ok\x1b[2J\u202e\n\t" + strings.Repeat("界", 80)
 			m = applyDetail(m, apitypes.RunDTO{ID: "hostile", Status: "completed", HarnessDecision: &apitypes.HarnessDecisionDTO{Preferred: hostile, Chosen: hostile, Reason: hostile}}, nil)
-			block := stripANSI(m.railHarnessDecision(0))
+			rawBlock := m.railHarnessDecision(0)
+			// Stripping ANSI first would hide the injected erase-screen command.
+			if strings.Contains(rawBlock, "\x1b[2J") {
+				t.Fatalf("unsafe escape in raw block: %q", rawBlock)
+			}
+			block := stripANSI(rawBlock)
 			for _, prefix := range []string{"preferred: ok", "chosen: ok", "reason: ok"} {
 				if !strings.Contains(block, prefix) {
 					t.Fatalf("field not exercised: %q", block)
@@ -93,7 +98,11 @@ func TestRailHarnessDecisionHostileWidth(t *testing.T) {
 				}
 			}
 			// These are the shipped full-rail draws, with the stored evidence still present.
-			rail := stripANSI(m.renderLaneRail())
+			rawRail := m.renderLaneRail()
+			if strings.Contains(rawRail, "\x1b[2J") {
+				t.Fatalf("unsafe escape in composed rail: %q", rawRail)
+			}
+			rail := stripANSI(rawRail)
 			if !strings.Contains(rail, "HARNESS at creation") || strings.ContainsAny(rail, "\x1b\u202e") {
 				t.Fatalf("unsafe or missing rail block: %q", rail)
 			}
