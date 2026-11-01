@@ -700,6 +700,24 @@ it("a scope-capped park is still recognised when the issue was retitled before t
   assert.equal(forge.calls.length, 0);
 });
 
+for (const [name, enrolTitle, resumeTitle] of [
+  ["a capped run on an issue already titled with the partial prefix", "[partial] foo", "[partial] foo"],
+  ["a capped run whose issue was retitled to start with the partial prefix", "Fix thing", "[partial] other"],
+] as const) {
+  it(`${name} still holds as scope-capped`, async () => {
+    const { claim, last } = await enrolAndPark(5395, await mkOutbox(), {
+      claim: { issue_title: enrolTitle }, result: { scopeCapped: { completedCount: 1, total: 3 } },
+    });
+    reset();
+    const c = counts();
+    const forge = fakeGitlab({ head: last.candidate });
+    await build(tripwireExecutor(c), { gitlab: forge.gitlab }, await mkOutbox(), { c }).execute(resumeClaim(claim, last, { issue_title: resumeTitle }));
+    assert.deepEqual(c, counts());
+    assert.deepEqual(parks(claim.run_id).filter(b => b.publication_hold_reason !== undefined).map(h => h.publication_hold_reason), ["publication_model_required"]);
+    assert.equal(forge.calls.length, 0);
+  });
+}
+
 it("an issue whose own title starts with the partial prefix is not mistaken for a scope cap", async () => {
   const { claim, last } = await enrolAndPark(5396, await mkOutbox(), { claim: { issue_title: "[partial] a real title" } });
   reset();

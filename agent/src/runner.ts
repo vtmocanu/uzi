@@ -7966,11 +7966,12 @@ export class RunRunner {
 
     // A scope-capped delivery is a closing fact the live claim cannot restate (the cap is a run-time outcome of
     // the executor). Its recorded title carries the partial prefix; without a live owner deferral to explain
-    // that prefix the delivery cannot be rebuilt model-free, so hold. Keyed on the RECORDED title alone, so a
-    // retitled issue cannot hide the cap; an issue whose own title starts with the prefix is not a cap.
+    // that prefix the delivery cannot be rebuilt model-free, so hold. A recorded partial title counts as a cap
+    // unless it is exactly the uncapped title the live claim renders (an issue whose own title starts with the
+    // prefix). A retitled issue therefore holds rather than hiding the cap: the safe direction.
     const PARTIAL = "[partial] ";
-    if ((claim.config?.completion_scope?.deferred?.length ?? 0) === 0 &&
-        record.mr.title.startsWith(PARTIAL) && !(claim.issue_title ?? "").trim().startsWith(PARTIAL)) {
+    if ((claim.config?.completion_scope?.deferred?.length ?? 0) === 0 && record.mr.title.startsWith(PARTIAL) &&
+        record.mr.title !== sliceWellFormed(flight.redactText(mrTitle(claim, undefined, claim.config?.completion_scope)), 1024)) {
       return hold("publication_model_required", "the recorded delivery was scope-capped, which only the executor can restate");
     }
 
@@ -8028,7 +8029,7 @@ export class RunRunner {
     // the existing non-closing path. An interlocked run's recorded set is empty by construction; the interlock
     // and the live claim.config.non_closing decide there.
     if (claim.config?.completion_contract_version == null && resolveRunKind(claim.kind) === "issue" &&
-        typeof claim.issue_iid === "number" && claim.config?.non_closing === undefined &&
+        typeof claim.issue_iid === "number" && claim.config?.non_closing == null &&
         (claim.config?.completion_scope?.deferred?.length ?? 0) === 0 &&
         !record.mr.closing.includes(`#${claim.issue_iid}`)) {
       flight.result.nonClosing = { reason: "The original delivery did not close its issue; the resumed publication keeps it open." };
