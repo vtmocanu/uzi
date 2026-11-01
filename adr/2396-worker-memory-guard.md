@@ -250,7 +250,7 @@ The worker keeps a worker-local, in-memory table of its own settled parks, per r
 | none | present | re-park (F2) |
 | none | none | ordinary flow |
 
-An entry moves `pending` to `consumed` only after a complete handoff. A pending entry with no reference therefore re-parks, and a stuck pending entry costs at most one conservative re-park.
+An entry moves `pending` to `consumed` only after a complete handoff. A pending entry with no reference therefore re-parks, and a stuck pending entry costs one conservative re-park per Resume until a fallback park is acknowledged (a lost ACK keeps the entry pending).
 
 ### Gate, handoff and fallbacks
 
@@ -261,13 +261,13 @@ The gate runs once at the top of the clone phase, before discovery, source admis
 3. The memory guard produces a fresh valid, armed sample after the gate began, with no pending intervention. This is a context-free wait that captures nothing, bounded by the guard's rearm plus twice its sample and response budget, and by shutdown and the flight lifecycle.
 4. The slot check passes again after the wait.
 
-Discovery is then bound to the receipt's expected source and never heals or repairs, and a handoff admission check runs before the existing retained-recovery admission (which re-checks under its own lock). Failure handling: a timeout of only the guard wait (with 1 and 4 intact) is F1 and re-parks through the existing D4 body; every other failure is F2 (identity, reference or corruption) or F3 and re-parks at the claim's own binding writing nothing (no journal, bare, authority, ledger or source write). A cancel during the gate reports `failed` ("run cancelled") with custody kept, like other retained-recovery cancels. Only a complete handoff consumes the entry.
+Discovery is then bound to the receipt's expected source and never heals or repairs, and a handoff admission check runs before the existing retained-recovery admission (which re-checks under its own lock). Failure handling: a timeout of only the guard wait (with 1 and 4 intact) is F1 and re-parks through the existing D4 body; every other failure is F2 (identity, reference or corruption) or F3 and re-parks at the claim's own binding writing nothing (no journal, bare, authority, ledger or source write). Cancel, pause, shutdown and the claim fence during the gate go to the existing retained-recovery arms without a re-park: a cancel reports `failed` ("run cancelled") with custody kept, like other retained-recovery cancels, and pause and shutdown stop nonterminally. Only a complete handoff consumes the entry.
 
 ### Residuals and not shipped
 
 - Parks made before the deploy have no reference row and are never lifted; receipts arriving after Resume are refused and the park stays unqualified.
-- A stuck `pending` entry costs at most one conservative re-park. A guard sample ticket that never resolves makes every continuation time out to F1.
+- A stuck `pending` entry costs one conservative re-park per Resume until a fallback park is acknowledged (a lost ACK keeps the entry pending). A guard sample ticket that never resolves makes every continuation time out to F1.
 - The window between discovery's lock release and the existing admission is unchecked (admission re-checks under its own lock).
 - Docker and unregistered writers are excluded. Descriptor-only continuation, hard-kill recovery and the restart follow-up (#3644) are not built; a worker restart still does not release a memory park.
-- Memory cost: the aggregate worker own-park registry has a raw upper bound of 1024 entries x 512 KiB = 512 MiB before overhead. It is unmeasured. Server storage is bounded per run by the 512 KiB cap.
+- Memory cost: the aggregate worker own-park registry has a raw upper bound of 1024 entries x 512 KiB = 512 MiB before overhead. That counts UTF-8 bytes; V8 stores a string containing any non-Latin-1 character at two bytes per character, so the in-memory worst case is about 1 GiB. It is unmeasured. Server storage is bounded per park by the 512 KiB cap: `memory_park_releases` is keyed `(run_id, claim_generation)`, one row per park, each at most 512 KiB, kept until the run is deleted.
 - No hosted or compose acceptance of a settled park continued after Resume is claimed; it remains a human step.

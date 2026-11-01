@@ -96,15 +96,21 @@ claim the run again, where an ordinary memory park keeps that worker excluded.
 That worker continues only if its own local checks pass: the claim must match its
 record of the park, the settled source must still verify, and the memory guard
 must produce a fresh sample. If a check fails, it re-parks the run at the same
-`worker_memory_pressure` hold for you (writing nothing), and **Cancel** remains
-the exit. A receipt that reaches the server after you Resume is refused, and
+`worker_memory_pressure` hold for you and **Cancel** remains the exit. A
+refusal on the identity, receipt or source checks writes nothing locally; a
+timeout of only the guard sample goes through the existing continuation
+re-park, which writes a `memoryPark` journal record. Every such re-park also
+reports the park to the server. A receipt that reaches the server after you Resume is refused, and
 parks made before this behavior was deployed have no receipt and are never
-lifted. Until the exclusion is lifted, or when no other worker is free, the run
-health reads "waiting for another worker, or restart worker NAME (its previous
-process was released by a memory-pressure park)". Restarting a worker does not
-release a memory park.
+lifted. After Resume, while the run is queued, the released worker is still
+excluded (no receipt lifted it), no other worker can take the run and the
+released worker is still heartbeating, the run health reads "waiting for
+another worker, or restart worker NAME (its previous process was released by a
+memory-pressure park)". A restart does not lift the hold without owner Resume;
+after Resume, a restarted worker (new registration nonce) is a different
+incarnation and is no longer excluded.
 
-If it did not (the park was not confirmed, or the source end
+If the parking worker's source end was not settled (the park was not confirmed, or the source end
 was not durably recorded) and the journal records the park (a `memoryPark`
 record in the active journal, with the successor running the memory guard and
 `worker_memory_pressure_v1`), a fresh worker re-parks the run at the same

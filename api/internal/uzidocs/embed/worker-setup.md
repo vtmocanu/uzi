@@ -450,6 +450,12 @@ the cross-check lane are unaffected. Guard-disabled workers never register the
 capability and are unchanged; an older worker image lacks it and is never gated
 (its claims fail until restart, as before).
 
+The worker also advertises `memory_park_settlement_v1`, only together with
+`worker_memory_pressure_v1`. It carries the settlement receipt a fully settled
+memory park sends and the reference its next claim presents. With an old api or
+an old worker there is no receipt and no reference, and the park stays
+unqualified (see [Run recovery](run-recovery.md)).
+
 **Releasing it.** Restart the worker's container (the pod, for a
 [hosted worker](hosted-workers.md)). Only a fresh registration restores
 authority; a heartbeat never does, and there is no self-restart or retry.
