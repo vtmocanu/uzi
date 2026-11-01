@@ -1,11 +1,15 @@
 package handler
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -52,11 +56,12 @@ func TestAdvertisedFeaturesClosureNeedsKnobPortAndLimiter(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newProtocolHandler(t, &protocolStore{})
-			if !tc.port {
-				h.wsvc = nil
-			}
 			h.cfg.PrerequisiteClosureForges = tc.forges
-			h.RecoveryService()
+			svc := h.RecoveryService()
+			if !tc.port {
+				// Only the port goes: the knob and the limiter stay wired.
+				svc.SetPrerequisiteFinal(nil)
+			}
 			if advertised(h) {
 				t.Fatal("advertised before the limiter was wired")
 			}
@@ -65,5 +70,28 @@ func TestAdvertisedFeaturesClosureNeedsKnobPortAndLimiter(t *testing.T) {
 				t.Fatalf("advertised = %t, want %t", got, tc.want)
 			}
 		})
+	}
+}
+
+// The heartbeat replaces the worker's feature set, so it must advertise the closure feature
+// exactly as register does, or a worker would lose it after its first heartbeat.
+func TestWorkerHeartbeatAdvertisesPrerequisiteClosure(t *testing.T) {
+	h := newProtocolHandler(t, &protocolStore{})
+	h.cfg.PrerequisiteClosureForges = []string{"github"}
+	h.RecoveryService()
+	h.mountWorkerRoutes(chi.NewRouter(), mw.NewLimiter(10, time.Minute, nil))
+	rec := httptest.NewRecorder()
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, "{}", uuid.New()))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("heartbeat: %d %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Features []string `json:"protocol_features"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(response.Features, capability.RecoveryPrerequisiteClosureV1) {
+		t.Fatalf("heartbeat features %v lack %s", response.Features, capability.RecoveryPrerequisiteClosureV1)
 	}
 }
