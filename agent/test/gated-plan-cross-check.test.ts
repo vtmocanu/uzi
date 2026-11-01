@@ -329,8 +329,11 @@ describe("gated plan cross-check: human gate settlement", () => {
 });
 
 describe("gated plan cross-check: semantic candidate", () => {
-  it("a gated pass of a compiled semantic candidate binds the semantic digest and opens the human gate", { skip: LINUX_CAPTURE }, async () => {
+  for (const redacted of [false, true]) it(`a compiled semantic gated pass presents the matching bundle (${redacted ? "redacted title" : "unchanged title"})`, { skip: LINUX_CAPTURE }, async () => {
     git.capturePlanningDiff = async () => Buffer.from("");
+    const rawPlan = redacted ? "Implement A\u202e" : "Implement A";
+    const rawMilestones = [{ id: "m1", title: redacted ? "A glpat-" + "a".repeat(20) : "A" }];
+    const checkedMilestones = [{ id: "m1", title: redacted ? "A [redacted]" : "A" }];
     const c = gatedClaim(1, { issue_description: "Implement A", semantic_planning: enrollment });
     const events: string[] = [];
     const server = semanticServer(client, events);
@@ -350,7 +353,7 @@ describe("gated plan cross-check: semantic candidate", () => {
       const identity = server.compiled().candidate;
       return { status: 200, body: { result: "candidate", round, checker_run_id: child,
         candidate_digest: identity.digest, candidate_generation: 1,
-        candidate: { ...candidate, semantic_candidate: identity },
+        candidate: { ...candidate, plan_md: "Implement A", milestones: checkedMilestones, semantic_candidate: identity },
         verdict: "approve", reason_class: "approve", findings: null,
         automatic_revision_limit: 2, automatic_rounds_enabled: true,
         deadline_at: new Date(Date.now() + 60_000).toISOString(),
@@ -361,17 +364,24 @@ describe("gated plan cross-check: semantic candidate", () => {
     const transport = await boundedTransport("claude", server.report, events);
     const p = proposal();
     p.criteria[0]!.citations[0]!.source_id = "issue:" + c.issue_iid;
+    let humanVerdict: PlanVerdict | undefined;
     const exec: Executor = { run: async (ctx) => {
-      const verdict = await ctx.gatePlan!("Implement A", [{ id: "m1", title: "A" }], undefined, undefined, p);
-      assert.equal(verdict.kind, "approve");
-      assert.notEqual((verdict as { approval?: string }).approval, "cross_check");
+      humanVerdict = await ctx.gatePlan!(rawPlan, rawMilestones, undefined, undefined, p);
       return { branch: ctx.branch };
     } };
     await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
       planCrossCheckTiming: timing, planApprovalTimeoutMs: 4000 }).execute(c);
     const [gate, ...rest] = gates(c.run_id);
     assert.ok(gate && rest.length === 0, JSON.stringify(api.states));
+    assert.equal(gate.plan_md, rawPlan, "semantic presentation preserves the raw plan identity");
+    assert.deepEqual(gate.milestones, checkedMilestones);
     assert.equal(gate.candidate_digest, server.compiled().candidate.digest);
+    assert.equal(humanVerdict?.kind, "approve", "a human verdict reached the executor");
+    assert.notEqual((humanVerdict as { approval?: string }).approval, "cross_check");
+    assert.deepEqual((humanVerdict as { canonical?: unknown }).canonical, {
+      plan: gate.plan_md, milestones: gate.milestones, candidate_digest: gate.candidate_digest, claimGeneration: 1,
+    }, "implementation receives the exact presented plan, milestones and semantic identity");
+    assertNoCheckedStorage(c.run_id);
     assert.equal(Object.hasOwn(gate, "plan_cross_check_gate_reason"), false);
     assert.equal(Object.hasOwn(gate, "semantic_park"), false, "a human-gated run supplies no autopilot park");
     assert.deepEqual(passLine(c.run_id), ["plan cross-check: passed after 1 round"]);

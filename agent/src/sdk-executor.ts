@@ -2968,8 +2968,11 @@ export class SdkExecutor implements Executor {
       // Repeat the checked server contract on every implement attempt: an interrupted
       // first attempt may not have delivered it to the model or updated the old session.
       // Serialize the entire approved list, including nested values and explicit [].
-      const checkedContext = drive.checkedPlan || drive.humanCanonicalPlan
-        ? checkedImplementationContext(approvedPlan, frozenMilestones) + renderPlanApprovalAdvice(drive.checkedFindings) : "";
+      // An enrolled pre-approved resume repeats the persisted contract even with a
+      // surviving session; that session may still carry the pre-normalization draft.
+      // Missing frozen milestones remain unknown (null), never an inferred empty list.
+      const checkedContext = drive.checkedPlan || drive.humanCanonicalPlan || (preApproved && ctx.repeatApprovedPlan === true)
+        ? checkedImplementationContext(approvedPlan, frozenMilestones ?? null) + renderPlanApprovalAdvice(drive.checkedFindings) : "";
       const seededPlanBody = embedSeededPlan({
         preApproved,
         seeded: ctx.seeded === true,

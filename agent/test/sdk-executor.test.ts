@@ -1590,6 +1590,51 @@ describe("SdkExecutor checked canonical approval", () => {
     return { kind: "approve", approval: "cross_check", selection: { status: "absent" }, canonical: bundle } as PlanVerdict;
   }
 
+  for (const autoApprove of [false, true]) for (const [label, milestones] of [
+    ["nested", canonical.milestones], ["empty", []], ["unavailable", undefined],
+  ] as const) it(`a pre-approved ${autoApprove ? "required-check" : "human-gated"} resume repeats its persisted contract (${label})`, async () => {
+    const { queryFn, turns } = fakeTurns([
+      [assistantText("working"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ planApproved: true, sessionId: "surviving-plan-session", autoApprove,
+      approvedPlan: canonical.plan, frozenMilestones: milestones,
+      repeatApprovedPlan: true,
+    } as Partial<RunContext>);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(probe.gated.length, 0);
+    assert.equal(turns.length, 2, "both turns implement, without replanning");
+    assert.equal(turns[0]!.options.resume, "surviving-plan-session");
+    for (const turn of turns) {
+      const prompt = turn.promptText!;
+      assert.ok(prompt.includes(canonical.plan), "the persisted plan overrides the earlier draft in the surviving session");
+      const contract = prompt.match(/<approved_milestone_contract>\n([\s\S]*?)\n<\/approved_milestone_contract>/);
+      assert.ok(contract, "the full persisted milestone contract rides every implement attempt");
+      assert.deepEqual(JSON.parse(contract[1]!), milestones ?? null, "missing evidence is not inferred to be an empty contract");
+      assert.doesNotMatch(prompt, /Your plan was cross-checked/);
+    }
+  });
+
+  it("an ordinary approved session resume keeps its existing prompt", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({ planApproved: true, sessionId: "ordinary-session", approvedPlan: canonical.plan,
+      frozenMilestones: canonical.milestones });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(probe.gated.length, 0);
+    assert.doesNotMatch(turns[0]!.promptText!, /Canonical scrubbed plan|<approved_milestone_contract>/);
+  });
+
+  it("repeating a persisted contract never grants approval", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones([], "new draft"), resultSuccess()], [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ planApproved: false, sessionId: "unapproved-session", approvedPlan: canonical.plan,
+      repeatApprovedPlan: true } as Partial<RunContext>);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(probe.gated.length, 1, "the normal gate still owns approval");
+    assert.doesNotMatch(turns[1]!.promptText!, /Canonical scrubbed plan|<approved_milestone_contract>/);
+  });
+
   it("a human approval implements the presented canonical bundle without checker approval", async () => {
     const { queryFn, turns } = fakeTurns([
       [submitPlanWithMilestones([{ id: "local", title: "LOCAL title" }], "LOCAL raw plan"), resultSuccess()],

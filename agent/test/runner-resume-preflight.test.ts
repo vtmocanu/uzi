@@ -313,6 +313,27 @@ describe("RunRunner — resume preflight (issue #105)", () => {
     }
   });
 
+  for (const [name, flags, repeat] of [
+    ["human-gated", { auto_approve: false, plan_cross_check_gated: true }, true],
+    ["required-check", { auto_approve: true, plan_cross_check_required: true }, true],
+    ["ordinary", { auto_approve: false }, undefined],
+  ] as const) it(`marks only enrolled ${name} resumes to repeat the persisted approved contract`, async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-approved-contract-resume-"));
+    const seen: RunContext[] = [];
+    const claim = gitlabClaim(3708, { ...flags, session_id: SID, plan_approved: true,
+      plan_source: "agent", plan_md: "PERSISTED_CANONICAL_PROSE" });
+    try {
+      plantTranscript(path.join(homeRoot, claim.run_id), SID);
+      await runnerWith(capturingFactory(homeRoot, seen), gitlab).execute(claim);
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0]!.sessionId, SID);
+      assert.equal(seen[0]!.planApproved, true);
+      assert.equal(seen[0]!.approvedPlan, claim.plan_md);
+      assert.equal(seen[0]!.repeatApprovedPlan, repeat);
+    } finally { fs.rmSync(homeRoot, { recursive: true, force: true }); }
+  });
+
   it("emits neither resume event on a fresh first attempt (no prior session)", async () => {
     // A brand-new first attempt has claim.session_id == null — there was never a session
     // to resolve — so it must emit NEITHER the negative nor the positive resume signal

@@ -63,6 +63,7 @@ import { type CodexOperationController, type CodexOperationWaitPolicy } from "./
 import { CodexOperationAdmissionError } from "./client.js";
 import { PLAN_REVISION_RETRY_FEATURE, PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "./plan-revision-retry.js";
 import { checkPlan, type CheckedHumanGate, type CheckedPlanDecision, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
+import { gatedPlanPresentation } from "./checked-plan.js";
 import { captureSemanticSources, parseSemanticEnrollment } from "./semantic-plan.js";
 import { SemanticPlanningGate } from "./semantic-planning-gate.js";
 import { observePrdSources, hasDriftContradiction, type FrozenSource, type SemanticObservationRecord, type SemanticObservationRequest } from "./semantic-drift.js";
@@ -13663,6 +13664,10 @@ export class RunRunner {
       // emits the "plan supplied externally" feed line off this.
       seeded,
       approvedPlan: claim.plan_md ?? undefined,
+      // The session may still contain a pre-normalization draft. Enrollment scopes
+      // replay of the persisted approved contract; it does not establish a checker pass.
+      ...(!seeded && (claim.plan_cross_check_required === true || claim.plan_cross_check_gated === true)
+        ? { repeatApprovedPlan: true } : {}),
       // The persisted selection, replayed on the claim (PRD #35). Passed through
       // unconditionally rather than gated on planApproved: it is the run's
       // selection whether or not this particular resume skips the gate, and the
@@ -14087,12 +14092,13 @@ export class RunRunner {
           }
           return flight.reportState(frozen, steering.lifecycleSignal(), "semantic");
         };
-        // A gated pass presents the canonical candidate the checker read, so the feed plan, the
-        // rewrite nudge and the awaiting_approval report all carry the stored text. A semantic
-        // candidate keeps the exact bytes its digest was computed over.
-        const presentedPlanMd = gatedPass && !semanticCompiled ? gatedPass.response.candidate.plan_md : planMd;
-        const presentedMilestones = gatedPass && !semanticCompiled
-          ? gatedPass.response.candidate.milestones as Milestone[] : milestones;
+        const gatedPresentation = gatedPass ? gatedPlanPresentation({ plan: planMd, milestones }, {
+          plan: gatedPass.response.candidate.plan_md,
+          milestones: gatedPass.response.candidate.milestones as Milestone[],
+          candidate_digest: gatedPass.response.candidate_digest,
+        }, semanticCompiled?.candidate.digest) : undefined;
+        const presentedPlanMd = gatedPresentation?.plan ?? planMd;
+        const presentedMilestones = gatedPresentation ? gatedPresentation.milestones : milestones;
         const verdict = await this.gatePlan(
           runId,
           presentedPlanMd,
@@ -14144,8 +14150,8 @@ export class RunRunner {
             await this.observeSemanticDrift(flight, { phase: "presentation",
               candidate_digest: semanticCompiled!.candidate.digest, gate_revision: ack.gateRevision! }, steering.lifecycleSignal());
           } : undefined,
-          gatedPass ? { plan: presentedPlanMd, milestones: presentedMilestones ?? [],
-            candidate_digest: gatedPass.response.candidate_digest, claimGeneration: flight.claimGeneration } : undefined,
+          gatedPresentation ? { ...gatedPresentation, milestones: presentedMilestones ?? [],
+            claimGeneration: flight.claimGeneration } : undefined,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);

@@ -1,5 +1,5 @@
-// The checked plan-gate contract both lead executors (sdk-executor.ts, codex/codex-executor.ts)
-// consume: the validated server candidate approved by a checker or a human, the implement-prompt context
+// The plan-gate contract shared by the runner and both lead executors:
+// the validated server candidate approved by a checker or a human, the implement-prompt context
 // that carries it, and the bound on automatic revision rounds. One copy, so the two harnesses
 // cannot drift on what "exactly the approved candidate" means.
 
@@ -8,6 +8,20 @@ import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 
 /** The most automatic (checker-requested) revision rounds a plan gate accepts (PRD #2150). */
 const MAX_AUTOMATIC_ROUND = 4;
+
+/** One tuple for the human gate and its approved bundle. Semantic plan bytes retain
+ * their raw PlanHash identity; structural plans use the checker's normalized text. */
+export function gatedPlanPresentation(
+  raw: { plan: string; milestones: Milestone[] | undefined },
+  checked: { plan: string; milestones: Milestone[]; candidate_digest: string },
+  semanticDigest?: string,
+) {
+  return {
+    plan: semanticDigest ? raw.plan : checked.plan,
+    milestones: checked.milestones,
+    candidate_digest: semanticDigest ?? checked.candidate_digest,
+  };
+}
 
 /**
  * Validate the whole canonical approval bundle before adopting any of it. The digest is an opaque
