@@ -1220,6 +1220,7 @@ type Run struct {
 	ForgeAdmission              []byte             `json:"forge_admission"`
 	CodexSelectReason           pgtype.Text        `json:"codex_select_reason"`
 	RecoveryWaitPhase           pgtype.Text        `json:"recovery_wait_phase"`
+	PlanCrossCheckGated         bool               `json:"plan_cross_check_gated"`
 	PolicyPreserveRequired      bool               `json:"policy_preserve_required"`
 	PolicyPendingFresh          bool               `json:"policy_pending_fresh"`
 	PolicyOutcomeID             pgtype.UUID        `json:"policy_outcome_id"`
@@ -1233,7 +1234,6 @@ type Run struct {
 	PolicyRefusalPhase          pgtype.Text        `json:"policy_refusal_phase"`
 	PolicyRefusalCorrelationID  pgtype.Text        `json:"policy_refusal_correlation_id"`
 	PolicyHoldPublished         pgtype.Bool        `json:"policy_hold_published"`
-	PlanCrossCheckGated         bool               `json:"plan_cross_check_gated"`
 }
 
 type RunCompletionAttempt struct {
