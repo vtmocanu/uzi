@@ -8,6 +8,18 @@ import "time"
 // Raw archive bytes NEVER appear here — only metadata (D6). Adding these grows no
 // existing DTO: RunDTO is untouched, so the run-list wire is unchanged.
 
+// RecoveryPrerequisiteClosureDTO exposes persisted owner-safe pin metadata.
+// Its state is the durable state, independent of worker readiness.
+type RecoveryPrerequisiteClosureDTO struct {
+	State              string    `json:"state"`
+	Reason             string    `json:"reason,omitempty"`
+	PinRef             string    `json:"pin_ref"`
+	PinTip             *string   `json:"pin_tip,omitempty"`
+	AbsenceUnconfirmed bool      `json:"absence_unconfirmed"`
+	CleanupExhausted   bool      `json:"cleanup_exhausted"`
+	UpdatedAt          time.Time `json:"updated_at"`
+}
+
 // RecoveryArchiveDTO is one owner-visible capture's metadata (PRD #1296 D7). It carries
 // NO raw bytes and no idempotency key — only what the run page and `uzi run export`
 // render: the capture id, its run, the custody hold it was reserved under (hold_id, so
@@ -18,18 +30,19 @@ import "time"
 // expiry (absent until the artifact is available). Every optional field is omitempty, so
 // a zero value marshals with no null (the finding.zero.json shape).
 type RecoveryArchiveDTO struct {
-	ID               string     `json:"id"`
-	RunID            string     `json:"run_id"`
-	HoldID           string     `json:"hold_id"`
-	State            string     `json:"state"`
-	SourceSha        string     `json:"source_sha"`
-	AttemptedHeadSha *string    `json:"attempted_head_sha,omitempty"`
-	ByteSize         *int64     `json:"byte_size,omitempty"`
-	Checksum         string     `json:"checksum,omitempty"`
-	Reason           string     `json:"reason,omitempty"`
-	PrerequisiteShas []string   `json:"prerequisite_shas,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
-	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
+	PrerequisiteClosure *RecoveryPrerequisiteClosureDTO `json:"prerequisite_closure,omitempty"`
+	ID                  string                          `json:"id"`
+	RunID               string                          `json:"run_id"`
+	HoldID              string                          `json:"hold_id"`
+	State               string                          `json:"state"`
+	SourceSha           string                          `json:"source_sha"`
+	AttemptedHeadSha    *string                         `json:"attempted_head_sha,omitempty"`
+	ByteSize            *int64                          `json:"byte_size,omitempty"`
+	Checksum            string                          `json:"checksum,omitempty"`
+	Reason              string                          `json:"reason,omitempty"`
+	PrerequisiteShas    []string                        `json:"prerequisite_shas,omitempty"`
+	CreatedAt           time.Time                       `json:"created_at"`
+	ExpiresAt           *time.Time                      `json:"expires_at,omitempty"`
 }
 
 // RecoveryArchiveStateCountsDTO is the per-state capture tally on a run's recovery

@@ -1356,10 +1356,15 @@ func TestRecoveryArchiveDTOTags(t *testing.T) {
 	full := RecoveryArchiveDTO{
 		AttemptedHeadSha: &h, ByteSize: &sz, Checksum: "sha256:x", Reason: "quota",
 		PrerequisiteShas: []string{"deadbeef"}, ExpiresAt: &now,
+		PrerequisiteClosure: &RecoveryPrerequisiteClosureDTO{State: "pinned"},
 	}
 	assertTags(t, "RecoveryArchiveDTO(full)", full,
 		"id", "run_id", "hold_id", "state", "source_sha", "created_at",
-		"attempted_head_sha", "byte_size", "checksum", "reason", "prerequisite_shas", "expires_at")
+		"attempted_head_sha", "byte_size", "checksum", "reason", "prerequisite_shas", "expires_at", "prerequisite_closure")
+	assertTags(t, "RecoveryPrerequisiteClosureDTO", RecoveryPrerequisiteClosureDTO{},
+		"state", "pin_ref", "absence_unconfirmed", "cleanup_exhausted", "updated_at")
+	assertTags(t, "RecoveryPrerequisiteClosureDTO(full)", RecoveryPrerequisiteClosureDTO{Reason: "pin_unknown", PinTip: &h},
+		"state", "reason", "pin_ref", "pin_tip", "absence_unconfirmed", "cleanup_exhausted", "updated_at")
 }
 
 // The summary's counts is a fixed struct (all six state keys always present); archives is a

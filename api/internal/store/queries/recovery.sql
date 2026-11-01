@@ -70,9 +70,17 @@ WHERE id = @id AND run_id = @run_id AND user_id = @user_id;
 -- name: ListCapturesForRunOwner :many
 -- D7: every retained capture for one run, owner-scoped, oldest-first. Feeds the run's
 -- Recovery archives section (all states shown, not gated on availability).
-SELECT * FROM recovery_captures
-WHERE run_id = @run_id AND user_id = @user_id
-ORDER BY created_at;
+SELECT sqlc.embed(c), p.id AS closure_id, p.state AS closure_state,
+    p.reason AS closure_reason, p.pin_ref, p.pin_tip, p.absent_since,
+    p.cleanup_exhausted_at, p.updated_at AS closure_updated_at
+FROM recovery_captures c
+LEFT JOIN recovery_prerequisite_closures p
+    ON p.capture_id = c.id AND p.user_id = c.user_id AND p.run_id = c.run_id
+    AND p.hold_id = c.hold_id
+    AND p.repo_id = (SELECT h.repo_id FROM recovery_custody_holds h WHERE h.id = c.hold_id)
+    AND p.checksum = c.checksum AND p.prerequisite_shas = c.prerequisite_shas
+WHERE c.run_id = @run_id AND c.user_id = @user_id
+ORDER BY c.created_at;
 
 -- name: ListCaptureChunks :many
 -- D4: the ordered chunk inventory for a download stream. The caller reads chunks in
