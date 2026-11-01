@@ -3038,14 +3038,32 @@ export class SdkExecutor implements Executor {
       };
       // PRD #1226 M3 (D3): completion-interlock attempt-loop state, DISTINCT from the #281 prose
       // stall state above but sharing STALL_LIMIT. completionAttempted latches true once the
-      // first structural attempt has run — it gates the post-attempt failure routing (before it,
-      // wall/idle/max-iter/no-progress fail exactly as today). The completion fingerprint is
+      // first structural attempt has run — it gates the post-attempt failure routing.
+      // Zero-attempt iteration parks use authoritative history separately. The completion fingerprint is
       // (sorted unmet ids, head, worktree fingerprint); an identical fingerprint across
       // consecutive attempts advances completionStallStreak, and STALL_LIMIT identical attempts
       // route to the hold. completionHeld latches the reason when the run entered the hold, so it
       // survives the `break` into the ExecutorResult (like pausedAt/scopeCapped).
       let completionAttempted = false;
       const history = new CompletionHistory();
+      // The runner withholds this capability on review targets and isolated fetches.
+      const iterationParkSupported = ctx.config?.iteration_park_version === 1 &&
+        !!ctx.parkForIteration && !ctx.interactive &&
+        ["issue", "mr_rework", "ci_fix", "task", "prompt", "self_improve"].some(kind => kind === ctx.kind);
+      let iterationParked: ExecutorResult["iterationParked"];
+      const parkIteration = async (iterationCount: number): Promise<boolean> => {
+        // Only the latest authoritative zero admits a park. A historical positive
+        // survives later zero/missing ACKs; a local false latch proves nothing.
+        if (!iterationParkSupported || lastServedCompletionAttempts !== 0 ||
+            completionAttempted || history.priorAttempt) return false;
+        this.throwIfTerminal(ctx);
+        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+        throwIfDiskStop(ctx);
+        await this.closeAndSettlePlanSummary();
+        iterationParked = { outcome: await ctx.parkForIteration!({ iterationCount, maxIterations }) };
+        // Every outcome stops this flight; a refusal never authorizes a redrive.
+        return true;
+      };
       let completionStallStreak = 0;
       let lastCompletionFingerprint: string | undefined;
       let completionHeld: { reason: string } | undefined;
@@ -3281,6 +3299,10 @@ export class SdkExecutor implements Executor {
         // park, whatever the soft layer concluded.
         throwIfDiskStop(ctx);
         if (capVerdict === "park") throw new DiskParkSignal(true);
+        // Checkpoints bypass the post-turn limit. Refresh budget/history and honor
+        // controls first; a clarification still owns the uncompleted current turn.
+        if (iteration - 1 >= maxIterations && !state.tripReason && state.wallRemainingMs > 0 &&
+            await parkIteration(iteration - 1)) break;
         ctx.emit({
           kind: "status",
           agent: "worker",
@@ -3554,6 +3576,10 @@ export class SdkExecutor implements Executor {
             }
           }
           if (!processed) carriedSafetySteer = safetySteer;
+          // A zero-attempt restart continues this uncompleted iteration, like clarification.
+          // Leave the existing post-attempt and legacy iteration controls unchanged.
+          if (iterationParkSupported && lastServedCompletionAttempts === 0 &&
+              !completionAttempted && !history.priorAttempt) iteration--;
         };
         // The worker's completion-attempt sequence, shared by the done path and the issue #3139
         // stall path so both keep one order and one set of cancel/terminal checks.
@@ -4295,9 +4321,8 @@ export class SdkExecutor implements Executor {
           }
         }
         if (iteration >= maxIterations) {
-          // PRD #1226 M3 (D3): a POST-attempt iteration exhaustion routes to the completion hold
-          // (M4) rather than failing; PRE-attempt (or with the seam unwired) it throws the legacy
-          // REASON_MAX_ITERATIONS exactly as before.
+          // Post-attempt exhaustion keeps the completion hold. Supported authoritative-zero
+          // exhaustion parks separately; legacy or ineligible claims keep the original throw.
           if (
             await this.routeSummaryHold(
               ctx,
@@ -4308,6 +4333,7 @@ export class SdkExecutor implements Executor {
             completionHeld = { reason: REASON_MAX_ITERATIONS };
             break;
           }
+          if (await parkIteration(iteration)) break;
           throw new Error(REASON_MAX_ITERATIONS);
         }
 
@@ -4514,6 +4540,7 @@ export class SdkExecutor implements Executor {
       // pausedAt/completionHeld. NOT gated on isIssueRun (all six timed kinds park). OMITTED (not
       // undefined) on every normal completion so existing deepStrictEqual assertions hold.
       if (walled) result.walled = walled;
+      if (iterationParked) result.iterationParked = iterationParked;
       // PRD #1247 M5b (data-integrity fix): forward the released-in-place disposition. Set only when a
       // held-state credential switch RELEASED the claim (ctx.attemptCredentialSwitch → "released")
       // from the implement loop, an ask_user question, or an interactive follow-up wait — the loop

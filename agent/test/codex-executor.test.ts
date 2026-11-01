@@ -15,7 +15,7 @@ import { PassThrough } from "node:stream";
 import { createHash, randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
 import fs from "node:fs/promises";
-import { readFileSync, symlinkSync } from "node:fs";
+import { readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -4165,6 +4165,43 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
     });
     return { ctx, spies, emitted };
   }
+
+
+  for (const outcome of ["parked", "refused"] as const) it(`M3 Codex interrupted last iteration wall ${outcome} preserves completed count`, async () => {
+    const controller = new AbortController();
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted());
+        else {
+          c.transport.push({ kind: "activity", method: "item/started", params: {
+            threadId: "th-1", item: { type: "commandExecution" },
+          } }).push(agentMessage("M3 genuine redrive work")).push(turnCompleted("completed"));
+        }
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    let parks = 0;
+    const acks: number[] = [];
+    const { ctx, spies } = wallCtx({ signal: controller.signal, kind: "issue",
+      config: { max_iterations: 1, iteration_park_version: 1 },
+      reportIteration: async n => { acks.push(n); return { completionAttempts: 0 }; },
+      takeWallParkRefresh: () => ({ completionAttempts: 0, totalSeconds: 60, usedSeconds: 0 }),
+      parkForIteration: async at => { parks++; assert.deepEqual(at, { iterationCount: 1, maxIterations: 1 }); return "parked"; },
+    });
+    spies.outcome = outcome;
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount === 1, "M3 interrupted turn started");
+    spies.mode = "wall"; controller.abort(new PauseNowSignal());
+    const result = await withTimeout(running, 5000, "M3 Codex wall redrive");
+    assert.equal(rig.transport.turnStartCount, outcome === "refused" ? 2 : 1);
+    assert.equal(parks, outcome === "refused" ? 1 : 0);
+    assert.equal(spies.parkForWallCalls, 1);
+    assert.deepEqual(acks, [1], "Codex redrive stays inside the current iteration");
+    assert.deepEqual(result.iterationParked, outcome === "refused" ? { outcome: "parked" } : undefined);
+    assert.equal(Boolean(result.walled), outcome === "parked");
+  });
 
   it("(implement) a `wall` PauseNowSignal trips REASON_PAUSE not REASON_CANCEL and reaches the wall park", async () => {
     const controller = new AbortController();
@@ -12985,7 +13022,8 @@ describe("Codex completion interlock", () => {
       const holds: string[] = [];
       const { ctx } = makeCtx({
         kind: "issue", interactive: false, completionInterlock: true,
-        config: { max_iterations: scenario === "final iteration" ? 1 : 10 },
+        config: { max_iterations: scenario === "final iteration" ? 1 : 10, iteration_park_version: 1 },
+        parkForIteration: async () => assert.fail("post-attempt dynamic bound must preserve existing routing"),
         frozenMilestones: [{ id: "m1", title: "Remaining" }],
         cancelRequested: () => cancelled,
         checkpoint: async () => { if (scenario === "checkpoint cancel") cancelled = true; },
@@ -13142,7 +13180,8 @@ describe("Codex completion interlock", () => {
       const holds: string[] = [];
       let attempts = 0;
       const { ctx } = makeCtx({
-        kind: "issue", completionInterlock: true, config: { max_iterations: mode === "raised threshold" ? 2 : 1 },
+        kind: "issue", completionInterlock: true, config: { max_iterations: mode === "raised threshold" ? 2 : 1, iteration_park_version: 1 },
+        parkForIteration: async () => assert.fail("post-attempt must preserve existing routing"),
         frozenMilestones: [1, 2, 3].map((n) => ({ id: `m${n}`, title: `Milestone ${n}` })),
         cancelRequested: () => ackCancelled || (mode === "cancel" && attempts === 1),
         checkpoint: async (opts) => { assert.equal(opts.sink, "done_checkpoint"); order.push("checkpoint"); },
@@ -26193,8 +26232,201 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
   ];
   const script = (special: Record<number, Notes>): Notes => (c, th, tn) => (special[c] ?? (c === 1 ? rp1 : prose))(c, th, tn);
 
+  // M3: finite allowance parking is distinct from completion and idle-stall decisions.
+  const m3Config = { max_iterations: 2, iteration_park_version: 1 as const };
+  const m3Checkpoint: Notes = (c, th, tn) => [toolCall(800 + c, "checkpoint", {}, th, tn, `ck-m3-${c}`)];
+  const m3Question: Notes = (c, th, tn) => [toolCall(900 + c, "ask_user", { questions: [{ question: "Which endpoint?" }] }, th, tn, `ask-m3-${c}`)];
+  const m3Work: Notes = bashTool;
+  function m3AssertPark(r: Awaited<ReturnType<typeof drive>>, outcome: "parked" | "retained-stop") {
+    assert.equal(r.error, null, "M3 finite allowance must park rather than throw");
+    assert.deepEqual(r.result?.iterationParked, { outcome });
+    assert.equal(r.result?.completionHeld, undefined);
+    assert.equal(r.result?.prSummary, undefined, "parking must not finalize");
+    assert.equal(r.result?.milestonesCompleted, undefined);
+    assert.deepEqual(r.fixture.attempts, [], "parking never manufactures a completion attempt");
+    assert.deepEqual(r.fixture.holds, []);
+    assert.deepEqual(r.fixture.questions, []);
+  }
+
+  for (const kind of ["issue", "task", "prompt", "self_improve", "mr_rework", "ci_fix"] as const) {
+    for (const outcome of ["parked", "retained-stop"] as const) {
+      it(`M3 ordinary zero-history ${kind} ${outcome} stops exactly at the finite allowance`, async () => {
+        const parks: unknown[] = [];
+        const r = await drive(m3Work, { kind, config: m3Config, served: 0,
+          parkForIteration: async at => { parks.push(at); return outcome; } });
+        m3AssertPark(r, outcome);
+        assert.equal(r.calls(), 2, "no extra model call after either park outcome");
+        assert.deepEqual(parks, [{ iterationCount: 2, maxIterations: 2 }]);
+        assert.deepEqual(r.fixture.iterations, [1, 2]);
+      });
+    }
+  }
+
+  for (const lift of [false, true]) {
+    it(`M3 repeated checkpoint preturn uses fresh ACK and completed count; lift=${lift}`, async () => {
+      const acks: number[] = [], parks: unknown[] = [];
+      const r = await drive(m3Checkpoint, { config: m3Config,
+        reportIteration: async n => {
+          acks.push(n);
+          assert.ok(n <= (lift ? 4 : 3), "checkpoint bypass must remain bounded");
+          return { completionAttempts: 0, ...(lift && n >= 3 ? { maxIterations: 3 } : {}) };
+        },
+        parkForIteration: async at => {
+          assert.equal(acks.at(-1), lift ? 4 : 3, "park sees the latest ACK");
+          parks.push(at); return "parked";
+        } });
+      m3AssertPark(r, "parked");
+      assert.equal(r.calls(), lift ? 3 : 2, "upward served allowance is honored before preturn park");
+      assert.deepEqual(acks, lift ? [1, 2, 3, 4] : [1, 2, 3]);
+      assert.deepEqual(parks, [{ iterationCount: lift ? 3 : 2, maxIterations: lift ? 3 : 2 }]);
+      assert.equal(r.fixture.checkpoints.filter(c => c.reap).length, lift ? 3 : 2);
+    });
+  }
+
+  it("M3 clarification keeps iteration identity until genuine next work turn", async () => {
+    const acks: number[] = [], parks: unknown[] = [];
+    const r = await drive((c, th, tn) => (c === 1 ? m3Question : m3Work)(c, th, tn), { config: m3Config,
+      askUser: async () => ({ kind: "answer", answers: ["Use the existing endpoint"] }),
+      reportIteration: async n => { acks.push(n); return { completionAttempts: 0 }; },
+      parkForIteration: async at => { parks.push(at); return "parked"; } });
+    m3AssertPark(r, "parked");
+    assert.equal(r.calls(), 3, "question and answer share the first iteration");
+    assert.deepEqual(acks, [1, 2], "Codex answers within the same epoch without an extra boundary ACK");
+    assert.equal(r.rig.providerLaunches(), 1, "clarification retains the provider epoch");
+    assert.deepEqual(parks, [{ iterationCount: 2, maxIterations: 2 }]);
+    assert.match(r.prompts[1]!, /Use the existing endpoint/);
+  });
+
+  it("M3 park Resume new invocation genuine work then repeat park needs another Resume", async () => {
+    const io = await import("node:fs/promises");
+    const root = await io.mkdtemp(path.join(process.cwd(), "../.uzi/scratch/m3-resume-"));
+    const file = path.join(root, "work.txt");
+    let fingerprint = 0;
+    let resumes = 0, parks = 0;
+    try {
+      for (let flight = 0; flight < 3; flight++) {
+        if (flight) resumes++; // runner/server Resume is M4; each call is a fresh executor invocation.
+        const before = fingerprint;
+        const r = await drive((c, th, tn) => {
+          writeFileSync(file, String(++fingerprint));
+          return m3Work(c, th, tn);
+        }, { config: m3Config, served: 0, worktreePath: root,
+          worktreeFingerprint: async () => io.readFile(file, "utf8").catch(() => "unstarted"),
+          parkForIteration: async at => { parks++; assert.deepEqual(at, { iterationCount: 2, maxIterations: 2 }); return "parked"; } });
+        m3AssertPark(r, "parked");
+        assert.equal(r.calls(), 2, "each explicit Resume gets genuine finite work, then stops");
+        assert.ok(fingerprint > before, "real worktree activity prevents idle-stall masking");
+      }
+      assert.equal(resumes, 2); assert.equal(parks, 3);
+    } finally { await io.rm(root, { recursive: true, force: true }); }
+  });
+
+
+  for (const control of ["cancel", "pause", "scope", "success"] as const) {
+    it(`M3 ${control} wins before an unstarted or exhausted iteration park`, async () => {
+      let parks = 0, pauses = 0;
+      const acks: number[] = [];
+      const r = await drive((_c, th, tn) => [toolCall(990, "signal_done", { milestones_completed: ["m1", "m2"] }, th, tn, "m3-success")], {
+        config: { max_iterations: 1, iteration_park_version: 1 }, completionInterlock: false,
+        reportIteration: async n => {
+          acks.push(n);
+          return { completionAttempts: 0, pauseRequested: control === "pause",
+            ...(control === "scope" ? { scopeCeiling: 1, completedCount: 1 } : {}) };
+        },
+        cancelRequested: () => control === "cancel",
+        parkForPause: async () => { pauses++; return true; },
+        parkForIteration: async () => { parks++; return "parked"; },
+      });
+      assert.equal(parks, 0); assert.equal(r.result?.iterationParked, undefined);
+      if (control === "cancel") { assert.match(r.error ?? "", /cancel/); assert.equal(r.calls(), 0); }
+      else {
+        assert.equal(r.error, null);
+        assert.equal(r.calls(), control === "success" ? 1 : 0);
+        if (control === "pause") { assert.equal(pauses, 1); assert.ok(r.result?.pausedAt); }
+        if (control === "scope") assert.deepEqual(r.result?.scopeCapped, { completedCount: 1, total: 2 });
+      }
+    });
+  }
+
+  it("M3 fresh missing checkpoint ACK cannot reuse an older authoritative zero", async () => {
+    let parks = 0;
+    const acks: number[] = [];
+    const r = await drive((c, th, tn) => (c <= 2 ? m3Checkpoint : m3Work)(c, th, tn), {
+      config: m3Config,
+      reportIteration: async n => { acks.push(n); return n <= 2 ? { completionAttempts: 0 } : undefined; },
+      parkForIteration: async () => { parks++; return "parked"; },
+    });
+    assert.match(r.error ?? "", /iteration budget/);
+    assert.equal(r.calls(), 3); assert.equal(parks, 0);
+    assert.deepEqual(acks, [1, 2, 3]);
+  });
+
+
+  for (const lift of [false, true]) {
+    it(`M3 postattempt interlocked boundary preservation lift=${lift}`, async () => {
+      let parks = 0;
+      const acks: number[] = [];
+      const r = await drive((c, th, tn) => c === 1 ? [toolCall(981, "signal_done", {}, th, tn, "m3-attempt")] : m3Work(c, th, tn), {
+        config: { max_iterations: 1, iteration_park_version: 1 },
+        reportIteration: async n => {
+          acks.push(n);
+          return { completionAttempts: n === 1 ? 0 : 1, ...(lift && n > 1 ? { maxIterations: 2 } : {}) };
+        },
+        parkForIteration: async () => { parks++; return "parked"; },
+      });
+      assert.equal(r.error, null); assert.equal(parks, 0);
+      assert.equal(r.calls(), lift ? 2 : 1);
+      assert.equal(r.fixture.attempts.length, 1);
+      assert.equal(r.fixture.holds.length, 1);
+      assert.match(r.result?.completionHeld?.reason ?? "", /iteration budget/);
+      assert.deepEqual(acks, [1, 2]);
+    });
+  }
+
+  for (const control of ["pause", "cancel"] as const) {
+    it(`M3 checkpoint fresh ${control} precedes exhausted preturn park`, async () => {
+      let cancel = false, parks = 0, pauses = 0;
+      const acks: number[] = [];
+      const r = await drive(m3Checkpoint, { config: m3Config,
+        reportIteration: async n => { acks.push(n); cancel = n === 3 && control === "cancel";
+          return { completionAttempts: 0, pauseRequested: n === 3 && control === "pause" }; },
+        cancelRequested: () => cancel,
+        parkForPause: async () => { pauses++; return true; },
+        parkForIteration: async () => { parks++; return "parked"; },
+      });
+      assert.equal(parks, 0); assert.equal(r.calls(), 2);
+      assert.deepEqual(acks, [1, 2, 3]);
+      if (control === "cancel") assert.match(r.error ?? "", /cancel/);
+      else { assert.equal(r.error, null); assert.equal(pauses, 1); assert.ok(r.result?.pausedAt); }
+    });
+  }
+
+  const m3LegacyControls: Array<[string, Partial<RunContext>]> = [
+    ["absent capability", { config: { max_iterations: 2 } }],
+    ["unknown capability", { config: { max_iterations: 2, iteration_park_version: 99 } as never }],
+    ["missing callback", { parkForIteration: undefined }],
+    ["interactive", { interactive: true }],
+    ["ineligible job", { kind: "job" }],
+    ...[undefined, -1, NaN, 0.5, 1].map(value => [
+      `history ${String(value)}`, { reportIteration: async () => ({ completionAttempts: value }) },
+    ] as [string, Partial<RunContext>]),
+    ["resumed sticky positive then zero", { reportIteration: async n => ({ completionAttempts: n === 1 ? 1 : 0 }) }],
+  ];
+  for (const [name, control] of m3LegacyControls) {
+    it(`M3 legacy control ${name} retains ordinary exhaustion`, async () => {
+      let parks = 0;
+      const r = await drive(m3Work, { config: m3Config, served: 0,
+        parkForIteration: async () => { parks++; return "parked"; }, ...control });
+      assert.match(r.error ?? "", /iteration budget/);
+      assert.equal(r.calls(), 2); assert.equal(parks, 0);
+      assert.equal(r.result?.iterationParked, undefined);
+      assert.deepEqual(r.fixture.attempts, []);
+    });
+  }
+
+
   it("a reworded stall reaches the no_progress_stall question and an expired window holds (regression pin: base failed on max_iterations)", async () => {
-    const r = await drive(script({}), { config: { max_iterations: 8 } });
+    const r = await drive(script({}), { config: { max_iterations: 8, iteration_park_version: 1 }, parkForIteration: async () => assert.fail("idle stall precedes iteration exhaustion") });
     assert.equal(r.error, null);
     assert.equal(r.calls(), 4, "tripped on the third consecutive stall turn");
     assert.deepEqual(r.fixture.questions, [[["m2"], { kind: "no_progress_stall" }]]);
@@ -26463,10 +26695,15 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
       assert.equal(task.calls(), 6);
     });
 
-    it("real work (a tool call every turn) still ends on max_iterations", async () => {
-      const r = await drive((c, th, tn) => (c === 1 ? rp1(c, th, tn) : bashTool(c, th, tn)), { config: { max_iterations: 6 } });
-      assert.equal(r.error, ITER_REASON);
-      assert.equal(r.fixture.attempts.length, 0);
+    it("M3 #3139 real work parks at max_iterations with authoritative zero", async () => {
+      const parks: unknown[] = [];
+      const r = await drive((c, th, tn) => (c === 1 ? rp1(c, th, tn) : bashTool(c, th, tn)), {
+        config: { max_iterations: 6, iteration_park_version: 1 }, served: 0,
+        parkForIteration: async at => { parks.push(at); return "parked"; },
+      });
+      m3AssertPark(r, "parked");
+      assert.equal(r.calls(), 6);
+      assert.deepEqual(parks, [{ iterationCount: 6, maxIterations: 6 }]);
     });
 
     it("a post-attempt stall still routes to the max_iterations hold as before", async () => {
