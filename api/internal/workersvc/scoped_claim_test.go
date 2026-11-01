@@ -105,6 +105,9 @@ func (tx *scopedClaimTx) QueryRow(_ context.Context, sql string, args ...any) pg
 	case "GetActivePublicationResume":
 		// Scoped-claim fixtures have no publication-resume enrollment.
 		return scopedClaimRow{err: pgx.ErrNoRows}
+	case "GetLatestMemoryParkRelease":
+		// Scoped-claim fixtures have no memory-park release row.
+		return scopedClaimRow{err: pgx.ErrNoRows}
 	case "GetPriorRunCredentialEpoch":
 		return scopedClaimRow{err: pgx.ErrNoRows}
 	case "LockSecretEnablementForShareNowait":
