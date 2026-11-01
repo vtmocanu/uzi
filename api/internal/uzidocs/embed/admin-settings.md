@@ -100,7 +100,7 @@ and how to add a theme.
 
 A global kill-switch for the [run judge](./judge.md), plus the model it runs
 on (**Claude judge model**, `opus` by default — the judge's recommendations feed
-self-improvement, so the default is the built-in `opus`; pin a cheaper alias
+self-improvement; pin a cheaper alias
 like `haiku` or `sonnet` to spend less, and **Codex judge model**, `gpt-6.1-sol`
 by default, for judges of Codex runs). Each field is a model picker. The
 **Default · opus (built-in)** option of the Claude field and the
@@ -116,7 +116,7 @@ Settings, and the judge always spends that user's own credential for the run's h
 the admin's. A **Not a Claude model** warning appears under the Claude field
 when its stored value is a Codex id, which Claude judges skip. Changing a
 field to an invalid model ID (interior spaces, control or format characters,
-or too long) is blocked before save, with an error beneath the picker; an
+or too long) is blocked before save, with a message beneath the picker; an
 unchanged stored value does not block saving other settings.
 
 As an admin, you can also review every user's judge recommendations at once,
@@ -206,7 +206,8 @@ generate on, instance-wide (`haiku` by default). It is a picker of the curated
 Claude models (`opus`, `sonnet`, `haiku`, `fable`) plus **Other (custom model
 ID)**. There is no empty or Default option: a blank value, an empty custom ID,
 or an invalid ID (interior spaces, control or format characters, or too long)
-is blocked before save, with an error beneath the picker. Each user can override it
+is blocked before save, with a message beneath the picker; an unchanged stored
+value does not block saving the Now line switch. Each user can override it
 for their own Claude runs from **Settings → Run defaults → Run summaries →
 Summary model** (their empty option reads `Default · instance default`); the
 admin default applies while they haven't. Codex intent
