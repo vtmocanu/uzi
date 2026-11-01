@@ -2285,6 +2285,8 @@ interface RunFlight {
   /** issue #3639: set when the memory-receipt gate passed; discovery then runs bound to this receipt and the handoff
    *  checks it before any coordinate is assigned. Never set for an ordinary flight. */
   memoryReceipt?: { readonly entry: OwnMemoryPark; readonly record: MemoryParkRecord };
+  /** issue #3639: the receipt flight's first memory context began with the guard armed; later renewals are ordinary. */
+  memoryReceiptBegun?: boolean;
   /** issue #3639: the claim was refused by the receipt gate or handoff (F2/F3); the teardown producer and the owed-candidate
    *  retention write nothing for it. */
   memoryGateRefused?: boolean;
@@ -21799,6 +21801,17 @@ export class RunRunner {
       this.retireWorkerMemory(flight);
       throw new RetainedRecoveryStop();
     }
+    // issue #3639: a receipt flight must not open a memory context (and so admit commands) while the guard is disarmed or
+    // has a pending intervention, e.g. another flight intervened after the handoff. Nothing was admitted yet, so the
+    // consumed entry goes back to pending and the next claim passes the gate again; the claim stops nonterminally.
+    // Only the first begin is held: a renewal later in an admitted flight is ordinary, like any other flight's.
+    if (flight.memoryReceipt && !flight.memoryReceiptBegun && !this.memoryGuardArmed()) {
+      const { entry } = flight.memoryReceipt;
+      if (entry.state === "consumed" && this.ownMemoryParks.get(flight.runId) === entry) entry.state = "pending";
+      memory.ended = true;
+      this.retireWorkerMemory(flight);
+      throw new RetainedRecoveryStop();
+    }
     // Renewal uses only the original registration, episode and spent allowance.
     // A retired context is never made current again.
     const context = runtime.begin({
@@ -21843,6 +21856,7 @@ export class RunRunner {
       preservationBudgetMs: this.codexBoundaryDeadlineMs,
     });
     memory.context = context;
+    if (flight.memoryReceipt) flight.memoryReceiptBegun = true;
     // A persisted exhausted allowance has no new victim or outcome. Capture the
     // full binding before retaining custody; executeClaim reconciles the same
     // original owner operation used by pressure-triggered preservation.
@@ -23363,6 +23377,12 @@ export class RunRunner {
     flight.memoryReceipt = Object.freeze({ entry, record });
   }
 
+  /** issue #3639 - the memory guard is armed with no pending intervention right now. Read-only; grants no authority. */
+  private memoryGuardArmed(): boolean {
+    const seen = this.memoryRuntime?.guardObservation();
+    return seen !== undefined && seen.armed && !seen.pendingIntervention;
+  }
+
   /**
    * issue #3639 D6 - between expected-bound discovery and `recoverRetainedClaim`, before any coordinate is assigned: (e1) the
    * discovered source is exactly the receipt's, (e2) the settled slots verify afresh, (e3) the clone is admissible and not
@@ -23391,6 +23411,10 @@ export class RunRunner {
     if (admission.kind !== "admissible" || authority.heldByOtherSink(source.clonePath, sink)) {
       return f3("the receipt's clone is not admissible at handoff");
     }
+    // The guard was observed armed at gate step (c), before the awaits above. Another flight may have intervened and disarmed
+    // it since, so look again: this check, the coordinate assignment and the consumption below share one synchronous
+    // section. Failing here is F3 and leaves the entry pending.
+    if (!this.memoryGuardArmed()) return f3("the memory guard is no longer armed at handoff");
     flight.barePath = bare;
     flight.effectiveAttemptPaths = true;
     entry.state = "consumed";

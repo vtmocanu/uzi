@@ -6,7 +6,7 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import type { Logger } from "../src/log.js";
 import { performance } from "node:perf_hooks";
-import { acquireWorkerLifetime } from "../src/authority-lock.js";
+import { acquireWorkerLifetime, withAuthorityTransaction } from "../src/authority-lock.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { openAuthorityStore, type SlotSnapshot } from "../src/completion-authority.js";
 import { RequestError, WorkerClient, isTransient } from "../src/client.js";
@@ -40,13 +40,15 @@ const settings = { enabled: true as const, reserveBytes: 100, hysteresisBytes: 1
   sampleMs: 2, responseBudgetMs: 200, rearmMs: 10, maxInterventions: 2 };
 const timing = { rearmMs: settings.rearmMs, sampleMs: settings.sampleMs, responseBudgetMs: settings.responseBudgetMs };
 
+/** The cgroup usage the memory runtime's sampler reports; the default 0 never presses. */
+let usage = 0;
 function memoryRuntime(): WorkerMemoryRuntime {
   let sampleId = 0;
   return new WorkerMemoryRuntime(settings, client, nullLogger(), {
     reader: { sample: () => {
       const time = performance.now();
       return { available: true, sampleId: ++sampleId, startedAtMs: time, completedAtMs: time,
-        currentBytes: 0, limitBytes: 1000,
+        currentBytes: usage, limitBytes: 1000,
         stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0, inactive_file: 0 },
         pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 },
           full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
@@ -54,16 +56,19 @@ function memoryRuntime(): WorkerMemoryRuntime {
   });
 }
 
-async function setup(features = FEATURES) {
+async function setup(features = FEATURES, count = 2) {
+  usage = 0;
   api.memoryRegisterNonce = NONCE;
   api.setRegisterProtocolFeatures(features);
   await client.register("memory-fixture", "base");
   const claim: ClaimResponse = { ...gitlabClaim(IID), claim_generation: 7,
-    memory_episode: 3, memory_policy: { version: 1, max_interventions: 2 }, memory_intervention_count: 2 };
+    memory_episode: 3, memory_policy: { version: 1, max_interventions: 2 }, memory_intervention_count: count };
   api.setOwnershipStatus(claim.run_id, "running", 7);
-  let used = 2;
+  let used = count;
+  const reservations: MemoryReservationRequest[] = [];
   const accepted = new Map<string, number>();
   client.reserveMemoryIntervention = async (request: MemoryReservationRequest) => {
+    reservations.push(request);
     accepted.set(request.intervention_id, ++used);
     return { ...request, admitted: true, authorizing: true, allowance: { limit: 2, used, remaining: 2 - used } };
   };
@@ -72,15 +77,16 @@ async function setup(features = FEATURES) {
     return { ...request, policy: { version: 1, max_interventions: 2 }, admitted: true, authorizing: false,
       allowance: { limit: 2, used: spent, remaining: 2 - spent } };
   };
-  return { memory: memoryRuntime(), claim, workerId: client.memoryIncarnation!.worker_id };
+  return { memory: memoryRuntime(), claim, workerId: client.memoryIncarnation!.worker_id, reservations };
 }
 
-async function authorityRig() {
+async function authorityRig(extra: Partial<ConstructorParameters<typeof AuthorityRuntime>[0]> = {}) {
   const dataDir = fs.realpathSync(fx.dataDir);
   const lifetime = await acquireWorkerLifetime(dataDir, testLockOptions());
-  const rt = new AuthorityRuntime({ lifetime, workerToken: TOKEN, timeoutMs: 5000 });
+  const rt = new AuthorityRuntime({ lifetime, workerToken: TOKEN, timeoutMs: 5000, ...extra });
   return {
     rt,
+    lifetime,
     successor: () => new AuthorityRuntime({ lifetime, workerToken: TOKEN, workerIncarnation: randomUUID(), timeoutMs: 5000 }),
   };
 }
@@ -164,9 +170,13 @@ interface Parked {
 async function parked(o: {
   post?: PostBehaviour; features?: string[]; boundaryMs?: number; endKept?: boolean; attempt?: boolean;
   tweak?: (inner: Internals, r: Awaited<ReturnType<typeof authorityRig>>) => void;
+  authority?: Parameters<typeof authorityRig>[0];
+  count?: number;
+  /** The predecessor's model turn, built from the fixture's memory runtime; default stops at the exhausted allowance. */
+  predecessor?: (f: Awaited<ReturnType<typeof setup>>) => Executor;
 } = {}): Promise<Parked> {
-  const f = await setup(o.features);
-  const r = await authorityRig();
+  const f = await setup(o.features, o.count);
+  const r = await authorityRig(o.authority);
   fs.writeFileSync(homeDir + "/session-proof", "original session");
   git.worktreeStatus = async () => [];
   const posts: Post[] = [];
@@ -177,7 +187,7 @@ async function parked(o: {
   };
   if (o.endKept) r.rt.endSourceUse = async (paths) => ({ ended: [], kept: [...paths], endedSlots: [] });
   const monitoring = f.memory.run();
-  let current: Executor = {
+  let current: Executor = o.predecessor?.(f) ?? {
     run: async ctx => {
       api.setOwnershipStatus(f.claim.run_id, "running", 7);
       assert.throws(() => ctx.capturedMemory!(), /retained recovery/i);
@@ -225,11 +235,12 @@ async function parked(o: {
 }
 
 /** The owner's Resume on the SAME worker incarnation: a later generation and the next memory episode, carrying `ref`. */
-async function resume(p: Parked, o: { generation?: number; episode?: number; ref?: MemoryParkReference | null } = {}) {
+async function resume(p: Parked, o: { generation?: number; episode?: number; ref?: MemoryParkReference | null;
+  policy?: { version: 1; max_interventions: number } } = {}) {
   const generation = o.generation ?? 8;
   const ref = o.ref === undefined ? p.ref() : o.ref;
   const claim: ClaimResponse = { ...p.f.claim, claim_generation: generation, memory_episode: o.episode ?? 4,
-    memory_policy: null, memory_intervention_count: 0, ...(ref ? { memory_park_reference: ref } : {}) };
+    memory_policy: o.policy ?? null, memory_intervention_count: 0, ...(ref ? { memory_park_reference: ref } : {}) };
   api.setOwnershipStatus(claim.run_id, "running", generation);
   p.setExecutor(p.successor);
   const before = parks().length;
@@ -933,6 +944,302 @@ describe("expected-bound discovery and the handoff (issue #3639)", () => {
       assertRefusal(p, "F2", /no longer confirms/);
       assertNothingDone(p);
       assert.equal(entryOf(p)?.state, "pending");
+    } finally { await p.done(); }
+  });
+});
+
+/** A registered inert command on the flight's captured memory context, as a model command would be. */
+function enrollCommand(ctx: Parameters<Executor["run"]>[0], counts: { cancelled: number }) {
+  const captured = ctx.capturedMemory!()!;
+  const entry = captured.commands.register(captured.context, {
+    source: "codex-model-command", toolId: "tool", attemptId: "attempt", command: "inert fixture", root: { pid: 10, startTime: "10" },
+    observe: async () => {
+      const time = performance.now();
+      return { available: true, complete: true, startedAtMs: time, completedAtMs: time, rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] };
+    },
+    cancel: async () => { counts.cancelled++; },
+    drain: async () => ({ confirmed: true }),
+  });
+  return { captured, entry };
+}
+
+describe("the same memory runtime and nonce guard the continuation (issue #3639)", () => {
+  it("predecessor intervention (genuine drain and outcome) -> rearm after the quiet dwell -> gate passes at G+1 -> a later high-pressure sample intervenes with G+1 / E+1", async () => {
+    const cancels = { cancelled: 0 };
+    const p = await parked({ count: 1, predecessor: () => ({ run: async ctx => {
+      const command = enrollCommand(ctx, cancels);
+      usage = 950;
+      const result = await command.captured.commands.watchOutcome(command.entry);
+      ctx.emit({ kind: "tool_result", payload: { tool_id: result.tool_id, result } });
+      throw new Error("model abort is not a test failure");
+    } }) });
+    try {
+      assert.equal(p.f.reservations.length, 1, "premise: the predecessor really intervened");
+      assert.deepEqual([p.f.reservations[0]!.claim_generation, p.f.reservations[0]!.memory_episode], [7, 3]);
+      assert.equal(cancels.cancelled, 1, "premise: the predecessor's command was signalled");
+      assert.equal(activeJournal()?.memoryPark?.settlement?.confirmed, true, "premise: a complete settlement (its joins really happened)");
+      assert.equal(p.posts.length, 1);
+      assert.equal(p.f.memory.guardObservation().armed, false, "premise: the intervention disarmed the guard (pressure still high)");
+      const nonce = client.memoryIncarnation!.register_nonce;
+      usage = 0; // the load drains: the guard rearms only inside its own evaluate, after the ticket resolved and a quiet dwell
+      const nextCancels = { cancelled: 0 };
+      // The owner's Resume starts the new episode's allowance afresh (the claim carries count 0).
+      const spent = new Map<string, number>();
+      client.reserveMemoryIntervention = async (request: MemoryReservationRequest) => {
+        p.f.reservations.push(request);
+        spent.set(request.intervention_id, spent.size + 1);
+        const used = spent.size;
+        return { ...request, admitted: true, authorizing: true, allowance: { limit: 2, used, remaining: 2 - used } };
+      };
+      client.reportMemoryInterventionOutcome = async request => {
+        const used = spent.get(request.intervention_id)!;
+        return { ...request, policy: { version: 1, max_interventions: 2 }, admitted: true, authorizing: false,
+          allowance: { limit: 2, used, remaining: 2 - used } };
+      };
+      let ran = 0;
+      let armedAtAdmission: boolean | undefined;
+      p.setExecutor({ run: async ctx => {
+        ran++;
+        armedAtAdmission = p.f.memory.guardObservation().armed;
+        const command = enrollCommand(ctx, nextCancels);
+        usage = 950; // a later high-pressure event
+        await command.captured.commands.watchOutcome(command.entry);
+        throw new Error("the successor stops after its intervention");
+      } });
+      const claim: ClaimResponse = { ...p.f.claim, claim_generation: 8, memory_episode: 4, memory_policy: { version: 1, max_interventions: 2 },
+        memory_intervention_count: 0, memory_park_reference: p.ref() };
+      api.setOwnershipStatus(claim.run_id, "running", 8);
+      try { await p.runner.execute(claim); } catch { /* the successor's stop */ }
+      assert.equal(p.counters.refusals.length, 0, `the gate passed: ${JSON.stringify(p.counters.refusals)}`);
+      assert.equal(ran, 1);
+      assert.equal(armedAtAdmission, true, "the SAME guard rearmed (no reset, no fabricated ticket) before the continuation admitted anything");
+      assert.equal(client.memoryIncarnation!.register_nonce, nonce, "the same registration nonce throughout");
+      assert.equal(p.f.reservations.length, 2, "the later high-pressure sample intervened");
+      assert.deepEqual([p.f.reservations[1]!.claim_generation, p.f.reservations[1]!.memory_episode], [8, 4],
+        "its reserve request names the continuation's generation and episode");
+      assert.equal(p.f.reservations[1]!.register_nonce, NONCE);
+      assert.equal(nextCancels.cancelled, 1, "the continuation's command was actually signalled");
+    } finally { await p.done(); }
+  });
+});
+
+describe("the guard stays armed through the handoff and up to the first memory context (issue #3639)", () => {
+  const DISARMED = () => ({ seq: 9, validSeq: 9, armed: false, pendingIntervention: true });
+
+  it("armed at gate step (c), then another flight's intervention disarms it before the handoff ends: F3, nothing admitted, PENDING kept", async () => {
+    const p = await parked();
+    try {
+      declinePark();
+      let armedReads = 0;
+      const observe = p.f.memory.guardObservation.bind(p.f.memory);
+      p.f.memory.guardObservation = () => { armedReads++; return observe(); };
+      const classify = p.r.rt.classifySourceAdmission.bind(p.r.rt);
+      p.r.rt.classifySourceAdmission = async (...args: Parameters<typeof classify>) => {
+        const out = await classify(...args);
+        assert.ok(armedReads >= 2, "premise: the gate had already observed the armed guard");
+        p.f.memory.guardObservation = DISARMED; // the concurrent intervention, after the gate and before the handoff's end
+        return out;
+      };
+      await resume(p);
+      assertRefusal(p, "F3", /no longer armed at handoff/);
+      assertNothingDone(p);
+      await assertUntouched(p);
+      assert.equal(entryOf(p)?.state, "pending", "PENDING kept");
+    } finally { await p.done(); }
+  });
+
+  it("disarmed after the handoff passed, before the first memory context: no context is begun, no command admitted, the entry returns to pending", async () => {
+    const p = await parked();
+    try {
+      declinePark();
+      let began = 0;
+      const begin = p.f.memory.begin.bind(p.f.memory);
+      p.f.memory.begin = (...args: Parameters<typeof begin>) => { began++; return begin(...args); };
+      let capturedThrew = false;
+      let stateAtCapture: string | undefined;
+      p.setExecutor({ run: async ctx => {
+        p.counters.ran++;
+        stateAtCapture = entryOf(p)?.state;
+        p.f.memory.guardObservation = DISARMED;
+        try { ctx.capturedMemory!(); } catch { capturedThrew = true; }
+        throw new Error("the successor stops here");
+      } });
+      const claim: ClaimResponse = { ...p.f.claim, claim_generation: 8, memory_episode: 4, memory_policy: { version: 1, max_interventions: 2 },
+        memory_intervention_count: 0, memory_park_reference: p.ref() };
+      api.setOwnershipStatus(claim.run_id, "running", 8);
+      try { await p.runner.execute(claim); } catch { /* nonterminal stop */ }
+      assert.equal(stateAtCapture, "consumed", "premise: the handoff passed and consumed the entry");
+      assert.equal(capturedThrew, true, "the memory capture was refused");
+      assert.equal(began, 0, "no memory context was begun, so no command could be admitted");
+      assert.equal(entryOf(p)?.state, "pending", "the next claim passes the gate again");
+    } finally { await p.done(); }
+  });
+
+  it("a renewal begin inside an already-admitted receipt flight is ordinary: a later disarm neither stops it nor resets the consumed entry", async () => {
+    const p = await parked();
+    try {
+      let began = 0;
+      const begin = p.f.memory.begin.bind(p.f.memory);
+      p.f.memory.begin = (...args: Parameters<typeof begin>) => { began++; return begin(...args); };
+      let flight: { workerMemory?: { epochReady?: boolean; resumeReady?: boolean } } | undefined;
+      const capture = p.inner.captureWorkerMemory.bind(p.runner) as (f: unknown) => unknown;
+      p.inner.captureWorkerMemory = (f: unknown) => { flight = f as typeof flight; return capture(f); };
+      const seen: { first?: boolean; second?: boolean; threw?: boolean; stateAfter?: string } = {};
+      p.setExecutor({ run: async ctx => {
+        p.counters.ran++;
+        seen.first = ctx.capturedMemory!() !== undefined;
+        p.f.memory.guardObservation = DISARMED; // another flight intervened after this flight was admitted
+        flight!.workerMemory!.epochReady = true; // the epoch renewal path retires the context and begins again
+        flight!.workerMemory!.resumeReady = true;
+        try { seen.second = ctx.capturedMemory!() !== undefined; } catch { seen.threw = true; }
+        seen.stateAfter = entryOf(p)?.state;
+        throw new Error("the successor stops here");
+      } });
+      const claim: ClaimResponse = { ...p.f.claim, claim_generation: 8, memory_episode: 4, memory_policy: { version: 1, max_interventions: 2 },
+        memory_intervention_count: 0, memory_park_reference: p.ref() };
+      api.setOwnershipStatus(claim.run_id, "running", 8);
+      try { await p.runner.execute(claim); } catch { /* the executor stops */ }
+      assert.equal(seen.first, true, "the first begin had the guard armed");
+      assert.equal(seen.threw, undefined, "no RetainedRecoveryStop on the renewal");
+      assert.equal(seen.second, true);
+      assert.equal(began, 2, "begin ran again for the renewal");
+      assert.equal(seen.stateAfter, "consumed", "the entry stays consumed");
+    } finally { await p.done(); }
+  });
+
+  it("armed with no intervention ticket at all is the positive control: the real guard passes the gate and the first context begins", async () => {
+    const p = await parked();
+    try {
+      let began = 0;
+      const begin = p.f.memory.begin.bind(p.f.memory);
+      p.f.memory.begin = (...args: Parameters<typeof begin>) => { began++; return begin(...args); };
+      let captured = false;
+      p.setExecutor({ run: async ctx => {
+        p.counters.ran++;
+        captured = ctx.capturedMemory!() !== undefined;
+        throw new Error("the successor stops here");
+      } });
+      const claim: ClaimResponse = { ...p.f.claim, claim_generation: 8, memory_episode: 4, memory_policy: { version: 1, max_interventions: 2 },
+        memory_intervention_count: 0, memory_park_reference: p.ref() };
+      api.setOwnershipStatus(claim.run_id, "running", 8);
+      try { await p.runner.execute(claim); } catch { /* the executor stops */ }
+      assert.equal(p.counters.refusals.length, 0);
+      assert.equal(captured, true);
+      assert.equal(began, 1);
+      assert.equal(entryOf(p)?.state, "consumed");
+    } finally { await p.done(); }
+  });
+});
+
+describe("the live producer's durable source end is genuinely delayed or failed (issue #3639)", () => {
+  // The REAL AuthorityRuntime.endSourceUse runs in both cases; only the condition around it is injected.
+  const settledProbe = (inner: Internals, seen: boolean[]) => {
+    const real = inner.memoryHoldSettled.bind(inner);
+    inner.memoryHoldSettled = (...args: unknown[]) => { const out = real(...args); seen.push(out); return out; };
+  };
+  async function drained(p: Parked): Promise<SlotSnapshot | null> {
+    let slot = await slotOf(p.r.rt, p.clone);
+    for (let i = 0; i < 300 && slot?.state !== "ineligible"; i++) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      slot = await slotOf(p.r.rt, p.clone);
+    }
+    return slot;
+  }
+
+  it("end paused under the authority lock: the end is only queued, no POST, no qualifying settlement, and the queued end cannot act on a successor lease", async () => {
+    const settled: boolean[] = [];
+    const ends: Array<{ kept: number; endedSlots: number }> = [];
+    const p = await parked({ authority: { retryMs: 20 }, tweak: (inner, r) => {
+      (inner as unknown as { sourceUseEndWaitMs: number }).sourceUseEndWaitMs = 150;
+      settledProbe(inner, settled);
+      const real = r.rt.endSourceUse.bind(r.rt);
+      // The authority lock A is held by another party for the whole of the producer's bounded end wait, and freed right
+      // after it gave up: the end is then only QUEUED, and the drain applies it later.
+      r.rt.endSourceUse = async (paths, opts) => {
+        let release!: () => void;
+        const held = new Promise<void>(resolve => { release = resolve; });
+        let acquired!: () => void;
+        const holding = new Promise<void>(resolve => { acquired = resolve; });
+        const holder = withAuthorityTransaction(r.lifetime, { timeoutMs: 5000 }, async () => { acquired(); await held; });
+        await holding;
+        const out = await real(paths, opts);
+        ends.push({ kept: out.kept.length, endedSlots: out.endedSlots.length });
+        release();
+        await holder;
+        return out;
+      };
+    } });
+    try {
+      assert.ok(settled.length >= 1 && settled.every(Boolean), "premise: the hold is settled and the tails were joined; only the durable end is missing");
+      assert.deepEqual(ends, [{ kept: 1, endedSlots: 0 }], "premise: the real end was kept, with no end receipt");
+      assert.equal(p.posts.length, 0, "no settlement POST");
+      assert.notEqual(activeJournal()?.memoryPark?.settlement?.confirmed, true, "no settlement was confirmed");
+      assert.equal(entryOf(p), undefined, "the park does not qualify");
+      // The queued end lands on ITS OWN epoch only.
+      const old = await drained(p);
+      assert.equal(old?.state, "ineligible");
+      assert.equal(old?.epoch, p.slot.epoch);
+      const lease = await p.r.rt.bindSource(p.clone);
+      await p.r.rt.withTransaction(async () => undefined);
+      const next = await slotOf(p.r.rt, p.clone);
+      assert.equal(next?.state, "active", "the successor's slot stays active");
+      assert.notEqual(next?.epoch, p.slot.epoch, "a fresh epoch");
+      assert.equal(p.r.rt.leaseFor(p.clone), lease);
+    } finally { await p.done(); }
+  });
+
+  it("end write failing: the key stays active and owned, no POST, no qualifying settlement", async () => {
+    const settled: boolean[] = [];
+    const flags = { head: false };
+    const ends: Array<{ kept: number; endedSlots: number }> = [];
+    const p = await parked({ authority: {
+      retryMs: 3_600_000,
+      ops: { syncFile: h => h.sync(), syncDir: h => h.sync(), rename: async (a, b) => {
+        if (flags.head && path.basename(path.dirname(b)) === "heads") throw new Error("injected head failure");
+        fs.renameSync(a, b);
+      } },
+    }, tweak: (inner, r) => {
+      settledProbe(inner, settled);
+      const real = r.rt.endSourceUse.bind(r.rt);
+      r.rt.endSourceUse = async (paths, opts) => {
+        flags.head = true;
+        const out = await real(paths, opts);
+        ends.push({ kept: out.kept.length, endedSlots: out.endedSlots.length });
+        return out;
+      };
+    } });
+    try {
+      assert.ok(settled.length >= 1 && settled.every(Boolean), "premise: the hold is settled and the tails were joined; only the durable end failed");
+      assert.equal(p.posts.length, 0, "no settlement POST");
+      assert.notEqual(activeJournal()?.memoryPark?.settlement?.confirmed, true);
+      assert.equal(entryOf(p), undefined);
+      assert.deepEqual(ends, [{ kept: 1, endedSlots: 0 }], "the real end reported no end receipt");
+      assert.equal(p.r.rt.heldByOtherSink(p.clone, new Set()), true, "the key stays owned");
+    } finally { await p.done(); }
+  });
+});
+
+describe("old-API claims after a lost receipt ACK (issue #3639)", () => {
+  it("stored receipt, lost ACK, retry 400, Resume, old-API claim with the reference AND journal missing: F2, nothing admitted, PENDING kept for the next claim", async () => {
+    const p = await parked({ post: async attempt => { if (attempt === 0) throw new TypeError("fetch failed"); throw new RequestError("POST", "/memory/settlement", 400, ""); } });
+    try {
+      assert.equal(p.posts.length, 2, "the lost ACK was retried and the retry was refused with 400");
+      assert.equal(entryOf(p)?.state, "pending", "a bare 400 never consumes PENDING");
+      declinePark();
+      dropJournal();
+      const c = await resume(p, { ref: null });
+      assertRefusal(p, "F2", /no reference/);
+      assert.equal(c.newParks().length >= 1, true, "the fallback park was reported, not accepted");
+      assertNothingDone(p);
+      assert.equal(rawJournal(), "", "no provenance was invented for the missing journal");
+      assert.equal(entryOf(p)?.state, "pending", "PENDING kept");
+      // A later requeue claim (the reference is advertised again) still finds the pending entry: it reaches the gate.
+      assert.equal(p.inner.memoryReceiptDecision({ run_id: p.f.claim.run_id, memory_park_reference: p.ref() }).kind, "gate");
+      p.counters.refusals.length = 0;
+      await resume(p, { generation: 9, episode: 4 });
+      assertRefusal(p, "F2", /no longer confirms/);
+      assertNothingDone(p);
+      assert.equal(entryOf(p)?.state, "pending", "still PENDING after the requeue claim");
     } finally { await p.done(); }
   });
 });
