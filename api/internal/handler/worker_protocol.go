@@ -357,13 +357,20 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"worker_id":         updated.ID.String(),
 		"worker":            dto,
-		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication, h.cfg.PublicationResume),
+		"protocol_features": h.advertisedFeatures(),
 		"register_nonce":    registerNonce,
 		// worker_outbox_max_pending (PRD #1391 Run B M3c): the server's terminal_pending outbox cap,
 		// returned at register so the worker can size its own pending-outcome quota to match the
 		// server's WORKER_OUTBOX_MAX_PENDING without a separate config channel.
 		"worker_outbox_max_pending": h.cfg.WorkerOutboxMaxPending,
 	})
+}
+
+// advertisedFeatures computes the protocol feature set for one response. The closure token is
+// derived from the recovery service on every call, never cached: RecoveryService() runs before
+// mountWorkerRoutes wires the limiter, so a boot-time snapshot would be stale.
+func (h *Handler) advertisedFeatures() []string {
+	return protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication, h.cfg.PublicationResume, h.recovery().PrerequisiteFinalEnabled())
 }
 
 // protocolFeatures is the set of optional wire-protocol behaviours this api implements,
@@ -403,7 +410,11 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // activeSnapshotEnabled (= !cfg.ActiveSnapshotDisabled). When the api is started with
 // UZI_ACTIVE_SNAPSHOT_DISABLED set (the D7 rollback simulation) the token is omitted and the
 // worker never sends the snapshot — the same shape an old worker sees.
-func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publicationResumeEnabled bool) []string {
+//
+// `recovery_prerequisite_closure_v1` (issue #3727) is the last group, gated on
+// prerequisiteClosureEnabled (= the recovery service's PrerequisiteFinalEnabled(), evaluated per
+// request by Handler.advertisedFeatures because the limiter is wired after boot).
+func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publicationResumeEnabled, prerequisiteClosureEnabled bool) []string {
 	groups := [][]string{
 		{workersvc.ForgeCloneSuccessFeature},
 		{workersvc.CapabilityEvidenceFeature},
@@ -486,6 +497,12 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publication
 		// the worker capability of the same name, and omitted when UZI_HELD_PUBLICATION is off so
 		// a worker defers nothing and takes the archive path. Step B needs no advertisement.
 		groups = append(groups, []string{"recovery_held_publication_v1", "recovery_held_publication_v2"})
+	}
+	if prerequisiteClosureEnabled {
+		// Issue #3727: this api releases a thin guarded capture against its pinned closure.
+		// Its own trailing group, true only while recovery Service.PrerequisiteFinalEnabled()
+		// holds (knob has github, port wired, limiter wired).
+		groups = append(groups, []string{capability.RecoveryPrerequisiteClosureV1})
 	}
 	seen := make(map[string]bool)
 	out := make([]string, 0)
@@ -642,7 +659,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	response := map[string]any{
 		"worker":                    dto,
-		"protocol_features":         protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication, h.cfg.PublicationResume),
+		"protocol_features":         h.advertisedFeatures(),
 		"worker_outbox_max_pending": h.cfg.WorkerOutboxMaxPending,
 	}
 	if slices.Contains(updated.ProtocolCapabilities, capability.DindMaintenanceV1) {

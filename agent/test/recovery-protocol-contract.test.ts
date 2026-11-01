@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+import { isRecoveryPrerequisiteClosureStatus } from "../src/protocol.js";
 import type {
   RecoveryReserveRequest,
   RecoveryReserveResponse,
@@ -69,6 +70,24 @@ test("recovery RPC request/response shapes are frozen (PRD #1296 M1)", () => {
     manifest_bound: false,
   };
   assert.equal(statusMinimal.byte_size, undefined);
+  assert.equal(statusMinimal.prerequisite_closure, undefined);
+
+  // The optional C1b closure object mirrors Go apitypes.RecoveryPrerequisiteClosureStatus
+  // (tags pinned by TestRecoveryWorkerRPCTags): state, reason, prerequisite_shas, checksum.
+  const sha = "a".repeat(40);
+  const checksum = "b".repeat(64);
+  const withClosure: RecoveryCaptureStatusResponse = {
+    ...status,
+    prerequisite_closure: { state: "pinned", prerequisite_shas: [sha], checksum },
+  };
+  assert.equal(isRecoveryPrerequisiteClosureStatus(withClosure.prerequisite_closure), true);
+  assert.equal(isRecoveryPrerequisiteClosureStatus({ state: "refused", reason: "pin_refused" }), true);
+  assert.equal(isRecoveryPrerequisiteClosureStatus({ state: "pending", reason: "" }), true);
+  for (const bad of [undefined, null, [], "pinned", {}, { state: "available" }, { state: "pinned", reason: "nope" },
+    { state: "pinned", extra: 1 }, { state: "pinned", prerequisite_shas: ["short"] },
+    { state: "pinned", prerequisite_shas: "x" }, { state: "pinned", checksum: "short" }, { state: 1 }]) {
+    assert.equal(isRecoveryPrerequisiteClosureStatus(bad), false, JSON.stringify(bad));
+  }
 
   const release: RecoveryReleaseResponse = {
     run_id: "run-1",

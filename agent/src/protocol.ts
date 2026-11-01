@@ -3470,6 +3470,36 @@ export interface RecoveryCaptureStatusResponse {
   checksum?: string;
   reason?: string;
   expires_at?: string;
+  /** Capture-bound prerequisite pin facts (C1b), present only for a qualifying thin capture. */
+  prerequisite_closure?: RecoveryPrerequisiteClosureStatus;
+}
+
+/** Mirrors Go apitypes.RecoveryPrerequisiteClosureStatus. */
+export interface RecoveryPrerequisiteClosureStatus {
+  state: string;
+  reason?: string;
+  prerequisite_shas?: string[];
+  checksum?: string;
+}
+
+/** The closed wire vocabulary of RecoveryPrerequisiteClosureStatus (api/internal/recovery prerequisiteStatus). */
+const PREREQUISITE_CLOSURE_STATES = ["unsupported", "pending", "pinned", "refused", "lost"] as const;
+const PREREQUISITE_CLOSURE_REASONS = [
+  "closure_unsupported", "prerequisite_not_on_default", "prerequisite_ancestry_unknown",
+  "prerequisite_prepare_budget_exhausted", "pin_absence_unconfirmed", "pin_refused", "pin_unknown",
+  "pin_foreign", "archive_unavailable", "pin_lost",
+] as const;
+
+/** Strict decode of the optional closure object: unknown states, reasons, fields or shapes are rejected. */
+export function isRecoveryPrerequisiteClosureStatus(value: unknown): value is RecoveryPrerequisiteClosureStatus {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  if (Object.keys(v).some(k => !["state", "reason", "prerequisite_shas", "checksum"].includes(k))) return false;
+  return typeof v.state === "string" && (PREREQUISITE_CLOSURE_STATES as readonly string[]).includes(v.state) &&
+    (v.reason === undefined || v.reason === "" || (typeof v.reason === "string" && (PREREQUISITE_CLOSURE_REASONS as readonly string[]).includes(v.reason))) &&
+    (v.prerequisite_shas === undefined || (Array.isArray(v.prerequisite_shas) && v.prerequisite_shas.length <= 64 &&
+      v.prerequisite_shas.every(sha => typeof sha === "string" && /^[0-9a-f]{40}$/.test(sha)))) &&
+    (v.checksum === undefined || (typeof v.checksum === "string" && /^[0-9a-f]{64}$/.test(v.checksum)));
 }
 
 /** Atomic capture reconciliation never reserves or releases custody. */

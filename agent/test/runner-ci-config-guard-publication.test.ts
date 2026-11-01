@@ -104,13 +104,14 @@ describe("CI-config guard: checkpoint publication", () => {
 });
 
 describe("CI-config guard: held publication", () => {
-  async function held(extra: (ctx: RunContext) => Promise<void> | void) {
+  async function held(extra: (ctx: RunContext) => Promise<void> | void, setup?: (r: ReturnType<typeof runner>) => void) {
     const claim = gitlabClaim(iid++, { claim_generation: 50, inventory_guarded: true, config: GUARD });
     const { gitlab } = fakeGitlab();
     const server = heldServer(claim);
     skipCheckpoints();
     const work: Partial<Work> = {};
     const r = runner(failingWork(work, extra), gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 });
+    setup?.(r);
     await r.execute(claim);
     return { claim, server, work };
   }
@@ -135,6 +136,58 @@ describe("CI-config guard: held publication", () => {
     git.changedFilesNoRenames = async (...a) => (failed ? null : real(...a));
     try {
       const { server } = await held(() => { failed = true; });
+      assert.equal(server.heldCalls.length, 0);
+    } finally {
+      git.changedFilesNoRenames = real;
+    }
+  });
+
+  // The held preparation reads the path list twice: its own policy check, then the runner's ciHold
+  // (RunRunner.ciConfigGuardVerdict). Only the second read is made uncomputable here, so the refusal
+  // comes from ciHold and must be ci_config_unknown, which never attests a fallback.
+  it("an uncomputable diff in the runner's ciHold neither uploads nor mints an archive FINAL", { skip: HELD_LINUX_ONLY }, async () => {
+    const real = git.changedFilesNoRenames.bind(git);
+    let failed = false;
+    let reads = 0;
+    git.changedFilesNoRenames = async (...a) => {
+      if (!failed) return real(...a);
+      return reads++ === 0 ? [] : null;
+    };
+    const prepared: unknown[] = [];
+    try {
+      const { claim, server, work } = await held(() => { failed = true; }, r => {
+        const rr = r as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+        const step = rr.heldPublicationStep!.bind(r);
+        rr.heldPublicationStep = async (...a: unknown[]) => { const out = await step(...a); prepared.push(out); return out; };
+      });
+      assert.equal(reads >= 2, true, "both the policy check and ciHold ran");
+      assert.deepEqual(prepared, [{ reason: "ci_config_unknown" }], "an uncomputable ciHold diff is unknown, never a stated guard refusal");
+      assert.equal(server.heldCalls.length, 0);
+      assert.equal(server.archiveUploads(), 1);
+      const record = await assertCustodyRetained(server, claim, work, "uncomputable ciHold");
+      assert.equal(record.finalRequest, undefined);
+      assert.equal(server.finals.filter(f => f.disposition?.kind === "archive").length, 0, "no archive FINAL is minted");
+    } finally {
+      git.changedFilesNoRenames = real;
+    }
+  });
+
+  it("a flagged path seen only by the runner's ciHold is a stated ci_config_guard refusal", { skip: HELD_LINUX_ONLY }, async () => {
+    const real = git.changedFilesNoRenames.bind(git);
+    let failed = false;
+    let reads = 0;
+    git.changedFilesNoRenames = async (...a) => {
+      if (!failed) return real(...a);
+      return reads++ === 0 ? [] : ["deploy/ci.yml"];
+    };
+    const prepared: unknown[] = [];
+    try {
+      const { server } = await held(() => { failed = true; }, r => {
+        const rr = r as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+        const step = rr.heldPublicationStep!.bind(r);
+        rr.heldPublicationStep = async (...a: unknown[]) => { const out = await step(...a); prepared.push(out); return out; };
+      });
+      assert.deepEqual(prepared, [{ reason: "ci_config_guard" }]);
       assert.equal(server.heldCalls.length, 0);
     } finally {
       git.changedFilesNoRenames = real;
