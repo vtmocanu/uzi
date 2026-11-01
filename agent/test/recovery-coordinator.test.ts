@@ -249,6 +249,24 @@ describe("RecoveryCoordinator — authenticated pin & journal (D1)", () => {
     assert.equal(seen[0]!.attemptedHeadSha, H_PRIME);
   });
 
+  it("pins EVERY transformed publication candidate in order (an align, then a bridge), bounded, and a restart reads them back", async () => {
+    const coord = makeCoordinator();
+    const C1 = "3".repeat(40);
+    const C2 = "4".repeat(40);
+    const pin = (attemptedHeadSha?: string) =>
+      coord.pin({ runId: "run-cands", sourceSha: H, kind: "issue", branch: "agent/x", generation: 2, ...(attemptedHeadSha ? { attemptedHeadSha } : {}) });
+    assert.ok(await pin());
+    assert.deepEqual((await pin(C1))?.attemptedHeadShas, [C1]);
+    const both = await pin(C2);
+    assert.equal(both?.attemptedHeadSha, C1, "the first stays the provenance head");
+    assert.deepEqual(both?.attemptedHeadShas, [C1, C2]);
+    assert.deepEqual((await pin(C1))?.attemptedHeadShas, [C1, C2], "a repeat is idempotent");
+    const restarted = await makeCoordinator().inspect("run-cands");
+    assert.deepEqual(restarted[0]?.attemptedHeadShas, [C1, C2]);
+    for (let i = 0; i < 20; i++) await pin(i.toString(16).padStart(40, "a"));
+    assert.equal((await makeCoordinator().inspect("run-cands"))[0]?.attemptedHeadShas?.length, 16, "bounded");
+  });
+
   it("optional reservation key round-trips through fresh reader and capture writer; legacy remains unchanged", async () => {
     const client = new FakeClient();
     client.uploadShouldThrow = true;

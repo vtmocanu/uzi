@@ -117,6 +117,7 @@
   "limit_wait_count": 0,
   "rate_limit_type": null,
   "recovery_wait_cause": null,
+  "recovery_wait_phase": null,
   "codex_account_action": null,
   "codex_secret_id": null,
   "codex_secret_label": null,

@@ -1191,6 +1191,8 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/usage", h.WorkerRunUsage)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
 		r.Post("/runs/{id}/forge-clone-success", h.WorkerForgeCloneSuccess)
+		// Bound intent body-decoding and enrollment writes per worker, like the semantic candidate.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/publication-intent", h.WorkerPublicationIntent)
 		r.Post("/runs/{id}/memory/reserve", h.WorkerMemoryReserve)
 		r.Post("/runs/{id}/memory/outcome", h.WorkerMemoryOutcome)
 		// Bound semantic body-decoding work per worker, including while production enrollment is off.

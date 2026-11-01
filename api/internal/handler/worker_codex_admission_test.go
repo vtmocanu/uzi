@@ -41,7 +41,7 @@ func TestWorkerCodexAdmissionStrictBody(t *testing.T) {
 }
 
 func TestWorkerCodexAdmissionProtocolAndRoute(t *testing.T) {
-	if !slices.Contains(protocolFeatures(false, false), "codex_account_admission_signal_v1") {
+	if !slices.Contains(protocolFeatures(false, false, false), "codex_account_admission_signal_v1") {
 		t.Fatal("missing admission feature")
 	}
 	router, ok := (&Handler{}).WorkerRoutes(nil).(chi.Routes)
