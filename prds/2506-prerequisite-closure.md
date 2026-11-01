@@ -1,7 +1,7 @@
 # PRD #2506 (option A): a pinned prerequisite closure lets a thin guarded capture release custody
 
 **Issue:** #2506 (option A only). Delivery under this PRD is **non-closing**: every PR uses `Refs #2506` and closes only its own child issue. #2506 stays open until the whole acceptance below is met. Option D shipped separately (ADR-2506) and does not complete this.
-**Current execution (2026-11-01):** C2 (#3727) merged in [PR #3748](https://github.com/vtmocanu/uzi/pull/3748); source at `a07f813708ced206cd7b8c3f9d09e259b2fff64b` is known. This current-state update makes no claim about unobserved hosted CI or full store-it results (see the historical [C2 execution record](#c2-execution-record-2026-11-01-3727)). C1a and C1b source are merged. C1b landed in [PR #3655](https://github.com/vtmocanu/uzi/pull/3655) as `b6fab6b7`, with migration 00387; exact-head hosted checks and timing were collected before merge. The local handoff records below remain historical evidence, not the current hosted-gate status. C1b itself added no thin FINAL release, feature advertisement or agent change; C2 adds them. C3 M1–M3 are locally complete/reviewed; M4 documentation is pending final validation and landing. E5 is measured locally as recorded below; broad C3 and parent acceptance remain open; E6 is post-roll reporting only. M6 operator observation is not claimed performed. See [current execution and checkbox disposition](#c1b-current-execution-2026-10-29-child-3591).
+**Current execution (2026-11-01):** C2 (#3727) merged in [PR #3748](https://github.com/vtmocanu/uzi/pull/3748); source at `a07f813708ced206cd7b8c3f9d09e259b2fff64b` is known. This current-state update makes no claim about unobserved hosted CI or full store-it results (see the historical [C2 execution record](#c2-execution-record-2026-11-01-3727)). C1a and C1b source are merged. C1b landed in [PR #3655](https://github.com/vtmocanu/uzi/pull/3655) as `b6fab6b7`, with migration 00387; exact-head hosted checks and timing were collected before merge. The local handoff records below remain historical evidence, not the current hosted-gate status. C1b itself added no thin FINAL release, feature advertisement or agent change; C2 adds them. C3 M1–M4 functional delivery is locally implemented and validated; product/documentation units are reviewed at `10ff078c` and the minimal integration-fixture repair at `287b04b9`. Required exact-head landing checks remain unobserved here. E5 is measured locally as recorded below; broad C3 and parent acceptance remain open; E6 is post-roll reporting only. M6 operator observation is not claimed performed. See [current execution and checkbox disposition](#c1b-current-execution-2026-10-29-child-3591).
 
 **Historical design status:** DRAFT, revision 18 (2026-10-28), approved C1a/C1b split and review folds, pending exact-text final review. C1a and C1b are API-only; no filing or dispatch follows from this draft. Based on the exact revision-11 artifact (SHA256 `2205e1146950263b2aa90f35863cadec3f3debfbd350590b9e65bd560a9640ec`, whose header still said revision 10). The earlier paired architecture reviews and owner decisions remain the design history; this new evidence fold requires recov6 review and is not filing, dispatch or implementation approval. **E2 ran on GitHub on 2026-10-27 and returned FINDING (one measured workflow-scope refusal, zero probe malfunctions), conclusive for the tested production credential class.** The anchor strategy is feasible in that tested case; other forges and protected/ruleset configurations remain unverified. Existing source line anchors are historical at `91647464c02bd12ae30d4fce6aa656f2245e88e1`, not refreshed line numbers for current main. The new E2 section states the exact observed scope and remaining gates.
 **Priority:** High (inherits #2506). The independent architecture review CLAUDE.md requires for priority::high applies to this PRD and to each child before dispatch; no waiver. M0 is evidence-only and is never auto-dispatched.
@@ -885,7 +885,7 @@ the ADR amendments dated 2026-11-01.
 
 - **Depends on:** C1b (states). Parallel with C2 only with disjoint file ownership.
 - **Scope and evidence:** owner DTO, fixtures, web and CLI (`cellText`), `pin_lost` and `pin_cleanup_exhausted` visibility, restore commands, `docs/cli.md`; E5 measured.
-- **Local completion (#3728, 2026-11-01):** M1–M3 are implemented and reviewed at `60c71323`; M4 documentation is pending final validation and landing. Broad C3 acceptance and parent release remain open. Owner projection is advisory persisted history with eight states and independent absence/cleanup flags, not a fresh probe or release/cleanup authority. The [owner restore guide](../docs/run-recovery.md#restoring-with-a-confirmed-pin) uses existing export, a UUID-derived ref and full-tip comparison before native verify/import. E6 remains an unperformed post-roll observation.
+- **Local completion (#3728, 2026-11-01):** M1–M3 are implemented/reviewed at `60c71323`; M4 guide/product checks passed on `287b04b9` after reviewed documentation at `10ff078c` and a reviewed fixture repair. Exact-head API/repo/full store-it landing remains pending. Broad C3 acceptance and parent release remain open. Owner projection is advisory persisted history with eight states and independent absence/cleanup flags, not a fresh probe or release/cleanup authority. The [owner restore guide](../docs/run-recovery.md#restoring-with-a-confirmed-pin) uses existing export, a UUID-derived ref and full-tip comparison before native verify/import. E6 remains an unperformed post-roll observation.
 
 #### C3 local E5 measurement (2026-11-01, #3728)
 
@@ -893,7 +893,7 @@ The explicit `TestRecoveryRestoreWorkflowLiveDB/E5FullHistory` invocation
 passed with zero SKIP/FAIL. This is a local owner-workflow measurement, not
 hosted GitHub latency, a C2 FINAL exercise or parent release acceptance.
 The ordinary `SmallNative` controls also passed; they do not substitute for E5.
-The parent and C3 documentation/integration acceptance remain open.
+The parent and broad C3 landing acceptance remain open; completed local integration checks are recorded below.
 
 Input was a `clone --no-local` of this checkout, selected at public revision
 `a07f813708ced206cd7b8c3f9d09e259b2fff64b`: non-shallow, connectivity/full
@@ -998,8 +998,50 @@ The owner guide, CLI documentation, visibility ADR and human requirement now
 describe persisted pin observations separately from fresh verification and
 custody authority. The restore sequence selects an explicit available capture,
 compares the fetched pin's full recorded tip before bundle verification/import,
-then checks source/tree/content. Documentation mirrors and final gates/review
-are pending for this integration record; no acceptance box is ticked here.
+then checks source/tree/content. Source/documentation review passed at
+`10ff078c`; a test-only UUID fixture repair passed scoped review at
+`287b04b9`. Both embedded mirrors match. The local checks below are complete;
+the broader parent C3 checkbox remains open for landing, without claiming
+hosted acceptance.
+
+- [x] C3 local M1: owner projection/contracts and authenticated read-only LiveDB controls, with complete history/order/identity and constant Summary SQL round trips.
+- [x] C3 local M2: safe existing CLI/web diagnostics, shared meanings, preserved actions and dawn/ember keyboard/layout controls.
+- [x] C3 local M3: actual full-history E5, native prune/no-pin/tip controls and retained exports; explicit E5 and routine controls PASS with zero SKIP.
+- [x] C3 local M4 guide/product checks: synced documentation, links, shipping fragment/spec note, full web gate, focused Go controls and E2E library/fake gates.
+- [ ] C3 landing: exact-head required API/repo checks and full inherited store-it, including hosted timing; not observed or waived here.
+
+Full `task gate:web` passed on frozen `287b04b9`: 386 unit files /
+8,425 tests (502.82 s Vitest duration), then 10 real Chromium files / 35 tests
+(19.63 s). Dependency, lint, dead-code, documentation/changelog/style and type
+slots passed first. The four recovery browser cases cover dawn/ember at
+375/1100 widths with keyboard/focus checks. Focused Go checks used
+`-buildvcs=false -race -count=1` and clean Git config: apitypes, uzidocs
+(including byte-equal embeds), owner-summary/status recovery tests and affected
+CLI recovery/export/landing/docs/printed-instruction tests all passed.
+The M1/M3 DB/native proofs remain applicable: their implementation sources are
+unchanged by this documentation integration. The final restored SmallNative
+after both M3 mutations passed at the committed fixture hashes, zero SKIP
+(`gate-log.j6TRGU`, package 96.358 s).
+
+The first web invocation stopped before tests because a relative TMPDIR was
+invalid for the root dependency check. Narrow candidate/base checks reproduced
+the setup failure and passed with an absolute owned scratch path. A scratch
+wrapper runs the existing native Chromium with a short relative TMPDIR to avoid
+Unix socket path limits; it changes no product code or test assertions. A
+subsequent full run exposed one stale RunView fixture expecting an unsafe
+`r1/cap-ok` copy command (8,424 other tests passed). Equivalent narrow base
+PASS / candidate FAIL confirmed that cause. The minimal canonical-UUID fixture
+repair kept the production guard and assertions intact; its three focused
+cases, lint/typecheck and all allocated scoped reviews passed before the final
+full gate rerun. These failed/setup attempts are not counted as passing gates.
+
+Local log identifiers read directly: `msJBoD` (docs/E2E), `qTvnCp`
+(focused Go), `dlqAaG` (full web), `GGeF6t` (repair), `RvY9VX` /
+`uaRUbE` (narrow candidate/base). Logs are run-local scratch artifacts;
+the sanitized results here are the durable record. Local M4 scanner callbacks
+returned no verdict; no final-head scanner pass is claimed. Source audits
+found no security defect. Required repository/API scanners and vulnerability
+checks remain part of exact-head landing acceptance.
 
 A targeted tracked E2E audit searched the changed retired output phrases and
 all recovery/prerequisite identifiers in phases, library tests and the forge
@@ -1007,7 +1049,7 @@ fake. No retired phrase survived. Existing readers select capture id/state/
 checksum/byte size or tolerate absent fields; the optional projection changes
 no fake forge operation or route. No harness edit was needed. Compose phases
 52 (outage/outbox) and 72 (custody), and general CLI smoke phase 18, are unrun;
-library/fake gate results will be recorded after execution.
+library gates passed all six reported tallies (7/403/24/6/5/6), and the fake-forge gate passed 12 tests with zero skips. No compose acceptance is claimed.
 
 Equivalent focused component commands were run on frozen
 `a07f813708ced206cd7b8c3f9d09e259b2fff64b` and `60c71323` exports,

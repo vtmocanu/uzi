@@ -273,4 +273,5 @@ a synthetic coverage commit is distinct from an attempted publication head.
 The [local E5 record](../prds/2506-prerequisite-closure.md#c3-local-e5-measurement-2026-11-01-3728)
 covers owned native transport, full 2,405-commit input and a generated 26-byte
 file; it is not hosted GitHub latency, a C2 FINAL or parent release acceptance.
-C3 final validation/landing, parent acceptance and post-roll E6 remain open.
+C3 local validation is recorded in the PRD; required exact-head landing checks,
+parent acceptance and post-roll E6 remain open.
