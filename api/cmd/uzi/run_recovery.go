@@ -367,7 +367,7 @@ func printRecoveryHint(p *uzicli.Printer, exportable, decisionNeeded int, runArg
 	}
 	p.Printf("\n")
 	if exportable > 0 {
-		p.Printf("%d hold(s) have a recovery archive: recover with `uzi run export`\n", exportable)
+		p.Printf("%d hold(s) have a recovery archive: download with `uzi run export`; thin archives also need prerequisite commits and verified import\n", exportable)
 	}
 	if decisionNeeded > 0 {
 		p.Printf("%d hold(s) await a decision: discard with `uzi run discard %s --hold <hold-id> --yes`\n",

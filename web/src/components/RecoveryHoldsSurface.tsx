@@ -377,7 +377,7 @@ function HoldRow({
             <span className="font-mono">{holdShort}</span>).{" "}
             {hold.has_available_capture ? (
               <>
-                An earlier available archive can restore older work but may not cover the latest
+                An earlier available archive requires its prerequisite commits to restore older work and may not cover the latest
                 worker-local work. The latest worker-local source may be the only copy.
               </>
             ) : (

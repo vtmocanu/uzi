@@ -251,7 +251,7 @@ func TestRunRecoveryCanonicalRunID(t *testing.T) {
 							"run " + recoveryHeldRunID + " hold canonical-source gen 7: " + terminalCopy + "\n",
 							"run " + recoveryHeldRunID + ": " + reason + "\n",
 							"2 hold(s) await a decision: discard with `uzi run discard " + recoveryHeldRunID + " --hold <hold-id> --yes`\n",
-							"1 hold(s) have a recovery archive: recover with `uzi run export`\n",
+							"1 hold(s) have a recovery archive: download with `uzi run export`; thin archives also need prerequisite commits and verified import\n",
 						} {
 							if !strings.Contains(out, want) {
 								t.Errorf("missing %q in stdout=%q", want, out)
@@ -1001,7 +1001,7 @@ func TestOwnerRecoveryHintsSplitByArchive(t *testing.T) {
 	}
 	for _, want := range []string{
 		"blocked_runs: 1\n\nrun run-a hold hold-a: no recovery archive; custody of worker worker-a's local source is retained (export unavailable; it may be the only copy)",
-		"1 hold(s) have a recovery archive: recover with `uzi run export`",
+		"1 hold(s) have a recovery archive: download with `uzi run export`; thin archives also need prerequisite commits and verified import",
 		"2 hold(s) await a decision: discard with `uzi run discard <run-id> --hold <hold-id> --yes`",
 	} {
 		if !strings.Contains(out, want) {
@@ -1130,7 +1130,7 @@ func TestRunRecoveryArchiveReadyGetsExportHint(t *testing.T) {
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d", code)
 	}
-	if !strings.Contains(out, "1 hold(s) have a recovery archive: recover with `uzi run export`") {
+	if !strings.Contains(out, "1 hold(s) have a recovery archive: download with `uzi run export`; thin archives also need prerequisite commits and verified import") {
 		t.Errorf("export hint absent:\n%s", out)
 	}
 	if strings.Contains(out, "await a decision") || strings.Contains(out, "custody of worker") {

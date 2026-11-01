@@ -237,7 +237,7 @@ func renderExportResult(env Env, gf *globalFlags, runID string, a apitypes.Recov
 		"warning: this archive is the run's ORIGINAL committed history and may contain secrets — "+
 			"review it before publishing anywhere; a real credential must be revoked/rotated and removed from the history\n"+
 			"verification checks bytes only, not availability of required commits. In a fresh destination clone of your forge repo, "+
-			"run `git bundle verify <bundle-path>` before import or discarding retained source. An available archive does not resolve guarded custody.\n")
+			"run `git bundle verify <bundle-path>` before import or discarding retained source. An available archive alone does not resolve guarded custody.\n")
 
 	for _, line := range prerequisiteLines(a) {
 		_, _ = fmt.Fprintln(env.Stderr, line)
@@ -370,9 +370,9 @@ func renderLandingHint(env Env, gf *globalFlags, run apitypes.RunDTO, summary ap
 		// between several — name a concrete `--capture <id>` then so the hint is a runnable
 		// command, not one the CLI would reject (issue #1418).
 		if ids := availableCaptureIDs(summary); len(ids) > 1 {
-			p.Printf("\nthis failed run's committed work is landable by hand: it has %d recovery archives — export one with `uzi run export %s --capture <id>` (ids: %s)\n", len(ids), id, strings.Join(ids, ", "))
+			p.Printf("\nthis failed run's committed work may be landable by hand after prerequisite and import verification: it has %d recovery archives — export one with `uzi run export %s --capture <id>` (ids: %s)\n", len(ids), id, strings.Join(ids, ", "))
 		} else {
-			p.Printf("\nthis failed run's committed work is landable by hand: export the recovery archive with `uzi run export %s`\n", id)
+			p.Printf("\nthis failed run's committed work may be landable by hand after prerequisite and import verification: export the recovery archive with `uzi run export %s`\n", id)
 		}
 	case run.PreservedPatch != nil && strings.TrimSpace(*run.PreservedPatch) != "":
 		p.Printf("\nthis failed run's committed work is landable by hand: its diff is preserved — view it with `uzi run get %s --field preserved_patch`\n", id)

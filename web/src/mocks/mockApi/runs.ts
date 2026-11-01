@@ -1065,7 +1065,7 @@ export const runsApi = {
   getRunArchives: async (id: string) => {
     const r = getRun(id);
     if (!r) throw new ApiError(404, "run not found");
-    const capId = `${id}-cap1`;
+    const capId = `00000000-0000-0000-0000-${([...state.runs.keys()].indexOf(id) + 1).toString(16).padStart(12, "0")}`;
     if (r.status === "failed" && !discardedCaptures.has(capId)) {
       return delay(
         {
@@ -1090,6 +1090,12 @@ export const runsApi = {
               attempted_head_sha: "f0e1d2c3b4a5968778695a4b3c2d1e0f01234567",
               byte_size: 4718592,
               checksum: "sha256:3f786850e387550fdab836ed7e6dc881de23001b",
+              prerequisite_closure: {
+                state: "pinned", pin_ref: `refs/uzi-prereq/${capId}`,
+                pin_tip: "1111111111111111111111111111111111111111",
+                absence_unconfirmed: false, cleanup_exhausted: false,
+                updated_at: new Date(Date.now() - 3_600_000).toISOString(),
+              },
               prerequisite_shas: ["9988776655443322110099887766554433221100"],
               created_at: new Date(Date.now() - 3_600_000).toISOString(),
               expires_at: new Date(Date.now() + 6 * 86_400_000).toISOString(),
