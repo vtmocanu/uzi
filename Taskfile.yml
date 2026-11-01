@@ -1365,8 +1365,8 @@ tasks:
       # hotfix tag does not move the next RC's window. Prints `N passed, N failed` and
       # exits nonzero on any failure. Watch it fail on the unmodified scripts. See the
       # script header.
-      - python3 -I -B scripts/release-notes.test.py
       - ./scripts/release-scripts-test.sh
+      - python3 -I -B scripts/release-notes.test.py
       - ./scripts/worker-roll-target.test.sh
       - task: test:release-ci-coverage
       - task: test:release-auto
