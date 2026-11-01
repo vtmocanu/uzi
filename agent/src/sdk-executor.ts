@@ -3539,7 +3539,8 @@ export class SdkExecutor implements Executor {
         };
         const requestPark: NonNullable<RunContext["requestParkRun"]> = async (at) => {
           const step = await this.runThroughSwitch(ctx, state, async () => {
-            // Re-entry continues the pending question's open parked-time interval (the shared parked-time budget).
+            // Re-entry shares the run's parked-time budget: a same-id re-entry continues its open
+            // interval, while a declined park already closed it and the next attempt opens a new one.
             // Only a settled owner answer permits another attempt; lifecycle refusals keep waiting.
             for (;;) {
               try { return await ctx.requestParkRun!(at); }
