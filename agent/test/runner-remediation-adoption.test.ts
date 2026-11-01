@@ -25,9 +25,15 @@ function command(dir: string, ...args: string[]): string {
 // The scanner reports and default-empty process view are harness seams, not hosted
 // quiescence proof. Late-seed separately checks real persisted authority epochs.
 for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "excluded", "scan-floor", "missing-pending",
-  "missing-RR", "historical", "late-scan-pending", "late-scan-root", "late-seed"] as const) {
+  "missing-RR", "historical", "late-scan-pending", "late-scan-root", "late-seed",
+  "marker", "marker-plain", "marker-staged", "marker-historical", "marker-floor", "marker-exclude", "marker-published-floor",
+  "marker-late-scan", "marker-late-seed", "marker-credential"] as const) {
   test("production remediation adoption: " + mode, async t => {
-    const succeeds = mode === "clean" || mode === "clean-no-pending";
+    const peel = mode.startsWith("marker");
+    const lateSeed = mode === "late-seed" || mode === "marker-late-seed";
+    const lateScan = mode === "late-scan-pending" || mode === "marker-late-scan";
+    const finding = mode === "historical" || mode === "marker-historical" || mode === "marker-staged";
+    const succeeds = mode === "clean" || mode === "clean-no-pending" || mode === "marker" || mode === "marker-plain";
     const claim = gitlabClaim(3747, { claim_generation: 2, session_id: "predecessor-session" });
     const branch = "agent/issue-3747";
     const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
@@ -54,8 +60,19 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
     await git.recordRemediationScan(bare, branch, source, { trusted: true, tip: q, flaggedOIDs: [q], origin: "pre-exit" });
     const historical = command(bare, "-c", "user.name=t", "-c", "user.email=t@example.com",
       "commit-tree", base + "^{tree}", "-p", base, "-m", "historical only finding");
-    const s = commit("clean replacement", mode === "historical" ? historical : base);
+    let s = commit("clean replacement", mode === "historical" || mode === "marker-historical" ? historical : base);
     await fetch();
+    let execution = s;
+    if (peel) {
+      execution = commit("ordinary execution parent", s);
+      fs.writeFileSync(path.join(clone.path, "marker-content.txt"), "staged marker content\n");
+      command(clone.path, "add", "marker-content.txt");
+      assert.equal(await git.commitWipMarker(clone.path), true);
+      s = command(clone.path, "rev-parse", "HEAD");
+      await fetch();
+      assert.notEqual(command(bare, "rev-parse", s + "^{tree}"), command(bare, "rev-parse", execution + "^{tree}"));
+    }
+    const foundOID = mode === "marker-staged" ? s : historical;
     assert.equal(await git.ancestry(bare, q, s), "divergent");
     if (mode === "historical") assert.equal(await git.ancestry(bare, historical, s), "ancestor");
     const key = "uzi-recovery." + branch + ".clone";
@@ -67,7 +84,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
     }
     // Reconstruct cache, runner and its coordinator from persisted predecessor artifacts;
     // the cases below explicitly inject any additional worker-local negative knowledge.
-    const authority = mode === "late-seed" ? new AuthorityRuntime({
+    const authority = lateSeed ? new AuthorityRuntime({
       lifetime: await acquireWorkerLifetime(fs.realpathSync(fx.dataDir), testLockOptions()),
       workerToken: "fixture-adoption-authority", timeoutMs: 5000,
     }) : undefined;
@@ -84,8 +101,15 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
         try {
           assert.ok(succeeds);
           assert.equal(ctx.sessionId, undefined, "the predecessor provider session is not reused");
-          assert.equal(command(ctx.worktreePath, "rev-parse", "HEAD"), s);
+          assert.equal(command(ctx.worktreePath, "rev-parse", "HEAD"), execution);
           assert.equal(command(ctx.worktreePath, "write-tree"), command(bare, "rev-parse", s + "^{tree}"));
+          if (peel) {
+            assert.equal(command(ctx.worktreePath, "diff", "--name-only"), "");
+            assert.equal(command(ctx.worktreePath, "diff", "--cached", "--name-only"), "marker-content.txt");
+            assert.equal(read().remediationRecovery.ownedTip, execution);
+            assert.ok(read().remediationRecovery.excludedRoots.includes(s));
+            assert.equal(read().remediationRecovery.sequence, before.sequence);
+          }
           assert.equal(read().remediationRecovery.active, undefined);
           assert.deepEqual(read().remediationRecovery.edges, before.edges);
           assert.equal(flight.remediationRestrictions.pending.attemptId, read().attemptId);
@@ -97,6 +121,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       teardownTestDeps: portableTeardownTestDeps, recoveryRetryMs: 1, authority });
     const endSource = authority ? t.mock.method(authority, "endSourceUse") : undefined;
     const publication = t.mock.method(runner as any, "publishFlightSource");
+    if (mode === "marker-credential") client.protocolFeatures = ["claim_generation_fence"];
     api.setOwnershipStatus(claim.run_id, "running", 2);
     const latch = () => (runner as any).latchRemediationFindings(flight, bare, branch, [{ commit: q }]);
     // Supply a genuine C[D,S] coverage artifact at the existing capture seam. X is an
@@ -107,7 +132,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
         runId: claim.run_id, generation: 2, kind: "issue", branch, barePath: bare,
         defaultIdentity: { ref: "refs/remotes/origin/main", sha: base },
       }, [q, x, s], s);
-      args[5] = coverage.sha; args[6] = s;
+      args[5] = mode === "marker-plain" ? s : coverage.sha; args[6] = s;
       return capture(...args);
     });
     const prepare = cache.prepareRecoverySuccessor.bind(cache);
@@ -115,12 +140,18 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       const original = args[6]!.admitRemediationSource!;
       args[6] = { ...args[6], admitRemediationSource: async input => {
         callbacks++; underB = true;
-        assert.ok(input.restrictedRoots.includes(x));
+        assert.equal(input.executionTip ?? input.sourceTip, execution);
+        if (peel) assert.ok(input.restrictedRoots.includes(s));
+        if (mode !== "marker-plain") assert.ok(input.restrictedRoots.includes(x));
         assert.ok(!input.flaggedOIDs.includes(x), "a proposed excluded root is not global finding evidence");
         assert.ok(!flight.remediationRestrictions.roots.includes(x));
         try { return await original(input); } finally { underB = false; }
       } };
-      return prepare(...args);
+      const result = await prepare(...args);
+      // Trip AFTER the durable Git result. The worker must first synchronously adopt the
+      // verified tuple, so credential-switch custody verification sees the new source.
+      if (mode === "marker-credential") flight.steering.tripCredentialSwitch(2);
+      return result;
     });
     // Install independently selected old facts immediately before the production restore.
     const restore = (runner as any).restoreRemediationRestrictions.bind(runner);
@@ -128,9 +159,10 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       flight = f;
       if (!oldFactsInstalled && f.predecessorCapture) {
         oldFactsInstalled = true;
+        if (mode === "marker-published-floor") f.publishedRealTips = [s];
         if (mode !== "clean-no-pending")
           (runner as any).latchRemediationFindings(f, bare, branch,
-            mode === "late-scan-pending" || mode === "late-seed" ? [] :
+            lateScan || lateSeed ? [] :
               [{ commit: mode === "missing-pending" ? x : q }]);
         else assert.equal(f.remediationRestrictions.pending, undefined);
       }
@@ -141,17 +173,19 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       if (!underB) return { trusted: true as const, findings: [] };
       scans++; assert.equal(range.tipSha, s);
       await Promise.resolve();
-      if (mode === "late-scan-pending") {
+      if (lateScan) {
         assert.deepEqual(flight.remediationRestrictions.pending.requiredOIDs, []);
         latch();
       }
       if (mode === "late-scan-root") flight.remediationRestrictions.roots.push(base);
       if (mode === "untrusted") return { trusted: false as const, reason: "fixture untrusted", findings: [] };
-      return { trusted: true as const, findings: mode === "historical" ? [{ commit: historical } as any] : [] };
+      return { trusted: true as const, findings: finding ? [{ commit: foundOID } as any] : [] };
     });
     const range = cache.resolveCheckpointRange.bind(cache);
     t.mock.method(cache, "resolveCheckpointRange", async (...args: Parameters<typeof range>) => {
       const value = await range(...args);
+      if (underB && value && mode === "marker-exclude") return { ...value, excludeSha: s };
+      if (underB && value && mode === "marker-floor") return { ...value, scanFloorShas: [s] };
       if (underB && value && mode === "excluded") return { ...value, excludeSha: q };
       if (underB && value && mode === "scan-floor") return { ...value, scanFloorShas: [q] };
       return value;
@@ -162,13 +196,13 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
     const seed = (cache as any).seedRunnerClone.bind(cache);
     t.mock.method(cache as any, "seedRunnerClone", async (...args: any[]) => {
       const result = await seed(...args);
-      if (mode === "late-seed") latch();
+      if (lateSeed) latch();
       return result;
     });
     const persist = cache.recordRemediationRestrictions.bind(cache);
     t.mock.method(cache, "recordRemediationRestrictions", async (...args: Parameters<typeof persist>) => {
       assert.equal(underB, false); writes++;
-      assert.ok(flight.remediationRestrictions.pending.requiredOIDs.includes(historical));
+      assert.ok(flight.remediationRestrictions.pending.requiredOIDs.includes(foundOID));
       return persist(...args);
     });
     try {
@@ -177,9 +211,12 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       assert.equal(models, succeeds ? 1 : 0, JSON.stringify({ states: api.states, logs }));
       assert.equal(callbacks, mode === "missing-pending" || mode === "missing-RR" ? 0 : 1, JSON.stringify({ states: api.states, logs }));
       if (callbacks) assert.equal(scans, 1);
-      assert.equal(command(bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-owed/"), pins);
+      const actualPins = command(bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-owed/");
+      for (const pin of pins.split("\n")) assert.ok(actualPins.split("\n").includes(pin));
+      if (peel && (succeeds || lateSeed || mode === "marker-credential")) assert.ok(actualPins.includes(`refs/uzi-owed/${claim.run_id}/${execution} ${execution}`));
+      else assert.equal(actualPins, pins);
       assert.ok(fs.existsSync(clone.path));
-      if (!succeeds) {
+      if (!succeeds && mode !== "marker-credential") {
         assert.equal(flight.remediationRestrictions.pending.clonePath, source.clonePath);
         assert.equal(flight.remediationRestrictions.pending.attemptId, source.attemptId);
         if (mode === "missing-pending") {
@@ -189,19 +226,28 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
           assert.ok(!flight.remediationRestrictions.roots.includes(x), "proposal never installs exclusions on refusal");
         }
       }
-      if (mode === "historical") {
+      if (mode === "marker-credential") {
+        assert.equal(read().recovery.stage, "ready-for-model");
+        assert.equal(read().remediationRecovery.ownedTip, execution);
+        assert.equal(read().remediationRecovery.active, undefined);
+        assert.equal(flight.worktreePath, read().clonePath);
+        assert.equal(flight.attemptId, read().attemptId);
+        assert.deepEqual(api.states.filter(s => s.body.status === "credential_switch" || s.body.status === "credential_switch_failed")
+          .map(s => [s.body.status, s.body.claim_generation]), [["credential_switch", 2]]);
+      }
+      if (finding) {
         assert.equal(writes, 1);
-        assert.ok(read().remediationRecovery.flaggedOIDs.includes(historical));
+        assert.ok(read().remediationRecovery.flaggedOIDs.includes(foundOID));
         assert.deepEqual(read().remediationRecovery.active, before.active, "negative finding grants no origin");
         const restarted = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
-        assert.ok((await restarted.readRuntimeRemediationRecovery(bare, branch, source))!.flaggedOIDs.includes(historical));
+        assert.ok((await restarted.readRuntimeRemediationRecovery(bare, branch, source))!.flaggedOIDs.includes(foundOID));
         // A fresh consumer must honor the persisted fact even if the scanner now
         // excludes that history and reports clean. This is negative admission proof,
         // not permission to execute in the predecessor or a process-quiescence test.
         const resolve = restarted.resolveCheckpointRange.bind(restarted);
         t.mock.method(restarted, "resolveCheckpointRange", async (...args: Parameters<typeof resolve>) => {
           const actual = await resolve(...args);
-          return actual ? { ...actual, excludeSha: historical } : actual;
+          return actual ? { ...actual, excludeSha: foundOID } : actual;
         });
         t.mock.method(restarted, "secretScanCheckpointRange", async () => ({ trusted: true as const, findings: [] }));
         const fresh = new RunRunner(client, restarted, runId => ({ homeDir: path.join(homeDir, runId),
@@ -215,7 +261,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
           }), /history restricted/);
         } finally { fresh.shutdown(); }
       }
-      if (mode === "late-seed") {
+      if (lateSeed) {
         assert.equal(read().recovery.stage, "ready-for-model");
         assert.equal(flight.sourceTailsJoined, true, "production teardown positively joined its tails");
         assert.equal(flight.evidenceProcessJoined, flight.executor);

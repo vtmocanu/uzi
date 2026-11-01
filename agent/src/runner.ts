@@ -23631,6 +23631,7 @@ export class RunRunner {
           const attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
           let deferredRestrictions: { tip: string; findings: SecretFinding[] } | undefined;
           let admittedSourceTip: string | undefined;
+          let admittedExecutionTip: string | undefined;
           let successor: RunnerClone;
           try {
             successor = await this.inFlightAuthority(flight, async () => {
@@ -23672,19 +23673,40 @@ export class RunRunner {
                       this.latchRemediationFindings(flight, bare, branch, scan.findings);
                       return false;
                     }
+                    this.retainedLifecycleGuard(flight);
+                    assertOldFacts(input.flaggedOIDs);
                     if (!scan.trusted) return false;
                     const roots = [...new Set([...input.restrictedRoots, ...(flight.remediationRestrictions?.roots ?? [])])];
-                    const floors = [...new Set([input.sourceTip, ...scan.floorCandidates,
+                    const executionTip = input.executionTip ?? input.sourceTip;
+                    const floors = [...new Set([executionTip, ...scan.floorCandidates,
                       scan.range.excludeSha, ...(scan.range.scanFloorShas ?? [])])];
+                    // Only the newly peeled S is exempt from the CONTENT-S check. Old live
+                    // restrictions must still be divergent from S; all roots, including S,
+                    // must be divergent from execution P and every actual published/range floor.
+                    const contentRoots = roots.filter(root => root !== input.sourceTip ||
+                      executionTip === input.sourceTip || record.excludedRoots?.includes(root) ||
+                      record.flaggedOIDs.includes(root) || record.edges.some(e => e.from === root) ||
+                      flight.remediationRestrictions?.roots.includes(root));
+                    for (const root of contentRoots) {
+                      const relation = await this.git.ancestry(bare, root, input.sourceTip);
+                      this.retainedLifecycleGuard(flight);
+                      assertOldFacts(input.flaggedOIDs);
+                      if (relation !== "divergent") return false;
+                    }
                     // Parser-bounded roots and range/published floors; a failed proof stops adoption.
                     // Every probe retains the existing recovery signal and deadline.
                     for (const floor of floors)
-                      for (const root of roots)
-                        if (await this.git.ancestry(bare, root, floor) !== "divergent") return false;
+                      for (const root of roots) {
+                        const relation = await this.git.ancestry(bare, root, floor);
+                        this.retainedLifecycleGuard(flight);
+                        assertOldFacts(input.flaggedOIDs);
+                        if (relation !== "divergent") return false;
+                      }
                     this.retainedLifecycleGuard(flight);
                     assertOldFacts(input.flaggedOIDs);
                     admittedFlags = input.flaggedOIDs;
                     admittedSourceTip = input.sourceTip;
+                    admittedExecutionTip = executionTip;
                     return true;
                   },
                 });
@@ -23748,7 +23770,7 @@ export class RunRunner {
             const restored = await this.restoreRemediationRestrictions(flight);
             if (!admittedSourceTip) return;
             const pending = flight.remediationRestrictions?.pending;
-            if (!restored || restored.ownedTip !== admittedSourceTip ||
+            if (!restored || restored.ownedTip !== admittedExecutionTip ||
                 restored.runId !== source.runId || restored.clonePath !== successor.path ||
                 restored.attemptId !== successor.attemptId || restored.branch !== branch ||
                 (pending && (pending.requireDenial || pending.bindingUncertain ||
@@ -23759,7 +23781,8 @@ export class RunRunner {
           }, { signal, timeoutMs: Math.max(1, Math.min(CLONE_AUTHORITY_WAIT_MS, iteration.deadline - Date.now())) });
           // Close old active permission under the independently restored new binding. The exact
           // immutable S was scanned clean; this writer creates no origin grant.
-          if (admittedSourceTip) await this.persistRemediationScan(flight, bare, branch, admittedSourceTip, []);
+          if (admittedSourceTip && admittedExecutionTip === admittedSourceTip)
+            await this.persistRemediationScan(flight, bare, branch, admittedSourceTip, []);
           flight.batcher.emit({ kind: "status", agent: "worker", payload: {
             text: "retained work verified on a fresh local attempt; predecessor sources and custody retained",
           } });
