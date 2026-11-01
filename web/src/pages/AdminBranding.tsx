@@ -185,7 +185,7 @@ export function AdminBranding() {
   };
 
   // App-mark preview source, mirroring AppShell.appMarkImgSrc's three-mode logic so
-  // the preview never diverges from the chrome: `preset` resolves the slug through
+  // the preview reflects saved/edited branding even in demo mode: `preset` resolves the slug through
   // the shared brandPresets registry (unknown/empty → FactoryIcon); `custom` serves
   // the uploaded asset (cache-busted by logoRev) or the FactoryIcon when none is
   // uploaded — there is NO /brand-default.svg fallback for the app slot; `default`
@@ -513,7 +513,7 @@ export function AdminBranding() {
 // optional light plaque). The chrome itself (M3a/M3b) is the source of truth for the
 // real rendering; this is the operator's in-app equivalent of the design mock. The
 // app mark is resolved upstream (appMarkSrc) exactly as AppShell.appMarkImgSrc does,
-// so the preview cannot diverge from the chrome: a non-null src renders an <img>,
+// so the preview stays real even in demo mode: a non-null src renders an <img>,
 // null renders the FactoryIcon.
 function BrandingPreview({
   appLogoMode,

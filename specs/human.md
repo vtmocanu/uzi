@@ -1622,6 +1622,10 @@ PRD at `prds/done/3522-weekly-usage-reserve.md`.
 - Reasons recorded on the run: `default`, `pool_empty`, `auto`, `best_of_pool`, `pool_stale`, `pool_exhausted`; shown on `uzi run get` (`CODEX_ALIAS`, "not recorded" for older runs), the web run view and the TUI detail rail. (AI-synced 2026-10-31)
 - Pooled aliases but none bindable makes Codex unusable (default login never a fallback): implicit runs fall back to Claude (ADR-1732 D15); explicit Codex refuses with 422 `no_credential_for_harness` plus reason `codex_pool_unavailable`; schedules skip (one-time held) with skip reason `codex_pool_unavailable`; automatic MR rework is skipped. Exception: when every Codex credential the user holds is disabled, the existing credential-disabled refusal applies (422 with no reason; schedules record `credential_disabled`). Lock order and fence: [ADR-1106 amendment](../adr/1106-codex-harness.md#amendment-codex-account-auto-selection-at-run-creation-3719-2026-10-31); D13 supersession: ADR-1732 amendment. Out of scope: OpenAI API key pooling, Codex chat. (AI-synced 2026-10-31)
 
+## Demo mode branding
+
+- Web demo mode shows the stock uzi factory icon and wordmark, default tab title and favicon base, and hides all instance POWERED BY branding and the optional build-time license credit. Toggling it off restores the real branding live. This is per-device presentation only; server settings and the Admin Branding live preview stay real. (AI-synced 2026-11-01)
+
 ## Deferred (user, "later stuff")
 
 - On-demand worker spawning: on compose the worker simply runs always-on (idle is
