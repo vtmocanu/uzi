@@ -1575,7 +1575,15 @@ for (const wrapped of [false, true]) {
     assert.deepEqual(journal().remediationRecovery.edges, old.edges, "ordinary progress adds no displacement edge");
     assert.equal(journal().remediationRecovery.active, undefined);
     assert.ok(journal().remediationRecovery.excludedRoots.includes(marker));
-    const coverage = await restarted.buildRecoveryCoverage(bare, opts.context as PositiveOwedCandidateContext, [displaced, progress], progress);
+    assert.equal(await restarted.ancestry(bare, marker, progress), "divergent");
+    assert.ok(journal().peeledMarkers.includes(marker), "the next capture must reuse proven marker lineage");
+    const owedBeforeCoverage = git(bare, "for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${RUN}/`);
+    const coverage = await restarted.buildRecoveryCoverage(bare, opts.context as PositiveOwedCandidateContext,
+      [displaced, marker, progress], progress);
+    for (const line of owedBeforeCoverage.split("\n").filter(Boolean)) {
+      const [ref, oid] = line.split(" ");
+      assert.equal(await restarted.ancestry(bare, oid!, coverage.sha), "ancestor", "coverage omitted owed root " + ref);
+    }
     const reservation = await restarted.reserveRecoveryIteration(bare, BRANCH, KEY, next);
     await restarted.recordRecoveryCapture(bare, BRANCH, KEY, next, reservation.attempts, coverage.sha, progress);
     const thirdAttempt = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 3, "abcdef0123456789");
