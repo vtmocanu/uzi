@@ -1,7 +1,7 @@
 # PRD #2506 (option A): a pinned prerequisite closure lets a thin guarded capture release custody
 
 **Issue:** #2506 (option A only). Delivery under this PRD is **non-closing**: every PR uses `Refs #2506` and closes only its own child issue. #2506 stays open until the whole acceptance below is met. Option D shipped separately (ADR-2506) and does not complete this.
-**Current execution (2026-11-01):** C2 (#3727) is implemented on branch `agent/issue-3727` in four milestones (M1 schema, M2 API release, M3 worker mint, M4 advertisement and combined proof) and M5 documentation; its landing, exact-head CI and the full store-it sweep are pending, so nothing here claims C2 shipped (see the [C2 execution record](#c2-execution-record-2026-11-01-3727)). C1a and C1b source are merged. C1b landed in [PR #3655](https://github.com/vtmocanu/uzi/pull/3655) as `b6fab6b7`, with migration 00387; exact-head hosted checks and timing were collected before merge. The local handoff records below remain historical evidence, not the current hosted-gate status. C1b itself added no thin FINAL release, feature advertisement or agent change; C2 adds them on its branch. C3, E5 and parent acceptance remain open; E6 is post-roll reporting only. M6 operator observation is not claimed performed. See [current execution and checkbox disposition](#c1b-current-execution-2026-10-29-child-3591).
+**Current execution (2026-11-01):** C2 (#3727) merged in [PR #3748](https://github.com/vtmocanu/uzi/pull/3748); source at `a07f813708ced206cd7b8c3f9d09e259b2fff64b` is known. This current-state update makes no claim about unobserved hosted CI or full store-it results (see the historical [C2 execution record](#c2-execution-record-2026-11-01-3727)). C1a and C1b source are merged. C1b landed in [PR #3655](https://github.com/vtmocanu/uzi/pull/3655) as `b6fab6b7`, with migration 00387; exact-head hosted checks and timing were collected before merge. The local handoff records below remain historical evidence, not the current hosted-gate status. C1b itself added no thin FINAL release, feature advertisement or agent change; C2 adds them. C3 M1–M3 are locally complete/reviewed; M4 documentation is pending final validation and landing. E5 is measured locally as recorded below; broad C3 and parent acceptance remain open; E6 is post-roll reporting only. M6 operator observation is not claimed performed. See [current execution and checkbox disposition](#c1b-current-execution-2026-10-29-child-3591).
 
 **Historical design status:** DRAFT, revision 18 (2026-10-28), approved C1a/C1b split and review folds, pending exact-text final review. C1a and C1b are API-only; no filing or dispatch follows from this draft. Based on the exact revision-11 artifact (SHA256 `2205e1146950263b2aa90f35863cadec3f3debfbd350590b9e65bd560a9640ec`, whose header still said revision 10). The earlier paired architecture reviews and owner decisions remain the design history; this new evidence fold requires recov6 review and is not filing, dispatch or implementation approval. **E2 ran on GitHub on 2026-10-27 and returned FINDING (one measured workflow-scope refusal, zero probe malfunctions), conclusive for the tested production credential class.** The anchor strategy is feasible in that tested case; other forges and protected/ruleset configurations remain unverified. Existing source line anchors are historical at `91647464c02bd12ae30d4fce6aa656f2245e88e1`, not refreshed line numbers for current main. The new E2 section states the exact observed scope and remaining gates.
 **Priority:** High (inherits #2506). The independent architecture review CLAUDE.md requires for priority::high applies to this PRD and to each child before dispatch; no waiver. M0 is evidence-only and is never auto-dispatched.
@@ -465,7 +465,7 @@ retention obey these same boundaries. C1a is unaffected by this clarification.
 
 ### Security and data
 
-- A history purge is defeated while a pin anchors pre-purge history; `docs/run-recovery.md` must say a purge also deletes `refs/uzi-*` refs; owner early expiry triggers S7.
+- Pins can keep pre-purge history reachable under `refs/uzi-*`, independently of the external deletion/rewrite restore residual. The run-recovery guide records this limitation without a purge recipe: O10/S7 automatic cleanup follows expiry/discard, expected-tip CAS and confirmed absence; unknown creates and cleanup exhaustion retain blockers.
 - Pins point only at default-branch commits and publish no run content. No new worker credential, endpoint or authority; the four guardrail layers unchanged.
 
 ### Out of scope
@@ -479,7 +479,7 @@ Changing held ordering; deleting pins when another route settles the hold (pins 
 | E1 | Population | done (zero verified standalone A1); user: Proceed | done |
 | E2 | Maintainer-only same-scope/same-role probe; actual production go-git helpers plus native supplement; current-tip and old-tip workflow-tree cases. | **GitHub FINDING, 2026-10-27:** compatible anchor succeeded; differing-workflow old tip refused; same-tree old tips succeeded; zero malfunctions. Other forges/configurations unverified. | evidence fold review and final architecture disposition before filing |
 | E4 | Per-capture prerequisites, guarded manifest-bound thin population, 2026-10-24 snapshot | 386 captures / 257 holds; min 1, median 1, nearest-rank p90 6, p99 16, max 16; 204 expired and 182 available (available p90 8). Source SHA256 349a1c59e4b1eac90c26b63178a73651c1bb2a79fa58ec7725d91708854747b5. Independent local recomputation; no fresh DB query. Not a latency measurement. | reported before C1b dispatch; retain max-64 tests |
-| E5 | Owner restore time on this repository | open | C3 acceptance |
+| E5 | Owner restore time on this repository | [measured locally](#c3-local-e5-measurement-2026-11-01-3728) | C3 final validation/landing remains open |
 | E6 | Two weeks hosted after the roll: releases, refusals per reason, live pins, unresolved and cleanup-exhausted rows | open | post-acceptance |
 
 ## Child issues (after architecture approval only)
@@ -885,6 +885,7 @@ the ADR amendments dated 2026-11-01.
 
 - **Depends on:** C1b (states). Parallel with C2 only with disjoint file ownership.
 - **Scope and evidence:** owner DTO, fixtures, web and CLI (`cellText`), `pin_lost` and `pin_cleanup_exhausted` visibility, restore commands, `docs/cli.md`; E5 measured.
+- **Local completion (#3728, 2026-11-01):** M1–M3 are implemented and reviewed at `60c71323`; M4 documentation is pending final validation and landing. Broad C3 acceptance and parent release remain open. Owner projection is advisory persisted history with eight states and independent absence/cleanup flags, not a fresh probe or release/cleanup authority. The [owner restore guide](../docs/run-recovery.md#restoring-with-a-confirmed-pin) uses existing export, a UUID-derived ref and full-tip comparison before native verify/import. E6 remains an unperformed post-roll observation.
 
 #### C3 local E5 measurement (2026-11-01, #3728)
 
@@ -990,6 +991,46 @@ critical-path impact were not measured. The small containing test took 68.28 s
 clock. Full inherited store-it and required exact-head API/repo CI remain landing
 obligations. External pin deletion/history rewrite remains the accepted residual;
 this measurement grants no custody-release or cleanup authority.
+
+#### C3 M4 integration record (2026-11-01, #3728)
+
+The owner guide, CLI documentation, visibility ADR and human requirement now
+describe persisted pin observations separately from fresh verification and
+custody authority. The restore sequence selects an explicit available capture,
+compares the fetched pin's full recorded tip before bundle verification/import,
+then checks source/tree/content. Documentation mirrors and final gates/review
+are pending for this integration record; no acceptance box is ticked here.
+
+A targeted tracked E2E audit searched the changed retired output phrases and
+all recovery/prerequisite identifiers in phases, library tests and the forge
+fake. No retired phrase survived. Existing readers select capture id/state/
+checksum/byte size or tolerate absent fields; the optional projection changes
+no fake forge operation or route. No harness edit was needed. Compose phases
+52 (outage/outbox) and 72 (custody), and general CLI smoke phase 18, are unrun;
+library/fake gate results will be recorded after execution.
+
+Equivalent focused component commands were run on frozen
+`a07f813708ced206cd7b8c3f9d09e259b2fff64b` and `60c71323` exports,
+baseline first, with copied provisioned dependencies, Node 26.12.1, Vitest
+4.1.12 and TZ=UTC:
+
+| RecoveryArchives test file | Baseline | Candidate |
+|---|---:|---:|
+| Cases, all passing | 28 | 57 |
+| File test time | 944 ms | 2,268 ms |
+| Vitest total | 4.95 s | 8.35 s |
+| Command wall | 7.553 s | 10.765 s |
+
+Command: `npx --no-install vitest run src/components/RecoveryArchives.test.tsx`
+from each export's web directory. Candidate includes 29 added cases; these are
+single sequential samples, not an identical-case comparison or a CI benchmark.
+Filesystem/dependency-copy warming and cache hit rates were uncontrolled.
+Hosted critical path, queue, cache and rerun costs remain unmeasured. The new
+M3 routine native fixture had no pre-existing case comparator; its driver
+preparation cost is reported in the E5 record. Worker command callbacks can
+assign fresh Go cache directories, so those preparation timings do not predict
+hosted CI cache behavior. Full inherited store-it timing and required exact-head
+API/repo checks remain landing obligations.
 
 ### Parent acceptance
 
