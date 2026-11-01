@@ -487,6 +487,8 @@ func (h *Handler) RerunJudge(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "run judging is disabled")
 		case errors.Is(err, workersvc.ErrNoAnthropicToken):
 			httpx.Error(w, http.StatusUnprocessableEntity, "add an Anthropic token before running the judge")
+		case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
+			httpx.JSON(w, http.StatusUnprocessableEntity, codexPoolUnavailableBody())
 		case errors.Is(err, workersvc.ErrNoCredentialForHarness):
 			// PRD #1429 M3 (D4): the judge INHERITS the target run's harness explicitly; if
 			// that harness is no longer usable, creation refuses with no fallback. Same 422
