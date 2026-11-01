@@ -159,25 +159,39 @@ func TestHarnessOverflowOffPreservesResolverMatrix(t *testing.T) {
 
 func TestHarnessOverflowCodexEvidence(t *testing.T) {
 	for _, reason := range []codexselect.Reason{codexselect.ReasonAuto, codexselect.ReasonBestOfPool, codexselect.ReasonPoolStale, codexselect.ReasonPoolExhausted, codexselect.ReasonPoolEmpty, "default"} {
-		c := codexselect.Candidate{Structural: true, Score: 48, ScoreKnown: true}
-		e := codexOverflowEvidence(c, reason)
-		if !e.Measured.Valid || e.Measured.Float64 != 48 {
-			t.Fatalf("%s lost actual measurement: %+v", reason, e)
+		for _, destination := range []bool{false, true} {
+			c := codexselect.Candidate{Structural: true, Score: 48, ScoreKnown: true}
+			e := codexOverflowEvidence(c, reason, destination)
+			if !e.Measured.Valid || e.Measured.Float64 != 48 {
+				t.Fatalf("%s lost actual measurement: %+v", reason, e)
+			}
+			allowed := reason == codexselect.ReasonAuto || reason == codexselect.ReasonBestOfPool || reason == "default"
+			if e.Destination != allowed || e.comparison().Valid != (!destination || allowed) {
+				t.Fatalf("%s destination=%t evidence=%+v comparison=%+v", reason, destination, e, e.comparison())
+			}
+			c.CapacityExcluded = true
+			e = codexOverflowEvidence(c, reason, destination)
+			comparison := e.comparison()
+			if comparison.Valid != !destination || (comparison.Valid && comparison.Float64 != 0) || e.Measured.Float64 != 48 {
+				t.Fatalf("held %s destination=%t: %+v", reason, destination, e)
+			}
+			c.ScoreKnown = false
+			e = codexOverflowEvidence(c, reason, destination)
+			if e.Measured.Valid || e.comparison().Valid != !destination {
+				t.Fatalf("unknown held %s destination=%t: %+v", reason, destination, e)
+			}
+			c.CapacityExcluded = false
+			if e = codexOverflowEvidence(c, reason, destination); e.comparison().Valid {
+				t.Fatalf("unknown unheld %s destination=%t acquired a comparison", reason, destination)
+			}
 		}
-		want := reason == codexselect.ReasonAuto || reason == codexselect.ReasonBestOfPool || reason == "default"
-		if e.Destination != want {
-			t.Fatalf("%s destination=%v", reason, e.Destination)
-		}
-		c.CapacityExcluded = true
-		e = codexOverflowEvidence(c, reason)
-		if e.comparison().Float64 != 0 || !e.comparison().Valid || e.Measured.Float64 != 48 {
-			t.Fatalf("held %s: %+v", reason, e)
-		}
-		c.ScoreKnown = false
-		e = codexOverflowEvidence(c, reason)
-		if e.Measured.Valid || !e.comparison().Valid {
-			t.Fatalf("unknown held %s: %+v", reason, e)
-		}
+	}
+	unavailable := codexselect.Candidate{Score: 48, ScoreKnown: true}
+	if codexOverflowEvidence(unavailable, "default", true).comparison().Valid {
+		t.Fatal("structurally unavailable destination acquired a comparison")
+	}
+	if !codexOverflowEvidence(unavailable, "default", false).comparison().Valid {
+		t.Fatal("preferred default lost its measured score")
 	}
 }
 

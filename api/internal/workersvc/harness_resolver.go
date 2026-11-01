@@ -733,7 +733,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 				return store.Run{}, resolvedHarness{}, err
 			}
 		}
-		ce := codexOverflowEvidence(pick.Candidate, pick.Reason)
+		ce := codexOverflowEvidence(pick.Candidate, pick.Reason, d.Preferred == HarnessClaude)
 		if d.Preferred == HarnessCodex {
 			d.PreferredEvidence = ce
 		} else {

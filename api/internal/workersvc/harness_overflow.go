@@ -94,12 +94,19 @@ func (d *harnessCreationDecision) chosen() Harness {
 	return HarnessClaude
 }
 
-func codexOverflowEvidence(c codexselect.Candidate, reason codexselect.Reason) overflowEvidence {
-	return overflowEvidence{
+func codexOverflowEvidence(c codexselect.Candidate, reason codexselect.Reason, destination bool) overflowEvidence {
+	e := overflowEvidence{
 		Measured:    pgtype.Float8{Float64: c.Score, Valid: c.ScoreKnown},
 		Held:        c.CapacityExcluded,
 		Destination: c.Structural && (reason == codexselect.ReasonAuto || reason == codexselect.ReasonBestOfPool || string(reason) == "default"),
 	}
+	if destination && (!e.Destination || e.Held) {
+		// Only an admissible receiver has a comparison score. Keep the raw
+		// measurement separately; held=0 is a preferred-side exception.
+		e.hasValue = true
+		e.value = pgtype.Float8{}
+	}
+	return e
 }
 
 // claudeOverflowEvidence enumerates the complete enabled set, including unpooled
@@ -229,7 +236,7 @@ func (s *Service) evaluateCreationOverflow(ctx context.Context, q *store.Queries
 			return res, nil, e
 		}
 		pick = &picked
-		ce = codexOverflowEvidence(picked.Candidate, picked.Reason)
+		ce = codexOverflowEvidence(picked.Candidate, picked.Reason, res.Harness == HarnessClaude)
 		choice := *codex.Codex
 		choice.SecretID = picked.AliasID
 		codex.Codex = &choice
@@ -255,7 +262,7 @@ func (s *Service) evaluateCreationOverflow(ctx context.Context, q *store.Queries
 		// still the selected account's reading (reauth makes that unknown).
 		picked.Candidate.Structural = codexPoolRowStructural(r)
 		pick = &picked
-		ce = codexOverflowEvidence(picked.Candidate, picked.Reason)
+		ce = codexOverflowEvidence(picked.Candidate, picked.Reason, res.Harness == HarnessClaude)
 	}
 	claude, e := s.claudeOverflowEvidence(ctx, q, userID, s.selectionNow(), res.Harness == HarnessCodex)
 	if e != nil {
