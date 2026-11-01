@@ -1,6 +1,6 @@
 # ADR-3105: Closed custody is refusal evidence for bindingless recovery
 
-**Status**: Accepted design; final regression and mutation validation pending.
+**Status**: Accepted.
 **Date**: 2026-11-01
 **Issue**: [#3105](https://github.com/vtmocanu/uzi/issues/3105)
 
@@ -95,10 +95,62 @@ ordering remains [#3754](https://github.com/vtmocanu/uzi/issues/3754). The paren
 [prerequisite-closure PRD](../prds/2506-prerequisite-closure.md) is not completed
 by this issue.
 
-Final red/green and mutation evidence is still pending. Local full-module API
-dead-code analysis was canceled twice for memory pressure and remains unverified;
+The isolated regression and mutation proofs were executed at runtime/test revision
+`aa0b83adf73c9ca62bafe042043a059fb4dac811`, against the unfixed baseline above.
+Candidate controls passed; baseline no-FINAL and ambiguous-custody cases failed
+the intended behavioral assertions. Every candidate mutant compiled or typechecked
+before failing its intended assertion: selecting one row as unique, filtering open
+or invalid-provenance siblings before counting, granting ACK/retirement from
+closure, and suppressing matching thin-FINAL replay. The ACK and actual journal
+retirement variants separately exercised cleanup and retained-tree checks. The
+matching positive control persisted its original ACK without reading capture status.
+All mutation changes stayed in disposable exports.
+
+The API baseline used an export-only capability-name alias to its existing V2
+value; its production route and SQL stayed unchanged. The worker baseline ran the
+backported behavioral probes with tsx; compiling those new test typings against
+its absent APIs is not a claimed compatibility check.
+
+Local full-module API dead-code analysis was canceled twice for memory pressure
+and remains unverified;
 it must not be reported as passed. Other canonical API constituents passed
 serially with `UZI_TEST_DATABASE_URL` unset. Exact-head `lint-api` dead-code,
 full agent/API/repository CI, inherited store-it sweep and hosted job timing remain
 mandatory before merge. Local focused checks do not establish hosted latency or
-full compose acceptance.
+full compose acceptance. Compose phase 72 (`custody-lifecycle`) was not run.
+
+### Local timing record
+
+These are affected-test proxies, not full CI jobs or hosted latency measurements.
+
+| Workload | Baseline | Candidate |
+|---|---:|---:|
+| Existing worker exact-read and discovery-cost tests, seven tests | 6.741s | 6.998s |
+| Existing API exact-route and closure replay controls, nine named results | 23.267s | 17.983s |
+
+The worker sample compared the baseline with `568d4a46`; the API sample compared
+it with `aa0b83ad`. Shipped runtime code is identical at those candidate revisions.
+Each row is one local serial sample, with matching executed names and zero skips.
+Node was v26.12.1 with provisioned dependencies; OS/tsx caches were not controlled.
+The additional 40-test worker regression file took 25.469s at `aa0b83ad`, separate
+from the unchanged seven-test comparison. The historical-reader proof is a
+standalone check, outside the ordinary agent test-file inventory.
+
+The API command ran from `api/` with race, uncached tests, serial package builds
+and build-VCS discovery disabled:
+
+```sh
+go test -race -count=1 -p=1 -buildvcs=false -timeout=5m -v -run '^(TestExactRecoveryHoldRouteLiveDB|TestRecoveryClosureFinalReplayNeedsNoForgeLiveDB)$' ./internal/handler ./internal/recovery
+```
+
+Both API samples followed precompilation. The initial candidate precompilation
+was 330.363s; baseline/candidate timing precompilation was 167.042s/140.851s.
+The fixture used PostgreSQL 17, `GOMAXPROCS=2`, `GOMEMLIMIT=4GiB` and
+`GOFLAGS=-p=1`, with run-owned module/build caches and offline module lookup.
+The baseline database had served raw-candidate controls. Its recreated candidate
+fixture was warmed by the comparison workload (29.232s) before measurement.
+Shared module/build caches, different fixture warmups and concurrent host load
+prevent attributing the elapsed difference to implementation performance. These
+figures exclude queueing and do not establish a CI critical-path improvement.
+Exact-head hosted job/critical-path timing remains a landing obligation. No
+workflow, concurrency cap or production wait was changed.
