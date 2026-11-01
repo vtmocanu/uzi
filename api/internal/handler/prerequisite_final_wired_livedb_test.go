@@ -41,6 +41,8 @@ type pinGit struct {
 	hits atomic.Int32
 	// onList runs on every served listing, before the answer (a hook for the lock-bound test).
 	onList func()
+	// onListContext lets shutdown tests stall a real transport until its caller cancels.
+	onListContext func(context.Context)
 }
 
 func (g *pinGit) set(ref, tip string) {
@@ -61,6 +63,7 @@ func (g *pinGit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.hits.Add(1)
 	g.mu.Lock()
 	onList := g.onList
+	onListContext := g.onListContext
 	fail := g.fail
 	names := make([]string, 0, len(g.refs))
 	tips := map[string]string{}
@@ -71,6 +74,9 @@ func (g *pinGit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.mu.Unlock()
 	if onList != nil {
 		onList()
+	}
+	if onListContext != nil {
+		onListContext(r.Context())
 	}
 	if fail {
 		http.Error(w, "synthetic listing failure", http.StatusInternalServerError)
