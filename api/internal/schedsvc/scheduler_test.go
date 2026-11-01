@@ -1535,8 +1535,9 @@ func TestSkipReasonForErr(t *testing.T) {
 	// codex_override_conflict; a PRD #1429 review fix added no_usable_credential; PRD #1732 added
 	// credential_disabled; issue #2853 added harness_label_conflict and harness_label_invalid).
 	// PRD #2865 added the eleven ci_watch reasons (ci_green .. ci_config_changed).
-	if len(AllSkipReasons) != 25 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 25", len(AllSkipReasons))
+	// Issue #3719 added codex_pool_unavailable.
+	if len(AllSkipReasons) != 26 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 26", len(AllSkipReasons))
 	}
 }
 

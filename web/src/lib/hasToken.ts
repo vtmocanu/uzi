@@ -39,14 +39,33 @@ export function showsRunAccounts(counts: { claude: number; codex: number }): boo
   return counts.claude + counts.codex > 1;
 }
 
-// isCodexUsable mirrors the server's D11 Codex-availability rule EXACTLY (PRD #1429
-// D3, api/internal/workersvc/harness_resolver.go resolveUsableCodexCredential): a
-// subscription (codex_auth) default is usable ONLY when linked (codex_status ===
-// "linked"); an api_key (openai_api_key) default is usable by mere existence; a
-// failed/missing/unlinked subscription default NEVER falls through to a non-default
-// api key — only the DEFAULT row of either kind is consulted. The web only uses this
-// to hide/explain controls (D3): the server is authoritative regardless.
-export function isCodexUsable(secrets: SecretMeta[]): boolean {
+// isCodexUsable approximates the server's Codex-availability rule from the facts the
+// client holds (PRD #1429 D3, api/internal/workersvc/harness_resolver.go
+// resolveUsableCodexCredential; issue #3719 for the pool). The SERVER IS AUTHORITATIVE:
+// quarantine and re-login-required live only server-side, so a pooled login this reads as
+// usable can still be refused. The web uses this only to hide or explain controls (D3).
+//
+// Two rules, picked by the user's codex_account_mode:
+//   - POOL RULE: mode "auto" and at least one codex_auth login pooled (auto_eligible,
+//     disabled ones included). Codex is usable iff some pooled login is enabled and linked.
+//     The default is NOT consulted: with pooled logins and none eligible the server falls
+//     an implicit run back to Claude and refuses an explicit Codex request.
+//   - DEFAULT RULE (mode "default", mode unknown, or auto with nothing pooled): a
+//     subscription (codex_auth) default is usable ONLY when linked; an api_key
+//     (openai_api_key) default is usable by mere existence; a failed/missing/unlinked
+//     subscription default NEVER falls through to a non-default api key — only the
+//     DEFAULT row of either kind is consulted.
+//
+// `mode` is optional: a caller that has not loaded the user's settings passes undefined
+// and gets the default rule, which is today's behaviour and the server's own answer for
+// every user who never chose "auto".
+export function isCodexUsable(secrets: SecretMeta[], mode?: string | null): boolean {
+  if (mode === "auto") {
+    const pooled = secrets.filter((s) => s.kind === "codex_auth" && s.auto_eligible);
+    if (pooled.length > 0) {
+      return pooled.some((s) => s.enabled !== false && s.codex_status === "linked");
+    }
+  }
   const sub = secrets.find((s) => s.kind === "codex_auth" && s.is_default);
   if (sub) return sub.codex_status === "linked";
   return secrets.some((s) => s.kind === "openai_api_key" && s.is_default);
@@ -64,6 +83,6 @@ export function hasAnyCodexCredential(secrets: SecretMeta[]): boolean {
 // hasUsableCredential is "a usable credential for AT LEAST ONE harness" — the onboarding
 // checklist's DONE condition (PRD #1429 M4a, Dashboard): a Codex-only user has already
 // completed the "connect a credential" step even with zero Anthropic tokens.
-export function hasUsableCredential(secrets: SecretMeta[]): boolean {
-  return hasAnthropicToken(secrets) || isCodexUsable(secrets);
+export function hasUsableCredential(secrets: SecretMeta[], codexMode?: string | null): boolean {
+  return hasAnthropicToken(secrets) || isCodexUsable(secrets, codexMode);
 }

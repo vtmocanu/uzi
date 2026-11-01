@@ -201,7 +201,7 @@ func (e *Scheduler) fireSelfImprove(ctx context.Context, sched store.RunSchedule
 		if holdsOnceCredentialDisabled(sched, err) {
 			return FireOutcome{}, err
 		}
-		if reason, ok := skipReasonForErr(err); ok && reason == SkipCredentialDisabled {
+		if reason, ok := skipReasonForErr(err); ok && (reason == SkipCredentialDisabled || reason == SkipCodexPoolUnavailable) {
 			e.logger.Info("scheduler: self_improve fire skipped", "schedule", sched.ID.String(), "reason", err)
 			return FireOutcome{Matched: 1, Skips: []Skip{{Reason: reason}}}, nil
 		}

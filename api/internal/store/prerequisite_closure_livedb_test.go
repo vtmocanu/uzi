@@ -85,14 +85,14 @@ func prerequisiteInvoke(t *testing.T, ctx context.Context, f prerequisiteFixture
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
-	// Rollback fixtures stop at 00387. Lock only the stable identity here: the current
-	// generated full-run projection can include columns introduced by later migrations.
-	var runID uuid.UUID
-	err = tx.QueryRow(ctx, "SELECT id FROM runs WHERE id=$1 FOR KEY SHARE", f.run).Scan(&runID)
-	if err != nil {
+	// Take LockPrerequisiteRun's row lock by id only: the migration round-trip calls this at
+	// schema 387, where a generated `SELECT *` would name runs columns later migrations add.
+	// The generated query itself is exercised by the repair, budget and handler tests.
+	var lockedRun uuid.UUID
+	if err = tx.QueryRow(ctx, "SELECT id FROM runs WHERE id = $1 FOR KEY SHARE", f.run).Scan(&lockedRun); err != nil {
 		t.Fatal(err)
 	}
-	if runID != f.run {
+	if lockedRun != f.run {
 		t.Fatal("wrong run")
 	}
 	h, err := q.LockPrerequisiteHold(ctx, f.hold)

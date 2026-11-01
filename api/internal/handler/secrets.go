@@ -647,6 +647,11 @@ func (h *Handler) PatchAnthropicTokenAutoEligible(w http.ResponseWriter, r *http
 			}
 			return gerr
 		}
+		if cur.Kind != store.KindAnthropicToken {
+			// Another kind's id (a codex_auth or openai_api_key alias): 404, never the
+			// 500 the kind-scoped write below would otherwise surface as ErrNoRows.
+			return nil
+		}
 		found = true
 		disabledAt = cur.DisabledAt
 		if cur.DisabledAt.Valid && *req.AutoEligible {
