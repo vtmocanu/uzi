@@ -7113,13 +7113,55 @@ export class GitCache {
     return "confirmed";
   }
 
+  /**
+   * Persist worker-trusted negative findings independently of a remediation decision.
+   * The caller holds source-use authority. One locked write, no retries; any failure
+   * propagates so the caller retains the source epoch until independently confirmed.
+   * Candidate coverage proves only Q -> C, never ownership or execution authority for C.
+   */
+  async recordRemediationRestrictions(barePath: string, branch: string,
+    source: { runId: string; clonePath: string; attemptId: string },
+    scan: { trusted: boolean; tip: string; flaggedOIDs: readonly string[] },
+    durability: MemoryParkDurability = {}): Promise<void> {
+    scan = { ...scan, flaggedOIDs: [...new Set(scan.flaggedOIDs)] };
+    if (!scan.trusted) return;
+    await this.withLock(barePath, async () => {
+      const stored = await this.remediationSourceUnderLock(barePath, branch, source);
+      let r = stored.journal.remediationRecovery;
+      if (r && r.blocked !== false) throw new Error("remediation record is custody only");
+      if (!scan.flaggedOIDs.length) return;
+      if (!r) {
+        const tip = await this.worktreeHead(source.clonePath);
+        if (!tip || (await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId, tip)).kind !== "owned")
+          throw new Error("remediation restriction enrollment tip not owned");
+        r = { version: 1, ...source, branch, sequence: 0, ownedTip: tip,
+          flaggedOIDs: [], edges: [], blocked: false };
+      }
+      const candidate = { ...r, flaggedOIDs: [...new Set([...r.flaggedOIDs, ...scan.flaggedOIDs])] };
+      // Preflight the complete bounded body before doing per-finding Git work.
+      // Denial preserves the old complete body, including prepared edges and grants.
+      try { parseRemediationRecovery(candidate); }
+      catch (error) {
+        await this.blockRemediationUnderLock(barePath, branch, source, durability);
+        throw error;
+      }
+      await this.requireOwedCommit(barePath, scan.tip);
+      for (const q of scan.flaggedOIDs) {
+        await this.requireOwedCommit(barePath, q);
+        if (await this.ancestry(barePath, q, scan.tip) !== "ancestor")
+          throw new Error("remediation finding not reachable");
+      }
+      await this.writeRemediationUnderLock(barePath, branch, stored, candidate, durability);
+    });
+  }
+
   /** Trusted worker scan/decision seam. A request or untrusted finding never opens a grant.
    * The caller holds the existing source-use authority transaction; this method takes the bare lock. */
   async recordRemediationScan(barePath: string, branch: string,
     source: { runId: string; clonePath: string; attemptId: string },
     scan: { trusted: boolean; tip: string; flaggedOIDs: readonly string[]; origin?: RemediationGrant["origin"] },
     durability: MemoryParkDurability = {}): Promise<void> {
-    scan = { ...scan, flaggedOIDs: [...scan.flaggedOIDs] };
+    scan = { ...scan, flaggedOIDs: [...new Set(scan.flaggedOIDs)] };
     if (!scan.trusted) return;
     await this.withLock(barePath, async () => {
       const stored = await this.remediationSourceUnderLock(barePath, branch, source);
@@ -7135,6 +7177,10 @@ export class GitCache {
       let sequence = r.sequence;
       if (scan.flaggedOIDs.length) {
         if (!scan.origin) throw new Error("remediation origin required");
+        if (flags.length > 64) {
+          await this.blockRemediationUnderLock(barePath, branch, source, durability);
+          throw new Error("invalid remediation recovery");
+        }
         for (const q of scan.flaggedOIDs) {
           await this.requireOwedCommit(barePath, q);
           if (await this.ancestry(barePath, q, scan.tip) !== "ancestor") throw new Error("remediation finding not reachable");

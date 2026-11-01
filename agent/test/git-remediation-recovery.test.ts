@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { parseRecoveryJournal as oldParse } from "./fixtures/base-parse-recovery-journal.js";
 import { createHash } from "node:crypto";
-import { GitCache, type FetchAgentBranchOptions, type PositiveOwedCandidateContext } from "../src/git.js";
+import { GitCache, type FetchAgentBranchOptions, type PositiveOwedCandidateContext, type RemediationRecovery } from "../src/git.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
@@ -1067,4 +1067,165 @@ test("same-source lifecycle writes cannot clear denial or upgrade legacy evidenc
   write(complete);
   await assert.rejects(internal.writeRecovery(bare, BRANCH, legacy), /metadata loss/);
   assert.deepEqual(journal(), complete);
+});
+
+test("restriction writer: first enrollment retains flags without rewrite or adoption authority", async () => {
+  const q = commit("negative enrollment"); await fetch();
+  const scan = { trusted: true, tip: q, flaggedOIDs: [q, q] };
+  await cache.recordRemediationRestrictions(bare, BRANCH, source(), scan);
+  assert.deepEqual(journal().remediationRecovery, { version: 1, ...source(), branch: BRANCH,
+    sequence: 0, ownedTip: q, flaggedOIDs: [q], edges: [], blocked: false });
+  const replacement = commit("ungranted replacement"); await fetch();
+  const evidence = await cache.readRuntimeRemediationRecovery(bare, BRANCH, source());
+  assert.equal(evidence?.ownedTip, replacement);
+  assert.deepEqual(evidence?.edges, []);
+  assert.equal(evidence?.active, undefined);
+  assert.deepEqual(evidence?.flaggedOIDs, [q]);
+  const { iteration } = await captureAdoption([q, replacement], replacement);
+  await refusal(iteration);
+});
+
+test("restriction writer: candidate coverage stays independent of source and refuses bad controls", async () => {
+  const q = git(bare, ...IDENT, "commit-tree", base + "^{tree}", "-p", base, "-m", "candidate only");
+  const c = git(bare, ...IDENT, "commit-tree", base + "^{tree}", "-p", q, "-m", "coverage only");
+  const scan = { trusted: true, tip: c, flaggedOIDs: [q] };
+  await cache.recordRemediationRestrictions(bare, BRANCH, source(), { ...scan, trusted: false });
+  assert.equal(journal().remediationRecovery, undefined);
+  for (const wrong of [{ ...source(), runId: "other" }, { ...source(), attemptId: successorAttempt }])
+    await assert.rejects(cache.recordRemediationRestrictions(bare, BRANCH, wrong, scan), /source binding/);
+  await assert.rejects(cache.recordRemediationRestrictions(bare, BRANCH, source(),
+    { ...scan, tip: base }), /not reachable/);
+  const saved = journal();
+  commit("not yet owned");
+  await assert.rejects(cache.recordRemediationRestrictions(bare, BRANCH, source(), scan), /tip not owned/);
+  git(clone, "update-ref", "refs/heads/" + BRANCH, base);
+  await cache.recordRemediationRestrictions(bare, BRANCH, source(), scan);
+  const r = journal().remediationRecovery;
+  assert.equal(await cache.ancestry(bare, q, base), "divergent");
+  assert.deepEqual(r, { version: 1, ...source(), branch: BRANCH, sequence: 0,
+    ownedTip: base, flaggedOIDs: [q], edges: [], blocked: false });
+  assert.deepEqual((await cache.readRuntimeRemediationRecovery(bare, BRANCH, source()))?.flaggedOIDs, [q]);
+  for (const blocked of [undefined, true]) {
+    const held: RemediationRecovery = { ...r, version: 1, blocked };
+    write({ ...saved, remediationRecovery: held });
+    await assert.rejects(cache.recordRemediationRestrictions(bare, BRANCH, source(), scan), /custody only/);
+    assert.deepEqual(journal().remediationRecovery, JSON.parse(JSON.stringify(held)));
+  }
+});
+
+test("restriction writer: later findings preserve original grant and prepared phases", async () => {
+  const oldQ = commit("original checkpoint finding"); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(),
+    { trusted: true, tip: oldQ, flaggedOIDs: [oldQ], origin: "checkpoint-pending" });
+  const d = commit("later finding", oldQ); await fetch();
+  const before = journal().remediationRecovery;
+  await cache.recordRemediationRestrictions(bare, BRANCH, source(), { trusted: true, tip: d, flaggedOIDs: [d] });
+  assert.deepEqual(journal().remediationRecovery, { ...before, flaggedOIDs: [oldQ, d] });
+  await cache.recordRemediationRestrictions(bare, BRANCH, source(), { trusted: true, tip: d, flaggedOIDs: [] });
+  assert.deepEqual(journal().remediationRecovery.active, before.active);
+  const replacement = commit("rewrite under original grant"); await fetch();
+  const r = await cache.readRuntimeRemediationRecovery(bare, BRANCH, source());
+  assert.deepEqual(r?.active, before.active);
+  assert.deepEqual(r?.edges.map(e => ({ from: e.from, to: e.to, grant: e.grant })),
+    [{ from: d, to: replacement, grant: before.active }]);
+  assert.deepEqual(r?.flaggedOIDs, [oldQ, d]);
+  // A separate prepared snapshot must stay prepared when negative evidence arrives.
+  const complete = journal();
+  const prepared = structuredClone(complete);
+  prepared.remediationRecovery.edges[0].phase = "prepared";
+  write(prepared);
+  const q = git(bare, ...IDENT, "commit-tree", base + "^{tree}", "-p", base, "-m", "later coverage Q");
+  await cache.recordRemediationRestrictions(bare, BRANCH, source(), { trusted: true, tip: q, flaggedOIDs: [q] });
+  assert.deepEqual(journal().remediationRecovery,
+    { ...prepared.remediationRecovery, flaggedOIDs: [oldQ, d, q] });
+  write({ ...complete, remediationRecovery: { ...complete.remediationRecovery, flaggedOIDs: [oldQ, d, q] } });
+  const unsafe = git(bare, ...IDENT, "commit-tree", base + "^{tree}", "-p", replacement, "-p", q, "-m", "excluded Q");
+  assert.equal(await cache.ancestry(bare, oldQ, unsafe), "divergent");
+  assert.equal(await cache.ancestry(bare, d, unsafe), "divergent");
+  let admissions = 0;
+  await assert.rejects(cache.updateRemediationTrackingRef(bare, BRANCH, unsafe,
+    { context: opts.context }, source(), replacement,
+    { trusted: true, admit: async () => { admissions++; return true; } }), /includes excluded history/);
+  assert.equal(admissions, 0);
+  const { iteration } = await captureAdoption([d, replacement], replacement);
+  await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), iteration, successorAttempt, admitSource);
+});
+
+test("restriction writer: failed durability never reports success and new bodies need independent confirmation", async t => {
+  await enroll();
+  const saved = journal();
+  const q = git(bare, ...IDENT, "commit-tree", base + "^{tree}", "-p", base, "-m", "durable negative");
+  const scan = { trusted: true, tip: q, flaggedOIDs: [q] };
+  for (const durability of [
+    ...(["config", "directory"] as const).map(target => ({
+      sync: async (handle: { sync(): Promise<void> }, what: "config" | "directory") => {
+        if (what === target) throw Error(target);
+        await handle.sync();
+      },
+    })),
+    { readback: async () => "" },
+  ]) {
+    write(saved);
+    await assert.rejects(cache.recordRemediationRestrictions(bare, BRANCH, source(), scan, durability));
+    const fresh = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+    assert.deepEqual((await fresh.readRuntimeRemediationRecovery(bare, BRANCH, source()))?.flaggedOIDs, [base, q]);
+  }
+  write(saved);
+  const internal = cache as any, run = internal.runGit.bind(cache);
+  t.mock.method(internal, "runGit", async (dir: string, args: string[]) => {
+    if (args[0] === "config" && args.some(a => a.includes('"remediationRecovery"'))) throw Error("negative write");
+    return run(dir, args);
+  });
+  await assert.rejects(cache.recordRemediationRestrictions(bare, BRANCH, source(), scan), /negative write/);
+  assert.deepEqual(journal(), saved);
+  assert.deepEqual((await cache.readRuntimeRemediationRecovery(bare, BRANCH, source()))?.flaggedOIDs, [base]);
+  await assert.rejects(cache.recordRemediationRestrictions(bare, BRANCH, source(),
+    { ...scan, flaggedOIDs: Array.from({ length: 65 }, (_, i) => (i + 1).toString(16).padStart(40, "0")) }),
+    /negative write/);
+  assert.deepEqual(journal(), saved, "failed denial cannot replace the old complete body");
+});
+
+test("restriction writer: bounded overflow retains old metadata and positive overflow skips per-Q validation", async t => {
+  await enroll();
+  const saved = journal();
+  const flags = Array.from({ length: 65 }, (_, i) => (i + 1).toString(16).padStart(40, "0"));
+  const internal = cache as any, run = internal.runGit.bind(cache);
+  let perFindingCalls = 0;
+  t.mock.method(internal, "runGit", async (dir: string, args: string[]) => {
+    if (args.includes("cat-file") && flags.includes(args.at(-1)!)) perFindingCalls++;
+    return run(dir, args);
+  });
+  for (const positive of [false, true]) {
+    write(saved);
+    await assert.rejects(positive
+      ? cache.recordRemediationScan(bare, BRANCH, source(),
+        { trusted: true, tip: base, flaggedOIDs: flags, origin: "pre-exit" })
+      : cache.recordRemediationRestrictions(bare, BRANCH, source(),
+        { trusted: true, tip: base, flaggedOIDs: flags }), /invalid remediation/);
+    assert.equal(perFindingCalls, 0);
+    assert.deepEqual(journal().remediationRecovery, { ...saved.remediationRecovery, blocked: true });
+  }
+  // Fill a valid old body to six bytes below the UTF-8 ceiling; adding Q must deny,
+  // preserving all old grants and edges rather than truncating them.
+  const large = structuredClone(saved), r = large.remediationRecovery;
+  r.flaggedOIDs = [base, ...flags.slice(0, 62)];
+  r.active.flaggedOIDs = [...r.flaggedOIDs];
+  for (let i = 0; i < 64; i++) {
+    const edge = { from: (i + 100).toString(16).padStart(40, "0"),
+      to: (i + 101).toString(16).padStart(40, "0"), phase: "prepared",
+      context: "context-" + "a".repeat(64) + ".json",
+      grant: { ...r.active, id: i + 2, originSource: { ...source() } } };
+    if (Buffer.byteLength(JSON.stringify({ ...r, sequence: i + 2, edges: [...r.edges, edge] })) > 65530) break;
+    r.edges.push(edge); r.sequence = i + 2;
+  }
+  const padding = 65530 - Buffer.byteLength(JSON.stringify(r));
+  r.edges.at(-1).grant.originSource.clonePath = clone.replace(".attempt-", "x".repeat(padding) + ".attempt-");
+  assert.ok(Buffer.byteLength(r.edges.at(-1).grant.originSource.clonePath) <= 4096);
+  assert.equal(Buffer.byteLength(JSON.stringify(r)), 65530);
+  write(large);
+  await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT);
+  const q = git(bare, ...IDENT, "commit-tree", base + "^{tree}", "-p", base, "-m", "byte overflow Q");
+  await assert.rejects(cache.recordRemediationRestrictions(bare, BRANCH, source(),
+    { trusted: true, tip: q, flaggedOIDs: [q] }), /invalid remediation/);
+  assert.deepEqual(journal().remediationRecovery, { ...r, blocked: true });
 });
