@@ -971,6 +971,100 @@ describe("PRD #88 M6 — RunRunner.askUser", () => {
     assert.strictEqual(arms.at(-1), 1500 - 650, "a new question arms budget minus X+Y only");
   });
 
+  /**
+   * A guarded park emits and flushes its question AFTER the server ACK, while the run is
+   * already parked: that flush time is parked time. Move the interval's opening back after
+   * the guarded emit/flush and this reddens (it would arm 1500).
+   */
+  it("charges the guarded post-ACK question flush to the parked-time budget", async () => {
+    let clockMs = 0;
+    const arms: number[] = [];
+    const runner = runnerFor(askingExecutor(0, { asked: [], verdicts: [] }), {
+      questionTimeoutMs: 1500,
+      now: () => clockMs,
+      setTimer: (_cb, ms) => { arms.push(ms); return () => {}; },
+    });
+    let acked = false;
+    const reportState = async (body: { status?: string }) => {
+      if (body.status === "awaiting_input") acked = true;
+      return { status: body.status, applied: true };
+    };
+    const batcher = {
+      emit: () => {},
+      flush: async () => { if (acked) clockMs += 900; },
+    } as never;
+    const steering = {
+      awaitAnswer: async () => ({ kind: "answer", answers: ["ok"] }) as AnswerVerdict,
+    } as never;
+    const verdict = await (runner as any).parkQuestion(
+      "run-flush", [{ question: "q?", header: "Q" }], "worker", undefined, batcher, steering,
+      reportState, nullLogger(), null, { requireRunning: true },
+    ) as AnswerVerdict;
+    assert.strictEqual(verdict.kind, "answer");
+    assert.deepStrictEqual(arms, [600], "the 900ms post-ACK flush is charged: 1500 - 900");
+  });
+
+  /**
+   * A credential switch interrupts the answer wait; the executor re-asks. The re-park reuses
+   * the same question id and the interval, so the gap is charged, and nothing leaks afterwards.
+   */
+  it("keeps one parked-time interval across a credential-switch re-ask through execute()", async () => {
+    let clockMs = 0;
+    const arms: number[] = [];
+    const claim = claimFor(3160);
+    const original = SteeringChannel.prototype.awaitAnswer;
+    let waits = 0;
+    let caught = 0;
+    let parks = 0;
+    SteeringChannel.prototype.awaitAnswer = function (this: SteeringChannel, questionId: string) {
+      if (++waits === 1) {
+        clockMs += 900; // parked
+        return Promise.reject(new CredentialSwitchSignal());
+      }
+      return original.call(this, questionId);
+    };
+    api.onState(claim.run_id, (body) => {
+      if (body.status !== "awaiting_input" || !body.open_question_id) return;
+      if (++parks === 1) return; // Q's first park: the stub rejects the wait
+      api.setInputs(claim.run_id, [answerInput(body.open_question_id, "ok")]);
+    });
+    const executor: Executor = {
+      async run(ctx: RunContext) {
+        const qs: AskUserQuestion[] = [{ question: "q?", header: "Q" }];
+        try {
+          await ctx.askUser!(qs);
+        } catch (e) {
+          if (!(e instanceof CredentialSwitchSignal)) throw e;
+          caught++;
+          clockMs += 300; // still parked server-side before the re-park
+        }
+        await ctx.askUser!(qs);
+        commitMarker(ctx.worktreePath, "re-asked");
+        return { branch: ctx.branch };
+      },
+    };
+    const runner = runnerFor(executor, {
+      questionTimeoutMs: 1500,
+      now: () => clockMs,
+      setTimer: (_cb, ms) => { arms.push(ms); return () => {}; },
+    });
+    try {
+      await runner.execute(claim);
+    } finally {
+      SteeringChannel.prototype.awaitAnswer = original;
+    }
+    assert.strictEqual(caught, 1, "the executor observed the CredentialSwitchSignal");
+    const ids = parkedQuestionIds(claim.run_id);
+    assert.strictEqual(ids.length, 2);
+    assert.strictEqual(ids[0], ids[1], "the re-park reuses the SAME question id");
+    assert.deepStrictEqual(arms, [1500, 1500 - 1200]);
+    assert.strictEqual(statuses(claim.run_id).at(-1), "completed");
+    const internal = runner as any;
+    assert.strictEqual(internal.questionParkBudgets.has(claim.run_id), false);
+    assert.strictEqual(internal.openQuestionIds.has(claim.run_id), false);
+    assert.strictEqual(internal.questionCounts.has(claim.run_id), false);
+  });
+
   /** The completion window (ADR-1225 I6) is never charged to the clarification budget. */
   it("closes an open clarification interval at completion-question entry and does not charge the window", async () => {
     let clockMs = 0;

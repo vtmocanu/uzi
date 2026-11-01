@@ -25186,6 +25186,11 @@ export class RunRunner {
         `${REASON_QUESTION_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
       );
     }
+    // The server is parked at awaiting_input from the ACK on, so the budget clock starts here,
+    // before the guarded question's emit/flush (that time is parked, hence charged). The later
+    // openParkCharge for the same id keeps `since` and returns the up-to-date charge.
+    const timeoutMs = questionTimeoutMs(config, this.questionTimeoutMs);
+    if (timeoutMs > 0) this.openParkCharge(runId, questionId);
     if (options.requireRunning) {
       emitQuestion();
       await batcher.flush().catch(() => undefined);
@@ -25236,11 +25241,10 @@ export class RunRunner {
       return v;
     };
 
-    const timeoutMs = questionTimeoutMs(config, this.questionTimeoutMs);
     if (timeoutMs <= 0) return settle(await steering.awaitAnswer(questionId));
 
-    // Only parked time is charged (issue #3140): open the interval now that the park is
-    // acknowledged. The same question id continues its interval (a same-id re-park keeps the
+    // Only parked time is charged (issue #3140): the interval was opened at the ACK above.
+    // The same question id continues its interval (a same-id re-park keeps the
     // server at awaiting_input, so the gap is parked time too); a different id closes the old one.
     const remaining = Math.max(0, timeoutMs - this.openParkCharge(runId, questionId));
     let cancel: (() => void) | undefined;
