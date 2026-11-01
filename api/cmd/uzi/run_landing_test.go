@@ -56,14 +56,14 @@ func TestRunGetLandingStatusAndHint(t *testing.T) {
 	data := []byte("bundle")
 	fc := &uzicli.FakeClient{
 		RunByID: map[string]apitypes.RunDTO{
-			"nl":    {ID: "nl", Kind: "issue", Status: "failed", LandingState: "needs_landing"},
-			"unrec": {ID: "unrec", Kind: "issue", Status: "failed", LandingState: "unrecoverable"},
-			"plain": {ID: "plain", Kind: "issue", Status: "failed", LandingState: "none"},
+			"00000000-0000-0000-0000-000000000011": {ID: "00000000-0000-0000-0000-000000000011", Kind: "issue", Status: "failed", LandingState: "needs_landing"},
+			"unrec":                                {ID: "unrec", Kind: "issue", Status: "failed", LandingState: "unrecoverable"},
+			"plain":                                {ID: "plain", Kind: "issue", Status: "failed", LandingState: "none"},
 		},
 		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
 			// Only the human-landable run has an available capture — the recovery-summary block
 			// surfaces its id, and the hint below points at `uzi run export`.
-			"nl": {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{availableCapture("cap-1", data)}},
+			"00000000-0000-0000-0000-000000000011": {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{availableCapture("cap-1", data)}},
 		},
 	}
 	for _, tc := range []struct {
@@ -71,7 +71,7 @@ func TestRunGetLandingStatusAndHint(t *testing.T) {
 		wantWord string
 		wantHint bool
 	}{
-		{"nl", "needs landing", true},
+		{"00000000-0000-0000-0000-000000000011", "needs landing", true},
 		{"unrec", "failed", false},
 		{"plain", "failed", false},
 	} {
@@ -104,32 +104,32 @@ func TestRunGetLandingHintByRecoverability(t *testing.T) {
 		RunByID: map[string]apitypes.RunDTO{
 			// Preserved-patch-only: needs_landing, a preserved diff, and NO available archive
 			// (absent from RecoverySummaries → the fake returns the empty summary).
-			"pp": {ID: "pp", Kind: "issue", Status: "failed", LandingState: "needs_landing", PreservedPatch: &patch},
+			"00000000-0000-0000-0000-000000000012": {ID: "00000000-0000-0000-0000-000000000012", Kind: "issue", Status: "failed", LandingState: "needs_landing", PreservedPatch: &patch},
 			// Neither an archive nor a preserved diff visible to this reader (a still-preparing
 			// capture / transient fetch miss) — the server still derived needs_landing.
-			"none": {ID: "none", Kind: "issue", Status: "failed", LandingState: "needs_landing"},
+			"00000000-0000-0000-0000-000000000016": {ID: "00000000-0000-0000-0000-000000000016", Kind: "issue", Status: "failed", LandingState: "needs_landing"},
 		},
 	}
 
-	ppOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "pp")
+	ppOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "00000000-0000-0000-0000-000000000012")
 	if code != uzicli.ExitOK {
 		t.Fatalf("run get pp exit = %d, want 0", code)
 	}
-	if !strings.Contains(ppOut, "`uzi run get pp --field preserved_patch`") {
+	if !strings.Contains(ppOut, "`uzi run get 00000000-0000-0000-0000-000000000012 --field preserved_patch`") {
 		t.Errorf("preserved-patch-only run must point at --field preserved_patch:\n%s", ppOut)
 	}
-	if strings.Contains(ppOut, "uzi run export pp") {
+	if strings.Contains(ppOut, "uzi run export 00000000-0000-0000-0000-000000000012") {
 		t.Errorf("preserved-patch-only run must NOT name `uzi run export` (it exports archives only):\n%s", ppOut)
 	}
 
-	noneOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "none")
+	noneOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "00000000-0000-0000-0000-000000000016")
 	if code != uzicli.ExitOK {
 		t.Fatalf("run get none exit = %d, want 0", code)
 	}
-	if !strings.Contains(noneOut, "`uzi run recovery none`") {
+	if !strings.Contains(noneOut, "`uzi run recovery 00000000-0000-0000-0000-000000000016`") {
 		t.Errorf("needs_landing run with neither archive nor patch must fall back to `uzi run recovery`:\n%s", noneOut)
 	}
-	if strings.Contains(noneOut, "uzi run export none") {
+	if strings.Contains(noneOut, "uzi run export 00000000-0000-0000-0000-000000000016") {
 		t.Errorf("fallback hint must NOT name `uzi run export`:\n%s", noneOut)
 	}
 }
@@ -144,16 +144,16 @@ func TestRunGetLandingHintMultipleArchives(t *testing.T) {
 	b := []byte("bundle-b")
 	fc := &uzicli.FakeClient{
 		RunByID: map[string]apitypes.RunDTO{
-			"multi": {ID: "multi", Kind: "issue", Status: "failed", LandingState: "needs_landing"},
-			"sole":  {ID: "sole", Kind: "issue", Status: "failed", LandingState: "needs_landing"},
+			"00000000-0000-0000-0000-000000000013": {ID: "00000000-0000-0000-0000-000000000013", Kind: "issue", Status: "failed", LandingState: "needs_landing"},
+			"00000000-0000-0000-0000-000000000014": {ID: "00000000-0000-0000-0000-000000000014", Kind: "issue", Status: "failed", LandingState: "needs_landing"},
 		},
 		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
-			"multi": {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{availableCapture("cap-a", a), availableCapture("cap-b", b)}},
-			"sole":  {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{availableCapture("cap-only", a)}},
+			"00000000-0000-0000-0000-000000000013": {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{availableCapture("cap-a", a), availableCapture("cap-b", b)}},
+			"00000000-0000-0000-0000-000000000014": {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{availableCapture("cap-only", a)}},
 		},
 	}
 
-	multiOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "multi")
+	multiOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "00000000-0000-0000-0000-000000000013")
 	if code != uzicli.ExitOK {
 		t.Fatalf("run get multi exit = %d, want 0", code)
 	}
@@ -165,17 +165,17 @@ func TestRunGetLandingHintMultipleArchives(t *testing.T) {
 		t.Errorf("multi-archive hint must list the available capture ids:\n%s", multiOut)
 	}
 	// The bare, guess-required command must NOT be suggested as-is.
-	if strings.Contains(multiOut, "`uzi run export multi`\n") {
-		t.Errorf("multi-archive hint must not suggest the bare `uzi run export multi` the CLI would reject:\n%s", multiOut)
+	if strings.Contains(multiOut, "`uzi run export 00000000-0000-0000-0000-000000000013`\n") {
+		t.Errorf("multi-archive hint must not suggest the bare `uzi run export 00000000-0000-0000-0000-000000000013` the CLI would reject:\n%s", multiOut)
 	}
 
-	soleOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "sole")
+	soleOut, _, code := runCLI(t, fakeEnv(fc), "run", "get", "00000000-0000-0000-0000-000000000014")
 	if code != uzicli.ExitOK {
 		t.Fatalf("run get sole exit = %d, want 0", code)
 	}
 	// A sole available capture auto-selects, so the plain command stays and no --capture is forced.
-	if !strings.Contains(soleOut, "`uzi run export sole`") {
-		t.Errorf("sole-archive hint must keep the plain `uzi run export sole`:\n%s", soleOut)
+	if !strings.Contains(soleOut, "`uzi run export 00000000-0000-0000-0000-000000000014`") {
+		t.Errorf("sole-archive hint must keep the plain `uzi run export 00000000-0000-0000-0000-000000000014`:\n%s", soleOut)
 	}
 	if strings.Contains(soleOut, "--capture") {
 		t.Errorf("sole-archive hint must not force --capture:\n%s", soleOut)
@@ -187,16 +187,16 @@ func TestRunGetLandingHintMultipleArchives(t *testing.T) {
 func TestRunGetLandingHintNamesRun(t *testing.T) {
 	data := []byte("bundle")
 	fc := &uzicli.FakeClient{
-		RunByID: map[string]apitypes.RunDTO{"landme": {ID: "landme", Kind: "issue", Status: "failed", LandingState: "needs_landing"}},
+		RunByID: map[string]apitypes.RunDTO{"00000000-0000-0000-0000-000000000015": {ID: "00000000-0000-0000-0000-000000000015", Kind: "issue", Status: "failed", LandingState: "needs_landing"}},
 		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
-			"landme": {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{availableCapture("cap-1", data)}},
+			"00000000-0000-0000-0000-000000000015": {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{availableCapture("cap-1", data)}},
 		},
 	}
-	out, _, code := runCLI(t, fakeEnv(fc), "run", "get", "landme")
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "get", "00000000-0000-0000-0000-000000000015")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(out, "landable by hand") || !strings.Contains(out, "`uzi run export landme`") {
+	if !strings.Contains(out, "landable by hand") || !strings.Contains(out, "`uzi run export 00000000-0000-0000-0000-000000000015`") {
 		t.Errorf("hint missing or does not name the run + export command:\n%s", out)
 	}
 	// The capture id is surfaced by the recovery-summary block (no new capture plumbing).

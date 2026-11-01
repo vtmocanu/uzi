@@ -46,9 +46,9 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 		Long: "Without a run id, show your open custody holds across all runs, oldest first, " +
 			"with exact run and hold ids, disposition, archive availability, worker, age, and the " +
 			"owner-wide custody summary. With a run id, show that run's retained holds: each hold's exact id, " +
-			"claim generation, server-derived disposition, and the latest capture's state.\n\n" +
+			"claim generation, server-derived disposition, the latest capture state, and retained captures' recorded prerequisite pins.\n\n" +
 			"Owner-only: you see only your own runs' holds. An `archive_ready` hold has a recovery " +
-			"archive: recover it with `run export`. An unguarded hold can release when the archive is " +
+			"archive: download it with `run export`; thin archives also require external commits and destination import verification. An unguarded hold can release when the archive is " +
 			"durable; guarded inventory requires verified final coverage or an explicit disposition. " +
 			"Eligible guarded COMPLETED issue/mr_rework/self_improve runs may instead release after " +
 			"the API proves publication of the fixed final SHA on the branch and MR. This exception " +
@@ -70,7 +70,7 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"Without a run id, --json emits the entire owner-wide aggregate and holds DTO, " +
 			"including settled holds. With a run id, --json emits each of the run's hold DTOs " +
 			"plus a `captures` array listing that hold's " +
-			"recovery captures (id, state, source_sha, byte_size, created_at); a capture id is what " +
+			"recovery captures (id, state, source_sha, byte_size, created_at, checksum, ordered prerequisites, expiry, attempted head and optional prerequisite_closure); a capture id is what " +
 			"`run export --capture` takes. A hold that outlived its deleted run lists `captures: []`.\n\n" +
 			"While the server retains the run's last published checkpoint on origin, the hold also " +
 			"names where it lives: `refs/uzi-checkpoints/<checkpoint-key>`, or `refs/uzi-recovery/<run-id>` " +
@@ -122,10 +122,10 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			// --json joins each hold's captures (#1417) so an agent reads the capture ids as
-			// data. The human table needs no archives read; a run with no holds
-			// has nothing to join onto, so it skips the archives read too.
+			// data. Human output uses the same read for recorded pin observations.
+			// A run with no holds has nothing to join onto.
 			var archives []apitypes.RecoveryArchiveDTO
-			if gf.json && len(forRun) > 0 {
+			if len(forRun) > 0 {
 				summary, err := c.RecoveryArchives(cmd.Context(), runID)
 				switch {
 				case uzicli.ExitCodeFor(err) == uzicli.ExitNotFound:
@@ -134,7 +134,10 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 					// run whose archives read 404s. Degrade to every hold listing no captures
 					// rather than failing the whole listing.
 				case err != nil:
-					return err
+					if gf.json {
+						return err
+					}
+					_, _ = fmt.Fprintln(env.Stderr, "warning: capture and prerequisite-pin metadata unavailable; protection unknown; custody remains as listed")
 				default:
 					archives = summary.Archives
 				}
@@ -375,11 +378,16 @@ func printRecoveryHint(p *uzicli.Printer, exportable, decisionNeeded int, runArg
 // recoveryHoldCapture is one capture listed under its hold in `run recovery --json` (#1417):
 // the metadata an agent needs to pick a capture for `run export --capture`, nothing more.
 type recoveryHoldCapture struct {
-	ID        string    `json:"id"`
-	State     string    `json:"state"`
-	SourceSha string    `json:"source_sha"`
-	ByteSize  *int64    `json:"byte_size,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	ID                  string                                   `json:"id"`
+	State               string                                   `json:"state"`
+	SourceSha           string                                   `json:"source_sha"`
+	ByteSize            *int64                                   `json:"byte_size,omitempty"`
+	CreatedAt           time.Time                                `json:"created_at"`
+	Checksum            string                                   `json:"checksum,omitempty"`
+	PrerequisiteShas    []string                                 `json:"prerequisite_shas,omitempty"`
+	ExpiresAt           *time.Time                               `json:"expires_at,omitempty"`
+	AttemptedHeadSha    *string                                  `json:"attempted_head_sha,omitempty"`
+	PrerequisiteClosure *apitypes.RecoveryPrerequisiteClosureDTO `json:"prerequisite_closure,omitempty"`
 }
 
 // recoveryHoldJSON is one hold in `run recovery --json`: the hold DTO's keys, flat and
@@ -403,6 +411,8 @@ func holdsWithCaptures(holds []apitypes.RecoveryCustodyHoldDTO, archives []apity
 			}
 			caps = append(caps, recoveryHoldCapture{
 				ID: a.ID, State: a.State, SourceSha: a.SourceSha, ByteSize: a.ByteSize, CreatedAt: a.CreatedAt,
+				Checksum: a.Checksum, PrerequisiteShas: a.PrerequisiteShas, ExpiresAt: a.ExpiresAt,
+				AttemptedHeadSha: a.AttemptedHeadSha, PrerequisiteClosure: a.PrerequisiteClosure,
 			})
 		}
 		out = append(out, recoveryHoldJSON{recoveryOwnerHoldJSON: recoveryOwnerHoldJSON{RecoveryCustodyHoldDTO: h, TerminalRejection: terminalRejectionCopy(h), FailureReason: reasons[h.RunID]}, Captures: caps})
@@ -442,6 +452,16 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 				n, cellText(runID))
 		}
 		return p.JSON(holdsWithCaptures(holds, archives, reasons))
+	}
+	for _, h := range holds {
+		for _, a := range archives {
+			if a.HoldID != h.ID {
+				continue
+			}
+			for _, line := range captureDetailLines(a) {
+				p.Printf("%s\n", line)
+			}
+		}
 	}
 	if len(holds) == 0 {
 		if !gf.quiet {
