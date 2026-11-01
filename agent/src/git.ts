@@ -644,8 +644,43 @@ export interface PublicationCandidate {
   readonly candidate: string;
 }
 
+/**
+ * Ephemeral negative-evidence identity; grants no source use or publication authority.
+ * Live selected-source callers hold source-use A; omission is for held custody only.
+ */
+export interface RemediationRestrictionIdentity {
+  readonly exactRunId: string;
+  readonly workerSelectedSource?: {
+    readonly runId: string;
+    readonly clonePath: string;
+    readonly attemptId: string;
+  };
+}
+
+interface CheckpointPackOptions {
+  defaultBranch?: string;
+  signal?: AbortSignal;
+  deadline?: number;
+  restrictionIdentity?: RemediationRestrictionIdentity;
+}
+
+/** Copy only the identity fields before any await, including waiting for B. */
+function captureRestrictionIdentity(identity?: RemediationRestrictionIdentity): RemediationRestrictionIdentity | undefined {
+  if (identity === undefined) return undefined;
+  try {
+    const selected = identity.workerSelectedSource;
+    return Object.freeze({ exactRunId: identity.exactRunId,
+      ...(selected === undefined ? {} : { workerSelectedSource: Object.freeze({
+        runId: selected.runId, clonePath: selected.clonePath, attemptId: selected.attemptId,
+      }) }) });
+  } catch {
+    throw new ScratchPublicationError("remediation restriction admission unavailable");
+  }
+}
+
 /** Exact transient checkpoint producer inputs; admission grants no publication authority. */
 export interface CheckpointPublicationContext {
+  readonly restrictionFacts?: RemediationRestrictionFacts;
   readonly sourceSha: string;
   readonly candidateSha: string;
   readonly excludeSha: string;
@@ -655,6 +690,7 @@ export interface CheckpointPublicationContext {
 
 /** Freshly verified publication inputs captured under the bare lock. */
 export interface PushPublicationContext {
+  readonly restrictionFacts?: RemediationRestrictionFacts;
   readonly candidateSha: string;
   readonly originalHead: string;
   readonly originalFloor: PublicationFloor;
@@ -3515,7 +3551,9 @@ export class GitCache {
     barePath: string, branch: string, pat: string, repoUrl: string, username?: string,
     publication?: PublicationCandidate,
     beforePush?: (candidateSha: string, context: PushPublicationContext) => Promise<void>,
+    restrictionIdentity?: RemediationRestrictionIdentity,
   ): Promise<void> {
+    const identity = captureRestrictionIdentity(restrictionIdentity);
     const captured = publication && Object.freeze({ ...publication, floor: Object.freeze({ ...publication.floor }) });
     const scope = httpScopeForUrl(repoUrl);
     await this.withLock(barePath, async () => {
@@ -3524,10 +3562,14 @@ export class GitCache {
       // Legacy callers have no claim floor and cannot produce a supersession proof.
       const group = captured ?? { floor: Object.freeze({ kind: "absent" } as const), originalHead: candidate, candidate };
       const remoteFloor = await this.refreshScratchPublicationFloor(barePath, branch, group, pat, scope, username);
-      // Called under bare lock B: the callback must not invoke methods that take B.
+      const restrictionFacts = identity && await this.publicationRestrictionFactsUnderLock(
+        barePath, branch, identity, typeof beforePush === "function");
+      // Called under B: no public B-taking queries or deferred writes. The trusted
+      // guard still judges actual candidate/floors/history and current flight facts.
       await beforePush?.(candidate, Object.freeze({
         candidateSha: candidate, originalHead: group.originalHead,
         originalFloor: group.floor, remoteFloor,
+        ...(restrictionFacts === undefined ? {} : { restrictionFacts }),
       }));
       try {
         await this.runGit(barePath, ["push", "origin", `${candidate}:refs/heads/${branch}`], pat, scope, username);
@@ -7347,6 +7389,21 @@ export class GitCache {
       clonePath: workerSelectedSource.clonePath, attemptId: workerSelectedSource.attemptId };
     return this.withLock(barePath, () => this.remediationRestrictionFactsUnderLock(
       barePath, branch, exactRunId, source, durability));
+  }
+
+  /** Admission consumes fresh negative evidence under B; false blocked is never a grant. */
+  private async publicationRestrictionFactsUnderLock(
+    barePath: string, branch: string, identity: RemediationRestrictionIdentity, hasGuard: boolean,
+  ): Promise<RemediationRestrictionFacts> {
+    try {
+      if (!hasGuard) throw new Error("restriction guard missing");
+      const facts = await this.remediationRestrictionFactsUnderLock(
+        barePath, branch, identity.exactRunId, identity.workerSelectedSource);
+      if (facts.blocked) throw new Error("restriction evidence blocked");
+      return facts;
+    } catch {
+      throw new ScratchPublicationError("remediation restriction admission unavailable");
+    }
   }
 
   /** Shared by worker callbacks that already own B; never reacquire B here. */
@@ -11571,12 +11628,13 @@ export class GitCache {
      *  that is not already contained in it (see {@link buildCheckpointChain}), so the broker sees a
      *  strict descendant of the ref. Optional: absent ⇒ today's raw behaviour. */
     chainFrom?: readonly (string | undefined)[],
-    options: { defaultBranch?: string; signal?: AbortSignal; deadline?: number } = {},
+    options: CheckpointPackOptions = {},
   ): Promise<{
     tipOid: string; pack: Readable; exited: Promise<number>; cancel: () => void;
     replay: () => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void }>;
   } | null> {
     // Snapshot caller-owned producer inputs before entering any asynchronous scope.
+    options = { ...options, restrictionIdentity: captureRestrictionIdentity(options.restrictionIdentity) };
     pinned = pinned && { ...pinned,
       packExcludeShas: pinned.packExcludeShas === undefined ? undefined : Object.freeze([...pinned.packExcludeShas]) };
     const parent = this.recoveryOperation();
@@ -11664,7 +11722,7 @@ export class GitCache {
      *  that is not already contained in it (see {@link buildCheckpointChain}), so the broker sees a
      *  strict descendant of the ref. Optional: absent ⇒ today's raw behaviour. */
     chainFrom?: readonly (string | undefined)[],
-    options: { defaultBranch?: string; signal?: AbortSignal; deadline?: number } = {},
+    options: CheckpointPackOptions = {},
     producerTimeoutMs?: number,
   ): Promise<{
     tipOid: string; pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void>;
@@ -11682,11 +11740,6 @@ export class GitCache {
         throw new ScratchPublicationError("captured checkpoint default is unavailable");
       }
       const excludes = Object.freeze([...(candidate === floor && packExcludes !== undefined ? packExcludes : [floor])]);
-      const context: CheckpointPublicationContext = Object.freeze({
-        sourceSha: source, candidateSha: candidate, excludeSha: floor,
-        packExcludeShas: excludes, ...(defaultBlobSha === undefined ? {} : { defaultBlobSha }),
-      });
-      await beforePack?.(candidate, context);
       this.checkCheckpointCooperation();
       const selected = defaultBlobSha && !(candidate === floor && packExcludes !== undefined)
         ? await this.prepareCheckpointObjects(barePath, candidate, floor, defaultBlobSha) : undefined;
@@ -11695,15 +11748,30 @@ export class GitCache {
       // Preserve #3242's zero-range transport envelope. It is deliberately packed by
       // the legacy producer: blob selection over candidate ^floor would be empty.
       this.checkCheckpointCooperation();
-      const { stdout, exited, cancel, settled } = await this.spawnGit(
-        barePath, selected === undefined ? ["pack-objects", "--revs", "--stdout"] : ["pack-objects", "--stdout"],
-        selected ?? `${candidate}\n${excludes.map((x) => `^${x}\n`).join("")}`, {
-          stdoutCategory: "artifactBytes", stderrMaxBytes: 64 * 1024,
-          // checkpointPack's synthetic recovery scope must not add a producer timeout default.
-          timeoutMs: producerTimeoutMs,
-        },
-      );
-      return { pack: stdout, exited, cancel, settled };
+      const start = async () => {
+        const restrictionFacts = options.restrictionIdentity && await this.publicationRestrictionFactsUnderLock(
+          barePath, branch, options.restrictionIdentity, typeof beforePack === "function");
+        const context: CheckpointPublicationContext = Object.freeze({
+          sourceSha: source, candidateSha: candidate, excludeSha: floor,
+          packExcludeShas: excludes, ...(defaultBlobSha === undefined ? {} : { defaultBlobSha }),
+          ...(restrictionFacts === undefined ? {} : { restrictionFacts }),
+        });
+        // Identity-bound guards own B: no public B-taking queries or deferred writes.
+        // Negative facts alone never grant source use or publication.
+        await beforePack?.(candidate, context);
+        this.checkCheckpointCooperation();
+        const { stdout, exited, cancel, settled } = await this.spawnGit(
+          barePath, selected === undefined ? ["pack-objects", "--revs", "--stdout"] : ["pack-objects", "--stdout"],
+          selected ?? `${candidate}\n${excludes.map((x) => `^${x}\n`).join("")}`, {
+            stdoutCategory: "artifactBytes", stderrMaxBytes: 64 * 1024,
+            // checkpointPack's synthetic recovery scope must not add a producer timeout default.
+            timeoutMs: producerTimeoutMs,
+          },
+        );
+        return { pack: stdout, exited, cancel, settled };
+      };
+      // Release B after starting the producer, before handing out its stream.
+      return options.restrictionIdentity ? this.withLock(barePath, start) : start();
     };
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
