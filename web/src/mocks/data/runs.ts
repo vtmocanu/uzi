@@ -31,7 +31,7 @@ const APPROVAL_NOTIFY_CANDIDATES: Milestone[] = [
 
 // PRD #3244 lead_config demo fixtures. Rule 2 (run-queued: schedule pin, no rows), rule 3
 // (run-done: claimed by a worker that recorded nothing, still showing the schedule pin) and
-// rule 4 (run-failed: a requested-only row, the observed side not reported yet).
+// rule 4 (pool-tuning run: a requested-only row, the observed side not reported yet).
 const LEAD_CONFIG_NO_ROWS: RunLeadConfig = { applicable: true, claim_generation: 0, current: true, phases: [] };
 const LEAD_CONFIG_OPUS_MEDIUM: RunLeadConfig = {
   applicable: true,
@@ -1381,9 +1381,9 @@ export const mockRuns: Run[] = [
     // untouched empty state, "This run hasn't been judged yet.", beside an ENABLED
     // Run judge button.
     //
-    // 🔴 IT EXISTS BECAUSE #119 CONSUMED THE FIXTURE THAT USED TO REACH IT. run-failed
+    // 🔴 IT EXISTS BECAUSE #119 CONSUMED THE FIXTURE THAT USED TO REACH IT. pool-tuning run
     // was the one terminal run with no review, and giving it a scheduled auto-judge
-    // left run-done (review, settled), run-closed (review + running) and run-failed
+    // left run-done (review, settled), closed-MR run (review + running) and pool-tuning run
     // (no review + scheduled) — three of the panel's four states, with the fourth, the
     // control state the PRD promises is UNCHANGED, unreachable in the browser. The
     // regression is invisible to the suite, which mounts JudgePanel against stubbed
@@ -1460,10 +1460,10 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(470),
   },
   {
-    // run-closed: a completed run whose MR was later closed unmerged (PRD #24). It
+    // closed-MR run: a completed run whose MR was later closed unmerged (PRD #24). It
     // renders the muted, struck-through "!8 closed" chip in the runs list, the
     // dashboard, and on its board card.
-    id: "run-closed",
+    id: "c57b3989-105a-4e08-bf74-77ebc28e5a02",
     repo_id: "repo-uzi",
     issue_iid: 12,
     issue_title: "Retry the flaky worker heartbeat probe",
@@ -1532,7 +1532,9 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(120),
   },
   {
-    id: "run-failed",
+    id: "c57b3989-105a-4e08-bf74-77ebc28e5a01",
+    // Committed recovery work is retained for manual landing in the normal demo.
+    landing_state: "needs_landing",
     usage_estimated_tail: demoTailEstimated,
     repo_id: "repo-atlas",
     issue_iid: 7,
@@ -1564,10 +1566,10 @@ export const mockRuns: Run[] = [
     failure_reason: "run timed out after 2h0m0s (RUN_TIMEOUT)",
     // PRD #1867: a promoted salvage, so mock mode shows the Salvage panel's saved state
     // with the fetch command. The ref names this run's own id (the server builds it from the
-    // run's UUID; mock run ids are slugs), because the panel shows the ref and the command
+    // run's UUID), because the panel shows the ref and the command
     // only for refs/uzi-salvage/<this run's id>.
     salvage_state: "promoted",
-    salvage_ref: "refs/uzi-salvage/run-failed",
+    salvage_ref: "refs/uzi-salvage/c57b3989-105a-4e08-bf74-77ebc28e5a01",
     salvage_tip: "9c41e07b2d5a8f3e61b0c7d94a2e5f18b3c6d0a7",
     salvage_expires_at: minsAhead(60 * 24 * 13),
     salvage_last_error: null,
@@ -1632,7 +1634,7 @@ export const mockRuns: Run[] = [
     // repo-only PAT can't push workflow files, so uzi fails the run early with a typed
     // reason and PRESERVES the agent's diff (preserved_patch) for a human to land as a PR.
     // The diff is an in-memory synthetic string, NOT a real workflow file.
-    id: "run-workflow-scope",
+    id: "c57b3989-105a-4e08-bf74-77ebc28e5a03",
     repo_id: "repo-atlas",
     issue_iid: 9,
     issue_title: "Add a main-branch guard workflow",
@@ -2156,8 +2158,8 @@ export const mockRuns: Run[] = [
 ];
 
 mockRuns.push({
-  ...mockRuns.find((r) => r.id === "run-failed")!,
-  id: "run-rejected", issue_iid: 10,
+  ...mockRuns.find((r) => r.id === "c57b3989-105a-4e08-bf74-77ebc28e5a01")!,
+  id: "c57b3989-105a-4e08-bf74-77ebc28e5a04", issue_iid: 10,
   issue_title: "Refresh pool metrics after base update",
   issue_description: "", branch: "agent/issue-10",
   fail_origin: "base_diverged",

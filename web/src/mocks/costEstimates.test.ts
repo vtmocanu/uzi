@@ -18,14 +18,14 @@ it("priced Codex checker fixture matches the independently expected DTO", () => 
 });
 
 it("keeps a visible legacy row and an unavailable mixed row with recorded partial dollars", () => {
-  const legacy = runListItem(mockRuns.find((r) => r.id === "run-closed")!);
+  const legacy = runListItem(mockRuns.find((r) => r.id === "c57b3989-105a-4e08-bf74-77ebc28e5a02")!);
   expect(legacy.usage).toMatchObject({ cost_status: "subscription", cost_usd: 0 });
-  const mixed = runListItem(mockRuns.find((r) => r.id === "run-failed")!);
+  const mixed = runListItem(mockRuns.find((r) => r.id === "c57b3989-105a-4e08-bf74-77ebc28e5a01")!);
   expect(mixed.usage).toMatchObject({ cost_status: "unreported", cost_usd: 0.61 });
 });
 
 it("detail fixtures retain the list cost status and partial amounts", async () => {
-  for (const id of ["run-closed", "run-failed"]) {
+  for (const id of ["c57b3989-105a-4e08-bf74-77ebc28e5a02", "c57b3989-105a-4e08-bf74-77ebc28e5a01"]) {
     const listed = runListItem(mockRuns.find((r) => r.id === id)!);
     const { run } = await mockApi.getRun(id);
     expect(run.usage).toEqual(listed.usage);

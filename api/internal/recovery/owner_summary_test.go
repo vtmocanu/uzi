@@ -64,7 +64,9 @@ func TestOwnerSummarySharedClosureCases(t *testing.T) {
 	}
 	wantNames := []string{"pending", "invoked", "create_unknown", "pinned", "refused", "foreign", "lost", "deleted",
 		"absence-unconfirmed", "cleanup-exhausted", "both-flags", "deleted-historical-exhaustion",
-		"thin-no-row", "self-contained", "old-server", "unknown-reason", "non-pinned-absence", "nullable-id-missing", "unknown-state"}
+		"thin-no-row", "self-contained", "old-server", "unknown-reason", "non-pinned-absence", "nullable-id-missing", "unknown-state",
+		"expired-pending", "expired-invoked", "expired-create_unknown", "expired-refused", "expired-foreign", "expired-lost",
+		"discarded-pending", "discarded-invoked", "discarded-create_unknown", "discarded-refused", "discarded-foreign", "discarded-lost"}
 	var names []string
 	for _, tc := range table.Cases {
 		names = append(names, tc.Name)

@@ -1074,6 +1074,175 @@ assign fresh Go cache directories, so those preparation timings do not predict
 hosted CI cache behavior. Full inherited store-it timing and required exact-head
 API/repo checks remain landing obligations.
 
+#### C3 advisory repair evidence (2026-11-01, #3728)
+
+The follow-up confirmed and repaired D1–D5, C1 and C2. An omitted/empty
+prerequisite list means self-contained only with valid bound byte-manifest
+facts; otherwise it is unknown. CLI pending cleanup now requires a pinned
+row on an expired/discarded capture. Human recovery details follow the hold
+table with hold attribution, obey quiet mode, and warn on legacy unlinked
+captures. Relevant mock runs/history use canonical UUIDs while the executable
+command guards stay unchanged. Documentation/skill copy distinguishes byte
+export from prerequisite verification, and JSON pin facts from the smaller
+human capture-choice table. The shared table adds twelve expired/discarded
+non-pinned cases, exercised by Go, CLI and web tests.
+
+Owner-summary LiveDB seeds now use the generated invocation, cleanup,
+reservation, absence and lost/deleted transition methods. A closure-bearing
+capture is discarded with the owner store query and asserted in the complete
+history. The test records the identity-schema limitation: valid sibling rows
+prove isolation, but immutable constraints prevent constructing a mismatched
+closure for the same capture without bypassing guards. Timing substitutions
+remain fixture-only: make scheduling due, and age only the initial absence
+observation through a narrowly checked DBTX clock adapter. That adapter changes
+only the initial timestamp expression of RecordPrerequisiteAbsence; production
+state/generation/pass predicates and the real schema guard remain intact.
+An initial attempt to age an already recorded absence was rejected by the
+immutable-candidate guard; the final fixture does not overwrite it.
+
+Observed regressions failed on the unrepaired CLI and web for manifest,
+cleanup, layout and demo command defects. The final focused Go selection
+passed with race/count flags: apitypes (1.567 s), embedded docs (1.582 s),
+recovery summary/status (1.550 s), CLI recovery/prerequisite/export/landing/
+docs instructions (6.047 s), plus focused vet (`gate-log.viLgAF`). The expanded
+authenticated owner-history LiveDB control passed with zero SKIP (11.238 s
+package; `gate-log.iC7DKY`), including the unchanged two-query/read-only checks.
+The tester callback was cancelled after this completed log; its unfinished
+broad vet callback is not counted as passing. The lead read the result directly.
+
+C3's coverage-uncertainty note does not invalidate the retained local evidence:
+the lead reopened the explicit E5 PASS/measurements (`gate-log.v1jaiY`),
+blackbox baseline missing-projection failure (`gate-log.TJ6kWR`), CLI/web
+red–green logs and full-web PASS (`gate-log.dlqAaG`). All three native E5/driver
+fixture hashes still match the measured record above; no duplicate E5 run is
+claimed. C4 remains an exact-head hosted landing obligation: API/repo checks,
+full inherited store-it, native backend availability and package timeout must
+be observed before merge. Local output cannot promise those hosted results.
+
+#### D5 / C1 documentation audit (2026-11-01, #3728)
+
+This is a current-working-tree documentation audit, not new runtime, hosted,
+restore or release evidence. No acceptance checkbox or earlier measurement is
+changed. Tracked searches started with available/recover/export/prerequisite
+claims in the CLI reference, recovery guide and bundled skill, then inspected
+the matching availability/thin-archive contexts in adjacent live documentation.
+This is not an exhaustive audit of historical PRDs, ADRs, changelog entries or
+other skills.
+
+The M2 product-copy audit covered `web/src/pages/RunView.tsx` (memory,
+exhaustion and terminal recovery sections),
+`web/src/components/RecoveryHoldsSurface.tsx`,
+`web/src/components/RecoveryArchives.tsx`, `web/src/lib/recovery.ts`,
+`api/cmd/uzi/run_export.go`, `api/cmd/uzi/run_recovery.go` and their directly
+affected tests/mocks. The follow-up inspected `api/cmd/uzi/run_get.go` and
+`api/cmd/uzi/run_wait.go` routing/help: terminal get uses the shared
+summary/landing renderer; wait help points to inspection/export without an
+import-success guarantee. This is an enumerated starting point for current
+recovery claims, not a claim that every historical recovery mention was edited.
+
+The documentation file set actually inspected is:
+`docs/cli.md`, `docs/run-recovery.md`,
+`api/internal/uzicli/skill/SKILL.md`, `docs/admin-health.md`,
+`docs/configuration.md`, `docs/issue-3031-delivery.md`,
+`docs/recovery-storage-diagnosis.md`, `docs/run-recovery-wait.md`,
+`ARCHITECTURE.md`, this parent PRD (current execution/C3 integration context),
+and the corresponding `api/internal/uzidocs/embed/cli.md` and
+`api/internal/uzidocs/embed/run-recovery.md` mirrors. Adjacent-file inspection
+covers the matching claim and surrounding paragraph, not every contract in
+each file.
+
+Source boundaries inspected: `api/cmd/uzi/run_export.go`
+(`recoverySummaryLines`, `renderCaptureChoice`, selection, manifest precheck
+and result), `api/cmd/uzi/run_prerequisite.go` (capture/pin detail rendering),
+`api/cmd/uzi/run_recovery.go` (`recoveryHoldCapture`,
+`holdsWithCaptures`, per-hold human details), `api/cmd/uzi/run_get.go`
+(human summary versus JSON run object),
+`api/internal/uzicli/client_recovery.go` (owner archive endpoint),
+`api/internal/uzicli/safefile.go` (byte count/checksum before destination link),
+`api/internal/recovery/service.go` (upload stream checks, manifest binding and
+two-query Summary), and `api/internal/recovery/download.go` (owner/state/
+manifest gate). `api/cmd/uzi/run_prerequisite_test.go` was inspected for its
+JSON inspect-field assertions, not rerun as part of this documentation audit.
+No new claim that all available metadata has a usable bound manifest follows:
+export retains its own manifest precheck and download can fail. The server
+checks uploaded length/checksum; it does not independently verify Git
+dependencies. A thin export still requires destination-clone verification.
+
+Validation for this audit: `task docs:sync` exited 0; `task check-docs:web`
+exited 0 (80 docs validated, 49 line-budget warnings); both changed embed mirrors
+compare byte-for-byte with their sources. `git diff --check` passed. No Go/web
+runtime test, hosted check, new E5 measurement or acceptance decision is claimed.
+
+Per-site verdicts below concern that availability/importability distinction,
+not revalidation of unrelated retention, quota, release or cleanup mechanisms.
+Mirror verdicts apply to the same named sections after byte-for-byte sync.
+
+| Site | Verdict |
+|---|---|
+| docs/cli.md — recovery summary | updated: every retained capture, with state and recorded pin details; human view. |
+| docs/cli.md — export-choice refusal | updated: pin facts preserved in JSON; human table has id/state/source/size/created only. |
+| docs/cli.md — successful export | updated: byte verification, bound-manifest/download gate, no prerequisite guarantee. |
+| docs/cli.md — owner ARCHIVE column | already accurate: presence of an available capture, not an import proof. |
+| docs/cli.md — coverage paragraph | already accurate: an export can omit latest local work. |
+| docs/cli.md — export hint | already accurate: availability offers export independently of attention. |
+| docs/cli.md — retained-recovery exception | already accurate: available/in-flight captures do not settle owner custody. |
+| docs/cli.md — latest versus older capture | already accurate: download and latest coverage are independent. |
+| docs/cli.md — detailed recovery JSON | updated: checksum, ordered prerequisites, expiry, attempted head and optional pin snapshot; absent optional fields remain possible. |
+| docs/cli.md — terminal-record rejection | already accurate: export requires its own available capture. |
+| docs/cli.md — prerequisite-pin lifecycle | updated: recovery/get show persisted pin state; held refs remain separate. |
+| docs/cli.md — completed held alternative | already accurate: thin archive describes fallback eligibility, not standalone importability. |
+| docs/cli.md — worker-recovery exhaustion | already accurate: recorded availability is historical, not current export/coverage proof. |
+| docs/cli.md — retained exhaustion coverage | already accurate: earlier available archive does not prove latest coverage. |
+| docs/cli.md — adoption-failure export advice | already accurate: export before deciding does not promise verified import. |
+| docs/run-recovery.md — opening recovery promise | updated: bytes can outlive the worker; thin prerequisites remain separate. |
+| docs/run-recovery.md — opening guarded release | already accurate: confirmed pins are a distinct release condition. |
+| docs/run-recovery.md — owner-held memory custody | already accurate: availability does not automatically release custody. |
+| docs/run-recovery.md — held-publication-conflict export | already accurate: export can refuse. |
+| docs/run-recovery.md — Available state | updated: archive bytes ready; prerequisite verification before import. |
+| docs/run-recovery.md — needs-landing with no archive | already accurate: lack of diff/archive is unresolved, not losslessness. |
+| docs/run-recovery.md — local thin proof | already accurate: local verified dependencies do not establish remote durability. |
+| docs/run-recovery.md — source-only export limit | already accurate: manifest-bound archive required; no source download API. |
+| docs/run-recovery.md — C2 lifecycle introduction | already accurate: pinning/release distinguished from byte download. |
+| docs/run-recovery.md — confirmed-pin step 1 | updated: recovery JSON supplies inspect fields; missing linking requires owner archive metadata, not run JSON. |
+| docs/run-recovery.md — thin FINAL worker grant | already accurate: release proof is separate from owner import verification. |
+| docs/run-recovery.md — pin retention after alternate settlement | already accurate: available archive retains its pin lifecycle. |
+| docs/run-recovery.md — ready owner quota | already accurate: accounts for archive bytes, not prerequisite storage. |
+| docs/run-recovery.md — instance quota | already accurate: accounts for archive bytes/reservations. |
+| docs/run-recovery.md — thin guarded disposition | already accurate: downloadable does not imply final release. |
+| docs/run-recovery.md — selected archive after receipt | already accurate: download remains available under its retention policy. |
+| docs/run-recovery.md — forge-park history caveat | already accurate: availability alone proves no complete history. |
+| docs/run-recovery.md — prerequisite-release rollout | already accurate: API release guard precedes guarded-thin producer rollout. |
+| docs/run-recovery.md — Option D archive survival | already accurate: bytes, recorded prerequisites and expiry survive hold settlement. |
+| docs/run-recovery.md — same-issue witness archive survival | already accurate: preserves archive metadata/bytes, not external commit availability. |
+| docs/run-recovery.md — terminal rejection older export | already accurate: earlier export may omit latest work. |
+| docs/run-recovery.md — terminal rejection source-only state | already accurate: readiness is distinct from custody attention. |
+| docs/run-recovery.md — terminal rejection export guidance | updated: a pin alone is not an archive; bound manifest/download and destination verification remain required. |
+| api/internal/uzicli/skill/SKILL.md — ARCHIVE column | already accurate: reports capture availability. |
+| api/internal/uzicli/skill/SKILL.md — recovery/export contract | updated: inspect fields and human/JSON pin visibility; bytes versus Git dependencies. |
+| api/internal/uzicli/skill/SKILL.md — needs-landing export/diff | updated: download first, then verify prerequisites before import; preserved diff remains separate. |
+| api/internal/uzicli/skill/SKILL.md — adoption-failure export advice | already accurate: export precedes owner decision without guaranteeing success. |
+| api/internal/uzicli/skill/SKILL.md — source-only/available distinction | updated: pin alone is not an archive; thin exports require dependency verification. |
+| api/internal/uzicli/skill/SKILL.md — held-ref expiry | already accurate: expiring a held ref does not delete an available archive. |
+| docs/admin-health.md — per-owner recovery bytes | already accurate: byte utilization, not restore readiness. |
+| docs/admin-health.md — marker clearance | already accurate: clearance does not prove archive availability. |
+| docs/configuration.md — prerequisite forge knob | already accurate: pin admission/release has separate conditions. |
+| docs/configuration.md — held-publication knob | already accurate: thin fallback and replay are qualified. |
+| docs/configuration.md — proposal limiter | already accurate: thin FINAL listing budget, not import verification. |
+| docs/issue-3031-delivery.md — conditional thin-release invariant | correct as history: explicitly qualified by the following C2 note. |
+| docs/issue-3031-delivery.md — C2 note | already accurate: ordinary-origin closure release grants no producer authority. |
+| docs/recovery-storage-diagnosis.md — hold discard | already accurate: preserves available archive bytes under archive policy. |
+| docs/run-recovery-wait.md — adoption-failure export advice | already accurate: earlier archive can omit latest work. |
+| docs/run-recovery-wait.md — local decoded-history verification | already accurate: local proof grants no custody release. |
+| docs/run-recovery-wait.md — source-only export limit | already accurate: requires manifest-bound available archive. |
+| docs/run-recovery-wait.md — exhaustion evidence | already accurate: recorded availability leads to a hold, not restore proof. |
+| ARCHITECTURE.md — frozen-inventory archive identity | already accurate: digest identity is not server Git-ancestry proof. |
+| ARCHITECTURE.md — same-issue discard TTL | already accurate: archive retention gives no source/PVC guarantee. |
+| ARCHITECTURE.md — held-publication thin fallback | already accurate: fallback qualification, not import proof. |
+| ARCHITECTURE.md — C1b lifecycle boundary | correct as history/component boundary: the later C2 release section is separate. |
+| ARCHITECTURE.md — worker-exhaustion capture evidence | already accurate: historical evidence affects custody disposition. |
+| api/internal/uzidocs/embed/cli.md — recovery/export sections above | updated: synchronized CLI-reference mirror. |
+| api/internal/uzidocs/embed/run-recovery.md — availability/restore sections above | updated: synchronized recovery-guide mirror. |
+
 ### Parent acceptance
 
 - C1a, C1b, C2 **and C3** complete (C3 may be dropped only by a separate owner decision adopting P5).

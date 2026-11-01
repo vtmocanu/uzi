@@ -243,8 +243,9 @@ func TestRunRecoveryCanonicalRunID(t *testing.T) {
 					}
 					const terminalCopy = "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody"
 					if mode == "human" {
-						if errb != "" || client.archivesCalls != 1 {
-							t.Errorf("human stderr=%q archives=%d; want empty stderr and one capture metadata lookup", errb, client.archivesCalls)
+						wantWarning := "uzi: 1 capture(s) carry no hold id (server predates it) and are not listed; 'uzi run get " + recoveryHeldRunID + "' lists the available ones\n"
+						if errb != wantWarning || client.archivesCalls != 1 {
+							t.Errorf("human stderr=%q archives=%d; want canonical legacy warning %q and one capture metadata lookup", errb, client.archivesCalls, wantWarning)
 						}
 						for _, want := range []string{
 							"canonical-source", "canonical-archive",

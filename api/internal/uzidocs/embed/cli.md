@@ -1368,10 +1368,11 @@ uzi run export <run-id> --output ./recovered.bundle
   `--json` instead prints the listed captures (archive DTOs, each with a `hold_id`) as a
   JSON array on stdout, still exiting 2 or 5.
 
-`uzi run get` also shows a metadata-only recovery summary for a terminal run that has
-captures (the archive count, per-state tally, and each available capture's id) so you
-know what `--capture` can fetch. It is metadata only and never claims an archive is
-available when it is not.
+The human `uzi run get` view also shows a metadata-only recovery summary for a terminal run that has
+captures: the archive count, per-state tally, and every retained capture's id, state,
+source, size, expiry and prerequisite-pin observations. Only `available` captures
+can be exported; the other states remain visible for inspection. These are recorded
+metadata, not a fresh forge probe or proof of Git importability.
 
 The optional owner `prerequisite_closure` is a persisted pin snapshot, with
 `state`, optional bounded `reason`, `pin_ref`, optional `pin_tip`,
@@ -1389,8 +1390,11 @@ fresh forge probe; `updated_at` is a record update, not last verification.
 - No projection: older API or no matching row. Thin prerequisite availability is
   unknown; a self-contained manifest reports no prerequisites and needs no pin.
 
-Capture details and export-choice refusals preserve these facts. An available
-capture can be exported regardless of pin state. Successful `export --json`
+Capture details and export-choice refusals in `--json` preserve these facts.
+The human export-choice table shows only id, state, source, size and creation time;
+use `uzi run get` or `uzi run recovery <run-id>` for pin details. An available
+capture can be exported regardless of pin state, subject to a bound byte manifest
+and a successful download. Successful `export --json`
 still reports verified bytes/checksum only, with the existing result fields;
 it does not certify prerequisite availability or importability. Owner history
 is complete, with a constant two SQL queries for the summary, not bounded rows
@@ -1472,8 +1476,9 @@ uzi run recovery <run-id> [--json]
   omit latest work while a newer capture prepares/uploads. The same source, coverage,
   export and discard guidance as above follows. `--json` prints
   the rows for scripting, each hold with a `captures` array carrying id, state,
-  source_sha, optional attempted_head_sha, byte_size, checksum, prerequisite_shas,
-  expires_at, created_at and optional prerequisite_closure. Its ids are accepted by
+  source_sha, byte_size, created_at and, when present, checksum,
+  prerequisite_shas (in recorded order), expires_at, attempted_head_sha and
+  prerequisite_closure. Its ids are accepted by
   `uzi run export --capture`; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives
   its run) or the server predates capture-hold linking. Owner-only.
@@ -1522,15 +1527,16 @@ uzi run discard <run-id> --hold <hold-id> --yes
   only your own runs' holds.
 
 Prerequisite pins (`refs/uzi-prereq/<capture-id>`, #3591) are a separate
-API lifecycle. This CLI has no prerequisite-pin listing or expiry command;
-`run recovery`/`run held` do not show pin state. On a server that enables it for
-GitHub.com, a pinned thin archive can release custody through the archive FINAL
+API lifecycle. `run get` and `run recovery <run-id>` show recorded pin state
+with capture details; `run held` lists terminal held refs, not prerequisite pins.
+There is no dedicated prerequisite-pin listing or expiry command. On a server
+that enables it for GitHub.com, a pinned thin archive can release custody through the archive FINAL
 (#3727); otherwise it cannot authorize archive FINAL or local-source cleanup.
 Pinning alone never authorizes local cleanup: an ACK and the existing independent
 source, writer and shared-consumer guards still apply.
 See [prerequisite pin restore and backlog handling](run-recovery.md#prerequisite-pins-lifecycle-and-custody-release)
 for native Git restore, the release conditions and the frozen-binding/cleanup
-limits. Owner/CLI pin visibility belongs to C3.
+limits.
 
 ### Fetching and expiring terminal held refs: `uzi run held`
 

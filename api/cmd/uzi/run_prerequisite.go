@@ -41,7 +41,13 @@ func prerequisiteLines(a apitypes.RecoveryArchiveDTO) []string {
 		lines = append(lines, "archive expiry: not recorded")
 	}
 	if len(a.PrerequisiteShas) == 0 {
-		lines = append(lines, "prerequisites: self_contained (worker manifest reports no prerequisites)")
+		// RecoveryArchiveDTO exposes size and checksum only once the manifest is bound.
+		// Zero bytes is valid; lifecycle state alone does not establish binding.
+		if a.ByteSize != nil && *a.ByteSize >= 0 && len(a.Checksum) == 64 && recoveryObjectID(a.Checksum) {
+			lines = append(lines, "prerequisites: self_contained (worker manifest reports no prerequisites)")
+		} else {
+			lines = append(lines, "prerequisites: unknown (no valid bound manifest evidence)")
+		}
 	} else {
 		lines = append(lines, fmt.Sprintf("prerequisites: %d required commit(s); worker manifest is not import proof", len(a.PrerequisiteShas)))
 	}
@@ -102,7 +108,7 @@ func prerequisiteLines(a apitypes.RecoveryArchiveDTO) []string {
 			lines = append(lines, "pin cleanup: exhausted; automatic deletes stopped; this grants no manual deletion permission")
 		case c.State == "deleted":
 			lines = append(lines, "pin cleanup: complete (recorded deletion)")
-		case a.State == "expired" || a.State == "discarded":
+		case c.State == "pinned" && (a.State == "expired" || a.State == "discarded"):
 			lines = append(lines, "pin cleanup: pending; completion not confirmed")
 		}
 	}

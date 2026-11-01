@@ -33,7 +33,7 @@ describe("mockApi.setRunWaitOnLimit (PRD #35)", () => {
 
   it("is a no-op error on a terminal run, mirroring the server's negative guard", async () => {
     await expect(mockApi.setRunWaitOnLimit("run-done", true)).rejects.toBeInstanceOf(ApiError);
-    await expect(mockApi.setRunWaitOnLimit("run-failed", true)).rejects.toBeInstanceOf(ApiError);
+    await expect(mockApi.setRunWaitOnLimit("c57b3989-105a-4e08-bf74-77ebc28e5a01", true)).rejects.toBeInstanceOf(ApiError);
     await expect(mockApi.setRunWaitOnLimit("run-cancelled", true)).rejects.toBeInstanceOf(ApiError);
   });
 

@@ -43,6 +43,8 @@ function archive(over: Partial<RecoveryArchive> = {}): RecoveryArchive {
     state: "available",
     source_sha: "0123456789abcdef0123456789abcdef01234567",
     created_at: "2026-09-13T00:00:00Z",
+    checksum: "a".repeat(64),
+    byte_size: 123,
     ...over,
   };
 }
@@ -414,6 +416,23 @@ describe("RecoveryArchivesPanel — needs_landing export hint (issue #1418)", ()
 
 // Feed the actual owner DTO, not DB hints, through the public panel.
 describe("prerequisite closure owner projection", () => {
+  it.each(["preparing", "uploading", "needs_action"].flatMap(state =>
+    [false, true].flatMap(bound =>
+      [false, true].map(emptyList => ({ state, bound, emptyList })),
+    ),
+  ))("$state bound=$bound emptyList=$emptyList renders only established self-containment", async ({ state, bound, emptyList }) => {
+    await renderPanel(aRun(), summary({ archives: [archive({
+      state,
+      prerequisite_shas: emptyList ? [] : undefined,
+      checksum: bound ? "a".repeat(64) : undefined,
+      byte_size: bound ? 123 : undefined,
+    })] }));
+    const section = screen.getByLabelText("Prerequisite protection");
+    expect(section.textContent).toContain(bound ? "Self-contained archive" : "Prerequisite protection unknown");
+    expect(section.textContent!.includes("Self-contained archive")).toBe(bound);
+    expect(section.textContent).not.toContain("git fetch origin");
+  });
+
   const explanations: Record<string, RegExp> = {
     pending: /Pin pending: prerequisite protection is not established/,
     invoked: /Pin creation invoked: prerequisite protection is not established/,

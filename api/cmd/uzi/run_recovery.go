@@ -439,29 +439,17 @@ func unattributedCaptures(archives []apitypes.RecoveryArchiveDTO) int {
 func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.RecoveryCustodyHoldDTO,
 	archives []apitypes.RecoveryArchiveDTO, reasons map[string]string) error {
 	p := env.printer(gf)
-	if p.Format == uzicli.FormatJSON {
-		// Never emit a null slice: an empty result is [] so a consuming agent iterates it
-		// unconditionally.
-		if n := unattributedCaptures(archives); n > 0 {
-			// An older server sends no hold_id, so its captures join onto no hold and the
-			// JSON would read as "no captures" (#1417). Say so on stderr, leaving stdout's
-			// shape unchanged (the plan degrades without failing), and name the listing that
-			// shows available ids without downloading; run export needs --output and fetches a sole capture.
-			_, _ = fmt.Fprintf(env.Stderr,
-				"uzi: %d capture(s) carry no hold id (server predates it) and are not listed; 'uzi run get %s' lists the available ones\n",
-				n, cellText(runID))
-		}
-		return p.JSON(holdsWithCaptures(holds, archives, reasons))
+	if n := unattributedCaptures(archives); n > 0 {
+		// An older server sends no hold_id, so its captures join onto no hold.
+		// Warn in human and JSON modes, including quiet, and name the metadata-only
+		// listing; run export needs --output and fetches a sole capture.
+		_, _ = fmt.Fprintf(env.Stderr,
+			"uzi: %d capture(s) carry no hold id (server predates it) and are not listed; 'uzi run get %s' lists the available ones\n",
+			n, cellText(runID))
 	}
-	for _, h := range holds {
-		for _, a := range archives {
-			if a.HoldID != h.ID {
-				continue
-			}
-			for _, line := range captureDetailLines(a) {
-				p.Printf("%s\n", line)
-			}
-		}
+	if p.Format == uzicli.FormatJSON {
+		// Never emit a null slice: an empty result is [] so a consuming agent iterates it.
+		return p.JSON(holdsWithCaptures(holds, archives, reasons))
 	}
 	if len(holds) == 0 {
 		if !gf.quiet {
@@ -492,6 +480,21 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 		return err
 	}
 	for _, h := range holds {
+		if !gf.quiet {
+			labelled := false
+			for _, a := range archives {
+				if a.HoldID == "" || a.HoldID != h.ID {
+					continue
+				}
+				if !labelled {
+					p.Printf("hold %s captures:\n", cellText(h.ID))
+					labelled = true
+				}
+				for _, line := range captureDetailLines(a) {
+					p.Printf("%s\n", line)
+				}
+			}
+		}
 		if line := completedPublicationReasonLine(h); line != "" {
 			p.Printf("%s\n", line)
 		}

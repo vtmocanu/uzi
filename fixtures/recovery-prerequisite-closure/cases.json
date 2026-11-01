@@ -484,6 +484,298 @@
           "discard"
         ]
       }
+    },
+    {
+      "name": "expired-pending",
+      "input": {
+        "row": true,
+        "state": "pending",
+        "reason": "",
+        "thin": true,
+        "capture_state": "expired",
+        "pin_tip": false
+      },
+      "expected": {
+        "closure": {
+          "state": "pending",
+          "pin_ref": "refs/uzi-prereq/00000000-0000-0000-0000-000000000001",
+          "absence_unconfirmed": false,
+          "cleanup_exhausted": false,
+          "updated_at": "2026-10-01T12:00:00Z"
+        },
+        "protection": "uncertain",
+        "cleanup": "none",
+        "permitted_actions": []
+      }
+    },
+    {
+      "name": "expired-invoked",
+      "input": {
+        "row": true,
+        "state": "invoked",
+        "reason": "",
+        "thin": true,
+        "capture_state": "expired",
+        "pin_tip": true
+      },
+      "expected": {
+        "closure": {
+          "state": "invoked",
+          "pin_ref": "refs/uzi-prereq/00000000-0000-0000-0000-000000000001",
+          "pin_tip": "1111111111111111111111111111111111111111",
+          "absence_unconfirmed": false,
+          "cleanup_exhausted": false,
+          "updated_at": "2026-10-01T12:00:00Z"
+        },
+        "protection": "uncertain",
+        "cleanup": "none",
+        "permitted_actions": []
+      }
+    },
+    {
+      "name": "expired-create_unknown",
+      "input": {
+        "row": true,
+        "state": "create_unknown",
+        "reason": "pin_unknown",
+        "thin": true,
+        "capture_state": "expired",
+        "pin_tip": true
+      },
+      "expected": {
+        "closure": {
+          "state": "create_unknown",
+          "reason": "pin_unknown",
+          "pin_ref": "refs/uzi-prereq/00000000-0000-0000-0000-000000000001",
+          "pin_tip": "1111111111111111111111111111111111111111",
+          "absence_unconfirmed": false,
+          "cleanup_exhausted": false,
+          "updated_at": "2026-10-01T12:00:00Z"
+        },
+        "protection": "uncertain",
+        "cleanup": "none",
+        "permitted_actions": []
+      }
+    },
+    {
+      "name": "expired-refused",
+      "input": {
+        "row": true,
+        "state": "refused",
+        "reason": "pin_refused",
+        "thin": true,
+        "capture_state": "expired",
+        "pin_tip": false
+      },
+      "expected": {
+        "closure": {
+          "state": "refused",
+          "reason": "pin_refused",
+          "pin_ref": "refs/uzi-prereq/00000000-0000-0000-0000-000000000001",
+          "absence_unconfirmed": false,
+          "cleanup_exhausted": false,
+          "updated_at": "2026-10-01T12:00:00Z"
+        },
+        "protection": "unprotected",
+        "cleanup": "none",
+        "permitted_actions": []
+      }
+    },
+    {
+      "name": "expired-foreign",
+      "input": {
+        "row": true,
+        "state": "foreign",
+        "reason": "pin_foreign",
+        "thin": true,
+        "capture_state": "expired",
+        "pin_tip": true
+      },
+      "expected": {
+        "closure": {
+          "state": "foreign",
+          "reason": "pin_foreign",
+          "pin_ref": "refs/uzi-prereq/00000000-0000-0000-0000-000000000001",
+          "pin_tip": "1111111111111111111111111111111111111111",
+          "absence_unconfirmed": false,
+          "cleanup_exhausted": false,
+          "updated_at": "2026-10-01T12:00:00Z"
+        },
+        "protection": "unprotected",
+        "cleanup": "none",
+        "permitted_actions": []
+      }
+    },
+    {
+      "name": "expired-lost",
+      "input": {
+        "row": true,
+        "state": "lost",
+        "reason": "pin_lost",
+        "thin": true,
+        "capture_state": "expired",
+        "pin_tip": true
+      },
+      "expected": {
+        "closure": {
+          "state": "lost",
+          "reason": "pin_lost",
+          "pin_ref": "refs/uzi-prereq/00000000-0000-0000-0000-000000000001",
+          "pin_tip": "1111111111111111111111111111111111111111",
+          "absence_unconfirmed": false,
+          "cleanup_exhausted": false,
+          "updated_at": "2026-10-01T12:00:00Z"
+        },
+        "protection": "unprotected",
+        "cleanup": "none",
+        "permitted_actions": []
+      }
+    },
+    {
+      "name": "discarded-pending",
+      "input": {
+        "row": true,
+        "state": "pending",
+        "reason": "",
+        "thin": true,
+        "capture_state": "discarded",
+        "pin_tip": false
+      },
+      "expected": {
+        "closure": {
+          "state": "pending",
+          "pin_ref": "refs/uzi-prereq/00000000-0000-0000-0000-000000000001",
+          "absence_unconfirmed": false,
+          "cleanup_exhausted": false,
+          "updated_at": "2026-10-01T12:00:00Z"
+        },
+        "protection": "uncertain",
+        "cleanup": "none",
+        "permitted_actions": []
+      }
+    },
+    {
+      "name": "discarded-invoked",
+      "input": {
+        "row": true,
+        "state": "invoked",
+        "reason": "",
+        "thin": true,
+        "capture_state": "discarded",
+        "pin_tip": true
+      },
+      "expected": {
+        "closure": {
+          "state": "invoked",
+          "pin_ref": "refs/uzi-prereq/00000000-0000-0000-0000-000000000001",
+          "pin_tip": "1111111111111111111111111111111111111111",
+          "absence_unconfirmed": false,
+          "cleanup_exhausted": false,
+          "updated_at": "2026-10-01T12:00:00Z"
+        },
+        "protection": "uncertain",
+        "cleanup": "none",
+        "permitted_actions": []
+      }
+    },
+    {
+      "name": "discarded-create_unknown",
+      "input": {
+        "row": true,
+        "state": "create_unknown",
+        "reason": "pin_unknown",
+        "thin": true,
+        "capture_state": "discarded",
+        "pin_tip": true
+      },
+      "expected": {
+        "closure": {
+          "state": "create_unknown",
+          "reason": "pin_unknown",
+          "pin_ref": "refs/uzi-prereq/00000000-0000-0000-0000-000000000001",
+          "pin_tip": "1111111111111111111111111111111111111111",
+          "absence_unconfirmed": false,
+          "cleanup_exhausted": false,
+          "updated_at": "2026-10-01T12:00:00Z"
+        },
+        "protection": "uncertain",
+        "cleanup": "none",
+        "permitted_actions": []
+      }
+    },
+    {
+      "name": "discarded-refused",
+      "input": {
+        "row": true,
+        "state": "refused",
+        "reason": "pin_refused",
+        "thin": true,
+        "capture_state": "discarded",
+        "pin_tip": false
+      },
+      "expected": {
+        "closure": {
+          "state": "refused",
+          "reason": "pin_refused",
+          "pin_ref": "refs/uzi-prereq/00000000-0000-0000-0000-000000000001",
+          "absence_unconfirmed": false,
+          "cleanup_exhausted": false,
+          "updated_at": "2026-10-01T12:00:00Z"
+        },
+        "protection": "unprotected",
+        "cleanup": "none",
+        "permitted_actions": []
+      }
+    },
+    {
+      "name": "discarded-foreign",
+      "input": {
+        "row": true,
+        "state": "foreign",
+        "reason": "pin_foreign",
+        "thin": true,
+        "capture_state": "discarded",
+        "pin_tip": true
+      },
+      "expected": {
+        "closure": {
+          "state": "foreign",
+          "reason": "pin_foreign",
+          "pin_ref": "refs/uzi-prereq/00000000-0000-0000-0000-000000000001",
+          "pin_tip": "1111111111111111111111111111111111111111",
+          "absence_unconfirmed": false,
+          "cleanup_exhausted": false,
+          "updated_at": "2026-10-01T12:00:00Z"
+        },
+        "protection": "unprotected",
+        "cleanup": "none",
+        "permitted_actions": []
+      }
+    },
+    {
+      "name": "discarded-lost",
+      "input": {
+        "row": true,
+        "state": "lost",
+        "reason": "pin_lost",
+        "thin": true,
+        "capture_state": "discarded",
+        "pin_tip": true
+      },
+      "expected": {
+        "closure": {
+          "state": "lost",
+          "reason": "pin_lost",
+          "pin_ref": "refs/uzi-prereq/00000000-0000-0000-0000-000000000001",
+          "pin_tip": "1111111111111111111111111111111111111111",
+          "absence_unconfirmed": false,
+          "cleanup_exhausted": false,
+          "updated_at": "2026-10-01T12:00:00Z"
+        },
+        "protection": "unprotected",
+        "cleanup": "none",
+        "permitted_actions": []
+      }
     }
   ],
   "malformed": [

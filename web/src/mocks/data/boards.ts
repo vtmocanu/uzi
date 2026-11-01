@@ -376,7 +376,7 @@ const boardFixtures: Record<string, Board> = {
         assignee_ids: [],
         forge_updated_at: minsAgo(130),
         latest_run: latestRun({
-          id: "run-closed",
+          id: "c57b3989-105a-4e08-bf74-77ebc28e5a02",
           status: "completed",
           mr_iid: 8,
           mr_state: "closed",
@@ -605,7 +605,7 @@ const boardFixtures: Record<string, Board> = {
         assignee_ids: [],
         forge_updated_at: minsAgo(700),
         latest_run: latestRun({
-          id: "run-failed",
+          id: "c57b3989-105a-4e08-bf74-77ebc28e5a01",
           status: "failed",
           failure_reason: "run timed out after 2h0m0s (RUN_TIMEOUT)",
           worker_name: "ci-runner-1",
@@ -651,7 +651,7 @@ boardFixtures["repo-atlas"].cards.push({
   title: "Refresh pool metrics after base update",
   web_url: atlasUrl(10),
   latest_run: latestRun({
-    id: "run-rejected", status: "failed", fail_origin: "base_diverged",
+    id: "c57b3989-105a-4e08-bf74-77ebc28e5a04", status: "failed", fail_origin: "base_diverged",
     failure_reason: "The base branch changed; start a fresh run.",
   }),
 });

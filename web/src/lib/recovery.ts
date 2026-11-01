@@ -581,8 +581,12 @@ export function prerequisiteView(capture: RecoveryArchive) {
     lost: "The recorded pin was lost; prerequisites are not protected by this record.",
     deleted: "Pin deletion was recorded; this is historical cleanup evidence, not current prerequisite protection.",
   };
-  const selfContained = capture.prerequisite_shas === undefined ||
-    (Array.isArray(capture.prerequisite_shas) && capture.prerequisite_shas.length === 0);
+  // RecoveryArchive exposes checksum and byte_size only after manifest binding.
+  // An absent prerequisite list before that point says nothing about the bundle.
+  const manifestBound = typeof capture.checksum === "string" && /^[0-9a-f]{64}$/i.test(capture.checksum) &&
+    capture.checksum.length === 64 && typeof capture.byte_size === "number" && Number.isSafeInteger(capture.byte_size) && capture.byte_size >= 0;
+  const selfContained = manifestBound && (capture.prerequisite_shas === undefined ||
+    (Array.isArray(capture.prerequisite_shas) && capture.prerequisite_shas.length === 0));
   const protection = selfContained ? "self_contained" : state === "pinned" && row?.absence_unconfirmed === false && safeTip
     ? "protected" : ["refused", "foreign", "lost", "deleted"].includes(state) ? "unprotected" : "uncertain";
   const cleanup = row?.cleanup_exhausted === true ? "exhausted" : state === "deleted" ? "complete"

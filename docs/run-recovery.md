@@ -11,8 +11,9 @@ workflow or secret preflight check, a rejected push, or exhausted base
 alignment against a moving default branch. Before this failure can happen,
 uzi captures the run's **original committed history** — exactly what the
 agent committed, not a diff or a rebased copy — into a durable, encrypted,
-owner-only Git bundle stored in the database. This is your recovery path
-even after the worker and its disk are gone.
+owner-only Git bundle stored in the database. The archive bytes can outlive
+the worker and its disk. A thin bundle also needs external prerequisite commits;
+verify those in the destination clone before import or discarding retained source.
 
 uzi captures at other boundaries too, not only at final failure: when a run
 is parked (a usage limit or a recovery wait) or gracefully stopped while it
@@ -444,7 +445,9 @@ reaches a final status. Each retained capture is in one of these six states:
   protected boundary; nothing is downloadable yet.
 - **Uploading** — the encrypted archive is being stored; nothing is
   downloadable yet.
-- **Available** — the original committed history is ready to download.
+- **Available** — archive bytes are ready to download. A thin bundle also needs
+  its prerequisite commits in the destination clone; verify dependencies before import
+  using [Importing the bundle](#importing-the-bundle).
 - **Needs action** — the archive could not be completed (for example, a
   storage limit was hit); the source stays retained. Retries depend on the
   recovery path's budget; terminal retained-source failure does not cycle
@@ -791,8 +794,14 @@ latest local coverage, custody release or physical retirement.
 
 ### Restoring with a confirmed pin
 
-1. Select the exact available capture using `uzi run recovery '<run-uuid>'`.
-   Record its checksum, prerequisites, source SHA, expiry and full pin tip.
+1. Select the exact available capture using `uzi run recovery '<run-uuid>' --json`.
+   Record its checksum, ordered `prerequisite_shas`, source SHA, expiry and full pin
+   tip from the hold's `captures` array. Optional inspect fields can be absent on
+   older APIs or when not recorded; a missing field is not positive restore evidence.
+   If capture-to-hold linking is absent, obtain the owner archive metadata from
+   `GET /api/runs/<run-uuid>/archives` before proceeding. The human `run get`
+   summary shows retained captures, but `run get --json` emits the run object,
+   not the archive metadata.
    Validate the capture id as a canonical lowercase UUID before substituting it
    into the fixed namespace below. Do not execute API-provided ref, reason, tip
    strings or shell snippets; the tip is a full hexadecimal object id for
@@ -986,8 +995,8 @@ with backoff capped at one hour. A later confirmed absence can settle cleanup,
 but does not grant another delete attempt. This is a schedule cap, not a
 one-hour completion guarantee. Available-pin audits normally run at 24 hours;
 absence requires a different pass at least ten minutes later to become `lost`.
-Owner-facing pin diagnostics/CLI display remain C3 work; raw forge errors are
-not a worker status contract.
+Owner-facing archive rows and CLI capture details show this persisted pin
+snapshot separately from worker readiness; raw forge errors are not exposed.
 
 The active-capture cap (default 256) excludes expired/discarded captures. It
 does not bound leaked pins, unresolved rows or permanent audit tombstones.
@@ -1953,7 +1962,8 @@ recorded evidence does not prove absence of unrecorded worker work:
 
 A rejected record cannot supply a source head or make an archive exportable.
 Export is offered when a capture is available, including a thin capture; a
-verified pin must first produce an available archive. Export verifies bytes only;
+pin alone is not an archive. Export still requires a bound byte manifest and a
+successful download. Export verifies bytes only;
 verify Git dependencies in the destination clone before import or source discard.
 
 The worker negotiates `terminal_rejection_report` through registration's

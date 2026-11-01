@@ -14,6 +14,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
@@ -49,6 +51,26 @@ func (f *ownerSummaryForge) ForgeForConnection(string, string, []byte) (forge.Fo
 	return nil, errors.New("owner summary must not contact the forge")
 }
 
+// ownerSummaryPastObservation advances only the fixture's initial absence timestamp.
+// The production RecordPrerequisiteAbsence statement still supplies every state,
+// generation and pass predicate and runs through the unchanged schema guard.
+// Aging an already recorded observation would violate its immutable identity;
+// initialize it in the past instead of disabling or weakening that guard.
+type ownerSummaryPastObservation struct {
+	store.DBTX
+	t *testing.T
+}
+
+func (db ownerSummaryPastObservation) Exec(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error) {
+	db.t.Helper()
+	if !strings.HasPrefix(query, "-- name: RecordPrerequisiteAbsence :execrows") ||
+		strings.Count(query, "absent_since=now()") != 1 {
+		db.t.Fatal("fixture observation clock must only adjust RecordPrerequisiteAbsence's initial timestamp")
+	}
+	query = strings.Replace(query, "absent_since=now()", "absent_since=now()-interval '11 minutes'", 1)
+	return db.DBTX.Exec(ctx, query, args...)
+}
+
 // seedClosure exercises the durable transition guard; no trigger or constraint is disabled.
 // Scheduling timestamps are made due between the eight bounded cleanup attempts.
 // A failed transition aborts this fixture rather than seeding misleading sibling cases.
@@ -75,11 +97,42 @@ func (f *ownerSummaryFixture) seedClosure(t *testing.T, state string, absent, ex
 		}
 		return id
 	}
-	cliMustExec(t, f.pool, `UPDATE recovery_prerequisite_closures p SET state='invoked',live_run_id=p.run_id,
- invoked_at=now(),invoked_deadline=now()+interval '30 seconds',pin_tip=repeat('1',40),
- connection_id=r.connection_id,forge_kind='github',normalized_base_url='https://github.com',
- project_id=r.forge_project_id,default_branch=r.default_branch,updated_at=now()
- FROM repos r WHERE p.id=$1 AND r.id=p.repo_id`, p.ID)
+	// Follow the production lock order before freezing the invocation binding.
+	tx, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	locked := q.WithTx(tx)
+	if _, err := locked.LockPrerequisiteRun(ctx, p.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := locked.LockPrerequisiteHold(ctx, p.HoldID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := locked.LockPrerequisiteCapture(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := locked.LockPrerequisiteClosure(ctx, p.ID); err != nil {
+		t.Fatal(err)
+	}
+	marker := store.MarkPrerequisiteInvokedParams{
+		ID: p.ID, Generation: p.Attempts, SendSeconds: 30,
+		PinTip: pgtype.Text{String: strings.Repeat("1", 40), Valid: true},
+	}
+	if err := tx.QueryRow(ctx, `SELECT r.connection_id,f.forge_type,rtrim(f.base_url,'/'),
+ r.forge_project_id,r.default_branch FROM repos r JOIN forge_connections f ON f.id=r.connection_id
+ WHERE r.id=$1`, p.RepoID).Scan(&marker.ConnectionID, &marker.ForgeKind,
+		&marker.NormalizedBaseUrl, &marker.ProjectID, &marker.DefaultBranch); err != nil {
+		t.Fatal(err)
+	}
+	p, err = locked.MarkPrerequisiteInvoked(ctx, marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if state == "invoked" {
 		return id
 	}
@@ -108,32 +161,65 @@ func (f *ownerSummaryFixture) seedClosure(t *testing.T, state string, absent, ex
 			attempts = 8
 		}
 		for i := 0; i < attempts; i++ {
+			// Fixture-only clock advancement: make backoff due without changing a
+			// generation, lease, pass identity, or transition guard.
 			cliMustExec(t, f.pool, "UPDATE recovery_prerequisite_closures SET next_attempt_at=now()-interval '1 second' WHERE id=$1", p.ID)
-			pass := uuid.New()
-			// Same reservation/retry transitions as the cleanup queries, under the real guard.
-			cliMustExec(t, f.pool, `UPDATE recovery_prerequisite_closures SET cleanup_attempts=cleanup_attempts+1,
- cleanup_deadline=now()+interval '30 seconds',next_attempt_at=now()+interval '60 seconds',last_audit_pass_id=$2,updated_at=now() WHERE id=$1`, p.ID, pass)
+			pass := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+			p, err = q.ReservePrerequisiteCleanup(ctx, store.ReservePrerequisiteCleanupParams{
+				ID: p.ID, PassID: pass, LeaseSeconds: 30,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
 			if state == "deleted" {
-				cliMustExec(t, f.pool, `UPDATE recovery_prerequisite_closures SET state='deleted',live_run_id=NULL,reason='',
- cleanup_exhausted_at=NULL,updated_at=now() WHERE id=$1`, p.ID)
+				n, err = q.RecordPrerequisiteDeleted(ctx, store.RecordPrerequisiteDeletedParams{
+					ID: p.ID, Generation: p.CleanupAttempts, PassID: pass,
+				})
 			} else {
-				cliMustExec(t, f.pool, `UPDATE recovery_prerequisite_closures SET cleanup_deadline=NULL,
- cleanup_exhausted_at=CASE WHEN cleanup_attempts=8 THEN now() ELSE NULL END,
- reason=CASE WHEN cleanup_attempts=8 THEN 'pin_cleanup_exhausted' ELSE reason END,updated_at=now() WHERE id=$1`, p.ID)
+				n, err = q.RecordPrerequisiteCleanupRetry(ctx, store.RecordPrerequisiteCleanupRetryParams{
+					ID: p.ID, Generation: p.CleanupAttempts, PassID: pass, LastError: "fixture delete unavailable",
+				})
+			}
+			if err != nil || n != 1 {
+				t.Fatalf("cleanup attempt %d=%d %v", i+1, n, err)
 			}
 		}
 	}
 	if absent || state == "lost" {
-		// The first observation may have occurred eleven minutes ago; the guard still
-		// requires a distinct later pass before the lost transition.
-		pass := uuid.New()
-		cliMustExec(t, f.pool, `UPDATE recovery_prerequisite_closures SET absent_since=now()-interval '11 minutes',
- absence_pass_id=$2,last_audit_pass_id=$2,reason='pin_absence_unconfirmed',updated_at=now() WHERE id=$1`, p.ID, pass)
+		// Fixture-only clock advancement: make the first audit due.
+		cliMustExec(t, f.pool, "UPDATE recovery_prerequisite_closures SET audit_next_at=now()-interval '1 second' WHERE id=$1", p.ID)
+		pass := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+		p, err = q.ReservePrerequisiteAudit(ctx, store.ReservePrerequisiteAuditParams{ID: p.ID, PassID: pass})
+		if err != nil {
+			t.Fatal(err)
+		}
+		observationQueries := q
 		if state == "lost" {
-			next := uuid.New()
-			cliMustExec(t, f.pool, "UPDATE recovery_prerequisite_closures SET last_audit_pass_id=$2 WHERE id=$1", p.ID, next)
-			cliMustExec(t, f.pool, `UPDATE recovery_prerequisite_closures SET state='lost',live_run_id=NULL,
- absent_since=NULL,absence_pass_id=NULL,cleanup_exhausted_at=NULL,reason='pin_lost',updated_at=now() WHERE id=$1`, p.ID)
+			// Fixture-only timing advancement at initial observation, never an
+			// overwrite of absent_since or its pass identity.
+			observationQueries = store.New(ownerSummaryPastObservation{DBTX: f.pool, t: t})
+		}
+		n, err = observationQueries.RecordPrerequisiteAbsence(ctx, store.RecordPrerequisiteAbsenceParams{
+			ID: p.ID, Generation: p.CleanupAttempts, PassID: pass,
+		})
+		if err != nil || n != 1 {
+			t.Fatalf("absence=%d %v", n, err)
+		}
+		if state == "lost" {
+			// Fixture-only clock advancement: the confirmation audit is due.
+			// Preserve the initial observation and require a distinct later pass.
+			cliMustExec(t, f.pool, "UPDATE recovery_prerequisite_closures SET audit_next_at=now()-interval '1 second' WHERE id=$1", p.ID)
+			next := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+			p, err = q.ReservePrerequisiteAudit(ctx, store.ReservePrerequisiteAuditParams{ID: p.ID, PassID: next})
+			if err != nil {
+				t.Fatal(err)
+			}
+			n, err = q.ConfirmPrerequisiteLost(ctx, store.ConfirmPrerequisiteLostParams{
+				ID: p.ID, Generation: p.CleanupAttempts, PassID: next,
+			})
+			if err != nil || n != 1 {
+				t.Fatalf("lost=%d %v", n, err)
+			}
 		}
 	}
 	return id
@@ -200,9 +286,27 @@ func TestOwnerSummaryClosureHistoryAuthReadOnlyLiveDB(t *testing.T) {
 			absent, exhausted bool
 		}{"pinned", flags[0], flags[1]}
 	}
+	// Discard a genuine closure-bearing capture through the production owner query.
+	// Its pinned closure remains durable history even though the archive is discarded.
+	discarded := f.seedClosure(t, "pinned", false, false)
+	n, err := store.New(f.pool).DiscardCaptureForOwner(ctx, store.DiscardCaptureForOwnerParams{
+		ID: discarded, RunID: f.run, UserID: f.owner,
+	})
+	if err != nil || n != 1 {
+		t.Fatalf("discard closure-bearing capture=%d %v", n, err)
+	}
+	expected[discarded.String()] = struct {
+		state             string
+		absent, exhausted bool
+	}{"pinned", false, false}
 	thin := f.seedCapture(t, true)
 	self := f.seedCapture(t, false)
 	// A different run and owner each have genuine closure rows; neither may leak.
+	// Structural limitation: the schema guard binds closure capture/hold/run/user
+	// identity at insertion and makes it immutable. A schema-equivalent malformed
+	// sibling sharing a capture but differing on another identity cannot be seeded
+	// without bypassing that guard. These valid sibling rows prove isolation, but
+	// cannot independently discriminate every redundant identity JOIN predicate.
 	otherRun := rmSeedRun(t, f.pool, f.owner, func() uuid.UUID {
 		var repo uuid.UUID
 		if err := f.pool.QueryRow(ctx, "SELECT repo_id FROM runs WHERE id=$1", f.run).Scan(&repo); err != nil {
@@ -273,6 +377,7 @@ func TestOwnerSummaryClosureHistoryAuthReadOnlyLiveDB(t *testing.T) {
 		if len(ids) != len(got.Archives) {
 			t.Fatalf("complete history length=%d want %d", len(got.Archives), len(ids))
 		}
+		foundDiscardedClosure := false
 		for i, a := range got.Archives {
 			if a.ID != ids[i] {
 				t.Fatalf("first ordering mismatch at %d: got %s want %s", i, a.ID, ids[i])
@@ -288,6 +393,12 @@ func TestOwnerSummaryClosureHistoryAuthReadOnlyLiveDB(t *testing.T) {
 			if p == nil || p.State != want.state || p.AbsenceUnconfirmed != want.absent || p.CleanupExhausted != want.exhausted || p.PinRef != "refs/uzi-prereq/"+a.ID {
 				t.Fatalf("closure %s=%+v want %+v", a.ID, p, want)
 			}
+			if a.ID == discarded.String() {
+				if a.State != "discarded" {
+					t.Fatalf("closure-bearing discarded capture state=%q", a.State)
+				}
+				foundDiscardedClosure = true
+			}
 			var updated string
 			if err := f.pool.QueryRow(ctx, "SELECT to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') FROM recovery_prerequisite_closures WHERE capture_id=$1", uuid.MustParse(a.ID)).Scan(&updated); err != nil {
 				t.Fatal(err)
@@ -300,6 +411,9 @@ func TestOwnerSummaryClosureHistoryAuthReadOnlyLiveDB(t *testing.T) {
 			if !p.UpdatedAt.Equal(stored.UpdatedAt.Time) {
 				t.Fatalf("closure %s updated_at differs from persisted %s", a.ID, updated)
 			}
+		}
+		if !foundDiscardedClosure {
+			t.Fatal("discarded closure-bearing capture missing from retained history")
 		}
 		var counts apitypes.RecoveryArchiveStateCountsDTO
 		for _, a := range got.Archives {

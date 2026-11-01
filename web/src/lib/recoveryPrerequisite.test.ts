@@ -7,7 +7,7 @@ const CAP_UUID = "00000000-0000-0000-0000-000000000001";
 const EXPORT_CMD = `uzi run export ${RUN_UUID} --output <path> --capture ${CAP_UUID}`;
 function archive(over: Partial<RecoveryArchive> = {}): RecoveryArchive {
   return { id: CAP_UUID, run_id: RUN_UUID, hold_id: "hold", state: "available", source_sha: cases.pin_tip,
-    created_at: cases.updated_at, ...over };
+    created_at: cases.updated_at, checksum: "a".repeat(64), byte_size: 123, ...over };
 }
 describe("bounded prerequisite view and safe commands", () => {
   it.each(cases.cases)("$name maps owner DTO semantics independently", c => {
@@ -43,6 +43,30 @@ describe("bounded prerequisite view and safe commands", () => {
     expect(recoveryExportCommand(RUN_UUID, CAP_UUID)).toBe(EXPORT_CMD);
   });
 
+
+  it.each(["preparing", "uploading", "needs_action"])("requires bound manifest facts in %s", state => {
+    for (const prerequisite_shas of [undefined, []]) {
+      for (const facts of [
+        { checksum: undefined, byte_size: undefined },
+        { checksum: undefined, byte_size: 123 },
+        { checksum: "a".repeat(64), byte_size: undefined },
+        { checksum: "", byte_size: 123 },
+        { checksum: "not-a-checksum", byte_size: 123 },
+        { checksum: "a".repeat(64), byte_size: -1 },
+        { checksum: "a".repeat(64), byte_size: NaN },
+        { checksum: "a".repeat(64), byte_size: 1.5 },
+      ]) {
+        const view = prerequisiteView(archive({ state, prerequisite_shas, ...facts }));
+        expect(view.protection).toBe("uncertain");
+        expect(view.description).toContain("Prerequisite protection unknown");
+        expect(view.fetchCommand).toBeNull();
+      }
+      const bound = prerequisiteView(archive({ state, prerequisite_shas, byte_size: 0 }));
+      expect(bound.protection).toBe("self_contained");
+      expect(bound.description).toContain("Self-contained archive");
+      expect(bound.fetchCommand).toBeNull();
+    }
+  });
 
   it("preserves self-contained behavior when the optional prerequisite list is omitted", () => {
     const view = prerequisiteView(archive());

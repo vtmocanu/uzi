@@ -111,6 +111,10 @@ func TestPrerequisiteSharedCases(t *testing.T) {
 					}
 				}
 				switch tc.Expected.Cleanup {
+				case "none":
+					if strings.Contains(rendered, "pin cleanup:") {
+						t.Error("cleanup implied without a recorded owned pin")
+					}
 				case "exhausted":
 					if !strings.Contains(rendered, "pin cleanup: exhausted; automatic deletes stopped; this grants no manual deletion permission") {
 						t.Error("cleanup exhaustion hidden")
