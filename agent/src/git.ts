@@ -19471,7 +19471,7 @@ try {
   }
 
   /** Boot discovery walks only this worker's known bare store, independent of HOME/journals. */
-  async discoverOwedCandidates(): Promise<Array<{ context: StoredOwedContext; candidates: OwedCandidate[] }>> {
+  async discoverOwedCandidates(skipContext?: (context: StoredOwedContext) => Promise<boolean>): Promise<Array<{ context: StoredOwedContext; candidates: OwedCandidate[] }>> {
     const result: Array<{ context: StoredOwedContext; candidates: OwedCandidate[] }> = [];
     let dirs: string[];
     try {
@@ -19502,11 +19502,12 @@ try {
         // One metadata read per bare, and one enumeration (git calls) per run, however many
         // contexts exist: the contexts of a run share its enumeration.
         const metadata = await this.readOwedMetadataUnderLock(bare);
-        const allPins = await this.runGit(bare, ["for-each-ref", "--format=%(refname)", "refs/uzi-owed/"]);
+        const allPins = await this.runGit(bare, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-owed/"]);
         const runs = new Set<string>();
         const perRun = new Map<string, OwedCandidate[]>();
         for (const [n, context] of metadata.contexts) {
           runs.add(context.runId);
+          if (await skipContext?.(context)) continue;
           let enumerated = perRun.get(context.runId);
           if (!enumerated) {
             enumerated = await this.enumerateOwedUnderLock(bare, context.runId, metadata);
@@ -19515,10 +19516,18 @@ try {
           const candidates = enumerated.filter((candidate) => candidate.contexts.some((c) => this.contextName(c) === n));
           result.push({ context, candidates });
         }
-        for (const ref of allPins.trim().split("\n").filter(Boolean)) {
-          if (!/^refs\/uzi-owed\/[^/]+\/[0-9a-f]{40}$/.test(ref) || !runs.has(ref.split("/")[2]!)) {
-            throw new Error("owed pin has no boot discovery context");
+        for (const line of allPins.trim().split("\n").filter(Boolean)) {
+          const pin = /^refs\/uzi-owed\/([^/]+)\/([0-9a-f]{40}) ([0-9a-f]{40})$/.exec(line);
+          if (!pin || !runs.has(pin[1]!)) throw new Error("owed pin has no boot discovery context");
+          // Enumerated runs already checked every pin and its producing metadata.
+          if (perRun.has(pin[1]!)) continue;
+          MaintenanceResources.consumeMetadataEntriesIfActive(line, "\n");
+          if (pin[2] !== pin[3]) throw new Error("malformed owed pin");
+          await this.requireOwedCommit(bare, pin[2]!);
+          if (!metadata.records.some(r => r.runId === pin[1] && r.sha === pin[2])) {
+            throw new Error("owed pin has no discovery metadata");
           }
+          MaintenanceResources.consumeIfActive("candidates", 1);
         }
       });
     }
