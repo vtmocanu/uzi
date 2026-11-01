@@ -7968,7 +7968,9 @@ export class RunRunner {
     // the executor). Its recorded title carries the partial prefix; without a live owner deferral to explain
     // that prefix the delivery cannot be rebuilt model-free, so hold. A recorded partial title counts as a cap
     // unless it is exactly the uncapped title the live claim renders (an issue whose own title starts with the
-    // prefix). A retitled issue therefore holds rather than hiding the cap: the safe direction.
+    // prefix). Any other retitle holds rather than hiding the cap. One boundary is accepted: an issue retitled to
+    // exactly the prefixed original title is indistinguishable from one natively so titled, so it publishes
+    // without the cap disclosure, still non-closing through the recorded-closing tightening below.
     const PARTIAL = "[partial] ";
     if ((claim.config?.completion_scope?.deferred?.length ?? 0) === 0 && record.mr.title.startsWith(PARTIAL) &&
         record.mr.title !== sliceWellFormed(flight.redactText(mrTitle(claim, undefined, claim.config?.completion_scope)), 1024)) {
