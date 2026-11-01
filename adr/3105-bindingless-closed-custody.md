@@ -116,7 +116,19 @@ and remains unverified;
 it must not be reported as passed. Other canonical API constituents passed
 serially with `UZI_TEST_DATABASE_URL` unset. Exact-head `lint-api` dead-code,
 full agent/API/repository CI, inherited store-it sweep and hosted job timing remain
-mandatory before merge. Local focused checks do not establish hosted latency or
+mandatory before merge.
+
+The repository gate failed under Node 26.12.1 in the unchanged forge operation
+contract test: `stripTypeScriptTypes` rejected transform mode. The same narrow
+test failed on the untouched baseline. Separately, `test:ci-safe-paths` returned
+instrument status 3 where its Brew failure fixture expected 1, on both candidate
+and baseline exports. Its release-watch helper invokes a Git configuration form
+that this worker rejects; this comparison does not establish a source defect.
+Neither check is reported as passed or waived. The remaining repository
+constituents ran serially: 45 passed and the already-passed E2E library check was
+reused on the unchanged candidate. E2E library and fake-forge tests passed; secret
+scanning and Semgrep passed. These constituent results do not make the full
+repository gate green. Local focused checks do not establish hosted latency or
 full compose acceptance. Compose phase 72 (`custody-lifecycle`) was not run.
 
 ### Local timing record
