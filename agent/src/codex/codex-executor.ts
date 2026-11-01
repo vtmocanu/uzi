@@ -3892,6 +3892,7 @@ export class CodexExecutor implements Executor {
       let gatedPlan: string | undefined;
       // PRD #2460: the approved plan is a checked server bundle, restated in the implement prompt.
       let checkedPlan = false;
+      let humanCanonicalPlan = false;
       let checkedFindings: PlanCrossCheckFindings | null | undefined;
       // Issue #1674: the milestone breakdown of the plan version the gate approved (the final
       // planResult.milestones after any revise rounds, mirroring sdk-executor's
@@ -4159,14 +4160,17 @@ export class CodexExecutor implements Executor {
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason, verdict.sourceGateRevision);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
         pauseNow.vaultLock.gateOpen = false;
-        if (verdict.approval === "cross_check") {
+        if (verdict.approval === "cross_check" || verdict.canonical !== undefined) {
           // Exactly the approved server candidate: the bundle is validated whole before either value
           // is adopted, and it supersedes the plan thread's local plan and milestones.
           const canonical = validateCheckedPlanBundle(verdict.canonical, ctx.claimGeneration);
           gatedPlan = canonical.plan;
           approvedMilestones = canonical.milestones;
-          checkedPlan = true;
-          checkedFindings = verdict.findings;
+          humanCanonicalPlan = verdict.approval !== "cross_check";
+          if (verdict.approval === "cross_check") {
+            checkedPlan = true;
+            checkedFindings = verdict.findings;
+          }
         } else {
           gatedPlan = planMd;
           approvedMilestones = planResult.milestones;
@@ -4479,7 +4483,8 @@ export class CodexExecutor implements Executor {
           installState.noted = true;
         }
         const ownerPrompt = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts,
-          checkedPlan ? { milestones: approvedMilestones, findings: checkedFindings } : undefined);
+          checkedPlan || humanCanonicalPlan
+            ? { milestones: approvedMilestones, findings: checkedFindings, humanApproved: humanCanonicalPlan } : undefined);
         const ownerBase = depsNote ? `${ownerPrompt}\n\n${depsNote}` : ownerPrompt;
         // Issue #3149: earlier owner follow-ups ride only the first implement turn of a reviewed-plan
         // resume (never a system-text turn), deduped by id against this turn's live batch and the
@@ -6613,7 +6618,7 @@ export class CodexExecutor implements Executor {
    *  and the clarification continuation replace this prompt for their turn and do not carry the
    *  block. Empty block ⇒ byte-identical. */
   private implementPrompt(ctx: RunContext, gatedPlan?: string, milestoneNote = "", facts?: EnvFacts,
-    checked?: { milestones: Milestone[] | undefined; findings?: PlanCrossCheckFindings | null }): string {
+    checked?: { milestones: Milestone[] | undefined; findings?: PlanCrossCheckFindings | null; humanApproved?: boolean }): string {
     const approved = ctx.approvedPlan?.trim();
     // PRD #2460: a cross-check approved the server's normalized candidate, not the lead's local plan.
     // The contract (plan prose plus the full milestone list) leads every implement attempt and
@@ -6622,7 +6627,9 @@ export class CodexExecutor implements Executor {
       ? [
           checkedImplementationContext(gatedPlan, checked.milestones ?? []).trimEnd() + renderPlanApprovalAdvice(checked.findings),
           "",
-          "Your plan was cross-checked and the server contract above was approved. Implement THAT contract now",
+          checked.humanApproved
+            ? "The human approved the presented server contract above. Implement THAT contract now"
+            : "Your plan was cross-checked and the server contract above was approved. Implement THAT contract now",
           "on the current branch, delegating to your subagents and iterating until the review passes. It is",
           "your authoritative instruction for this run: it supersedes the plan you drafted in this thread and,",
           "except for in-scope additions the approval advice above permits, the issue text; do not re-plan or resubmit it.",

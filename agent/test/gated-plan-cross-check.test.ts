@@ -118,6 +118,9 @@ describe("gated plan cross-check: checker outcomes all open the human gate", () 
     assert.equal(verdicts.length, 1);
     assert.equal(verdicts[0]!.kind, "approve");
     assert.notEqual((verdicts[0] as { approval?: string }).approval, "cross_check", "the human approved, not the checker");
+    assert.deepEqual((verdicts[0] as { canonical?: unknown }).canonical, {
+      plan: gate.plan_md, milestones: gate.milestones, candidate_digest: digest, claimGeneration: c.claim_generation,
+    }, "the human verdict carries exactly the presented candidate to implementation");
     assertNoCheckedStorage(c.run_id);
     assert.deepEqual(passLine(c.run_id), ["plan cross-check: passed after 1 round"]);
   });

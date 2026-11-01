@@ -8118,6 +8118,25 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     }
   });
 
+  it("a human approval implements the presented canonical bundle without checker approval", async () => {
+    const rig = planThenImplementRig();
+    const milestones = [{ id: "m1", title: "Human-approved canonical milestone", nested: { keep: [] } }];
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined, claimGeneration: 7,
+      gatePlan: async () => ({ kind: "approve", approval: "human", selection: { status: "absent" },
+        canonical: { plan: "Human-approved canonical plan", milestones, candidate_digest: "a".repeat(64), claimGeneration: 7 },
+      }) as never,
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "human canonical approval");
+    const request = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
+    const implement = (request.params as { input: { text: string }[] }).input[0]!.text;
+    assert.match(implement, /Human-approved canonical plan/);
+    const contract = implement.match(/<approved_milestone_contract>\n([\s\S]*?)\n<\/approved_milestone_contract>/);
+    assert.ok(contract);
+    assert.deepEqual(JSON.parse(contract[1]!), milestones);
+    assert.doesNotMatch(implement, /local plan 1|cross-checked/);
+  });
+
   it("PRD #2460: a checked approval implements exactly the server contract, which supersedes the local plan", async () => {
     const rig = planThenImplementRig();
     let iterations = 0;

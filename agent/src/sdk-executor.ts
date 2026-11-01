@@ -877,6 +877,8 @@ interface DriveState {
   approvedPlan?: string;
   /** Checked canonical instructions replace the local plan carried by the planning session. */
   checkedPlan?: boolean;
+  /** A human approved a presented canonical bundle; checker approval remains false. */
+  humanCanonicalPlan?: boolean;
   checkedFindings?: PlanCrossCheckFindings | null;
   /** Issue #3178: the plan gate approved (non-cross_check) while NO session exists to carry the
    *  plan (post-gate `resumeId` undefined), e.g. a re-presented stored plan after the SDK
@@ -2748,13 +2750,16 @@ export class SdkExecutor implements Executor {
           throw new TrustedExecutionRefusal(
             `unexpected plan verdict: ${(verdict as { kind: string }).kind}`,
           );
-        if (verdict.approval === "cross_check") {
+        if (verdict.approval === "cross_check" || verdict.canonical !== undefined) {
           // Validate the entire bundle before adopting either value (checked-plan.ts).
           const canonical = validateCheckedPlanBundle(verdict.canonical, ctx.claimGeneration);
           approvedPlan = canonical.plan;
           candidateMilestones = canonical.milestones;
-          drive.checkedPlan = true;
-          drive.checkedFindings = verdict.findings;
+          drive.humanCanonicalPlan = verdict.approval !== "cross_check";
+          if (verdict.approval === "cross_check") {
+            drive.checkedPlan = true;
+            drive.checkedFindings = verdict.findings;
+          }
         }
         // Issue #3178: keyed on the post-gate resumeId (a revise turn may have produced a
         // session), never ctx.sessionId. Cross-check approvals carry the canonical contract.
@@ -2963,7 +2968,8 @@ export class SdkExecutor implements Executor {
       // Repeat the checked server contract on every implement attempt: an interrupted
       // first attempt may not have delivered it to the model or updated the old session.
       // Serialize the entire approved list, including nested values and explicit [].
-      const checkedContext = drive.checkedPlan ? checkedImplementationContext(approvedPlan, frozenMilestones) + renderPlanApprovalAdvice(drive.checkedFindings) : "";
+      const checkedContext = drive.checkedPlan || drive.humanCanonicalPlan
+        ? checkedImplementationContext(approvedPlan, frozenMilestones) + renderPlanApprovalAdvice(drive.checkedFindings) : "";
       const seededPlanBody = embedSeededPlan({
         preApproved,
         seeded: ctx.seeded === true,

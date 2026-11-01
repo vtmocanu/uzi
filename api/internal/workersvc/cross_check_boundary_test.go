@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -200,6 +201,81 @@ func (tx *crossCheckBoundaryTx) Exec(_ context.Context, sql string, args ...any)
 	// Positional: $7 is plan_cross_check_gate_reason (server_gate_reason is $6) in SetRunAwaitingApproval.
 	tx.reason = args[6].(pgtype.Text).String
 	return pgconn.NewCommandTag("UPDATE 0"), nil
+}
+
+func TestGatedLegacyGateUsesLockedGeneration(t *testing.T) {
+	w := worker()
+	r := store.Run{ID: uuid.New(), UserID: w.UserID, WorkerID: pgconv.UUID(w.ID), Kind: "issue",
+		Status: "running", Harness: "claude", PlanCrossCheckGated: true, ClaimGeneration: 1}
+	locked := r
+	locked.ClaimGeneration = 7 // The unlocked ownership read is deliberately stale.
+	tx := &crossCheckBoundaryTx{t: t, run: locked, checkErr: pgx.ErrNoRows}
+	tx.exec = func(sql string, args []any) (pgconn.CommandTag, error) {
+		if !strings.HasPrefix(sql, "-- name: SetRunAwaitingApproval") {
+			t.Fatalf("unexpected write: %s", sql)
+		}
+		tx.writes++
+		if got := args[14].(pgtype.Int8); !got.Valid || got.Int64 != 7 {
+			t.Fatalf("SQL generation = %+v; want locked generation 7", got)
+		}
+		if got := args[5].(pgtype.Text); !got.Valid || got.String != "worker_unsupported" {
+			t.Fatalf("server gate reason = %+v", got)
+		}
+		return pgconn.NewCommandTag("UPDATE 0"), nil
+	}
+	svc := New(&fakeStore{runOwned: r}, newBox(t), testParams())
+	svc.SetTxBeginner(tx)
+	plan := "legacy plan"
+	result, err := svc.SetStateReportWithReconciliation(context.Background(), w, r.ID, StateRequest{State: "awaiting_approval", PlanMd: &plan})
+	if err != nil || result.Applied || tx.writes != 1 || !tx.committed {
+		t.Fatalf("applied=%v writes=%d committed=%v err=%v", result.Applied, tx.writes, tx.committed, err)
+	}
+}
+
+func TestGatedLegacyGenerationControls(t *testing.T) {
+	for _, tc := range []struct {
+		name                                                        string
+		capable, generationFence, required, noLock, released, stale bool
+		want                                                        error
+	}{
+		{name: "capable worker must supply generation", capable: true, want: ErrClaimGenerationRequired},
+		{name: "older capable worker keeps its generation fence", generationFence: true, want: ErrMissingClaimGeneration},
+		{name: "required check must supply generation", required: true, want: ErrClaimGenerationRequired},
+		{name: "no server row lock", noLock: true, want: ErrClaimGenerationRequired},
+		{name: "released claim", released: true, want: ErrStaleClaim},
+		{name: "supplied stale generation is refused", stale: true, want: ErrStaleClaim},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := worker()
+			if tc.capable {
+				w.ProtocolCapabilities = []string{capability.CrossCheckGatedV1}
+			}
+			if tc.generationFence {
+				w.ProtocolCapabilities = []string{capability.CredentialSwitchV1}
+			}
+			r := store.Run{ID: uuid.New(), UserID: w.UserID, WorkerID: pgconv.UUID(w.ID), Kind: "issue",
+				Status: "running", Harness: "claude", PlanCrossCheckGated: !tc.required, PlanCrossCheckRequired: tc.required,
+				AutoApprove: tc.required, ClaimGeneration: 7}
+			if tc.released {
+				r.ClaimReleasedAt = pgtype.Timestamptz{Valid: true}
+			}
+			tx := &crossCheckBoundaryTx{t: t, run: r, checkErr: pgx.ErrNoRows}
+			svc := New(&fakeStore{runOwned: r}, newBox(t), testParams())
+			if !tc.noLock {
+				svc.SetTxBeginner(tx)
+			}
+			plan := "legacy plan"
+			req := StateRequest{State: "awaiting_approval", PlanMd: &plan}
+			if tc.stale {
+				gen := int64(1)
+				req.ClaimGeneration = &gen
+			}
+			_, applied, err := svc.SetState(context.Background(), w, r.ID, req)
+			if !errors.Is(err, tc.want) || applied || tx.writes != 0 || tx.committed {
+				t.Fatalf("applied=%v writes=%d committed=%v err=%v; want %v", applied, tx.writes, tx.committed, err, tc.want)
+			}
+		})
+	}
 }
 
 func TestPlanCrossCheckRefusalStateBoundary(t *testing.T) {

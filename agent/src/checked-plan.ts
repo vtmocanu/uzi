@@ -1,5 +1,5 @@
 // The checked plan-gate contract both lead executors (sdk-executor.ts, codex/codex-executor.ts)
-// consume: the validated server bundle of an APPROVED cross-check, the implement-prompt context
+// consume: the validated server candidate approved by a checker or a human, the implement-prompt context
 // that carries it, and the bound on automatic revision rounds. One copy, so the two harnesses
 // cannot drift on what "exactly the approved candidate" means.
 
@@ -10,7 +10,7 @@ import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 const MAX_AUTOMATIC_ROUND = 4;
 
 /**
- * Validate the whole checked-approval bundle before adopting any of it. The digest is an opaque
+ * Validate the whole canonical approval bundle before adopting any of it. The digest is an opaque
  * server SHA-256 identity, not a locally recomputed proof of approval; the bundle must belong to
  * the claim generation this execution holds. Throws TrustedExecutionRefusal on any defect.
  */

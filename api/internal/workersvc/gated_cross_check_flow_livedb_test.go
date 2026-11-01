@@ -28,10 +28,33 @@ func (f *gateFix) crossCheckRows(t *testing.T, run uuid.UUID) int {
 	return n
 }
 
+// A pre-generation-fence worker can open an ordinary human gate. Its reconciliation
+// snapshot uses the server generation, and implementation still needs human approval.
+func TestGatedLegacyWorkerWithoutGenerationLiveDB(t *testing.T) {
+	f := newGateFix(t, 3)
+	f.liveWorker()
+	run := f.newRun("issue")
+	f.exec(`UPDATE runs SET plan_cross_check_gated=true WHERE id=$1`, run)
+	result, err := f.svc.SetStateReportWithReconciliation(f.ctx, f.wkr, run, gateReq(nil, nil))
+	if err != nil || !result.Applied || result.GateRevision != 1 || result.Run.Status != "awaiting_approval" {
+		t.Fatalf("legacy gate: %+v err=%v", result, err)
+	}
+	if proof := result.Reconciliation; proof == nil || proof.ClaimGeneration != 1 || proof.GateRevision != 1 || !proof.PlanCrossCheckSettled {
+		t.Fatalf("legacy gate reconciliation: %+v", proof)
+	}
+	if reason, ok := f.gateReasonOf(t, run); !ok || reason != "worker_unsupported" {
+		t.Fatalf("gate reason = %q (set %v)", reason, ok)
+	}
+	if n := f.crossCheckRows(t, run); n != 0 {
+		t.Fatalf("legacy gate created %d checks", n)
+	}
+	if _, applied, err := f.svc.SetState(f.ctx, f.wkr, run, StateRequest{State: "running", ClaimGeneration: i64(1)}); err != nil || applied {
+		t.Fatalf("legacy gate must still require human approval: applied=%v err=%v", applied, err)
+	}
+}
+
 // TestGatedOldWorkerGateFlowLiveDB drives a worker that does not advertise cross_check_gated_v1
-// through gate -> human revise -> re-gate -> approve -> running (PRD #3708 seam 2: the api
-// is new, the worker is old). The worker declares no reason; the server records worker_unsupported
-// itself, and an old worker's ordinary gate keeps every pre-existing guarantee.
+// through gate -> human revise -> re-gate -> approve -> running (PRD #3708 seam 2).
 func TestGatedOldWorkerGateFlowLiveDB(t *testing.T) {
 	f := newGateFix(t, 3)
 	f.liveWorker()

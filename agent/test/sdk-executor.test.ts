@@ -1590,6 +1590,23 @@ describe("SdkExecutor checked canonical approval", () => {
     return { kind: "approve", approval: "cross_check", selection: { status: "absent" }, canonical: bundle } as PlanVerdict;
   }
 
+  it("a human approval implements the presented canonical bundle without checker approval", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones([{ id: "local", title: "LOCAL title" }], "LOCAL raw plan"), resultSuccess()],
+      [reportProgress([], ["server-id"]), signalDone(), resultSuccess()],
+    ]);
+    const human = { ...checked(), approval: "human" } as PlanVerdict;
+    const probe = makeCtx({ claimGeneration: 7, reportProgress: async () => {} } as Partial<RunContext>, [human]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    const prompt = turns[1]!.promptText!;
+    assert.ok(prompt.includes(canonical.plan), "implementation uses the presented plan despite the existing session");
+    const contract = prompt.match(/<approved_milestone_contract>\n([\s\S]*?)\n<\/approved_milestone_contract>/);
+    assert.ok(contract);
+    assert.deepEqual(JSON.parse(contract[1]!), canonical.milestones);
+    assert.doesNotMatch(prompt, /LOCAL|cross-checked/);
+    assert.deepEqual(transitionFrames(probe.emits), ["milestone server-id started — Server scrubbed title"]);
+  });
+
   it("M1 approval advice reaches actual SDK prompts completely; empty variants preserve bytes", async () => {
     const issueDescription = "Implement criteria A, B, C and D (fourth criterion).";
     const approved = { ...canonical, plan: "Implement criteria A, B and C." };

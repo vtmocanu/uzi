@@ -4629,7 +4629,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 	}
 	// Required reconciliation cannot infer authority from an unfenced report.
-	if reconciliationOut != nil && (owned.PlanCrossCheckRequired || owned.PlanCrossCheckGated) && (req.State == "running" || req.State == "awaiting_approval") && req.ClaimGeneration == nil {
+	// An ordinary gate from a legacy gated worker instead uses the server generation
+	// under the owning row lock below. This does not relax revision or running reports.
+	legacyGatedReport := req.ClaimGeneration == nil && !owned.PlanCrossCheckRequired && gatedServerGateReason(owned, wkr, req).Valid
+	if reconciliationOut != nil && (owned.PlanCrossCheckRequired || owned.PlanCrossCheckGated) && (req.State == "running" || req.State == "awaiting_approval") && req.ClaimGeneration == nil && !legacyGatedReport {
 		return owned, false, ErrClaimGenerationRequired
 	}
 	q := Store(s.q)
@@ -4797,6 +4800,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		req.RequiredCapabilities = &caps
 	}
 	var rows int64
+	stateClaimGeneration := req.ClaimGeneration
 	// PRD #1795 M1: a refused awaiting_approval report (historical id, changed payload on the
 	// current id, stale adoption). It wrote no report; it is returned AFTER the commit (its
 	// accounting commits) and after the terminal fan-out when the refusal cap failed the run.
@@ -4998,7 +5002,13 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
 		if owned.PlanCrossCheckRequired || owned.PlanCrossCheckGated {
 			if req.ClaimGeneration == nil {
-				return owned, false, ErrClaimGenerationRequired
+				if !legacyGatedReport || owned.PlanCrossCheckRequired || !gatedServerGateReason(owned, wkr, req).Valid ||
+					!gateTracked || fenceTx == nil || owned.ClaimGeneration <= 0 || owned.ClaimReleasedAt.Valid {
+					return owned, false, ErrClaimGenerationRequired
+				}
+				// Never synthesize a worker report: only the SQL fence and the response
+				// snapshot use this server-owned value, captured under FOR UPDATE.
+				stateClaimGeneration = &owned.ClaimGeneration
 			}
 			if err := s.validatePlanCrossCheckGateReason(ctx, q, wkr, owned, req, gateTracked && fenceTx != nil); err != nil {
 				return owned, false, err
@@ -5009,7 +5019,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		approvalParams := store.SetRunAwaitingApprovalParams{
 			PlanCrossCheckGateReason:  pgconv.TextPtr(req.PlanCrossCheckGateReason),
 			PlanCrossCheckDiffRefusal: pgconv.TextOrNull(req.PlanCrossCheckDiffRefusal),
-			ClaimGeneration:           pgconv.Int8Ptr(req.ClaimGeneration),
+			ClaimGeneration:           pgconv.Int8Ptr(stateClaimGeneration),
 			PlanMd:                    stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			// Issue #1626: an interlocked run's FIRST plan-bearing report with no milestones is the
 			// explicit `[]` (planMilestonesParam), so the approve freeze builds a criteria:[]
@@ -5566,10 +5576,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if reconciliationOut != nil && (owned.PlanCrossCheckRequired || owned.PlanCrossCheckGated) && rows > 0 && gateRefusal == nil &&
 		(req.State == "awaiting_approval" || req.State == "running") {
 		reader, ok := q.(reconciliationReader)
-		if fenceTx == nil || req.ClaimGeneration == nil || !ok {
+		if fenceTx == nil || stateClaimGeneration == nil || !ok {
 			return store.Run{}, false, ErrCrossCheckRefused
 		}
-		reconciliation, err = captureLeadReconciliation(ctx, reader, wkr, runID, *req.ClaimGeneration)
+		reconciliation, err = captureLeadReconciliation(ctx, reader, wkr, runID, *stateClaimGeneration)
 		if err != nil {
 			return store.Run{}, false, err
 		}

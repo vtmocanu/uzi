@@ -14144,6 +14144,8 @@ export class RunRunner {
             await this.observeSemanticDrift(flight, { phase: "presentation",
               candidate_digest: semanticCompiled!.candidate.digest, gate_revision: ack.gateRevision! }, steering.lifecycleSignal());
           } : undefined,
+          gatedPass ? { plan: presentedPlanMd, milestones: presentedMilestones ?? [],
+            candidate_digest: gatedPass.response.candidate_digest, claimGeneration: flight.claimGeneration } : undefined,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
@@ -23792,6 +23794,7 @@ export class RunRunner {
     revisionRecovery?: PlanRevisionRecovery,
     semanticPark?: SemanticPark,
     onSemanticPresented?: (ack: StateAck) => Promise<void>,
+    presentedCanonical?: Extract<PlanVerdict, { approval: "cross_check" }>["canonical"],
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -24093,7 +24096,10 @@ export class RunRunner {
         // Issue #1604: no later verdict can act; each is final on arrival.
         steering.closeGate(v.kind);
       }
-      return v; // NOTE: no bump here — the awaiting_approval re-report bumps.
+      // Preserve the presented candidate even when a credential switch resumes this
+      // same wait. The human remains the approver; this bundle carries only its data.
+      // No bump here: the awaiting_approval re-report bumps.
+      return v.kind === "approve" && presentedCanonical ? { ...v, canonical: presentedCanonical } : v;
     };
 
     if (this.planApprovalTimeoutMs <= 0)

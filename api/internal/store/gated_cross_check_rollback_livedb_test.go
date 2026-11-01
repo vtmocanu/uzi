@@ -137,9 +137,9 @@ func requireRefusedDown(t *testing.T, err error) {
 
 func TestGatedPlanCrossCheckMigrationDownLiveDB(t *testing.T) {
 	wantHead, wantBetween, wantBelow := gatedSchemas(t)
-	upV, _, lowerV := gatedMigrationVersions(t)
+	upV, validateV, lowerV := gatedMigrationVersions(t)
 	ctx, dsn := standIsolatedDB(t, "gated_down_")
-	if err := store.Migrate(ctx, dsn); err != nil {
+	if err := store.MigrateTo(ctx, dsn, validateV); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -190,15 +190,15 @@ func TestGatedPlanCrossCheckMigrationDownLiveDB(t *testing.T) {
 	}
 }
 
-// Up -> Down -> Up recreates the column, constraints, trigger and function (twice, so a leftover
-// object from a Down would fail the second Up), and the recreated trigger still guards the gate.
+// Up -> Down -> Up at this pair's validate version recreates the column, constraints, trigger
+// and function twice, detecting leftover objects. The recreated trigger still guards the gate.
 func TestGatedPlanCrossCheckMigrationCycleLiveDB(t *testing.T) {
 	wantHead, _, wantBelow := gatedSchemas(t)
-	_, _, lowerV := gatedMigrationVersions(t)
+	_, validateV, lowerV := gatedMigrationVersions(t)
 	ctx, dsn := standIsolatedDB(t, "gated_cycle_")
 	var owner rollbackIDs
 	for cycle := 1; cycle <= 2; cycle++ {
-		if err := store.Migrate(ctx, dsn); err != nil {
+		if err := store.MigrateTo(ctx, dsn, validateV); err != nil {
 			t.Fatalf("cycle %d Up: %v", cycle, err)
 		}
 		pool, err := store.OpenPool(ctx, dsn)
@@ -234,8 +234,8 @@ func TestGatedPlanCrossCheckMigrationCycleLiveDB(t *testing.T) {
 		requireGatedSchema(t, "cycle Down", gatedFacts(ctx, t, pool), wantBelow)
 		pool.Close()
 	}
-	// The schema also ends where a never-downgraded database does.
-	if err := store.Migrate(ctx, dsn); err != nil {
+	// Finish at this pair's validate version, independent of later embedded migrations.
+	if err := store.MigrateTo(ctx, dsn, validateV); err != nil {
 		t.Fatalf("final Up: %v", err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
