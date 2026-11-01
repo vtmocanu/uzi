@@ -479,6 +479,19 @@ describe("Run defaults — judge model per harness (PRD #3245)", () => {
     expect(codexEffect?.textContent).toBe("In effect: gpt-6-sol \u00b7 your choice");
   });
 
+  it("harness help says Default · automatic (not 'Use my default') and summary help is Claude-only (#3255)", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings());
+    renderPage();
+    await screen.findByLabelText("Claude judge model");
+    const harnessHelp = screen.getByText(/to let uzi choose your only usable/).textContent ?? "";
+    expect(harnessHelp).toContain("Default · automatic");
+    expect(harnessHelp).not.toContain("Use my default");
+    const harnessOptions = Array.from((screen.getByLabelText("Default harness") as HTMLSelectElement).options).map((o) => o.text);
+    expect(harnessOptions.some((t) => t.includes("Use my default"))).toBe(false);
+    expect(screen.getByText(/This setting applies to Claude runs/).textContent).toContain("Codex summaries use a fixed model");
+  });
+
   it("saves only the dirty lane, and adopts the response's In-effect cell", async () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
     mockApi.getMySettings.mockResolvedValue(judgeSettings());

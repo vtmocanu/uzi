@@ -395,7 +395,7 @@ describe("the output-mode control on a DEFAULT prompt schedule (PRD #929, F5)", 
 describe('the "apply model also to agents" toggle (PRD #305)', () => {
   it("renders always enabled, including when Model is Inherit/empty", () => {
     renderModal();
-    // A fresh create leaves Model on Inherit (empty). The toggle is first-class on
+    // A fresh create leaves Model on Default (empty). The toggle is first-class on
     // Inherit (Decision 3), so it must render and never be disabled.
     const model = screen.getByLabelText("Model (optional)") as HTMLSelectElement;
     expect(model.value).toBe("inherit");

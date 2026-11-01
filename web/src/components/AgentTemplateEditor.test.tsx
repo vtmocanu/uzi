@@ -36,4 +36,22 @@ describe("AgentTemplateEditor model Default label (#3255)", () => {
     expect(select.options[0]?.text).toBe("Default · lead's model");
     expect(screen.queryByText(WORKER_MODEL_HELP)).toBeNull();
   });
+
+  it("the shipped-vs-current model diff names the Default label for a null shipped model", () => {
+    render(
+      <MemoryRouter>
+        <AgentTemplateEditor
+          initial={{ name: "coder", description: "d", model: "sonnet", tools: null, prompt_body: "b" }}
+          builtin={{ name: "coder", description: "d", model: null, tools: null, prompt_body: "b" }}
+          nameEditable={false}
+          submitLabel="Save"
+          busy={false}
+          error=""
+          onSubmit={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("Default · lead's model", { selector: "span.text-ok" })).toBeTruthy();
+    expect(screen.queryByText(/^inherit$/i)).toBeNull();
+  });
 });

@@ -175,7 +175,7 @@ export function ModelSelect({
             existing custom value that predates a harness switch must still have a
             matching <option value="custom"> — otherwise a controlled <select> whose
             value names an absent option silently falls back to the first option
-            (selectedIndex 0), which would show "Inherit" while still emitting the
+            (selectedIndex 0), which would show "Default" while still emitting the
             stale custom string underneath it. */}
         {(customAllowed || mode === "custom") && <option value="custom">Other (custom model ID)…</option>}
       </Select>

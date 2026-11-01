@@ -12,7 +12,7 @@ const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 // EffortSelect is the per-user reasoning-effort picker: a caller-labelled Default (empty) option,
 // an optional "Runtime default" option (only when runtimeLabel is passed), plus the
 // five closed levels. The effective value is surfaced through onChange ("" =
-// inherit, "runtime" = the preference-only token). Unlike ModelSelect there is NO
+// the Default option, "runtime" = the preference-only token). Unlike ModelSelect there is NO
 // custom free-text mode and NO warning surface — the enum is closed, so the control
 // can only ever emit a valid value, "" or (when offered) "runtime".
 export function EffortSelect({

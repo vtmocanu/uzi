@@ -1,12 +1,14 @@
 import { useState, type FormEvent } from "react";
 import { api, type AppSettings, type SettingsResponse } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
-import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
+import { ModelSelect } from "../../components/ModelSelect";
+import { modelFieldWarning } from "../../lib/agentTemplates";
+import { Alert, Button, Card, Field, SectionTitle } from "../../components/ui";
 
 // SummarySettingsCard is the admin surface for the run-summary model (PRD #362
 // Decision 8): the cheap model the inline plain-English run-summary generator runs
-// on. It mirrors the Judge model field exactly — a raw free-text model alias input —
-// but the value rides the ISSUE-run claim, not the judge claim, and a per-user
+// on. It uses the curated Claude model picker with a custom-ID escape (no Default
+// option: the value is always a model). The value the value rides the ISSUE-run claim, not the judge claim, and a per-user
 // override wins where set. Saved independently through the same settings PUT.
 export function SummarySettingsCard({
   settings,
@@ -16,6 +18,7 @@ export function SummarySettingsCard({
   onSaved: (resp: SettingsResponse) => void;
 }) {
   const [model, setModel] = useState(settings.summary_model);
+  const [modelCustom, setModelCustom] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -29,8 +32,20 @@ export function SummarySettingsCard({
   const nowDirty = nowEnabled !== savedNow;
   const dirty = modelDirty || nowDirty;
 
+  // No Default option here (the value is never ""), so an empty custom box or a blank
+  // value is an error; a malformed ID is a warning. Either blocks saving a changed model.
+  const warning = modelFieldWarning(model);
+  const emptyError =
+    model.trim() !== ""
+      ? ""
+      : modelCustom
+        ? "Enter a model ID, or choose a listed model."
+        : "The summary model must not be empty.";
+  const modelInvalid = modelDirty && (warning !== "" || emptyError !== "");
+
   const save = async (e: FormEvent) => {
     e.preventDefault();
+    if (modelInvalid) return;
     setError("");
     setNotice("");
     if (modelDirty && model.trim() === "") {
@@ -73,19 +88,29 @@ export function SummarySettingsCard({
 
       <form onSubmit={save} className="space-y-4">
         <div className="space-y-1.5">
-          <Field label="Summary model">
-            <Input
+          <Field label="Summary model" htmlFor="summary-model-admin">
+            <ModelSelect
+              id="summary-model-admin"
+              harness="claude"
+              defaultLabel={null}
               value={model}
-              maxLength={100}
-              autoComplete="off"
-              placeholder="haiku"
-              onChange={(e) => setModel(e.target.value)}
+              onChange={setModel}
+              onCustomModeChange={setModelCustom}
+              customAriaLabel="Custom summary model ID"
+              ariaDescribedBy="summary-model-admin-help"
             />
           </Field>
-          <p className="text-xs text-faint">
-            The Claude model the run-summary generator runs on. The default is{" "}
+          {warning && <Alert tone="warning" message={warning} />}
+          {emptyError && (
+            <p className="text-xs text-danger" role="alert">
+              {emptyError}
+            </p>
+          )}
+          <p id="summary-model-admin-help" className="text-xs text-faint">
+            The Claude model the run-summary generator runs on. Choose a listed model, or pick Other to enter
+            a custom model ID. The default is{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">haiku</code> — fast and near-free, since
-            summaries are light and produced per run. Pin{" "}
+            summaries are light and produced per run. Choose{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">sonnet</code> or{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">opus</code> for richer summaries.
           </p>
@@ -108,7 +133,7 @@ export function SummarySettingsCard({
           </p>
         </div>
 
-        <Button type="submit" disabled={busy || !dirty}>
+        <Button type="submit" disabled={busy || !dirty || modelInvalid}>
           {busy ? "Saving…" : "Save run summary settings"}
         </Button>
       </form>
