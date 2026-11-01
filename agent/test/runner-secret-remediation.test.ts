@@ -142,6 +142,7 @@ interface Drive {
 async function drive(opts: {
   iid: number;
   forge: "github" | "gitlab";
+  attemptPaths?: boolean;
   body: (ctx: RunContext, gate: () => Promise<SecretRemediationDecision>, d: () => Drive) => Promise<void>;
   configure?: (g: GitCache) => void;
   /** Runs on the runner instance right after construction (e.g. to stub a private method). */
@@ -158,6 +159,10 @@ async function drive(opts: {
     pushed++;
     pushedTips.push(trackingOf(bare, branch));
   };
+  if (opts.attemptPaths) {
+    const bare = await g.ensureClone(fx.originPath);
+    gitIn(bare, ["config", "uzi-attemptmode.issue-" + opts.iid + ".enabled", "true"]);
+  }
   opts.configure?.(g);
   const pub = stubPublish();
   const claim = forgeClaim(opts.iid, opts.forge);
@@ -1649,4 +1654,61 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     assert.equal(d.pub.count(), 1);
     assert.ok(d.completed());
   });
+});
+
+
+for (const origin of ["checkpoint-pending", "pre-exit"] as const) {
+  it("M1 production " + origin + " persists exact attempt provenance", { skip }, async () => {
+    let observed = false;
+    const outcome = await drive({
+      iid: origin === "pre-exit" ? 3747_101 : 3747_102,
+      forge: origin === "pre-exit" ? "github" : "gitlab",
+      attemptPaths: true,
+      body: async (ctx, gate, d) => {
+        const q = commitIn(ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        if (origin === "pre-exit") assert.equal((await gate()).action, "remediate");
+        else await ctx.checkpoint!({ reap: true });
+        const journal = JSON.parse(gitIn(d().bare, ["config", "--get", "uzi-recovery." + ctx.branch + ".clone"]));
+        const r = journal.remediationRecovery;
+        assert.ok(r);
+        assert.equal(r.active.origin, origin);
+        assert.equal(r.active.scannedTip, q);
+        assert.deepEqual(r.active.flaggedOIDs, [q]);
+        assert.deepEqual(r.active.originSource, {
+          runId: journal.runId, clonePath: ctx.worktreePath, attemptId: journal.attemptId,
+        });
+        observed = true;
+      },
+    });
+    assert.ok(observed, outcome.everything());
+    assert.deepEqual(errors, []);
+  });
+}
+
+it("M1 production checkpoint refuses mixed valid and invalid finding identities atomically", { skip }, async () => {
+  let observed = false;
+  let scanned = false;
+  await drive({
+    iid: 3747_103, forge: "gitlab", attemptPaths: true,
+    configure: g => {
+      const scan = g.secretScanCheckpointRange.bind(g);
+      g.secretScanCheckpointRange = async (...args) => {
+        const result = await scan(...args);
+        scanned ||= result.findings.length > 0;
+        return result.findings.length
+          ? { ...result, findings: [...result.findings, { ...result.findings[0]!, commit: "invalid" }] }
+          : result;
+      };
+    },
+    body: async (ctx, _gate, d) => {
+      commitIn(ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+      await ctx.checkpoint!({ reap: true });
+      const journal = JSON.parse(gitIn(d().bare, ["config", "--get", "uzi-recovery." + ctx.branch + ".clone"]));
+      assert.equal(journal.remediationRecovery, undefined);
+      observed = true;
+    },
+  });
+  assert.ok(observed);
+  assert.ok(scanned);
+  assert.deepEqual(errors, []);
 });

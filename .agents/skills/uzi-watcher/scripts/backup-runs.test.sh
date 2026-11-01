@@ -549,6 +549,67 @@ expect_pick() {
     || fail "$1: expected WIP marker $3 missing"
 }
 
+# M1 remediationRecovery parity: both journal readers retain a valid record and
+# refuse the whole descriptor for malformed bounded provenance or rewrite graphs.
+for kind in protected ordinary; do
+  reset_layout
+  rid=completed-1
+  [ "$kind" = protected ] || rid=run-4242
+  predecessor="$RB/issue-4242.attempt-$A1"
+  make_clone "$predecessor" agent/issue-4242 remediation-dirty
+  rr_journal="$(jq -cn --arg rid "$rid" --arg p "$predecessor" --arg a "$A1" '
+    {runId:$rid,clonePath:$p,attemptId:$a} as $s
+    | ("a"*40) as $q | ("b"*40) as $t
+    | {id:1,origin:"checkpoint-pending",originSource:$s,scannedTip:$q,flaggedOIDs:[$q]} as $g
+    | $s + {remediationRecovery:($s + {version:1,branch:"agent/issue-4242",sequence:1,
+      ownedTip:$t,flaggedOIDs:[$q],active:$g,
+      edges:[{from:$q,to:$t,grant:$g,context:("context-"+("c"*64)+".json"),phase:"committed"}]})}')"
+  if [ "$kind" = protected ]; then
+    ledger "$A1" "$rid" "$predecessor" live
+    rr_journal="$(printf '%s' "$rr_journal" | jq '. + {retainedSources:[{runId,clonePath,attemptId}]}')"
+  fi
+  for variant in valid unknown version identity path attempt origin-source origin-extra origin-missing control bounds flags edges grant conflict cycle overflow; do
+    value="$rr_journal"
+    case "$variant" in
+      unknown) filter='.remediationRecovery.extra=1' ;;
+      version) filter='.remediationRecovery.version=2' ;;
+      identity) filter='.remediationRecovery.runId="other"' ;;
+      path) filter='.remediationRecovery.clonePath="/outside/source"' ;;
+      attempt) filter='.remediationRecovery.attemptId="invalid"' ;;
+      origin-source) filter='.remediationRecovery.active.originSource.clonePath="/outside/source"' ;;
+      origin-extra) filter='.remediationRecovery.active.originSource.extra=1' ;;
+      origin-missing) filter='del(.remediationRecovery.active.originSource.attemptId)' ;;
+      control) filter='.remediationRecovery.branch="agent/\u202eunsafe"' ;;
+      bounds) filter='.remediationRecovery.sequence=9007199254740992' ;;
+      flags) filter='.remediationRecovery.flaggedOIDs = [range(65) | ("a"*40)]' ;;
+      edges) filter='.remediationRecovery.edges |= (. as $e | [range(65) | $e[0]])' ;;
+      grant) filter='.remediationRecovery.active.origin="request"' ;;
+      conflict) filter='.remediationRecovery.active.scannedTip=("d"*40)' ;;
+      cycle) filter='.remediationRecovery.edges += [(.remediationRecovery.edges[0] | .from=("b"*40) | .to=("a"*40))]' ;;
+      overflow) filter='.remediationRecovery.branch=("x"*65536)' ;;
+      valid) filter='.' ;;
+    esac
+    value="$(printf '%s' "$value" | jq "$filter")"
+    if [ "$kind" = protected ]; then
+      value="$(printf '%s' "$value" | jq '{version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+      git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+    else
+      git --git-dir="$BARE" config "$JKEY" "$value"
+    fi
+    dest="$WORK/out.remediation-$kind-$variant"
+    rc="$(backup_rc "$dest" "$rid")"
+    if [ "$variant" = valid ]; then
+      [ "$rc" -eq 0 ] || fail "remediation $kind: valid record rejected; $(cat "$dest/latest-attempt/backup.log")"
+      tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+remediation-dirty' \
+        || fail "remediation $kind: dirty bytes missing"
+    else
+      [ "$rc" -ne 0 ] || fail "remediation $kind/$variant: invalid record accepted"
+      [ ! -e "$dest/latest-attempt/issue-4242.tgz" ] || fail "remediation $kind/$variant: invalid record attributed bytes"
+    fi
+    echo "PASS remediation $kind/$variant"
+  done
+done
+
 # #2958: detached protected descriptors and ordinary journals carry an optional
 # positive safe-integer claim fence. Missing fences remain valid legacy progress.
 for kind in protected ordinary; do

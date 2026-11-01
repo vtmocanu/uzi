@@ -1571,6 +1571,8 @@ export interface RecoveryJournalEntry extends RecoverySource {
    *  a coverage wrapper may leave such a superseded marker as a leaf. Lost lineage can only cause a
    *  refusal, never an acceptance. */
   peeledMarkers?: string[];
+  /** Worker-only restrictions and observed rewrite evidence; never adoption or publication authority. */
+  remediationRecovery?: RemediationRecovery;
   /** issue #3404 M2: the authenticated completion-source fence {version, sourceUseEpoch,
    *  sourceCoreDigest}, installed on the plain completing journal by
    *  {@link GitCache.installCompletionSourceFence} and consumed by completion retirement. Always
@@ -1583,6 +1585,101 @@ export interface RecoveryJournalEntry extends RecoverySource {
    *  release. Always emitted immediately before `completionSourceFence` (see recoveryJournalJson). Workers built
    *  before this field existed reject the unknown key (their strict allowlist), the same accepted rollback fence. */
   memoryPark?: MemoryParkRecord;
+}
+
+export interface RemediationGrant {
+  id: number;
+  origin: "checkpoint-pending" | "pre-exit";
+  originSource: { runId: string; clonePath: string; attemptId: string };
+  scannedTip: string;
+  flaggedOIDs: string[];
+}
+export interface RemediationRecovery {
+  version: 1;
+  runId: string;
+  branch: string;
+  clonePath: string;
+  attemptId: string;
+  sequence: number;
+  ownedTip: string;
+  flaggedOIDs: string[];
+  active?: RemediationGrant;
+  edges: Array<{ from: string; to: string; grant: RemediationGrant; context: string; phase: "prepared" | "committed" }>;
+}
+
+function validRemediationBranch(branch: string): boolean {
+  return !branch.startsWith("-") && branch !== "@" && !branch.includes("..") && !branch.includes("@{") &&
+    !/[ ~^:?*[\\]/.test(branch) && branch.split("/").every(p => p.length > 0 && !p.startsWith(".") &&
+      !p.endsWith(".") && !p.endsWith(".lock"));
+}
+
+function parseRemediationRecovery(value: unknown): RemediationRecovery {
+  const fail = (): never => { throw new Error("invalid remediation recovery"); };
+  const object = (v: unknown, keys: string[]) => {
+    if (!v || typeof v !== "object" || Array.isArray(v) ||
+        Object.keys(v).some(k => !keys.includes(k))) fail();
+    return v as Record<string, unknown>;
+  };
+  const identifier = (v: unknown, max: number): v is string =>
+    typeof v === "string" && Buffer.byteLength(v, "utf8") > 0 && Buffer.byteLength(v, "utf8") <= max &&
+    sanitizeForLog(v, Infinity) === v;
+  const oid = (v: unknown): v is string => typeof v === "string" && SHA40_RE.test(v);
+  const list = (v: unknown): string[] => {
+    if (!Array.isArray(v) || v.length > 64 || !v.every(oid) || new Set(v).size !== v.length) fail();
+    return [...v as string[]];
+  };
+  const integer = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
+  const grant = (v: unknown): RemediationGrant => {
+    const g = object(v, ["id", "origin", "originSource", "scannedTip", "flaggedOIDs"]);
+    const s = object(g.originSource, ["runId", "clonePath", "attemptId"]);
+    if (!identifier(s.runId, 128) || !OWED_RUN_ID.test(s.runId) || !identifier(s.clonePath, 4096) ||
+        !identifier(s.attemptId, 256) || !ATTEMPT_ID_RE.test(s.attemptId)) fail();
+    const originSource = recoverySource(s) as RemediationGrant["originSource"];
+    if (!integer(g.id) || (g.id as number) < 1 || !["checkpoint-pending", "pre-exit"].includes(g.origin as string) ||
+        !oid(g.scannedTip)) fail();
+    const flaggedOIDs = list(g.flaggedOIDs);
+    if (!flaggedOIDs.length) fail();
+    return { id: g.id as number, origin: g.origin as RemediationGrant["origin"], originSource, scannedTip: g.scannedTip as string, flaggedOIDs };
+  };
+  const o = object(value, ["version", "runId", "branch", "clonePath", "attemptId", "sequence", "ownedTip", "flaggedOIDs", "active", "edges"]);
+  if (Buffer.byteLength(JSON.stringify(value), "utf8") > 65536 || o.version !== 1 ||
+      !identifier(o.runId, 128) || !OWED_RUN_ID.test(o.runId) ||
+      !identifier(o.branch, 1024) || !validRemediationBranch(o.branch) || !identifier(o.clonePath, 4096) ||
+      !path.isAbsolute(o.clonePath as string) || path.normalize(o.clonePath as string) !== o.clonePath ||
+      !identifier(o.attemptId, 256) || !ATTEMPT_ID_RE.test(o.attemptId) ||
+      !integer(o.sequence) || !oid(o.ownedTip) || !Array.isArray(o.edges) || o.edges.length > 64) fail();
+  recoverySource({ runId: o.runId, clonePath: o.clonePath, attemptId: o.attemptId });
+  const flaggedOIDs = list(o.flaggedOIDs);
+  const active = o.active === undefined ? undefined : grant(o.active);
+  const edges: RemediationRecovery["edges"] = (o.edges as unknown[]).map(v => {
+    const e = object(v, ["from", "to", "grant", "context", "phase"]);
+    if (!oid(e.from) || !oid(e.to) || e.from === e.to || !identifier(e.context, 77) ||
+        !/^context-[0-9a-f]{64}\.json$/.test(e.context) || !["prepared", "committed"].includes(e.phase as string)) fail();
+    return { from: e.from as string, to: e.to as string, grant: grant(e.grant), context: e.context as string,
+      phase: e.phase as "prepared" | "committed" };
+  });
+  const grants = new Map<number, string>();
+  for (const g of [...edges.map(e => e.grant), ...(active ? [active] : [])]) {
+    const spelling = JSON.stringify(g);
+    if (g.originSource.runId !== o.runId || g.id > (o.sequence as number) || g.flaggedOIDs.some(q => !flaggedOIDs.includes(q)) ||
+        (grants.has(g.id) && grants.get(g.id) !== spelling)) fail();
+    grants.set(g.id, spelling);
+  }
+  const next = new Map<string, string>();
+  for (const e of edges) {
+    if (next.has(e.from)) fail();
+    next.set(e.from, e.to);
+  }
+  for (const start of next.keys()) {
+    const seen = new Set<string>();
+    for (let tip: string | undefined = start; tip !== undefined; tip = next.get(tip)) {
+      if (seen.has(tip)) fail();
+      seen.add(tip);
+    }
+  }
+  return { version: 1, runId: o.runId as string, branch: o.branch as string, clonePath: o.clonePath as string,
+    attemptId: o.attemptId as string, sequence: o.sequence as number, ownedTip: o.ownedTip as string,
+    flaggedOIDs, ...(active ? { active } : {}), edges };
 }
 
 /** The server-accepted (or attempted) park binding a record is about. */
@@ -1814,7 +1911,7 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
     throw new Error("invalid retained recovery clone journal");
   }
   const o = parsed as Record<string, unknown>;
-  if (Object.keys(o).some(k => !["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources", "peeledMarkers", "memoryPark", "completionSourceFence"].includes(k))) {
+  if (Object.keys(o).some(k => !["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources", "peeledMarkers", "remediationRecovery", "memoryPark", "completionSourceFence"].includes(k))) {
     throw new Error("invalid retained recovery clone journal");
   }
   // Legacy callers classify a mismatched attempt id as CapturePathMismatchError.
@@ -1860,8 +1957,11 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
     memoryPark = parseMemoryPark(o.memoryPark);
     if (memoryPark.binding.runId !== source.runId) throw new Error("memory park run identity mismatch");
   }
+  if (o.remediationRecovery !== undefined && !sameRecoverySource(parseRemediationRecovery(o.remediationRecovery), source))
+    throw new Error("remediation journal identity mismatch");
   return { ...source, ...(recovery ? { recovery } : {}), ...(retainedSources ? { retainedSources } : {}),
     ...(peeledMarkers?.length ? { peeledMarkers } : {}),
+    ...(o.remediationRecovery === undefined ? {} : { remediationRecovery: parseRemediationRecovery(o.remediationRecovery) }),
     ...(memoryPark ? { memoryPark } : {}),
     ...(completionSourceFence ? { completionSourceFence } : {}) };
 }
@@ -1873,7 +1973,8 @@ function recoveryJournalJson(journal: RecoveryJournalEntry): string {
   const { completionSourceFence, memoryPark, ...rest } = journal;
   // issue #3638: the memory-park record, when present, is re-parsed and emitted in its fixed field order at a fixed
   // position: after every other key, immediately before the fence (which stays the LAST key).
-  const withPark = memoryPark === undefined ? rest : { ...rest, memoryPark: parseMemoryPark(memoryPark) };
+  const canonical = rest.remediationRecovery === undefined ? rest : { ...rest, remediationRecovery: parseRemediationRecovery(rest.remediationRecovery) };
+  const withPark = memoryPark === undefined ? canonical : { ...canonical, memoryPark: parseMemoryPark(memoryPark) };
   if (completionSourceFence === undefined) return JSON.stringify(withPark);
   return JSON.stringify({ ...withPark, completionSourceFence: parseSourceFence(completionSourceFence) });
 }
@@ -2466,6 +2567,8 @@ export type CommittedTrackingOwnership =
   | { kind: "not_owned" };
 export interface FetchAgentBranchOptions {
   context: OwedCandidateContext;
+  /** Independently authenticated producing source; omitted by legacy/canonical imports. */
+  producingSource?: { runId: string; clonePath: string; attemptId: string };
   remotelyConfirmedSha?: string;
   /** Worker-captured candidate; never substitute a newer branch head. */
   expectedCandidateSha?: string;
@@ -5473,6 +5576,13 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       const importBranch = async (): Promise<TrackingUpdateResult> => {
         this.checkCheckpointCooperation();
+        const enrolled = await this.readRecoveryCapture(barePath, branch);
+        if (enrolled?.remediationRecovery && !opts.producingSource) throw new Error("remediation producing source required");
+        if (opts.producingSource) {
+          if (opts.producingSource.clonePath !== clonePath || opts.producingSource.runId !== runId)
+            throw new Error("remediation producing source mismatch");
+          await this.remediationSourceUnderLock(barePath, branch, opts.producingSource);
+        }
         const observed = await this.observeTrackingUnderLock(barePath, branch);
         const stage = `refs/uzi-incoming/${randomUUID()}`;
         opts.checkpointStep?.("checkpoint_import_transport");
@@ -5670,6 +5780,8 @@ export class GitCache {
     opts.checkpointStep?.("checkpoint_lock_wait");
     return this.withLock(barePath, async () => {
       opts.checkpointStep?.("checkpoint_bridge");
+      if ((await this.readRecoveryCapture(barePath, branch))?.remediationRecovery)
+        throw new Error("remediation tracking rebind requires proof");
       const observed = await this.observeTrackingUnderLock(barePath, branch);
       if (!observed) return { kind: "not_updated", reason: "ownership_unknown" };
       this.checkCheckpointCooperation();
@@ -6859,6 +6971,114 @@ export class GitCache {
    * later capture cannot prevent the restart guard from knowing whose work it is.
    * The runner clears this journal only after atomically retiring the clone
    * (retireRunnerClone), never before the rename. */
+  private async remediationSourceUnderLock(barePath: string, branch: string,
+    source: { runId: string; clonePath: string; attemptId: string }): Promise<{ journal: RecoveryJournalEntry; raw: string }> {
+    const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
+    const shape = parseAttemptPath(source.clonePath, path.resolve(this.runnerRoot));
+    const ledger = (await this.readAttemptLedger(barePath, branch)).get(source.attemptId);
+    if (!stored || !sameRecoverySource(stored.journal, source) || shape?.attemptId !== source.attemptId ||
+        path.resolve(source.clonePath) !== source.clonePath || !await this.realCloneDir(source.clonePath) ||
+        ledger?.runId !== source.runId || ledger.clonePath !== source.clonePath || ledger.state !== "live")
+      throw new Error("remediation source binding unavailable");
+    await this.admitSource(source.clonePath, "remediation-recovery");
+    const record = stored.journal.remediationRecovery;
+    if (record && (record.branch !== branch || !sameRecoverySource(record, source)))
+      throw new Error("remediation source binding changed");
+    return stored;
+  }
+
+  private async writeRemediationUnderLock(barePath: string, branch: string, stored: { journal: RecoveryJournalEntry; raw: string },
+    record: RemediationRecovery, durability: MemoryParkDurability = {}): Promise<void> {
+    if (await this.readRecoveryCaptureRaw(barePath, branch) !== stored.raw) throw new Error("remediation journal changed");
+    const value = { ...stored.journal, remediationRecovery: parseRemediationRecovery(record) };
+    await this.writeRecovery(barePath, branch, value);
+    await this.syncJournalAndReadBack(barePath, branch, recoveryJournalJson(value), durability);
+  }
+
+  /** Trusted worker scan/decision seam. A request or untrusted finding never opens a grant.
+   * The caller holds the existing source-use authority transaction; this method takes the bare lock. */
+  async recordRemediationScan(barePath: string, branch: string,
+    source: { runId: string; clonePath: string; attemptId: string },
+    scan: { trusted: boolean; tip: string; flaggedOIDs: readonly string[]; origin?: RemediationGrant["origin"] },
+    durability: MemoryParkDurability = {}): Promise<void> {
+    scan = { ...scan, flaggedOIDs: [...scan.flaggedOIDs] };
+    if (!scan.trusted) return;
+    await this.withLock(barePath, async () => {
+      const stored = await this.remediationSourceUnderLock(barePath, branch, source);
+      if (!stored.journal.remediationRecovery && !scan.flaggedOIDs.length) return;
+      const r: RemediationRecovery = stored.journal.remediationRecovery ?? { version: 1, ...source, branch,
+        sequence: 0, ownedTip: scan.tip, flaggedOIDs: [], edges: [] };
+      if (r.ownedTip !== scan.tip ||
+          (await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId, scan.tip)).kind !== "owned" ||
+          await this.worktreeHead(source.clonePath) !== scan.tip) throw new Error("remediation scanned tip not owned");
+      const flags = [...new Set([...r.flaggedOIDs, ...scan.flaggedOIDs])];
+      let active = r.active;
+      let sequence = r.sequence;
+      if (scan.flaggedOIDs.length) {
+        if (!scan.origin) throw new Error("remediation origin required");
+        for (const q of scan.flaggedOIDs) {
+          await this.requireOwedCommit(barePath, q);
+          if (await this.ancestry(barePath, q, scan.tip) !== "ancestor") throw new Error("remediation finding not reachable");
+        }
+        // Repeated pending findings keep the original monotonic identity. New findings/decisions
+        // create a new identity; all completed edges retain their original grant.
+        if (!active || active.origin !== scan.origin || scan.flaggedOIDs.some(q => !active!.flaggedOIDs.includes(q))) {
+          sequence++;
+          active = { id: sequence, origin: scan.origin, originSource: { ...source }, scannedTip: scan.tip, flaggedOIDs: [...new Set(scan.flaggedOIDs)] };
+        }
+      } else if (active) {
+        let clean = true;
+        for (const q of flags) if (await this.ancestry(barePath, q, scan.tip) !== "divergent") clean = false;
+        if (clean) active = undefined;
+      }
+      const { active: _old, ...rest } = r;
+      await this.writeRemediationUnderLock(barePath, branch, stored,
+        { ...rest, sequence, flaggedOIDs: flags, ...(active ? { active } : {}) }, durability);
+    });
+  }
+
+  /** M1 query only. Re-sync plus independently supplied source, ledger, authority, pins and ownership.
+   * Prepared edges are never promoted or returned. This grants no adoption or publication permission. */
+  async readRemediationRecovery(barePath: string, branch: string,
+    source: { runId: string; clonePath: string; attemptId: string },
+    durability: MemoryParkDurability = {}): Promise<RemediationRecovery | undefined> {
+    try {
+      return await this.withLock(barePath, async () => {
+        const stored = await this.remediationSourceUnderLock(barePath, branch, source);
+        const r = stored.journal.remediationRecovery;
+        if (!r || r.edges.some(e => e.phase !== "committed") ||
+            (await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId, r.ownedTip)).kind !== "owned" ||
+            await this.worktreeHead(source.clonePath) !== r.ownedTip) return undefined;
+        const ledger = await this.readAttemptLedger(barePath, branch);
+        for (const g of [...r.edges.map(e => e.grant), ...(r.active ? [r.active] : [])]) {
+          const original = ledger.get(g.originSource.attemptId);
+          const shape = parseAttemptPath(g.originSource.clonePath, path.resolve(this.runnerRoot));
+          if (!original || !sameRecoverySource(original, g.originSource) ||
+              shape?.attemptId !== g.originSource.attemptId) return undefined;
+          await this.requireOwedCommit(barePath, g.scannedTip);
+          for (const q of g.flaggedOIDs) {
+            await this.requireOwedCommit(barePath, q);
+            if (await this.ancestry(barePath, q, g.scannedTip) !== "ancestor") return undefined;
+          }
+        }
+        for (const e of r.edges) {
+          const context = await this.parseOwedContext(barePath, await this.readOwedFile(barePath, e.context));
+          if ("origin" in context || context.runId !== e.grant.originSource.runId || context.branch !== branch ||
+              this.contextName(context) !== e.context || !await this.hasOwedAnchorUnderLock(barePath, e.grant.originSource.runId, e.from))
+            return undefined;
+          await this.requireOwedCommit(barePath, e.to);
+          if (await this.ancestry(barePath, e.grant.scannedTip, e.from) !== "ancestor") return undefined;
+          for (const q of e.grant.flaggedOIDs)
+            if (await this.ancestry(barePath, q, e.grant.scannedTip) !== "ancestor") return undefined;
+        }
+        const canonical = recoveryJournalJson(stored.journal);
+        if (canonical !== stored.raw) return undefined;
+        await this.syncJournalAndReadBack(barePath, branch, canonical, durability);
+        return parseRemediationRecovery(r);
+      });
+    } catch { return undefined; }
+  }
+
   async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string, attemptId?: string,
     peeledMarker?: string): Promise<void> {
     if (peeledMarker !== undefined && !SHA40_RE.test(peeledMarker)) throw new Error("invalid peeled marker");
@@ -7776,6 +7996,9 @@ export class GitCache {
   private async writeRecovery(barePath: string, branch: string, journal: RecoveryJournalEntry, guard?: () => void | Promise<void>): Promise<void> {
     const value = recoveryJournalJson(journal);
     parseRecoveryJournal(value);
+    const prior = await this.readRecoveryCapture(barePath, branch);
+    if (prior?.remediationRecovery && (!journal.remediationRecovery || !sameRecoverySource(prior, journal)))
+      throw new Error("remediation metadata loss or rebind refused");
     await this.assertRecoveryBare(barePath);
     if (guard) await guard();
     await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), value]);
@@ -7792,6 +8015,8 @@ export class GitCache {
 
   /** Throws {@link CompletionSourceFenceError} before any effect when {@link dropsFence}. */
   private refuseFenceDrop(journal: RecoveryJournalEntry | undefined, op: string): void {
+    if (journal?.remediationRecovery && op !== "discardRetainedRecovery")
+      throw new Error("remediation recovery rebind requires proof");
     if (this.dropsFence(journal)) {
       throw new CompletionSourceFenceError(`${op}: the journal carries a completion source fence; only a certified retirement may clear it`);
     }
@@ -7868,7 +8093,7 @@ export class GitCache {
   private async healBoundStoppedJournal(barePath: string, branch: string, stored: { journal: RecoveryJournalEntry; raw: string }): Promise<boolean> {
     const { journal, raw } = stored;
     if (journal.attemptId !== undefined || journal.recovery || journal.retainedSources?.length) return false;
-    if (this.dropsFence(journal)) return false;
+    if (journal?.remediationRecovery || this.dropsFence(journal)) return false;
     if (residueQuarantine() !== undefined) return false;
     const markers = await this.readStoppedMarkers(barePath);
     const named = JSON.stringify(journal.clonePath).slice(1, -1);
@@ -8852,7 +9077,7 @@ export class GitCache {
         if (!(await this.realCloneDir(source.clonePath))) return "unknown";
         const pending = await this.readRecoveryCapture(barePath, branch);
         const named = pending !== undefined && sameRecoverySource(pending, source);
-        if (named && this.dropsFence(pending)) return "unknown";
+        if (named && (pending?.remediationRecovery || this.dropsFence(pending))) return "unknown";
         if (residueQuarantine() !== undefined) return named ? "retained" : "unknown";
         if (entry.state === "live") {
           await this.appendAttemptLedger(barePath, branch, { ...entry, state: "reclaimed" });
@@ -8903,7 +9128,7 @@ export class GitCache {
         if (input.generation !== null && (!Number.isSafeInteger(input.generation) || input.generation < 0)) return "unknown";
         const current = await this.readRecoveryCaptureWithRaw(barePath, branch);
         if (current && (current.journal.attemptId !== undefined || current.journal.recovery || current.journal.retainedSources?.length ||
-            !sameRecoverySource(current.journal, source) || this.dropsFence(current.journal))) return "unknown";
+            !sameRecoverySource(current.journal, source) || current.journal.remediationRecovery || this.dropsFence(current.journal))) return "unknown";
         if (!(await this.realCloneDir(source.clonePath))) return "unknown";
         const markers = await this.readStoppedMarkers(barePath);
         if (markers.overflow.has(input.runId) || markers.malformed.some((m) => m.runId === input.runId)) return "unknown";
@@ -12143,7 +12368,7 @@ export class GitCache {
       if (!processOpen()) return false;
       if (pending && (pending.runId !== runId || pending.clonePath !== clonePath || pending.attemptId !== attemptId))
         return false; // A successor/adoption owns this branch now.
-      if (pending?.recovery || pending?.retainedSources?.length || this.dropsFence(pending)) return false;
+      if (pending?.recovery || pending?.retainedSources?.length || pending?.remediationRecovery || this.dropsFence(pending)) return false;
       try { await fs.lstat(clonePath); return false; }
       catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
       if (!await open()) return false;
@@ -12186,7 +12411,7 @@ export class GitCache {
       const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
       const pending = stored?.journal;
       if (!stored || !pending || pending.runId !== runId || pending.clonePath !== clonePath || pending.attemptId !== attemptId) return false;
-      if (pending.recovery || pending.retainedSources?.length || pending.completionSourceFence === undefined) return false;
+      if (pending.remediationRecovery || pending.recovery || pending.retainedSources?.length || pending.completionSourceFence === undefined) return false;
       try {
         if (serializeSourceFence(pending.completionSourceFence) !== serializeSourceFence(expectedFence)) return false;
       } catch { return false; }
@@ -12326,6 +12551,7 @@ export class GitCache {
       }
       // issue #3404 M2: only a certified completion retirement (checked against its expectedFence below)
       // may clear a fenced journal; any other retirement (orphan reclaim included) refuses before effects.
+      if (pending.remediationRecovery) throw new Error("remediation recovery retirement requires proof");
       if (!opts.completionSource) this.refuseFenceDrop(pending, "retireRunnerClone");
       // issue #1786: a marked stopped canonical source is retired only by the operator discard.
       checkProcessProof();
@@ -18736,6 +18962,7 @@ try {
   private snapshotOwedOptions(opts: FetchAgentBranchOptions): FetchAgentBranchOptions {
     const c = opts.context;
     return { context: { ...c, defaultIdentity: c?.defaultIdentity && { ...c.defaultIdentity } },
+      producingSource: opts.producingSource && { ...opts.producingSource },
       remotelyConfirmedSha: opts.remotelyConfirmedSha, expectedCandidateSha: opts.expectedCandidateSha,
       checkpointImportMode: opts.checkpointImportMode, checkpointStep: opts.checkpointStep };
   }
@@ -19183,6 +19410,29 @@ try {
         if (abort) throw abort;
         return { kind: "not_updated", reason: preservationReason(cause) };
       }
+      let remediation: { journal: RecoveryJournalEntry; raw: string } | undefined;
+      let prepared: RemediationRecovery | undefined;
+      if (opts.producingSource) {
+        remediation = await this.remediationSourceUnderLock(barePath, branch, opts.producingSource);
+        const r = remediation.journal.remediationRecovery;
+        if (r) await this.syncJournalAndReadBack(barePath, branch, remediation.raw, {});
+        if (r?.edges.some(e => e.phase !== "committed")) throw new Error("remediation edge remains prepared");
+        if (r && r.ownedTip !== observed.sha) throw new Error("remediation observed tip changed");
+        if (r?.active && divergence === "divergent" && observed.sha && observed.owner?.runId === c.runId &&
+            observed.owner.context === this.contextName(c) && displacedContext &&
+            await this.hasOwedAnchorUnderLock(barePath, c.runId, observed.sha) &&
+            await this.ancestry(barePath, r.active.scannedTip, observed.sha) === "ancestor") {
+          let reachable = true;
+          for (const q of r.active.flaggedOIDs)
+            if (await this.ancestry(barePath, q, r.active.scannedTip) !== "ancestor") reachable = false;
+          if (reachable) {
+            prepared = { ...r, edges: [...r.edges, { from: observed.sha, to: incoming,
+              grant: r.active, context: this.contextName(c), phase: "prepared" }] };
+            await this.writeRemediationUnderLock(barePath, branch, remediation, prepared);
+            remediation = await this.remediationSourceUnderLock(barePath, branch, opts.producingSource);
+          }
+        }
+      }
       const receipt: TrackingReceipt = { version: 1, branch, runId: c.runId, generation: c.generation, context: this.contextName(c),
         trackingSha: incoming, phase: "pending" };
       try {
@@ -19221,6 +19471,13 @@ try {
         const abort = this.boundaryAbortError(cause);
         if (abort) throw abort;
         return { kind: "not_updated", reason: "receipt_commit_failed" };
+      }
+      if (opts.producingSource && remediation?.journal.remediationRecovery) {
+        const current = await this.remediationSourceUnderLock(barePath, branch, opts.producingSource);
+        if (current.raw !== remediation.raw) throw new Error("remediation journal changed during import");
+        const record = current.journal.remediationRecovery!;
+        const edges = prepared ? record.edges.map((e, i) => i === record.edges.length - 1 ? { ...e, phase: "committed" as const } : e) : record.edges;
+        await this.writeRemediationUnderLock(barePath, branch, current, { ...record, ownedTip: incoming, edges });
       }
       return { kind: "updated", trackingRef: runnerTrackingRef(branch), candidateSha: incoming,
         retainedShas: [...new Set(retainedShas)].sort(), displacedSha: observed.sha, divergence };

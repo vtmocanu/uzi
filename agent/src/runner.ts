@@ -15364,7 +15364,9 @@ export class RunRunner {
       throw error;
     }
     if (context.barePath !== barePath || context.branch !== branch) throw new Error("owed candidate flight context changed");
-    return { context, remotelyConfirmedSha: flight.lastCheckpointRefTip };
+    return { context, remotelyConfirmedSha: flight.lastCheckpointRefTip,
+      ...(flight.runnerClone?.attemptId && flight.runnerClone.path === flight.worktreePath
+        ? { producingSource: { runId: flight.runId, clonePath: flight.runnerClone.path, attemptId: flight.runnerClone.attemptId } } : {}) };
   }
 
   private owedAnnouncedFor(runId: string): OwedAnnounced {
@@ -15762,11 +15764,11 @@ export class RunRunner {
     options.checkpointStep?.("checkpoint_import_context");
     const owed = await this.owedOptions(flight, barePath, branch);
     return importScope(async () => {
-      // No A across the fetch: its only authority hook is assertBareClear (a transaction-free read), so the
-      // model-sized pack transport never holds A.
-      const result = await this.git.fetchAgentBranch(
+      const acquire = () => this.git.fetchAgentBranch(
         barePath, worktreePath, branch, flight.runId, { ...owed, ...options },
       );
+      const result = owed.producingSource
+        ? await this.inFlightAuthority(flight, acquire, this.authorityWait(flight)) : await acquire();
       if (result.kind === "not_updated") throw this.preservationRefused(flight, result.reason);
       if (result.divergence === "divergent") {
         const heads = result.displacedSha && result.retainedShas.includes(result.displacedSha) ? [result.displacedSha] : [];
@@ -16645,6 +16647,19 @@ export class RunRunner {
    * inside a permit DEFERS its publish to the next tick outside the permit instead of scanning there
    * (`scan_deferred`, see doCheckpointPublish).
    */
+  private async persistRemediationScan(flight: RunFlight, barePath: string, branch: string,
+    tip: string, findings: readonly SecretFinding[], origin?: "checkpoint-pending" | "pre-exit"): Promise<void> {
+    const clone = flight.runnerClone;
+    if (!clone?.attemptId || clone.path !== flight.worktreePath) return;
+    const identities = findings.map(f => f.commit?.toLowerCase());
+    if (identities.some(q => typeof q !== "string" || !/^[0-9a-f]{40}$/.test(q)))
+      throw new Error("remediation finding identity unavailable");
+    const flaggedOIDs = [...new Set(identities as string[])];
+    await this.inFlightAuthority(flight, () => this.git.recordRemediationScan(barePath, branch,
+      { runId: flight.runId, clonePath: clone.path, attemptId: clone.attemptId! },
+      { trusted: true, tip, flaggedOIDs, ...(origin ? { origin } : {}) }), this.authorityWait(flight));
+  }
+
   private async scanCheckpointForPublish(
     flight: RunFlight,
     barePath: string,
@@ -16685,6 +16700,7 @@ export class RunRunner {
         // remediation and finalize also consult the retained findings.
         if (scan.trusted) {
           this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), scan.findings, flight.runLog);
+          await this.persistRemediationScan(flight, barePath, branch, range.tipSha, scan.findings, "checkpoint-pending");
         }
         // D6(c) on this log surface too: a committed filename can itself be a secret. The path
         // scan runs in the same scope as the range scan, and fails closed (withholds) on abort.
@@ -16703,6 +16719,7 @@ export class RunRunner {
         return { kind: "blocked", outcome: "secret_found" };
       }
       if (!scan.trusted) return untrusted(scan.reason ?? "scan_untrusted");
+      await this.persistRemediationScan(flight, barePath, branch, range.tipSha, []);
       await this.checkpointTestHooks?.afterCheckpointScan?.({ barePath, branch, range });
       return { kind: "pinned", range };
     } catch (e) {
@@ -16908,6 +16925,7 @@ export class RunRunner {
         // (possibly a local-only bridge) hid it from this range: keep it known.
         const still = await this.reachableFlaggedFindings(state, barePath, cloneTip);
         if (still.length === 0) {
+          await this.persistRemediationScan(flight, barePath, branch, range.tipSha, []);
           state.known = undefined;
           state.cleanTip = range.tipSha;
           return { action: "proceed" };
@@ -16969,6 +16987,7 @@ export class RunRunner {
         runLog.warn("pre-exit secret scan: remediation attempts exhausted; failing", { run_id: runId });
         return { action: "fail" };
       }
+      await this.persistRemediationScan(flight, barePath, branch, range.tipSha, findings, "pre-exit");
       state.attempts++;
       // An ancestor-verified floor: the checkpoint floor when it is one of the range's scan floors,
       // else the range's exclude SHA.

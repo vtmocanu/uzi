@@ -1,0 +1,394 @@
+import { afterEach, beforeEach, test } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { parseRecoveryJournal as oldParse } from "./fixtures/base-parse-recovery-journal.js";
+import { createHash } from "node:crypto";
+import { GitCache, type FetchAgentBranchOptions } from "../src/git.js";
+import { formatAttemptId } from "../src/attempt-path.js";
+import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
+
+const BRANCH = "agent/issue-3747";
+const RUN = "run-3747";
+const KEY = "issue-3747";
+const ATTEMPT = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
+const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+const IDENT = ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"];
+let fx: Fixture;
+let cache: GitCache;
+let bare: string;
+let clone: string;
+let base: string;
+let opts: FetchAgentBranchOptions;
+const source = () => ({ runId: RUN, clonePath: clone, attemptId: ATTEMPT });
+function git(dir: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", dir, ...args], { env: ENV, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+}
+function commit(label: string, parent = base): string {
+  const sha = git(clone, ...IDENT, "commit-tree", base + "^{tree}", "-p", parent, "-m", label);
+  git(clone, "update-ref", "refs/heads/" + BRANCH, sha);
+  return sha;
+}
+async function fetch() {
+  const result = await cache.fetchAgentBranch(bare, clone, BRANCH, RUN, opts);
+  assert.equal(result.kind, "updated", JSON.stringify(result));
+  return result;
+}
+async function enroll() {
+  await cache.recordRemediationScan(bare, BRANCH, source(),
+    { trusted: true, tip: git(clone, "rev-parse", "HEAD"), flaggedOIDs: [git(clone, "rev-parse", "HEAD")], origin: "pre-exit" });
+}
+const raw = () => git(bare, "config", "--get", "uzi-recovery." + BRANCH + ".clone");
+const journal = () => JSON.parse(raw());
+function write(value: unknown) {
+  git(bare, "config", "uzi-recovery." + BRANCH + ".clone", JSON.stringify(value));
+}
+beforeEach(async () => {
+  fx = makeFixture();
+  cache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  bare = await cache.ensureClone(fx.originPath);
+  base = git(bare, "rev-parse", "refs/remotes/origin/main");
+  clone = (await cache.runnerCloneForBranch(bare, BRANCH, KEY, noProofReseed, RUN, false, undefined,
+    { attemptId: ATTEMPT, isLive: () => false, beforeSeed: async () => {} })).path;
+  await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT);
+  opts = { context: { runId: RUN, generation: 1, kind: "issue", branch: BRANCH, barePath: bare,
+    defaultIdentity: { ref: "refs/remotes/origin/main", sha: base } }, producingSource: source() };
+  await fetch();
+});
+afterEach(() => fx.cleanup());
+
+for (const origin of ["checkpoint-pending", "pre-exit"] as const) {
+  test(origin + ": real import, later pending head, displacement and restart query", async () => {
+    const q = commit("flagged");
+    await fetch();
+    await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: q, flaggedOIDs: [q], origin });
+    const later = commit("later pending", q);
+    await fetch();
+    const replacement = commit("replacement");
+    await fetch();
+    const restarted = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+    const evidence = await restarted.readRemediationRecovery(bare, BRANCH, source());
+    assert.ok(evidence);
+    assert.equal(evidence.edges.length, 1);
+    assert.deepEqual(evidence.edges[0], { from: later, to: replacement, phase: "committed",
+      context: evidence.edges[0]!.context, grant: { id: 1, origin, originSource: source(), scannedTip: q, flaggedOIDs: [q] } });
+    assert.ok((await cache.enumerateOwedCandidates(bare, RUN)).some(c => c.sha === later));
+    await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: replacement, flaggedOIDs: [] });
+    assert.equal(journal().remediationRecovery.active, undefined);
+    const arbitrary = commit("later arbitrary");
+    await fetch();
+    assert.equal(journal().remediationRecovery.edges.length, 1);
+    assert.equal((await cache.readRemediationRecovery(bare, BRANCH, source()))?.ownedTip, arbitrary);
+    const reservation = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, source());
+    await cache.recordRecoveryCapture(bare, BRANCH, KEY, source(), reservation.attempts, arbitrary, arbitrary);
+    await assert.rejects(cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), reservation.attempts,
+      formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "fedcba9876543210")), /remediation/);
+  });
+}
+
+test("untrusted scans and arbitrary same-tree siblings create no edge", async () => {
+  const q = commit("q"); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: false, tip: q, flaggedOIDs: [q], origin: "checkpoint-pending" });
+  commit("sibling"); await fetch();
+  assert.equal(journal().remediationRecovery, undefined);
+});
+
+test("empty scan cannot close a grant whose flagged commit is hidden below its floor", async () => {
+  const q = commit("q"); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: q, flaggedOIDs: [q], origin: "checkpoint-pending" });
+  const later = commit("later", q); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: later, flaggedOIDs: [] });
+  assert.equal(journal().remediationRecovery.active.id, 1);
+});
+
+test("wrong run, same-generation other attempt, stale source and absent trusted import binding refuse", async () => {
+  await enroll();
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, { ...source(), runId: "other" }), undefined);
+  const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "fedcba9876543210");
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, { ...source(), attemptId }), undefined);
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, { ...source(), clonePath: clone + "-stale" }), undefined);
+  await assert.rejects(cache.fetchAgentBranch(bare, clone, BRANCH, RUN, { context: opts.context }), /producing source required/);
+});
+
+test("strict bounded schema rejects unknown keys, versions, identifiers, duplicates, cycles and overflow", async () => {
+  await enroll();
+  const saved = journal();
+  const mutations = [
+    (r: any) => { r.extra = true; },
+    (r: any) => { r.version = 2; },
+    (r: any) => { r.runId = "x".repeat(129); },
+    (r: any) => { r.branch = "x".repeat(1025); },
+    (r: any) => { r.clonePath = "/" + "x".repeat(4096); },
+    (r: any) => { r.attemptId = "x".repeat(257); },
+    (r: any) => { r.branch = "agent/\u202eunsafe"; },
+    (r: any) => { r.sequence = Number.MAX_SAFE_INTEGER + 1; },
+    (r: any) => { r.flaggedOIDs = [base, base]; },
+    (r: any) => { r.flaggedOIDs = Array.from({ length: 65 }, (_, i) => i.toString(16).padStart(40, "0")); },
+    (r: any) => { r.edges = Array(65).fill({}); },
+    (r: any) => { r.extra = "x".repeat(65536); },
+  ];
+  for (const mutate of mutations) {
+    const next = structuredClone(saved); mutate(next.remediationRecovery); write(next);
+    await assert.rejects(cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT), /remediation/);
+  }
+  write(saved);
+  await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT);
+  assert.deepEqual(journal().remediationRecovery, saved.remediationRecovery);
+});
+
+test("consumer refuses prepared edge, missing pin, altered receipt, failed sync and failed readback", async () => {
+  const q = commit("q"); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: q, flaggedOIDs: [q], origin: "pre-exit" });
+  commit("rewrite"); await fetch();
+  const saved = journal();
+  const prepared = structuredClone(saved);
+  prepared.remediationRecovery.edges[0].phase = "prepared"; write(prepared);
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
+  write(saved);
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source(), { sync: async () => { throw Error("sync"); } }), undefined);
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source(), { readback: async () => "" }), undefined);
+  const receipt = path.join(bare, "uzi-owed", "receipt-" + createHash("sha256").update(BRANCH).digest("hex") + ".json");
+  const receiptRaw = fs.readFileSync(receipt, "utf8");
+  fs.writeFileSync(receipt, receiptRaw.replace('"committed"', '"pending"'));
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
+  fs.writeFileSync(receipt, receiptRaw);
+  git(bare, "update-ref", "-d", "refs/uzi-owed/" + RUN + "/" + q, q);
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
+});
+
+test("frozen old parser accepts baseline, rejects only the new journal key", async () => {
+  await enroll();
+  const { remediationRecovery, ...baseline } = journal();
+  assert.deepEqual(oldParse(JSON.stringify(baseline)), baseline);
+  assert.throws(() => oldParse(JSON.stringify({ ...baseline, remediationRecovery })), /invalid/);
+});
+
+test("64 flagged OIDs and 64 edges round-trip; conflicts, cycles and 64KiB overflow refuse", async () => {
+  await enroll();
+  const saved = journal();
+  const r = saved.remediationRecovery;
+  const sha = (i: number) => i.toString(16).padStart(40, "0");
+  delete r.active;
+  r.sequence = 64;
+  r.flaggedOIDs = Array.from({ length: 64 }, (_, i) => sha(i + 100));
+  r.edges = Array.from({ length: 64 }, (_, i) => ({ from: sha(i + 1), to: sha(i + 2),
+    phase: "committed", context: "context-" + "a".repeat(64) + ".json",
+    grant: { id: i + 1, origin: "checkpoint-pending", originSource: source(), scannedTip: sha(i + 100), flaggedOIDs: [sha(i + 100)] } }));
+  write(saved);
+  await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT);
+  assert.equal(journal().remediationRecovery.edges.length, 64);
+  for (const change of [
+    (x: any) => { x.edges[63].to = x.edges[0].from; },
+    (x: any) => { x.edges[1].from = x.edges[0].from; },
+    (x: any) => { x.edges[0].extra = 1; },
+    (x: any) => { x.edges[0].grant.extra = 1; },
+    (x: any) => { for (const e of x.edges.slice(0, 16)) e.grant.flaggedOIDs = [...x.flaggedOIDs]; },
+  ]) {
+    const next = structuredClone(saved); change(next.remediationRecovery); write(next);
+    await assert.rejects(cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT), /remediation/);
+  }
+});
+
+test("grant write fsync/readback failures yield no successful write; consumer re-syncs independently", async () => {
+  const q = commit("q"); await fetch();
+  for (const durability of [
+    ...(["config", "directory"] as const).map(target => ({
+      sync: async (handle: { sync(): Promise<void> }, what: "config" | "directory") => {
+        if (what === target) throw Error(target);
+        await handle.sync();
+      },
+    })),
+    { readback: async () => "" },
+  ]) {
+    await assert.rejects(cache.recordRemediationScan(bare, BRANCH, source(),
+      { trusted: true, tip: q, flaggedOIDs: [q], origin: "checkpoint-pending" }, durability));
+    assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source(), durability), undefined);
+    // Readability is insufficient: the separate successful consumer must still sync and prove binding.
+    assert.ok(await cache.readRemediationRecovery(bare, BRANCH, source()));
+  }
+});
+
+test("failed tracking CAS leaves prepared evidence that restart never promotes", async t => {
+  const q = commit("q"); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: q, flaggedOIDs: [q], origin: "pre-exit" });
+  commit("rewrite");
+  const internal = cache as any;
+  const run = internal.runGit.bind(cache);
+  t.mock.method(internal, "runGit", async (dir: string, args: string[]) => {
+    if (args[0] === "update-ref" && args[1] === "refs/uzi-runner/" + BRANCH) throw Error("CAS");
+    return run(dir, args);
+  });
+  const result = await cache.fetchAgentBranch(bare, clone, BRANCH, RUN, opts);
+  assert.deepEqual(result, { kind: "not_updated", reason: "tracking_update_failed" });
+  assert.equal(journal().remediationRecovery.edges[0].phase, "prepared");
+  const restarted = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  assert.equal(await restarted.readRemediationRecovery(bare, BRANCH, source()), undefined);
+  t.mock.restoreAll();
+  const retry = await cache.fetchAgentBranch(bare, clone, BRANCH, RUN, opts);
+  assert.equal(retry.kind, "not_updated");
+  assert.equal(journal().remediationRecovery.edges[0].phase, "prepared");
+});
+
+for (const phase of ["prepared", "committed"] as const) {
+  test("import " + phase + " durability failure is not successful import authority", async t => {
+    const q = commit("q"); await fetch();
+    await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: q, flaggedOIDs: [q], origin: "pre-exit" });
+    commit("rewrite");
+    const internal = cache as any;
+    const sync = internal.syncJournalAndReadBack.bind(cache);
+    t.mock.method(internal, "syncJournalAndReadBack", async (...args: any[]) => {
+      const record = JSON.parse(args[2]).remediationRecovery;
+      if (record?.edges.some((e: any) => e.phase === phase)) throw Error("durability");
+      return sync(...args);
+    });
+    await assert.rejects(fetch(), /durability/);
+    assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
+    t.mock.restoreAll();
+    const restarted = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+    const confirmed = await restarted.readRemediationRecovery(bare, BRANCH, source());
+    assert.equal(confirmed !== undefined, phase === "committed");
+  });
+}
+
+test("same run and generation with two real producing attempts cannot substitute identity", async () => {
+  await enroll();
+  const saved = raw();
+  git(bare, "config", "uzi-recovery." + BRANCH + ".clone", "");
+  const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "fedcba9876543210");
+  const sibling = await cache.runnerCloneForBranch(bare, BRANCH, KEY, noProofReseed, RUN, false, undefined,
+    { attemptId, isLive: p => p === clone, beforeSeed: async () => {} });
+  git(bare, "config", "uzi-recovery." + BRANCH + ".clone", saved);
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, { runId: RUN, clonePath: sibling.path, attemptId }), undefined);
+  await assert.rejects(cache.fetchAgentBranch(bare, sibling.path, BRANCH, RUN,
+    { ...opts, producingSource: { runId: RUN, clonePath: sibling.path, attemptId } }), /binding/);
+});
+
+test("one pending checkpoint rewrite followed by a distinct pre-exit rewrite retains both grants", async () => {
+  const q = commit("checkpoint q"); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: q, flaggedOIDs: [q], origin: "checkpoint-pending" });
+  const later = commit("pending later", q); await fetch();
+  const first = commit("first rewrite"); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: first, flaggedOIDs: [] });
+  const q2 = commit("pre-exit q", first); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: q2, flaggedOIDs: [q2], origin: "pre-exit" });
+  const last = commit("second rewrite", first); await fetch();
+  const record = await cache.readRemediationRecovery(bare, BRANCH, source());
+  assert.ok(record);
+  assert.deepEqual(record.edges.map(e => [e.from, e.to, e.grant.id, e.grant.origin]),
+    [[later, first, 1, "checkpoint-pending"], [q2, last, 2, "pre-exit"]]);
+  assert.deepEqual(record.flaggedOIDs, [q, q2]);
+});
+
+
+test("ordinary imports and clean scans leave no field and permit the existing bridge and retirement lifecycle", async () => {
+  assert.equal(journal().remediationRecovery, undefined);
+  await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: base, flaggedOIDs: [] });
+  assert.equal(journal().remediationRecovery, undefined);
+  const tip = commit("ordinary"); await fetch();
+  const next = commit("ordinary bridge", tip);
+  // updateTrackingRef takes a bare commit, as a production synthesized bridge would.
+  git(clone, "push", bare, next + ":refs/keep/ordinary");
+  assert.equal((await cache.updateTrackingRef(bare, BRANCH, next, opts)).kind, "updated");
+  assert.equal(journal().remediationRecovery, undefined);
+  await cache.retireRunnerClone(bare, clone, BRANCH, RUN, { discard: true, attemptId: ATTEMPT });
+  assert.equal(raw(), "");
+});
+
+test("findings require an authorized origin and every full commit identity before enrollment", async () => {
+  const q = commit("q"); await fetch();
+  for (const scan of [
+    { trusted: true, tip: q, flaggedOIDs: [q] },
+    { trusted: true, tip: q, flaggedOIDs: [q, "invalid"], origin: "pre-exit" as const },
+    { trusted: true, tip: base, flaggedOIDs: [base], origin: "pre-exit" as const },
+  ]) {
+    await assert.rejects(cache.recordRemediationScan(bare, BRANCH, source(), scan));
+    assert.equal(journal().remediationRecovery, undefined);
+  }
+});
+
+test("metadata is preserved on refresh and unproven drop but independently authorized discard still works", async () => {
+  await enroll();
+  const saved = raw();
+  await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT);
+  assert.equal(raw(), saved);
+  await assert.rejects(cache.releaseAttemptInPlace(bare, clone, BRANCH, RUN, "abandoned"), /remediation/);
+  await assert.rejects(cache.updateTrackingRef(bare, BRANCH, base, opts), /remediation/);
+  await assert.rejects(cache.retireRunnerClone(bare, clone, BRANCH, RUN, { discard: true, attemptId: ATTEMPT }), /remediation/);
+  assert.equal(raw(), saved);
+  assert.ok(fs.existsSync(clone));
+  await cache.discardRetainedRecovery(bare, BRANCH, KEY, source(), true);
+  assert.equal(raw(), "");
+  assert.ok(fs.existsSync(clone), "metadata discard does not itself delete the source");
+});
+
+test("restart query refuses changed pins, missing objects, stale journal/owner/ledger and forged grant source", async t => {
+  const q = commit("q"); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: q, flaggedOIDs: [q], origin: "pre-exit" });
+  const tip = commit("rewrite"); await fetch();
+  const saved = journal();
+  const pin = "refs/uzi-owed/" + RUN + "/" + q;
+  git(bare, "update-ref", pin, base, q);
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
+  git(bare, "update-ref", pin, q, base);
+  const internal = cache as any, run = internal.runGit.bind(cache);
+  t.mock.method(internal, "runGit", async (dir: string, args: string[]) => {
+    if (args.includes("cat-file") && args.includes(q)) throw Error("missing object");
+    return run(dir, args);
+  });
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
+  t.mock.restoreAll();
+  for (const mutate of [
+    (j: any) => { j.remediationRecovery.ownedTip = base; },
+    (j: any) => {
+      for (const g of [j.remediationRecovery.active, ...j.remediationRecovery.edges.map((e: any) => e.grant)])
+        g.originSource = { ...source(), clonePath: clone.replace(ATTEMPT, ATTEMPT.replace("0123", "abcd")), attemptId: ATTEMPT.replace("0123", "abcd") };
+    },
+  ]) {
+    const next = structuredClone(saved); mutate(next); write(next);
+    assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
+  }
+  write(saved);
+  const ledgerKey = "uzi-attempts." + BRANCH + ".entry";
+  const ledger = git(bare, "config", "--get-all", ledgerKey);
+  git(bare, "config", "--unset-all", ledgerKey);
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
+  for (const entry of ledger.split("\n")) git(bare, "config", "--add", ledgerKey, entry);
+  const receipt = path.join(bare, "uzi-owed", "receipt-" + createHash("sha256").update(BRANCH).digest("hex") + ".json");
+  const owner = fs.readFileSync(receipt, "utf8");
+  fs.writeFileSync(receipt, JSON.stringify({ ...JSON.parse(owner), runId: "foreign" }));
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
+  fs.writeFileSync(receipt, owner);
+  assert.equal((await cache.readRemediationRecovery(bare, BRANCH, source()))?.ownedTip, tip);
+});
+
+test("completion episode, memory park and completion fence retain remediation metadata", async () => {
+  await enroll();
+  const r = journal().remediationRecovery;
+  // A ready journal is an already completed same-source handoff. M1 never creates or adopts a successor.
+  const now = Date.now();
+  write({ ...journal(), restoreTip: base, recovery: { version: 1, source: { ...source(), restoreTip: base },
+    successor: { ...source(), restoreTip: base }, attempts: 1, startedAt: now, deadline: now + 300000,
+    backoffMs: 0, stage: "ready-for-model", restoreTip: base } });
+  await cache.completeRecoveryEpisode(bare, BRANCH, KEY, source(), { settled: true, processedEvents: 1, attemptId: ATTEMPT });
+  assert.deepEqual(journal().remediationRecovery, r);
+  const uuid = "11111111-1111-4111-8111-111111111111";
+  await cache.recordMemoryPark(bare, BRANCH, source(), { version: 1,
+    binding: { runId: RUN, claimGeneration: 1, workerId: "worker", registerNonce: "nonce", memoryEpisode: 0 },
+    ack: "sent_unconfirmed", origin: { flightId: uuid, attemptId: ATTEMPT, executorIncarnation: null,
+      authorityIncarnation: uuid, sourceEpoch: uuid } });
+  assert.deepEqual(journal().remediationRecovery, r);
+  await cache.installCompletionSourceFence(bare, BRANCH, source(), { version: 1, sourceUseEpoch: uuid, sourceCoreDigest: "a".repeat(64) });
+  assert.deepEqual(journal().remediationRecovery, r);
+});
+
+test("config write failure cannot durably enroll remediation", async t => {
+  const internal = cache as any, run = internal.runGit.bind(cache);
+  t.mock.method(internal, "runGit", async (dir: string, args: string[]) => {
+    if (args[0] === "config" && args.some(a => a.includes('"remediationRecovery"'))) throw Error("config write");
+    return run(dir, args);
+  });
+  await assert.rejects(enroll(), /config write/);
+  assert.equal(journal().remediationRecovery, undefined);
+});

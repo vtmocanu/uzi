@@ -625,14 +625,59 @@ select_clone(){
              and (.executorIncarnation == null or (.executorIncarnation | type == "string" and test("^[A-Za-z0-9._:-]{1,128}$")))
              and (.authorityIncarnation | uuid) and (.sourceEpoch | uuid))
         and (if has("settlement") then .ack == "confirmed" and (.settlement | mpsettlement($m.binding)) else true end);
+      def rrid($max): type == "string" and utf8bytelength >= 1 and utf8bytelength <= $max
+        and (test("[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]") | not);
+      def rrsha: type == "string" and test("^[0-9a-f]{40}$");
+      def rrlist: type == "array" and length <= 64 and all(.[]; rrsha) and (unique | length) == length;
+      def rrsource:
+        type == "object" and keys == ["attemptId","clonePath","runId"]
+        and (.runId | rrid(128) and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"))
+        and (.attemptId | rrid(256) and test("^[0-9]{8}T[0-9]{6}Z-(g[0-9]+|gx)-[0-9a-f]{16}$"))
+        and (.clonePath | rrid(4096) and startswith("/")
+          and (split("/")[1:] | all(.[]; length > 0 and . != "." and . != "..")))
+        and (. as $s | .clonePath | endswith(".attempt-" + $s.attemptId));
+      def rrgrant:
+        type == "object" and keys == ["flaggedOIDs","id","origin","originSource","scannedTip"]
+        and (.originSource | rrsource)
+        and (.id | integer) and .id >= 1 and (.origin | IN("checkpoint-pending","pre-exit"))
+        and (.scannedTip | rrsha) and (.flaggedOIDs | rrlist and length > 0);
+      def rrcycle($edges; $tip; $seen):
+        if ($seen | index($tip)) != null then true
+        else [$edges[] | select(.from == $tip) | .to] as $next
+          | if ($next | length) == 0 then false else rrcycle($edges; $next[0]; $seen + [$tip]) end end;
+      def remediation($j):
+        . as $r | type == "object" and (tojson | utf8bytelength) <= 65536
+        and (keys - ["active"]) == ["attemptId","branch","clonePath","edges","flaggedOIDs","ownedTip","runId","sequence","version"]
+        and .version == 1 and (.runId | rrid(128) and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"))
+        and (.branch | rrid(1024) and . != "@" and (startswith("-") | not)
+          and (contains("..") | not) and (contains("@{") | not)
+          and (test("[ ~^:?*\\[\\\\]") | not)
+          and (split("/") | all(.[]; length > 0 and (startswith(".") | not) and (endswith(".") | not) and (endswith(".lock") | not)))) and (.clonePath | rrid(4096) and startswith("/")
+          and (split("/")[1:] | all(.[]; length > 0 and . != "." and . != "..")))
+        and (.attemptId | rrid(256) and test("^[0-9]{8}T[0-9]{6}Z-(g[0-9]+|gx)-[0-9a-f]{16}$"))
+        and .runId == $j.runId and .clonePath == $j.clonePath and .attemptId == $j.attemptId
+        and (.clonePath | endswith(".attempt-" + $r.attemptId))
+        and (.sequence | integer) and (.ownedTip | rrsha) and (.flaggedOIDs | rrlist)
+        and (if has("active") then (.active | rrgrant) else true end)
+        and (.edges | type == "array" and length <= 64
+          and all(.[]; type == "object" and keys == ["context","from","grant","phase","to"]
+            and (.from | rrsha) and (.to | rrsha) and .from != .to
+            and (.context | type == "string" and test("^context-[0-9a-f]{64}[.]json$"))
+            and (.phase | IN("prepared","committed")) and (.grant | rrgrant))
+          and ((map(.from) | unique | length) == length))
+        and ([.edges[].grant, .active // empty] | all(.[]; . as $g | .originSource.runId == $r.runId and .id <= $r.sequence
+          and all(.flaggedOIDs[]; . as $q | ($r.flaggedOIDs | index($q)) != null))
+          and (group_by(.id) | all(.[]; (unique | length) == 1)))
+        and all(.edges[]; rrcycle($r.edges; .from; []) | not);
       def journal:
-        . as $j | type == "object" and fields(["runId","clonePath","attemptId","restoreTip","recovery","retainedSources","peeledMarkers","memoryPark","completionSourceFence"])
+        . as $j | type == "object" and fields(["runId","clonePath","attemptId","restoreTip","recovery","retainedSources","peeledMarkers","remediationRecovery","memoryPark","completionSourceFence"])
         and ({runId,clonePath} + (if has("attemptId") then {attemptId} else {} end)
           + (if has("restoreTip") then {restoreTip} else {} end) | src)
         and (if has("retainedSources") then (.retainedSources | type) == "array" and all(.retainedSources[]; src) else true end)
         and (if has("peeledMarkers") then (.peeledMarkers | type) == "array" and (.peeledMarkers | length) <= 64
              and all(.peeledMarkers[]; sha) and ((.peeledMarkers | unique | length) == (.peeledMarkers | length)) else true end)
         and (if has("completionSourceFence") then (.completionSourceFence | fence) else true end)
+        and (if has("remediationRecovery") then (.remediationRecovery | remediation($j)) else true end)
         and (if has("memoryPark") then (.memoryPark | memorypark($j.runId)) else true end)
         and (if has("recovery") then
           (.recovery | progress) and
@@ -683,10 +728,55 @@ select_clone(){
     # shellcheck disable=SC2016
     journal_ok="$(printf '%s' "$journal" | "$JQ" -r --arg rid "$rid" '
       def integer: type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
+      def rrid($max): type == "string" and utf8bytelength >= 1 and utf8bytelength <= $max
+        and (test("[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]") | not);
+      def rrsha: type == "string" and test("^[0-9a-f]{40}$");
+      def rrlist: type == "array" and length <= 64 and all(.[]; rrsha) and (unique | length) == length;
+      def rrsource:
+        type == "object" and keys == ["attemptId","clonePath","runId"]
+        and (.runId | rrid(128) and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"))
+        and (.attemptId | rrid(256) and test("^[0-9]{8}T[0-9]{6}Z-(g[0-9]+|gx)-[0-9a-f]{16}$"))
+        and (.clonePath | rrid(4096) and startswith("/")
+          and (split("/")[1:] | all(.[]; length > 0 and . != "." and . != "..")))
+        and (. as $s | .clonePath | endswith(".attempt-" + $s.attemptId));
+      def rrgrant:
+        type == "object" and keys == ["flaggedOIDs","id","origin","originSource","scannedTip"]
+        and (.originSource | rrsource)
+        and (.id | integer) and .id >= 1 and (.origin | IN("checkpoint-pending","pre-exit"))
+        and (.scannedTip | rrsha) and (.flaggedOIDs | rrlist and length > 0);
+      def rrcycle($edges; $tip; $seen):
+        if ($seen | index($tip)) != null then true
+        else [$edges[] | select(.from == $tip) | .to] as $next
+          | if ($next | length) == 0 then false else rrcycle($edges; $next[0]; $seen + [$tip]) end end;
+      def remediation($j):
+        . as $r | type == "object" and (tojson | utf8bytelength) <= 65536
+        and (keys - ["active"]) == ["attemptId","branch","clonePath","edges","flaggedOIDs","ownedTip","runId","sequence","version"]
+        and .version == 1 and (.runId | rrid(128) and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"))
+        and (.branch | rrid(1024) and . != "@" and (startswith("-") | not)
+          and (contains("..") | not) and (contains("@{") | not)
+          and (test("[ ~^:?*\\[\\\\]") | not)
+          and (split("/") | all(.[]; length > 0 and (startswith(".") | not) and (endswith(".") | not) and (endswith(".lock") | not)))) and (.clonePath | rrid(4096) and startswith("/")
+          and (split("/")[1:] | all(.[]; length > 0 and . != "." and . != "..")))
+        and (.attemptId | rrid(256) and test("^[0-9]{8}T[0-9]{6}Z-(g[0-9]+|gx)-[0-9a-f]{16}$"))
+        and .runId == $j.runId and .clonePath == $j.clonePath and .attemptId == $j.attemptId
+        and (.clonePath | endswith(".attempt-" + $r.attemptId))
+        and (.sequence | integer) and (.ownedTip | rrsha) and (.flaggedOIDs | rrlist)
+        and (if has("active") then (.active | rrgrant) else true end)
+        and (.edges | type == "array" and length <= 64
+          and all(.[]; type == "object" and keys == ["context","from","grant","phase","to"]
+            and (.from | rrsha) and (.to | rrsha) and .from != .to
+            and (.context | type == "string" and test("^context-[0-9a-f]{64}[.]json$"))
+            and (.phase | IN("prepared","committed")) and (.grant | rrgrant))
+          and ((map(.from) | unique | length) == length))
+        and ([.edges[].grant, .active // empty] | all(.[]; . as $g | .originSource.runId == $r.runId and .id <= $r.sequence
+          and all(.flaggedOIDs[]; . as $q | ($r.flaggedOIDs | index($q)) != null))
+          and (group_by(.id) | all(.[]; (unique | length) == 1)))
+        and all(.edges[]; rrcycle($r.edges; .from; []) | not);
       def source: type == "object" and (.runId | type) == "string"
         and (.clonePath | type) == "string"
         and ((.attemptId // "") | type) == "string";
       select(source and .runId == $rid)
+      | select(if has("remediationRecovery") then . as $j | (.remediationRecovery | remediation($j)) else true end)
       | select(.recovery == null or (.recovery.version == 1
         and (.recovery.attempts | type) == "number"
         and .recovery.attempts >= 1 and .recovery.attempts <= 3
