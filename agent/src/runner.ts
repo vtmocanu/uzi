@@ -7877,8 +7877,8 @@ export class RunRunner {
       if (server.run_id !== claim.run_id || server.repo_id !== claim.repo.id) {
         throw new PublicationIntentMismatchError("the active intent belongs to another run or repository");
       }
-      if (flight.branch !== undefined && server.branch !== flight.branch) {
-        throw new PublicationIntentMismatchError("the active intent names another branch");
+      if (flight.branch === undefined || server.branch !== flight.branch) {
+        throw new PublicationIntentMismatchError("the active intent names another branch, or this flight has none");
       }
       if (server.claim_generation > flight.claimGeneration) {
         throw new PublicationIntentMismatchError("the active enrollment is newer than this claim");
@@ -7964,13 +7964,13 @@ export class RunRunner {
         beyond ? "the workspace holds work beyond the recorded candidate" : "the restored workspace is not the recorded candidate");
     }
 
-    // A scope-capped delivery is the one closing fact the live claim cannot restate (the cap is a run-time
-    // outcome of the executor). Its title carries the partial prefix; without a live owner deferral to explain
-    // that prefix the delivery cannot be rebuilt model-free, so hold.
-    const redactText = flight.redactText;
-    const base = sliceWellFormed(redactText(mrTitle(claim, undefined, claim.config?.completion_scope)), 1024);
+    // A scope-capped delivery is a closing fact the live claim cannot restate (the cap is a run-time outcome of
+    // the executor). Its recorded title carries the partial prefix; without a live owner deferral to explain
+    // that prefix the delivery cannot be rebuilt model-free, so hold. Keyed on the RECORDED title alone, so a
+    // retitled issue cannot hide the cap; an issue whose own title starts with the prefix is not a cap.
+    const PARTIAL = "[partial] ";
     if ((claim.config?.completion_scope?.deferred?.length ?? 0) === 0 &&
-        record.mr.title !== base && record.mr.title === sliceWellFormed(redactText(`[partial] ${mrTitle(claim)}`), 1024)) {
+        record.mr.title.startsWith(PARTIAL) && !(claim.issue_title ?? "").trim().startsWith(PARTIAL)) {
       return hold("publication_model_required", "the recorded delivery was scope-capped, which only the executor can restate");
     }
 
@@ -7989,6 +7989,8 @@ export class RunRunner {
 
     flight.publicationRecord = record;
     flight.publicationOnly = { originalHead: record.original_head, guard };
+    // The recorded floor (not the live forge floor phaseClone read) is the floor of the original flight: an older
+    // floor only widens the scans, and a remote that has moved past it rejects the non-forced push.
     flight.publicationFloor = floorOid === undefined ? { kind: "absent" } : { kind: "pinned", oid: floorOid };
     flight.publishedTip = guard.published_tip ?? floorOid;
     flight.checkpointFloor = flight.publishedTip;
@@ -8016,9 +8018,24 @@ export class RunRunner {
 
     // The model-free publish inputs: the branch, and the lead's recorded claims (redacted, re-validated) for
     // the description ladder's lead_only rung. The scope flags and every closing directive come from the live
-    // claim inside phasePublish; the recorded `closing` is never read.
+    // claim inside phasePublish; the recorded `closing` can only tighten them (below).
     const lead = leadSummaryFromIntent(record.mr.summary);
     flight.result = { branch: record.branch, ...(lead ? { prSummary: lead } : {}) };
+    // The recorded closing set can only TIGHTEN. A run without the completion interlock keeps a lead's
+    // non-closing declaration (signal_done, or the report_only fallback) only in the executor result, which
+    // the api never learns, so the live claim cannot restate it. If the live rules would close the issue but
+    // the record does not list it as closing, deliver NON-closing (a fixed reason, never recorded text) through
+    // the existing non-closing path. An interlocked run's recorded set is empty by construction; the interlock
+    // and the live claim.config.non_closing decide there.
+    if (claim.config?.completion_contract_version == null && resolveRunKind(claim.kind) === "issue" &&
+        typeof claim.issue_iid === "number" && claim.config?.non_closing === undefined &&
+        (claim.config?.completion_scope?.deferred?.length ?? 0) === 0 &&
+        !record.mr.closing.includes(`#${claim.issue_iid}`)) {
+      flight.result.nonClosing = { reason: "The original delivery did not close its issue; the resumed publication keeps it open." };
+    }
+    // A required code cross-check has no executor on this flight to report it: disclose that on the MR (the
+    // publication phase replaces this with the persisted status when the api has one).
+    if (claim.code_cross_check_required === true) flight.result.codeCrossCheckSummary = { incomplete: "status unavailable" };
     runLog.info("publication-only resume: continuing the recorded publication without model work", {
       run_id: flight.runId, enrollment_seq: record.enrollment_seq, candidate_seq: record.candidate_seq, choice: choice.kind,
     });
@@ -9556,8 +9573,9 @@ export class RunRunner {
           // The recorded closing set is only what is KNOWN to close at enrollment: a declared, owner-partial or
           // scope-capped delivery, an interlocked one (Closes is added only after the head is verified) and one
           // decided later (pendingNonClosing, which the publication ACK supplies) record none. The resume
-          // (phasePublicationOnly) never reads this value: phasePublish recomputes every closing directive from
-          // the live claim and the delivery rules, so a recorded value can never close an issue.
+          // (phasePublicationOnly) uses this value only to TIGHTEN: when the live rules would close the issue of a
+          // non-interlocked run but this set omits it, the resume delivers non-closing. It never adds a closing
+          // directive: phasePublish recomputes those from the live claim and the delivery rules.
           closing: issuePublication && typeof claim.issue_iid === "number" && !effectiveDeclared && !result.scopeCapped &&
             (completionScope?.deferred?.length ?? 0) === 0 && !interlocked ? [`#${claim.issue_iid}`] : [],
           contract_revision: claim.config?.completion_contract_version ?? 0,

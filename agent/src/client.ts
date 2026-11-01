@@ -2512,7 +2512,8 @@ export class WorkerClient {
       }
     }
     if (body.recovery_phase !== undefined || body.publication_surface !== undefined ||
-        body.publication_step !== undefined || body.handoff_checkpoint_tip !== undefined) {
+        body.publication_step !== undefined || body.handoff_checkpoint_tip !== undefined ||
+        body.publication_hold_reason !== undefined) {
       // Issue #1324: the publication-phase forge park. The api refuses an enrolled run's untyped park
       // and a typed park without an enrollment, so this report can neither degrade to an untyped one
       // nor drop its generation fence: it is sent exactly as given, once, or not at all.

@@ -164,7 +164,7 @@ function pushOutage(): { restore: () => void } {
  * The first flight: enrol (1,1), optionally advance to a transformed candidate, and park on a forge outage at
  * the push (default: nothing is published, so the resumed episode has to do all of it) or at the MR create.
  */
-async function enrolAndPark(iid: number, outbox: Outbox, opts: { github?: boolean; transformed?: boolean; handoff?: boolean; at?: "push" | "mr_create" } = {}): Promise<Enrolled> {
+async function enrolAndPark(iid: number, outbox: Outbox, opts: { github?: boolean; transformed?: boolean; handoff?: boolean; at?: "push" | "mr_create"; result?: Partial<ExecutorResult>; claim?: Record<string, unknown> } = {}): Promise<Enrolled> {
   client.protocolFeatures = FEATURES;
   ackIntents();
   if (opts.transformed) commitToOriginMain({ ".github/workflows/ci.yml": CI_V1 }, "seed workflows");
@@ -176,11 +176,13 @@ async function enrolAndPark(iid: number, outbox: Outbox, opts: { github?: boolea
     };
   }
   const at = opts.at ?? "push";
-  const claim = opts.github ? githubClaim(iid) : claimFor(iid);
+  const claim = opts.github ? githubClaim(iid, opts.claim) : claimFor(iid, opts.claim);
   const mrOutage = { intercept: (req: { method: string }) => req.method === "POST" ? { status: 503, text: async () => "down" } : undefined };
   const forgeOpts = at === "mr_create" ? mrOutage : {};
   const forge = opts.github ? { github: fakeGitHub(forgeOpts).github } : { gitlab: fakeGitlab(forgeOpts).gitlab };
-  const executor = opts.transformed ? advancingExecutor() : new StubExecutor(nullLogger());
+  const stub = new StubExecutor(nullLogger());
+  const executor: Executor = opts.transformed ? advancingExecutor()
+    : opts.result ? { run: async (ctx: RunContext) => ({ ...(await stub.run(ctx)), ...opts.result }) } : stub;
   const outage = at === "push" ? pushOutage() : undefined;
   await build(executor, forge, outbox).execute(claim);
   outage?.restore();
@@ -496,7 +498,7 @@ it("a push that already landed is a no-op and an existing merge request is adopt
   await build(tripwireExecutor(c), { gitlab: forge.gitlab }, outbox, { c }).execute(resumeClaim(claim, last));
   assert.deepEqual(c, counts());
   assert.equal(originBranch(5316), landed, "the non-forced push left the remote exactly at C");
-  assert.equal(completed(claim.run_id).length, 1, JSON.stringify(states(claim.run_id).map(s => s.status)));
+  assert.equal(completed(claim.run_id).length, 1, JSON.stringify(states(claim.run_id).map(s => s.status === "failed" ? `failed:${s.failure_reason}` : s.status)));
   assert.equal(failed(claim.run_id).length, 0);
   assert.equal(forge.calls.filter(x => x.method === "POST").length, 1, "one create call, answered with the existing merge request");
   assert.ok(forge.reads.length > 0, "the adopted merge request was read back");
@@ -525,6 +527,9 @@ it("the client refuses a malformed hold: a surface or step, an unknown reason or
   await assert.rejects(client.reportState(runId, { ...hold, publication_hold_reason: "something_else" as never }), /publication park requires/);
   await assert.rejects(client.reportState(runId, { ...hold, claim_generation: 0 }), /publication park requires/);
   await assert.rejects(client.reportState(runId, { ...hold, status: "failed" as never }), /publication park requires/);
+  // A hold with no recovery_phase is as malformed: it must not slip past the validation as an untyped park.
+  const { recovery_phase: _phase, ...noPhase } = hold;
+  await assert.rejects(client.reportState(runId, noPhase), /publication park requires/);
   assert.equal(api.states.filter(s => s.runId === runId).length, 0, "nothing reached the api");
 });
 
@@ -635,7 +640,7 @@ it("a recorded clean_tip never skips the scan: an ever-known run is re-scanned a
   await r.execute(resumeClaim(claim, claimed));
   assert.deepEqual(c, counts());
   assert.deepEqual(rescans, ["scan"], "the branch was re-scanned although the record said it was clean");
-  assert.equal(completed(claim.run_id).length, 1, JSON.stringify(states(claim.run_id).map(s => s.status)));
+  assert.equal(completed(claim.run_id).length, 1, JSON.stringify(states(claim.run_id).map(s => s.status === "failed" ? `failed:${s.failure_reason}` : s.status)));
 });
 
 // ── the guards the live claim and the record both set ───────────────────────────────────────────────
@@ -653,4 +658,149 @@ it("a recorded CI-config guard stays on when the live claim no longer asks for i
   assert.equal(originBranch(5352), undefined, "the recorded guard refused the candidate that changes impl.ts");
   assert.equal(forge.calls.filter(x => x.method === "POST").length, 0);
   assert.equal(failed(claim.run_id).length, 1);
+});
+
+// ── the recorded closing set only tightens ──────────────────────────────────────────────────────────
+
+/** The merge request description the resumed flight wrote: the create body, then every later write. */
+const writtenBodies = (forge: { calls: Array<{ body?: string }>; pr: { description: string } }): string =>
+  [...forge.calls.map(x => x.body ?? ""), forge.pr.description].join("\n");
+
+it("a lead's non-closing declaration (no interlock) survives the resume: the merge request never closes the issue", async () => {
+  const { claim, last } = await enrolAndPark(5399, await mkOutbox(), { result: { nonClosing: { reason: "partial by design" } } });
+  assert.deepEqual(last.mr.closing, [], "the original flight recorded no closing issue");
+  reset();
+  const c = counts();
+  const forge = fakeGitlab({ head: last.candidate });
+  await build(tripwireExecutor(c), { gitlab: forge.gitlab }, await mkOutbox(), { c }).execute(resumeClaim(claim, last));
+  assert.deepEqual(c, counts());
+  assert.equal(completed(claim.run_id).length, 1, JSON.stringify(states(claim.run_id).map(s => s.status === "failed" ? `failed:${s.failure_reason}` : s.status)));
+  assert.ok(!/Closes #5399/.test(writtenBodies(forge)), `no closing directive: ${writtenBodies(forge)}`);
+});
+
+it("control: an ordinary full delivery still closes its issue on the resume", async () => {
+  const { claim, last } = await enrolAndPark(5398, await mkOutbox());
+  assert.deepEqual(last.mr.closing, ["#5398"]);
+  reset();
+  const c = counts();
+  const forge = fakeGitlab({ head: last.candidate });
+  await build(tripwireExecutor(c), { gitlab: forge.gitlab }, await mkOutbox(), { c }).execute(resumeClaim(claim, last));
+  assert.match(writtenBodies(forge), /Closes #5398/);
+});
+
+it("a scope-capped park is still recognised when the issue was retitled before the resume", async () => {
+  const { claim, last } = await enrolAndPark(5397, await mkOutbox(), { result: { scopeCapped: { completedCount: 1, total: 3 } } });
+  assert.ok(String(last.mr.title).startsWith("[partial] "));
+  reset();
+  const c = counts();
+  const forge = fakeGitlab({ head: last.candidate });
+  await build(tripwireExecutor(c), { gitlab: forge.gitlab }, await mkOutbox(), { c }).execute(resumeClaim(claim, last, { issue_title: "A completely different title" }));
+  assert.deepEqual(c, counts());
+  assert.deepEqual(parks(claim.run_id).filter(b => b.publication_hold_reason !== undefined).map(h => h.publication_hold_reason), ["publication_model_required"]);
+  assert.equal(forge.calls.length, 0);
+});
+
+it("an issue whose own title starts with the partial prefix is not mistaken for a scope cap", async () => {
+  const { claim, last } = await enrolAndPark(5396, await mkOutbox(), { claim: { issue_title: "[partial] a real title" } });
+  reset();
+  const c = counts();
+  await build(tripwireExecutor(c), { gitlab: fakeGitlab().gitlab }, await mkOutbox(), { c }).execute(resumeClaim(claim, last));
+  assert.equal(completed(claim.run_id).length, 1, JSON.stringify(states(claim.run_id).map(s => s.status === "failed" ? `failed:${s.failure_reason}` : s.status)));
+});
+
+for (const [name, config] of [
+  ["a live claim.config.non_closing", { non_closing: { reason: "owner declared" } }],
+  ["a live owner deferral", { completion_scope: { deferred: [{ milestone_id: "m2", title: "later", reason: "owner" }] } }],
+] as const) {
+  it(`the live claim wins over a recorded closing set: ${name} delivers non-closing`, async () => {
+    const iid = name.includes("deferral") ? 5395 : 5394;
+    const { claim, last } = await enrolAndPark(iid, await mkOutbox());
+    assert.deepEqual(last.mr.closing, [`#${iid}`], "the record lists the issue as closing");
+    reset();
+    const c = counts();
+    const forge = fakeGitlab({ head: last.candidate });
+    await build(tripwireExecutor(c), { gitlab: forge.gitlab }, await mkOutbox(), { c }).execute(resumeClaim(claim, last, { config }));
+    assert.equal(completed(claim.run_id).length, 1, JSON.stringify(states(claim.run_id).map(s => s.status === "failed" ? `failed:${s.failure_reason}` : s.status)));
+    assert.ok(!new RegExp(`Closes #${iid}`).test(writtenBodies(forge)), writtenBodies(forge));
+  });
+}
+
+// ── plan test-list gaps ─────────────────────────────────────────────────────────────────────────────
+
+it("a superseded local record: the server's intent is adopted, never the old local identity, and nothing is re-enrolled", async () => {
+  const first = await enrolAndPark(5393, await mkOutbox());
+  reset();
+  const stale = await mkOutbox();
+  // An older enrollment of this run, with a candidate this worker never had: adopting it would be unpublishable.
+  await seedLocal(stale, { ...first.last, candidate: "9".repeat(40) }, { enrollment_seq: 7, candidate_seq: 1 });
+  const c = counts();
+  await build(tripwireExecutor(c), { gitlab: fakeGitlab().gitlab }, stale, { c }).execute(resumeClaim(first.claim, first.last));
+  assert.deepEqual(c, counts());
+  assert.equal(api.publicationIntentRequests.length, 0, "no enrollment and no resend of the old identity");
+  assert.equal(completed(first.claim.run_id).length, 1, JSON.stringify(states(first.claim.run_id).map(s => s.status)));
+  assert.equal(originBranch(5393), first.last.candidate);
+});
+
+it("a failed capture on the re-park is retried until it is verified; the park is sent once, after it, and nothing fails", async () => {
+  const outbox = await mkOutbox();
+  const { claim, last } = await enrolAndPark(5392, outbox, { at: "mr_create" });
+  reset();
+  const c = counts();
+  const down = fakeGitlab({ intercept: (req) => req.method === "POST" ? { status: 503, text: async () => "down" } : undefined });
+  const r = build(tripwireExecutor(c), { gitlab: down.gitlab }, outbox, { c });
+  const seam = r as unknown as { captureRecoveryRestorePoint: (...a: unknown[]) => Promise<unknown> };
+  const real = seam.captureRecoveryRestorePoint.bind(r);
+  let attempts = 0;
+  seam.captureRecoveryRestorePoint = async (...a) => {
+    attempts++;
+    if (attempts <= 2) return { verified: false, published: false };
+    return real(...a);
+  };
+  const before = parks(claim.run_id).length;
+  await r.execute(resumeClaim(claim, last));
+  assert.deepEqual(c, counts());
+  assert.ok(attempts >= 3, `the capture was retried: ${attempts}`);
+  assert.equal(parks(claim.run_id).length - before, 1, "exactly one park, after the capture verified");
+  assert.equal(failed(claim.run_id).length, 0);
+});
+
+it("a secret finding known at the recorded floor is treated the same after the resume (blocked, not pushed)", async () => {
+  const { claim, last } = await enrolAndPark(5391, await mkOutbox());
+  reset();
+  const c = counts();
+  const forge = fakeGitlab();
+  // The finding sits AT the recorded floor, as an at-floor finding the original gate could not remediate.
+  const floor = last.original_head;
+  const atFloor = withRemediation({ ...last, floor: { kind: "pinned", oid: floor } }, {
+    ever_known: true, known: [{ start_line: 1, commit: floor, rule_id: "generic-api-key" }],
+    flagged_commits: [floor], flagged_findings: [{ start_line: 1, commit: floor, rule_id: "generic-api-key" }],
+  });
+  await build(tripwireExecutor(c), { gitlab: forge.gitlab }, await mkOutbox(), { c }).execute(resumeClaim(claim, atFloor));
+  assert.deepEqual(c, counts());
+  assert.equal(originBranch(5391), undefined);
+  assert.equal(forge.calls.length, 0);
+  assert.equal(failed(claim.run_id)[0]?.fail_origin, "push_secret_blocked");
+});
+
+it("a required code cross-check is disclosed as incomplete instead of silently dropped", async () => {
+  const { claim, last } = await enrolAndPark(5390, await mkOutbox());
+  reset();
+  const c = counts();
+  const forge = fakeGitlab();
+  await build(tripwireExecutor(c), { gitlab: forge.gitlab }, await mkOutbox(), { c })
+    .execute(resumeClaim(claim, last, { code_cross_check_required: true }));
+  assert.equal(completed(claim.run_id).length, 1, JSON.stringify(states(claim.run_id).map(s => s.status === "failed" ? `failed:${s.failure_reason}` : s.status)));
+  assert.match(writtenBodies(forge), /status unavailable|incomplete/i);
+});
+
+it("a flight with no branch is refused as an intent mismatch instead of skipping the branch check", async () => {
+  const { claim, last } = await enrolAndPark(5389, await mkOutbox());
+  reset();
+  const c = counts();
+  const r = build(tripwireExecutor(c), { gitlab: fakeGitlab().gitlab }, await mkOutbox(), { c });
+  const seam = r as unknown as { phasePublicationOnly: (claim: ClaimResponse, flight: { branch?: string }) => Promise<unknown> };
+  const real = seam.phasePublicationOnly.bind(r);
+  seam.phasePublicationOnly = async (cl, flight) => { flight.branch = undefined; return real(cl, flight); };
+  await r.execute(resumeClaim(claim, last));
+  assert.deepEqual(parks(claim.run_id).filter(b => b.publication_hold_reason !== undefined).map(h => h.publication_hold_reason), ["publication_intent_mismatch"]);
 });
