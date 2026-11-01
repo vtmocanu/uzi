@@ -35,6 +35,7 @@ func TestIterationParkEvidence(t *testing.T) {
 		{"durability_null", strings.Replace(valid, "}", `,"checkpoint_contains_latest":null}`, 1), false},
 		{"durability", strings.Replace(valid, "}", `,"checkpoint_contains_latest":false}`, 1), true},
 		{"utf8_bytes", strings.Replace(valid, `"head":""`, `"head":"`+strings.Repeat("é", 65)+`"`, 1), false},
+		{"exact_body_limit", valid + strings.Repeat(" ", (16<<10)-len(valid)), true},
 		{"body_limit", valid + strings.Repeat(" ", 16<<10), false},
 		{"trailing_json", valid + " {}", false},
 		{"invalid_utf8", strings.Replace(valid, `"head":""`, `"head":"`+string([]byte{255})+`"`, 1), false},

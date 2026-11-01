@@ -269,6 +269,17 @@ func TestWorkerIterationParkLiveDB(t *testing.T) {
 			}
 		}
 	})
+	t.Run("changed_default_before_first_park", func(t *testing.T) {
+		id := f.run(t, "prompt")
+		f.exec(t, "UPDATE runs SET budget_max_iterations=NULL WHERE id=$1", id)
+		f.install(t, workersvc.Params{RunMaxIterations: 8, RunTimeout: time.Hour}, nil)
+		defer f.install(t, workersvc.Params{RunMaxIterations: 5, RunTimeout: time.Hour}, nil)
+		before := f.snapshot(t, id)
+		assertIterationAck(t, f.call(id, "iteration-park", iterationParkBody, f.worker), 409, "allowance_mismatch")
+		if f.snapshot(t, id) != before {
+			t.Fatal("changed-default refusal persisted an allowance or changed run state")
+		}
+	})
 	t.Run("replay", func(t *testing.T) {
 		id := f.run(t, "prompt")
 		f.exec(t, "UPDATE runs SET budget_max_iterations=NULL WHERE id=$1", id)
@@ -451,6 +462,206 @@ func TestWorkerIterationParkRacesLiveDB(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// Recovery queries must leave an iteration hold intact even when a matching
+// live snapshot reports the old phase, or a later snapshot omits the attempt.
+func TestWorkerIterationParkRecoveryQueriesLiveDB(t *testing.T) {
+	for _, frozen := range []bool{false, true} {
+		t.Run(fmt.Sprintf("frozen=%v", frozen), func(t *testing.T) {
+			f := iterationRoutes(t)
+			ctx := context.Background()
+			held, control := f.run(t, "prompt"), f.run(t, "prompt")
+			body := strings.Replace(iterationParkBody, `"head":""`, `"head":"captured-head"`, 1)
+			assertIterationAck(t, f.call(held, "iteration-park", body, f.worker), 200, "")
+			ids := []uuid.UUID{held, control}
+			f.exec(t, "UPDATE runs SET status_since=now()-interval '10 minutes',requeue_count=1 WHERE id=ANY($1::uuid[])", ids)
+			f.exec(t, "UPDATE runs SET status='queued' WHERE id=$1", control)
+			f.exec(t, "UPDATE workers SET snapshot_register_nonce='iteration-recovery',snapshot_epoch=1 WHERE id=$1", f.worker)
+			for _, id := range ids {
+				f.exec(t, `INSERT INTO worker_active_runs(worker_id,run_id,claim_generation,phase,terminal_pending,snapshot_epoch,reported_at)
+ VALUES($1,$2,4,'running',false,1,now())`, f.worker, id)
+			}
+			var ledger []byte
+			if err := f.pool.QueryRow(ctx, `SELECT jsonb_agg(jsonb_build_object(
+ 'id',id,'kind',kind,'target_run_id',target_run_id,'worker_id',worker_id,
+ 'claim_generation',claim_generation,'cross_check_id',NULL,'parent_lead_id',id))
+ FROM runs WHERE id=ANY($1::uuid[])`, ids).Scan(&ledger); err != nil {
+				t.Fatal(err)
+			}
+			before := f.snapshot(t, held)
+			// The complete snapshot comparison below includes head, generation,
+			// session, allowance, every budget counter and claim release identity.
+			parked, err := f.q.GetRunByID(ctx, held)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if parked.Status != "paused" || parked.HoldReason.String != "iteration_budget_exhausted" ||
+				parked.HoldCapturedHead.String != "captured-head" || parked.ClaimGeneration != 4 {
+				t.Fatal("fixture did not establish the iteration hold")
+			}
+			runQuery := func(name string, check func(*store.Queries)) {
+				t.Helper()
+				tx, err := f.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				q := store.New(tx)
+				if _, err := q.GetWorkerForUpdate(ctx, f.worker); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := tx.Exec(ctx, "SELECT id FROM runs WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE", ids); err != nil {
+					t.Fatal(err)
+				}
+				check(q)
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if f.snapshot(t, held) != before {
+					t.Fatalf("%s changed the iteration hold, generation, head or budgets", name)
+				}
+			}
+			runQuery("readoption", func(q *store.Queries) {
+				if frozen {
+					rows, err := q.FrozenReadoptRunsFromSnapshot(ctx, store.FrozenReadoptRunsFromSnapshotParams{
+						WorkerID: f.worker, FrozenTargets: ledger, LockedParentIds: ids,
+					})
+					if err != nil || len(rows) != 1 || rows[0].ID != control || rows[0].Status != "running" {
+						t.Fatalf("frozen readopt=%v err=%v; want only running control", rows, err)
+					}
+				} else {
+					rows, err := q.ReadoptRunsFromSnapshot(ctx, f.worker)
+					if err != nil || len(rows) != 1 || rows[0].ID != control || rows[0].Status != "running" {
+						t.Fatalf("readopt=%v err=%v; want only running control", rows, err)
+					}
+				}
+			})
+			// Make both attempts old enough for missing-snapshot recovery.
+			// The held attempt is otherwise eligible for both requeue caps.
+			f.exec(t, "DELETE FROM worker_active_runs WHERE worker_id=$1", f.worker)
+			f.exec(t, "UPDATE workers SET snapshot_epoch=2 WHERE id=$1", f.worker)
+			f.exec(t, "UPDATE runs SET status_since=now()-interval '10 minutes' WHERE id=$1", control)
+			now := time.Now()
+			cutoff, observed := pgconv.Time(now.Add(-time.Minute)), pgconv.Time(now)
+			runQuery("missing requeue", func(q *store.Queries) {
+				if frozen {
+					rows, err := q.FrozenRequeueRunsMissingFromSnapshot(ctx, store.FrozenRequeueRunsMissingFromSnapshotParams{
+						WorkerID: pgconv.UUID(f.worker), MissingCutoff: cutoff, MaxRequeues: 2,
+						Now: observed, GlobalTimeoutSeconds: 3600, FrozenTargets: ledger, LockedParentIds: ids,
+					})
+					if err != nil || len(rows) != 1 || rows[0].ID != control || rows[0].Status != "queued" {
+						t.Fatalf("frozen missing requeue=%v err=%v; want only queued control", rows, err)
+					}
+				} else {
+					rows, err := q.RequeueRunsMissingFromSnapshot(ctx, store.RequeueRunsMissingFromSnapshotParams{
+						WorkerID: pgconv.UUID(f.worker), MissingCutoff: cutoff, MaxRequeues: 2,
+						Now: observed, GlobalTimeoutSeconds: 3600,
+					})
+					if err != nil || len(rows) != 1 || rows[0].ID != control || rows[0].Status != "queued" {
+						t.Fatalf("missing requeue=%v err=%v; want only queued control", rows, err)
+					}
+				}
+			})
+			f.exec(t, "UPDATE runs SET status='running',status_since=now()-interval '10 minutes' WHERE id=$1", control)
+			runQuery("missing exhaustion", func(q *store.Queries) {
+				if frozen {
+					rows, err := q.FrozenFailRunsMissingFromSnapshot(ctx, store.FrozenFailRunsMissingFromSnapshotParams{
+						WorkerID: pgconv.UUID(f.worker), MissingCutoff: cutoff, MaxRequeues: 1,
+						Now: observed, GlobalTimeoutSeconds: 3600, FrozenTargets: ledger, LockedParentIds: ids,
+						FailureReason: pgconv.TextOrNull("iteration recovery control"),
+					})
+					if err != nil || len(rows) != 1 || rows[0].ID != control {
+						t.Fatalf("frozen missing exhaustion=%v err=%v; want only control", rows, err)
+					}
+				} else {
+					rows, err := q.FailRunsMissingFromSnapshot(ctx, store.FailRunsMissingFromSnapshotParams{
+						WorkerID: pgconv.UUID(f.worker), MissingCutoff: cutoff, MaxRequeues: 1,
+						Now: observed, GlobalTimeoutSeconds: 3600,
+						FailureReason: pgconv.TextOrNull("iteration recovery control"),
+					})
+					if err != nil || len(rows) != 1 || rows[0].ID != control {
+						t.Fatalf("missing exhaustion=%v err=%v; want only control", rows, err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestWorkerIterationParkSnapshotsLiveDB(t *testing.T) {
+	f := iterationRoutes(t)
+	ctx := context.Background()
+	id := f.run(t, "prompt")
+	body := strings.Replace(iterationParkBody, `"head":""`, `"head":"snapshot-head"`, 1)
+	assertIterationAck(t, f.call(id, "iteration-park", body, f.worker), 200, "")
+	f.exec(t, "UPDATE runs SET status_since=now()-interval '10 minutes',requeue_count=1 WHERE id=$1", id)
+	f.exec(t, "UPDATE workers SET snapshot_register_nonce='iteration-snapshot',snapshot_epoch=0 WHERE id=$1", f.worker)
+	before := f.snapshot(t, id)
+	svc := workersvc.New(f.q, newHandlerTestBox(t), workersvc.Params{
+		RunMaxIterations: 5, RunTimeout: time.Hour, RunMaxRequeues: 1,
+		WorkerHeartbeatStale: time.Minute, WorkerHeartbeatInterval: time.Second,
+		ActiveSnapshotMaxEntries: 8, WorkerOutboxMaxPending: 8,
+	})
+	svc.SetTxBeginner(f.pool)
+	for _, step := range []struct {
+		name     string
+		register bool
+		listed   bool
+		epoch    int64
+	}{
+		{"heartbeat_listed", false, true, 1},
+		{"heartbeat_missing", false, false, 2},
+		{"register_listed", true, true, 0},
+		{"register_missing", true, false, 0},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			wkr, err := f.q.GetWorkerByID(ctx, f.worker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snap := &workersvc.ActiveSnapshot{SnapshotEpoch: step.epoch, Active: []workersvc.ActiveRunEntry{}}
+			if step.listed {
+				snap.Active = append(snap.Active, workersvc.ActiveRunEntry{
+					RunID: id.String(), ClaimGeneration: 4, Phase: "running",
+				})
+			}
+			if step.register {
+				_, nonce, err := svc.Register(ctx, wkr, "v1", "base", nil, nil, nil, snap)
+				if err != nil || nonce == "" || nonce == wkr.SnapshotRegisterNonce.String {
+					t.Fatalf("register nonce=%q err=%v; want a fresh nonce", nonce, err)
+				}
+				stored, err := f.q.GetWorkerByID(ctx, f.worker)
+				if err != nil || stored.SnapshotRegisterNonce.String != nonce || stored.SnapshotEpoch != 0 {
+					t.Fatalf("register did not persist the rotated nonce and reset epoch: %v", err)
+				}
+			} else {
+				snap.RegisterNonce = wkr.SnapshotRegisterNonce.String
+				if _, err := svc.Heartbeat(ctx, wkr, nil, nil, snap); err != nil {
+					t.Fatal(err)
+				}
+				stored, err := f.q.GetWorkerByID(ctx, f.worker)
+				if err != nil || stored.SnapshotEpoch != step.epoch {
+					t.Fatalf("heartbeat did not accept snapshot epoch %d: %v", step.epoch, err)
+				}
+			}
+			var count int
+			var exact bool
+			err = f.pool.QueryRow(ctx, `SELECT count(*),COALESCE(bool_and(
+ claim_generation=4 AND phase='running' AND NOT terminal_pending AND snapshot_epoch=$3),false)
+ FROM worker_active_runs WHERE worker_id=$1 AND run_id=$2`, f.worker, id, step.epoch).Scan(&count, &exact)
+			want := 0
+			if step.listed {
+				want = 1
+			}
+			if err != nil || count != want || (step.listed && !exact) {
+				t.Fatalf("snapshot storage count=%d exact=%v want=%d err=%v", count, exact, want, err)
+			}
+			if f.snapshot(t, id) != before {
+				t.Fatal("snapshot recovery changed the iteration hold, generation, captured head or budgets")
+			}
+		})
 	}
 }
 

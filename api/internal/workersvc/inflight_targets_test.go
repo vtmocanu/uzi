@@ -110,6 +110,10 @@ func TestSelfImproveClaimCarriesInflightTargets(t *testing.T) {
 		t.Fatal("expected a self_improve payload, got idle")
 	}
 
+	if payload.Config.IterationParkVersion != 1 {
+		t.Fatalf("assembled claim iteration_park_version=%d, want 1", payload.Config.IterationParkVersion)
+	}
+
 	if got := len(payload.InflightTargets); got != 1 {
 		t.Fatalf("InflightTargets has %d entries, want exactly 1 (self and other-repo excluded): %#v", got, payload.InflightTargets)
 	}
