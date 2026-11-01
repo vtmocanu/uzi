@@ -21,6 +21,20 @@ import (
 // journal hidden behind a refused UUID symlink. HTTP here proves actual intake,
 // rather than merely the stubbed request emission the old D1 control observed.
 func TestWorkerIncompleteInventoryClaimLiveDB(t *testing.T) {
+	exerciseIncompleteInventoryClaim(t, false)
+}
+
+// Manual protocol-skew probe only. It is intentionally outside the LiveDB$ gate:
+// the normal regression above can never be switched to accepting legacy idle.
+func TestWorkerIncompleteInventoryOlderAPISkew(t *testing.T) {
+	if os.Getenv("UZI_INCOMPLETE_EXPECT_LEGACY") != "1" {
+		t.Skip("manual older-API probe requires UZI_INCOMPLETE_EXPECT_LEGACY=1, an isolated LiveDB DSN and pre-marker API source")
+	}
+	exerciseIncompleteInventoryClaim(t, true)
+}
+
+func exerciseIncompleteInventoryClaim(t *testing.T, expectLegacy bool) {
+	t.Helper()
 	raw, err := os.ReadFile("../../../fixtures/worker-register-snapshot/incomplete-claim.json")
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +83,7 @@ func TestWorkerIncompleteInventoryClaimLiveDB(t *testing.T) {
 		}
 	})
 	rec = f.post(t, "/api/worker/runs/claim", string(raw))
-	if os.Getenv("UZI_INCOMPLETE_EXPECT_LEGACY") == "1" {
+	if expectLegacy {
 		// Only for the watched baseline/skew control. The earlier API ignores the
 		// marker without rejecting unknown nested fields and must remain idle.
 		if rec.Code != http.StatusNoContent {

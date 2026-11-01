@@ -18,6 +18,25 @@ Two tests read `finalize-resume.json`, one per side, and neither reads the other
 strictly; an older api ignores the inner field. `fixtures/` sits above `api/`, so run the Go
 package with `-count=1` after a fixture-only edit.
 
+## Incomplete-inventory claim
+
+`incomplete-claim.json` is the complete claim POST body emitted by a real Outbox
+and negotiated client with zero installed pending entries but a signed journal
+hidden behind a refused UUID symlink. It retains overflow, sets the standalone
+`pending_inventory_incomplete` marker and omits complete/group lists. The marker
+permits unrelated intake only; the existing owner-overflow SQL still excludes
+all work attributed to that worker.
+
+- `agent/test/incomplete-claim-fixture.test.ts` byte-checks the real projection,
+  verifies downgrade stripping and retained bytes, and keeps exhausted capacity closed.
+- `api/internal/handler/worker_incomplete_claim_livedb_test.go` feeds the same
+  bytes through authenticated routes and the real Claim transaction. Its gating
+  `TestWorkerIncompleteInventoryClaimLiveDB` requires an actual unrelated claim,
+  normal custody and protected-source exclusion for the owner and a peer.
+- `TestWorkerIncompleteInventoryOlderAPISkew` is a separate manual opt-in probe,
+  outside the `LiveDB$` sweep. It checks conservative idle against pre-marker API
+  source; setting its opt-in environment variable cannot weaken the gating test.
+
 ## Scoped claim (R3)
 
 `scoped-claim.json` is a complete POST body for `/api/worker/runs/claim`, rather

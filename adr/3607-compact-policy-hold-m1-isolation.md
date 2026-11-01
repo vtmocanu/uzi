@@ -212,9 +212,9 @@ existing SQL still excludes all candidates attributed to any overflowed worker;
 only otherwise eligible unrelated work can be returned. Register and heartbeat
 cannot persist or grant the exception.
 
-The capability is introduced by this unmerged change, not deployed on main. The
-real older-API downgrade strips the marker when capability negotiation is absent.
-For future skew, an earlier API that knows the capability but not this marker
+Roll out API support before capable workers. An API without capability support
+causes the client to strip the marker. For protocol skew, an earlier API that
+knows the capability but not this marker
 ignores the nested field and conservatively returns idle. No partial list is ever
 sent as `pending_all`, so it cannot be mistaken for complete empty coverage.
 Outer worker bodies reject unknown fields; the isolated snapshot's custom decoder
