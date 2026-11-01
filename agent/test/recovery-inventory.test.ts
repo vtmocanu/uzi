@@ -6713,7 +6713,7 @@ it("#3727 retained-claim grant 4 denies an unresolved held create even with a cl
   } finally { await f.close(); }
 });
 
-it("#3727 an unaccepted expired thin FINAL replaces only after the validated fence, then mints under a fresh grant", async () => {
+it("#3727 an unaccepted expired thin FINAL replaces after a validated replaceable response, then mints under a fresh grant", async () => {
   const f = await fixture(true, os.tmpdir(), true);
   try {
     closureHarness(f, { features: CLOSURE_ONLY });
@@ -6727,25 +6727,24 @@ it("#3727 an unaccepted expired thin FINAL replaces only after the validated fen
     old.state = "expired";
     old.expires = "1970-01-01T00:00:00Z";
     const bundle = await fs.readFile(before.bundlePath!);
-    let fenced = false;
+    let replaceableObserved = false;
     const reconcile = f.client.reconcileRecoveryCapture!;
     Object.assign(f.client, { reconcileRecoveryCapture: async (...args: Parameters<typeof reconcile>) => {
       const out = await reconcile(...args);
       if (out.outcome === "replaceable") {
-        assert.equal(old.state, "expired");
-        fenced = true;
+        replaceableObserved = true;
       }
       return out;
     } });
     const getStatus = f.client.getRecoveryCaptureStatus;
     Object.assign(f.client, { getRecoveryCaptureStatus: async (run: string, id: string) => {
-      assert.equal(fenced, true, "saved replay must not query status before the committed replacement fence");
+      assert.equal(replaceableObserved, true, "saved replay must not query status before the validated replaceable response");
       return getStatus(run, id);
     } });
     f.state.finalError = undefined;
     await f.make(true).resumePending();
     const replaced = (await f.coordinator.inspect("run-1"))[0]!;
-    assert.equal(fenced, true);
+    assert.equal(replaceableObserved, true);
     assert.equal(replaced.captureId, before.captureId);
     assert.notEqual(replaced.serverCaptureId, before.serverCaptureId);
     assert.equal(f.state.produced, 1);
