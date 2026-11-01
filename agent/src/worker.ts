@@ -194,6 +194,7 @@ export class Worker {
 
   /** Issue #1512: single-flight guard for {@link sweepPendingTerminals}, like `draining`. */
   private sweepingTerminals = false;
+  private policyOwnershipCursor = 0;
   private sweepingFinalizes = false;
   // Only the exact 256-or-fewer wire offers accepted in this worker lifetime gain handoff.
   // Keep identities even while a terminal hides the record; replacements never inherit them.
@@ -824,29 +825,39 @@ export class Worker {
     }
   }
 
-  /** One ownership request per pending policy run per invocation, serially.
-   * The bounded catalog limits attempts; transport bounds each request. A failed
-   * observation stays conservative and does not prevent observing sibling runs. */
+  /** At most 16 ownership reads share one second per pass, including response bodies.
+   * Rotate global passes so old slow entries cannot monopolize later observations.
+   * Expiry leaves ownership conservative and allows unrelated terminal replay to proceed. */
   private async observePendingPolicyOwnership(signal?: AbortSignal, onlyRun?: string): Promise<void> {
-    const seen = new Set<string>();
+    const candidates = new Map<string, { run_id: string; outcome_kind?: string }>();
     for (const entry of this.outbox?.listPendingOutcomeSources() ?? []) {
       if (signal?.aborted) return;
       if (entry.server_settled) continue;
       if (entry.outcome_kind !== "policy_hold" && entry.outcome_kind !== "unknown") continue;
       const run_id = entry.run_id.toLowerCase();
       if (onlyRun !== undefined && run_id !== onlyRun.toLowerCase()) continue;
-      if (seen.has(run_id)) continue;
-      seen.add(run_id);
-      await this.observePolicyOwnership({ ...entry, run_id });
+      if (!candidates.has(run_id)) candidates.set(run_id, { run_id, outcome_kind: entry.outcome_kind });
+    }
+    const entries = [...candidates.values()];
+    if (entries.length === 0) return;
+    const deadline = Date.now() + 1000;
+    const start = onlyRun === undefined ? this.policyOwnershipCursor % entries.length : 0;
+    for (let offset = 0; offset < Math.min(16, entries.length); offset++) {
+      if (signal?.aborted || Date.now() >= deadline) return;
+      const index = (start + offset) % entries.length;
+      if (onlyRun === undefined) this.policyOwnershipCursor = (index + 1) % entries.length;
+      await this.observePolicyOwnership(entries[index]!, { signal, deadline });
     }
   }
 
   /** Lease evidence only: bind before HTTP so a late response cannot replace a newer claim. */
-  private async observePolicyOwnership(entry: { run_id: string; outcome_kind?: string }): Promise<void> {
+  private async observePolicyOwnership(entry: { run_id: string; outcome_kind?: string },
+    budget: { signal?: AbortSignal; deadline: number }): Promise<void> {
     if (entry.outcome_kind !== "policy_hold" && entry.outcome_kind !== "unknown") return;
     const observe = this.activeRuns?.beginPolicyOwnershipObservation(entry.run_id);
     try {
-      const generation = policyOwnershipGeneration(await this.client.getRunOwnership(entry.run_id));
+      const generation = policyOwnershipGeneration(await this.client.getRunOwnership(entry.run_id, budget));
+      if (budget.signal?.aborted || Date.now() >= budget.deadline) return;
       if (generation !== undefined) observe?.(generation);
     } catch { /* Unknown ownership keeps the conservative projection. */ }
   }

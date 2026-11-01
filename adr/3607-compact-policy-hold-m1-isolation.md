@@ -163,9 +163,12 @@ Registration does not wait for ownership GETs. It publishes the conservative
 pending snapshot first and starts heartbeats before the existing boot, drain and
 sweep reconciliation reads. Those reads skip authenticated server-settled sources.
 Unknown ownership still grants no lease or claim authority, and incomplete
-coverage still cannot produce a complete `pending_all`. The remaining serial
-post-registration reconciliation cost is unchanged; this repair removes it only
-from the registration and heartbeat barrier.
+coverage still cannot produce a complete `pending_all`. Each post-registration
+ownership pass makes at most 16 requests sharing one second, including response
+bodies through the existing HTTP deadline. Global passes rotate their starting
+candidate, and expired responses supply no ownership proof. This bounds ownership
+observation's added delay before boot admission and terminal replay independently
+of retained-run count; existing delivery and admission guards remain unchanged.
 
 The targeted scanner and persistent recovery pager cooperate after at most 256
 visited entries per slice or a one-second elapsed-time checkpoint. Ignored entries

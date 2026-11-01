@@ -93,3 +93,68 @@ it("ownership refresh skips authenticated server-settled sources", async () => {
   await (worker as unknown as { observePendingPolicyOwnership(): Promise<void> }).observePendingPolicyOwnership();
   assert.deepEqual(requested, [active.run_id]);
 });
+
+for (const lane of ["boot", "drain", "sweep"] as const)
+it(`${lane} ownership pass shares one deadline across 100 slow reads and still delivers an ordinary terminal`, async t => {
+  const entries = Array.from({ length: 100 }, (_, n) => pending(n + 1));
+  const target = entries[0]!.run_id;
+  const terminal = { ...pending(1), claim_generation: 2, outcome_kind: "terminal" as const };
+  const registry = new ActiveRunRegistry(() => entries, () => 200);
+  let now = 10000;
+  t.mock.method(Date, "now", () => now);
+  const reads: Array<{ signal?: AbortSignal; deadline: number } | undefined> = [];
+  const delivered: string[] = [];
+  const signal = new AbortController().signal;
+  const client = {
+    hasFeature: () => false,
+    getRunOwnership: async (_run: string, budget?: { signal?: AbortSignal; deadline: number }) => {
+      reads.push(budget);
+      // Deterministically consume the whole pass, rather than waiting a real second.
+      now += 1000;
+      return { status: "running", claim_generation: 1, claim_released: false };
+    },
+    reportState: async (run: string) => { delivered.push(run); return { applied: false, status: "running" }; },
+  } as unknown as WorkerClient;
+  const store = outbox(entries);
+  Object.assign(store, {
+    listPendingTerminals: () => [terminal],
+    isTerminalResolveHeld: () => false,
+    readTerminalJournal: async () => ({ body: { status: "failed", error: "ordinary" }, messagesThroughSeq: 0, blocked: false }),
+  });
+  const replayRunner = { observeSettlementTerminalAck: async () => {} } as unknown as RunRunner;
+  const worker = new Worker(config, client, replayRunner, {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner,
+    nullLogger(), undefined, store, undefined, registry);
+  const seam = worker as unknown as {
+    resolveBootTerminals(signal: AbortSignal): Promise<void>;
+    resolveRunTerminal(run: string, signal: AbortSignal): Promise<void>;
+    sweepPendingTerminals(signal: AbortSignal): Promise<void>;
+  };
+  if (lane === "boot") await seam.resolveBootTerminals(signal);
+  else if (lane === "drain") await seam.resolveRunTerminal(target, signal);
+  else await seam.sweepPendingTerminals(signal);
+  assert.equal(reads.length, 1, "expiry must stop the pass instead of spending a timeout per source");
+  assert.equal(reads[0]?.deadline, 11000, "the existing HTTP transport receives the absolute shared deadline");
+  assert.equal(reads[0]?.signal, signal, "worker shutdown cancels the actual request");
+  assert.deepEqual(delivered, [target], "ordinary terminal delivery proceeds after ownership expiry");
+  assert.deepEqual(registry.build(true).pending_policy_protection, [],
+    "a response arriving at the deadline cannot establish ownership");
+});
+
+it("ownership passes cap fast reads and rotate beyond old candidates", async t => {
+  const entries = Array.from({ length: 100 }, (_, n) => pending(n + 1));
+  const requested: string[] = [], deadlines: number[] = [];
+  t.mock.method(Date, "now", () => 10000);
+  const client = { getRunOwnership: async (run: string, budget: { deadline: number }) => {
+    requested.push(run); deadlines.push(budget?.deadline);
+    return { status: "running", claim_generation: 1, claim_released: false };
+  } } as unknown as WorkerClient;
+  const registry = new ActiveRunRegistry(() => entries, () => 200);
+  const worker = new Worker(config, client, runner, {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner,
+    nullLogger(), undefined, outbox(entries), undefined, registry);
+  const seam = worker as unknown as { observePendingPolicyOwnership(): Promise<void> };
+  await seam.observePendingPolicyOwnership();
+  assert.equal(requested.length, 16);
+  await seam.observePendingPolicyOwnership();
+  assert.deepEqual(requested, entries.slice(0, 32).map(entry => entry.run_id));
+  assert.deepEqual(deadlines, Array(32).fill(11000));
+});
