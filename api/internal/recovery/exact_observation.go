@@ -73,7 +73,13 @@ func validExactClosedObservation(out apitypes.RecoveryExactHold, owner uuid.UUID
 	switch f.Kind {
 	case "held_publication", "archive":
 		sha, err := validateSha(f.SourceSha, false)
-		if err != nil || sha != f.SourceSha || !validCoverageDigest(f.CoverageDigest) || out.ReleaseEvidence != f.Kind {
+		if err != nil || sha != f.SourceSha || !validCoverageDigest(f.CoverageDigest) {
+			return false
+		}
+		// An archive FINAL is evidenced by "archive" or, for a thin capture released against its
+		// pinned closure, "prerequisite_closure"; every other kind is evidenced by its own name.
+		closureArchive := f.Kind == "archive" && out.ReleaseEvidence == "prerequisite_closure"
+		if out.ReleaseEvidence != f.Kind && !closureArchive {
 			return false
 		}
 		if f.Kind == "held_publication" {
@@ -141,7 +147,10 @@ WHERE h.run_id=$1 AND h.generation=$2 AND h.original_worker_id=$3 AND h.user_id=
          OR (h.final_disposition='no_adopted_source' AND h.release_evidence='no_adopted_source'
           AND h.final_capture_id IS NULL AND h.final_publication_id IS NULL
           AND h.final_source_sha IS NULL AND h.final_coverage_digest IS NULL)
-         OR (h.final_disposition='archive' AND h.release_evidence='archive'
+         OR (h.final_disposition='archive' AND (h.release_evidence='archive'
+           OR (h.release_evidence='prerequisite_closure' AND h.final_closure_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM recovery_prerequisite_closures pc WHERE pc.id=h.final_closure_id
+             AND pc.capture_id=h.final_capture_id AND pc.hold_id=h.id)))
           AND h.final_publication_id IS NULL AND EXISTS (
            SELECT 1 FROM recovery_captures c WHERE c.id=h.final_capture_id AND c.hold_id=h.id
             AND c.run_id=h.run_id AND c.user_id=h.user_id AND c.original_worker_id=h.original_worker_id

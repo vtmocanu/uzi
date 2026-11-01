@@ -135,7 +135,7 @@ export async function assertTrustedRefusalCase(entry: { error: () => unknown; di
       assert.equal(parks().length, 0, "trusted rejection must never park");
       const failures = api.states.filter((s) => s.body.status === "failed");
       assert.equal(failures.length, 1, "one terminal failure");
-      assert.equal(failures[0]!.body.failure_reason, entry.display, "preserve original display reason");
+      assert.equal(failures[0]!.body.failure_reason, entry.display, "preserve original display");
       if (entry.display === "the planning turn ended without a plan or a structured question after a corrective nudge") {
         assert.equal(failures[0]!.body.fail_origin, "plan_missing", "retain plan-missing disposition");
       }

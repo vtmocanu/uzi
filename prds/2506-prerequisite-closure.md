@@ -1,7 +1,7 @@
 # PRD #2506 (option A): a pinned prerequisite closure lets a thin guarded capture release custody
 
 **Issue:** #2506 (option A only). Delivery under this PRD is **non-closing**: every PR uses `Refs #2506` and closes only its own child issue. #2506 stays open until the whole acceptance below is met. Option D shipped separately (ADR-2506) and does not complete this.
-**Current execution (2026-10-31):** C1a and C1b source are merged. C1b landed in [PR #3655](https://github.com/vtmocanu/uzi/pull/3655) as `b6fab6b7`, with migration 00387; exact-head hosted checks and timing were collected before merge. The local handoff records below remain historical evidence, not the current hosted-gate status. C1b adds no thin FINAL release, feature advertisement or agent change. C2/C3, E5 and parent acceptance remain open; E6 is post-roll reporting only. M6 operator observation is not claimed performed. See [current execution and checkbox disposition](#c1b-current-execution-2026-10-29-child-3591).
+**Current execution (2026-11-01):** C2 (#3727) is implemented on branch `agent/issue-3727` in four milestones (M1 schema, M2 API release, M3 worker mint, M4 advertisement and combined proof) and M5 documentation; its landing, exact-head CI and the full store-it sweep are pending, so nothing here claims C2 shipped (see the [C2 execution record](#c2-execution-record-2026-11-01-3727)). C1a and C1b source are merged. C1b landed in [PR #3655](https://github.com/vtmocanu/uzi/pull/3655) as `b6fab6b7`, with migration 00387; exact-head hosted checks and timing were collected before merge. The local handoff records below remain historical evidence, not the current hosted-gate status. C1b itself added no thin FINAL release, feature advertisement or agent change; C2 adds them on its branch. C3, E5 and parent acceptance remain open; E6 is post-roll reporting only. M6 operator observation is not claimed performed. See [current execution and checkbox disposition](#c1b-current-execution-2026-10-29-child-3591).
 
 **Historical design status:** DRAFT, revision 18 (2026-10-28), approved C1a/C1b split and review folds, pending exact-text final review. C1a and C1b are API-only; no filing or dispatch follows from this draft. Based on the exact revision-11 artifact (SHA256 `2205e1146950263b2aa90f35863cadec3f3debfbd350590b9e65bd560a9640ec`, whose header still said revision 10). The earlier paired architecture reviews and owner decisions remain the design history; this new evidence fold requires recov6 review and is not filing, dispatch or implementation approval. **E2 ran on GitHub on 2026-10-27 and returned FINDING (one measured workflow-scope refusal, zero probe malfunctions), conclusive for the tested production credential class.** The anchor strategy is feasible in that tested case; other forges and protected/ruleset configurations remain unverified. Existing source line anchors are historical at `91647464c02bd12ae30d4fce6aa656f2245e88e1`, not refreshed line numbers for current main. The new E2 section states the exact observed scope and remaining gates.
 **Priority:** High (inherits #2506). The independent architecture review CLAUDE.md requires for priority::high applies to this PRD and to each child before dispatch; no waiver. M0 is evidence-only and is never auto-dispatched.
@@ -354,7 +354,7 @@ sequenceDiagram
 - **C2 replay (worker and server, lost ACK):** a committed closure release replays to the same ACK after pin loss, capture expiry, knob-off, capability removal and a forge outage; the worker replays without reading closure status. Named worker cases: saved thin FINAL with (i) capture status `expired`, (ii) capture status read throwing, (iii) status `discarded`: each sends the unchanged request and records the ACK. Named replacement case: hold still open, capture genuinely unaccepted: the server fences it (`expired`, `unaccepted_capture_replaced`) and answers `replaceable`; the worker takes the validated branch, clears the saved request and returns the record to `bundled`; a fresh upload creates a new capture and a new S0 row. Named negative cases: a reconcile timeout, a malformed response and a `retained` outcome each leave the saved request unchanged; a committed release never yields `replaceable` (the `accepted` echo wins). Named server case: `releaseFinalInventory` answers the exact replay of a closure release with the original ACK after capture expiry, pin deletion and knob-off.
 - **C2 structural ineligibility (O9):** feature set with the closure feature and neither held feature grants the permission; a cleared or never-received feature set denies; a set with either held feature does not grant through this route.
 - **C1b absence status (S5):** while `absent_since` is set, the capture status reports `prerequisite_closure.state = "pending"` with reason `pin_absence_unconfirmed`, and the worker mints no FINAL for it; after the candidate is cleared it reports `pinned` again.
-- **C2 exact observation:** through `getExactRecoveryHold` end to end, a hold released with `prerequisite_closure` (and its `final_closure_id`) observes as released; `prerequisite_closure` without a closure id, or any other evidence on disposition `archive`, is refused at the SQL, the Go check and the agent validator.
+- **C2 exact observation:** through `getExactRecoveryHold` end to end, a hold released with `prerequisite_closure` (and its `final_closure_id`) observes as released; `prerequisite_closure` without a closure id, or any other evidence on disposition `archive`, is refused at the SQL and the Go check. The closure-id relation is server-enforced (CHECK, composite foreign key and guard); the wire carries no closure id, so the agent validator only checks evidence-by-kind.
 - **C2 #2969 grantor:** a `captureAndUpload` call from `recoverRetainedClaim` with the permission mints only under grants 1 or 4; a record that would need grant 2 or 3 does not mint there.
 - **C1b one-item pin:** a fresh `pending` row reaches `pinned` in one item; with too little remaining deadline the item stops before the marker (row `pending`, nothing sent).
 - **C1b absence confirmation (O11):** first absent listing denies FINAL and keeps the pointer; a positive listing in between clears the candidate; a confirming absent listing in a later pass ends `lost` and clears the pointer; the same pass never confirms.
@@ -595,7 +595,7 @@ they do not assert that hosted checks were available at that earlier time.
 - [x] C1b M5 local evidence: documentation/mirrors, tracked E2E audit, E2E library/fake tests, focused build/vet/race checks, SQLC/migration/static/security checks and committed repair reviews recorded below.
 - [x] C1b M5 overall acceptance: local deliverables and final exact-head hosted checks/timing collected at the #3655 landing boundary.
 - [x] C1b final exact-head hosted acceptance: required API/repo checks and the full store-it sweep passed, all 62 required names PASS with zero SKIP; advisory timing recorded below. This is not a post-deployment runtime result.
-- [ ] C2 thin FINAL release, feature/worker advertisement, permission/replay/reconciliation and real freeze-path authority acceptance.
+- [ ] C2 thin FINAL release, feature/worker advertisement, permission/replay/reconciliation and real freeze-path authority acceptance. Sub-note: M1-M4 are implemented and checked locally (see the C2 execution record below); this line stays open for exact-head hosted acceptance, the full store-it sweep and the recorded deviations.
 - [ ] C3 owner/web/CLI pin visibility and E5 restore-time acceptance.
 - [ ] E6 two weeks of hosted post-roll counts and growth, including unresolved/exhausted pins and removal blockers (reporting only, not a closure gate).
 - [ ] Parent release/acceptance: all child acceptance and remaining end-to-end/rollout criteria below.
@@ -763,6 +763,124 @@ unchecked; the earlier local repairs alone did not establish hosted success.
 - **Evidence:** FINAL success with `prerequisite_closure` (including the force-push-after-pin case end to end); permission, origin, replay, reconciliation and real-freeze-path tests above; every existing guard branch green; the rollout rows.
 - **Regression failing on current code:** archive FINAL for a thin capture with a `pinned` closure returns `ErrManifestConflict` and must release; a retained-claim thin record with status `pinned` mints no FINAL and must mint, ACK and clean up.
 
+#### C2 execution record (2026-11-01, #3727)
+
+C2 is implemented on branch `agent/issue-3727`; it has **not landed**. Migration
+00393 (draft 00389, renumbered at landing).
+
+What landed, by milestone (commit subjects):
+
+- **M1 schema** (`api/internal/store/migrations/00393_prerequisite_closure_release.sql`):
+  `1a751723d` feat(recovery): schema for closure-backed thin archive release (C2 M1);
+  `c6e748b87` fix(recovery): closure release admits NULL-cause parks; isolate guard-layer tests (C2 M1);
+  `aa469eb71` test(recovery): isolate closure disposition CHECK and release binding predicates (C2 M1).
+  `final_closure_id`, a composite foreign key to the exact closure/capture/hold,
+  release evidence `prerequisite_closure`, tie CHECKs and a guard branch; Down refuses
+  (SQLSTATE 55000) while closure-backed rows exist. The DBA measured the combined `ALTER`
+  on synthetic data at about 0.4 s per 500k holds (about 0.8 s per million) under
+  `ACCESS EXCLUSIVE`, plus up to 5 s of `lock_timeout` waiting; live row counts and a
+  cold cache are unmeasured.
+- **M2 API release** (`api/internal/recovery/final_closure.go`):
+  `ca4544ef8` feat(recovery): release a thin archive FINAL on a pinned prerequisite closure (C2 M2);
+  `5e2d4b44a` fix(recovery): bound closure FINAL locks server-side and test the real listing seam (C2 M2);
+  `25402622f` test(recovery): pin the lock_not_available mapping of closure FINAL errors (C2 M2).
+  Unlocked precheck, per-worker limiter admission, fenced listing reservation, one listing
+  outside any transaction, locked release (500 ms lock timeout per step, 6 s budget);
+  refusals `manifest_conflict`, `prerequisite_pin_missing`, `prerequisite_pin_foreign`
+  (409) and `prerequisite_pin_unavailable` (503).
+- **M3 worker mint** (`agent/src/recovery.ts`):
+  `aaf13f0ce` feat(worker): mint a thin archive FINAL only under a transient closure grant (C2 M3);
+  `7d5ccbb0d` fix(worker): grant a same-pass closure mint only on an attested held fallback (C2 M3);
+  `8e133c665` fix(worker): attest a held fallback only on a bounded server refusal (C2 M3);
+  `5005d0fe2` fix(worker): an uncomputable CI diff or a bare 400 release never attests (C2 M3).
+- **M4 advertisement and proof**:
+  `97a180f83` feat(recovery): advertise prerequisite closure release and prove it end to end (C2 M4);
+  `4c3459295` test(recovery): pin closure advertisement on heartbeat and isolate the port (C2 M4).
+  The feature is advertised only while `UZI_PREREQUISITE_CLOSURE_FORGES` contains `github`
+  and the port and limiter are wired; the combined proof `TestPrerequisiteClosureReleaseE2E`
+  runs in the opt-in leg of `e2e/run-store-it.sh`.
+- **M5 documentation** (`c990de73c` docs(recovery): document closure-backed thin archive release (C2 M5)): ADR-1296, ADR-1197, ADR-2417, ADR-2506 and ADR-3591 amendments,
+  `docs/run-recovery.md`, `docs/configuration.md`, `docs/cli.md` and the embedded mirrors,
+  `specs/human.md`, a changelog fragment, and the E2E literal audit (no matches in
+  `e2e/phases/`, `e2e/lib.sh`, `e2e/lib.test.sh` or `e2e/forge-fake/`; `task test:e2e-lib`
+  6 of 6 and `task test:forge-fake` 11 pass, 0 fail).
+
+Local verification actually run: the store LiveDB C2 tests; the recovery, workersvc and
+handler focused LiveDB tests; `lint:api` with 0 issues; `deadcode:api` clean; sqlc drift
+clean; `check:agent` pass; the touched agent test files; the combined opt-in proof leg
+PASS with no skips.
+
+- [x] C2 M1 schema, guard branch, tie CHECKs and guarded Down implemented and checked locally.
+- [x] C2 M2 API release, limiter, refusals and replay implemented and checked locally.
+- [x] C2 M3 worker mint grants, replay and attestation implemented and checked locally.
+- [x] C2 M4 advertisement predicate and the combined opt-in proof implemented; proof leg PASS locally with no skips.
+- [x] C2 M5 documentation, ADR amendments, spec line, changelog fragment and E2E literal audit written and checked locally.
+- [ ] C2 exact-head hosted acceptance (full agent suite, full store-it sweep, native git tests): not verified in this run.
+
+**Not verified in this run.** The full agent suite is left to exact-head PR CI. The full
+store-it sweep exceeded the local 60-minute cap and is left to exact-head CI. Native git
+tests skip locally for lack of `git-http-backend` and run in CI. No live GitHub.com
+observation was made; that is a parent/operator follow-up. Compose e2e phases were not run.
+M6 operator observation, E5, E6 and C3 are not claimed.
+
+**Worker-handoff deviations at `8fea87a` (historical).**
+
+- The positive real-observer C2 case lives in `api/internal/handler/prerequisite_final_wired_livedb_test.go`.
+- No `pg_locks` lock-order test and no explicit shutdown test were added.
+- The exact-observation closure `EXISTS` branch is unreachable by tests, because the schema forbids forged rows.
+- The specified downgrade/roll-forward journal test and the thin replacement-fence tests were not added.
+
+**Landing-review follow-up, 2026-11-01.** The missing frozen acceptance is being
+completed locally, with hosted acceptance above still unchecked:
+
+- `TestRecoveryClosureFinalClosureLastLockOrderLiveDB` observes the blocked FINAL
+  through `pg_locks` and checks actual earlier row-lock ownership, in one server
+  round trip before the real 500 ms lock deadline.
+- The existing `TestRecoveryClosureFinalCancelledRequestLeavesNothingOpenLiveDB`
+  already covers paused and blocked-listing cancellation.
+  `TestHandlerPrerequisiteFinalShutdownDrainsListingLiveDB` adds an authenticated
+  HTTP shutdown proof through the real port and broker. Graceful HTTP shutdown
+  drains handlers; the bounded listing ends without custody release, a detached
+  listing or an open transaction. It does not assume that `http.Server.Shutdown`
+  immediately cancels active request contexts.
+  `TestHandlerPrerequisiteFinalShutdownAtomicCommitLiveDB` additionally starts
+  drain mid-request with a valid pin: this deterministic positive control requires
+  HTTP 200, `released=true` and the complete persisted release/capture protection.
+  A load/deadline 503 fails explicitly rather than satisfying the positive case.
+  The stalled control still requires no custody/capture effect. After HTTP shutdown and the
+  prerequisite drain return, no handler, listing or transaction remains open.
+  The agreed graceful-drain interpretation is recorded in the Decision Log below;
+  no global server shutdown behavior is changed here.
+- The worker journal test uses an explicit test-only
+  `UZI_RECOVERY_COMPAT_READER` module path for the actual untouched pre-C2 reader
+  at `cb6ebd8f`. That reader authenticated and retained the new signed thin journal,
+  rejected a MAC mutation, and roll-forward recovered the unchanged request's ACK.
+  Ordinary CI exercises feature rollback and persistence; it does not silently
+  claim that the historical module ran when the input is absent.
+- Thin replacement controls now exercise the committed API fence, the unchanged
+  committed receipt, and worker handling of retained, malformed and timed-out
+  reconciliation. Replacement still needs a fresh ordinary mint grant.
+- Review found the inherited capture-health gate still prevented saved thin FINALs
+  from sending when status was expired, discarded or unreadable. Three controls
+  failed on that behavior. The local correction makes status diagnostic for an
+  already-saved thin archive request only; header, source/coverage, inactivity and
+  new-mint health checks remain. These controls passed after the correction.
+  A stricter call-order control also requires zero pre-send capture-status reads:
+  a slow diagnostic must not spend the replay budget. Only validated replaceable
+  reconciliation fetches the additional status proof after its committed fence.
+- Retained-claim grant 4 now denies an unresolved held create before either
+  grantor is considered. The helper's previous grant under a closure-only feature
+  snapshot failed a direct control. The actual caller's execution gate remains
+  unchanged, and no #2969 exemption or observed production release is claimed.
+
+These are local review proofs, not a full-suite or hosted PASS, an owner/operator
+observation, E5 or parent completion. Exact-head CI and the lead's independent
+delta review remain required. Added fixture/test time and critical-path impact
+must be recorded at landing; local fixture times do not establish hosted cost.
+
+Mixed-version, source-history, limiter and #2884 coordination boundaries are recorded in
+the ADR amendments dated 2026-11-01.
+
 ### C3: "Show the prerequisite closure to the owner and document restore"
 
 - **Depends on:** C1b (states). Parallel with C2 only with disjoint file ownership.
@@ -817,7 +935,7 @@ unchecked; the earlier local repairs alone did not establish hosted success.
 | 2026-10-28 (draft consequence, pending review) | Keep the compatible default-tip anchor and all ancestry/binding/lifetime rules; no token expansion or retry at a new D after invocation. #2969 consumes implementation-proven pin status within its existing window only. | E2 closes the tested transport question, not implementation, integration, other-forge feasibility or #3031 producer FINAL authority. |
 | 2026-10-28 (user; matching draft review pending) | Split C1 into API-only C1a ready-query/guard/fixture prefactor and dependent C1b complete pin lifecycle; C2 owns agent changes and release. Publish E4 distribution, clarify registration/status/retry contracts, use next free migrations at landing. | One reviewable invariant first; no partial pin lifecycle, capability advertisement or release. Agent changes in later children use full-suite exact-head PR CI; C1a/C1b stop on agent scope drift. |
 | 2026-10-31 (lead/buddy scope agreement after paired architecture review) | Keep C2 as one release-proof child and one PR, implemented in reviewed serial commits; C3 remains the independently useful owner/restore child and is dispatched serially by default because files overlap. | No independently valuable further C2 split was identified under the supported-worker acceptance. A dark, nonadvertised API-first stage is a safe fallback if run size requires it, but does not by itself deliver the supported-worker release outcome. Advertisement before API acceptance is implemented remains forbidden; API-first acceptance without advertisement does not create that rollout hole. C1b already isolated pin creation/lifetime. The API, worker, schema and reader compatibility must agree on the same proof; size alone does not justify dropping tests or authority checks. This records the reviewed scope choice; dispatch still requires its gated plan review. |
-
+| 2026-11-01 (lead/buddy C2 landing review) | Preserve existing graceful HTTP drain. Graceful drain lets in-flight requests finish or time out within their request-bounded context; shutdown does not cancel handler contexts; plan v4 wording was stronger than production and is superseded. | Safety comes from atomic release plus the full locked recheck, not cancellation on shutdown. A valid in-flight FINAL may commit fully during drain; a stalled listing ends by its bounded context without custody effect. After HTTP shutdown and DrainPrerequisiteClosures return, no detached listing/goroutine or open transaction remains. No global shutdown change or new cancellation subsystem is authorized. |
 
 ## Open questions (owner calls)
 

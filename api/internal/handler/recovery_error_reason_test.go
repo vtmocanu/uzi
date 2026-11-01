@@ -29,6 +29,9 @@ func TestMapRecoveryErrorReason(t *testing.T) {
 		{"quota", recovery.ErrQuota, http.StatusInsufficientStorage, "storage quota exceeded", "quota"},
 		{"integrity", recovery.ErrIntegrity, http.StatusUnprocessableEntity, "archive integrity check failed", "integrity"},
 		{"busy", recovery.ErrBusy, http.StatusServiceUnavailable, "too many concurrent transfers; retry shortly", "busy"},
+		{"pin missing", recovery.ErrPrerequisitePinMissing, http.StatusConflict, "the prerequisite closure pin is missing", "prerequisite_pin_missing"},
+		{"pin foreign", recovery.ErrPrerequisitePinForeign, http.StatusConflict, "the prerequisite closure pin is foreign", "prerequisite_pin_foreign"},
+		{"pin unavailable", recovery.ErrPrerequisitePinUnavailable, http.StatusServiceUnavailable, "the prerequisite closure pin is unavailable; retry shortly", "prerequisite_pin_unavailable"},
 		{"unknown", errors.New("boom"), http.StatusInternalServerError, "internal error", "internal"},
 	}
 	for _, tc := range cases {

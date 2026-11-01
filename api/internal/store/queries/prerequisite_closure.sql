@@ -202,6 +202,24 @@ WHERE p.id = @id AND p.state='pinned'
     AND p.last_audit_pass_id IS DISTINCT FROM @pass_id AND @pass_id::uuid IS NOT NULL
 RETURNING p.*;
 
+-- name: ReservePrerequisiteFinalListing :one
+-- FINAL's pre-release listing: reserves a pass on a live pinned closure of an available
+-- capture, fenced by the cleanup generation. It never authorizes a delete.
+UPDATE recovery_prerequisite_closures p
+SET last_audit_pass_id = @pass_id,updated_at=now()
+WHERE p.id = @id AND p.state='pinned' AND p.absent_since IS NULL
+    AND (p.cleanup_deadline IS NULL OR p.cleanup_deadline<=now())
+    AND p.cleanup_attempts = @generation::int
+    AND p.last_audit_pass_id IS DISTINCT FROM @pass_id
+    AND @pass_id::uuid IS NOT NULL AND @pass_id::uuid <> '00000000-0000-0000-0000-000000000000'::uuid
+    AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id=p.capture_id AND c.state='available'
+        AND c.manifest_bound AND c.expires_at > clock_timestamp())
+RETURNING p.*;
+
+-- name: GetPrerequisiteClosureForCapture :one
+-- Unlocked precheck by capture id alone (GetPrerequisiteClosure also requires the user id).
+SELECT * FROM recovery_prerequisite_closures WHERE capture_id = @capture_id;
+
 -- name: RecordPrerequisiteAbsence :execrows
 -- FINAL must reserve a listing pass before the external listing too.
 -- All pinned listings carry both the audit reservation and cleanup generation.

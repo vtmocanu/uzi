@@ -511,6 +511,13 @@ func TestLeadPlanCritiquePhrases(t *testing.T) {
 	}
 	// Everything the lead owes BEFORE it calls `submit_plan`.
 	planCases := []pin{
+		{"feasibility is checked before authoring the full plan", "Before authoring a full plan, make a short feasibility check"},
+		{"feasibility compares verification, ownership, gates, and budgets", "compare the requirement-to-verification map, dependency and ownership seams, expensive mandatory gates, and available execution and plan-revision budgets"},
+		{"scope that cannot fit gets reviewable slices with every requirement placed before freezing", "If complete scope cannot fit, propose concrete independently reviewable slices, their dependencies, and the placement of every requirement before freezing the plan"},
+		{"owner scope decisions follow the existing lifecycle and classification rules", "Seek an owner scope decision through the existing approval/question lifecycle when required, subject to the classification and auto-approved-run rules below"},
+		{"slice proposals do not authorize deferral", "a slice proposal does not authorize deferral of approved scope"},
+		{"automatic issues, silently dropped requirements, and milestone padding are prohibited", "Do not create issues automatically, silently drop requirements, or pad milestone counts"},
+		{"milestone scaling preserves execution and revision limits", "Capped milestone scaling does not remove execution or plan-revision limits"},
 		{"the citation property is due before submit_plan", "Before you call `submit_plan`"},
 		{"every asserted mechanism is cited by file and line", "name the file that implements it and quote the line"},
 		{"the wave reviews the plan text, not a diff", "the artifact under review is the plan text, not a diff"},
