@@ -712,9 +712,10 @@ permitted scratch relocation alone is not a validation bypass or proof of
 harmlessness. Complete automatic revisions include `Cross-check dispositions`
 for every immediately preceding delivered item, with addressed location/method
 or declined rationale and inspectable evidence. The checker considers supported
-declines; round 2+ missing/incomplete defect dispositions mean REVISE, never
-BLOCK solely for omission. Missing or declined prior coverage dispositions
-alone never justify REVISE or BLOCK; a supported decline cannot waive a
+declines, but receives no separate prior findings and cannot establish disposition
+completeness. Round 2+ missing/incomplete defect dispositions identifiable from
+the supplied input mean REVISE, never BLOCK solely for omission. Missing or
+declined prior coverage dispositions alone never justify REVISE or BLOCK; a supported decline cannot waive a
 mandatory defect requirement.
 Uninspectable instruction claims remain explicitly unverified and cannot alone
 establish an exception to inspectable requirements; precedence is unchanged.

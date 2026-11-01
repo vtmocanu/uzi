@@ -138,8 +138,12 @@ The complete automatically revised `plan_md` must include the exact heading
 **Cross-check dispositions**, with one disposition for each item delivered by
 the immediately preceding check: addressed (where and how in the plan), or
 declined (rationale and inspectable evidence). Older entries are optional.
-Round 1 does not require dispositions; missing or incomplete defect entries in
-round 2 and later call for ordinary REVISE, never BLOCK solely for that omission.
+Round 1 does not require dispositions. The checker assesses only dispositions
+and inspectable evidence supplied in its input; previous findings are not
+supplied separately, so it cannot establish completeness against the preceding
+check's items. In round 2 and later, missing or incomplete defect dispositions
+identifiable from that input call for ordinary REVISE, never BLOCK solely for
+that omission.
 Coverage notes use `Requirement gap:` or `Coverage uncertainty:`. Disposition
 them where useful; a missing or declined prior coverage disposition alone
 never justifies REVISE, BLOCK or another round. Defect disposition rules remain
