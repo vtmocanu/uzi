@@ -3572,7 +3572,8 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// (d) Claimant guard (snapshot-replace BEFORE overflow, blocker 2). The replace just set/cleared
 	// pending_overflow_until from the snapshot's pending_overflow flag; re-read the row to see the
 	// CURRENT value. An unexpired overflow closure refuses snapshot claims unless this transaction
-	// proves scoped pending coverage; that refusal includes unassigned runs. The valid replacement
+	// proves scoped pending coverage or accepts explicit incomplete-inventory intake;
+	// otherwise that refusal includes unassigned runs. The valid replacement
 	// must persist, so COMMIT and report idle. An UNFLAGGED valid snapshot cleared the closure here,
 	// so the claim proceeds in
 	// this SAME tx below.
@@ -3582,7 +3583,8 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	}
 	// Only fresh, applied evidence from this transaction can exempt this claimant.
 	// The persisted overflow closure still excludes its owned candidates for everyone.
-	scopedClaim := applied && locked.ID == wkr.ID && pending.scoped.allowed
+	scopedClaim := applied && locked.ID == wkr.ID &&
+		(pending.scoped.allowed || s.incompletePendingClaim(locked, snapshot))
 	if reread.PendingOverflowUntil.Valid && reread.PendingOverflowUntil.Time.After(s.now()) && !scopedClaim {
 		if err := tx.Commit(ctx); err != nil {
 			return nil, err

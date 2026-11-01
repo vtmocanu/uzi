@@ -1658,9 +1658,10 @@ export class WorkerClient {
   }
 
   private snapshotForServer(snapshot: ActiveSnapshot): ActiveSnapshot {
-    const { pending_policy_protection, ...legacy } = snapshot;
+    const { pending_policy_protection, pending_inventory_incomplete, ...legacy } = snapshot;
     return { ...legacy,
       ...(this.supportsScopedPendingClaim && pending_policy_protection !== undefined ? { pending_policy_protection } : {}),
+      ...(this.supportsScopedPendingClaim && pending_inventory_incomplete === true ? { pending_inventory_incomplete } : {}),
       active: snapshot.active.map(entry => {
       const { account_cooldown, ...rest } = entry;
       return (this.hasFeature("codex_account_operation_admission_v1") ||

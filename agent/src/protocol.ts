@@ -752,6 +752,9 @@ export interface ActiveSnapshot {
   pending_all?: { run_id: string; claim_generation: number }[];
   /** Negotiated separately from policy production; current fenced ownership only. */
   pending_policy_protection?: { run_id: string; owner_generation: number }[];
+  /** Negotiated intake only: inventory is unavailable, never complete empty.
+   * Overflow still excludes every candidate attributed to this worker. */
+  pending_inventory_incomplete?: true;
   /** Issue #1742: carried ONLY on the register snapshot — each run whose executor finished at the
    *  named exact claim generation and whose authenticated finalize-pending record survived a
    *  process restart with no journaled terminal outcome. Never an outcome and never a lease: the

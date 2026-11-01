@@ -42,7 +42,7 @@ type ActiveSnapshot struct {
 	// PendingOverflow is set when the worker has more pending outcomes than it may list; while
 	// its server-side closure is unexpired every run it owns is closed to every claimant and the
 	// worker itself is refused snapshot claims unless this transaction proves bounded
-	// scoped pending coverage (#1391, D11).
+	// scoped pending coverage or accepts explicit incomplete-inventory intake (#1391, D11).
 	PendingOverflow bool `json:"pending_overflow"`
 	// FinalizeResume (issue #1742) is carried ONLY on a register snapshot: the attempts whose
 	// executor finished and whose worker holds an authenticated finalize-pending record, but no
@@ -63,15 +63,19 @@ type ActiveSnapshot struct {
 	PendingPolicyProtection          []PendingPolicyProtectionEntry `json:"pending_policy_protection,omitempty"`
 	pendingPolicyProtectionMalformed bool
 
+	// Intake attestation only; absent/null lists remain unavailable, never complete.
+	PendingInventoryIncomplete          bool `json:"pending_inventory_incomplete,omitempty"`
+	pendingInventoryIncompleteMalformed bool
+
 	// finalizeResumeMalformed is set by UnmarshalJSON when finalize_resume had a wrong wire type
 	// and was dropped. Only the register path (validateFinalizeResume) logs it, with the worker id;
 	// heartbeat and claim snapshots stay silent about the field.
 	finalizeResumeMalformed bool
 }
 
-// UnmarshalJSON decodes finalize_resume, pending_all and pending_policy_protection independently from the
-// strict enclosing active snapshot. Malformed optional evidence drops only its
-// own list. Service validation logs pending_all only after enclosing acceptance;
+// UnmarshalJSON isolates optional evidence from the typed enclosing snapshot;
+// unknown nested fields are ignored for protocol compatibility. Malformed optional
+// evidence grants no authority. Service validation logs pending_all only after enclosing acceptance;
 // finalize_resume retains its register-only validation policy.
 func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
 	// json.Unmarshaler convention: a JSON null is a no-op.
@@ -81,12 +85,20 @@ func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
 	type plain ActiveSnapshot
 	aux := struct {
 		*plain
-		FinalizeResume          json.RawMessage `json:"finalize_resume"`
-		PendingAll              json.RawMessage `json:"pending_all"`
-		PendingPolicyProtection json.RawMessage `json:"pending_policy_protection"`
+		FinalizeResume             json.RawMessage `json:"finalize_resume"`
+		PendingAll                 json.RawMessage `json:"pending_all"`
+		PendingPolicyProtection    json.RawMessage `json:"pending_policy_protection"`
+		PendingInventoryIncomplete json.RawMessage `json:"pending_inventory_incomplete"`
 	}{plain: (*plain)(s)}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
+	}
+	s.PendingInventoryIncomplete = false
+	s.pendingInventoryIncompleteMalformed = false
+	if raw := bytes.TrimSpace(aux.PendingInventoryIncomplete); len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
+		if err := json.Unmarshal(raw, &s.PendingInventoryIncomplete); err != nil {
+			s.pendingInventoryIncompleteMalformed = true
+		}
 	}
 	s.PendingAll = nil
 	s.pendingAllMalformed = false
@@ -131,6 +143,13 @@ func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
 		}
 	}
 	s.FinalizeResume = nil
+	// A marked list is not a complete inventory. Do not let contradictory input
+	// fall through to the older complete-inventory exception or identity writes.
+	if s.PendingInventoryIncomplete && (s.PendingAll != nil || s.PendingPolicyProtection != nil || s.pendingAllMalformed || s.pendingPolicyProtectionMalformed) {
+		s.pendingInventoryIncompleteMalformed = true
+		s.pendingAllMalformed = true
+		s.PendingAll = nil
+	}
 	s.finalizeResumeMalformed = false
 	if len(aux.FinalizeResume) == 0 || string(aux.FinalizeResume) == "null" {
 		return nil
@@ -171,6 +190,16 @@ type validatedPendingAll struct {
 
 type scopedPendingClaim struct {
 	allowed bool
+}
+
+// Incomplete intake never grants a run lease. ClaimRun's unchanged owner-overflow
+// SQL exclusion protects every attributed candidate, including unlisted sources.
+func (s *Service) incompletePendingClaim(wkr store.Worker, snap *ActiveSnapshot) bool {
+	return snap != nil && snap.PendingOverflow && snap.PendingInventoryIncomplete &&
+		!snap.pendingInventoryIncompleteMalformed && !snap.pendingAllMalformed && !snap.pendingPolicyProtectionMalformed &&
+		snap.PendingAll == nil && snap.PendingPolicyProtection == nil &&
+		s.p.WorkerOutboxMaxPending > 0 &&
+		slices.Contains(wkr.ProtocolCapabilities, capability.PendingOutcomeScopedClaimV1)
 }
 
 // scopedPendingGroups runs only after LockFrozenWorkerSnapshotRuns has returned.
@@ -245,6 +274,9 @@ func (s *Service) validatePendingAll(wkr store.Worker, snap *ActiveSnapshot) val
 		return validatedPendingAll{}
 	}
 	if snap == nil {
+		return validatedPendingAll{}
+	}
+	if snap.PendingInventoryIncomplete {
 		return validatedPendingAll{}
 	}
 	if snap.pendingAllMalformed {

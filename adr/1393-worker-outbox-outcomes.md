@@ -134,6 +134,14 @@ This amends the old claimant-wide implication, not the pending lease or stale re
 authority. The field is a trusted-worker attestation, not filesystem completeness
 proved cryptographically by the API.
 
+**Incomplete-inventory amendment (#3607, 2026-11-01):** the explicit
+`pending_inventory_incomplete` marker in ADR-3607 permits unrelated intake without
+claiming complete source accounting. It omits complete/group lists, retains overflow
+and every attributed-candidate exclusion, and grants no per-run lease or lifecycle
+authority. Fresh transaction/locked-capability gates still apply; actual exhausted
+local capacity remains closed. This supplements the complete-inventory mode above,
+not its ownership proof. Older APIs remain conservatively idle.
+
 ### D12 — Segments are immutable and one generation-numbered manifest is the only metadata authority
 
 The terminal journal is its own file, not a mutation of a Run A segment, and is never

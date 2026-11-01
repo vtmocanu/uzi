@@ -39,6 +39,12 @@ worker attestation of grouping/completeness, not cryptographic filesystem proof.
 An UNKNOWN source with active=[] can be accounted for without inventing an owner
 row lease. Opaque or incomplete source inventory cannot claim complete coverage.
 
+The 2026-11-01 incomplete-inventory correction in ADR-3607 adds a separate
+`pending_inventory_incomplete` intake marker, never a partial `pending_all` list.
+It retains worker-wide attributed-candidate protection and creates no identity
+coverage, per-run lease or deletion authority. The complete-only meaning of
+`pending_all`, including the distinction between omitted/null and `[]`, is unchanged.
+
 Register, heartbeat and the compatibility replacement entrypoint do not grant the
 exception, and no persisted exemption is added. Overflow persists, candidate SQL
 still excludes work attributed to the overflowed worker, and bodyless ordinary,

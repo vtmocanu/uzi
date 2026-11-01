@@ -450,6 +450,7 @@ export class ActiveRunRegistry {
       pending_overflow: this.coverageGetter?.() === false || projection.unknown ||
         pending.length > Math.min(this.effectiveCap(), wireRoom),
       ...this.pendingWire(projection.sources),
+      ...(scoped && this.coverageGetter?.() === false ? { pending_inventory_incomplete: true as const } : {}),
       ...(scoped && this.pendingWire(projection.sources).pending_all !== undefined ? { pending_policy_protection: [...new Set(projection.sources.filter(p => this.isPolicy(p)).map(p => p.run_id))]
         .flatMap(run_id => {
           const owner_generation = this.policyOwnership.get(run_id)?.generation;

@@ -70,7 +70,7 @@ afterEach(async () => {
 });
 
 for (const scoped of [false, true]) for (const scenario of ["boot", "symlink", "mutation"] as const)
-it(`D1: real Worker claims ordinary work with incomplete ${scenario} coverage (scoped=${scoped})`, async t => {
+it(`D1: real Worker attempts an ordinary claim with incomplete ${scenario} coverage (scoped=${scoped})`, async t => {
   const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "worker-coverage-"));
   tmpRoots.push(root);
   const outbox = new Outbox({ root, log: nullLogger(), runMaxBytes: 1e6, maxBytes: 4e6, retentionMs: 86400000 });
@@ -111,6 +111,7 @@ it(`D1: real Worker claims ordinary work with incomplete ${scenario} coverage (s
     assert.ok(sent, "the production claim carries its active snapshot");
     assert.equal(sent.pending_all, undefined, "incomplete inventory is never advertised as complete");
     assert.equal(sent.pending_overflow, true, "the server retains conservative attributed-run protection");
+    assert.equal(sent.pending_inventory_incomplete, scoped ? true : undefined);
     assert.equal(outbox.listPendingOutcomeSources().length, 0);
   } finally { clearTimeout(timer); controller.abort(); await running; }
 });

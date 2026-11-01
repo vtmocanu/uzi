@@ -37,7 +37,8 @@ claim transaction the server revalidates worker registration, frozen run locks,
 current ownership/generation, release state and bounded pending accounting.
 Source classification and completeness remain worker attestations, not facts
 independently authenticated from worker disk. Missing capability or invalid,
-incomplete or uncertain evidence retains the legacy conservative claim guard.
+incomplete or uncertain evidence retains attributed-candidate protection. The
+separate incomplete-inventory intake exception below never asserts coverage.
 
 The historical critique corrected F6's baseline premise and removed the proposed
 bodyless overflow guard, startup rewrite and durable placeholder. Implementation
@@ -87,6 +88,10 @@ pages can leave coverage unavailable with zero known pending outcomes. In that
 case both legacy and scoped local claim gates stay open. Snapshots still omit
 `pending_all` and retain `pending_overflow`, preserving conservative protection
 for worker-attributed runs without falsely claiming a complete inventory.
+Request emission alone did not establish API admission in the initial D1 repair:
+the older claimant-wide overflow guard still returned idle. The marker below
+repairs that server-side gap; the shared agent/API regression proves an actual
+claim, not just a fake client's invocation.
 Actual pending capacity and the existing legacy unknown-source gate remain.
 Scoped capacity counts only positively observed owner generations, matching
 `pending_policy_protection`; unknown ownership supplies no invented lease.
@@ -188,6 +193,36 @@ fingerprint, unlink and directory-fsync checks. Independent selected or opaque
 evidence stays protected.
 
 ### A fresh, transaction-local scoped claim exception
+
+#### Incomplete inventory: intake without complete-coverage authority
+
+When physical coverage is unavailable, a negotiated snapshot may carry
+`pending_inventory_incomplete: true` with `pending_overflow: true`, omitting
+`pending_all` and `pending_policy_protection`. Known sources retain existing
+bounded active projection; every attributed candidate remains protected by the
+persisted worker overflow closure, including sources hidden behind skipped paths.
+This marker supplies no complete inventory, per-run lease, release or deletion
+authority. Actual local pending/protection capacity gates remain closed when full.
+
+Only a freshly applied snapshot in the claim transaction, with the capability on
+the locked worker row and positive pending capacity, may bypass claimant-wide idle
+using this marker. Wrong types, false/null markers, stale nonce/epoch and a marker
+combined with any non-null complete/group list grant no new exception. ClaimRun's
+existing SQL still excludes all candidates attributed to any overflowed worker;
+only otherwise eligible unrelated work can be returned. Register and heartbeat
+cannot persist or grant the exception.
+
+The capability is introduced by this unmerged change, not deployed on main. The
+real older-API downgrade strips the marker when capability negotiation is absent.
+For future skew, an earlier API that knows the capability but not this marker
+ignores the nested field and conservatively returns idle. No partial list is ever
+sent as `pending_all`, so it cannot be mistaken for complete empty coverage.
+Outer worker bodies reject unknown fields; the isolated snapshot's custom decoder
+accepts unknown nested fields, covered on both claim and heartbeat routes.
+No migration or capability version is added. Coverage-specific operator diagnostics
+remain deferred; the existing overflow display is not a new diagnostic.
+
+#### Complete inventory: existing bounded ownership accounting
 
 An active snapshot may carry:
 

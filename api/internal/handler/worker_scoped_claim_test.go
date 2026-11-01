@@ -43,3 +43,31 @@ func TestWorkerScopedClaimRawOptionalGroup(t *testing.T) {
 		}
 	}
 }
+
+// DecodeJSON rejects unknown outer fields, but snapshots are isolated RawMessage
+// with their own lenient UnmarshalJSON. New nested fields must not 400 old routes.
+func TestWorkerUnknownNestedSnapshotField(t *testing.T) {
+	for _, lane := range []string{"claim", "heartbeat"} {
+		t.Run(lane, func(t *testing.T) {
+			h := newProtocolHandler(t, &protocolStore{claimErr: pgx.ErrNoRows})
+			rec := httptest.NewRecorder()
+			const snapshot = `{"snapshot_epoch":1,"register_nonce":"n","active":[],"pending_overflow":true,"future_snapshot_field":{"ignored":true}}`
+			if parsed := parseActiveSnapshot(json.RawMessage(snapshot), uuid.Nil); parsed == nil || parsed.SnapshotEpoch != 1 || !parsed.PendingOverflow {
+				t.Fatal("unknown nested field must preserve the snapshot, not drop it to a bodyless fallback")
+			}
+			req := workerReq(http.MethodPost, `{"active_snapshot":`+snapshot+`}`, uuid.Nil)
+			if lane == "claim" {
+				h.WorkerClaim(rec, req)
+			} else {
+				h.WorkerHeartbeat(rec, req)
+			}
+			want := http.StatusNoContent
+			if lane == "heartbeat" {
+				want = http.StatusOK
+			}
+			if rec.Code != want {
+				t.Fatalf("unknown nested field poisoned %s: %d %s", lane, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
