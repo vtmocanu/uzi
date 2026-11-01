@@ -237,6 +237,9 @@ func runBandOf(r apitypes.RunListItemDTO) int {
 // which the `/` filter matches alongside the effective status.
 func runStateWord(r apitypes.RunListItemDTO) string {
 	if isForgeOwnerHold(r.RunDTO) {
+		if isPublicationPark(r.RunDTO) {
+			return publicationHeldWord
+		}
 		return "forge held"
 	}
 	if isRecoveryDecisionPark(r.RunDTO) {

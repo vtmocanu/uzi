@@ -26,6 +26,8 @@ type fakeNotifStore struct {
 	codexAsked    []store.IsCodexEarlyResetCurrentParams
 	rc            store.GetSlackRunContextRow
 	crossCheckRun store.Run
+	pubSide       *store.RunPublicationResume
+	pubSideErr    error
 	rcErr         error
 	delivery      pgtype.Text
 	deliveryErr   error
@@ -106,6 +108,18 @@ func (f *fakeNotifStore) GetSecretEnablement(_ context.Context, arg store.GetSec
 
 func (f *fakeNotifStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
 	return f.crossCheckRun, nil
+}
+
+// GetActivePublicationResume models the run's active publication intent (issue #1324): a nil
+// pubSide with no error is "no active intent" (pgx.ErrNoRows).
+func (f *fakeNotifStore) GetActivePublicationResume(context.Context, uuid.UUID) (store.RunPublicationResume, error) {
+	if f.pubSideErr != nil {
+		return store.RunPublicationResume{}, f.pubSideErr
+	}
+	if f.pubSide == nil {
+		return store.RunPublicationResume{}, pgx.ErrNoRows
+	}
+	return *f.pubSide, nil
 }
 
 func (f *fakeNotifStore) GetSlackRunContext(context.Context, uuid.UUID) (store.GetSlackRunContextRow, error) {

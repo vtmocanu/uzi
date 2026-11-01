@@ -444,6 +444,9 @@ func tuiRejectedRun(r apitypes.RunDTO) bool {
 // own tokens; other runs use stateToken. Provider markers require matching status.
 func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	if isForgeOwnerHold(r) {
+		if isPublicationPark(r) {
+			return runToken{glyph: "!", word: publicationHeldWord, color: p.amber}
+		}
 		return runToken{glyph: "!", word: "forge held", color: p.amber}
 	}
 	if isRecoveryDecisionPark(r) {
