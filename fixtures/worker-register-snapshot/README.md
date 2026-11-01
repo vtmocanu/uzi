@@ -33,6 +33,8 @@ all work attributed to that worker.
   bytes through authenticated routes and the real Claim transaction. Its gating
   `TestWorkerIncompleteInventoryClaimLiveDB` requires an actual unrelated claim,
   normal custody and protected-source exclusion for the owner and a peer.
+  Its API fixture additionally negotiates `recovery_archive_v1` for the custody
+  assertion; the scoped-intake capability alone does not promise a custody hold.
 - `TestWorkerIncompleteInventoryOlderAPISkew` is a separate manual opt-in probe,
   outside the `LiveDB$` sweep. It checks conservative idle against pre-marker API
   source; setting its opt-in environment variable cannot weaken the gating test.

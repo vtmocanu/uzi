@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -57,7 +58,10 @@ func exerciseIncompleteInventoryClaim(t *testing.T, expectLegacy bool) {
 			t.Fatal(err)
 		}
 	}
-	rec := f.post(t, "/api/worker/register", `{"version":"test","template":"base","max_concurrent_runs":8,"protocol_capabilities":["pending_outcome_scoped_claim_v1"]}`)
+	// Custody is a separate negotiated contract: scoped intake alone deliberately
+	// keeps old, non-recovery workers hold-free. Use the existing archive contract
+	// so the one-hold assertion exercises an actually recovery-capable claim.
+	rec := f.post(t, "/api/worker/register", `{"version":"test","template":"base","max_concurrent_runs":8,"protocol_capabilities":["pending_outcome_scoped_claim_v1","recovery_archive_v1"]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("register=%d %s", rec.Code, rec.Body.String())
 	}
@@ -67,6 +71,13 @@ func exerciseIncompleteInventoryClaim(t *testing.T, expectLegacy bool) {
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &registration); err != nil {
 		t.Fatal(err)
+	}
+	registered, err := q.GetWorkerByID(ctx, registration.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(registered.ProtocolCapabilities, "recovery_archive_v1") {
+		t.Fatalf("fixture must register recovery capability before asserting custody: capabilities=%v", registered.ProtocolCapabilities)
 	}
 	exec("UPDATE workers SET snapshot_register_nonce='incomplete-inventory-fixture',snapshot_epoch=0 WHERE id=$1", registration.WorkerID)
 	source := uuid.MustParse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -110,7 +121,21 @@ func exerciseIncompleteInventoryClaim(t *testing.T, expectLegacy bool) {
 		t.Fatal(err)
 	}
 	if holds != 1 {
-		t.Fatalf("normal claim must open exactly one custody hold, got %d", holds)
+		// Claim responses contain credentials, even though this fixture uses only
+		// synthetic ones. Keep the body useful without logging its secrets subtree.
+		var diagnostic map[string]json.RawMessage
+		if err := json.Unmarshal(rec.Body.Bytes(), &diagnostic); err != nil {
+			t.Fatalf("normal claim must open exactly one custody hold, got %d; status=%d claim=%+v body decode error=%v", holds, rec.Code, claimed, err)
+		}
+		diagnostic["secrets"] = json.RawMessage(`"<redacted>"`)
+		body, err := json.Marshal(diagnostic)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(body) > 4096 {
+			body = append(body[:4096], []byte(" [truncated]")...)
+		}
+		t.Fatalf("normal claim must open exactly one custody hold, got %d; status=%d claim=%+v body=%q", holds, rec.Code, claimed, body)
 	}
 	// Once unrelated work is terminal, the protected owner's queued source is the
 	// only candidate. Neither a fresh marked owner claim nor a peer may take it.
@@ -118,7 +143,12 @@ func exerciseIncompleteInventoryClaim(t *testing.T, expectLegacy bool) {
 	exec("UPDATE runs SET updated_at=now()-interval '3 hours' WHERE id=$1", source)
 	ownerBody := `{"active_snapshot":{"snapshot_epoch":2,"register_nonce":"incomplete-inventory-fixture","active":[],"pending_overflow":true,"pending_inventory_incomplete":true}}`
 	if rec := f.post(t, "/api/worker/runs/claim", ownerBody); rec.Code != http.StatusNoContent {
-		t.Fatalf("owner took protected source: %d %s", rec.Code, rec.Body.String())
+		var taken struct {
+			RunID      uuid.UUID `json:"run_id"`
+			Generation int64     `json:"claim_generation"`
+		}
+		err := json.Unmarshal(rec.Body.Bytes(), &taken)
+		t.Fatalf("owner took protected source: status=%d claim=%+v response_bytes=%d decode_error=%v", rec.Code, taken, rec.Body.Len(), err)
 	}
 	token, hash, err := jointoken.Generate()
 	if err != nil {
