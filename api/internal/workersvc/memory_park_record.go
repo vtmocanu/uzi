@@ -32,7 +32,7 @@ const (
 	// 512 leaves headroom while keeping a hostile body's tree small.
 	memoryParkMaxValues = 512
 	maxSafeInteger      = 1<<53 - 1
-	// MaxMemoryParkSettlementBytes caps a receipt body and the stored bytea (migration 00388).
+	// MaxMemoryParkSettlementBytes caps a receipt body and the stored bytea (migration 00389).
 	MaxMemoryParkSettlementBytes = 524288
 )
 
