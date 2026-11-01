@@ -183,7 +183,7 @@ export interface RecoveryRecord {
   originalRoots?: Array<{ sha: string; contexts: OwedCandidate["contexts"] }>;
   coverageDigest?: string;
   coverageContext?: PositiveOwedCandidateContext;
-  /** Original hold identity authenticated at freeze; absent on legacy records. */
+  /** Original hold identity authenticated at freeze or learned with immutable closed custody. */
   exactHoldBinding?: { holdId: string; repoId: string };
   heldPolicy?: FrozenHeldPolicy;
   heldCreateUncertain?: boolean;
@@ -1562,7 +1562,8 @@ export class RecoveryCoordinator {
     // No A: the only authority hook this cycle reaches is assertBareClear (buildRecoveryCoverage), a read.
     return this.withCancellationAttempt({ runId: context.runId, generation: context.generation, inventoryGuarded: true } as RecoveryRecord, async () =>
       runCaptureCycle(await this.cycleKey({ runId: context.runId, generation: context.generation, captureId: "", inventoryGuarded: true }), "wait", async () => {
-      if (!await this.newReconstructionRecords(context.runId, context.generation)) return undefined;
+      const existing = await this.newReconstructionRecords(context.runId, context.generation);
+      if (!existing || await this.settledInventoryContext(context, existing)) return undefined;
       if (!this.git.enumerateOwedCandidates || !this.git.buildRecoveryCoverage) throw new Error("inventory Git support unavailable");
       const candidates = await ownedRecoveryIO(() => this.git.enumerateOwedCandidates!(context.barePath, context.runId));
       const probe = { runId: context.runId, generation: context.generation } as RecoveryRecord;

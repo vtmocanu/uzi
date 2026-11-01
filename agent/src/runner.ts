@@ -16380,15 +16380,21 @@ export class RunRunner {
         return;
       }
       if (record.finalAcknowledged) { flight.heldAcked = true; return; }
+      if (record.holdSettlement && !record.finalRequest && !record.completionReceipt) {
+        flight.preserveRecoveryClone = true;
+        return;
+      }
       if (this.isCredentialFreeOwnerCancel(claim, flight) && this.client.hasHeldPublicationV2()) {
         // Unknown, live, or unbound evidence cannot turn a freeze into archive fallback.
         if (residueQuarantine() !== undefined) return;
         if (!record.finalRequest && !(record.state === "uploaded" && record.selfContained === true &&
             Array.isArray(record.prerequisiteShas) && record.prerequisiteShas.length === 0)) {
           if (!record.exactHoldBinding || flight.steering.claimFence() !== undefined) return;
-          const exact = await this.client.getExactRecoveryHold(claim.run_id, generation!, record.exactHoldBinding, signal);
-          if (!exact || (exact.state === "open" &&
-              !["failed", "cancelled", "completed"].includes(exact.run_status))) return;
+          if (!record.holdSettlement) {
+            const exact = await this.client.getExactRecoveryHold(claim.run_id, generation!, record.exactHoldBinding, signal);
+            if (!exact || (exact.state === "open" &&
+                !["failed", "cancelled", "completed"].includes(exact.run_status))) return;
+          }
         }
       }
       await this.captureFrozenInventory(claim, flight, record, signal);

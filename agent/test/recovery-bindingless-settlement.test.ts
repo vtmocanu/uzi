@@ -6,6 +6,7 @@ import { afterEach, test } from "node:test";
 import { GitCache } from "../src/git.js";
 import { canonicalJson, type RecoveryRecord } from "../src/recovery.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import { RunRunner } from "../src/runner.js";
 import type { RecoveryExactHold } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import { makeOutbox, stored } from "./publication-intent-fixture.js";
@@ -73,6 +74,8 @@ for (const variant of ["pinned", "needs_action", "uploaded", "saved-final"] as c
     await restarted.coordinator.resumePending();
     await restarted.coordinator.captureAndUpload(s.input());
     await restarted.coordinator.operateFrozenInventory(s.input());
+    assert.equal(await restarted.coordinator.freezeInventory({ context: f.context, currentSha: f.head,
+      defaultBranch: "main", repoId: binding.repoId }), undefined, "direct freeze cannot rebuild settled custody");
     assert.equal(s.counts().walks, 0);
     assert.equal(s.counts().holds, 0);
     assert.deepEqual(restarted.calls, { produce: 0, reserve: 0, upload: 0, final: 0, held: 0, cleanup: 0 });
@@ -181,6 +184,33 @@ test("cap one never observes a deferred record or refills after learning closure
   assert.equal(saved.find(r => r.captureId === s.f.record.captureId)!.holdSettlement, undefined);
   assert.deepEqual(s.e.calls, { produce: 0, reserve: 0, upload: 0, final: 0, held: 0, cleanup: 0 });
 });
+
+for (const [variant, fenced] of [["pinned", false], ["completion-receipt", false], ["completion-receipt", true]] as const) {
+  test(`runner cancellation skips durable closure probes without starving ${variant} closeout (fenced=${fenced})`, async () => {
+    const s = await setup(variant);
+    await patch(s.e.coordinator, s.f.record, { exactHoldBinding: binding, holdSettlement: closed(s.f),
+      ...(variant === "completion-receipt" ? { state: "needs_action" as const, reason: "upload_transient" } : {}) });
+    let probes = 0, captures = 0;
+    const instance = Object.create(RunRunner.prototype) as RunRunner;
+    Object.assign(instance, {
+      recovery: s.e.coordinator,
+      client: { hasHeldPublicationV2: () => true, getExactRecoveryHold: async () => { probes++; return closed(s.f); } },
+      isCredentialFreeOwnerCancel: () => true,
+      captureFrozenInventory: async () => { captures++; },
+    });
+    s.e.coordinator.inventoryCleanupState = async () => "pending";
+    const flight = { heldDeferredCapture: s.f.record.captureId, preserveRecoveryClone: false,
+      steering: { claimFence: () => fenced ? { kind: "stale" } : undefined }, runLog: nullLogger() };
+    await instance["settleHeldDeferred"](
+      { run_id: s.f.context.runId, claim_generation: 7 } as Parameters<RunRunner["settleHeldDeferred"]>[0],
+      flight as unknown as Parameters<RunRunner["settleHeldDeferred"]>[1]);
+    assert.equal(probes, 0, "persisted custody needs no redundant runner probe");
+    assert.equal(captures, variant === "completion-receipt" && !fenced ? 1 : 0, "existing claim fence still refuses");
+    assert.equal(flight.preserveRecoveryClone, variant === "pinned" || !fenced);
+    assert.deepEqual(s.e.calls, { produce: 0, reserve: 0, upload: 0, final: 0, held: 0, cleanup: 0 });
+    await sourceProof(s.f);
+  });
+}
 
 test("caller executing filter prevents bindingless observation before live admission", async () => {
   const s = await setup("pinned");
