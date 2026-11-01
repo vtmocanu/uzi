@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { StubExecutor, type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import { Outbox } from "../src/outbox.js";
+import { resolvePendingTerminal } from "../src/terminal-resolve.js";
 import { acquireWorkerLifetime } from "../src/authority-lock.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { openAuthorityStore } from "../src/completion-authority.js";
@@ -318,6 +319,101 @@ it("ordinary cooperative pause teardown emits SOURCE-END READY without the retai
   assert.ok(publish.mock.callCount() > 0);
   assert.equal(api.states.some(s => s.runId === c.run_id && s.body.status === "paused"), true);
   assert.deepEqual(ready(log.lines).map(l => l.fields), [{ run_id: c.run_id, claim_generation: 1, sources: 1 }]);
+});
+
+it("post-publication cut leaves a real trace tail pending under the durable terminal fence", async t => {
+  const { outbox } = await setup();
+  api.setRegisterProtocolFeatures(["terminal_fence", "claim_generation_fence"]);
+  await client.register("stub-fixture");
+  const c = claim(TERMINAL, 2);
+  const executor = new StubExecutor(nullLogger(), { fixtureBarrierDirectory: fx.dataDir, fixtureBarrierTimeoutMs: 5000 });
+  const marker = path.join(fx.dataDir, `cdr-outbox-terminal-${c.run_id}-2`);
+  let down = false;
+  let preCutSeq = 0;
+  let failedTerminal = 0;
+  const post = client.postMessages.bind(client);
+  t.mock.method(client, "postMessages", async (...args: Parameters<typeof post>) => {
+    if (down) throw new Error("fixture API down");
+    return post(...args);
+  });
+  const report = client.reportState.bind(client);
+  t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+    if (down && args[1].status === "completed") {
+      const journal = await outbox.readTerminalJournal(c.run_id, 2);
+      assert.ok(journal, "journal installed before the failed first send");
+      assert.ok(journal.messagesThroughSeq > preCutSeq);
+      assert.equal(outbox.hasUndrainedMessages(c.run_id), true);
+      failedTerminal++;
+      throw new Error("fixture API down");
+    }
+    return report(...args);
+  });
+  const log = logger((message, fields) => {
+    if (message !== "stub: fixture barrier ready") return;
+    assert.deepEqual(fields, { stage: "terminal", run_id: c.run_id, claim_generation: 2 });
+    preCutSeq = Math.max(0, ...api.messages(c.run_id).map(m => m.seq));
+    assert.equal(api.messages(c.run_id).some(m => m.payload.event === "stub_outbox_terminal_tail"), false);
+    down = true;
+    fs.writeFileSync(marker, "release\n");
+  });
+  try {
+    await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, log.log,
+      { outbox, checkpointIntervalMs: 0, transientTripMs: 0 }).execute(c);
+    assert.ok(failedTerminal > 0, JSON.stringify(log.lines));
+    assert.equal(api.states.some(s => s.runId === c.run_id && s.body.status === "completed"), false);
+    const journal = await outbox.readTerminalJournal(c.run_id, 2);
+    assert.ok(journal);
+    const pending: Parameters<typeof client.postMessages>[1] = [];
+    await outbox.drainRun(c.run_id, async (messages, generation) => {
+      assert.equal(generation, 2);
+      pending.push(...messages);
+      throw new Error("still down");
+    });
+    const tails = pending.filter(m => m.payload.event === "stub_outbox_terminal_tail");
+    assert.equal(tails.length, 1, "the emitted tail survived close in a real pending segment");
+    const tail = tails[0]!;
+    assert.ok(tail.seq > preCutSeq);
+    assert.ok(journal.messagesThroughSeq >= tail.seq);
+    assert.deepEqual(tail.payload, { event: "stub_outbox_terminal_tail", run_id: c.run_id, claim_generation: 2 });
+    down = false;
+    const deps = { outbox, client, gapFillMax: 1000, terminalMaxBytes: 1_310_720, log: log.log };
+    const order: string[] = [];
+    // A recovery attempt before message replay must retain the journal and the real
+    // trace, rather than tombstoning its recoverable tail or applying completion.
+    await resolvePendingTerminal(deps, {
+      runId: c.run_id, claimGeneration: 2,
+      send: async body => {
+        assert.equal(body.messages_through_seq, journal.messagesThroughSeq);
+        assert.ok(Math.max(0, ...api.messages(c.run_id).map(m => m.seq)) < body.messages_through_seq!);
+        order.push("terminal fenced");
+        return { applied: false, reason: "messages_pending", status: "running" };
+      },
+    });
+    assert.equal(outbox.hasPendingTerminal(c.run_id, 2), true);
+    assert.equal(outbox.hasUndrainedMessages(c.run_id), true);
+    assert.equal(api.states.some(s => s.runId === c.run_id && s.body.status === "completed"), false);
+    await outbox.drainRun(c.run_id, async (messages, generation) => {
+      await client.postMessages(c.run_id, messages, generation);
+      order.push("tail persisted");
+    });
+    await resolvePendingTerminal(deps, {
+      runId: c.run_id, claimGeneration: 2,
+      send: async body => {
+        assert.equal(body.messages_through_seq, journal.messagesThroughSeq);
+        assert.equal(api.messages(c.run_id).filter(m => m.payload.event === "stub_outbox_terminal_tail").length, 1);
+        assert.ok(Math.max(...api.messages(c.run_id).map(m => m.seq)) >= body.messages_through_seq!);
+        order.push("terminal applied");
+        return client.reportState(c.run_id, body);
+      },
+    });
+    assert.deepEqual(order, ["terminal fenced", "tail persisted", "terminal applied"]);
+    const messages = api.messages(c.run_id);
+    assert.deepEqual(messages.map(m => m.seq).sort((a, b) => a - b), Array.from({ length: messages.length }, (_, i) => i + 1));
+    assert.ok(api.states.some(s => s.runId === c.run_id && s.body.status === "completed"));
+    assert.equal(outbox.hasPendingTerminal(c.run_id, 2), false);
+  } finally {
+    fs.rmSync(marker, { force: true });
+  }
 });
 
 for (const stage of ["terminal", "running-ack"] as const) {

@@ -494,6 +494,34 @@ ready_eof() {
   echo true
 }
 custody_case "ready decoder reads to EOF without SIGPIPE" pass true ready_eof
+
+# Oversized inputs carry genuine readiness so rejecting noise alone cannot pass.
+awk 'BEGIN {
+  print "{\"msg\":\"stub: source-end ready\",\"run_id\":\"R\",\"claim_generation\":2,\"sources\":1}"
+  for (i=0;i<70000;i++) print "{\"noise\":\"000000000000000000000000000000000000000000000000000000000000\"}"
+}' > "$SEQ_DIR/oversized-ready.jsonl"
+head -c 4194304 "$SEQ_DIR/oversized-ready.jsonl" > "$SEQ_DIR/boundary-ready.jsonl"
+ready_size_case() {
+  if fixture_event_ready "$SEQ_DIR/$1-ready.jsonl" R 2 "stub: source-end ready"; then echo true; else echo false; fi
+}
+custody_case "ready decoder accepts the exact 4 MiB boundary" pass true ready_size_case boundary
+custody_case "ready decoder rejects overflowing genuine readiness" pass false ready_size_case oversized
+capture_overflow_case() (
+  RUNROOT="$SEQ_DIR"
+  COMPOSE=(large_fixture_log)
+  large_fixture_log() { cat "$SEQ_DIR/oversized-ready.jsonl"; }
+  timeout() { shift; "$@"; }
+  fixture_event_ready() { touch "$SEQ_DIR/overflow-parsed"; return 0; }
+  rm -f "$SEQ_DIR/overflow-parsed"
+  if fixture_worker_event_ready R 2 "stub: source-end ready"; then
+    fail "overflowing capture provided readiness"
+  fi
+  [ "$(LC_ALL=C wc -c < "$RUNROOT/.fixture-ready.log")" -le 4194305 ] ||
+    fail "capture exceeded its actual-byte bound"
+  [ ! -e "$SEQ_DIR/overflow-parsed" ] || fail "overflow entered the parser"
+  echo 'overflow rejected before parsing'
+)
+custody_case "worker capture enforces actual bytes and skips overflow parsing" pass 'overflow rejected' capture_overflow_case
 run_hold_generations() {
   apiget() { echo '{"holds":[{"run_id":"R","generation":3},{"run_id":"other","generation":9},{"run_id":"R","generation":1},{"run_id":"R","generation":2}]}'; }
   resolve_fixture_source_hold() { printf '%s:%s\n' "$1" "$2"; }

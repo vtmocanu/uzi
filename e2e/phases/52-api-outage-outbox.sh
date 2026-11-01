@@ -522,13 +522,99 @@ fi
 # under the 300s heartbeat-stale window raised above — the worker stays leased across the outage.
 say "M6 (Run B): write-ahead terminal reports survive an api outage (finish-during, restart, sweep carve-out; interlocked publication ACK retry, then permit after recovery)"
 unset WORKER_OUTBOX_RUN_MAX_BYTES            # back to DEFAULT quotas (a clean spill, no eviction) for the M6 runs
+# The stub-only post-release flush enters spill on its first refused send while still open.
+# Ordinary close then persists the tail; no elapsed-time assumption gates this proof.
+export WORKER_TRANSIENT_TRIP_MS=0
 export UZI_STUB_OUTBOX_TICKS=20              # ~20s stream (vs the 90s Run A default), e2e-only; unset at restore
 recreate_outbox_agent
-pass "agent recreated with WORKER_TRANSIENT_TRIP_MS=3s + a short UZI_STUB_OUTBOX stream for the M6 terminal-replay cases"
+pass "agent recreated with WORKER_TRANSIENT_TRIP_MS=0ms + a short UZI_STUB_OUTBOX stream for the M6 terminal-replay cases"
 
 # rb_run_field RUN COL — a scalar runs column straight from the db (COL is a fixed literal from
 # THIS file, never user input). Empty string for a SQL NULL (the 42-readoption idiom).
 rb_run_field() { db_psql "SELECT $2 FROM runs WHERE id = '$1'"; }
+
+# Snapshot while the exact terminal barrier is ready and the API is still healthy.
+# No tail may already be acknowledged: the release must create new replay work.
+snapshot_terminal_tail() {
+  local run="$1" gen="$2" api_seq db_seq
+  wait_fixture_worker_event "$run" "$gen" "stub: fixture barrier ready" terminal 90 || return 1
+  apiget "/api/runs/$run" | jq -e '.run.status=="running"' >/dev/null || return 1
+  api_seq="$(apiget "/api/runs/$run/messages" | jq -er '[.messages[].seq] | max // 0')" || return 1
+  db_seq="$(rb_run_field "$run" last_seq)" || return 1
+  [[ "$api_seq" =~ ^[0-9]+$ ]] && [ "$api_seq" = "$db_seq" ] || return 1
+  [ "$(db_psql "SELECT count(*) FROM run_messages WHERE run_id='$run' AND payload->>'event'='stub_outbox_terminal_tail'")" = 0 ] || return 1
+  printf '%s\n' "$db_seq"
+}
+# Read existing durable files only. One bounded exec, no worker control or new authority.
+# The manifest must still own the exact tail segment, beyond its acknowledged cursor.
+terminal_tail_projection() {
+  "${COMPOSE[@]}" exec -T agent timeout 15 node --input-type=module - /data/outbox "$1" "$2" <<'NODE'
+  import fs from "node:fs";
+  import path from "node:path";
+  const [root, run, generation] = process.argv.slice(2);
+  const gen = Number(generation), dir = path.join(root, run);
+  const read = name => JSON.parse(fs.readFileSync(path.join(dir, name), "utf8"));
+  const journal = read(`terminal-${gen}.json`), manifest = read("manifest.json");
+  const tails = [];
+  for (const ref of manifest.records) {
+    if (ref.kind !== "segment" || ref.lastSeq <= manifest.cursor) continue;
+    if (path.basename(ref.file) !== ref.file) throw new Error("invalid segment path");
+    const segment = read(ref.file);
+    for (const message of segment.messages) {
+      if (message.payload?.event !== "stub_outbox_terminal_tail") continue;
+      tails.push({ seq: message.seq, run: segment.runId, generation: segment.generation,
+        payload: message.payload, first: ref.firstSeq, last: ref.lastSeq });
+    }
+  }
+  console.log(JSON.stringify({ run: journal.run_id, generation: journal.claim_generation,
+    status: journal.body.status, fence: journal.messages_through_seq,
+    manifest_run: manifest.runId, cursor: manifest.cursor, tails }));
+NODE
+}
+terminal_tail_pending_valid() {
+  jq -es --arg run "$1" --argjson gen "$2" --argjson pre "$3" '
+    length==1 and (.[0] | .run==$run and .generation==$gen and .status=="completed" and .manifest_run==$run and
+    (.tails|length)==1 and (.tails[0] |
+      .run==$run and .generation==$gen and .payload.run_id==$run and
+      .payload.claim_generation==$gen and .payload.event=="stub_outbox_terminal_tail" and
+      (.seq|type)=="number" and .seq>0 and .seq>$pre and .first<=.seq and .last>=.seq) and
+    .cursor<.tails[0].seq and .fence>=.tails[0].seq)' >/dev/null
+}
+wait_terminal_tail_pending() {
+  local run="$1" gen="$2" pre="$3" deadline=$((SECONDS + 30)) file="$RUNROOT/.terminal-tail-$1.json"
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if terminal_tail_projection "$run" "$gen" > "$file" 2>/dev/null &&
+       terminal_tail_pending_valid "$run" "$gen" "$pre" < "$file" &&
+       [ "$(rb_run_field "$run" last_seq)" = "$pre" ] &&
+       [ "$(rb_run_field "$run" status)" = running ]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+# Corroborate replay with server-recorded completion/message timestamps and the entire
+# journal fence, including the exact post-cut tail (rather than a pre-cut gapless stream).
+terminal_tail_persisted_valid() {
+  jq -es --arg run "$1" --argjson gen "$2" --argjson seq "$3" --argjson fence "$4" '
+    length==1 and (.[0] | .run==$run and .generation==$gen and .status=="completed" and
+    .tail_count==1 and .tail_seq==$seq and .tail_run==$run and .tail_generation==$gen and
+    .last_seq>=$fence and .fence_count==$fence and .after_tail==true)' >/dev/null
+}
+assert_terminal_tail_replayed() {
+  local run="$1" gen="$2" file="$RUNROOT/.terminal-tail-$1.json" seq fence
+  seq="$(jq -er '.tails[0].seq' "$file")" || fail "missing pending tail evidence for $run"
+  fence="$(jq -er '.fence' "$file")" || fail "missing terminal fence for $run"
+  db_psql "SELECT json_build_object('run',r.id,'generation',r.claim_generation,'status',r.status,
+    'last_seq',r.last_seq,'tail_count',(SELECT count(*) FROM run_messages WHERE run_id=r.id AND payload->>'event'='stub_outbox_terminal_tail'),
+    'tail_seq',m.seq,'tail_run',m.payload->>'run_id','tail_generation',(m.payload->>'claim_generation')::bigint,
+    'fence_count',(SELECT count(*) FROM run_messages WHERE run_id=r.id AND seq BETWEEN 1 AND $fence),
+    'after_tail',r.finished_at >= (SELECT max(created_at) FROM run_messages WHERE run_id=r.id AND seq <= $fence))
+    FROM runs r JOIN run_messages m ON m.run_id=r.id AND m.seq=$seq
+    WHERE r.id='$run' AND m.payload->>'event'='stub_outbox_terminal_tail' AND m.claim_generation=$gen" \
+    | terminal_tail_persisted_valid "$run" "$gen" "$seq" "$fence" \
+    || fail "terminal application did not follow the exactly-once durable post-cut tail for $run"
+}
 
 # Each M6 outage is EVENT-GATED on the terminal being journaled AND its first live send lost to the
 # outage (wait_terminal_lost), not a fixed sleep: the run must REACH+JOURNAL its terminal AND have its
@@ -550,13 +636,16 @@ say "CASE 3: a run finishing during the outage -> completed after its messages (
 make_outbox_run terminal
 RUN_B1="$OUTBOX_RUN"
 GEN_B1="$(rb_run_field "$RUN_B1" claim_generation)"
+PRE_B1="$(snapshot_terminal_tail "$RUN_B1" "$GEN_B1")" || fail "case 3: invalid pre-cut terminal snapshot"
 say "cutting the api so run $RUN_B1 reaches AND journals its terminal (write-ahead) while it is down"
 api_cut
 release_outbox_cut_barrier "$RUN_B1" terminal "$GEN_B1" || { api_back; fail "case 3: barrier release failed"; }
 terminal_lost_b1=0; if wait_terminal_lost "$RUN_B1"; then terminal_lost_b1=1; fi
+tail_pending_b1=0; if wait_terminal_tail_pending "$RUN_B1" "$GEN_B1" "$PRE_B1"; then tail_pending_b1=1; fi
 api_back
 # Judge only AFTER the api is back: a `fail` with it still unavailable would take every later phase down
 # with this one.
+[ "$tail_pending_b1" = 1 ] || fail "case 3: no durable pending post-cut message tail under the terminal fence"
 [ "$terminal_lost_b1" = 1 ] \
   || fail "case 3: run $RUN_B1 never reached+journaled its terminal AND lost its first send while the api was down — the finish-during-outage precondition never held, so the first send could have landed post-recovery and the fence replay was never exercised"
 # On recovery the drainer replays the run's messages FIRST; the terminal SetState is then fenced
@@ -567,6 +656,7 @@ api_back
 wait_status "$RUN_B1" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 wait_drained "$RUN_B1"
 assert_contiguous "$RUN_B1"
+assert_terminal_tail_replayed "$RUN_B1" "$GEN_B1"
 RB1_FR="$(apiget "/api/runs/$RUN_B1" | jq -r '.run.failure_reason // ""')"
 [ -z "$RB1_FR" ] \
   || fail "case 3: run carried a failure_reason after a transient outage — the journaled completed was not the outcome: $RB1_FR"
@@ -574,20 +664,20 @@ RB1_FR="$(apiget "/api/runs/$RUN_B1" | jq -r '.run.failure_reason // ""')"
 # claim generation, so the generation is unchanged (a re-execution would re-claim, +1).
 [ "$(rb_run_field "$RUN_B1" claim_generation)" = "$GEN_B1" ] \
   || fail "case 3: generation advanced across the outage — the outcome was re-executed, not replayed (gen $GEN_B1 -> $(rb_run_field "$RUN_B1" claim_generation))"
-# A `completed` run whose whole persisted stream is gapless 1..N (assert_contiguous above) could
-# only reach terminal once last_seq was contiguous through the fence; the per-seq fence refusal
-# itself is asserted directly in api/internal/workersvc/terminal_fence_livedb_test.go.
+# The pending segment proved new trace existed after the cut; server timestamps above prove
+# completion followed persistence through that journal fence, including the exact fixed tail.
 pass "case 3: run finished during the outage -> completed AFTER its gapless messages (fence held), gen unchanged ($GEN_B1), no false failed"
 
 # =============================================================================
 # CASE 4 — the agent CONTAINER restarted mid-outage lands the journaled outcome from the D7 BOOT
 # GATE, before any new claim (SC3). Publication finishes while API is up, then the cut releases
-# the terminal journal. That journal and the suite's pre-existing `.reserve` form the existing
-# disk tree the restart resumes onto. /data is the `agentdata` named volume.
+# a fixed message tail, spilled before the terminal journal. Both pending message and terminal
+# records (plus the existing `.reserve`) survive for boot replay. /data is the `agentdata` named volume.
 say "CASE 4: agent restarted mid-outage -> boot gate lands the journaled outcome before any claim (SC3)"
 make_outbox_run terminal
 RUN_B2="$OUTBOX_RUN"
 GEN_B2="$(rb_run_field "$RUN_B2" claim_generation)"
+PRE_B2="$(snapshot_terminal_tail "$RUN_B2" "$GEN_B2")" || fail "case 4: invalid pre-cut terminal snapshot"
 RQ_B2="$(rb_run_field "$RUN_B2" requeue_count)"
 say "cutting the api so run $RUN_B2 journals its terminal and loses its first send while down"
 api_cut
@@ -598,6 +688,7 @@ release_outbox_cut_barrier "$RUN_B2" terminal "$GEN_B2" || { api_back; fail "cas
 # left to land the on-disk outcome. Judged after api_back — a `fail` with the api down would wedge
 # every later phase.
 terminal_lost_b2=0; if wait_terminal_lost "$RUN_B2"; then terminal_lost_b2=1; fi
+tail_pending_b2=0; if wait_terminal_tail_pending "$RUN_B2" "$GEN_B2" "$PRE_B2"; then tail_pending_b2=1; fi
 # Restart the agent CONTAINER while the api is still down. Its original execution process dies, so
 # the ONLY path left to terminal is the boot gate replaying the on-disk journal. `restart` reuses
 # the same container + the same /data volume, so the existing outbox tree is what the worker boots
@@ -609,11 +700,13 @@ say "restarting the agent container mid-outage (its /data outbox tree persists a
 # claim loops start.
 api_back
 wait_worker_online
+[ "$tail_pending_b2" = 1 ] || fail "case 4: no durable pending post-cut message tail under the terminal fence"
 [ "$terminal_lost_b2" = 1 ] \
   || fail "case 4: run $RUN_B2 never journaled its terminal AND lost its first send before the restart — the original process died with no unresolved on-disk outcome, so the boot gate had nothing to replay"
 wait_status "$RUN_B2" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 wait_drained "$RUN_B2"
 assert_contiguous "$RUN_B2"
+assert_terminal_tail_replayed "$RUN_B2" "$GEN_B2"
 # Landed via the BOOT GATE, before any new claim: the terminal is sent at the JOURNALED generation
 # with no re-claim, so the generation is unchanged AND no requeue was charged. A re-execution
 # (journal missing / run re-claimed) would advance the generation and bank a requeue.
@@ -632,6 +725,7 @@ say "CASE 5: a sweep-carve-out run's lost terminal lands on replay (never sits n
 make_outbox_run terminal
 RUN_B3="$OUTBOX_RUN"
 GEN_B3="$(rb_run_field "$RUN_B3" claim_generation)"
+PRE_B3="$(snapshot_terminal_tail "$RUN_B3" "$GEN_B3")" || fail "case 5: invalid pre-cut terminal snapshot"
 # Place the run in the completion-interlock carve-out the ordinary timeout sweep is DELIBERATELY
 # blind to (SweepRunningTimeout / sweep.go: `completion_attempts > 0 AND a live worker`): a
 # post-attempt run past its wall budget that the wall-clock sweep will NOT terminal-fail. We reach
@@ -658,7 +752,9 @@ say "cutting the api so the carve-out run's terminal is journaled and its first 
 api_cut
 release_outbox_cut_barrier "$RUN_B3" terminal "$GEN_B3" || { api_back; fail "case 5: barrier release failed"; }
 terminal_lost_b3=0; if wait_terminal_lost "$RUN_B3"; then terminal_lost_b3=1; fi
+tail_pending_b3=0; if wait_terminal_tail_pending "$RUN_B3" "$GEN_B3" "$PRE_B3"; then tail_pending_b3=1; fi
 api_back
+[ "$tail_pending_b3" = 1 ] || fail "case 5: no durable pending post-cut message tail under the terminal fence"
 [ "$terminal_lost_b3" = 1 ] \
   || fail "case 5: the carve-out run $RUN_B3 never journaled its terminal AND lost its first send while the api was down — with the outcome unresolved through a journal it would sit non-terminal forever (the carve-out spares it from both sweeps), which is the exact loss this case proves is repaired"
 # The journal replays: the run reaches `completed` (never the sweep's run_timeout `failed`), at its
@@ -666,6 +762,7 @@ api_back
 wait_status "$RUN_B3" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 wait_drained "$RUN_B3"
 assert_contiguous "$RUN_B3"
+assert_terminal_tail_replayed "$RUN_B3" "$GEN_B3"
 [ "$(rb_run_field "$RUN_B3" claim_generation)" = "$GEN_B3" ] \
   || fail "case 5: generation advanced — the terminal was re-executed, not replayed from the journal (gen $GEN_B3 -> $(rb_run_field "$RUN_B3" claim_generation))"
 RB3_ORIGIN="$(apiget "/api/runs/$RUN_B3" | jq -r '.run.fail_origin // ""')"
@@ -681,6 +778,9 @@ pass "case 5: the carve-out run's lost terminal landed on replay -> completed at
 # bounded send budget remains available. Completion then exercises the permit after recovery;
 # this case proves publication ACK retry/recovery, not permit transport retry during the outage.
 say "CASE 6: an interlocked run retries its publication-running ACK during the outage, then gets its permit and completes"
+# Return to the existing threshold for the running-ACK and retained-source cases.
+export WORKER_TRANSIENT_TRIP_MS=3s
+recreate_outbox_agent
 set_interlock true
 make_outbox_run running-ack
 RUN_B4="$OUTBOX_RUN"

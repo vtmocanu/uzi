@@ -6932,14 +6932,6 @@ export class RunRunner {
     // Issue #1673: a flight an input receipt fenced (released or superseded claim) sends and
     // journals no terminal; the StaleClaimError reaches executeClaim's quiet stop.
     if (flight.steering?.claimFence() !== undefined) throw new StaleClaimError();
-    const fixture = StubExecutor.fixture(flight.executor);
-    if (body.status === "completed" && fixture) {
-      await fixture.fixtureBarrier("terminal", flight.runId, flight.claimGeneration,
-        flight.cancel.signal, () => flight.runLog.info("stub: fixture barrier ready", {
-          stage: "terminal", run_id: flight.runId, claim_generation: flight.claimGeneration,
-        }));
-      if (flight.steering?.claimFence() !== undefined) throw new StaleClaimError();
-    }
     const deps = this.terminalDeps();
     const preexistingPending = deps?.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration) ?? false;
     const previouslyAttempted = flight.completionSendAttempted ||
@@ -8874,6 +8866,23 @@ export class RunRunner {
           runLog.info(logMessage, fields);
         });
         return;
+      }
+      const fixture = StubExecutor.fixture(flight.executor);
+      if (body.status === "completed" &&
+          fixture?.fixtureRequested("UZI_STUB_POST_PUBLICATION_BARRIER", flight.runId, flight.claimGeneration)) {
+        // All publication/head verification has finished, but the ordinary batcher is still open.
+        // Only a constructed stub with this exact marker emits a post-release tail; Codex's
+        // deferred terminal callback above and real harnesses never enter this fixture seam.
+        await fixture.fixtureBarrier("terminal", flight.runId, flight.claimGeneration,
+          flight.cancel.signal, () => flight.runLog.info("stub: fixture barrier ready", {
+            stage: "terminal", run_id: flight.runId, claim_generation: flight.claimGeneration,
+          }));
+        batcher.emit({ kind: "status", agent: "worker", payload: {
+          event: "stub_outbox_terminal_tail", run_id: flight.runId, claim_generation: flight.claimGeneration,
+        } });
+        // The fixture's immediate-spill setting makes a refused send enter spill while
+        // still open. Ordinary close then durably writes the tail through finalSpillOnClose.
+        await batcher.flushOwned(flight.cancel.signal);
       }
       await closeBatcher();
       await journalTerminalReport(body);

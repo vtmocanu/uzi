@@ -544,8 +544,21 @@ wait_custody_headroom() {
 # Consume every line, including Compose-prefixed JSON, without an early pipe close.
 # Invalid JSON and unrelated prose are misses; source readiness requires positive sources.
 fixture_event_ready() {
-  local file="$1" run="$2" gen="$3" event="$4" stage="${5:-}"
+  local file="$1" run="$2" gen="$3" event="$4" stage="${5:-}" bytes spool limiter rc=0
   [[ "$gen" =~ ^[1-9][0-9]*$ ]] || return 1
+  limiter="$(command -v timeout || command -v gtimeout || true)"
+  [ -n "$limiter" ] || return 1
+  spool="$(mktemp)" || return 1
+  # Bound even direct stream inputs before parsing; never parse an overflowing prefix.
+  if ! "$limiter" 10 head -c 4194305 -- "$file" > "$spool"; then
+    rm -f "$spool"
+    return 1
+  fi
+  bytes="$(LC_ALL=C wc -c < "$spool")" || { rm -f "$spool"; return 1; }
+  if [ "$bytes" -gt 4194304 ]; then
+    rm -f "$spool"
+    return 1
+  fi
   jq -Rne --arg run "$run" --argjson gen "$gen" --arg event "$event" --arg stage "$stage" '
     reduce inputs as $line (false;
       . or (try ($line | .[index("{"):] | fromjson |
@@ -554,16 +567,24 @@ fixture_event_ready() {
         (if $event=="stub: source-end ready" then
           (.sources | type=="number" and .>0 and .==floor)
          else true end)) catch false))
-    | select(.)' "$file" >/dev/null
+    | select(.)' "$spool" >/dev/null || rc=$?
+  rm -f "$spool"
+  return "$rc"
 }
 
-# A daemon read gets at most 10s, independently of the polling deadline.
-# Missing host timeout support is a miss, never an unbounded fallback.
+# A daemon read gets at most 10s and 4 MiB; retain one extra byte to detect overflow.
+# Missing host timeout support or overflow is a miss, never truncated readiness.
 fixture_worker_log() {
-  local file="$1" limiter
+  local file="$1" limiter bytes
   limiter="$(command -v timeout || command -v gtimeout || true)"
   [ -n "$limiter" ] || return 1
-  "$limiter" 10 "${COMPOSE[@]}" logs --no-color agent > "$file" 2>/dev/null
+  (
+    set -o pipefail
+    "$limiter" 10 "${COMPOSE[@]}" logs --no-color agent 2>/dev/null |
+      head -c 4194305 > "$file"
+  ) || return 1
+  bytes="$(LC_ALL=C wc -c < "$file")" || return 1
+  [ "$bytes" -le 4194304 ]
 }
 
 # Read the worker log once; an unsuccessful read cannot provide readiness.

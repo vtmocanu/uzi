@@ -530,4 +530,127 @@ for variant in timeout release-error; do
   )
   echo "PASS: finalize $variant restores API before failure"
 done
-echo 'cases=48 passed=48'
+
+# Real durable-file projection and predicates: completion/gaplessness alone must not
+# satisfy the terminal cut when the post-release trace was missing or already ACKed.
+eval "$(awk '/^(terminal_tail_projection|terminal_tail_pending_valid|terminal_tail_persisted_valid|wait_terminal_tail_pending|snapshot_terminal_tail|assert_terminal_tail_replayed)\(\) \{/,/^\}/' "$PHASE")"
+(
+  fixture
+  run="$RUN_B1"
+  dir="$SCRATCH/tail-outbox/$run"
+  mkdir -p "$dir"
+  fake_compose() {
+    [ "$*" = "exec -T agent timeout 15 node --input-type=module - /data/outbox $run 2" ] || return 1
+    node --input-type=module - "$SCRATCH/tail-outbox" "$run" 2
+  }
+  COMPOSE=(fake_compose)
+  jq -nc --arg r "$run" '{run_id:$r,claim_generation:2,body:{status:"completed"},messages_through_seq:12}' > "$dir/terminal-2.json"
+  jq -nc --arg r "$run" '{runId:$r,cursor:10,records:[{kind:"segment",firstSeq:11,lastSeq:12,file:"seg.json"}]}' > "$dir/manifest.json"
+  jq -nc --arg r "$run" '{runId:$r,generation:2,messages:[{seq:12,payload:{event:"stub_outbox_terminal_tail",run_id:$r,claim_generation:2}}]}' > "$dir/seg.json"
+  evidence="$(terminal_tail_projection "$run" 2)"
+  printf '%s\n' "$evidence" | terminal_tail_pending_valid "$run" 2 10
+  for filter in '.tails=[]' '.tails[0].seq=10' '.cursor=12' '.run="foreign"'       '.generation=1' '.manifest_run="foreign"' '.tails[0].run="foreign"'       '.tails[0].generation=1' '.tails[0].payload.run_id="foreign"'       '.tails[0].payload.claim_generation=1' '.tails[0].seq=0' '.fence=11'       '.tails[0].first=13' '.tails[0].last=11' '.tails += .tails'; do
+    if printf '%s\n' "$evidence" | jq "$filter" | terminal_tail_pending_valid "$run" 2 10; then
+      fail "pending tail accepted $filter"
+    fi
+  done
+  if terminal_tail_pending_valid "$run" 2 10 < /dev/null; then fail 'absent pending proof accepted'; fi
+  # A real manifest cursor at the tail removes its segment from the projection.
+  jq '.cursor=12' "$dir/manifest.json" > "$SCRATCH/acked.json"
+  cp "$SCRATCH/acked.json" "$dir/manifest.json"
+  if terminal_tail_projection "$run" 2 | terminal_tail_pending_valid "$run" 2 10; then fail 'retired segment accepted'; fi
+  rm "$dir/seg.json"
+  if terminal_tail_projection "$run" 2 | terminal_tail_pending_valid "$run" 2 10; then fail 'absent segment accepted'; fi
+  echo 'PASS: terminal cut requires an exact post-cut pending message segment and covering journal fence'
+
+  persisted="$(jq -nc --arg r "$run" '{run:$r,generation:2,status:"completed",last_seq:12,tail_count:1,tail_seq:12,tail_run:$r,tail_generation:2,fence_count:12,after_tail:true}')"
+  printf '%s\n' "$persisted" | terminal_tail_persisted_valid "$run" 2 12 12
+  for filter in '.after_tail=false' '.after_tail=null' '.tail_count=0' '.tail_count=2'       '.tail_seq=10' '.tail_run="foreign"' '.tail_generation=1' '.run="foreign"'       '.generation=1' '.last_seq=11' '.fence_count=11' '.status="running"'; do
+    if printf '%s\n' "$persisted" | jq "$filter" | terminal_tail_persisted_valid "$run" 2 12 12; then
+      fail "persisted tail accepted $filter"
+    fi
+  done
+  if terminal_tail_persisted_valid "$run" 2 12 12 < /dev/null; then fail 'absent timestamp proof accepted'; fi
+  echo 'PASS: terminal replay rejects premature completion, duplicates and wrong run/generation/sequence/fence'
+
+  # Exercise the real outage wait: pending disk evidence is insufficient if the DB
+  # already ACKed the tail or applied a terminal. Advance only the fixture clock.
+  terminal_tail_projection() { printf '%s\n' "$evidence"; }
+  sleep() { SECONDS=$((SECONDS + 31)); }
+  for db_variant in valid acknowledged premature missing; do
+    rb_run_field() {
+      case "$db_variant:$2" in
+        valid:last_seq|premature:last_seq|missing:last_seq) echo 10;;
+        acknowledged:last_seq) echo 12;;
+        premature:status) echo completed;;
+        *) echo running;;
+      esac
+    }
+    if [ "$db_variant" = missing ]; then terminal_tail_projection() { echo '{}'; }; fi
+    rc=0
+    wait_terminal_tail_pending "$run" 2 10 || rc=$?
+    if [ "$db_variant" = valid ]; then [ "$rc" = 0 ]; else [ "$rc" != 0 ]; fi
+  done
+  echo 'PASS: pending tail wait rejects already-acknowledged trace, premature terminal and missing disk proof'
+)
+(
+  fixture
+  run="$RUN_B1"
+  snapshot_variant=valid
+  apiget() {
+    if [[ "$1" == */messages ]]; then
+      if [ "$snapshot_variant" = mismatch ]; then echo '{"messages":[{"seq":11}]}'; else echo '{"messages":[{"seq":10}]}'; fi
+    elif [ "$snapshot_variant" = premature ]; then echo '{"run":{"status":"completed"}}'
+    else echo '{"run":{"status":"running"}}'
+    fi
+  }
+  rb_run_field() { echo 10; }
+  db_psql() { if [ "$snapshot_variant" = preexisting ]; then echo 1; else echo 0; fi; }
+  for snapshot_variant in valid premature mismatch preexisting; do
+    rc=0
+    seq="$(snapshot_terminal_tail "$run" 2)" || rc=$?
+    if [ "$snapshot_variant" = valid ]; then [ "$rc:$seq" = 0:10 ]; else [ "$rc" != 0 ]; fi
+  done
+  echo 'PASS: healthy barrier snapshot rejects premature completion, DB/API disagreement and a pre-cut tail'
+)
+# Evaluate the actual case wiring: each case must carry its healthy snapshot into the
+# outage proof, retain that proof before restart, and verify persistence after recovery.
+for selected in 3 4 5; do
+  (
+    fixture
+    configure_outbox_api_alias
+    # shellcheck disable=SC2034  # evaluated case commands consume these ids
+    RUN_B2="$RUN_B1" RUN_B3="$RUN_B1"
+    SNAPSHOT_DONE=0 PENDING_DONE=0
+    make_outbox_run terminal
+    snapshot_terminal_tail() {
+      [ "$API_AVAILABLE" = 1 ] || fail 'snapshot after cut'
+      echo 10
+    }
+    api_cut_original="$(declare -f api_cut)"
+    eval "${api_cut_original/api_cut ()/cut_with_alias ()}"
+    api_cut() { SNAPSHOT_DONE=1; cut_with_alias; }
+    wait_terminal_tail_pending() {
+      [ "$API_AVAILABLE:$BARRIER_RELEASED:$3" = 0:1:10 ] || fail 'pending proof outside exact cut'
+      PENDING_DONE=1
+    }
+    compose_with_proof() {
+      if [ "$1" = restart ]; then [ "$PENDING_DONE" = 1 ] || fail 'restart without pending message proof'; fi
+      fake_compose "$@"
+    }
+    COMPOSE=(compose_with_proof)
+    assert_terminal_tail_replayed() {
+      [ "$SNAPSHOT_DONE:$PENDING_DONE:$API_AVAILABLE" = 1:1:1 ] || fail 'replay missing post-cut proof'
+    }
+    eval "$(awk -v selected="$selected" '
+      /^say "CASE [0-9]+:/ { inside=index($0,"CASE " selected ":")>0 }
+      inside && (/^PRE_B[123]=/ || /^api_cut$/ || /^release_outbox_cut_barrier/ ||
+        /^terminal_lost_b[123]=/ || /^tail_pending_b[123]=/ || /^api_back$/ ||
+        /^\[ "\$tail_pending_b[123]"/ || /^assert_terminal_tail_replayed/ ||
+        index($0,"\"${COMPOSE[@]}\" restart agent")==1) { print }
+    ' "$PHASE")"
+    [ "$PENDING_DONE" = 1 ]
+  )
+  echo "PASS: real CASE $selected wires the healthy snapshot, pending message fence and persisted-tail proof"
+done
+echo 'cases=55 passed=55'
