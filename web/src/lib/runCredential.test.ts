@@ -175,19 +175,19 @@ describe("describeCredential", () => {
 // ── Codex (issue #3719) ───────────────────────────────────────────────────────────────
 
 // The Codex edge of the same three-language guard. codexselect.AllReasons in Go is
-// already pinned to migration 00387's runs_codex_select_reason_check; this pins the web's
+// already pinned to migration 00389's runs_codex_select_reason_check; this pins the web's
 // exhaustive phrase map to that CHECK too, so a reason added server-side without a web
 // phrase reddens here instead of rendering the raw wire string. Comments are stripped
 // first, and the match is anchored on the codex_select_reason IN-list, because the file
 // carries other quoted vocabularies (users_codex_account_mode_check's 'default'/'auto').
 function codexReasonsFromMigration(): string[] {
-  const path = "../api/internal/store/migrations/00387_codex_account_autoselect.sql";
+  const path = "../api/internal/store/migrations/00389_codex_account_autoselect.sql";
   const stmt = readFileSync(path, "utf8")
     .split("\n")
     .filter((line) => !line.trimStart().startsWith("--"))
     .join("\n");
   const inList = stmt.match(/codex_select_reason IN \(([^)]*)\)/);
-  if (!inList) throw new Error("could not find the codex_select_reason IN-list in 00387");
+  if (!inList) throw new Error("could not find the codex_select_reason IN-list in 00389");
   return [...inList[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]).sort();
 }
 
@@ -196,7 +196,7 @@ function codexRun(reason: string | null, id: string | null = "sec-codex") {
 }
 
 describe("the Codex reason vocabulary is one vocabulary", () => {
-  it("matches migration 00387's CHECK", () => {
+  it("matches migration 00389's CHECK", () => {
     const fromSQL = codexReasonsFromMigration();
     // Six, so a parser that matched nothing (or the wrong, two-value list) cannot pass.
     expect(fromSQL).toHaveLength(6);

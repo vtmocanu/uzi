@@ -10,7 +10,7 @@
 -- users and runs are hot tables, so the statement times out rather than queue behind a
 -- long writer and stall everyone behind it. Plain ADD COLUMNs (a constant default needs
 -- no rewrite) come first; every CHECK on a populated table is added NOT VALID and
--- VALIDATE-d in the sibling 00388, the lock-cheap two-step 00233/00234 established.
+-- VALIDATE-d in the sibling 00390, the lock-cheap two-step 00233/00234 established.
 SET LOCAL lock_timeout = '5s';
 
 -- users.codex_account_mode: the per-user opt-in. 'default' keeps today's binding; 'auto'

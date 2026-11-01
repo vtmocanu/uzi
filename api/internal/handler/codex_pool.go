@@ -13,7 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// The two stored values of users.codex_account_mode (migration 00387's CHECK).
+// The two stored values of users.codex_account_mode (migration 00389's CHECK).
 const (
 	codexModeDefault = "default"
 	codexModeAuto    = "auto"

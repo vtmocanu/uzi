@@ -8,7 +8,7 @@ package codexselect
 // Reason is WHY run creation bound the Codex alias it bound, persisted in
 // runs.codex_select_reason and rendered by the CLI, TUI and web. It is a CLOSED vocabulary
 // and this file is its ONE Go home, mirroring autoselect.Reason. The SQL CHECK
-// (runs_codex_select_reason_check, migration 00387) lists the same values, and a guard test
+// (runs_codex_select_reason_check, migration 00389) lists the same values, and a guard test
 // parses that migration and compares it with AllReasons: a value added in Go and forgotten
 // in SQL is a constraint violation at create time, i.e. a refused run.
 type Reason string

@@ -205,7 +205,7 @@ export function describeCredential(
 // WHY run creation bound the Codex login it bound, rendered from runs.codex_select_reason.
 // Same rules as the Anthropic map above: every string renders the server's record, the
 // map is EXHAUSTIVE over CodexSelectReason by type, and the runtime list is derived from
-// it (CODEX_SELECT_REASONS), so a guard test parsing migration 00387's CHECK reddens on a
+// it (CODEX_SELECT_REASONS), so a guard test parsing migration 00389's CHECK reddens on a
 // reason the web cannot phrase.
 //
 // The Codex words differ from the Anthropic ones on purpose: Codex chooses at run

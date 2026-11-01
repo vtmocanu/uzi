@@ -2,9 +2,9 @@
 
 SET LOCAL lock_timeout = '5s';
 
--- Validate the three CHECKs added NOT VALID in 00387 (issue #3719). VALIDATE CONSTRAINT
+-- Validate the three CHECKs added NOT VALID in 00389 (issue #3719). VALIDATE CONSTRAINT
 -- scans each table but takes only a SHARE UPDATE EXCLUSIVE lock (write-compatible), unlike
--- the ACCESS EXCLUSIVE lock an inline validated ADD CONSTRAINT would hold. Split from 00387
+-- the ACCESS EXCLUSIVE lock an inline validated ADD CONSTRAINT would hold. Split from 00389
 -- per the two-step pattern (00233/00234).
 --
 -- The backlog satisfies every CHECK by construction: users took the 'default' column
@@ -18,9 +18,9 @@ ALTER TABLE user_secrets VALIDATE CONSTRAINT user_secrets_auto_eligible_kind_che
 
 SET LOCAL lock_timeout = '5s';
 
--- There is no VALIDATE inverse, so restore the pre-00388 state (each constraint present
--- but NOT VALID) by dropping and re-adding it NOT VALID. The bodies match 00387's Up
--- verbatim; 00387's Down then drops or narrows them. Mirrors 00234's Down.
+-- There is no VALIDATE inverse, so restore the pre-00390 state (each constraint present
+-- but NOT VALID) by dropping and re-adding it NOT VALID. The bodies match 00389's Up
+-- verbatim; 00389's Down then drops or narrows them. Mirrors 00234's Down.
 ALTER TABLE users DROP CONSTRAINT users_codex_account_mode_check;
 ALTER TABLE users ADD CONSTRAINT users_codex_account_mode_check
     CHECK (codex_account_mode IN ('default', 'auto')) NOT VALID;
