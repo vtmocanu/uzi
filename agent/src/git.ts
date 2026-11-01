@@ -644,6 +644,23 @@ export interface PublicationCandidate {
   readonly candidate: string;
 }
 
+/** Exact transient checkpoint producer inputs; admission grants no publication authority. */
+export interface CheckpointPublicationContext {
+  readonly sourceSha: string;
+  readonly candidateSha: string;
+  readonly excludeSha: string;
+  readonly packExcludeShas: readonly string[];
+  readonly defaultBlobSha?: string;
+}
+
+/** Freshly verified publication inputs captured under the bare lock. */
+export interface PushPublicationContext {
+  readonly candidateSha: string;
+  readonly originalHead: string;
+  readonly originalFloor: PublicationFloor;
+  readonly remoteFloor: Exclude<PublicationFloor, { readonly kind: "unverified" }>;
+}
+
 /** Only a complete locked proof may create this disposition. */
 export class RemoteBranchAdvancedError extends ScratchPublicationError {
   constructor(readonly proof: Readonly<{ P: string; H: string; C: string; R: string; cause: "remote_branch_advanced" }>) {
@@ -3497,14 +3514,21 @@ export class GitCache {
   async pushBranch(
     barePath: string, branch: string, pat: string, repoUrl: string, username?: string,
     publication?: PublicationCandidate,
+    beforePush?: (candidateSha: string, context: PushPublicationContext) => Promise<void>,
   ): Promise<void> {
+    const captured = publication && Object.freeze({ ...publication, floor: Object.freeze({ ...publication.floor }) });
     const scope = httpScopeForUrl(repoUrl);
     await this.withLock(barePath, async () => {
-      const tip = publication?.candidate ?? await this.resolveCommitStrict(barePath, runnerTrackingRef(branch));
+      const tip = captured?.candidate ?? await this.resolveCommitStrict(barePath, runnerTrackingRef(branch));
       const candidate = await this.scratchPublicationPreflight(barePath, branch, tip);
       // Legacy callers have no claim floor and cannot produce a supersession proof.
-      const group = publication ?? { floor: { kind: "absent" } as const, originalHead: candidate, candidate };
-      await this.refreshScratchPublicationFloor(barePath, branch, group, pat, scope, username);
+      const group = captured ?? { floor: Object.freeze({ kind: "absent" } as const), originalHead: candidate, candidate };
+      const remoteFloor = await this.refreshScratchPublicationFloor(barePath, branch, group, pat, scope, username);
+      // Called under bare lock B: the callback must not invoke methods that take B.
+      await beforePush?.(candidate, Object.freeze({
+        candidateSha: candidate, originalHead: group.originalHead,
+        originalFloor: group.floor, remoteFloor,
+      }));
       try {
         await this.runGit(barePath, ["push", "origin", `${candidate}:refs/heads/${branch}`], pat, scope, username);
       } catch (error) {
@@ -3650,7 +3674,7 @@ export class GitCache {
   private async refreshScratchPublicationFloor(
     barePath: string, branch: string, group: PublicationCandidate, pat: string,
     scope: string | undefined, username?: string,
-  ): Promise<void> {
+  ): Promise<PushPublicationContext["remoteFloor"]> {
     if (!(await this.isRemoteBranchName(barePath, branch))) {
       throw new ScratchPublicationError("invalid remote branch", undefined, {
         kind: "floor_unverified", step: "floor_refresh",
@@ -3681,7 +3705,7 @@ export class GitCache {
       if (R === null) {
         if (group.floor.kind !== "absent") refuse("floor_unverified");
         if (await observe() !== null) refuse("remote_changed_during_refresh");
-        return;
+        return Object.freeze({ kind: "absent" });
       }
       await this.runGit(barePath, ["fetch", "--refmap=", "--", "origin", `+${remoteRef}:${scratchRef}`], pat, scope, username);
       const fetched = await this.resolveCommitStrict(barePath, scratchRef).catch((error: unknown) => {
@@ -3699,7 +3723,7 @@ export class GitCache {
       const remoteInCandidate = await relation(R, C);
       if (remoteInCandidate === "ancestor") {
         if (await observe() !== R) refuse("remote_changed_during_refresh");
-        return;
+        return Object.freeze({ kind: "pinned", oid: R });
       }
       if (floor.kind !== "pinned") return refuse("new_remote_candidate_diverged");
       const P = floor.oid;
@@ -11541,7 +11565,7 @@ export class GitCache {
     /** Exact committed ownership snapshot supplied by the runner; never a source ref name. */
     sourceSha?: string,
     /** Judge the actual candidate after overlay/floor validation, before starting a producer. */
-    beforePack?: (wantedSha: string) => Promise<void>,
+    beforePack?: (wantedSha: string, context?: CheckpointPublicationContext) => Promise<void>,
     /** issue #2733: the checkpoint ref tips this run knows, in preference order (attempted, then
      *  confirmed). When no overlay wrapper was built, the raw tip is chained over the first one
      *  that is not already contained in it (see {@link buildCheckpointChain}), so the broker sees a
@@ -11552,6 +11576,9 @@ export class GitCache {
     tipOid: string; pack: Readable; exited: Promise<number>; cancel: () => void;
     replay: () => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void }>;
   } | null> {
+    // Snapshot caller-owned producer inputs before entering any asynchronous scope.
+    pinned = pinned && { ...pinned,
+      packExcludeShas: pinned.packExcludeShas === undefined ? undefined : Object.freeze([...pinned.packExcludeShas]) };
     const parent = this.recoveryOperation();
     const boundary = this.boundaryProcesses.getStore();
     const budget = MaintenanceBudget.current();
@@ -11631,7 +11658,7 @@ export class GitCache {
     /** Exact committed ownership snapshot supplied by the runner; never a source ref name. */
     sourceSha?: string,
     /** Judge the actual candidate after overlay/floor validation, before starting a producer. */
-    beforePack?: (wantedSha: string) => Promise<void>,
+    beforePack?: (wantedSha: string, context?: CheckpointPublicationContext) => Promise<void>,
     /** issue #2733: the checkpoint ref tips this run knows, in preference order (attempted, then
      *  confirmed). When no overlay wrapper was built, the raw tip is chained over the first one
      *  that is not already contained in it (see {@link buildCheckpointChain}), so the broker sees a
@@ -11650,19 +11677,23 @@ export class GitCache {
       await this.scratchPublicationPreflight(barePath, branch, source);
       if (candidate !== source) await this.scratchPublicationPreflight(barePath, branch, candidate);
       await this.validateCheckpointFloor(barePath, floor, candidate);
-      await beforePack?.(candidate);
-      this.checkCheckpointCooperation();
       if (defaultBlobSha && (!SHA40_RE.test(defaultBlobSha) ||
           await this.revParse(barePath, `${defaultBlobSha}^{commit}`) !== defaultBlobSha)) {
         throw new ScratchPublicationError("captured checkpoint default is unavailable");
       }
+      const excludes = Object.freeze([...(candidate === floor && packExcludes !== undefined ? packExcludes : [floor])]);
+      const context: CheckpointPublicationContext = Object.freeze({
+        sourceSha: source, candidateSha: candidate, excludeSha: floor,
+        packExcludeShas: excludes, ...(defaultBlobSha === undefined ? {} : { defaultBlobSha }),
+      });
+      await beforePack?.(candidate, context);
+      this.checkCheckpointCooperation();
       const selected = defaultBlobSha && !(candidate === floor && packExcludes !== undefined)
         ? await this.prepareCheckpointObjects(barePath, candidate, floor, defaultBlobSha) : undefined;
       this.checkCheckpointCooperation();
       onStep?.("checkpoint_pack");
       // Preserve #3242's zero-range transport envelope. It is deliberately packed by
       // the legacy producer: blob selection over candidate ^floor would be empty.
-      const excludes = candidate === floor && packExcludes !== undefined ? packExcludes : [floor];
       this.checkCheckpointCooperation();
       const { stdout, exited, cancel, settled } = await this.spawnGit(
         barePath, selected === undefined ? ["pack-objects", "--revs", "--stdout"] : ["pack-objects", "--stdout"],
