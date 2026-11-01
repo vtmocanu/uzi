@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { loadConfig } from "../src/config.js";
+import { loadConfig, memoryGuardTimingOf } from "../src/config.js";
 import { TRANSIENT_TRIP_MS } from "../src/batcher.js";
 
 // Minimal env that satisfies loadConfig's required fields.
@@ -9,6 +9,19 @@ const baseEnv = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
   UZI_API_URL: "http://api:8080",
   UZI_WORKER_TOKEN: "worker-join-token-0123456789",
   ...over,
+});
+
+describe("memoryGuardTimingOf (issue #3639)", () => {
+  it("an enabled guard yields exactly its rearm, sample and response-budget timings; a disabled or absent one yields none", () => {
+    const enabled = loadConfig(baseEnv({
+      WORKER_MEMORY_GUARD_ENABLED: "true", WORKER_MEMORY_GUARD_RESERVE_BYTES: "111", WORKER_MEMORY_GUARD_SAMPLE_MS: "222",
+      WORKER_MEMORY_GUARD_HYSTERESIS_BYTES: "333", WORKER_MEMORY_GUARD_REARM_MS: "444",
+      WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS: "555", WORKER_MEMORY_GUARD_MAX_INTERVENTIONS: "6",
+    }));
+    assert.deepEqual(memoryGuardTimingOf(enabled.memoryGuard), { rearmMs: 444, sampleMs: 222, responseBudgetMs: 555 });
+    assert.equal(memoryGuardTimingOf(loadConfig(baseEnv()).memoryGuard), undefined);
+    assert.equal(memoryGuardTimingOf(undefined), undefined);
+  });
 });
 
 describe("recovery decoded limit config", () => {

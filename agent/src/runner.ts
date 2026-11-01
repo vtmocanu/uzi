@@ -23296,6 +23296,9 @@ export class RunRunner {
           b.workerId !== entry.binding.worker_id || b.registerNonce !== entry.binding.register_nonce ||
           b.memoryEpisode !== entry.binding.memory_episode) throw new Error("entry does not match its record");
     } catch { return f2("the stored receipt is not a settled record of this park"); }
+    if ((entry.attemptId ?? null) !== (record.origin.attemptId ?? null)) {
+      return f2("the stored receipt names another attempt than the entry");
+    }
     const settlement = record.settlement!;
     const authorityIncarnation = authority.authorityIncarnation();
     if (authorityIncarnation === undefined || record.origin.authorityIncarnation !== authorityIncarnation) {

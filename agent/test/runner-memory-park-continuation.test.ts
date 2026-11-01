@@ -136,6 +136,7 @@ type Internals = {
   ownMemoryParks: Map<string, Entry>;
   createOwnMemoryPark(runId: string, binding: Record<string, unknown>): Entry | undefined;
   memoryReceiptDecision(claim: unknown): { kind: string; reason?: string };
+  memoryReceiptGate(claim: unknown, flight: unknown): Promise<void>;
 };
 
 type Counters = { refusals: Array<{ kind: string; reason: string }>; reserve: number; block: number; capture: number;
@@ -322,6 +323,24 @@ describe("the producer posts the settled park's exact journal bytes (issue #3639
       try {
         assert.equal(p.posts.length, 0);
         assert.equal(activeJournal()?.memoryPark?.settlement?.confirmed === true, false, "no settlement was confirmed");
+        assert.equal(entryOf(p), undefined, "an entry that never reached a POST is removed");
+      } finally { await p.done(); }
+    });
+  }
+
+  // A settlement IS built and the journal really holds it, but the producer's own write call did not report `settled`
+  // for this hold: the POST is gated on that return value alone. (The `hold &&` term of the delivery condition is
+  // redundant: `record.settlement` is only ever assigned in the branch that has a hold, so with no hold the condition is
+  // already false at `record.settlement`; a cleared hold cannot reach it, and the re-park test below pins the no-POST.)
+  for (const outcome of ["unconfirmed", "recorded"] as const) {
+    it(`no POST and no entry: the journal write returned ${outcome} although a settlement was built`, async () => {
+      const p = await parked({ tweak: () => {
+        const record = git.recordMemoryPark.bind(git);
+        git.recordMemoryPark = async (...args: Parameters<typeof record>) => { await record(...args); return outcome; };
+      } });
+      try {
+        assert.equal(activeJournal()?.memoryPark?.settlement?.confirmed, true, "premise: the settlement was built and written");
+        assert.equal(p.posts.length, 0);
         assert.equal(entryOf(p), undefined, "an entry that never reached a POST is removed");
       } finally { await p.done(); }
     });
@@ -600,6 +619,26 @@ describe("gate steps (a) to (d) (issue #3639)", () => {
     } finally { await p.done(); }
   });
 
+  for (const [name, attempt, stored] of [
+    ["an attempt-path receipt whose entry names no attempt", true, null],
+    ["an attempt-path receipt whose entry names another attempt", true, "20200101T000000Z-g1-0000000000000000"],
+    ["a canonical receipt whose entry names an attempt", false, "20200101T000000Z-g1-0000000000000000"],
+  ] as const) {
+    it(`(a) ${name}: F2`, async () => {
+      const p = await parked({ attempt });
+      try {
+        declinePark();
+        assert.notEqual(entryOf(p)!.attemptId, stored, "premise: the tampered value differs from the record's");
+        entryOf(p)!.attemptId = stored;
+        await resume(p);
+        assertRefusal(p, "F2", /another attempt/);
+        assertNothingDone(p);
+        assert.equal(rawJournal(), p.journal0, "the journal is byte-identical");
+        assert.equal(entryOf(p)?.state, "pending");
+      } finally { await p.done(); }
+    });
+  }
+
   it("(a) no memory runtime on the claimant: F2", async () => {
     const p = await parked();
     try {
@@ -649,6 +688,7 @@ describe("gate steps (a) to (d) (issue #3639)", () => {
       const c = await resume(p);
       assert.equal(p.counters.refusals.length, 0, "not a receipt refusal");
       assert.equal(c.newParks().length, 1, "one authenticated park report");
+      assert.equal(p.posts.length, 1, "the re-park (no hold) posts nothing: only the original park's receipt was sent");
       assert.deepEqual([c.newParks()[0]!.body.claim_generation, c.newParks()[0]!.body.memory_episode], [8, 4]);
       assert.deepEqual({ ...p.counters, refusals: 0 }, { refusals: 0, reserve: 0, block: 0, capture: 0, captureMemory: 0, admit: 0,
         preserve: 0, ran: 0, clone: 0, owed: p.counters.owed }, "no reservation, capture, admission or model turn");
@@ -696,7 +736,7 @@ describe("gate steps (a) to (d) (issue #3639)", () => {
     });
   }
 
-  it("(c) cancellation, pause or shutdown during the wait ends the claim nonterminally and keeps the entry pending", async () => {
+  it("(c) a wait stub that reports aborted ends the claim nonterminally and keeps the entry pending", async () => {
     const p = await parked();
     try {
       starveGuard(p.f.memory, "aborted");
@@ -708,6 +748,62 @@ describe("gate steps (a) to (d) (issue #3639)", () => {
       assert.equal(entryOf(p)?.state, "pending", "PENDING kept");
     } finally { await p.done(); }
   });
+
+  // The guard wait is a stand-in that honours the lifecycle signal it is handed exactly as the monitor's wait does
+  // (it returns `aborted` only once that signal aborts, and a stall surfaces as `timeout`, which would F1 and fail the
+  // test). The abort itself is raised by the REAL mechanism: a steering input polled from the server, or runner.shutdown().
+  const custodyOf = (flight: Record<string, unknown>) => ({
+    preserveRecoveryClone: flight.preserveRecoveryClone, preserveSession: flight.preserveSession,
+    retainedLocalCustody: flight.retainedLocalCustody, keepGuardedInventoryOpen: flight.keepGuardedInventoryOpen,
+  });
+  const RETAINED = { preserveRecoveryClone: true, preserveSession: true, retainedLocalCustody: true, keepGuardedInventoryOpen: true };
+  function lifecycleWait(p: Parked, trigger: () => void) {
+    let flight: Record<string, unknown> | undefined;
+    const seen: { atWait?: ReturnType<typeof custodyOf>; signalAborted?: boolean } = {};
+    const gate = p.inner.memoryReceiptGate.bind(p.runner);
+    p.inner.memoryReceiptGate = (claim, f) => { flight = f as Record<string, unknown>; return gate(claim, f); };
+    p.f.memory.guardObservation = () => ({ seq: 1, validSeq: 0, armed: true, pendingIntervention: false });
+    p.f.memory.waitGuardSample = async (_seq, _deadline, signal) => {
+      seen.atWait = custodyOf(flight!);
+      trigger();
+      await new Promise<void>(resolve => {
+        if (signal?.aborted) return resolve();
+        const stall = setTimeout(resolve, 20_000);
+        signal?.addEventListener("abort", () => { clearTimeout(stall); resolve(); }, { once: true });
+      });
+      seen.signalAborted = signal?.aborted === true;
+      return seen.signalAborted ? "aborted" : "timeout";
+    };
+    return { seen, flight: () => flight! };
+  }
+  // A real cancel is the owner's terminal decision: its existing arm reports the run `failed` ("run cancelled"); the gate
+  // adds nothing to that (no park report, no refusal, no fallback). Pause and shutdown report nothing terminal.
+  const lifecycleCases: Array<[string, (p: Parked) => () => void, string[]]> = [
+    ["a real server cancel", p => () => api.setInputs(p.f.claim.run_id, [{ id: 1, kind: "cancel" }]), ["run cancelled"]],
+    ["a real steering pause now", p => () => api.setInputs(p.f.claim.run_id, [{ id: 1, kind: "pause", body: "now" }]), []],
+    ["a real worker shutdown", p => () => p.runner.shutdown(), []],
+  ];
+  for (const [name, trigger, cancelReports] of lifecycleCases) {
+    it(`(c) ${name} during the wait ends the gate without a refusal or fallback, retains custody from its start, keeps the entry pending`, async () => {
+      const p = await parked();
+      try {
+        const w = lifecycleWait(p, trigger(p));
+        const c = await resume(p);
+        assert.equal(w.seen.signalAborted, true, "the wait ended because the real lifecycle signal aborted");
+        assert.deepEqual(w.seen.atWait, RETAINED, "custody was already retained when the wait began (before the gate's first await)");
+        assert.deepEqual(custodyOf(w.flight()), RETAINED, "and still is at the end");
+        assert.equal(c.newParks().length, 0, "no park report and no fallback");
+        assert.equal(p.counters.refusals.length, 0);
+        assert.deepEqual(terminals().map(s => s.body.failure_reason).filter(Boolean), cancelReports);
+        const { refusals: _refusals, ...work } = p.counters;
+        void _refusals;
+        assert.deepEqual(work, { reserve: 0, block: 0, capture: 0, captureMemory: 0, admit: 0, preserve: 0, ran: 0, clone: 0, owed: 0 },
+          "no reservation, capture, admission, preservation, fresh clone or model turn");
+        await assertUntouched(p);
+        assert.equal(entryOf(p)?.state, "pending", "PENDING kept");
+      } finally { await p.done(); }
+    });
+  }
 
   it("a gate that passes admits nothing before the handoff: no memory context, reservation or capture precedes discovery", async () => {
     const p = await parked();
@@ -947,6 +1043,29 @@ describe("the client side of the receipt (issue #3639)", () => {
     await c.reportMemoryParkSettlement(run, BYTES);
     assert.deepEqual(seen, [{ url: `http://example.invalid/api/worker/runs/${run}/memory/settlement`, body: BYTES, type: "application/json" }]);
   });
+
+  // The producer cannot be driven to the fixture's exact record (its run id, incarnations and epochs are fixed values), so
+  // this pins the two halves at their seams: the client posts whatever bytes it is given verbatim and accepts only the
+  // echo of their sha256, and the runner hands it serializeMemoryPark of the journal record (first producer test above).
+  for (const fixture of ["settlement-typical.json", "settlement-max-shape.json"]) {
+    it(`the client posts ${fixture}'s bytes verbatim and accepts exactly the fixture's .sha256 as the echo`, async t => {
+      const dir = path.resolve(import.meta.dirname, "../../fixtures/memory-park");
+      const text = fs.readFileSync(path.join(dir, fixture), "utf8");
+      const expected = fs.readFileSync(path.join(dir, `${fixture}.sha256`), "utf8").trim();
+      const c = newClient();
+      const bodies: unknown[] = [];
+      t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+        if (url.endsWith("/register")) return json(registration(["memory_park_settlement_v1"]));
+        bodies.push(init.body);
+        return json({ settlement_sha256: expected });
+      });
+      await c.register("fixture");
+      await c.reportMemoryParkSettlement(run, text);
+      assert.equal(bodies.length, 1);
+      assert.equal(bodies[0], text, "the POST body is the fixture's bytes exactly");
+      assert.equal(sha256(bodies[0] as string), expected, "and S is the fixture's .sha256");
+    });
+  }
 
   it("a 200 that does not echo the posted bytes' sha256 is a definite failure, never a retry", async t => {
     const c = newClient();
