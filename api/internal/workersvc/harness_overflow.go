@@ -39,8 +39,9 @@ func (o harnessCreationOrigin) eligible(p store.GetHarnessCreationPolicyRow) boo
 	return o.TriggerSource == "manual" || o.TriggerSource == "autopilot" || o.TriggerSource == "schedule"
 }
 
-// overflowEvidence separates comparison capacity from measurement. A capacity hold
-// makes comparison known zero even when the underlying measurement is unavailable.
+// overflowEvidence separates comparison capacity from measurement. A hold on the
+// preferred side gives a known zero even when measurement is unavailable. A
+// destination comparison can remain unknown despite a measurement or hold.
 type overflowEvidence struct {
 	Measured    pgtype.Float8
 	Held        bool

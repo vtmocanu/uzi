@@ -1,8 +1,9 @@
 -- +goose Up
 ALTER TABLE users ADD COLUMN harness_overflow_enabled boolean NOT NULL DEFAULT false;
 
--- NULL means no creation decision (including all historical rows and direct chat inserts).
--- Comparison scores use held=0; measured scores retain the underlying gauge independently.
+-- A NULL preferred harness/reason means no creation decision (including historical
+-- rows and direct chat inserts). Preferred holds compare as 0; ineligible Codex
+-- destination comparisons are NULL. Measured scores retain the gauge independently.
 ALTER TABLE runs
     ADD COLUMN harness_preferred text,
     ADD COLUMN harness_decision_reason text,
