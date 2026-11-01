@@ -593,7 +593,7 @@ func TestForgeAPIOriginMigrationDownUpLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	raw, err := os.ReadFile("migrations/00390_forge_api_origin.sql")
+	raw, err := os.ReadFile("migrations/00392_forge_api_origin.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

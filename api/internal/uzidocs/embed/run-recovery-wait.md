@@ -631,7 +631,7 @@ ordinary attempt rather than a publication-only episode; the older API cannot
 then claim it (the guard aborts the claim's worker/generation write), and after
 roll-forward the unreset wait clock can re-hold it at the next park.
 Mixed-version residual: an older API's clone-success path deletes a shared
-cooldown row without checking the API flag. After a 00390 schema rollback, API
+cooldown row without checking the API flag. After a 00392 schema rollback, API
 evidence on a shared row is lost, because that Down drops the flag columns. See [ADR-1392](../adr/1392-forge-unreachable-preclone-park.md).
 
 Not covered: the post-merge-request hops listed above, probes, new run

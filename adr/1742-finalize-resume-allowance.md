@@ -745,7 +745,7 @@ unchanged for a run without such a record.
   taken from the body being validated.
 - **Enrollment.** Before any remote finalize step the worker saves the local
   record, then enrolls it with `POST /api/worker/runs/{id}/publication-intent`
-  (server copy in the side table `run_publication_resume`, migration 00389),
+  (server copy in the side table `run_publication_resume`, migration 00391),
   then records the acknowledged sequence numbers locally. Only an acknowledged
   enrollment lets the remote steps run.
 - **Precise fallback.** A failure is classified as exactly one of two outcomes.

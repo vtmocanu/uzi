@@ -447,7 +447,7 @@ SELECT set_config('uzi.publication_resume_api', 'v1', true)
 // Write-ahead publication intent (issue #1324). The side table is guarded by
 // guard_publication_resume_row: enrollment, candidate updates and retirement here require the
 // API opt-in below, set in the same transaction as the writer. A run reaching a terminal status
-// also closes its intent through close_publication_resume_trg (00389), without the opt-in.
+// also closes its intent through close_publication_resume_trg (00391), without the opt-in.
 func (q *Queries) OptInPublicationResume(ctx context.Context) error {
 	_, err := q.db.Exec(ctx, optInPublicationResume)
 	return err
