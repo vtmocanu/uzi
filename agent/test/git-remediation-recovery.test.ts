@@ -656,3 +656,109 @@ for (const lineage of [false, true]) {
     }
   });
 }
+
+// Real tracking writes through the worker-only seam; no source-import authority for B.
+async function transformationFixture() {
+  const { displaced, replacement: s } = await rewritten();
+  await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: s, flaggedOIDs: [] });
+  const floor = git(bare, ...IDENT, "commit-tree", base + "^{tree}", "-m", "safe unrelated floor");
+  const bridge = await cache.bridgeToFloors(bare, s, [floor]);
+  assert.equal(bridge.kind, "built");
+  if (bridge.kind !== "built") throw Error("bridge not built");
+  return { s, b: bridge.sha, displaced, floor, context: { context: opts.context } };
+}
+const allowTransformation = { trusted: true, admit: async () => true };
+
+test("worker transformation: real bridge advances tracking while execution and provenance stay S", async () => {
+  const { s, b, displaced, context } = await transformationFixture();
+  await captureAdoption([displaced, s], s);
+  const before = raw(), pins = pinnedRefs().split("\n");
+  const origins = git(bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/");
+  const result = await cache.updateRemediationTrackingRef(bare, BRANCH, b, context, source(), s, {
+    trusted: true, admit: async input => {
+      assert.ok(Object.isFrozen(input));
+      assert.deepEqual(input, { barePath: bare, branch: BRANCH, ...source(), generation: 1,
+        sourceTip: s, trackingTip: s, candidateSha: b });
+      return true;
+    },
+  });
+  assert.equal(result.kind, "updated");
+  assert.equal(git(bare, "rev-parse", "refs/uzi-runner/" + BRANCH), b);
+  assert.equal(git(clone, "rev-parse", "HEAD"), s);
+  assert.equal(git(clone, "rev-parse", "HEAD^{tree}"), git(bare, "rev-parse", b + "^{tree}"));
+  assert.equal(raw(), before);
+  for (const pin of pins) assert.ok(pinnedRefs().split("\n").includes(pin));
+  assert.equal(git(bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes/"), origins);
+  assert.ok((await cache.enumerateOwedCandidates(bare, RUN)).some(c => c.sha === s));
+  const fresh = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  assert.equal((await fresh.readRuntimeRemediationRecovery(bare, BRANCH, source()))?.ownedTip, s);
+  assert.equal(await fresh.readRemediationRecovery(bare, BRANCH, source()), undefined);
+  // A second transform authenticates tracking H independently when H already differs from S.
+  const next = git(bare, ...IDENT, "commit-tree", s + "^{tree}", "-p", b, "-m", "next worker transform");
+  assert.equal((await fresh.updateRemediationTrackingRef(bare, BRANCH, next, context, source(), b,
+    allowTransformation)).kind, "updated");
+  assert.equal(raw(), before);
+});
+
+test("worker transformation: excluded merge history refuses even with trusted admission; generic update stays guarded", async () => {
+  const { s, displaced, context } = await transformationFixture();
+  const unsafe = await cache.bridgeToFloors(bare, s, [displaced]);
+  assert.equal(unsafe.kind, "built");
+  if (unsafe.kind !== "built") throw Error("unsafe bridge not built");
+  const before = raw(), pins = pinnedRefs();
+  let called = false;
+  await assert.rejects(cache.updateRemediationTrackingRef(bare, BRANCH, unsafe.sha, context, source(), s,
+    { trusted: true, admit: async () => { called = true; return true; } }), /excluded history/);
+  assert.equal(called, false);
+  await assert.rejects(cache.updateTrackingRef(bare, BRANCH, unsafe.sha, context), /remediation/);
+  assert.equal(git(bare, "rev-parse", "refs/uzi-runner/" + BRANCH), s);
+  assert.equal(raw(), before);
+  assert.equal(pinnedRefs(), pins);
+});
+
+test("worker transformation: exact source, claim, expected tracking and fresh admission are mandatory", async () => {
+  const { s, b, context } = await transformationFixture();
+  const before = raw(), pins = pinnedRefs();
+  const call = (options = context, identity = source(), expected = s, admission = allowTransformation) =>
+    cache.updateRemediationTrackingRef(bare, BRANCH, b, options, identity, expected, admission);
+  await assert.rejects(call(context, source(), s, { trusted: true, admit: async () => false }));
+  await assert.rejects(call(context, source(), s, { trusted: false, admit: async () => true }));
+  await assert.rejects(call(context, { ...source(), attemptId: undefined } as any));
+  await assert.rejects(call(context, { ...source(), attemptId: successorAttempt }));
+  await assert.rejects(call(context, source(), base));
+  await assert.rejects(call({ context: { ...opts.context as PositiveOwedCandidateContext, generation: 2 } }));
+  await assert.rejects(call(opts));
+  await assert.rejects(call(context, source(), s, { trusted: true, admit: async () => { throw Error("scan unavailable"); } }));
+  assert.equal(git(bare, "rev-parse", "refs/uzi-runner/" + BRANCH), s);
+  assert.equal(raw(), before);
+  assert.equal(pinnedRefs(), pins);
+});
+
+test("worker transformation: callback source or evidence changes and failed CAS cannot grant eligibility", async t => {
+  const { s, b, context } = await transformationFixture();
+  const before = raw(), pins = pinnedRefs();
+  await assert.rejects(cache.updateRemediationTrackingRef(bare, BRANCH, b, context, source(), s, {
+    trusted: true, admit: async () => { commit("changed during scan"); return true; },
+  }));
+  git(clone, "update-ref", "refs/heads/" + BRANCH, s);
+  await assert.rejects(cache.updateRemediationTrackingRef(bare, BRANCH, b, context, source(), s, {
+    trusted: true, admit: async () => {
+      const changed = journal(); changed.remediationRecovery.sequence++; write(changed); return true;
+    },
+  }));
+  write(JSON.parse(before));
+  assert.equal(git(bare, "rev-parse", "refs/uzi-runner/" + BRANCH), s);
+  assert.equal(pinnedRefs(), pins);
+  const internal = cache as any, run = internal.runGit.bind(cache);
+  t.mock.method(internal, "runGit", async (dir: string, args: string[]) => {
+    if (args[0] === "update-ref" && args[1] === "refs/uzi-runner/" + BRANCH) throw Error("CAS unavailable");
+    return run(dir, args);
+  });
+  assert.equal((await cache.updateRemediationTrackingRef(bare, BRANCH, b, context, source(), s,
+    allowTransformation)).kind, "not_updated");
+  assert.equal(git(bare, "rev-parse", "refs/uzi-runner/" + BRANCH), s);
+  assert.equal(raw(), before);
+  for (const pin of pins.split("\n")) assert.ok(pinnedRefs().split("\n").includes(pin));
+  assert.ok((await cache.enumerateOwedCandidates(bare, RUN)).some(c => c.sha === s));
+  await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, source()));
+});

@@ -5798,6 +5798,85 @@ export class GitCache {
     });
   }
 
+  /** Worker transformation only. Caller holds source-use authority; admission runs under the
+   * bare lock and must scan B's applicable merge history without reacquiring that lock.
+   * This preserves execution S and grants no release, publication, or source-import authority. */
+  async updateRemediationTrackingRef(barePath: string, branch: string, candidateSha: string,
+    opts: FetchAgentBranchOptions,
+    source: { runId: string; clonePath: string; attemptId: string }, expectedTrackingSha: string,
+    admission: { trusted: boolean; admit: (input: Readonly<{ barePath: string; branch: string;
+      runId: string; clonePath: string; attemptId: string; generation: number;
+      sourceTip: string; trackingTip: string; candidateSha: string }>) => Promise<boolean> }): Promise<TrackingUpdateResult> {
+    if (!opts || opts.producingSource !== undefined || opts.expectedCandidateSha !== undefined ||
+        opts.checkpointImportMode !== undefined) throw new Error("remediation transformation conflicts with source import");
+    opts = this.snapshotOwedOptions(opts);
+    source = { runId: source?.runId, clonePath: source?.clonePath, attemptId: source?.attemptId };
+    const trusted = admission?.trusted === true, admit = admission?.admit;
+    const c = opts.context;
+    if (!trusted || typeof admit !== "function" || !source.attemptId || !source.clonePath ||
+        source.runId !== c.runId || !Number.isSafeInteger(c.generation) || c.generation === null || c.generation <= 0 ||
+        !SHA40_RE.test(expectedTrackingSha)) throw new Error("remediation transformation identity or admission unavailable");
+    await this.validateOwedContext(barePath, branch, c);
+    this.validateConfirmedSha(opts.remotelyConfirmedSha);
+    await this.requireOwedCommit(barePath, candidateSha);
+    opts.checkpointStep?.("checkpoint_lock_wait");
+    return this.withLock(barePath, async () => {
+      opts.checkpointStep?.("checkpoint_bridge");
+      const read = () => this.readRemediationUnderLock(barePath, branch, source, {}, "runtime-restrictions");
+      const record = await read();
+      if (!record) throw new Error("remediation transformation requires enrollment");
+      const canonical = await this.readRecoveryCaptureRaw(barePath, branch);
+      const checkOwnership = async (sha: string) => {
+        const owned = await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId, sha, c.generation!);
+        if (owned.kind !== "owned" || this.contextName(owned.context) !== this.contextName(c))
+          throw new Error("remediation transformation tracking ownership changed");
+      };
+      await checkOwnership(expectedTrackingSha);
+      if (await this.ancestry(barePath, record.ownedTip, candidateSha) !== "ancestor")
+        throw new Error("remediation transformation does not cover source");
+      const tree = await this.revParse(barePath, `${record.ownedTip}^{tree}`);
+      if (!tree || await this.revParse(barePath, `${candidateSha}^{tree}`) !== tree)
+        throw new Error("remediation transformation changed source tree");
+      // The schema bounds both lists. Each root gets one positive proof; any failure
+      // blocks this transformation, with no retry or fallback admission.
+      for (const root of new Set([...record.flaggedOIDs, ...record.edges.map(e => e.from)])) {
+        await this.requireOwedCommit(barePath, root);
+        if (await this.ancestry(barePath, root, candidateSha) !== "divergent")
+          throw new Error("remediation transformation includes excluded history");
+      }
+      const input = Object.freeze({ barePath, branch, ...source, generation: c.generation!,
+        sourceTip: record.ownedTip, trackingTip: expectedTrackingSha, candidateSha });
+      if (await admit(input) !== true) throw new Error("remediation transformation candidate not admitted");
+      await this.validateOwedContext(barePath, branch, c);
+      const checked = await read();
+      if (!checked || JSON.stringify(checked) !== JSON.stringify(record) ||
+          await this.readRecoveryCaptureRaw(barePath, branch) !== canonical)
+        throw new Error("remediation transformation evidence changed");
+      await checkOwnership(expectedTrackingSha);
+      const observed = await this.observeTrackingUnderLock(barePath, branch);
+      if (!observed || observed.sha !== expectedTrackingSha || observed.owner?.context !== this.contextName(c) ||
+          observed.owner.runId !== c.runId || observed.owner.generation !== c.generation)
+        throw new Error("remediation transformation tracking changed");
+      this.checkCheckpointCooperation();
+      const result = await this.maskCheckpointCooperation(async () => {
+        // Preserve S independently even when a remote confirmation covers it. Promotion
+        // receives no producingSource, so it cannot rewrite the remediation journal.
+        await this.pinOwedUnderLock(c, record.ownedTip);
+        const promoted = await this.promoteTrackingUnderLock(barePath, branch, candidateSha, observed,
+          { ...opts, checkpointStep: undefined });
+        if (promoted.kind === "not_updated") return promoted;
+        await checkOwnership(candidateSha);
+        const recovered = await read();
+        if (!recovered || JSON.stringify(recovered) !== JSON.stringify(record) ||
+            await this.readRecoveryCaptureRaw(barePath, branch) !== canonical)
+          throw new Error("remediation transformation readback changed");
+        return promoted;
+      });
+      this.checkCheckpointCooperation();
+      return result;
+    });
+  }
+
   /** issue #1117: the CURRENT origin-tracking tip of `refs/remotes/origin/<branch>`,
    *  read WITHOUT fetching, or null when unresolvable. Mirrors {@link trackingTip} but for
    *  the origin mirror rather than the runner tracking ref. Used at the mr_rework finalize
