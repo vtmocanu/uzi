@@ -198,9 +198,17 @@ describe("CI-config guard: final push check", () => {
       return checks <= 2 ? real(...a) : [".github/workflows/late.yml"];
     });
     let pushes = 0;
-    t.mock.method(git, "pushBranch", async () => {
-      pushes++;
-      throw new Error("fatal: unable to access remote: Connection reset by peer");
+    // Inject below runGit so the production wrapper retains actual Git stderr for retry classification.
+    const wire = git as unknown as { execScoped(cmd: string, args: string[], ...rest: unknown[]): Promise<unknown> };
+    const exec = wire.execScoped.bind(git);
+    t.mock.method(wire, "execScoped", async (cmd, args, ...rest) => {
+      if (cmd === "git" && args.includes("push")) {
+        pushes++;
+        throw Object.assign(new Error("git push failed"), {
+          code: 128, stderr: "fatal: unable to access remote: Connection reset by peer",
+        });
+      }
+      return exec(cmd, args, ...rest);
     });
     const claim = guarded(4162);
     await runner(commitExec([{ write: "src/ok.ts" }]), gitlab).execute(claim);

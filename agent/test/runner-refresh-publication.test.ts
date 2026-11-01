@@ -425,16 +425,18 @@ describe("M2 refresh publication — real runner, scanner and push", () => {
         const rig = alignedCandidate(t);
         observations(rig.h.original, ["closing", "closing", final]);
         const f = forgeFor("github", rig.h.original);
-        const forward = git.pushBranch.bind(git);
+        const push = t.mock.method(git, "pushBranch");
+        const wire = git as unknown as { execScoped(cmd: string, args: string[], ...rest: unknown[]): Promise<unknown> };
+        const exec = wire.execScoped.bind(git);
         let failed = false;
-        const push = t.mock.method(git, "pushBranch", async (...args: Parameters<typeof forward>) => {
-          if (!failed) {
+        t.mock.method(wire, "execScoped", async (cmd, args, ...rest) => {
+          if (cmd === "git" && args.includes("push") && !failed) {
             failed = true;
             assert.equal(api.publicationContextRequests.length, 2);
             assert.equal(gitIn(fx.originPath, ["rev-parse", BRANCH]), rig.h.original);
-            throw new Error("connection reset");
+            throw Object.assign(new Error("git push failed"), { code: 128, stderr: "connection reset" });
           }
-          return forward(...args);
+          return exec(cmd, args, ...rest);
         });
         // Advance only the forge retry's one-second timer, leaving runner and HTTP timers real.
         const realTimeout = globalThis.setTimeout;
