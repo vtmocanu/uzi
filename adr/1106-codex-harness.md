@@ -1331,8 +1331,8 @@ The user contract is
   read taken before the shared lock, so if the last bindable pooled alias is
   un-pooled, disabled or unlinked in that window, a run with an implicit
   harness is refused with `codex_pool_unavailable` rather than falling back to
-  Claude. That usability race refuses rather than binding an un-pooled,
-  disabled or unlinked alias; it does not cover the quarantine and re-login
+  Claude. In that race creation refuses rather than binding an un-pooled,
+  disabled or unlinked alias; this does not cover the quarantine and re-login
   window above.
 - **Unusable pool.** With mode `auto` and pooled aliases but none structurally
   bindable, Codex is unusable: the default login is never used as a fallback.

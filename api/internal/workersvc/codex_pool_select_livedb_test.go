@@ -679,7 +679,7 @@ func TestCodexPoolUnusableReadersLiveDB(t *testing.T) {
 	}
 }
 
-// TestCodexPoolEmptyResolveHarnessForUserOnLiveDB: the transaction-bound reader over an EMPTY
+// TestCodexPoolEmptyResolveHarnessForUserOnLiveDB: the caller-queries reader over an EMPTY
 // pool keeps today's default-credential usability in both modes: a usable subscription or API-key
 // default resolves explicit Codex, and no Codex credential refuses without the pool error.
 func TestCodexPoolEmptyResolveHarnessForUserOnLiveDB(t *testing.T) {

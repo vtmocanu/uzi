@@ -192,10 +192,10 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			"Anthropic tokens: the selector also needs a fresh rate-limit reading for the\n" +
 			"token (the web settings page shows one per credential), and a change takes\n" +
 			"effect on the next claim: no restart, no new join token.\n\n" +
-			"Codex logins: the login is chosen when a run is created, from the most headroom\n" +
-			"among pooled logins; with no fresh reading it may still be picked (reason\n" +
-			"pool_stale). The choice is frozen on the run, so a change affects only runs\n" +
-			"created afterwards, never one already queued or running.\n\n" +
+			"Codex logins: the login is chosen when a run is created, from the pooled logins'\n" +
+			"rate-limit readings; when no pooled login has a fresh reading, one is still\n" +
+			"picked (reason pool_stale). The choice is frozen on the run, so a change affects\n" +
+			"only runs created afterwards, never one already queued or running.\n\n" +
 			"A label may exist as both an Anthropic token and a Codex login: pass --kind\n" +
 			"anthropic or --kind codex to say which. API keys (openai_api_key) cannot be pooled.",
 		Args: cobra.ExactArgs(1),
