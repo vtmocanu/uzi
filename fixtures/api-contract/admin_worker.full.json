@@ -5,7 +5,10 @@
       "cooled_until": "2020-01-02T03:04:05Z",
       "half_open_run_id": "x",
       "state": "x",
-      "detail": "x"
+      "detail": "x",
+      "surfaces": [
+        "x"
+      ]
     }
   ],
   "manual_cordoned_at": "2020-01-02T03:04:05Z",

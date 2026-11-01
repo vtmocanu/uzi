@@ -88,7 +88,14 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 	}
 
 	base, _ := n.baseURL(ctx)
+	// Issue #1324: a publication-phase forge park announces and stamps like a provider hold
+	// (post first, stamp only after a delivered post), under its own park kind.
+	pp := n.publicationParkOf(ctx, rc)
 	blocks, fallback := rootBlocks(rc, base)
+	if pp != nil && pp.hold {
+		blocks, fallback = rootBlocksLabelled(rc, base, "⚠️", "Needs your attention · publishing held")
+	}
+	announced := providerHold(rc) || pp != nil
 
 	existing, err := n.store.GetSlackRunMessage(ctx, ev.runID)
 	var anchor store.SlackRunMessage
@@ -112,8 +119,18 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 		// The first root announces the park (PRD #1116). Provider holds require a
 		// saved anchor before stamping delivery; other parks retain the legacy
 		// marker attempt even when the anchor write fails.
-		if !providerHold(rc) || uerr == nil {
-			n.recordLimitPause(ctx, rc)
+		switch {
+		case pp != nil:
+			// A publication park also carries its own thread line (the hold's reason), posted
+			// to the fresh root; the marker is stamped only after it is delivered.
+			tblocks, tfallback, _ := publicationThreadBlocks(rc, *pp, base)
+			if _, perr := n.poster.PostBlocks(ctx, channel, ts, tfallback, tblocks); perr != nil {
+				n.logf("post thread event", perr)
+			} else if uerr == nil {
+				n.recordLimitPause(ctx, rc, pp)
+			}
+		case !announced || uerr == nil:
+			n.recordLimitPause(ctx, rc, nil)
 		}
 	case err != nil:
 		n.logf("load anchor", err)
@@ -123,24 +140,34 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 		n.updateRoot(ctx, rc, existing, fallback, blocks)
 		// State events are serial, but can be late or repeated. The fetched hold and
 		// its status_since identify the announcement, rather than ev.status.
-		holdAnnounced := providerHold(rc) && existing.ParkKind.String == "paused" &&
-			existing.LimitPausedAt.Valid && rc.StatusSince.Valid &&
-			existing.LimitPausedAt.Time.Equal(rc.StatusSince.Time)
-		if tblocks, tfallback, tok := renderThreadBlocks(rc, base); tok && !holdAnnounced {
+		// A publication park is identified by its owner episode (pp.at), not status_since:
+		// each automatic retry re-parks with a fresh status_since.
+		announcedKind, announcedAt := "paused", rc.StatusSince
+		if pp != nil {
+			announcedKind, announcedAt = pp.kind(), pp.at
+		}
+		holdAnnounced := announced && existing.ParkKind.String == announcedKind &&
+			existing.LimitPausedAt.Valid && announcedAt.Valid &&
+			existing.LimitPausedAt.Time.Equal(announcedAt.Time)
+		tblocks, tfallback, tok := renderThreadBlocks(rc, base)
+		if pp != nil {
+			tblocks, tfallback, tok = publicationThreadBlocks(rc, *pp, base)
+		}
+		if tok && !holdAnnounced {
 			if _, perr := n.poster.PostBlocks(ctx, existing.ChannelID, existing.RootTs, tfallback, tblocks); perr != nil {
 				n.logf("post thread event", perr)
-			} else if providerHold(rc) {
-				// For provider holds, replace the prior marker only after delivery;
-				// a failed post stays retryable and a duplicate needs no write.
-				n.recordLimitPause(ctx, rc)
+			} else if announced {
+				// For provider holds and publication parks, replace the prior marker only
+				// after delivery; a failed post stays retryable and a duplicate needs no write.
+				n.recordLimitPause(ctx, rc, pp)
 			}
 		}
 		// Resume-then-progress: consume a PRIOR park's marker before the milestone
 		// line (PRD #1116). Nonprovider parks retain the legacy recordLimitPause
 		// call after handleLimitResume, including when their thread post fails.
 		n.handleLimitResume(ctx, rc, existing, base)
-		if !providerHold(rc) {
-			n.recordLimitPause(ctx, rc)
+		if !announced {
+			n.recordLimitPause(ctx, rc, nil)
 		}
 		n.handleMilestone(ctx, rc, existing)
 	}
@@ -163,15 +190,25 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 // It also records WHICH park this was in park_kind (PRD #1190) — the run's own status at the
 // park, guaranteed here to be "limit_wait" or "paused" — so handleLimitResume can word the
 // resume reply honestly (an owner pause never says "· usage limit cleared").
-func (n *Notifier) recordLimitPause(ctx context.Context, rc store.GetSlackRunContextRow) {
-	if rc.Status != "limit_wait" && rc.Status != "paused" {
+//
+// Issue #1324: a publication-phase forge park (pp non-nil) is recorded under park_kind
+// 'forge_publication' (timed wait) or 'forge_publication_hold' (owner hold), valued at the owner
+// episode's start rather than status_since, so automatic retries are not new parks. Only the hold
+// kind posts a resume line. The column has no CHECK, and forge parks without a publication phase
+// stay unrecorded.
+func (n *Notifier) recordLimitPause(ctx context.Context, rc store.GetSlackRunContextRow, pp *publicationPark) {
+	kind := rc.Status
+	at := rc.StatusSince
+	switch {
+	case pp != nil && rc.Status == "recovery_wait":
+		kind, at = pp.kind(), pp.at
+	case rc.Status != "limit_wait" && rc.Status != "paused":
 		return
 	}
-	at := rc.StatusSince
 	if !at.Valid {
 		at = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	}
-	if _, err := n.store.SetSlackRunLimitPause(ctx, store.SetSlackRunLimitPauseParams{RunID: rc.ID, At: at, ParkKind: pgconv.Text(rc.Status)}); err != nil {
+	if _, err := n.store.SetSlackRunLimitPause(ctx, store.SetSlackRunLimitPauseParams{RunID: rc.ID, At: at, ParkKind: pgconv.Text(kind)}); err != nil {
 		n.logf("record limit pause", err)
 	}
 }
@@ -198,6 +235,12 @@ func (n *Notifier) handleLimitResume(ctx context.Context, rc store.GetSlackRunCo
 	}
 	switch rc.Status {
 	case "running":
+		// A timed publication wait ends by automatic retry, which is not news: keep its marker
+		// (so a re-park of the same episode is not re-announced) and post nothing. Only an owner
+		// hold's Resume, recorded under the hold kind, posts the resume line.
+		if anchor.ParkKind.String == parkKindForgePublication {
+			return
+		}
 		waited := time.Since(anchor.LimitPausedAt.Time)
 		hasWait := waited >= 0 && waited <= maxPlausibleWait
 		// PRD #1247 M9 (D14): if a credential switch was APPLIED during THIS park cycle, name the
@@ -257,19 +300,25 @@ func resumeThreadBlocks(rc store.GetSlackRunContextRow, waited time.Duration, ha
 	if parkKind == "paused" {
 		header = "▶️ *Resumed*"
 	}
+	publication := isPublicationParkKind(parkKind)
+	if publication {
+		header = "▶️ *Resumed · publishing again*"
+	}
 	blocks = []slack.Block{threadSectionBlock(header)}
 
 	var detail strings.Builder
 	if hasWait {
 		detail.WriteString("waited " + humanWait(waited))
 	}
-	if rc.LimitWaitCount > 1 {
+	// The usage-limit pause count and the in-progress milestone describe model work; a
+	// publication retry does none, so neither is shown for it.
+	if rc.LimitWaitCount > 1 && !publication {
 		if detail.Len() > 0 {
 			detail.WriteString(" ")
 		}
 		fmt.Fprintf(&detail, "(pause %d)", rc.LimitWaitCount)
 	}
-	if title := inProgressTitle(rc); title != "" {
+	if title := inProgressTitle(rc); title != "" && !publication {
 		if detail.Len() > 0 {
 			detail.WriteString(" · ")
 		}
@@ -577,6 +626,13 @@ func anchorGateRevision(anchor store.SlackRunMessage) *int64 {
 // applies (Slack rejects an empty one).
 func rootBlocks(rc store.GetSlackRunContextRow, base string) (blocks []slack.Block, fallback string) {
 	emoji, label := statusGlyph(rc)
+	return rootBlocksLabelled(rc, base, emoji, label)
+}
+
+// rootBlocksLabelled is rootBlocks with the status glyph and label chosen by the caller. The
+// publication owner hold uses it to read "Needs your attention", like a provider hold, because
+// the phase that tells it from a timed wait is not on the context row statusGlyph sees.
+func rootBlocksLabelled(rc store.GetSlackRunContextRow, base, emoji, label string) (blocks []slack.Block, fallback string) {
 	repo := ScrubSecrets(EscapeMrkdwn(rc.PathWithNamespace))
 	title := ScrubSecrets(EscapeMrkdwn(rc.IssueTitle))
 
@@ -831,6 +887,11 @@ func inProgressTitle(rc store.GetSlackRunContextRow) string {
 //     posted elsewhere), and the per-run bound is now 2 × RUN_LIMIT_MAX_WAITS: one
 //     pause line + one resume line per episode. The thread reads pause → resume →
 //     (maybe) pause → resume, never a stream.
+//
+// A publication-phase forge park (issue #1324) keeps both properties by a different key: its
+// parks are not counted by RUN_LIMIT_MAX_WAITS and every automatic retry re-parks, so it is
+// announced once per owner episode (publication_wait_started_at), a hold once per hold, and only
+// an owner Resume of a hold posts a resume line (see recordLimitPause and handleLimitResume).
 //
 // The worker-originated failure reason is untrusted free text with no source-side
 // length bound, so it is ScrubSecrets'd, whole-blob EscapeMrkdwn'd, and length-bounded

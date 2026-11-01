@@ -554,7 +554,7 @@ export function Dashboard() {
                     ) : (
                       <RunHealthBadge run={r} nowMs={now} />
                     )}
-                    <StatusPill health={r.health} status={effectiveRunStatus(r)} progress={r.progress} recovery_wait_cause={r.recovery_wait_cause} recovery_retry_not_before={r.recovery_retry_not_before} />
+                    <StatusPill health={r.health} status={effectiveRunStatus(r)} progress={r.progress} recovery_wait_cause={r.recovery_wait_cause} recovery_retry_not_before={r.recovery_retry_not_before} recovery_wait_phase={r.recovery_wait_phase} />
                   </div>
                 </div>
               </li>

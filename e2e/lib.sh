@@ -859,6 +859,43 @@ forge_owner_hold_ready() {
   printf '%s' "$view" | jq -r '.status=="recovery_wait" and .cause=="forge_unreachable" and .retry==null'
 }
 
+# Publication-phase forge park (issue #1324), read through the public run DTO. A timed park
+# stamps a retry; the owner hold clears it and names publication_retry_exhausted. Poll these
+# through wait_eq (they print true/false). A terminal run prints a FAIL line that wait_eq
+# reports at its timeout (fail only exits wait_eq's subshell, so it does not abort early).
+publication_park_ready() {
+  local view
+  view="$(apiget "/api/runs/$1")"
+  printf '%s' "$view" | jq -e '.run.status=="failed" or .run.status=="cancelled"' >/dev/null \
+    && fail "publication park unexpectedly terminal: $view"
+  printf '%s' "$view" | jq -r '.run.status=="recovery_wait" and .run.recovery_wait_cause=="forge_unreachable"
+    and .run.recovery_wait_phase=="publication" and .run.recovery_retry_not_before!=null
+    and (.run.publication_hold_reason // null)==null'
+}
+publication_hold_ready() {
+  local view
+  view="$(apiget "/api/runs/$1")"
+  printf '%s' "$view" | jq -e '.run.status=="failed" or .run.status=="cancelled"' >/dev/null \
+    && fail "publication hold unexpectedly terminal: $view"
+  printf '%s' "$view" | jq -r '.run.status=="recovery_wait" and .run.recovery_wait_phase=="publication"
+    and .run.recovery_retry_not_before==null and .run.publication_hold_reason=="publication_retry_exhausted"'
+}
+
+# run_executor_runs RUN — how many times the stub executor ran for the run: it emits exactly one
+# "stub work committed locally" message per execution, and a publication-only flight never runs
+# the executor, so this count must not move across a publication park or resume.
+run_executor_runs() {
+  apiget "/api/runs/$1/messages" \
+    | jq '[.messages[] | select(.kind=="text" and ((.payload.text // "") == "stub work committed locally"))] | length'
+}
+
+# fake_fault_create_mr STATUS COUNT — make the fake forge answer the next COUNT merge/pull-request
+# CREATE calls (GitLab, Forgejo and GitHub routes) with STATUS. fake_clear_create_mr_fault drops it.
+fake_fault_create_mr() {
+  fake_post /_e2e/faults "$(jq -nc --argjson s "$1" --argjson c "$2" '{surface:"create-mr",status:$s,count:$c}')" >/dev/null
+}
+fake_clear_create_mr_fault() { fake_post /_e2e/faults '{"surface":"create-mr","count":0}' >/dev/null; }
+
 # wait_status RUN WANT [TIMEOUT] — poll a run until it reaches WANT; abort early
 # if it lands in an unexpected terminal state.
 wait_status() {

@@ -26,6 +26,9 @@ type NotifierStore interface {
 	// GetLatestPlanCrossCheckSummary backs the one-line gated plan cross-check outcome
 	// on the gate card (PRD #3708). No row = not checked.
 	GetLatestPlanCrossCheckSummary(ctx context.Context, arg store.GetLatestPlanCrossCheckSummaryParams) (store.GetLatestPlanCrossCheckSummaryRow, error)
+	// GetActivePublicationResume reads the run's active publication intent (issue #1324): the
+	// notifier takes a publication park's hold reason from it. No row (pgx.ErrNoRows) = none.
+	GetActivePublicationResume(ctx context.Context, runID uuid.UUID) (store.RunPublicationResume, error)
 	// GetSlackChatContext is the repo-less context for a CHAT run (PRD #191 M2b): the
 	// notifier falls back to it on the run-context ErrNoRows so a Slack-anchored chat's
 	// terminal transitions reach the DM. A non-chat id returns ErrNoRows.

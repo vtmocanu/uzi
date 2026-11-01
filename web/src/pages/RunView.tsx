@@ -39,7 +39,7 @@ import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useNow } from "../lib/useNow";
 import { useMaintenance } from "../lib/useMaintenance";
 import { ForgeOriginStatus } from "../components/ForgeOriginStatus";
-import { forgeWaitMode, forgeWaitLabel } from "../lib/forgeCooldown";
+import { forgeWaitMode, forgeWaitLabel, forgeWaitPhase, publicationHoldCopy } from "../lib/forgeCooldown";
 import { credentialSwitchHold } from "../lib/credentialSwitchHold";
 import {
   effectiveRunStatus,
@@ -69,7 +69,7 @@ import { latestActivity } from "../lib/runActivity";
 import { stageForMessages } from "../lib/runStage";
 import { PlainMarkdownExcerpt } from "../components/PlainMarkdownExcerpt";
 import { RunProgressCard, runProgressCardVisible } from "../components/RunProgressCard";
-import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
+import { forgeNounLower, forgeNounSentence, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { pauseOrigin, type PauseOrigin } from "../lib/pauseOrigin";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage, hasSideUsage } from "../lib/runUsage";
@@ -1600,6 +1600,80 @@ function BaseAttestationHoldPanel({ run, ownerProof = false, busy = false, onCan
   </Card>;
 }
 
+// The screen-reader sentence for a `publication:<mode>:<reason>` park key (parkAnnounce).
+function publicationAnnounce(parkKey: string): string {
+  const [, mode, ...rest] = parkKey.split(":");
+  const reason = rest.join(":");
+  const why = reason ? ` ${publicationHoldCopy(reason)}` : "";
+  return mode === "held"
+    ? `Publishing is held and needs your decision.${why} Only the run owner can Resume or Cancel. There is no scheduled retry. Resume starts a new publication-only attempt with no model work; it does not promise execution.`
+    : mode === "timed"
+      ? `Publishing is paused because the forge was unreachable.${why} It retries automatically after the scheduled time, including when already due; no model work runs.`
+      : `Publishing is paused because the forge was unreachable.${why} Retry timing is unavailable. An owner hold or automatic retry date cannot be inferred.`;
+}
+
+/**
+ * Issue #1324: the body of a publication-phase forge park. The run finished its work and
+ * is publishing it; the forge was unreachable. Resume starts a new publication-only attempt
+ * (no model work, no other budget). The forge park count is deliberately not shown: it is
+ * the pre-clone forge budget, not a publication limit. Nothing here promises execution.
+ */
+function PublicationParkBody({ run, mode, retryAt, ownerProof, busy, onResume, onCancel }: {
+  run: Run; mode: ReturnType<typeof forgeWaitMode>; retryAt: string | null;
+  ownerProof: boolean; busy: boolean; onResume?: () => void; onCancel?: () => void;
+}) {
+  const now = useNow(mode === "timed" ? 1000 : null);
+  const intent = run.publication_intent;
+  const reason = run.publication_hold_reason;
+  const startedMs = run.publication_wait_started_at ? Date.parse(run.publication_wait_started_at) : NaN;
+  const limit = run.publication_wait_limit_seconds;
+  const limitText = typeof limit === "number" && limit > 0 ? formatElapsed(limit * 1000) : null;
+  const target = intent
+    ? intent.mr_iid != null
+      ? `${forgeNounSentence(run.forge_type)} ${mrRefSymbol(run.forge_type)}${intent.mr_iid}`
+      : `Branch ${sanitizeLabel(intent.branch)}`
+    : null;
+  const held = mode === "held";
+  return (
+    <>
+      <p className="mt-0.5 text-xs text-muted">
+        {held
+          ? "Publishing is on hold. This owner hold has no scheduled retry. Only the run owner can Resume or Cancel."
+          : mode === "timed"
+            ? "The forge was unreachable while publishing the finished work. Publication retries automatically after the scheduled time, including when already due; a due retry may still be waiting for admission."
+            : "The forge was unreachable while publishing. Retry timing is unavailable; this does not establish an owner hold or an automatic retry date."}
+      </p>
+      {reason && <p className="mt-1.5 text-xs text-muted">{publicationHoldCopy(reason)}</p>}
+      {mode === "timed" && retryAt && <p className="mt-1.5 text-xs text-muted">Retry at {retryAt}.</p>}
+      {!held && (
+        <p className="mt-1.5 text-xs text-muted">
+          {Number.isFinite(startedMs)
+            ? `Waiting ${formatElapsed(now - startedMs)} of ${limitText ? `a ${limitText} limit` : "no limit"}.`
+            : limitText ? `Wait limit: ${limitText}. Wait start unavailable.` : "No wait limit. Wait start unavailable."}
+        </p>
+      )}
+      {held && limitText && <p className="mt-1.5 text-xs text-muted">Wait limit: {limitText}.</p>}
+      {target && <p className="mt-1.5 text-xs text-muted">Publishing to: {target}.</p>}
+      {/* True only for a timed wait and a retry-exhausted hold. The source-unavailable,
+          custodian-unavailable and model-required holds contradict it, and an unknown or
+          absent reason cannot establish it. */}
+      {(mode === "timed" || reason === "publication_retry_exhausted") && (
+        <p className="mt-1.5 text-xs text-muted">
+          The work is kept on its worker. Publication resumes without running the model again.
+        </p>
+      )}
+      {held && <>
+        <p className="mt-1.5 text-xs text-muted">Resume starts a new publication-only attempt with no model work and no other budget; it does not promise execution. Admission limits may still block it. Cancel ends the run.</p>
+        {run.health_reason && <p className="mt-1.5 text-xs text-muted">Admission: {displayHealthReason(run)}</p>}
+        {ownerProof ? <div className="mt-3 flex flex-wrap gap-2">
+          <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+          <Button size="sm" variant="ghost" disabled={busy} onClick={onCancel}>Cancel</Button>
+        </div> : <p className="mt-1.5 text-xs text-muted">Only the confirmed run owner can Resume or Cancel.</p>}
+      </>}
+    </>
+  );
+}
+
 export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onResume = () => {}, onCancel = () => {} }: {
   run: Run;
   ownerProof?: boolean;
@@ -1621,6 +1695,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
   const providerPark = run.recovery_wait_cause === "provider_outage";
   const forgePark = run.recovery_wait_cause === "forge_unreachable";
   const forgeMode = forgeWaitMode(run);
+  const publicationPark = forgeWaitPhase(run) === "publication";
   // Issue #1766: a vault_locked park waits for the run owner's vault to be unlocked; it
   // explicit unlock queues it promptly, and the timer remains the fallback (#1792).
   const vaultPark = run.recovery_wait_cause === "vault_locked";
@@ -1686,6 +1761,8 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
             Provider outage: {run.provider_park_count} parks. Streak started: {run.provider_park_streak_started_at ?? "unknown"}.
             {" "}{retryAt ? `Next retry at ${retryAt}.` : "Next retry time unavailable."} Retries automatically. If a provider recovery bound is enabled and reached, the run enters an owner hold.
           </p>
+        ) : forgePark && publicationPark ? (
+          <PublicationParkBody run={run} mode={forgeMode} retryAt={retryAt} ownerProof={ownerProof} busy={busy} onResume={onResume} onCancel={onCancel} />
         ) : forgePark ? (
           <>
             <p className="mt-0.5 text-xs text-muted">
@@ -1695,6 +1772,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
                   ? "The forge was unreachable. Retries automatically after the scheduled time, including when already due; a due retry may still be waiting for admission."
                   : "The forge was unreachable. Retry timing is unavailable; this does not establish an owner hold or an automatic retry date."}
             </p>
+            {forgeWaitPhase(run) === "other" && <p className="mt-1.5 text-xs text-muted">Recovery phase: {sanitizeLabel(String(run.recovery_wait_phase))} (not recognised by this page).</p>}
             <p className="mt-1.5 text-xs text-muted">
               {retryAt ? `Retry at ${retryAt}. ` : ""}Forge parks: {parkLabel}. The count and allowance are unchanged by Resume.
             </p>
@@ -2313,7 +2391,9 @@ export function RunView() {
                   run.recovery_wait_cause === "data_volume_full"
                   ? "data_volume_full"
                   : run.recovery_wait_cause === "forge_unreachable"
-                    ? `forge:${forgeWaitMode(run)}`
+                    ? forgeWaitPhase(run) === "publication"
+                      ? `publication:${forgeWaitMode(run)}:${run.publication_hold_reason ?? ""}`
+                      : `forge:${forgeWaitMode(run)}`
                   : run.recovery_wait_cause === "provider_outage"
                     ? "provider_outage"
                   : (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed")
@@ -2367,6 +2447,8 @@ export function RunView() {
             ? "Worker memory pressure. Only the run owner can resume or cancel this hold. Resume starts a fresh memory episode. There is no scheduled retry."
           : parkKey === "provider_outage"
             ? "The provider is unavailable. Retries automatically. If a provider recovery bound is enabled and reached, the run enters an owner hold."
+          : parkKey.startsWith("publication:")
+            ? publicationAnnounce(parkKey)
           : parkKey === "forge:held"
             ? "Forge recovery needs your decision. Only the run owner can Resume or Cancel. There is no scheduled retry. Resume permits one bounded ordinary attempt without promising execution or resetting counts, custody or grants."
           : parkKey === "forge:timed"
@@ -2534,7 +2616,7 @@ export function RunView() {
               <span ref={statusRef} tabIndex={-1} className="rounded-md focus-visible:ring-2 focus-visible:ring-brand/60 focus:outline-none">
                 {pillStatus === "provider_unavailable" || pillStatus === "provider_outage"
                   ? <Badge tone="warning" dot>{parkLabel(run)}</Badge>
-                  : <StatusPill health={run.health} status={pillStatus} recovery_wait_cause={run.recovery_wait_cause} recovery_retry_not_before={run.recovery_retry_not_before} />}
+                  : <StatusPill health={run.health} status={pillStatus} recovery_wait_cause={run.recovery_wait_cause} recovery_retry_not_before={run.recovery_retry_not_before} recovery_wait_phase={run.recovery_wait_phase} />}
               </span>
               {/* PRD #320 M6: the queue-priority pill + the owner's Expedite/undo action.
                   Both are QUEUED-ONLY (the pill self-hides on any other status; the action

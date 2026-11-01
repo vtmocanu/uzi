@@ -180,6 +180,9 @@ func (tx *crossCheckBoundaryTx) QueryRow(_ context.Context, sql string, args ...
 		// Default boundary fixtures are structural. Semantic fixtures retain
 		// their explicit query override above; no missing query is generalized.
 		return crossCheckBoundaryRow{err: pgx.ErrNoRows}
+	case strings.HasPrefix(sql, "-- name: GetActivePublicationResume"):
+		// The boundary fixtures are not publication-enrolled.
+		return crossCheckBoundaryRow{err: pgx.ErrNoRows}
 	case strings.HasPrefix(sql, "-- name: GetPlanCrossCheck"):
 		return crossCheckBoundaryRow{value: tx.check, err: tx.checkErr}
 	default:
@@ -190,6 +193,11 @@ func (tx *crossCheckBoundaryTx) QueryRow(_ context.Context, sql string, args ...
 func (tx *crossCheckBoundaryTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	if sql == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED" {
 		return pgconn.NewCommandTag("SET"), nil
+	}
+	// The fenced state write opts into the run-row fences unconditionally (issue #1324); it is a
+	// transaction-local setting, not a run write.
+	if strings.HasPrefix(sql, "-- name: OptInRunFences") {
+		return pgconn.NewCommandTag("SELECT 1"), nil
 	}
 	if tx.exec != nil {
 		return tx.exec(sql, args)

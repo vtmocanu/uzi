@@ -1697,6 +1697,10 @@ type Params struct {
 	// It gates step A only (held_publish.go). The zero value is off; the default-on lives in
 	// config.go where the env is read.
 	HeldPublication bool
+
+	// PublicationResume (issue #1324, RUN_PUBLICATION_RESUME_ENABLED) carries
+	// config.Config.PublicationResume. It gates NEW enrollment only; the zero value refuses it.
+	PublicationResume bool
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -2533,6 +2537,8 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	}
 	// Issue #1742: the attested finalize list, validated independently of the active list.
 	finalize, finalizeOK := s.validateFinalizeResume(wkr, snapshot)
+	// Issue #1324 D6: a run attested as a publication resume is never a finalize resume.
+	finalize, finalizeOK = s.withoutPublicationResume(wkr, snapshot, finalize, finalizeOK)
 	finalizeOffered := 0
 	if snapshot != nil {
 		finalizeOffered = len(snapshot.FinalizeResume)
@@ -2950,7 +2956,7 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 			return store.Worker{}, err
 		}
 		maxRequeues := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
-		if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+		if err := optInRunFences(ctx, qtx, updated.ID, true); err != nil {
 			return store.Worker{}, err
 		}
 		readopted, err = qtx.FrozenReadoptRunsFromSnapshot(ctx, store.FrozenReadoptRunsFromSnapshotParams{WorkerID: updated.ID, FrozenTargets: frozen, LockedParentIds: parents})
@@ -3511,6 +3517,9 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		if s.txBeginner != nil {
 			return s.claimRunLeasedNoSnapshot(ctx, wkr, params, report)
 		}
+		// This claim runs outside a transaction and cannot set the publication-resume opt-in
+		// guard_publication_resume requires, so it never selects a run with an active intent.
+		params.SkipPublicationResume = true
 		run, err := s.q.ClaimRun(ctx, params)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -4268,6 +4277,20 @@ type StateRequest struct {
 	// Absent (nil) on every non-recovery_wait report and on a legacy worker's empty-turn park. httpx.DecodeJSON rejects unknown fields, so this field MUST
 	// exist here or a new worker's report 400s.
 	RecoveryCause *string `json:"recovery_cause"`
+	// RecoveryPhase, PublicationSurface, PublicationStep and HandoffCheckpointTip (issue #1324)
+	// type a forge_unreachable park that happened while publishing: phase "publication", the
+	// surface that failed (git|api), the step (floor_refresh|push|mr_create), and optionally the
+	// published checkpoint tip a peer may resume from. Validated by validatePublicationPark;
+	// httpx.DecodeJSON rejects unknown fields, so they MUST exist here.
+	RecoveryPhase        *string `json:"recovery_phase,omitempty"`
+	PublicationSurface   *string `json:"publication_surface,omitempty"`
+	PublicationStep      *string `json:"publication_step,omitempty"`
+	HandoffCheckpointTip *string `json:"handoff_checkpoint_tip,omitempty"`
+	// PublicationHoldReason types a publication-only resume that cannot publish without model work
+	// or source: a NULL-stamp owner hold (never a failure, never a custody release) with one of
+	// publicationWorkerHoldReasons as the side row's hold_reason. Validated by
+	// validatePublicationPark; absent on every other report.
+	PublicationHoldReason *string `json:"publication_hold_reason,omitempty"`
 	// PresentationID is the worker-minted identity of the gate presentation an
 	// `awaiting_approval` report publishes (PRD #1795 M1, D1). A new id allocates the run's next
 	// gate revision; the run's CURRENT id with an unchanged approval-relevant payload is an
@@ -4457,6 +4480,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		return store.Run{}, false, err
 	}
 	if err := validateProviderPark(req); err != nil {
+		return store.Run{}, false, err
+	}
+	if err := validatePublicationPark(req); err != nil {
 		return store.Run{}, false, err
 	}
 	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
@@ -4679,7 +4705,14 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// Completed publication and ephemeral leasing serialize on the worker before the run.
 		// Keep leasing conditional on an ephemeral terminal report with the lease enabled.
 		leaseFence = req.ClaimGeneration != nil && s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed")
-		if len(owned.CheckpointCoordinates) > 0 || leaseFence || completedPublicationCapable(wkr, req) || req.SourcePublication != nil {
+		// A publication-enrolled run's authority writes (owner, generation, claim) need the
+		// worker locked before the run row; the enrollment is read before the run lock.
+		pubEnrolled, perr := publicationEnrolled(ctx, qtx, runID)
+		if perr != nil {
+			return store.Run{}, false, perr
+		}
+		workerLocked := len(owned.CheckpointCoordinates) > 0 || leaseFence || pubEnrolled || completedPublicationCapable(wkr, req) || req.SourcePublication != nil
+		if workerLocked {
 			if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 				if errors.Is(werr, pgx.ErrNoRows) {
 					return store.Run{}, false, ErrRunNotOwned // the worker row is gone: the run left it
@@ -4687,8 +4720,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, werr
 			}
 		}
-		if len(owned.CheckpointCoordinates) > 0 {
-			if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+		// The opt-ins are set only after the worker lock: without it the 00352 checkpoint fence and
+		// the publication fence stay closed and refuse a wrong-lock-order authority write.
+		if workerLocked {
+			if err := optInRunFences(ctx, qtx, wkr.ID, true); err != nil {
 				return store.Run{}, false, err
 			}
 		}
@@ -4700,6 +4735,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, ErrRunNotOwned
 			}
 			return store.Run{}, false, lerr
+		}
+		if err := recheckPublicationEnrollment(ctx, qtx, runID, workerLocked); err != nil {
+			return store.Run{}, false, err
 		}
 		reconciled, rerr := reconciliationExists(ctx, tx, runID)
 		if rerr != nil {
@@ -4783,13 +4821,18 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		fenceTx = tx
 		qtx := store.New(tx)
-		if len(owned.CheckpointCoordinates) > 0 {
+		pubEnrolled, perr := publicationEnrolled(ctx, qtx, runID)
+		if perr != nil {
+			return store.Run{}, false, perr
+		}
+		workerLocked := len(owned.CheckpointCoordinates) > 0 || pubEnrolled
+		if workerLocked {
 			if _, err := qtx.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
 				return store.Run{}, false, err
 			}
 		}
-		if len(owned.CheckpointCoordinates) > 0 {
-			if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+		if workerLocked {
+			if err := optInRunFences(ctx, qtx, wkr.ID, true); err != nil {
 				return store.Run{}, false, err
 			}
 		}
@@ -4799,6 +4842,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, ErrRunNotOwned
 			}
 			return store.Run{}, false, lerr
+		}
+		if err := recheckPublicationEnrollment(ctx, qtx, runID, workerLocked); err != nil {
+			return store.Run{}, false, err
 		}
 		owned = locked
 		q = qtx
@@ -8366,9 +8412,12 @@ type SweepResult struct {
 	// incapable, or unresponsive past the grace (PRD #1497 M1, D5). Set from the ParkRunsAtWall row
 	// count. These transition to paused (hold_reason='budget_exhausted') and are fanned out via
 	// publishSwept; they are NOT enqueued to the judge (the run is not finished).
-	WallParked         int64
-	StaleFailed        int64
-	StaleRequeued      int64
+	WallParked    int64
+	StaleFailed   int64
+	StaleRequeued int64
+	// PublicationHeld is the number of queued runs moved to an owner hold because their
+	// publication custodian worker cannot serve them (issue #1324 D5).
+	PublicationHeld    int64
 	ChatIdleCompleted  int64
 	ProposalsRecovered int64
 	// HealthChanged is the number of runs whose health flag the detector wrote this
