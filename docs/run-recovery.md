@@ -842,7 +842,7 @@ saved FINAL and retries.
 | 409 | `manifest_conflict` | Unsupported configuration or binding (knob off, no `github`, capability missing, closure not pinned for this exact capture, expired or mismatched capture); unchanged from the prerequisite-free path. |
 | 409 | `prerequisite_pin_missing` | The pin ref was cleanly listed as absent and the absence is recorded. |
 | 409 | `prerequisite_pin_foreign` | The pin ref is listed at a different tip. |
-| 403 | `not_authorized` | The precheck, or the locked release after the listing, found no hold, run or capture for this worker, or the hold or run is not eligible, or the capture belongs to another hold or worker. A 403 from the locked release has already been charged an admission. |
+| 403 | `not_authorized` | The precheck, a re-precheck after a lost reservation, or the locked release found no hold, run or capture for this worker, or the hold or run is not eligible, or the capture belongs to another hold or worker. A 403 returned after admission (the re-precheck or the locked release) has already been charged. |
 | 400 | `bad_request` | The server's configured ready retention is under one second (a configuration fault, not a request fault). |
 | 503 | `prerequisite_pin_unavailable` | The listing failed or timed out, the limiter refused, a lock wait or deadline ran out, or a newer reservation superseded this one. Retry shortly. |
 

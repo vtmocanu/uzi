@@ -6564,6 +6564,41 @@ it("#3727 M3 retained claim evaluates only grants 1 and 4, and execution still b
   }
 });
 
+it("#3727 M3 composed: a retained claim captures during execution, then the ordinary frozen pass finalizes the same capture", async () => {
+  const f = await fixture(true);
+  try {
+    closureHarness(f, { features: CLOSURE_ONLY });
+    let executing = true;
+    const c = f.make(true, undefined, undefined, undefined, { isExecuting: () => executing });
+    const record = await f.freeze();
+    assert.ok(record);
+    // (1) Execution: capture and upload happen, but no FINAL is minted or sent.
+    await c.captureAndUpload({ record, barePath: f.context.barePath, defaultBranch: "main", closureMint: "retained_claim" });
+    const captured = (await c.inspect("run-1"))[0]!;
+    assert.equal(captured.state, "uploaded");
+    assert.equal(f.finals.length, 0, "no FINAL during execution");
+    assert.equal(captured.finalRequest, undefined);
+    assert.equal(captured.finalAcknowledged, undefined);
+    assert.ok(captured.captureId);
+    assert.equal(captured.selfContained, false);
+    const producedBefore = f.state.produced;
+    const uploadsBefore = f.state.uploads;
+    assert.equal(producedBefore, 1);
+    assert.equal(uploadsBefore, 1);
+    // (2) The generation ends; the ordinary frozen pass finalizes the same server capture.
+    executing = false;
+    await c.operateFrozenInventory({ record, barePath: f.context.barePath, defaultBranch: "main" });
+    const after = (await c.inspect("run-1"))[0]!;
+    assert.equal(f.finals.length, 1);
+    assert.equal((f.finals[0]![3] as RecoveryFinalDisposition).kind, "archive");
+    assert.equal(after.captureId, captured.captureId, "the same server capture is finalized");
+    // (3) The FINAL is acknowledged with no re-capture or re-upload.
+    assert.equal(after.finalAcknowledged, true);
+    assert.equal(f.state.produced, producedBefore);
+    assert.equal(f.state.uploads, uploadsBefore);
+  } finally { await f.close(); }
+});
+
 it("#3727 M3 a retained-claim capture that is not executing and held-v2 metadata is missing mints (grant 1)", async () => {
   const f = await fixture(true);
   try {
