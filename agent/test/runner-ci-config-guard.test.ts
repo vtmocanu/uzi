@@ -201,7 +201,7 @@ describe("CI-config guard: final push check", () => {
     // Inject below runGit so the production wrapper retains actual Git stderr for retry classification.
     const wire = git as unknown as { execScoped(cmd: string, args: string[], ...rest: unknown[]): Promise<unknown> };
     const exec = wire.execScoped.bind(git);
-    t.mock.method(wire, "execScoped", async (cmd, args, ...rest) => {
+    t.mock.method(wire, "execScoped", async (cmd: string, args: string[], ...rest: unknown[]) => {
       if (cmd === "git" && args.includes("push")) {
         pushes++;
         throw Object.assign(new Error("git push failed"), {

@@ -429,7 +429,7 @@ describe("M2 refresh publication — real runner, scanner and push", () => {
         const wire = git as unknown as { execScoped(cmd: string, args: string[], ...rest: unknown[]): Promise<unknown> };
         const exec = wire.execScoped.bind(git);
         let failed = false;
-        t.mock.method(wire, "execScoped", async (cmd, args, ...rest) => {
+        t.mock.method(wire, "execScoped", async (cmd: string, args: string[], ...rest: unknown[]) => {
           if (cmd === "git" && args.includes("push") && !failed) {
             failed = true;
             assert.equal(api.publicationContextRequests.length, 2);
