@@ -686,9 +686,12 @@ original head to land.
 ## Prerequisite pins: API lifecycle, release still disabled
 
 C1b (#3591) implements the API pin lifecycle for qualifying new thin captures.
-It does **not** advertise `recovery_prerequisite_closure_v1`, change the agent,
-or permit a thin archive FINAL. Even a `pinned` response retains the existing
-custody and local-source rules. C2 owns release; C3 owns owner/CLI pin visibility.
+The API advertises `recovery_prerequisite_closure_v1` on register and heartbeat
+responses only while `UZI_PREREQUISITE_CLOSURE_FORGES` contains `github`, the
+closure FINAL port is wired and the per-worker admission limiter is wired (the one
+predicate that also gates a closure-backed archive FINAL); it is computed per
+response, never cached at boot. A `pinned` response alone does not release custody.
+C2 owns release; C3 owns owner/CLI pin visibility.
 The parent #2506 remains active. See [ADR-3591](../adr/3591-prerequisite-closure.md)
 for the implementation and local evidence boundaries.
 
@@ -699,7 +702,7 @@ available. It requires an open inventory-guarded hold, a bound manifest with
 1–64 prerequisites, the original authenticated uploading worker's registered
 `recovery_prerequisite_closure_v1` capability, and the configured reviewed
 forge strategy. Existing available receipts, upload retries and sweeps do not
-backfill rows. The current agent does not advertise this capability.
+backfill rows.
 
 `UZI_PREREQUISITE_CLOSURE_FORGES` defaults to empty. Its parser accepts
 comma-separated `github`, `gitlab`, and `forgejo` (trimmed, lowercased,

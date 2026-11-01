@@ -23,14 +23,14 @@ import (
 // recovery_completed_publication_v1 beside the recovery inventory feature, and issue #2625 adds
 // recovery_archive_redundancy_v1 right after it (the api accepts the archive redundancy claim).
 func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
-	got := protocolFeatures(true, true)
+	got := protocolFeatures(true, true, false)
 	want := []string{"forge_clone_success_v1", "capability_inference_evidence_v1", "heartbeat_protocol_refresh_v1", "codex_account_admission_signal_v1", "codex_account_operation_admission_v1", "completion_non_closing_v1", "refresh_publication_context_v1", "completion_semantic_publication_v1", "dind_maintenance_v1", "worker_memory_pressure_v1", "worker_memory_authority_claim_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "plan_revision_retry_v1", "recovery_cause_codex_idle_stall_v1", "recovery_cause_retained_recovery_exhausted", "recovery_cause_retained_recovery_adoption_failed", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "credential_switch_hold", "active_run_snapshot", "recovery_held_publication_v1", "recovery_held_publication_v2"}
 	if !slices.Equal(got, want) {
-		t.Fatalf("protocolFeatures(true, true) = %v, want exactly %v", got, want)
+		t.Fatalf("protocolFeatures(true, true, false) = %v, want exactly %v", got, want)
 	}
 	// Fresh slice: a caller mutating the result must not corrupt the advertised set.
 	got[0] = "clobbered"
-	if protocolFeatures(true, true)[0] == "clobbered" {
+	if protocolFeatures(true, true, false)[0] == "clobbered" {
 		t.Fatal("protocolFeatures returns an aliasable view; it must return a fresh slice")
 	}
 }
@@ -39,7 +39,7 @@ func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 // with UZI_ACTIVE_SNAPSHOT_DISABLED omits active_run_snapshot from the advertised set (so a
 // worker never sends the snapshot) while every other landed token stays exactly as it was.
 func TestProtocolFeaturesOmitsSnapshotWhenDisabled(t *testing.T) {
-	got := protocolFeatures(false, true)
+	got := protocolFeatures(false, true, false)
 	want := []string{"forge_clone_success_v1", "capability_inference_evidence_v1", "heartbeat_protocol_refresh_v1", "codex_account_admission_signal_v1", "codex_account_operation_admission_v1", "completion_non_closing_v1", "refresh_publication_context_v1", "completion_semantic_publication_v1", "dind_maintenance_v1", "worker_memory_pressure_v1", "worker_memory_authority_claim_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "plan_revision_retry_v1", "recovery_cause_codex_idle_stall_v1", "recovery_cause_retained_recovery_exhausted", "recovery_cause_retained_recovery_adoption_failed", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "credential_switch_hold", "recovery_held_publication_v1", "recovery_held_publication_v2"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protocolFeatures(false, true) = %v, want exactly %v", got, want)
@@ -54,7 +54,7 @@ func TestProtocolFeaturesOmitsSnapshotWhenDisabled(t *testing.T) {
 // token untouched, while it is off (a worker then defers nothing and archives as before).
 func TestProtocolFeaturesHeldPublicationSwitch(t *testing.T) {
 	for _, snapshot := range []bool{true, false} {
-		on, off := protocolFeatures(snapshot, true), protocolFeatures(snapshot, false)
+		on, off := protocolFeatures(snapshot, true, false), protocolFeatures(snapshot, false, false)
 		if !slices.Contains(on, "recovery_held_publication_v1") || !slices.Equal(on[len(on)-2:], []string{"recovery_held_publication_v1", "recovery_held_publication_v2"}) {
 			t.Fatalf("snapshot=%t: switch on = %v, want V1 then V2 last", snapshot, on)
 		}

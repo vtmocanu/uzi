@@ -123,6 +123,7 @@ type wiredFinal struct {
 	pinRef  string
 	expires time.Time
 	worker  store.Worker
+	router  http.Handler
 }
 
 // newWiredFinal seeds a completed run holding one thin capture whose closure is driven to
@@ -154,7 +155,7 @@ func newWiredFinal(t *testing.T, maxAdmissions int) *wiredFinal {
 	// Production order: the shared recovery service exists before the worker routes mount, and
 	// mounting hands it the per-worker admission gate built on the route limiter.
 	svc := h.RecoveryService()
-	h.WorkerRoutes(mw.NewLimiter(maxAdmissions, time.Hour, nil))
+	router := h.WorkerRoutes(mw.NewLimiter(maxAdmissions, time.Hour, nil))
 	if !svc.PrerequisiteFinalEnabled() {
 		t.Fatal("the closure-backed FINAL is not enabled by the production wiring")
 	}
@@ -196,7 +197,7 @@ func newWiredFinal(t *testing.T, maxAdmissions int) *wiredFinal {
 	e.mustExec("UPDATE runs SET status='completed' WHERE id=$1", e.run)
 	// From here the repository lives on the loopback remote.
 	e.mustExec("UPDATE repos SET web_url=$2 WHERE id=$1", e.repo, srv.URL+"/g/m2")
-	f := &wiredFinal{recoveryEnv: e, h: h, svc: svc, git: git, capture: capture, body: body, pinRef: pinned.PinRef, worker: e.worker}
+	f := &wiredFinal{recoveryEnv: e, h: h, svc: svc, git: git, capture: capture, body: body, pinRef: pinned.PinRef, worker: e.worker, router: router}
 	if err := e.pool.QueryRow(e.ctx, "SELECT expires_at FROM recovery_captures WHERE id=$1", capture).Scan(&f.expires); err != nil {
 		t.Fatal(err)
 	}

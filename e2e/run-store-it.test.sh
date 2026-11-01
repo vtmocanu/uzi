@@ -232,10 +232,11 @@ case " $* " in
     esac
     printf 'ok\t%s\t0.01s\n' "$root"
     exit 0 ;;
-  *" ^TestCodex(RefreshLostReply|RetainedStop)E2E$ "*)
+  *" ^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease)E2E$ "*)
     if [ "$SCENARIO" = retained-go-fail ]; then echo "retained process failed"; exit 9; fi
-    for name in TestCodexRefreshLostReplyE2E TestCodexRetainedStopE2E; do
-      if [ "$name" != TestCodexRetainedStopE2E ] || [ "$SCENARIO" != retained-missing-run ]; then
+    for name in TestCodexRefreshLostReplyE2E TestCodexRetainedStopE2E TestPrerequisiteClosureReleaseE2E; do
+      if { [ "$name" != TestCodexRetainedStopE2E ] || [ "$SCENARIO" != retained-missing-run ]; } &&
+        { [ "$name" != TestPrerequisiteClosureReleaseE2E ] || [ "$SCENARIO" != retained-missing-closure-run ]; }; then
         echo "=== RUN   $name"
       fi
       if [ "$name" != TestCodexRetainedStopE2E ] || [ "$SCENARIO" != retained-missing-pass ]; then
@@ -280,7 +281,7 @@ assert_case() {
 
 # Explicit expected order, independent of the runner's PKGS array.
 expected_pkgs=(store handler forgesvc schedsvc workersvc recovery poller)
-for scenario in success optional retained-missing-run retained-missing-pass retained-top-skip retained-sub-skip retained-go-fail go-fail no-tests missing-ok top-skip sub-skip; do
+for scenario in success optional retained-missing-run retained-missing-closure-run retained-missing-pass retained-top-skip retained-sub-skip retained-go-fail go-fail no-tests missing-ok top-skip sub-skip; do
   case_dir="$TMP/$scenario"
   mkdir -p "$case_dir"
   optional=""
@@ -307,7 +308,7 @@ for scenario in success optional retained-missing-run retained-missing-pass reta
   done
   if [ "$scenario" = optional ] || [[ "$scenario" = retained-* ]]; then
     # The optional leg retains its own selector and Go's default timeout policy.
-    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-run\t^TestCodex(RefreshLostReply|RetainedStop)E2E$\t./internal/handler/...\n' \
+    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-run\t^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease)E2E$\t./internal/handler/...\n' \
       "$dsn" >> "$case_dir/expected"
   fi
   assert_case "ordered calls, exact flags, timeout reset and shared DSN" \
@@ -338,7 +339,7 @@ for scenario in success optional retained-missing-run retained-missing-pass reta
         retained-go-fail)
           assert_case "optional Go failure survives tee" test "$rc" -eq 9
           ;;
-        retained-missing-run|retained-missing-pass|retained-top-skip|retained-sub-skip)
+        retained-missing-run|retained-missing-closure-run|retained-missing-pass|retained-top-skip|retained-sub-skip)
           assert_case "retained proof guard reports missing evidence or skip" \
             grep -qE 'combined Codex proof (skipped|did not run and pass)' "$case_dir/output"
           ;;
