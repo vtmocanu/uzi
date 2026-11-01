@@ -11610,8 +11610,9 @@ export class GitCache {
    * input is used. Both producers are non-thin. The stdout is returned
    * for the client to upload directly. Credential-free: this is a LOCAL read of the
    * WORKER-OWNED bare by the worker uid (base gitEnv, no PAT, no runner-uid switch — the
-   * runner does not own the bare). A shared lock is not taken: pack-objects reads a
-   * consistent object snapshot, and this is a read, not a mutation.
+   * runner does not own the bare). Legacy reads take no shared bare lock. With a
+   * restriction identity, a short bare lock covers the fresh query, admission and
+   * producer start; it is released before streaming the pack.
    */
   async checkpointPack(
     barePath: string,
@@ -11647,7 +11648,8 @@ export class GitCache {
       budget ? Date.now() + budget.remainingMs() : Infinity);
     // Cooperative stops stay in the boundary scope: recovery signals and deadlines are hard.
     // Replay retains the original soft clock and supervisor without renewing either lifetime.
-    const run = <T extends { pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void> } | null>(action: () => Promise<T>): Promise<T> => {
+    type Producer = { pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void> };
+    const run = <T extends Producer | null>(action: (registerOwner: (producer: Producer) => void) => Promise<T>): Promise<T> => {
       const scoped = async (): Promise<T> => {
         // The runner's upload signal can combine the hard permit and cooperative signal.
         // Relay only independent aborts into recovery; the boundary owns cooperative stopping.
@@ -11660,12 +11662,11 @@ export class GitCache {
         const remove = () => options.signal?.removeEventListener("abort", abort);
         options.signal?.addEventListener("abort", abort, { once: true });
         if (options.signal?.aborted) abort();
-        let owner: NonNullable<T> | undefined;
+        let owner: Producer | undefined;
         try {
           const result = await this.withRecoveryOperation(AbortSignal.any([signal, caller.signal]), deadline, async () => {
             this.checkCheckpointCooperation();
-            const created = await action();
-            if (created) owner = created as NonNullable<T>;
+            const created = await action(producer => { owner = producer; });
             return created;
           });
           if (result) void result.exited.then(remove, remove);
@@ -11692,7 +11693,7 @@ export class GitCache {
       };
       return boundary ? this.boundaryProcesses.run(boundary, scoped) : scoped();
     };
-    const packed = await run(() => this.checkpointPackCaptured(barePath, branch, overlay, pinned, onStep,
+    const packed = await run(registerOwner => this.checkpointPackCaptured(registerOwner, barePath, branch, overlay, pinned, onStep,
       sourceSha, beforePack, chainFrom, options, parent ? undefined : Infinity));
     if (!packed) return null;
     let settlePrevious = packed.settled;
@@ -11708,6 +11709,7 @@ export class GitCache {
   }
 
   private async checkpointPackCaptured(
+    registerOwner: (producer: { pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void> }) => void,
     barePath: string,
     branch: string,
     overlay?: CheckpointOverlayContext,
@@ -11726,10 +11728,10 @@ export class GitCache {
     producerTimeoutMs?: number,
   ): Promise<{
     tipOid: string; pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void>;
-    replay: () => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void> }>;
+    replay: (registerOwner: Parameters<GitCache["checkpointPackCaptured"]>[0]) => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void> }>;
   } | null> {
     // Replay closes over literal OIDs and the original guard; it never rebuilds an overlay.
-    const openProducer = async (source: string, candidate: string, floor: string, defaultBlobSha?: string, packExcludes?: readonly string[]) => {
+    const openProducer = async (registerOwner: Parameters<GitCache["checkpointPackCaptured"]>[0], source: string, candidate: string, floor: string, defaultBlobSha?: string, packExcludes?: readonly string[]) => {
       this.checkCheckpointCooperation();
       onStep?.("scratch_preflight");
       await this.scratchPublicationPreflight(barePath, branch, source);
@@ -11740,6 +11742,12 @@ export class GitCache {
         throw new ScratchPublicationError("captured checkpoint default is unavailable");
       }
       const excludes = Object.freeze([...(candidate === floor && packExcludes !== undefined ? packExcludes : [floor])]);
+      const context = (restrictionFacts?: CheckpointPublicationContext["restrictionFacts"]): CheckpointPublicationContext => Object.freeze({
+        sourceSha: source, candidateSha: candidate, excludeSha: floor,
+        packExcludeShas: excludes, ...(defaultBlobSha === undefined ? {} : { defaultBlobSha }),
+        ...(restrictionFacts === undefined ? {} : { restrictionFacts }),
+      });
+      if (!options.restrictionIdentity) await beforePack?.(candidate, context());
       this.checkCheckpointCooperation();
       const selected = defaultBlobSha && !(candidate === floor && packExcludes !== undefined)
         ? await this.prepareCheckpointObjects(barePath, candidate, floor, defaultBlobSha) : undefined;
@@ -11751,14 +11759,9 @@ export class GitCache {
       const start = async () => {
         const restrictionFacts = options.restrictionIdentity && await this.publicationRestrictionFactsUnderLock(
           barePath, branch, options.restrictionIdentity, typeof beforePack === "function");
-        const context: CheckpointPublicationContext = Object.freeze({
-          sourceSha: source, candidateSha: candidate, excludeSha: floor,
-          packExcludeShas: excludes, ...(defaultBlobSha === undefined ? {} : { defaultBlobSha }),
-          ...(restrictionFacts === undefined ? {} : { restrictionFacts }),
-        });
         // Identity-bound guards own B: no public B-taking queries or deferred writes.
         // Negative facts alone never grant source use or publication.
-        await beforePack?.(candidate, context);
+        if (options.restrictionIdentity) await beforePack?.(candidate, context(restrictionFacts));
         this.checkCheckpointCooperation();
         const { stdout, exited, cancel, settled } = await this.spawnGit(
           barePath, selected === undefined ? ["pack-objects", "--revs", "--stdout"] : ["pack-objects", "--stdout"],
@@ -11768,7 +11771,10 @@ export class GitCache {
             timeoutMs: producerTimeoutMs,
           },
         );
-        return { pack: stdout, exited, cancel, settled };
+        const producer = { pack: stdout, exited, cancel, settled };
+        // Retain custody before withLock's postchecks can reject the handoff.
+        registerOwner(producer);
+        return producer;
       };
       // Release B after starting the producer, before handing out its stream.
       return options.restrictionIdentity ? this.withLock(barePath, start) : start();
@@ -11802,8 +11808,8 @@ export class GitCache {
         }
       }
       const candidate = wanted;
-      const replay = () => openProducer(tipSha, candidate, excludeSha, defaultBlobSha, packExcludeShas);
-      return { tipOid: wanted, ...await replay(), replay };
+      const replay = (currentRegisterOwner: typeof registerOwner) => openProducer(currentRegisterOwner, tipSha, candidate, excludeSha, defaultBlobSha, packExcludeShas);
+      return { tipOid: wanted, ...await replay(registerOwner), replay };
     }
     const defaultBlobSha = await this.captureCheckpointDefault(barePath, options.defaultBranch);
     const realTip = sourceSha ?? await this.trackingTip(barePath, branch);
@@ -11871,8 +11877,8 @@ export class GitCache {
         kind: "checkpoint_range", step: "checkpoint_floor", ...execDetail(classifyExecFailure(e)),
       });
     }
-    const replay = () => openProducer(realTip, wanted, floor, defaultBlobSha, packExcludes);
-    return { tipOid: wanted, ...await replay(), replay };
+    const replay = (currentRegisterOwner: typeof registerOwner) => openProducer(currentRegisterOwner, realTip, wanted, floor, defaultBlobSha, packExcludes);
+    return { tipOid: wanted, ...await replay(registerOwner), replay };
   }
 
   /** Server context is the sole name authority. origin/HEAD only vetoes a conflict. */

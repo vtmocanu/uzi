@@ -378,13 +378,16 @@ for (const [stage, target, output, reason] of [
   });
 }
 
-for (const pinned of [false, true]) for (const replay of [false, true]) {
+for (const identity of [false, true]) for (const pinned of [false, true]) for (const replay of [false, true]) {
   for (const stop of ["abort", "expiry", "unsafe"] as const) {
-    it(`producer handoff joins verified disposal: pinned=${pinned} replay=${replay} stop=${stop}`, async t => {
+    it(`producer handoff joins verified disposal: identity=${identity} pinned=${pinned} replay=${replay} stop=${stop}`, async t => {
       const timers = trackTimers(t);
       let now = 1000, launches = 0, returned = false;
       t.mock.method(Date, "now", () => now);
       const git = cache(), parent = new AbortController(), owner = controlled(replay ? 1 : 0);
+      if (identity) Object.assign(git, { publicationRestrictionFactsUnderLock: async () => Object.freeze({
+        enrolled: false, blocked: false, roots: Object.freeze([]), flaggedOIDs: Object.freeze([]), fingerprint: "test",
+      }) });
       Object.assign(git, { prepareCheckpointObjects: async () => Buffer.from(TIP + "\n") });
       const spawn = git["spawnGit"].bind(git);
       const signals: AbortSignal[] = [];
@@ -407,7 +410,9 @@ for (const pinned of [false, true]) for (const replay of [false, true]) {
       const pending = git.withBoundaryProcessSpawner(spawner, new AbortController().signal, async () => {
         const packed = await git.checkpointPack("bare", "task", undefined,
           pinned ? { tipSha: TIP, excludeSha: FLOOR, defaultBlobSha: DEFAULT } : undefined,
-          undefined, undefined, undefined, undefined, { signal: parent.signal, deadline: 61000 });
+          undefined, undefined, identity ? async () => {} : undefined, undefined,
+          { signal: parent.signal, deadline: 61000,
+            ...(identity ? { restrictionIdentity: { exactRunId: "run-test" } } : {}) });
         if (replay) {
           assert.ok(packed);
           for await (const _chunk of packed.pack) { /* drain initial producer */ }
