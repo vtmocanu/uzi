@@ -94,7 +94,8 @@ it("tags an HTTP 503 as floor_unreachable and keeps remote text out of message a
       assert.ok(e instanceof ScratchPublicationError);
       assert.equal(e.kind, "floor_unreachable");
       assert.ok(!e.message.includes(marker) && !e.message.includes("127.0.0.1"), e.message);
-      assert.ok(e.detail !== undefined && !e.detail.includes(marker) && !e.detail.includes("127.0.0.1"), e.detail);
+      assert.ok(e.detail !== undefined);
+      assert.ok(!e.detail.includes(marker) && !e.detail.includes("127.0.0.1"), e.detail);
       assert.ok(e.rawDetail !== undefined && e.rawDetail.length > 0);
       return true;
     });
