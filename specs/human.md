@@ -1093,6 +1093,10 @@ Tracked as GitHub issue vtmocanu/uzi#2545; design in ADR-2545 (`adr/2545-failed-
 - Release replays an exact earlier receipt before any mutable check, and lists the ref outside locks, then rechecks eligibility and that listing's verdict under locks. Ref retention runs `UZI_RECOVERY_READY_RETENTION` from acknowledgement, and the owner may expire early. A held ref is deleted only by a CAS delete while the run has no open hold, and a ref at a foreign tip is never touched. (AI-synced 2026-10-12)
 - Repo and forge-connection removal is refused with a 409 while a held ref may exist. `UZI_HELD_PUBLICATION` (default on) gates only new publications, never cleanup or the owner's list and expire. Owners can list a run's held refs in the CLI and on the run page. (AI-synced 2026-10-12)
 
+## Feature #3105 — Closed custody stops redundant bindingless recovery work
+
+- MAC-verified bindingless guarded journals may persist a uniquely authenticated closed hold through the explicitly negotiated `recovery_bindingless_closed_v1` observation, for refusal only. Open, missing or ambiguous history does not backfill binding or publication policy. Closure grants no new capture, publication, FINAL, fallback, ACK, receipt or disposal authority; matching immutable released requests retain original ACK replay, and independently authorized ACK/receipt closeout remains runnable. The 2026-10-18 decision leaves open-hold settlement and already-bound repair with #2494. See ADR-3105 (`adr/3105-bindingless-closed-custody.md`). (AI-synced 2026-11-01)
+
 ## Feature #1810 — A finished run's checkpoint ref is retained, not deleted, while custody is open
 
 Tracked as GitHub issue vtmocanu/uzi#1810; PRD at `prds/done/1810-retain-failed-run-checkpoint-ref.md`.

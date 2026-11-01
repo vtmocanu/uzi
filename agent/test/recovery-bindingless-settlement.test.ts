@@ -10,8 +10,19 @@ import { RunRunner } from "../src/runner.js";
 import type { RecoveryExactHold } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import { makeOutbox, stored } from "./publication-intent-fixture.js";
-import { binding, closed, environment, fixture, git, inventory, patch, sourceProof,
+import { binding, closed, environment, equalInventory, fixture, git, inventory, patch, sourceProof,
   type Variant } from "./fixtures/recovery-bindingless-compat.js";
+
+function retainedIdentity(before: RecoveryRecord, after: RecoveryRecord, acknowledged = false): void {
+  const allowed = new Set(["exactHoldBinding", "holdSettlement", "reason", ...(acknowledged ? ["finalAcknowledged"] : [])]);
+  for (const field of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    if (allowed.has(field)) continue;
+    const key = field as keyof RecoveryRecord;
+    assert.ok(canonicalJson(after[key]) === canonicalJson(before[key]), `retained record field changed: ${field}`);
+  }
+  assert.equal(JSON.stringify(after.finalRequest), JSON.stringify(before.finalRequest), "saved request bytes retained");
+  assert.equal(after.finalAcknowledged, acknowledged ? true : before.finalAcknowledged, "closure cannot manufacture an ACK");
+}
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true }); });
@@ -72,10 +83,15 @@ for (const variant of ["pinned", "needs_action", "uploaded", "saved-final"] as c
     restarted.coordinator["client"].getBindinglessRecoveryHold = async () => { throw new Error("durable closure needs no bindingless observation"); };
     await restarted.coordinator.snapshotOwedInventory();
     await restarted.coordinator.resumePending();
+    await equalInventory(f.root, after, journal);
+    const restartedRecord = (await restarted.coordinator.inspect(f.context.runId))[0];
+    assert.ok(restartedRecord, "settled journal retained across boot");
+    retainedIdentity(f.record, restartedRecord);
     await restarted.coordinator.captureAndUpload(s.input());
     await restarted.coordinator.operateFrozenInventory(s.input());
     assert.equal(await restarted.coordinator.freezeInventory({ context: f.context, currentSha: f.head,
       defaultBranch: "main", repoId: binding.repoId }), undefined, "direct freeze cannot rebuild settled custody");
+    await equalInventory(f.root, after, journal);
     assert.equal(s.counts().walks, 0);
     assert.equal(s.counts().holds, 0);
     assert.deepEqual(restarted.calls, { produce: 0, reserve: 0, upload: 0, final: 0, held: 0, cleanup: 0 });
@@ -294,6 +310,8 @@ for (const disposition of ["discarded", "mismatch", "matching"] as const) {
         ? { kind: "settled", coverage_digest: s.f.record.coverageDigest! } : request.disposition };
     s.answer(proof);
     s.e.state.allowFinal = true;
+    if (disposition !== "matching") s.e.cleanup();
+    const before = await inventory(s.f.root);
     const sent: string[] = [];
     const release = s.client.releaseRecoveryCustody.bind(s.client);
     s.client.releaseRecoveryCustody = async (...args) => {
@@ -303,7 +321,14 @@ for (const disposition of ["discarded", "mismatch", "matching"] as const) {
     await s.e.coordinator.resumePending();
     assert.equal(sent.length, disposition === "matching" ? 1 : 0);
     if (disposition === "matching") assert.equal(sent[0], canonicalJson(request));
-    assert.equal(s.e.calls.produce + s.e.calls.reserve + s.e.calls.upload + s.e.calls.held, 0);
+    assert.deepEqual(s.e.calls, { produce: 0, reserve: 0, upload: 0,
+      final: disposition === "matching" ? 1 : 0, held: 0, cleanup: 0 });
+    await equalInventory(s.f.root, before, path.relative(s.f.root, s.e.coordinator["recordPath"](s.f.record)));
+    const saved = (await s.e.coordinator.inspect(s.f.context.runId))[0];
+    assert.ok(saved, "closed receipt cannot retire the journal");
+    retainedIdentity(s.f.record, saved, disposition === "matching");
+    assert.deepEqual(saved.exactHoldBinding, binding);
+    assert.equal(canonicalJson(saved.holdSettlement), canonicalJson(proof));
     await sourceProof(s.f);
   });
 }
@@ -334,6 +359,9 @@ test("matching released thin FINAL replays before unavailable capture status", a
   assert.deepEqual(sent, [canonicalJson(f.record.finalRequest)]);
   assert.equal(s.counts().observations, 1);
   assert.equal(s.e.calls.reserve + s.e.calls.upload + s.e.calls.produce, 0);
+  const saved = (await s.e.coordinator.inspect(f.context.runId))[0];
+  assert.ok(saved, "original ACK remains journaled");
+  retainedIdentity(f.record, saved, true);
 });
 
 for (const variant of ["acknowledged", "completion-receipt"] as const) {
