@@ -245,7 +245,8 @@ function createCodexCredential(kind: CodexKind, label: string, isDefault: boolea
     is_default: wantDefault,
     enabled: true,
     disabled_at: null,
-    // No Codex auto-selection pool.
+    // Issue #3719: a Codex login joins the auto-selection pool only by explicit opt-in
+    // (setCodexAliasAutoEligible); an API key can never be pooled.
     auto_eligible: false,
     // The resolver-observed lifecycle state at birth: a login stages, a key is static.
     codex_status: kind === "codex_auth" ? "staging" : "static",
@@ -501,6 +502,20 @@ export const secretsApi = {
     body: { label?: string; default?: boolean; token?: string },
   ) => patchCodexCredential("codex_auth", id, body),
   deleteCodexAuthById: async (id: string) => deleteCodexCredential("codex_auth", id),
+  // Issue #3719: the Codex pool toggle, mirroring handler.PatchCodexAuthAutoEligible. Any
+  // id that is not one of the user's codex_auth aliases is a 404 (an openai_api_key cannot
+  // be pooled); pooling a disabled alias is a 409, un-pooling one is allowed. Like the
+  // server, the answer omits codex_status, which is why the card refetches the list.
+  setCodexAliasAutoEligible: async (id: string, autoEligible: boolean) => {
+    const row = secrets.find((s) => s.id === id && s.kind === "codex_auth");
+    if (!row) throw new ApiError(404, "codex login not found");
+    if (autoEligible) refuseIfDisabled(row);
+    row.auto_eligible = autoEligible;
+    row.updated_at = new Date().toISOString();
+    const meta: SecretMeta = { ...row };
+    delete meta.codex_status;
+    return delay({ secret: meta });
+  },
   createOpenAIApiKey: async (_token: string, label: string, isDefault: boolean) =>
     createCodexCredential("openai_api_key", label, isDefault),
   patchOpenAIApiKey: async (

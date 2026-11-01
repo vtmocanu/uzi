@@ -1113,13 +1113,34 @@ successor node's kernel release before and after each node roll.
 
 **Evidence latency and worker pin.** The controller still sends negative handoff
 documents when the successor pod is first seen. A positive proof is frozen at that
-point but sent once, as a version-2 document, at the first later pod update that
+point but first sent, as a version-2 document, at the first later pod update that
 carries the successor's own container IDs, so positive evidence waits for those
 IDs. If they never appear (or the pod is deleted, tainted, terminal or superseded
 first) nothing is sent and the worker reports `partial` / `evidence_timeout`
-(authority `unproven`) without an inventory. The single
-PATCH is unchanged: no retry, and a 409 conflict consumes it. No new RBAC is
-needed. `workers.image.tag` is decoupled from the controller: a new controller
+(authority `unproven`) without an inventory. Under #3739, only an API conflict
+(`apierrors.IsConflict`) permits a new single-use decision on a later changed
+same-UID watch event with its own resourceVersion. Duplicate objects and immediate
+resume replays spend no attempt. The bound is three total PATCH attempts per UID
+within 90 s of first observation, before identity resolution or waiting for IDs;
+each request gets min(10 s, remaining), checked again before submission. Other
+errors (including 429, 5xx and ambiguous timeouts/transport failures) stop delivery.
+The UID/resourceVersion/annotation-only body, `MaxRetries(0)`, wire schema and
+RBAC are unchanged. This bounds submissions; an in-flight write may still commit
+after cancellation, expiry or reset.
+
+Late retry plus downward-API projection lag can exceed the worker's nominal
+115 s soft stop (120 s cap minus 5 s settlement reserve). The expected timing
+margin is 25 s plus pod startup, minus watch lag and projection latency; it is
+not a safety margin or a guarantee. Late evidence is ignored once the worker's
+one-shot is consumed. The controller warns for each failed request with a
+controlled reason, and logs one final stop or success with attempts, conflicts
+and elapsed time since first observation, without raw errors or additional IDs.
+The success elapsed time supports #3621 correlation with projection latency.
+The maintainer's #3621 live graceful-roll check remains pending: record
+attempts/conflicts per successor and diagnose exhaustion from watch/request
+evidence. Cap or fence changes require separate review.
+
+`workers.image.tag` is decoupled from the controller: a new controller
 with old workers is normal until the pin moves, and an old worker refuses
 version 2 (`evidence_invalid`), so it reports no shadow data. A new worker with
 an old controller reports `legacy_evidence`.

@@ -104,13 +104,12 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				// gauge may never have polled, or its reading may have aged out — which is
 				// exactly the state a user needs to see rather than infer.
 				//
-				// Both POOL and ELIGIBLE are Anthropic-only concepts: there is no Codex
-				// auto-selection pool server-side, so a codex row's POOL/ELIGIBLE must read
-				// "-" (not applicable), not "false"/"no" (which would imply an opt-in a user
-				// could flip). ELIGIBLE already reads "-" for a codex row because it is
-				// absent from the anthropic-only eligibility map and carries
-				// AutoEligible=false; POOL is forced to "-" here for the same reason rather
-				// than rendering a misleading boolean (PRD #1147 M3).
+				// POOL reads the opt-in for the two poolable kinds, anthropic_token and
+				// codex_auth (issue #3719), and "-" (not applicable) for openai_api_key,
+				// which has no pool and so no flag a user could flip. ELIGIBLE stays
+				// Anthropic-only: it is autoselect's live headroom answer, which the Codex
+				// pool does not use, so a codex row reads "-" there (it is absent from the
+				// anthropic-only eligibility map and is gated on isAnthropic below).
 				//
 				// The status string is RENDERED, never re-derived (D21): it is
 				// autoselect.Classify's answer, the same function the selector gates on,
@@ -127,7 +126,7 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				// this row ever stops being rendered through Printer.Table.
 				isAnthropic := s.Kind == kindAnthropicToken
 				poolCell := "-"
-				if isAnthropic {
+				if isAnthropic || s.Kind == kindCodexAuth {
 					poolCell = boolStr(s.AutoEligible)
 				}
 				//
@@ -136,7 +135,7 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				// never picked while disabled and the meters read omits it: ELIGIBLE reads
 				// "-" rather than the "?" an unknown pooled token would get.
 				eligible := eligibilityCell(s.AutoEligible, eligibility[s.ID])
-				if secretDisabled(s) && isAnthropic {
+				if !isAnthropic || secretDisabled(s) {
 					eligible = "-"
 				}
 				rows = append(rows, []string{
@@ -180,17 +179,25 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 	// credential-adjacent write surface to save one round trip. Routing this through
 	// the server later would fix both bullets at once and is the cleaner end state.
 	var on, off bool
+	var poolKind string
 	pool := &cobra.Command{
 		Use:   "pool <label>",
-		Short: "Opt a token into (--on) or out of (--off) the auto-selection pool",
-		Long: "Opt one of your Anthropic tokens into or out of the pool an `auto` worker\n" +
-			"may spend from.\n\n" +
-			"The pool is opt-in per token and empty by default, on purpose: a pool that\n" +
+		Short: "Opt a token or Codex login into (--on) or out of (--off) the auto-selection pool",
+		Long: "Opt one of your Anthropic tokens or Codex logins into or out of the pool an\n" +
+			"`auto` choice may spend from (an `auto` worker for Anthropic tokens; `uzi settings\n" +
+			"codex-mode auto` for Codex logins).\n\n" +
+			"The pool is opt-in per credential and empty by default, on purpose: a pool that\n" +
 			"helped itself to every credential would spend the one you reserved for\n" +
-			"something else. Opting a token IN does not guarantee it gets picked — the\n" +
-			"selector also needs a fresh rate-limit reading for it, which the web\n" +
-			"settings page shows per token.\n\n" +
-			"Takes effect on the next claim: no restart, no new join token.",
+			"something else. Opting a credential IN does not guarantee it gets picked.\n\n" +
+			"Anthropic tokens: the selector also needs a fresh rate-limit reading for the\n" +
+			"token (the web settings page shows one per credential), and a change takes\n" +
+			"effect on the next claim: no restart, no new join token.\n\n" +
+			"Codex logins: the login is chosen when a run is created, from the pooled logins'\n" +
+			"rate-limit readings; when no pooled login has a fresh reading, one is still\n" +
+			"picked (reason pool_stale). The choice is frozen on the run, so a change affects\n" +
+			"only runs created afterwards, never one already queued or running.\n\n" +
+			"A label may exist as both an Anthropic token and a Codex login: pass --kind\n" +
+			"anthropic or --kind codex to say which. API keys (openai_api_key) cannot be pooled.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Exactly one of --on/--off, and one of them required. Defaulting either
@@ -211,36 +218,24 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// KIND-FILTERED to anthropic_token (PRD #1147 M3). Before this milestone
-			// findSecretByLabel had no kind filter and anthropic_token was the only kind,
-			// so the resolution was vacuously anthropic-only; now that ListSecrets returns
-			// codex_auth/openai_api_key rows too, an unfiltered match could cross-resolve a
-			// codex secret sharing a label with an anthropic one, or land on a codex row
-			// and try to set auto-eligible on it — but there is no Codex auto-selection
-			// pool server-side, so pool stays Anthropic-only.
-			target, ok := findSecretByLabel(secrets, kindAnthropicToken, args[0])
-			if !ok {
-				// If a NON-anthropic secret carries this label, name its kind so the caller
-				// understands the refusal (the pool is Anthropic-only) rather than being told
-				// no such token exists when one plainly does under `uzi token list`.
-				if other, found := findSecretByLabel(secrets, "", args[0]); found {
-					return uzicli.Exitf(uzicli.ExitUsage,
-						"token pool applies only to Anthropic tokens; %q is a %s credential",
-						args[0], tokenKindAlias(other.Kind))
-				}
-				// A usage error, not a 404: the label never reached the server, so this
-				// reports what actually happened — the caller holds no token by that name.
-				return uzicli.Exitf(uzicli.ExitUsage, "no Anthropic token labelled %q; `uzi token list` shows yours", args[0])
+			target, err := resolvePoolTarget(secrets, poolKind, args[0])
+			if err != nil {
+				return err
 			}
-			// PRD #1732 D5: a disabled token cannot join the pool. Refuse before the write
-			// with the same advice the server's 409 gives ("credential is disabled; enable
-			// it in Settings", workersvc.ErrCredentialDisabled); enabling is a web-only
-			// action (D12). Opting a disabled token OUT stays allowed.
+			// PRD #1732 D5: a disabled credential cannot join the pool. Refuse before the
+			// write with the same advice the server's 409 gives ("credential is disabled;
+			// enable it in Settings", workersvc.ErrCredentialDisabled); enabling is a
+			// web-only action (D12). Opting a disabled credential OUT stays allowed.
 			if on && secretDisabled(target) {
 				return uzicli.Exitf(uzicli.ExitConflict,
-					"token %q is disabled; enable it in Settings before adding it to the pool", cellText(target.Label))
+					"%s %q is disabled; enable it in Settings before adding it to the pool", poolNoun(target.Kind), cellText(target.Label))
 			}
-			out, err := c.SetTokenAutoEligible(cmd.Context(), target.ID, on)
+			var out apitypes.SecretDTO
+			if target.Kind == kindCodexAuth {
+				out, err = c.SetCodexAutoEligible(cmd.Context(), target.ID, on)
+			} else {
+				out, err = c.SetTokenAutoEligible(cmd.Context(), target.ID, on)
+			}
 			if err != nil {
 				return err
 			}
@@ -249,10 +244,11 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 				return p.JSON(out)
 			}
 			if !gf.quiet {
+				noun := poolNoun(target.Kind)
 				if on {
-					p.Printf("token %q is now in the auto-selection pool\n", cellText(out.Label))
+					p.Printf("%s %q is now in the auto-selection pool\n", noun, cellText(out.Label))
 				} else {
-					p.Printf("token %q is no longer in the auto-selection pool\n", cellText(out.Label))
+					p.Printf("%s %q is no longer in the auto-selection pool\n", noun, cellText(out.Label))
 				}
 			}
 			return nil
@@ -260,6 +256,7 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 	pool.Flags().BoolVar(&on, "on", false, "add the token to the auto-selection pool")
 	pool.Flags().BoolVar(&off, "off", false, "remove the token from the auto-selection pool")
+	pool.Flags().StringVar(&poolKind, "kind", "", "credential kind to pool: anthropic or codex (needed when a label exists in both)")
 
 	var testKind string
 	test := &cobra.Command{
@@ -465,6 +462,52 @@ func codexStatusCell(status string) string {
 	return status
 }
 
+// resolvePoolTarget picks the credential `uzi token pool <label>` toggles (issue #3719).
+// Only anthropic_token and codex_auth are poolable. With kind ("anthropic" or "codex") the
+// label is resolved within that kind alone, so a same-label credential of the other kind is
+// never touched. Without it, a label held by exactly one poolable kind resolves to it, a
+// label held by both is a usage error naming --kind, and an openai_api_key match is refused
+// (it has no pool). Every refusal is a usage error raised before any write.
+func resolvePoolTarget(secrets []apitypes.SecretDTO, kindFlag, label string) (apitypes.SecretDTO, error) {
+	switch kindFlag {
+	case "":
+		anthropic, hasAnthropic := findSecretByLabel(secrets, kindAnthropicToken, label)
+		codex, hasCodex := findSecretByLabel(secrets, kindCodexAuth, label)
+		switch {
+		case hasAnthropic && hasCodex:
+			return apitypes.SecretDTO{}, uzicli.Exitf(uzicli.ExitUsage,
+				"%q names both an Anthropic token and a Codex login; pass --kind anthropic or --kind codex", label)
+		case hasAnthropic:
+			return anthropic, nil
+		case hasCodex:
+			return codex, nil
+		}
+		if other, found := findSecretByLabel(secrets, "", label); found {
+			return apitypes.SecretDTO{}, uzicli.Exitf(uzicli.ExitUsage,
+				"token pool applies only to Anthropic tokens and Codex logins; %q is a %s credential",
+				label, tokenKindAlias(other.Kind))
+		}
+		return apitypes.SecretDTO{}, uzicli.Exitf(uzicli.ExitUsage,
+			"no Anthropic token or Codex login labelled %q; `uzi token list` shows yours", label)
+	case "anthropic", "codex":
+		kind, noun := kindAnthropicToken, "Anthropic token"
+		if kindFlag == "codex" {
+			kind, noun = kindCodexAuth, "Codex login"
+		}
+		if target, ok := findSecretByLabel(secrets, kind, label); ok {
+			return target, nil
+		}
+		if other, found := findSecretByLabel(secrets, "", label); found {
+			return apitypes.SecretDTO{}, uzicli.Exitf(uzicli.ExitUsage,
+				"no %s labelled %q; that label is a %s credential", noun, label, tokenKindAlias(other.Kind))
+		}
+		return apitypes.SecretDTO{}, uzicli.Exitf(uzicli.ExitUsage,
+			"no %s labelled %q; `uzi token list` shows yours", noun, label)
+	default:
+		return apitypes.SecretDTO{}, uzicli.Exitf(uzicli.ExitUsage, "invalid kind %q; use anthropic or codex", kindFlag)
+	}
+}
+
 // findSecretByLabel resolves a user-facing label to the token it names,
 // case-insensitively — matching the unique index 00077 put on
 // (user_id, kind, lower(label)), so the CLI accepts the same spellings the server
@@ -473,8 +516,9 @@ func codexStatusCell(status string) string {
 // kind filters the search to a single SecretDTO.Kind; an empty kind matches any.
 // The filter mirrors GetUserSecretIDByLabel's server-side kind scoping (PRD #1147
 // M3): now that ListSecrets returns multiple kinds, a label can collide across
-// kinds, so the pool command passes kindAnthropicToken to avoid cross-resolving a
-// codex secret.
+// kinds, so callers pass the kind they mean (the pool command resolves both
+// kindAnthropicToken and kindCodexAuth and refuses an ambiguous label without --kind)
+// to avoid cross-resolving another kind's secret.
 func findSecretByLabel(secrets []apitypes.SecretDTO, kind, label string) (apitypes.SecretDTO, bool) {
 	want := strings.ToLower(strings.TrimSpace(label))
 	for _, s := range secrets {
@@ -486,4 +530,13 @@ func findSecretByLabel(secrets []apitypes.SecretDTO, kind, label string) (apityp
 		}
 	}
 	return apitypes.SecretDTO{}, false
+}
+
+// poolNoun is the word `token pool` uses for a credential in its messages: a Codex alias is a
+// login, an Anthropic credential a token.
+func poolNoun(kind string) string {
+	if kind == kindCodexAuth {
+		return "login"
+	}
+	return "token"
 }
