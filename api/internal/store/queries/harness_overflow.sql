@@ -15,3 +15,6 @@ UPDATE runs SET
     harness_preferred_held = @preferred_held::boolean,
     harness_other_held = @other_held::boolean
 WHERE id = @id AND user_id = @user_id AND harness_decision_reason IS NULL;
+
+-- name: SetUserHarnessOverflowEnabled :execrows
+UPDATE users SET harness_overflow_enabled = @enabled::boolean WHERE id = @id;

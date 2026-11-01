@@ -76,3 +76,20 @@ func (q *Queries) SetRunHarnessDecision(ctx context.Context, arg SetRunHarnessDe
 	}
 	return result.RowsAffected(), nil
 }
+
+const setUserHarnessOverflowEnabled = `-- name: SetUserHarnessOverflowEnabled :execrows
+UPDATE users SET harness_overflow_enabled = $1::boolean WHERE id = $2
+`
+
+type SetUserHarnessOverflowEnabledParams struct {
+	Enabled bool      `json:"enabled"`
+	ID      uuid.UUID `json:"id"`
+}
+
+func (q *Queries) SetUserHarnessOverflowEnabled(ctx context.Context, arg SetUserHarnessOverflowEnabledParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setUserHarnessOverflowEnabled, arg.Enabled, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}

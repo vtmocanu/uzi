@@ -1015,6 +1015,7 @@ var wantRouteMounts = []routeMount{
 	// columns, no spend, no forge write, no fan-out: the same shape as /me/notify-early-reset.
 	{"PUT", "/api/me/usage-reserve", noLimiter},
 	{"PUT", "/api/me/codex-account-mode", noLimiter},
+	{"PUT", "/api/me/harness-overflow", noLimiter},
 	// PRD #46: the run-judge consent toggle (SetJudgeEnabled). A single boolean
 	// UPDATE on the caller's own users row, spends no Anthropic token at toggle time
 	// — noLimiter, matching /me/autopilot and /me/ci-autofix beside it. Its route

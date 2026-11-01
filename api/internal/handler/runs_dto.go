@@ -924,3 +924,23 @@ func overlayAdmissionReason(reason *string, queueReason string, class *string, e
 	}
 	return &current
 }
+
+// harnessDecisionForViewer projects quota evidence only for the owner. Generic
+// runToDTO and worker responses leave it null, including admin mutation responses.
+func harnessDecisionForViewer(r store.Run, viewer store.User) *apitypes.HarnessDecisionDTO {
+	if viewer.ID == uuid.Nil || viewer.ID != r.UserID || !r.HarnessDecisionReason.Valid || !r.HarnessPreferred.Valid {
+		return nil
+	}
+	nullableFloat := func(v pgtype.Float8) *float64 {
+		if !v.Valid {
+			return nil
+		}
+		return &v.Float64
+	}
+	return &apitypes.HarnessDecisionDTO{
+		Preferred: r.HarnessPreferred.String, Chosen: r.Harness, Reason: r.HarnessDecisionReason.String,
+		PreferredScore: nullableFloat(r.HarnessPreferredScore), OtherScore: nullableFloat(r.HarnessOtherScore),
+		PreferredMeasured: nullableFloat(r.HarnessPreferredMeasured), OtherMeasured: nullableFloat(r.HarnessOtherMeasured),
+		PreferredHeld: r.HarnessPreferredHeld.Bool, OtherHeld: r.HarnessOtherHeld.Bool,
+	}
+}

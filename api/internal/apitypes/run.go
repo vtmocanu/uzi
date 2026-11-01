@@ -203,6 +203,20 @@ type MemoryHoldDTO struct {
 	Remaining *int32 `json:"remaining"`
 }
 
+// HarnessDecisionDTO is the creation-time harness comparison. Unknown usage stays
+// null; measured zero is a value. Chosen is the run's stored harness.
+type HarnessDecisionDTO struct {
+	Preferred         string   `json:"preferred"`
+	Chosen            string   `json:"chosen"`
+	Reason            string   `json:"reason"`
+	PreferredScore    *float64 `json:"preferred_score"`
+	OtherScore        *float64 `json:"other_score"`
+	PreferredMeasured *float64 `json:"preferred_measured"`
+	OtherMeasured     *float64 `json:"other_measured"`
+	PreferredHeld     bool     `json:"preferred_held"`
+	OtherHeld         bool     `json:"other_held"`
+}
+
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
 	// Optional advisory cooldown for the assigned worker and current authorized origin.
@@ -247,6 +261,8 @@ type RunDTO struct {
 	// value honestly — the API is deployed separately and a newer server can ship a harness
 	// this client has not heard of.
 	Harness string `json:"harness"`
+	// HarnessDecision is private to the run owner; null for legacy and foreign reads.
+	HarnessDecision *HarnessDecisionDTO `json:"harness_decision"`
 	// HasPRDLink is server-computed PRD presence for the runs view (PRD #764),
 	// derived label-independently from the run's snapshotted issue description via
 	// the same detector the board card uses (forgesvc.HasPRDLink). False for
@@ -1163,6 +1179,8 @@ type RunSummaryItemDTO struct {
 	// value honestly — the API is deployed separately and a newer server can ship a harness
 	// this client has not heard of.
 	Harness string `json:"harness"`
+	// HarnessDecision is private to the run owner; null for legacy and foreign reads.
+	HarnessDecision *HarnessDecisionDTO `json:"harness_decision"`
 	// HasPRDLink is server-computed PRD presence for the runs view (PRD #764),
 	// derived label-independently from the run's snapshotted issue description via
 	// the same detector the board card uses (forgesvc.HasPRDLink). False for
@@ -1981,6 +1999,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		ContinuedIssueIID:             item.ContinuedIssueIID,
 		IssueTitle:                    item.IssueTitle,
 		Harness:                       item.Harness,
+		HarnessDecision:               item.HarnessDecision,
 		HasPRDLink:                    item.HasPRDLink,
 		Title:                         item.Title,
 		ResumeOfRunID:                 item.ResumeOfRunID,
@@ -2166,6 +2185,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			ContinuedIssueIID:             s.ContinuedIssueIID,
 			IssueTitle:                    s.IssueTitle,
 			Harness:                       s.Harness,
+			HarnessDecision:               s.HarnessDecision,
 			HasPRDLink:                    s.HasPRDLink,
 			Title:                         s.Title,
 			ResumeOfRunID:                 s.ResumeOfRunID,

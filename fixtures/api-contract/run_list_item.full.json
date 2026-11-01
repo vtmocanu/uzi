@@ -288,6 +288,17 @@
   "issue_title": "x",
   "issue_description": "x",
   "harness": "x",
+  "harness_decision": {
+    "preferred": "x",
+    "chosen": "x",
+    "reason": "x",
+    "preferred_score": 1.5,
+    "other_score": 1.5,
+    "preferred_measured": 1.5,
+    "other_measured": 1.5,
+    "preferred_held": true,
+    "other_held": true
+  },
   "has_prd_link": true,
   "title": "x",
   "resume_of_run_id": "x",
