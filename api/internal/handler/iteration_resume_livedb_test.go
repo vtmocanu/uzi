@@ -65,7 +65,7 @@ func TestIterationResumeWallBudgetLiveDB(t *testing.T) {
 			rec := httptest.NewRecorder()
 			h.ResumeRunNow(rec, inputReq(store.User{ID: f.user}, id, ""))
 			if exhausted {
-				if rec.Code != 409 || !strings.Contains(rec.Body.String(), "extend") || !strings.Contains(rec.Body.String(), "out of time") {
+				if rec.Code != 409 || !strings.Contains(rec.Body.String(), "extend it, then resume") || !strings.Contains(rec.Body.String(), "uzi run resume "+id.String()) || !strings.Contains(rec.Body.String(), "out of time") {
 					t.Fatalf("spent wall resume=%d %s", rec.Code, rec.Body.String())
 				}
 				if f.snapshot(t, id) != snapshot {

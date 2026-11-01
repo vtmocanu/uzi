@@ -3548,13 +3548,13 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string, claimGeneration?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
+  async getInputs(runId: string, claimGeneration?: number, signal?: AbortSignal, maxResponseBytes?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
     const epoch = this.inputObservationEpoch;
     let res: InputsResponse;
     try {
-      res = (await this.inputJSON("GET", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs${query}`)) as InputsResponse;
+      res = (await this.inputJSON("GET", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs${query}`, undefined, signal, maxResponseBytes)) as InputsResponse;
     } catch (err) {
       if (epoch !== this.inputObservationEpoch) return { inputs: [], staleObservation: true };
       throw err;
@@ -4865,15 +4865,17 @@ export class WorkerClient {
 
   /** Input polling/receipts share one deadline through response-body consumption, including
    * injected transports whose Response stream does not inherit fetch's abort signal. */
-  private async inputJSON(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown> {
-    const signal = AbortSignal.timeout(this.httpTimeoutMs);
+  private async inputJSON(method: "GET" | "POST", path: string, body?: unknown, callerSignal?: AbortSignal,
+    maxResponseBytes = Number.MAX_SAFE_INTEGER): Promise<unknown> {
+    const signal = AbortSignal.any([AbortSignal.timeout(this.httpTimeoutMs), ...(callerSignal ? [callerSignal] : [])]);
+    signal.throwIfAborted();
     const res = await this.fetchRaw(method, path, body, this.httpTimeoutMs, signal);
     if (res.status >= 400) {
       const text = await readBoundedText(res, ERROR_BODY_MAX_BYTES, false, signal);
       throw new RequestError(method, path, res.status, text.slice(0, 4096), retryAfterMsOf(res.headers.get("Retry-After")));
     }
     if (res.status === 204) return undefined;
-    const text = await readBoundedText(res, Number.MAX_SAFE_INTEGER, true, signal);
+    const text = await readBoundedText(res, maxResponseBytes, true, signal);
     return text ? JSON.parse(text) : undefined;
   }
 

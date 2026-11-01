@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { ExecutorResult, IterationParkOutcome, RunContext } from "../src/executor.js";
+import { WorkerClient } from "../src/client.js";
 import type { SteeringChannel } from "../src/steering.js";
 import { recordingLogger } from "./helpers.js";
 import { quiesceRunAttempt } from "../src/run-quiescence.js";
@@ -22,6 +23,25 @@ afterEach(() => {
   assert.deepEqual(errors, [], "executor assertions completed without being swallowed");
 });
 
+for (const mode of ["aborted body", "oversize body"] as const) {
+  it(`iteration control observation: ${mode} remains bounded`, async () => {
+    const cancel = new AbortController();
+    const { logger } = recordingLogger();
+    let cancelled = false;
+    const fixture = new WorkerClient("http://example.com", "fixture-token", "test", logger, {
+      fetch: async () => new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (mode === "aborted body") cancel.abort(new Error("fixture capture ended"));
+          else controller.enqueue(new Uint8Array(64 * 1024 + 1));
+        },
+        cancel() { cancelled = true; },
+      })),
+    });
+    await assert.rejects(fixture.getInputs(sid, 7, cancel.signal, 64 * 1024));
+    assert.ok(cancelled, "body cancellation joined before the observation returns");
+  });
+}
+
 const at = { iterationCount: 10, maxIterations: 10 };
 const bytes = "iteration work awaiting continuation\n";
 const sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -37,7 +57,10 @@ function plantTranscript(home: string): void {
 const cases = [
   "capture success", "degraded capture", "failed publication", "unproven quiescence",
   "committed park lost response", "404", "503", "unmodelled reply", "generation change",
-  "cancel during capture", "cancel during report", "permanent failure during sink",
+  "cancel during capture", "cancel during report", "live poller cancel", "ACK at deadline", "ACK at shutdown",
+  "ACK with failed join", "pending cancel", "pending cancel with switch", "pending stop", "pending switch", "pending unknown",
+  "pending stale", "pending terminal control", "pending stale refusal", "pending stale owner", "pending unknown owner",
+  "permanent failure during sink",
   "refused running prior_attempt", "refused running pending_control", "refused running stale_claim",
 ] as const;
 for (const mode of cases) {
@@ -53,10 +76,17 @@ for (const mode of cases) {
     let flight: unknown;
     let samePromise = false;
     let sinkEntered = false;
+    let modelSignal: AbortSignal | undefined;
+    let captureDeadline = Infinity;
+    let reportJoined = false;
+    let sinkJoined = false;
+    let observations = 0, retirements = 0;
+    const pending = mode.startsWith("pending ");
     const executor = {
       run: async (ctx: RunContext): Promise<ExecutorResult> => {
         try {
           turns++;
+          modelSignal = ctx.signal;
           fs.mkdirSync(homeDir, { recursive: true });
           fs.writeFileSync(path.join(homeDir, "SESSION"), "session retained");
           commitInTree(ctx.worktreePath, "COMMITTED.txt", "committed iteration work\n");
@@ -88,16 +118,45 @@ for (const mode of cases) {
       newCaptureEpisode: (...args: unknown[]) => unknown;
       handlePermanentFailure: (...args: unknown[]) => Promise<void>;
       reportGenericFailure: (...args: unknown[]) => Promise<void>;
+      shutdownSignal: AbortController;
+      finishWallCancellation: (...args: unknown[]) => Promise<void>;
+      disposeCredentialFreeOwnerCancel: (...args: unknown[]) => Promise<void>;
+      retireFinalizeRecord: (...args: unknown[]) => Promise<void>;
     };
     let genericFailures = 0, finalizes = 0, hookCalls = 0;
     const gated = internal.runGatedSink.bind(runner);
-    t.mock.method(internal, "runGatedSink", (f: { steering: SteeringChannel }, action: () => Promise<unknown>) => {
+    t.mock.method(internal, "runGatedSink", async (f: { steering: SteeringChannel }, action: () => Promise<unknown>) => {
       flight = f;
       steering = f.steering;
-      return gated(f, action);
+      try {
+        const result = await gated(f, action);
+        if (mode === "ACK with failed join" && sinkEntered) throw new Error("fixture join failed");
+        return result;
+      }
+      finally { if (sinkEntered) sinkJoined = true; }
+    });
+    t.mock.method(internal, "retireFinalizeRecord", async () => { retirements++; });
+    const getInputs = client.getInputs.bind(client);
+    t.mock.method(client, "getInputs", async (...args: Parameters<typeof getInputs>) => {
+      // Hold the ordinary poller behind the queued control; only the capture observation sees it.
+      if (pending && sinkEntered && !args[2]) return { inputs: [], receipts: true };
+      if (args[2]) {
+        observations++;
+        assert.ok(reportJoined, "park request joined before observation");
+        assert.ok(!args[2].aborted);
+        if (mode === "pending stale") return { inputs: [{ id: 1, kind: "cancel" }], receipts: true, staleObservation: true };
+      }
+      return getInputs(...args);
     });
     const episode = internal.newCaptureEpisode.bind(runner);
-    t.mock.method(internal, "newCaptureEpisode", (...args: unknown[]) => { episodes++; return episode(...args); });
+    t.mock.method(internal, "newCaptureEpisode", (...args: unknown[]) => {
+      episodes++;
+      const result = episode(...args);
+      captureDeadline = (result as { deadlineAt: number }).deadlineAt;
+      return result;
+    });
+    t.mock.method(internal, "finishWallCancellation", async () => { callbackErrors.push("wall cancellation disposal"); });
+    t.mock.method(internal, "disposeCredentialFreeOwnerCancel", async () => { callbackErrors.push("owner cancellation disposal"); });
     t.mock.method(internal, "reportGenericFailure", async () => { genericFailures++; });
     t.mock.method(git, "pushBranch", async () => { finalizes++; });
     const status = git.worktreeStatus.bind(git);
@@ -128,8 +187,32 @@ for (const mode of cases) {
     t.mock.method(client, "reportIterationPark", async (...args: Parameters<typeof report>) => {
       const reply = await report(...args);
       if (mode === "cancel during report") steering!.markCancelled();
+      if (mode === "live poller cancel") {
+        const stopped = new Promise<void>(resolve => modelSignal!.addEventListener("abort", () => resolve(), { once: true }));
+        api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+        await stopped;
+      }
+      if (pending) {
+        assert.equal(steering!.isCancelled(), false, "poller has not seen queued control");
+        api.ownershipWire.set(claim.run_id, res => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "running", claim_released: false,
+            claim_generation: mode === "pending stale owner" ? 8 : mode === "pending unknown owner" ? undefined : 7 }));
+        });
+        api.rawInputGets(claim.run_id, {
+          inputs: [{ id: 1, kind: ["pending cancel", "pending cancel with switch", "pending stale refusal", "pending stale owner", "pending unknown owner"].includes(mode) ? "cancel" : mode === "pending stop" ? "stop" : "future_control" }],
+          receipts: true,
+          ...(["pending switch", "pending cancel with switch"].includes(mode) ? { credential_switch: { generation: 7 } } : {}),
+          ...(mode === "pending terminal control" ? { terminal_cancelled: { run_id: claim.run_id, generation: 8 } } : {}),
+        });
+      }
+      if (mode === "ACK at deadline") t.mock.method(Date, "now", () => captureDeadline);
+      if (mode === "ACK at shutdown") internal.shutdownSignal.abort(new Error("fixture shutdown after ACK"));
+      reportJoined = true;
       return reply;
     });
+    if (pending) api.setIterationParkRefusal("pending_control", "running", mode === "pending stale refusal" ? 8 : 7);
+    if (mode === "live poller cancel") api.setIterationParkRefusal("pending_control", "running", 7);
     if (mode === "committed park lost response") api.commitIterationParkThenLoseFirstReply();
     if (mode === "404" || mode === "503") api.setIterationParkResponse({ error: "unknown delivery" }, Number(mode));
     if (mode === "unmodelled reply") api.setIterationParkResponse({ run: { status: "paused" } });
@@ -141,11 +224,28 @@ for (const mode of cases) {
       "running", mode.endsWith("stale_claim") ? 8 : 7,
     );
 
+    const stateReport = client.reportState.bind(client);
+    t.mock.method(client, "reportState", async (...args: Parameters<typeof stateReport>) => {
+      if (args[1].failure_reason === "run cancelled") {
+        assert.ok(sinkJoined, "capture sink joined before cancellation report");
+        assert.ok(mode === "cancel during capture" || reportJoined, "report RPC joined before cancellation report");
+        await assert.rejects((flight as { reportState: (body: { status: "failed"; failure_reason: string }) => Promise<unknown> })
+          .reportState({ status: "failed", failure_reason: "run cancelled" }), "other cancellation-shaped reports remain fenced");
+        assert.equal(args[1].claim_generation, 7);
+        assert.ok(args[2], "cancellation report has an independent bounded signal");
+      }
+      return stateReport(...args);
+    });
     await runner.execute(claim);
-    const stopped = ["404", "503", "unmodelled reply", "generation change", "cancel during capture", "cancel during report"].includes(mode)
-      || mode.startsWith("refused");
+    const stopped = ["404", "503", "unmodelled reply", "generation change", "cancel during capture", "cancel during report", "live poller cancel"].includes(mode)
+      || mode.startsWith("refused") || pending;
     assert.ok(outcomes.length > 0, JSON.stringify(lines));
     assert.deepEqual(outcomes, [stopped ? "retained-stop" : "parked"]);
+    assert.equal(observations, pending && mode !== "pending stale refusal" || mode === "refused running pending_control" ? 1 : 0);
+    if (mode.startsWith("ACK ")) {
+      assert.ok(!lines.some(line => JSON.stringify(line).includes("iteration park unconfirmed")), "recorded ACK never logs unconfirmed");
+      assert.equal(retirements, 0, "expired, shutdown or failed join cannot retire finalization evidence");
+    }
     assert.equal(turns, 1, "no next model turn after the sink");
     assert.equal(samePromise, true, "repeated callbacks join the exact same promise");
     assert.equal(episodes, 1, "one shared capture episode");
@@ -166,7 +266,12 @@ for (const mode of cases) {
     assert.equal(calls.length, 0, "no MR or forge finalization");
     assert.equal(api.completionPermitRequests.length, 0);
     assert.equal(api.wallParkRequests.length, 0, "separate iteration control never enters wall park");
-    assert.ok(!api.states.some(s => s.runId === claim.run_id && ["failed", "completed", "pause_failed"].includes(s.body.status!)));
+    const terminalReports = api.states.filter(s => s.runId === claim.run_id && ["failed", "completed", "pause_failed"].includes(s.body.status!));
+    if (["cancel during capture", "cancel during report", "live poller cancel", "pending cancel", "pending cancel with switch"].includes(mode)) {
+      assert.equal(terminalReports.length, 1, "one authoritative cancellation report");
+      assert.equal(terminalReports[0]!.body.status, "failed");
+      assert.equal(terminalReports[0]!.body.failure_reason, "run cancelled");
+    } else assert.deepEqual(terminalReports, []);
     assert.ok(fs.existsSync(worktreeDirFor(iid)), "clone retained");
     assert.equal(fs.readFileSync(path.join(homeDir, "SESSION"), "utf8"), "session retained");
     assert.equal(fs.readFileSync(path.join(worktreeDirFor(iid), "DIRTY.txt"), "utf8"), bytes);

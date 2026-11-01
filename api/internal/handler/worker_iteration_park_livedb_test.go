@@ -775,3 +775,34 @@ func testWorkerIterationParkLateWrites(t *testing.T, resumed bool) {
 		t.Fatalf("owner cancel status=%s %v", r.Status, err)
 	}
 }
+
+// A live-poller cancel is queued, so the retained iteration sink must still send
+// the ordinary cancellation report after its capture region has joined.
+func TestWorkerIterationCancelReportLiveDB(t *testing.T) {
+	f := iterationRoutes(t)
+	ctx := context.Background()
+	id := f.run(t, "prompt")
+	svc := workersvc.New(f.q, newHandlerTestBox(t), workersvc.Params{
+		RunTimeout: time.Hour, RunMaxIterations: 5, WorkerHeartbeatStale: time.Minute,
+	})
+	svc.SetTxBeginner(f.pool)
+	f.exec(t, "UPDATE workers SET last_heartbeat_at=now() WHERE id=$1", f.worker)
+	result, err := svc.SubmitInput(ctx, f.user, id, "cancel", "owner cancellation during capture", nil)
+	if err != nil || result.ServerSide {
+		t.Fatalf("cancel was not queued for the live poller: %+v %v", result, err)
+	}
+	before, err := f.q.GetRunByID(ctx, id)
+	if err != nil || before.Status != "running" || before.StopKind.String != "cancelled" {
+		t.Fatalf("pending cancel did not preserve running state: %+v %v", before, err)
+	}
+	assertIterationAck(t, f.call(id, "iteration-park", iterationParkBody, f.worker), 409, "pending_control")
+	rec := f.call(id, "state", `{"claim_generation":4,"status":"failed","failure_reason":"run cancelled"}`, f.worker)
+	if rec.Code != 200 {
+		t.Fatalf("retained cancellation report=%d %s", rec.Code, rec.Body.String())
+	}
+	after, err := f.q.GetRunByID(ctx, id)
+	if err != nil || after.Status != "cancelled" || after.FailOrigin.Valid || after.ClaimReleasedAt.Valid ||
+		after.ClaimGeneration != before.ClaimGeneration || after.SessionID != before.SessionID || after.WorkerID != before.WorkerID {
+		t.Fatalf("owner cancel did not win without releasing the retained claim: %+v %v", after, err)
+	}
+}

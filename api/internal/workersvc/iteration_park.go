@@ -104,11 +104,19 @@ func (s *Service) ReportIterationPark(ctx context.Context, w store.Worker, id uu
 	if pending || run.StopKind.String != "" || run.CredentialSwitchRequestedAt.Valid {
 		return run, false, "pending_control", nil
 	}
+	// Pass the server fallback to the write when it applies. A frozen allowance
+	// makes it irrelevant; do not narrow an unused, potentially wider config value.
+	globalMaxIterations := e.MaxIterations
+	if !run.BudgetMaxIterations.Valid {
+		configured := s.p.RunMaxIterations
+		if configured <= 0 || configured > 2147483647 {
+			return run, false, "allowance_mismatch", nil
+		}
+		globalMaxIterations = int32(configured)
+	}
 	n, err := q.SetRunIterationPark(ctx, store.SetRunIterationParkParams{
 		ID: id, WorkerID: pgconv.UUID(w.ID), ClaimGeneration: e.ClaimGeneration,
-		// The effective allowance matched this bounded value above; do not
-		// narrow the unbounded configured int when a frozen budget overrides it.
-		HoldCapturedHead: captured, GlobalMaxIterations: e.MaxIterations,
+		HoldCapturedHead: captured, GlobalMaxIterations: globalMaxIterations,
 		MaxIterations: e.MaxIterations, IterationCount: e.IterationCount,
 	})
 	if err != nil {

@@ -2400,6 +2400,8 @@ interface RunFlight {
   /** Latched before sink admission; every entered iteration sink retains custody. */
   iterationParkState: "none" | "entered" | "confirmed" | "retained";
   iterationParkFlight?: Promise<IterationParkOutcome>;
+  /** Identity-scoped report permission, installed only after the iteration capture joins. */
+  iterationCancellationReport?: StateRequest;
   /** PRD #1391 Run B M3 (N2/D5): true once ANY terminal outcome for this generation has been
    *  sent/resolved through {@link RunRunner.journalAndSendTerminal} — a run-lane completed/failed
    *  site, the permanent-failure hook, or reportGenericFailure itself — or a competing outcome has
@@ -11013,7 +11015,9 @@ export class RunRunner {
       observedSessionId: undefined,
       latestContractRevision: undefined,
       reportState: async (body, signal, checked = false) => {
-        if (flight.iterationParkState !== "none" && body.status !== undefined)
+        if (flight.iterationParkState !== "none" && body.status !== undefined &&
+            !(body === flight.iterationCancellationReport && steering.isCancelled() &&
+              body.status === "failed" && body.failure_reason === "run cancelled"))
           throw new RetainedRecoveryStop();
         if (steering.claimFence() !== undefined) throw new StaleClaimError();
         const memory = flight.workerMemory;
@@ -21037,6 +21041,8 @@ export class RunRunner {
     flight.iterationParkState = "entered";
     this.retainCaptureSource(flight);
     flight.iterationParkFlight = (async (): Promise<IterationParkOutcome> => {
+      let episode: CaptureEpisode | undefined;
+      let captureCompleted = false;
       try {
         const positiveInt32 = (value: number): boolean =>
           Number.isInteger(value) && value > 0 && value <= 2147483647;
@@ -21047,41 +21053,58 @@ export class RunRunner {
             !positiveInt32(at.iterationCount) || !positiveInt32(at.maxIterations) ||
             at.iterationCount < at.maxIterations || at.iterationCount - at.maxIterations > 1)
           throw new TrustedExecutionRefusal("iteration park evidence or lane unavailable");
-        const episode = this.newCaptureEpisode(flight);
+        const captureEpisode = this.newCaptureEpisode(flight);
+        episode = captureEpisode;
         const capture = (options: HoldCaptureOptions): Promise<IterationParkOutcome> =>
-          this.captureIterationPark(flight, claim, runLog, at, episode, options);
+          this.captureIterationPark(flight, claim, runLog, at, captureEpisode, options);
         let outcome: IterationParkOutcome;
         if (this.isCodexCapture(claim, flight)) {
-          outcome = await this.runCaptureRegion(claim, flight, episode,
+          outcome = await this.runCaptureRegion(claim, flight, captureEpisode,
             held => capture({ heldAuthenticated: held, signal: held.signal }),
             held => capture({ heldCapture: held, publishCheckpoint: false, signal: held.signal }),
             async () => {
-              this.validateJoinedCapture(flight, episode);
-              const progress = this.captureProgressFor(flight, episode);
+              this.validateJoinedCapture(flight, captureEpisode);
+              const progress = this.captureProgressFor(flight, captureEpisode);
               // A failed region cannot turn a possibly delivered ACK into a pause claim.
               // Resume may only send remaining requests using joined local evidence.
               if (progress.iterationOutcome !== undefined || progress.local?.kind !== "hold")
                 return "retained-stop";
-              return this.withCaptureDisposition(flight, episode,
+              return this.withCaptureDisposition(flight, captureEpisode,
                 signal => capture({ dispositionOnly: true, publishCheckpoint: false, signal }));
             });
         } else {
-          outcome = await this.runGatedSink(flight, () => this.withCaptureDisposition(flight, episode,
+          outcome = await this.runGatedSink(flight, () => this.withCaptureDisposition(flight, captureEpisode,
             signal => capture({ signal })));
         }
-        // runCaptureRegion has now joined the capture scope and its cleanup.
-        this.captureAuthority(flight, episode.deadlineAt);
-        if (outcome === "parked") {
-          flight.iterationParkState = "confirmed";
-          flight.parked = true;
-          await this.retireFinalizeRecord(flight, "iteration_park_accepted");
-          runLog.info("run parked at its iteration limit; preserving clone and HOME for resume");
-          return "parked";
-        }
+        captureCompleted = outcome === "parked";
       } catch (error) {
         // Cancellation, fencing, admission refusal and uncertain transport all stop
-        // here after region unwind. None grants terminal or custody authority.
-        runLog.warn("iteration park unconfirmed; local work retained", { error: errMessage(error) });
+        // here after region unwind. None grants generic failure or custody authority.
+        if (!episode || this.captureProgressFor(flight, episode).iterationOutcome !== "parked")
+          runLog.warn("iteration park unconfirmed; local work retained", { error: errMessage(error) });
+      }
+      // Every path above has joined the capture region before reporting cancellation.
+      // This single bounded report keeps all custody; it never enters wall disposal.
+      if (flight.steering.isCancelled() && flight.steering.claimFence() === undefined) {
+        const budget = this.observeCancellation(flight);
+        const body: StateRequest = { status: "failed", failure_reason: "run cancelled" };
+        flight.iterationCancellationReport = body;
+        try {
+          budget.check();
+          await flight.reportState(body, AbortSignal.any([budget.signal, this.shutdownSignal.signal]));
+        } catch (error) {
+          runLog.warn("iteration cancellation report unavailable; local work retained", { error: errMessage(error) });
+        } finally { flight.iterationCancellationReport = undefined; }
+      } else if (episode && this.captureProgressFor(flight, episode).iterationOutcome === "parked" &&
+                 flight.steering.claimFence() === undefined) {
+        flight.iterationParkState = "confirmed";
+        flight.parked = true;
+        // Record the ACK even after expiry/shutdown, without granting new cleanup authority.
+        if (captureCompleted && !flight.steering.terminalLifecycleSignal().aborted &&
+            !this.shutdownSignal.signal.aborted && !flight.active?.shuttingDown && Date.now() < episode.deadlineAt)
+          await this.retireFinalizeRecord(flight, "iteration_park_accepted");
+        runLog.info("run parked at its iteration limit; preserving clone and HOME for resume");
+        return "parked";
       }
       flight.iterationParkState = "retained";
       this.retainCaptureSource(flight);
@@ -21153,16 +21176,20 @@ export class RunRunner {
       progress.dispositionStarted = true;
       progress.iterationReportCount = (progress.iterationReportCount ?? 0) + 1;
       const ack = await this.client.reportIterationPark(flight.runId, report, options.signal);
+      // WorkerClient validates the matching generation and hold reason. Preserve this
+      // evidence before authority checks can observe a racing deadline or stop.
+      if (ack.outcome === "parked") progress.iterationOutcome = "parked";
       check();
-      if (ack.outcome === "parked") {
-        progress.iterationOutcome = "parked";
-        return "parked";
-      }
+      if (ack.outcome === "parked") return "parked";
       if (ack.outcome === "refused") {
         progress.iterationOutcome = "retained-stop";
         runLog.warn("iteration park refused; local work retained", {
           reason: ack.reason, server_status: ack.status, claim_generation: ack.claimGeneration,
         });
+        if (ack.reason === "pending_control" && ack.claimGeneration === flight.claimGeneration && ack.status === "running") {
+          // Observe once inside this same bounded region. Refusal itself is never cancellation.
+          await flight.steering.observePendingCancellation(options.signal!);
+        }
         return "retained-stop";
       }
     }

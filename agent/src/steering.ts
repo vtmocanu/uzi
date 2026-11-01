@@ -1651,6 +1651,28 @@ export class SteeringChannel {
     this.shutdownStop.abort();
   }
 
+  /** One read-only observation for a refused capture disposition. The poller retains
+   * ACK/routing ownership; only an explicit cancel in a current receipt-mode reply
+   * becomes sticky. The caller supplies the existing capture signal, with no retry. */
+  async observePendingCancellation(signal: AbortSignal): Promise<void> {
+    if (!Number.isSafeInteger(this.claimGeneration) || this.claimGeneration <= 0 ||
+        this.fence !== undefined || this.terminalLifecycle.signal.aborted) return;
+    const reply = await this.client.getInputs(this.runId, this.claimGeneration, signal, 64 * 1024);
+    signal.throwIfAborted();
+    if (this.fence !== undefined || this.terminalLifecycle.signal.aborted || reply.staleObservation ||
+        !reply.receipts || reply.terminalCancelled ||
+        !validBatch(reply.inputs)) return;
+    if (!reply.inputs.some(input => input.kind === "cancel")) return;
+    // Receipt-mode GET is read-only and does not fence its generation. Recheck the
+    // existing ownership seam after reading; generation is monotonic, and reports
+    // remain fenced server-side if ownership changes again after this observation.
+    const owner = await this.client.getRunOwnership(this.runId, signal);
+    signal.throwIfAborted();
+    if (this.fence === undefined && !this.terminalLifecycle.signal.aborted &&
+        owner.status === "running" && owner.claim_generation === this.claimGeneration &&
+        owner.claim_released === false) this.markCancelled();
+  }
+
   /** Register the re-armable pause-now interrupt (see pauseNowInterrupt, PRD #1190 rework N2).
    *  Last-wins; the runner wires it to the executor's per-run trip so a `now` pause drops the
    *  current turn even after the shared abort controller has been spent by an earlier `now`. */

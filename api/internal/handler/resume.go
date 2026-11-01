@@ -178,7 +178,7 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 					total := wall + int64(current.BudgetExtensionSeconds) + int64(current.BudgetFinalizeSeconds)
 					used := max(0, int64(current.StatusSince.Time.Sub(current.StartedAt.Time).Round(time.Second).Seconds())) - int64(current.BudgetPausedSeconds)
 					if total-used <= 0 {
-						httpx.Error(w, http.StatusConflict, fmt.Sprintf("this run is out of time; extend it to resume: uzi run extend %s --by 2h", runID))
+						httpx.Error(w, http.StatusConflict, fmt.Sprintf("this run is out of time; extend it, then resume: uzi run extend %s --by 2h; uzi run resume %s", runID, runID))
 						return
 					}
 				}
