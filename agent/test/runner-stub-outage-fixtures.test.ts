@@ -354,6 +354,25 @@ for (const stage of ["terminal", "running-ack"] as const) {
     let wrongRelease: Promise<void> | undefined;
     const marker = path.join(fx.dataDir, `cdr-outbox-${stage}-${c.run_id}-2`);
     const wrong = path.join(fx.dataDir, `cdr-outbox-${stage}-${c.run_id}-1`);
+    const access = fs.promises.access.bind(fs.promises);
+    const unlink = fs.promises.unlink.bind(fs.promises);
+    // Keep release-file I/O deterministic: the first check runs immediately after ready().
+    // All its promise continuations settle before the setImmediate observation below.
+    t.mock.method(fs.promises, "access", async (...args: Parameters<typeof access>) => {
+      if (args[0] === marker || args[0] === wrong) fs.accessSync(args[0]);
+      else await access(...args);
+    });
+    t.mock.method(fs.promises, "unlink", async (...args: Parameters<typeof unlink>) => {
+      if (args[0] === marker || args[0] === wrong) fs.unlinkSync(args[0]);
+      else await unlink(...args);
+    });
+    const releasedStages = new Set<string>();
+    const executor = new class extends StubExecutor {
+      override async fixtureBarrier(...args: Parameters<StubExecutor["fixtureBarrier"]>) {
+        await super.fixtureBarrier(...args);
+        releasedStages.add(args[0]);
+      }
+    }(nullLogger(), { fixtureBarrierDirectory: fx.dataDir, fixtureBarrierTimeoutMs: 5000 });
     const log = logger((message, fields) => {
       if (message !== "stub: fixture barrier ready") return;
       reached = true;
@@ -371,8 +390,9 @@ for (const stage of ["terminal", "running-ack"] as const) {
       }
       const running = events.filter(e => e === "running").length;
       fs.writeFileSync(wrong, "release\n");
-      wrongRelease = new Promise<void>((resolve, reject) => setTimeout(() => {
+      wrongRelease = new Promise<void>((resolve, reject) => setImmediate(() => {
         try {
+          assert.equal(releasedStages.has(stage), false, "wrong generation did not release the fixture await");
           assert.equal(events.filter(e => e === "running").length, running, "wrong generation did not release the barrier");
           assert.equal(outbox.hasPendingTerminal(c.run_id, 2), false, "wrong generation did not journal a terminal");
           assert.equal(api.states.some(s => s.runId === c.run_id &&
@@ -384,13 +404,11 @@ for (const stage of ["terminal", "running-ack"] as const) {
         } finally {
           fs.writeFileSync(marker, "release\n");
         }
-      }, 20));
+      }));
       void wrongRelease.catch(() => undefined);
     });
     try {
-      await runnerWith(() => ({ executor: new StubExecutor(nullLogger(), {
-        fixtureBarrierDirectory: fx.dataDir, fixtureBarrierTimeoutMs: 5000,
-      }) }), forge.gitlab,
+      await runnerWith(() => ({ executor }), forge.gitlab,
         undefined, log.log, { outbox, checkpointIntervalMs: 0 }).execute(c);
       await wrongRelease;
       const diagnostic = JSON.stringify({ events, states: api.states, lines: log.lines });
