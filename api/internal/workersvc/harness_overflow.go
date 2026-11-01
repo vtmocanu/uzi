@@ -98,7 +98,7 @@ func codexOverflowEvidence(c codexselect.Candidate, reason codexselect.Reason) o
 	return overflowEvidence{
 		Measured:    pgtype.Float8{Float64: c.Score, Valid: c.ScoreKnown},
 		Held:        c.CapacityExcluded,
-		Destination: reason == codexselect.ReasonAuto || reason == codexselect.ReasonBestOfPool || string(reason) == "default",
+		Destination: c.Structural && (reason == codexselect.ReasonAuto || reason == codexselect.ReasonBestOfPool || string(reason) == "default"),
 	}
 }
 
@@ -239,16 +239,23 @@ func (s *Service) evaluateCreationOverflow(ctx context.Context, q *store.Queries
 			return res, nil, e
 		}
 		r := store.ListCodexPoolAliasesRow(row)
-		if !codexPoolRowStructural(r) {
-			return res, nil, errHarnessOverflowFence
+		if !codexPoolRowStructural(r) && res.Harness == HarnessClaude {
+			// The legacy default resolver still regards this linked account as
+			// usable. An unavailable destination must not fail the Claude run.
+			d.Reason = "excluded"
+			return res, nil, nil
 		}
 		cs, e := s.scoreCodexCandidates(ctx, q, userID, []store.ListCodexPoolAliasesRow{r}, s.selectionNow())
 		if e != nil {
 			return res, nil, e
 		}
 		picked := codexPoolPick{AliasID: r.AliasID, AccountID: uuid.UUID(r.ProviderAccountID.Bytes), ProviderUserID: r.ProviderUserID.String, WorkspaceAccountID: r.WorkspaceAccountID.String, Reason: codexselect.Reason(codex.Codex.Select), Candidate: cs[0]}
+		// Default-mode preferred accounts retain their existing creation
+		// behavior even when quarantined or needing re-login. Their score is
+		// still the selected account's reading (reauth makes that unknown).
+		picked.Candidate.Structural = codexPoolRowStructural(r)
 		pick = &picked
-		ce = codexOverflowEvidence(cs[0], picked.Reason)
+		ce = codexOverflowEvidence(picked.Candidate, picked.Reason)
 	}
 	claude, e := s.claudeOverflowEvidence(ctx, q, userID, s.selectionNow(), res.Harness == HarnessCodex)
 	if e != nil {

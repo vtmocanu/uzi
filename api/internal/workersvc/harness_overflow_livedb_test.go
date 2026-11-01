@@ -426,18 +426,70 @@ func TestHarnessOverflowCreationOverrideInheritanceLiveDB(t *testing.T) {
 	}
 }
 
+func TestHarnessOverflowUnavailableDefaultPreservesPreferredLiveDB(t *testing.T) {
+	for _, preference := range []string{"claude", "codex"} {
+		for _, state := range []string{"quarantined", "reauth_required"} {
+			t.Run(preference+"/"+state, func(t *testing.T) {
+				fx := newOverflowFix(t)
+				fx.mode("default")
+				setDefaultHarness(t, fx.env, fx.userID, preference)
+				if state == "quarantined" {
+					fx.env.exec("UPDATE codex_provider_account SET coord_state='quarantined' WHERE id=$1", fx.codex.account)
+				} else {
+					fx.env.exec("UPDATE codex_provider_account SET reauth_required=true,reauth_generation=1,reauth_credential_revision=1 WHERE id=$1", fx.codex.account)
+				}
+				run, err := fx.issue()
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantReason := "excluded"
+				if preference == "codex" {
+					wantReason = "preferred"
+					if state == "reauth_required" {
+						wantReason = "unknown_usage"
+					}
+				}
+				if run.Harness != preference || run.HarnessDecisionReason.String != wantReason {
+					t.Fatalf("unavailable default changed preferred choice: harness=%s reason=%v", run.Harness, run.HarnessDecisionReason)
+				}
+			})
+		}
+	}
+}
+
+func TestHarnessOverflowQuarantinedPreferredUsesMeasuredScoreLiveDB(t *testing.T) {
+	fx := newOverflowFix(t)
+	fx.mode("default")
+	setDefaultHarness(t, fx.env, fx.userID, "codex")
+	fx.reading(fx.codex, 95)
+	fx.claudeReading(fx.token, 10, "1 minute")
+	fx.env.exec("UPDATE codex_provider_account SET coord_state='quarantined' WHERE id=$1", fx.codex.account)
+	run, err := fx.issue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Harness != "claude" || run.HarnessDecisionReason.String != "overflow" ||
+		!run.HarnessPreferredScore.Valid || run.HarnessPreferredScore.Float64 >= 20 ||
+		run.HarnessPreferredHeld.Bool {
+		t.Fatalf("preferred score was discarded: harness=%s reason=%v score=%v held=%v",
+			run.Harness, run.HarnessDecisionReason, run.HarnessPreferredScore, run.HarnessPreferredHeld)
+	}
+}
+
 func TestHarnessOverflowMigrationDefaultsAndConstraintsLiveDB(t *testing.T) {
 	fx := newPoolFix(t)
 	policy, err := fx.env.q.GetHarnessCreationPolicy(fx.env.ctx, fx.userID)
 	if err != nil || policy.HarnessOverflowEnabled {
 		t.Fatalf("migration must default off: policy=%+v err=%v", policy, err)
 	}
+	account := fx.newAccount("migration-check")
+	fx.makeDefault(account.alias)
 	run := fx.mustCreate()
 	for _, query := range []string{
 		"UPDATE runs SET harness_decision_reason='other' WHERE id=$1",
 		"UPDATE runs SET harness_preferred_score=101 WHERE id=$1",
 		"UPDATE runs SET harness_other_measured=-1 WHERE id=$1",
-		"UPDATE runs SET harness_preferred_held=true,harness_preferred_score=10 WHERE id=$1",
+		"UPDATE runs SET harness_preferred=NULL WHERE id=$1",
 	} {
 		if _, err := fx.env.pool.Exec(fx.env.ctx, query, run.ID); err == nil {
 			t.Fatalf("invalid decision accepted: %s", query)

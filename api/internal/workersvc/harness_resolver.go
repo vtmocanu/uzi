@@ -713,6 +713,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	}
 
 	if overflowPick != nil {
+		d := res.Decision
 		if s.codexSelectBeforeFenceHook != nil {
 			s.codexSelectBeforeFenceHook(ctx, pick.AliasID)
 		}
@@ -723,7 +724,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			}
 			if row.Kind != store.KindCodexAuth || !row.Enabled || !row.Status.Valid || row.Status.String != codexStatusLinked ||
 				!row.ProviderAccountID.Valid || uuid.UUID(row.ProviderAccountID.Bytes) != pick.AccountID ||
-				!codexPoolAccountUsable(row.CoordState, row.ReauthRequired) {
+				(!(d.Preferred == HarnessCodex && !pick.Candidate.Structural) && !codexPoolAccountUsable(row.CoordState, row.ReauthRequired)) {
 				return store.Run{}, resolvedHarness{}, errHarnessOverflowFence
 			}
 		} else {
@@ -732,7 +733,6 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 				return store.Run{}, resolvedHarness{}, err
 			}
 		}
-		d := res.Decision
 		ce := codexOverflowEvidence(pick.Candidate, pick.Reason)
 		if d.Preferred == HarnessCodex {
 			d.PreferredEvidence = ce

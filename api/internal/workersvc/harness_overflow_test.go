@@ -159,7 +159,7 @@ func TestHarnessOverflowOffPreservesResolverMatrix(t *testing.T) {
 
 func TestHarnessOverflowCodexEvidence(t *testing.T) {
 	for _, reason := range []codexselect.Reason{codexselect.ReasonAuto, codexselect.ReasonBestOfPool, codexselect.ReasonPoolStale, codexselect.ReasonPoolExhausted, codexselect.ReasonPoolEmpty, "default"} {
-		c := codexselect.Candidate{Score: 48, ScoreKnown: true}
+		c := codexselect.Candidate{Structural: true, Score: 48, ScoreKnown: true}
 		e := codexOverflowEvidence(c, reason)
 		if !e.Measured.Valid || e.Measured.Float64 != 48 {
 			t.Fatalf("%s lost actual measurement: %+v", reason, e)
