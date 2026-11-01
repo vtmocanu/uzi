@@ -3656,7 +3656,7 @@ export class SdkExecutor implements Executor {
           if (turn.parkRun) {
             if (!parkRunEnabled(ctx, "implement") || !ctx.requestParkRun) throw new Error("illicit park_run signal");
             if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
-            // The worker callback owns explicit owner retries and their absolute deadline.
+            // The worker callback owns explicit owner retries and the shared parked-time budget.
             const disposition = await requestPark(parkAt);
             if (switchReleased || walled || completionHeld || pausedAt) break;
             if (disposition.kind === "paused") { pausedAt = parkAt; break; }

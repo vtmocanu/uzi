@@ -23,7 +23,7 @@ import {
 } from "../src/executor.js";
 import { GitLabClient, type FetchFn } from "../src/forge.js";
 import { RunRunner, REASON_QUESTION_TIMEOUT } from "../src/runner.js";
-import { SteeringChannel, type AnswerVerdict } from "../src/steering.js";
+import { CredentialSwitchSignal, SteeringChannel, type AnswerVerdict } from "../src/steering.js";
 import type { AskUserQuestion, UserInput } from "../src/protocol.js";
 import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER } from "../src/plan-missing.js";
 
@@ -705,26 +705,25 @@ describe("PRD #88 M6 — RunRunner.askUser", () => {
   });
 
   /**
-   * D-S mutation 4: make the deadline per-question instead of per-run, i.e. drop the
-   * `questionDeadlines.get(runId)` reuse and compute `now() + timeoutMs` at every park.
+   * D-S mutation 4: make the budget per-question instead of per-run, i.e. drop the
+   * `questionParkBudgets` accumulation (`spentMs`) so every park arms the full timeout.
    *
-   * The documented bound is one budget for the RUN — N questions must not extend a
-   * parked run indefinitely. A per-question clock is the plausible misreading, and
-   * it is the shape a later "optimisation" would reach for.
+   * The documented bound is one parked-time budget for the RUN — N questions must not
+   * extend a parked run indefinitely. A per-question clock is the plausible misreading,
+   * and it is the shape a later "optimisation" would reach for.
    *
    * DETERMINISTIC, not wall-clock. The per-run-vs-per-question distinction is a fact
    * about the `remaining` the SECOND park arms, so it is asserted directly on the
    * armed values through the injected `now`/`setTimer` seams — no real time elapses
    * and no bound is raced. (The old form measured `Date.now()` elapsed against a
-   * ~1500ms bound and flaked under CI CPU contention: a documented CPU-contention
-   * flake source inflated the measurement past even the ~2400ms per-question marker.)
+   * ~1500ms bound and flaked under CI CPU contention.)
    *
-   * With a 1500ms budget and 900ms "spent" answering Q1: a correct run arms the full
-   * 1500ms at the first park and the REMAINING 600ms at the second (one shared clock);
-   * a per-question run would re-arm a fresh 1500ms at the second park. The two are
-   * distinguished by the exact armed value, with zero timing slack to flake on.
+   * With a 1500ms budget and 900ms spent PARKED on Q1: a correct run arms the full
+   * 1500ms at the first park and the REMAINING 600ms at the second (one shared
+   * budget); a per-question run would re-arm a fresh 1500ms at the second park. The
+   * two are distinguished by the exact armed value, with zero timing slack to flake on.
    */
-  it("spends ONE answer deadline across the whole run, not one per question", async () => {
+  it("charges parked time from every question to ONE budget, not one per question", async () => {
     const budgetMs = 1500;
     const answerDelayMs = 900; // logical time charged to the shared budget answering Q1
     const log: AskLog = { asked: [], verdicts: [] };
@@ -785,11 +784,210 @@ describe("PRD #88 M6 — RunRunner.askUser", () => {
     assert.strictEqual(
       arms[1],
       budgetMs - answerDelayMs,
-      "the second park arms the REMAINING budget (budget minus the time Q1 spent), " +
-        "proving ONE clock measured from the first park; a per-question deadline " +
+      "the second park arms the REMAINING budget (budget minus the time Q1 spent parked), " +
+        "proving ONE shared parked-time budget; a per-question budget " +
         `would re-arm the full ${budgetMs}ms here`,
     );
   });
+
+  /** Drive askingExecutor(2) with a manual clock; returns what each park armed. */
+  async function runTwoQuestions(
+    iid: number,
+    budgetMs: number,
+    opts: { parkedAdvanceMs: number; runningReportAdvanceMs: number },
+  ) {
+    const log: AskLog = { asked: [], verdicts: [] };
+    const claim = claimFor(iid, { kind: "issue" });
+    let clockMs = 0;
+    const arms: number[] = [];
+    const setTimer = (_cb: () => void, ms: number): (() => void) => {
+      arms.push(ms);
+      if (arms.length === 1) clockMs += opts.parkedAdvanceMs; // time parked on Q1
+      return () => {};
+    };
+    let parks = 0;
+    let advanced = false;
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_input" && body.open_question_id) {
+        parks++;
+        api.setInputs(claim.run_id, [
+          { id: parks, kind: "answer", body: JSON.stringify({ question_id: body.open_question_id, answers: [`answer ${parks}`] }) },
+        ]);
+      } else if (body.status === "running" && parks >= 1 && !advanced && !(body as { repo_agents?: unknown }).repo_agents) {
+        advanced = true; // the settle `running` report of Q1: working time starts after it
+        clockMs += opts.runningReportAdvanceMs;
+      }
+    });
+    await runnerFor(askingExecutor(2, log), {
+      questionTimeoutMs: budgetMs,
+      now: () => clockMs,
+      setTimer,
+    }).execute(claim);
+    return { claim, log, arms, parks };
+  }
+
+  /**
+   * Issue #3140 regression. Revert `parkQuestion` to an absolute deadline measured from
+   * the first question and this reddens: Q2 would arm 0 and fail "clarification timed
+   * out" even though the run only spent 900ms of 1500ms PARKED.
+   */
+  it("does not charge working time between questions to the parked-time budget", async () => {
+    const { claim, log, arms, parks } = await runTwoQuestions(3140, 1500, {
+      parkedAdvanceMs: 900,
+      runningReportAdvanceMs: 5000, // working >> budget, after Q1 settled
+    });
+    assert.strictEqual(parks, 2);
+    assert.deepStrictEqual(arms, [1500, 600], "Q2 arms budget minus ONLY the time parked on Q1");
+    assert.notStrictEqual(failureReason(claim.run_id), REASON_QUESTION_TIMEOUT);
+    assert.strictEqual(statuses(claim.run_id).at(-1), "completed");
+    assert.deepStrictEqual(
+      log.verdicts.map((v) => (v.kind === "answer" ? v.answers : [v.kind])),
+      [["answer 1"], ["answer 2"]],
+    );
+  });
+
+  /** Time that passes inside the settle `running` report (confirmRunning) is not parked. */
+  it("does not charge the settle `running` report to the next park", async () => {
+    const { arms, claim } = await runTwoQuestions(3141, 1500, {
+      parkedAdvanceMs: 0,
+      runningReportAdvanceMs: 7000,
+    });
+    assert.deepStrictEqual(arms, [1500, 1500]);
+    assert.strictEqual(statuses(claim.run_id).at(-1), "completed");
+  });
+
+  /**
+   * A same-question re-park (credential-switch give-up, interrupted callback) continues the
+   * SAME interval: the server keeps the run at awaiting_input, so the gap is parked time.
+   */
+  it("keeps charging one open question across a same-id re-park", async () => {
+    let clockMs = 0;
+    const arms: number[] = [];
+    const runner = runnerFor(askingExecutor(0, { asked: [], verdicts: [] }), {
+      questionTimeoutMs: 1500,
+      now: () => clockMs,
+      setTimer: (_cb, ms) => { arms.push(ms); return () => {}; },
+    });
+    const reports: Array<{ status?: string; open_question_id?: string }> = [];
+    const reportState = async (body: { status?: string; open_question_id?: string }) => {
+      reports.push(body);
+      return { status: body.status, applied: true };
+    };
+    const batcher = { emit: () => {}, flush: async () => {} } as never;
+    let waits = 0;
+    const steering = {
+      awaitAnswer: async () => {
+        if (++waits === 1) {
+          clockMs += 900; // parked
+          throw new CredentialSwitchSignal();
+        }
+        return { kind: "answer", answers: ["ok"] } as AnswerVerdict;
+      },
+    } as never;
+    const park = () => (runner as any).parkQuestion(
+      "run-redrive", [{ question: "q?", header: "Q" }], "lead", undefined, batcher, steering,
+      reportState, nullLogger(), null, {},
+    ) as Promise<AnswerVerdict>;
+    await assert.rejects(park(), CredentialSwitchSignal);
+    clockMs += 300; // gap before the internal re-drive: still parked server-side
+    const verdict = await park();
+    assert.strictEqual(verdict.kind, "answer");
+    const ids = reports.filter((r) => r.status === "awaiting_input").map((r) => r.open_question_id);
+    assert.strictEqual(ids.length, 2);
+    assert.strictEqual(ids[0], ids[1], "the re-park reuses the SAME question id");
+    assert.deepStrictEqual(arms, [1500, 1500 - 1200]);
+  });
+
+  /**
+   * An owner pause surfacing from the guarded park's settle `running` report charges only
+   * the parked time up to the answer; the time before the next question is free.
+   */
+  it("charges a guarded park only up to its answer when the settle report returns an owner pause", async () => {
+    let clockMs = 0;
+    const arms: number[] = [];
+    const runner = runnerFor(askingExecutor(0, { asked: [], verdicts: [] }), {
+      questionTimeoutMs: 1500,
+      now: () => clockMs,
+      setTimer: (_cb, ms) => { arms.push(ms); if (arms.length === 1) clockMs += 400; return () => {}; },
+    });
+    const reportState = async (body: { status?: string }) =>
+      body.status === "running" ? { status: "paused", applied: true } : { status: body.status, applied: true };
+    const batcher = { emit: () => {}, flush: async () => {} } as never;
+    const steering = {
+      awaitAnswer: async () => ({ kind: "answer", answers: ["ok"] }) as AnswerVerdict,
+    } as never;
+    const park = () => (runner as any).parkQuestion(
+      "run-pause", [{ question: "q?", header: "Q" }], "worker", undefined, batcher, steering,
+      reportState, nullLogger(), null, { confirmRunning: true, requireRunning: true },
+    ) as Promise<AnswerVerdict>;
+    await assert.rejects(park(), (e: Error) => e.constructor.name === "OrdinaryOwnerPaused");
+    clockMs += 10_000; // paused / working: uncharged
+    await assert.rejects(park(), (e: Error) => e.constructor.name === "OrdinaryOwnerPaused");
+    assert.deepStrictEqual(arms, [1500, 1100]);
+  });
+
+  /** The completion window (ADR-1225 I6) is never charged to the clarification budget. */
+  it("closes an open clarification interval at completion-question entry and does not charge the window", async () => {
+    let clockMs = 0;
+    const arms: number[] = [];
+    const runner = runnerFor(askingExecutor(0, { asked: [], verdicts: [] }), {
+      questionTimeoutMs: 1500,
+      now: () => clockMs,
+      setTimer: (_cb, ms) => { arms.push(ms); return () => {}; },
+    });
+    const internal = runner as any;
+    const reportState = async (body: { status?: string }) => ({ status: body.status, applied: true });
+    const batcher = { emit: () => {}, flush: async () => {} } as never;
+    let clarifyWaits = 0;
+    const clarifySteering = {
+      awaitAnswer: async () => {
+        if (++clarifyWaits === 1) { clockMs += 500; throw new CredentialSwitchSignal(); }
+        return { kind: "answer", answers: ["ok"] } as AnswerVerdict;
+      },
+    } as never;
+    const parkClarify = () => internal.parkQuestion(
+      "run-cw", [{ question: "q?", header: "Q" }], "lead", undefined, batcher, clarifySteering,
+      reportState, nullLogger(), null, {},
+    ) as Promise<AnswerVerdict>;
+    await assert.rejects(parkClarify(), CredentialSwitchSignal);
+    assert.ok(internal.questionParkBudgets.get("run-cw").open, "the rejected waiter leaves its interval open");
+    clockMs += 200;
+    const completionSteering = {
+      awaitAnswer: async () => { clockMs += 9000; return { kind: "answer", answers: ["continue"] } as AnswerVerdict; },
+    } as never;
+    const outcome = await internal.askCompletionQuestion(
+      "run-cw", ["m1"], batcher, completionSteering, reportState, nullLogger(), null,
+    );
+    assert.deepStrictEqual(outcome, { outcome: "continue", guidance: undefined });
+    const budget = internal.questionParkBudgets.get("run-cw");
+    assert.strictEqual(budget.open, undefined, "the clarification interval is closed");
+    assert.strictEqual(budget.spentMs, 700, "500 parked + 200 gap before the window; the 9000ms window is not charged");
+    await parkClarify();
+    assert.strictEqual(arms.at(-1), 1500 - 700, "the next clarification arms budget minus 700ms");
+  });
+
+  /** Per-run parked-time state must not survive the execution, whatever way it ends. */
+  for (const ending of ["completed", "timed out", "cancelled"] as const) {
+    it(`leaves no per-run question state behind after an execution that ${ending}`, async () => {
+      const claim = claimFor(3150);
+      api.onState(claim.run_id, (body) => {
+        if (body.status !== "awaiting_input" || !body.open_question_id || ending === "timed out") return;
+        api.setInputs(claim.run_id, [ending === "cancelled" ? input("cancel") : answerInput(body.open_question_id, "go")]);
+      });
+      const runner = runnerFor(askingExecutor(1, { asked: [], verdicts: [] }), {
+        setTimer: (cb) => {
+          if (ending === "timed out") setImmediate(cb);
+          return () => {};
+        },
+      });
+      await runner.execute(claim);
+      const internal = runner as any;
+      if (ending === "timed out") assert.strictEqual(failureReason(claim.run_id), REASON_QUESTION_TIMEOUT);
+      assert.strictEqual(internal.questionParkBudgets.has(claim.run_id), false);
+      assert.strictEqual(internal.openQuestionIds.has(claim.run_id), false);
+      assert.strictEqual(internal.questionCounts.has(claim.run_id), false);
+    });
+  }
 
   /**
    * PRD #307 — the fix under test. Delete the `v.kind === "answer"` `running`
