@@ -418,11 +418,7 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 		rows = append(rows, []string{"ANTHROPIC_TOKEN", credentialCell(r)})
 	}
 	if r.Harness == "codex" && r.CodexSecretLabel != nil && *r.CodexSecretLabel != "" {
-		label := cellText(*r.CodexSecretLabel)
-		if r.CodexSecretID == nil {
-			label += " (deleted)"
-		}
-		rows = append(rows, []string{"CODEX_ALIAS", label})
+		rows = append(rows, []string{"CODEX_ALIAS", codexAliasCell(r)})
 	}
 	// The per-run token CHOICE and any in-flight switch (PRD #1247 M8), DISTINCT from the
 	// ANTHROPIC_TOKEN row above: that names the token the run SPENT, this names what the
@@ -2572,6 +2568,14 @@ func providerHoldAction(r apitypes.RunDTO) string {
 // dropped when the server sent no retry stamp. HH:MM is the viewer's local wall clock, the
 // same idiom as the near-timeout / times-out rows above.
 func forgeParkLine(r apitypes.RunDTO) string {
+	// Issue #1324: a publication-phase park has no park-count budget, so it never reaches the
+	// "N of MAX" wording below; an unknown phase gets a generic line, never the pre-clone one.
+	if isPublicationPark(r) {
+		return publicationParkLineAt(r, time.Now())
+	}
+	if isUnknownPhasePark(r) {
+		return unknownPhaseParkLine(r)
+	}
 	capLabel := "unlimited"
 	if r.ForgeParkMax != 0 {
 		capLabel = itoa(r.ForgeParkMax)

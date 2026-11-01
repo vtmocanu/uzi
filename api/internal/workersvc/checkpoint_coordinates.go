@@ -59,7 +59,7 @@ func (s *Service) claimCheckpointRun(ctx context.Context, tx pgx.Tx, params stor
 			return store.Run{}, err
 		}
 		q := store.New(sp)
-		if err = q.OptInCheckpointCoordinates(ctx); err != nil {
+		if err = optInRunFences(ctx, q, uuid.UUID(params.WorkerID.Bytes), true); err != nil {
 			_ = sp.Rollback(ctx)
 			return store.Run{}, err
 		}

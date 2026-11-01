@@ -23,6 +23,7 @@ export const SCHEDULE_SKIP_REASON_LABELS: Record<ScheduleSkipReason, string> = {
   schedules_paused: "all schedules paused",
   no_usable_credential: "no usable credential",
   credential_disabled: "pinned credential is disabled",
+  codex_pool_unavailable: "no eligible Codex account in the auto-select pool",
   ci_green: "CI is green",
   ci_already_handled: "failure already handled",
   ci_halted_no_progress: "halted: same failure after a repair attempt",

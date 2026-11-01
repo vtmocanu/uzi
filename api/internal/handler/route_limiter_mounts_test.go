@@ -618,6 +618,7 @@ var wantRouteMounts = []routeMount{
 	// like PATCH /api/workers/{id} below, which is the same class and is likewise
 	// unlimited.
 	{"PATCH", "/api/me/secrets/anthropic_token/{id}/auto-eligible", noLimiter},
+	{"PATCH", "/api/me/secrets/codex_auth/{id}/auto-eligible", noLimiter},
 	{"PATCH", "/api/repos/{id}", noLimiter},
 	// Expedite/undo a queued run's priority (PRD #320 M3): one owner-scoped, queued-only
 	// UPDATE of runs.priority, no token spend, no forge write, no status touch → noLimiter.
@@ -857,6 +858,8 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/codex/operation-admission", noLimiter},
 	// Authenticated, run-scoped advisory telemetry: no forge call or token spend.
 	{"POST", "/api/worker/runs/{id}/forge-clone-success", noLimiter},
+	// Rides proposalLimiter.PerWorkerMiddleware (per-WORKER), which this per-USER probe reads as noLimiter.
+	{"POST", "/api/worker/runs/{id}/publication-intent", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/release", noLimiter},
 	// PRD #1226 M2: the completion-interlock permit-issue and same-lead attempt endpoints.
 	// Worker-authenticated, scoped to the worker's own run, no forge call → noLimiter, matching
@@ -1014,6 +1017,7 @@ var wantRouteMounts = []routeMount{
 	// PRD #3522: the weekly usage reserve (SetUsageReserve). One owner-scoped UPDATE of two
 	// columns, no spend, no forge write, no fan-out: the same shape as /me/notify-early-reset.
 	{"PUT", "/api/me/usage-reserve", noLimiter},
+	{"PUT", "/api/me/codex-account-mode", noLimiter},
 	// PRD #46: the run-judge consent toggle (SetJudgeEnabled). A single boolean
 	// UPDATE on the caller's own users row, spends no Anthropic token at toggle time
 	// — noLimiter, matching /me/autopilot and /me/ci-autofix beside it. Its route

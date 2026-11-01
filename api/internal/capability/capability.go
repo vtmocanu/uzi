@@ -250,6 +250,14 @@ const CrossCheckPinsV1 = "cross_check_pins_v1"
 // offered as a repo capability.
 const CrossCheckCodexLeadV1 = "cross_check_codex_lead_v1"
 
+// CrossCheckGatedV1 identifies workers that run the checked plan loop BEFORE the human plan
+// gate (PRD #3708): they submit a gated run's plan for cross-check, follow the rounds, and
+// present the ordinary human gate with the checker outcome. It is a protocol capability, never
+// a repo capability, and deliberately NOT a ClaimRun clause: an older worker still claims a
+// gated run and simply presents the ordinary gate, which the server records as
+// worker_unsupported.
+const CrossCheckGatedV1 = "cross_check_gated_v1"
+
 // CrossCheckSemanticPlanV1 identifies workers whose Claude/Codex checker understands the
 // semantic plan-candidate digest and payload (PRD #1230 D2). It is a protocol capability and a
 // hard ClaimRun clause on a plan-stage checker child whose target run is semantic-enrolled; it
@@ -288,6 +296,16 @@ const MemoryParkSettlementV1 = "memory_park_settlement_v1"
 
 // CIArtifactsV1 negotiates guarded CI artifact evidence delivery and read access.
 const CIArtifactsV1 = "ci_artifacts_v1"
+
+// PublicationResumeV1 negotiates the write-ahead publication intent: a worker that reports it
+// may enroll a run's publication intent and resume publication-only on a later claim. The
+// guard_publication_resume trigger and the claim clauses read it from workers.protocol_capabilities.
+const PublicationResumeV1 = "publication_resume_v1"
+
+// ForgeAPISuccessV1 negotiates advisory direct forge API success telemetry (issue #1324 D9): a
+// worker that reports it may send forge-clone-success with surface "api" for the API-origin
+// reservation of its claim. Without it that surface is refused; Git-surface reports are unaffected.
+const ForgeAPISuccessV1 = "forge_" + "api_" + "success_v1"
 
 // CIConfigGuardV1 is the PROTOCOL capability a worker self-reports (PRD #2865) to declare
 // that it enforces the unconditional CI-config push guard for a run carrying
@@ -339,16 +357,19 @@ var protocolVocabulary = map[string]struct{}{
 	CrossCheckRoundsV1:              {},
 	CrossCheckPinsV1:                {},
 	CrossCheckCodexLeadV1:           {},
+	CrossCheckGatedV1:               {},
 	CrossCheckSemanticPlanV1:        {},
 	CompletionSemanticPublicationV1: {},
 	CrossCheckCodeV1:                {},
 	CIConfigGuardV1:                 {},
 	CIArtifactsV1:                   {},
+	PublicationResumeV1:             {},
+	ForgeAPISuccessV1:               {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, MemoryParkSettlementV1, DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryPrerequisiteClosureV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckSemanticPlanV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, CIArtifactsV1}
+var protocolOrder = []string{ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, MemoryParkSettlementV1, DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryPrerequisiteClosureV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckGatedV1, CrossCheckSemanticPlanV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, CIArtifactsV1, PublicationResumeV1, ForgeAPISuccessV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

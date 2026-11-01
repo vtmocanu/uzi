@@ -410,6 +410,8 @@ func (h *Handler) writeStartRunError(w http.ResponseWriter, r *http.Request, err
 			"error": "the selected harness's credentials are all disabled; enable one in Settings",
 			"code":  "no_credential_for_harness",
 		})
+	case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
+		httpx.JSON(w, http.StatusUnprocessableEntity, codexPoolUnavailableBody())
 	case errors.Is(err, workersvc.ErrNoCredentialForHarness):
 		// PRD #1429 M2 (D2): an EXPLICIT harness (request or pin) whose credential is unusable —
 		// 422 with the stable no_credential_for_harness classification. Never falls back.
@@ -548,6 +550,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	// PRD #3454: queue_reason "maintenance" for a queued run the intake pause holds back.
 	h.overlayQueueReasons(r.Context(), &dto)
 	h.overlayRunForgeOriginCooldowns(r.Context(), &dto)
+	h.overlayRunPublicationIntents(r.Context(), &dto)
 	// PRD #1798: the run's PR's published description and last write outcome. runToDTO stays
 	// pure, so this detail-only overlay sets both here. Best-effort: a lookup error leaves both
 	// null rather than failing the read of an otherwise-fine run.
@@ -1248,4 +1251,20 @@ func (h *Handler) ListRunInputs(w http.ResponseWriter, r *http.Request) {
 		out = append(out, steerInputToDTO(i))
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"inputs": out})
+}
+
+// codexPoolUnavailableCode is the typed, nonsecret reason a refused Codex start carries beside the
+// stable no_credential_for_harness code (issue #3719): the user runs Codex account mode 'auto' and
+// no pooled account can be bound. It equals the schedule skip reason of the same refusal.
+const codexPoolUnavailableCode = "codex_pool_unavailable"
+
+// codexPoolUnavailableBody is the 422 body for workersvc.ErrCodexPoolUnavailable. The code stays
+// the stable no_credential_for_harness (existing clients keep working); reason says why, and the
+// message points at the Codex accounts in Settings.
+func codexPoolUnavailableBody() map[string]any {
+	return map[string]any{
+		"error":  "no pooled Codex account is available; link, re-authenticate or pool a Codex account in Settings",
+		"code":   "no_credential_for_harness",
+		"reason": codexPoolUnavailableCode,
+	}
 }

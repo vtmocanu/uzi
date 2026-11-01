@@ -84,7 +84,7 @@ func TestForgeOriginParkObservationLiveDB(t *testing.T) {
 				if _, err := q.ParkRunForgeUnreachable(e.ctx, store.ParkRunForgeUnreachableParams{ID: id, WorkerID: pgconv.UUID(w), RetryNotBefore: pgconv.Time(time.Now().Add(time.Minute))}); err != nil {
 					t.Fatal(err)
 				}
-				n, err := q.ObserveParkedForgeOrigin(e.ctx, store.ObserveParkedForgeOriginParams{RunID: id, WorkerID: w, Generation: 1, BaseMs: 60000, CapMs: 1800000})
+				n, err := q.ObserveParkedForgeOrigin(e.ctx, store.ObserveParkedForgeOriginParams{RunID: id, WorkerID: w, Generation: 1, BaseMs: 60000, CapMs: 1800000, Reason: "transient_clone_fetch_exhausted"})
 				if err != nil || n != 1 {
 					t.Fatalf("observe = %d, %v", n, err)
 				}

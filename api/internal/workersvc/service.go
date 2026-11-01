@@ -1697,6 +1697,10 @@ type Params struct {
 	// It gates step A only (held_publish.go). The zero value is off; the default-on lives in
 	// config.go where the env is read.
 	HeldPublication bool
+
+	// PublicationResume (issue #1324, RUN_PUBLICATION_RESUME_ENABLED) carries
+	// config.Config.PublicationResume. It gates NEW enrollment only; the zero value refuses it.
+	PublicationResume bool
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -2102,6 +2106,14 @@ type Service struct {
 	// to the real freeze — so the seam is inert unless a test sets it, matching the
 	// publishFn/deleteCheckpointFn/background seam idiom above.
 	codexFreezeFn func(ctx context.Context, q codexFreezeStore, userID, runID, secretID uuid.UUID, authMode string) error
+	// codexSelectHook / codexSelectLockedHook / codexSelectBeforeFenceHook are test seams in
+	// createRunAtomic's Codex pool selection (issue #3719): the first runs after the harness
+	// resolves and before the shared secret-mutation lock is taken, the second right after the
+	// lock is held, the third after the run INSERT and before the alias fence (it receives the
+	// picked alias). Nil in production.
+	codexSelectHook            func(ctx context.Context)
+	codexSelectLockedHook      func(ctx context.Context)
+	codexSelectBeforeFenceHook func(ctx context.Context, picked uuid.UUID)
 	// claimHooks are the run-lane claim race seams (PRD #1590 M1): a LiveDB test injects a
 	// concurrent account or claim mutation between ClaimRun and assembly, after the Codex mint,
 	// or between assembly and the final exact-claim transaction. Nil in production, so every
@@ -2525,6 +2537,8 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	}
 	// Issue #1742: the attested finalize list, validated independently of the active list.
 	finalize, finalizeOK := s.validateFinalizeResume(wkr, snapshot)
+	// Issue #1324 D6: a run attested as a publication resume is never a finalize resume.
+	finalize, finalizeOK = s.withoutPublicationResume(wkr, snapshot, finalize, finalizeOK)
 	finalizeOffered := 0
 	if snapshot != nil {
 		finalizeOffered = len(snapshot.FinalizeResume)
@@ -2942,7 +2956,7 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 			return store.Worker{}, err
 		}
 		maxRequeues := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
-		if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+		if err := optInRunFences(ctx, qtx, updated.ID, true); err != nil {
 			return store.Worker{}, err
 		}
 		readopted, err = qtx.FrozenReadoptRunsFromSnapshot(ctx, store.FrozenReadoptRunsFromSnapshotParams{WorkerID: updated.ID, FrozenTargets: frozen, LockedParentIds: parents})
@@ -3505,6 +3519,9 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		}
 		// Test-only path: production always wires SetTxBeginner. Without a transaction there is no
 		// worker lock to hang the memory-park reference or supersede on, so this path skips both.
+		// This claim runs outside a transaction and cannot set the publication-resume opt-in
+		// guard_publication_resume requires, so it never selects a run with an active intent.
+		params.SkipPublicationResume = true
 		run, err := s.q.ClaimRun(ctx, params)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -4262,6 +4279,20 @@ type StateRequest struct {
 	// Absent (nil) on every non-recovery_wait report and on a legacy worker's empty-turn park. httpx.DecodeJSON rejects unknown fields, so this field MUST
 	// exist here or a new worker's report 400s.
 	RecoveryCause *string `json:"recovery_cause"`
+	// RecoveryPhase, PublicationSurface, PublicationStep and HandoffCheckpointTip (issue #1324)
+	// type a forge_unreachable park that happened while publishing: phase "publication", the
+	// surface that failed (git|api), the step (floor_refresh|push|mr_create), and optionally the
+	// published checkpoint tip a peer may resume from. Validated by validatePublicationPark;
+	// httpx.DecodeJSON rejects unknown fields, so they MUST exist here.
+	RecoveryPhase        *string `json:"recovery_phase,omitempty"`
+	PublicationSurface   *string `json:"publication_surface,omitempty"`
+	PublicationStep      *string `json:"publication_step,omitempty"`
+	HandoffCheckpointTip *string `json:"handoff_checkpoint_tip,omitempty"`
+	// PublicationHoldReason types a publication-only resume that cannot publish without model work
+	// or source: a NULL-stamp owner hold (never a failure, never a custody release) with one of
+	// publicationWorkerHoldReasons as the side row's hold_reason. Validated by
+	// validatePublicationPark; absent on every other report.
+	PublicationHoldReason *string `json:"publication_hold_reason,omitempty"`
 	// PresentationID is the worker-minted identity of the gate presentation an
 	// `awaiting_approval` report publishes (PRD #1795 M1, D1). A new id allocates the run's next
 	// gate revision; the run's CURRENT id with an unchanged approval-relevant payload is an
@@ -4453,6 +4484,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err := validateProviderPark(req); err != nil {
 		return store.Run{}, false, err
 	}
+	if err := validatePublicationPark(req); err != nil {
+		return store.Run{}, false, err
+	}
 	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return store.Run{}, false, err
@@ -4631,7 +4665,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 	}
 	// Required reconciliation cannot infer authority from an unfenced report.
-	if reconciliationOut != nil && owned.PlanCrossCheckRequired && (req.State == "running" || req.State == "awaiting_approval") && req.ClaimGeneration == nil {
+	// An ordinary gate from a legacy gated worker instead uses the server generation
+	// under the owning row lock below. This does not relax revision or running reports.
+	legacyGatedReport := req.ClaimGeneration == nil && !owned.PlanCrossCheckRequired && gatedServerGateReason(owned, wkr, req).Valid
+	if reconciliationOut != nil && (owned.PlanCrossCheckRequired || owned.PlanCrossCheckGated) && (req.State == "running" || req.State == "awaiting_approval") && req.ClaimGeneration == nil && !legacyGatedReport {
 		return owned, false, ErrClaimGenerationRequired
 	}
 	q := Store(s.q)
@@ -4670,7 +4707,14 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// Completed publication and ephemeral leasing serialize on the worker before the run.
 		// Keep leasing conditional on an ephemeral terminal report with the lease enabled.
 		leaseFence = req.ClaimGeneration != nil && s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed")
-		if len(owned.CheckpointCoordinates) > 0 || leaseFence || completedPublicationCapable(wkr, req) || req.SourcePublication != nil {
+		// A publication-enrolled run's authority writes (owner, generation, claim) need the
+		// worker locked before the run row; the enrollment is read before the run lock.
+		pubEnrolled, perr := publicationEnrolled(ctx, qtx, runID)
+		if perr != nil {
+			return store.Run{}, false, perr
+		}
+		workerLocked := len(owned.CheckpointCoordinates) > 0 || leaseFence || pubEnrolled || completedPublicationCapable(wkr, req) || req.SourcePublication != nil
+		if workerLocked {
 			if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 				if errors.Is(werr, pgx.ErrNoRows) {
 					return store.Run{}, false, ErrRunNotOwned // the worker row is gone: the run left it
@@ -4678,8 +4722,10 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, werr
 			}
 		}
-		if len(owned.CheckpointCoordinates) > 0 {
-			if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+		// The opt-ins are set only after the worker lock: without it the 00352 checkpoint fence and
+		// the publication fence stay closed and refuse a wrong-lock-order authority write.
+		if workerLocked {
+			if err := optInRunFences(ctx, qtx, wkr.ID, true); err != nil {
 				return store.Run{}, false, err
 			}
 		}
@@ -4691,6 +4737,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return store.Run{}, false, ErrRunNotOwned
 			}
 			return store.Run{}, false, lerr
+		}
+		if err := recheckPublicationEnrollment(ctx, qtx, runID, workerLocked); err != nil {
+			return store.Run{}, false, err
 		}
 		reconciled, rerr := reconciliationExists(ctx, tx, runID)
 		if rerr != nil {
@@ -4774,13 +4823,18 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		fenceTx = tx
 		qtx := store.New(tx)
-		if len(owned.CheckpointCoordinates) > 0 {
+		pubEnrolled, perr := publicationEnrolled(ctx, qtx, runID)
+		if perr != nil {
+			return store.Run{}, false, perr
+		}
+		workerLocked := len(owned.CheckpointCoordinates) > 0 || pubEnrolled
+		if workerLocked {
 			if _, err := qtx.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
 				return store.Run{}, false, err
 			}
 		}
-		if len(owned.CheckpointCoordinates) > 0 {
-			if err := qtx.OptInCheckpointCoordinates(ctx); err != nil {
+		if workerLocked {
+			if err := optInRunFences(ctx, qtx, wkr.ID, true); err != nil {
 				return store.Run{}, false, err
 			}
 		}
@@ -4791,6 +4845,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			}
 			return store.Run{}, false, lerr
 		}
+		if err := recheckPublicationEnrollment(ctx, qtx, runID, workerLocked); err != nil {
+			return store.Run{}, false, err
+		}
 		owned = locked
 		q = qtx
 	}
@@ -4799,6 +4856,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		req.RequiredCapabilities = &caps
 	}
 	var rows int64
+	stateClaimGeneration := req.ClaimGeneration
 	// PRD #1795 M1: a refused awaiting_approval report (historical id, changed payload on the
 	// current id, stale adoption). It wrote no report; it is returned AFTER the commit (its
 	// accounting commits) and after the terminal fan-out when the refusal cap failed the run.
@@ -4968,6 +5026,20 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			}
 		}
 		rows, err = q.SetRunRunning(ctx, runningParams)
+		if isGatedPlanApprovalViolation(err) {
+			// PRD #3708: the version-independent trigger refused an awaiting_approval ->
+			// running edge with no current bound approval. The SetRunRunning predicate already
+			// requires the same approval, so this mapping is defensive: it is not reachable via
+			// DiscardRunInputRows, which only touches unapplied rows and so cannot supersede an
+			// applied approval between the predicate and the trigger. It is the same
+			// stale/refused outcome as 0 rows, never a 500. The failed statement aborted the
+			// fence transaction, so nothing in it may commit.
+			if fenceTx != nil {
+				_ = fenceTx.Rollback(ctx)
+				fenceTx = nil
+			}
+			rows, err = 0, nil
+		}
 	case "awaiting_approval":
 		// PRD #122 M1: the CANDIDATE milestone list rides the pre-approval report.
 		// milestonesParam validates + kind-gates it (Decision 12/13) and returns NULL
@@ -4984,9 +5056,15 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// as an absent-safe pgtype.Text, so an off-vocabulary or absent value is an invalid
 		// (SQL NULL) param the query's COALESCE keeps out of the column.
 		inferredCaps, inferredTools, sizeClass := inferredRequirementParams(req)
-		if owned.PlanCrossCheckRequired {
+		if owned.PlanCrossCheckRequired || owned.PlanCrossCheckGated {
 			if req.ClaimGeneration == nil {
-				return owned, false, ErrClaimGenerationRequired
+				if !legacyGatedReport || owned.PlanCrossCheckRequired || !gatedServerGateReason(owned, wkr, req).Valid ||
+					!gateTracked || fenceTx == nil || owned.ClaimGeneration <= 0 || owned.ClaimReleasedAt.Valid {
+					return owned, false, ErrClaimGenerationRequired
+				}
+				// Never synthesize a worker report: only the SQL fence and the response
+				// snapshot use this server-owned value, captured under FOR UPDATE.
+				stateClaimGeneration = &owned.ClaimGeneration
 			}
 			if err := s.validatePlanCrossCheckGateReason(ctx, q, wkr, owned, req, gateTracked && fenceTx != nil); err != nil {
 				return owned, false, err
@@ -4997,7 +5075,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		approvalParams := store.SetRunAwaitingApprovalParams{
 			PlanCrossCheckGateReason:  pgconv.TextPtr(req.PlanCrossCheckGateReason),
 			PlanCrossCheckDiffRefusal: pgconv.TextOrNull(req.PlanCrossCheckDiffRefusal),
-			ClaimGeneration:           pgconv.Int8Ptr(req.ClaimGeneration),
+			ClaimGeneration:           pgconv.Int8Ptr(stateClaimGeneration),
 			PlanMd:                    stripNULParam(req.PlanMd), SessionID: sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			// Issue #1626: an interlocked run's FIRST plan-bearing report with no milestones is the
 			// explicit `[]` (planMilestonesParam), so the approve freeze builds a criteria:[]
@@ -5025,6 +5103,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				return owned, false, err
 			}
 		}
+		if owned.PlanCrossCheckGated {
+			// PRD #3708: set only after validation. The digest binds a "passed" gate to the
+			// exact candidate the checker approved; both are inputs, never grants.
+			approvalParams.ServerGateReason = gatedServerGateReason(owned, wkr, req)
+			bindGatedAwaitingApproval(owned, req, semanticPresentation != nil, &approvalParams)
+		}
 		decision := gateDecision{class: gateClassUntracked}
 		if gateTracked && fenceTx != nil {
 			var witnessWorker *uuid.UUID
@@ -5048,9 +5132,12 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 				planMd:             approvalParams.PlanMd,
 				milestones:         approvalParams.MilestonesCandidate,
 				milestonesReported: req.Milestones != nil,
-				caps:               inferredCaps,
-				tools:              inferredTools,
-				sizeClass:          sizeClass,
+				// approvalParams, not the pre-bind inferred values: for a gated run
+				// bindGatedAwaitingApproval rewrote them, and SetRunAwaitingApproval writes
+				// those, so the presented payload must describe the same requirements.
+				caps:      approvalParams.InferredCapabilities,
+				tools:     approvalParams.InferredTools,
+				sizeClass: approvalParams.SizeClass,
 			})
 			if err != nil {
 				return store.Run{}, false, err
@@ -5063,7 +5150,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		// against RUN_GATE_REFUSAL_MAX like any other refusal (issue #3081).
 		if req.ExpectedGateRevision != nil && decision.refusal == nil {
 			if req.RevisionInputID != nil && decision.class == gateClassRetain && revisionReceiptReplay(owned, req) {
-				if reconciliationOut != nil && owned.PlanCrossCheckRequired {
+				if reconciliationOut != nil && (owned.PlanCrossCheckRequired || owned.PlanCrossCheckGated) {
 					proof, err := captureLeadReconciliation(ctx, q.(*store.Queries), wkr, runID, *req.ClaimGeneration)
 					if err != nil {
 						return owned, false, err
@@ -5542,13 +5629,13 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	// Capture after state, trigger settlement, and presentation writes, while the
 	// owning lock is still held. Early returns, refusals and zero-row writes grant no proof.
 	var reconciliation *LeadReconciliation
-	if reconciliationOut != nil && owned.PlanCrossCheckRequired && rows > 0 && gateRefusal == nil &&
+	if reconciliationOut != nil && (owned.PlanCrossCheckRequired || owned.PlanCrossCheckGated) && rows > 0 && gateRefusal == nil &&
 		(req.State == "awaiting_approval" || req.State == "running") {
 		reader, ok := q.(reconciliationReader)
-		if fenceTx == nil || req.ClaimGeneration == nil || !ok {
+		if fenceTx == nil || stateClaimGeneration == nil || !ok {
 			return store.Run{}, false, ErrCrossCheckRefused
 		}
-		reconciliation, err = captureLeadReconciliation(ctx, reader, wkr, runID, *req.ClaimGeneration)
+		reconciliation, err = captureLeadReconciliation(ctx, reader, wkr, runID, *stateClaimGeneration)
 		if err != nil {
 			return store.Run{}, false, err
 		}
@@ -8327,9 +8414,12 @@ type SweepResult struct {
 	// incapable, or unresponsive past the grace (PRD #1497 M1, D5). Set from the ParkRunsAtWall row
 	// count. These transition to paused (hold_reason='budget_exhausted') and are fanned out via
 	// publishSwept; they are NOT enqueued to the judge (the run is not finished).
-	WallParked         int64
-	StaleFailed        int64
-	StaleRequeued      int64
+	WallParked    int64
+	StaleFailed   int64
+	StaleRequeued int64
+	// PublicationHeld is the number of queued runs moved to an owner hold because their
+	// publication custodian worker cannot serve them (issue #1324 D5).
+	PublicationHeld    int64
 	ChatIdleCompleted  int64
 	ProposalsRecovered int64
 	// HealthChanged is the number of runs whose health flag the detector wrote this

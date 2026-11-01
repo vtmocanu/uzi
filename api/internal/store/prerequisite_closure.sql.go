@@ -317,6 +317,53 @@ func (q *Queries) GetPrerequisiteClosure(ctx context.Context, arg GetPrerequisit
 	return i, err
 }
 
+const getPrerequisiteClosureForCapture = `-- name: GetPrerequisiteClosureForCapture :one
+SELECT id, capture_id, hold_id, run_id, user_id, repo_id, live_run_id, checksum, prerequisite_shas, pin_ref, state, reason, last_error, attempts, reconciliation_attempts, next_attempt_at, attempt_deadline, invoked_at, invoked_deadline, pin_tip, connection_id, forge_kind, normalized_base_url, project_id, default_branch, cleanup_attempts, cleanup_deadline, cleanup_exhausted_at, absent_since, absence_pass_id, audit_next_at, last_audit_pass_id, created_at, updated_at FROM recovery_prerequisite_closures WHERE capture_id = $1
+`
+
+// Unlocked precheck by capture id alone (GetPrerequisiteClosure also requires the user id).
+func (q *Queries) GetPrerequisiteClosureForCapture(ctx context.Context, captureID uuid.UUID) (RecoveryPrerequisiteClosure, error) {
+	row := q.db.QueryRow(ctx, getPrerequisiteClosureForCapture, captureID)
+	var i RecoveryPrerequisiteClosure
+	err := row.Scan(
+		&i.ID,
+		&i.CaptureID,
+		&i.HoldID,
+		&i.RunID,
+		&i.UserID,
+		&i.RepoID,
+		&i.LiveRunID,
+		&i.Checksum,
+		&i.PrerequisiteShas,
+		&i.PinRef,
+		&i.State,
+		&i.Reason,
+		&i.LastError,
+		&i.Attempts,
+		&i.ReconciliationAttempts,
+		&i.NextAttemptAt,
+		&i.AttemptDeadline,
+		&i.InvokedAt,
+		&i.InvokedDeadline,
+		&i.PinTip,
+		&i.ConnectionID,
+		&i.ForgeKind,
+		&i.NormalizedBaseUrl,
+		&i.ProjectID,
+		&i.DefaultBranch,
+		&i.CleanupAttempts,
+		&i.CleanupDeadline,
+		&i.CleanupExhaustedAt,
+		&i.AbsentSince,
+		&i.AbsencePassID,
+		&i.AuditNextAt,
+		&i.LastAuditPassID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const insertPrerequisiteClosure = `-- name: InsertPrerequisiteClosure :one
 
 INSERT INTO recovery_prerequisite_closures
@@ -846,7 +893,7 @@ func (q *Queries) LockPrerequisiteClosure(ctx context.Context, id uuid.UUID) (Re
 }
 
 const lockPrerequisiteHold = `-- name: LockPrerequisiteHold :one
-SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding FROM recovery_custody_holds WHERE id = $1 FOR NO KEY UPDATE
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding, final_closure_id FROM recovery_custody_holds WHERE id = $1 FOR NO KEY UPDATE
 `
 
 func (q *Queries) LockPrerequisiteHold(ctx context.Context, holdID uuid.UUID) (RecoveryCustodyHold, error) {
@@ -885,12 +932,13 @@ func (q *Queries) LockPrerequisiteHold(ctx context.Context, holdID uuid.UUID) (R
 		&i.CompletedPublicationReason,
 		&i.FinalPublicationID,
 		&i.MergedPredecessorDiscardBinding,
+		&i.FinalClosureID,
 	)
 	return i, err
 }
 
 const lockPrerequisiteRun = `-- name: LockPrerequisiteRun :one
-SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates, retained_park_count, ignored_inferred_capabilities, reserve_hold_reason, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_credential_id, reserve_exempt_window_reset, reserve_exempt_prior_pct, hinted_capabilities, capability_inference_evidence, idle_stall_park_count, forge_admission FROM runs WHERE id = $1 FOR KEY SHARE
+SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates, retained_park_count, ignored_inferred_capabilities, reserve_hold_reason, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_credential_id, reserve_exempt_window_reset, reserve_exempt_prior_pct, hinted_capabilities, capability_inference_evidence, idle_stall_park_count, forge_admission, codex_select_reason, recovery_wait_phase, plan_cross_check_gated FROM runs WHERE id = $1 FOR KEY SHARE
 `
 
 func (q *Queries) LockPrerequisiteRun(ctx context.Context, runID uuid.UUID) (Run, error) {
@@ -1090,6 +1138,9 @@ func (q *Queries) LockPrerequisiteRun(ctx context.Context, runID uuid.UUID) (Run
 		&i.CapabilityInferenceEvidence,
 		&i.IdleStallParkCount,
 		&i.ForgeAdmission,
+		&i.CodexSelectReason,
+		&i.RecoveryWaitPhase,
+		&i.PlanCrossCheckGated,
 	)
 	return i, err
 }
@@ -1493,6 +1544,69 @@ type ReservePrerequisiteCleanupParams struct {
 // Durable generation BEFORE a delete; cleanup exhaustion retains the live pointer for listing only.
 func (q *Queries) ReservePrerequisiteCleanup(ctx context.Context, arg ReservePrerequisiteCleanupParams) (RecoveryPrerequisiteClosure, error) {
 	row := q.db.QueryRow(ctx, reservePrerequisiteCleanup, arg.PassID, arg.LeaseSeconds, arg.ID)
+	var i RecoveryPrerequisiteClosure
+	err := row.Scan(
+		&i.ID,
+		&i.CaptureID,
+		&i.HoldID,
+		&i.RunID,
+		&i.UserID,
+		&i.RepoID,
+		&i.LiveRunID,
+		&i.Checksum,
+		&i.PrerequisiteShas,
+		&i.PinRef,
+		&i.State,
+		&i.Reason,
+		&i.LastError,
+		&i.Attempts,
+		&i.ReconciliationAttempts,
+		&i.NextAttemptAt,
+		&i.AttemptDeadline,
+		&i.InvokedAt,
+		&i.InvokedDeadline,
+		&i.PinTip,
+		&i.ConnectionID,
+		&i.ForgeKind,
+		&i.NormalizedBaseUrl,
+		&i.ProjectID,
+		&i.DefaultBranch,
+		&i.CleanupAttempts,
+		&i.CleanupDeadline,
+		&i.CleanupExhaustedAt,
+		&i.AbsentSince,
+		&i.AbsencePassID,
+		&i.AuditNextAt,
+		&i.LastAuditPassID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const reservePrerequisiteFinalListing = `-- name: ReservePrerequisiteFinalListing :one
+UPDATE recovery_prerequisite_closures p
+SET last_audit_pass_id = $1,updated_at=now()
+WHERE p.id = $2 AND p.state='pinned' AND p.absent_since IS NULL
+    AND (p.cleanup_deadline IS NULL OR p.cleanup_deadline<=now())
+    AND p.cleanup_attempts = $3::int
+    AND p.last_audit_pass_id IS DISTINCT FROM $1
+    AND $1::uuid IS NOT NULL AND $1::uuid <> '00000000-0000-0000-0000-000000000000'::uuid
+    AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id=p.capture_id AND c.state='available'
+        AND c.manifest_bound AND c.expires_at > clock_timestamp())
+RETURNING p.id, p.capture_id, p.hold_id, p.run_id, p.user_id, p.repo_id, p.live_run_id, p.checksum, p.prerequisite_shas, p.pin_ref, p.state, p.reason, p.last_error, p.attempts, p.reconciliation_attempts, p.next_attempt_at, p.attempt_deadline, p.invoked_at, p.invoked_deadline, p.pin_tip, p.connection_id, p.forge_kind, p.normalized_base_url, p.project_id, p.default_branch, p.cleanup_attempts, p.cleanup_deadline, p.cleanup_exhausted_at, p.absent_since, p.absence_pass_id, p.audit_next_at, p.last_audit_pass_id, p.created_at, p.updated_at
+`
+
+type ReservePrerequisiteFinalListingParams struct {
+	PassID     pgtype.UUID `json:"pass_id"`
+	ID         uuid.UUID   `json:"id"`
+	Generation int32       `json:"generation"`
+}
+
+// FINAL's pre-release listing: reserves a pass on a live pinned closure of an available
+// capture, fenced by the cleanup generation. It never authorizes a delete.
+func (q *Queries) ReservePrerequisiteFinalListing(ctx context.Context, arg ReservePrerequisiteFinalListingParams) (RecoveryPrerequisiteClosure, error) {
+	row := q.db.QueryRow(ctx, reservePrerequisiteFinalListing, arg.PassID, arg.ID, arg.Generation)
 	var i RecoveryPrerequisiteClosure
 	err := row.Scan(
 		&i.ID,

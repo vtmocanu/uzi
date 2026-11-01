@@ -7,5 +7,8 @@ SELECT r.id, r.checkpoint_tip,
     EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state NOT IN ('available','expired','discarded'))::boolean AS capture_uncertain,
     EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.state NOT IN ('released','discarded'))::boolean AS custody_uncertain,
     (EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state NOT IN ('preparing','uploading','available','needs_action','expired','discarded'))
-     OR EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.state NOT IN ('open','released','discarded')))::boolean AS unknown_evidence
+     OR EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.state NOT IN ('open','released','discarded')))::boolean AS unknown_evidence,
+    -- Issue #1324 D7: a run with an active publication intent is never failed over the requeue
+    -- cap; it parks as an owner hold with its custody and source kept.
+    EXISTS (SELECT 1 FROM run_publication_resume p WHERE p.run_id = r.id AND p.state = 'active')::boolean AS publication_enrolled
 FROM runs r WHERE r.id = ANY(@run_ids::uuid[]);

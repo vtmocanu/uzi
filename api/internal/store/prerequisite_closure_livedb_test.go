@@ -85,11 +85,14 @@ func prerequisiteInvoke(t *testing.T, ctx context.Context, f prerequisiteFixture
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
-	r, err := q.LockPrerequisiteRun(ctx, f.run)
-	if err != nil {
+	// Take LockPrerequisiteRun's row lock by id only: the migration round-trip calls this at
+	// schema 387, where a generated `SELECT *` would name runs columns later migrations add.
+	// The generated query itself is exercised by the repair, budget and handler tests.
+	var lockedRun uuid.UUID
+	if err = tx.QueryRow(ctx, "SELECT id FROM runs WHERE id = $1 FOR KEY SHARE", f.run).Scan(&lockedRun); err != nil {
 		t.Fatal(err)
 	}
-	if r.ID != f.run {
+	if lockedRun != f.run {
 		t.Fatal("wrong run")
 	}
 	h, err := q.LockPrerequisiteHold(ctx, f.hold)
@@ -358,6 +361,12 @@ func TestPrerequisiteClosureQueryExecutionLiveDB(t *testing.T) {
 	ctx, _, pool := prerequisiteMigratedPool(t, "prereq_queries_")
 	q := store.New(pool)
 	f := prerequisiteNew(t, ctx, pool)
+	// Exercise the generated full-run projection at the current schema, separately
+	// from the version-pinned rollback fixture's identity-only lock.
+	lockedRun, err := q.LockPrerequisiteRun(ctx, f.run)
+	if err != nil || lockedRun.ID != f.run {
+		t.Fatalf("current-schema run lock: run=%s err=%v", lockedRun.ID, err)
+	}
 	due := pgtype.Timestamptz{Time: time.Now().Add(48 * time.Hour), Valid: true}
 	rows, err := q.ListPrerequisitePendingDue(ctx, store.ListPrerequisitePendingDueParams{DueAt: due, AfterDueAt: pgtype.Timestamptz{InfinityModifier: pgtype.NegativeInfinity, Valid: true}, Lim: 10})
 	if err != nil || len(rows) != 1 || rows[0].ID != f.closure.ID {
@@ -685,12 +694,14 @@ func TestPrerequisiteClosureMigrationRoundTripLiveDB(t *testing.T) {
 		t.Run(state, func(t *testing.T) {
 			// A fresh database prevents an earlier pending row masking later states.
 			ctx, dsn, pool := prerequisiteMigratedPool(t, "prereq_down_state_")
-			// Isolate 00387: later migrations roll back first and are not this test's subject.
+			// Seed through the head-generated queries, then isolate 00387: later
+			// migrations (which hold no closure-release evidence here) roll back
+			// first and are not this test's subject.
+			f := prerequisiteNew(t, ctx, pool)
+			prerequisiteSetState(t, ctx, f, state)
 			if err := store.MigrateDownTo(ctx, dsn, 387); err != nil {
 				t.Fatal(err)
 			}
-			f := prerequisiteNew(t, ctx, pool)
-			prerequisiteSetState(t, ctx, f, state)
 			prerequisiteSchemaVersion(t, ctx, pool, 387)
 			if err := store.MigrateDownTo(ctx, dsn, 386); err == nil {
 				t.Fatalf("Down forgot %s evidence", state)

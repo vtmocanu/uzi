@@ -234,6 +234,7 @@ uzi admin egress-profile list | show <name>
 uzi admin maintenance status [--json]
 uzi settings get
 uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]
+uzi settings codex-mode default|auto
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -1489,13 +1490,16 @@ uzi run discard <run-id> --hold <hold-id> --yes
 - **Terminal and owner-scoped.** A discarded hold cannot be revived, and you can discard
   only your own runs' holds.
 
-C1b prerequisite pins (`refs/uzi-prereq/<capture-id>`, #3591) are a separate
+Prerequisite pins (`refs/uzi-prereq/<capture-id>`, #3591) are a separate
 API lifecycle. This CLI has no prerequisite-pin listing or expiry command;
-`run recovery`/`run held` do not acquire that owner visibility in C1b. A pinned
-thin archive still cannot authorize archive FINAL or local-source cleanup.
-See [prerequisite pin restore and backlog handling](run-recovery.md#prerequisite-pins-api-lifecycle-release-still-disabled)
-for native Git restore and the frozen-binding/cleanup limits. Owner/CLI pin
-visibility belongs to C3; thin custody release belongs to C2.
+`run recovery`/`run held` do not show pin state. On a server that enables it for
+GitHub.com, a pinned thin archive can release custody through the archive FINAL
+(#3727); otherwise it cannot authorize archive FINAL or local-source cleanup.
+Pinning alone never authorizes local cleanup: an ACK and the existing independent
+source, writer and shared-consumer guards still apply.
+See [prerequisite pin restore and backlog handling](run-recovery.md#prerequisite-pins-lifecycle-and-custody-release)
+for native Git restore, the release conditions and the frozen-binding/cleanup
+limits. Owner/CLI pin visibility belongs to C3.
 
 ### Fetching and expiring terminal held refs: `uzi run held`
 
@@ -2660,6 +2664,7 @@ uzi token list                                 # labels, default flag, pool opt-
 uzi token test <label> [--kind anthropic|codex|openai-key]
 uzi token pool console-key --on                # add it to the auto-selection pool
 uzi token pool console-key --off               # take it back out
+uzi token pool work-codex --kind codex --on    # pool a Codex login (see settings codex-mode)
 uzi worker set-token <worker-id> console-key   # bind a worker to a named token
 uzi worker set-token <worker-id> --default     # clear the binding
 uzi worker set-token <worker-id> --auto        # pick per claim, from the pool
@@ -2686,6 +2691,11 @@ successful credential check. A result can go stale after the test.
 the same reason the others are not: it mints nothing and reveals nothing, it
 only re-points spend among tokens you already hold. Adding, renaming,
 re-defaulting and deleting stay web-only.
+
+It pools Anthropic tokens and Codex subscription logins (OpenAI API keys have
+no pool). Pass `--kind anthropic|codex` when the same label exists in both
+kinds; without it that is a usage error. See [Codex account
+mode](#codex-account-mode).
 
 `uzi token list` prints two columns about the pool, and they answer different
 questions:
@@ -3082,6 +3092,60 @@ On a run the reserve touches, `uzi run get` shows:
 - a pending reserve pause: the `PAUSE_REQUESTED` suffix described under
   `run pause` above.
 
+### Codex account mode
+
+```sh
+uzi settings codex-mode auto
+uzi settings codex-mode default
+uzi token pool work-codex --kind codex --on
+```
+
+`uzi settings codex-mode default|auto` sets how a new Codex run chooses its
+login (`PUT /api/me/codex-account-mode`, which accepts a `uzc_` Bearer token).
+`default` binds your default Codex login. `auto` picks, at run creation, the
+pooled Codex login with the most limit headroom; you opt logins into the pool
+per login with `uzi token pool <label> --kind codex --on` (the pool is empty
+until you do, and `auto` then falls back to your default). Logins are created
+unpooled. `--kind` is required only when the label is held by both an Anthropic
+token and a Codex login: without it that is a usage error. Before Codex pooling
+existed, `uzi token pool <label>` silently picked the Anthropic token in that
+case, so a script that relied on it now needs `--kind anthropic`. An
+`openai_api_key` cannot be pooled. `uzi token list` shows the Codex pool state in
+the `POOL` column; its `ELIGIBLE` column is Anthropic-only and reads `-` for a
+Codex login. The HTTP routes are `PUT /api/me/codex-account-mode` and `PATCH
+/api/me/secrets/codex_auth/{id}/auto-eligible`.
+
+`uzi run get` explains the pick on the `CODEX_ALIAS` row, or `not recorded` for
+a run created before auto-selection:
+
+| Reason | `CODEX_ALIAS` text |
+|---|---|
+| `default` | `work-codex — default` |
+| `pool_empty` | `work-codex — default (auto mode, but no login is pooled)` |
+| `auto` | `work-codex — auto (most limit headroom)` |
+| `best_of_pool` | `work-codex — auto (best of pool; every login was under the headroom floor)` |
+| `pool_stale` | `work-codex — auto (no usage reading yet; first pooled login)` |
+| `pool_exhausted` | `work-codex — auto (every login at capacity; soonest to release)` |
+
+The TUI detail rail shows the short form (`default`, `pool empty`, `auto`,
+`best of pool`, `pool stale`, `pool exhausted`), and `--json` carries the raw
+value as `codex_select_reason`. See [Letting uzi pick the
+account](./codex-credentials.md#letting-uzi-pick-the-account) for how the
+choice is made.
+
+When `auto` has pooled logins but none can be bound, Codex is unusable and the
+selection never falls back to your default login. A run that did not name a
+harness starts on Claude. A run that explicitly asks for Codex, including a
+manual MR rework of a Codex run, is refused with a 422 whose code is
+`no_credential_for_harness` and whose reason is `codex_pool_unavailable`
+(the CLI prints `no pooled Codex account is available; link, re-authenticate
+or pool a Codex account in Settings (reason: codex_pool_unavailable)`). A
+schedule skips (or, once, holds) with the skip reason `codex_pool_unavailable`,
+and an automatic MR rework is skipped. When every Codex login you hold is
+disabled, the existing disabled-credential refusal applies instead (a 422 with
+no reason; a schedule records `credential_disabled`). `uzi settings get` shows `Codex account
+mode:` after the reserve line, and `--json` carries `codex_account_mode`.
+
 ### Plan cross-check evidence
 
 `uzi whoami` shows your `PLAN CROSS-CHECK` consent value. Change it in
@@ -3115,6 +3179,29 @@ appends the refusal sub-code with underscores shown as spaces, e.g.
 A stored checker APPROVE and a current human gate can coexist: decide against
 the displayed gate revision, not historical findings. See
 [Cross-check](./cross-check.md) for fallbacks and terminal delivery failures.
+
+For a run [checked before your review](./cross-check.md#checked-before-your-review),
+`uzi run get <id>` adds these rows. `PLAN_CHECK_MODE` and the `passed` /
+`not checked` / `checked an earlier version of this plan` results are specific
+to that mode; the `PLAN_CHECK_ROUNDS` and `PLAN_CHECK_ROUND_<n>_*` rows
+appear for any plan cross-check with recorded rounds (and `PLAN_CHECK_DEADLINE`
+while its latest round is pending), auto-approved runs included:
+
+| Row | Value |
+|---|---|
+| `PLAN_CHECK_MODE` | `checked before your review`. |
+| `PLAN_CROSS_CHECK` | The gate result, for example `plan cross-check: passed after 2 rounds`, `plan cross-check: not checked` (once a plan is presented, or on a finished run), `plan cross-check: checked an earlier version of this plan`, or `plan cross-check: unavailable, not supported on this worker`. `passed` needs no gate reason, a latest check that approved and a check of the current plan. |
+| `PLAN_CHECK_ROUNDS` | The number of rounds shown (at most 5). |
+| `PLAN_CHECK_DEADLINE` | The checker deadline in RFC 3339 UTC, while the latest round is pending. |
+| `PLAN_CHECK_ROUND_<n>_RESULT` | Round n's verdict. |
+| `PLAN_CHECK_ROUND_<n>_SUMMARY`, `_<i>_FILE`, `_<i>_SEVERITY`, `_<i>_SUMMARY`, `_<i>_RATIONALE`, `_MORE` | Round n's findings (20 items at most, then `N findings omitted`). The latest round's findings appear in the `PLAN_CHECK_*` rows above instead. |
+| `PLAN_CHECK_ROUND_<n>_RESPONSE_STATE` | `reported`, `truncated`, `not_reported`, `unknown`, `replanned_after_interruption`, `reported_in_presented_plan` or `no_following_candidate`. |
+| `PLAN_CHECK_ROUND_<n>_RESPONSE` | `lead's response (unverified claims): ` followed by the "Cross-check dispositions" text of the next candidate, sanitized. It is the lead's claim, never a verified resolution, and may include older entries. |
+
+After a human revision the `PLAN_CHECK_` rows use the `EARLIER_PLAN_CHECK_`
+prefix like the rest of the evidence. In `--json`, `plan_cross_check_gated` is `true` for such a
+run (omitted otherwise), and `plan_cross_check_summary` gains `rounds` and
+`deadline_at`; an older server omits all three and the CLI prints no new rows.
 
 ### Code cross-check evidence
 
@@ -3553,6 +3640,38 @@ that unpublished latest edits are available on another worker.
 through `paused` unless `--until paused` is selected.
 See [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
 for both harnesses, verified-capture limits and mixed-fleet compatibility.
+
+### Publication parks and holds
+
+A `recovery_wait` / `forge_unreachable` run whose `recovery_wait_phase` is
+`publication` met a sustained forge outage while publishing finished work.
+`uzi run get`, `--follow` and the TUI detail header share one line (the TUI
+board row for an owner hold is shorter: `Publishing held · Resume
+(publication-only)/Cancel · detail: enter`):
+
+- Timed wait: `publishing paused: forge unreachable; waiting 12m of 24h,
+  retry at 15:04`, or `waiting 12m, no limit` when
+  `RUN_PROVIDER_PARK_MAX_DURATION` is `0`, followed by ` · PR #42` (GitHub,
+  Forgejo), ` · MR !42` (GitLab) or ` · branch <name>` when known.
+- Owner hold: `publishing held: <reason>`, with a fixed sentence per
+  `publication_hold_reason` (`publication_retry_exhausted`,
+  `publication_custodian_unavailable`, `publication_model_required`,
+  `publication_source_unavailable`, `publication_intent_mismatch`). An
+  unrecognised reason is shown as unrecognised, and an unrecognised phase as a
+  generic parked line.
+
+A hold prints `Owner Resume or Cancel; no automatic resume.`, then
+`uzi run resume <id>` (starts a new publication-only attempt; no model work)
+and `uzi run cancel <id>`. Resume grants no other budget. The park does not
+use or show the pre-clone forge park count.
+
+With `--json` the run carries `recovery_wait_phase`, and while the run holds
+an active publication intent `publication_wait_started_at`,
+`publication_wait_limit_seconds`, `publication_hold_reason`,
+`publication_first_wait_at`, `publication_park_total`, `publication_episode`
+and `publication_intent`. The run's forge cooldown object adds `surfaces`
+(`git`, `api`), the unverified evidence surfaces. See
+[Forge unreachable while publishing](./run-recovery-wait.md#forge-unreachable-while-publishing).
 
 ### Worker recovery exhaustion
 

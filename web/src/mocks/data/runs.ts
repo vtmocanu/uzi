@@ -7,6 +7,7 @@ import { daysAgo, minsAgo, minsAhead, secsAgo } from "./time";
 import { LIVE_RUN_ID } from "./boards";
 import { SAMPLE_PLAN, SEEDED_PLAN } from "./plans";
 import { demoTailEstimated, demoTailUnpriced } from "./runHistories";
+import { gatedCrossCheckRuns } from "./planCrossCheckGated";
 
 // ── Runs ─────────────────────────────────────────────────────────────────────
 
@@ -146,6 +147,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -225,6 +227,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -296,6 +299,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -364,6 +368,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -430,6 +435,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -498,6 +504,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -599,6 +606,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -733,6 +741,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -809,6 +818,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -874,6 +884,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -964,6 +975,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -1099,6 +1111,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -1173,6 +1186,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -1260,8 +1274,12 @@ export const mockRuns: Run[] = [
     rate_limit_type: null,
     recovery_wait_cause: null,
     codex_account_action: null,
-    codex_secret_id: "sec-codex-linked",
-    codex_secret_label: "chatgpt-plus",
+    // Issue #3719: created under codex_account_mode "auto" with every pooled login low on
+    // headroom, so it bound the pooled `team-codex` as best of pool. The run page's
+    // credential chip shows the reason, and links to Settings because it is worth reading.
+    codex_secret_id: "sec-codex-team",
+    codex_secret_label: "team-codex",
+    codex_select_reason: "best_of_pool",
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -1344,6 +1362,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -1425,6 +1444,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -1499,6 +1519,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -1594,6 +1615,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -1700,6 +1722,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -1768,6 +1791,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -1852,6 +1876,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -1933,6 +1958,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -2012,6 +2038,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -2110,6 +2137,7 @@ export const mockRuns: Run[] = [
     codex_account_action: null,
     codex_secret_id: null,
     codex_secret_label: null,
+    codex_select_reason: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
     provider_park_count: 0,
@@ -2138,6 +2166,9 @@ mockRuns.push({
   salvage_state: null, salvage_ref: null, salvage_tip: null, salvage_expires_at: null,
   usage_estimated_tail: null,
 });
+
+// PRD #3708: gated plan cross-check runs (checked before your review), from the parked gate.
+mockRuns.push(...gatedCrossCheckRuns(mockRuns.find((r) => r.id === "run-awaiting")!));
 
 // PRD #1732 D14: runs HELD on `credential_disabled` — server-parked (status `paused`,
 // hold_reason set), resumed by the promoter on Enable, never by a plain Resume. Derived
@@ -2196,6 +2227,36 @@ for (const [id, status, retry] of [
       half_open_run_id: "run-forge-queued", state: "legacy_serialized_until_upgrade",
       detail: "One active flight is checking this origin; recovery is unverified.",
     },
+  });
+}
+// Issue #1324: publication-phase forge parks (the run finished its work; the forge was
+// unreachable while publishing). Open /runs/run-forge-publication-timed (with a wait limit),
+// -timed-nolimit (limit disabled), -hold (limit reached), -hold-custody / -hold-model (other
+// fixed blockers), or -hold-unknown (an unrecognised reason). The -branch fixture has no
+// merge request yet. The forge park count is the pre-clone budget and stays out of these.
+for (const [id, retry, reason, limit, mrIid] of [
+  ["run-forge-publication-timed", minsAhead(5), undefined, 7200, 42],
+  ["run-forge-publication-timed-nolimit", minsAhead(5), undefined, undefined, 42],
+  ["run-forge-publication-branch", minsAhead(5), undefined, 7200, null],
+  ["run-forge-publication-hold", null, "publication_retry_exhausted", 7200, 42],
+  ["run-forge-publication-hold-custody", null, "publication_custodian_unavailable", 7200, 42],
+  ["run-forge-publication-hold-model", null, "publication_model_required", undefined, null],
+  ["run-forge-publication-hold-unknown", null, "publication_future_reason", 7200, 42],
+] as const) {
+  mockRuns.push({
+    ...pausedBase, id, status: "recovery_wait", hold_reason: null,
+    issue_title: "Publish finished work once the forge is reachable",
+    recovery_wait_cause: "forge_unreachable", recovery_wait_phase: "publication",
+    recovery_retry_not_before: retry,
+    forge_park_count: 0, forge_park_max: 5,
+    health: "ok", health_reason: null,
+    publication_wait_started_at: minsAgo(retry === null ? 125 : 20),
+    publication_wait_limit_seconds: limit,
+    publication_hold_reason: reason,
+    publication_first_wait_at: minsAgo(130),
+    publication_park_total: 3, publication_episode: 1,
+    publication_intent: { branch: "agent/issue-1324", mr_iid: mrIid, original_head: "1a2b3c4d5e6f",
+      candidate: "6f5e4d3c2b1a", state: "prepared", enrollment_seq: 1 },
   });
 }
 // Issue #3181: the token-switch holds. The owner switched each run to console-key; its
@@ -2260,6 +2321,7 @@ mockRuns.push(
     anthropic_headroom_pct: null,
     codex_secret_id: "sec-codex-team-laptop",
     codex_secret_label: "team-codex-laptop",
+    codex_select_reason: null,
     milestones_completed: [],
     checkpoint_tip_at: null,
     budget_used_seconds: 600,

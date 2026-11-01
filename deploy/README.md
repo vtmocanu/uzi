@@ -396,6 +396,11 @@ image rebuild; old versions stay in GHCR). Because `0.*` would otherwise re-adva
 bad version, resuming auto-tracking means cutting a **fix release** (`0.Y.Z+1`) first, then
 setting `targetRevision` back to `0.*`.
 
+A rollback that crosses migrations 00394/00395 (gated Plan cross-check, PRD #3708) needs the
+drain procedure first: with the upgraded api stopped, run
+`scripts/gated-cross-check-drain-check.sql` and abort if it reports a non-terminal gated run.
+See [Rolling back Plan cross-check before the human gate](../docs/cross-check.md#rolling-back-plan-cross-check-before-the-human-gate).
+
 **Hotfix** remains a manual procedure. Start a worktree at the previous stable patch
 (for example `v0.85.2` for `v0.85.3`), cherry-pick the already-merged fixes, add a cited
 CHANGELOG section and bump both chart version fields. This manual off-main preparation

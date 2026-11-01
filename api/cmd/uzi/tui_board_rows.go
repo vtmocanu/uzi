@@ -630,7 +630,11 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	// the owner's alias label (user-authored), folded through cellText by
 	// codexAccountActionLine and through renderer.Plain here (D7).
 	if isForgeOwnerHold(r.RunDTO) {
-		out := prefix + paintSeg(m.pal.amber, bg, false, "Owner-held · Resume/Cancel · detail: enter")
+		hold := "Owner-held · Resume/Cancel · detail: enter"
+		if isPublicationPark(r.RunDTO) {
+			hold = "Publishing held · Resume (publication-only)/Cancel · detail: enter"
+		}
+		out := prefix + paintSeg(m.pal.amber, bg, false, hold)
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}
 	if line := providerBoardLine(r.RunDTO); line != "" {

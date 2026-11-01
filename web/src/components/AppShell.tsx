@@ -222,6 +222,7 @@ export function __resetBrandingForTests(): void {
 }
 
 function useBranding(): Branding | null {
+  const demoMode = useDemoMode();
   const [branding, setBranding] = useState<Branding | null>(null);
   useEffect(() => {
     if (!brandingPromise) {
@@ -243,7 +244,9 @@ function useBranding(): Branding | null {
       live = false;
     };
   }, []);
-  return branding;
+  // Keep the real response cached so toggling demo off restores it immediately.
+  // All chrome, title and favicon consumers share the stock null-branding path.
+  return demoMode ? null : branding;
 }
 
 // The app-logo <img> src, or null when the mark should render the default inline
@@ -314,13 +317,15 @@ function AppMark({ branding, className }: { branding: Branding | null; className
 // The license/author credit, gated on the build-time source constant
 // SHOW_LICENSE_CREDIT (see lib/flags.ts), default OFF (hidden). Still never a
 // setting — a rebrand or full white-label cannot show or strip it; only editing
-// the source flag and rebuilding does. When enabled it renders independently of
+// the source flag and rebuilding does. Demo mode hides it for screenshots.
+// When enabled it renders independently of
 // the build-info fetch (so it shows during load and on fetch failure) on both
 // the signed-in sidebar footer and the signed-out shell. `©` (U+00A9), not `·`.
 const LICENSE_CREDIT = "MIT © Vlad Mocanu";
 
 function LicenseCredit({ className }: { className?: string }) {
-  if (!licenseCreditEnabled()) return null;
+  const demoMode = useDemoMode();
+  if (demoMode || !licenseCreditEnabled()) return null;
   return (
     <span data-testid="license-credit" className={cx("font-mono text-[10px] text-faint", className)}>
       {LICENSE_CREDIT}

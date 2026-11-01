@@ -61,7 +61,7 @@ function WorkerOfflineBanner() {
 // terminal run is an "ended" conversation, not a "completed"/"failed" job.
 function ChatStatusBadge({ status, run }: { status: string; run?: Run | null }) {
   if (isTerminalRun(status)) return <Badge tone="neutral">ended</Badge>;
-  return <StatusPill health={run?.health} status={status} recovery_wait_cause={run?.recovery_wait_cause} recovery_retry_not_before={run?.recovery_retry_not_before} />;
+  return <StatusPill health={run?.health} status={status} recovery_wait_cause={run?.recovery_wait_cause} recovery_retry_not_before={run?.recovery_retry_not_before} recovery_wait_phase={run?.recovery_wait_phase} />;
 }
 
 // ── Conversation list (/chat) ────────────────────────────────────────────────

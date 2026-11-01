@@ -46,6 +46,7 @@ cd api && ../scripts/sqlc.sh v1.31.1 generate
 | `fixtures/code-cross-check/` | `api/internal/handler/code_cross_check_contract_test.go`, `agent/test/code-cross-check-wire.test.ts` |
 | `fixtures/claims/resume-unapproved-no-session.json` | `api/internal/workersvc/resume_unapproved_claim_livedb_test.go`, `agent/test/runner-gate-verdict-interruption.test.ts` |
 | `fixtures/claims/claim-response-limit.json` | `api/internal/workersvc/claim_size_test.go`, `agent/test/client-claim-response-bound.test.ts` |
+| `fixtures/forge-api-origin/cases.json` | `api/internal/store/forge_api_origin_livedb_test.go` (LiveDB), `agent/test/forge-api-origin-parity.test.ts` |
 | `fixtures/recovery-archive-redundancy/vectors.json` | `api/internal/workersvc/archive_redundancy_test.go`, `agent/test/recovery-archive-redundancy.test.ts` |
 | `api/internal/hostedsvc/testdata/` | the controller's contract goldens, the other way |
 
