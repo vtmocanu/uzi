@@ -34,10 +34,13 @@ export type BudgetRun = {
 export type BudgetView = {
   // Active time used so far (paused-aware). Aged client-side for a running run.
   usedSec: number;
-  // The FROZEN budget, excluding any extension — the "/ 8h" number.
+  // The FROZEN wall budget, excluding extensions and finalization reserve.
+  // When the frozen wall is unknown, this is the aggregate server total minus extensions.
   wallSec: number;
   // The owner-granted extension on top of wallSec (0 when never extended).
   extSec: number;
+  // Derived only from a known frozen wall and server total; never from used + remaining.
+  finalizeSec?: number;
   // The effective admin cap (0 = extending disabled).
   capSec: number;
   // The most one Extend may add: the per-request cap (not reduced by earlier extensions).
@@ -125,6 +128,7 @@ export function extendBudgetView(run: BudgetRun, nowMs: number): BudgetView | nu
       usedSec: used,
       wallSec: Math.max(0, wall),
       extSec: ext,
+      finalizeSec: run.budget_wall_seconds == null ? 0 : Math.max(0, total - wall - ext),
       capSec: cap,
       perExtensionMaxSec: perExtensionMax,
       remainingSec: remaining,
@@ -150,6 +154,7 @@ export function extendBudgetView(run: BudgetRun, nowMs: number): BudgetView | nu
       usedSec: used,
       wallSec: wall,
       extSec: ext,
+      finalizeSec: total == null || run.budget_wall_seconds == null ? 0 : Math.max(0, total - wall - ext),
       capSec: cap,
       perExtensionMaxSec: perExtensionMax,
       remainingSec: remaining,
@@ -165,10 +170,13 @@ export function extendBudgetView(run: BudgetRun, nowMs: number): BudgetView | nu
  * budgetRightLabel renders the "/ 8h" right-hand side: the frozen budget, plus `+<extension>`
  * when the run has been extended, so an extended 8h reads `8h+2h`, NEVER `10h` (the extension
  * is an additive column the owner granted, distinct from the immutable frozen budget).
+ * A known finalization reserve is named separately so the displayed parts cover the total.
  */
 export function budgetRightLabel(view: BudgetView): string {
   const base = formatBudgetDuration(view.wallSec);
-  return view.extSec > 0 ? `${base}+${formatBudgetDuration(view.extSec)}` : base;
+  const extended = view.extSec > 0 ? `${base}+${formatBudgetDuration(view.extSec)}` : base;
+  const finalize = view.finalizeSec ?? 0;
+  return finalize > 0 ? `${extended}+${formatBudgetDuration(finalize)} finalization reserve` : extended;
 }
 
 // formatLocalTime renders an ISO instant as the viewer's local wall-clock time ("15:20"),
