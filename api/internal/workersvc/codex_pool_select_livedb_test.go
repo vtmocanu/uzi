@@ -679,6 +679,43 @@ func TestCodexPoolUnusableReadersLiveDB(t *testing.T) {
 	}
 }
 
+// TestCodexPoolEmptyResolveHarnessForUserOnLiveDB: the transaction-bound reader over an EMPTY
+// pool keeps today's default-credential usability in both modes: a usable subscription or API-key
+// default resolves explicit Codex, and no Codex credential refuses without the pool error.
+func TestCodexPoolEmptyResolveHarnessForUserOnLiveDB(t *testing.T) {
+	defaults := []struct {
+		name string
+		seed func(fx *poolFix) // nil: no Codex credential at all (unusable default)
+	}{
+		{"subscription default", func(fx *poolFix) { fx.makeDefault(fx.newAccount("def").alias) }},
+		{"api key default", func(fx *poolFix) {
+			fx.makeDefault(fx.env.seedStaticAPIKey(fx.t, fx.userID, "key", codexToken("sk")))
+		}},
+		{"no codex credential", nil},
+	}
+	for _, d := range defaults {
+		for _, mode := range []string{"default", "auto"} {
+			t.Run(d.name+"/"+mode, func(t *testing.T) {
+				fx := newPoolFix(t)
+				if d.seed != nil {
+					d.seed(fx)
+				}
+				fx.mode(mode)
+				got, err := fx.svc.ResolveHarnessForUserOn(fx.env.ctx, fx.env.q, fx.userID, h(HarnessCodex))
+				if d.seed != nil {
+					if err != nil || got != HarnessCodex {
+						t.Fatalf("ResolveHarnessForUserOn = (%q, %v), want codex", got, err)
+					}
+					return
+				}
+				if !errors.Is(err, ErrNoCredentialForHarness) || errors.Is(err, ErrCodexPoolUnavailable) {
+					t.Fatalf("ResolveHarnessForUserOn err = %v, want a plain no-credential refusal", err)
+				}
+			})
+		}
+	}
+}
+
 // --- derived origins -----------------------------------------------------------------------------
 
 // TestCodexSelectMRReworkUsesPoolLiveDB: a rework of a Codex run created under 'auto' goes

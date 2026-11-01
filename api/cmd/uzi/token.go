@@ -188,12 +188,16 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			"codex-mode auto` for Codex logins).\n\n" +
 			"The pool is opt-in per credential and empty by default, on purpose: a pool that\n" +
 			"helped itself to every credential would spend the one you reserved for\n" +
-			"something else. Opting a credential IN does not guarantee it gets picked — the\n" +
-			"selector also needs a fresh rate-limit reading for it, which the web\n" +
-			"settings page shows per credential.\n\n" +
+			"something else. Opting a credential IN does not guarantee it gets picked.\n\n" +
+			"Anthropic tokens: the selector also needs a fresh rate-limit reading for the\n" +
+			"token (the web settings page shows one per credential), and a change takes\n" +
+			"effect on the next claim: no restart, no new join token.\n\n" +
+			"Codex logins: the login is chosen when a run is created, from the most headroom\n" +
+			"among pooled logins; with no fresh reading it may still be picked (reason\n" +
+			"pool_stale). The choice is frozen on the run, so a change affects only runs\n" +
+			"created afterwards, never one already queued or running.\n\n" +
 			"A label may exist as both an Anthropic token and a Codex login: pass --kind\n" +
-			"anthropic or --kind codex to say which. API keys (openai_api_key) cannot be pooled.\n\n" +
-			"Takes effect on the next claim: no restart, no new join token.",
+			"anthropic or --kind codex to say which. API keys (openai_api_key) cannot be pooled.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Exactly one of --on/--off, and one of them required. Defaulting either
