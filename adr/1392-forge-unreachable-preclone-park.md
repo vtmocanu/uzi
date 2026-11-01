@@ -231,7 +231,7 @@ candidate and the original head and floor are its ancestors.
 
 ### API-origin extension of the cooldown
 
-Migration 00387 extends the advisory placement cooldown of #3585 from a
+Migration 00390 extends the advisory placement cooldown of #3585 from a
 worker's Git origin to its forge API origin. The API origin is derived on the
 server from the repository (GitHub: `api.github.com` or `api.<host>`; GitLab and
 Forgejo: the web host, equal to the Git origin), never from a worker report. The
@@ -245,7 +245,7 @@ Writers opt in with the setting `uzi.publication_resume_api='v1'` plus the
 worker capability `publication_resume_v1` (the pattern of [ADR-3343](3343-task-checkpoint-coordinates.md)), so an older
 API's write to an enrolled run aborts when it changes the worker or claim
 generation, re-opens a released claim, or moves the status into claimed,
-running or an awaiting state. The 00386 Down refuses while enrolled rows exist.
+running or an awaiting state. The 00389 Down refuses while enrolled rows exist.
 `RUN_PUBLICATION_RESUME_ENABLED` (default on) stops advertising and new
 enrollment only. Runbook: before an API rollback, convert enrolled queued runs
 and timed waits to NULL holds. Accepted costs: an older API aborts on those
@@ -253,7 +253,7 @@ writes, and its owner Resume re-queues the held run as an ordinary attempt, not 
 publication-only episode; the older API cannot then claim it, and after
 roll-forward the unreset wait clock can re-hold it at the next park. Residuals:
 in a mixed-version fleet an older API's clone-success path deletes a shared
-cooldown row without checking the API flag, and after a 00387 schema rollback
+cooldown row without checking the API flag, and after a 00390 schema rollback
 API evidence on a shared row is lost because that Down drops the flag columns;
 and the #3585 legacy extra-attempt residual above (an older API's
 `set-token` promoter queuing one extra attempt against a NULL hold) is unchanged.

@@ -18700,7 +18700,7 @@ export class RunRunner {
 
   /**
    * Issue #1324: the api APPLIED a terminal write for this run (completed, failed or cancelled). The same
-   * transaction closed the run's publication enrollment (migration 00386 `close_publication_resume_trg`), so
+   * transaction closed the run's publication enrollment (migration 00389 `close_publication_resume_trg`), so
    * no local publication record of ANY generation has anything left to guard, whichever flight or replay
    * delivered the ACK. Each is removed only for the exact enrollment_seq it carries (a sequence-less record
    * for none); a record that fails to authenticate or read is kept, and so is every record on an unapplied,

@@ -668,7 +668,7 @@ func TestPublicationResumeDownRefusesEnrolledLiveDB(t *testing.T) {
 	f := newPublicationResumeFixture(t)
 	ctx := f.env.ctx
 	f.enroll(t)
-	migration, err := os.ReadFile("../store/migrations/00386_publication_resume.sql")
+	migration, err := os.ReadFile("../store/migrations/00389_publication_resume.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -781,7 +781,7 @@ func TestPublicationResumeDownSucceedsOnceRunsTerminalLiveDB(t *testing.T) {
 	ctx := f.env.ctx
 	f.enroll(t)
 	f.env.exec(`UPDATE runs SET status='completed' WHERE id=$1`, f.runID)
-	migration, err := os.ReadFile("../store/migrations/00386_publication_resume.sql")
+	migration, err := os.ReadFile("../store/migrations/00389_publication_resume.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
