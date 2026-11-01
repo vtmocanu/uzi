@@ -2587,6 +2587,8 @@ interface RunFlight {
   /** Restriction latch only. Never authorizes source use; launch re-reads durable proofs. */
   remediationRestrictions?: {
     roots: string[];
+    /** Global negative findings, never a substitute for the current positive body. */
+    flaggedOIDs?: string[];
     /** Worker-selected identity and bounded negative knowledge; never a consumer confirmation cache. */
     pending?: {
       runId: string; clonePath?: string; attemptId?: string; barePath?: string; branch?: string;
@@ -3554,10 +3556,20 @@ export class RunRunner {
           proof.clonePath !== flight.worktreePath || proof.attemptId !== selected.attemptId ||
           proof.branch !== flight.branch || recordBarePath !== flight.barePath))
         throw new Error("remediation source identity unavailable");
+      const restrictions = flight.remediationRestrictions;
+      if (restrictions) {
+        const bodyRoots = proof && new Set([...proof.flaggedOIDs, ...proof.edges.map(edge => edge.from),
+          ...(proof.excludedRoots ?? [])]);
+        if (!proof || !restrictions.roots.every(root => bodyRoots!.has(root)) ||
+            !(restrictions.flaggedOIDs ?? []).every(q => proof.flaggedOIDs.includes(q)))
+          throw new Error("remediation current restriction metadata unavailable");
+      }
     };
     // Restrictions apply even on workers without a source-use authority runtime.
     await this.inFlightAuthority(flight, async () => {
       recordBarePath = flight.barePath;
+      const negative = await this.bootstrapRemediationRestrictions(flight);
+      if (negative.kind === "unavailable") throw new Error("remediation restriction facts unavailable");
       record = await this.restoreRemediationRestrictions(flight);
       checkRemediation();
       if (!record) return;
@@ -3585,7 +3597,35 @@ export class RunRunner {
     const record = journal.remediationRecovery;
     if (!record) return;
     const state = flight.remediationRestrictions ??= { roots: [] };
+    state.flaggedOIDs = [...new Set([...(state.flaggedOIDs ?? []), ...record.flaggedOIDs])];
     state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from), ...(record.excludedRoots ?? [])])];
+  }
+
+  /**
+   * One custody-only two-read query: no selected live source, discovery, lease or clone admission.
+   * Failure latches denial but does not interrupt private byte preservation. Positive callers
+   * must refuse unavailable facts and independently authenticate the current runtime body.
+   */
+  private async bootstrapRemediationRestrictions(
+    flight: RunFlight, barePath = flight.barePath, branch = flight.branch,
+  ): Promise<{ kind: "confirmed"; enrolled: boolean } | { kind: "unavailable" }> {
+    if (!barePath && !branch && !flight.worktreePath && !flight.remediationRestrictions)
+      return { kind: "confirmed", enrolled: false }; // Repo-less flight.
+    try {
+      if (!barePath || !branch) throw new Error("restriction identity unavailable");
+      const facts = await this.git.readRemediationRestrictionFacts(barePath, branch, flight.runId);
+      if (facts.enrolled) {
+        const state = flight.remediationRestrictions ??= { roots: [] };
+        state.roots = [...new Set([...state.roots, ...facts.roots, ...facts.flaggedOIDs])];
+        state.flaggedOIDs = [...new Set([...(state.flaggedOIDs ?? []), ...facts.flaggedOIDs])];
+      }
+      if (facts.blocked) throw new Error("restriction evidence is custody only");
+      return { kind: "confirmed", enrolled: facts.enrolled };
+    } catch {
+      flight.remediationRestrictions ??= { roots: [] };
+      flight.preserveRecoveryClone = true;
+      return { kind: "unavailable" };
+    }
   }
 
   /** Query the journal without discovery or normalization side effects. The exact attempt
@@ -7931,6 +7971,7 @@ export class RunRunner {
               claim.repo.default_branch?.trim() ||
               (await this.git.defaultBranchName(capBarePath)) ||
               "main";
+            await this.bootstrapRemediationRestrictions(flight);
             const outcome = await this.recovery.captureAndUpload({
               onArchiveAccepted: record => this.archiveAccepted(flight, record),
               onCancellationObserved: () => this.observeCancellation(flight),
@@ -12288,8 +12329,11 @@ export class RunRunner {
       /^[0-9a-f]{40}$/.test(flight.runnerClone.adoptedSource) ? flight.runnerClone.adoptedSource : undefined;
     await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId, flight.runnerClone?.attemptId,
       peeledMarker);
-    await this.inFlightAuthority(flight, () => this.restoreRemediationRestrictions(flight),
-      this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+    await this.inFlightAuthority(flight, async () => {
+      const negative = await this.bootstrapRemediationRestrictions(flight);
+      if (negative.kind === "unavailable") throw new Error("remediation restriction facts unavailable");
+      await this.restoreRemediationRestrictions(flight);
+    }, this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
     batcher.emit({
       kind: "status",
       agent: "worker",
@@ -15589,6 +15633,7 @@ export class RunRunner {
     const barePath = flight.barePath, branch = flight.branch;
     if (flight.cancellationCustodyUnknown || flight.keepGuardedInventoryOpen || !barePath || !branch || !claim.claim_generation || !this.recovery.enabled ||
         !isCodePublishingKind(resolveRunKind(claim.kind))) return;
+    await this.bootstrapRemediationRestrictions(flight);
     // Issue #2545: once a record is deferred, EVERY later settle works on that exact record. It never
     // re-freezes: the post-send freeze would pin a different original source and mint a second record.
     if (flight.heldDeferredCapture !== undefined && opts.deferCapture !== true) {
@@ -15679,6 +15724,8 @@ export class RunRunner {
       return this.runCancellationMaintenance(flight, () => this.captureFrozenInventory(claim, flight, record, budget.signal)).catch(() => undefined);
     }
     signal = MaintenanceBudget.current()?.signal ?? signal;
+    MaintenanceBudget.current()?.check();
+    await this.bootstrapRemediationRestrictions(flight);
     MaintenanceBudget.current()?.check();
     const barePath = flight.barePath!;
     const input = {
@@ -15808,6 +15855,9 @@ export class RunRunner {
   private async heldPublicationStep(
     claim: ClaimResponse, flight: RunFlight, record: RecoveryRecord,
   ): Promise<{ pack: Buffer } | { reason: string }> {
+    const negative = await this.bootstrapRemediationRestrictions(flight, flight.barePath, record.branch);
+    if (negative.kind === "unavailable" || flight.remediationRestrictions)
+      return { reason: "secret_remediation_pending" };
     return prepareFrozenHeld({
       git: this.git, barePath: flight.barePath!, branch: record.branch, sourceSha: record.sourceSha,
       policy: record.heldPolicy!, deadlineMs: this.scanDeadlineMs(),
@@ -16057,6 +16107,10 @@ export class RunRunner {
     adopt: <T>(action: () => Promise<T>) => Promise<T> = action => action(),
     step?: (step: BoundaryStep) => void,
   ): Promise<BridgeOutcome> {
+    const negative = await this.bootstrapRemediationRestrictions(flight, barePath, branch);
+    // Positive bridge admission is not wired yet. An unknown best-effort outcome keeps
+    // park/private capture callers preserving bytes without building or adopting a bridge.
+    if (negative.kind === "unavailable" || flight.remediationRestrictions) return { kind: "unknown" };
     const H = await this.checkedTrackingSnapshot(flight, barePath, branch, undefined, step, "checkpoint_bridge");
     if (H === null) {
       this.preservationRefused(flight, "ownership_unknown");
@@ -18667,6 +18721,7 @@ export class RunRunner {
         claim.repo.default_branch?.trim() ||
         (await this.git.defaultBranchName(barePath)) ||
         "main";
+      await this.bootstrapRemediationRestrictions(flight);
       const outcome = await this.recovery.captureAndUpload({
         onArchiveAccepted: record => this.archiveAccepted(flight, record),
         onCancellationObserved: () => this.observeCancellation(flight),
@@ -20711,6 +20766,7 @@ export class RunRunner {
       );
       return { verified: false, published: false };
     }
+    await this.bootstrapRemediationRestrictions(flight);
     // issue #1783 (auditor M2): prove the clone quiescent BEFORE the capture (its wip marker, the
     // fetch-back and the credentialed overlay + publish). On survivors/unverified NOTHING runs:
     // the result is unverified and `residueBlocked`, which each caller treats as its
@@ -23285,6 +23341,8 @@ export class RunRunner {
         claim_generation: flight.claimGeneration });
       throw new RetainedRecoveryStop();
     }
+    await this.bootstrapRemediationRestrictions(flight);
+    this.retainedLifecycleGuard(flight);
     await this.logPredecessorMemorySettlement(flight, bare, branch, source);
     const inherited = flight.sourceInherited?.family;
     if (inherited?.observedExecution.runId === flight.runId) {
@@ -23595,6 +23653,8 @@ export class RunRunner {
               });
               await check();
               if (!record) { blocker = "preservation_failed"; throw finalize; }
+              await this.bootstrapRemediationRestrictions(flight);
+              await check();
               const outcome = await this.recovery.captureAndUpload({
                 onArchiveAccepted: record => this.archiveAccepted(flight, record),
                 onCancellationObserved: () => this.observeCancellation(flight),
