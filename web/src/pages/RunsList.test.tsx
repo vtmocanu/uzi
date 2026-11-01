@@ -2106,6 +2106,14 @@ describe("RunsList — summary run projection (#2661)", () => {
   });
 });
 
+it("iteration-held list row names the owner hold without a completion label", () => {
+  const { container } = render(<MemoryRouter><ul><RunRow run={aRun({ status: "paused",
+    hold_reason: "iteration_budget_exhausted", completion_phase: "blocked" })} now={FIXED_NOW} /></ul></MemoryRouter>);
+  expect(screen.getAllByText("Iteration limit reached").length).toBeGreaterThan(0);
+  expect(container.querySelector("[data-attention]")).not.toBeNull();
+  expect(screen.queryByText("Completion blocked")).toBeNull();
+});
+
 describe("RunRow rejection presentation", () => {
   it.each([
     ["base_diverged", null, "rejected", "neutral"],

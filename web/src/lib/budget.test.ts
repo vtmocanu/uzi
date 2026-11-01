@@ -112,6 +112,15 @@ describe("extendBudgetView (PRD #1189)", () => {
     expect(v.remainingSec).toBe(28800 - 13320); // 4h18m
   });
 
+  it("uses the paused server total including fallback wall and finalize reserve without aging", () => {
+    const run: BudgetRun = { status: "paused", budget_wall_seconds: null,
+      budget_total_seconds: 9000, budget_extension_seconds: 3600, budget_used_seconds: 6000 };
+    expect(extendBudgetView(run, nowMs)).toMatchObject({ remainingSec: 3000, usedSec: 6000, running: false });
+    expect(extendBudgetView(run, nowMs + 86400000)).toMatchObject({ remainingSec: 3000 });
+    expect(extendBudgetView({ ...run, budget_wall_seconds: 3600 }, nowMs)).toMatchObject({ remainingSec: 3000 });
+    expect(extendBudgetView({ ...run, budget_used_seconds: null }, nowMs)).toBeNull();
+  });
+
   it("returns null when there is no budget to show (rollout skew or a null-budget kind)", () => {
     expect(extendBudgetView({ status: "running", budget_total_seconds: null }, nowMs)).toBeNull();
     expect(extendBudgetView({ status: "running" }, nowMs)).toBeNull(); // older api omits it

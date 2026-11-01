@@ -43,6 +43,95 @@ function runFor(id: string, mode: Mode): Run {
     gate_revision: 2, plan_md: "# Plan two", ...runOverrides,
   };
 }
+it.each([
+  ["issue", []],
+  ["issue", ["one"]],
+  ["task", []],
+] as const)("iteration hold offers Resume and Cancel without completed-scope Stop %s %j", async (kind, completed) => {
+  runOverrides = { kind, milestones_completed: [...completed],
+    hold_reason: "iteration_budget_exhausted", completion_phase: "", completion_attempts: 3,
+    budget_wall_seconds: null, budget_total_seconds: 3600, budget_used_seconds: 1800,
+    budget_extension_seconds: 0, budget_extension_cap_seconds: 7200 };
+  mount();
+  expect(screen.getByRole("heading", { name: "Iteration limit reached" })).toBeTruthy();
+  expect(screen.getByText(/Iteration limit reached\. The run is paused and will not retry automatically/)).toBeTruthy();
+  expect(screen.getByText(/30m of wall budget remains/)).toBeTruthy();
+  expect(screen.queryByRole("heading", { name: "Completion state" })).toBeNull();
+  expect(screen.queryByRole("heading", { name: /^Paused/ })).toBeNull();
+  expect(screen.queryByRole("button", { name: /Stop/ })).toBeNull();
+  expect(screen.queryByRole("button", { name: /Extend time/ })).toBeNull();
+  expect(screen.queryByText(/out of time/)).toBeNull();
+  await act(async () => click(/^Resume$/));
+  expect(api.resumeRun).toHaveBeenCalledExactlyOnceWith("A");
+  expect(refreshRun).toHaveBeenCalledOnce();
+  expect(api.submitRunInput).not.toHaveBeenCalled();
+  await act(async () => click(/^Cancel$/));
+  expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false);
+});
+
+it.each([false, undefined])("iteration controls await confirmed owner %s", (proof) => {
+  owner = proof;
+  runOverrides = { hold_reason: "iteration_budget_exhausted" };
+  mount();
+  expect(screen.getByText("Only the confirmed run owner can Resume or Cancel.")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /Resume|Cancel|Stop|Extend time/ })).toBeNull();
+});
+
+it("iteration wall exhaustion extends while paused before a separate Resume", async () => {
+  runOverrides = { hold_reason: "iteration_budget_exhausted", budget_wall_seconds: null,
+    budget_total_seconds: 3600, budget_used_seconds: 3600, budget_extension_seconds: 0,
+    budget_extension_cap_seconds: 7200 };
+  const view = mount();
+  expect((screen.getByRole("button", { name: "Resume" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByText("The remaining wall budget is spent. Extend time, then explicitly Resume.")).toBeTruthy();
+  click("Extend time…");
+  await act(async () => click("Extend by 2h"));
+  expect(submit).toHaveBeenCalledWith("extend", "7200");
+  expect(api.resumeRun).not.toHaveBeenCalled();
+  expect(refreshRun).toHaveBeenCalledOnce();
+  runOverrides = { ...runOverrides, budget_total_seconds: 10800, budget_extension_seconds: 7200 };
+  view.updateRun();
+  expect(screen.getByRole("heading", { name: "Iteration limit reached" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /Extend time/ })).toBeNull();
+  await act(async () => click(/^Resume$/));
+  expect(api.resumeRun).toHaveBeenCalledExactlyOnceWith("A");
+});
+
+it("unknown iteration wall budget defers Resume eligibility to the server", () => {
+  runOverrides = { hold_reason: "iteration_budget_exhausted", budget_wall_seconds: null,
+    budget_total_seconds: null, budget_used_seconds: null, budget_extension_cap_seconds: 7200 };
+  mount();
+  expect(screen.getByText(/Remaining wall budget is unavailable/)).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Resume" }) as HTMLButtonElement).disabled).toBe(false);
+  expect(screen.queryByRole("button", { name: /Extend time/ })).toBeNull();
+  expect(screen.queryByText(/remaining wall budget is spent/)).toBeNull();
+});
+
+it("iteration Resume retires its late result on navigation", async () => {
+  runOverrides = { hold_reason: "iteration_budget_exhausted", budget_total_seconds: 3600,
+    budget_used_seconds: 1800 };
+  const old = deferred();
+  vi.mocked(api.resumeRun).mockReturnValueOnce(old.promise);
+  mount();
+  click(/^Resume$/);
+  expect(api.resumeRun).toHaveBeenCalledExactlyOnceWith("A");
+  navigate();
+  await settle(old, "failure");
+  expect(refreshRun).not.toHaveBeenCalled();
+  expect(screen.queryByText("Old action failed")).toBeNull();
+});
+
+it("iteration Cancel retains pending-outcome discard confirmation", async () => {
+  runOverrides = { hold_reason: "iteration_budget_exhausted" };
+  submit.mockRejectedValueOnce(refusal());
+  mount();
+  await act(async () => click(/^Cancel$/));
+  expect(screen.getByRole("button", { name: "Discard and cancel" })).toBeTruthy();
+  await act(async () => click("Discard and cancel"));
+  expect(submit).toHaveBeenLastCalledWith("cancel", "", undefined, undefined, true);
+  expect(api.resumeRun).not.toHaveBeenCalled();
+});
+
 function deferred() {
   let resolve!: () => void;
   let reject!: (error: Error) => void;

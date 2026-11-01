@@ -97,6 +97,18 @@ it("provider recovery badge only names provider when cause is available", () => 
   expect(runBadge(run({ status: "recovery_wait" }), 0)).toMatchObject({ label: "recovery wait" });
 });
 
+it("iteration hold overrides completion phases and requests owner attention", () => {
+  const held = { ...run({ status: "paused", hold_reason: "iteration_budget_exhausted" }), completion_phase: "blocked" as const };
+  expect(effectiveRunStatus(held)).toBe("iteration_budget_exhausted");
+  expect(parkLabel(held)).toBe("Iteration limit reached");
+  expect(runBadge(held, 0)).toMatchObject({
+    kind: "badge", label: "Iteration limit reached", tone: "warning", pulse: false,
+  });
+  expect(needsHumanAttention(effectiveRunStatus(held))).toBe(true);
+  expect(runStatusTone(effectiveRunStatus(held), null)).toBe("warning");
+  expect(effectiveRunStatus({ ...held, status: "completed", completion_phase: "" })).toBe("completed");
+});
+
 // run builds a LatestRun with sane defaults, overridable per test.
 function run(over: Partial<LatestRun> = {}): LatestRun {
   return {

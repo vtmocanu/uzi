@@ -467,7 +467,7 @@ export function HealthFlag({ run }: { run: Run }) {
 // the copy states the hold is available on the same worker only — it must NOT claim the
 // completion hold is durable across workers.
 export function CompletionStatePanel({ run }: { run: Run }) {
-  if (run.status === "paused" && run.hold_reason === "provider_unavailable") return null;
+  if (run.status === "paused" && (run.hold_reason === "provider_unavailable" || run.hold_reason === "iteration_budget_exhausted")) return null;
   const phase = run.completion_phase ?? "";
   // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
   // Issue #3181/#3194: token-switch and base-attestation holds have their own panels.
@@ -951,6 +951,7 @@ export function PausedPanel({
     run.hold_reason === "completion_blocked" ||
     run.hold_reason === "credential_disabled" ||
     run.hold_reason === "provider_unavailable" ||
+    run.hold_reason === "iteration_budget_exhausted" ||
     // Issue #3181: the token-switch holds have their own panel and Resume gating.
     credentialSwitchHold(run) !== null ||
     run.hold_reason === "base_attestation_missing"
@@ -1553,6 +1554,30 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   );
 }
 
+function IterationHoldPanel({ run, ownerProof, busy, onResume, onCancel, onExtend }: {
+  run: Run; ownerProof: boolean; busy: boolean;
+  onResume: () => void; onCancel: () => void; onExtend: (seconds: number) => Promise<boolean>;
+}) {
+  if (run.status !== "paused" || run.hold_reason !== "iteration_budget_exhausted") return null;
+  const budget = extendBudgetView(run, Date.now());
+  const spent = budget !== null && budget.remainingSec <= 0;
+  return <Card className="p-4">
+    <h2 className="text-sm font-semibold text-warn">Iteration limit reached</h2>
+    <p className="mt-1 text-xs text-muted">The run is paused. No automatic retry is scheduled. Resume requests a fresh finite iteration allowance.</p>
+    {budget !== null ? <p className="mt-1 text-xs text-muted">
+      {spent ? "The remaining wall budget is spent. Extend time, then explicitly Resume."
+        : `${formatBudgetDuration(budget.remainingSec)} of wall budget remains. Resume to continue working.`}
+    </p> : <p className="mt-1 text-xs text-muted">Remaining wall budget is unavailable. The server checks whether Resume is allowed.</p>}
+    <p className="mt-1 text-xs text-muted">{spent ? "Extend adds wall time and leaves the run paused. " : ""}Cancel ends the run.</p>
+    {spent && !extendEnabled(run) && <p className="mt-1 text-xs text-muted">Time extensions are unavailable. Resume requires remaining wall budget.</p>}
+    {ownerProof ? <div className="mt-3 flex flex-wrap gap-2">
+      <Button size="sm" disabled={busy || spent} onClick={onResume}>Resume</Button>
+      {spent && extendEnabled(run) && <ExtendTimePopover run={run} busy={busy} onSubmit={onExtend} />}
+      <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
+    </div> : <p className="mt-2 text-xs text-muted">{spent ? "Only the confirmed run owner can Resume, Extend or Cancel." : "Only the confirmed run owner can Resume or Cancel."}</p>}
+  </Card>;
+}
+
 function ProviderHoldPanel({ run, ownerProof, busy, onResume, onStop, onCancel }: {
   run: Run; ownerProof: boolean; busy: boolean;
   onResume: () => void; onStop: () => void; onCancel: () => void;
@@ -1887,7 +1912,8 @@ export function RunView() {
   const switchHeld = run != null && credentialSwitchHold(run) !== null;
   const retainedRecovery = run?.status === "recovery_wait" && (run.recovery_wait_cause === "retained_recovery_exhausted" || run.recovery_wait_cause === "codex_idle_stall" || run.recovery_wait_cause === "retained_recovery_adoption_failed");
   const forgeHeld = run != null && forgeWaitMode(run) === "held";
-  const ownerDecisionHold = forgeHeld || retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
+  const iterationHeld = run?.status === "paused" && run.hold_reason === "iteration_budget_exhausted";
+  const ownerDecisionHold = iterationHeld || forgeHeld || retainedRecovery || workerExhausted || memoryHeld || providerHeld || switchHeld;
   const canSteer = optimisticCanSteer && (!ownerDecisionHold || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
   const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
@@ -2323,6 +2349,8 @@ export function RunView() {
                   : run.recovery_wait_cause === "worker_memory_pressure"
                     ? "worker_memory_pressure"
                     : "recovery_wait"
+            : run?.status === "paused" && run.hold_reason === "iteration_budget_exhausted"
+              ? `iteration_budget_exhausted${extendBudgetView(run, Date.now())?.remainingSec === 0 ? ":spent" : ""}`
             : run?.status === "paused" && run.hold_reason === "provider_unavailable"
               ? "provider_unavailable"
             : run?.status === "paused" && run.hold_reason === "credential_disabled"
@@ -2385,6 +2413,10 @@ export function RunView() {
               ? "The run is waiting because a credential it needs is disabled. Enable it and the run resumes automatically."
             : parkKey === "base_attestation_missing"
               ? "The run is held because its retained work is not attested to the planned base commit. The agent was not started. Recover the work or start a successor run."
+            : parkKey === "iteration_budget_exhausted:spent"
+              ? "Iteration limit reached. The remaining wall budget is spent. Extend time, then explicitly Resume, or Cancel. Extend leaves the run paused."
+            : parkKey === "iteration_budget_exhausted"
+              ? "Iteration limit reached. The run is paused and will not retry automatically. Only the owner can Resume or Cancel."
             : parkKey === "provider_unavailable"
               ? "Provider unavailable. Automatic retries have stopped; the run waits for its owner."
             : parkKey === "credential_switch_settling"
@@ -2581,6 +2613,7 @@ export function RunView() {
                 // plain Resume would only park it again.
                 run.hold_reason !== "credential_disabled" &&
                 run.hold_reason !== "provider_unavailable" &&
+                run.hold_reason !== "iteration_budget_exhausted" &&
                 // Issue #3181: the token-switch holds offer Resume in their own panel, which
                 // shows the server's settling refusal inline.
                 credentialSwitchHold(run) === null &&
@@ -2915,6 +2948,19 @@ export function RunView() {
         }}
       />
 
+      <IterationHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
+        onResume={() => act(async (isCurrent) => {
+          if (!canSteer || run.id !== id) return;
+          await api.resumeRun(run.id);
+          if (isCurrent()) await refreshRun();
+        })}
+        onCancel={() => cancelRun()}
+        onExtend={(seconds) => act(async (isCurrent) => {
+          if (!canSteer || run.id !== id) return false;
+          await submit("extend", String(seconds));
+          if (isCurrent()) await refreshRun();
+        })}
+      />
       <ProviderHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
         onResume={() => act(async (isCurrent) => {
           const requestRunId = run.id;

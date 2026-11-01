@@ -170,6 +170,7 @@ const PARK_LABELS = {
   worker_memory_pressure: "memory pressure: owner hold",
   paused: "paused",
   credential_disabled: "waiting: credential disabled",
+  iteration_budget_exhausted: "Iteration limit reached",
   provider_unavailable: "provider unavailable: owner hold",
   base_attestation_missing: "base unverified: owner hold",
   provider_outage: "waiting for provider",
@@ -208,6 +209,7 @@ export function effectiveRunStatus(
     recovery_retry_not_before?: string | null;
   },
 ): string {
+  if (run.status === "paused" && run.hold_reason === "iteration_budget_exhausted") return "iteration_budget_exhausted";
   if (run.status === "paused" && run.hold_reason === "provider_unavailable") return "provider_unavailable";
   // Issue #3181: the token-switch holds sit in raw "paused" (shared with the owner pause), so
   // they are overlaid like the provider hold to name what the run is actually waiting on.
@@ -286,6 +288,7 @@ export function shadowSignal(
   run:
     | {
         status: string;
+        hold_reason?: string | null;
         is_planning?: boolean;
         is_revising?: boolean;
         health?: HealthFlaggable["health"];
@@ -300,7 +303,7 @@ export function shadowSignal(
   if (run == null || isAccountCooldownWaiting(run)) return null;
   const eff = effectiveRunStatus(run);
   if (eff === "claimed" || eff === "running" || eff === "planning") return "live";
-  if (eff === "awaiting_approval" || eff === "revising") return "attention";
+  if (eff === "awaiting_approval" || eff === "revising" || eff === "iteration_budget_exhausted") return "attention";
   // "in review" is a COMPLETED run whose MR is still open. Gate on eff === "completed"
   // so a failed / cancelled / queued / limit_wait run that happens to carry an open MR
   // (e.g. a run that failed after opening its MR) stays quiet rather than lighting the
@@ -380,6 +383,7 @@ export function runStatusTone(
   if (status === "completion_checking" || status === "completion_reworking") return "info";
   if (status === "completion_blocked") return "warning";
   // PRD #1732: held on a disabled credential. Warn like the other involuntary holds.
+  if (status === "iteration_budget_exhausted") return "warning";
   if (status === "credential_disabled" || status === "provider_unavailable" || status === "base_attestation_missing" || status === "provider_outage") return "warning";
   // Issue #3181: both token-switch holds wait on something outside the run; warn, never danger.
   if (status === "credential_switch_settling" || status === "credential_switch_unsettled") return "warning";
@@ -766,6 +770,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     // PRD #1732 D14: held because a credential it needs is disabled. Static warn, like the
     // other holds; the label is StatusPill's RUN_STATUS_LABELS word, so the pill and the
     // board badge agree (asserted by the ui.test.tsx label-agreement loop).
+    case "iteration_budget_exhausted":
+      return { kind: "badge", label: PARK_LABELS.iteration_budget_exhausted, tone: "warning", pulse: false,
+        title: "Iteration limit reached. Only the owner can Resume with a fresh finite iteration allowance, or Cancel. Extend time first only if the remaining wall budget is spent; Extend does not resume the run." };
     case "provider_unavailable":
       return { kind: "badge", label: PARK_LABELS.provider_unavailable, tone: "warning", pulse: false,
         title: "Automatic provider retries have stopped. The run waits for its owner; open the run for Resume, Stop availability and Cancel." };
@@ -1184,6 +1191,7 @@ export function needsHumanAttention(status: string): boolean {
     status === "retained_recovery_adoption_failed" ||
     status === "worker_requeue_exhausted" ||
     status === "worker_memory_pressure" ||
+    status === "iteration_budget_exhausted" ||
     status === "provider_unavailable" ||
     status === "credential_switch_settling" ||
     status === "credential_switch_unsettled" ||

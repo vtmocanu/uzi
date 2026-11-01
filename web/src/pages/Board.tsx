@@ -436,6 +436,7 @@ export function Board() {
   // action ("awaiting follow-up"). Same needs-you classification and loud ring as the two
   // parks above (needsHumanAttention), so it belongs in the "how many need me" tally.
   const [followupRuns, setFollowupRuns] = useState<RunSummaryItem[]>([]);
+  const [iterationRuns, setIterationRuns] = useState<RunSummaryItem[]>([]);
   // The viewer's runs on this repo the health detector flagged as looking stuck
   // (PRD #47): any non-ok flag on a run the two buckets above do not already carry.
   // Issue runs only (a ci_fix run has no board card to link to).
@@ -573,9 +574,11 @@ export function Board() {
       setAwaitingRuns(runs.filter((r) => !isAccountCooldownWaiting(r) && isAwaitingApproval(effectiveRunStatus(r))));
       setQuestionRuns(runs.filter((r) => isAwaitingInput(r.status)));
       setFollowupRuns(runs.filter((r) => isAwaitingFollowup(r.status)));
+      setIterationRuns(runs.filter((r) => effectiveRunStatus(r) === "iteration_budget_exhausted"));
       setStuckRuns(
         runs.filter(
           (r) =>
+            effectiveRunStatus(r) !== "iteration_budget_exhausted" &&
             r.health !== "ok" &&
             r.health !== "waiting_account_cooldown" &&
             // Whatever the three buckets above already show, this one must not repeat.
@@ -1295,6 +1298,7 @@ export function Board() {
       {(awaitingRuns.length > 0 ||
         questionRuns.length > 0 ||
         followupRuns.length > 0 ||
+        iterationRuns.length > 0 ||
         stuckRuns.length > 0) && (
         <div
           role="status"
@@ -1313,13 +1317,15 @@ export function Board() {
               // into the answer count.
               followupRuns.length > 0 &&
                 `${followupRuns.length} run${followupRuns.length > 1 ? "s" : ""} awaiting follow-up`,
+              iterationRuns.length > 0 &&
+                `${iterationRuns.length} run${iterationRuns.length > 1 ? "s" : ""}: Iteration limit reached`,
               stuckRuns.length > 0 &&
                 `${stuckRuns.length} run${stuckRuns.length > 1 ? "s" : ""} ${stuckRuns.length > 1 ? "look" : "looks"} stuck`,
             ]
               .filter(Boolean)
               .join(" · ")}
           </span>
-          {[...awaitingRuns, ...questionRuns, ...followupRuns, ...stuckRuns].map((r) => (
+          {[...awaitingRuns, ...questionRuns, ...followupRuns, ...iterationRuns, ...stuckRuns].map((r) => (
             // Issue #485 NB1: the forge issue anchor rendered by RunIssueRef is a real
             // <a>, so it can no longer nest inside the navigational <Link> (also an <a> —
             // invalid HTML). The pill span is a `relative` container; the run-details
