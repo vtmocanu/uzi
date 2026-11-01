@@ -2177,8 +2177,8 @@ tasks:
       #   GOMEMLIMIT=2GiB    14.53 GB   452 s
       #
       # On that worker, among the GOMEMLIMIT rows, 12GiB gave most of the observed
-      # reduction for the smallest observed time increase. Runner results are
-      # unmeasured until CI.
+      # reduction for the smallest observed time increase. Later API growth can
+      # exceed these samples; runner headroom must still be measured in CI.
       #
       # The value is fixed on purpose: `env GOMEMLIMIT=...` overrides an inherited
       # GOMEMLIMIT, so the limit is identical locally and in CI (GOGC and hardware
@@ -2186,7 +2186,8 @@ tasks:
       # `12GB`) makes `go` itself die with `malformed GOMEMLIMIT`, exit 2, which
       # the gate reports as a load error. The hand-run `--write` command in
       # api/.deadcode-baseline's header does not carry the limit.
-      - env GOMEMLIMIT=12GiB ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0
+      # Bound API analysis execution concurrency without narrowing its roots.
+      - env GOMAXPROCS=1 GOMEMLIMIT=12GiB ./scripts/deadcode-gate.sh api golang.org/x/tools/cmd/deadcode@v0.48.0
 
   deadcode:api:all:
     desc: api - unreachable funcs WITHOUT -test; reported, never gating, ALWAYS EXITS 0
