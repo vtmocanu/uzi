@@ -78,6 +78,30 @@ describe("SummarySettingsCard model picker (#3255)", () => {
     expect(picker().value).toBe("sonnet");
   });
 
+  it("saves an edited custom ID verbatim and keeps it in custom mode", async () => {
+    mockApi.updateSettings.mockResolvedValue(response(settings("claude-y-2")));
+    render(<Harness initial="claude-x-1" />);
+    fireEvent.change(customInput(), { target: { value: "claude-y-2" } });
+    expect(save().disabled).toBe(false);
+    fireEvent.click(save());
+    await screen.findByText("Run summary settings saved.");
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({ summary_model: "claude-y-2" });
+    expect(picker().value).toBe("custom");
+    expect(customInput().value).toBe("claude-y-2");
+  });
+
+  it("shows a stored non-Claude value in custom mode and never re-sends it on an unrelated save", async () => {
+    mockApi.updateSettings.mockResolvedValue(response(settings("gpt-6.1-sol", "false")));
+    render(<Harness initial="gpt-6.1-sol" />);
+    expect(picker().value).toBe("custom");
+    expect(customInput().value).toBe("gpt-6.1-sol");
+    fireEvent.click(screen.getByRole("checkbox", { name: "Model-written Now line" }));
+    fireEvent.click(save());
+    await screen.findByText("Run summary settings saved.");
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({ now_summary_enabled: "false" });
+    expect(customInput().value).toBe("gpt-6.1-sol");
+  });
+
   it("keeps the accessible names while in custom mode", () => {
     render(<Harness initial="claude-x-1" />);
     expect(picker()).toBeTruthy();
