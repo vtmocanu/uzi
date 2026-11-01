@@ -45,7 +45,7 @@ async function fixture() {
     return tip;
   };
   const freshFlight = (): Flight => ({ runId: RUN, branch: BRANCH, barePath: bare, worktreePath: clone.path,
-    runnerClone: clone, remediationSourceInputs: { cloneUrl: fx.originPath, key: KEY } });
+    runnerClone: clone, cancel: new AbortController(), steering: { lifecycleSignal: () => new AbortController().signal } });
   await fetch();
   const enroll = async () => {
     const flagged = commit("flagged");
@@ -95,8 +95,10 @@ test("fresh runner restores flagged and displaced roots, admits only confirmed c
     ancestor === displaced && descendant === clean ? "unknown" : ancestry(bare, ancestor, descendant));
   await assert.rejects(runner.requireLaunchAuthority(flight), /history restricted/);
   // A later query failure cannot borrow the earlier in-memory confirmation.
-  t.mock.method(git, "readRuntimeRemediationRecovery", async () => undefined);
+  t.mock.method(git, "readRuntimeRemediationRecovery", async () => { throw new Error("remediation source evidence unconfirmed"); });
   await assert.rejects(runner.requireLaunchAuthority(flight), /unconfirmed/);
+  t.mock.method(git, "readRuntimeRemediationRecovery", async () => undefined);
+  await assert.rejects(runner.requireLaunchAuthority(flight), /enrollment disappeared/);
 });
 
 test("fresh enrolled flight refuses flagged history even when a trusted scan hides it behind a floor", async t => {
@@ -113,7 +115,7 @@ test("fresh enrolled flight refuses flagged history even when a trusted scan hid
 test("enrolled but unconfirmed and malformed records hold rather than look absent", async t => {
   const f = await fixture();
   await f.enroll();
-  t.mock.method(git, "readRuntimeRemediationRecovery", async () => undefined);
+  t.mock.method(git, "readRuntimeRemediationRecovery", async () => { throw new Error("remediation source evidence unconfirmed"); });
   const runner = freshRunner();
   const flight = f.freshFlight();
   await assert.rejects(runner.requireLaunchAuthority(flight), /unconfirmed/);
@@ -122,6 +124,15 @@ test("enrolled but unconfirmed and malformed records hold rather than look absen
   const restarted = f.freshFlight();
   await assert.rejects(freshRunner().requireLaunchAuthority(restarted));
   assert.equal(await runner.checkpointRemediationHold(restarted, f.bare, f.base, true), true);
+});
+
+test("enrolled launch cannot borrow a missing selected attempt identity", async () => {
+  const f = await fixture();
+  await f.enroll();
+  const flight = f.freshFlight();
+  flight.runnerClone = { ...f.clone, attemptId: undefined };
+  await assert.rejects(freshRunner().requireLaunchAuthority(flight), /source identity unavailable/);
+  assert.equal(await freshRunner().checkpointRemediationHold(flight, f.bare, f.base, true), true);
 });
 
 test("ordinary unenrolled launch and checkpoint remain unscanned", async t => {

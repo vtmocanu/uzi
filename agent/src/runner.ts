@@ -2586,7 +2586,7 @@ interface RunFlight {
   steeredTips?: Set<string>;
   /** Restriction latch only. Never authorizes source use; launch re-reads durable proofs. */
   remediationRestrictions?: { roots: string[] };
-  remediationSourceInputs?: Readonly<{ cloneUrl: string; key: string }>;
+  remediationPredecessorAttempt?: string;
   /** issue #1932: per-flight state of the pre-exit secret remediation gate (see
    *  RunRunner.runSecretRemediationGate). `known` = findings of the last trusted gate scan that
    *  suppress every checkpoint publication and make finalize fail (`push_secret_blocked`, no push)
@@ -3543,7 +3543,7 @@ export class RunRunner {
       for (const root of flight.remediationRestrictions!.roots)
         if (await this.git.ancestry(flight.barePath!, root, record.ownedTip) !== "divergent")
           throw new Error("remediation continuation history restricted");
-    });
+    }, this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
     if (!this.authority || !flight.runnerClone) return;
     await this.authority.assertLaunchable(flight.runnerClone.path, flight.sourceLease, flight.executor.executorIncarnation,
       this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
@@ -3556,30 +3556,26 @@ export class RunRunner {
     state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from)])];
   }
 
-  /** Public discovery distinguishes absence from refusal; the evidence query alone cannot.
-   * Call outside a bare lock, under the flight's source-use transaction. No cached proof grants launch. */
+  /** Query the journal without discovery or normalization side effects. The exact attempt
+   * comes from the worker-selected source, not from the evidence being authenticated. */
   private async restoreRemediationRestrictions(flight: RunFlight): Promise<RemediationRecovery | undefined> {
-    const inputs = flight.remediationSourceInputs;
-    if (!inputs || !flight.barePath || !flight.branch || !flight.worktreePath ||
-        typeof this.git.discoverRetainedRecovery !== "function") {
+    if (!flight.barePath && !flight.branch && !flight.worktreePath) {
       if (flight.remediationRestrictions) throw new Error("remediation source identity unavailable");
-      return undefined;
+      return undefined; // Repo-less flights have no recovery journal.
     }
     try {
-      const selected = await this.git.discoverRetainedRecovery(inputs.cloneUrl, flight.branch, inputs.key, flight.runId);
-      if (selected) this.rememberRemediationRestrictions(flight, selected.journal);
-      if (!selected?.journal.remediationRecovery) {
+      if (!flight.barePath || !flight.branch || !flight.worktreePath ||
+          (!flight.predecessorCapture && flight.runnerClone?.path !== flight.worktreePath))
+        throw new Error("remediation source identity unavailable");
+      const attemptId = flight.predecessorCapture ? flight.remediationPredecessorAttempt : flight.runnerClone?.attemptId;
+      const record = await this.git.readRuntimeRemediationRecovery(flight.barePath, flight.branch,
+        { runId: flight.runId, clonePath: flight.worktreePath, ...(attemptId ? { attemptId } : {}) });
+      if (!record) {
         if (flight.remediationRestrictions) throw new Error("remediation enrollment disappeared");
         return undefined;
       }
-      const attemptId = flight.predecessorCapture ? selected.journal.attemptId : flight.runnerClone?.attemptId;
-      if (selected.barePath !== flight.barePath || selected.journal.clonePath !== flight.worktreePath ||
-          selected.journal.attemptId !== attemptId || !attemptId)
-        throw new Error("remediation source identity changed");
-      const record = await this.git.readRuntimeRemediationRecovery(flight.barePath, flight.branch,
-        { runId: flight.runId, clonePath: flight.worktreePath, attemptId });
-      if (!record) throw new Error("remediation source evidence unconfirmed");
-      this.rememberRemediationRestrictions(flight, { ...selected.journal, remediationRecovery: record });
+      const state = flight.remediationRestrictions ??= { roots: [] };
+      state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from)])];
       return record;
     } catch (error) {
       // An unreadable enrollment is held, rather than silently treated as absent.
@@ -11877,7 +11873,6 @@ export class RunRunner {
     // phase), before the clone/fetch writes to it. An optimisation only: free-space checks cannot
     // remove races, so the typed handling around ensureClone below is the guarantee.
     const coordinates = this.cloneCoordinates(claim);
-    flight.remediationSourceInputs = Object.freeze({ cloneUrl: claim.repo.clone_url, key: coordinates.key });
     flight.effectiveAttemptPaths = this.attemptPaths;
     let retainedJournal: RecoveryJournalEntry | undefined;
     const discoverRetained = async (required = false, branch = coordinates.branch) => {
@@ -12234,7 +12229,8 @@ export class RunRunner {
       /^[0-9a-f]{40}$/.test(flight.runnerClone.adoptedSource) ? flight.runnerClone.adoptedSource : undefined;
     await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId, flight.runnerClone?.attemptId,
       peeledMarker);
-    await this.inFlightAuthority(flight, () => this.restoreRemediationRestrictions(flight));
+    await this.inFlightAuthority(flight, () => this.restoreRemediationRestrictions(flight),
+      this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
     batcher.emit({
       kind: "status",
       agent: "worker",
@@ -23118,6 +23114,7 @@ export class RunRunner {
     flight.retainedEpisodeCustody = true;
     flight.retainedLocalCustody = true;
     flight.predecessorCapture = true;
+    flight.remediationPredecessorAttempt = source.attemptId;
     this.rememberRemediationRestrictions(flight, source);
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
@@ -23519,7 +23516,8 @@ export class RunRunner {
           }
           // The (possibly new) executor is bound to the successor's epoch before it runs anything there.
           await this.bindFlightSource(flight, successor.path);
-          await this.inFlightAuthority(flight, () => this.restoreRemediationRestrictions(flight));
+          await this.inFlightAuthority(flight, () => this.restoreRemediationRestrictions(flight),
+            { signal, timeoutMs: Math.max(1, Math.min(CLONE_AUTHORITY_WAIT_MS, iteration.deadline - Date.now())) });
           flight.batcher.emit({ kind: "status", agent: "worker", payload: {
             text: "retained work verified on a fresh local attempt; predecessor sources and custody retained",
           } });
