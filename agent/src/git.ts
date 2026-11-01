@@ -27,7 +27,7 @@ import { validateCaptureGitRequest } from "./credential-free-capture.js";
 import { RUNNER_UID, WORKER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
-import { withForgeRetry } from "./forge-retry.js";
+import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import {
   ATTEMPT_ID_RE,
@@ -411,7 +411,9 @@ export type ScratchPublicationKind =
   | "tip_unavailable" | "shallow_history" | "missing_objects" | "object_walk_failed"
   | "exec_failed" | "scratch_present" | "floor_unverified" | "checkpoint_range"
   | "remote_changed_during_refresh" | "remote_candidate_diverged"
-  | "new_remote_candidate_diverged" | "remote_branch_advanced";
+  | "new_remote_candidate_diverged" | "remote_branch_advanced"
+  /** The remote was transiently unreachable at ls-remote/fetch; nothing about the floor is proven either way. */
+  | "floor_unreachable";
 /** The check that refused. */
 export type ScratchPublicationStep =
   | "resolve_tip" | "shallow_check" | "object_walk" | "scratch_walk" | "floor_refresh" | "checkpoint_floor";
@@ -471,6 +473,15 @@ const retainedSuccessorDiagnostics = new WeakMap<Error, string>();
 export function annotateRetainedSuccessorError<T>(error: T, reason: string): T {
   if (error instanceof Error && RETAINED_SUCCESSOR_REASONS.has(reason)) retainedSuccessorDiagnostics.set(error, reason);
   return error;
+}
+
+/** Classify a runGit failure from git's own stderr only. runGit's message embeds the argument list
+ *  (`refs/heads/<branch>`), so classifying the message would let a branch name such as `agent/issue-502`
+ *  or `agent/issue-404` decide the verdict. A failure without retained stderr is permanent. */
+export function classifyGitStderr(error: unknown): "transient" | "permanent" {
+  const retained = error instanceof Error ? retainedGitDiagnostics.get(error) : undefined;
+  const stderr = retained?.stderr.trim();
+  return stderr ? classifyForgeError(new Error(stderr)) : "permanent";
 }
 
 const RETAINED_DIAGNOSTIC_INPUT_MAX = 64 * 1024;
@@ -1518,6 +1529,18 @@ export class ForeignRetainedRecoveryError extends Error {
 }
 
 /**
+ * issue #3639: why {@link GitCache.discoverRetainedRecovery} in expected-receipt mode found the retained journal is not
+ * the one a settled memory-park receipt names. Terminal for every caller: the message carries no deadline text, so
+ * the runner's retained-discovery classifier never treats it as retryable.
+ */
+export class MemoryReceiptSourceError extends Error {
+  constructor(readonly reason: "absent" | "foreign" | "changed") {
+    super(`memory receipt source ${reason}`);
+    this.name = "MemoryReceiptSourceError";
+  }
+}
+
+/**
  * issue #2886: a bare cache directory named by the bounded `uzi-sha256-<hex>.git` form does not
  * provably belong to the origin being asked for (stored origin missing, duplicated, unreadable or
  * different, or the path is not a bare). Fail closed: nothing is fetched, deleted or rewritten.
@@ -1716,7 +1739,7 @@ function sameMemoryParkBinding(a: MemoryParkBinding, b: MemoryParkBinding): bool
  * binding. Throws on anything else. Returns a fresh object whose key order is the persisted order, so its
  * JSON.stringify is the canonical spelling.
  */
-function parseMemoryPark(value: unknown): MemoryParkRecord {
+export function parseMemoryPark(value: unknown): MemoryParkRecord {
   const o = memoryParkKeys(value, ["version", "binding", "ack", "origin"], ["settlement"]);
   if (o.version !== 1) return memoryParkFail();
   const binding = memoryParkBinding(o.binding);
@@ -1765,7 +1788,7 @@ function parseMemoryPark(value: unknown): MemoryParkRecord {
 }
 
 /** The persisted spelling of a record: re-parsed, fixed field order. */
-function serializeMemoryPark(record: MemoryParkRecord): string {
+export function serializeMemoryPark(record: MemoryParkRecord): string {
   return JSON.stringify(parseMemoryPark(record));
 }
 
@@ -3538,8 +3561,23 @@ export class GitCache {
         kind, step: "floor_refresh",
       });
     };
+    // Only the two direct remote operations (ls-remote, fetch) may produce `floor_unreachable`, and only
+    // when that direct error classifies transient. Local git, residue, abort and auth errors keep
+    // flowing to the catch-all as `floor_unverified`; no cause chain is walked.
+    const remote = async (args: string[]): Promise<string> => {
+      try {
+        return await this.runGit(barePath, args, pat, scope, username);
+      } catch (cause) {
+        if (cause instanceof RunResidueBlockedError || isAbortLike(cause) || this.boundaryAbortError(cause)) throw cause;
+        if (classifyGitStderr(cause) !== "transient") throw cause;
+        throw new ScratchPublicationError("cannot reach remote to verify floor", cause, {
+          kind: "floor_unreachable", step: "floor_refresh", detail: "remote unreachable during floor refresh",
+          rawDetail: execDetail(classifyExecFailure(cause)).rawDetail,
+        });
+      }
+    };
     const observe = async (): Promise<string | null> => {
-      const listed = (await this.runGit(barePath, ["ls-remote", "--", "origin", remoteRef], pat, scope, username)).trim();
+      const listed = (await remote(["ls-remote", "--", "origin", remoteRef])).trim();
       if (!listed) return null;
       const oid = listed.slice(0, 40);
       if (!SHA40_RE.test(oid) || listed !== `${oid}\t${remoteRef}`) refuse("floor_unverified");
@@ -3558,7 +3596,7 @@ export class GitCache {
         if (await observe() !== null) refuse("remote_changed_during_refresh");
         return;
       }
-      await this.runGit(barePath, ["fetch", "--refmap=", "--", "origin", `+${remoteRef}:${scratchRef}`], pat, scope, username);
+      await remote(["fetch", "--refmap=", "--", "origin", `+${remoteRef}:${scratchRef}`]);
       const fetched = await this.resolveCommitStrict(barePath, scratchRef).catch((error: unknown) => {
         if (error instanceof RunResidueBlockedError || isAbortLike(error)) throw error;
         throw new ScratchPublicationError("cannot verify fresh remote floor", error, {
@@ -7125,6 +7163,8 @@ export class GitCache {
    * Confirmation here re-syncs and re-reads, but it is not independent of the journal: it proves only that the
    * journal's own bytes are durable and stable. An authoritative consumer (#3639) must bind `expected` to a reference
    * obtained independently of this journal (for example the server's accepted park binding).
+   * {@link GitCache.discoverRetainedRecovery} with `expected` is a read-only, non-healing re-check of the same
+   * run, clone path, attempt id (absent for a canonical clone) and record bytes, and additionally refuses a stopped source.
    */
   async readConfirmedMemoryPark(
     barePath: string, branch: string, expected: { runId: string; clonePath: string; attemptId?: string; record: MemoryParkRecord },
@@ -7477,9 +7517,9 @@ export class GitCache {
 
   private async checkedRecovery(
     barePath: string, branch: string, key: string, expected: RecoverySource, allowMissing = false,
-    detached?: RecoveryJournalEntry,
+    detached?: RecoveryJournalEntry, allowLegacyRepair = true,
   ): Promise<RecoveryJournalEntry> {
-    const { journal, repair } = await this.attributedRecovery(barePath, branch, key, expected, detached, true);
+    const { journal, repair } = await this.attributedRecovery(barePath, branch, key, expected, detached, allowLegacyRepair);
     let missing = false;
     // One pass over the recorded sources, no retries. Any unsafe sibling refuses discovery.
     for (const source of this.recoverySources(journal)) {
@@ -7831,9 +7871,17 @@ export class GitCache {
   }
 
   /** Credential-free discovery before ensureClone/preflight. No remote reads or creation.
-   * A recorded successor is evidence only: every claim must reserve a new iteration. */
+   * A recorded successor is evidence only: every claim must reserve a new iteration.
+   *
+   * issue #3639: with `expected` (a settled memory-park receipt's source binding; `memoryPark` is the
+   * {@link serializeMemoryPark} bytes) this is strictly read-only and exact. After the origin check and the journal
+   * read, and before anything could be healed or repaired, no stored journal throws
+   * {@link MemoryReceiptSourceError} `absent`, another run's `foreign`, and a different clone path, attempt id or
+   * memory-park record `changed`. A stopped-journal heal and a legacy attribution repair (a ledger append) are never
+   * attempted; a journal that needs either throws instead. Without `expected` behaviour is unchanged. */
   async discoverRetainedRecovery(
     repoUrl: string, branch: string, key: string, runId: string,
+    expected?: { runId: string; clonePath: string; attemptId?: string; memoryPark: string },
   ): Promise<{ barePath: string; journal: RecoveryJournalEntry } | undefined> {
     const barePath = this.barePathFor(repoUrl);
     if (!await this.pathPresent(barePath)) return undefined;
@@ -7841,6 +7889,19 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       await this.assertBareOriginIdentity(barePath, repoUrl);
       const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
+      if (expected) {
+        if (!stored) throw new MemoryReceiptSourceError("absent");
+        const read = stored.journal;
+        if (read.runId !== expected.runId) throw new MemoryReceiptSourceError("foreign");
+        if (read.clonePath !== expected.clonePath || read.attemptId !== expected.attemptId ||
+            read.memoryPark === undefined || serializeMemoryPark(read.memoryPark) !== expected.memoryPark) {
+          throw new MemoryReceiptSourceError("changed");
+        }
+        await this.assertNoStoppedMarker(barePath, read.clonePath, read);
+        if (read.runId !== runId) throw new ForeignRetainedRecoveryError();
+        await this.checkedRecovery(barePath, branch, key, read, false, undefined, false);
+        return { barePath, journal: read };
+      }
       if (!stored) return undefined;
       const journal = stored.journal;
       // issue #1786: a pending plain journal that a VALID marker names exactly (same run and path,

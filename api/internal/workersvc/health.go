@@ -1695,6 +1695,9 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 		} else if claimable.Claimable == 0 {
 			if wkr, werr := s.q.GetWorkerByID(ctx, uuid.UUID(r.ReleasedWorkerID.Bytes)); werr == nil &&
 				wkr.LastHeartbeatAt.Valid && !wkr.LastHeartbeatAt.Time.Before(now.Add(-s.p.WorkerHeartbeatStale)) {
+				if r.ReleasedByMemoryPark {
+					return fmt.Sprintf("waiting for another worker, or restart worker %s (its previous process was released by a memory-pressure park)", wkr.Name)
+				}
 				return fmt.Sprintf("waiting for another worker, or restart worker %s (its previous process was released at the time limit)", wkr.Name)
 			}
 		}

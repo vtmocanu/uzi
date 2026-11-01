@@ -32,10 +32,10 @@ const maxAdditionalRateLimits = 16
 // control/bidi strip.
 const maxBucketLabelBytes = 96
 
-// codexMainBucketID is the stable key for the account's top-level rate_limit bucket. The
+// CodexMainBucketID is the stable key for the account's top-level rate_limit bucket. The
 // additional_rate_limits entries are keyed by their own limit_name/metered_feature; a
 // collision with this reserved id is rejected as a duplicate (see normalizeUsage).
-const codexMainBucketID = "codex"
+const CodexMainBucketID = "codex"
 
 // UsageWindow is one utilization window of a Codex rate-limit bucket, decoded from the
 // provider's snake_case wire shape. Every field is a pointer so a MISSING/null sub-field
@@ -165,8 +165,8 @@ func normalizeUsage(body usageResponseWire) (UsageReading, error) {
 	seen := map[string]struct{}{}
 
 	if body.RateLimit != nil {
-		reading.Buckets = append(reading.Buckets, bucketFromWire(codexMainBucketID, "", *body.RateLimit))
-		seen[codexMainBucketID] = struct{}{}
+		reading.Buckets = append(reading.Buckets, bucketFromWire(CodexMainBucketID, "", *body.RateLimit))
+		seen[CodexMainBucketID] = struct{}{}
 	}
 
 	additional := body.AdditionalRateLimits

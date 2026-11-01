@@ -447,6 +447,9 @@ func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 		return runToken{glyph: "⊘", word: "iter limit", color: p.amber}
 	}
 	if isForgeOwnerHold(r) {
+		if isPublicationPark(r) {
+			return runToken{glyph: "!", word: publicationHeldWord, color: p.amber}
+		}
 		return runToken{glyph: "!", word: "forge held", color: p.amber}
 	}
 	if isRecoveryDecisionPark(r) {

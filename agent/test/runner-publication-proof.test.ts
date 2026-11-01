@@ -131,21 +131,22 @@ for (const move of ["unchanged", "foreign", "same-generation"] as const) {
       return result;
     };
     const seam = git as unknown as {
-      runGit(cwd: string, args: string[], ...rest: unknown[]): Promise<string>;
+      execScoped(command: string, args: string[], ...rest: unknown[]): Promise<unknown>;
     };
-    const wire = seam.runGit.bind(git);
+    const wire = seam.execScoped.bind(git);
     const refspecs: string[] = [];
-    seam.runGit = async (cwd, args, ...rest) => {
-      if (args[0] === "push") {
-        refspecs.push(args[2]!);
+    seam.execScoped = async (command, args, ...rest) => {
+      const pushIndex = args.indexOf("push");
+      if (command === "git" && pushIndex !== -1) {
+        refspecs.push(args[pushIndex + 2]!);
         if (refspecs.length === 1) {
           order.push("failed wire");
           failedWire = true;
-          throw new Error("connection reset before send");
+          throw Object.assign(new Error("git push failed before send"), { code: 128, stderr: "connection reset" });
         }
         order.push("successful wire");
       }
-      return wire(cwd, args, ...rest);
+      return wire(command, args, ...rest);
     };
     const push = git.pushBranch.bind(git);
     const publications: PublicationCandidate[] = [];

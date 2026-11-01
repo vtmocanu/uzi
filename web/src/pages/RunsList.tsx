@@ -521,7 +521,7 @@ export function RunRow({
               {/* PRD #320 M6: the queue-priority pill (Deprioritized/Expedited/Restored),
                   self-hiding on a normal or non-queued run. */}
               <RunPriorityBadge priority={run.priority} status={run.status} />
-              <StatusPill health={run.health} status={pillStatus} progress={run.progress} recovery_wait_cause={run.recovery_wait_cause} recovery_retry_not_before={run.recovery_retry_not_before} />
+              <StatusPill health={run.health} status={pillStatus} progress={run.progress} recovery_wait_cause={run.recovery_wait_cause} recovery_retry_not_before={run.recovery_retry_not_before} recovery_wait_phase={run.recovery_wait_phase} />
               <ForgeOriginStatus cooldown={run.forge_origin_cooldown} />
               {/* PRD #320 M6: the owner-only Expedite/undo control, queued rows only. It is
                   raised above the card's stretched-link overlay (relative z-10, issue #485

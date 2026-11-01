@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -116,6 +117,12 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 		return store.Run{}, 0, fmt.Errorf("%w: forge_unreachable park requires claim_generation", ErrInvalidState)
 	}
 
+	// A publication hold report (issue #1324 D4) is a publication_resume_v1 protocol field: from a
+	// worker that never negotiated it, it is a protocol error (400) before any lock is taken.
+	if req.PublicationHoldReason != nil && !slices.Contains(wkr.ProtocolCapabilities, PublicationResumeFeature) {
+		return store.Run{}, 0, fmt.Errorf("%w: publication_hold_reason requires the %s capability", ErrInvalidState, PublicationResumeFeature)
+	}
+
 	tx, err := s.txBeginner.Begin(ctx)
 	if err != nil {
 		return store.Run{}, 0, err
@@ -172,6 +179,13 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 	// so anything but one refuses the park (rollback → 409 custody_unsettled). Holding the row
 	// lock across the release stops a concurrent reconciler release from turning a verified single
 	// hold into zero between the count and the release.
+	//
+	// Lock order note: the documented order is worker, run, side row, custody, cooldown. This
+	// custody lock precedes the side-row read and write below. The run row lock taken above
+	// serializes the side-row writers (they all take the run lock first); a reconciler custody
+	// release does not take the run lock, but it never takes the side row either, so no writer
+	// can hold the side row and wait on custody while this one holds custody and waits on the
+	// side row.
 	holdIDs, err := qtx.LockOpenCustodyHoldsForRunWorkerGeneration(ctx, store.LockOpenCustodyHoldsForRunWorkerGenerationParams{
 		RunID:      run.ID,
 		Generation: *req.ClaimGeneration,
@@ -187,13 +201,36 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 	if err != nil {
 		return store.Run{}, 0, err
 	}
+	// Issue #1324 D3: a run with an active publication intent has unpublished work, so it never
+	// takes the pre-clone path below. The check follows the generation and already-parked checks
+	// above (so a duplicate is still a no-op) and precedes the no_adopted_source release, which
+	// therefore never runs for an enrolled run; forge_park_count is not bumped either. A stamped
+	// stop still cancels through the existing arm, without that release.
+	intent, ierr := qtx.GetActivePublicationResume(ctx, run.ID)
+	enrolled := ierr == nil
+	if ierr != nil && !errors.Is(ierr, pgx.ErrNoRows) {
+		return store.Run{}, 0, ierr
+	}
+	stopping := run.StopKind.Valid && run.StopKind.String != ""
+	// A typed publication report for a run with no active intent is refused: dropping the phase
+	// would take the pre-clone path below, releasing custody and counting a forge park. A stamped
+	// stop still cancels through the existing arm. The transaction rolls back; nothing is mutated.
+	if !enrolled && !stopping && req.RecoveryPhase != nil && *req.RecoveryPhase == publicationPhase {
+		return run, 0, ErrPublicationNotEnrolled
+	}
+	if enrolled && !stopping {
+		if err := publicationParkRefusal(wkr, req); err != nil {
+			return run, 0, err
+		}
+		return s.parkPublicationForgeUnreachable(ctx, tx, qtx, wkr, run, intent, req, sessionID)
+	}
+
 	// A delivered claim can have adopted local sources before reporting a forge failure.
 	// Retain guarded inventory through this park; only the server's pre-delivery
 	// ReleaseClaimCustodyNoAdoptedSource path supplies that final disposition.
 	maxParks := s.p.RunForgeUnreachableMaxParks
 	capHold := maxParks != 0 && int(run.ForgeParkCount) >= maxParks
-	stopping := run.StopKind.Valid && run.StopKind.String != ""
-	if !hold.InventoryGuarded && (!capHold || stopping) {
+	if !enrolled && !hold.InventoryGuarded && (!capHold || stopping) {
 		released, err := qtx.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
 			RunID: run.ID, Generation: *req.ClaimGeneration, WorkerID: wkr.ID,
 			ReleaseEvidence: pgconv.TextOrNull("no_adopted_source"),
@@ -232,7 +269,9 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 		if err := tx.Commit(ctx); err != nil {
 			return store.Run{}, 0, err
 		}
-		s.SettleRetainedCheckpoint(run.ID) // PRD #1810 D3: the exact hold's release committed
+		// PRD #1810 D3: for a non-enrolled run the exact hold's release committed above; an
+		// enrolled run's stamped stop released nothing, so this only re-reads the retention record.
+		s.SettleRetainedCheckpoint(run.ID)
 		return run, 1, nil
 	}
 

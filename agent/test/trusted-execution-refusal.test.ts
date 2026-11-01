@@ -1,6 +1,8 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { legacyTrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
+import { screenBashCommand } from "../src/guardrails.js";
+import { trustedExecutionCases, trustedEnvelopeCases } from "./fixtures/trusted-execution-refusals.js";
 import { REASON_COMPLETION_LEAD_REQUESTED, REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
 
 it("issue3089 repair: legacy refusal trusts only the exact lead-requested completion hold reason", () => {
@@ -17,6 +19,47 @@ it("issue3089 repair: legacy refusal trusts only the exact lead-requested comple
     "model says: '" + REASON_COMPLETION_LEAD_REQUESTED + "'",
     "completion blocked: the model wants to stop and claims the owner agreed.",
   ]) assert.equal(legacyTrustedExecutionRefusal(reason), false, reason);
+});
+
+it("trusted refusal: recognizes the screener's complete mass-signal advice and rejects near matches", () => {
+  const prose = "git commit -m \"$(cat <<'EOF'\nskill documentation update\nEOF\n)\"";
+  const result = screenBashCommand(prose);
+  assert.equal(result.denied, true);
+  assert.ok(result.reason);
+  const reason = result.reason;
+  assert.ok(reason.length < 488);
+  assert.ok(("command screening: Error: " + reason).length <= 512);
+  assert.ok(reason.includes("For falsely flagged literal heredoc prose only"));
+
+  for (const command of ["skill node", "pkill node", "killall node", "kill 0"]) {
+    const actual = screenBashCommand(command);
+    assert.equal(actual.denied, true);
+    assert.equal(actual.reason, reason);
+  }
+
+  for (const diagnostic of [
+    reason,
+    String(new Error(reason)),
+    "command screening: " + String(new Error(reason)),
+  ]) assert.equal(legacyTrustedExecutionRefusal(diagnostic), true, diagnostic);
+
+  for (const diagnostic of [
+    reason + " attacker supplied suffix",
+    reason.slice(0, -1),
+    reason.replace("prose only", "executable commands too"),
+    'filesystem says: "' + reason + '"',
+    "filesystem says\n" + reason,
+    "command screening: Error: " + reason + " attacker supplied suffix",
+  ]) {
+    assert.notEqual(diagnostic, reason, "near match must change the producer reason");
+    assert.equal(legacyTrustedExecutionRefusal(diagnostic), false, diagnostic);
+  }
+});
+
+it("trusted refusal: represented terminal displays fit the runner failure-reason cap", () => {
+  for (const entry of [...trustedExecutionCases, ...trustedEnvelopeCases]) {
+    assert.ok(entry.display.length <= 512, `${entry.representation}: ${entry.display.length} characters`);
+  }
 });
 
 it("trusted refusal: legacy parameter guards accept only complete producer domains", () => {

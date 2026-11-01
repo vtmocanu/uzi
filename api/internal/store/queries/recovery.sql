@@ -927,7 +927,9 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
       (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL
         -- A forge_unreachable pre-clone park keeps its claim; only the worker's settled
         -- forge_no_output proof (empty inventory) may end that exact generation early.
+        -- A publication-phase park holds unpublished source and never settles custody.
         OR (r.status = 'recovery_wait' AND r.recovery_wait_cause = 'forge_unreachable'
+          AND r.recovery_wait_phase IS NULL
           AND @final_disposition::text = 'settled' AND @release_evidence::text = 'forge_no_output')))))
   AND (
     (@final_disposition::text = 'archive' AND @release_evidence::text = 'archive'
@@ -946,6 +948,55 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
           WHERE r.id = h.run_id AND r.user_id = h.user_id AND r.status = 'completed'
             AND r.claim_generation = h.generation AND r.worker_id = h.original_worker_id))))
   );
+
+-- name: ProtectFinalClosureCapture :execrows
+-- Closure-bearing twin of ProtectFinalInventoryCapture: requires prerequisites and an
+-- exact still-pinned closure bound to this capture.
+-- Precondition: the caller holds the worker and run rows FOR UPDATE, the hold FOR NO KEY UPDATE,
+-- the capture FOR UPDATE and the closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
+-- serialize against closure state changes, so this query is only safe under those locks.
+UPDATE recovery_captures c SET local_replica_worker_id = @worker_id::uuid,
+    ready_retention_seconds = @retention_seconds::bigint, updated_at = now()
+WHERE c.id = @id AND c.hold_id = @hold_id AND c.original_worker_id = @worker_id::uuid
+  AND c.source_sha = @source_sha AND c.coverage_digest = @coverage_digest
+  AND c.manifest_bound AND c.state = 'available' AND c.expires_at > clock_timestamp()
+  AND cardinality(c.prerequisite_shas) > 0
+  AND EXISTS (SELECT 1 FROM recovery_prerequisite_closures p WHERE p.id = @closure_id
+    AND p.capture_id = c.id AND p.hold_id = c.hold_id AND p.state = 'pinned' AND p.absent_since IS NULL
+    AND p.checksum = c.checksum AND p.prerequisite_shas = c.prerequisite_shas)
+  AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.id = c.hold_id
+    AND h.inventory_guarded AND h.state = 'open' AND h.live_worker_id = @worker_id::uuid);
+
+-- name: ReleaseFinalClosureHold :execrows
+-- Archive-only release of a hold whose capture carries prerequisites, bound to its pinned closure.
+-- Runs parked on an owner-only recovery_wait cause never release this way.
+-- Precondition: the caller holds the worker and run rows FOR UPDATE, the hold FOR NO KEY UPDATE,
+-- the capture FOR UPDATE and the closure FOR UPDATE (closure last). The composite foreign key's KEY SHARE lock does not
+-- serialize against closure state changes, so this query is only safe under those locks.
+UPDATE recovery_custody_holds h SET state = 'released', live_worker_id = NULL, live_run_id = NULL,
+    final_disposition = 'archive', final_capture_id = @final_capture_id::uuid,
+    final_source_sha = @final_source_sha::text, final_coverage_digest = @final_coverage_digest::text,
+    release_evidence = 'prerequisite_closure', final_closure_id = @closure_id::uuid,
+    released_at = now(), updated_at = now()
+WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
+  AND h.generation = @generation AND h.original_worker_id = @worker_id::uuid
+  AND h.live_worker_id = @worker_id::uuid AND h.inventory_guarded AND h.state = 'open'
+  AND EXISTS (SELECT 1 FROM runs r WHERE r.id = h.run_id AND r.user_id = h.user_id
+    AND (r.claim_generation > h.generation OR (r.claim_generation = h.generation AND
+      (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL)))
+    AND NOT (r.status = 'recovery_wait' AND r.recovery_wait_cause IS NOT NULL
+      AND r.recovery_wait_cause IN ('worker_requeue_exhausted',
+      'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')))
+  AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id = @final_capture_id::uuid
+    AND c.hold_id = h.id AND c.run_id = h.run_id AND c.user_id = h.user_id
+    AND c.original_worker_id = h.original_worker_id AND c.source_sha = @final_source_sha::text
+    AND c.coverage_digest = @final_coverage_digest::text
+    AND c.manifest_bound AND c.state = 'available' AND c.expires_at > clock_timestamp()
+    AND cardinality(c.prerequisite_shas) > 0
+    AND c.local_replica_worker_id = h.original_worker_id AND c.ready_retention_seconds > 0
+    AND EXISTS (SELECT 1 FROM recovery_prerequisite_closures p WHERE p.id = @closure_id::uuid
+      AND p.capture_id = c.id AND p.hold_id = h.id AND p.state = 'pinned' AND p.absent_since IS NULL
+      AND p.checksum = c.checksum AND p.prerequisite_shas = c.prerequisite_shas));
 
 -- name: RunHasGuardedInventoryHold :one
 SELECT EXISTS (SELECT 1 FROM recovery_custody_holds

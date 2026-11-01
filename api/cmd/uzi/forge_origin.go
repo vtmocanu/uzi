@@ -58,12 +58,23 @@ func workerForgeLines(w apitypes.WorkerDTO) []string {
 }
 
 func isForgeOwnerHold(r apitypes.RunDTO) bool {
-	return isForgePark(r) && r.RecoveryRetryNotBeforePresent && r.RecoveryRetryNotBefore == nil
+	if !isForgePark(r) || r.RecoveryRetryNotBefore != nil {
+		return false
+	}
+	// A publication hold carries its reason, so it is an owner hold even if the client could not
+	// tell an absent retry key from a null one.
+	return r.RecoveryRetryNotBeforePresent || (publicationPhaseOf(r) == publicationPhase && strOr(r.PublicationHoldReason, "") != "")
 }
 
 func forgeHoldLines(r apitypes.RunDTO) []string {
 	if !isForgeOwnerHold(r) {
 		return nil
+	}
+	if isPublicationPark(r) {
+		return publicationHoldLines(r)
+	}
+	if isUnknownPhasePark(r) {
+		return unknownPhaseHoldLines(r)
 	}
 	id := providerCommandID(r.ID)
 	return []string{

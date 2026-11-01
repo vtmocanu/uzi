@@ -184,6 +184,30 @@ func TestPlanCrossCheckSummaryCanonicalBoundary(t *testing.T) {
 	}
 }
 
+// A failing rounds query loses only the round history; the summary row is still returned
+// so a checked gated run is not rendered as "not checked" by clients.
+type summaryRoundsErrStore struct{ summaryTestStore }
+
+func (*summaryRoundsErrStore) ListPlanCrossCheckRounds(context.Context, store.ListPlanCrossCheckRoundsParams) ([]store.ListPlanCrossCheckRoundsRow, error) {
+	return nil, errors.New("rounds query failed")
+}
+
+func (*summaryRoundsErrStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
+	return store.Run{}, pgx.ErrNoRows
+}
+
+func TestPlanCrossCheckSummaryRoundsErrorKeepsSummary(t *testing.T) {
+	q := &summaryRoundsErrStore{summaryTestStore{row: store.GetLatestPlanCrossCheckSummaryRow{
+		Verdict: "approve", Round: 2, ReasonClass: pgtype.Text{String: "approve", Valid: true}}}}
+	got, err := (&Service{q: q}).PlanCrossCheckSummary(t.Context(), uuid.New(), uuid.New())
+	if err != nil || got == nil {
+		t.Fatalf("summary dropped on rounds error: %+v %v", got, err)
+	}
+	if got.Verdict != "approve" || got.Round != 2 || got.Rounds != nil {
+		t.Fatalf("unexpected summary: %+v", got)
+	}
+}
+
 func TestPlanCrossCheckSummaryFieldBounds(t *testing.T) {
 	for _, tc := range []struct {
 		name                  string

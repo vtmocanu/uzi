@@ -13,4 +13,7 @@ type ForgeOriginCooldownDTO struct {
 	// Detail is fixed server wording.
 	State  string `json:"state"`
 	Detail string `json:"detail"`
+	// Surfaces lists which evidence surfaces are still unverified on this origin: "git" for
+	// clone/fetch/push, "api" for forge API calls. Equal Git and API origins share one row.
+	Surfaces []string `json:"surfaces"`
 }

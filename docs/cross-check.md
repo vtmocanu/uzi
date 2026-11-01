@@ -7,9 +7,10 @@ audience: user
 # Cross-check
 
 Cross-check asks the other model family for a second opinion on a run.
-**Plan cross-check** is a required gate on opted-in auto-approved plans: a
-Claude lead is checked on Codex and a Codex lead on Claude, never on its own
-family.
+**Plan cross-check** is a required gate on opted-in auto-approved plans, and a
+check before your review on opted-in plans that stop at the human gate (see
+[Checked before your review](#checked-before-your-review)): a Claude lead is
+checked on Codex and a Codex lead on Claude, never on its own family.
 **Code cross-check** is a separate, opt-in advisory stage before publication:
 the other family reads the committed code and its findings go into the merge
 request, but it never blocks publication (see
@@ -19,11 +20,13 @@ request, but it never blocks publication (see
 
 In **Settings → Run defaults → Cross-check**, enable **Plan cross-check**.
 It is off by default and requires usable Claude and Codex credentials. The
-setting applies to new eligible auto-approved runs, not existing runs or
-human-gated plans. It covers issue, prompt, self-improvement, CI fix and merge
-request rework plans that reach the auto-approval gate. Gateless tasks and
-plans supplied at creation are outside this gate. Turning it off affects
-future runs only.
+setting applies to new eligible runs, not existing runs. On an auto-approved
+run it covers issue, prompt, self-improvement, CI fix and merge request rework
+plans that reach the auto-approval gate. On a run that is not auto-approved it
+covers issue, prompt and CI fix plans, checked before your review (see
+[Checked before your review](#checked-before-your-review)). Gateless tasks and
+plans supplied at creation are outside both. Turning it off affects future
+runs only.
 
 The **Plan cross-check** row has independent model and effort choices for
 Claude and Codex. At **Default**, the model follows that family's worker
@@ -217,6 +220,108 @@ See the [dated ADR amendment](../adr/2149-cross-check.md#advisory-plan-coverage-
 and [PRD #3168](../prds/3168-plan-cross-check-coverage.md) for validation and
 remaining replay scope.
 
+## Checked before your review
+
+With **Plan cross-check** enabled, a run that is not auto-approved is checked
+before its first human plan gate. The run snapshots this mode when it is
+created, from your setting at that moment: it covers issue, prompt and CI fix
+runs, not seeded plans, gateless kinds or isolated-lane runs. A run is
+required (auto-approved), checked before your review, or neither, never two.
+Runs created before the upgrade, and runs created with the setting off, keep
+their current behavior.
+
+**The loop.** The lead submits its plan, the opposite family checks it
+(Claude lead on Codex, Codex lead on Claude), and changes requested go back to
+the lead automatically under the same rules as the
+[required check](#2-wait-for-the-checked-plan): the same revision budget
+(`PLAN_CROSS_CHECK_MAX_REVISIONS`), a fresh deadline per candidate, the same
+cross-check lane, and the lead's
+[Cross-check dispositions](#automatic-plan-revision-contract) section. No new
+setting or budget applies, and the automatic rounds do not spend your human
+revision allowance.
+
+**The difference is the end.** Whatever the final verdict, including APPROVE,
+the run stops at the human gate on the latest candidate and does not
+implement. A checker APPROVE is evidence for you, never an implementation
+grant: implementation starts only when you approve the plan shown at the gate.
+The server enforces this where approval is decided, and a database trigger
+refuses the move from `awaiting_approval` to `running` for a checked-before-
+review run without a current approval bound to the presented plan. You approve,
+request changes or reject exactly as for any plan.
+
+**Outcomes at the gate.** The gate typically shows one of these results, with
+any findings:
+
+| Result | Meaning |
+|--------|---------|
+| Passed after N rounds | The latest check approved the current plan. |
+| Changes requested | The latest check asked for changes and no later round completed. |
+| Blocked | The checker returned BLOCK. |
+| Revisions exhausted | The automatic budget ran out. |
+| Timed out | The verdict or checker-model deadline passed. |
+| Interrupted | The attempt was interrupted before a verdict was bound to the presented plan. |
+| Unavailable | The checker could not start, failed, or gave no usable verdict. |
+| Unavailable, not supported on this worker | The lead's worker lacks the capability (see the version matrix below). |
+| Not checked | No check row exists for this plan. |
+| Checked an earlier version of this plan | You requested changes after a check; the check is historical and certifies nothing about the revised plan. |
+| Outcome unavailable | The recorded rows are inconsistent with a pass, so none is claimed. |
+
+A failed check never parks the run: it presents the gate with the reason. Web,
+CLI and Slack apply the same rule for **passed**: the gate carries no reason,
+the latest check approved, and that check is of the current plan. The run
+page additionally checks that the last listed round agrees, and shows
+**Outcome unavailable** instead when it does not. After you
+request changes, the earlier check is historical (**Earlier-plan evidence**)
+and does not certify the revised plan; no new check runs (ADR-2149 and PRD
+#2149 D16 are unchanged).
+
+**Every round, not only the last.** The run page and `uzi run get` list up to
+five rounds, the server's per-run cap (for any plan cross-check with recorded
+rounds, auto-approved runs included): each round's verdict and findings,
+with the lead's response beside them. The response is the "Cross-check
+dispositions" section of the **next** round's candidate, capped at 8 KiB, and
+is labelled as the lead's unverified claims: nothing infers that a finding was
+addressed, and dispositions never gate approval. The response state is one of
+`reported`, `truncated`, `not_reported`, `unknown` (the next plan was too long
+to search), `replanned_after_interruption`, `reported_in_presented_plan` (the
+presented plan, not a checked candidate, held the section) or
+`no_following_candidate`. The section may also carry entries for older rounds,
+because a later plan's section is not limited to the preceding check. While a
+check runs, the run page shows that it is in progress with its deadline, and
+between rounds that the lead is revising. Findings stay fenced as untrusted,
+possibly wrong advice. Slack shows one result line and no findings.
+
+**Version matrix.** The mode needs a worker advertising `cross_check_gated_v1`.
+
+| API | Worker | Behavior |
+|-----|--------|----------|
+| New | New | The loop runs before the first gate. |
+| New | Old | An ordinary gate opens at once; the server records the check as unavailable, "not supported on this worker" (`worker_unsupported`), because an old worker cannot report a new outcome. |
+| Old | New | The worker never submits a check and presents an ordinary gate. |
+| Old | Old | Today's behavior. |
+
+A Codex lead's gated check also needs `cross_check_codex_lead_v1`, as for the
+required check.
+
+**How long the gate can take.** The first gate waits for the loop. With the
+defaults the checker waiting is at most 5 candidates x 30 minutes (2 h 30 min);
+at the 2-hour maximum `PLAN_CROSS_CHECK_TIMEOUT` it is at most 10 hours; the
+timeout is shorter on installations with a short `RUN_TIMEOUT`. The lead's own
+revision turns add to this and are charged to the run as usual. This is an
+upper bound, not a promised gate time. The lead keeps its worker slot while it
+waits, and pending time is excluded from its wall budget as for the required
+check. See [Configuration](./configuration.md#cross-check-settings).
+
+**Recovery.** A reclaimed lead retries the same check without creating a second
+checker run or renewing its deadline. If custody is lost while a check is
+pending, the check ends and the gate opens as interrupted or timed out, with no
+new round and no new deadline. A decided REVISE can still start a new round,
+and an unpresented APPROVE shows as interrupted. A gate that was already
+presented never re-runs the check.
+
+[CLI](./cli.md#plan-cross-check-evidence) shows the mode, rounds and deadline
+rows.
+
 ## 3. Read the evidence and decide
 
 Open the run to see distinct rounds in the feed, the current gate reason,
@@ -370,6 +475,44 @@ deletes Claude checker runs but keeps the check history, with the checker run
 link empty. Run the Down only with the new api stopped. With ephemeral workers
 off, the settings toggle warns when no online worker can run the checker,
 including when none advertises `cross_check_codex_lead_v1`.
+
+## Rolling back Plan cross-check before the human gate
+
+Migrations 00394 and 00395 add the `runs.plan_cross_check_gated` column, a mode
+CHECK, the `worker_unsupported` gate reason and the trigger
+`enforce_gated_plan_approval`. An older api does not know the trigger's
+contract, so a run that is checked before your review must not be in flight
+when you roll back. The api is a single `Recreate` instance, so stop it before
+you check. Turning off a user's **Plan cross-check** setting is not an
+admission barrier: it affects only runs created afterwards.
+
+1. **Drain.** While the current api still runs, let every checked-before-review
+   run reach a terminal state (`completed`, `failed` or `cancelled`): approve,
+   reject or cancel them, and wait for in-flight loops to reach their gate.
+2. **Stop the upgraded api and keep it stopped** (compose: `docker compose stop
+   api`; Helm: scale the api Deployment to 0).
+3. **Run the drain check** against the database:
+
+   ```sh
+   psql -v ON_ERROR_STOP=1 -1 -f scripts/gated-cross-check-drain-check.sql "$DATABASE_URL"
+   ```
+
+   It writes nothing. If it reports any non-terminal run, **abort**: run no
+   Down, start no older api. Restart the current api, finish or cancel those
+   runs, and restart from step 1.
+4. **Roll back the schema or only the binary.** For a schema rollback, run goose
+   down to 00393; the Down of 00395 and of 00394 each repeat the same guard
+   (a refusal means abort), and 00394's Down remaps `worker_unsupported` to
+   `checker_unavailable`, restores the earlier reason list, and drops the
+   trigger, its function, the mode CHECK and the column. For a binary-only
+   downgrade, skip the Down: step 3 is the admission check.
+5. **Deploy and start the older api.**
+
+The guard locks `runs` (`SHARE ROW EXCLUSIVE`) with a 5-second lock timeout and
+refuses while any `plan_cross_check_gated` run is not terminal. A test keeps the
+script and the two Down guards identical. No hosted rollback rehearsal has been
+run; see [PRD #3708](../prds/3708-gated-plan-cross-check.md) for the pending live
+acceptance. See also the [deploy runbook](../deploy/README.md).
 
 ## Semantic contract profile (dormant)
 

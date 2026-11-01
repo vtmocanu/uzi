@@ -89,6 +89,7 @@ type AuthorizedForgeOrigin struct {
 	UserID       uuid.UUID `json:"user_id"`
 	ConnectionID uuid.UUID `json:"connection_id"`
 	Origin       string    `json:"origin"`
+	ApiOrigin    string    `json:"api_origin"`
 }
 
 type AutopilotTrigger struct {
@@ -440,6 +441,8 @@ type ForgeOriginCooldown struct {
 	ReservationIncarnation        pgtype.UUID        `json:"reservation_incarnation"`
 	ReservationVersion            pgtype.Int8        `json:"reservation_version"`
 	ReservationObservationVersion pgtype.Int8        `json:"reservation_observation_version"`
+	GitUnverified                 bool               `json:"git_unverified"`
+	ApiUnverified                 bool               `json:"api_unverified"`
 }
 
 type GithubProjectItem struct {
@@ -650,6 +653,21 @@ type MemoryIntervention struct {
 	Outcome         pgtype.Text        `json:"outcome"`
 	ReservedAt      pgtype.Timestamptz `json:"reserved_at"`
 	OutcomeAt       pgtype.Timestamptz `json:"outcome_at"`
+}
+
+type MemoryParkRelease struct {
+	RunID            uuid.UUID          `json:"run_id"`
+	ClaimGeneration  int64              `json:"claim_generation"`
+	MemoryEpisode    int64              `json:"memory_episode"`
+	WorkerID         uuid.UUID          `json:"worker_id"`
+	RegisterNonce    string             `json:"register_nonce"`
+	ReleasedAt       pgtype.Timestamptz `json:"released_at"`
+	Settlement       []byte             `json:"settlement"`
+	SettlementSha256 []byte             `json:"settlement_sha256"`
+	SettledAt        pgtype.Timestamptz `json:"settled_at"`
+	LiftedAt         pgtype.Timestamptz `json:"lifted_at"`
+	SupersededAt     pgtype.Timestamptz `json:"superseded_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 }
 
 type MrReviewAuthorQueue struct {
@@ -921,6 +939,7 @@ type RecoveryCustodyHold struct {
 	CompletedPublicationReason      pgtype.Text        `json:"completed_publication_reason"`
 	FinalPublicationID              pgtype.UUID        `json:"final_publication_id"`
 	MergedPredecessorDiscardBinding []byte             `json:"merged_predecessor_discard_binding"`
+	FinalClosureID                  pgtype.UUID        `json:"final_closure_id"`
 }
 
 type RecoveryCustodyHoldFact struct {
@@ -1214,6 +1233,9 @@ type Run struct {
 	CapabilityInferenceEvidence []byte             `json:"capability_inference_evidence"`
 	IdleStallParkCount          int32              `json:"idle_stall_park_count"`
 	ForgeAdmission              []byte             `json:"forge_admission"`
+	CodexSelectReason           pgtype.Text        `json:"codex_select_reason"`
+	RecoveryWaitPhase           pgtype.Text        `json:"recovery_wait_phase"`
+	PlanCrossCheckGated         bool               `json:"plan_cross_check_gated"`
 }
 
 type RunCompletionAttempt struct {
@@ -1299,14 +1321,17 @@ type RunFetchReservation struct {
 }
 
 type RunForgeOrigin struct {
-	RunID                  uuid.UUID   `json:"run_id"`
-	UserID                 uuid.UUID   `json:"user_id"`
-	WorkerID               uuid.UUID   `json:"worker_id"`
-	Generation             int64       `json:"generation"`
-	ConnectionID           uuid.UUID   `json:"connection_id"`
-	Origin                 pgtype.Text `json:"origin"`
-	ReservationIncarnation pgtype.UUID `json:"reservation_incarnation"`
-	ReservationVersion     pgtype.Int8 `json:"reservation_version"`
+	RunID                     uuid.UUID   `json:"run_id"`
+	UserID                    uuid.UUID   `json:"user_id"`
+	WorkerID                  uuid.UUID   `json:"worker_id"`
+	Generation                int64       `json:"generation"`
+	ConnectionID              uuid.UUID   `json:"connection_id"`
+	Origin                    pgtype.Text `json:"origin"`
+	ReservationIncarnation    pgtype.UUID `json:"reservation_incarnation"`
+	ReservationVersion        pgtype.Int8 `json:"reservation_version"`
+	ApiOrigin                 pgtype.Text `json:"api_origin"`
+	ApiReservationIncarnation pgtype.UUID `json:"api_reservation_incarnation"`
+	ApiReservationVersion     pgtype.Int8 `json:"api_reservation_version"`
 }
 
 type RunGatePresentation struct {
@@ -1393,6 +1418,25 @@ type RunMilestoneReconciliation struct {
 	AppliedInputID   int64              `json:"applied_input_id"`
 	StopCutoff       int64              `json:"stop_cutoff"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunPublicationResume struct {
+	RunID           uuid.UUID          `json:"run_id"`
+	EnrollmentSeq   int32              `json:"enrollment_seq"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	WorkerID        pgtype.UUID        `json:"worker_id"`
+	Intent          []byte             `json:"intent"`
+	CandidateSeq    int32              `json:"candidate_seq"`
+	State           string             `json:"state"`
+	RetiredReason   pgtype.Text        `json:"retired_reason"`
+	WaitStartedAt   pgtype.Timestamptz `json:"wait_started_at"`
+	FirstWaitAt     pgtype.Timestamptz `json:"first_wait_at"`
+	ParkTotal       int32              `json:"park_total"`
+	Episode         int32              `json:"episode"`
+	HoldReason      pgtype.Text        `json:"hold_reason"`
+	Handoff         []byte             `json:"handoff"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
 type RunReview struct {
@@ -1706,6 +1750,7 @@ type User struct {
 	VaultEpoch                int64              `json:"vault_epoch"`
 	VaultAutoReunlock         bool               `json:"vault_auto_reunlock"`
 	VaultSlotGeneration       int64              `json:"vault_slot_generation"`
+	CodexAccountMode          string             `json:"codex_account_mode"`
 }
 
 type UserCrossCheckPin struct {

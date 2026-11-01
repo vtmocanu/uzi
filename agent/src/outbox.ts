@@ -63,6 +63,17 @@ import path from "node:path";
 import type { Logger } from "./log.js";
 import type { TerminalRejectionCustodyResponse, OutgoingMessage } from "./protocol.js";
 import type { DiskFullVerdict } from "./disk-full.js";
+import {
+  MAX_PUBLICATION_INTENT_BYTES,
+  MAX_PUBLICATION_RECORD_BYTES,
+  PublicationIntentMismatchError,
+  parsePublicationRecord,
+  publicationIntentBytes,
+  samePublicationIdentity,
+  type PublicationRecord,
+  type PublicationWriteFailure,
+  type PublicationWriteResult,
+} from "./publication-intent.js";
 
 /** The worker-local HMAC secret is exactly this many random bytes. */
 const OUTBOX_KEY_BYTES = 32;
@@ -108,6 +119,10 @@ const FINALIZE_RESUME_MAX_ENTRIES = 256;
  *  a terminal journal (or any other kind) under the same worker-local key. */
 const MAC_DOMAIN_FINALIZE = "uzi.outbox.finalize.v1";
 
+/** Issue #1324: the publication-intent record's own domain label. Distinct from the finalize label
+ *  (and every other), so a finalize record's MAC never verifies as a publication record and vice versa. */
+const MAC_DOMAIN_PUBLICATION = "uzi.outbox.publication.v1";
+
 const MANIFEST_FILE = "manifest.json";
 const KEY_FILE = ".key";
 const RESERVE_FILE = ".reserve";
@@ -119,6 +134,14 @@ const TERMINAL_FILE_SUFFIX = ".json";
 /** Issue #1742: the per-run finalize-pending record filename, `finalize-<claimGeneration>.json`. */
 const FINALIZE_FILE_PREFIX = "finalize-";
 const FINALIZE_FILE_SUFFIX = ".json";
+/** Issue #1324: the per-run publication-intent record filename, `publication-<claimGeneration>.json`.
+ *  Never a finalize record and never retired through retireFinalize*. */
+const PUBLICATION_FILE_PREFIX = "publication-";
+const PUBLICATION_FILE_SUFFIX = ".json";
+/** An install temp left by a crash: `publication-<G>.json.<uuid>.tmp`. */
+const PUBLICATION_TEMP_RE = /^publication-\d+\.json\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+/** Issue #1742: the most publication_resume entries one register offers (the api's default cap). */
+const PUBLICATION_RESUME_MAX_ENTRIES = 256;
 
 /** The fixed reason a quota / ENOSPC drop records; replay expands the range into
  *  one status tombstone per seq carrying this reason (batcher.ts:152-180). */
@@ -267,7 +290,43 @@ interface RunState {
   terminals: Map<number, TerminalMeta>;
   /** Issue #1742: the run's pending finalize-pending records keyed by claim generation. */
   finalizes: Map<number, FinalizeMeta>;
+  /** Issue #1324: the run's publication-intent records keyed by claim generation. */
+  publications: Map<number, PublicationMeta>;
 }
+
+/** Issue #1324: in-memory metadata for one authenticated publication record. */
+interface PublicationMeta {
+  claimGeneration: number;
+  since: number;
+  enrollmentSeq?: number;
+  candidateSeq?: number;
+}
+
+/** Issue #1324: one authenticated publication record listed by {@link Outbox.listPublicationRecords}. */
+export interface PendingPublication {
+  run_id: string;
+  claim_generation: number;
+  enrollment_seq?: number;
+  candidate_seq?: number;
+}
+
+/** Issue #1324: a register `publication_resume` entry (api `PublicationResumeEntry`). */
+export interface PublicationResumeRegisterEntry {
+  run_id: string;
+  claim_generation: number;
+  enrollment_seq: number;
+  candidate_seq: number;
+}
+
+/** Issue #1324: what {@link Outbox.loadPublicationRecord} found. `unauthenticated` and `unreadable`
+ *  say nothing about the enrollment, only that this file proves nothing; neither implies retirement. */
+export type PublicationLoadResult =
+  | { kind: "ok"; record: PublicationRecord }
+  | { kind: "absent" }
+  | { kind: "unauthenticated" }
+  /** The MAC verified but the content is not an intent this worker honours (unknown version or guard state). */
+  | { kind: "mismatch"; detail: string }
+  | { kind: "unreadable" };
 
 /** Issue #1742: in-memory metadata for one finalize-pending record. It records only that the
  *  executor of this generation returned success and the worker had begun finalizing; it is never an
@@ -317,7 +376,7 @@ export interface OutboxDepth {
  *  seam that throws `ENOSPC` to exercise the reserve path. */
 export type RawWriteSeam = (
   write: () => Promise<void>,
-  ctx: { path: string; kind: RecordFileKind | "manifest" | "terminal" | "finalize" },
+  ctx: { path: string; kind: RecordFileKind | "manifest" | "terminal" | "finalize" | "publication" },
 ) => Promise<void>;
 
 /** Content-free physical evidence. Unknown files never enter the pending inventory. */
@@ -547,7 +606,7 @@ export class Outbox {
     // proves records once existed, so minting a fresh key would orphan its MACs).
     let hasRecords = false;
     for (const runId of runDirs) {
-      if (await pathExists(path.join(this.runDir(runId), MANIFEST_FILE))) {
+      if (await pathExists(path.join(this.runDir(runId), MANIFEST_FILE)) || await this.hasPublicationFile(runId)) {
         hasRecords = true;
         break;
       }
@@ -595,6 +654,7 @@ export class Outbox {
       authenticated += result.authenticated;
       rejected += result.rejected;
       await this.loadFinalizes(runId);
+      await this.loadPublications(runId);
     }
 
     this.log.info("outbox terminal journal load", {
@@ -701,7 +761,7 @@ export class Outbox {
         recordBytes.set(rec.file, 0); // referenced file missing/gone; accounts as 0
       }
     }
-    this.runs.set(runId, { runId, manifest, recordBytes, terminals: new Map(), finalizes: new Map() });
+    this.runs.set(runId, { runId, manifest, recordBytes, terminals: new Map(), finalizes: new Map(), publications: new Map() });
     if (manifest.spilledUnclean) this.uncleanAtInit.push(runId);
   }
 
@@ -1143,6 +1203,7 @@ export class Outbox {
         rs.manifest.records.length === 0 &&
         rs.terminals.size === 0 &&
         rs.finalizes.size === 0 &&
+        rs.publications.size === 0 &&
         now - rs.manifest.updatedAt > this.retentionMs
       ) {
         toRemove.push(runId);
@@ -1177,6 +1238,7 @@ export class Outbox {
     if (rs.manifest.records.length !== 0) return false; // a record was appended after the decision
     if (rs.terminals.size !== 0) return false; // a terminal journal was installed after the decision
     if (rs.finalizes.size !== 0) return false; // a finalize record was installed after the decision
+    if (rs.publications.size !== 0) return false; // a publication record was installed after the decision
     if (now - rs.manifest.updatedAt <= this.retentionMs) return false; // no longer past retention
     if (await this.hasPhysicalTerminalProtection(runId)) return false;
     await this.removeRun(runId);
@@ -1760,7 +1822,7 @@ export class Outbox {
    *  The reserve/ENOSPC handling now lives in {@link journalTerminal} (and {@link journalFinalize}), wrapping this call AND the
    *  run-dir mkdir together, so the whole sequence uses (and replenishes) the reserve exactly once
    *  on a full volume — the temp write and the `link()` both ride that single release. */
-  private async installExclusive(dst: string, serialized: string, kind: "terminal" | "finalize"): Promise<boolean> {
+  private async installExclusive(dst: string, serialized: string, kind: "terminal" | "finalize" | "publication"): Promise<boolean> {
     const tmp = `${dst}.${randomUUID()}.tmp`;
     const doWrite = async () => {
       const fh = await fs.open(
@@ -1795,7 +1857,7 @@ export class Outbox {
       }
     }
     try {
-      await this.fsyncDir(path.dirname(dst), kind === "finalize");
+      await this.fsyncDir(path.dirname(dst), kind !== "terminal");
     } finally {
       // The installed destination stays intact even when strict directory fsync fails.
       await fs.rm(tmp, { force: true }).catch(() => undefined);
@@ -1982,6 +2044,324 @@ export class Outbox {
     }
   }
 
+  // ── publication intent (issue #1324) ─────────────────────────────────────────
+  //
+  // `publication-<G>.json` is the worker-side half of a write-ahead publication enrollment. It is
+  // sealed under its OWN MAC domain, so a finalize record never verifies as one and vice versa, and
+  // it is not a finalize record: nothing here shares code with retireFinalize*, and nothing that
+  // reads `finalize-<G>.json` ever treats it as an enrollment. It protects its run directory from
+  // retention, retireRun and the physical-protection probe for as long as the file exists. Losing it
+  // never implies the enrollment was retired; it is removed only through discardPublicationRecord,
+  // which the caller invokes after the api positively confirmed that enrollment_seq retired.
+
+  /** Does the run directory physically hold any `publication-*` entry (a record, a crash-left temp, or a
+   *  record that failed authentication or is a mismatch and so is not tracked in memory)? */
+  async hasPublicationFile(runId: string): Promise<boolean> {
+    if (!this.validRunId(runId)) return false;
+    try {
+      return (await fs.readdir(this.runDir(runId))).some((name) => name.startsWith(PUBLICATION_FILE_PREFIX));
+    } catch {
+      return false;
+    }
+  }
+
+  /** Authenticate, size-bound and strictly parse one run's record for a generation. */
+  private async readPublication(runId: string, claimGeneration: number): Promise<PublicationLoadResult> {
+    if (!this.validRunId(runId) || !this.key) return { kind: "unreadable" };
+    const file = path.join(this.runDir(runId), publicationFileName(claimGeneration));
+    try {
+      const st = await fs.lstat(file);
+      if (!st.isFile() || st.size > MAX_PUBLICATION_RECORD_BYTES) return { kind: "unauthenticated" };
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable" };
+    }
+    const authed = await this.readAuthed(file, MAC_DOMAIN_PUBLICATION);
+    if (!authed) return { kind: "unauthenticated" };
+    try {
+      // The owner kind is envelope metadata the writer sealed beside the intent (the api's allowlist has no
+      // such member); a missing or unknown one is not guessed from the body.
+      const ownerKind = authed.owner_kind;
+      if (ownerKind !== "task" && ownerKind !== "issue") return { kind: "mismatch", detail: "record owner_kind is missing or unknown" };
+      const record = parsePublicationRecord(authed, ownerKind);
+      if (record.run_id !== runId || record.claim_generation !== claimGeneration) {
+        return { kind: "mismatch", detail: "record identity does not match its directory and filename" };
+      }
+      return { kind: "ok", record };
+    } catch (err) {
+      if (err instanceof PublicationIntentMismatchError) return { kind: "mismatch", detail: err.message };
+      return { kind: "unreadable" };
+    }
+  }
+
+  private trackPublication(record: PublicationRecord): void {
+    const rs = this.ensureInMemoryRun(record.run_id, this.now());
+    const previous = rs.publications.get(record.claim_generation);
+    rs.publications.set(record.claim_generation, {
+      claimGeneration: record.claim_generation,
+      since: previous?.since ?? this.now(),
+      ...(record.enrollment_seq !== undefined ? { enrollmentSeq: record.enrollment_seq } : {}),
+      ...(record.candidate_seq !== undefined ? { candidateSeq: record.candidate_seq } : {}),
+    });
+  }
+
+  /** At init: drop crash-left install temps, then adopt every authenticated record. An unauthenticated,
+   *  mismatched or misfiled record is left on disk (it still protects the directory) with one warn. */
+  private async loadPublications(runId: string): Promise<void> {
+    if (!this.validRunId(runId)) return;
+    const dir = this.runDir(runId);
+    let names: string[];
+    try {
+      names = await fs.readdir(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (PUBLICATION_TEMP_RE.test(name)) {
+        // An install temp that never became the record: it carries no authority.
+        await fs.rm(path.join(dir, name), { force: true }).catch(() => undefined);
+        continue;
+      }
+      const gen = parsePublicationFileName(name);
+      if (gen === undefined) continue;
+      const loaded = await this.readPublication(runId, gen);
+      if (loaded.kind === "ok") {
+        this.trackPublication(loaded.record);
+      } else {
+        this.log.warn("outbox: publication record not adopted (left on disk, still protecting its run)", {
+          run_id: runId, file: name, outcome: loaded.kind,
+        });
+      }
+    }
+  }
+
+  /** Load one record for a run and generation: MAC verified, size bounded, version and guard state
+   *  strictly validated. `mismatch` is the typed signal for a record this worker cannot honour; the
+   *  publication-only resume (RunRunner.phasePublicationOnly) turns it into the `publication_intent_mismatch`
+   *  hold; `unauthenticated` and `unreadable` never imply retirement. */
+  async loadPublicationRecord(runId: string, claimGeneration: number): Promise<PublicationLoadResult> {
+    if (this.disabled) return { kind: "unreadable" };
+    return this.withRunLock(runId, () => this.readPublication(runId, claimGeneration));
+  }
+
+  /** Every authenticated record this process knows, from memory (a run with a pending terminal journal included). */
+  listPublicationRecords(): PendingPublication[] {
+    const out: PendingPublication[] = [];
+    for (const rs of this.runs.values()) {
+      for (const meta of rs.publications.values()) {
+        out.push({
+          run_id: rs.runId,
+          claim_generation: meta.claimGeneration,
+          ...(meta.enrollmentSeq !== undefined ? { enrollment_seq: meta.enrollmentSeq } : {}),
+          ...(meta.candidateSeq !== undefined ? { candidate_seq: meta.candidateSeq } : {}),
+        });
+      }
+    }
+    return out;
+  }
+
+  /** Does the run hold an authenticated publication record (any generation)? */
+  hasPublicationRecords(runId: string): boolean {
+    return (this.runs.get(runId)?.publications.size ?? 0) > 0;
+  }
+
+  /**
+   * The register snapshot's `publication_resume` entries: one per run (its highest ACKNOWLEDGED
+   * generation: a record with both sequence numbers known; a later sequence-less record does not hide it) and a run with no pending terminal
+   * journal, oldest first and capped like finalize_resume (the api drops a list above its ceiling).
+   */
+  listPublicationRegisterEntries(): PublicationResumeRegisterEntry[] {
+    const best: (PublicationResumeRegisterEntry & { since: number })[] = [];
+    for (const rs of this.runs.values()) {
+      if (rs.terminals.size > 0) continue;
+      // The highest ACKNOWLEDGED generation: a later sequence-less record (saved, never ACKed) must not hide
+      // an acknowledged enrollment from the register.
+      let top: PublicationMeta | undefined;
+      for (const meta of rs.publications.values()) {
+        if (meta.enrollmentSeq === undefined || meta.candidateSeq === undefined) continue;
+        if (!top || meta.claimGeneration > top.claimGeneration) top = meta;
+      }
+      if (top?.enrollmentSeq === undefined || top.candidateSeq === undefined) continue;
+      best.push({ run_id: rs.runId, claim_generation: top.claimGeneration, enrollment_seq: top.enrollmentSeq, candidate_seq: top.candidateSeq, since: top.since });
+    }
+    best.sort((a, b) => a.since - b.since || (a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : 0));
+    return best.slice(0, PUBLICATION_RESUME_MAX_ENTRIES).map(({ since: _since, ...entry }) => entry);
+  }
+
+  private async publicationAbsent(dst: string): Promise<boolean> {
+    try {
+      await fs.lstat(dst);
+      return false;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === "ENOENT";
+    }
+  }
+
+  /** Validate a record for writing; a failure is the result to return, nothing having been written. */
+  private checkPublicationWrite(input: PublicationRecord): { record: PublicationRecord } | PublicationWriteResult {
+    try {
+      const record = parsePublicationRecord(input, input.owner_kind);
+      if (publicationIntentBytes(record) > MAX_PUBLICATION_INTENT_BYTES) return { ok: false, reason: "intent_too_large", state: "unwritten" };
+      if (this.disabled || !this.key) return { ok: false, reason: "outbox_disabled", state: "unwritten" };
+      return { record };
+    } catch (err) {
+      return { ok: false, reason: "intent_invalid", state: "unwritten", detail: errText(err) };
+    }
+  }
+
+  /**
+   * Install the record exclusively (temp write with fsync, no-replace link, directory fsync, under the
+   * run lock). Never throws. An existing record for the generation is ADOPTED and returned, so the
+   * caller can compare it. A failure is `unwritten` only when the destination was verified absent
+   * afterwards; any other failure (a partial link or fsync) is `unverified`, because a file may exist.
+   */
+  async savePublicationRecord(input: PublicationRecord): Promise<PublicationWriteResult> {
+    const checked = this.checkPublicationWrite(input);
+    if (!("record" in checked)) return this.publicationFailed(input.run_id, input.claim_generation, checked);
+    const { record } = checked;
+    const runId = record.run_id;
+    const gen = record.claim_generation;
+    const fail = (reason: PublicationWriteFailure, state: "unwritten" | "unverified", detail?: string): PublicationWriteResult =>
+      this.publicationFailed(runId, gen, { ok: false, reason, state, ...(detail !== undefined ? { detail } : {}) });
+    try {
+      return await this.withRunLock(runId, async () => {
+        if (!this.validRunId(runId)) return fail("io_error", "unwritten", "invalid_run_id");
+        const dir = this.runDir(runId);
+        if (await this.isSymlink(dir)) return fail("io_error", "unwritten", "run_dir_symlink");
+        const dst = path.join(dir, publicationFileName(gen));
+        const serialized = this.seal(MAC_DOMAIN_PUBLICATION, record);
+        if (Buffer.byteLength(serialized, "utf8") > MAX_PUBLICATION_RECORD_BYTES) return fail("intent_too_large", "unwritten");
+        let adopted: boolean;
+        try {
+          adopted = await this.withReserveOnEnospc(async () => {
+            await this.rawWrite(async () => { await fs.mkdir(dir, { recursive: true, mode: 0o700 }); }, { path: dir, kind: "publication" });
+            await this.fsyncDir(this.root, true);
+            return this.installExclusive(dst, serialized, "publication");
+          });
+        } catch (err) {
+          return fail(isENOSPC(err) ? "enospc" : "io_error", (await this.publicationAbsent(dst)) ? "unwritten" : "unverified", errText(err));
+        }
+        const loaded = await this.readPublication(runId, gen);
+        if (loaded.kind !== "ok") return fail("conflict", "unverified", `existing record is ${loaded.kind}`);
+        if (!samePublicationIdentity(loaded.record, record)) return fail("conflict", "unverified", "an existing record has a different identity");
+        this.trackPublication(loaded.record);
+        this.log.info("publication record durable", { run_id: runId, claim_generation: gen, adopted });
+        return { ok: true, record: loaded.record, adopted };
+      });
+    } catch (err) {
+      return fail("io_error", "unverified", `unexpected: ${errText(err)}`);
+    }
+  }
+
+  private publicationFailed(runId: string, claimGeneration: number, result: Extract<PublicationWriteResult, { ok: false }>): PublicationWriteResult {
+    this.log.warn("publication record not written", { run_id: runId, claim_generation: claimGeneration, reason: result.reason, state: result.state });
+    return result;
+  }
+
+  /**
+   * Crash-safe compare-and-swap replace: the new content is written to a temp file and fsynced, then
+   * `rename`d over the record (atomic), then the directory is fsynced. At every instant the path holds
+   * either the whole old record or the whole new one, so there is never a window without a valid
+   * record. The swap happens only when the on-disk record has the same identity and exactly the
+   * `expected` sequence numbers, and `next` advances them monotonically (same enrollment, candidate_seq
+   * unchanged or +1; a sequence-less record may gain its first pair). Re-applying content already on
+   * disk is a success (an ACK-recording retry). Never throws.
+   */
+  async replacePublicationRecord(input: PublicationRecord, expected: { enrollment_seq?: number; candidate_seq?: number }): Promise<PublicationWriteResult> {
+    const checked = this.checkPublicationWrite(input);
+    if (!("record" in checked)) return this.publicationFailed(input.run_id, input.claim_generation, checked);
+    const { record: next } = checked;
+    const runId = next.run_id;
+    const gen = next.claim_generation;
+    const fail = (reason: PublicationWriteFailure, state: "unwritten" | "unverified", detail?: string): PublicationWriteResult =>
+      this.publicationFailed(runId, gen, { ok: false, reason, state, ...(detail !== undefined ? { detail } : {}) });
+    try {
+      return await this.withRunLock(runId, async () => {
+        const current = await this.readPublication(runId, gen);
+        if (current.kind === "absent") return fail("absent", "unwritten");
+        if (current.kind !== "ok") return fail("conflict", "unwritten", `current record is ${current.kind}`);
+        const old = current.record;
+        if (!samePublicationIdentity(old, next)) return fail("conflict", "unwritten", "identity differs");
+        if (canonicalJson(old) === canonicalJson(next)) return { ok: true, record: old, adopted: true } as PublicationWriteResult;
+        if (old.enrollment_seq !== expected.enrollment_seq || old.candidate_seq !== expected.candidate_seq) {
+          return fail("cas_mismatch", "unwritten", "the on-disk sequence numbers differ from the expected ones");
+        }
+        if (old.enrollment_seq !== undefined && old.candidate_seq !== undefined) {
+          const step = next.candidate_seq === undefined ? -1 : next.candidate_seq - old.candidate_seq;
+          if (next.enrollment_seq !== old.enrollment_seq || (step !== 0 && step !== 1)) {
+            return fail("cas_mismatch", "unwritten", "not a monotonic advance of the enrollment");
+          }
+        }
+        const dir = this.runDir(runId);
+        const dst = path.join(dir, publicationFileName(gen));
+        const serialized = this.seal(MAC_DOMAIN_PUBLICATION, next);
+        if (Buffer.byteLength(serialized, "utf8") > MAX_PUBLICATION_RECORD_BYTES) return fail("intent_too_large", "unwritten");
+        try {
+          // The closure may run twice (the ENOSPC reserve retry), so each run mints and removes its own temp:
+          // reopening one path with O_EXCL would fail with EEXIST.
+          await this.withReserveOnEnospc(async () => {
+            const tmp = `${dst}.${randomUUID()}.tmp`;
+            try {
+              await this.rawWrite(async () => {
+                const fh = await fs.open(tmp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+                try {
+                  await fh.writeFile(serialized, "utf8");
+                  await fh.sync();
+                } finally {
+                  await fh.close();
+                }
+              }, { path: tmp, kind: "publication" });
+              await fs.rename(tmp, dst);
+            } catch (err) {
+              // Nothing was renamed over the record: the old one is intact.
+              await fs.rm(tmp, { force: true }).catch(() => undefined);
+              throw err;
+            }
+          });
+        } catch (err) {
+          return fail(isENOSPC(err) ? "enospc" : "io_error", "unwritten", errText(err));
+        }
+        try {
+          await this.fsyncDir(dir, true);
+        } catch (err) {
+          // The rename happened; the directory entry's durability is unproven.
+          this.trackPublication(next);
+          return fail("io_error", "unverified", errText(err));
+        }
+        this.trackPublication(next);
+        this.log.info("publication record replaced", { run_id: runId, claim_generation: gen, candidate_seq: next.candidate_seq ?? null });
+        return { ok: true, record: next, adopted: false } as PublicationWriteResult;
+      });
+    } catch (err) {
+      return fail("io_error", "unverified", `unexpected: ${errText(err)}`);
+    }
+  }
+
+  /**
+   * Remove one run's record. The caller calls it only after the api positively confirmed that exact
+   * enrollment_seq retired or completed (or, for a sequence-less record, that no enrollment exists).
+   * Returns true when the record is gone (removed here, or already absent). A record that does not
+   * authenticate, or carries a different enrollment_seq, is never removed.
+   */
+  async discardPublicationRecord(runId: string, claimGeneration: number, expected: { enrollment_seq?: number }): Promise<boolean> {
+    if (this.disabled) return false;
+    return this.withRunLock(runId, async () => {
+      const current = await this.readPublication(runId, claimGeneration);
+      if (current.kind === "absent") {
+        this.runs.get(runId)?.publications.delete(claimGeneration);
+        return true;
+      }
+      if (current.kind !== "ok" || current.record.enrollment_seq !== expected.enrollment_seq) return false;
+      try {
+        await fs.unlink(path.join(this.runDir(runId), publicationFileName(claimGeneration)));
+      } catch {
+        return false;
+      }
+      this.runs.get(runId)?.publications.delete(claimGeneration);
+      await this.fsyncDir(this.runDir(runId));
+      return true;
+    });
+  }
+
   /** Get an existing in-memory run entry, or create one WITHOUT writing a manifest to disk — a run
    *  may carry a terminal journal with no message manifest, and forcing an empty manifest write here
    *  would be a needless durable side effect. */
@@ -1999,7 +2379,7 @@ export class Outbox {
       since,
       updatedAt: since,
     };
-    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map(), finalizes: new Map() };
+    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map(), finalizes: new Map(), publications: new Map() };
     this.runs.set(runId, rs);
     return rs;
   }
@@ -2119,7 +2499,7 @@ export class Outbox {
       since: t,
       updatedAt: t,
     };
-    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map(), finalizes: new Map() };
+    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map(), finalizes: new Map(), publications: new Map() };
     this.runs.set(runId, rs);
     return rs;
   }
@@ -2342,6 +2722,9 @@ export class Outbox {
           const entry = await dir.read();
           if (!entry) return false;
           if (entry.name.startsWith(TERMINAL_FILE_PREFIX)) return true;
+          // Issue #1324: a publication record (or a crash-left temp of one) protects the run subtree
+          // too: it names unpublished work the api may be waiting on.
+          if (entry.name.startsWith(PUBLICATION_FILE_PREFIX)) return true;
         }
       } finally {
         await dir.close();
@@ -2904,6 +3287,20 @@ function parseFinalizeFileName(name: string): number | undefined {
   const gen = Number(mid);
   // Canonical names only: `finalize-03.json` parses to 3 but is not a name journalFinalize writes.
   return Number.isSafeInteger(gen) && gen >= 0 && String(gen) === mid ? gen : undefined;
+}
+
+/** The `publication-<generation>.json` filename for a claim generation (issue #1324). */
+function publicationFileName(claimGeneration: number): string {
+  return `${PUBLICATION_FILE_PREFIX}${claimGeneration}${PUBLICATION_FILE_SUFFIX}`;
+}
+
+/** The claim generation a publication-record filename names (canonical names only), or undefined. */
+function parsePublicationFileName(name: string): number | undefined {
+  if (!name.startsWith(PUBLICATION_FILE_PREFIX) || !name.endsWith(PUBLICATION_FILE_SUFFIX)) return undefined;
+  const mid = name.slice(PUBLICATION_FILE_PREFIX.length, name.length - PUBLICATION_FILE_SUFFIX.length);
+  if (!/^\d+$/.test(mid)) return undefined;
+  const gen = Number(mid);
+  return Number.isSafeInteger(gen) && gen >= 1 && String(gen) === mid ? gen : undefined;
 }
 
 /** Validate an authenticated finalize-record object: the embedded run id must match the directory

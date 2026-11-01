@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -109,29 +111,41 @@ func NormalizePlanCrossCheckCandidate(c PlanCrossCheckCandidate) (PlanCrossCheck
 	return c, err
 }
 
-func bindPlanCrossCheckWrite(p *store.SetRunAutopilotPlanParams, run store.Run, req *StateRequest) error {
-	if req.ClaimGeneration == nil {
-		return ErrClaimGenerationRequired
-	}
+// boundCrossCheckReport is the normalized, digest-bound view of a worker report that claims a
+// checked plan: the one canonical text boundary shared by the autopilot plan write
+// (bindPlanCrossCheckWrite) and the gated awaiting_approval report (PRD #3708).
+type boundCrossCheckReport struct {
+	candidate  PlanCrossCheckCandidate
+	caps       []string
+	tools      []string
+	digest     []byte
+	milestones []Milestone
+}
+
+// normalizeBoundCrossCheckReport requires the cross-check plan fields and a 32-byte hex
+// candidate digest on the report, then runs planMd and the reported fields through
+// NormalizePlanCrossCheckCandidate and the server-owned vocabularies. It writes nothing.
+func normalizeBoundCrossCheckReport(run store.Run, req StateRequest, planMd string) (boundCrossCheckReport, error) {
+	var out boundCrossCheckReport
 	if req.RequiredCapabilities == nil || req.RequiredTools == nil || req.SizeClass == nil {
-		return fmt.Errorf("%w: cross-check plan fields are required", ErrInvalidState)
+		return out, fmt.Errorf("%w: cross-check plan fields are required", ErrInvalidState)
 	}
 	digest, err := hex.DecodeString(req.CandidateDigest)
 	if err != nil || len(digest) != 32 {
-		return fmt.Errorf("%w: invalid cross-check candidate digest", ErrInvalidState)
+		return out, fmt.Errorf("%w: invalid cross-check candidate digest", ErrInvalidState)
 	}
-	rawMilestones := reportPlanMilestonesParam(run, *req)
+	rawMilestones := reportPlanMilestonesParam(run, req)
 	if req.Milestones != nil {
 		rawMilestones, err = json.Marshal(*req.Milestones)
 		if err != nil {
-			return fmt.Errorf("%w: invalid cross-check milestones", ErrInvalidState)
+			return out, fmt.Errorf("%w: invalid cross-check milestones", ErrInvalidState)
 		}
 	}
 	c, err := NormalizePlanCrossCheckCandidate(PlanCrossCheckCandidate{
-		PlanMd: p.PlanMd.String, Milestones: rawMilestones,
+		PlanMd: planMd, Milestones: rawMilestones,
 		RequiredCapabilities: append([]string{}, (*req.RequiredCapabilities)...), RequiredTools: append([]string{}, (*req.RequiredTools)...), SizeClass: *req.SizeClass})
 	if err != nil {
-		return fmt.Errorf("%w: invalid cross-check candidate", ErrInvalidState)
+		return out, fmt.Errorf("%w: invalid cross-check candidate", ErrInvalidState)
 	}
 	caps := capability.Filter(c.RequiredCapabilities)
 	tools := capability.FilterTools(c.RequiredTools)
@@ -144,27 +158,84 @@ func bindPlanCrossCheckWrite(p *store.SetRunAutopilotPlanParams, run store.Run, 
 	switch c.SizeClass {
 	case "s", "m", "l":
 	default:
-		return fmt.Errorf("%w: invalid cross-check size", ErrInvalidState)
+		return out, fmt.Errorf("%w: invalid cross-check size", ErrInvalidState)
 	}
-	p.PlanMd = pgconv.Text(c.PlanMd)
-	p.MilestonesFrozen = c.Milestones
-	p.InferredCapabilities = caps
-	p.InferredTools = tools
-	p.SizeClass = pgconv.Text(c.SizeClass)
-	p.CandidateDigest = digest
 	milestones, err := DecodeMilestones(c.Milestones)
 	if err != nil {
-		return fmt.Errorf("%w: invalid cross-check milestones", ErrInvalidState)
+		return out, fmt.Errorf("%w: invalid cross-check milestones", ErrInvalidState)
 	}
 	if _, valid := validateMilestones(milestones); !valid {
-		return fmt.Errorf("%w: invalid cross-check milestones", ErrInvalidState)
+		return out, fmt.Errorf("%w: invalid cross-check milestones", ErrInvalidState)
 	}
+	return boundCrossCheckReport{candidate: c, caps: caps, tools: tools, digest: digest, milestones: milestones}, nil
+}
+
+func bindPlanCrossCheckWrite(p *store.SetRunAutopilotPlanParams, run store.Run, req *StateRequest) error {
+	if req.ClaimGeneration == nil {
+		return ErrClaimGenerationRequired
+	}
+	b, err := normalizeBoundCrossCheckReport(run, *req, p.PlanMd.String)
+	if err != nil {
+		return err
+	}
+	c := b.candidate
+	p.PlanMd = pgconv.Text(c.PlanMd)
+	p.MilestonesFrozen = c.Milestones
+	p.InferredCapabilities = b.caps
+	p.InferredTools = b.tools
+	p.SizeClass = pgconv.Text(c.SizeClass)
+	p.CandidateDigest = b.digest
 	// The structural contract frozen later in this same transaction must use
 	// the same normalized fields the checker approved.
 	req.PlanMd = &c.PlanMd
-	req.Milestones = &milestones
-	req.RequiredCapabilities = &caps
-	req.RequiredTools = &tools
+	req.Milestones = &b.milestones
+	req.RequiredCapabilities = &b.caps
+	req.RequiredTools = &b.tools
 	req.SizeClass = &c.SizeClass
 	return nil
+}
+
+// bindGatedAwaitingApproval binds a gated run's awaiting_approval report to the candidate the
+// checker approved (PRD #3708). SetRunAwaitingApproval derives a NULL ("passed") reason from
+// an approve row only when its stored candidate digest, plan, milestones and requirements
+// equal what is written here, so this writes the normalized report fields the checker saw. A
+// report without a digest, or whose fields do not normalize, is left untouched with no digest:
+// the SQL then derives interrupted instead of refusing the report, because a refused report
+// would leave a finished check with no human gate. semantic leaves the plan text raw because
+// semanticGateReport already hashed the reported bytes.
+func bindGatedAwaitingApproval(run store.Run, req StateRequest, semantic bool, p *store.SetRunAwaitingApprovalParams) {
+	if req.CandidateDigest == "" {
+		return
+	}
+	if semantic {
+		if digest, err := hex.DecodeString(req.CandidateDigest); err == nil && len(digest) == 32 {
+			p.CandidateDigest = digest
+		}
+		return
+	}
+	b, err := normalizeBoundCrossCheckReport(run, req, p.PlanMd.String)
+	if err != nil {
+		return
+	}
+	bound := req
+	bound.PlanMd = &b.candidate.PlanMd
+	bound.Milestones = &b.milestones
+	p.PlanMd = pgconv.Text(b.candidate.PlanMd)
+	p.MilestonesCandidate = reportPlanMilestonesParam(run, bound)
+	p.InferredCapabilities = b.caps
+	p.InferredTools = b.tools
+	p.SizeClass = pgconv.Text(b.candidate.SizeClass)
+	p.CandidateDigest = b.digest
+}
+
+// gatedServerGateReason is the server-recorded "unavailable" for a gated run (PRD #3708): a
+// worker that does not advertise cross_check_gated_v1 never ran the check and declared no
+// reason, so the server records worker_unsupported itself. It is never a worker-declared
+// value, which validatePlanCrossCheckGateReason keeps refusing.
+func gatedServerGateReason(lead store.Run, wkr store.Worker, req StateRequest) pgtype.Text {
+	if req.State != "awaiting_approval" || !lead.PlanCrossCheckGated || req.PlanCrossCheckGateReason != nil ||
+		slices.Contains(wkr.ProtocolCapabilities, capability.CrossCheckGatedV1) {
+		return pgtype.Text{}
+	}
+	return pgconv.Text("worker_unsupported")
 }

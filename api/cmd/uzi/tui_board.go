@@ -247,6 +247,9 @@ func runStateWord(r apitypes.RunListItemDTO) string {
 		return "iter limit"
 	}
 	if isForgeOwnerHold(r.RunDTO) {
+		if isPublicationPark(r.RunDTO) {
+			return publicationHeldWord
+		}
 		return "forge held"
 	}
 	if isRecoveryDecisionPark(r.RunDTO) {

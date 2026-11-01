@@ -139,10 +139,19 @@ func runClaimOpenedCustody(run store.Run, recoveryCapable bool) bool {
 // assembleAndFinishRunClaim is the run lane's single post-ClaimRun tail, shared by both
 // Claim return paths so each outcome goes through the same exact-claim transaction.
 func (s *Service) assembleAndFinishRunClaim(ctx context.Context, wkr store.Worker, run store.Run, recoveryCapable bool) (*ClaimPayload, error) {
+	return s.assembleAndFinishRunClaimRef(ctx, wkr, run, recoveryCapable, nil)
+}
+
+// assembleAndFinishRunClaimRef is assembleAndFinishRunClaim carrying the memory-park reference
+// claimRunInTx built inside the claim transaction (issue #3639); nil attaches nothing.
+func (s *Service) assembleAndFinishRunClaimRef(ctx context.Context, wkr store.Worker, run store.Run, recoveryCapable bool, ref *MemoryParkReference) (*ClaimPayload, error) {
 	if h := s.claimHooks; h != nil && h.beforeAssembly != nil {
 		h.beforeAssembly(ctx, run)
 	}
 	payload, err := s.assembleClaim(ctx, wkr, run)
+	if payload != nil {
+		payload.MemoryParkReference = ref
+	}
 	if h := s.claimHooks; h != nil && h.afterAssembly != nil {
 		h.afterAssembly(ctx, run, payload, err)
 	}
@@ -244,10 +253,20 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		if !ok {
 			return nil, "", errClaimRecoveryNoTx
 		}
-		if _, err := live.GetWorkerForUpdate(ctx, identity.workerID); err != nil {
+		if err := optInRunFences(ctx, live, identity.workerID, false); err != nil {
 			return nil, "", err
 		}
-		if err := live.OptInCheckpointCoordinates(ctx); err != nil {
+	} else if live, ok := q.(pgxClaimFinishTx); ok {
+		// A publication-enrolled run locks its worker before the run row, like a checkpoint run;
+		// any other run needs only the opt-in. No re-check after the run lock: this runs inside a
+		// claim of a run that is claimed, not running, and enrollment (RegisterPublicationIntent)
+		// requires status running at the live generation, so an enrollment cannot appear between
+		// this read and the run lock.
+		enrolled, err := publicationEnrolled(ctx, live.Queries, run.ID)
+		if err != nil {
+			return nil, "", err
+		}
+		if err := optInRunFences(ctx, live, identity.workerID, !enrolled); err != nil {
 			return nil, "", err
 		}
 	}

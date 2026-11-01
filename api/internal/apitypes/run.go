@@ -283,7 +283,11 @@ type RunDTO struct {
 	CodeCrossCheckRequired    bool         `json:"code_cross_check_required"`
 	// PlanCrossCheckRequired is the run's snapshot of the owner's plan cross-check
 	// setting at creation. It remains true after the approval gate is decided.
-	PlanCrossCheckRequired   bool    `json:"plan_cross_check_required"`
+	PlanCrossCheckRequired bool `json:"plan_cross_check_required"`
+	// PlanCrossCheckGated (PRD #3708) is the run's snapshot of "checked before the human plan
+	// gate": the owner consented, the run is not auto-approved, and the plan is agent-written.
+	// An older api omits it, and clients then render nothing for it.
+	PlanCrossCheckGated      bool    `json:"plan_cross_check_gated,omitempty"`
 	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
 	// PlanCrossCheckDiffRefusal is the planning-diff refusal sub-code. It is set only
 	// while PlanCrossCheckGateReason is planning_diff_refused; otherwise nil.
@@ -889,6 +893,24 @@ type RunDTO struct {
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
 	RecoveryWaitCause *string `json:"recovery_wait_cause"`
+	// RecoveryWaitPhase (issue #1324) says which part of the run the 'recovery_wait' park
+	// interrupted. "publication" is a forge outage met while publishing: the run keeps its
+	// publication intent and resumes publication only. Null for every other park (the pre-clone
+	// forge park included). Clients render an unrecognised value honestly.
+	RecoveryWaitPhase *string `json:"recovery_wait_phase"`
+	// Publication park diagnostics (issue #1324), set only while the run holds an active
+	// publication intent and omitted otherwise. WaitStartedAt is when the current owner episode's
+	// wait began (the clock the limit is measured from; absent between episodes), WaitLimitSeconds
+	// is RUN_PROVIDER_PARK_MAX_DURATION (absent when the hold is disabled), HoldReason is the
+	// reason of an owner hold ("publication_retry_exhausted", "publication_custodian_unavailable",
+	// ...), FirstWaitAt/ParkTotal are lifetime diagnostics and Episode counts owner resumes.
+	PublicationWaitStartedAt    *time.Time            `json:"publication_wait_started_at,omitempty"`
+	PublicationWaitLimitSeconds *int                  `json:"publication_wait_limit_seconds,omitempty"`
+	PublicationHoldReason       *string               `json:"publication_hold_reason,omitempty"`
+	PublicationFirstWaitAt      *time.Time            `json:"publication_first_wait_at,omitempty"`
+	PublicationParkTotal        *int                  `json:"publication_park_total,omitempty"`
+	PublicationEpisode          *int                  `json:"publication_episode,omitempty"`
+	PublicationIntent           *PublicationIntentDTO `json:"publication_intent,omitempty"`
 	// CodexAccountAction is what a run held on its Codex subscription account needs next
 	// (PRD #1590 D6). It is non-null only for a 'recovery_wait' run whose RecoveryWaitCause is
 	// "codex_account_unavailable", and is derived at read time from the run's frozen binding
@@ -914,6 +936,13 @@ type RunDTO struct {
 	// The label is USER-SUPPLIED text, so terminal consumers must sanitize it as they
 	// do AnthropicSecretLabel.
 	CodexSecretLabel *string `json:"codex_secret_label"`
+	// CodexSelectReason is why the run's Codex alias was chosen (issue #3719): one of the
+	// server-generated codexselect.Reason values (default, pool_empty, auto, best_of_pool,
+	// pool_stale, pool_exhausted). A CLOSED SERVER ENUM describing the owner's own
+	// configuration, so it rides under the same owner-or-admin scoping as CodexSecretLabel.
+	// Null for a run created before auto-selection and for a non-Codex run. Clients must
+	// render an UNRECOGNISED value honestly: the API deploys separately from its clients.
+	CodexSelectReason *string `json:"codex_select_reason"`
 	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
 	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
@@ -1169,7 +1198,11 @@ type RunSummaryItemDTO struct {
 	CodeCrossCheckRequired    bool         `json:"code_cross_check_required"`
 	// PlanCrossCheckRequired is the run's snapshot of the owner's plan cross-check
 	// setting at creation. It remains true after the approval gate is decided.
-	PlanCrossCheckRequired   bool    `json:"plan_cross_check_required"`
+	PlanCrossCheckRequired bool `json:"plan_cross_check_required"`
+	// PlanCrossCheckGated (PRD #3708) is the run's snapshot of "checked before the human plan
+	// gate": the owner consented, the run is not auto-approved, and the plan is agent-written.
+	// An older api omits it, and clients then render nothing for it.
+	PlanCrossCheckGated      bool    `json:"plan_cross_check_gated,omitempty"`
 	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
 	// PlanCrossCheckDiffRefusal is the planning-diff refusal sub-code. It is set only
 	// while PlanCrossCheckGateReason is planning_diff_refused; otherwise nil.
@@ -1750,6 +1783,24 @@ type RunSummaryItemDTO struct {
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
 	RecoveryWaitCause *string `json:"recovery_wait_cause"`
+	// RecoveryWaitPhase (issue #1324) says which part of the run the 'recovery_wait' park
+	// interrupted. "publication" is a forge outage met while publishing: the run keeps its
+	// publication intent and resumes publication only. Null for every other park (the pre-clone
+	// forge park included). Clients render an unrecognised value honestly.
+	RecoveryWaitPhase *string `json:"recovery_wait_phase"`
+	// Publication park diagnostics (issue #1324), set only while the run holds an active
+	// publication intent and omitted otherwise. WaitStartedAt is when the current owner episode's
+	// wait began (the clock the limit is measured from; absent between episodes), WaitLimitSeconds
+	// is RUN_PROVIDER_PARK_MAX_DURATION (absent when the hold is disabled), HoldReason is the
+	// reason of an owner hold ("publication_retry_exhausted", "publication_custodian_unavailable",
+	// ...), FirstWaitAt/ParkTotal are lifetime diagnostics and Episode counts owner resumes.
+	PublicationWaitStartedAt    *time.Time            `json:"publication_wait_started_at,omitempty"`
+	PublicationWaitLimitSeconds *int                  `json:"publication_wait_limit_seconds,omitempty"`
+	PublicationHoldReason       *string               `json:"publication_hold_reason,omitempty"`
+	PublicationFirstWaitAt      *time.Time            `json:"publication_first_wait_at,omitempty"`
+	PublicationParkTotal        *int                  `json:"publication_park_total,omitempty"`
+	PublicationEpisode          *int                  `json:"publication_episode,omitempty"`
+	PublicationIntent           *PublicationIntentDTO `json:"publication_intent,omitempty"`
 	// CodexAccountAction is what a run held on its Codex subscription account needs next
 	// (PRD #1590 D6). It is non-null only for a 'recovery_wait' run whose RecoveryWaitCause is
 	// "codex_account_unavailable", and is derived at read time from the run's frozen binding
@@ -1775,6 +1826,13 @@ type RunSummaryItemDTO struct {
 	// The label is USER-SUPPLIED text, so terminal consumers must sanitize it as they
 	// do AnthropicSecretLabel.
 	CodexSecretLabel *string `json:"codex_secret_label"`
+	// CodexSelectReason is why the run's Codex alias was chosen (issue #3719): one of the
+	// server-generated codexselect.Reason values (default, pool_empty, auto, best_of_pool,
+	// pool_stale, pool_exhausted). A CLOSED SERVER ENUM describing the owner's own
+	// configuration, so it rides under the same owner-or-admin scoping as CodexSecretLabel.
+	// Null for a run created before auto-selection and for a non-Codex run. Clients must
+	// render an UNRECOGNISED value honestly: the API deploys separately from its clients.
+	CodexSelectReason *string `json:"codex_select_reason"`
 	// RecoveryRetryNotBefore is the earliest scheduled recovery promotion time, not
 	// a promise of immediate execution. It is separate from the usage-limit RetryNotBefore.
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
@@ -1945,6 +2003,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		AutoApproveBlockedReasons:     item.AutoApproveBlockedReasons,
 		IssueInputReason:              item.IssueInputReason,
 		PlanCrossCheckRequired:        item.PlanCrossCheckRequired,
+		PlanCrossCheckGated:           item.PlanCrossCheckGated,
 		PlanCrossCheckGateReason:      item.PlanCrossCheckGateReason,
 		PlanCrossCheckDiffRefusal:     item.PlanCrossCheckDiffRefusal,
 		PlanCrossCheckSummary:         item.PlanCrossCheckSummary,
@@ -2052,10 +2111,19 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		LimitWaitCount:                item.LimitWaitCount,
 		RateLimitType:                 item.RateLimitType,
 		RecoveryWaitCause:             item.RecoveryWaitCause,
+		RecoveryWaitPhase:             item.RecoveryWaitPhase,
+		PublicationWaitStartedAt:      item.PublicationWaitStartedAt,
+		PublicationWaitLimitSeconds:   item.PublicationWaitLimitSeconds,
+		PublicationHoldReason:         item.PublicationHoldReason,
+		PublicationFirstWaitAt:        item.PublicationFirstWaitAt,
+		PublicationParkTotal:          item.PublicationParkTotal,
+		PublicationEpisode:            item.PublicationEpisode,
+		PublicationIntent:             item.PublicationIntent,
 		ForgeOriginCooldown:           item.ForgeOriginCooldown,
 		CodexAccountAction:            item.CodexAccountAction,
 		CodexSecretID:                 item.CodexSecretID,
 		CodexSecretLabel:              item.CodexSecretLabel,
+		CodexSelectReason:             item.CodexSelectReason,
 		RecoveryRetryNotBefore:        item.RecoveryRetryNotBefore,
 		RecoveryRetryNotBeforePresent: item.RecoveryRetryNotBeforePresent,
 		ForgeParkCount:                item.ForgeParkCount,
@@ -2121,6 +2189,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			AutoApproveBlockedReasons:     s.AutoApproveBlockedReasons,
 			IssueInputReason:              s.IssueInputReason,
 			PlanCrossCheckRequired:        s.PlanCrossCheckRequired,
+			PlanCrossCheckGated:           s.PlanCrossCheckGated,
 			PlanCrossCheckGateReason:      s.PlanCrossCheckGateReason,
 			PlanCrossCheckDiffRefusal:     s.PlanCrossCheckDiffRefusal,
 			PlanCrossCheckSummary:         s.PlanCrossCheckSummary,
@@ -2228,10 +2297,19 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			LimitWaitCount:                s.LimitWaitCount,
 			RateLimitType:                 s.RateLimitType,
 			RecoveryWaitCause:             s.RecoveryWaitCause,
+			RecoveryWaitPhase:             s.RecoveryWaitPhase,
+			PublicationWaitStartedAt:      s.PublicationWaitStartedAt,
+			PublicationWaitLimitSeconds:   s.PublicationWaitLimitSeconds,
+			PublicationHoldReason:         s.PublicationHoldReason,
+			PublicationFirstWaitAt:        s.PublicationFirstWaitAt,
+			PublicationParkTotal:          s.PublicationParkTotal,
+			PublicationEpisode:            s.PublicationEpisode,
+			PublicationIntent:             s.PublicationIntent,
 			ForgeOriginCooldown:           s.ForgeOriginCooldown,
 			CodexAccountAction:            s.CodexAccountAction,
 			CodexSecretID:                 s.CodexSecretID,
 			CodexSecretLabel:              s.CodexSecretLabel,
+			CodexSelectReason:             s.CodexSelectReason,
 			RecoveryRetryNotBefore:        s.RecoveryRetryNotBefore,
 			RecoveryRetryNotBeforePresent: s.RecoveryRetryNotBeforePresent,
 			ForgeParkCount:                s.ForgeParkCount,

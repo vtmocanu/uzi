@@ -121,6 +121,23 @@ func (s *Service) ContinueCompletionDecision(ctx context.Context, userID, runID 
 	// NUL-strip it like the partial/accept reason (#1227): a NUL raises SQLSTATE 22021 and fails
 	// the decision (#1728). An all-NUL guidance strips to "", the existing bare-continue case.
 	guidance, _ = stripNUL(guidance)
+	// Issue #1324 D2: the owner's continue ends the publication intent the blocked completion was
+	// holding, so the next finalize enrolls afresh. A run with an active intent retires it in the
+	// SAME transaction as the decision; both commit or both roll back.
+	if s.txBeginner != nil {
+		if reader, ok := s.q.(publicationEnrollmentReader); ok {
+			enrolled, err := publicationEnrolled(ctx, reader, runID)
+			if err != nil {
+				return store.Run{}, err
+			}
+			if enrolled {
+				if err := s.continueCompletionRetiringIntent(ctx, run, userID, guidance); err != nil {
+					return store.Run{}, err
+				}
+				return s.GetRun(ctx, userID, runID)
+			}
+		}
+	}
 	// The continue writes are NON-transactional and otherwise byte-identical to #1226: the shared
 	// resumeCompletionBlocked helper (also used by the #1227 partial/accept transaction) executes
 	// them against s.q, with followupGuidance == auditBody == guidance.
@@ -130,6 +147,41 @@ func (s *Service) ContinueCompletionDecision(ctx context.Context, userID, runID 
 	// Re-read owner-scoped so the DTO reflects the resumed (queued) status for the paused case,
 	// and the unchanged awaiting_input status for the live case.
 	return s.GetRun(ctx, userID, runID)
+}
+
+// publicationRetiredOwnerContinue is the retired_reason of an intent ended by the owner's
+// completion-hold continue decision.
+const publicationRetiredOwnerContinue = "owner_completion_continue"
+
+// continueCompletionRetiringIntent runs the continue decision and retires the run's active
+// publication intent in one transaction. Lock order: worker, run, side row (the opt-ins authorize
+// the state change). A decision that cannot apply (the run is not completion-blocked) rolls the
+// retirement back; custody is not touched.
+func (s *Service) continueCompletionRetiringIntent(ctx context.Context, run store.Run, userID uuid.UUID, guidance string) error {
+	tx, err := s.beginReadCommitted(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := store.New(tx)
+	if run.WorkerID.Valid {
+		if err := optInRunFences(ctx, qtx, uuid.UUID(run.WorkerID.Bytes), false); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+	} else if err := optInRunFences(ctx, qtx, uuid.Nil, true); err != nil {
+		return err
+	}
+	locked, err := qtx.GetRunByIDForUpdate(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	if _, err := qtx.RetirePublicationResume(ctx, store.RetirePublicationResumeParams{RunID: run.ID, Reason: publicationRetiredOwnerContinue}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if err := resumeCompletionBlocked(ctx, qtx, locked, userID, guidance, guidance, int32(s.p.RunTimeout.Seconds()), s.staleWorkerCutoff()); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // resumeCompletionBlocked performs the shared resume mechanics for an owner decision on a

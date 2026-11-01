@@ -43,6 +43,17 @@ full multi-milestone plan, and the third before submitting it:
   and earlier steering answer to a plan mechanism and its verification. Name any
   unmet clause explicitly; do not silently drop or weaken it.
 
+Before authoring a full plan, make a short feasibility check: compare the
+requirement-to-verification map, dependency and ownership seams, expensive
+mandatory gates, and available execution and plan-revision budgets. If complete
+scope cannot fit, propose concrete independently reviewable slices, their
+dependencies, and the placement of every requirement before freezing the plan.
+Seek an owner scope decision through the existing approval/question lifecycle
+when required, subject to the classification and auto-approved-run rules below;
+a slice proposal does not authorize deferral of approved scope. Do not create
+issues automatically, silently drop requirements, or pad milestone counts.
+Capped milestone scaling does not remove execution or plan-revision limits.
+
 Source issue closing directives must never go in commit messages; the worker
 controls issue closing via the PR body. In a new, unfrozen plan, checks that
 inherently need the PR/merge environment (for example exact-head PR CI), or an

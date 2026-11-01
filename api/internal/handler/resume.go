@@ -63,15 +63,29 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		var resumeErr error
 		switch run.RecoveryWaitCause.String {
 		case "forge_unreachable":
+			if run.RecoveryWaitPhase.Valid {
+				// Issue #1324: a publication-phase hold has its own Resume, which also starts a new
+				// episode on the intent. It runs ahead of the pre-clone arm, which never matches it.
+				var resumed bool
+				if resumed, resumeErr = h.wsvc.ResumePublicationForgeHold(r.Context(), user.ID, run); resumeErr == nil && !resumed {
+					resumeErr = pgx.ErrNoRows
+				}
+				break
+			}
 			_, resumeErr = h.q.ResumeForgeUnreachableHold(r.Context(), store.ResumeForgeUnreachableHoldParams{
 				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
 			})
 		case "codex_idle_stall":
 			_, resumeErr = h.q.ResumeCodexIdleStall(r.Context(), store.ResumeCodexIdleStallParams{ID: runID, UserID: user.ID})
 		case "worker_memory_pressure":
-			_, resumeErr = h.q.ResumeMemoryEpisode(r.Context(), store.ResumeMemoryEpisodeParams{
-				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
-			})
+			// Issue #3639: the resume and the settled-park lift commit together or not at all.
+			if h.pool != nil {
+				resumeErr = workersvc.ResumeMemoryHold(r.Context(), h.pool, runID, user.ID, int32(h.cfg.RunTimeout.Seconds()))
+			} else {
+				_, resumeErr = h.q.ResumeMemoryEpisode(r.Context(), store.ResumeMemoryEpisodeParams{
+					ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),
+				})
+			}
 		default:
 			_, resumeErr = h.q.ResumeWorkerRecoveryEpisode(r.Context(), store.ResumeWorkerRecoveryEpisodeParams{
 				ID: runID, UserID: user.ID, GlobalTimeoutSeconds: int32(h.cfg.RunTimeout.Seconds()),

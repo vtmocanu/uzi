@@ -629,10 +629,11 @@ const RUN_STATUS_LABELS: Record<string, string> = {
 
 // A running or live completion row may attach its server estimate to the status pill.
 // Other callers and non-percent states retain the ordinary status presentation.
-export function StatusPill({ status: rawStatus, progress, health, recovery_wait_cause, recovery_retry_not_before }: {
+export function StatusPill({ status: rawStatus, progress, health, recovery_wait_cause, recovery_retry_not_before, recovery_wait_phase }: {
   status: string; progress?: RunProgress | null; health?: RunHealth;
   recovery_wait_cause?: string | null;
   recovery_retry_not_before?: string | null;
+  recovery_wait_phase?: string | null;
 }) {
   const status = effectiveRunStatus({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before });
   // Callers may already have projected live raw states to planning or revising.
@@ -641,7 +642,7 @@ export function StatusPill({ status: rawStatus, progress, health, recovery_wait_
   const cfg = accountWait ? { tone: "info" as BadgeTone, pulse: false } :
     RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
   const label = accountWait ? "waiting" :
-    forgeWaitLabel({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before }) ?? RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
+    forgeWaitLabel({ status: rawStatus, recovery_wait_cause, recovery_retry_not_before, recovery_wait_phase }) ?? RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
   const showsProgress = status === "running" || status === "completion_checking" || status === "completion_reworking";
   const pct = !accountWait && showsProgress && progress?.state === "percent" &&
     typeof progress.pct === "number" && Number.isFinite(progress.pct)

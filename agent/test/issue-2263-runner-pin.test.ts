@@ -91,7 +91,12 @@ describe("RunRunner — archived recovery pin ownership (issue #2263)", () => {
       const iid = 6301;
       const claim = gitlabClaim(iid, { claim_generation: 7 });
       runnerRef.current = runnerWith(commitThenFailFactory(homeRoot), gitlab, undefined, nullLogger(), { recovery: coord });
+      const mints: unknown[] = [];
+      const capture = coord.captureAndUpload.bind(coord);
+      coord.captureAndUpload = async (input) => { mints.push(input.closureMint); return capture(input); };
       await runnerRef.current.execute(claim);
+      // #3727 M3: the generation-settlement caller (settleRecoveryGeneration) denies the closure mint grant.
+      assert.deepEqual(mints, ["deny"]);
       assert.equal(client.uploadCalls.length, 1, "the bundle was archived");
       assert.equal(client.releaseCalls.length, 0);
       const bare = git.barePathFor(fx.originPath);

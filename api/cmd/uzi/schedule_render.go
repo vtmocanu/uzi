@@ -143,6 +143,7 @@ var skipReasonLabels = map[string]string{ //nolint:gosec // G101: schedule skip-
 	"fetch_failed":           "fetch failed",
 	"schedules_paused":       "all schedules paused",
 	"credential_disabled":    "pinned credential is disabled",
+	"codex_pool_unavailable": "no pooled Codex account is available",
 	"harness_label_conflict": "issue harness label conflicts with schedule pin",
 	"harness_label_invalid":  "invalid issue harness labels",
 	// PRD #2865: the ci_watch fire path.
@@ -177,6 +178,8 @@ var skipReasonHints = map[string]string{
 	"harness_label_invalid":  "keep exactly one of harness::codex or harness::claude and remove other harness::* labels",
 	// PRD #1732 D2/D12: the schedule's pin is kept, never substituted; enabling is web-only.
 	"credential_disabled": "enable the credential in Settings, or change the schedule's token",
+	// Issue #3719: Codex account mode is auto and no pooled account can be bound.
+	"codex_pool_unavailable": "link, re-authenticate or pool a Codex account in Settings",
 }
 
 // skipReasonHint returns the remediation hint for a skip reason, or "" when none applies.
@@ -239,7 +242,7 @@ func renderLastFire(p *uzicli.Printer, lf *apitypes.LastFire) {
 		p.Printf("    %s  %s  %s\n", fireCandidateLabel(sk.IssueIID), skipReasonLabel(sk.Reason), sk.Title)
 		// PRD #1732: a credential_disabled skip is the one last-fire skip the owner resolves
 		// outside the schedule itself, so the detail says where (Settings).
-		if sk.Reason == "credential_disabled" {
+		if sk.Reason == "credential_disabled" || sk.Reason == "codex_pool_unavailable" {
 			p.Printf("      # %s\n", skipReasonHint(sk.Reason))
 		}
 	}

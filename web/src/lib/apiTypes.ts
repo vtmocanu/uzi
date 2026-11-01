@@ -250,6 +250,9 @@ export interface UserSettings {
   weekly_reserve_pct?: number | null;
   /** PRD #3522: also pause running runs at the reserve (default true). */
   weekly_reserve_pause_running?: boolean;
+  /** Issue #3719: how a new Codex run chooses its login. "default" binds the default alias;
+   *  "auto" picks among the pooled aliases. Absent on a server that predates the setting. */
+  codex_account_mode?: CodexAccountMode | string;
   /** Per-user default harness (PRD #1429 M1 / D3); null = "no preference", so implicit run
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
@@ -2091,6 +2094,7 @@ export type ScheduleSkipReason =
   | "schedules_paused"
   | "no_usable_credential"
   | "credential_disabled"
+  | "codex_pool_unavailable"
   | "ci_green"
   | "ci_already_handled"
   | "ci_halted_no_progress"
@@ -2494,6 +2498,8 @@ export interface ForgeOriginCooldown {
   half_open_run_id: string | null;
   state: "cooling" | "half_open" | "retry_eligible_unverified" | "legacy_serialized_until_upgrade" | "reserved_unverified";
   detail: string;
+  /** Unverified evidence surfaces on this origin: "git" and/or "api". Absent on APIs predating it. */
+  surfaces?: string[];
 }
 
 export interface Worker {
@@ -3101,6 +3107,18 @@ export interface SemanticDriftDTO {
   contradiction: boolean;
 }
 
+/** Issue #1324: the active write-ahead publication intent of a run. No URL, path or
+ *  credential. `original_head` and `candidate` are shortened object ids; `candidate` is
+ *  null until a candidate commit exists and `mr_iid` until the merge request exists. */
+export interface PublicationIntent {
+  branch: string;
+  mr_iid: number | null;
+  original_head: string;
+  candidate: string | null;
+  state: string;
+  enrollment_seq: number;
+}
+
 /** PRD #3244: one recorded lead-config row. Model strings are untrusted worker-attested text. */
 export interface LeadPhaseConfig {
   phase: "plan" | "implement";
@@ -3253,6 +3271,9 @@ export interface Run {
   plan_cross_check_required: boolean;
   /** Independent creation-time code-check consent snapshot. */
   code_cross_check_required?: boolean;
+  /** PRD #3708: "checked before your review" snapshot. The server omits it when false,
+   *  and older servers never send it. */
+  plan_cross_check_gated?: boolean;
   /** Persisted forced-gate reason; optional for older server and mock responses. */
   plan_cross_check_gate_reason?: string | null;
   /** Planning-diff refusal sub-code; set only while the gate reason is planning_diff_refused. */
@@ -3647,6 +3668,23 @@ export interface Run {
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
   recovery_wait_cause: string | null;
+  /** Issue #1324: which part of the run a `recovery_wait` park interrupted. "publication"
+   *  is a forge outage met while publishing: the run keeps its publication intent and
+   *  resumes publication only. Null for every other park. Render an unrecognised value
+   *  honestly. */
+  recovery_wait_phase?: string | null;
+  /** Issue #1324 publication park diagnostics, present only while the run holds an active
+   *  publication intent. `publication_wait_started_at` is when the current owner episode's
+   *  wait began (absent between episodes); `publication_wait_limit_seconds` is the elapsed
+   *  limit (absent when the hold is disabled); `publication_hold_reason` names an owner hold
+   *  ("publication_retry_exhausted", "publication_custodian_unavailable", ...). */
+  publication_wait_started_at?: string;
+  publication_wait_limit_seconds?: number;
+  publication_hold_reason?: string;
+  publication_first_wait_at?: string;
+  publication_park_total?: number;
+  publication_episode?: number;
+  publication_intent?: PublicationIntent;
   /** PRD #1590 D6: what a run held on its Codex subscription account needs next. Non-null
    *  only for a `recovery_wait` run whose recovery_wait_cause is "codex_account_unavailable";
    *  derived at read time from the run's frozen binding and never persisted. Known values:
@@ -3662,6 +3700,10 @@ export interface Run {
    * codex_account_action on owner/admin run reads. User-authored: render as text
    * through sanitizeLabel, never as markup. */
   codex_secret_label: string | null;
+  /** Why the run's Codex alias was chosen (issue #3719); a closed server enum (see
+   *  CodexSelectReason). Null for a run created before auto-selection and for a non-Codex run.
+   *  Render an unrecognised value honestly: the API deploys separately from the web bundle. */
+  codex_select_reason: CodexSelectReason | string | null;
   /** PRD #1392 M1: when the server will promote a `recovery_wait` run back to queued — the
    *  retry stamp the forge-park surface counts down to ("retry at HH:MM"), and (issue #1766)
    *  the next retry a `vault_locked` park resumes at once the vault is unlocked. The
@@ -4053,6 +4095,22 @@ export interface PlanCrossCheckSummary {
   checker_effort_source: "pin" | "worker default" | "cross-check default" | null;
   usage: RunUsage | null;
   historical: boolean;
+  /** PRD #3708: the newest five rounds, oldest first. Older servers omit it. */
+  rounds?: PlanCrossCheckRound[];
+  /** PRD #3708: the latest round's checker deadline, only while it is pending. */
+  deadline_at?: string;
+}
+
+/** One checked round of the plan loop (PRD #3708). It never carries plan text. */
+export interface PlanCrossCheckRound {
+  round: number;
+  verdict: string;
+  reason_class: string | null;
+  findings: { summary: string; items: PlanCrossCheckFinding[] | null } | null;
+  decided_at: string | null;
+  /** The lead's response to this round's findings, taken from the following candidate.
+   *  Untrusted prose: claims, never a verified resolution. */
+  response: { state: string; text: string };
 }
 
 // RunUsage is a run's server-rolled token/cost totals (PRD #40). The run VIEW
@@ -4285,6 +4343,20 @@ export type MyRateLimits =
     }
   | { status: "no_token" }
   | { status: "unavailable" };
+
+/** Why run creation bound the Codex alias it bound (issue #3719), mirroring
+ *  codexselect.Reason. Closed server-side; the unions that carry it stay open (`| string`)
+ *  so a newer server's reason renders honestly. */
+export type CodexSelectReason =
+  | "default"
+  | "pool_empty"
+  | "auto"
+  | "best_of_pool"
+  | "pool_stale"
+  | "pool_exhausted";
+
+/** The user's Codex account mode (issue #3719). */
+export type CodexAccountMode = "default" | "auto";
 
 // TokenRateLimits is ONE token's meter (PRD #104 M5): the credential's label and
 // default flag — a name, never a value — plus the same status union PRD #53 froze.

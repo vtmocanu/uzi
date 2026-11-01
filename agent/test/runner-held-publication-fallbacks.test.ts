@@ -9,7 +9,7 @@ import { fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } 
 import {
   HELD_LINUX_ONLY, JOIN_TOKEN, PUBLICATION_ID, SERVER_CAPTURE_ID, assertCustodyRetained, badRequest, bare, command, commit,
   deferTerminalEvidence, failedStates, failingWork, frozenRecords, heldServer, patShaped, pinRef, redrive, retained, skipCheckpoints,
-  watchFreezes, type FinalCall, type HeldCall, type HeldServer, type Work,
+  recoveryOf, watchFreezes, type FinalCall, type HeldCall, type HeldServer, type Work,
 } from "./runner-held-publication-fixture.js";
 
 installHarness();
@@ -174,6 +174,33 @@ describe("held publication falls back to the archive", () => {
     assert.equal(s.server.heldCalls.length, 1, "a stale branch does not block the held publication");
     assert.equal(s.server.archiveUploads(), 0);
     await assertCustodyRetained(s.server, s.claim, s.work, "stale branch");
+  });
+
+  // #3727 M3 (r2): pins only the closureMint value the captureAndUpload branch receives from captureFrozenInventory.
+  it("the frozen-inventory capture tail passes closureMint deny", { skip: HELD_LINUX_ONLY }, async t => {
+    const seen: unknown[] = [];
+    await scenario(t, {
+      runnerOptions: { checkpointTestHooks: { heldPackMaxBytes: 16 } },
+      setup: ({ r }) => {
+        let depth = 0;
+        const rr = r as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+        const tail = rr.captureFrozenInventory!.bind(r);
+        t.mock.method(rr, "captureFrozenInventory", async (...a: unknown[]) => {
+          depth++;
+          try { return await tail(...a); } finally { depth--; }
+        });
+        const recovery = recoveryOf(r) as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+        for (const name of ["captureAndUpload", "operateFrozenInventory"]) {
+          const real = recovery[name]!.bind(recovery);
+          t.mock.method(recovery, name, async (...a: unknown[]) => {
+            if (depth > 0) seen.push((a[0] as { closureMint?: unknown }).closureMint);
+            return real(...a);
+          });
+        }
+      },
+    });
+    assert.ok(seen.length > 0, "the capture tail reached the coordinator");
+    assert.deepEqual(seen.filter(x => x !== "deny"), []);
   });
 
   it("a pack over the cap is never sent and archives", { skip: HELD_LINUX_ONLY }, async t => {

@@ -5,7 +5,8 @@
 #
 #   changelog-section.sh body  <version>   -> section content (Added/Changed/...)
 #                                             heading + release-title marker stripped;
-#                                             this becomes the Release NOTES body.
+#                                             input to the bounded Release presentation
+#                                             in scripts/release-notes.py.
 #   changelog-section.sh title <version>   -> "vX.Y.Z: <marker>" if the section
 #                                             carries a `<!-- release-title: … -->`
 #                                             marker, else "vX.Y.Z".

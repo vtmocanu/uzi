@@ -29,7 +29,33 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ## [Unreleased]
 
-## [0.86.0] - 2026-10-06
+## [0.86.1] - 2026-11-01
+
+### Added
+
+- **A run that cannot publish because the forge is unreachable now parks and resumes publication-only, with no model work ([#1324](https://github.com/vtmocanu/uzi/pull/1324), [#3746](https://github.com/vtmocanu/uzi/pull/3746)).**
+  A sustained transient failure at base refresh, push or merge request create parks a run whose publication intent is enrolled (an unenrolled run fails with `publication_forge_unreachable`) with `recovery_wait_phase=publication` and keeps its source, retrying until `RUN_PROVIDER_PARK_MAX_DURATION` and then holding for an owner Resume that queues one publication-only episode; `RUN_PUBLICATION_RESUME_ENABLED` stops new enrollment only, and before an API rollback enrolled queued runs and timed waits must be converted to NULL holds.
+
+- **Codex runs can pick among your pooled ChatGPT accounts when they are created ([#3719](https://github.com/vtmocanu/uzi/pull/3719), [#3744](https://github.com/vtmocanu/uzi/pull/3744)).**
+  Opt in with `uzi settings codex-mode auto` and `uzi token pool <label> --kind codex --on`; the choice is made once at creation and a run never switches account, and `uzi token pool <label>` now needs `--kind` when a label exists in both kinds.
+
+### Changed
+
+- **Demo mode hides instance branding ([#3757](https://github.com/vtmocanu/uzi/pull/3757)).**
+  Screenshots use the stock uzi identity, tab title and favicon base, with POWERED BY and optional license credits hidden; toggling demo mode off restores real branding without changing server settings.
+
+### Fixed
+
+- **Pod-epoch evidence can recover from annotation conflicts ([#3739](https://github.com/vtmocanu/uzi/pull/3739), [#3741](https://github.com/vtmocanu/uzi/pull/3741)).**
+  Bounded retries on later pod updates allow evidence recovery after resourceVersion conflicts while preserving successor binding and stopping on ambiguous failures.
+
+- **Codex cross-checks accept commentary before a final answer ([#3745](https://github.com/vtmocanu/uzi/pull/3745), [#3749](https://github.com/vtmocanu/uzi/pull/3749)).**
+  Plan and code checkers validate one completed final answer after a successful turn, preserving per-item integrity and shared output limits; the reproduced rejection mechanism does not establish the cause of every historical failure.
+
+- **Keep oversized GitHub Release notes publishable ([#3752](https://github.com/vtmocanu/uzi/pull/3752), [#3755](https://github.com/vtmocanu/uzi/pull/3755)).**
+  Long notes now retain complete bullets and security metadata within GitHub's limit, with a link to the complete changelog.
+
+## [0.86.0] - 2026-11-01
 
 ### Changed
 
@@ -379,6 +405,15 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Runs list owner-only acceptance outside their milestones, so they stop asking at completion ([#3721](https://github.com/vtmocanu/uzi/pull/3721), [#3723](https://github.com/vtmocanu/uzi/pull/3723)).**
   Plans put PR-environment checks in a "Landing obligations" section and live or human acceptance in an "Owner acceptance" section, with a non-closing delivery for the latter; worker obligations stay milestones, and unfinished worker work such as a failed gate still parks at completion.
 
+- **The TUI board names its columns and stops reserving space for rare statuses ([#3732](https://github.com/vtmocanu/uzi/pull/3732), [#3734](https://github.com/vtmocanu/uzi/pull/3734)).**
+  Band headings carry faint column names over their columns, and the status cell fits the longest status on screen (leaving room for the heading's age label, at most 14 columns), so titles get the spare room.
+
+- **The TUI CI view names its columns ([#3736](https://github.com/vtmocanu/uzi/pull/3736), [#3737](https://github.com/vtmocanu/uzi/pull/3737)).**
+  CI band headings carry faint column names over their cells, so the run time (`elapsed`/`took`) and the time since the run was triggered (`age`) are no longer two bare durations.
+
+- **Docker worker pod-epoch shadow now reports settle candidates and runtime authority ([#3431](https://github.com/vtmocanu/uzi/pull/3431), [#3733](https://github.com/vtmocanu/uzi/pull/3733)).**
+  Version-2 handoff evidence adds the successor's container IDs and a runtime-prefix cross-check, and `pod_epoch_reclaim` gains `authority`, `would_settle` and per-entry basis; it is still read-only, `crio-crun` defers `kernel_unaudited` outside an exact kernel allowlist, and old workers refuse v2 until the worker pin moves.
+
 ### Added
 
 - **Healthy busy workers no longer show custody attention.**
@@ -569,6 +604,15 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Record incomplete Codex command-cache calibration ([#3076](https://github.com/vtmocanu/uzi/pull/3076)).**
   Document inherited cache scan measurements, the observed overhead above target, and remaining safety and coverage gaps without changing cache behavior.
+
+- **Hosted workers carry a configurable `workers.nodeSelector`, defaulting to `kubernetes.io/arch: amd64` ([#3679](https://github.com/vtmocanu/uzi/pull/3679)).**
+  The published agent images are amd64 only, so on a mixed-arch cluster workers now stay off arm64 nodes, where they would crash-loop. The selector applies to all three worker tiers (plain, docker, isolated), next to the docker tier's existing soft anti-affinity. Override it, or clear it with `workers.nodeSelector: null`, when running your own arm64-capable worker image. Changing the selector also removes dropped keys from existing workers, which a plain merge patch would leave behind. **Upgrading re-hashes every worker's pod template: persistent workers go through the normal paced drain-and-roll, while run-bound (ephemeral) workers are outside the pacing pools but keep the usual busy-drift deferral, so a busy one is not replaced mid-run.**
+
+- **The TUI board shows how long each finished run took ([#3731](https://github.com/vtmocanu/uzi/pull/3731)).**
+  DONE rows add a run-length cell (wall time from first start to finish) after the finished-ago age on wide boards (from 111 columns).
+
+- **Runs show the lead model and effort that were requested and what the runtime reported ([#3244](https://github.com/vtmocanu/uzi/pull/3244), [#3695](https://github.com/vtmocanu/uzi/pull/3695)).**
+  Recorded per claim attempt and phase and shown as a run-page chip, `uzi run get` rows and `uzi run lead-config`; worker-attested and display-only.
 
 ### Fixed
 
@@ -1416,6 +1460,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Cross-check runs no longer send their own Slack DMs ([#3628](https://github.com/vtmocanu/uzi/pull/3628), [#3687](https://github.com/vtmocanu/uzi/pull/3687)).**
   A plan or code cross-check run used to get a separate run-state or health DM titled `<repo>#0 · <parent title>`, which could read "Failed" for a run that had actually completed; a plan cross-check's reason still appears on the parent's plan-gate message, and code cross-check results still go to the merge request.
+
+- **Claude meters keep refreshing for plans without a 5-hour limit (1bfe171cd, d7b57cdd3).**
+  Anthropic removed the 5-hour window for some plans, so their usage probe carries only 7-day data; the poller rejected that as malformed, the meter went stale and the token dropped out of auto-selection. The 5-hour window is now optional: such tokens show a single 7-day meter and are ranked on 7-day headroom. Failed polls now log the secret id, call, kind and HTTP status.
 
 ### Security
 
@@ -6253,7 +6300,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.86.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.86.1...HEAD
+[0.86.1]: https://github.com/vtmocanu/uzi/compare/v0.86.0...v0.86.1
 [0.86.0]: https://github.com/vtmocanu/uzi/compare/v0.85.2...v0.86.0
 [0.85.2]: https://github.com/vtmocanu/uzi/compare/v0.85.1...v0.85.2
 [0.85.1]: https://github.com/vtmocanu/uzi/compare/v0.85.0...v0.85.1

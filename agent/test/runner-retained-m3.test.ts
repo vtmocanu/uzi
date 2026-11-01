@@ -6,6 +6,7 @@ import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import type { ExecutorFactory } from "../src/runner.js";
+import type { RecoveryCoordinator } from "../src/recovery.js";
 import { DataVolumeGuard } from "../src/disk-full.js";
 import { noProofReseed, nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
@@ -219,6 +220,22 @@ it("M3 real full-to-thin fallback adopts through executor.run with unknown remot
   assert.ok(descriptor, "durable thin descriptor survives unknown upload ACK");
   assert.ok(fs.existsSync(descriptor.bundlePath!));
   assert.deepEqual(descriptor.prerequisiteShas, bundles[0]!.prerequisites);
+});
+
+// #3727 M3 (r4): the retained-claim caller evaluates only the missing-metadata and feature-snapshot grants.
+it("M3 recoverRetainedClaim captures with closureMint retained_claim", async () => {
+  const { claim } = await seed();
+  guarded(claim);
+  client.releaseRecoveryCustody = async () => { throw new Error("must keep custody"); };
+  const r = runnerWith(factory(async () => { throw new Error("model interrupted before settled completion"); }),
+    fakeGitlab().gitlab, "fixture-journal-key", nullLogger(), { recoveryRetryMs: 1 });
+  const recovery = Reflect.get(r, "recovery") as RecoveryCoordinator;
+  const seen: unknown[] = [];
+  const capture = recovery.captureAndUpload.bind(recovery);
+  recovery.captureAndUpload = async input => { seen.push(input.closureMint); return capture(input); };
+  await r.execute(claim);
+  assert.ok(seen.length > 0, "the retained-claim capture was reached");
+  assert.equal(seen[0], "retained_claim");
 });
 
 function assertBlocked(bare: string, clone: { path: string; branch: string }, blocker: string, attempts: number) {

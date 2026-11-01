@@ -101,7 +101,7 @@ func (q *Queries) CountRunPlanMessages(ctx context.Context, runID uuid.UUID) (in
 }
 
 const getConfirmedUserBySlackID = `-- name: GetConfirmedUserBySlackID :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation FROM users
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled, codex_judge_model, weekly_reserve_pct, weekly_reserve_pause_running, vault_mode, vault_epoch, vault_auto_reunlock, vault_slot_generation, codex_account_mode FROM users
 WHERE slack_resolved_id = $1 AND slack_link_confirmed_at IS NOT NULL AND is_active = true
 `
 
@@ -168,6 +168,7 @@ func (q *Queries) GetConfirmedUserBySlackID(ctx context.Context, slackResolvedID
 		&i.VaultEpoch,
 		&i.VaultAutoReunlock,
 		&i.VaultSlotGeneration,
+		&i.CodexAccountMode,
 	)
 	return i, err
 }
@@ -856,14 +857,18 @@ type SetSlackRunLimitPauseParams struct {
 }
 
 // Stamp the pending park's start on the run's anchor (PRD #1116, generalised by PRD #1190):
-// @at is the run's own status_since captured at the park, and @park_kind records WHICH park it
-// was ('limit_wait' or 'paused') so the eventual resume reply can be worded honestly — a
-// usage-limit park clears "· usage limit cleared", an owner pause does not. It is its OWN
+// @at is the run's own status_since captured at the park (for a publication-phase forge park,
+// issue #1324, the owner episode's publication_wait_started_at instead), and @park_kind records
+// WHICH park it was ('limit_wait', 'paused', 'forge_publication' or 'forge_publication_hold') so
+// the eventual resume reply can be worded honestly — a usage-limit park clears "· usage limit
+// cleared", an owner pause does not, and only the hold kind posts one. It is its OWN
 // column, not a reuse of the gate/question anchors, for the same reason gate_generation and
 // milestones_notified_completed are their own columns — a distinct dedupe fact (a park awaiting
 // its resume line), so a park can never clear a gate and a gate can never clear a park. Overwrite
-// is correct: a re-park always follows a consumed resume (the park SQL guards on status='running',
-// and the resumed worker reports running first), so a set never clobbers a live pending park.
+// is the contract, and a set CAN replace a live pending marker: a custodian hold moves a run
+// queued -> recovery_wait without a running report in between, and a timed publication wait's
+// marker is deliberately kept across its automatic retries. The replaced marker's resume line is
+// dropped, which is the intended reading (the newest park is the one the owner must act on).
 func (q *Queries) SetSlackRunLimitPause(ctx context.Context, arg SetSlackRunLimitPauseParams) (SlackRunMessage, error) {
 	row := q.db.QueryRow(ctx, setSlackRunLimitPause, arg.At, arg.ParkKind, arg.RunID)
 	var i SlackRunMessage
