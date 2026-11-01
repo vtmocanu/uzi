@@ -285,10 +285,10 @@ func TestCompletionDecisionAwaitingInputEmptyGuidanceSendsContinueSentinelLiveDB
 }
 
 // TestCompletionDecisionNotBlockedRefusedLiveDB (PRD #1226 M5, D7): a run in NEITHER
-// completion-blocked state is refused with ErrCompletionNotBlocked, and no rows are written. Four
-// shapes: a plain running interlocked run with no attempt, a paused run held for a DIFFERENT reason
-// (owner pause, hold_reason NULL), an awaiting_input run with NO completion-question marker (an
-// ordinary clarification), and a marker-set awaiting_input run missing its open_question_id.
+// completion-blocked state is refused with ErrCompletionNotBlocked, and no rows are written.
+// Shapes include a plain running interlocked run with no attempt, an owner pause, an iteration
+// hold, an awaiting_input run with NO completion-question marker (an ordinary clarification),
+// and a marker-set awaiting_input run missing its open_question_id.
 func TestCompletionDecisionNotBlockedRefusedLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
