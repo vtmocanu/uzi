@@ -17,8 +17,18 @@ const ATTEMPT = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789
 function command(dir: string, ...args: string[]): string {
   return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: "pipe" }).trim();
 }
-type Flight = Record<string, unknown> & { remediationRestrictions?: { roots: string[] } };
+type Flight = Record<string, unknown> & {
+  remediationRestrictions?: {
+    roots: string[];
+    pending?: {
+      runId: string; clonePath?: string; attemptId?: string; barePath?: string; branch?: string;
+      requiredOIDs: string[]; requireDenial: boolean; bindingUncertain: boolean;
+    };
+  };
+};
 type Subject = {
+  persistRemediationScan(flight: Flight, bare: string, branch: string, tip: string,
+    findings: Array<{ commit?: string }>, origin?: "pre-exit"): Promise<void>;
   requireLaunchAuthority(flight: Flight): Promise<void>;
   checkpointRemediationHold(flight: Flight, bare: string, candidate: string, reap: boolean): Promise<boolean>;
   frozenHeldPolicy(flight: Flight): FrozenHeldPolicy;
@@ -143,4 +153,73 @@ test("ordinary unenrolled launch and checkpoint remain unscanned", async t => {
   await runner.requireLaunchAuthority(flight);
   assert.equal(flight.remediationRestrictions, undefined);
   assert.equal(await runner.checkpointRemediationHold(flight, f.bare, f.base, true), false);
+});
+
+
+test("pending persistence foundation: invalid findings latch denial before validation without retaining content", async t => {
+  const f = await fixture();
+  const producer = t.mock.method(git, "recordRemediationScan", async () => {});
+  for (const malformed of [{}, { commit: 0 }, null]) {
+    const flight = f.freshFlight();
+    await assert.rejects(freshRunner().persistRemediationScan(flight, f.bare, BRANCH, f.base,
+      [{ commit: f.base }, malformed] as Array<{ commit?: string }>, "pre-exit"));
+    assert.deepEqual(flight.remediationRestrictions?.pending, {
+      runId: RUN, clonePath: f.clone.path, attemptId: ATTEMPT, barePath: f.bare, branch: BRANCH,
+      requiredOIDs: [f.base], requireDenial: true, bindingUncertain: false,
+    });
+  }
+  assert.equal(producer.mock.callCount(), 0);
+});
+
+test("pending persistence foundation: config failure retains facts and refuses source rebinding", async t => {
+  const f = await fixture();
+  const flight = f.freshFlight();
+  const runner = freshRunner();
+  let writes = 0;
+  t.mock.method(git, "recordRemediationScan", async () => {
+    writes++;
+    assert.deepEqual(flight.remediationRestrictions?.pending?.requiredOIDs, [f.base], "already latched at first effect");
+    throw new Error("config write failed");
+  });
+  await assert.rejects(runner.persistRemediationScan(flight, f.bare, BRANCH, f.base,
+    [{ commit: f.base }], "pre-exit"), /config write failed/);
+  flight.runnerClone = { ...f.clone, attemptId: "another-attempt" };
+  await assert.rejects(runner.persistRemediationScan(flight, f.bare, BRANCH, f.base,
+    [{ commit: f.base }], "pre-exit"), /source identity unavailable/);
+  assert.equal(writes, 1);
+  assert.equal(flight.remediationRestrictions?.pending?.attemptId, ATTEMPT, "never rebound");
+  assert.equal(flight.remediationRestrictions?.pending?.bindingUncertain, true);
+});
+
+test("pending persistence foundation: Q65 requires denial with a bounded Q snapshot", async t => {
+  const f = await fixture();
+  const flight = f.freshFlight();
+  const findings = Array.from({ length: 65 }, (_, i) => ({ commit: (i + 1).toString(16).padStart(40, "0") }));
+  t.mock.method(git, "recordRemediationScan", async () => { throw new Error("overflow denial sync failed"); });
+  await assert.rejects(freshRunner().persistRemediationScan(flight, f.bare, BRANCH, f.base, findings, "pre-exit"),
+    /overflow denial sync failed/);
+  assert.equal(flight.remediationRestrictions?.pending?.requiredOIDs.length, 64);
+  assert.equal(flight.remediationRestrictions?.pending?.requireDenial, true);
+  assert.equal(flight.remediationRestrictions?.pending?.attemptId, ATTEMPT);
+});
+
+test("pending persistence foundation: selected missing identity holds while unenrolled legacy stays residual", async t => {
+  const f = await fixture();
+  const runner = freshRunner();
+  const producer = t.mock.method(git, "recordRemediationScan", async () => {});
+  const selected = f.freshFlight();
+  selected.worktreePath = undefined;
+  await assert.rejects(runner.persistRemediationScan(selected, f.bare, BRANCH, f.base, [{ commit: f.base }], "pre-exit"),
+    /source identity unavailable/);
+  assert.equal(selected.remediationRestrictions?.pending?.bindingUncertain, true);
+  const enrolled = f.freshFlight();
+  enrolled.runnerClone = undefined;
+  enrolled.remediationRestrictions = { roots: [f.base] };
+  await assert.rejects(runner.persistRemediationScan(enrolled, f.bare, BRANCH, f.base, [{ commit: f.base }], "pre-exit"),
+    /source identity unavailable/);
+  const legacy = f.freshFlight();
+  legacy.runnerClone = undefined;
+  await runner.persistRemediationScan(legacy, f.bare, BRANCH, f.base, [{ commit: f.base }], "pre-exit");
+  assert.equal(legacy.remediationRestrictions, undefined);
+  assert.equal(producer.mock.callCount(), 0);
 });

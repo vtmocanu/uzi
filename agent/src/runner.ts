@@ -2585,7 +2585,14 @@ interface RunFlight {
    *  the finalize bridge in M3 is the correctness backstop). */
   steeredTips?: Set<string>;
   /** Restriction latch only. Never authorizes source use; launch re-reads durable proofs. */
-  remediationRestrictions?: { roots: string[] };
+  remediationRestrictions?: {
+    roots: string[];
+    /** Worker-selected identity and bounded negative knowledge; never a consumer confirmation cache. */
+    pending?: {
+      runId: string; clonePath?: string; attemptId?: string; barePath?: string; branch?: string;
+      requiredOIDs: string[]; requireDenial: boolean; bindingUncertain: boolean;
+    };
+  };
   remediationPredecessorAttempt?: string;
   /** issue #1932: per-flight state of the pre-exit secret remediation gate (see
    *  RunRunner.runSecretRemediationGate). `known` = findings of the last trusted gate scan that
@@ -3617,11 +3624,36 @@ export class RunRunner {
     const authority = this.authority;
     const none: FlightSourceEnd = { paths: [], endedSlots: [], published: false, ownedEpochs: {} };
     if (!authority) return none;
-    // Retired at the very entry, before any early return: a callback this flight left behind (a late git hook)
-    // can no longer admit, whatever happens to the end below. Keys it admitted stay owned until a confirmed end.
     const sink = flight.sourceUsePaths ??= new Set();
-    authority.retireSink(sink);
-    flight.sourceAdmissionRetired = true;
+    const retire = (): void => {
+      authority.retireSink(sink);
+      flight.sourceAdmissionRetired = true;
+    };
+    const remediation: { kind: "confirmed" | "denied" | "held" } = { kind: "confirmed" };
+    if (flight.remediationRestrictions?.pending && flight.sourceTailsJoined === true) {
+      remediation.kind = "held";
+      try {
+        // One bounded acquisition/confirmation attempt. Retire under the same owning A.
+        // A callback can latch synchronously while the Git proof awaits; changed knowledge
+        // keeps custody even if the earlier snapshot could be confirmed.
+        await this.inFlightAuthority(flight, async () => {
+          const snapshot = canonicalJson(flight.remediationRestrictions!.pending!);
+          try { remediation.kind = await this.confirmPendingRemediation(flight); }
+          finally {
+            retire();
+            if (canonicalJson(flight.remediationRestrictions!.pending!) !== snapshot) remediation.kind = "held";
+          }
+        }, this.cleanupAuthorityWait(this.sourceUseEndWaitMs));
+      } catch {
+        remediation.kind = "held";
+        runLog.warn("source use left active: remediation durability unconfirmed");
+      } finally {
+        // Acquisition can fail before the callback runs.
+        retire();
+      }
+    } else {
+      retire();
+    }
     // Barrier: an admission that passed its entry check before the retirement may still be running under A. Taking A
     // once proves it finished (its path is in the sink and its owner recorded) before the snapshot below.
     const quiescent = await authority.awaitSinkQuiescent({ timeoutMs: this.sourceUseEndWaitMs });
@@ -3644,12 +3676,14 @@ export class RunRunner {
         sources: paths.size });
       return { paths: allPaths, endedSlots: [], published: false, ownedEpochs };
     }
+    if (remediation.kind === "held")
+      return { paths: allPaths, endedSlots: [], published: false, ownedEpochs };
     // U4: a flight whose completing source the journal durably bound publishes it (Codex: sealed; Claude:
     // claude_ready) instead of ending it. Publication moves the slot out of `active` itself and returns its
     // lease, so only the paths that did NOT publish still need the ineligible step below.
     const bound = flight.completionSourceBound;
     let published = false;
-    if (bound && paths.has(resolvePath(bound.clonePath))) {
+    if (remediation.kind !== "denied" && bound && paths.has(resolvePath(bound.clonePath))) {
       // "ended": a failed publication already moved the slot to ineligible under its own A.
       const outcome = await this.publishFlightSource(flight, bound, runLog);
       if (outcome !== "unpublished") { paths.delete(resolvePath(bound.clonePath)); published = true; }
@@ -16682,6 +16716,85 @@ export class RunRunner {
     return still.length > 0;
   }
 
+  /** Independent consumer confirmation, under the flight's owning A before sink retirement.
+   * One read and at most one denial write; unconfirmed denial keeps the source epoch active. */
+  private async confirmPendingRemediation(flight: RunFlight): Promise<"confirmed" | "denied"> {
+    const pending = flight.remediationRestrictions!.pending!;
+    const { runId, clonePath, attemptId, barePath, branch } = pending;
+    if (pending.bindingUncertain || !runId || !clonePath || !attemptId || !barePath || !branch ||
+        flight.runId !== runId || flight.worktreePath !== clonePath ||
+        flight.runnerClone?.path !== clonePath || flight.runnerClone.attemptId !== attemptId ||
+        flight.barePath !== barePath || flight.branch !== branch)
+      throw new Error("remediation pending source identity unavailable");
+    const source = { runId, clonePath, attemptId };
+    if (!pending.requireDenial) {
+      try {
+        const record = await this.git.readRuntimeRemediationRecovery(barePath, branch, source);
+        if (!pending.requireDenial && !pending.bindingUncertain && record?.blocked === false &&
+            pending.requiredOIDs.every(q => record.flaggedOIDs.includes(q)))
+          return "confirmed";
+      } catch {
+        // A failed positive proof may still be replaced by independently confirmed permanent denial.
+      }
+    }
+    if (pending.bindingUncertain) throw new Error("remediation pending source identity unavailable");
+    if (await this.git.blockRemediationRecovery(barePath, branch, source) !== "confirmed" || pending.bindingUncertain)
+      throw new Error("remediation denial unconfirmed");
+    return "denied";
+  }
+
+  private async persistRemediationScan(flight: RunFlight, barePath: string, branch: string,
+    tip: string, findings: readonly SecretFinding[], origin?: "checkpoint-pending" | "pre-exit"): Promise<void> {
+    this.assertFlightSourceAdmissible(flight);
+    const clone = flight.runnerClone;
+    // Keep the unenrolled legacy residual outside this seam. Selected attempts and remembered
+    // restrictions cannot interpret a missing identity as absence.
+    if (!clone?.attemptId && !flight.remediationRestrictions) return;
+    // An ordinary clean scan adds no negative knowledge and keeps the existing unenrolled path.
+    if (!findings.length && !flight.remediationRestrictions && flight.runId && clone?.attemptId &&
+        clone.path && clone.path === flight.worktreePath && flight.barePath === barePath && flight.branch === branch) {
+      await this.inFlightAuthority(flight, () => this.git.recordRemediationScan(barePath, branch,
+        { runId: flight.runId, clonePath: clone.path, attemptId: clone.attemptId! },
+        { trusted: true, tip, flaggedOIDs: [], ...(origin ? { origin } : {}) }), this.authorityWait(flight));
+      return;
+    }
+    const restrictions = flight.remediationRestrictions ??= { roots: [] };
+    const pending = restrictions.pending ??= {
+      runId: flight.runId, clonePath: clone?.path, attemptId: clone?.attemptId,
+      barePath: flight.barePath, branch: flight.branch,
+      requiredOIDs: [], requireDenial: false, bindingUncertain: false,
+    };
+    if (!clone?.attemptId || clone.path !== flight.worktreePath ||
+        pending.runId !== flight.runId || pending.clonePath !== clone.path ||
+        pending.attemptId !== clone.attemptId || pending.barePath !== flight.barePath ||
+        pending.branch !== flight.branch || barePath !== pending.barePath || branch !== pending.branch ||
+        !pending.runId || !pending.barePath || !pending.branch)
+      pending.bindingUncertain = true;
+    // Latch before validation and before any await. Only OIDs enter memory, never finding content.
+    // At most 64 distinct requirements fit the journal; overflow needs permanent denial instead.
+    const flaggedOIDs: string[] = [];
+    let invalid = false;
+    for (const finding of findings) {
+      const q = finding && typeof finding.commit === "string" ? finding.commit.toLowerCase() : undefined;
+      if (q === undefined || !/^[0-9a-f]{40}$/.test(q)) {
+        pending.requireDenial = true;
+        invalid = true;
+        continue;
+      }
+      if (!flaggedOIDs.includes(q)) flaggedOIDs.push(q);
+      if (!pending.requiredOIDs.includes(q)) {
+        if (pending.requiredOIDs.length < 64) pending.requiredOIDs.push(q);
+        else pending.requireDenial = true;
+      }
+    }
+    restrictions.roots = [...new Set([...restrictions.roots, ...pending.requiredOIDs])];
+    if (pending.bindingUncertain) throw new Error("remediation source identity unavailable");
+    if (invalid) throw new Error("remediation finding identity unavailable");
+    await this.inFlightAuthority(flight, () => this.git.recordRemediationScan(barePath, branch,
+      { runId: pending.runId, clonePath: pending.clonePath!, attemptId: pending.attemptId! },
+      { trusted: true, tip, flaggedOIDs, ...(origin ? { origin } : {}) }), this.authorityWait(flight));
+  }
+
   /**
    * issue #1597 M2 — the pinned SCAN-then-pack gate for an overlay-less checkpoint publish.
    * Resolves the range to SHAs (the same floor checkpointPack excludes), scans exactly that range
@@ -16709,24 +16822,6 @@ export class RunRunner {
    * inside a permit DEFERS its publish to the next tick outside the permit instead of scanning there
    * (`scan_deferred`, see doCheckpointPublish).
    */
-  private async persistRemediationScan(flight: RunFlight, barePath: string, branch: string,
-    tip: string, findings: readonly SecretFinding[], origin?: "checkpoint-pending" | "pre-exit"): Promise<void> {
-    const clone = flight.runnerClone;
-    if (!clone?.attemptId || clone.path !== flight.worktreePath) return;
-    const identities = findings.map(f => f.commit?.toLowerCase());
-    if (identities.some(q => typeof q !== "string" || !/^[0-9a-f]{40}$/.test(q)))
-      throw new Error("remediation finding identity unavailable");
-    const flaggedOIDs = [...new Set(identities as string[])];
-    // A write that lands but fails readback must still restrict this flight's publication.
-    if (flaggedOIDs.length) {
-      const restrictions = flight.remediationRestrictions ??= { roots: [] };
-      restrictions.roots = [...new Set([...restrictions.roots, ...flaggedOIDs])];
-    }
-    await this.inFlightAuthority(flight, () => this.git.recordRemediationScan(barePath, branch,
-      { runId: flight.runId, clonePath: clone.path, attemptId: clone.attemptId! },
-      { trusted: true, tip, flaggedOIDs, ...(origin ? { origin } : {}) }), this.authorityWait(flight));
-  }
-
   private async scanCheckpointForPublish(
     flight: RunFlight,
     barePath: string,
