@@ -147,11 +147,8 @@ func testPrerequisiteFinalShutdown(t *testing.T, present bool) {
 		t.Fatal(err)
 	}
 	committed := state == "released"
-	// The positive fixture is deterministic (pin present, no contention), so a
-	// valid in-flight FINAL must commit during graceful drain. A refusal here would
-	// also pass a build that drops the release path or aborts on shutdown.
-	if present && !committed {
-		t.Fatalf("valid in-flight FINAL did not commit during graceful drain: reply=%+v state=%s", reply, state)
+	if present && (reply.status != http.StatusOK || !reply.released || !committed) {
+		t.Fatalf("valid in-flight FINAL did not commit during drain; a load/deadline refusal is not a positive control: reply=%+v state=%s", reply, state)
 	}
 	if (!present && committed) || (reply.status == http.StatusOK && (!reply.released || !committed)) {
 		t.Fatalf("drained response disagrees with complete database outcome: reply=%+v state=%s", reply, state)

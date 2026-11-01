@@ -844,8 +844,10 @@ completed locally, with hosted acceptance above still unchecked:
   listing or an open transaction. It does not assume that `http.Server.Shutdown`
   immediately cancels active request contexts.
   `TestHandlerPrerequisiteFinalShutdownAtomicCommitLiveDB` additionally starts
-  drain mid-request with a valid pin: either release and capture protection commit
-  fully, or a bounded refusal leaves both unchanged. After HTTP shutdown and the
+  drain mid-request with a valid pin: this deterministic positive control requires
+  HTTP 200, `released=true` and the complete persisted release/capture protection.
+  A load/deadline 503 fails explicitly rather than satisfying the positive case.
+  The stalled control still requires no custody/capture effect. After HTTP shutdown and the
   prerequisite drain return, no handler, listing or transaction remains open.
   The agreed graceful-drain interpretation is recorded in the Decision Log below;
   no global server shutdown behavior is changed here.
