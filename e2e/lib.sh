@@ -540,6 +540,68 @@ wait_custody_headroom() {
   done
 }
 
+# fixture_event_ready FILE RUN GEN EVENT [STAGE] — exact same-line JSON fields.
+# Consume every line, including Compose-prefixed JSON, without an early pipe close.
+# Invalid JSON and unrelated prose are misses; source readiness requires positive sources.
+fixture_event_ready() {
+  local file="$1" run="$2" gen="$3" event="$4" stage="${5:-}"
+  [[ "$gen" =~ ^[1-9][0-9]*$ ]] || return 1
+  jq -Rne --arg run "$run" --argjson gen "$gen" --arg event "$event" --arg stage "$stage" '
+    reduce inputs as $line (false;
+      . or (try ($line | .[index("{"):] | fromjson |
+        .run_id==$run and .claim_generation==$gen and .msg==$event and
+        (if $stage=="" then true else .stage==$stage end) and
+        (if $event=="stub: source-end ready" then
+          (.sources | type=="number" and .>0 and .==floor)
+         else true end)) catch false))
+    | select(.)' "$file" >/dev/null
+}
+
+# A daemon read gets at most 10s, independently of the polling deadline.
+# Missing host timeout support is a miss, never an unbounded fallback.
+fixture_worker_log() {
+  local file="$1" limiter
+  limiter="$(command -v timeout || command -v gtimeout || true)"
+  [ -n "$limiter" ] || return 1
+  "$limiter" 10 "${COMPOSE[@]}" logs --no-color agent > "$file" 2>/dev/null
+}
+
+# Read the worker log once; an unsuccessful read cannot provide readiness.
+fixture_worker_event_ready() {
+  local run="$1" gen="$2" event="$3" stage="${4:-}" file="$RUNROOT/.fixture-ready.log"
+  fixture_worker_log "$file" || return 1
+  fixture_event_ready "$file" "$run" "$gen" "$event" "$stage"
+}
+
+# Bounded polling returns nonzero on timeout; callers restore API before judging.
+# TIMEOUT=0 performs one observation. A failed observation never blocks sibling cleanup.
+wait_fixture_worker_event() {
+  local run="$1" gen="$2" event="$3" stage="${4:-}" timeout="${5:-90}"
+  local deadline=$((SECONDS + timeout))
+  while :; do
+    fixture_worker_event_ready "$run" "$gen" "$event" "$stage" && return 0
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
+
+# Enumerate actual owned generations, including intermediate successor captures.
+# Each ordinary resolution retains resolve_fixture_source_hold's archive FINAL wait.
+# The finite snapshot bounds attempts, each by TIMEOUT; failure stops later generations
+# and preserves evidence for the phase's restore trap.
+resolve_fixture_run_source_holds() {
+  local run="$1" timeout="${2:-120}" generations gen
+  generations="$(apiget /api/recovery/holds | jq -r --arg run "$run" '
+    [.holds[] | select(.run_id==$run) | .generation] | unique | sort |
+    if length>0 and all(.[]; type=="number" and .>0 and .==floor)
+    then .[] else error("missing/invalid generations") end')" \
+    || fail "fixture hold generation listing failed: $run"
+  while IFS= read -r gen; do
+    [ -n "$gen" ] || continue
+    resolve_fixture_source_hold "$run" "$gen" "$timeout"
+  done <<< "$generations"
+}
+
 # An ephemeral fixture with no bound run may be reaped between any two checks.
 # Absence is global by exact UUID, never inferred from an empty owner-filtered read.
 fixture_worker_absent() {

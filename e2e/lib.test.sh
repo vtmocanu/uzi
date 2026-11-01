@@ -466,6 +466,43 @@ custody_case "no messages means no executor run" pass 0 pub_wrap run_executor_ru
 custody_case "fault helper arms create-mr with status and count" pass '/_e2e/faults {"surface":"create-mr","status":503,"count":8}' pub_fault_wrap fake_fault_create_mr 503 8
 custody_case "fault clear helper sends count 0" pass '/_e2e/faults {"surface":"create-mr","count":0}' pub_fault_wrap fake_clear_create_mr_fault
 
+# Shared exact-generation fixture readiness: same-line structured events only.
+eval "$(awk '/^(fixture_event_ready|fixture_worker_log|fixture_worker_event_ready|wait_fixture_worker_event|resolve_fixture_run_source_holds)\(\) \{/,/^\}/' "$LIB")"
+fixture_ready_case() {
+  local event="$1" stage="$2" body="$3"
+  printf '%s\n' "$body" > "$SEQ_DIR/ready.jsonl"
+  if fixture_event_ready "$SEQ_DIR/ready.jsonl" R 2 "$event" "$stage"; then echo true; else echo false; fi
+}
+for body in   '{"msg":"stub: source-end ready","run_id":"R","claim_generation":2,"sources":1}'   'agent-1 | { "sources": 3, "claim_generation": 2, "run_id": "R", "msg": "stub: source-end ready" }'; do
+  custody_case "exact source-end JSON accepts positive integer sources" pass true fixture_ready_case "stub: source-end ready" "" "$body"
+done
+for fold in '.run_id="other"' '.claim_generation=20' '.sources=0' '.sources=-1' '.sources=1.5' '.sources="2"' 'del(.sources)' '.msg="warning: stub: source-end ready"' '.msg="warning" | .detail="stub: source-end ready"'; do
+  body="$(jq -nc --argjson fixture '{"msg":"stub: source-end ready","run_id":"R","claim_generation":2,"sources":2}' "\$fixture | $fold")"
+  custody_case "source readiness rejects $fold" pass false fixture_ready_case "stub: source-end ready" "" "$body"
+done
+custody_case "source readiness rejects string prose and split fields" pass false fixture_ready_case "stub: source-end ready" "" 'stub: source-end ready R 2 sources 4
+{"msg":"stub: source-end ready"}
+{"run_id":"R","claim_generation":2,"sources":1}'
+for stage in terminal running-ack; do
+  body="$(jq -nc --arg stage "$stage" '{msg:"stub: fixture barrier ready",run_id:"R",claim_generation:2,stage:$stage}')"
+  custody_case "stage readiness accepts $stage" pass true fixture_ready_case "stub: fixture barrier ready" "$stage" "$body"
+  custody_case "stage readiness rejects wrong stage $stage" pass false fixture_ready_case "stub: fixture barrier ready" other "$body"
+done
+# Consume a large suffix after a hit under pipefail, rather than closing the writer early.
+ready_eof() {
+  { echo '{"msg":"stub: source-end ready","run_id":"R","claim_generation":2,"sources":1}';     awk 'BEGIN { for (i=0;i<20000;i++) print "irrelevant log suffix" }'; } |     fixture_event_ready /dev/stdin R 2 "stub: source-end ready" || return 1
+  echo true
+}
+custody_case "ready decoder reads to EOF without SIGPIPE" pass true ready_eof
+run_hold_generations() {
+  apiget() { echo '{"holds":[{"run_id":"R","generation":3},{"run_id":"other","generation":9},{"run_id":"R","generation":1},{"run_id":"R","generation":2}]}'; }
+  resolve_fixture_source_hold() { printf '%s:%s\n' "$1" "$2"; }
+  resolve_fixture_run_source_holds R
+}
+custody_case "ordinary cleanup enumerates all and only run-owned generations" pass 'R:1
+R:2
+R:3' run_hold_generations
+
 # Drive the real sequential outbox creation seam, not just the admission helper.
 # Each fresh claim must observe a saturated-then-free owner before create_run.
 eval "$(awk '/^make_outbox_run\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"
@@ -1187,7 +1224,7 @@ fixture_phase_boundary() {
     echo '{"discarded":true}'
   }
   before="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
-  eval "$(awk '/^[[:space:]]*resolve_fixture_source_hold /' "$ROOT/e2e/phases/$phase.sh")"
+  eval "$(awk '/^[[:space:]]*resolve_fixture_(source_hold|run_source_holds) /' "$ROOT/e2e/phases/$phase.sh")"
   after="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
   [ "$before" = 9 ] && [ "$after" -lt 8 ] || fail 'next sweep still blocked by deliberate fixture holds'
   jq -e --arg run "$UUID" '[.holds[]|select(.run_id==$run)][0].state=="open"' "$SEQ_DIR/boundary-holds" >/dev/null \

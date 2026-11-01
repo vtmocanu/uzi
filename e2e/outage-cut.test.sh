@@ -2,6 +2,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PHASE="${OUTBOX_TEST_PHASE:-$ROOT/e2e/phases/52-api-outage-outbox.sh}"
+mkdir -p "$ROOT/.uzi/scratch/tmp"
+export TMPDIR="$ROOT/.uzi/scratch/tmp"
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 fixture() {
@@ -9,6 +11,9 @@ fixture() {
   RUNROOT="$SCRATCH" PROJECT=fixture COMPOSE=(fake_compose) OUTBOX_BASE_COMPOSE=(fake_compose) OUTBOX_RESTORE_NEEDED=0 RUN_B1=00000000-0000-0000-0000-000000000001
   API_AVAILABLE=1 API_PAUSED=0 ALIAS_AVAILABLE=0 REFUSE_API=0 REFUSE_ALIAS=0 REFUSE_REMOVE=0
   BARRIER_ARMED=0 BARRIER_RELEASED=0 FIXTURE_FINISHED=0 SLOW_HELPER=0
+  BARRIER_STAGE="cut"
+  # shellcheck disable=SC2034  # real extracted case releases consume these generations
+  GEN_B1=1 GEN_B2=1 GEN_B3=1 GEN_B4=1
   RESTORING=0 PROJECTION_FAIL=0
   # Host limiter fixture: records the bound it was given, then runs the command.
   timeout() { printf 'limit %s\n' "$1" >> "$SCRATCH/calls"; shift; "$@"; }
@@ -58,6 +63,13 @@ fixture() {
           return 0
         fi
         [ "${3:-}:${4:-}" = -u:10001:10001 ] || fail 'barrier writer must match worker uid for sticky tmp cleanup'
+        local release_run="${9:-}" release_stage="${10:-}" release_gen="${11:-}"
+        [ "$release_run" = "$RUN_B1" ] || fail 'release wrong run'
+        [ "$release_stage" = "$BARRIER_STAGE" ] || fail 'release wrong stage'
+        if [ "$release_stage" != cut ]; then
+          [ "$release_gen" = 1 ] || fail 'release wrong generation'
+        fi
+        [[ "${8:-}" == *'flag:"wx"'* ]] || fail 'release must be exclusive'
         BARRIER_RELEASED=1 ;;
     esac
   }
@@ -68,7 +80,16 @@ fixture() {
   wait_worker_online() { :; }
   set_interlock() { :; }
   make_outbox_run() {
-    case "${1:-}" in cut_barrier|first_cut_barrier) BARRIER_ARMED=1 ;; esac
+    case "${1:-}" in cut_barrier|first_cut_barrier|terminal|running-ack) BARRIER_ARMED=1 ;; esac
+    case "${1:-}" in terminal|running-ack) BARRIER_STAGE="$1";; *) BARRIER_STAGE="cut";; esac
+  }
+  rb_run_field() { echo 1; }
+  wait_fixture_worker_event() {
+    [ "$API_AVAILABLE" = 1 ] || fail 'stage readiness waited after API cut'
+  }
+  f42_settled_ready() { f42_durable_logged "$@"; }
+  f42_files_ready() {
+    [ "$BARRIER_RELEASED" = 1 ] || fail 'finalize file checked before barrier release'
   }
   wait_publication_retrying() { wait_terminal_lost "$@"; }
   wait_terminal_lost() {
@@ -311,7 +332,7 @@ rc=0
   configure_outbox_api_alias
   # shellcheck disable=SC2034  # evaluated real CASE 6 commands consume this id
   RUN_B4="$RUN_B1"
-  make_outbox_run cut_barrier
+  make_outbox_run running-ack
   eval "$(awk '/^wait_publication_retrying\(\) \{/,/^\}/' "$PHASE")"
   sleep() { SECONDS=$((SECONDS + 1)); }
   fail() {
@@ -380,9 +401,133 @@ done
   tick_count() { echo 3; }
   eval "$(awk '/^make_outbox_run\(\) \{/,/^\}/' "$PHASE")"
   make_outbox_run first_cut_barrier
-  jq -e '.description | contains("UZI_STUB_OUTBOX_FIRST_CUT_BARRIER") and (contains("UZI_STUB_OUTBOX_CUT_BARRIER") | not)' "$SCRATCH/issue.json" >/dev/null
+  jq -e '.description | contains("UZI_STUB_OUTBOX_FIRST_CUT_BARRIER") and contains("UZI_STUB_FIRST_PRE_ENROLLMENT_STOP") and (contains("UZI_STUB_PRE_ENROLLMENT_STOP") | not) and (contains("UZI_STUB_OUTBOX_CUT_BARRIER") | not)' "$SCRATCH/issue.json" >/dev/null
   make_outbox_run cut_barrier
-  jq -e '.description | contains("UZI_STUB_OUTBOX_CUT_BARRIER")' "$SCRATCH/issue.json" >/dev/null
+  jq -e '.description | contains("UZI_STUB_OUTBOX_CUT_BARRIER") and contains("UZI_STUB_PRE_ENROLLMENT_STOP") and (contains("UZI_STUB_FIRST_PRE_ENROLLMENT_STOP") | not)' "$SCRATCH/issue.json" >/dev/null
 )
 echo 'PASS: real issue producer arms first-claim and every-execution barriers distinctly'
-echo 'cases=24 passed=24'
+# Run exact production decoders and restart preconditions with synthetic worker logs.
+# No evaluated candidate payload: fake Compose interprets only fixed inspection commands.
+eval "$(awk '/^(fixture_event_ready|fixture_worker_log|fixture_worker_event_ready|wait_fixture_worker_event)\(\) \{/,/^\}/' "$ROOT/e2e/lib.sh")"
+settled_fixture() {
+  local variant="$1"
+  jq -nc --arg r "$RUN_B1" --arg v "$variant" '
+    [{msg:"finalize record durable",run_id:$r,claim_generation:1},
+     {msg:"stub: pre-enrollment retained stop",run_id:$r,claim_generation:1},
+     {msg:"stub: source-end ready",run_id:$r,claim_generation:1,sources:2}] |
+    if $v=="stale" then map(.claim_generation=2)
+    elif $v=="wrong-run" then map(.run_id="other")
+    elif $v=="missing" then []
+    elif $v=="partial" then .[:2]
+    elif $v=="warning" then .[2].msg="warning: stub: source-end ready"
+    elif $v=="zero" then .[2].sources=0
+    elif $v=="terminal-log" then .+[{msg:"outbox: terminal journaled write-ahead",run_id:$r,claim_generation:1}]
+    elif $v=="publication-log" then .+[{msg:"publication record durable",run_id:$r,claim_generation:1}]
+    else . end | .[]' > "$SCRATCH/settled.jsonl"
+}
+for variant in valid stale wrong-run missing partial warning zero terminal-log publication-log terminal-file publication-file no-finalize inspection-error log-error; do
+  (
+    fixture
+    eval "$(awk '/^(fixture_worker_log|fixture_worker_event_ready|wait_fixture_worker_event)\(\) \{/,/^\}/' "$ROOT/e2e/lib.sh")"
+    eval "$(awk '/^(f42_settled_ready|f42_files_ready|f42_restart_cycle|f42_cut_judge)\(\) \{/,/^\}/' "$PHASE")"
+    settled_fixture "$variant"
+    API_AVAILABLE=0
+    : > "$SCRATCH/restart-calls"
+    fake_compose() {
+      printf '%s\n' "$*" >> "$SCRATCH/restart-calls"
+      case "$1" in
+        logs)
+          [ "$variant" != log-error ] || return 1
+          cat "$SCRATCH/settled.jsonl"
+          echo '{"msg":"registered"}'
+          [ ! -f "$SCRATCH/restarted" ] || echo '{"msg":"registered"}'
+          ;;
+        exec)
+          # Verify the real inspection covers all three record families; inject its exit status.
+          [[ "${6:-}" == *'publication-'* && "${6:-}" == *'terminal-'* && "${6:-}" == *'finalize-'* ]] || return 1
+          case "$variant" in terminal-file|publication-file|no-finalize|inspection-error) return 1;; esac
+          ;;
+        kill)
+          [ "$variant" = valid ] || fail "unsafe kill: $variant"
+          : > "$SCRATCH/restarted"
+          ;;
+        start) :;;
+      esac
+    }
+    rm -f "$SCRATCH/restarted"
+    api_back() { API_AVAILABLE=1; }
+    say() { :; }
+    fail() {
+      [ "$API_AVAILABLE" = 1 ] || exit 2
+      echo "restored: $*" >&2
+      exit 9
+    }
+    rc=0
+    ( f42_restart_cycle "$RUN_B1" 1 2 0 ) > "$SCRATCH/restart-$variant.log" 2>&1 || rc=$?
+    if [ "$variant" = valid ]; then
+      [ "$rc" = 0 ] || { cat "$SCRATCH/restart-$variant.log"; exit 1; }
+      grep -F 'kill -s SIGKILL agent' "$SCRATCH/restart-calls" >/dev/null
+    else
+      [ "$rc" = 9 ] || { cat "$SCRATCH/restart-$variant.log"; exit 1; }
+      ! grep -F 'kill -s SIGKILL agent' "$SCRATCH/restart-calls" >/dev/null
+      grep -F 'restored:' "$SCRATCH/restart-$variant.log" >/dev/null
+    fi
+  )
+  echo "PASS: restart precondition $variant preserves readiness and restores before judging"
+done
+# Real issue producer must positively wait for its exact stage/run/generation while API is UP.
+for stage in terminal running-ack; do
+  for variant in valid stale missing wrong-stage; do
+    (
+      fixture
+      eval "$(awk '/^(fixture_worker_log|fixture_worker_event_ready|wait_fixture_worker_event)\(\) \{/,/^\}/' "$ROOT/e2e/lib.sh")"
+      eval "$(awk '/^make_outbox_run\(\) \{/,/^\}/' "$PHASE")"
+      # shellcheck disable=SC2034  # extracted producer consumes the repo identity
+      REPO_ID=fixture
+      apipost() { echo '{"card":{"iid":7}}'; }
+      create_run() { echo "$RUN_B1"; }
+      wait_custody_headroom() { :; }
+      wait_status() { :; }
+      tick_count() { echo 3; }
+      sleep() { SECONDS=$((SECONDS + 90)); }
+      fake_compose() {
+        [ "$API_AVAILABLE" = 1 ] || fail 'readiness observed after API cut'
+        [ "$variant" != missing ] || return 0
+        local gen=1 log_stage="$stage"
+        [ "$variant" != stale ] || gen=2
+        [ "$variant" != wrong-stage ] || log_stage=other
+        jq -nc --arg r "$RUN_B1" --arg stage "$log_stage" --argjson gen "$gen"           '{msg:"stub: fixture barrier ready",run_id:$r,claim_generation:$gen,stage:$stage}'
+      }
+      rc=0
+      ( make_outbox_run "$stage" ) > "$SCRATCH/producer-$stage-$variant.log" 2>&1 || rc=$?
+      if [ "$variant" = valid ]; then
+        [ "$rc" = 0 ] || { cat "$SCRATCH/producer-$stage-$variant.log"; exit 1; }
+      else
+        [ "$rc" != 0 ]
+        grep -F "no exact $stage readiness" "$SCRATCH/producer-$stage-$variant.log" >/dev/null
+      fi
+    )
+    echo "PASS: real producer $stage readiness $variant gates before outage"
+  done
+done
+# Real f42_cut timeout and release-failure paths restore before their caller judges.
+for variant in timeout release-error; do
+  (
+    fixture
+    configure_outbox_api_alias
+    f42_durable_logged() { return 1; }
+    f42_settled_ready() { return 1; }
+    sleep() { SECONDS=$((SECONDS + 90)); }
+    [ "$variant" != release-error ] || release_outbox_cut_barrier() { return 1; }
+    rc=0; f42_cut "$RUN_B1" 1 || rc=$?
+    [ "$rc" = 1 ]
+    api_back
+    [ "$API_AVAILABLE:$ALIAS_AVAILABLE" = 1:0 ]
+    eval "$(awk '/^f42_cut_judge\(\) \{/,/^\}/' "$PHASE")"
+    fail() { [ "$API_AVAILABLE" = 1 ] || exit 2; exit 9; }
+    result=0; ( f42_cut_judge "$rc" "$RUN_B1" 1 ) || result=$?
+    [ "$result" = 9 ]
+  )
+  echo "PASS: finalize $variant restores API before failure"
+done
+echo 'cases=48 passed=48'
