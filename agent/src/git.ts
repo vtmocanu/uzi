@@ -1611,6 +1611,15 @@ export interface RemediationRecovery {
   edges: Array<{ from: string; to: string; grant: RemediationGrant; context: string; phase: "prepared" | "committed" }>;
 }
 
+/** Negative evidence only; neither the data nor its fingerprint grants source use. */
+interface RemediationRestrictionFacts {
+  readonly enrolled: boolean;
+  readonly blocked: boolean;
+  readonly flaggedOIDs: readonly string[];
+  readonly roots: readonly string[];
+  readonly fingerprint: string;
+}
+
 function validRemediationBranch(branch: string): boolean {
   return !branch.startsWith("-") && branch !== "@" && !branch.includes("..") && !branch.includes("@{") &&
     !/[ ~^:?*[\\]/.test(branch) && branch.split("/").every(p => p.length > 0 && !p.startsWith(".") &&
@@ -7296,6 +7305,92 @@ export class GitCache {
     });
   }
 
+  /**
+   * Worker-only durable negative evidence. Caller holds source-use A before this bare lock B
+   * when selecting a live source. Held queries authenticate custody but never bind an attempt.
+   * One two-read pass, no retries or writes; any unavailable evidence holds by throwing.
+   * The fingerprint coordinates transient changes only, never eligibility or preservation.
+   */
+  async readRemediationRestrictionFacts(barePath: string, branch: string, exactRunId: string,
+    workerSelectedSource?: { runId: string; clonePath: string; attemptId: string },
+    durability: MemoryParkDurability = {}): Promise<RemediationRestrictionFacts> {
+    // A caller-owned options object cannot redirect the identity while waiting for B.
+    const source = workerSelectedSource && { runId: workerSelectedSource.runId,
+      clonePath: workerSelectedSource.clonePath, attemptId: workerSelectedSource.attemptId };
+    return this.withLock(barePath, () => this.remediationRestrictionFactsUnderLock(
+      barePath, branch, exactRunId, source, durability));
+  }
+
+  /** Shared by worker callbacks that already own B; never reacquire B here. */
+  private async remediationRestrictionFactsUnderLock(barePath: string, branch: string, exactRunId: string,
+    workerSelectedSource?: { runId: string; clonePath: string; attemptId: string },
+    durability: MemoryParkDurability = {}): Promise<RemediationRestrictionFacts> {
+    try {
+      if (!OWED_RUN_ID.test(exactRunId) || Buffer.byteLength(exactRunId) > 128 ||
+          sanitizeForLog(exactRunId, Infinity) !== exactRunId || !validRemediationBranch(branch) ||
+          Buffer.byteLength(branch) > 1024 || sanitizeForLog(branch, Infinity) !== branch)
+        throw new Error("invalid restriction identity");
+      if (workerSelectedSource && workerSelectedSource.runId !== exactRunId)
+        throw new Error("restriction source run mismatch");
+      const read = async () => {
+        await this.assertRecoveryBare(barePath);
+        // Unlike the legacy last-value reader, negative absence cannot ignore duplicates.
+        const entries = (await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
+        const key = recoveryCaptureKey(branch);
+        const activeEntries = entries.filter(e => e === key || e.startsWith(key + "\n"));
+        if (activeEntries.length > 1 || activeEntries.some(e => !e.startsWith(key + "\n")))
+          throw new Error("ambiguous restriction journal");
+        const activeRaw = activeEntries[0]?.slice(key.length + 1) || undefined;
+        const active = activeRaw === undefined ? undefined : parseRecoveryJournal(activeRaw);
+        if (active && recoveryJournalJson(active) !== activeRaw) throw new Error("noncanonical restriction journal");
+        if (workerSelectedSource) {
+          const authenticated = await this.remediationSourceUnderLock(barePath, branch, workerSelectedSource);
+          if (authenticated.raw !== activeRaw) throw new Error("restriction source changed");
+        }
+        const protectedRaw: string[] = [];
+        const protectedRecords = await this.protectedRecoveries(barePath, exactRunId, raw => protectedRaw.push(raw));
+        if (protectedRecords.some(r => r.branch !== branch)) throw new Error("restriction custody branch mismatch");
+        const relevant = active?.runId === exactRunId ? [active] : [];
+        for (const journal of relevant) {
+          const shape = parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot));
+          const sourceKey = shape?.key ?? path.basename(journal.clonePath);
+          await this.attributedRecovery(barePath, branch, sourceKey, journal, journal);
+        }
+        relevant.push(...protectedRecords.map(r => r.journal));
+        if (relevant.some(j => j.remediationRecovery && j.remediationRecovery.branch !== branch))
+          throw new Error("restriction record branch mismatch");
+        return { activeRaw, protectedRaw, relevant };
+      };
+      const first = await read();
+      await this.syncJournalAndReadBack(barePath, branch, first.activeRaw, durability);
+      const second = await read();
+      if (first.activeRaw !== second.activeRaw ||
+          JSON.stringify(first.protectedRaw) !== JSON.stringify(second.protectedRaw))
+        throw new Error("restriction read-back differs");
+      const records = second.relevant.flatMap(j => j.remediationRecovery ? [j.remediationRecovery] : []);
+      const flaggedOIDs = [...new Set(records.flatMap(r => r.flaggedOIDs))].sort();
+      const roots = [...new Set(records.flatMap(r =>
+        [...r.flaggedOIDs, ...r.edges.map(e => e.from), ...(r.excludedRoots ?? [])]))].sort();
+      // The ephemeral union must fit the existing representational bounds too.
+      // Each stored record already passed its 64 KiB bound. Two identical active
+      // and protected copies must not invent a smaller per-record limit.
+      if (flaggedOIDs.length > 64 || roots.length > 1524)
+        throw new Error("restriction union overflow");
+      const fingerprint = createHash("sha256").update(JSON.stringify({
+        runId: exactRunId, branch, source: workerSelectedSource ? { runId: workerSelectedSource.runId,
+          clonePath: workerSelectedSource.clonePath, attemptId: workerSelectedSource.attemptId } : null,
+        journals: second.relevant.map(recoveryJournalJson),
+      })).digest("hex");
+      return Object.freeze({ enrolled: records.length > 0,
+        blocked: records.some(r => r.blocked !== false || r.excludedRoots === undefined ||
+          r.edges.some(e => e.phase !== "committed")),
+        flaggedOIDs: Object.freeze(flaggedOIDs), roots: Object.freeze(roots), fingerprint });
+    } catch {
+      // No raw journal, diagnostic, subject or arbitrary path escapes this boundary.
+      throw new Error("remediation restriction facts unavailable");
+    }
+  }
+
   async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string, attemptId?: string,
     peeledMarker?: string): Promise<void> {
     if (peeledMarker !== undefined && !SHA40_RE.test(peeledMarker)) throw new Error("invalid peeled marker");
@@ -7420,7 +7515,7 @@ export class GitCache {
   }
 
   /** fsync `<bare>/config`, fsync the bare directory, then require the journal's raw value to read back as exactly `want`. */
-  private async syncJournalAndReadBack(barePath: string, branch: string, want: string, opts: MemoryParkDurability): Promise<void> {
+  private async syncJournalAndReadBack(barePath: string, branch: string, want: string | undefined, opts: MemoryParkDurability): Promise<void> {
     const sync = opts.sync ?? (async (h: { sync(): Promise<void> }) => { await h.sync(); });
     const config = await fs.open(path.join(barePath, "config"), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     try { await sync(config, "config"); } finally { await config.close(); }
@@ -7813,8 +7908,13 @@ export class GitCache {
     return sources.filter((s, i) => sources.findIndex(p => sameRecoverySource(p, s)) === i);
   }
 
-  /** Protected records are custody evidence only, never seed/adoption authority. */
-  private async protectedRecoveries(barePath: string, selectedRunId?: string): Promise<Array<{ branch: string; key: string; journal: RecoveryJournalEntry }>> {
+  /** Protected records are custody evidence only, never seed/adoption authority.
+   * Only the negative query supplies negativeSnapshot: it confirms whole canonical bytes
+   * and unions independently attributed restrictions despite differing active snapshots.
+   * All existing callers retain the strict active/protected conflict check and return shape.
+   */
+  private async protectedRecoveries(barePath: string, selectedRunId?: string,
+    negativeSnapshot?: (raw: string) => void): Promise<Array<{ branch: string; key: string; journal: RecoveryJournalEntry }>> {
     await this.assertRecoveryBare(barePath);
     const records: Array<{ branch: string; key: string; journal: RecoveryJournalEntry }> = [];
     const seen = new Set<string>();
@@ -7836,8 +7936,13 @@ export class GitCache {
       await this.runGit(barePath, ["check-ref-format", "--branch", record.branch]);
       await this.attributedRecovery(barePath, record.branch, record.key, journal, journal);
       const active = await this.readRecoveryCapture(barePath, record.branch);
-      if (active?.runId === journal.runId && JSON.stringify(active) !== JSON.stringify(journal)) {
+      if (!negativeSnapshot && active?.runId === journal.runId && JSON.stringify(active) !== JSON.stringify(journal)) {
         throw new Error("conflicting active and protected recovery descriptor");
+      }
+      if (negativeSnapshot) {
+        const canonical = JSON.stringify({ version: 1, branch: record.branch, key: record.key, journal });
+        if (canonical !== item.slice(nl + 1)) throw new Error("noncanonical protected recovery descriptor");
+        negativeSnapshot(canonical);
       }
       records.push({ branch: record.branch, key: record.key, journal });
     }
