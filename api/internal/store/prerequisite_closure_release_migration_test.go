@@ -13,9 +13,9 @@ const closureGuardEnd = "-- +goose StatementEnd"
 // closureReleaseMigration is the landed goose version of the C2 release migration;
 // a landing renumber edits only this block.
 const (
-	closureReleaseMigration     = 391
+	closureReleaseMigration     = 393
 	closureReleasePrevMigration = closureReleaseMigration - 1
-	closureReleaseMigrationFile = "00391_prerequisite_closure_release.sql"
+	closureReleaseMigrationFile = "00393_prerequisite_closure_release.sql"
 )
 
 func closureMigrationText(t *testing.T, name string) string {
