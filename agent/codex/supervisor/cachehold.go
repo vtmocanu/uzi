@@ -21,7 +21,8 @@ const maxReleaseLine = 4096
 
 // Exit codes of the cache modes.
 const (
-	cacheExitRemoved  = 0
+	cacheExitComplete = 0 // also a removal that finished (cacheExitRemoved)
+	cacheExitRemoved  = cacheExitComplete
 	cacheExitSetup    = 2
 	cacheExitRetained = 3
 )

@@ -236,11 +236,11 @@ describe("what the image ships", () => {
     assert.equal(str("DEFAULT_DATA_DIR"), "/data", "the client default matches config.ts UZI_DATA_DIR");
   });
 
-  it("both image templates still copy agent/src into /app and run node:24", () => {
+  it("both image templates still copy agent/src into /app and run node:26", () => {
     for (const tpl of ["base", "jvm"]) {
       const dockerfile = fs.readFileSync(path.join(AGENT_DIR, "templates", tpl, "Dockerfile"), "utf8");
       assert.match(dockerfile, /^COPY agent\/src \.\/src$/m, `${tpl}: COPY agent/src ./src`);
-      assert.match(dockerfile, /^FROM node:24-alpine@sha256:[0-9a-f]{64} AS runtime$/m, `${tpl}: node:24 runtime`);
+      assert.match(dockerfile, /^FROM node:26-alpine@sha256:[0-9a-f]{64} AS runtime$/m, `${tpl}: node:26 runtime`);
     }
   });
 });

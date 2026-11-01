@@ -53,12 +53,13 @@ func TestClassifyStatuses(t *testing.T) {
 	noReading.SyncedAt = nil
 	noReading.FiveHourPct, noReading.SevenDayPct = nil, nil
 
-	// A row exists but only ONE window was measured. D12: a reading that cannot
+	// A row exists but the 7-day window was not measured. D12: a reading that cannot
 	// produce a headroom number is excluded rather than defaulted to some
 	// assumed-full value, which would make an unmeasured token look like the
-	// emptiest one in the pool and win every ranking.
+	// emptiest one in the pool and win every ranking. (A NULL 5-hour pct alone is
+	// measured; see TestClassifySevenDayOnly.)
 	halfMeasured := pooled()
-	halfMeasured.FiveHourPct = nil
+	halfMeasured.SevenDayPct = nil
 
 	stale := pooled()
 	stale.SyncedAt = at(-time.Hour)
@@ -252,5 +253,29 @@ func TestPackageImportsStayPure(t *testing.T) {
 					"move the impure part into the caller (workersvc) instead.", name, path)
 			}
 		}
+	}
+}
+
+// An account without a 5-hour window reports only the 7-day one (Anthropic removed
+// the 5-hour limit for some plans). A NULL five-hour pct with a set seven-day pct is
+// MEASURED: headroom is the 7-day headroom and the 7-day reset is the binding one.
+// A NULL seven-day pct stays unmeasured.
+func TestClassifySevenDayOnly(t *testing.T) {
+	c := pooled()
+	c.FiveHourPct, c.FiveResetsAt = nil, nil
+	c.SevenDayPct = i16(30)
+	got := Classify(c, testPolicy(), now)
+	if got.Status != StatusEligible || !got.Measured || got.Headroom != 70 {
+		t.Fatalf("got %+v, want eligible, measured, headroom 70", got)
+	}
+	r, ok := BindingWindowReset(c)
+	if !ok || !r.Equal(*c.SevenResetsAt) {
+		t.Fatalf("binding reset = %v,%v, want the 7-day reset", r, ok)
+	}
+
+	noSeven := pooled()
+	noSeven.SevenDayPct = nil
+	if got := Classify(noSeven, testPolicy(), now); got.Status != StatusUnmeasured {
+		t.Fatalf("NULL 7-day status = %q, want unmeasured", got.Status)
 	}
 }

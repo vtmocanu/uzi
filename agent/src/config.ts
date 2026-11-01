@@ -260,6 +260,13 @@ export interface Config {
    */
   codexCommandSandbox: CommandSandboxMode;
   /**
+   * Issue #3675: the measured size (bytes) at which a run's Codex command cache is
+   * rotated to a fresh generation (UZI_CODEX_COMMAND_CACHE_RUN_BYTES). Parsed strictly;
+   * unset/empty defaults to 4 GiB and `0` disables measurement and rotation. No command
+   * is ever refused for cache size.
+   */
+  codexCommandCacheRunBytes: number;
+  /**
    * PRD #1493 M3: the resolved honest-advertisement decision for `codex_harness_v1`.
    * Like {@link codexProbe}/{@link dockerWiring}, `loadConfig` leaves it a
    * not-advertising default; main.ts resolves it ONCE at startup by combining the
@@ -484,6 +491,25 @@ function parseCommandSandbox(v: string | undefined): CommandSandboxMode {
   throw new Error(`invalid UZI_CODEX_COMMAND_SANDBOX ${JSON.stringify(v)} (expected "off", "required" or "best-effort")`);
 }
 
+/** Default per-run command-cache rotation threshold (4 GiB). */
+const DEFAULT_CODEX_COMMAND_CACHE_RUN_BYTES = 4294967296;
+
+/**
+ * Strict parse of UZI_CODEX_COMMAND_CACHE_RUN_BYTES: trimmed; unset/empty is the 4 GiB
+ * default; otherwise a plain non-negative decimal safe integer (`0` disables). Anything
+ * else (sign, fraction, unit suffix, hex, leading zero, past MAX_SAFE_INTEGER) THROWS so a
+ * fat-fingered budget refuses to start rather than silently changing rotation.
+ */
+function parseCacheRunBytes(v: string | undefined): number {
+  const s = v?.trim();
+  if (s === undefined || s === "") return DEFAULT_CODEX_COMMAND_CACHE_RUN_BYTES;
+  if (/^(0|[1-9][0-9]*)$/.test(s)) {
+    const n = Number(s);
+    if (Number.isSafeInteger(n)) return n;
+  }
+  throw new Error(`invalid UZI_CODEX_COMMAND_CACHE_RUN_BYTES ${JSON.stringify(v)} (expected a non-negative integer byte count; 0 disables)`);
+}
+
 function parseBool(v: string | undefined): boolean {
   const s = v?.trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes";
@@ -652,6 +678,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // PRD #1493 M3: the command-sandbox mode, strict-parsed (unknown value throws
     // and refuses to start). Default `off`: Landlock is never applied.
     codexCommandSandbox: parseCommandSandbox(env.UZI_CODEX_COMMAND_SANDBOX),
+    codexCommandCacheRunBytes: parseCacheRunBytes(env.UZI_CODEX_COMMAND_CACHE_RUN_BYTES),
     // Populated by main.ts after the async receipt + Landlock probes; the sync parse
     // cannot probe, so the default is "do not advertise" until startup resolves it.
     codexHarness: { advertise: false, degraded: false, landlock: "probe-failed" },

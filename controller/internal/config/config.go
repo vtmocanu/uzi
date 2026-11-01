@@ -5,6 +5,7 @@ package config
 
 import (
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // workerMaxConcurrentRunsCeiling is the sanity ceiling for UZI_WORKER_MAX_CONCURRENT_RUNS.
@@ -34,6 +36,10 @@ const (
 	commandSandboxRequired   = "required"
 	commandSandboxBestEffort = "best-effort"
 )
+
+// maxSafeJSInteger is Number.MAX_SAFE_INTEGER (2^53-1): the worker parses
+// UZI_CODEX_COMMAND_CACHE_RUN_BYTES as a JS number, so a larger value would lose precision.
+const maxSafeJSInteger uint64 = 9007199254740991
 
 // Config holds the controller's runtime settings.
 type Config struct {
@@ -119,6 +125,12 @@ type Config struct {
 	// workers.priorityClass.enabled, naming the cluster-scoped PriorityClass the chart
 	// creates (issue #1341).
 	WorkerPriorityClassName string
+	// WorkerNodeSelector is the nodeSelector rendered onto every worker pod, all three
+	// tiers (UZI_WORKER_NODE_SELECTOR, a JSON object of label key -> value). Unset,
+	// empty, "null" or "{}" means no nodeSelector. The chart defaults it to
+	// kubernetes.io/arch=amd64, because the published agent images are amd64 only and
+	// would crash-loop on an arm64 node of a mixed-arch cluster.
+	WorkerNodeSelector map[string]string
 	// WorkerEphemeralRequest overrides the WORKER container's
 	// requests.ephemeral-storage for a PLAIN worker (issue #224 M-b;
 	// UZI_WORKER_EPHEMERAL_REQUEST). Empty ⇒ the render side's built-in 512Mi.
@@ -201,6 +213,13 @@ type Config struct {
 	// default install's pod stays byte-identical and a worker image older than the "off"
 	// mode never receives a value it would refuse to boot on.
 	WorkerCommandSandbox string
+	// WorkerCommandCacheRunBytes is the per-run Codex command-cache byte budget
+	// (UZI_CODEX_COMMAND_CACHE_RUN_BYTES), kept as the validated plain-decimal string. Empty
+	// means unset: the worker applies its own default (4 GiB); "0" disables live rotation. A
+	// set value must be a plain non-negative decimal no larger than 9007199254740991 (the
+	// worker parses it as a JS safe integer); anything else is a BOOT error. Rendered onto the
+	// worker container only when non-empty, so a default install's pod stays byte-identical.
+	WorkerCommandCacheRunBytes string
 
 	// --- drain policy (PRD #422 M5) -------------------------------------------
 	// DrainDeadline bounds busy deferral for independent NONDRIFTED pressure/nix-size
@@ -465,6 +484,11 @@ func loadWorkerSettings(cfg *Config) error {
 	}
 	cfg.WorkerStorageClass = strings.TrimSpace(os.Getenv("UZI_WORKER_STORAGE_CLASS"))
 	cfg.WorkerPriorityClassName = strings.TrimSpace(os.Getenv("UZI_WORKER_PRIORITY_CLASS_NAME"))
+	sel, err := parseNodeSelector(os.Getenv("UZI_WORKER_NODE_SELECTOR"))
+	if err != nil {
+		return err
+	}
+	cfg.WorkerNodeSelector = sel
 
 	// The per-worker slot cap (UZI_WORKER_MAX_CONCURRENT_RUNS). Default 1 (empty/unset),
 	// operator-configurable in [1, workerMaxConcurrentRunsCeiling]. A non-integer or an
@@ -567,6 +591,16 @@ func loadWorkerSettings(cfg *Config) error {
 			return fmt.Errorf("UZI_CODEX_COMMAND_SANDBOX=%q is not a recognized mode (want %q, %q or %q)",
 				raw, commandSandboxOff, commandSandboxRequired, commandSandboxBestEffort)
 		}
+	}
+
+	// The per-run Codex command-cache byte budget: unset stays "" (worker default); a set
+	// value must be a plain decimal within the JS safe-integer range, else a BOOT error.
+	if raw := strings.TrimSpace(os.Getenv("UZI_CODEX_COMMAND_CACHE_RUN_BYTES")); raw != "" {
+		n, perr := strconv.ParseUint(raw, 10, 64)
+		if perr != nil || n > maxSafeJSInteger || (len(raw) > 1 && raw[0] == '0') {
+			return fmt.Errorf("UZI_CODEX_COMMAND_CACHE_RUN_BYTES=%q is not a plain decimal byte count between 0 and %d", raw, maxSafeJSInteger)
+		}
+		cfg.WorkerCommandCacheRunBytes = raw
 	}
 
 	// The docker tier (PRD #83 M3): namespace + sidecar image, both or neither. No
@@ -738,6 +772,40 @@ func validateDockerTier(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// parseNodeSelector reads UZI_WORKER_NODE_SELECTOR. Every key must be a valid label
+// key and every value a valid label value, checked here at boot: the API server would
+// accept neither on a Deployment, so a bad selector would otherwise surface only as
+// workers that never appear. A top-level null means no selector, but a null MEMBER is
+// refused: decoded into a plain string it would become "", a valid label value, and
+// every worker would then require an empty label and stay Pending.
+func parseNodeSelector(raw string) (map[string]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" {
+		return nil, nil
+	}
+	var members map[string]*string
+	if err := json.Unmarshal([]byte(raw), &members); err != nil {
+		return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR=%q is not a JSON object of label key to string value: %w", raw, err)
+	}
+	sel := make(map[string]string, len(members))
+	for k, v := range members {
+		if v == nil {
+			return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR: key %q has a null value; give it a string value or remove the key", k)
+		}
+		if errs := validation.IsQualifiedName(k); len(errs) > 0 {
+			return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR: key %q is not a valid label key: %s", k, strings.Join(errs, "; "))
+		}
+		if errs := validation.IsValidLabelValue(*v); len(errs) > 0 {
+			return nil, fmt.Errorf("UZI_WORKER_NODE_SELECTOR: value %q for key %q is not a valid label value: %s", *v, k, strings.Join(errs, "; "))
+		}
+		sel[k] = *v
+	}
+	if len(sel) == 0 {
+		return nil, nil
+	}
+	return sel, nil
 }
 
 // parseQuantityEnv reads an optional k8s-quantity env var into dst, leaving dst

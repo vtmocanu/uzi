@@ -405,7 +405,7 @@ describe("the real procfs (issue #2213)", { skip: process.platform !== "linux" ?
         registry: new LiveAttemptRegistry(),
       });
       const named = out.process?.processes.find((p) => p.pid === pid);
-      assert.equal(named?.reason, "unreadable_unattributed", out.process?.detail);
+      assert.equal(named?.reason, "unreadable_unattributed", out.process?.detail ?? "no process detail reported");
       assert.deepEqual(out.process?.killed, [], "nothing was signalled");
       const rr = runnerWith(neverStarts({ started: 0 }), fakeGitlab().gitlab);
       await assert.rejects(rr.checkWorkerResidueBeforeFetch("22180000-0000-4000-8000-000000000000", "pre_clone"), RunResidueBlockedError);

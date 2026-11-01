@@ -61,7 +61,7 @@ jobs:
       # installs nothing), so this guard needs the node RUNTIME but no node_modules.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
         with:
-          node-version: "24"
+          node-version: "26"
       - uses: ./.github/actions/setup-task
       # No `npm ci`: check-docs has no third-party deps (its own comment in ci.yml
       # says so), so installing web/node_modules here was ~15-30s of pure waste on

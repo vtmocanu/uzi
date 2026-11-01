@@ -131,6 +131,7 @@ func helpLines(v tuiView) []string {
 			"tab / shift+tab  floor · workers · pulls · ci",
 			"1 / 2 / 3 / 4  floor / workers / pulls / ci",
 			"R          cycle the scoped repo (when several are enabled)",
+			"elapsed / took  run time so far / in total · age  since the run was triggered",
 		}, common...)
 	case viewPR:
 		return append([]string{
@@ -153,6 +154,7 @@ func helpLines(v tuiView) []string {
 			"a          toggle the factory-wide admin board (needs a uza_ token)",
 			"h          hide finished runs; keep active and needs-you",
 			"p          floor: highest progress first; again restores the default order",
+			"done rows  ended = how long ago it finished · took = first start to finish",
 			"cost       API-equivalent estimate",
 			"+ after 7d cost means the estimate is incomplete",
 			"           runs without estimates: tokens only",

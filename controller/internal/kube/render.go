@@ -538,6 +538,11 @@ type RenderConfig struct {
 	// identically to before this field existed — a disabled install does not re-hash or
 	// roll its workers.
 	PriorityClassName string
+	// NodeSelector is rendered onto every worker pod, all three tiers, alongside (never
+	// instead of) the docker tier's soft anti-affinity. Nil renders no nodeSelector
+	// (json omitempty), so an install that clears it hashes exactly as before this
+	// field existed. Changing it re-hashes the template and rolls every worker.
+	NodeSelector map[string]string
 	// MaxConcurrentRuns is the per-worker slot cap rendered into the pod's
 	// WORKER_MAX_CONCURRENT_RUNS. Zero (a RenderConfig{} built in a test, or a caller
 	// that never set it) renders "1", so the default stays 1 everywhere; see config.go,
@@ -580,6 +585,11 @@ type RenderConfig struct {
 	// predates "off" never receives it (that image keeps its own "required" default). Worker container
 	// only — the mode never comes off the wire and never touches the seed/dind containers.
 	CommandSandbox string
+	// CommandCacheRunBytes is the per-run Codex command-cache byte budget as a validated
+	// plain-decimal string. Rendered onto the worker container as
+	// UZI_CODEX_COMMAND_CACHE_RUN_BYTES ONLY when non-empty; empty emits no env key, so a
+	// default install's pod stays byte-identical.
+	CommandCacheRunBytes string
 	// SecretMountPath is where the worker's join-token Secret (worker_token + ca.crt)
 	// mounts, and so what UZI_WORKER_TOKEN_FILE and NODE_EXTRA_CA_CERTS point at (issue
 	// #1761). Empty means defaultSecretMountPath (/run/secrets), and then the rendered
@@ -1166,6 +1176,9 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	if mode != "off" {
 		env = append(env, corev1.EnvVar{Name: "UZI_CODEX_COMMAND_SANDBOX", Value: mode})
 	}
+	if cfg.CommandCacheRunBytes != "" {
+		env = append(env, corev1.EnvVar{Name: "UZI_CODEX_COMMAND_CACHE_RUN_BYTES", Value: cfg.CommandCacheRunBytes})
+	}
 
 	containerSecurity := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: &allowPrivilegeEscalation,
@@ -1433,6 +1446,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		Spec: corev1.PodSpec{
 			ServiceAccountName:           cfg.ServiceAccountName,
 			PriorityClassName:            cfg.PriorityClassName,
+			NodeSelector:                 cfg.NodeSelector,
 			AutomountServiceAccountToken: &automount,
 			// Soft anti-affinity for docker workers ONLY (nil for a plain worker, so its
 			// spec/hash is untouched). Keeps the pod off nodes running the crown-jewel

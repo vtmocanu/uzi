@@ -398,6 +398,12 @@ describe("runner.ts: which sites use the cleanup wait", () => {
     const classification = starts("authority.classifySourceAdmission(").map(statement);
     assert.equal(classification.length, 1);
     assert.ok(classification[0]!.includes("this.authorityWait(flight)"), "memory classification uses the flight lifecycle wait");
-    assert.equal(starts("this.authorityWait(").length, 5, "no other authorityWait caller");
+    // issue #3645: the terminal-owner handoff computes ONE wait for the claimant's coordinator call; it reaches A only
+    // through RecoveryCoordinator.retireCompletedSourceForHandoff, which takes it as the bound of its withTransaction.
+    const handoff = starts("const wait = this.authorityWait(").map(statement);
+    assert.equal(handoff.length, 1);
+    assert.ok(handoff[0]!.includes("this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)"), "handoff uses authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)");
+    assert.ok(source.slice(source.indexOf("const wait = this.authorityWait(")).includes("this.recovery.retireCompletedSourceForHandoff({"));
+    assert.equal(starts("this.authorityWait(").length, 6, "no other authorityWait caller");
   });
 });

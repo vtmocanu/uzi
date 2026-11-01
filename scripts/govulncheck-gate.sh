@@ -153,15 +153,16 @@ case "$effective_goflags" in
 esac
 
 # 🔴 THE ANALYSIS IS PINNED TO THE IMAGE'S BUILD CONFIGURATION --
-# `CGO_ENABLED=0 GOOS=linux GOARCH=amd64` -- ON THE govulncheck RUN BELOW, NOT
-# ON THE HOST. This gate's predicate is "is a vulnerable function reachable from
-# SHIPPED code", so it must scan the file set the images ship, not the file set
-# the invoking machine's platform defaults happen to select. The shipped values
-# come straight from the Dockerfiles: `api/Dockerfile:50` and
-# `controller/Dockerfile:19` both read `RUN CGO_ENABLED=0 GOOS=linux go build`,
-# and the published images are linux/amd64 only (`.github/workflows/release.yml`,
-# "platforms: linux/amd64 -- amd64-only for now"). amd64-only is sufficient today
-# because there is exactly one published platform; add axes here if that changes.
+# `CGO_ENABLED=0 GOOS=linux GOARCH=<each published arch>` -- ON THE govulncheck
+# RUNS BELOW, NOT ON THE HOST. This gate's predicate is "is a vulnerable function
+# reachable from SHIPPED code", so it must scan the file set the images ship, not
+# the file set the invoking machine's platform defaults happen to select. The
+# shipped values come straight from the Dockerfiles: api/Dockerfile and
+# controller/Dockerfile both read `RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH}
+# go build`, and release.yml publishes them for `linux/amd64,linux/arm64`. One run
+# per published arch: build constraints can select a different file set per GOARCH,
+# so a clean amd64 analysis says nothing about the arm64 binary. Keep GOARCHES equal
+# to the publish-api/publish-controller `platforms:`.
 #
 # WHY THE PIN IS ON THE RUN AND NOT THE INSTALL. The govulncheck binary itself
 # must be host-native -- it runs on this machine, it only ANALYSES the target
@@ -256,44 +257,51 @@ fi
 # thing that becomes a red the day somebody writes a call to it, so a count is not
 # enough to act on. It is a DISPLAY flag: it cannot change the verdict, and the
 # rc 0/3/* mapping below is untouched by it.
-rc=0
-(cd "$MODULE_DIR" && GOTOOLCHAIN="$selected_go_version" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-  "$TMP/bin/govulncheck" -test=false -show verbose ./...) \
-  >"$TMP/out" 2>"$TMP/err" || rc=$?
+#
+# One run per published arch (see the pin note above). A finding or instrument
+# failure on any arch stops the gate there; clean means clean on every arch.
+GOARCHES="amd64 arm64"
+for goarch in $GOARCHES; do
+  rc=0
+  (cd "$MODULE_DIR" && GOTOOLCHAIN="$selected_go_version" CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
+    "$TMP/bin/govulncheck" -test=false -show verbose ./...) \
+    >"$TMP/out" 2>"$TMP/err" || rc=$?
 
-case "$rc" in
-  0)
-    # Print the report even when clean: with `-show verbose` above it NAMES the
-    # residual UNCALLED vulnerabilities, and there is no other place they surface.
-    # (Before that flag was added this comment claimed the same thing and was
-    # false -- the report gave a count. Fixed on both sides rather than by
-    # softening the sentence, because the count alone is not actionable.)
-    cat "$TMP/out"
-    # Written as an `if` and not `[ -s ... ] && cat`, for the reason
-    # scripts/deadcode-gate.sh records at the same spot: that idiom's status is
-    # the TEST's when the file is empty, which is the common case here, and it is
-    # a coin-flip against errexit.
-    if [ -s "$TMP/err" ]; then cat "$TMP/err" >&2; fi
-    echo "govulncheck-gate: $MODULE_DIR clean (0 called vulnerabilities)"
-    exit 0
-    ;;
-  3)
-    cat "$TMP/out"
-    if [ -s "$TMP/err" ]; then cat "$TMP/err" >&2; fi
-    echo "govulncheck-gate: $MODULE_DIR has CALLED vulnerabilities (govulncheck exit 3 -> gate exit 1)." >&2
-    echo "  The fix is a dependency BUMP, in this MR. There is no suppression" >&2
-    echo "  mechanism -- govulncheck has no baseline, allowlist or ignore file." >&2
-    echo "  If a fix genuinely does not exist upstream yet, that is a decision for" >&2
-    echo "  the user, not a flag: say so on the MR." >&2
-    exit 1
-    ;;
-  *)
-    cat "$TMP/out"
-    cat "$TMP/err" >&2
-    echo "govulncheck-gate: $TOOL exited $rc over $MODULE_DIR -- INSTRUMENT FAILURE, NOT FINDINGS." >&2
-    echo "  govulncheck uses 3 for findings, 2 for a usage error and 1 for everything" >&2
-    echo "  else, including an unreachable vulnerability database and a module that" >&2
-    echo "  does not compile. Do not read this as a security result." >&2
-    exit 2
-    ;;
-esac
+  case "$rc" in
+    0)
+      # Print the report even when clean: with `-show verbose` above it NAMES the
+      # residual UNCALLED vulnerabilities, and there is no other place they surface.
+      # (Before that flag was added this comment claimed the same thing and was
+      # false -- the report gave a count. Fixed on both sides rather than by
+      # softening the sentence, because the count alone is not actionable.)
+      cat "$TMP/out"
+      # Written as an `if` and not `[ -s ... ] && cat`, for the reason
+      # scripts/deadcode-gate.sh records at the same spot: that idiom's status is
+      # the TEST's when the file is empty, which is the common case here, and it is
+      # a coin-flip against errexit.
+      if [ -s "$TMP/err" ]; then cat "$TMP/err" >&2; fi
+      echo "govulncheck-gate: $MODULE_DIR linux/$goarch clean (0 called vulnerabilities)"
+      ;;
+    3)
+      cat "$TMP/out"
+      if [ -s "$TMP/err" ]; then cat "$TMP/err" >&2; fi
+      echo "govulncheck-gate: $MODULE_DIR linux/$goarch has CALLED vulnerabilities (govulncheck exit 3 -> gate exit 1)." >&2
+      echo "  The fix is a dependency BUMP, in this MR. There is no suppression" >&2
+      echo "  mechanism -- govulncheck has no baseline, allowlist or ignore file." >&2
+      echo "  If a fix genuinely does not exist upstream yet, that is a decision for" >&2
+      echo "  the user, not a flag: say so on the MR." >&2
+      exit 1
+      ;;
+    *)
+      cat "$TMP/out"
+      cat "$TMP/err" >&2
+      echo "govulncheck-gate: $TOOL exited $rc over $MODULE_DIR linux/$goarch -- INSTRUMENT FAILURE, NOT FINDINGS." >&2
+      echo "  govulncheck uses 3 for findings, 2 for a usage error and 1 for everything" >&2
+      echo "  else, including an unreachable vulnerability database and a module that" >&2
+      echo "  does not compile. Do not read this as a security result." >&2
+      exit 2
+      ;;
+  esac
+done
+echo "govulncheck-gate: $MODULE_DIR clean on every published arch ($GOARCHES)"
+exit 0

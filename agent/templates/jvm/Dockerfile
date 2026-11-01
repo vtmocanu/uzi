@@ -8,7 +8,7 @@
 # of truth for the common layers; keep this in lockstep with it (a test pins the
 # devbox install + DEVBOX_VERSION match), and never drop a guardrail-relevant layer
 # to add a dependency.
-FROM node:24-alpine@sha256:e67514e5d0f6c46656005e1b693b2ec9d52e80b641307de684d4a015ba7a4eaf AS runtime
+FROM node:26-alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797 AS runtime
 WORKDIR /app
 
 # git for clone/fetch/worktree; bash for the SDK Bash tool; tini as PID 1; curl +
@@ -185,6 +185,11 @@ RUN SQLC_PIN="$(awk -F '"' '/^SQLC_LINUX_AMD64_VERSION=/{print $2}' /tmp/worker-
 # the worker itself. MIRRORED from templates/base (jvm is NOT `FROM base`) — keep in lockstep.
 RUN GOFLAGS=-buildvcs=false GOBIN=/usr/local/bin go install github.com/zricethezav/gitleaks/v8@v8.30.1 && gitleaks version
 
+# Yarn Classic 1.22.22 for yarn.lock repos (node:26-alpine ships no yarn). MIRRORED from
+# templates/base, which explains the pin and the build-time version assertion.
+RUN n=0; until npm install --global --ignore-scripts yarn@1.22.22; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "yarn install: giving up after $n attempts" >&2; exit 1; }; echo "yarn install failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
+ && test "$(yarn --version)" = 1.22.22
+
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.
 # The build context is the REPO ROOT (PRD #39 Decision 5), so the worker's own
@@ -310,7 +315,7 @@ RUN chmod -R a+rX /nix \
 # verifies its SHA256 fail-closed and rejects a missing member, a mismatched manifest field
 # or an unsupported arch BEFORE installing. assert-codex.sh is the build-time runner-uid
 # guard: it execs `codex --version` as the cap-less `runner` uid (setpriv --reuid runner,
-# fresh throwaway HOME, replaced env, bounded timeout), asserting EXACTLY `codex-cli 0.163.0` + exit 0 AND
+# fresh throwaway HOME, replaced env, bounded timeout), asserting EXACTLY `codex-cli 0.164.0` + exit 0 AND
 # the fake-GNU-ldd PATH case AND the code-mode host sibling — so a broken binary/loader or a
 # missing host fails the BUILD, not a run. The helpers + lock are removed after (no
 # residue); NO auth/config/session state is baked.

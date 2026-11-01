@@ -1426,6 +1426,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 			e.o.DeploymentUID = string(e.dep.UID)
 			e.o.DeploymentResourceVersion = e.dep.ResourceVersion
 			e.o.SpecHash = e.dep.Spec.Template.Annotations[AnnotationSpecHash]
+			e.o.DeploymentNodeSelector = e.dep.Spec.Template.Spec.NodeSelector
 			e.marker, err = decodeRoll(e.dep.Annotations[annotationRoll])
 			if err != nil {
 				e.blocked = err.Error()

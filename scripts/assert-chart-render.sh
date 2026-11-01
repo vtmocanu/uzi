@@ -1504,6 +1504,76 @@ for budget in 3 5 0; do
 done
 echo "OK: RUN_MAX_REQUEUES budgets 3/5/0 are quoted exactly in the API ConfigMap and consumed by the API Deployment envFrom"
 
+# Issue #3675: workers.codex.commandCacheRunBytes reaches the controller as
+# UZI_CODEX_COMMAND_CACHE_RUN_BYTES. Unset renders no env; a string "0" and a numeric 0
+# both render "0" (a falsy `with` would drop the numeric one and silently restore the
+# 4 GiB default); a large integer renders as a plain decimal, never "4.294967296e+09".
+# The -f and --set-json cases are the float64 path (see the controller-deployment template).
+# No retries; each render must succeed and hold exactly one controller Deployment.
+for cache_case in default:: string0:--set-string:0 int0:--set:0 big:--set:4294967296 \
+                  bigjson:--set-json:4294967296 zerojson:--set-json:0 \
+                  bigfile:-f:4294967296 zerofile:-f:0 stringfile:-f:'"4294967296"'; do
+  cache_name=${cache_case%%:*}
+  cache_rest=${cache_case#*:}
+  cache_flag=${cache_rest%%:*}
+  cache_val=${cache_rest#*:}
+  CACHE_RENDER="$WORK/cache-$cache_name.yaml"
+  set -- --set workers.enabled=true --set api.tls.enabled=true
+  cache_want=${cache_val#\"}
+  cache_want=${cache_want%\"}
+  if [ "$cache_flag" = "-f" ]; then
+    # A values file parses an unquoted integer as a float64, as --set-json does; --set
+    # and --set-string yield an int64 and a string, so only these cases reach the float path.
+    printf 'workers:\n  codex:\n    commandCacheRunBytes: %s\n' "$cache_val" > "$WORK/cache-$cache_name-values.yaml"
+    set -- "$@" -f "$WORK/cache-$cache_name-values.yaml"
+  elif [ -n "$cache_flag" ]; then
+    set -- "$@" "$cache_flag" "workers.codex.commandCacheRunBytes=$cache_val"
+  fi
+  if ! helm template uzi "$STRIPPED" --show-only templates/controller-deployment.yaml \
+       "$@" > "$CACHE_RENDER" 2> "$WORK/err"; then
+    echo "BROKEN: helm template of the controller (commandCacheRunBytes case $cache_name) failed:" >&2
+    cat "$WORK/err" >&2
+    exit 2
+  fi
+  awk -v name="$cache_name" -v want="$cache_want" '
+    /^kind: Deployment$/ { deployment++ }
+    /- name: UZI_CODEX_COMMAND_CACHE_RUN_BYTES$/ { pins++; want_value = 1; next }
+    want_value && /^[[:space:]]*value:/ { value = $2; want_value = 0 }
+    END {
+      if (deployment != 1) {
+        print "BROKEN: expected exactly one controller Deployment"; exit 2
+      }
+      if (name == "default" && pins != 0) {
+        print "FAIL: UZI_CODEX_COMMAND_CACHE_RUN_BYTES must be absent when commandCacheRunBytes is unset"; exit 1
+      }
+      if (name != "default" && (pins != 1 || value != "\"" want "\"")) {
+        printf "FAIL: commandCacheRunBytes case %s must render exactly one UZI_CODEX_COMMAND_CACHE_RUN_BYTES of \"%s\" (got %d, value %s)\n", name, want, pins, value; exit 1
+      }
+    }
+  ' "$CACHE_RENDER" || exit $?
+done
+echo "OK: UZI_CODEX_COMMAND_CACHE_RUN_BYTES is absent by default and renders 0 and 4294967296 as plain quoted decimals from --set, --set-string, --set-json and a values file"
+
+# A bool or a fractional number must fail the render, not be cast by int64 into a tiny
+# budget (true -> 1, 1.5 -> 1). Each case must exit non-zero and name the key.
+for cache_bad in bool:true frac:1.5 neg:-1; do
+  cache_name=${cache_bad%%:*}
+  cache_val=${cache_bad#*:}
+  printf 'workers:\n  codex:\n    commandCacheRunBytes: %s\n' "$cache_val" > "$WORK/cache-bad-$cache_name.yaml"
+  if helm template uzi "$STRIPPED" --show-only templates/controller-deployment.yaml \
+       --set workers.enabled=true --set api.tls.enabled=true \
+       -f "$WORK/cache-bad-$cache_name.yaml" > /dev/null 2> "$WORK/err"; then
+    echo "FAIL: commandCacheRunBytes: $cache_val (case $cache_name) rendered; it must fail the render" >&2
+    exit 1
+  fi
+  if ! grep -F -q "workers.codex.commandCacheRunBytes must be" "$WORK/err"; then
+    echo "BROKEN: commandCacheRunBytes: $cache_val (case $cache_name) failed, but not with the validation message:" >&2
+    cat "$WORK/err" >&2
+    exit 2
+  fi
+done
+echo "OK: a bool, a fractional or a negative commandCacheRunBytes fails the render with a clear message"
+
 DEFAULT_OFF="$WORK/default-off.yaml"
 # Issue #1982: the hosted-worker pin also tells healthsvc to expect a controller.
 # Render only the API Deployment so an unrelated object's env cannot satisfy the

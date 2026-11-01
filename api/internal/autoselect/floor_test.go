@@ -95,7 +95,7 @@ func TestFloorReturnsSoleStaleToken(t *testing.T) {
 // the secret-id leg rather than dereferencing a nil pct.
 func TestFloorReturnsUnmeasuredToken(t *testing.T) {
 	unmeasured := cand(1, 80, at(time.Hour))
-	unmeasured.FiveHourPct = nil // no headroom signal ⇒ Select drops it
+	unmeasured.SevenDayPct = nil // no headroom signal ⇒ Select drops it
 	sid, ok := Floor([]Candidate{unmeasured}, uuid.Nil, now)
 	if !ok || sid != id(1) {
 		t.Fatalf("Floor = (%v, %v), want (%v, true)", sid, ok, id(1))
@@ -155,7 +155,7 @@ func TestFloorOrderIndependent(t *testing.T) {
 	stale := cand(1, 80, at(time.Hour))
 	stale.SyncedAt = at(-99 * time.Hour)
 	unmeasured := cand(2, 80, at(time.Hour))
-	unmeasured.FiveHourPct = nil
+	unmeasured.SevenDayPct = nil
 	nullReset := cand(3, 78, nil)
 	dated := cand(4, 77, at(time.Hour))
 	dated2 := cand(5, 40, at(time.Hour)) // shares dated's reset ⇒ decided on secret id

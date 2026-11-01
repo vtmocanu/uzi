@@ -1,8 +1,8 @@
 # ADR-3076: Codex command-cache calibration — incomplete
 
-**Status**: Evidence/documentation partial; M0 incomplete. No scanner limits selected or production code changed. M1–M5 are deferred to follow-up work by the recorded owner partial decision.
+**Status**: Evidence/documentation partial; M0 incomplete. No scanner limits were selected from the calibration below, and that record changed no production code. M1–M5 are deferred to follow-up work by the recorded owner partial decision. The calibration record stays incomplete; a separate decision, [rotate, never refuse (#3675)](#decision-rotate-never-refuse-3675), is implemented by issue #3675 and supersedes the refusal proposed here.
 **Date**: 2026-10-30
-**Related**: issue #3076; [ADR-1598](1598-codex-command-storage.md); [ADR-1809](1809-per-run-cache-bounds.md).
+**Related**: issue #3076; issue #3675; [ADR-1598](1598-codex-command-storage.md); [ADR-1809](1809-per-run-cache-bounds.md).
 
 ## Decision state
 
@@ -12,7 +12,7 @@ M0's first-scan/warm work was authorized while cold evidence remained unavailabl
 
 **cold populated-tree scan: pending, needs a qualifying environment (VM or privileged host)**
 
-A container restart does not clear kernel caches; replacing an emptyDir-backed pod loses the populated cache. Neither supplies the missing evidence. Cold latency and cold-induced refusal frequency are unvalidated. A future exceeded bound must yield unknown and a recoverable `codex_command_cache_budget` refusal: that protects safety, not availability. This behavior is proposed, not implemented here.
+A container restart does not clear kernel caches; replacing an emptyDir-backed pod loses the populated cache. Neither supplies the missing evidence. Cold latency and cold-induced refusal frequency are unvalidated. A future exceeded bound must yield unknown and a recoverable `codex_command_cache_budget` refusal: that protects safety, not availability. This behavior is proposed, not implemented here (superseded by the rotate, never refuse decision below).
 
 ## Evidence-only delivery and recovery provenance
 
@@ -173,3 +173,77 @@ Independent safety review identified this conflict before enabling any producer.
 The full scheduler, live monitor synchronization and complete observation matrix remain worker implementation obligations. The current manifest driver is deliberately disabled; its refusal is not a measured calibration result. Before an actual attempt, the producer boundary needs either an available bounded-write environment or an explicit owner amendment permitting sampled own-producer overshoot. No such amendment is assumed.
 
 **Follow-up outcome:** zero new representative scans, zero Go command pairs and no corpus allocation. No experiment producer or representative scan leg was launched; no producer cleanup was necessary. The small tooling tests completed; no live test child was left outstanding by those tests. Cold validation, full layout coverage, overhead/completeness targets and scanner-limit selection remain unperformed. M0 is incomplete and M1–M4 remain gated.
+
+## Decision: rotate, never refuse (#3675)
+
+**Status**: Implemented by issue #3675. Supersedes this record's proposed `codex_command_cache_budget` refusal: no command is ever refused for cache size. The M0 calibration above stays incomplete and is not reopened by this decision; the walk bounds below are provisional because of it.
+
+### Mechanism
+
+- **Measure.** The supervisor has a `--measure-cache` mode: a read-only, no-follow, fd-relative walk of `<cache root>/<token>` as the command uid. It takes no lock and never chmods, unlinks or renames. It charges `max(st_size, st_blocks*512)` per entry and prints one `cache_measure` line.
+- **Schedule.** After a cached command's roots dispose, the worker schedules a measurement of the run's current cache generation. The command does not await it, but when the worker-wide limiter slot is free its helper is spawned before the disposing caller resumes (otherwise it waits in the queue) (the dispose-to-return cost under Measured overhead). At most one is outstanding per generation (requests coalesce) and at most one starts per 30 s per generation (`minIntervalMs`, default 30 000). A worker-wide FIFO limiter runs one measure helper at a time.
+- **Rotate.** A result at or above the budget, or an unknown result (incomplete, error, timeout), marks the generation rotation-pending. Commands keep being admitted to it until a replacement holder is ready; admission then switches atomically. A per-launch reservation is taken before any cache-bearing spec is built, and a prepared launch keeps its pinned generation and never reacquires. The old generation is closed and never reopened.
+- **Holder loss** still means uncached commands, as before. Terminal eviction, the capture and reaper bypasses, Landlock and the private HOME/TMPDIR are unchanged. The startup reaper is not run mid-run, and only the run's own tokens are touched.
+
+### Finite retirement and cleanup judgment
+
+- A retiring generation is removed only through the existing drain proof (all roots that used it disposed cleanly, poisoned registries proven), with zero reservations and no unresolved measurement. Removal is by holder release, or `--remove-cache` after holder loss.
+- If it cannot be proven drained mid-run it is left for terminal settle; there is no early distrust.
+- At most one retiring generation exists per run. While one is not removed (pending, failed or deferred), no further rotation happens: growth limiting is sacrificed rather than letting generations accumulate.
+- A failed replacement start latches replacement off for the run. An abandoned replacement (ready but no longer adoptable) blocks until its own settlement and latches if unclean. A replacement that never spawned a process does not distrust, and a capture-admission refusal before any spawn re-arms rotation.
+- Cleanup judgment is ownership-specific: an adopted holder's close is joined but judged only by the existing release/remove path. Holder loss plus verified drainage plus successful removal therefore keeps today's clean lifetime outcome.
+
+### Helper settlement
+
+The helper's delivery bound is 30 s (`DEFAULT_MEASURE_TIMEOUT_MS`). At timeout or abort it is SIGKILLed as the command uid, only while no exit has been observed. The slot and the generation's unresolved measurement settle at the helper's `close`, or at `exit` plus a 2 s stdout drain (`MEASURE_STDOUT_DRAIN_MS`).
+
+### Setting and default
+
+`UZI_CODEX_COMMAND_CACHE_RUN_BYTES` is plain decimal bytes. Unset or empty means 4294967296 (4 GiB); `0` disables live measurement and rotation; anything else (sign, suffix, hex, leading zero, above 9007199254740991) refuses to start the worker and is a boot error in the controller. The chart value is `workers.codex.commandCacheRunBytes` (default empty, forwarded only when non-empty, so a default install's pod is unchanged). On compose the agent service has no `env_file` and does not pass the variable through, so it must be added to the agent service's `environment` through a compose override; a uid-split compose worker then reads it directly. Worker images older than this change ignore it.
+
+4 GiB is above the roughly 2.1 GiB single-build corpus measured above and below the 10-14 GiB historical run-cache samples (#3076). It is a candidate, not a validated fleet default.
+
+### Provisional walk bounds, undercount, advisory status
+
+The walk is incomplete (and so counts as unknown, which triggers rotation) on a foreign owner, device or swap, a missing owner r+x, an I/O error, byte-total saturation (`bytes`), or the provisional uncalibrated bounds of 500,000 entries, depth 64 and 5 s wall. These bounds were not selected from the incomplete M0 matrix. Entries or directories that vanish mid-walk are skipped, so a result can undercount. A measurement is advisory and never cleanup authority.
+
+### Exposure
+
+Rotation is best-effort and promises no numeric bound.
+
+- Measurement lags several admissions (30 s spacing, the helper queue).
+- Overlapping commands keep writing a closed generation until they finish.
+- A failed or stalled removal retains bytes until the startup reaper.
+- Per run there can be one current generation, one retiring generation and overshoot. As the issue's hypothetical capacity example, two ordinary slots plus one checker would be roughly three current-generation targets plus retiring or retained caches on node ephemeral storage; that is not a default (the hosted default `maxConcurrentRuns` is 1, `deploy/chart/values.yaml`).
+
+Residual risks:
+
+- If the kill of a stopped helper cannot be delivered (`timeout_unkilled`), the worker-wide measurement slot stays held and rotation stops for every run on that worker. How to force this is not demonstrated.
+- A same-uid peer that repeatedly stops helpers can delay other runs' measurements by up to 30 s each and force rotations (bounded).
+- A kill racing libuv's reap can target a free pid; reuse would need the pid space to wrap.
+- After the 2 s drain a peer may still hold the helper's stdout pipe (it gains no cache access).
+
+### Measured overhead
+
+Measured 2026-10-30 from the committed test, 3 runs. Environment: Intel Xeon Gold 5120, 4 CPUs available to the process (nproc/cgroup; the host reports 8), node v24.20.0, go1.27.3, ext4-family scratch filesystem, single process. The test is `agent/test/codex-command-cache-overhead.test.ts`. Its two scenarios are gated independently: (a) runs with `UZI_CACHE_OVERHEAD=1`, (b) with `UZI_CACHE_OVERHEAD_SUPERVISOR=<absolute path to a built supervisor binary>`; each is skipped otherwise. Not measured: the production `setpriv`/uid split, real Go/npm caches, large corpora and cold caches. No latency claim is made beyond these figures.
+
+(a) Synthetic scheduler overhead (fake helpers, 50 ms fake measure, 20 ms fake holder start, 200 commands, 5 ms think time, minInterval 0):
+
+- elapsed 1141-1144 ms with no rotation options, 1089-1373 ms with budget 0, and 1090-1241 ms with rotation enabled; run-to-run noise exceeds the difference;
+- reserve-to-launch and dispose-to-return medians 0.022-0.029 ms, worst p95 0.196 ms, worst max 3.1 ms;
+- 18-20 measurements and 7 rotations per enabled run.
+
+(b) Integrated real helper. In the helper process layer the only substitution is the spawn (the built binary is exec'd directly, without `setpriv`, with the test uid and an owned 0700 fixture root) plus mapping the holder's ready path back to the production root text; the holder, measure, limiter, remove and rotation code are production. In addition the scenario launches fake roots (no real Codex command runs; the test writes the files itself) and uses a no-op capture-admission check. 100 commands per cache, each fake command's test code writing 20 x 4 KiB into the generation's `gocache/`; 2 MiB budget; minInterval 20 ms (a stress setting far more frequent than the 30 s default); 10 ms think time.
+
+- Single cache: command sequence 1190-1235 ms off vs 1364-1539 ms on (+15-25%; per run +24.6%, +14.7%, +15.2%). Dispose-to-return median 0.02-0.03 ms off vs 0.26-1.5 ms on, p95 4.8-7.2 ms, max 18.7 ms: the measurement is not awaited, but with a free limiter slot its helper is forked/exec'd before the disposing caller resumes. Helper spawn-to-close median 7.1-8.7 ms, p95 10.8-23.4 ms, max 30.7 ms; queue wait median about 0.2 ms, max 1.4 ms. 50-53 measurements and 3 rotations per run, 3 generations retired mid-run with no `--remove-cache` needed, the fixture root empty after settle, and all lifetimes sealed.
+- Two caches sharing the worker-wide limiter: sequence 1179-1227 ms off vs 1317-1367 ms on (+11-14%). Dispose-to-return median 0.04-0.11 ms, p95 3.3-3.8 ms, max 8.3 ms. Helper spawn-to-close median 6.7-9.0 ms, p95 11.6-18.1 ms, max 19.8 ms. Queue wait median 0.2-2.0 ms, p95 6.1-10.3 ms, max 15.2 ms. 6 rotations per run; fixture root empty after settle.
+- The burst-on and two-cache-on runs always, and one of the three single-cache-on runs, end with one in-flight measurement aborted by terminal settle (reported `unknown`/aborted with a "measurement helper unresolved" warning); two of the three two-cache runs also had one queued measurement cancelled. This is expected teardown behaviour.
+- The burst scenarios (0 ms think time) are not a helper-work measurement: only one measurement starts, at the first command, and it cannot finish until the loop yields.
+
+(c) Isolated Go walk: `BenchmarkMeasure` 6.6 ms per walk of a 2,040-entry tree.
+
+At the 30 s production interval a run triggers at most about two measurements per minute per generation, so the per-measurement spawn cost is amortised. This frequency argument is arithmetic, not a measurement.
+
+### Not yet done
+
+Hosted observation of a long Go-heavy run after release is pending (owner, #3675 m5). The 4 GiB default, the walk bounds and the hosted effect on node ephemeral storage are unvalidated until then.

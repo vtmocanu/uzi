@@ -3,7 +3,7 @@ paths:
   - "agent/**"
 ---
 
-# agent (Node 24 + tsx, Claude Agent SDK worker)
+# agent (Node 26 + tsx, Claude Agent SDK worker)
 
 Loaded when you touch `agent/`. The repo-wide map is the root `CLAUDE.md`.
 
@@ -23,7 +23,7 @@ cd agent && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --i
 
 ## `--test-timeout`
 
-- CI's `test-agent` runs Node 24 on `ubuntu-latest`. There, as on local node v26.8, each file runs in its own child process and the flag caps each test, not the whole file. What the flag caps has changed across node majors (the old `node:22-alpine` CI capped the whole file), so check which node the SLOWEST environment runs before reading a timeout.
+- CI's `test-agent` runs Node 26 on `ubuntu-latest`. There, as on local node v26.8, each file runs in its own child process and the flag caps each test, not the whole file. What the flag caps has changed across node majors (the old `node:22-alpine` CI capped the whole file), so check which node the SLOWEST environment runs before reading a timeout.
 - Keep a single test well under the cap rather than raising 120000.
 - A cap kill is reported `cancelled`, not `fail`, so the summary reads `fail 0` on a red job; the cancelled test is named in the `✖` list.
 - Settle an unexplained failure by re-running one unchanged commit, rather than inventing a mechanism from the diff.
@@ -58,5 +58,5 @@ cd agent && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --i
 ## Worker runtime
 
 - The guardrail DENIES reading the process environment (bare `env`), the process table (`ps` / `pgrep`) and `/proc` — `agent/src/guardrails.ts`, `REASON_ENV` / `REASON_PS` / `REASON_PROC` — because they leak the worker's join token. A trace that burned a retry on a denied read is showing the environment, not a broken tool.
-- The base image is `node:24-alpine` (`agent/templates/base/Dockerfile`), but do not assume BusyBox limits: the baked toolchain at `/opt/uzi-toolchain/bin` is FIRST on the agent PATH and prepends GNU `coreutils` (so GNU flags such as `ls --time-style=full-iso` work) plus `file`, `perl` and others (`agent/devbox-global/devbox.json`, guarded by `toolchain-guard.tsv`).
+- The base image is `node:26-alpine` (`agent/templates/base/Dockerfile`), but do not assume BusyBox limits: the baked toolchain at `/opt/uzi-toolchain/bin` is FIRST on the agent PATH and prepends GNU `coreutils` (so GNU flags such as `ls --time-style=full-iso` work) plus `file`, `perl` and others (`agent/devbox-global/devbox.json`, guarded by `toolchain-guard.tsv`).
 - Guardrail invariant #6, `settingSources: []`, is enforced by `semgrep/settings-sources-isolation.yml` at every SDK query site under `agent/src/`. It fires on an explicit widening (`settingSources: ["project"]`, or a variable in that position) but does NOT catch an omitted key, since the SDK default is fail-open and loads every source, including a cloned repo's `.claude/`. Full boundary in [`docs/security-gate.md`](../../docs/security-gate.md).

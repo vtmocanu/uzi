@@ -145,7 +145,7 @@ if (process.env.UZI_1725_CHILD === "1") {
       // shim dir also ends an orphaned shim's wait loop, which exits once its dir is gone.
       fs.rmSync(childTmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
-    assert.equal(result.status, 0, result.stderr || result.error?.message);
+    assert.equal(result.status, 0, result.stderr || result.error?.message || "child failed without stderr or error");
     const observed = JSON.parse(result.stdout.trim());
     assert.match(observed.packedTip, /^[0-9a-f]{40}$/);
     assert.equal(typeof observed.exit, "number");

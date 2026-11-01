@@ -8,7 +8,8 @@ audience: user
 
 uzi watches every active run and can flag one that looks stuck, looping, or
 close to its timeout — a **⚠** badge on the board, dashboard, runs list, and
-run view, and (if you've set up [Slack](./slack.md)) a DM. The badge's
+run view, and (if you've set up [Slack](./slack.md)) a DM, except for a
+cross-check run, which never gets a DM of its own. The badge's
 elapsed time counts from when the flag was raised, not from when the run
 started — except **near timeout**, whose badge instead counts down the time
 left to the deadline (e.g. `1h 5m left`).

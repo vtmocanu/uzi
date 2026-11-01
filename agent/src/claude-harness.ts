@@ -31,6 +31,7 @@ import type {
   SpawnedProcess,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "./log.js";
+import { decodeClaudeEffort, decodeObservedModel } from "./runtime-observation.js";
 import type { ContextUsageReading, SdkQueryFn } from "./sdk-executor.js";
 import {
   assistantModelOf,
@@ -68,6 +69,7 @@ import type {
   HarnessThrownFailure,
   HarnessTurn,
   RunHarness,
+  RuntimeConfigObservation,
   RunTurnRequest,
   SessionPresence,
   TurnSignals,
@@ -137,7 +139,60 @@ async function readLeadContext(
 
 type SdkQueryInstance = AsyncIterable<SDKMessage> & {
   getContextUsage?(opts?: { detail?: "summary" | "full" }): Promise<ContextUsageReading>;
+  /** Feature-detected only: the pinned SDK implements it at runtime but its d.ts does not type it. */
+  getSettings?(): Promise<unknown>;
 };
+
+/** PRD #3244 M2 settings probe bound, in ms. */
+const SETTINGS_PROBE_TIMEOUT_MS = 2000;
+
+export interface SettingsProbeTimers {
+  setTimeout(fn: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+const realProbeTimers: SettingsProbeTimers = {
+  setTimeout: (fn, ms) => {
+    const h = setTimeout(fn, ms);
+    h.unref?.();
+    return h;
+  },
+  clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+};
+
+/**
+ * PRD #3244 M2: the one Claude settings probe. Used only when the init frame carried no `effort`
+ * key. Feature-detects `getSettings` on the live query, bounds it by `timeoutMs`, and strictly
+ * decodes only `response.applied.effort`; the response is never logged. Absence, a throw, a
+ * timeout or any other shape gives `unknown`. Never throws.
+ */
+async function probeAppliedEffort(
+  qi: SdkQueryInstance,
+  timeoutMs: number,
+  timers: SettingsProbeTimers,
+): Promise<Pick<RuntimeConfigObservation, "effort" | "effortEvidence">> {
+  const unknown = { effortEvidence: "unknown" as const };
+  const getSettings = qi.getSettings;
+  if (typeof getSettings !== "function") return unknown;
+  let handle: unknown;
+  try {
+    const response = await Promise.race([
+      getSettings.call(qi),
+      new Promise<never>((_, reject) => {
+        handle = timers.setTimeout(() => reject(new Error("getSettings timed out")), timeoutMs);
+      }),
+    ]);
+    const applied = asRecord(asRecord(response)?.["applied"]);
+    if (!applied || !("effort" in applied)) return unknown;
+    if (applied["effort"] === null) return { effort: null, effortEvidence: "claude_get_settings" };
+    const level = decodeClaudeEffort(applied["effort"]);
+    return level === undefined ? unknown : { effort: level, effortEvidence: "claude_get_settings" };
+  } catch {
+    return unknown;
+  } finally {
+    if (handle !== undefined) timers.clearTimeout(handle);
+  }
+}
 
 /**
  * The private Claude-specific construction input for a turn (PRD #1146 M2). The
@@ -224,6 +279,8 @@ export interface ClaudeHarnessDeps {
   onRootSpawned?: (pid: number) => void;
   /** Per-run SDK HOME, for session inspection. */
   homeDir: string;
+  /** PRD #3244 M2: bound and timers of the single settings probe (tests inject the timers). */
+  settingsProbe?: { timeoutMs?: number; timers?: SettingsProbeTimers };
 }
 
 export class ClaudeHarness implements RunHarness {
@@ -372,8 +429,14 @@ export class ClaudeHarness implements RunHarness {
       const rateLimits = new RateLimitObserver();
       // issue #2014: one usage leg per query(); its close marker is enqueued in the finally below.
       const leg = sink?.startLeg();
+      let runtimeConfigPending = request.onRuntimeConfig;
       try {
         for await (const msg of queryInstance) {
+          if (runtimeConfigPending && isLeadInitFrame(msg)) {
+            const cb = runtimeConfigPending;
+            runtimeConfigPending = undefined;
+            reportRuntimeConfig(cb, asRecord(msg)!, queryInstance, deps);
+          }
           // Feed the observer before decode: a rate_limit_event maps to an activity
           // event, so any later placement would never see one (as today).
           rateLimits.observe(msg);
@@ -522,6 +585,45 @@ export class ClaudeHarness implements RunHarness {
       };
     }
     return { kind: "activity", sessionId, orphanInstanceFrameKind };
+  }
+}
+
+/** The lead's own init frame (a subagent frame carries a parent tool-use id). */
+function isLeadInitFrame(msg: unknown): boolean {
+  const rec = asRecord(msg);
+  return rec?.["type"] === "system" && rec["subtype"] === "init" && (rec["parent_tool_use_id"] ?? null) === null;
+}
+
+/** PRD #3244 M2: build the observation from the init frame and deliver it, never throwing into the
+ *  turn and never blocking the event stream (the settings probe, when needed, runs detached). */
+function reportRuntimeConfig(
+  cb: (obs: RuntimeConfigObservation) => void,
+  init: Record<string, unknown>,
+  qi: SdkQueryInstance,
+  deps: ClaudeHarnessDeps,
+): void {
+  const deliver = (obs: RuntimeConfigObservation): void => {
+    try {
+      cb(obs);
+    } catch (err) {
+      deps.log.warn("runtime config callback threw", { error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+  try {
+    const model = decodeObservedModel(init["model"]);
+    const base = { ...(model !== undefined ? { model } : {}), modelEvidence: model !== undefined ? "claude_init" as const : "unknown" as const };
+    if ("effort" in init) {
+      const raw = init["effort"];
+      const level = raw === null ? null : decodeClaudeEffort(raw);
+      deliver(level === undefined
+        ? { ...base, effortEvidence: "unknown" }
+        : { ...base, effort: level, effortEvidence: "claude_init" });
+      return;
+    }
+    void probeAppliedEffort(qi, deps.settingsProbe?.timeoutMs ?? SETTINGS_PROBE_TIMEOUT_MS, deps.settingsProbe?.timers ?? realProbeTimers)
+      .then((effort) => deliver({ ...base, ...effort }), () => deliver({ ...base, effortEvidence: "unknown" }));
+  } catch {
+    /* an observation is best-effort: it must never reach the turn */
   }
 }
 

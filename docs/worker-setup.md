@@ -76,7 +76,7 @@ A worker image is built from a **template**: a curated, code-reviewed Dockerfile
 
 | Template | What it adds | Use it when |
 |---|---|---|
-| `base` (default) | Node 24 + git + bash + make + the `docker` CLI + go + python3 — the minimal worker | Most repos |
+| `base` (default) | Node 26 + git + bash + make + the `docker` CLI + go + python3 — the minimal worker | Most repos |
 | `jvm` | `base` plus a JDK (`java`/`javac`) | Repos that build or test Java |
 
 Every worker also ships the `docker` CLI and a default go/python3/pip toolchain, baked at build time onto both templates' `PATH` — no per-repo provisioning needed for either. The `docker` CLI alone can't run anything until a daemon is wired up: see [Docker inside a worker](./worker-docker.md). go/python3/pip share the nix store's first-run-only warm cache described under [Tool provisioning](#tool-provisioning) below: they refresh only when `/nix` is deleted and the worker reprovisions, not on every worker image upgrade. The baked set also covers a handful of everyday utilities (`ripgrep`, `opentofu`/`tofu`, and others) beyond go/python3/pip — the shared manifest at `agent/devbox-global/devbox.json` is the canonical list, not this page.
@@ -148,7 +148,7 @@ resources:
 
 **A [docker sidecar](#docker-sidecar) costs more** on top of either number above: budget roughly an extra **1-2 GiB memory / 1 CPU** for the `dind` daemon itself, plus its own storage for pulled images and build cache — a compose `dinddata` volume, or its k8s equivalent. Under compose, `dinddata` only grows: reclaim it the same way as `agentnix` (`docker compose down -v`, or `docker volume rm <project>_dinddata`) once you don't need what's cached. On a hosted k8s worker the equivalent is a persistent per-worker PVC (`dind-data`), and a `dind-meter` sidecar samples its fill level and supports automatic cache pruning and, under a stricter terminal-run maintenance gate, DinD PVC recycling under sustained pressure — see [Docker inside a worker](./worker-docker.md#dind-data-metering-and-automatic-pruning) for what that covers and what it doesn't. Expect a real workload — uzi's own e2e suite pulls `postgres:17` and builds `api`/`web`/`agent` through the sidecar — to land in the **5-20 GiB** range.
 
-**On a hosted k8s worker, a per-pod Codex command cache draws on the pod's ephemeral storage, separately from the dind budget above**: it exists only under the uid split. A worker-only emptyDir (`codex-cmd-cache`) holds one directory per run with that run's Codex command build cache (`GOMODCACHE`/`GOCACHE`/npm). It is removed at the end of any run whose command roots have all drained, and via `--remove-cache` after a cache-holder loss; otherwise it is kept on disk until the startup orphan reaper sweeps it. It counts toward `workers.ephemeralRequest`/`workers.docker.ephemeralRequest`, the docker tier's 5Gi default adds provisional headroom for it (issue #1757), unmeasured; the plain tier's 512Mi does not yet, pending a hosted measurement of a Go-heavy Codex run's peak usage.
+**On a hosted k8s worker, a per-pod Codex command cache draws on the pod's ephemeral storage, separately from the dind budget above**: it exists only under the uid split. A worker-only emptyDir (`codex-cmd-cache`) holds one directory per run with that run's Codex command build cache (`GOMODCACHE`/`GOCACHE`/npm). It is removed at the end of a run only when its command roots have all drained, its cache reservations have settled and no measurement is still running, and via `--remove-cache` after a cache-holder loss under the same conditions; otherwise it is kept on disk until the startup orphan reaper sweeps it. While a run is live, its cache is measured after commands and rotated to a fresh generation when a complete measurement reaches or exceeds the per-run budget, or when the measurement is unknown (incomplete, failed or timed out) (`UZI_CODEX_COMMAND_CACHE_RUN_BYTES`, default 4 GiB, `0` turns it off; see [Configuration](./configuration.md)). Rotation is best-effort with no hard size bound, and a command is never refused for cache size. It counts toward `workers.ephemeralRequest`/`workers.docker.ephemeralRequest`, the docker tier's 5Gi default adds provisional headroom for it (issue #1757), unmeasured; the plain tier's 512Mi does not yet, pending a hosted measurement of a Go-heavy Codex run's peak usage.
 
 What the gauges mean:
 
@@ -720,6 +720,11 @@ disables native `Bash` and `Monitor`. What changes for those runs
   automatic extension. Every call starts at the repository root.
 - At most 8 commands per run may be live; the 9th is refused with a visible
   error.
+- Commands one agent issues together run one after another, not at once (the
+  8-command cap counts all agents on the run), and a command placed after a
+  batch of subagents waits for that batch. To keep the integration gate
+  overlapping the review, the lead delegates the gate to one subagent in the
+  same batch as the reviewers.
 - Inline output is capped at 30000 characters (start and end preview). A
   best-effort spill file under `.uzi/scratch/uzi-cmd/` is capped at 64 MiB and
   truncated beyond that; it is bounded, not a promise of full output.

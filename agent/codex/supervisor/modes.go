@@ -11,13 +11,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The three standalone modes. Each is selected by its flag as the FIRST
+// The four standalone modes. Each is selected by its flag as the FIRST
 // argument, has its own strict fixed-order parser, needs no fd 3/4 and forks
 // nothing, and writes its JSON lines to stdout.
 const (
 	modeReapOrphans = "--reap-orphans"
 	modeHoldCache   = "--hold-cache"
 	modeRemoveCache = "--remove-cache"
+	// modeMeasureCache is non-mutating and advisory: see measureCache.
+	modeMeasureCache = "--measure-cache"
 )
 
 // Exit codes of --reap-orphans.
@@ -36,7 +38,7 @@ type modeArgs struct {
 
 // isModeFlag reports whether arg selects one of the standalone modes.
 func isModeFlag(arg string) bool {
-	return arg == modeReapOrphans || arg == modeHoldCache || arg == modeRemoveCache
+	return arg == modeReapOrphans || arg == modeHoldCache || arg == modeRemoveCache || arg == modeMeasureCache
 }
 
 // parseModeArgs parses exactly:
@@ -44,6 +46,7 @@ func isModeFlag(arg string) bool {
 //	--reap-orphans --expect-uid <N> --cache-root <abs dir>
 //	--hold-cache   --expect-uid <N> --cache-root <abs dir> --cache-token <lowercase uuid>
 //	--remove-cache --expect-uid <N> --cache-root <abs dir> --cache-token <lowercase uuid>
+//	--measure-cache --expect-uid <N> --cache-root <abs dir> --cache-token <lowercase uuid>
 //
 // in that order. The cache root must be an absolute, already-clean path other
 // than "/".
@@ -87,7 +90,8 @@ type modeEnv struct {
 	hygiene func() error
 	// nondumpable makes the process nondumpable (PR_SET_DUMPABLE 0, confirmed),
 	// so a same-uid peer cannot reopen its fds (its stdin, the release
-	// channel) through the proc fd directory; --hold-cache runs it first.
+	// channel) through the proc fd directory; --hold-cache and --measure-cache
+	// run it first.
 	nondumpable func() bool
 	// uids returns the real and effective uid.
 	uids func() (int, int)
@@ -121,9 +125,9 @@ type reapErrorLine struct {
 	Reason string `json:"reason"`
 }
 
-// runMode runs the standalone mode args[0] names: for --hold-cache the
-// nondumpable step first, then fd hygiene, then the strict argv, then the uid
-// check (real and effective uid must both be --expect-uid), then the mode. It
+// runMode runs the standalone mode args[0] names. Order: for --hold-cache and
+// --measure-cache only, the nondumpable step first; then fd hygiene, the
+// strict argv, then the uid check (real and effective uid must both be --expect-uid), then the mode. It
 // returns the exit code.
 func runMode(args []string, env modeEnv) int {
 	fail := func(reason string) int {
@@ -133,7 +137,7 @@ func runMode(args []string, env modeEnv) int {
 		}
 		return cacheError(env.stdout, reason)
 	}
-	if len(args) > 0 && args[0] == modeHoldCache && !env.nondumpable() {
+	if len(args) > 0 && (args[0] == modeHoldCache || args[0] == modeMeasureCache) && !env.nondumpable() {
 		return fail("dumpable")
 	}
 	if err := env.hygiene(); err != nil {
@@ -157,6 +161,9 @@ func runMode(args []string, env modeEnv) int {
 	defer func() { _ = unix.Close(rootFd) }()
 	if a.mode == modeHoldCache {
 		return holdCache(rootFd, a.cacheRoot, a.token, a.expectUID, env.stdin, env.stdout)
+	}
+	if a.mode == modeMeasureCache {
+		return measureCache(rootFd, a.token, a.expectUID, env.stdout, env.now)
 	}
 	return removeCache(rootFd, a.token, a.expectUID, env.stdout)
 }

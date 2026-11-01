@@ -97,6 +97,7 @@ import { followSuccessfulPush as m2FollowPush } from "./publication-fixture.js";
 import { shutdownContentProof } from "./shutdown-3101-content-fixture.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { closingDirectiveFor as m2ClosingDirective } from "../src/pr-description.js";
+import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
@@ -105,6 +106,7 @@ import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_L
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
+import { CommandCacheStartError } from "../src/codex/launcher.js";
 import { isBrokerModelCommand, type CapturedMemoryContext, type SpawnCommandOptions } from "../src/codex/broker.js";
 import { WorkerMemoryCommands } from "../src/worker-memory-commands.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
@@ -112,7 +114,8 @@ import type { ClaimResponse, MemoryReservationRequest, StateAck } from "../src/p
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
 import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
-import type { AgentTemplate, MilestoneProgress } from "../src/protocol.js";
+import type { AgentTemplate, ClaimConfig, LeadConfigReportBody, MilestoneProgress } from "../src/protocol.js";
+import { LeadConfigReporter, leadConfigActive } from "../src/lead-config-report.js";
 import { EpochCleanupUnprovenError, type BoundaryRequest, type BoundaryPermit } from "../src/harness.js";
 import type { CodexExecutionSafetyImpl } from "../src/codex/safety.js";
 import type {
@@ -9807,7 +9810,7 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
               env: { PATH: "/usr/bin:/bin" }, timeout: 10_000, encoding: "utf8",
               input: frames.map(frame => JSON.stringify(frame) + "\n").join(""),
             });
-            assert.equal(result.status, 0, result.stderr || result.error?.message);
+            assert.equal(result.status, 0, result.stderr || result.error?.message || "child failed without stderr or error");
             const replies = result.stdout.trim().split("\n").map(line => JSON.parse(line));
             assert.equal(replies.length, frames.length);
             assert.equal(replies[0].id, 1);
@@ -9828,7 +9831,7 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
             const confined = spawnSync(sandbox.command, sandbox.args, {
               env: { PATH: "/usr/bin:/bin" }, timeout: 10_000, encoding: "utf8",
             });
-            assert.equal(confined.status, 0, confined.stderr || confined.error?.message);
+            assert.equal(confined.status, 0, confined.stderr || confined.error?.message || "child failed without stderr or error");
             assert.equal(confined.stdout, "sandbox-control-ok");
             assert.equal(await fs.readFile(file, "utf8"), bytes.toString());
             assert.equal(await fs.readFile(sentinel, "utf8"), canary);
@@ -10062,6 +10065,7 @@ describe("production advice data teardown (#2324)", () => {
       let swapped = false;
       const pin = mock.method(fs, "stat", async (...args: Parameters<typeof fs.stat>) => {
         const result = await originalStat(...args);
+        assert.ok(result, "fs.stat resolved without stats");
         if (!swapped && String(result.ino) === String(identity.ino) && String(result.dev) === String(identity.dev) && args[1]?.bigint) {
           swapped = true;
           uidScript(runnerCommand, "const fs=require('node:fs');fs.renameSync(process.argv[1],process.argv[1]+'.retained');fs.mkdirSync(process.argv[1]);fs.writeFileSync(process.argv[1]+'/planted','keep')", owned);
@@ -12073,20 +12077,361 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     assert.deepEqual(c.holder.releases, [true], "the partial epoch's fileop root was reaped clean before the release");
   });
 
+  // Issue #3675 m2: the run's cache is measured after commands and rotated to a fresh holder once it
+  // reaches the budget. Driven through the PRODUCTION command seam (spawnCommand undefined) with a
+  // DISTINCT fake holder per start, an injected measurement over a byte counter that each cached
+  // command root "writes" to, and gates (never sleeps) for every ordering.
+  describe("command cache rotation (issue #3675)", () => {
+    const PER_COMMAND = 600;
+    const BUDGET = 1000;
+    const REMOVED_RESULT: CacheCleanupResult = { state: "removed", reason: "" };
+    interface Gate<T = void> { promise: Promise<T>; resolve(value: T): void }
+    function gate<T = void>(): Gate<T> {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((r) => { resolve = r; });
+      return { promise, resolve };
+    }
+    interface RotHolder {
+      holder: CommandCacheHolder;
+      token: string;
+      dir: string;
+      releases: boolean[];
+      close: Gate<CacheCleanupResult>;
+      die(): void;
+    }
+    function rotHolder(token: string, mode: "removed" | "pending", result?: CacheCleanupResult): RotHolder {
+      const dir = `/var/cache/uzi-codex-cmd/${token}`;
+      let alive = true;
+      const releases: boolean[] = [];
+      const close = gate<CacheCleanupResult>();
+      return {
+        token, dir, releases, close,
+        // A dead holder's process has closed without a verdict.
+        die: () => { alive = false; close.resolve({ state: "error", reason: "exited" }); },
+        holder: {
+          token, path: dir, alive: () => alive,
+          release: async (drained) => {
+            releases.push(drained);
+            alive = false;
+            if (mode === "pending") return { state: "pending", reason: "", settlement: close.promise };
+            const outcome = result ?? REMOVED_RESULT;
+            close.resolve(outcome);
+            return outcome;
+          },
+        },
+      };
+    }
+
+    interface RotRig extends CacheRig {
+      holders: RotHolder[];
+      starts: string[];
+      measured: string[];
+      bytes: Map<string, number>;
+      removeAnswers: CacheCleanupResult[];
+      /** Hold back the nth (0-based) start until resolved. */
+      gateStart(n: number): Gate;
+      /** Make the nth start throw this after announcing its helper. */
+      failStart(n: number, error: unknown, close: Gate<CacheCleanupResult>): void;
+      /** Hold back the nth measurement until resolved with the byte count to report. */
+      gateMeasure(n: number): Gate;
+      dirOf(commandIndex: number): string | undefined;
+    }
+    function rotationRig(opts: {
+      holderMode?: "removed" | "pending";
+      unclean?: (index: number, spec: CodexEffectLaunchSpec) => boolean;
+      onLaunch?: (index: number, rig: RotRig) => void;
+      remove?: () => CacheCleanupResult;
+    } = {}): RotRig {
+      const base = cacheRig({ unclean: opts.unclean });
+      const holders: RotHolder[] = [];
+      const starts: string[] = [];
+      const measured: string[] = [];
+      const bytes = new Map<string, number>();
+      const startGates = new Map<number, Gate>();
+      const startFailures = new Map<number, { error: unknown; close: Gate<CacheCleanupResult> }>();
+      const measureGates = new Map<number, Gate>();
+      const removeAnswers: CacheCleanupResult[] = [];
+      const rr: RotRig = {
+        ...base, holders, starts, measured, bytes, removeAnswers,
+        gateStart: (n) => { const g = gate(); startGates.set(n, g); return g; },
+        failStart: (n, error, close) => { startFailures.set(n, { error, close }); },
+        gateMeasure: (n) => { const g = gate(); measureGates.set(n, g); return g; },
+        dirOf: (i) => {
+          const spec = base.specs[i];
+          const at = spec?.args.indexOf("--cache") ?? -1;
+          return spec !== undefined && at >= 0 ? spec.args[at + 1] : undefined;
+        },
+      };
+      const launch = base.rig.deps.launchEffectRoot!;
+      base.rig.deps = {
+        ...base.rig.deps,
+        commandCacheRunBytes: BUDGET,
+        cacheMeasureMinIntervalMs: 0,
+        startCacheHolder: async (token, startOpts) => {
+          const n = starts.length;
+          starts.push(token);
+          const h = rotHolder(token, opts.holderMode ?? "removed");
+          holders.push(h);
+          if (n > 0) startOpts?.onSpawned?.(startFailures.get(n)?.close.promise ?? h.close.promise);
+          await startGates.get(n)?.promise;
+          const failure = startFailures.get(n);
+          if (failure) throw failure.error;
+          return h.holder;
+        },
+        measureCommandCache: async (token) => {
+          const n = measured.length;
+          measured.push(token);
+          await measureGates.get(n)?.promise;
+          return { state: "complete", bytes: bytes.get(`/var/cache/uzi-codex-cmd/${token}`) ?? 0 };
+        },
+        removeCommandCache: async (token) => {
+          base.events.push("remove");
+          base.removals.push(token);
+          const answer = opts.remove?.() ?? REMOVED_RESULT;
+          removeAnswers.push(answer);
+          return answer;
+        },
+        launchEffectRoot: async (spec, ...rest) => {
+          const at = spec.args.indexOf("--cache");
+          if (at >= 0 && !spec.args.includes(ENV_PROBE_SCRIPT)) {
+            const dir = spec.args[at + 1]!;
+            bytes.set(dir, (bytes.get(dir) ?? 0) + PER_COMMAND);
+          }
+          opts.onLaunch?.(base.specs.length, rr);
+          return launch(spec, ...rest);
+        },
+      };
+      return rr;
+    }
+    function driver(c: RotRig) {
+      const t = c.rig.transport;
+      let seq = 0;
+      t.push(threadStarted());
+      return {
+        bash: (command: string): void => { t.push(toolCall(10 + seq, "Bash", { command }, "th-1", "tn-1", `c-rot-${seq}`)); seq++; },
+        finish: (): void => { t.push(signalDone()).push(turnCompleted("completed")).end(); },
+      };
+    }
+    const executorFor = (c: RotRig, log: Logger = noopLog): CodexExecutor => makeExecutor(c.rig, bindingOf(SUBSCRIPTION), log);
+
+    it("REGRESSION 3675: an over-budget cache rotates; later commands carry the new holder's dir, the old one is never reused and is released only once idle", async () => {
+      const c = rotationRig();
+      const d = driver(c);
+      const exec = executorFor(c);
+      const running = exec.run(makeCtx().ctx);
+      d.bash("echo one");
+      d.bash("echo two");
+      await waitFor(() => c.starts.length === 2, "the replacement holder to start");
+      const g1 = c.holders[0]!;
+      const g2 = c.holders[1]!;
+      assert.equal(c.dirOf(1), g1.dir);
+      assert.equal(c.dirOf(2), g1.dir, "the pending generation keeps admitting until the replacement is adopted");
+      await waitFor(() => g1.releases.length === 1, "G1 to retire");
+      assert.deepEqual(g1.releases, [true], "released drained only after its last root was disposed");
+      assert.equal(c.specs.length, 3, "no command was launched meanwhile");
+      d.bash("echo three");
+      await waitFor(() => c.specs.length === 4, "the third command");
+      assert.equal(c.dirOf(3), g2.dir, "later command specs carry G2's dir");
+      d.finish();
+      await withTimeout(running, 3000, "rotation run");
+      assert.deepEqual(c.specs.filter((s) => s.args.includes(g1.dir)).length, 2, "G1 was never reacquired");
+      assert.deepEqual(g1.releases, [true]);
+      assert.deepEqual(g2.releases, [true], "G2 is released at terminal teardown");
+      assert.deepEqual(c.removals, []);
+      assert.equal(c.starts.length, 2);
+    });
+
+    it("G1 to G2 to G3: closes stay unresolved, no concurrent extra replacement, the seal waits for them", async () => {
+      const c = rotationRig({ holderMode: "pending" });
+      const d = driver(c);
+      const exec = executorFor(c);
+      const running = exec.run(makeCtx().ctx);
+      d.bash("echo one");
+      d.bash("echo two");
+      await waitFor(() => c.starts.length === 2, "G2 start");
+      const [g1, g2] = c.holders as [RotHolder, RotHolder];
+      await waitFor(() => g1.releases.length === 1, "G1 retired");
+      // G1's close is its own (pending) settlement; it is fully removed before the second switch.
+      g1.close.resolve(REMOVED_RESULT);
+      await tick();
+      assert.equal(c.starts.length, 2, "exactly one replacement so far");
+      d.bash("echo three");
+      d.bash("echo four");
+      await waitFor(() => c.starts.length === 3, "G3 start");
+      const g3 = c.holders[2]!;
+      await waitFor(() => g2.releases.length === 1, "G2 retired after G3 was adopted");
+      d.bash("echo five");
+      await waitFor(() => c.specs.length === 6, "the fifth command");
+      assert.equal(c.dirOf(5), g3.dir);
+      d.finish();
+      await withTimeout(running, 3000, "G1-G2-G3 run");
+      assert.equal(c.starts.length, 3, "startCacheHolder called exactly 3 times");
+      assert.deepEqual(g2.releases, [true]);
+      assert.deepEqual(g3.releases, [true], "terminal drainage releases G3 exactly once");
+      let sealed = false;
+      const sealing = exec.sealLifetime({}).then((value) => { sealed = true; return value; });
+      await tick(); await tick();
+      assert.equal(sealed, false, "the seal waits for G2's and G3's closes");
+      g2.close.resolve(REMOVED_RESULT);
+      await tick(); await tick();
+      assert.equal(sealed, false, "and for G3's");
+      g3.close.resolve(REMOVED_RESULT);
+      assert.equal((await sealing).kind, "sealed");
+    });
+
+    it("holder loss after a rotation: later commands get no cache; the lost holder is removed by token at the terminal settle", async () => {
+      const c = rotationRig();
+      const d = driver(c);
+      const exec = executorFor(c);
+      const running = exec.run(makeCtx().ctx);
+      d.bash("echo one");
+      d.bash("echo two");
+      await waitFor(() => c.holders.length === 2 && c.holders[0]!.releases.length === 1, "G1 retired");
+      const g2 = c.holders[1]!;
+      d.bash("echo three");
+      await waitFor(() => c.specs.length === 4, "a G2 command");
+      assert.equal(c.dirOf(3), g2.dir);
+      g2.die();
+      d.bash("echo four");
+      await waitFor(() => c.specs.length === 5, "a command after the loss");
+      assert.equal(c.dirOf(4), undefined, "no --cache once the current holder is gone");
+      d.finish();
+      await withTimeout(running, 3000, "holder loss run");
+      assert.deepEqual(c.removals, [g2.token], "terminal settle removes only the lost G2");
+      assert.deepEqual(c.holders[0]!.releases, [true]);
+      assert.deepEqual(g2.releases, []);
+      assert.equal((await exec.sealLifetime({})).kind, "sealed");
+    });
+
+    describe("negative controls", () => {
+      async function lostRun(remove: () => CacheCleanupResult) {
+        const c = rotationRig({ remove });
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        await waitFor(() => c.holders.length === 2 && c.holders[0]!.releases.length === 1, "G1 retired");
+        const g2 = c.holders[1]!;
+        g2.die();
+        d.bash("echo three");
+        await waitFor(() => c.specs.length === 4, "an uncached command");
+        d.finish();
+        await withTimeout(running, 3000, "lost run");
+        return { c, exec, g2 };
+      }
+
+      it("a removal that stays pending forever never seals", async () => {
+        const { exec } = await lostRun(() => ({ state: "pending", reason: "", settlement: new Promise<CacheCleanupResult>(() => undefined) }));
+        let settled = false;
+        void exec.sealLifetime({}).then(() => { settled = true; });
+        await tick(); await tick(); await tick();
+        assert.equal(settled, false, "no seal inside the observed window, and never sealed");
+      });
+
+      it("a retained/live or errored removal is unproven", async () => {
+        for (const answer of [
+          { state: "retained", reason: "live" },
+          { state: "error", reason: "protocol" },
+        ] as const) {
+          const { exec } = await lostRun(() => answer);
+          assert.equal((await exec.sealLifetime({})).kind, "unproven", answer.state);
+        }
+      });
+
+      it("a lost holder with an unclean root is retained without a removal, and unproven", async () => {
+        const c = rotationRig({ unclean: (i) => i === 3 });
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        await waitFor(() => c.holders.length === 2 && c.holders[0]!.releases.length === 1, "G1 retired");
+        d.bash("echo three");
+        await waitFor(() => c.specs.length === 4, "an unclean G2 command");
+        c.holders[1]!.die();
+        d.finish();
+        await withTimeout(running.catch(() => undefined), 3000, "unclean lost run");
+        assert.deepEqual(c.removals, []);
+        assert.deepEqual(c.holders[1]!.releases, []);
+        assert.equal((await exec.sealLifetime({})).kind, "unproven");
+      });
+
+      it("the positive scenario plus an independent distrust is still unproven", async () => {
+        const c = rotationRig();
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        d.finish();
+        await withTimeout(running, 3000, "distrust run");
+        (exec as unknown as { lifetime: { distrust(): void } }).lifetime.distrust();
+        assert.equal((await exec.sealLifetime({})).kind, "unproven");
+      });
+
+      it("a failed replacement start whose helper closes retained is unproven, and seals only after that close", async () => {
+        const c = rotationRig();
+        const close = gate<CacheCleanupResult>();
+        c.failStart(1, new CommandCacheStartError("timeout", close.promise), close);
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        await waitFor(() => c.starts.length === 1 + 1, "the replacement attempt");
+        d.bash("echo three");
+        await waitFor(() => c.specs.length === 4, "a command on the still-current G1");
+        assert.equal(c.dirOf(3), c.holders[0]!.dir, "a failed replacement never changes admission");
+        d.finish();
+        await withTimeout(running, 3000, "failed replacement run");
+        let settled = false;
+        const sealing = exec.sealLifetime({}).then((value) => { settled = true; return value; });
+        await tick(); await tick();
+        assert.equal(settled, false, "the live replacement helper keeps the seal pending");
+        close.resolve({ state: "retained", reason: "unattested" });
+        assert.equal((await sealing).kind, "unproven");
+        assert.equal(c.starts.length, 2, "no second replacement");
+        assert.deepEqual(c.removals, []);
+      });
+
+      it("an abandoned replacement whose release resolves removed is clean", async () => {
+        const c = rotationRig();
+        const hold = c.gateStart(1);
+        const d = driver(c);
+        const exec = executorFor(c);
+        const running = exec.run(makeCtx().ctx);
+        d.bash("echo one");
+        d.bash("echo two");
+        await waitFor(() => c.starts.length === 2, "the replacement attempt");
+        d.finish();
+        await withTimeout(running, 3000, "abandoned replacement run");
+        const sealing = exec.sealLifetime({});
+        hold.resolve();
+        assert.equal((await sealing).kind, "sealed");
+        assert.deepEqual(c.holders[1]!.releases, [true], "the late, never-used replacement was released");
+        assert.deepEqual(c.holders[0]!.releases, [true]);
+        assert.deepEqual(c.removals, []);
+      });
+    });
+  });
+
   describe("HeldRunCommandCache", () => {
     const cleanLaunch = async (): Promise<CodexRootHandle> => effectHandle(false);
     const spec = {} as CodexEffectLaunchSpec;
     const WAITS = { releaseMs: 100, removeMs: 100 };
 
-    it("once settle has begun, current() is undefined and a launch gets no cache (even while the holder is alive)", async () => {
+    it("once settle has begun, reserve() is undefined and a launch gets no cache (even while the holder is alive)", async () => {
       let answer!: (r: CacheCleanupResult) => void;
       const releaseAnswer = new Promise<CacheCleanupResult>((r) => { answer = r; });
       const base = fakeHolder([]);
       const cache = new HeldRunCommandCache({ ...base.holder, release: () => releaseAnswer });
-      assert.deepEqual(cache.current(), { dir: CACHE_DIR });
+      const reservation = cache.reserve();
+      assert.equal(reservation?.dir, CACHE_DIR);
+      reservation!.cancel();
       const settling = cache.settle(noopLog, async () => ({ state: "removed", reason: "" }), WAITS);
       assert.equal(base.holder.alive(), true, "the holder has not answered the release yet");
-      assert.equal(cache.current(), undefined, "no cache is handed out once settle has begun");
+      assert.equal(cache.reserve(), undefined, "no cache is handed out once settle has begun");
 
       const launched: CodexEffectLaunchSpec[] = [];
       const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
@@ -12111,7 +12456,7 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     it("drained is true with no roots and with every tracked root disposed clean", async () => {
       const cache = new HeldRunCommandCache(fakeHolder([]).holder);
       assert.equal(cache.drained(), true);
-      const h = await cache.track(cleanLaunch)(spec);
+      const h = await cache.reserve()!.launch(cleanLaunch)(spec);
       assert.equal(cache.drained(), false, "a launched, not yet disposed root is not drained");
       await h.dispose(10);
       assert.equal(cache.drained(), true);
@@ -12119,16 +12464,16 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
 
     it("an unclean dispose, a rejected dispose or a failed launch makes it false (sticky)", async () => {
       const unclean = new HeldRunCommandCache(fakeHolder([]).holder);
-      await (await unclean.track(async () => effectHandle(true))(spec)).dispose(10);
+      await (await unclean.reserve()!.launch(async () => effectHandle(true))(spec)).dispose(10);
       assert.equal(unclean.drained(), false);
 
       const rejected = new HeldRunCommandCache(fakeHolder([]).holder);
-      const h = await rejected.track(async () => ({ ...effectHandle(false), dispose: async () => { throw new Error("boom"); } }))(spec);
+      const h = await rejected.reserve()!.launch(async () => ({ ...effectHandle(false), dispose: async () => { throw new Error("boom"); } }))(spec);
       await assert.rejects(h.dispose(10), /boom/);
       assert.equal(rejected.drained(), false);
 
       const failed = new HeldRunCommandCache(fakeHolder([]).holder);
-      await assert.rejects(failed.track(async () => { throw new Error("launch failed"); })(spec), /launch failed/);
+      await assert.rejects(failed.reserve()!.launch(async () => { throw new Error("launch failed"); })(spec), /launch failed/);
       assert.equal(failed.drained(), false);
     });
 
@@ -12136,7 +12481,7 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
       const cache = new HeldRunCommandCache(fakeHolder([]).holder);
       const registry = new ExecutionRegistry(newLocalExecutionEpoch(9));
       cache.watchRegistry(registry);
-      await (await cache.track(cleanLaunch)(spec)).dispose(10);
+      await (await cache.reserve()!.launch(cleanLaunch)(spec)).dispose(10);
       assert.equal(cache.drained(), true);
       registry.poison({ category: "protocol", message: "poisoned" });
       assert.equal(cache.drained(), false);
@@ -12153,20 +12498,22 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
       await a.settle(rlog.log, remove, WAITS);
       await a.settle(rlog.log, remove, WAITS);
       assert.deepEqual(alive.releases, [true]);
-      assert.equal(a.current(), undefined, "no cache is handed out after settle");
+      assert.equal(a.reserve(), undefined, "no cache is handed out after settle");
       assert.ok(rlog.lines.some((l) => l.includes('"level":"warn"') && l.includes('"reason":"mismatch"')), "a retained release is a warn with its reason");
 
       const dead = fakeHolder(events);
       const d = new HeldRunCommandCache(dead.holder);
-      assert.deepEqual(d.current(), { dir: CACHE_DIR });
+      const held = d.reserve();
+      assert.equal(held?.dir, CACHE_DIR);
+      held!.cancel();
       dead.die();
-      assert.equal(d.current(), undefined, "no cache after holder loss");
+      assert.equal(d.reserve(), undefined, "no cache after holder loss");
       await d.settle(noopLog, remove, WAITS);
       assert.deepEqual(removals, [CACHE_TOKEN]);
 
       const undrained = fakeHolder(events);
       const u = new HeldRunCommandCache(undrained.holder);
-      await (await u.track(async () => effectHandle(true))(spec)).dispose(10);
+      await (await u.reserve()!.launch(async () => effectHandle(true))(spec)).dispose(10);
       undrained.die();
       await u.settle(noopLog, remove, WAITS);
       assert.deepEqual(removals, [CACHE_TOKEN], "not drained: no removal");
@@ -13635,6 +13982,55 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
         JSON.stringify(m2Runner.api.states.filter(s => s.runId === claim.run_id)));
       assert.match(pr.description, /Approved Codex follow-up remains/);
       assert.equal(m2ClosingDirective(pr.description, 2172, "org/repo"), false);
+    });
+    it("issue #3721 all-met interlocked Codex run: broker non_closing + deferred scope notes deliver an open-issue PR with no completion hold", async () => {
+      m2Runner.api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
+      await m2Runner.client.register("codex-3721-owner-acceptance");
+      const prApi = new FakePrDescApi();
+      m2Runner.api.prDescription = prApi;
+      const reason = "Owner acceptance pending: live dev-cluster rollout check";
+      const rig = makeMultiEpochRig([script("th-1", [
+        (th, tn) => [done(3721, th, tn, {
+          milestones_completed: ["m1", "m2"],
+          non_closing: { reason },
+          pr_summary: {
+            what: "Adds the thing.",
+            scope_notes: [
+              { kind: "deferred", text: "Owner acceptance: live dev-cluster rollout check" },
+              { kind: "deferred", text: "Owner acceptance: dashboard sign-off" },
+            ],
+          },
+        })],
+      ])]);
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const delivery: Executor = { run: async ctx => {
+        commitInTree(ctx.worktreePath, "m3721.txt", "delivered work\n");
+        return executor.run(ctx);
+      } };
+      const { gitlab, pr } = m2Runner.fakeGitlab();
+      m2FollowPush(m2Runner.git, pr);
+      const claim = m2Runner.gitlabClaim(3721, {
+        claim_generation: 7, issue_title: "Fixes #3721", plan_md: "Two milestones; owner acceptance is planned outside them", plan_approved: true, plan_source: "seeded",
+        milestones: [{ id: "m1", title: "Build" }, { id: "m2", title: "Wire" }],
+        config: { completion_contract_version: 1, contract_revision: 1 },
+      });
+      m2Runner.api.setPublicationState(claim.run_id, [], 1);
+      // The completion permit is canned (always granted), so the "no completion hold" assert below
+      // guards agent-side holding only, not the server's all-milestones-met decision.
+      m2Runner.api.setCompletionPermitResponse(true);
+      await m2Runner.runner(delivery, gitlab).execute(claim);
+      const states = m2Runner.api.states.filter(s => s.runId === claim.run_id).map(s => s.body.status);
+      assert.ok(states.includes("completed"), JSON.stringify(states));
+      assert.ok(!states.includes("awaiting_input"), "no completion question or owner-decision park");
+      assert.equal(m2Runner.api.completionHoldRequests.length, 0, "no completion hold");
+      assert.equal(m2Runner.api.completionPermitRequests.length, 1, "the permit is still requested");
+      assert.equal(m2ClosingDirective(pr.title + "\n" + pr.description, 3721, "org/repo"), false);
+      assert.doesNotMatch(pr.description, /Closes #3721/);
+      assert.ok(pr.title.includes("#3721"));
+      assert.ok(pr.description.includes(`> **Issue remains open.** ${reason}`), pr.description);
+      assert.match(pr.description, /- Deferred: Owner acceptance: live dev-cluster rollout check/);
+      assert.match(pr.description, /- Deferred: Owner acceptance: dashboard sign-off/);
+      assert.equal(prApi.calls.find(c => c.op === "stage")!.body.source, "lead_only", "the notes came from the lead's claims");
     });
     it("m2 non-closing actual broker callback retitles a closing issue title (issue #2779)", async () => {
       const rig = makeMultiEpochRig([script("th-1", [
@@ -27126,5 +27522,219 @@ describe("3404 terminal executor lifetime", () => {
     const executor = makeExecutor(rig, bindingOf(API_KEY));
     await executor.run(makeCtx().ctx);
     assert.equal((await executor.sealLifetime("run-1" as never)).kind, "unproven");
+  });
+});
+
+// ================================================================================
+describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
+  const ACTIVE = {
+    default_model: "gpt-6-astra", default_model_source: "user_default" as const,
+    default_effort: "high" as const, default_effort_source: "user_default" as const,
+  };
+  const approve = { kind: "approve", selection: { status: "absent" } } as never;
+
+  /** A real reporter over a recording client: the rows the executor makes it post. */
+  const reporterRig = (config: ClaimConfig | null) => {
+    const posts: LeadConfigReportBody[] = [];
+    const reporter = new LeadConfigReporter({
+      client: { async recordLeadConfig(_runId, body) { posts.push(body); return { kind: "ok" }; } },
+      runId: "run-1", claimGeneration: 5, active: leadConfigActive(config), logger: noopLog,
+    });
+    return { posts, reporter, rows: () => posts.map((p) => `${p.phase}#${p.phase_entry}/${p.seq}`) };
+  };
+  const doneFrames = (t: FakeTransport, th: string, tn: string) => {
+    t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+  };
+
+  /** Add the thread's resolved model / reasoning effort to every thread/start and thread/resume answer. */
+  const reporting = (responder: Responder, fields: () => Record<string, unknown>): Responder => (c) => {
+    const out = responder(c);
+    return c.method === "thread/start" || c.method === "thread/resume" ? { ...rec(out), ...fields() } : out;
+  };
+  const reported = (model: string, reasoningEffort: unknown) => () => ({ model, reasoningEffort, cwd: "/ignored" });
+  const observed = (p: LeadConfigReportBody) =>
+    [p.observed_model, p.observed_model_evidence, p.observed_effort, p.observed_effort_evidence];
+  const idle: Responder = (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+    if (c.method === "turn/start") { c.transport.push(threadStarted("th-1")); return { turn: { id: "tn-1" } }; }
+    return {};
+  };
+  const waitForRows = (posts: unknown[], n: number) => waitFor(() => posts.length >= n, `${n} lead-config rows`);
+
+  it("a pre-approved run records the requested row, then the runtime row, matching what was sent", async () => {
+    const { posts, reporter, rows } = reporterRig(ACTIVE);
+    const rig = makeRig({ responder: reporting(defaultResponder, reported("gpt-6-astra", "low")) });
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ config: ACTIVE, leadConfig: reporter });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "pre-approved lead-config run");
+    await waitForRows(posts, 2);
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
+    const sent = rig.transport.requests.find((r) => r.method === "turn/start");
+    assert.equal(rec(sent?.params).model, posts[0]!.requested_model);
+    assert.equal(rec(sent?.params).effort, posts[0]!.requested_effort);
+    assert.equal(posts[0]!.requested_model_source, "user_default");
+    assert.equal(posts[0]!.requested_effort_source, "user_default");
+    assert.equal(posts[0]!.requested_effort_mode, "explicit");
+    assert.equal(posts[0]!.claim_generation, 5);
+    assert.deepEqual(observed(posts[0]!), [null, null, null, null]);
+    // Effort was sent on turn/start, so the thread's own "low" is not what is reported.
+    assert.deepEqual(observed(posts[1]!), ["gpt-6-astra", "codex_thread_response", "high", "codex_sent"]);
+  });
+
+  it("acceptance example 2 (Codex schedule pin, user effort high): requested and runtime lines on the posted rows", async () => {
+    const config = {
+      default_model: "gpt-6-astra", default_model_source: "schedule_pin" as const,
+      default_effort: "high" as const, default_effort_source: "user_default" as const,
+    };
+    const { posts, reporter } = reporterRig(config);
+    const rig = makeRig({ responder: reporting(defaultResponder, reported("gpt-6-astra", "high")) });
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ config, leadConfig: reporter });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "schedule-pin lead-config run");
+    await waitForRows(posts, 2);
+    const last = posts[posts.length - 1]!;
+    assert.equal(last.requested_model, "gpt-6-astra");
+    assert.equal(last.requested_model_source, "schedule_pin");
+    assert.equal(last.requested_effort, "high");
+    assert.equal(last.requested_effort_source, "user_default");
+    assert.deepEqual(observed(last), ["gpt-6-astra", "codex_thread_response", "high", "codex_sent"]);
+  });
+
+  it("a runtime-default effort run reports the thread's configured effort as codex_runtime_default", async () => {
+    const config = { default_effort_source: "builtin" as const };
+    const { posts, reporter } = reporterRig(config);
+    const rig = makeRig({ responder: reporting(defaultResponder, reported(provider.model, "persistent")) });
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ config, leadConfig: reporter });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "provider-default lead-config run");
+    await waitForRows(posts, 2);
+    assert.equal(posts[0]!.requested_model, provider.model);
+    assert.equal(posts[0]!.requested_model_source, "builtin");
+    assert.equal(posts[0]!.requested_effort, null);
+    assert.equal(posts[0]!.requested_effort_mode, "runtime_default");
+    assert.deepEqual(observed(posts[1]!), [provider.model, "codex_thread_response", "other", "codex_runtime_default"]);
+  });
+
+  it("plan, revise, approve, implement: one plan entry (revise re-drives it) then one implement entry, each with its own runtime row", async () => {
+    const { posts, reporter, rows } = reporterRig(ACTIVE);
+    const planEpoch: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+      if (c.method === "turn/start") {
+        const tn = `tn-plan-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
+        c.transport
+          .push(toolCall(c.turnStartCount, "submit_plan", { plan_md: `PLAN ${c.turnStartCount}` }, "th-plan", tn, `c-plan-${c.turnStartCount}`))
+          .push(turnCompleted("completed", "th-plan", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    const fields = reported("gpt-6-astra", "high");
+    const rig = makeMultiEpochRig([
+      reporting(planEpoch, fields),
+      reporting(resumedEpochResponder("th-plan", "tn-impl", doneFrames), fields),
+    ]);
+    let gates = 0;
+    const { ctx } = makeCtx({
+      config: { ...ACTIVE, plan_max_revisions: 2 }, leadConfig: reporter,
+      planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => (++gates === 1 ? { kind: "revise", feedback: "tighten it" } : approve),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "gated lead-config run");
+    await waitForRows(posts, 4);
+    assert.equal(gates, 2);
+    assert.deepEqual(rows(), ["plan#1/1", "plan#1/2", "implement#1/1", "implement#1/2"]);
+    assert.equal(posts[1]!.observed_model_evidence, "codex_thread_response");
+    assert.equal(posts[3]!.observed_effort_evidence, "codex_sent");
+  });
+
+  /** One implement entry, interrupted into a recreated epoch (the issue #1782 refused-wall-park path). */
+  async function recreatedEpoch(config: ClaimConfig, first: () => Record<string, unknown>, second: () => Record<string, unknown>) {
+    const { posts, reporter, rows } = reporterRig(config);
+    const controller = new AbortController();
+    const rig = makeMultiEpochRig([
+      reporting(idle, first),
+      reporting(resumedEpochResponder("th-1", "tn-2", doneFrames), second),
+    ]);
+    let exec!: CodexExecutor;
+    let mode: "wall" | null = null;
+    const { ctx } = makeCtx({
+      config, leadConfig: reporter, signal: controller.signal,
+      pauseModeRequested: () => mode,
+      clearWallMode: () => { mode = null; },
+      parkForWall: async () => {
+        await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+        return "refused";
+      },
+    });
+    exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const running = exec.run(ctx);
+    await waitFor(() => rig.epochs[0]?.transport.turnStartCount === 1, "implement turn started");
+    mode = "wall";
+    controller.abort(new PauseNowSignal());
+    await withTimeout(running, 5000, "lead-config recreated epoch");
+    assert.equal(rig.providerLaunches(), 2, "the epoch was recreated");
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the re-drive ran on the fresh epoch");
+    return { posts, rows, rig };
+  }
+
+  it("a recreated epoch reporting a changed configured effort posts one more row on the same entry (issue #1782 path)", async () => {
+    const config = { default_model: "gpt-6-astra", default_model_source: "user_default" as const, default_effort_source: "builtin" as const };
+    let calls = 0;
+    const { posts, rows, rig } = await recreatedEpoch(config, () => {
+      calls++;
+      return { model: "gpt-6-astra", reasoningEffort: "medium" };
+    }, () => ({ model: "gpt-6-astra", reasoningEffort: "high" }));
+    await waitForRows(posts, 3);
+    assert.equal(calls, 1);
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2", "implement#1/3"], "one reporter, one entry, seq continuing across the recreate");
+    assert.deepEqual(observed(posts[1]!), ["gpt-6-astra", "codex_thread_response", "medium", "codex_runtime_default"]);
+    assert.deepEqual(observed(posts[2]!), ["gpt-6-astra", "codex_thread_response", "high", "codex_runtime_default"]);
+    // What each epoch actually sent is what the requested side says.
+    for (const e of rig.epochs) {
+      const sent = e.transport.requests.find((r) => r.method === "turn/start");
+      assert.equal(rec(sent?.params).model, posts[0]!.requested_model);
+      assert.equal(rec(sent?.params).effort, undefined, "runtime default sends no effort");
+    }
+  });
+
+  it("a recreated epoch reporting the same thing posts nothing more (per-entry dedupe)", async () => {
+    const same = () => ({ model: "gpt-6-astra", reasoningEffort: "high" });
+    const { posts, rows } = await recreatedEpoch(ACTIVE, same, same);
+    await waitForRows(posts, 2);
+    for (let i = 0; i < 5; i++) await tick();
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
+  });
+
+  it("a recreated epoch whose thread effort changed posts nothing when the sent effort is the evidence on both", async () => {
+    const { posts, rows } = await recreatedEpoch(
+      ACTIVE,
+      () => ({ model: "gpt-6-astra", reasoningEffort: "high" }),
+      () => ({ model: "gpt-6-astra", reasoningEffort: "low" }),
+    );
+    await waitForRows(posts, 2);
+    for (let i = 0; i < 5; i++) await tick();
+    // The sent effort is the evidence on both epochs, so a changed thread effort is not a change.
+    assert.deepEqual(rows(), ["implement#1/1", "implement#1/2"]);
+  });
+
+  it("posts nothing without the activation signal", async () => {
+    const config = { default_model: "gpt-6-astra", default_effort: "high" as const };
+    const { posts, reporter } = reporterRig(config);
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    assert.equal(reporter.enabled, false);
+    let entered = 0;
+    let observedCalls = 0;
+    const enterPhase = reporter.enterPhase.bind(reporter);
+    const observe = reporter.observe.bind(reporter);
+    reporter.enterPhase = (...args) => { entered++; return enterPhase(...args); };
+    reporter.observe = (...args) => { observedCalls++; return observe(...args); };
+    const { ctx } = makeCtx({ config, leadConfig: reporter });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "inactive lead-config run");
+    assert.equal(posts.length, 0);
+    // An inactive reporter gets no entry and the harness gets no runtime-config callback.
+    assert.equal(entered, 0);
+    assert.equal(observedCalls, 0);
   });
 });

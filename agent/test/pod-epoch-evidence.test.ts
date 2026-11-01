@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   parsePodEpochEvidence, assertPodEpochEvidenceBinding, PodEpochEvidenceError,
 } from "../src/pod-epoch-evidence.js";
+import { parsePodEpochEvidence as parseFrozenV1Consumer } from "./pod-epoch-evidence-v1-fixture.js";
 
 const root = new URL("../../fixtures/pod-epoch/", import.meta.url);
 const positive = await readFile(new URL("valid/positive.json", root), "utf8");
@@ -86,4 +87,40 @@ test("strict calendar validity and nanosecond observation ordering", () => {
   assert.ok(parsePodEpochEvidence(JSON.stringify(e)));
   e.successorAdded = "2026-10-25T23:59:59Z";
   assert.throws(() => parsePodEpochEvidence(JSON.stringify(e)));
+});
+test("v2 corpus: raw bytes, version discrimination, strict presence rule", async () => {
+  for (const directory of ["valid", "invalid"]) {
+    const names = await readdir(new URL("v2/" + directory + "/", root));
+    assert.ok(names.length > 0);
+    for (const name of names) {
+      const bytes = await readFile(new URL("v2/" + directory + "/" + name, root));
+      if (directory === "invalid") {
+        assert.throws(() => parsePodEpochEvidence(bytes), PodEpochEvidenceError, name);
+        continue;
+      }
+      const e = parsePodEpochEvidence(bytes);
+      assert.ok("version" in e, name);
+      assert.equal(e.version, 2, name);
+      if (e.version === 2) {
+        assert.ok(e.successorContainers.length > 0 && e.attestation.reason.length > 0, name);
+      }
+    }
+  }
+  const v2 = parsePodEpochEvidence(await readFile(new URL("v2/positive.json", root)));
+  assert.ok("version" in v2 && v2.version === 2);
+  assert.deepEqual(v2.version === 2 && v2.attestation, { result: "consistent", reason: "observations_consistent" });
+  const v1 = parsePodEpochEvidence(positive);
+  assert.ok("version" in v1 && v1.version === 1);
+  assert.equal("successorContainers" in v1, false);
+});
+test("old workers (frozen v0.86.0-rc.30 consumer) refuse every v2 document and still parse v1", async () => {
+  for (const name of await readdir(new URL("v2/valid/", root))) {
+    const bytes = await readFile(new URL("v2/valid/" + name, root));
+    assert.throws(() => parseFrozenV1Consumer(bytes), Error, name);
+  }
+  assert.throws(() => parseFrozenV1Consumer(positive.replace('"version":1', '"version":2')));
+  for (const name of await readdir(new URL("valid/", root))) {
+    const bytes = await readFile(new URL("valid/" + name, root));
+    assert.ok(parseFrozenV1Consumer(bytes), name);
+  }
 });

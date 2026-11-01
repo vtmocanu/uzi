@@ -32,8 +32,8 @@ configure({ asyncUtilTimeout: 5000 });
 // `localStorage.clear()` (e.g. AuthContext.test.tsx's beforeEach) throws
 // "TypeError: Cannot read properties of undefined (reading 'clear')".
 //
-// This repo pins Node 24 (.nvmrc), where jsdom DOES provide a working `localStorage`, so the
-// guard below is a strict no-op there: it only installs a store when one is missing or broken.
+// This repo pins Node 26 (.nvmrc). On a Node where jsdom DOES provide a working `localStorage`, the
+// guard below is a strict no-op: it only installs a store when one is missing or broken.
 // Several test files carry their own per-`beforeEach` `makeStorage()` shim for the same reason;
 // they redefine the (configurable) property with a fresh Map for isolation and keep working.
 function makeMemoryStorage(): Storage {

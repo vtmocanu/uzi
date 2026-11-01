@@ -219,7 +219,7 @@ describe("M1 boundary and cache authority", () => {
     let authenticError: unknown;
     let startupBudget: number | undefined;
     let registry: ExecutionRegistry;
-    const wrapped = held.track(async (_spec, startupMs, context) => {
+    const wrapped = held.reserve()!.launch(async (_spec, startupMs, context) => {
       launcherContext = context;
       startupBudget = startupMs;
       assert.equal(registry.pendingLaunchCount(), 1);
@@ -266,7 +266,7 @@ describe("M1 boundary and cache authority", () => {
     const deadline = context.hardDeadlineAt;
     const t = transport();
     let forwarded: StartupCleanupAuthorization | undefined;
-    const tracked = held.track(async (_spec, ms, auth) => {
+    const tracked = held.reserve()!.launch(async (_spec, ms, auth) => {
       forwarded = auth;
       return launch(t, auth, ms);
     });
@@ -279,9 +279,9 @@ describe("M1 boundary and cache authority", () => {
   it("a replay with the SAME authorization object cannot certify a later cache invocation", async () => {
     const held = cache();
     const context = authorization();
-    const error = await rejection(held.track(async (_spec, ms, auth) => launch(transport(), auth, ms))(spec, 2, context));
+    const error = await rejection(held.reserve()!.launch(async (_spec, ms, auth) => launch(transport(), auth, ms))(spec, 2, context));
     assert.equal(held.drained(), true);
-    await rejection(held.track(async () => { throw error; })(spec, 2, context));
+    await rejection(held.reserve()!.launch(async () => { throw error; })(spec, 2, context));
     assert.equal(held.drained(), false, "proof must be minted during this invocation, not merely match its context");
   });
   it("a mismatched/reused genuine rejection poisons the new attempt and taints the cache", async () => {
@@ -289,7 +289,7 @@ describe("M1 boundary and cache authority", () => {
     const reused = await rejection(launch(transport(), original));
     assert.equal(certificate(reused, original), true);
     const held = cache();
-    const seam = boundaryProcessSpawnerForTest("required", held.track(async () => { throw reused; }));
+    const seam = boundaryProcessSpawnerForTest("required", held.reserve()!.launch(async () => { throw reused; }));
     const { registry, safety } = safetyFor(seam);
     await assert.rejects(safety.withBoundary({ boundary: "checkpoint", deadlineMs: 1000 }, async (permit) => {
       const error = await rejection(safety.spawnBoundaryProcess(permit, request));
@@ -307,7 +307,7 @@ describe("M1 boundary and cache authority", () => {
         fabricated === "worker_marker" ? new CheckpointChildStartupTimeoutError(new Error("private-input")) :
         new Error("started deadline exceeded private-input");
       const { registry, safety } = safetyFor(boundaryProcessSpawnerForTest("required",
-        held.track(async () => { throw cause; })));
+        held.reserve()!.launch(async () => { throw cause; })));
       await assert.rejects(safety.withBoundary({ boundary: "checkpoint", deadlineMs: 1000 }, async (permit) => {
         const error = await rejection(safety.spawnBoundaryProcess(permit, request));
         assert.ok(error instanceof launcher.CodexLaunchError);

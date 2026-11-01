@@ -123,6 +123,16 @@ table ranks by recorded API-equivalent cost. Cost share is each user's share
 of recorded factory cost in the selected period, unavailable when that cost
 is zero. Incomplete-cost disclosures also apply to these shares.
 
+The usage card also shows the count of PRs uzi runs opened and cost per PR for
+each window. A PR is a distinct repo and PR number over non-chat runs, counted
+once and attributed to the earliest run's user and creation time; open, merged
+and closed PRs all count. The PR number records the PR associated with a run's
+branch, not proof that uzi created it: an already-existing PR on the branch can
+be adopted, almost always uzi's own. "Per PR" is the window's displayed cost
+divided by its PR count, "—" at zero PRs, and "at least $X per PR" when the cost
+carries the incomplete-cost disclosure. The per-user table has a PRs column
+following the window.
+
 Distinct legacy and metered fold rows make the run `unreported` while
 preserving its priced rows in aggregates and counting it as an unreported
 run. A status conflict on the same fold key instead zeros that row; other

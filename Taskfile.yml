@@ -1376,6 +1376,7 @@ tasks:
     cmds:
       - python3 -I -B scripts/release-watch.test.py
       - python3 -I -B scripts/release-journal.test.py
+      - python3 -I -B scripts/release-smoke-recovery.test.py
 
   test:release-auto:
     desc: offline release automation orchestration regressions
@@ -1647,6 +1648,13 @@ tasks:
       # helm-render job is a maintainer hand-off (M7). Offline + non-vacuous — see the
       # script header.
       - ./scripts/assert-drain-knobs-render.sh
+
+  render:node-selector-check:
+    desc: assert the controller Deployment renders workers.nodeSelector (default, override, null, {}) and refuses a non-map value
+    cmds:
+      # Not in gate:repo (the lint job lacks helm); CI's helm-chart job runs it. Offline +
+      # non-vacuous, see the script header.
+      - ./scripts/assert-worker-node-selector-render.sh
 
   render:ephemeral-docker-check:
     desc: assert effective Docker tier availability reaches the api Deployment

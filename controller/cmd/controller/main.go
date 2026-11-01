@@ -122,6 +122,7 @@ func main() {
 		APIURL:                      cfg.WorkerAPIURL,
 		StorageClass:                cfg.WorkerStorageClass,
 		PriorityClassName:           cfg.WorkerPriorityClassName,
+		NodeSelector:                cfg.WorkerNodeSelector,
 		MaxConcurrentRuns:           cfg.WorkerMaxConcurrentRuns,
 		MemoryGuardEnabled:          cfg.WorkerMemoryGuardEnabled,
 		MemoryGuardReserveBytes:     cfg.WorkerMemoryGuardReserveBytes,
@@ -139,7 +140,9 @@ func main() {
 		// default "off".
 		UIDSplit:       cfg.WorkerUIDSplit,
 		CommandSandbox: cfg.WorkerCommandSandbox,
-		APICAPEM:       cfg.APICAPEM,
+		// Per-run Codex command-cache byte budget; empty renders no env (worker default).
+		CommandCacheRunBytes: cfg.WorkerCommandCacheRunBytes,
+		APICAPEM:             cfg.APICAPEM,
 		// Where the join-token Secret mounts (issue #1761); empty keeps /run/secrets.
 		SecretMountPath: cfg.WorkerSecretMountPath,
 		// The docker worker's gated DinD prune (issue #1759) rides the disk self-heal

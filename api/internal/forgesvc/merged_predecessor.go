@@ -8,24 +8,42 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/recovery"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 type MergedPredecessorStore interface {
+	ListCrossRunTargets(context.Context, store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error)
 	ListMergedPredecessorCandidates(context.Context, store.ListMergedPredecessorCandidatesParams) ([]store.ListMergedPredecessorCandidatesRow, error)
 }
 
 type MergedPredecessorRecovery interface {
+	DiscardCrossRunHolds(context.Context, recovery.CrossRunTargetBinding, recovery.VerifiedCrossRunWitnessSnapshot) (int64, error)
 	DiscardMergedPredecessorHolds(context.Context, recovery.VerifiedMergeSnapshot) (int64, error)
 }
+
+type crossRunContinuation struct {
+	witness   uuid.UUID
+	createdAt pgtype.Timestamptz
+	runID     uuid.UUID
+	// Consecutive target-enumeration failures or phase-deadline exits for this
+	// witness. Reset by a successful enumeration or a different witness.
+	failures int
+}
+
+// After this many consecutive failures the witness cursor moves past B so later
+// candidates in the repository, legacy same-run discards included, progress.
+// B and its targets are rediscovered from an empty key after the cursor wraps.
+const crossRunEnumerationFailureLimit = 3
 
 type mergedPredecessorReconciler struct {
 	mu       sync.Mutex
 	q        MergedPredecessorStore
 	recovery MergedPredecessorRecovery
 	cursors  map[uuid.UUID]uuid.UUID
+	targets  map[uuid.UUID]crossRunContinuation
 	nextRepo uuid.UUID
 	// Internal context seam for deterministic deadline tests; nil uses real timers.
 	withTimeout func(context.Context, time.Duration) (context.Context, context.CancelFunc)
@@ -46,8 +64,10 @@ func (s *Service) SetMergedPredecessorRecovery(q MergedPredecessorStore, r Merge
 // ReconcileMergedPredecessors runs after ordinary polling using its original parent.
 // At most 100 repository visits and attempts share 30 seconds; each observation
 // gets at most five seconds and the client's existing timeout. Failures advance
-// attempted run cursors without blocking siblings; enumeration failures retain
-// their run cursor. Exhaustion wraps only for a later phase, preventing repeats.
+// attempted run cursors without blocking siblings. Cross-run targets retain the
+// witness cursor until exhausted; enumeration failures retain their continuation
+// until crossRunEnumerationFailureLimit consecutive failures yield past the witness.
+// Exhaustion wraps only for a later phase, preventing repeats.
 func (s *Service) ReconcileMergedPredecessors(parent context.Context, repoIDs []uuid.UUID) {
 	m := &s.merged
 	if m.q == nil || m.recovery == nil {
@@ -69,12 +89,20 @@ func (s *Service) ReconcileMergedPredecessors(parent context.Context, repoIDs []
 			delete(m.cursors, id)
 		}
 	}
+	for id := range m.targets {
+		if !enabled[id] {
+			delete(m.targets, id)
+		}
+	}
 	if len(repos) == 0 {
 		m.nextRepo = uuid.Nil
 		return
 	}
 	if m.cursors == nil {
 		m.cursors = make(map[uuid.UUID]uuid.UUID)
+	}
+	if m.targets == nil {
+		m.targets = make(map[uuid.UUID]crossRunContinuation)
 	}
 	index := 0
 	for index < len(repos) && slices.Compare(repos[index][:], m.nextRepo[:]) < 0 {
@@ -107,6 +135,7 @@ func (s *Service) ReconcileMergedPredecessors(parent context.Context, repoIDs []
 		}
 		if len(rows) == 0 {
 			m.cursors[repo] = uuid.Nil
+			delete(m.targets, repo)
 			exhausted[repo] = true
 			continue
 		}
@@ -120,13 +149,29 @@ func (s *Service) ReconcileMergedPredecessors(parent context.Context, repoIDs []
 			continue
 		}
 		attempted[row.RunID] = true
+		before := m.cursors[repo]
 		m.cursors[repo] = row.RunID
-		attempts++
-		s.verifyMergedPredecessor(ctx, row)
+		s.verifyMergedPredecessor(ctx, row, before, &attempts)
+		if _, pending := m.targets[repo]; pending {
+			exhausted[repo] = true
+		}
 	}
 }
 
-func (s *Service) verifyMergedPredecessor(ctx context.Context, row store.ListMergedPredecessorCandidatesRow) {
+func (s *Service) verifyMergedPredecessor(ctx context.Context, row store.ListMergedPredecessorCandidatesRow, before uuid.UUID, attempts *int) {
+	m := &s.merged
+	continuation := m.targets[row.RepoID]
+	if continuation.witness != row.RunID {
+		continuation = crossRunContinuation{witness: row.RunID}
+	}
+	delete(m.targets, row.RepoID)
+	// Freeze every witness field before any forge I/O.
+	binding := recovery.MergeBinding{
+		RunID: row.RunID, OwnerID: row.OwnerID, RepoID: row.RepoID, ConnectionID: row.ConnectionID,
+		ProjectID: row.ProjectID, MRIID: row.MrIid, CompletedGeneration: row.CompletedGeneration,
+		ForgeType: row.ForgeType, BaseURL: row.BaseUrl,
+	}
+	witnessBinding := recovery.CrossRunWitnessBinding{MergeBinding: binding, Kind: row.Kind, IssueIID: row.IssueIid.Int64, CreatedAt: row.CreatedAt.Time}
 	// Isolate each attempted candidate, including a post-commit settlement hook.
 	// A panic cannot undo a committed discard; the existing retention backstop retries settlement.
 	// Never log the recovered value: it may contain forge response data or credentials.
@@ -151,16 +196,85 @@ func (s *Service) verifyMergedPredecessor(ctx context.Context, row store.ListMer
 		slog.Warn("merged predecessor reconciliation refused", "run_id", row.RunID, "reason", "merge_unverified")
 		return
 	}
-	snapshot, err := recovery.NewVerifiedMergeSnapshot(recovery.MergeBinding{
-		RunID: row.RunID, OwnerID: row.OwnerID, RepoID: row.RepoID, ConnectionID: row.ConnectionID,
-		ProjectID: row.ProjectID, MRIID: row.MrIid, CompletedGeneration: row.CompletedGeneration,
-		ForgeType: row.ForgeType, BaseURL: row.BaseUrl,
-	}, time.Now(), &recovery.MergeObservation{IID: observed.IID, State: observed.State})
-	if err != nil {
-		slog.Warn("merged predecessor reconciliation refused", "run_id", row.RunID, "reason", "invalid_snapshot")
+	verifiedAt := time.Now().UTC()
+	observation := &recovery.MergeObservation{IID: observed.IID, State: observed.State}
+	if row.OriginalBranch {
+		snapshot, snapshotErr := recovery.NewVerifiedMergeSnapshot(binding, verifiedAt, observation)
+		if snapshotErr != nil {
+			slog.Warn("merged predecessor reconciliation refused", "run_id", row.RunID, "reason", "invalid_snapshot")
+			return
+		}
+		(*attempts)++
+		if _, err = m.recovery.DiscardMergedPredecessorHolds(ctx, snapshot); err != nil {
+			slog.Warn("merged predecessor reconciliation refused", "run_id", row.RunID, "reason", "settlement_refused")
+		}
+	}
+	if !row.IssueIid.Valid || !row.CreatedAt.Valid || row.CreatedAt.InfinityModifier != pgtype.Finite {
 		return
 	}
-	if _, err = s.merged.recovery.DiscardMergedPredecessorHolds(ctx, snapshot); err != nil {
-		slog.Warn("merged predecessor reconciliation refused", "run_id", row.RunID, "reason", "settlement_refused")
+	witness, err := recovery.NewVerifiedCrossRunWitnessSnapshot(witnessBinding, verifiedAt, observation)
+	if err != nil {
+		return
 	}
+	// Keep the witness cursor before B until its targets are exhausted. Each phase
+	// observes B again and visits at most one target; refusals retry after a wrap.
+	m.targets[row.RepoID] = continuation
+	m.cursors[row.RepoID] = before
+	if *attempts >= 100 {
+		// A refused legacy transaction can repeatedly consume the final slot.
+		// Resume this repository first so its deferred target gets a fresh budget.
+		m.nextRepo = row.RepoID
+		return
+	}
+	if ctx.Err() != nil {
+		m.crossRunEnumerationFailed(row, continuation)
+		return
+	}
+	targets, err := m.q.ListCrossRunTargets(ctx, store.ListCrossRunTargetsParams{
+		RepoID: pgtype.UUID{Bytes: row.RepoID, Valid: true}, OwnerID: binding.OwnerID,
+		IssueIid: row.IssueIid, WitnessRunID: binding.RunID, WitnessCreatedAt: row.CreatedAt,
+		AfterCreatedAt: continuation.createdAt, AfterRunID: continuation.runID,
+	})
+	if ctx.Err() != nil {
+		m.crossRunEnumerationFailed(row, continuation)
+		return
+	}
+	if err != nil {
+		slog.Warn("merged predecessor reconciliation refused", "run_id", row.RunID, "reason", "target_enumeration_failed")
+		m.crossRunEnumerationFailed(row, continuation)
+		return
+	}
+	if len(targets) == 0 {
+		delete(m.targets, row.RepoID)
+		m.cursors[row.RepoID] = row.RunID
+		return
+	}
+	target := targets[0]
+	// Advance before entering recovery, including when recovery refuses or panics.
+	m.targets[row.RepoID] = crossRunContinuation{witness: row.RunID, createdAt: target.CreatedAt, runID: target.RunID}
+	if !target.RepoID.Valid || !target.IssueIid.Valid || !target.FinishedAt.Valid || target.FinishedAt.InfinityModifier != pgtype.Finite {
+		return
+	}
+	(*attempts)++
+	if _, err = m.recovery.DiscardCrossRunHolds(ctx, recovery.CrossRunTargetBinding{
+		RunID: target.RunID, OwnerID: target.OwnerID, RepoID: uuid.UUID(target.RepoID.Bytes),
+		Kind: target.Kind, Status: target.Status, Generation: target.Generation,
+		IssueIID: target.IssueIid.Int64, FinishedAt: target.FinishedAt.Time,
+	}, witness); err != nil {
+		slog.Warn("merged predecessor reconciliation refused", "run_id", row.RunID, "reason", "cross_run_settlement_refused")
+	}
+}
+
+// crossRunEnumerationFailed keeps the continuation for a transient failure and
+// yields the witness cursor past B once the consecutive-failure limit is reached.
+// The attempt-cap deferral is not a failure and never calls this.
+func (m *mergedPredecessorReconciler) crossRunEnumerationFailed(row store.ListMergedPredecessorCandidatesRow, continuation crossRunContinuation) {
+	continuation.failures++
+	if continuation.failures >= crossRunEnumerationFailureLimit {
+		slog.Warn("merged predecessor reconciliation refused", "run_id", row.RunID, "reason", "target_enumeration_yielded")
+		delete(m.targets, row.RepoID)
+		m.cursors[row.RepoID] = row.RunID
+		return
+	}
+	m.targets[row.RepoID] = continuation
 }

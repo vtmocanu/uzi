@@ -523,7 +523,7 @@ for (const exhaustion of [undefined, "adminEntries", "metadataBytes"] as const) 
           return c;
         } },
     }));
-    assert.equal(result.process?.state, exhaustion ? "unverified" : "quiescent", result.process?.detail);
+    assert.equal(result.process?.state, exhaustion ? "unverified" : "quiescent", result.process?.detail ?? "no process detail reported");
     assert.deepEqual(JSON.parse(input).workLimits, limits);
     // Even exhausted children retain the entire original parent reservation.
     f.run(() => {

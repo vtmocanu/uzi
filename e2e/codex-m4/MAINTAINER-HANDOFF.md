@@ -195,7 +195,7 @@ Both were satisfied for PR #1309.
   Linux-only P leg through the same pinned container on macOS). The runner
   (`executeMacosLinuxRun` in `macos-linux-runner.ts`) runs the COMPLETE strict P suite (all
   three P files — startup-smoke, policy-real, native-bypass) inside the pinned container —
-  `docker.io/library/node:24-bookworm@sha256:6dac556d980b7f0e5498d08f08cee0ca67798b4ad6c23964a9214920e67758d0`
+  `docker.io/library/node:26-bookworm@sha256:3b764117159bda01d2396391e7789b6a9106af9729cfd001ef55e98557868310`
   (multiarch-verified amd64/arm64) — mounting only the disposable fixture/test inputs, network
   disabled during tests, no Docker socket or maintainer HOME mounted, and hard-fails on missing
   Docker or an unsupported architecture (never a silent platform skip). `e2e/codex-m4/README.md`

@@ -528,6 +528,9 @@ func (h *Handler) recovery() *recovery.Service {
 			h.recoverySvc = recovery.New(h.q, h.pool, h.box, h.recoveryLimits(), h.now)
 			if h.wsvc != nil {
 				h.recoverySvc.SetCustodySettledHook(h.wsvc.SettleRetainedCheckpoint)
+				h.recoverySvc.SetPrerequisiteClosure(h.cfg.PrerequisiteClosureForges, func(userID, captureID uuid.UUID) {
+					h.wsvc.KickPrerequisiteClosure(userID, captureID)
+				})
 				// Issue #2545 step B: the held-ref listing goes through the same SSRF-gated
 				// derivation as step A's push.
 				heldRemote := h.wsvc.HeldRemote()
@@ -972,6 +975,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// GetRunReviewPanel → GetRunForViewer-scoped, capped by the same
 				// RequireUser masking as GetRun.
 				r.Get("/{id}/review", h.GetRunReview)
+				// Lead-config history (PRD #3244 M3): every recorded lead model/effort row of the
+				// run across claim generations, for `uzi run lead-config`. Owner-or-admin via
+				// GetRunForViewer (404 otherwise); read-only, no token spend, so RequireUser.
+				r.Get("/{id}/lead-config", h.GetRunLeadConfigHistory)
 				// Task diff-review read (PRD #400 M4a): the handoff task's structured
 				// findings as JSON, for `uzi handoff review <id>`. Owner-or-admin, same
 				// GetRunForViewer scoping as the review read; no forge write, no token spend.
@@ -1294,6 +1301,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// lineage. Both are gated by the decisions_memo_enabled admin setting, failing closed.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/decisions-memo", h.WorkerSaveDecisionsMemo)
 		r.With(h.refuseJobRuns).Get("/runs/{id}/decisions-memo", h.WorkerGetDecisionsMemo)
+
+		// Lead-config record (PRD #3244): the worker reports what its lead agent was configured
+		// to use and what the runtime reported, one claim-fenced row per report.
+		r.With(h.refuseJobRuns).Post("/runs/{id}/lead-config", h.WorkerRecordLeadConfig)
 		r.With(interruptedCallsDeadline, h.refuseJobRuns).Get("/runs/{id}/interrupted-calls", h.WorkerInterruptedCalls)
 
 		// Forge read surface (PRD #158 M1): worker-authenticated, run-scoped, READ

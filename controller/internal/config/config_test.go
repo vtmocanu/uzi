@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"maps"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -530,6 +531,58 @@ func TestLoadLeavesThePriorityClassOptional(t *testing.T) {
 	}
 }
 
+// UZI_WORKER_NODE_SELECTOR is a JSON object; every "no selector" spelling the chart can
+// render (unset, empty, null, {}) loads as nil, so a cleared selector hashes as before.
+func TestLoadParsesTheWorkerNodeSelector(t *testing.T) {
+	for raw, want := range map[string]map[string]string{
+		"":                               nil,
+		"null":                           nil,
+		"{}":                             nil,
+		`{"kubernetes.io/arch":"amd64"}`: {"kubernetes.io/arch": "amd64"},
+		`{"kubernetes.io/arch":"arm64","pool":"a"}`: {"kubernetes.io/arch": "arm64", "pool": "a"},
+		// An explicit empty value is a valid label value ("label present and empty").
+		`{"pool":""}`: {"pool": ""},
+	} {
+		t.Run(raw, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://uzi.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+			t.Setenv("UZI_WORKER_NODE_SELECTOR", raw)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if !maps.Equal(cfg.WorkerNodeSelector, want) || (want == nil) != (cfg.WorkerNodeSelector == nil) {
+				t.Errorf("WorkerNodeSelector = %#v, want %#v", cfg.WorkerNodeSelector, want)
+			}
+		})
+	}
+}
+
+// A selector the API server would reject fails at boot, not as workers that never appear.
+func TestLoadRejectsABadWorkerNodeSelector(t *testing.T) {
+	for _, bad := range []string{
+		`["kubernetes.io/arch"]`,
+		`{"kubernetes.io/arch":1}`,
+		`{"bad key!":"amd64"}`,
+		`{"kubernetes.io/arch":"not a label value"}`,
+		`{"kubernetes.io/arch":"amd64"`,
+		// A null member would decode to "" and pin every worker to an empty label.
+		`{"kubernetes.io/arch":null}`,
+		`{"pool":"a","kubernetes.io/arch":null}`,
+	} {
+		t.Run(bad, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://uzi.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+			t.Setenv("UZI_WORKER_NODE_SELECTOR", bad)
+			if _, err := Load(); err == nil {
+				t.Fatalf("UZI_WORKER_NODE_SELECTOR=%s loaded without error", bad)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsABadWorkerAPIURL(t *testing.T) {
 	for _, bad := range []string{"api.uzi.svc.cluster.local:8443", "ftp://api", "https://"} {
 		t.Run(bad, func(t *testing.T) {
@@ -998,6 +1051,57 @@ func TestLoadParsesTheUIDSplit(t *testing.T) {
 			t.Fatalf("err = %v, want a boot refusal naming UZI_WORKER_UID_SPLIT", err)
 		}
 	})
+}
+
+// UZI_CODEX_COMMAND_CACHE_RUN_BYTES stays "" when unset, keeps a valid plain decimal (trimmed),
+// and refuses anything else at boot.
+func TestLoadParsesTheCommandCacheRunBytes(t *testing.T) {
+	load := func(t *testing.T, val string, set bool) (Config, error) {
+		t.Helper()
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		if set {
+			t.Setenv("UZI_CODEX_COMMAND_CACHE_RUN_BYTES", val)
+		}
+		return Load()
+	}
+
+	t.Run("unset stays empty", func(t *testing.T) {
+		cfg, err := load(t, "", false)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerCommandCacheRunBytes != "" {
+			t.Errorf("WorkerCommandCacheRunBytes = %q, want empty", cfg.WorkerCommandCacheRunBytes)
+		}
+	})
+
+	for in, want := range map[string]string{
+		"0":                "0",
+		"4294967296":       "4294967296",
+		"  4294967296\n":   "4294967296",
+		"9007199254740991": "9007199254740991",
+		"   ":              "",
+	} {
+		t.Run("accepts "+in, func(t *testing.T) {
+			cfg, err := load(t, in, true)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.WorkerCommandCacheRunBytes != want {
+				t.Errorf("WorkerCommandCacheRunBytes = %q, want %q", cfg.WorkerCommandCacheRunBytes, want)
+			}
+		})
+	}
+
+	for _, bad := range []string{"-1", "1.5", "4GiB", "0x10", "01", "+1", "9007199254740992", "99999999999999999999999"} {
+		t.Run("rejects "+bad, func(t *testing.T) {
+			if _, err := load(t, bad, true); err == nil || !strings.Contains(err.Error(), "UZI_CODEX_COMMAND_CACHE_RUN_BYTES") {
+				t.Fatalf("err = %v, want a boot refusal naming UZI_CODEX_COMMAND_CACHE_RUN_BYTES", err)
+			}
+		})
+	}
 }
 
 // UZI_CODEX_COMMAND_SANDBOX defaults to "off", accepts "required" and "best-effort", and rejects any

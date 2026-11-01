@@ -61,6 +61,11 @@ func (*BaseFake) VerifyToken(context.Context) (forge.BotIdentity, error) {
 	return forge.BotIdentity{}, notStubbed("VerifyToken")
 }
 
+// GetProject implements forge.Forge.
+func (*BaseFake) GetProject(context.Context, int64) (forge.Project, error) {
+	return forge.Project{}, notStubbed("GetProject")
+}
+
 // ListProjects implements forge.Forge.
 func (*BaseFake) ListProjects(context.Context) ([]forge.Project, error) {
 	return nil, notStubbed("ListProjects")

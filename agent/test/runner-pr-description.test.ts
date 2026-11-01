@@ -138,7 +138,7 @@ describe("M4 owner-deferred work", () => {
     assert.equal((parsed.completion.match(/^> - \[ \]/gm) ?? []).length, 2);
     const explanation = "Not delivered or verified by this run; must be completed or verified before closing the source issue.";
     for (const id of ["m2", "m3"]) {
-      const item = parsed.completion.split("\n").find(line => line.startsWith(`> - [ ] \`${id}\` — `));
+      const item: string | undefined = parsed.completion.split("\n").find(line => line.startsWith(`> - [ ] \`${id}\` — `));
       assert.ok(item, `${id} is an unchecked item`);
       assert.ok(item.endsWith(`. ${explanation}`), `${id} carries its own explanation`);
       if (id === "m2") {
@@ -997,6 +997,61 @@ describe("m2 non-closing delivery", () => {
     assert.ok(statuses(claim.run_id).includes("completed"));
     assert.match(pr.description, /Approved follow-up remains/);
     assert.equal(closingDirectiveFor(pr.description, 2172, "org/repo"), false);
+  });
+
+  // Issue #3721: a lead whose frozen milestones are ALL met but whose owner acceptance is planned
+  // outside the milestones declares `non_closing` (reason naming the pending item) plus `deferred`
+  // pr_summary scope notes; delivery then leaves the issue open with no completion question.
+  it("issue #3721 all-met interlocked run: raw Claude non_closing + deferred scope notes deliver an open-issue PR with no completion hold", async () => {
+    const prApi = new FakePrDescApi();
+    api.prDescription = prApi;
+    const { gitlab, pr } = fakeGitlab();
+    const claim = interlockedClaim(3721);
+    claim.issue_title = "Fixes #3721"; // a closing issue title must not reach the PR title either
+    // The completion permit is canned (always granted), so the "no completion hold" assert below
+    // guards agent-side holding only, not the server's all-milestones-met decision.
+    api.setCompletionPermitResponse(true);
+    api.setInputs(claim.run_id, [input("approve_plan")]);
+    const reason = "Owner acceptance pending: live dev-cluster rollout check";
+    let turn = 0;
+    const queryFn: SdkQueryFn = params => (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      if (turn++ === 0) {
+        yield assistant([{ type: "tool_use", id: "plan", name: "mcp__uzi__submit_plan", input: {
+          plan_md: "Two milestones; owner acceptance is planned outside them",
+          milestones: [{ id: "m1", title: "Build" }, { id: "m2", title: "Wire" }],
+        } }]);
+      } else {
+        const cwd = params.options.cwd!;
+        fs.writeFileSync(path.join(cwd, "m3721.txt"), "delivered work\n");
+        execFileSync("git", ["-C", cwd, "add", "m3721.txt"]);
+        execFileSync("git", ["-C", cwd, "-c", "user.name=Test", "-c", "user.email=test@example.test", "-c", "commit.gpgsign=false", "commit", "-m", "m3721 work"]);
+        yield assistant([{ type: "tool_use", id: "done", name: "mcp__uzi__signal_done", input: {
+          milestones_completed: ["m1", "m2"],
+          non_closing: { reason },
+          pr_summary: {
+            what: "Adds the thing.",
+            scope_notes: [
+              { kind: "deferred", text: "Owner acceptance: live dev-cluster rollout check" },
+              { kind: "deferred", text: "Owner acceptance: dashboard sign-off" },
+            ],
+          },
+        } }]);
+      }
+      yield resultOk();
+    })();
+    await runnerWith(() => ({ executor: new SdkExecutor(nullLogger(), homeDir, { queryFn }), homeDir }), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"), JSON.stringify(statuses(claim.run_id)));
+    assert.ok(!statuses(claim.run_id).includes("awaiting_input"), "no completion question or owner-decision park");
+    assert.equal(api.completionHoldRequests.length, 0, "no completion hold");
+    assert.equal(api.completionPermitRequests.length, 1, "the permit is still requested (the declaration never skips it)");
+    assert.equal(closingDirectiveFor(pr.title + "\n" + pr.description, 3721, "org/repo"), false);
+    assert.doesNotMatch(pr.description, /Closes #3721/);
+    assert.ok(pr.title.includes("#3721"));
+    assert.ok(pr.description.includes(`> **Issue remains open.** ${reason}`), pr.description);
+    assert.match(pr.description, /- Deferred: Owner acceptance: live dev-cluster rollout check/);
+    assert.match(pr.description, /- Deferred: Owner acceptance: dashboard sign-off/);
+    assert.equal(prApi.calls.find(c => c.op === "stage")!.body.source, "lead_only", "the notes came from the lead's claims");
   });
 
   // Issue #2779: the PR TITLE of a declared non-closing issue run must not close the issue either.

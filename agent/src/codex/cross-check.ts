@@ -193,6 +193,7 @@ function settleActivity(activity: CheckActivityRecorder, callId: string, kind: A
   }
   const fileop = result.fileopCode;
   if (fileop === "E_OVERSIZE") activity.settle(callId, { outcome: "oversize" });
+  // The search_limit operand is a deliberate defensive fallback: Search now returns ceilings as ok partial results.
   else if (fileop === "E_TIMEOUT" || result.code === "search_limit") activity.settle(callId, { outcome: "limit" });
   else if (fileop === "E_ESCAPE" || fileop === "E_SYMLINK" || result.code === "path_denied") activity.settle(callId, { outcome: "denied" });
   else if (fileop === "E_DENIED" || result.code === "denied_tool" || result.code === "unknown_tool") {

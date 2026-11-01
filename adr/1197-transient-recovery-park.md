@@ -4,6 +4,22 @@
 **Date**: 2026-09-08
 **Issue**: [vtmocanu/uzi#1197](https://github.com/vtmocanu/uzi/issues/1197)
 
+## Amendment 2026-10-29 — C1b pinning preserves the local-proof boundary (#3591)
+
+The API-only prerequisite lifecycle in [ADR-3591](3591-prerequisite-closure.md)
+does not change verified-capture park policy or grant custody/source cleanup
+from a locally verified thin bundle. The conditional T1–T5 proof trusts the
+worker's header declaration and byte binding; the server does not parse or
+verify bundle contents. Native tests show restore after pin fetch across a
+default rewrite, and failure when a required second prerequisite is undeclared.
+
+C1b has no feature advertisement, agent change, closure-mint permission or
+thin FINAL release. Retained-claim, boot and producer paths gain no reconstructed
+binding or held-publication policy. C2 release, #2969 integration and producer
+FINAL need their separate proofs. A frozen unknown stays listing-only without
+resend/rebind/reset; S7 and the O10 operator procedure grant no disposal shortcut.
+Exact-head hosted acceptance and timing remain pending.
+
 ## Context
 
 The failed run reported a zero-turn SDK result with no model activity.

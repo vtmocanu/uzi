@@ -85,6 +85,23 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) err
 	return renderRunDetailAt(p, r, time.Now(), origin...)
 }
 
+// leadConfigRows are the LEAD and LEAD_SOURCE rows (PRD #3244 section 8), emitted only when the run
+// carries lead_config (a lead-lane run). LEAD is the chip text without its "lead: " prefix; LEAD_SOURCE joins
+// the tooltip lines with "; ". Model strings are worker-attested, so both cells go through sanitizeTTY.
+func leadConfigRows(r apitypes.RunDTO) [][]string {
+	if r.LeadConfig == nil {
+		return nil
+	}
+	v := runpresentation.LeadConfigView(runpresentation.LeadConfigViewInputFromRun(r))
+	if v.Chip == "" {
+		return nil
+	}
+	return [][]string{
+		{"LEAD", sanitizeTTY(strings.TrimPrefix(v.Chip, "lead: "))},
+		{"LEAD_SOURCE", sanitizeTTY(strings.Join(v.Lines, "; "))},
+	}
+}
+
 func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, origin ...string) error {
 	rows := [][]string{
 		{"ID", r.ID},
@@ -111,6 +128,7 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 		// and still carries the raw enum (machine-facing, D1).
 		{"HEALTH", displayHealth(r.Health)},
 	}
+	rows = append(rows, leadConfigRows(r)...)
 	if len(r.AutoApproveBlockedReasons) > 0 {
 		rows = append(rows, []string{"AUTO_APPROVE_BLOCKED", strings.Join(r.AutoApproveBlockedReasons, ", ")})
 	}

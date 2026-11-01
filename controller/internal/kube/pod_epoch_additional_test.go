@@ -27,7 +27,7 @@ func TestPodEpochDeletionAndHistoricalMembership(t *testing.T) {
 		h.event(watch.Modified, x)
 		x.Status = corev1.PodStatus{}
 		h.event(watch.Deleted, x)
-		h.assertDecision(h.event(watch.Added, epochPod(epochB)), true)
+		h.assertDecision(h.successor(epochPod(epochB)), true)
 	})
 	t.Run("foreign-label-user-loses-membership", func(t *testing.T) {
 		// No claim mounts: only the original label makes this pod count.
@@ -59,7 +59,7 @@ func TestPodEpochDeletionAndHistoricalMembership(t *testing.T) {
 		h.assertDecision(h.event(watch.Added, epochPod(epochB)), false)
 		h.event(watch.Modified, epochTerminal(epochPod(epochA)))
 		h.event(watch.Modified, epochTerminal(epochPod(epochB)))
-		e := h.assertDecision(h.event(watch.Added, epochPod(epochC)), true)
+		e := h.assertDecision(h.successor(epochPod(epochC)), true)
 		if e.Predecessor != epochB {
 			t.Fatal("skipped immediate B")
 		}
@@ -71,7 +71,7 @@ func TestPodEpochDeletionAndHistoricalMembership(t *testing.T) {
 		h.event(watch.Modified, epochTerminal(w))
 		h.assertDecision(h.event(watch.Added, epochPod(epochA)), false)
 		h.event(watch.Modified, epochTerminal(epochPod(epochA)))
-		h.assertDecision(h.event(watch.Added, epochPod(epochB)), true)
+		h.assertDecision(h.successor(epochPod(epochB)), true)
 	})
 	t.Run("terminal-regression", func(t *testing.T) {
 		h := newEpochHarness(t, epochPod(epochA))
@@ -91,8 +91,11 @@ func TestPodEpochReadFailureAndCancellation(t *testing.T) {
 		h := newEpochHarness(t, epochPod(epochA))
 		h.event(watch.Modified, epochTerminal(epochPod(epochA)))
 		ctx, cancel := context.WithCancel(context.Background())
-		d, err := h.session.Handle(ctx, h.generation, watch.Added, epochPod(epochB))
-		if err != nil {
+		if _, err := h.session.Handle(ctx, h.generation, watch.Added, epochPod(epochB)); err != nil {
+			t.Fatal(err)
+		}
+		d, err := h.session.Handle(ctx, h.generation, watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
+		if err != nil || d == nil {
 			t.Fatal(err)
 		}
 		cancel()
@@ -103,7 +106,7 @@ func TestPodEpochReadFailureAndCancellation(t *testing.T) {
 	t.Run("submitted-patch-keeps-original-binding", func(t *testing.T) {
 		h := newEpochHarness(t, epochPod(epochA))
 		h.event(watch.Modified, epochTerminal(epochPod(epochA)))
-		d := h.event(watch.Added, epochPod(epochB))
+		d := h.successor(epochPod(epochB))
 		entered, release := make(chan struct{}), make(chan struct{})
 		h.client.PrependReactor("patch", "pods", func(a ktesting.Action) (bool, runtime.Object, error) {
 			close(entered)
@@ -113,7 +116,7 @@ func TestPodEpochReadFailureAndCancellation(t *testing.T) {
 				t.Error(err)
 			}
 			m := body["metadata"].(map[string]any)
-			if m["uid"] != epochB || m["resourceVersion"] != epochPod(epochB).ResourceVersion {
+			if m["uid"] != epochB || m["resourceVersion"] != epochWithIDs(epochPod(epochB), "containerd://").ResourceVersion {
 				t.Error("retargeted submitted patch")
 			}
 			return true, &corev1.Pod{}, nil
@@ -200,7 +203,7 @@ func TestPodEpochRemintBinding(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			h.assertDecision(h.event(watch.Added, epochPod(epochB)), mode == "new-pv")
+			h.assertDecision(h.successor(epochPod(epochB)), mode == "new-pv")
 		})
 	}
 }

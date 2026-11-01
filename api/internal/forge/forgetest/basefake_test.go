@@ -9,17 +9,16 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 )
 
-// The forge.Forge interface has exactly 36 methods. This test invokes EVERY one
+// This test invokes EVERY method of forge.Forge
 // on a *BaseFake and asserts its default. It is both the contract proof (each
 // method returns what the package promises) AND the deadcode shield: the
 // compile-time `var _ forge.Forge = (*BaseFake)(nil)` assertion in basefake.go
 // creates NO reachability, so a BaseFake method that every fake overrides and
 // nothing else invokes could be flagged by `deadcode -test`. Actually calling
-// each method here is what keeps them all reachable — so all 36 must appear
-// below (34 action methods + 2 pipeline reads). A missing method defeats the
+// each method here is what keeps them all reachable. A missing method defeats the
 // shield.
 
-// actionMethods are the 34 methods that default to notStubbed(<name>). Each
+// actionMethods are the methods that default to notStubbed(<name>). Each
 // closure calls exactly one method and returns only its error return, so every
 // method is invoked and every arity collapses to a single comparable error.
 func actionMethods() []struct {
@@ -39,6 +38,13 @@ func actionMethods() []struct {
 			return err
 		}},
 		{"VerifyToken", func(b *BaseFake) error { _, err := b.VerifyToken(ctx); return err }},
+		{"GetProject", func(b *BaseFake) error {
+			p, err := b.GetProject(ctx, 1)
+			if p != (forge.Project{}) {
+				return errors.New("GetProject default is not zero Project")
+			}
+			return err
+		}},
 		{"ListProjects", func(b *BaseFake) error { _, err := b.ListProjects(ctx); return err }},
 		{"ListLabels", func(b *BaseFake) error { _, err := b.ListLabels(ctx, 1); return err }},
 		{"EnsureLabels", func(b *BaseFake) error { return b.EnsureLabels(ctx, 1, nil) }},
@@ -160,8 +166,8 @@ func actionMethods() []struct {
 
 func TestBaseFakeActionMethodsNotStubbed(t *testing.T) {
 	methods := actionMethods()
-	if len(methods) != 36 {
-		t.Fatalf("expected 36 action methods, got %d", len(methods))
+	if len(methods) != 37 {
+		t.Fatalf("expected 37 action methods, got %d", len(methods))
 	}
 	b := &BaseFake{}
 	for _, m := range methods {

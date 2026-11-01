@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 	"github.com/vtmocanu/uzi/api/internal/recovery"
@@ -21,6 +22,7 @@ import (
 )
 
 type mergeCandidates struct {
+	targets        func(context.Context, store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error)
 	rows           map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow
 	fail           map[uuid.UUID]bool
 	visits         []store.ListMergedPredecessorCandidatesParams
@@ -43,7 +45,15 @@ func (q *mergeCandidates) ListMergedPredecessorCandidates(ctx context.Context, p
 	return nil, nil
 }
 
+func (q *mergeCandidates) ListCrossRunTargets(ctx context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+	if q.targets != nil {
+		return q.targets(ctx, p)
+	}
+	return nil, nil
+}
+
 type mergeSink struct {
+	cross func(context.Context, recovery.CrossRunTargetBinding, recovery.VerifiedCrossRunWitnessSnapshot) (int64, error)
 	calls int
 	err   error
 }
@@ -51,6 +61,13 @@ type mergeSink struct {
 func (r *mergeSink) DiscardMergedPredecessorHolds(context.Context, recovery.VerifiedMergeSnapshot) (int64, error) {
 	r.calls++
 	return 1, r.err
+}
+
+func (r *mergeSink) DiscardCrossRunHolds(ctx context.Context, target recovery.CrossRunTargetBinding, witness recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+	if r.cross != nil {
+		return r.cross(ctx, target, witness)
+	}
+	return 0, nil
 }
 
 type mergeForge struct {
@@ -76,7 +93,7 @@ func mergeTestService(t *testing.T, f forge.Forge) (*Service, []byte) {
 	return s, token
 }
 func mergeRow(repo uuid.UUID, n int, token []byte) store.ListMergedPredecessorCandidatesRow {
-	return store.ListMergedPredecessorCandidatesRow{RunID: mergeID(n), OwnerID: mergeID(9000), RepoID: repo, ConnectionID: mergeID(9001), ProjectID: 42, MrIid: int64(n), CompletedGeneration: 2, ForgeType: "gitlab", BaseUrl: "https://forge.test", TokenCiphertext: token}
+	return store.ListMergedPredecessorCandidatesRow{RunID: mergeID(n), OwnerID: mergeID(9000), RepoID: repo, ConnectionID: mergeID(9001), OriginalBranch: true, ProjectID: 42, MrIid: int64(n), CompletedGeneration: 2, ForgeType: "gitlab", BaseUrl: "https://forge.test", TokenCiphertext: token}
 }
 
 func TestMergedPredecessorFairnessAndRestart(t *testing.T) {
@@ -348,6 +365,10 @@ func (fn mergedRecoveryFunc) DiscardMergedPredecessorHolds(ctx context.Context, 
 	return fn(ctx, snapshot)
 }
 
+func (fn mergedRecoveryFunc) DiscardCrossRunHolds(context.Context, recovery.CrossRunTargetBinding, recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+	return 0, nil
+}
+
 func TestMergedPredecessorCandidatePanicIsolation(t *testing.T) {
 	var output bytes.Buffer
 	oldLogger := slog.Default()
@@ -491,5 +512,562 @@ func TestMergedPredecessorEnumerationRetryAndEmptyRepo(t *testing.T) {
 	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo, empty})
 	if reads != 1 || sink.calls != 1 {
 		t.Fatal("enumeration failure lost candidate")
+	}
+}
+
+func crossRunRow(repo uuid.UUID, n int, token []byte) store.ListMergedPredecessorCandidatesRow {
+	row := mergeRow(repo, n, token)
+	row.OriginalBranch = false
+	row.Kind = "issue"
+	row.IssueIid = pgtype.Int8{Int64: 77, Valid: true}
+	row.CreatedAt = pgtype.Timestamptz{Time: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), Valid: true}
+	return row
+}
+
+func crossRunTarget(row store.ListMergedPredecessorCandidatesRow, n int) store.ListCrossRunTargetsRow {
+	return store.ListCrossRunTargetsRow{
+		RunID: mergeID(n), OwnerID: row.OwnerID, RepoID: pgtype.UUID{Bytes: row.RepoID, Valid: true},
+		Kind: "issue", Status: "failed", Generation: 3, IssueIid: row.IssueIid,
+		FinishedAt: pgtype.Timestamptz{Time: row.CreatedAt.Time.Add(-time.Hour), Valid: true},
+		CreatedAt:  pgtype.Timestamptz{Time: row.CreatedAt.Time.Add(-2 * time.Hour), Valid: true},
+	}
+}
+
+func TestCrossRunContinuationRefusalAndFreshObservation(t *testing.T) {
+	for _, original := range []bool{false, true} {
+		t.Run(fmt.Sprint(original), func(t *testing.T) {
+			reads := 0
+			f := &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+				reads++
+				return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+			}}
+			s, token := mergeTestService(t, f)
+			repo := mergeID(1)
+			row := crossRunRow(repo, 100, token)
+			row.OriginalBranch = original
+			first, second := crossRunTarget(row, 90), crossRunTarget(row, 80)
+			q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {row}}}
+			enumerations, calls := 0, 0
+			q.targets = func(_ context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+				enumerations++
+				if reads != enumerations || p.WitnessRunID != row.RunID || p.OwnerID != row.OwnerID ||
+					p.RepoID.Bytes != row.RepoID || p.IssueIid != row.IssueIid || p.WitnessCreatedAt != row.CreatedAt {
+					t.Fatalf("target enumeration did not follow fresh exact B observation: reads=%d params=%+v", reads, p)
+				}
+				switch enumerations {
+				case 1:
+					if p.AfterCreatedAt.Valid || p.AfterRunID != uuid.Nil {
+						t.Fatal("first key not empty")
+					}
+					return []store.ListCrossRunTargetsRow{first}, nil
+				case 2:
+					if p.AfterCreatedAt != first.CreatedAt || p.AfterRunID != first.RunID {
+						t.Fatal("refusal lost immutable key")
+					}
+					return []store.ListCrossRunTargetsRow{second}, nil
+				default:
+					if p.AfterCreatedAt != second.CreatedAt || p.AfterRunID != second.RunID {
+						t.Fatal("second key lost")
+					}
+					return nil, nil
+				}
+			}
+			sink := &mergeSink{cross: func(_ context.Context, target recovery.CrossRunTargetBinding, witness recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+				calls++
+				want := first
+				if calls == 2 {
+					want = second
+				}
+				if target.RunID != want.RunID || target.Generation != 3 || target.Status != "failed" ||
+					target.FinishedAt != want.FinishedAt.Time || target.Validate(witness) != nil {
+					t.Fatalf("target binding=%+v", target)
+				}
+				if s.merged.targets[repo].runID != want.RunID || s.merged.cursors[repo] != uuid.Nil {
+					t.Fatal("continuation not saved before transaction")
+				}
+				return 0, errors.New("locked refusal")
+			}}
+			s.SetMergedPredecessorRecovery(q, sink)
+			for phase := 1; phase <= 2; phase++ {
+				s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+				if reads != phase || calls != phase || s.merged.cursors[repo] != uuid.Nil || len(s.merged.targets) != 1 {
+					t.Fatal("target visit repeated or skipped B")
+				}
+			}
+			s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+			if calls != 2 || len(s.merged.targets) != 0 {
+				t.Fatal("empty enumeration retained continuation")
+			}
+			wantLegacy := 0
+			if original {
+				wantLegacy = 3
+			}
+			if sink.calls != wantLegacy {
+				t.Fatalf("legacy calls=%d want=%d", sink.calls, wantLegacy)
+			}
+		})
+	}
+}
+
+func TestCrossRunEnumerationFailureRetainsTuple(t *testing.T) {
+	reads := 0
+	s, token := mergeTestService(t, &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+		reads++
+		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+	}})
+	repo := mergeID(1)
+	row := crossRunRow(repo, 100, token)
+	target := crossRunTarget(row, 90)
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {row}}}
+	var keys []uuid.UUID
+	q.targets = func(_ context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+		keys = append(keys, p.AfterRunID)
+		if len(keys) == 1 {
+			return []store.ListCrossRunTargetsRow{target}, nil
+		}
+		if p.AfterRunID != target.RunID || p.AfterCreatedAt != target.CreatedAt {
+			t.Fatal("enumeration failure lost tuple")
+		}
+		return nil, errors.New("enumeration failed")
+	}
+	calls := 0
+	sink := &mergeSink{cross: func(context.Context, recovery.CrossRunTargetBinding, recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+		calls++
+		return 0, nil
+	}}
+	s.SetMergedPredecessorRecovery(q, sink)
+	for phase := 0; phase < 3; phase++ {
+		s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+	}
+	if reads != 3 || calls != 1 || len(keys) != 3 || s.merged.targets[repo].runID != target.RunID {
+		t.Fatal("failed enumeration consumed target continuation")
+	}
+	// Candidate enumeration failures also preserve the target and witness cursor.
+	q.fail = map[uuid.UUID]bool{repo: true}
+	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+	if s.merged.targets[repo].runID != target.RunID || reads != 3 {
+		t.Fatal("witness enumeration failure consumed continuation")
+	}
+	s.ReconcileMergedPredecessors(context.Background(), nil)
+	if len(s.merged.targets) != 0 || len(s.merged.cursors) != 0 {
+		t.Fatal("disabled repo retained continuation")
+	}
+}
+
+func TestCrossRunUnverifiedAndVanishedWitnessClearTuple(t *testing.T) {
+	for _, mode := range []string{"unmerged", "wrong_iid", "error", "vanished", "replaced"} {
+		t.Run(mode, func(t *testing.T) {
+			state, wrong, fail := forge.MRStateMerged, false, false
+			s, token := mergeTestService(t, &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+				if fail {
+					return forge.MergeRequest{}, errors.New("unreadable")
+				}
+				if wrong {
+					iid++
+				}
+				return forge.MergeRequest{IID: iid, State: state}, nil
+			}})
+			repo := mergeID(1)
+			row := crossRunRow(repo, 100, token)
+			target := crossRunTarget(row, 90)
+			q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {row}}}
+			var keys []uuid.UUID
+			q.targets = func(_ context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+				keys = append(keys, p.AfterRunID)
+				return []store.ListCrossRunTargetsRow{target}, nil
+			}
+			s.SetMergedPredecessorRecovery(q, &mergeSink{})
+			s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+			switch mode {
+			case "unmerged":
+				state = forge.MRStateOpened
+			case "wrong_iid":
+				wrong = true
+			case "error":
+				fail = true
+			case "vanished":
+				q.rows[repo] = nil
+			case "replaced":
+				q.rows[repo] = []store.ListMergedPredecessorCandidatesRow{crossRunRow(repo, 101, token)}
+			}
+			s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+			if mode == "replaced" {
+				if len(keys) != 2 || keys[1] != uuid.Nil || s.merged.targets[repo].witness != mergeID(101) {
+					t.Fatal("vanished B transferred target key to next witness")
+				}
+			} else if len(s.merged.targets) != 0 || len(keys) != 1 {
+				t.Fatal("unverified or vanished B retained tuple")
+			}
+		})
+	}
+}
+
+func TestCrossRunPanicKeepsTargetProgressAndSiblings(t *testing.T) {
+	a, b := mergeID(1), mergeID(2)
+	s, token := mergeTestService(t, &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+	}})
+	row := crossRunRow(a, 100, token)
+	target := crossRunTarget(row, 90)
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{a: {row}, b: {mergeRow(b, 200, token)}}}
+	q.targets = func(context.Context, store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+		return []store.ListCrossRunTargetsRow{target}, nil
+	}
+	sink := &mergeSink{cross: func(context.Context, recovery.CrossRunTargetBinding, recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+		panic("private settlement")
+	}}
+	s.SetMergedPredecessorRecovery(q, sink)
+	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{a, b})
+	if sink.calls != 1 || s.merged.targets[a].runID != target.RunID || s.merged.cursors[a] != uuid.Nil {
+		t.Fatal("panic lost tuple or sibling")
+	}
+}
+
+func TestCrossRunSharedAttemptCap(t *testing.T) {
+	reads, targets := 0, 0
+	s, token := mergeTestService(t, &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+		reads++
+		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+	}})
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{}}
+	var repos []uuid.UUID
+	for n := 1; n <= 100; n++ {
+		repo := mergeID(n)
+		repos = append(repos, repo)
+		row := crossRunRow(repo, n+200, token)
+		row.OriginalBranch = n < 100
+		q.rows[repo] = []store.ListMergedPredecessorCandidatesRow{row}
+	}
+	q.targets = func(_ context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+		targets++
+		return []store.ListCrossRunTargetsRow{crossRunTarget(q.rows[uuid.UUID(p.RepoID.Bytes)][0], 150)}, nil
+	}
+	crossCalls := 0
+	sink := &mergeSink{cross: func(context.Context, recovery.CrossRunTargetBinding, recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+		crossCalls++
+		return 0, nil
+	}}
+	s.SetMergedPredecessorRecovery(q, sink)
+	s.ReconcileMergedPredecessors(context.Background(), repos)
+	if reads != 50 || targets != 50 || sink.calls != 50 || crossCalls != 50 {
+		t.Fatalf("shared attempt cap: reads=%d enumerations=%d legacy=%d cross=%d", reads, targets, sink.calls, crossCalls)
+	}
+}
+
+func TestCrossRunUnmergedObservationsDoNotSpendRecoveryBudget(t *testing.T) {
+	var observed []int64
+	s, token := mergeTestService(t, &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+		observed = append(observed, iid)
+		state := forge.MRStateMerged
+		if iid <= 220 {
+			state = forge.MRStateOpened
+		}
+		return forge.MergeRequest{IID: iid, State: state}, nil
+	}})
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{}}
+	var repos []uuid.UUID
+	for n := 1; n <= 100; n++ {
+		repo := mergeID(n)
+		repos = append(repos, repo)
+		row := crossRunRow(repo, n+200, token)
+		row.OriginalBranch = true
+		q.rows[repo] = []store.ListMergedPredecessorCandidatesRow{row}
+	}
+	enumerations, crossCalls := 0, 0
+	q.targets = func(_ context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+		enumerations++
+		return []store.ListCrossRunTargetsRow{crossRunTarget(q.rows[uuid.UUID(p.RepoID.Bytes)][0], 150)}, nil
+	}
+	sink := &mergeSink{cross: func(context.Context, recovery.CrossRunTargetBinding, recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+		crossCalls++
+		return 0, errors.New("permanent inventory refusal")
+	}}
+	s.SetMergedPredecessorRecovery(q, sink)
+	s.ReconcileMergedPredecessors(context.Background(), repos)
+	// Twenty unmerged GETs spend visits but no transaction attempts. The next
+	// fifty witnesses each use both branches, including the hundredth attempt.
+	if len(observed) != 70 || sink.calls != 50 || crossCalls != 50 || enumerations != 50 {
+		t.Fatalf("mixed budget GETs=%d legacy=%d cross=%d enumerations=%d; want 70/50/50/50", len(observed), sink.calls, crossCalls, enumerations)
+	}
+	for i, iid := range observed {
+		if iid != int64(201+i) {
+			t.Fatalf("first observation mismatch at %d: got %d want %d", i, iid, 201+i)
+		}
+	}
+	if len(s.merged.targets) != 50 {
+		t.Fatalf("continuation slots=%d want exactly one per visited merged repo (50)", len(s.merged.targets))
+	}
+	s.ReconcileMergedPredecessors(context.Background(), repos)
+	if observed[70] != 271 {
+		t.Fatalf("budget restart GET=%d want next repository PR 271", observed[70])
+	}
+}
+
+func TestCrossRunAttemptCapDefersSecondTransaction(t *testing.T) {
+	reads, crossCalls := 0, 0
+	phase, resumed := 1, false
+	s, token := mergeTestService(t, &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+		reads++
+		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+	}})
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{}}
+	var repos []uuid.UUID
+	for n := 1; n <= 51; n++ {
+		repo := mergeID(n)
+		repos = append(repos, repo)
+		row := crossRunRow(repo, n+200, token)
+		row.OriginalBranch = n != 1
+		q.rows[repo] = []store.ListMergedPredecessorCandidatesRow{row}
+	}
+	q.targets = func(_ context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+		if uuid.UUID(p.RepoID.Bytes) == repos[50] {
+			if phase == 1 {
+				t.Fatal("cross target visited beyond shared cap")
+			}
+			resumed = true
+		}
+		return []store.ListCrossRunTargetsRow{crossRunTarget(q.rows[uuid.UUID(p.RepoID.Bytes)][0], 150)}, nil
+	}
+	sink := &mergeSink{cross: func(context.Context, recovery.CrossRunTargetBinding, recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+		crossCalls++
+		return 0, nil
+	}}
+	s.SetMergedPredecessorRecovery(q, sink)
+	s.ReconcileMergedPredecessors(context.Background(), repos)
+	continuation, pending := s.merged.targets[repos[50]]
+	if reads != 51 || sink.calls != 50 || crossCalls != 50 || !pending || continuation.runID != uuid.Nil || s.merged.cursors[repos[50]] != uuid.Nil {
+		t.Fatalf("cap did not retain unvisited cross target: reads=%d legacy=%d cross=%d continuation=%+v", reads, sink.calls, crossCalls, continuation)
+	}
+	// Permanently refused legacy holds continue to select the same witnesses.
+	// Restart rotation at the deferred repository, or its legacy transaction
+	// consumes the last attempt every phase and the cross-run target starves.
+	sink.err = errors.New("legacy disposition refused")
+	phase = 2
+	s.ReconcileMergedPredecessors(context.Background(), repos)
+	if !resumed {
+		t.Fatal("deferred cross-run target starved after phase cap")
+	}
+}
+
+func TestCrossRunTargetEnumerationCancellationRetainsTuple(t *testing.T) {
+	for _, result := range []string{"rows", "error", "empty"} {
+		t.Run(result, func(t *testing.T) {
+			s, token := mergeTestService(t, &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+				return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+			}})
+			repo := mergeID(1)
+			row := crossRunRow(repo, 100, token)
+			first, second := crossRunTarget(row, 90), crossRunTarget(row, 80)
+			q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {row}}}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			enumerations, calls := 0, 0
+			q.targets = func(_ context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+				enumerations++
+				if enumerations == 1 {
+					return []store.ListCrossRunTargetsRow{first}, nil
+				}
+				if p.AfterRunID != first.RunID || p.AfterCreatedAt != first.CreatedAt {
+					t.Fatal("cancelled enumeration consumed tuple")
+				}
+				if enumerations == 2 {
+					cancel()
+					if result == "error" {
+						return nil, errors.New("enumeration")
+					}
+					if result == "empty" {
+						return nil, nil
+					}
+				}
+				return []store.ListCrossRunTargetsRow{second}, nil
+			}
+			sink := &mergeSink{cross: func(context.Context, recovery.CrossRunTargetBinding, recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+				calls++
+				return 0, nil
+			}}
+			s.SetMergedPredecessorRecovery(q, sink)
+			s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+			s.ReconcileMergedPredecessors(ctx, []uuid.UUID{repo})
+			if calls != 1 || s.merged.targets[repo].runID != first.RunID {
+				t.Fatal("late target enumeration was consumed")
+			}
+			s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+			if calls != 2 || s.merged.targets[repo].runID != second.RunID {
+				t.Fatal("interrupted target not resumed")
+			}
+		})
+	}
+}
+
+// A witness whose target enumeration keeps failing or running out of phase
+// budget must not pin the repository cursor before it: a later legacy candidate
+// is reached within a bounded number of phases, and B is rediscovered after the
+// cursor wraps with an empty key and a fresh failure count.
+func TestCrossRunPersistentEnumerationFailureYieldsWitness(t *testing.T) {
+	for _, mode := range []string{"error", "deadline_before_query", "deadline_during_query"} {
+		t.Run(mode, func(t *testing.T) {
+			var reads []int64
+			var phase *mergeDeadlineContext
+			expire := func() {
+				expired, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
+				t.Cleanup(stop)
+				phase.Context = expired
+			}
+			s, token := mergeTestService(t, &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+				reads = append(reads, iid)
+				if mode == "deadline_before_query" && iid == 100 {
+					expire()
+				}
+				return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+			}})
+			repo := mergeID(1)
+			witness := crossRunRow(repo, 100, token)
+			q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {witness, mergeRow(repo, 200, token)}}}
+			enumerations := 0
+			q.targets = func(_ context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+				enumerations++
+				if p.AfterRunID != uuid.Nil || p.AfterCreatedAt.Valid {
+					t.Fatal("failed enumeration advanced the target key")
+				}
+				if mode == "deadline_during_query" {
+					expire()
+					return []store.ListCrossRunTargetsRow{crossRunTarget(witness, 90)}, nil
+				}
+				return nil, errors.New("enumeration failed")
+			}
+			crossCalls := 0
+			sink := &mergeSink{cross: func(context.Context, recovery.CrossRunTargetBinding, recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+				crossCalls++
+				return 0, nil
+			}}
+			s.SetMergedPredecessorRecovery(q, sink)
+			s.merged.withTimeout = func(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+				if d == 30*time.Second {
+					phase = &mergeDeadlineContext{Context: ctx}
+					return phase, func() {}
+				}
+				// Observations stay independent so only the phase budget expires.
+				return context.WithTimeout(context.Background(), d)
+			}
+			// A fixed bound, not the constant: the limit itself is under test.
+			phases := 0
+			for phases < 4 && sink.calls == 0 {
+				phases++
+				s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+			}
+			if sink.calls != 1 || !slices.Contains(reads, 200) {
+				t.Fatalf("later legacy candidate starved behind failing witness: phases=%d enumerations=%d reads=%v", phases, enumerations, reads)
+			}
+			// A pre-query deadline exit fails before any enumeration is issued.
+			perFailure := 1
+			if mode == "deadline_before_query" {
+				perFailure = 0
+			}
+			if enumerations != perFailure*crossRunEnumerationFailureLimit || crossCalls != 0 {
+				t.Fatalf("enumerations=%d cross=%d; want %d and no settlement", enumerations, crossCalls, perFailure*crossRunEnumerationFailureLimit)
+			}
+			if _, pending := s.merged.targets[repo]; pending {
+				t.Fatal("yielded witness retained its continuation")
+			}
+			// The phase that reached the later candidate also wrapped the cursor,
+			// so the next phase rediscovers B.
+			s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+			if continuation := s.merged.targets[repo]; enumerations != perFailure*(crossRunEnumerationFailureLimit+1) ||
+				continuation.witness != witness.RunID || continuation.failures != 1 {
+				t.Fatalf("witness not rediscovered with a fresh count after wrap: enumerations=%d continuation=%+v", enumerations, continuation)
+			}
+		})
+	}
+}
+
+// Transient failures keep the tuple, and a successful enumeration resets the
+// consecutive-failure count, so interleaved failures never yield the witness.
+func TestCrossRunEnumerationSuccessResetsFailureCount(t *testing.T) {
+	s, token := mergeTestService(t, &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+	}})
+	repo := mergeID(1)
+	witness := crossRunRow(repo, 100, token)
+	first, second := crossRunTarget(witness, 90), crossRunTarget(witness, 80)
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {witness, mergeRow(repo, 200, token)}}}
+	results := []string{"fail", "fail", "first", "fail", "fail", "second"}
+	enumerations := 0
+	q.targets = func(_ context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+		if enumerations >= len(results) {
+			t.Fatal("unexpected enumeration")
+		}
+		result := results[enumerations]
+		enumerations++
+		switch result {
+		case "first":
+			return []store.ListCrossRunTargetsRow{first}, nil
+		case "second":
+			if p.AfterRunID != first.RunID || p.AfterCreatedAt != first.CreatedAt {
+				t.Fatal("transient failure lost the target tuple")
+			}
+			return []store.ListCrossRunTargetsRow{second}, nil
+		}
+		return nil, errors.New("enumeration failed")
+	}
+	crossCalls := 0
+	sink := &mergeSink{cross: func(context.Context, recovery.CrossRunTargetBinding, recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+		crossCalls++
+		return 0, nil
+	}}
+	s.SetMergedPredecessorRecovery(q, sink)
+	for range results {
+		s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+	}
+	if crossCalls != 2 || sink.calls != 0 || s.merged.targets[repo].runID != second.RunID || s.merged.cursors[repo] != uuid.Nil {
+		t.Fatalf("interleaved transient failures yielded the witness: cross=%d legacy=%d continuation=%+v", crossCalls, sink.calls, s.merged.targets[repo])
+	}
+}
+
+func TestCrossRunRestartAndWitnessSnapshot(t *testing.T) {
+	var q *mergeCandidates
+	reads := 0
+	f := &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+		reads++
+		// Simulate B changing during forge I/O. The service must retain its prior
+		// identity and recovery must compare that snapshot against its locked rows.
+		if reads == 1 {
+			for repo, rows := range q.rows {
+				changed := rows[0]
+				changed.Kind = "job"
+				changed.IssueIid.Int64++
+				changed.CreatedAt.Time = changed.CreatedAt.Time.Add(time.Hour)
+				q.rows[repo] = []store.ListMergedPredecessorCandidatesRow{changed}
+			}
+		}
+		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+	}}
+	s, token := mergeTestService(t, f)
+	repo := mergeID(1)
+	row := crossRunRow(repo, 100, token)
+	target := crossRunTarget(row, 90)
+	q = &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {row}}}
+	enumerations, calls := 0, 0
+	q.targets = func(_ context.Context, p store.ListCrossRunTargetsParams) ([]store.ListCrossRunTargetsRow, error) {
+		enumerations++
+		if p.IssueIid != row.IssueIid || p.WitnessCreatedAt != row.CreatedAt || p.AfterRunID != uuid.Nil || p.AfterCreatedAt.Valid {
+			t.Fatal("witness reconstructed or restart reused key")
+		}
+		return []store.ListCrossRunTargetsRow{target}, nil
+	}
+	sink := &mergeSink{cross: func(_ context.Context, target recovery.CrossRunTargetBinding, witness recovery.VerifiedCrossRunWitnessSnapshot) (int64, error) {
+		calls++
+		if err := target.Validate(witness); err != nil {
+			t.Fatalf("lost pre-I/O witness: %v", err)
+		}
+		return 0, errors.New("refused")
+	}}
+	s.SetMergedPredecessorRecovery(q, sink)
+	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+	q.rows[repo] = []store.ListMergedPredecessorCandidatesRow{row}
+	restarted, _ := mergeTestService(t, f)
+	restarted.SetMergedPredecessorRecovery(q, sink)
+	restarted.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+	if calls != 2 || reads != 2 || enumerations != 2 {
+		t.Fatal("restart lost durable OPEN workset")
 	}
 }

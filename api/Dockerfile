@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1
 
 # --- build stage ---
-FROM golang:1.26@sha256:3c3e25a4da13fd0478eed2df1eb35a0e667094a7124d3993a6a1d30f71c17e79 AS build
+# Runs on the BUILD platform and cross-compiles to TARGETARCH (set by buildx per
+# --platform), so a multi-arch publish needs no QEMU: the binary is static Go.
+FROM --platform=$BUILDPLATFORM golang:1.26@sha256:3c3e25a4da13fd0478eed2df1eb35a0e667094a7124d3993a6a1d30f71c17e79 AS build
 WORKDIR /src
 
 COPY go.mod go.sum ./
@@ -45,15 +47,18 @@ ARG UZI_BUILT_AT=
 ARG UZI_COMMIT_COUNT=
 ARG UZI_PRDS_DONE=
 ARG UZI_PRDS_OPEN=
+# Declared here, below `go mod download`, not at the top: a declared ARG joins the
+# cache key of every later RUN, so higher up it would split the module layer per arch.
+ARG TARGETARCH
 # Static, VCS-stamp-free build. Migrations are embedded via go:embed, so the
 # runtime image needs nothing but the binary. -buildvcs=false stays: the publish
 # context is api/ with no .git in it (nothing to stamp from), and a VCS-free build
 # is the deliberate reproducibility choice — which is why these coordinates arrive
 # as ldflags rather than from debug.ReadBuildInfo().
-RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X main.version=${UZI_VERSION#v} -X main.commit=${UZI_COMMIT} -X main.builtAt=${UZI_BUILT_AT} -X main.commits=${UZI_COMMIT_COUNT} -X main.prdsDone=${UZI_PRDS_DONE} -X main.prdsOpen=${UZI_PRDS_OPEN}" -o /out/server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -buildvcs=false -ldflags="-s -w -X main.version=${UZI_VERSION#v} -X main.commit=${UZI_COMMIT} -X main.builtAt=${UZI_BUILT_AT} -X main.commits=${UZI_COMMIT_COUNT} -X main.prdsDone=${UZI_PRDS_DONE} -X main.prdsOpen=${UZI_PRDS_OPEN}" -o /out/server ./cmd/server
 # uzi-fetcher (PRD #1906 M2) ships in the same image as /fetcher and runs as its own
 # Deployment with a different command; ENTRYPOINT stays /server.
-RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X main.version=${UZI_VERSION#v} -X main.commit=${UZI_COMMIT}" -o /out/fetcher ./cmd/fetcher
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -buildvcs=false -ldflags="-s -w -X main.version=${UZI_VERSION#v} -X main.commit=${UZI_COMMIT}" -o /out/fetcher ./cmd/fetcher
 
 # --- runtime stage ---
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:1b7b9f0f0e0a1d2155f531db587cc48ec26aaf97ab64364225f5bf18a054e66a

@@ -95,17 +95,18 @@
 //
 // # Standalone modes
 //
-// Three modes run instead of the supervisor when their flag is the FIRST
+// Four modes run instead of the supervisor when their flag is the FIRST
 // argument. Each has its own strict, fixed-order argv, uses no fd 3/4, forks
 // nothing, and writes JSON lines to STDOUT. Each first runs the fd hygiene
-// described under DESCRIPTORS (--hold-cache makes itself nondumpable even
-// before that, see below), then parses its argv, then requires
+// described under DESCRIPTORS (--hold-cache and --measure-cache make themselves nondumpable
+// even before that, see below), then parses its argv, then requires
 // getuid() == geteuid() == --expect-uid; any of those failing exits 2 with one
 // error line.
 //
 //	uzi-codex-supervisor --reap-orphans --expect-uid <N> --cache-root <abs dir>
 //	uzi-codex-supervisor --hold-cache   --expect-uid <N> --cache-root <abs dir> --cache-token <lowercase-uuid>
 //	uzi-codex-supervisor --remove-cache --expect-uid <N> --cache-root <abs dir> --cache-token <lowercase-uuid>
+//	uzi-codex-supervisor --measure-cache --expect-uid <N> --cache-root <abs dir> --cache-token <lowercase-uuid>
 //
 // The cache root must be absolute, already clean and not "/"; the uid must be
 // plain decimal.
@@ -228,4 +229,33 @@
 //	{"event":"cache_error","reason":"fd_hygiene"|"args"|"uid"|"root"}          // exit 2
 //
 // <word> is a tmpCleanup reason ("mismatch", "owner", "io", ...).
+//
+// --measure-cache measures one run's cache directory <cache root>/<token> and
+// prints one line. It is NON-MUTATING and advisory: a worker uses it to decide
+// whether to rotate a run, and it is never authority for cleanup. Like
+// --hold-cache it first makes itself nondumpable (cache_error "dumpable" on
+// failure). It takes NO flock, so it can run beside the holder, and it never
+// chmods, unlinks, renames or locks anything. The walk is read-only and
+// no-follow: it opens each directory through the same two-step
+// O_PATH|O_NOFOLLOW then O_RDONLY|O_NOFOLLOW verification as the removal walk,
+// but requires only owner r+x on a directory (a 0555 module-cache directory
+// measures; one lacking owner r or x is "mismatch") and never adds a mode
+// bit. Each entry is lstat'ed (AT_SYMLINK_NOFOLLOW) and must be on the
+// directory's filesystem ("mismatch") and owned by --expect-uid ("owner"). It
+// is charged max(st_size, st_blocks*512); a symlink is charged for its own
+// inode only and is never followed, and only directories are opened. The token
+// directory's own inode is not charged or counted. An entry that vanished
+// before its lstat, and a directory that vanished before its first open or
+// between its two opens (including a rename-away), is skipped, so a tree under
+// concurrent writers may be UNDERCOUNTED; the figure is an estimate, not a
+// bound. A directory replaced by a different object between the opens is
+// "mismatch". Compiled-in bounds: 500000 entries, depth 64, 5 s of wall time;
+// past any of them the answer is incomplete with the partial counts. A byte
+// total that would overflow uint64 is incomplete "bytes" with bytes saturated
+// at 18446744073709551615. A missing token directory is
+// incomplete "absent". Its one line always carries all five keys:
+//
+//	{"event":"cache_measure","state":"complete","bytes":<n>,"entries":<n>,"reason":""}                                       // exit 0
+//	{"event":"cache_measure","state":"incomplete","bytes":<n>,"entries":<n>,"reason":"absent"|"entries"|"depth"|"bytes"|"deadline"|"mismatch"|"owner"|"io"}  // exit 3
+//	{"event":"cache_error","reason":"dumpable"|"fd_hygiene"|"args"|"uid"|"root"}                                              // exit 2
 package main

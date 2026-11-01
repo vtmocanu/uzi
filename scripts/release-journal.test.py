@@ -19,6 +19,21 @@ def module():
 
 
 class Journal(unittest.TestCase):
+    def test_recovery_decision_target_and_scope_are_bounded_labels(self):
+        journal = module()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'journal.json'
+            record = journal.Journal(path, 'fixture', 'fixture/repo', 'v0.2.0', 'a' * 40)
+            record.decision('kind-smoke.yml', 10, 1, 'kind-infra', 2, 1, 'reserved',
+                            target_job=101, affected_jobs=['kind-smoke', 'kind-smoke-gate'])
+            original = journal.read(path)
+            for key, value in [('target_job', True), ('target_job', '101'),
+                               ('affected_jobs', ['job'] * 9), ('affected_jobs', ['bad\nlabel'])]:
+                changed = copy.deepcopy(original)
+                changed['decisions'][0][key] = value
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    journal.decode(json.dumps(changed))
+
     def test_audit_wire_preserves_count_and_truncation_across_hops(self):
         journal = module()
         rows = [dict(sha='a' * 40, pr=number + 1, shipping=True) for number in range(1000)]

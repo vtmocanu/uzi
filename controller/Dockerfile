@@ -5,7 +5,8 @@
 # context stays this directory (the same shape api/Dockerfile has).
 
 # --- build stage ---
-FROM golang:1.26@sha256:3c3e25a4da13fd0478eed2df1eb35a0e667094a7124d3993a6a1d30f71c17e79 AS build
+# Cross-compiles on the build platform, matching api/Dockerfile.
+FROM --platform=$BUILDPLATFORM golang:1.26@sha256:3c3e25a4da13fd0478eed2df1eb35a0e667094a7124d3993a6a1d30f71c17e79 AS build
 WORKDIR /src
 
 # M3 brought in the kube client, so the go.sum + `go mod download` this comment
@@ -17,8 +18,11 @@ COPY go.mod go.sum ./
 RUN n=0; until go mod download; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "go mod download: giving up after $n attempts" >&2; exit 1; }; echo "go mod download failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done
 
 COPY . .
+# Declared here, below `go mod download`, not at the top: a declared ARG joins the
+# cache key of every later RUN, so higher up it would split the module layer per arch.
+ARG TARGETARCH
 # Static, VCS-stamp-free build, matching api/Dockerfile.
-RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w" -o /out/controller ./cmd/controller
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -buildvcs=false -ldflags="-s -w" -o /out/controller ./cmd/controller
 
 # --- runtime stage ---
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:1b7b9f0f0e0a1d2155f531db587cc48ec26aaf97ab64364225f5bf18a054e66a

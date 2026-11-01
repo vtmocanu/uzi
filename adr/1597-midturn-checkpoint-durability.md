@@ -78,9 +78,17 @@ fixed phase and cause labels. Phase is `packing` until a packed tip exists, then
 `publish_request`. At most four nodes, including the root, in a linear cause chain
 are inspected with cycle detection and defensive code/message/cause reads. The first
 recognized exact code wins: ENOTFOUND/EAI_AGAIN → `dns`, ECONNREFUSED →
-`connection_refused`, ECONNRESET → `connection_reset`, and ETIMEDOUT or
-UND_ERR_CONNECT_TIMEOUT/UND_ERR_HEADERS_TIMEOUT/UND_ERR_BODY_TIMEOUT → `timeout`.
-Everything else is `unknown`; messages and aggregate collections do not classify errors.
+`connection_refused`, ECONNRESET → `connection_reset`, ETIMEDOUT or
+UND_ERR_CONNECT_TIMEOUT/UND_ERR_HEADERS_TIMEOUT/UND_ERR_BODY_TIMEOUT → `timeout`,
+UND_ERR_SOCKET/UND_ERR_CLOSED/ECONNABORTED → `connection_closed`,
+EHOSTUNREACH/ENETUNREACH/EHOSTDOWN/ENETDOWN → `network_unreachable`, and
+CERT_HAS_EXPIRED/UNABLE_TO_VERIFY_LEAF_SIGNATURE/DEPTH_ZERO_SELF_SIGNED_CERT/
+SELF_SIGNED_CERT_IN_CHAIN/UNABLE_TO_GET_ISSUER_CERT_LOCALLY/ERR_TLS_CERT_ALTNAME_INVALID
+→ `tls`. Each list is exact: other TLS codes such as CERT_NOT_YET_VALID stay `unknown`.
+`connection_closed` does not say which side closed (UND_ERR_CLOSED can be a local client
+close). EPIPE is deliberately excluded: it mostly comes from local pack-objects/gitleaks
+pipes, and the `packing` phase is local. Everything else is `unknown`; messages and
+aggregate collections do not classify errors. The label set stays fixed.
 Boundary failures, typed refusals and aborts retain their earlier precedence, including
 fail-closed propagation from hostile boundary/name getters.
 

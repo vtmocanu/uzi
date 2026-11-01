@@ -478,7 +478,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
     const captured: Array<() => void> = [];
     const mock = t.mock.method(globalThis, "setTimeout", ((fn: (...a: unknown[]) => void, ms?: number, ...args: unknown[]) => {
       if (typeof fn === "function" && typeof ms === "number" && match(ms)) captured.push(() => fn(...args));
-      return (real as (...a: unknown[]) => NodeJS.Timeout).call(globalThis, fn, ms, ...args);
+      return (real as unknown as (...a: unknown[]) => NodeJS.Timeout).call(globalThis, fn, ms, ...args);
     }) as unknown as typeof setTimeout);
     return {
       count: () => captured.length,

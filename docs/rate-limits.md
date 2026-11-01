@@ -6,10 +6,17 @@ audience: user
 
 # Claude rate limits
 
-Anthropic caps every account against two rolling windows — **5-hour** and
-**7-day** — and once either is exhausted your runs queue until it resets.
-uzi reads both windows for you, server-side, using your own
+Anthropic caps every account against a rolling **7-day** window and, on plans
+that still have one, a rolling **5-hour** window. Once a window is exhausted,
+your runs queue until it resets. uzi reads the windows for you, server-side,
+using your own
 [Anthropic tokens](./anthropic-token.md), and shows them as live meters.
+
+Some plans have no 5-hour window (Anthropic removed it for them in late
+October 2026). For such a token Anthropic reports only the 7-day window, so
+uzi shows a single 7-day meter and no 5-hour row, and the `uzi` CLI lists the
+5-hour column as `-`. If Anthropic reports a 5-hour window for a token, both
+meters appear again with no change on your side.
 
 That covers a run that hasn't started yet. A run already **in progress**
 when it hits one of these windows is a different page —

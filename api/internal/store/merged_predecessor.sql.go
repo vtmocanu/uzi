@@ -12,6 +12,42 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const discardCrossRunHold = `-- name: DiscardCrossRunHold :execrows
+UPDATE recovery_custody_holds SET
+    state = 'discarded', live_worker_id = NULL, live_run_id = NULL,
+    release_evidence = 'merged_predecessor_discard',
+    merged_predecessor_discard_binding = $1::jsonb, updated_at = now()
+WHERE id = $2 AND run_id = $3 AND user_id = $4 AND repo_id = $5
+    AND generation = $6 AND generation > 0 AND generation <= $7
+    AND state = 'open' AND merged_predecessor_discard_binding IS NULL
+`
+
+type DiscardCrossRunHoldParams struct {
+	Binding            []byte      `json:"binding"`
+	HoldID             uuid.UUID   `json:"hold_id"`
+	RunID              uuid.UUID   `json:"run_id"`
+	OwnerID            uuid.UUID   `json:"owner_id"`
+	RepoID             pgtype.UUID `json:"repo_id"`
+	Generation         int64       `json:"generation"`
+	TerminalGeneration int64       `json:"terminal_generation"`
+}
+
+func (q *Queries) DiscardCrossRunHold(ctx context.Context, arg DiscardCrossRunHoldParams) (int64, error) {
+	result, err := q.db.Exec(ctx, discardCrossRunHold,
+		arg.Binding,
+		arg.HoldID,
+		arg.RunID,
+		arg.OwnerID,
+		arg.RepoID,
+		arg.Generation,
+		arg.TerminalGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const discardMergedPredecessorHold = `-- name: DiscardMergedPredecessorHold :execrows
 UPDATE recovery_custody_holds SET
     state = 'discarded', live_worker_id = NULL, live_run_id = NULL,
@@ -48,22 +84,238 @@ func (q *Queries) DiscardMergedPredecessorHold(ctx context.Context, arg DiscardM
 	return result.RowsAffected(), nil
 }
 
+const hasCrossRunLiveClaim = `-- name: HasCrossRunLiveClaim :one
+SELECT EXISTS (SELECT 1 FROM worker_active_runs WHERE run_id = $1)
+`
+
+func (q *Queries) HasCrossRunLiveClaim(ctx context.Context, runID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasCrossRunLiveClaim, runID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const hasCrossRunLiveConsumer = `-- name: HasCrossRunLiveConsumer :one
+SELECT EXISTS (
+    SELECT 1 FROM runs
+    WHERE user_id = $1 AND repo_id = $2
+        AND status NOT IN ('completed', 'failed', 'cancelled')
+        AND (issue_iid = $3 OR continued_issue_iid = $3)
+)
+`
+
+type HasCrossRunLiveConsumerParams struct {
+	OwnerID  uuid.UUID   `json:"owner_id"`
+	RepoID   pgtype.UUID `json:"repo_id"`
+	IssueIid pgtype.Int8 `json:"issue_iid"`
+}
+
+func (q *Queries) HasCrossRunLiveConsumer(ctx context.Context, arg HasCrossRunLiveConsumerParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasCrossRunLiveConsumer, arg.OwnerID, arg.RepoID, arg.IssueIid)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const hasCrossRunSharedFinal = `-- name: HasCrossRunSharedFinal :one
+SELECT EXISTS (
+    SELECT 1 FROM recovery_custody_holds other
+    WHERE other.run_id <> $1 AND (
+        other.live_run_id = $1
+        OR other.final_capture_id IN (
+            SELECT c.id FROM recovery_captures c
+            JOIN recovery_custody_holds own ON own.id = c.hold_id
+            WHERE own.run_id = $1)
+        OR other.final_capture_id IN (
+            SELECT final_capture_id FROM recovery_custody_holds WHERE run_id = $1)
+        OR other.final_publication_id IN (
+            SELECT pub.id FROM run_held_publications pub
+            WHERE pub.run_id = $1 OR pub.hold_id IN (
+                SELECT id FROM recovery_custody_holds WHERE run_id = $1)
+                OR pub.id IN (
+                    SELECT final_publication_id FROM recovery_custody_holds WHERE run_id = $1)))
+)
+`
+
+func (q *Queries) HasCrossRunSharedFinal(ctx context.Context, runID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasCrossRunSharedFinal, runID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const listCrossRunFinalCaptures = `-- name: ListCrossRunFinalCaptures :many
+SELECT c.id, c.hold_id, c.run_id, c.user_id, c.original_worker_id, c.original_worker_identity, c.source_sha, c.attempted_head_sha, c.idempotency_key, c.state, c.manifest_bound, c.byte_size, c.checksum, c.chunk_count, c.prerequisite_shas, c.reason, c.context, c.expires_at, c.created_at, c.updated_at, c.reserved_bytes, c.coverage_digest, c.local_replica_worker_id, c.ready_retention_seconds, c.redundancy_proof, c.redundancy_refused_at, c.redundancy_refusal FROM recovery_captures c
+WHERE c.id IN (SELECT h.final_capture_id FROM recovery_custody_holds h WHERE h.run_id = $1)
+ORDER BY c.id LIMIT 1001
+`
+
+// Identity only: historical FINALs do not depend on current archive availability.
+func (q *Queries) ListCrossRunFinalCaptures(ctx context.Context, runID uuid.UUID) ([]RecoveryCapture, error) {
+	rows, err := q.db.Query(ctx, listCrossRunFinalCaptures, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RecoveryCapture{}
+	for rows.Next() {
+		var i RecoveryCapture
+		if err := rows.Scan(
+			&i.ID,
+			&i.HoldID,
+			&i.RunID,
+			&i.UserID,
+			&i.OriginalWorkerID,
+			&i.OriginalWorkerIdentity,
+			&i.SourceSha,
+			&i.AttemptedHeadSha,
+			&i.IdempotencyKey,
+			&i.State,
+			&i.ManifestBound,
+			&i.ByteSize,
+			&i.Checksum,
+			&i.ChunkCount,
+			&i.PrerequisiteShas,
+			&i.Reason,
+			&i.Context,
+			&i.ExpiresAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.ReservedBytes,
+			&i.CoverageDigest,
+			&i.LocalReplicaWorkerID,
+			&i.ReadyRetentionSeconds,
+			&i.RedundancyProof,
+			&i.RedundancyRefusedAt,
+			&i.RedundancyRefusal,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listCrossRunTargets = `-- name: ListCrossRunTargets :many
+SELECT a.id AS run_id, a.user_id AS owner_id, a.repo_id, a.kind, a.status,
+    a.claim_generation AS generation, a.issue_iid, a.finished_at, a.created_at
+FROM runs a
+WHERE a.repo_id = $1 AND a.user_id = $2
+    AND a.issue_iid = $3 AND a.issue_iid > 0 AND a.kind = 'issue'
+    AND a.id <> $4
+    AND a.status IN ('failed', 'cancelled') AND a.claim_generation > 0
+    AND a.mr_iid IS NULL AND a.fail_origin IS DISTINCT FROM 'run_timeout'
+    AND isfinite(a.finished_at) AND a.finished_at < $5::timestamptz
+    AND NOT EXISTS (SELECT 1 FROM worker_active_runs w WHERE w.run_id = a.id)
+    AND EXISTS (
+        SELECT 1 FROM recovery_custody_holds h
+        WHERE h.run_id = a.id AND h.user_id = a.user_id AND h.repo_id = a.repo_id
+            AND h.state = 'open'
+    )
+    AND ($6::timestamptz IS NULL
+        OR (a.created_at, a.id) < ($6::timestamptz, $7::uuid))
+ORDER BY a.created_at DESC, a.id DESC LIMIT 1
+`
+
+type ListCrossRunTargetsParams struct {
+	RepoID           pgtype.UUID        `json:"repo_id"`
+	OwnerID          uuid.UUID          `json:"owner_id"`
+	IssueIid         pgtype.Int8        `json:"issue_iid"`
+	WitnessRunID     uuid.UUID          `json:"witness_run_id"`
+	WitnessCreatedAt pgtype.Timestamptz `json:"witness_created_at"`
+	AfterCreatedAt   pgtype.Timestamptz `json:"after_created_at"`
+	AfterRunID       uuid.UUID          `json:"after_run_id"`
+}
+
+type ListCrossRunTargetsRow struct {
+	RunID      uuid.UUID          `json:"run_id"`
+	OwnerID    uuid.UUID          `json:"owner_id"`
+	RepoID     pgtype.UUID        `json:"repo_id"`
+	Kind       string             `json:"kind"`
+	Status     string             `json:"status"`
+	Generation int64              `json:"generation"`
+	IssueIid   pgtype.Int8        `json:"issue_iid"`
+	FinishedAt pgtype.Timestamptz `json:"finished_at"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+}
+
+// The issue history index supplies descending creation order; UUID breaks ties.
+// Only immutable keys drive continuation, never a mutable completion timestamp.
+func (q *Queries) ListCrossRunTargets(ctx context.Context, arg ListCrossRunTargetsParams) ([]ListCrossRunTargetsRow, error) {
+	rows, err := q.db.Query(ctx, listCrossRunTargets,
+		arg.RepoID,
+		arg.OwnerID,
+		arg.IssueIid,
+		arg.WitnessRunID,
+		arg.WitnessCreatedAt,
+		arg.AfterCreatedAt,
+		arg.AfterRunID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCrossRunTargetsRow{}
+	for rows.Next() {
+		var i ListCrossRunTargetsRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.OwnerID,
+			&i.RepoID,
+			&i.Kind,
+			&i.Status,
+			&i.Generation,
+			&i.IssueIid,
+			&i.FinishedAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listMergedPredecessorCandidates = `-- name: ListMergedPredecessorCandidates :many
 SELECT r.id AS run_id, r.user_id AS owner_id, p.id AS repo_id,
     p.connection_id, p.forge_project_id AS project_id, r.mr_iid::bigint AS mr_iid,
     r.claim_generation AS completed_generation, c.forge_type, c.base_url,
-    c.token_ciphertext
+    c.token_ciphertext, r.kind, r.issue_iid, r.created_at,
+    (EXISTS (
+        SELECT 1 FROM recovery_custody_holds h
+        WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.repo_id = p.id
+            AND h.state = 'open' AND h.generation < r.claim_generation
+    ))::boolean AS original_branch
 FROM runs r
 JOIN repos p ON p.id = r.repo_id
 JOIN forge_connections c ON c.id = p.connection_id AND c.user_id = r.user_id
 WHERE p.id = $1 AND p.enabled
     AND r.status = 'completed' AND r.mr_iid > 0 AND r.claim_generation > 0
     AND r.id > $2
-    AND EXISTS (
+    AND (EXISTS (
         SELECT 1 FROM recovery_custody_holds h
         WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.repo_id = p.id
             AND h.state = 'open' AND h.generation < r.claim_generation
-    )
+    ) OR (r.kind = 'issue' AND r.issue_iid > 0
+        AND isfinite(r.created_at) AND EXISTS (
+        SELECT 1 FROM runs a WHERE a.user_id = r.user_id AND a.repo_id = p.id AND a.issue_iid = r.issue_iid
+            AND a.kind = 'issue' AND a.issue_iid > 0
+            AND a.status IN ('failed', 'cancelled') AND a.claim_generation > 0
+            AND a.mr_iid IS NULL AND a.fail_origin IS DISTINCT FROM 'run_timeout'
+            AND isfinite(a.finished_at) AND a.finished_at < r.created_at
+            AND NOT EXISTS (SELECT 1 FROM worker_active_runs w WHERE w.run_id = a.id)
+            AND EXISTS (
+                SELECT 1 FROM recovery_custody_holds h
+                WHERE h.run_id = a.id AND h.user_id = a.user_id AND h.repo_id = a.repo_id
+                    AND h.state = 'open'
+            )
+    )))
 ORDER BY r.id LIMIT 1
 `
 
@@ -73,16 +325,20 @@ type ListMergedPredecessorCandidatesParams struct {
 }
 
 type ListMergedPredecessorCandidatesRow struct {
-	RunID               uuid.UUID `json:"run_id"`
-	OwnerID             uuid.UUID `json:"owner_id"`
-	RepoID              uuid.UUID `json:"repo_id"`
-	ConnectionID        uuid.UUID `json:"connection_id"`
-	ProjectID           int64     `json:"project_id"`
-	MrIid               int64     `json:"mr_iid"`
-	CompletedGeneration int64     `json:"completed_generation"`
-	ForgeType           string    `json:"forge_type"`
-	BaseUrl             string    `json:"base_url"`
-	TokenCiphertext     []byte    `json:"token_ciphertext"`
+	RunID               uuid.UUID          `json:"run_id"`
+	OwnerID             uuid.UUID          `json:"owner_id"`
+	RepoID              uuid.UUID          `json:"repo_id"`
+	ConnectionID        uuid.UUID          `json:"connection_id"`
+	ProjectID           int64              `json:"project_id"`
+	MrIid               int64              `json:"mr_iid"`
+	CompletedGeneration int64              `json:"completed_generation"`
+	ForgeType           string             `json:"forge_type"`
+	BaseUrl             string             `json:"base_url"`
+	TokenCiphertext     []byte             `json:"token_ciphertext"`
+	Kind                string             `json:"kind"`
+	IssueIid            pgtype.Int8        `json:"issue_iid"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	OriginalBranch      bool               `json:"original_branch"`
 }
 
 // OPEN exact-identity predecessor holds are the durable workset, including
@@ -107,6 +363,10 @@ func (q *Queries) ListMergedPredecessorCandidates(ctx context.Context, arg ListM
 			&i.ForgeType,
 			&i.BaseUrl,
 			&i.TokenCiphertext,
+			&i.Kind,
+			&i.IssueIid,
+			&i.CreatedAt,
+			&i.OriginalBranch,
 		); err != nil {
 			return nil, err
 		}
@@ -116,6 +376,200 @@ func (q *Queries) ListMergedPredecessorCandidates(ctx context.Context, arg ListM
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockCrossRunInventory = `-- name: LockCrossRunInventory :many
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding FROM recovery_custody_holds WHERE run_id = $1
+ORDER BY generation, id LIMIT 1001 FOR NO KEY UPDATE
+`
+
+// Include every state and identity: closed or anomalous siblings must be classified
+// under the same disposer lock as open holds, before locking publications/captures.
+func (q *Queries) LockCrossRunInventory(ctx context.Context, runID uuid.UUID) ([]RecoveryCustodyHold, error) {
+	rows, err := q.db.Query(ctx, lockCrossRunInventory, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RecoveryCustodyHold{}
+	for rows.Next() {
+		var i RecoveryCustodyHold
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.RepoID,
+			&i.RunID,
+			&i.Generation,
+			&i.State,
+			&i.OriginalWorkerID,
+			&i.OriginalWorkerIdentity,
+			&i.LiveWorkerID,
+			&i.LiveRunID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.ReleasedAt,
+			&i.ReleaseEvidence,
+			&i.ReleasePushedSha,
+			&i.ReleaseSourceSha,
+			&i.ReleaseAdoptedSha,
+			&i.ReleaseFinalHeadSha,
+			&i.ReleaseSuccessorGeneration,
+			&i.ReleaseBranch,
+			&i.ReleaseTarget,
+			&i.TerminalRecordRejection,
+			&i.InventoryGuarded,
+			&i.FinalDisposition,
+			&i.FinalCaptureID,
+			&i.FinalSourceSha,
+			&i.FinalCoverageDigest,
+			&i.CompletionIdentity,
+			&i.CompletedPublicationReceipt,
+			&i.CompletedPublicationReason,
+			&i.FinalPublicationID,
+			&i.MergedPredecessorDiscardBinding,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockCrossRunPublications = `-- name: LockCrossRunPublications :many
+SELECT pub.id, pub.run_id, pub.generation, pub.hold_id, pub.user_id, pub.repo_id, pub.worker_id, pub.live_run_id, pub.ref, pub.tip, pub.coverage_digest, pub.state, pub.attempts, pub.created_at, pub.updated_at, pub.create_invoked_at, pub.ref_created_at, pub.acknowledged_at, pub.expires_at, pub.owner_expired_at, pub.deleted_at, pub.next_attempt_at, pub.last_error, pub.refusal_reason FROM run_held_publications pub
+WHERE pub.run_id = $1 OR pub.hold_id IN (
+    SELECT id FROM recovery_custody_holds WHERE run_id = $1
+) OR pub.id IN (
+    SELECT final_publication_id FROM recovery_custody_holds WHERE run_id = $1
+)
+ORDER BY pub.generation, pub.id LIMIT 1001 FOR NO KEY UPDATE
+`
+
+func (q *Queries) LockCrossRunPublications(ctx context.Context, runID uuid.UUID) ([]RunHeldPublication, error) {
+	rows, err := q.db.Query(ctx, lockCrossRunPublications, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RunHeldPublication{}
+	for rows.Next() {
+		var i RunHeldPublication
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Generation,
+			&i.HoldID,
+			&i.UserID,
+			&i.RepoID,
+			&i.WorkerID,
+			&i.LiveRunID,
+			&i.Ref,
+			&i.Tip,
+			&i.CoverageDigest,
+			&i.State,
+			&i.Attempts,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.CreateInvokedAt,
+			&i.RefCreatedAt,
+			&i.AcknowledgedAt,
+			&i.ExpiresAt,
+			&i.OwnerExpiredAt,
+			&i.DeletedAt,
+			&i.NextAttemptAt,
+			&i.LastError,
+			&i.RefusalReason,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockCrossRunTarget = `-- name: LockCrossRunTarget :one
+SELECT id, user_id, repo_id, kind, status, claim_generation, issue_iid, mr_iid,
+    fail_origin, finished_at, created_at
+FROM runs WHERE id = $1 FOR UPDATE
+`
+
+type LockCrossRunTargetRow struct {
+	ID              uuid.UUID          `json:"id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	RepoID          pgtype.UUID        `json:"repo_id"`
+	Kind            string             `json:"kind"`
+	Status          string             `json:"status"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	IssueIid        pgtype.Int8        `json:"issue_iid"`
+	MrIid           pgtype.Int8        `json:"mr_iid"`
+	FailOrigin      pgtype.Text        `json:"fail_origin"`
+	FinishedAt      pgtype.Timestamptz `json:"finished_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+// The caller orders target/witness run locks by ascending UUID.
+func (q *Queries) LockCrossRunTarget(ctx context.Context, runID uuid.UUID) (LockCrossRunTargetRow, error) {
+	row := q.db.QueryRow(ctx, lockCrossRunTarget, runID)
+	var i LockCrossRunTargetRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.Kind,
+		&i.Status,
+		&i.ClaimGeneration,
+		&i.IssueIid,
+		&i.MrIid,
+		&i.FailOrigin,
+		&i.FinishedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const lockCrossRunWitness = `-- name: LockCrossRunWitness :one
+SELECT id, user_id, repo_id, kind, status, claim_generation, issue_iid, mr_iid,
+    fail_origin, finished_at, created_at
+FROM runs WHERE id = $1 FOR SHARE
+`
+
+type LockCrossRunWitnessRow struct {
+	ID              uuid.UUID          `json:"id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	RepoID          pgtype.UUID        `json:"repo_id"`
+	Kind            string             `json:"kind"`
+	Status          string             `json:"status"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	IssueIid        pgtype.Int8        `json:"issue_iid"`
+	MrIid           pgtype.Int8        `json:"mr_iid"`
+	FailOrigin      pgtype.Text        `json:"fail_origin"`
+	FinishedAt      pgtype.Timestamptz `json:"finished_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) LockCrossRunWitness(ctx context.Context, runID uuid.UUID) (LockCrossRunWitnessRow, error) {
+	row := q.db.QueryRow(ctx, lockCrossRunWitness, runID)
+	var i LockCrossRunWitnessRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.Kind,
+		&i.Status,
+		&i.ClaimGeneration,
+		&i.IssueIid,
+		&i.MrIid,
+		&i.FailOrigin,
+		&i.FinishedAt,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const lockMergedPredecessorBinding = `-- name: LockMergedPredecessorBinding :one

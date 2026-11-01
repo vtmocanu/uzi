@@ -11,7 +11,9 @@
 //
 // Shared / forge-less chrome (nav, app-shell, admin, docs) has no forge_type to key
 // off and MUST NOT default to one forge's word: it names both or restructures past
-// the noun. Those surfaces do not call this helper.
+// the noun. Those surfaces do not call this helper. The one stated exception is the
+// Overview usage card (components/UsageCards.tsx): it writes "PRs" for every forge,
+// GitLab included, because it aggregates across forges (issue #3686).
 
 const FORGEJO = "forgejo";
 const GITHUB = "github";

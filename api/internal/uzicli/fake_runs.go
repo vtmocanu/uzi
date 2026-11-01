@@ -172,6 +172,23 @@ func (f *FakeClient) RunInputs(_ context.Context, id string) ([]apitypes.SteerIn
 	return nil, Exitf(ExitNotFound, "run %s not found", id)
 }
 
+// RunLeadConfigHistory mirrors the owner-or-admin endpoint: a key present in LeadConfigHistoryByID
+// is a visible run (return its history, possibly empty); a key absent is a non-owner / unknown run
+// -> ExitNotFound (exit 4), matching the server's 404. Entries is never nil on the way out.
+func (f *FakeClient) RunLeadConfigHistory(_ context.Context, id string) (apitypes.LeadConfigHistoryDTO, error) {
+	if f.Err != nil {
+		return apitypes.LeadConfigHistoryDTO{}, f.Err
+	}
+	h, ok := f.LeadConfigHistoryByID[id]
+	if !ok {
+		return apitypes.LeadConfigHistoryDTO{}, Exitf(ExitNotFound, "run %s not found", id)
+	}
+	if h.Entries == nil {
+		h.Entries = []apitypes.LeadConfigHistoryEntryDTO{}
+	}
+	return h, nil
+}
+
 // SetRunPriority records the (run id, expedite) it was called with and returns the
 // canned run. SetRunPriorityErr wins over the blanket Err — mirroring SetDispositionErr
 // — so a test can model the non-queued 409 on the WRITE while the capture still proves

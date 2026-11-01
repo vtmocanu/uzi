@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -166,6 +167,33 @@ describe("buildRunExecutor — worker secret deny paths (issue #1761)", () => {
   it("the default /run/secrets token adds no directory (the built-in prefix covers it)", () => {
     const { executor } = buildRunExecutor("run-8", undefined, baseDeps({ workerTokenFile: "/run/secrets/worker_token" }));
     assert.deepEqual((executor as unknown as { secretPaths: readonly string[] }).secretPaths, ["/run/secrets/worker_token"]);
+  });
+});
+
+// Issue #3675: the per-run command-cache budget reaches the Codex executor's deps.
+describe("buildRunExecutor: command cache rotation budget (issue #3675)", () => {
+  const depsOf = (e: unknown) => (e as { deps: { commandCacheRunBytes?: number } }).deps;
+
+  it("passes codexCommandCacheRunBytes through as commandCacheRunBytes, 0 included", () => {
+    for (const bytes of [123_456_789, 0]) {
+      const { executor } = buildRunExecutor("run-cache", VALID_SUBSCRIPTION_CODEX, baseDeps({ codexCommandCacheRunBytes: bytes }));
+      assert.ok(executor instanceof CodexExecutor);
+      assert.equal(depsOf(executor).commandCacheRunBytes, bytes);
+    }
+  });
+
+  it("leaves rotation off when no budget is supplied", () => {
+    const { executor } = buildRunExecutor("run-cache", VALID_SUBSCRIPTION_CODEX, baseDeps());
+    assert.ok(executor instanceof CodexExecutor);
+    assert.equal(depsOf(executor).commandCacheRunBytes, undefined);
+  });
+
+  it("main() threads config.codexCommandCacheRunBytes into buildRunExecutor", () => {
+    // main() starts the worker and cannot be called here, so its wiring is pinned in the source.
+    const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+    // Anchored on the buildRunExecutor( call's argument object so a comment or an unrelated
+    // literal elsewhere cannot satisfy it.
+    assert.match(source, /buildRunExecutor\(runId, codex, \{[^}]*\bcodexCommandCacheRunBytes:\s*config\.codexCommandCacheRunBytes\b/);
   });
 });
 

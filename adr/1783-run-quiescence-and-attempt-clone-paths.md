@@ -1342,3 +1342,176 @@ record. No generic force-clear exists.
   reclaim and SETTLE/CLEANUP separation (#2746) are unchanged.
 - No hosted or multi-worker acceptance of the crash behaviour is claimed here;
   hosted acceptance remains a separate human step.
+
+## Amendment 2026-10-30 — #3645: coordinated terminal-owner handoff
+
+Refs #3645. Builds on the #3404 amendment above and is serial with #3638 (landed)
+and the open #3639 and #3644. It changes how a successor claimant meets a
+terminal owner's fenced source. It does not change the fence, the certificate
+or the authority store.
+
+### The problem
+
+A terminal owner whose completing bare journal carried the #3404 completion-source
+fence left an orphan that the successor's reclaim could not clear. The reclaim
+called the uncertified `retireRunnerClone`, `refuseFenceDrop` refused the fence
+drop at `journal_validation`, and the successor failed instead of being seeded.
+The refusal is correct: an uncertified path must not clear a fence. What was
+missing is a route that retires the source through the certified chain.
+
+### Routing
+
+- `RunRunner.reclaimTerminalOrphan` reads the exact owner journal before any
+  effect (`GitCache.readOrphanJournalFence`, one bare-lock read that uses the
+  strict journal reader and reports `changed`, `unfenced` or `fenced`). A worker
+  without authority reports `unfenced` and keeps its baseline behaviour.
+- For a fenced journal it calls `RecoveryCoordinator.retireCompletedSourceForHandoff`,
+  which drives the existing certified chain: `forgetCompletedGeneration`, then
+  `verifyDurableRetirement`, then `withCompletionSourceBoundary`, then
+  `retireRunnerClone` with `expectedFence`. The owner's receipt only selects the
+  generation; it is never a certificate. Every certificate, cohort, epoch, source,
+  fence, artifact and pending-operation check is redone, and nothing is synthesized.
+- `refuseFenceDrop` stays at every call site, including the two the orphan path
+  reaches (`retireRunnerClone`, `releaseAttemptInPlace`). The #3404 sentence "an orphan
+  reclaim, for one, may not clear a fenced journal" stays true: the handoff
+  retires through the certified chain, it does not clear a fence from the
+  orphan path.
+
+### Lock order
+
+The handoff is entered holding none of A, C, J or B. It takes A (bounded by the
+claimant's `authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)` and ended by its
+lifecycle signal), then J for selection only (released), then C in `skip` mode so
+it never waits behind a coordinator pass, then J again, then B inside the
+boundary. The claimant can still queue for A behind a coordinator cycle that holds
+it. That wait is bounded by the wait above (the lesser of 300 seconds and the
+remaining maintenance budget) and, on timeout, is a retained stop. There is no
+new sleep, timeout or generic retry.
+
+The timeout is the typed `AuthorityLockBusy`, a subclass of `AuthorityRefusal`
+with the unchanged message `authority lock timeout`, thrown at the two timeout
+sites in `agent/src/authority-lock.ts`. Every existing `AuthorityRefusal` handler
+still matches it. Only a timeout while acquiring A is `authority_busy`; every
+other refusal and every abort propagates unchanged, except a failed journal read
+during selection, which is `uncertain`.
+
+### Outcomes and the claimant disposition
+
+The coordinator answers with a typed `CompletedRetirement`, or `not_completion`
+when no record of the owner carries the fence.
+
+| Outcome | Claimant disposition |
+|---|---|
+| `retired` | Re-admit through ordinary admission. |
+| `pending` (including `authority_busy`, `preflight`, `cycle_busy`, `action_failed`) | Retained stop: `RetainedRecoveryStop`, no terminal report, nonterminal, bounded by `RUN_MAX_REQUEUES`. |
+| `uncertain` | Retained stop. |
+| `invalid` (retire mode) | The unchanged outward refusal. |
+| `unsupported` (retire mode) | The unchanged outward refusal. |
+| `not_completion` (retire mode) | The unchanged outward refusal. |
+
+After every non-`retired` outcome the journal is re-read. `changed` re-admits (the
+pair was retired or replaced under the call). A re-read that throws keeps the
+outcome's own disposition. Re-admission is bounded: at most 2 per claim, and the
+third is a retained stop.
+
+A seed that meets a slot still `retiring` (typed refusal kind `retiring`) is a
+not-ready retirement and a retained stop. This applies to a fresh claim as well as
+after a re-admission: a retirement interrupted before the claim arrived leaves the
+same slot. It fails safe, because a retained stop is nonterminal and bounded by the
+requeue cap; the diagnostic names no owner or path when none is known. The untyped
+operator-discard refusal is raised only inside the discard itself, so a seed never
+sees it. A `retiring` slot with no blocking pending record is a retained stop. A
+retiring slot whose pending record is still running, or whose destructive record
+settled failed (as an interrupted operator discard can leave it) raises the untyped "source has an
+unresolved pending footprint" refusal at seed first, which stays terminal; it is
+outside this change and recorded as a residual.
+
+An error thrown while the entry prepares the retirement once A is held (an I/O
+error on a bundle or skills `lstat`, the completion-check cleanup, the redundancy
+claims) is `uncertain`/`preparation_error`, never a raw throw that would reach a
+failure reason. Any AuthorityRefusal, lifecycle aborts and a spent maintenance
+budget still propagate, and the background sweep is unchanged. In classify mode a
+coordinator that is disabled or has no authority scope answers
+`uncertain`/`classify_unavailable` (a retained stop), not `not_completion`: it
+cannot rule out a fenced journal. Retire mode keeps `not_completion`.
+
+### A fenced journal that has retained sources
+
+The certified chain does not retire a journal that carries an episode or retained
+sources. Authority decides the disposition, in classify-only mode. Classify-only
+selects by fence, looks the authority slot up by clone path, verifies, enters no
+boundary and deletes nothing; its only side effect is the settlement drain every
+outer A acquisition already runs.
+
+- Only a classify `not_completion` (no record carries the fence and no authority
+  slot covers the path) reaches the unchanged baseline `detachTerminalRetained`,
+  and that detach is bound to the classified fence: a fence that appeared or
+  changed meanwhile is never detached on the earlier answer.
+- Every other outcome is a retained stop and is never detached, so the journal,
+  fence and bytes stay reachable.
+- No protected-descriptor extension was added.
+
+### Quiescence exclusion
+
+The completion boundary's quiescence request counts other claims in flight. While
+the handoff runs, the pre-seed claimant's own run is excluded from
+`otherClaimInFlight` only while it is the exact current pre-seed flight: its
+execution tail is the recorded tail (a queued duplicate that replaced it is not
+excluded), it has no claim fence, is not cancelled, is not shutting down, and has
+no worktree, clone or attempt. The predicate is rechecked after each awaited
+quiesce; if it no longer holds the boundary retains. This is parity with
+`quiesceRun`, which excludes the flight's own run. Every other execution tail,
+live attempt and the owner's own tail still count; default boundary calls are
+unchanged.
+
+### Exhaustion
+
+A retained stop leaves the claimant's own `ClaimRun` custody hold open and fabricates
+no evidence. `ReadWorkerExhaustionEvidence` reads it as `custody_uncertain`, so at
+the requeue cap (including 0) the run parks `recovery_wait` with cause
+`worker_requeue_exhausted` for an owner Resume or Cancel. Every claimant that can
+reach this path has the hold: profile-bound runs are routed to the isolated runner
+and never reach `RunRunner`, the other kinds have their own runners, and current
+images advertise the recovery capabilities the hold requires. Every claim opens its
+own hold and the stop leaves it open, so at the default cap of 3 this stop loop accrues
+at most 1 + `RUN_MAX_REQUEUES` (4) open holds per exhaustion episode, below the default `custody_hold_limit` of 8; those holds
+share the owner's admission count with the owner's other runs, so several
+exhausted runs can hold the owner's new claims queued until those holds are discarded or
+released; Resume and Cancel leave them open. The `stopOnHeldSource` stop accrues holds the same way. `TestClaimantHandoffExhaustionLiveDB` proves one open
+hold per claim, all holds open at the cap (0 and 3), a cancel leaving them open and the ownership change; the
+Resume and admission statements rest on the code (`ResumeWorkerRecoveryEpisode`, `fn_custody_admission_count`).
+
+### Diagnostics
+
+The orphan events gain a closed-set `retirement_subreason`, taken from
+`OrphanRetirementSubreason` in `agent/src/git.ts`: `fenced_source`, `pair_changed`,
+`completion_pending`, `completion_preflight_retained`, `completion_unverified`,
+`completion_uncertain`, `completion_unsupported`, `authority_busy`,
+`published_source_retained` and `unknown`. Anything outside the set is written as
+`unknown`, and no error text, path or provider output is included. Outward errors
+are unchanged. See [Reading orphan-reclaim diagnostics](../docs/run-recovery.md#reading-orphan-reclaim-diagnostics).
+
+### Rejected alternatives
+
+These came from the preserved earlier attempt (`bc3c7750`).
+
+- A 10 second wait on the owner's execution tail. A live owner tail is `pending`
+  and a retained stop, with no wait.
+- A boolean result whose `false` fell back to the uncertified reclaim and its
+  terminal refusal. The typed outcome replaces it.
+- A waiting capture cycle under A.
+- A reseed that bypassed #3638's held-source mapping. The loop keeps
+  `reseedAfterReclaim` and its `SourceUseHeldRefusal` mapping.
+
+### Known residuals
+
+- A same-process Codex owner without a live disposal witness, a permanently
+  refusing preflight, or a valid episode-bearing fenced source stays retained
+  until requeue exhaustion, then owner-held.
+- Profile-bound runs never reach this path.
+- Human and live acceptance on the exact PR head (E2E phases 32 and 71, and the
+  combined lane after #3644) is not claimed here.
+
+### Related issues
+
+Out of scope: #3638 and #3639 (memory-park settlement) and #3644 (same-run restart).

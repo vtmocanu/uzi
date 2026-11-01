@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
-import { acquireWorkerLifetime, type AuthorityTransaction, withAuthorityTransaction } from "../src/authority-lock.js";
+import { acquireWorkerLifetime, AuthorityRefusal, type AuthorityTransaction, withAuthorityTransaction } from "../src/authority-lock.js";
 import { type AuthorityStore, leaseEpoch, openAuthorityStore, type SourceUseLease } from "../src/completion-authority.js";
 import {
   buildClaudeSourceCore, buildCodexSourceCore, type CompletionSourceV2, parseCompletionSourceV2,
@@ -349,6 +349,9 @@ test("verifyPublishedSource needs the certificate AND the slot's current publica
   assert.equal(published.publication.state, "claude_ready");
   assert.deepEqual(published.publication.cohort, { runId: "run-1", generation: 2, captureIds: CAP });
   await assert.rejects(f.tx((t2) => verifyPublishedSource(t2, f.store, rival)), /not the published source/, "valid certificate, other digest");
+  // issue #3645: the refusal is typed so a handoff classifies it invalid, never uncertain.
+  await assert.rejects(f.tx((t2) => verifyPublishedSource(t2, f.store, rival)),
+    (err: unknown) => err instanceof AuthorityRefusal && err.kind === "source_mismatch");
   await assert.rejects(f.tx((t2) => verifyPublishedSource(t2, f.store, { ...certified, certificate: "0".repeat(64) })), /certificate does not verify/);
   await f.tx((t2) => f.store.transition(t2, f.lease, "ineligible"));
   assert.equal((await f.tx((t2) => f.store.readPublication(t2, f.clone)))?.state, "ineligible", "the publication outlives the state");

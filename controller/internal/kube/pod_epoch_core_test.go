@@ -118,6 +118,26 @@ func (h *epochHarness) event(event watch.EventType, p *corev1.Pod) *PodEpochDeci
 	}
 	return d
 }
+
+// epochWithIDs returns p with successor container IDs in its statuses, as the
+// kubelet reports them once the successor's containers exist.
+func epochWithIDs(p *corev1.Pod, prefix string) *corev1.Pod {
+	p = p.DeepCopy()
+	p.ResourceVersion += "/ids"
+	p.Status.InitContainerStatuses = []corev1.ContainerStatus{{Name: "seed", ContainerID: prefix + "seed2"}}
+	p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "worker", ContainerID: prefix + "worker2"}}
+	return p
+}
+
+// successor sends the successor's Added event and, if that yields no decision
+// (a positive proof is deferred), the later Modified event carrying container IDs.
+func (h *epochHarness) successor(p *corev1.Pod) *PodEpochDecision {
+	h.t.Helper()
+	if d := h.event(watch.Added, p); d != nil {
+		return d
+	}
+	return h.event(watch.Modified, epochWithIDs(p, "containerd://"))
+}
 func (h *epochHarness) assertDecision(d *PodEpochDecision, positive bool) *PodEpochEvidence {
 	h.t.Helper()
 	if d == nil {
@@ -152,7 +172,10 @@ func TestPodEpochGracefulAndSharedFixture(t *testing.T) {
 	x := epochTerminal(epochPod(epochA))
 	h.event(watch.Modified, x)
 	h.event(watch.Deleted, x)
-	d := h.event(watch.Added, epochPod(epochB))
+	if h.event(watch.Added, epochPod(epochB)) != nil {
+		t.Fatal("positive proof emitted before successor container IDs")
+	}
+	d := h.successor(epochPod(epochB))
 	e := h.assertDecision(d, true)
 	if e.Predecessor != epochA || e.Successor != epochB || e.Runtime != "containerd-runc" {
 		t.Fatal(e)
@@ -167,7 +190,7 @@ func TestPodEpochGracefulAndSharedFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture, err := os.ReadFile("../../../fixtures/pod-epoch/positive.json")
+	fixture, err := os.ReadFile("../../../fixtures/pod-epoch/v2/positive.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +292,7 @@ func TestPodEpochRefusals(t *testing.T) {
 		v := false
 		x.Spec.ShareProcessNamespace = &v
 		h.event(watch.Modified, x)
-		h.assertDecision(h.event(watch.Added, epochPod(epochB)), true)
+		h.assertDecision(h.successor(epochPod(epochB)), true)
 	})
 	t.Run("signal-after-add", func(t *testing.T) {
 		h := newEpochHarness(t, epochPod(epochA))
@@ -290,7 +313,7 @@ func TestPodEpochHistory(t *testing.T) {
 		x := epochTerminal(epochPod(epochA))
 		h.event(watch.Modified, x)
 		h.event(watch.Modified, x)
-		h.assertDecision(h.event(watch.Added, epochPod(epochB)), true)
+		h.assertDecision(h.successor(epochPod(epochB)), true)
 	})
 	t.Run("label-drift", func(t *testing.T) {
 		h := newEpochHarness(t, epochPod(epochA))
@@ -316,9 +339,9 @@ func TestPodEpochHistory(t *testing.T) {
 	t.Run("B-terminal-C-does-not-skip", func(t *testing.T) {
 		h := newEpochHarness(t, epochPod(epochA))
 		h.event(watch.Modified, epochTerminal(epochPod(epochA)))
-		h.assertDecision(h.event(watch.Added, epochPod(epochB)), true)
+		h.assertDecision(h.successor(epochPod(epochB)), true)
 		h.event(watch.Modified, epochTerminal(epochPod(epochB)))
-		e := h.assertDecision(h.event(watch.Added, epochPod(epochC)), true)
+		e := h.assertDecision(h.successor(epochPod(epochC)), true)
 		if e.Predecessor != epochB {
 			t.Fatal("skipped B")
 		}
@@ -343,7 +366,7 @@ func TestPodEpochHistory(t *testing.T) {
 				}
 				// A modified after the ambiguous baseline establishes no new ordering;
 				// labeled baseline overlap remains ambiguous, hence always refuses.
-				h.assertDecision(h.event(watch.Added, epochPod(epochB)), foreign && order == "before")
+				h.assertDecision(h.successor(epochPod(epochB)), foreign && order == "before")
 			})
 		}
 	}
@@ -397,7 +420,7 @@ func TestPodEpochLiveIdentity(t *testing.T) {
 		x := epochTerminal(epochPod(epochA))
 		x.OwnerReferences[0].Name = "old-rs"
 		h.event(watch.Modified, x)
-		h.assertDecision(h.event(watch.Added, epochPod(epochB)), true)
+		h.assertDecision(h.successor(epochPod(epochB)), true)
 	})
 }
 func TestPodEpochMaintenanceRemint(t *testing.T) {
@@ -413,7 +436,7 @@ func TestPodEpochMaintenanceRemint(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			e := h.assertDecision(h.event(watch.Added, epochPod(epochB)), receipt)
+			e := h.assertDecision(h.successor(epochPod(epochB)), receipt)
 			if receipt && (e.Maintenance == nil || e.Maintenance.OperationID != "maintenance-1") {
 				t.Fatal("receipt lost")
 			}
@@ -467,7 +490,7 @@ func TestPodEpochGenerationAndDelivery(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			h := newEpochHarness(t, epochPod(epochA))
 			h.event(watch.Modified, epochTerminal(epochPod(epochA)))
-			d := h.event(watch.Added, epochPod(epochB))
+			d := h.successor(epochPod(epochB))
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			requests := 0
@@ -502,7 +525,7 @@ func TestPodEpochGenerationAndDelivery(t *testing.T) {
 	t.Run("concurrent-delivery", func(t *testing.T) {
 		h := newEpochHarness(t, epochPod(epochA))
 		h.event(watch.Modified, epochTerminal(epochPod(epochA)))
-		d := h.event(watch.Added, epochPod(epochB))
+		d := h.successor(epochPod(epochB))
 		var wg sync.WaitGroup
 		for i := 0; i < 8; i++ {
 			wg.Add(1)
@@ -541,7 +564,7 @@ func TestPodEpochBounds(t *testing.T) {
 		}
 		h.generation = g
 		h.event(watch.Modified, epochTerminal(epochPod(epochA)))
-		h.assertDecision(h.event(watch.Added, epochPod(epochB)), true)
+		h.assertDecision(h.successor(epochPod(epochB)), true)
 	})
 	t.Run("retained-bytes", func(t *testing.T) {
 		h := newEpochHarness(t, epochPod(epochA))
@@ -559,7 +582,7 @@ func TestPodEpochBounds(t *testing.T) {
 		p := epochTerminal(epochPod(epochA))
 		p.Status.ContainerStatuses[0].ContainerID = strings.Repeat("x", PodEpochMaxDocument)
 		h.event(watch.Modified, p)
-		d := h.event(watch.Added, epochPod(epochB))
+		d := h.successor(epochPod(epochB))
 		h.assertDecision(d, false)
 		if len(d.Document()) > PodEpochMaxDocument {
 			t.Fatal("oversize negative")
@@ -589,7 +612,7 @@ func TestPodEpochContractCorpus(t *testing.T) {
 			})
 		}
 	}
-	b, err := os.ReadFile("../../../fixtures/pod-epoch/positive.json")
+	b, err := os.ReadFile("../../../fixtures/pod-epoch/v2/positive.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -603,7 +626,7 @@ func TestPodEpochContractCorpus(t *testing.T) {
 	}{
 		{"uuid", func(e *PodEpochEvidence) { e.Successor = "AAAAAAAA-0000-4000-8000-000000000002" }},
 		{"runtime", func(e *PodEpochEvidence) { e.Runtime = "containerd" }},
-		{"version", func(e *PodEpochEvidence) { e.Version = 2 }},
+		{"version", func(e *PodEpochEvidence) { e.Version = 3 }},
 		{"entry-duplicate", func(e *PodEpochEvidence) { e.Containers = append(e.Containers, e.Containers[0]) }},
 		{"reverse-time", func(e *PodEpochEvidence) { e.SuccessorAdded = e.SessionStarted }},
 		{"maintenance", func(e *PodEpochEvidence) {

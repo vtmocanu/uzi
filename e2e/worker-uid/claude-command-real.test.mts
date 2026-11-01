@@ -341,13 +341,13 @@ describe("real Claude guarded command lane", { skip: INIT_SKIP }, () => {
       };
       // Control: with no recorded root the real scan does see the live supervisor and cannot attribute it.
       const control = await sibling(() => []);
-      assert.equal(control.process?.state, "unverified", control.process?.detail);
+      assert.equal(control.process?.state, "unverified", control.process?.detail ?? "no process detail reported");
       assert.ok(control.process?.processes.some((p) => p.pid === supervisorPid && p.reason === "unreadable_unattributed"),
         `the unrecorded supervisor is reported: ${JSON.stringify(control.process?.processes)}`);
       assert.deepEqual(control.process?.killed, []);
       // The lane's recorded root attributes it to the live sibling: the capture proof is clean and signals nothing.
       const clean = await sibling(() => lane.recordedRoots());
-      assert.equal(clean.process?.state, "quiescent", clean.process?.detail);
+      assert.equal(clean.process?.state, "quiescent", clean.process?.detail ?? "no process detail reported");
       assert.deepEqual(clean.process?.killed, []);
       assert.ok(tree.every((pid) => alive(pid)), "the sibling scan did not touch the live command");
       assert.equal(lane.liveCount, 1);
@@ -360,7 +360,7 @@ describe("real Claude guarded command lane", { skip: INIT_SKIP }, () => {
         mode: "own", attempt: attemptA, cloneKey: attemptA.cloneKey, targetPaths: [rig.dir],
         processes: true, dockerHost: undefined, registry: registryA, otherClaimInFlight: false,
       });
-      assert.equal(own.process?.state, "quiescent", own.process?.detail);
+      assert.equal(own.process?.state, "quiescent", own.process?.detail ?? "no process detail reported");
       assert.ok(own.process?.killed.includes(supervisorPid), `the own reap killed the recorded supervisor: ${JSON.stringify(own.process)}`);
       await untilGone([supervisorPid], "the supervisor killed by the own-run reap");
       await pending;
@@ -641,7 +641,7 @@ describe("real Claude guarded command lane", { skip: INIT_SKIP }, () => {
         mode: "own", attempt: attemptA, cloneKey: attemptA.cloneKey, targetPaths: [rig.dir],
         processes: true, dockerHost: undefined, registry, otherClaimInFlight: true,
       });
-      assert.notEqual(own.process?.state, "quiescent", own.process?.detail);
+      assert.notEqual(own.process?.state, "quiescent", own.process?.detail ?? "no process detail reported");
       assert.equal(own.process?.state, "unverified", JSON.stringify(own.process));
       assert.ok(own.process?.processes.some((p) => p.pid === ndPid && p.reason === "unreadable_unattributed"),
         `the non-dumpable descendant is reported: ${JSON.stringify(own.process?.processes)}`);

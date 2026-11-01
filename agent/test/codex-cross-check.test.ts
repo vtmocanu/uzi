@@ -1259,11 +1259,34 @@ it("activity: an empty path falls through to file_path like the broker, for Read
  ]);
 });
 
-it("activity: a Search the broker denies with search_limit records outcome limit", async () => {
+it("activity: a Search over a truncated listing records ok with matches_truncated", async () => {
  const { r, events } = activityRig([{ tool: "Search", arguments: { query: "x", path: "src" } }],
   (op) => op.op === "list" ? { ok: true, entries: [], truncated: true } : undefined);
  assert.equal(await r.run(), verdict);
- assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "limit", path: "src" }]);
+ assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "ok", path: "src", matches: 0, matches_truncated: true }]);
+});
+
+it("activity: a ceiling-truncated Search with a match records ok with matches_truncated", async () => {
+ const body = Buffer.from("needle\n");
+ const { r, events } = activityRig([{ tool: "Search", arguments: { query: "needle", path: "src" } }], (op) => {
+  if (op.op === "list" && op.path === "src") return { ok: true, truncated: true, entries: [{ name: "f.ts", type: "file" }] };
+  if (op.path === "src/f.ts") return { ok: true, data: body.toString("base64"), size: body.length };
+  return undefined;
+ });
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "ok", path: "src", matches: 1, matches_truncated: true }]);
+});
+
+it("activity: a file-path Search (list E_NOT_DIR from the helper, then stat and read) records ok with matches", async () => {
+ const body = Buffer.from("a\nneedle\n");
+ const { r, events } = activityRig([{ tool: "Search", arguments: { query: "needle", path: "src/f.ts" } }], (op) => {
+  if (op.op === "list" && op.path === "src/f.ts") return { ok: false, code: "E_NOT_DIR" };
+  if (op.op === "stat" && op.path === "src/f.ts") return { ok: true, exists: true, type: "file", size: body.length };
+  if (op.op === "read" && op.path === "src/f.ts") return { ok: true, data: body.toString("base64"), size: body.length };
+  return undefined;
+ });
+ assert.equal(await r.run(), verdict);
+ assert.deepEqual(events, [{ event: "check_activity", op: "search", outcome: "ok", path: "src/f.ts", matches: 1 }]);
 });
 
 it("activity: a fileop E_TIMEOUT records outcome limit", async () => {

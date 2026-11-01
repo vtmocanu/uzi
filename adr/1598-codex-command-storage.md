@@ -286,3 +286,6 @@ no analogous emptyDir concept to add.
   is idempotent and disposable either way.
 - The hosted-worker measurement that would justify raising the ephemeral
   requests is explicitly **pending**, not delivered by this issue.
+- A running run's cache is later measured and rotated to a fresh generation
+  when it exceeds a per-run budget; see [ADR-3076](3076-codex-command-cache-budget.md)
+  (rotate, never refuse, issue #3675).
