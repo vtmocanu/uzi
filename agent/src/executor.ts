@@ -392,9 +392,10 @@ export interface RunContext {
    *  and an empty value never qualifies for the pre-approved skip. */
   approvedPlan?: string;
   /** Cross-check-enrolled runs can persist an approved plan different from the surviving
-   *  planning session's draft. Repeat that persisted plan and frozen contract on pre-approved
-   *  implementation resumes. Enrollment is not proof of a checker pass and grants no approval;
-   *  planApproved and the normal pre-approved eligibility checks remain authoritative.
+   *  planning session's draft. Repeat the final approved plan and full milestone contract on
+   *  every implementation attempt, including approval at a reclaimed open gate. Enrollment
+   *  is not proof of a checker pass and grants no approval; the normal gate and pre-approved
+   *  eligibility checks remain authoritative.
    *  Absent for ordinary and seeded runs. */
   repeatApprovedPlan?: boolean;
   /** The run's persisted subagent selection, replayed on the claim (PRD #35).

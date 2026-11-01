@@ -8118,6 +8118,78 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     }
   });
 
+  for (const autoApprove of [false, true]) for (const milestones of [
+    [{ id: "server", title: "Persisted normalized milestone", nested: { keep: ["full contract"] } }], [], undefined,
+  ]) it(`an enrolled Codex pre-approved resume repeats its persisted contract (${autoApprove}, ${milestones?.length ?? "unknown"})`, async () => {
+    let attempts = 0;
+    const rig = makeRig({ responder: epochResponder("surviving-draft", "tn-implement", (t, th, tn) => {
+      if (++attempts === 2) t.push(toolCall(99, "signal_done", {}, th, tn, "c-done"));
+      t.push(turnCompleted("completed", th, tn));
+    }) });
+    let gates = 0;
+    const { ctx } = makeCtx({ planApproved: true, sessionId: "surviving-draft", autoApprove,
+      approvedPlan: "Persisted normalized Codex plan", frozenMilestones: milestones,
+      repeatApprovedPlan: true, gatePlan: async () => { gates++; return humanApprove; },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "persisted Codex contract");
+    assert.equal(gates, 0);
+    const requests = rig.transport.requests.filter(r => r.method === "turn/start");
+    assert.equal(requests.length, 2, "the contract rides every implementation attempt");
+    for (const request of requests) {
+      const prompt = (request.params as { input: { text: string }[] }).input[0]!.text;
+      assert.match(prompt, /Persisted normalized Codex plan/);
+      const contract = prompt.match(/<approved_milestone_contract>\n([\s\S]*?)\n<\/approved_milestone_contract>/);
+      assert.ok(contract, "the full persisted contract supersedes the surviving draft");
+      assert.deepEqual(JSON.parse(contract[1]!), milestones ?? null);
+      assert.match(prompt, /supersedes the local plan in this session/);
+      assert.doesNotMatch(prompt, /Your plan was cross-checked|The human approved/);
+    }
+  });
+
+  it("an enrolled Codex rejection never releases an implementation turn", async () => {
+    const rig = planThenImplementRig();
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined,
+      repeatApprovedPlan: true, gatePlan: async () => ({ kind: "reject", reason: "owner denies" }),
+    });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000,
+      "enrolled Codex rejection"), /owner denies/);
+    assert.equal(turnTexts(rig, 0).length, 1, "only the planning turn ran");
+    for (const epoch of rig.epochs.slice(1))
+      assert.equal(epoch.transport.requests.filter(r => r.method === "turn/start").length, 0);
+  });
+
+  it("an ordinary Codex pre-approved session keeps its existing prompt", async () => {
+    const rig = makeRig({ responder: epochResponder("ordinary-session", "tn-implement", (t, th, tn) => {
+      t.push(toolCall(99, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+    }) });
+    const { ctx } = makeCtx({ sessionId: "ordinary-session", approvedPlan: "Ordinary approved plan",
+      frozenMilestones: [{ id: "m1", title: "Ordinary title" }],
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "ordinary Codex resume");
+    const requests = rig.transport.requests.filter(r => r.method === "turn/start");
+    assert.ok(requests.length > 0);
+    const prompt = (requests[0]!.params as { input: { text: string }[] }).input[0]!.text;
+    assert.match(prompt, /Ordinary approved plan/);
+    assert.doesNotMatch(prompt, /approved_milestone_contract|supersedes the local plan in this session/);
+  });
+
+  it("an enrolled Codex human gate repeats the final approved contract, never the stale claim", async () => {
+    const rig = planThenImplementRig();
+    let gates = 0;
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: "Stale persisted plan",
+      repeatApprovedPlan: true, gatePlan: async (plan) => { gates++; assert.equal(plan, "local plan 1"); return humanApprove; },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "enrolled Codex human gate");
+    assert.equal(gates, 1);
+    const request = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
+    const prompt = (request.params as { input: { text: string }[] }).input[0]!.text;
+    assert.match(prompt, /local plan 1/);
+    assert.doesNotMatch(prompt, /Stale persisted plan/);
+    assert.match(prompt, /supersedes the local plan in this session/);
+    assert.match(prompt, /<approved_milestone_contract>\nnull\n<\/approved_milestone_contract>/);
+    assert.doesNotMatch(prompt, /Your plan was cross-checked/);
+  });
+
   it("a human approval implements the presented canonical bundle without checker approval", async () => {
     const rig = planThenImplementRig();
     const milestones = [{ id: "m1", title: "Human-approved canonical milestone", nested: { keep: [] } }];

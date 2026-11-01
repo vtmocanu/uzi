@@ -1615,6 +1615,37 @@ describe("SdkExecutor checked canonical approval", () => {
     }
   });
 
+  for (const autoApprove of [false, true]) it(`an enrolled ${autoApprove ? "required-check" : "human-gated"} open-gate reclaim repeats the approved stored contract`, async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({ planApproved: false, resumePhase: "awaiting_approval",
+      sessionId: "surviving-draft-session", approvedPlan: canonical.plan,
+      frozenMilestones: canonical.milestones, repeatApprovedPlan: true, autoApprove,
+    }, [{ kind: "approve", approval: "human", selection: { status: "absent" } }]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(probe.gated.length, 1, "the human gate remains mandatory");
+    assert.equal(probe.gated[0], canonical.plan, "the gate re-presents the stored candidate");
+    assert.equal(turns.length, 1, "no new planning turn or checker round");
+    assert.equal(turns[0]!.options.resume, "surviving-draft-session");
+    const prompt = turns[0]!.promptText!;
+    assert.ok(prompt.includes(canonical.plan));
+    const contract = prompt.match(/<approved_milestone_contract>\n([\s\S]*?)\n<\/approved_milestone_contract>/);
+    assert.ok(contract, "approval at the reclaimed gate repeats the full presented contract");
+    assert.deepEqual(JSON.parse(contract[1]!), canonical.milestones);
+    assert.match(prompt, /supersedes the local plan in this session/);
+    assert.doesNotMatch(prompt, /Your plan was cross-checked/);
+  });
+
+  it("an enrolled open-gate reclaim cannot implement after a human rejection", async () => {
+    const { queryFn, turns } = fakeTurns([]);
+    const probe = makeCtx({ planApproved: false, resumePhase: "awaiting_approval",
+      sessionId: "surviving-draft-session", approvedPlan: canonical.plan,
+      frozenMilestones: canonical.milestones, repeatApprovedPlan: true,
+    }, [{ kind: "reject", reason: "owner denies" }]);
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /owner denies/);
+    assert.equal(probe.gated.length, 1);
+    assert.equal(turns.length, 0, "enrollment never releases an implementation turn");
+  });
+
   it("an ordinary approved session resume keeps its existing prompt", async () => {
     const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
     const probe = makeCtx({ planApproved: true, sessionId: "ordinary-session", approvedPlan: canonical.plan,
@@ -1632,7 +1663,8 @@ describe("SdkExecutor checked canonical approval", () => {
       repeatApprovedPlan: true } as Partial<RunContext>);
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.equal(probe.gated.length, 1, "the normal gate still owns approval");
-    assert.doesNotMatch(turns[1]!.promptText!, /Canonical scrubbed plan|<approved_milestone_contract>/);
+    assert.doesNotMatch(turns[1]!.promptText!, /Canonical scrubbed plan/);
+    assert.ok(turns[1]!.promptText!.includes("new draft"), "only the newly approved plan is repeated");
   });
 
   it("a human approval implements the presented canonical bundle without checker approval", async () => {

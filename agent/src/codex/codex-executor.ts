@@ -4482,9 +4482,16 @@ export class CodexExecutor implements Executor {
           depsNote = depsProvisionImplementNote(result.results, result.truncated);
           installState.noted = true;
         }
-        const ownerPrompt = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts,
-          checkedPlan || humanCanonicalPlan
-            ? { milestones: approvedMilestones, findings: checkedFindings, humanApproved: humanCanonicalPlan } : undefined);
+        // Enrollment grants no approval. Only this post-approval loop may repeat the final
+        // contract, whether approved before reclaim or at this execution's human gate.
+        // An in-process canonical bundle already repeats it through implementPrompt.
+        const repeatPlan = ctx.repeatApprovedPlan === true && !checkedPlan && !humanCanonicalPlan
+          ? gatedPlan ?? (preApproved ? ctx.approvedPlan : undefined) : undefined;
+        const ownerPrompt = (repeatPlan !== undefined
+          ? checkedImplementationContext(repeatPlan, approvedMilestones ?? ctx.frozenMilestones ?? null) : "") +
+          this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts,
+            checkedPlan || humanCanonicalPlan
+              ? { milestones: approvedMilestones, findings: checkedFindings, humanApproved: humanCanonicalPlan } : undefined);
         const ownerBase = depsNote ? `${ownerPrompt}\n\n${depsNote}` : ownerPrompt;
         // Issue #3149: earlier owner follow-ups ride only the first implement turn of a reviewed-plan
         // resume (never a system-text turn), deduped by id against this turn's live batch and the
