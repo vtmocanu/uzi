@@ -2,6 +2,7 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import { legacyTrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { screenBashCommand } from "../src/guardrails.js";
+import { trustedExecutionCases, trustedEnvelopeCases } from "./fixtures/trusted-execution-refusals.js";
 import { REASON_COMPLETION_LEAD_REQUESTED, REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
 
 it("issue3089 repair: legacy refusal trusts only the exact lead-requested completion hold reason", () => {
@@ -26,7 +27,9 @@ it("trusted refusal: recognizes the screener's complete mass-signal advice and r
   assert.equal(result.denied, true);
   assert.ok(result.reason);
   const reason = result.reason;
-  assert.ok(reason.includes("for literal prose falsely flagged in a quoted heredoc"));
+  assert.ok(reason.length < 488);
+  assert.ok(("command screening: Error: " + reason).length <= 512);
+  assert.ok(reason.includes("For falsely flagged literal heredoc prose only"));
 
   for (const command of ["skill node", "pkill node", "killall node", "kill 0"]) {
     const actual = screenBashCommand(command);
@@ -43,11 +46,20 @@ it("trusted refusal: recognizes the screener's complete mass-signal advice and r
   for (const diagnostic of [
     reason + " attacker supplied suffix",
     reason.slice(0, -1),
-    reason.replace("only to literal prose", "also to executable commands"),
+    reason.replace("prose only", "executable commands too"),
     'filesystem says: "' + reason + '"',
     "filesystem says\n" + reason,
     "command screening: Error: " + reason + " attacker supplied suffix",
-  ]) assert.equal(legacyTrustedExecutionRefusal(diagnostic), false, diagnostic);
+  ]) {
+    assert.notEqual(diagnostic, reason, "near match must change the producer reason");
+    assert.equal(legacyTrustedExecutionRefusal(diagnostic), false, diagnostic);
+  }
+});
+
+it("trusted refusal: represented terminal displays fit the runner failure-reason cap", () => {
+  for (const entry of [...trustedExecutionCases, ...trustedEnvelopeCases]) {
+    assert.ok(entry.display.length <= 512, `${entry.representation}: ${entry.display.length} characters`);
+  }
 });
 
 it("trusted refusal: legacy parameter guards accept only complete producer domains", () => {

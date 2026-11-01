@@ -402,7 +402,7 @@ describe("existing denies still fire on a wired docker worker (PRD #83 B3)", () 
 // "deny reasons carry the user-facing phrase" table below reaches it too.
 describe("mass-signal guardrail (#1576)", () => {
   const MASS_SIGNAL_REASON =
-    "denied by guardrail: mass-signal kill commands (pkill, killall, skill, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command); for literal prose falsely flagged in a quoted heredoc, use a file-edit tool to write the text under .uzi/scratch/ and the consumer's supported file input (e.g. git commit -F); this applies only to literal prose, never denied executable commands";
+    "denied by guardrail: mass-signal kill commands can kill the agent's process tree; stop tasks through the harness, or kill \"$pid\" with the exact PID saved at launch, as its own command without lsof/pgrep/ps/fuser/pidof. For falsely flagged literal heredoc prose only, use a file-edit tool to write under .uzi/scratch/ and the consumer's supported file input (e.g. git commit -F); never use this workaround for denied executable commands.";
 
   const DENIED_MASS = [
     "pkill -f vite",
@@ -536,15 +536,15 @@ describe("mass-signal guardrail (#1576)", () => {
     });
   }
 
-  it("keeps line-leading skill prose in a quoted heredoc denied with literal-text advice", () => {
-    const command = "git commit -m \"$(cat <<'EOF'\nskill documentation update\nEOF\n)\"";
+  for (const delimiter of ["'EOF'", "EOF"]) it(`keeps line-leading skill prose in a ${delimiter} heredoc denied with literal-text advice`, () => {
+    const command = `git commit -m "$(cat <<${delimiter}\nskill documentation update\nEOF\n)"`;
     const result = screenBashCommand(command);
     assert.strictEqual(result.denied, true);
     assert.strictEqual(result.reason, MASS_SIGNAL_REASON);
-    assert.ok(result.reason.includes("for literal prose falsely flagged in a quoted heredoc"));
-    assert.ok(result.reason.includes("use a file-edit tool to write the text under .uzi/scratch/"));
+    assert.ok(result.reason.includes("For falsely flagged literal heredoc prose only"));
+    assert.ok(result.reason.includes("use a file-edit tool to write under .uzi/scratch/"));
     assert.ok(result.reason.includes("consumer's supported file input (e.g. git commit -F)"));
-    assert.ok(result.reason.includes("only to literal prose, never denied executable commands"));
+    assert.ok(result.reason.includes("never use this workaround for denied executable commands"));
   });
 
   for (const command of [
