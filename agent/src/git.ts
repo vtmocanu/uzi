@@ -7197,7 +7197,8 @@ export class GitCache {
         // while completed edges retain their original proof.
         const lineage = active ? await this.ancestry(barePath, active.scannedTip, scan.tip) : undefined;
         if (lineage === "unknown") throw new Error("remediation scan lineage unavailable");
-        if (!active || lineage === "divergent" || active.origin !== scan.origin ||
+        if (!active || !sameRecoverySource(active.originSource, source) ||
+            lineage === "divergent" || active.origin !== scan.origin ||
             scan.flaggedOIDs.some(q => !active!.flaggedOIDs.includes(q))) {
           sequence++;
           active = { id: sequence, origin: scan.origin, originSource: { ...source }, scannedTip: scan.tip, flaggedOIDs: [...new Set(scan.flaggedOIDs)] };
@@ -19802,7 +19803,8 @@ try {
             if (!sourceContext) throw new Error("remediation source preservation unavailable");
           }
         }
-        if (r?.active && sourceDivergence === "divergent" && sourceContext &&
+        if (r?.active && sameRecoverySource(r.active.originSource, opts.producingSource) &&
+            sourceDivergence === "divergent" && sourceContext &&
             await this.ancestry(barePath, r.active.scannedTip, r.ownedTip) === "ancestor") {
           let reachable = true;
           for (const q of r.active.flaggedOIDs)

@@ -596,6 +596,100 @@ test("M2 committed M1 evidence adopts exact S and durably transfers immutable pr
   await assert.rejects(cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT));
 });
 
+// Exercise the Git handoff seam: the same claim context has two real producing attempts.
+async function adoptedGrantFixture(origin: "checkpoint-pending" | "pre-exit") {
+  const q = commit("old attempt finding"); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(),
+    { trusted: true, tip: q, flaggedOIDs: [q], origin });
+  const d1 = commit("old attempt displaced descendant", q); await fetch();
+  const r = commit("old attempt clean rewrite"); await fetch();
+  const old = await cache.readRemediationRecovery(bare, BRANCH, source());
+  assert.ok(old?.active);
+  assert.equal(old.active.scannedTip, q);
+  assert.deepEqual(old.active.originSource, source());
+  assert.equal(await cache.ancestry(bare, q, r), "divergent");
+  // Q is not an inventory leaf: only D1 becomes an unconditional excluded root.
+  const { iteration } = await captureAdoption([d1, r], r);
+  const pins = pinnedRefs();
+  const nextAttempt = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "fedcba9876543210");
+  const successor = await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(),
+    iteration, nextAttempt, admitSource);
+  const next = { runId: RUN, clonePath: successor.path, attemptId: nextAttempt };
+  assert.equal(next.runId, source().runId);
+  assert.notEqual(next.attemptId, source().attemptId);
+  assert.match(next.attemptId, /-g1-/);
+  assert.match(source().attemptId, /-g1-/);
+  assert.notEqual(next.clonePath, source().clonePath);
+  assert.equal(successor.adoptedSource, r);
+  assert.equal(git(next.clonePath, "rev-parse", "HEAD"), r);
+  assert.equal(pinnedRefs(), pins);
+  const transferred = { ...old, ...next, excludedRoots: [d1] };
+  assert.deepEqual(journal().remediationRecovery, transferred);
+  assert.deepEqual(await cache.readRuntimeRemediationRecovery(bare, BRANCH, next), transferred);
+  await cache.completeRecoveryEpisode(bare, BRANCH, KEY, next,
+    { settled: true, processedEvents: 1, attemptId: nextAttempt });
+  const nextOpts = { ...opts, producingSource: next };
+  assert.equal(nextOpts.context, opts.context, "same run and claim generation, with no attempt in the receipt context");
+  assert.equal((await cache.committedTrackingOwnership(bare, BRANCH, RUN, r, 1)).kind, "owned");
+
+  const d2 = git(next.clonePath, ...IDENT, "commit-tree", r + "^{tree}", "-p", r, "-p", q,
+    "-m", "new attempt merges Q without D1");
+  git(next.clonePath, "update-ref", "refs/heads/" + BRANCH, d2);
+  assert.equal((await cache.fetchAgentBranch(bare, next.clonePath, BRANCH, RUN, nextOpts)).kind, "updated");
+  assert.equal(await cache.ancestry(bare, q, d2), "ancestor");
+  assert.equal(await cache.ancestry(bare, d1, d2), "divergent");
+  assert.equal(git(bare, "rev-parse", d2 + "^{tree}"), git(bare, "rev-parse", r + "^{tree}"));
+  assert.deepEqual(journal().remediationRecovery, { ...transferred, ownedTip: d2 });
+  return { q, d1, r, d2, old, next, nextOpts };
+}
+
+for (const origin of [undefined, "checkpoint-pending", "pre-exit"] as const) {
+  test("M2 adopted attempt grant: " + (origin ?? "no fresh scan") + " binds displacement to actual producer", async () => {
+    const { q, d1, r, d2, old, next, nextOpts } = await adoptedGrantFixture(origin ?? "pre-exit");
+    if (origin) {
+      await cache.recordRemediationScan(bare, BRANCH, next,
+        { trusted: true, tip: d2, flaggedOIDs: [q], origin });
+      const refreshed = journal().remediationRecovery;
+      assert.equal(refreshed.sequence, old.sequence + 1);
+      assert.deepEqual(refreshed.active, { ...old.active, id: old.sequence + 1,
+        originSource: next, scannedTip: d2 });
+      assert.deepEqual(refreshed.edges, old.edges);
+    }
+    const active = journal().remediationRecovery.active;
+    const pins = pinnedRefs().split("\n").filter(Boolean);
+    const r2 = git(next.clonePath, ...IDENT, "commit-tree", r + "^{tree}", "-p", r,
+      "-m", "new attempt clean rewrite");
+    git(next.clonePath, "update-ref", "refs/heads/" + BRANCH, r2);
+    const imported = await cache.fetchAgentBranch(bare, next.clonePath, BRANCH, RUN, nextOpts);
+    assert.equal(imported.kind, "updated", JSON.stringify(imported));
+    assert.equal(await cache.ancestry(bare, q, r2), "divergent");
+    assert.equal(await cache.ancestry(bare, d1, r2), "divergent");
+    assert.equal(git(bare, "rev-parse", "refs/uzi-runner/" + BRANCH), r2);
+    assert.equal((await cache.committedTrackingOwnership(bare, BRANCH, RUN, r2, 1)).kind, "owned");
+    const restarted = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+    const evidence = await restarted.readRuntimeRemediationRecovery(bare, BRANCH, next);
+    assert.ok(evidence);
+    assert.deepEqual(await restarted.readRemediationRecovery(bare, BRANCH, next), evidence);
+    assert.equal(evidence.ownedTip, r2);
+    assert.deepEqual(evidence.excludedRoots, [d1]);
+    assert.deepEqual(evidence.active, active);
+    assert.deepEqual(evidence.edges.slice(0, old.edges.length), old.edges, "completed old provenance is immutable");
+    assert.deepEqual(evidence.edges[0]!.grant.originSource, source());
+    if (origin) {
+      assert.deepEqual(evidence.edges, [...old.edges, { from: d2, to: r2,
+        grant: active, context: old.edges[0]!.context, phase: "committed" }]);
+      assert.deepEqual(evidence.edges[1]!.grant.originSource, next);
+    } else {
+      assert.deepEqual(evidence.edges, old.edges, "inherited grant confers no new displacement authority");
+      assert.deepEqual(evidence.active, old.active, "custody does not rebind the old grant");
+    }
+    const heldPins = pinnedRefs().split("\n");
+    for (const pin of pins) assert.ok(heldPins.includes(pin), "old pins survive source import");
+    const owed = await restarted.enumerateOwedCandidates(bare, RUN);
+    for (const sha of [d1, r, d2, r2]) assert.ok(owed.some(candidate => candidate.sha === sha));
+  });
+}
+
 test("M2 repeated authorized rewrites permit ordinary progress between replacements", async () => {
   const { displaced, replacement } = await rewritten();
   const q2 = commit("new finding after progress", replacement); await fetch(); await enroll();
