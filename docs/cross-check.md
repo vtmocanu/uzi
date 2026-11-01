@@ -478,7 +478,7 @@ including when none advertises `cross_check_codex_lead_v1`.
 
 ## Rolling back Plan cross-check before the human gate
 
-Migrations 00389 and 00390 add the `runs.plan_cross_check_gated` column, a mode
+Migrations 00391 and 00392 add the `runs.plan_cross_check_gated` column, a mode
 CHECK, the `worker_unsupported` gate reason and the trigger
 `enforce_gated_plan_approval`. An older api does not know the trigger's
 contract, so a run that is checked before your review must not be in flight
@@ -501,8 +501,8 @@ admission barrier: it affects only runs created afterwards.
    Down, start no older api. Restart the current api, finish or cancel those
    runs, and restart from step 1.
 4. **Roll back the schema or only the binary.** For a schema rollback, run goose
-   down to 00388; the Down of 00390 and of 00389 each repeat the same guard
-   (a refusal means abort), and 00389's Down remaps `worker_unsupported` to
+   down to 00390; the Down of 00392 and of 00391 each repeat the same guard
+   (a refusal means abort), and 00391's Down remaps `worker_unsupported` to
    `checker_unavailable`, restores the earlier reason list, and drops the
    trigger, its function, the mode CHECK and the column. For a binary-only
    downgrade, skip the Down: step 3 is the admission check.

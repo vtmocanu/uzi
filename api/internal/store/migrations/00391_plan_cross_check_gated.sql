@@ -6,12 +6,12 @@
 -- human approval. The three modes (required, gated, neither) are mutually exclusive.
 --
 -- Additive: one NOT NULL column with a constant default (metadata-only, no table rewrite).
--- The CHECKs are added NOT VALID and validated in 00390, the two-step pattern of 00242/00243
+-- The CHECKs are added NOT VALID and validated in 00392, the two-step pattern of 00242/00243
 -- and 00366/00367/00368, so no validating scan runs under this migration's ACCESS EXCLUSIVE
 -- lock. The statements time out rather than queue behind a long transaction.
 --
 -- The migration number is a draft: it is renumbered above the live head at landing, the pair
--- (00389, 00390) together.
+-- (00391, 00392) together.
 SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE runs
@@ -74,7 +74,7 @@ EXECUTE FUNCTION enforce_gated_plan_approval();
 -- +goose Down
 -- Fail-closed: refuse while any gated run is not terminal, so no active run is silently
 -- downgraded to the any-prior-approve arm. This guard is identical to
--- scripts/gated-cross-check-drain-check.sql and to the guard in 00390's Down.
+-- scripts/gated-cross-check-drain-check.sql and to the guard in 00392's Down.
 SET LOCAL lock_timeout = '5s';
 LOCK TABLE runs IN SHARE ROW EXCLUSIVE MODE;
 -- +goose StatementBegin
