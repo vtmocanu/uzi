@@ -222,6 +222,18 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   finished state, that reply carries the news and no resume reply is added.
   So one pause episode is at most one pause reply plus one resume reply
   (bounded by the per-run retry cap).
+- **Publication waits and holds** (#1324): when a finished run cannot
+  publish because the forge is unreachable, it parks and keeps its work. The
+  thread gets one `⏸️ Publishing paused · forge unreachable` line per owner
+  episode, saying uzi is retrying automatically; later automatic retries of
+  the same episode are not announced again. If the wait reaches its bound
+  (`RUN_PROVIDER_PARK_MAX_DURATION`) or publishing cannot continue without
+  model work or the recorded source, one `⚠️ Needs your attention ·
+  publishing held` line says why and offers Resume (a new publication-only
+  attempt, no model work) or Cancel from the run page. A
+  `▶️ Resumed · publishing again` reply is posted only after you Resume a
+  hold, not when a timed wait retries on its own. The branch and merge
+  request are shown when known.
 - **Scope-capped completions** (PRD #634): if you or a teammate stopped or
   narrowed a milestone-structured issue run's scope from the CLI or web (`uzi
   run stop` / `uzi run scope --through N` — see [Stopping or narrowing a

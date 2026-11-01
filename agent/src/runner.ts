@@ -8249,9 +8249,10 @@ export class RunRunner {
   /** Test seam: replaces the real backoff wait at the publication push and MR-create retries. */
   private forgeRetrySleep: ((ms: number) => Promise<void>) | undefined;
 
-  /** Single entry for a publication hop that stayed transiently unreachable after its retry schedule. Today
-   *  it rethrows, so the run fails as before but with the typed, stable `publication_forge_unreachable`
-   *  reason; a later change replaces the body with a park. Callers invoke it before any fallback arm. */
+  /** Single entry for a publication hop that stayed transiently unreachable after its retry schedule. It logs
+   *  and rethrows the typed error; the run's failure dispatch parks an enrolled run publication-only (D3)
+   *  and fails an unenrolled one with the stable `publication_forge_unreachable` reason. Callers invoke it
+   *  before any fallback arm. */
   private async onPublicationForgeUnreachable(runId: string, err: PublicationForgeUnreachableError): Promise<never> {
     // rawDetail was already redacted and sanitized by publicationForgeUnreachable; never log other cause text.
     this.log.warn("publication forge unreachable after retries", {

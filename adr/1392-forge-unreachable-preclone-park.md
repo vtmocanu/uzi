@@ -1,8 +1,8 @@
 # ADR-1392: pre-clone forge-unreachable park (reuse `recovery_wait`, add a cause)
 
 **Status**: Accepted; amended 2026-10-29 for #3585 M1-M4 behavior and M5
-documentation. First delivery is partial and non-closing; no hosted acceptance
-or publication recovery is claimed.
+documentation, and 2026-11-01 for the #1324 publication phase. The #3585
+delivery was partial and non-closing; no hosted acceptance is claimed.
 **Date**: 2026-09-16
 **Issue**: [vtmocanu/uzi#1392](https://github.com/vtmocanu/uzi/issues/1392)
 **PRD**: [prds/done/1392-forge-unreachable-preclone-park.md](../prds/done/1392-forge-unreachable-preclone-park.md) —
@@ -109,9 +109,9 @@ The #3585 incident remains the record of the live-worker/direct-Git failure.
 Heartbeat liveness proves contact with the API, not reachability of the forge.
 The original bounded-failure and ordinary-affinity policies above are amended
 to stop repeated failing placement without sacrificing unverified local work.
-The first delivery is partial and non-closing. Publication-only recovery
-(#1324) follows after the first merge; no probes, new run states or
-credentials are added.
+The first delivery was partial and non-closing; publication-only recovery
+(#1324) followed it and is the amendment below. No probes, new run states or
+credentials are added by either.
 
 ### Cooldown and the ordinary half-open claim
 
@@ -184,7 +184,79 @@ Archive export is an option when an archive is available, not a consequence
 of a forge park. Local protected-source admission is unchanged.
 Active [#2506](../prds/2506-prerequisite-closure.md) owns prerequisite closure;
 [#2746](../prds/2746-automatic-hold-settlement.md) owns the automatic-settlement
-programme. This delivery implements neither programme nor publication recovery.
+programme. The #3585 delivery implements neither programme and no publication recovery;
+the publication phase is the 2026-11-01 amendment below.
+
+## Amendment — 2026-11-01: the publication phase (#1324)
+
+(AI-synced 2026-11-01)
+
+The pre-clone park above covers an outage at clone or fetch. A forge outage
+met while **publishing** finished work (floor refresh, non-forced push, or
+merge/pull request create) is a different park with a different budget. There
+is no separate ADR or PRD for #1324; this amendment and
+[ADR-1742](1742-finalize-resume-allowance.md#amendment-2026-11-01--1324-a-publication-intent-is-not-a-finalize-allowance)
+carry the decisions.
+
+### Publication phase
+
+After the existing retry schedule, a sustained transient failure at those three
+steps is `publication_forge_unreachable`. Auth errors, history or movement
+proofs, local git errors, aborts and residue stay permanent. For an enrolled run
+the agent captures source first, then reports `recovery_wait` /
+`forge_unreachable` with `recovery_wait_phase=publication` (a run DTO field).
+Unlike the pre-clone park it never bumps `forge_park_count`, is independent of
+`RUN_FORGE_UNREACHABLE_MAX_PARKS`, and never releases custody or source. A
+legacy untyped forge park of an enrolled run is refused (409
+`publication_enrolled`) or redirected; a typed publication park of a run with no
+active intent is refused (`publication_not_enrolled`). Post-merge-request hops
+(description publish, title read/write, PR-head verify) are out of scope and
+unchanged.
+
+### Elapsed bound and the NULL hold
+
+Timed retries use the capped backoff, raised to the failing origin's cooldown
+when later. The wait is bounded in elapsed time by
+`RUN_PROVIDER_PARK_MAX_DURATION` (default 24h), measured from the first park of
+the owner episode and not reset by a later park, generation or worker; `0`
+means no hold. At the bound the run becomes an owner hold: a NULL retry stamp
+and `publication_hold_reason=publication_retry_exhausted`. Owner Resume queues
+one publication-only episode (new wait clock; intent, custody and source kept);
+it does no model work and grants no other budget. A publication-only resume
+that cannot publish holds the same way with `publication_model_required`,
+`publication_source_unavailable` or `publication_intent_mismatch`; the server
+sweep holds a custodian-only run with `publication_custodian_unavailable`. A
+peer may take the run only when a broker-confirmed checkpoint tip equals the
+candidate and the original head and floor are its ancestors.
+
+### API-origin extension of the cooldown
+
+Migration 00387 extends the advisory placement cooldown of #3585 from a
+worker's Git origin to its forge API origin. The API origin is derived on the
+server from the repository (GitHub: `api.github.com` or `api.<host>`; GitLab and
+Forgejo: the web host, equal to the Git origin), never from a worker report. The
+same table carries per-surface `git_unverified` / `api_unverified` flags and the
+run DTO's cooldown lists `surfaces`. An API failure clears only on the exact
+current half-open run and generation success; a Git success does not clear it.
+
+### Rollback and residuals
+
+Writers opt in with the setting `uzi.publication_resume_api='v1'` plus the
+worker capability `publication_resume_v1` (the pattern of [ADR-3343](3343-task-checkpoint-coordinates.md)), so an older
+API aborts on enrolled runs. The 00386 Down refuses while enrolled rows exist.
+`RUN_PUBLICATION_RESUME_ENABLED` (default on) stops advertising and new
+enrollment only. Runbook: before an API rollback, convert enrolled queued runs
+and timed waits to NULL holds. Accepted costs: an older API aborts on enrolled
+runs, and its owner Resume queues a NULL hold. Residuals: in a mixed-version
+fleet an older API's clone-success path or the 00385 trigger deletes a shared
+cooldown row; and the #3585 legacy extra-attempt residual above (an older API's
+`set-token` promoter queuing one extra attempt against a NULL hold) is unchanged.
+
+### Verification boundary
+
+E2E phase 73 gains cases D and E for the publication park and owner hold
+(`e2e/phases/73-forge-unreachable-park.sh`). They are written but were not run
+in the delivery that added them; no hosted acceptance is claimed.
 
 ## Consequences
 

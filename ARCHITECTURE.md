@@ -1208,7 +1208,14 @@ chain in the diagram above, with no intervening `running`.
   claims until due, then serializes one ordinary recovery trial. Expiry is
   unverified; safe early affinity escape requires complete guarded source
   disposition evidence. These placement hints grant no execution or custody
-  authority. See
+  authority. A forge outage met later, while publishing finished work (#1324),
+  parks the run in the same status with `recovery_wait_phase=publication`
+  instead: the agent saves an HMAC-sealed write-ahead intent and enrolls it
+  with the API (`run_publication_resume`) before any remote finalize step, the
+  park keeps custody and source, and the next claim publishes only, with no
+  model work; see
+  [docs/run-recovery-wait.md](docs/run-recovery-wait.md#forge-unreachable-while-publishing).
+  See
   [adr/1197-transient-recovery-park.md](adr/1197-transient-recovery-park.md),
   [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md) (the
   2026-09-14 PRD #1349 amendment),

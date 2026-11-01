@@ -1055,6 +1055,14 @@ Resume preserves custody and cooldown and does not promise execution.
 Export an archive when one is available; a forge park does not promise one.
 See [Forge unreachable at clone](./run-recovery-wait.md#forge-unreachable-at-clone).
 
+A forge outage met while **publishing** finished work (#1324) is a different
+park (`recovery_wait_phase=publication`). It keeps the custody hold and the
+unpublished source on the worker that holds them, and the API refuses the
+empty-hold `forge_no_output` settle for it. The run resumes publication
+only, with no model work; if the worker that holds the source is gone, the
+run is held for its owner and the work is local-only. See
+[Forge unreachable while publishing](./run-recovery-wait.md#forge-unreachable-while-publishing).
+
 A guarded generation that parks (forge unreachable) or fails before its
 repository was ever cloned adopted nothing, yet its hold stays open until a
 final disposition. The worker closes that empty hold itself: after reporting

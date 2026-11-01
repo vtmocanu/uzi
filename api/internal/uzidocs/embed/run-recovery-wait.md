@@ -489,9 +489,148 @@ still fails the run immediately instead of parking. Cancel ends the run
 `cancelled`, as usual. Archive export is available when an archive exists;
 a forge park alone does not create one. The original incident remains
 recorded in issue #3585; first delivery is partial and non-closing.
-Publication-only recovery (#1324) is separate follow-up after the first
-merge; this clone/fetch policy does not provide publication recovery or
-add probes, run states or credentials.
+This clone/fetch policy adds no probes, run states or credentials and does
+not itself recover publication. A forge outage met later, while the run is
+publishing finished work, is a different park with its own bound; see
+[Forge unreachable while publishing](#forge-unreachable-while-publishing).
+
+## Forge unreachable while publishing
+
+A run whose work is finished can meet the same kind of forge outage at
+publication: refreshing the base (`git ls-remote`/fetch), the non-forced
+push, or creating the merge/pull request. After the existing short retry
+schedule, a sustained transient failure at one of those three steps is
+classified as `publication_forge_unreachable`. Permanent failures are not
+classified this way and keep their existing outcome: authentication or
+permission errors, history or movement proofs, local git errors, aborts and
+residue blocks. The hops after the merge request exists are unchanged and
+are not covered: description publish, title read/write and PR-head verify.
+
+### Write-ahead publication intent
+
+Before any remote finalize step, the worker saves a local record and enrolls
+it with the API (`POST /api/worker/runs/{id}/publication-intent`). The local
+file is `publication-<G>.json` in the worker outbox, sealed with an HMAC
+(domain `uzi.outbox.publication.v1`), at most 64 KiB, and carries neither
+credentials nor filesystem paths. The server copy lives in a side table,
+`run_publication_resume`. Only an acknowledged enrollment lets the remote
+steps run:
+
+- **Known not enrolled** (for example no outbox, an oversized record, or a
+  server without the feature): ordinary finalize runs, with the diagnostic
+  `publication_resume_unavailable` and no resume guarantee.
+- **Uncertain, or already enrolled**: no external attempt is made and the
+  work is retained until the record is reconciled.
+- A **transformed candidate** (base alignment, bridge) is saved and
+  acknowledged before its push.
+
+The worker advertises `publication_resume_v1` and lists enrolled runs under
+`publication_resume` in its register snapshot. Those runs are withheld from
+the one-shot finalize-resume allowance ([ADR-1742](../adr/1742-finalize-resume-allowance.md))
+and take the ordinary orphan requeue, which keeps the intent. The intent
+stays active across automatic parks, owner pause or resume and requeues. It
+is completed on completion and retired on terminal failure, on cancel, and
+on the owner's completion-hold `--continue`.
+
+### Publication park
+
+For an enrolled run, the worker captures the source first, then reports
+`recovery_wait` with cause `forge_unreachable` and
+`recovery_wait_phase=publication` (a run-DTO field; null for every other
+park). This park:
+
+- never increments `forge_park_count` and is independent of
+  `RUN_FORGE_UNREACHABLE_MAX_PARKS`;
+- never releases custody or the unpublished source;
+- retries on the capped backoff, raised to the failing origin's cooldown
+  when that is later (see below);
+- is bounded in elapsed time by `RUN_PROVIDER_PARK_MAX_DURATION` (default
+  `24h`) measured from the first park of the owner episode. `0` means no
+  hold: timed retries only.
+
+At the bound the run becomes an **owner hold**: a NULL retry time and
+`publication_hold_reason=publication_retry_exhausted`. A run that is not
+enrolled does not park this way; it fails with the typed
+`publication_forge_unreachable` reason. A legacy untyped forge park of an
+enrolled run is refused (409 `publication_enrolled`) or redirected to the
+typed park, and a typed publication park of a run with no active intent is
+refused (409 `publication_not_enrolled`).
+
+Owner **Resume** of a publication hold queues one publication-only episode
+and restarts the wait clock at its next park. It does no model work and
+grants no other budget.
+
+### Publication-only resume
+
+A claim that carries `publication_resume` runs no executor and makes no
+model or description-model pass. The worker verifies or adopts the server
+intent and restores the recorded guard state; the live claim can only make
+that state stricter. It requires the recorded original head, floor and
+candidate to be present with ancestry proven, re-runs every publication
+guard, and publishes. A resumed delivery that is not under the completion
+interlock is non-closing unless its enrollment recorded the close.
+
+When it cannot publish without model work or the recorded source, the run
+holds for its owner (NULL retry time, custody kept) instead of failing, with
+one of these reasons:
+
+| Hold reason | Meaning |
+|---|---|
+| `publication_retry_exhausted` | The forge stayed unreachable for the whole bound. |
+| `publication_model_required` | Publishing needs model work a publication-only resume does not do. |
+| `publication_source_unavailable` | The recorded head, floor or candidate is not available. |
+| `publication_intent_mismatch` | The recorded intent did not match what this worker can honour. |
+| `publication_custodian_unavailable` | The worker holding the unpublished source is gone; set by the server sweep. |
+
+A peer worker can take the run only when a broker-confirmed checkpoint tip
+equals the candidate and the original head and floor are its ancestors.
+Otherwise the run is custodian-only, and the server sweep holds it with
+`publication_custodian_unavailable` when the custodian cannot serve it.
+
+### API-origin cooldown
+
+The worker-origin cooldown described above also covers a worker's forge API
+origin. On GitHub that is `api.github.com` (or `api.<host>` for a GitHub
+host); GitLab and Forgejo serve the API from the web host, so it equals the
+Git origin and shares one cooldown row. The API origin is derived by the
+server from the repository, never from a worker report. The row keeps
+separate Git and API unverified flags, and the run's forge cooldown shows
+which `surfaces` are unverified. An API-surface failure clears only on the
+exact current half-open run and generation success reported by a worker
+that negotiated it; a Git success does not clear it.
+
+### Where you'll see it
+
+- **CLI and TUI:** `publishing paused: forge unreachable; waiting 12m of 24h,
+  retry at 15:04` for a timed wait, or `publishing held: <reason>` for an
+  owner hold, each followed by the merge/pull request or branch when known.
+  A hold adds the Resume and Cancel commands. See
+  [CLI](cli.md#publication-parks-and-holds).
+- **Web:** a **Publishing paused** or **Publishing held** pill on the run
+  badge and a panel on the run page that names the reason and the actions.
+- **Slack:** one wait line per owner episode, one line per hold, and a
+  resume line only after an owner Resume of a hold. See
+  [Slack](slack.md#publication-waits-and-holds).
+
+### Deployment and rollback
+
+Writers opt in with the database setting `uzi.publication_resume_api='v1'`
+and the worker capability `publication_resume_v1`; an older API lacks the
+setting and its writes to an enrolled run abort. The migration's Down refuses
+while enrolled rows exist. `RUN_PUBLICATION_RESUME_ENABLED` (default on) only
+stops advertising the feature and refuses new enrollment; existing intents
+keep their meaning.
+
+Before rolling the API back, convert enrolled queued runs and timed
+publication waits to NULL holds. Accepted costs of a rollback: an older API
+aborts on enrolled runs, and its owner Resume queues a NULL hold rather than
+a publication-only episode. Mixed-version residual: an older API's
+clone-success path or the earlier cooldown trigger can delete a shared
+cooldown row. See [ADR-1392](../adr/1392-forge-unreachable-preclone-park.md).
+
+Not covered: the post-merge-request hops listed above, probes, new run
+states or credentials, and any guarantee of execution after Resume (cooldown,
+cordon, custody and capacity limits still apply).
 
 ## Codex account unavailable
 

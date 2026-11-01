@@ -724,3 +724,55 @@ the CLI JSON contract and wait/follow behavior live in
 [CLI worker recovery exhaustion](../docs/cli.md#worker-recovery-exhaustion).
 This amendment changes neither authenticated record format nor terminal
 MAC/lease guards.
+
+## Amendment 2026-11-01 — #1324 a publication intent is not a finalize allowance
+
+(AI-synced 2026-11-01)
+
+[Issue #1324](https://github.com/vtmocanu/uzi/issues/1324) adds a second,
+stronger worker record beside the finalize-pending record: a write-ahead
+**publication intent**. This amendment states how the two relate. The
+allowance, its one-shot lifetime marker and the restart semantics above are
+unchanged for a run without such a record.
+
+- **Continuation MAC.** The intent is saved in the worker outbox as
+  `publication-<G>.json`, sealed under its own MAC domain
+  `uzi.outbox.publication.v1`, distinct from `uzi.outbox.finalize.v1` and
+  `uzi.outbox.terminal.v1`, so a record of one kind can never authenticate as
+  another. It is at most 64 KiB and carries no credentials or filesystem
+  paths. The owner kind (`task` or issue-style) is sealed in the envelope, not
+  taken from the body being validated.
+- **Enrollment.** Before any remote finalize step the worker saves the local
+  record, then enrolls it with `POST /api/worker/runs/{id}/publication-intent`
+  (server copy in the side table `run_publication_resume`, migration 00386),
+  then records the acknowledged sequence numbers locally. Only an acknowledged
+  enrollment lets the remote steps run.
+- **Precise fallback.** A failure is classified as exactly one of two outcomes.
+  Known not enrolled (nothing written or sent: no outbox, oversized or invalid
+  intent, no space, local write failure, a server without the feature, a
+  server decline) runs ordinary finalize with the diagnostic
+  `publication_resume_unavailable` and no resume guarantee. Uncertain (a file
+  may exist, the request outcome is unknown, the server disagrees, the
+  record is already enrolled) makes no external attempt and retains the work.
+  A local record is discarded only after the API positively answers that the
+  exact enrollment is retired.
+- **The allowance is withheld.** The worker never offers a run with any
+  publication record or file under `finalize_resume`, acknowledged or not,
+  authenticating or not; it lists acknowledged enrollments under
+  `publication_resume` in the register snapshot. The API also removes any run
+  listed under `publication_resume` from a validated `finalize_resume` list, so
+  such a run takes the ordinary orphan requeue, which keeps its intent. An
+  invalid `publication_resume` list is ignored with a warning and the finalize
+  list is left unchanged. The cost is accepted: a never-enrolled run with an
+  uncertain local record takes the ordinary orphan requeue instead of this
+  allowance. A run directory that cannot be listed at all is not detected and
+  keeps its finalize entry (deferred).
+- **Lifecycle.** The intent stays active across automatic parks, owner pause or
+  resume, and requeues. It is completed when the run completes and retired on
+  terminal failure or cancel, and on the owner's completion-hold `--continue`.
+
+Park, resume, hold and rollback behavior live in
+[ADR-1392](1392-forge-unreachable-preclone-park.md) and
+[Forge unreachable while publishing](../docs/run-recovery-wait.md#forge-unreachable-while-publishing).
+There is no separate ADR or PRD for #1324. Not shipped: a publication intent
+does not extend the hosted-worker restart acceptance above.
