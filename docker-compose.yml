@@ -206,7 +206,7 @@ services:
       # each is held in worker memory (a park counter and a park timer), so a worker
       # death re-queues the run and both restart. Both are per RUN-ATTEMPT, not per
       # park: questionParkBudgets charges only time parked on a question and is cleared only
-      # by the terminal finally, so N questions in one attempt SHARE one budget. The lifetime
+      # when the attempt's execute() ends, so N questions in one attempt SHARE one budget. The lifetime
       # ceilings are each value x (RUN_MAX_REQUEUES + 1) — on defaults, 20 questions
       # and 96h of waiting, rather than the per-attempt 5 and 24h. A run that used the one-shot #1742
       # finalize-resume allowance gets one more attempt: x (RUN_MAX_REQUEUES + 2).

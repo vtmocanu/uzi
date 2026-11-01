@@ -926,6 +926,51 @@ describe("PRD #88 M6 — RunRunner.askUser", () => {
     assert.deepStrictEqual(arms, [1500, 1100]);
   });
 
+  /**
+   * A guarded park whose same-id re-entry is declined (wall_pending) closes the interval it
+   * left open: the time up to the decline is charged, the pause handling after it is not.
+   * Delete the `closeParkCharge` in parkQuestion's declined-park branch and this reddens.
+   */
+  it("closes the open interval when a guarded re-entry is declined with wall_pending", async () => {
+    let clockMs = 0;
+    const arms: number[] = [];
+    const runner = runnerFor(askingExecutor(0, { asked: [], verdicts: [] }), {
+      questionTimeoutMs: 1500,
+      now: () => clockMs,
+      setTimer: (_cb, ms) => { arms.push(ms); return () => {}; },
+    });
+    const internal = runner as any;
+    let reports = 0;
+    const reportState = async (body: { status?: string }) => {
+      reports++;
+      if (reports === 2) return { status: "running", applied: false, reason: "wall_pending" };
+      return { status: body.status, applied: true };
+    };
+    const batcher = { emit: () => {}, flush: async () => {} } as never;
+    let waits = 0;
+    const steering = {
+      seedPauseRequested: () => {},
+      awaitAnswer: async () => {
+        if (++waits === 1) { clockMs += 400; throw new CredentialSwitchSignal(); } // X
+        return { kind: "answer", answers: ["ok"] } as AnswerVerdict;
+      },
+    } as never;
+    const park = () => internal.parkQuestion(
+      "run-wall", [{ question: "q?", header: "Q" }], "worker", undefined, batcher, steering,
+      reportState, nullLogger(), null, { requireRunning: true },
+    ) as Promise<AnswerVerdict>;
+    await assert.rejects(park(), CredentialSwitchSignal);
+    clockMs += 250; // Y: still parked server-side before the re-entry
+    await assert.rejects(park(), (e: Error) => e.constructor.name === "PauseNowSignal");
+    const budget = internal.questionParkBudgets.get("run-wall");
+    assert.strictEqual(budget.open, undefined, "the declined re-entry closes the open interval");
+    assert.strictEqual(budget.spentMs, 650);
+    clockMs += 5000; // Z: pause handling, not parked
+    const verdict = await park();
+    assert.strictEqual(verdict.kind, "answer");
+    assert.strictEqual(arms.at(-1), 1500 - 650, "a new question arms budget minus X+Y only");
+  });
+
   /** The completion window (ADR-1225 I6) is never charged to the clarification budget. */
   it("closes an open clarification interval at completion-question entry and does not charge the window", async () => {
     let clockMs = 0;

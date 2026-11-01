@@ -635,8 +635,8 @@ type ClaimConfig struct {
 	// worker-side — the cap counts in-process ask_user parks (there is no input row to
 	// count, unlike a revise_plan), and the budget is worker-held.
 	//
-	// The deadline is therefore NOT durable: a worker death re-queues the run and the
-	// resumed worker starts a fresh clock, so the honest worst case is
+	// The budget is therefore NOT durable: a worker death re-queues the run and the
+	// resumed worker starts a fresh budget, so the honest worst case is
 	// QuestionTimeoutSeconds × (RUN_MAX_REQUEUES + 1) — or × (RUN_MAX_REQUEUES + 2) for a run that
 	// used the one-shot finalize-resume allowance (#1742, runs.finalize_resume_generation), which
 	// gets exactly one more attempt.
