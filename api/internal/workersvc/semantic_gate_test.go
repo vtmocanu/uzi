@@ -129,6 +129,38 @@ func TestSemanticGateExactApproval(t *testing.T) {
 	}
 }
 
+func TestSemanticGateNormalizedMilestonePresentation(t *testing.T) {
+	structural, proposal, sources := semanticFixture()
+	raw := []Milestone{{ID: "m1", Title: "A glpat-" + strings.Repeat("a", 20)}}
+	if _, valid := validateMilestones(raw); !valid {
+		t.Fatal("the compiler must accept the raw milestone title before canonicalization")
+	}
+	structural.Milestones = semanticJSON(t, raw)
+	candidate, _, err := compileSemanticProposal(structural, semanticJSON(t, proposal), sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := NormalizePlanCrossCheckCandidate(structural)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clean, err := DecodeMilestones(canonical.Milestones)
+	if err != nil || len(clean) != 1 || clean[0].Title != "A [redacted]" {
+		t.Fatal("the checked milestone must use the canonical redacted title")
+	}
+	gate := &apitypes.SemanticGatePresentation{Candidate: candidate}
+	payload := func(ms []Milestone) gatePresentedPayload {
+		return gatePresentedPayload{PlanMd: &structural.PlanMd,
+			Milestones: reportPlanMilestonesParam(store.Run{Kind: "issue"}, StateRequest{PlanMd: &structural.PlanMd, Milestones: &ms})}
+	}
+	if err := validateSemanticGateFields(payload(raw), gate); err != ErrSemanticGateMismatch {
+		t.Fatalf("raw milestone report: got %v, want ErrSemanticGateMismatch", err)
+	}
+	if err := validateSemanticGateFields(payload(clean), gate); err != nil {
+		t.Fatalf("canonical milestone report refused: %v", err)
+	}
+}
+
 func TestSemanticRawPlanDisplayIdentity(t *testing.T) {
 	structural, proposal, sources := semanticFixture()
 	prd := apitypes.SemanticSourceCapture{ID: "linked-prd", Kind: "prd", Provenance: "repo:prd", Completeness: "complete", Bytes: []byte("café\x00 😀 requirement")}

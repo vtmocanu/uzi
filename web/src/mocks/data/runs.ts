@@ -7,6 +7,7 @@ import { daysAgo, minsAgo, minsAhead, secsAgo } from "./time";
 import { LIVE_RUN_ID } from "./boards";
 import { SAMPLE_PLAN, SEEDED_PLAN } from "./plans";
 import { demoTailEstimated, demoTailUnpriced } from "./runHistories";
+import { gatedCrossCheckRuns } from "./planCrossCheckGated";
 
 // ── Runs ─────────────────────────────────────────────────────────────────────
 
@@ -2165,6 +2166,9 @@ mockRuns.push({
   salvage_state: null, salvage_ref: null, salvage_tip: null, salvage_expires_at: null,
   usage_estimated_tail: null,
 });
+
+// PRD #3708: gated plan cross-check runs (checked before your review), from the parked gate.
+mockRuns.push(...gatedCrossCheckRuns(mockRuns.find((r) => r.id === "run-awaiting")!));
 
 // PRD #1732 D14: runs HELD on `credential_disabled` — server-parked (status `paused`,
 // hold_reason set), resumed by the promoter on Enable, never by a plain Resume. Derived

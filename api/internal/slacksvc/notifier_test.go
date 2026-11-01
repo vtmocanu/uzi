@@ -26,19 +26,23 @@ type fakeNotifStore struct {
 	codexAsked    []store.IsCodexEarlyResetCurrentParams
 	rc            store.GetSlackRunContextRow
 	crossCheckRun store.Run
-	pubSide       *store.RunPublicationResume
-	pubSideErr    error
-	runErr        error
-	rcErr         error
-	delivery      pgtype.Text
-	deliveryErr   error
-	msg           store.SlackRunMessage
-	msgErr        error
-	upserted      []store.UpsertSlackRunMessageParams
-	gateSet       []store.SetSlackRunGateParams
-	gateSetGen    []store.SetSlackRunGateGenParams
-	planCount     int64
-	planCountErr  error
+	// Gated plan cross-check summary (PRD #3708): nil + nil error models no row.
+	ccSummary      *store.GetLatestPlanCrossCheckSummaryRow
+	ccSummaryErr   error
+	ccSummaryAsked []store.GetLatestPlanCrossCheckSummaryParams
+	pubSide        *store.RunPublicationResume
+	pubSideErr     error
+	runErr         error
+	rcErr          error
+	delivery       pgtype.Text
+	deliveryErr    error
+	msg            store.SlackRunMessage
+	msgErr         error
+	upserted       []store.UpsertSlackRunMessageParams
+	gateSet        []store.SetSlackRunGateParams
+	gateSetGen     []store.SetSlackRunGateGenParams
+	planCount      int64
+	planCountErr   error
 	// PRD #88 M3: the latest kind='question' payload and the anchor write recording
 	// which question the thread already carries. A nil question with no error models
 	// "no row" the way the generated :one query surfaces it.
@@ -112,6 +116,19 @@ func (f *fakeNotifStore) GetRunByID(context.Context, uuid.UUID) (store.Run, erro
 		return store.Run{}, f.runErr
 	}
 	return f.crossCheckRun, nil
+}
+
+// GetLatestPlanCrossCheckSummary models the :one query: with no staged row it
+// returns pgx.ErrNoRows (never checked). ccSummaryAsked captures the scoped read.
+func (f *fakeNotifStore) GetLatestPlanCrossCheckSummary(_ context.Context, arg store.GetLatestPlanCrossCheckSummaryParams) (store.GetLatestPlanCrossCheckSummaryRow, error) {
+	f.ccSummaryAsked = append(f.ccSummaryAsked, arg)
+	if f.ccSummaryErr != nil {
+		return store.GetLatestPlanCrossCheckSummaryRow{}, f.ccSummaryErr
+	}
+	if f.ccSummary == nil {
+		return store.GetLatestPlanCrossCheckSummaryRow{}, pgx.ErrNoRows
+	}
+	return *f.ccSummary, nil
 }
 
 // GetActivePublicationResume models the run's active publication intent (issue #1324): a nil
@@ -756,6 +773,7 @@ func TestNotifierCrossCheckGateReason(t *testing.T) {
 		{"nil revision", "claude", "", true, pgtype.Text{}},
 		{"cleared revision", "codex", "", true, txt("")},
 		{"ordinary", "claude", "", false, txt("block")},
+		{"required keeps worker unsupported text", "claude", "worker unsupported", true, txt("worker_unsupported")},
 		{"unknown hostile", "codex", "future reason&lt;!channel&gt;", true, txt("future_reason\u202e\x1b\n<!channel>")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -782,6 +800,107 @@ func TestNotifierCrossCheckGateReason(t *testing.T) {
 			}
 			if strings.ContainsAny(section, "\x1b\u202e") || strings.Contains(section, "<!channel>") || strings.Contains(section, "findings") {
 				t.Fatalf("unsafe or excessive cross-check detail: %q", section)
+			}
+		})
+	}
+}
+
+// A gated run (PRD #3708) shows the same one-line reason as a required run, under the
+// shared rule: only a persisted reason is stated, never findings or lead responses, and
+// an ordinary run still shows nothing.
+func TestNotifierGatedCrossCheckGateLine(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		gated      bool
+		reason     pgtype.Text
+	}{
+		{"gated block", "blocked", true, txt("blocked")},
+		{"gated worker unsupported", "unavailable, not supported on this worker", true, txt("worker_unsupported")},
+		{"gated no reason, never checked", "not checked", true, pgtype.Text{}},
+		{"neither mode", "", false, txt("blocked")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := baseRun("awaiting_approval")
+			fs := &fakeNotifStore{
+				rc:            rc,
+				crossCheckRun: store.Run{ID: rc.ID, PlanCrossCheckGated: tc.gated, Harness: "claude", PlanCrossCheckGateReason: tc.reason},
+				delivery:      txt("U1"),
+				msg:           store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+				planCount:     1,
+			}
+			fp := &fakePoster{dmChannel: "D1"}
+			NewNotifier(fs, fp, fixedBase, nil).handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+			if len(fp.blocks) != 1 {
+				t.Fatalf("gate blocks = %+v", fp.blocks)
+			}
+			section := fp.blocks[0].sectionText
+			if tc.want == "" {
+				if strings.Contains(section, "Plan cross-check:") {
+					t.Fatalf("invented gate line: %q", section)
+				}
+			} else if !strings.Contains(section, "Plan cross-check: "+tc.want) {
+				t.Fatalf("section %q, want cross-check line %q", section, tc.want)
+			}
+		})
+	}
+}
+
+// A gated run with no gate reason states its outcome in one fixed line from the latest
+// summary row: passed (approve, not historical), earlier version (historical), not
+// checked (no row). A reason wins without a lookup; a lookup error posts no line and
+// still posts the gate; a required run never looks up.
+func TestNotifierGatedCrossCheckSummaryLine(t *testing.T) {
+	row := func(verdict string, round int32, hist bool) *store.GetLatestPlanCrossCheckSummaryRow {
+		return &store.GetLatestPlanCrossCheckSummaryRow{Verdict: verdict, Round: round, Historical: hist}
+	}
+	for _, tc := range []struct {
+		name, want string
+		gated      bool
+		reason     pgtype.Text
+		sum        *store.GetLatestPlanCrossCheckSummaryRow
+		sumErr     error
+		lookup     bool
+	}{
+		{"passed after 2 rounds", "Plan cross-check: passed after 2 rounds", true, pgtype.Text{}, row("approve", 2, false), nil, true},
+		{"passed after 1 round", "Plan cross-check: passed after 1 round", true, txt(""), row("approve", 1, false), nil, true},
+		{"historical approve", "Plan cross-check: checked an earlier version of this plan", true, pgtype.Text{}, row("approve", 2, true), nil, true},
+		{"no rows", "Plan cross-check: not checked", true, pgtype.Text{}, nil, nil, true},
+		{"non-approve verdict", "", true, pgtype.Text{}, row("revise", 1, false), nil, true},
+		{"lookup error", "", true, pgtype.Text{}, nil, errors.New("db down"), true},
+		{"reason wins, no lookup", "Plan cross-check: blocked", true, txt("blocked"), row("approve", 1, false), nil, false},
+		{"not gated, no lookup", "", false, pgtype.Text{}, row("approve", 1, false), nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := baseRun("awaiting_approval")
+			owner := uuid.New()
+			fs := &fakeNotifStore{
+				rc:            rc,
+				crossCheckRun: store.Run{ID: rc.ID, UserID: owner, PlanCrossCheckGated: tc.gated, Harness: "claude", PlanCrossCheckGateReason: tc.reason},
+				ccSummary:     tc.sum, ccSummaryErr: tc.sumErr,
+				delivery:  txt("U1"),
+				msg:       store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"},
+				planCount: 1,
+			}
+			fp := &fakePoster{dmChannel: "D1"}
+			NewNotifier(fs, fp, fixedBase, nil).handle(context.Background(), stateEvent{runID: rc.ID, status: "awaiting_approval"})
+			if len(fp.blocks) != 1 {
+				t.Fatalf("gate must post exactly once: %+v", fp.blocks)
+			}
+			section := fp.blocks[0].sectionText
+			if tc.want == "" && strings.Contains(section, "Plan cross-check:") {
+				t.Fatalf("invented line: %q", section)
+			}
+			if tc.want != "" && !strings.Contains(section, tc.want) {
+				t.Fatalf("section %q, want %q", section, tc.want)
+			}
+			if n := strings.Count(section, "Plan cross-check:"); n > 1 {
+				t.Fatalf("want one line, got %d: %q", n, section)
+			}
+			if got := len(fs.ccSummaryAsked) > 0; got != tc.lookup {
+				t.Fatalf("lookup = %v, want %v", got, tc.lookup)
+			}
+			if tc.lookup && (fs.ccSummaryAsked[0].LeadRunID != rc.ID || fs.ccSummaryAsked[0].UserID != owner) {
+				t.Fatalf("lookup not scoped to run and owner: %+v", fs.ccSummaryAsked[0])
 			}
 		})
 	}

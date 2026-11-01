@@ -3287,6 +3287,9 @@ export interface Run {
   plan_cross_check_required: boolean;
   /** Independent creation-time code-check consent snapshot. */
   code_cross_check_required?: boolean;
+  /** PRD #3708: "checked before your review" snapshot. The server omits it when false,
+   *  and older servers never send it. */
+  plan_cross_check_gated?: boolean;
   /** Persisted forced-gate reason; optional for older server and mock responses. */
   plan_cross_check_gate_reason?: string | null;
   /** Planning-diff refusal sub-code; set only while the gate reason is planning_diff_refused. */
@@ -4105,6 +4108,22 @@ export interface PlanCrossCheckSummary {
   checker_effort_source: "pin" | "worker default" | "cross-check default" | null;
   usage: RunUsage | null;
   historical: boolean;
+  /** PRD #3708: the newest five rounds, oldest first. Older servers omit it. */
+  rounds?: PlanCrossCheckRound[];
+  /** PRD #3708: the latest round's checker deadline, only while it is pending. */
+  deadline_at?: string;
+}
+
+/** One checked round of the plan loop (PRD #3708). It never carries plan text. */
+export interface PlanCrossCheckRound {
+  round: number;
+  verdict: string;
+  reason_class: string | null;
+  findings: { summary: string; items: PlanCrossCheckFinding[] | null } | null;
+  decided_at: string | null;
+  /** The lead's response to this round's findings, taken from the following candidate.
+   *  Untrusted prose: claims, never a verified resolution. */
+  response: { state: string; text: string };
 }
 
 // RunUsage is a run's server-rolled token/cost totals (PRD #40). The run VIEW

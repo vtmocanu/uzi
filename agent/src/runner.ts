@@ -64,7 +64,8 @@ import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 import { type CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
 import { CodexOperationAdmissionError } from "./client.js";
 import { PLAN_REVISION_RETRY_FEATURE, PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "./plan-revision-retry.js";
-import { checkPlan, type CheckedHumanGate, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
+import { checkPlan, type CheckedHumanGate, type CheckedPlanDecision, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
+import { gatedPlanPresentation } from "./checked-plan.js";
 import { captureSemanticSources, parseSemanticEnrollment } from "./semantic-plan.js";
 import { SemanticPlanningGate } from "./semantic-planning-gate.js";
 import { observePrdSources, hasDriftContradiction, type FrozenSource, type SemanticObservationRecord, type SemanticObservationRequest } from "./semantic-drift.js";
@@ -14696,6 +14697,10 @@ export class RunRunner {
       // emits the "plan supplied externally" feed line off this.
       seeded,
       approvedPlan: claim.plan_md ?? undefined,
+      // The session may still contain a pre-normalization draft. Enrollment scopes
+      // replay of the persisted approved contract; it does not establish a checker pass.
+      ...(!seeded && (claim.plan_cross_check_required === true || claim.plan_cross_check_gated === true)
+        ? { repeatApprovedPlan: true } : {}),
       // The persisted selection, replayed on the claim (PRD #35). Passed through
       // unconditionally rather than gated on planApproved: it is the run's
       // selection whether or not this particular resume skips the gate, and the
@@ -14927,14 +14932,24 @@ export class RunRunner {
             },
           });
         }
-        const eligible = claim.auto_approve === true && claim.plan_cross_check_required === true &&
+        const requiredEligible = claim.auto_approve === true && claim.plan_cross_check_required === true &&
           !seeded && !forceGate && !ownerHistoryIncomplete && ["issue", "prompt", "self_improve", "ci_fix", "mr_rework"].includes(resolveRunKind(claim.kind));
+        // PRD #3708: a human-gated run (never auto-approve) is checked before its FIRST human
+        // gate only. forceGate and ownerHistoryIncomplete are deliberately absent: the human gate
+        // they force is the gate this check precedes, and the check only informs it. A claim that
+        // already holds a plan or a presented gate revision is a reclaim of a presented gate and
+        // is never re-checked (the server derives that gate's reason).
+        const gatedEligible = claim.auto_approve !== true && claim.plan_cross_check_gated === true &&
+          !seeded && ["issue", "prompt", "ci_fix"].includes(resolveRunKind(claim.kind)) &&
+          !claim.plan_md?.trim() && !((claim.resume_gate_revision ?? 0) > 0);
+        const eligible = requiredEligible || gatedEligible;
         // Older api (no plan_cross_check_codex_lead): do not submit a Codex lead's check, park at
         // the human gate. This is a capability check, NOT a mapping of 409 refusals.
         const codexLeadUnsupported = !!claim.secrets.codex && claim.plan_cross_check_codex_lead !== true;
         let crossCheckReason: string | undefined;
         let checkedApproval: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "approve" }>["response"] | undefined;
         let checkedFields: PlanCrossCheckStateRequest | undefined;
+        let gatedPass: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "gated_pass" }> | undefined;
         let releaseStateBarrier: (() => void) | undefined;
         let failStateBarrier: ((error: unknown) => void) | undefined;
         if (eligible && !crossCheckSelected && !checkedHuman) {
@@ -14992,7 +15007,8 @@ export class RunRunner {
                   plan_cross_check_diff_refusal: captured.refusal };
                 checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
               } else {
-                const decision = await checkPlan({ client: this.client, runId, generation: flight.claimGeneration,
+                const checkOptions = {
+                  client: this.client, runId, generation: flight.claimGeneration,
                   candidate: {
                     ...(semanticCompiled ? { candidate_identity_version: "semantic_v1" as const,
                       semantic_candidate: semanticCompiled.candidate } : {}),
@@ -15001,9 +15017,34 @@ export class RunRunner {
                     required_tools: toolchainDetection?.required_tools ?? [],
                     size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
                     planning_diff: captured.diff }, batcher, signal: steering.lifecycleSignal(), timing: this.planCrossCheckTiming,
-                  round: crossCheckRound, allowAutomaticRevision: true });
+                  round: crossCheckRound, allowAutomaticRevision: true as const };
+                // Literal-mode calls select the typed overloads: the gated result excludes
+                // "approve" at compile time (the runtime throw below stays as a backstop).
+                const gatedDecision: Exclude<CheckedPlanDecision, { kind: "approve" }> | undefined =
+                  gatedEligible ? await checkPlan({ ...checkOptions, mode: "gated" }) : undefined;
+                const decision = gatedDecision ?? await checkPlan({ ...checkOptions, mode: "required" });
                 if (decision.kind === "approve") {
+                  // Gated mode never mints an approval: checkPlan returns gated_pass instead.
+                  if (gatedEligible) throw new Error("plan cross-check: unexpected approval in gated mode");
                   checkedApproval = decision.response;
+                } else if (decision.kind === "gated_pass") {
+                  // The checker approved, and a human still approves: present the ordinary gate
+                  // from the canonical candidate the checker read, bound to its digest. The
+                  // reason is deliberately absent (the server derives "passed" only from the
+                  // matching approve row), so this is not the forced-gate branch below.
+                  const canonical = decision.response.candidate;
+                  gatedPass = decision;
+                  checkedHuman = { phase: "publishinginitial" };
+                  checkedFields = { status: "awaiting_approval", candidate_digest: decision.response.candidate_digest,
+                    required_capabilities: canonical.required_capabilities, required_tools: canonical.required_tools,
+                    size_class: canonical.size_class };
+                  const rounds = decision.response.round;
+                  crossCheckReason = `plan cross-check: passed after ${rounds} ${rounds === 1 ? "round" : "rounds"}`;
+                  checkedHuman.onApplied = async (ack) => {
+                    if (!decision.reservation.releaseAppliedGate(ack))
+                      throw new Error("plan cross-check: gated pass settlement receipts unavailable");
+                    releaseStateBarrier?.();
+                  };
                 } else if (decision.kind === "revise") {
                   // checkPlan has released the decided proof and settled usage. Release and
                   // await this exact barrier before allowing another executor planning turn.
@@ -15087,10 +15128,17 @@ export class RunRunner {
           }
           return flight.reportState(frozen, steering.lifecycleSignal(), "semantic");
         };
+        const gatedPresentation = gatedPass ? gatedPlanPresentation({ plan: planMd, milestones }, {
+          plan: gatedPass.response.candidate.plan_md,
+          milestones: gatedPass.response.candidate.milestones as Milestone[],
+          candidate_digest: gatedPass.response.candidate_digest,
+        }, semanticCompiled?.candidate.digest) : undefined;
+        const presentedPlanMd = gatedPresentation?.plan ?? planMd;
+        const presentedMilestones = gatedPresentation ? gatedPresentation.milestones : milestones;
         const verdict = await this.gatePlan(
           runId,
-          planMd,
-          milestones,
+          presentedPlanMd,
+          presentedMilestones,
           batcher,
           steering,
           semanticCompiled ? reportSemanticState : checkedHuman || checkedApproval ? reportCheckedState : reportState,
@@ -15138,6 +15186,8 @@ export class RunRunner {
             await this.observeSemanticDrift(flight, { phase: "presentation",
               candidate_digest: semanticCompiled!.candidate.digest, gate_revision: ack.gateRevision! }, steering.lifecycleSignal());
           } : undefined,
+          gatedPresentation ? { ...gatedPresentation, milestones: presentedMilestones ?? [],
+            claimGeneration: flight.claimGeneration } : undefined,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
@@ -15165,7 +15215,7 @@ export class RunRunner {
         revisionRecovery?.accept(verdict);
         return verdict;
       },
-      ...(claim.auto_approve && claim.plan_cross_check_required && !seeded ? {
+      ...((claim.auto_approve && claim.plan_cross_check_required || !claim.auto_approve && claim.plan_cross_check_gated) && !seeded ? {
         continueExistingPlanGate: async (otherwise: () => Promise<PlanVerdict>) => {
           if (continueCheckedStorage) return continueCheckedStorage();
           if (!checkedHuman) return otherwise();
@@ -24508,7 +24558,7 @@ export class RunRunner {
           const attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
           const successor = await this.inFlightAuthority(flight, () => this.git.prepareRecoverySuccessor(bare, branch, key, source,
             iteration.attempts, attemptId, { checkpointWriteUnresolved: flight.checkpointClaimEvidence.writeUnresolved, checkpointKey: flight.checkpointCoordinates?.checkpoint_key ??
-              (flight.runKind === "task" ? null : undefined), selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true }),
+              (flight.runKind === "task" ? null : undefined), selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.plan_cross_check_gated === true }),
             { signal, timeoutMs: Math.max(1, iteration.deadline - Date.now()) });
           expectedSource = { ...source, clonePath: successor.path, attemptId: successor.attemptId };
           flight.runnerClone = successor;
@@ -24630,7 +24680,7 @@ export class RunRunner {
     // also refuses object alternates, including for Claude. Dissociate either clone at seed.
     // `executor.sandboxesCommands` is set at construction; `executor.safety` is populated
     // only inside run(), so it is still unset here. Ordinary Claude/stub clones pass false.
-    const cloneOpts = { checkpointWriteUnresolved: frozenEvidence.writeUnresolved, checkpointKey: checkpointCoordinates?.checkpoint_key ?? (claim.kind === "task" ? null : undefined), selfContained: executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.code_cross_check_required === true };
+    const cloneOpts = { checkpointWriteUnresolved: frozenEvidence.writeUnresolved, checkpointKey: checkpointCoordinates?.checkpoint_key ?? (claim.kind === "task" ? null : undefined), selfContained: executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.plan_cross_check_gated === true || claim.code_cross_check_required === true };
     // PRD #983 M4b: the per-kind branch derivations (ci_fix's default-branch vs run-branch
     // choice, self_improve/prompt's fresh-per-cycle run-id branch, task/mr_rework's
     // pre-seeded branch with its loud missing-branch guard) live in RUN_KIND_PROFILES. A
@@ -24874,6 +24924,7 @@ export class RunRunner {
     revisionRecovery?: PlanRevisionRecovery,
     semanticPark?: SemanticPark,
     onSemanticPresented?: (ack: StateAck) => Promise<void>,
+    presentedCanonical?: Extract<PlanVerdict, { approval: "cross_check" }>["canonical"],
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -25057,6 +25108,11 @@ export class RunRunner {
       // non-empty (additive-optional), matching the milestones conditional above.
       // PRD #1795: a re-presentation sends the requirements the human was shown instead.
       ...(reuse ? presentedReportFields(reuse.presented) : toolchainReportFields(toolchainDetection, this.client.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE))),
+      // PRD #3708: a gated pass reports the canonical requirement set the checker read (bound to
+      // candidate_digest), so it must win over the raw detection spread above.
+      ...(checkedFields?.required_capabilities !== undefined ? { required_capabilities: checkedFields.required_capabilities } : {}),
+      ...(checkedFields?.required_tools !== undefined ? { required_tools: checkedFields.required_tools } : {}),
+      ...(checkedFields?.size_class !== undefined ? { size_class: checkedFields.size_class } : {}),
       // PRD #212 (Decision 3): ALWAYS send (empty [] when clean), NOT conditionally
       // spread — so each gate round REPLACES the server's list (M1's COALESCE clears on
       // empty), keeping a revision gate from showing a stale earlier round's writes.
@@ -25170,7 +25226,10 @@ export class RunRunner {
         // Issue #1604: no later verdict can act; each is final on arrival.
         steering.closeGate(v.kind);
       }
-      return v; // NOTE: no bump here — the awaiting_approval re-report bumps.
+      // Preserve the presented candidate even when a credential switch resumes this
+      // same wait. The human remains the approver; this bundle carries only its data.
+      // No bump here: the awaiting_approval re-report bumps.
+      return v.kind === "approve" && presentedCanonical ? { ...v, canonical: presentedCanonical } : v;
     };
 
     if (this.planApprovalTimeoutMs <= 0)

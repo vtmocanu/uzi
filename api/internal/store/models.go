@@ -1233,6 +1233,7 @@ type Run struct {
 	PolicyRefusalPhase          pgtype.Text        `json:"policy_refusal_phase"`
 	PolicyRefusalCorrelationID  pgtype.Text        `json:"policy_refusal_correlation_id"`
 	PolicyHoldPublished         pgtype.Bool        `json:"policy_hold_published"`
+	PlanCrossCheckGated         bool               `json:"plan_cross_check_gated"`
 }
 
 type RunCompletionAttempt struct {
