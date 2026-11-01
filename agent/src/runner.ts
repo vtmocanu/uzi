@@ -23638,7 +23638,6 @@ export class RunRunner {
               const record = await this.restoreRemediationRestrictions(flight);
               const snapshot = canonicalJson(flight.remediationRestrictions ?? null);
               const assertOldFacts = (flags: readonly string[]): void => {
-                this.retainedLifecycleGuard(flight);
                 this.assertFlightSourceAdmissible(flight);
                 const selected = this.remediationSource(flight);
                 const pending = flight.remediationRestrictions?.pending;
@@ -23652,6 +23651,7 @@ export class RunRunner {
                       pending.branch !== branch || !pending.requiredOIDs.every(q => flags.includes(q)))))
                   throw new Error("remediation predecessor facts changed or unconfirmed");
               };
+              this.retainedLifecycleGuard(flight);
               assertOldFacts(record?.flaggedOIDs ?? []);
               let admittedFlags: readonly string[] | undefined;
               const prepared = await this.git.prepareRecoverySuccessor(bare, branch, key, source,
@@ -23660,6 +23660,7 @@ export class RunRunner {
                   checkpointKey: flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : undefined),
                   selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true,
                   admitRemediationSource: async input => {
+                    this.retainedLifecycleGuard(flight);
                     assertOldFacts(input.flaggedOIDs);
                     if (!record || input.runId !== source.runId || input.clonePath !== source.clonePath ||
                         input.attemptId !== source.attemptId || input.branch !== branch ||
@@ -23680,6 +23681,7 @@ export class RunRunner {
                     for (const floor of floors)
                       for (const root of roots)
                         if (await this.git.ancestry(bare, root, floor) !== "divergent") return false;
+                    this.retainedLifecycleGuard(flight);
                     assertOldFacts(input.flaggedOIDs);
                     admittedFlags = input.flaggedOIDs;
                     admittedSourceTip = input.sourceTip;
@@ -23687,7 +23689,9 @@ export class RunRunner {
                   },
                 });
               // Git awaits seed and durable readback after admission. A readable ready record
-              // cannot discharge facts arriving in those waits.
+              // cannot discharge facts arriving in those waits. Confirm them and reflect the
+              // completed durable handoff synchronously before the next lifecycle check, so a
+              // stop verifies the successor tuple already journaled by prepareRecoverySuccessor.
               assertOldFacts(admittedFlags ?? record?.flaggedOIDs ?? []);
               if (record && (!admittedFlags || admittedSourceTip !== record.ownedTip))
                 throw new Error("remediation source admission unavailable");
