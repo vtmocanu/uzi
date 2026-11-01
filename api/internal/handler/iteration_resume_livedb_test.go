@@ -165,6 +165,99 @@ func TestIterationHoldStopRefusedLiveDB(t *testing.T) {
 	}
 }
 
+// iterationStopBeginner runs its hook once before opening the owner's transaction;
+// the worker park uses the fixture's separate service and real pool transaction.
+type iterationStopBeginner struct {
+	workersvc.TxBeginner
+	beforeBegin func()
+}
+
+func (b *iterationStopBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
+	if hook := b.beforeBegin; hook != nil {
+		b.beforeBegin = nil
+		hook()
+	}
+	return b.TxBeginner.Begin(ctx)
+}
+
+func TestIterationHoldStopLockedRecheckLiveDB(t *testing.T) {
+	for _, park := range []bool{true, false} {
+		t.Run(fmt.Sprintf("parkBeforeBegin=%v", park), func(t *testing.T) {
+			f := iterationRoutes(t)
+			h := iterationOwnerHandler(t, f)
+			ctx := context.Background()
+			id := f.run(t, "issue")
+			f.exec(t, `UPDATE runs SET milestones_frozen='[{"id":"m1","title":"one"},{"id":"m2","title":"two"}]',
+ milestones_completed='["m1"]' WHERE id=$1`, id)
+			inputCounts := func() (scope, stop int) {
+				t.Helper()
+				if err := f.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE kind='scope'),
+ count(*) FILTER (WHERE kind='stop') FROM run_user_inputs WHERE run_id=$1`, id).Scan(&scope, &stop); err != nil {
+					t.Fatal(err)
+				}
+				return scope, stop
+			}
+			assertNoScopeOrStop := func() {
+				t.Helper()
+				r, err := f.q.GetRunByID(ctx, id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				scope, stop := inputCounts()
+				if r.ScopeCeiling.Valid || scope != 0 || stop != 0 {
+					t.Fatalf("unexpected ceiling/inputs: ceiling=%+v scope=%d stop=%d", r.ScopeCeiling, scope, stop)
+				}
+			}
+			assertNoScopeOrStop()
+			var parkedSnapshot string
+			begins := 0
+			h.wsvc.SetTxBeginner(&iterationStopBeginner{TxBeginner: f.pool, beforeBegin: func() {
+				begins++
+				r, err := f.q.GetRunByID(ctx, id)
+				if err != nil || r.Status != "running" || r.HoldReason.Valid {
+					t.Fatalf("Stop did not reach Begin from a running run: %+v err=%v", r, err)
+				}
+				if park {
+					assertIterationAck(t, f.call(id, "iteration-park", iterationParkBody, f.worker), http.StatusOK, "")
+					r, err = f.q.GetRunByID(ctx, id)
+					if err != nil || r.Status != "paused" || r.HoldReason.String != "iteration_budget_exhausted" {
+						t.Fatalf("worker park did not commit: %+v err=%v", r, err)
+					}
+					assertNoScopeOrStop()
+					parkedSnapshot = f.snapshot(t, id)
+				}
+			}})
+			rec := httptest.NewRecorder()
+			h.CreateRunInput(rec, inputReq(store.User{ID: f.user}, id, `{"kind":"stop"}`))
+			if begins != 1 {
+				t.Fatalf("Stop bypassed the transaction interleaving: begins=%d", begins)
+			}
+			if park {
+				if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "Resume") || !strings.Contains(rec.Body.String(), "Cancel") {
+					t.Fatalf("HTTP Stop=%d %s", rec.Code, rec.Body.String())
+				}
+				assertNoScopeOrStop()
+				if f.snapshot(t, id) != parkedSnapshot {
+					t.Fatal("refused Stop changed the committed iteration park")
+				}
+				return
+			}
+			if rec.Code < 200 || rec.Code >= 300 {
+				t.Fatalf("running HTTP Stop=%d %s", rec.Code, rec.Body.String())
+			}
+			r, err := f.q.GetRunByID(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			scope, stop := inputCounts()
+			if r.Status != "running" || r.HoldReason.Valid || !r.ScopeCeiling.Valid || r.ScopeCeiling.Int32 != 1 ||
+				r.StopKind.Valid || scope != 1 || stop != 0 {
+				t.Fatalf("running Stop lost scope authority: run=%+v scope=%d stop=%d", r, scope, stop)
+			}
+		})
+	}
+}
+
 // TestIterationResumeUpdateWallGuardLiveDB blocks ResumePausedRun on its parent
 // row lock after candidate selection, then commits an exhausted wall. This exercises
 // the UPDATE predicate independently of the candidate predicate.

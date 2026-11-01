@@ -1184,6 +1184,10 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 		if terminalStatuses[current.Status] {
 			return SubmitInputResult{}, ErrRunTerminal
 		}
+		if len(stopping) > 0 && stopping[0] && current.Status == "paused" &&
+			current.HoldReason.Valid && current.HoldReason.String == "iteration_budget_exhausted" {
+			return SubmitInputResult{}, &iterationHoldStopError{}
+		}
 		frozen, err := DecodeMilestones(current.MilestonesFrozen)
 		if err != nil {
 			return SubmitInputResult{}, err

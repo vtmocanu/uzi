@@ -2727,6 +2727,9 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE runs.id = @id AND worker_id = @worker_id
+  -- Resume can retain worker affinity while fencing the old invocation. A late
+  -- approval report cannot reopen that released flight, including without cross-check.
+  AND claim_released_at IS NULL
   AND (NOT plan_cross_check_required OR (claim_generation = sqlc.narg('claim_generation')::bigint
        AND claim_released_at IS NULL))
   AND status NOT IN ('completed', 'failed', 'cancelled')
