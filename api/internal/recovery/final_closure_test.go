@@ -1,11 +1,15 @@
 package recovery
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -134,6 +138,27 @@ func TestPrerequisiteFinalEnabledNeedsEveryPart(t *testing.T) {
 		want := set(s)
 		if got := s.PrerequisiteFinalEnabled(); got != want {
 			t.Fatalf("%s: enabled=%v want %v", name, got, want)
+		}
+	}
+}
+
+// The live lock tests end on the client deadline first, so the 55P03 branch is pinned here.
+func TestFinalClosureUnavailableClassifiesOnlyRetryableErrors(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"deadline", fmt.Errorf("commit: %w", context.DeadlineExceeded), true},
+		{"cancel", fmt.Errorf("read: %w", context.Canceled), true},
+		{"lock_not_available", fmt.Errorf("lock: %w", &pgconn.PgError{Code: "55P03"}), true},
+		{"other sqlstate", &pgconn.PgError{Code: "23505"}, false},
+		{"not authorized", ErrNotAuthorized, false},
+		{"plain", errors.New("boom"), false},
+		{"nil", nil, false},
+	} {
+		if got := finalClosureUnavailable(c.err); got != c.want {
+			t.Errorf("%s: finalClosureUnavailable = %v, want %v", c.name, got, c.want)
 		}
 	}
 }
