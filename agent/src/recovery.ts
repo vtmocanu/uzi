@@ -2252,27 +2252,22 @@ export class RecoveryCoordinator {
     }
     if (!await this.frozenCoverageProven(record)) return;
     // A new mint requires healthy capture status. For a saved thin archive FINAL,
-    // status is diagnostic: send the unchanged request before reconciliation.
+    // status is diagnostic: send before looking it up, and reconcile first on failure.
     // Local header, source/coverage and inactivity proofs above still apply.
     let observedStatus: RecoveryCaptureStatusResponse | undefined;
     const savedThinReplay = thinArchive && record.finalRequest?.disposition.kind === "archive";
     if (record.finalRequest?.disposition.kind !== "settled" && !heldFinal) {
       if (record.state !== "uploaded" || !record.serverCaptureId!) return;
-      try { observedStatus = await this.recoveryRPC(() => this.client.getRecoveryCaptureStatus(record.runId, record.serverCaptureId!)); }
-      catch {
-        MaintenanceBudget.current()?.check();
-        if (!savedThinReplay) {
-          if (reconcile) return this.reconcileInventory(record, prove);
+      if (!savedThinReplay) {
+        try { observedStatus = await this.recoveryRPC(() => this.client.getRecoveryCaptureStatus(record.runId, record.serverCaptureId!)); }
+        catch { MaintenanceBudget.current()?.check(); if (reconcile) return this.reconcileInventory(record, prove); return; }
+        if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
+        if (!healthyInventoryStatus(observedStatus, record, this.now())) {
+          if (reconcile) return this.reconcileInventory(record, prove, observedStatus);
           return;
         }
+        if (thinArchive && !record.finalRequest && !pinnedClosureMatches(observedStatus, record)) return;
       }
-      if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
-      if (!savedThinReplay && !healthyInventoryStatus(observedStatus!, record, this.now())) {
-        if (reconcile) return this.reconcileInventory(record, prove, observedStatus);
-        return;
-      }
-      // Mint requirement 6. The status is read-only evidence for a new mint and diagnostic for a replay.
-      if (thinArchive && !record.finalRequest && !pinnedClosureMatches(observedStatus!, record)) return;
     }
     if (!record.finalRequest) {
       const hold = await this.heldOperationState(record);
@@ -2354,10 +2349,10 @@ export class RecoveryCoordinator {
   /** The retained-claim caller evaluates only grants 1 (missing held metadata) and 4 (feature snapshot). */
   private async retainedClaimMint(input: CaptureInput): Promise<ClosureMint> {
     const latest = await this.readLatest(input.record);
-    if (latest.kind !== "ok") return "deny";
+    if (latest.kind !== "ok" || latest.record.heldCreateUncertain === true) return "deny";
     const record = latest.record;
     const missingMetadata = this.client.hasHeldPublicationV2?.() === true &&
-      (!record.exactHoldBinding || !record.heldPolicy) && record.heldCreateUncertain !== true;
+      (!record.exactHoldBinding || !record.heldPolicy);
     return missingMetadata || this.closureOnlyFeatureSnapshot() ? "grant" : "deny";
   }
 
@@ -2578,8 +2573,14 @@ export class RecoveryCoordinator {
         return { state: current.state, captureId: current.captureId, reason };
       }
       if (response.final_receipt !== undefined || response.release_evidence !== undefined ||
-          response.outcome !== "replaceable" || response.reason !== undefined ||
-          !status || !replaceableInventoryStatus(status, record, this.now())) return unknown();
+          response.outcome !== "replaceable" || response.reason !== undefined) return unknown();
+      // Saved thin FINALs send without a capture-status lookup. Only a validated
+      // replaceable response needs that additional proof; accepted/retained wins first.
+      if (!status && record.selfContained === false && record.finalRequest?.disposition.kind === "archive") {
+        status = await this.recoveryRPC(() => this.client.getRecoveryCaptureStatus(record.runId, record.serverCaptureId!));
+        if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
+      }
+      if (!status || !replaceableInventoryStatus(status, record, this.now())) return unknown();
       if (!await this.openInventoryHold(record)) return;
       if (!this.newProductionAllowed(record)) return { state: record.state, captureId: record.captureId, held: "kept" };
       if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;

@@ -6695,6 +6695,24 @@ it("#3727 thin journal survives feature rollback and roll-forward, with an optio
   } finally { await f.close(); }
 });
 
+it("#3727 retained-claim grant 4 denies an unresolved held create even with a closure-only snapshot", async () => {
+  const f = await fixture(true);
+  try {
+    closureHarness(f, { features: CLOSURE_ONLY });
+    const record = await f.freeze();
+    assert.ok(record);
+    await patchAuthenticated(f, record, { heldCreateUncertain: true });
+    const input = { record, barePath: f.context.barePath, defaultBranch: "main", closureMint: "retained_claim" as const };
+    assert.equal(await f.coordinator["retainedClaimMint"](input), "deny", "uncertain creation denies both retained-claim grantors");
+    await f.coordinator.captureAndUpload(input);
+    const after = (await f.coordinator.inspect(record.runId))[0]!;
+    assert.equal(after.heldCreateUncertain, true);
+    assert.equal(after.finalRequest, undefined);
+    assert.equal(after.finalAcknowledged, undefined);
+    assert.equal(f.finals.length, 0);
+  } finally { await f.close(); }
+});
+
 it("#3727 an unaccepted expired thin FINAL replaces only after the validated fence, then mints under a fresh grant", async () => {
   const f = await fixture(true, os.tmpdir(), true);
   try {
@@ -6718,6 +6736,11 @@ it("#3727 an unaccepted expired thin FINAL replaces only after the validated fen
         fenced = true;
       }
       return out;
+    } });
+    const getStatus = f.client.getRecoveryCaptureStatus;
+    Object.assign(f.client, { getRecoveryCaptureStatus: async (run: string, id: string) => {
+      assert.equal(fenced, true, "saved replay must not query status before the committed replacement fence");
+      return getStatus(run, id);
     } });
     f.state.finalError = undefined;
     await f.make(true).resumePending();
@@ -6776,8 +6799,10 @@ for (const status of ["expired", "discarded", "read failure"] as const) {
       assert.ok(before.finalRequest);
       const getStatus = f.client.getRecoveryCaptureStatus;
       let reconciles = 0;
+      let statusReads = 0;
       Object.assign(f.client, {
         getRecoveryCaptureStatus: async (run: string, id: string) => {
+          statusReads++;
           if (status === "read failure") throw new Error("capture status unavailable");
           return { ...await getStatus(run, id), state: status, expires_at: "1970-01-01T00:00:00Z" };
         },
@@ -6790,6 +6815,7 @@ for (const status of ["expired", "discarded", "read failure"] as const) {
       assert.deepEqual(after.finalRequest, before.finalRequest);
       assert.equal(after.finalAcknowledged, true);
       assert.equal(reconciles, 0, "a successful replay ACK needs no reconciliation");
+      assert.equal(statusReads, 0, "a diagnostic status lookup cannot delay or exhaust the saved replay's budget");
       assert.equal(f.state.uploads, 1);
       assert.equal(f.state.produced, 1);
     } finally { await f.close(); }

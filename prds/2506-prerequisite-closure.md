@@ -861,6 +861,13 @@ completed locally, with hosted acceptance above still unchecked:
   failed on that behavior. The local correction makes status diagnostic for an
   already-saved thin archive request only; header, source/coverage, inactivity and
   new-mint health checks remain. These controls passed after the correction.
+  A stricter call-order control also requires zero pre-send capture-status reads:
+  a slow diagnostic must not spend the replay budget. Only validated replaceable
+  reconciliation fetches the additional status proof after its committed fence.
+- Retained-claim grant 4 now denies an unresolved held create before either
+  grantor is considered. The helper's previous grant under a closure-only feature
+  snapshot failed a direct control. The actual caller's execution gate remains
+  unchanged, and no #2969 exemption or observed production release is claimed.
 
 These are local review proofs, not a full-suite or hosted PASS, an owner/operator
 observation, E5 or parent completion. Exact-head CI and the lead's independent
