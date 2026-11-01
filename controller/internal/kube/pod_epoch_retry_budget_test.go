@@ -224,9 +224,11 @@ func TestPodEpochRetryHTTPBudgetExpiryLogsOnce(t *testing.T) {
 
 func TestPodEpochRetryStoppedStillTracksPredecessor(t *testing.T) {
 	h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
-	h.event(watch.Added, epochPod(epochB))
+	now := time.Now()
+	h.session.now = func() time.Time { return now }
+	h.successor(epochPod(epochB))
 	// Expiry stops delivery, but B must still be observed as C's predecessor.
-	h.session.attempts[epochB].firstSeen = h.session.now().Add(-podEpochDeliveryBudget)
+	now = now.Add(podEpochDeliveryBudget)
 	h.event(watch.Modified, epochTerminal(epochPod(epochB)))
 	if !h.session.attempts[epochB].stopped || h.session.records[epochB].terminal == 0 {
 		t.Fatal("stopped delivery lost terminal observation")

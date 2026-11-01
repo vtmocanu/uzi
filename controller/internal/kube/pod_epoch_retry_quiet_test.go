@@ -109,12 +109,9 @@ func TestPodEpochRetryHTTPTimeoutNeverRetriesLaterEvent(t *testing.T) {
 	h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 	now := time.Now()
 	h.session.now = func() time.Time { return now }
-	delegate := h.session.resolver
-	h.session.resolver = epochResolverFunc(func(ctx context.Context, w PodEpochWorker, p *corev1.Pod, f bool) (PodEpochIdentity, error) {
-		id, err := delegate.ResolvePodEpoch(ctx, w, p, f)
-		now = now.Add(90*time.Second - 25*time.Millisecond)
-		return id, err
-	})
+	h.event(watch.Added, epochPod(epochB))
+	decision := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
+	now = now.Add(90*time.Second - 25*time.Millisecond)
 	var requests atomic.Int32
 	client := epochHTTPClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -136,6 +133,9 @@ func TestPodEpochRetryHTTPTimeoutNeverRetriesLaterEvent(t *testing.T) {
 		}
 	})
 	h.session.client = client
+	if err := h.session.Deliver(context.Background(), decision); err == nil {
+		t.Fatal("expected timeout")
+	}
 	owner := NewPodEpochWatch(client.CoreV1().RESTClient(), "docker", "containerd-runc", h.session)
 	stream, err := client.CoreV1().RESTClient().Get().Namespace("docker").Resource("pods").Param("watch", "true").Stream(context.Background())
 	if err != nil {

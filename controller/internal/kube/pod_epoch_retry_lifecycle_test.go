@@ -47,39 +47,52 @@ func TestPodEpochRetryClockBudget(t *testing.T) {
 			h.event(watch.Added, epochPod(epochB))
 			now = now.Add(offset)
 			d := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
-			if offset < 90*time.Second {
-				if d == nil {
-					t.Fatal("stopped before boundary")
-				}
-			} else if d != nil || !h.session.attempts[epochB].stopped {
-				t.Fatal("budget renewed while waiting for IDs")
+			if d == nil || h.session.attempts[epochB].stopped {
+				t.Fatal("startup consumed positive delivery budget")
 			}
 		})
 	}
-	t.Run("identity-time-counts", func(t *testing.T) {
-		h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
-		now := time.Now()
-		h.session.now = func() time.Time { return now }
-		delegate := h.session.resolver
-		h.session.resolver = epochResolverFunc(func(ctx context.Context, w PodEpochWorker, p *corev1.Pod, f bool) (PodEpochIdentity, error) {
-			now = now.Add(90 * time.Second)
-			return delegate.ResolvePodEpoch(ctx, w, p, f)
+	for _, positive := range []bool{false, true} {
+		t.Run(fmt.Sprintf("identity-time-counts/positive=%v", positive), func(t *testing.T) {
+			h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
+			if !positive {
+				h = newEpochHarness(t, epochPod(epochA))
+			}
+			now := time.Now()
+			h.session.now = func() time.Time { return now }
+			delegate := h.session.resolver
+			h.session.resolver = epochResolverFunc(func(ctx context.Context, w PodEpochWorker, p *corev1.Pod, f bool) (PodEpochIdentity, error) {
+				now = now.Add(90 * time.Second)
+				return delegate.ResolvePodEpoch(ctx, w, p, f)
+			})
+			if h.event(watch.Added, epochPod(epochB)) != nil || h.session.attempts[epochB].stopped == positive {
+				t.Fatal("incorrect resolver-time budget")
+			}
+			if positive && h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://")) == nil {
+				t.Fatal("positive expired during resolver")
+			}
 		})
-		if h.event(watch.Added, epochPod(epochB)) != nil || !h.session.attempts[epochB].stopped {
-			t.Fatal("identity resolution renewed budget")
-		}
-	})
-	t.Run("duplicate-expiry", func(t *testing.T) {
-		h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
-		now := time.Now()
-		h.session.now = func() time.Time { return now }
-		p := epochPod(epochB)
-		h.event(watch.Added, p)
-		now = now.Add(90 * time.Second)
-		if h.event(watch.Added, p) != nil || !h.session.attempts[epochB].stopped || h.session.records[epochB].pending != nil {
-			t.Fatal("duplicate bypassed expiry")
-		}
-	})
+	}
+	for _, positive := range []bool{false, true} {
+		t.Run(fmt.Sprintf("duplicate-expiry/positive=%v", positive), func(t *testing.T) {
+			h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
+			now := time.Now()
+			h.session.now = func() time.Time { return now }
+			if !positive {
+				h = newEpochHarness(t, epochPod(epochA))
+				h.session.now = func() time.Time { return now }
+			}
+			p := epochPod(epochB)
+			h.event(watch.Added, p)
+			now = now.Add(90 * time.Second)
+			if h.event(watch.Added, p) != nil || h.session.attempts[epochB].stopped == positive {
+				t.Fatal("incorrect duplicate expiry")
+			}
+			if positive && h.event(watch.Modified, epochWithIDs(p, "containerd://")) == nil {
+				t.Fatal("duplicate expired unanchored positive")
+			}
+		})
+	}
 	t.Run("deliver-expiry", func(t *testing.T) {
 		h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 		now := time.Now()
@@ -354,8 +367,18 @@ func TestPodEpochRetryLogsAndAccounting(t *testing.T) {
 			if requests != wantRequests || stops+success != 1 || (outcome == "success" && success != 1) {
 				t.Fatalf("unexpected lifecycle records %s", text)
 			}
-			if strings.Contains(text, epochB) || strings.Contains(text, "private request") || strings.Contains(text, "containerd://") {
-				t.Fatal("identifiers or errors leaked")
+			for _, record := range records {
+				if record["worker_id"] != "w" || record["pod"] != "pod-"+epochB || record["elapsed"] == nil || record["elapsed_since_ids"] == nil {
+					t.Fatal("missing delivery context", record)
+				}
+				for _, value := range record {
+					if value == epochB || value == "containerd://worker2" || value == "containerd://seed2" {
+						t.Fatal("identifier leaked", record)
+					}
+				}
+			}
+			if strings.Contains(text, "private request") {
+				t.Fatal("raw error leaked")
 			}
 			_ = h.session.Deliver(context.Background(), d)
 			if outcome != "reset" && outcome != "maintenance-overflow" {

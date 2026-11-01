@@ -15,14 +15,18 @@ import (
 )
 
 func TestPodEpochRetryOtherUIDExpiry(t *testing.T) {
-	for _, trigger := range []string{"unregistered", "duplicate", "deliver", "repeat-deliver"} {
-		for _, conflicted := range []bool{false, true} {
-			name := trigger + "/pending"
+	for _, trigger := range []string{"unregistered", "duplicate", "deliver", "repeat-deliver", "register"} {
+		for _, mode := range []string{"negative", "unanchored", "conflicted"} {
+			conflicted := mode == "conflicted"
+			name := trigger + "/" + mode
 			if conflicted {
 				name = trigger + "/conflicted"
 			}
 			t.Run(name, func(t *testing.T) {
 				h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
+				if mode == "negative" {
+					h = newEpochHarness(t, epochPod(epochA))
+				}
 				start := time.Now()
 				now := start
 				h.session.now = func() time.Time { return now }
@@ -45,6 +49,9 @@ func TestPodEpochRetryOtherUIDExpiry(t *testing.T) {
 				if trigger == "duplicate" {
 					// A is registered and already observed; this is an exact duplicate.
 					foreign = epochTerminal(epochPod(epochA))
+					if mode == "negative" {
+						foreign = epochPod(epochA)
+					}
 				}
 				if trigger == "deliver" || trigger == "repeat-deliver" {
 					now = start.Add(30 * time.Second)
@@ -85,8 +92,21 @@ func TestPodEpochRetryOtherUIDExpiry(t *testing.T) {
 					if err == nil || (trigger == "deliver" && !apierrors.IsConflict(err)) {
 						t.Fatal("expected decision refusal or conflict", err)
 					}
+				} else if trigger == "register" {
+					if err := h.session.RegisterWorker(PodEpochWorker{ID: "new", Runtime: "containerd-runc"}); err != nil {
+						t.Fatal(err)
+					}
 				} else if h.event(watch.Added, foreign) != nil {
 					t.Fatal("unexpected foreign decision")
+				}
+				if mode == "unanchored" {
+					if a.stopped || r.pending == nil {
+						t.Fatal("foreign sweep expired unanchored positive")
+					}
+					if h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://")) == nil {
+						t.Fatal("unanchored positive lost")
+					}
+					return
 				}
 				if !a.stopped || a.attempts != wantAttempts || r.pending != nil || r.pendingCost != 0 || a.issued != nil || a.negative != "" {
 					t.Fatal("other UID event did not stop/release B without spending an attempt")
