@@ -1494,6 +1494,8 @@ API lifecycle. This CLI has no prerequisite-pin listing or expiry command;
 `run recovery`/`run held` do not show pin state. On a server that enables it for
 GitHub.com, a pinned thin archive can release custody through the archive FINAL
 (#3727); otherwise it cannot authorize archive FINAL or local-source cleanup.
+Pinning alone never authorizes local cleanup: an ACK and the existing independent
+source, writer and shared-consumer guards still apply.
 See [prerequisite pin restore and backlog handling](run-recovery.md#prerequisite-pins-lifecycle-and-custody-release)
 for native Git restore, the release conditions and the frozen-binding/cleanup
 limits. Owner/CLI pin visibility belongs to C3.

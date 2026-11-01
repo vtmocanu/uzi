@@ -823,12 +823,49 @@ tests skip locally for lack of `git-http-backend` and run in CI. No live GitHub.
 observation was made; that is a parent/operator follow-up. Compose e2e phases were not run.
 M6 operator observation, E5, E6 and C3 are not claimed.
 
-**Deviations from the plan.**
+**Worker-handoff deviations at `8fea87a` (historical).**
 
 - The positive real-observer C2 case lives in `api/internal/handler/prerequisite_final_wired_livedb_test.go`.
 - No `pg_locks` lock-order test and no explicit shutdown test were added.
 - The exact-observation closure `EXISTS` branch is unreachable by tests, because the schema forbids forged rows.
 - The specified downgrade/roll-forward journal test and the thin replacement-fence tests were not added.
+
+**Landing-review follow-up, 2026-11-01.** The missing frozen acceptance is being
+completed locally, with hosted acceptance above still unchecked:
+
+- `TestRecoveryClosureFinalClosureLastLockOrderLiveDB` observes the blocked FINAL
+  through `pg_locks` and checks actual earlier row-lock ownership, in one server
+  round trip before the real 500 ms lock deadline.
+- The existing `TestRecoveryClosureFinalCancelledRequestLeavesNothingOpenLiveDB`
+  already covers paused and blocked-listing cancellation.
+  `TestHandlerPrerequisiteFinalShutdownDrainsListingLiveDB` adds an authenticated
+  HTTP shutdown proof through the real port and broker. Graceful HTTP shutdown
+  drains handlers; the bounded listing ends without custody release, a detached
+  listing or an open transaction. It does not assume that `http.Server.Shutdown`
+  immediately cancels active request contexts.
+  This test does not prohibit a valid admitted FINAL from completing during the
+  drain. The stronger interpretation of plan v4's shutdown-cancellation wording
+  remains an explicit review question, not acceptance silently credited by this
+  stalled-listing case; no global server shutdown behavior is changed here.
+- The worker journal test uses an explicit test-only
+  `UZI_RECOVERY_COMPAT_READER` module path for the actual untouched pre-C2 reader
+  at `cb6ebd8f`. That reader authenticated and retained the new signed thin journal,
+  rejected a MAC mutation, and roll-forward recovered the unchanged request's ACK.
+  Ordinary CI exercises feature rollback and persistence; it does not silently
+  claim that the historical module ran when the input is absent.
+- Thin replacement controls now exercise the committed API fence, the unchanged
+  committed receipt, and worker handling of retained, malformed and timed-out
+  reconciliation. Replacement still needs a fresh ordinary mint grant.
+- Review found the inherited capture-health gate still prevented saved thin FINALs
+  from sending when status was expired, discarded or unreadable. Three controls
+  failed on that behavior. The local correction makes status diagnostic for an
+  already-saved thin archive request only; header, source/coverage, inactivity and
+  new-mint health checks remain. These controls passed after the correction.
+
+These are local review proofs, not a full-suite or hosted PASS, an owner/operator
+observation, E5 or parent completion. Exact-head CI and the lead's independent
+delta review remain required. Added fixture/test time and critical-path impact
+must be recorded at landing; local fixture times do not establish hosted cost.
 
 Mixed-version, source-history, limiter and #2884 coordination boundaries are recorded in
 the ADR amendments dated 2026-11-01.
