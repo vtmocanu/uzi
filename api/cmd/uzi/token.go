@@ -516,8 +516,9 @@ func resolvePoolTarget(secrets []apitypes.SecretDTO, kindFlag, label string) (ap
 // kind filters the search to a single SecretDTO.Kind; an empty kind matches any.
 // The filter mirrors GetUserSecretIDByLabel's server-side kind scoping (PRD #1147
 // M3): now that ListSecrets returns multiple kinds, a label can collide across
-// kinds, so the pool command passes kindAnthropicToken to avoid cross-resolving a
-// codex secret.
+// kinds, so callers pass the kind they mean (the pool command resolves both
+// kindAnthropicToken and kindCodexAuth and refuses an ambiguous label without --kind)
+// to avoid cross-resolving another kind's secret.
 func findSecretByLabel(secrets []apitypes.SecretDTO, kind, label string) (apitypes.SecretDTO, bool) {
 	want := strings.ToLower(strings.TrimSpace(label))
 	for _, s := range secrets {

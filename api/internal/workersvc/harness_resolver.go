@@ -225,11 +225,13 @@ func (s *Service) harnessStore() (harnessResolverStore, bool) {
 // explicit is the caller's outright or inherited harness choice, nil for "let the resolver
 // decide". Public request pins and derived-run inheritance both use the explicit path.
 //
-// Codex credential selection follows M1's named-default and auth-mode rules
-// (resolveUsableCodexCredential): the user's single default codex credential decides both
-// whether Codex is usable AND which credential a Codex run binds — so a failed or missing
+// Codex usability follows resolveUsableCodexCredential: in codex_account_mode 'default' (or
+// 'auto' with no pooled alias) the user's single default codex credential decides both
+// whether Codex is usable AND which credential a Codex run binds, so a failed or missing
 // subscription default is simply "Codex not usable" and NEVER falls through to spend a
-// non-default API key (D4). It acquires no lock or lease (D6): it is reads only, so two
+// non-default API key (D4). In 'auto' with a configured pool, Codex is usable iff a pooled
+// alias is structurally eligible, and the alias is picked later, inside the creation
+// transaction (issue #3719). It acquires no lock or lease (D6): it is reads only, so two
 // runs bound to one canonical subscription resolve concurrently.
 func (s *Service) resolveRunHarness(ctx context.Context, userID uuid.UUID, explicit *Harness) (resolvedHarness, error) {
 	q, ok := s.harnessStore()
@@ -332,7 +334,8 @@ func explicitHarnessRefusal(ctx context.Context, q harnessResolverStore, userID 
 }
 
 // BothHarnessesUsable applies the same credential rules as run creation when a user
-// enables plan cross-check. In particular, Codex requires a usable default credential.
+// enables plan cross-check. In particular, Codex must be usable under the user's
+// codex_account_mode (resolveUsableCodexCredential); no usage score is read.
 func (s *Service) BothHarnessesUsable(ctx context.Context, userID uuid.UUID) (bool, error) {
 	q, ok := s.harnessStore()
 	if !ok {
@@ -421,9 +424,11 @@ func (s *Service) userDefaultHarness(ctx context.Context, userID uuid.UUID, q ha
 	}
 }
 
-// resolveUsableCodexCredential resolves the user's single default codex credential and
-// decides whether it is USABLE, returning the credential coordinates a Codex run would
-// bind (PRD #1332 D4, M1's named-default rules).
+// resolveUsableCodexCredential decides whether Codex is USABLE for the user. In
+// codex_account_mode 'auto' with a configured pool it answers from the pooled aliases alone
+// (see the comment in the body); otherwise it resolves the user's single default codex
+// credential and returns the coordinates a Codex run would bind (PRD #1332 D4, M1's
+// named-default rules), as described below.
 //
 // The codex kinds share ONE default slot (user_secrets_codex_one_default_key), so the
 // default is at most one row across both kinds; it is resolved per-kind and whichever

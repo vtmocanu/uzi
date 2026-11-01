@@ -123,12 +123,15 @@ func TestSettingsGetShowsCodexMode(t *testing.T) {
 
 // TestRailCodexReasonLineCountsAgainstSiblingBudget pins that the Codex label AND its reason
 // line both count toward the row budget the sibling Claude entries are fitted into. Two
-// readable accounts make the shown one a 3-row entry (label, 5h, 7d); a budget of header + 2
-// (Codex label, reason) + 2 is one row short of it, so the sibling must be dropped whole.
+// readable accounts with both windows make the shown one a 3-row entry (label, 5h, 7d); a
+// budget of header + 2 (Codex label, reason) + 2 is one row short of it, so the sibling must
+// be dropped whole. Both windows are set because a readable account with no 5-hour window
+// renders without the 5h row.
 func TestRailCodexReasonLineCountsAgainstSiblingBudget(t *testing.T) {
 	label := "old-login"
 	id := "alias-id"
-	ok := apitypes.RateLimitDTO{Status: "ok"}
+	ok := apitypes.RateLimitDTO{Status: "ok",
+		FiveHour: &apitypes.RateLimitWindow{Pct: 10}, SevenDay: &apitypes.RateLimitWindow{Pct: 20}}
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "codex-run")
 	m.width, m.height = 100, 40
 	m.rateLimits = []apitypes.TokenRateLimitDTO{
