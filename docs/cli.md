@@ -234,6 +234,7 @@ uzi admin egress-profile list | show <name>
 uzi admin maintenance status [--json]
 uzi settings get
 uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]
+uzi settings codex-mode default|auto
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -1926,7 +1927,16 @@ A newer release is available.
   `subscription` or unreported run, and a blank cell for no recorded usage;
   it too is hidden on
   a narrow terminal, dropping right after the micro-bar does so the title is
-  never squeezed. `[h]` hides finished runs (completed/failed/cancelled),
+  never squeezed. On your own board, a DONE row also shows its **run length**
+  right after the AGE (which, on a DONE row, is how long ago it finished): wall
+  time from the run's first start to its finish, so approval waits, limit parks
+  and pauses count too. It is blank for a run that never started or has no
+  finish stamp, and blank on active rows (the cell is reserved so columns line
+  up). It is the lowest-priority column: it appears only from 111 columns (123
+  with the account column, wider still when judge badges are shown) and is the
+  first to go on a narrowing terminal. The DONE heading labels the two
+  numbers `ended` and `took`, and the `?` legend explains them.
+  `[h]` hides finished runs (completed/failed/cancelled),
   leaving the active and needs-you runs. The rows are grouped into three
   triage bands (NEEDS YOU, then ON THE FLOOR, then DONE) rather than one
   flat table. Failed and `needs landing` DONE rows use one dimmed red for
@@ -1937,9 +1947,16 @@ A newer release is available.
   `▌` andon strip and
   status glyph, the run id, the status WORD in its own colour (a stalled run
   reads `▲ stalled`, because health folds into the status token rather than
-  a separate column), the AGE, the milestone micro-bar, the COST cell, and
-  the TITLE; there are no STATUS/HEALTH/MILE column headers or full-width
-  rules. The list windows to the terminal height so the wordmark and key
+  a separate column), the AGE, the DONE run length, the milestone micro-bar, the COST cell, and
+  the TITLE. There is no separate header row or full-width rule: each band
+  heading carries faint lowercase column names over its columns (`age`, or
+  `ended` and `took` on DONE, then `miles`, `acct`, `cost`, `title`, `judge`,
+  `worker`; `judge` only on a band where some run has a verdict), shown only
+  for visible columns and dropped where one would
+  collide with the heading text; the run id, status and admin owner sit under
+  the heading itself. The status cell fits the longest status word on
+  screen and, where possible, leaves room for the heading's age label, capped
+  at 14 columns; the remaining space goes to the title. The list windows to the terminal height so the wordmark and key
   legend stay on screen however many runs there are, with the visible run
   span (`lo–hi`) and a seven-day cost shown in the top-right summary
   cluster (`⚑ N · ✎ N · ➤ N · ⚿ N · ▲ N · $N 7d · T runs`). On your own
@@ -2131,7 +2148,12 @@ or workflow name.
   every 10s.
 - **`ci`** lists the repo's CI/workflow runs, banded **RUNNING**,
   **FAILED**, and **RECENT**, each row carrying a `▰▱ done/total` jobs
-  micro-bar while it's running. On a forge version with no Actions/CI-runs
+  micro-bar while it's running. Like the board, each band heading carries
+  faint column names over its cells: `event`, `branch`, `status`, then
+  `elapsed` (RUNNING) or `took` (finished bands) for the run time, `title`,
+  and `jobs/age` (RUNNING: the jobs bar, or the age before jobs report) or
+  `age` (time since the run was triggered), following the columns shown at
+  the terminal's width. On a forge version with no Actions/CI-runs
   API it degrades to a one-line notice instead of an empty list. Polls
   every 10s.
 - **PR view** (`enter`/`→` on a `pulls` row) drills into one PR: CHECKS
@@ -2642,6 +2664,7 @@ uzi token list                                 # labels, default flag, pool opt-
 uzi token test <label> [--kind anthropic|codex|openai-key]
 uzi token pool console-key --on                # add it to the auto-selection pool
 uzi token pool console-key --off               # take it back out
+uzi token pool work-codex --kind codex --on    # pool a Codex login (see settings codex-mode)
 uzi worker set-token <worker-id> console-key   # bind a worker to a named token
 uzi worker set-token <worker-id> --default     # clear the binding
 uzi worker set-token <worker-id> --auto        # pick per claim, from the pool
@@ -2668,6 +2691,11 @@ successful credential check. A result can go stale after the test.
 the same reason the others are not: it mints nothing and reveals nothing, it
 only re-points spend among tokens you already hold. Adding, renaming,
 re-defaulting and deleting stay web-only.
+
+It pools Anthropic tokens and Codex subscription logins (OpenAI API keys have
+no pool). Pass `--kind anthropic|codex` when the same label exists in both
+kinds; without it that is a usage error. See [Codex account
+mode](#codex-account-mode).
 
 `uzi token list` prints two columns about the pool, and they answer different
 questions:
@@ -3063,6 +3091,60 @@ On a run the reserve touches, `uzi run get` shows:
   uzi run resume <id>`);
 - a pending reserve pause: the `PAUSE_REQUESTED` suffix described under
   `run pause` above.
+
+### Codex account mode
+
+```sh
+uzi settings codex-mode auto
+uzi settings codex-mode default
+uzi token pool work-codex --kind codex --on
+```
+
+`uzi settings codex-mode default|auto` sets how a new Codex run chooses its
+login (`PUT /api/me/codex-account-mode`, which accepts a `uzc_` Bearer token).
+`default` binds your default Codex login. `auto` picks, at run creation, the
+pooled Codex login with the most limit headroom; you opt logins into the pool
+per login with `uzi token pool <label> --kind codex --on` (the pool is empty
+until you do, and `auto` then falls back to your default). Logins are created
+unpooled. `--kind` is required only when the label is held by both an Anthropic
+token and a Codex login: without it that is a usage error. Before Codex pooling
+existed, `uzi token pool <label>` silently picked the Anthropic token in that
+case, so a script that relied on it now needs `--kind anthropic`. An
+`openai_api_key` cannot be pooled. `uzi token list` shows the Codex pool state in
+the `POOL` column; its `ELIGIBLE` column is Anthropic-only and reads `-` for a
+Codex login. The HTTP routes are `PUT /api/me/codex-account-mode` and `PATCH
+/api/me/secrets/codex_auth/{id}/auto-eligible`.
+
+`uzi run get` explains the pick on the `CODEX_ALIAS` row, or `not recorded` for
+a run created before auto-selection:
+
+| Reason | `CODEX_ALIAS` text |
+|---|---|
+| `default` | `work-codex — default` |
+| `pool_empty` | `work-codex — default (auto mode, but no login is pooled)` |
+| `auto` | `work-codex — auto (most limit headroom)` |
+| `best_of_pool` | `work-codex — auto (best of pool; every login was under the headroom floor)` |
+| `pool_stale` | `work-codex — auto (no usage reading yet; first pooled login)` |
+| `pool_exhausted` | `work-codex — auto (every login at capacity; soonest to release)` |
+
+The TUI detail rail shows the short form (`default`, `pool empty`, `auto`,
+`best of pool`, `pool stale`, `pool exhausted`), and `--json` carries the raw
+value as `codex_select_reason`. See [Letting uzi pick the
+account](./codex-credentials.md#letting-uzi-pick-the-account) for how the
+choice is made.
+
+When `auto` has pooled logins but none can be bound, Codex is unusable and the
+selection never falls back to your default login. A run that did not name a
+harness starts on Claude. A run that explicitly asks for Codex, including a
+manual MR rework of a Codex run, is refused with a 422 whose code is
+`no_credential_for_harness` and whose reason is `codex_pool_unavailable`
+(the CLI prints `no pooled Codex account is available; link, re-authenticate
+or pool a Codex account in Settings (reason: codex_pool_unavailable)`). A
+schedule skips (or, once, holds) with the skip reason `codex_pool_unavailable`,
+and an automatic MR rework is skipped. When every Codex login you hold is
+disabled, the existing disabled-credential refusal applies instead (a 422 with
+no reason; a schedule records `credential_disabled`). `uzi settings get` shows `Codex account
+mode:` after the reserve line, and `--json` carries `codex_account_mode`.
 
 ### Plan cross-check evidence
 

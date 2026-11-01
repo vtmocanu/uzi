@@ -144,6 +144,17 @@ describe("statusBadge", () => {
   });
 });
 
+describe("7-day-only reading (no five_hour)", () => {
+  const { five_hour: _omit, ...sevenOnly } = ok(0, 97) as Extract<MyRateLimits, { status: "ok" }>;
+  const seven = sevenOnly as Extract<MyRateLimits, { status: "ok" }>;
+
+  it("worstWindow and the state use only the 7-day window", () => {
+    expect(worstWindow(seven)).toMatchObject({ label: "7-day", pct: 97 });
+    expect(rowState(seven)).toBe("live_danger");
+    expect(statusBadge(seven, false)).toMatchObject({ label: "7d nearly out" });
+  });
+});
+
 describe("worstWindow (PRD #54)", () => {
   const okOnly = (limits: MyRateLimits) => limits as Extract<MyRateLimits, { status: "ok" }>;
 

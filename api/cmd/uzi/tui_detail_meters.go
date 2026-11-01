@@ -136,12 +136,23 @@ func (m tuiModel) railRateMeters(now time.Time, usedRows int) string {
 			width -= len(deleted)
 			suffix = deleted
 		}
-		label := m.renderer.Plain(*m.detail.run.CodexSecretLabel, width) + suffix
+		label := m.renderer.Plain(*m.detail.run.CodexSecretLabel, max(width, 1)) + suffix
 		if headerRow+1 > budget {
 			return ""
 		}
-		fitted = append(fitted, lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(label))
-		accumulated++
+		entry := lipgloss.NewStyle().Foreground(m.pal.tungsten).Render(label)
+		rows := 1
+		// Issue #3719: why this alias was chosen, on its own faint line under the label so
+		// neither is shortened by the other. The tag is a closed enum from this binary's own
+		// table, but an unrecognised value from a newer server is untrusted, so it rides
+		// renderer.Plain, capped to the rail width. When only the label row fits the budget the
+		// reason line is dropped, not the label.
+		if t := codexReasonTag(m.detail.run.CodexSelectReason); t != "" && headerRow+2 <= budget {
+			entry += "\n" + m.pal.faint.Render(m.renderer.Plain(t, max(m.railWidth(), 1)))
+			rows++
+		}
+		fitted = append(fitted, entry)
+		accumulated += rows
 	}
 	for _, t := range shown {
 		var lines []string
@@ -155,10 +166,12 @@ func (m tuiModel) railRateMeters(now time.Time, usedRows int) string {
 		} else if showLabel {
 			lines = append(lines, m.pal.faint.Render(m.renderer.Plain(t.Label, m.railWidth())))
 		}
-		lines = append(lines,
-			m.rateWindowCell("5h", t.Limits.FiveHour, railRateBarWidth, 4, now),
-			m.rateWindowCell("7d", t.Limits.SevenDay, railRateBarWidth, 4, now),
-		)
+		// A nil 5h window on a READABLE (ok) token means the account has no 5-hour window;
+		// a synthesized run-account entry with no reading keeps its `5h -` placeholder.
+		if t.Limits.FiveHour != nil || t.Limits.Status != "ok" {
+			lines = append(lines, m.rateWindowCell("5h", t.Limits.FiveHour, railRateBarWidth, 4, now))
+		}
+		lines = append(lines, m.rateWindowCell("7d", t.Limits.SevenDay, railRateBarWidth, 4, now))
 		entry := strings.Join(lines, "\n")
 		rows := len(lines)
 		if headerRow+accumulated+rows > budget {

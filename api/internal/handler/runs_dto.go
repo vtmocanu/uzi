@@ -387,6 +387,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		dto.CodexSecretID = &s
 	}
 	dto.CodexSecretLabel = textPtrValue(r.CodexSecretLabel.Valid, r.CodexSecretLabel.String)
+	dto.CodexSelectReason = textPtrValue(r.CodexSelectReason.Valid, r.CodexSelectReason.String)
 	// PRD #111 M5. Mapped independently of BOTH fields above, for the same reason and
 	// one more: the reason is present on every M1-era run (all three lanes write one)
 	// while the headroom is present only on an auto pick, so a run legitimately

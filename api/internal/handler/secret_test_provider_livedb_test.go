@@ -60,7 +60,7 @@ func TestSecretAnthropicProviderLiveDB(t *testing.T) {
 	session := cliMintJWT(t, pool, owner)
 	h.cfg.UsageProbe = true
 	reading := anthropic.Reading{
-		FiveHour: anthropic.Window{Pct: 23}, SevenDay: anthropic.Window{Pct: 67},
+		FiveHour: &anthropic.Window{Pct: 23}, SevenDay: anthropic.Window{Pct: 67},
 		Source: anthropic.SourceUsageEndpoint,
 	}
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {

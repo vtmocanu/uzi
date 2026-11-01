@@ -448,6 +448,11 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 		// A race with a ci_fix on the branch, a concurrent rework on this MR, or a concurrent
 		// cycle that consumed these comments or spent the cap: swallow, nothing was written,
 		// retry next tick.
+	case errors.Is(err, workersvc.ErrCodexPoolUnavailable):
+		// Issue #3719: the source run's Codex harness is inherited, and the owner's auto-mode pool
+		// has no bindable account. Same skip as below with the reason named; the ledger is not advanced.
+		slog.Warn("poller: mr-rework skipped: codex pool unavailable",
+			"repo", r.PathWithNamespace, "ref", ref, "source_run", cand.SourceRunID.String(), "reason", "codex_pool_unavailable")
 	case errors.Is(err, workersvc.ErrNoCredentialForHarness):
 		// PRD #1429 M2 (D4): the automatic rework INHERITS the source run's harness explicitly; if
 		// that harness is no longer usable, creation refuses with no fallback. Record a legible,

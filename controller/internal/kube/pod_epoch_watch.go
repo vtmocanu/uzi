@@ -143,7 +143,9 @@ func (w *PodEpochWatch) baseline(ctx context.Context) (string, error) {
 var errPodEpochReset = errors.New("pod epoch subscription reset")
 
 // consume caps each NDJSON frame before any Kubernetes or JSON decoder sees it.
-// Delivery is synchronous: rv advances only after Handle and its sole patch attempt.
+// Delivery is synchronous: rv advances only after Handle and its event-bound patch attempt.
+// Only a conflict permits another decision on a later changed same-UID event.
+// Cancellation or expiry stops submissions but cannot retract an in-flight write.
 func (w *PodEpochWatch) consume(ctx context.Context, body io.Reader, rv *string) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 4096), (2<<20)+1)
@@ -202,14 +204,17 @@ func (w *PodEpochWatch) consume(ctx context.Context, body io.Reader, rv *string)
 // attempt. A reset discards proof before relisting; normal reconciliation is independent.
 func (w *PodEpochWatch) Run(ctx context.Context) {
 	defer close(w.done)
+	g := w.session.CurrentGeneration()
+	defer func() { w.session.StopGeneration(g) }()
 	rv := ""
 	var fence uint64
 	for ctx.Err() == nil {
+		g = w.session.CurrentGeneration()
 		if rv == "" {
 			w.mu.Lock()
 			fence = w.baselineFence
 			w.mu.Unlock()
-			_, _ = w.session.Reset(ctx, nil)
+			g, _ = w.session.Reset(ctx, nil)
 			next, err := w.baseline(ctx)
 			if err != nil {
 				if !podEpochRetry(ctx) {
@@ -218,6 +223,7 @@ func (w *PodEpochWatch) Run(ctx context.Context) {
 				continue
 			}
 			rv = next
+			g = w.session.CurrentGeneration()
 		}
 		// A timeout during LIST requires a new baseline before opening WATCH.
 		w.mu.Lock()
@@ -225,7 +231,7 @@ func (w *PodEpochWatch) Run(ctx context.Context) {
 		w.mu.Unlock()
 		if stale {
 			rv = ""
-			_, _ = w.session.Reset(ctx, nil)
+			g, _ = w.session.Reset(ctx, nil)
 			continue
 		}
 		body, err := w.client.Get().Namespace(w.namespace).Resource("pods").SetHeader("Accept", "application/json").Param("watch", "true").Param("resourceVersion", rv).Stream(ctx)
@@ -241,7 +247,7 @@ func (w *PodEpochWatch) Run(ctx context.Context) {
 				// The next attempt captures the new fence before its LIST.
 				_ = body.Close() // This entire subscription is discarded, including close failures.
 				rv = ""
-				_, _ = w.session.Reset(ctx, nil)
+				g, _ = w.session.Reset(ctx, nil)
 				continue
 			}
 			err = w.consume(ctx, body, &rv)
@@ -251,7 +257,7 @@ func (w *PodEpochWatch) Run(ctx context.Context) {
 		}
 		if errors.Is(err, errPodEpochReset) || apierrors.IsResourceExpired(err) || apierrors.IsGone(err) {
 			rv = ""
-			_, _ = w.session.Reset(ctx, nil)
+			g, _ = w.session.Reset(ctx, nil)
 		}
 		if !podEpochRetry(ctx) {
 			return
