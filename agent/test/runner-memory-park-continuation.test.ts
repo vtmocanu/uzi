@@ -742,6 +742,7 @@ describe("gate steps (a) to (d) (issue #3639)", () => {
         p.f.memory.waitGuardSample = async () => (waits++ === 0 ? "sample" : "timeout");
         const c = await resume(p);
         assert.equal(c.newParks().length, 1);
+        assert.equal(p.counters.refusals.length, 0, "F1 re-park, not an F3 refusal");
         assert.equal(p.counters.ran, 0);
       } finally { await p.done(); }
     });
@@ -1023,10 +1024,12 @@ describe("the same memory runtime and nonce guard the continuation (issue #3639)
   });
 });
 
-describe("the guard stays armed through the handoff and up to the first memory context (issue #3639)", () => {
+describe("the guard stays armed through the handoff (issue #3639)", () => {
   const DISARMED = () => ({ seq: 9, validSeq: 9, armed: false, pendingIntervention: true });
 
-  it("armed at gate step (c), then another flight's intervention disarms it before the handoff ends: F3, nothing admitted, PENDING kept", async () => {
+  for (const [label, observed] of [["another flight's intervention disarms it", DISARMED],
+    ["its current sample turns invalid", () => ({ seq: 10, validSeq: 9, armed: true, pendingIntervention: false })]] as const) {
+  it(`armed at gate step (c), then ${label} before the handoff ends: F3, nothing admitted, PENDING kept`, async () => {
     const p = await parked();
     try {
       declinePark();
@@ -1037,7 +1040,7 @@ describe("the guard stays armed through the handoff and up to the first memory c
       p.r.rt.classifySourceAdmission = async (...args: Parameters<typeof classify>) => {
         const out = await classify(...args);
         assert.ok(armedReads >= 2, "premise: the gate had already observed the armed guard");
-        p.f.memory.guardObservation = DISARMED; // the concurrent intervention, after the gate and before the handoff's end
+        p.f.memory.guardObservation = observed; // the concurrent change, after the gate and before the handoff's end
         return out;
       };
       await resume(p);
@@ -1047,35 +1050,9 @@ describe("the guard stays armed through the handoff and up to the first memory c
       assert.equal(entryOf(p)?.state, "pending", "PENDING kept");
     } finally { await p.done(); }
   });
+  }
 
-  it("disarmed after the handoff passed, before the first memory context: no context is begun, no command admitted, the entry returns to pending", async () => {
-    const p = await parked();
-    try {
-      declinePark();
-      let began = 0;
-      const begin = p.f.memory.begin.bind(p.f.memory);
-      p.f.memory.begin = (...args: Parameters<typeof begin>) => { began++; return begin(...args); };
-      let capturedThrew = false;
-      let stateAtCapture: string | undefined;
-      p.setExecutor({ run: async ctx => {
-        p.counters.ran++;
-        stateAtCapture = entryOf(p)?.state;
-        p.f.memory.guardObservation = DISARMED;
-        try { ctx.capturedMemory!(); } catch { capturedThrew = true; }
-        throw new Error("the successor stops here");
-      } });
-      const claim: ClaimResponse = { ...p.f.claim, claim_generation: 8, memory_episode: 4, memory_policy: { version: 1, max_interventions: 2 },
-        memory_intervention_count: 0, memory_park_reference: p.ref() };
-      api.setOwnershipStatus(claim.run_id, "running", 8);
-      try { await p.runner.execute(claim); } catch { /* nonterminal stop */ }
-      assert.equal(stateAtCapture, "consumed", "premise: the handoff passed and consumed the entry");
-      assert.equal(capturedThrew, true, "the memory capture was refused");
-      assert.equal(began, 0, "no memory context was begun, so no command could be admitted");
-      assert.equal(entryOf(p)?.state, "pending", "the next claim passes the gate again");
-    } finally { await p.done(); }
-  });
-
-  it("a renewal begin inside an already-admitted receipt flight is ordinary: a later disarm neither stops it nor resets the consumed entry", async () => {
+  it("after the handoff the flight is admitted like any claim: a later disarm stops neither a renewal begin nor resets the consumed entry", async () => {
     const p = await parked();
     try {
       let began = 0;
