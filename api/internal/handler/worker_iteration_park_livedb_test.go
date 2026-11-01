@@ -468,6 +468,11 @@ func TestWorkerIterationParkRacesLiveDB(t *testing.T) {
 // Recovery queries must leave an iteration hold intact even when a matching
 // live snapshot reports the old phase, or a later snapshot omits the attempt.
 func TestWorkerIterationParkRecoveryQueriesLiveDB(t *testing.T) {
+	t.Run("held", func(t *testing.T) { testWorkerIterationParkRecoveryQueries(t, false) })
+	t.Run("resumed", func(t *testing.T) { testWorkerIterationParkRecoveryQueries(t, true) })
+}
+
+func testWorkerIterationParkRecoveryQueries(t *testing.T, resumed bool) {
 	for _, frozen := range []bool{false, true} {
 		t.Run(fmt.Sprintf("frozen=%v", frozen), func(t *testing.T) {
 			f := iterationRoutes(t)
@@ -490,6 +495,10 @@ func TestWorkerIterationParkRecoveryQueriesLiveDB(t *testing.T) {
  FROM runs WHERE id=ANY($1::uuid[])`, ids).Scan(&ledger); err != nil {
 				t.Fatal(err)
 			}
+			if resumed {
+				resumeIteration(t, f, held)
+				f.exec(t, "UPDATE runs SET status_since=now()-interval '10 minutes' WHERE id=$1", held)
+			}
 			before := f.snapshot(t, held)
 			// The complete snapshot comparison below includes head, generation,
 			// session, allowance, every budget counter and claim release identity.
@@ -497,8 +506,8 @@ func TestWorkerIterationParkRecoveryQueriesLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if parked.Status != "paused" || parked.HoldReason.String != "iteration_budget_exhausted" ||
-				parked.HoldCapturedHead.String != "captured-head" || parked.ClaimGeneration != 4 {
+			if (!resumed && (parked.Status != "paused" || parked.HoldReason.String != "iteration_budget_exhausted" || parked.HoldCapturedHead.String != "captured-head")) ||
+				(resumed && (parked.Status != "queued" || parked.HoldReason.Valid || !parked.ClaimReleasedAt.Valid)) || parked.ClaimGeneration != 4 {
 				t.Fatal("fixture did not establish the iteration hold")
 			}
 			runQuery := func(name string, check func(*store.Queries)) {
@@ -591,6 +600,11 @@ func TestWorkerIterationParkRecoveryQueriesLiveDB(t *testing.T) {
 }
 
 func TestWorkerIterationParkSnapshotsLiveDB(t *testing.T) {
+	t.Run("held", func(t *testing.T) { testWorkerIterationParkSnapshots(t, false) })
+	t.Run("resumed", func(t *testing.T) { testWorkerIterationParkSnapshots(t, true) })
+}
+
+func testWorkerIterationParkSnapshots(t *testing.T, resumed bool) {
 	f := iterationRoutes(t)
 	ctx := context.Background()
 	id := f.run(t, "prompt")
@@ -598,6 +612,9 @@ func TestWorkerIterationParkSnapshotsLiveDB(t *testing.T) {
 	assertIterationAck(t, f.call(id, "iteration-park", body, f.worker), 200, "")
 	f.exec(t, "UPDATE runs SET status_since=now()-interval '10 minutes',requeue_count=1 WHERE id=$1", id)
 	f.exec(t, "UPDATE workers SET snapshot_register_nonce='iteration-snapshot',snapshot_epoch=0 WHERE id=$1", f.worker)
+	if resumed {
+		resumeIteration(t, f, id)
+	}
 	before := f.snapshot(t, id)
 	svc := workersvc.New(f.q, newHandlerTestBox(t), workersvc.Params{
 		RunMaxIterations: 5, RunTimeout: time.Hour, RunMaxRequeues: 1,
@@ -652,10 +669,10 @@ func TestWorkerIterationParkSnapshotsLiveDB(t *testing.T) {
  claim_generation=4 AND phase='running' AND NOT terminal_pending AND snapshot_epoch=$3),false)
  FROM worker_active_runs WHERE worker_id=$1 AND run_id=$2`, f.worker, id, step.epoch).Scan(&count, &exact)
 			want := 0
-			if step.listed {
+			if step.listed && !resumed {
 				want = 1
 			}
-			if err != nil || count != want || (step.listed && !exact) {
+			if err != nil || count != want || (want == 1 && !exact) {
 				t.Fatalf("snapshot storage count=%d exact=%v want=%d err=%v", count, exact, want, err)
 			}
 			if f.snapshot(t, id) != before {
@@ -666,10 +683,18 @@ func TestWorkerIterationParkSnapshotsLiveDB(t *testing.T) {
 }
 
 func TestWorkerIterationParkLateWritesLiveDB(t *testing.T) {
+	t.Run("held", func(t *testing.T) { testWorkerIterationParkLateWrites(t, false) })
+	t.Run("resumed", func(t *testing.T) { testWorkerIterationParkLateWrites(t, true) })
+}
+
+func testWorkerIterationParkLateWrites(t *testing.T, resumed bool) {
 	f := iterationRoutes(t)
 	ctx := context.Background()
-	id := f.run(t, "prompt")
+	id := f.run(t, "mr_rework")
 	assertIterationAck(t, f.call(id, "iteration-park", iterationParkBody, f.worker), 200, "")
+	if resumed {
+		resumeIteration(t, f, id)
+	}
 	before := f.snapshot(t, id)
 	// Legacy and generation-stamped state reports both retain the iteration hold.
 	for _, gen := range []string{"", `,"claim_generation":4`} {
@@ -683,8 +708,31 @@ func TestWorkerIterationParkLateWritesLiveDB(t *testing.T) {
 			}
 		}
 	}
+	if resumed {
+		assertIterationAck(t, f.call(id, "iteration-park", iterationParkBody, f.worker), 409, "released_claim")
+	} else {
+		assertIterationAck(t, f.call(id, "iteration-park", iterationParkBody, f.worker), 200, "")
+	}
+	if f.snapshot(t, id) != before {
+		t.Fatal("duplicate park changed state")
+	}
+	for _, body := range []string{
+		`{"status":"failed","claim_generation":4,"fail_origin":"plan_rejected"}`,
+		`{"status":"failed","claim_generation":4,"branch_moved":true}`,
+	} {
+		rec := f.call(id, "state", body, f.worker)
+		if rec.Code == 200 || f.snapshot(t, id) != before {
+			t.Fatalf("late terminal report accepted: %d %s", rec.Code, rec.Body.String())
+		}
+	}
 	// Exercise SQL guards directly as well as the HTTP service fence.
 	worker := pgconv.UUID(f.worker)
+	if n, err := f.q.SetRunRunning(ctx, store.SetRunRunningParams{ID: id, WorkerID: worker}); err != nil || n != 0 {
+		t.Fatalf("running=%d %v", n, err)
+	}
+	if n, err := f.q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{ID: id, WorkerID: worker}); err != nil || n != 0 {
+		t.Fatalf("approval=%d %v", n, err)
+	}
 	if n, err := f.q.SetRunAwaitingInput(ctx, store.SetRunAwaitingInputParams{ID: id, WorkerID: worker}); err != nil || n != 0 {
 		t.Fatalf("input=%d %v", n, err)
 	}

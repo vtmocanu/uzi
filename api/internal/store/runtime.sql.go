@@ -19334,7 +19334,7 @@ WITH candidates AS MATERIALIZED (
        OR NOT EXISTS (SELECT 1 FROM workers w
                       WHERE w.id = runs.worker_id AND ($9::timestamptz IS NULL OR w.last_heartbeat_at >= $9::timestamptz)
                         AND w.dind_register_floor <= runs.status_since))
-  AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
+  AND ((runs.hold_reason IS DISTINCT FROM 'budget_exhausted' AND runs.hold_reason IS DISTINCT FROM 'iteration_budget_exhausted')
        OR (COALESCE(runs.budget_wall_seconds, $10::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
   AND ($11::text IS NULL OR runs.hold_reason = $11::text)
@@ -19382,10 +19382,12 @@ UPDATE runs SET
         + GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int),
     -- D19: drop worker affinity for a server-side park; keep it for a worker-side park.
     worker_id = CASE WHEN runs.claim_released_at IS NOT NULL THEN NULL ELSE runs.worker_id END,
-    -- D7: a resumed budget_exhausted row leaves the wall hold behind.
+    -- Both CASE expressions read the OLD row: release the iteration flight without dropping affinity.
+    claim_released_at = CASE WHEN runs.hold_reason = 'iteration_budget_exhausted' THEN now() ELSE runs.claim_released_at END,
+    -- Resumed wall and iteration holds leave their reason and captured head behind.
     -- Issue #3181: a resumed credential-switch hold (settling once its fence lifted, or unsettled) is cleared too.
-    hold_reason = CASE WHEN runs.hold_reason IN ('budget_exhausted', 'credential_switch_settling', 'credential_switch_unsettled', 'weekly_reserve') THEN NULL ELSE runs.hold_reason END,
-    hold_captured_head = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_captured_head END,
+    hold_reason = CASE WHEN runs.hold_reason IN ('budget_exhausted', 'iteration_budget_exhausted', 'credential_switch_settling', 'credential_switch_unsettled', 'weekly_reserve') THEN NULL ELSE runs.hold_reason END,
+    hold_captured_head = CASE WHEN runs.hold_reason IN ('budget_exhausted', 'iteration_budget_exhausted') THEN NULL ELSE runs.hold_captured_head END,
     -- PRD #3522 M4a: the owner's manual resume of a weekly_reserve pause is a recorded OVERRIDE until the
     -- next observed 7-day reset. The five exemption columns are written ONLY on a weekly_reserve hold and
     -- only when the caller supplies a grant time (the owner resume does; set-token, the completion
@@ -19426,9 +19428,9 @@ WHERE runs.id = $6 AND runs.user_id = $7
        OR NOT EXISTS (SELECT 1 FROM workers w
                       WHERE w.id = runs.worker_id AND ($9::timestamptz IS NULL OR w.last_heartbeat_at >= $9::timestamptz)
                         AND w.dind_register_floor <= runs.status_since))
-  -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
+  -- Refuse a wall or iteration hold with no remaining wall budget (Extend adds time only for an iteration hold).
   -- Remaining = three-term total - (elapsed active run-time) = total - ((status_since - started_at) - budget_paused_seconds).
-  AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
+  AND ((runs.hold_reason IS DISTINCT FROM 'budget_exhausted' AND runs.hold_reason IS DISTINCT FROM 'iteration_budget_exhausted')
        OR (COALESCE(runs.budget_wall_seconds, $10::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
@@ -19495,16 +19497,18 @@ type ResumePausedRunRow struct {
 //     owner-facing/credential callers pass @allow_completion_blocked_hold = false, which refuses
 //     it (0 rows); resumeCompletionBlocked passes true. The completion path leaves hold_reason set
 //     (SetRunRunning clears it on the first running report, as PRD #1226).
-//   - A 'budget_exhausted' wall park resumes only WITH remaining budget (D7): a bare resume of an
+//   - Wall and iteration budget holds resume only WITH remaining wall budget (D7): a bare resume of an
 //     out-of-time run is refused with the extend command; @global_timeout_seconds feeds the
 //     three-term total for a NULL-budget run. On resume of a budget_exhausted row hold_reason and
-//     hold_captured_head are CLEARED (the CASE reads the OLD hold_reason).
+//     hold_captured_head are CLEARED (also for iteration holds; CASE reads the OLD hold_reason).
 //   - A SERVER-parked row (claim_released_at IS NOT NULL, only ParkRunsAtWall leaves this on a
 //     paused row) resumes WITHOUT its worker and BARS that worker from reclaiming (D19): worker_id
 //     is nulled so the ownership guard on every report writer rejects the old flight, and the
 //     released_worker_* pair ParkRunsAtWall captured is PRESERVED (never re-read here — the park
 //     has no expiry, so the worker may be a new safe incarnation by now). A worker-side park
 //     (claim_released_at IS NULL) KEEPS worker_id for the same-worker resume, as PRD #1190.
+//     An iteration resume sets claim_released_at without a released_worker_* ban or custody change;
+//     ClaimRun clears that fence and advances the generation for the continued session.
 //
 // Issue #3181: a 'credential_switch_unsettled' hold (the worker finished its own operations; processes were not proven stopped)
 // resumes like an owner pause and keeps worker_id for the same-worker resume. A

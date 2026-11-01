@@ -112,12 +112,10 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusConflict, "this run is blocked on a completion decision; resolve it at POST /api/runs/{id}/completion/decision")
 			return
 		}
-		// PRD #1190 M1 / #1497 M1: resume an owner-paused run or a budget_exhausted wall park.
-		// ResumePausedRun banks the parked time into budget_paused_seconds and keeps started_at
-		// (gate-park accounting, Decision 2); owner+status-scoped, and it refuses a completion hold
-		// (allow=false) and a budget_exhausted park with no remaining budget (D7). pgx.ErrNoRows means
-		// a race moved the run out of paused, or — for a budget_exhausted hold — that there is no
-		// budget left to resume on.
+		// Resume owner pauses, wall holds and iteration holds through the same accounting.
+		// ResumePausedRun banks parked time and keeps started_at; completion holds require
+		// their own endpoint, and both exhausted holds require remaining wall budget.
+		// A refused write can also mean a competing owner action changed the hold.
 		resumeParams := store.ResumePausedRunParams{
 			ID:                         runID,
 			UserID:                     user.ID,
@@ -168,6 +166,21 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 				} else if settling {
 					httpx.Error(w, http.StatusConflict, workersvc.ErrRunHoldSettling.Error())
 					return
+				}
+				// Read the current iteration hold before naming exhaustion: a refused resume
+				// can also mean that a competing owner action moved the run.
+				if current, readErr := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: user.ID}); readErr == nil &&
+					current.Status == "paused" && current.HoldReason.String == "iteration_budget_exhausted" && current.StartedAt.Valid {
+					wall := int64(h.cfg.RunTimeout.Seconds())
+					if current.BudgetWallSeconds.Valid {
+						wall = int64(current.BudgetWallSeconds.Int32)
+					}
+					total := wall + int64(current.BudgetExtensionSeconds) + int64(current.BudgetFinalizeSeconds)
+					used := max(0, int64(current.StatusSince.Time.Sub(current.StartedAt.Time).Round(time.Second).Seconds())) - int64(current.BudgetPausedSeconds)
+					if total-used <= 0 {
+						httpx.Error(w, http.StatusConflict, fmt.Sprintf("this run is out of time; extend it to resume: uzi run extend %s --by 2h", runID))
+						return
+					}
 				}
 				if run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" {
 					httpx.Error(w, http.StatusConflict, fmt.Sprintf("this run is out of time; extend it to resume: uzi run extend %s --by 2h", runID))
