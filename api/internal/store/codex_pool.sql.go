@@ -66,6 +66,66 @@ func (q *Queries) CountCodexInFlightByAccount(ctx context.Context, userID uuid.U
 	return items, nil
 }
 
+const getCodexDefaultSelectionCandidate = `-- name: GetCodexDefaultSelectionCandidate :one
+SELECT
+    us.id                               AS alias_id,
+    (us.disabled_at IS NULL)::boolean   AS enabled,
+    cs.status                           AS link_status,
+    cs.provider_account_id,
+    a.provider_user_id,
+    a.workspace_account_id,
+    a.coord_state,
+    a.reauth_required,
+    t.effective_expiry                  AS throttle_effective_expiry,
+    t.spread_width_ms                   AS throttle_spread_width_ms
+FROM user_secrets us
+LEFT JOIN codex_credential_state cs
+    ON cs.user_secret_id = us.id AND cs.user_id = us.user_id
+LEFT JOIN codex_provider_account a
+    ON a.id = cs.provider_account_id AND a.user_id = us.user_id
+LEFT JOIN codex_account_admission_throttle t
+    ON t.user_id = us.user_id AND t.provider_account_id = a.id
+WHERE us.user_id = $1 AND us.kind = 'codex_auth' AND us.id = $2
+ORDER BY us.id
+`
+
+type GetCodexDefaultSelectionCandidateParams struct {
+	UserID  uuid.UUID `json:"user_id"`
+	AliasID uuid.UUID `json:"alias_id"`
+}
+
+type GetCodexDefaultSelectionCandidateRow struct {
+	AliasID                 uuid.UUID          `json:"alias_id"`
+	Enabled                 bool               `json:"enabled"`
+	LinkStatus              pgtype.Text        `json:"link_status"`
+	ProviderAccountID       pgtype.UUID        `json:"provider_account_id"`
+	ProviderUserID          pgtype.Text        `json:"provider_user_id"`
+	WorkspaceAccountID      pgtype.Text        `json:"workspace_account_id"`
+	CoordState              pgtype.Text        `json:"coord_state"`
+	ReauthRequired          pgtype.Bool        `json:"reauth_required"`
+	ThrottleEffectiveExpiry pgtype.Timestamptz `json:"throttle_effective_expiry"`
+	ThrottleSpreadWidthMs   pgtype.Int4        `json:"throttle_spread_width_ms"`
+}
+
+// Same account and throttle projection for an unpooled subscription default.
+func (q *Queries) GetCodexDefaultSelectionCandidate(ctx context.Context, arg GetCodexDefaultSelectionCandidateParams) (GetCodexDefaultSelectionCandidateRow, error) {
+	row := q.db.QueryRow(ctx, getCodexDefaultSelectionCandidate, arg.UserID, arg.AliasID)
+	var i GetCodexDefaultSelectionCandidateRow
+	err := row.Scan(
+		&i.AliasID,
+		&i.Enabled,
+		&i.LinkStatus,
+		&i.ProviderAccountID,
+		&i.ProviderUserID,
+		&i.WorkspaceAccountID,
+		&i.CoordState,
+		&i.ReauthRequired,
+		&i.ThrottleEffectiveExpiry,
+		&i.ThrottleSpreadWidthMs,
+	)
+	return i, err
+}
+
 const getUserCodexAccountMode = `-- name: GetUserCodexAccountMode :one
 SELECT codex_account_mode FROM users WHERE id = $1
 `

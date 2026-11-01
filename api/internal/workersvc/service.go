@@ -7943,13 +7943,18 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 			// PRD #1429 M2 (D1): the AUDITOR INVARIANT — runs.harness is stamped from the D11 result
 			// createRunAtomic resolved and froze inside THIS transaction, never a hardcoded literal, so
 			// the frozen row's harness equals the harness the freeze decision used.
-			Harness: string(resolved.Harness),
+			Harness:                string(resolved.Harness),
+			CapturedPlanCrossCheck: capturedCreationFlag(resolved.CreationPolicy, true),
+			CapturedCodeCrossCheck: capturedCreationFlag(resolved.CreationPolicy, false),
 			// PRD #1247 / #1429 M2: the per-run credential override columns, from the effective override
 			// resolved above (rawOverride validated against resolved.Harness, or a schedule's stored
 			// credOverride written as-is). nil ⇒ NULL/NULL ⇒ inherit the worker binding.
 			CredentialOverrideMode:     pgOverrideMode(effOverride),
 			CredentialOverrideSecretID: pgOverrideSecretID(effOverride),
 		})
+	}, harnessCreationOrigin{
+		Kind: "issue", TriggerSource: triggerSource, Explicit: explicit, Model: model,
+		AnthropicOverride: credOverride != nil || (rawOverride != nil && rawOverride.Mode != CredentialOverrideModeInherit),
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

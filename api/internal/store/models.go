@@ -1220,6 +1220,14 @@ type Run struct {
 	ForgeAdmission              []byte             `json:"forge_admission"`
 	CodexSelectReason           pgtype.Text        `json:"codex_select_reason"`
 	RecoveryWaitPhase           pgtype.Text        `json:"recovery_wait_phase"`
+	HarnessPreferred            pgtype.Text        `json:"harness_preferred"`
+	HarnessDecisionReason       pgtype.Text        `json:"harness_decision_reason"`
+	HarnessPreferredScore       pgtype.Float8      `json:"harness_preferred_score"`
+	HarnessOtherScore           pgtype.Float8      `json:"harness_other_score"`
+	HarnessPreferredMeasured    pgtype.Float8      `json:"harness_preferred_measured"`
+	HarnessOtherMeasured        pgtype.Float8      `json:"harness_other_measured"`
+	HarnessPreferredHeld        pgtype.Bool        `json:"harness_preferred_held"`
+	HarnessOtherHeld            pgtype.Bool        `json:"harness_other_held"`
 }
 
 type RunCompletionAttempt struct {
@@ -1735,6 +1743,7 @@ type User struct {
 	VaultAutoReunlock         bool               `json:"vault_auto_reunlock"`
 	VaultSlotGeneration       int64              `json:"vault_slot_generation"`
 	CodexAccountMode          string             `json:"codex_account_mode"`
+	HarnessOverflowEnabled    bool               `json:"harness_overflow_enabled"`
 }
 
 type UserCrossCheckPin struct {
