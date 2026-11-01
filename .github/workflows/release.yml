@@ -827,10 +827,12 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          bash scripts/changelog-section.sh body "$VERSION" > release-notes.md
+          bash scripts/changelog-section.sh body "$VERSION" > release-notes-source.md
+          flags=(--repository "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME")
           if [ "$HOTFIX_UNVERIFIED" = true ]; then
-            printf '\n**UNVERIFIED hotfix: this off-main release has no full CI evidence. Tagged metadata, worker-image checks and real KinD smoke passed.**\n' >> release-notes.md
+            flags+=(--unverified-hotfix)
           fi
+          python3 -I scripts/release-notes.py "${flags[@]}" < release-notes-source.md > release-notes.md
           {
             echo "title=$(bash scripts/changelog-section.sh title "$VERSION")"
           } >> "$GITHUB_OUTPUT"

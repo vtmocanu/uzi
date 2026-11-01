@@ -77,9 +77,9 @@ func FarBehind(runningVersion, latestTag, publishedAt string, now time.Time) boo
 // Security reports whether the persisted release body advertises a security fix (PRD
 // #836 D5): a line beginning with "### Security" after trimming surrounding
 // whitespace. It is deliberately tolerant of trailing text ("### Security fixes")
-// by matching the prefix rather than the exact heading, mirroring the Keep-a-Changelog
-// `### Security` subsection the release pipeline emits verbatim into each release
-// body. PURE — a plain scan of the persisted body, no egress.
+// by matching the prefix rather than the exact heading. Bounded Release presentation
+// retains this heading even when its full Keep-a-Changelog section cannot fit.
+// PURE: a plain scan of the persisted body, no egress.
 func Security(body string) bool {
 	for _, line := range strings.Split(body, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "### Security") {

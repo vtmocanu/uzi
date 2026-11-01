@@ -41,6 +41,8 @@ The first RC of `X.Y.Z` folds `[Unreleased]` into `## [X.Y.Z] - <date>`; later R
 
 The `chore(release):` commit is now exempt from the coverage oracle by its conventional message. Today's single-step cut always folds CHANGELOG, so the release commit was exempt by the touched-CHANGELOG rule; a next-candidate cut (`rc.N+1`) bumps only `Chart.yaml` and does not touch CHANGELOG, so that rule no longer covers it. Exempting `chore(release):` is principled — a release commit is a mechanical version bump, never a feature merge — and only widens exemptions.
 
+**Presentation amendment (#3752).** Selection and accumulation above remain unchanged. After selection, `scripts/release-notes.py` bounds the final GitHub Release body to 120,000 characters, including any hotfix warning. Under-budget notes remain byte-identical; oversized notes keep whole bullets, reserve the Security section or its heading, and link to the complete CHANGELOG at the tag. The raw section/delta, source CHANGELOG and coverage oracle are unchanged.
+
 ### D4 — The coverage window is "since the highest lower stable tag by version", never `git describe`
 
 `assert-changelog-covers-release.sh` derives PREV as the highest **stable** tag (`vX.Y.Z`, no prerelease) strictly below the base version, filtering stable tags first and comparing numerically. `git describe` ancestry is wrong under the train for two reasons: a promoted stable tag lives on a throwaway release branch and is **not** an ancestor of main, and a prerelease tag between releases would silently narrow an ancestry-nearest window. A hotfix tag (`vX.Y.Z` off a promoted `vX.Y.W`) does not change the next RC's window, because it shares main's merge-base (the RC commit) with the promoted stable.
