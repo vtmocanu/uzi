@@ -571,9 +571,10 @@ test("M2 committed M1 evidence adopts exact S and durably transfers immutable pr
   const successor = await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), iteration, successorAttempt, {
     admitRemediationSource: async input => {
       admissions++;
-      assert.deepEqual(input, { ...source(), branch: BRANCH, sourceTip: current, captureTip: coverage, restrictedRoots: [displaced] });
+      assert.deepEqual(input, { ...source(), branch: BRANCH, sourceTip: current, captureTip: coverage, restrictedRoots: [displaced], flaggedOIDs: [displaced] });
       assert.ok(Object.isFrozen(input));
       assert.ok(Object.isFrozen(input.restrictedRoots));
+      assert.ok(Object.isFrozen(input.flaggedOIDs));
       return true;
     },
   });

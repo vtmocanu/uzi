@@ -15483,9 +15483,10 @@ export class RunRunner {
       throw error;
     }
     if (context.barePath !== barePath || context.branch !== branch) throw new Error("owed candidate flight context changed");
+    const selected = this.remediationSource(flight);
     return { context, remotelyConfirmedSha: flight.lastCheckpointRefTip,
-      ...(flight.runnerClone?.attemptId && flight.runnerClone.path === flight.worktreePath
-        ? { producingSource: { runId: flight.runId, clonePath: flight.runnerClone.path, attemptId: flight.runnerClone.attemptId } } : {}) };
+      ...(selected.attemptId && selected.clonePath === flight.worktreePath
+        ? { producingSource: { runId: flight.runId, clonePath: selected.clonePath!, attemptId: selected.attemptId } } : {}) };
   }
 
   private owedAnnouncedFor(runId: string): OwedAnnounced {
@@ -23628,18 +23629,89 @@ export class RunRunner {
           await check();
           blocker = "adoption_failed";
           const attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
-          const successor = await this.inFlightAuthority(flight, () => this.git.prepareRecoverySuccessor(bare, branch, key, source,
-            iteration.attempts, attemptId, { checkpointWriteUnresolved: flight.checkpointClaimEvidence.writeUnresolved, checkpointKey: flight.checkpointCoordinates?.checkpoint_key ??
-              (flight.runKind === "task" ? null : undefined), selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true }),
-            { signal, timeoutMs: Math.max(1, iteration.deadline - Date.now()) });
-          expectedSource = { ...source, clonePath: successor.path, attemptId: successor.attemptId };
-          flight.runnerClone = successor;
-          flight.worktreePath = successor.path;
-          flight.attemptId = attemptId;
-          flight.predecessorCapture = false;
-          flight.publicationFloor = successor.publicationFloor ?? { kind: "unverified" };
-          flight.publishedTip = flight.publicationFloor.kind === "pinned" ? flight.publicationFloor.oid : undefined;
-          flight.checkpointFloor = flight.publishedTip;
+          let deferredRestrictions: { tip: string; findings: SecretFinding[] } | undefined;
+          let admittedSourceTip: string | undefined;
+          let successor: RunnerClone;
+          try {
+            successor = await this.inFlightAuthority(flight, async () => {
+              // Independently restore the selected predecessor before entering Git's bare lock.
+              const record = await this.restoreRemediationRestrictions(flight);
+              const snapshot = canonicalJson(flight.remediationRestrictions ?? null);
+              const assertOldFacts = (flags: readonly string[]): void => {
+                this.retainedLifecycleGuard(flight);
+                this.assertFlightSourceAdmissible(flight);
+                const selected = this.remediationSource(flight);
+                const pending = flight.remediationRestrictions?.pending;
+                if (selected.runId !== source.runId || selected.clonePath !== source.clonePath ||
+                    selected.attemptId !== source.attemptId || flight.worktreePath !== source.clonePath ||
+                    flight.barePath !== bare || flight.branch !== branch ||
+                    canonicalJson(flight.remediationRestrictions ?? null) !== snapshot ||
+                    (pending && (!record || pending.requireDenial || pending.bindingUncertain ||
+                      pending.runId !== source.runId || pending.clonePath !== source.clonePath ||
+                      pending.attemptId !== source.attemptId || pending.barePath !== bare ||
+                      pending.branch !== branch || !pending.requiredOIDs.every(q => flags.includes(q)))))
+                  throw new Error("remediation predecessor facts changed or unconfirmed");
+              };
+              assertOldFacts(record?.flaggedOIDs ?? []);
+              let admittedFlags: readonly string[] | undefined;
+              const prepared = await this.git.prepareRecoverySuccessor(bare, branch, key, source,
+                iteration.attempts, attemptId, {
+                  checkpointWriteUnresolved: flight.checkpointClaimEvidence.writeUnresolved,
+                  checkpointKey: flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : undefined),
+                  selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true,
+                  admitRemediationSource: async input => {
+                    assertOldFacts(input.flaggedOIDs);
+                    if (!record || input.runId !== source.runId || input.clonePath !== source.clonePath ||
+                        input.attemptId !== source.attemptId || input.branch !== branch ||
+                        input.sourceTip !== record.ownedTip) return false;
+                    const scan = await this.scanRemediationRange(flight, bare, branch, input.sourceTip, true);
+                    // Latch before validation or another await. Persist only after Git releases B.
+                    if (scan.trusted && scan.findings.length) {
+                      deferredRestrictions = { tip: input.sourceTip, findings: scan.findings };
+                      this.latchRemediationFindings(flight, bare, branch, scan.findings);
+                      return false;
+                    }
+                    if (!scan.trusted) return false;
+                    const roots = [...new Set([...input.restrictedRoots, ...(flight.remediationRestrictions?.roots ?? [])])];
+                    const floors = [...new Set([input.sourceTip, ...scan.floorCandidates,
+                      scan.range.excludeSha, ...(scan.range.scanFloorShas ?? [])])];
+                    // Parser-bounded roots and range/published floors; a failed proof stops adoption.
+                    // Every probe retains the existing recovery signal and deadline.
+                    for (const floor of floors)
+                      for (const root of roots)
+                        if (await this.git.ancestry(bare, root, floor) !== "divergent") return false;
+                    assertOldFacts(input.flaggedOIDs);
+                    admittedFlags = input.flaggedOIDs;
+                    admittedSourceTip = input.sourceTip;
+                    return true;
+                  },
+                });
+              // Git awaits seed and durable readback after admission. A readable ready record
+              // cannot discharge facts arriving in those waits.
+              assertOldFacts(admittedFlags ?? record?.flaggedOIDs ?? []);
+              if (record && (!admittedFlags || admittedSourceTip !== record.ownedTip))
+                throw new Error("remediation source admission unavailable");
+              const pending = flight.remediationRestrictions?.pending;
+              if (pending) {
+                pending.clonePath = prepared.path;
+                pending.attemptId = prepared.attemptId;
+              }
+              expectedSource = { ...source, clonePath: prepared.path, attemptId: prepared.attemptId };
+              flight.runnerClone = prepared;
+              flight.worktreePath = prepared.path;
+              flight.attemptId = attemptId;
+              flight.predecessorCapture = false;
+              flight.publicationFloor = prepared.publicationFloor ?? { kind: "unverified" };
+              flight.publishedTip = flight.publicationFloor.kind === "pinned" ? flight.publicationFloor.oid : undefined;
+              flight.checkpointFloor = flight.publishedTip;
+              return prepared;
+            }, { signal, timeoutMs: Math.max(1, iteration.deadline - Date.now()) });
+          } catch (error) {
+            if (deferredRestrictions)
+              await this.persistRemediationRestrictions(flight, bare, branch,
+                deferredRestrictions.tip, deferredRestrictions.findings);
+            throw error;
+          }
           const attempt = newRunAttempt(claim.run_id, claim.claim_generation, successor.path,
             () => flight.executor.recordedRootPids?.() ?? [], new Date(this.now()), attemptId);
           flight.attempt = attempt;
@@ -23668,8 +23740,22 @@ export class RunRunner {
           }
           // The (possibly new) executor is bound to the successor's epoch before it runs anything there.
           await this.bindFlightSource(flight, successor.path);
-          await this.inFlightAuthority(flight, () => this.restoreRemediationRestrictions(flight),
-            { signal, timeoutMs: Math.max(1, Math.min(CLONE_AUTHORITY_WAIT_MS, iteration.deadline - Date.now())) });
+          await this.inFlightAuthority(flight, async () => {
+            const restored = await this.restoreRemediationRestrictions(flight);
+            if (!admittedSourceTip) return;
+            const pending = flight.remediationRestrictions?.pending;
+            if (!restored || restored.ownedTip !== admittedSourceTip ||
+                restored.runId !== source.runId || restored.clonePath !== successor.path ||
+                restored.attemptId !== successor.attemptId || restored.branch !== branch ||
+                (pending && (pending.requireDenial || pending.bindingUncertain ||
+                  pending.runId !== restored.runId || pending.clonePath !== restored.clonePath ||
+                  pending.attemptId !== restored.attemptId || pending.barePath !== bare ||
+                  pending.branch !== branch || !pending.requiredOIDs.every(q => restored.flaggedOIDs.includes(q)))))
+              throw new Error("remediation successor facts unconfirmed");
+          }, { signal, timeoutMs: Math.max(1, Math.min(CLONE_AUTHORITY_WAIT_MS, iteration.deadline - Date.now())) });
+          // Close old active permission under the independently restored new binding. The exact
+          // immutable S was scanned clean; this writer creates no origin grant.
+          if (admittedSourceTip) await this.persistRemediationScan(flight, bare, branch, admittedSourceTip, []);
           flight.batcher.emit({ kind: "status", agent: "worker", payload: {
             text: "retained work verified on a fresh local attempt; predecessor sources and custody retained",
           } });

@@ -8831,9 +8831,11 @@ export class GitCache {
     const graph = await this.readMarkerWrapperGraph(barePath, tip, src);
     if (!graph) return undefined;
     const { aggregates, leaves, markerLeaves, srcMarker, lookalike, fail } = graph;
+    // A recognized coverage graph cannot establish its own content source.
+    if (!src) return fail("wrapper_source_missing");
     let divergent = false;
     const excludedRoots = new Set<string>();
-    if (src) for (const leaf of leaves) {
+    for (const leaf of leaves) {
       const relation = await this.ancestry(barePath, leaf, src);
       if (relation === "unknown") return fail("wrapper_lineage_ancestry");
       if (relation === "divergent") { divergent = true; excludedRoots.add(leaf); }
@@ -8842,7 +8844,6 @@ export class GitCache {
     if (lookalike) return fail("wrapper_lookalike");
 
     // Markers and divergent marker-free wrappers require the same full provenance proof.
-    if (!src) return fail("wrapper_source_missing");
     if (!aggregates.length) return fail("wrapper_aggregate_missing");
     const fp = aggregates[0]!.fp;
     if (aggregates.some(a => a.fp !== fp)) return fail("wrapper_fingerprint_mismatch");
@@ -8972,7 +8973,8 @@ export class GitCache {
       /** Trusted worker continuation-history scan, under the source-use transaction and bare lock.
        * Must not acquire the bare lock. Exact true admits selection only, never publication. */
       admitRemediationSource?: (input: Readonly<{ runId: string; branch: string; clonePath: string;
-        attemptId: string; sourceTip: string; captureTip: string; restrictedRoots: readonly string[] }>) => Promise<boolean> },
+        attemptId: string; sourceTip: string; captureTip: string; restrictedRoots: readonly string[];
+        flaggedOIDs: readonly string[] }>) => Promise<boolean> },
   ): Promise<RunnerClone> {
     if (!ATTEMPT_ID_RE.test(attemptId)) throw annotateRetainedSuccessorError(new Error("invalid successor attempt"), "attempt_invalid");
     return this.withLock(barePath, async () => {
@@ -9013,6 +9015,7 @@ export class GitCache {
         if (!opts?.admitRemediationSource || await opts.admitRemediationSource(Object.freeze({
           runId: expected.runId, branch, clonePath: expected.clonePath, attemptId: remediation.attemptId,
           sourceTip: remediation.ownedTip, captureTip: tip, restrictedRoots,
+          flaggedOIDs: Object.freeze([...remediation.flaggedOIDs]),
         })) !== true) throw new Error("remediation continuation scan admission required");
         // A callback cannot change the evidence or source we just authenticated.
         if (JSON.stringify(await this.remediationAdoptionUnderLock(barePath, branch, expected, recovery.restoreSource)) !== JSON.stringify(remediation))

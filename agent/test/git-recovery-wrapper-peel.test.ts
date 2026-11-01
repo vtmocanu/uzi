@@ -362,6 +362,30 @@ test("issue #3239 (k): a plain clean tip journals no peeled markers", async () =
   assert.equal(journal().peeledMarkers, undefined);
 });
 
+test("M2 unbound marker-free divergent coverage refuses before successor effects", async () => {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const s = sha("HEAD", source.clonePath);
+  const d = sibling(s, "unbound retained sibling");
+  const c = (await genuine([d, s], s)).sha;
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c);
+  const unbound = journal(); delete unbound.recovery.restoreSource; writeJournal(unbound);
+  assert.equal(journal().recovery.restoreSource, undefined);
+  await assertRefused(r.attempts, aid(2), "wrapper_source_missing");
+});
+
+test("M2 source-bound clean ancestor coverage keeps ordinary wrapper behavior", async () => {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const parent = sha("HEAD", source.clonePath);
+  const s = sibling(parent, "clean ordinary progress");
+  git(source.clonePath, ["reset", "--hard", s]);
+  await fixtureFetchTracking(cache, bare, source.clonePath, branch, runId);
+  const c = (await genuine([parent, s], s)).sha;
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, s);
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2));
+  assert.equal(sha("HEAD", successor.path), c);
+  assert.equal(sha("HEAD^{tree}", successor.path), sha(s + "^{tree}"));
+});
+
 test("issue #3239: markRecoveryCapture unions and dedups peeled markers, keeps them across a capture, and writes none when none is given", async () => {
   const a = "a".repeat(40), b = "b".repeat(40);
   assert.equal(journal().peeledMarkers, undefined, "no marker given: the field is not written");
