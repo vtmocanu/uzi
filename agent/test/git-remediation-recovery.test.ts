@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { parseRecoveryJournal as oldParse } from "./fixtures/base-parse-recovery-journal.js";
 import { createHash } from "node:crypto";
-import { GitCache, type FetchAgentBranchOptions } from "../src/git.js";
+import { GitCache, type FetchAgentBranchOptions, type PositiveOwedCandidateContext } from "../src/git.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
@@ -409,3 +409,142 @@ test("partial checkpoint rewrite and trusted rescan retain both displacement edg
   assert.deepEqual(record.edges.map(e => [e.from, e.to, e.grant.scannedTip, e.grant.id]),
     [[firstTip, partial, firstTip, 1], [partial, clean, partial, 2]]);
 });
+
+const successorAttempt = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 2, "fedcba9876543210");
+const admitSource = { admitRemediationSource: async () => true };
+async function captureAdoption(roots: string[], current: string) {
+  const coverage = await cache.buildRecoveryCoverage(bare, opts.context as PositiveOwedCandidateContext, roots, current);
+  const reservation = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, source());
+  await cache.recordRecoveryCapture(bare, BRANCH, KEY, source(), reservation.attempts, coverage.sha, current);
+  return { coverage: coverage.sha, iteration: reservation.attempts };
+}
+function pinnedRefs(): string {
+  return git(bare, "for-each-ref", "--format=%(refname) %(objectname)",
+    "refs/uzi-owed/", "refs/uzi-coverage/", "refs/uzi-recovery-episode/");
+}
+async function rewritten() {
+  const displaced = commit("displaced"); await fetch(); await enroll();
+  const replacement = commit("authorized replacement"); await fetch();
+  return { displaced, replacement };
+}
+async function refusal(iteration: number, options: Parameters<GitCache["prepareRecoverySuccessor"]>[6] = admitSource) {
+  const before = raw();
+  const pins = pinnedRefs();
+  const entries = git(bare, "config", "--get-all", "uzi-attempts." + BRANCH + ".entry");
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), iteration, successorAttempt, options));
+  assert.equal(raw(), before);
+  assert.equal(pinnedRefs(), pins);
+  assert.equal(git(bare, "config", "--get-all", "uzi-attempts." + BRANCH + ".entry"), entries);
+}
+
+test("M2 marker-free divergent wrapper without authority refuses before any effects", async () => {
+  const displaced = commit("unapproved sibling"); await fetch();
+  const current = commit("ordinary sibling"); await fetch();
+  const { iteration } = await captureAdoption([displaced, current], current);
+  await refusal(iteration);
+});
+
+test("M2 committed M1 evidence adopts exact S and durably transfers immutable provenance and pins", async () => {
+  const { displaced, replacement } = await rewritten();
+  const current = commit("ordinary progress after rewrite", replacement); await fetch();
+  const { iteration, coverage } = await captureAdoption([displaced, current], current);
+  const evidence = await cache.readRemediationRecovery(bare, BRANCH, source());
+  assert.ok(evidence);
+  const before = journal();
+  const pins = pinnedRefs();
+  const tracking = git(bare, "rev-parse", "refs/uzi-runner/" + BRANCH);
+  await refusal(iteration, {});
+  await refusal(iteration, { admitRemediationSource: async () => false });
+  let admissions = 0;
+  const successor = await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), iteration, successorAttempt, {
+    admitRemediationSource: async input => {
+      admissions++;
+      assert.deepEqual(input, { ...source(), branch: BRANCH, sourceTip: current, captureTip: coverage });
+      return true;
+    },
+  });
+  assert.equal(admissions, 1);
+  assert.equal(git(successor.path, "rev-parse", "HEAD"), current);
+  assert.equal(git(successor.path, "write-tree"), git(bare, "rev-parse", current + "^{tree}"));
+  assert.equal(git(successor.path, "status", "--porcelain"), "");
+  assert.equal(successor.adoptedSource, current);
+  assert.equal(pinnedRefs(), pins);
+  assert.equal(git(bare, "rev-parse", "refs/uzi-runner/" + BRANCH), tracking);
+  const transferred = journal();
+  assert.deepEqual(transferred.remediationRecovery, { ...evidence, clonePath: successor.path, attemptId: successorAttempt });
+  assert.deepEqual(transferred.recovery.source, before.recovery.source);
+  const next = { runId: RUN, clonePath: successor.path, attemptId: successorAttempt };
+  const restarted = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  assert.deepEqual(await restarted.readRemediationRecovery(bare, BRANCH, next), transferred.remediationRecovery);
+  await cache.completeRecoveryEpisode(bare, BRANCH, KEY, next, { settled: true, processedEvents: 1, attemptId: successorAttempt });
+  assert.deepEqual(journal().remediationRecovery, transferred.remediationRecovery);
+  assert.equal(pinnedRefs(), pins);
+  await assert.rejects(cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT));
+});
+
+test("M2 repeated authorized rewrites permit ordinary progress between replacements", async () => {
+  const { displaced, replacement } = await rewritten();
+  const q2 = commit("new finding after progress", replacement); await fetch(); await enroll();
+  const d2 = commit("later displaced tip", q2); await fetch();
+  const r2 = commit("second replacement"); await fetch();
+  const current = commit("final progress", r2); await fetch();
+  const { iteration } = await captureAdoption([displaced, replacement, d2, current], current);
+  const successor = await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), iteration, successorAttempt, admitSource);
+  assert.equal(git(successor.path, "rev-parse", "HEAD"), current);
+  assert.equal(journal().remediationRecovery.edges.length, 2);
+});
+
+test("M2 partial rewrites under one active grant reach S through ordinary progress", async () => {
+  const q = commit("finding"); await fetch(); await enroll();
+  const first = commit("first displaced", q); await fetch();
+  const partial = commit("partial replacement retaining finding", q); await fetch();
+  const second = commit("ordinary progress before second displacement", partial); await fetch();
+  const clean = commit("final replacement"); await fetch();
+  const current = commit("ordinary progress after closure", clean); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: current, flaggedOIDs: [] });
+  const evidence = await cache.readRemediationRecovery(bare, BRANCH, source());
+  assert.ok(evidence);
+  assert.deepEqual(evidence.edges.map(e => e.grant.id), [1, 1]);
+  assert.equal(evidence.active, undefined);
+  const { iteration } = await captureAdoption([q, first, partial, second, current], current);
+  const successor = await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), iteration, successorAttempt, admitSource);
+  assert.equal(git(successor.path, "rev-parse", "HEAD"), current);
+});
+
+for (const fault of ["prepared", "foreign", "unrelated leaf", "unrelated replacement", "source mismatch"] as const) {
+  test("M2 refuses " + fault + " evidence without adoption effects", async () => {
+    const { displaced, replacement } = await rewritten();
+    let roots = [displaced, replacement];
+    if (fault === "unrelated leaf") roots = [...roots, git(bare, ...IDENT, "commit-tree", base + "^{tree}", "-p", base, "-m", "unrelated")];
+    const { iteration } = await captureAdoption(roots, replacement);
+    const value = journal();
+    if (fault === "prepared") value.remediationRecovery.edges[0].phase = "prepared";
+    if (fault === "foreign") value.remediationRecovery.edges[0].grant.originSource.attemptId = successorAttempt;
+    if (fault === "unrelated replacement") value.remediationRecovery.edges[0].to = git(bare, ...IDENT, "commit-tree", base + "^{tree}", "-p", base, "-m", "unrelated replacement");
+    if (fault === "source mismatch") value.recovery.restoreSource = displaced;
+    write(value);
+    await refusal(iteration);
+  });
+}
+
+for (const lineage of [false, true]) {
+  test("M2 superseded marker requires lineage as well as displaced-parent proof: " + lineage, async () => {
+    const displaced = commit("flagged marker parent"); await fetch(); await enroll();
+    fs.writeFileSync(path.join(clone, "marker.txt"), "marker content\n");
+    git(clone, "add", "marker.txt");
+    assert.equal(await cache.commitWipMarker(clone), true);
+    const marker = git(clone, "rev-parse", "HEAD"); await fetch();
+    // Use a genuinely different clean tree, not a same-tree substitute for ancestry.
+    git(clone, "reset", "--hard", base);
+    const current = commit("clean replacement"); await fetch();
+    if (lineage) await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT, marker);
+    const { iteration } = await captureAdoption([displaced, marker, current], current);
+    if (!lineage) await refusal(iteration);
+    else {
+      const successor = await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), iteration, successorAttempt, admitSource);
+      assert.equal(git(successor.path, "rev-parse", "HEAD"), current);
+      assert.equal(git(successor.path, "write-tree"), git(bare, "rev-parse", current + "^{tree}"));
+      assert.deepEqual(journal().peeledMarkers, [marker]);
+    }
+  });
+}

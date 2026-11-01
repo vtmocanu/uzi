@@ -1973,7 +1973,9 @@ function recoveryJournalJson(journal: RecoveryJournalEntry): string {
   const { completionSourceFence, memoryPark, ...rest } = journal;
   // issue #3638: the memory-park record, when present, is re-parsed and emitted in its fixed field order at a fixed
   // position: after every other key, immediately before the fence (which stays the LAST key).
-  const canonical = rest.remediationRecovery === undefined ? rest : { ...rest, remediationRecovery: parseRemediationRecovery(rest.remediationRecovery) };
+  // Enrolled journals also canonicalize the outer source/episode key order. Capturing can add
+  // restoreTip after recovery; parsing it back must not make independently verified evidence vanish.
+  const canonical = rest.remediationRecovery === undefined ? rest : parseRecoveryJournal(JSON.stringify(rest));
   const withPark = memoryPark === undefined ? canonical : { ...canonical, memoryPark: parseMemoryPark(memoryPark) };
   if (completionSourceFence === undefined) return JSON.stringify(withPark);
   return JSON.stringify({ ...withPark, completionSourceFence: parseSourceFence(completionSourceFence) });
@@ -7041,45 +7043,49 @@ export class GitCache {
     });
   }
 
-  /** M1 query only. Re-sync plus independently supplied source, ledger, authority, pins and ownership.
-   * Prepared edges are never promoted or returned. This grants no adoption or publication permission. */
+  /** Independently confirm M1 evidence without nesting the caller's bare lock. */
+  private async readRemediationUnderLock(barePath: string, branch: string,
+    source: { runId: string; clonePath: string; attemptId: string },
+    durability: MemoryParkDurability = {}): Promise<RemediationRecovery | undefined> {
+    const stored = await this.remediationSourceUnderLock(barePath, branch, source);
+    const r = stored.journal.remediationRecovery;
+    if (!r || r.edges.some(e => e.phase !== "committed") ||
+        (await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId, r.ownedTip)).kind !== "owned" ||
+        await this.worktreeHead(source.clonePath) !== r.ownedTip) return undefined;
+    const ledger = await this.readAttemptLedger(barePath, branch);
+    for (const g of [...r.edges.map(e => e.grant), ...(r.active ? [r.active] : [])]) {
+      const original = ledger.get(g.originSource.attemptId);
+      const shape = parseAttemptPath(g.originSource.clonePath, path.resolve(this.runnerRoot));
+      if (!original || !sameRecoverySource(original, g.originSource) ||
+          shape?.attemptId !== g.originSource.attemptId) return undefined;
+      await this.requireOwedCommit(barePath, g.scannedTip);
+      for (const q of g.flaggedOIDs) {
+        await this.requireOwedCommit(barePath, q);
+        if (await this.ancestry(barePath, q, g.scannedTip) !== "ancestor") return undefined;
+      }
+    }
+    for (const e of r.edges) {
+      const context = await this.parseOwedContext(barePath, await this.readOwedFile(barePath, e.context));
+      if ("origin" in context || context.runId !== e.grant.originSource.runId || context.branch !== branch ||
+          this.contextName(context) !== e.context || !await this.hasOwedAnchorUnderLock(barePath, e.grant.originSource.runId, e.from))
+        return undefined;
+      await this.requireOwedCommit(barePath, e.to);
+      if (await this.ancestry(barePath, e.grant.scannedTip, e.from) !== "ancestor") return undefined;
+      for (const q of e.grant.flaggedOIDs)
+        if (await this.ancestry(barePath, q, e.grant.scannedTip) !== "ancestor") return undefined;
+    }
+    const canonical = recoveryJournalJson(stored.journal);
+    if (canonical !== stored.raw) return undefined;
+    await this.syncJournalAndReadBack(barePath, branch, canonical, durability);
+    return parseRemediationRecovery(r);
+  }
+
+  /** Query only: evidence grants neither clean-scan nor publication admission. */
   async readRemediationRecovery(barePath: string, branch: string,
     source: { runId: string; clonePath: string; attemptId: string },
     durability: MemoryParkDurability = {}): Promise<RemediationRecovery | undefined> {
     try {
-      return await this.withLock(barePath, async () => {
-        const stored = await this.remediationSourceUnderLock(barePath, branch, source);
-        const r = stored.journal.remediationRecovery;
-        if (!r || r.edges.some(e => e.phase !== "committed") ||
-            (await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId, r.ownedTip)).kind !== "owned" ||
-            await this.worktreeHead(source.clonePath) !== r.ownedTip) return undefined;
-        const ledger = await this.readAttemptLedger(barePath, branch);
-        for (const g of [...r.edges.map(e => e.grant), ...(r.active ? [r.active] : [])]) {
-          const original = ledger.get(g.originSource.attemptId);
-          const shape = parseAttemptPath(g.originSource.clonePath, path.resolve(this.runnerRoot));
-          if (!original || !sameRecoverySource(original, g.originSource) ||
-              shape?.attemptId !== g.originSource.attemptId) return undefined;
-          await this.requireOwedCommit(barePath, g.scannedTip);
-          for (const q of g.flaggedOIDs) {
-            await this.requireOwedCommit(barePath, q);
-            if (await this.ancestry(barePath, q, g.scannedTip) !== "ancestor") return undefined;
-          }
-        }
-        for (const e of r.edges) {
-          const context = await this.parseOwedContext(barePath, await this.readOwedFile(barePath, e.context));
-          if ("origin" in context || context.runId !== e.grant.originSource.runId || context.branch !== branch ||
-              this.contextName(context) !== e.context || !await this.hasOwedAnchorUnderLock(barePath, e.grant.originSource.runId, e.from))
-            return undefined;
-          await this.requireOwedCommit(barePath, e.to);
-          if (await this.ancestry(barePath, e.grant.scannedTip, e.from) !== "ancestor") return undefined;
-          for (const q of e.grant.flaggedOIDs)
-            if (await this.ancestry(barePath, q, e.grant.scannedTip) !== "ancestor") return undefined;
-        }
-        const canonical = recoveryJournalJson(stored.journal);
-        if (canonical !== stored.raw) return undefined;
-        await this.syncJournalAndReadBack(barePath, branch, canonical, durability);
-        return parseRemediationRecovery(r);
-      });
+      return await this.withLock(barePath, () => this.readRemediationUnderLock(barePath, branch, source, durability));
     } catch { return undefined; }
   }
 
@@ -8578,9 +8584,10 @@ export class GitCache {
   /**
    * issue #3239: decide what a retained-recovery successor may adopt when the episode restore tip is a
    * recovery-coverage wrapper that may carry a `wip(park):` marker. Returns undefined for the
-   * unchanged shapes (the tip itself is a marker, or neither the source nor any wrapper leaf is one),
+   * unchanged ordinary ancestor-only shapes (or when the tip itself is a marker),
    * which keep the plain adoption of the tip. Otherwise the wrapper must be provably the worker's own
-   * coverage of the journaled source, and the successor adopts the SOURCE (a marker is then peeled by
+   * coverage of the journaled source. Divergent leaves need independently verified remediation
+   * evidence. The successor adopts the SOURCE (a marker is then peeled by
    * the seed's `reset --soft`, so neither marker nor wrapper enters history); any failed proof throws
    * `successor recovery verification failed`, before a ledger entry or clone exists.
    *
@@ -8599,14 +8606,21 @@ export class GitCache {
    */
   private async resolveMarkerWrapperAdoption(
     barePath: string, journal: RecoveryJournalEntry, tip: string, src: string | undefined,
+    remediation?: RemediationRecovery,
   ): Promise<{ seedTip: string; expectedHead: string; expectedTree: string; peeledMarkers: string[] } | undefined> {
     const graph = await this.readMarkerWrapperGraph(barePath, tip, src);
     if (!graph) return undefined;
     const { aggregates, leaves, markerLeaves, srcMarker, lookalike, fail } = graph;
-    if (!srcMarker && markerLeaves.size === 0) return undefined;
+    let divergent = false;
+    if (src) for (const leaf of leaves) {
+      const relation = await this.ancestry(barePath, leaf, src);
+      if (relation === "unknown") return fail("wrapper_lineage_ancestry");
+      if (relation === "divergent") divergent = true;
+    }
+    if (!srcMarker && markerLeaves.size === 0 && !divergent && !remediation) return undefined;
     if (lookalike) return fail("wrapper_lookalike");
 
-    // From here the shape involves a marker: everything below is a hard requirement.
+    // Markers and divergent marker-free wrappers require the same full provenance proof.
     if (!src) return fail("wrapper_source_missing");
     if (!aggregates.length) return fail("wrapper_aggregate_missing");
     const fp = aggregates[0]!.fp;
@@ -8653,12 +8667,26 @@ export class GitCache {
     // Leaves: the source, history of the source, or a marker this attempt's lineage proves superseded.
     const lineage = new Set(journal.peeledMarkers ?? []);
     const accepted: string[] = [];
+    const eligible = async (oid: string): Promise<boolean> => {
+      const relation = await this.ancestry(barePath, oid, src);
+      if (relation === "unknown") return fail("wrapper_lineage_ancestry");
+      if (relation === "ancestor") return true;
+      // At most 64 authenticated edges, with a Git command deadline per ancestry query.
+      // Unknown proof refuses all adoption, rather than skipping a sibling leaf.
+      for (const edge of remediation?.edges ?? []) {
+        const displaced = await this.ancestry(barePath, oid, edge.from);
+        if (displaced === "unknown") return fail("wrapper_lineage_ancestry");
+        if (displaced === "ancestor") return true;
+      }
+      return false;
+    };
     for (const leaf of sortedLeaves) {
-      if (leaf === src || await this.isAncestor(barePath, leaf, src)) continue;
-      if (!markerLeaves.has(leaf)) return fail("wrapper_lineage_marker");
-      if (!lineage.has(leaf)) return fail("wrapper_lineage_membership");
-      if (!await this.isAncestor(barePath, await sha1Of(`${leaf}^`, "wrapper_marker_parent"), src)) return fail("wrapper_lineage_ancestry");
-      accepted.push(leaf);
+      if (leaf === src) continue;
+      if (markerLeaves.has(leaf)) {
+        if (!lineage.has(leaf)) return fail("wrapper_lineage_membership");
+        if (!await eligible(await sha1Of(`${leaf}^`, "wrapper_marker_parent"))) return fail("wrapper_lineage_ancestry");
+        accepted.push(leaf);
+      } else if (!await eligible(leaf)) return fail("wrapper_lineage_marker");
     }
     if (srcMarker) {
       return { seedTip: src, expectedHead: await sha1Of(`${src}^`, "wrapper_source_parent"), expectedTree: srcTree,
@@ -8667,13 +8695,59 @@ export class GitCache {
     return { seedTip: src, expectedHead: src, expectedTree: srcTree, peeledMarkers: unionPeeledMarkers(accepted) };
   }
 
+  /** Source selection only. Every authenticated edge must reach exactly S, allowing ordinary
+   * progress to a later independently authorized displacement. At most 64 recursive edges and
+   * 64 squared ancestry probes; each Git probe has its normal deadline. Any uncertainty blocks
+   * the entire adoption and leaves the journal, pins and predecessor intact. */
+  private async remediationAdoptionUnderLock(barePath: string, branch: string, expected: RecoverySource,
+    src: string | undefined): Promise<RemediationRecovery> {
+    if (!expected.attemptId || !src) throw new Error("remediation adoption source unavailable");
+    const record = await this.readRemediationUnderLock(barePath, branch, { ...expected, attemptId: expected.attemptId });
+    if (!record || record.ownedTip !== src) throw new Error("remediation adoption source unverified");
+    for (const oid of [...record.flaggedOIDs, ...record.edges.map(e => e.from)]) {
+      if (await this.ancestry(barePath, oid, src) !== "divergent")
+        throw new Error("remediation adoption source still restricted");
+    }
+    const reached = new Set<number>();
+    const refused = new Set<number>();
+    const reaches = async (index: number, visiting: Set<number>): Promise<boolean> => {
+      if (reached.has(index)) return true;
+      if (refused.has(index)) return false;
+      if (visiting.has(index) || visiting.size >= 64) return false;
+      const edge = record.edges[index]!;
+      const relation = await this.ancestry(barePath, edge.to, src);
+      if (relation === "unknown") throw new Error("remediation replacement ancestry unknown");
+      if (relation === "ancestor") { reached.add(index); return true; }
+      const next = new Set(visiting).add(index);
+      for (let i = 0; i < record.edges.length; i++) {
+        const later = record.edges[i]!;
+        // Edges append in worker-observed import order. One still-active grant can
+        // cover several partial rewrites; grant identity need not increase per edge.
+        if (i <= index) continue;
+        const progress = await this.ancestry(barePath, edge.to, later.from);
+        if (progress === "unknown") throw new Error("remediation replacement ancestry unknown");
+        if (progress === "ancestor" && await reaches(i, next)) { reached.add(index); return true; }
+      }
+      refused.add(index);
+      return false;
+    };
+    for (let i = 0; i < record.edges.length; i++) {
+      if (!await reaches(i, new Set())) throw new Error("remediation replacement does not reach source");
+    }
+    return record;
+  }
+
   /** Fresh successor, local-only under one bare lock. Never executes in a predecessor.
    * Adopting + successor identity land before clone creation; failure leaves that evidence.
    * Ready and attribution handoff land in ONE config write only after tip/tree/history checks.
    * This return value is usable only by the current caller, never by rediscovery after reclaim. */
   async prepareRecoverySuccessor(
     barePath: string, branch: string, key: string, expected: RecoverySource, iteration: number,
-    attemptId: string, opts?: { selfContained?: boolean; checkpointKey?: string | null; checkpointWriteUnresolved?: boolean },
+    attemptId: string, opts?: { selfContained?: boolean; checkpointKey?: string | null; checkpointWriteUnresolved?: boolean;
+      /** Trusted worker continuation-history scan, under the source-use transaction and bare lock.
+       * Must not acquire the bare lock. Exact true admits selection only, never publication. */
+      admitRemediationSource?: (input: Readonly<{ runId: string; branch: string; clonePath: string;
+        attemptId: string; sourceTip: string; captureTip: string }>) => Promise<boolean> },
   ): Promise<RunnerClone> {
     if (!ATTEMPT_ID_RE.test(attemptId)) throw annotateRetainedSuccessorError(new Error("invalid successor attempt"), "attempt_invalid");
     return this.withLock(barePath, async () => {
@@ -8685,12 +8759,27 @@ export class GitCache {
       if (!recovery || recovery.stage !== "captured" || recovery.attempts !== iteration ||
           !recovery.restoreTip || !await this.recoveryClockCurrent(barePath, branch, journal)) throw annotateRetainedSuccessorError(new Error("successor iteration is not current"), "iteration_before");
       // The successor journal below is a fresh object that deliberately omits the fence.
-      this.refuseFenceDrop(journal, "adopt successor");
+      // Evidence is independently authenticated before allowing this one rebind. Fence rules remain.
+      const remediation = journal.remediationRecovery
+        ? await this.remediationAdoptionUnderLock(barePath, branch, expected, recovery.restoreSource) : undefined;
+      if (!remediation) this.refuseFenceDrop(journal, "adopt successor");
+      else if (this.dropsFence(journal)) throw new CompletionSourceFenceError("adopt successor: completion source fence");
       const tip = recovery.restoreTip;
       const pin = `refs/uzi-recovery-episode/${journal.runId}/${tip}`;
       if ((await this.runGit(barePath, ["rev-parse", "--verify", pin])).trim() !== tip) throw annotateRetainedSuccessorError(new Error("recovery pin changed"), "episode_pin_changed");
       // issue #3239: before any write, so a refusal leaves no ledger entry, journal change or clone.
-      const wrapped = await this.resolveMarkerWrapperAdoption(barePath, journal, tip, recovery.restoreSource);
+      const wrapped = await this.resolveMarkerWrapperAdoption(barePath, journal, tip, recovery.restoreSource, remediation);
+      if (remediation) {
+        if ((!wrapped && tip !== remediation.ownedTip) || wrapped?.expectedHead !== wrapped?.seedTip)
+          throw new Error("remediation adoption requires exact clean source");
+        if (!opts?.admitRemediationSource || await opts.admitRemediationSource(Object.freeze({
+          runId: expected.runId, branch, clonePath: expected.clonePath, attemptId: remediation.attemptId,
+          sourceTip: remediation.ownedTip, captureTip: tip,
+        })) !== true) throw new Error("remediation continuation scan admission required");
+        // A callback cannot change the evidence or source we just authenticated.
+        if (JSON.stringify(await this.remediationAdoptionUnderLock(barePath, branch, expected, recovery.restoreSource)) !== JSON.stringify(remediation))
+          throw new Error("remediation evidence changed during admission");
+      }
       const clonePath = attemptClonePath(this.runnerClonePath(barePath, key), attemptId);
       if (await this.pathPresent(clonePath) || (await this.readAttemptLedger(barePath, branch)).has(attemptId)) throw annotateRetainedSuccessorError(new Error("successor identity already used"), "identity_used");
       const successor: RecoverySource = { runId: journal.runId, clonePath, attemptId, restoreTip: tip };
@@ -8735,7 +8824,9 @@ export class GitCache {
       if (!await this.recoveryClockCurrent(barePath, branch, { ...journal, retainedSources,
         recovery: { ...recovery, successor, stage: "adopting" } })) throw annotateRetainedSuccessorError(new Error("successor iteration is not current"), "iteration_after");
       if (owner) await this.writeRecoveryOwner(barePath, { ...owner, successor });
-      await this.writeRecovery(barePath, branch, { ...successor, retainedSources,
+      const readyJournal: RecoveryJournalEntry = { ...successor, retainedSources,
+        ...(remediation ? { remediationRecovery: parseRemediationRecovery({ ...remediation,
+          runId: successor.runId, clonePath: successor.clonePath, attemptId }) } : {}),
         // issue #3239: the lineage of what this seed peeled: the wrapper's accepted markers, or the tip
         // itself when the tip is the marker the seed's `reset --soft` removed from history.
         ...(wrapped ? (wrapped.peeledMarkers.length ? { peeledMarkers: wrapped.peeledMarkers } : {})
@@ -8743,7 +8834,27 @@ export class GitCache {
         // issue #3404 M2: this fresh object does not spread `journal` and is deliberately NOT given its
         // fence: the successor is a different source (new path and attempt), and a predecessor's fence
         // would make the successor's own installCompletionSourceFence refuse as "a different fence".
-        recovery: { ...recovery, successor, stage: "ready-for-model" } });
+        recovery: { ...recovery, successor, stage: "ready-for-model" } };
+      if (remediation) {
+        // The only verified rebind: ordinary writeRecovery still rejects attribution changes.
+        // No tracking ref or ownership receipt is created or rebound here.
+        const beforeTransfer = await this.readRecoveryCapture(barePath, branch);
+        if (!beforeTransfer || !sameRecoverySource(beforeTransfer, journal) ||
+            JSON.stringify(beforeTransfer.remediationRecovery) !== JSON.stringify(remediation) ||
+            beforeTransfer.recovery?.stage !== "adopting" ||
+            !sameRecoverySource(beforeTransfer.recovery.successor!, successor))
+          throw new Error("remediation transfer journal changed");
+        await this.remediationAdoptionUnderLock(barePath, branch, expected, recovery.restoreSource);
+        if (await this.worktreeHead(clonePath) !== remediation.ownedTip ||
+            (await this.runGitAsRunner(clonePath, ["rev-parse", "HEAD^{tree}"])).trim() !== expectedTree)
+          throw new Error("remediation successor source changed");
+        const peeled = unionPeeledMarkers(journal.peeledMarkers, readyJournal.peeledMarkers);
+        if (peeled.length) readyJournal.peeledMarkers = peeled;
+        const canonical = recoveryJournalJson(readyJournal);
+        parseRecoveryJournal(canonical);
+        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), canonical]);
+        await this.syncJournalAndReadBack(barePath, branch, canonical, {});
+      } else await this.writeRecovery(barePath, branch, readyJournal);
       if (owner) {
         const ready = await this.readRecoveryCapture(barePath, branch);
         if (!ready || ready.recovery?.stage !== "ready-for-model" ||
