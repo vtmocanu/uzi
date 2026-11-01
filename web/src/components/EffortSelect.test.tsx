@@ -12,7 +12,7 @@ function Harness({ initial }: { initial: string }) {
   const [effort, setEffort] = useState(initial);
   return (
     <>
-      <EffortSelect value={effort} onChange={setEffort} />
+      <EffortSelect value={effort} onChange={setEffort} defaultLabel="Default · test" />
       <output data-testid="effort">{effort}</output>
     </>
   );
@@ -38,7 +38,7 @@ describe("EffortSelect", () => {
     render(<Harness initial="" />);
     const labels = Array.from(combo().options).map((o) => o.text);
     expect(labels).toEqual([
-      "Inherit (uzi default: medium)",
+      "Default · test",
       "low",
       "medium (uzi default)",
       "high",
@@ -50,12 +50,12 @@ describe("EffortSelect", () => {
   // PRD #3247: the preference-only runtime token is offered ONLY when the caller passes
   // runtimeLabel (the ordinary worker cards); it sits right after Inherit.
   it("offers the Runtime default option only when runtimeLabel is passed, after Inherit", () => {
-    const { unmount } = render(<EffortSelect value="" onChange={() => {}} />);
+    const { unmount } = render(<EffortSelect value="" onChange={() => {}} defaultLabel="Default · test" />);
     expect(Array.from(combo().options).map((o) => o.value)).not.toContain("runtime");
     unmount();
-    render(<EffortSelect value="" onChange={() => {}} runtimeLabel="Runtime default · Codex decides" />);
+    render(<EffortSelect value="" onChange={() => {}} defaultLabel="Default · test" runtimeLabel="Runtime default · Codex decides" />);
     expect(Array.from(combo().options).map((o) => [o.value, o.text])).toEqual([
-      ["", "Inherit (uzi default: medium)"],
+      ["", "Default · test"],
       ["runtime", "Runtime default · Codex decides"],
       ["low", "low"],
       ["medium", "medium (uzi default)"],

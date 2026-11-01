@@ -1587,6 +1587,23 @@ describe("the per-schedule harness picker (PRD #1429 M4a)", () => {
     const modelSelect = screen.getByLabelText("Model (optional)") as HTMLSelectElement;
     expect(within(modelSelect).getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
     expect(within(modelSelect).queryByRole("option", { name: "opus" })).toBeNull();
+    expect(modelSelect.options[0]?.text).toBe("Default · your Codex worker model");
+  });
+
+  it("labels the model Default by the effective harness (#3255)", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken(), codexKey()] });
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={schedFixture()} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    const picker = (await screen.findByLabelText("Harness for this schedule")) as HTMLSelectElement;
+    const modelSelect = screen.getByLabelText("Model (optional)") as HTMLSelectElement;
+    expect(modelSelect.options[0]?.text).toBe("Default · your worker model");
+    fireEvent.change(picker, { target: { value: "claude" } });
+    expect(modelSelect.options[0]?.text).toBe("Default · your Claude worker model");
+    fireEvent.change(picker, { target: { value: "codex" } });
+    expect(modelSelect.options[0]?.text).toBe("Default · your Codex worker model");
   });
 });
 

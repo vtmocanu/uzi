@@ -1410,6 +1410,32 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     expect(mockApi.putMySettings).toHaveBeenNthCalledWith(2, patch);
   });
 
+  it("Default options name their actual source and never echo a saved pin (#3255)", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    const base = settings();
+    mockApi.getMySettings.mockResolvedValue({
+      settings: {
+        ...base.settings,
+        default_claude_model: "sonnet",
+        cross_check_pins: [
+          { stage: "plan", harness: "claude", model: null, effort: null, worker_default_model: "sonnet", resolved_model: "sonnet",
+            resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: false },
+        ],
+      },
+    });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    const optionTexts = (el: HTMLElement) => Array.from((el as HTMLSelectElement).options).map((o) => o.text);
+    const claude = await screen.findByLabelText("Claude model");
+    expect(optionTexts(claude)[0]).toBe("Default · lead template");
+    expect(optionTexts(claude).join("|")).not.toMatch(/Default[^|]*sonnet/);
+    expect(optionTexts(screen.getByLabelText("Codex model"))[0]).toBe("Default · gpt-6.1-sol (built-in)");
+    expect(optionTexts(screen.getByLabelText("Summary model"))[0]).toBe("Default · instance default");
+    expect(optionTexts(screen.getByLabelText("Claude effort"))[0]).toBe("Default · medium (built-in)");
+    expect(optionTexts(screen.getByLabelText("Codex effort"))[0]).toBe("Default · medium (built-in)");
+    expect(optionTexts(screen.getByLabelText("Default harness"))[0]).toBe("Default · automatic");
+  });
+
   it("both usable: shows the harness selector, both lanes, and the badge on the effective (Claude) lane", async () => {
     mockAuth(baseUser);
     mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });

@@ -15,8 +15,10 @@ import { ModelSelect } from "./ModelSelect";
 import {
   frontmatterFieldWarning,
   KNOWN_TOOLS,
+  isLeadTemplateName,
   looseSecretWarning,
   modelFieldWarning,
+  templateModelDefaultLabel,
   renderSubagent,
   splitToolInput,
   toolsSummary,
@@ -219,8 +221,18 @@ export const AgentTemplateEditor = forwardRef<
 
       <div className="space-y-2">
         <Field label="Model" htmlFor="template-model">
-          <ModelSelect id="template-model" value={model} onChange={setModel} />
+          <ModelSelect
+            id="template-model"
+            value={model}
+            onChange={setModel}
+            defaultLabel={templateModelDefaultLabel(name)}
+          />
         </Field>
+        {isLeadTemplateName(name) && (
+          <p className="text-xs text-faint">
+            A user's worker model (Settings → Run defaults) overrides this for their own runs.
+          </p>
+        )}
         {modelWarning && <Alert message={modelWarning} tone="warning" />}
       </div>
 
@@ -390,9 +402,9 @@ function BuiltinDiff({
 
       {changed.includes("model") && (
         <DiffField label="Model">
-          <span className="text-ok">{shipped.model ?? "inherit"}</span>
+          <span className="text-ok">{shipped.model ?? templateModelDefaultLabel(shipped.name)}</span>
           <span className="text-faint"> → </span>
-          <span className="text-danger">{current.model ?? "inherit"}</span>
+          <span className="text-danger">{current.model ?? templateModelDefaultLabel(shipped.name)}</span>
         </DiffField>
       )}
 

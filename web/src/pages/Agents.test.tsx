@@ -92,6 +92,30 @@ describe("Agents page always-visible agent-templates guide link (PRD #57 M3)", (
   });
 });
 
+describe("Agents page unset model label (#3255)", () => {
+  it("shows what an unset model resolves to for the lead and for a subagent", async () => {
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    mockApi.listAgentTemplates.mockResolvedValue({
+      templates: [
+        tmpl({ id: "b-lead", name: "lead", scope: "builtin" }),
+        tmpl({ id: "b-coder", name: "coder", scope: "builtin" }),
+      ],
+    });
+    mockApi.getTemplateAllocations.mockResolvedValue({
+      templates: [
+        alloc({ id: "b-lead", name: "lead", scope: "builtin" }),
+        alloc({ id: "b-coder", name: "coder", scope: "builtin" }),
+      ],
+    });
+    render(<MemoryRouter><Agents /></MemoryRouter>);
+    const leadRow = (await screen.findByRole("link", { name: "lead" })).closest("tr")!;
+    expect(within(leadRow).getByText("Default · SDK/account default (built-in)")).toBeTruthy();
+    const coderRow = screen.getByRole("link", { name: "coder" }).closest("tr")!;
+    expect(within(coderRow).getByText("Default · lead's model")).toBeTruthy();
+    expect(screen.queryByText("inherit")).toBeNull();
+  });
+});
+
 describe("Agents page shadowed hint (PRD #18 M7/M8)", () => {
   it("badges a user template whose name collides with a builtin, not a unique one", async () => {
     mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
