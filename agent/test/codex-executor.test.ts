@@ -8158,6 +8158,31 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
       assert.equal(epoch.transport.requests.filter(r => r.method === "turn/start").length, 0);
   });
 
+  for (const kind of ["deferred", "accepted"] as const)
+    it(`a fresh Codex claim honors persisted owner ${kind} scope without restoring the original contract`, async () => {
+      let count = 0;
+      const rig = makeRig({ responder: epochResponder("reclaimed-scope", "tn-recheck", (t, th, tn) => {
+        t.push(agentMessage("rechecking scope", th));
+        if (++count === 2) t.push(toolCall(99, "signal_done", {}, th, tn, "c-done"));
+        t.push(turnCompleted("completed", th, tn));
+      }) });
+      const scope = kind === "deferred" ? { deferred: [{ milestone_id: "m2", title: "OLD-CLAIM-CODEX-MILESTONE", reason: "owner deferred" }] }
+        : { accepted: [{ id: "m2.c1", milestone_id: "m2", text: "old criterion", reason: "owner accepted" }] };
+      const { ctx } = makeCtx({ planApproved: true, sessionId: "reclaimed-scope", kind: "issue",
+        approvedPlan: "OLD-CLAIM-CODEX-PLAN", frozenMilestones: [{ id: "m2", title: "OLD-CLAIM-CODEX-MILESTONE" }],
+        repeatApprovedPlan: true, completionInterlock: true, config: { completion_scope: scope },
+        recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 2 }), checkpoint: async () => {},
+      });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "persisted owner scope");
+      const requests = rig.transport.requests.filter(r => r.method === "turn/start");
+      assert.equal(requests.length, 2);
+      for (const request of requests) {
+        const prompt = (request.params as { input: { text: string }[] }).input[0]!.text;
+        assert.doesNotMatch(prompt, /OLD-CLAIM-CODEX-PLAN|approved_milestone_contract/);
+        assert.match(prompt, /OLD-CLAIM-CODEX-MILESTONE/, "the existing milestone-status note is unchanged");
+      }
+    });
+
   it("an ordinary Codex pre-approved session keeps its existing prompt", async () => {
     const rig = makeRig({ responder: epochResponder("ordinary-session", "tn-implement", (t, th, tn) => {
       t.push(toolCall(99, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
@@ -13283,6 +13308,79 @@ describe("Codex completion interlock", () => {
   });
 
   const quietEpoch = (n: number): Responder => resumedEpochResponder("th-1", `tn-${n}`, () => {});
+
+  for (const mode of ["checked", "enrolled", "ordinary", "seeded"] as const) for (const rejected of [false, true])
+    it(`owner completion scope survives later Codex turns (${mode}, rejected=${rejected})`, async (t) => {
+      const plan = "ORIGINAL-REVOKED-CODEX-PLAN";
+      const milestones = [{ id: "m2", title: "ORIGINAL-DEFERRED-CODEX-MILESTONE" }];
+      const planning = epochResponder("th-scope", "tn-plan", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: plan, milestones }, th, tn, "plan"))
+          .push(turnCompleted("completed", th, tn));
+      });
+      const first = epochResponder("th-scope", "tn-first", (t, th, tn) => {
+        t.push(toolCall(2, "signal_done", { owner_decision_requested: { reason: "Need scope decision" } }, th, tn, "request"))
+          .push(turnCompleted("completed", th, tn));
+      });
+      const later: Responder = call => {
+        if (call.method === "thread/start" || call.method === "thread/resume") return { thread: { id: "th-scope" } };
+        if (call.method !== "turn/start") return {};
+        const tn = `tn-later-${call.turnStartCount}`;
+        if (call.turnStartCount === 1) call.transport.push(threadStarted("th-scope"));
+        call.transport.push(agentMessage(`reviewing scope ${call.turnStartCount}`, "th-scope"));
+        if (call.turnStartCount >= 3) call.transport.push(toolCall(3, "signal_done", {}, "th-scope", tn, "done"));
+        call.transport.push(turnCompleted("completed", "th-scope", tn));
+        return { turn: { id: tn } };
+      };
+      const rig = makeMultiEpochRig(mode === "checked" ? [planning, first, later] : [first, later]);
+      const last = rig.epochs.at(-1)!;
+      if (rejected) last.transport.requestOverride = call => call.method === "thread/resume"
+        ? Promise.reject(new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" }))
+        : undefined;
+      let attempts = 0;
+      let answered = false;
+      let pulled = false;
+      let remediated = false;
+      const included: number[] = [];
+      const { ctx, emitted } = makeCtx({ kind: "issue", interactive: false, completionInterlock: true,
+        planApproved: mode !== "checked", approvedPlan: mode === "checked" ? undefined : plan,
+        seeded: mode === "seeded", repeatApprovedPlan: mode === "enrolled", frozenMilestones: milestones,
+        claimGeneration: 7, config: { max_iterations: 10 }, checkpoint: async () => {},
+        recordCompletionAttempt: async () => ({ unmet: ++attempts === 1 ? ["m2"] : [], attemptCount: attempts }),
+        askCompletionQuestion: async () => { answered = true; return { outcome: "continue", guidance: "OWNER-SCOPE-CODEX" }; },
+        secretRemediationGate: async () => {
+          if (answered && !remediated) { remediated = true; return { action: "remediate", followUp: "NEW-WORKER-REPAIR" }; }
+          return { action: "proceed" };
+        },
+        pullFollowUps: () => answered && !pulled ? (pulled = true, [{ id: 44, body: "NEW-OWNER-CODEX-INPUT" }]) : [],
+        followUpIncluded: id => included.push(id),
+        gatePlan: async () => ({ kind: "approve", approval: "cross_check", selection: { status: "absent" },
+          canonical: { plan, milestones, candidate_digest: "a".repeat(64), claimGeneration: 7 } }),
+      });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "owner-adjusted Codex scope");
+      assert.equal(attempts, 2);
+      const requests = last.transport.requests.filter(r => r.method === "turn/start");
+      assert.equal(requests.length, 4, "reach the second ordinary turn and a worker remediation after the owner's answer");
+      for (const request of requests) {
+        const prompt = (request.params as { input: { text: string }[] }).input[0]!.text;
+        if (mode === "checked" || mode === "enrolled") assert.doesNotMatch(prompt, /ORIGINAL-REVOKED-CODEX-PLAN|approved_milestone_contract/);
+      }
+      const prompts = requests.map(request => (request.params as { input: { text: string }[] }).input[0]!.text);
+      assert.match(prompts[1]!, /ORIGINAL-DEFERRED-CODEX-MILESTONE/, "the pre-existing milestone-status note stays unchanged");
+      if (mode === "ordinary" || mode === "seeded") {
+        assert.match(prompts[1]!, /ORIGINAL-REVOKED-CODEX-PLAN/, "the ordinary/seeded plan rendering is unchanged");
+        t.diagnostic("ordinary-codex-prompt-hashes " + mode + " " + rejected + " " + JSON.stringify(prompts.map(prompt =>
+          createHash("sha256").update(prompt.replace(/(follow_up|owner_guidance|issue_context|issue_comments)_[a-f0-9]+/g, "$1_NONCE")).digest("hex"))));
+      }
+      assert.ok(JSON.stringify(requests[0]!.params).includes("OWNER-SCOPE-CODEX"));
+      assert.ok(JSON.stringify(requests[1]!.params).includes("NEW-OWNER-CODEX-INPUT"));
+      assert.deepEqual(included, [44]);
+      assert.ok(JSON.stringify(requests[3]!.params).includes("NEW-WORKER-REPAIR"), "worker remediation is preserved alongside the owner scope");
+      if (rejected) {
+        assert.ok(last.transport.requests.some(r => r.method === "thread/resume"));
+        assert.ok(last.transport.requests.some(r => r.method === "thread/start"));
+        assert.ok(emitted.some(m => m.payload.event === "resume_lineage_break"));
+      }
+    });
 
   it("issue3089 Codex completion recheck retains owner input until an ordinary turn", async () => {
     const first = epochResponder("th-1", "tn-1", (t, th, tn) => {

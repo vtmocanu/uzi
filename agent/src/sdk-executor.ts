@@ -153,6 +153,7 @@ import {
   updateCompletionStreak,
   routeCompletionHold,
   buildCompletionReworkFollowUp,
+  hasClaimedOwnerCompletionScope,
 } from "./completion-attempt.js";
 
 // Fallbacks used only when the claim omits `config`. Wire units are SECONDS
@@ -880,6 +881,8 @@ interface DriveState {
   /** A human approved a presented canonical bundle; checker approval remains false. */
   humanCanonicalPlan?: boolean;
   checkedFindings?: PlanCrossCheckFindings | null;
+  /** Once owner scope changes, the repeated approved contract stays suppressed through restarts. */
+  approvedContractSuperseded?: boolean;
   /** Issue #3178: the plan gate approved (non-cross_check) while NO session exists to carry the
    *  plan (post-gate `resumeId` undefined), e.g. a re-presented stored plan after the SDK
    *  session was dropped. The first implement turn then opens a fresh session, so the approved
@@ -2968,10 +2971,12 @@ export class SdkExecutor implements Executor {
       // Repeat the checked server contract on every implement attempt: an interrupted
       // first attempt may not have delivered it to the model or updated the old session.
       // Serialize the entire approved list, including nested values and explicit [].
-      // Every enrolled implementation repeats its final approved contract, including a
+      // Until an owner completion decision supersedes it, repeat the enrolled contract, including a
       // human approval arriving after reclaim at an open gate with a surviving draft session.
       // Missing frozen milestones remain unknown (null), never an inferred empty list.
-      const checkedContext = drive.checkedPlan || drive.humanCanonicalPlan || ctx.repeatApprovedPlan === true
+      const repeatingContract = drive.checkedPlan || drive.humanCanonicalPlan || ctx.repeatApprovedPlan === true;
+      if (repeatingContract && hasClaimedOwnerCompletionScope(ctx)) drive.approvedContractSuperseded = true;
+      const checkedContext = repeatingContract
         ? checkedImplementationContext(approvedPlan, frozenMilestones ?? null) + renderPlanApprovalAdvice(drive.checkedFindings) : "";
       const seededPlanBody = embedSeededPlan({
         preApproved,
@@ -3312,6 +3317,7 @@ export class SdkExecutor implements Executor {
         // in its slot for the next ordinary turn.
         const reworkForTurn = completionRework;
         completionRework = undefined;
+        if (repeatingContract && reworkForTurn?.answered) drive.approvedContractSuperseded = true;
         if (followUp === undefined && !reworkForTurn) ownerBatch ??= fillOwnerBatch(queuedOwner, ctx);
         const ownerRides = followUp === undefined && !reworkForTurn ? ownerBatch : undefined;
         const ownerFirstEvent = ownerRides
@@ -3404,7 +3410,7 @@ export class SdkExecutor implements Executor {
           implementConfig,
           "implement",
           resumeId,
-          (reworkForTurn?.answered ? "" : checkedContext) + buildImplementPrompt({
+          (reworkForTurn?.answered || drive.approvedContractSuperseded ? "" : checkedContext) + buildImplementPrompt({
             branch: ctx.branch,
             subagentNames: selectedNames,
             // PRD #266 M1: the implement roster's OWN capability map (selectedCanWrite),

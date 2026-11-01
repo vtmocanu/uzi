@@ -102,6 +102,7 @@ import {
   updateCompletionStreak,
   routeCompletionHold,
   buildCompletionReworkFollowUp,
+  hasClaimedOwnerCompletionScope,
 } from "../completion-attempt.js";
 import { makeMemoryToolHandlers, memoryToolNames, type MemoryToolHandlers } from "../memory-tools.js";
 import { makeFindingsToolHandlers, reportIncidentalIssueToolName, type FindingsToolHandlers } from "../findings-tools.js";
@@ -4267,6 +4268,8 @@ export class CodexExecutor implements Executor {
       let completionStallStreak = 0;
       let completionFollowUp: string | undefined;
       let completionAnswered = false;
+      const repeatingContract = checkedPlan || humanCanonicalPlan || ctx.repeatApprovedPlan === true;
+      let approvedContractSuperseded = repeatingContract && hasClaimedOwnerCompletionScope(ctx);
       // Issue #3139: the worker-initiated no-progress stall detector. It never reads the lead's text.
       // The served attempt and completed counts are refreshed at every loop-top boundary. An absent
       // attempt count means ineligible; an absent completed count falls back to the milestones
@@ -4457,6 +4460,7 @@ export class CodexExecutor implements Executor {
         // Issue #1800: a system text (completion-rework, secret-remediation or clarification)
         // owns the turn outright, so the owner follow-up is neither pulled nor rendered on it.
         let systemFollowUp = clarificationPrompt ?? completionFollowUp;
+        if (repeatingContract && completionAnswered) approvedContractSuperseded = true;
         if (systemFollowUp !== undefined && completionAnswered && isIssueRun && ctx.completionInterlock && !ctx.interactive) {
           systemFollowUp += `\n\n${COMPLETION_CONTRACT_GUIDANCE}\n\n${NON_CLOSING_REMINDER}`;
         }
@@ -4485,13 +4489,14 @@ export class CodexExecutor implements Executor {
         // Enrollment grants no approval. Only this post-approval loop may repeat the final
         // contract, whether approved before reclaim or at this execution's human gate.
         // An in-process canonical bundle already repeats it through implementPrompt.
-        const repeatPlan = ctx.repeatApprovedPlan === true && !checkedPlan && !humanCanonicalPlan
+        const repeatPlan = !approvedContractSuperseded && ctx.repeatApprovedPlan === true && !checkedPlan && !humanCanonicalPlan
           ? gatedPlan ?? (preApproved ? ctx.approvedPlan : undefined) : undefined;
         const ownerPrompt = (repeatPlan !== undefined
           ? checkedImplementationContext(repeatPlan, approvedMilestones ?? ctx.frozenMilestones ?? null) : "") +
           this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts,
-            checkedPlan || humanCanonicalPlan
-              ? { milestones: approvedMilestones, findings: checkedFindings, humanApproved: humanCanonicalPlan } : undefined);
+            checkedPlan || humanCanonicalPlan || approvedContractSuperseded
+              ? { milestones: approvedMilestones, findings: checkedFindings, humanApproved: humanCanonicalPlan,
+                scopeSuperseded: approvedContractSuperseded } : undefined);
         const ownerBase = depsNote ? `${ownerPrompt}\n\n${depsNote}` : ownerPrompt;
         // Issue #3149: earlier owner follow-ups ride only the first implement turn of a reviewed-plan
         // resume (never a system-text turn), deduped by id against this turn's live batch and the
@@ -6625,12 +6630,14 @@ export class CodexExecutor implements Executor {
    *  and the clarification continuation replace this prompt for their turn and do not carry the
    *  block. Empty block ⇒ byte-identical. */
   private implementPrompt(ctx: RunContext, gatedPlan?: string, milestoneNote = "", facts?: EnvFacts,
-    checked?: { milestones: Milestone[] | undefined; findings?: PlanCrossCheckFindings | null; humanApproved?: boolean }): string {
+    checked?: { milestones: Milestone[] | undefined; findings?: PlanCrossCheckFindings | null; humanApproved?: boolean; scopeSuperseded?: boolean }): string {
     const approved = ctx.approvedPlan?.trim();
     // PRD #2460: a cross-check approved the server's normalized candidate, not the lead's local plan.
-    // The contract (plan prose plus the full milestone list) leads every implement attempt and
-    // supersedes whatever the plan thread holds.
-    const body = gatedPlan !== undefined && checked !== undefined
+    // Until an owner completion decision supersedes it, the contract (plan prose plus the full
+    // milestone list) leads each implement attempt and supersedes the planning thread.
+    const body = checked?.scopeSuperseded
+      ? CURRENT_EXECUTION_STATE_GUIDANCE
+      : gatedPlan !== undefined && checked !== undefined
       ? [
           checkedImplementationContext(gatedPlan, checked.milestones ?? []).trimEnd() + renderPlanApprovalAdvice(checked.findings),
           "",
