@@ -647,7 +647,8 @@ select_clone(){
           | if ($next | length) == 0 then false else rrcycle($edges; $next[0]; $seen + [$tip]) end end;
       def remediation($j):
         . as $r | type == "object" and (tojson | utf8bytelength) <= 65536
-        and (keys - ["active"]) == ["attemptId","branch","clonePath","edges","flaggedOIDs","ownedTip","runId","sequence","version"]
+        and (keys - ["active","blocked"]) == ["attemptId","branch","clonePath","edges","flaggedOIDs","ownedTip","runId","sequence","version"]
+        and (if has("blocked") then (.blocked | type == "boolean") else true end)
         and .version == 1 and (.runId | rrid(128) and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"))
         and (.branch | rrid(1024) and . != "@" and (startswith("-") | not)
           and (contains("..") | not) and (contains("@{") | not)
@@ -750,7 +751,8 @@ select_clone(){
           | if ($next | length) == 0 then false else rrcycle($edges; $next[0]; $seen + [$tip]) end end;
       def remediation($j):
         . as $r | type == "object" and (tojson | utf8bytelength) <= 65536
-        and (keys - ["active"]) == ["attemptId","branch","clonePath","edges","flaggedOIDs","ownedTip","runId","sequence","version"]
+        and (keys - ["active","blocked"]) == ["attemptId","branch","clonePath","edges","flaggedOIDs","ownedTip","runId","sequence","version"]
+        and (if has("blocked") then (.blocked | type == "boolean") else true end)
         and .version == 1 and (.runId | rrid(128) and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"))
         and (.branch | rrid(1024) and . != "@" and (startswith("-") | not)
           and (contains("..") | not) and (contains("@{") | not)

@@ -1596,6 +1596,8 @@ export interface RemediationGrant {
 }
 export interface RemediationRecovery {
   version: 1;
+  /** Exact false permits independent validation; true is sticky denial; absent is legacy custody only. */
+  blocked?: boolean;
   runId: string;
   branch: string;
   clonePath: string;
@@ -1641,8 +1643,9 @@ function parseRemediationRecovery(value: unknown): RemediationRecovery {
     if (!flaggedOIDs.length) fail();
     return { id: g.id as number, origin: g.origin as RemediationGrant["origin"], originSource, scannedTip: g.scannedTip as string, flaggedOIDs };
   };
-  const o = object(value, ["version", "runId", "branch", "clonePath", "attemptId", "sequence", "ownedTip", "flaggedOIDs", "active", "edges"]);
-  if (Buffer.byteLength(JSON.stringify(value), "utf8") > 65536 || o.version !== 1 ||
+  const o = object(value, ["version", "runId", "branch", "clonePath", "attemptId", "sequence", "ownedTip", "flaggedOIDs", "active", "edges", "blocked"]);
+  if (("blocked" in o && typeof o.blocked !== "boolean") ||
+      Buffer.byteLength(JSON.stringify(value), "utf8") > 65536 || o.version !== 1 ||
       !identifier(o.runId, 128) || !OWED_RUN_ID.test(o.runId) ||
       !identifier(o.branch, 1024) || !validRemediationBranch(o.branch) || !identifier(o.clonePath, 4096) ||
       !path.isAbsolute(o.clonePath as string) || path.normalize(o.clonePath as string) !== o.clonePath ||
@@ -1679,7 +1682,8 @@ function parseRemediationRecovery(value: unknown): RemediationRecovery {
   }
   return { version: 1, runId: o.runId as string, branch: o.branch as string, clonePath: o.clonePath as string,
     attemptId: o.attemptId as string, sequence: o.sequence as number, ownedTip: o.ownedTip as string,
-    flaggedOIDs, ...(active ? { active } : {}), edges };
+    flaggedOIDs, ...(active ? { active } : {}), edges,
+    ...(o.blocked === undefined ? {} : { blocked: o.blocked as boolean }) };
 }
 
 /** The server-accepted (or attempted) park binding a record is about. */
@@ -7076,6 +7080,39 @@ export class GitCache {
     await this.syncJournalAndReadBack(barePath, branch, recoveryJournalJson(value), durability);
   }
 
+  /**
+   * Persist and independently confirm negative custody evidence, never a grant.
+   * Throws on binding, write, sync or readback failure so callers retain source uncertainty.
+   * One locked attempt, no retries; existing complete metadata is always read afresh.
+   */
+  async blockRemediationRecovery(barePath: string, branch: string,
+    source: { runId: string; clonePath: string; attemptId: string },
+    durability: MemoryParkDurability = {}): Promise<"confirmed"> {
+    return this.withLock(barePath, () => this.blockRemediationUnderLock(barePath, branch, source, durability));
+  }
+
+  private async blockRemediationUnderLock(barePath: string, branch: string,
+    source: { runId: string; clonePath: string; attemptId: string },
+    durability: MemoryParkDurability = {}): Promise<"confirmed"> {
+    const stored = await this.remediationSourceUnderLock(barePath, branch, source);
+    // A detached descriptor is a separate protected copy. Refuse rather than leave a
+    // stale positive copy behind; terminal/protected sources require their existing proof.
+    if ((await this.protectedRecoveries(barePath, source.runId)).length)
+      throw new Error("remediation protected copy requires proof");
+    let record = stored.journal.remediationRecovery;
+    if (!record) {
+      const tip = await this.worktreeHead(source.clonePath);
+      if (!tip || (await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId, tip)).kind !== "owned")
+        throw new Error("remediation denial enrollment tip not owned");
+      record = { version: 1, ...source, branch, sequence: 0, ownedTip: tip,
+        flaggedOIDs: [], edges: [], blocked: true };
+    }
+    // No edge, object or positive eligibility proof is needed to confirm denial.
+    // false -> true shrinks the bounded body; legacy may refuse if adding the key overflows.
+    await this.writeRemediationUnderLock(barePath, branch, stored, { ...record, blocked: true }, durability);
+    return "confirmed";
+  }
+
   /** Trusted worker scan/decision seam. A request or untrusted finding never opens a grant.
    * The caller holds the existing source-use authority transaction; this method takes the bare lock. */
   async recordRemediationScan(barePath: string, branch: string,
@@ -7088,7 +7125,8 @@ export class GitCache {
       const stored = await this.remediationSourceUnderLock(barePath, branch, source);
       if (!stored.journal.remediationRecovery && !scan.flaggedOIDs.length) return;
       const r: RemediationRecovery = stored.journal.remediationRecovery ?? { version: 1, ...source, branch,
-        sequence: 0, ownedTip: scan.tip, flaggedOIDs: [], edges: [] };
+        sequence: 0, ownedTip: scan.tip, flaggedOIDs: [], edges: [], blocked: false };
+      if (r.blocked !== false) throw new Error("remediation record is custody only");
       if (r.ownedTip !== scan.tip ||
           (await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId, scan.tip)).kind !== "owned" ||
           await this.worktreeHead(source.clonePath) !== scan.tip) throw new Error("remediation scanned tip not owned");
@@ -7117,8 +7155,15 @@ export class GitCache {
         if (clean) active = undefined;
       }
       const { active: _old, ...rest } = r;
-      await this.writeRemediationUnderLock(barePath, branch, stored,
-        { ...rest, sequence, flaggedOIDs: flags, ...(active ? { active } : {}) }, durability);
+      const candidate = { ...rest, sequence, flaggedOIDs: flags, ...(active ? { active } : {}) };
+      // Only representational failure poisons the old body. A failed sync of a complete
+      // new body remains independently confirmable by a later consumer.
+      try { parseRemediationRecovery(candidate); }
+      catch (error) {
+        await this.blockRemediationUnderLock(barePath, branch, source, durability);
+        throw error;
+      }
+      await this.writeRemediationUnderLock(barePath, branch, stored, candidate, durability);
     });
   }
 
@@ -7134,7 +7179,7 @@ export class GitCache {
       if (mode === "runtime-restrictions") throw new Error("remediation runtime restriction proof unavailable");
       return undefined;
     };
-    if (r.edges.some(e => e.phase !== "committed")) return refuse();
+    if (r.blocked !== false || r.edges.some(e => e.phase !== "committed")) return refuse();
     const tracking = await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId,
       mode === "source-adoption" ? r.ownedTip : undefined);
     if (tracking.kind !== "owned" ||
@@ -7211,7 +7256,7 @@ export class GitCache {
       // history; journal it as lineage for a later coverage wrapper over this attempt's successor marker.
       const peeled = peeledMarker === undefined ? pending?.peeledMarkers : unionPeeledMarkers(pending?.peeledMarkers, [peeledMarker]);
       const value: RecoveryJournalEntry = { ...pending, ...source, ...(peeled?.length ? { peeledMarkers: peeled } : {}) };
-      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), recoveryJournalJson(value)]);
+      await this.writeRecovery(barePath, branch, value);
     });
   }
 
@@ -8111,12 +8156,22 @@ export class GitCache {
     this.log.warn("recovery custody discovery: incomplete physical evidence; attribution remains protected");
   }
 
+  private assertRemediationPreserved(prior: RecoveryJournalEntry | undefined, next: RecoveryJournalEntry): void {
+    const before = prior?.remediationRecovery;
+    const after = next.remediationRecovery;
+    if (!before) return;
+    if (!after || !sameRecoverySource(prior!, next) ||
+        (before.blocked === true && after.blocked !== true) ||
+        (before.blocked === undefined && after.blocked === false) ||
+        (before.blocked === false && after.blocked === undefined))
+      throw new Error("remediation metadata loss or rebind refused");
+  }
+
   private async writeRecovery(barePath: string, branch: string, journal: RecoveryJournalEntry, guard?: () => void | Promise<void>): Promise<void> {
     const value = recoveryJournalJson(journal);
     parseRecoveryJournal(value);
     const prior = await this.readRecoveryCapture(barePath, branch);
-    if (prior?.remediationRecovery && (!journal.remediationRecovery || !sameRecoverySource(prior, journal)))
-      throw new Error("remediation metadata loss or rebind refused");
+    this.assertRemediationPreserved(prior, journal);
     await this.assertRecoveryBare(barePath);
     if (guard) await guard();
     await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), value]);
@@ -13159,6 +13214,8 @@ export class GitCache {
                   { runId: ownerRunId, clonePath, ...(opts.attemptId ? { attemptId: opts.attemptId } : {}) }] })
                 : journalBeforeMove.raw;
               try {
+                const repaired = parseRecoveryJournal(raw);
+                this.assertRemediationPreserved(await this.readRecoveryCapture(barePath, branch), repaired);
                 await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), raw]);
               } catch (journalError) {
                 unproven();
@@ -13186,7 +13243,7 @@ export class GitCache {
                   const retained = before.clonePath === clonePath
                     ? { ...before, clonePath: movedTo, attemptId: undefined, retainedSources: [source] }
                     : { ...before, retainedSources: [...(before.retainedSources ?? []), source] };
-                  await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), recoveryJournalJson(retained)]);
+                  await this.writeRecovery(barePath, branch, retained);
                 }
                 throw renameError;
               }
@@ -19638,6 +19695,7 @@ try {
       if (opts.producingSource) {
         remediation = await this.remediationSourceUnderLock(barePath, branch, opts.producingSource);
         const r = remediation.journal.remediationRecovery;
+        if (r && r.blocked !== false) throw new Error("remediation record is custody only");
         if (r) await this.syncJournalAndReadBack(barePath, branch, remediation.raw, {});
         if (r?.edges.some(e => e.phase !== "committed")) throw new Error("remediation edge remains prepared");
         let sourceDivergence: "ancestor" | "divergent" | "unknown" | undefined;
@@ -19674,6 +19732,14 @@ try {
           if (reachable) {
             prepared = { ...r, edges: [...r.edges, { from: r.ownedTip, to: incoming,
               grant: r.active, context: this.contextName(sourceContext), phase: "prepared" }] };
+            try {
+              parseRemediationRecovery(prepared);
+              parseRemediationRecovery({ ...prepared, ownedTip: incoming,
+                edges: prepared.edges.map(e => ({ ...e, phase: "committed" })) });
+            } catch (error) {
+              await this.blockRemediationUnderLock(barePath, branch, opts.producingSource);
+              throw error;
+            }
             await this.writeRemediationUnderLock(barePath, branch, remediation, prepared);
             remediation = await this.remediationSourceUnderLock(barePath, branch, opts.producingSource);
           }

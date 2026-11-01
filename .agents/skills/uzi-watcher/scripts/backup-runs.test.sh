@@ -568,9 +568,13 @@ for kind in protected ordinary; do
     ledger "$A1" "$rid" "$predecessor" live
     rr_journal="$(printf '%s' "$rr_journal" | jq '. + {retainedSources:[{runId,clonePath,attemptId}]}')"
   fi
-  for variant in valid unknown version identity path attempt origin-source origin-extra origin-missing control bounds flags edges grant conflict cycle overflow; do
+  for variant in valid blocked clear malformed-blocked null-blocked unknown version identity path attempt origin-source origin-extra origin-missing control bounds flags edges grant conflict cycle overflow; do
     value="$rr_journal"
     case "$variant" in
+      blocked) filter='.remediationRecovery.blocked=true' ;;
+      clear) filter='.remediationRecovery.blocked=false' ;;
+      malformed-blocked) filter='.remediationRecovery.blocked="false"' ;;
+      null-blocked) filter='.remediationRecovery.blocked=null' ;;
       unknown) filter='.remediationRecovery.extra=1' ;;
       version) filter='.remediationRecovery.version=2' ;;
       identity) filter='.remediationRecovery.runId="other"' ;;
@@ -598,7 +602,7 @@ for kind in protected ordinary; do
     fi
     dest="$WORK/out.remediation-$kind-$variant"
     rc="$(backup_rc "$dest" "$rid")"
-    if [ "$variant" = valid ]; then
+    if [ "$variant" = valid ] || [ "$variant" = blocked ] || [ "$variant" = clear ]; then
       [ "$rc" -eq 0 ] || fail "remediation $kind: valid record rejected; $(cat "$dest/latest-attempt/backup.log")"
       tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+remediation-dirty' \
         || fail "remediation $kind: dirty bytes missing"

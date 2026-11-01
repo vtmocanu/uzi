@@ -118,6 +118,7 @@ test("strict bounded schema rejects unknown keys, versions, identifiers, duplica
   const mutations = [
     (r: any) => { r.extra = true; },
     (r: any) => { r.version = 2; },
+    ...[null, 0, "false", {}, []].map(blocked => (r: any) => { r.blocked = blocked; }),
     (r: any) => { r.runId = "x".repeat(129); },
     (r: any) => { r.branch = "x".repeat(1025); },
     (r: any) => { r.clonePath = "/" + "x".repeat(4096); },
@@ -867,3 +868,195 @@ for (const fault of ["unknown ancestry", "missing source anchor"] as const) {
     assert.ok((await cache.enumerateOwedCandidates(bare, RUN)).some(candidate => candidate.sha === r));
   });
 }
+
+test("new enrollment is exact false; legacy and blocked records are custody only through refresh and import", async () => {
+  await enroll();
+  const saved = journal();
+  assert.equal(saved.remediationRecovery.blocked, false);
+  assert.ok(await cache.readRuntimeRemediationRecovery(bare, BRANCH, source()));
+  for (const blocked of [undefined, true]) {
+    const value = structuredClone(saved);
+    if (blocked === undefined) delete value.remediationRecovery.blocked;
+    else value.remediationRecovery.blocked = blocked;
+    write(value);
+    await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT);
+    assert.equal(journal().remediationRecovery.blocked, blocked);
+    const fresh = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+    assert.equal(await fresh.readRemediationRecovery(bare, BRANCH, source()), undefined);
+    await assert.rejects(fresh.readRuntimeRemediationRecovery(bare, BRANCH, source()));
+    await assert.rejects(cache.recordRemediationScan(bare, BRANCH, source(),
+      { trusted: true, tip: base, flaggedOIDs: [] }), /custody only/);
+    commit("refused import " + String(blocked));
+    await assert.rejects(cache.fetchAgentBranch(bare, clone, BRANCH, RUN, opts), /custody only/);
+    assert.deepEqual(journal().remediationRecovery, value.remediationRecovery);
+    git(clone, "update-ref", "refs/heads/" + BRANCH, base);
+  }
+});
+
+test("65th trusted flag durably denies the old complete 64-flag body and zero continuation", async () => {
+  const flags: string[] = [];
+  for (let i = 0; i < 65; i++) flags.push(commit("flag " + i, flags.at(-1) ?? base));
+  await fetch();
+  const scan = { trusted: true, tip: flags[64]!, flaggedOIDs: flags.slice(0, 64), origin: "pre-exit" as const };
+  await cache.recordRemediationScan(bare, BRANCH, source(), scan);
+  // Remove the old flagged history, close its grant, then add a new finding.
+  // Without durable denial a later zero-finding scan could forget only this Q.
+  const clean = commit("clean after 64 findings");
+  await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(),
+    { trusted: true, tip: clean, flaggedOIDs: [] });
+  const nextFinding = commit("new finding after clean rewrite", clean);
+  await fetch();
+  const before = journal().remediationRecovery;
+  assert.equal(before.blocked, false);
+  assert.equal(before.active, undefined);
+  assert.equal(before.edges.length, 1);
+  for (const flag of before.flaggedOIDs)
+    assert.equal(await cache.ancestry(bare, flag, nextFinding), "divergent");
+  await assert.rejects(cache.recordRemediationScan(bare, BRANCH, source(),
+    { ...scan, tip: nextFinding, flaggedOIDs: [nextFinding] }), /invalid remediation/);
+  assert.deepEqual(journal().remediationRecovery, { ...before, blocked: true });
+  assert.equal(Buffer.byteLength(JSON.stringify(journal().remediationRecovery)),
+    Buffer.byteLength(JSON.stringify(before)) - 1);
+  const fresh = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  assert.equal(await fresh.readRemediationRecovery(bare, BRANCH, source()), undefined);
+  await assert.rejects(fresh.readRuntimeRemediationRecovery(bare, BRANCH, source()));
+  await assert.rejects(fresh.recordRemediationScan(bare, BRANCH, source(),
+    { ...scan, tip: nextFinding, flaggedOIDs: [] }));
+  await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT);
+  const reservation = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, source());
+  assert.deepEqual(journal().remediationRecovery, { ...before, blocked: true });
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), reservation.attempts,
+    formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "fedcba9876543210")));
+});
+
+test("negative enrollment and structural confirmation confer no grant, even with prepared or missing evidence", async () => {
+  assert.equal(await cache.blockRemediationRecovery(bare, BRANCH, source()), "confirmed");
+  assert.deepEqual(journal().remediationRecovery, { version: 1, ...source(), branch: BRANCH,
+    sequence: 0, ownedTip: base, flaggedOIDs: [], edges: [], blocked: true });
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
+  // Simulate the latest complete body from another producer, then confirm its denial
+  // without requiring its positive edge objects or overwriting it with the minimal body.
+  write({ ...journal(), remediationRecovery: undefined });
+  await enroll();
+  const latest = journal();
+  latest.remediationRecovery.edges = [{
+    from: "a".repeat(40), to: "b".repeat(40), phase: "prepared",
+    context: "context-" + "c".repeat(64) + ".json", grant: latest.remediationRecovery.active,
+  }];
+  write(latest);
+  assert.equal(await cache.blockRemediationRecovery(bare, BRANCH, source()), "confirmed");
+  assert.deepEqual(journal().remediationRecovery, { ...latest.remediationRecovery, blocked: true });
+  assert.equal(await cache.blockRemediationRecovery(bare, BRANCH, source()), "confirmed");
+  await assert.rejects(cache.blockRemediationRecovery(bare, BRANCH, { ...source(), runId: "other" }));
+});
+
+test("negative persistence failures throw and later confirmation independently re-syncs", async t => {
+  await enroll();
+  for (const durability of [
+    ...(["config", "directory"] as const).map(target => ({
+      sync: async (handle: { sync(): Promise<void> }, what: "config" | "directory") => {
+        if (what === target) throw Error(target);
+        await handle.sync();
+      },
+    })),
+    { readback: async () => "" },
+  ]) {
+    await assert.rejects(cache.blockRemediationRecovery(bare, BRANCH, source(), durability));
+    assert.equal(journal().remediationRecovery.blocked, true);
+    assert.equal(await cache.blockRemediationRecovery(bare, BRANCH, source()), "confirmed");
+  }
+  const internal = cache as any, run = internal.runGit.bind(cache);
+  t.mock.method(internal, "runGit", async (dir: string, args: string[]) => {
+    if (args[0] === "config" && args.some(a => a.includes('"remediationRecovery"'))) throw Error("deny write");
+    return run(dir, args);
+  });
+  await assert.rejects(cache.blockRemediationRecovery(bare, BRANCH, source()), /deny write/);
+});
+
+test("first enrollment flag overflow leaves a minimal durable denial", async () => {
+  const flags: string[] = [];
+  for (let i = 0; i < 65; i++) flags.push(commit("initial flag " + i, flags.at(-1) ?? base));
+  await fetch();
+  await assert.rejects(cache.recordRemediationScan(bare, BRANCH, source(),
+    { trusted: true, tip: flags[64]!, flaggedOIDs: flags, origin: "pre-exit" }), /invalid remediation/);
+  assert.equal(journal().remediationRecovery.blocked, true);
+  assert.deepEqual(journal().remediationRecovery.flaggedOIDs, []);
+});
+
+test("import edge overflow denies without losing existing flags or edges", async () => {
+  commit("flagged before overflow"); await fetch();
+  await enroll();
+  const saved = journal();
+  const r = saved.remediationRecovery;
+  r.edges = Array.from({ length: 64 }, (_, i) => ({
+    from: (i + 1).toString(16).padStart(40, "0"), to: (i + 2).toString(16).padStart(40, "0"),
+    grant: r.active, context: "context-" + "a".repeat(64) + ".json", phase: "committed",
+  }));
+  write(saved);
+  commit("overflow replacement");
+  await assert.rejects(cache.fetchAgentBranch(bare, clone, BRANCH, RUN, opts), /invalid remediation/);
+  assert.deepEqual(journal().remediationRecovery, { ...r, blocked: true });
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
+});
+
+test("import encoded byte overflow durably denies below the edge-count limit", async () => {
+  const flags: string[] = [];
+  for (let i = 0; i < 64; i++) flags.push(commit("byte flag " + i, flags.at(-1) ?? base));
+  await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(),
+    { trusted: true, tip: flags[63]!, flaggedOIDs: flags, origin: "pre-exit" });
+  const saved = journal();
+  const r = saved.remediationRecovery;
+  // Fill with complete bounded grants until one more edge crosses 64KiB.
+  // At most 64 attempts; no filesystem work in the loop.
+  for (let i = 0; i < 64; i++) {
+    const edge = { from: (i + 1).toString(16).padStart(40, "0"), to: (i + 2).toString(16).padStart(40, "0"),
+      grant: r.active, context: "context-" + "a".repeat(64) + ".json", phase: "committed" };
+    if (Buffer.byteLength(JSON.stringify({ ...r, edges: [...r.edges, edge] })) > 65536) break;
+    r.edges.push(edge);
+  }
+  assert.ok(r.edges.length > 0 && r.edges.length < 64);
+  assert.ok(Buffer.byteLength(JSON.stringify(r)) <= 65536);
+  write(saved);
+  await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT);
+  commit("byte overflow replacement");
+  await assert.rejects(cache.fetchAgentBranch(bare, clone, BRANCH, RUN, opts), /invalid remediation/);
+  assert.deepEqual(journal().remediationRecovery, { ...r, blocked: true });
+});
+
+test("overflow denial durability failure propagates and preserves the full old body", async () => {
+  const flags: string[] = [];
+  for (let i = 0; i < 65; i++) flags.push(commit("deny sync flag " + i, flags.at(-1) ?? base));
+  await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(),
+    { trusted: true, tip: flags[64]!, flaggedOIDs: flags.slice(0, 64), origin: "pre-exit" });
+  const before = journal().remediationRecovery;
+  await assert.rejects(cache.recordRemediationScan(bare, BRANCH, source(),
+    { trusted: true, tip: flags[64]!, flaggedOIDs: [flags[64]!], origin: "pre-exit" },
+    { sync: async () => { throw Error("negative sync failed"); } }), /negative sync failed/);
+  assert.deepEqual(journal().remediationRecovery, { ...before, blocked: true });
+  assert.equal(await cache.blockRemediationRecovery(bare, BRANCH, source()), "confirmed");
+});
+
+test("same-source lifecycle writes cannot clear denial or upgrade legacy evidence", async () => {
+  await enroll();
+  const complete = journal();
+  const internal = cache as any;
+  // A stale lifecycle snapshot must not overwrite a denial committed while it awaited.
+  await cache.blockRemediationRecovery(bare, BRANCH, source());
+  const denied = journal();
+  await assert.rejects(internal.writeRecovery(bare, BRANCH, complete), /metadata loss/);
+  const dropped = structuredClone(denied);
+  delete dropped.remediationRecovery.blocked;
+  await assert.rejects(internal.writeRecovery(bare, BRANCH, dropped), /metadata loss/);
+  assert.deepEqual(journal(), denied);
+  const legacy = structuredClone(complete);
+  delete legacy.remediationRecovery.blocked;
+  write(legacy);
+  await assert.rejects(internal.writeRecovery(bare, BRANCH, complete), /metadata loss/);
+  assert.deepEqual(journal(), legacy);
+  write(complete);
+  await assert.rejects(internal.writeRecovery(bare, BRANCH, legacy), /metadata loss/);
+  assert.deepEqual(journal(), complete);
+});
