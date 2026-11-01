@@ -85,11 +85,14 @@ func prerequisiteInvoke(t *testing.T, ctx context.Context, f prerequisiteFixture
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
-	r, err := q.LockPrerequisiteRun(ctx, f.run)
-	if err != nil {
+	// Take LockPrerequisiteRun's row lock by id only: the migration round-trip calls this at
+	// schema 387, where a generated `SELECT *` would name runs columns later migrations add.
+	// The generated query itself is exercised by the repair, budget and handler tests.
+	var lockedRun uuid.UUID
+	if err = tx.QueryRow(ctx, "SELECT id FROM runs WHERE id = $1 FOR KEY SHARE", f.run).Scan(&lockedRun); err != nil {
 		t.Fatal(err)
 	}
-	if r.ID != f.run {
+	if lockedRun != f.run {
 		t.Fatal("wrong run")
 	}
 	h, err := q.LockPrerequisiteHold(ctx, f.hold)
