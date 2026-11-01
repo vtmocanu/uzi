@@ -924,10 +924,18 @@ test("65th trusted flag durably denies the old complete 64-flag body and zero co
   await assert.rejects(fresh.recordRemediationScan(bare, BRANCH, source(),
     { ...scan, tip: nextFinding, flaggedOIDs: [] }));
   await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT);
-  const reservation = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, source());
+  const { iteration } = await captureAdoption([flags[64]!, nextFinding], nextFinding);
+  assert.equal(journal().recovery.stage, "captured", "private capture remains available under denial");
   assert.deepEqual(journal().remediationRecovery, { ...before, blocked: true });
-  await assert.rejects(cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), reservation.attempts,
-    formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "fedcba9876543210")));
+  const pins = pinnedRefs();
+  const captured = raw();
+  let admissions = 0;
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), iteration,
+    successorAttempt, { admitRemediationSource: async () => { admissions++; return true; } }),
+    /remediation adoption source unverified/);
+  assert.equal(admissions, 0, "a positive scan callback cannot substitute for denied evidence");
+  assert.equal(raw(), captured);
+  assert.equal(pinnedRefs(), pins);
 });
 
 test("negative enrollment and structural confirmation confer no grant, even with prepared or missing evidence", async () => {
