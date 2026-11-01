@@ -6,6 +6,7 @@ import type { FakePrDescApi, PrDescOp } from "./fake-pr-desc-api.js";
 import type {
   ClaimResponse,
   CompletionPermitResponse,
+  IterationParkRefusalReason,
   OutgoingMessage,
   RunOrphanClassificationResponse,
   StateRequest,
@@ -403,6 +404,10 @@ export class FakeApi {
     runId: string;
     body: Record<string, unknown>;
   }> = [];
+  readonly iterationParkRequests: Array<{ runId: string; body: Record<string, unknown> }> = [];
+  private iterationParkResponse: { httpStatus: number; body: Record<string, unknown> } | undefined;
+  private iterationParkLoseFirstReply = false;
+  private readonly iterationParkCommits = new Map<string, Record<string, unknown>>();
   private wallParkStatus = "paused";
   private wallParkHttpStatus = 200;
   private wallParkLoseFirstReply = false;
@@ -1092,6 +1097,23 @@ export class FakeApi {
    *  answers with (default 200/"paused" = a landed park; 409 with a non-"paused" status models a
    *  REFUSED park the client must NOT throw on; a 404/5xx models an UNDELIVERABLE report the client
    *  THROWS on, D17). */
+  /** Flat iteration disposition; an omitted generation echoes the request's fence. */
+  setIterationParkResponse(body: Record<string, unknown>, httpStatus = 200): void {
+    this.iterationParkResponse = { body, httpStatus };
+  }
+
+  setIterationParkRefusal(reason: IterationParkRefusalReason, status = "running", claimGeneration?: number): void {
+    this.setIterationParkResponse({
+      applied: false, status, hold_reason: "", reason,
+      ...(claimGeneration === undefined ? {} : { claim_generation: claimGeneration }),
+    }, 409);
+  }
+
+  commitIterationParkThenLoseFirstReply(): void {
+    this.iterationParkLoseFirstReply = true;
+    this.iterationParkCommits.clear();
+  }
+
   setWallParkResponse(status: string, httpStatus = 200, budget?: { total?: number; used?: number; completionAttempts?: number }): void {
     this.wallParkStatus = status;
     this.wallParkHttpStatus = httpStatus;
@@ -1755,9 +1777,36 @@ export class FakeApi {
       });
     }
 
-    // PRD #1497 M2: the wall-park endpoint. Records the request and answers the configured
-    // {run:{status}} at the configured HTTP status (200 landed / 409 refused / 404|5xx undeliverable).
-    // On an undeliverable status the RunDTO is still shaped but the client throws on the non-200/409.
+    // Iteration parks use a flat, generation-bound disposition. A lost reply leaves
+    // the committed ownership visible and the duplicate request gets its original ACK.
+    const iterationParkMatch = /^\/api\/worker\/runs\/([^/]+)\/iteration-park$/.exec(p);
+    if (req.method === "POST" && iterationParkMatch) {
+      const runId = iterationParkMatch[1] as string;
+      this.iterationParkRequests.push({ runId, body: json });
+      const key = `${runId}:${String(json.claim_generation)}`;
+      const committed = this.iterationParkCommits.get(key);
+      if (committed) return send(res, 200, committed);
+      const ack: Record<string, unknown> = {
+        claim_generation: json.claim_generation,
+        ...(this.iterationParkResponse?.body ?? {
+          applied: true, status: "paused", hold_reason: "iteration_budget_exhausted",
+        }),
+      };
+      if ((this.iterationParkResponse?.httpStatus ?? 200) === 200 && ack.applied === true &&
+          ack.status === "paused" && ack.claim_generation === json.claim_generation &&
+          ack.hold_reason === "iteration_budget_exhausted") {
+        this.setOwnershipStatus(runId, "paused", json.claim_generation as number);
+      }
+      if (this.iterationParkLoseFirstReply) {
+        this.iterationParkLoseFirstReply = false;
+        this.iterationParkCommits.set(key, ack);
+        req.socket.destroy();
+        return;
+      }
+      return send(res, this.iterationParkResponse?.httpStatus ?? 200, ack);
+    }
+
+    // Wall parks retain their separate, legacy nested RunDTO protocol.
     const wallParkMatch = /^\/api\/worker\/runs\/([^/]+)\/wall-park$/.exec(p);
     if (req.method === "POST" && wallParkMatch) {
       const runId = wallParkMatch[1] as string;

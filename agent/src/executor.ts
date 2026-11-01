@@ -96,6 +96,9 @@ export interface EmittedMessage {
  */
 export type WallParkOutcome = "parked" | "undeliverable" | "refused" | "cancelled";
 
+/** Both outcomes end the exhausted flight without finalization; retained-stop keeps its work. */
+export type IterationParkOutcome = "parked" | "retained-stop";
+
 /**
  * Issue #1600: the run's budget as the server reported it on a REFUSED wall park's 409 body
  * ({@link RunContext.takeWallParkRefresh}). `totalSeconds` is the served three-term total wall and
@@ -644,6 +647,8 @@ export interface RunContext {
    * legacy behaviour (the caller treats the absent seam as "no park").
    */
   parkForWall?(at: { completedCount: number; total?: number }): Promise<WallParkOutcome>;
+  /** Iteration exhaustion sink: every outcome stops the flight, including refusals and unknown ACKs. */
+  parkForIteration?(at: { iterationCount: number; maxIterations: number }): Promise<IterationParkOutcome>;
   /**
    * Issue #1600: the budget the server returned with the most recent REFUSED wall park, consumed
    * once (a second call returns undefined until the next refusal). A caller that re-drives a turn
@@ -915,6 +920,8 @@ export interface ExecutorResult {
    *  the trip used (REASON_WALL). NOT gated on run kind (all six timed kinds park at the wall) or on
    *  harness (both Claude and Codex). Absent on every normal completion. StubExecutor never sets it. */
   walled?: { reason: string };
+  /** Disposition for every iteration sink outcome. The runner must skip finalization for either. */
+  iterationParked?: { outcome: IterationParkOutcome };
   /** PRD #1247 M5b (data-integrity fix): set when a held-state credential switch RELEASED the claim
    *  IN PLACE — `ctx.attemptCredentialSwitch` returned "released" from the implement loop, the plan
    *  gate, an ask_user question, or an interactive follow-up wait. The switch already drained the

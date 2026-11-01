@@ -538,6 +538,7 @@ export const HELD_CONTEXT_CALLBACKS = [
   "awaitFollowUp",
   "parkForPause",
   "parkForWall",
+  "parkForIteration",
   "attemptCredentialSwitch",
   "enterCompletionHold",
   "askCompletionQuestion",

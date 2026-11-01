@@ -63,6 +63,9 @@ import {
   type CompletionPermitRequest,
   type CompletionPermitResponse,
   type WallParkRequest,
+  type IterationParkRequest,
+  type IterationParkResult,
+  type IterationParkRefusalReason,
   type ReportFindingRequest,
   type HeartbeatRequest,
   type DindMaintenance,
@@ -1391,7 +1394,7 @@ export class WorkerClient {
   }
 
   private sealCodexAdmission(path: string, body: unknown): void {
-    const match = /^\/api\/worker\/runs\/([^/]+)\/(state|cross-check-verdict|wall-park|pause|completion\/hold|base-attestation-hold|completion\/attempt|archives\/release)$/.exec(path);
+    const match = /^\/api\/worker\/runs\/([^/]+)\/(state|cross-check-verdict|wall-park|iteration-park|pause|completion\/hold|base-attestation-hold|completion\/attempt|archives\/release)$/.exec(path);
     if (!match || !isRecord(body)) return;
     const runId = decodeURIComponent(match[1]!);
     const owned = this.codexAdmission.get(runId);
@@ -4229,6 +4232,51 @@ export class WorkerClient {
       // A 2xx we do not model: no status came back, so it cannot confirm a park.
       return { applied: false, status: "" };
     });
+  }
+
+  /** One fenced request; the caller owns episode retries. All response bodies are bounded before
+   * decoding, including errors. Unknown delivery never becomes a generic run failure. */
+  async reportIterationPark(runId: string, request: IterationParkRequest, signal?: AbortSignal): Promise<IterationParkResult> {
+    const body = { ...request };
+    const positiveGeneration = (value: unknown): value is number =>
+      typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+    const positiveInt = (value: unknown): value is number =>
+      positiveGeneration(value) && value <= 2147483647;
+    if (!isRecord(body) || !positiveGeneration(body.claim_generation) || !positiveInt(body.iteration_count)
+      || !positiveInt(body.max_iterations) || body.iteration_count < body.max_iterations
+      || body.iteration_count - body.max_iterations > 1 || typeof body.head !== "string"
+      || Buffer.from(body.head, "utf8").toString("utf8") !== body.head || Buffer.byteLength(body.head, "utf8") > 128
+      || typeof body.published !== "boolean"
+      || (body.checkpoint_contains_latest !== undefined && typeof body.checkpoint_contains_latest !== "boolean"))
+      throw new Error("invalid iteration park evidence");
+    const serialized = JSON.stringify(body);
+    const keys = ["claim_generation", "iteration_count", "max_iterations", "head", "published", "checkpoint_contains_latest"];
+    if (Buffer.byteLength(serialized, "utf8") > 16 * 1024
+      || Object.keys(body).some(key => !keys.includes(key)))
+      throw new Error("invalid iteration park evidence");
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/iteration-park`;
+    const deadline = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(this.httpTimeoutMs)]);
+    try {
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, deadline);
+      const raw = await readBoundedBytes(res, 16 * 1024, true, deadline);
+      const ack: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
+      if (!isRecord(ack)) return { outcome: "unknown" };
+      if (res.status === 200 && ack.applied === true && ack.status === "paused"
+        && ack.hold_reason === "iteration_budget_exhausted" && ack.claim_generation === body.claim_generation)
+        return { outcome: "parked" };
+      const reasons: readonly IterationParkRefusalReason[] = ["prior_attempt", "ineligible_lane", "not_running",
+        "allowance_mismatch", "stale_claim", "released_claim", "pending_control"];
+      const statuses = ["queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup",
+        "pool_wait", "limit_wait", "recovery_wait", "paused", "completed", "failed", "cancelled"];
+      if (res.status === 409 && ack.applied === false && typeof ack.reason === "string"
+        && reasons.includes(ack.reason as IterationParkRefusalReason) && typeof ack.status === "string"
+        && statuses.includes(ack.status) && positiveGeneration(ack.claim_generation) && typeof ack.hold_reason === "string")
+        return { outcome: "refused", reason: ack.reason as IterationParkRefusalReason,
+          status: ack.status, claimGeneration: ack.claim_generation };
+      return { outcome: "unknown" };
+    } catch {
+      return { outcome: "unknown" };
+    }
   }
 
   /** Request an ordinary pause. A running ACK records intent; only a paused status confirms a park.

@@ -1003,6 +1003,8 @@ export interface ClaimConfig {
    *  constant (30m). Seconds, converted to ms at the park site. */
   task_idle_timeout_seconds?: number;
   max_iterations?: number;
+  /** Only version 1 supports iteration parking; absent or unknown versions are unsupported. */
+  iteration_park_version?: number;
   /** Bound on plan-revision rounds at the approval gate (PRD #41, env
    *  PLAN_MAX_REVISIONS). The worker enforces the same cap the server does. */
   plan_max_revisions?: number;
@@ -2178,6 +2180,28 @@ export type BaseAttestationHoldOutcome =
   | { outcome: "held"; status: string }
   | { outcome: "stale"; status: string }
   | { outcome: "unknown"; detail: string };
+
+/** Dedicated iteration park evidence. Counters/allowances are positive int32 values;
+ * claim_generation is a positive safe integer. iteration_count is max_iterations or
+ * max_iterations + 1; head is at most 128 UTF8 bytes. */
+export interface IterationParkRequest {
+  claim_generation: number;
+  iteration_count: number;
+  max_iterations: number;
+  head: string;
+  published: boolean;
+  checkpoint_contains_latest?: boolean;
+}
+
+export type IterationParkRefusalReason =
+  | "prior_attempt" | "ineligible_lane" | "not_running" | "allowance_mismatch"
+  | "stale_claim" | "released_claim" | "pending_control";
+
+/** A refusal is advisory evidence, never permission to continue the exhausted flight. */
+export type IterationParkResult =
+  | { outcome: "parked" }
+  | { outcome: "refused"; reason: IterationParkRefusalReason; status: string; claimGeneration: number }
+  | { outcome: "unknown" };
 
 /** Request body for POST /api/worker/runs/:id/wall-park (PRD #1497 M2, D4/D15): the worker
  *  reports it dropped its turn at the run's wall-clock deadline and captured the tree, and the
