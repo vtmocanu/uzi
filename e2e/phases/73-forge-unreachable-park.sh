@@ -88,6 +88,11 @@ restore_stack() {
     cp "$GITCONFIG_SAVE" "$GITCONFIG" 2>/dev/null || true
   fi
   fake_clear_create_mr_fault >/dev/null 2>&1 || true
+  # A D/E failure mid-case would leave its parked/held run holding custody into later phases.
+  local leftover
+  for leftover in "${RUN_D:-}" "${RUN_E:-}"; do
+    [ -n "$leftover" ] && apipost "/api/runs/$leftover/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
+  done
   local var
   for var in E2E_FORGE_UNREACHABLE_MAX_PARKS E2E_PROVIDER_PARK_MAX_DURATION; do
     if grep -q "^$var=" "$ENVFILE" 2>/dev/null; then
@@ -136,7 +141,8 @@ assert_one_park_event() {
   fail "no forge-park feed event ever landed for run $run"
 }
 
-# dispatch_run_forge_broken TITLE — with the git path ALREADY broken, create an issue + run.
+# dispatch_run_forge_broken TITLE — create an issue + run. Cases A-C call it with the git path
+# broken; Cases D/E reuse it with the path healthy.
 # forge-fake is UP, so CreateIssue and the run-create forge snapshot both succeed, and the
 # claim-time default-branch guardrail passes; the worker then claims and its FIRST clone
 # attempt resolves the `.invalid` host and fails transiently. Sets DISPATCHED_RUN.
@@ -293,9 +299,10 @@ wait_forge_park_release "$RUN_C" "$PARK_GENERATION_C" 10 cancelled
 [ -z "$(db_psql "SELECT id FROM runs WHERE kind='judge' AND target_run_id='$RUN_C'")" ] \
   || fail "a judge run was enqueued for the cancelled clone"
 pass "Case C: run $RUN_C cancelled with its exact final custody receipt, no judge"
+restore_git_path
 
 # --- Cases D/E: publication-phase park (issue #1324) --------------------------
-# The git path is WORKING here (Case C restored it): clone, plan, executor and push all
+# The git path is WORKING here (restored right after Case C): clone, plan, executor and push all
 # succeed, and only the forge API's merge-request CREATE answers 503. The agent retries it on
 # the withForgeRetry schedule (1s, 2s, 4s, 8s, 16s = 6 attempts) and only then parks.
 

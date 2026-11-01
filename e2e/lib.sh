@@ -861,7 +861,8 @@ forge_owner_hold_ready() {
 
 # Publication-phase forge park (issue #1324), read through the public run DTO. A timed park
 # stamps a retry; the owner hold clears it and names publication_retry_exhausted. Poll these
-# through wait_eq (they print true/false) and abort early on a terminal outcome.
+# through wait_eq (they print true/false). A terminal run prints a FAIL line that wait_eq
+# reports at its timeout (fail only exits wait_eq's subshell, so it does not abort early).
 publication_park_ready() {
   local view
   view="$(apiget "/api/runs/$1")"
