@@ -329,6 +329,22 @@ func TestCompletionDecisionNotBlockedRefusedLiveDB(t *testing.T) {
 		}
 	})
 
+	t.Run("iteration hold requires Resume rather than a completion decision", func(t *testing.T) {
+		runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+		e.exec(t, `UPDATE runs SET status = 'paused', hold_reason = 'iteration_budget_exhausted',
+ hold_captured_head = 'iteration-head' WHERE id = $1`, runID)
+		assertRefused(t, runID)
+		var status, reason, head string
+		var released bool
+		if err := e.pool.QueryRow(e.ctx, `SELECT status, hold_reason, hold_captured_head,
+ claim_released_at IS NOT NULL FROM runs WHERE id=$1`, runID).Scan(&status, &reason, &head, &released); err != nil {
+			t.Fatal(err)
+		}
+		if status != "paused" || reason != "iteration_budget_exhausted" || head != "iteration-head" || released {
+			t.Fatalf("completion decision changed iteration hold: %s %s %s released=%v", status, reason, head, released)
+		}
+	})
+
 	t.Run("awaiting_input with no completion marker (ordinary question)", func(t *testing.T) {
 		// No completion-question marker (completion_question_at NULL) — an ordinary clarification,
 		// which completionQuestionOpen no longer admits regardless of the attempt count.
