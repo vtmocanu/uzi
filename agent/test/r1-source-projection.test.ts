@@ -193,7 +193,7 @@ it("R1 scoped source groups remain paused at zero cap and over cap", async t => 
   }
 });
 
-for (const disabled of [false, true]) it("R1 Worker observes scope-only ownership before register/boot/drain/sweep, disabled=" + disabled, async t => {
+for (const disabled of [false, true]) it("R1 Worker registers conservatively before scope-only ownership in boot/drain/sweep, disabled=" + disabled, async t => {
   const { box, root, file } = await fixture(t);
   await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.symlink(path.join(root, "missing"), file);
@@ -233,10 +233,11 @@ for (const disabled of [false, true]) it("R1 Worker observes scope-only ownershi
   };
   const signal = new AbortController().signal;
   await seam.registerWithRetry(signal);
+  assert.deepEqual(observed, [], "scope ownership cannot delay registration");
   await seam.resolveBootTerminals(signal);
   await seam.resolveRunTerminal(run);
   await seam.sweepPendingTerminals();
-  assert.deepEqual(observed, [run, run, run, run]);
+  assert.deepEqual(observed, [run, run, run]);
   assert.equal(registered.length, 1);
   assert.deepEqual(registered[0]?.pending_all, [{ run_id: run, claim_generation: 7 }]);
   assert.deepEqual(registry.build(true).pending_policy_protection, [{ run_id: run, owner_generation: 9 }]);

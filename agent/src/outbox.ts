@@ -901,6 +901,23 @@ export class Outbox {
     return true;
   }
 
+  /** A deferred placeholder may authenticate only the observed file version.
+   * Failed/oversized observations grant no later read authority; existing bindings
+   * cannot be refreshed to a replacement while the first writer is unresolved. */
+  private bindDeferredObservation(runId: string, generation: number | undefined, fileName: string,
+    stat?: Parameters<typeof fileVersion>[0]): void {
+    const own = generation === undefined ? undefined : this.runs.get(runId)?.terminals.get(generation);
+    if (!own || own.fileName !== fileName || own.outcomeKind !== "unknown" || !own.budgetDeferred) return;
+    if (!stat) { own.budgetDeferred = false; return; }
+    const version = fileVersion(stat);
+    if (own.deferredVersion !== undefined && own.deferredVersion !== version) {
+      own.budgetDeferred = false;
+      return;
+    }
+    own.deferredVersion = version;
+    if (Number(stat.size) > Math.min(this.terminalReadMaxBytes, this.runMaxBytes, this.maxBytes)) own.budgetDeferred = false;
+  }
+
   // Inspection reservations and retained unclassified physical scopes belong to
   // the same identity tier as selected metadata and producer reservations. No
   // generation is attributed to a scope whose filename cannot establish one.
@@ -1098,6 +1115,7 @@ export class Outbox {
                   this.policyInspections.delete(token);
                 }
                 const stat = await fs.lstat(path.join(directory, source.name), { bigint: true }).catch(() => undefined);
+                this.bindDeferredObservation(entry.name, generation, source.name, stat);
                 if (!stat) return true;
                 const known = this.runs.get(entry.name)?.terminals.get(generation);
                 if (known?.outcomeKind === "terminal" && known.fileName === source.name &&
@@ -1211,7 +1229,9 @@ export class Outbox {
                 this.policyInspections.set(token, scope);
             }
             const remaining = Math.min(this.runMaxBytes - runReadBytes, this.maxBytes - totalReadBytes);
-            const stat = await fs.lstat(path.join(this.runDir(physicalRun), entry.name), { bigint: true });
+            const stat = await fs.lstat(path.join(this.runDir(physicalRun), entry.name), { bigint: true }).catch(() => undefined);
+            this.bindDeferredObservation(physicalRun, gen, entry.name, stat);
+            if (!stat) return true;
             const known = gen === undefined ? undefined : this.runs.get(physicalRun)?.terminals.get(gen);
             if (known?.outcomeKind === "terminal" && known.fileName === entry.name && known.ordinaryVersion === fileVersion(stat)) {
               if (token) this.policyInspections.delete(token);
@@ -3464,6 +3484,7 @@ export class Outbox {
               try {
                 const stat = await fs.lstat(path.join(this.runDir(runId), entry.name), { bigint: true });
                 bytes = Number(stat.size);
+                this.bindDeferredObservation(runId, generation, entry.name, stat);
                 if (represented?.outcomeKind === "terminal" && represented.ordinaryVersion === fileVersion(stat)) {
                   if (token) this.policyInspections.delete(token);
                 } else if (!token && represented?.outcomeKind === "terminal" && !this.hasCountedPhysicalScope(runId, entry.name)) {
@@ -3471,7 +3492,9 @@ export class Outbox {
                   this.terminalScanIncomplete = true;
                   break; // A changed ordinary lifetime needs a new counted slot.
                 }
-              } catch { /* inspection records uncertainty */ }
+              } catch {
+                this.bindDeferredObservation(runId, generation, entry.name);
+              }
               checkProofBudget(budget);
               const individualCap = Math.min(this.terminalReadMaxBytes, this.runMaxBytes, this.maxBytes);
               if (bytes <= individualCap && (bytes > remaining || bytes > runRemaining)) {

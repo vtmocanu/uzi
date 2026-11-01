@@ -127,3 +127,93 @@ it(`deferral identity: an unchanged deferred canonical remains readable (scan ba
   assert.equal(captured?.journal.body.error, "original");
   assert.ok(captured?.context.expectedIdentity);
 });
+
+type RuntimeScan = "global" | "target" | "page";
+async function runtimeScan(box: Outbox, mode: RuntimeScan): Promise<void> {
+  if (mode === "global") { await box.hasPendingPolicyOutcome(); return; }
+  if (mode === "target") { await box.hasPendingPolicyOutcome(run); return; }
+  for (let page = 0; page < 20; page++) if ((await box.scanTerminalObservationsPage()).passComplete) return;
+  assert.fail("runtime fixture must finish within twenty bounded pages");
+}
+
+for (const mode of ["global", "target", "page"] as const) {
+  for (const observation of ["oversized", "unreadable"] as const)
+  it(`deferral identity: ${mode} runtime ${observation} evidence cannot authenticate later rewritten bytes`, async t => {
+    const f = await fixture(t);
+    await f.install(9, { status: "failed", error: "anchor" });
+    const reader = f.make({ terminalMaxBytes: 1024, runMaxBytes: 100000 });
+    await reader.init();
+    const file = path.join(f.dir, canonical);
+    await f.install(3, { status: "failed", error: "older small outcome" });
+    const small = await fs.readFile(file);
+    assert.equal(await f.writer.retireTerminal(run, 3), true);
+    await f.install(3, { status: "completed", report_md: "L".repeat(200000) });
+    assert.ok((await fs.stat(file)).size > 100000);
+    const inode = (await fs.lstat(file)).ino;
+    const lstat = fs.lstat;
+    let rejectedStats = 0;
+    if (observation === "unreadable") fs.lstat = (async (...args: Parameters<typeof fs.lstat>) => {
+      if (String(args[0]) === file) {
+        rejectedStats++;
+        throw Object.assign(new Error("runtime fixture cannot observe the file version"), { code: "EIO" });
+      }
+      return lstat(...args);
+    }) as typeof fs.lstat;
+    try { await runtimeScan(reader, mode); }
+    finally { fs.lstat = lstat; }
+    if (observation === "unreadable") assert.ok(rejectedStats > 0, "the actual stat path must exercise EIO");
+    assert.equal(reader.listPendingTerminals().find(p => p.claim_generation === 3)?.outcome_kind, "unknown");
+    await fs.writeFile(file, small);
+    assert.equal((await fs.lstat(file)).ino, inode);
+    assert.equal(await reader.readTerminalJournalForRetirement(run, 3), undefined,
+      "a retained UNKNOWN must not treat an unbound version as future authentication authority");
+    assert.equal(reader.listPendingTerminals().find(p => p.claim_generation === 3)?.outcome_kind, "unknown");
+    assert.equal(await reader.hasPendingPolicyOutcome(run), true);
+  });
+
+  it(`deferral identity: ${mode} runtime first-sight authentication of valid unchanged bytes still works`, async t => {
+    const f = await fixture(t);
+    await f.install(9, { status: "failed", error: "anchor" });
+    const reader = f.make({ terminalMaxBytes: 1024, runMaxBytes: 100000 });
+    await reader.init();
+    await f.install(3, { status: "failed", error: "original" });
+    await runtimeScan(reader, mode);
+    const captured = await reader.readTerminalJournalForRetirement(run, 3);
+    assert.equal(captured?.journal.body.error, "original");
+    assert.ok(captured?.context.expectedIdentity);
+  });
+}
+
+it("deferral identity: a later page cannot refresh the version of an already deferred first writer", async t => {
+  const f = await fixture(t);
+  await f.install(9, { status: "failed", error: "anchor" });
+  const file = path.join(f.dir, canonical);
+  await f.install(3, { status: "failed", error: "older small outcome" });
+  const older = await fs.readFile(file);
+  assert.equal(await f.writer.retireTerminal(run, 3), true);
+  // Create the reader before the current first writer appears, but serve a
+  // per-run budget that will defer that writer after reading the filler.
+  await f.install(3, { status: "completed", report_md: "N".repeat(400) });
+  const current = await fs.readFile(file);
+  assert.equal(await f.writer.retireTerminal(run, 3), true);
+  await f.install(1, { status: "failed", error: "f".repeat(2500) });
+  const fillerBytes = (await fs.stat(path.join(f.dir, filler))).size;
+  // Temporarily move the filler so it, too, first appears after reader.init().
+  const savedFiller = path.join(f.root, "saved-filler");
+  await fs.rename(path.join(f.dir, filler), savedFiller);
+  const reader = f.make({ runMaxBytes: fillerBytes + Math.floor(current.length / 2) });
+  await reader.init();
+  await fs.rename(savedFiller, path.join(f.dir, filler));
+  await fs.writeFile(file, current);
+  await ordered(f.dir, [filler, canonical, "terminal-9.json"], async () => {
+    const page = await reader.scanTerminalObservationsPage();
+    assert.equal(page.passComplete, false, "the first bounded page defers the canonical");
+    assert.equal(reader.listPendingTerminals().find(p => p.claim_generation === 3)?.outcome_kind, "unknown");
+    const inode = (await fs.lstat(file)).ino;
+    await fs.writeFile(file, older);
+    assert.equal((await fs.lstat(file)).ino, inode);
+    await runtimeScan(reader, "page");
+  });
+  assert.equal(await reader.readTerminalJournalForRetirement(run, 3), undefined);
+  assert.equal(reader.listPendingTerminals().find(p => p.claim_generation === 3)?.outcome_kind, "unknown");
+});

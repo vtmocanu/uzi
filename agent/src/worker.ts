@@ -831,6 +831,7 @@ export class Worker {
     const seen = new Set<string>();
     for (const entry of this.outbox?.listPendingOutcomeSources() ?? []) {
       if (signal?.aborted) return;
+      if (entry.server_settled) continue;
       if (entry.outcome_kind !== "policy_hold" && entry.outcome_kind !== "unknown") continue;
       const run_id = entry.run_id.toLowerCase();
       if (onlyRun !== undefined && run_id !== onlyRun.toLowerCase()) continue;
@@ -873,7 +874,9 @@ export class Worker {
     // snapshot. Freeze each original identity before the request, including existing lower records.
     // Only exact offered identities gain lifetime handoff; captured lower originals gain batch-only authority.
     const offeredFinalizes = this.outbox?.listPendingFinalizes() ?? [];
-    await this.observePendingPolicyOwnership(signal);
+    // Registration uses conservative overflow protection without ownership GETs.
+    // Observe ownership in the existing post-register boot/drain/sweep paths,
+    // after registration has started the heartbeat loop.
     const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes);
     const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
     const frozenFinalizes = this.captureFinalizes().filter(({ entry }) =>

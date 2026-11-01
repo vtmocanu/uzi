@@ -112,6 +112,8 @@ At that checkpoint, the worker had to fetch current main and supply its local ob
 
 **Deferred runtime alias scope:** runtime alias-promotion beyond the selected boot MAC-rejection repair remains deferred and fails closed; it is not an M1 closing obligation. The same-file deferral repair only binds eligibility/version updates and invalidation to the enrolled filename; it does not add arbitration ranks or a rejection cache.
 
+**Deferral and startup review repairs:** target, global and page scanners bind deferred UNKNOWN authentication to the observed file version. Failed stats and individually oversized observations revoke deferred eligibility; later pages cannot refresh an existing binding to replacement bytes. Valid unchanged first-sight and budget-deferred reads remain supported. Registration now publishes its conservative snapshot and starts heartbeats before ownership GETs, retaining the existing post-registration boot gate and reconciliation. Authenticated server-settled sources need no ownership refresh. Serial reconciliation after registration remains a residual cost; no ownership authority is inferred from an absent or slow response.
+
 The following final merged obligations remain unfinished:
 
 - After default integration, reevaluate affected-test coverage against the merged inputs. The current 125-file union passed and retains all eight terminal-rejection files, all changed tests and eleven additional direct callers.

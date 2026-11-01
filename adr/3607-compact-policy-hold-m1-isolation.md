@@ -151,9 +151,21 @@ or settlement authority.
 Deferral fields belong to the enrolled filename: an alias observation cannot
 stamp its version/eligibility onto another file or clear that file's eligibility.
 The existing version and selected-identity checks still control authentication.
+Target, global and page scanner placeholders bind that observed version before
+remaining deferred. Failed stats and individually oversized files revoke deferred
+authentication eligibility; an existing binding cannot be refreshed to a different
+version. First-sight authentication of valid unchanged bytes remains supported.
 Runtime displacement of a rejected UNKNOWN entry by an authenticated alias is
 deferred, retaining the baseline fail-closed boundary. No new rejection cache,
 ranking policy or lifetime/version-cache subsystem is introduced by this repair.
+
+Registration does not wait for ownership GETs. It publishes the conservative
+pending snapshot first and starts heartbeats before the existing boot, drain and
+sweep reconciliation reads. Those reads skip authenticated server-settled sources.
+Unknown ownership still grants no lease or claim authority, and incomplete
+coverage still cannot produce a complete `pending_all`. The remaining serial
+post-registration reconciliation cost is unchanged; this repair removes it only
+from the registration and heartbeat barrier.
 
 The targeted scanner and persistent recovery pager cooperate after at most 256
 visited entries per slice or a one-second elapsed-time checkpoint. Ignored entries
