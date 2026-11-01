@@ -7046,36 +7046,49 @@ export class GitCache {
   /** Independently confirm M1 evidence without nesting the caller's bare lock. */
   private async readRemediationUnderLock(barePath: string, branch: string,
     source: { runId: string; clonePath: string; attemptId: string },
-    durability: MemoryParkDurability = {}): Promise<RemediationRecovery | undefined> {
+    durability: MemoryParkDurability = {},
+    mode: "source-adoption" | "runtime-restrictions" = "source-adoption"): Promise<RemediationRecovery | undefined> {
     const stored = await this.remediationSourceUnderLock(barePath, branch, source);
     const r = stored.journal.remediationRecovery;
-    if (!r || r.edges.some(e => e.phase !== "committed") ||
-        (await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId, r.ownedTip)).kind !== "owned" ||
-        await this.worktreeHead(source.clonePath) !== r.ownedTip) return undefined;
+    if (!r) return undefined;
+    const refuse = (): undefined => {
+      if (mode === "runtime-restrictions") throw new Error("remediation runtime restriction proof unavailable");
+      return undefined;
+    };
+    if (r.edges.some(e => e.phase !== "committed")) return refuse();
+    const tracking = await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId,
+      mode === "source-adoption" ? r.ownedTip : undefined);
+    if (tracking.kind !== "owned" ||
+        await this.worktreeHead(source.clonePath) !== r.ownedTip) return refuse();
+    // Runtime restrictions authenticate S independently of the current tracking receipt, which
+    // has no attempt identity. They confer no execution or publication authority over tracking B.
+    if (tracking.sha !== r.ownedTip &&
+        (!await this.hasOwedAnchorUnderLock(barePath, source.runId, r.ownedTip) ||
+         await this.ancestry(barePath, r.ownedTip, tracking.sha) !== "ancestor")) return refuse();
     const ledger = await this.readAttemptLedger(barePath, branch);
     for (const g of [...r.edges.map(e => e.grant), ...(r.active ? [r.active] : [])]) {
       const original = ledger.get(g.originSource.attemptId);
       const shape = parseAttemptPath(g.originSource.clonePath, path.resolve(this.runnerRoot));
       if (!original || !sameRecoverySource(original, g.originSource) ||
-          shape?.attemptId !== g.originSource.attemptId) return undefined;
+          shape?.attemptId !== g.originSource.attemptId) return refuse();
       await this.requireOwedCommit(barePath, g.scannedTip);
       for (const q of g.flaggedOIDs) {
         await this.requireOwedCommit(barePath, q);
-        if (await this.ancestry(barePath, q, g.scannedTip) !== "ancestor") return undefined;
+        if (await this.ancestry(barePath, q, g.scannedTip) !== "ancestor") return refuse();
       }
     }
     for (const e of r.edges) {
       const context = await this.parseOwedContext(barePath, await this.readOwedFile(barePath, e.context));
       if ("origin" in context || context.runId !== e.grant.originSource.runId || context.branch !== branch ||
           this.contextName(context) !== e.context || !await this.hasOwedAnchorUnderLock(barePath, e.grant.originSource.runId, e.from))
-        return undefined;
+        return refuse();
       await this.requireOwedCommit(barePath, e.to);
-      if (await this.ancestry(barePath, e.grant.scannedTip, e.from) !== "ancestor") return undefined;
+      if (await this.ancestry(barePath, e.grant.scannedTip, e.from) !== "ancestor") return refuse();
       for (const q of e.grant.flaggedOIDs)
-        if (await this.ancestry(barePath, q, e.grant.scannedTip) !== "ancestor") return undefined;
+        if (await this.ancestry(barePath, q, e.grant.scannedTip) !== "ancestor") return refuse();
     }
     const canonical = recoveryJournalJson(stored.journal);
-    if (canonical !== stored.raw) return undefined;
+    if (canonical !== stored.raw) return refuse();
     await this.syncJournalAndReadBack(barePath, branch, canonical, durability);
     return parseRemediationRecovery(r);
   }
@@ -7087,6 +7100,18 @@ export class GitCache {
     try {
       return await this.withLock(barePath, () => this.readRemediationUnderLock(barePath, branch, source, durability));
     } catch { return undefined; }
+  }
+
+  /** Strict runtime restriction query only. Absence is successful; unavailable enrolled proof
+   * throws. This never creates pins, opens a grant, or admits execution/publication of tracking. */
+  async readRuntimeRemediationRecovery(barePath: string, branch: string,
+    expectedSource: { runId: string; clonePath: string; attemptId: string },
+    durability: MemoryParkDurability = {}): Promise<RemediationRecovery | undefined> {
+    return this.withLock(barePath, async () => {
+      // A successful config read proves an absent/cleared journal; failed reads must propagate.
+      if (await this.readRecoveryCaptureRaw(barePath, branch) === undefined) return undefined;
+      return this.readRemediationUnderLock(barePath, branch, expectedSource, durability, "runtime-restrictions");
+    });
   }
 
   async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string, attemptId?: string,

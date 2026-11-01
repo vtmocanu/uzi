@@ -29,7 +29,7 @@ import { AuthorityRefusal, SourceUseHeldRefusal } from "./authority-lock.js";
 import type { AuthorityRuntime, AuthorityWait } from "./authority-runtime.js";
 import { leaseEpoch, leaseHarness, type SourceUseLease } from "./completion-authority.js";
 import { buildClaudeSourceCore, buildCodexSourceCore, serializeSourceFence, sourceFenceOf } from "./completion-source.js";
-import type { MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
+import type { RemediationRecovery, MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
   RecoveryChargeInterruptedError,
@@ -2584,6 +2584,9 @@ interface RunFlight {
    *  checkpoint ticks within a flight (a fresh flight after a restart re-detects, which is fine —
    *  the finalize bridge in M3 is the correctness backstop). */
   steeredTips?: Set<string>;
+  /** Restriction latch only. Never authorizes source use; launch re-reads durable proofs. */
+  remediationRestrictions?: { roots: string[] };
+  remediationSourceInputs?: Readonly<{ cloneUrl: string; key: string }>;
   /** issue #1932: per-flight state of the pre-exit secret remediation gate (see
    *  RunRunner.runSecretRemediationGate). `known` = findings of the last trusted gate scan that
    *  suppress every checkpoint publication and make finalize fail (`push_secret_blocked`, no push)
@@ -3526,9 +3529,63 @@ export class RunRunner {
    * flight's lease is the current lease for that clone and (Codex) carries this executor's incarnation.
    */
   private async requireLaunchAuthority(flight: RunFlight): Promise<void> {
+    // Restrictions apply even on workers without a source-use authority runtime.
+    await this.inFlightAuthority(flight, async () => {
+      const record = await this.restoreRemediationRestrictions(flight);
+      if (!record) return;
+      const scan = await this.scanRemediationRange(flight, flight.barePath!, flight.branch!, record.ownedTip, true);
+      if (!scan.trusted || scan.findings.length) throw new Error("remediation continuation history unavailable");
+      for (const floor of scan.floorCandidates)
+        for (const root of flight.remediationRestrictions!.roots)
+          if (await this.git.ancestry(flight.barePath!, root, floor) !== "divergent")
+            throw new Error("remediation continuation published floor conflict");
+      // One pass over the durable, parser-bounded set; any failed proof stops launch.
+      for (const root of flight.remediationRestrictions!.roots)
+        if (await this.git.ancestry(flight.barePath!, root, record.ownedTip) !== "divergent")
+          throw new Error("remediation continuation history restricted");
+    });
     if (!this.authority || !flight.runnerClone) return;
     await this.authority.assertLaunchable(flight.runnerClone.path, flight.sourceLease, flight.executor.executorIncarnation,
       this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+  }
+
+  private rememberRemediationRestrictions(flight: RunFlight, journal: RecoveryJournalEntry): void {
+    const record = journal.remediationRecovery;
+    if (!record) return;
+    const state = flight.remediationRestrictions ??= { roots: [] };
+    state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from)])];
+  }
+
+  /** Public discovery distinguishes absence from refusal; the evidence query alone cannot.
+   * Call outside a bare lock, under the flight's source-use transaction. No cached proof grants launch. */
+  private async restoreRemediationRestrictions(flight: RunFlight): Promise<RemediationRecovery | undefined> {
+    const inputs = flight.remediationSourceInputs;
+    if (!inputs || !flight.barePath || !flight.branch || !flight.worktreePath ||
+        typeof this.git.discoverRetainedRecovery !== "function") {
+      if (flight.remediationRestrictions) throw new Error("remediation source identity unavailable");
+      return undefined;
+    }
+    try {
+      const selected = await this.git.discoverRetainedRecovery(inputs.cloneUrl, flight.branch, inputs.key, flight.runId);
+      if (selected) this.rememberRemediationRestrictions(flight, selected.journal);
+      if (!selected?.journal.remediationRecovery) {
+        if (flight.remediationRestrictions) throw new Error("remediation enrollment disappeared");
+        return undefined;
+      }
+      const attemptId = flight.predecessorCapture ? selected.journal.attemptId : flight.runnerClone?.attemptId;
+      if (selected.barePath !== flight.barePath || selected.journal.clonePath !== flight.worktreePath ||
+          selected.journal.attemptId !== attemptId || !attemptId)
+        throw new Error("remediation source identity changed");
+      const record = await this.git.readRuntimeRemediationRecovery(flight.barePath, flight.branch,
+        { runId: flight.runId, clonePath: flight.worktreePath, attemptId });
+      if (!record) throw new Error("remediation source evidence unconfirmed");
+      this.rememberRemediationRestrictions(flight, { ...selected.journal, remediationRecovery: record });
+      return record;
+    } catch (error) {
+      // An unreadable enrollment is held, rather than silently treated as absent.
+      flight.remediationRestrictions ??= { roots: [] };
+      throw error;
+    }
   }
 
   /**
@@ -11820,6 +11877,7 @@ export class RunRunner {
     // phase), before the clone/fetch writes to it. An optimisation only: free-space checks cannot
     // remove races, so the typed handling around ensureClone below is the guarantee.
     const coordinates = this.cloneCoordinates(claim);
+    flight.remediationSourceInputs = Object.freeze({ cloneUrl: claim.repo.clone_url, key: coordinates.key });
     flight.effectiveAttemptPaths = this.attemptPaths;
     let retainedJournal: RecoveryJournalEntry | undefined;
     const discoverRetained = async (required = false, branch = coordinates.branch) => {
@@ -12176,6 +12234,7 @@ export class RunRunner {
       /^[0-9a-f]{40}$/.test(flight.runnerClone.adoptedSource) ? flight.runnerClone.adoptedSource : undefined;
     await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId, flight.runnerClone?.attemptId,
       peeledMarker);
+    await this.inFlightAuthority(flight, () => this.restoreRemediationRestrictions(flight));
     batcher.emit({
       kind: "status",
       agent: "worker",
@@ -15678,7 +15737,7 @@ export class RunRunner {
     const state = flight.secretRemediation;
     return {
       version: 1,
-      blocked: !!((state?.known?.length ?? 0) || (state?.blocked?.length ?? 0) || state?.overflow),
+      blocked: !!(flight.remediationRestrictions || (state?.known?.length ?? 0) || (state?.blocked?.length ?? 0) || state?.overflow),
       everKnown: state?.everKnown === true,
       ...(state?.cleanTip ? { cleanTip: state.cleanTip } : {}),
       flaggedCommits: [...(state?.flaggedCommits ?? [])],
@@ -16641,9 +16700,10 @@ export class RunRunner {
    * A tracking tip whose floor does not resolve is `secret_scan_untrusted` — an unscanned range is
    * never published. Never throws.
    *
-   * BY DESIGN the park / shutdown / pause / capture publishes (and every overlay publish) are NOT
+   * BY DESIGN ordinary unenrolled park / shutdown / pause / capture publishes (and overlays) are NOT
    * scanned: permitted candidates reach the forge UNSCANNED, but #1964 holds findings
    * remembered in this flight at the shared pack/publish seam before any producer starts.
+   * Persisted remediation restrictions hold enrolled checkpoint publication unconditionally.
    * The ONE scanned exception is an eligible terminal run's held publication (issues #2545/#3030,
    * {@link RunRunner.heldPublicationStep}): it uploads work the worker would otherwise archive, so it
    * runs a fresh scan of its own range; an untrusted result needs a qualifying archive or protected custody.
@@ -16661,6 +16721,11 @@ export class RunRunner {
     if (identities.some(q => typeof q !== "string" || !/^[0-9a-f]{40}$/.test(q)))
       throw new Error("remediation finding identity unavailable");
     const flaggedOIDs = [...new Set(identities as string[])];
+    // A write that lands but fails readback must still restrict this flight's publication.
+    if (flaggedOIDs.length) {
+      const restrictions = flight.remediationRestrictions ??= { roots: [] };
+      restrictions.roots = [...new Set([...restrictions.roots, ...flaggedOIDs])];
+    }
     await this.inFlightAuthority(flight, () => this.git.recordRemediationScan(barePath, branch,
       { runId: flight.runId, clonePath: clone.path, attemptId: clone.attemptId! },
       { trusted: true, tip, flaggedOIDs, ...(origin ? { origin } : {}) }), this.authorityWait(flight));
@@ -16767,6 +16832,7 @@ export class RunRunner {
     barePath: string,
     branch: string,
     expectedTip: string,
+    explicitTip = false,
   ): Promise<
     | { trusted: true; range: CheckpointRange; findings: SecretFinding[]; floorCandidates: string[] }
     | { trusted: false; why: string }
@@ -16784,6 +16850,7 @@ export class RunRunner {
       defaultBranch: flight.checkpointDefaultBranch,
       confirmedTip: flight.lastCheckpointRefTip,
       extraFloors: floorCandidates,
+      ...(explicitTip ? { tipSha: expectedTip } : {}),
     });
     if (!range || range.tipSha !== expectedTip) return { trusted: false, why: "range_unresolved" };
     const scan = await this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() });
@@ -17330,9 +17397,10 @@ export class RunRunner {
   }
 
   /**
-   * Hold only process-local remembered findings, independently of finding-display metadata.
-   * At most the capped flaggedCommits list is read, serially; the first reachable/unknown SHA
-   * or git error holds the whole candidate. Clean-tip equality judges the source, not its wrapper.
+   * Enrolled sources remain held until candidate admission is wired. For ordinary unenrolled
+   * sources, read the capped process-local flaggedCommits list serially, independently of display
+   * metadata: the first reachable/unknown SHA or git error holds the candidate.
+   * Clean-tip equality judges the unenrolled source, not its wrapper.
    */
   private async checkpointRemediationHold(
     flight: RunFlight,
@@ -17341,6 +17409,9 @@ export class RunRunner {
     reap: boolean,
     sourceSha: string | null = candidate,
   ): Promise<boolean> {
+    // Until candidate admission is wired for every transform, enrollment is a publication hold.
+    // This covers wrappers and pack replays without trusting a cached clean tip.
+    if (flight.remediationRestrictions) return true;
     const state = flight.secretRemediation;
     if (!state) return false;
     if ((state.known?.length ?? 0) > 0 || (state.blocked?.length ?? 0) > 0 || state.overflow === true) return true;
@@ -23047,6 +23118,7 @@ export class RunRunner {
     flight.retainedEpisodeCustody = true;
     flight.retainedLocalCustody = true;
     flight.predecessorCapture = true;
+    this.rememberRemediationRestrictions(flight, source);
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;
@@ -23447,6 +23519,7 @@ export class RunRunner {
           }
           // The (possibly new) executor is bound to the successor's epoch before it runs anything there.
           await this.bindFlightSource(flight, successor.path);
+          await this.inFlightAuthority(flight, () => this.restoreRemediationRestrictions(flight));
           flight.batcher.emit({ kind: "status", agent: "worker", payload: {
             text: "retained work verified on a fresh local attempt; predecessor sources and custody retained",
           } });

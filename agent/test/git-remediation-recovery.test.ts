@@ -410,6 +410,114 @@ test("partial checkpoint rewrite and trusted rescan retain both displacement edg
     [[firstTip, partial, firstTip, 1], [partial, clean, partial, 2]]);
 });
 
+test("runtime restriction: positive absence succeeds, malformed enrollment and unavailable reads throw", async t => {
+  assert.equal(await cache.readRuntimeRemediationRecovery(bare, BRANCH, source()), undefined);
+  const saved = journal();
+  write({ ...saved, remediationRecovery: {} });
+  await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, source()));
+  write(saved);
+  const internal = cache as any;
+  const run = internal.runGit.bind(cache);
+  t.mock.method(internal, "runGit", async (dir: string, args: string[]) => {
+    if (args[0] === "config" && args.includes("--list")) throw Error("config unavailable");
+    return run(dir, args);
+  });
+  await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, source()), /config unavailable/);
+});
+
+test("runtime restriction: real committed M1 evidence confirms without writing pins or journal", async () => {
+  const { replacement } = await rewritten();
+  const before = raw();
+  const pins = pinnedRefs();
+  const synced: string[] = [];
+  const result = await cache.readRuntimeRemediationRecovery(bare, BRANCH, source(), {
+    sync: async (handle, what) => { synced.push(what); await handle.sync(); },
+  });
+  assert.equal(result?.ownedTip, replacement);
+  assert.equal(result?.edges[0]?.phase, "committed");
+  assert.deepEqual(synced, ["config", "directory"]);
+  assert.deepEqual(result, await cache.readRemediationRecovery(bare, BRANCH, source()));
+  assert.equal(raw(), before);
+  assert.equal(pinnedRefs(), pins);
+});
+
+test("runtime restriction: exact source identities, live ledger and clone HEAD remain independent proofs", async t => {
+  await enroll();
+  for (const wrong of [
+    { ...source(), runId: "other" },
+    { ...source(), clonePath: clone + "-stale" },
+    { ...source(), attemptId: successorAttempt },
+    { ...source(), attemptId: undefined } as any,
+  ]) await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, wrong));
+  commit("unimported source head");
+  await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, source()));
+  git(clone, "update-ref", "refs/heads/" + BRANCH, base);
+  t.mock.method(cache as any, "readAttemptLedger", async () => new Map());
+  await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, source()), /source binding/);
+});
+
+test("runtime restriction: prepared evidence, missing pins, receipt and durability failures throw", async () => {
+  const { displaced } = await rewritten();
+  const saved = journal();
+  const prepared = structuredClone(saved);
+  prepared.remediationRecovery.edges[0].phase = "prepared";
+  write(prepared);
+  await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, source()));
+  write(saved);
+  for (const target of ["config", "directory"] as const) {
+    await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, source(), {
+      sync: async (handle, what) => { if (what === target) throw Error("sync " + target); await handle.sync(); },
+    }), /sync/);
+  }
+  await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, source(), { readback: async () => "" }), /read-back/);
+  const receipt = path.join(bare, "uzi-owed", "receipt-" + createHash("sha256").update(BRANCH).digest("hex") + ".json");
+  const receiptRaw = fs.readFileSync(receipt, "utf8");
+  fs.writeFileSync(receipt, receiptRaw.replace('"committed"', '"pending"'));
+  await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, source()));
+  fs.writeFileSync(receipt, receiptRaw);
+  git(bare, "update-ref", "-d", "refs/uzi-owed/" + RUN + "/" + displaced, displaced);
+  await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, source()));
+});
+
+for (const proof of ["missing anchor", "divergent B", "anchored descendant B"] as const) {
+  test("runtime restriction: hypothetical B at receipt seam, " + proof, async t => {
+    const { replacement: s } = await rewritten();
+    if (proof !== "missing anchor") {
+      assert.equal((await cache.retainCurrentOwedCandidate(bare, opts)).kind, "updated");
+      assert.ok((await cache.enumerateOwedCandidates(bare, RUN)).some(c => c.sha === s));
+    } else {
+      // M1 import already preserves its replacement. Remove only S's pin for this refusal case.
+      git(bare, "update-ref", "-d", "refs/uzi-owed/" + RUN + "/" + s, s);
+      assert.ok(!(await cache.enumerateOwedCandidates(bare, RUN)).some(c => c.sha === s));
+    }
+    const b = git(bare, ...IDENT, "commit-tree", base + "^{tree}", "-p", proof === "divergent B" ? base : s, "-m", "hypothetical B");
+    // Reader-only fixture: the next task owns guarded B production writes. Substitute only
+    // the observed tracking SHA and receipt payload; real governance, stamp, context, source,
+    // ancestry and existing owed-anchor validation still run. No tracking ref is rewritten.
+    const internal = cache as any;
+    const read = internal.readOwedFile.bind(cache);
+    const receiptName = "receipt-" + createHash("sha256").update(BRANCH).digest("hex") + ".json";
+    t.mock.method(internal, "checkedTrackingSha", async () => b);
+    t.mock.method(internal, "readOwedFile", async (...args: any[]) => {
+      const value = await read(...args);
+      return args[1] === receiptName ? { ...value, trackingSha: b } : value;
+    });
+    const before = raw();
+    const pins = pinnedRefs();
+    assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
+    if (proof === "anchored descendant B") {
+      const result = await cache.readRuntimeRemediationRecovery(bare, BRANCH, source());
+      assert.equal(result?.ownedTip, s);
+      assert.equal(result?.edges.length, 1);
+      // A receipt contains no attempt; journal identity is still mandatory with tracking B.
+      await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, { ...source(), attemptId: successorAttempt }));
+    } else await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, source()));
+    assert.equal(raw(), before);
+    assert.equal(pinnedRefs(), pins);
+    assert.equal(git(bare, "rev-parse", "refs/uzi-runner/" + BRANCH), s);
+  });
+}
+
 const successorAttempt = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 2, "fedcba9876543210");
 const admitSource = { admitRemediationSource: async () => true };
 async function captureAdoption(roots: string[], current: string) {
