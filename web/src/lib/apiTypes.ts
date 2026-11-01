@@ -4289,7 +4289,8 @@ export type RateLimitSource = (typeof RATE_LIMIT_SOURCES)[number];
 export type MyRateLimits =
   | {
       status: "ok";
-      five_hour: RateLimitWindow;
+      /** Absent when the account has no 5-hour window (plans where Anthropic removed it). */
+      five_hour?: RateLimitWindow;
       seven_day: RateLimitWindow;
       source: RateLimitSource;
       synced_at: string; // ISO-8601

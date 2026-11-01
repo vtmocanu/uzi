@@ -113,7 +113,12 @@ func (m tuiModel) boardClaudeMeterSegs(now time.Time) []string {
 	segs := make([]string, 0, len(shown))
 	for _, t := range shown {
 		seg := paintSeg(m.pal.faintC, nil, false, m.renderer.Plain(t.Label, 16)+" ")
-		seg += m.rateWindowCell("5h", t.Limits.FiveHour, rateBarWidth, 0, now) + "   " + m.rateWindowCell("7d", t.Limits.SevenDay, rateBarWidth, 0, now)
+		// selectedRateMeters yields readable (ok) tokens only, so a nil 5h window here
+		// means the account has no 5-hour window: omit the cell instead of "5h -".
+		if t.Limits.FiveHour != nil || t.Limits.Status != "ok" {
+			seg += m.rateWindowCell("5h", t.Limits.FiveHour, rateBarWidth, 0, now) + "   "
+		}
+		seg += m.rateWindowCell("7d", t.Limits.SevenDay, rateBarWidth, 0, now)
 		// Prefix a per-group accent bar TIGHT against the label: it both delimits the group and
 		// doubles as a status light — alarm when the token's peak window pct ≥ rateDangerPct,
 		// faint otherwise. Emitted unconditionally via paintSeg so the group DELIMITER survives
