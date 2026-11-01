@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/slack-go/slack"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -23,6 +24,16 @@ import (
 // resumeThreadBlocks, so a publication kind never reaches that wording.
 const parkKindForgePublication = "forge_publication"
 
+// parkKindForgePublicationHold is the park_kind of a publication owner hold. Only this kind
+// posts a resume line: a timed wait ends by automatic retry, which is not news (the marker of a
+// wait is kept across retries so the next re-park of the same episode is not re-announced).
+const parkKindForgePublicationHold = "forge_publication_hold"
+
+// isPublicationParkKind reports either publication park kind.
+func isPublicationParkKind(kind string) bool {
+	return kind == parkKindForgePublication || kind == parkKindForgePublicationHold
+}
+
 const (
 	publicationPhaseWire    = "publication"
 	forgeUnreachableCause   = "forge_unreachable"
@@ -31,9 +42,22 @@ const (
 
 // publicationPark describes a publication-phase park: hold is true for an owner hold (no retry
 // stamp or a recorded hold reason) and reason is the side row's hold reason ("" when none).
+//
+// at is the owner episode's start (publication_wait_started_at), the marker value both kinds
+// are recorded under. It is NOT the run's status_since: every automatic retry re-parks with a
+// fresh status_since, which would announce each retry as a new park.
 type publicationPark struct {
 	hold   bool
 	reason string
+	at     pgtype.Timestamptz
+}
+
+// kind is the park_kind this park is recorded under.
+func (p publicationPark) kind() string {
+	if p.hold {
+		return parkKindForgePublicationHold
+	}
+	return parkKindForgePublication
 }
 
 // publicationParkOf returns the publication park of rc, or nil when rc is not one. The run
@@ -52,7 +76,7 @@ func (n *Notifier) publicationParkOf(ctx context.Context, rc store.GetSlackRunCo
 	if !run.RecoveryWaitPhase.Valid || run.RecoveryWaitPhase.String != publicationPhaseWire {
 		return nil
 	}
-	pp := &publicationPark{hold: !rc.RecoveryRetryNotBefore.Valid}
+	pp := &publicationPark{hold: !rc.RecoveryRetryNotBefore.Valid, at: rc.StatusSince}
 	side, err := n.store.GetActivePublicationResume(ctx, rc.ID)
 	switch {
 	case err == nil:
@@ -60,8 +84,14 @@ func (n *Notifier) publicationParkOf(ctx context.Context, rc store.GetSlackRunCo
 			pp.hold = true
 			pp.reason = side.HoldReason.String
 		}
+		if side.WaitStartedAt.Valid {
+			pp.at = side.WaitStartedAt
+		}
 	case !errors.Is(err, pgx.ErrNoRows):
+		// Without the episode there is no stable announcement key; stay silent rather than
+		// announce every retry.
 		n.logf("load publication hold", err)
+		return nil
 	}
 	return pp
 }

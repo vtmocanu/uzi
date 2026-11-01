@@ -28,6 +28,7 @@ type fakeNotifStore struct {
 	crossCheckRun store.Run
 	pubSide       *store.RunPublicationResume
 	pubSideErr    error
+	runErr        error
 	rcErr         error
 	delivery      pgtype.Text
 	deliveryErr   error
@@ -107,6 +108,9 @@ func (f *fakeNotifStore) GetSecretEnablement(_ context.Context, arg store.GetSec
 }
 
 func (f *fakeNotifStore) GetRunByID(context.Context, uuid.UUID) (store.Run, error) {
+	if f.runErr != nil {
+		return store.Run{}, f.runErr
+	}
 	return f.crossCheckRun, nil
 }
 

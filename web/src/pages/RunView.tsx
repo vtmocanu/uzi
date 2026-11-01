@@ -1629,9 +1629,14 @@ function PublicationParkBody({ run, mode, retryAt, ownerProof, busy, onResume, o
       )}
       {held && limitText && <p className="mt-1.5 text-xs text-muted">Wait limit: {limitText}.</p>}
       {target && <p className="mt-1.5 text-xs text-muted">Publishing to: {target}.</p>}
-      <p className="mt-1.5 text-xs text-muted">
-        The work is kept on its worker. Publication resumes without running the model again.
-      </p>
+      {/* True only for a timed wait and a retry-exhausted hold. The source-unavailable,
+          custodian-unavailable and model-required holds contradict it, and an unknown or
+          absent reason cannot establish it. */}
+      {(mode === "timed" || reason === "publication_retry_exhausted") && (
+        <p className="mt-1.5 text-xs text-muted">
+          The work is kept on its worker. Publication resumes without running the model again.
+        </p>
+      )}
       {held && <>
         <p className="mt-1.5 text-xs text-muted">Resume starts a new publication-only attempt with no model work and no other budget; it does not promise execution. Admission limits may still block it. Cancel ends the run.</p>
         {run.health_reason && <p className="mt-1.5 text-xs text-muted">Admission: {displayHealthReason(run)}</p>}
@@ -1775,9 +1780,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
           </>
         )}
         <p className="mt-1.5 text-xs text-muted">
-          {forgePark && publicationPark
-            ? "A worker heartbeat or an OK health flag does not verify forge reachability. Retry eligibility is not proof of recovery."
-            : forgePark
+          {forgePark
             ? "A worker heartbeat or an OK health flag does not verify forge reachability. Retry eligibility is not proof of recovery."
             : vaultPark
             ? "The run saved its work before parking; resume uses that recovery data."

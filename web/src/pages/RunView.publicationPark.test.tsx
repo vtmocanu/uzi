@@ -140,6 +140,26 @@ it.each([
   fireEvent.click(screen.getByRole("button", { name: /^Cancel$/ }));
   await waitFor(() => expect(submit).toHaveBeenCalledWith("cancel", "", undefined, undefined, false));
 });
+const KEPT_LINE = /The work is kept on its worker\. Publication resumes without running the model again\./;
+it("shows the kept-on-worker line for a timed wait and a retry-exhausted hold", () => {
+  const { unmount } = render(view(timed(), true));
+  expect(screen.getByText(KEPT_LINE)).toBeTruthy();
+  unmount();
+  render(view(held("publication_retry_exhausted"), true));
+  expect(screen.getByText(KEPT_LINE)).toBeTruthy();
+});
+it.each([
+  "publication_source_unavailable",
+  "publication_custodian_unavailable",
+  "publication_model_required",
+] as const)("omits the kept-on-worker line for hold %s", (reason) => {
+  render(view(held(reason), true));
+  // Positive control: the hold panel rendered with its reason, so the absence below can fail.
+  expect(screen.getByText(/Publishing held: needs your decision/, { selector: "p[role=status]" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: /^Resume$/ })).toBeTruthy();
+  expect(screen.queryByText(KEPT_LINE)).toBeNull();
+  expect(screen.queryByText(/kept on its worker/)).toBeNull();
+});
 it.each([undefined, false])("hides hold actions without confirmed owner proof (%s)", (proof) => {
   render(view(held("publication_retry_exhausted"), proof));
   expect(screen.getByText(/Only the confirmed run owner can Resume or Cancel/)).toBeTruthy();

@@ -24,6 +24,16 @@ func pubRun(t *testing.T, extra string) apitypes.RunDTO {
 	return r
 }
 
+func withForge(r apitypes.RunDTO, forge string) apitypes.RunDTO {
+	r.ForgeType = forge
+	return r
+}
+
+func withRunMR(r apitypes.RunDTO, iid int64) apitypes.RunDTO {
+	r.MrIID = &iid
+	return r
+}
+
 func TestPublicationParkLineTimedWait(t *testing.T) {
 	now := time.Date(2030, 1, 2, 12, 0, 0, 0, time.Local)
 	start := now.Add(-12 * time.Minute)
@@ -45,7 +55,11 @@ func TestPublicationParkLineTimedWait(t *testing.T) {
 	}{
 		{"limit", mk(&day, nil), "publishing paused: forge unreachable; waiting 12m of 24h, retry at 15:04"},
 		{"no limit", mk(nil, nil), "publishing paused: forge unreachable; waiting 12m, no limit, retry at 15:04"},
-		{"mr known", mk(&day, &apitypes.PublicationIntentDTO{Branch: "agent/issue-1", MrIID: &mr}), "retry at 15:04 · !42"},
+		{"mr known", mk(&day, &apitypes.PublicationIntentDTO{Branch: "agent/issue-1", MrIID: &mr}), "retry at 15:04 · MR !42"},
+		{"mr known github", withForge(mk(&day, &apitypes.PublicationIntentDTO{Branch: "agent/issue-1", MrIID: &mr}), "github"), "retry at 15:04 · PR #42"},
+		{"mr known forgejo", withForge(mk(&day, &apitypes.PublicationIntentDTO{Branch: "agent/issue-1", MrIID: &mr}), "forgejo"), "retry at 15:04 · PR #42"},
+		{"run mr github", withForge(withRunMR(mk(&day, nil), mr), "github"), "retry at 15:04 · PR #42"},
+		{"run mr gitlab", withRunMR(mk(&day, nil), mr), "retry at 15:04 · MR !42"},
 		{"branch only", mk(&day, &apitypes.PublicationIntentDTO{Branch: "agent/issue-1"}), "retry at 15:04 · branch agent/issue-1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -86,8 +100,13 @@ func TestPublicationHoldReasons(t *testing.T) {
 				t.Fatal("not an owner hold")
 			}
 			head := forgeParkLine(r)
-			if head != "publishing held: "+tc.want+" · !7" {
+			if head != "publishing held: "+tc.want+" · MR !7" {
 				t.Fatalf("headline %q", head)
+			}
+			gh := r
+			gh.ForgeType = "github"
+			if head := forgeParkLine(gh); head != "publishing held: "+tc.want+" · PR #7" {
+				t.Fatalf("github headline %q", head)
 			}
 			all := strings.Join(forgeRunLines(r), "\n")
 			requireWorkerCopy(t, all, "uzi run resume r1", "starts a new publication-only attempt; no model work", "uzi run cancel r1")

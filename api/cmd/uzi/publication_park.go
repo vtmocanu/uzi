@@ -29,7 +29,8 @@ const (
 	publicationHeldLeadPrefix = "publishing held: "
 )
 
-// publicationPhaseOf is the trimmed phase string, "" for the pre-clone park (null phase).
+// publicationPhaseOf is the phase string as the server sent it (not trimmed), "" for the
+// pre-clone park (null phase).
 func publicationPhaseOf(r apitypes.RunDTO) string {
 	return strOr(r.RecoveryWaitPhase, "")
 }
@@ -51,19 +52,30 @@ func isUnknownPhasePark(r apitypes.RunDTO) bool {
 func publicationTarget(r apitypes.RunDTO) string {
 	if in := r.PublicationIntent; in != nil {
 		if in.MrIID != nil {
-			return " · !" + itoa(int(*in.MrIID))
+			return " · " + publicationMRRef(r.ForgeType, *in.MrIID)
 		}
 		if b := cellText(in.Branch); b != "" {
 			return " · branch " + b
 		}
 	}
 	if r.MrIID != nil {
-		return " · !" + itoa(int(*r.MrIID))
+		return " · " + publicationMRRef(r.ForgeType, *r.MrIID)
 	}
 	if b := cellText(strOr(r.Branch, "")); b != "" {
 		return " · branch " + b
 	}
 	return ""
+}
+
+// publicationMRRef is the merge/pull request reference in the run's own forge vocabulary:
+// "MR !42" on GitLab (and any unknown forge), "PR #42" on GitHub and Forgejo, the same pairing
+// as mrAbbrev and slacksvc's forgeMrRef.
+func publicationMRRef(forgeType string, iid int64) string {
+	abbrev := mrAbbrev(forgeType)
+	if abbrev == "PR" {
+		return abbrev + " #" + itoa(int(iid))
+	}
+	return abbrev + " !" + itoa(int(iid))
 }
 
 // pubDuration renders whole hours as hours ("24h", not shortDuration's "1d") so the limit reads
