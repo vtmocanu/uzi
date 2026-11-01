@@ -392,3 +392,20 @@ test("config write failure cannot durably enroll remediation", async t => {
   await assert.rejects(enroll(), /config write/);
   assert.equal(journal().remediationRecovery, undefined);
 });
+
+
+test("partial checkpoint rewrite and trusted rescan retain both displacement edges", async () => {
+  const q = commit("still flagged"); await fetch();
+  const firstTip = commit("first scanned tip", q); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(),
+    { trusted: true, tip: firstTip, flaggedOIDs: [q], origin: "checkpoint-pending" });
+  const partial = commit("partial rewrite", q); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(),
+    { trusted: true, tip: partial, flaggedOIDs: [q], origin: "checkpoint-pending" });
+  const clean = commit("clean rewrite"); await fetch();
+  const restarted = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  const record = await restarted.readRemediationRecovery(bare, BRANCH, source());
+  assert.ok(record);
+  assert.deepEqual(record.edges.map(e => [e.from, e.to, e.grant.scannedTip, e.grant.id]),
+    [[firstTip, partial, firstTip, 1], [partial, clean, partial, 2]]);
+});

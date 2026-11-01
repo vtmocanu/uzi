@@ -88,7 +88,7 @@ describe("hooks require the outer transaction", () => {
 });
 
 describe("source-use admission", () => {
-  it("records the flight-visible lease; a normalize keeps the epoch, any other op mints a fresh one", async (t) => {
+  it("records the flight-visible lease; normalization keeps the epoch and reseeding mints a fresh one", async (t) => {
     const r = await rig(t);
     await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "seed-canonical"));
     const first = await slotOf(r.rt, r.clone);
@@ -955,5 +955,34 @@ describe("an end that could not be applied is retried by the drain", () => {
     let slot = await slotOf(successorOf(r), r.clone);
     for (let i = 0; i < 200 && slot?.state !== "ineligible"; i++) { await new Promise((resolve) => setTimeout(resolve, 20)); slot = await slotOf(successorOf(r), r.clone); }
     assert.equal(slot?.state, "ineligible");
+  });
+});
+
+
+describe("M1 remediation authenticates the bound source lease", () => {
+  for (const executor of [undefined, "codex-remediation-executor"]) {
+    it(`${executor ? "Codex" : "Claude"} keeps its lease, epoch and launch authority`, async t => {
+      const r = await rig(t);
+      const lease = await r.rt.bindSource(r.clone, executor);
+      const before = await slotOf(r.rt, r.clone);
+      await r.rt.assertLaunchable(r.clone, lease, executor);
+      await r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "remediation-recovery"));
+      assert.equal(r.rt.leaseFor(r.clone), lease);
+      const after = await slotOf(r.rt, r.clone);
+      assert.equal(after?.epoch, before?.epoch);
+      assert.deepEqual(after?.owner, before?.owner);
+      await r.rt.assertLaunchable(r.clone, lease, executor);
+      await r.rt.endSourceUse([r.clone]);
+      const ended = await slotOf(r.rt, r.clone);
+      await assert.rejects(r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "remediation-recovery")),
+        /current active source lease/);
+      assert.deepEqual(await slotOf(r.rt, r.clone), ended, "refusal creates no replacement epoch");
+    });
+  }
+  it("missing lease cannot mint a source epoch", async t => {
+    const r = await rig(t);
+    await assert.rejects(r.rt.withTransaction(() => r.rt.hooks.admitSourceUse(r.clone, "remediation-recovery")),
+      /current active source lease/);
+    assert.equal(await slotOf(r.rt, r.clone), null);
   });
 });

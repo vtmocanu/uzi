@@ -951,10 +951,10 @@ export class AuthorityRuntime implements AuthorityScope {
     // A restart retirement whose whole manifest is CONFIRMED deleted (lstat; see #finishRecordedRetirement) but whose
     // tombstone was never written (a crash or failed write after the last unlink) is finished here, so it cannot wedge
     // the path's next use. A pending binder for the path in this process defers it: the path stays refused.
-    await this.#finishRecordedRetirement(tx, store, key);
-    // A normalize works on the source its own epoch already covers: the same open lease keeps its
-    // epoch. Every other op starts a new use of the path and mints a fresh epoch first.
-    if (op === "normalize") {
+    if (op !== "remediation-recovery") await this.#finishRecordedRetirement(tx, store, key);
+    // Normalize can reuse an existing epoch. Remediation evidence must authenticate that exact
+    // open lease: it neither creates an epoch nor replaces a flight's executor-bound identity.
+    if (op === "normalize" || op === "remediation-recovery") {
       const held = this.#leases.get(key);
       const slot = held ? await this.#slotOf(tx, store, key) : null;
       if (held && slot && this.#ends.get(key) !== held && this.#ownedActive(store, slot, held)) {
@@ -963,6 +963,7 @@ export class AuthorityRuntime implements AuthorityScope {
         await store.admitSourceUse(tx, key, { lease: held });
         return;
       }
+      if (op === "remediation-recovery") throw new AuthorityRefusal("remediation requires the current active source lease");
     }
     // Only the canonical/attempt seeds may consume a live publication (git.ts runs them after the journal guards).
     await this.#mint(tx, store, key, CONSUMING_OPS.has(op) ? { consumePublication: true } : {});

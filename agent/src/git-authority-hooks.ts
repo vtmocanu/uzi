@@ -45,6 +45,8 @@
  *    Footprint: the fresh attempt dir. Owner: the bare lock.
  *  - "normalize": GitCache.normalizeRetainedSourceObjects, after attribution and before the
  *    supervised helper writes object permissions into the clone's objects and the bare's.
+ *  - "remediation-recovery": authenticate the current executor-bound lease before recording or
+ *    reading attempt-bound remediation evidence. Never mints an epoch or consumes a publication.
  *  - "replace": GitCache.prepareRecoverySuccessor, before the successor ledger/journal writes and
  *    clone. Footprint: the successor path and the journal that names the retained predecessors.
  *  - "discard": GitCache.discardRetainedSource, after the disposition check and before the first

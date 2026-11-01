@@ -5165,7 +5165,11 @@ export class RunRunner {
                   check();
                   // issue #3239: an unvetted marker (rollback refused) is never fetched back or published.
                   if (flight.wipMarkerUnsafe && await this.wipSafeTip(flight, worktreePath, branch) === null) return;
-                  const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, flight, runLog);
+                  const cause = flight.active!.gracefulShutdownCheckpoint!;
+                  if (cause.stopSignal.aborted || Date.now() >= cause.deadlineAt) return;
+                  const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, flight, runLog,
+                    {}, undefined, { signal: permit?.signal ?? cause.stopSignal,
+                      timeoutMs: Math.max(1, cause.deadlineAt - Date.now()) });
                   check();
                   if (fetched.kind === "refused") return;
                   // PRD #1416 M3 (C6): bridge a divergent tracking tip BEFORE the shutdown publish so
@@ -15754,7 +15758,7 @@ export class RunRunner {
     return sha;
   }
 
-  private async fetchTracking(flight: RunFlight, barePath: string, worktreePath: string, branch: string, options: Pick<FetchAgentBranchOptions, "expectedCandidateSha" | "checkpointImportMode" | "checkpointStep"> = {}, importScope: <T>(action: () => Promise<T>) => Promise<T> = action => action()): Promise<Extract<TrackingUpdateResult, { kind: "updated" }>> {
+  private async fetchTracking(flight: RunFlight, barePath: string, worktreePath: string, branch: string, options: Pick<FetchAgentBranchOptions, "expectedCandidateSha" | "checkpointImportMode" | "checkpointStep"> = {}, importScope: <T>(action: () => Promise<T>) => Promise<T> = action => action(), sourceAuthorityWait?: AuthorityWait): Promise<Extract<TrackingUpdateResult, { kind: "updated" }>> {
     if (flight.wipMarkerUnsafe || flight.wipUnsafeMarkers?.size) {
       const safeTip = await this.wipSafeTip(flight, worktreePath, branch);
       if (safeTip === null || (options.expectedCandidateSha !== undefined && options.expectedCandidateSha !== safeTip))
@@ -15769,7 +15773,7 @@ export class RunRunner {
         barePath, worktreePath, branch, flight.runId, { ...owed, ...options },
       );
       const result = owed.producingSource
-        ? await this.inFlightAuthority(flight, acquire, this.authorityWait(flight)) : await acquire();
+        ? await this.inFlightAuthority(flight, acquire, sourceAuthorityWait ?? this.authorityWait(flight)) : await acquire();
       if (result.kind === "not_updated") throw this.preservationRefused(flight, result.reason);
       if (result.divergence === "divergent") {
         const heads = result.displacedSha && result.retainedShas.includes(result.displacedSha) ? [result.displacedSha] : [];
@@ -15796,9 +15800,10 @@ export class RunRunner {
     runLog: Logger,
     options: Pick<FetchAgentBranchOptions, "expectedCandidateSha" | "checkpointImportMode" | "checkpointStep"> = {},
     importScope?: <T>(action: () => Promise<T>) => Promise<T>,
+    sourceAuthorityWait?: AuthorityWait,
   ): Promise<FetchBackOutcome> {
     try {
-      await this.fetchTracking(flight, barePath, worktreePath, branch, options, importScope);
+      await this.fetchTracking(flight, barePath, worktreePath, branch, options, importScope, sourceAuthorityWait);
       return { kind: "updated" };
     } catch (e) {
       if (isCheckpointBoundaryFailure(e)) throw e;

@@ -7020,9 +7020,13 @@ export class GitCache {
           await this.requireOwedCommit(barePath, q);
           if (await this.ancestry(barePath, q, scan.tip) !== "ancestor") throw new Error("remediation finding not reachable");
         }
-        // Repeated pending findings keep the original monotonic identity. New findings/decisions
-        // create a new identity; all completed edges retain their original grant.
-        if (!active || active.origin !== scan.origin || scan.flaggedOIDs.some(q => !active!.flaggedOIDs.includes(q))) {
+        // Keep a grant only while its scanned history still reaches the new scan. A partial
+        // rewrite can leave the same finding on a different lineage; it needs a fresh grant,
+        // while completed edges retain their original proof.
+        const lineage = active ? await this.ancestry(barePath, active.scannedTip, scan.tip) : undefined;
+        if (lineage === "unknown") throw new Error("remediation scan lineage unavailable");
+        if (!active || lineage === "divergent" || active.origin !== scan.origin ||
+            scan.flaggedOIDs.some(q => !active!.flaggedOIDs.includes(q))) {
           sequence++;
           active = { id: sequence, origin: scan.origin, originSource: { ...source }, scannedTip: scan.tip, flaggedOIDs: [...new Set(scan.flaggedOIDs)] };
         }
