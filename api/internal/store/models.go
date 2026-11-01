@@ -1220,6 +1220,7 @@ type Run struct {
 	ForgeAdmission              []byte             `json:"forge_admission"`
 	CodexSelectReason           pgtype.Text        `json:"codex_select_reason"`
 	RecoveryWaitPhase           pgtype.Text        `json:"recovery_wait_phase"`
+	PlanCrossCheckGated         bool               `json:"plan_cross_check_gated"`
 }
 
 type RunCompletionAttempt struct {

@@ -1620,6 +1620,10 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  implementation. The M1 worker parks it for human review while the checker is unavailable.
    *  Omitted by older servers and on runs without the requirement. */
   plan_cross_check_required?: boolean;
+  /** PRD #3708: this human-gated run has its plan cross-checked BEFORE the ordinary human plan
+   *  gate; every checker outcome, APPROVE included, still opens that gate. The api sends it only
+   *  to a worker that advertises cross_check_gated_v1, so an older api or worker never sees it. */
+  plan_cross_check_gated?: boolean;
   /** Independent code-check consent snapshot. Absent on older APIs means disabled. */
   code_cross_check_required?: boolean;
   /** PRD #2460 rework: additive api-capability signal that this server accepts a Codex lead's

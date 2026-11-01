@@ -975,6 +975,10 @@ export class Worker {
           // checker (claude-cross-check.ts). Advertised UNCONDITIONALLY: the Claude SDK is
           // always present, and the api requires it of a worker claiming a Claude child.
           "cross_check_codex_lead_v1",
+          // PRD #3708 M2: this image runs the gated plan cross-check loop (the check runs before
+          // the human plan gate). Advertised UNCONDITIONALLY: the api sends plan_cross_check_gated
+          // only to a worker advertising it, so an older image keeps the ordinary gate.
+          "cross_check_gated_v1",
           // PRD #1230 M4 (dormant): this image runs the semantic plan checker child and
           // publishes maintainer-pending (completion_pending) delivery non-closing. Advertised
           // UNCONDITIONALLY: the api makes each a hard claim clause of its semantic runs only,

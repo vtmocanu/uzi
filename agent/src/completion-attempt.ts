@@ -141,6 +141,12 @@ export class CompletionHistory {
   }
 }
 
+/** A nonempty server-projected decision means the original completion scope may be obsolete. */
+export function hasClaimedOwnerCompletionScope(ctx: RunContext): boolean {
+  const scope = ctx.config?.completion_scope;
+  return (scope?.deferred?.length ?? 0) > 0 || (scope?.accepted?.length ?? 0) > 0;
+}
+
 /** Worker-authored rework; an answered question requires a fresh server check, even without prose. */
 export function buildCompletionReworkFollowUp(
   unmet: string[],

@@ -52,6 +52,13 @@ import type { Logger } from "./log.js";
 import { parseAgentSelection, type AgentSelectionParse, type Milestone, type UserInput } from "./protocol.js";
 import { errMessage, sleep } from "./util.js";
 
+type CanonicalPlanApproval = {
+  plan: string;
+  milestones: Milestone[];
+  candidate_digest: string;
+  claimGeneration: number;
+};
+
 /** The outcome of the plan-approval gate. On approve, `selection` is the parsed
  *  `approve_plan` body (PRD #37): the executor resolves it against the run's
  *  detected roster (absent → run default; malformed → own, never repo). A `revise`
@@ -59,7 +66,9 @@ import { errMessage, sleep } from "./util.js";
  *  constructs only the human variant; automatic provenance is worker-only and has
  *  no input receipt to settle (approve/reject/cancel are terminal; revise is not). */
 export type PlanVerdict =
-  | { kind: "approve"; approval?: "human"; selection: AgentSelectionParse }
+  | { kind: "approve"; approval?: "human"; selection: AgentSelectionParse;
+      /** Presented canonical candidate, carried only after the human gate approves it. */
+      canonical?: CanonicalPlanApproval }
   | {
       kind: "approve";
       approval: "cross_check";
@@ -68,12 +77,7 @@ export type PlanVerdict =
       selection: AgentSelectionParse;
       /** One server-normalized candidate, delivered only after exact approval and durable applied ACK.
        * Consumers must adopt plan and milestones together; no local candidate fallback. */
-      canonical: {
-        plan: string;
-        milestones: Milestone[];
-        candidate_digest: string;
-        claimGeneration: number;
-      };
+      canonical: CanonicalPlanApproval;
     }
   | { kind: "reject"; reason: string; sourceGateRevision?: number }
   | { kind: "cancel" }
