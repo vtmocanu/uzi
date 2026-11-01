@@ -89,7 +89,7 @@ func testPrerequisiteFinalShutdown(t *testing.T, present bool) {
 			done <- answer{err: err}
 			return
 		}
-		defer res.Body.Close()
+		defer func() { _ = res.Body.Close() }()
 		var out struct {
 			Reason   string `json:"reason"`
 			Released bool   `json:"released"`

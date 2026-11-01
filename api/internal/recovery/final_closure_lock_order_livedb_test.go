@@ -65,7 +65,10 @@ func TestRecoveryClosureFinalClosureLastLockOrderLiveDB(t *testing.T) {
 		cancel()
 		_ = tx.Rollback(context.Background())
 		select {
-		case <-done:
+		case err := <-done:
+			if err != nil {
+				t.Logf("FINAL request settled after cleanup cancel: %v", err)
+			}
 		case <-time.After(2 * time.Second):
 			t.Error("FINAL request did not settle")
 		}
