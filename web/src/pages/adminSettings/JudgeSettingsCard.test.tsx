@@ -48,7 +48,11 @@ describe("JudgeSettingsCard model validation (#3255)", () => {
     expect(mockApi.updateSettings).not.toHaveBeenCalled();
   });
 
-  it("warns beneath the Codex picker for a stored invalid Codex ID and blocks Save", () => {
+  it("warns beneath the Codex picker for a stored invalid Codex ID without locking unrelated saves", () => {
+    mockApi.updateSettings.mockResolvedValue({
+      settings: { ...settings, codex_judge_model: "bad id", judge_model: "sonnet" },
+      sources: { judge_model: "db", codex_judge_model: "db" },
+    } as never);
     render(
       <JudgeSettingsCard
         settings={{ ...settings, codex_judge_model: "bad id" }}
@@ -59,7 +63,13 @@ describe("JudgeSettingsCard model validation (#3255)", () => {
     );
     expect(screen.getByText("Model must be a single token with no spaces.")).toBeTruthy();
     fireEvent.change(screen.getByLabelText("Claude judge model"), { target: { value: "sonnet" } });
-    expect(save().disabled).toBe(true);
+    // The untouched stored value is never sent, so it must not block saving the change.
+    expect(save().disabled).toBe(false);
+    fireEvent.submit(save().closest("form")!);
+    expect(mockApi.updateSettings).toHaveBeenCalledTimes(1);
+    const payload = mockApi.updateSettings.mock.calls[0]?.[0] ?? {};
+    expect(payload).toMatchObject({ judge_model: "sonnet" });
+    expect(payload).not.toHaveProperty("codex_judge_model");
   });
 
   it("enforce help no longer calls the built-in the strongest and points at the pickers", () => {

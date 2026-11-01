@@ -8,8 +8,8 @@ import { Alert, Button, Card, Field, SectionTitle } from "../../components/ui";
 // SummarySettingsCard is the admin surface for the run-summary model (PRD #362
 // Decision 8): the cheap model the inline plain-English run-summary generator runs
 // on. It uses the curated Claude model picker with a custom-ID escape (no Default
-// option: the value is always a model). The value the value rides the ISSUE-run claim, not the judge claim, and a per-user
-// override wins where set. Saved independently through the same settings PUT.
+// option: the value is always a model). The value rides the ISSUE-run claim, not the
+// judge claim, and a per-user override wins where set. Saved independently through the same settings PUT.
 export function SummarySettingsCard({
   settings,
   onSaved,
@@ -48,10 +48,6 @@ export function SummarySettingsCard({
     if (modelInvalid) return;
     setError("");
     setNotice("");
-    if (modelDirty && model.trim() === "") {
-      setError("The summary model must not be empty.");
-      return;
-    }
     setBusy(true);
     try {
       // Only the changed keys, so saving one control never rewrites the other.

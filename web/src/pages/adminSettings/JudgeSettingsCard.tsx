@@ -68,7 +68,13 @@ export function JudgeSettingsCard({
   const codexCustomEmpty = codexCustom && codexModel.trim() === "";
   const claudeWarning = modelFieldWarning(model);
   const codexWarning = modelFieldWarning(codexModel);
-  const blocked = claudeCustomEmpty || codexCustomEmpty || claudeWarning !== "" || codexWarning !== "";
+  // A malformed ID blocks only when it is the change being saved (parity with Run defaults):
+  // an untouched stored value is never sent, so it must not lock the kill-switch.
+  const blocked =
+    claudeCustomEmpty ||
+    codexCustomEmpty ||
+    (model !== pinned && claudeWarning !== "") ||
+    (codexModel !== codexPinned && codexWarning !== "");
   // PRD #3245 legacy warning: the stored instance Claude value is a Codex id, which
   // Claude judges skip in favour of the built-in. Shown until the admin changes it.
   const legacyCodexInClaude = pinned !== "" && model === pinned && CODEX_ROLE_MODELS.includes(pinned.trim());
