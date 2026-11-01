@@ -158,6 +158,22 @@ const state = {
 // git-over-HTTPS Basic push traversed forge-fake (exposed on /_e2e/state).
 const gitStats = { receivePackPosts: 0, uploadPackPosts: 0 };
 
+// Injected API faults (NOT persisted; a container recreate clears them). POST /_e2e/faults
+// {surface:"create-mr", status, count} makes the next `count` merge/pull-request CREATE
+// calls on the GitLab, Forgejo and GitHub routes answer `status`; count 0 clears. Used by
+// the publication-park e2e phase to outlast the agent's MR-create retry schedule.
+const FAULT_SURFACES = ["create-mr"];
+const faults = /** @type {Record<string, {status: number, remaining: number}>} */ ({});
+
+// takeFault(surface) -> the status to answer with, or 0 when no fault is armed. Each
+// call that returns a status consumes one of the armed count.
+function takeFault(surface) {
+  const f = faults[surface];
+  if (!f || f.remaining <= 0) return 0;
+  f.remaining--;
+  return f.status;
+}
+
 function persist() {
   try {
     fs.writeFileSync(
@@ -797,7 +813,31 @@ const server = https.createServer(
         project: PROJECT,
         projects: PROJECTS,
         gitStats,  // PRD #97 M1: smart-HTTP push/fetch counters (positive transport control)
+        faults,    // armed fault injections (surface -> {status, remaining})
       });
+    }
+    // Arm (or clear, with count 0) a fault. Body {surface, status, count}.
+    if (method === "POST" && path === "/_e2e/faults") {
+      const body = await readBody(req);
+      const surface = String(body.surface || "");
+      if (!FAULT_SURFACES.includes(surface)) {
+        return send(res, 400, { message: `bad fault surface ${JSON.stringify(surface)}` });
+      }
+      const count = body.count;
+      if (!Number.isInteger(count) || count < 0) {
+        return send(res, 400, { message: "count must be a non-negative integer" });
+      }
+      if (count === 0) {
+        delete faults[surface];
+        log("_e2e fault cleared", surface);
+        return send(res, 200, { surface, status: 0, remaining: 0 });
+      }
+      if (!Number.isInteger(body.status) || body.status < 400 || body.status > 599) {
+        return send(res, 400, { message: "status must be an integer 400..599" });
+      }
+      faults[surface] = { status: body.status, remaining: count };
+      log("_e2e fault armed", surface, body.status, "x", count);
+      return send(res, 200, { surface, status: body.status, remaining: count });
     }
     if (method === "GET" && (path === "/_e2e/health" || path === "/")) {
       return send(res, 200, { ok: true });
@@ -1281,6 +1321,11 @@ const server = https.createServer(
         // the same head, so a resumed finish reuses it (matches Forgejo's
         // ErrPullRequestAlreadyExists). head/base are branch names.
         const body = await readBody(req);
+        const fault = takeFault("create-mr");
+        if (fault) {
+          log("fj PR create fault", fault);
+          return send(res, fault, { message: `injected fault ${fault}` });
+        }
         const dup = state.mrs.find((m) => m.source_branch === body.head && m.target_branch === body.base && m.state === "opened");
         if (dup) {
           log("fj PR create 409 (open PR exists)", dup.iid, body.head);
@@ -1600,6 +1645,11 @@ const server = https.createServer(
           // head/base — GitHub's generic-validation status, which the worker's
           // driver-declared duplicate set {409,422} catches (R6).
           const body = await readBody(req);
+          const fault = takeFault("create-mr");
+          if (fault) {
+            log("gh PR create fault", fault);
+            return send(res, fault, { message: `injected fault ${fault}` });
+          }
           const dup = state.mrs.find((m) => m.source_branch === body.head && m.target_branch === body.base && m.state === "opened");
           if (dup) {
             log("gh PR create 422 (open PR exists)", dup.iid, body.head);
@@ -1970,6 +2020,11 @@ const server = https.createServer(
       }
       if (method === "POST" && rest === "/merge_requests") {
         const body = await readBody(req);
+        const fault = takeFault("create-mr");
+        if (fault) {
+          log("MR create fault", fault);
+          return send(res, fault, { message: `injected fault ${fault}` });
+        }
         // GitLab returns 409 when an OPEN MR already exists for this
         // source->target branch pair; the worker catches it and reuses the existing
         // MR (findOpenMr) instead of stacking a second one. Emulate that so a ci_fix

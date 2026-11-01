@@ -427,6 +427,45 @@ for fold in '.run.status="failed"' '.run.forge_park_count=0' '.run.recovery_wait
   custody_case "Resume response refuses $fold" fail 'Resume did not queue one ordinary attempt' forge_resume_response_contract
 done
 
+# Issue #1324 publication-park helpers. custody_case runs each helper in a command
+# substitution, so the stubs below live and die inside that subshell.
+eval "$(awk '/^publication_park_ready\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^publication_hold_ready\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^run_executor_runs\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^fake_fault_create_mr\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^fake_clear_create_mr_fault\(\) \{/' "$LIB")"
+pub_wrap() {
+  apiget() { printf '%s' "$PUB_VIEW"; }
+  fake_post() { printf '%s %s\n' "$1" "$2" >> "$SEQ_DIR/fake-post"; }
+  "$@"
+}
+pub_fault_wrap() { : > "$SEQ_DIR/fake-post"; pub_wrap "$@"; cat "$SEQ_DIR/fake-post"; }
+PUB_PARK='{"run":{"status":"recovery_wait","recovery_wait_cause":"forge_unreachable","recovery_wait_phase":"publication","recovery_retry_not_before":"2026-01-01T00:00:00Z"}}'
+PUB_HOLD='{"run":{"status":"recovery_wait","recovery_wait_cause":"forge_unreachable","recovery_wait_phase":"publication","recovery_retry_not_before":null,"publication_hold_reason":"publication_retry_exhausted"}}'
+PUB_VIEW="$PUB_PARK"
+custody_case "publication park is ready" pass true pub_wrap publication_park_ready R
+custody_case "publication park is not an owner hold" pass false pub_wrap publication_hold_ready R
+PUB_VIEW="$PUB_HOLD"
+custody_case "publication hold is ready" pass true pub_wrap publication_hold_ready R
+custody_case "publication hold is not a timed park" pass false pub_wrap publication_park_ready R
+for fold in '.run.recovery_wait_phase=null' '.run.recovery_wait_cause="provider_outage"'; do
+  PUB_VIEW="$(printf '%s' "$PUB_PARK" | jq -c "$fold")"
+  custody_case "park refuses $fold" pass false pub_wrap publication_park_ready R
+done
+PUB_VIEW="$(printf '%s' "$PUB_HOLD" | jq -c '.run.publication_hold_reason="publication_custodian_unavailable"')"
+custody_case "hold refuses another hold reason" pass false pub_wrap publication_hold_ready R
+PUB_VIEW="$(printf '%s' "$PUB_PARK" | jq -c '.run.recovery_wait_phase=null')"
+custody_case "pre-clone park is not a publication park" pass false pub_wrap publication_park_ready R
+PUB_VIEW='{"run":{"status":"failed"}}'
+custody_case "terminal run aborts park polling" fail 'unexpectedly terminal' pub_wrap publication_park_ready R
+custody_case "terminal run aborts hold polling" fail 'unexpectedly terminal' pub_wrap publication_hold_ready R
+PUB_VIEW='{"messages":[{"kind":"text","payload":{"text":"stub work committed locally"}},{"kind":"text","payload":{"text":"other"}},{"kind":"status","payload":{"text":"stub work committed locally"}}]}'
+custody_case "executor runs counts only stub text messages" pass 1 pub_wrap run_executor_runs R
+PUB_VIEW='{"messages":[]}'
+custody_case "no messages means no executor run" pass 0 pub_wrap run_executor_runs R
+custody_case "fault helper arms create-mr with status and count" pass '/_e2e/faults {"surface":"create-mr","status":503,"count":8}' pub_fault_wrap fake_fault_create_mr 503 8
+custody_case "fault clear helper sends count 0" pass '/_e2e/faults {"surface":"create-mr","count":0}' pub_fault_wrap fake_clear_create_mr_fault
+
 # Drive the real sequential outbox creation seam, not just the admission helper.
 # Each fresh claim must observe a saturated-then-free owner before create_run.
 eval "$(awk '/^make_outbox_run\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"

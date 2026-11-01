@@ -334,6 +334,36 @@ test("shared fake HTTPS comment, author and publication contracts", { timeout: 3
     }
   });
 
+  await t.test("POST /_e2e/faults fails the next count MR/PR creates on every forge, then succeeds", async () => {
+    const bad = [
+      { surface: "nope", status: 503, count: 1 },
+      { surface: "create-mr", status: 200, count: 1 },
+      { surface: "create-mr", status: 503, count: -1 },
+      { surface: "create-mr", status: 503, count: 1.5 },
+    ];
+    for (const body of bad) assert.equal((await request("/_e2e/faults", "POST", body)).status, 400, JSON.stringify(body));
+    const creates = [
+      ["GitLab", "/api/v4/projects/1/merge_requests", (n) => ({ source_branch: `fault/gl-${n}`, target_branch: "main", title: "t", description: "d" })],
+      ["Forgejo", "/api/v1/repos/group/repo/pulls", (n) => ({ head: `fault/fj-${n}`, base: "main", title: "t", body: "d" })],
+      ["GitHub", "/api/v3/repos/group/repo/pulls", (n) => ({ head: `fault/gh-${n}`, base: "main", title: "t", body: "d" })],
+    ];
+    for (const [forge, route, mk] of creates) {
+      const armed = await request("/_e2e/faults", "POST", { surface: "create-mr", status: 503, count: 2 });
+      assert.deepEqual([armed.status, armed.body.remaining], [200, 2]);
+      assert.equal((await get("/_e2e/state")).body.faults["create-mr"].remaining, 2);
+      const before = (await get("/_e2e/state")).body.mrs.length;
+      assert.equal((await request(route, "POST", mk(1))).status, 503, `${forge} first`);
+      assert.equal((await request(route, "POST", mk(2))).status, 503, `${forge} second`);
+      assert.equal((await get("/_e2e/state")).body.mrs.length, before, `${forge} faulted creates must not create`);
+      assert.equal((await request(route, "POST", mk(3))).status, 201, `${forge} after count`);
+      assert.equal((await get("/_e2e/state")).body.mrs.length, before + 1);
+    }
+    // count 0 clears an armed fault.
+    await request("/_e2e/faults", "POST", { surface: "create-mr", status: 503, count: 5 });
+    assert.equal((await request("/_e2e/faults", "POST", { surface: "create-mr", count: 0 })).status, 200);
+    assert.equal((await request(creates[0][1], "POST", creates[0][2](9))).status, 201);
+  });
+
   await t.test("GitLab notes remain shared and unchanged", async () => {
     const route = "/api/v4/projects/2/issues/80/notes";
     const posted = await request(route, "POST", { body: "gitlab shared note" });
