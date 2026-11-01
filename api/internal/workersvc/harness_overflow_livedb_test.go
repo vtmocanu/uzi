@@ -426,6 +426,32 @@ func TestHarnessOverflowCreationOverrideInheritanceLiveDB(t *testing.T) {
 	}
 }
 
+func TestHarnessOverflowInheritRefusalCompatibilityLiveDB(t *testing.T) {
+	for _, scenario := range []string{"off", "explicit Codex", "preferred Codex"} {
+		t.Run(scenario, func(t *testing.T) {
+			fx := newOverflowFix(t)
+			var explicit *Harness
+			switch scenario {
+			case "off":
+				fx.env.exec("UPDATE users SET harness_overflow_enabled=false,default_harness='codex' WHERE id=$1", fx.userID)
+			case "explicit Codex":
+				h := HarnessCodex
+				explicit = &h
+			case "preferred Codex":
+				setDefaultHarness(t, fx.env, fx.userID, "codex")
+			}
+			_, err := fx.svc.CreateRun(fx.env.ctx, fx.userID, fx.repoID, fx.nextIssue(),
+				"inherit", nil, nil, false, nil, explicit, &RawCredentialOverride{Mode: CredentialOverrideModeInherit})
+			if !errors.Is(err, ErrCredentialOverrideHarnessUnsupported) {
+				t.Fatalf("legacy refusal changed: %v", err)
+			}
+			if fx.runs() != 0 {
+				t.Fatal("refused override left a run")
+			}
+		})
+	}
+}
+
 func TestHarnessOverflowUnavailableDefaultPreservesPreferredLiveDB(t *testing.T) {
 	for _, preference := range []string{"claude", "codex"} {
 		for _, state := range []string{"quarantined", "reauth_required"} {

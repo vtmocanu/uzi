@@ -7848,8 +7848,16 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// The pinned-secret lookup reads through the tx-bound q (issue #1626), not the pool, so
 		// no second connection is taken while this closure holds the run-branch lock.
 		effOverride := credOverride
-		if rawOverride != nil {
-			ov, verr := validateCredentialOverrideOn(ctx, q, userID, runkind.Issue, string(resolved.Harness), rawOverride.Mode, rawOverride.SecretID)
+		requestOverride := rawOverride
+		if requestOverride != nil && requestOverride.Mode == CredentialOverrideModeInherit &&
+			resolved.Decision != nil && resolved.Decision.Reason == "overflow" {
+			// Inherit carries no Anthropic assignment. Normalize it only for
+			// this new creation-time decision; the shared validator retains
+			// its existing Codex refusal for explicit/default/off paths.
+			requestOverride = nil
+		}
+		if requestOverride != nil {
+			ov, verr := validateCredentialOverrideOn(ctx, q, userID, runkind.Issue, string(resolved.Harness), requestOverride.Mode, requestOverride.SecretID)
 			if verr != nil {
 				return store.Run{}, verr
 			}
