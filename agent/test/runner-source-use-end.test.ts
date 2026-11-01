@@ -623,6 +623,44 @@ describe("pending remediation source end foundation", () => {
     assert.equal((await slotOf(r.rt, canonical))?.state, "active");
   });
 
+  // Partial Git seam only: real authority epochs and retirement, stubbed Git evidence.
+  for (const producer of ["positive", "negative"] as const) {
+    it(`source finding unit: predecessor ${producer} uses independent selected attempt through source end`, async t => {
+      const { r, bare, canonical, flight, record, subject } = await setup();
+      flight.predecessorCapture = true;
+      flight.remediationPredecessorAttempt = attemptId;
+      flight.runnerClone = { path: canonical + "-different", attemptId: "not-the-predecessor" };
+      const writer = t.mock.method(git,
+        producer === "positive" ? "recordRemediationScan" : "recordRemediationRestrictions",
+        async (_bare: string, _branch: string, source: { runId: string; clonePath: string; attemptId: string }) => {
+          assert.ok(r.rt.active());
+          assert.deepEqual(source, { runId: record.runId, clonePath: canonical, attemptId });
+        });
+      const negative = subject as unknown as {
+        persistRemediationRestrictions(flight: Flight, bare: string, branch: string, tip: string,
+          findings: Array<{ commit: string }>): Promise<void>;
+      };
+      if (producer === "positive")
+        await subject.persistRemediationScan(flight, bare, record.branch, newerQ, [{ commit: newerQ }], "pre-exit");
+      else
+        await negative.persistRemediationRestrictions(flight, bare, record.branch, newerQ, [{ commit: newerQ }]);
+      assert.equal(writer.mock.callCount(), 1);
+      assert.equal(flight.remediationRestrictions?.pending?.attemptId, attemptId);
+      t.mock.method(git, "readRuntimeRemediationRecovery", async (_bare: string, _branch: string,
+        source: { runId: string; clonePath: string; attemptId?: string }) => {
+        assert.ok(r.rt.active());
+        assert.deepEqual(source, { runId: record.runId, clonePath: canonical, attemptId });
+        return record;
+      });
+      const denial = t.mock.method(git, "blockRemediationRecovery", async () => { throw new Error("unneeded denial"); });
+      t.mock.method(subject, "publishFlightSource", async () => "unpublished");
+      const result = await subject.endFlightSourceUse(flight, nullLogger());
+      assert.equal(denial.mock.callCount(), 0);
+      assert.equal(result.endedSlots.length, 1);
+      assert.equal((await slotOf(r.rt, canonical))?.state, "ineligible");
+    });
+  }
+
   it("pending foundation: mismatched selected source cannot confirm or deny another source", async t => {
     const { r, bare, canonical, flight, record, subject } = await setup();
     t.mock.method(git, "recordRemediationScan", async () => {});

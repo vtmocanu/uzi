@@ -3540,7 +3540,21 @@ export class RunRunner {
     await this.inFlightAuthority(flight, async () => {
       const record = await this.restoreRemediationRestrictions(flight);
       if (!record) return;
+      const pending = flight.remediationRestrictions?.pending;
+      if (pending) {
+        const selected = this.remediationSource(flight);
+        // An older readable record cannot discharge facts retained after a failed write.
+        if (pending.bindingUncertain || pending.requireDenial || record.blocked !== false ||
+            !selected.runId || !selected.clonePath || !selected.attemptId || !flight.barePath || !flight.branch ||
+            pending.runId !== selected.runId || pending.clonePath !== selected.clonePath ||
+            pending.attemptId !== selected.attemptId || pending.barePath !== flight.barePath ||
+            pending.branch !== flight.branch ||
+            !pending.requiredOIDs.every(q => record.flaggedOIDs.includes(q)))
+          throw new Error("remediation pending persistence unconfirmed");
+      }
       const scan = await this.scanRemediationRange(flight, flight.barePath!, flight.branch!, record.ownedTip, true);
+      if (scan.trusted && scan.findings.length)
+        await this.persistRemediationRestrictions(flight, flight.barePath!, flight.branch!, scan.range.tipSha, scan.findings);
       if (!scan.trusted || scan.findings.length) throw new Error("remediation continuation history unavailable");
       for (const floor of scan.floorCandidates)
         for (const root of flight.remediationRestrictions!.roots)
@@ -16721,9 +16735,11 @@ export class RunRunner {
   private async confirmPendingRemediation(flight: RunFlight): Promise<"confirmed" | "denied"> {
     const pending = flight.remediationRestrictions!.pending!;
     const { runId, clonePath, attemptId, barePath, branch } = pending;
+    const selected = this.remediationSource(flight);
     if (pending.bindingUncertain || !runId || !clonePath || !attemptId || !barePath || !branch ||
         flight.runId !== runId || flight.worktreePath !== clonePath ||
-        flight.runnerClone?.path !== clonePath || flight.runnerClone.attemptId !== attemptId ||
+        (!flight.predecessorCapture && flight.runnerClone?.path !== clonePath) ||
+        selected.attemptId !== attemptId ||
         flight.barePath !== barePath || flight.branch !== branch)
       throw new Error("remediation pending source identity unavailable");
     const source = { runId, clonePath, attemptId };
@@ -16743,30 +16759,33 @@ export class RunRunner {
     return "denied";
   }
 
-  private async persistRemediationScan(flight: RunFlight, barePath: string, branch: string,
-    tip: string, findings: readonly SecretFinding[], origin?: "checkpoint-pending" | "pre-exit"): Promise<void> {
+  /** Identity comes only from the worker's selected source, never recovery evidence. */
+  private remediationSource(flight: RunFlight): { runId: string; clonePath?: string; attemptId?: string } {
+    return { runId: flight.runId, clonePath: flight.predecessorCapture ? flight.worktreePath : flight.runnerClone?.path,
+      attemptId: flight.predecessorCapture ? flight.remediationPredecessorAttempt : flight.runnerClone?.attemptId };
+  }
+
+  /** Synchronous negative-knowledge latch: at most 64 required OIDs and a sticky denial.
+   * The transient writer list keeps at most 65 IDs to let Git prove representational overflow. */
+  private latchRemediationFindings(flight: RunFlight, barePath: string, branch: string,
+    findings: readonly SecretFinding[]): string[] | undefined {
     this.assertFlightSourceAdmissible(flight);
-    const clone = flight.runnerClone;
-    // Keep the unenrolled legacy residual outside this seam. Selected attempts and remembered
-    // restrictions cannot interpret a missing identity as absence.
-    if (!clone?.attemptId && !flight.remediationRestrictions) return;
-    // An ordinary clean scan adds no negative knowledge and keeps the existing unenrolled path.
-    if (!findings.length && !flight.remediationRestrictions && flight.runId && clone?.attemptId &&
-        clone.path && clone.path === flight.worktreePath && flight.barePath === barePath && flight.branch === branch) {
-      await this.inFlightAuthority(flight, () => this.git.recordRemediationScan(barePath, branch,
-        { runId: flight.runId, clonePath: clone.path, attemptId: clone.attemptId! },
-        { trusted: true, tip, flaggedOIDs: [], ...(origin ? { origin } : {}) }), this.authorityWait(flight));
-      return;
-    }
+    const source = this.remediationSource(flight);
+    if (!source.attemptId && !flight.remediationRestrictions) return undefined;
+    if (findings.length) flight.preserveRecoveryClone = true;
+    if (!findings.length && !flight.remediationRestrictions && flight.runId && source.attemptId &&
+        source.clonePath && source.clonePath === flight.worktreePath &&
+        flight.barePath === barePath && flight.branch === branch) return [];
     const restrictions = flight.remediationRestrictions ??= { roots: [] };
     const pending = restrictions.pending ??= {
-      runId: flight.runId, clonePath: clone?.path, attemptId: clone?.attemptId,
+      runId: flight.runId, clonePath: source.clonePath, attemptId: source.attemptId,
       barePath: flight.barePath, branch: flight.branch,
       requiredOIDs: [], requireDenial: false, bindingUncertain: false,
     };
-    if (!clone?.attemptId || clone.path !== flight.worktreePath ||
-        pending.runId !== flight.runId || pending.clonePath !== clone.path ||
-        pending.attemptId !== clone.attemptId || pending.barePath !== flight.barePath ||
+    if (!source.attemptId || !source.clonePath || source.clonePath !== flight.worktreePath ||
+        (!flight.predecessorCapture && flight.runnerClone?.path !== source.clonePath) ||
+        pending.runId !== flight.runId || pending.clonePath !== source.clonePath ||
+        pending.attemptId !== source.attemptId || pending.barePath !== flight.barePath ||
         pending.branch !== flight.branch || barePath !== pending.barePath || branch !== pending.branch ||
         !pending.runId || !pending.barePath || !pending.branch)
       pending.bindingUncertain = true;
@@ -16781,7 +16800,7 @@ export class RunRunner {
         invalid = true;
         continue;
       }
-      if (!flaggedOIDs.includes(q)) flaggedOIDs.push(q);
+      if (!flaggedOIDs.includes(q) && flaggedOIDs.length < 65) flaggedOIDs.push(q);
       if (!pending.requiredOIDs.includes(q)) {
         if (pending.requiredOIDs.length < 64) pending.requiredOIDs.push(q);
         else pending.requireDenial = true;
@@ -16790,8 +16809,26 @@ export class RunRunner {
     restrictions.roots = [...new Set([...restrictions.roots, ...pending.requiredOIDs])];
     if (pending.bindingUncertain) throw new Error("remediation source identity unavailable");
     if (invalid) throw new Error("remediation finding identity unavailable");
+    return flaggedOIDs;
+  }
+
+  private async persistRemediationRestrictions(flight: RunFlight, barePath: string, branch: string,
+    tip: string, findings: readonly SecretFinding[]): Promise<void> {
+    const flaggedOIDs = this.latchRemediationFindings(flight, barePath, branch, findings);
+    if (flaggedOIDs === undefined) return;
+    const source = this.remediationSource(flight);
+    await this.inFlightAuthority(flight, () => this.git.recordRemediationRestrictions(barePath, branch,
+      { runId: source.runId, clonePath: source.clonePath!, attemptId: source.attemptId! },
+      { trusted: true, tip, flaggedOIDs }), this.authorityWait(flight));
+  }
+
+  private async persistRemediationScan(flight: RunFlight, barePath: string, branch: string,
+    tip: string, findings: readonly SecretFinding[], origin?: "checkpoint-pending" | "pre-exit"): Promise<void> {
+    const flaggedOIDs = this.latchRemediationFindings(flight, barePath, branch, findings);
+    if (flaggedOIDs === undefined) return;
+    const source = this.remediationSource(flight);
     await this.inFlightAuthority(flight, () => this.git.recordRemediationScan(barePath, branch,
-      { runId: pending.runId, clonePath: pending.clonePath!, attemptId: pending.attemptId! },
+      { runId: source.runId, clonePath: source.clonePath!, attemptId: source.attemptId! },
       { trusted: true, tip, flaggedOIDs, ...(origin ? { origin } : {}) }), this.authorityWait(flight));
   }
 
@@ -16861,6 +16898,7 @@ export class RunRunner {
         // holds later checkpoint candidates while reachable, including through a local bridge;
         // remediation and finalize also consult the retained findings.
         if (scan.trusted) {
+          this.latchRemediationFindings(flight, barePath, branch, scan.findings);
           this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), scan.findings, flight.runLog);
           await this.persistRemediationScan(flight, barePath, branch, range.tipSha, scan.findings, "checkpoint-pending");
         }
@@ -17041,7 +17079,7 @@ export class RunRunner {
     // `authoritativeTip` is the clone tip when the fetch-back succeeded and matches the tracking tip
     // (the scan itself was untrusted but the tip is real); undefined in the stale-tip / thrown case.
     const failOrProceed = async (why: string, authoritativeTip?: string): Promise<SecretRemediationDecision> => {
-      if (state.known && state.known.length > 0) {
+      if (flight.remediationRestrictions?.pending || (state.known && state.known.length > 0)) {
         state.blocked = state.known;
         runLog.warn("pre-exit secret scan could not be trusted after a known finding; failing", { run_id: runId, why });
         return { action: "fail" };
@@ -17096,6 +17134,14 @@ export class RunRunner {
         }
         findings = still;
       }
+      const required = this.latchRemediationFindings(flight, barePath, branch, findings);
+      if (required !== undefined) {
+        // Until the path scanner succeeds, every early return must withhold filenames.
+        state.withholdPaths = true;
+        state.known = findings;
+        state.everKnown = true;
+      }
+      await this.persistRemediationRestrictions(flight, barePath, branch, range.tipSha, findings);
       this.recordFlaggedCommits(state, findings, runLog);
       if (state.overflow) {
         state.known = findings;

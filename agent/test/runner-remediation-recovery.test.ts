@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { test } from "node:test";
 import { formatAttemptId } from "../src/attempt-path.js";
-import type { CheckpointRange } from "../src/git.js";
+import type { CheckpointRange, RunnerClone } from "../src/git.js";
+import type { SecretFinding } from "../src/secret-scan-guard.js";
 import type { FrozenHeldPolicy } from "../src/frozen-held.js";
 import { prepareFrozenHeld } from "../src/frozen-held.js";
-import { noProofReseed } from "./helpers.js";
+import { noProofReseed, nullLogger } from "./helpers.js";
 import { fakeGitlab, fx, git, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
@@ -32,6 +33,17 @@ type Subject = {
   requireLaunchAuthority(flight: Flight): Promise<void>;
   checkpointRemediationHold(flight: Flight, bare: string, candidate: string, reap: boolean): Promise<boolean>;
   frozenHeldPolicy(flight: Flight): FrozenHeldPolicy;
+  persistRemediationRestrictions(flight: Flight, bare: string, branch: string, tip: string,
+    findings: SecretFinding[]): Promise<void>;
+  runSecretRemediationGate(flight: Flight, bare: string, clone: RunnerClone): Promise<{ action: string }>;
+  fetchBackBestEffort(...args: unknown[]): Promise<{ kind: "updated" }>;
+  scanRemediationRange(...args: unknown[]): Promise<{
+    trusted: true; range: CheckpointRange; findings: SecretFinding[]; floorCandidates: string[];
+  }>;
+  withholdPathsFor(findings: SecretFinding[]): Promise<boolean>;
+  checkpointTestHooks: { flaggedCommitsCap?: number };
+  recordFlaggedCommits(state: unknown, findings: SecretFinding[], log: unknown): void;
+  scanCheckpointForPublish(flight: Flight, bare: string, branch: string): Promise<{ kind: string }>;
 };
 function freshRunner(): Subject {
   return runnerWith(() => ({ homeDir, executor: { run: async () => { throw new Error("unused executor"); } } }),
@@ -55,7 +67,9 @@ async function fixture() {
     return tip;
   };
   const freshFlight = (): Flight => ({ runId: RUN, branch: BRANCH, barePath: bare, worktreePath: clone.path,
-    runnerClone: clone, cancel: new AbortController(), steering: { lifecycleSignal: () => new AbortController().signal } });
+    runnerClone: clone, runLog: nullLogger(), batcher: { emit: () => {} }, claimGenerations: new Map(),
+    reportedPublishOutcomes: new Set(),
+    cancel: new AbortController(), steering: { lifecycleSignal: () => new AbortController().signal } });
   await fetch();
   const enroll = async () => {
     const flagged = commit("flagged");
@@ -109,6 +123,76 @@ test("fresh runner restores flagged and displaced roots, admits only confirmed c
   await assert.rejects(runner.requireLaunchAuthority(flight), /unconfirmed/);
   t.mock.method(git, "readRuntimeRemediationRecovery", async () => undefined);
   await assert.rejects(runner.requireLaunchAuthority(flight), /enrollment disappeared/);
+});
+
+test("launch pending admission: old readable recovery cannot cover an unpersisted divergent finding", async t => {
+  const f = await fixture();
+  const q1 = await f.enroll();
+  const clean = f.commit("clean selected source");
+  assert.equal((await f.fetch()).kind, "updated");
+  await git.recordRemediationScan(f.bare, BRANCH, f.source,
+    { trusted: true, tip: clean, flaggedOIDs: [] });
+  const old = await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source);
+  assert.equal(old?.ownedTip, clean);
+  assert.equal(old?.active, undefined, "clean scan closed the rewrite grant");
+  assert.deepEqual(old?.flaggedOIDs, [q1]);
+
+  const runner = freshRunner();
+  const flight = f.freshFlight();
+  const ranges: CheckpointRange[] = [];
+  t.mock.method(git, "secretScanCheckpointRange", async (_bare: string, range: CheckpointRange) => {
+    ranges.push(range);
+    return { trusted: true, findings: [] };
+  });
+  // Real recovery-source authentication and range resolution must succeed before the new hold.
+  await runner.requireLaunchAuthority(flight);
+  assert.equal(ranges.length, 1);
+  assert.equal(ranges[0]?.tipSha, clean);
+  assert.equal(ranges[0]?.excludeSha, f.base);
+
+  const q2 = f.commit("finding in separate candidate");
+  const candidate = f.commit("candidate containing second finding", q2);
+  command(f.bare, "fetch", "--no-tags", f.clone.path, candidate);
+  command(f.clone.path, "update-ref", "refs/heads/" + BRANCH, clean);
+  assert.equal(await git.ancestry(f.bare, q2, candidate), "ancestor");
+  assert.equal(await git.ancestry(f.bare, q2, clean), "divergent");
+  const finding: SecretFinding = { commit: q2, file: "withheld", startLine: 1, ruleId: "unit" };
+  const writer = t.mock.method(git, "recordRemediationRestrictions", async () => {
+    throw new Error("config write failed");
+  });
+  await assert.rejects(runner.persistRemediationRestrictions(flight, f.bare, BRANCH, candidate, [finding]),
+    /config write failed/);
+  assert.equal(writer.mock.callCount(), 1);
+  writer.mock.restore();
+  const pending = flight.remediationRestrictions!.pending!;
+  assert.deepEqual(pending.requiredOIDs, [q2]);
+  assert.deepEqual(await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source), old,
+    "OLD RR remains independently readable and does not contain Q2");
+  await assert.rejects(runner.requireLaunchAuthority(flight), /remediation pending/);
+  assert.equal(ranges.length, 1, "incomplete pending facts hold before a clean scan can excuse them");
+
+  await runner.persistRemediationRestrictions(flight, f.bare, BRANCH, candidate, [finding]);
+  const complete = await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source);
+  assert.deepEqual(complete?.flaggedOIDs, [q1, q2]);
+  assert.equal(complete?.ownedTip, clean);
+  assert.equal(complete?.active, undefined, "negative persistence grants no authority to the candidate");
+  await runner.requireLaunchAuthority(flight);
+  assert.equal(ranges.length, 2, "complete durable pending facts allow the legitimate clean scan");
+  assert.equal(ranges[1]?.tipSha, clean);
+  assert.equal(flight.remediationRestrictions!.pending, pending, "admission never clears the latch");
+
+  for (const key of ["runId", "clonePath", "attemptId", "barePath", "branch"] as const) {
+    const original = pending[key];
+    pending[key] = "different selected binding";
+    await assert.rejects(runner.requireLaunchAuthority(flight), /remediation pending/, key);
+    pending[key] = original!;
+  }
+  for (const key of ["requireDenial", "bindingUncertain"] as const) {
+    pending[key] = true;
+    await assert.rejects(runner.requireLaunchAuthority(flight), /remediation pending/, key);
+    pending[key] = false;
+  }
+  assert.equal(ranges.length, 2, "binding and denial controls hold before scanning");
 });
 
 test("fresh enrolled flight refuses flagged history even when a trusted scan hides it behind a floor", async t => {
@@ -222,4 +306,137 @@ test("pending persistence foundation: selected missing identity holds while unen
   await runner.persistRemediationScan(legacy, f.bare, BRANCH, f.base, [{ commit: f.base }], "pre-exit");
   assert.equal(legacy.remediationRestrictions, undefined);
   assert.equal(producer.mock.callCount(), 0);
+});
+
+// These private gate tests stub fetching/scanning only; enrollment, ownership receipts,
+// negative writes and grant reads use the real GitCache and local Git objects.
+for (const mode of ["floor", "exhausted", "overflow", "path failure", "remediate", "checkpoint authority"] as const) {
+  test(`source finding unit: pre-exit ${mode} persists restrictions before decision`, async t => {
+    const f = await fixture();
+    let checkpointQ: string | undefined;
+    if (mode === "checkpoint authority") {
+      checkpointQ = f.commit("checkpoint finding");
+      assert.equal((await f.fetch()).kind, "updated");
+      await git.recordRemediationScan(f.bare, BRANCH, f.source,
+        { trusted: true, tip: checkpointQ, flaggedOIDs: [checkpointQ], origin: "checkpoint-pending" });
+    }
+    const tip = f.commit("new trusted finding", checkpointQ ?? f.base);
+    assert.equal((await f.fetch()).kind, "updated");
+    const finding: SecretFinding = { commit: tip, file: "credential-shaped-filename", startLine: 1, ruleId: "unit" };
+    const runner = freshRunner();
+    const flight = f.freshFlight();
+    flight.secretRemediation = { attempts: mode === "exhausted" ? 2 : 0 };
+    const range: CheckpointRange = { tipSha: tip, excludeSha: f.base };
+    t.mock.method(runner, "fetchBackBestEffort", async () => ({ kind: "updated" }));
+    t.mock.method(runner, "scanRemediationRange", async () => ({
+      trusted: true, range, findings: [finding], floorCandidates: mode === "floor" ? [tip] : [],
+    }));
+    if (mode === "overflow") runner.checkpointTestHooks = { flaggedCommitsCap: 0 };
+    if (mode === "checkpoint authority") flight.secretRemediation = { attempts: 2 };
+    const expectedFlags = checkpointQ ? [checkpointQ, tip] : [tip];
+    const before = await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source);
+    let pathCalls = 0;
+    let pathValidated = false;
+    t.mock.method(runner, "withholdPathsFor", async () => {
+      pathCalls++;
+      const stored = await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source);
+      assert.deepEqual(stored?.flaggedOIDs, expectedFlags, "negative facts durable before path scanner");
+      assert.deepEqual(stored?.active, before?.active, "negative write opens no grant");
+      assert.equal((flight.secretRemediation as { withholdPaths: boolean }).withholdPaths, true);
+      pathValidated = true;
+      if (mode === "path failure") throw new Error("path scanner failed");
+      return mode !== "remediate";
+    });
+    const decision = await runner.runSecretRemediationGate(flight, f.bare, f.clone);
+    const stored = await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source);
+    assert.deepEqual(stored?.flaggedOIDs, expectedFlags);
+    assert.equal(stored?.blocked, false, "ordinary early decisions do not poison enrollment");
+    assert.equal(flight.preserveRecoveryClone, true);
+    assert.deepEqual(flight.remediationRestrictions?.pending?.requiredOIDs, [tip]);
+    assert.equal(decision.action, mode === "floor" ? "proceed" : mode === "remediate" ? "remediate" : "fail");
+    assert.equal(pathCalls, mode === "overflow" ? 0 : 1);
+    assert.equal(pathValidated, mode !== "overflow", "path scanner observed the complete durable negative record");
+    if (mode === "remediate") {
+      assert.equal(stored?.active?.origin, "pre-exit");
+      assert.equal((flight.secretRemediation as { withholdPaths: boolean }).withholdPaths, false,
+        "duplicate positive writer keeps the path scanner's decision");
+    } else {
+      assert.deepEqual(stored?.active, before?.active);
+      assert.equal(stored?.sequence, before?.sequence ?? 0);
+    }
+    if (checkpointQ) {
+      await runner.persistRemediationRestrictions(flight, f.bare, BRANCH, tip, []);
+      const empty = await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source);
+      assert.deepEqual(empty, stored, "empty negative call neither closes nor changes existing authority");
+    }
+  });
+}
+
+test("source finding unit: launch and checkpoint latch trusted findings before effects", async t => {
+  const f = await fixture();
+  const first = await f.enroll();
+  const tip = f.commit("later trusted finding", first);
+  assert.equal((await f.fetch()).kind, "updated");
+  const finding: SecretFinding = { commit: tip, file: "withheld", startLine: 1, ruleId: "unit" };
+  t.mock.method(git, "secretScanCheckpointRange", async () => ({ trusted: true, findings: [finding] }));
+  const runner = freshRunner();
+  const launch = f.freshFlight();
+  await assert.rejects(runner.requireLaunchAuthority(launch), /history unavailable/);
+  const stored = await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source);
+  assert.deepEqual(new Set(stored?.flaggedOIDs), new Set([first, tip]));
+  assert.equal(stored?.active?.origin, "pre-exit", "launch does not change authority");
+  assert.deepEqual(stored?.active?.flaggedOIDs, [first]);
+
+  const checkpoint = f.freshFlight();
+  let collectorObservedLatch = false;
+  const collect = runner.recordFlaggedCommits.bind(runner);
+  t.mock.method(runner, "recordFlaggedCommits", (state: unknown, findings: SecretFinding[], log: unknown) => {
+    assert.deepEqual(checkpoint.remediationRestrictions?.pending?.requiredOIDs, [tip]);
+    collectorObservedLatch = true;
+    collect(state, findings, log);
+  });
+  let writerObservedLatch = false;
+  t.mock.method(git, "recordRemediationScan", async () => {
+    assert.deepEqual(checkpoint.remediationRestrictions?.pending?.requiredOIDs, [tip]);
+    assert.equal(checkpoint.preserveRecoveryClone, true);
+    writerObservedLatch = true;
+    throw new Error("positive sync failure");
+  });
+  assert.equal((await runner.scanCheckpointForPublish(checkpoint, f.bare, BRANCH)).kind, "blocked");
+  assert.equal(collectorObservedLatch, true);
+  assert.equal(writerObservedLatch, true);
+});
+
+test("source finding unit: failed first negative write and malformed findings retain custody and fail closed", async t => {
+  const f = await fixture();
+  const tip = f.commit("first finding");
+  assert.equal((await f.fetch()).kind, "updated");
+  const runner = freshRunner();
+  t.mock.method(runner, "fetchBackBestEffort", async () => ({ kind: "updated" }));
+  const finding: SecretFinding = { commit: tip, file: "never-rendered", startLine: 1, ruleId: "unit" };
+  t.mock.method(runner, "scanRemediationRange", async () => ({
+    trusted: true, range: { tipSha: tip, excludeSha: f.base }, findings: [finding], floorCandidates: [],
+  }));
+  const writer = t.mock.method(git, "recordRemediationRestrictions", async () => { throw new Error("config failure"); });
+  const paths = t.mock.method(runner, "withholdPathsFor", async () => { throw new Error("must not scan paths"); });
+  const flight = f.freshFlight();
+  assert.equal((await runner.runSecretRemediationGate(flight, f.bare, f.clone)).action, "fail");
+  assert.equal(await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source), undefined);
+  assert.equal(flight.preserveRecoveryClone, true);
+  assert.deepEqual(flight.remediationRestrictions?.pending?.requiredOIDs, [tip]);
+  assert.equal((flight.secretRemediation as { withholdPaths: boolean }).withholdPaths, true);
+  assert.equal(writer.mock.callCount(), 1);
+  assert.equal(paths.mock.callCount(), 0);
+  for (const malformed of [null, { commit: 0 }, {}]) {
+    const invalid = f.freshFlight();
+    t.mock.method(runner, "scanRemediationRange", async () => ({
+      trusted: true, range: { tipSha: tip, excludeSha: f.base },
+      findings: [finding, malformed] as SecretFinding[], floorCandidates: [],
+    }));
+    assert.equal((await runner.runSecretRemediationGate(invalid, f.bare, f.clone)).action, "fail");
+    assert.equal(invalid.remediationRestrictions?.pending?.requireDenial, true);
+    assert.equal(invalid.preserveRecoveryClone, true);
+    assert.equal((invalid.secretRemediation as { known?: unknown }).known, undefined, "malformed objects never reach rendering state");
+  }
+  assert.equal(writer.mock.callCount(), 1);
 });
