@@ -105,7 +105,13 @@ All new Go code lives in `controller/internal/kube/pod_epoch*.go`.
    replay spends no attempt. There is no same-decision retry or retargeting.
 
    Delivery allows three total PATCH attempts per UID within a nonrenewable
-   monotonic 90 s budget from first observation, before resolver work/ID waits.
+   monotonic 90 s budget from an optional delivery anchor, separate from
+   observation `firstSeen` (explicit `hasAnchor` records its presence). Initial
+   negatives anchor at `firstSeen`, including resolver time. Positive proof
+   freezes at Added without anchoring even if Added has IDs; the first later
+   changed same-UID event with any nonempty init/regular container ID anchors
+   once. Positive encoding fallback retains that anchor even past Added + 90 s;
+   later IDs/retries do not renew it. Expiry uses the anchor.
    Identity reads retain their 10 s deadline; each PATCH gets min(10 s, remaining
    delivery budget), checked again immediately before submission. Non-conflict
    errors, including 429, 5xx, timeouts, transport and response-cap failures, are
@@ -147,12 +153,17 @@ while regressions or changed terminal container identities refuse evidence.
 The caps are 4096 distinct pod UIDs plus claim UIDs, and 16 MiB of retained proof
 metadata (serialized pod snapshots, terminal snapshots, keys, receipts, and
 conservative per-record/membership allowances), including per-UID delivery
-bookkeeping, retained payloads and issued decisions. Observation accounting
-also reserves 64 bytes per pod/claim identity key, including baseline and
+bookkeeping, the captured Added-time pod-name length, retained payloads and
+issued decisions. Observation accounting also reserves 64 bytes per pod/claim identity key, including baseline and
 maintenance-receipt keys, and the encoded size of each cached resolved identity.
 Those costs remain charged while cached, until Reset/invalidation. This broader
 accounting can reach overflow earlier than before #3739 without changing the
-16 MiB cap. Pending proof survives
+16 MiB cap. Before anchoring, retention is capacity-only under the existing
+caps and supersession rules: no startup TTL, timer eviction, rearm, proof renewal
+or resolver rerun. Unbounded frozen-proof age and no recheck of later-added pods
+are accepted; worker durable one-shot consumption, UID/runtime binding and
+pod-entry checks under exclusive epoch ownership remain required. A relist
+during a long wait fails closed with `reason=reset`. Pending proof survives
 conflicts; success or permanent stop releases payloads. Stopped bookkeeping and
 tombstones remain until Reset/invalidation; quiet watches have no timer eviction.
 Delivery stops on deletion, terminal phase including unaudited termination,
@@ -160,8 +171,18 @@ taint (apart from the initial identity-unverified negative), supersession,
 reset/generation stop, cancellation or caps, without resurrection. Expiry is
 observed on the next event/Handle/Deliver, without a quiet timer. Failed attempts
 warn with controlled reasons; one final info stop or success reports attempts,
-conflicts and elapsed time since first observation, without raw errors or extra
-IDs. Later stopped-UID events are silent. Wire schema and RBAC are unchanged.
+conflicts. Request-failed, stopped and succeeded records carry `worker_id`,
+the captured Added-time `pod` name, `elapsed` since `firstSeen` and
+`elapsed_since_ids` iff an anchor exists, including initial negatives. Each
+record samples the clock once for both durations; neither is server commit time
+or downward-API projection latency. Names can be reused and are correlation
+labels, not identity; UID/resourceVersion fencing remains authoritative. No raw
+errors, pod UIDs or container IDs are logged. Later stopped-UID events are silent.
+The directional nominal worker margin is 25 s + (worker_wait_start − controller_anchor),
+minus delivery/watch/projection lag. Startup no longer consumes positive budget;
+quiet after conflict, watch lag and late projection remain availability residuals,
+not regression guarantees. Measure projection latency independently for #3621;
+live acceptance remains pending. Wire schema and RBAC are unchanged.
 Overflow latches, drops proof
 state, and returns no further decisions until reset. Workers therefore defer
 through their ordinary missing-evidence bound; reconciliation can continue.
