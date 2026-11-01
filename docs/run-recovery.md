@@ -796,7 +796,9 @@ needs all of the following.
 - **Worker.** The worker registers `recovery_prerequisite_closure_v1` and mints a
   thin archive FINAL only under a transient grant: the frozen path (which also
   serves park-observed records in `paused`, `recovery_wait` or `limit_wait`) can pass
-  any of four grants, and the #2969 retained-claim caller passes only grants 1 and 4:
+  any of four grants, and the #2969 retained-claim caller passes only grants 1 and 4
+  (it runs while the run still executes, so it captures without minting; the mint
+  comes from the later frozen pass):
   (1) a missing v2 metadata record; (2) a proven held-publication ineligibility;
   (3) a held-publication fallback in the same pass that the server explicitly
   refused (a 409, 413 or 422 with a bounded reason, a 200 `create_refused`, or a
@@ -840,7 +842,7 @@ saved FINAL and retries.
 | 409 | `manifest_conflict` | Unsupported configuration or binding (knob off, no `github`, capability missing, closure not pinned for this exact capture, expired or mismatched capture); unchanged from the prerequisite-free path. |
 | 409 | `prerequisite_pin_missing` | The pin ref was cleanly listed as absent and the absence is recorded. |
 | 409 | `prerequisite_pin_foreign` | The pin ref is listed at a different tip. |
-| 403 | `not_authorized` | The precheck found no hold, run or capture for this worker, or the hold or run is not eligible, or the capture belongs to another hold or worker. |
+| 403 | `not_authorized` | The precheck, or the locked release after the listing, found no hold, run or capture for this worker, or the hold or run is not eligible, or the capture belongs to another hold or worker. A 403 from the locked release has already been charged an admission. |
 | 400 | `bad_request` | The server's configured ready retention is under one second (a configuration fault, not a request fault). |
 | 503 | `prerequisite_pin_unavailable` | The listing failed or timed out, the limiter refused, a lock wait or deadline ran out, or a newer reservation superseded this one. Retry shortly. |
 
