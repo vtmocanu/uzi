@@ -1956,3 +1956,30 @@ it("records base divergence separately and carries the nullable board origin", (
   const nullableOrigin: LatestRun["fail_origin"] = null;
   expect(nullableOrigin).toBeNull();
 });
+
+
+describe("harness overflow shared DTO contract", () => {
+  it("requires the saved boolean in both settings DTOs", () => {
+    for (const settings of [userSettingsZero, settingsUserSettingsZero]) expect(settings.harness_overflow_enabled).toBe(false);
+    for (const settings of [userSettingsFull, settingsUserSettingsFull]) expect(settings.harness_overflow_enabled).toBe(true);
+  });
+  it("preserves nullable stored decisions on detail, list and summary DTOs", () => {
+    for (const run of [runZero, runListItemZero, runSummaryItemZero]) expect(run.harness_decision).toBeNull();
+    for (const run of [runFull, runListItemFull, runSummaryItemFull]) {
+      const decision: NonNullable<Run["harness_decision"]> = run.harness_decision;
+      expect(Object.keys(decision).sort()).toEqual([
+        "preferred", "chosen", "reason", "preferred_score", "other_score",
+        "preferred_measured", "other_measured", "preferred_held", "other_held",
+      ].sort());
+      for (const key of ["preferred_score", "other_score", "preferred_measured", "other_measured"] as const) expect(typeof decision[key]).toBe("number");
+      expect(typeof decision.preferred_held).toBe("boolean");
+      expect(typeof decision.other_held).toBe("boolean");
+    }
+    const unknown: NonNullable<Run["harness_decision"]> = {
+      preferred: "claude", chosen: "claude", reason: "unknown_usage",
+      preferred_score: null, other_score: null, preferred_measured: null, other_measured: null,
+      preferred_held: false, other_held: false,
+    };
+    expect(unknown.preferred_score).toBeNull();
+  });
+});

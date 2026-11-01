@@ -63,6 +63,7 @@ function histRun(i: number, minsBack: number): Run {
   const merged = status === "completed" && i % 4 !== 3;
   const hasMr = status === "completed" || (!planRejected && i % 3 === 0);
   return {
+    harness_decision: null,
     id: `run-hist-${i}`,
     repo_id: HIST_REPOS[i % HIST_REPOS.length],
     issue_iid: 400 + i,
@@ -163,6 +164,7 @@ export const mockOtherRunOwners: Record<string, string> = {
 
 export const mockOtherUserRuns: Run[] = [
   {
+    harness_decision: null,
     id: "run-mira-embed",
     repo_id: "repo-atlas",
     issue_iid: 61,
@@ -227,6 +229,7 @@ export const mockOtherUserRuns: Run[] = [
     updated_at: minsAgo(2),
   },
   {
+    harness_decision: null,
     // Queued and NOT the viewer's own: the factory card must render this as a plain
     // "queued" pill — another owner's vault state is unknown to the viewing admin
     // (PRD #32), and with own rows filtered out the waiting-for-unlock badge has no

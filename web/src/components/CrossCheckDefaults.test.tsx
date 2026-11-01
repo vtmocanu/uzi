@@ -16,6 +16,7 @@ const pin = (harness: "claude" | "codex", over: Partial<CrossCheckPinDTO> = {}):
   resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: harness === "codex", ...over,
 });
 const settings = (over: Partial<UserSettings> = {}): UserSettings => ({
+  harness_overflow_enabled: false,
   default_model: null, default_harness: null, default_claude_model: null, default_codex_model: null,
   default_effort: "low", default_codex_effort: "low", judge_model: null, summary_model: null, theme: null,
   appearance_mode: null, light_theme: null, dark_theme: null, typeface: null,

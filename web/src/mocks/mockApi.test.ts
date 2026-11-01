@@ -1095,3 +1095,23 @@ describe("mockApi codex_judge_model (PRD #3245)", () => {
     }
   });
 });
+
+
+describe("mock harness overflow persistence", () => {
+  it("saves true and false independently across reloads", async () => {
+    installStorage();
+    let api = await reload();
+    await api.login("admin@uzi.local", "whatever");
+    expect((await api.getMySettings()).settings.harness_overflow_enabled).toBe(false);
+    expect(await api.setHarnessOverflow(true)).toEqual({ harness_overflow_enabled: true });
+    await api.putMySettings({ default_harness: "codex" });
+    api = await reload();
+    expect((await api.getMySettings()).settings.harness_overflow_enabled).toBe(true);
+    await api.login("admin@uzi.local", "whatever");
+    expect(await api.setHarnessOverflow(false)).toEqual({ harness_overflow_enabled: false });
+    api = await reload();
+    const settings = (await api.getMySettings()).settings;
+    expect(settings.harness_overflow_enabled).toBe(false);
+    expect(settings.default_harness).toBe("codex");
+  });
+});

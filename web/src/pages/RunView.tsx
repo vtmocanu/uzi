@@ -80,6 +80,7 @@ import { RecoveryArchivesPanel } from "../components/RecoveryArchives";
 import { HeldPublicationPanel } from "../components/HeldPublicationPanel";
 import { SalvagePanel } from "../components/SalvagePanel";
 import { RunIssueRef } from "../components/RunIssueRef";
+import { RunHarnessDecision } from "../components/RunHarnessDecision";
 import { RunCredential } from "../components/RunCredential";
 import { HarnessBadge } from "../components/HarnessBadge";
 import {
@@ -2850,6 +2851,7 @@ export function RunView() {
                   for every claimed run, and the usage panel only appears once a run
                   has reported usage. */}
               <RunCredential run={run} />
+              <RunHarnessDecision run={run} />
               {/* Only a requested or released switch adds a second token chip. The
                   stored choice and applied history live in Run settings. */}
               {(run.credential_switch === "requested" || run.credential_switch === "released") && (

@@ -44,7 +44,7 @@ vi.mock("../lib/api", () => ({
     getMyRateLimits: vi.fn().mockResolvedValue({ status: "no_token" }),
     getMyCodexRateLimits: vi.fn().mockResolvedValue({ accounts: [] }),
     getMySettings: vi.fn().mockResolvedValue({
-      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null },
+      settings: { harness_overflow_enabled: false, default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, theme: null },
     }),
     version: vi.fn().mockResolvedValue({ version: "9.9.9-test", founded: "2026-07-03" }),
   },

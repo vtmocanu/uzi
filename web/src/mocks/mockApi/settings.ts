@@ -108,6 +108,7 @@ const SEED_USER_SETTINGS: UserSettings = {
   now_summary_enabled: null,
   // PRD #1429 M1 (D3): per-user default harness; null = no preference (falls through D11).
   default_harness: null,
+  harness_overflow_enabled: false,
   // Issue #3719: how a new Codex run chooses its login. Seeded "auto" so the demo shows the
   // pool at work (a pooled login sits in mocks/data/secrets.ts); the server's own default is
   // "default". Tolerantly validated like default_harness, so no storage-key bump.
@@ -291,6 +292,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // PRD #1429 M1: optional so a pre-feature blob stays valid; absent/null reads as "no
     // preference" and the SEED fills default_harness=null on load (no key bump needed).
     (u.default_harness === undefined || u.default_harness === null || typeof u.default_harness === "string") &&
+    // Optional for older blobs; the seed fills the default-off overflow setting.
+    (u.harness_overflow_enabled === undefined || typeof u.harness_overflow_enabled === "boolean") &&
     // Issue #3719: optional so a pre-feature blob stays valid; the SEED fills it on load.
     (u.codex_account_mode === undefined || u.codex_account_mode === "default" || u.codex_account_mode === "auto") &&
     // Optional so a pre-feature blob stays valid; absent reads as default-only.
@@ -1335,6 +1338,12 @@ export const settingsApi = {
     return delay({ user: { ...u } }, 200);
   },
   getMySettings: async () => delay(mySettingsResponse()),
+  setHarnessOverflow: async (enabled: boolean) => {
+    requireSession();
+    userSettings = { ...userSettings, harness_overflow_enabled: enabled };
+    persistSettings();
+    return delay({ harness_overflow_enabled: enabled });
+  },
   // Issue #3719: PUT /me/codex-account-mode, mirroring handler.SetCodexAccountMode — a
   // closed two-value vocabulary (400 otherwise) answered with the stored mode alone.
   setCodexAccountMode: async (mode: CodexAccountMode) => {

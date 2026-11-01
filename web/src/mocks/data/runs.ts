@@ -89,6 +89,7 @@ const LEAD_CONFIG_CODEX_OBSERVED: RunLeadConfig = {
 
 export const mockRuns: Run[] = [
   {
+    harness_decision: null,
     // run-queued is parked in the queue, not yet claimed by a worker: it renders
     // the "queued" status badge (PRD #21 SC3 — violet under mission, gray under
     // ember) on issue 26's board card and in the runs list.
@@ -165,6 +166,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
+    harness_decision: null,
     // PRD #411: an issue-LESS run (kind "task", from `uzi handoff`) so the muted
     // kind chip renders in place of a "#<iid>" in mock mode, and the M4 tests have a
     // positive fixture for the issue-less branch. issue_iid + issue_web_url are null.
@@ -240,6 +242,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(2),
   },
   {
+    harness_decision: null,
     // PRD #700 M6: an mr_rework run, the "reworking" branch of the MR-review
     // watcher. It is issue-LESS — CreateAutoMRReworkRun leaves issue_iid NULL and
     // carries the human summary in issue_title/issue_description — so RunIssueRef
@@ -312,6 +315,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
+    harness_decision: null,
     // PRD #320 M6 demo: a DEMOTED background run — a self_improve sweep yielding to
     // interactive work while it waits, so its "Deprioritized" pill and the owner's
     // Expedite control are visible on /runs in mock mode. Owned by the session (absent
@@ -381,6 +385,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(4),
   },
   {
+    harness_decision: null,
     // PRD #320 M6 demo: an EXPEDITED interactive run the owner bumped to the front, so
     // its "Expedited" pill and the "Undo" control render. Owned by the session.
     id: "run-expedited",
@@ -448,6 +453,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
+    harness_decision: null,
     // A repo-less judge meta-run (PRD #239 Decision 4). It is NON-terminal on
     // purpose: it exists so the Runs-badge parity test can prove the count EXCLUDES
     // kind "judge" — a judge run that could not be counted would pin nothing. It is
@@ -517,6 +523,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
+    harness_decision: null,
     id: LIVE_RUN_ID,
     repo_id: "repo-uzi",
     issue_iid: 24,
@@ -619,6 +626,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
+    harness_decision: null,
     // run-awaiting is parked at the plan gate (PRD #12): it drives the board's
     // attention strip + loud card and renders the run view's plan-approval panel.
     id: "run-awaiting",
@@ -754,6 +762,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(6),
   },
   {
+    harness_decision: null,
     // run-seeded (PRD #209 M5): a run created WITH a user-authored plan (plan_source
     // "seeded"). It skips the Phase-1 planning turn and the approval gate, so it NEVER
     // enters awaiting_approval and PlanPanel never renders — SeededPlanPanel is the only
@@ -831,6 +840,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
+    harness_decision: null,
     // run-unreadable-question is parked on a clarification question whose payload the
     // UI CANNOT render (PRD #88): the `question` message carries no `question_id`.
     //
@@ -918,6 +928,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(14),
   },
   {
+    harness_decision: null,
     // run-awaiting-followup is parked on a follow-up (PRD #517): the interactive run
     // finished the turn it was steered to and stopped to wait for its owner's NEXT
     // follow-up, holding its worker slot open the whole time. It is the ONLY
@@ -1003,6 +1014,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(3),
   },
   {
+    harness_decision: null,
     id: "run-done",
     repo_id: "repo-uzi",
     issue_iid: 18,
@@ -1124,6 +1136,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(184),
   },
   {
+    harness_decision: null,
     // run-ci-halted (PRD #1650 D3a): a COMPLETED issue run whose MR is still open and whose
     // branch pipeline is red after automatic CI fixing gave up. It is issue 22's latest run
     // on the board, because the server reads the halt through the latest run's branch
@@ -1199,6 +1212,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1682),
   },
   {
+    harness_decision: null,
     // run-rework-capped (PRD #1202): a COMPLETED issue run whose MR is still OPEN and whose
     // AUTOMATIC rework loop has hit its cap (5 of 5 cycles). It exercises the run view's
     // past-cap panel: the "Automatic rework: 5 of 5 cycles used · stopped" line and the
@@ -1292,6 +1306,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(96),
   },
   {
+    harness_decision: null,
     // run-report-only: a COMPLETED issue run that intentionally opened NO merge request
     // (issue #279). Its deliverable is report_md — the lead's server-scrubbed findings —
     // not a code change, so branch and mr_iid are null. This is the fixture that exercises
@@ -1375,6 +1390,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(58),
   },
   {
+    harness_decision: null,
     // run-unjudged: the NEVER-JUDGED fixture (PRD #119 follow-up). Terminal and
     // judge-eligible (kind "issue"), with NO seeded review and NO entry in
     // mockPendingJudges — the only combination that renders the run-review panel's
@@ -1460,6 +1476,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(470),
   },
   {
+    harness_decision: null,
     // run-closed: a completed run whose MR was later closed unmerged (PRD #24). It
     // renders the muted, struck-through "!8 closed" chip in the runs list, the
     // dashboard, and on its board card.
@@ -1532,6 +1549,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(120),
   },
   {
+    harness_decision: null,
     id: "run-failed",
     usage_estimated_tail: demoTailEstimated,
     repo_id: "repo-atlas",
@@ -1628,6 +1646,7 @@ export const mockRuns: Run[] = [
     updated_at: daysAgo(1.1),
   },
   {
+    harness_decision: null,
     // PRD #377 M2: a GitHub run whose branch touched .github/workflows/** — the bot's
     // repo-only PAT can't push workflow files, so uzi fails the run early with a typed
     // reason and PRESERVES the agent's diff (preserved_patch) for a human to land as a PR.
@@ -1735,6 +1754,7 @@ export const mockRuns: Run[] = [
     updated_at: daysAgo(0.55),
   },
   {
+    harness_decision: null,
     id: "run-cancelled",
     usage_estimated_tail: demoTailUnpriced,
     repo_id: "repo-atlas",
@@ -1804,6 +1824,7 @@ export const mockRuns: Run[] = [
     updated_at: daysAgo(3),
   },
   {
+    harness_decision: null,
     // PRD #35: a run PARKED on an Anthropic usage limit — the only fixture whose
     // status is `limit_wait`, so it is the only one that renders the warn pill, the
     // resume countdown, and the per-run toggle in its parked form.
@@ -1889,6 +1910,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(6),
   },
   {
+    harness_decision: null,
     // PRD #35, second parked run: the DEGRADED countdown states, which the first
     // fixture cannot reach. Added because the browser validator had to override
     // Date.now() inside the page to see them at all, and a state reachable only by
@@ -1971,6 +1993,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(3),
   },
   {
+    harness_decision: null,
     // Issue #754: an `auto`-lane run parked because the owner's Anthropic token pool
     // is genuinely EMPTY. It is NOT a usage-limit park, and the fixture asserts that
     // difference deliberately:
@@ -2051,6 +2074,7 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(9),
   },
   {
+    harness_decision: null,
     // PRD #1190: a run its OWNER paused — the only fixture whose status is `paused`, so
     // the only one that renders the `‖ paused` info pill, the conditional Resume header
     // action, the "· clock stopped" elapsed, and the PausedPanel. It parked after

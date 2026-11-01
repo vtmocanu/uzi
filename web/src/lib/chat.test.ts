@@ -188,6 +188,7 @@ describe("chatIsEnded / conversationTitle / sortConversations", () => {
 describe("chatFromRun (create/continue runDTO → unified Chat view)", () => {
   function aRun(over: Partial<Run> = {}): Run {
     return {
+      harness_decision: null,
       id: "r1",
       repo_id: null,
       kind: "chat",
