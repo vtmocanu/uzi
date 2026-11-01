@@ -125,6 +125,8 @@ type Client interface {
 	// /api/me/codex-account-mode {codex_account_mode: "default"|"auto"}, RequireUser.
 	// Returns the stored mode.
 	SetCodexAccountMode(ctx context.Context, mode string) (string, error)
+	// SetHarnessOverflowEnabled sets creation-time cross-harness overflow.
+	SetHarnessOverflowEnabled(ctx context.Context, enabled bool) (bool, error)
 	// SetRunPriority expedites (expedite=true → priority bumped to the front) or clears
 	// (expedite=false → manual override removed, back to the kind default) ONE queued run:
 	// PATCH /api/runs/{id}/priority (PRD #320 D6/D7), RequireUser so a CLI token can reach
