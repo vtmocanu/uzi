@@ -124,7 +124,8 @@ it("provider hold resource copy locks only issue runs and promises no automatic 
   runOverrides = { kind: "task" };
   mount("provider");
   expect(screen.getByText(/No retry is scheduled/)).toBeTruthy();
-  expect(screen.getByText(/Only a verified available recovery archive/)).toBeTruthy();
+  expect(screen.getByText(/An available archive can restore captured work only when its prerequisite commits are also present/)).toBeTruthy();
+  expect(screen.getByText(/Verify the bundle in the destination clone; uncaptured work is not guaranteed/)).toBeTruthy();
   expect(screen.queryByText(/issue remains locked/)).toBeNull();
 });
 
