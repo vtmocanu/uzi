@@ -789,3 +789,25 @@ moves with materialization in either landing order. Producer admission, #3577 re
 proof and journal/API formats are unchanged. Pruning remains #2823's carried #2414 work
 with independent fail-closed authority. Measurements and regression evidence belong in
 the implementing PR.
+
+## Amendment (2026-11-01, #3727 C2): D5 thin archive FINAL on a pinned prerequisite closure
+
+**Status**: Implemented by C2 of [PRD #2506](../prds/2506-prerequisite-closure.md); builds on the pin lifecycle in [ADR-3591](3591-prerequisite-closure.md). The parent #2506 stays open (C3, E5 and parent acceptance).
+
+D5's refusal of a thin archive FINAL is narrowed, not removed. For an inventory-guarded **archive** FINAL only, a capture that lists prerequisites may release its hold when the API proves, at release time, that the capture's closure is pinned: the closure row is bound to the exact capture and hold, its checksum and prerequisites match the capture, no absence is recorded, and one fresh listing of `refs/uzi-prereq/<capture-id>` on GitHub.com shows the recorded tip. The hold then records `release_evidence = prerequisite_closure` with a `final_closure_id`. Without a positive listing the hold stays open: a recorded absence is refused as `prerequisite_pin_missing`, a different tip as `prerequisite_pin_foreign` (409), and an unlistable pin, timeout or limiter refusal as `prerequisite_pin_unavailable` (503). The proof is archive-only; it adds nothing for publication, held-publication or empty-inventory dispositions, and the server still does not parse bundle bytes (T1-T5 of ADR-3591 are unchanged).
+
+The worker mints a thin archive FINAL only under a transient grant on the frozen path and only against a pinned, matching closure; an unknown or transient result never grants. A committed release replays to its original ACK without forge I/O or admission, and a saved thin FINAL replays on its MAC and bundle header independent of the pin, expiry or knob.
+
+Mixed-version limits, all fail closed:
+
+- C1b API with a C2 worker: the API does not advertise `recovery_prerequisite_closure_v1`, so the worker never mints a thin archive FINAL and the hold stays protected.
+- C2 API rolled back to an older binary without running Down: the older code cannot observe a closure-released hold or classify it across runs, and fails closed on both. A replay of an archive FINAL still ACKs by kind, capture, source and digest.
+- C1b binary against the C2 schema: it never writes the new `prerequisite_closure` evidence or `final_closure_id`.
+
+Accepted residuals: a thin FINAL stays stuck and is retried while the pin or the feature is unavailable; available-pin audits run at about 24 hours, so an external deletion can go unnoticed for up to a day before release-time listing records the absence and refuses; an external writer deleting or rewriting the pin after release defeats restore (the external-writer residual above is unchanged). A closure-released hold remains not history-safe for forge placement (`fn_forge_source_history_safe` is unchanged).
+
+Deploy-window cost: the schema migration (draft number 00389, renumbered at landing) takes `ACCESS EXCLUSIVE` on `recovery_custody_holds` for the combined `ALTER`. Measured on synthetic data it is about 0.4 s per 500k holds (about 0.8 s per million), plus up to 5 s of `lock_timeout` waiting; live row counts and a cold cache are unmeasured. Its Down refuses (SQLSTATE 55000) while closure-backed rows exist.
+
+Admission bound: each closure-backed FINAL that survives the unlocked precheck spends one unit of a per-worker bucket (`prereq-final-list|<worker>`) on the proposal limiter, never refunded. The limiter is a fixed window per API process, so the bound is `PROPOSAL_RATE_LIMIT_MAX` per window per worker per API process, up to twice that across a window edge, multiplied by the number of API replicas. Each admission costs two `GetProject` calls and one `ls-remote` on the owner's stored token.
+
+Coordination with #2884: it also rebuilds the `recovery_inventory_hold_guard` function and the release-evidence CHECK. Whichever lands second must rebuild from the other's live body rather than from its own copy; neither migration may drop the other's branch or constraint value.

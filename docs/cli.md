@@ -1489,13 +1489,14 @@ uzi run discard <run-id> --hold <hold-id> --yes
 - **Terminal and owner-scoped.** A discarded hold cannot be revived, and you can discard
   only your own runs' holds.
 
-C1b prerequisite pins (`refs/uzi-prereq/<capture-id>`, #3591) are a separate
+Prerequisite pins (`refs/uzi-prereq/<capture-id>`, #3591) are a separate
 API lifecycle. This CLI has no prerequisite-pin listing or expiry command;
-`run recovery`/`run held` do not acquire that owner visibility in C1b. A pinned
-thin archive still cannot authorize archive FINAL or local-source cleanup.
-See [prerequisite pin restore and backlog handling](run-recovery.md#prerequisite-pins-api-lifecycle-release-still-disabled)
-for native Git restore and the frozen-binding/cleanup limits. Owner/CLI pin
-visibility belongs to C3; thin custody release belongs to C2.
+`run recovery`/`run held` do not show pin state. On a server that enables it for
+GitHub.com, a pinned thin archive can release custody through the archive FINAL
+(#3727); otherwise it cannot authorize archive FINAL or local-source cleanup.
+See [prerequisite pin restore and backlog handling](run-recovery.md#prerequisite-pins-lifecycle-and-custody-release)
+for native Git restore, the release conditions and the frozen-binding/cleanup
+limits. Owner/CLI pin visibility belongs to C3.
 
 ### Fetching and expiring terminal held refs: `uzi run held`
 

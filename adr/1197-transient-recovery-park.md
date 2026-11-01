@@ -1793,3 +1793,19 @@ this cause's held runs to terminal `worker_lost`, preserving custody and sources
 that conversion is not recovery success and does not make rolling API downgrade
 supported. No database counter is added. The budget-exhaustion contract, strict
 backup schemas and verification before model execution remain unchanged.
+
+## Amendment (2026-11-01, #3727 C2): local thin proof still grants nothing; a pinned closure is a separate API proof
+
+**Status**: Implemented by C2 of [PRD #2506](../prds/2506-prerequisite-closure.md).
+
+The local-proof rule is unchanged: a verified thin bundle with locally available prerequisites permits local adoption and model execution, but that local proof never releases custody. C2 adds a different route that does not rest on the worker's local proof at all: the API releases a thin archive FINAL only after its own fresh listing confirms the pinned closure ([ADR-1296](1296-durable-run-recovery.md), 2026-11-01 amendment). The worker's cached default-branch tip and merge bases remain unproven for public availability.
+
+The proof is archive-only. A park-observed or retained-claim thin record mints the closure FINAL only on the narrow grants described there (missing v2 metadata, or a closure-only feature snapshot); other records, and any producer-origin record, mint nothing.
+
+Mixed-version limits, all fail closed:
+
+- C1b API with a C2 worker: the API does not advertise `recovery_prerequisite_closure_v1`, so the worker never mints a thin archive FINAL and the hold stays protected.
+- C2 API rolled back to an older binary without running Down: the older code cannot observe a closure-released hold or classify it across runs, and fails closed on both. A replay of an archive FINAL still ACKs by kind, capture, source and digest.
+- C1b binary against the C2 schema: it never writes the new `prerequisite_closure` evidence or `final_closure_id`.
+
+Accepted residuals: a thin FINAL stays stuck and is retried while the pin or the feature is unavailable; available-pin audits run at about 24 hours, so an external deletion can go unnoticed for up to a day before release-time listing records the absence and refuses; an external writer deleting or rewriting the pin after release defeats restore (the external-writer residual above is unchanged). A closure-released hold remains not history-safe for forge placement (`fn_forge_source_history_safe` is unchanged).

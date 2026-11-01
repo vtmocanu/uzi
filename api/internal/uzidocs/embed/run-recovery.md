@@ -18,7 +18,9 @@ uzi captures at other boundaries too, not only at final failure: when a run
 is parked (a usage limit or a recovery wait) or gracefully stopped while it
 holds committed work, uzi archives that exact work before its source can be
 torn down. For guarded generations, release normally requires final acknowledgment
-of a covering, prerequisite-free archive or a verified empty inventory.
+of a covering, prerequisite-free archive or a verified empty inventory (or, where
+the operator enables it for GitHub.com, a thin archive whose prerequisites are
+pinned and re-confirmed; see [Prerequisite pins](#prerequisite-pins-lifecycle-and-custody-release)).
 Eligible completed issue, MR-rework and self-improvement runs can instead
 release their exact completing-generation hold after the API verifies the
 published final commit against the run's branch and MR (see below). Legacy generations can release on proof that their
@@ -561,7 +563,8 @@ including prerequisite history, and refuses missing or corrupt objects.
 or remote durability and does not release custody: predecessor sources, pins, journals
 and descriptors remain until the existing verified final disposition or
 explicit discard. The guarded prerequisite-free archive/empty-inventory
-release conditions below remain unchanged.
+release conditions below remain unchanged; the pinned-closure release is a
+separate API proof.
 
 The configured budget counts delivered object contents cumulatively within a
 recovery operation. Successfully verified objects are cached per bare identity
@@ -683,17 +686,21 @@ its `coverage_digest`; it does not provide a new server-side root list or
 prove Git ancestry. Preserve the downloaded bundle while reviewing which
 original head to land.
 
-## Prerequisite pins: API lifecycle, release still disabled
+## Prerequisite pins: lifecycle and custody release
 
-C1b (#3591) implements the API pin lifecycle for qualifying new thin captures.
+C1b (#3591) implements the API pin lifecycle for qualifying new thin captures;
+C2 (#3727) lets a pinned thin archive release custody (see
+[Releasing custody on a pinned closure](#releasing-custody-on-a-pinned-closure)).
 The API advertises `recovery_prerequisite_closure_v1` on register and heartbeat
 responses only while `UZI_PREREQUISITE_CLOSURE_FORGES` contains `github`, the
 closure FINAL port is wired and the per-worker admission limiter is wired (the one
 predicate that also gates a closure-backed archive FINAL); it is computed per
-response, never cached at boot. A `pinned` response alone does not release custody.
-C2 owns release; C3 owns owner/CLI pin visibility.
-The parent #2506 remains active. See [ADR-3591](../adr/3591-prerequisite-closure.md)
-for the implementation and local evidence boundaries.
+response, never cached at boot. A `pinned` response alone does not release custody:
+release needs the worker's thin archive FINAL and the API's fresh pin listing
+below. C3 owns owner/CLI pin visibility. The parent #2506 remains active. See
+[ADR-3591](../adr/3591-prerequisite-closure.md) for the pin lifecycle and
+[ADR-1296](../adr/1296-durable-run-recovery.md) (2026-11-01 amendment) for the
+release boundary and its limits.
 
 ### When a pin can be created
 
@@ -739,7 +746,7 @@ This is the conditional trusted-worker T1–T5 proof:
 | T2 | The API checks byte length/checksum and binds the immutable manifest. It does not parse, apply or verify Git bundle contents. |
 | T3 | The forge positively proves every declared P ancestor/equal to fresh D. Undeclared dependencies are outside that proof. |
 | T4 | Create-only pinning and read-back observe the ref at frozen D. |
-| T5 | Exact capture/hold binding and uzi's cleanup rules retain the pin while its archive is available. Future FINAL-time observation/revalidation belongs to C2. |
+| T5 | Exact capture/hold binding and uzi's cleanup rules retain the pin while its archive is available. FINAL-time observation re-lists the pin before every release (see below); an external writer can still delete it later. |
 
 A pin cannot repair an incorrect worker declaration. Native restore tests
 include an omitted second prerequisite: the declared prerequisite is fetched,
@@ -770,8 +777,98 @@ fresh `--no-local` clone missing P; fetching the pin permits verify/import and
 restores the exact source commit, tree and file. The no-pin control fails on P.
 A rewrite before preparation is refused without marker/send. These fixtures use
 fake persistence and native graph ancestry; separate LiveDB tests exercise
-upload/manifest/state/locking behavior. They are not a new live forge probe or
-a released-custody end-to-end test.
+upload/manifest/state/locking behavior. They are not a new live forge probe.
+The combined released-custody proof is described under
+[Releasing custody on a pinned closure](#releasing-custody-on-a-pinned-closure).
+
+### Releasing custody on a pinned closure
+
+A thin (prerequisite-carrying) inventory-guarded archive can release its
+custody hold when its prerequisites are pinned and the API confirms the pin at
+release time. Otherwise the hold stays protected exactly as before. Release
+needs all of the following.
+
+- **Knob and advertisement.** `UZI_PREREQUISITE_CLOSURE_FORGES` contains `github`
+  and the API wires the closure FINAL port and the per-worker limiter (the
+  advertisement predicate above). Only GitHub.com (`https://github.com`) is
+  authorized; GitLab, Forgejo, GitHub Enterprise and other hosts are unprobed
+  and are refused as `manifest_conflict`.
+- **Worker.** The worker registers `recovery_prerequisite_closure_v1` and mints a
+  thin archive FINAL only under a transient grant on the frozen path: a missing
+  v2 metadata record; a proven held-publication ineligibility; a held-publication
+  fallback in the same pass that the server explicitly refused (a 409, 413 or 422
+  with a bounded reason, a 200 `create_refused`, or a retained held-FINAL fallback
+  reason) or that a deterministic local check refused (`secret_found`,
+  `workflow_change`, `ci_config_guard`); or a feature set naming the closure
+  feature and neither held feature. It also needs an ordinary local origin, a
+  verified local capture and a capture status whose closure is `pinned` and
+  matches the capture's checksum and prerequisites. An unknown or transient
+  result never grants a mint. A saved thin FINAL replays on its recorded MAC and
+  bundle header, independent of the pin, capture expiry or the knob.
+- **API.** Each FINAL runs an unlocked precheck, then admission, then one forge
+  listing, then a locked release:
+  1. The precheck applies every refusal that needs no forge call. A replay of
+     an already committed release answers with the original ACK without forge I/O
+     or admission.
+  2. Admission charges one unit on the per-worker limiter (bucket
+     `prereq-final-list|<worker>` on the proposal limiter, sized by
+     `PROPOSAL_RATE_LIMIT_MAX` / `PROPOSAL_RATE_LIMIT_WINDOW`, default `20` per
+     `1m`). It is a fixed window per API process and an admission is never
+     refunded, even when the FINAL later fails. The bound is at most the
+     configured maximum per window per worker per API process (up to twice that
+     across a window edge), multiplied by the number of API replicas. Each
+     admission costs two project reads (`GetProject`) and one `ls-remote` of
+     `refs/uzi-prereq/<capture-id>` on github.com with the repository owner's
+     stored token.
+  3. A short transaction reserves a fresh listing pass; the listing runs outside
+     every transaction.
+  4. A present pin at the recorded tip releases the hold under the full lock
+     chain (worker, run, hold, capture, closure). Each locked step waits at most
+     500 ms server-side and the whole request has a 6-second budget. The hold
+     records `release_evidence = prerequisite_closure` and a `final_closure_id`
+     that the schema ties to the exact closure, capture and hold.
+
+The API refuses as follows. Every refusal keeps custody; the worker keeps the
+saved FINAL and retries.
+
+| Status | Reason | Meaning |
+|---|---|---|
+| 409 | `manifest_conflict` | Unsupported configuration or binding (knob off, no `github`, capability missing, closure not pinned for this exact capture, expired or mismatched capture); unchanged from the prerequisite-free path. |
+| 409 | `prerequisite_pin_missing` | The pin ref was cleanly listed as absent and the absence is recorded. |
+| 409 | `prerequisite_pin_foreign` | The pin ref is listed at a different tip. |
+| 503 | `prerequisite_pin_unavailable` | The listing failed or timed out, the limiter refused, a lock wait or deadline ran out, or a newer reservation superseded this one. Retry shortly. |
+
+Restoring a closure-released archive follows
+[Restoring with a confirmed pin](#restoring-with-a-confirmed-pin): fetch
+`refs/uzi-prereq/<capture-id>`, then verify and import the bundle.
+
+Limits an operator should expect:
+
+- A FINAL stays stuck, and the worker keeps retrying, while the pin or the
+  feature is unavailable (forge outage, knob turned off, limiter exhausted).
+  Nothing releases by elapsed time.
+- Available-pin audits normally run at 24 hours, so an externally deleted pin can
+  go unnoticed for up to a day. The release-time listing catches it before any
+  release: absence is recorded and the FINAL is refused. After release, deleting
+  or rewriting the pin defeats restore (ADR-1296's accepted external-writer
+  residual).
+- A closure-released hold is still **not history-safe for forge placement**: the
+  forge source-history predicate is unchanged and treats it like any other
+  archive-released hold.
+- Mixed versions fail closed. Without the API advertisement the worker never
+  mints; a rolled-back API that keeps the new schema cannot observe or classify a
+  closure-released hold and refuses those checks, though it still ACKs a replay
+  of an archive FINAL by kind, capture, source and digest; an older binary never
+  writes the new evidence.
+- The schema migration takes `ACCESS EXCLUSIVE` on `recovery_custody_holds`.
+  Measured on synthetic data it takes about 0.4 s per 500k holds (about 0.8 s per
+  million), plus up to 5 s of `lock_timeout` waiting. Live row counts and a cold
+  cache are unmeasured, and its Down refuses (SQLSTATE 55000) while any
+  closure-backed row exists.
+- The opt-in combined proof `TestPrerequisiteClosureReleaseE2E` (in the opt-in leg
+  of `e2e/run-store-it.sh`) exercises the worker, API, limiter and a real Git
+  backend with a default-branch rewrite after the pin. No live GitHub.com
+  observation has been made.
 
 ### Unknown pins, cleanup and removal blockers
 
@@ -1151,8 +1248,11 @@ checkpoint, and introduces no new publication path.
 For the archive path, custody transfers after the API acknowledges the final
 disposition: either the exact selected available, prerequisite-free archive (capture id,
 source SHA and `coverage_digest`) or a verified empty inventory with settlement
-evidence. A thin archive is downloadable but does not authorize archive-backed
-FINAL or source cleanup, even when it covers every original root. Without a
+evidence. A thin archive is downloadable but, unless its prerequisites are pinned
+and the API confirms the pin at release time (see
+[Releasing custody on a pinned closure](#releasing-custody-on-a-pinned-closure)),
+does not authorize archive-backed FINAL or source cleanup, even when it covers
+every original root. Without a
 completed-publication receipt, holds, pins and clones remain retained until
 independently verified empty-inventory settlement or explicit owner discard.
 Thin-archive availability alone does not retire a pod; pod, PVC and hold costs
@@ -1672,7 +1772,8 @@ active protection. Each row offers the right action for its state:
   export`). Downloading does not itself release custody. Legacy holds can
   release automatically when an archive becomes ready; guarded holds await
   a verified final disposition even if an archive is available; prerequisites
-  prevent archive-backed final custody release. Eligible completed runs can
+  prevent archive-backed final custody release unless they are pinned and the API
+  confirms the pin at release time. Eligible completed runs can
   instead release through the separate completed-publication proof below.
   An Export-only row is not proof that guarded custody has closed.
 - **Discard held work** — for a hold whose source may be the only copy (no

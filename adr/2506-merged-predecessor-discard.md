@@ -94,3 +94,21 @@ Implementation: `api/internal/forgesvc/merged_predecessor.go`, `api/internal/rec
 Acceptance should cover nonancestor predecessors and available/thin archives, exact binding drift and refused merge observations, concurrent upload/owner discard, immutable audit and rollback refusal, historical/issue-less polling, fairness, cursor retry/wrap/restart, parent cancellation and independent deadlines. Relevant named cases include `TestMergedPredecessorSelectionAndArchiveLiveDB`, `TestMergedPredecessorSnapshotDriftLiveDB`, `TestMergedPredecessorRollbackLiveDB` and `TestMergedPredecessorFairnessAndRestart`; these are acceptance references, not claims of execution. Test and timing evidence is owned by the lead.
 
 This narrowly amends [ADR-1296](1296-durable-run-recovery.md); it does not close #2506 or ship the deferred physical disposal.
+
+## Amendment (2026-11-01, #3727 C2): option A's release shares the guard and the evidence CHECK
+
+**Status**: Implemented by C2 of [PRD #2506](../prds/2506-prerequisite-closure.md); option D's behavior is unchanged.
+
+Option A's thin archive FINAL on a pinned prerequisite closure ([ADR-1296](1296-durable-run-recovery.md), 2026-11-01 amendment) is a different proof from `merged_predecessor_discard` and does not widen it. It rebuilds the same `recovery_inventory_hold_guard` function and the `release_evidence` CHECK this ADR also touches, adding a `prerequisite_closure` value and a `final_closure_id` that the guard preserves with the rest of the FINAL columns. The merged-predecessor binding branch is carried forward from its live body, not rewritten. The closure proof is archive-only, and a closure-released hold remains not history-safe for forge placement.
+
+Mixed-version limits, all fail closed:
+
+- C1b API with a C2 worker: the API does not advertise `recovery_prerequisite_closure_v1`, so the worker never mints a thin archive FINAL and the hold stays protected.
+- C2 API rolled back to an older binary without running Down: the older code cannot observe a closure-released hold or classify it across runs, and fails closed on both. A replay of an archive FINAL still ACKs by kind, capture, source and digest.
+- C1b binary against the C2 schema: it never writes the new `prerequisite_closure` evidence or `final_closure_id`.
+
+Accepted residuals: a thin FINAL stays stuck and is retried while the pin or the feature is unavailable; available-pin audits run at about 24 hours, so an external deletion can go unnoticed for up to a day before release-time listing records the absence and refuses; an external writer deleting or rewriting the pin after release defeats restore (the external-writer residual above is unchanged). A closure-released hold remains not history-safe for forge placement (`fn_forge_source_history_safe` is unchanged).
+
+Deploy-window cost: the schema migration (draft number 00389, renumbered at landing) takes `ACCESS EXCLUSIVE` on `recovery_custody_holds` for the combined `ALTER`. Measured on synthetic data it is about 0.4 s per 500k holds (about 0.8 s per million), plus up to 5 s of `lock_timeout` waiting; live row counts and a cold cache are unmeasured. Its Down refuses (SQLSTATE 55000) while closure-backed rows exist.
+
+Coordination with #2884: it also rebuilds the `recovery_inventory_hold_guard` function and the release-evidence CHECK. Whichever lands second must rebuild from the other's live body rather than from its own copy; neither migration may drop the other's branch or constraint value.
