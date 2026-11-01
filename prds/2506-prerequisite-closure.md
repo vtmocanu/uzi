@@ -886,6 +886,111 @@ the ADR amendments dated 2026-11-01.
 - **Depends on:** C1b (states). Parallel with C2 only with disjoint file ownership.
 - **Scope and evidence:** owner DTO, fixtures, web and CLI (`cellText`), `pin_lost` and `pin_cleanup_exhausted` visibility, restore commands, `docs/cli.md`; E5 measured.
 
+#### C3 local E5 measurement (2026-11-01, #3728)
+
+The explicit `TestRecoveryRestoreWorkflowLiveDB/E5FullHistory` invocation
+passed with zero SKIP/FAIL. This is a local owner-workflow measurement, not
+hosted GitHub latency, a C2 FINAL exercise or parent release acceptance.
+The ordinary `SmallNative` controls also passed; they do not substitute for E5.
+The parent and C3 documentation/integration acceptance remain open.
+
+Input was a `clone --no-local` of this checkout, selected at public revision
+`a07f813708ced206cd7b8c3f9d09e259b2fff64b`: non-shallow, connectivity/full
+object checks passed, 2,405 reachable commits. The captured source added
+`recovery-generated.txt` (26 bytes, SHA-256
+`5a96308b340168c758f0ad6da84524bc09893aa989bc88bccaa22c78dc86b43b`),
+giving 2,406 commits at source
+`eeffd4ccba0fc168d69068bbe0c71a0fb545a8a5`, tree
+`b4ae331a571f7a7c46bba83bb1c442c552b76246`.
+
+| Observed component | Actual result |
+|---|---|
+| Exported thin bundle | 507 bytes; SHA-256 `809a9636aaeb1fae98af11eb7663a46c1c5d54da3da5f48767b236af9981638a` |
+| Pin fetch | 97,835,961 bytes of native upload-pack POST response bodies, including Git protocol framing, excluding advertisements, HTTP headers and transport overhead |
+| Explicit-capture CLI export | 95.414 ms |
+| Exact pin fetch to the same ref namespace | 13.741274 s |
+| Recorded-tip comparison, bundle verify and recovered-source import | 79.169 ms |
+| Owner clock: export start through import completion | 13.915937 s; includes exported-byte comparison, excludes final source/tree/file assertions |
+| Fixture setup through native pinning | 47.765507 s |
+| Owned remote rewrite/prune clock | 2.224715 s |
+| Clean consumer clone | 45.426 ms |
+| Entire case clock | 64.732682 s, including setup, prune, clone, source/tree/file assertions and negative controls |
+| Containing test / Go package test time | 159.08 s / 160.441 s; includes full-input verification and CLI driver compilation outside the case/owner clocks |
+
+The lane used real C1b sweep, broker prepare/send/readback, PostgreSQL
+constraints/transitions, encrypted archive upload/storage, authenticated owner
+metadata/download and the existing CLI export/SafeWriteVerifiedFile path.
+Both owned bare remotes had their default branch rewritten, reflogs expired and
+`gc --prune=now` run. The independently unpinned remote no longer contained
+the frozen prerequisite. The clean consumer initially failed bundle verification
+naming that prerequisite, then fetched its capture-specific pin, compared the
+recorded tip, verified/imported the advertised recovered-source ref and matched
+source SHA, tree and file content. No alternates or local-clone hardlinks supplied
+the consumer's history.
+
+Missing metadata/ref/tip, foreign capture/ref/tip, unavailable history and expired
+download controls passed with the exported archive retained. Expiry required
+HTTP 409 with `not_available`, not an arbitrary error. Read/export/import left
+capture, closure and hold rows byte-identical before the fixture's explicit expiry
+control; the native pin and captured source ref were unchanged.
+Existing S0 no-backfill/admission controls passed separately, including the
+unreviewed-host refusal. No production host policy was relaxed.
+
+Substitutions were fixture identities/configuration, generated source content,
+loopback forge discovery/URL policy, native ancestry in place of the hosted forge
+API, and a test-only Main/Env/config driver in place of the installed CLI entry.
+Upload first used the production GitHub.com S0 policy; only the fixture's pending
+binding then moved to the owned loopback remote. The driver kept HOME unchanged,
+used an owned Store/SkillHome and explicit nonsecret environment allowlist, and
+proved inherited UZI settings/credential sentinels did not reach the API.
+
+Environment: native Linux x86_64/Go linux-amd64 runner, Git 2.54.0, Go 1.27.3,
+CLI version emitted by the test build `dev`, owned PostgreSQL 17 container.
+The Alpine Git package lacked its CGI helper: the initial small control failed
+for that setup reason. The matching git-daemon 2.54.0-r0 package was fetched,
+signature-verified and extracted only under scratch (archive SHA-256
+`b376522eadb4df8dc5274687ceabe07456924d415cfcc5683c4b198e97a6c855`).
+Its native git-http-backend was added to the test PATH; no global install or
+Git exec-path change occurred. A cancelled intermediate compile and an unfinished
+component-static invocation are not passing checks.
+
+Reproduce from `api/`, after preparing a marker-guarded owned test database and
+the independently cloned/full-checked frozen source, with native git-http-backend
+available on PATH:
+
+```sh
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+  UZI_TEST_DATABASE_URL="<owned-test-database-url>" \
+  UZI_TEST_RECOVERY_RESTORE_FULL_HISTORY_SOURCE="<absolute-owned-full-source>" \
+  go test -buildvcs=false -race -count=1 -v -p 1 \
+  -run '^TestRecoveryRestoreWorkflowLiveDB$/^E5FullHistory$' ./internal/handler
+```
+
+Require the exact E5FullHistory RUN/PASS, positive archive/fetch byte counts and
+the LiveDB skip guard with zero SKIP/FAIL; an ordinary small-only pass is
+insufficient. The full-input mode rejects missing/wrong/shallow/incomplete input
+rather than falling back. Routine CI omits E5 registration when full mode is
+not requested.
+
+Evidence was collected from the candidate fixture sources with SHA-256
+`6094c38936c0487a8c4f877d7db905005dee6f089f4ef6dcc18f85fad6629b23`
+(native helper),
+`0956a91715973e0e5ee25632219509688f430a3f6fd5175ef58697ba1c861466`
+(workflow), and
+`665eff881f1d5bfdfcbe94cf25f7c026314672cc589c0ef01a24086621a9b683`
+(CLI driver). Local logs were read directly: gate-log.MnbjAQ (small),
+gate-log.v1jaiY (E5), gate-log.k3D0Gr (S0). Scratch paths are run-local,
+not durable artifacts; the sanitized results above are the committed record.
+
+These are the latest successful local passes after setup/static-check repairs,
+with warmed module and filesystem caches. An earlier full-history pass also
+succeeded; these are individual observations, not a performance average. Cache hit rates, hosted queue/cache/rerun costs and CI
+critical-path impact were not measured. The small containing test took 68.28 s
+(case 6.40 s), exposing substantial driver-preparation cost outside the restore
+clock. Full inherited store-it and required exact-head API/repo CI remain landing
+obligations. External pin deletion/history rewrite remains the accepted residual;
+this measurement grants no custody-release or cleanup authority.
+
 ### Parent acceptance
 
 - C1a, C1b, C2 **and C3** complete (C3 may be dropped only by a separate owner decision adopting P5).
