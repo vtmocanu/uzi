@@ -24831,6 +24831,12 @@ export class RunRunner {
       if (!associated || isCheckedLifecycleControl(error)) throw error;
       throw new Error("plan cross-check: human-presentation ACK unrecoverable", { cause: error });
     }
+    if (ack.applied === true && ack.status === "awaiting_approval") {
+      // A restarted planning turn can submit a plan without settling its interrupted question.
+      // Match SetRunAwaitingApproval's ID clear and stop charging before the plan-gate wait.
+      this.closeParkCharge(runId);
+      this.openQuestionIds.delete(runId);
+    }
     if (associated && (ack.applied !== true || ack.status !== "awaiting_approval" ||
         !Number.isSafeInteger(ack.gateRevision) || (ack.gateRevision ?? 0) <= 0))
       throw new Error("plan cross-check: human-presentation ACK unrecoverable");

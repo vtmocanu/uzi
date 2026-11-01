@@ -1065,6 +1065,65 @@ describe("PRD #88 M6 — RunRunner.askUser", () => {
     assert.strictEqual(internal.questionCounts.has(claim.run_id), false);
   });
 
+  it("closes an interrupted planning question when the restarted turn submits a plan", async () => {
+    let clockMs = 0;
+    const arms: number[] = [];
+    const claim = claimFor(3161, { kind: "issue" });
+    const originalAnswer = SteeringChannel.prototype.awaitAnswer;
+    const originalGate = SteeringChannel.prototype.awaitGateEvent;
+    let waits = 0;
+    let parks = 0;
+    let gates = 0;
+    SteeringChannel.prototype.awaitAnswer = function (this: SteeringChannel, questionId: string) {
+      if (++waits === 1) {
+        clockMs += 900;
+        return Promise.reject(new CredentialSwitchSignal());
+      }
+      return originalAnswer.call(this, questionId);
+    };
+    SteeringChannel.prototype.awaitGateEvent = function (this: SteeringChannel, epoch: number, signal?: AbortSignal) {
+      gates++;
+      clockMs += 5000; // after the plan-gate ACK, while waiting for approval
+      return originalGate.call(this, epoch, signal);
+    };
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_approval") api.setInputs(claim.run_id, [input("approve_plan")]);
+      if (body.status !== "awaiting_input" || !body.open_question_id) return;
+      if (++parks === 1) return;
+      api.setInputs(claim.run_id, [{ ...answerInput(body.open_question_id, "continue"), id: 2 }]);
+    });
+    const executor: Executor = {
+      async run(ctx: RunContext) {
+        await assert.rejects(ctx.askUser!([{ question: "planning question?", header: "Plan" }]), CredentialSwitchSignal);
+        // A switch give-up restarts planning; the new turn submits a plan instead of re-asking.
+        const gate = await ctx.gatePlan!("# Restarted plan");
+        assert.strictEqual(gate.kind, "approve");
+        clockMs += 5000; // implementation work, also outside the clarification budget
+        const answer = await ctx.askUser!([{ question: "implementation question?", header: "Work" }]);
+        assert.strictEqual(answer.kind, "answer");
+        commitMarker(ctx.worktreePath, "planning question replaced by plan");
+        return { branch: ctx.branch };
+      },
+    };
+    const runner = runnerFor(executor, {
+      questionTimeoutMs: 1500,
+      now: () => clockMs,
+      setTimer: (_cb, ms) => { arms.push(ms); return () => {}; },
+    });
+    try {
+      await runner.execute(claim);
+    } finally {
+      SteeringChannel.prototype.awaitAnswer = originalAnswer;
+      SteeringChannel.prototype.awaitGateEvent = originalGate;
+    }
+    assert.deepStrictEqual(arms, [1500, 600], "only the 900ms clarification wait is charged");
+    const ids = parkedQuestionIds(claim.run_id);
+    assert.strictEqual(ids.length, 2);
+    assert.notStrictEqual(ids[0], ids[1], "the plan gate clears the interrupted question identity");
+    assert.strictEqual(gates, 1, "the real runner plan gate waited for approval");
+    assert.strictEqual(statuses(claim.run_id).at(-1), "completed", failureReason(claim.run_id));
+  });
+
   /** The completion window (ADR-1225 I6) is never charged to the clarification budget. */
   it("closes an open clarification interval at completion-question entry and does not charge the window", async () => {
     let clockMs = 0;
