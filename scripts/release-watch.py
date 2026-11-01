@@ -29,7 +29,9 @@ ASSERT_AFFECTED_JOBS = ['assert-tag-smoke', 'publish-chart', 'publish-release']
 RELEASE_SUCCESS_ROLES = {'prep', 'assert-version', 'assert-changelog', 'assert-ci-coverage',
                          'assert-release-metadata', 'assert-worker-pin', 'assert-agent-version',
                          'publish-api', 'publish-web', 'publish-controller',
-                         'publish-agent (base)', 'publish-agent (jvm)'}
+                         'publish-agent (base, amd64)', 'publish-agent (base, arm64)',
+                         'publish-agent (jvm, amd64)', 'publish-agent (jvm, arm64)',
+                         'publish-agent-index (base)', 'publish-agent-index (jvm)'}
 RELEASE_SKIPPED_ROLES = {'publish-chart', 'publish-release'}
 
 

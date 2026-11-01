@@ -228,7 +228,7 @@ jobs:
   # manifests out of the pushed tag, matching the chart's simple {repo}:{tag} image
   # references. api, web and controller publish linux/amd64,linux/arm64 (one index per
   # tag; their Dockerfiles cross-compile on $BUILDPLATFORM, so no QEMU). The agent
-  # images stay linux/amd64 only.
+  # images publish both arches too, built natively per arch (publish-agent below).
   #
   # SIGNING (cosign keyless / Sigstore). Every image is signed BY DIGEST after push,
   # using the job's GitHub OIDC identity (id-token: write) -- no long-lived key to
@@ -439,12 +439,17 @@ jobs:
   # The cost control is therefore structural: a release whose runtime inputs did not change
   # pays only the thin stage, whether or not the registry layer cache hits.
   #
-  # SERIALIZED PER TEMPLATE. Two release runs (a promote pushes a stable and an RC tag)
-  # could otherwise both find a key absent and build it. Job concurrency makes
-  # resolve -> build -> sign atomic per template. Should two outputs for one key ever exist
-  # anyway, that is acceptable by design: each release consumes the digest it verified.
+  # SERIALIZED PER TEMPLATE AND ARCH. Two release runs (a promote pushes a stable and an RC
+  # tag) could otherwise both find a key absent and build it. Job concurrency makes
+  # resolve -> build -> sign atomic per template and arch. Should two outputs for one key ever
+  # exist anyway, that is acceptable by design: each release consumes the digest it verified.
+  #
+  # MULTI-ARCH. Each (template, arch) leg builds natively (the nix + Chromium realize is
+  # impractical under QEMU), keys its runtime base per platform (the key hashes it), and
+  # pushes its release image BY DIGEST, untagged. publish-agent-index then joins the two
+  # digests into one index and tags and signs that, so a tag never points at one arch alone.
   publish-agent:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     needs: [prep, assert-version, assert-changelog, assert-ci-coverage, assert-release-metadata]
     environment: release
     permissions:
@@ -455,13 +460,19 @@ jobs:
       fail-fast: false
       matrix:
         template: [base, jvm]
+        arch: [amd64, arm64]
     # queue: max -- without it a third concurrent release would CANCEL the pending second
     # one (a group keeps a single pending job by default, even with cancel-in-progress off).
     # actionlint does not know the key yet; .github/actionlint.yaml ignores exactly that.
     concurrency:
-      group: agent-runtime-${{ matrix.template }}
+      group: agent-runtime-${{ matrix.template }}-${{ matrix.arch }}
       cancel-in-progress: false
       queue: max
+    env:
+      PLATFORM: linux/${{ matrix.arch }}
+      # A registry cache ref holds one platform's layers, so the legs would overwrite each
+      # other. amd64 keeps the refs it always had (PR CI reads them); arm64 gets its own.
+      CACHE_SUFFIX: ${{ matrix.arch == 'arm64' && '-arm64' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
@@ -495,15 +506,15 @@ jobs:
           TEMPLATE: ${{ matrix.template }}
         run: |
           set -euo pipefail
-          KEY="$(scripts/agent-runtime-key.sh "$TEMPLATE" linux/amd64)"
-          echo "agent/${TEMPLATE}: runtime input key ${KEY}"
+          KEY="$(scripts/agent-runtime-key.sh "$TEMPLATE" "$PLATFORM")"
+          echo "agent/${TEMPLATE} ${PLATFORM}: runtime input key ${KEY}"
           echo "key=${KEY}" >> "$GITHUB_OUTPUT"
       - id: resolve
         name: Reuse the runtime base if a signed one exists for this key
         env:
           TEMPLATE: ${{ matrix.template }}
           KEY: ${{ steps.key.outputs.key }}
-        run: scripts/agent-runtime-resolve.sh "$TEMPLATE" "$KEY" linux/amd64 >> "$GITHUB_OUTPUT"
+        run: scripts/agent-runtime-resolve.sh "$TEMPLATE" "$KEY" "$PLATFORM" >> "$GITHUB_OUTPUT"
       # Only on a confirmed absence. The registry cache (agent-<t>:buildcache) carries the
       # runtime layers, so a base rebuild after a small input change reuses the untouched
       # nix/Chromium layers; PR CI reads the same cache (read-only) for its full builds.
@@ -516,18 +527,18 @@ jobs:
           file: agent/templates/${{ matrix.template }}/Dockerfile
           target: runtime
           push: true
-          platforms: linux/amd64
+          platforms: ${{ env.PLATFORM }}
           provenance: false
-          cache-from: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache
+          cache-from: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache${{ env.CACHE_SUFFIX }}
           # ignore-error: a cache EXPORT failure must not fail the release or block
           # signing -- the cache is an optimization, not a gate (#739).
-          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache,mode=max,ignore-error=true
+          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache${{ env.CACHE_SUFFIX }},mode=max,ignore-error=true
           tags: ghcr.io/vtmocanu/uzi/agent-runtime-${{ matrix.template }}:${{ steps.key.outputs.key }}
           labels: |
             org.opencontainers.image.source=https://github.com/vtmocanu/uzi
             io.github.vtmocanu.uzi.runtime-key=${{ steps.key.outputs.key }}
             io.github.vtmocanu.uzi.runtime-template=${{ matrix.template }}
-            io.github.vtmocanu.uzi.runtime-platform=linux/amd64
+            io.github.vtmocanu.uzi.runtime-platform=${{ env.PLATFORM }}
       # Named "Sign image" so release-verify.sh counts it among the expected signatures.
       - name: Sign image (cosign keyless) -- runtime base
         if: steps.resolve.outputs.found == 'false'
@@ -547,7 +558,7 @@ jobs:
           if [ "$FOUND" = true ]; then DIGEST="$REUSED"; else DIGEST="$BUILT"; fi
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "no runtime base digest (found=$FOUND)" >&2; exit 1; }
           REF="ghcr.io/vtmocanu/uzi/agent-runtime-${TEMPLATE}@${DIGEST}"
-          echo "agent/${TEMPLATE}: release builds on ${REF} ($([ "$FOUND" = true ] && echo reused || echo built))"
+          echo "agent/${TEMPLATE} ${PLATFORM}: release builds on ${REF} ($([ "$FOUND" = true ] && echo reused || echo built))"
           echo "ref=${REF}" >> "$GITHUB_OUTPUT"
       # The release stage, ALWAYS built. The `runtime` build context replaces the
       # Dockerfile's runtime stage with the pinned digest, so nothing above the stage
@@ -561,19 +572,17 @@ jobs:
           file: agent/templates/${{ matrix.template }}/Dockerfile
           target: release
           build-contexts: runtime=docker-image://${{ steps.runtime.outputs.ref }}
-          push: true
-          platforms: linux/amd64
+          platforms: ${{ env.PLATFORM }}
           provenance: false
           # The release stage's own cache (COPY . /opt/uzi-src and the chown are worth
           # reusing on a fresh runner). A separate ref, so it never overwrites the runtime
           # layers in :buildcache. Export failure is non-fatal (#739).
           cache-from: |
-            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache-release
-            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache
-          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache-release,mode=max,ignore-error=true
-          tags: |
-            ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:${{ needs.prep.outputs.version }}
-            ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:${{ needs.prep.outputs.short_sha }}
+            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache-release${{ env.CACHE_SUFFIX }}
+            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache${{ env.CACHE_SUFFIX }}
+          cache-to: type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache-release${{ env.CACHE_SUFFIX }},mode=max,ignore-error=true
+          # Pushed by digest, untagged: publish-agent-index tags the multi-arch index.
+          outputs: type=image,name=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             UZI_SRC_SHA=${{ github.sha }}
             UZI_AGENT_VERSION=${{ github.ref_name }}+g${{ needs.prep.outputs.short_sha }}
@@ -586,13 +595,11 @@ jobs:
       # Filesystem half of the identity check (assert-agent-version reads only the image
       # config): export JUST /opt/uzi-src/BUILD_INFO from the digest this job pushed and
       # require it to name this commit. The builder already holds those layers, so this
-      # does not re-pull the image. Also proves both tags resolve to that digest.
-      - name: Verify the pushed release image (BUILD_INFO, tags)
+      # does not re-pull the image.
+      - name: Verify the pushed release image (BUILD_INFO)
         env:
           TEMPLATE: ${{ matrix.template }}
           DIGEST: ${{ steps.build.outputs.digest }}
-          VERSION: ${{ needs.prep.outputs.version }}
-          SHORT_SHA: ${{ needs.prep.outputs.short_sha }}
         run: |
           set -euo pipefail
           REPO="ghcr.io/vtmocanu/uzi/agent-${TEMPLATE}"
@@ -604,19 +611,93 @@ jobs:
           cat "${out}/BUILD_INFO"
           grep -qxF "commit: ${GITHUB_SHA}" "${out}/BUILD_INFO" \
             || { echo "BUILD_INFO does not name ${GITHUB_SHA}" >&2; exit 1; }
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad digest '$DIGEST'" >&2; exit 1; }
+          mkdir -p "${RUNNER_TEMP}/agent-digest"
+          printf '%s\n' "$DIGEST" > "${RUNNER_TEMP}/agent-digest/${PLATFORM#linux/}"
+          echo "agent/${TEMPLATE} ${PLATFORM}: ${DIGEST}, BUILD_INFO names ${GITHUB_SHA}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: agent-digest-${{ matrix.template }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/agent-digest/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # One index per template over the per-arch digests publish-agent pushed. The index is what
+  # :<version> and :<short_sha> name, so a node of either arch pulls its own image by tag.
+  # The index binds its children by digest, so its signature covers both; each child also
+  # carries its own signature from its leg.
+  publish-agent-index:
+    runs-on: ubuntu-latest
+    needs: [prep, publish-agent]
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # cosign keyless: mint the OIDC token used to sign
+    strategy:
+      fail-fast: false
+      matrix:
+        template: [base, jvm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: ./.github/actions/install-cosign
+        with:
+          cosign-release: 'v3.1.3'
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6  # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: agent-digest-${{ matrix.template }}-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/agent-digest
+      - id: index
+        name: Create and tag the multi-arch index
+        env:
+          TEMPLATE: ${{ matrix.template }}
+          VERSION: ${{ needs.prep.outputs.version }}
+          SHORT_SHA: ${{ needs.prep.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          REPO="ghcr.io/vtmocanu/uzi/agent-${TEMPLATE}"
+          dir="${RUNNER_TEMP}/agent-digest"
+          want=""
+          refs=()
+          for arch in amd64 arm64; do
+            d="$(cat "${dir}/${arch}")"
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad ${arch} digest '$d'" >&2; exit 1; }
+            refs+=("${REPO}@${d}")
+            want+="linux/${arch}=${d}"$'\n'
+          done
+          docker buildx imagetools create -t "${REPO}:${VERSION}" -t "${REPO}:${SHORT_SHA}" "${refs[@]}"
           # GHCR's tag read-after-write can lag a push by a moment (issue #1102): poll briefly.
+          index=""
           for t in "${VERSION}" "${SHORT_SHA}"; do
             got=""
             for i in 1 2 3 4 5; do
-              if got="$(docker buildx imagetools inspect "${REPO}:${t}" --format '{{.Manifest.Digest}}' 2>/dev/null)" \
-                 && [ "$got" = "$DIGEST" ]; then
-                break
-              fi
+              got="$(docker buildx imagetools inspect "${REPO}:${t}" --format '{{.Manifest.Digest}}' 2>/dev/null)" \
+                && [ -n "$got" ] && break
               sleep "$((i * 2))"
             done
-            [ "$got" = "$DIGEST" ] || { echo "${REPO}:${t} resolves to '${got:-<not found>}', want ${DIGEST}" >&2; exit 1; }
+            [[ "$got" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "${REPO}:${t} did not resolve" >&2; exit 1; }
+            [ -z "$index" ] || [ "$got" = "$index" ] || { echo "${REPO}: :${VERSION} and :${t} differ" >&2; exit 1; }
+            index="$got"
           done
-          echo "agent/${TEMPLATE}: :${VERSION} and :${SHORT_SHA} -> ${DIGEST}, BUILD_INFO names ${GITHUB_SHA}"
+          # The tag must name an index of exactly these two children, nothing else.
+          have="$(docker buildx imagetools inspect "${REPO}@${index}" --raw \
+            | jq -r '.manifests[] | "\(.platform.os)/\(.platform.architecture)=\(.digest)"' | sort)"
+          [ "$have" = "$(printf '%s' "$want" | sort)" ] \
+            || { printf 'index %s children:\n%s\nwant:\n%s' "$index" "$have" "$want" >&2; exit 1; }
+          echo "agent/${TEMPLATE}: :${VERSION} and :${SHORT_SHA} -> ${index}"
+          echo "digest=${index}" >> "$GITHUB_OUTPUT"
+      # Named "Sign image" so release-verify.sh counts it among the expected signatures.
+      - name: Sign image (cosign keyless) -- multi-arch index
+        env:
+          TEMPLATE: ${{ matrix.template }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: ./scripts/cosign-sign-retry.sh "ghcr.io/vtmocanu/uzi/agent-${TEMPLATE}@${DIGEST}"
 
   # ------------------------------------------------- agent identity check ----
   # Every published agent image must BE the release it is tagged as (#1682, #1720): exact
@@ -626,7 +707,7 @@ jobs:
   # exist on GHCR but no chart or Release ever points at it.
   assert-agent-version:
     runs-on: ubuntu-latest
-    needs: [prep, publish-agent]
+    needs: [prep, publish-agent-index]
     permissions:
       contents: read
       packages: read
@@ -671,12 +752,12 @@ jobs:
   # 0.83.0-rc.7 incident, 2026-09-19). The pin moves only when the agent runtime surface
   # changes (scripts/worker-tag-autobump.sh), so this verifies the pinned image identity,
   # not "pin == this release" -- the pin may point at an older, already-published tag. It runs after
-  # publish-agent (the images are live by then) and gates publish-chart via `needs`, so
+  # publish-agent-index (the images are live by then) and gates publish-chart via `needs`, so
   # a bad pin blocks the chart push before ArgoCD can ever see it. The verified baked
   # stamp also supplies the packaged chart's exact paced-roll target (#2906).
   assert-worker-pin:
     runs-on: ubuntu-latest
-    needs: [publish-agent]
+    needs: [publish-agent-index]
     outputs:
       roll_target_version: ${{ steps.worker-pin.outputs.roll_target_version }}
     permissions:
@@ -732,7 +813,7 @@ jobs:
   # oci://ghcr.io/vtmocanu/uzi/uzi:<Chart.version>.
   publish-chart:
     runs-on: ubuntu-latest
-    needs: [assert-version, assert-changelog, assert-ci-coverage, assert-release-metadata, assert-tag-smoke, publish-api, publish-web, publish-controller, publish-agent, assert-worker-pin, assert-agent-version]
+    needs: [assert-version, assert-changelog, assert-ci-coverage, assert-release-metadata, assert-tag-smoke, publish-api, publish-web, publish-controller, publish-agent-index, assert-worker-pin, assert-agent-version]
     environment: release
     permissions:
       contents: read
@@ -815,7 +896,7 @@ jobs:
   # in-run approval. See the TRUST BOUNDARY note at the top.)
   publish-release:
     runs-on: ubuntu-latest
-    needs: [assert-ci-coverage, assert-release-metadata, publish-api, publish-web, publish-controller, publish-agent, publish-chart]
+    needs: [assert-ci-coverage, assert-release-metadata, publish-api, publish-web, publish-controller, publish-agent-index, publish-chart]
     permissions:
       contents: write
     steps:

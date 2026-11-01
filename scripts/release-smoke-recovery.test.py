@@ -40,10 +40,13 @@ class Classification(unittest.TestCase):
         path = Path(__file__).parent.parent / '.github/workflows/release.yml'
         program = 'puts YAML.safe_load(File.read(ARGV[0]), aliases: true).fetch("jobs").to_json'
         graph = json.loads(subprocess.check_output(['ruby', '-ryaml', '-rjson', '-e', program, str(path)], text=True, timeout=60))
-        roles = set(graph) - {'publish-agent'}
-        templates = graph['publish-agent']['strategy']['matrix']['template']
-        self.assertEqual(set(templates), {'base', 'jvm'})
-        roles.update('publish-agent (' + template + ')' for template in templates)
+        roles = set(graph) - {'publish-agent', 'publish-agent-index'}
+        matrix = graph['publish-agent']['strategy']['matrix']
+        self.assertEqual(set(matrix['template']), {'base', 'jvm'})
+        self.assertEqual(set(matrix['arch']), {'amd64', 'arm64'})
+        self.assertEqual(graph['publish-agent-index']['strategy']['matrix']['template'], matrix['template'])
+        roles.update('publish-agent (' + t + ', ' + a + ')' for t in matrix['template'] for a in matrix['arch'])
+        roles.update('publish-agent-index (' + t + ')' for t in matrix['template'])
         self.assertEqual(roles, watch.RELEASE_SUCCESS_ROLES | watch.RELEASE_SKIPPED_ROLES | {'assert-tag-smoke'})
         self.assertIn('assert-tag-smoke', graph['publish-chart']['needs'])
         self.assertIn('publish-chart', graph['publish-release']['needs'])
@@ -291,7 +294,9 @@ class Recovery(unittest.TestCase):
                              for i, name in enumerate(['prep', 'assert-version', 'assert-changelog', 'assert-ci-coverage',
                                                         'assert-release-metadata', 'assert-worker-pin', 'assert-agent-version',
                                                         'publish-api', 'publish-web', 'publish-controller',
-                                                        'publish-agent (base)', 'publish-agent (jvm)'])]
+                                                        'publish-agent (base, amd64)', 'publish-agent (base, arm64)',
+                                                        'publish-agent (jvm, amd64)', 'publish-agent (jvm, arm64)',
+                                                        'publish-agent-index (base)', 'publish-agent-index (jvm)'])]
         self.release_jobs += [job('publish-chart', 'skipped', 297, []), job('publish-release', 'skipped', 298, [])]
         self.release_jobs += [job('assert-tag-smoke', identity=299, steps=[step('Require the real tagged KinD smoke job')])]
         engine.main_api.run.side_effect = lambda workflow, *_: self.smoke_run if workflow == 'kind-smoke.yml' else self.release_run

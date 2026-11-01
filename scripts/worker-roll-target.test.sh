@@ -46,9 +46,22 @@ case "$ref" in
     elif [ "${ROLL_MODE:-}" = signed_digest_mismatch ]; then printf 'sha256:%064d\n' 2
     else echo "$digest"; fi;;
   *"@$digest")
+    if [ "$5" = --raw ]; then
+      [ "${ROLL_MODE:-}" != raw_error ] || { echo '{broken'; exit 0; }
+      if [ "${ROLL_INDEX:-}" = 1 ]; then printf '{"manifests":[{"digest":"sha256:%064d"},{"digest":"sha256:%064d"}]}\n' 3 4
+      else echo '{"config":{}}'; fi
+    else
+      [ "${ROLL_INDEX:-}" != 1 ] || { echo 'config read from the index itself' >&2; exit 1; }
+      [ "$6" = '{{json .Image.Config}}' ]
+      [ "${ROLL_MODE:-}" != config_error ] || exit 1
+      cat "$ROLL_FIXTURE/$t.json"
+    fi;;
+  *"@sha256:$(printf '%064d' 3)" | *"@sha256:$(printf '%064d' 4)")
+    [ "${ROLL_INDEX:-}" = 1 ]
     [ "$6" = '{{json .Image.Config}}' ]
-    [ "${ROLL_MODE:-}" != config_error ] || exit 1
-    cat "$ROLL_FIXTURE/$t.json";;
+    # The second child (arm64 in a real index) may carry its own fixture.
+    if [[ "$ref" = *4 ]] && [ -f "$ROLL_FIXTURE/$t-arm64.json" ]; then cat "$ROLL_FIXTURE/$t-arm64.json"
+    else cat "$ROLL_FIXTURE/$t.json"; fi;;
   *) echo 'config was not read at the resolved digest' >&2; exit 1;;
 esac
 STUB
@@ -67,9 +80,10 @@ printf '%s\n' "$*" >> "$ROLL_FIXTURE/cosign.log"
 STUB
 chmod +x "$work/docker" "$work/cosign"
 reset() {
-  unset ROLL_MODE
+  unset ROLL_MODE ROLL_INDEX
   printf '%s\n' '{"Env":["UZI_AGENT_VERSION=0.85.0-rc.3+gabcdef0"],"Labels":{"org.opencontainers.image.version":"0.85.0-rc.3+gabcdef0"}}' > "$work/base.json"
   cp "$work/base.json" "$work/jvm.json"
+  rm -f "$work/base-arm64.json" "$work/jvm-arm64.json"
   : > "$work/docker.log"; : > "$work/cosign.log"
 }
 reject() {
@@ -81,10 +95,18 @@ reject() {
 }
 reset
 [ "$("$scripts/worker-roll-target.sh" "$ROLL_PIN")" = '0.85.0-rc.3+gabcdef0' ]
-[ "$(wc -l < "$work/docker.log" | tr -d ' ')" = 4 ]
+[ "$(wc -l < "$work/docker.log" | tr -d ' ')" = 6 ]
 [ "$(wc -l < "$work/cosign.log" | tr -d ' ')" = 2 ]
 cases=$((cases + 1)); echo 'PASS: valid older pin, single resolution per template, exact signer and digest-bound config'
-for mode in signature_error registry_error bad_digest signed_digest_mismatch config_error; do
+reset; export ROLL_INDEX=1
+[ "$("$scripts/worker-roll-target.sh" "$ROLL_PIN")" = '0.85.0-rc.3+gabcdef0' ]
+[ "$(wc -l < "$work/docker.log" | tr -d ' ')" = 8 ]
+[ "$(wc -l < "$work/cosign.log" | tr -d ' ')" = 2 ]
+cases=$((cases + 1)); echo 'PASS: multi-arch index pin, every child config read under the signed index'
+reset; export ROLL_INDEX=1
+jq '.Env=["UZI_AGENT_VERSION=0.85.0-rc.3+g1234567"] | .Labels["org.opencontainers.image.version"]="0.85.0-rc.3+g1234567"' "$work/base.json" > "$work/base-arm64.json"
+reject 'index children disagree'
+for mode in signature_error registry_error bad_digest signed_digest_mismatch config_error raw_error; do
   reset; export ROLL_MODE="$mode"; reject "$mode"
   if [ "$mode" = registry_error ]; then grep -Fq 'only a PUBLISHED one' "$work/err"; fi
   if [ "$mode" = signature_error ]; then grep -Fq "expected identity https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/v$ROLL_PIN" "$work/err"; fi
