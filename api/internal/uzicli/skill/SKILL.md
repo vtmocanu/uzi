@@ -1469,8 +1469,11 @@ of which seeding is one mode (the "Seed & ship" option).
    verdict.** A seeded plan is already approved for this run; state that
    implementation starts immediately. Preserve product approval requirements,
    safety gates, and validation commands. Stale plan-gate wording can make the
-   lead wait for a verdict that never comes, until the iteration budget fails
-   the run with no file changed.
+   lead wait for a verdict that never comes, spending its iteration budget
+   with no file changed. At iteration exhaustion, eligible runs with negotiated
+   `iteration_park_version: 1` and authoritative persisted `completion_attempts = 0`
+   park needing explicit owner Resume. Prior-attempt, excluded and legacy runs
+   keep their existing dispositions, including possible completion holds or failure.
 3. **Read the roster off the clone, not from memory, if you're naming one.**
    `--agent-source repo` means the roster in the clone's `.claude/agents/`
    (`ls .claude/agents/` there to see it — one role per file, named by its
