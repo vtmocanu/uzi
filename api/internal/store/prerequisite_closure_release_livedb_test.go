@@ -470,7 +470,7 @@ func closureHoldRows(t *testing.T, ctx context.Context, pool interface {
 
 func TestPrerequisiteClosureReleaseMigrationRoundTripLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "closure_release_rt_")
-	if err := store.MigrateTo(ctx, dsn, 388); err != nil {
+	if err := store.MigrateTo(ctx, dsn, closureReleasePrevMigration); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -478,7 +478,7 @@ func TestPrerequisiteClosureReleaseMigrationRoundTripLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	prerequisiteSchemaVersion(t, ctx, pool, 388)
+	prerequisiteSchemaVersion(t, ctx, pool, closureReleasePrevMigration)
 	heldNewHoldFixture(ctx, t, pool, true, "failed", nil)
 	heldNewHoldFixture(ctx, t, pool, false, "failed", nil)
 	released := heldNewHoldFixture(ctx, t, pool, true, "completed", nil)
@@ -494,10 +494,10 @@ func TestPrerequisiteClosureReleaseMigrationRoundTripLiveDB(t *testing.T) {
 		t.Fatal("no hold rows were seeded")
 	}
 	for round := 0; round < 2; round++ {
-		if err = store.MigrateTo(ctx, dsn, 389); err != nil {
+		if err = store.MigrateTo(ctx, dsn, closureReleaseMigration); err != nil {
 			t.Fatal(err)
 		}
-		prerequisiteSchemaVersion(t, ctx, pool, 389)
+		prerequisiteSchemaVersion(t, ctx, pool, closureReleaseMigration)
 		if got := closureHoldRows(t, ctx, pool); got != want {
 			t.Fatalf("Up changed hold rows:\n%s\n%s", want, got)
 		}
@@ -505,10 +505,10 @@ func TestPrerequisiteClosureReleaseMigrationRoundTripLiveDB(t *testing.T) {
 		if err = pool.QueryRow(ctx, "SELECT count(*) FROM recovery_custody_holds WHERE final_closure_id IS NOT NULL").Scan(&ids); err != nil || ids != 0 {
 			t.Fatalf("Up invented closure ids: %d %v", ids, err)
 		}
-		if err = store.MigrateDownTo(ctx, dsn, 388); err != nil {
+		if err = store.MigrateDownTo(ctx, dsn, closureReleasePrevMigration); err != nil {
 			t.Fatal(err)
 		}
-		prerequisiteSchemaVersion(t, ctx, pool, 388)
+		prerequisiteSchemaVersion(t, ctx, pool, closureReleasePrevMigration)
 		if got := closureHoldRows(t, ctx, pool); got != want {
 			t.Fatalf("Down changed hold rows:\n%s\n%s", want, got)
 		}
@@ -518,37 +518,37 @@ func TestPrerequisiteClosureReleaseMigrationRoundTripLiveDB(t *testing.T) {
 			t.Fatalf("Down left the column: %d %v", cols, err)
 		}
 	}
-	if err = store.MigrateTo(ctx, dsn, 389); err != nil {
+	if err = store.MigrateTo(ctx, dsn, closureReleaseMigration); err != nil {
 		t.Fatal(err)
 	}
-	prerequisiteSchemaVersion(t, ctx, pool, 389)
+	prerequisiteSchemaVersion(t, ctx, pool, closureReleaseMigration)
 }
 
 func TestPrerequisiteClosureReleaseDownRefusalLiveDB(t *testing.T) {
 	ctx, dsn, pool := prerequisiteMigratedPool(t, "closure_release_down_")
-	if err := store.MigrateDownTo(ctx, dsn, 389); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, closureReleaseMigration); err != nil {
 		t.Fatal(err)
 	}
-	prerequisiteSchemaVersion(t, ctx, pool, 389)
+	prerequisiteSchemaVersion(t, ctx, pool, closureReleaseMigration)
 	f := closureReady(t, ctx, prerequisiteNew(t, ctx, pool))
 	// A pinned closure without release evidence rolls back and forward cleanly.
-	if err := store.MigrateDownTo(ctx, dsn, 388); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, closureReleasePrevMigration); err != nil {
 		t.Fatalf("Down with an unreleased closure: %v", err)
 	}
-	prerequisiteSchemaVersion(t, ctx, pool, 388)
-	if err := store.MigrateTo(ctx, dsn, 389); err != nil {
+	prerequisiteSchemaVersion(t, ctx, pool, closureReleasePrevMigration)
+	if err := store.MigrateTo(ctx, dsn, closureReleaseMigration); err != nil {
 		t.Fatal(err)
 	}
-	prerequisiteSchemaVersion(t, ctx, pool, 389)
+	prerequisiteSchemaVersion(t, ctx, pool, closureReleaseMigration)
 	n, err := store.New(pool).ReleaseFinalClosureHold(ctx, closureReleaseParams(f, f.closure.ID))
 	prerequisiteRows(t, 1, n, err)
 	before := closureHoldSnapshot(t, ctx, f)
-	err = store.MigrateDownTo(ctx, dsn, 388)
+	err = store.MigrateDownTo(ctx, dsn, closureReleasePrevMigration)
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "55000" {
 		t.Fatalf("Down must refuse with SQLSTATE 55000, got %v", err)
 	}
-	prerequisiteSchemaVersion(t, ctx, pool, 389)
+	prerequisiteSchemaVersion(t, ctx, pool, closureReleaseMigration)
 	if after := closureHoldSnapshot(t, ctx, f); after != before {
 		t.Fatalf("refused Down changed the hold:\n%s\n%s", before, after)
 	}

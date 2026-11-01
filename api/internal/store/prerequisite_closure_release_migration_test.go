@@ -10,6 +10,14 @@ import (
 const closureGuardStart = "-- +goose StatementBegin\nCREATE OR REPLACE FUNCTION recovery_inventory_hold_guard()"
 const closureGuardEnd = "-- +goose StatementEnd"
 
+// closureReleaseMigration is the landed goose version of the C2 release migration;
+// a landing renumber edits only this block.
+const (
+	closureReleaseMigration     = 391
+	closureReleasePrevMigration = closureReleaseMigration - 1
+	closureReleaseMigrationFile = "00391_prerequisite_closure_release.sql"
+)
+
 func closureMigrationText(t *testing.T, name string) string {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join("migrations", name)) //nolint:gosec // G304: test reads a repo-local migration file by fixed name under migrations/, not user input
@@ -32,7 +40,7 @@ func closureGuardBlock(t *testing.T, s string) string {
 
 func TestPrerequisiteClosureReleaseMigrationPreservesGuard(t *testing.T) {
 	preceding := closureGuardBlock(t, closureMigrationText(t, "00340_terminal_held_publication.sql"))
-	parts := strings.Split(closureMigrationText(t, "00389_prerequisite_closure_release.sql"), "-- +goose Down\n")
+	parts := strings.Split(closureMigrationText(t, closureReleaseMigrationFile), "-- +goose Down\n")
 	if len(parts) != 2 {
 		t.Fatal("migration must have exactly one Down section")
 	}
@@ -82,7 +90,7 @@ func TestPrerequisiteClosureReleaseMigrationRestoresEvidenceCheck(t *testing.T) 
 	if !strings.Contains(want, "'merged_predecessor_discard'") {
 		t.Fatal("00338 Up evidence list unexpected")
 	}
-	parts := strings.Split(closureMigrationText(t, "00389_prerequisite_closure_release.sql"), "-- +goose Down\n")
+	parts := strings.Split(closureMigrationText(t, closureReleaseMigrationFile), "-- +goose Down\n")
 	if len(parts) != 2 {
 		t.Fatal("migration must have exactly one Down section")
 	}

@@ -766,11 +766,11 @@ unchecked; the earlier local repairs alone did not establish hosted success.
 #### C2 execution record (2026-11-01, #3727)
 
 C2 is implemented on branch `agent/issue-3727`; it has **not landed**. Migration
-00389 is a draft number, renumbered at landing.
+00391 (draft 00389, renumbered at landing).
 
 What landed, by milestone (commit subjects):
 
-- **M1 schema** (`api/internal/store/migrations/00389_prerequisite_closure_release.sql`):
+- **M1 schema** (`api/internal/store/migrations/00391_prerequisite_closure_release.sql`):
   `1a751723d` feat(recovery): schema for closure-backed thin archive release (C2 M1);
   `c6e748b87` fix(recovery): closure release admits NULL-cause parks; isolate guard-layer tests (C2 M1);
   `aa469eb71` test(recovery): isolate closure disposition CHECK and release binding predicates (C2 M1).
