@@ -12,6 +12,7 @@ import { RunRunner, composeBaseAlignConflictReason, type RunnerOptions } from ".
 import { Outbox } from "../src/outbox.js";
 import { CheckpointSoftDeadlineError, RunnerCloneImportError, isNonFastForwardRejection } from "../src/git.js";
 import { GitHubClient } from "../src/forge.js";
+import { FakeRecoveryClient, FakeRecoveryGit, makeRecoveryCoordinator } from "./codex-reap-fixture.js";
 import {
   api,
   client,
@@ -1105,6 +1106,35 @@ describe("RunRunner — finalize base-align (PRD #456)", () => {
     assert.ok(failed.preserved_patch, "the pre-align diff is preserved even on a non-fast-forward rejection");
     assert.match(failed.preserved_patch!, /impl\.ts/, "the preserved patch carries the agent's work");
     assert.strictEqual(calls.length, 0, "no PR opened when the aligned push was rejected");
+  });
+
+  // #3727 M3: the finalization-failure capture (phasePublish -> driveRecoveryTerminal) denies the
+  // closure mint grant. Same failure as (g), with a real coordinator whose captureAndUpload is observed.
+  it("(g') the finalization-failure capture passes closureMint deny", async () => {
+    seedWorkflowsOnOrigin();
+    git.changedFiles = (async () => null) as typeof git.changedFiles;
+    const { github } = fakeGitHub();
+    let pushCalls = 0;
+    git.pushBranch = (async () => {
+      pushCalls++;
+      throw new Error(pushCalls === 1
+        ? "git push origin ... failed: ! [remote rejected] refs/uzi-runner/agent/issue-59 -> agent/issue-59 " +
+          "(refusing to allow a Personal Access Token to create or update workflow `.github/workflows/ci.yml` without workflow scope)"
+        : "git push origin ... failed: ! [rejected] agent/issue-59 -> agent/issue-59 (non-fast-forward)");
+    }) as typeof git.pushBranch;
+    const { coord, root } = makeRecoveryCoordinator(new FakeRecoveryClient(), new FakeRecoveryGit());
+    const mints: unknown[] = [];
+    const capture = coord.captureAndUpload.bind(coord);
+    coord.captureAndUpload = async (input) => { mints.push(input.closureMint); return capture(input); };
+    try {
+      const exec = committingExecutor({ "impl.ts": "export const x = 1;\n" }, { ".github/workflows/ci.yml": CI_V2 });
+      const claim = githubClaim(59, { claim_generation: 7 });
+      await githubRunnerWith(github, exec, { recovery: coord }).execute(claim);
+      assert.ok(api.states.some((x) => x.runId === claim.run_id && x.body.status === "failed"));
+      assert.deepStrictEqual(mints, ["deny"]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   // (h) issue #627 PRIMARY: base-staleness on workflows PLUS an unrelated divergence on a

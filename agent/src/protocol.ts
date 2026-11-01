@@ -3343,8 +3343,8 @@ export interface RecoveryPrerequisiteClosureStatus {
 }
 
 /** The closed wire vocabulary of RecoveryPrerequisiteClosureStatus (api/internal/recovery prerequisiteStatus). */
-export const PREREQUISITE_CLOSURE_STATES = ["unsupported", "pending", "pinned", "refused", "lost"] as const;
-export const PREREQUISITE_CLOSURE_REASONS = [
+const PREREQUISITE_CLOSURE_STATES = ["unsupported", "pending", "pinned", "refused", "lost"] as const;
+const PREREQUISITE_CLOSURE_REASONS = [
   "closure_unsupported", "prerequisite_not_on_default", "prerequisite_ancestry_unknown",
   "prerequisite_prepare_budget_exhausted", "pin_absence_unconfirmed", "pin_refused", "pin_unknown",
   "pin_foreign", "archive_unavailable", "pin_lost",

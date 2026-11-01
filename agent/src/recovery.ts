@@ -2787,6 +2787,9 @@ export class RecoveryCoordinator {
     if (!record.heldPolicy || !this.client.publishHeld) return uncertainCreate ? outcome("kept") : archived ?? this.captureCycle({ ...input, record }, "deny");
     let publicationId: string | undefined;
     let result: "fallback" | "kept" | "settled" = uncertainCreate ? "kept" : "fallback";
+    // Grant 3 needs a fallback attested in this pass (a server refusal or a deterministic local refusal).
+    // A thrown, timed-out, malformed or otherwise unknown held result is a fallback without attestation.
+    let attested = false;
     const publish = async (prove: () => Promise<boolean>) => {
       if (!await prove() || !await this.frozenCoverageProven(record)) { result = "kept"; return; }
       const git = this.git;
@@ -2800,6 +2803,7 @@ export class RecoveryCoordinator {
       if (!("pack" in prepared)) {
         // A fresh finding remains a remediation hold after restart even if a later
         // scanner changes its verdict on these same immutable bytes.
+        if (["secret_found", "workflow_change", "ci_config_guard"].includes(prepared.reason)) attested = true;
         if (prepared.reason === "secret_found") {
           record = await this.writeExistingRecord(record, cur => ({ ...cur,
             heldPolicy: { ...cur.heldPolicy!, blocked: true } }));
@@ -2823,6 +2827,8 @@ export class RecoveryCoordinator {
             (response.httpStatus !== undefined && (response.httpStatus < 400 || response.httpStatus >= 500)))) return;
         if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false }));
         result = "fallback";
+        attested = response.reason !== "malformed_response" && response.httpStatus !== undefined &&
+          response.httpStatus >= 400 && response.httpStatus < 500;
         return;
       }
       const body = response.body;
@@ -2832,6 +2838,7 @@ export class RecoveryCoordinator {
       if (body.state === "refused" && body.reason === "create_refused") {
         if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false }));
         result = "fallback";
+        attested = true;
         return;
       }
       if (body.state !== "created") return;
@@ -2852,14 +2859,19 @@ export class RecoveryCoordinator {
       const released = await this.releaseHeldWithinCycle(record, publicationId);
       if (released !== "fallback") return outcome(released);
       result = "fallback";
+      attested = true;
     }
     if (result !== "fallback") return outcome(result);
     // Every fallback observes current authoritative settlement again.
     hold = await this.heldOperationState(record, input.signal);
     if (hold !== "open") return this.heldStopped(record, hold);
-    // Grant 3: a held attempt in this pass fell back. Re-run the capture with the grant rather than
-    // returning the earlier (denied) archive outcome.
-    return this.captureCycle({ ...input, record: await this.requireRecord(record) }, "grant");
+    // Grant 3: only an attested fallback grants. An unknown held result keeps the pre-closure behaviour.
+    if (!attested) return archived ?? this.captureCycle({ ...input, record }, "deny");
+    // Re-run with the grant only when the earlier pass merely stopped short of the mint (no capture yet,
+    // or an uploaded thin capture without a FINAL); an already-failed archive step is never repeated.
+    const fresh = await this.requireRecord(record);
+    if (archived && !(fresh.state === "uploaded" && !fresh.finalRequest)) return archived;
+    return this.captureCycle({ ...input, record: fresh }, "grant");
   }
 
   private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal, isExecuting = this.isExecuting,
