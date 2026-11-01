@@ -100,7 +100,7 @@ and how to add a theme.
 
 A global kill-switch for the [run judge](./judge.md), plus the model it runs
 on (**Claude judge model**, `opus` by default — the judge's recommendations feed
-self-improvement, so the strongest model is the default; pin a cheaper alias
+self-improvement, so the default is the built-in `opus`; pin a cheaper alias
 like `haiku` or `sonnet` to spend less, and **Codex judge model**, `gpt-6.1-sol`
 by default, for judges of Codex runs). Each field is a model picker. The
 **Default · opus (built-in)** option of the Claude field and the
@@ -114,7 +114,10 @@ as source `default`. This switch
 only arms the feature instance-wide; each user still opts in under their own
 Settings, and the judge always spends that user's own credential for the run's harness, never
 the admin's. A **Not a Claude model** warning appears under the Claude field
-when its stored value is a Codex id, which Claude judges skip.
+when its stored value is a Codex id, which Claude judges skip. Changing a
+field to an invalid model ID (interior spaces, control or format characters,
+or too long) is blocked before save, with an error beneath the picker; an
+unchanged stored value does not block saving other settings.
 
 As an admin, you can also review every user's judge recommendations at once,
 in an attribution-hidden **All users** view on the Judge page, and mark them
@@ -199,9 +202,14 @@ and no queued run.
 ## Run summaries
 
 **Summary model** sets which model [Claude run summaries](./run-summaries.md)
-generate on, instance-wide (`haiku` by default). Each user can override it
+generate on, instance-wide (`haiku` by default). It is a picker of the curated
+Claude models (`opus`, `sonnet`, `haiku`, `fable`) plus **Other (custom model
+ID)**. There is no empty or Default option: a blank value, an empty custom ID,
+or an invalid ID (interior spaces, control or format characters, or too long)
+is blocked before save, with an error beneath the picker. Each user can override it
 for their own Claude runs from **Settings → Run defaults → Run summaries →
-Summary model**; the admin default applies while they haven't. Codex intent
+Summary model** (their empty option reads `Default · instance default`); the
+admin default applies while they haven't. Codex intent
 and plan summaries use fixed `gpt-6-luna` with low effort, independent of
 this picker, with no fallback model. Both lanes spend the run owner's own
 credential for the run's original harness: an Anthropic token for Claude,

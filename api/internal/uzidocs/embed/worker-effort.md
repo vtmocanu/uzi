@@ -8,7 +8,7 @@ audience: user
 
 Choose reasoning effort independently for your Claude and Codex runs in
 **Settings → Run defaults → Reasoning effort**. Both product defaults are
-**medium**. Leave a control on **Inherit** to use that product default,
+**medium**. Leave a control on **Default · medium (built-in)** to use that product default,
 choose `low`, `medium`, `high`, `xhigh` or `max` for that harness, or choose
 **Runtime default** to send no level.
 
@@ -19,14 +19,14 @@ effort freeze. Other users and the shared lead template are unaffected.
 
 When upgrading from the shared setting, every existing explicit value is
 copied into the Codex setting and retained for Claude. An unset or blank
-preference inherits medium. Changing one harness's setting does not change the
+preference uses the built-in medium. Changing one harness's setting does not change the
 other. Schema rollback keeps the Claude/shared value but loses independently
 edited Codex preferences.
 
 ## Set an override
 
 1. Open **Settings → Run defaults → Reasoning effort**.
-2. Pick the **Claude effort** or **Codex effort** level, **Runtime default**, or **Inherit**.
+2. Pick the **Claude effort** or **Codex effort** level, **Runtime default**, or **Default · medium (built-in)**.
 3. Click **Save Claude effort** or **Save Codex effort**.
 
 The controls offer five levels; Codex's `ultra` catalog level is deliberately
@@ -59,8 +59,8 @@ web controls. `uzi settings get` reports the result (see
 
 ## Runtime default
 
-Each harness also offers **Runtime default** beside **Inherit (uzi default:
-medium)** and the five levels. The option is labelled **Runtime default · value
+Each harness also offers **Runtime default** beside **Default · medium
+(built-in)** and the five levels. The option is labelled **Runtime default · value
 not reported** for Claude and **Runtime default · Codex decides** for Codex.
 It is stored as the token `runtime` in the same preference (`default_effort`
 or `default_codex_effort` on `PUT /api/me/settings`, cookie-only; `GET`
@@ -69,7 +69,7 @@ returns the stored token).
 With Runtime default, uzi sends no effort: the Claude CLI gets no `--effort`
 and Codex thread and turn requests carry no effort, so the runtime picks its
 own level. This applies to ordinary issue and lead runs and their subagents,
-the judge, chat, job and isolated runs. It differs from **Inherit**: an unset
+the judge, chat, job and isolated runs. It differs from **Default · medium (built-in)**: an unset
 preference still means an explicit medium. A stored value uzi does not
 recognise falls back to medium and is never forwarded, and workers drop any
 claimed default effort outside the five levels when decoding the claim,
@@ -118,7 +118,7 @@ used](./worker-model.md#see-which-model-a-run-used).
 
 - **Requested** is what uzi sent: your Claude or Codex effort override
   (*your Claude effort*, *your Codex effort*), or *built-in* when you left it on
-  Inherit. With [Runtime default](#runtime-default) uzi sends no level, so the
+  **Default · medium (built-in)**. With [Runtime default](#runtime-default) uzi sends no level, so the
   request reads *runtime default*, for example `lead: opus · runtime default`.
   The display shows that mode in place of a source; the stored record keeps the
   source (`user_default`), which `uzi run lead-config --json` returns.
