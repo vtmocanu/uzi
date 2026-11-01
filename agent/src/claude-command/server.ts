@@ -33,6 +33,13 @@ export function buildGuardedCommandServer(lane: ClaudeCommandLane): McpSdkServer
     alwaysLoad: true,
     timeout: GUARDED_SERVER_TIMEOUT_MS,
     tools: [
+      // Issue #3722: deliberately NO annotations. The CLI derives an MCP tool's
+      // isConcurrencySafe() from readOnlyHint, so guarded calls run one at a time. Do not
+      // "fix" that with readOnlyHint: true. The CLI also uses read-only for write
+      // coordination, execution metadata, plan mode and permissions, and an arbitrary shell
+      // command can write. It would also allow concurrent shell batches under a slot-only
+      // cap that reserves no memory per command (OOM risk: #2127, #3118, #3384). The guarded
+      // lead overlaps the gate by delegating it instead (CLAUDE_GUARDED_LEAD_GATE_APPEND).
       tool("bash", GUARDED_COMMAND_DESCRIPTION, {
         command: z.string().refine((value) => {
           const bytes = Buffer.byteLength(value);

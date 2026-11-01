@@ -77,6 +77,8 @@ import { constants as FS } from "node:fs";
 import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
+import { resolveLeadRequest, type LeadRequest } from "../lead-config-report.js";
+import { toLeadObservation } from "../runtime-observation.js";
 import { CodexRequestFailure, RequestError, codexDeferralReason, codexRefreshFailure, isTransientStatus, type PlanCrossCheckFindings, type WorkerClient } from "../client.js";
 import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
@@ -122,7 +124,6 @@ import {
   type CodexExecutionSafety,
   type HarnessAgent,
   type HarnessContextHook,
-  type HarnessEffort,
   type HarnessError,
   type CredentialFreeCaptureContext,
   type CompletedCredentialFreeCapture,
@@ -5070,7 +5071,8 @@ export class CodexExecutor implements Executor {
     revision: number,
     setupRegistries: Set<ExecutionRegistry>,
   ): Promise<ProviderEpoch> {
-    const level = codexEffort(ctx);
+    // The claim's effort, as resolveLeadRequest reads it for the turn (PRD #3244); absent for Runtime default.
+    const level = ctx.config?.default_effort;
     // Snapshot the runner contract once for all effect surfaces in this epoch.
     // Legacy direct callers may still bind through the static executor option.
     const captureMemory = ctx.capturedMemory;
@@ -5714,8 +5716,29 @@ export class CodexExecutor implements Executor {
           return true;
         },
       };
+      // PRD #3244: record the lead's requested config for this phase before the turn starts. A new
+      // entry only on a phase change (a re-driven turn, replacement turn or recreated epoch of the
+      // same phase is a no-op); bounded to 3 s inside the reporter, which never throws.
+      // PRD #3244 M2: every root thread/start and thread/resume reports the thread's resolved config,
+      // once its first turn/start is accepted (D30), against the entry bound here; the reporter
+      // dedupes an unchanged reading per entry.
+      // An inactive or disabled reporter gets no entry and hands the harness no runtime-config callback.
+      let onRuntimeConfig: RunTurnRequest["onRuntimeConfig"];
+      if (ctx.leadConfig?.enabled) {
+        const reporter = ctx.leadConfig;
+        const entry = await reporter.enterPhase(phase, this.leadRequestFor(ctx, phase));
+        onRuntimeConfig = (obs) => {
+          try {
+            reporter.observe(entry, toLeadObservation(obs));
+          } catch {
+            /* an observation is best-effort and never reaches the turn */
+          }
+        };
+        if (tripReason) throw this.tripError(tripReason, tripToken!, processedEvents, tripRetryClassification);
+      }
       const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
       request.rootDispatch = dispatch;
+      if (onRuntimeConfig) request.onRuntimeConfig = onRuntimeConfig;
       let turn = harness.startTurn(request);
       let events = turn.events[Symbol.asyncIterator]();
       let first = await (async () => {
@@ -5732,6 +5755,7 @@ export class CodexExecutor implements Executor {
           } });
           const fallback = this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal, selection, repoInstructions, ownerCompletionRecheck);
           fallback.rootDispatch = dispatch;
+          if (onRuntimeConfig) fallback.onRuntimeConfig = onRuntimeConfig;
           turn = harness.startTurn(fallback);
           events = turn.events[Symbol.asyncIterator]();
           return events.next();
@@ -6422,6 +6446,18 @@ export class CodexExecutor implements Executor {
   }
 
   // ─── request + prompt construction ────────────────────────────────────────────
+  /** PRD #3244: the lead's requested model/effort for a phase, from the one worker resolver. Pure in
+   *  (ctx.config, provider model), so the request built per turn and the row reported at the phase
+   *  entry cannot differ. */
+  private leadRequestFor(ctx: RunContext, phase: "plan" | "implement"): LeadRequest {
+    return resolveLeadRequest({
+      harness: "codex",
+      phase,
+      config: ctx.config,
+      providerDefaultModel: this.opts.provider.model,
+    });
+  }
+
   private buildRunRequest(
     ctx: RunContext,
     phase: "plan" | "implement",
@@ -6491,7 +6527,9 @@ export class CodexExecutor implements Executor {
       seeded: phase === "implement" && isSeededOwnerPlan(ctx),
     }).append;
     const leadSkills = (ctx.skills ?? []).map((s) => s.name);
-    const effort = codexEffort(ctx);
+    // PRD #3244: the model and effort sent below are the same LeadRequest the lead-config row reports.
+    const leadRequest = this.leadRequestFor(ctx, phase);
+    const effort = leadRequest.effort;
     if (parkRunEnabled(ctx, phase)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
     // Lead wiring must carry this worker-owned access into root-thread registration and the broker.
     // Presence is consent: runner only supplies the gate/hooks for strictly opted-in publishing runs.
@@ -6515,7 +6553,7 @@ export class CodexExecutor implements Executor {
       // the claim; fall back to the fixed provider default when the claim carries none. render.ts's
       // resolveModel re-validates request.model downstream and codex-harness.ts's
       // `rendered.lead.model ?? this.provider.model` supplies the same default for an out-of-set value.
-      model: ctx.config?.default_model ?? this.opts.provider.model,
+      model: leadRequest.model!,
       // PRD #1551 (D4/D5): mark the ROOT model's provenance ONLY when it came from the
       // server worker default (a present, non-empty `default_model`). This is the sole
       // source render.ts's resolveModel lets carry a validated CUSTOM (non-curated) ID
@@ -7931,9 +7969,4 @@ async function defaultLaunchProviderRoot(
   const transport = createCodexTransport({ inbound: stdout, outbound: stdin });
   const root = registeredRoot(handle, "provider");
   return { root, transport, supervisorPid: handle.supervisorPid ?? -1 };
-}
-
-/** The server-resolved per-harness effort travels on the existing claim field. */
-function codexEffort(ctx: RunContext): HarnessEffort | undefined {
-  return ctx.config?.default_effort;
 }

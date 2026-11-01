@@ -210,7 +210,7 @@ it("ExactModelKeys: raw Unicode is checked before module validation", async () =
     // One independent module load per fixture, each capped at 10 seconds.
     // An assertion failure stops this test; finally removes its scratch.
     for (const line of corpus.split("\n")) {
-      const [name, verdict, template] = line.split("|");
+      const [name = "unnamed fixture", verdict, template] = line.split("|");
       const raw = template!.replaceAll("@ROW@", JSON.stringify(table.models["gpt-6-astra"]));
       await writeFile(resolve(scratch, "codex-pricing.json"), raw);
       const child = spawnSync(process.execPath, ["--import", "tsx", resolve(scratch, "codex-pricing.ts")], {
@@ -243,7 +243,7 @@ it("raw UTF8 rejection occurs before replacement decoding at actual module load"
     // Fixed corpus and four independent placements; each load has a 10-second cap.
     // A failed assertion stops the test, with scratch removed by finally.
     for (const line of corpus.split("\n")) {
-      const [name, verdict, hex] = line.split("|");
+      const [name = "unnamed fixture", verdict, hex] = line.split("|");
       const bytes = Buffer.from(hex!, "hex");
       const placements = [
         ['"models":{"', '":' + row + ',"�":' + replacementRow + '}}'],

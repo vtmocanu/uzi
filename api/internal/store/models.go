@@ -937,6 +937,43 @@ type RecoveryCustodyHoldFact struct {
 	DecisionNeeded      bool      `json:"decision_needed"`
 }
 
+type RecoveryPrerequisiteClosure struct {
+	ID                     uuid.UUID          `json:"id"`
+	CaptureID              uuid.UUID          `json:"capture_id"`
+	HoldID                 uuid.UUID          `json:"hold_id"`
+	RunID                  uuid.UUID          `json:"run_id"`
+	UserID                 uuid.UUID          `json:"user_id"`
+	RepoID                 uuid.UUID          `json:"repo_id"`
+	LiveRunID              pgtype.UUID        `json:"live_run_id"`
+	Checksum               string             `json:"checksum"`
+	PrerequisiteShas       []string           `json:"prerequisite_shas"`
+	PinRef                 string             `json:"pin_ref"`
+	State                  string             `json:"state"`
+	Reason                 string             `json:"reason"`
+	LastError              string             `json:"last_error"`
+	Attempts               int32              `json:"attempts"`
+	ReconciliationAttempts int32              `json:"reconciliation_attempts"`
+	NextAttemptAt          pgtype.Timestamptz `json:"next_attempt_at"`
+	AttemptDeadline        pgtype.Timestamptz `json:"attempt_deadline"`
+	InvokedAt              pgtype.Timestamptz `json:"invoked_at"`
+	InvokedDeadline        pgtype.Timestamptz `json:"invoked_deadline"`
+	PinTip                 pgtype.Text        `json:"pin_tip"`
+	ConnectionID           pgtype.UUID        `json:"connection_id"`
+	ForgeKind              pgtype.Text        `json:"forge_kind"`
+	NormalizedBaseUrl      pgtype.Text        `json:"normalized_base_url"`
+	ProjectID              pgtype.Int8        `json:"project_id"`
+	DefaultBranch          pgtype.Text        `json:"default_branch"`
+	CleanupAttempts        int32              `json:"cleanup_attempts"`
+	CleanupDeadline        pgtype.Timestamptz `json:"cleanup_deadline"`
+	CleanupExhaustedAt     pgtype.Timestamptz `json:"cleanup_exhausted_at"`
+	AbsentSince            pgtype.Timestamptz `json:"absent_since"`
+	AbsencePassID          pgtype.UUID        `json:"absence_pass_id"`
+	AuditNextAt            pgtype.Timestamptz `json:"audit_next_at"`
+	LastAuditPassID        pgtype.UUID        `json:"last_audit_pass_id"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Repo struct {
 	ID                                uuid.UUID          `json:"id"`
 	ConnectionID                      uuid.UUID          `json:"connection_id"`
@@ -1305,6 +1342,26 @@ type RunHeldPublication struct {
 	NextAttemptAt   pgtype.Timestamptz `json:"next_attempt_at"`
 	LastError       pgtype.Text        `json:"last_error"`
 	RefusalReason   pgtype.Text        `json:"refusal_reason"`
+}
+
+type RunLeadConfig struct {
+	RunID                  uuid.UUID          `json:"run_id"`
+	ClaimGeneration        int64              `json:"claim_generation"`
+	Phase                  string             `json:"phase"`
+	PhaseEntry             int16              `json:"phase_entry"`
+	Seq                    int16              `json:"seq"`
+	Harness                string             `json:"harness"`
+	RequestedModel         pgtype.Text        `json:"requested_model"`
+	RequestedModelSource   string             `json:"requested_model_source"`
+	ObservedModel          pgtype.Text        `json:"observed_model"`
+	ObservedModelEvidence  pgtype.Text        `json:"observed_model_evidence"`
+	RequestedEffort        pgtype.Text        `json:"requested_effort"`
+	RequestedEffortMode    string             `json:"requested_effort_mode"`
+	RequestedEffortSource  string             `json:"requested_effort_source"`
+	ObservedEffort         pgtype.Text        `json:"observed_effort"`
+	ObservedEffortEvidence pgtype.Text        `json:"observed_effort_evidence"`
+	Truncated              bool               `json:"truncated"`
+	ReportedAt             pgtype.Timestamptz `json:"reported_at"`
 }
 
 type RunMessage struct {

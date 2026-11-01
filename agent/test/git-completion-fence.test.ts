@@ -6,11 +6,12 @@ import fs from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { GitBoundaryAbortError } from "../src/checkpoint-stop.js";
-import { GitCache, type FetchAgentBranchOptions, type PositiveOwedCandidateContext, type RecoveryJournalEntry } from "../src/git.js";
+import { GitCache, emitOrphanDiagnostic, isCompletionSourceFenceError, type FetchAgentBranchOptions, type OrphanDiagnostics, type OrphanRetirementSubreason, type PositiveOwedCandidateContext, type RecoveryJournalEntry } from "../src/git.js";
+import type { Logger } from "../src/log.js";
 import type { AuthoritySettlement, GitAuthorityHooks } from "../src/git-authority-hooks.js";
 import { serializeSourceFence, type CompletionSourceFence } from "../src/completion-source.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, noProofReseed, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { parseRecoveryJournal as baseParseRecoveryJournal } from "./fixtures/base-parse-recovery-journal.js";
 
 // issue #3404 M2 U2: the completion-source fence in the recovery journal, its install and its
@@ -355,6 +356,109 @@ describe("a fenced journal is never cleared or rewritten without its fence by a 
     unfence();
     await strict.releaseAttemptInPlace(bare, clonePath, BRANCH, RUN, "reclaimed");
     assert.equal(gitIn(bare, ["config", "--get", `uzi-recovery.${BRANCH}.clone`]), "");
+  });
+
+  describe("issue #3645: orphan retirement subreason diagnostics", () => {
+    const UUID = (n: number): string => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+    const ctx = (logger: Logger): OrphanDiagnostics => ({ logger, claimantId: UUID(1), ownerId: UUID(2), repoId: UUID(3), pathShape: "canonical" });
+    const failed = (lines: unknown[]): Record<string, unknown>[] =>
+      (lines as Record<string, unknown>[]).filter(l => l.event === "orphan_retirement_failed");
+
+    it("a fenced journal refuses outward unchanged and logs fenced_source at journal_validation", async () => {
+      const rec = recordingLogger();
+      await assert.rejects(strict.retireRunnerClone(bare, clonePath, BRANCH, RUN, { discard: false, orphanDiagnostics: ctx(rec.logger) }), /completion source fence/);
+      const [line, ...rest] = failed(rec.lines);
+      assert.equal(rest.length, 0);
+      assert.equal(line!.retirement_subreason, "fenced_source");
+      assert.equal(line!.stage, "journal_validation");
+      assert.equal(line!.reason, "canonical_retirement_failure");
+    });
+
+    it("a changed pair refuses with CapturePathMismatchError and logs pair_changed", async () => {
+      const rec = recordingLogger();
+      await assert.rejects(
+        strict.retireRunnerClone(bare, `${clonePath}-x`, BRANCH, RUN, { discard: false, orphanDiagnostics: ctx(rec.logger) }),
+        (e: Error) => e.name === "CapturePathMismatchError");
+      const [line] = failed(rec.lines);
+      assert.equal(line!.retirement_subreason, "pair_changed");
+      assert.equal(line!.stage, "journal_validation");
+    });
+
+    it("a path-mismatch at another stage is unknown, not pair_changed", async () => {
+      unfence();
+      const outside = path.join(fx.dataDir, "outside-runner-root");
+      gitIn(bare, ["config", `uzi-recovery.${BRANCH}.clone`, JSON.stringify({ ...journal(), clonePath: outside })]);
+      const rec = recordingLogger();
+      await assert.rejects(
+        strict.retireRunnerClone(bare, outside, BRANCH, RUN, { discard: false, orphanDiagnostics: ctx(rec.logger) }),
+        (e: Error) => e.name === "CapturePathMismatchError");
+      const [line] = failed(rec.lines);
+      assert.equal(line!.stage, "containment");
+      assert.equal(line!.retirement_subreason, "unknown");
+    });
+
+    it("emitOrphanDiagnostic allowlists the subreason and copies no error text", () => {
+      const rec = recordingLogger();
+      emitOrphanDiagnostic(ctx(rec.logger), clonePath, "orphan_retirement_failed", "retirement", "canonical_retirement_failure",
+        new Error("secret /private/path text"), undefined, "bogus" as unknown as OrphanRetirementSubreason);
+      emitOrphanDiagnostic(ctx(rec.logger), clonePath, "orphan_retirement_failed", "retirement", "canonical_retirement_failure",
+        undefined, undefined, "authority_busy");
+      emitOrphanDiagnostic(ctx(rec.logger), clonePath, "orphan_retirement_failed", "retirement", "canonical_retirement_failure");
+      const [bogus, good, none] = failed(rec.lines);
+      assert.equal(bogus!.retirement_subreason, "unknown");
+      assert.equal(good!.retirement_subreason, "authority_busy");
+      assert.equal("retirement_subreason" in none!, false);
+      assert.equal(JSON.stringify(rec.lines).includes("secret"), false);
+      assert.equal(JSON.stringify(rec.lines).includes("/private/path"), false);
+    });
+
+    it("isCompletionSourceFenceError is true only for the fence refusal", async () => {
+      const fenceError = await strict.retireRunnerClone(bare, clonePath, BRANCH, RUN, { discard: false }).then(() => undefined, (e: unknown) => e);
+      assert.equal(isCompletionSourceFenceError(fenceError), true);
+      const mismatch = await strict.retireRunnerClone(bare, `${clonePath}-x`, BRANCH, RUN, { discard: false }).then(() => undefined, (e: unknown) => e);
+      assert.equal(isCompletionSourceFenceError(mismatch), false);
+      assert.equal(isCompletionSourceFenceError(new Error("completion source fence")), false);
+      assert.equal(isCompletionSourceFenceError(undefined), false);
+    });
+  });
+
+  describe("issue #3645: readOrphanJournalFence", () => {
+    it("returns the fence and attempt id of a fenced journal, not retained", async () => {
+      const got = await strict.readOrphanJournalFence(bare, BRANCH, RUN, clonePath);
+      assert.equal(got.state, "fenced");
+      if (got.state !== "fenced") return;
+      assert.equal(serializeSourceFence(got.fence), serializeSourceFence(FENCE));
+      assert.equal(got.attemptId, undefined);
+      assert.equal(got.retained, false);
+    });
+
+    it("reports unfenced for a worker without authority, and for a journal with no fence", async () => {
+      assert.deepEqual(await cache.readOrphanJournalFence(bare, BRANCH, RUN, clonePath), { state: "unfenced", retained: false });
+      unfence();
+      assert.deepEqual(await strict.readOrphanJournalFence(bare, BRANCH, RUN, clonePath), { state: "unfenced", retained: false });
+    });
+
+    it("reports changed for another run, another path and no journal, and writes nothing", async () => {
+      const before = configBytes();
+      assert.deepEqual(await strict.readOrphanJournalFence(bare, BRANCH, "run-other", clonePath), { state: "changed" });
+      assert.deepEqual(await strict.readOrphanJournalFence(bare, BRANCH, RUN, `${clonePath}-x`), { state: "changed" });
+      assert.deepEqual(configBytes(), before);
+      gitIn(bare, ["config", `uzi-recovery.${BRANCH}.clone`, ""]);
+      assert.deepEqual(await strict.readOrphanJournalFence(bare, BRANCH, RUN, clonePath), { state: "changed" });
+    });
+
+    it("reports retained when the journal carries a recovery episode", async () => {
+      await cache.reserveRecoveryIteration(bare, BRANCH, KEY, reconstructionSource());
+      const got = await strict.readOrphanJournalFence(bare, BRANCH, RUN, clonePath);
+      assert.equal(got.state, "fenced");
+      assert.equal(got.state === "fenced" && got.retained, true);
+    });
+
+    it("reports retained when the journal names retained sources", async () => {
+      unfence();
+      gitIn(bare, ["config", `uzi-recovery.${BRANCH}.clone`, JSON.stringify({ ...journal(), retainedSources: [{ runId: RUN, clonePath: `${clonePath}-old` }] })]);
+      assert.deepEqual(await strict.readOrphanJournalFence(bare, BRANCH, RUN, clonePath), { state: "unfenced", retained: true });
+    });
   });
 
   it("stopped-source retention answers unknown and writes nothing", async () => {

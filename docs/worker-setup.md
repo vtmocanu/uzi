@@ -76,7 +76,7 @@ A worker image is built from a **template**: a curated, code-reviewed Dockerfile
 
 | Template | What it adds | Use it when |
 |---|---|---|
-| `base` (default) | Node 24 + git + bash + make + the `docker` CLI + go + python3 — the minimal worker | Most repos |
+| `base` (default) | Node 26 + git + bash + make + the `docker` CLI + go + python3 — the minimal worker | Most repos |
 | `jvm` | `base` plus a JDK (`java`/`javac`) | Repos that build or test Java |
 
 Every worker also ships the `docker` CLI and a default go/python3/pip toolchain, baked at build time onto both templates' `PATH` — no per-repo provisioning needed for either. The `docker` CLI alone can't run anything until a daemon is wired up: see [Docker inside a worker](./worker-docker.md). go/python3/pip share the nix store's first-run-only warm cache described under [Tool provisioning](#tool-provisioning) below: they refresh only when `/nix` is deleted and the worker reprovisions, not on every worker image upgrade. The baked set also covers a handful of everyday utilities (`ripgrep`, `opentofu`/`tofu`, and others) beyond go/python3/pip — the shared manifest at `agent/devbox-global/devbox.json` is the canonical list, not this page.
@@ -720,6 +720,11 @@ disables native `Bash` and `Monitor`. What changes for those runs
   automatic extension. Every call starts at the repository root.
 - At most 8 commands per run may be live; the 9th is refused with a visible
   error.
+- Commands one agent issues together run one after another, not at once (the
+  8-command cap counts all agents on the run), and a command placed after a
+  batch of subagents waits for that batch. To keep the integration gate
+  overlapping the review, the lead delegates the gate to one subagent in the
+  same batch as the reviewers.
 - Inline output is capped at 30000 characters (start and end preview). A
   best-effort spill file under `.uzi/scratch/uzi-cmd/` is capped at 64 MiB and
   truncated beyond that; it is bounded, not a promise of full output.

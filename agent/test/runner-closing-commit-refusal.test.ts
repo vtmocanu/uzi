@@ -6,7 +6,7 @@ import path from "node:path";
 import { followSuccessfulPush } from "./publication-fixture.js";
 import { nullLogger } from "./helpers.js";
 import { StubExecutor, type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
-import { api, fakeGitHub, fakeGitlab as rawFakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { api, client, fakeGitHub, fakeGitlab as rawFakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 
 installHarness();
 
@@ -71,6 +71,36 @@ describe("declared non-closing run with a closing commit message (issue #2779)",
     assert.ok((failureReason(claim.run_id) ?? "").includes(obs.sha!));
     assert.equal(all.length, 0);
     assert.equal(originHasBranch(), false);
+  });
+
+  it("issue #3721 interlocked run declaring an owner-acceptance non_closing: a `Closes #N` commit is refused before any push or forge call", async () => {
+    api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
+    await client.register("closing-commit-3721");
+    const { gitlab, all } = fakeGitlab();
+    const obs: { sha?: string } = {};
+    const claim = gitlabClaim(3721, {
+      claim_generation: 7,
+      milestones: [{ id: "m1", title: "Build" }, { id: "m2", title: "Wire" }],
+      config: { completion_contract_version: 1, contract_revision: 1 },
+    });
+    api.setPublicationState(claim.run_id, [], 1);
+    // The closing-commit refusal fires before any completion permit is requested, so the single hold
+    // below is the agent-side history-correction hold, not a server decision.
+    const executor = committing("Closes #3721", obs, true, "closing.txt", {
+      nonClosing: { reason: "Owner acceptance pending: live dev-cluster rollout check" },
+    });
+    await runner(executor, gitlab).execute(claim);
+    assert.ok(obs.sha);
+    // An interlocked, hold-eligible run takes the owner-held path instead of failing: the refusal is
+    // still total (nothing pushed, no forge call), and the run neither completes nor fails.
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    assert.ok(!statuses(claim.run_id).includes("failed"));
+    assert.equal(api.completionHoldRequests.length, 1, "held for history correction exactly once");
+    assert.equal(api.completionPermitRequests.length, 0, "refused before any completion permit request");
+    assert.equal(all.length, 0, "no forge request of any kind");
+    assert.equal(originHasBranch(), false, "nothing was pushed");
+    const feed = api.messages(claim.run_id).map(m => String((m.payload as { text?: unknown } | undefined)?.text ?? "")).join("\n");
+    assert.ok(feed.includes(obs.sha!) && /commit message\(s\) close issue #3721/.test(feed), "the refusal names the closing commit");
   });
 
   it("refuses before any push or forge call and names the offending commit", async () => {

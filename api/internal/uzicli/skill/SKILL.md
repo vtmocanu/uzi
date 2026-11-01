@@ -223,6 +223,7 @@ uzi run recovery [<run-id>] [--json]
 uzi run discard <run-id> --hold <hold-id> [--yes]
 uzi run held <run-id> [--json]
 uzi run held expire <run-id> [--yes]
+uzi run lead-config <run-id> [--json]
 uzi run fetches <run-id> [--json]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text> | --ci-watch [--workflow <key|name>]... [--prompt <text>]) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--remove-label-on-dispatch[=false]] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit] [--harness claude|codex]
 uzi schedule list
@@ -952,6 +953,12 @@ uzi version
   **Destructive:** fetch the work first. It prompts for confirmation interactively; `--yes` is
   **required** for a non-interactive run (without a TTY and without `--yes` it refuses and
   changes nothing).
+- `uzi run lead-config <run-id> [--json]` — the lead agent's model and effort history for a run, one
+  row per recorded phase entry across every claim attempt (columns `GEN PHASE ENTRY SEQ REQUESTED
+  SOURCE OBSERVED EVIDENCE REPORTED`), newest attempt first and plan before implement: what was
+  requested and where each value came from, and what the runtime reported. At most 256 entries (the
+  first 256 in that order); a note says when the rest are left out. A run without a lead agent prints "no recorded lead
+  config". `--json` prints `{entries, truncated}`. Owner or admin (a foreign run is a 404, exit 4).
 - `uzi run fetches <run-id> [--json]` — the source log of a run bound to a site list
   (official-sources research): every web fetch it attempted, allowed or refused, with the
   reason, HTTP status, bytes, content type, the URL asked for and the final URL. Owner-only

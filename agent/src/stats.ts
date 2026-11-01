@@ -96,8 +96,8 @@ export interface StatsCollectorOptions {
   processCpuUsage?: () => { user: number; system: number };
   /** process.memoryUsage().rss passthrough for the process fallback. */
   processRss?: () => number;
-  /** statfs passthrough, injected in tests. Defaults to fs.statfsSync (Node 24, the
-   *  `node:24-alpine` base image). Throws on a missing mount; each volume is guarded
+  /** statfs passthrough, injected in tests. Defaults to fs.statfsSync (Node 26, the
+   *  `node:26-alpine` base image). Throws on a missing mount; each volume is guarded
    *  independently so one failure never drops the other or fails the heartbeat. */
   statfs?: (path: string) => StatfsSample;
   /** The nix-store mount to sample (PRD #837); defaults to the fixed /nix constant. */

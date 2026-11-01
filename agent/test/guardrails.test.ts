@@ -766,14 +766,14 @@ describe("mass-signal guardrail (#1576)", () => {
     const cmd = 'echo "' + '$('.repeat(7) + 'printf ok' + ')'.repeat(7) + '"';
     const result = screenBashCommand(cmd);
     assert.strictEqual(result.denied, true);
-    assert.ok(result.reason?.includes("nested too deeply"), result.reason);
+    assert.ok(result.reason?.includes("nested too deeply"), result.reason ?? "no denial reason reported");
   });
 
   it("denies extreme substitution nesting without throwing", () => {
     const cmd = 'echo "' + '$('.repeat(8192) + 'printf ok' + ')'.repeat(8192) + '"';
     const result = screenBashCommand(cmd);
     assert.strictEqual(result.denied, true);
-    assert.ok(result.reason?.includes("nested too deeply"), result.reason);
+    assert.ok(result.reason?.includes("nested too deeply"), result.reason ?? "no denial reason reported");
   });
 
   it("allows shallow nested command substitutions", () => {
@@ -787,7 +787,7 @@ describe("mass-signal guardrail (#1576)", () => {
     });
     const result = screenBashCommand("echo ok", badPaths);
     assert.strictEqual(result.denied, true);
-    assert.ok(result.reason?.includes("screening failed"), result.reason);
+    assert.ok(result.reason?.includes("screening failed"), result.reason ?? "no denial reason reported");
   });
 });
 

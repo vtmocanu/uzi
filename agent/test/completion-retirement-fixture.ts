@@ -86,12 +86,19 @@ export const receiptOf = (runId: string, head: string): CompletedPublicationRece
 
 export async function rig(_t: TestContext, options: { codex: boolean; cohort?: number; unproven?: boolean; issue?: number;
   /** Explicit capture ids for the extra cohort members (default randomUUID()). */
-  memberIds?: string[] }): Promise<Rig> {
+  memberIds?: string[];
+  /** The owner's run kind (default "issue") and clone slug (default "u5-source"); a slug the claimant would derive puts the owner at its real canonical path. */
+  kind?: "issue" | "mr_rework"; slug?: string;
+  /** Seed the owner at the CANONICAL clone path for its slug (no attempt id), as a legacy/unwired worker does. */
+  canonical?: boolean }): Promise<Rig> {
   const dataDir = fs.realpathSync(fx.dataDir);
   const lifetime = await acquireWorkerLifetime(dataDir, testLockOptions());
   const rt = new AuthorityRuntime({ lifetime, workerToken: TOKEN, timeoutMs: 5000 });
   const executor: Executor = options.codex ? sealingExecutor(options.unproven === true) : { run: async ctx => ({ branch: ctx.branch }) };
-  const claim = gitlabClaim(options.issue ?? 3404, { claim_generation: GENERATION, inventory_guarded: true });
+  const claim = gitlabClaim(options.issue ?? 3404, {
+    claim_generation: GENERATION, inventory_guarded: true,
+    ...(options.kind ? { kind: options.kind, branch: BRANCH } : {}),
+  });
   const runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, JOIN, undefined, { authority: rt });
   const p = runner as unknown as PrivateRunner;
   client.hasFeature = () => true;
@@ -102,16 +109,16 @@ export async function rig(_t: TestContext, options: { codex: boolean; cohort?: n
   fs.chmodSync(path.dirname(bare), 0o700);
   fs.chmodSync(bare, 0o700);
   fs.chmodSync(path.join(bare, "config"), 0o600);
-  const attemptId = mintAttemptId(GENERATION);
-  const cloneInfo = await git.runnerCloneForBranch(bare, BRANCH, "u5-source", {
+  const attemptId = options.canonical ? undefined : mintAttemptId(GENERATION);
+  const cloneInfo = await git.runnerCloneForBranch(bare, BRANCH, options.slug ?? "u5-source", {
     isLive: () => false, beforeFree: async () => { throw new Error("unexpected incumbent"); },
-  }, claim.run_id, false, undefined, {
+  }, claim.run_id, false, undefined, attemptId === undefined ? undefined : {
     attemptId, isLive: () => false, beforeSeed: async paths => assert.deepEqual(paths, []),
   });
   await git.markRecoveryCapture(bare, cloneInfo.path, BRANCH, claim.run_id, attemptId);
   const head = await git.worktreeHead(cloneInfo.path);
   assert.ok(head);
-  const first = await p.recovery.pin({ runId: claim.run_id, generation: GENERATION, kind: "issue", branch: BRANCH, sourceSha: head, inventoryGuarded: true });
+  const first = await p.recovery.pin({ runId: claim.run_id, generation: GENERATION, kind: options.kind ?? "issue", branch: BRANCH, sourceSha: head, inventoryGuarded: true });
   assert.ok(first);
   const captureIds = [first.captureId];
   for (let i = 1; i < (options.cohort ?? 1); i++) {

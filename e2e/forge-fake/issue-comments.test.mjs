@@ -299,6 +299,9 @@ test("shared fake HTTPS comment, author and publication contracts", { timeout: 3
         const repo = (await get(`/api/${dialect}/repositories/${id}`)).body;
         assert.equal(repo.id, id);
         assert.equal(repo.full_name, slug);
+        assert.equal(repo.name, slug.split("/").at(-1));
+        assert.equal(repo.html_url, `https://configured.invalid/${slug}`);
+        assert.equal(repo.default_branch, "main");
         assert.deepEqual(repo.owner, { id: 1, login: "group" });
         // The owner's login differs from the bot: this proves no personal-owner eligibility.
         assert.notEqual(repo.owner.login, bot.login);
@@ -332,6 +335,19 @@ test("shared fake HTTPS comment, author and publication contracts", { timeout: 3
       // Retain the existing numeric repository fallback.
       assert.equal((await get(`/api/${dialect}/repositories/999`)).body.id, 1);
     }
+  });
+
+  await t.test("GitLab stable-ID project metadata", async () => {
+    for (const [id, slug] of [[1, "group/repo"], [2, "group/repo2"]]) {
+      const project = (await get(`/api/v4/projects/${id}`)).body;
+      assert.equal(project.id, id);
+      assert.equal(project.path_with_namespace, slug);
+      assert.equal(project.path, slug.split("/").at(-1));
+      assert.equal(project.namespace.full_path, "group");
+      assert.equal(project.web_url, `https://configured.invalid/${slug}`);
+      assert.equal(project.default_branch, "main");
+    }
+    assert.equal((await request("/api/v4/projects/999")).status, 404);
   });
 
   await t.test("GitLab notes remain shared and unchanged", async () => {

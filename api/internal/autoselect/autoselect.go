@@ -40,9 +40,11 @@ import (
 // HasReading distinguishes "the LEFT JOIN found no gauge row at all" from "there is
 // a row whose columns are NULL", which are different facts with different causes: a
 // credential the usage endpoint permanently refuses never produces a row, while a
-// reading that measured neither window produces one full of NULLs. D16 turns the
-// first into "never polled" and D12 the second into "unmeasured", so collapsing
-// them would lose the one diagnosis a user can act on.
+// reading that measured no 7-day window produces one with a NULL 7-day pct. D16
+// turns the first into "never polled" and D12 the second into "unmeasured", so
+// collapsing them would lose the one diagnosis a user can act on. A NULL FiveHourPct
+// with a set SevenDayPct is NOT that case: plans without a 5-hour window report only
+// the 7-day one, and that is a measured token whose headroom is the 7-day headroom.
 type Candidate struct {
 	SecretID      uuid.UUID
 	Label         string
@@ -103,10 +105,11 @@ const (
 	// the usage endpoint permanently refuses never produces a row at all, so opting
 	// it in would otherwise change nothing while LOOKING active.
 	StatusNoReading Status = "no_reading"
-	// StatusUnmeasured: a gauge row exists but at least one window's pct is NULL
-	// (D12). A reading that measured neither window carries no headroom signal, so
-	// it cannot be ranked and is excluded rather than defaulted to some
-	// assumed-full value.
+	// StatusUnmeasured: a gauge row exists but its 7-day pct is NULL (D12). A reading
+	// without the 7-day window carries no headroom signal, so it cannot be ranked and
+	// is excluded rather than defaulted to some assumed-full value. A NULL 5-hour pct
+	// alone does not qualify: the account simply has no 5-hour window, so the 7-day
+	// pct is the whole headroom signal.
 	StatusUnmeasured Status = "unmeasured"
 	// StatusStale: measurable, but the reading is older than MaxStaleness. This is
 	// also where the poller's 15-minute refusal backoff lands (D11) and where every
@@ -161,13 +164,13 @@ func Classify(c Candidate, p Policy, now time.Time) Eligibility {
 	if !c.HasReading || c.SyncedAt == nil {
 		return Eligibility{Status: StatusNoReading}
 	}
-	if c.FiveHourPct == nil || c.SevenDayPct == nil {
+	if c.SevenDayPct == nil {
 		return Eligibility{Status: StatusUnmeasured}
 	}
 	if p.MaxStaleness <= 0 || now.Sub(*c.SyncedAt) > p.MaxStaleness {
 		return Eligibility{Status: StatusStale}
 	}
-	h := headroom(*c.FiveHourPct, *c.SevenDayPct)
+	h := headroom(c.FiveHourPct, *c.SevenDayPct)
 	if h < p.MinHeadroom {
 		return Eligibility{Status: StatusBelowThreshold, Measured: true, Headroom: h}
 	}
@@ -175,15 +178,19 @@ func Classify(c Candidate, p Policy, now time.Time) Eligibility {
 }
 
 // headroom is how much of the BINDING window is left: min(100-five, 100-seven).
+// A nil five (the account has no 5-hour window) leaves the 7-day window alone.
 //
 // The min, not an average and not the five-hour window alone, because the two
 // windows are a conjunction — a token at 10% of its 5-hour allowance and 98% of its
 // 7-day one has 2 points of usable capacity, not 46. The 7-day window is the hard
 // cap and the 5-hour one the near-term one; whichever is fuller is what actually
 // stops the next run.
-func headroom(fivePct, sevenPct int16) int {
-	five := 100 - int(fivePct)
+func headroom(fivePct *int16, sevenPct int16) int {
 	seven := 100 - int(sevenPct)
+	if fivePct == nil {
+		return seven
+	}
+	five := 100 - int(*fivePct)
 	if seven < five {
 		return seven
 	}

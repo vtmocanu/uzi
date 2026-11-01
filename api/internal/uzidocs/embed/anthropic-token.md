@@ -178,7 +178,8 @@ The emptiest token wins. When two are within a few points of each other, the
 one that **replenishes soonest** wins — and it is the reset of the window
 that is actually holding it back, because a 5-hour reset does not relieve a
 7-day cap. Ties beyond that are broken deterministically, so the same inputs
-always give the same answer.
+always give the same answer. A token whose plan has no 5-hour window is ranked
+on its 7-day headroom alone.
 
 A small bias spreads work: each run already in flight on a token counts
 slightly against it, so several claims arriving inside one polling interval

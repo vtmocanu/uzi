@@ -453,6 +453,7 @@ describe("runner clone teardown (#2324)", () => {
     let swapped = false;
     const statMock = mock.method(fs, "stat", async (...args: Parameters<typeof fs.stat>) => {
       const result = await originalStat(...args);
+      assert.ok(result, "fs.stat resolved without stats");
       if (!swapped && String(result.ino) === String(identity.ino) && String(result.dev) === String(identity.dev) && args[1]?.bigint) {
         swapped = true;
         uidScript(runnerCommand, "const fs=require('node:fs');fs.renameSync(process.argv[1],process.argv[1]+'.moved');fs.mkdirSync(process.argv[1]);fs.writeFileSync(process.argv[1]+'/planted','keep')", target);

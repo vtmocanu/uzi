@@ -3099,6 +3099,57 @@ export interface SemanticDriftDTO {
   contradiction: boolean;
 }
 
+/** PRD #3244: one recorded lead-config row. Model strings are untrusted worker-attested text. */
+export interface LeadPhaseConfig {
+  phase: "plan" | "implement";
+  phase_entry: number;
+  seq: number;
+  harness: "claude" | "codex";
+  requested_model: string | null;
+  requested_model_source: LeadModelSource;
+  requested_model_fixed_at: "create" | "claim";
+  requested_effort: string | null;
+  requested_effort_mode: "explicit" | "runtime_default";
+  requested_effort_source: LeadEffortSource;
+  requested_effort_fixed_at: "create" | "claim";
+  observed_model: string | null;
+  observed_model_evidence: "claude_init" | "codex_thread_response" | "unknown" | null;
+  observed_effort: string | null;
+  observed_effort_evidence:
+    | "claude_init"
+    | "claude_get_settings"
+    | "codex_sent"
+    | "codex_runtime_default"
+    | "unknown"
+    | null;
+  truncated: boolean;
+  reported_at: string;
+}
+
+export type LeadModelSource =
+  | "run_override"
+  | "schedule_pin"
+  | "user_planning_default"
+  | "user_default"
+  | "template"
+  | "builtin";
+
+export type LeadEffortSource =
+  | "run_override"
+  | "user_planning_default"
+  | "user_default"
+  | "template"
+  | "builtin";
+
+/** PRD #3244: Run.lead_config. phases holds the highest-seq row per phase of the highest claim
+ *  generation that has rows, plan first; claim_generation is 0 when none. */
+export interface RunLeadConfig {
+  applicable: boolean;
+  claim_generation: number;
+  current: boolean;
+  phases: LeadPhaseConfig[];
+}
+
 export interface Run {
   forge_origin_cooldown?: ForgeOriginCooldown;
   capability_provenance?: {
@@ -3654,6 +3705,10 @@ export interface Run {
   home_bytes?: number;
   cache_bytes?: number;
   disk_truncated?: boolean;
+  /** PRD #3244: the lead agent's configured and runtime-reported model and effort. Set on the
+   *  single-run read (GET /api/runs/{id}) for lead-lane runs only; absent on list rows and on runs
+   *  without a lead agent. */
+  lead_config?: RunLeadConfig;
   /** PRD #84 M4: the run's inferred/hinted scheduling requirements, surfaced RAW so the
    *  web derives the plan-gate readiness display from them plus the assigned worker's
    *  capabilities (there is no server-computed "capability_block" field — the 409 the
@@ -4094,7 +4149,7 @@ export type RunSummaryItem = Omit<
   "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
-  | "capability_provenance"
+  | "capability_provenance" | "lead_config"
 >;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
@@ -4235,7 +4290,8 @@ export type RateLimitSource = (typeof RATE_LIMIT_SOURCES)[number];
 export type MyRateLimits =
   | {
       status: "ok";
-      five_hour: RateLimitWindow;
+      /** Absent when the account has no 5-hour window (plans where Anthropic removed it). */
+      five_hour?: RateLimitWindow;
       seven_day: RateLimitWindow;
       source: RateLimitSource;
       synced_at: string; // ISO-8601
@@ -5040,7 +5096,8 @@ export interface AgentSelectionInput {
 // reconciles by REST refetch (mount/reconnect/state/health), so a dropped frame
 // self-heals — its handling lands in M3.
 export interface WsEvent {
-  type: "message" | "state" | "health" | "input";
+  // "refresh" (PRD #3244) is data-less like "health": a stored lead-config row changed, so re-read.
+  type: "message" | "state" | "health" | "input" | "refresh";
   seq?: number;
   kind?: string;
   agent?: string | null;

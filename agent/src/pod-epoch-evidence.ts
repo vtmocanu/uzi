@@ -1,16 +1,24 @@
-/** Version-1 controller evidence. Parsing grants no epoch or deletion authority. */
+/** Controller evidence, versions 1 (legacy) and 2 (adds successor containers and attestation).
+ * Parsing grants no epoch or deletion authority. */
 export interface PodEpochContainer {
   name: string; containerID: string; exitCode: number; restartCount: number;
 }
 export interface PodEpochClaim { name: string; uid: string; volumeName: string }
-export interface PodEpochEvidence {
-  version: 1; session: string; predecessor: string; successor: string;
+interface PodEpochEvidenceBase {
+  session: string; predecessor: string; successor: string;
   containers: PodEpochContainer[]; initContainers: PodEpochContainer[];
   data: PodEpochClaim; dind: PodEpochClaim;
   maintenance?: { operationID: string; oldClaimUID: string; newClaimUID: string };
   runtime: "containerd-runc" | "crio-crun";
   sessionStarted: string; terminalObserved: string; successorAdded: string;
 }
+export interface PodEpochEvidenceV1 extends PodEpochEvidenceBase { version: 1 }
+export interface PodEpochEvidenceV2 extends PodEpochEvidenceBase {
+  version: 2;
+  successorContainers: Array<{ name: string; containerID: string }>;
+  attestation: { result: "consistent" | "contradicted"; reason: string };
+}
+export type PodEpochEvidence = PodEpochEvidenceV1 | PodEpochEvidenceV2;
 export interface PodEpochNegative { handoff: "none"; reason: string }
 export type PodEpochDocument = PodEpochEvidence | PodEpochNegative;
 export class PodEpochEvidenceError extends Error {
@@ -121,9 +129,13 @@ export function parsePodEpochEvidence(input: string | Uint8Array): PodEpochDocum
       requireValid(v.handoff === "none" && nonempty(v.reason) && v.reason.trim() !== "");
       return v as unknown as PodEpochNegative;
     }
+    const version = typeof v === "object" && v !== null ? (v as { version?: unknown }).version : undefined;
+    requireValid(version === 1 || version === 2);
+    const v2 = version === 2;
     shape(v, ["version", "session", "predecessor", "successor", "containers", "initContainers",
-      "data", "dind", "runtime", "sessionStarted", "terminalObserved", "successorAdded"], ["maintenance"]);
-    requireValid(v.version === 1 && identity(v.session) && identity(v.predecessor) &&
+      "data", "dind", "runtime", "sessionStarted", "terminalObserved", "successorAdded",
+      ...(v2 ? ["successorContainers", "attestation"] : [])], ["maintenance"]);
+    requireValid(identity(v.session) && identity(v.predecessor) &&
       identity(v.successor) && v.predecessor !== v.successor &&
       (v.runtime === "containerd-runc" || v.runtime === "crio-crun"));
     claim(v.data); claim(v.dind); requireValid(v.data.name !== v.dind.name);
@@ -137,6 +149,19 @@ export function parsePodEpochEvidence(input: string | Uint8Array): PodEpochDocum
       requireValid(nonempty(m.operationID) && m.operationID.trim() !== "" &&
         identity(m.oldClaimUID) && identity(m.newClaimUID) &&
         m.oldClaimUID !== m.newClaimUID && m.newClaimUID === v.dind.uid);
+    }
+    if (v2) {
+      requireValid(Array.isArray(v.successorContainers) && v.successorContainers.length > 0);
+      const names = new Set<string>();
+      for (const c of v.successorContainers as unknown[]) {
+        shape(c, ["name", "containerID"]);
+        requireValid(nonempty(c.name) && !names.has(c.name) && nonempty(c.containerID));
+        names.add(c.name);
+      }
+      const a = v.attestation;
+      shape(a, ["result", "reason"]);
+      requireValid((a.result === "consistent" || a.result === "contradicted") &&
+        nonempty(a.reason) && a.reason.trim() !== "");
     }
     return v as unknown as PodEpochEvidence;
   } catch { throw new PodEpochEvidenceError(); }

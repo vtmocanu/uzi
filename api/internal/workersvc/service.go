@@ -665,6 +665,9 @@ type Store interface {
 	// push whose outcome the api never learned.
 	RecordCheckpointPublishAttempt(ctx context.Context, arg store.RecordCheckpointPublishAttemptParams) (uuid.UUID, error)
 	RecordLiveCheckpointPublishAttempt(ctx context.Context, arg store.RecordLiveCheckpointPublishAttemptParams) (uuid.UUID, error)
+	// PRD #3244: the claim-fenced lead-config row write (run_lead_configs, two statements in one
+	// READ COMMITTED transaction). The GetRun overlay read does not go through this interface.
+	RecordRunLeadConfig(ctx context.Context, arg store.RecordRunLeadConfigParams) (store.RecordRunLeadConfigResult, error)
 	MarkCheckpointPublishAttemptReady(ctx context.Context, id uuid.UUID) (int64, error)
 	DeleteCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (int64, error)
 	GetCheckpointPublishAttempt(ctx context.Context, id uuid.UUID) (store.CheckpointPublishAttempt, error)
@@ -2040,6 +2043,7 @@ type Service struct {
 	heldPrepareFn      func(ctx context.Context, o pushbroker.HeldPackOptions) (*pushbroker.PreparedHeldPack, error)
 	heldSendFn         func(ctx context.Context, p *pushbroker.PreparedHeldPack) (pushbroker.HeldCreateOutcome, error)
 	heldListFn         func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
+	prerequisite       *prerequisiteRuntime
 	heldSlots          chan struct{}
 	heldBeforeSendHook func()
 	heldOutcomeHook    func() error
@@ -2388,6 +2392,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		heldListFn:           pushbroker.ListRefTips,
 		heldDeleteFn:         pushbroker.Delete,
 		heldSlots:            make(chan struct{}, heldPublishMaxConcurrent),
+		prerequisite:         newPrerequisiteRuntime(),
 		createRefFn:          pushbroker.CreateRef,
 		listRefTipsFn:        pushbroker.ListRefTips,
 		background:           func(fn func()) { go fn() },

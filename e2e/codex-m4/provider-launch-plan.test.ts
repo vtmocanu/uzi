@@ -7,7 +7,7 @@ test("P provider launch keeps the production contract separate from a rootless e
   const executableBin = "/tmp/rootless-cache/0.163.0/bin/codex";
   const plan = buildProviderLaunchPlan(
     {
-      CODEX_BIN: "/opt/uzi-codex/0.163.0/bin/codex",
+      CODEX_BIN: "/opt/uzi-codex/0.164.0/bin/codex",
       SUPERVISOR_BIN: "/usr/local/bin/uzi-codex-supervisor",
       PROVIDER_CHILD_ARGV: ["app-server"],
     },
@@ -20,7 +20,7 @@ test("P provider launch keeps the production contract separate from a rootless e
     },
   );
 
-  assert.equal(plan.spec.codexBin, "/opt/uzi-codex/0.163.0/bin/codex");
+  assert.equal(plan.spec.codexBin, "/opt/uzi-codex/0.164.0/bin/codex");
   assert.equal(plan.executableBin, executableBin);
   assert.notEqual(plan.spec.codexBin, plan.executableBin);
 });

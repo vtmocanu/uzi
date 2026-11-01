@@ -153,13 +153,15 @@ function TokenMeters({ token, now }: { token: TokenRateLimits; now: number }) {
       {heading}
       {resetLabel && <div className="mt-0.5 text-xs text-faint">{resetLabel}</div>}
       <div className="mt-2">
-        <SettingsWindowRow
-          label="5-hour window"
-          win={limits.five_hour}
-          now={now}
-          dim={limits.stale}
-          forecast={rowForecast(limits.stale, limits.five_hour.pct, limits.five_hour.resets_at, WINDOW_DURATION["5h"], now, limits.source)}
-        />
+        {limits.five_hour && (
+          <SettingsWindowRow
+            label="5-hour window"
+            win={limits.five_hour}
+            now={now}
+            dim={limits.stale}
+            forecast={rowForecast(limits.stale, limits.five_hour.pct, limits.five_hour.resets_at, WINDOW_DURATION["5h"], now, limits.source)}
+          />
+        )}
         <SettingsWindowRow
           label="7-day window"
           win={limits.seven_day}
@@ -353,20 +355,22 @@ function MicroRow({
 export function TokenMicroMeters({ token, now }: { token: TokenRateLimits; now: number }) {
   const { limits } = token;
   if (limits.status !== "ok") return null;
-  const c5 = formatCountdown(limits.five_hour.resets_at);
+  const c5 = limits.five_hour ? formatCountdown(limits.five_hour.resets_at) : null;
   const c7 = formatCountdown(limits.seven_day.resets_at);
   const title = [token.label, c5 && `5h resets in ${c5}`, c7 && `7d resets in ${c7}`]
     .filter(Boolean)
     .join(" · ");
   return (
     <div className="space-y-1.5" title={title || undefined}>
-      <MicroRow
-        label="5h"
-        win={limits.five_hour}
-        dim={limits.stale}
-        forecast={rowForecast(limits.stale, limits.five_hour.pct, limits.five_hour.resets_at, WINDOW_DURATION["5h"], now, limits.source)}
-        now={now}
-      />
+      {limits.five_hour && (
+        <MicroRow
+          label="5h"
+          win={limits.five_hour}
+          dim={limits.stale}
+          forecast={rowForecast(limits.stale, limits.five_hour.pct, limits.five_hour.resets_at, WINDOW_DURATION["5h"], now, limits.source)}
+          now={now}
+        />
+      )}
       <MicroRow
         label="7d"
         win={limits.seven_day}

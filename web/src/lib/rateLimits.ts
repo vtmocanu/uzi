@@ -72,10 +72,10 @@ export type RowState =
   | "unavailable"
   | "no_token";
 
-// worstPct is the higher of the two windows — a user is as worth flagging at 97%
-// on 5h as at 97% on 7d.
+// worstPct is the higher of the present windows — a user is as worth flagging at
+// 97% on 5h as at 97% on 7d. An account without a 5-hour window has only the 7-day.
 function worstPct(limits: Extract<MyRateLimits, { status: "ok" }>): number {
-  return Math.max(limits.five_hour.pct, limits.seven_day.pct);
+  return Math.max(limits.five_hour?.pct ?? 0, limits.seven_day.pct);
 }
 
 export interface WorstWindow {
@@ -87,9 +87,10 @@ export interface WorstWindow {
 // worstWindow names the more-utilized of the two windows (not just its pct — that
 // is worstPct) so the aria-live announcer (PRD #54) can say WHICH window drove a
 // tone crossing and read its countdown. Tie → 5-hour, the shorter and more urgent
-// window.
+// window. With no 5-hour window the 7-day one is the answer.
 export function worstWindow(limits: Extract<MyRateLimits, { status: "ok" }>): WorstWindow {
   const { five_hour: five, seven_day: seven } = limits;
+  if (!five) return { label: "7-day", pct: seven.pct, resets_at: seven.resets_at };
   return seven.pct > five.pct
     ? { label: "7-day", pct: seven.pct, resets_at: seven.resets_at }
     : { label: "5-hour", pct: five.pct, resets_at: five.resets_at };
@@ -139,7 +140,8 @@ const RANK: Record<RowState, number> = {
 };
 
 function fiveHourPct(limits: MyRateLimits): number {
-  return limits.status === "ok" ? limits.five_hour.pct : -1;
+  // No 5-hour window: rank by the 7-day one, the only meter the account has.
+  return limits.status === "ok" ? (limits.five_hour?.pct ?? limits.seven_day.pct) : -1;
 }
 
 // sortAdminRows returns a new array ordered danger → warn → ok → stale →
@@ -187,7 +189,7 @@ export function statusBadge(limits: MyRateLimits, vaultLocked: boolean, vaultMod
     case "live_danger": {
       const ok = limits as Extract<MyRateLimits, { status: "ok" }>;
       const which = [
-        ok.five_hour.pct >= 95 ? "5h" : null,
+        (ok.five_hour?.pct ?? 0) >= 95 ? "5h" : null,
         ok.seven_day.pct >= 95 ? "7d" : null,
       ].filter(Boolean);
       if (which.length === 0) return { tone: "ok", label: "Live", dot: true };

@@ -110,8 +110,8 @@ task test:codex-m3b:host
 task check:codex-m4-receipts
 ```
 
-`test:codex-m4` needs the pinned `codex-cli 0.163.0` package (`agent/codex/codex-package.lock`):
-either the image-baked absolute path at `/opt/uzi-codex/0.163.0`, or a rootless test-cache
+`test:codex-m4` needs the pinned `codex-cli 0.164.0` package (`agent/codex/codex-package.lock`):
+either the image-baked absolute path at `/opt/uzi-codex/0.164.0`, or a rootless test-cache
 provision via `provision.ts` (`install-codex.sh` with SHA256-verified layout) on a Linux
 contributor/CI host without the baked package. D7 point 3's strict macOS Linux-container
 invocation is now reproducibly callable: `task test:codex-m4:macos` runs
@@ -120,7 +120,7 @@ auto-route the Linux-only P leg through the same pinned container on macOS (a `p
 [darwin]` command; the P files self-route to a skip on non-Linux via `p-platform.ts`). It runs
 the complete strict P suite (all three P files — startup-smoke, policy-real, native-bypass)
 unprivileged, pinned to
-`docker.io/library/node:24-bookworm@sha256:6dac556d980b7f0e5498d08f08cee0ca67798b4ad6c23964a9214920e67758d0`,
+`docker.io/library/node:26-bookworm@sha256:3b764117159bda01d2396391e7789b6a9106af9729cfd001ef55e98557868310`,
 with the network disabled during tests and no Docker socket or maintainer HOME mounted. Docker
 on the macOS host is required; missing Docker or an unsupported architecture fail loudly
 (`assertPrerequisites` throws), never a silent platform skip.

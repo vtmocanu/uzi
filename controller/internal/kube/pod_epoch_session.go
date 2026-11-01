@@ -38,7 +38,17 @@ type podEpochRecord struct {
 	deletedAt  uint64
 	tainted    bool
 	identity   *PodEpochIdentity
+	// pending is the frozen positive proof awaiting successor container IDs.
+	pending     *PodEpochEvidence
+	pendingCost int
 }
+
+func (s *PodEpochSession) dropPending(r *podEpochRecord) {
+	s.bytes -= r.pendingCost
+	r.pending = nil
+	r.pendingCost = 0
+}
+
 type PodEpochDecision struct {
 	generation               PodEpochGeneration
 	session                  *PodEpochSession
@@ -500,10 +510,54 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 		r.tainted = true
 	}
 	if !fresh {
+		if r.pending == nil {
+			return nil, nil
+		}
+		if event == watch.Added || baseline {
+			return nil, nil
+		}
+		// The Deleted and r.deleted clauses are defence in depth: a Deleted event
+		// always leaves the record tainted or terminal, so they are not separately
+		// testable. The terminal, tainted and current clauses are pinned by
+		// TestPodEpochSuccessorNeverEmits. A successor in phase Succeeded or
+		// Failed never emits, whether or not podEpochSignal audited a termination
+		// signal (r.terminal): Evicted, incomplete statuses and exit 137 leave
+		// r.terminal zero. Dropping the pending proof makes that permanent.
+		if event == watch.Deleted || r.deleted || r.tainted || r.terminal != 0 ||
+			p.Status.Phase == corev1.PodSucceeded || p.Status.Phase == corev1.PodFailed ||
+			s.current[w.ID] != uid {
+			s.dropPending(r)
+			return nil, nil
+		}
+		succ := podEpochSuccessorContainers(p)
+		if len(succ) == 0 {
+			return nil, nil
+		}
+		ev := *r.pending
+		s.dropPending(r)
+		if p.ResourceVersion == "" || !podEpochUUID.MatchString(uid) {
+			return nil, nil
+		}
+		return &PodEpochDecision{generation: g, session: s, namespace: p.Namespace, name: p.Name, uid: uid, rv: p.ResourceVersion, document: podEpochComplete(ev, succ), context: ctx}, nil
+	}
+	doc, proof := s.produce(w, p, r, predecessor, identityErr)
+	if p.ResourceVersion == "" || !podEpochUUID.MatchString(uid) {
 		return nil, nil
 	}
-	doc := s.produce(w, p, r, predecessor, identityErr)
-	if p.ResourceVersion == "" || !podEpochUUID.MatchString(uid) {
+	if proof != nil {
+		// Positive proofs wait for successor container IDs; the bytes are charged
+		// against the session budget.
+		b, err := json.Marshal(proof)
+		if err != nil {
+			return nil, nil
+		}
+		if s.bytes+len(b) > PodEpochMaxMetadata {
+			s.invalidate()
+			return nil, nil
+		}
+		s.bytes += len(b)
+		r.pending = proof
+		r.pendingCost = len(b)
 		return nil, nil
 	}
 	return &PodEpochDecision{generation: g, session: s, namespace: p.Namespace, name: p.Name, uid: uid, rv: p.ResourceVersion, document: doc, context: ctx}, nil
@@ -513,29 +567,30 @@ func podEpochSameMounts(a, b *corev1.Pod) bool {
 	y, _ := json.Marshal(b.Spec.Volumes)
 	return string(x) == string(y)
 }
-func (s *PodEpochSession) produce(w PodEpochWorker, p *corev1.Pod, r *podEpochRecord, pred string, identityErr error) string {
-	negative := func(reason string) string {
-		b, _ := json.Marshal(PodEpochNegative{Handoff: "none", Reason: reason})
-		return string(b)
-	}
+
+// produce evaluates every proof check at the successor's Added event. It returns
+// a negative document, or a frozen positive proof (document empty) to be completed
+// by podEpochComplete.
+func (s *PodEpochSession) produce(w PodEpochWorker, p *corev1.Pod, r *podEpochRecord, pred string, identityErr error) (string, *PodEpochEvidence) {
+	neg := func(reason string) (string, *PodEpochEvidence) { return podEpochNegativeDoc(reason), nil }
 	x := s.records[pred]
 	if identityErr != nil || r.identity == nil {
-		return negative("identity_unverified")
+		return neg("identity_unverified")
 	}
 	if !podEpochRuntime(w.Runtime) {
-		return negative("runtime_not_declared")
+		return neg("runtime_not_declared")
 	}
 	if !podEpochPrivatePID(p) {
-		return negative("successor_pid_unaudited")
+		return neg("successor_pid_unaudited")
 	}
 	if x == nil || x.terminal == 0 || x.terminal >= r.start || x.tainted || x.identity == nil {
-		return negative("predecessor_unproven")
+		return neg("predecessor_unproven")
 	}
 	var xp corev1.Pod
 	_ = json.Unmarshal(x.proof, &xp)
 	cs, is, ok := podEpochSignal(&xp)
 	if !ok {
-		return negative("predecessor_unproven")
+		return neg("predecessor_unproven")
 	}
 	for id, other := range s.records {
 		if id == pred || id == string(p.UID) || other.start > r.start {
@@ -554,25 +609,74 @@ func (s *PodEpochSession) produce(w PodEpochWorker, p *corev1.Pod, r *podEpochRe
 			continue
 		}
 		if other.tainted || other.terminal == 0 || other.terminal >= x.terminal {
-			return negative("concurrent_pod_unproven")
+			return neg("concurrent_pod_unproven")
 		}
 	}
 	before, after := x.identity, r.identity
 	if before.Data != after.Data || before.DinD.Name != after.DinD.Name || (before.DinD.UID == after.DinD.UID && before.DinD.VolumeName != after.DinD.VolumeName) {
-		return negative("claim_changed")
+		return neg("claim_changed")
 	}
 	var remint *PodEpochRemint
 	if before.DinD.UID != after.DinD.UID {
 		receipt, ok := s.remints[w.ID+":"+before.DinD.UID+":"+after.DinD.UID]
 		if !ok || receipt.OldClaimUID != before.DinD.UID || receipt.NewClaimUID != after.DinD.UID {
-			return negative("dind_remint_unrecorded")
+			return neg("dind_remint_unrecorded")
 		}
 		remint = &receipt
 	}
-	e := PodEpochEvidence{Version: 1, Session: s.id, Predecessor: pred, Successor: string(p.UID), Containers: cs, InitContainers: is, Data: after.Data, DinD: after.DinD, Maintenance: remint, Runtime: w.Runtime, SessionStarted: s.started, TerminalObserved: x.terminalAt, SuccessorAdded: r.addedAt}
+	// The proof is frozen here; successor container IDs and the attestation are
+	// added when they first appear (see podEpochComplete).
+	e := PodEpochEvidence{Version: 2, Session: s.id, Predecessor: pred, Successor: string(p.UID), Containers: cs, InitContainers: is, Data: after.Data, DinD: after.DinD, Maintenance: remint, Runtime: w.Runtime, SessionStarted: s.started, TerminalObserved: x.terminalAt, SuccessorAdded: r.addedAt}
+	return "", &e
+}
+
+func podEpochNegativeDoc(reason string) string {
+	b, _ := json.Marshal(PodEpochNegative{Handoff: "none", Reason: reason})
+	return string(b)
+}
+
+// podEpochSuccessorContainers lists every successor status entry with a
+// container ID, init containers first.
+func podEpochSuccessorContainers(p *corev1.Pod) []PodEpochSuccessorContainer {
+	var out []PodEpochSuccessorContainer
+	for _, list := range [][]corev1.ContainerStatus{p.Status.InitContainerStatuses, p.Status.ContainerStatuses} {
+		for _, c := range list {
+			if c.ContainerID != "" {
+				out = append(out, PodEpochSuccessorContainer{Name: c.Name, ContainerID: c.ContainerID})
+			}
+		}
+	}
+	return out
+}
+
+// podEpochComplete turns a frozen positive proof into the final v2 document
+// once the successor reports container IDs.
+func podEpochComplete(e PodEpochEvidence, succ []PodEpochSuccessorContainer) string {
+	prefix := "containerd://"
+	if e.Runtime == "crio-crun" {
+		prefix = "cri-o://"
+	}
+	att := PodEpochAttestation{Result: "consistent", Reason: "observations_consistent"}
+	for _, list := range [][]PodEpochContainer{e.Containers, e.InitContainers} {
+		for _, c := range list {
+			if !strings.HasPrefix(c.ContainerID, prefix) {
+				att = PodEpochAttestation{Result: "contradicted", Reason: "predecessor_runtime_prefix"}
+			}
+		}
+	}
+	if att.Result == "consistent" {
+		for _, c := range succ {
+			if !strings.HasPrefix(c.ContainerID, prefix) {
+				att = PodEpochAttestation{Result: "contradicted", Reason: "successor_runtime_prefix"}
+				break
+			}
+		}
+	}
+	e.SuccessorContainers = succ
+	e.Attestation = &att
 	b, err := EncodePodEpochEvidence(e)
 	if err != nil {
-		return negative("evidence_invalid_or_oversize")
+		return podEpochNegativeDoc("evidence_invalid_or_oversize")
 	}
 	return string(b)
 }

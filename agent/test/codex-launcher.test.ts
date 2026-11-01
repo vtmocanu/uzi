@@ -59,7 +59,7 @@ resetResidueQuarantineAfterEach();
 // Most privileged steps are injected; the worker-UID regression exercises the
 // production runner-tree creator with real setpriv and the worker image binaries.
 
-const CODEX_BIN = "/opt/uzi-codex/0.163.0/bin/codex";
+const CODEX_BIN = "/opt/uzi-codex/0.164.0/bin/codex";
 const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
 const RUNNER_UID = 10002;
 const DATA_ROOT = "/data/run/root-1";
@@ -1028,6 +1028,7 @@ describe("M1 controlled advice disposal ordering probe", () => {
             replacement = await originalStat(owned);
             ownerMetadata = t.mock.method(fs, "stat", async (...args: Parameters<typeof fs.stat>) => {
               const stat = await originalStat(...args);
+              assert.ok(stat, "fs.stat resolved without stats");
               if (/^\/proc\/self\/fd\/[0-9]+$/.test(String(args[0])) &&
                 String(stat.dev) === String(replacement!.dev) && String(stat.ino) === String(replacement!.ino)) {
                 if (typeof stat.uid === "bigint") bigintIdentityReads++;

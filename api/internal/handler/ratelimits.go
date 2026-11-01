@@ -190,9 +190,15 @@ func (h *Handler) adminRateVaultSnapshot(ctx context.Context, ownerID uuid.UUID,
 // is computed server-side (D3); resets are rendered as epoch seconds (D7).
 func (h *Handler) okRateLimitDTO(fivePct pgtype.Int2, fiveReset pgtype.Timestamptz, sevenPct pgtype.Int2, sevenReset pgtype.Timestamptz, source pgtype.Text, syncedAt pgtype.Timestamptz) apitypes.RateLimitDTO {
 	stale := h.rateLimitStale(syncedAt)
+	// A NULL five_hour_pct means the account has no 5-hour window (plans where
+	// Anthropic removed it): FiveHour stays nil and is omitted from the JSON.
+	var five *apitypes.RateLimitWindow
+	if fivePct.Valid {
+		five = &apitypes.RateLimitWindow{Pct: int(fivePct.Int16), ResetsAt: epochPtr(fiveReset)}
+	}
 	return apitypes.RateLimitDTO{
 		Status:   rateLimitStatusOK,
-		FiveHour: &apitypes.RateLimitWindow{Pct: int(fivePct.Int16), ResetsAt: epochPtr(fiveReset)},
+		FiveHour: five,
 		SevenDay: &apitypes.RateLimitWindow{Pct: int(sevenPct.Int16), ResetsAt: epochPtr(sevenReset)},
 		Source:   source.String,
 		SyncedAt: syncedAt.Time.UTC().Format(time.RFC3339),

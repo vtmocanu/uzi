@@ -52,7 +52,7 @@ function expected(content: string, size: number, tail: number, linesReturned: nu
   return { ok: true, output: { size, content, tail, fromEnd: true, linesReturned, partialFirstLine, truncated } };
 }
 
-function assertTailResult(actual: unknown, expected: unknown, message?: string): void {
+function assertTailResult(actual: unknown, expected: unknown, message = "tail result mismatch"): void {
   const { output: actualOutput, ...actualRest } = actual as { output: Record<string, unknown> };
   const { output: expectedOutput, ...expectedRest } = expected as { output: Record<string, unknown> };
   assert.ok(actualOutput, message);

@@ -65,6 +65,12 @@ for (const [code, expected] of [
   ["ECONNRESET", "connection_reset"], ["ETIMEDOUT", "timeout"],
   ["UND_ERR_CONNECT_TIMEOUT", "timeout"], ["UND_ERR_HEADERS_TIMEOUT", "timeout"],
   ["UND_ERR_BODY_TIMEOUT", "timeout"],
+  ["UND_ERR_SOCKET", "connection_closed"], ["UND_ERR_CLOSED", "connection_closed"], ["ECONNABORTED", "connection_closed"],
+  ["EHOSTUNREACH", "network_unreachable"], ["ENETUNREACH", "network_unreachable"],
+  ["EHOSTDOWN", "network_unreachable"], ["ENETDOWN", "network_unreachable"],
+  ["CERT_HAS_EXPIRED", "tls"], ["UNABLE_TO_VERIFY_LEAF_SIGNATURE", "tls"], ["DEPTH_ZERO_SELF_SIGNED_CERT", "tls"],
+  ["SELF_SIGNED_CERT_IN_CHAIN", "tls"], ["UNABLE_TO_GET_ISSUER_CERT_LOCALLY", "tls"],
+  ["ERR_TLS_CERT_ALTNAME_INVALID", "tls"],
 ]) {
   it(`nested fetch ${code} yields only the fixed label and key, without retries`, async () => {
     const h = harness();
@@ -88,6 +94,23 @@ it("uses the first recognized code and does not infer from text or aggregate col
   assert.equal(h.feed[0]!.payload.text, label("publish_request", "connection_refused"));
   await h.fail(new AggregateError([{ code: "ENOTFOUND" }], "ECONNRESET"));
   assert.equal(h.feed[1]!.payload.text, label("publish_request", "unknown"));
+});
+
+it("a new root code wins over a deeper older code", async () => {
+  const h = harness();
+  await h.fail({ code: "UND_ERR_SOCKET", cause: { code: "ENOTFOUND" } });
+  assert.equal(h.feed[0]!.payload.text, label("publish_request", "connection_closed"));
+});
+
+it("keeps EPIPE and CERT_NOT_YET_VALID unknown in every phase", async () => {
+  const h = harness();
+  await h.fail({ code: "EPIPE" }, true);
+  await h.fail({ code: "EPIPE" });
+  await h.fail({ cause: { code: "CERT_NOT_YET_VALID" } });
+  assert.deepEqual(h.feed.map(e => e.payload.text),
+    [label("packing", "unknown"), label("publish_request", "unknown")]);
+  assert.deepEqual([...h.flight.reportedPublishOutcomes], ["error:packing:unknown", "error:publish_request:unknown"]);
+  assert.equal(h.logs.length, 3);
 });
 
 it("bounds traversal at four nodes including root, detects cycles, and accepts the fourth code", async () => {

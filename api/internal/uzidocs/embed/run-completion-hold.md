@@ -111,21 +111,53 @@ without progress, or an announcement of publication.
 
 ## Planning work and pending acceptance
 
-Put owner or deployment acceptance in a separate final milestone when it
-must happen outside the worker. Implementation, documentation, tests,
-mandatory gates, security checks and review remain worker work. Approval
-or auto-approval of that plan does not waive them. This separate-final-milestone
-convention is the structural-run rule; a dormant semantic run instead uses
-`maintainer` criteria (see [Maintainer outstanding proof on semantic
+A new, unfrozen plan keeps two kinds of item out of its milestones:
+
+- **Landing obligations**: checks that inherently need the PR/merge
+  environment (for example exact-head PR CI) or an already-authorized
+  issue-specific landing fallback. The plan lists them in a "Landing
+  obligations" section.
+- **Owner acceptance**: live, hosted or human-judgment acceptance the worker
+  cannot perform. The plan lists them in an "Owner acceptance" section naming
+  the remaining verification, why the worker cannot perform it, the
+  responsible actor and actionable steps.
+
+Neither is a milestone, so the run no longer parks at completion for them.
+When the plan has Owner acceptance items, the lead declares `non_closing`
+with a reason naming them as pending and not verified, and lists each as a
+`deferred` `pr_summary` scope note. The worker always renders that reason as
+"> **Issue remains open.** <reason>" in its completion block. Scope notes
+can be replaced by the generated summary or dropped by the 6 KiB region
+fallback; at most 8 of the lead's notes of 200 bytes each are published (5
+when the generated summary replaces them), so the reason is the dependable
+record.
+
+Implementation, documentation, tests, mandatory gates, security checks and
+review remain worker work and never move to either section, even if the
+lander repeats a check or the worker lacks time, permissions or tooling.
+Approval or auto-approval of the plan does not waive them. Unfinished worker
+work, such as a failed gate, still parks at completion.
+
+The lead resolves classification from the issue, the repository and prior
+owner instructions. If consequential doubt remains and `ask_user` reaches a
+human (the plan prompt carries no autopilot note), it asks before submitting
+the plan. On an auto-approved run `ask_user` reaches no human, even when the
+plan is force-gated, so a consequentially doubtful item stays a required
+milestone with the uncertainty recorded in the plan; auto-approval, a checker
+approval and the auto-answer supply no waiver. A dormant semantic run instead
+uses `maintainer` criteria (see [Maintainer outstanding proof on semantic
 runs](#maintainer-outstanding-proof-on-semantic-runs-dormant)).
 
-Formal owner partial is the scope-reduction authority: it records the exact
-kept and deferred milestone IDs and a reason. This applies to ordinary
-coding work too, not just acceptance milestones. An ordinary answer or a
-non-closing declaration grants no waiver.
+These sections apply to new, unfrozen plans. Plan approval, ordinary answers
+and `non_closing` never change frozen scope. For a frozen milestone that
+remains unmet (for example on a plan approved earlier), formal owner partial
+is the scope-reduction authority: it records the exact kept and deferred
+milestone IDs and a reason. This applies to ordinary coding work too, not
+just acceptance milestones. An ordinary answer or a non-closing declaration
+grants no waiver.
 
-On a partial delivery, the pending checklist keeps each deferred entry
-unchecked and includes its ID, frozen title and reason, explicitly marked
+On a partial delivery of frozen milestones, the pending checklist keeps each
+deferred entry unchecked and includes its ID, frozen title and reason, explicitly marked
 **not delivered** or **not verified** before owner closure. Checking a box
 grants no completion authority; a refresh restores it unchecked. Put
 actionable next steps in the ordinary summary outside the worker-owned

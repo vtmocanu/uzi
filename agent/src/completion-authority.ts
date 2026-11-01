@@ -988,7 +988,7 @@ export class AuthorityStore {
     const harness: LeaseHarness = options.executor !== undefined ? "codex" : "claude";
     if (old) {
       if (blocksNewOperation(old.pending)) throw new AuthorityRefusal("source has an unresolved pending footprint");
-      if (old.state === "retiring") throw new AuthorityRefusal("source is being retired");
+      if (old.state === "retiring") throw new AuthorityRefusal("source is being retired", "retiring");
       if (old.state === "active" && old.owner.worker !== this.#init.incarnation) {
         throw new AuthorityRefusal("source is active under another worker incarnation");
       }
@@ -1070,7 +1070,7 @@ export class AuthorityStore {
     if (held.harness !== wanted) throw new AuthorityRefusal(`${to} requires harness ${wanted}`);
     const source = await this.#bindSource(tx, held, body, input.source);
     const digest = sourceCoreDigest(source);
-    if (!this.#verifies(digest, source.certificate)) throw new AuthorityRefusal("completion source certificate does not verify");
+    if (!this.#verifies(digest, source.certificate)) throw new AuthorityRefusal("completion source certificate does not verify", "certificate_invalid");
     const publication = normalizePublication(JSON.parse(JSON.stringify({
       harness: wanted, sourceCoreDigest: digest,
       cohort: { runId: source.context.runId, generation: source.context.generation, captureIds: input.captureIds },
@@ -1127,7 +1127,7 @@ export class AuthorityStore {
     const old = await this.#load(dir, key);
     if (old) {
       if (blocksNewOperation(old.pending)) throw new AuthorityRefusal("source has an unresolved pending footprint");
-      if (old.state === "retiring") throw new AuthorityRefusal("source is being retired");
+      if (old.state === "retiring") throw new AuthorityRefusal("source is being retired", "retiring");
       if (old.state === "active" && old.owner.worker !== this.#init.incarnation) {
         throw new AuthorityRefusal("source is active under another worker incarnation");
       }

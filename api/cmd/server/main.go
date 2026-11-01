@@ -608,6 +608,7 @@ func run() error {
 	// completion errors rather than completing non-atomically), so this wiring is what lets an
 	// interlocked run complete at all.
 	wsvc.SetTxBeginner(pool)
+	wsvc.StartPrerequisiteClosures(ctx)
 	// Checkpoint-ref retention (PRD #1810): the per-run SESSION advisory lock that serialises
 	// every forge write against a retained checkpoint ref pins its connection from this pool. A
 	// nil pool is fail-safe (every retained ref is kept, nothing is deleted).
@@ -938,6 +939,14 @@ func run() error {
 		sweeper.Pass{
 			Name: "held_publication",
 			Run:  wsvc.SweepHeldPublications,
+		},
+		// Prerequisite closure always advances existing rows, regardless of admission knobs.
+		// Its extra share before run liveness is at most a 10s pass plus a 5s in-flight
+		// durable outcome tail (15s), independent of WorkerHeartbeatStale and RunTimeout.
+		// Prior pass costs and the tick cadence add to this; this is no pin-latency promise.
+		sweeper.Pass{
+			Name: "prerequisite_closure",
+			Run:  wsvc.SweepPrerequisiteClosures,
 		},
 		// Stale fetch reservations (PRD #1906 M3): a reservation older than
 		// fetchctl.StaleReservationAge belongs to a fetch whose fetcher crashed or lost its
@@ -1636,14 +1645,19 @@ func run() error {
 	// the storage work they are blocked in (pool acquire, lock wait, queries), and waits 2 s more
 	// for them to return. So the worst case is 17 s, not the 60 s storage deadline: a generation
 	// holding a pooled connection does not make the deferred pool.Close wait that long. Budget: the
-	// HTTP drain above is up to 10 s, so 10 s + 17 s stays inside the default 30 s Kubernetes
+	// HTTP drain above is up to 10 s; the prerequisite drain runs concurrently for up to 5 s,
+	// so 10 s + max(17 s, 5 s) stays inside the default 30 s Kubernetes
 	// termination grace (the chart sets none). A generation that does not return even then (stuck
 	// outside a context-aware call) is left behind, and is not lost silently: SubmitJobResult
 	// committed a generation_pending refusal row for each generated file with the result, and only
 	// storing the file (or recording its failure) removes it, so an abandoned one (this bound, a
 	// SIGKILL, a crash) stays visible as generation_pending.
-	if !wsvc.DrainGeneratedOutputs() {
+	generatedDrained, prerequisiteErr := drainShutdownWork(wsvc.DrainPrerequisiteClosures, wsvc.DrainGeneratedOutputs)
+	if !generatedDrained {
 		slog.Warn("shutdown: generated job outputs still in flight at the drain deadline")
+	}
+	if prerequisiteErr != nil {
+		slog.Warn("shutdown: prerequisite closures failed to drain", "error", prerequisiteErr)
 	}
 	stop() // cancel ctx so the poller + sweeper + reconciler Run return (covers the server-error path too)
 	bgWG.Wait()
@@ -1652,6 +1666,22 @@ func run() error {
 	// race a closing pool.
 	lifecycle.Wait()
 	return runErr
+}
+
+const prerequisiteShutdownBudget = 5 * time.Second
+
+// drainShutdownWork joins the prerequisite drain alongside the existing generated-output
+// drain. Call after HTTP shutdown and before pool.Close. Each callback owns its bounded
+// drain; an error in one does not prevent joining the other.
+func drainShutdownWork(prerequisiteDrain func(context.Context) error, generatedDrain func() bool) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), prerequisiteShutdownBudget)
+	defer cancel()
+	prerequisiteDone := make(chan error, 1)
+	go func() {
+		prerequisiteDone <- prerequisiteDrain(ctx)
+	}()
+	generatedDrained := generatedDrain()
+	return generatedDrained, <-prerequisiteDone
 }
 
 // gateSubmitter adapts *workersvc.Service to slacksvc.PlanGateSubmitter — the

@@ -25,6 +25,9 @@ var ErrRefAdvertisementTooLarge = errors.New("pushbroker: ref advertisement exce
 type refAdvertisementTransport struct{ original http.RoundTripper }
 
 func (t refAdvertisementTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method != http.MethodGet {
+		return t.original.RoundTrip(req)
+	}
 	res, err := t.original.RoundTrip(req)
 	if err != nil || res == nil || res.Body == nil {
 		return res, err
@@ -69,7 +72,7 @@ func (r *refAdvertisementReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func boundRefStdout(sess transport.UploadPackSession) error {
+func boundRefStdout(sess any) error {
 	v := reflect.ValueOf(sess)
 	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
 		return errors.New("pushbroker: ref discovery requires stdout reader seam")
@@ -105,6 +108,7 @@ func boundedRefTips(ctx context.Context, url string, auth transport.AuthMethod, 
 		// NewEndpoint(URL) cannot set TLS/proxy options requiring go-git's
 		// concrete *http.Transport assertion. Retain the broker pool and policy.
 		copied := *brokerHTTPClient
+		copied.CheckRedirect = func(req *http.Request, via []*http.Request) error { return checkRedirect(ctx, req, via) }
 		copied.Transport = refAdvertisementTransport{original: brokerHTTPClient.Transport}
 		c = githttp.NewClient(&copied)
 	} else {

@@ -2555,6 +2555,23 @@ describe("lead guidance routing", () => {
       assert.ok(!codexChild.includes(policy));
     }
   });
+
+  it("issue #3721: the builtin lead keeps owner-only work out of the milestones and never asks on autopilot", () => {
+    const flat = readFileSync(new URL("../../api/internal/agenttmpl/builtins/lead.md", import.meta.url), "utf8").replace(/\s+/g, " ");
+    for (const phrase of [
+      "\"Landing obligations\" plan section, not a milestone", "\"Owner acceptance\" plan section, not a milestone",
+      "already-authorized issue-specific landing fallback", "lacks time, permissions or tooling", "In a new, unfrozen plan",
+      "declare `non_closing` with a reason naming them as pending and not verified",
+      "with such items on an issue run, declare `non_closing`",
+      "On an auto-approved run `ask_user` reaches no human: keep each consequentially doubtful item as a required milestone",
+      "Never silently omit ambiguous work from the milestones", "formal owner partial decision",
+      "when `ask_user` reaches a human (no autopilot note), settle consequential doubt with it",
+      "A frozen milestone that remains unmet goes to the formal owner completion decision",
+    ]) assert.ok(flat.includes(phrase), phrase);
+    for (const gone of ["informative milestone", "also on an auto-approved run", "Milestones hold only work", "on a gated run settle"]) {
+      assert.ok(!flat.includes(gone), gone);
+    }
+  });
 });
 
 describe("issue #2593: lead gate-sequencing append", () => {
@@ -2645,11 +2662,30 @@ describe("M2 completion delivery guidance", () => {
       const prompt = buildLeadSystemPrompt("Custom lead body", { harness }).append;
       for (const phrase of [
         "closing directives must never go in commit messages", "worker controls issue closing via the PR body",
-        "separate, final informative milestone", "remaining verification", "responsible actor", "actionable steps",
+        "\"Landing obligations\" plan section, not a milestone", "\"Owner acceptance\" plan section, not a milestone",
+        "exact-head PR CI", "declare `non_closing` with a reason naming them as pending and not verified",
+        "On issue runs, when the plan has Owner acceptance items, declare `non_closing`",
+        "list each as a `deferred` `pr_summary` scope note", "use ask_user before the final submit_plan",
+        "and ask_user reaches a human (the plan prompt carries no autopilot note)",
+        "On an auto-approved run ask_user reaches no human: keep each consequentially doubtful item as a required milestone",
+        "record the uncertainty in the plan", "Auto-approval, a checker approval and the auto-answer supply no waiver",
+        "the formal owner completion decision applies",
+        "never move to either section", "remaining verification", "responsible actor", "actionable steps",
+        "already-authorized", "issue-specific landing fallback", "even if the lander repeats a check",
+        "lacks time, permissions or tooling", "These sections apply to new, unfrozen plans",
+        "never a question in plan prose", "Never silently omit ambiguous work from the milestones",
+        "a subagent reports classification doubt to the lead",
         "mandatory gates, security and review remain worker obligations", "Mixed or ambiguous milestones block completion",
         "Environment limits, permissions and automatic approval do not waive", "formal owner partial decision",
         "exact kept and deferred milestone IDs", "Never describe unperformed checks as accepted or done",
       ]) assert.ok(prompt.includes(phrase), phrase);
+      // Issue #3721: owner-only acceptance is a plan section, never a final informative milestone.
+      assert.ok(!prompt.includes("informative milestone"), "the informative-milestone rule is gone");
+      assert.ok(!prompt.includes("Pending human/live acceptance requires"), "pending acceptance no longer asks at completion");
+      // Owner decision 2026-10-31: on autopilot ask_user reaches no human (AUTOPILOT_PLAN_NOTE), so the
+      // shared guidance must never tell an auto-approved lead to ask.
+      assert.ok(!prompt.includes("also on an auto-approved run"), "autopilot is never told to ask_user");
+      assert.ok(AUTOPILOT_PLAN_NOTE.includes("will not reach a human"), "the autopilot note this rule defers to");
     });
   }
 });

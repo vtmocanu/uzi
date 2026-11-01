@@ -219,6 +219,14 @@ func (c *HTTPClient) RunInputs(ctx context.Context, id string) ([]apitypes.Steer
 	return env.Inputs, nil
 }
 
+func (c *HTTPClient) RunLeadConfigHistory(ctx context.Context, id string) (apitypes.LeadConfigHistoryDTO, error) {
+	var out apitypes.LeadConfigHistoryDTO
+	if err := c.get(ctx, "/api/runs/"+url.PathEscape(id)+"/lead-config", &out); err != nil {
+		return apitypes.LeadConfigHistoryDTO{}, err
+	}
+	return out, nil
+}
+
 func (c *HTTPClient) SetRunPriority(ctx context.Context, id string, expedite bool) (apitypes.RunDTO, error) {
 	body := struct {
 		Expedite bool `json:"expedite"`

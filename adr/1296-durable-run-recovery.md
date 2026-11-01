@@ -42,6 +42,26 @@ local-source and available-archive disposal is deferred to #2823 and #1373. #250
 partial and nonclosing. ADR-2506 records polling bounds, inherited unbounded response
 decoding, migration validation/locking risk and rollback's refusal to lose audit evidence.
 
+## Amendment 2026-10-29 — C1b prerequisite pin lifecycle (#3591)
+
+[ADR-3591](3591-prerequisite-closure.md) records the API-only pin lifecycle.
+Fresh default-tip D must positively cover each declared P (ancestor/equal);
+the invocation freezes D and forge binding before one create-only send.
+Unknown creation remains listing-only indefinitely; S7 cleans a pinned ref
+after confirmed capture expiry/discard with expected-tip CAS and confirmed
+absence. Cleanup exhaustion retains the live blocker, with no reset authority.
+
+D5's thin archive FINAL refusal and local-source retention remain in force:
+C1b has no feature advertisement, agent change or release predicate. T1–T5
+is a conditional trusted-worker proof, not server parsing/verification of Git
+bundle bytes. C2 owns the release amendment and FINAL-time revalidation.
+The existing “Later user deletion or rewriting is outside the proof” residual
+also applies to external prerequisite-pin deletion/history rewrite; pins can
+retain pre-purge history. This amendment authorizes no purge, manual pin delete,
+database override or clearing of unresolved evidence. Local native restore and
+omitted-prerequisite negatives are recorded in ADR-3591; exact-head hosted
+acceptance and timing remain pending.
+
 ## Context
 
 A run can commit real, useful work and still fail before it publishes: a workflow or

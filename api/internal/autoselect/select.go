@@ -406,14 +406,15 @@ func tieLess(a, b Candidate) bool {
 // NULL-reset token win every tie — the exact inversion of the rule.
 func resetKey(c Candidate) (time.Time, bool) {
 	// Callers reach here only for MEASURED candidates, where Classify has already
-	// established both pcts are non-nil. The guard is kept anyway because resetKey is
-	// one refactor away from being called on an unmeasured row, and the failure mode
-	// there is a nil dereference in the claim path.
-	if c.FiveHourPct == nil || c.SevenDayPct == nil {
+	// established the 7-day pct is non-nil. The guard is kept anyway because resetKey
+	// is one refactor away from being called on an unmeasured row, and the failure
+	// mode there is a nil dereference in the claim path. A nil 5-hour pct (the
+	// account has no 5-hour window) makes the 7-day window the binding one.
+	if c.SevenDayPct == nil {
 		return time.Time{}, false
 	}
 	r := c.SevenResetsAt
-	if *c.FiveHourPct >= *c.SevenDayPct {
+	if c.FiveHourPct != nil && *c.FiveHourPct >= *c.SevenDayPct {
 		r = c.FiveResetsAt
 	}
 	if r == nil {

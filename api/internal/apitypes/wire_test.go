@@ -1389,8 +1389,10 @@ func TestRecoveryWorkerRPCTags(t *testing.T) {
 	sz := int64(1)
 	now := time.Unix(0, 0)
 	assertTags(t, "RecoveryCaptureStatusResponse(full)",
-		RecoveryCaptureStatusResponse{ByteSize: &sz, Checksum: "x", Reason: "r", ExpiresAt: &now},
-		"capture_id", "state", "manifest_bound", "byte_size", "checksum", "reason", "expires_at")
+		RecoveryCaptureStatusResponse{ByteSize: &sz, Checksum: "x", Reason: "r", ExpiresAt: &now, PrerequisiteClosure: &RecoveryPrerequisiteClosureStatus{State: "pending"}},
+		"capture_id", "state", "manifest_bound", "byte_size", "checksum", "reason", "expires_at", "prerequisite_closure")
+	assertTags(t, "RecoveryPrerequisiteClosureStatus", RecoveryPrerequisiteClosureStatus{}, "state")
+	assertTags(t, "RecoveryPrerequisiteClosureStatus(full)", RecoveryPrerequisiteClosureStatus{State: "refused", Reason: "pin_refused", PrerequisiteShas: []string{"sha"}, Checksum: "sum"}, "state", "reason", "prerequisite_shas", "checksum")
 	assertTags(t, "RecoveryReleaseResponse", RecoveryReleaseResponse{},
 		"run_id", "released", "holds_released")
 	// PRD #1349 M1: retained + reason are omitempty, present only on the v1/ambiguous retain path.

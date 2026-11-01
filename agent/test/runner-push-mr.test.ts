@@ -550,7 +550,7 @@ describe("RunRunner — worker-performed push + MR", () => {
     const claim = gitlabClaim(24);
     await runner(exec, gitlab).execute(claim);
     const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed");
-    assert.equal(failed, undefined, failed?.body.failure_reason);
+    assert.equal(failed, undefined, failed?.body.failure_reason ?? "run failed without a failure_reason");
     const posts = calls.filter((c) => c.method === "POST");
     assert.equal(posts.length, 1, "one MR opened");
     const description = String((JSON.parse(posts[0]!.body ?? "{}") as { description?: unknown }).description);

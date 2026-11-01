@@ -218,9 +218,8 @@ func TestMarkSevenDayExhaustedLiveDB(t *testing.T) {
 }
 
 // TestMarkFiveHourExhaustedNullPctLiveDB covers D4's one hazardous shape: a gauge row
-// whose five_hour_pct is NULL. The sole PRODUCTION writer (the poller) cannot make
-// that row — anthropic.Window.Pct is a non-pointer int — but e2e/run-e2e.sh INSERTs
-// rows directly and can, so this is the shape that turns an Unmeasured row Measured.
+// whose five_hour_pct is NULL. The poller writes that shape for a plan with no
+// 5-hour window (a 7-day-only reading), and e2e/run-e2e.sh INSERTs it directly.
 // The write must land 100 (non-null) into the previously-NULL column while still
 // leaving every other column untouched, exactly as the fully-populated case does.
 func TestMarkFiveHourExhaustedNullPctLiveDB(t *testing.T) {
@@ -231,7 +230,7 @@ func TestMarkFiveHourExhaustedNullPctLiveDB(t *testing.T) {
 	if _, err := q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID:     sec,
 		UserID:           gaugeOwner(ctx, t, pool, sec),
-		FiveHourPct:      pgtype.Int2{}, // NULL — the Unmeasured five-hour window
+		FiveHourPct:      pgtype.Int2{}, // NULL — no five-hour window
 		SevenDayPct:      pgtype.Int2{Int16: 30, Valid: true},
 		SevenDayResetsAt: pgtype.Timestamptz{Time: base.Add(72 * time.Hour), Valid: true},
 		Source:           pgtype.Text{String: "usage_endpoint", Valid: true},
