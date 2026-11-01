@@ -613,6 +613,51 @@ describe("3282 Claude lead-request refresh precedence", () => {
 });
 
 describe("M3 finite allowance wall redrive", () => {
+  it("M3 predispatch refused wall preserves allowance one for genuine work", async () => {
+    const controller = new AbortController();
+    let mode: "wall" | null = null;
+    let boundaries = 0, dispatches = 0, walls = 0, parks = 0;
+    const acks: number[] = [];
+    const { ctx } = makeCtx({
+      planApproved: true, approvedPlan: "Approved", sessionId: "sess-1", kind: "issue",
+      config: { max_iterations: 1, iteration_park_version: 1 }, signal: controller.signal,
+      reportIteration: async n => { acks.push(n); return { completionAttempts: 0 }; },
+      pullSafetySteer: () => {
+        if (++boundaries === 1) { mode = "wall"; controller.abort(new PauseNowSignal()); }
+        return undefined;
+      },
+      pauseModeRequested: () => mode,
+      parkForWall: async () => {
+        walls++;
+        assert.equal(dispatches, 0, "the dropped turn never reached the provider");
+        return "refused";
+      },
+      clearWallMode: () => { mode = null; },
+      takeWallParkRefresh: () => ({ completionAttempts: 0, totalSeconds: 60, usedSeconds: 0 }),
+      recordCompletionAttempt: async () => { assert.fail("no completion attempt"); },
+      parkForIteration: async at => {
+        parks++;
+        assert.equal(dispatches, 1, "genuine work completed before parking");
+        assert.deepEqual(at, { iterationCount: 1, maxIterations: 1 });
+        return "parked";
+      },
+    });
+    const queryFn: SdkQueryFn = params => (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      assert.equal(++dispatches, 1, "no extra dispatch");
+      yield { type: "assistant", session_id: "sess-1", message: { content: [
+        { type: "tool_use", id: "read-before-dispatch", name: "Read", input: { file_path: "a.txt" } },
+      ] } } as unknown as SDKMessage;
+      yield resultSuccess();
+    })();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(walls, 1); assert.equal(parks, 1); assert.equal(dispatches, 1);
+    assert.deepEqual(acks, [1, 1]);
+    assert.deepEqual(result.iterationParked, { outcome: "parked" });
+    assert.equal(result.prSummary, undefined);
+    assert.equal(result.completionHeld, undefined);
+  });
+
   for (const outcome of ["parked", "refused"] as const) it(`M3 interrupted last iteration wall ${outcome} does not count uncompleted work`, async () => {
     const runSignal = new AbortController();
     let mode: "wall" | null = null, calls = 0, walls = 0, parks = 0;

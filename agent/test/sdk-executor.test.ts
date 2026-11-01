@@ -9159,6 +9159,26 @@ describe("SdkExecutor no-progress stall owner decision (issue #3139)", () => {
     assert.match(r.prompts[1]!, /Use the existing endpoint/);
   });
 
+  it("M3 checkpoint clarification preserves allowance one through answered continuation", async () => {
+    const acks: number[] = [], parks: unknown[] = [];
+    let answers = 0;
+    const r = await drive(c => c === 1
+      ? [...m3Checkpoint(c).slice(0, -1), ...m3Question(c)]
+      : m3Work(c), {
+      config: { max_iterations: 1, iteration_park_version: 1 },
+      askUser: async () => { answers++; return { kind: "answer", answers: ["Use the existing endpoint"] }; },
+      reportIteration: async n => { acks.push(n); return { completionAttempts: 0 }; },
+      parkForIteration: async at => { parks.push(at); return "parked"; },
+    });
+    m3AssertPark(r, "parked");
+    assert.equal(answers, 1);
+    assert.equal(r.calls(), 2, "checkpoint/question and genuine answered work only");
+    assert.deepEqual(acks, [1, 1], "the answer continues the uncompleted iteration");
+    assert.deepEqual(parks, [{ iterationCount: 1, maxIterations: 1 }]);
+    assert.equal(r.fixture.checkpoints.filter(c => c.reap).length, 1);
+    assert.match(r.prompts[1]!, /Use the existing endpoint/);
+  });
+
   it("M3 park Resume new invocation genuine work then repeat park needs another Resume", async () => {
     const io = await import("node:fs/promises");
     const root = await io.mkdtemp(path.join(process.cwd(), "../.uzi/scratch/m3-resume-"));

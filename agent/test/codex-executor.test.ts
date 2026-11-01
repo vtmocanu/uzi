@@ -4167,6 +4167,49 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
   }
 
 
+  it("M3 predispatch Codex refused wall preserves allowance one for genuine work", async () => {
+    const controller = new AbortController();
+    const rig = makeRig({ responder: epochResponder("th-1", "tn-work", (t, th, tn) => {
+      t.push({ kind: "activity", method: "item/started", params: {
+        threadId: th, item: { type: "commandExecution" },
+      } }).push(agentMessage("genuine predispatch redrive work", th)).push(turnCompleted("completed", th, tn));
+    }) });
+    let boundaries = 0, parks = 0, walls = 0;
+    let mode: "wall" | null = null;
+    const acks: number[] = [];
+    const { ctx } = wallCtx({
+      signal: controller.signal, kind: "issue", completionInterlock: true,
+      config: { max_iterations: 1, iteration_park_version: 1 },
+      reportIteration: async n => { acks.push(n); return { completionAttempts: 0 }; },
+      pullSafetySteer: () => {
+        if (++boundaries === 1) { mode = "wall"; controller.abort(new PauseNowSignal()); }
+        return undefined;
+      },
+      pauseModeRequested: () => mode,
+      parkForWall: async () => {
+        walls++;
+        assert.equal(rig.transport.turnStartCount, 0, "dropped before provider dispatch");
+        return "refused";
+      },
+      clearWallMode: () => { mode = null; },
+      takeWallParkRefresh: () => ({ completionAttempts: 0, totalSeconds: 60, usedSeconds: 0 }),
+      recordCompletionAttempt: async () => { assert.fail("no completion attempt"); },
+      parkForIteration: async at => {
+        parks++;
+        assert.equal(rig.transport.turnStartCount, 1, "genuine work completed before parking");
+        assert.deepEqual(at, { iterationCount: 1, maxIterations: 1 });
+        return "parked";
+      },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "predispatch refused wall");
+    assert.equal(walls, 1); assert.equal(parks, 1);
+    assert.equal(rig.transport.turnStartCount, 1, "no extra dispatch");
+    assert.deepEqual(acks, [1], "redrive remains in the current iteration");
+    assert.deepEqual(result.iterationParked, { outcome: "parked" });
+    assert.equal(result.prSummary, undefined);
+    assert.equal(result.completionHeld, undefined);
+  });
+
   for (const outcome of ["parked", "refused"] as const) it(`M3 Codex interrupted last iteration wall ${outcome} preserves completed count`, async () => {
     const controller = new AbortController();
     const rig = makeRig({ responder: c => {
@@ -26282,6 +26325,61 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
       assert.equal(r.fixture.checkpoints.filter(c => c.reap).length, lift ? 3 : 2);
     });
   }
+
+  it("M3 checkpoint clarification preserves allowance one through resumed answered work", async () => {
+    let exec!: CodexExecutor;
+    let asks = 0, parks = 0;
+    const acks: number[] = [], sinks: string[] = [];
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-question", (t, th, tn) => {
+        t.push(toolCall(801, "checkpoint", {}, th, tn, "checkpoint-question"))
+          .push(toolCall(901, "ask_user", { questions: [{ question: "Which endpoint?" }] }, th, tn, "question-checkpoint"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-work", (t, th, tn) => {
+        assert.equal(rig.sessionOps.adopt, 2, "recreated provider adopted the saved session");
+        assert.ok(rig.epochs[1]!.transport.requests.some(r => r.method === "thread/resume" && rec(r.params).threadId === "th-1"));
+        t.push({ kind: "activity", method: "item/started", params: {
+          threadId: th, item: { type: "commandExecution" },
+        } }).push(agentMessage("genuine answered work", th)).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true,
+      config: { max_iterations: 1, iteration_park_version: 1 },
+      reportIteration: async n => { acks.push(n); return { completionAttempts: 0 }; },
+      checkpoint: async opts => {
+        assert.equal(rig.sessionOps.persist, 1, "session saved before checkpoint capture");
+        sinks.push(opts.sink!);
+        await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+      },
+      askUser: async () => {
+        asks++;
+        assert.ok(rig.epochs[0]!.reaped() > 0, "checkpoint reaped the first provider before asking");
+        assert.equal(rig.providerLaunches(), 1, "answer precedes recreation");
+        return { kind: "answer", answers: ["Use the existing endpoint"] };
+      },
+      recordCompletionAttempt: async () => { assert.fail("no completion attempt"); },
+      parkForIteration: async at => {
+        parks++;
+        assert.deepEqual(rig.epochs.map(e => e.transport.turnStartCount), [1, 1]);
+        assert.ok(rig.sessionOps.persist >= 2, "session saved before iteration capture");
+        assert.deepEqual(at, { iterationCount: 1, maxIterations: 1 });
+        return "parked";
+      },
+    });
+    exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const result = await withTimeout(exec.run(ctx), 5000, "checkpoint clarification allowance one");
+    assert.equal(asks, 1); assert.equal(parks, 1);
+    assert.equal(rig.providerLaunches(), 2);
+    assert.deepEqual(acks, [1, 1], "recreated answer retains iteration identity");
+    assert.deepEqual(sinks, ["milestone_checkpoint"]);
+    const resumedTurn = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
+    assert.match(String((rec(resumedTurn.params).input as { text: string }[])[0]!.text), /Use the existing endpoint/);
+    assert.deepEqual(result.iterationParked, { outcome: "parked" });
+    assert.equal(result.prSummary, undefined);
+    assert.equal(result.completionHeld, undefined);
+  });
 
   it("M3 clarification keeps iteration identity until genuine next work turn", async () => {
     const acks: number[] = [], parks: unknown[] = [];
