@@ -172,11 +172,98 @@ jobs:
         run: go mod download
       - name: Fetch origin/main for the ratchet
         run: git fetch --quiet origin +refs/heads/main:refs/remotes/origin/main
+      - name: Inspect memory and add owned swap headroom
+        id: swap_headroom
+        run: |
+          set -euo pipefail
+          free -b
+          swapon --show --bytes
+          nproc
+          # Keep existing swap. Require 8 GiB plus 2 GiB of free-disk margin.
+          swap_dir=
+          for candidate in /mnt /; do
+            if [ -d "$candidate" ]; then
+              df -h "$candidate"
+              available=$(df -B1 --output=avail "$candidate" | tail -n 1 | tr -d ' ')
+              if [ "$available" -ge 10737418240 ]; then
+                swap_dir=$candidate
+                break
+              fi
+            fi
+          done
+          if [ -z "$swap_dir" ]; then
+            echo 'Insufficient disk for 8 GiB swap plus 2 GiB margin' >&2
+            exit 1
+          fi
+          cgroup_path=$(awk -F: '$1 == "0" { print $3; exit }' /proc/self/cgroup)
+          cgroup_dir="/sys/fs/cgroup${cgroup_path%/}"
+          printf '%s\n' "$cgroup_dir" > "$RUNNER_TEMP/lint-api-cgroup-path"
+          for name in memory.max memory.swap.max memory.events; do
+            if [ -r "$cgroup_dir/$name" ]; then
+              echo "Before: $cgroup_dir/$name"
+              cat "$cgroup_dir/$name"
+            else
+              echo "Unavailable: $cgroup_dir/$name"
+            fi
+          done
+          # mktemp owns a fresh path; never truncate an existing swap file.
+          swap_file=$(sudo -n mktemp "${swap_dir%/}/lint-api-swap.XXXXXX")
+          printf 'file=%s\n' "$swap_file" >> "$GITHUB_OUTPUT"
+          sudo -n chmod 600 "$swap_file"
+          sudo -n fallocate -l 8G "$swap_file"
+          sudo -n mkswap "$swap_file"
+          sudo -n swapon "$swap_file"
+          swapon --show --bytes
+          free -b
       - name: lint + deadcode + vulncheck
         run: |
+          # Sample system swap use in KiB. Reap only this step's own monitor.
+          vmstat -S K -w 1 > "$RUNNER_TEMP/lint-api-vmstat.log" &
+          monitor=$!
+          trap 'kill "$monitor" 2>/dev/null || true; wait "$monitor" 2>/dev/null || true' EXIT
           task lint:api
           task deadcode:api
           task vulncheck:api
+      - name: Record memory and swap outcome
+        if: always()
+        env:
+          OWNED_SWAP_FILE: ${{ steps.swap_headroom.outputs.file }}
+        run: |
+          free -b || true
+          swapon --show --bytes || true
+          awk '/^Swap(Total|Free):/ { print }' /proc/meminfo || true
+          if [ -s "$RUNNER_TEMP/lint-api-vmstat.log" ]; then
+            awk '$1 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ {
+              if ($3 > peak) peak=$3; samples++
+            } END {
+              if (samples) printf "sampled_system_swap_peak_bytes=%.0f samples=%d interval_seconds=1\n", peak*1024, samples
+              else print "sampled_system_swap_peak_bytes=unavailable"
+            }' "$RUNNER_TEMP/lint-api-vmstat.log"
+            tail -n 5 "$RUNNER_TEMP/lint-api-vmstat.log"
+          else
+            echo 'sampled_system_swap_peak_bytes=unavailable'
+          fi
+          if [ -n "$OWNED_SWAP_FILE" ]; then
+            echo "Owned swap: $OWNED_SWAP_FILE"
+          fi
+          if [ -r "$RUNNER_TEMP/lint-api-cgroup-path" ]; then
+            cgroup_dir=$(cat "$RUNNER_TEMP/lint-api-cgroup-path")
+            for name in memory.events memory.swap.current memory.swap.peak; do
+              if [ -r "$cgroup_dir/$name" ]; then
+                echo "After: $cgroup_dir/$name"
+                cat "$cgroup_dir/$name"
+              else
+                echo "Unavailable: $cgroup_dir/$name"
+              fi
+            done
+          fi
+          if kernel_log=$(sudo -n dmesg --ctime 2>/dev/null); then
+            printf '%s\n' "$kernel_log" | grep -Ei 'oom|out of memory|killed process' || true
+          else
+            echo 'Kernel OOM log unavailable'
+          fi
+          # Leave swap active until this disposable VM is destroyed. swapoff
+          # could force other processes' swapped pages back into scarce RAM.
       - name: Save Go cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'
         uses: ./.github/actions/go-cache-save
