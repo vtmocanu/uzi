@@ -195,6 +195,138 @@ test("launch pending admission: old readable recovery cannot cover an unpersiste
   assert.equal(ranges.length, 2, "binding and denial controls hold before scanning");
 });
 
+test("launch pending admission: finding latched during clean scan must refuse incomplete persistence", async t => {
+  const f = await fixture();
+  const q1 = await f.enroll();
+  const clean = f.commit("clean selected source");
+  assert.equal((await f.fetch()).kind, "updated");
+  await git.recordRemediationScan(f.bare, BRANCH, f.source,
+    { trusted: true, tip: clean, flaggedOIDs: [] });
+  const old = await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source);
+  assert.equal(old?.ownedTip, clean);
+  assert.equal(old?.active, undefined, "clean scan closed the rewrite grant");
+  assert.deepEqual(old?.flaggedOIDs, [q1]);
+
+  const q2 = f.commit("finding in separate candidate");
+  const candidate = f.commit("candidate containing second finding", q2);
+  command(f.bare, "fetch", "--no-tags", f.clone.path, candidate);
+  command(f.clone.path, "update-ref", "refs/heads/" + BRANCH, clean);
+  assert.equal(await git.ancestry(f.bare, q2, candidate), "ancestor");
+  assert.equal(await git.ancestry(f.bare, q2, clean), "divergent");
+
+  const runner = freshRunner();
+  const flight = f.freshFlight();
+  assert.equal((runner as unknown as { authority?: unknown }).authority, undefined,
+    "exercise the supported launch path without an authority runtime");
+  const events: string[] = [];
+  let markEntered!: () => void;
+  let releaseScan!: () => void;
+  const entered = new Promise<void>(resolve => { markEntered = resolve; });
+  const released = new Promise<void>(resolve => { releaseScan = resolve; });
+  t.mock.method(git, "secretScanCheckpointRange", async (_bare: string, range: CheckpointRange) => {
+    assert.equal(range.tipSha, clean);
+    assert.equal(range.excludeSha, f.base);
+    events.push("scan entered");
+    markEntered();
+    await released;
+    events.push("scan returned clean");
+    return { trusted: true, findings: [] };
+  });
+  const writer = t.mock.method(git, "recordRemediationRestrictions", async () => {
+    events.push("negative write failed");
+    throw new Error("config write failed");
+  });
+  const launch = runner.requireLaunchAuthority(flight);
+  // Attach the expected rejection immediately, so a rejection cannot go unhandled.
+  const refused = assert.rejects(launch, /remediation pending/,
+    "launch must refuse facts latched during the scan until independently confirmed");
+  try {
+    await entered;
+    const finding: SecretFinding = { commit: q2, file: "withheld", startLine: 1, ruleId: "unit" };
+    // This callback runs outside launch's async context; the scanner only waits on release.
+    await assert.rejects(runner.persistRemediationRestrictions(flight, f.bare, BRANCH, candidate, [finding]),
+      /config write failed/);
+    assert.equal(writer.mock.callCount(), 1);
+    assert.deepEqual(flight.remediationRestrictions?.pending?.requiredOIDs, [q2]);
+    assert.equal(flight.remediationRestrictions?.pending?.requireDenial, false);
+    assert.equal(flight.remediationRestrictions?.pending?.bindingUncertain, false);
+    assert.deepEqual(await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source), old,
+      "OLD RR remains independently readable and does not contain Q2");
+    assert.deepEqual(events, ["scan entered", "negative write failed"]);
+    events.push("pending latched and OLD RR independently confirmed");
+    events.push("scan released");
+  } finally {
+    releaseScan();
+  }
+  await refused;
+  assert.deepEqual(events, ["scan entered", "negative write failed",
+    "pending latched and OLD RR independently confirmed", "scan released", "scan returned clean"]);
+  assert.deepEqual(flight.remediationRestrictions?.pending?.requiredOIDs, [q2]);
+  assert.deepEqual(await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source), old,
+    "launch refusal leaves OLD RR independently readable and the new finding pending");
+});
+
+for (const enrolled of [false, true]) {
+  test(`launch final admission: ${enrolled ? "selected source drift" : "first pending enrollment"} during authority wait refuses`, async t => {
+    const f = await fixture();
+    if (enrolled) {
+      await f.enroll();
+      const clean = f.commit("clean selected source");
+      assert.equal((await f.fetch()).kind, "updated");
+      await git.recordRemediationScan(f.bare, BRANCH, f.source,
+        { trusted: true, tip: clean, flaggedOIDs: [] });
+    } else {
+      assert.equal(await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source), undefined);
+    }
+    const scanner = t.mock.method(git, "secretScanCheckpointRange",
+      async () => ({ trusted: true, findings: [] }));
+    const runner = freshRunner();
+    const flight = f.freshFlight();
+    flight.executor = {};
+    let markEntered!: () => void;
+    let releaseWait!: () => void;
+    const entered = new Promise<void>(resolve => { markEntered = resolve; });
+    const released = new Promise<void>(resolve => { releaseWait = resolve; });
+    const events: string[] = [];
+    // Exercise the existing authority wait seam without adding a production test API.
+    (runner as unknown as { authority: unknown }).authority = {
+      withTransaction: (fn: () => Promise<unknown>) => fn(),
+      recordAdmissions: (_paths: Set<string>, fn: () => Promise<unknown>) => fn(),
+      assertLaunchable: async () => {
+        events.push("authority entered");
+        markEntered();
+        await released;
+        events.push("authority returned");
+      },
+    };
+    const launch = runner.requireLaunchAuthority(flight);
+    const refused = assert.rejects(launch,
+      enrolled ? /remediation source identity unavailable/ : /remediation pending/);
+    try {
+      await entered;
+      assert.equal(scanner.mock.callCount(), enrolled ? 1 : 0,
+        "truly unenrolled admission does not scan");
+      if (enrolled) {
+        flight.runnerClone = { ...f.clone, attemptId: "different selected attempt" };
+      } else {
+        const q = f.commit("first finding during launch wait");
+        t.mock.method(git, "recordRemediationRestrictions", async () => {
+          throw new Error("config write failed");
+        });
+        await assert.rejects(runner.persistRemediationRestrictions(flight, f.bare, BRANCH, q,
+          [{ commit: q, file: "withheld", startLine: 1, ruleId: "unit" }]), /config write failed/);
+        assert.deepEqual(flight.remediationRestrictions?.pending?.requiredOIDs, [q]);
+        assert.equal(await git.readRuntimeRemediationRecovery(f.bare, BRANCH, f.source), undefined);
+      }
+      events.push("late change confirmed");
+    } finally {
+      releaseWait();
+    }
+    await refused;
+    assert.deepEqual(events, ["authority entered", "late change confirmed", "authority returned"]);
+  });
+}
+
 test("fresh enrolled flight refuses flagged history even when a trusted scan hides it behind a floor", async t => {
   const f = await fixture();
   const flagged = await f.enroll();

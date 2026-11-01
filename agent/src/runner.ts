@@ -3536,22 +3536,31 @@ export class RunRunner {
    * flight's lease is the current lease for that clone and (Codex) carries this executor's incarnation.
    */
   private async requireLaunchAuthority(flight: RunFlight): Promise<void> {
+    let record: RemediationRecovery | undefined;
+    let recordBarePath: string | undefined;
+    const checkRemediation = (): void => {
+      const proof = record;
+      const selected = this.remediationSource(flight);
+      const pending = flight.remediationRestrictions?.pending;
+      // An older readable record cannot discharge facts retained after a failed write.
+      if (pending && (!proof || pending.bindingUncertain || pending.requireDenial || proof.blocked !== false ||
+          !selected.runId || !selected.clonePath || !selected.attemptId || !flight.barePath || !flight.branch ||
+          pending.runId !== selected.runId || pending.clonePath !== selected.clonePath ||
+          pending.attemptId !== selected.attemptId || pending.barePath !== flight.barePath ||
+          pending.branch !== flight.branch ||
+          !pending.requiredOIDs.every(q => proof.flaggedOIDs.includes(q))))
+        throw new Error("remediation pending persistence unconfirmed");
+      if (proof && (proof.runId !== selected.runId || proof.clonePath !== selected.clonePath ||
+          proof.clonePath !== flight.worktreePath || proof.attemptId !== selected.attemptId ||
+          proof.branch !== flight.branch || recordBarePath !== flight.barePath))
+        throw new Error("remediation source identity unavailable");
+    };
     // Restrictions apply even on workers without a source-use authority runtime.
     await this.inFlightAuthority(flight, async () => {
-      const record = await this.restoreRemediationRestrictions(flight);
+      recordBarePath = flight.barePath;
+      record = await this.restoreRemediationRestrictions(flight);
+      checkRemediation();
       if (!record) return;
-      const pending = flight.remediationRestrictions?.pending;
-      if (pending) {
-        const selected = this.remediationSource(flight);
-        // An older readable record cannot discharge facts retained after a failed write.
-        if (pending.bindingUncertain || pending.requireDenial || record.blocked !== false ||
-            !selected.runId || !selected.clonePath || !selected.attemptId || !flight.barePath || !flight.branch ||
-            pending.runId !== selected.runId || pending.clonePath !== selected.clonePath ||
-            pending.attemptId !== selected.attemptId || pending.barePath !== flight.barePath ||
-            pending.branch !== flight.branch ||
-            !pending.requiredOIDs.every(q => record.flaggedOIDs.includes(q)))
-          throw new Error("remediation pending persistence unconfirmed");
-      }
       const scan = await this.scanRemediationRange(flight, flight.barePath!, flight.branch!, record.ownedTip, true);
       if (scan.trusted && scan.findings.length)
         await this.persistRemediationRestrictions(flight, flight.barePath!, flight.branch!, scan.range.tipSha, scan.findings);
@@ -3565,9 +3574,11 @@ export class RunRunner {
         if (await this.git.ancestry(flight.barePath!, root, record.ownedTip) !== "divergent")
           throw new Error("remediation continuation history restricted");
     }, this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
-    if (!this.authority || !flight.runnerClone) return;
-    await this.authority.assertLaunchable(flight.runnerClone.path, flight.sourceLease, flight.executor.executorIncarnation,
-      this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+    if (this.authority && flight.runnerClone)
+      await this.authority.assertLaunchable(flight.runnerClone.path, flight.sourceLease, flight.executor.executorIncarnation,
+        this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+    // No await follows: callbacks during any admission wait must be covered by this read.
+    checkRemediation();
   }
 
   private rememberRemediationRestrictions(flight: RunFlight, journal: RecoveryJournalEntry): void {
