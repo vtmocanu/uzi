@@ -148,6 +148,13 @@ services:
       # Mirrors the FORGE_POLL_INTERVAL interpolation pattern below. Overlay-only;
       # production (config.go RUN_FORGE_UNREACHABLE_MAX_PARKS) is untouched.
       RUN_FORGE_UNREACHABLE_MAX_PARKS: ${E2E_FORGE_UNREACHABLE_MAX_PARKS:-6}
+      # Publication-park wait bound (issue #1324): how long a run may keep parking on a forge
+      # outage met while publishing before it becomes an owner hold
+      # (publication_hold_reason publication_retry_exhausted). The default 24h is the api's
+      # shipped one; phase 73 (forge-unreachable-park) shortens it to 20s by writing
+      # E2E_PROVIDER_PARK_MAX_DURATION into the env-file and recreating the api, then removes
+      # it. Overlay-only; production (config.go RUN_PROVIDER_PARK_MAX_DURATION) is untouched.
+      RUN_PROVIDER_PARK_MAX_DURATION: ${E2E_PROVIDER_PARK_MAX_DURATION:-24h}
       # MR review-watcher debounce (PRD #966 M6 / D6): the review-landed quiet period
       # the mr_rework detector waits after the newest review comment before queuing a
       # rework. Shrunk from the shipped 3m default so phase 71 can inject a note and

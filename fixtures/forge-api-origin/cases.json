@@ -1,0 +1,13 @@
+[
+  { "name": "github.com", "forge_type": "github", "web_url": "https://github.com/octo/repo", "api_origin": "https://api.github.com" },
+  { "name": "github.com with www and default port", "forge_type": "github", "web_url": "https://www.github.com:443/octo/repo", "api_origin": "https://api.github.com" },
+  { "name": "github.com mixed case host", "forge_type": "github", "web_url": "https://GitHub.COM/octo/repo", "api_origin": "https://api.github.com" },
+  { "name": "GHES host", "forge_type": "github", "web_url": "https://ghe.corp.example/octo/repo", "api_origin": "https://api.ghe.corp.example" },
+  { "name": "GHES host with port", "forge_type": "github", "web_url": "https://ghe.corp.example:8443/octo/repo", "api_origin": "https://api.ghe.corp.example:8443" },
+  { "name": "GHES host with www", "forge_type": "github", "web_url": "https://www.ghe.corp.example/octo/repo", "api_origin": "https://api.ghe.corp.example" },
+  { "name": "forgejo subpath", "forge_type": "forgejo", "web_url": "https://git.example.com/forge/owner/repo", "api_origin": "https://git.example.com" },
+  { "name": "forgejo port", "forge_type": "forgejo", "web_url": "https://git.example.com:3000/owner/repo", "api_origin": "https://git.example.com:3000" },
+  { "name": "gitlab port", "forge_type": "gitlab", "web_url": "https://gitlab.example.com:8443/group/sub/repo", "api_origin": "https://gitlab.example.com:8443" },
+  { "name": "gitlab default port", "forge_type": "gitlab", "web_url": "https://gitlab.example.com:443/group/repo", "api_origin": "https://gitlab.example.com" },
+  { "name": "gitlab plain host", "forge_type": "gitlab", "web_url": "https://gitlab.example.com/group/repo", "api_origin": "https://gitlab.example.com" }
+]

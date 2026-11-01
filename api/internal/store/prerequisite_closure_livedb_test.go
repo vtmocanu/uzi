@@ -361,6 +361,12 @@ func TestPrerequisiteClosureQueryExecutionLiveDB(t *testing.T) {
 	ctx, _, pool := prerequisiteMigratedPool(t, "prereq_queries_")
 	q := store.New(pool)
 	f := prerequisiteNew(t, ctx, pool)
+	// Exercise the generated full-run projection at the current schema, separately
+	// from the version-pinned rollback fixture's identity-only lock.
+	lockedRun, err := q.LockPrerequisiteRun(ctx, f.run)
+	if err != nil || lockedRun.ID != f.run {
+		t.Fatalf("current-schema run lock: run=%s err=%v", lockedRun.ID, err)
+	}
 	due := pgtype.Timestamptz{Time: time.Now().Add(48 * time.Hour), Valid: true}
 	rows, err := q.ListPrerequisitePendingDue(ctx, store.ListPrerequisitePendingDueParams{DueAt: due, AfterDueAt: pgtype.Timestamptz{InfinityModifier: pgtype.NegativeInfinity, Valid: true}, Lim: 10})
 	if err != nil || len(rows) != 1 || rows[0].ID != f.closure.ID {

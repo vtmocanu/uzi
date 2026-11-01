@@ -132,6 +132,10 @@ WITH candidates AS MATERIALIZED (
       SELECT 1 FROM workers coordinate_worker
       WHERE coordinate_worker.id = @worker_id AND coordinate_worker.user_id = r.user_id
         AND 'task_checkpoint_coordinates_v1' = ANY(coordinate_worker.protocol_capabilities)))
+  AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR EXISTS (
+      SELECT 1 FROM workers publication_worker
+      WHERE publication_worker.id = @worker_id AND publication_worker.user_id = r.user_id
+        AND 'publication_resume_v1' = ANY(publication_worker.protocol_capabilities)))
   AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation
@@ -250,6 +254,10 @@ WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = fals
       SELECT 1 FROM workers coordinate_worker
       WHERE coordinate_worker.id = @worker_id AND coordinate_worker.user_id = r.user_id
         AND 'task_checkpoint_coordinates_v1' = ANY(coordinate_worker.protocol_capabilities)))
+  AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR EXISTS (
+      SELECT 1 FROM workers publication_worker
+      WHERE publication_worker.id = @worker_id AND publication_worker.user_id = r.user_id
+        AND 'publication_resume_v1' = ANY(publication_worker.protocol_capabilities)))
   AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation

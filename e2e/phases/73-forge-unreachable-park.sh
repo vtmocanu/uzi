@@ -1,14 +1,14 @@
 # shellcheck shell=bash
 # phase:    forge-unreachable-park
-# title:    PRD #1392: pre-clone forge park — recovery_wait(forge_unreachable), promote+complete, owner hold/Resume/rehold no judge, cancel
+# title:    PRD #1392 + #1324: forge park — pre-clone (promote+complete, owner hold/Resume/rehold no judge, cancel) and publication phase (MR-create 503 park, auto recovery, owner hold/Resume, zero model turns)
 # critical: no
 # lane:     gitlab
 # executor: stub
 # requires: REPO_ID UZI_WORKER_TOKEN
 # provides: -
 # handoff:  -
-# mutates:  rewrites the agent gitconfig so the AGENT's clone/fetch URL redirects to an unresolvable .invalid host (a pre-phase copy is saved); forge-fake stays UP the WHOLE phase so the api's claim-time default-branch guardrail + the poller keep reaching it over HTTP; lowers the api forge-park cap to 2 via E2E_FORGE_UNREACHABLE_MAX_PARKS in the env-file (api force-recreated while forge-fake is healthy)
-# restores: gitconfig restored byte-for-byte from the pre-phase copy; the forge-park cap default restored (env line removed, api recreated) — done in-phase on the happy path AND by an EXIT-trap fail-safe (phase 20 / 35 precedent) so the fail-soft driver never continues on a broken stack
+# mutates:  rewrites the agent gitconfig so the AGENT's clone/fetch URL redirects to an unresolvable .invalid host (a pre-phase copy is saved); forge-fake stays UP the WHOLE phase so the api's claim-time default-branch guardrail + the poller keep reaching it over HTTP; lowers the api forge-park cap to 2 via E2E_FORGE_UNREACHABLE_MAX_PARKS in the env-file (api force-recreated while forge-fake is healthy); Cases D/E arm a forge-fake MR-create fault (POST /_e2e/faults) and Case E shortens the api publication-park bound to 20s via E2E_PROVIDER_PARK_MAX_DURATION (api force-recreated again)
+# restores: gitconfig restored byte-for-byte from the pre-phase copy; the forge-fake MR-create fault cleared; the forge-park cap and publication-park bound defaults restored (both env lines removed, api recreated) — done in-phase on the happy path AND by an EXIT-trap fail-safe (phase 20 / 35 precedent) so the fail-soft driver never continues on a broken stack
 # =============================================================================
 # M5 contract update — the pre-clone forge-unreachable park, end to end through the LIVE
 # claim/clone/park/promote loop (the store-level and worker-level halves are proven at
@@ -53,6 +53,20 @@
 #   C  an owner cancel during the clone retries ends the run cancelled (the park
 #      transaction reads the stamped cancel under its lock and cancels instead of parking).
 #
+# Issue #1324 adds two PUBLICATION-phase cases (the git path is WORKING; the fault is on the
+# forge API instead). They are lettered D and E here only because C was already taken:
+#
+#   D  a sustained MR-create 503 (forge-fake POST /_e2e/faults, count outlasting the agent's
+#      1s/2s/4s/8s/16s withForgeRetry schedule) PARKS the run in the publication phase
+#      (recovery_wait_phase=publication, forge_park_count untouched). The fault is then
+#      cleared, the timed retry recovers it automatically, it completes with exactly one MR,
+#      and the stub executor ran once in total (no new model turns after the park).
+#   E  with RUN_PROVIDER_PARK_MAX_DURATION shortened to 20s and the fault persisting, the
+#      timed parks run out of time and the run becomes an owner hold
+#      (publication_hold_reason=publication_retry_exhausted, retry stamp NULL). With the fault
+#      cleared an owner Resume (resume-now) queues one publication-only episode that completes
+#      the run with one MR and still no extra executor run.
+#
 # The incident's DNS shape stays a unit case in agent/test/forge-retry.test.ts; this phase
 # asserts the PARK, not the error phrase.
 # =============================================================================
@@ -73,11 +87,20 @@ restore_stack() {
   if [ -f "$GITCONFIG_SAVE" ]; then
     cp "$GITCONFIG_SAVE" "$GITCONFIG" 2>/dev/null || true
   fi
-  if grep -q '^E2E_FORGE_UNREACHABLE_MAX_PARKS=' "$ENVFILE" 2>/dev/null; then
-    if grep -v '^E2E_FORGE_UNREACHABLE_MAX_PARKS=' "$ENVFILE" > "$ENVFILE.tmp73" 2>/dev/null; then
-      mv "$ENVFILE.tmp73" "$ENVFILE" 2>/dev/null || true
+  fake_clear_create_mr_fault >/dev/null 2>&1 || true
+  # A D/E failure mid-case would leave its parked/held run holding custody into later phases.
+  local leftover
+  for leftover in "${RUN_D:-}" "${RUN_E:-}"; do
+    [ -n "$leftover" ] && apipost "/api/runs/$leftover/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
+  done
+  local var
+  for var in E2E_FORGE_UNREACHABLE_MAX_PARKS E2E_PROVIDER_PARK_MAX_DURATION; do
+    if grep -q "^$var=" "$ENVFILE" 2>/dev/null; then
+      if grep -v "^$var=" "$ENVFILE" > "$ENVFILE.tmp73" 2>/dev/null; then
+        mv "$ENVFILE.tmp73" "$ENVFILE" 2>/dev/null || true
+      fi
     fi
-  fi
+  done
   "${COMPOSE[@]}" up -d --no-deps --force-recreate api >/dev/null 2>&1 || true
 }
 
@@ -118,7 +141,8 @@ assert_one_park_event() {
   fail "no forge-park feed event ever landed for run $run"
 }
 
-# dispatch_run_forge_broken TITLE — with the git path ALREADY broken, create an issue + run.
+# dispatch_run_forge_broken TITLE — create an issue + run. Cases A-C call it with the git path
+# broken; Cases D/E reuse it with the path healthy.
 # forge-fake is UP, so CreateIssue and the run-create forge snapshot both succeed, and the
 # claim-time default-branch guardrail passes; the worker then claims and its FIRST clone
 # attempt resolves the `.invalid` host and fails transiently. Sets DISPATCHED_RUN.
@@ -275,6 +299,97 @@ wait_forge_park_release "$RUN_C" "$PARK_GENERATION_C" 10 cancelled
 [ -z "$(db_psql "SELECT id FROM runs WHERE kind='judge' AND target_run_id='$RUN_C'")" ] \
   || fail "a judge run was enqueued for the cancelled clone"
 pass "Case C: run $RUN_C cancelled with its exact final custody receipt, no judge"
+restore_git_path
+
+# --- Cases D/E: publication-phase park (issue #1324) --------------------------
+# The git path is WORKING here (restored right after Case C): clone, plan, executor and push all
+# succeed, and only the forge API's merge-request CREATE answers 503. The agent retries it on
+# the withForgeRetry schedule (1s, 2s, 4s, 8s, 16s = 6 attempts) and only then parks.
+
+# publication_run_to_gate TITLE — dispatch a run with the git path healthy, drive it to the
+# plan gate, and return with the run at awaiting_approval (the caller arms the fault first).
+# Sets DISPATCHED_RUN.
+publication_run_to_gate() {
+  dispatch_run_forge_broken "$1"
+  wait_status "$DISPATCHED_RUN" awaiting_approval 600
+}
+
+# assert_publication_untouched RUN MRS_BEFORE — after the run completed: it finished with MR
+# link(s), the fake forge gained exactly one merge request (no duplicate, no missing MR), the
+# lifetime forge-park counter never moved, and the stub executor ran exactly once (a
+# publication-only flight runs no executor and so no model turns).
+assert_publication_untouched() {
+  local run="$1" mrs_before="$2" view mrs_after
+  view="$(apiget "/api/runs/$run")"
+  [ -n "$(printf '%s' "$view" | jq -r '.run.mr_web_url // empty')" ] \
+    || fail "run $run completed without an MR link: $view"
+  [ "$(printf '%s' "$view" | jq -r '.run.forge_park_count')" = 0 ] \
+    || fail "publication park touched forge_park_count (got: $(printf '%s' "$view" | jq -c '.run.forge_park_count'))"
+  mrs_after="$(fake_state | jq '.mrs | length')"
+  [ "$mrs_after" = "$((mrs_before + 1))" ] \
+    || fail "expected exactly one new merge request on the forge (before=$mrs_before after=$mrs_after)"
+  [ "$(run_executor_runs "$run")" = 1 ] \
+    || fail "stub executor ran $(run_executor_runs "$run") times for run $run; a publication park/resume must add no model turns"
+}
+
+say "Case D: a sustained MR-create 503 PARKS the run in the publication phase, then it recovers on its own"
+MRS_BEFORE_D="$(fake_state | jq '.mrs | length')"
+publication_run_to_gate "E2E publication park then recover"
+RUN_D="$DISPATCHED_RUN"
+# 8 > 6 attempts per episode: the first episode exhausts its schedule and parks. The count
+# still has 2 left for the first timed retry; the explicit clear below makes recovery
+# deterministic whichever attempt it lands on.
+fake_fault_create_mr 503 8
+pass "forge-fake armed: the next 8 merge-request creates answer 503"
+apipost "/api/runs/$RUN_D/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+wait_eq true 300 "publication park" publication_park_ready "$RUN_D"
+FD="$(apiget "/api/runs/$RUN_D")"
+[ "$(printf '%s' "$FD" | jq -r '.run.forge_park_count')" = 0 ] \
+  || fail "publication park counted a forge park (got: $(printf '%s' "$FD" | jq -c '.run.forge_park_count'))"
+[ -z "$(printf '%s' "$FD" | jq -r '.run.fail_origin // empty')" ] \
+  || fail "run carries a fail_origin while parked (got: $(printf '%s' "$FD" | jq -c '.run.fail_origin'))"
+[ "$(run_executor_runs "$RUN_D")" = 1 ] || fail "stub executor did not run exactly once before the park"
+pass "run $RUN_D parked in the publication phase: recovery_wait/forge_unreachable/publication, retry stamped, forge_park_count=0, executor ran once"
+fake_clear_create_mr_fault
+pass "MR-create fault cleared; waiting for the timed retry to publish"
+wait_status "$RUN_D" completed 600
+assert_publication_untouched "$RUN_D" "$MRS_BEFORE_D"
+pass "Case D: run $RUN_D recovered automatically, opened one MR, ran the executor once"
+
+say "Case E: an exhausted publication wait HOLDS the run; owner Resume publishes without a model call"
+printf 'E2E_PROVIDER_PARK_MAX_DURATION=20s\n' >> "$ENVFILE"
+"${COMPOSE[@]}" up -d --no-deps --force-recreate api >/dev/null
+wait_http
+login
+wait_worker_online
+pass "api recreated with the publication-park bound shortened to 20s"
+MRS_BEFORE_E="$(fake_state | jq '.mrs | length')"
+publication_run_to_gate "E2E publication hold then Resume"
+RUN_E="$DISPATCHED_RUN"
+fake_fault_create_mr 503 1000
+apipost "/api/runs/$RUN_E/inputs" '{"kind":"approve_plan","body":""}' >/dev/null
+# First park ~35s after approval (schedule), the next retry is due after the 5s..30s park
+# jitter and fails for another ~31s, which is past the 20s bound: the second park decision
+# holds. Bounded generously for a loaded host.
+wait_eq true 600 "publication owner hold" publication_hold_ready "$RUN_E"
+FE="$(apiget "/api/runs/$RUN_E")"
+[ "$(printf '%s' "$FE" | jq -r '.run.forge_park_count')" = 0 ] \
+  || fail "publication hold counted a forge park (got: $(printf '%s' "$FE" | jq -c '.run.forge_park_count'))"
+[ -z "$(printf '%s' "$FE" | jq -r '.run.fail_origin // empty')" ] \
+  || fail "held run carries a fail_origin (got: $(printf '%s' "$FE" | jq -c '.run.fail_origin'))"
+[ "$(run_executor_runs "$RUN_E")" = 1 ] || fail "stub executor did not run exactly once before the hold"
+[ -z "$(db_psql "SELECT id FROM runs WHERE kind='judge' AND target_run_id='$RUN_E'")" ] \
+  || fail "a judge run was enqueued for the publication hold"
+pass "Case E: run $RUN_E held: publication_retry_exhausted, retry stamp NULL, count=0, no failure, no judge"
+fake_clear_create_mr_fault
+RESUMED_E="$(apipost "/api/runs/$RUN_E/resume-now" '')"
+printf '%s' "$RESUMED_E" | jq -e '(.run.status=="queued" or .run.status=="claimed" or .run.status=="running")
+  and .run.fail_origin==null and .run.finished_at==null' >/dev/null \
+  || fail "Resume did not queue a publication episode: $RESUMED_E"
+pass "fault cleared and owner Resume accepted"
+wait_status "$RUN_E" completed 600
+assert_publication_untouched "$RUN_E" "$MRS_BEFORE_E"
+pass "Case E: Resume published run $RUN_E with one MR and no new executor run"
 
 # --- restore (explicit happy path) + drop the fail-safe ----------------------
 say "restore: default clone path, default forge-park cap"

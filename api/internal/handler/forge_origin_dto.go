@@ -10,8 +10,14 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-func forgeOriginCooldownDTO(origin string, until time.Time, halfOpen string, reporting, reserved bool, now time.Time) apitypes.ForgeOriginCooldownDTO {
-	d := apitypes.ForgeOriginCooldownDTO{Origin: origin, CooledUntil: until}
+func forgeOriginCooldownDTO(origin string, until time.Time, halfOpen string, reporting, reserved, gitUnverified, apiUnverified bool, now time.Time) apitypes.ForgeOriginCooldownDTO {
+	d := apitypes.ForgeOriginCooldownDTO{Origin: origin, CooledUntil: until, Surfaces: []string{}}
+	if gitUnverified {
+		d.Surfaces = append(d.Surfaces, "git")
+	}
+	if apiUnverified {
+		d.Surfaces = append(d.Surfaces, "api")
+	}
 	switch {
 	case halfOpen != "":
 		d.HalfOpenRunID = &halfOpen
@@ -49,7 +55,7 @@ func (h *Handler) workerForgeOriginCooldowns(ctx context.Context, ids []uuid.UUI
 	out := make(map[uuid.UUID][]apitypes.ForgeOriginCooldownDTO)
 	now := h.clock()
 	for _, row := range rows {
-		out[row.WorkerID] = append(out[row.WorkerID], forgeOriginCooldownDTO(row.Origin, row.CooledUntil.Time, row.HalfOpenRunID, row.SuccessReporting, row.Reserved, now))
+		out[row.WorkerID] = append(out[row.WorkerID], forgeOriginCooldownDTO(row.Origin, row.CooledUntil.Time, row.HalfOpenRunID, row.SuccessReporting, row.Reserved, row.GitUnverified, row.ApiUnverified, now))
 	}
 	return out
 }
@@ -84,9 +90,12 @@ func (h *Handler) overlayRunForgeOriginCooldowns(ctx context.Context, dtos ...*a
 	}
 	now := h.clock()
 	for _, row := range rows {
-		d := forgeOriginCooldownDTO(row.Origin, row.CooledUntil.Time, row.HalfOpenRunID, row.SuccessReporting, row.Reserved, now)
+		d := forgeOriginCooldownDTO(row.Origin, row.CooledUntil.Time, row.HalfOpenRunID, row.SuccessReporting, row.Reserved, row.GitUnverified, row.ApiUnverified, now)
 		for _, target := range byID[row.RunID] {
-			target.ForgeOriginCooldown = &d
+			// The query orders a run's rows by later deadline first; the run DTO shows that one.
+			if target.ForgeOriginCooldown == nil {
+				target.ForgeOriginCooldown = &d
+			}
 		}
 	}
 }

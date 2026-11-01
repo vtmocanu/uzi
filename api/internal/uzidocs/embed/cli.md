@@ -3618,6 +3618,38 @@ through `paused` unless `--until paused` is selected.
 See [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
 for both harnesses, verified-capture limits and mixed-fleet compatibility.
 
+### Publication parks and holds
+
+A `recovery_wait` / `forge_unreachable` run whose `recovery_wait_phase` is
+`publication` met a sustained forge outage while publishing finished work.
+`uzi run get`, `--follow` and the TUI detail header share one line (the TUI
+board row for an owner hold is shorter: `Publishing held · Resume
+(publication-only)/Cancel · detail: enter`):
+
+- Timed wait: `publishing paused: forge unreachable; waiting 12m of 24h,
+  retry at 15:04`, or `waiting 12m, no limit` when
+  `RUN_PROVIDER_PARK_MAX_DURATION` is `0`, followed by ` · PR #42` (GitHub,
+  Forgejo), ` · MR !42` (GitLab) or ` · branch <name>` when known.
+- Owner hold: `publishing held: <reason>`, with a fixed sentence per
+  `publication_hold_reason` (`publication_retry_exhausted`,
+  `publication_custodian_unavailable`, `publication_model_required`,
+  `publication_source_unavailable`, `publication_intent_mismatch`). An
+  unrecognised reason is shown as unrecognised, and an unrecognised phase as a
+  generic parked line.
+
+A hold prints `Owner Resume or Cancel; no automatic resume.`, then
+`uzi run resume <id>` (starts a new publication-only attempt; no model work)
+and `uzi run cancel <id>`. Resume grants no other budget. The park does not
+use or show the pre-clone forge park count.
+
+With `--json` the run carries `recovery_wait_phase`, and while the run holds
+an active publication intent `publication_wait_started_at`,
+`publication_wait_limit_seconds`, `publication_hold_reason`,
+`publication_first_wait_at`, `publication_park_total`, `publication_episode`
+and `publication_intent`. The run's forge cooldown object adds `surfaces`
+(`git`, `api`), the unverified evidence surfaces. See
+[Forge unreachable while publishing](./run-recovery-wait.md#forge-unreachable-while-publishing).
+
 ### Worker recovery exhaustion
 
 `recovery_wait` with cause `worker_requeue_exhausted` means automatic

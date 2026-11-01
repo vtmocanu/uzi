@@ -20,12 +20,14 @@ import (
 func TestProtocolFeaturesClosureGroupIsLastAndOwn(t *testing.T) {
 	for _, active := range []bool{false, true} {
 		for _, held := range []bool{false, true} {
-			on, off := protocolFeatures(active, held, true), protocolFeatures(active, held, false)
-			if slices.Contains(off, capability.RecoveryPrerequisiteClosureV1) {
-				t.Fatalf("active=%t held=%t: advertised while disabled: %v", active, held, off)
-			}
-			if on[len(on)-1] != capability.RecoveryPrerequisiteClosureV1 || !slices.Equal(on[:len(on)-1], off) {
-				t.Fatalf("active=%t held=%t: closure must be its own last group: on=%v off=%v", active, held, on, off)
+			for _, resume := range []bool{false, true} {
+				on, off := protocolFeatures(active, held, resume, true), protocolFeatures(active, held, resume, false)
+				if slices.Contains(off, capability.RecoveryPrerequisiteClosureV1) {
+					t.Fatalf("active=%t held=%t resume=%t: advertised while disabled: %v", active, held, resume, off)
+				}
+				if on[len(on)-1] != capability.RecoveryPrerequisiteClosureV1 || !slices.Equal(on[:len(on)-1], off) {
+					t.Fatalf("active=%t held=%t resume=%t: closure must be its own last group: on=%v off=%v", active, held, resume, on, off)
+				}
 			}
 		}
 	}

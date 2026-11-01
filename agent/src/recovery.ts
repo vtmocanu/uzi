@@ -213,6 +213,10 @@ export interface RecoveryRecord {
   /** The attempted publication head H' (provenance only; omitted when no publish was
    *  attempted). Recording it is provenance, never permission to substitute it. */
   attemptedHeadSha?: string;
+  /** Issue #1324: EVERY transformed publication candidate pinned for this generation, in the order attempted
+   *  (the first equals `attemptedHeadSha`), bounded by {@link MAX_ATTEMPTED_HEADS}. Provenance only, like
+   *  `attemptedHeadSha`; a base align followed by a bridge pins both rather than only the first. */
+  attemptedHeadShas?: string[];
   /** Run kind (provenance). */
   kind: RunKind;
   /** The run's branch, used to name the bundle's source ref. */
@@ -906,6 +910,9 @@ function pinFactsDiffer(snapshot: RecoveryRecord, current: RecoveryRecord): bool
   );
 }
 
+/** Issue #1324: the bound on the transformed publication candidates one generation's record remembers. */
+const MAX_ATTEMPTED_HEADS = 16;
+
 /** Apply a pin to the CURRENT record under the journal lock; returns `current` itself when nothing
  *  changes. Only a `pinned` record may re-point its source or take the finalization facts; any other
  *  state may only fill an absent attempted head or generation (issue #1995). */
@@ -952,6 +959,18 @@ function applyPin(current: RecoveryRecord, input: PinInput): RecoveryRecord {
   if (input.attemptedHeadSha && !next.attemptedHeadSha) {
     next.attemptedHeadSha = input.attemptedHeadSha;
     changed = true;
+  }
+  // Issue #1324: and every further distinct candidate, in order, up to the bound. The list starts with the
+  // single recorded head so an older record gains the rest without losing it.
+  if (input.attemptedHeadSha) {
+    const heads = next.attemptedHeadShas ?? (next.attemptedHeadSha ? [next.attemptedHeadSha] : []);
+    if (!heads.includes(input.attemptedHeadSha) && heads.length < MAX_ATTEMPTED_HEADS) {
+      next.attemptedHeadShas = [...heads, input.attemptedHeadSha];
+      changed = true;
+    } else if (next.attemptedHeadShas === undefined && heads.length > 0) {
+      next.attemptedHeadShas = heads;
+      changed = true;
+    }
   }
   // Fill the generation in if an earlier v1-shaped pin created the record without one.
   if (next.generation === undefined && input.generation !== undefined) {
@@ -6438,6 +6457,11 @@ function coerceRecord(obj: Record<string, unknown>): RecoveryRecord | null {
     state,
   };
   if (str(obj.attemptedHeadSha)) record.attemptedHeadSha = obj.attemptedHeadSha;
+  if (obj.attemptedHeadShas !== undefined) {
+    const heads = obj.attemptedHeadShas;
+    if (!Array.isArray(heads) || heads.length > MAX_ATTEMPTED_HEADS || !heads.every((h) => str(h) && /^[0-9a-f]{40}$/.test(h))) return null;
+    record.attemptedHeadShas = heads as string[];
+  }
   if (num(obj.generation)) record.generation = obj.generation;
   if (str(obj.bundlePath)) record.bundlePath = obj.bundlePath;
   if (num(obj.byteSize)) record.byteSize = obj.byteSize;

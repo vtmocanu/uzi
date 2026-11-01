@@ -927,7 +927,9 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
       (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL
         -- A forge_unreachable pre-clone park keeps its claim; only the worker's settled
         -- forge_no_output proof (empty inventory) may end that exact generation early.
+        -- A publication-phase park holds unpublished source and never settles custody.
         OR (r.status = 'recovery_wait' AND r.recovery_wait_cause = 'forge_unreachable'
+          AND r.recovery_wait_phase IS NULL
           AND @final_disposition::text = 'settled' AND @release_evidence::text = 'forge_no_output')))))
   AND (
     (@final_disposition::text = 'archive' AND @release_evidence::text = 'archive'
