@@ -1675,7 +1675,6 @@ WITH claimant AS MATERIALIZED (
       -- lease, so the worker-level closure stands in for the row-level lease. An unassigned run
       -- (r.worker_id IS NULL) has no owner row, so it is never closed here; the claimant-side half
       -- (a flagged worker refused every claim, unassigned included) is the service-level guard.
-      AND NOT EXISTS (SELECT 1 FROM workers w WHERE w.id = r.worker_id AND w.pending_overflow_until > now())
       -- PRD #1497 M1 (D19): a server-side wall park records the incarnation it released
       -- (released_worker_id + released_worker_nonce, captured under the park's lock). That EXACT
       -- incarnation cannot reclaim its own parked run — otherwise a dead/incapable/unresponsive
