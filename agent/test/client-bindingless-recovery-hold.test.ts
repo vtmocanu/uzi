@@ -166,7 +166,7 @@ test("registration during body read invalidates an observation; out-of-order rep
   const second = e.register();
   newer.resolve(Response.json({ worker_id: worker, protocol_features: [] }));
   await second;
-  older.resolve(Response.json({ worker_id: repo, protocol_features: [feature] }));
+  older.resolve(Response.json({ worker_id: worker, protocol_features: [feature] }));
   await first;
   release.resolve();
   assert.equal(await pending, undefined);
