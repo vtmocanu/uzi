@@ -1530,6 +1530,11 @@ Tracked as GitHub issue vtmocanu/uzi#2012.
 - Reworks use the smallest fixing change with no new design (a mandatory item needing one is re-planned as a material change); re-validation is scoped to the committed fix range, with a full wave when impact is uncertain. (AI-synced 2026-10-02)
 - Non-blocking notes not reworked are recorded as grouped `deferred` scope notes in `signal_done`, never as incidental findings. (AI-synced 2026-10-02)
 
+## Feature #296 — Bounded run guidance
+
+- Before authoring a full plan, the lead checks requirement verification, dependency/ownership seams, expensive mandatory gates and available execution/plan-revision budgets. If scope cannot fit, it proposes reviewable slices with dependencies and every requirement placed, using the existing owner decision lifecycle; slices never authorize silent deferral of approved scope or removal of budget limits. This is prompt guidance, not runtime enforcement. (AI-synced 2026-11-01)
+- Mass-signal guardrail denials explain how to move falsely flagged literal heredoc prose into a worktree scratch file through a file-edit tool and use supported file input. Screening and refusal classification stay unchanged; denied executable commands remain denied and the heredoc parsing limitation remains. (AI-synced 2026-11-01)
+
 ## Proposal agent output modes
 
 - Feature-bingo and refactor-scout default to issues (supersedes PRD #929 D5); global fallback stays mr; stored mr/issues modes remain authoritative, NULL inherits the catalog default, and reset adopts that default; no migration. (AI-synced 2026-10-02)
