@@ -176,7 +176,7 @@ describe("held publication falls back to the archive", () => {
     await assertCustodyRetained(s.server, s.claim, s.work, "stale branch");
   });
 
-  // #3727 M3 (r2): the held publication fallback's capture tail (captureFrozenInventory) denies the closure mint.
+  // #3727 M3 (r2): pins only the closureMint value the captureAndUpload branch receives from captureFrozenInventory.
   it("the frozen-inventory capture tail passes closureMint deny", { skip: HELD_LINUX_ONLY }, async t => {
     const seen: unknown[] = [];
     await scenario(t, {

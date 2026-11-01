@@ -326,6 +326,9 @@ export interface RecoveryOutcome {
    *  against the forge ref; `kept` = the journaled held FINAL stays (non-definitive); `fallback` = the
    *  held FINAL was cleared (definitive refusal or a downgrade 400) and the caller must capture. */
   held?: "acked" | "kept" | "fallback" | "settled";
+  /** Set with `held: "fallback"` when the held FINAL was cleared without a server-stated reason (a bare
+   *  downgrade 400 is indistinguishable from a body-read or proxy 400), so it never attests the fallback. */
+  heldUnattested?: true;
 }
 
 /** The archive RPC subset {@link RecoveryCoordinator} needs — WorkerClient satisfies it
@@ -1125,14 +1128,15 @@ export async function classifyUploadFailure(err: unknown, record?: RecoveryRecor
 const JOURNAL_KEY_LABEL = "uzi-recovery-journal-v1";
 const JOURNAL_VERSION = 1 as const;
 
-/** A held publication id is the api's UUID (lowercase hex, hyphenated). */
 /** The server's non-transient HeldRefusal reasons (api/internal/workersvc/held_publish.go HeldReason*),
- *  sent on 409/413/422. forge_unavailable (503) is transient and deliberately absent. */
+ *  sent on 409/413/422. forge_unavailable (503) is transient and deliberately absent; create_refused
+ *  arrives only as a 200 body state "refused", handled separately. */
 const HELD_REFUSAL_REASONS: ReadonlySet<string> = new Set([
-  "not_failed", "excluded_origin", "generation_mismatch", "identity_changed", "create_refused",
+  "not_failed", "excluded_origin", "generation_mismatch", "identity_changed",
   "unsupported", "hold_missing", "pack_invalid", "pack_too_large", "tip_missing", "ci_config_guard",
 ]);
 const HELD_REFUSAL_STATUSES: ReadonlySet<number> = new Set([409, 413, 422]);
+/** A held publication id is the api's UUID (lowercase hex, hyphenated). */
 const HELD_PUBLICATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Stable, key-sorted JSON so the MAC is deterministic regardless of insertion order. Shared
@@ -2375,7 +2379,8 @@ export class RecoveryCoordinator {
       if (cleared.finalRequest !== undefined) return kept(why);
       this.log.warn("recovery: held publication final cleared; falling back to the archive", {
         run_id: record.runId, generation: record.generation, reason: why });
-      return { state: cleared.state, captureId: cleared.captureId, reason: why, held: "fallback" };
+      return { state: cleared.state, captureId: cleared.captureId, reason: why, held: "fallback",
+        ...(HELD_FINAL_FALLBACK_REASONS.has(why) ? {} : { heldUnattested: true as const }) };
     };
     try {
       if (!this.client.hasFeature?.("recovery_inventory_v1") || !(await this.inactiveInventory(record))) return kept();
@@ -2462,7 +2467,10 @@ export class RecoveryCoordinator {
     if (residueQuarantine() !== undefined) return "kept";
     try {
       return await this.withCancellationAttempt(record, () => this.inAuthority(async () =>
-        runCaptureCycle(await this.cycleKey(record), "wait", () => this.releaseHeldWithinCycle(record, publicationId))));
+        runCaptureCycle(await this.cycleKey(record), "wait", async () => {
+          const released = await this.releaseHeldWithinCycle(record, publicationId);
+          return released === "fallback_unattested" ? "fallback" : released;
+        })));
     } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: held publication final not completed; custody retained", {
         run_id: record.runId, generation: record.generation, error: errText(err) });
@@ -2470,7 +2478,8 @@ export class RecoveryCoordinator {
     }
   }
 
-  private async releaseHeldWithinCycle(record: RecoveryRecord, publicationId: string): Promise<"acked" | "kept" | "fallback" | "settled"> {
+  /** `fallback_unattested` is a cleared held FINAL whose cause the server did not state (see RecoveryOutcome.heldUnattested). */
+  private async releaseHeldWithinCycle(record: RecoveryRecord, publicationId: string): Promise<"acked" | "kept" | "fallback" | "fallback_unattested" | "settled"> {
     let latest = await this.readLatest(record);
     if (latest.kind !== "ok") return "kept" as const;
     let cur = latest.record;
@@ -2494,7 +2503,7 @@ export class RecoveryCoordinator {
     // The replayed identity wins over a differing caller id: it is what the api may already hold.
     if (this.isExecuting(cur.runId)) return "kept" as const;
     const outcome = await this.finalizeInventory(cur, false, "deny");
-    if (outcome?.held) return outcome.held;
+    if (outcome?.held) return outcome.held === "fallback" && outcome.heldUnattested ? "fallback_unattested" : outcome.held;
     latest = await this.readLatest(cur);
     if (latest.kind !== "ok") return "kept" as const;
     if (latest.record.finalAcknowledged) return "acked" as const;
@@ -2688,11 +2697,12 @@ export class RecoveryCoordinator {
         const hold = await this.heldOperationState(record, input.signal);
         if (hold !== "open") return this.heldStopped(record, hold);
         // Grant 3: the replayed held FINAL definitively fell back in this pass.
-        return this.captureCycle({ ...input, record }, final?.held === "fallback" ? "grant" : "deny");
+        return this.captureCycle({ ...input, record }, final?.held === "fallback" && !final.heldUnattested ? "grant" : "deny");
       }
     }
     let hold = await this.heldOperationState(record, input.signal);
     if (hold !== "open") return this.heldStopped(record, hold);
+    let unattestedFallback = false;
     if (record.heldCreateUncertain) {
       if (!this.client.publishHeld || input.signal?.aborted || residueQuarantine() !== undefined) return outcome("kept");
       try {
@@ -2712,14 +2722,15 @@ export class RecoveryCoordinator {
               finalRequest: { disposition: { kind: "held_publication", publication_id: body.publication_id,
                 source_sha: cur.sourceSha, coverage_digest: cur.coverageDigest! } } }));
             const released = await this.releaseHeldWithinCycle(record, body.publication_id);
-            if (released !== "fallback") return outcome(released);
+            if (released !== "fallback" && released !== "fallback_unattested") return outcome(released);
+            unattestedFallback = released === "fallback_unattested";
           } else if (body.state === "refused" && body.reason === "create_refused") {
             record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false }));
           } else return outcome("kept");
           hold = await this.heldOperationState(record, input.signal);
           if (hold !== "open") return this.heldStopped(record, hold);
           // Grant 3: only the two held fallbacks above (create_refused, or a created ref that fell back) reach here.
-          return this.captureCycle({ ...input, record }, "grant");
+          return this.captureCycle({ ...input, record }, unattestedFallback ? "deny" : "grant");
         }
         // An empty probe can fail before any invocation exists. It is not proof
         // of absence: retry the same frozen pack through the API's existing
@@ -2871,9 +2882,9 @@ export class RecoveryCoordinator {
     }
     if (publicationId) {
       const released = await this.releaseHeldWithinCycle(record, publicationId);
-      if (released !== "fallback") return outcome(released);
+      if (released !== "fallback" && released !== "fallback_unattested") return outcome(released);
       result = "fallback";
-      attested = true;
+      attested = released === "fallback";
     }
     if (result !== "fallback") return outcome(result);
     // Every fallback observes current authoritative settlement again.

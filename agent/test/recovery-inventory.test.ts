@@ -6724,11 +6724,12 @@ for (const [name, response, minted] of [
 // B2: only a bounded, non-transient HeldRefusal reason on 409/413/422 attests a fallback.
 const HELD_REFUSAL_CASES: Array<[string, number]> = [
   ["not_failed", 409], ["excluded_origin", 409], ["generation_mismatch", 409], ["identity_changed", 409],
-  ["create_refused", 409], ["hold_missing", 409], ["ci_config_guard", 409], ["unsupported", 422],
+  ["hold_missing", 409], ["ci_config_guard", 409], ["unsupported", 422],
   ["pack_invalid", 422], ["tip_missing", 422], ["pack_too_large", 413],
 ];
 const TRANSIENT_HELD_ANSWERS: Array<[string, { ok: false; reason: string; httpStatus: number }]> = [
   ["429 busy", { ok: false, reason: "busy", httpStatus: 429 }],
+  ["409 busy", { ok: false, reason: "busy", httpStatus: 409 }],
   ["408 upload timeout", { ok: false, reason: "http_408", httpStatus: 408 }],
   ["400 body read", { ok: false, reason: "http_400", httpStatus: 400 }],
   ["401 auth race", { ok: false, reason: "http_401", httpStatus: 401 }],
@@ -6886,34 +6887,47 @@ for (const state of ["unsupported", "pending", "refused", "lost"] as const) {
   });
 }
 
-it("#3727 M3 grant 3 sub-paths: replayed held fallback, created-then-fallback and an uncertain create_refused grant; kept denies", async () => {
-  const release400 = (f: V2Fixture, mode: { held: "lost" | "400" | "ok" }) => {
+it("#3727 M3 grant 3 sub-paths: an attested held-FINAL fallback and an uncertain create_refused grant; a bare 400 fallback and kept deny", async () => {
+  type Mode = { held: "lost" | "400" | "ref_missing" | "ok" };
+  const release400 = (f: V2Fixture, mode: Mode) => {
     const release = f.client.releaseRecoveryCustody as (...a: unknown[]) => Promise<unknown>;
     Object.assign(f.client, { releaseRecoveryCustody: async (...args: unknown[]) => {
       if ((args[3] as RecoveryFinalDisposition).kind === "held_publication") {
         f.finals.push(structuredClone(args));
         if (mode.held === "lost") throw new Error("FINAL answer lost");
         if (mode.held === "400") throw new RequestError("POST", "/release", 400, "unknown kind");
+        if (mode.held === "ref_missing") return { run_id: f.context.runId, generation: args[1], released: false,
+          holds_released: 0, retained: true, reason: "held_publication_ref_missing" };
       }
       return release(...args);
     } });
   };
-  // created, then the release falls back (400): the archive FINAL is minted.
+  // created, then the release is definitively refused (ref missing, a HELD_FINAL_FALLBACK_REASONS member): minted.
   const a = await v2FrozenFixture("issue", true);
   try {
     a.state.status = "failed";
     closureHarness(a, { features: [] });
-    release400(a, { held: "400" });
+    release400(a, { held: "ref_missing" });
     await a.operate();
-    assert.equal(archiveFinals(a), 1, "created then fallback");
+    assert.equal(archiveFinals(a), 1, "created then attested fallback");
   } finally { await a.close(); }
-  // replayed held FINAL that falls back mints; one that stays kept does not.
-  for (const outcome of ["400", "lost"] as const) {
+  // created, then a bare 400 (indistinguishable from a body-read or proxy 400): falls back, mints nothing.
+  const a400 = await v2FrozenFixture("issue", true);
+  try {
+    a400.state.status = "failed";
+    closureHarness(a400, { features: [] });
+    release400(a400, { held: "400" });
+    await a400.operate();
+    assert.equal(archiveFinals(a400), 0, "created then unattested 400 fallback");
+    assert.equal(a400.state.produced, 1, "the archive is still captured");
+  } finally { await a400.close(); }
+  // replayed held FINAL: an attested fallback mints; a bare 400 fallback and one that stays kept do not.
+  for (const outcome of ["ref_missing", "400", "lost"] as const) {
     const b = await v2FrozenFixture("issue", true);
     try {
       b.state.status = "failed";
       closureHarness(b, { features: [] });
-      const mode = { held: "lost" as "lost" | "400" | "ok" };
+      const mode: Mode = { held: "lost" };
       release400(b, mode);
       await b.operate();
       assert.equal(archiveFinals(b), 0);
@@ -6921,15 +6935,17 @@ it("#3727 M3 grant 3 sub-paths: replayed held fallback, created-then-fallback an
       mode.held = outcome;
       b.state.now += 3_600_000;
       await b.operate();
-      assert.equal(archiveFinals(b), outcome === "400" ? 1 : 0, `replayed held ${outcome}`);
+      assert.equal(archiveFinals(b), outcome === "ref_missing" ? 1 : 0, `replayed held ${outcome}`);
     } finally { await b.close(); }
   }
-  // uncertain create, then the probe says "created" and the release falls back (400): mints once.
+  // uncertain create, then the probe says "created" and the release is refused (ref missing): mints once;
+  // with a bare 400 it mints nothing.
+  for (const mode of ["ref_missing", "400"] as const) {
   const g = await v2FrozenFixture("issue", true);
   try {
     g.state.status = "failed";
     closureHarness(g, { features: [] });
-    release400(g, { held: "400" });
+    release400(g, { held: mode });
     let calls = 0;
     Object.assign(g.client, { publishHeld: async (run: string, gen: number, tip: string) => {
       if (++calls === 1) throw new Error("connection lost");
@@ -6939,8 +6955,9 @@ it("#3727 M3 grant 3 sub-paths: replayed held fallback, created-then-fallback an
     assert.equal((await g.coordinator.inspect(g.context.runId))[0]!.heldCreateUncertain, true);
     assert.equal(archiveFinals(g), 0);
     await g.operate();
-    assert.equal(archiveFinals(g), 1, "uncertain create resolved to created, then the release fell back");
+    assert.equal(archiveFinals(g), mode === "ref_missing" ? 1 : 0, `uncertain create resolved to created, then release ${mode}`);
   } finally { await g.close(); }
+  }
   // heldCreateUncertain, then create_refused: grants; any other answer keeps.
   for (const answer of ["create_refused", "pack_invalid", "other"] as const) {
     const c = await v2FrozenFixture("issue", true);

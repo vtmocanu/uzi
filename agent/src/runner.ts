@@ -15698,7 +15698,7 @@ export class RunRunner {
           this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), scan.findings, flight.runLog);
       },
       remediationHold: () => this.checkpointRemediationHold(flight, flight.barePath!, record.sourceSha, true),
-      ciHold: () => this.ciConfigGuardBlocksPublication(flight, flight.barePath!, record.sourceSha, "held publication"),
+      ciHold: () => this.ciConfigGuardVerdict(flight, flight.barePath!, record.sourceSha, "held publication"),
     });
   }
 
@@ -17344,16 +17344,22 @@ export class RunRunner {
    * Never fails the run; the early and final push guards do that.
    */
   private async ciConfigGuardBlocksPublication(flight: RunFlight, barePath: string, sha: string, what: string): Promise<boolean> {
+    return (await this.ciConfigGuardVerdict(flight, barePath, sha, what)) !== "clear";
+  }
+
+  /** The tri-state form: "unknown" (diff not computable) still blocks, but a caller that attests a
+   *  stated refusal must not read it as one. */
+  private async ciConfigGuardVerdict(flight: RunFlight, barePath: string, sha: string, what: string): Promise<"clear" | "blocked" | "unknown"> {
     const globs = flight.ciConfigGuardGlobs;
-    if (!globs) return false;
+    if (!globs) return "clear";
     const changed = await this.git.changedFilesNoRenames(barePath, sha);
     const flagged = changed === null ? null : flagCIConfigPathsRaw(changed, globs);
-    if (flagged !== null && flagged.length === 0) return false;
+    if (flagged !== null && flagged.length === 0) return "clear";
     const shown = flagged === null ? "diff could not be computed" : flagged.slice(0, 5).map(displayGuardPath).join(", ") +
       (flagged.length > 5 ? `, and ${flagged.length - 5} more` : "");
     this.reportPublishOutcome(flight, `ci_config_guard:${what}`,
       `${what} skipped: CI-config guard (${shown}); work stays local`, { sha: sha.slice(0, 12) });
-    return true;
+    return flagged === null ? "unknown" : "blocked";
   }
 
   private async publishCheckpointBestEffort(
