@@ -291,7 +291,10 @@ func TestIterationResumeUpdateWallGuardLiveDB(t *testing.T) {
 	}()
 	// At most ten seconds, one lock observation every 10ms. On every exit,
 	// cancel the query and join it before releasing its connection.
-	defer func() { cancel(); <-result }()
+	defer func() {
+		cancel()
+		<-result //nolint:errcheck // The main test asserts the result; an earlier t.Fatal has already failed the test. Cleanup still cancels and joins on every exit.
+	}()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
