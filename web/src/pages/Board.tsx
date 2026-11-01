@@ -560,7 +560,8 @@ export function Board() {
       setHasWorker(workers.length > 0);
       setHasToken(hasAnthropicToken(secrets));
       // PRD #1429 M4a, D3: harness-aware credential facts alongside hasToken.
-      setCodexUsable(isCodexUsable(secrets));
+      // Issue #3719: the viewer's codex_account_mode picks the pool rule or the default rule.
+      setCodexUsable(isCodexUsable(secrets, settings.codex_account_mode));
       setHasCodexCredential(hasAnyCodexCredential(secrets));
       setDefaultHarness(settings.default_harness);
       // PRD #1247 M7: keep the Anthropic tokens for the per-card token picker.

@@ -1214,6 +1214,7 @@ type Run struct {
 	CapabilityInferenceEvidence []byte             `json:"capability_inference_evidence"`
 	IdleStallParkCount          int32              `json:"idle_stall_park_count"`
 	ForgeAdmission              []byte             `json:"forge_admission"`
+	CodexSelectReason           pgtype.Text        `json:"codex_select_reason"`
 	PlanCrossCheckGated         bool               `json:"plan_cross_check_gated"`
 }
 
@@ -1707,6 +1708,7 @@ type User struct {
 	VaultEpoch                int64              `json:"vault_epoch"`
 	VaultAutoReunlock         bool               `json:"vault_auto_reunlock"`
 	VaultSlotGeneration       int64              `json:"vault_slot_generation"`
+	CodexAccountMode          string             `json:"codex_account_mode"`
 }
 
 type UserCrossCheckPin struct {

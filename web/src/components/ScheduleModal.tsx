@@ -368,6 +368,9 @@ export function ScheduleModal({
   // only an edit-time hint for the effective-Codex gate below, mirroring IssueView's
   // start dialog and Board's per-card gate.
   const [ownerDefaultHarness, setOwnerDefaultHarness] = useState<Harness | null>(null);
+  // Issue #3719: the owner's codex_account_mode, from the same settings read, so the
+  // Codex-usability gate applies the pool rule when the owner picks automatically.
+  const [ownerCodexMode, setOwnerCodexMode] = useState<string | undefined>(undefined);
   const [credentialSel, setCredentialSel] = useState<CredentialSelection>(
     selectionFromOverride(editing?.credential_override, []),
   );
@@ -381,6 +384,7 @@ export function ScheduleModal({
         if (cancelled) return;
         setAllSecrets(secrets);
         setOwnerDefaultHarness(settings.default_harness);
+        setOwnerCodexMode(settings.codex_account_mode);
         const anthropic = secrets.filter((s) => s.kind === "anthropic_token");
         setTokens(anthropic);
         // Re-seed to resolve a pinned label→id now that the list is known — unless the
@@ -426,7 +430,7 @@ export function ScheduleModal({
   // D2: the picker appears only when the caller has a usable credential for BOTH
   // harnesses — a single-harness user never sees a redundant picker.
   const claudeUsableForHarness = hasAnthropicToken(allSecrets);
-  const codexUsableForHarness = isCodexUsable(allSecrets);
+  const codexUsableForHarness = isCodexUsable(allSecrets, ownerCodexMode);
   const showHarnessPicker = bothHarnessesUsable(claudeUsableForHarness, codexUsableForHarness);
   // Fix 2 (M4a review): gate the Anthropic TokenPicker on the EFFECTIVE harness, not the
   // raw `harnessSel` — a Codex-only owner never sees the harness picker above

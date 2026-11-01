@@ -1,5 +1,6 @@
-// RunCredential names the credential snapshot for the run's harness. Claude runs
-// also show the server-recorded selection reason and headroom (PRD #111 M1/M5).
+// RunCredential names the credential snapshot for the run's harness, with the
+// server-recorded selection reason: claim-time mode and headroom for Claude runs (PRD
+// #111 M1/M5), creation-time codex_select_reason for Codex runs (issue #3719).
 //
 // It keys off the LABEL, not the id, and that is the whole reason it is a component
 // rather than three lines inline. The fields go null INDEPENDENTLY: the label is a
@@ -25,7 +26,7 @@
 import { Link } from "react-router-dom";
 
 import type { Run } from "../lib/api";
-import { describeCredential } from "../lib/runCredential";
+import { describeCodexCredential, describeCredential } from "../lib/runCredential";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { Badge } from "./ui";
 
@@ -43,6 +44,7 @@ export function RunCredential({
     | "harness"
     | "codex_secret_id"
     | "codex_secret_label"
+    | "codex_select_reason"
   >;
   // variant "compact" (PRD #295) is the Runs-list rendering: label + a tone dot
   // (non-neutral only) + `(deleted)`, with mode/hint moved into the title so the
@@ -62,13 +64,7 @@ export function RunCredential({
   // web-ux F8 is `deleted`: a run whose credential was DELETED is otherwise
   // indistinguishable from one whose credential still exists. Saying so is the
   // difference between "go look at this token" and "this token is gone".
-  const description = codex ? {
-    mode: "",
-    hint: "This run is bound to the recorded Codex credential.",
-    tone: "neutral" as const,
-    linked: false,
-    deleted: run.codex_secret_id === null,
-  } : describeCredential(run);
+  const description = codex ? describeCodexCredential(run) : describeCredential(run);
   const { mode, hint, tone, linked, deleted } = description;
   const hintId = `run-credential-hint-${codex ? "codex" : "claude"}-${(codex ? run.codex_secret_id : run.anthropic_secret_id) ?? "gone"}`;
   const noun = codex ? "credential" : "token";
