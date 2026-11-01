@@ -794,6 +794,8 @@ Git default committed,-loose-object permits host-crash loose-object loss and ref
 rollback, with the same backstop limits. If #2506 option A authorizes release on
 thin archives, re-review this invariant as authority-bearing.
 
+Note (2026-11-01, #3727): C2 of #2506 now authorizes release of a thin archive FINAL, but only on a server-confirmed pinned prerequisite closure, not on the worker's local proof. The statement above is the historical text for this delivery. See [Releasing custody on a pinned closure](run-recovery.md#releasing-custody-on-a-pinned-closure).
+
 Owner R8 clarification: read-only Git queries/config acquisition and supervised private
 pack/index/decoded proof commands do not independently need remote pairs. They retain
 original operation/slot/deadline/cancellation/accounting/pin checks; fixed private

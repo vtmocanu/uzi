@@ -771,9 +771,9 @@ C2 is implemented on branch `agent/issue-3727`; it has **not landed**. Migration
 What landed, by milestone (commit subjects):
 
 - **M1 schema** (`api/internal/store/migrations/00389_prerequisite_closure_release.sql`):
-  `1a751723` feat(recovery): schema for closure-backed thin archive release;
-  `c6e903e8` fix(recovery): closure release admits NULL-cause parks, isolate guard-layer tests;
-  `aa469eb7` test(recovery): isolate closure disposition CHECK and release binding predicates.
+  `1a751723d` feat(recovery): schema for closure-backed thin archive release (C2 M1);
+  `c6e748b87` fix(recovery): closure release admits NULL-cause parks; isolate guard-layer tests (C2 M1);
+  `aa469eb71` test(recovery): isolate closure disposition CHECK and release binding predicates (C2 M1).
   `final_closure_id`, a composite foreign key to the exact closure/capture/hold,
   release evidence `prerequisite_closure`, tie CHECKs and a guard branch; Down refuses
   (SQLSTATE 55000) while closure-backed rows exist. The DBA measured the combined `ALTER`
@@ -781,25 +781,25 @@ What landed, by milestone (commit subjects):
   `ACCESS EXCLUSIVE`, plus up to 5 s of `lock_timeout` waiting; live row counts and a
   cold cache are unmeasured.
 - **M2 API release** (`api/internal/recovery/final_closure.go`):
-  `ca4544ef` feat(recovery): release a thin archive FINAL on a pinned prerequisite closure;
-  `5e2d4b44` fix(recovery): bound closure FINAL locks server-side and test the real listing seam;
-  `25402622` test(recovery): pin the lock_not_available mapping of closure FINAL errors.
+  `ca4544ef8` feat(recovery): release a thin archive FINAL on a pinned prerequisite closure (C2 M2);
+  `5e2d4b44a` fix(recovery): bound closure FINAL locks server-side and test the real listing seam (C2 M2);
+  `25402622f` test(recovery): pin the lock_not_available mapping of closure FINAL errors (C2 M2).
   Unlocked precheck, per-worker limiter admission, fenced listing reservation, one listing
   outside any transaction, locked release (500 ms lock timeout per step, 6 s budget);
   refusals `manifest_conflict`, `prerequisite_pin_missing`, `prerequisite_pin_foreign`
   (409) and `prerequisite_pin_unavailable` (503).
 - **M3 worker mint** (`agent/src/recovery.ts`):
-  `aaf13f0c` feat(worker): mint a thin archive FINAL only under a transient closure grant;
-  `7d5ccbb0` fix(worker): grant a same-pass closure mint only on an attested held fallback;
-  `8e133c66` fix(worker): attest a held fallback only on a bounded server refusal;
-  `5005d0fe` fix(worker): an uncomputable CI diff or a bare 400 release never attests.
+  `aaf13f0ce` feat(worker): mint a thin archive FINAL only under a transient closure grant (C2 M3);
+  `7d5ccbb0d` fix(worker): grant a same-pass closure mint only on an attested held fallback (C2 M3);
+  `8e133c665` fix(worker): attest a held fallback only on a bounded server refusal (C2 M3);
+  `5005d0fe2` fix(worker): an uncomputable CI diff or a bare 400 release never attests (C2 M3).
 - **M4 advertisement and proof**:
-  `97a180f8` feat(recovery): advertise prerequisite closure release and prove it end to end;
-  `4c345929` test(recovery): pin closure advertisement on heartbeat and isolate the port.
+  `97a180f83` feat(recovery): advertise prerequisite closure release and prove it end to end (C2 M4);
+  `4c3459295` test(recovery): pin closure advertisement on heartbeat and isolate the port (C2 M4).
   The feature is advertised only while `UZI_PREREQUISITE_CLOSURE_FORGES` contains `github`
   and the port and limiter are wired; the combined proof `TestPrerequisiteClosureReleaseE2E`
   runs in the opt-in leg of `e2e/run-store-it.sh`.
-- **M5 documentation**: ADR-1296, ADR-1197, ADR-2417, ADR-2506 and ADR-3591 amendments,
+- **M5 documentation** (`c990de73c` docs(recovery): document closure-backed thin archive release (C2 M5)): ADR-1296, ADR-1197, ADR-2417, ADR-2506 and ADR-3591 amendments,
   `docs/run-recovery.md`, `docs/configuration.md`, `docs/cli.md` and the embedded mirrors,
   `specs/human.md`, a changelog fragment, and the E2E literal audit (no matches in
   `e2e/phases/`, `e2e/lib.sh`, `e2e/lib.test.sh` or `e2e/forge-fake/`; `task test:e2e-lib`

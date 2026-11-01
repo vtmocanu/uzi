@@ -794,13 +794,15 @@ needs all of the following.
   authorized; GitLab, Forgejo, GitHub Enterprise and other hosts are unprobed
   and are refused as `manifest_conflict`.
 - **Worker.** The worker registers `recovery_prerequisite_closure_v1` and mints a
-  thin archive FINAL only under a transient grant on the frozen path: a missing
-  v2 metadata record; a proven held-publication ineligibility; a held-publication
-  fallback in the same pass that the server explicitly refused (a 409, 413 or 422
-  with a bounded reason, a 200 `create_refused`, or a retained held-FINAL fallback
-  reason) or that a deterministic local check refused (`secret_found`,
-  `workflow_change`, `ci_config_guard`); or a feature set naming the closure
-  feature and neither held feature. It also needs an ordinary local origin, a
+  thin archive FINAL only under a transient grant: the frozen path (which also
+  serves park-observed records in `paused`, `recovery_wait` or `limit_wait`) can pass
+  any of four grants, and the #2969 retained-claim caller passes only grants 1 and 4:
+  (1) a missing v2 metadata record; (2) a proven held-publication ineligibility;
+  (3) a held-publication fallback in the same pass that the server explicitly
+  refused (a 409, 413 or 422 with a bounded reason, a 200 `create_refused`, or a
+  retained held-FINAL fallback reason) or that a deterministic local check refused
+  (`secret_found`, `workflow_change`, `ci_config_guard`); or (4) a feature set
+  naming the closure feature and neither held feature. It also needs an ordinary local origin, a
   verified local capture and a capture status whose closure is `pinned` and
   matches the capture's checksum and prerequisites. An unknown or transient
   result never grants a mint. A saved thin FINAL replays on its recorded MAC and
@@ -814,12 +816,14 @@ needs all of the following.
      `prereq-final-list|<worker>` on the proposal limiter, sized by
      `PROPOSAL_RATE_LIMIT_MAX` / `PROPOSAL_RATE_LIMIT_WINDOW`, default `20` per
      `1m`). It is a fixed window per API process and an admission is never
-     refunded, even when the FINAL later fails. The bound is at most the
-     configured maximum per window per worker per API process (up to twice that
-     across a window edge), multiplied by the number of API replicas. Each
-     admission costs two project reads (`GetProject`) and one `ls-remote` of
+     refunded, even when the FINAL later fails. Replays and precheck refusals
+     are not charged. The bound is at most the configured maximum per window
+     per worker per API process (up to twice that across a window edge),
+     multiplied by the number of API replicas. An admitted request costs at
+     most two project reads (`GetProject`) and one `ls-remote` of
      `refs/uzi-prereq/<capture-id>` on github.com with the repository owner's
-     stored token.
+     stored token; it can stop before listing when under 3 seconds of the
+     6-second budget remain or a newer reservation supersedes it.
   3. A short transaction reserves a fresh listing pass; the listing runs outside
      every transaction.
   4. A present pin at the recorded tip releases the hold under the full lock
@@ -828,7 +832,7 @@ needs all of the following.
      records `release_evidence = prerequisite_closure` and a `final_closure_id`
      that the schema ties to the exact closure, capture and hold.
 
-The API refuses as follows. Every refusal keeps custody; the worker keeps the
+The API refuses as follows (the closure-specific outcomes plus the two generic refusals the closure path can also return). Every refusal keeps custody; the worker keeps the
 saved FINAL and retries.
 
 | Status | Reason | Meaning |
@@ -836,6 +840,8 @@ saved FINAL and retries.
 | 409 | `manifest_conflict` | Unsupported configuration or binding (knob off, no `github`, capability missing, closure not pinned for this exact capture, expired or mismatched capture); unchanged from the prerequisite-free path. |
 | 409 | `prerequisite_pin_missing` | The pin ref was cleanly listed as absent and the absence is recorded. |
 | 409 | `prerequisite_pin_foreign` | The pin ref is listed at a different tip. |
+| 403 | `not_authorized` | The precheck found no hold, run or capture for this worker, or the hold or run is not eligible, or the capture belongs to another hold or worker. |
+| 400 | `bad_request` | The server's configured ready retention is under one second (a configuration fault, not a request fault). |
 | 503 | `prerequisite_pin_unavailable` | The listing failed or timed out, the limiter refused, a lock wait or deadline ran out, or a newer reservation superseded this one. Retry shortly. |
 
 Restoring a closure-released archive follows
