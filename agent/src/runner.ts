@@ -3112,8 +3112,10 @@ export class RunRunner {
    *
    *  Not durable, and that is worth stating rather than implying: the map is worker
    *  memory, so a worker death re-queues the run and the resuming worker starts a
-   *  fresh budget. The honest worst case is QUESTION_TIMEOUT x (RUN_MAX_REQUEUES + 1); a run that
-   *  used the issue #1742 one-shot finalize-resume allowance gets one more attempt, so x (RUN_MAX_REQUEUES + 2). */
+   *  fresh budget. With no other fresh executor execution, worker-death retries contribute
+   *  QUESTION_TIMEOUT x (RUN_MAX_REQUEUES + 1), or x (RUN_MAX_REQUEUES + 2) for a run that used the
+   *  issue #1742 one-shot finalize-resume allowance. Ordinary transient/limit/credential redispatch
+   *  also starts a fresh execute() and so a fresh budget: this is not an unconditional bound. */
   private readonly questionParkBudgets = new Map<
     string,
     { spentMs: number; open?: { questionId: string; since: number } }
