@@ -1,6 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING, type ExecutorKind, type Config } from "./config.js";
+import { loadConfig, memoryGuardTimingOf, MAX_CONCURRENT_RUNS_SOFT_CEILING, type ExecutorKind, type Config } from "./config.js";
 import { configureGoConcurrency } from "./go-concurrency.js";
 import { acquireWorkerLifetime } from "./authority-lock.js";
 import { installWorkerLifetime, requireWorkerLifetime } from "./completion-authority.js";
@@ -688,10 +688,13 @@ async function main(): Promise<void> {
     proof: scans => terminalMaintenanceProof(scans, config.dockerWiring.dockerHost),
     log,
   });
+  const memoryGuardTiming = memoryGuardTimingOf(config.memoryGuard);
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     authority,
     maintenanceExclusion,
     memoryRuntime: memory,
+    // issue #3639: the guard timing the memory-receipt gate derives its sample wait from.
+    ...(memoryGuardTiming ? { memoryGuardTiming } : {}),
     recoveryLiveTiming: buildRecoveryLiveTiming(config.executor, log),
     pollMs: config.pollIntervalMs,
     onSourceRetained: () => notifyRetained?.(),

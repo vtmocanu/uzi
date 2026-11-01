@@ -563,6 +563,17 @@ function resolveWorkerToken(env: NodeJS.ProcessEnv): string {
   return required(env, "UZI_WORKER_TOKEN");
 }
 
+/**
+ * issue #3639: the guard timing the memory-receipt gate derives its sample wait from. Present only for an enabled
+ * guard; a disabled or absent one yields undefined, so every receipt claim re-parks (F1) instead of waiting.
+ */
+export function memoryGuardTimingOf(guard: Config["memoryGuard"]):
+  { rearmMs: number; sampleMs: number; responseBudgetMs: number } | undefined {
+  return guard?.enabled
+    ? { rearmMs: guard.rearmMs, sampleMs: guard.sampleMs, responseBudgetMs: guard.responseBudgetMs }
+    : undefined;
+}
+
 function memoryGuardConfig(env: NodeJS.ProcessEnv): NonNullable<Config["memoryGuard"]> {
   const flag = env.WORKER_MEMORY_GUARD_ENABLED?.trim().toLowerCase() ?? "";
   if (["", "0", "false", "no", "off"].includes(flag)) return { enabled: false };

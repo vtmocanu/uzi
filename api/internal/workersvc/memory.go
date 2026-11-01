@@ -360,6 +360,11 @@ func (s *Service) parkWorkerMemoryPressure(ctx context.Context, w store.Worker, 
 	if err != nil {
 		return run, false, err
 	}
+	// Issue #3639: the release row is written in the park's own transaction from the just-parked
+	// row. The exact-replay return above inserts nothing.
+	if err = insertMemoryParkRelease(ctx, q, run); err != nil {
+		return run, false, err
+	}
 	if err = tx.Commit(ctx); err != nil {
 		return run, false, err
 	}

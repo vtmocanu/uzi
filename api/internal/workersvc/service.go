@@ -3533,6 +3533,8 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		if s.txBeginner != nil {
 			return s.claimRunLeasedNoSnapshot(ctx, wkr, params, report)
 		}
+		// Test-only path: production always wires SetTxBeginner. Without a transaction there is no
+		// worker lock to hang the memory-park reference or supersede on, so this path skips both.
 		// This claim runs outside a transaction and cannot set the publication-resume opt-in
 		// guard_publication_resume requires, so it never selects a run with an active intent.
 		params.SkipPublicationResume = true
@@ -3613,7 +3615,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// claimRunInTx). Not claimed: COMMIT (the snapshot replace must persist) and report idle. On
 	// success, COMMIT and then assemble OUTSIDE the tx (assembly opens credentials + builds
 	// snapshots and must not hold the DB tx), exactly as the no-snapshot path does.
-	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, reread, params, report)
+	run, memRef, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, reread, params, report)
 	if err != nil {
 		return nil, err
 	}
@@ -3628,7 +3630,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		return nil, err
 	}
 	committed = true
-	return s.assembleAndFinishRunClaim(ctx, reread, run, params.RecoveryCapable)
+	return s.assembleAndFinishRunClaimRef(ctx, reread, run, params.RecoveryCapable, memRef)
 }
 
 // requestActivePairs extracts the index-aligned (run_id, claim_generation) pairs a claim's request

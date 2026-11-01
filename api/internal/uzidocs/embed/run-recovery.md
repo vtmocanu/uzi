@@ -89,13 +89,43 @@ from recovery after an actual OOM kills a worker.
 
 After a memory park, the parking worker ends its own source use only on
 positive evidence. If it did, Resume lets a fresh worker continue normally from
-the retained work. If it did not (the park was not confirmed, or the source end
+the retained work.
+
+A worker whose park was fully settled also sends the server a settlement
+receipt. When the server holds a current receipt for the park, owner **Resume**
+lets the same worker incarnation (the process that parked, not a restarted one)
+claim the run again, where an ordinary memory park keeps that worker excluded.
+That worker continues only if its own local checks pass: the claim must match its
+record of the park, the settled source must still verify, and the memory guard
+must produce a fresh sample. If a check fails, it re-parks the run at the same
+`worker_memory_pressure` hold for you and **Cancel** remains the exit. A
+refusal on the identity, receipt or source checks writes nothing locally; a
+timeout of only the guard sample goes through the existing continuation
+re-park, which writes a `memoryPark` journal record. Every such re-park also
+reports the park to the server. If the server accepts a guard-timeout re-park,
+that new park has no settlement receipt. The earlier receipt cannot lift the
+new park's exclusion: another Resume queues the run but leaves the same
+worker incarnation excluded. A confirmed park ACK also removes its old local
+receipt entry; a lost ACK can retain that entry without making the worker
+eligible. This is a known limit of same-incarnation continuation, including
+when that worker is the run's only placement.
+
+A receipt that reaches the server after you Resume is refused, and
+parks made before this behavior was deployed have no receipt and are never
+lifted. After Resume, while the run is queued, the released worker is still
+excluded (no receipt lifted it), no other worker can take the run and the
+released worker is still heartbeating, the run health reads "waiting for
+another worker, or restart worker NAME (its previous process was released by a
+memory-pressure park)". A restart does not lift the hold without owner Resume;
+after Resume, a restarted worker (new registration nonce) is a different
+incarnation and is no longer excluded.
+
+If the parking worker's source end was not settled (the park was not confirmed, or the source end
 was not durably recorded) and the journal records the park (a `memoryPark`
 record in the active journal, with the successor running the memory guard and
 `worker_memory_pressure_v1`), a fresh worker re-parks the run at the same
-`worker_memory_pressure` hold instead of failing it. Until the companion
-issue #3639 lands, Resume of such an unsettled continuation re-parks
-immediately, so **Cancel** or an operator discard of the retained source is the
+`worker_memory_pressure` hold instead of failing it. Resume of such an
+unsettled continuation re-parks immediately, so **Cancel** or an operator discard of the retained source is the
 exit. A worker restart does not release it: the slot stays active under the old
 incarnation, so the continuation is still refused and Resume keeps re-parking.
 The no-record case matters only for an unsettled park (a confirmed source end
