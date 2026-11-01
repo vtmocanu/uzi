@@ -6575,7 +6575,7 @@ it("#3727 M3 a retained-claim capture that is not executing and held-v2 metadata
   } finally { await f.close(); }
 });
 
-it("#3727 M3 lost thin ACK replays on the saved identity without a pin, a closure read, the capability or a mint", async () => {
+it("#3727 M3 lost thin ACK replays the saved identity with no new capture or upload once the closure status and the capability are gone", async () => {
   const { f, h, operate, saved } = await closureFrozen({ features: CLOSURE_ONLY });
   try {
     f.state.finalError = new Error("ACK lost");
@@ -6657,6 +6657,7 @@ for (const status of ["completed", "failed"] as const) {
     ["the scan is untrusted", { secretScanCheckpointRange: async () => ({ trusted: false, findings: [] }) }],
     ["the workflow check is unknown", { rangeTouchesWorkflows: async () => "unknown" }],
     ["preparation is unavailable", { checkpointPack: undefined }],
+    ["the CI-config path list is unknown (a git failure)", { changedFilesNoRenames: async () => null }],
   ] as const) {
     it(`#3727 M3 grant 3 never mints on an unknown preparation result (${status}, ${name})`, async () => {
       const f = await v2FrozenFixture("issue", true);
@@ -6701,7 +6702,7 @@ for (const [name, response, minted] of [
   ["timeout without a status", { ok: false, reason: "timeout" }, false],
   ["malformed response", { ok: false, reason: "malformed_response" }, false],
   ["thrown error", "throw", false],
-  ["HTTP 404 refusal", { ok: false, reason: "not_found", httpStatus: 404 }, true],
+  ["HTTP 404 not-owned answer", { ok: false, reason: "http_404", httpStatus: 404 }, false],
   ["create_refused answer", "create_refused", true],
 ] as const) {
   it(`#3727 M3 v1 lane: a ${name} from publishHeld ${minted ? "is an attested fallback and mints" : "mints nothing"}`, async () => {
@@ -6719,6 +6720,80 @@ for (const [name, response, minted] of [
     } finally { await f.close(); }
   });
 }
+
+// B2: only a bounded, non-transient HeldRefusal reason on 409/413/422 attests a fallback.
+const HELD_REFUSAL_CASES: Array<[string, number]> = [
+  ["not_failed", 409], ["excluded_origin", 409], ["generation_mismatch", 409], ["identity_changed", 409],
+  ["create_refused", 409], ["hold_missing", 409], ["ci_config_guard", 409], ["unsupported", 422],
+  ["pack_invalid", 422], ["tip_missing", 422], ["pack_too_large", 413],
+];
+const TRANSIENT_HELD_ANSWERS: Array<[string, { ok: false; reason: string; httpStatus: number }]> = [
+  ["429 busy", { ok: false, reason: "busy", httpStatus: 429 }],
+  ["408 upload timeout", { ok: false, reason: "http_408", httpStatus: 408 }],
+  ["400 body read", { ok: false, reason: "http_400", httpStatus: 400 }],
+  ["401 auth race", { ok: false, reason: "http_401", httpStatus: 401 }],
+  ["404 run not owned", { ok: false, reason: "http_404", httpStatus: 404 }],
+  ["503 forge_unavailable", { ok: false, reason: "forge_unavailable", httpStatus: 503 }],
+  ["409 with an unlisted reason", { ok: false, reason: "something_new", httpStatus: 409 }],
+  ["500 carrying an allowlisted reason", { ok: false, reason: "ci_config_guard", httpStatus: 500 }],
+  ["400 carrying an allowlisted reason", { ok: false, reason: "pack_invalid", httpStatus: 400 }],
+];
+for (const lane of ["v1", "v2"] as const) {
+  const run = async (f: V2Fixture, answer: unknown) => {
+    Object.assign(f.client, { publishHeld: async () => answer });
+    if (lane === "v1") {
+      Object.assign(f.client, { hasHeldPublicationV2: () => false });
+      await f.coordinator.operateFrozenInventory({ record: f.record, barePath: f.context.barePath, defaultBranch: "main" },
+        { foreground: true, terminal: { status: "failed" } });
+    } else await f.operate();
+  };
+  for (const [name, answer] of TRANSIENT_HELD_ANSWERS) {
+    it(`#3727 M3 ${lane} lane: a transient or unlisted held answer (${name}) mints nothing`, async () => {
+      const f = await v2FrozenFixture("issue", true);
+      try {
+        f.state.status = "failed";
+        closureHarness(f, { features: lane === "v1" ? [] : CLOSURE_ONLY });
+        await run(f, answer);
+        assert.equal(archiveFinals(f), 0);
+        assert.equal((await f.coordinator.inspect(f.context.runId))[0]!.finalRequest, undefined);
+      } finally { await f.close(); }
+    });
+  }
+  for (const [reason, httpStatus] of HELD_REFUSAL_CASES) {
+    it(`#3727 M3 ${lane} lane: the server-stated refusal ${reason} (HTTP ${httpStatus}) mints once`, async () => {
+      const f = await v2FrozenFixture("issue", true);
+      try {
+        f.state.status = "failed";
+        closureHarness(f, { features: lane === "v1" ? [] : CLOSURE_ONLY });
+        await run(f, { ok: false, reason, httpStatus });
+        assert.equal(archiveFinals(f), 1);
+        assert.equal(f.state.produced, 1);
+      } finally { await f.close(); }
+    });
+  }
+}
+
+it("#3727 M3 a deterministic local refusal followed by a failed proof no longer attests (v1 lane mints nothing)", async () => {
+  const f = await v2FrozenFixture("issue", true);
+  try {
+    f.state.status = "failed";
+    closureHarness(f, { features: [] });
+    Object.assign(f.client, { hasHeldPublicationV2: () => false });
+    let armed = false;
+    const enumerate = (f.git as unknown as { enumerateOwedCandidates: (...a: unknown[]) => Promise<unknown> }).enumerateOwedCandidates;
+    Object.assign(f.git, {
+      secretScanCheckpointRange: async () => { armed = true; return { trusted: true, findings: [{ rule: "fixture" }] }; },
+      enumerateOwedCandidates: async (...args: unknown[]) => {
+        if (armed) { armed = false; throw new Error("proof failed after the refusal"); }
+        return enumerate.apply(f.git, args);
+      },
+    });
+    await f.coordinator.operateFrozenInventory({ record: f.record, barePath: f.context.barePath, defaultBranch: "main" },
+      { foreground: true, terminal: { status: "failed" } });
+    assert.equal(armed, false, "the proof was reached and threw");
+    assert.equal(archiveFinals(f), 0);
+  } finally { await f.close(); }
+});
 
 it("#3727 M3 grant 3 does not repeat an archive step that already failed in the same pass", async () => {
   for (const [name, arrange, check] of [
@@ -6849,6 +6924,23 @@ it("#3727 M3 grant 3 sub-paths: replayed held fallback, created-then-fallback an
       assert.equal(archiveFinals(b), outcome === "400" ? 1 : 0, `replayed held ${outcome}`);
     } finally { await b.close(); }
   }
+  // uncertain create, then the probe says "created" and the release falls back (400): mints once.
+  const g = await v2FrozenFixture("issue", true);
+  try {
+    g.state.status = "failed";
+    closureHarness(g, { features: [] });
+    release400(g, { held: "400" });
+    let calls = 0;
+    Object.assign(g.client, { publishHeld: async (run: string, gen: number, tip: string) => {
+      if (++calls === 1) throw new Error("connection lost");
+      return { ok: true, body: { publication_id: "00000000-0000-4000-8000-000000000009", ref: `refs/uzi-held/${run}/${gen}`, tip, state: "created" } };
+    } });
+    await g.operate();
+    assert.equal((await g.coordinator.inspect(g.context.runId))[0]!.heldCreateUncertain, true);
+    assert.equal(archiveFinals(g), 0);
+    await g.operate();
+    assert.equal(archiveFinals(g), 1, "uncertain create resolved to created, then the release fell back");
+  } finally { await g.close(); }
   // heldCreateUncertain, then create_refused: grants; any other answer keeps.
   for (const answer of ["create_refused", "pack_invalid", "other"] as const) {
     const c = await v2FrozenFixture("issue", true);

@@ -1126,6 +1126,13 @@ const JOURNAL_KEY_LABEL = "uzi-recovery-journal-v1";
 const JOURNAL_VERSION = 1 as const;
 
 /** A held publication id is the api's UUID (lowercase hex, hyphenated). */
+/** The server's non-transient HeldRefusal reasons (api/internal/workersvc/held_publish.go HeldReason*),
+ *  sent on 409/413/422. forge_unavailable (503) is transient and deliberately absent. */
+const HELD_REFUSAL_REASONS: ReadonlySet<string> = new Set([
+  "not_failed", "excluded_origin", "generation_mismatch", "identity_changed", "create_refused",
+  "unsupported", "hold_missing", "pack_invalid", "pack_too_large", "tip_missing", "ci_config_guard",
+]);
+const HELD_REFUSAL_STATUSES: ReadonlySet<number> = new Set([409, 413, 422]);
 const HELD_PUBLICATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Stable, key-sorted JSON so the MAC is deterministic regardless of insertion order. Shared
@@ -2827,8 +2834,11 @@ export class RecoveryCoordinator {
             (response.httpStatus !== undefined && (response.httpStatus < 400 || response.httpStatus >= 500)))) return;
         if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false }));
         result = "fallback";
-        attested = response.reason !== "malformed_response" && response.httpStatus !== undefined &&
-          response.httpStatus >= 400 && response.httpStatus < 500;
+        // Only a bounded, non-transient HeldRefusal reason the server stated on its refusal statuses
+        // attests. busy (429), upload timeout (408), body read (400), auth (401), not-owned (404)
+        // and forge_unavailable (503) are transient or say nothing about held for this capture.
+        attested = response.httpStatus !== undefined && HELD_REFUSAL_STATUSES.has(response.httpStatus) &&
+          HELD_REFUSAL_REASONS.has(response.reason);
         return;
       }
       const body = response.body;
@@ -2854,7 +2864,11 @@ export class RecoveryCoordinator {
         const boundary = await this.inventorySourceBoundary({ ...record.coverageContext!, generation: record.generation }, publish);
         if (boundary !== "passed") result = "kept";
       } else result = "kept";
-    } catch { MaintenanceBudget.current()?.check(); result = v2 || uncertainCreate ? "kept" : "fallback"; }
+    } catch {
+      MaintenanceBudget.current()?.check();
+      result = v2 || uncertainCreate ? "kept" : "fallback";
+      attested = false; // A refusal followed by a failed proof or journal write is no longer attested.
+    }
     if (publicationId) {
       const released = await this.releaseHeldWithinCycle(record, publicationId);
       if (released !== "fallback") return outcome(released);
