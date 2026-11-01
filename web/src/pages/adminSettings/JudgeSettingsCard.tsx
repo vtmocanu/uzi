@@ -201,8 +201,7 @@ export function JudgeSettingsCard({
           </div>
           <p className="text-xs text-faint">
             The judge runs on the harness of the run it reviews, so each harness has its own judge model.
-            Default follows uzi&rsquo;s built-in model, including future changes to it; the built-ins are the
-            strongest models because judge recommendations feed self-improvement. Pin a cheaper model, such
+            Default follows uzi&rsquo;s built-in model, including future changes to it. Pin a cheaper model, such
             as <code className="rounded bg-raised px-1 py-0.5 text-fg">sonnet</code> for Claude, to spend less.
             A user&rsquo;s own choice under Settings &rarr; Run defaults wins over these.
           </p>

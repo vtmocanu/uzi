@@ -77,5 +77,7 @@ describe("JudgeSettingsCard model validation (#3255)", () => {
     const help = screen.getByText(/Before\s+enforcing/).textContent ?? "";
     expect(help).toContain("Default follows the built-in model.");
     expect(help).not.toContain("strongest");
+    // No judge copy ranks the built-in by capability: it is a pinned default.
+    expect(document.body.textContent ?? "").not.toMatch(/strongest/i);
   });
 });
