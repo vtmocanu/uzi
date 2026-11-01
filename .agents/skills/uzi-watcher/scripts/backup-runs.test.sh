@@ -568,10 +568,17 @@ for kind in protected ordinary; do
     ledger "$A1" "$rid" "$predecessor" live
     rr_journal="$(printf '%s' "$rr_journal" | jq '. + {retainedSources:[{runId,clonePath,attemptId}]}')"
   fi
-  for variant in valid blocked clear malformed-blocked null-blocked unknown version identity path attempt origin-source origin-extra origin-missing control bounds flags edges grant conflict cycle overflow; do
+  for variant in valid blocked clear roots roots-many roots-null roots-type roots-duplicate roots-oid roots-overflow malformed-blocked null-blocked unknown version identity path attempt origin-source origin-extra origin-missing control bounds flags edges grant conflict cycle overflow; do
     value="$rr_journal"
     case "$variant" in
       blocked) filter='.remediationRecovery.blocked=true' ;;
+      roots) filter='.remediationRecovery.excludedRoots=[]' ;;
+      roots-many) filter='.remediationRecovery.excludedRoots=[range(100) | tostring | "0"*(40-length)+.]' ;;
+      roots-null) filter='.remediationRecovery.excludedRoots=null' ;;
+      roots-type) filter='.remediationRecovery.excludedRoots={}' ;;
+      roots-duplicate) filter='.remediationRecovery.excludedRoots=[("a"*40),("a"*40)]' ;;
+      roots-oid) filter='.remediationRecovery.excludedRoots=[("a"*39)]' ;;
+      roots-overflow) filter='.remediationRecovery.excludedRoots=[range(1525) | tostring | "0"*(40-length)+.]' ;;
       clear) filter='.remediationRecovery.blocked=false' ;;
       malformed-blocked) filter='.remediationRecovery.blocked="false"' ;;
       null-blocked) filter='.remediationRecovery.blocked=null' ;;
@@ -602,7 +609,7 @@ for kind in protected ordinary; do
     fi
     dest="$WORK/out.remediation-$kind-$variant"
     rc="$(backup_rc "$dest" "$rid")"
-    if [ "$variant" = valid ] || [ "$variant" = blocked ] || [ "$variant" = clear ]; then
+    if [ "$variant" = valid ] || [ "$variant" = blocked ] || [ "$variant" = clear ] || [ "$variant" = roots ] || [ "$variant" = roots-many ]; then
       [ "$rc" -eq 0 ] || fail "remediation $kind: valid record rejected; $(cat "$dest/latest-attempt/backup.log")"
       tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+remediation-dirty' \
         || fail "remediation $kind: dirty bytes missing"

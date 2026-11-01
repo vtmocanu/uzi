@@ -3585,7 +3585,7 @@ export class RunRunner {
     const record = journal.remediationRecovery;
     if (!record) return;
     const state = flight.remediationRestrictions ??= { roots: [] };
-    state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from)])];
+    state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from), ...(record.excludedRoots ?? [])])];
   }
 
   /** Query the journal without discovery or normalization side effects. The exact attempt
@@ -3607,7 +3607,7 @@ export class RunRunner {
         return undefined;
       }
       const state = flight.remediationRestrictions ??= { roots: [] };
-      state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from)])];
+      state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from), ...(record.excludedRoots ?? [])])];
       return record;
     } catch (error) {
       // An unreadable enrollment is held, rather than silently treated as absent.

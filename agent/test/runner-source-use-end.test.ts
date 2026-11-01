@@ -469,7 +469,7 @@ describe("pending remediation source end foundation", () => {
     };
     const record: RemediationRecovery = {
       version: 1, blocked: false, runId: "run-pending", clonePath: canonical, attemptId,
-      branch: "agent/issue-374701", sequence: 1, ownedTip: newerQ, flaggedOIDs: [q, newerQ], edges: [],
+      branch: "agent/issue-374701", sequence: 1, ownedTip: newerQ, flaggedOIDs: [q, newerQ], excludedRoots: [], edges: [],
     };
     return { r, bare, canonical, flight, record, subject: runner as unknown as Subject };
   }

@@ -1605,6 +1605,8 @@ export interface RemediationRecovery {
   sequence: number;
   ownedTip: string;
   flaggedOIDs: string[];
+  /** Cumulative actual roots excluded by authenticated adoptions; absent is legacy custody. */
+  excludedRoots?: string[];
   active?: RemediationGrant;
   edges: Array<{ from: string; to: string; grant: RemediationGrant; context: string; phase: "prepared" | "committed" }>;
 }
@@ -1643,9 +1645,13 @@ function parseRemediationRecovery(value: unknown): RemediationRecovery {
     if (!flaggedOIDs.length) fail();
     return { id: g.id as number, origin: g.origin as RemediationGrant["origin"], originSource, scannedTip: g.scannedTip as string, flaggedOIDs };
   };
-  const o = object(value, ["version", "runId", "branch", "clonePath", "attemptId", "sequence", "ownedTip", "flaggedOIDs", "active", "edges", "blocked"]);
+  const o = object(value, ["version", "runId", "branch", "clonePath", "attemptId", "sequence", "ownedTip", "flaggedOIDs", "excludedRoots", "active", "edges", "blocked"]);
+  // Full-body cap precedes collection validation; 43n+1 gives the loose root-array ceiling.
+  if (Buffer.byteLength(JSON.stringify(value), "utf8") > 65536) fail();
+  if ("excludedRoots" in o && (!Array.isArray(o.excludedRoots) || o.excludedRoots.length > 1524 ||
+      !o.excludedRoots.every(oid) || new Set(o.excludedRoots).size !== o.excludedRoots.length)) fail();
   if (("blocked" in o && typeof o.blocked !== "boolean") ||
-      Buffer.byteLength(JSON.stringify(value), "utf8") > 65536 || o.version !== 1 ||
+      o.version !== 1 ||
       !identifier(o.runId, 128) || !OWED_RUN_ID.test(o.runId) ||
       !identifier(o.branch, 1024) || !validRemediationBranch(o.branch) || !identifier(o.clonePath, 4096) ||
       !path.isAbsolute(o.clonePath as string) || path.normalize(o.clonePath as string) !== o.clonePath ||
@@ -1682,7 +1688,8 @@ function parseRemediationRecovery(value: unknown): RemediationRecovery {
   }
   return { version: 1, runId: o.runId as string, branch: o.branch as string, clonePath: o.clonePath as string,
     attemptId: o.attemptId as string, sequence: o.sequence as number, ownedTip: o.ownedTip as string,
-    flaggedOIDs, ...(active ? { active } : {}), edges,
+    flaggedOIDs, ...("excludedRoots" in o ? { excludedRoots: [...o.excludedRoots as string[]] } : {}),
+    ...(active ? { active } : {}), edges,
     ...(o.blocked === undefined ? {} : { blocked: o.blocked as boolean }) };
 }
 
@@ -5843,7 +5850,7 @@ export class GitCache {
         throw new Error("remediation transformation changed source tree");
       // The schema bounds both lists. Each root gets one positive proof; any failure
       // blocks this transformation, with no retry or fallback admission.
-      for (const root of new Set([...record.flaggedOIDs, ...record.edges.map(e => e.from)])) {
+      for (const root of new Set([...record.flaggedOIDs, ...record.edges.map(e => e.from), ...(record.excludedRoots ?? [])])) {
         await this.requireOwedCommit(barePath, root);
         if (await this.ancestry(barePath, root, candidateSha) !== "divergent")
           throw new Error("remediation transformation includes excluded history");
@@ -7105,7 +7112,7 @@ export class GitCache {
       if (!tip || (await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId, tip)).kind !== "owned")
         throw new Error("remediation denial enrollment tip not owned");
       record = { version: 1, ...source, branch, sequence: 0, ownedTip: tip,
-        flaggedOIDs: [], edges: [], blocked: true };
+        flaggedOIDs: [], excludedRoots: [], edges: [], blocked: true };
     }
     // No edge, object or positive eligibility proof is needed to confirm denial.
     // false -> true shrinks the bounded body; legacy may refuse if adding the key overflows.
@@ -7128,14 +7135,14 @@ export class GitCache {
     await this.withLock(barePath, async () => {
       const stored = await this.remediationSourceUnderLock(barePath, branch, source);
       let r = stored.journal.remediationRecovery;
-      if (r && r.blocked !== false) throw new Error("remediation record is custody only");
+      if (r && (r.blocked !== false || r.excludedRoots === undefined)) throw new Error("remediation record is custody only");
       if (!scan.flaggedOIDs.length) return;
       if (!r) {
         const tip = await this.worktreeHead(source.clonePath);
         if (!tip || (await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId, tip)).kind !== "owned")
           throw new Error("remediation restriction enrollment tip not owned");
         r = { version: 1, ...source, branch, sequence: 0, ownedTip: tip,
-          flaggedOIDs: [], edges: [], blocked: false };
+          flaggedOIDs: [], excludedRoots: [], edges: [], blocked: false };
       }
       const candidate = { ...r, flaggedOIDs: [...new Set([...r.flaggedOIDs, ...scan.flaggedOIDs])] };
       // Preflight the complete bounded body before doing per-finding Git work.
@@ -7167,8 +7174,8 @@ export class GitCache {
       const stored = await this.remediationSourceUnderLock(barePath, branch, source);
       if (!stored.journal.remediationRecovery && !scan.flaggedOIDs.length) return;
       const r: RemediationRecovery = stored.journal.remediationRecovery ?? { version: 1, ...source, branch,
-        sequence: 0, ownedTip: scan.tip, flaggedOIDs: [], edges: [], blocked: false };
-      if (r.blocked !== false) throw new Error("remediation record is custody only");
+        sequence: 0, ownedTip: scan.tip, flaggedOIDs: [], excludedRoots: [], edges: [], blocked: false };
+      if (r.blocked !== false || r.excludedRoots === undefined) throw new Error("remediation record is custody only");
       if (r.ownedTip !== scan.tip ||
           (await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId, scan.tip)).kind !== "owned" ||
           await this.worktreeHead(source.clonePath) !== scan.tip) throw new Error("remediation scanned tip not owned");
@@ -7225,7 +7232,7 @@ export class GitCache {
       if (mode === "runtime-restrictions") throw new Error("remediation runtime restriction proof unavailable");
       return undefined;
     };
-    if (r.blocked !== false || r.edges.some(e => e.phase !== "committed")) return refuse();
+    if (r.blocked !== false || r.excludedRoots === undefined || r.edges.some(e => e.phase !== "committed")) return refuse();
     const tracking = await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId,
       mode === "source-adoption" ? r.ownedTip : undefined);
     if (tracking.kind !== "owned" ||
@@ -8209,7 +8216,10 @@ export class GitCache {
     if (!after || !sameRecoverySource(prior!, next) ||
         (before.blocked === true && after.blocked !== true) ||
         (before.blocked === undefined && after.blocked === false) ||
-        (before.blocked === false && after.blocked === undefined))
+        (before.blocked === false && after.blocked === undefined) ||
+        (before.excludedRoots !== undefined && (after.excludedRoots === undefined ||
+          before.excludedRoots.some(root => !after.excludedRoots!.includes(root)))) ||
+        (before.excludedRoots === undefined && after.excludedRoots !== undefined && after.blocked !== true))
       throw new Error("remediation metadata loss or rebind refused");
   }
 
@@ -8816,15 +8826,16 @@ export class GitCache {
   private async resolveMarkerWrapperAdoption(
     barePath: string, journal: RecoveryJournalEntry, tip: string, src: string | undefined,
     remediation?: RemediationRecovery,
-  ): Promise<{ seedTip: string; expectedHead: string; expectedTree: string; peeledMarkers: string[] } | undefined> {
+  ): Promise<{ seedTip: string; expectedHead: string; expectedTree: string; peeledMarkers: string[]; excludedRoots: string[] } | undefined> {
     const graph = await this.readMarkerWrapperGraph(barePath, tip, src);
     if (!graph) return undefined;
     const { aggregates, leaves, markerLeaves, srcMarker, lookalike, fail } = graph;
     let divergent = false;
+    const excludedRoots = new Set<string>();
     if (src) for (const leaf of leaves) {
       const relation = await this.ancestry(barePath, leaf, src);
       if (relation === "unknown") return fail("wrapper_lineage_ancestry");
-      if (relation === "divergent") divergent = true;
+      if (relation === "divergent") { divergent = true; excludedRoots.add(leaf); }
     }
     if (!srcMarker && markerLeaves.size === 0 && !divergent && !remediation) return undefined;
     if (lookalike) return fail("wrapper_lookalike");
@@ -8893,15 +8904,19 @@ export class GitCache {
       if (leaf === src) continue;
       if (markerLeaves.has(leaf)) {
         if (!lineage.has(leaf)) return fail("wrapper_lineage_membership");
-        if (!await eligible(await sha1Of(`${leaf}^`, "wrapper_marker_parent"))) return fail("wrapper_lineage_ancestry");
+        const parent = await sha1Of(`${leaf}^`, "wrapper_marker_parent");
+        if (!await eligible(parent)) return fail("wrapper_lineage_ancestry");
+        const relation = await this.ancestry(barePath, parent, src);
+        if (relation === "unknown") return fail("wrapper_lineage_ancestry");
+        if (relation === "divergent") excludedRoots.add(parent);
         accepted.push(leaf);
       } else if (!await eligible(leaf)) return fail("wrapper_lineage_marker");
     }
     if (srcMarker) {
       return { seedTip: src, expectedHead: await sha1Of(`${src}^`, "wrapper_source_parent"), expectedTree: srcTree,
-        peeledMarkers: unionPeeledMarkers(accepted, [src]) };
+        peeledMarkers: unionPeeledMarkers(accepted, [src]), excludedRoots: [...excludedRoots] };
     }
-    return { seedTip: src, expectedHead: src, expectedTree: srcTree, peeledMarkers: unionPeeledMarkers(accepted) };
+    return { seedTip: src, expectedHead: src, expectedTree: srcTree, peeledMarkers: unionPeeledMarkers(accepted), excludedRoots: [...excludedRoots] };
   }
 
   /** Source selection only. Every authenticated edge must reach exactly S, allowing ordinary
@@ -8913,7 +8928,7 @@ export class GitCache {
     if (!expected.attemptId || !src) throw new Error("remediation adoption source unavailable");
     const record = await this.readRemediationUnderLock(barePath, branch, { ...expected, attemptId: expected.attemptId });
     if (!record || record.ownedTip !== src) throw new Error("remediation adoption source unverified");
-    for (const oid of [...record.flaggedOIDs, ...record.edges.map(e => e.from)]) {
+    for (const oid of [...record.flaggedOIDs, ...record.edges.map(e => e.from), ...(record.excludedRoots ?? [])]) {
       if (await this.ancestry(barePath, oid, src) !== "divergent")
         throw new Error("remediation adoption source still restricted");
     }
@@ -8956,7 +8971,7 @@ export class GitCache {
       /** Trusted worker continuation-history scan, under the source-use transaction and bare lock.
        * Must not acquire the bare lock. Exact true admits selection only, never publication. */
       admitRemediationSource?: (input: Readonly<{ runId: string; branch: string; clonePath: string;
-        attemptId: string; sourceTip: string; captureTip: string }>) => Promise<boolean> },
+        attemptId: string; sourceTip: string; captureTip: string; restrictedRoots: readonly string[] }>) => Promise<boolean> },
   ): Promise<RunnerClone> {
     if (!ATTEMPT_ID_RE.test(attemptId)) throw annotateRetainedSuccessorError(new Error("invalid successor attempt"), "attempt_invalid");
     return this.withLock(barePath, async () => {
@@ -8978,18 +8993,30 @@ export class GitCache {
       if ((await this.runGit(barePath, ["rev-parse", "--verify", pin])).trim() !== tip) throw annotateRetainedSuccessorError(new Error("recovery pin changed"), "episode_pin_changed");
       // issue #3239: before any write, so a refusal leaves no ledger entry, journal change or clone.
       const wrapped = await this.resolveMarkerWrapperAdoption(barePath, journal, tip, recovery.restoreSource, remediation);
+      const clonePath = attemptClonePath(this.runnerClonePath(barePath, key), attemptId);
+      let projected: RemediationRecovery | undefined;
       if (remediation) {
         if ((!wrapped && tip !== remediation.ownedTip) || wrapped?.expectedHead !== wrapped?.seedTip)
           throw new Error("remediation adoption requires exact clean source");
+        try {
+          // Preflight the complete rebound body before ledger, journal or clone effects.
+          projected = parseRemediationRecovery({ ...remediation, clonePath, attemptId,
+            excludedRoots: [...new Set([...remediation.excludedRoots!, ...(wrapped?.excludedRoots ?? [])])] });
+        } catch (error) {
+          await this.blockRemediationUnderLock(barePath, branch, { ...expected, attemptId: remediation.attemptId });
+          throw error;
+        }
+        const restrictedRoots = Object.freeze([...new Set([
+          ...projected.flaggedOIDs, ...projected.edges.map(e => e.from), ...projected.excludedRoots!,
+        ])]);
         if (!opts?.admitRemediationSource || await opts.admitRemediationSource(Object.freeze({
           runId: expected.runId, branch, clonePath: expected.clonePath, attemptId: remediation.attemptId,
-          sourceTip: remediation.ownedTip, captureTip: tip,
+          sourceTip: remediation.ownedTip, captureTip: tip, restrictedRoots,
         })) !== true) throw new Error("remediation continuation scan admission required");
         // A callback cannot change the evidence or source we just authenticated.
         if (JSON.stringify(await this.remediationAdoptionUnderLock(barePath, branch, expected, recovery.restoreSource)) !== JSON.stringify(remediation))
           throw new Error("remediation evidence changed during admission");
       }
-      const clonePath = attemptClonePath(this.runnerClonePath(barePath, key), attemptId);
       if (await this.pathPresent(clonePath) || (await this.readAttemptLedger(barePath, branch)).has(attemptId)) throw annotateRetainedSuccessorError(new Error("successor identity already used"), "identity_used");
       const successor: RecoverySource = { runId: journal.runId, clonePath, attemptId, restoreTip: tip };
       const existingSources: RecoverySource[] = [];
@@ -9034,8 +9061,7 @@ export class GitCache {
         recovery: { ...recovery, successor, stage: "adopting" } })) throw annotateRetainedSuccessorError(new Error("successor iteration is not current"), "iteration_after");
       if (owner) await this.writeRecoveryOwner(barePath, { ...owner, successor });
       const readyJournal: RecoveryJournalEntry = { ...successor, retainedSources,
-        ...(remediation ? { remediationRecovery: parseRemediationRecovery({ ...remediation,
-          runId: successor.runId, clonePath: successor.clonePath, attemptId }) } : {}),
+        ...(projected ? { remediationRecovery: projected } : {}),
         // issue #3239: the lineage of what this seed peeled: the wrapper's accepted markers, or the tip
         // itself when the tip is the marker the seed's `reset --soft` removed from history.
         ...(wrapped ? (wrapped.peeledMarkers.length ? { peeledMarkers: wrapped.peeledMarkers } : {})
@@ -19741,8 +19767,14 @@ try {
       if (opts.producingSource) {
         remediation = await this.remediationSourceUnderLock(barePath, branch, opts.producingSource);
         const r = remediation.journal.remediationRecovery;
-        if (r && r.blocked !== false) throw new Error("remediation record is custody only");
+        if (r && (r.blocked !== false || r.excludedRoots === undefined)) throw new Error("remediation record is custody only");
         if (r) await this.syncJournalAndReadBack(barePath, branch, remediation.raw, {});
+        // Only durable actual roots are unconditional import restrictions. Active findings
+        // still use the existing grant/displacement protocol below.
+        for (const root of r?.excludedRoots ?? []) {
+          if (await this.ancestry(barePath, root, incoming) !== "divergent")
+            throw new Error("remediation import includes excluded history");
+        }
         if (r?.edges.some(e => e.phase !== "committed")) throw new Error("remediation edge remains prepared");
         let sourceDivergence: "ancestor" | "divergent" | "unknown" | undefined;
         let sourceContext: StoredOwedContext | undefined;

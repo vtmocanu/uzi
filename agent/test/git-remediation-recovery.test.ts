@@ -128,6 +128,9 @@ test("strict bounded schema rejects unknown keys, versions, identifiers, duplica
     (r: any) => { r.flaggedOIDs = [base, base]; },
     (r: any) => { r.flaggedOIDs = Array.from({ length: 65 }, (_, i) => i.toString(16).padStart(40, "0")); },
     (r: any) => { r.edges = Array(65).fill({}); },
+    ...[null, "", {}, [base, base], ["a".repeat(39)], [0], Array.from({ length: 1524 }, (_, i) => i.toString(16).padStart(40, "0")),
+      Array.from({ length: 1525 }, (_, i) => i.toString(16).padStart(40, "0"))]
+      .map(excludedRoots => (r: any) => { r.excludedRoots = excludedRoots; }),
     (r: any) => { r.extra = "x".repeat(65536); },
   ];
   for (const mutate of mutations) {
@@ -568,7 +571,9 @@ test("M2 committed M1 evidence adopts exact S and durably transfers immutable pr
   const successor = await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), iteration, successorAttempt, {
     admitRemediationSource: async input => {
       admissions++;
-      assert.deepEqual(input, { ...source(), branch: BRANCH, sourceTip: current, captureTip: coverage });
+      assert.deepEqual(input, { ...source(), branch: BRANCH, sourceTip: current, captureTip: coverage, restrictedRoots: [displaced] });
+      assert.ok(Object.isFrozen(input));
+      assert.ok(Object.isFrozen(input.restrictedRoots));
       return true;
     },
   });
@@ -580,7 +585,7 @@ test("M2 committed M1 evidence adopts exact S and durably transfers immutable pr
   assert.equal(pinnedRefs(), pins);
   assert.equal(git(bare, "rev-parse", "refs/uzi-runner/" + BRANCH), tracking);
   const transferred = journal();
-  assert.deepEqual(transferred.remediationRecovery, { ...evidence, clonePath: successor.path, attemptId: successorAttempt });
+  assert.deepEqual(transferred.remediationRecovery, { ...evidence, clonePath: successor.path, attemptId: successorAttempt, excludedRoots: [displaced] });
   assert.deepEqual(transferred.recovery.source, before.recovery.source);
   const next = { runId: RUN, clonePath: successor.path, attemptId: successorAttempt };
   const restarted = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
@@ -654,6 +659,8 @@ for (const lineage of [false, true]) {
       assert.equal(git(successor.path, "rev-parse", "HEAD"), current);
       assert.equal(git(successor.path, "write-tree"), git(bare, "rev-parse", current + "^{tree}"));
       assert.deepEqual(journal().peeledMarkers, [marker]);
+      assert.ok(journal().remediationRecovery.excludedRoots.includes(marker));
+      assert.ok(journal().remediationRecovery.excludedRoots.includes(displaced));
     }
   });
 }
@@ -941,7 +948,7 @@ test("65th trusted flag durably denies the old complete 64-flag body and zero co
 test("negative enrollment and structural confirmation confer no grant, even with prepared or missing evidence", async () => {
   assert.equal(await cache.blockRemediationRecovery(bare, BRANCH, source()), "confirmed");
   assert.deepEqual(journal().remediationRecovery, { version: 1, ...source(), branch: BRANCH,
-    sequence: 0, ownedTip: base, flaggedOIDs: [], edges: [], blocked: true });
+    sequence: 0, ownedTip: base, flaggedOIDs: [], excludedRoots: [], edges: [], blocked: true });
   assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
   // Simulate the latest complete body from another producer, then confirm its denial
   // without requiring its positive edge objects or overwriting it with the minimal body.
@@ -1074,7 +1081,7 @@ test("restriction writer: first enrollment retains flags without rewrite or adop
   const scan = { trusted: true, tip: q, flaggedOIDs: [q, q] };
   await cache.recordRemediationRestrictions(bare, BRANCH, source(), scan);
   assert.deepEqual(journal().remediationRecovery, { version: 1, ...source(), branch: BRANCH,
-    sequence: 0, ownedTip: q, flaggedOIDs: [q], edges: [], blocked: false });
+    sequence: 0, ownedTip: q, flaggedOIDs: [q], excludedRoots: [], edges: [], blocked: false });
   const replacement = commit("ungranted replacement"); await fetch();
   const evidence = await cache.readRuntimeRemediationRecovery(bare, BRANCH, source());
   assert.equal(evidence?.ownedTip, replacement);
@@ -1103,7 +1110,7 @@ test("restriction writer: candidate coverage stays independent of source and ref
   const r = journal().remediationRecovery;
   assert.equal(await cache.ancestry(bare, q, base), "divergent");
   assert.deepEqual(r, { version: 1, ...source(), branch: BRANCH, sequence: 0,
-    ownedTip: base, flaggedOIDs: [q], edges: [], blocked: false });
+    ownedTip: base, flaggedOIDs: [q], excludedRoots: [], edges: [], blocked: false });
   assert.deepEqual((await cache.readRuntimeRemediationRecovery(bare, BRANCH, source()))?.flaggedOIDs, [q]);
   for (const blocked of [undefined, true]) {
     const held: RemediationRecovery = { ...r, version: 1, blocked };
@@ -1228,4 +1235,177 @@ test("restriction writer: bounded overflow retains old metadata and positive ove
   await assert.rejects(cache.recordRemediationRestrictions(bare, BRANCH, source(),
     { trusted: true, tip: q, flaggedOIDs: [q] }), /invalid remediation/);
   assert.deepEqual(journal().remediationRecovery, { ...r, blocked: true });
+});
+
+
+test("M2 actual clean ancestor leaf is cumulative, source ancestors remain allowed, and admission rejection has no effects", async () => {
+  const x = commit("clean ancestor X"); await fetch();
+  const y = commit("clean ancestor Y", x); await fetch();
+  const q = commit("finding after X", y); await fetch(); await enroll();
+  const d = commit("actual D", q); await fetch();
+  const replacement = commit("authorized clean replacement"); await fetch();
+  const s1 = git(clone, ...IDENT, "commit-tree", base + "^{tree}", "-p", replacement, "-p", x,
+    "-m", "clean S includes X before adoption");
+  git(clone, "update-ref", "refs/heads/" + BRANCH, s1); await fetch();
+  assert.equal(await cache.ancestry(bare, x, s1), "ancestor");
+  let captured = await captureAdoption([d, x, s1], s1);
+  await refusal(captured.iteration, { admitRemediationSource: async input => {
+    assert.ok(!input.restrictedRoots.includes(x), "no unconditional ancestor-of-D ban");
+    return false; // Includes the worker's floor-proof refusal path.
+  } });
+  assert.deepEqual(journal().remediationRecovery.excludedRoots, []);
+  // A rejected proposal must not poison a later source selection.
+  const s2 = commit("clean rewind eligible source", replacement); await fetch();
+  const old = journal();
+  // Charge the next capture in the existing bounded episode.
+  captured = await captureAdoption([d, x, s2], s2);
+  const successor = await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), captured.iteration, successorAttempt, admitSource);
+  const next = { runId: RUN, clonePath: successor.path, attemptId: successorAttempt };
+  const roots = journal().remediationRecovery.excludedRoots as string[];
+  assert.deepEqual(new Set(roots), new Set([d, x]));
+  assert.ok(!old.remediationRecovery.edges.some((e: any) => e.from === x));
+  const fresh = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  assert.deepEqual((await fresh.readRuntimeRemediationRecovery(bare, BRANCH, next))?.excludedRoots, roots);
+  await cache.completeRecoveryEpisode(bare, BRANCH, KEY, next, { settled: true, processedEvents: 1, attemptId: successorAttempt });
+  assert.deepEqual(journal().remediationRecovery.excludedRoots, roots);
+  const b = git(bare, ...IDENT, "commit-tree", s2 + "^{tree}", "-p", s2, "-p", x, "-m", "same tree reintroduces X");
+  let calls = 0;
+  await assert.rejects(fresh.updateRemediationTrackingRef(bare, BRANCH, b, { context: opts.context }, next, s2,
+    { trusted: true, admit: async () => { calls++; return true; } }), /excluded history/);
+  assert.equal(calls, 0);
+  // A second adoption adds Y even without a new displacement edge; old X remains forever.
+  const cov2 = await cache.buildRecoveryCoverage(bare, opts.context as PositiveOwedCandidateContext, [d, y, s2], s2);
+  const reservation = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, next);
+  await cache.recordRecoveryCapture(bare, BRANCH, KEY, next, reservation.attempts, cov2.sha, s2);
+  const thirdAttempt = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 3, "abcdef0123456789");
+  const third = await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, next, reservation.attempts, thirdAttempt, admitSource);
+  assert.deepEqual(new Set(journal().remediationRecovery.excludedRoots), new Set([d, x, y]));
+  assert.equal(journal().remediationRecovery.edges.length, 1);
+  // A refused source import still preserves incoming work. Run this after the adoption
+  // sequence: its new owed B cannot be silently left out of a later coverage inventory.
+  const originalPins = pinnedRefs().split("\n").filter(Boolean);
+  assert.ok(!pinnedRefs().includes(b));
+  git(third.path, "update-ref", "refs/heads/" + BRANCH, b);
+  const thirdSource = { runId: RUN, clonePath: third.path, attemptId: thirdAttempt };
+  await assert.rejects(fresh.fetchAgentBranch(bare, third.path, BRANCH, RUN,
+    { context: opts.context, producingSource: thirdSource }), /excluded history/);
+  const heldPins = pinnedRefs();
+  assert.ok(heldPins.includes(b), "incoming B is pinned before source eligibility is refused");
+  for (const pin of originalPins) assert.ok(heldPins.split("\n").includes(pin), "original pin remains unchanged");
+  assert.equal(git(bare, "rev-parse", "refs/uzi-runner/" + BRANCH), s2);
+  assert.equal(journal().remediationRecovery.ownedTip, s2);
+  assert.deepEqual(new Set(journal().remediationRecovery.excludedRoots), new Set([d, x, y]));
+  await assert.rejects(fresh.readRuntimeRemediationRecovery(bare, BRANCH, thirdSource),
+    /restriction proof unavailable/, "preserving B grants no runtime source authority");
+});
+
+test("M2 superseded marker itself is excluded even when its parent is already clean source history", async () => {
+  const p = commit("clean P"); await fetch();
+  fs.writeFileSync(path.join(clone, "marker.txt"), "marker content\n");
+  git(clone, "add", "marker.txt");
+  assert.equal(await cache.commitWipMarker(clone), true);
+  const m = git(clone, "rev-parse", "HEAD"); await fetch();
+  git(clone, "reset", "--hard", p);
+  const q = commit("Q on sibling of marker", p); await fetch(); await enroll();
+  const d = commit("D descendant of Q", q); await fetch();
+  const s = commit("clean S descendant of P", p); await fetch();
+  await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT, m);
+  const { iteration } = await captureAdoption([d, m, s], s);
+  const successor = await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), iteration, successorAttempt, admitSource);
+  const next = { runId: RUN, clonePath: successor.path, attemptId: successorAttempt };
+  assert.deepEqual(new Set(journal().remediationRecovery.excludedRoots), new Set([d, m]));
+  assert.equal(await cache.ancestry(bare, p, s), "ancestor");
+  assert.equal(await cache.ancestry(bare, q, m), "divergent");
+  assert.equal(await cache.ancestry(bare, d, m), "divergent");
+  assert.equal((await cache.readRemediationRecovery(bare, BRANCH, next))?.ownedTip, s);
+  const b = git(bare, ...IDENT, "commit-tree", s + "^{tree}", "-p", s, "-p", m, "-m", "B merges superseded marker");
+  assert.equal(git(bare, "rev-parse", b + "^{tree}"), git(bare, "rev-parse", s + "^{tree}"));
+  let calls = 0;
+  await assert.rejects(cache.updateRemediationTrackingRef(bare, BRANCH, b, { context: opts.context }, next, s,
+    { trusted: true, admit: async () => { calls++; return true; } }), /excluded history/);
+  assert.equal(calls, 0);
+});
+
+test("M2 roots permit more than 64 entries, preserve custody and hold absent legacy roots", async () => {
+  await enroll();
+  const saved = journal();
+  saved.remediationRecovery.excludedRoots = Array.from({ length: 100 }, (_, i) => (i + 1).toString(16).padStart(40, "0"));
+  write(saved);
+  await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT);
+  assert.deepEqual(journal().remediationRecovery.excludedRoots, saved.remediationRecovery.excludedRoots);
+  for (const excludedRoots of [[], undefined]) {
+    const dropped = structuredClone(saved);
+    if (excludedRoots === undefined) delete dropped.remediationRecovery.excludedRoots;
+    else dropped.remediationRecovery.excludedRoots = excludedRoots;
+    await assert.rejects((cache as any).writeRecovery(bare, BRANCH, dropped), /metadata loss/);
+  }
+  const legacy = structuredClone(saved); delete legacy.remediationRecovery.excludedRoots; write(legacy);
+  await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT);
+  assert.equal(journal().remediationRecovery.excludedRoots, undefined);
+  assert.equal(await cache.readRemediationRecovery(bare, BRANCH, source()), undefined);
+  await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, source()));
+  await assert.rejects(cache.recordRemediationScan(bare, BRANCH, source(), { trusted: true, tip: base, flaggedOIDs: [] }), /custody only/);
+  await assert.rejects((cache as any).writeRecovery(bare, BRANCH, saved), /metadata loss/);
+  commit("legacy import refused");
+  await assert.rejects(fetch(), /custody only/);
+  await cache.blockRemediationRecovery(bare, BRANCH, source());
+  assert.equal(journal().remediationRecovery.excludedRoots, undefined);
+});
+
+
+test("M2 projected root byte overflow denies without eviction or successor effects", async t => {
+  const { displaced, replacement } = await rewritten();
+  const { iteration } = await captureAdoption([displaced, replacement], replacement);
+  const saved = journal();
+  const r = saved.remediationRecovery;
+  // Negative-only schema fixture. At most 1524 in-memory attempts, no Git work in the loop.
+  for (let i = 0; i < 1524; i++) {
+    const root = (i + 1).toString(16).padStart(40, "0");
+    const proposed = { ...r, excludedRoots: [...r.excludedRoots, root] };
+    if (Buffer.byteLength(JSON.stringify(proposed)) > 65536) break;
+    r.excludedRoots.push(root);
+  }
+  assert.ok(r.excludedRoots.length > 64);
+  assert.ok(Buffer.byteLength(JSON.stringify(r)) <= 65536);
+  assert.ok(Buffer.byteLength(JSON.stringify({ ...r, excludedRoots: [...r.excludedRoots, displaced] })) > 65536);
+  const fixtureRoots = new Set(r.excludedRoots);
+  const ancestry = cache.ancestry.bind(cache);
+  t.mock.method(cache, "ancestry", async (repo: string, a: string, b: string) =>
+    fixtureRoots.has(a) ? "divergent" : ancestry(repo, a, b));
+  write(saved);
+  await cache.markRecoveryCapture(bare, clone, BRANCH, RUN, ATTEMPT);
+  const pins = pinnedRefs();
+  const entries = git(bare, "config", "--get-all", "uzi-attempts." + BRANCH + ".entry");
+  let admissions = 0;
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), iteration, successorAttempt,
+    { admitRemediationSource: async () => { admissions++; return true; } }), /invalid remediation/);
+  assert.equal(admissions, 0);
+  assert.deepEqual(journal().remediationRecovery, { ...r, blocked: true });
+  assert.equal(pinnedRefs(), pins);
+  assert.equal(git(bare, "config", "--get-all", "uzi-attempts." + BRANCH + ".entry"), entries);
+});
+
+test("M2 failed ready sync returns no successor and retains the complete new negative union", async t => {
+  const x = commit("clean X"); await fetch();
+  const q = commit("Q", x); await fetch(); await enroll();
+  const d = commit("D", q); await fetch();
+  const s = commit("S"); await fetch();
+  const { iteration } = await captureAdoption([d, x, s], s);
+  const pins = pinnedRefs();
+  const internal = cache as any;
+  const sync = internal.syncJournalAndReadBack.bind(cache);
+  const hook = t.mock.method(internal, "syncJournalAndReadBack", async (...args: any[]) => {
+    if (JSON.parse(args[2]).recovery?.stage === "ready-for-model") throw new Error("ready sync failed");
+    return sync(...args);
+  });
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source(), iteration, successorAttempt, admitSource), /ready sync failed/);
+  hook.mock.restore();
+  const retained = journal();
+  assert.deepEqual(new Set(retained.remediationRecovery.excludedRoots), new Set([d, x]));
+  assert.equal(retained.remediationRecovery.ownedTip, s);
+  assert.equal(pinnedRefs(), pins);
+  const fresh = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  assert.deepEqual((await fresh.readRuntimeRemediationRecovery(bare, BRANCH,
+    { runId: RUN, clonePath: retained.clonePath, attemptId: successorAttempt }))?.excludedRoots,
+    retained.remediationRecovery.excludedRoots);
 });

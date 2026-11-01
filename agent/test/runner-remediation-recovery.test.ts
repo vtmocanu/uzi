@@ -572,3 +572,32 @@ test("source finding unit: failed first negative write and malformed findings re
   }
   assert.equal(writer.mock.callCount(), 1);
 });
+
+
+test("fresh runner restores actual adopted roots independently of flags and edge sources", async t => {
+  const f = await fixture();
+  const x = f.commit("clean inventory ancestor X"); await f.fetch();
+  const q = f.commit("finding descendant of X", x); await f.fetch();
+  await git.recordRemediationScan(f.bare, BRANCH, f.source,
+    { trusted: true, tip: q, flaggedOIDs: [q], origin: "pre-exit" });
+  const d = f.commit("D descendant of Q", q); await f.fetch();
+  const s = f.commit("clean source"); await f.fetch();
+  await git.recordRemediationScan(f.bare, BRANCH, f.source, { trusted: true, tip: s, flaggedOIDs: [] });
+  const context = { runId: RUN, generation: 1, kind: "issue" as const, branch: BRANCH, barePath: f.bare,
+    defaultIdentity: { ref: "refs/remotes/origin/main", sha: f.base } };
+  const coverage = await git.buildRecoveryCoverage(f.bare, context, [d, x, s], s);
+  const reservation = await git.reserveRecoveryIteration(f.bare, BRANCH, KEY, f.source);
+  await git.recordRecoveryCapture(f.bare, BRANCH, KEY, f.source, reservation.attempts, coverage.sha, s);
+  const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 2, "fedcba9876543210");
+  const successor = await git.prepareRecoverySuccessor(f.bare, BRANCH, KEY, f.source, reservation.attempts,
+    attemptId, { admitRemediationSource: async () => true });
+  t.mock.method(git, "secretScanCheckpointRange", async () => ({ trusted: true, findings: [] }));
+  const runner = freshRunner();
+  const flight = f.freshFlight();
+  flight.worktreePath = successor.path;
+  flight.runnerClone = successor;
+  await runner.requireLaunchAuthority(flight);
+  assert.deepEqual(new Set(flight.remediationRestrictions?.roots), new Set([q, d, x]));
+  flight.publishedRealTips = [x];
+  await assert.rejects(runner.requireLaunchAuthority(flight), /published floor conflict/);
+});
