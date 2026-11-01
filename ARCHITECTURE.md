@@ -823,7 +823,7 @@ local round/recovery proofs do not establish hosted authenticated model acceptan
 snapshots a second mode at INSERT, `runs.plan_cross_check_gated` (owner consent,
 non-seeded, kinds `issue`, `prompt` and `ci_fix`, no isolated lane); it is
 mutually exclusive with the required mode (CHECK `runs_plan_cross_check_mode_check`,
-migrations 00393/00394). It reuses the checked-plan machinery (`cross_checks`
+migrations 00394/00395). It reuses the checked-plan machinery (`cross_checks`
 rows, rounds, budget, deadlines, lane, wait banking), but every checker outcome,
 APPROVE included, presents the ordinary human gate: the agent's gated path
 returns `gated_pass`, never an approval grant. Approval authority stays with the

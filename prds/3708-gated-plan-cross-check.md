@@ -73,7 +73,7 @@ The Codex-lead direction with a Claude checker (`cross_check_codex_lead_v1`), th
 Ticked only where committed code and its tests back the item; the full agent suite is proven by exact-head PR CI, not by this list.
 
 M1:
-- [x] Enrollment snapshot: `runs.plan_cross_check_gated` (migrations 00393/00394), required predicate unchanged, INSERT parity for `CreateRun`, `ci_fix` and schedule inserts.
+- [x] Enrollment snapshot: `runs.plan_cross_check_gated` (migrations 00394/00395), required predicate unchanged, INSERT parity for `CreateRun`, `ci_fix` and schedule inserts.
 - [x] Server backstop: bound human-approval arms widened, `SetRunAutopilotPlan` refuses gated runs, digest-bound "passed", trigger `enforce_gated_plan_approval`.
 - [x] Gated check path in the agent (`gated_pass`; every outcome ends at the human gate) and gated recovery rules.
 - [x] Server-recorded `worker_unsupported` for a worker without the capability, and the four-way version matrix.
