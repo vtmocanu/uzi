@@ -165,3 +165,93 @@ it("retires matching Codex admission authority before sending the park", async (
   assert.equal(parkCalls, 1);
   assert.equal(admissionCalls, 0);
 });
+
+
+for (const negotiated of [false, true]) {
+  for (const strict400 of [false, true]) {
+    it(`iteration cancellation keeps its generation: negotiated=${negotiated} strict400=${strict400}`, async () => {
+      const sent: unknown[] = [];
+      const worker = client(async (_url, init) => {
+        sent.push(JSON.parse(String(init!.body)));
+        return strict400
+          ? Response.json({ error: "invalid request body" }, { status: 400 })
+          : Response.json({ run: { id: "run", status: "failed", plan_md: "x".repeat(20 * 1024) } });
+      });
+      worker.protocolFeatures = negotiated ? ["claim_generation_fence"] : [];
+      const body = { status: "failed" as const, failure_reason: "run cancelled", claim_generation: 7, session_id: "session" };
+      const result = worker.reportState("run", body, undefined, { iterationCancellation: true });
+      body.claim_generation = 8;
+      body.session_id = "changed";
+      if (strict400) await assert.rejects(result);
+      else assert.equal((await result).status, "failed");
+      assert.deepEqual(sent, [{ status: "failed", failure_reason: "run cancelled", claim_generation: 7, session_id: "session" }]);
+    });
+  }
+}
+
+it("iteration cancellation rejects ineligible bodies before transport", async () => {
+  let calls = 0;
+  const worker = client(async () => { calls++; return Response.json({}); });
+  const body = { status: "failed" as const, failure_reason: "run cancelled", claim_generation: 7 };
+  for (const invalid of [
+    ...[undefined, 0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1].map(claim_generation => ({ ...body, claim_generation })),
+    { ...body, failure_reason: "ordinary failure" }, { ...body, status: "running" as const },
+    { ...body, branch: "extra" },
+  ]) await assert.rejects(worker.reportState("run", invalid, undefined, { iterationCancellation: true }), /exact cancellation body/);
+  assert.equal(calls, 0);
+});
+
+
+it("iteration cancellation bounds actual streamed state ACKs at the existing 6MiB cap", async () => {
+  let consumed = 0;
+  let cancelled = false;
+  const cap = 6 * 1024 * 1024;
+  const bytes = Buffer.from(JSON.stringify({ run: { id: "run", status: "failed", plan_md: "x".repeat(cap) } }));
+  const worker = client(async () => new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (consumed === bytes.length) { controller.close(); return; }
+      controller.enqueue(bytes.subarray(consumed, consumed + 1024));
+      consumed += 1024;
+    },
+    cancel() { cancelled = true; },
+  }, { highWaterMark: 0 }), { headers: { "Content-Length": "1" } }));
+  await assert.rejects(worker.reportState("run", {
+    status: "failed", failure_reason: "run cancelled", claim_generation: 7,
+  }, undefined, { iterationCancellation: true }));
+  assert.equal(consumed, cap + 1024);
+  assert.equal(cancelled, true);
+});
+
+it("iteration cancellation seals the same Codex claim before its HTTP attempt", async () => {
+  const claim = makeClaim({ claim_generation: 7, secrets: { forge_pat: "fixture-pat", codex: {
+    auth_mode: "subscription", access_token: "fixture-access", capability: "fixture-capability",
+    generation: 3, chatgpt_account_id: "fixture-account", chatgpt_plan_type: null,
+  } } });
+  let stateCalls = 0;
+  let admissionCalls = 0;
+  const worker = client(async url => {
+    const path = String(url);
+    if (path.includes("/runs/claim")) return Response.json(claim);
+    if (path.endsWith("/state")) {
+      stateCalls++;
+      assert.equal(worker.codexAdmissionReporter(claim.run_id, 7), undefined);
+      return Response.json({ error: "invalid request body" }, { status: 400 });
+    }
+    admissionCalls++;
+    return new Response(null, { status: 204 });
+  });
+  worker.protocolFeatures = ["codex_account_admission_signal_v1", "claim_generation_fence"];
+  await worker.claimRun();
+  const reporter = worker.codexAdmissionReporter(claim.run_id, 7);
+  assert.ok(reporter);
+  await assert.rejects(worker.reportState(claim.run_id, {
+    status: "failed", failure_reason: "run cancelled", claim_generation: 7,
+  }, undefined, { iterationCancellation: true }));
+  const attempt = reporter.begin("thread");
+  attempt.bind("turn");
+  attempt.observe({ kind: "codex_error", method: "error", threadId: "thread", turnId: "turn", willRetry: true,
+    params: { threadId: "thread", turnId: "turn", error: { codexErrorInfo: "rateLimitExceeded" } } });
+  await barrier();
+  assert.equal(stateCalls, 1);
+  assert.equal(admissionCalls, 0);
+});

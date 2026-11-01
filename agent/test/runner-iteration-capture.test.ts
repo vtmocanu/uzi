@@ -25,7 +25,7 @@ function barrier() {
   const timer = setTimeout(() => reject(new Error("iteration admission event did not arrive")), 30_000);
   return { promise: promise.finally(() => clearTimeout(timer)), resolve };
 }
-const modes = ["capture", "root cancel", "root fence", "preadmission cancel", "preadmission fence", "pending admission", "joined cleanup rejection"] as const;
+const modes = ["capture", "root cancel", "root cancel lost report", "root fence", "preadmission cancel", "preadmission fence", "pending admission", "joined cleanup rejection"] as const;
 for (const mode of modes) {
   it(`Codex iteration capture: ${mode} preserves source and custody after joined sink`, async t => {
     const iid = 359800 + modes.indexOf(mode);
@@ -38,7 +38,7 @@ for (const mode of modes) {
     // These barriers are only needed in the pending admission scenario.
     if (mode !== "pending admission") { admission.resolve(); release.resolve(); }
     const lifecycle = new AbortController();
-    let sink = false, publication = false, injected = 0, joined = false;
+    let sink = false, publication = false, injected = 0, joined = false, sinkJoined = false;
     let revoked = false, source = 0, turns = 0, freeCalls = 0;
     let steering: SteeringChannel | undefined;
     type Flight = { steering: SteeringChannel; preserveSession: boolean; preserveRecoveryClone: boolean; iterationParkState: string };
@@ -76,9 +76,9 @@ for (const mode of modes) {
     if (reservation.kind === "reserved") rig.registry.registerRoot(reservation.reservation, {
       kind: "provider",
       reap: async () => {
-        if (sink && !revoked && (mode === "root cancel" || mode === "root fence")) {
+        if (sink && !revoked && (mode.startsWith("root cancel") || mode === "root fence")) {
           revoked = true;
-          if (mode === "root cancel") steering!.markCancelled();
+          if (mode.startsWith("root cancel")) steering!.markCancelled();
           else t.mock.method(steering!, "claimFence", () => "stale");
         }
         return { ok: true };
@@ -131,7 +131,7 @@ for (const mode of modes) {
       buildCheckpointOverlay: (...args: unknown[]) => Promise<unknown>;
     };
     const gated = internal.runGatedSink.bind(runner);
-    t.mock.method(internal, "runGatedSink", (f: Flight, action: () => Promise<unknown>) => {
+    t.mock.method(internal, "runGatedSink", async (f: Flight, action: () => Promise<unknown>) => {
       flight = f;
       steering = f.steering;
       if (sink && mode.startsWith("preadmission")) {
@@ -142,7 +142,29 @@ for (const mode of modes) {
         if (mode === "preadmission cancel") steering.markCancelled();
         else t.mock.method(steering, "claimFence", () => "stale");
       }
-      return gated(f, action);
+      const iterationSink = sink;
+      try { return await gated(f, action); }
+      finally { if (iterationSink) sinkJoined = true; }
+    });
+    let cancellationSends = 0;
+    if (mode === "root cancel lost report") {
+      const transport = globalThis.fetch;
+      t.mock.method(globalThis, "fetch", async (...args: Parameters<typeof transport>) => {
+        const body = typeof args[1]?.body === "string" ? JSON.parse(args[1].body) : undefined;
+        if (body?.failure_reason === "run cancelled") {
+          cancellationSends++;
+          assert.equal(sinkJoined, true);
+          assert.equal(body.claim_generation, 7);
+          throw new Error("ambiguous cancellation response lost");
+        }
+        return transport(...args);
+      });
+    }
+    const reportState = client.reportState.bind(client);
+    t.mock.method(client, "reportState", async (...args: Parameters<typeof client.reportState>) => {
+      if (args[1].status === "failed" && args[1].failure_reason === "run cancelled")
+        assert.equal(sinkJoined, true, "cancellation report follows joined iteration capture");
+      return reportState(...args);
     });
     let genericFailures = 0, pushes = 0;
     t.mock.method(internal, "reportGenericFailure", async () => { genericFailures++; });
@@ -187,7 +209,12 @@ for (const mode of modes) {
     assert.equal(archive.releaseCalls.length, 0);
     assert.equal(api.completionPermitRequests.length, 0);
     assert.equal(api.wallParkRequests.length, 0);
-    assert.ok(!api.states.some(s => ["failed", "completed", "pause_failed"].includes(s.body.status!)));
+    const terminalReports = api.states.filter(s => ["failed", "completed", "pause_failed"].includes(s.body.status!));
+    assert.deepEqual(terminalReports, mode === "root cancel" || mode === "preadmission cancel" ? [{
+      runId: claim.run_id,
+      body: { status: "failed", failure_reason: "run cancelled", claim_generation: claim.claim_generation },
+    }] : []);
+    if (mode === "root cancel lost report") assert.equal(cancellationSends, 3, "bounded retries keep generation without generic failure");
     assert.ok(api.iterationParkRequests.length <= 2);
     assert.equal(fs.readFileSync(path.join(worktreeDirFor(iid), "DIRTY.txt"), "utf8"), "Codex dirty iteration work\n");
     assert.equal(fs.readFileSync(path.join(homeDir, "SESSION"), "utf8"), "Codex retained session\n");

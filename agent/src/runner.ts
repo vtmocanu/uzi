@@ -11099,7 +11099,9 @@ export class RunRunner {
         const transport = () => checked === "semantic"
           ? this.client.reportSemanticPlanGateState(runId, stamped, signal)
           : checked ? this.client.reportPlanCrossCheckGateState(runId, stamped, signal)
-          : this.client.reportState(runId, stamped, signal);
+          : body === flight.iterationCancellationReport
+            ? this.client.reportState(runId, stamped, signal, { iterationCancellation: true })
+            : this.client.reportState(runId, stamped, signal);
         // Preservation expiry cannot prevent the honest terminal report. FINAL stays budgeted.
         const sending = body.status === "failed" || body.status === "completed"
           ? MaintenanceBudget.withoutAttempt(transport) : transport();

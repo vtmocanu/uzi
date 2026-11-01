@@ -271,6 +271,7 @@ for (const mode of cases) {
       assert.equal(terminalReports.length, 1, "one authoritative cancellation report");
       assert.equal(terminalReports[0]!.body.status, "failed");
       assert.equal(terminalReports[0]!.body.failure_reason, "run cancelled");
+      assert.equal(terminalReports[0]!.body.claim_generation, 7);
     } else assert.deepEqual(terminalReports, []);
     assert.ok(fs.existsSync(worktreeDirFor(iid)), "clone retained");
     assert.equal(fs.readFileSync(path.join(homeDir, "SESSION"), "utf8"), "session retained");

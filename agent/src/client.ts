@@ -2429,8 +2429,21 @@ export class WorkerClient {
    * so parsing a 409's status back out of the error text would work in tests and
    * fail on real runs.
    */
-  async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
+  async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal,
+    options?: { iterationCancellation?: true }): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    if (options?.iterationCancellation) {
+      // Snapshot before any asynchronous work; only the iteration sink cancellation
+      // may bypass compatibility negotiation, with its exact claim authority intact.
+      const frozen = Object.freeze(structuredClone(body));
+      if (frozen.status !== "failed" || frozen.failure_reason !== "run cancelled" ||
+          !Number.isSafeInteger(frozen.claim_generation) || (frozen.claim_generation ?? 0) <= 0 ||
+          (frozen.session_id !== undefined && typeof frozen.session_id !== "string") ||
+          Object.keys(frozen).some(key => !["status", "failure_reason", "claim_generation", "session_id"].includes(key)))
+        throw new Error("iteration cancellation requires exact cancellation body and positive generation");
+      this.sealCodexAdmission(path, frozen);
+      return this.reportStateOnce(runId, path, frozen, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+    }
     this.sealCodexAdmission(path, body);
     if (body.source_publication !== undefined) {
       // Snapshot nested proof once, before either transport retries or caller mutation.
