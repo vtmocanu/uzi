@@ -843,10 +843,12 @@ completed locally, with hosted acceptance above still unchecked:
   drains handlers; the bounded listing ends without custody release, a detached
   listing or an open transaction. It does not assume that `http.Server.Shutdown`
   immediately cancels active request contexts.
-  This test does not prohibit a valid admitted FINAL from completing during the
-  drain. The stronger interpretation of plan v4's shutdown-cancellation wording
-  remains an explicit review question, not acceptance silently credited by this
-  stalled-listing case; no global server shutdown behavior is changed here.
+  `TestHandlerPrerequisiteFinalShutdownAtomicCommitLiveDB` additionally starts
+  drain mid-request with a valid pin: either release and capture protection commit
+  fully, or a bounded refusal leaves both unchanged. After HTTP shutdown and the
+  prerequisite drain return, no handler, listing or transaction remains open.
+  The agreed graceful-drain interpretation is recorded in the Decision Log below;
+  no global server shutdown behavior is changed here.
 - The worker journal test uses an explicit test-only
   `UZI_RECOVERY_COMPAT_READER` module path for the actual untouched pre-C2 reader
   at `cb6ebd8f`. That reader authenticated and retained the new signed thin journal,
@@ -931,7 +933,7 @@ the ADR amendments dated 2026-11-01.
 | 2026-10-28 (draft consequence, pending review) | Keep the compatible default-tip anchor and all ancestry/binding/lifetime rules; no token expansion or retry at a new D after invocation. #2969 consumes implementation-proven pin status within its existing window only. | E2 closes the tested transport question, not implementation, integration, other-forge feasibility or #3031 producer FINAL authority. |
 | 2026-10-28 (user; matching draft review pending) | Split C1 into API-only C1a ready-query/guard/fixture prefactor and dependent C1b complete pin lifecycle; C2 owns agent changes and release. Publish E4 distribution, clarify registration/status/retry contracts, use next free migrations at landing. | One reviewable invariant first; no partial pin lifecycle, capability advertisement or release. Agent changes in later children use full-suite exact-head PR CI; C1a/C1b stop on agent scope drift. |
 | 2026-10-31 (lead/buddy scope agreement after paired architecture review) | Keep C2 as one release-proof child and one PR, implemented in reviewed serial commits; C3 remains the independently useful owner/restore child and is dispatched serially by default because files overlap. | No independently valuable further C2 split was identified under the supported-worker acceptance. A dark, nonadvertised API-first stage is a safe fallback if run size requires it, but does not by itself deliver the supported-worker release outcome. Advertisement before API acceptance is implemented remains forbidden; API-first acceptance without advertisement does not create that rollout hole. C1b already isolated pin creation/lifetime. The API, worker, schema and reader compatibility must agree on the same proof; size alone does not justify dropping tests or authority checks. This records the reviewed scope choice; dispatch still requires its gated plan review. |
-
+| 2026-11-01 (lead/buddy C2 landing review) | Preserve existing graceful HTTP drain. Graceful drain lets in-flight requests finish or time out within their request-bounded context; shutdown does not cancel handler contexts; plan v4 wording was stronger than production and is superseded. | Safety comes from atomic release plus the full locked recheck, not cancellation on shutdown. A valid in-flight FINAL may commit fully during drain; a stalled listing ends by its bounded context without custody effect. After HTTP shutdown and DrainPrerequisiteClosures return, no detached listing/goroutine or open transaction remains. No global shutdown change or new cancellation subsystem is authorized. |
 
 ## Open questions (owner calls)
 

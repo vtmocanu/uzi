@@ -834,6 +834,13 @@ needs all of the following.
      records `release_evidence = prerequisite_closure` and a `final_closure_id`
      that the schema ties to the exact closure, capture and hold.
 
+**API shutdown uses graceful drain.** In-flight FINALs finish or time out within
+their request-bounded context; shutdown does not cancel handler contexts. A valid
+release can commit fully during drain, after the same locked checks. A stalled
+listing times out without custody effect. HTTP shutdown precedes the prerequisite
+drain; after both return there is no detached listing or open transaction. This
+is separate from the worker background-recovery cancellation described above.
+
 The API refuses as follows (the closure-specific outcomes plus the two generic refusals the closure path can also return). Every refusal keeps custody; the worker keeps the
 saved FINAL and retries.
 
