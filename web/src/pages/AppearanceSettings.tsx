@@ -410,7 +410,8 @@ export function AppearanceSettings() {
           <SectionTitle>Demo mode</SectionTitle>
           <p id="demo-mode-desc" className="mt-2 text-sm text-muted">
             This device only. Masks emails, repo names, forge host, and other
-            identifying info in what you see — for screenshots. Doesn&apos;t change
+            identifying info for screenshots. Hides instance branding (logos and
+            company name). Doesn&apos;t change
             your data or affect anyone else.
           </p>
         </div>

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AppShell, __resetBrandingForTests, __resetBuildInfoForTests } from "./AppShell";
 import { api, type Branding } from "../lib/api";
@@ -8,6 +8,10 @@ import { DEFAULT_TITLE } from "../lib/brandTitle";
 import { useAuth } from "../auth/AuthContext";
 import { licenseCreditEnabled } from "../lib/flags";
 import { mockBuildInfo } from "../mocks/data";
+import { setDemoMode } from "../lib/demoMode";
+import { useFavicon } from "../lib/useFavicon";
+
+vi.mock("../lib/useFavicon", () => ({ useFavicon: vi.fn() }));
 
 // Instance-branding chrome (PRD #685 M3a): the custom app mark across all four
 // surfaces (desktop aside, mobile drawer, signed-out PublicShell, mobile signed-in
@@ -95,6 +99,7 @@ function signOut() {
 }
 
 beforeEach(() => {
+  setDemoMode(false);
   __resetBrandingForTests();
   __resetBuildInfoForTests();
   signIn();
@@ -108,6 +113,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  setDemoMode(false);
   window.localStorage.clear();
 });
 
@@ -125,6 +131,82 @@ function renderShell(initial = "/dashboard") {
 // "admin@uzi.local" also contains "uzi", so match the subtitle instead), and a
 // substring regex because PublicShell/mobile render it as "· uzinele întunecate".
 const NAME_RE = /uzinele întunecate/;
+
+describe("AppShell demo branding", () => {
+  it("keeps stock branding when the real response arrives with demo already on", async () => {
+    setDemoMode(true);
+    let resolveBranding!: (branding: Branding) => void;
+    mockApi.branding.mockReturnValue(new Promise((resolve) => { resolveBranding = resolve; }));
+    renderShell();
+    await act(async () => resolveBranding(brandingWith({ app_logo_mode: "custom", app_logo_present: true, app_logo_keep_name: false, brand_mode: "text", brand_company: "Acme, Inc." })));
+    expect(screen.getAllByTestId("app-mark-fallback")).toHaveLength(2);
+    expect(screen.getAllByText("uzi", { exact: true })).toHaveLength(2);
+    expect(document.title).toBe(DEFAULT_TITLE);
+    expect(screen.queryAllByTestId("app-logo-img")).toHaveLength(0);
+    expect(screen.queryByText("Acme, Inc.")).toBeNull();
+    act(() => setDemoMode(false));
+    expect(screen.getAllByTestId("app-logo-img")).toHaveLength(2);
+    expect(document.title).toBe("Acme, Inc.");
+  });
+
+  const cases: Partial<Branding>[] = [
+    { app_logo_mode: "preset", app_logo_preset: "metaminds", brand_mode: "text" },
+    { app_logo_mode: "custom", app_logo_present: true, brand_mode: "text" },
+    { app_logo_mode: "custom", app_logo_present: true, app_logo_keep_name: false, brand_mode: "text" },
+    { app_logo_mode: "preset", app_logo_preset: "metaminds", app_logo_keep_name: false, brand_mode: "logo", brand_logo_present: true },
+    { app_logo_mode: "custom", app_logo_present: true, brand_mode: "logo", brand_logo_present: true, brand_placement: "topright" },
+  ];
+
+  it.each(cases)("restores branding live after masking %j on every signed-in mark", async (overrides) => {
+    const branding = brandingWith({ brand_company: "Acme, Inc.", ...overrides });
+    mockApi.branding.mockResolvedValue(branding);
+    renderShell();
+    fireEvent.click(screen.getByLabelText("Open navigation"));
+    // Start with the real assets as a positive control for every hidden channel.
+    expect(await screen.findAllByTestId("app-logo-img")).toHaveLength(3);
+    act(() => setDemoMode(true));
+    expect(screen.queryAllByTestId("app-logo-img")).toHaveLength(0);
+    expect(screen.getAllByTestId("app-mark-fallback")).toHaveLength(3);
+    expect(screen.getAllByText("uzi", { exact: true })).toHaveLength(3);
+    expect(screen.queryByText(/powered by/)).toBeNull();
+    expect(screen.queryByText("Acme, Inc.")).toBeNull();
+    expect(screen.queryAllByTestId("brand-logo-img")).toHaveLength(0);
+    expect(document.title).toBe(DEFAULT_TITLE);
+    expect(vi.mocked(useFavicon).mock.lastCall?.[0].appLogoSrc).toBeNull();
+
+    act(() => setDemoMode(false));
+    expect(screen.getAllByTestId("app-logo-img")).toHaveLength(3);
+    expect(screen.queryAllByText(NAME_RE)).toHaveLength(branding.app_logo_keep_name ? 3 : 0);
+    expect(document.title).toBe(branding.app_logo_keep_name ? DEFAULT_TITLE : "Acme, Inc.");
+    expect(vi.mocked(useFavicon).mock.lastCall?.[0].appLogoSrc).toBe(
+      branding.app_logo_mode === "preset" ? "/brand-presets/metaminds.svg" : "/api/branding/logo/app",
+    );
+    if (branding.brand_mode === "text") {
+      expect(screen.getAllByText("Acme, Inc.")).toHaveLength(2);
+    } else {
+      expect(screen.getAllByTestId("brand-logo-img")).toHaveLength(2);
+    }
+  });
+
+  it.each([false, true])("hides an enabled license credit and restores it live (signed out: %s)", async (signedOut) => {
+    if (signedOut) signOut();
+    vi.mocked(licenseCreditEnabled).mockReturnValue(true);
+    mockApi.branding.mockResolvedValue(brandingWith({ app_logo_mode: "custom", app_logo_present: true, app_logo_keep_name: false, brand_company: "Acme, Inc." }));
+    renderShell(signedOut ? "/" : "/dashboard");
+    await screen.findAllByTestId("app-logo-img");
+    expect(screen.getAllByTestId("license-credit").length).toBeGreaterThan(0);
+    act(() => setDemoMode(true));
+    expect(screen.queryAllByTestId("license-credit")).toHaveLength(0);
+    expect(screen.queryAllByTestId("app-logo-img")).toHaveLength(0);
+    expect(screen.getAllByTestId("app-mark-fallback")).toHaveLength(signedOut ? 1 : 2);
+    expect(screen.getAllByText("uzi", { exact: true })).toHaveLength(signedOut ? 1 : 2);
+    expect(document.title).toBe(DEFAULT_TITLE);
+    act(() => setDemoMode(false));
+    expect(screen.getAllByTestId("license-credit").length).toBeGreaterThan(0);
+    expect(screen.getAllByTestId("app-logo-img")).toHaveLength(signedOut ? 1 : 2);
+    expect(document.title).toBe("Acme, Inc.");
+  });
+});
 
 describe("AppShell branding — build-flag-gated credit", () => {
   // Leaves both branding and version pending to prove the credit renders while BOTH
