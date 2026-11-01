@@ -842,7 +842,8 @@ export class Worker {
     // Issue #1324 D6: a run holding a publication-intent record resumes publication only. It is attested
     // under publication_resume and NEVER also under finalize_resume (it must not consume the #1742
     // one-shot allowance), so any run with a publication record or file present is withheld from the finalize
-    // list, whether the record is ACKed or not and whether it is readable or not. The api's finalize requeue has no
+    // list, whether the record is ACKed or not and whether it authenticates or not (a run directory that cannot be
+    // listed at all is not detected and keeps its finalize entry; deferred). The api's finalize requeue has no
     // enrollment predicate, so withholding here is what keeps an enrolled run off the allowance when its ACK was
     // lost or its record failed authentication. The cost: a never-enrolled run with an uncertain local record takes
     // the ordinary orphan requeue instead of the #1742 finalize path.
