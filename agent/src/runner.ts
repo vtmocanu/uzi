@@ -8416,6 +8416,7 @@ export class RunRunner {
               cloneUrl: claim.repo.clone_url,
               forgeUsername: claim.secrets.forge_username,
               signal: boundarySignal,
+              closureMint: "deny",
             });
             terminalCaptureVerified = outcome.state === "uploaded";
             runLog.info("recovery: finalization-failure capture outcome", {
@@ -16297,6 +16298,7 @@ export class RunRunner {
       onArchiveAccepted: (accepted: RecoveryRecord) => this.archiveAccepted(flight, accepted),
       onCancellationObserved: () => this.observeCancellation(flight),
       record, barePath, defaultBranch: record.defaultBranch!, signal,
+      closureMint: "deny" as const,
     };
     // V1 ordinary settlement keeps its archive entry point; deferred held work
     // and V2 share the coordinator's frozen-record ordering and reconciliation.
@@ -16430,7 +16432,7 @@ export class RunRunner {
           this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), scan.findings, flight.runLog);
       },
       remediationHold: () => this.checkpointRemediationHold(flight, flight.barePath!, record.sourceSha, true),
-      ciHold: () => this.ciConfigGuardBlocksPublication(flight, flight.barePath!, record.sourceSha, "held publication"),
+      ciHold: () => this.ciConfigGuardVerdict(flight, flight.barePath!, record.sourceSha, "held publication"),
     });
   }
 
@@ -18076,16 +18078,22 @@ export class RunRunner {
    * Never fails the run; the early and final push guards do that.
    */
   private async ciConfigGuardBlocksPublication(flight: RunFlight, barePath: string, sha: string, what: string): Promise<boolean> {
+    return (await this.ciConfigGuardVerdict(flight, barePath, sha, what)) !== "clear";
+  }
+
+  /** The tri-state form: "unknown" (diff not computable) still blocks, but a caller that attests a
+   *  stated refusal must not read it as one. */
+  private async ciConfigGuardVerdict(flight: RunFlight, barePath: string, sha: string, what: string): Promise<"clear" | "blocked" | "unknown"> {
     const globs = flight.ciConfigGuardGlobs;
-    if (!globs) return false;
+    if (!globs) return "clear";
     const changed = await this.git.changedFilesNoRenames(barePath, sha);
     const flagged = changed === null ? null : flagCIConfigPathsRaw(changed, globs);
-    if (flagged !== null && flagged.length === 0) return false;
+    if (flagged !== null && flagged.length === 0) return "clear";
     const shown = flagged === null ? "diff could not be computed" : flagged.slice(0, 5).map(displayGuardPath).join(", ") +
       (flagged.length > 5 ? `, and ${flagged.length - 5} more` : "");
     this.reportPublishOutcome(flight, `ci_config_guard:${what}`,
       `${what} skipped: CI-config guard (${shown}); work stays local`, { sha: sha.slice(0, 12) });
-    return true;
+    return flagged === null ? "unknown" : "blocked";
   }
 
   private async publishCheckpointBestEffort(
@@ -19190,6 +19198,7 @@ export class RunRunner {
         cloneUrl: claim.repo.clone_url,
         forgeUsername: claim.secrets.forge_username,
         signal,
+        closureMint: "deny",
       });
       // issue #1507 — the transient bare pin goes only once a durable replacement exists. An archive
       // upload's pin is deleted by the recovery coordinator itself (cleanupUploadedRecoveryPin, after
@@ -24155,6 +24164,9 @@ export class RunRunner {
                 onCancellationObserved: () => this.observeCancellation(flight),
                 record: record!, barePath: bare, defaultBranch: record!.defaultBranch!,
                 signal: held.signal,
+                // The retained claim evaluates only the missing-metadata and feature-snapshot grants; the
+                // run is still executing here, so the coordinator's inactive-inventory check blocks any mint.
+                closureMint: "retained_claim",
               });
               await check();
               const local = await this.recovery.verifiedLocalCapture(record!, held.signal);

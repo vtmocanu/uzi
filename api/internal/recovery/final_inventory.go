@@ -26,6 +26,43 @@ func validCoverageDigest(digest string) bool {
 	return err == nil && hex.EncodeToString(bytes) == digest
 }
 
+// finalRunFacts is the run state a FINAL release judges its generation by.
+type finalRunFacts struct {
+	status    string
+	gen       int64
+	released  pgtype.Timestamptz
+	parkCause pgtype.Text
+}
+
+// finalReplayMatches reports whether a released hold is the receipt of exactly this FINAL.
+// A closure-backed archive release is an archive receipt like any other.
+func finalReplayMatches(hold store.RecoveryCustodyHold, f *apitypes.RecoveryFinalDisposition, capture pgtype.UUID, evidence *string) bool {
+	return hold.FinalDisposition.String == f.Kind && hold.FinalCaptureID == capture &&
+		hold.FinalSourceSha.String == f.SourceSha && hold.FinalCoverageDigest.String == f.CoverageDigest &&
+		(f.Kind == "archive" || (evidence != nil && hold.ReleaseEvidence.String == *evidence))
+}
+
+// finalInventoryEligible is the mutable custody gate shared by every FINAL release (and the
+// closure-backed release's unlocked precheck): an open guarded hold live on this worker, no
+// owner-only park, and an ended generation. forgeNoOutput admits the settled pre-clone proof.
+func finalInventoryEligible(hold store.RecoveryCustodyHold, workerID uuid.UUID, run finalRunFacts, generation int64, forgeNoOutput bool) bool {
+	if hold.State != "open" || !hold.InventoryGuarded || !hold.LiveWorkerID.Valid ||
+		uuid.UUID(hold.LiveWorkerID.Bytes) != workerID {
+		return false
+	}
+	// Requeue exhaustion and memory pressure release the claim but leave custody an owner-only decision
+	// (Resume/Cancel); a worker's archive or settled proof must not end it implicitly.
+	if run.status == "recovery_wait" && run.parkCause.Valid && (run.parkCause.String == "worker_requeue_exhausted" || run.parkCause.String == "worker_memory_pressure" || run.parkCause.String == "retained_recovery_exhausted" || run.parkCause.String == "retained_recovery_adoption_failed") {
+		return false
+	}
+	// A forge_unreachable park is a pre-clone park of a generation that may have adopted nothing:
+	// the parked run keeps its claim, so only a settled forge_no_output release (the worker's
+	// positive no-adopted-source proof, empty digest) may end that exact generation early. An
+	// archive release and a publication release keep the terminal/released/newer-claim gate.
+	forgeParkedEmpty := forgeNoOutput && run.status == "recovery_wait" && run.parkCause.Valid && run.parkCause.String == "forge_unreachable"
+	return run.gen > generation || (run.gen == generation && (run.released.Valid || custodyRunTerminalStatuses[run.status] || forgeParkedEmpty))
+}
+
 // releaseFinalInventory locks worker, run, hold, then capture. All proof and release
 // mutations share this transaction; custody hooks run only after its commit.
 func (s *Service) releaseFinalInventory(ctx context.Context, wkr store.Worker, runID uuid.UUID, req apitypes.RecoveryReleaseRequest) (apitypes.RecoveryReleaseResponse, error) {
@@ -92,30 +129,13 @@ func (s *Service) releaseFinalInventory(ctx context.Context, wkr store.Worker, r
 		return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
 	}
 	if hold.State == "released" {
-		if hold.FinalDisposition.String == f.Kind && hold.FinalCaptureID == capture &&
-			hold.FinalSourceSha.String == f.SourceSha && hold.FinalCoverageDigest.String == f.CoverageDigest &&
-			(f.Kind == "archive" || hold.ReleaseEvidence.String == *req.ReleaseEvidence) {
+		if finalReplayMatches(hold, f, capture, req.ReleaseEvidence) {
 			return ack, nil
 		}
 		return apitypes.RecoveryReleaseResponse{}, ErrManifestConflict
 	}
-	if hold.State != "open" || !hold.InventoryGuarded || !hold.LiveWorkerID.Valid ||
-		uuid.UUID(hold.LiveWorkerID.Bytes) != wkr.ID {
-		return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
-	}
-	// Requeue exhaustion and memory pressure release the claim but leave custody an owner-only decision
-	// (Resume/Cancel); a worker's archive or settled proof must not end it implicitly.
-	if status == "recovery_wait" && parkCause.Valid && (parkCause.String == "worker_requeue_exhausted" || parkCause.String == "worker_memory_pressure" || parkCause.String == "retained_recovery_exhausted" || parkCause.String == "retained_recovery_adoption_failed") {
-		return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
-	}
-	// A forge_unreachable park is a pre-clone park of a generation that may have adopted nothing:
-	// the parked run keeps its claim, so only a settled forge_no_output release (the worker's
-	// positive no-adopted-source proof, empty digest) may end that exact generation early. An
-	// archive release and a publication release keep the terminal/released/newer-claim gate.
-	forgeParkedEmpty := f.Kind == "settled" && *req.ReleaseEvidence == "forge_no_output" &&
-		status == "recovery_wait" && parkCause.Valid && parkCause.String == "forge_unreachable"
-	ended := gen > *req.Generation || (gen == *req.Generation && (released.Valid || custodyRunTerminalStatuses[status] || forgeParkedEmpty))
-	if !ended {
+	forgeNoOutput := f.Kind == "settled" && *req.ReleaseEvidence == "forge_no_output"
+	if !finalInventoryEligible(hold, wkr.ID, finalRunFacts{status, gen, released, parkCause}, *req.Generation, forgeNoOutput) {
 		return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
 	}
 	evidence := "archive"
@@ -136,6 +156,12 @@ func (s *Service) releaseFinalInventory(ctx context.Context, wkr store.Worker, r
 				return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
 			}
 			return apitypes.RecoveryReleaseResponse{}, err
+		}
+		if len(cap.PrerequisiteShas) != 0 && cap.SourceSha == f.SourceSha && cap.CoverageDigest.String == f.CoverageDigest {
+			// A thin capture is released only against its pinned prerequisite closure, which
+			// needs forge I/O: end this transaction (releasing every lock) before any of it.
+			_ = tx.Rollback(ctx)
+			return s.releaseFinalClosure(ctx, wkr, runID, req, uuid.UUID(capture.Bytes))
 		}
 		if cap.SourceSha != f.SourceSha || cap.CoverageDigest.String != f.CoverageDigest ||
 			!cap.ManifestBound || len(cap.PrerequisiteShas) != 0 || cap.State != "available" || !cap.ExpiresAt.Valid || !cap.ExpiresAt.Time.After(time.Now()) {

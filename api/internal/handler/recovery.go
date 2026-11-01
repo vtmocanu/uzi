@@ -53,6 +53,12 @@ func mapRecoveryError(w http.ResponseWriter, err error) {
 		httpx.ErrorReason(w, http.StatusRequestEntityTooLarge, "bundle exceeds the maximum size", "oversize")
 	case errors.Is(err, recovery.ErrManifestConflict):
 		httpx.ErrorReason(w, http.StatusConflict, "a different manifest is already bound for this capture", "manifest_conflict")
+	case errors.Is(err, recovery.ErrPrerequisitePinMissing):
+		httpx.ErrorReason(w, http.StatusConflict, "the prerequisite closure pin is missing", "prerequisite_pin_missing")
+	case errors.Is(err, recovery.ErrPrerequisitePinForeign):
+		httpx.ErrorReason(w, http.StatusConflict, "the prerequisite closure pin is foreign", "prerequisite_pin_foreign")
+	case errors.Is(err, recovery.ErrPrerequisitePinUnavailable):
+		httpx.ErrorReason(w, http.StatusServiceUnavailable, "the prerequisite closure pin is unavailable; retry shortly", "prerequisite_pin_unavailable")
 	case errors.Is(err, recovery.ErrQuota):
 		httpx.ErrorReason(w, http.StatusInsufficientStorage, "storage quota exceeded", "quota")
 	case errors.Is(err, recovery.ErrIntegrity):

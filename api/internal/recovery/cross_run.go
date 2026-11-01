@@ -347,7 +347,10 @@ func classifyCrossRunHold(h store.RecoveryCustodyHold, terminal int64, generatio
 	switch h.FinalDisposition.String {
 	case "archive":
 		c, ok := captures[uuid.UUID(h.FinalCaptureID.Bytes)]
-		if ev != "archive" || !h.FinalCaptureID.Valid || !ok || h.FinalPublicationID.Valid ||
+		// A closure-backed archive release carries its pinned closure's id; the closure row's
+		// state is deliberately not consulted (the pin may later be deleted by cleanup).
+		evidenceOK := (ev == "archive" && !h.FinalClosureID.Valid) || (ev == "prerequisite_closure" && h.FinalClosureID.Valid)
+		if !evidenceOK || !h.FinalCaptureID.Valid || !ok || h.FinalPublicationID.Valid ||
 			!h.FinalSourceSha.Valid || !h.FinalCoverageDigest.Valid || !validCoverageDigest(h.FinalCoverageDigest.String) ||
 			c.HoldID != h.ID || c.RunID != h.RunID || c.UserID != h.UserID ||
 			!c.OriginalWorkerID.Valid || uuid.UUID(c.OriginalWorkerID.Bytes) != h.OriginalWorkerID ||

@@ -24,8 +24,12 @@ func (s *Service) prerequisiteList(ctx context.Context, b prerequisiteBinding, d
 	if identityErr := b.validate(c, driver); identityErr != nil {
 		return "", false, identityErr
 	}
+	if err != nil {
+		// A failed listing is never absence: no tip and no presence accompany an error.
+		return "", false, err
+	}
 	tip, ok := tips[row.PinRef]
-	return tip, ok, err
+	return tip, ok, nil
 }
 
 // Reconciliation never creates or deletes. Even an expired capture must commit

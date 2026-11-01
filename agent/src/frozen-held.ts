@@ -43,7 +43,7 @@ export async function prepareFrozenHeld(input: {
   deadlineMs: number; maxBytes?: number; defaultBranch?: string;
   onScan?: (scan: Awaited<ReturnType<HeldGit["secretScanCheckpointRange"]>>) => void;
   remediationHold?: () => Promise<boolean>;
-  ciHold?: () => Promise<boolean>;
+  ciHold?: () => Promise<"clear" | "blocked" | "unknown">;
 }): Promise<{ pack: Buffer } | { reason: string }> {
   const ownBudget = MaintenanceBudget.current() ? undefined : new MaintenanceBudget(input.deadlineMs);
   try {
@@ -90,12 +90,16 @@ async function prepareFrozenHeldWithBudget(input: Parameters<typeof prepareFroze
   if (policy.ciGlobs !== null) {
     const paths = await git.changedFilesNoRenames(barePath, sourceSha);
     check();
-    if (paths === null || flagCIConfigPathsRaw(paths, policy.ciGlobs).length) return { reason: "ci_config_guard" };
+    // A null path list is an unknown (a git failure), not a verdict: it keeps the held refusal but is
+    // a distinct reason so the same-pass closure grant never reads it as a stated refusal.
+    if (paths === null) return { reason: "ci_config_unknown" };
+    if (flagCIConfigPathsRaw(paths, policy.ciGlobs).length) return { reason: "ci_config_guard" };
   }
   check();
   const ci = await input.ciHold?.();
   check();
-  if (ci) return { reason: "ci_config_guard" };
+  if (ci === "unknown") return { reason: "ci_config_unknown" };
+  if (ci === "blocked") return { reason: "ci_config_guard" };
   const packed = await git.checkpointPack(barePath, branch, undefined, range, undefined, sourceSha);
   if (!packed) { check(); return { reason: "pack_tip_mismatch" }; }
   const chunks: Buffer[] = [];
