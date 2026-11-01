@@ -145,7 +145,8 @@ go test -race -count=1 -p=1 -buildvcs=false -timeout=5m -v -run '^(TestExactReco
 
 Both API samples followed precompilation. The initial candidate precompilation
 was 330.363s; baseline/candidate timing precompilation was 167.042s/140.851s.
-The fixture used PostgreSQL 17, `GOMAXPROCS=2`, `GOMEMLIMIT=4GiB` and
+The local Go toolchain was 1.27.3 on Linux/amd64; this is not an exact CI-toolchain
+measurement. The fixture used PostgreSQL 17, `GOMAXPROCS=2`, `GOMEMLIMIT=4GiB` and
 `GOFLAGS=-p=1`, with run-owned module/build caches and offline module lookup.
 The baseline database had served raw-candidate controls. Its recreated candidate
 fixture was warmed by the comparison workload (29.232s) before measurement.
