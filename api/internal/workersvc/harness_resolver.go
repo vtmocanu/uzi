@@ -724,7 +724,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			}
 			if row.Kind != store.KindCodexAuth || !row.Enabled || !row.Status.Valid || row.Status.String != codexStatusLinked ||
 				!row.ProviderAccountID.Valid || uuid.UUID(row.ProviderAccountID.Bytes) != pick.AccountID ||
-				(!(d.Preferred == HarnessCodex && !pick.Candidate.Structural) && !codexPoolAccountUsable(row.CoordState, row.ReauthRequired)) {
+				((d.Preferred != HarnessCodex || pick.Candidate.Structural) && !codexPoolAccountUsable(row.CoordState, row.ReauthRequired)) {
 				return store.Run{}, resolvedHarness{}, errHarnessOverflowFence
 			}
 		} else {
