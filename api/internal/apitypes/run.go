@@ -429,6 +429,7 @@ type RunDTO struct {
 	CompletionUnmet []string `json:"completion_unmet"`
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
+	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
@@ -1314,6 +1315,7 @@ type RunSummaryItemDTO struct {
 	CompletionUnmet []string `json:"completion_unmet"`
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
+	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),

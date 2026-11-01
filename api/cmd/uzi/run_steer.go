@@ -157,6 +157,7 @@ func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
 			"--by takes a duration: Go's `2h`, `90m`, `1h30m`, plus a `d` (day = 24h) unit — `1d` is " +
 			"24h. It must be at least 60 seconds (the server's minimum); `0`, a value under a minute, " +
 			"a negative value or an unparseable one is a usage error (exit 2).\n\n" +
+			"For Iteration limit reached, Extend adds wall time only and leaves the run paused; use Resume separately.\n\n" +
 			"Valid on any non-terminal run of a kind the sweep can time out (an issue, task, prompt, " +
 			"self-improve, mr-rework or ci-fix run), including a queued or parked one. A chat, judge " +
 			"or interactive-task run never times out, so extending one is a 409 (exit 5); a request " +

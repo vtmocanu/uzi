@@ -100,6 +100,8 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			"keeps the worker pin, and banks the parked time so the remaining budget is what it was — the " +
 			"clock stopped while paused. The claim then continues the SDK session on the same worker if it " +
 			"is still alive, or recovers the branch from the checkpoint on another worker if it is gone.\n\n" +
+			"For Iteration limit reached, Resume requests another iteration allowance; Cancel ends the run. " +
+			"If wall time is exhausted, Extend adds time only; Resume is still required.\n\n" +
 			"For a finite-cap forge-unreachable hold with an explicit NULL retry time, automatic retries are exhausted. " +
 			"Resume requests one ordinary bounded attempt; counters, cooldown, custody and grants are preserved. " +
 			"Admission can still block, including limit 1 or saturation. Timed retries remain automatic; omitted retry timing is unknown. " +

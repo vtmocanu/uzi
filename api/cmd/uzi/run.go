@@ -118,6 +118,7 @@ const statusPaused = "paused"
 const (
 	holdProviderUnavailable = "provider_unavailable"
 	providerOutageCause     = "provider_outage"
+	holdIterationExhausted  = "iteration_budget_exhausted"
 	holdBudgetExhausted     = "budget_exhausted"
 	holdCompletionBlocked   = "completion_blocked"
 	holdCredentialDisabled  = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
