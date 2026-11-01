@@ -147,14 +147,14 @@ for (const mode of modes) {
       finally { if (iterationSink) sinkJoined = true; }
     });
     let cancellationSends = 0;
+    const cancellationAttempts: unknown[] = [];
     if (mode === "root cancel lost report") {
       const transport = globalThis.fetch;
       t.mock.method(globalThis, "fetch", async (...args: Parameters<typeof transport>) => {
         const body = typeof args[1]?.body === "string" ? JSON.parse(args[1].body) : undefined;
         if (body?.failure_reason === "run cancelled") {
           cancellationSends++;
-          assert.equal(sinkJoined, true);
-          assert.equal(body.claim_generation, 7);
+          cancellationAttempts.push({ sinkJoined, body: structuredClone(body) });
           throw new Error("ambiguous cancellation response lost");
         }
         return transport(...args);
@@ -214,7 +214,13 @@ for (const mode of modes) {
       runId: claim.run_id,
       body: { status: "failed", failure_reason: "run cancelled", claim_generation: claim.claim_generation },
     }] : []);
-    if (mode === "root cancel lost report") assert.equal(cancellationSends, 3, "bounded retries keep generation without generic failure");
+    if (mode === "root cancel lost report") {
+      assert.equal(cancellationSends, 3, "bounded retries keep generation without generic failure");
+      assert.deepEqual(cancellationAttempts, Array.from({ length: 3 }, () => ({
+        sinkJoined: true,
+        body: { status: "failed", failure_reason: "run cancelled", claim_generation: 7 },
+      })), "every lost-response attempt follows join and keeps exact cancellation authority");
+    }
     assert.ok(api.iterationParkRequests.length <= 2);
     assert.equal(fs.readFileSync(path.join(worktreeDirFor(iid), "DIRTY.txt"), "utf8"), "Codex dirty iteration work\n");
     assert.equal(fs.readFileSync(path.join(homeDir, "SESSION"), "utf8"), "Codex retained session\n");
