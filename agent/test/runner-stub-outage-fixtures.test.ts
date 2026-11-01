@@ -371,11 +371,21 @@ for (const stage of ["terminal", "running-ack"] as const) {
       }
       const running = events.filter(e => e === "running").length;
       fs.writeFileSync(wrong, "release\n");
-      wrongRelease = new Promise<void>(resolve => setTimeout(() => {
-        assert.equal(events.filter(e => e === "running").length, running, "wrong generation did not release the barrier");
-        fs.writeFileSync(marker, "release\n");
-        resolve();
+      wrongRelease = new Promise<void>((resolve, reject) => setTimeout(() => {
+        try {
+          assert.equal(events.filter(e => e === "running").length, running, "wrong generation did not release the barrier");
+          assert.equal(outbox.hasPendingTerminal(c.run_id, 2), false, "wrong generation did not journal a terminal");
+          assert.equal(api.states.some(s => s.runId === c.run_id &&
+            ["completed", "failed", "cancelled"].includes(s.body.status)), false,
+          "wrong generation did not send a terminal state");
+          resolve();
+        } catch (error) {
+          reject(error);
+        } finally {
+          fs.writeFileSync(marker, "release\n");
+        }
       }, 20));
+      void wrongRelease.catch(() => undefined);
     });
     try {
       await runnerWith(() => ({ executor: new StubExecutor(nullLogger(), {
