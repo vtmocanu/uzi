@@ -995,6 +995,7 @@ export const runsApi = {
         : {}),
       // The held-only projection disappears on Resume; the API owns the fresh episode.
       ...(forgeHeld ? { recovery_wait_cause: null, recovery_retry_not_before: null,
+        recovery_wait_phase: null, publication_hold_reason: undefined, publication_wait_started_at: undefined,
         health_reason: "Owner resumed one bounded forge attempt; origin cooldown and other admission limits may still block execution.",
       } : {}),
       ...(memoryHeld ? { memory_hold: undefined, recovery_wait_cause: null, recovery_retry_not_before: null } : {}),
