@@ -7148,7 +7148,11 @@ export class GitCache {
       if (!scan.flaggedOIDs.length) return;
       if (!r) {
         const tip = await this.worktreeHead(source.clonePath);
-        if (!tip || (await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId, tip)).kind !== "owned")
+        const tracking = await this.committedTrackingOwnershipUnderLock(barePath, branch, source.runId);
+        if (!tip || tracking.kind !== "owned" ||
+            (tracking.sha !== tip &&
+             (!await this.hasOwedAnchorUnderLock(barePath, source.runId, tip) ||
+              await this.ancestry(barePath, tip, tracking.sha) !== "ancestor")))
           throw new Error("remediation restriction enrollment tip not owned");
         r = { version: 1, ...source, branch, sequence: 0, ownedTip: tip,
           flaggedOIDs: [], excludedRoots: [], edges: [], blocked: false };

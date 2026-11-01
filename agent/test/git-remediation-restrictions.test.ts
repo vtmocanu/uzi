@@ -2,6 +2,7 @@ import { afterEach, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { GitCache, type FetchAgentBranchOptions, type MemoryParkDurability } from "../src/git.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
@@ -70,6 +71,111 @@ beforeEach(async () => {
   await fetch();
 });
 afterEach(() => fx.cleanup());
+
+// Real producer setup: ordinary private S is fetched/pinned before the generic worker
+// bridge update. Q is imported into the bare only; execution HEAD remains S.
+async function firstFindingBridge(unrelated = false, foreign = false) {
+  const s = commit("private source S"); await fetch();
+  const q = git(bare, ...IDENT, "commit-tree", base + "^{tree}", "-p", base, "-m", "sibling Q");
+  const parents = unrelated ? ["-p", q] : ["-p", s, "-p", q];
+  const b = git(bare, ...IDENT, "commit-tree", s + "^{tree}", ...parents, "-m", "worker bridge B");
+  const c = git(bare, ...IDENT, "commit-tree", s + "^{tree}", "-p", b, "-m", "actual candidate C");
+  const context = { ...opts.context, ...(foreign ? { runId: "foreign-run" } : {}) };
+  assert.equal((await cache.updateTrackingRef(bare, BRANCH, b, { context })).kind, "updated");
+  assert.equal(git(clone, "rev-parse", "HEAD"), s);
+  assert.equal(await cache.worktreeHead(clone), s, "worker observes the exact source S");
+  assert.equal((await cache.committedTrackingOwnership(bare, BRANCH, RUN)).kind,
+    foreign ? "not_owned" : "owned", "the tracking receipt is independently committed");
+  assert.ok((await cache.enumerateOwedCandidates(bare, RUN)).some(candidate => candidate.sha === s), "source S has its exact owed anchor");
+  assert.equal(await cache.ancestry(bare, s, b), unrelated ? "divergent" : "ancestor");
+  assert.equal(journal().remediationRecovery, undefined);
+  return { s, q, b, c };
+}
+function owedFiles() {
+  const dir = path.join(bare, "uzi-owed");
+  return Object.fromEntries(fs.readdirSync(dir).sort().map(name => [name, fs.readFileSync(path.join(dir, name), "utf8")]));
+}
+const receiptFile = () => path.join(bare, "uzi-owed",
+  "receipt-" + createHash("sha256").update(BRANCH).digest("hex") + ".json");
+
+for (const candidate of ["B", "C"] as const) {
+  test("first negative finding on " + candidate + " enrolls independently pinned execution S only", async () => {
+    const { s, q, b, c } = await firstFindingBridge();
+    assert.equal(await cache.ancestry(bare, q, s), "divergent");
+    const before = snapshot(), metadata = owedFiles(), oldJournal = journal(), absent = await query();
+    const calls: string[] = [];
+    await cache.recordRemediationRestrictions(bare, BRANCH, source(),
+      { trusted: true, tip: candidate === "B" ? b : c, flaggedOIDs: [q] },
+      { sync: async (h, kind) => { calls.push(kind); await h.sync(); } });
+    assert.deepEqual(calls, ["config", "directory"]);
+    const r = { version: 1, ...source(), branch: BRANCH, sequence: 0, ownedTip: s,
+      flaggedOIDs: [q], excludedRoots: [], edges: [], blocked: false };
+    assert.deepEqual(journal(), { ...oldJournal, remediationRecovery: r });
+    assert.equal(snapshot().refs, before.refs); assert.equal(snapshot().head, before.head);
+    assert.deepEqual(owedFiles(), metadata);
+    assert.equal(JSON.parse(fs.readFileSync(receiptFile(), "utf8")).attemptId, undefined);
+    const fresh = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+    assert.deepEqual(await fresh.readRuntimeRemediationRecovery(bare, BRANCH, source()), r);
+    assert.equal(await fresh.readRemediationRecovery(bare, BRANCH, source()), undefined);
+    const facts = await query();
+    assert.deepEqual(facts.flaggedOIDs, [q]); assert.deepEqual(facts.roots, [q]);
+    assert.notEqual(facts.fingerprint, absent.fingerprint);
+    assert.deepEqual(Object.keys(facts).sort(), ["blocked", "enrolled", "fingerprint", "flaggedOIDs", "roots"]);
+    const stable = snapshot();
+    for (const tip of [b, c]) await assert.rejects(cache.recordRemediationScan(bare, BRANCH, source(),
+      { trusted: true, tip, flaggedOIDs: [q], origin: "pre-exit" }), /scanned tip not owned/);
+    await assert.rejects(cache.readRemediationRestrictionFacts(bare, BRANCH, RUN, { ...source(), attemptId: OTHER }));
+    assert.deepEqual(snapshot(), stable);
+  });
+}
+
+for (const fault of ["missing source ref", "changed source ref", "missing source metadata",
+  "changed source metadata", "foreign owner", "missing receipt", "invalid receipt", "unknown ancestry", "unrelated tracking"] as const) {
+  test("first negative enrollment holds without repair on " + fault, async t => {
+    const { s, q, b } = await firstFindingBridge(fault === "unrelated tracking", fault === "foreign owner");
+    const ref = "refs/uzi-owed/" + RUN + "/" + s;
+    if (fault === "missing source ref") git(bare, "update-ref", "-d", ref);
+    if (fault === "changed source ref") git(bare, "update-ref", ref, base);
+    if (fault === "missing source metadata" || fault === "changed source metadata") {
+      const dir = path.join(bare, "uzi-owed");
+      const name = fs.readdirSync(dir).find(name => {
+        const value = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8"));
+        return value.sha === s;
+      });
+      assert.ok(name, "the real fetch wrote source metadata");
+      if (fault === "missing source metadata") fs.unlinkSync(path.join(dir, name));
+      else fs.writeFileSync(path.join(dir, name), "{}");
+    }
+    if (fault === "missing receipt") fs.unlinkSync(receiptFile());
+    if (fault === "invalid receipt") {
+      const receipt = JSON.parse(fs.readFileSync(receiptFile(), "utf8"));
+      fs.writeFileSync(receiptFile(), JSON.stringify({ ...receipt, trackingSha: s }));
+    }
+    if (fault === "unknown ancestry") {
+      const ancestry = cache.ancestry.bind(cache);
+      t.mock.method(cache, "ancestry", async (dir: string, from: string, to: string) =>
+        from === s && to === b ? "unknown" : ancestry(dir, from, to));
+    }
+    const before = snapshot(), metadata = owedFiles();
+    await assert.rejects(cache.recordRemediationRestrictions(bare, BRANCH, source(),
+      { trusted: true, tip: b, flaggedOIDs: [q] }));
+    assert.equal(journal().remediationRecovery, undefined);
+    assert.deepEqual(snapshot(), before); assert.deepEqual(owedFiles(), metadata);
+  });
+}
+
+test("exact tracking S needs no extra owed pin; empty and untrusted scans do not enroll", async () => {
+  const s = commit("exact S"); await fetch();
+  git(bare, "update-ref", "-d", "refs/uzi-owed/" + RUN + "/" + s);
+  const before = snapshot();
+  await cache.recordRemediationRestrictions(bare, BRANCH, source(), { trusted: true, tip: s, flaggedOIDs: [] });
+  await cache.recordRemediationRestrictions(bare, BRANCH, source(), { trusted: false, tip: s, flaggedOIDs: [s] });
+  assert.deepEqual(snapshot(), before);
+  await cache.recordRemediationRestrictions(bare, BRANCH, source(), { trusted: true, tip: s, flaggedOIDs: [s] });
+  assert.equal(journal().remediationRecovery.ownedTip, s);
+  assert.equal(journal().remediationRecovery.active, undefined);
+  assert.equal(snapshot().refs, before.refs);
+});
 
 test("confirmed absence is synced every time, frozen and never enrolls or writes", async () => {
   const before = snapshot(), calls: string[] = [];
