@@ -1,6 +1,6 @@
 # ADR-3745: Codex cross-check assistant item lifecycle
 
-**Status**: Accepted (decided contract); implementation and verification pending
+**Status**: Accepted; implemented (full agent suite pending exact-head PR CI)
 **Date**: 2026-11-01
 **Issue**: [vtmocanu/uzi#3745](https://github.com/vtmocanu/uzi/issues/3745)
 **Extends**: [ADR-2149](2149-cross-check.md) and [ADR-1106](1106-codex-harness.md).
@@ -86,12 +86,18 @@ neither Claude behavior nor workflow, publication or approval policy.
 
 ## Verification boundary
 
-M1 records this contract before any behavior change. Implementation and
-verification are pending M2; this ADR does not claim the behavior is built.
-M2 must replay the exact rejection mechanism synthetically: completed streamed
-commentary A, distinct streamed/completed final answer B, then a successful
-bound terminal. Use synthetic text because the probe retained metadata only.
-Record red-before/green-after regression evidence in M2, alongside coverage of
-the lifecycle, phase, terminal and aggregate-budget refusal boundaries above.
-No such regression has been executed as part of M1, and no live model call is
-needed for this verification.
+M1 recorded this contract before any behavior change. M2 implements it in the
+checker-local event consumer. The deterministic tests named `3745 observed
+commentary then final plan` and `3745 observed commentary then final code`
+replay completed streamed commentary A, distinct streamed/completed final
+answer B, then a successful bound terminal. Both failed on the M1 revision at
+the original guard with `subreason=delta_after_completion`; both pass with the
+per-item implementation. The focused checker suite also exercises lifecycle,
+phase, terminal and aggregate-budget controls for both stages.
+
+All replay text is synthetic because the probe retained metadata only. These
+hermetic tests exercise the adapter through its real transport; they do not
+establish historical-incident attribution or a fresh packaged Linux filesystem
+confinement proof. No live model call was needed. The full agent suite remains
+pending exact-head PR CI; focused checks do not substitute for that landing
+obligation.

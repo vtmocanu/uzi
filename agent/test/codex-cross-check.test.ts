@@ -717,6 +717,281 @@ for (const [name, subreason, frames] of [
  });
 }
 
+// ADR-3745: synthetic assistant lifecycle through the existing real transport rig.
+// Omitted phase and explicit null are deliberately distinct fixture inputs.
+function assistantStart(id: unknown, phase?: unknown, binding: Record<string, unknown> = {}): Frame {
+ return { method: "item/started", params: { threadId: "thread", turnId: "turn",
+  item: { type: "agentMessage", id, ...(phase === undefined ? {} : { phase }) }, ...binding } };
+}
+function assistantDelta(id: unknown, text: string, phase?: unknown, binding: Record<string, unknown> = {}): Frame {
+ return diagnosticDelta({ itemId: id, delta: text, ...(phase === undefined ? {} : { phase }), ...binding });
+}
+function assistantComplete(id: unknown, text: string, phase?: unknown, binding: Record<string, unknown> = {}): Frame {
+ return diagnosticCompletion({ id, text, ...(phase === undefined ? {} : { phase }) }, binding);
+}
+function assistantTerminal(binding: Record<string, unknown> = {}, status: unknown = "completed"): Frame {
+ return { method: "turn/completed", params: { threadId: "thread",
+  turn: { id: "turn", status }, ...binding } };
+}
+
+// Avoid allocating a giant assertion diff for the aggregate-cap fixtures.
+function assertSelectedText(actual: string, expected: string, seam: string): void {
+ assert.equal(actual.length, expected.length, seam + ": selected text length");
+ let firstMismatch = -1;
+ for (let i = 0; i < expected.length; i++) {
+  if (actual[i] !== expected[i]) { firstMismatch = i; break; }
+ }
+ assert.equal(firstMismatch, -1, seam + ": first differing UTF-16 offset");
+}
+
+for (const stage of ["plan", "code"] as const) {
+ const stageClaim = () => stage === "code" ? codeClaim() : claim();
+ const finalText = stage === "code" ? '{"findings":[]}' : verdict;
+ const decoy = stage === "code"
+  ? JSON.stringify({ findings: [{ id: "DECOY", severity: "minor", path: "decoy.ts", line: 1, title: "Commentary only", detail: "Synthetic" }] })
+  : JSON.stringify({ verdict: "block", summary: "Commentary only", items: [] });
+ const cap = stage === "code" ? 256 * 1024 : 64 * 1024;
+ const replay = (frames: Frame[]) => rig({ claim: stageClaim(), notes(emit) {
+  for (const frame of frames) emit(frame);
+  emit(assistantTerminal());
+ } });
+ const nonverdict = (id: string, phase: string, text: string, streamed = true): Frame[] => [
+  assistantStart(id, phase),
+  ...(streamed ? [assistantDelta(id, text)] : []),
+  assistantComplete(id, text),
+ ];
+ const final = (text = finalText): Frame[] => [
+  assistantStart("B", "final_answer"), assistantDelta("B", text), assistantComplete("B", text),
+ ];
+ const refuse = async (frames: Frame[]): Promise<void> => {
+  const r = replay(frames);
+  await assert.rejects(r.run());
+  assert.equal(r.usage.at(-1)!.is_error, true, "refusal marks result usage");
+  assert.deepEqual(r.disposed, ["provider", "fileop"]);
+  assert.equal(r.secrets.size, 0);
+ };
+
+ it("3745 observed commentary then final " + stage, async () => {
+  const r = replay([...nonverdict("A", "commentary", decoy), ...final()]);
+  assertSelectedText(await r.run(), finalText, "selection: B alone, never valid JSON commentary A");
+  assert.equal(r.usage.at(-1)!.is_error, false);
+ });
+
+ for (const phase of ["commentary", "partial_answer"]) {
+  for (const text of [decoy, "Synthetic non-JSON text"]) {
+   it(`3745 ${stage} ignores ${phase} text: ${text === decoy ? "JSON decoy" : "plain text"}`, async () => {
+    assertSelectedText(await replay([...nonverdict("A", phase, text), ...final()]).run(),
+     finalText, "selection: nonverdict text excluded from parsing");
+   });
+  }
+ }
+
+ for (const source of ["start", "delta", "completion"] as const) {
+  for (const later of [undefined, null]) {
+   it(`3745 ${stage} phase learned at ${source} only; later ${later === null ? "null" : "absent"} preserves it`, async () => {
+    const item = (id: string, phase: string, text: string): Frame[] => [
+     assistantStart(id, source === "start" ? phase : undefined),
+     assistantDelta(id, text, source === "delta" ? phase : later),
+     assistantComplete(id, text, source === "completion" ? phase : later),
+    ];
+    const r = replay([...item("A", "commentary", decoy), ...item("B", "final_answer", finalText)]);
+    assertSelectedText(await r.run(), finalText, "selection: phase retained across metadata gaps");
+   });
+  }
+ }
+ for (const phase of [undefined, null]) {
+  for (const started of [false, true]) {
+   it(`3745 ${stage} sole legacy ${phase === null ? "null" : "absent"} phase completion-only, start=${started}`, async () => {
+    const r = replay([...(started ? [assistantStart("A", phase)] : []), assistantComplete("A", finalText, phase)]);
+    assertSelectedText(await r.run(), finalText, "selection: sole legacy item");
+   });
+  }
+  for (const unknownFirst of [false, true]) {
+   it(`3745 ${stage} refuses legacy ${phase === null ? "null" : "absent"} mixed with other item, unknownFirst=${unknownFirst}`, async () => {
+    const unknown = [assistantComplete("unknown", finalText, phase)];
+    const other = nonverdict("other", "commentary", decoy);
+    await refuse(unknownFirst ? [...unknown, ...other] : [...other, ...unknown]);
+   });
+  }
+ }
+
+ const lifecycleCases: [string, Frame[]][] = [
+  ["overlapping starts", [assistantStart("A", "commentary"), assistantStart("B", "final_answer"),
+   assistantComplete("A", decoy), assistantComplete("B", finalText)]],
+  ["overlapping start and foreign delta", [assistantStart("A", "commentary"), assistantDelta("B", finalText, "final_answer"),
+   assistantComplete("A", decoy), assistantComplete("B", finalText)]],
+  ["overlapping stream and foreign completion", [assistantDelta("A", decoy, "commentary"), assistantComplete("B", finalText, "final_answer"),
+   assistantComplete("A", decoy)]],
+  ["duplicate start", [assistantStart("A", "final_answer"), assistantStart("A", "final_answer"), assistantComplete("A", finalText)]],
+  ["start after completion", [assistantComplete("A", decoy, "commentary"), assistantStart("A", "commentary"), ...final()]],
+  ["duplicate nonverdict completion", [assistantComplete("A", decoy, "commentary"), assistantComplete("A", decoy, "commentary"), ...final()]],
+  ["duplicate final completion", [assistantComplete("B", finalText, "final_answer"), assistantComplete("B", finalText, "final_answer")]],
+  ["same-item post-completion delta", [...nonverdict("A", "commentary", decoy), assistantDelta("A", ""), ...final()]],
+  ["two final candidates", [...final(), assistantComplete("C", finalText, "final_answer")]],
+  ["assistant start after final", [...final(), assistantStart("C", "commentary")]],
+  ["assistant delta after final", [...final(), assistantDelta("C", "", "commentary")]],
+  ["assistant completion after final", [...final(), assistantComplete("C", decoy, "commentary")]],
+  ["no assistant final", []],
+  ["only commentary", nonverdict("A", "commentary", decoy)],
+  ["only partial answer", nonverdict("A", "partial_answer", decoy)],
+  ["incomplete started item", [assistantStart("B", "final_answer")]],
+  ["incomplete streamed item", [assistantDelta("B", finalText, "final_answer")]],
+ ];
+ for (const [name, frames] of lifecycleCases) {
+  it(`3745 ${stage} refuses ${name}`, async () => { await refuse(frames); });
+ }
+
+ for (const phase of ["commentary", "partial_answer", "final_answer"]) {
+  it(`3745 ${stage} per-item stream mismatch in ${phase}`, async () => {
+   await refuse([assistantStart("A", phase), assistantDelta("A", "prefix"),
+    assistantComplete("A", phase === "final_answer" ? finalText : "different"),
+    ...(phase === "final_answer" ? [] : final())]);
+  });
+  it(`3745 ${stage} empty-stream seam requires matching completion in ${phase}`, async () => {
+   await refuse([assistantStart("A", phase), assistantDelta("A", ""),
+    assistantComplete("A", phase === "final_answer" ? finalText : decoy),
+    ...(phase === "final_answer" ? [] : final())]);
+  });
+ }
+ it(`3745 ${stage} empty-stream seam accepts matching empty nonverdict completion`, async () => {
+  assertSelectedText(await replay([...nonverdict("A", "commentary", ""), ...final()]).run(),
+   finalText, "empty-stream: empty delta is a received stream");
+ });
+ it(`3745 ${stage} optional start permits delta-established explicit final`, async () => {
+  assertSelectedText(await replay([assistantDelta("B", finalText, "final_answer"),
+   assistantComplete("B", finalText)]).run(), finalText, "selection: optional start");
+ });
+ it(`3745 ${stage} explicit completion-only final`, async () => {
+  assertSelectedText(await replay([assistantComplete("B", finalText, "final_answer")]).run(),
+   finalText, "selection: explicit completion-only");
+ });
+
+ for (const event of ["start", "delta", "completion"] as const) {
+  const frame = (id: unknown, phase: unknown, binding: Record<string, unknown> = {}): Frame =>
+   event === "start" ? assistantStart(id, phase, binding)
+    : event === "delta" ? assistantDelta(id, finalText, phase, binding)
+     : assistantComplete(id, finalText, phase, binding);
+  for (const [label, id] of [["missing", undefined], ["null", null], ["empty", ""], ["nonstring", 7]] as const) {
+   it(`3745 ${stage} refuses ${event} ${label} item identity`, async () => {
+    await refuse([frame(id, "final_answer"), ...(event === "completion" ? [] : [assistantComplete("B", finalText, "final_answer")])]);
+   });
+  }
+  for (const key of ["threadId", "turnId"]) {
+   for (const [label, value] of [["foreign", "foreign"], ["missing", undefined], ["empty", ""], ["nonstring", 7]] as const) {
+    it(`3745 ${stage} refuses ${event} ${label} ${key}`, async () => {
+     await refuse([frame("B", "final_answer", { [key]: value }), ...(event === "completion" ? [] : [assistantComplete("B", finalText, "final_answer")])]);
+    });
+   }
+  }
+  for (const [label, phase] of [["unknown", "analysis"], ["number", 7], ["object", {}], ["empty", ""]] as const) {
+   it(`3745 ${stage} refuses ${event} ${label} explicit phase`, async () => {
+    await refuse([frame("B", phase), ...(event === "completion" ? [] : [assistantComplete("B", finalText)])]);
+   });
+  }
+ }
+ for (const [name, frames] of [
+  ["start to delta", [assistantStart("B", "commentary"), assistantDelta("B", finalText, "final_answer"), assistantComplete("B", finalText)]],
+  ["start to completion", [assistantStart("B", "commentary"), assistantComplete("B", finalText, "final_answer")]],
+  ["delta to completion", [assistantDelta("B", finalText, "commentary"), assistantComplete("B", finalText, "final_answer")]],
+ ] as [string, Frame[]][]) {
+  it(`3745 ${stage} refuses conflicting phases ${name}`, async () => { await refuse(frames); });
+ }
+ for (const key of ["threadId", "id"]) {
+  for (const [label, value] of [["foreign", "foreign"], ["missing", undefined], ["empty", ""], ["nonstring", 7]] as const) {
+   it(`3745 ${stage} refuses terminal ${label} ${key}`, async () => {
+    await refuse([...final(), assistantTerminal(key === "threadId" ? { threadId: value } : { turn: { id: value, status: "completed" } })]);
+   });
+  }
+ }
+ for (const status of ["failed", "incomplete", null, undefined]) {
+  it(`3745 ${stage} refuses terminal status ${String(status)}`, async () => {
+   await refuse([...final(), assistantTerminal({ turn: { id: "turn", status } })]);
+  });
+ }
+ it(`3745 ${stage} absent terminal refuses on existing provider-failure seam`, async () => {
+  const r = rig({ claim: stageClaim(), notes(emit) {
+   for (const frame of final()) emit(frame);
+   // No wall-clock timeout: fail the owned fake root after delivering the candidate.
+   queueMicrotask(() => r.fail());
+  } });
+  await assert.rejects(r.run());
+  assert.equal(r.usage.at(-1)!.is_error, true, "selection: completed item cannot replace terminal");
+ });
+
+ const invalidFinals = [
+  "prefix " + finalText, finalText + " suffix", "```json\n" + finalText + "\n```", "{broken",
+  stage === "code" ? '{"findings":[],"extra":true}' : '{"verdict":"maybe","summary":"","items":[]}',
+  stage === "code" ? '{"findings":[{"id":"bad id","severity":"minor","path":"a","line":1,"title":"x","detail":"x"}]}'
+   : '{"verdict":"approve","summary":"","items":[{"file":"a","severity":"bad","summary":"x","rationale":"x"}]}',
+ ];
+ for (const [index, text] of invalidFinals.entries()) {
+  it(`3745 ${stage} selected final retains strict JSON/schema case ${index}`, async () => {
+   await refuse([...nonverdict("A", "commentary", decoy), ...final(text)]);
+  });
+ }
+
+ for (const multiple of [false, true]) {
+ for (const streamed of [false, true]) {
+  for (const overflow of [false, true]) {
+   it(`3745 ${stage} aggregate UTF8 ${multiple ? "multiple nonverdict" : "commentary"} plus final ${streamed ? "streamed no double-charge" : "completion-only"} ${overflow ? "overflow" : "exact cap"}`, async () => {
+    const prefixBytes = multiple ? 3 : 0;
+    const remaining = cap - Buffer.byteLength(finalText) - prefixBytes;
+    const text = "é".repeat(Math.floor(remaining / 2)) + "x".repeat(remaining % 2);
+    const frames = [
+     ...(multiple ? nonverdict("A1", "partial_answer", "界", streamed) : []),
+     ...nonverdict("A2", "commentary", text + (overflow ? "x" : ""), streamed),
+     ...(streamed ? final() : [assistantComplete("B", finalText, "final_answer")]),
+    ];
+    assert.equal(prefixBytes + Buffer.byteLength(text) + Buffer.byteLength(finalText), cap, "aggregate: exact UTF8 fixture");
+    if (overflow) await refuse(frames);
+    else assertSelectedText(await replay(frames).run(), finalText, "aggregate: all items charged exactly once");
+   });
+  }
+ }
+ }
+ for (const streamed of [false, true]) {
+  for (const overflow of [false, true]) {
+   it(`3745 ${stage} sole final aggregate boundary ${streamed ? "streamed no double-charge" : "completion-only"} ${overflow ? "overflow" : "exact cap"}`, async () => {
+    const padding = cap - Buffer.byteLength(finalText);
+    const text = finalText + " ".repeat(padding + (overflow ? 1 : 0));
+    const frames = streamed ? final(text) : [assistantComplete("B", text, "final_answer")];
+    if (overflow) await refuse(frames);
+    else assertSelectedText(await replay(frames).run(), text, "aggregate: matching completion never double charged");
+   });
+  }
+ }
+
+ for (const seam of ["identity", "phase"] as const) {
+  it(`3745 ${stage} ${seam} errors and logs are static bounded and content-free`, async () => {
+   const messages: string[] = [];
+   for (const marker of ["SYNTHETIC_A\n\u001b[31m\u202e", "SYNTHETIC_B\t\u001b[0m\u2066"]) {
+    const frames = seam === "identity"
+     ? [assistantDelta("A", finalText, "final_answer"), assistantComplete(marker, finalText, "final_answer")]
+     : [assistantComplete("B", finalText, marker)];
+    const r = replay(frames);
+    await assert.rejects(r.run(), (error: unknown) => {
+     assert.ok(error instanceof Error);
+     assert.ok(error.message.length <= 256, "diagnostic: bounded static error");
+     assert.ok(Array.from(error.message).every(char => {
+      const code = char.codePointAt(0)!;
+      return code >= 32 && code !== 127 && !(code >= 0x202a && code <= 0x202e)
+       && !(code >= 0x2066 && code <= 0x2069);
+     }), "diagnostic: no control, ANSI or bidi characters");
+     const diagnostics = String(error) + JSON.stringify(error) + JSON.stringify(r.logs) + JSON.stringify(r.usage);
+     assert.equal(diagnostics.includes("SYNTHETIC_"), false, "diagnostic: no untrusted identity or phase");
+     assert.equal(diagnostics.includes("Commentary only"), false, "diagnostic: no commentary content");
+     assert.equal(diagnostics.includes("Anchors checked"), false, "diagnostic: no final content");
+     assert.equal(Object.hasOwn(error, "cause"), false);
+     messages.push(error.message);
+     return true;
+    });
+    assert.equal(JSON.stringify(r.logs).includes("SYNTHETIC_"), false);
+   }
+   assert.equal(messages[0], messages[1], "diagnostic: changing untrusted content cannot change error");
+  });
+ }
+}
+
 it("denies effects, delegation and Skill and charges all callbacks including repeated denials", async () => {
  let count = 0;
  const r = rig({ notes: (emit) => next(emit), onToolReply: (frame, emit) => {
