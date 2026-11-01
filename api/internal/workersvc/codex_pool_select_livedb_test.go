@@ -43,6 +43,10 @@ func newPoolFix(t *testing.T) *poolFix {
 	t.Helper()
 	env := setupCodexLiveDB(t)
 	userID, _, repoID := env.seedCodexInfra(t)
+	// Delete the user (and, by cascade, its runs) after the test, as the reserve fixtures do:
+	// some tests here set weekly_reserve_pct and queue runs, and the reserve marker's pass is
+	// global, so a leftover owner would leak into later reserve LiveDB tests in this package.
+	t.Cleanup(func() { _, _ = env.pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, userID) })
 	svc := atomicSvc(env)
 	svc.p.Autoselect = autoselect.Policy{MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10}
 	svc.p.CodexUsagePollInterval = 10 * time.Minute
