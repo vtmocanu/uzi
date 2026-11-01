@@ -203,6 +203,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
+      listPublicationRegisterEntries: () => [],
       unclassifiedPolicyRunIds: () => [], runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
@@ -253,6 +254,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
+      listPublicationRegisterEntries: () => [],
       unclassifiedPolicyRunIds: () => [], runsWithPending: () => (retired ? [] : ["r1"]),
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
@@ -312,6 +314,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // this drainer-focused fake keeps the sweep out of the way.
       hasUndrainedMessages: () => true,
       listPendingFinalizes: () => [],
+      listPublicationRegisterEntries: () => [],
       unclassifiedPolicyRunIds: () => [], runsWithPending: () => (retired ? [] : ["r1"]),
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
@@ -405,6 +408,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // this drainer-focused fake keeps the sweep out of the way.
       hasUndrainedMessages: () => true,
       listPendingFinalizes: () => [],
+      listPublicationRegisterEntries: () => [],
       unclassifiedPolicyRunIds: () => [], runsWithPending: () => (retired ? [] : ["r1"]),
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
@@ -480,6 +484,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
+      listPublicationRegisterEntries: () => [],
       unclassifiedPolicyRunIds: () => [], runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
@@ -531,6 +536,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       listPendingOutcomeSources(this: { listPendingTerminals: Outbox["listPendingTerminals"] }) { return this.listPendingTerminals(); },
       listPendingTerminals: () => [],
       listPendingFinalizes: () => [],
+      listPublicationRegisterEntries: () => [],
       unclassifiedPolicyRunIds: () => [], runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {

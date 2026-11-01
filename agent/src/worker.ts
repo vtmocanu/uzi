@@ -14,7 +14,7 @@ import type { CrossCheckRunner } from "./cross-check-runner.js";
 import type { IsolatedRunner } from "./isolated-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
-import type { ActiveSnapshot, ClaimResponse, OutboxHeartbeatEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
+import type { ActiveSnapshot, ClaimResponse, OutboxHeartbeatEntry, PublicationResumeEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { DindPruneController, DindPruneGate } from "./dind-prune.js";
 import type { DindMaintenanceController } from "./dind-maintenance.js";
@@ -884,11 +884,25 @@ export class Worker {
     // Issue #1742: the finalize-pending records offered on this register, captured ONCE with the
     // snapshot. Freeze each original identity before the request, including existing lower records.
     // Only exact offered identities gain lifetime handoff; captured lower originals gain batch-only authority.
-    const offeredFinalizes = this.outbox?.listPendingFinalizes() ?? [];
-    // Registration uses conservative overflow protection without ownership GETs.
-    // Observe ownership in the existing post-register boot/drain/sweep paths,
-    // after registration has started the heartbeat loop.
-    const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes);
+    // Issue #1324 D6: a run holding a publication-intent record resumes publication only. It is attested
+    // under publication_resume and NEVER also under finalize_resume (it must not consume the #1742
+    // one-shot allowance), so any run with a publication record or file present is withheld from the finalize
+    // list, whether the record is ACKed or not and whether it authenticates or not (a run directory that cannot be
+    // listed at all is not detected and keeps its finalize entry; deferred). The api's finalize requeue has no
+    // enrollment predicate, so withholding here is what keeps an enrolled run off the allowance when its ACK was
+    // lost or its record failed authentication. The cost: a never-enrolled run with an uncertain local record takes
+    // the ordinary orphan requeue instead of the #1742 finalize path.
+    const outbox = this.outbox;
+    const offeredPublications = outbox?.listPublicationRegisterEntries() ?? [];
+    // A record that failed authentication, or is a mismatch, is not tracked in memory but still sits on
+    // disk and still marks the run publication-only, so presence is judged on the directory.
+    const offeredFinalizes: ReturnType<Outbox["listPendingFinalizes"]> = [];
+    for (const entry of outbox?.listPendingFinalizes() ?? []) {
+      const withheld = outbox!.hasPublicationRecords(entry.run_id) || (await outbox!.hasPublicationFile(entry.run_id));
+      if (!withheld) offeredFinalizes.push(entry);
+    }
+    // Ownership GETs remain in bounded post-registration passes, after heartbeat starts.
+    const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes, offeredPublications);
     const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
     const frozenFinalizes = this.captureFinalizes().filter(({ entry }) =>
       sentFinalizes.some(offered => offered.run_id === entry.run_id &&
@@ -901,6 +915,9 @@ export class Worker {
         claim_generations_sample: sentFinalizes.slice(0, 8).map((entry) => entry.claim_generation),
         claim_generations_omitted: Math.max(0, sentFinalizes.length - 8),
       });
+    }
+    if (offeredPublications.length > 0) {
+      this.log.info("register publication snapshot", { count: offeredPublications.length });
     }
     this.log.info("register terminal snapshot", {
       authenticated_pending: pending.length,
@@ -940,6 +957,11 @@ export class Worker {
           "recovery_inventory_v1",
           "recovery_completed_publication_v1",
           "forge_clone_success_v1",
+          // Issue #1324 D9: this image echoes the claim's forge_api_origin_reservation on a successful
+          // direct forge API call (reportForgeApiSuccess, called after the merge request is created).
+          // Advertised UNCONDITIONALLY: the api offers the reservation, and accepts the api-surface
+          // success report, only to a worker advertising it.
+          "forge_api_success_v1",
           "recovery_held_publication_v1",
           "recovery_held_publication_v2",
           // PRD #1247 M5b (D3/protocol §9): this image implements the held-state credential-switch
@@ -1052,6 +1074,12 @@ export class Worker {
         }
         protocolCapabilities.push("pending_outcome_scoped_claim_v1");
         if (this.dindMaintenance) protocolCapabilities.push("dind_maintenance_v1");
+        // Issue #1324: publication_resume_v1 promises a durable local publication-intent record, so it is
+        // advertised only while the outbox that holds it is usable. Without it the api never enrolls this
+        // worker's runs and an ordinary finalize runs exactly as before.
+        if (typeof this.outbox?.savePublicationRecord === "function" && !this.outbox.isDisabled()) {
+          protocolCapabilities.push("publication_resume_v1");
+        }
         const res = await this.client.register(
           this.config.workerName,
           this.config.workerTemplate,
@@ -1282,14 +1310,15 @@ export class Worker {
    * gate is purely "do we hold a pending outcome or finalize record to protect". Undefined when there
    * is no registry or nothing pending.
    */
-  private buildRegisterSnapshot(finalizes: readonly PendingFinalize[]): ActiveSnapshot | undefined {
+  private buildRegisterSnapshot(finalizes: readonly PendingFinalize[], publications: readonly PublicationResumeEntry[] = []): ActiveSnapshot | undefined {
     if (!this.activeRuns) return undefined;
     if (!this.outbox) return undefined;
     // Issue #1742: a pending finalize record also warrants the register snapshot (it carries
-    // finalize_resume), even with no pending terminal journal.
+    // Policy scopes and publication enrollment both require boot protection.
     if (this.outbox.listPendingOutcomeSources().length === 0 &&
-        this.outbox.unclassifiedPolicyRunIds().length === 0 && finalizes.length === 0) return undefined;
-    return this.activeRuns.buildRegisterSnapshot(finalizes);
+        this.outbox.unclassifiedPolicyRunIds().length === 0 && finalizes.length === 0 && publications.length === 0) return undefined;
+    const snapshot = this.activeRuns.buildRegisterSnapshot(finalizes);
+    return publications.length > 0 ? { ...snapshot, publication_resume: publications.map((entry) => ({ ...entry })) } : snapshot;
   }
 
   /**

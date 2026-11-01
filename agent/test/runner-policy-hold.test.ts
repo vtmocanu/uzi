@@ -555,3 +555,28 @@ describe("R1 producer flight envelope lifecycle", () => {
     assert.equal(policies, 0, "selected evidence remains while feature loss suspends delivery");
   });
 });
+
+// Exercise the merged post-clone dispatch boundary independently of the capture
+// and publication protocols, which have their own real-stack fixtures above.
+describe("policy admission before publication-only dispatch", () => {
+  installHarness();
+  for (const blocked of [false, true]) it(`publication-only dispatch preserves policy stop (blocked=${blocked})`, async () => {
+    const claim = gitlabClaim(3799, { claim_generation: 3,
+      publication_resume: { enrollment_seq: 1, candidate_seq: 1, intent: {} } });
+    let models = 0, publications = 0, reconciliations = 0;
+    const runner = runnerWith(() => ({ executor: { run: async () => { models++; throw new Error("model forbidden"); } } }),
+      fakeGitlab().gitlab, undefined, nullLogger());
+    const seam = runner as unknown as Record<string, unknown>;
+    seam.preparePolicyAdmission = async () => blocked ? {
+      outcome_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", source_generation: 1, claim_generation: 3,
+      tag: "cyberPolicy", phase: "implementation", correlation_id: "selected-policy", published: false,
+    } : undefined;
+    seam.phaseClone = async () => {};
+    seam.reconcilePolicyAdmission = async () => { reconciliations++; return false; };
+    seam.phasePublicationOnly = async () => { publications++; return "stop"; };
+    await runner.execute(claim);
+    assert.equal(models, 0);
+    assert.equal(publications, blocked ? 0 : 1, "unresolved policy cannot dispatch publication; the unblocked control must reach it");
+    assert.equal(reconciliations, blocked ? 1 : 0);
+  });
+});

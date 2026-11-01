@@ -92,7 +92,7 @@ func (q *Queries) classifyWorkerExhaustion(ctx context.Context, ids []uuid.UUID,
 		}
 		dispositions[row.ID.String()] = exhaustionDisposition{
 			ReleaseNonceCaptured: nonceOverride != nil, ReleasedWorkerNonce: releasedNonce,
-			Park:     evidence.CheckpointTip != nil || evidence.AvailableCapture || evidence.PublicationUncertain || evidence.CaptureUncertain || evidence.CustodyUncertain || evidence.Unknown,
+			Park:     row.PublicationEnrolled || evidence.CheckpointTip != nil || evidence.AvailableCapture || evidence.PublicationUncertain || evidence.CaptureUncertain || evidence.CustodyUncertain || evidence.Unknown,
 			Evidence: evidence,
 		}
 	}

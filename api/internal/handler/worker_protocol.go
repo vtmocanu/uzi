@@ -357,7 +357,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"worker_id":         updated.ID.String(),
 		"worker":            dto,
-		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication),
+		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication, h.cfg.PublicationResume),
 		"register_nonce":    registerNonce,
 		// worker_outbox_max_pending (PRD #1391 Run B M3c): the server's terminal_pending outbox cap,
 		// returned at register so the worker can size its own pending-outcome quota to match the
@@ -396,11 +396,14 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // `recovery_held_publication_v1` and `recovery_held_publication_v2` are appended last, in its own group, only while
 // heldPublicationEnabled (= cfg.HeldPublication, UZI_HELD_PUBLICATION).
 //
+// `publication_resume_v1` (issue #1324) is appended in its own group only while
+// publicationResumeEnabled (= cfg.PublicationResume, RUN_PUBLICATION_RESUME_ENABLED).
+//
 // `active_run_snapshot` (PRD #1390 M2a) is appended in its own group, gated on
 // activeSnapshotEnabled (= !cfg.ActiveSnapshotDisabled). When the api is started with
 // UZI_ACTIVE_SNAPSHOT_DISABLED set (the D7 rollback simulation) the token is omitted and the
 // worker never sends the snapshot — the same shape an old worker sees.
-func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []string {
+func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled, publicationResumeEnabled bool) []string {
 	groups := [][]string{
 		{workersvc.ForgeCloneSuccessFeature},
 		{workersvc.CapabilityEvidenceFeature},
@@ -467,6 +470,13 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		// with disposition "held" / "hold_settled". Advertised UNCONDITIONALLY: a worker sends
 		// the two reports ONLY after seeing this token, because an older api 400s the unknown states.
 		{"credential_switch_hold"},
+	}
+	if publicationResumeEnabled {
+		// Issue #1324: this api accepts NEW publication intents. Omitted when
+		// RUN_PUBLICATION_RESUME_ENABLED is off, which refuses new enrollment only: an existing
+		// enrollment keeps its candidate updates, and publication_resume still rides the claim of
+		// a capable worker.
+		groups = append(groups, []string{workersvc.PublicationResumeFeature})
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot", capability.PendingOutcomeScopedClaimV1}) // PRD #1390 M2a
@@ -632,7 +642,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	response := map[string]any{
 		"worker":                    dto,
-		"protocol_features":         protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication),
+		"protocol_features":         protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication, h.cfg.PublicationResume),
 		"worker_outbox_max_pending": h.cfg.WorkerOutboxMaxPending,
 	}
 	if slices.Contains(updated.ProtocolCapabilities, capability.DindMaintenanceV1) {
@@ -1383,6 +1393,14 @@ func forgeParkRefusalReason(err error) (string, bool) {
 		return "stale_claim", true
 	case errors.Is(err, workersvc.ErrForgeParkCustodyUnsettled):
 		return "custody_unsettled", true
+	case errors.Is(err, workersvc.ErrPublicationEnrolled):
+		// Issue #1324: a legacy forge park for a run with an active publication intent. Nothing was
+		// mutated; the worker retries with recovery_phase "publication".
+		return "publication_enrolled", true
+	case errors.Is(err, workersvc.ErrPublicationNotEnrolled):
+		// Issue #1324: a typed publication park for a run with no active intent. Nothing was
+		// mutated; the pre-clone path must not absorb it.
+		return "publication_not_enrolled", true
 	default:
 		return "", false
 	}
@@ -1480,6 +1498,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// this answers whenever the run's worker_id is not this worker (another worker or
 			// NULL), at any generation; it proves neither a newer claim nor a landed outcome.
 			httpx.ErrorReason(w, http.StatusNotFound, "run not found for this worker", "run_not_owned")
+		case errors.Is(err, workersvc.ErrPublicationEnrollmentChanged):
+			// The run was enrolled while this report waited for its lock; nothing was written.
+			// A retryable 503 (not a 409 no-op ack), so the worker re-sends the report.
+			httpx.ErrorReason(w, http.StatusServiceUnavailable, "publication enrollment changed; retry", "publication_enrollment_changed")
 		case errors.Is(err, workersvc.ErrRunWallExpired):
 			ack, ackErr := h.workerStateAck(w, r, run)
 			if ackErr != nil {

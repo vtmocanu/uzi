@@ -857,14 +857,18 @@ type SetSlackRunLimitPauseParams struct {
 }
 
 // Stamp the pending park's start on the run's anchor (PRD #1116, generalised by PRD #1190):
-// @at is the run's own status_since captured at the park, and @park_kind records WHICH park it
-// was ('limit_wait' or 'paused') so the eventual resume reply can be worded honestly — a
-// usage-limit park clears "· usage limit cleared", an owner pause does not. It is its OWN
+// @at is the run's own status_since captured at the park (for a publication-phase forge park,
+// issue #1324, the owner episode's publication_wait_started_at instead), and @park_kind records
+// WHICH park it was ('limit_wait', 'paused', 'forge_publication' or 'forge_publication_hold') so
+// the eventual resume reply can be worded honestly — a usage-limit park clears "· usage limit
+// cleared", an owner pause does not, and only the hold kind posts one. It is its OWN
 // column, not a reuse of the gate/question anchors, for the same reason gate_generation and
 // milestones_notified_completed are their own columns — a distinct dedupe fact (a park awaiting
 // its resume line), so a park can never clear a gate and a gate can never clear a park. Overwrite
-// is correct: a re-park always follows a consumed resume (the park SQL guards on status='running',
-// and the resumed worker reports running first), so a set never clobbers a live pending park.
+// is the contract, and a set CAN replace a live pending marker: a custodian hold moves a run
+// queued -> recovery_wait without a running report in between, and a timed publication wait's
+// marker is deliberately kept across its automatic retries. The replaced marker's resume line is
+// dropped, which is the intended reading (the newest park is the one the owner must act on).
 func (q *Queries) SetSlackRunLimitPause(ctx context.Context, arg SetSlackRunLimitPauseParams) (SlackRunMessage, error) {
 	row := q.db.QueryRow(ctx, setSlackRunLimitPause, arg.At, arg.ParkKind, arg.RunID)
 	var i SlackRunMessage

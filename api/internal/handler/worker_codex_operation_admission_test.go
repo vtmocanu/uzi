@@ -57,7 +57,7 @@ func TestWorkerCodexOperationAdmissionStrictBody(t *testing.T) {
 }
 
 func TestWorkerCodexOperationFeatureAndRoute(t *testing.T) {
-	if !slices.Contains(protocolFeatures(false, false), "codex_account_operation_admission_v1") {
+	if !slices.Contains(protocolFeatures(false, false, false), "codex_account_operation_admission_v1") {
 		t.Fatal("missing independent feature")
 	}
 	routes, ok := (&Handler{}).WorkerRoutes(nil).(chi.Routes)

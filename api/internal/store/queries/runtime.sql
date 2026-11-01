@@ -1014,7 +1014,9 @@ WITH claimant AS MATERIALIZED (
 ), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id,
            fo.connection_id AS forge_connection_id, fo.origin AS forge_origin, fc.incarnation AS forge_incarnation,
-           fc.observation_version AS forge_observation_version
+           fc.observation_version AS forge_observation_version,
+           fo.api_origin AS forge_api_origin, fca.incarnation AS forge_api_incarnation,
+           fca.observation_version AS forge_api_observation_version
     FROM runs r
     LEFT JOIN authorized_forge_origins fo
       ON fo.repo_id = r.repo_id AND fo.user_id = r.user_id
@@ -1025,6 +1027,11 @@ WITH claimant AS MATERIALIZED (
             WHERE cc.lead_run_id = r.target_run_id AND cc.stage = 'code' AND cc.checker_run_id = r.id))
     LEFT JOIN forge_origin_cooldowns fc
       ON fc.user_id = r.user_id AND fc.worker_id = @worker_id AND fc.origin = fo.origin
+    -- Issue #1324 D9: the server-derived API origin is a second admission key only when it
+    -- differs from the Git origin (equal origins share fc's row). NULL is ignored.
+    LEFT JOIN forge_origin_cooldowns fca
+      ON fca.user_id = r.user_id AND fca.worker_id = @worker_id AND fca.origin = fo.api_origin
+        AND fo.api_origin <> fo.origin
     WHERE r.user_id = @user_id
       -- Hard admission even for a lone worker, an old run, or its own resume.
       AND EXISTS (SELECT 1 FROM claimant c WHERE fn_forge_origin_eligible(c, r, now()))
@@ -1231,6 +1238,11 @@ WITH claimant AS MATERIALIZED (
       AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
            OR 'milestone_reconciliation_claim_v1' = ANY(@worker_protocol_caps::text[]))
       AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(@worker_protocol_caps::text[]))
+      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, the side row's worker_id (not runs.worker_id, which resume writers clear); a NULL side worker_id is held. No affinity-ceiling release.
+      AND NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL AND pc.worker_id IS DISTINCT FROM @worker_id)
+      -- A claim outside a transaction cannot set the publication-resume opt-in the trigger requires.
+      AND (NOT @skip_publication_resume::boolean OR NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active'))
       AND (r.completion_contract_version IS NULL
            OR 'completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -1502,6 +1514,9 @@ WITH claimant AS MATERIALIZED (
                 AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
                      OR 'milestone_reconciliation_claim_v1' = ANY(p.protocol_capabilities))
       AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(p.protocol_capabilities))
+      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(p.protocol_capabilities))
+      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, the side row's worker_id (not runs.worker_id, which resume writers clear); a NULL side worker_id is held. No affinity-ceiling release.
+      AND NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL AND pc.worker_id IS DISTINCT FROM p.id)
                 AND (r.completion_contract_version IS NULL
                      OR 'completion_interlock_v1' = ANY(p.protocol_capabilities))
                 -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -1723,6 +1738,32 @@ WITH claimant AS MATERIALIZED (
     FOR UPDATE OF r SKIP LOCKED
     LIMIT 1
 ),
+forge_locked AS MATERIALIZED (
+    -- Issue #1324 D9: a run can need two reservations (Git and API origin) and must take both or
+    -- neither. Lock the target's cooldown rows first, in a fixed order, after claimant and target;
+    -- under READ COMMITTED a row changed since the statement snapshot is re-read at its latest
+    -- version, so the all-or-nothing decision below sees committed state and a stale snapshot loses.
+    SELECT c.origin, c.incarnation, c.observation_version, c.cooled_until, c.reservation_run_id
+    FROM forge_origin_cooldowns c JOIN target t
+      ON c.user_id = t.user_id AND c.worker_id = @worker_id
+        AND c.origin IN (t.forge_origin, t.forge_api_origin)
+    ORDER BY c.origin
+    FOR UPDATE OF c
+),
+forge_ok AS MATERIALIZED (
+    -- A missing snapshot row stays advisory (no origin or synthetic lock is taken for absence).
+    SELECT t.id FROM target t
+    WHERE (t.forge_incarnation IS NULL OR EXISTS (
+              SELECT 1 FROM forge_locked l
+              WHERE l.origin = t.forge_origin AND l.incarnation = t.forge_incarnation
+                AND l.observation_version = t.forge_observation_version
+                AND l.cooled_until <= now() AND l.reservation_run_id IS NULL))
+      AND (t.forge_api_incarnation IS NULL OR EXISTS (
+              SELECT 1 FROM forge_locked l
+              WHERE l.origin = t.forge_api_origin AND l.incarnation = t.forge_api_incarnation
+                AND l.observation_version = t.forge_api_observation_version
+                AND l.cooled_until <= now() AND l.reservation_run_id IS NULL))
+),
 forge_reservation AS (
     -- One conditional write, no retry. The existing row is locked only after
     -- claimant and target. A stale snapshot loses here without opening custody
@@ -1739,12 +1780,32 @@ forge_reservation AS (
       AND c.incarnation = t.forge_incarnation
       AND c.observation_version = t.forge_observation_version
       AND c.cooled_until <= now() AND c.reservation_run_id IS NULL
+      AND EXISTS (SELECT 1 FROM forge_ok ok WHERE ok.id = t.id)
+    RETURNING c.reservation_run_id AS run_id
+),
+forge_api_reservation AS (
+    -- The API origin's half-open trial, reserved in the same statement under the same CAS.
+    UPDATE forge_origin_cooldowns c SET
+        reservation_run_id = t.id,
+        reservation_generation = t.claim_generation + 1,
+        reservation_incarnation = c.incarnation,
+        reservation_version = c.observation_version,
+        reservation_observation_version = c.observation_version
+    FROM target t
+    WHERE c.user_id = t.user_id AND c.worker_id = @worker_id AND c.origin = t.forge_api_origin
+      AND t.forge_api_incarnation IS NOT NULL
+      AND c.incarnation = t.forge_api_incarnation
+      AND c.observation_version = t.forge_api_observation_version
+      AND c.cooled_until <= now() AND c.reservation_run_id IS NULL
+      AND EXISTS (SELECT 1 FROM forge_ok ok WHERE ok.id = t.id)
     RETURNING c.reservation_run_id AS run_id
 ),
 forge_admitted AS MATERIALIZED (
     SELECT t.* FROM target t
-    WHERE t.forge_incarnation IS NULL
-       OR EXISTS (SELECT 1 FROM forge_reservation fr WHERE fr.run_id = t.id)
+    WHERE (t.forge_incarnation IS NULL
+           OR EXISTS (SELECT 1 FROM forge_reservation fr WHERE fr.run_id = t.id))
+      AND (t.forge_api_incarnation IS NULL
+           OR EXISTS (SELECT 1 FROM forge_api_reservation fa WHERE fa.run_id = t.id))
 ),
 hold AS (
     -- PRD #1296 M1 (D2/D3): open the H-free custody hold atomically with the claim, for a
@@ -1773,7 +1834,8 @@ hold AS (
 )
 UPDATE runs SET
     forge_admission = jsonb_build_object('generation', runs.claim_generation + 1, 'worker_id', @worker_id::uuid,
-        'connection_id', (SELECT forge_connection_id FROM forge_admitted), 'origin', (SELECT forge_origin FROM forge_admitted)),
+        'connection_id', (SELECT forge_connection_id FROM forge_admitted), 'origin', (SELECT forge_origin FROM forge_admitted),
+        'api_origin', (SELECT forge_api_origin FROM forge_admitted)),
     cross_check_lane = COALESCE(@lane::text = 'cross_check', false),
     status     = 'claimed',
     status_since = now(),
@@ -3423,6 +3485,9 @@ UPDATE runs SET
     updated_at = now()
 WHERE id = @id AND user_id = @user_id AND status = 'recovery_wait'
   AND recovery_wait_cause = 'forge_unreachable' AND recovery_retry_not_before IS NULL
+  -- A publication-phase hold resumes through ResumePublicationForgeHold (issue #1324), which also
+  -- advances the side row's episode in the same transaction; this pre-clone arm never matches it.
+  AND recovery_wait_phase IS NULL
   AND COALESCE(stop_kind, '') = ''
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
@@ -7555,6 +7620,10 @@ WITH candidates AS MATERIALIZED (
       SELECT 1 FROM workers coordinate_worker
       WHERE coordinate_worker.id = @worker_id AND coordinate_worker.user_id = r.user_id
         AND 'task_checkpoint_coordinates_v1' = ANY(coordinate_worker.protocol_capabilities)))
+  AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR EXISTS (
+      SELECT 1 FROM workers publication_worker
+      WHERE publication_worker.id = @worker_id AND publication_worker.user_id = r.user_id
+        AND 'publication_resume_v1' = ANY(publication_worker.protocol_capabilities)))
   AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation
@@ -7619,6 +7688,10 @@ WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = fals
       SELECT 1 FROM workers coordinate_worker
       WHERE coordinate_worker.id = @worker_id AND coordinate_worker.user_id = r.user_id
         AND 'task_checkpoint_coordinates_v1' = ANY(coordinate_worker.protocol_capabilities)))
+  AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR EXISTS (
+      SELECT 1 FROM workers publication_worker
+      WHERE publication_worker.id = @worker_id AND publication_worker.user_id = r.user_id
+        AND 'publication_resume_v1' = ANY(publication_worker.protocol_capabilities)))
   AND (r.kind <> 'cross_check' OR r.claim_generation > 0)
   AND r.kind <> 'chat'
   AND r.claim_generation = a.claim_generation
@@ -10349,7 +10422,7 @@ WITH candidates AS (
 SELECT w.id,
        fn_forge_origin_eligible(w,run,@cross_check_evaluated_at::timestamptz)::boolean AS forge_eligible,
        EXISTS (SELECT 1 FROM authorized_forge_origins a JOIN forge_origin_cooldowns c
-               ON c.user_id = a.user_id AND c.origin = a.origin AND c.worker_id = w.id
+               ON c.user_id = a.user_id AND c.origin IN (a.origin, a.api_origin) AND c.worker_id = w.id
                WHERE a.repo_id = run.repo_id AND a.user_id = run.user_id)::boolean AS has_cooldown,
        COALESCE(codex_admission_run_eligible_at(run.id) <= now(), true)::boolean AS admission_eligible,
        (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), @cross_check_evaluated_at::timestamptz, @cross_check_affinity_cutoff::timestamptz))::boolean AS strict_candidate,
@@ -10441,6 +10514,9 @@ WHERE run.id = @run_id
   AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = run.id)
        OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
       AND (run.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
+      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = run.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(w.protocol_capabilities))
+      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, the side row's worker_id (not runs.worker_id, which resume writers clear); a NULL side worker_id is held. No affinity-ceiling release.
+      AND NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = run.id AND pc.state = 'active' AND pc.handoff IS NULL AND pc.worker_id IS DISTINCT FROM w.id)
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10838,6 +10914,9 @@ SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
+  -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, so a new
+  -- ephemeral worker could never serve it (ClaimRun bars it and the reaper removes the worker).
+  AND NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL)
   -- Filter admission before LIMIT so held accounts cannot crowd out demand.
   AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
   AND fn_forge_origin_provision_allowed(r, now())
@@ -10912,6 +10991,9 @@ WHERE r.status = 'queued'
         AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
                       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
       AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
+      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(w.protocol_capabilities))
+      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, the side row's worker_id (not runs.worker_id, which resume writers clear); a NULL side worker_id is held. No affinity-ceiling release.
+      AND NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL AND pc.worker_id IS DISTINCT FROM w.id)
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -11070,6 +11152,9 @@ SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
+  -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, so a new
+  -- ephemeral worker could never serve it (ClaimRun bars it and the reaper removes the worker).
+  AND NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL)
   -- Filter admission before LIMIT so held accounts cannot crowd out demand.
   AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
   AND fn_forge_origin_provision_allowed(r, now())
@@ -11132,6 +11217,9 @@ WHERE r.status = 'queued'
         AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
                       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
       AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
+      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(w.protocol_capabilities))
+      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, the side row's worker_id (not runs.worker_id, which resume writers clear); a NULL side worker_id is held. No affinity-ceiling release.
+      AND NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL AND pc.worker_id IS DISTINCT FROM w.id)
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -11211,6 +11299,9 @@ WHERE r.status = 'queued'
         AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
                       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
       AND (r.checkpoint_coordinates IS NULL OR 'task_checkpoint_coordinates_v1' = ANY(w.protocol_capabilities))
+      AND (NOT EXISTS (SELECT 1 FROM run_publication_resume pr WHERE pr.run_id = r.id AND pr.state = 'active') OR 'publication_resume_v1' = ANY(w.protocol_capabilities))
+      -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, the side row's worker_id (not runs.worker_id, which resume writers clear); a NULL side worker_id is held. No affinity-ceiling release.
+      AND NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL AND pc.worker_id IS DISTINCT FROM w.id)
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -11322,6 +11413,9 @@ LIMIT @max_rows;
 SELECT r.id, r.user_id, r.required_capabilities
 FROM runs r
 WHERE r.status = 'queued'
+  -- Issue #1324 D5: an enrolled run with no handoff is claimable only by its custodian, so a new
+  -- ephemeral worker could never serve it (ClaimRun bars it and the reaper removes the worker).
+  AND NOT EXISTS (SELECT 1 FROM run_publication_resume pc WHERE pc.run_id = r.id AND pc.state = 'active' AND pc.handoff IS NULL)
   AND r.egress_profile_id IS NOT NULL
   AND r.kind <> 'chat'
   AND NOT EXISTS (SELECT 1 FROM cross_checks code_check

@@ -72,3 +72,29 @@ func TestIncompleteInventoryClaim(t *testing.T) {
 		})
 	}
 }
+
+func TestSnapshotPolicyAndPublicationDecodeIndependently(t *testing.T) {
+	for _, broken := range []string{"neither", "policy", "publication"} {
+		t.Run(broken, func(t *testing.T) {
+			policy := `[{"run_id":"11111111-1111-4111-8111-111111111111","owner_generation":9}]`
+			publication := `[{"run_id":"22222222-2222-4222-8222-222222222222","claim_generation":4,"enrollment_seq":2,"candidate_seq":1}]`
+			if broken == "policy" {
+				policy = `{"invalid":"list"}`
+			}
+			if broken == "publication" {
+				publication = `{"invalid":"list"}`
+			}
+			var snap ActiveSnapshot
+			raw := fmt.Sprintf(`{"snapshot_epoch":1,"active":[],"pending_overflow":true,"pending_policy_protection":%s,"publication_resume":%s}`, policy, publication)
+			if err := json.Unmarshal([]byte(raw), &snap); err != nil {
+				t.Fatal(err)
+			}
+			if (len(snap.PendingPolicyProtection) == 1) != (broken != "policy") || snap.pendingPolicyProtectionMalformed != (broken == "policy") {
+				t.Fatalf("policy evidence lost or misclassified: %+v", snap)
+			}
+			if (len(snap.PublicationResume) == 1) != (broken != "publication") || snap.publicationResumeMalformed != (broken == "publication") {
+				t.Fatalf("publication evidence lost or misclassified: %+v", snap)
+			}
+		})
+	}
+}

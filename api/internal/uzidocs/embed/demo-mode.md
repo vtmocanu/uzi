@@ -49,10 +49,23 @@ leak the real value either.
 ## What stays real
 
 Issue/MR/PR titles, branch names, issue/MR numbers, your worker names, and
-the instance's brand/app name are never masked — the operator controls
+other authored content are never masked: the operator controls
 those for a demo. Editable form fields (your public base URL, forge
 connection inputs, and the like) also stay real, so forms and saves keep
-working.
+working. **Admin → Branding** keeps its real live preview so admins can
+edit the instance branding while demo mode is on.
+
+## What it hides
+
+- **Instance branding**: all app marks use the stock uzi factory icon and
+  `uzi` wordmark, including full white-label instances. The browser tab
+  title and favicon base also use the stock defaults. POWERED BY text and
+  logos are hidden in every placement.
+- **License credit**: the optional build-time MIT author credit is hidden.
+
+Turning demo mode off restores the real branding and any enabled license
+credit immediately. No server branding settings change. See
+[Branding](branding.md) for the instance-wide settings.
 
 ## Things to know before you screenshot
 

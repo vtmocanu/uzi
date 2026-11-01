@@ -20,7 +20,7 @@ const config = { dockerWiring: {}, workerName: "registration", workerTemplate: "
 const runner = { resumePendingRecoveries: async () => {} } as unknown as RunRunner;
 function outbox(entries: PendingTerminal[]): Outbox {
   return { listPendingTerminals: () => entries, listPendingOutcomeSources: () => entries,
-    listPendingFinalizes: () => [], uncleanRuns: () => [], depths: () => [],
+    listPendingFinalizes: () => [], listPublicationRegisterEntries: () => [], uncleanRuns: () => [], depths: () => [],
     runsWithPending: () => [], unclassifiedPolicyRunIds: () => [], depthFor: () => undefined,
     drain: async () => {}, hasUndrainedMessages: () => false } as unknown as Outbox;
 }

@@ -2586,6 +2586,14 @@ func providerHoldAction(r apitypes.RunDTO) string {
 // dropped when the server sent no retry stamp. HH:MM is the viewer's local wall clock, the
 // same idiom as the near-timeout / times-out rows above.
 func forgeParkLine(r apitypes.RunDTO) string {
+	// Issue #1324: a publication-phase park has no park-count budget, so it never reaches the
+	// "N of MAX" wording below; an unknown phase gets a generic line, never the pre-clone one.
+	if isPublicationPark(r) {
+		return publicationParkLineAt(r, time.Now())
+	}
+	if isUnknownPhasePark(r) {
+		return unknownPhaseParkLine(r)
+	}
 	capLabel := "unlimited"
 	if r.ForgeParkMax != 0 {
 		capLabel = itoa(r.ForgeParkMax)

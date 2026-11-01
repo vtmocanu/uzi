@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { decodeCodeCoverage, type CodeCoverage } from "./code-cross-check-coverage.js";
 import { decodePublicationContext, validatePublicationContextRequest } from "./publication-context.js";
 import type { PublicationContextRequest, PublicationContextResponse } from "./protocol.js";
+import type { PublicationIntentRequest, PublicationIntentResult } from "./publication-intent.js";
 import type { LeadConfigReportBody } from "./protocol.js";
 import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
@@ -1229,6 +1230,13 @@ type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 /** issue #3181: the registration feature that lets a worker hold a credential switch it cannot settle. */
 export const CREDENTIAL_SWITCH_HOLD_FEATURE = "credential_switch_hold";
 
+/** Issue #1324: the api accepts NEW publication intents and the typed publication-phase park. */
+const PUBLICATION_RESUME_FEATURE = "publication_resume_v1";
+/** Issue #1324 M5: the owner-hold reasons the api accepts on a publication-phase report (anything else is a 400). */
+const PUBLICATION_HOLD_REASONS: ReadonlySet<string> = new Set([
+  "publication_model_required", "publication_source_unavailable", "publication_intent_mismatch",
+]);
+
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private registeredWorkerId: string | undefined;
@@ -1547,10 +1555,65 @@ export class WorkerClient {
 
   private readonly forgeCloneReports = new Set<AbortController>();
 
+  /**
+   * Issue #1324: enroll a run's publication intent, or advance its candidate. ONE request, no internal
+   * retry (the caller's bounded retry re-sends the identical idempotent request). Never throws; the result
+   * says what is known: `acked` (the api stored it), `refused` (a definite answer that stored nothing, with
+   * the machine-readable reason: publication_intent_mismatch, publication_enrollment_retired,
+   * publication_resume_disabled, publication_resume_unsupported, publication_kind_unsupported,
+   * stale_claim, ...), `unsupported` (a NEW enrollment without the negotiated feature; nothing was sent) or `unknown`
+   * (transport failure, timeout, a 429/5xx or an unreadable ack: the request may have been applied).
+   */
+  async registerPublicationIntent(runId: string, request: PublicationIntentRequest, signal?: AbortSignal): Promise<PublicationIntentResult> {
+    // Only a NEW enrollment needs the advertised feature (the api's switch refuses new enrollment alone):
+    // an existing enrollment keeps its candidate updates and retirement answers whatever the api advertises.
+    if (request.enrollment_seq === undefined && !this.hasFeature(PUBLICATION_RESUME_FEATURE)) return { kind: "unsupported" };
+    if (!terminalUUID(runId)) return { kind: "refused", status: 0, reason: "invalid_run_id" };
+    let res: Response;
+    try {
+      res = await this.fetchRaw("POST", WORKER_API_PREFIX + "/runs/" + encodeURIComponent(runId) + "/publication-intent", request, this.httpTimeoutMs, signal);
+    } catch (err) {
+      return { kind: "unknown", detail: err instanceof Error ? err.message : String(err) };
+    }
+    let parsed: Record<string, unknown> = {};
+    try {
+      const raw = await readBoundedBytes(res, PUBLICATION_ACK_MAX_BYTES);
+      const value: unknown = JSON.parse(new TextDecoder().decode(raw));
+      if (isRecord(value)) parsed = value;
+    } catch {
+      // An unreadable body is judged by its status below.
+    }
+    if (res.status === 200) {
+      const { enrollment_seq: enrollment, candidate_seq: candidate, state } = parsed;
+      if (typeof enrollment === "number" && Number.isSafeInteger(enrollment) && enrollment > 0 &&
+          typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate > 0 && typeof state === "string") {
+        return { kind: "acked", enrollment_seq: enrollment, candidate_seq: candidate, state };
+      }
+      return { kind: "unknown", detail: "unreadable publication intent ack" };
+    }
+    const reason = typeof parsed.reason === "string" ? parsed.reason
+      : typeof parsed.error === "string" && /^publication_[a-z_]+$/.test(parsed.error) ? parsed.error : "";
+    if (res.status === 409 && parsed.disposition === "stale_claim") return { kind: "refused", status: 409, reason: "stale_claim" };
+    // The api's 503 for a disabled feature is a definite refusal; any other 5xx, and 429, may be transient.
+    if (res.status === 503 && reason === "publication_resume_disabled") return { kind: "refused", status: 503, reason };
+    if (res.status >= 500 || res.status === 429) return { kind: "unknown", detail: `http ${res.status}` };
+    return { kind: "refused", status: res.status, reason: reason || `http_${res.status}` };
+  }
+
   /** One attempt, no retries/backlog, no response authority. The ordinary clone
    * flight alone calls this after its actual successful direct Git operation. */
   reportForgeCloneSuccess(claim: ClaimResponse, flightSignal: AbortSignal): void {
-    const token = claim.forge_origin_reservation;
+    this.postForgeSuccess(claim, claim.forge_origin_reservation, undefined, flightSignal);
+  }
+
+  /** Issue #1324 D9: the API-surface twin. One attempt after an actual successful direct forge API
+   * call, echoing the claim's `forge_api_origin_reservation` (offered only to a forge_api_success_v1
+   * worker). Same advisory contract: no retries, no backlog, the response grants nothing. */
+  reportForgeApiSuccess(claim: ClaimResponse, flightSignal: AbortSignal): void {
+    this.postForgeSuccess(claim, claim.forge_api_origin_reservation, "api", flightSignal);
+  }
+
+  private postForgeSuccess(claim: ClaimResponse, token: ClaimResponse["forge_origin_reservation"], surface: "api" | undefined, flightSignal: AbortSignal): void {
     if (!this.hasFeature("forge_clone_success_v1") || flightSignal.aborted ||
         !terminalUUID(claim.run_id) || !terminalGeneration(claim.claim_generation) ||
         (claim.claim_generation ?? 0) <= 0 || !isRecord(token) ||
@@ -1575,11 +1638,13 @@ export class WorkerClient {
         { method: "POST", headers: { Authorization: "Bearer " + this.token,
           "Content-Type": "application/json", "X-Client-Version": this.version },
           body: JSON.stringify({ claim_generation: claim.claim_generation,
-            incarnation: token.incarnation, version: token.version, observation_version: token.observation_version }), signal },
+            incarnation: token.incarnation, version: token.version, observation_version: token.observation_version,
+            ...(surface !== undefined ? { surface } : {}) }), signal },
       ).then(response => {
         // Status and body never authorize anything; strict legacy endpoints can
-        // refuse this optional report without changing the flight.
-        if (!signal.aborted && [400, 404, 405].includes(response.status)) this.dropFeature("forge_clone_success_v1");
+        // refuse this optional report without changing the flight. Only the Git surface
+        // closes the feature: an API-surface 400 may just mean forge_api_success_v1 was not negotiated.
+        if (!signal.aborted && surface === undefined && [400, 404, 405].includes(response.status)) this.dropFeature("forge_clone_success_v1");
         void response.body?.cancel().catch(() => {});
       }).catch(() => {}).finally(finish);
     } catch { finish(); }
@@ -2487,6 +2552,36 @@ export class WorkerClient {
         if (!evidence.ambiguous && evidence.refusals > 0 && error instanceof StateDecodeRefusalError)
           throw new StateReportUnappliedError(runId, error);
         if (evidence.refusedAfterAmbiguity) throw new Error("Codex idle park outcome uncertain", { cause: error });
+        throw error;
+      }
+    }
+    if (body.recovery_phase !== undefined || body.publication_surface !== undefined ||
+        body.publication_step !== undefined || body.handoff_checkpoint_tip !== undefined ||
+        body.publication_hold_reason !== undefined) {
+      // Issue #1324: the publication-phase forge park. The api refuses an enrolled run's untyped park
+      // and a typed park without an enrollment, so this report can neither degrade to an untyped one
+      // nor drop its generation fence: it is sent exactly as given, once, or not at all.
+      // Not gated on the advertised feature: the api accepts a typed publication park whatever its
+      // switch says, and refuses an enrolled run's untyped park, so a park must never be withheld.
+      // Issue #1324 M5: an owner HOLD is the same report with a hold reason and NO surface or step (the api
+      // refuses a hold that names either, and a park that names neither).
+      const hold = body.publication_hold_reason !== undefined;
+      const forgeOutage = !hold &&
+        (body.publication_surface === "git" || body.publication_surface === "api") &&
+        (body.publication_step === "floor_refresh" || body.publication_step === "push" || body.publication_step === "mr_create");
+      const validHold = hold && PUBLICATION_HOLD_REASONS.has(body.publication_hold_reason!) &&
+        body.publication_surface === undefined && body.publication_step === undefined;
+      if (body.status !== "recovery_wait" ||
+          body.recovery_cause !== "forge_unreachable" || body.recovery_phase !== "publication" ||
+          !(forgeOutage || validHold) ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) < 1 ||
+          (body.handoff_checkpoint_tip !== undefined && !/^[0-9a-f]{40}$/.test(body.handoff_checkpoint_tip)))
+        throw new Error("publication park requires a forge_unreachable recovery_wait, a surface and a step (or a hold reason and neither) and a positive generation");
+      const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+      try {
+        return await this.reportStateOnce(runId, path, Object.freeze({ ...body }), signal, CROSS_CHECK_RESPONSE_MAX_BYTES, evidence);
+      } catch (error) {
+        if (evidence.refusedAfterAmbiguity) throw new Error("publication park outcome uncertain", { cause: error });
         throw error;
       }
     }
@@ -5110,6 +5205,8 @@ class ResponseBodyOverflowError extends Error {
 
 /** Most bytes of an error response body toError reads. */
 const ERROR_BODY_MAX_BYTES = 4096;
+/** The publication-intent ack and its refusal bodies are a few small members. */
+const PUBLICATION_ACK_MAX_BYTES = 16 * 1024;
 
 /** Read at most `maxBytes` of `res`'s body as UTF-8 text, then cancel the stream so a hostile or
  *  unending body neither fills memory nor holds the connection. A body that ends sooner is read

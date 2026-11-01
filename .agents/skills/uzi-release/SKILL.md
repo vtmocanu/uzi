@@ -67,6 +67,13 @@ Once step 1 holds (nothing wanted left unmerged, `main` green on the tip), cut t
 
 **Present the step-3 summary once the tag is pushed** — the publish runs unattended in the background (`release-watch.sh`) while you report what shipped, and you fold the verified tags (or a block) into the summary when `release-verify.sh` confirms.
 
+**Stable TL;DR (stable only, after `release-verify.sh` passes).** Draft it locally, never in CI, from the `## [B]` section and its merged PRs:
+- **Shape:** a one-line theme, 4-6 themed bullets, a "Bottom line", and links to the CHANGELOG at the tag and to the Release.
+- **Content:** user-facing language, no em dashes, no internal names.
+- **Review:** the buddy checks every claim against the section and the tag (versions from manifests at the tag), then the user approves the text.
+- **Publish:** prepend it as `## Technical TL;DR` to the Release body with `gh release edit vB --notes-file <file> --latest`. Keep the body within 125,000 characters with its `### Security` heading intact (`api/internal/releasecheck`), then confirm it is still Latest.
+- **Slack:** give the user the same text for Slack. A rerun of the tag's `publish-release` overwrites the Release body, so prepend the TL;DR again after one.
+
 ## 3. Final summary (always end with this)
 Report to the user, concisely:
 - **One line up top**: version X.Y.Z and its status — cut / CI-green / tag pushed / **published to GHCR (images + chart)** / blocked on `<what>` (e.g. the tag push awaiting the user's `! git push`); CI coverage proven at publish (or explicitly UNVERIFIED for an annotated hotfix exception); deploy state (or "deploy verification needs cluster access I don't have"). Since the publish runs in the background (step 2's `release-watch.sh`), the summary may go out while it is still publishing — say so, and update once `release-verify.sh` confirms.

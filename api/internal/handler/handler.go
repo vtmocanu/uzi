@@ -1194,6 +1194,8 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// limiter or upstream I/O. Strict 17 KiB decoding and worker/run fences apply.
 		r.Post("/runs/{id}/policy-hold", h.WorkerRunPolicyHold)
 		r.Post("/runs/{id}/forge-clone-success", h.WorkerForgeCloneSuccess)
+		// Bound intent body-decoding and enrollment writes per worker, like the semantic candidate.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/publication-intent", h.WorkerPublicationIntent)
 		r.Post("/runs/{id}/memory/reserve", h.WorkerMemoryReserve)
 		r.Post("/runs/{id}/memory/outcome", h.WorkerMemoryOutcome)
 		// Bound semantic body-decoding work per worker, including while production enrollment is off.

@@ -760,7 +760,27 @@ export interface ActiveSnapshot {
    *  process restart with no journaled terminal outcome. Never an outcome and never a lease: the
    *  api re-queues such a run through the ordinary claim path. Never sent on a heartbeat/claim. */
   finalize_resume?: FinalizeResumeEntry[];
+  /** Issue #1324 D6: carried ONLY on the register snapshot — each run whose authenticated
+   *  publication-intent record (an acknowledged enrollment) survived a restart. The api requeues
+   *  such a run through the ordinary orphan path, keeping its intent. A run listed here is never
+   *  also listed in finalize_resume. Never an outcome and never a lease. */
+  publication_resume?: PublicationResumeEntry[];
 }
+
+/** Issue #1324: one publication-resume attempt attested on the register snapshot (api `PublicationResumeEntry`). */
+export interface PublicationResumeEntry {
+  run_id: string;
+  claim_generation: number;
+  enrollment_seq: number;
+  candidate_seq: number;
+}
+
+/** Issue #1324 M5: why a publication-only resume holds the run for its owner instead of publishing (api
+ *  `validatePublicationPark`; any other value is a 400). */
+export type PublicationHoldReason =
+  | "publication_model_required"
+  | "publication_source_unavailable"
+  | "publication_intent_mismatch";
 
 /** Issue #1742: one finalize-pending attempt attested on the register snapshot. */
 export interface FinalizeResumeEntry {
@@ -1583,6 +1603,18 @@ export interface ForgeOriginReservation {
 export interface ClaimResponse extends ClaimMemoryState {
   /** Optional negotiated telemetry token; grants no execution or custody authority. */
   forge_origin_reservation?: ForgeOriginReservation;
+  /** Issue #1324 D9: the half-open API-origin reservation of this claim, sent only to a worker that
+   *  advertised forge_api_success_v1. Echoed on a successful direct forge API call; grants no authority. */
+  forge_api_origin_reservation?: ForgeOriginReservation;
+  /** Issue #1324: the active publication intent, sent only to a publication_resume_v1 worker while an
+   *  enrollment is active (api `PublicationResumePayload`). `intent` and `handoff` are opaque here; parse
+   *  them with parseClaimPublicationResume (publication-intent.ts), which throws a typed mismatch. */
+  publication_resume?: {
+    enrollment_seq: number;
+    candidate_seq: number;
+    intent: unknown;
+    handoff?: unknown;
+  };
   /** Server row only; no production enrollment writer in M2. */
   semantic_planning?: import("./semantic-plan.js").SemanticPlanning;
   /** Guarded prompt repair inputs; metadata is untrusted. */
@@ -3012,6 +3044,26 @@ export interface StateRequest {
    * recovery_cause_codex_idle_stall_v1 and a positive, stampable generation. This
    * contract never downgrades after negotiation; both idle kinds carry progress. */
   recovery_cause?: string;
+  /** Issue #1324 D3/D8: with `recovery_cause: "forge_unreachable"`, the park is a PUBLICATION-phase park of
+   *  a run with an active publication intent. Sent only to an api that advertised publication_resume_v1
+   *  and always together with publication_surface, publication_step and a positive claim_generation. An
+   *  enrolled run's legacy untyped park is refused 409 `publication_enrolled`; this typed park for a run
+   *  with no active intent is refused 409 `publication_not_enrolled` (see StateAck.reason). */
+  recovery_phase?: "publication";
+  /** Issue #1324: which forge surface the transient outage hit (the api keys its origin cooldown on it). */
+  publication_surface?: "git" | "api";
+  /** Issue #1324: the publication step that met the outage. */
+  publication_step?: "floor_refresh" | "push" | "mr_create";
+  /** Issue #1324: optional 40-hex checkpoint tip a peer may claim the run from; the api records it only
+   *  when it is the run's current published checkpoint tip. */
+  handoff_checkpoint_tip?: string;
+  /** Issue #1324 M5: a worker-reported publication OWNER HOLD, a state report and never a failure. Sent as
+   *  `recovery_wait` + `recovery_cause: "forge_unreachable"` + `recovery_phase: "publication"` with a positive
+   *  claim_generation, and with publication_surface and publication_step ABSENT (they mark a forge outage; a
+   *  hold is not one). The api stamps it NULL (no automatic retry; an owner Resume queues one publication-only
+   *  episode), keeps custody and the active intent, and leaves the forge park count alone. Refused 409
+   *  `publication_not_enrolled` when no intent is active and 409 stale_claim on a stale generation. */
+  publication_hold_reason?: PublicationHoldReason;
   /** PRD #1733: with `recovery_cause: "provider_outage"` only (the api 400s it on any other report),
    *  the count of successful model turns completed since this flight started, so the api
    *  can tell a streak of unproductive outages from one that made progress in between. Gated on

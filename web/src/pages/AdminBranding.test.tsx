@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AdminBranding } from "./AdminBranding";
 import { api, ApiError } from "../lib/api";
 import type { AppSettings, Branding, SettingsResponse } from "../lib/api";
+import { setDemoMode } from "../lib/demoMode";
 
 // Swap only the api object; ApiError/types stay real so the page's `instanceof
 // ApiError` checks match what the mocked methods throw.
@@ -117,10 +118,24 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  setDemoMode(false);
   vi.clearAllMocks();
 });
 
 describe("AdminBranding", () => {
+  it("keeps the live branding preview real while demo mode is on", async () => {
+    setDemoMode(true);
+    mockApi.getSettings.mockResolvedValue(response({ app_logo_mode: "custom", app_logo_keep_name: "false", brand_mode: "text", brand_company: "Acme, Inc." }));
+    mockApi.branding.mockResolvedValue(branding({ app_logo_mode: "custom", app_logo_present: true }));
+    renderPage();
+    const preview = within(await screen.findByTestId("branding-preview"));
+    expect(preview.getByAltText("app logo").getAttribute("src")).toContain("/api/branding/logo/app");
+    expect(preview.getByText("Acme, Inc.")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Company name"), { target: { value: "Example Company" } });
+    expect(preview.getByText("Example Company")).toBeTruthy();
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+  });
+
   it("renders the default (unbranded) state with the uzi tile selected and no upload controls", async () => {
     renderPage();
     // The App-logo tile picker defaults to the "uzi" tile (mode=default).

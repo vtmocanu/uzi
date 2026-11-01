@@ -89,6 +89,7 @@ type AuthorizedForgeOrigin struct {
 	UserID       uuid.UUID `json:"user_id"`
 	ConnectionID uuid.UUID `json:"connection_id"`
 	Origin       string    `json:"origin"`
+	ApiOrigin    string    `json:"api_origin"`
 }
 
 type AutopilotTrigger struct {
@@ -440,6 +441,8 @@ type ForgeOriginCooldown struct {
 	ReservationIncarnation        pgtype.UUID        `json:"reservation_incarnation"`
 	ReservationVersion            pgtype.Int8        `json:"reservation_version"`
 	ReservationObservationVersion pgtype.Int8        `json:"reservation_observation_version"`
+	GitUnverified                 bool               `json:"git_unverified"`
+	ApiUnverified                 bool               `json:"api_unverified"`
 }
 
 type GithubProjectItem struct {
@@ -1228,6 +1231,7 @@ type Run struct {
 	PolicyRefusalPhase          pgtype.Text        `json:"policy_refusal_phase"`
 	PolicyRefusalCorrelationID  pgtype.Text        `json:"policy_refusal_correlation_id"`
 	PolicyHoldPublished         pgtype.Bool        `json:"policy_hold_published"`
+	RecoveryWaitPhase           pgtype.Text        `json:"recovery_wait_phase"`
 }
 
 type RunCompletionAttempt struct {
@@ -1313,14 +1317,17 @@ type RunFetchReservation struct {
 }
 
 type RunForgeOrigin struct {
-	RunID                  uuid.UUID   `json:"run_id"`
-	UserID                 uuid.UUID   `json:"user_id"`
-	WorkerID               uuid.UUID   `json:"worker_id"`
-	Generation             int64       `json:"generation"`
-	ConnectionID           uuid.UUID   `json:"connection_id"`
-	Origin                 pgtype.Text `json:"origin"`
-	ReservationIncarnation pgtype.UUID `json:"reservation_incarnation"`
-	ReservationVersion     pgtype.Int8 `json:"reservation_version"`
+	RunID                     uuid.UUID   `json:"run_id"`
+	UserID                    uuid.UUID   `json:"user_id"`
+	WorkerID                  uuid.UUID   `json:"worker_id"`
+	Generation                int64       `json:"generation"`
+	ConnectionID              uuid.UUID   `json:"connection_id"`
+	Origin                    pgtype.Text `json:"origin"`
+	ReservationIncarnation    pgtype.UUID `json:"reservation_incarnation"`
+	ReservationVersion        pgtype.Int8 `json:"reservation_version"`
+	ApiOrigin                 pgtype.Text `json:"api_origin"`
+	ApiReservationIncarnation pgtype.UUID `json:"api_reservation_incarnation"`
+	ApiReservationVersion     pgtype.Int8 `json:"api_reservation_version"`
 }
 
 type RunGatePresentation struct {
@@ -1407,6 +1414,25 @@ type RunMilestoneReconciliation struct {
 	AppliedInputID   int64              `json:"applied_input_id"`
 	StopCutoff       int64              `json:"stop_cutoff"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunPublicationResume struct {
+	RunID           uuid.UUID          `json:"run_id"`
+	EnrollmentSeq   int32              `json:"enrollment_seq"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	WorkerID        pgtype.UUID        `json:"worker_id"`
+	Intent          []byte             `json:"intent"`
+	CandidateSeq    int32              `json:"candidate_seq"`
+	State           string             `json:"state"`
+	RetiredReason   pgtype.Text        `json:"retired_reason"`
+	WaitStartedAt   pgtype.Timestamptz `json:"wait_started_at"`
+	FirstWaitAt     pgtype.Timestamptz `json:"first_wait_at"`
+	ParkTotal       int32              `json:"park_total"`
+	Episode         int32              `json:"episode"`
+	HoldReason      pgtype.Text        `json:"hold_reason"`
+	Handoff         []byte             `json:"handoff"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 }
 
 type RunReview struct {

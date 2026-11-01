@@ -13,7 +13,7 @@ import type {
   RunPriority,
   StopKind,
 } from "./apiTypes";
-import { forgeWaitLabel, forgeWaitMode } from "./forgeCooldown";
+import { forgeWaitLabel, forgeWaitMode, forgeWaitPhase } from "./forgeCooldown";
 import { isTerminalRun } from "./runStatus";
 import { credentialSwitchHold } from "./credentialSwitchHold";
 import { forgeNounSentence, forgeNounLower, forgePlatform } from "./forgeNoun";
@@ -207,6 +207,7 @@ export function effectiveRunStatus(
     hold_reason?: string | null;
     recovery_wait_cause?: string | null;
     recovery_retry_not_before?: string | null;
+    recovery_wait_phase?: string | null;
   },
 ): string {
   // The applied policy hold takes precedence over a retained completion marker.
@@ -690,7 +691,7 @@ function badgeTitle(reason: string | null | undefined): string | undefined {
 
 // runBadge maps a card's latest_run to its primary status pill. nowMs is passed in
 // (not read from Date.now) so the running elapsed is deterministic under test.
-export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause" | "recovery_retry_not_before" | "worker_recovery" | "requeue_count" | "memory_hold">>, nowMs: number, maintenanceReason?: string | null): RunBadge {
+export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause" | "recovery_retry_not_before" | "recovery_wait_phase" | "worker_recovery" | "requeue_count" | "memory_hold">>, nowMs: number, maintenanceReason?: string | null): RunBadge {
   // The stopped signal wins over the raw status so a cancel-shaped `failed`
   // never renders as breakage.
   if (isStoppedRun(run.status, run.stop_kind)) {
@@ -701,6 +702,14 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
   }
   const forgeMode = forgeWaitMode(run);
   if (forgeMode) {
+    if (forgeWaitPhase(run) === "publication") {
+      return { kind: "badge", label: forgeWaitLabel(run)!, tone: "warning", pulse: false,
+        title: forgeMode === "held"
+          ? "Publishing is held for the run owner. Resume starts a new publication-only attempt with no model work; Cancel ends the run."
+          : forgeMode === "timed"
+            ? "The forge was unreachable while publishing. Publication retries automatically after the scheduled time; no model work runs."
+            : "Retry timing is unavailable; neither an owner hold nor an automatic retry date is established." };
+    }
     return { kind: "badge", label: forgeWaitLabel(run)!, tone: "warning", pulse: false,
       title: forgeMode === "held"
         ? "Only the run owner can Resume or Cancel; no scheduled retry. Resume permits one bounded ordinary attempt, without promising execution or resetting counts, custody or grants."
