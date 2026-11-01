@@ -419,6 +419,40 @@ export class AuthorityRuntime implements AuthorityScope {
   }
 
   /**
+   * issue #3639 - the AUTHORIZING counterpart of {@link verifyEndedSlots}, which stays diagnostic. Same lock, same
+   * read-only path (no drain of queued settlements, no write), same identity checks (exact `authorityKey`,
+   * `ineligible`, recorded epoch and seq, owned by `worker`), and additionally every slot must carry no pending
+   * footprint (`pending === null`, whatever its kind or settlement) and must not be held by a sink other than `sink`.
+   * A true answer is the evidence a same-incarnation reclaim relies on; any difference or uncertainty (lock timeout,
+   * unreadable store or slot, empty `sources`) answers false.
+   */
+  async verifyReceiptSlots(
+    sources: ReadonlyArray<{ path: string; authorityKey: string; epoch: string; seq: number }>, worker: string,
+    sink: Set<string> | undefined, options: AuthorityWait = {},
+  ): Promise<boolean> {
+    if (sources.length === 0) return false;
+    const read = async (): Promise<boolean> => {
+      for (const source of sources) {
+        const key = path.resolve(source.path);
+        const slot = await peekAuthoritySlot({ dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken }, key);
+        if (!slot || slot.key !== source.authorityKey || slot.state !== "ineligible" || slot.epoch !== source.epoch ||
+            slot.seq !== source.seq || slot.owner.worker !== worker || slot.pending !== null ||
+            this.heldByOtherSink(key, sink)) return false;
+      }
+      return true;
+    };
+    try {
+      if (this.active()) return await read();
+      return await withAuthorityTransaction(this.#options.lifetime, {
+        ...(options.signal ? { signal: options.signal } : {}),
+        timeoutMs: options.timeoutMs ?? LATE_WAIT_MS,
+      }, read);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * issue #3638 D4 - classify, WITHOUT writing or repairing anything, what an admission of `clonePath` made by the flight
    * owning `sink` would meet. A is held through the same lock primitive as {@link withTransaction}, but the pre-callback
    * drain of queued late settlements and ends is NOT run, no idle drain is scheduled and the store is not (re)opened for
