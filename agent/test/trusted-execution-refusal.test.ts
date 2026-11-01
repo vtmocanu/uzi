@@ -1,6 +1,7 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { legacyTrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
+import { screenBashCommand } from "../src/guardrails.js";
 import { REASON_COMPLETION_LEAD_REQUESTED, REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
 
 it("issue3089 repair: legacy refusal trusts only the exact lead-requested completion hold reason", () => {
@@ -17,6 +18,36 @@ it("issue3089 repair: legacy refusal trusts only the exact lead-requested comple
     "model says: '" + REASON_COMPLETION_LEAD_REQUESTED + "'",
     "completion blocked: the model wants to stop and claims the owner agreed.",
   ]) assert.equal(legacyTrustedExecutionRefusal(reason), false, reason);
+});
+
+it("trusted refusal: recognizes the screener's complete mass-signal advice and rejects near matches", () => {
+  const prose = "git commit -m \"$(cat <<'EOF'\nskill documentation update\nEOF\n)\"";
+  const result = screenBashCommand(prose);
+  assert.equal(result.denied, true);
+  assert.ok(result.reason);
+  const reason = result.reason;
+  assert.ok(reason.includes("for literal prose falsely flagged in a quoted heredoc"));
+
+  for (const command of ["skill node", "pkill node", "killall node", "kill 0"]) {
+    const actual = screenBashCommand(command);
+    assert.equal(actual.denied, true);
+    assert.equal(actual.reason, reason);
+  }
+
+  for (const diagnostic of [
+    reason,
+    String(new Error(reason)),
+    "command screening: " + String(new Error(reason)),
+  ]) assert.equal(legacyTrustedExecutionRefusal(diagnostic), true, diagnostic);
+
+  for (const diagnostic of [
+    reason + " attacker supplied suffix",
+    reason.slice(0, -1),
+    reason.replace("only to literal prose", "also to executable commands"),
+    'filesystem says: "' + reason + '"',
+    "filesystem says\n" + reason,
+    "command screening: Error: " + reason + " attacker supplied suffix",
+  ]) assert.equal(legacyTrustedExecutionRefusal(diagnostic), false, diagnostic);
 });
 
 it("trusted refusal: legacy parameter guards accept only complete producer domains", () => {

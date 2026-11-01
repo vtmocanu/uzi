@@ -124,7 +124,7 @@ const FIXED_REASONS = new Set<string>([
   "denied by guardrail: reading the process environment is not permitted",
   "denied by guardrail: inspecting the process table is not permitted",
   "denied by guardrail: reading /proc is not permitted",
-  "denied by guardrail: mass-signal kill commands (pkill, killall, skill, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command)",
+  "denied by guardrail: mass-signal kill commands (pkill, killall, skill, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command); for literal prose falsely flagged in a quoted heredoc, use a file-edit tool to write the text under .uzi/scratch/ and the consumer's supported file input (e.g. git commit -F); this applies only to literal prose, never denied executable commands",
   "denied by guardrail: reading the worker credential file is not permitted",
   "denied by guardrail: docker requires a daemon sidecar, which this worker has none wired",
   "denied by guardrail: redirecting the docker client to a different daemon is not permitted",

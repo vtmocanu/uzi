@@ -199,7 +199,7 @@ const REASON_ENV = "denied by guardrail: reading the process environment is not 
 const ENV_READ_ALLOWLIST: ReadonlySet<string> = new Set(["PATH", "TMPDIR"]);
 const REASON_PS = "denied by guardrail: inspecting the process table is not permitted";
 const REASON_PROC = "denied by guardrail: reading /proc is not permitted";
-const REASON_MASS_SIGNAL = "denied by guardrail: mass-signal kill commands (pkill, killall, skill, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command)";
+const REASON_MASS_SIGNAL = "denied by guardrail: mass-signal kill commands (pkill, killall, skill, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command); for literal prose falsely flagged in a quoted heredoc, use a file-edit tool to write the text under .uzi/scratch/ and the consumer's supported file input (e.g. git commit -F); this applies only to literal prose, never denied executable commands";
 const REASON_SECRET_FILE = "denied by guardrail: reading the worker credential file is not permitted";
 const REASON_OPS_CHANNEL = "denied by guardrail: the worker's operator retained-source channel is for the operator, not the agent";
 // PRD #83 M1 (Q3): docker is inert without a daemon sidecar wired (DOCKER_HOST/keystone

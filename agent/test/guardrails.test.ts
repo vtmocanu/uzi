@@ -402,12 +402,14 @@ describe("existing denies still fire on a wired docker worker (PRD #83 B3)", () 
 // "deny reasons carry the user-facing phrase" table below reaches it too.
 describe("mass-signal guardrail (#1576)", () => {
   const MASS_SIGNAL_REASON =
-    "denied by guardrail: mass-signal kill commands (pkill, killall, skill, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command)";
+    "denied by guardrail: mass-signal kill commands (pkill, killall, skill, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command); for literal prose falsely flagged in a quoted heredoc, use a file-edit tool to write the text under .uzi/scratch/ and the consumer's supported file input (e.g. git commit -F); this applies only to literal prose, never denied executable commands";
 
   const DENIED_MASS = [
     "pkill -f vite",
     "pkill node",
     "killall node",
+    "skill node",
+    "skill -9 node",
     "sudo killall -9 node",
     "sh -c 'pkill -f npm'",
     'eval "killall node"',
@@ -531,6 +533,28 @@ describe("mass-signal guardrail (#1576)", () => {
       const r = screenBashCommand(cmd);
       assert.strictEqual(r.denied, true, `expected denied for: ${cmd}`);
       assert.strictEqual(r.reason, MASS_SIGNAL_REASON);
+    });
+  }
+
+  it("keeps line-leading skill prose in a quoted heredoc denied with literal-text advice", () => {
+    const command = "git commit -m \"$(cat <<'EOF'\nskill documentation update\nEOF\n)\"";
+    const result = screenBashCommand(command);
+    assert.strictEqual(result.denied, true);
+    assert.strictEqual(result.reason, MASS_SIGNAL_REASON);
+    assert.ok(result.reason.includes("for literal prose falsely flagged in a quoted heredoc"));
+    assert.ok(result.reason.includes("use a file-edit tool to write the text under .uzi/scratch/"));
+    assert.ok(result.reason.includes("consumer's supported file input (e.g. git commit -F)"));
+    assert.ok(result.reason.includes("only to literal prose, never denied executable commands"));
+  });
+
+  for (const command of [
+    "task check:skill-size",
+    "echo skill",
+    "git commit -m 'skill documentation update'",
+    "git commit -F .uzi/scratch/message.txt",
+  ]) {
+    it(`allows skill mentions and supported prose file input: ${command}`, () => {
+      assert.strictEqual(screenBashCommand(command).denied, false);
     });
   }
 
