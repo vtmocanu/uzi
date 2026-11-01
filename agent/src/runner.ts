@@ -7824,6 +7824,7 @@ export class RunRunner {
               cloneUrl: claim.repo.clone_url,
               forgeUsername: claim.secrets.forge_username,
               signal: boundarySignal,
+              closureMint: "deny",
             });
             terminalCaptureVerified = outcome.state === "uploaded";
             runLog.info("recovery: finalization-failure capture outcome", {
@@ -15563,6 +15564,7 @@ export class RunRunner {
       onArchiveAccepted: (accepted: RecoveryRecord) => this.archiveAccepted(flight, accepted),
       onCancellationObserved: () => this.observeCancellation(flight),
       record, barePath, defaultBranch: record.defaultBranch!, signal,
+      closureMint: "deny" as const,
     };
     // V1 ordinary settlement keeps its archive entry point; deferred held work
     // and V2 share the coordinator's frozen-record ordering and reconciliation.
@@ -18432,6 +18434,7 @@ export class RunRunner {
         cloneUrl: claim.repo.clone_url,
         forgeUsername: claim.secrets.forge_username,
         signal,
+        closureMint: "deny",
       });
       // issue #1507 — the transient bare pin goes only once a durable replacement exists. An archive
       // upload's pin is deleted by the recovery coordinator itself (cleanupUploadedRecoveryPin, after
@@ -23353,6 +23356,9 @@ export class RunRunner {
                 onCancellationObserved: () => this.observeCancellation(flight),
                 record: record!, barePath: bare, defaultBranch: record!.defaultBranch!,
                 signal: held.signal,
+                // The retained claim evaluates only the missing-metadata and feature-snapshot grants; the
+                // run is still executing here, so the coordinator's inactive-inventory check blocks any mint.
+                closureMint: "retained_claim",
               });
               await check();
               const local = await this.recovery.verifiedLocalCapture(record!, held.signal);

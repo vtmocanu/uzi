@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { RecoveryCoordinator, canonicalJson, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type RecoveryArchiveClient, type RecoveryRecord, type RecoveryCoordinatorOptions } from "../src/recovery.js";
+import { RecoveryCoordinator, canonicalJson, type FrozenOperationOptions, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type RecoveryArchiveClient, type RecoveryRecord, type RecoveryCoordinatorOptions } from "../src/recovery.js";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { GitCache, RecoveryBundleTooLargeError, type OwedCandidate, type PositiveOwedCandidateContext } from "../src/git.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
@@ -6370,3 +6370,269 @@ for (const reason of ["budget", "abort"] as const) {
     } finally { budget.dispose(); await q.f.close(); }
   });
 }
+
+// ── #3727 C2 M3: release a thin archive FINAL on a pinned prerequisite closure ───────────────────
+const CLOSURE_FEATURE_NAME = "recovery_prerequisite_closure_v1";
+
+type ClosureOverride = ((status: { checksum?: string }) => unknown) | "absent";
+
+/** A thin-capture harness over the real coordinator with a controllable closure status and feature view. */
+function closureHarness(f: Awaited<ReturnType<typeof fixture>>, opts: { features?: string[]; heldV2?: boolean } = {}) {
+  f.state.thin = true;
+  const h = {
+    closureFeature: true,
+    closure: ((s: { checksum?: string }) => ({ state: "pinned", prerequisite_shas: [H], checksum: s.checksum })) as ClosureOverride,
+    closureReads: 0,
+  };
+  const status = f.client.getRecoveryCaptureStatus;
+  Object.assign(f.client, {
+    hasFeature: (name: string) => name === CLOSURE_FEATURE_NAME ? h.closureFeature : f.state.feature,
+    getRecoveryCaptureStatus: async (run: string, id: string) => {
+      const s = await status(run, id);
+      if (h.closure === "absent") return s;
+      h.closureReads++;
+      return { ...s, prerequisite_closure: h.closure(s) };
+    },
+    ...(opts.heldV2 ? { hasHeldPublicationV2: () => true } : {}),
+    ...(opts.features ? { protocolFeatures: opts.features } : {}),
+  });
+  return h;
+}
+
+async function closureFrozen(opts: { features?: string[]; heldV2?: boolean; options?: FrozenOperationOptions } = {}) {
+  const f = await fixture(true);
+  const h = closureHarness(f, opts);
+  const record = await f.freeze();
+  assert.ok(record);
+  const operate = (options?: Parameters<RecoveryCoordinator["operateFrozenInventory"]>[1]) =>
+    f.coordinator.operateFrozenInventory({ record, barePath: f.context.barePath, defaultBranch: "main" }, options);
+  const saved = async () => (await f.coordinator.inspect("run-1"))[0]!;
+  return { f, h, record, operate, saved };
+}
+
+const CLOSURE_ONLY = [CLOSURE_FEATURE_NAME, "recovery_inventory_v1"];
+
+for (const [name, setup, minted] of [
+  ["grant 2: foreground push_secret_blocked", { features: [] as string[], options: { foreground: true, terminal: { status: "failed" as const, fail_origin: "push_secret_blocked" } } }, true],
+  ["grant 2: foreground worker_residue_blocked", { features: [] as string[], options: { foreground: true, terminal: { status: "failed" as const, fail_origin: "worker_residue_blocked" } } }, true],
+  ["grant 4: closure-only feature snapshot", { features: CLOSURE_ONLY }, true],
+  ["grant 1: v2 missing held metadata", { features: [] as string[], heldV2: true }, true],
+  ["unknown eligibility denies (no snapshot, no proof)", { features: undefined }, false],
+  ["empty or cleared snapshot denies", { features: [] as string[] }, false],
+  ["snapshot without the closure feature denies", { features: ["recovery_inventory_v1"] }, false],
+  ["snapshot naming held_v1 denies", { features: [...CLOSURE_ONLY, "recovery_held_publication_v1"] }, false],
+  ["snapshot naming held_v2 denies", { features: [...CLOSURE_ONLY, "recovery_held_publication_v2"] }, false],
+  ["foreground failure without a blocking fail_origin denies", { features: [] as string[], options: { foreground: true, terminal: { status: "failed" as const } } }, false],
+] as const) {
+  it(`#3727 M3 mint grant matrix: ${name}`, async () => {
+    const { f, operate, saved } = await closureFrozen(setup as unknown as Parameters<typeof closureFrozen>[0]);
+    try {
+      await operate("options" in setup ? setup.options : undefined);
+      const record = await saved();
+      assert.equal(record.state, "uploaded");
+      assert.equal(record.selfContained, false);
+      if (minted) {
+        assert.equal(f.finals.length, 1);
+        assert.equal((f.finals[0]![3] as RecoveryFinalDisposition).kind, "archive");
+        assert.equal(record.finalAcknowledged, true);
+        assert.equal(f.state.produced, 1, "no re-upload of the captured bytes");
+        assert.equal(f.state.uploads, 1);
+      } else {
+        assert.equal(f.finals.length, 0);
+        assert.equal(record.finalRequest, undefined);
+        assert.equal(record.finalAcknowledged, undefined);
+      }
+    } finally { await f.close(); }
+  });
+}
+
+it("#3727 M3 default deny: ordinary captureAndUpload never mints, even with every fact present", async () => {
+  const { f, record } = await closureFrozen({ features: CLOSURE_ONLY });
+  try {
+    await f.coordinator.captureAndUpload({ record, barePath: f.context.barePath, defaultBranch: "main", closureMint: "deny" });
+    await f.coordinator.captureAndUpload({ record, barePath: f.context.barePath, defaultBranch: "main" });
+    assert.equal(f.finals.length, 0);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]!.finalRequest, undefined);
+  } finally { await f.close(); }
+});
+
+for (const [name, closure, feature] of [
+  ["closure object absent", "absent" as const, true],
+  ["closure pending", () => ({ state: "pending" }), true],
+  ["closure refused", () => ({ state: "refused", reason: "pin_refused" }), true],
+  ["pinned with a foreign checksum", () => ({ state: "pinned", prerequisite_shas: [H], checksum: "c".repeat(64) }), true],
+  ["pinned with other prerequisites", () => ({ state: "pinned", prerequisite_shas: [H2], checksum: undefined }), true],
+  ["pinned with an unknown field", () => ({ state: "pinned", prerequisite_shas: [H], extra: true }), true],
+  ["pinned with a reason", () => ({ state: "pinned", reason: "pin_unknown", prerequisite_shas: [H] }), true],
+  ["malformed closure", () => "pinned", true],
+  ["closure feature dropped", undefined, false],
+] as const) {
+  it(`#3727 M3 mint needs the exact pinned status: ${name}`, async () => {
+    const { f, h, operate, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+    try {
+      if (closure !== undefined) h.closure = typeof closure === "function"
+        ? (s => { const v = (closure as (status: { checksum?: string }) => unknown)(s) as Record<string, unknown>; return typeof v === "object" && "checksum" in v && v.checksum === undefined ? { ...v, checksum: s.checksum } : v; })
+        : closure;
+      h.closureFeature = feature;
+      await operate();
+      assert.equal(f.finals.length, 0);
+      assert.equal((await saved()).finalRequest, undefined);
+    } finally { await f.close(); }
+  });
+}
+
+it("#3727 M3 a held-eligible completed thin capture does not pre-empt held, and a same-pass held fallback mints later", async () => {
+  const f = await v2FrozenFixture("issue", true);
+  try {
+    f.state.status = "completed";
+    f.state.thin = true;
+    const h = closureHarness(f, { features: CLOSURE_ONLY });
+    // Held succeeds: the archive was only captured; exactly one held FINAL, no archive mint.
+    await f.operate();
+    assert.equal(f.finals.length, 1);
+    assert.equal((f.finals[0]![3] as RecoveryFinalDisposition).kind, "held_publication");
+    assert.equal(h.closureReads, 0, "a held-eligible completed run never reads closure status for a mint");
+  } finally { await f.close(); }
+
+  const g = await v2FrozenFixture("issue", true);
+  try {
+    g.state.status = "completed";
+    closureHarness(g, { features: CLOSURE_ONLY });
+    Object.assign(g.client, { publishHeld: async (_r: string, _g: number, tip: string) => ({ ok: true,
+      body: { publication_id: "00000000-0000-4000-8000-000000000009", ref: `refs/uzi-held/${g.context.runId}/7`, tip, state: "refused", reason: "create_refused" } }) });
+    await g.operate();
+    assert.equal(g.finals.length, 1);
+    assert.equal((g.finals[0]![3] as RecoveryFinalDisposition).kind, "archive", "fallback mints the thin archive FINAL");
+    assert.equal(g.order.filter(x => x === "archive").length, 1);
+    assert.equal(g.state.uploads, 1);
+  } finally { await g.close(); }
+});
+
+it("#3727 M3 heldCreateUncertain and the no-held-attempt exit never grant", async () => {
+  const f = await v2FrozenFixture("issue", true);
+  try {
+    f.state.status = "failed";
+    closureHarness(f, { features: [] });
+    Object.assign(f.client, { publishHeld: async () => ({ ok: false, reason: "malformed_response" }) });
+    await f.operate();
+    const record = (await f.coordinator.inspect(f.context.runId))[0]!;
+    assert.equal(record.heldCreateUncertain, true);
+    assert.equal(f.finals.length, 0, "uncertain create keeps held authority and mints nothing");
+  } finally { await f.close(); }
+});
+
+it("#3727 M3 grant 2 from a new exact observation of a non-terminal run; an unreadable observation never grants", async () => {
+  for (const readable of [true, false]) {
+    const f = await v2FrozenFixture("issue", true);
+    try {
+      f.state.status = "paused";
+      closureHarness(f, { features: [] });
+      if (!readable) Object.assign(f.client, { getExactRecoveryHold: async () => { throw new Error("observation unavailable"); } });
+      await f.operate();
+      assert.equal(f.finals.length, readable ? 1 : 0, `readable=${readable}`);
+    } finally { await f.close(); }
+  }
+});
+
+it("#3727 M3 retained claim evaluates only grants 1 and 4, and execution still blocks the mint", async () => {
+  for (const [name, features, executing, minted] of [
+    ["executing, grant 4 present", CLOSURE_ONLY, true, false],
+    ["not executing, grant 4 present", CLOSURE_ONLY, false, true],
+    ["not executing, no grant", [] as string[], false, false],
+  ] as const) {
+    const f = await fixture(true);
+    try {
+      closureHarness(f, { features });
+      const c = f.make(true, undefined, undefined, undefined, { isExecuting: () => executing });
+      const record = await f.freeze();
+      assert.ok(record);
+      const outcome = await c.captureAndUpload({ record, barePath: f.context.barePath, defaultBranch: "main", closureMint: "retained_claim" });
+      const saved = (await c.inspect("run-1"))[0]!;
+      assert.equal(f.finals.length, minted ? 1 : 0, name);
+      assert.equal(saved.state, "uploaded", name);
+      assert.equal(saved.finalAcknowledged === true, minted, `${name} ${outcome.state}`);
+      assert.equal(f.state.uploads, 1, name);
+    } finally { await f.close(); }
+  }
+});
+
+it("#3727 M3 a retained-claim capture that is not executing and held-v2 metadata is missing mints (grant 1)", async () => {
+  const f = await fixture(true);
+  try {
+    closureHarness(f, { features: [], heldV2: true });
+    const record = await f.freeze();
+    assert.ok(record);
+    await f.coordinator.captureAndUpload({ record, barePath: f.context.barePath, defaultBranch: "main", closureMint: "retained_claim" });
+    assert.equal(f.finals.length, 1);
+  } finally { await f.close(); }
+});
+
+it("#3727 M3 lost thin ACK replays on the saved identity without a pin, a closure read, the capability or a mint", async () => {
+  const { f, h, operate, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+  try {
+    f.state.finalError = new Error("ACK lost");
+    await operate();
+    const first = await saved();
+    assert.equal(f.finals.length, 1);
+    assert.ok(first.finalRequest);
+    assert.notEqual(first.finalAcknowledged, true);
+    const request = structuredClone(first.finalRequest);
+    // Pin lost, expiry-independent: closure status gone, capability gone, knob gone.
+    h.closure = "absent"; h.closureFeature = false;
+    Object.assign(f.client, { protocolFeatures: [] });
+    const reads = h.closureReads;
+    f.state.finalError = undefined;
+    f.state.now += 3_600_000;
+    await f.make(true).resumePending(undefined, [first]);
+    const after = await saved();
+    assert.equal(f.finals.length, 2);
+    assert.deepEqual(f.finals[1]![3], f.finals[0]![3], "the same identity is replayed");
+    assert.deepEqual(after.finalRequest, request);
+    assert.equal(after.finalAcknowledged, true);
+    assert.equal(after.captureId, first.captureId);
+    assert.equal(f.state.produced, 1);
+    assert.equal(f.state.uploads, 1);
+    assert.equal(h.closureReads, reads);
+    assert.equal(JSON.stringify(after).includes("closure"), false, "the grant is never journaled");
+  } finally { await f.close(); }
+});
+
+for (const mutation of ["other prerequisite", "other source", "self-contained", "unreadable"] as const) {
+  it(`#3727 M3 saved thin FINAL with a ${mutation} bundle header sends nothing and rewrites nothing`, async () => {
+    const { f, operate, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+    try {
+      f.state.finalError = new Error("ACK lost");
+      await operate();
+      const first = await saved();
+      assert.equal(f.finals.length, 1);
+      const bytes = await fs.readFile(first.bundlePath!);
+      const text = bytes.toString("latin1");
+      const mutated = mutation === "other prerequisite" ? text.replace(`-${H} `, `-${H2} `)
+        : mutation === "other source" ? text.replace(`${first.sourceSha} refs`, `${H2} refs`)
+        : mutation === "self-contained" ? text.replace(`-${H} retained dependency\n`, "")
+        : "garbage";
+      await fs.writeFile(first.bundlePath!, Buffer.from(mutated, "latin1"));
+      f.state.finalError = undefined;
+      f.state.now += 3_600_000;
+      await f.make(true).resumePending(undefined, [first]);
+      assert.equal(f.finals.length, 1);
+      assert.deepEqual(await saved(), first);
+    } finally { await f.close(); }
+  });
+}
+
+it("#3727 M3 a saved thin FINAL replays through the first frozen branch under every deny (explicit deny mints nothing new)", async () => {
+  const { f, operate, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+  try {
+    f.state.finalError = new Error("ACK lost");
+    await operate();
+    const first = await saved();
+    f.state.finalError = undefined;
+    f.state.now += 3_600_000;
+    await operate();
+    assert.equal(f.finals.length, 2);
+    assert.deepEqual(f.finals[1]![3], f.finals[0]![3]);
+    assert.equal((await saved()).finalAcknowledged, true);
+    assert.equal((await saved()).captureId, first.captureId);
+  } finally { await f.close(); }
+});

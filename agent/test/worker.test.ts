@@ -1021,6 +1021,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "forge_clone_success_v1",
     "recovery_held_publication_v1",
     "recovery_held_publication_v2",
+    "recovery_prerequisite_closure_v1",
     "credential_switch_v1",
     "milestone_reconciliation_claim_v1",
     "codex_refresh_recovery_v1",

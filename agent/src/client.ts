@@ -5673,7 +5673,7 @@ function validExactClosedProof(value: Record<string, unknown>): boolean {
       return value.release_evidence === f.kind && noCapture && terminalUUID(f.publication_id) &&
         typeof f.source_sha === "string" && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(f.source_sha) && digest;
     case "archive":
-      return value.release_evidence === f.kind && noPublication && terminalUUID(f.capture_id) && typeof f.source_sha === "string" && /^[0-9a-fA-F]{4,64}$/.test(f.source_sha) && digest;
+      return (value.release_evidence === f.kind || value.release_evidence === "prerequisite_closure") && noPublication && terminalUUID(f.capture_id) && typeof f.source_sha === "string" && /^[0-9a-fA-F]{4,64}$/.test(f.source_sha) && digest;
     case "settled":
       return ["publication", "forge_no_output"].includes(String(value.release_evidence)) && noCapture && noPublication &&
         f.source_sha === undefined && f.coverage_digest === "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";

@@ -38,7 +38,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { setTimeout as retryDelay } from "node:timers/promises";
 
-import { RUN_KINDS, HELD_FINAL_FALLBACK_REASONS, HELD_FINAL_RETAINED_REASONS, type HeldFinalRetainedReason } from "./protocol.js";
+import { RUN_KINDS, HELD_FINAL_FALLBACK_REASONS, HELD_FINAL_RETAINED_REASONS, isRecoveryPrerequisiteClosureStatus, type HeldFinalRetainedReason } from "./protocol.js";
 import { RequestError, isRunOwnershipLost, type WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
 import { residueQuarantine } from "./residue-quarantine.js";
@@ -278,6 +278,26 @@ function healthyInventoryStatus(status: RecoveryCaptureStatusResponse, record: R
     !status.reason && Date.parse(status.expires_at ?? "") > now;
 }
 
+const CLOSURE_FEATURE = "recovery_prerequisite_closure_v1";
+const HELD_V1_FEATURE = "recovery_held_publication_v1";
+const HELD_V2_FEATURE = "recovery_held_publication_v2";
+const KNOWN_RUN_STATUSES: ReadonlySet<string> = new Set(["queued", "claimed", "running", "awaiting_approval", "awaiting_input",
+  "awaiting_followup", "limit_wait", "pool_wait", "paused", "recovery_wait", "completed", "failed", "cancelled"]);
+
+/**
+ * Whether a new thin archive FINAL may be minted in this call. Transient: it is a function argument,
+ * never journaled, and every caller of the finalize chain names it explicitly. `deny` is the default.
+ */
+type ClosureMint = "grant" | "deny";
+
+/** Mint requirement 6: the status names exactly this capture's pinned closure. */
+function pinnedClosureMatches(status: RecoveryCaptureStatusResponse, record: RecoveryRecord): boolean {
+  const closure = status.prerequisite_closure;
+  return isRecoveryPrerequisiteClosureStatus(closure) && closure.state === "pinned" && !closure.reason &&
+    Array.isArray(closure.prerequisite_shas) && canonicalJson(closure.prerequisite_shas) === canonicalJson(record.prerequisiteShas) &&
+    closure.checksum === record.checksum;
+}
+
 /** Contradictory observed integrity evidence cannot authorize a replacement. */
 function replaceableInventoryStatus(status: RecoveryCaptureStatusResponse, record: RecoveryRecord, now: number): boolean {
   if (!validInventoryStatus(status, record) || status.reason === "archive integrity check failed") return false;
@@ -314,6 +334,8 @@ export interface RecoveryArchiveClient {
   withAcknowledgedFinalReportCustody?: WorkerClient["withAcknowledgedFinalReportCustody"];
   hasFeature?(feature: string): boolean;
   hasHeldPublicationV2?: WorkerClient["hasHeldPublicationV2"];
+  /** The negotiated feature cache as a fresh array: one snapshot per read. */
+  readonly protocolFeatures?: readonly string[];
   publishHeld?: WorkerClient["publishHeld"];
   getExactRecoveryHold?: WorkerClient["getExactRecoveryHold"];
   observeTerminalMaintenanceHold?: WorkerClient["observeTerminalMaintenanceHold"];
@@ -430,6 +452,10 @@ export interface CaptureInput {
   onArchiveAccepted?: (record: RecoveryRecord) => void;
   /** Foreground attempts hand their first observed cancellation back to the flight. Never serialized. */
   onCancellationObserved?: () => MaintenanceBudget;
+  /** Transient, never serialized. Default deny: no new thin archive FINAL is minted. `retained_claim` asks
+   *  captureAndUpload to evaluate only the retained-claim grants (missing held metadata, or a feature
+   *  snapshot with the closure feature and no held feature); no caller can pass a grant directly. */
+  closureMint?: "deny" | "retained_claim";
   record: RecoveryRecord;
   barePath: string;
   /** The fresh-forge-tip inputs (D5). The PAT is used ONLY here, on the failure path
@@ -1831,15 +1857,15 @@ export class RecoveryCoordinator {
     }
   }
 
-  private async finalizeInventory(snapshot: RecoveryRecord, reconcile = true): Promise<RecoveryOutcome | void> {
+  private async finalizeInventory(snapshot: RecoveryRecord, reconcile: boolean, closureMint: ClosureMint): Promise<RecoveryOutcome | void> {
     // #3031 F1: while its live slot holds the run boundary, this slot's own producer record mints
     // no NEW FINAL; the ordinary pass mints it later from the immutable evidence. A saved FINAL
     // (request or ACK) and every other record keep their existing replay and proofs.
     if (await this.deferProducerFinalization(snapshot)) return { state: snapshot.state, captureId: snapshot.captureId };
-    return this.withCancellationAttempt(snapshot, () => this.finalizeInventoryInAttempt(snapshot, reconcile));
+    return this.withCancellationAttempt(snapshot, () => this.finalizeInventoryInAttempt(snapshot, reconcile, closureMint));
   }
 
-  private async finalizeInventoryInAttempt(snapshot: RecoveryRecord, reconcile = true): Promise<RecoveryOutcome | void> {
+  private async finalizeInventoryInAttempt(snapshot: RecoveryRecord, reconcile: boolean, closureMint: ClosureMint): Promise<RecoveryOutcome | void> {
     if (!snapshot.coverageContext || typeof snapshot.generation !== "number") return;
     // Exact closure can refuse work before mutable health/source probes. It grants no ACK or cleanup.
     const current = await this.requireRecord(snapshot);
@@ -1854,7 +1880,7 @@ export class RecoveryCoordinator {
       outcome = await this.finalizeInventoryWithinBoundary(snapshot, async () => {
         sourceVerified = await prove();
         return sourceVerified;
-      }, reconcile);
+      }, reconcile, closureMint);
     });
     if (result === "retained" || !sourceVerified) {
       diagnostics.retained();
@@ -2181,7 +2207,7 @@ export class RecoveryCoordinator {
     return true;
   }
 
-  private async finalizeInventoryWithinBoundary(snapshot: RecoveryRecord, prove: () => Promise<boolean>, reconcile: boolean): Promise<RecoveryOutcome | void> {
+  private async finalizeInventoryWithinBoundary(snapshot: RecoveryRecord, prove: () => Promise<boolean>, reconcile: boolean, closureMint: ClosureMint): Promise<RecoveryOutcome | void> {
     let record = await this.requireRecord(snapshot);
     // issue #2213 (ADR-2213 "Nothing is uploaded or released while latched"): the guarded FINAL is a
     // custody release of an inactive run's inventory. Neither named exemption (a completed run's
@@ -2195,13 +2221,23 @@ export class RecoveryCoordinator {
     // Issue #2545: a held_publication FINAL rests on the forge ref the api verified, not on retained
     // archive bytes, so it needs no bundle; every other check below still applies to it.
     const heldFinal = record.finalRequest?.disposition.kind === "held_publication";
+    let thinArchive = false;
     if (record.finalRequest?.disposition.kind !== "settled" && !heldFinal) {
-      if (record.selfContained !== true || !Array.isArray(record.prerequisiteShas) ||
-          record.prerequisiteShas.length !== 0 || !record.bundlePath) return;
-      try {
-        const header = await readRecoveryBundleHeader(record.bundlePath, record.sourceSha);
-        if (!header.selfContained || header.prerequisiteShas.length !== 0) return;
-      } catch { MaintenanceBudget.current()?.check(); return; }
+      if (!Array.isArray(record.prerequisiteShas) || !record.bundlePath) return;
+      let header: Awaited<ReturnType<typeof readRecoveryBundleHeader>>;
+      try { header = await readRecoveryBundleHeader(record.bundlePath, record.sourceSha); }
+      catch { MaintenanceBudget.current()?.check(); return; }
+      if (record.selfContained === true) {
+        if (record.prerequisiteShas.length !== 0 || !header.selfContained || header.prerequisiteShas.length !== 0) return;
+      } else if (record.selfContained === false) {
+        // A saved thin archive FINAL replays on the MAC-authenticated record plus an exact header match;
+        // it depends on no pin, expiry, knob, capability or closure status and mints nothing. A NEW thin
+        // FINAL needs the transient grant and every mint requirement.
+        if (record.prerequisiteShas.length === 0 || header.selfContained ||
+            canonicalJson(header.prerequisiteShas) !== canonicalJson(record.prerequisiteShas)) return;
+        if (record.finalRequest ? record.finalRequest.disposition.kind !== "archive" : !await this.closureMintAllowed(record, closureMint)) return;
+        thinArchive = true;
+      } else return;
     }
     if (!await this.frozenCoverageProven(record)) return;
     // Validate the archive before both minting and replaying FINAL. A committed receipt
@@ -2216,6 +2252,8 @@ export class RecoveryCoordinator {
         if (reconcile) return this.reconcileInventory(record, prove, observedStatus);
         return;
       }
+      // Mint requirement 6. The status is read-only evidence for a new mint and diagnostic for a replay.
+      if (thinArchive && !record.finalRequest && !pinnedClosureMatches(observedStatus!, record)) return;
     }
     if (!record.finalRequest) {
       const hold = await this.heldOperationState(record);
@@ -2274,6 +2312,34 @@ export class RecoveryCoordinator {
       return { state: record.state, captureId: record.captureId,
         reason: cls.kind === "transient" ? cls.reason ?? "upload_transient" : cls.reason };
     }
+  }
+
+  /** Mint requirements 1-4 for a NEW thin archive FINAL (5 and 6 follow the status read). */
+  private async closureMintAllowed(record: RecoveryRecord, closureMint: ClosureMint): Promise<boolean> {
+    if (closureMint !== "grant" || !this.client.hasFeature?.(CLOSURE_FEATURE) ||
+        classifyRecoveryOrigin(record.captureId) !== "ordinary") return false;
+    try {
+      const local = await this.verifiedLocalCapture(record, MaintenanceBudget.current()?.signal);
+      return local !== undefined && local.captureId === record.captureId && local.sourceSha === record.sourceSha &&
+        local.checksum === record.checksum && local.selfContained === false;
+    } catch { MaintenanceBudget.current()?.check(); return false; }
+  }
+
+  /** Grant 4: one feature snapshot naming the closure feature and neither held feature. */
+  private closureOnlyFeatureSnapshot(): boolean {
+    const features = this.client.protocolFeatures;
+    return Array.isArray(features) && features.includes(CLOSURE_FEATURE) &&
+      !features.includes(HELD_V1_FEATURE) && !features.includes(HELD_V2_FEATURE);
+  }
+
+  /** The retained-claim caller evaluates only grants 1 (missing held metadata) and 4 (feature snapshot). */
+  private async retainedClaimMint(input: CaptureInput): Promise<ClosureMint> {
+    const latest = await this.readLatest(input.record);
+    if (latest.kind !== "ok") return "deny";
+    const record = latest.record;
+    const missingMetadata = this.client.hasHeldPublicationV2?.() === true &&
+      (!record.exactHoldBinding || !record.heldPolicy) && record.heldCreateUncertain !== true;
+    return missingMetadata || this.closureOnlyFeatureSnapshot() ? "grant" : "deny";
   }
 
   /**
@@ -2420,7 +2486,7 @@ export class RecoveryCoordinator {
     }
     // The replayed identity wins over a differing caller id: it is what the api may already hold.
     if (this.isExecuting(cur.runId)) return "kept" as const;
-    const outcome = await this.finalizeInventory(cur, false);
+    const outcome = await this.finalizeInventory(cur, false, "deny");
     if (outcome?.held) return outcome.held;
     latest = await this.readLatest(cur);
     if (latest.kind !== "ok") return "kept" as const;
@@ -2600,7 +2666,8 @@ export class RecoveryCoordinator {
       record.prerequisiteShas?.length === 0;
     const replayedHeld = record.finalRequest?.disposition.kind === "held_publication";
     if (record.finalRequest || selfContainedArchive) {
-      const final = await this.finalizeInventory(record);
+      // Saved-request replay (and a self-contained archive) mints no thin FINAL: explicit deny.
+      const final = await this.finalizeInventory(record, true, "deny");
       const latest = await this.readLatest(record);
       if (latest.kind === "gone") return final ?? outcome("acked");
       if (latest.kind !== "ok") return outcome("kept");
@@ -2613,7 +2680,8 @@ export class RecoveryCoordinator {
       if (replayedHeld) {
         const hold = await this.heldOperationState(record, input.signal);
         if (hold !== "open") return this.heldStopped(record, hold);
-        return this.captureCycle({ ...input, record });
+        // Grant 3: the replayed held FINAL definitively fell back in this pass.
+        return this.captureCycle({ ...input, record }, final?.held === "fallback" ? "grant" : "deny");
       }
     }
     let hold = await this.heldOperationState(record, input.signal);
@@ -2643,7 +2711,8 @@ export class RecoveryCoordinator {
           } else return outcome("kept");
           hold = await this.heldOperationState(record, input.signal);
           if (hold !== "open") return this.heldStopped(record, hold);
-          return this.captureCycle({ ...input, record });
+          // Grant 3: only the two held fallbacks above (create_refused, or a created ref that fell back) reach here.
+          return this.captureCycle({ ...input, record }, "grant");
         }
         // An empty probe can fail before any invocation exists. It is not proof
         // of absence: retry the same frozen pack through the API's existing
@@ -2651,13 +2720,17 @@ export class RecoveryCoordinator {
       } catch { MaintenanceBudget.current()?.check(); return outcome("kept"); }
     }
     if (!this.newProductionAllowed(record)) {
-      return hasJournaledBundle(record) ? this.captureCycle({ ...input, record }) : outcome("kept");
+      return hasJournaledBundle(record) ? this.captureCycle({ ...input, record }, "deny") : outcome("kept");
     }
     const uncertainCreate = record.heldCreateUncertain === true;
     const v2 = this.client.hasHeldPublicationV2?.() === true;
     // Missing new held metadata cannot grant publication authority, but it must
     // preserve the pre-existing guarded archive path for boot and legacy journals.
-    if (v2 && (!record.exactHoldBinding || !record.heldPolicy)) return uncertainCreate ? outcome("kept") : this.captureCycle({ ...input, record });
+    // Grant 1: the held refusal is unchanged; only a non-uncertain create may archive-mint a thin FINAL.
+    if (v2 && (!record.exactHoldBinding || !record.heldPolicy)) return uncertainCreate ? outcome("kept") : this.captureCycle({ ...input, record }, "grant");
+    // Grant 4 reads one feature snapshot, taken once for this cycle.
+    const featureGrant = !v2 && this.closureOnlyFeatureSnapshot();
+    let ineligibleObserved = false;
     let terminal = options.terminal;
     if (v2) {
       terminal = undefined;
@@ -2667,11 +2740,15 @@ export class RecoveryCoordinator {
         if (exact && exact.run_id === record.runId && exact.generation === record.generation &&
             exact.hold_id === record.exactHoldBinding!.holdId && exact.repo_id === record.exactHoldBinding!.repoId &&
             exact.inventory_guarded === true && exact.state === "open" &&
-            Number.isSafeInteger(exact.current_claim_generation) && exact.current_claim_generation >= record.generation! &&
-            ["failed", "cancelled", "completed"].includes(exact.run_status)) {
-          terminal = { status: exact.run_status as "failed" | "cancelled" | "completed",
-            fail_origin: options.terminal?.fail_origin };
-          if (exact.run_status === "cancelled") MaintenanceBudget.observeCancellation();
+            Number.isSafeInteger(exact.current_claim_generation) && exact.current_claim_generation >= record.generation!) {
+          if (["failed", "cancelled", "completed"].includes(exact.run_status)) {
+            terminal = { status: exact.run_status as "failed" | "cancelled" | "completed",
+              fail_origin: options.terminal?.fail_origin };
+            if (exact.run_status === "cancelled") MaintenanceBudget.observeCancellation();
+          } else if (KNOWN_RUN_STATUSES.has(exact.run_status)) {
+            // Grant 2 evidence: a new, successful, exactly matching open guarded observation of a non-terminal run.
+            ineligibleObserved = true;
+          }
         }
       } catch { MaintenanceBudget.current()?.check(); /* Unknown terminal eligibility retains the archive policy. */ }
     } else if (!options.foreground) {
@@ -2688,10 +2765,15 @@ export class RecoveryCoordinator {
       this.client.hasFeature?.("recovery_held_publication_v1"))) &&
       terminal.fail_origin !== "push_secret_blocked" && terminal.fail_origin !== "worker_residue_blocked";
     if (uncertainCreate && !eligible) return outcome("kept");
+    // Grant 2: proven ineligibility only. A held-eligible completed run's archive first-attempt is denied,
+    // so it cannot pre-empt held; unknown eligibility never grants.
+    const provenIneligible = !isCodePublishingKind(record.kind) ||
+      options.terminal?.fail_origin === "push_secret_blocked" || options.terminal?.fail_origin === "worker_residue_blocked" ||
+      ineligibleObserved;
     // Completed runs attempt the archive first, on precisely this identity.
     let archived: RecoveryOutcome | undefined;
     if (!eligible || (terminal?.status === "completed" && !uncertainCreate)) {
-      archived = await this.captureCycle({ ...input, record });
+      archived = await this.captureCycle({ ...input, record }, !eligible && (provenIneligible || featureGrant) ? "grant" : "deny");
       const latest = await this.readLatest(record);
       if (latest.kind === "gone") return archived;
       if (latest.kind !== "ok") return outcome("kept");
@@ -2702,7 +2784,7 @@ export class RecoveryCoordinator {
       if (!thin && !record.archiveRefusal) return archived;
     }
     if (residueQuarantine() !== undefined) return archived ?? outcome("kept");
-    if (!record.heldPolicy || !this.client.publishHeld) return uncertainCreate ? outcome("kept") : archived ?? this.captureCycle({ ...input, record });
+    if (!record.heldPolicy || !this.client.publishHeld) return uncertainCreate ? outcome("kept") : archived ?? this.captureCycle({ ...input, record }, "deny");
     let publicationId: string | undefined;
     let result: "fallback" | "kept" | "settled" = uncertainCreate ? "kept" : "fallback";
     const publish = async (prove: () => Promise<boolean>) => {
@@ -2775,7 +2857,9 @@ export class RecoveryCoordinator {
     // Every fallback observes current authoritative settlement again.
     hold = await this.heldOperationState(record, input.signal);
     if (hold !== "open") return this.heldStopped(record, hold);
-    return archived ?? this.captureCycle({ ...input, record: await this.requireRecord(record) });
+    // Grant 3: a held attempt in this pass fell back. Re-run the capture with the grant rather than
+    // returning the earlier (denied) archive outcome.
+    return this.captureCycle({ ...input, record: await this.requireRecord(record) }, "grant");
   }
 
   private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal, isExecuting = this.isExecuting,
@@ -2803,7 +2887,7 @@ export class RecoveryCoordinator {
     let archiveFallback = false;
     if (record.finalRequest) {
       this.clearRedriveExit(record);
-      const outcome = await this.finalizeInventory(record);
+      const outcome = await this.finalizeInventory(record, true, "deny");
       await this.paceFinalRetry(record, outcome);
       const latest = await this.readLatest(record);
       if (latest.kind !== "ok" || latest.record.finalRequest || latest.record.finalAcknowledged) return outcome;
@@ -2819,7 +2903,7 @@ export class RecoveryCoordinator {
       const hold = await this.heldOperationState(record, signal);
       if (hold !== "open") return this.heldStopped(record, hold);
       this.clearRedriveExit(record);
-      return this.captureCycle(input);
+      return this.captureCycle(input, "deny");
     }
     this.clearRedriveExit(record);
     return this.frozenOperationCycle(input);
@@ -2989,11 +3073,13 @@ export class RecoveryCoordinator {
     // issue #2213: a latched worker captures and uploads nothing; the record and pin stay as they are.
     if (residueQuarantine() !== undefined) return quarantinedOutcome(input.record.captureId);
     return this.withCancellationAttempt(input.record, () => this.inAuthority(async () =>
-      runCaptureCycle(await this.cycleKey(input.record), "wait", () => this.captureCycle(input))), undefined, input.onCancellationObserved);
+      runCaptureCycle(await this.cycleKey(input.record), "wait", async () =>
+        this.captureCycle(input, input.closureMint === "retained_claim" ? await this.retainedClaimMint(input) : "deny"))),
+      undefined, input.onCancellationObserved);
   }
 
   /** The capture cycle; the caller holds the record's capture-cycle lock. */
-  private async captureCycle(input: CaptureInput): Promise<RecoveryOutcome> {
+  private async captureCycle(input: CaptureInput, closureMint: ClosureMint): Promise<RecoveryOutcome> {
     let record = input.record;
     // The bundle bytes are dropped only when the record's file is CONFIRMED absent; a record that is
     // present but unreadable keeps them (they may be the only copy) and nothing is written.
@@ -3026,7 +3112,7 @@ export class RecoveryCoordinator {
       }
       if (record.finalRequest || record.state === "uploaded") {
         const wasHeld = record.finalRequest?.disposition.kind === "held_publication";
-        const finalOutcome = record.inventoryGuarded ? await this.finalizeInventory(record) : undefined;
+        const finalOutcome = record.inventoryGuarded ? await this.finalizeInventory(record, true, closureMint) : undefined;
         record = await this.requireRecord(record);
         // Issue #2545: a held FINAL the api definitively refused is cleared by the replay above; the
         // record then has no request and no bundle yet, and falls through to the archive capture
@@ -3076,7 +3162,7 @@ export class RecoveryCoordinator {
       if (record.inventoryGuarded && outcome.state === "uploaded") {
         record = await this.requireRecord(record);
         input.onArchiveAccepted?.(record);
-        const finalOutcome = await this.finalizeInventory(record, false);
+        const finalOutcome = await this.finalizeInventory(record, false, closureMint);
         if (finalOutcome) return finalOutcome;
       }
       return outcome;

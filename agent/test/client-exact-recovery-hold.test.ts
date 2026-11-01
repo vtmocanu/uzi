@@ -133,3 +133,22 @@ test("exact observation validates identity and closed evidence without minting a
  assert.deepEqual(await e.client.listRecoveryHolds(run), { run_id: run, holds: [] });
  assert.equal(e.paths.at(-1), `/api/worker/runs/${run}/recovery-holds`);
 });
+
+test("#3727 M3 closed archive proof accepts archive or prerequisite_closure evidence only", async () => {
+ const e = await setup();
+ const receipt = { kind: "archive", capture_id: repo, source_sha: "a".repeat(40), coverage_digest: "b".repeat(64) };
+ const closed = { ...open(), state: "released", live_worker_id: undefined, live_run_id: undefined,
+  release_evidence: "archive", final_receipt: receipt };
+ for (const evidence of ["archive", "prerequisite_closure"]) {
+  e.answer({ run_id: run, holds: [], exact_hold: { ...closed, release_evidence: evidence } });
+  assert.deepEqual((await e.client.getExactRecoveryHold(run, 1, expected))?.final_receipt, receipt, evidence);
+ }
+ for (const evidence of ["held_publication", "publication", "forge_no_output", "owner_discard", "", undefined]) {
+  e.answer({ run_id: run, holds: [], exact_hold: { ...closed, release_evidence: evidence } });
+  assert.equal(await e.client.getExactRecoveryHold(run, 1, expected), undefined, String(evidence));
+ }
+ // Only the archive kind gains the new evidence; another kind keeps its own name.
+ const held = { kind: "held_publication", publication_id: repo, source_sha: "a".repeat(40), coverage_digest: "b".repeat(64) };
+ e.answer({ run_id: run, holds: [], exact_hold: { ...closed, release_evidence: "prerequisite_closure", final_receipt: held } });
+ assert.equal(await e.client.getExactRecoveryHold(run, 1, expected), undefined);
+});
