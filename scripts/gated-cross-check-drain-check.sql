@@ -1,13 +1,13 @@
 -- Read-only admission check for rolling back gated Plan cross-check (PRD #3708).
 --
 -- Run it with the upgraded api STOPPED, as the final step before either a schema rollback
--- (goose down to the version below 00391) or a binary-only downgrade:
+-- (goose down to the version below 00393) or a binary-only downgrade:
 --
 --   psql -v ON_ERROR_STOP=1 -1 -f scripts/gated-cross-check-drain-check.sql "$DATABASE_URL"
 --
 -- It raises (and psql exits non-zero) while any gated run is not terminal. It writes
 -- nothing. The statements below are identical to the guard at the top of the Down of
--- 00391 and 00392; a test keeps the three copies equal. Procedure: docs/cross-check.md,
+-- 00393 and 00394; a test keeps the three copies equal. Procedure: docs/cross-check.md,
 -- "Rolling back Plan cross-check before the human gate".
 SET LOCAL lock_timeout = '5s';
 LOCK TABLE runs IN SHARE ROW EXCLUSIVE MODE;

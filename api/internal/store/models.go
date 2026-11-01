@@ -1218,8 +1218,8 @@ type Run struct {
 	IdleStallParkCount          int32              `json:"idle_stall_park_count"`
 	ForgeAdmission              []byte             `json:"forge_admission"`
 	CodexSelectReason           pgtype.Text        `json:"codex_select_reason"`
-	PlanCrossCheckGated         bool               `json:"plan_cross_check_gated"`
 	RecoveryWaitPhase           pgtype.Text        `json:"recovery_wait_phase"`
+	PlanCrossCheckGated         bool               `json:"plan_cross_check_gated"`
 }
 
 type RunCompletionAttempt struct {
