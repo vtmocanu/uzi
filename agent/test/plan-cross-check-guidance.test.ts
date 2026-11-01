@@ -30,6 +30,7 @@ const rules = {
   laterRounds: /(?:round[ _-]*2|subsequent|later round|second)[\s\S]{0,200}Cross-check dispositions/i,
   omission: /(?:missing|incomplete|omission)[\s\S]{0,180}revise[\s\S]{0,160}(?:never|not)[\s\S]{0,60}block/i,
   latestItems: /(?:each|every|one per)[\s\S]{0,140}(?:immediately preceding|most recent|latest|current)[\s\S]{0,100}(?:item|finding)/i,
+  suppliedDispositions: /Assess each supplied disposition and its inspectable evidence/,
   olderOptional: /older[\s\S]{0,100}(?:optional|not required|need not)/i,
   declines: /declin[\s\S]{0,130}(?:rationale|reason)[\s\S]{0,130}(?:inspectable|evidence)/i,
   rationaleFirst: /(?:evaluat|consider|assess|read)[\s\S]{0,120}(?:rationale|reason|declin)[\s\S]{0,150}before[\s\S]{0,100}(?:repeat|reissu)/i,
@@ -66,7 +67,9 @@ test("guidance fixture loader has the exact nonempty case set", () => {
 });
 
 for (const c of fixtures) test(`plan checker instructions decide ${c.name}: ${c.expected}`, () => {
-  for (const tools of ["Read and Search", "Read, Grep and Glob"]) requireRules(crossCheckBrief(tools), c.rules);
+  // The lead receives prior findings; the checker receives only candidate-contained dispositions.
+  const checkerRules = c.rules.map(name => name === "latestItems" ? "suppliedDispositions" as const : name);
+  for (const tools of ["Read and Search", "Read, Grep and Glob"]) requireRules(crossCheckBrief(tools), checkerRules);
   const revision = buildAutomaticRevisionPrompt("plan", { summary: c.expected, items: [
     { file: "plan.md", severity: "warning", summary: c.name, rationale: "inspect the cited script" },
   ] }, c.plan);
@@ -78,6 +81,17 @@ const revisionRules: (keyof typeof rules)[] = [
   "effects", "rejectBypass", "scratch", "goChildren", "reliedEffects", "noNameProof", "sensitiveEffects",
   "coverageDisposition", "latestItems", "olderOptional", "declines", "unverified", "noPrecedence", "completePlan", "addressed", "heading",
 ];
+test("plan checkers limit disposition completeness to supplied evidence in both families", () => {
+  for (const tools of ["Read and Search", "Read, Grep and Glob"]) {
+    const brief = trusted(crossCheckBrief(tools));
+    assert.match(brief, /Assess each supplied disposition and its inspectable evidence/);
+    assert.match(brief, /Previous findings are not supplied; do not claim to establish disposition completeness/);
+    assert.match(brief, /Missing or incomplete defect dispositions identifiable from the supplied input call for REVISE/);
+    assert.doesNotMatch(brief, /Cover each of the immediately preceding check's delivered items/);
+    assert.match(brief, /A supported decline cannot waive a mandatory defect requirement/);
+    requireRules(brief, ["coverageDisposition", "unverified", "noPrecedence"]);
+  }
+});
 test("plan revision puts dispositions and effect guidance outside both DATA fences", () => {
   const advice = { summary: "CURRENT-SUMMARY", items: [
     { file: "Taskfile.yml", severity: "warning" as const, summary: "CURRENT-ITEM", rationale: "CURRENT-EVIDENCE" },

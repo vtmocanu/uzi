@@ -272,6 +272,23 @@ Consistent with D16, a human revision of the plan triggers no new cross-family c
 
 Production coverage review reaches no model today: see the [coverage transport limitation](1225-structural-completion-interlock-invariants.md#coverage-transport-limitation) in ADR-1225. Because no enforceable bounds exist (#1231 is not planned), a production call would settle as coverage-unavailable (`semantic_park: coverage_unavailable`) rather than reach a model.
 
+## Disposition evidence amendment (2026-11-01, #3097)
+
+The maintainer chose Option B: checkers assess dispositions and inspectable
+evidence supplied in their input. Previous findings are not supplied separately,
+so a checker cannot establish completeness against the preceding check's items.
+This narrows the checker instruction in the 2026-10-17 amendment: missing or
+incomplete defect dispositions identifiable from supplied input call for REVISE,
+never BLOCK solely for omission. The lead still includes dispositions for each
+immediately preceding delivered item. Supported declines cannot waive mandatory
+defect requirements, and #3168's advisory coverage exception remains unchanged.
+
+No prior-findings transport, candidate identity, replay input, capability or
+privilege changes are added. Option A (bounded server-derived prior findings)
+is deferred unless a controlled dropped-defect-disposition evaluation shows
+benefit with that input. Instruction tests establish this contract, not improved
+live-model convergence, cost or latency; those outcomes remain unmeasured.
+
 ## Advisory plan coverage amendment (2026-10-23, #3334 / #3168 M1)
 
 This amendment records [PRD #3168](../prds/3168-plan-cross-check-coverage.md)
