@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { RecoveryCoordinator, canonicalJson, type FrozenOperationOptions, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type RecoveryArchiveClient, type RecoveryRecord, type RecoveryCoordinatorOptions } from "../src/recovery.js";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { GitCache, RecoveryBundleTooLargeError, type OwedCandidate, type PositiveOwedCandidateContext } from "../src/git.js";
@@ -6636,6 +6637,164 @@ it("#3727 M3 lost thin ACK replays the saved identity with no new capture or upl
     assert.equal(JSON.stringify(after).includes("closure"), false, "the grant is never journaled");
   } finally { await f.close(); }
 });
+
+it("#3727 thin journal survives feature rollback and roll-forward, with an optional actual pre-C2 reader", async t => {
+  const { f, h, operate, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+  try {
+    f.state.finalError = new Error("ACK lost");
+    await operate();
+    const first = await saved();
+    assert.ok(first.finalRequest);
+    assert.equal(first.finalAcknowledged, undefined);
+    const recordPath = path.join(f.root, "journal", first.runId, first.captureId + ".json");
+    const journal = await fs.readFile(recordPath);
+    const bundle = await fs.readFile(first.bundlePath!);
+    const requests = f.finals.length;
+    h.closureFeature = false;
+    h.closure = "absent";
+    Object.assign(f.client, { protocolFeatures: [] });
+
+    // This opt-in executes an unmodified released module from a detached checkout.
+    // Ordinary CI still pins the MAC/persistence and API-feature rollback contract;
+    // the named owner compatibility run supplies the actual historical reader.
+    const modulePath = process.env.UZI_RECOVERY_COMPAT_READER;
+    if (modulePath) {
+      const { RecoveryCoordinator: OldCoordinator } = await import(pathToFileURL(modulePath).href);
+      const old = new OldCoordinator({
+        recoveryRoot: path.join(f.root, "journal"), workerToken: "local-worker-fixture",
+        client: f.client, git: f.git, log: f.log, now: () => f.state.now,
+        withInventorySourceBoundary: f.coordinator["withInventorySourceBoundary"],
+      });
+      assert.deepEqual(await old.inspect(first.runId), [first], "released reader must authenticate the unchanged journal");
+      await old.resumePending();
+      assert.equal(f.finals.length, requests, "pre-C2 reader cannot replay or mint the thin FINAL");
+      assert.equal(f.state.pinDeletes, 0, "downgrade grants no pin cleanup");
+      assert.deepEqual(await fs.readFile(recordPath), journal, "downgrade must not rewrite the journal");
+      assert.deepEqual(await fs.readFile(first.bundlePath!), bundle);
+      const bad = JSON.parse(journal.toString());
+      bad.reason = "tampered without a new MAC";
+      await fs.writeFile(recordPath, JSON.stringify(bad));
+      assert.deepEqual(await old.inspect(first.runId), [], "old-reader positive must not bypass MAC validation");
+      assert.deepEqual(await fs.readFile(first.bundlePath!), bundle);
+      await fs.writeFile(recordPath, journal);
+      t.diagnostic("actual pre-C2 reader authenticated the new journal, retained it, and rejected a MAC mutation");
+    } else {
+      t.diagnostic("actual historical reader not invoked; set UZI_RECOVERY_COMPAT_READER for the owner compatibility proof");
+    }
+    assert.deepEqual((await f.make(true).inspect(first.runId))[0], first);
+    assert.deepEqual(await fs.readFile(recordPath), journal);
+    f.state.finalError = undefined;
+    await f.make(true).resumePending();
+    const after = await saved();
+    assert.deepEqual(after.finalRequest, first.finalRequest);
+    assert.equal(after.finalAcknowledged, true, "roll-forward replays and records the original ACK");
+    assert.equal(f.finals.length, requests + 1);
+    assert.equal(f.state.produced, 1);
+    assert.equal(f.state.uploads, 1);
+    assert.deepEqual(await fs.readFile(first.bundlePath!), bundle);
+  } finally { await f.close(); }
+});
+
+it("#3727 an unaccepted expired thin FINAL replaces only after the validated fence, then mints under a fresh grant", async () => {
+  const f = await fixture(true, os.tmpdir(), true);
+  try {
+    closureHarness(f, { features: CLOSURE_ONLY });
+    const record = await f.freeze();
+    assert.ok(record);
+    f.state.finalError = new Error("unaccepted FINAL");
+    await f.coordinator.operateFrozenInventory({ record, barePath: f.context.barePath, defaultBranch: "main" });
+    const before = (await f.coordinator.inspect("run-1"))[0]!;
+    assert.ok(before.finalRequest);
+    const old = f.captures.get(f.reserveKeys[0]!)!;
+    old.state = "expired";
+    old.expires = "1970-01-01T00:00:00Z";
+    const bundle = await fs.readFile(before.bundlePath!);
+    let fenced = false;
+    const reconcile = f.client.reconcileRecoveryCapture!;
+    Object.assign(f.client, { reconcileRecoveryCapture: async (...args: Parameters<typeof reconcile>) => {
+      const out = await reconcile(...args);
+      if (out.outcome === "replaceable") {
+        assert.equal(old.state, "expired");
+        fenced = true;
+      }
+      return out;
+    } });
+    f.state.finalError = undefined;
+    await f.make(true).resumePending();
+    const replaced = (await f.coordinator.inspect("run-1"))[0]!;
+    assert.equal(fenced, true);
+    assert.equal(replaced.captureId, before.captureId);
+    assert.notEqual(replaced.serverCaptureId, before.serverCaptureId);
+    assert.equal(f.state.produced, 1);
+    assert.equal(f.state.uploads, 2);
+    assert.deepEqual(await fs.readFile(replaced.bundlePath!), bundle);
+    // The ordinary frozen pass can evaluate grant 4 after replacement; the
+    // fence is not itself authority and never reuses the old server identity.
+    if (!replaced.finalAcknowledged) {
+      await f.coordinator.operateFrozenInventory({ record: replaced, barePath: f.context.barePath, defaultBranch: "main" });
+    }
+    const after = (await f.coordinator.inspect("run-1"))[0]!;
+    assert.equal(after.finalAcknowledged, true);
+    assert.equal(after.finalRequest?.disposition.capture_id, replaced.serverCaptureId);
+    assert.equal(f.state.uploads, 2);
+  } finally { await f.close(); }
+});
+
+for (const response of ["retained", "malformed", "timeout"] as const) {
+  it(`#3727 thin replacement refusal ${response} preserves the saved request and bytes`, async () => {
+    const { f, operate, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+    try {
+      f.state.finalError = new Error("not accepted");
+      await operate();
+      const before = await saved();
+      const bundle = await fs.readFile(before.bundlePath!);
+      Object.assign(f.client, { reconcileRecoveryCapture: async (run: string, id: string, req: { generation: number }) => {
+        if (response === "timeout") throw new Error("timeout");
+        return { run_id: run, capture_id: id, generation: req.generation,
+          outcome: response === "retained" ? "retained" : "replaceable",
+          ...(response === "retained" ? { reason: "capture_available" } : { final_receipt: {} }) };
+      } });
+      await f.make(true).resumePending();
+      const after = await saved();
+      assert.deepEqual(after.finalRequest, before.finalRequest);
+      assert.equal(after.serverCaptureId, before.serverCaptureId);
+      assert.equal(after.finalAcknowledged, undefined);
+      assert.equal(f.state.uploads, 1);
+      assert.equal(f.state.produced, 1);
+      assert.deepEqual(await fs.readFile(after.bundlePath!), bundle);
+    } finally { await f.close(); }
+  });
+}
+
+for (const status of ["expired", "discarded", "read failure"] as const) {
+  it(`#3727 saved thin FINAL sends first when capture status is ${status}`, async () => {
+    const { f, operate, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+    try {
+      f.state.finalError = new Error("ACK lost");
+      await operate();
+      const before = await saved();
+      assert.ok(before.finalRequest);
+      const getStatus = f.client.getRecoveryCaptureStatus;
+      let reconciles = 0;
+      Object.assign(f.client, {
+        getRecoveryCaptureStatus: async (run: string, id: string) => {
+          if (status === "read failure") throw new Error("capture status unavailable");
+          return { ...await getStatus(run, id), state: status, expires_at: "1970-01-01T00:00:00Z" };
+        },
+        reconcileRecoveryCapture: async () => { reconciles++; throw new Error("reconcile unavailable"); },
+      });
+      f.state.finalError = undefined;
+      await f.make(true).resumePending();
+      const after = await saved();
+      assert.equal(f.finals.length, 2, "saved request must send before reconciliation, despite diagnostic status failure");
+      assert.deepEqual(after.finalRequest, before.finalRequest);
+      assert.equal(after.finalAcknowledged, true);
+      assert.equal(reconciles, 0, "a successful replay ACK needs no reconciliation");
+      assert.equal(f.state.uploads, 1);
+      assert.equal(f.state.produced, 1);
+    } finally { await f.close(); }
+  });
+}
 
 for (const mutation of ["other prerequisite", "other source", "self-contained", "unreadable"] as const) {
   it(`#3727 M3 saved thin FINAL with a ${mutation} bundle header sends nothing and rewrites nothing`, async () => {

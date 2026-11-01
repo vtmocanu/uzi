@@ -2251,15 +2251,23 @@ export class RecoveryCoordinator {
       } else return;
     }
     if (!await this.frozenCoverageProven(record)) return;
-    // Validate the archive before both minting and replaying FINAL. A committed receipt
-    // remains authoritative when its capture has expired or its status is unusable.
+    // A new mint requires healthy capture status. For a saved thin archive FINAL,
+    // status is diagnostic: send the unchanged request before reconciliation.
+    // Local header, source/coverage and inactivity proofs above still apply.
     let observedStatus: RecoveryCaptureStatusResponse | undefined;
+    const savedThinReplay = thinArchive && record.finalRequest?.disposition.kind === "archive";
     if (record.finalRequest?.disposition.kind !== "settled" && !heldFinal) {
       if (record.state !== "uploaded" || !record.serverCaptureId!) return;
       try { observedStatus = await this.recoveryRPC(() => this.client.getRecoveryCaptureStatus(record.runId, record.serverCaptureId!)); }
-      catch { MaintenanceBudget.current()?.check(); if (reconcile) return this.reconcileInventory(record, prove); return; }
+      catch {
+        MaintenanceBudget.current()?.check();
+        if (!savedThinReplay) {
+          if (reconcile) return this.reconcileInventory(record, prove);
+          return;
+        }
+      }
       if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
-      if (!healthyInventoryStatus(observedStatus, record, this.now())) {
+      if (!savedThinReplay && !healthyInventoryStatus(observedStatus!, record, this.now())) {
         if (reconcile) return this.reconcileInventory(record, prove, observedStatus);
         return;
       }
