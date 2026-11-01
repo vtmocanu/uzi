@@ -49,6 +49,52 @@ func TestValidatePublicationPark(t *testing.T) {
 	}
 }
 
+func pubHoldReport(gen int64, reason string) StateRequest {
+	return StateRequest{
+		State: "recovery_wait", RecoveryCause: strPtr("forge_unreachable"), ClaimGeneration: i64Ptr(gen),
+		RecoveryPhase: strPtr("publication"), PublicationHoldReason: strPtr(reason),
+	}
+}
+
+func TestValidatePublicationHoldReport(t *testing.T) {
+	for _, reason := range []string{"publication_model_required", "publication_source_unavailable", "publication_intent_mismatch"} {
+		if err := validatePublicationPark(pubHoldReport(2, reason)); err != nil {
+			t.Errorf("%s: %v", reason, err)
+		}
+	}
+	withTip := pubHoldReport(2, "publication_model_required")
+	withTip.HandoffCheckpointTip = strPtr(pubHeadC)
+	if err := validatePublicationPark(withTip); err != nil {
+		t.Errorf("valid tip on a hold: %v", err)
+	}
+	mut := func(f func(*StateRequest)) StateRequest {
+		r := pubHoldReport(2, "publication_model_required")
+		f(&r)
+		return r
+	}
+	for name, req := range map[string]StateRequest{
+		"server-only custodian reason": mut(func(r *StateRequest) { r.PublicationHoldReason = strPtr("publication_custodian_unavailable") }),
+		"server-only exhausted reason": mut(func(r *StateRequest) { r.PublicationHoldReason = strPtr("publication_retry_exhausted") }),
+		"unknown reason":               mut(func(r *StateRequest) { r.PublicationHoldReason = strPtr("other") }),
+		"empty reason":                 mut(func(r *StateRequest) { r.PublicationHoldReason = strPtr("") }),
+		"with surface":                 mut(func(r *StateRequest) { r.PublicationSurface = strPtr("git") }),
+		"with step":                    mut(func(r *StateRequest) { r.PublicationStep = strPtr("push") }),
+		"missing phase":                mut(func(r *StateRequest) { r.RecoveryPhase = nil }),
+		"wrong phase":                  mut(func(r *StateRequest) { r.RecoveryPhase = strPtr("clone") }),
+		"wrong cause":                  mut(func(r *StateRequest) { r.RecoveryCause = strPtr("provider_outage") }),
+		"no cause":                     mut(func(r *StateRequest) { r.RecoveryCause = nil }),
+		"non recovery_wait state":      mut(func(r *StateRequest) { r.State = "running" }),
+		"no generation":                mut(func(r *StateRequest) { r.ClaimGeneration = nil }),
+		"zero generation":              mut(func(r *StateRequest) { r.ClaimGeneration = i64Ptr(0) }),
+		"short tip":                    mut(func(r *StateRequest) { r.HandoffCheckpointTip = strPtr("abc") }),
+		"reason on a running report":   {State: "running", ClaimGeneration: i64Ptr(1), PublicationHoldReason: strPtr("publication_model_required")},
+	} {
+		if err := validatePublicationPark(req); !errors.Is(err, ErrInvalidState) {
+			t.Errorf("%s: err=%v, want ErrInvalidState", name, err)
+		}
+	}
+}
+
 func TestPublicationHandoffRequiresThePublishedTip(t *testing.T) {
 	run := store.Run{ID: uuid.New(), CheckpointTip: pgtype.Text{String: pubHeadC, Valid: true}}
 	with := func(tip string) StateRequest { return StateRequest{HandoffCheckpointTip: &tip} }

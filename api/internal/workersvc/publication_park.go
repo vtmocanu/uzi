@@ -45,13 +45,22 @@ const (
 var (
 	publicationSurfaces = []string{"git", "api"}
 	publicationSteps    = []string{"floor_refresh", "push", "mr_create"}
+
+	// publicationWorkerHoldReasons are the hold reasons a worker may report for a publication-only
+	// resume that cannot publish without model work or source. publication_custodian_unavailable
+	// and publication_retry_exhausted are server-only and refused from a worker.
+	publicationWorkerHoldReasons = []string{
+		"publication_model_required", "publication_source_unavailable", "publication_intent_mismatch",
+	}
 )
 
 // validatePublicationPark checks the publication fields of a state report before any SQL. The
 // fields describe a forge_unreachable park and mean nothing elsewhere, so any of them on another
-// report, an unknown enum value, or a handoff tip that is not a full object id is a 400.
+// report, an unknown enum value, or a handoff tip that is not a full object id is a 400. A hold
+// report (publication_hold_reason) replaces the timed park's surface and step, which it must omit.
 func validatePublicationPark(req StateRequest) error {
-	if req.RecoveryPhase == nil && req.PublicationSurface == nil && req.PublicationStep == nil && req.HandoffCheckpointTip == nil {
+	if req.RecoveryPhase == nil && req.PublicationSurface == nil && req.PublicationStep == nil && req.HandoffCheckpointTip == nil &&
+		req.PublicationHoldReason == nil {
 		return nil
 	}
 	bad := func(msg string) error { return fmt.Errorf("%w: %s", ErrInvalidState, msg) }
@@ -61,11 +70,20 @@ func validatePublicationPark(req StateRequest) error {
 	if req.RecoveryPhase == nil || *req.RecoveryPhase != publicationPhase {
 		return bad("recovery_phase must be \"publication\"")
 	}
-	if req.PublicationSurface == nil || !slices.Contains(publicationSurfaces, *req.PublicationSurface) {
-		return bad("publication_surface must be git or api")
-	}
-	if req.PublicationStep == nil || !slices.Contains(publicationSteps, *req.PublicationStep) {
-		return bad("publication_step must be floor_refresh, push or mr_create")
+	if req.PublicationHoldReason != nil {
+		if !slices.Contains(publicationWorkerHoldReasons, *req.PublicationHoldReason) {
+			return bad("publication_hold_reason must be publication_model_required, publication_source_unavailable or publication_intent_mismatch")
+		}
+		if req.PublicationSurface != nil || req.PublicationStep != nil {
+			return bad("a publication hold report must not carry publication_surface or publication_step")
+		}
+	} else {
+		if req.PublicationSurface == nil || !slices.Contains(publicationSurfaces, *req.PublicationSurface) {
+			return bad("publication_surface must be git or api")
+		}
+		if req.PublicationStep == nil || !slices.Contains(publicationSteps, *req.PublicationStep) {
+			return bad("publication_step must be floor_refresh, push or mr_create")
+		}
 	}
 	if req.ClaimGeneration == nil || *req.ClaimGeneration <= 0 {
 		return bad("publication park requires a positive claim_generation")
@@ -94,7 +112,9 @@ func publicationHandoff(run store.Run, req StateRequest) []byte {
 	return raw
 }
 
-// parkPublicationForgeUnreachable is the D8 writer. The caller holds the worker and run locks and
+// parkPublicationForgeUnreachable is the D8 writer, and also the D4 writer of a worker-reported
+// hold (req.PublicationHoldReason): the same preconditions and the same park statement, with a NULL
+// stamp and the reported side-row hold_reason. The caller holds the worker and run locks and
 // has verified the generation, that the run is running, the exact custody hold, and the active
 // intent. It parks the run (timed retry, or an owner hold once the elapsed bound is reached),
 // records the wait clock and counters on the side row, and commits. All time comes from s.now().
@@ -113,10 +133,15 @@ func (s *Service) parkPublicationForgeUnreachable(ctx context.Context, tx pgx.Tx
 		start = intent.WaitStartedAt.Time
 	}
 	apiSurface := req.PublicationSurface != nil && *req.PublicationSurface == "api"
+	// A worker-reported hold (publication_hold_reason) is an owner hold at once: NULL stamp, the
+	// reported reason, and no forge-origin observation or cooldown, since the forge did not fail.
+	workerHold := req.PublicationHoldReason != nil
 	var retry pgtype.Timestamptz
 	var stamp time.Time
 	var holdReason pgtype.Text
-	if bound := s.p.RunProviderParkMaxDuration; bound > 0 && now.Sub(start) >= bound {
+	if workerHold {
+		holdReason = pgconv.TextOrNull(*req.PublicationHoldReason)
+	} else if bound := s.p.RunProviderParkMaxDuration; bound > 0 && now.Sub(start) >= bound {
 		holdReason = pgconv.TextOrNull(publicationHoldRetryExhausted)
 	} else {
 		stamp = now.Add(s.recoveryParkFallbackFor(run.RecoveryWaitCount) + recoveryParkJitter())
@@ -143,8 +168,10 @@ func (s *Service) parkPublicationForgeUnreachable(ctx context.Context, tx pgx.Tx
 	}
 	// The observation needs the parked row (status recovery_wait / forge_unreachable), so it follows
 	// the park; a cooldown that outlasts the provisional backoff stamp then raises the stamp.
-	if err := s.observeForgeOrigin(ctx, qtx, parked, apiSurface, forgeReasonPublicationExhaust); err != nil {
-		return store.Run{}, 0, err
+	if !workerHold {
+		if err := s.observeForgeOrigin(ctx, qtx, parked, apiSurface, forgeReasonPublicationExhaust); err != nil {
+			return store.Run{}, 0, err
+		}
 	}
 	if !stamp.IsZero() {
 		cooled, err := s.publicationOriginCooldown(ctx, qtx, run, wkr, apiSurface)

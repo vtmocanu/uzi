@@ -95,6 +95,7 @@ type stateRequestMinusGateRevision struct {
 	PublicationSurface          *string                            `json:"publication_surface,omitempty"`
 	PublicationStep             *string                            `json:"publication_step,omitempty"`
 	HandoffCheckpointTip        *string                            `json:"handoff_checkpoint_tip,omitempty"`
+	PublicationHoldReason       *string                            `json:"publication_hold_reason,omitempty"`
 	DiskParkPreventive          *bool                              `json:"disk_park_preventive"`
 	ProductiveTurns             *int32                             `json:"productive_turns"`
 	ProviderProgressTurns       *int32                             `json:"provider_progress_turns"`

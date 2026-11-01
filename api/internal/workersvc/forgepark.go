@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -114,6 +115,12 @@ func (s *Service) parkForgeUnreachableAttempt(ctx context.Context, wkr store.Wor
 	// stale_claim is a generation MISMATCH, which needs a value to compare.
 	if req.ClaimGeneration == nil {
 		return store.Run{}, 0, fmt.Errorf("%w: forge_unreachable park requires claim_generation", ErrInvalidState)
+	}
+
+	// A publication hold report (issue #1324 D4) is a publication_resume_v1 protocol field: from a
+	// worker that never negotiated it, it is a protocol error (400) before any lock is taken.
+	if req.PublicationHoldReason != nil && !slices.Contains(wkr.ProtocolCapabilities, PublicationResumeFeature) {
+		return store.Run{}, 0, fmt.Errorf("%w: publication_hold_reason requires the %s capability", ErrInvalidState, PublicationResumeFeature)
 	}
 
 	tx, err := s.txBeginner.Begin(ctx)

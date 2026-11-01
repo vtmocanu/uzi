@@ -4269,6 +4269,11 @@ type StateRequest struct {
 	PublicationSurface   *string `json:"publication_surface,omitempty"`
 	PublicationStep      *string `json:"publication_step,omitempty"`
 	HandoffCheckpointTip *string `json:"handoff_checkpoint_tip,omitempty"`
+	// PublicationHoldReason types a publication-only resume that cannot publish without model work
+	// or source: a NULL-stamp owner hold (never a failure, never a custody release) with one of
+	// publicationWorkerHoldReasons as the side row's hold_reason. Validated by
+	// validatePublicationPark; absent on every other report.
+	PublicationHoldReason *string `json:"publication_hold_reason,omitempty"`
 	// PresentationID is the worker-minted identity of the gate presentation an
 	// `awaiting_approval` report publishes (PRD #1795 M1, D1). A new id allocates the run's next
 	// gate revision; the run's CURRENT id with an unchanged approval-relevant payload is an
