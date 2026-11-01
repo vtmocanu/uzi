@@ -56,7 +56,11 @@ for (const variant of ["pinned", "needs_action", "uploaded", "saved-final"] as c
       await producer.enumerateOwedCandidates!(f.context.barePath, f.context.runId);
       return [{ context: f.context, candidates: [] }];
     };
-    assert.equal(await e.coordinator.heldOperationState(f.record), "settled");
+    const initial = await inventory(f.root);
+    const journal = path.relative(f.root, e.coordinator["recordPath"](f.record));
+    const observation = await e.coordinator.heldOperationState(f.record);
+    await equalInventory(f.root, initial, journal);
+    assert.equal(observation, "settled");
     const before = await inventory(f.root);
     await e.coordinator.resumeLive({ authenticatedAtMs: 1000, isExecuting: () => false });
     const saved = (await e.coordinator.inspect(f.context.runId))[0]!;
@@ -70,7 +74,6 @@ for (const variant of ["pinned", "needs_action", "uploaded", "saved-final"] as c
     assert.equal(discovery, 1);
     const after = await inventory(f.root);
     assert.equal(after.length, before.length);
-    const journal = path.relative(f.root, e.coordinator["recordPath"](f.record));
     for (let i = 0; i < before.length; i++) {
       const actual = { ...after[i] };
       if (actual.path === journal) actual.bytes = before[i]!.bytes;
@@ -306,8 +309,9 @@ for (const disposition of ["discarded", "mismatch", "matching"] as const) {
     const s = await setup("saved-final");
     const request = s.f.record.finalRequest!;
     const proof: RecoveryExactHold = { ...closed(s.f), state: disposition === "discarded" ? "discarded" : "released",
-      release_evidence: request.evidence, final_receipt: disposition === "mismatch"
-        ? { kind: "settled", coverage_digest: s.f.record.coverageDigest! } : request.disposition };
+      release_evidence: disposition === "discarded" ? "merged_predecessor_discard" : "archive",
+      final_receipt: disposition === "mismatch"
+        ? { ...request.disposition, capture_id: binding.holdId } : request.disposition };
     s.answer(proof);
     s.e.state.allowFinal = true;
     if (disposition !== "matching") s.e.cleanup();
@@ -344,7 +348,7 @@ test("matching released thin FINAL replays before unavailable capture status", a
     checksum: createHash("sha256").update(bytes).digest("hex"), chunkCount: 1,
     selfContained: false, prerequisiteShas: [base] });
   s.answer({ ...closed(f), state: "released", final_receipt: f.record.finalRequest!.disposition,
-    release_evidence: f.record.finalRequest!.evidence });
+    release_evidence: "prerequisite_closure" });
   let statuses = 0;
   s.client.getRecoveryCaptureStatus = async () => { statuses++; throw new Error("capture unavailable"); };
   const sent: string[] = [];
@@ -379,7 +383,8 @@ for (const variant of ["acknowledged", "completion-receipt"] as const) {
 test("bound discarded receipt always refuses even when it matches the saved request", async () => {
   const s = await setup("saved-final");
   await patch(s.e.coordinator, s.f.record, { exactHoldBinding: binding,
-    holdSettlement: { ...closed(s.f), final_receipt: s.f.record.finalRequest!.disposition } });
+    holdSettlement: { ...closed(s.f), release_evidence: "merged_predecessor_discard",
+      final_receipt: s.f.record.finalRequest!.disposition } });
   await s.e.coordinator.resumePending();
   assert.equal(s.e.calls.final, 0);
 });
@@ -405,7 +410,7 @@ test("learning a matching binding preserves an existing immutable FINAL backoff"
   await s.e.coordinator.resumePending();
   assert.equal(s.e.calls.final, 1);
   s.answer({ ...closed(s.f), state: "released", final_receipt: s.f.record.finalRequest!.disposition,
-    release_evidence: s.f.record.finalRequest!.evidence });
+    release_evidence: "archive" });
   assert.equal(await s.e.coordinator.heldOperationState(s.f.record), "settled");
   await s.e.coordinator.resumePending();
   assert.equal(s.e.calls.final, 1, "learning binding must not reset the saved request's attempt clock");
