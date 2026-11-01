@@ -549,6 +549,70 @@ eval "$(awk '/^(terminal_tail_projection|terminal_tail_pending_valid|terminal_ta
   jq -nc --arg r "$run" '{runId:$r,generation:2,messages:[{seq:12,payload:{event:"stub_outbox_terminal_tail",run_id:$r,claim_generation:2}}]}' > "$dir/seg.json"
   evidence="$(terminal_tail_projection "$run" 2)"
   printf '%s\n' "$evidence" | terminal_tail_pending_valid "$run" 2 10
+  cp "$dir/terminal-2.json" "$SCRATCH/base-tail-terminal.json"
+  cp "$dir/manifest.json" "$SCRATCH/base-tail-manifest.json"
+  cp "$dir/seg.json" "$SCRATCH/base-tail-segment.json"
+  for budget_case in boundary file-overflow cumulative records messages output; do
+    python3 - "$dir" "$SCRATCH" "$budget_case" <<'PY'
+import json
+import pathlib
+import sys
+dest, scratch, case = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+journal = json.loads((scratch / "base-tail-terminal.json").read_text())
+manifest = json.loads((scratch / "base-tail-manifest.json").read_text())
+segment = json.loads((scratch / "base-tail-segment.json").read_text())
+limit = 1048576
+def write(name, obj, size=None):
+    data = json.dumps(obj).encode()
+    if size is not None:
+        data += b" " * (size - len(data))
+    (dest / name).write_bytes(data)
+if case in ("boundary", "file-overflow"):
+    write("terminal-2.json", journal, limit + (case == "file-overflow"))
+elif case == "cumulative":
+    journal["messages_through_seq"] = 14
+    manifest["records"] = []
+    for i in range(4):
+        seq = 11 + i
+        msg = dict(segment["messages"][0]) if i == 3 else {"seq": seq, "payload": {"text": "probe"}}
+        msg["seq"] = seq
+        part = dict(segment, messages=[msg])
+        name = "budget-part-" + str(i) + ".json"
+        write(name, part, limit)
+        manifest["records"].append({"kind": "segment", "file": name, "firstSeq": seq, "lastSeq": seq})
+elif case == "records":
+    manifest["records"] = [{"kind": "range"} for _ in range(256)] + manifest["records"]
+elif case == "messages":
+    segment["messages"] = [{"seq": i + 11, "payload": {"text": "probe"}} for i in range(2048)] + segment["messages"]
+elif case == "output":
+    segment["messages"][0]["payload"]["unused"] = "x" * 16384
+if case not in ("boundary", "file-overflow"):
+    write("terminal-2.json", journal)
+write("manifest.json", manifest)
+write("seg.json", segment)
+PY
+    if [ "$budget_case" = boundary ] || [ "$budget_case" = output ]; then
+      terminal_tail_projection "$run" 2 > "$SCRATCH/budget-projection.json"
+      terminal_tail_pending_valid "$run" 2 10 < "$SCRATCH/budget-projection.json"
+      [ "$(wc -c < "$SCRATCH/budget-projection.json")" -le 8192 ] || fail 'projection output exceeds budget'
+      jq -e '.tails[0].payload | keys == ["claim_generation","event","run_id"]' "$SCRATCH/budget-projection.json" >/dev/null
+    else
+      if terminal_tail_projection "$run" 2 > "$SCRATCH/budget-projection.json" 2> "$SCRATCH/budget-projection.err"; then
+        fail "projection accepted $budget_case overflow"
+      fi
+      [ ! -s "$SCRATCH/budget-projection.json" ] || fail 'overflow emitted partial projection evidence'
+      case "$budget_case" in
+        file-overflow|cumulative) reason='projection byte budget exceeded';;
+        records) reason='invalid projection envelope';;
+        messages) reason='invalid segment envelope';;
+      esac
+      grep -F "$reason" "$SCRATCH/budget-projection.err" >/dev/null || fail "wrong projection refusal for $budget_case"
+    fi
+    echo "PASS: durable projection enforces $budget_case resource budget"
+  done
+  cp "$SCRATCH/base-tail-terminal.json" "$dir/terminal-2.json"
+  cp "$SCRATCH/base-tail-manifest.json" "$dir/manifest.json"
+  cp "$SCRATCH/base-tail-segment.json" "$dir/seg.json"
   for filter in '.tails=[]' '.tails[0].seq=10' '.cursor=12' '.run="foreign"'       '.generation=1' '.manifest_run="foreign"' '.tails[0].run="foreign"'       '.tails[0].generation=1' '.tails[0].payload.run_id="foreign"'       '.tails[0].payload.claim_generation=1' '.tails[0].seq=0' '.fence=11'       '.tails[0].first=13' '.tails[0].last=11' '.tails += .tails'; do
     if printf '%s\n' "$evidence" | jq "$filter" | terminal_tail_pending_valid "$run" 2 10; then
       fail "pending tail accepted $filter"
@@ -653,4 +717,4 @@ for selected in 3 4 5; do
   )
   echo "PASS: real CASE $selected wires the healthy snapshot, pending message fence and persisted-tail proof"
 done
-echo 'cases=55 passed=55'
+echo 'cases=61 passed=61'

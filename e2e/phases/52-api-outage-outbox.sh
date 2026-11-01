@@ -548,27 +548,62 @@ snapshot_terminal_tail() {
 # Read existing durable files only. One bounded exec, no worker control or new authority.
 # The manifest must still own the exact tail segment, beyond its acknowledged cursor.
 terminal_tail_projection() {
-  "${COMPOSE[@]}" exec -T agent timeout 15 node --input-type=module - /data/outbox "$1" "$2" <<'NODE'
+  local limiter
+  limiter="$(command -v timeout || command -v gtimeout || true)"
+  [ -n "$limiter" ] || return 1
+  "$limiter" 20 "${COMPOSE[@]}" exec -T agent timeout 15 node --input-type=module - /data/outbox "$1" "$2" <<'NODE'
   import fs from "node:fs";
   import path from "node:path";
   const [root, run, generation] = process.argv.slice(2);
   const gen = Number(generation), dir = path.join(root, run);
-  const read = name => JSON.parse(fs.readFileSync(path.join(dir, name), "utf8"));
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(run) ||
+      !Number.isSafeInteger(gen) || gen < 1) throw new Error("invalid projection identity");
+  const fileLimit = 1_048_576, totalLimit = 4_194_304;
+  let total = 0;
+  const read = name => {
+    if (typeof name !== "string" || path.basename(name) !== name) throw new Error("invalid projection path");
+    const fd = fs.openSync(path.join(dir, name), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      if (!fs.fstatSync(fd).isFile()) throw new Error("projection entry is not a regular file");
+      const allowance = Math.min(fileLimit, totalLimit - total);
+      const bytes = Buffer.alloc(allowance + 1);
+      let length = 0;
+      while (length < bytes.length) {
+        const got = fs.readSync(fd, bytes, length, bytes.length - length, null);
+        if (got === 0) break;
+        length += got;
+      }
+      if (length > allowance) throw new Error("projection byte budget exceeded");
+      total += length;
+      return JSON.parse(bytes.subarray(0, length).toString("utf8"));
+    } finally { fs.closeSync(fd); }
+  };
   const journal = read(`terminal-${gen}.json`), manifest = read("manifest.json");
+  if (journal.run_id !== run || journal.claim_generation !== gen || journal.body?.status !== "completed" ||
+      !Number.isSafeInteger(journal.messages_through_seq) || journal.messages_through_seq < 0 ||
+      manifest.runId !== run || !Number.isSafeInteger(manifest.cursor) || manifest.cursor < 0 ||
+      !Array.isArray(manifest.records) || manifest.records.length > 256) throw new Error("invalid projection envelope");
   const tails = [];
   for (const ref of manifest.records) {
     if (ref.kind !== "segment" || ref.lastSeq <= manifest.cursor) continue;
-    if (path.basename(ref.file) !== ref.file) throw new Error("invalid segment path");
+    if (!Number.isSafeInteger(ref.firstSeq) || ref.firstSeq < 1 ||
+        !Number.isSafeInteger(ref.lastSeq) || ref.lastSeq < ref.firstSeq) throw new Error("invalid segment range");
     const segment = read(ref.file);
+    if (segment.runId !== run || segment.generation !== gen ||
+        !Array.isArray(segment.messages) || segment.messages.length > 2048) throw new Error("invalid segment envelope");
     for (const message of segment.messages) {
       if (message.payload?.event !== "stub_outbox_terminal_tail") continue;
-      tails.push({ seq: message.seq, run: segment.runId, generation: segment.generation,
-        payload: message.payload, first: ref.firstSeq, last: ref.lastSeq });
+      if (tails.length !== 0 || !Number.isSafeInteger(message.seq) || message.seq < 1 ||
+          message.payload.run_id !== run || message.payload.claim_generation !== gen) throw new Error("invalid projected tail");
+      tails.push({ seq: message.seq, run, generation: gen,
+        payload: { event: "stub_outbox_terminal_tail", run_id: run, claim_generation: gen },
+        first: ref.firstSeq, last: ref.lastSeq });
     }
   }
-  console.log(JSON.stringify({ run: journal.run_id, generation: journal.claim_generation,
-    status: journal.body.status, fence: journal.messages_through_seq,
-    manifest_run: manifest.runId, cursor: manifest.cursor, tails }));
+  const output = JSON.stringify({ run, generation: gen, status: "completed", fence: journal.messages_through_seq,
+    manifest_run: run, cursor: manifest.cursor, tails });
+  if (Buffer.byteLength(output) > 8192) throw new Error("projection output budget exceeded");
+  console.log(output);
 NODE
 }
 terminal_tail_pending_valid() {
