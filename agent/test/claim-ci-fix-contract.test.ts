@@ -25,6 +25,7 @@ const fixture = join(
 
 test("ci_fix claim wire contract: worker parses the server's ci_fix shape", () => {
   const claim = JSON.parse(readFileSync(fixture, "utf8")) as ClaimResponse;
+  assert.equal(claim.config?.iteration_park_version, 1);
 
   // A ci_fix run: kind set, no issue.
   assert.equal(claim.kind, "ci_fix");
