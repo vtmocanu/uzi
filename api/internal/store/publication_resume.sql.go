@@ -75,8 +75,8 @@ func (q *Queries) CompletePublicationResume(ctx context.Context, runID uuid.UUID
 }
 
 const enrollPublicationResume = `-- name: EnrollPublicationResume :one
-INSERT INTO run_publication_resume (run_id, enrollment_seq, claim_generation, worker_id, intent, state)
-SELECT $1::uuid, COALESCE(MAX(p.enrollment_seq), 0) + 1, $2::bigint, $3::uuid, $4::json, 'active'
+INSERT INTO run_publication_resume (run_id, enrollment_seq, claim_generation, worker_id, intent, candidate_seq, state)
+SELECT $1::uuid, COALESCE(MAX(p.enrollment_seq), 0) + 1, $2::bigint, $3::uuid, $4::json, 1, 'active'
 FROM run_publication_resume p WHERE p.run_id = $1::uuid
 RETURNING run_id, enrollment_seq, claim_generation, worker_id, intent, candidate_seq, state, retired_reason, wait_started_at, first_wait_at, park_total, episode, hold_reason, handoff, created_at, updated_at
 `

@@ -94,11 +94,30 @@ func (f *publicationResumeFixture) reclaim(t *testing.T, gen int64) {
 
 func seq(n int32) *int32 { return &n }
 
+// The real fresh-enrollment reply must satisfy the worker's positive-sequence
+// contract. The agent client consumes this same fixture, not an invented ACK.
+func TestPublicationResumeInitialAckContractLiveDB(t *testing.T) {
+	f := newPublicationResumeFixture(t)
+	for _, response := range []PublicationIntentResponse{f.enroll(t), f.enroll(t)} {
+		wire, err := json.Marshal(response)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := os.ReadFile("../../../fixtures/publication-intent/initial-ack.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.TrimSpace(string(wire)) != strings.TrimSpace(string(want)) {
+			t.Fatalf("initial enrollment ACK = %s, want worker-compatible %s", wire, want)
+		}
+	}
+}
+
 func TestPublicationResumeEnrollmentLiveDB(t *testing.T) {
 	f := newPublicationResumeFixture(t)
 	ctx := f.env.ctx
 	first := f.enroll(t)
-	if first.EnrollmentSeq != 1 || first.CandidateSeq != 0 || first.State != "active" {
+	if first.EnrollmentSeq != 1 || first.CandidateSeq != 1 || first.State != "active" {
 		t.Fatalf("first=%+v", first)
 	}
 	// Idempotent identity compare returns the existing enrollment.
@@ -119,21 +138,21 @@ func TestPublicationResumeEnrollmentLiveDB(t *testing.T) {
 	// Candidate CAS: current+1 stores, repeat is idempotent, a skip or a different repeat is a mismatch.
 	c := pubHeadC
 	upd, err := f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID,
-		PublicationIntentRequest{ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(1), Intent: f.intent("agent/issue-1", pubHeadA, &c)})
-	if err != nil || upd.CandidateSeq != 1 {
+		PublicationIntentRequest{ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(2), Intent: f.intent("agent/issue-1", pubHeadA, &c)})
+	if err != nil || upd.CandidateSeq != 2 {
 		t.Fatalf("update=%+v err=%v", upd, err)
 	}
 	repeat, err := f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID,
-		PublicationIntentRequest{ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(1), Intent: f.intent("agent/issue-1", pubHeadA, &c)})
-	if err != nil || repeat.CandidateSeq != 1 {
+		PublicationIntentRequest{ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(2), Intent: f.intent("agent/issue-1", pubHeadA, &c)})
+	if err != nil || repeat.CandidateSeq != 2 {
 		t.Fatalf("lost-ACK repeat=%+v err=%v", repeat, err)
 	}
 	other := pubHeadB
 	for name, req := range map[string]PublicationIntentRequest{
-		"skip":               {ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(3), Intent: f.intent("agent/issue-1", pubHeadA, &c)},
-		"different repeat":   {ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(1), Intent: f.intent("agent/issue-1", pubHeadA, &other)},
+		"skip":               {ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(4), Intent: f.intent("agent/issue-1", pubHeadA, &c)},
+		"different repeat":   {ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(2), Intent: f.intent("agent/issue-1", pubHeadA, &other)},
 		"stale lower":        {ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(1), Intent: f.intent("agent/issue-1", pubHeadA, nil)},
-		"identity in update": {ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(2), Intent: f.intent("agent/issue-1", pubHeadB, &c)},
+		"identity in update": {ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(3), Intent: f.intent("agent/issue-1", pubHeadB, &c)},
 	} {
 		if _, err := f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID, req); !errors.Is(err, ErrPublicationIntentMismatch) {
 			t.Fatalf("%s: err=%v", name, err)
@@ -218,8 +237,8 @@ func TestPublicationResumeCandidateAfterReclaimLiveDB(t *testing.T) {
 	f.reclaim(t, 2)
 	c := pubHeadC
 	upd, err := f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID,
-		PublicationIntentRequest{ClaimGeneration: 2, EnrollmentSeq: seq(1), CandidateSeq: seq(1), Intent: f.intentAt(1, "agent/issue-1", pubHeadA, &c)})
-	if err != nil || upd.CandidateSeq != 1 || upd.EnrollmentSeq != 1 {
+		PublicationIntentRequest{ClaimGeneration: 2, EnrollmentSeq: seq(1), CandidateSeq: seq(2), Intent: f.intentAt(1, "agent/issue-1", pubHeadA, &c)})
+	if err != nil || upd.CandidateSeq != 2 || upd.EnrollmentSeq != 1 {
 		t.Fatalf("update at generation 2 = %+v err=%v", upd, err)
 	}
 	var stored int64
@@ -228,13 +247,13 @@ func TestPublicationResumeCandidateAfterReclaimLiveDB(t *testing.T) {
 	}
 	// The stale request generation is refused at the live fence.
 	_, err = f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID,
-		PublicationIntentRequest{ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(2), Intent: f.intentAt(1, "agent/issue-1", pubHeadA, &c)})
+		PublicationIntentRequest{ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(3), Intent: f.intentAt(1, "agent/issue-1", pubHeadA, &c)})
 	if !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("stale generation err=%v, want ErrStaleClaim", err)
 	}
 	// Rewriting the enrollment generation to the live one is an identity change.
 	_, err = f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID,
-		PublicationIntentRequest{ClaimGeneration: 2, EnrollmentSeq: seq(1), CandidateSeq: seq(2), Intent: f.intentAt(2, "agent/issue-1", pubHeadA, &c)})
+		PublicationIntentRequest{ClaimGeneration: 2, EnrollmentSeq: seq(1), CandidateSeq: seq(3), Intent: f.intentAt(2, "agent/issue-1", pubHeadA, &c)})
 	if !errors.Is(err, ErrPublicationIntentMismatch) {
 		t.Fatalf("identity rewrite err=%v, want mismatch", err)
 	}
@@ -497,7 +516,7 @@ func TestPublicationResumeFeatureOffRefusesNewEnrollmentLiveDB(t *testing.T) {
 	}
 	c := pubHeadC
 	if _, err := f.svc.RegisterPublicationIntent(ctx, f.wkr, f.runID,
-		PublicationIntentRequest{ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(1), Intent: f.intent("agent/issue-1", pubHeadA, &c)}); err != nil {
+		PublicationIntentRequest{ClaimGeneration: 1, EnrollmentSeq: seq(1), CandidateSeq: seq(2), Intent: f.intent("agent/issue-1", pubHeadA, &c)}); err != nil {
 		t.Fatalf("candidate update with feature off: %v", err)
 	}
 	// A run with no active enrollment is refused.
@@ -613,7 +632,7 @@ func TestPublicationResumeClaimFenceLiveDB(t *testing.T) {
 			t.Fatalf("handoff=%s", payload.Handoff)
 		}
 		wire, err := json.Marshal(ClaimPayload{PublicationResume: payload})
-		if err != nil || !strings.Contains(string(wire), `"publication_resume":{"enrollment_seq":1,"candidate_seq":0,"intent":{`) ||
+		if err != nil || !strings.Contains(string(wire), `"publication_resume":{"enrollment_seq":1,"candidate_seq":1,"intent":{`) ||
 			!strings.Contains(string(wire), `"handoff":null`) {
 			t.Fatalf("wire=%s err=%v", wire, err)
 		}

@@ -26,8 +26,8 @@ SELECT EXISTS (
 
 -- name: EnrollPublicationResume :one
 -- The caller holds the run row lock, so MAX+1 cannot race; the partial unique index backs it.
-INSERT INTO run_publication_resume (run_id, enrollment_seq, claim_generation, worker_id, intent, state)
-SELECT @run_id::uuid, COALESCE(MAX(p.enrollment_seq), 0) + 1, @claim_generation::bigint, @worker_id::uuid, @intent::json, 'active'
+INSERT INTO run_publication_resume (run_id, enrollment_seq, claim_generation, worker_id, intent, candidate_seq, state)
+SELECT @run_id::uuid, COALESCE(MAX(p.enrollment_seq), 0) + 1, @claim_generation::bigint, @worker_id::uuid, @intent::json, 1, 'active'
 FROM run_publication_resume p WHERE p.run_id = @run_id::uuid
 RETURNING *;
 

@@ -1,14 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { WorkerClient } from "../src/client.js";
 import type { StateRequest } from "../src/protocol.js";
-import { publicationParkRefusal } from "../src/publication-intent.js";
+import { parsePublicationRecord, publicationParkRefusal } from "../src/publication-intent.js";
 import { intent, RUN } from "./publication-intent-fixture.js";
 import { makeClaim, nullLogger } from "./helpers.js";
 
-// Issue #1324: the client wire shapes. There is no shared wire fixture for these types, so each
-// shape below is compared by hand with the Go json tags: api/internal/workersvc/publication_resume.go
+// Issue #1324: the initial ACK uses a shared fixture verified against a live server enrollment.
+// The other shapes below are compared by hand with the Go json tags: api/internal/workersvc/publication_resume.go
 // (PublicationIntentRequest / PublicationIntentResponse), publication_park.go (validatePublicationPark),
 // forge_origin_success.go (ForgeCloneSuccessRequest) and apitypes/publication.go.
 
@@ -31,6 +32,18 @@ const json = (status: number, body: unknown) => new Response(JSON.stringify(body
 const request = () => ({ claim_generation: 4, intent: intent() });
 
 describe("client.registerPublicationIntent", () => {
+  it("accepts the real server's initial enrollment ACK for the local record", async () => {
+    // TestPublicationResumeInitialAckContractLiveDB compares the production reply to this fixture.
+    const ack = JSON.parse(readFileSync(new URL("../../fixtures/publication-intent/initial-ack.json", import.meta.url), "utf8")) as unknown;
+    const { client, sent } = clientWith(() => json(200, ack), ["publication_resume_v1"]);
+    const result = await client.registerPublicationIntent(RUN, request());
+    assert.ok(result.kind === "acked");
+    assert.deepEqual(result, { kind: "acked", enrollment_seq: 1, candidate_seq: 1, state: "active" });
+    const record = parsePublicationRecord({ ...intent(), owner_kind: "issue", enrollment_seq: result.enrollment_seq, candidate_seq: result.candidate_seq }, "issue");
+    assert.equal(record.candidate_seq, 1);
+    assert.equal(sent.length, 1, "the initial ACK needs no retry");
+  });
+
   it("sends nothing without the negotiated feature", async () => {
     const { client, sent } = clientWith(() => json(200, {}), []);
     assert.deepEqual(await client.registerPublicationIntent(RUN, request()), { kind: "unsupported" });
@@ -79,6 +92,7 @@ describe("client.registerPublicationIntent", () => {
       () => json(500, { error: "boom" }),
       () => json(429, {}),
       () => json(200, { enrollment_seq: 0, candidate_seq: 1, state: "active" }),
+      () => json(200, { enrollment_seq: 1, candidate_seq: 0, state: "active" }),
       () => new Response("not json", { status: 200 }),
       () => { throw new Error("socket hang up"); },
     ];
