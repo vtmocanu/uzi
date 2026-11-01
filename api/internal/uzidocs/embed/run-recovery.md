@@ -91,8 +91,9 @@ After a memory park, the parking worker ends its own source use only on
 positive evidence. If it did, Resume lets a fresh worker continue normally from
 the retained work.
 
-A worker whose park was fully settled also sends the server a settlement
-receipt. When the server holds a current receipt for the park, owner **Resume**
+A worker whose park was fully settled can send the server a settlement
+receipt, provided its local receipt table is not full of pending entries.
+When the server holds a current receipt for the park, owner **Resume**
 lets the same worker incarnation (the process that parked, not a restarted one)
 claim the run again, where an ordinary memory park keeps that worker excluded.
 That worker continues only if its own local checks pass: the claim must match its
