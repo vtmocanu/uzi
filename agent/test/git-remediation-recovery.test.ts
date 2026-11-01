@@ -762,3 +762,108 @@ test("worker transformation: callback source or evidence changes and failed CAS 
   assert.ok((await cache.enumerateOwedCandidates(bare, RUN)).some(c => c.sha === s));
   await assert.rejects(cache.readRuntimeRemediationRecovery(bare, BRANCH, source()));
 });
+
+test("source import after transform: ordinary source progress preserves B and immutable roots", async () => {
+  const { s, b, displaced, context } = await transformationFixture();
+  const before = journal().remediationRecovery;
+  assert.equal((await cache.updateRemediationTrackingRef(bare, BRANCH, b, context, source(), s,
+    allowTransformation)).kind, "updated");
+  const pins = pinnedRefs().split("\n");
+  const r = commit("actual ordinary progress", s);
+  await fetch();
+  assert.equal(git(bare, "rev-parse", "refs/uzi-runner/" + BRANCH), r);
+  assert.equal(journal().remediationRecovery.ownedTip, r);
+  assert.deepEqual(journal().remediationRecovery.edges, before.edges);
+  for (const pin of pins) assert.ok(pinnedRefs().split("\n").includes(pin));
+  const owed = await cache.enumerateOwedCandidates(bare, RUN);
+  for (const sha of [b, displaced, s]) assert.ok(owed.some(candidate => candidate.sha === sha));
+  const fresh = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  assert.equal((await fresh.readRuntimeRemediationRecovery(bare, BRANCH, source()))?.ownedTip, r);
+});
+
+test("source import after transform: later trusted finding displaces actual source only", async () => {
+  const { s, b, context } = await transformationFixture();
+  const original = journal().remediationRecovery.edges;
+  assert.equal((await cache.updateRemediationTrackingRef(bare, BRANCH, b, context, source(), s,
+    allowTransformation)).kind, "updated");
+  const d = commit("new source finding", s); await fetch();
+  await cache.recordRemediationScan(bare, BRANCH, source(),
+    { trusted: true, tip: d, flaggedOIDs: [d], origin: "checkpoint-pending" });
+  const grant = journal().remediationRecovery.active;
+  const r = commit("actual second rewrite"); await fetch();
+  const evidence = await cache.readRuntimeRemediationRecovery(bare, BRANCH, source());
+  assert.ok(evidence);
+  assert.deepEqual(evidence.edges.slice(0, -1), original);
+  assert.deepEqual(evidence.edges.at(-1), { from: d, to: r, phase: "committed",
+    context: original[0].context, grant });
+  assert.deepEqual(grant.originSource, source());
+  assert.ok(evidence.edges.every(edge => edge.from !== b && edge.to !== b));
+});
+
+test("source import after transform: crash handoff keeps old D context and producing attempt", async () => {
+  const d = commit("generation one finding"); await fetch(); await enroll();
+  const original = journal().remediationRecovery;
+  const ownership = await cache.committedTrackingOwnership(bare, BRANCH, RUN, d, 1);
+  assert.equal(ownership.kind, "owned");
+  const r = commit("private rewrite before crash");
+  opts = { ...opts, context: { ...opts.context as PositiveOwedCandidateContext, generation: 2 } };
+  await assert.rejects(cache.fetchAgentBranch(bare, clone, BRANCH, RUN,
+    { ...opts, producingSource: { ...source(), attemptId: successorAttempt } }), /source binding/);
+  await assert.rejects(cache.fetchAgentBranch(bare, clone, BRANCH, RUN,
+    { ...opts, producingSource: undefined }), /producing source required/);
+  await fetch();
+  const evidence = await cache.readRuntimeRemediationRecovery(bare, BRANCH, source());
+  assert.ok(evidence);
+  assert.equal(ownership.kind === "owned" && ownership.context.generation, 1);
+  const oldContext = (cache as any).contextName(ownership.kind === "owned" && ownership.context);
+  assert.deepEqual(evidence.edges, [{ from: d, to: r, phase: "committed", context: oldContext,
+    grant: original.active }]);
+  assert.deepEqual(evidence.edges[0]!.grant.originSource, source());
+  assert.equal((await cache.committedTrackingOwnership(bare, BRANCH, RUN, r, 2)).kind, "owned");
+});
+
+test("source import after transform: reconciled S is repinned and ordinary progress needs no S pin", async () => {
+  const { s, b, displaced, context } = await transformationFixture();
+  const before = raw();
+  const reconciled = await cache.reconcileOwedCandidates(bare, RUN, s);
+  assert.ok(reconciled.removedShas.includes(s));
+  assert.ok(reconciled.retainedShas.includes(displaced));
+  assert.equal((await cache.updateRemediationTrackingRef(bare, BRANCH, b,
+    { ...context, remotelyConfirmedSha: s }, source(), s, allowTransformation)).kind, "updated");
+  assert.ok((await cache.enumerateOwedCandidates(bare, RUN)).some(candidate => candidate.sha === s));
+  assert.equal(raw(), before);
+  await cache.reconcileOwedCandidates(bare, RUN, s);
+  assert.ok(!(await cache.enumerateOwedCandidates(bare, RUN)).some(candidate => candidate.sha === s));
+  await fetch(); // Same-S re-observation creates no edge even after independent reconciliation.
+  assert.equal(raw(), before);
+  const next = git(bare, ...IDENT, "commit-tree", s + "^{tree}", "-p", b, "-m", "another safe bridge");
+  assert.equal((await cache.updateRemediationTrackingRef(bare, BRANCH, next, context, source(), s,
+    allowTransformation)).kind, "updated");
+  await cache.reconcileOwedCandidates(bare, RUN, s);
+  const r = commit("ordinary source after repin and reconcile", s); await fetch();
+  assert.equal(journal().remediationRecovery.ownedTip, r);
+  assert.deepEqual(journal().remediationRecovery.edges, JSON.parse(before).remediationRecovery.edges);
+  assert.equal((await cache.readRuntimeRemediationRecovery(bare, BRANCH, source()))?.ownedTip, r);
+});
+
+for (const fault of ["unknown ancestry", "missing source anchor"] as const) {
+  test("source import after transform: divergent import holds on " + fault, async t => {
+    const { s, b, context } = await transformationFixture();
+    assert.equal((await cache.updateRemediationTrackingRef(bare, BRANCH, b, context, source(), s,
+      allowTransformation)).kind, "updated");
+    if (fault === "missing source anchor") await cache.reconcileOwedCandidates(bare, RUN, s);
+    const before = raw(), pins = pinnedRefs().split("\n");
+    const r = commit("private divergent source");
+    if (fault === "unknown ancestry") {
+      const internal = cache as any, ancestry = internal.ancestry.bind(cache);
+      t.mock.method(internal, "ancestry", async (dir: string, from: string, to: string) =>
+        from === s && to === b ? "unknown" : ancestry(dir, from, to));
+    }
+    await assert.rejects(fetch(), /remediation (tracking does not cover source|source preservation unavailable)/);
+    assert.equal(raw(), before);
+    assert.equal(git(bare, "rev-parse", "refs/uzi-runner/" + BRANCH), b);
+    assert.equal(git(clone, "rev-parse", "HEAD"), r);
+    for (const pin of pins) assert.ok(pinnedRefs().split("\n").includes(pin));
+    assert.ok((await cache.enumerateOwedCandidates(bare, RUN)).some(candidate => candidate.sha === r));
+  });
+}

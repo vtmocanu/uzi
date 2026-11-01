@@ -19640,17 +19640,40 @@ try {
         const r = remediation.journal.remediationRecovery;
         if (r) await this.syncJournalAndReadBack(barePath, branch, remediation.raw, {});
         if (r?.edges.some(e => e.phase !== "committed")) throw new Error("remediation edge remains prepared");
-        if (r && r.ownedTip !== observed.sha) throw new Error("remediation observed tip changed");
-        if (r?.active && divergence === "divergent" && observed.sha && observed.owner?.runId === c.runId &&
-            observed.owner.context === this.contextName(c) && displacedContext &&
-            await this.hasOwedAnchorUnderLock(barePath, c.runId, observed.sha) &&
-            await this.ancestry(barePath, r.active.scannedTip, observed.sha) === "ancestor") {
+        let sourceDivergence: "ancestor" | "divergent" | "unknown" | undefined;
+        let sourceContext: StoredOwedContext | undefined;
+        if (r) {
+          // Tracking B proves current custody only. The exact producing source and its
+          // journal-owned S independently determine whether this import displaces execution.
+          if (!observed.sha || observed.owner?.runId !== c.runId || !observed.owner.context ||
+              observed.owner.generation === null || observed.owner.generation === undefined ||
+              await this.worktreeHead(opts.producingSource.clonePath) !== incoming)
+            throw new Error("remediation import ownership or source changed");
+          const ownership = await this.committedTrackingOwnershipUnderLock(barePath, branch, c.runId, observed.sha);
+          if (ownership.kind !== "owned" || this.contextName(ownership.context) !== observed.owner.context)
+            throw new Error("remediation import tracking proof unavailable");
+          if (observed.sha !== r.ownedTip &&
+              await this.ancestry(barePath, r.ownedTip, observed.sha) !== "ancestor")
+            throw new Error("remediation tracking does not cover source");
+          sourceDivergence = await this.ancestry(barePath, r.ownedTip, incoming);
+          if (sourceDivergence === "unknown") throw new Error("remediation source ancestry unavailable");
+          if (sourceDivergence === "divergent") {
+            const anchor = (await this.enumerateOwedUnderLock(barePath, c.runId))
+              .find(candidate => candidate.sha === r.ownedTip);
+            sourceContext = anchor?.contexts.find(context => !("origin" in context) &&
+              context.generation !== null && context.runId === c.runId && context.branch === branch &&
+              (observed.sha !== r.ownedTip || this.contextName(context) === observed.owner!.context));
+            if (!sourceContext) throw new Error("remediation source preservation unavailable");
+          }
+        }
+        if (r?.active && sourceDivergence === "divergent" && sourceContext &&
+            await this.ancestry(barePath, r.active.scannedTip, r.ownedTip) === "ancestor") {
           let reachable = true;
           for (const q of r.active.flaggedOIDs)
             if (await this.ancestry(barePath, q, r.active.scannedTip) !== "ancestor") reachable = false;
           if (reachable) {
-            prepared = { ...r, edges: [...r.edges, { from: observed.sha, to: incoming,
-              grant: r.active, context: this.contextName(c), phase: "prepared" }] };
+            prepared = { ...r, edges: [...r.edges, { from: r.ownedTip, to: incoming,
+              grant: r.active, context: this.contextName(sourceContext), phase: "prepared" }] };
             await this.writeRemediationUnderLock(barePath, branch, remediation, prepared);
             remediation = await this.remediationSourceUnderLock(barePath, branch, opts.producingSource);
           }
