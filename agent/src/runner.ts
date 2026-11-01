@@ -3446,8 +3446,9 @@ export class RunRunner {
    *
    * Only a site whose call can reach a mutating hook (admitSourceUse, beginBareMutation,
    * beginDestructive) needs this. A site whose only hook is assertBareClear does not: that hook is a
-   * read-only load that needs no transaction, so fetchAgentBranch, updateTrackingRef,
-   * retainCurrentOwedCandidate and anchorRecoveryHead run without A.
+   * read-only load that needs no transaction. Legacy imports, updateTrackingRef,
+   * retainCurrentOwedCandidate and anchorRecoveryHead run without A. Attempt-bound imports and
+   * remediation scans hold A outside the bare lock to authenticate their producing source.
    *
    * `wait` bounds the wait for A: pass the caller's signal and the deadline of the surrounding boundary.
    */
