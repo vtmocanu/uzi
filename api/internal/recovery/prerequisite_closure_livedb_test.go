@@ -368,7 +368,9 @@ func TestRecoveryPrerequisiteClosureUploadIntegrityLiveDB(t *testing.T) {
 
 // A pinned closure alone releases nothing: with no FINAL port wired (C2's closure-backed release
 // disabled) the thin FINAL keeps the exact manifest-conflict refusal and custody stays open.
-// The enabled path is covered by TestRecoveryClosureFinal*LiveDB.
+// The enabled path is covered by TestRecoveryClosureFinal*LiveDB here (scripted pin listing) and,
+// with the REAL observer (workersvc port + handler adapter + mw.Limiter + a fake smart-HTTP forge),
+// by TestHandlerPrerequisiteFinal*LiveDB in api/internal/handler/prerequisite_final_wired_livedb_test.go.
 func TestRecoveryPrerequisiteClosurePinnedThinFinalLiveDB(t *testing.T) {
 	e := closureUploadEnv(t)
 	id := e.reserve("pinned-final")

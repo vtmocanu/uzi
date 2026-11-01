@@ -30,6 +30,8 @@ type scriptedFinalPort struct {
 	recordRows                             int64 // -1: use the real query
 	reserves, observes, absences, foreigns int
 	onObserve                              func()
+	block                                  bool  // Observe answers only when its context ends
+	recordErr                              error // RecordAbsence/RecordForeign fail with this
 	passes                                 []uuid.UUID
 }
 
@@ -74,6 +76,10 @@ func (p *scriptedFinalPort) Observe(ctx context.Context, row store.RecoveryPrere
 	if hook != nil {
 		hook()
 	}
+	if p.block {
+		<-ctx.Done()
+		return PrerequisiteFinalUnknown, ctx.Err()
+	}
 	if ctx.Err() != nil {
 		return PrerequisiteFinalUnknown, ctx.Err()
 	}
@@ -83,8 +89,11 @@ func (p *scriptedFinalPort) Observe(ctx context.Context, row store.RecoveryPrere
 func (p *scriptedFinalPort) RecordAbsence(ctx context.Context, row store.RecoveryPrerequisiteClosure, pass uuid.UUID) (int64, error) {
 	p.mu.Lock()
 	p.absences++
-	rows := p.recordRows
+	rows, rerr := p.recordRows, p.recordErr
 	p.mu.Unlock()
+	if rerr != nil {
+		return 0, rerr
+	}
 	if rows >= 0 {
 		return rows, nil
 	}
@@ -95,8 +104,11 @@ func (p *scriptedFinalPort) RecordAbsence(ctx context.Context, row store.Recover
 func (p *scriptedFinalPort) RecordForeign(ctx context.Context, row store.RecoveryPrerequisiteClosure, pass uuid.UUID) (int64, error) {
 	p.mu.Lock()
 	p.foreigns++
-	rows := p.recordRows
+	rows, rerr := p.recordRows, p.recordErr
 	p.mu.Unlock()
+	if rerr != nil {
+		return 0, rerr
+	}
 	if rows >= 0 {
 		return rows, nil
 	}
@@ -669,16 +681,19 @@ func TestRecoveryClosureFinalStateChangedAfterListingLiveDB(t *testing.T) {
 	// Closure rows and their capture foreign keys outlive a test, and other tests in this package
 	// wipe whole tables: own a database per top-level test.
 	isolateClosureUploadDatabase(t)
-	t.Run("run parked owner-only after the listing", func(t *testing.T) {
-		fx := newClosureFinalFx(t, "pinned")
-		fx.svc.finalClosureHook = func(s string) {
-			if s == "observed" {
-				fx.exec("UPDATE runs SET claim_generation=2,worker_id=NULL,status='recovery_wait',recovery_wait_cause='worker_requeue_exhausted' WHERE id=$1", fx.run)
+	// Every owner-only cause that appears after the listing refuses the release.
+	for _, cause := range []string{"worker_requeue_exhausted", "worker_memory_pressure", "retained_recovery_exhausted", "retained_recovery_adoption_failed"} {
+		t.Run("run parked "+cause+" after the listing", func(t *testing.T) {
+			fx := newClosureFinalFx(t, "pinned")
+			fx.svc.finalClosureHook = func(s string) {
+				if s == "observed" {
+					fx.exec("UPDATE runs SET claim_generation=2,worker_id=NULL,status='recovery_wait',recovery_wait_cause=$2 WHERE id=$1", fx.run, cause)
+				}
 			}
-		}
-		fx.reject(fx.w, fx.request(fx.capture), ErrNotAuthorized)
-		fx.assertOpen()
-	})
+			fx.reject(fx.w, fx.request(fx.capture), ErrNotAuthorized)
+			fx.assertOpen()
+		})
+	}
 	t.Run("capability removed after the listing", func(t *testing.T) {
 		fx := newClosureFinalFx(t, "pinned")
 		fx.svc.finalClosureHook = func(s string) {
@@ -733,13 +748,18 @@ func TestRecoveryClosureFinalDiagnosticsLeakNothingLiveDB(t *testing.T) {
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
-	for _, name := range []string{"observe", "reserve"} {
+	for _, name := range []string{"observe", "reserve", "record absence", "record foreign"} {
 		t.Run(name, func(t *testing.T) {
 			fx := newClosureFinalFx(t, "pinned")
-			if name == "observe" {
+			switch name {
+			case "observe":
 				fx.port.obsErr = errors.New(secret)
-			} else {
+			case "reserve":
 				fx.port.reserveErr = errors.New(secret)
+			case "record absence":
+				fx.port.obs, fx.port.recordErr = PrerequisiteFinalAbsent, errors.New(secret)
+			case "record foreign":
+				fx.port.obs, fx.port.recordErr = PrerequisiteFinalForeign, errors.New(secret)
 			}
 			ack, err := fx.release(fx.w, fx.request(fx.capture))
 			if !errors.Is(err, ErrPrerequisitePinUnavailable) {
@@ -795,14 +815,14 @@ func TestRecoveryClosureFinalBoundsLiveDB(t *testing.T) {
 	// Closure rows and their capture foreign keys outlive a test, and other tests in this package
 	// wipe whole tables: own a database per top-level test.
 	isolateClosureUploadDatabase(t)
-	// A port that never answers cannot hold the request past its enforced 6s bound, and the
-	// stall is neither an absence nor a release.
+	// A port that only answers when its context ends cannot hold the request past its enforced
+	// 6s bound, and the stall is neither an absence nor a release.
 	fx := newClosureFinalFx(t, "pinned")
-	fx.port.onObserve = func() { time.Sleep(finalClosureBudget + time.Second) }
+	fx.port.block = true
 	start := time.Now()
 	fx.reject(fx.w, fx.request(fx.capture), ErrPrerequisitePinUnavailable)
-	if d := time.Since(start); d > finalClosureBudget+3*time.Second {
-		t.Fatalf("request took %v", d)
+	if d := time.Since(start); d < finalClosureBudget-time.Second || d > finalClosureBudget+500*time.Millisecond {
+		t.Fatalf("request took %v, want the %v budget plus a small margin", d, finalClosureBudget)
 	}
 	fx.assertOpen()
 	if fx.closure().AbsentSince.Valid {

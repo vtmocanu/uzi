@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -87,6 +88,20 @@ func finalStmt(ctx context.Context, fn func(context.Context) error) error {
 	return fn(c)
 }
 
+// finalClosureUnavailable reports an error that decided nothing about the request: a deadline,
+// a cancellation or a lock wait that PostgreSQL gave up on (SQLSTATE 55P03, lock_not_available).
+// All of them are a retryable 503, never a 500.
+func finalClosureUnavailable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		(errors.As(err, &pgErr) && pgErr.Code == "55P03")
+}
+
+// finalClosureLockTimeout is the server-side bound on every lock wait of the locked commit.
+// The 500ms client deadline alone only closes the socket: the backend would keep waiting, and
+// keep holding the locks it already took, until the blocker released.
+const finalClosureLockTimeout = "SET LOCAL lock_timeout = '500ms'"
+
 // finalClosureView is what the unlocked precheck proved.
 type finalClosureView struct {
 	hold store.RecoveryCustodyHold
@@ -119,6 +134,16 @@ func finalClosureCaptureOK(cap store.RecoveryCapture, f *apitypes.RecoveryFinalD
 // refusals a thin FINAL gets before it may spend an admission. A non-nil ack is an exact replay.
 // Every refusal here is final for this request except the typed pin_missing.
 func (s *Service) finalClosurePrecheck(ctx context.Context, wkr store.Worker, runID uuid.UUID,
+	req apitypes.RecoveryReleaseRequest, captureID uuid.UUID) (finalClosureView, *apitypes.RecoveryReleaseResponse, error) {
+	v, ack, err := s.finalClosureRead(ctx, wkr, runID, req, captureID)
+	if err != nil && finalClosureUnavailable(err) {
+		// A deadline, cancellation or lock wait decided nothing about the request: retryable.
+		err = ErrPrerequisitePinUnavailable
+	}
+	return v, ack, err
+}
+
+func (s *Service) finalClosureRead(ctx context.Context, wkr store.Worker, runID uuid.UUID,
 	req apitypes.RecoveryReleaseRequest, captureID uuid.UUID) (finalClosureView, *apitypes.RecoveryReleaseResponse, error) {
 	f := req.FinalDisposition
 	generation := *req.Generation
@@ -234,6 +259,11 @@ func (s *Service) releaseFinalClosure(ctx context.Context, wkr store.Worker, run
 	if !s.prereqFinalAllow(wkr.ID) {
 		return apitypes.RecoveryReleaseResponse{}, ErrPrerequisitePinUnavailable
 	}
+	// A request too late to fit the listing window must not supersede an audit pass: decide
+	// before the reservation moves the closure's listing fence.
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) < finalClosureListReserve {
+		return apitypes.RecoveryReleaseResponse{}, ErrPrerequisitePinUnavailable
+	}
 	pass := uuid.New()
 	reserved, err := s.prereqFinal.Reserve(ctx, view.row, pass)
 	if err != nil {
@@ -253,9 +283,6 @@ func (s *Service) releaseFinalClosure(ctx context.Context, wkr store.Worker, run
 		}
 		return apitypes.RecoveryReleaseResponse{}, ErrPrerequisitePinUnavailable
 	}
-	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) < finalClosureListReserve {
-		return apitypes.RecoveryReleaseResponse{}, ErrPrerequisitePinUnavailable
-	}
 	obs, err := s.prereqFinal.Observe(ctx, view.row)
 	if err != nil {
 		slog.Warn("closure final: pin listing failed", "run", runID)
@@ -268,8 +295,8 @@ func (s *Service) releaseFinalClosure(ctx context.Context, wkr store.Worker, run
 	switch obs {
 	case PrerequisiteFinalPresent:
 		resp, err := s.finalClosureCommit(ctx, wkr, runID, req, view, pass)
-		if err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
-			// A timeout before the commit decided nothing: retry, never a 500.
+		if err != nil && finalClosureUnavailable(err) {
+			// A timeout or lock wait before the commit decided nothing: retry, never a 500.
 			err = ErrPrerequisitePinUnavailable
 		}
 		return resp, err
@@ -315,6 +342,11 @@ func (s *Service) finalClosureCommit(ctx context.Context, wkr store.Worker, runI
 		defer cancel()
 		_ = tx.Rollback(c)
 	}()
+	// First statement: bound every lock wait on the server, so a blocked request ends its own
+	// backend (and the locks it holds) instead of waiting on after the client gave up.
+	if err := finalStmt(ctx, func(c context.Context) error { _, err := tx.Exec(c, finalClosureLockTimeout); return err }); err != nil {
+		return apitypes.RecoveryReleaseResponse{}, err
+	}
 	notFound := func(err error) error {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotAuthorized

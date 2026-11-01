@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -11,7 +12,7 @@ const closureGuardEnd = "-- +goose StatementEnd"
 
 func closureMigrationText(t *testing.T, name string) string {
 	t.Helper()
-	b, err := os.ReadFile("migrations/" + name)
+	b, err := os.ReadFile(filepath.Join("migrations", name)) //nolint:gosec // G304: test reads a repo-local migration file by fixed name under migrations/, not user input
 	if err != nil {
 		t.Fatal(err)
 	}

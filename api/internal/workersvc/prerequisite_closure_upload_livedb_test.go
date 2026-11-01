@@ -172,7 +172,10 @@ func TestPrerequisiteUploadKicksBrokerOnceLiveDB(t *testing.T) {
 				t.Fatalf("rows=%d markers=%d sends=%d deletes=%d tip=%s kicks=%d admitted=%d", rows, markers, sends, deletes, tip, kicks.Load(), admitted.Load())
 			}
 			// Pinning prerequisites never makes a thin archive a self-contained FINAL, and with no
-			// closure FINAL port wired on this service the release stays the exact refusal.
+			// closure FINAL port wired on this service the release stays the exact refusal. The sibling
+			// wired-port positive (real workersvc port, handler adapter and limiter, fake smart-HTTP
+			// forge) is TestHandlerPrerequisiteFinalPositiveLiveDB in
+			// api/internal/handler/prerequisite_final_wired_livedb_test.go.
 			if _, err := r.svc.Release(ctx, r.worker, f.m.row.RunID, r.final); !errors.Is(err, recovery.ErrManifestConflict) {
 				t.Fatalf("thin FINAL: %v", err)
 			}

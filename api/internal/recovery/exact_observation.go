@@ -78,7 +78,8 @@ func validExactClosedObservation(out apitypes.RecoveryExactHold, owner uuid.UUID
 		}
 		// An archive FINAL is evidenced by "archive" or, for a thin capture released against its
 		// pinned closure, "prerequisite_closure"; every other kind is evidenced by its own name.
-		if out.ReleaseEvidence != f.Kind && !(f.Kind == "archive" && out.ReleaseEvidence == "prerequisite_closure") {
+		closureArchive := f.Kind == "archive" && out.ReleaseEvidence == "prerequisite_closure"
+		if out.ReleaseEvidence != f.Kind && !closureArchive {
 			return false
 		}
 		if f.Kind == "held_publication" {

@@ -42,7 +42,7 @@ func (s *Service) PrerequisiteFinalReserve(ctx context.Context, row store.Recove
 	c, cancel := context.WithTimeout(ctx, prerequisiteDBTimeout)
 	defer cancel()
 	reserved := false
-	err := s.prerequisiteTx(c, func(tx PrerequisiteStore) error {
+	err := s.prerequisiteFinalTx(c, func(tx PrerequisiteStore) error {
 		r, ok := tx.(prerequisiteFinalReserver)
 		if !ok {
 			return errors.New("prerequisite final: reservation unavailable")
@@ -96,13 +96,42 @@ func (s *Service) PrerequisiteFinalObserve(ctx context.Context, row store.Recove
 	return PrerequisiteFinalPresent, nil
 }
 
+// prerequisiteFinalTx is prerequisiteTx with the server-side lock bound as its first statement:
+// the 500ms client deadline only closes the socket, while the backend would keep waiting (and
+// keep holding the locks it already took) until the blocker released. An injected transaction
+// hook (tests) is used unchanged.
+func (s *Service) prerequisiteFinalTx(ctx context.Context, fn func(PrerequisiteStore) error) error {
+	if s.prerequisite.transaction != nil {
+		return s.prerequisiteTx(ctx, fn)
+	}
+	if s.txBeginner == nil {
+		return errors.New("prerequisite: transactions unavailable")
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), 500*time.Millisecond)
+		defer cancel()
+		_ = tx.Rollback(c)
+	}()
+	if _, err = tx.Exec(ctx, "SET LOCAL lock_timeout = '500ms'"); err != nil {
+		return err
+	}
+	if err = fn(store.New(tx)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // prerequisiteFinalOutcome runs one listing outcome under capture then closure locks, bounded
 // by the request context and a 1.5s cap (never a detached context).
 func (s *Service) prerequisiteFinalOutcome(ctx context.Context, row store.RecoveryPrerequisiteClosure, fn func(context.Context, PrerequisiteStore) (int64, error)) (int64, error) {
 	w, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	defer cancel()
 	var n int64
-	err := s.prerequisiteTx(w, func(tx PrerequisiteStore) error {
+	err := s.prerequisiteFinalTx(w, func(tx PrerequisiteStore) error {
 		if _, e := tx.LockPrerequisiteCapture(w, row.CaptureID); e != nil {
 			return e
 		}
