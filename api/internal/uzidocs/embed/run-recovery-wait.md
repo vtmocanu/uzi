@@ -511,8 +511,9 @@ are not covered: description publish, title read/write and PR-head verify.
 Before any remote finalize step, the worker saves a local record and enrolls
 it with the API (`POST /api/worker/runs/{id}/publication-intent`). The local
 file is `publication-<G>.json` in the worker outbox, sealed with an HMAC
-(domain `uzi.outbox.publication.v1`), at most 64 KiB, and carries neither
-credentials nor filesystem paths. The server copy lives in a side table,
+(domain `uzi.outbox.publication.v1`), and carries neither credentials nor
+filesystem paths. The intent is at most 64 KiB; the sealed local record,
+which adds the sequence numbers and the MAC, may be up to 1 KiB larger. The server copy lives in a side table,
 `run_publication_resume`. Only an acknowledged enrollment lets the remote
 steps run:
 
@@ -610,23 +611,28 @@ that negotiated it; a Git success does not clear it.
   badge and a panel on the run page that names the reason and the actions.
 - **Slack:** one wait line per owner episode, one line per hold, and a
   resume line only after an owner Resume of a hold. See
-  [Slack](slack.md#publication-waits-and-holds).
+  [Slack](slack.md#using-it).
 
 ### Deployment and rollback
 
 Writers opt in with the database setting `uzi.publication_resume_api='v1'`
 and the worker capability `publication_resume_v1`; an older API lacks the
-setting and its writes to an enrolled run abort. The migration's Down refuses
+setting, so its write to an enrolled run aborts when it changes the run's
+worker or claim generation, re-opens a released claim, or moves the status
+into claimed, running or an awaiting state. The migration's Down refuses
 while enrolled rows exist. `RUN_PUBLICATION_RESUME_ENABLED` (default on) only
 stops advertising the feature and refuses new enrollment; existing intents
 keep their meaning.
 
 Before rolling the API back, convert enrolled queued runs and timed
 publication waits to NULL holds. Accepted costs of a rollback: an older API
-aborts on enrolled runs, and its owner Resume queues a NULL hold rather than
-a publication-only episode. Mixed-version residual: an older API's
-clone-success path or the earlier cooldown trigger can delete a shared
-cooldown row. See [ADR-1392](../adr/1392-forge-unreachable-preclone-park.md).
+aborts on enrolled runs, and its owner Resume re-queues the held run as an
+ordinary attempt rather than a publication-only episode; the older API cannot
+then claim it (the guard aborts the claim's worker/generation write), and after
+roll-forward the unreset wait clock can re-hold it at the next park.
+Mixed-version residual: an older API's clone-success path deletes a shared
+cooldown row without checking the API flag. After a 00387 schema rollback, API
+evidence on a shared row is lost, because that Down drops the flag columns. See [ADR-1392](../adr/1392-forge-unreachable-preclone-park.md).
 
 Not covered: the post-merge-request hops listed above, probes, new run
 states or credentials, and any guarantee of execution after Resume (cooldown,

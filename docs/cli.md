@@ -3484,8 +3484,9 @@ for both harnesses, verified-capture limits and mixed-fleet compatibility.
 
 A `recovery_wait` / `forge_unreachable` run whose `recovery_wait_phase` is
 `publication` met a sustained forge outage while publishing finished work.
-`uzi run get`, `--follow`, the board and the TUI detail header share one
-line:
+`uzi run get`, `--follow` and the TUI detail header share one line (the TUI
+board row for an owner hold is shorter: `Publishing held · Resume
+(publication-only)/Cancel · detail: enter`):
 
 - Timed wait: `publishing paused: forge unreachable; waiting 12m of 24h,
   retry at 15:04`, or `waiting 12m, no limit` when

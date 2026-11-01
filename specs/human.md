@@ -1598,7 +1598,7 @@ PRD at `prds/done/3522-weekly-usage-reserve.md`.
 
 Tracked as GitHub issue vtmocanu/uzi#1324. No PRD is linked; the decisions are in the 2026-11-01 amendments to [ADR-1392](../adr/1392-forge-unreachable-preclone-park.md) and [ADR-1742](../adr/1742-finalize-resume-allowance.md).
 
-- A run whose publication (base refresh, push, or merge/pull request create) hits a sustained forge outage parks and keeps its finished work, then resumes publication-only with zero model work. Permanent failures (auth, history proofs, local git errors) still fail as before. An owner Resume on a publication hold queues one publication-only episode and grants no other budget. See [Forge unreachable while publishing](../docs/run-recovery-wait.md#forge-unreachable-while-publishing). (AI-synced 2026-11-01)
+- A run whose publication (base refresh, push, or merge/pull request create) hits a sustained forge outage parks (when its publication intent is enrolled; an unenrolled run fails with `publication_forge_unreachable`) and keeps its finished work, then resumes publication-only with zero model work. Permanent failures (auth, history proofs, local git errors) still fail as before. An owner Resume on a publication hold queues one publication-only episode and grants no other budget. See [Forge unreachable while publishing](../docs/run-recovery-wait.md#forge-unreachable-while-publishing). (AI-synced 2026-11-01)
 
 ## Deferred (user, "later stuff")
 

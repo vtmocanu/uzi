@@ -739,8 +739,9 @@ unchanged for a run without such a record.
   `publication-<G>.json`, sealed under its own MAC domain
   `uzi.outbox.publication.v1`, distinct from `uzi.outbox.finalize.v1` and
   `uzi.outbox.terminal.v1`, so a record of one kind can never authenticate as
-  another. It is at most 64 KiB and carries no credentials or filesystem
-  paths. The owner kind (`task` or issue-style) is sealed in the envelope, not
+  another. The intent is at most 64 KiB (the sealed local record, with its
+  sequence numbers and MAC, up to 1 KiB more) and carries no credentials or
+  filesystem paths. The owner kind (`task` or issue-style) is sealed in the envelope, not
   taken from the body being validated.
 - **Enrollment.** Before any remote finalize step the worker saves the local
   record, then enrolls it with `POST /api/worker/runs/{id}/publication-intent`

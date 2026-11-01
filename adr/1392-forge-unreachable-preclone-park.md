@@ -243,13 +243,19 @@ current half-open run and generation success; a Git success does not clear it.
 
 Writers opt in with the setting `uzi.publication_resume_api='v1'` plus the
 worker capability `publication_resume_v1` (the pattern of [ADR-3343](3343-task-checkpoint-coordinates.md)), so an older
-API aborts on enrolled runs. The 00386 Down refuses while enrolled rows exist.
+API's write to an enrolled run aborts when it changes the worker or claim
+generation, re-opens a released claim, or moves the status into claimed,
+running or an awaiting state. The 00386 Down refuses while enrolled rows exist.
 `RUN_PUBLICATION_RESUME_ENABLED` (default on) stops advertising and new
 enrollment only. Runbook: before an API rollback, convert enrolled queued runs
-and timed waits to NULL holds. Accepted costs: an older API aborts on enrolled
-runs, and its owner Resume queues a NULL hold. Residuals: in a mixed-version
-fleet an older API's clone-success path or the 00385 trigger deletes a shared
-cooldown row; and the #3585 legacy extra-attempt residual above (an older API's
+and timed waits to NULL holds. Accepted costs: an older API aborts on those
+writes, and its owner Resume re-queues the held run as an ordinary attempt, not a
+publication-only episode; the older API cannot then claim it, and after
+roll-forward the unreset wait clock can re-hold it at the next park. Residuals:
+in a mixed-version fleet an older API's clone-success path deletes a shared
+cooldown row without checking the API flag, and after a 00387 schema rollback
+API evidence on a shared row is lost because that Down drops the flag columns;
+and the #3585 legacy extra-attempt residual above (an older API's
 `set-token` promoter queuing one extra attempt against a NULL hold) is unchanged.
 
 ### Verification boundary
