@@ -205,7 +205,7 @@ func (h *Handler) WorkerListRecoveryHolds(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	if values, requested := r.URL.Query()["generation"]; requested && slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV2) {
+	if values, requested := r.URL.Query()["generation"]; requested && (slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV2) || slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryBindinglessClosedV1)) {
 		// The additive read is capability gated, but not governed by the write switch.
 		response := apitypes.RecoveryExactHoldsResponse{RunID: runID.String(), Holds: []apitypes.RecoveryHoldDTO{}}
 		if len(values) == 1 {
@@ -217,6 +217,12 @@ func (h *Handler) WorkerListRecoveryHolds(w http.ResponseWriter, r *http.Request
 					return
 				}
 			}
+		}
+		if slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryBindinglessClosedV1) {
+			// Registration negotiation alone cannot identify an older API instance serving
+			// this read during a mixed-version rollout. Echo the explicit guarantee;
+			// clients must require both it and the negotiated feature, never JSON shape.
+			w.Header().Set("Uzi-Recovery-Observation", capability.RecoveryBindinglessClosedV1)
 		}
 		httpx.JSON(w, http.StatusOK, response)
 		return
