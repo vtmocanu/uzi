@@ -4455,6 +4455,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 	if err != nil {
 		return store.Run{}, false, err
 	}
+	if owned.Status == "paused" && owned.HoldReason.String == IterationBudgetExhausted {
+		return owned, false, nil
+	}
 	if err := validateCappedReportOnly(owned, req); err != nil {
 		return owned, false, err
 	}
@@ -4704,6 +4707,9 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// released this claim. Return the LOCKED row so the handler can render it beside the
 			// stale_claim disposition. The deferred Rollback releases the lock.
 			return locked, false, ErrStaleClaim
+		}
+		if locked.Status == "paused" && locked.HoldReason.String == IterationBudgetExhausted {
+			return locked, false, nil
 		}
 		if req.ExpectedGateRevision != nil && locked.StopKind.String != "cancelled" {
 			if !gateReportAdmissible(locked.Status) {

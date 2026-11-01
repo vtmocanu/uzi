@@ -942,6 +942,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			RunTimeoutSeconds:      coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds())) + int(run.BudgetExtensionSeconds) + int(run.BudgetFinalizeSeconds),
 			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
 			TaskIdleTimeoutSeconds: taskIdleTimeoutSeconds,
+			IterationParkVersion:   1,
 			MaxIterations:          coalesceInt(run.BudgetMaxIterations, s.p.RunMaxIterations),
 			PlanMaxRevisions:       s.p.PlanMaxRevisions,
 			QuestionMax:            s.p.QuestionMax,

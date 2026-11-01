@@ -1238,6 +1238,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// three-term deadline. paused = parked (clean up), anything else = the owner extended in the
 		// window, restart the turn. Mirrors the completion/hold ack contract.
 		r.Post("/runs/{id}/wall-park", h.WorkerRunWallPark)
+		r.Post("/runs/{id}/iteration-park", h.WorkerRunIterationPark)
 		r.Post("/runs/{id}/pause", h.WorkerRunPause)
 		// issue #3194: the --require-base base-attestation HOLD. The worker's preflight guard found
 		// retained work no checkpoint attests; the service parks its own live claim (running ->

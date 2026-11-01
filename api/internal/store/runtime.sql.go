@@ -684,6 +684,7 @@ const cancelRunByWorker = `-- name: CancelRunByWorker :execrows
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = $1 AND runs.worker_id = $2 AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
 ), parent_mapping AS MATERIALIZED (
@@ -725,6 +726,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE runs.id = $1 AND runs.worker_id = $2 AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
@@ -9208,6 +9210,19 @@ func (q *Queries) InvalidatePriorCompletionPermits(ctx context.Context, arg Inva
 	return result.RowsAffected(), nil
 }
 
+const iterationParkHasPendingControl = `-- name: IterationParkHasPendingControl :one
+SELECT EXISTS (SELECT 1 FROM run_user_inputs WHERE run_id = $1
+    AND kind IN ('stop', 'cancel') AND applied_at IS NULL
+    AND disposition IS DISTINCT FROM 'superseded')::boolean
+`
+
+func (q *Queries) IterationParkHasPendingControl(ctx context.Context, runID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, iterationParkHasPendingControl, runID)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const latestPersistedPlanFrameAtForRun = `-- name: LatestPersistedPlanFrameAtForRun :one
 SELECT MAX(created_at)::timestamptz AS at
 FROM run_messages
@@ -16775,6 +16790,7 @@ WITH ins AS (
     SELECT r.id, $9, $3::jsonb, $4, $5
     FROM runs r
     WHERE r.id = $6 AND r.worker_id = $7 AND (r.kind <> 'cross_check' OR r.claim_generation > 0) AND r.completion_contract_version IS NOT NULL
+      AND NOT (r.status = 'paused' AND COALESCE(r.hold_reason = 'iteration_budget_exhausted', FALSE))
       -- PRD #1247 M5: the per-query generation fence, the SAME nil-guarded shape as InsertRunMessage.
       -- A CAPABILITY worker stamps claim_generation; a STALE attempt from an OLD flight (its claim
       -- RELEASED by a held-state switch, or SUPERSEDED by a reclaim) inserts NOTHING here, so with the
@@ -16833,6 +16849,7 @@ UPDATE runs SET
     ),
     updated_at = now()
 WHERE runs.id = $6 AND runs.worker_id = $7 AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0) AND runs.completion_contract_version IS NOT NULL
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
   AND EXISTS (SELECT 1 FROM ins)
   -- PRD #1247 M5: mirror the ins CTE's generation fence on the counter/summary UPDATE too, so a
   -- fenced-out attempt updates NOTHING as well as inserting nothing (0 rows -> pgx.ErrNoRows ->
@@ -16923,6 +16940,35 @@ func (q *Queries) RecordCompletionAttempt(ctx context.Context, arg RecordComplet
 	var completion_attempts int32
 	err := row.Scan(&completion_attempts)
 	return completion_attempts, err
+}
+
+const recordIterationParkCapturedHead = `-- name: RecordIterationParkCapturedHead :execrows
+UPDATE runs SET hold_captured_head = $1, updated_at = now()
+WHERE id = $2 AND worker_id = $3
+  AND claim_generation = $4::bigint
+  AND claim_released_at IS NULL AND status = 'paused'
+  AND hold_reason = 'iteration_budget_exhausted' AND hold_captured_head IS NULL
+`
+
+type RecordIterationParkCapturedHeadParams struct {
+	Head            pgtype.Text `json:"head"`
+	ID              uuid.UUID   `json:"id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration int64       `json:"claim_generation"`
+}
+
+// Add a missing head once; iteration parks never admit released flights.
+func (q *Queries) RecordIterationParkCapturedHead(ctx context.Context, arg RecordIterationParkCapturedHeadParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordIterationParkCapturedHead,
+		arg.Head,
+		arg.ID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const recordPlanCrossCheckClaim = `-- name: RecordPlanCrossCheckClaim :one
@@ -20958,6 +21004,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $3 AND worker_id = $4 AND (kind <> 'cross_check' OR claim_generation > 0)
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'iteration_budget_exhausted', FALSE))
   AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- PRD #1733: a late report from the parking flight must not turn an owner-facing provider hold
@@ -21021,6 +21068,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = $4 AND worker_id = $5 AND (kind <> 'cross_check' OR claim_generation > 0)
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'iteration_budget_exhausted', FALSE))
   AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- PRD #1733: a late report from the parking flight must not turn an owner-facing provider hold
@@ -21215,6 +21263,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE runs.id = $12 AND runs.worker_id = $13 AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
   AND ($1::text IS NULL OR runs.claim_generation = $14::bigint)
   -- PRD #1497 M1 (DEVIATION-3): a legacy (nil-generation, non-interlocked) ` + "`" + `completed` + "`" + ` from an
   -- old flight must never complete a run the wall-park sweep just server-parked. ParkRunsAtWall
@@ -21686,6 +21735,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = $5 AND worker_id = $6 AND (kind <> 'cross_check' OR claim_generation > 0)
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'iteration_budget_exhausted', FALSE))
   AND status NOT IN ('completed', 'failed', 'cancelled')
   AND status <> 'paused'
   -- All paused runs are protected above. Retain provider protection through
@@ -21761,6 +21811,7 @@ WITH failed AS (
         health = 'ok', health_reason = NULL, health_since = NULL,
         updated_at         = now()
     WHERE runs.id = $5 AND worker_id = $6
+      AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
       AND status NOT IN ('completed', 'failed', 'cancelled')
       AND status <> 'paused'
       -- All paused runs are protected above. Retain provider protection through
@@ -21910,6 +21961,69 @@ func (q *Queries) SetRunIntentSummary(ctx context.Context, arg SetRunIntentSumma
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const setRunIterationPark = `-- name: SetRunIterationPark :one
+WITH parked AS (
+    UPDATE runs SET status = 'paused', status_since = now(),
+        hold_reason = 'iteration_budget_exhausted',
+        hold_captured_head = $1,
+        pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+        health = 'ok', health_reason = NULL, health_since = NULL, updated_at = now()
+    WHERE runs.id = $2 AND runs.worker_id = $3
+      AND runs.claim_generation = $4::bigint
+      AND $4::bigint > 0
+      AND runs.claim_released_at IS NULL AND runs.status = 'running'
+      AND runs.completion_attempts = 0
+      AND runs.kind IN ('issue', 'mr_rework', 'ci_fix', 'task', 'prompt', 'self_improve')
+      AND NOT runs.interactive AND runs.review_target_run_id IS NULL
+      AND runs.egress_profile_id IS NULL
+      AND COALESCE(runs.budget_max_iterations, $5::int) = $6::int
+      AND $6::int > 0
+      AND $7::int >= $6::int
+      AND $7::bigint <= $6::bigint + 1
+      AND COALESCE(runs.stop_kind, '') = ''
+      AND runs.credential_switch_requested_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM run_user_inputs i WHERE i.run_id = runs.id
+          AND i.kind IN ('stop', 'cancel') AND i.applied_at IS NULL
+          AND i.disposition IS DISTINCT FROM 'superseded')
+    RETURNING runs.id, runs.user_id, runs.repo_id, runs.issue_iid, runs.issue_title, runs.issue_description, runs.status, runs.requeue_count, runs.worker_id, runs.session_id, runs.last_seq, runs.branch, runs.mr_iid, runs.failure_reason, runs.plan_md, runs.iteration_count, runs.claimed_at, runs.started_at, runs.finished_at, runs.created_at, runs.updated_at, runs.origin_column, runs.board_column, runs.move_pending_since, runs.mr_state, runs.auto_approve, runs.autopilot_commented_at, runs.kind, runs.pipeline_id, runs.pipeline_ref, runs.failure_snapshot, runs.fix_verdict, runs.stop_kind, runs.agent_source, runs.agent_exclusions, runs.repo_agents, runs.title, runs.resume_of_run_id, runs.last_activity_at, runs.health, runs.health_reason, runs.health_since, runs.health_notified_at, runs.target_run_id, runs.mr_web_url, runs.prd_done_path, runs.prd_patch_settled_at, runs.anthropic_secret_id, runs.anthropic_secret_label, runs.anthropic_select_reason, runs.anthropic_headroom_pct, runs.wait_on_limit, runs.limit_resets_at, runs.retry_not_before, runs.limit_wait_count, runs.rate_limit_type, runs.open_question_id, runs.revise_count, runs.plan_source, runs.planned_base_commit, runs.require_base_match, runs.milestones_candidate, runs.milestones_frozen, runs.milestones_completed, runs.milestones_in_progress, runs.budget_max_iterations, runs.budget_wall_seconds, runs.schedule_id, runs.limit_dead_secret_id, runs.report_only, runs.report_md, runs.ci_config_paths, runs.model, runs.override_subagent_model, runs.fail_origin, runs.priority, runs.summary_intent, runs.summary_plan, runs.summary_deltas, runs.issue_comments, runs.base_branch, runs.open_mr, runs.dispatched_at, runs.review_target_run_id, runs.review_requested, runs.then_fix_requested, runs.then_fix_of_run_id, runs.preserved_patch, runs.required_capabilities, runs.stop_reason, runs.required_tools, runs.size_class, runs.interactive, runs.open_followup_id, runs.plan_changed_files, runs.scope_ceiling, runs.status_since, runs.review_comments, runs.budget_paused_seconds, runs.mr_rework_enabled, runs.trigger_source, runs.checkpoint_tip, runs.usage_refolded, runs.codex_secret_id, runs.codex_auth_mode, runs.codex_secret_label, runs.codex_account_key, runs.codex_material_revision, runs.codex_account_revision, runs.codex_claim_epoch, runs.codex_cap_hash, runs.pause_requested_at, runs.pause_mode, runs.pause_after_count, runs.checkpoint_tip_at, runs.recovery_wait_count, runs.recovery_retry_not_before, runs.completion_contract_version, runs.contract_revision, runs.completion_contract, runs.completion_attempts, runs.latest_completion_attempt, runs.milestones_agents, runs.hold_reason, runs.hold_captured_head, runs.completion_budget_exhausted_at, runs.completion_question_at, runs.budget_extension_seconds, runs.claim_generation, runs.harness, runs.recovery_wait_cause, runs.forge_park_count, runs.credential_override_mode, runs.credential_override_secret_id, runs.claim_released_at, runs.credential_switch_requested_at, runs.credential_switch_generation, runs.stale_requeue_generation, runs.budget_finalize_seconds, runs.released_worker_id, runs.released_worker_nonce, runs.gate_revision, runs.gate_presentation_id, runs.gate_presented_payload, runs.gate_payload_digest, runs.gate_refusal_count, runs.gate_refusal_generation, runs.disk_park_count, runs.checkpoint_contains_latest, runs.egress_profile_id, runs.egress_snapshot, runs.job_type, runs.finalize_resume_generation, runs.job_protocol, runs.first_started_at, runs.plan_cross_check_required, runs.plan_cross_check_gate_reason, runs.issue_raw_digest, runs.issue_saved_body, runs.issue_input_reason, runs.auto_approve_blocked_reasons, runs.plan_cross_check_diff_refusal, runs.worker_recovery_episode, runs.requeue_episode_baseline, runs.worker_recovery_evidence, runs.cross_check_lane, runs.cross_check_lane_generation, runs.completion_final_head, runs.code_cross_check_required, runs.provider_park_count, runs.provider_park_streak_started_at, runs.ci_config_guard, runs.memory_episode, runs.memory_intervention_count, runs.memory_policy, runs.completion_non_closing_reason, runs.ci_artifact_manifest, runs.checkpoint_attested_source, runs.source_publication_intent, runs.continued_issue_iid, runs.checkpoint_coordinates, runs.retained_park_count, runs.ignored_inferred_capabilities, runs.reserve_hold_reason, runs.reserve_exempt_until, runs.reserve_exempt_granted_at, runs.reserve_exempt_credential_id, runs.reserve_exempt_window_reset, runs.reserve_exempt_prior_pct, runs.hinted_capabilities, runs.capability_inference_evidence, runs.idle_stall_park_count, runs.forge_admission
+), settled AS (
+    UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), applied_at = now(),
+        consumed_worker_id = $3,
+        consumed_claim_generation = $4::bigint
+    WHERE run_id IN (SELECT id FROM parked) AND kind = 'pause'
+      AND body IN ('now', 'milestone', 'wall', 'reserve') AND applied_at IS NULL
+)
+SELECT count(*) FROM parked
+`
+
+type SetRunIterationParkParams struct {
+	HoldCapturedHead    pgtype.Text `json:"hold_captured_head"`
+	ID                  uuid.UUID   `json:"id"`
+	WorkerID            pgtype.UUID `json:"worker_id"`
+	ClaimGeneration     int64       `json:"claim_generation"`
+	GlobalMaxIterations int32       `json:"global_max_iterations"`
+	MaxIterations       int32       `json:"max_iterations"`
+	IterationCount      int32       `json:"iteration_count"`
+}
+
+// Invocation-local evidence is checked independently of the lifetime iteration_count.
+// The caller holds the worker then run locks. The UPDATE repeats every admission
+// guard; pause inputs are settled only from its successful RETURNING row.
+func (q *Queries) SetRunIterationPark(ctx context.Context, arg SetRunIterationParkParams) (int64, error) {
+	row := q.db.QueryRow(ctx, setRunIterationPark,
+		arg.HoldCapturedHead,
+		arg.ID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+		arg.GlobalMaxIterations,
+		arg.MaxIterations,
+		arg.IterationCount,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const setRunLimitWait = `-- name: SetRunLimitWait :execrows
@@ -24153,6 +24267,7 @@ const supersedeRunByWorker = `-- name: SupersedeRunByWorker :execrows
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = $2 AND runs.worker_id = $3 AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'base_attestation_missing'), FALSE))
@@ -24198,6 +24313,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE runs.id = $2 AND runs.worker_id = $3 AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'base_attestation_missing'), FALSE))

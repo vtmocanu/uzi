@@ -613,6 +613,7 @@ type ClaimConfig struct {
 	// omitempty keeps every other claim byte-identical to today's wire, and an older
 	// worker (or a missing field) falls back to its own TASK_FOLLOWUP_IDLE_MS constant.
 	TaskIdleTimeoutSeconds int `json:"task_idle_timeout_seconds,omitempty"`
+	IterationParkVersion   int `json:"iteration_park_version,omitempty"`
 	MaxIterations          int `json:"max_iterations"`
 	// PlanMaxRevisions is the PRD #41 plan-revision cap the worker enforces at the
 	// approval gate (server-authoritative; the server also caps in SubmitInput).

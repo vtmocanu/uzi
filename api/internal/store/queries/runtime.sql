@@ -4094,6 +4094,56 @@ WHERE runs.id = @id AND runs.user_id = @user_id
   ))
 RETURNING runs.id, runs.user_id, runs.status;
 
+-- name: SetRunIterationPark :one
+-- Invocation-local evidence is checked independently of the lifetime iteration_count.
+-- The caller holds the worker then run locks. The UPDATE repeats every admission
+-- guard; pause inputs are settled only from its successful RETURNING row.
+WITH parked AS (
+    UPDATE runs SET status = 'paused', status_since = now(),
+        hold_reason = 'iteration_budget_exhausted',
+        hold_captured_head = sqlc.narg('hold_captured_head'),
+        pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+        health = 'ok', health_reason = NULL, health_since = NULL, updated_at = now()
+    WHERE runs.id = @id AND runs.worker_id = @worker_id
+      AND runs.claim_generation = sqlc.arg('claim_generation')::bigint
+      AND sqlc.arg('claim_generation')::bigint > 0
+      AND runs.claim_released_at IS NULL AND runs.status = 'running'
+      AND runs.completion_attempts = 0
+      AND runs.kind IN ('issue', 'mr_rework', 'ci_fix', 'task', 'prompt', 'self_improve')
+      AND NOT runs.interactive AND runs.review_target_run_id IS NULL
+      AND runs.egress_profile_id IS NULL
+      AND COALESCE(runs.budget_max_iterations, sqlc.arg('global_max_iterations')::int) = sqlc.arg('max_iterations')::int
+      AND sqlc.arg('max_iterations')::int > 0
+      AND sqlc.arg('iteration_count')::int >= sqlc.arg('max_iterations')::int
+      AND sqlc.arg('iteration_count')::bigint <= sqlc.arg('max_iterations')::bigint + 1
+      AND COALESCE(runs.stop_kind, '') = ''
+      AND runs.credential_switch_requested_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM run_user_inputs i WHERE i.run_id = runs.id
+          AND i.kind IN ('stop', 'cancel') AND i.applied_at IS NULL
+          AND i.disposition IS DISTINCT FROM 'superseded')
+    RETURNING runs.*
+), settled AS (
+    UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), applied_at = now(),
+        consumed_worker_id = @worker_id,
+        consumed_claim_generation = sqlc.arg('claim_generation')::bigint
+    WHERE run_id IN (SELECT id FROM parked) AND kind = 'pause'
+      AND body IN ('now', 'milestone', 'wall', 'reserve') AND applied_at IS NULL
+)
+SELECT count(*) FROM parked;
+
+-- name: RecordIterationParkCapturedHead :execrows
+-- Add a missing head once; iteration parks never admit released flights.
+UPDATE runs SET hold_captured_head = @head, updated_at = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND claim_generation = sqlc.arg('claim_generation')::bigint
+  AND claim_released_at IS NULL AND status = 'paused'
+  AND hold_reason = 'iteration_budget_exhausted' AND hold_captured_head IS NULL;
+
+-- name: IterationParkHasPendingControl :one
+SELECT EXISTS (SELECT 1 FROM run_user_inputs WHERE run_id = @run_id
+    AND kind IN ('stop', 'cancel') AND applied_at IS NULL
+    AND disposition IS DISTINCT FROM 'superseded')::boolean;
+
 -- name: SetRunWallPark :one
 -- PRD #1497 M1 (D4/D14/D15): the worker's own capture-first wall park. A NEW worker-authored,
 -- FENCED transition for the `wall_park` report. running -> paused, NON-TERMINAL, hold_reason
@@ -4475,6 +4525,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'iteration_budget_exhausted', FALSE))
   AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- PRD #1733: a late report from the parking flight must not turn an owner-facing provider hold
@@ -4592,6 +4643,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'iteration_budget_exhausted', FALSE))
   AND claim_released_at IS NULL
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- PRD #1733: a late report from the parking flight must not turn an owner-facing provider hold
@@ -4708,6 +4760,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
   AND (sqlc.narg('completion_final_head')::text IS NULL OR runs.claim_generation = sqlc.narg('completion_generation')::bigint)
   -- PRD #1497 M1 (DEVIATION-3): a legacy (nil-generation, non-interlocked) `completed` from an
   -- old flight must never complete a run the wall-park sweep just server-parked. ParkRunsAtWall
@@ -4797,6 +4850,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'iteration_budget_exhausted', FALSE))
   AND status NOT IN ('completed', 'failed', 'cancelled')
   AND status <> 'paused'
   -- All paused runs are protected above. Retain provider protection through
@@ -4852,6 +4906,7 @@ WITH failed AS (
         health = 'ok', health_reason = NULL, health_since = NULL,
         updated_at         = now()
     WHERE runs.id = @id AND worker_id = @worker_id
+      AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
       AND status NOT IN ('completed', 'failed', 'cancelled')
       AND status <> 'paused'
       -- All paused runs are protected above. Retain provider protection through
@@ -5087,6 +5142,7 @@ LIMIT 1;
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
 ), parent_mapping AS MATERIALIZED (
@@ -5128,6 +5184,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND runs.id IN (SELECT run_id FROM eligible_candidates);
@@ -5140,6 +5197,7 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_che
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'base_attestation_missing'), FALSE))
@@ -5185,6 +5243,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'base_attestation_missing'), FALSE))
@@ -11481,6 +11540,7 @@ WITH ins AS (
     SELECT r.id, sqlc.narg('contract_revision'), @unmet::jsonb, sqlc.narg('head'), sqlc.narg('worktree_fingerprint')
     FROM runs r
     WHERE r.id = @run_id AND r.worker_id = @worker_id AND (r.kind <> 'cross_check' OR r.claim_generation > 0) AND r.completion_contract_version IS NOT NULL
+      AND NOT (r.status = 'paused' AND COALESCE(r.hold_reason = 'iteration_budget_exhausted', FALSE))
       -- PRD #1247 M5: the per-query generation fence, the SAME nil-guarded shape as InsertRunMessage.
       -- A CAPABILITY worker stamps claim_generation; a STALE attempt from an OLD flight (its claim
       -- RELEASED by a held-state switch, or SUPERSEDED by a reclaim) inserts NOTHING here, so with the
@@ -11539,6 +11599,7 @@ UPDATE runs SET
     ),
     updated_at = now()
 WHERE runs.id = @run_id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0) AND runs.completion_contract_version IS NOT NULL
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
   AND EXISTS (SELECT 1 FROM ins)
   -- PRD #1247 M5: mirror the ins CTE's generation fence on the counter/summary UPDATE too, so a
   -- fenced-out attempt updates NOTHING as well as inserting nothing (0 rows -> pgx.ErrNoRows ->

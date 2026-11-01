@@ -869,6 +869,7 @@ var wantRouteMounts = []routeMount{
 	// own run with no forge call → noLimiter, exactly like the completion/hold report beside it (both
 	// are fenced server-side, not by a per-user limiter).
 	{"POST", "/api/worker/runs/{id}/wall-park", noLimiter},
+	{"POST", "/api/worker/runs/{id}/iteration-park", noLimiter},
 	{"POST", "/api/worker/runs/{id}/pause", noLimiter},
 	// issue #3194: the base-attestation HOLD report, fenced server-side like the wall park above.
 	{"POST", "/api/worker/runs/{id}/base-attestation-hold", noLimiter},
