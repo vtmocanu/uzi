@@ -51,7 +51,7 @@ func TestPolicyHoldRouteHasNoRateLimiter(t *testing.T) {
 }
 
 func TestPolicyHoldNotReady(t *testing.T) {
-	if slices.Contains(protocolFeatures(true, true), capability.ProviderPolicyHoldV1) {
+	if slices.Contains(protocolFeatures(true, true, true, true), capability.ProviderPolicyHoldV1) {
 		t.Fatal("incomplete policy continuation advertised ready")
 	}
 }
