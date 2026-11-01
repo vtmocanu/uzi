@@ -231,7 +231,7 @@ func main() {
 		"isolated_lane", cfg.WorkerIsolatedNamespace != "",
 		"isolated_namespace", cfg.WorkerIsolatedNamespace)
 	if cfg.WorkerDockerNamespace != "" {
-		session := kube.NewPodEpochSession(kubeClient, kube.PodEpochKubeResolver{Client: kubeClient}, nil)
+		session := kube.NewPodEpochSession(kubeClient, kube.PodEpochKubeResolver{Client: kubeClient}, nil, log)
 		materializer.SetPodEpochSession(session)
 		owner := kube.NewPodEpochWatch(kubeClient.CoreV1().RESTClient(), cfg.WorkerDockerNamespace, cfg.WorkerPodEpochRuntime, session)
 		owner.Start(ctx)

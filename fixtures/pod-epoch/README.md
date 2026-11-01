@@ -76,7 +76,9 @@ runtime, claim identity, lock and durable consumption rules all still apply.
 
 All new Go code lives in `controller/internal/kube/pod_epoch*.go`.
 
-1. Construct `NewPodEpochSession(client, resolver, []PodEpochWorker)`. Supply only
+1. Construct `NewPodEpochSession(client, resolver, []PodEpochWorker)`; the
+   variadic logger preserves this three-argument form and accepts an optional
+   fourth `*slog.Logger` argument. Supply only
    Docker worker registrations and one Docker namespace's unfiltered pod stream.
    The registrations are copied and fixed for the session owner; replace the
    session when changing the registration set. `PodEpochRuntimeEnv` names the
@@ -93,13 +95,30 @@ All new Go code lives in `controller/internal/kube/pod_epoch*.go`.
    Resume an accepted watch with the same generation and opaque resourceVersion.
    Relist, 410, decode error, and restart require Reset or a new session.
 4. A non-nil immutable `PodEpochDecision` exposes `Document()` for inspection.
-   Call `Deliver(ctx, decision)` once. It attempts a MergePatch carrying only
-   metadata.uid, metadata.resourceVersion and the evidence annotation on that
-   exact pod. There are no PVC writes and no retries, including conflicts and
-   ambiguous transport errors. Invalidated/canceled decisions never submit.
-   Identity resolution and patch submission each have a 10-second deadline.
-   Reset invalidates old generation tokens and pending decisions. An API request
-   already submitted can commit; its exact UID/RV binding is never retargeted.
+   Call `Deliver(ctx, decision)` once per decision. It attempts a MergePatch
+   carrying only metadata.uid, metadata.resourceVersion and the evidence
+   annotation on that exact pod, with `MaxRetries(0)` and no PVC writes.
+   Negative evidence is offered at Added; positive proof freezes at Added but
+   first submits on a later IDs-bearing event. After `apierrors.IsConflict(err)`,
+   a later changed same-UID watch event may issue a new single-use decision with
+   that event's resourceVersion. Repeating the last object or immediate resume
+   replay spends no attempt. There is no same-decision retry or retargeting.
+
+   Delivery allows three total PATCH attempts per UID within a nonrenewable
+   monotonic 90 s budget from first observation, before resolver work/ID waits.
+   Identity reads retain their 10 s deadline; each PATCH gets min(10 s, remaining
+   delivery budget), checked again immediately before submission. Non-conflict
+   errors, including 429, 5xx, timeouts, transport and response-cap failures, are
+   terminal. Invalidated/canceled decisions do not submit. Reset invalidates old
+   generations and pending decisions. The budget limits new submissions; an
+   in-flight request may commit after cancellation, expiry or reset, bound to
+   its exact UID/RV.
+
+   Verdict/class, Added-time identity and predecessor proof freeze once; retries
+   refresh only successor containers and attestation, without rerunning `produce`,
+   predecessor selection or the resolver. Negative bytes remain fixed after late
+   proof/remint. An encoding-fallback negative replaces positive proof and stays
+   negative; a tainted `identity_unverified` negative is initial-only.
 5. The existing maintenance owner can call
    `RecordMaintenanceRemint(generation, workerID, PodEpochRemint)` after observing
    an operation's old/new DinD claim UID binding. Only matching receipts permit
@@ -127,7 +146,23 @@ while regressions or changed terminal container identities refuse evidence.
 
 The caps are 4096 distinct pod UIDs plus claim UIDs, and 16 MiB of retained proof
 metadata (serialized pod snapshots, terminal snapshots, keys, receipts, and
-conservative per-record/membership allowances). Overflow latches, drops proof
+conservative per-record/membership allowances), including per-UID delivery
+bookkeeping, retained payloads and issued decisions. Observation accounting
+also reserves 64 bytes per pod/claim identity key, including baseline and
+maintenance-receipt keys, and the encoded size of each cached resolved identity.
+Those costs remain charged while cached, until Reset/invalidation. This broader
+accounting can reach overflow earlier than before #3739 without changing the
+16 MiB cap. Pending proof survives
+conflicts; success or permanent stop releases payloads. Stopped bookkeeping and
+tombstones remain until Reset/invalidation; quiet watches have no timer eviction.
+Delivery stops on deletion, terminal phase including unaudited termination,
+taint (apart from the initial identity-unverified negative), supersession,
+reset/generation stop, cancellation or caps, without resurrection. Expiry is
+observed on the next event/Handle/Deliver, without a quiet timer. Failed attempts
+warn with controlled reasons; one final info stop or success reports attempts,
+conflicts and elapsed time since first observation, without raw errors or extra
+IDs. Later stopped-UID events are silent. Wire schema and RBAC are unchanged.
+Overflow latches, drops proof
 state, and returns no further decisions until reset. Workers therefore defer
 through their ordinary missing-evidence bound; reconciliation can continue.
 Caller-owned returned documents are bounded independently at 8 KiB.
