@@ -24,7 +24,7 @@ const witnessDiscardSQL = `UPDATE recovery_custody_holds SET state='discarded',
 // standAtWitnessMigration rolls later migrations back so the same-issue-witness migration (00386)
 // is the head under test. A Down to 385 otherwise first commits every later migration's Down,
 // which changes the version table the refusal assertions compare and takes locks on tables the
-// writer race is not about. Later Downs have their own tests (00387/00388: the gated rollback
+// writer race is not about. Later Downs have their own tests (00389/00390: the gated rollback
 // tests in gated_cross_check_rollback_livedb_test.go).
 func standAtWitnessMigration(ctx context.Context, t *testing.T, dsn string) {
 	t.Helper()

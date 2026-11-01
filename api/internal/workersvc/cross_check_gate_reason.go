@@ -133,7 +133,7 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 }
 
 // gatedPlanApprovalConstraint names the constraint the enforce_gated_plan_approval trigger
-// (migration 00387) raises, with SQLSTATE 23514, when a gated run's awaiting_approval ->
+// (migration 00389) raises, with SQLSTATE 23514, when a gated run's awaiting_approval ->
 // running edge has no current bound approval.
 const gatedPlanApprovalConstraint = "runs_gated_plan_approval"
 
