@@ -1240,6 +1240,7 @@ const PUBLICATION_HOLD_REASONS: ReadonlySet<string> = new Set([
 export class WorkerClient {
   private registeredWorkerId: string | undefined;
   private hasExactHoldCapability = false;
+  private hasBindinglessHoldCapability = false;
   /** Issue #3142: this registration advertised worker_memory_authority_claim_v1. */
   private hasMemoryAuthorityClaimCapability = false;
   private memoryAuthorityLostLogged = false;
@@ -1737,6 +1738,7 @@ export class WorkerClient {
     this.inputObservationEpoch++;
     this.registeredWorkerId = undefined;
     this.hasExactHoldCapability = false;
+    this.hasBindinglessHoldCapability = false;
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
     this.registrationReport = undefined;
@@ -1805,6 +1807,7 @@ export class WorkerClient {
     // are fenced server-side) even when a one-shot register missed the negotiated feature.
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
     this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
+    this.hasBindinglessHoldCapability = originalCapabilities?.includes("recovery_bindingless_closed_v1") ?? false;
     this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
     // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
     // ActiveSnapshot the worker sends. A string only (defensive); absent on an older api ⇒
@@ -3421,9 +3424,57 @@ export class WorkerClient {
     if (incarnation !== this.completionIncarnation || worker !== this.registeredWorkerId ||
         !this.hasExactHoldCapability ||
         !isRecord(body) || body.run_id !== runId || !isRecord(body.exact_hold)) return undefined;
-    const value = body.exact_hold;
-    if (value.run_id !== runId || value.generation !== generation || value.hold_id !== expected.holdId ||
-        value.repo_id !== expected.repoId || value.original_worker_id !== worker ||
+    return this.validateExactRecoveryHold(body.exact_hold, runId, generation, worker, expected);
+  }
+
+  /** Authenticated observation without local hold/repo binding. Closed facts may
+   * support refusal-only persistence; never an ACK, cleanup or producer authority. */
+  async getBindinglessRecoveryHold(
+    runId: string,
+    generation: number,
+    signal?: AbortSignal,
+  ): Promise<RecoveryExactHold | undefined> {
+    const supported = () => this.hasBindinglessHoldCapability && this.hasFeature("recovery_bindingless_closed_v1");
+    const worker = this.registeredWorkerId;
+    if (!supported() || !worker || !terminalUUID(runId) || !terminalGeneration(generation) || generation <= 0)
+      return undefined;
+    const epoch = this.inputObservationEpoch;
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds?generation=${generation}`;
+    const res = await this.fetchRaw("GET", path, undefined, this.httpTimeoutMs, signal);
+    if (res.status !== 200 || res.headers.get("Uzi-Recovery-Observation") !== "recovery_bindingless_closed_v1") {
+      if (ownedResponses.has(res)) await discardResponse(res);
+      else void res.body?.cancel().catch(() => undefined);
+      MaintenanceResources.checkIfActive();
+      MaintenanceBudget.current()?.check();
+      MaintenanceBudget.signal()?.throwIfAborted();
+      signal?.throwIfAborted();
+      return undefined;
+    }
+    let body: unknown;
+    try { body = JSON.parse(await readBoundedText(res, COMPLETION_HOLDS_MAX_BYTES, true, signal)); }
+    catch {
+      MaintenanceResources.checkIfActive();
+      MaintenanceBudget.current()?.check();
+      MaintenanceBudget.signal()?.throwIfAborted();
+      signal?.throwIfAborted();
+      return undefined;
+    }
+    MaintenanceResources.checkIfActive();
+    MaintenanceBudget.current()?.check();
+    MaintenanceBudget.signal()?.throwIfAborted();
+    signal?.throwIfAborted();
+    if (epoch !== this.inputObservationEpoch || worker !== this.registeredWorkerId || !supported() ||
+        !isRecord(body) || body.run_id !== runId || !isRecord(body.exact_hold)) return undefined;
+    return this.validateExactRecoveryHold(body.exact_hold, runId, generation, worker);
+  }
+
+  private validateExactRecoveryHold(
+    value: Record<string, unknown>, runId: string, generation: number, worker: string,
+    expected?: { holdId: string; repoId: string },
+  ): RecoveryExactHold | undefined {
+    if (value.run_id !== runId || value.generation !== generation || !terminalUUID(value.hold_id) || !terminalUUID(value.repo_id) ||
+        (expected !== undefined && (value.hold_id !== expected.holdId || value.repo_id !== expected.repoId)) ||
+        value.original_worker_id !== worker ||
         typeof value.original_worker_identity !== "string" || !value.original_worker_identity.trim() ||
         value.inventory_guarded !== true || (value.run_worker_id !== undefined && !terminalUUID(value.run_worker_id)) ||
         (value.recovery_wait_cause !== undefined && typeof value.recovery_wait_cause !== "string") || !terminalGeneration(value.current_claim_generation) ||

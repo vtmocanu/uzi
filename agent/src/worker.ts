@@ -918,6 +918,7 @@ export class Worker {
           "forge_api_success_v1",
           "recovery_held_publication_v1",
           "recovery_held_publication_v2",
+          "recovery_bindingless_closed_v1",
           "recovery_prerequisite_closure_v1",
           // PRD #1247 M5b (D3/protocol §9): this image implements the held-state credential-switch
           // protocol: it stamps claim_generation on state reports (already landed in W2a),
