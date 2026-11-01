@@ -102,7 +102,15 @@ must produce a fresh sample. If a check fails, it re-parks the run at the same
 refusal on the identity, receipt or source checks writes nothing locally; a
 timeout of only the guard sample goes through the existing continuation
 re-park, which writes a `memoryPark` journal record. Every such re-park also
-reports the park to the server. A receipt that reaches the server after you Resume is refused, and
+reports the park to the server. If the server accepts a guard-timeout re-park,
+that new park has no settlement receipt. The earlier receipt cannot lift the
+new park's exclusion: another Resume queues the run but leaves the same
+worker incarnation excluded. A confirmed park ACK also removes its old local
+receipt entry; a lost ACK can retain that entry without making the worker
+eligible. This is a known limit of same-incarnation continuation, including
+when that worker is the run's only placement.
+
+A receipt that reaches the server after you Resume is refused, and
 parks made before this behavior was deployed have no receipt and are never
 lifted. After Resume, while the run is queued, the released worker is still
 excluded (no receipt lifted it), no other worker can take the run and the
