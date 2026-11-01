@@ -913,7 +913,8 @@ read is a 0–100 percentage.
 
 Headroom means `min(100 − 5-hour %, 100 − 7-day %)`: the two windows are a
 conjunction, so a token at 10% of its 5-hour allowance and 98% of its 7-day one has
-2 points of usable capacity, not 46.
+2 points of usable capacity, not 46. A token with no 5-hour window (some plans
+have none) is measured on its 7-day window alone.
 
 | Var | Default | Notes |
 |---|---|---|

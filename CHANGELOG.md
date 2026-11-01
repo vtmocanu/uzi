@@ -33,6 +33,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ### Changed
 
+- **Routine dependency updates ([#3698](https://github.com/vtmocanu/uzi/pull/3698), [#3699](https://github.com/vtmocanu/uzi/pull/3699)).**
+  Dependency manifest and image bumps that carry no entry of their own.
+
 - **Routine dependency updates ([#3537](https://github.com/vtmocanu/uzi/pull/3537), [#3581](https://github.com/vtmocanu/uzi/pull/3581), [#3490](https://github.com/vtmocanu/uzi/pull/3490)).**
   Dependency manifest and image bumps that carry no entry of their own.
 
@@ -361,6 +364,30 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Admin usage ranks users by recorded API-equivalent cost ([#3658](https://github.com/vtmocanu/uzi/pull/3658)).**
   Cost share follows the selected period's recorded cost, retains incomplete-cost disclosures, and is unavailable when no factory cost is recorded.
 
+- **Workers, the web build and CI run on Node 26 ([#3716](https://github.com/vtmocanu/uzi/pull/3716), [#3717](https://github.com/vtmocanu/uzi/pull/3717)).**
+  Both worker templates move to `node:26-alpine`, as do the web image build and every CI job. The Node 26 image no longer ships Yarn, so the worker images install Yarn Classic 1.22.22 themselves, keeping dependency installs for `yarn.lock` repositories working as before. Existing hosted workers pick up the new image through the usual worker image roll.
+
+- **Older failed or cancelled issue custody can settle after a later same-issue PR merges ([#3654](https://github.com/vtmocanu/uzi/pull/3654), [#3685](https://github.com/vtmocanu/uzi/pull/3685)).**
+  Fresh exact merge verification and locked live-run, dependency and publication safeguards permit narrow intentional discard, including unique work; available archives keep their existing expiry and no new worker deletion authority is granted.
+
+- **Codex workers use the pinned 0.164.0 native runtime ([#3713](https://github.com/vtmocanu/uzi/pull/3713)).**
+  The coordinated package pins include upstream resume and compaction fixes; worker-owned tool permissions remain unchanged.
+
+- **A running Codex run's command cache is measured and rotated to a fresh generation when it exceeds a per-run budget ([#3675](https://github.com/vtmocanu/uzi/pull/3675), [#3683](https://github.com/vtmocanu/uzi/pull/3683)).**
+  Set by `UZI_CODEX_COMMAND_CACHE_RUN_BYTES` (default 4 GiB, `0` disables; chart value `workers.codex.commandCacheRunBytes`, which rolls the fleet once if set); rotation is best-effort with no hard size bound, and no command is refused for cache size.
+
+- **Runs list owner-only acceptance outside their milestones, so they stop asking at completion ([#3721](https://github.com/vtmocanu/uzi/pull/3721), [#3723](https://github.com/vtmocanu/uzi/pull/3723)).**
+  Plans put PR-environment checks in a "Landing obligations" section and live or human acceptance in an "Owner acceptance" section, with a non-closing delivery for the latter; worker obligations stay milestones, and unfinished worker work such as a failed gate still parks at completion.
+
+- **The TUI board names its columns and stops reserving space for rare statuses ([#3732](https://github.com/vtmocanu/uzi/pull/3732), [#3734](https://github.com/vtmocanu/uzi/pull/3734)).**
+  Band headings carry faint column names over their columns, and the status cell fits the longest status on screen (leaving room for the heading's age label, at most 14 columns), so titles get the spare room.
+
+- **The TUI CI view names its columns ([#3736](https://github.com/vtmocanu/uzi/pull/3736), [#3737](https://github.com/vtmocanu/uzi/pull/3737)).**
+  CI band headings carry faint column names over their cells, so the run time (`elapsed`/`took`) and the time since the run was triggered (`age`) are no longer two bare durations.
+
+- **Docker worker pod-epoch shadow now reports settle candidates and runtime authority ([#3431](https://github.com/vtmocanu/uzi/pull/3431), [#3733](https://github.com/vtmocanu/uzi/pull/3733)).**
+  Version-2 handoff evidence adds the successor's container IDs and a runtime-prefix cross-check, and `pod_epoch_reclaim` gains `authority`, `would_settle` and per-entry basis; it is still read-only, `crio-crun` defers `kernel_unaudited` outside an exact kernel allowlist, and old workers refuse v2 until the worker pin moves.
+
 ### Added
 
 - **Healthy busy workers no longer show custody attention.**
@@ -530,6 +557,36 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Choose password protection for personal credentials ([#3507](https://github.com/vtmocanu/uzi/pull/3507), [#3582](https://github.com/vtmocanu/uzi/pull/3582)).**
   Settings can enable or disable the vault under instance policy, atomically converting Claude, OpenAI and Codex credentials; Off uses server-key encryption and avoids restart unlocks, while protected users retain password-based protection.
+
+- **Codex warns when its catalog does not list the chosen reasoning effort ([#3247](https://github.com/vtmocanu/uzi/pull/3247)).**
+  The worker reads the runtime's `model/list` catalog read-only before the first turn and shows one advisory run-feed warning per claim; the level is still sent unchanged and never rewritten or retried, and an unreadable or timed-out catalog warns nothing.
+
+- **The usage card shows how many PRs uzi runs opened, and the cost per PR ([#3686](https://github.com/vtmocanu/uzi/pull/3686), [#3701](https://github.com/vtmocanu/uzi/pull/3701)).**
+  Each window counts a PR once, for its earliest run's user and creation time, shows "N PRs · $X per PR" ("at least" when the cost is incomplete, "—" at zero PRs), and the admin per-user table gains a PRs column; older servers that omit the counts show neither.
+
+- **Codex Read selects bounded text tails ([#3657](https://github.com/vtmocanu/uzi/pull/3657), [#3666](https://github.com/vtmocanu/uzi/pull/3666)).**
+  Text-only tail reads return recent lines within 64 KiB, with one confined helper-oversize fallback that validates the suffix frontier under the shared scan budget and reports incomplete results on scan exhaustion.
+
+- **Reasoning effort can be set to Runtime default for Claude and Codex ([#3247](https://github.com/vtmocanu/uzi/pull/3247)).**
+  Settings → Run defaults → Reasoning effort sends no effort level, so the runtime chooses and the level used is not reported; unset still means medium, and cross-check checkers are unaffected.
+
+- **API prerequisite pins preserve declared thin-archive dependencies ([#3591](https://github.com/vtmocanu/uzi/pull/3591), Refs #2506) ([#3655](https://github.com/vtmocanu/uzi/pull/3655)).**
+  New qualifying uploads can use the reviewed GitHub.com strategy with frozen binding, verified project identity before and after Git operations, redirect refusal and bounded reconciliation/cleanup; the default-off control is exposed in bundled Compose and documented in .env.example. Unknowns retain blockers indefinitely, and thin FINAL release, feature advertisement and owner pin visibility remain separate work.
+
+- **The api, web and controller images are published for `linux/arm64` as well as `linux/amd64` ([#3665](https://github.com/vtmocanu/uzi/pull/3665)).**
+  Each tag is now a multi-arch index, so the control plane runs on arm64 nodes (Raspberry Pi, Graviton, Apple silicon). The images cross-compile on the build platform with no QEMU, and the govulncheck gate now analyses both architectures. The agent worker images are still amd64 only.
+
+- **Record incomplete Codex command-cache calibration ([#3076](https://github.com/vtmocanu/uzi/pull/3076)).**
+  Document inherited cache scan measurements, the observed overhead above target, and remaining safety and coverage gaps without changing cache behavior.
+
+- **Hosted workers carry a configurable `workers.nodeSelector`, defaulting to `kubernetes.io/arch: amd64` ([#3679](https://github.com/vtmocanu/uzi/pull/3679)).**
+  The published agent images are amd64 only, so on a mixed-arch cluster workers now stay off arm64 nodes, where they would crash-loop. The selector applies to all three worker tiers (plain, docker, isolated), next to the docker tier's existing soft anti-affinity. Override it, or clear it with `workers.nodeSelector: null`, when running your own arm64-capable worker image. Changing the selector also removes dropped keys from existing workers, which a plain merge patch would leave behind. **Upgrading re-hashes every worker's pod template: persistent workers go through the normal paced drain-and-roll, while run-bound (ephemeral) workers are outside the pacing pools but keep the usual busy-drift deferral, so a busy one is not replaced mid-run.**
+
+- **The TUI board shows how long each finished run took ([#3731](https://github.com/vtmocanu/uzi/pull/3731)).**
+  DONE rows add a run-length cell (wall time from first start to finish) after the finished-ago age on wide boards (from 111 columns).
+
+- **Runs show the lead model and effort that were requested and what the runtime reported ([#3244](https://github.com/vtmocanu/uzi/pull/3244), [#3695](https://github.com/vtmocanu/uzi/pull/3695)).**
+  Recorded per claim attempt and phase and shown as a run-page chip, `uzi run get` rows and `uzi run lead-config`; worker-attested and display-only.
 
 ### Fixed
 
@@ -1353,6 +1410,33 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Invalidated recovery inventories get a fair reconstruction opportunity ([#3614](https://github.com/vtmocanu/uzi/pull/3614), [#3616](https://github.com/vtmocanu/uzi/pull/3616)).**
   Live recovery revisits an ordinary inventory awaiting replacement without waiting behind every retained discovery context, while preserving FIFO progress, existing pass limits and all custody proofs.
+
+- **Memory-pressure parks settle their source use, so a fresh worker continues instead of failing ([#3638](https://github.com/vtmocanu/uzi/pull/3638), [#3663](https://github.com/vtmocanu/uzi/pull/3663)).**
+  A parked flight now ends its source use only on a witnessed park and a durable end, recorded in a versioned `memoryPark` journal field; with no such proof, and a journal that records the park, the fresh worker re-parks at the same hold (Resume re-parks until #3639; without a record a different worker process fails the run as before, while the same process retries until the requeue cap), and workers built before this change reject the field and fail closed on it.
+
+- **Checkpoint publish failures name more network causes ([#3702](https://github.com/vtmocanu/uzi/pull/3702)).**
+  The generic checkpoint error diagnostic now labels closed connections, unreachable networks and common TLS certificate failures instead of reporting `unknown`; the lists are exact, and EPIPE stays `unknown` because it mostly comes from local pipes.
+
+- **A refused repo enable is no longer silent off-screen ([#3670](https://github.com/vtmocanu/uzi/pull/3670)).**
+  The Repos page scrolls its error and guardrail-refusal banner into view, so clicking Enable far down a long list shows why it failed.
+
+- **A successor no longer fails when its predecessor's completed source still carries a completion fence ([#3645](https://github.com/vtmocanu/uzi/pull/3645), [#3689](https://github.com/vtmocanu/uzi/pull/3689)).**
+  The reclaim now retires a fenced terminal owner's source through the certified completion chain and re-admits; while that retirement is pending or uncertain, or the journal keeps retained sources, the claim stops without a terminal report and ends owner-held at the requeue cap, and positively invalid or unsupported sources keep the existing refusal in retire mode (a journal with retained sources is a retained stop instead).
+
+- **Avoid repeated placement on a worker that cannot reach a Git origin ([#3585](https://github.com/vtmocanu/uzi/pull/3585), [#3648](https://github.com/vtmocanu/uzi/pull/3648)).**
+  Clone/fetch failures cool down that worker for the affected origin, then allow one recovery attempt. Exhausted automatic retries wait for owner Resume or Cancel while preserving local work. Worker and run views distinguish cooldown, unverified recovery and owner holds. Publication recovery remains a separate follow-up ([#1324](https://github.com/vtmocanu/uzi/pull/1324)).
+
+- **The Codex cross-checker's Search returns the matches it found instead of failing on a real repository ([#3707](https://github.com/vtmocanu/uzi/pull/3707), [#3718](https://github.com/vtmocanu/uzi/pull/3718)).**
+  A search that reaches its time, operation, directory, entry or byte ceiling, or skips a file over 1 MiB, now returns its matches marked truncated with a reason, and a path may name a single file; a truncated result is never proof that text is absent.
+
+- **Memory-guard Claude runs now overlap the integration gate with review ([#3722](https://github.com/vtmocanu/uzi/pull/3722), [#3725](https://github.com/vtmocanu/uzi/pull/3725)).**
+  Guarded shell calls from one agent run one at a time, so the lead now delegates the gate to one subagent in the review batch, and every guarded agent is told its own commands run in sequence.
+
+- **Cross-check runs no longer send their own Slack DMs ([#3628](https://github.com/vtmocanu/uzi/pull/3628), [#3687](https://github.com/vtmocanu/uzi/pull/3687)).**
+  A plan or code cross-check run used to get a separate run-state or health DM titled `<repo>#0 · <parent title>`, which could read "Failed" for a run that had actually completed; a plan cross-check's reason still appears on the parent's plan-gate message, and code cross-check results still go to the merge request.
+
+- **Claude meters keep refreshing for plans without a 5-hour limit (1bfe171cd, d7b57cdd3).**
+  Anthropic removed the 5-hour window for some plans, so their usage probe carries only 7-day data; the poller rejected that as malformed, the meter went stale and the token dropped out of auto-selection. The 5-hour window is now optional: such tokens show a single 7-day meter and are ranked on 7-day headroom. Failed polls now log the secret id, call, kind and HTTP status.
 
 ### Security
 

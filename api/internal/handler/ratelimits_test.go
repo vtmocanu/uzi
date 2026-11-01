@@ -477,3 +477,26 @@ func TestAdminRateLimitsModeAwareGate(t *testing.T) {
 		})
 	}
 }
+
+// A NULL five_hour_pct (an account without a 5-hour window) omits five_hour from the
+// ok reading instead of rendering a fabricated 0%.
+func TestSelfRateLimitsOmitsNullFiveHour(t *testing.T) {
+	withFive := okSelfRow(uuid.New(), "has-5h", true, time.Now())
+	sevenOnly := okSelfRow(uuid.New(), "seven-only", false, time.Now())
+	sevenOnly.FiveHourPct = pgtype.Int2{}
+	sevenOnly.FiveHourResetsAt = pgtype.Timestamptz{}
+	h := rlHandler(&fakeRLDB{selfRows: []store.ListRateLimitsForUserRow{withFive, sevenOnly}}, 5*time.Minute)
+	rec := httptest.NewRecorder()
+	h.SelfRateLimits(rec, rlReq(uuid.New(), false))
+
+	tokens := selfTokens(t, rec)
+	if len(tokens) != 2 {
+		t.Fatalf("got %d tokens, want 2", len(tokens))
+	}
+	if tokens[0].Limits.FiveHour == nil {
+		t.Errorf("token with a 5h reading lost five_hour")
+	}
+	if tokens[1].Limits.Status != "ok" || tokens[1].Limits.FiveHour != nil {
+		t.Errorf("7d-only token = %+v, want ok with five_hour omitted", tokens[1].Limits)
+	}
+}

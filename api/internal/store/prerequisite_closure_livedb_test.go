@@ -5,10 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -638,53 +636,40 @@ func TestPrerequisiteClosureAttemptEightLiveDB(t *testing.T) {
 	}
 }
 
-// prerequisiteSchemaHead is the newest migration, read from the migrations directory so a later
-// migration does not need an edit here; these tests roll down to 386 and back up to this head. The
-// literal 387 below is the prerequisite closure's own migration, which is intentionally fixed.
-var prerequisiteSchemaHead = func() int64 {
-	entries, err := os.ReadDir("migrations")
-	if err != nil {
-		panic(err)
-	}
-	var head int64
-	for _, e := range entries {
-		if n, err := strconv.ParseInt(strings.SplitN(e.Name(), "_", 2)[0], 10, 64); err == nil && n > head {
-			head = n
-		}
-	}
-	return head
-}()
-
 func prerequisiteSchemaVersion(t *testing.T, ctx context.Context, pool *pgxpool.Pool, expected int64) {
 	t.Helper()
 	applied, head, atHead, err := store.SchemaVersionStatus(ctx, pool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if applied != expected || head != prerequisiteSchemaHead || atHead != (expected == prerequisiteSchemaHead) {
-		t.Fatalf("schema version: applied=%d head=%d atHead=%t; want applied=%d head=%d atHead=%t",
-			applied, head, atHead, expected, prerequisiteSchemaHead, expected == prerequisiteSchemaHead)
+	// head is the newest embedded migration, which a later migration moves past 387.
+	if applied != expected || atHead != (expected == head) {
+		t.Fatalf("schema version: applied=%d head=%d atHead=%t; want applied=%d atHead=%t",
+			applied, head, atHead, expected, expected == head)
 	}
 }
 
 func TestPrerequisiteClosureMigrationRoundTripLiveDB(t *testing.T) {
 	ctx, dsn, pool := prerequisiteMigratedPool(t, "prereq_roundtrip_")
+	// Isolate 00387: later migrations roll back first and are not this test's subject.
+	if err := store.MigrateDownTo(ctx, dsn, 387); err != nil {
+		t.Fatal(err)
+	}
 	// Empty Down/Up, then dependent evidence blocks without CASCADE.
-	prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
+	prerequisiteSchemaVersion(t, ctx, pool, 387)
 	if err := store.MigrateDownTo(ctx, dsn, 386); err != nil {
 		t.Fatal(err)
 	}
 	prerequisiteSchemaVersion(t, ctx, pool, 386)
-	if err := store.Migrate(ctx, dsn); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 387); err != nil {
 		t.Fatal(err)
 	}
-	prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
+	prerequisiteSchemaVersion(t, ctx, pool, 387)
 	mustExec(ctx, t, pool, "CREATE VIEW prerequisite_closure_dependency AS SELECT id FROM recovery_prerequisite_closures")
-	prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
+	prerequisiteSchemaVersion(t, ctx, pool, 387)
 	if err := store.MigrateDownTo(ctx, dsn, 386); err == nil {
 		t.Fatal("Down removed dependent evidence")
 	}
-	// The newer migration above the closure rolled back first; the closure's own Down refused.
 	prerequisiteSchemaVersion(t, ctx, pool, 387)
 	mustExec(ctx, t, pool, "DROP VIEW prerequisite_closure_dependency")
 	prerequisiteSchemaVersion(t, ctx, pool, 387)
@@ -692,17 +677,21 @@ func TestPrerequisiteClosureMigrationRoundTripLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	prerequisiteSchemaVersion(t, ctx, pool, 386)
-	if err := store.Migrate(ctx, dsn); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 387); err != nil {
 		t.Fatal(err)
 	}
-	prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
+	prerequisiteSchemaVersion(t, ctx, pool, 387)
 	for _, state := range []string{"pending", "invoked", "create_unknown", "pinned", "refused", "foreign", "lost", "deleted"} {
 		t.Run(state, func(t *testing.T) {
 			// A fresh database prevents an earlier pending row masking later states.
 			ctx, dsn, pool := prerequisiteMigratedPool(t, "prereq_down_state_")
+			// Isolate 00387: later migrations roll back first and are not this test's subject.
+			if err := store.MigrateDownTo(ctx, dsn, 387); err != nil {
+				t.Fatal(err)
+			}
 			f := prerequisiteNew(t, ctx, pool)
 			prerequisiteSetState(t, ctx, f, state)
-			prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
+			prerequisiteSchemaVersion(t, ctx, pool, 387)
 			if err := store.MigrateDownTo(ctx, dsn, 386); err == nil {
 				t.Fatalf("Down forgot %s evidence", state)
 			}
@@ -710,10 +699,10 @@ func TestPrerequisiteClosureMigrationRoundTripLiveDB(t *testing.T) {
 			if c := prerequisiteRead(t, ctx, f); c.State != state {
 				t.Fatalf("failed Down changed %s to %s", state, c.State)
 			}
-			if err := store.Migrate(ctx, dsn); err != nil {
+			if err := store.MigrateTo(ctx, dsn, 387); err != nil {
 				t.Fatal(err)
 			}
-			prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
+			prerequisiteSchemaVersion(t, ctx, pool, 387)
 		})
 	}
 }
@@ -1106,6 +1095,10 @@ func TestPrerequisiteQueryPlansLiveDB(t *testing.T) {
 // wait before that check, rather than discover the row only when DROP takes its lock.
 func TestPrerequisiteClosureDownConcurrentInsertLiveDB(t *testing.T) {
 	ctx, dsn, pool := prerequisiteMigratedPool(t, "prereq_down_race_")
+	// Isolate 00387: later migrations roll back first and are not this test's subject.
+	if err := store.MigrateDownTo(ctx, dsn, 387); err != nil {
+		t.Fatal(err)
+	}
 	f := heldNewHoldFixture(ctx, t, pool, true, "failed", nil)
 	capture := uuid.New()
 	mustExec(ctx, t, pool, `INSERT INTO recovery_captures
@@ -1124,7 +1117,7 @@ func TestPrerequisiteClosureDownConcurrentInsertLiveDB(t *testing.T) {
 	bounded, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
-	prerequisiteSchemaVersion(t, ctx, pool, prerequisiteSchemaHead)
+	prerequisiteSchemaVersion(t, ctx, pool, 387)
 	go func() { done <- store.MigrateDownTo(bounded, dsn, 386) }()
 	joined := false
 	defer func() {

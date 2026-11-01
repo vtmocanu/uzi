@@ -335,7 +335,7 @@ func TestSelectFallbackReasons(t *testing.T) {
 	noReading.HasReading, noReading.SyncedAt = false, nil
 
 	unmeasured := cand(4, 80, at(time.Hour))
-	unmeasured.FiveHourPct = nil
+	unmeasured.SevenDayPct = nil
 
 	for _, tc := range []struct {
 		name  string
@@ -346,7 +346,7 @@ func TestSelectFallbackReasons(t *testing.T) {
 		{"tokens exist but none is pooled", []Candidate{unpooled}, ReasonPoolEmpty},
 		{"pooled but the reading aged out", []Candidate{stale}, ReasonPoolStale},
 		{"pooled but never polled", []Candidate{noReading}, ReasonPoolStale},
-		{"pooled but a window is NULL", []Candidate{unmeasured}, ReasonPoolStale},
+		{"pooled but the 7-day window is NULL", []Candidate{unmeasured}, ReasonPoolStale},
 		{"pooled, mixed, none measurable", []Candidate{unpooled, stale, noReading, unmeasured}, ReasonPoolStale},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

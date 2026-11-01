@@ -53,7 +53,7 @@ import { maskEmail, maskName } from "../lib/demoMask";
 // name), and the chip stays text-muted (not the mock's faint) so it clears WCAG AA
 // at its small size: it is the only visible window identity a sighted low-vision
 // admin has now that the full column headers are gone.
-type OkWindow = Extract<MyRateLimits, { status: "ok" }>["five_hour"];
+type OkWindow = Extract<MyRateLimits, { status: "ok" }>["seven_day"];
 
 function WindowRow({
   win,
@@ -103,14 +103,16 @@ function UtilizationCell({ token, now }: { token: TokenRateLimits; now: number }
   if (limits.status !== "ok") return <span className="text-faint">—</span>;
   return (
     <div className="flex max-w-[22rem] flex-col gap-2">
-      <WindowRow
-        win={limits.five_hour}
-        chip="5h"
-        label="5-hour window"
-        stale={limits.stale}
-        now={now}
-        forecast={rowForecast(limits.stale, limits.five_hour.pct, limits.five_hour.resets_at, WINDOW_DURATION["5h"], now, limits.source)}
-      />
+      {limits.five_hour && (
+        <WindowRow
+          win={limits.five_hour}
+          chip="5h"
+          label="5-hour window"
+          stale={limits.stale}
+          now={now}
+          forecast={rowForecast(limits.stale, limits.five_hour.pct, limits.five_hour.resets_at, WINDOW_DURATION["5h"], now, limits.source)}
+        />
+      )}
       <WindowRow
         win={limits.seven_day}
         chip="7d"

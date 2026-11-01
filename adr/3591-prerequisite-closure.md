@@ -174,10 +174,14 @@ permission to erase server evidence.
 
 ## Local evidence and remaining acceptance
 
-The lead's M1–M4 evidence records focused race/count=1 checks, scoped reviews
-and isolated behavioral mutations/restored greens. Those are local evidence;
-no hosted exact-head API constituents, repo/store-it acceptance or comparative
-CI timing has yet been collected. M5 stays open. Representative tests inspected:
+C1b merged in [PR #3655](https://github.com/vtmocanu/uzi/pull/3655) on
+2026-10-31, with final exact-head hosted checks and timing collected at landing.
+The [PRD landing record](../prds/2506-prerequisite-closure.md#c1b-current-execution-2026-10-29-child-3591)
+distinguishes that M5 evidence from unperformed M6 operator observation and the
+remaining child/parent acceptance. The M1–M4 reports below are historical local
+race/count=1 checks, scoped reviews and isolated mutations/restored greens;
+their original lack of hosted evidence is not the current landing status.
+Representative tests inspected:
 
 | Tests | Claim and limit |
 |---|---|
@@ -207,10 +211,10 @@ weakening old guards; three database-identity mutations fail and restore green.
 Pinned uncapped lint is clean through `60a94c89`. Earlier failed checks remain
 recorded, rather than being represented as aggregate success.
 
-Remaining: exact-head hosted API/repo/store-it PASS with zero SKIP, and
-affected-job/critical-path timing with queue/cache/reruns separated. The added
-per-fixture migration cost remains unmeasured in CI; local command times are
-not a comparative CI delta. The latest pipeline read returned an upstream
-forge error. No hosted verdict or dependency-scan PASS is inferred. M6 live/operator acceptance is a separate
-informative milestone, not performed here. C2/C3, E5/E6, release and hosted
-acceptance remain open; no source-disposal or parent-completion claim follows.
+At worker handoff, exact-head hosted API/repo/store-it and comparative timing
+were uncollected, and the last pipeline read failed upstream. The subsequent
+landing record supplies the required green checks, full inherited sweep and
+timing with queue/cache limits; it does not isolate per-fixture migration cost
+or establish production pin latency. M6 remains a separate unperformed operator
+observation. C2/C3, E5 and parent release/acceptance remain open; E6 is post-roll
+reporting only. No source-disposal, rollout or parent-completion claim follows.

@@ -47,6 +47,25 @@ type PodEpochEvidence struct {
 	SessionStarted   time.Time           `json:"sessionStarted"`
 	TerminalObserved time.Time           `json:"terminalObserved"`
 	SuccessorAdded   time.Time           `json:"successorAdded"`
+	// SuccessorContainers and Attestation are version-2 only: required at
+	// version 2 and forbidden at version 1 (enforced by DecodePodEpochDocument,
+	// because podEpochShape treats omitempty fields as optional).
+	SuccessorContainers []PodEpochSuccessorContainer `json:"successorContainers,omitempty"`
+	Attestation         *PodEpochAttestation         `json:"attestation,omitempty"`
+}
+
+// PodEpochSuccessorContainer is a successor container identity observed by the
+// controller; exactly name and containerID.
+type PodEpochSuccessorContainer struct {
+	Name        string `json:"name"`
+	ContainerID string `json:"containerID"`
+}
+
+// PodEpochAttestation is the controller's cross-check of runtime prefixes of the
+// predecessor and successor container IDs against the declared runtime.
+type PodEpochAttestation struct {
+	Result string `json:"result"`
+	Reason string `json:"reason"`
 }
 type PodEpochNegative struct {
 	Handoff string `json:"handoff"`
@@ -57,8 +76,10 @@ var podEpochUUID = regexp.MustCompile("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 
 func podEpochRuntime(s string) bool { return s == "containerd-runc" || s == "crio-crun" }
 
-// DecodePodEpochDocument is the version-1 worker wire contract. It rejects duplicate
-// keys at every depth, nulls, unknown/missing fields, and trailing JSON.
+// DecodePodEpochDocument is the worker wire contract for versions 1 and 2. Version 2
+// adds required successorContainers and attestation, which version 1 must not carry.
+// It rejects duplicate keys at every depth, nulls, unknown/missing fields, and
+// trailing JSON. A decoded document alone grants no cleanup authority.
 func DecodePodEpochDocument(b []byte) (*PodEpochEvidence, *PodEpochNegative, error) {
 	if len(b) == 0 || len(b) > PodEpochMaxDocument || !utf8.Valid(b) {
 		return nil, nil, errors.New("document size")
@@ -94,7 +115,7 @@ func DecodePodEpochDocument(b []byte) (*PodEpochEvidence, *PodEpochNegative, err
 	if err := json.Unmarshal(b, &e); err != nil {
 		return nil, nil, err
 	}
-	if e.Version != 1 || !podEpochUUID.MatchString(e.Session) || !podEpochUUID.MatchString(e.Predecessor) || !podEpochUUID.MatchString(e.Successor) || e.Predecessor == e.Successor || !podEpochRuntime(e.Runtime) {
+	if (e.Version != 1 && e.Version != 2) || !podEpochUUID.MatchString(e.Session) || !podEpochUUID.MatchString(e.Predecessor) || !podEpochUUID.MatchString(e.Successor) || e.Predecessor == e.Successor || !podEpochRuntime(e.Runtime) {
 		return nil, nil, errors.New("identity or runtime")
 	}
 	if !podEpochValidClaim(e.Data) || !podEpochValidClaim(e.DinD) || e.Data.Name == e.DinD.Name {
@@ -110,6 +131,25 @@ func DecodePodEpochDocument(b []byte) (*PodEpochEvidence, *PodEpochNegative, err
 		if strings.TrimSpace(m.OperationID) == "" || !podEpochUUID.MatchString(m.OldClaimUID) || !podEpochUUID.MatchString(m.NewClaimUID) || m.OldClaimUID == m.NewClaimUID || m.NewClaimUID != e.DinD.UID {
 			return nil, nil, errors.New("maintenance")
 		}
+	}
+	if e.Version == 1 {
+		if e.SuccessorContainers != nil || e.Attestation != nil {
+			return nil, nil, errors.New("version 1 carries version 2 fields")
+		}
+		return &e, nil, nil
+	}
+	if e.Attestation == nil || (e.Attestation.Result != "consistent" && e.Attestation.Result != "contradicted") || strings.TrimSpace(e.Attestation.Reason) == "" {
+		return nil, nil, errors.New("attestation")
+	}
+	if len(e.SuccessorContainers) == 0 {
+		return nil, nil, errors.New("successor containers")
+	}
+	seen := map[string]bool{}
+	for _, c := range e.SuccessorContainers {
+		if c.Name == "" || c.ContainerID == "" || seen[c.Name] {
+			return nil, nil, errors.New("successor containers")
+		}
+		seen[c.Name] = true
 	}
 	return &e, nil, nil
 }

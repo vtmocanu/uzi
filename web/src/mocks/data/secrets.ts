@@ -87,6 +87,19 @@ export const mockSecrets: SecretMeta[] = [
     created_at: daysAgo(6),
     updated_at: minsAgo(14),
   },
+  // A 7-day-only account (see mockMyTokenRateLimits): auto_eligible matches its
+  // meter fixture, both false.
+  {
+    id: "sec-seven-only",
+    kind: "anthropic_token",
+    label: "ultra-key",
+    is_default: false,
+    enabled: true,
+    disabled_at: null,
+    auto_eligible: false,
+    created_at: daysAgo(3),
+    updated_at: minsAgo(2),
+  },
   // Codex credentials (PRD #1147 / issue #1174 item 10). Seeded so ALL FOUR status
   // badges — and the legend that explains them — are browsable in the mock: the
   // create path only ever births `staging`/`static`, so `linked` and `failed` are

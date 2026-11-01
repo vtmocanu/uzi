@@ -22,6 +22,7 @@ var summaryOmitted = map[string]bool{
 	"repo_agents":       true,
 	"issue_description": true,
 	"preserved_patch":   true,
+	"lead_config":       true, // GetRun-only overlay (PRD #3244); never on a list or summary.
 }
 
 // TestRunSummaryItemDTOKeys pins the summary key set to the list item's key set minus
@@ -67,6 +68,7 @@ func TestRunSummaryItemRoundTrip(t *testing.T) {
 	want.RunDTO.WorkerName = nil
 	want.RunDTO.RepoPath = "" // detail-only; the list carries its own shadowing RepoPath
 	want.CapabilityProvenance = nil
+	want.LeadConfig = nil
 
 	got := RunSummaryOf(full).ListItem()
 	if !reflect.DeepEqual(got, want) {

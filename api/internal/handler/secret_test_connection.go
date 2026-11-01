@@ -228,10 +228,17 @@ func (h *Handler) anthropicTestRejected(ctx context.Context, row store.GetAnthro
 }
 
 func (h *Handler) anthropicTestSuccess(ctx context.Context, row store.GetAnthropicTokenToPollRow, reading anthropic.Reading) secretTestResult {
+	// No 5-hour window (reading.FiveHour nil) stores NULL pct + reset.
+	var fhPct pgtype.Int2
+	var fhReset *time.Time
+	if reading.FiveHour != nil {
+		fhPct = pgtype.Int2{Int16: int16(reading.FiveHour.Pct), Valid: true} //nolint:gosec // G115: a rate-limit percentage (0-100), far within int16 range
+		fhReset = reading.FiveHour.ResetsAt
+	}
 	n, err := h.q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID: row.ID, UserID: row.UserID, EnablementRev: row.EnablementRev,
-		FiveHourPct:      pgtype.Int2{Int16: int16(reading.FiveHour.Pct), Valid: true}, //nolint:gosec // G115: a rate-limit percentage (0-100), far within int16 range
-		FiveHourResetsAt: pgconv.TimePtr(reading.FiveHour.ResetsAt),
+		FiveHourPct:      fhPct,
+		FiveHourResetsAt: pgconv.TimePtr(fhReset),
 		SevenDayPct:      pgtype.Int2{Int16: int16(reading.SevenDay.Pct), Valid: true}, //nolint:gosec // G115: a rate-limit percentage (0-100), far within int16 range
 		SevenDayResetsAt: pgconv.TimePtr(reading.SevenDay.ResetsAt),
 		Source:           pgconv.Text(reading.Source), SyncedAt: pgconv.Time(time.Now().UTC()),

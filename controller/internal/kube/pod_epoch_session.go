@@ -6,11 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
@@ -21,6 +26,7 @@ import (
 const PodEpochMaxIdentities = 4096
 const PodEpochMaxMetadata = 16 * 1024 * 1024
 const podEpochRequestTimeout = 10 * time.Second
+const podEpochDeliveryBudget = 90 * time.Second
 
 // PodEpochGeneration is an opaque subscription token, required on every event.
 // A caller must stop the old watch after Reset; replay with its token is refused.
@@ -38,6 +44,30 @@ type podEpochRecord struct {
 	deletedAt  uint64
 	tainted    bool
 	identity   *PodEpochIdentity
+	// pending is the frozen positive proof awaiting successor container IDs.
+	pending     *PodEpochEvidence
+	pendingCost int
+}
+
+func (s *PodEpochSession) dropPending(r *podEpochRecord) {
+	s.bytes -= r.pendingCost
+	r.pending = nil
+	r.pendingCost = 0
+}
+
+// podEpochDelivery is a bounded tombstone after completion. Payload is released,
+// but the UID cannot acquire a fresh budget until the generation is reset.
+type podEpochDelivery struct {
+	firstSeen           time.Time
+	context             context.Context
+	attempts, conflicts int
+	stopped             bool
+	negative            string
+	negativeCost        int
+	issuedCost          int
+	identityUnverified  bool
+	issued              *PodEpochDecision
+	worker              string
 }
 type PodEpochDecision struct {
 	generation               PodEpochGeneration
@@ -55,29 +85,35 @@ func (d *PodEpochDecision) Document() string { return d.document }
 // Retained pod JSON and identity keys are charged before storage. Overflow drops
 // proof state permanently until Reset, retaining only the generation fence.
 type PodEpochSession struct {
-	events         sync.Mutex
-	mu             sync.Mutex
-	resolver       PodEpochIdentityResolver
-	client         kubernetes.Interface
-	workers        []PodEpochWorker
-	workerBytes    int
-	invalidWorkers bool
-	generation     PodEpochGeneration
-	id             string
-	started        time.Time
-	seq            uint64
-	records        map[string]*podEpochRecord
-	current        map[string]string
-	attempts       map[string]bool
-	identities     map[string]bool
-	relatedIDs     map[string]bool
-	remints        map[string]PodEpochRemint
-	bytes          int
-	overflow       bool
+	events          sync.Mutex
+	mu              sync.Mutex
+	resolver        PodEpochIdentityResolver
+	client          kubernetes.Interface
+	workers         []PodEpochWorker
+	workerBytes     int
+	invalidWorkers  bool
+	generation      PodEpochGeneration
+	id              string
+	started         time.Time
+	seq             uint64
+	records         map[string]*podEpochRecord
+	current         map[string]string
+	attempts        map[string]*podEpochDelivery
+	logger          *slog.Logger
+	now             func() time.Time
+	identities      map[string]bool
+	relatedIDs      map[string]bool
+	remints         map[string]PodEpochRemint
+	bytes           int
+	overflow        bool
+	deliveryStopped bool
 }
 
-func NewPodEpochSession(client kubernetes.Interface, resolver PodEpochIdentityResolver, workers []PodEpochWorker) *PodEpochSession {
-	s := &PodEpochSession{client: client, resolver: resolver}
+func NewPodEpochSession(client kubernetes.Interface, resolver PodEpochIdentityResolver, workers []PodEpochWorker, loggers ...*slog.Logger) *PodEpochSession {
+	s := &PodEpochSession{client: client, resolver: resolver, logger: slog.Default(), now: time.Now}
+	if len(loggers) > 0 && loggers[0] != nil {
+		s.logger = loggers[0]
+	}
 	for _, w := range workers {
 		if err := s.RegisterWorker(w); err != nil {
 			s.invalidWorkers = true
@@ -146,6 +182,9 @@ func (s *PodEpochSession) RegisterWorker(w PodEpochWorker) error {
 		chosen = ""
 	}
 	s.current[w.ID] = chosen
+	for uid, a := range s.attempts {
+		s.checkDelivery(uid, a)
+	}
 	return nil
 }
 
@@ -153,6 +192,7 @@ func (s *PodEpochSession) RegisterWorker(w PodEpochWorker) error {
 // predecessors only. The caller establishes a watch from the opaque LIST RV.
 func (s *PodEpochSession) Reset(ctx context.Context, pods []corev1.Pod) (PodEpochGeneration, error) {
 	s.mu.Lock()
+	s.stopAllLocked("reset")
 	s.generation++
 	g := s.generation
 	var b [16]byte
@@ -166,11 +206,12 @@ func (s *PodEpochSession) Reset(ctx context.Context, pods []corev1.Pod) (PodEpoc
 	s.id = fmt.Sprintf("%x-%x-%x-%x-%x", b[:4], b[4:6], b[6:8], b[8:10], b[10:])
 	s.started = time.Now().UTC()
 	s.seq = 0
+	s.deliveryStopped = false
 	s.bytes = s.workerBytes
 	s.overflow = s.invalidWorkers
 	s.records = map[string]*podEpochRecord{}
 	s.current = map[string]string{}
-	s.attempts = map[string]bool{}
+	s.attempts = map[string]*podEpochDelivery{}
 	s.relatedIDs = map[string]bool{}
 	s.identities = map[string]bool{}
 	s.remints = map[string]PodEpochRemint{}
@@ -203,7 +244,81 @@ func (s *PodEpochSession) Reset(ctx context.Context, pods []corev1.Pod) (PodEpoc
 func (s *PodEpochSession) Handle(ctx context.Context, g PodEpochGeneration, event watch.EventType, p *corev1.Pod) (*PodEpochDecision, error) {
 	return s.handle(ctx, g, event, p, false)
 }
+
+// StopGeneration fences quiet watch cancellation before Stop joins Run.
+func (s *PodEpochSession) StopGeneration(g PodEpochGeneration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if g == s.generation {
+		s.deliveryStopped = true
+		s.stopAllLocked("watch_stopped")
+	}
+}
+func (s *PodEpochSession) stopAllLocked(reason string) {
+	for uid, a := range s.attempts {
+		s.stopDelivery(uid, a, reason, false)
+	}
+}
+func (s *PodEpochSession) stopDelivery(uid string, a *podEpochDelivery, reason string, success bool) {
+	if a == nil || a.stopped {
+		return
+	}
+	a.stopped = true
+	if r := s.records[uid]; r != nil {
+		s.dropPending(r)
+	}
+	s.bytes -= a.negativeCost
+	if a.issued != nil {
+		s.bytes -= a.issuedCost
+	}
+	a.negative, a.negativeCost, a.issuedCost, a.issued = "", 0, 0, nil
+	args := []any{"reason", reason, "attempts", a.attempts, "conflicts", a.conflicts, "elapsed", s.now().Sub(a.firstSeen)}
+	if success {
+		s.logger.Info("pod epoch delivery succeeded", args...)
+	} else {
+		s.logger.Info("pod epoch delivery stopped", args...)
+	}
+}
+func (s *PodEpochSession) checkDelivery(uid string, a *podEpochDelivery) bool {
+	if a == nil || a.stopped {
+		return false
+	}
+	reason := ""
+	r := s.records[uid]
+	switch {
+	case s.deliveryStopped:
+		reason = "watch_stopped"
+	case a.context.Err() != nil:
+		reason = "canceled"
+	case s.now().Sub(a.firstSeen) >= podEpochDeliveryBudget:
+		reason = "time_budget"
+	case a.attempts >= 3:
+		reason = "attempt_limit"
+	case r == nil:
+		reason = "record_missing"
+	case r.deleted:
+		reason = "deleted"
+	case r.terminal != 0:
+		reason = "terminal"
+	case r.tainted && (!a.identityUnverified || a.attempts != 0):
+		reason = "tainted"
+	case s.current[a.worker] != uid:
+		reason = "superseded"
+	default:
+		var p corev1.Pod
+		_ = json.Unmarshal(r.raw, &p)
+		if p.Status.Phase == corev1.PodFailed || p.Status.Phase == corev1.PodSucceeded {
+			reason = "terminal"
+		}
+	}
+	if reason != "" {
+		s.stopDelivery(uid, a, reason, false)
+		return false
+	}
+	return true
+}
 func (s *PodEpochSession) invalidate() {
+	s.stopAllLocked("metadata_overflow")
 	s.overflow = true
 	s.records = map[string]*podEpochRecord{}
 	s.current = map[string]string{}
@@ -211,7 +326,7 @@ func (s *PodEpochSession) invalidate() {
 	s.identities = map[string]bool{}
 	s.remints = map[string]PodEpochRemint{}
 	// No further decisions are issued, so attempts need not grow after overflow.
-	s.attempts = map[string]bool{}
+	s.attempts = map[string]*podEpochDelivery{}
 	s.bytes = 0
 }
 
@@ -233,12 +348,12 @@ func (s *PodEpochSession) chargeKey(key string) bool {
 	if s.identities[key] {
 		return true
 	}
-	if len(s.identities) >= PodEpochMaxIdentities || s.bytes+len(key) > PodEpochMaxMetadata {
+	if len(s.identities) >= PodEpochMaxIdentities || s.bytes+len(key)+64 > PodEpochMaxMetadata {
 		s.invalidate()
 		return false
 	}
 	s.identities[key] = true
-	s.bytes += len(key)
+	s.bytes += len(key) + 64
 	return true
 }
 
@@ -299,8 +414,14 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 	}
 	s.mu.Lock()
 	if g != s.generation || ctx.Err() != nil {
+		if g == s.generation {
+			s.stopAllLocked("canceled")
+		}
 		s.mu.Unlock()
 		return nil, errors.New("stale or canceled session")
+	}
+	for uid, a := range s.attempts {
+		s.checkDelivery(uid, a)
 	}
 	if s.overflow {
 		s.mu.Unlock()
@@ -319,6 +440,9 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 		return nil, nil
 	}
 	delta := len(raw)
+	if old == nil {
+		delta += 512
+	}
 	if old != nil {
 		delta -= len(old.raw)
 	}
@@ -331,9 +455,6 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 	if baseline {
 		r.start = 0
 	}
-	if old == nil {
-		delta += 512
-	}
 	if old != nil {
 		*r = *old
 		r.raw = raw
@@ -343,6 +464,9 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 		_ = json.Unmarshal(old.raw, &prev)
 		if prev.Labels[LabelWorkerID] != p.Labels[LabelWorkerID] || !podEpochSameMounts(&prev, p) || old.deleted {
 			r.tainted = true
+			if a := s.attempts[uid]; a != nil {
+				a.identityUnverified = false
+			}
 		}
 	}
 	// Keep the union even for workers which have not been registered yet.
@@ -450,6 +574,9 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 		}
 	}
 	if worker == nil {
+		if a := s.attempts[uid]; a != nil {
+			s.checkDelivery(uid, a)
+		}
 		s.mu.Unlock()
 		return nil, nil
 	}
@@ -463,7 +590,24 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 	if baseline {
 		s.current[w.ID] = uid
 	}
-	needsIdentity := baseline || fresh || (signal && r.identity == nil)
+	if fresh {
+		cost := 256 + len(uid) + len(w.ID)
+		if s.bytes+cost > PodEpochMaxMetadata {
+			s.invalidate()
+			s.mu.Unlock()
+			return nil, nil
+		}
+		s.bytes += cost
+		s.attempts[uid] = &podEpochDelivery{firstSeen: s.now(), context: ctx, worker: w.ID}
+	}
+	// Supersession also stops issued decisions for the previous current pod.
+	for other, a := range s.attempts {
+		if other != uid {
+			s.checkDelivery(other, a)
+		}
+	}
+	a := s.attempts[uid]
+	needsIdentity := baseline || fresh || (signal && r.identity == nil && a == nil)
 	s.mu.Unlock()
 	var identity PodEpochIdentity
 	var identityErr error
@@ -479,6 +623,9 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if g != s.generation || ctx.Err() != nil {
+		if g == s.generation {
+			s.stopAllLocked("canceled")
+		}
 		return nil, errors.New("stale or canceled resolution")
 	}
 	if s.overflow {
@@ -493,49 +640,126 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 					return nil, nil
 				}
 			}
+			b, err := json.Marshal(identity)
+			if err != nil || s.bytes+len(b) > PodEpochMaxMetadata {
+				s.invalidate()
+				return nil, nil
+			}
+			s.bytes += len(b)
 			r.identity = &identity
 		}
 	}
 	if needsIdentity && identityErr != nil {
 		r.tainted = true
 	}
-	if !fresh {
+	if a == nil || a.stopped {
 		return nil, nil
 	}
-	doc := s.produce(w, p, r, predecessor, identityErr)
+	if fresh {
+		doc, proof := s.produce(w, p, r, predecessor, identityErr)
+		a.identityUnverified = identityErr != nil
+		if proof != nil {
+			b, err := json.Marshal(proof)
+			if err != nil {
+				s.stopDelivery(uid, a, "encoding", false)
+				return nil, nil
+			}
+			if s.bytes+len(b) > PodEpochMaxMetadata {
+				s.invalidate()
+				return nil, nil
+			}
+			s.bytes += len(b)
+			r.pending, r.pendingCost = proof, len(b)
+		} else {
+			if !s.retainNegative(a, doc) {
+				return nil, nil
+			}
+		}
+	}
+	if !s.checkDelivery(uid, a) {
+		return nil, nil
+	}
+	// An issued decision remains single-use; a later event may retry only
+	// after its actual conflict has consumed it.
+	if a.issued != nil {
+		return nil, nil
+	}
 	if p.ResourceVersion == "" || !podEpochUUID.MatchString(uid) {
+		s.stopDelivery(uid, a, "invalid_target", false)
 		return nil, nil
 	}
-	return &PodEpochDecision{generation: g, session: s, namespace: p.Namespace, name: p.Name, uid: uid, rv: p.ResourceVersion, document: doc, context: ctx}, nil
+	doc := a.negative
+	if r.pending != nil {
+		// Positive Added freezes proof, even if Added already carries IDs.
+		if fresh {
+			return nil, nil
+		}
+		succ := podEpochSuccessorContainers(p)
+		if len(succ) == 0 {
+			return nil, nil
+		}
+		doc = podEpochComplete(*r.pending, succ)
+		if doc == podEpochNegativeDoc("evidence_invalid_or_oversize") {
+			if !s.retainNegative(a, doc) {
+				return nil, nil
+			}
+			s.dropPending(r)
+		}
+	}
+	if doc == "" {
+		return nil, nil
+	}
+	d := &PodEpochDecision{generation: g, session: s, namespace: p.Namespace, name: p.Name, uid: uid, rv: p.ResourceVersion, document: doc, context: a.context}
+	// Charge the issued document and variable target metadata separately from
+	// the proof/negative payload, including the event resourceVersion.
+	cost := len(doc) + len(d.namespace) + len(d.name) + len(d.uid) + len(d.rv) + 128
+	if s.bytes+cost > PodEpochMaxMetadata {
+		s.invalidate()
+		return nil, nil
+	}
+	s.bytes += cost
+	a.issuedCost = cost
+	a.issued = d
+	return d, nil
+}
+func (s *PodEpochSession) retainNegative(a *podEpochDelivery, doc string) bool {
+	if s.bytes+len(doc) > PodEpochMaxMetadata {
+		s.invalidate()
+		return false
+	}
+	a.negative, a.negativeCost = doc, len(doc)
+	s.bytes += len(doc)
+	return true
 }
 func podEpochSameMounts(a, b *corev1.Pod) bool {
 	x, _ := json.Marshal(a.Spec.Volumes)
 	y, _ := json.Marshal(b.Spec.Volumes)
 	return string(x) == string(y)
 }
-func (s *PodEpochSession) produce(w PodEpochWorker, p *corev1.Pod, r *podEpochRecord, pred string, identityErr error) string {
-	negative := func(reason string) string {
-		b, _ := json.Marshal(PodEpochNegative{Handoff: "none", Reason: reason})
-		return string(b)
-	}
+
+// produce evaluates every proof check at the successor's Added event. It returns
+// a negative document, or a frozen positive proof (document empty) to be completed
+// by podEpochComplete.
+func (s *PodEpochSession) produce(w PodEpochWorker, p *corev1.Pod, r *podEpochRecord, pred string, identityErr error) (string, *PodEpochEvidence) {
+	neg := func(reason string) (string, *PodEpochEvidence) { return podEpochNegativeDoc(reason), nil }
 	x := s.records[pred]
 	if identityErr != nil || r.identity == nil {
-		return negative("identity_unverified")
+		return neg("identity_unverified")
 	}
 	if !podEpochRuntime(w.Runtime) {
-		return negative("runtime_not_declared")
+		return neg("runtime_not_declared")
 	}
 	if !podEpochPrivatePID(p) {
-		return negative("successor_pid_unaudited")
+		return neg("successor_pid_unaudited")
 	}
 	if x == nil || x.terminal == 0 || x.terminal >= r.start || x.tainted || x.identity == nil {
-		return negative("predecessor_unproven")
+		return neg("predecessor_unproven")
 	}
 	var xp corev1.Pod
 	_ = json.Unmarshal(x.proof, &xp)
 	cs, is, ok := podEpochSignal(&xp)
 	if !ok {
-		return negative("predecessor_unproven")
+		return neg("predecessor_unproven")
 	}
 	for id, other := range s.records {
 		if id == pred || id == string(p.UID) || other.start > r.start {
@@ -554,25 +778,74 @@ func (s *PodEpochSession) produce(w PodEpochWorker, p *corev1.Pod, r *podEpochRe
 			continue
 		}
 		if other.tainted || other.terminal == 0 || other.terminal >= x.terminal {
-			return negative("concurrent_pod_unproven")
+			return neg("concurrent_pod_unproven")
 		}
 	}
 	before, after := x.identity, r.identity
 	if before.Data != after.Data || before.DinD.Name != after.DinD.Name || (before.DinD.UID == after.DinD.UID && before.DinD.VolumeName != after.DinD.VolumeName) {
-		return negative("claim_changed")
+		return neg("claim_changed")
 	}
 	var remint *PodEpochRemint
 	if before.DinD.UID != after.DinD.UID {
 		receipt, ok := s.remints[w.ID+":"+before.DinD.UID+":"+after.DinD.UID]
 		if !ok || receipt.OldClaimUID != before.DinD.UID || receipt.NewClaimUID != after.DinD.UID {
-			return negative("dind_remint_unrecorded")
+			return neg("dind_remint_unrecorded")
 		}
 		remint = &receipt
 	}
-	e := PodEpochEvidence{Version: 1, Session: s.id, Predecessor: pred, Successor: string(p.UID), Containers: cs, InitContainers: is, Data: after.Data, DinD: after.DinD, Maintenance: remint, Runtime: w.Runtime, SessionStarted: s.started, TerminalObserved: x.terminalAt, SuccessorAdded: r.addedAt}
+	// The proof is frozen here; successor container IDs and the attestation are
+	// added when they first appear (see podEpochComplete).
+	e := PodEpochEvidence{Version: 2, Session: s.id, Predecessor: pred, Successor: string(p.UID), Containers: cs, InitContainers: is, Data: after.Data, DinD: after.DinD, Maintenance: remint, Runtime: w.Runtime, SessionStarted: s.started, TerminalObserved: x.terminalAt, SuccessorAdded: r.addedAt}
+	return "", &e
+}
+
+func podEpochNegativeDoc(reason string) string {
+	b, _ := json.Marshal(PodEpochNegative{Handoff: "none", Reason: reason})
+	return string(b)
+}
+
+// podEpochSuccessorContainers lists every successor status entry with a
+// container ID, init containers first.
+func podEpochSuccessorContainers(p *corev1.Pod) []PodEpochSuccessorContainer {
+	var out []PodEpochSuccessorContainer
+	for _, list := range [][]corev1.ContainerStatus{p.Status.InitContainerStatuses, p.Status.ContainerStatuses} {
+		for _, c := range list {
+			if c.ContainerID != "" {
+				out = append(out, PodEpochSuccessorContainer{Name: c.Name, ContainerID: c.ContainerID})
+			}
+		}
+	}
+	return out
+}
+
+// podEpochComplete turns a frozen positive proof into the final v2 document
+// once the successor reports container IDs.
+func podEpochComplete(e PodEpochEvidence, succ []PodEpochSuccessorContainer) string {
+	prefix := "containerd://"
+	if e.Runtime == "crio-crun" {
+		prefix = "cri-o://"
+	}
+	att := PodEpochAttestation{Result: "consistent", Reason: "observations_consistent"}
+	for _, list := range [][]PodEpochContainer{e.Containers, e.InitContainers} {
+		for _, c := range list {
+			if !strings.HasPrefix(c.ContainerID, prefix) {
+				att = PodEpochAttestation{Result: "contradicted", Reason: "predecessor_runtime_prefix"}
+			}
+		}
+	}
+	if att.Result == "consistent" {
+		for _, c := range succ {
+			if !strings.HasPrefix(c.ContainerID, prefix) {
+				att = PodEpochAttestation{Result: "contradicted", Reason: "successor_runtime_prefix"}
+				break
+			}
+		}
+	}
+	e.SuccessorContainers = succ
+	e.Attestation = &att
 	b, err := EncodePodEpochEvidence(e)
 	if err != nil {
-		return negative("evidence_invalid_or_oversize")
+		return podEpochNegativeDoc("evidence_invalid_or_oversize")
 	}
 	return string(b)
 }
@@ -615,39 +888,119 @@ func (s *PodEpochSession) RecordMaintenanceRemint(g PodEpochGeneration, worker s
 	return nil
 }
 
-// Deliver reserves the single attempt under the reset fence. The API call is
-// submitted while holding that fence: Reset cannot interpose after validation.
-// Once submitted, cancellation/reset cannot promise to revoke the server write.
-// No retries, including conflicts and ambiguous transport failures.
+// podEpochFailureReason deliberately excludes raw API/transport messages.
+func podEpochFailureReason(err error) string {
+	if apierrors.IsConflict(err) {
+		return "conflict"
+	}
+	if apierrors.IsTooManyRequests(err) {
+		return "rate_limited"
+	}
+	if errors.Is(err, context.DeadlineExceeded) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	var capError *http.MaxBytesError
+	if errors.As(err, &capError) {
+		return "response_cap"
+	}
+	var status apierrors.APIStatus
+	if errors.As(err, &status) {
+		if status.Status().Code >= 500 {
+			return "server_error"
+		}
+		return "api_error"
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "transport_error"
+	}
+	return "request_failed"
+}
+
+// Deliver consumes one decision under the reset fence, held through the API
+// call and outcome classification. Only a conflict permits a later changed
+// watch object to issue another decision; the same decision never retries.
+// The budget bounds new submissions, not server commits: an already-submitted
+// request can still commit after cancellation, expiry or Reset.
 func (s *PodEpochSession) Deliver(ctx context.Context, d *PodEpochDecision) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if d == nil || d.session != s || d.generation != s.generation || s.overflow {
 		return errors.New("stale decision")
 	}
-	if d.discarded || ctx.Err() != nil || d.context.Err() != nil {
-		d.discarded = true
-		return errors.New("canceled decision")
+	for uid, a := range s.attempts {
+		if uid != d.uid {
+			s.checkDelivery(uid, a)
+		}
 	}
-	if s.attempts[d.uid] {
+	a := s.attempts[d.uid]
+	if ctx.Err() != nil {
+		s.stopDelivery(d.uid, a, "canceled", false)
+	}
+	active := s.checkDelivery(d.uid, a)
+	if d.discarded {
 		return errors.New("attempt already submitted")
 	}
-	s.attempts[d.uid] = true
+	if !active || a.issued != d {
+		d.discarded = true
+		return errors.New("stopped decision")
+	}
+	d.discarded = true
+	a.issued = nil
+	s.bytes -= a.issuedCost
+	a.issuedCost = 0
 	body, err := json.Marshal(map[string]any{"metadata": map[string]any{"uid": d.uid, "resourceVersion": d.rv, "annotations": map[string]string{PodEpochAnnotation: d.document}}})
 	if err != nil {
+		s.stopDelivery(d.uid, a, "encoding", false)
 		return err
 	}
-	requestCtx, cancel := context.WithTimeout(markMaintenanceRead(ctx), podEpochRequestTimeout)
-	defer cancel()
 	client := s.client.CoreV1().RESTClient()
 	if concrete, ok := client.(*rest.RESTClient); ok && concrete == nil {
 		client = nil
 	}
+	// Recheck after body/client preparation, then cap this request by the
+	// nonrenewable remainder immediately before submission.
+	if !s.checkDelivery(d.uid, a) {
+		return errors.New("stopped decision")
+	}
+	remaining := podEpochDeliveryBudget - s.now().Sub(a.firstSeen)
+	if remaining <= 0 {
+		s.stopDelivery(d.uid, a, "time_budget", false)
+		return errors.New("delivery budget expired")
+	}
+	requestCtx, cancel := context.WithTimeout(markMaintenanceRead(ctx), min(podEpochRequestTimeout, remaining))
+	defer cancel()
+	// Preserve original observation cancellation even with a fresh caller context.
+	stopCancel := context.AfterFunc(a.context, cancel)
+	defer stopCancel()
+	if requestCtx.Err() != nil || a.context.Err() != nil {
+		s.stopDelivery(d.uid, a, "canceled", false)
+		return errors.New("stopped decision")
+	}
+	a.attempts++
 	if client != nil {
-		return client.Patch(types.MergePatchType).MaxRetries(0).
+		err = client.Patch(types.MergePatchType).MaxRetries(0).
 			Namespace(d.namespace).Resource("pods").Name(d.name).Body(body).
 			Do(requestCtx).Error()
+	} else {
+		_, err = s.client.CoreV1().Pods(d.namespace).Patch(requestCtx, d.name, types.MergePatchType, body, metav1.PatchOptions{})
 	}
-	_, err = s.client.CoreV1().Pods(d.namespace).Patch(requestCtx, d.name, types.MergePatchType, body, metav1.PatchOptions{})
+	if err == nil {
+		s.stopDelivery(d.uid, a, "success", true)
+		return nil
+	}
+	reason := podEpochFailureReason(err)
+	if apierrors.IsConflict(err) {
+		a.conflicts++
+	}
+	s.logger.Warn("pod epoch delivery request failed", "reason", reason, "attempts", a.attempts)
+	if !apierrors.IsConflict(err) {
+		s.stopDelivery(d.uid, a, reason, false)
+	} else {
+		s.checkDelivery(d.uid, a)
+	}
 	return err
 }

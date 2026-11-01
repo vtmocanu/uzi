@@ -163,7 +163,7 @@ func TestHumanStopViewNeutralSGR(t *testing.T) {
 		for _, admin := range []bool{false, true} {
 			m := humanStopBoard(t, dark, admin, 100)
 			out := m.View().Content
-			segment := paintSeg(m.pal.faintC, nil, false, "stopped       ")
+			segment := paintSeg(m.pal.faintC, nil, false, padCell("stopped", boardTestStatusW(m)))
 			for _, title := range []string{"cancel title", "reject title", "stop title"} {
 				if row := lineWith(t, out, title); !strings.Contains(row, segment) {
 					t.Errorf("board neutral SGR segment absent %q:\n%q", segment, row)

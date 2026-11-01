@@ -6212,6 +6212,150 @@ describe("3506 retry context lifetime", () => {
   });
 });
 
+// PRD #3244 M2: the runtime-reported lead model and effort, from the thread/start and
+// thread/resume responses.
+describe("CodexHarness runtime config observation (PRD #3244 M2)", () => {
+  type Obs = import("../src/harness.js").RuntimeConfigObservation;
+
+  async function observe(
+    response: Record<string, unknown>,
+    opts: { resume?: boolean; effort?: RunTurnRequest["effort"]; throwInCallback?: boolean } = {},
+  ): Promise<{ obs: Obs[]; requests: { method: string; params: unknown }[] }> {
+    const transport = new FakeTransport((method) => {
+      if (method === "thread/start") return { thread: { id: "th-1" }, ...response };
+      if (method === "thread/resume") return { thread: { id: "resumed-1" }, ...response };
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport });
+    const obs: Obs[] = [];
+    const threadId = opts.resume ? "resumed-1" : "th-1";
+    transport.push(threadStarted(threadId)).push(turnCompleted("completed", undefined, threadId)).end();
+    try {
+      await collect(harness.startTurn(makeRequest({
+        ...(opts.resume ? { resumeSessionId: "resumed-1" } : {}),
+        ...(opts.effort ? { effort: opts.effort } : {}),
+        onRuntimeConfig: (o) => { obs.push(o); if (opts.throwInCallback) throw new Error("boom"); },
+      })).events);
+    } finally { await harness.close(); }
+    return { obs, requests: transport.requests };
+  }
+
+  it("reports the response model and, with no effort sent, the configured reasoningEffort as runtime default", async () => {
+    const { obs, requests } = await observe({ model: "gpt-6-astra", reasoningEffort: "medium", cwd: "/ignored" });
+    assert.equal(rec(requests.find((r) => r.method === "turn/start")!.params).effort, undefined);
+    assert.deepEqual(obs, [{
+      model: "gpt-6-astra", modelEvidence: "codex_thread_response",
+      effort: "medium", effortEvidence: "codex_runtime_default",
+    }]);
+  });
+
+  it("reports the effort sent on turn/start as codex_sent, whatever the thread reports", async () => {
+    const { obs, requests } = await observe({ model: "gpt-6-astra", reasoningEffort: "low" }, { effort: "xhigh" });
+    assert.equal(rec(requests.find((r) => r.method === "turn/start")!.params).effort, "xhigh");
+    assert.deepEqual(obs, [{
+      model: "gpt-6-astra", modelEvidence: "codex_thread_response",
+      effort: "xhigh", effortEvidence: "codex_sent",
+    }]);
+  });
+
+  it("maps persistent and a custom string to other, and a null or absent effort to unknown", async () => {
+    for (const reported of ["persistent", "something-new"]) {
+      const { obs } = await observe({ model: "gpt-6-astra", reasoningEffort: reported });
+      assert.equal(obs[0]!.effort, "other", reported);
+      assert.equal(obs[0]!.effortEvidence, "codex_runtime_default");
+    }
+    for (const response of [{ model: "gpt-6-astra", reasoningEffort: null }, { model: "gpt-6-astra" }]) {
+      const { obs } = await observe(response);
+      assert.equal(obs[0]!.effort, undefined);
+      assert.equal(obs[0]!.effortEvidence, "unknown");
+    }
+  });
+
+  it("keeps a known Codex-only level as itself", async () => {
+    const { obs } = await observe({ model: "gpt-6-astra", reasoningEffort: "minimal" });
+    assert.equal(obs[0]!.effort, "minimal");
+  });
+
+  it("maps a model failing the stored-model rules to unknown", async () => {
+    const bad = ["has space", "tab\there", "bidi\u202eflip", "zero\u200bwidth", "x".repeat(101), "", 42, null];
+    for (const model of bad) {
+      const { obs } = await observe({ model, reasoningEffort: "high" });
+      assert.equal(obs[0]!.model, undefined, JSON.stringify(model));
+      assert.equal(obs[0]!.modelEvidence, "unknown");
+    }
+    const { obs } = await observe({ model: "x".repeat(100), reasoningEffort: "high" });
+    assert.equal(obs[0]!.model, "x".repeat(100), "exactly 100 bytes is accepted");
+  });
+
+  it("the approval epoch's thread/resume produces its own observation", async () => {
+    const { obs, requests } = await observe({ model: "gpt-6-astra", reasoningEffort: "high" }, { resume: true });
+    assert.ok(requests.some((r) => r.method === "thread/resume"));
+    assert.deepEqual(obs, [{
+      model: "gpt-6-astra", modelEvidence: "codex_thread_response",
+      effort: "high", effortEvidence: "codex_runtime_default",
+    }]);
+  });
+
+  it("a throwing callback never reaches the turn", async () => {
+    const { obs } = await observe({ model: "gpt-6-astra", reasoningEffort: "high" }, { throwInCallback: true });
+    assert.equal(obs.length, 1);
+  });
+
+  it("a dispatch refused after thread setup records no observation (no codex_sent without turn/start)", async () => {
+    const transport = new FakeTransport((method) => {
+      if (method === "thread/start") return { thread: { id: "th-1" }, model: "gpt-6-astra", reasoningEffort: "low" };
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport });
+    const obs: unknown[] = [];
+    transport.push(threadStarted()).push(turnCompleted("completed")).end();
+    try {
+      await assert.rejects(collect(harness.startTurn(makeRequest({
+        effort: "xhigh",
+        onRuntimeConfig: (o) => { obs.push(o); },
+        rootDispatch: { prepare: async () => { throw new Error("dispatch refused"); }, check: () => true },
+      })).events), /dispatch refused/);
+    } finally { await harness.close(); }
+    assert.ok(transport.requests.some((r) => r.method === "thread/start"));
+    assert.ok(!transport.requests.some((r) => r.method === "turn/start"));
+    assert.deepEqual(obs, []);
+  });
+
+  it("a later accepted turn reports once after a refused one, and a further turn does not report again", async () => {
+    const transport = new FakeTransport((method) => {
+      if (method === "thread/start") return { thread: { id: "th-1" }, model: "gpt-6-astra", reasoningEffort: "low" };
+      return defaultResponder(method);
+    });
+    const { harness } = makeHarness({ transport });
+    const obs: unknown[] = [];
+    const onRuntimeConfig = (o: unknown) => { obs.push(o); };
+    try {
+      await assert.rejects(collect(harness.startTurn(makeRequest({
+        effort: "xhigh", onRuntimeConfig,
+        rootDispatch: { prepare: async () => { throw new Error("dispatch refused"); }, check: () => true },
+      })).events), /dispatch refused/);
+      assert.deepEqual(obs, []);
+      transport.push(turnCompleted("completed")).push(turnCompleted("completed"));
+      await collect(harness.startTurn(makeRequest({ effort: "xhigh", onRuntimeConfig })).events);
+      await collect(harness.startTurn(makeRequest({ effort: "xhigh", onRuntimeConfig })).events);
+      transport.end();
+    } finally { await harness.close(); }
+    assert.equal(transport.requests.filter((r) => r.method === "turn/start").length, 2);
+    assert.deepEqual(obs, [{
+      model: "gpt-6-astra", modelEvidence: "codex_thread_response",
+      effort: "xhigh", effortEvidence: "codex_sent",
+    }]);
+  });
+
+  it("without a callback nothing is read or required", async () => {
+    const transport = new FakeTransport();
+    const { harness } = makeHarness({ transport });
+    transport.push(threadStarted()).push(turnCompleted("completed")).end();
+    try { await collect(harness.startTurn(makeRequest()).events); } finally { await harness.close(); }
+    assert.ok(transport.requests.some((r) => r.method === "turn/start"));
+  });
+});
+
 // PRD #3247 M2: the opt-in Codex catalog probe (`model/list`) and its bounded parser.
 describe("#3247 catalog probe", () => {
   const opt = (reasoningEffort: string) => ({ reasoningEffort, description: "d" });

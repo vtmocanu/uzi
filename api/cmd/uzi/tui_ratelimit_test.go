@@ -865,3 +865,19 @@ func TestBoardRateLimitStripBarStaysSix(t *testing.T) {
 		t.Errorf("board strip must NOT carry the rail's %d-wide bar:\n%s", railRateBarWidth, out)
 	}
 }
+
+// A readable token whose account has no 5-hour window (nil FiveHour on an ok reading)
+// renders only the 7-day cell in the board strip.
+func TestBoardRateLimitStripOmitsAbsentFiveHour(t *testing.T) {
+	m := stripModel(t, []apitypes.TokenRateLimitDTO{
+		{SecretID: "sec-ultra", Label: "ultra", IsDefault: true, Limits: apitypes.RateLimitDTO{
+			Status: "ok", SevenDay: &apitypes.RateLimitWindow{Pct: 31}}},
+	}, nil)
+	out := m.View().Content
+	if !strings.Contains(out, "7d") || !strings.Contains(out, "31%") {
+		t.Errorf("the 7-day cell must render:\n%s", out)
+	}
+	if strings.Contains(out, "5h") {
+		t.Errorf("a 7d-only account must not render a 5h cell:\n%s", out)
+	}
+}

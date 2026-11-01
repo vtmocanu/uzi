@@ -352,15 +352,18 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev,
 	switch {
 	case !errors.As(err, &aerr) || aerr.Kind == anthropic.KindTransport:
 		// Transport failure — transient, just wait for the next tick (no backoff).
+		e.logPollFailure(secretID, "usage", err)
 		return
 	case aerr.Kind == anthropic.KindMalformed:
 		// A 2xx we couldn't parse — fail closed: keep the last good row, no backoff.
+		e.logPollFailure(secretID, "usage", err)
 		return
 	}
 
 	// KindHTTP: the usage endpoint definitively refused this credential (observed:
 	// 429 for setup-tokens). Fall back to the ~1-token header probe (D2).
 	if !e.probe {
+		e.logPollFailure(secretID, "usage", err)
 		e.setBackoff(secretID) // no usable fallback → back off (D5)
 		return
 	}
@@ -380,9 +383,29 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev,
 			e.logger.Error("usage poller: mark rejected token", "secret", secretID.String(), "error", markErr)
 		}
 	}
+	e.logPollFailure(secretID, "probe", perr)
 	// The probe also failed (refused, transport, or malformed) — no usable fallback,
 	// so back off to avoid hammering a persistently refusing credential (D5).
 	e.setBackoff(secretID)
+}
+
+// logPollFailure logs one line for a poll that ended without a reading: the secret
+// id, which call failed, the error kind and (for a refusal) the HTTP status. It
+// never logs the token or a response body. A token in backoff is skipped before any
+// call, so this fires at most once per tick per token.
+func (e *Engine) logPollFailure(secretID uuid.UUID, call string, err error) {
+	kind, status := "transport", 0
+	var aerr *anthropic.Error
+	if errors.As(err, &aerr) {
+		status = aerr.Status
+		switch aerr.Kind {
+		case anthropic.KindHTTP:
+			kind = "http"
+		case anthropic.KindMalformed:
+			kind = "malformed"
+		}
+	}
+	e.logger.Warn("usage poller: poll failed", "secret", secretID.String(), "call", call, "kind", kind, "status", status)
 }
 
 // earlyResetThreshold: only alert when the weekly window reopened comfortably
@@ -505,11 +528,19 @@ func earlyResetFires(prev store.AnthropicRateLimit, hasPrev bool, next anthropic
 // nil error means the D13 fence refused it (PRD #1732), because the token is
 // disabled or its enablement revision is no longer rev.
 func (e *Engine) upsert(ctx context.Context, userID, secretID uuid.UUID, rev int64, r anthropic.Reading) (bool, error) {
+	// An account without a 5-hour window (r.FiveHour nil) stores NULL pct + reset,
+	// never a fabricated 0%.
+	var fhPct pgtype.Int2
+	var fhReset *time.Time
+	if r.FiveHour != nil {
+		fhPct = pgInt2(r.FiveHour.Pct)
+		fhReset = r.FiveHour.ResetsAt
+	}
 	n, err := e.store.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID:     secretID,
 		UserID:           userID,
-		FiveHourPct:      pgInt2(r.FiveHour.Pct),
-		FiveHourResetsAt: pgconv.TimePtr(r.FiveHour.ResetsAt),
+		FiveHourPct:      fhPct,
+		FiveHourResetsAt: pgconv.TimePtr(fhReset),
 		SevenDayPct:      pgInt2(r.SevenDay.Pct),
 		SevenDayResetsAt: pgconv.TimePtr(r.SevenDay.ResetsAt),
 		Source:           pgconv.Text(r.Source),

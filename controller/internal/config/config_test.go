@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"maps"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -527,6 +528,58 @@ func TestLoadLeavesThePriorityClassOptional(t *testing.T) {
 	}
 	if cfg.WorkerPriorityClassName != "" {
 		t.Errorf("WorkerPriorityClassName = %q, want empty (no priorityClassName)", cfg.WorkerPriorityClassName)
+	}
+}
+
+// UZI_WORKER_NODE_SELECTOR is a JSON object; every "no selector" spelling the chart can
+// render (unset, empty, null, {}) loads as nil, so a cleared selector hashes as before.
+func TestLoadParsesTheWorkerNodeSelector(t *testing.T) {
+	for raw, want := range map[string]map[string]string{
+		"":                               nil,
+		"null":                           nil,
+		"{}":                             nil,
+		`{"kubernetes.io/arch":"amd64"}`: {"kubernetes.io/arch": "amd64"},
+		`{"kubernetes.io/arch":"arm64","pool":"a"}`: {"kubernetes.io/arch": "arm64", "pool": "a"},
+		// An explicit empty value is a valid label value ("label present and empty").
+		`{"pool":""}`: {"pool": ""},
+	} {
+		t.Run(raw, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://uzi.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+			t.Setenv("UZI_WORKER_NODE_SELECTOR", raw)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if !maps.Equal(cfg.WorkerNodeSelector, want) || (want == nil) != (cfg.WorkerNodeSelector == nil) {
+				t.Errorf("WorkerNodeSelector = %#v, want %#v", cfg.WorkerNodeSelector, want)
+			}
+		})
+	}
+}
+
+// A selector the API server would reject fails at boot, not as workers that never appear.
+func TestLoadRejectsABadWorkerNodeSelector(t *testing.T) {
+	for _, bad := range []string{
+		`["kubernetes.io/arch"]`,
+		`{"kubernetes.io/arch":1}`,
+		`{"bad key!":"amd64"}`,
+		`{"kubernetes.io/arch":"not a label value"}`,
+		`{"kubernetes.io/arch":"amd64"`,
+		// A null member would decode to "" and pin every worker to an empty label.
+		`{"kubernetes.io/arch":null}`,
+		`{"pool":"a","kubernetes.io/arch":null}`,
+	} {
+		t.Run(bad, func(t *testing.T) {
+			setWorkerEnv(t)
+			t.Setenv("UZI_API_URL", "https://uzi.example.com")
+			t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+			t.Setenv("UZI_WORKER_NODE_SELECTOR", bad)
+			if _, err := Load(); err == nil {
+				t.Fatalf("UZI_WORKER_NODE_SELECTOR=%s loaded without error", bad)
+			}
+		})
 	}
 }
 

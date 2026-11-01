@@ -348,6 +348,28 @@ describe("RateLimitAnnouncer (aria-live)", () => {
 // PRD #310 M3 — the absolute "resets <Day HH:MM>" line under the token name,
 // derived from the 7-day reset. The countdown ("resets in …") in the utilization
 // column is a different string; the label regex matches only "resets <Wd> HH:MM".
+describe("RateLimitCard 7-day-only account (no 5-hour window)", () => {
+  const { five_hour: _omit, ...sevenOnly } = { ...okReading, seven_day: { pct: 31, resets_at: nowSecs + 200_000 } } as Extract<MyRateLimits, { status: "ok" }>;
+
+  it("shows the 7-day row and no 5-hour row", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(sevenOnly));
+    render(<RateLimitCard />);
+    await screen.findByText("Claude limits");
+    expect(screen.getByText("31%")).toBeTruthy();
+    expect(screen.getByText("7-day window")).toBeTruthy();
+    expect(screen.queryByText("5-hour window")).toBeNull();
+    expect(screen.getByText("Live")).toBeTruthy();
+  });
+
+  it("still shows both rows when the 5-hour window is present", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue(tokens(okReading));
+    render(<RateLimitCard />);
+    await screen.findByText("Claude limits");
+    expect(screen.getByText("5-hour window")).toBeTruthy();
+    expect(screen.getByText("7-day window")).toBeTruthy();
+  });
+});
+
 describe("RateLimitCard reset label (PRD #310 M3)", () => {
   const RESET_LABEL = /resets [A-Za-z]{3} \d{2}:\d{2}/;
 
