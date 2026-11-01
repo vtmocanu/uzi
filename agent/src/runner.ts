@@ -59,7 +59,7 @@ import type {
   WallParkOutcome,
   WallParkRefresh,
 } from "./executor.js";
-import { PlanRejectedError } from "./executor.js";
+import { PlanRejectedError, StubExecutor } from "./executor.js";
 import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 import { type CodexOperationController, type CodexOperationWaitPolicy } from "./codex-operation-controller.js";
 import { CodexOperationAdmissionError } from "./client.js";
@@ -6420,6 +6420,26 @@ export class RunRunner {
       // issue #3404 M2 U3 - END SOURCE USE, the last teardown step: every worker-owned tail above is joined or
       // known not to be, and this is the single seam where the flight's source slots leave `active`.
       const sourceEnd = await this.endFlightSourceUse(flight, runLog);
+      const stub = StubExecutor.fixture(executor);
+      const sourceReadyRequested = ["UZI_STUB_SOURCE_END_READY", "UZI_STUB_PRE_ENROLLMENT_STOP",
+        ...(flight.claimGeneration === 1 ? ["UZI_STUB_FIRST_PRE_ENROLLMENT_STOP"] : [])]
+        .some(name => stub?.fixtureRequested(name, flight.runId, flight.claimGeneration));
+      const incarnation = this.authority?.authorityIncarnation();
+      if (sourceReadyRequested && incarnation && flight.sourceTailsJoined && !sourceEnd.published &&
+          !await this.outbox?.hasPublicationFile(flight.runId) &&
+          sourceEnd.paths.length > 0 && sourceEnd.paths.length === sourceEnd.endedSlots.length &&
+          new Set(sourceEnd.paths).size === sourceEnd.paths.length &&
+          new Set(sourceEnd.endedSlots.map(slot => slot.key)).size === sourceEnd.paths.length &&
+          sourceEnd.paths.every(p => {
+            const matches = sourceEnd.endedSlots.filter(slot => slot.path === p);
+            return matches.length === 1 && !!sourceEnd.ownedEpochs[p] &&
+              matches[0]!.epoch === sourceEnd.ownedEpochs[p] && matches[0]!.worker === incarnation &&
+              Number.isSafeInteger(matches[0]!.seq) && matches[0]!.seq > 0;
+          })) {
+        // One bounded diagnostic per flight. Paths, epochs and source contents stay local.
+        runLog.info("stub: source-end ready", { run_id: flight.runId,
+          claim_generation: flight.claimGeneration, sources: sourceEnd.paths.length });
+      }
       // issue #3638 D3: the cooperative memory-park record, after the source use ended. Never throws.
       await this.recordMemoryParkOutcome(flight, runLog, sourceEnd, {
         steeringJoined, parkReap: parkReapApplied ? "complete" : "not_applicable" });
@@ -6912,6 +6932,14 @@ export class RunRunner {
     // Issue #1673: a flight an input receipt fenced (released or superseded claim) sends and
     // journals no terminal; the StaleClaimError reaches executeClaim's quiet stop.
     if (flight.steering?.claimFence() !== undefined) throw new StaleClaimError();
+    const fixture = StubExecutor.fixture(flight.executor);
+    if (body.status === "completed" && fixture) {
+      await fixture.fixtureBarrier("terminal", flight.runId, flight.claimGeneration,
+        flight.cancel.signal, () => flight.runLog.info("stub: fixture barrier ready", {
+          stage: "terminal", run_id: flight.runId, claim_generation: flight.claimGeneration,
+        }));
+      if (flight.steering?.claimFence() !== undefined) throw new StaleClaimError();
+    }
     const deps = this.terminalDeps();
     const preexistingPending = deps?.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration) ?? false;
     const previouslyAttempted = flight.completionSendAttempted ||
@@ -9141,6 +9169,21 @@ export class RunRunner {
     // now idempotent re-reaps of an already-reaped tree.
     steps?.enter("run_quiescence");
     const finalizeQuiescence = await this.quiesceRun(flight, executor, { mode: "own", site: "finalize" });
+    const fixture = StubExecutor.fixture(executor);
+    const retainedFixture = fixture?.fixtureRequested("UZI_STUB_PRE_ENROLLMENT_STOP", flight.runId, flight.claimGeneration) ||
+      (flight.claimGeneration === 1 && fixture?.fixtureRequested("UZI_STUB_FIRST_PRE_ENROLLMENT_STOP", flight.runId, flight.claimGeneration));
+    if (retainedFixture) {
+      // The ordinary finalize proof runs first. Ambiguous proof still retains custody;
+      // teardown cannot announce SOURCE-END without its own positively joined tails.
+      if (finalizeQuiescence.outcome.process?.state === "quiescent" && !finalizeQuiescence.blocked &&
+          this.outbox?.listPendingFinalizes().some(record =>
+            record.run_id === flight.runId && record.claim_generation === flight.claimGeneration) &&
+          !this.outbox.hasPublicationRecords(flight.runId) &&
+          !await this.outbox.hasPublicationFile(flight.runId)) {
+        runLog.info("stub: pre-enrollment retained stop", { run_id: flight.runId, claim_generation: flight.claimGeneration });
+      }
+      throw new RetainedRecoveryStop();
+    }
     if (finalizeQuiescence.blocked) {
       flight.preserveRecoveryClone = true;
       throw new RunResidueBlockedError(finalizeQuiescence.outcome.process?.detail ?? "not quiescent");
@@ -10125,6 +10168,13 @@ export class RunRunner {
     // This fresh ACK supplies only the request-local publication guard projection. Completion
     // permit and frozen contract authority remain unchanged; cached ACKs cannot supply this guard.
     if (interlocked && issuePublication) {
+      if (flight.publicationRecord && fixture) {
+        await fixture.fixtureBarrier("running-ack", runId, flight.claimGeneration,
+          boundarySignal ? AbortSignal.any([boundarySignal, flight.cancel.signal]) : flight.cancel.signal,
+          () => runLog.info("stub: fixture barrier ready", {
+            stage: "running-ack", run_id: runId, claim_generation: flight.claimGeneration,
+          }));
+      }
       publicationAck = await flight.reportState({ status: "running" }, boundarySignal);
       // Reuse the stopped-claim path so the owner's local bytes survive this nonterminal exit.
       if (publicationAck.status !== "running") throw new StaleClaimError();
