@@ -94,7 +94,7 @@ function absolute(value: unknown): string {
 }
 
 /** Strict lexical decoding, with decoded-key uniqueness in every object. */
-export function parsePinRestoreJson(raw: string, maxBytes: number, onRootKey?: (key: string) => void): unknown {
+export function parsePinRestoreJson(raw: string, maxBytes: number, onRootKey?: (key: string, keyEnd: number) => void): unknown {
   if (typeof raw !== "string" || !Number.isSafeInteger(maxBytes) || maxBytes < 0 ||
       Buffer.byteLength(raw) > maxBytes || Buffer.from(raw, "utf8").toString("utf8") !== raw) return fail();
   const stack: ({ keys: Set<string>; expectingKey: boolean } | null)[] = [];
@@ -110,7 +110,7 @@ export function parsePinRestoreJson(raw: string, maxBytes: number, onRootKey?: (
     else if (t === "," && top) top.expectingKey = true;
     else if (t.startsWith('"') && top?.expectingKey) {
       const key = JSON.parse(t) as string;
-      if (stack.length === 1) onRootKey?.(key);
+      if (stack.length === 1) onRootKey?.(key, token.index + t.length);
       if (top.keys.has(key)) return fail();
       top.keys.add(key);
       top.expectingKey = false;

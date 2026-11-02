@@ -88,6 +88,23 @@ it("settlement writes retain protected and unknown refs while legacy unprotected
     assert.equal(commitProbes, 0, "protection must precede ref verification");
   }
   git(r.bare, ["config", "--local", "--unset-all", "uzi-retained." + RUN + ".journal"]);
+  const foreign = "uzi-retained.run-foreign.journal";
+  for (const raw of [
+    '{"version":2,"version":2,"intent":',
+    '{"version":2,"version":2,',
+    '{"version":2',
+    '{"\\u0076ersion" \t:\r\n2e0,"version":2,',
+    '{"version":3,"version":3,',
+  ]) {
+    r.config(foreign, raw);
+    const before = refs();
+    await r.cache.deleteSettlementPin(r.bare, RUN, "hold", "source");
+    assert.equal(refs(), before);
+    assert.equal(await r.cache.pinSettlementRefs(r.bare, RUN, "hold", { source: next }), false);
+    assert.equal(refs(), before);
+    assert.equal(commitProbes, 0, "foreign version evidence must precede ref verification");
+  }
+  git(r.bare, ["config", "--local", "--unset-all", foreign]);
   assert.equal(await r.cache.pinSettlementRefs(r.bare, RUN, "hold", { source: next }), true);
   assert.equal(git(r.bare, ["rev-parse", ref]).trim(), next);
 });
