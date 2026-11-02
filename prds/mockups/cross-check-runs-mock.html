@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Runs: Cross-check History</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: uzi app shell (rail nav + page), Runs header with Judge-style segmented control,
+   Active/Past tabs, then one card per work run ("check thread") holding a round ladder
+   and an attempt table that keeps execution, verdict and effect-on-run in separate columns. */
+:root{
+  --bg:#f2f3f7; --surface:#ffffff; --raised:#eceef3; --edge:#dcdfe7; --edge-strong:#c3c8d4;
+  --fg:#181b22; --muted:#555d6e; --faint:#7a8292;
+  --brand:#a8471a; --brand-soft:#f6e6dc;
+  --ok:#17795a; --ok-soft:#e1f2eb;
+  --warn:#9a6200; --warn-soft:#fbefd6;
+  --danger:#b4233f; --danger-soft:#fbe3e8;
+  --info:#1f6f9e; --info-soft:#e0eff8;
+  --plan:#4b4fc4; --plan-soft:#e7e8fb;
+  --code:#0f7680; --code-soft:#dcf1f2;
+  --note:#fffbe9; --note-edge:#e8d9a0;
+  --font-sans:"IBM Plex Sans",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  --font-mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --r:10px;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#080a0f; --surface:#0f121a; --raised:#171b26; --edge:#272d3c; --edge-strong:#3a4256;
+  --fg:#e4e8f0; --muted:#949eb0; --faint:#7a859a;
+  --brand:#fb923c; --brand-soft:#3a2214;
+  --ok:#34d399; --ok-soft:#0f2a22; --warn:#fbbf24; --warn-soft:#2e2510;
+  --danger:#fb7185; --danger-soft:#33141c; --info:#38bdf8; --info-soft:#0f2533;
+  --plan:#818cf8; --plan-soft:#1d1f3f; --code:#2dd4bf; --code-soft:#0d2a2a;
+  --note:#1d1a0e; --note-edge:#4a4220; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#080a0f; --surface:#0f121a; --raised:#171b26; --edge:#272d3c; --edge-strong:#3a4256;
+  --fg:#e4e8f0; --muted:#949eb0; --faint:#7a859a;
+  --brand:#fb923c; --brand-soft:#3a2214;
+  --ok:#34d399; --ok-soft:#0f2a22; --warn:#fbbf24; --warn-soft:#2e2510;
+  --danger:#fb7185; --danger-soft:#33141c; --info:#38bdf8; --info-soft:#0f2533;
+  --plan:#818cf8; --plan-soft:#1d1f3f; --code:#2dd4bf; --code-soft:#0d2a2a;
+  --note:#1d1a0e; --note-edge:#4a4220; color-scheme:dark}
+
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:var(--font-sans);font-size:14px;line-height:1.45}
+button{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--brand);outline-offset:2px;border-radius:6px}
+.mono{font-family:var(--font-mono);font-size:12.5px}
+.tnum{font-variant-numeric:tabular-nums}
+
+/* demo bar */
+.demo{background:var(--note);border-bottom:1px solid var(--note-edge);padding-block:8px;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));
+  display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;font-size:12.5px;color:var(--muted)}
+.demo b{color:var(--fg);font-weight:600}
+.demo label{display:inline-flex;gap:6px;align-items:center;cursor:pointer}
+
+.shell{display:grid;grid-template-columns:200px minmax(0,1fr);min-height:100%}
+.rail{border-right:1px solid var(--edge);background:var(--surface);padding:18px 12px;display:flex;flex-direction:column;gap:2px}
+.rail .logo{font-weight:700;letter-spacing:.02em;padding:4px 10px 16px;color:var(--brand)}
+.rail a{display:block;padding:7px 10px;border-radius:8px;color:var(--muted);text-decoration:none}
+.rail .rsec{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);padding:14px 10px 4px}
+.rail a.on{background:var(--raised);color:var(--fg);font-weight:500}
+main{padding-block:28px 48px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));min-width:0}
+.page{max-width:1080px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
+
+.head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
+.head h1{margin:0;font-size:24px;font-weight:600;display:flex;gap:10px;align-items:center}
+.head h1 svg{color:var(--brand)}
+.head p{margin:6px 0 0;color:var(--muted)}
+.seg{display:inline-flex;border:1px solid var(--edge);border-radius:8px;overflow:hidden;background:var(--surface)}
+.seg button{border:0;background:transparent;padding:6px 12px;color:var(--muted);cursor:pointer;display:inline-flex;gap:6px;align-items:center}
+.seg button+button{border-left:1px solid var(--edge)}
+.seg button[aria-pressed="true"]{background:var(--raised);color:var(--fg);font-weight:500}
+.seg .dot{width:7px;height:7px;border-radius:50%;background:var(--info)}
+
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--edge)}
+.tabs button{border:0;background:none;padding:8px 12px;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tabs button[aria-selected="true"]{color:var(--fg);border-color:var(--brand);font-weight:500}
+.tabs .n{font-size:12px;color:var(--faint);margin-left:4px}
+
+.toolbar{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;justify-content:space-between}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{border:1px solid var(--edge);background:var(--surface);border-radius:999px;padding:3px 10px;font-size:12.5px;color:var(--muted);cursor:pointer}
+.chip[aria-pressed="true"]{border-color:var(--fg);color:var(--fg);font-weight:500}
+.count{font-size:12.5px;color:var(--faint)}
+
+/* thread card */
+.thread{background:var(--surface);border:1px solid var(--edge);border-radius:var(--r);overflow:hidden}
+.thead{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px 16px;padding:14px 16px;align-items:start}
+.title{font-weight:600;min-width:0}
+.title a{color:inherit;text-decoration:none}
+.title a:hover{text-decoration:underline}
+.sub{color:var(--muted);font-size:12.5px;margin-top:3px;display:flex;flex-wrap:wrap;gap:4px 10px}
+.workrun{display:flex;flex-direction:column;align-items:flex-end;gap:4px;font-size:12px;color:var(--faint)}
+.pill{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:2px 9px;font-size:12px;font-weight:500;white-space:nowrap;border:1px solid transparent}
+.p-neutral{background:var(--raised);color:var(--muted);border-color:var(--edge)}
+.p-ok{background:var(--ok-soft);color:var(--ok)}
+.p-warn{background:var(--warn-soft);color:var(--warn)}
+.p-danger{background:var(--danger-soft);color:var(--danger)}
+.p-info{background:var(--info-soft);color:var(--info)}
+.p-plan{background:var(--plan-soft);color:var(--plan)}
+.p-code{background:var(--code-soft);color:var(--code)}
+.p-outline{background:transparent;border:1px dashed var(--edge-strong);color:var(--muted)}
+.spin{width:8px;height:8px;border-radius:50%;background:currentColor;animation:pulse 1.4s infinite}
+@keyframes pulse{50%{opacity:.25}}
+@media (prefers-reduced-motion: reduce){.spin{animation:none}}
+
+/* ladder: one step per attempt, plan rounds then code */
+.ladder{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:0 16px 14px}
+.lstage{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);margin-right:2px}
+.step{display:inline-flex;align-items:center;gap:6px;border-radius:7px;padding:3px 8px;font-size:12px;border:1px solid var(--edge);background:var(--surface);cursor:pointer}
+.step .r{font-family:var(--font-mono);font-size:11.5px;color:var(--faint)}
+.step .sw{width:10px;height:10px;border-radius:3px;flex:none}
+.sep{width:12px;height:1px;background:var(--edge-strong)}
+.gap{width:14px}
+.sw.ok{background:var(--ok)} .sw.warn{background:var(--warn)} .sw.danger{background:var(--danger)}
+.sw.run{background:var(--info)} .sw.queued{background:transparent;border:1.5px solid var(--info)}
+.sw.err{background:repeating-linear-gradient(135deg,var(--danger) 0 2px,transparent 2px 4px);border:1.5px solid var(--danger)}
+.sw.repl{background:transparent;border:1.5px dashed var(--faint)}
+.step.sel{border-color:var(--fg);box-shadow:0 0 0 1px var(--fg) inset}
+
+/* attempts table */
+.attempts{border-top:1px solid var(--edge);background:var(--bg)}
+.atable{width:100%;border-collapse:collapse}
+.atable th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);font-weight:500;text-align:left;padding:8px 12px;border-bottom:1px solid var(--edge)}
+.atable td{padding:10px 12px;border-bottom:1px solid var(--edge);vertical-align:top}
+.atable tr:last-child td{border-bottom:0}
+.atable tr.sel td{background:var(--surface)}
+.cell-main{font-weight:500}
+.cell-sub{font-size:12px;color:var(--muted);margin-top:2px}
+.open{color:var(--brand);text-decoration:none;font-size:12.5px;white-space:nowrap}
+.open[aria-disabled="true"]{color:var(--faint);cursor:not-allowed}
+.why{margin:0 12px 12px;border:1px solid var(--edge);border-left:3px solid var(--danger);border-radius:8px;background:var(--surface);padding:10px 12px;display:grid;gap:4px;font-size:13px}
+.why.repl{border-left-color:var(--faint)}
+.why .k{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint)}
+.toggle{border:0;background:none;color:var(--muted);font-size:12.5px;cursor:pointer;padding:0 16px 12px}
+.toggle:hover{color:var(--fg)}
+
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12px;color:var(--muted)}
+.legend span{display:inline-flex;gap:6px;align-items:center}
+
+.empty{border:1px dashed var(--edge-strong);border-radius:var(--r);padding:28px;text-align:center;color:var(--muted)}
+
+.notes{background:var(--surface);border:1px solid var(--edge);border-radius:var(--r);padding:18px 20px;display:grid;gap:10px}
+.notes h2{margin:0;font-size:16px}
+.notes ol{margin:0;padding-left:20px;display:grid;gap:7px;max-width:78ch;color:var(--muted)}
+.notes b{color:var(--fg)}
+
+/* runs scope placeholder rows */
+.runrow{background:var(--surface);border:1px solid var(--edge);border-radius:var(--r);padding:12px 16px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+
+@media (max-width:760px){
+  .shell{grid-template-columns:1fr}
+  .rail{flex-direction:row;overflow-x:auto;border-right:0;border-bottom:1px solid var(--edge);padding:8px 12px}
+  .rail .logo{padding:7px 10px}
+  .rail .rsec{display:none}
+  .thead{grid-template-columns:1fr}
+  .workrun{align-items:flex-start;flex-direction:row;flex-wrap:wrap}
+  .atable thead{display:none}
+  .atable,.atable tbody,.atable tr,.atable td{display:block;width:100%}
+  .atable tr{border-bottom:1px solid var(--edge);padding:8px 0}
+  .atable td{border:0;padding:4px 12px;display:grid;grid-template-columns:110px minmax(0,1fr);gap:8px}
+  .atable td::before{content:attr(data-l);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);padding-top:2px}
+}
+</style>
+<style>html,body{height:100%}body{margin:0;font-size:14px}img{max-width:100%}[hidden]{display:none!important}</style>
+</head>
+<body>
+
+<div class="demo" role="region" aria-label="Mock controls">
+  <b>Mock, synthetic data.</b>
+  <label><input type="checkbox" id="hasEvidence" checked> Viewer has active or retained cross-check attempts</label>
+  <span>Scope choice is remembered in this browser.</span>
+</div>
+
+<div class="shell">
+  <nav class="rail" aria-label="Main">
+    <div class="logo">uzi</div>
+    <a href="#">Overview</a>
+    <span class="rsec">Work</span>
+    <a href="#">Repos</a>
+    <a href="#" class="on">Runs</a>
+    <a href="#">Findings</a>
+    <a href="#">Schedules</a>
+    <a href="#">Chat</a>
+    <span class="rsec">Factory</span>
+    <a href="#">Agents</a>
+    <a href="#">Workers</a>
+    <a href="#">Judge</a>
+    <a href="#">Docs</a>
+  </nav>
+  <main>
+    <div class="page">
+      <div class="head">
+        <div>
+          <h1><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>Runs</h1>
+          <p id="subtitle">Your agent runs. Open one to watch it live.</p>
+        </div>
+        <div class="seg" id="scopeSeg" role="group" aria-label="What to list">
+          <button type="button" data-scope="runs" aria-pressed="true">Runs</button>
+          <button type="button" data-scope="checks" aria-pressed="false">Cross-checks <span class="dot" id="activeDot" title="A check is running" hidden></span></button>
+        </div>
+      </div>
+
+      <div class="tabs" role="tablist">
+        <button role="tab" id="tab-active" aria-selected="true" data-tab="active">Active <span class="n" id="nActive"></span></button>
+        <button role="tab" id="tab-past" aria-selected="false" data-tab="past"><span id="pastLabel">Past runs</span> <span class="n" id="nPast"></span></button>
+      </div>
+
+      <div id="content"></div>
+
+      <section class="notes" aria-labelledby="notesH">
+        <h2 id="notesH">Design notes</h2>
+        <ol>
+          <li><b>One card per work run, not one row per checker.</b> A card holds every plan round and the code check for that run, so round 5 failing after four rounds of changes is read as a sequence. The card sits in Active while any attempt is queued or running, otherwise in Past.</li>
+          <li><b>Three questions, three columns.</b> <i>Check</i> says whether the checker ran to the end. <i>Verdict</i> says what it concluded. <i>Effect on the run</i> says what uzi did next. The work run's own status stays in the card header, labelled "Work run", so a check that did not finish never makes finished work look failed.</li>
+          <li><b>"Didn't finish" is not a verdict.</b> Changes requested and Blocked are finished checks with a result. Didn't finish, Couldn't start and Replaced are execution outcomes; Replaced is greyed and kept out of failure counts.</li>
+          <li><b>Honest gaps.</b> An attempt with no checker run says so and disables Open checker. When the cause was not recorded, the row says "Cause not recorded" instead of guessing.</li>
+          <li><b>Selector appears only with evidence.</b> Runs | Cross-checks shows when the viewer has any active or retained attempt, including attempts that never got a checker run, and stays after the setting is turned off. Without evidence the page is today's Runs page.</li>
+        </ol>
+      </section>
+    </div>
+  </main>
+</div>
+
+<script>
+(function(){
+  // ---------- synthetic data ----------
+  // exec: queued | running | finished | didnt_finish | couldnt_start | replaced
+  // verdict (plan): approve | revise | block | none ; (code): clean | findings | none
+  const threads = [
+    { id:"r-7a31", issue:214, title:"Paginate the invoice export endpoint", repo:"acme/ledger", harness:"Claude", work:{label:"Planning", tone:"info", live:true}, started:"14:02",
+      attempts:[
+        {stage:"plan", round:1, exec:"finished", verdict:"revise", effect:"Revised; round 2 followed", checker:"Codex · high", dur:"3m 10s", child:true},
+        {stage:"plan", round:2, exec:"running", verdict:"none", effect:"Plan waits for this verdict", checker:"Codex · high", dur:"1m 42s", child:true},
+      ]},
+    { id:"r-5c09", issue:198, title:"Add retry budget to the webhook sender", repo:"acme/notify", harness:"Claude", work:{label:"Running", tone:"info", live:true}, started:"13:20",
+      attempts:[
+        {stage:"plan", round:1, exec:"finished", verdict:"approve", effect:"Plan approved", checker:"Codex · high", dur:"2m 05s", child:true},
+        {stage:"code", round:1, exec:"queued", verdict:"none", effect:"Advisory; result pending", checker:"Codex · high", dur:"waiting 0m 40s", child:true},
+      ]},
+    { id:"r-3e88", issue:177, title:"Move session storage to the shared cache", repo:"acme/ledger", harness:"Claude", work:{label:"Completed", tone:"ok"}, started:"Yesterday 09:14",
+      attempts:[
+        {stage:"plan", round:1, exec:"finished", verdict:"revise", effect:"Revised; round 2 followed", checker:"Codex · high", dur:"3m 02s", child:true},
+        {stage:"plan", round:2, exec:"finished", verdict:"revise", effect:"Revised; round 3 followed", checker:"Codex · high", dur:"2m 51s", child:true},
+        {stage:"plan", round:3, exec:"finished", verdict:"revise", effect:"Revised; round 4 followed", checker:"Codex · high", dur:"3m 33s", child:true},
+        {stage:"plan", round:4, exec:"finished", verdict:"revise", effect:"Revised; round 5 followed", checker:"Codex · high", dur:"2m 47s", child:true},
+        {stage:"plan", round:5, exec:"didnt_finish", reason:"Model error", verdict:"none", effect:"Plan held for human approval", checker:"Codex · high", dur:"2m 45s", child:true,
+          why:{what:"The checker stopped after 2m 45s without returning a verdict.", cause:"Cause not recorded for this attempt.", next:"A plan check that does not finish never approves the plan. uzi held the plan at the approval gate."}},
+        {stage:"code", round:1, exec:"finished", verdict:"findings", nfind:2, effect:"Advisory; 2 findings recorded", checker:"Codex · high", dur:"4m 18s", child:true},
+      ]},
+    { id:"r-2b17", issue:169, title:"Validate CSV headers on import", repo:"acme/ingest", harness:"Codex", work:{label:"Completed", tone:"ok"}, started:"Yesterday 16:40",
+      attempts:[
+        {stage:"plan", round:1, exec:"finished", verdict:"approve", effect:"Plan approved", checker:"Claude · high", dur:"1m 58s", child:true},
+        {stage:"code", round:1, exec:"didnt_finish", reason:"Unreadable reply", verdict:"none", effect:"Advisory; PR marked “code check incomplete”", checker:"Claude · high", dur:"5m 02s", child:true,
+          why:{what:"The checker replied, but the reply did not match the review format.", cause:"Example only: a safe diagnostic code, if the diagnostics issue ships.", next:"Code checks are advisory, so publication continued. The PR description says the code check is incomplete."}},
+      ]},
+    { id:"r-1f40", issue:161, title:"Drop the legacy report scheduler", repo:"acme/reports", harness:"Claude", work:{label:"Completed", tone:"ok"}, started:"Oct 31",
+      attempts:[
+        {stage:"plan", round:1, exec:"finished", verdict:"approve", effect:"Plan approved", checker:"Codex · high", dur:"2m 20s", child:true},
+        {stage:"code", round:1, exec:"couldnt_start", reason:"Worker unsupported", verdict:"none", effect:"Advisory; PR marked “code check incomplete”", checker:"Not recorded", dur:"Not recorded", child:false,
+          why:{what:"No worker could run this check, so no checker run was created.", cause:"Reason: worker_unsupported", next:"Code checks are advisory, so publication continued without a checker review."}},
+      ]},
+    { id:"r-0d92", issue:158, title:"Rate-limit password reset emails", repo:"acme/notify", harness:"Claude", work:{label:"Cancelled", tone:"neutral"}, started:"Oct 30",
+      attempts:[
+        {stage:"plan", round:1, exec:"finished", verdict:"revise", effect:"Revised; round 2 followed", checker:"Codex · high", dur:"2m 40s", child:true},
+        {stage:"plan", round:2, exec:"finished", verdict:"block", effect:"Plan held for human approval", checker:"Codex · high", dur:"3m 12s", child:true},
+      ]},
+    { id:"r-0a55", issue:150, title:"Index audit log by actor", repo:"acme/ledger", harness:"Claude", work:{label:"Completed", tone:"ok"}, started:"Oct 29",
+      attempts:[
+        {stage:"plan", round:1, exec:"replaced", reason:"Run restarted", verdict:"none", effect:"Superseded; round 2 followed", checker:"Codex · high", dur:"0m 55s", child:true,
+          why:{what:"The work run lost its worker while this check was in progress.", cause:"Recorded as superseded, not a checker failure.", next:"The next plan got a fresh check (round 2).", repl:true}},
+        {stage:"plan", round:2, exec:"finished", verdict:"approve", effect:"Plan approved", checker:"Codex · high", dur:"2m 09s", child:true},
+        {stage:"code", round:1, exec:"finished", verdict:"clean", effect:"Advisory; no findings", checker:"Codex · high", dur:"3m 41s", child:true},
+      ]},
+  ];
+
+  const EXEC = {
+    queued:{label:"Queued", tone:"p-info", sw:"queued", note:"Waiting for a worker"},
+    running:{label:"Running", tone:"p-info", sw:"run", live:true},
+    finished:{label:"Finished", tone:"p-neutral"},
+    didnt_finish:{label:"Didn't finish", tone:"p-danger", sw:"err"},
+    couldnt_start:{label:"Couldn't start", tone:"p-danger", sw:"err"},
+    replaced:{label:"Replaced", tone:"p-outline", sw:"repl"},
+  };
+  const VERDICT = {
+    approve:{label:"Approved", tone:"p-ok", sw:"ok"},
+    revise:{label:"Changes requested", tone:"p-warn", sw:"warn"},
+    block:{label:"Blocked", tone:"p-danger", sw:"danger"},
+    clean:{label:"No issues found", tone:"p-ok", sw:"ok"},
+    findings:{label:"Findings", tone:"p-warn", sw:"warn"},
+    none:{label:"No verdict", tone:"p-outline"},
+  };
+  const isActive = a => a.exec==="queued"||a.exec==="running";
+  const threadActive = t => t.attempts.some(isActive);
+  const swatch = a => (a.exec==="finished" ? VERDICT[a.verdict].sw : EXEC[a.exec].sw);
+  const vlabel = a => a.verdict==="findings" ? `${a.nfind} findings` : VERDICT[a.verdict].label;
+  const stageName = s => s==="plan" ? "Plan" : "Code";
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+  // ---------- state ----------
+  const store = {
+    get(k,d){try{const v=localStorage.getItem(k);return v===null?d:v}catch(e){return d}},
+    set(k,v){try{localStorage.setItem(k,v)}catch(e){}}
+  };
+  let scope = store.get("uzi.runs.scope","runs");
+  let tab = "active";
+  let stageF = "all", outcomeF = "all";
+  const open = new Set(["r-3e88","r-7a31"]);   // expanded cards
+  const sel = {"r-3e88":"plan-5"};             // selected attempt per card
+
+  const $ = id => document.getElementById(id);
+  const hasEv = () => $("hasEvidence").checked;
+
+  function attemptMatches(a){
+    if (stageF!=="all" && a.stage!==stageF) return false;
+    if (outcomeF==="all") return true;
+    if (outcomeF==="incomplete") return a.exec==="didnt_finish"||a.exec==="couldnt_start";
+    if (outcomeF==="raised") return a.exec==="finished" && ["revise","block","findings"].includes(a.verdict);
+    if (outcomeF==="passed") return a.exec==="finished" && ["approve","clean"].includes(a.verdict);
+    if (outcomeF==="replaced") return a.exec==="replaced";
+    return true;
+  }
+
+  function render(){
+    const ev = hasEv();
+    if (!ev) scope = "runs";
+    $("scopeSeg").hidden = !ev;
+    document.querySelectorAll("#scopeSeg button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.scope===scope)));
+    $("activeDot").hidden = !threads.some(threadActive);
+    document.querySelectorAll(".tabs button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.tab===tab)));
+    $("subtitle").textContent = scope==="checks"
+      ? "Plan and code cross-checks on your runs, every round kept. Opening one does not change it."
+      : "Your agent runs. Open one to watch it live.";
+    $("pastLabel").textContent = scope==="checks" ? "Past checks" : "Past runs";
+    if (scope==="checks"){
+      $("nActive").textContent = threads.filter(threadActive).length;
+      $("nPast").textContent = threads.filter(t=>!threadActive(t)).length;
+      renderChecks();
+    } else {
+      $("nActive").textContent = 2; $("nPast").textContent = 31;
+      renderRuns();
+    }
+  }
+
+  function renderRuns(){
+    const rows = tab==="active"
+      ? [["Paginate the invoice export endpoint","acme/ledger #214","Planning","p-info"],["Add retry budget to the webhook sender","acme/notify #198","Running","p-info"]]
+      : [["Move session storage to the shared cache","acme/ledger #177","Completed","p-ok"],["Validate CSV headers on import","acme/ingest #169","Completed","p-ok"],["Rate-limit password reset emails","acme/notify #158","Cancelled","p-neutral"]];
+    $("content").innerHTML = `<div style="display:grid;gap:8px">${rows.map(r=>`<div class="runrow"><div><div class="title">${esc(r[0])}</div><div class="sub">${esc(r[1])}</div></div><span class="pill ${r[3]}">${r[2]}</span></div>`).join("")}
+      <p class="count">Today's Runs list, unchanged. Checker runs never appear here.</p></div>`;
+  }
+
+  function renderChecks(){
+    const list = threads.filter(t => (tab==="active") === threadActive(t))
+      .map(t => ({t, shown: t.attempts.filter(attemptMatches)}))
+      .filter(x => x.shown.length);
+    const allAtt = threads.filter(t => (tab==="active")===threadActive(t)).flatMap(t=>t.attempts);
+    const settled = allAtt.filter(a => !isActive(a) && a.exec!=="replaced");
+    const incomplete = settled.filter(a => a.exec==="didnt_finish"||a.exec==="couldnt_start").length;
+
+    const outcomeChips = tab==="past" ? `
+      <div class="chips" role="group" aria-label="Outcome">
+        ${[["all","Any outcome"],["incomplete","Didn't finish"],["raised","Raised issues"],["passed","Passed"],["replaced","Replaced"]]
+          .map(([k,l])=>`<button class="chip" data-of="${k}" aria-pressed="${outcomeF===k}">${l}</button>`).join("")}
+      </div>` : "";
+    const summary = tab==="past"
+      ? `${allAtt.length} attempts on ${list.length} runs shown · ${incomplete} of ${settled.length} settled didn't finish · replaced not counted`
+      : `${allAtt.filter(isActive).length} checks in flight`;
+
+    let html = `<div class="toolbar">
+        <div class="chips" role="group" aria-label="Stage">
+          ${[["all","All stages"],["plan","Plan"],["code","Code"]].map(([k,l])=>`<button class="chip" data-sf="${k}" aria-pressed="${stageF===k}">${l}</button>`).join("")}
+        </div>${outcomeChips}
+      </div>
+      <div class="toolbar"><span class="count tnum">${summary}</span>
+        <div class="legend" aria-label="Legend">
+          <span><i class="sw ok" style="width:10px;height:10px;border-radius:3px;display:inline-block;background:var(--ok)"></i>Passed</span>
+          <span><i style="width:10px;height:10px;border-radius:3px;display:inline-block;background:var(--warn)"></i>Changes / findings</span>
+          <span><i style="width:10px;height:10px;border-radius:3px;display:inline-block;background:var(--danger)"></i>Blocked</span>
+          <span><i class="sw err" style="width:10px;height:10px;border-radius:3px;display:inline-block"></i>Didn't finish</span>
+          <span><i class="sw repl" style="width:10px;height:10px;border-radius:3px;display:inline-block"></i>Replaced</span>
+          <span><i style="width:10px;height:10px;border-radius:3px;display:inline-block;background:var(--info)"></i>Running</span>
+        </div></div>`;
+
+    if (!list.length){
+      html += `<div class="empty">${tab==="active" ? "No cross-checks running right now." : "No past attempts match these filters."}</div>`;
+    } else {
+      html += `<div style="display:grid;gap:12px">` + list.map(({t,shown}) => card(t, shown)).join("") + `</div>
+        <p class="count">Showing newest first. Older runs load as you scroll.</p>`;
+    }
+    $("content").innerHTML = html;
+  }
+
+  function card(t, shown){
+    const plan = t.attempts.filter(a=>a.stage==="plan"), code = t.attempts.filter(a=>a.stage==="code");
+    const step = a => {
+      const key = `${a.stage}-${a.round}`;
+      const lab = a.exec==="finished" ? vlabel(a) : EXEC[a.exec].label + (a.reason?`: ${a.reason}`:"");
+      return `<button class="step ${sel[t.id]===key?"sel":""}" data-t="${t.id}" data-k="${key}" title="${esc(stageName(a.stage))} ${a.stage==="plan"?"round "+a.round:"check"}: ${esc(lab)}">
+        ${a.stage==="plan"?`<span class="r">R${a.round}</span>`:""}<span class="sw ${swatch(a)}"></span><span>${esc(lab)}</span></button>`;
+    };
+    const ladder = `<div class="ladder">
+        ${plan.length?`<span class="lstage">Plan</span>${plan.map(step).join('<span class="sep"></span>')}`:""}
+        ${code.length?`<span class="gap"></span><span class="lstage">Code</span>${code.map(step).join("")}`:""}
+      </div>`;
+    const isOpen = open.has(t.id);
+    const rows = shown.map(a => {
+      const key = `${a.stage}-${a.round}`, e = EXEC[a.exec];
+      const vcell = a.exec==="finished"
+        ? `<span class="pill ${VERDICT[a.verdict].tone}">${esc(vlabel(a))}</span>`
+        : isActive(a) ? `<span class="cell-sub">Pending</span>` : `<span class="pill p-outline">No verdict</span>`;
+      const ecell = `<span class="pill ${e.tone}">${e.live?'<span class="spin"></span>':""}${e.label}</span>${a.reason?`<div class="cell-sub">${esc(a.reason)}</div>`:e.note?`<div class="cell-sub">${e.note}</div>`:""}`;
+      const openL = a.child ? `<a class="open" href="#">Open checker →</a>` : `<a class="open" aria-disabled="true" title="No checker run was created for this attempt">No checker run</a>`;
+      let tr = `<tr class="${sel[t.id]===key?"sel":""}">
+        <td data-l="Attempt"><div class="cell-main"><span class="pill ${a.stage==="plan"?"p-plan":"p-code"}">${stageName(a.stage)}</span> ${a.stage==="plan"?`round ${a.round}`:""}</div></td>
+        <td data-l="Check">${ecell}</td>
+        <td data-l="Verdict">${vcell}</td>
+        <td data-l="Effect on run"><div>${esc(a.effect)}</div></td>
+        <td data-l="Checker"><div class="mono">${esc(a.checker)}</div><div class="cell-sub tnum">${esc(a.dur)}</div></td>
+        <td data-l="">${openL}</td></tr>`;
+      if (a.why && sel[t.id]===key){
+        tr += `<tr class="sel"><td colspan="6" style="padding:0"><div class="why ${a.why.repl?"repl":""}">
+          <span class="k">What happened</span><div>${esc(a.why.what)}</div>
+          <div class="cell-sub ${a.why.cause.startsWith("Diagnostic")||a.why.cause.startsWith("Reason")?"mono":""}">${esc(a.why.cause)}</div>
+          <span class="k" style="margin-top:6px">What uzi did next</span><div>${esc(a.why.next)}</div></div></td></tr>`;
+      }
+      return tr;
+    }).join("");
+    return `<article class="thread" aria-label="${esc(t.title)}">
+      <div class="thead">
+        <div style="min-width:0"><div class="title"><a href="#">${esc(t.title)}</a></div>
+          <div class="sub"><span class="mono">${esc(t.repo)} #${t.issue}</span><span>Lead: ${esc(t.harness)}</span><span>Started ${esc(t.started)}</span></div></div>
+        <div class="workrun"><span>Work run</span><span class="pill p-${t.work.tone}">${t.work.live?'<span class="spin"></span>':""}${esc(t.work.label)}</span></div>
+      </div>
+      ${ladder}
+      <button class="toggle" data-toggle="${t.id}" aria-expanded="${isOpen}">${isOpen?"Hide":"Show"} ${shown.length} attempt${shown.length>1?"s":""}${shown.length<t.attempts.length?` (filtered from ${t.attempts.length})`:""}</button>
+      ${isOpen?`<div class="attempts" style="overflow-x:auto"><table class="atable">
+        <thead><tr><th>Attempt</th><th>Check</th><th>Verdict</th><th>Effect on run</th><th>Checker</th><th></th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`:""}
+    </article>`;
+  }
+
+  // ---------- events ----------
+  document.addEventListener("click", ev => {
+    const b = ev.target.closest("button,a");
+    if (!b) return;
+    if (b.tagName==="A"){ ev.preventDefault(); return; }
+    if (b.dataset.scope){ scope=b.dataset.scope; store.set("uzi.runs.scope",scope); render(); }
+    else if (b.dataset.tab){ tab=b.dataset.tab; outcomeF="all"; render(); }
+    else if (b.dataset.sf){ stageF=b.dataset.sf; render(); }
+    else if (b.dataset.of){ outcomeF=b.dataset.of; render(); }
+    else if (b.dataset.toggle){ const id=b.dataset.toggle; open.has(id)?open.delete(id):open.add(id); render(); }
+    else if (b.dataset.k){ const id=b.dataset.t; sel[id] = sel[id]===b.dataset.k ? undefined : b.dataset.k; open.add(id); render(); }
+  });
+  $("hasEvidence").addEventListener("change", render);
+  if (scope!=="checks" && scope!=="runs") scope="runs";
+  // Open the mock on the most informative view on first visit.
+  if (store.get("uzi.runs.scope", null)===null){ scope="checks"; tab="past"; }
+  render();
+})();
+</script>
+
+</body>
+</html>
