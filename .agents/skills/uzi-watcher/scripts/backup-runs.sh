@@ -111,6 +111,7 @@ KUBECTL="${UZI_KUBECTL:-kubectl}"
 UZI="${UZI_BIN:-uzi}"
 JQ="${UZI_JQ:-jq}"
 STAT="${UZI_STAT:-stat}"
+PIN_RESTORE_DECODER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pin-restore-descriptor.py"
 
 CTX="${UZI_CTX:-$("$KUBECTL" config current-context 2>/dev/null)}"
 NAMESPACES="${UZI_WORKER_NS:-uzi-workers uzi-workers-docker}"
@@ -485,7 +486,7 @@ aid_newer(){
 select_clone(){
   local ns="$1" pod="$2" stem="$3" branch="$4" rid="$5"
   local LC_ALL=C listing journal ledger protected_ledger="" protected="" protected_ok="" ledger_rows ledger_ok ledger_live journal_ok="" journal_current="" retained="" path br name aid
-  local attributed="" primary=""
+  local attributed="" primary="" config_snapshot=""
   local best="" best_aid="" have_best=0 tab=$'\t' bare="$REPOS_BASE/$REPO_SLUG.git"
   local stopped="" marker_path="" marker_verdict=""
   [ -n "$branch" ] || return 1
@@ -500,10 +501,17 @@ select_clone(){
     3) : > "$PROBE_ERR_FILE"; printf '%s\n' "$ns/$pod" >> "$GIT_UNREAD_FILE" ;;
     *) probe_inconclusive "listing candidate clones on pod $ns/$pod failed"; return 1 ;;
   esac
-  [ -n "$listing" ] || return 1
+  # Even an empty clone listing must not bypass protected-metadata validation.
   rc=0
+  # A host-side sentinel preserves all value bytes. Git adds exactly one output
+  # newline and kexec_probe adds one before its status marker. Remove exactly
+  # those two framing newlines, preserving every newline in the JSON value.
   journal="$(kexec_probe "$ns" "$pod" \
-    git --git-dir="$bare" config --get "uzi-recovery.$branch.clone")" || rc=$?
+    git --git-dir="$bare" config --get "uzi-recovery.$branch.clone"
+    rc=$?; printf '__UZI_CONFIG_END__'; exit "$rc")" || rc=$?
+  journal="${journal%__UZI_CONFIG_END__}"
+  journal="${journal%$'\n'}"
+  journal="${journal%$'\n'}"
   probe_absent "$rc" "$ns/$pod" || journal=""
   rc=0
   ledger="$(kexec_probe "$ns" "$pod" \
@@ -545,13 +553,34 @@ select_clone(){
   fi
   rc=0
   protected="$(kexec_probe "$ns" "$pod" \
-    git --git-dir="$bare" config --local --no-includes --get-all "uzi-retained.$rid.journal")" || rc=$?
+    git --git-dir="$bare" config --local --no-includes --get-all "uzi-retained.$rid.journal"
+    rc=$?; printf '__UZI_CONFIG_END__'; exit "$rc")" || rc=$?
+  protected="${protected%__UZI_CONFIG_END__}"
+  protected="${protected%$'\n'}"
+  protected="${protected%$'\n'}"
   case "$rc" in 0|1) ;; *) probe_inconclusive "reading the protected descriptor on pod $ns/$pod failed"; return 1 ;; esac
   if [ "$rc" -eq 0 ]; then
     rc=0
     protected_ledger="$(kexec_probe "$ns" "$pod" git --git-dir="$bare" config --local --no-includes \
       --get-regexp '^uzi-attempts\..*\.entry$')" || rc=$?
     case "$rc" in 0|1) ;; *) probe_inconclusive "reading the attempt ledger on pod $ns/$pod failed"; return 1 ;; esac
+    # V2 is decoded independently, without probing predecessor clones. Python3
+    # absence or any validation error refuses this pod. V1 below is unchanged;
+    # the historical ordinary active-journal reader remains permissive.
+    if printf '%s' "$protected" | "$JQ" -es 'any(.[]; type == "object" and .version == 2)' >/dev/null 2>&1; then
+      # Encode NUL config records across shell substitutions, including git's
+      # final status so a successful encoder cannot hide a failed config read.
+      # shellcheck disable=SC2016
+      config_snapshot="$(kexec_probe "$ns" "$pod" sh -c \
+        '{ git --git-dir="$1" config --local --no-includes --null --list; rc=$?; printf "\000__UZI_CONFIG_RC=%s" "$rc"; } | base64' _ "$bare")" || {
+        probe_inconclusive "reading V2 config snapshot on pod $ns/$pod failed"; return 1;
+      }
+      protected_ok="$(printf '%s' "$config_snapshot" |
+        python3 "$PIN_RESTORE_DECODER" "$rid" "$branch" "$stem" "$RUNNER_BASE" "${bare##*/}" \
+          "$DEST/.pin-restore-decode-budget" 2>/dev/null)" || {
+        probe_inconclusive "invalid V2 protected descriptor or ledger evidence on pod $ns/$pod"; return 1;
+      }
+    else
     # Validate the full exact-run descriptor and all source ledger identities in
     # one pass. Malformed evidence refuses this pod, including a newer active slot.
     # shellcheck disable=SC2016
@@ -669,6 +698,7 @@ select_clone(){
       | .[] | "\(.attemptId // "")\t\(.clonePath)"' 2>/dev/null)" || {
         probe_inconclusive "invalid protected descriptor or ledger evidence on pod $ns/$pod"; return 1;
       }
+    fi
   fi
   if [ "${terminal_capture:-0}" -eq 2 ]; then
     # A completed/cancelled run ignores the live journal: a canonical journal entry
@@ -1139,7 +1169,7 @@ for RID in "${RUNS[@]}"; do
   fi
 done
 
-rm -f "$PROBE_ERR_FILE" "$GAP_FILE" "$UNREAD_FILE" "$GIT_UNREAD_FILE"
+rm -f "$PROBE_ERR_FILE" "$GAP_FILE" "$UNREAD_FILE" "$GIT_UNREAD_FILE" "$DEST/.pin-restore-decode-budget"
 ln -sfn "$DEST" "$OUTROOT/latest-attempt"
 if [ "$failures" -eq 0 ] && [ "$recoverable" -eq 1 ]; then
   ln -sfn "$DEST" "$OUTROOT/latest"
