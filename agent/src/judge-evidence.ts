@@ -31,6 +31,7 @@ export interface JudgeEvidence {
   counts: {
     fetched: number; excluded: number; eligible: number; retained: number; omitted: number;
     toolUses: number; toolResults: number; dispatches: number;
+    resultErrorFlags: { true: number; false: number; unknown: number };
     confirmed: Record<Outcome, number>; provisional: number; collisions: number;
     oversizedKeys: number; evictions: number; extraResults: number;
     unmatchedResults: number; incomplete: number; omittedRows: number;
@@ -160,6 +161,7 @@ export class JudgeEvidenceReducer {
   private eligible = 0;
   private toolUses = 0;
   private toolResults = 0;
+  private resultErrorFlags = { true: 0, false: 0, unknown: 0 };
   private dispatches = 0;
   private collisions = 0;
   private oversizedKeys = 0;
@@ -222,7 +224,11 @@ export class JudgeEvidenceReducer {
         if (candidates.length === 1 && !candidates[0]!.ambiguous) candidates[0]!.childTools++;
       }
     }
-    if (m.kind === "tool_result") this.toolResults++;
+    if (m.kind === "tool_result") {
+      this.toolResults++;
+      const flag = p["is_error"] === true ? "true" : p["is_error"] === false ? "false" : "unknown";
+      this.resultErrorFlags[flag]++;
+    }
     if (dispatch) {
       this.dispatches++;
       this.boundary = { seq: m.seq, time: ownedPrefix(str(m.created_at), 64), id: ownedPrefix(str(p["id"]), 256) };
@@ -370,7 +376,8 @@ export class JudgeEvidenceReducer {
     const counts = {
       fetched: this.fetched, excluded: this.excluded, eligible: this.eligible, retained,
       omitted: this.eligible - retained, toolUses: this.toolUses, toolResults: this.toolResults,
-      dispatches: this.dispatches, confirmed: { ...this.confirmed }, provisional,
+      dispatches: this.dispatches, resultErrorFlags: { ...this.resultErrorFlags },
+      confirmed: { ...this.confirmed }, provisional,
       collisions: this.collisions, oversizedKeys: this.oversizedKeys, evictions: this.evictions,
       extraResults: this.extraResults, unmatchedResults: this.toolResults - this.resultPairs,
       incomplete, omittedRows: this.dispatches - this.rows.length,
@@ -383,7 +390,7 @@ export class JudgeEvidenceReducer {
         + " endTime=" + quoted(Number.isFinite(timestamp(r.endTime ?? "")) ? r.endTime! : "unknown", 44)
         + " " + interval(r) + " child_tool_uses=" + r.childTools
         + " deadline=unknown cause=" + (r.ambiguous || !r.cause ? "unknown" : quoted(r.cause, 50)), 374)).join("\n");
-    const aggregates = clip("Raw observations; tool uses are not gate or ownership proof.\n"
+    const aggregates = clip("Raw observations; tool uses and result-error flags are not gate, ownership or delegation-success proof.\n"
       + JSON.stringify(counts) + "\nTool identity counts:\n"
       + [...this.tools].map(([name, c]) => quoted(name, 60) + " " + JSON.stringify(c)).join("\n")
       + "\noverflow " + JSON.stringify(this.overflow)

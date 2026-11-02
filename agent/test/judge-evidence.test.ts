@@ -77,6 +77,26 @@ test("owned metadata preserves exact UTF-16 tool correlation identities", () => 
   assert.equal(f.reducer.render().counts.confirmed.success, 2);
 });
 
+test("raw result-error flags survive omitted and evicted orphan results", () => {
+  function scenario(change: boolean) {
+    const f = fixture();
+    for (let i = 0; i < 160; i++) f.end("orphan-" + i, "finished", !(change && i === 19));
+    f.send("tool_result", { tool_use_id: "missing", content: "finished" });
+    f.send("tool_result", { tool_use_id: "invalid", content: "finished", is_error: "false" });
+    return f.reducer.render();
+  }
+  const allErrors = scenario(false), oneFalse = scenario(true);
+  assert.deepEqual(allErrors.counts.resultErrorFlags, { true: 160, false: 0, unknown: 2 });
+  assert.deepEqual(oneFalse.counts.resultErrorFlags, { true: 159, false: 1, unknown: 2 });
+  assert.equal(allErrors.sections.prose, oneFalse.sections.prose, "changed result is omitted and evicted");
+  assert.equal(oneFalse.counts.toolResults, 162);
+  assert.equal(oneFalse.counts.unmatchedResults, 162);
+  assert.equal(oneFalse.counts.provisional, 0);
+  assert.equal(oneFalse.counts.confirmed.success + oneFalse.counts.confirmed.failed, 0);
+  assert.match(oneFalse.sections.aggregates, /"resultErrorFlags":{"true":159,"false":1,"unknown":2}/);
+  bounded(oneFalse);
+});
+
 test("repeated roles, interleaving and child replay keep parent and child tool identities independent", () => {
   const f = fixture();
   f.start("A"); f.start("B");

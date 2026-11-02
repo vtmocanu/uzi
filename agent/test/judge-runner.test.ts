@@ -1348,6 +1348,18 @@ describe("judge streaming trace fetch", () => {
 });
 
 describe("buildJudgePrompt", () => {
+  it("keeps raw result-error flags in aggregates before prose sampling", () => {
+    const messages = Array.from({ length: 160 }, (_, index) => ({
+      seq: index + 1, kind: "tool_result", agent: "lead", created_at: "2026-11-02T12:00:00Z",
+      payload: { tool_use_id: "orphan-" + index, content: "finished", is_error: index !== 19 },
+    }));
+    const prompt = buildJudgePrompt({ ...emptyTrace, messages }, null);
+    const flag = prompt.indexOf('"resultErrorFlags":{"true":159,"false":1,"unknown":0}');
+    assert.ok(flag > prompt.indexOf("Raw aggregates:"));
+    assert.ok(flag < prompt.indexOf("Retained evidence:"));
+    assert.ok(!prompt.slice(prompt.indexOf("Retained evidence:")).includes('"tool_use_id":"orphan-19"'));
+  });
+
   it("keeps latest owner steering and timestamps under an input flood", () => {
     const inputs = Array.from({ length: 500 }, (_, i) => ({
       kind: "steer", body: "owner input " + i, created_at: "2026-11-02T12:00:00Z",
