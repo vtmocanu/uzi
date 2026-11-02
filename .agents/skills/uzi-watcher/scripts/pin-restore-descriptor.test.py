@@ -521,6 +521,37 @@ class DescriptorTests(unittest.TestCase):
         name, raw = ledger(e).split(" ", 1)
         self.decode(e, rows=[(name, "\n" + json.dumps(json.loads(raw), indent=2) + "\n\n")])
 
+    def test_snapshot_queries_match_git_bytes_and_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config"
+            config.write_text('[uzi-recovery "uzi/issue-1"]\nclone=first\nclone="last\\n\\n"\n'
+                              '[uzi-attempts "one"]\nentry=\nentry\n'
+                              '[uzi-attempts "two"]\nentry="line\\nbreak"\n')
+            def git(*args):
+                return subprocess.run(["git", "config", "--file", str(config), *args], capture_output=True)
+            snapshot = git("--null", "--list")
+            self.assertEqual(snapshot.returncode, 0)
+            payload = base64.encodebytes(snapshot.stdout + b"\0__UZI_CONFIG_RC=0")
+            args = [sys.executable, str(HERE / "pin-restore-descriptor.py"), "--config-query"]
+            for mode, key in (("--get", "uzi-recovery.uzi/issue-1.clone"),
+                              ("--get-all", "uzi-recovery.uzi/issue-1.clone"),
+                              ("--get-all", "uzi-attempts.one.entry"),
+                              ("--get-regexp", r"^uzi-attempts\..*\.entry$"),
+                              ("--get", "uzi-recovery.absent.clone")):
+                expected = git(mode, key)
+                actual = subprocess.run([*args, mode, key], input=payload, capture_output=True)
+                self.assertEqual(actual.returncode, expected.returncode, actual.stderr)
+                self.assertEqual(actual.stdout, expected.stdout + b"\n")
+            # No truncated final record, empty internal record, invalid UTF-8 or
+            # invalid base64 may be mistaken for an absent metadata value.
+            for bad in (b"x.key\nvalue", b"x.key\nvalue\0\0", b"x.key\n\xff\0"):
+                actual = subprocess.run([*args, "--get", "x.absent"],
+                                        input=base64.b64encode(bad + b"\0__UZI_CONFIG_RC=0"), capture_output=True)
+                self.assertEqual(actual.returncode, 2)
+                self.assertFalse(actual.stdout)
+            actual = subprocess.run([*args, "--get", "x.absent"], input=b"!!!!", capture_output=True)
+            self.assertEqual(actual.returncode, 2)
+
     def test_stdin_read_is_bounded(self):
         stream = mock.Mock()
         stream.buffer.read.return_value = b""

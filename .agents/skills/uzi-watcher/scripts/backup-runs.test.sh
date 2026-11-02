@@ -134,6 +134,130 @@ for data in (b"A" * 4096 + suffix, b"\0" * 4096 + suffix,
 assert host_run(b"A" + suffix, "1").returncode != 0
 assert host_run(b"AA\nAA" + suffix).stdout == b"AA\nAA"
 print("PASS V2 bounded remote input/output and host byte capture/framing")
+
+# Drive select_clone itself: no metadata query may precede the bounded reader.
+# Small private transport limits keep adversarial caller fixtures inexpensive.
+import json
+import runpy
+import signal
+import shutil
+fixtures = runpy.run_path(str(Path(sys.argv[1]).with_name("pin-restore-descriptor.test.py")))
+e = fixtures["envelope"]()
+raw = e["predecessors"][0]["rawJournal"]
+rows = fixtures["ledger"](e)
+caller = work / "caller"
+caller.mkdir()
+caller_bare = caller / "host+repo.git"
+caller_bare.mkdir()
+caller_config = caller_bare / "config"
+log = caller / "commands"
+real_git = shutil.which("git")
+query_git = caller / "git"
+query_git.write_text("""#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["CALLER_LOG"], "a") as f: f.write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1:5] != ["config", "--file", "-", "--no-includes"]:
+    sys.exit(97)
+os.execv(os.environ["CALLER_GIT"], [os.environ["CALLER_GIT"], *sys.argv[1:]])
+""")
+query_git.chmod(0o700)
+kubectl = caller / "kubectl"
+kubectl.write_text("""#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[sys.argv.index("--") + 1:]
+with open(os.environ["CALLER_LOG"], "a") as f: f.write(json.dumps(args) + "\\n")
+if "node" in args:
+    if os.environ.get("CALLER_GROW"):
+        i = args.index("-e") + 1
+        args[i] = os.environ["CALLER_GROW"] + args[i]
+    os.execvp(args[0], args)
+# The listing is the only other permitted RPC. In particular, forbid bare config.
+if len(args) > 4 and args[4] == "sh" and 'for d in ' in args[6]:
+    print("/runner/repo/issue-1.attempt-20261101T120000Z-g1-0123456789abcdef\\tuzi/issue-1")
+    print("\\n__uzi_probe_rc=0")
+    sys.exit(0)
+sys.exit(98)
+""")
+kubectl.chmod(0o700)
+definitions = source[source.index("kexec_probe(){"):source.index('PROBE_ERR_FILE="$DEST/.probe-inconclusive"')]
+definitions = definitions.replace("v2_config_snapshot(){", "bounded_snapshot(){")
+# Wrap only the existing optional limit arguments; production defaults stay fixed.
+command = definitions + """
+v2_config_snapshot(){ bounded_snapshot "$1" "$2" "$3" 16384 8192; }
+probe_inconclusive(){ printf '%s\n' "$*" >&2; }
+select_clone ns pod issue-1 uzi/issue-1 run-1
+"""
+env = dict(os.environ, PATH=str(caller) + os.pathsep + os.environ["PATH"],
+           CALLER_LOG=str(log), CALLER_GIT=real_git, DEST=str(caller), CTX="test",
+           KUBECTL=str(kubectl), REPOS_BASE=str(caller), REPO_SLUG="host+repo",
+           RUNNER_BASE="/runner/repo", PIN_RESTORE_DECODER=str(Path(sys.argv[1]).with_name("pin-restore-descriptor.py")),
+           JQ=shutil.which("jq"), PROBE_ERR_FILE=str(caller / "probe"),
+           GIT_UNREAD_FILE=str(caller / "unread"))
+
+def caller_run():
+    log.write_text("")
+    child = subprocess.Popen(["bash", "-c", command], env=env, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        stdout, stderr = child.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.communicate()
+        raise AssertionError("select_clone exceeded owned deadline")
+    return child.returncode, stdout, stderr
+
+def set_config(version=2):
+    if caller_config.exists() or caller_config.is_fifo():
+        caller_config.unlink()
+    caller_config.write_bytes(b"")
+    def add(key, value):
+        subprocess.run([real_git, "config", "--file", str(caller_config), "--add", key, value], check=True)
+    if version == 2:
+        add("uzi-retained.run-1.journal", fixtures["dump"](e))
+        add("uzi-recovery.uzi/issue-1.clone", raw)
+    else:
+        j = dict(runId="run-1", clonePath=fixtures["identity"](1)["clonePath"], attemptId=fixtures["attempt"](1),
+                 retainedSources=[dict(runId="run-1", clonePath="/runner/repo/issue-1")])
+        add("uzi-retained.run-1.journal", fixtures["dump"](dict(version=1, branch="uzi/issue-1", key="issue-1", journal=j)))
+        add("uzi-recovery.uzi/issue-1.clone", fixtures["dump"](j))
+    name, value = rows.split(" ", 1)
+    add(name, value)
+    return add
+
+for version in (1, 2):
+    set_config(version)
+    rc, out, err = caller_run()
+    assert rc == 0 and fixtures["identity"](1)["clonePath"].encode() in out, (version, rc, out, err)
+    commands = [json.loads(line) for line in log.read_text().splitlines()]
+    assert commands[0][4] == "node", commands
+    assert sum(c[:4] == ["config", "--file", "-", "--no-includes"] for c in commands) == 1, commands
+
+for kind in ("active", "protected", "ledger", "unrelated", "growth", "fifo"):
+    add = set_config()
+    if kind in ("active", "protected", "ledger"):
+        key = {"active": "uzi-recovery.uzi/issue-1.clone", "protected": "uzi-retained.run-1.journal",
+               "ledger": "uzi-attempts.uzi/issue-1.entry"}[kind]
+        add(key, "x" * 8193)
+    elif kind == "unrelated":
+        add("unrelated.value", "x" * 8193)
+    elif kind == "fifo":
+        caller_config.unlink()
+        os.mkfifo(caller_config)
+    else:
+        # Real reads plus deterministic growth, as in the remote seam above.
+        env["CALLER_GROW"] = grow.replace("2048", "16384").replace(
+            'process.stderr.write("READ_BYTES=" + readBytes)',
+            'growFs.writeFileSync(process.env.CALLER_COUNT, String(readBytes))')
+        env["CALLER_COUNT"] = str(caller / "read-count")
+    rc, out, err = caller_run()
+    assert rc != 0 and not out, (kind, rc, out, err)
+    commands = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len(commands) == 1 and commands[0][4] == "node", (kind, commands)
+    if kind == "growth":
+        assert (caller / "read-count").read_text() == "8193"
+        del env["CALLER_GROW"]
+    print("PASS select_clone bounded bootstrap " + kind)
+
 PY
 [ "$?" -eq 0 ] || fail "bounded V2 transport"
 

@@ -384,7 +384,7 @@ kexec_probe(){
   return "$rc"
 }
 
-# V2 only: bound actual config input bytes before Git, and actual Git output.
+# Bound actual config input bytes before Git, and actual Git output.
 # No stat preflight: a growing file still cannot exceed limit+1 bytes read.
 # shellcheck disable=SC2016
 V2_CONFIG_READER='
@@ -430,7 +430,7 @@ child.on("close", code => {
 child.stdin.end(input);
 '
 
-# V2 only. Cap actual encoded bytes before shell substitution, including NUL.
+# Cap actual encoded bytes before shell substitution, including NUL.
 # Optional limits are private small-cap test seams; production uses fixed defaults.
 # Overflow/cancellation kills and joins this helper's kubectl child.
 v2_config_snapshot(){
@@ -477,6 +477,11 @@ finally:
 ' "$DEST" "$limit" "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
     sh -c '"$@"; printf "\n__uzi_probe_rc=%s\n" "$?"' _ \
     node -e "$V2_CONFIG_READER" "$bare" "$raw_limit"
+}
+
+# Private consumer of the captured snapshot. Payload travels on stdin, never argv.
+snapshot_query(){
+  printf '%s' "$config_snapshot" | python3 "$PIN_RESTORE_DECODER" --config-query "$@"
 }
 
 # probe_absent <rc> <ns>/<pod>: succeed for a found result (0); fail for a genuine "not found" (1,
@@ -586,6 +591,10 @@ select_clone(){
   local stopped="" marker_path="" marker_verdict=""
   [ -n "$branch" ] || return 1
   local rc=0
+  config_snapshot="$(v2_config_snapshot "$ns" "$pod" "$bare")" || {
+    probe_inconclusive "exec into pod $ns/$pod failed to obtain a bounded config snapshot"; return 1;
+  }
+
   # rc 3: listed, but some candidate's .git could not be read; keep the readable ones.
   listing="$(kexec_probe "$ns" "$pod" sh -c "$LIST_CANDIDATES" _ "$RUNNER_BASE" "$stem")" || rc=$?
   case "$rc" in
@@ -598,20 +607,18 @@ select_clone(){
   esac
   # Even an empty clone listing must not bypass protected-metadata validation.
   rc=0
-  # A host-side sentinel preserves all value bytes. Git adds exactly one output
-  # newline and kexec_probe adds one before its status marker. Remove exactly
-  # those two framing newlines, preserving every newline in the JSON value.
-  journal="$(kexec_probe "$ns" "$pod" \
-    git --git-dir="$bare" config --get "uzi-recovery.$branch.clone"
+  # A host-side sentinel preserves all value bytes. snapshot_query reproduces
+  # Git's output newline plus the probe framing newline. Remove exactly those
+  # two framing newlines, preserving every newline in the JSON value.
+  journal="$(snapshot_query --get "uzi-recovery.$branch.clone"
     rc=$?; printf '__UZI_CONFIG_END__'; exit "$rc")" || rc=$?
   journal="${journal%__UZI_CONFIG_END__}"
   journal="${journal%$'\n'}"
   journal="${journal%$'\n'}"
-  probe_absent "$rc" "$ns/$pod" || journal=""
+  case "$rc" in 0|1) ;; *) probe_inconclusive "invalid journal snapshot on pod $ns/$pod"; return 1 ;; esac
   rc=0
-  ledger="$(kexec_probe "$ns" "$pod" \
-    git --git-dir="$bare" config --get-all "uzi-attempts.$branch.entry")" || rc=$?
-  probe_absent "$rc" "$ns/$pod" || ledger=""
+  ledger="$(snapshot_query --get-all "uzi-attempts.$branch.entry")" || rc=$?
+  case "$rc" in 0|1) ;; *) probe_inconclusive "invalid ledger snapshot on pod $ns/$pod"; return 1 ;; esac
   # Stopped-source markers (uzi-stopped.<runId>.entry, appended with --add). Each value
   # must pass the jq check below: the exact key set plus the field types/shapes it lists,
   # a subset of agent/src/git.ts parseStoppedMarker (it does not validate `at` as a date,
@@ -623,8 +630,7 @@ select_clone(){
   # A marker schema change (version bump) must update this validator first: an
   # unrecognised value makes the pod's search inconclusive.
   rc=0
-  stopped="$(kexec_probe "$ns" "$pod" \
-    git --git-dir="$bare" config --local --no-includes --get-all "uzi-stopped.$rid.entry")" || rc=$?
+  stopped="$(snapshot_query --get-all "uzi-stopped.$rid.entry")" || rc=$?
   case "$rc" in 0|1) ;; *) probe_inconclusive "reading the stopped marker on pod $ns/$pod failed"; return 1 ;; esac
   if [ "$rc" -eq 0 ]; then
     # shellcheck disable=SC2016
@@ -647,8 +653,7 @@ select_clone(){
     if printf '%s\n' "$marker_verdict" | grep -qxF match; then marker_path="$RUNNER_BASE/$stem"; fi
   fi
   rc=0
-  protected="$(kexec_probe "$ns" "$pod" \
-    git --git-dir="$bare" config --local --no-includes --get-all "uzi-retained.$rid.journal"
+  protected="$(snapshot_query --get-all "uzi-retained.$rid.journal"
     rc=$?; printf '__UZI_CONFIG_END__'; exit "$rc")" || rc=$?
   protected="${protected%__UZI_CONFIG_END__}"
   protected="${protected%$'\n'}"
@@ -656,18 +661,12 @@ select_clone(){
   case "$rc" in 0|1) ;; *) probe_inconclusive "reading the protected descriptor on pod $ns/$pod failed"; return 1 ;; esac
   if [ "$rc" -eq 0 ]; then
     rc=0
-    protected_ledger="$(kexec_probe "$ns" "$pod" git --git-dir="$bare" config --local --no-includes \
-      --get-regexp '^uzi-attempts\..*\.entry$')" || rc=$?
+    protected_ledger="$(snapshot_query --get-regexp '^uzi-attempts\..*\.entry$')" || rc=$?
     case "$rc" in 0|1) ;; *) probe_inconclusive "reading the attempt ledger on pod $ns/$pod failed"; return 1 ;; esac
     # V2 is decoded independently, without probing predecessor clones. Python3
     # absence or any validation error refuses this pod. V1 below is unchanged;
     # the historical ordinary active-journal reader remains permissive.
     if printf '%s' "$protected" | "$JQ" -es 'any(.[]; type == "object" and .version == 2)' >/dev/null 2>&1; then
-      # Encode NUL config records across shell substitutions, including git's
-      # final status so a successful encoder cannot hide a failed config read.
-      config_snapshot="$(v2_config_snapshot "$ns" "$pod" "$bare")" || {
-        probe_inconclusive "reading V2 config snapshot on pod $ns/$pod failed"; return 1;
-      }
       protected_ok="$(printf '%s' "$config_snapshot" |
         python3 "$PIN_RESTORE_DECODER" "$rid" "$branch" "$stem" "$RUNNER_BASE" "${bare##*/}" \
           "$DEST/.pin-restore-decode-budget" 2>/dev/null)" || {
@@ -901,15 +900,18 @@ select_clone(){
 }
 
 pod_has_ref(){
-  local ns="$1" pod="$2" ref="$3" branch="$4" rid="$5" owner
+  local ns="$1" pod="$2" ref="$3" branch="$4" rid="$5" owner config_snapshot
   [ -n "$branch" ] || return 1
   local rc=0
+  config_snapshot="$(v2_config_snapshot "$ns" "$pod" "$REPOS_BASE/$REPO_SLUG.git")" || {
+    probe_inconclusive "exec into pod $ns/$pod failed to obtain a bounded tracking config snapshot"; return 1;
+  }
+
   kexec_probe "$ns" "$pod" \
     git --git-dir="$REPOS_BASE/$REPO_SLUG.git" show-ref --verify --quiet "$ref" >/dev/null || rc=$?
   probe_absent "$rc" "$ns/$pod" || return 1
   rc=0
-  owner="$(kexec_probe "$ns" "$pod" \
-    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" config --get "uzi-trackowner.$branch.owner")" || rc=$?
+  owner="$(snapshot_query --get "uzi-trackowner.$branch.owner")" || rc=$?
   probe_absent "$rc" "$ns/$pod" || return 1
   [ "$owner" = "$rid" ]
 }
@@ -923,16 +925,16 @@ pod_has_ref(){
 # last-value-wins reduction so a damaged newest row cannot leave an older one as proof)
 # prints "attempt state unknown": absence of evidence is never reported as retirement.
 attempt_retirement(){
-  local ns="$1" pod="$2" branch="$3" rid="$4" ledger rc=0 states
+  local ns="$1" pod="$2" branch="$3" rid="$4" ledger rc=0 states config_snapshot
   [ -n "$branch" ] || { printf 'attempt state unknown'; return 0; }
-  # The pod prints a sentinel line after the values: command substitution strips trailing
-  # newlines, which would silently drop trailing EMPTY values (malformed rows) otherwise.
-  # shellcheck disable=SC2016  # expanded by the pod's shell, not here.
-  ledger="$(kexec_probe "$ns" "$pod" sh -c \
-    'git --git-dir="$1" config --get-all "$2"; rc=$?; printf "__LEDGER_END__\n"; exit "$rc"' _ \
-    "$REPOS_BASE/$REPO_SLUG.git" "uzi-attempts.$branch.entry")" || rc=$?
+  config_snapshot="$(v2_config_snapshot "$ns" "$pod" "$REPOS_BASE/$REPO_SLUG.git")" || {
+    printf 'attempt state unknown'; return 0;
+  }
+  # Preserve trailing empty rows with the same sentinel used by the old probe.
+  ledger="$(snapshot_query --get-all "uzi-attempts.$branch.entry"
+    rc=$?; printf '__LEDGER_END__'; exit "$rc")" || rc=$?
   [ "$rc" -eq 0 ] || { printf 'attempt state unknown'; return 0; }
-  case "$ledger" in *__LEDGER_END__*) ledger="${ledger%__LEDGER_END__*}" ;; *) printf 'attempt state unknown'; return 0 ;; esac
+  case "$ledger" in *__LEDGER_END__*) ledger="${ledger%__LEDGER_END__*}"; ledger="${ledger%$'\n'}" ;; *) printf 'attempt state unknown'; return 0 ;; esac
   # shellcheck disable=SC2016  # $rid/$e are jq variables, not host expansions.
   states="$(printf '%s' "$ledger" | "$JQ" -rRn --arg rid "$rid" '
     [inputs | (try fromjson catch null)] as $rows
