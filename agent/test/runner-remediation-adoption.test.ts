@@ -135,6 +135,39 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       args[5] = mode === "marker-plain" ? s : coverage.sha; args[6] = s;
       return capture(...args);
     });
+    // Fixed accounting inputs model the live-claim discount, not execution of store SQL.
+    // Two open holds on this live run discount only ONE; total open holds stay three.
+    const custody = {
+      claim: { runId: claim.run_id, generation: 2, worker: "fixture-worker", status: "running" },
+      heartbeat: { worker: "fixture-worker", fresh: true },
+      holds: [{ id: "current", runId: claim.run_id, generation: 2, open: true },
+        { id: "prior", runId: claim.run_id, generation: 1, open: true },
+        { id: "other", runId: "other-run", generation: 1, open: true }],
+      captures: [{ id: "fixed-capture", status: "available", generation: 1 }],
+    };
+    const accounting = () => {
+      const open = custody.holds.filter(h => h.open);
+      const live = custody.heartbeat.fresh && custody.claim.worker === custody.heartbeat.worker &&
+        custody.claim.status === "running";
+      const discount = live ? new Set(open.filter(h => h.runId === custody.claim.runId &&
+        h.generation === custody.claim.generation).map(h => h.runId)).size : 0;
+      return structuredClone({ custody, totalOpen: open.length, liveClaimDiscount: discount,
+        admissionCharged: open.length - discount });
+    };
+    const mutations = [
+      t.mock.method(client, "reserveRecoveryCapture"),
+      t.mock.method(client, "releaseRecoveryCustody"),
+      t.mock.method(client, "reconcileRecoveryCapture"),
+      t.mock.method(client, "settleRecoveryHold"),
+      t.mock.method(client, "settleRecoveryHoldLive"),
+      t.mock.method(client, "requestCompletionHold"),
+      t.mock.method(client, "requestBaseAttestationHold"),
+    ];
+    // WorkerClient has no owner-discard operation; observe the real request seam as
+    // well, including custody routes a future client method might introduce.
+    assert.deepEqual(Object.getOwnPropertyNames(Object.getPrototypeOf(client))
+      .filter(n => /discard.*(?:custody|recovery|hold)|(?:custody|recovery|hold).*discard/i.test(n)), []);
+    const requests = t.mock.method(client as any, "postJSON");
     const prepare = cache.prepareRecoverySuccessor.bind(cache);
     t.mock.method(cache, "prepareRecoverySuccessor", async (...args: Parameters<typeof prepare>) => {
       const original = args[6]!.admitRemediationSource!;
@@ -147,7 +180,39 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
         assert.ok(!flight.remediationRestrictions.roots.includes(x));
         try { return await original(input); } finally { underB = false; }
       } };
-      const result = await prepare(...args);
+      const counts = accounting();
+      assert.equal(counts.totalOpen, 3);
+      assert.equal(counts.liveClaimDiscount, 1);
+      assert.equal(counts.admissionCharged, 2);
+      const oldRoots = await cache.enumerateOwedCandidates(bare, claim.run_id);
+      assert.ok(oldRoots.length > 0);
+      const oldPins = command(bare, "for-each-ref", "--format=%(refname) %(objectname)",
+        "refs/uzi-owed/", "refs/uzi-coverage/", "refs/uzi-recovery-pin/", "refs/uzi-recovery-episode/").split("\n").filter(Boolean);
+      const mutationCounts = mutations.map(m => m.mock.callCount());
+      const requestStart = requests.mock.callCount();
+      const states = structuredClone(api.states);
+      let result: Awaited<ReturnType<typeof prepare>>;
+      try {
+        result = await prepare(...args);
+      } finally {
+        assert.deepEqual(accounting(), counts, "adoption alone changes no fixed custody/admission input");
+        assert.deepEqual(api.states, states, "no status transition inside adoption");
+        assert.deepEqual(mutations.map(m => m.mock.callCount()), mutationCounts,
+          "adoption neither reserves/releases custody nor creates/settles holds");
+        const custodyRequests = requests.mock.calls.slice(requestStart).filter((call: any) =>
+          /\/(?:archives|recovery-holds|completion\/hold|base-attestation-hold)(?:\/|$)/.test(call.arguments[0]));
+        assert.deepEqual(custodyRequests, [], "no custody mutation HTTP request, including discard");
+        const rootsAfter = await cache.enumerateOwedCandidates(bare, claim.run_id);
+        for (const root of oldRoots) assert.deepEqual(rootsAfter.find(r => r.sha === root.sha), root,
+          "every original root retains all original contexts");
+        const pinsAfter = command(bare, "for-each-ref", "--format=%(refname) %(objectname)",
+          "refs/uzi-owed/", "refs/uzi-coverage/", "refs/uzi-recovery-pin/", "refs/uzi-recovery-episode/").split("\n");
+        for (const pin of oldPins) {
+          assert.ok(pinsAfter.includes(pin), "original owed/coverage/episode pin unchanged: " + pin);
+          const [ref, oid] = pin.split(" ");
+          assert.equal(command(bare, "rev-parse", ref! + "^{commit}"), oid);
+        }
+      }
       // Trip AFTER the durable Git result. The worker must first synchronously adopt the
       // verified tuple, so credential-switch custody verification sees the new source.
       if (mode === "marker-credential") flight.steering.tripCredentialSwitch(2);
