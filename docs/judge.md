@@ -56,11 +56,11 @@ judge for everyone — into three effective modes:
   **Admin → Users** — one flag can't tell "an admin disabled you" from "you
   opted out," so enforcement wins whenever it's on.
 
-**The only real opt-out from enforced mode is deleting your Anthropic
-token.** That also stops your own runs, since both spend the same
-credential — there's no separate "opt out of enforced judging" switch. Your
-lever under enforced mode is the *model* it runs on, not the on/off toggle —
-see the next section.
+**Enforced mode has no separate user opt-out switch.** Judging still depends
+on a usable credential for the reviewed run's own harness. Removing Anthropic
+credentials does not prevent a Codex run from being judged when a usable
+Codex credential remains. Your lever under enforced mode is the *model* it
+runs on, not the on/off toggle — see the next section.
 
 ## Which token the judge spends
 

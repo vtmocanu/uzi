@@ -1,7 +1,7 @@
 import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 // The JudgeRunner (PRD #46 M3, Decision 1): a slim runner for a `judge` claim. It
 // fetches the reviewed run's trace through the Bearer trace endpoint, compacts it to a
-// budget, makes ONE structured-output model call on the run owner's Anthropic token,
+// budget, makes ONE structured-output model call on the run owner's credential for its harness,
 // and posts a verdict + recommendations back. No clone, no worktree, no git, no MR —
 // and NO tools: the trace is untrusted (a prompt-injected trace must not be able to
 // run a command on the worker), so the single turn runs with a deny-all tool hook and
