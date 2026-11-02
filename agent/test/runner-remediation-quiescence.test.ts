@@ -23,8 +23,7 @@ function command(dir: string, ...args: string[]): string {
   }).trim();
 }
 
-test("persisted remediation source requires scoped process quiescence and the exact owned tail before fresh adoption",
-  { skip: process.platform !== "linux" }, async t => {
+async function seedRemediationSource() {
   const claim = gitlabClaim(3747, { claim_generation: 2, session_id: "predecessor-session" });
   const branch = "agent/issue-3747";
   const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
@@ -63,6 +62,12 @@ test("persisted remediation source requires scoped process quiescence and the ex
   const pins = command(bare, "for-each-ref", "--format=%(refname) %(objectname)",
     "refs/uzi-owed/", "refs/uzi-coverage/", "refs/uzi-recovery-pin/", "refs/uzi-recovery-episode/").split("\n").filter(Boolean);
   assert.ok(pins.length > 0);
+  return { claim, branch, bare, base, clone, source, q, x, s, read, persisted, refsBefore, pins };
+}
+
+test("persisted remediation source requires scoped process quiescence and the exact owned tail before fresh adoption",
+  { skip: process.platform !== "linux" }, async t => {
+  const { claim, branch, bare, base, clone, source, q, x, s, read, persisted, refsBefore, pins } = await seedRemediationSource();
   let models = 0, adoptions = 0;
   // Independent consumer: no predecessor runner state, registry, cache or coordinator is copied.
   const authority = new AuthorityRuntime({
@@ -211,6 +216,58 @@ test("persisted remediation source requires scoped process quiescence and the ex
   } finally {
     finish();
     await Promise.allSettled([exactTail, queuedExecution, queuedTail]);
+    fresh.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("actual remediation recovery refuses a surviving scoped writer without an execution-tail shortcut",
+  { skip: process.platform !== "linux" }, async t => {
+  const f = await seedRemediationSource();
+  const authority = new AuthorityRuntime({
+    lifetime: await acquireWorkerLifetime(fs.realpathSync(fx.dataDir), testLockOptions()),
+    workerToken: "fixture-quiescence-refusal", timeoutMs: 5000,
+  });
+  const cache = new GitCache(fx.dataDir, nullLogger(), undefined,
+    testGitCacheOptions({ gitleaksBin: (git as any).gitleaksBin,
+      authority: authority.hooks, authorityRequired: true }));
+  let models = 0;
+  const fresh = new RunRunner(client, cache, runId => ({ homeDir: path.join(homeDir, runId), executor: {
+    run: async () => { models++; throw new Error("nonquiet source must not reach a model"); },
+  } }), nullLogger(), 20, undefined, { gitlab: fakeGitlab().gitlab,
+    teardownTestDeps: portableTeardownTestDeps, recoveryRetryMs: 1, authority });
+  const prepare = t.mock.method(cache, "prepareRecoverySuccessor");
+  const processProof = t.mock.method(fresh as any, "quiesceImpl");
+  t.mock.method(cache, "secretScanCheckpointRange", async () => ({ trusted: true as const, findings: [] }));
+  const root = makeFakeProcRoot("uzi-remediation-nonquiet-");
+  try {
+    await withQuiescenceView({ procRoot: root }, async () => {
+      plantInScope(root, 62, f.clone.path);
+      assert.equal((fresh as any).executionTails.has(f.claim.run_id), false);
+      api.setOwnershipStatus(f.claim.run_id, "running", 2);
+      const execution = fresh.execute(f.claim);
+      const tail = (fresh as any).executionTails.get(f.claim.run_id);
+      assert.ok(tail);
+      await execution;
+      await tail;
+      assert.equal(models, 0);
+      assert.equal(prepare.mock.callCount(), 0);
+      const observations = await Promise.all(processProof.mock.calls.map(async (call: any) => ({
+        site: call.arguments[0].site, mode: call.arguments[0].mode, result: await call.result,
+      })));
+      assert.ok(observations.some((proof: any) => proof.site === "predecessor_capture" && proof.mode === "capture" &&
+        proof.result.process.state === "survivors" && proof.result.process.processes.some((entry: any) =>
+          entry.pid === 62 && entry.reason === "unattributed_in_scope")),
+      "actual recovery observed the planted writer and refused without relying on a prior execution tail");
+      assert.equal(f.read().clonePath, f.clone.path);
+      assert.deepEqual(f.read().remediationRecovery.edges, f.persisted.edges);
+      assert.deepEqual(f.read().remediationRecovery.flaggedOIDs, f.persisted.flaggedOIDs);
+      const actualPins = command(f.bare, "for-each-ref", "--format=%(refname) %(objectname)",
+        "refs/uzi-owed/", "refs/uzi-coverage/", "refs/uzi-recovery-pin/", "refs/uzi-recovery-episode/").split("\n");
+      for (const pin of f.pins) assert.ok(actualPins.includes(pin), pin);
+    });
+  } finally {
     fresh.shutdown();
     fs.rmSync(root, { recursive: true, force: true });
   }
