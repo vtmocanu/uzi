@@ -200,7 +200,9 @@ func TestWorkerRecoveryFreezeDriftLiveDB(t *testing.T) {
 			defer func() {
 				cancel()
 				if !joined {
-					<-result
+					if err := <-result; err != nil {
+						t.Logf("recovery cleanup: %v", err)
+					}
 				}
 			}()
 			go func() { _, e := svc.Heartbeat(ctx, worker, nil, nil, snap); result <- e }()
@@ -317,7 +319,9 @@ func TestWorkerRecoveryCrossedServicesLiveDB(t *testing.T) {
 				defer func() {
 					cancel()
 					for i := 0; i < started; i++ {
-						<-results
+						if err := <-results; err != nil {
+							t.Logf("recovery cleanup: %v", err)
+						}
 					}
 				}()
 				call := func(s *Service, w store.Worker, snap *ActiveSnapshot) {

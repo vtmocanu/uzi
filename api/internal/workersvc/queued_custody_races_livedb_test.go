@@ -264,7 +264,9 @@ func TestQueuedCustodyDiscardRaceLiveDB(t *testing.T) {
 					cancel()
 					_ = tx.Rollback(context.Background())
 					if !joined {
-						_ = <-done
+						if err := <-done; err != nil {
+							t.Logf("race cleanup: %v", err)
+						}
 					}
 				}()
 				go func() {
@@ -469,7 +471,9 @@ func TestQueuedCustodyOwnerControlRaceLiveDB(t *testing.T) {
 		cancel()
 		_ = owner.Rollback(context.Background())
 		if !joined {
-			_ = <-done
+			if err := <-done; err != nil {
+				t.Logf("race cleanup: %v", err)
+			}
 		}
 	}()
 	go func() {
@@ -611,7 +615,9 @@ func TestQueuedCustodySettingsRaceLiveDB(t *testing.T) {
 					cancel()
 					_ = owner.Rollback(context.Background())
 					if !joined {
-						_ = <-done
+						if err := <-done; err != nil {
+							t.Logf("race cleanup: %v", err)
+						}
 					}
 				}()
 				go func() {
@@ -662,7 +668,9 @@ func TestQueuedCustodySettingsRaceLiveDB(t *testing.T) {
 					cancel()
 					_ = tx.Rollback(context.Background())
 					if !joined {
-						_ = <-done
+						if err := <-done; err != nil {
+							t.Logf("race cleanup: %v", err)
+						}
 					}
 				}()
 				go func() {
@@ -1072,7 +1080,9 @@ func TestQueuedCustodyMembershipRaceLiveDB(t *testing.T) {
 					cancel()
 					_ = tx.Rollback(context.Background())
 					if !joined {
-						_ = <-done
+						if err := <-done; err != nil {
+							t.Logf("race cleanup: %v", err)
+						}
 					}
 				}()
 				go func() {
@@ -1144,7 +1154,9 @@ func TestQueuedCustodyRecoveryWaitsForDiscardLiveDB(t *testing.T) {
 		cancel()
 		_ = owner.Rollback(context.Background())
 		if !joined {
-			_ = <-done
+			if result := <-done; result.err != nil {
+				t.Logf("race cleanup: %v", result.err)
+			}
 		}
 	}()
 	pid := tx.Conn().PgConn().PID()
