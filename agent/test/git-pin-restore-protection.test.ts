@@ -75,10 +75,14 @@ it("settlement writes retain protected and unknown refs while legacy unprotected
     if (args[0] === "rev-parse" && args.includes("--verify")) commitProbes++;
     return runGit(dir, args);
   });
-  for (const metadata of ["protected", "unknown"]) {
+  for (const metadata of ["protected", "unknown", "version-downgrade"]) {
     if (metadata === "protected") r.retain();
-    else r.config("uzi-retained." + RUN + ".journal", "{");
+    else r.config("uzi-retained." + RUN + ".journal", metadata === "unknown" ? "{" :
+      JSON.stringify(r.envelope).replace('"version":2,', '"version":2,"version":1,'));
     const before = refs();
+    if (metadata === "version-downgrade") assert.equal((await r.read()).kind, "unknown");
+    await r.cache.deleteSettlementPin(r.bare, RUN, "hold", "source");
+    assert.equal(refs(), before);
     assert.equal(await r.cache.pinSettlementRefs(r.bare, RUN, "hold", { source: next, adopted: next }), false);
     assert.equal(refs(), before);
     assert.equal(commitProbes, 0, "protection must precede ref verification");
