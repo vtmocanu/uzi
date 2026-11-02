@@ -1057,9 +1057,9 @@ test("publication findings persistence keeps a local bounded lifecycle", async t
 for (const transport of ["push", "pack/replay"] as const) {
   for (const clock of ["live", "caller", "maintenance"] as const) {
     test("Runner transport outlives admission clock: " + transport + "/" + clock, async t => {
-      const f = await fixture();
+      const f = await sourceImportFixture(true);
       await git.recordRemediationScan(f.bare, BRANCH, f.source, { trusted: true, tip: f.s, flaggedOIDs: [] });
-      const { cache, runner, subject, flight } = f.fresh();
+      const { cache, runner, subject, flight } = f;
       flight.publishedTip = f.base; flight.checkpointFloor = f.base;
       const startedAt = Date.now();
       let wall = startedAt, transports = 0, guards = 0;
@@ -1068,14 +1068,23 @@ for (const transport of ["push", "pack/replay"] as const) {
         ? wall + 300_000 : Infinity;
       const caller = new AbortController();
       const budget = clock === "maintenance" ? new MaintenanceBudget(300_000, () => wall) : undefined;
+      const positive = cache.readRuntimeRemediationRecovery.bind(cache);
+      let proofs = 0;
+      t.mock.method(cache, "readRuntimeRemediationRecovery", (...args: Parameters<typeof positive>) => {
+        assert.ok(activeAuthorityTransaction(f.lifetime), "enrolled source authentication holds A");
+        proofs++;
+        return positive(...args);
+      });
       const scan = cache.secretScanCheckpointRange.bind(cache);
       t.mock.method(cache, "secretScanCheckpointRange", (...args: Parameters<typeof scan>) => {
+        assert.ok(activeAuthorityTransaction(f.lifetime), "enrolled work retains A");
         const scope = (cache as any).recoveryOperations.getStore();
         assert.ok(scope.deadline <= wall + subject.codexBoundaryDeadlineMs, "each candidate scan is bounded");
         guards++;
         return scan(...args);
       });
       const advance = () => {
+        assert.ok(activeAuthorityTransaction(f.lifetime), "enrolled work retains A");
         const scope = (cache as any).recoveryOperations.getStore();
         assert.equal(scope.deadline, deadline, "actual Git transport inherits only the caller clock");
         wall += 31_000;
@@ -1119,6 +1128,7 @@ for (const transport of ["push", "pack/replay"] as const) {
         assert.equal(transports, transport === "push" ? 1 : 2);
         assert.ok(wall - startedAt > 30_000, "transport completes beyond the admission allowance");
         assert.ok(guards > 0, "real candidate scans precede transport");
+        assert.equal(proofs, transport === "push" ? 1 : 2, "every producer rebuilds current source authentication");
       } finally { budget?.dispose(); runner.shutdown(); }
     });
   }
@@ -1418,4 +1428,135 @@ for (const mode of ["done", "milestone"] as const) for (const stop of ["soft", "
       assert.equal(f.authority.ownedSourceEpoch(f.clone.path, f.flight.sourceUsePaths), f.epoch);
     } finally { f.runner.shutdown(); }
   });
+}
+
+for (const transport of ["push", "pack/replay"] as const) {
+  test("ordinary publication keeps A free and serializes B: " + transport, async t => {
+    const f = await sourceImportFixture(false);
+    f.flight.publishedTip = f.base; f.flight.checkpointFloor = f.base;
+    const started = latch(), resume = latch();
+    let transports = 0, reads = 0, uploads = 0, sameBare = false;
+    const read = f.cache.readRemediationRestrictionFacts.bind(f.cache);
+    t.mock.method(f.cache, "readRemediationRestrictionFacts", (...args: Parameters<typeof read>) => {
+      reads++;
+      assert.equal(args[3], undefined, "ordinary custody never selects a source");
+      assert.equal(activeAuthorityTransaction(f.lifetime), undefined);
+      return read(...args);
+    });
+    const observe = async () => {
+      transports++;
+      assert.equal(activeAuthorityTransaction(f.lifetime), undefined, "actual transport has no A");
+      assert.equal((f.cache as any).recoveryOperations.getStore().deadline, Infinity);
+      if (transports === 1) { started.release(); await resume.promise; }
+    };
+    const run = (f.cache as any).runGit.bind(f.cache);
+    t.mock.method(f.cache as any, "runGit", async (bare: string, args: string[], ...rest: unknown[]) => {
+      if (args[0] === "push") await observe();
+      return run(bare, args, ...rest);
+    });
+    const spawn = (f.cache as any).spawnGit.bind(f.cache);
+    t.mock.method(f.cache as any, "spawnGit", async (bare: string, args: string[], ...rest: unknown[]) => {
+      if (args[0] === "pack-objects") await observe();
+      return spawn(bare, args, ...rest);
+    });
+    f.subject.checkpointTestHooks = { retryBackoffMs: [0, 0] };
+    t.mock.method(client, "publishCheckpoint", async (_run: string, _tip: string, pack: Parameters<typeof client.publishCheckpoint>[2]) => {
+      for await (const chunk of pack) assert.ok(chunk.length > 0);
+      return ++uploads === 1 ? { ok: false as const, httpStatus: 503 }
+        : { ok: true as const, body: { published: true, ref: "refs/uzi-checkpoints/test" } };
+    });
+    const action = transport === "push"
+      ? f.subject.pushRemediationCandidate(f.flight, f.bare, BRANCH, "fixture", fx.originPath, undefined,
+        { candidate: f.s, originalHead: f.s, floor: { kind: "absent" } })
+      : f.subject.publishCheckpointOutcome(f.flight, f.bare, BRANCH);
+    const outcome = action.then((value: any) => ({ value }), (error: unknown) => ({ error }));
+    let sibling: Promise<void> | undefined;
+    try {
+      assert.equal(await Promise.race([started.promise.then(() => true), outcome.then(() => false)]), true);
+      const different = path.join(fx.dataDir, "sibling-publication.git");
+      command(fx.dataDir, "init", "--bare", different);
+      let otherBare = false;
+      await f.authority.withTransaction(() => f.cache.withBareLock(different, async () => { otherBare = true; }));
+      sibling = f.cache.withBareLock(f.bare, async () => { sameBare = true; });
+      await tick();
+      assert.equal(otherBare, true); assert.equal(sameBare, false);
+    } finally {
+      resume.release();
+      await Promise.all([outcome, ...(sibling ? [sibling] : [])]);
+      f.runner.shutdown();
+    }
+    const result = await outcome;
+    assert.ok("value" in result, String("error" in result ? result.error : ""));
+    if (transport === "push") assert.equal(command(fx.originPath, "rev-parse", "refs/heads/" + BRANCH), f.s);
+    else { assert.equal(result.value.published, true); assert.equal(uploads, 2); }
+    assert.equal(transports, transport === "push" ? 1 : 2);
+    assert.equal(reads, transports, "one preliminary custody query per producer, no doubled ordinary query");
+    assert.equal(sameBare, true);
+    assert.equal(f.journal().remediationRecovery, undefined);
+    assert.equal(f.authority.ownedSourceEpoch(f.clone.path, f.flight.sourceUsePaths), f.epoch);
+  });
+}
+
+for (const transport of ["push", "pack"] as const) {
+  for (const denial of ["read failure", "retired", "late enrollment", "late latch", "replay enrollment"] as const) {
+    if (transport === "push" && denial === "replay enrollment") continue;
+    test("ordinary publication refuses " + denial + ": " + transport, async t => {
+      const f = await sourceImportFixture(false);
+      f.flight.publishedTip = f.base; f.flight.checkpointFloor = f.base;
+      let transports = 0, entries = 0, uploads = 0;
+      const finding = { file: "fixture.txt", startLine: 1, commit: f.s, ruleId: "fixture" };
+      if (denial === "read failure") t.mock.method(f.cache, "readRemediationRestrictionFacts", async () => {
+        throw new Error("known custody read failure");
+      });
+      const beforeB = async () => {
+        entries++;
+        assert.equal(activeAuthorityTransaction(f.lifetime), undefined);
+        if (denial === "retired") f.flight.sourceAdmissionRetired = true;
+        if (denial === "late latch") f.subject.latchRemediationFindings(f.flight, f.bare, BRANCH, [finding]);
+        if (denial === "late enrollment" || (denial === "replay enrollment" && entries === 2)) {
+          // Disk-only enrollment after preliminary absence, before the actual B guard.
+          // Do not latch flight memory: this specifically tests fresh B-locked facts.
+          await f.subject.inFlightAuthority(f.flight, () => f.cache.recordRemediationScan(
+            f.bare, BRANCH, f.source,
+            { trusted: true, tip: f.s, flaggedOIDs: [f.s], origin: "checkpoint-pending" }));
+          assert.equal(f.flight.remediationRestrictions, undefined);
+          assert.ok(f.journal().remediationRecovery.flaggedOIDs.includes(f.s));
+        }
+      };
+      const push = f.cache.pushBranch.bind(f.cache);
+      t.mock.method(f.cache, "pushBranch", async (...args: Parameters<typeof push>) => { await beforeB(); return push(...args); });
+      const pack = f.cache.checkpointPack.bind(f.cache);
+      t.mock.method(f.cache, "checkpointPack", async (...args: Parameters<typeof pack>) => {
+        await beforeB();
+        const packed = await pack(...args);
+        if (!packed || denial !== "replay enrollment") return packed;
+        return { ...packed, replay: async () => { await beforeB(); return packed.replay(); } };
+      });
+      const run = (f.cache as any).runGit.bind(f.cache);
+      t.mock.method(f.cache as any, "runGit", (bare: string, args: string[], ...rest: unknown[]) => {
+        if (args[0] === "push") transports++;
+        return run(bare, args, ...rest);
+      });
+      const spawn = (f.cache as any).spawnGit.bind(f.cache);
+      t.mock.method(f.cache as any, "spawnGit", (bare: string, args: string[], ...rest: unknown[]) => {
+        if (args[0] === "pack-objects") transports++;
+        return spawn(bare, args, ...rest);
+      });
+      f.subject.checkpointTestHooks = { retryBackoffMs: [0, 0] };
+      t.mock.method(client, "publishCheckpoint", async (_run: string, _tip: string, bytes: Parameters<typeof client.publishCheckpoint>[2]) => {
+        for await (const chunk of bytes) assert.ok(chunk.length > 0);
+        uploads++;
+        return { ok: false as const, httpStatus: 503 };
+      });
+      try {
+        if (transport === "push") await assert.rejects(f.subject.pushRemediationCandidate(f.flight, f.bare, BRANCH,
+          "fixture", fx.originPath, undefined, { candidate: f.s, originalHead: f.s, floor: { kind: "absent" } }));
+        else assert.equal((await f.subject.publishCheckpointOutcome(f.flight, f.bare, BRANCH)).published, false);
+        assert.equal(entries, denial === "read failure" ? 0 : denial === "replay enrollment" ? 2 : 1);
+        assert.equal(transports, denial === "replay enrollment" ? 1 : 0, "fresh B facts refuse before push/producer");
+        assert.equal(uploads, denial === "replay enrollment" ? 1 : 0);
+        assert.equal(f.authority.ownedSourceEpoch(f.clone.path, f.flight.sourceUsePaths), f.epoch);
+      } finally { f.runner.shutdown(); }
+    });
+  }
 }

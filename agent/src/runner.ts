@@ -18554,7 +18554,8 @@ export class RunRunner {
     };
   }
 
-  /** Publication/transform admission. A encloses all scans and B callbacks.
+  /** Publication/transform admission. Enrolled preparation, scans and transport retain A.
+   * Confirmed unenrolled work uses custody-only evidence and the existing B transport.
    * Preparation and each guard are bounded separately; transport keeps the caller's clock.
    * B callbacks consume the supplied facts, never a public journal reader. Each distinct
    * tip is scanned once per callback; a failure stops the attempt and all sibling scans.
@@ -18570,97 +18571,119 @@ export class RunRunner {
     signal?: AbortSignal, deadlineAt?: number,
   ): Promise<T> {
     const revision = flight.remediationRestrictions?.denialRevision ?? 0;
-    return this.inFlightAuthority(flight, () => this.git.withRecoveryOperation(
+    const selected = this.remediationSource(flight);
+    const checkIdentity = () => {
+      this.assertFlightSourceAdmissible(flight);
+      const current = this.remediationSource(flight);
+      if (!Number.isSafeInteger(revision) || revision < 0 ||
+          (flight.remediationRestrictions?.denialRevision ?? 0) !== revision ||
+          current.runId !== selected.runId || current.clonePath !== selected.clonePath ||
+          current.attemptId !== selected.attemptId || flight.barePath !== barePath || flight.branch !== branch)
+        throw new SecretRemediationPendingError();
+    };
+    checkIdentity();
+    return this.git.withRecoveryOperation(
       signal ?? this.shutdownSignal.signal, deadlineAt ?? Infinity, async () => {
-      let record: RemediationRecovery | undefined;
-      let facts: CheckpointPublicationContext["restrictionFacts"];
-      const selected = this.remediationSource(flight);
-      const check = () => {
-        const state = flight.remediationRestrictions;
-        const current = this.remediationSource(flight);
-        if (!Number.isSafeInteger(revision) || revision < 0 ||
-            (state?.denialRevision ?? 0) !== revision || current.runId !== selected.runId ||
-            current.clonePath !== selected.clonePath || current.attemptId !== selected.attemptId ||
-            flight.barePath !== barePath || flight.branch !== branch)
-          throw new SecretRemediationPendingError();
-        // Enrolled predecessor capture has private custody only. Publication and
-        // tracking transforms wait until verified successor handoff clears this phase.
-        if (record && flight.predecessorCapture) throw new SecretRemediationPendingError();
-        if (!state) return;
-        const pending = state.pending;
-        if (flight.secretRemediation?.overflow === true || !record || !facts || facts.blocked || !facts.enrolled ||
-            selected.clonePath !== flight.worktreePath || !selected.attemptId ||
-            record.runId !== selected.runId || record.clonePath !== selected.clonePath ||
-            record.attemptId !== selected.attemptId || record.blocked !== false ||
-            !state.roots.every(root => facts!.roots.includes(root)) ||
-            !(state.flaggedOIDs ?? []).every(root => facts!.flaggedOIDs.includes(root)) ||
-            (pending && (pending.bindingUncertain || pending.requireDenial ||
-              pending.runId !== selected.runId || pending.clonePath !== selected.clonePath ||
-              pending.attemptId !== selected.attemptId || pending.barePath !== barePath ||
-              pending.branch !== branch || !pending.requiredOIDs.every(root => record!.flaggedOIDs.includes(root)))))
-          throw new SecretRemediationPendingError();
-      };
-      await this.withRemediationLifecycle(signal, async () => {
-        const negative = await this.bootstrapRemediationRestrictions(flight, barePath, branch, signal, deadlineAt);
-        if (negative.kind === "unavailable") throw new SecretRemediationPendingError();
-        if (negative.enrolled || flight.remediationRestrictions) {
-          record = await this.restoreRemediationRestrictions(flight);
-          if (!selected.clonePath || !selected.attemptId) throw new SecretRemediationPendingError();
-          facts = await this.git.readRemediationRestrictionFacts(barePath, branch, flight.runId,
-            { runId: selected.runId, clonePath: selected.clonePath, attemptId: selected.attemptId });
-        }
-        check();
-      }, deadlineAt);
-      const identity: RemediationRestrictionIdentity = { exactRunId: flight.runId,
-        ...(record ? { workerSelectedSource: { runId: selected.runId,
-          clonePath: selected.clonePath!, attemptId: selected.attemptId! } } : {}) };
-      const findings: Array<{ tip: string; findings: SecretFinding[] }> = [];
-      try {
-        return await action({ identity, admit: (source, candidate, floors, supplied) =>
-          this.withRemediationLifecycle(signal, async () => {
-          check();
-          // A context is fresh under B. Its fingerprint includes the authenticated body,
-          // independently confirmed for this selected run/path/attempt before the action.
-          if (supplied && (supplied.blocked || supplied.enrolled !== Boolean(record) ||
-              (facts && supplied.fingerprint !== facts.fingerprint))) throw new SecretRemediationPendingError();
-          if (!record) {
-            if (supplied?.enrolled || flight.remediationRestrictions) throw new SecretRemediationPendingError();
-            return;
-          }
-          const roots = [...new Set([...facts!.roots, ...(flight.secretRemediation?.flaggedCommits ?? [])])];
-          const tips = new Set([record.ownedTip, source, candidate, ...floors,
-            ...(flight.publishedRealTips ?? []), ...[flight.publishedTip, flight.checkpointFloor,
-              flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip].filter((x): x is string => !!x)]);
-          // The journal/parser and flight floor lists are bounded. Do not follow a mutable
-          // work queue: each input and each scan range contributes one finite pass.
-          for (const tip of tips) {
-            check();
-            const scan = await this.scanRemediationRange(flight, barePath, branch, tip, true);
-            if (scan.trusted && scan.findings.length) {
-              findings.push({ tip: scan.range.tipSha, findings: scan.findings });
-              this.latchRemediationFindings(flight, barePath, branch, scan.findings);
-              throw new SecretRemediationPendingError();
+      // This bounded query selects no source and conveys only negative knowledge.
+      const preliminary = await this.bootstrapRemediationRestrictions(flight, barePath, branch, signal, deadlineAt);
+      checkIdentity();
+      if (preliminary.kind === "unavailable") throw new SecretRemediationPendingError();
+      const needsAuthority = preliminary.enrolled || Boolean(flight.remediationRestrictions);
+      const execute = async () => {
+        let record: RemediationRecovery | undefined;
+        let facts: CheckpointPublicationContext["restrictionFacts"];
+        const check = () => {
+          const state = flight.remediationRestrictions;
+          checkIdentity();
+          // Enrolled predecessor capture has private custody only. Publication and
+          // tracking transforms wait until verified successor handoff clears this phase.
+          if (record && flight.predecessorCapture) throw new SecretRemediationPendingError();
+          if (!state) return;
+          const pending = state.pending;
+          if (flight.secretRemediation?.overflow === true || !record || !facts || facts.blocked || !facts.enrolled ||
+              selected.clonePath !== flight.worktreePath || !selected.attemptId ||
+              record.runId !== selected.runId || record.clonePath !== selected.clonePath ||
+              record.attemptId !== selected.attemptId || record.blocked !== false ||
+              !state.roots.every(root => facts!.roots.includes(root)) ||
+              !(state.flaggedOIDs ?? []).every(root => facts!.flaggedOIDs.includes(root)) ||
+              (pending && (pending.bindingUncertain || pending.requireDenial ||
+                pending.runId !== selected.runId || pending.clonePath !== selected.clonePath ||
+                pending.attemptId !== selected.attemptId || pending.barePath !== barePath ||
+                pending.branch !== branch || !pending.requiredOIDs.every(root => record!.flaggedOIDs.includes(root)))))
+            throw new SecretRemediationPendingError();
+        };
+        await this.withRemediationLifecycle(signal, async () => {
+          checkIdentity();
+          if (needsAuthority) {
+            // Reconfirm under A before authenticating the selected source.
+            const negative = await this.bootstrapRemediationRestrictions(flight, barePath, branch, signal, deadlineAt);
+            checkIdentity();
+            if (negative.kind === "unavailable") throw new SecretRemediationPendingError();
+            if (negative.enrolled || flight.remediationRestrictions) {
+              record = await this.restoreRemediationRestrictions(flight);
+              checkIdentity();
+              if (!selected.clonePath || !selected.attemptId) throw new SecretRemediationPendingError();
+              facts = await this.git.readRemediationRestrictionFacts(barePath, branch, flight.runId,
+                { runId: selected.runId, clonePath: selected.clonePath, attemptId: selected.attemptId });
             }
+          }
+          check();
+        }, deadlineAt);
+        const identity: RemediationRestrictionIdentity = { exactRunId: flight.runId,
+          ...(record ? { workerSelectedSource: { runId: selected.runId,
+            clonePath: selected.clonePath!, attemptId: selected.attemptId! } } : {}) };
+        const findings: Array<{ tip: string; findings: SecretFinding[] }> = [];
+        try {
+          check();
+          return await action({ identity, admit: (source, candidate, floors, supplied) =>
+            this.withRemediationLifecycle(signal, async () => {
             check();
-            if (!scan.trusted) throw new SecretRemediationPendingError();
-            for (const floor of new Set([tip, ...this.remediationRangeFloors(scan.range, scan.floorCandidates)])) {
-              for (const root of roots) {
-                check();
-                const relation = await this.git.ancestry(barePath, root, floor);
-                check();
-                if (relation !== "divergent") throw new SecretRemediationPendingError();
+            // A context is fresh under B. Its fingerprint includes the authenticated body,
+            // independently confirmed for this selected run/path/attempt before the action.
+            if (supplied && (supplied.blocked || supplied.enrolled !== Boolean(record) ||
+                (facts && supplied.fingerprint !== facts.fingerprint))) throw new SecretRemediationPendingError();
+            if (!record) {
+              if (supplied?.enrolled || flight.remediationRestrictions) throw new SecretRemediationPendingError();
+              return;
+            }
+            const roots = [...new Set([...facts!.roots, ...(flight.secretRemediation?.flaggedCommits ?? [])])];
+            const tips = new Set([record.ownedTip, source, candidate, ...floors,
+              ...(flight.publishedRealTips ?? []), ...[flight.publishedTip, flight.checkpointFloor,
+                flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip].filter((x): x is string => !!x)]);
+            // The journal/parser and flight floor lists are bounded. Do not follow a mutable
+            // work queue: each input and each scan range contributes one finite pass.
+            for (const tip of tips) {
+              check();
+              const scan = await this.scanRemediationRange(flight, barePath, branch, tip, true);
+              if (scan.trusted && scan.findings.length) {
+                findings.push({ tip: scan.range.tipSha, findings: scan.findings });
+                this.latchRemediationFindings(flight, barePath, branch, scan.findings);
+                throw new SecretRemediationPendingError();
+              }
+              check();
+              if (!scan.trusted) throw new SecretRemediationPendingError();
+              for (const floor of new Set([tip, ...this.remediationRangeFloors(scan.range, scan.floorCandidates)])) {
+                for (const root of roots) {
+                  check();
+                  const relation = await this.git.ancestry(barePath, root, floor);
+                  check();
+                  if (relation !== "divergent") throw new SecretRemediationPendingError();
+                }
               }
             }
-          }
-          check();
-        }, deadlineAt) });
-      } finally {
-        for (const finding of findings)
-          await this.withRemediationLifecycle(signal, () =>
-            this.persistRemediationRestrictions(flight, barePath, branch, finding.tip, finding.findings), deadlineAt);
-      }
-    }), { ...this.authorityWait(flight), ...(signal ? { signal } : {}),
-      ...(deadlineAt ? { timeoutMs: Math.max(1, deadlineAt - Date.now()) } : {}) });
+            check();
+          }, deadlineAt) });
+        } finally {
+          for (const finding of findings)
+            await this.withRemediationLifecycle(signal, () =>
+              this.persistRemediationRestrictions(flight, barePath, branch, finding.tip, finding.findings), deadlineAt);
+        }
+      };
+      return needsAuthority
+        ? this.inFlightAuthority(flight, execute, { ...this.authorityWait(flight), ...(signal ? { signal } : {}),
+          ...(deadlineAt ? { timeoutMs: Math.max(1, deadlineAt - Date.now()) } : {}) })
+        : execute();
+    });
   }
 
   /** Final push seam, shared by plain and aligned candidates and every network retry. */
