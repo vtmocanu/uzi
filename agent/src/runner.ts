@@ -23355,8 +23355,6 @@ export class RunRunner {
         claim_generation: flight.claimGeneration });
       throw new RetainedRecoveryStop();
     }
-    await this.bootstrapRemediationRestrictions(flight);
-    this.retainedLifecycleGuard(flight);
     await this.logPredecessorMemorySettlement(flight, bare, branch, source);
     const inherited = flight.sourceInherited?.family;
     if (inherited?.observedExecution.runId === flight.runId) {
@@ -23444,6 +23442,9 @@ export class RunRunner {
         await checkOwnership();
         try {
           await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), deadline, async signal => {
+            await this.bootstrapRemediationRestrictions(flight);
+            this.retainedLifecycleGuard(flight);
+            await this.requireRetainedOwnership(flight, deadline, signal);
             // No capture is performed on a rehold. Every source, including a partial
             // successor, still needs a fresh credential-free quiescence boundary.
             const proof = await this.runFreeCapture(claim, flight, deadline, signal, async held => {
@@ -23565,6 +23566,11 @@ export class RunRunner {
       try {
         await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), iteration.deadline, async signal => {
           const check = () => this.requireRetainedOwnership(flight, iteration.deadline, signal);
+          await check();
+          // Preservation is precharged independently; restore current custody before source work,
+          // with the same lifecycle and episode bound as the capture that consumes it.
+          await this.bootstrapRemediationRestrictions(flight);
+          this.retainedLifecycleGuard(flight);
           await check();
           // issue #3404 M2 U3: admit the predecessor path (a fresh epoch carrying the capturing executor)
           // under a short A BEFORE the capture's first effect. A foreign active slot refuses the capture.

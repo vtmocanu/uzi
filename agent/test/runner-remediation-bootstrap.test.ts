@@ -9,7 +9,7 @@ import { SteeringChannel } from "../src/steering.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { portableTeardownTestDeps } from "./teardown-fixtures.js";
-import { client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness } from "./runner-harness.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness } from "./runner-harness.js";
 
 installHarness();
 const BRANCH = "agent/issue-3747", KEY = "issue-3747";
@@ -24,6 +24,7 @@ function command(dir: string, ...args: string[]): string {
 
 async function fixture(enrolled = true) {
   const claim = gitlabClaim(3747, { claim_generation: 2, session_id: "predecessor-session" });
+  api.setOwnershipStatus(claim.run_id, "running", 2);
   const bare = await git.ensureClone(fx.originPath);
   fs.chmodSync(path.dirname(bare), 0o700); fs.chmodSync(bare, 0o700);
   const base = command(bare, "rev-parse", "refs/remotes/origin/main");
@@ -199,32 +200,101 @@ for (const unavailable of [false, true]) {
   });
 }
 
-for (const protectedOnly of [false, true]) {
-  test("retained entry restores custody before settlement/reservation protected=" + protectedOnly, async t => {
+for (const unavailable of [false, true]) {
+  test("retained bootstrap restores current custody after real reservation before effects unavailable=" + unavailable, async t => {
     const f = await fixture();
-    if (protectedOnly) await f.detach();
     const { cache, runner, subject, flight } = f.fresh();
-    const stop = new Error("fixture stops before reservation");
+    const stop = new Error("fixture stops at source admission");
     const reserve = t.mock.method(cache, "reserveRecoveryIteration");
-    const read = t.mock.method(cache, "readRemediationRestrictionFacts");
-    t.mock.method(subject, "logPredecessorMemorySettlement", async () => {
-      assert.equal(read.mock.callCount(), 1);
-      assert.ok(flight.remediationRestrictions.roots.includes(f.q));
-      assert.ok(flight.remediationRestrictions.roots.includes(f.d));
+    const read = cache.readRemediationRestrictionFacts.bind(cache);
+    const query = t.mock.method(cache, "readRemediationRestrictionFacts", async (...args: Parameters<typeof read>) => {
+      assert.equal(reserve.mock.callCount(), 1);
+      assert.deepEqual(f.journal().remediationRecovery, original,
+        "actual reservation preserves CURRENT remediation, absent from the stale parsed source");
+      return unavailable ? read(args[0], args[1], args[2], undefined, { readback: async () => "different" }) : read(...args);
+    });
+    const original = f.journal().remediationRecovery;
+    const admission = t.mock.method(subject, "admitPredecessorSource", async () => {
+      assert.equal(query.mock.callCount(), 1);
+      if (unavailable) {
+        assert.ok(flight.remediationRestrictions.denialRevision > 0);
+        assert.equal(flight.preserveRecoveryClone, true);
+      } else {
+        assert.ok(flight.remediationRestrictions.roots.includes(f.q));
+        assert.ok(flight.remediationRestrictions.roots.includes(f.d));
+      }
+      flight.cancel.abort(stop);
       throw stop;
     });
-    const before = f.snapshot();
+    const capture = t.mock.method(subject, "runFreeCapture", async () => { throw new Error("must not capture"); });
     try {
-      // A genuinely earlier parsed journal contains no remediation state. Current
-      // active/protected artifacts, rather than this old process view, supply it.
       assert.equal(f.seedJournal.remediationRecovery, undefined);
-      await assert.rejects(subject.recoverRetainedClaim(f.claim, flight, KEY, f.seedJournal),
-        error => error === stop);
-      assert.equal(reserve.mock.callCount(), 0);
-      assert.deepEqual(f.snapshot(), before);
+      await assert.rejects(subject.recoverRetainedClaim(f.claim, flight, KEY, f.seedJournal));
+      assert.equal(admission.mock.callCount(), 1);
+      assert.equal(reserve.mock.callCount(), 1);
+      assert.equal(query.mock.callCount(), 1);
+      assert.equal(flight.cancel.signal.aborted, true, "all before-effect assertions reached the controlled stop");
+      assert.equal(capture.mock.callCount(), 0);
+      assert.deepEqual(f.journal().remediationRecovery, original);
     } finally { runner.shutdown(); }
   });
 }
+
+test("protected-only stale source refuses actual reservation before effects", async t => {
+  const f = await fixture();
+  await f.detach();
+  const { cache, runner, subject, flight } = f.fresh();
+  const reserve = t.mock.method(cache, "reserveRecoveryIteration");
+  const admission = t.mock.method(subject, "admitPredecessorSource", async () => { throw new Error("must not admit"); });
+  const capture = t.mock.method(subject, "runFreeCapture", async () => { throw new Error("must not capture"); });
+  const before = f.snapshot();
+  try {
+    await assert.rejects(subject.recoverRetainedClaim(f.claim, flight, KEY, f.seedJournal));
+    assert.equal(reserve.mock.callCount(), 1);
+    assert.equal(admission.mock.callCount(), 0);
+    assert.equal(capture.mock.callCount(), 0);
+    assert.equal(flight.preserveRecoveryClone, true);
+    assert.equal(flight.preserveSession, true);
+    assert.deepEqual(f.snapshot(), before);
+  } finally { runner.shutdown(); }
+});
+
+test("adoption rehold bootstraps current custody inside its bounded operation before quiescence", async t => {
+  const f = await fixture();
+  const iteration = await git.reserveRecoveryIteration(f.bare, BRANCH, KEY, f.source, 1, f.claim.claim_generation);
+  await git.blockRecoveryEpisode(f.bare, BRANCH, KEY, f.source, "adoption_failed", iteration);
+  client.protocolFeatures = ["claim_generation_fence", "recovery_cause_retained_recovery_adoption_failed"];
+  const { cache, runner, subject, flight } = f.fresh();
+  const original = f.journal().remediationRecovery;
+  const stale = { ...f.seedJournal, recovery: f.journal().recovery };
+  const read = cache.readRemediationRestrictionFacts.bind(cache);
+  let boundedQuery = false;
+  const query = t.mock.method(cache, "readRemediationRestrictionFacts", (...args: Parameters<typeof read>) => {
+    const scope = (cache as any).recoveryOperations.getStore();
+    boundedQuery = !!scope && Number.isFinite(scope.deadline) && !scope.signal.aborted;
+    return read(...args);
+  });
+  const reserve = t.mock.method(cache, "reserveRecoveryIteration");
+  const capture = t.mock.method(subject, "runFreeCapture", async () => {
+    assert.equal(query.mock.callCount(), 1);
+    assert.equal(reserve.mock.callCount(), 0, "a blocked rehold never enters the normal iteration");
+    const scope = (cache as any).recoveryOperations.getStore();
+    assert.ok(scope && Number.isFinite(scope.deadline) && !scope.signal.aborted);
+    assert.ok(flight.remediationRestrictions.roots.includes(f.q));
+    assert.ok(flight.remediationRestrictions.roots.includes(f.d));
+    flight.cancel.abort(new Error("fixture stops before quiescence"));
+    throw flight.cancel.signal.reason;
+  });
+  const quiesce = t.mock.method(subject, "quiesceRun", async () => { throw new Error("must not prove"); });
+  try {
+    await assert.rejects(subject.recoverRetainedClaim(f.claim, flight, KEY, stale));
+    assert.equal(capture.mock.callCount(), 1);
+    assert.equal(boundedQuery, true, "the rehold query itself inherits the existing operation");
+    assert.equal(flight.cancel.signal.aborted, true, "custody assertions reached the controlled stop");
+    assert.equal(quiesce.mock.callCount(), 0);
+    assert.deepEqual(f.journal().remediationRecovery, original);
+  } finally { runner.shutdown(); }
+});
 
 test("confirmed absence preserves ordinary ancestor and divergent bridge behavior", async t => {
   const f = await fixture(false);
