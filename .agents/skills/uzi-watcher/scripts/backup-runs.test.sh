@@ -27,6 +27,7 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/backup-runs.sh"
+python3 -B "$HERE/pin-restore-descriptor.test.py" || exit $?
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -1622,5 +1623,101 @@ rc="$(backup_rc "$D_T3D" failed-2 "UZI_TEST_PODS=pod/uzi-hw-$WID-test pod/uzi-hw
 grep -q "FAIL failed-2 .*inconclusive (.*exec into pod ns/uzi-hw-second-test failed.*a candidate's .git on pod ns/uzi-hw-$WID-test could not be read); retry" "$D_T3D/latest-attempt/backup.log" \
   || fail "t3 both: FAIL line must name both pods; log: $(log_of "$D_T3D")"
 echo "PASS t3: the no-capture FAIL line names the failing pod, namespace or unreadable .git"
+
+# V2 protected metadata uses exact raw predecessor bytes and an independently
+# linked active successor. The backup must preserve original and sibling WIP.
+for phase in prepared-old prepared-new ready-new prepared-absent ready-absent progress ready-old tampered duplicate active-newline duplicate-empty active-duplicate-empty wrong-bare; do
+  reset_layout
+  make_clone "$RB/issue-4242" agent/issue-4242 v2-original
+  make_clone "$RB/issue-4242.attempt-$A1" agent/issue-4242 v2-sibling
+  make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 v2-successor
+  ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" reclaimed
+  # An absent active journal does not attribute a merely intended successor.
+  case "$phase" in
+    *-new) ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live ;;
+    *) ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" retired ;;
+  esac
+  if ! python3 - "$BARE" "$RB" "$A1" "$A2" "$phase" <<'PY'
+import hashlib
+import json
+import subprocess
+import sys
+bare, root, a1, a2, mode = sys.argv[1:]
+epoch = "00000000-0000-4000-8000-000000000001"
+successor_epoch = "00000000-0000-4000-8000-000000000002"
+def dump(x):
+    return json.dumps(x, separators=(",", ":"))
+source = dict(runId="run-4242", clonePath=root + "/issue-4242", sourceGeneration=1,
+              retainedSources=[dict(runId="run-4242", clonePath=root + "/issue-4242.attempt-" + a1, attemptId=a1)],
+              completionSourceFence=dict(version=1, sourceUseEpoch=epoch, sourceCoreDigest="a" * 64))
+if mode == "progress":
+    source["restoreTip"] = "a" * 40
+    source["recovery"] = dict(version=1, source=dict(runId="run-4242", clonePath=root + "/issue-4242"),
+                              attempts=1, startedAt=1000, deadline=301000, backoffMs=0,
+                              stage="captured", restoreTip="a" * 40, restoreSource="b" * 40)
+raw = "  " + dump(source) + "\n\n"
+digest = hashlib.sha256(raw.encode()).hexdigest()
+link = dict(version=1, intentId="intent-1", predecessorJournalDigest=digest,
+            predecessorGeneration=1, predecessorEpoch=epoch,
+            successor=dict(runId="run-4242", claimGeneration=2, workerId="worker", registerNonce="nonce",
+                           authorityIncarnation=epoch, executorIncarnation=None, sourceEpoch=successor_epoch,
+                           attemptId=a2, clonePath=root + "/issue-4242.attempt-" + a2),
+            restore=dict(captureId="capture-1", authenticatedRecordDigest="b" * 64, predecessorGeneration=1,
+                         bareDir="testrepo.git", pinRef="refs/uzi-recovery-pin/run-4242/1",
+                         tip="a" * 40, contentSource="b" * 40, expectedHead="c" * 40, expectedTree="d" * 40))
+new = dump(dict(runId="run-4242", clonePath=link["successor"]["clonePath"], attemptId=a2,
+                sourceGeneration=2, pinRestore=link))
+phase = "ready" if mode.startswith("ready") else "prepared"
+e = dict(version=2, runId="run-4242", branch="agent/issue-4242", key="issue-4242",
+         predecessors=[dict(journalDigest=digest, rawJournal=raw, generation=1, sourceEpoch=epoch)],
+         intent=dict(version=1, phase=phase, link=link))
+if mode == "tampered":
+    e["predecessors"][0]["journalDigest"] = "f" * 64
+if mode == "wrong-bare":
+    link["restore"]["bareDir"] = "other.git"
+value = dump(e)
+if mode == "duplicate":
+    value = value.replace('"version":2', '"version":2,"\\u0076ersion":2', 1)
+subprocess.run(["git", "--git-dir=" + bare, "config", "uzi-retained.run-4242.journal", value], check=True)
+if not mode.endswith("absent"):
+    active = new if mode.endswith("new") else raw
+    if mode == "active-newline":
+        active = raw.rstrip("\n")
+    subprocess.run(["git", "--git-dir=" + bare, "config", "uzi-recovery.agent/issue-4242.clone", active], check=True)
+if mode in ("duplicate-empty", "active-duplicate-empty"):
+    key = "uzi-retained.run-4242.journal" if mode == "duplicate-empty" else "uzi-recovery.agent/issue-4242.clone"
+    subprocess.run(["git", "--git-dir=" + bare, "config", "--add", key, ""], check=True)
+PY
+  then
+    fail "v2 $phase: fixture setup failed"
+  fi
+  dest="$WORK/out.v2-$phase"
+  rc="$(backup_rc "$dest" run-4242)"
+  case "$phase" in
+    ready-old|tampered|duplicate|active-newline|duplicate-empty|active-duplicate-empty|wrong-bare)
+      [ "$rc" -ne 0 ] || fail "v2 $phase: invalid descriptor accepted"
+      [ ! -e "$dest/latest" ] || fail "v2 $phase: latest advanced"
+      grep -q 'invalid V2 protected descriptor' "$dest/latest-attempt/backup.log" \
+        || fail "v2 $phase: refusal reason missing"
+      ;;
+    *)
+      [ "$rc" -eq 0 ] || fail "v2 $phase: exit $rc; log: $(log_of "$dest")"
+      markers="$WORK/v2-markers"
+      : > "$markers"
+      for archive in "$dest"/latest/issue-4242*.tgz; do
+        member="$(tar tzf "$archive" | awk '/uncommitted.patch$/ {print; exit}')"
+        tar -xOzf "$archive" "$member" >> "$markers"
+      done
+      grep -qxF '+v2-original' "$markers" || fail "v2 $phase: original dirty bytes missing"
+      grep -qxF '+v2-sibling' "$markers" || fail "v2 $phase: sibling dirty bytes missing"
+      case "$phase" in
+        *-new) grep -qxF '+v2-successor' "$markers" || fail "v2 $phase: active successor missing" ;;
+        *-absent) if grep -qxF '+v2-successor' "$markers"; then fail "v2 $phase: intended successor attributed without active journal"; fi ;;
+      esac
+      ;;
+  esac
+  git --git-dir="$BARE" config --unset-all uzi-retained.run-4242.journal
+  echo "PASS v2 $phase"
+done
 
 echo "ALL PASS"
