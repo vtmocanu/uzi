@@ -226,6 +226,7 @@ func TestHarnessOverflowCodexDefaultAndHoldsLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			run = mustRun(t, fx.env, run.ID)
 			if scenario == "fresh" {
 				if run.Harness != "codex" || run.HarnessDecisionReason.String != "overflow" {
 					t.Fatalf("fresh default: %s/%v", run.Harness, run.HarnessDecisionReason)
@@ -406,6 +407,7 @@ func TestHarnessOverflowCodexPreferredDefaultLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			run = mustRun(t, fx.env, run.ID)
 			if run.Harness != want {
 				t.Fatalf("%s harness=%s want %s", scenario, run.Harness, want)
 			}
@@ -573,6 +575,7 @@ func TestHarnessOverflowCodexSelectorOutcomesLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			run = mustRun(t, fx.env, run.ID)
 			switch scenario {
 			case "auto", "best_of_pool":
 				if run.Harness != "codex" || run.HarnessDecisionReason.String != "overflow" ||

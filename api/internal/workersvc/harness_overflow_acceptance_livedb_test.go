@@ -174,6 +174,13 @@ func TestHarnessOverflowCodexInvalidReadingLiveDB(t *testing.T) {
 						poolWindow(fiveHourSecs, 20, now.Unix()-poolEpoch-30),
 						poolWindow(weekSecs, 10, 100000)), "1 minute")
 				case "vault locked":
+					// Enrollment converts all existing secrets, including Claude's
+					// gauge-only fixture, so give that row real master ciphertext.
+					sealed, err := fx.env.box.Seal([]byte("overflow-claude-fixture"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					fx.env.exec("UPDATE user_secrets SET ciphertext=$1 WHERE id=$2", sealed, fx.token)
 					vlt := vault.NewPostgres(fx.env.box, fx.env.pool)
 					fx.svc.SetVault(vlt)
 					enrollCodexProtectedVault(t, fx.env, vlt, fx.userID, codexVaultLockedTestPassword)
