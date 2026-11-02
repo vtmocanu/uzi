@@ -248,6 +248,8 @@ type WorkerDTO struct {
 	// outcome (the entry OutboxBlocked describes), shown to the worker's owner so they can
 	// tell which run is held. Untrusted worker text: never joined to a run's title or status.
 	OutboxBlockedRunID *string `json:"outbox_blocked_run_id"`
+	// OutboxRootUnusable is worker-global telemetry, separate from per-run blocked outcomes.
+	OutboxRootUnusable *string `json:"outbox_root_unusable,omitempty"`
 	// ResidueQuarantinedAt / ResidueQuarantineCause report the worker's residue
 	// quarantine latch (issue #2213): the worker found an unreadable, unattributed
 	// runner-uid process and refuses new claims, forge-credentialed git and provider

@@ -751,6 +751,7 @@ describe("RunRunner — M2 explicit park callback", () => {
     const timerDelays: number[] = [];
     let callbackReads = 0;
     const clockStart = Date.now();
+    let parkedMs = 0;
     api.onState(claim.run_id, (state) => {
       if (state.status !== "awaiting_input") return;
       questions++;
@@ -823,9 +824,11 @@ describe("RunRunner — M2 explicit park callback", () => {
         ? new RunRunner(client, git, factory, nullLogger(), 20, undefined, {
             pollMs: 5, questionTimeoutMs: 600, gitlab, checkpointIntervalMs: 0,
             checkpointTestHooks: { retryBackoffMs: [0, 0] },
-            now: () => clockStart + (options.interruptWait ? (callbackEntries > 1 ? 200 : 0) : questions * 601),
+            now: () => clockStart + (options.interruptWait ? (callbackEntries > 1 ? 200 : 0) : parkedMs),
             setTimer: (cb, ms) => {
               timerDelays.push(ms);
+              // deadlineRetry: Q1's parked span consumes the whole budget (logical time only).
+              if (options.deadlineRetry && timerDelays.length === 1) parkedMs += 600;
               const timer = setTimeout(cb, ms);
               timer.unref();
               return () => clearTimeout(timer);
@@ -909,7 +912,7 @@ describe("RunRunner — M2 explicit park callback", () => {
     assert.equal(outcome.pauseAttempts, 1);
   });
 
-  it("retains an interrupted active question ID and absolute deadline on callback re-entry", async () => {
+  it("retains an interrupted active question ID and parked-time budget on callback re-entry", async () => {
     const outcome = await exercise({ empty: true, interruptWait: true, resumeGuardedWall: true });
     assert.equal(outcome.pauseAttempts, 1);
     assert.equal(outcome.callbackEntries, 2);
@@ -1099,8 +1102,9 @@ describe("RunRunner — M2 explicit park callback", () => {
     assert.equal(api.workerPauseRequests.length, 1);
   });
 
-  it("reuses the absolute question deadline across explicit retries", async () => {
+  it("shares one parked-time budget across explicit retries", async () => {
     const outcome = await exercise({ empty: true, deadlineRetry: true });
+    assert.deepEqual(outcome.timerDelays, [600, 0], "Q1's parked time consumed the budget, so Q2 arms none");
     assert.equal(outcome.result, undefined);
     assert.equal(outcome.questions, 2);
     assert.equal(api.workerPauseRequests.length, 2);

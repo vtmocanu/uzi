@@ -615,3 +615,19 @@ describe("milestone reset transport", () => {
     expect(fetchMock.mock.calls[2][0]).toBe("/api/runs/r1?reconciliation_before_gate_revision=12");
   });
 });
+
+
+describe("harness overflow HTTP contract", () => {
+  it.each([true, false])("PUTs explicit %s to its independent endpoint", async enabled => {
+    const body = { harness_overflow_enabled: enabled };
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, body));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "uzi_csrf=csrf-value" });
+    expect(await api.setHarnessOverflow(enabled)).toEqual(body);
+    expect(fetchMock.mock.calls).toEqual([["/api/me/harness-overflow", {
+      method: "PUT", credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": "csrf-value" },
+      body: JSON.stringify(body),
+    }]]);
+  });
+});

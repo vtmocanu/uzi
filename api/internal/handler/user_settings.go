@@ -99,6 +99,8 @@ type userSettingsDTO struct {
 	// default alias, "auto" picks among the aliases the user pooled. Read-only here:
 	// PUT /api/me/codex-account-mode owns the write.
 	CodexAccountMode string `json:"codex_account_mode"`
+	// Read-only here; PUT /api/me/harness-overflow owns the write.
+	HarnessOverflowEnabled bool `json:"harness_overflow_enabled"`
 }
 
 // userSettingsResponse reads the user's settings row (one GetUserSettings query,
@@ -141,6 +143,12 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 	codexMode, err := h.q.GetUserCodexAccountMode(r.Context(), userID)
 	if err != nil {
 		slog.Error("get codex account mode", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	policy, err := h.q.GetHarnessCreationPolicy(r.Context(), userID)
+	if err != nil {
+		slog.Error("get harness overflow preference", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
@@ -195,6 +203,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			WeeklyReservePct:          intPtrFromInt2(s.WeeklyReservePct),
 			WeeklyReservePauseRunning: s.WeeklyReservePauseRunning,
 			CodexAccountMode:          codexMode,
+			HarnessOverflowEnabled:    policy.HarnessOverflowEnabled,
 		},
 	})
 }

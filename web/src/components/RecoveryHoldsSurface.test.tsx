@@ -103,7 +103,7 @@ describe("RecoveryHoldsSurface", () => {
     fireEvent.click(screen.getByRole("button", { name: /Discard held work/ }));
     const group = screen.getByRole("group", { name: "Discard held work for run run-xyz on jvm-worker, generation 4" });
     const warning = document.getElementById(group.getAttribute("aria-describedby")!)!;
-    expect(warning.textContent).toContain("An earlier available archive can restore older work but may not cover the latest worker-local work.");
+    expect(warning.textContent).toContain("An earlier available archive requires its prerequisite commits to restore older work and may not cover the latest worker-local work.");
     expect(warning.textContent).toContain("The latest worker-local source may be the only copy.");
     expect(warning.textContent).not.toContain("no server archive can restore it");
     expect(warning.textContent).toContain("hold h-src");

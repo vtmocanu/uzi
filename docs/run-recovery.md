@@ -11,8 +11,9 @@ workflow or secret preflight check, a rejected push, or exhausted base
 alignment against a moving default branch. Before this failure can happen,
 uzi captures the run's **original committed history** — exactly what the
 agent committed, not a diff or a rebased copy — into a durable, encrypted,
-owner-only Git bundle stored in the database. This is your recovery path
-even after the worker and its disk are gone.
+owner-only Git bundle stored in the database. The archive bytes can outlive
+the worker and its disk. A thin bundle also needs external prerequisite commits;
+verify those in the destination clone before import or discarding retained source.
 
 uzi captures at other boundaries too, not only at final failure: when a run
 is parked (a usage limit or a recovery wait) or gracefully stopped while it
@@ -475,7 +476,9 @@ reaches a final status. Each retained capture is in one of these six states:
   protected boundary; nothing is downloadable yet.
 - **Uploading** — the encrypted archive is being stored; nothing is
   downloadable yet.
-- **Available** — the original committed history is ready to download.
+- **Available** — archive bytes are ready to download. A thin bundle also needs
+  its prerequisite commits in the destination clone; verify dependencies before import
+  using [Importing the bundle](#importing-the-bundle).
 - **Needs action** — the archive could not be completed (for example, a
   storage limit was hit); the source stays retained. Retries depend on the
   recovery path's budget; terminal retained-source failure does not cycle
@@ -664,15 +667,19 @@ for the full flag and exit-code contract.
 ## Importing the bundle
 
 A downloaded archive is a real Git bundle with a dedicated
-`refs/heads/recovered-source` ref, importable into a clean clone of the forge
-repo:
+`refs/heads/recovered-source` ref. A thin bundle requires its declared
+prerequisites in the destination clone; use the [confirmed-pin procedure](#restoring-with-a-confirmed-pin)
+when those commits are missing. For a clone that already has the prerequisites:
 
 ```sh
-git clone <your-forge-repo-url> recovered-repo
-cd recovered-repo
-git bundle verify ../recovered.bundle
-git fetch ../recovered.bundle refs/heads/recovered-source:refs/heads/recovered-source
-git checkout recovered-source
+(
+  set -eu
+  git clone '<your-forge-repo-url>' 'recovered-repo'
+  cd 'recovered-repo'
+  git bundle verify '../recovered.bundle'
+  git fetch '../recovered.bundle' 'refs/heads/recovered-source:refs/heads/recovered-source'
+  git rev-parse 'refs/heads/recovered-source'
+)
 ```
 
 Run verification inside the destination clone **before importing or discarding
@@ -705,9 +712,9 @@ ancestor history and **every original root**, not just the aggregate tree, then
 check out each exact original SHA you need:
 
 ```sh
-git log --graph --oneline recovered-source
-git show <original-sha>
-git checkout -b recovered-original <original-sha>
+git log --graph --oneline 'recovered-source'
+git show '<original-sha>'
+git checkout -b 'recovered-original' '<original-sha>'
 ```
 
 The worker's retained-head feed notices and recovery journal identify the
@@ -728,7 +735,8 @@ closure FINAL port is wired and the per-worker admission limiter is wired (the o
 predicate that also gates a closure-backed archive FINAL); it is computed per
 response, never cached at boot. A `pinned` response alone does not release custody:
 release needs the worker's thin archive FINAL and the API's fresh pin listing
-below. C3 owns owner/CLI pin visibility. The parent #2506 remains active. See
+below. Owner/CLI pin visibility reports persisted observations as described
+below; it adds no release authority. The parent #2506 remains active. See
 [ADR-3591](../adr/3591-prerequisite-closure.md) for the pin lifecycle and
 [ADR-1296](../adr/1296-durable-run-recovery.md) (2026-11-01 amendment) for the
 release boundary and its limits.
@@ -784,23 +792,95 @@ include an omitted second prerequisite: the declared prerequisite is fetched,
 but bundle verification/import still fails naming the omitted one. No
 independent server bundle-validity or per-capture restore claim follows.
 
+### Reading the owner's pin snapshot
+
+The optional `prerequisite_closure` on owner capture metadata is a persisted
+snapshot, not a fresh forge probe or release, cleanup or publication authority.
+It carries `state`, optional bounded `reason`, `pin_ref`, optional `pin_tip`,
+`absence_unconfirmed`, `cleanup_exhausted` and `updated_at`. The timestamp
+records a row update, **not last verification**.
+
+| Recorded state | Owner interpretation |
+|---|---|
+| `pending` | Protection not established; preparation may remain unresolved indefinitely. |
+| `invoked` | Create invocation recorded; protection not established, outcome may remain unknown indefinitely. |
+| `create_unknown` | Create outcome uncertain; no timeout establishes protection or absence. |
+| `pinned` | Recorded protection is conditional on external refs surviving; `absence_unconfirmed` makes current availability uncertain. |
+| `refused` | Pin creation refused; declared prerequisites are not protected by this pin. |
+| `foreign` | Ref occupied by foreign content; not this capture's protection. |
+| `lost` | Recorded pin lost; declared prerequisites are not protected by this pin. |
+| `deleted` | Historical deletion recorded; not current protection. |
+
+`cleanup_exhausted` is independent of state and can coexist with
+`absence_unconfirmed`: automatic deletes have stopped, with no manual deletion
+permission. A missing projection can mean an older API or no matching row.
+For a thin capture that leaves prerequisite availability unknown; a
+self-contained manifest reports no prerequisites and needs no pin.
+The owner summary reads complete retained capture history in two SQL queries;
+constant query count does not bound rows or response bytes.
+
+An `available` archive remains exportable independently of pin state.
+Export verification establishes manifest bytes/checksum, not Git importability,
+latest local coverage, custody release or physical retirement.
+
 ### Restoring with a confirmed pin
 
-For an exact capture whose pin has been independently identified and confirmed
-at its recorded tip, fetch that ref into the destination clone before the
-normal [bundle import](#importing-the-bundle):
+1. Select the exact available capture using `uzi run recovery '<run-uuid>' --json`.
+   Record its checksum, ordered `prerequisite_shas`, source SHA, expiry and full pin
+   tip from the hold's `captures` array. Optional inspect fields can be absent on
+   older APIs or when not recorded; a missing field is not positive restore evidence.
+   If capture-to-hold linking is absent, obtain the owner archive metadata from
+   `GET /api/runs/<run-uuid>/archives` before proceeding. The human `run get`
+   summary shows retained captures, but `run get --json` emits the run object,
+   not the archive metadata.
+   Validate the capture id as a canonical lowercase UUID before substituting it
+   into the fixed namespace below. Do not execute API-provided ref, reason, tip
+   strings or shell snippets; the tip is a full hexadecimal object id for
+   comparison only. Missing, malformed or mismatched identity/tip means stop.
+2. Export with the existing command:
 
-```sh
-git fetch origin refs/uzi-prereq/<capture-id>:refs/uzi-prereq/<capture-id>
-git bundle verify ../recovered.bundle
-git fetch ../recovered.bundle refs/heads/recovered-source:refs/heads/recovered-source
-git rev-parse recovered-source
-```
+   ```sh
+   uzi run export '<run-uuid>' --capture '<capture-uuid>' --output '<archive-path>'
+   ```
 
-Compare the restored SHA with the selected capture's recorded source, and
-inspect its original roots as above. These are native Git commands, not a new
-CLI pin-discovery or expiry command. Preserve retained source when verification
-fails or pin identity is unknown.
+3. Use a fresh clone/directory for the correct repository, with `origin` and
+   ordinary Git authentication already configured. Confirm the origin before
+   fetching; do not rewrite it or put credentials in commands or support channels.
+   Replace the quoted placeholders yourself. Use the same UUID-derived namespace
+   locally and remotely. This block stops on failure; a tip mismatch is reported
+   before bundle verification or import:
+
+   ```sh
+   (
+     set -eu
+     cd '<fresh-correct-repository-directory>'
+     git remote get-url 'origin'
+     git fetch 'origin' 'refs/uzi-prereq/<capture-uuid>:refs/uzi-prereq/<capture-uuid>'
+     if ! test "$(git rev-parse --verify 'refs/uzi-prereq/<capture-uuid>')" = '<full-recorded-pin-tip>'; then
+       printf '%s\n' 'STOP: fetched pin tip differs from recorded tip; retain the export.' >&2
+       exit 1
+     fi
+     git bundle verify '<archive-path>'
+     git fetch '<archive-path>' 'refs/heads/recovered-source:refs/heads/recovered-source'
+     if ! test "$(git rev-parse --verify 'refs/heads/recovered-source')" = '<recorded-source-sha>'; then
+       printf '%s\n' 'STOP: recovered source SHA differs; retain the export.' >&2
+       exit 1
+     fi
+     git rev-parse 'refs/heads/recovered-source^{tree}'
+     git show 'refs/heads/recovered-source:<captured-file-path>'
+   )
+   ```
+
+4. Compare the tree and file content with the independently recorded expected
+   source, and inspect the original roots [above](#importing-the-bundle).
+   An inventory capture can advertise a synthetic coverage commit; that source
+   SHA is distinct from `attempted_head_sha`, the attempted publication head.
+   No automatic checkout, origin rewrite or deletion is part of this procedure.
+   Any failed fetch, comparison, verify or import means stop visibly and retain
+   the export and retained source. A checksum alone is insufficient.
+
+Use an absolute archive path, or a path relative to the destination directory.
+These are native Git steps, with no new tool dependency or pin expiry command.
 
 Local tests exercise public sweep → production broker → real HTTP Git backend:
 after pinning D (a strict descendant of P), rewriting default history leaves a
@@ -811,6 +891,14 @@ fake persistence and native graph ancestry; separate LiveDB tests exercise
 upload/manifest/state/locking behavior. They are not a new live forge probe.
 The combined released-custody proof is described under
 [Releasing custody on a pinned closure](#releasing-custody-on-a-pinned-closure).
+
+The separate [local E5 owner measurement](../prds/2506-prerequisite-closure.md#c3-local-e5-measurement-2026-11-01-3728)
+used owned native HTTP Git transport and full 2,405-commit input history, with a
+tiny generated 26-byte source file: 507 archive bytes, 97,835,961 native
+upload-pack response-body bytes and a 13.915937-second export-through-import
+owner clock. This measures that fixture, not hosted GitHub latency, large changed
+content, a C2 FINAL or parent release acceptance. Source/tree/file assertions,
+setup costs and substitutions are recorded in the parent; E6 is still post-roll.
 
 ### Releasing custody on a pinned closure
 
@@ -886,7 +974,8 @@ saved FINAL and retries.
 
 Restoring a closure-released archive follows
 [Restoring with a confirmed pin](#restoring-with-a-confirmed-pin): fetch
-`refs/uzi-prereq/<capture-id>`, then verify and import the bundle.
+`refs/uzi-prereq/<capture-id>`, compare its full tip with the recorded tip,
+then verify and import the bundle.
 
 Limits an operator should expect:
 
@@ -937,8 +1026,8 @@ with backoff capped at one hour. A later confirmed absence can settle cleanup,
 but does not grant another delete attempt. This is a schedule cap, not a
 one-hour completion guarantee. Available-pin audits normally run at 24 hours;
 absence requires a different pass at least ten minutes later to become `lost`.
-Owner-facing pin diagnostics/CLI display remain C3 work; raw forge errors are
-not a worker status contract.
+Owner-facing archive rows and CLI capture details show this persisted pin
+snapshot separately from worker readiness; raw forge errors are not exposed.
 
 The active-capture cap (default 256) excludes expired/discarded captures. It
 does not bound leaked pins, unresolved rows or permanent audit tombstones.
@@ -1904,7 +1993,8 @@ recorded evidence does not prove absence of unrecorded worker work:
 
 A rejected record cannot supply a source head or make an archive exportable.
 Export is offered when a capture is available, including a thin capture; a
-verified pin must first produce an available archive. Export verifies bytes only;
+pin alone is not an archive. Export still requires a bound byte manifest and a
+successful download. Export verifies bytes only;
 verify Git dependencies in the destination clone before import or source discard.
 
 The worker negotiates `terminal_rejection_report` through registration's

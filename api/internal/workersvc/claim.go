@@ -628,21 +628,23 @@ type ClaimConfig struct {
 	// omitempty keeps every other claim byte-identical to today's wire, and an older
 	// worker (or a missing field) falls back to its own TASK_FOLLOWUP_IDLE_MS constant.
 	TaskIdleTimeoutSeconds int `json:"task_idle_timeout_seconds,omitempty"`
+	IterationParkVersion   int `json:"iteration_park_version,omitempty"`
 	MaxIterations          int `json:"max_iterations"`
 	// PlanMaxRevisions is the PRD #41 plan-revision cap the worker enforces at the
 	// approval gate (server-authoritative; the server also caps in SubmitInput).
 	PlanMaxRevisions int `json:"plan_max_revisions"`
 	// QuestionMax and QuestionTimeoutSeconds bound the PRD #88 clarification loop:
-	// how many times one run may stop to ask the human, and how long a single park
-	// waits before the run fails with "clarification timed out". Both are enforced
+	// how many times one run may stop to ask the human, and the cumulative
+	// parked-time budget before the run fails with "clarification timed out". Both are enforced
 	// worker-side — the cap counts in-process ask_user parks (there is no input row to
-	// count, unlike a revise_plan), and the deadline is a worker-held timer.
+	// count, unlike a revise_plan), and the budget is worker-held.
 	//
-	// The deadline is therefore NOT durable: a worker death re-queues the run and the
-	// resumed worker starts a fresh clock, so the honest worst case is
-	// QuestionTimeoutSeconds × (RUN_MAX_REQUEUES + 1) — or × (RUN_MAX_REQUEUES + 2) for a run that
-	// used the one-shot finalize-resume allowance (#1742, runs.finalize_resume_generation), which
-	// gets exactly one more attempt.
+	// The budget is therefore NOT durable: a worker death re-queues the run and the
+	// resumed worker starts a fresh budget. With no other fresh executor execution,
+	// worker-death retries contribute QuestionTimeoutSeconds × (RUN_MAX_REQUEUES + 1), or
+	// × (RUN_MAX_REQUEUES + 2) for a run that used the one-shot finalize-resume allowance
+	// (#1742, runs.finalize_resume_generation). Ordinary transient/limit/credential redispatch
+	// also starts a fresh execution and budget, so this is not an unconditional bound.
 	QuestionMax            int `json:"question_max"`
 	QuestionTimeoutSeconds int `json:"question_timeout_seconds"`
 	// CompletionHoldWindowSeconds is the PRD #1226 M5 (D6) live owner-continue window before a

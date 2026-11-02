@@ -875,6 +875,7 @@ var wantRouteMounts = []routeMount{
 	// own run with no forge call → noLimiter, exactly like the completion/hold report beside it (both
 	// are fenced server-side, not by a per-user limiter).
 	{"POST", "/api/worker/runs/{id}/wall-park", noLimiter},
+	{"POST", "/api/worker/runs/{id}/iteration-park", noLimiter},
 	{"POST", "/api/worker/runs/{id}/pause", noLimiter},
 	// issue #3194: the base-attestation HOLD report, fenced server-side like the wall park above.
 	{"POST", "/api/worker/runs/{id}/base-attestation-hold", noLimiter},
@@ -936,6 +937,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #1909 M4: the worker output-file upload, worker-authenticated and unlimited like the download above (bounded by the upload slots).
 	{"POST", "/api/worker/runs/{id}/files", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
+	// Bounded local lifecycle report, no forge/provider I/O; both actual router
+	// chains are also pinned by TestPolicyHoldRouteHasNoRateLimiter.
+	{"POST", "/api/worker/runs/{id}/policy-hold", noLimiter},
 	// Semantic planning uses worker authentication and claim-generation fences.
 	// Writes ride proposalLimiter.PerWorkerMiddleware; this per-USER table reads
 	// them as noLimiter. TestSemanticWorkerWritesUseWorkerLimiter proves their worker buckets.
@@ -1018,6 +1022,7 @@ var wantRouteMounts = []routeMount{
 	// columns, no spend, no forge write, no fan-out: the same shape as /me/notify-early-reset.
 	{"PUT", "/api/me/usage-reserve", noLimiter},
 	{"PUT", "/api/me/codex-account-mode", noLimiter},
+	{"PUT", "/api/me/harness-overflow", noLimiter},
 	// PRD #46: the run-judge consent toggle (SetJudgeEnabled). A single boolean
 	// UPDATE on the caller's own users row, spends no Anthropic token at toggle time
 	// — noLimiter, matching /me/autopilot and /me/ci-autofix beside it. Its route

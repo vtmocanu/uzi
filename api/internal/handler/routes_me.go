@@ -230,6 +230,10 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// two modes, both valid. Identity is the session user, never the body.
 	r.With(h.requireUser()).Put("/me/codex-account-mode", h.SetCodexAccountMode)
 
+	// Harness overflow chooses among the caller's existing harness credentials. Like
+	// account mode, it is owner-scoped and Bearer-reachable; cookie writes require CSRF.
+	r.With(h.requireUser()).Put("/me/harness-overflow", h.SetHarnessOverflowEnabled)
+
 	// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d
 	// windows. Self-scoped; admins use /api/admin/rate-limits for everyone.
 	//

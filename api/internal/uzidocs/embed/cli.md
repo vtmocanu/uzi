@@ -235,6 +235,7 @@ uzi admin maintenance status [--json]
 uzi settings get
 uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]
 uzi settings codex-mode default|auto
+uzi settings harness-overflow on|off
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -283,7 +284,8 @@ A few worth knowing:
   resolve one.** `run create --harness claude|codex` and `schedule create
   --harness claude|codex` request a specific harness outright; omitting the
   flag leaves the server's own resolution in charge (your effective default,
-  or whichever harness you have a usable credential for). `schedule edit
+  or whichever harness you have a usable credential for, with
+  [optional overflow](#harness-overflow) for eligible new issue runs). `schedule edit
   --harness ""` clears a schedule's pin back to per-fire resolution; leaving
   the flag unset on edit leaves the stored pin unchanged. The resolved
   harness shows as a `HARNESS` row on `uzi run get`; on `uzi run list` it's
@@ -612,7 +614,7 @@ A few worth knowing:
   Success is an ordinary owner-resumed pause: wall stopped, run slot freed.
   A failed publication instead asks a worker question in `awaiting_input`
   (wall wait banked, slot held), with no provider turn or park retry until
-  an explicit answer and no reset of the shared absolute `QUESTION_TIMEOUT_SECONDS`.
+  an explicit answer and no fresh window for the shared `QUESTION_TIMEOUT_SECONDS` parked-time budget.
   An unattended run needing that decision stops with a trusted refusal.
   See [Dependency waits](./run-pause.md#waiting-on-a-dependency-during-implementation)
   for compatibility, checkpoint and retention limits.
@@ -733,8 +735,8 @@ A few worth knowing:
   override) — without churning the id or
   run history the way delete-and-recreate would; `edit` now accepts
   `--model <alias|id>` to change the run model in place, valid on every
-  target and origin (an empty string clears it back to the Worker-model
-  default), and it preserves the stored `--model` and `--apply-model-to-agents`
+  target and origin (an empty string clears it back to your worker model for
+  the schedule's harness), and it preserves the stored `--model` and `--apply-model-to-agents`
   across a partial edit that does not pass those flags — a plain retime no
   longer wipes the stored model. On a **default-origin** schedule only
   the catalog-editable fields (`--cron`, `--tz`, `--auto-approve`,
@@ -1331,7 +1333,9 @@ uzi job file get <file-id> [-o path]
 When a run commits useful work but then fails to publish its head (a workflow or
 secret preflight, a rejected push, exhausted base alignment), uzi captures the run's
 original committed history into a durable, owner-only recovery archive — a real Git
-bundle that imports into a fresh clone even after the worker and its disk are gone.
+bundle retained independently of the worker and its disk. Thin bundles also need
+the declared prerequisite history in the destination clone; download verification
+alone does not establish importability. Follow the [confirmed-pin restore steps](run-recovery.md#restoring-with-a-confirmed-pin).
 `uzi run export` downloads that archive to a local file:
 
 ```
@@ -1366,10 +1370,41 @@ uzi run export <run-id> --output ./recovered.bundle
   `--json` instead prints the listed captures (archive DTOs, each with a `hold_id`) as a
   JSON array on stdout, still exiting 2 or 5.
 
-`uzi run get` also shows a metadata-only recovery summary for a terminal run that has
-captures (the archive count, per-state tally, and each available capture's id) so you
-know what `--capture` can fetch. It is metadata only and never claims an archive is
-available when it is not.
+The human `uzi run get` view also shows a metadata-only recovery summary for a terminal run that has
+captures: the archive count, per-state tally, and every retained capture's id, state,
+source, size, expiry and prerequisite-pin observations. Only `available` captures
+can be exported; the other states remain visible for inspection. These are recorded
+metadata, not a fresh forge probe or proof of Git importability.
+
+The optional owner `prerequisite_closure` is a persisted pin snapshot, with
+`state`, optional bounded `reason`, `pin_ref`, optional `pin_tip`,
+`absence_unconfirmed`, `cleanup_exhausted` and `updated_at`. It is not a
+fresh forge probe; `updated_at` is a record update, not last verification.
+
+- `pending`, `invoked` and `create_unknown`: protection not established;
+  uncertainty can persist indefinitely.
+- `pinned`: recorded protection conditional on external refs surviving;
+  `absence_unconfirmed` leaves availability uncertain.
+- `refused`, `foreign`, `lost` and `deleted`: respectively creation refused,
+  foreign content, lost pin and historical deletion; no protection by this pin.
+- `cleanup_exhausted` is independent, including alongside unconfirmed absence:
+  automatic deletes stopped; it grants no manual deletion permission.
+- No projection: older API or no matching row. Thin prerequisite availability is
+  unknown; a self-contained manifest reports no prerequisites and needs no pin.
+
+Capture details and export-choice refusals in `--json` preserve these facts.
+The human export-choice table shows only id, state, source, size and creation time;
+use `uzi run get` or `uzi run recovery <run-id>` for pin details. An available
+capture can be exported regardless of pin state, subject to a bound byte manifest
+and a successful download. Successful `export --json`
+still reports verified bytes/checksum only, with the existing result fields;
+it does not certify prerequisite availability or importability. Owner history
+is complete, with a constant two SQL queries for the summary, not bounded rows
+or response bytes. Pin metadata says nothing about latest local coverage,
+custody release, physical retirement or publication success. See the
+[restore procedure](run-recovery.md#restoring-with-a-confirmed-pin) for the
+explicit capture export, UUID-derived ref fetch and full recorded-tip comparison
+before native bundle verification/import.
 
 ### Reviewing and resolving held work: `uzi run recovery` / `uzi run discard`
 
@@ -1442,8 +1477,11 @@ uzi run recovery <run-id> [--json]
   The latest capture state and available archive are independent: an older download may
   omit latest work while a newer capture prepares/uploads. The same source, coverage,
   export and discard guidance as above follows. `--json` prints
-  the raw rows for scripting, each hold with a `captures` array (id, state, source_sha,
-  byte_size, created_at) whose ids `uzi run export --capture` takes; it's always `[]`
+  the rows for scripting, each hold with a `captures` array carrying id, state,
+  source_sha, byte_size, created_at and, when present, checksum,
+  prerequisite_shas (in recorded order), expires_at, attempted_head_sha and
+  prerequisite_closure. Its ids are accepted by
+  `uzi run export --capture`; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives
   its run) or the server predates capture-hold linking. Owner-only.
 - While the server retains the run's last published checkpoint on origin (PRD #1810), the
@@ -1491,15 +1529,16 @@ uzi run discard <run-id> --hold <hold-id> --yes
   only your own runs' holds.
 
 Prerequisite pins (`refs/uzi-prereq/<capture-id>`, #3591) are a separate
-API lifecycle. This CLI has no prerequisite-pin listing or expiry command;
-`run recovery`/`run held` do not show pin state. On a server that enables it for
-GitHub.com, a pinned thin archive can release custody through the archive FINAL
+API lifecycle. `run get` and `run recovery <run-id>` show recorded pin state
+with capture details; `run held` lists terminal held refs, not prerequisite pins.
+There is no dedicated prerequisite-pin listing or expiry command. On a server
+that enables it for GitHub.com, a pinned thin archive can release custody through the archive FINAL
 (#3727); otherwise it cannot authorize archive FINAL or local-source cleanup.
 Pinning alone never authorizes local cleanup: an ACK and the existing independent
 source, writer and shared-consumer guards still apply.
 See [prerequisite pin restore and backlog handling](run-recovery.md#prerequisite-pins-lifecycle-and-custody-release)
 for native Git restore, the release conditions and the frozen-binding/cleanup
-limits. Owner/CLI pin visibility belongs to C3.
+limits.
 
 ### Fetching and expiring terminal held refs: `uzi run held`
 
@@ -3076,8 +3115,9 @@ prints the result, for example `Weekly usage reserve: 70% (pause running runs:
 on)` or `Weekly usage reserve: off`; `--json` returns
 `weekly_reserve_pct` (`null` = off) and `weekly_reserve_pause_running`.
 
-`uzi settings get` ends with the same `Weekly usage reserve:` line (after the
-`Now summary:` line), and its `--json` carries both fields.
+`uzi settings get` shows the same `Weekly usage reserve:` line after the
+`Now summary:` line, followed by Codex account mode and harness overflow;
+its `--json` carries both reserve fields.
 
 On a run the reserve touches, `uzi run get` shows:
 
@@ -3145,6 +3185,62 @@ and an automatic MR rework is skipped. When every Codex login you hold is
 disabled, the existing disabled-credential refusal applies instead (a 422 with
 no reason; a schedule records `credential_disabled`). `uzi settings get` shows `Codex account
 mode:` after the reserve line, and `--json` carries `codex_account_mode`.
+
+### Harness overflow
+
+```sh
+uzi settings harness-overflow on
+uzi settings harness-overflow off
+uzi settings get
+uzi settings get --json
+```
+
+`uzi settings harness-overflow on|off` controls the per-user boolean
+`harness_overflow_enabled`, off by default. It matches **Settings → Run
+defaults → Overflow to the other harness when my default is near its limits**.
+The command writes `PUT /api/me/harness-overflow` with
+`{"harness_overflow_enabled":true}` (or `false`); `--json` returns that
+single boolean field. Other arguments are usage errors (exit 2). Human
+output reads `Harness overflow: on (new runs, at creation)` or
+`Harness overflow: off (new runs, at creation)`. `uzi settings get` shows
+the same line after Codex account mode; its decoded settings JSON includes
+`harness_overflow_enabled`.
+
+Overflow applies at creation to new implicit issue runs started manually,
+by autopilot or by a schedule, with both harnesses usable. Explicit
+harnesses (including issue harness labels), run/schedule model pins,
+Anthropic credential overrides and either raw saved Plan or Code cross-check
+enable flag exclude it, even when a checker would be inactive for that
+harness. Other run kinds and origins do not use overflow. A preferred score
+below 20%, an other-harness score of at least 30%, and an advantage of at
+least 15 percentage points are required; unknown comparisons keep the
+preferred harness. The decision freezes atomically with creation; overflow
+never changes an existing run or resume. See
+[Worker model](./worker-model.md#overflow-to-the-other-harness) for setup and
+[rate limits](./rate-limits.md#how-overflow-compares-headroom) for selected
+accounts, Claude aggregation and capacity holds.
+
+`uzi run get <id>` shows `HARNESS_PICK` rows headed `at creation:`;
+the TUI detail rail has **HARNESS at creation**, fitted as a whole block
+when space permits. The web run page shows the same stored explanation.
+These are owner-only readings, independent of live usage and claim-time
+credential metadata. Legacy or unavailable decisions read `not recorded`.
+
+In `uzi run get <id> --json`, `harness_decision` is an object with:
+
+| Field | Meaning |
+|---|---|
+| `preferred`, `chosen` | Preferred harness before overflow and the run's stored harness. |
+| `reason` | `off`, `excluded`, `unknown_usage`, `preferred` or `overflow`. |
+| `preferred_score`, `other_score` | Nullable comparison percentages used for the thresholds. |
+| `preferred_measured`, `other_measured` | Nullable measured headroom, kept separately from capacity holds. |
+| `preferred_held`, `other_held` | Capacity-hold flags; Claude preferred means the complete token set is held, Claude receiver means any token is held. |
+
+Unknown numeric evidence is `null`, distinct from a measured zero. A hold
+can make a preferred comparison zero with measured headroom still unknown.
+The whole object is `null` for a legacy/unrecorded decision or a foreign
+viewer, including an admin viewing another user's run. Generic mutation and
+worker responses also leave it `null`; reads do not trigger a usage lookup.
 
 ### Plan cross-check evidence
 
@@ -3474,9 +3570,17 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   page or `uzi run resume <id>`. The requester does not determine the display
   path: `park_run` and the owner's `/park` answer share the lead-park execution
   path; `uzi run pause` uses the owner path. See [Pausing and resuming a
-  run](run-pause.md). An ordinary pause does **not** auto-resume. A `paused` run can instead
-  be a **completion-blocked hold** on a run whose [structural completion
-  interlock](run-completion-hold.md) couldn't finish a frozen milestone —
+  run](run-pause.md). An ordinary pause does **not** auto-resume. A `paused` run can also
+  show **Iteration limit reached** (`hold_reason: iteration_budget_exhausted`):
+  eligible runs with negotiated `iteration_park_version: 1` and authoritative
+  persisted `completion_attempts = 0` park at iteration exhaustion. The owner chooses
+  **Resume** or **Cancel**. Resume grants a fresh finite invocation allowance with
+  no added wall time; if the wall budget is spent, **Extend**, then **Resume**.
+  Extend alone leaves this hold paused; **Stop** is unavailable. See
+  [Paused at the iteration limit](run-pause.md#paused-at-the-iteration-limit).
+  Prior-attempt, excluded and legacy runs keep their existing dispositions.
+  A `paused` run can instead be a **completion-blocked hold** on a run whose
+  [structural completion interlock](run-completion-hold.md) couldn't finish a frozen milestone —
   same status, a different reason, and a different resume path
   (`uzi run decide <id> --continue`, not `run resume`). `run get` prints the
   distinction as a `COMPLETION` row reading `Completion blocked`, alongside

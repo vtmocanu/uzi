@@ -214,7 +214,12 @@ describe("issue #1742 restart fault probes", () => {
     const restarted = makeOutbox(root);
     await restarted.init();
     assert.deepEqual(await terminalFiles(root, runId), ["terminal-5.json"], "physical file survives the restart fault");
-    assert.deepEqual(restarted.listPendingTerminals(), [], "corrupt journal was not authenticated or loaded");
-    assert.equal(await registerAfterRestart(restarted), undefined, "unloaded journal gives Register no snapshot");
+    assert.equal(restarted.listPendingTerminals()[0]?.outcome_kind, "unknown");
+    assert.equal(await restarted.readTerminalJournal(runId, 5), undefined, "corrupt bytes give no terminal send authority");
+    assert.equal(await restarted.hasPendingPolicyOutcome(runId), true, "unknown evidence still blocks admission");
+    const snapshot = await registerAfterRestart(restarted);
+    assert.deepEqual(snapshot?.active, [], "unknown bytes authorize no terminal lease");
+    assert.equal(snapshot?.pending_overflow, true, "unknown admission records keep conservative snapshot protection");
+    assert.deepEqual(snapshot?.pending_all, [{ run_id: runId, claim_generation: 5 }]);
   });
 });

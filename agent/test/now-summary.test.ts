@@ -882,6 +882,7 @@ describe("holdContextCallbacks", () => {
       "continueExistingPlanGate",
       "enterCompletionHold",
       "gatePlan",
+      "parkForIteration",
       "parkForPause",
       "parkForWall",
       "takeResumedGateEvent",

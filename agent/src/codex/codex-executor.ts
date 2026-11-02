@@ -3923,7 +3923,7 @@ export class CodexExecutor implements Executor {
         }
         let verdict = await ctx.askUser(questions);
         questionBudget.asked++;
-        // The worker callback owns explicit owner retries and their absolute deadline.
+        // The worker callback owns explicit owner retries and the shared parked-time budget.
         if (parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && requestPark) {
           const disposition = await requestPark(parkAt);
           if (disposition.kind === "paused") { clarificationPaused = true; return ""; }
@@ -4256,6 +4256,23 @@ export class CodexExecutor implements Executor {
       let latestProgress: ReducedTurnResult["progress"];
       let iteration = 0;
       let completionHeld: { reason: string } | undefined;
+      // The runner withholds this capability on review targets and isolated fetches.
+      const iterationParkSupported = ctx.config?.iteration_park_version === 1 &&
+        !!ctx.parkForIteration && !ctx.interactive &&
+        ["issue", "mr_rework", "ci_fix", "task", "prompt", "self_improve"].some(kind => kind === ctx.kind);
+      let resumeSecretPreflightPending = iterationParkSupported && ctx.resumed === true;
+      let iterationParked: ExecutorResult["iterationParked"];
+      const parkIteration = async (iterationCount: number): Promise<boolean> => {
+        // Require a fresh authoritative zero as well as the sticky prior-attempt
+        // history. Neither a local false latch nor lifetime accounting proves zero.
+        if (!iterationParkSupported || lastServedCompletionAttempts !== 0 ||
+            completionAttempted || completion.history.priorAttempt) return false;
+        if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+        // Iteration capture reaps the provider just like the wall sink.
+        await beforeReapingSink();
+        iterationParked = { outcome: await ctx.parkForIteration!({ iterationCount, maxIterations }) };
+        return true; // All outcomes retain the flight; none authorizes a redrive.
+      };
       let walledAtRequest = false;
       const stopAtWall = async (reason = REASON_WALL): Promise<boolean> => {
         if (!ctx.completionInterlock || !isIssueRun || !(completionAttempted || completion.history.priorAttempt)) return false;
@@ -4330,6 +4347,7 @@ export class CodexExecutor implements Executor {
         branch: ctx.branch,
         agentSelection,
         ...(completionHeld ? { completionHeld } : {}),
+        ...(iterationParked ? { iterationParked } : {}),
         ...(walledAtRequest ? { walled: { reason: REASON_WALL } } : {}),
         ...(pausedAt ? { pausedAt } : {}),
         ...(isIssueRun && scopeCapped ? { scopeCapped } : {}),
@@ -4437,6 +4455,11 @@ export class CodexExecutor implements Executor {
             pauseNow.consume(pauseToken);
           }
         }
+        // Checkpoints bypass the post-turn limit. The current clarification turn
+        // is uncompleted, so only iteration - 1 counts at this refreshed boundary.
+        if (iteration - 1 >= maxIterations &&
+            this.pendingInterruption(ctx, pauseNow, wall) === undefined &&
+            await parkIteration(iteration - 1)) break;
         // Issue #1764: an implement turn runs now, so mint the deferred fresh provider epoch (new
         // registry, freshly-released credential, adopted session) and fully dispose the reaped one.
         // A loop-top wall park or completion hold that was refused/declined above may already have
@@ -4459,6 +4482,15 @@ export class CodexExecutor implements Executor {
         // answer gets a neutral recheck turn because the old frozen scope may have changed.
         // Issue #1800: a system text (completion-rework, secret-remediation or clarification)
         // owns the turn outright, so the owner follow-up is neither pulled nor rendered on it.
+        // Re-derive lost remediation guidance on a resumed invocation, without
+        // requiring a surviving thread. The ordinary turn wrapper retains control
+        // precedence for interruptions that arrive during this advisory await.
+        if (resumeSecretPreflightPending && this.pendingInterruption(ctx, pauseNow, wall) === undefined) {
+          const decision = await ctx.secretRemediationGate?.({ unpublishedOnly: true });
+          resumeSecretPreflightPending = false;
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          if (decision?.action === "remediate") completionFollowUp = decision.followUp;
+        }
         let systemFollowUp = clarificationPrompt ?? completionFollowUp;
         if (repeatingContract && completionAnswered) approvedContractSuperseded = true;
         if (systemFollowUp !== undefined && completionAnswered && isIssueRun && ctx.completionInterlock && !ctx.interactive) {
@@ -4899,6 +4931,7 @@ export class CodexExecutor implements Executor {
             completionHeld = { reason: REASON_MAX_ITERATIONS };
             break;
           }
+          if (await parkIteration(iteration)) break;
           throw new Error(REASON_MAX_ITERATIONS);
         }
         // Issue #1674 (PRD #390 M3 parity): only a normal work turn reaches here. On a

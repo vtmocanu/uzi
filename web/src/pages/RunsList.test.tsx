@@ -75,6 +75,7 @@ function renderRuns(initialPath = "/runs") {
 
 function aRun(over: Partial<RunListItem> = {}): RunListItem {
   return {
+    harness_decision: null,
     id: "run-1",
     repo_id: "repo-1",
     forge_type: "gitlab",
@@ -2105,6 +2106,14 @@ describe("RunsList — summary run projection (#2661)", () => {
     for (const call of mockApi.adminListRuns.mock.calls) expect((call as unknown[])[0]).toEqual({ view: "summary" });
     for (const call of mockApi.listRuns.mock.calls) expect(call[0]).toEqual({ view: "summary" });
   });
+});
+
+it("iteration-held list row names the owner hold without a completion label", () => {
+  const { container } = render(<MemoryRouter><ul><RunRow run={aRun({ status: "paused",
+    hold_reason: "iteration_budget_exhausted", completion_phase: "blocked" })} now={FIXED_NOW} /></ul></MemoryRouter>);
+  expect(screen.getAllByText("Iteration limit reached").length).toBeGreaterThan(0);
+  expect(container.querySelector("[data-attention]")).not.toBeNull();
+  expect(screen.queryByText("Completion blocked")).toBeNull();
 });
 
 describe("RunRow rejection presentation", () => {

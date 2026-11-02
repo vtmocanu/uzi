@@ -489,14 +489,14 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
     expect(pending_judge).toBeNull();
 
     // A terminal run with no seeded review reads as null (not judged yet) — but the
-    // envelope's sibling key says WHY (PRD #119): run-failed has an auto-judge already
+    // envelope's sibling key says WHY (PRD #119): pool-tuning run has an auto-judge already
     // scheduled, which is the state review:null alone cannot express.
-    const failed = await api.getRunReview("run-failed");
+    const failed = await api.getRunReview("c57b3989-105a-4e08-bf74-77ebc28e5a01");
     expect(failed.review).toBeNull();
     expect(failed.pending_judge).toEqual({ state: "scheduled", enqueued_at: expect.any(String) });
 
     // A re-judge in flight over an existing verdict: both keys set at once.
-    const closed = await api.getRunReview("run-closed");
+    const closed = await api.getRunReview("c57b3989-105a-4e08-bf74-77ebc28e5a02");
     expect(closed.review).not.toBeNull();
     expect(closed.pending_judge).toEqual({ state: "running", enqueued_at: expect.any(String) });
 
@@ -506,7 +506,7 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
   // 🔴 The demo is the only place these four states are ever LOOKED at — the panel's own
   // tests mount JudgePanel against stubbed responses, so they stay green for a mock that
   // can no longer reach a state at all. That is exactly how #119 shipped with the
-  // never-judged empty state (unchanged copy, ENABLED button) unreachable: run-failed was
+  // never-judged empty state (unchanged copy, ENABLED button) unreachable: pool-tuning run was
   // the one terminal run with no review and the PRD gave it a scheduled auto-judge.
   // Asserted as a COVERAGE claim over the fixtures rather than by run id, so renaming or
   // re-purposing any one of them is free and dropping a state is not.
@@ -566,7 +566,7 @@ describe("mockApi run judge review (PRD #46 M4)", () => {
     // PRD #119: a target that already has an active judge 409s with the server's exact
     // message — the unique index's refusal, and the one the panel absorbs into a
     // re-fetch rather than an error banner.
-    await expect(api.rerunJudge("run-failed")).rejects.toMatchObject({
+    await expect(api.rerunJudge("c57b3989-105a-4e08-bf74-77ebc28e5a01")).rejects.toMatchObject({
       status: 409,
       message: "a judge run is already in progress for this run",
     });
@@ -588,7 +588,7 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
     expect(poller.bucket).toBe("todo");
     expect(all.groups[0]).toBe(poller); // ranked first (run_count desc)
 
-    // shellcheck is the PARTIALLY-settled group: DONE in run-done, TODO in run-closed. The
+    // shellcheck is the PARTIALLY-settled group: DONE in run-done, TODO in closed-MR run. The
     // fixture must be able to construct this before any test leans on it (checkpoint).
     const shellcheck = byCoord("install_worker_tool", "shellcheck")!;
     expect(shellcheck.run_count).toBe(2);
@@ -601,7 +601,7 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
     const stats = await api.getJudgeStats();
     expect(all.triage).toEqual(stats);
     // Per-recommendation, and still > the open group rows. It was 5 before PRD #98 review
-    // B3 seeded run-closed's ripgrep as an issue-close AUTO-DONE (filed #91, then closed):
+    // B3 seeded closed-MR run's ripgrep as an issue-close AUTO-DONE (filed #91, then closed):
     // that moved one recommendation off the todo rung. The number changed because the
     // fixture gained a state, not because the tally drifted.
     expect(stats.todo).toBe(4);
@@ -611,9 +611,9 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
     installStorage();
     const api = await reload();
 
-    const anchored = await api.getJudgeBacklog("all", "run-closed");
+    const anchored = await api.getJudgeBacklog("all", "c57b3989-105a-4e08-bf74-77ebc28e5a02");
     const coords = anchored.groups.map((g) => `${g.category}/${g.target}`).sort();
-    // run-closed's review carries poller, shellcheck, ripgrep, glab — and nothing else survives.
+    // closed-MR run's review carries poller, shellcheck, ripgrep, glab — and nothing else survives.
     expect(coords).toEqual([
       "enable_tool/ripgrep",
       "improve_uzi/api/internal/poller",
@@ -694,7 +694,7 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
   // the state most likely to read as fully defended.
   //
   // It is the path RunView's per-recommendation Mark done / Dismiss drives, and it is
-  // reachable on the very fixture B3 seeded: run-closed's enable_tool/ripgrep is an
+  // reachable on the very fixture B3 seeded: closed-MR run's enable_tool/ripgrep is an
   // issue-close auto-done, and that run's page renders per-rec controls. So without the
   // clear, hand-marking it from RunView leaves the Judge chip reading "Done via #91" for a
   // decision the user just made.
@@ -718,7 +718,7 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
   });
 
   // The BACKLOG path must carry the issue #167 denied_cli provenance through intact — it is
-  // what the Judge menu reads to render the auto-dismissal distinctly. run-closed seeds an
+  // what the Judge menu reads to render the auto-dismissal distinctly. closed-MR run seeds an
   // install_worker_tool/glab disposition dismissed with set_via='denied_cli'; the occurrence
   // must surface as bucket "dismissed" carrying that provenance, NOT a plain hand-dismissal.
   it("carries denied_cli through the backlog occurrence with set_via intact", async () => {
@@ -738,13 +738,13 @@ describe("mockApi judge backlog (PRD #98 M3)", () => {
   // cross-user done — matching the Judge occurrence chip. Before M4 the mock STRIPPED set_via
   // here because the DTO had no such field; the real API now sends it, so the mock carries it,
   // or a run-page provenance chip would work in production and show nothing in demo mode. The
-  // seeded run-closed ripgrep disposition is an issue-close auto-done, so it surfaces set_via.
+  // seeded closed-MR run ripgrep disposition is an issue-close auto-done, so it surfaces set_via.
   it("carries set_via onto the run-page review DTO (PRD #1184 M4)", async () => {
     installStorage();
     const api = await reload();
 
     // The endpoint answers an ENVELOPE, {review: ...|null, pending_judge: ...|null}.
-    const { review } = await api.getRunReview("run-closed");
+    const { review } = await api.getRunReview("c57b3989-105a-4e08-bf74-77ebc28e5a02");
     const disp = review!.dispositions.find((d) => d.category === "enable_tool" && d.target === "ripgrep");
     expect(disp).toBeTruthy();
     expect(disp!.set_via).toBe("issue_close");
@@ -883,10 +883,10 @@ describe("mockApi judge category stats (PRD #270)", () => {
     // recurring in that run. Read the backlog at the same anchor to learn which categories are in
     // scope, then assert the matrix's `all` slice matches that set.
     const whole = (await api.getJudgeCategoryStats()).counts_by_bucket;
-    const anchoredBacklog = await api.getJudgeBacklog("all", "run-closed");
+    const anchoredBacklog = await api.getJudgeBacklog("all", "c57b3989-105a-4e08-bf74-77ebc28e5a02");
     const anchoredCats = new Set(anchoredBacklog.groups.map((g) => g.category));
 
-    const anchored = (await api.getJudgeCategoryStats("run-closed")).counts_by_bucket;
+    const anchored = (await api.getJudgeCategoryStats("c57b3989-105a-4e08-bf74-77ebc28e5a02")).counts_by_bucket;
     expect(new Set(Object.keys(anchored.all))).toEqual(anchoredCats);
     // Anchoring can only narrow: every anchored `all` count is ≤ the whole-backlog one.
     for (const cat of Object.keys(anchored.all)) {
@@ -1093,5 +1093,25 @@ describe("mockApi codex_judge_model (PRD #3245)", () => {
     for (const bad of ["opus", "gpt-7-x", "gpt-6-luna", "two words"]) {
       await expect(api.updateSettings({ codex_judge_model: bad })).rejects.toMatchObject({ status: 400 });
     }
+  });
+});
+
+
+describe("mock harness overflow persistence", () => {
+  it("saves true and false independently across reloads", async () => {
+    installStorage();
+    let api = await reload();
+    await api.login("admin@uzi.local", "whatever");
+    expect((await api.getMySettings()).settings.harness_overflow_enabled).toBe(false);
+    expect(await api.setHarnessOverflow(true)).toEqual({ harness_overflow_enabled: true });
+    await api.putMySettings({ default_harness: "codex" });
+    api = await reload();
+    expect((await api.getMySettings()).settings.harness_overflow_enabled).toBe(true);
+    await api.login("admin@uzi.local", "whatever");
+    expect(await api.setHarnessOverflow(false)).toEqual({ harness_overflow_enabled: false });
+    api = await reload();
+    const settings = (await api.getMySettings()).settings;
+    expect(settings.harness_overflow_enabled).toBe(false);
+    expect(settings.default_harness).toBe("codex");
   });
 });

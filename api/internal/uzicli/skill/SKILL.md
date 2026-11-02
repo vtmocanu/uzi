@@ -188,6 +188,7 @@ uzi settings
 uzi settings get
 uzi settings reserve
 uzi settings codex-mode default|auto
+uzi settings harness-overflow on|off
 uzi context list
 uzi context current
 uzi context use <name>
@@ -356,9 +357,10 @@ uzi version
   server reports inactive is still shown; its stored pin remains visible. Table rendering inspects at most twenty response cells and
   displays each harness once. `uzi settings get --json` returns the settings
   object at the top level, including `cross_check_pins` and source fields.
-  The table output ends with a `Weekly usage reserve:` line (`off`, or the threshold
-  and whether running runs are paused); `--json` carries `weekly_reserve_pct` (null =
-  off) and `weekly_reserve_pause_running`.
+  The table also shows `Weekly usage reserve:` (`off`, or the threshold and whether
+  running runs are paused), `Codex account mode:`, and `Harness overflow:`.
+  `--json` carries `weekly_reserve_pct` (null = off), `weekly_reserve_pause_running`,
+  `codex_account_mode`, and `harness_overflow_enabled`.
 - `uzi settings codex-mode default|auto` — choose how a NEW Codex run picks its login:
   `default` binds your default Codex login (today's behaviour), `auto` picks, at run
   creation, the pooled login with the most limit headroom (pool logins with `uzi token
@@ -366,6 +368,13 @@ uzi version
   `uzi settings get` shows it as `Codex account mode:`; `uzi run get` explains the pick on
   the `CODEX_ALIAS` row. When `auto` cannot bind any pooled login the run start is refused
   with a 422 whose reason is `codex_pool_unavailable`.
+- `uzi settings harness-overflow on|off` — opt in to overflow when your preferred
+  harness is near its limits. Off by default. Applies only at creation to implicit
+  issue runs started manually, by autopilot, or by a schedule, with both harnesses
+  usable. Explicit harnesses, model pins, Anthropic credential overrides, and either
+  cross-check setting prevent overflow. Existing runs never switch. `--json` returns
+  `harness_overflow_enabled`; `uzi run get` shows the stored decision at creation,
+  including unknown scores and measured headroom versus capacity holds.
 - `uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]` — set
   your weekly usage reserve, the 7-day utilization percent at which uzi stops starting
   runs on your subscription (and, with pausing on, pauses running runs at their next
@@ -522,6 +531,10 @@ uzi version
   `vault_locked` recovery park still waits: a bare wait keeps waiting through it
   until the run owner's explicit unlock queues it and a worker resumes it, or the
   scheduled retry provides the fallback.
+  A paused `iteration_budget_exhausted` hold requires an explicit owner Resume
+  or Cancel. If wall time is spent, Extend first, then Resume; Extend alone leaves
+  it paused. Completed-scope Stop is unavailable for this hold. A default
+  `run wait` keeps waiting through this paused hold; its optional timeout still applies.
   Both credential-switch holds stop a wait, and a re-run wait against a run still in either
   hold returns immediately (exit 0), including while `credential_switch_settling`: poll
   `uzi run get <id>` for the hold to lift, or Cancel.
@@ -532,8 +545,8 @@ uzi version
   polls `GET /api/runs/:id` every `--interval` (default 3s) client-side, and
   prints each transition to **stderr**; `--json` prints the final run object (the
   same shape as `run get --json`) to **stdout**. `--timeout <dur>` is opt-in and
-  gives **exit 7** if it elapses first (there is no default timeout — a healthy
-  gated run stops at its gate, so a bare wait cannot hang). A single transient
+  gives **exit 7** if it elapses first (there is no default timeout; owner-held
+  pauses can keep a bare wait waiting until the owner acts). A single transient
   `6` (server blip) is ridden out, not fatal. `--until <a,b>` overrides the stop
   set (validated against the thirteen statuses).
 
@@ -837,12 +850,27 @@ uzi version
   A `source_only` or `needs_action` disposition awaits your decision;
   `archive_ready` can release after its required evidence is accepted; `active` labels
   nonterminal protection but does not prove admission eligibility.
-  Recover an available archive with `uzi run export`, or discard a held source with
-  `uzi run discard`. `--json` emits the run's raw hold DTOs, each with a `captures` array
-  (id, state, source_sha, byte_size, created_at); pass a capture id to
-  `uzi run export --capture`. A `failed` run whose
-  `landing_state` is `needs_landing` carries human-landable work: recover it with
-  `uzi run export` when an archive is available, or from the preserved diff
+  Download an available archive with `uzi run export`, or discard a held source with
+  `uzi run discard`. Availability means archive bytes can be exported, not that a thin
+  bundle's dependencies are present. Export still checks for a bound byte manifest
+  and can fail during download. `--json` emits hold rows with a `captures` array
+  (id, state, source_sha, byte_size, created_at and, when present, checksum,
+  ordered prerequisite_shas, expires_at, attempted_head_sha and prerequisite_closure);
+  pass a capture id to `uzi run export --capture`. The human `run get` summary shows
+  every retained capture with recorded pin details; the human recovery view shows
+  captures attached to the listed holds.
+  The optional pin snapshot is advisory persisted history, not a fresh forge probe;
+  its updated_at is a row update, not last verification. Missing metadata leaves
+  prerequisite availability unknown. Export-choice `--json` preserves archive DTO pin
+  facts; its human table shows only id/state/source/size/created. Successful export
+  JSON verifies bytes/checksum only. Before import or discarding retained source,
+  fetch missing prerequisites (compare the pin's full recorded tip when using it) and
+  run `git bundle verify` in the destination clone. Follow the owner restore guide in
+  `uzi docs show run-recovery`; pin facts alone grant no release or cleanup authority.
+  A `failed` run whose
+  `landing_state` is `needs_landing` carries human-landable work: download its
+  available archive with `uzi run export`, then verify prerequisites before import,
+  or inspect the preserved diff
   (`uzi run get <run-id> --field preserved_patch`) when it isn't.
   An integrity refusal is `recovery_wait` / `retained_recovery_adoption_failed`:
   local work and custody are preserved, with no automatic retry regardless of
@@ -921,7 +949,8 @@ uzi version
   archive stays exportable but may not cover the latest worker-local work. Without an
   available archive or a capture in progress, source-only custody reports:
   "no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)".
-  Export requires an available independent capture; a verified pin must first be archived.
+  Export requires an available capture, including a thin one; a pin alone is not
+  an archive. Download verification checks bytes/checksum, not Git dependencies.
   Hold discard changes database custody; it does not repair the worker journal.
   Periodic reconciliation permits cleanup only after a fresh positive, complete custody GET
   proves a nonempty exact-generation set is all released/discarded, with no open sibling
@@ -1118,7 +1147,7 @@ nothing a manual start cannot.
   `--auto-approve`, `--wait-on-limit`, `--mr-rework` (set whether fired runs' MR review
   comments are auto-reworked; `--mr-rework=false` to force off), `--model <alias|id>`
   (change the run model in
-  place; an empty string clears it back to the Worker-model default; valid on every
+  place; an empty string clears it back to your worker model for the schedule's harness; valid on every
   target and origin), `--apply-model-to-agents` (toggle the subagent model override),
   `--token <label>|auto|default|inherit` (PRD #1247, change the credential override
   fired runs carry; `--token inherit` clears it), `--harness claude|codex` (PRD #1429,
@@ -1477,8 +1506,12 @@ of which seeding is one mode (the "Seed & ship" option).
    verdict.** A seeded plan is already approved for this run; state that
    implementation starts immediately. Preserve product approval requirements,
    safety gates, and validation commands. Stale plan-gate wording can make the
-   lead wait for a verdict that never comes, until the iteration budget fails
-   the run with no file changed.
+   lead wait for a verdict that never comes, spending its iteration budget
+   with no file changed. At iteration exhaustion, eligible runs with negotiated
+   `iteration_park_version: 1` and authoritative persisted `completion_attempts = 0`
+   park under `iteration_budget_exhausted`, needing explicit owner Resume or Cancel.
+   Prior-attempt, excluded and legacy runs
+   keep their existing dispositions, including possible completion holds or failure.
 3. **Read the roster off the clone, not from memory, if you're naming one.**
    `--agent-source repo` means the roster in the clone's `.claude/agents/`
    (`ls .claude/agents/` there to see it — one role per file, named by its

@@ -163,6 +163,22 @@ grants no completion authority; a refresh restores it unchecked. Put
 actionable next steps in the ordinary summary outside the worker-owned
 completion block.
 
+## Iteration exhaustion before a completion attempt
+
+An eligible run with exactly zero persisted completion attempts can instead
+park as `iteration_budget_exhausted` when its completed per-invocation
+iteration allowance is spent, on either harness with negotiated support.
+That hold requires explicit owner Resume, grants a fresh finite iteration
+allowance but no wall time, and grants no Stop or publication authority.
+If the wall is spent, Extend then Resume; Extend alone does not resume it.
+See [Paused at the iteration limit](./run-pause.md#paused-at-the-iteration-limit)
+for eligibility, capture, acknowledgement and compatibility limits.
+
+Prior-attempt iteration exhaustion keeps its existing disposition, including
+the completion hold when this flight has attempted completion. Idle handling
+and the #3139 worker-initiated stall attempt below are unchanged; the iteration
+hold does not create a completion attempt or replace a completion decision.
+
 ## What you'll see
 
 The run view and `uzi run get`/`uzi run list --json` distinguish three states

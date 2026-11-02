@@ -15,7 +15,7 @@ beforeEach(() => {
   // Default-only chosen set; nothing in this file reads it today, but a stub keeps an
   // effect that fetches it from throwing on an undefined mock.
   mockApi.getMySettings.mockResolvedValue({
-    settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null, sidebar_token_ids: [] },
+    settings: { harness_overflow_enabled: false, default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null, sidebar_token_ids: [] },
   });
 });
 

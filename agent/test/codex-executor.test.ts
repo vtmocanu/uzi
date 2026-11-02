@@ -15,7 +15,7 @@ import { PassThrough } from "node:stream";
 import { createHash, randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
 import fs from "node:fs/promises";
-import { readFileSync, symlinkSync } from "node:fs";
+import { readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -59,6 +59,11 @@ import {
 import { WorkerClient, RequestError, CodexRequestFailure } from "../src/client.js";
 import { ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
 import { RunRunner } from "../src/runner.js";
+import { Worker } from "../src/worker.js";
+import type { Config } from "../src/config.js";
+import { Outbox } from "../src/outbox.js";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
+import type { PolicyHoldRequest } from "../src/protocol.js";
 import { resolveRunKind } from "../src/run-kind.js";
 import { GitCache, assertCaptureLaunch } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
@@ -3657,6 +3662,254 @@ describe("approved actual CodexExecutor policy flow (#2321)", () => {
 });
 
 // ================================================================================
+
+describe("compact policy hold production producer", () => {
+  const cases = [
+    ...(["plan", "implement"] as const).flatMap(phase =>
+      (["cyberPolicy", "misalignmentPolicyViolation"] as const).map(tag => ({ phase, tag, mode: "verified", kind: "issue" }))),
+    ...["degraded", "lost_ack", "journal_failure", "cancel", "worker_off", "server_off", "no_outbox", "no_snapshot", "long_session", "interactive", "invalid_generation", "metadata_failure", "metadata_cancel", "guarded_cancel", "home_retention"].map(mode =>
+      ({ phase: "implement" as const, tag: "cyberPolicy" as const, mode, kind: "issue" })),
+    ...["awaiting_approval", "persisted_unapproved", "stale_gate", "unknown_gate", "revision"].map(mode =>
+      ({ phase: "plan" as const, tag: "cyberPolicy" as const, mode, kind: "issue" })),
+    ...["task", "prompt", "self_improve"].map(kind =>
+      ({ phase: "plan" as const, tag: "cyberPolicy" as const, mode: "verified", kind })),
+  ];
+  for (const { phase, tag, mode, kind } of cases) {
+    it(`holds genuine root ${kind} ${phase} ${tag}: ${mode}`, async () => {
+      const excludedPlanning = ["awaiting_approval", "persisted_unapproved", "stale_gate", "unknown_gate", "revision"].includes(mode);
+      const persistedPlan = excludedPlanning && mode !== "revision";
+      const api = new FakeApi("compact-policy-worker");
+      api.gateRevisions = excludedPlanning;
+      const url = await api.listen();
+      const fx = makeFixture();
+      let worktree = "";
+      let lifecycle: AbortSignal | undefined;
+      let context: RunContext | undefined;
+      const captureLog = recordingLogger();
+      const rootThread = mode === "long_session" ? "x".repeat(1025) : "th-1";
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: rootThread } };
+        if (c.method === "turn/start") {
+          if (mode === "revision" && c.turnStartCount === 1) {
+            c.transport.push(toolCall(901, "submit_plan", { plan_md: "source plan" }, rootThread, "tn-1", "source-plan"))
+              .push(turnCompleted("completed", rootThread, "tn-1"));
+            return { turn: { id: "tn-1" } };
+          }
+          if (excludedPlanning) {
+            assert.equal(api.gateOf(claim.run_id).revision, mode === "unknown_gate" ? 0 : mode === "stale_gate" ? 2 : 1,
+              "refusal occurs with the actual current gate evidence");
+          }
+          c.transport.push({ ...turnCompleted("failed", rootThread), params: {
+            threadId: rootThread, turn: { id: "tn-1", status: "failed",
+              error: { codexErrorInfo: tag, message: "PRIVATE-PROVIDER-TEXT" } },
+          } });
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      } });
+      const launch = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+        launchEffectRoot: async (spec, deadline) =>
+          forwardCredentialFreeGitRoot(spec, deadline, await launch(spec, deadline)) };
+      const client = new WorkerClient(url, "compact-policy-worker", "test", noopLog);
+      api.setRegisterProtocolFeatures(mode === "server_off" ? ["claim_generation_fence"] :
+        ["provider_policy_hold_v1", "claim_generation_fence", ...(excludedPlanning ? ["gate_revision_v1"] : []),
+          ...(mode === "guarded_cancel" ? ["recovery_held_publication_v2"] : [])]);
+      await client.register("compact-test", "base", 1, [], mode === "worker_off" ? [] :
+        ["provider_policy_hold_v1", ...(mode === "guarded_cancel" ? ["recovery_held_publication_v2"] : [])], undefined, 0);
+      let ownerCancelInspections = 0;
+      let failJournal = mode === "journal_failure";
+      let failMetadata = mode === "metadata_failure" || mode === "metadata_cancel";
+      const outbox = new Outbox({ root: path.join(fx.dataDir, "policy-outbox"), log: noopLog,
+        runMaxBytes: 64 * 1024 * 1024, maxBytes: 128 * 1024 * 1024, retentionMs: 86400000,
+        rawWrite: async (write, context) => {
+          if (failJournal && context.kind === "terminal")
+            throw Object.assign(new Error("fixture ENOSPC"), { code: "ENOSPC" });
+          await write();
+        } });
+      await outbox.init();
+      const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 10);
+      const packets: PolicyHoldRequest[] = [];
+      let lateSessionReports = 0;
+      const reportState = client.reportState.bind(client);
+      client.reportState = async (...args) => {
+        if (args[1].session_id === "late-session-must-not-report") lateSessionReports++;
+        return reportState(...args);
+      };
+      client.reportPolicyHold = async (runId, body) => {
+        const journal = await outbox.readTerminalJournal(runId, body.source_generation);
+        assert.equal(journal?.outcome_kind, "policy_hold", "journal exists before policy HTTP");
+        assert.deepEqual(journal?.body, body);
+        assert.ok(context?.onSessionId, "production session callback is installed");
+        context.onSessionId("late-session-must-not-report");
+        packets.push(body);
+        if (mode === "lost_ack") throw new Error("fixture lost ACK");
+        return { disposition: "applied", outcome_id: body.outcome_id, source_generation: body.source_generation,
+          observed_status: "paused", observed_generation: 7, hold_reason: "codex_policy_hold" };
+      };
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const run = executor.run.bind(executor);
+      executor.run = async ctx => {
+        worktree = ctx.worktreePath;
+        lifecycle = ctx.signal;
+        context = ctx;
+        await fs.writeFile(path.join(worktree, "POLICY-WORK.txt"), "retained work\n");
+        return run(ctx);
+      };
+      const journalPolicy = outbox.journalPolicyHold.bind(outbox);
+      let selectedBody: PolicyHoldRequest | undefined;
+      outbox.journalPolicyHold = async (id, body) => {
+        selectedBody ??= structuredClone(body);
+        assert.deepEqual(body, selectedBody, "handoff retry keeps original UUID and content");
+        if (failMetadata) throw new Error("fixture metadata unavailable");
+        return journalPolicy(id, body);
+      };
+      const claim = makeClaim({
+        ...(excludedPlanning ? { auto_approve: false, plan_approved: false, config: { plan_max_revisions: 1 } } : {}),
+        ...(persistedPlan ? { plan_md: mode === "awaiting_approval" ? "" : "source plan", plan_source: "agent",
+          resume_plan_at: new Date(Date.now() - 1000).toISOString(),
+          ...(mode === "awaiting_approval" ? { resume_phase: "awaiting_approval" } : {}),
+          ...(mode !== "unknown_gate" ? { resume_gate_revision: 1 } : {}),
+        } : {}),
+        secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+        claim_generation: mode === "invalid_generation" ? 0 : 7,
+        interactive: mode === "interactive", kind: kind as ClaimResponse["kind"],
+        ...(mode === "guarded_cancel" ? { inventory_guarded: true } : {}),
+        ...(kind === "task" ? { branch: "uzi/task/policy-fixture", issue_iid: null } : {}),
+        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+        ...(phase === "implement" ? { plan_approved: true, plan_source: "seeded", plan_md: "approved work" } : {}),
+      });
+      if (persistedPlan) {
+        if (mode !== "unknown_gate") api.seedGate(claim.run_id, {
+          revision: mode === "stale_gate" ? 2 : 1, presentationId: null, payload: { plan_md: "source plan" },
+        });
+        api.setInputs(claim.run_id, [{ id: 1, kind: "revise_plan", body: "tighten the scope",
+          created_at: new Date().toISOString(), gate_binding: "bound", gate_revision: 1 }]);
+      }
+      if (mode === "revision") api.onState(claim.run_id, body => {
+        if (body.status === "awaiting_approval") api.setInputs(claim.run_id, [
+          { id: 1, kind: "revise_plan", body: "tighten the scope", gate_binding: "bound", gate_revision: 1 },
+        ]);
+      });
+      if (kind === "task") {
+        const seeded = spawnSync("git", ["-C", fx.originPath, "branch", claim.branch!], { env: gitEnv(), encoding: "utf8" });
+        assert.equal(seeded.status, 0, seeded.stderr);
+      }
+      const homeDir = mode === "home_retention" ? path.join(fx.dataDir, "policy-private-home") : undefined;
+      if (homeDir) {
+        await fs.mkdir(homeDir, { recursive: true });
+        await fs.writeFile(path.join(homeDir, "retained-session-evidence"), "session kept");
+      }
+      try {
+        const runner = new RunRunner(client, new GitCache(fx.dataDir, captureLog.logger, undefined, testGitCacheOptions()),
+          () => ({ executor, ...(homeDir ? { homeDir } : {}) }), captureLog.logger, 20, undefined, { pollMs: 5, outbox: mode === "no_outbox" ? undefined : outbox, activeRuns: mode === "no_snapshot" ? undefined : registry,
+            quiesceRun: async request => {
+              if (request.site === "owner_cancel_after_inspection") ownerCancelInspections++;
+              if (["cancel", "metadata_cancel", "guarded_cancel"].includes(mode) && request.site === "completion_hold") {
+                api.appendInputs(claim.run_id, [{ id: 1, kind: "cancel", body: null }]);
+                await waitFor(() => lifecycle?.aborted === true, "owner Cancel applied");
+              }
+              return { process: { state: mode === "degraded" && request.site === "completion_hold" ? "unverified" : "quiescent",
+                processes: [], killed: [], detail: "fixture proof" },
+                docker: { state: "not_wired", removed: [], detail: "not wired" } };
+            },
+          });
+        await runner.execute(claim);
+        assert.equal(lateSessionReports, 0, "late session callback never reaches client reportState boundary");
+        const supported = !excludedPlanning && !["worker_off", "server_off", "no_outbox", "no_snapshot", "interactive", "invalid_generation"].includes(mode);
+        assert.equal(packets.length, supported && !["journal_failure", "cancel", "metadata_failure", "metadata_cancel", "guarded_cancel"].includes(mode) ? 1 : 0,
+          String(rec(captureLog.lines.filter(line => rec(line).level === "error").at(-1)).error ?? "no terminal diagnostic").slice(0, 240));
+        assert.equal(rig.transport.turnStartCount, mode === "revision" ? 2 : 1, "real provider turn reaches the typed refusal");
+        assert.equal(await fs.readFile(path.join(worktree, "POLICY-WORK.txt"), "utf8"), "retained work\n");
+        if (homeDir) assert.equal(await fs.readFile(path.join(homeDir, "retained-session-evidence"), "utf8"), "session kept");
+        if (!supported) {
+          assert.equal(api.states.find(s => s.body.status === "failed")?.body.fail_origin, "provider_policy_refusal");
+          if (excludedPlanning) {
+            const failed = api.states.filter(s => s.body.status === "failed");
+            assert.equal(failed.length, 1);
+            assert.equal(failed[0]?.body.failure_reason, `Codex provider safety-policy refusal (${tag})`);
+            const refusal = api.messages(claim.run_id).find(m => m.payload.event === "provider_policy_refusal");
+            assert.equal(refusal?.payload.origin, "root");
+            assert.equal(refusal?.payload.phase, "planning");
+            assert.equal(refusal?.payload.policy_tag, tag);
+            assert.equal(api.states.some(s => s.body.status === "completed"), false);
+            assert.equal(await outbox.hasPendingPolicyOutcome(claim.run_id), false);
+            assert.equal(api.isApplied(claim.run_id, 1), false, "refusal does not successfully settle the revision");
+            if (mode === "revision") {
+              assert.equal(api.states.filter(s => s.body.status === "awaiting_approval").length, 1);
+              const turns = rig.transport.requests.filter(r => r.method === "turn/start");
+              assert.match(JSON.stringify(turns[1]?.params), /tighten the scope/, "the refused turn is the owner revision");
+            }
+          }
+          return;
+        }
+        assert.ok(!api.states.some(s => ["failed", "completed"].includes(s.body.status ?? "")));
+        if (["cancel", "metadata_cancel", "guarded_cancel"].includes(mode)) {
+          const disposition = captureLog.lines.map(rec).find(line => line.msg === "policy owner cancel custody disposition");
+          assert.equal(disposition?.disposition, "retained", "independent cancellation custody decision retains source");
+        }
+        if (["metadata_failure", "metadata_cancel", "journal_failure"].includes(mode)) {
+          assert.equal(registry.has(claim.run_id), false, "closed execution never remains abortable");
+          assert.equal(registry.size, 1, "unpersisted original retains pending-only fallback");
+          assert.equal(registry.build().pending_overflow, true);
+          failMetadata = false;
+          failJournal = false;
+          // Use the production singleflight sweep: it must install the pointer before enumerating.
+          const worker = new Worker({ gapFillMax: 100, outboxTerminalMaxBytes: 1 << 20 } as Config,
+            client, runner, {} as never, {} as never, {} as never, captureLog.logger,
+            () => ({ ok: true, missing: [] }), outbox, new Map(), registry);
+          await (worker as unknown as { sweepPendingTerminals(): Promise<void> }).sweepPendingTerminals();
+          assert.equal(registry.size, 0, "exact durable original takes over the fallback");
+          assert.deepEqual((await outbox.readTerminalJournal(claim.run_id, 7))?.body, selectedBody);
+          assert.equal(packets.length, 1, "existing worker sweep delivers the original after install");
+          assert.equal(lateSessionReports, 0);
+          return;
+        }
+        if (mode === "cancel" || mode === "guarded_cancel") {
+          if (mode === "guarded_cancel") {
+            assert.equal(client.hasHeldPublicationV2(), true);
+            assert.equal(ownerCancelInspections, 1, "guarded cancellation independently transfers and inspects source");
+          }
+          assert.ok(outbox.hasPendingTerminal(claim.run_id, 7));
+          assert.equal(outbox.listPendingTerminals()[0]?.server_settled, undefined);
+          assert.equal(registry.size, 0, "durable original takes over the fallback");
+          return;
+        }
+        if (mode === "degraded") {
+          assert.equal(packets[0]!.head, undefined);
+          assert.equal(packets[0]!.published, false);
+          assert.equal(packets[0]!.checkpoint_contains_latest, false);
+          return;
+        }
+        assert.match(packets[0]!.head ?? "", /^[0-9a-f]{40}$/, JSON.stringify(captureLog.lines.filter(line => rec(line).level === "warn")));
+        assert.deepEqual(packets[0], {
+          outcome_id: packets[0]!.outcome_id, source_generation: 7, claim_generation: 7, detail: "refused",
+          continuation_mode: "same_conversation", tag, phase: phase === "plan" ? "planning" : "implementation",
+          correlation_id: packets[0]!.correlation_id,
+          ...(mode === "long_session" ? {} : { session_id: "th-1" }),
+          head: packets[0]!.head, published: false, checkpoint_contains_latest: false,
+        });
+        assert.match(packets[0]!.head ?? "", /^[0-9a-f]{40}$/);
+        assert.match(packets[0]!.outcome_id, /^[0-9a-f-]{36}$/);
+        assert.equal(rig.transport.turnStartCount, 1);
+        assert.ok(!api.states.some(s => ["failed", "completed"].includes(s.body.status ?? "")));
+        assert.equal(await fs.readFile(path.join(worktree, "POLICY-WORK.txt"), "utf8"), "retained work\n");
+        if (homeDir) assert.equal(await fs.readFile(path.join(homeDir, "retained-session-evidence"), "utf8"), "session kept");
+        assert.ok(!JSON.stringify(packets).includes("PRIVATE-PROVIDER-TEXT"));
+        assert.equal(outbox.listPendingTerminals()[0]?.server_settled, mode === "lost_ack" ? undefined : true,
+          "only a validated ACK settles delivery; source remains");
+        if (mode === "lost_ack") {
+          const original = await outbox.readTerminalJournal(claim.run_id, 7);
+          assert.deepEqual(original?.body, packets[0], "lost ACK retains exact immutable outcome");
+        }
+      } finally {
+        await api.close();
+        fx.cleanup();
+      }
+    });
+  }
+});
+
 describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
   for (const control of ["cancel", "pause", "wall"] as const) it(`policy refusal (#2321) retains ${control} precedence during awaited root emission`, async () => {
     const rig = makeRig();
@@ -4165,6 +4418,86 @@ describe("CodexExecutor: wall park (PRD #1497 M2)", () => {
     });
     return { ctx, spies, emitted };
   }
+
+
+  it("M3 predispatch Codex refused wall preserves allowance one for genuine work", async () => {
+    const controller = new AbortController();
+    const rig = makeRig({ responder: epochResponder("th-1", "tn-work", (t, th, tn) => {
+      t.push({ kind: "activity", method: "item/started", params: {
+        threadId: th, item: { type: "commandExecution" },
+      } }).push(agentMessage("genuine predispatch redrive work", th)).push(turnCompleted("completed", th, tn));
+    }) });
+    let boundaries = 0, parks = 0, walls = 0;
+    let mode: "wall" | null = null;
+    const acks: number[] = [];
+    const { ctx } = wallCtx({
+      signal: controller.signal, kind: "issue", completionInterlock: true,
+      config: { max_iterations: 1, iteration_park_version: 1 },
+      reportIteration: async n => { acks.push(n); return { completionAttempts: 0 }; },
+      pullSafetySteer: () => {
+        if (++boundaries === 1) { mode = "wall"; controller.abort(new PauseNowSignal()); }
+        return undefined;
+      },
+      pauseModeRequested: () => mode,
+      parkForWall: async () => {
+        walls++;
+        assert.equal(rig.transport.turnStartCount, 0, "dropped before provider dispatch");
+        return "refused";
+      },
+      clearWallMode: () => { mode = null; },
+      takeWallParkRefresh: () => ({ completionAttempts: 0, totalSeconds: 60, usedSeconds: 0 }),
+      recordCompletionAttempt: async () => { assert.fail("no completion attempt"); },
+      parkForIteration: async at => {
+        parks++;
+        assert.equal(rig.transport.turnStartCount, 1, "genuine work completed before parking");
+        assert.deepEqual(at, { iterationCount: 1, maxIterations: 1 });
+        return "parked";
+      },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "predispatch refused wall");
+    assert.equal(walls, 1); assert.equal(parks, 1);
+    assert.equal(rig.transport.turnStartCount, 1, "no extra dispatch");
+    assert.deepEqual(acks, [1], "redrive remains in the current iteration");
+    assert.deepEqual(result.iterationParked, { outcome: "parked" });
+    assert.equal(result.prSummary, undefined);
+    assert.equal(result.completionHeld, undefined);
+  });
+
+  for (const outcome of ["parked", "refused"] as const) it(`M3 Codex interrupted last iteration wall ${outcome} preserves completed count`, async () => {
+    const controller = new AbortController();
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted());
+        else {
+          c.transport.push({ kind: "activity", method: "item/started", params: {
+            threadId: "th-1", item: { type: "commandExecution" },
+          } }).push(agentMessage("M3 genuine redrive work")).push(turnCompleted("completed"));
+        }
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    let parks = 0;
+    const acks: number[] = [];
+    const { ctx, spies } = wallCtx({ signal: controller.signal, kind: "issue",
+      config: { max_iterations: 1, iteration_park_version: 1 },
+      reportIteration: async n => { acks.push(n); return { completionAttempts: 0 }; },
+      takeWallParkRefresh: () => ({ completionAttempts: 0, totalSeconds: 60, usedSeconds: 0 }),
+      parkForIteration: async at => { parks++; assert.deepEqual(at, { iterationCount: 1, maxIterations: 1 }); return "parked"; },
+    });
+    spies.outcome = outcome;
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount === 1, "M3 interrupted turn started");
+    spies.mode = "wall"; controller.abort(new PauseNowSignal());
+    const result = await withTimeout(running, 5000, "M3 Codex wall redrive");
+    assert.equal(rig.transport.turnStartCount, outcome === "refused" ? 2 : 1);
+    assert.equal(parks, outcome === "refused" ? 1 : 0);
+    assert.equal(spies.parkForWallCalls, 1);
+    assert.deepEqual(acks, [1], "Codex redrive stays inside the current iteration");
+    assert.deepEqual(result.iterationParked, outcome === "refused" ? { outcome: "parked" } : undefined);
+    assert.equal(Boolean(result.walled), outcome === "parked");
+  });
 
   it("(implement) a `wall` PauseNowSignal trips REASON_PAUSE not REASON_CANCEL and reaches the wall park", async () => {
     const controller = new AbortController();
@@ -13101,7 +13434,8 @@ describe("Codex completion interlock", () => {
       const holds: string[] = [];
       const { ctx } = makeCtx({
         kind: "issue", interactive: false, completionInterlock: true,
-        config: { max_iterations: scenario === "final iteration" ? 1 : 10 },
+        config: { max_iterations: scenario === "final iteration" ? 1 : 10, iteration_park_version: 1 },
+        parkForIteration: async () => assert.fail("post-attempt dynamic bound must preserve existing routing"),
         frozenMilestones: [{ id: "m1", title: "Remaining" }],
         cancelRequested: () => cancelled,
         checkpoint: async () => { if (scenario === "checkpoint cancel") cancelled = true; },
@@ -13258,7 +13592,8 @@ describe("Codex completion interlock", () => {
       const holds: string[] = [];
       let attempts = 0;
       const { ctx } = makeCtx({
-        kind: "issue", completionInterlock: true, config: { max_iterations: mode === "raised threshold" ? 2 : 1 },
+        kind: "issue", completionInterlock: true, config: { max_iterations: mode === "raised threshold" ? 2 : 1, iteration_park_version: 1 },
+        parkForIteration: async () => assert.fail("post-attempt must preserve existing routing"),
         frozenMilestones: [1, 2, 3].map((n) => ({ id: `m${n}`, title: `Milestone ${n}` })),
         cancelRequested: () => ackCancelled || (mode === "cancel" && attempts === 1),
         checkpoint: async (opts) => { assert.equal(opts.sink, "done_checkpoint"); order.push("checkpoint"); },
@@ -17266,6 +17601,99 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
       .filter((r) => r.method === "turn/start")
       .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
   const REMEDIATE = "REMEDIATE-SECRET-MARKER: rewrite the flagged commit";
+
+  for (const resumed of [false, true]) {
+    it(`Codex preflight requires resume and park capability; resumed=${resumed}`, async () => {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(81, th, tn)]])]);
+      let preflights = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", resumed,
+        config: { max_iterations: 1, ...(resumed ? {} : { iteration_park_version: 1 }) },
+        parkForIteration: async () => "parked",
+        secretRemediationGate: async options => { if (options) preflights++; return { action: "proceed" }; },
+      });
+      await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      assert.equal(preflights, 0);
+    });
+  }
+
+  it("Codex preflight is regenerated after a crash before first model evidence", async () => {
+    let checks = 0;
+    for (const crash of [true, false]) {
+      const rig = makeMultiEpochRig([script("th-1", [() => [agentMessage("work")]])]);
+      const { ctx } = makeCtx({
+        kind: "issue", resumed: true, sessionId: null,
+        config: { max_iterations: 1, iteration_park_version: 1 },
+        reportIteration: async () => ({ completionAttempts: 0 }), parkForIteration: async () => "parked",
+        secretRemediationGate: async () => {
+          checks++;
+          if (crash) throw new Error("simulated crash before model evidence");
+          return { action: "remediate", followUp: REMEDIATE };
+        },
+      });
+      if (crash) {
+        await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), /simulated crash/);
+        assert.equal(rig.epochs.flatMap(epoch => turnTexts(epoch.transport)).length, 0);
+      } else {
+        await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        assert.ok(rig.epochs.flatMap(epoch => turnTexts(epoch.transport))[0]!.includes(REMEDIATE));
+      }
+    }
+    assert.equal(checks, 2);
+  });
+
+  for (const control of ["cancel", "wall"] as const) {
+    it(`Codex preflight preserves ${control} arriving during its await`, async () => {
+      const rig = makeMultiEpochRig([script("th-1", [() => [agentMessage("work")]])]);
+      const abort = new AbortController();
+      let mode: "wall" | null = null;
+      const { ctx } = makeCtx({
+        kind: "issue", resumed: true, signal: abort.signal,
+        config: { max_iterations: 1, iteration_park_version: 1 },
+        parkForIteration: async () => "parked", parkForWall: async () => "parked",
+        pauseModeRequested: () => mode,
+        secretRemediationGate: async () => {
+          if (control === "wall") mode = "wall";
+          abort.abort(control === "wall" ? new PauseNowSignal() : new Error("cancel"));
+          return { action: "remediate", followUp: REMEDIATE };
+        },
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (control === "cancel") await assert.rejects(running, /cancel/i);
+      else assert.ok((await running).walled);
+      assert.equal(rig.epochs.flatMap(epoch => turnTexts(epoch.transport)).length, 0);
+    });
+  }
+
+  for (const sessionId of ["th-1", null]) {
+    for (const action of ["remediate", "proceed", "fail"] as const) {
+      it(`Codex preflight session=${sessionId} action=${action} owns only the first work turn`, async () => {
+        const rig = makeMultiEpochRig([script("th-1", [() => [agentMessage("work")]])]);
+        let checks = 0;
+        let ownerPulls = 0;
+        const { ctx } = makeCtx({
+          kind: "issue", resumed: true, sessionId,
+          config: { max_iterations: 2, iteration_park_version: 1 },
+          reportIteration: async () => ({ completionAttempts: 0 }),
+          parkForIteration: async () => "parked",
+          pullFollowUps: () => { ownerPulls++; return []; },
+          secretRemediationGate: async options => {
+            checks++;
+            assert.deepEqual(options, { unpublishedOnly: true });
+            return action === "remediate" ? { action, followUp: REMEDIATE } : { action };
+          },
+        });
+        const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        const texts = rig.epochs.flatMap(epoch => turnTexts(epoch.transport));
+        assert.equal(checks, 1);
+        assert.equal(texts.length, 2, "preflight adds no model turn");
+        assert.equal(texts[0]!.includes(REMEDIATE), action === "remediate");
+        assert.equal(texts[1]!.includes(REMEDIATE), false);
+        if (action === "remediate") assert.equal(ownerPulls, 1);
+        assert.deepEqual(result.iterationParked, { outcome: "parked" });
+      });
+    }
+  }
 
   for (const interlocked of [false, true]) {
     it(`code repair recreates epoch with persisted session before both done paths: ${interlocked}`, async () => {
@@ -26383,8 +26811,256 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
   ];
   const script = (special: Record<number, Notes>): Notes => (c, th, tn) => (special[c] ?? (c === 1 ? rp1 : prose))(c, th, tn);
 
+  // M3: finite allowance parking is distinct from completion and idle-stall decisions.
+  const m3Config = { max_iterations: 2, iteration_park_version: 1 as const };
+  const m3Checkpoint: Notes = (c, th, tn) => [toolCall(800 + c, "checkpoint", {}, th, tn, `ck-m3-${c}`)];
+  const m3Question: Notes = (c, th, tn) => [toolCall(900 + c, "ask_user", { questions: [{ question: "Which endpoint?" }] }, th, tn, `ask-m3-${c}`)];
+  const m3Work: Notes = bashTool;
+  function m3AssertPark(r: Awaited<ReturnType<typeof drive>>, outcome: "parked" | "retained-stop") {
+    assert.equal(r.error, null, "M3 finite allowance must park rather than throw");
+    assert.deepEqual(r.result?.iterationParked, { outcome });
+    assert.equal(r.result?.completionHeld, undefined);
+    assert.equal(r.result?.prSummary, undefined, "parking must not finalize");
+    assert.equal(r.result?.milestonesCompleted, undefined);
+    assert.deepEqual(r.fixture.attempts, [], "parking never manufactures a completion attempt");
+    assert.deepEqual(r.fixture.holds, []);
+    assert.deepEqual(r.fixture.questions, []);
+  }
+
+  for (const kind of ["issue", "task", "prompt", "self_improve", "mr_rework", "ci_fix"] as const) {
+    for (const outcome of ["parked", "retained-stop"] as const) {
+      it(`M3 ordinary zero-history ${kind} ${outcome} stops exactly at the finite allowance`, async () => {
+        const parks: unknown[] = [];
+        const r = await drive(m3Work, { kind, config: m3Config, served: 0,
+          parkForIteration: async at => { parks.push(at); return outcome; } });
+        m3AssertPark(r, outcome);
+        assert.equal(r.calls(), 2, "no extra model call after either park outcome");
+        assert.deepEqual(parks, [{ iterationCount: 2, maxIterations: 2 }]);
+        assert.deepEqual(r.fixture.iterations, [1, 2]);
+      });
+    }
+  }
+
+  for (const lift of [false, true]) {
+    it(`M3 repeated checkpoint preturn uses fresh ACK and completed count; lift=${lift}`, async () => {
+      const acks: number[] = [], parks: unknown[] = [];
+      const r = await drive(m3Checkpoint, { config: m3Config,
+        reportIteration: async n => {
+          acks.push(n);
+          assert.ok(n <= (lift ? 4 : 3), "checkpoint bypass must remain bounded");
+          return { completionAttempts: 0, ...(lift && n >= 3 ? { maxIterations: 3 } : {}) };
+        },
+        parkForIteration: async at => {
+          assert.equal(acks.at(-1), lift ? 4 : 3, "park sees the latest ACK");
+          parks.push(at); return "parked";
+        } });
+      m3AssertPark(r, "parked");
+      assert.equal(r.calls(), lift ? 3 : 2, "upward served allowance is honored before preturn park");
+      assert.deepEqual(acks, lift ? [1, 2, 3, 4] : [1, 2, 3]);
+      assert.deepEqual(parks, [{ iterationCount: lift ? 3 : 2, maxIterations: lift ? 3 : 2 }]);
+      assert.equal(r.fixture.checkpoints.filter(c => c.reap).length, lift ? 3 : 2);
+    });
+  }
+
+  it("M3 checkpoint clarification preserves allowance one through resumed answered work", async () => {
+    let exec!: CodexExecutor;
+    let asks = 0, parks = 0;
+    const acks: number[] = [], sinks: string[] = [];
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-question", (t, th, tn) => {
+        t.push(toolCall(801, "checkpoint", {}, th, tn, "checkpoint-question"))
+          .push(toolCall(901, "ask_user", { questions: [{ question: "Which endpoint?" }] }, th, tn, "question-checkpoint"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-work", (t, th, tn) => {
+        assert.equal(rig.sessionOps.adopt, 2, "recreated provider adopted the saved session");
+        assert.ok(rig.epochs[1]!.transport.requests.some(r => r.method === "thread/resume" && rec(r.params).threadId === "th-1"));
+        t.push({ kind: "activity", method: "item/started", params: {
+          threadId: th, item: { type: "commandExecution" },
+        } }).push(agentMessage("genuine answered work", th)).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true,
+      config: { max_iterations: 1, iteration_park_version: 1 },
+      reportIteration: async n => { acks.push(n); return { completionAttempts: 0 }; },
+      checkpoint: async opts => {
+        assert.equal(rig.sessionOps.persist, 1, "session saved before checkpoint capture");
+        sinks.push(opts.sink!);
+        await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+      },
+      askUser: async () => {
+        asks++;
+        assert.ok(rig.epochs[0]!.reaped() > 0, "checkpoint reaped the first provider before asking");
+        assert.equal(rig.providerLaunches(), 1, "answer precedes recreation");
+        return { kind: "answer", answers: ["Use the existing endpoint"] };
+      },
+      recordCompletionAttempt: async () => { assert.fail("no completion attempt"); },
+      parkForIteration: async at => {
+        parks++;
+        assert.deepEqual(rig.epochs.map(e => e.transport.turnStartCount), [1, 1]);
+        assert.ok(rig.sessionOps.persist >= 2, "session saved before iteration capture");
+        assert.deepEqual(at, { iterationCount: 1, maxIterations: 1 });
+        return "parked";
+      },
+    });
+    exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const result = await withTimeout(exec.run(ctx), 5000, "checkpoint clarification allowance one");
+    assert.equal(asks, 1); assert.equal(parks, 1);
+    assert.equal(rig.providerLaunches(), 2);
+    assert.deepEqual(acks, [1, 1], "recreated answer retains iteration identity");
+    assert.deepEqual(sinks, ["milestone_checkpoint"]);
+    const resumedTurn = rig.epochs[1]!.transport.requests.find(r => r.method === "turn/start")!;
+    assert.match(String((rec(resumedTurn.params).input as { text: string }[])[0]!.text), /Use the existing endpoint/);
+    assert.deepEqual(result.iterationParked, { outcome: "parked" });
+    assert.equal(result.prSummary, undefined);
+    assert.equal(result.completionHeld, undefined);
+  });
+
+  it("M3 clarification keeps iteration identity until genuine next work turn", async () => {
+    const acks: number[] = [], parks: unknown[] = [];
+    const r = await drive((c, th, tn) => (c === 1 ? m3Question : m3Work)(c, th, tn), { config: m3Config,
+      askUser: async () => ({ kind: "answer", answers: ["Use the existing endpoint"] }),
+      reportIteration: async n => { acks.push(n); return { completionAttempts: 0 }; },
+      parkForIteration: async at => { parks.push(at); return "parked"; } });
+    m3AssertPark(r, "parked");
+    assert.equal(r.calls(), 3, "question and answer share the first iteration");
+    assert.deepEqual(acks, [1, 2], "Codex answers within the same epoch without an extra boundary ACK");
+    assert.equal(r.rig.providerLaunches(), 1, "clarification retains the provider epoch");
+    assert.deepEqual(parks, [{ iterationCount: 2, maxIterations: 2 }]);
+    assert.match(r.prompts[1]!, /Use the existing endpoint/);
+  });
+
+  it("M3 fresh executor invocations do finite genuine work and park again", async () => {
+    const io = await import("node:fs/promises");
+    const root = await io.mkdtemp(path.join(process.cwd(), "../.uzi/scratch/m3-resume-"));
+    const file = path.join(root, "work.txt");
+    let fingerprint = 0;
+    let parks = 0;
+    try {
+      // Each drive is a fresh invocation; service/HTTP Resume is covered in M4.
+      for (let flight = 0; flight < 3; flight++) {
+        const before = fingerprint;
+        const r = await drive((c, th, tn) => {
+          writeFileSync(file, String(++fingerprint));
+          return m3Work(c, th, tn);
+        }, { config: m3Config, served: 0, worktreePath: root,
+          worktreeFingerprint: async () => io.readFile(file, "utf8").catch(() => "unstarted"),
+          parkForIteration: async at => { parks++; assert.deepEqual(at, { iterationCount: 2, maxIterations: 2 }); return "parked"; } });
+        m3AssertPark(r, "parked");
+        assert.equal(r.calls(), 2, "each fresh invocation gets genuine finite work, then stops");
+        assert.ok(fingerprint > before, "real worktree activity prevents idle-stall masking");
+      }
+      assert.equal(parks, 3);
+    } finally { await io.rm(root, { recursive: true, force: true }); }
+  });
+
+
+  for (const control of ["cancel", "pause", "scope", "success"] as const) {
+    it(`M3 ${control} wins before an unstarted or exhausted iteration park`, async () => {
+      let parks = 0, pauses = 0;
+      const acks: number[] = [];
+      const r = await drive((_c, th, tn) => [toolCall(990, "signal_done", { milestones_completed: ["m1", "m2"] }, th, tn, "m3-success")], {
+        config: { max_iterations: 1, iteration_park_version: 1 }, completionInterlock: false,
+        reportIteration: async n => {
+          acks.push(n);
+          return { completionAttempts: 0, pauseRequested: control === "pause",
+            ...(control === "scope" ? { scopeCeiling: 1, completedCount: 1 } : {}) };
+        },
+        cancelRequested: () => control === "cancel",
+        parkForPause: async () => { pauses++; return true; },
+        parkForIteration: async () => { parks++; return "parked"; },
+      });
+      assert.equal(parks, 0); assert.equal(r.result?.iterationParked, undefined);
+      if (control === "cancel") { assert.match(r.error ?? "", /cancel/); assert.equal(r.calls(), 0); }
+      else {
+        assert.equal(r.error, null);
+        assert.equal(r.calls(), control === "success" ? 1 : 0);
+        if (control === "pause") { assert.equal(pauses, 1); assert.ok(r.result?.pausedAt); }
+        if (control === "scope") assert.deepEqual(r.result?.scopeCapped, { completedCount: 1, total: 2 });
+      }
+    });
+  }
+
+  it("M3 fresh missing checkpoint ACK cannot reuse an older authoritative zero", async () => {
+    let parks = 0;
+    const acks: number[] = [];
+    const r = await drive((c, th, tn) => (c <= 2 ? m3Checkpoint : m3Work)(c, th, tn), {
+      config: m3Config,
+      reportIteration: async n => { acks.push(n); return n <= 2 ? { completionAttempts: 0 } : undefined; },
+      parkForIteration: async () => { parks++; return "parked"; },
+    });
+    assert.match(r.error ?? "", /iteration budget/);
+    assert.equal(r.calls(), 3); assert.equal(parks, 0);
+    assert.deepEqual(acks, [1, 2, 3]);
+  });
+
+
+  for (const lift of [false, true]) {
+    it(`M3 postattempt interlocked boundary preservation lift=${lift}`, async () => {
+      let parks = 0;
+      const acks: number[] = [];
+      const r = await drive((c, th, tn) => c === 1 ? [toolCall(981, "signal_done", {}, th, tn, "m3-attempt")] : m3Work(c, th, tn), {
+        config: { max_iterations: 1, iteration_park_version: 1 },
+        reportIteration: async n => {
+          acks.push(n);
+          return { completionAttempts: n === 1 ? 0 : 1, ...(lift && n > 1 ? { maxIterations: 2 } : {}) };
+        },
+        parkForIteration: async () => { parks++; return "parked"; },
+      });
+      assert.equal(r.error, null); assert.equal(parks, 0);
+      assert.equal(r.calls(), lift ? 2 : 1);
+      assert.equal(r.fixture.attempts.length, 1);
+      assert.equal(r.fixture.holds.length, 1);
+      assert.match(r.result?.completionHeld?.reason ?? "", /iteration budget/);
+      assert.deepEqual(acks, [1, 2]);
+    });
+  }
+
+  for (const control of ["pause", "cancel"] as const) {
+    it(`M3 checkpoint fresh ${control} precedes exhausted preturn park`, async () => {
+      let cancel = false, parks = 0, pauses = 0;
+      const acks: number[] = [];
+      const r = await drive(m3Checkpoint, { config: m3Config,
+        reportIteration: async n => { acks.push(n); cancel = n === 3 && control === "cancel";
+          return { completionAttempts: 0, pauseRequested: n === 3 && control === "pause" }; },
+        cancelRequested: () => cancel,
+        parkForPause: async () => { pauses++; return true; },
+        parkForIteration: async () => { parks++; return "parked"; },
+      });
+      assert.equal(parks, 0); assert.equal(r.calls(), 2);
+      assert.deepEqual(acks, [1, 2, 3]);
+      if (control === "cancel") assert.match(r.error ?? "", /cancel/);
+      else { assert.equal(r.error, null); assert.equal(pauses, 1); assert.ok(r.result?.pausedAt); }
+    });
+  }
+
+  const m3LegacyControls: Array<[string, Partial<RunContext>]> = [
+    ["absent capability", { config: { max_iterations: 2 } }],
+    ["unknown capability", { config: { max_iterations: 2, iteration_park_version: 99 } as never }],
+    ["missing callback", { parkForIteration: undefined }],
+    ["interactive", { interactive: true }],
+    ["ineligible job", { kind: "job" }],
+    ...[undefined, -1, NaN, 0.5, 1].map(value => [
+      `history ${String(value)}`, { reportIteration: async () => ({ completionAttempts: value }) },
+    ] as [string, Partial<RunContext>]),
+    ["resumed sticky positive then zero", { reportIteration: async n => ({ completionAttempts: n === 1 ? 1 : 0 }) }],
+  ];
+  for (const [name, control] of m3LegacyControls) {
+    it(`M3 legacy control ${name} retains ordinary exhaustion`, async () => {
+      let parks = 0;
+      const r = await drive(m3Work, { config: m3Config, served: 0,
+        parkForIteration: async () => { parks++; return "parked"; }, ...control });
+      assert.match(r.error ?? "", /iteration budget/);
+      assert.equal(r.calls(), 2); assert.equal(parks, 0);
+      assert.equal(r.result?.iterationParked, undefined);
+      assert.deepEqual(r.fixture.attempts, []);
+    });
+  }
+
+
   it("a reworded stall reaches the no_progress_stall question and an expired window holds (regression pin: base failed on max_iterations)", async () => {
-    const r = await drive(script({}), { config: { max_iterations: 8 } });
+    const r = await drive(script({}), { config: { max_iterations: 8, iteration_park_version: 1 }, parkForIteration: async () => assert.fail("idle stall precedes iteration exhaustion") });
     assert.equal(r.error, null);
     assert.equal(r.calls(), 4, "tripped on the third consecutive stall turn");
     assert.deepEqual(r.fixture.questions, [[["m2"], { kind: "no_progress_stall" }]]);
@@ -26653,10 +27329,15 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
       assert.equal(task.calls(), 6);
     });
 
-    it("real work (a tool call every turn) still ends on max_iterations", async () => {
-      const r = await drive((c, th, tn) => (c === 1 ? rp1(c, th, tn) : bashTool(c, th, tn)), { config: { max_iterations: 6 } });
-      assert.equal(r.error, ITER_REASON);
-      assert.equal(r.fixture.attempts.length, 0);
+    it("M3 #3139 real work parks at max_iterations with authoritative zero", async () => {
+      const parks: unknown[] = [];
+      const r = await drive((c, th, tn) => (c === 1 ? rp1(c, th, tn) : bashTool(c, th, tn)), {
+        config: { max_iterations: 6, iteration_park_version: 1 }, served: 0,
+        parkForIteration: async at => { parks.push(at); return "parked"; },
+      });
+      m3AssertPark(r, "parked");
+      assert.equal(r.calls(), 6);
+      assert.deepEqual(parks, [{ iterationCount: 6, maxIterations: 6 }]);
     });
 
     it("a post-attempt stall still routes to the max_iterations hold as before", async () => {

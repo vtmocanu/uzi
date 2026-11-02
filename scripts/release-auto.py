@@ -31,7 +31,7 @@ RC = rf'v{BASE}-rc\.[1-9][0-9]*'
 SHA = r'[0-9a-f]{40}'
 PLAN_KEYS = {'OP', 'BASE', 'TAG', 'REASON', 'SHIPPING_COUNT', 'PREVIOUS_TAG', 'PUBLICATION_STATE', 'HEAD_SHA'}
 CUTTER = '.agents/skills/uzi-release/scripts/release-cut.sh'
-# Exact infrastructure step names only. Missing diagnostics and test failures refuse.
+# Only these exact infrastructure step names authorize an automatic rerun.
 INFRA_STEPS = {
     'Set up job', 'go mod download',
     'Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
@@ -339,6 +339,7 @@ class Release:
         deadline_reason = 'tip-not-green-by-cutoff' if self.config['scheduled'] else 'tip-not-green-by-deadline'
         started = self.clock()
         deadline, retried, pending_retry = started + seconds, False, None
+        observed_retry = None  # An outside attempt, never the own-request 60s grace.
         deadline_utc = dt.datetime.fromtimestamp(self.wall_time() + seconds, dt.timezone.utc).isoformat(timespec='seconds')
         last_progress = None
         selected, plan = None, None
@@ -348,6 +349,11 @@ class Release:
                 raise Stop('skip-ci-tip' if skip_tip else deadline_reason, 'defer')
             self.git('fetch', '--prune', '--tags', 'origin')
             sha = self.git('rev-parse', 'refs/remotes/origin/main')
+            if observed_retry and observed_retry['entry']['sha'] != sha:
+                entry = observed_retry['entry']
+                if entry['result'] in ('waiting for external retry', 'observed external retry pending'):
+                    entry['result'] = 'superseded by newer main tip'
+                observed_retry = None
             self.evidence['parent'] = sha
             self.evidence.update(phase='prepare', stage='plan')
             tags = self.git('show-ref', '--tags', '-d')
@@ -382,33 +388,63 @@ class Release:
                       skip_ci_tip=skip_tip,
                       remaining_seconds=round(max(0, deadline - self.clock()), 1)), sort_keys=True), flush=True)
                 last_progress = progress
+            observed_state = ci_state
+            if observed_retry:
+                entry = observed_retry['entry']
+                # GitHub.run filters exact SHA/provenance before returning thin metadata.
+                if (ci and ci['id'] == entry['run']
+                        and ci['run_attempt'] > entry['attempt']
+                        and ci['run_attempt'] >= observed_retry['latest_attempt']):
+                    observed_retry['latest_attempt'] = ci['run_attempt']
+                    entry['final_attempt'] = ci['run_attempt']
+                    if ci_state == 'failed':
+                        entry['result'] = 'failed after external retry'
+                    else:
+                        entry['result'] = 'passed on external retry' if ci_state == 'success' else 'observed external retry pending'
+                else:
+                    # Neither a stale success nor another run/SHA proves this retry.
+                    observed_state = 'pending'
+            # Keep guard priority while retaining the CI observation in the journal.
             if smoke_state == 'failed':
                 raise Stop('tip-smoke-failed')
             if skip_tip:
                 require(ci_state != 'failed', 'tip-ci-not-retryable')
                 if not self.config['scheduled']:
                     raise Stop('skip-ci-tip')
+            ci_state = observed_state
+            if observed_retry and ci_state == 'failed':
+                raise Stop('tip-ci-retry-failed')
             if ci_state == 'failed':
                 marker = ci['id'], ci['run_attempt']
-                if not retried:
+                own_failure = retried and (not self.config['scheduled'] or not pending_retry or ci['id'] == pending_retry[0])
+                if not own_failure:
                     jobs = self.api.pages(f'repos/vtmocanu/uzi/actions/runs/{ci["id"]}/attempts/{ci["run_attempt"]}/jobs?per_page=100', 'jobs')
-                    require(eligible_jobs(jobs), 'tip-ci-not-retryable')
+                    eligible = eligible_jobs(jobs)
+                    require(eligible or self.config['scheduled'], 'tip-ci-not-retryable')
+                    require(not eligible or not retried, 'tip-ci-retry-failed')
                     entry = dict(sha=sha, run=ci['id'], attempt=ci['run_attempt'],
-                                             result='requesting', jobs=[{'id': j.get('id'), 'name': j.get('name'),
+                                             result='requesting' if eligible else 'waiting for external retry', jobs=[{'id': j.get('id'), 'name': j.get('name'),
                                                 'steps': [{'name': s.get('name'), 'conclusion': s.get('conclusion')}
                                                           for s in j.get('steps', []) if s.get('conclusion') in ('failure', 'timed_out', 'cancelled')]}
                                                 for j in jobs if j.get('conclusion') != 'success'])
                     self.retries.append(entry)
-                    try:
-                        self.run('gh', 'run', 'rerun', str(ci['id']), '--failed', '--repo', 'vtmocanu/uzi')
-                    except (Stop, policy.Refusal, OSError, subprocess.TimeoutExpired):
-                        entry['result'] = 'request unconfirmed'
-                        raise
-                    entry['result'] = 'requested'
-                    retried = True
-                    pending_retry = (*marker, self.clock() + 60)
+                    if eligible:
+                        try:
+                            self.run('gh', 'run', 'rerun', str(ci['id']), '--failed', '--repo', 'vtmocanu/uzi')
+                        except (Stop, policy.Refusal, OSError, subprocess.TimeoutExpired):
+                            entry['result'] = 'request unconfirmed'
+                            raise
+                        entry['result'] = 'requested'
+                        retried = True
+                        pending_retry = (*marker, self.clock() + 60)
+                    else:
+                        entry['origin'] = 'external'
+                        observed_retry = dict(entry=entry, latest_attempt=ci['run_attempt'])
+                        print(f'release-auto: CI {ci["id"]} attempt {ci["run_attempt"]} failed; waiting for an outside rerun without requesting one', flush=True)
                 else:
                     for retry in self.retries:
+                        if retry.get('origin') == 'external':
+                            continue
                         if retry['sha'] == sha and retry['run'] == ci['id'] and ci['run_attempt'] > retry['attempt']:
                             retry['result'] = 'failed after retry'
                             retry['final_attempt'] = ci['run_attempt']
@@ -417,6 +453,8 @@ class Release:
                 if self.clock() > deadline:
                     raise Stop(deadline_reason, 'defer')
                 for retry in self.retries:
+                    if retry.get('origin') == 'external':
+                        continue
                     if retry['sha'] == sha and retry['run'] == ci['id'] and ci['run_attempt'] > retry['attempt']:
                         retry['result'] = 'passed on retry'
                 # Publication state may have changed during a long tip wait.

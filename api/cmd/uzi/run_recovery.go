@@ -46,9 +46,9 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 		Long: "Without a run id, show your open custody holds across all runs, oldest first, " +
 			"with exact run and hold ids, disposition, archive availability, worker, age, and the " +
 			"owner-wide custody summary. With a run id, show that run's retained holds: each hold's exact id, " +
-			"claim generation, server-derived disposition, and the latest capture's state.\n\n" +
+			"claim generation, server-derived disposition, the latest capture state, and retained captures' recorded prerequisite pins.\n\n" +
 			"Owner-only: you see only your own runs' holds. An `archive_ready` hold has a recovery " +
-			"archive: recover it with `run export`. An unguarded hold can release when the archive is " +
+			"archive: download it with `run export`; thin archives also require external commits and destination import verification. An unguarded hold can release when the archive is " +
 			"durable; guarded inventory requires verified final coverage or an explicit disposition. " +
 			"Eligible guarded COMPLETED issue/mr_rework/self_improve runs may instead release after " +
 			"the API proves publication of the fixed final SHA on the branch and MR. This exception " +
@@ -70,7 +70,7 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"Without a run id, --json emits the entire owner-wide aggregate and holds DTO, " +
 			"including settled holds. With a run id, --json emits each of the run's hold DTOs " +
 			"plus a `captures` array listing that hold's " +
-			"recovery captures (id, state, source_sha, byte_size, created_at); a capture id is what " +
+			"recovery captures (id, state, source_sha, byte_size, created_at, checksum, ordered prerequisites, expiry, attempted head and optional prerequisite_closure); a capture id is what " +
 			"`run export --capture` takes. A hold that outlived its deleted run lists `captures: []`.\n\n" +
 			"While the server retains the run's last published checkpoint on origin, the hold also " +
 			"names where it lives: `refs/uzi-checkpoints/<checkpoint-key>`, or `refs/uzi-recovery/<run-id>` " +
@@ -122,10 +122,10 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 				return err
 			}
 			// --json joins each hold's captures (#1417) so an agent reads the capture ids as
-			// data. The human table needs no archives read; a run with no holds
-			// has nothing to join onto, so it skips the archives read too.
+			// data. Human output uses the same read for recorded pin observations.
+			// A run with no holds has nothing to join onto.
 			var archives []apitypes.RecoveryArchiveDTO
-			if gf.json && len(forRun) > 0 {
+			if len(forRun) > 0 {
 				summary, err := c.RecoveryArchives(cmd.Context(), runID)
 				switch {
 				case uzicli.ExitCodeFor(err) == uzicli.ExitNotFound:
@@ -134,7 +134,10 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 					// run whose archives read 404s. Degrade to every hold listing no captures
 					// rather than failing the whole listing.
 				case err != nil:
-					return err
+					if gf.json {
+						return err
+					}
+					_, _ = fmt.Fprintln(env.Stderr, "warning: capture and prerequisite-pin metadata unavailable; protection unknown; custody remains as listed")
 				default:
 					archives = summary.Archives
 				}
@@ -364,7 +367,7 @@ func printRecoveryHint(p *uzicli.Printer, exportable, decisionNeeded int, runArg
 	}
 	p.Printf("\n")
 	if exportable > 0 {
-		p.Printf("%d hold(s) have a recovery archive: recover with `uzi run export`\n", exportable)
+		p.Printf("%d hold(s) have a recovery archive: download with `uzi run export`; thin archives also need prerequisite commits and verified import\n", exportable)
 	}
 	if decisionNeeded > 0 {
 		p.Printf("%d hold(s) await a decision: discard with `uzi run discard %s --hold <hold-id> --yes`\n",
@@ -375,11 +378,16 @@ func printRecoveryHint(p *uzicli.Printer, exportable, decisionNeeded int, runArg
 // recoveryHoldCapture is one capture listed under its hold in `run recovery --json` (#1417):
 // the metadata an agent needs to pick a capture for `run export --capture`, nothing more.
 type recoveryHoldCapture struct {
-	ID        string    `json:"id"`
-	State     string    `json:"state"`
-	SourceSha string    `json:"source_sha"`
-	ByteSize  *int64    `json:"byte_size,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	ID                  string                                   `json:"id"`
+	State               string                                   `json:"state"`
+	SourceSha           string                                   `json:"source_sha"`
+	ByteSize            *int64                                   `json:"byte_size,omitempty"`
+	CreatedAt           time.Time                                `json:"created_at"`
+	Checksum            string                                   `json:"checksum,omitempty"`
+	PrerequisiteShas    []string                                 `json:"prerequisite_shas,omitempty"`
+	ExpiresAt           *time.Time                               `json:"expires_at,omitempty"`
+	AttemptedHeadSha    *string                                  `json:"attempted_head_sha,omitempty"`
+	PrerequisiteClosure *apitypes.RecoveryPrerequisiteClosureDTO `json:"prerequisite_closure,omitempty"`
 }
 
 // recoveryHoldJSON is one hold in `run recovery --json`: the hold DTO's keys, flat and
@@ -403,6 +411,8 @@ func holdsWithCaptures(holds []apitypes.RecoveryCustodyHoldDTO, archives []apity
 			}
 			caps = append(caps, recoveryHoldCapture{
 				ID: a.ID, State: a.State, SourceSha: a.SourceSha, ByteSize: a.ByteSize, CreatedAt: a.CreatedAt,
+				Checksum: a.Checksum, PrerequisiteShas: a.PrerequisiteShas, ExpiresAt: a.ExpiresAt,
+				AttemptedHeadSha: a.AttemptedHeadSha, PrerequisiteClosure: a.PrerequisiteClosure,
 			})
 		}
 		out = append(out, recoveryHoldJSON{recoveryOwnerHoldJSON: recoveryOwnerHoldJSON{RecoveryCustodyHoldDTO: h, TerminalRejection: terminalRejectionCopy(h), FailureReason: reasons[h.RunID]}, Captures: caps})
@@ -429,18 +439,16 @@ func unattributedCaptures(archives []apitypes.RecoveryArchiveDTO) int {
 func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.RecoveryCustodyHoldDTO,
 	archives []apitypes.RecoveryArchiveDTO, reasons map[string]string) error {
 	p := env.printer(gf)
+	if n := unattributedCaptures(archives); n > 0 {
+		// An older server sends no hold_id, so its captures join onto no hold.
+		// Warn in human and JSON modes, including quiet, and name the metadata-only
+		// listing; run export needs --output and fetches a sole capture.
+		_, _ = fmt.Fprintf(env.Stderr,
+			"uzi: %d capture(s) carry no hold id (server predates it) and are not listed; 'uzi run get %s' lists the available ones\n",
+			n, cellText(runID))
+	}
 	if p.Format == uzicli.FormatJSON {
-		// Never emit a null slice: an empty result is [] so a consuming agent iterates it
-		// unconditionally.
-		if n := unattributedCaptures(archives); n > 0 {
-			// An older server sends no hold_id, so its captures join onto no hold and the
-			// JSON would read as "no captures" (#1417). Say so on stderr, leaving stdout's
-			// shape unchanged (the plan degrades without failing), and name the listing that
-			// shows available ids without downloading; run export needs --output and fetches a sole capture.
-			_, _ = fmt.Fprintf(env.Stderr,
-				"uzi: %d capture(s) carry no hold id (server predates it) and are not listed; 'uzi run get %s' lists the available ones\n",
-				n, cellText(runID))
-		}
+		// Never emit a null slice: an empty result is [] so a consuming agent iterates it.
 		return p.JSON(holdsWithCaptures(holds, archives, reasons))
 	}
 	if len(holds) == 0 {
@@ -472,6 +480,21 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 		return err
 	}
 	for _, h := range holds {
+		if !gf.quiet {
+			labelled := false
+			for _, a := range archives {
+				if a.HoldID == "" || a.HoldID != h.ID {
+					continue
+				}
+				if !labelled {
+					p.Printf("hold %s captures:\n", cellText(h.ID))
+					labelled = true
+				}
+				for _, line := range captureDetailLines(a) {
+					p.Printf("%s\n", line)
+				}
+			}
+		}
 		if line := completedPublicationReasonLine(h); line != "" {
 			p.Printf("%s\n", line)
 		}

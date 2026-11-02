@@ -185,7 +185,7 @@ export interface RecoveryRecord {
   originalRoots?: Array<{ sha: string; contexts: OwedCandidate["contexts"] }>;
   coverageDigest?: string;
   coverageContext?: PositiveOwedCandidateContext;
-  /** Original hold identity authenticated at freeze; absent on legacy records. */
+  /** Original hold identity authenticated at freeze or learned with immutable closed custody. */
   exactHoldBinding?: { holdId: string; repoId: string };
   heldPolicy?: FrozenHeldPolicy;
   heldCreateUncertain?: boolean;
@@ -347,6 +347,7 @@ export interface RecoveryArchiveClient {
   readonly protocolFeatures?: readonly string[];
   publishHeld?: WorkerClient["publishHeld"];
   getExactRecoveryHold?: WorkerClient["getExactRecoveryHold"];
+  getBindinglessRecoveryHold?: WorkerClient["getBindinglessRecoveryHold"];
   observeTerminalMaintenanceHold?: WorkerClient["observeTerminalMaintenanceHold"];
   isCurrentTerminalMaintenanceHold?: WorkerClient["isCurrentTerminalMaintenanceHold"];
   reconcileRecoveryCapture?(runId: string, captureId: string, req: RecoveryReconcileRequest, signal?: AbortSignal): Promise<RecoveryReconcileResponse>;
@@ -400,7 +401,7 @@ export interface RecoveryBundleProducer {
   readRemediationRestrictionFacts?: GitCache["readRemediationRestrictionFacts"];
   withRemediationRestrictionFacts?: GitCache["withRemediationRestrictionFacts"];
   enumerateOwedCandidates?(barePath: string, runId: string): Promise<OwedCandidate[]>;
-  discoverOwedCandidates?(): ReturnType<GitCache["discoverOwedCandidates"]>;
+  discoverOwedCandidates?(skipContext?: (context: OwedCandidateContext | HistoricalOwedContext) => Promise<boolean>): ReturnType<GitCache["discoverOwedCandidates"]>;
   retainCurrentOwedCandidate?(barePath: string, options: FetchAgentBranchOptions): Promise<TrackingUpdateResult>;
   buildRecoveryCoverage?(barePath: string, context: PositiveOwedCandidateContext, roots: string[], currentSha: string,
     opts?: { reuseCoveredCurrent?: "if-covered" | "required" }): Promise<RecoveryCoverage>;
@@ -894,6 +895,7 @@ function isReplaceableInventoryRecord(record: RecoveryRecord): boolean {
  *  transient/credential reason; pinned, bundle-less and permanent legacy records are skipped. */
 function isLiveCandidate(record: RecoveryRecord): boolean {
   if (record.inventoryGuarded && (record.finalAcknowledged || record.completionReceipt)) return true;
+  if (settledRefusesWork(record)) return false;
   if (record.inventoryGuarded && record.coverageDigest && !record.finalAcknowledged) {
     if (record.reason === "inventory_quiescence_breach" || record.reason === "inventory_snapshot_changed") return false;
     return record.state !== "needs_action" || (!!record.reason && LIVE_RETRY_REASONS.has(record.reason));
@@ -901,6 +903,23 @@ function isLiveCandidate(record: RecoveryRecord): boolean {
   if (!hasJournaledBundle(record)) return false;
   if (record.state === "bundled") return true;
   return record.state === "needs_action" && !!record.reason && LIVE_RETRY_REASONS.has(record.reason);
+}
+
+/** Refusal-only scheduling; ACK/completion and exact immutable replay retain their own guards. */
+function settledRefusesWork(record: RecoveryRecord): boolean {
+  if (!record.holdSettlement || record.finalAcknowledged || record.completionReceipt) return false;
+  const settled = record.holdSettlement, request = record.finalRequest;
+  return !(request && settled.state === "released" && settled.final_receipt &&
+    canonicalJson(settled.final_receipt) === canonicalJson(request.disposition) &&
+    (request.evidence === undefined || request.evidence === settled.release_evidence));
+}
+
+/** Settlement is tied to the same verified source/archive, while closeout fields may advance. */
+function settlementIdentity(record: RecoveryRecord): string {
+  const { finalRequest: _final, finalAcknowledged: _ack, completionReceipt: _receipt,
+    completionSource: _completion, reason: _reason, state: _state,
+    exactHoldBinding: _binding, holdSettlement: _settlement, ...identity } = record;
+  return canonicalJson(identity);
 }
 
 /** True when `current`'s pinned source differs from the one `snapshot`'s bytes were produced from. */
@@ -1223,6 +1242,8 @@ export class RecoveryCoordinator {
   private readonly passes = new Set<Promise<void>>();
   private readonly passShutdown = new AbortController();
   private readonly passSignal = new AsyncLocalStorage<AbortSignal>();
+  // Attempt/pass-local only: an unknown read or failed write gets no observer retry lane.
+  private readonly bindinglessObservations = new AsyncLocalStorage<Map<string, "legacy" | "unknown">>();
   /** The earliest time the next live pass may run (the coordinator's `now()` clock). */
   private nextPassAt = 0;
   /** issue #2213: the quarantine skip of a live pass is logged once. */
@@ -1240,7 +1261,7 @@ export class RecoveryCoordinator {
 
   private finalRetryIdentity(record: RecoveryRecord): string | undefined {
     return record.inventoryGuarded && record.finalRequest && !record.finalAcknowledged && !record.completionReceipt
-      ? canonicalJson([record.runId, record.generation, record.captureId, record.serverCaptureId, record.exactHoldBinding, record.finalRequest])
+      ? canonicalJson([record.runId, record.generation, record.captureId, record.serverCaptureId, record.finalRequest])
       : undefined;
   }
 
@@ -1545,7 +1566,8 @@ export class RecoveryCoordinator {
     // No A: the only authority hook this cycle reaches is assertBareClear (buildRecoveryCoverage), a read.
     return this.withCancellationAttempt({ runId: context.runId, generation: context.generation, inventoryGuarded: true } as RecoveryRecord, async () =>
       runCaptureCycle(await this.cycleKey({ runId: context.runId, generation: context.generation, captureId: "", inventoryGuarded: true }), "wait", async () => {
-      if (!await this.newReconstructionRecords(context.runId, context.generation)) return undefined;
+      const existing = await this.newReconstructionRecords(context.runId, context.generation);
+      if (!existing || await this.settledInventoryContext(context, existing)) return undefined;
       if (!this.git.enumerateOwedCandidates || !this.git.buildRecoveryCoverage) throw new Error("inventory Git support unavailable");
       const candidates = await ownedRecoveryIO(() => this.git.enumerateOwedCandidates!(context.barePath, context.runId));
       const probe = { runId: context.runId, generation: context.generation } as RecoveryRecord;
@@ -1776,19 +1798,48 @@ export class RecoveryCoordinator {
 
   /** One read per boundary, no retries. Unknown evidence retains all sources and blocks writes.
    * A validated closed hold is settled, never a release ACK or local cleanup permission. */
-  async heldOperationState(record: RecoveryRecord, signal?: AbortSignal): Promise<"open" | "settled" | "unknown"> {
-    if (!MaintenanceBudget.isAttempt(`${record.runId}:${record.generation}`)) {
-      return this.withCancellationAttempt(record, () => this.heldOperationState(record, signal));
+  async heldOperationState(record: RecoveryRecord, signal?: AbortSignal, observeOnly = false): Promise<"open" | "settled" | "unknown"> {
+    if (!this.bindinglessObservations.getStore() || !MaintenanceBudget.isAttempt(`${record.runId}:${record.generation}`)) {
+      return this.withCancellationAttempt(record, () => this.heldOperationState(record, signal, observeOnly));
     }
     try {
       const current = await this.requireRecord(record);
       if (current.holdSettlement) return "settled";
-      // Legacy immutable FINALs retain their byte-identical replay authority after a lost ACK.
-      if (!current.exactHoldBinding) return await this.openInventoryHold(current) ? "open" : "unknown";
-      const exact = await this.recoveryRPC(() => this.client.getExactRecoveryHold?.(current.runId, current.generation!,
-        current.exactHoldBinding!, maintenanceSignal(signal)));
+      const bindingless = !current.exactHoldBinding;
+      const identity = settlementIdentity(current);
+      let exact: RecoveryExactHold | undefined;
+      if (bindingless) {
+        if (current.inventoryGuarded && Number.isSafeInteger(current.generation) && current.generation! > 0 &&
+            this.client.getBindinglessRecoveryHold) {
+          const observations = this.bindinglessObservations.getStore()!;
+          const key = canonicalJson([current.runId, current.generation]);
+          if (!observations.has(key)) {
+            // Mark before dispatch: exceptions and write refusals cannot add attempts.
+            observations.set(key, "unknown");
+            try {
+              exact = await this.recoveryRPC(() => this.client.getBindinglessRecoveryHold!(
+                current.runId, current.generation!, maintenanceSignal(signal)));
+            } catch {
+              MaintenanceBudget.current()?.check();
+              observations.set(key, "legacy");
+            }
+            if (exact && (exact.run_id !== current.runId || exact.generation !== current.generation ||
+                exact.inventory_guarded !== true)) exact = undefined;
+            if (exact?.run_status === "cancelled" && Number.isSafeInteger(exact.current_claim_generation) &&
+                exact.current_claim_generation >= current.generation!) MaintenanceBudget.observeCancellation();
+            if (!exact || exact.state === "open") observations.set(key, "legacy");
+          }
+          if (!exact && observations.get(key) === "unknown") return "unknown";
+        }
+        // Open/unknown observations never backfill binding or publication policy.
+        if (!exact || exact.state === "open") return !observeOnly && await this.openInventoryHold(current) ? "open" : "unknown";
+      } else {
+        exact = await this.recoveryRPC(() => this.client.getExactRecoveryHold?.(current.runId, current.generation!,
+          current.exactHoldBinding!, maintenanceSignal(signal)));
+      }
       if (!exact || exact.run_id !== current.runId || exact.generation !== current.generation ||
-          exact.hold_id !== current.exactHoldBinding.holdId || exact.repo_id !== current.exactHoldBinding.repoId ||
+          (current.exactHoldBinding && (exact.hold_id !== current.exactHoldBinding.holdId ||
+            exact.repo_id !== current.exactHoldBinding.repoId)) ||
           exact.inventory_guarded !== true) return "unknown";
       if (exact.run_status === "cancelled" && Number.isSafeInteger(exact.current_claim_generation) &&
           exact.current_claim_generation >= current.generation!) {
@@ -1796,8 +1847,18 @@ export class RecoveryCoordinator {
       }
       if (exact.state === "open") return "open";
       if (exact.state !== "released" && exact.state !== "discarded") return "unknown";
-      await this.writeExistingRecord(current, cur => ({ ...cur, holdSettlement: exact }));
-      return "settled";
+      const settlement = exact;
+      // coerceRecord accepts only canonical lowercase IDs; persisting any other form would make the journal unreadable.
+      if (!HELD_PUBLICATION_ID_RE.test(settlement.hold_id) || !HELD_PUBLICATION_ID_RE.test(settlement.repo_id)) return "unknown";
+      const binding = current.exactHoldBinding ?? { holdId: settlement.hold_id, repoId: settlement.repo_id };
+      await this.writeExistingRecord(current, cur =>
+        settlementIdentity(cur) === identity && !cur.holdSettlement &&
+          canonicalJson(cur.exactHoldBinding) === canonicalJson(current.exactHoldBinding)
+          ? { ...cur, exactHoldBinding: binding, holdSettlement: settlement } : undefined);
+      const durable = await this.requireRecord(current);
+      return settlementIdentity(durable) === identity &&
+        canonicalJson(durable.exactHoldBinding) === canonicalJson(binding) &&
+        canonicalJson(durable.holdSettlement) === canonicalJson(settlement) ? "settled" : "unknown";
     } catch { MaintenanceBudget.current()?.check(); return "unknown"; }
   }
 
@@ -1811,7 +1872,7 @@ export class RecoveryCoordinator {
     // an API rollback removes exact observations. This grants no new FINAL or fallback.
     if (state === "unknown") return true;
     const settled = current.holdSettlement;
-    return !!settled?.final_receipt &&
+    return settled?.state === "released" && !!settled.final_receipt &&
       canonicalJson(settled.final_receipt) === canonicalJson(current.finalRequest.disposition) &&
       (current.finalRequest.evidence === undefined || current.finalRequest.evidence === settled.release_evidence);
   }
@@ -1903,9 +1964,15 @@ export class RecoveryCoordinator {
     if (!snapshot.coverageContext || typeof snapshot.generation !== "number") return;
     // Exact closure can refuse work before mutable health/source probes. It grants no ACK or cleanup.
     const current = await this.requireRecord(snapshot);
-    if (current.finalRequest && !current.finalAcknowledged && current.exactHoldBinding) {
-      const hold = await this.heldOperationState(current);
-      if (hold === "settled" && !await this.finalHoldAllowsReplay(current, hold)) return this.heldStopped(current, hold);
+    if (current.inventoryGuarded && !current.finalAcknowledged && !current.completionReceipt &&
+        (current.holdSettlement || current.finalRequest && current.exactHoldBinding ||
+          !current.exactHoldBinding && this.client.getBindinglessRecoveryHold)) {
+      const bindingless = !current.exactHoldBinding;
+      const hold = await this.heldOperationState(current, undefined, bindingless);
+      // Bindingless observation only adds refusal evidence here. Unknown/open legacy
+      // paths keep their inventory checks inside finalizeInventoryWithinBoundary.
+      if ((hold === "settled" || !bindingless && !current.finalRequest && hold !== "open") &&
+          !await this.finalHoldAllowsReplay(current, hold)) return this.heldStopped(current, hold);
     }
     let outcome: RecoveryOutcome | void = undefined;
     let sourceVerified = true;
@@ -2728,6 +2795,10 @@ export class RecoveryCoordinator {
   /** One probe per entry, before queueing. Unknown custody grants no new authority.
    * Nested work keeps even an expired ambient object; only its creator disposes it. */
   private async withCancellationAttempt<T>(record: RecoveryRecord, action: () => Promise<T>, attempts?: Map<string, MaintenanceBudget>, onCancellationObserved?: () => MaintenanceBudget): Promise<T> {
+    if (!this.bindinglessObservations.getStore()) {
+      return this.bindinglessObservations.run(new Map(), () =>
+        this.withCancellationAttempt(record, action, attempts, onCancellationObserved));
+    }
     const key = `${record.runId}:${record.generation}`;
     if (MaintenanceBudget.isAttempt(key)) {
       MaintenanceBudget.current()?.check();
@@ -2754,9 +2825,22 @@ export class RecoveryCoordinator {
         }
         if (!MaintenanceBudget.current()) {
           try {
-            if (trusted.finalRequest && trusted.holdSettlement &&
-                !await this.finalHoldAllowsReplay(trusted, "settled")) {
-              // Refusal-only work needs neither a fresh exact probe nor a cancellation budget.
+            if (settledRefusesWork(trusted)) {
+              // Refusal-only work, including no-FINAL records, needs no entry probe.
+            } else if (trusted.holdSettlement?.run_status === "cancelled" &&
+                trusted.holdSettlement.current_claim_generation >= trusted.generation!) {
+              MaintenanceBudget.observeCancellation();
+            } else if (trusted.captureId && trusted.inventoryGuarded && !trusted.exactHoldBinding &&
+                !trusted.finalAcknowledged && !trusted.completionReceipt && this.client.getBindinglessRecoveryHold) {
+              if (!this.bindinglessObservations.getStore()!.has(canonicalJson([trusted.runId, trusted.generation]))) {
+                const state = await this.heldOperationState(trusted, undefined, true);
+                if (state !== "settled" && !MaintenanceBudget.current()) {
+                  const own = await this.recoveryRPC(() => this.client.getRunOwnership?.(trusted.runId, ...this.passSignalArgs()));
+                  if (own?.status === "cancelled" && own.inventory_guarded === true &&
+                      Number.isSafeInteger(own.claim_generation) && own.claim_generation! >= trusted.generation!)
+                    MaintenanceBudget.observeCancellation();
+                }
+              }
             } else if (trusted.finalRequest && trusted.exactHoldBinding && !trusted.holdSettlement) {
               await this.heldOperationState(trusted);
             } else if (trusted.exactHoldBinding) {
@@ -3043,6 +3127,7 @@ export class RecoveryCoordinator {
       await this.forgetGenerationWithinCycle(record.runId, record.generation!, isExecuting, signal);
       return;
     }
+    if (settledRefusesWork(record)) return this.heldStopped(record, "settled");
     const exit = (reason: string, field?: string): void => this.noteRedriveExit(path, record, reason, field);
     if (this.isExecuting(record.runId)) return exit("executing");
     if (!isLiveCandidate(record)) return exit("not_live_candidate");
@@ -3083,8 +3168,16 @@ export class RecoveryCoordinator {
    * before materializing anything. A failure blocks discovery, never implies empty work. */
   async snapshotOwedInventory(): Promise<void> {
     if (!this.git.discoverOwedCandidates) throw new Error("inventory discovery unavailable");
-    const discovered = await ownedRecoveryIO(() => this.git.discoverOwedCandidates!());
-    const fresh = new Map(discovered.map(entry => [canonicalJson(entry.context), entry]));
+    // A hint only avoids unnecessary provenance reads for runs without closed records.
+    // Every positive skip below still requires a fresh complete verified journal view.
+    const closedRuns = new Set((await this.snapshotBootRecords()).filter(settledRefusesWork).map(r => r.runId));
+    const skip = (context: OwedCandidateContext | HistoricalOwedContext) =>
+      closedRuns.has(context.runId) ? this.settledInventoryContext(context) : Promise.resolve(false);
+    const discovered = await ownedRecoveryIO(() => this.git.discoverOwedCandidates!(skip));
+    const fresh = new Map<string, (typeof discovered)[number]>();
+    for (const entry of discovered) {
+      if (!await skip(entry.context)) fresh.set(canonicalJson(entry.context), entry);
+    }
     // A successful discovery is authoritative: a context it no longer returns has no pins left,
     // so it leaves the queue instead of costing a hold RPC per pass forever. Survivors keep their
     // queue position (materializeBootInventory rotates the queue to avoid starving later entries).
@@ -3096,6 +3189,16 @@ export class RecoveryCoordinator {
     }
     for (const [key, entry] of fresh) if (!entries.has(key)) entries.set(key, entry);
     this.bootOwed = [...entries.values()];
+  }
+
+  private async settledInventoryContext(context: OwedCandidateContext | HistoricalOwedContext,
+    records?: RecoveryRecord[]): Promise<boolean> {
+    if (context.generation === null) return false;
+    const verified = records ?? await this.newReconstructionRecords(context.runId, context.generation);
+    if (!verified) return false;
+    const siblings = verified.filter(r => r.generation === context.generation || r.generation === undefined);
+    return siblings.some(r => canonicalJson(r.coverageContext) === canonicalJson(context)) &&
+      siblings.every(r => r.inventoryGuarded && settledRefusesWork(r));
   }
 
   /** A local scheduling hint only; every effect still re-derives its authority. */
@@ -3150,12 +3253,13 @@ export class RecoveryCoordinator {
       if (this.isExecuting(ctx.runId) || isExecuting(ctx.runId)) { note("executing"); continue; }
       if (!this.client.hasFeature?.("recovery_inventory_v1")) { note("inventory_feature"); continue; }
       try {
+        const existing = await this.newReconstructionRecords(ctx.runId, ctx.generation);
+        if (!existing) { note("provenance_unavailable"); continue; }
+        if (await this.settledInventoryContext(ctx, existing)) { note("inventory_hold_settled"); continue; }
         const hold = (await this.recoveryRPC(() => this.client.listRecoveryHolds(ctx.runId, ...this.passSignalArgs()))).holds.find(h =>
           h.generation === ctx.generation && h.inventory_guarded === true);
         if (!hold) { note("hold_unavailable"); continue; } // closed/discarded never reopened
         if (!this.client.getRunOwnership) { note("ownership_unsupported"); continue; }
-        const existing = await this.newReconstructionRecords(ctx.runId, ctx.generation);
-        if (!existing) { note("provenance_unavailable"); continue; }
         // A stale hint has already consumed its reserved opportunity and rotated;
         // leave the cap-1 FIFO entries to progress without granting new authority.
         if (entry === priorityEntry && !this.isInventoryPriorityContext(ctx, existing, isExecuting)) continue;
@@ -4407,7 +4511,7 @@ export class RecoveryCoordinator {
         await this.passSignal.run(signal, () => {
           // Adopt a Git-inherited caller budget before owned cancellation is installed,
           // so runOwned isolates it even when the budget scope is not yet active.
-          const run = () => MaintenanceBudget.runOwned(signal, fn);
+          const run = () => this.bindinglessObservations.run(new Map(), () => MaintenanceBudget.runOwned(signal, fn));
           return this.git.withRecoveryOperation ? this.git.withRecoveryOperation(signal, Infinity, run) : run();
         });
       } catch (error) {
@@ -4852,6 +4956,8 @@ export class RecoveryCoordinator {
          opts.authenticatedAtMs <= this.credentialBlockedAt) ? "credentials_blocked"
       : undefined;
     if (recheck !== undefined) {
+      // Closure learned at this admitted attempt still consumes its original live slot.
+      if (settledRefusesWork(record)) this.lastAttemptAt.set(record.captureId, this.now());
       if (record.inventoryGuarded) this.noteRedriveExit("live", record, recheck);
       return "ok";
     }

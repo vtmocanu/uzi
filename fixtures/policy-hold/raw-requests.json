@@ -1,0 +1,37 @@
+[
+  {
+    "name": "outcome_id null tail",
+    "valid": false,
+    "wire": "{\"outcome_id\":\"11111111-1111-4111-8111-111111111111\",\"source_generation\":1,\"claim_generation\":1,\"detail\":\"refused\",\"continuation_mode\":\"same_conversation\",\"tag\":\"cyberPolicy\",\"phase\":\"planning\",\"correlation_id\":\"pr-00000000000000000000000000000000-1\",\"published\":false,\"outcome_id\":null}"
+  },
+  {
+    "name": "source_generation null tail",
+    "valid": false,
+    "wire": "{\"outcome_id\":\"11111111-1111-4111-8111-111111111111\",\"source_generation\":1,\"claim_generation\":1,\"detail\":\"refused\",\"continuation_mode\":\"same_conversation\",\"tag\":\"cyberPolicy\",\"phase\":\"planning\",\"correlation_id\":\"pr-00000000000000000000000000000000-1\",\"published\":false,\"source_generation\":null}"
+  },
+  {
+    "name": "claim_generation null tail",
+    "valid": false,
+    "wire": "{\"outcome_id\":\"11111111-1111-4111-8111-111111111111\",\"source_generation\":1,\"claim_generation\":1,\"detail\":\"refused\",\"continuation_mode\":\"same_conversation\",\"tag\":\"cyberPolicy\",\"phase\":\"planning\",\"correlation_id\":\"pr-00000000000000000000000000000000-1\",\"published\":false,\"claim_generation\":null}"
+  },
+  {
+    "name": "detail null tail",
+    "valid": false,
+    "wire": "{\"outcome_id\":\"11111111-1111-4111-8111-111111111111\",\"source_generation\":1,\"claim_generation\":1,\"detail\":\"refused\",\"continuation_mode\":\"same_conversation\",\"tag\":\"cyberPolicy\",\"phase\":\"planning\",\"correlation_id\":\"pr-00000000000000000000000000000000-1\",\"published\":false,\"detail\":null}"
+  },
+  {
+    "name": "continuation_mode null tail",
+    "valid": false,
+    "wire": "{\"outcome_id\":\"11111111-1111-4111-8111-111111111111\",\"source_generation\":1,\"claim_generation\":1,\"detail\":\"refused\",\"continuation_mode\":\"same_conversation\",\"tag\":\"cyberPolicy\",\"phase\":\"planning\",\"correlation_id\":\"pr-00000000000000000000000000000000-1\",\"published\":false,\"continuation_mode\":null}"
+  },
+  {
+    "name": "published null tail",
+    "valid": false,
+    "wire": "{\"outcome_id\":\"11111111-1111-4111-8111-111111111111\",\"source_generation\":1,\"claim_generation\":1,\"detail\":\"refused\",\"continuation_mode\":\"same_conversation\",\"tag\":\"cyberPolicy\",\"phase\":\"planning\",\"correlation_id\":\"pr-00000000000000000000000000000000-1\",\"published\":false,\"published\":null}"
+  },
+  {
+    "name": "valid phase last value",
+    "valid": true,
+    "wire": "{\"outcome_id\":\"11111111-1111-4111-8111-111111111111\",\"source_generation\":1,\"claim_generation\":1,\"detail\":\"refused\",\"continuation_mode\":\"same_conversation\",\"tag\":\"cyberPolicy\",\"phase\":\"planning\",\"correlation_id\":\"pr-00000000000000000000000000000000-1\",\"published\":false,\"phase\":\"implementation\"}"
+  }
+]

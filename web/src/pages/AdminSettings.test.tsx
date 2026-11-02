@@ -793,14 +793,15 @@ describe("AdminSettings — run judge (PRD #46)", () => {
     expect(select.value).toBe("haiku");
     fireEvent.change(select, { target: { value: "custom" } });
     const btn = screen.getByRole("button", { name: /save run judge settings/i }) as HTMLButtonElement;
-    expect(screen.getByText("Enter a model ID, or choose Default.").getAttribute("role")).toBe("alert");
+    // ModelSelect reports custom mode through an effect; await the card's validation.
+    expect((await screen.findByText("Enter a model ID, or choose Default.")).getAttribute("role")).toBe("alert");
     expect(btn.disabled).toBe(true);
     fireEvent.submit(btn.closest("form")!);
     expect(mockApi.updateSettings).not.toHaveBeenCalled();
     // A filled ID clears the refusal (the positive half above proves the query) and saves.
     mockApi.updateSettings.mockResolvedValue(response({ judge_model: "claude-opus-4-8" }, {}, { judge_model: "db" }));
     fireEvent.change(screen.getByLabelText("Custom Claude judge model ID"), { target: { value: "claude-opus-4-8" } });
-    expect(screen.queryByText("Enter a model ID, or choose Default.")).toBeNull();
+    await waitFor(() => expect(screen.queryByText("Enter a model ID, or choose Default.")).toBeNull());
     fireEvent.click(btn);
     await waitFor(() =>
       expect(mockApi.updateSettings).toHaveBeenCalledWith(expect.objectContaining({ judge_model: "claude-opus-4-8" })),

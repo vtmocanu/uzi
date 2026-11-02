@@ -87,7 +87,7 @@ function seed(): MockState {
   // anything other than legacy role lanes.
   for (const r of mockLaneRuns) runs.set(r.id, seedRun(r));
   // Generated terminal history (ux-tweaks item 3): what makes the runs page's date
-  // grouping + "Show 50 more" reveal exhibitable. The distinct run-hist- prefix
+  // grouping + "Show 50 more" reveal exhibitable. The distinct a015de00 UUID prefix
   // cannot collide with a hand-written fixture id.
   for (const r of mockHistoryRuns) runs.set(r.id, seedRun(r));
   // Other users' active runs (ux-tweaks amendment 2): in state.runs so an admin can
@@ -107,9 +107,9 @@ function seed(): MockState {
   messages.set("run-stalled", mockBusyMessages.map((m) => ({ ...m })));
   messages.set("run-degraded", mockDegradedMessages.map((m) => ({ ...m })));
   messages.set("run-done", [...mockDoneMessages]);
-  // run-closed is a completed run (its MR was later closed unmerged); reuse the
+  // closed-MR run is a completed run (its MR was later closed unmerged); reuse the
   // done stream so it also shows the run-view usage surfaces (PRD #40 web-ux).
-  messages.set("run-closed", [...mockDoneMessages]);
+  messages.set("c57b3989-105a-4e08-bf74-77ebc28e5a02", [...mockDoneMessages]);
   // run-ci-halted (PRD #1650 D3a) is a completed run too; the CI halt is board-card state,
   // not a feed row, so the done stream is enough to open its run view.
   messages.set("run-ci-halted", [...mockDoneMessages]);
@@ -124,7 +124,7 @@ function seed(): MockState {
   // PRD #88: the run parked on a question the UI cannot render. Seeded rather than
   // scripted, so the empty state is reachable by URL without walking the journey.
   messages.set("run-unreadable-question", [...mockUnreadableQuestionMessages]);
-  messages.set("run-failed", [...mockFailedMessages]);
+  messages.set("c57b3989-105a-4e08-bf74-77ebc28e5a01", [...mockFailedMessages]);
   // PRD #35: the only stream carrying `limit_wait` / `limit_hit` rows. The
   // degraded-countdown fixture shares it — the rows are the same shape and it exists
   // for the run-row states (expired stamp, 7-day window, suppressed attempt), not for
@@ -151,16 +151,16 @@ function seed(): MockState {
   // DTO. Copied so the script's appends never mutate the shared fixture.
   messages.set("run-live", mockLiveMessages.map((m) => ({ ...m })));
   messages.set("run-cancelled", []);
-  messages.set("run-rejected", []);
+  messages.set("c57b3989-105a-4e08-bf74-77ebc28e5a04", []);
   // The never-judged control fixture (PRD #119): a terminal run with no review AND no
   // pending judge, so the run page's unchanged "hasn't been judged yet" empty state and
-  // its live Run-judge button stay demoable — run-failed used to be that fixture and now
+  // its live Run-judge button stay demoable — pool-tuning run used to be that fixture and now
   // carries a scheduled judge. An empty log rather than no entry: getRunMessages 404s on
   // an unseeded id, which the real API does not do for a run that exists.
   messages.set("run-unjudged", []);
-  // Generated history runs reuse the done transcript (the run-closed precedent
+  // Generated history runs reuse the done transcript (the closed-MR run precedent
   // above): opening one from the past list shows a full run view, not a 404 alert.
-  // Shared row objects, same as run-closed — nothing mutates a seeded message.
+  // Shared row objects, same as closed-MR run — nothing mutates a seeded message.
   for (const r of mockHistoryRuns) messages.set(r.id, [...mockDoneMessages]);
   // Other users' runs: the running one shows the busy stream, the queued one an
   // empty log (a queued run has no transcript yet) — both open without a 404.

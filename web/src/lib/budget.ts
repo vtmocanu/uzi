@@ -34,10 +34,13 @@ export type BudgetRun = {
 export type BudgetView = {
   // Active time used so far (paused-aware). Aged client-side for a running run.
   usedSec: number;
-  // The FROZEN budget, excluding any extension — the "/ 8h" number.
+  // The FROZEN wall budget, excluding extensions and finalization reserve.
+  // When the frozen wall is unknown, this is the aggregate server total minus extensions.
   wallSec: number;
   // The owner-granted extension on top of wallSec (0 when never extended).
   extSec: number;
+  // Derived only from a known frozen wall and server total; never from used + remaining.
+  finalizeSec?: number;
   // The effective admin cap (0 = extending disabled).
   capSec: number;
   // The most one Extend may add: the per-request cap (not reduced by earlier extensions).
@@ -96,8 +99,8 @@ export function parseDurationToSeconds(input: string): number | null {
  *
  * A RUNNING run needs budget_total_seconds (server-computed, so RUN_TIMEOUT is already folded
  * in for a default-budget run); "used" is aged off deadline_at so it agrees with the header's
- * own deadline. A PAUSED run has no deadline_at (it moves), so it needs budget_wall_seconds
- * to state the frozen budget and derives "remaining when resumed" from the frozen used figure.
+ * own deadline. A PAUSED run has no deadline_at (it moves), so it uses budget_wall_seconds
+ * or the server total and derives "remaining when resumed" from the frozen used figure.
  * Every other status returns null.
  */
 export function extendBudgetView(run: BudgetRun, nowMs: number): BudgetView | null {
@@ -125,6 +128,7 @@ export function extendBudgetView(run: BudgetRun, nowMs: number): BudgetView | nu
       usedSec: used,
       wallSec: Math.max(0, wall),
       extSec: ext,
+      finalizeSec: run.budget_wall_seconds == null ? 0 : Math.max(0, total - wall - ext),
       capSec: cap,
       perExtensionMaxSec: perExtensionMax,
       remainingSec: remaining,
@@ -134,10 +138,10 @@ export function extendBudgetView(run: BudgetRun, nowMs: number): BudgetView | nu
   }
 
   if (run.status === "paused") {
-    // budget_total_seconds is null while paused (the deadline moves), so the frozen wall is
-    // the only budget number available; without it (a default-budget run) there is nothing to
-    // show and the caller keeps today's plain elapsed.
-    const wall = run.budget_wall_seconds;
+    // Newer servers project a paused total including fallback wall, extensions and finalize
+    // reserve. Older payloads still need the frozen wall; keep missing budget data unknown.
+    const total = run.budget_total_seconds;
+    const wall = run.budget_wall_seconds ?? (total == null ? null : total - ext);
     if (wall == null) return null;
     // Rollout skew: an older payload can carry budget_wall_seconds WITHOUT budget_used_seconds.
     // Coercing the missing value to 0 would fabricate "0s used" and a full remaining budget, so
@@ -145,11 +149,12 @@ export function extendBudgetView(run: BudgetRun, nowMs: number): BudgetView | nu
     // the remaining-budget sentence, rather than showing an invented number.
     if (run.budget_used_seconds == null) return null;
     const used = Math.max(0, run.budget_used_seconds);
-    const remaining = Math.max(0, wall + ext - used);
+    const remaining = Math.max(0, (total ?? wall + ext) - used);
     return {
       usedSec: used,
       wallSec: wall,
       extSec: ext,
+      finalizeSec: total == null || run.budget_wall_seconds == null ? 0 : Math.max(0, total - wall - ext),
       capSec: cap,
       perExtensionMaxSec: perExtensionMax,
       remainingSec: remaining,
@@ -165,10 +170,13 @@ export function extendBudgetView(run: BudgetRun, nowMs: number): BudgetView | nu
  * budgetRightLabel renders the "/ 8h" right-hand side: the frozen budget, plus `+<extension>`
  * when the run has been extended, so an extended 8h reads `8h+2h`, NEVER `10h` (the extension
  * is an additive column the owner granted, distinct from the immutable frozen budget).
+ * A known finalization reserve is named separately so the displayed parts cover the total.
  */
 export function budgetRightLabel(view: BudgetView): string {
   const base = formatBudgetDuration(view.wallSec);
-  return view.extSec > 0 ? `${base}+${formatBudgetDuration(view.extSec)}` : base;
+  const extended = view.extSec > 0 ? `${base}+${formatBudgetDuration(view.extSec)}` : base;
+  const finalize = view.finalizeSec ?? 0;
+  return finalize > 0 ? `${extended}+${formatBudgetDuration(finalize)} finalization reserve` : extended;
 }
 
 // formatLocalTime renders an ISO instant as the viewer's local wall-clock time ("15:20"),

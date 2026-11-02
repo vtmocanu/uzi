@@ -137,13 +137,13 @@ func harnessModelCompatible(h Harness, model string) bool {
 // That non-atomic fallback is UNREACHABLE in production — the server always wires a live
 // *store.Queries + txBeginner (cmd/server/main.go) — and it still fails an explicit non-Claude
 // request closed, so it can never emit a non-atomic Codex insert.
-func (s *Service) createRunResolved(ctx context.Context, userID uuid.UUID, explicit *Harness, insert func(q Store, resolved resolvedHarness) (store.Run, error)) (store.Run, error) {
+func (s *Service) createRunResolved(ctx context.Context, userID uuid.UUID, explicit *Harness, insert func(q Store, resolved resolvedHarness) (store.Run, error), origins ...harnessCreationOrigin) (store.Run, error) {
 	if _, ok := s.q.(*store.Queries); ok {
 		// A live query surface: resolve D11, INSERT and freeze atomically. *store.Queries
 		// satisfies Store, so the caller's insert closure is reused verbatim.
 		run, _, err := s.createRunAtomic(ctx, userID, explicit, func(q *store.Queries, resolved resolvedHarness) (store.Run, error) {
 			return insert(q, resolved)
-		})
+		}, origins...)
 		return run, err
 	}
 	// In-memory unit fakeStore: no live *store.Queries and no real transaction. Resolve to Claude

@@ -94,3 +94,26 @@ SELECT codex_account_mode FROM users WHERE id = @id;
 -- name: SetUserCodexAccountMode :execrows
 -- Set the user's Codex account mode. 0 rows for an unknown user.
 UPDATE users SET codex_account_mode = @mode WHERE id = @id;
+
+-- name: GetCodexDefaultSelectionCandidate :one
+-- Same account and throttle projection for an unpooled subscription default.
+SELECT
+    us.id                               AS alias_id,
+    (us.disabled_at IS NULL)::boolean   AS enabled,
+    cs.status                           AS link_status,
+    cs.provider_account_id,
+    a.provider_user_id,
+    a.workspace_account_id,
+    a.coord_state,
+    a.reauth_required,
+    t.effective_expiry                  AS throttle_effective_expiry,
+    t.spread_width_ms                   AS throttle_spread_width_ms
+FROM user_secrets us
+LEFT JOIN codex_credential_state cs
+    ON cs.user_secret_id = us.id AND cs.user_id = us.user_id
+LEFT JOIN codex_provider_account a
+    ON a.id = cs.provider_account_id AND a.user_id = us.user_id
+LEFT JOIN codex_account_admission_throttle t
+    ON t.user_id = us.user_id AND t.provider_account_id = a.id
+WHERE us.user_id = @user_id AND us.kind = 'codex_auth' AND us.id = @alias_id
+ORDER BY us.id;

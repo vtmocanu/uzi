@@ -211,6 +211,7 @@ beforeEach(() => {
   // PRD #1429 M4a review Fix 1: the viewer's default_harness, no preference by default.
   mockApi.getMySettings.mockResolvedValue({
     settings: {
+      harness_overflow_enabled: false,
       default_harness: null,
       default_model: null,
       default_effort: null,
@@ -300,6 +301,16 @@ describe("IssueView run history — forge-aware MR/PR link when mr_web_url is nu
     // Non-vacuous: the old hard-coded path would have produced /-/merge_requests/799.
     expect(container.querySelector('a[href*="merge_requests"]')).toBeNull();
   });
+});
+
+it.each([["paused", "Codex policy hold"], ["queued", "queued"], ["completed", "completed"]] as const)("policy history label for %s", async (status, label) => {
+  setAuth();
+  mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+  mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status, hold_reason: "codex_policy_hold" })] });
+  renderIssueView();
+  expect(await screen.findByText(label)).toBeTruthy();
+  expect(screen.queryByText("codex policy_hold")).toBeNull();
+  if (status !== "paused") expect(screen.queryByText("Codex policy hold")).toBeNull();
 });
 
 // issue #2004: a resumed run's started_at is reset to the last leg, so the history row's
@@ -659,6 +670,7 @@ describe("IssueView Start gate (PRD #764)", () => {
     });
     mockApi.getMySettings.mockResolvedValue({
       settings: {
+        harness_overflow_enabled: false,
         default_harness: "codex",
         default_model: null,
         default_effort: null,

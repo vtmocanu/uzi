@@ -1196,6 +1196,9 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// NOT lane-allowlisted: an isolated-lane run is not a Claude run-lane flight that posts it.
 		r.Post("/runs/{id}/usage", h.WorkerRunUsage)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
+		// Bounded local lifecycle outcome, like /state and memory outcomes: no rate
+		// limiter or upstream I/O. Strict 17 KiB decoding and worker/run fences apply.
+		r.Post("/runs/{id}/policy-hold", h.WorkerRunPolicyHold)
 		r.Post("/runs/{id}/forge-clone-success", h.WorkerForgeCloneSuccess)
 		// Bound intent body-decoding and enrollment writes per worker, like the semantic candidate.
 		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/publication-intent", h.WorkerPublicationIntent)
@@ -1248,6 +1251,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// three-term deadline. paused = parked (clean up), anything else = the owner extended in the
 		// window, restart the turn. Mirrors the completion/hold ack contract.
 		r.Post("/runs/{id}/wall-park", h.WorkerRunWallPark)
+		r.Post("/runs/{id}/iteration-park", h.WorkerRunIterationPark)
 		r.Post("/runs/{id}/pause", h.WorkerRunPause)
 		// issue #3194: the --require-base base-attestation HOLD. The worker's preflight guard found
 		// retained work no checkpoint attests; the service parks its own live claim (running ->

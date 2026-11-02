@@ -203,8 +203,23 @@ type MemoryHoldDTO struct {
 	Remaining *int32 `json:"remaining"`
 }
 
+// HarnessDecisionDTO is the creation-time harness comparison. Unknown usage stays
+// null; measured zero is a value. Chosen is the run's stored harness.
+type HarnessDecisionDTO struct {
+	Preferred         string   `json:"preferred"`
+	Chosen            string   `json:"chosen"`
+	Reason            string   `json:"reason"`
+	PreferredScore    *float64 `json:"preferred_score"`
+	OtherScore        *float64 `json:"other_score"`
+	PreferredMeasured *float64 `json:"preferred_measured"`
+	OtherMeasured     *float64 `json:"other_measured"`
+	PreferredHeld     bool     `json:"preferred_held"`
+	OtherHeld         bool     `json:"other_held"`
+}
+
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
+	PolicyHold *PolicyHoldDTO `json:"policy_hold,omitempty"`
 	// Optional advisory cooldown for the assigned worker and current authorized origin.
 	ForgeOriginCooldown *ForgeOriginCooldownDTO `json:"forge_origin_cooldown,omitempty"`
 	// Detail-only detector provenance; never approval authority or summary polling data.
@@ -247,6 +262,8 @@ type RunDTO struct {
 	// value honestly — the API is deployed separately and a newer server can ship a harness
 	// this client has not heard of.
 	Harness string `json:"harness"`
+	// HarnessDecision is private to the run owner; null for legacy and foreign reads.
+	HarnessDecision *HarnessDecisionDTO `json:"harness_decision"`
 	// HasPRDLink is server-computed PRD presence for the runs view (PRD #764),
 	// derived label-independently from the run's snapshotted issue description via
 	// the same detector the board card uses (forgesvc.HasPRDLink). False for
@@ -433,6 +450,7 @@ type RunDTO struct {
 	CompletionUnmet []string `json:"completion_unmet"`
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
+	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
@@ -1082,13 +1100,12 @@ type RunDTO struct {
 	OutcomePending *OutcomePendingDTO `json:"outcome_pending"`
 }
 
-// OutcomePendingDTO names a finished outcome held on the run's worker (PRD #1391 M3,
-// D13). Reason is one of the closed set the worker may report — completion_permit_mismatch
-// (the run's completion permit no longer matches), gap_unrecoverable (a message hole the
-// worker cannot fill bounds the terminal fence), reserve_exhausted (the terminal-journal
-// reserve is full) — mapped to friendly text by the web owner-resolution UI. The api drops
-// any other value (the worker is untrusted), so a client may render an unrecognised value
-// honestly but will never see one from this api.
+// OutcomePendingDTO describes retained delivery evidence on the run's worker.
+// Worker-reported permanent terminal reasons are restricted to completion_permit_mismatch,
+// gap_unrecoverable and reserve_exhausted (PRD #1391 M3, D13). The API separately derives
+// codex_policy_hold_pending from bounded policy delivery facts belonging to the current
+// worker; this transient reason does not confirm a server-applied hold or terminal outcome.
+// Arbitrary worker reason text is never forwarded. Clients tolerate newer reason values.
 type OutcomePendingDTO struct {
 	Reason string `json:"reason"`
 }
@@ -1136,10 +1153,11 @@ type CredentialEpochDTO struct {
 // RunDTO / RunListItemDTO source fields exactly; the nested value types are reused. There is
 // exactly one worker_name here, the list-level one (RunListItemDTO.WorkerName).
 type RunSummaryItemDTO struct {
+	PolicyHold     *PolicyHoldDTO     `json:"policy_hold,omitempty"`
+	WorkerRecovery *WorkerRecoveryDTO `json:"worker_recovery,omitempty"`
+	MemoryHold     *MemoryHoldDTO     `json:"memory_hold,omitempty"`
 	// Optional advisory cooldown for the assigned worker and current authorized origin.
 	ForgeOriginCooldown *ForgeOriginCooldownDTO `json:"forge_origin_cooldown,omitempty"`
-	WorkerRecovery      *WorkerRecoveryDTO      `json:"worker_recovery,omitempty"`
-	MemoryHold          *MemoryHoldDTO          `json:"memory_hold,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
@@ -1167,6 +1185,8 @@ type RunSummaryItemDTO struct {
 	// value honestly — the API is deployed separately and a newer server can ship a harness
 	// this client has not heard of.
 	Harness string `json:"harness"`
+	// HarnessDecision is private to the run owner; null for legacy and foreign reads.
+	HarnessDecision *HarnessDecisionDTO `json:"harness_decision"`
 	// HasPRDLink is server-computed PRD presence for the runs view (PRD #764),
 	// derived label-independently from the run's snapshotted issue description via
 	// the same detector the board card uses (forgesvc.HasPRDLink). False for
@@ -1347,6 +1367,7 @@ type RunSummaryItemDTO struct {
 	CompletionUnmet []string `json:"completion_unmet"`
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
+	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
@@ -1979,6 +2000,7 @@ type RunSummaryItemDTO struct {
 // key-set test in run_summary_test.go fails until the field is placed here on purpose.
 func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 	return RunSummaryItemDTO{
+		PolicyHold:                    item.PolicyHold,
 		WorkerRecovery:                item.WorkerRecovery,
 		MemoryHold:                    item.MemoryHold,
 		ID:                            item.ID,
@@ -1989,6 +2011,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		ContinuedIssueIID:             item.ContinuedIssueIID,
 		IssueTitle:                    item.IssueTitle,
 		Harness:                       item.Harness,
+		HarnessDecision:               item.HarnessDecision,
 		HasPRDLink:                    item.HasPRDLink,
 		Title:                         item.Title,
 		ResumeOfRunID:                 item.ResumeOfRunID,
@@ -2165,6 +2188,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 	return RunListItemDTO{
 		RunDTO: RunDTO{
+			PolicyHold:                    s.PolicyHold,
 			WorkerRecovery:                s.WorkerRecovery,
 			MemoryHold:                    s.MemoryHold,
 			ID:                            s.ID,
@@ -2175,6 +2199,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			ContinuedIssueIID:             s.ContinuedIssueIID,
 			IssueTitle:                    s.IssueTitle,
 			Harness:                       s.Harness,
+			HarnessDecision:               s.HarnessDecision,
 			HasPRDLink:                    s.HasPRDLink,
 			Title:                         s.Title,
 			ResumeOfRunID:                 s.ResumeOfRunID,

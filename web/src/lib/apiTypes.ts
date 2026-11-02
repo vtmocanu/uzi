@@ -253,6 +253,8 @@ export interface UserSettings {
   /** Issue #3719: how a new Codex run chooses its login. "default" binds the default alias;
    *  "auto" picks among the pooled aliases. Absent on a server that predates the setting. */
   codex_account_mode?: CodexAccountMode | string;
+  /** Owner opt-in, written only through PUT /me/harness-overflow. */
+  harness_overflow_enabled: boolean;
   /** Per-user default harness (PRD #1429 M1 / D3); null = "no preference", so implicit run
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
@@ -909,6 +911,8 @@ export interface LatestRun {
   // the issue #3181 token-switch holds ('credential_switch_settling' / 'credential_switch_unsettled')
   // so they read "settling: token switch" / "held: token switch".
   // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
+  // 'iteration_budget_exhausted' is a nonterminal owner hold: "Iteration limit reached".
+  // Resume grants a fresh finite allowance; Extend adds wall time without resuming; Cancel ends it.
   // Optional for api/web rollout skew: an absent key reads as no hold.
   hold_reason?: string | null;
   owner_name: string;
@@ -2729,6 +2733,8 @@ export interface Worker {
   // outbox_blocked describes), shown to the worker's owner. Untrusted worker text: never
   // joined to a run's title or status.
   outbox_blocked_run_id?: string | null;
+  /** Worker-global root diagnostic, distinct from per-run arbitration. */
+  outbox_root_unusable?: string | null;
   // The worker's residue-quarantine latch (issue #2213): it found an unreadable,
   // unattributed process running as its own uid, so it claims nothing and starts no
   // forge-credentialed git and no new Claude/Codex turn until its container restarts.
@@ -3168,7 +3174,36 @@ export interface RunLeadConfig {
   phases: LeadPhaseConfig[];
 }
 
+/** Stored creation-time evidence; null on legacy or redacted run responses. */
+export interface HarnessDecision {
+  preferred: string;
+  chosen: string;
+  reason: string;
+  preferred_score: number | null;
+  other_score: number | null;
+  preferred_measured: number | null;
+  other_measured: number | null;
+  preferred_held: boolean;
+  other_held: boolean;
+}
+
 export interface Run {
+  policy_hold?: {
+    preserve_required: boolean;
+    pending_fresh: boolean;
+    outcome_id: string;
+    continuation_mode: "same_conversation" | "fresh_from_saved_work";
+    resolved_at: string | null;
+    applying_worker_id: string | null;
+    applying_generation: number;
+    source_generation: number;
+    refusal_count: number;
+    policy_tag: "cyberPolicy" | "misalignmentPolicyViolation" | null;
+    phase: "planning" | "implementation" | null;
+    correlation_id: string | null;
+    published: boolean | null;
+    captured_head?: string | null;
+  };
   forge_origin_cooldown?: ForgeOriginCooldown;
   capability_provenance?: {
     hints_known: boolean;
@@ -3211,6 +3246,7 @@ export interface Run {
    *  "claude"). The web marks every run with its provider chip (HarnessBadge, PRD #1653
    *  D-W5), and keys the model/effort vocabulary on it (M4). */
   harness: Harness;
+  harness_decision: HarnessDecision | null;
   /** Chat conversation title (PRD #39), first-message derived; null for other kinds
    *  and until derived. resume_of_run_id points a continued chat at the ended one. */
   title: string | null;
@@ -3289,7 +3325,7 @@ export interface Run {
   worker_id: string | null;
   branch: string | null;
   /** PRD #300: the per-schedule model a schedule froze onto this run at fire time;
-   *  null = the run inherited the owner's per-user Worker default. Applies to all
+   *  null = the run inherited the owner's worker model (Run defaults). Applies to all
    *  schedule targets (unlike guidance). */
   model: string | null;
   /** PRD #305: the frozen "apply model also to agents" flag; true means this run's
@@ -3836,6 +3872,9 @@ export interface Run {
    *  Issue #3194: 'base_attestation_missing' for a --require-base run that adopted retained work no
    *  checkpoint attests to the planned base (issue #3194; the agent was not started, nothing
    *  automatic leaves the hold, Resume and extend are refused; recover or start a successor).
+   *  'iteration_budget_exhausted' is a nonterminal iteration hold: owner Resume or Cancel,
+   *  never completed-scope Stop. Extend wall time first only when remaining wall is spent;
+   *  Extend leaves it paused, and credential changes never retry it automatically.
    *  Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and
@@ -5409,7 +5448,18 @@ export interface CIRunDetail extends CIRun {
 // until the capture reaches the relevant lifecycle stage: attempted_head_sha (H') is
 // absent when no publish was attempted; byte_size/checksum are absent until the manifest
 // is bound; expires_at is absent until the artifact is available.
+export interface RecoveryPrerequisiteClosure {
+  state: string;
+  reason?: string;
+  pin_ref: string;
+  pin_tip?: string;
+  absence_unconfirmed: boolean;
+  cleanup_exhausted: boolean;
+  updated_at: string;
+}
+
 export interface RecoveryArchive {
+  prerequisite_closure?: RecoveryPrerequisiteClosure;
   id: string;
   run_id: string;
   hold_id: string;

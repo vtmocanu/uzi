@@ -55,8 +55,8 @@ function demoFailureRecency(hours: number, origin: string, completed: number) {
 const demoLinkedFailure = {
   ...demoFailureRecency(13.2, "workflow_scope_missing", 14),
   // Match the existing drill-in fixture's actual end time and failure reason.
-  last_failed_at: getRun("run-workflow-scope")?.finished_at ?? new Date(recencyDemoNow - 13.2 * 3_600_000).toISOString(),
-  last_failed_run_id: "run-workflow-scope",
+  last_failed_at: getRun("c57b3989-105a-4e08-bf74-77ebc28e5a03")?.finished_at ?? new Date(recencyDemoNow - 13.2 * 3_600_000).toISOString(),
+  last_failed_run_id: "c57b3989-105a-4e08-bf74-77ebc28e5a03",
 };
 
 function listRunsFor(): Run[] {
@@ -387,6 +387,7 @@ export const runsApi = {
     }
     const now = new Date().toISOString();
     const run: Run = {
+      harness_decision: null,
       id: nextRunId(),
       repo_id: repoId,
       forge_type: "gitlab",
@@ -478,6 +479,7 @@ export const runsApi = {
     if (active) throw new ApiError(409, "an active CI-fix run already exists for this ref");
     const now = new Date().toISOString();
     const run: Run = {
+      harness_decision: null,
       id: nextRunId(),
       repo_id: repoId,
       forge_type: "gitlab",
@@ -784,6 +786,15 @@ export const runsApi = {
       updated_at: new Date().toISOString(),
       ...(switchHold === "unsettled" ? { status: "queued" as const, hold_reason: null, status_since: new Date().toISOString() } : {}),
     });
+    // This per-run owner action explicitly sets a token AND resumes a paused run.
+    // Availability changes alone do not release an iteration hold.
+    if (run.status === "paused" && run.hold_reason === "iteration_budget_exhausted") {
+      const total = run.budget_total_seconds ??
+        (run.budget_wall_seconds ?? 6 * 3600) + (run.budget_extension_seconds ?? 0) + (run.budget_finalize_seconds ?? 0);
+      if (run.budget_used_seconds != null && total - run.budget_used_seconds <= 0)
+        throw new ApiError(409, "credential switch: run state changed, retry");
+      patchRun(id, { status: "queued", hold_reason: null, hold_context: null, status_since: new Date().toISOString() });
+    }
     const updated = { ...getRun(id)! };
     const pooledEligible = mockSecrets.some((s) => s.kind === "anthropic_token" && s.auto_eligible);
     const warning =
@@ -999,6 +1010,13 @@ export const runsApi = {
     const memoryHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
     if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld)
       throw new ApiError(409, `run is ${run.status}`);
+    const iterationHeld = run.status === "paused" && run.hold_reason === "iteration_budget_exhausted";
+    if (iterationHeld) {
+      const total = run.budget_total_seconds ??
+        (run.budget_wall_seconds ?? 6 * 3600) + (run.budget_extension_seconds ?? 0) + (run.budget_finalize_seconds ?? 0);
+      if (run.budget_used_seconds != null && total - run.budget_used_seconds <= 0)
+        throw new ApiError(409, `this run is out of time; extend it to resume: uzi run extend ${id} --by 2h`);
+    }
     // Issue #3181: mirrors the server's ErrRunHoldSettling refusal; an unsettled hold resumes.
     const switchHold = credentialSwitchHold(run);
     if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
@@ -1006,6 +1024,7 @@ export const runsApi = {
     // reset (the mock stands in with seven days).
     const reserveHeld = run.status === "paused" && run.hold_reason === "weekly_reserve";
     patchRun(id, { status: "queued", updated_at: new Date().toISOString(),
+      ...(iterationHeld ? { hold_reason: null, hold_context: null, status_since: new Date().toISOString() } : {}),
       ...(reserveHeld
         ? { hold_reason: null, reserve_exempt_until: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString() }
         : {}),
@@ -1065,7 +1084,7 @@ export const runsApi = {
   getRunArchives: async (id: string) => {
     const r = getRun(id);
     if (!r) throw new ApiError(404, "run not found");
-    const capId = `${id}-cap1`;
+    const capId = `00000000-0000-0000-0000-${([...state.runs.keys()].indexOf(id) + 1).toString(16).padStart(12, "0")}`;
     if (r.status === "failed" && !discardedCaptures.has(capId)) {
       return delay(
         {
@@ -1089,7 +1108,13 @@ export const runsApi = {
               source_sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
               attempted_head_sha: "f0e1d2c3b4a5968778695a4b3c2d1e0f01234567",
               byte_size: 4718592,
-              checksum: "sha256:3f786850e387550fdab836ed7e6dc881de23001b",
+              checksum: "3f786850e387550fdab836ed7e6dc881de23001b3f786850e387550fdab836ed7e6d",
+              prerequisite_closure: {
+                state: "pinned", pin_ref: `refs/uzi-prereq/${capId}`,
+                pin_tip: "1111111111111111111111111111111111111111",
+                absence_unconfirmed: false, cleanup_exhausted: false,
+                updated_at: new Date(Date.now() - 3_600_000).toISOString(),
+              },
               prerequisite_shas: ["9988776655443322110099887766554433221100"],
               created_at: new Date(Date.now() - 3_600_000).toISOString(),
               expires_at: new Date(Date.now() + 6 * 86_400_000).toISOString(),
@@ -1118,12 +1143,12 @@ export const runsApi = {
     );
   },
   // Issue #2545: one acknowledged held-work publication for the failed mock run
-  // run-workflow-scope; every other run has none.
+  // workflow-scope run; every other run has none.
   getRunHeldPublications: async (id: string) => {
     const r = getRun(id);
     if (!r) throw new ApiError(404, "run not found");
     const publications =
-      id === "run-workflow-scope" && r.status === "failed"
+      id === "c57b3989-105a-4e08-bf74-77ebc28e5a03" && r.status === "failed"
         ? [
             {
               id: "pub-mock-1",
@@ -1177,6 +1202,9 @@ export const runsApi = {
       throw new ApiError(404, "run not found");
     const current = getRun(id);
     if (!current) throw new ApiError(404, "run not found");
+    // The real endpoint also accepts Stop from CLI clients, outside the web input union.
+    if ((kind as string) === "stop" && current.status === "paused" && current.hold_reason === "iteration_budget_exhausted")
+      throw new ApiError(409, "Stop is unavailable for an iteration hold; Resume to keep working, or Cancel the run");
     // PRD #1795 D5: mirror the server's expected-revision contract. A revision on any kind
     // other than a plan verdict is a 400; a verdict bound to a revision the run no longer
     // shows (a different gate_revision, or no open gate at all) is the typed 409 with the

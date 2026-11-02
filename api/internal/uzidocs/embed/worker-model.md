@@ -17,11 +17,19 @@ Both settings live together in one **Settings → Run defaults** card:
 
 - A **default harness** picker, shown only when you have a usable credential
   for both Claude and Codex. It decides which harness a run uses when
-  nothing else names one.
+  nothing else names one, subject to the optional creation-time overflow below.
 - One **model lane per usable harness**: Anthropic and Codex side by side
   when both are usable, or a single lane when only one is. With no usable
   credential yet, the card still shows the Claude lane so you can
   preconfigure it before connecting one.
+
+Each picker's empty option is a **Default · …** label naming where the value
+comes from: the Claude model picker reads `Default · lead template` (the
+`lead` template's model) and the Codex model picker reads
+`Default · gpt-6.1-sol (built-in)`. The harness picker's empty option reads
+`Default · automatic`: uzi picks your only usable harness, or Claude when both
+are usable. Schedules and the start-run form still say **Use my default** for
+the harness.
 
 Switching the default harness never clears either model. Each lane is its
 own retained preference, so alternating between Claude and Codex keeps both
@@ -31,11 +39,40 @@ both lanes together, in one request.
 
 ![Settings, Run defaults, showing the grouped Harness and worker models card with side-by-side Claude and Codex model lanes](img/worker-model-settings.png)
 
+## Overflow to the other harness
+
+In **Settings → Run defaults**, turn on **Overflow to the other harness when my default is near its limits**.
+This per-user boolean is off by default and saves automatically, separately
+from **Save defaults**. The CLI equivalent is
+`uzi settings harness-overflow on|off`; `uzi settings get` reads it back.
+
+Overflow applies at creation to **new issue runs** started manually, by
+autopilot or by a schedule, when both harnesses are usable and the harness
+choice is implicit. An explicit harness (including an issue harness label),
+a run/schedule model pin, an Anthropic credential override, or either saved
+Plan or Code cross-check enable flag excludes it, even if that checker
+would be inactive for the preferred harness. Chat, jobs, tasks, prompts,
+reviews, rework, CI fixes and other origins do not use overflow.
+
+uzi compares stored usage and capacity holds. The preferred comparison
+score must be **below 20%**, the other harness **at least 30%**, and the
+advantage **at least 15 percentage points**. An unknown comparison keeps
+the preferred harness. See [How overflow compares headroom](./rate-limits.md#how-overflow-compares-headroom)
+for account selection, conservative Claude aggregation and hold handling.
+
+The harness and creation explanation are frozen atomically. Existing runs,
+including resumes and usage-limit parks, never switch harness through
+overflow. The owner's run page, `uzi run get <id>` (human and `--json`) and
+TUI detail rail show the stored preferred/chosen harness, reason, comparison
+scores, measured headroom and holds. This is creation-time evidence, not
+live usage; legacy or unavailable evidence reads **not recorded**.
+
 ## Model precedence
 
 For a given run, uzi resolves the harness first (an explicit run/schedule
 choice, then your default harness, then whichever harness you have a
-credential for), and only then reads that harness's model lane:
+credential for, with eligible overflow applied at creation), and only then
+reads that harness's model lane:
 
 1. The **schedule's model**, if the run was started by a
    [schedule](./scheduling.md) that pins one compatible with the run's
@@ -115,8 +152,11 @@ stay on your normal model.
 
 Set it in the schedule's create/edit form, in the **Model (optional)**
 control, or with `uzi schedule create --model <alias|id>`. Leaving it on
-Inherit uses your worker model for the schedule's harness. The schedule field accepts a single token of at most 100
-characters; blank means inherit. The Codex schedule picker remains curated;
+**Default** uses your worker model for the schedule's harness; the label
+names it, for example `Default · your Claude worker model`, `Default · your
+Codex worker model` or `Default · your worker model` when the harness is not
+pinned. The schedule field accepts a single token of at most 100
+characters; blank means Default. The Codex schedule picker remains curated;
 the custom Codex worker-root escape hatch does not extend to schedule pins.
 The frozen model is readable with `uzi run get <id> --field model` (or in
 `uzi run get <id> --json`); to see the model a run actually used, see [See
@@ -193,7 +233,7 @@ Where to see it:
   surfaced in that run's messages like any other agent error.
 - **Validation.** A model must be a single token: trimmed, no interior
   spaces or control characters, at most 100 characters. Blank means
-  inherit.
+  Default (the picker's empty option).
 - **Yours alone.** These settings only change runs you own; they never
   affect other users or the shared `lead` template.
 - **Cost status stays honest.** Codex uses uzi's pinned Standard price table

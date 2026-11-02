@@ -12,7 +12,7 @@ import { daysAgo, minsAgo, secsAgo } from "./time";
 // ── Run judge reviews (PRD #46 M4) ───────────────────────────────────────────
 // Seeded verdicts for the run-page review panel, keyed by target run id. run-done
 // carries a full "issues" verdict with recommendations so the panel + preview mode
-// have something to show; other terminal runs (e.g. run-failed) have no review, so
+// have something to show; other terminal runs (e.g. pool-tuning run) have no review, so
 // their panel renders the "not judged yet" state with a Run-judge button.
 export interface MockReview {
   id: string;
@@ -215,7 +215,7 @@ export const mockReviews: MockReview[] = [
   // is filed in two runs (a Filed-tab group seen in 2 runs).
   {
     id: "rev-closed",
-    target_run_id: "run-closed",
+    target_run_id: "c57b3989-105a-4e08-bf74-77ebc28e5a02",
     owner: "u-mira",
     verdict: "issues",
     summary_md:
@@ -494,17 +494,17 @@ export const mockAdminScenarioReviews: MockReview[] = [
 //
 // Four terminal fixtures cover the panel's four states between them — one each, so
 // dropping any one of them takes a state off the demo:
-//   run-failed    — no review + scheduled: the empty-state "verdict will appear here"
+//   pool-tuning run    — no review + scheduled: the empty-state "verdict will appear here"
 //                   copy with the button disabled and relabelled "Judge scheduled";
-//   run-closed    — a seeded review + running: the re-judge-in-flight note over an
+//   closed-MR run    — a seeded review + running: the re-judge-in-flight note over an
 //                   existing verdict;
 //   run-done      — a seeded review and NO entry: the settled panel with a live
 //                   Re-run judge button, which must stay demoable;
 //   run-unjudged  — NO review and NO entry: the never-judged empty state with the
-//                   ENABLED Run judge button. Added after #119 took run-failed for
+//                   ENABLED Run judge button. Added after #119 took pool-tuning run for
 //                   the scheduled case and left this one, the state the PRD promises
 //                   is unchanged, with no fixture at all.
 export const mockPendingJudges: Record<string, PendingJudge> = {
-  "run-failed": { state: "scheduled", enqueued_at: minsAgo(2) },
-  "run-closed": { state: "running", enqueued_at: minsAgo(9) },
+  "c57b3989-105a-4e08-bf74-77ebc28e5a01": { state: "scheduled", enqueued_at: minsAgo(2) },
+  "c57b3989-105a-4e08-bf74-77ebc28e5a02": { state: "running", enqueued_at: minsAgo(9) },
 };

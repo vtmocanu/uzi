@@ -870,10 +870,13 @@ attempts or logs:
   tails of failed jobs. Only timestamps the forge reported are used; a figure
   missing some durations is shown as a lower bound with its unknown count.
 - **Bounds**: collection stops at a 15-second deadline, a cap on forge calls or
-  the shared CI read budget, and the snapshot then says what is partial. It is
-  capped at 48 KiB; anything trimmed leaves a marker. Each fire collects
-  synchronously, so one scheduler tick collects for at most two CI scouts and
-  holds any further due scout until a later tick.
+  the shared CI read budget, and the snapshot then says what is partial. History
+  reads rotate across the selected default-branch and merge/pull request runs in
+  both the latest week and the week before. One fifth of the collection deadline
+  is reserved for log tails. The snapshot is capped at 48 KiB; anything trimmed
+  leaves a marker. Each fire collects synchronously, so one scheduler tick
+  collects for at most two CI scouts and holds any further due scout until a
+  later tick.
 - **The proposal**: one issue (`proposal::ci-scout`) with a short summary and an
   implementation spec ready for a run, picked from duration regressions, slow
   feedback, slow jobs, suspected flakes, infrastructure failures and

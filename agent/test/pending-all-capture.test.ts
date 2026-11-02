@@ -6,12 +6,22 @@ import path from "node:path";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { Outbox, canonicalizeTerminalBody } from "../src/outbox.js";
 import { nullLogger } from "./helpers.js";
+import type { ActiveSnapshot } from "../src/protocol.js";
 
 const runId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const identities = [
   { run_id: runId, claim_generation: 1 },
   { run_id: runId, claim_generation: 2 },
 ];
+
+// Directory iteration order is not a wire contract. Keep both generations and
+// every snapshot field, comparing this one-run fixture in canonical order.
+const byGeneration = <T extends { claim_generation: number }>(entries: T[]): T[] =>
+  [...entries].sort((a, b) => a.claim_generation - b.claim_generation);
+const orderedSnapshot = (snapshot: ActiveSnapshot): ActiveSnapshot => ({
+  ...snapshot, active: byGeneration(snapshot.active),
+  ...(snapshot.pending_all ? { pending_all: byGeneration(snapshot.pending_all) } : {}),
+});
 
 async function capturesPending(root: string): Promise<Outbox> {
   const options = {
@@ -34,7 +44,7 @@ async function capturesPending(root: string): Promise<Outbox> {
   const reader = new Outbox(options);
   await reader.init();
   assert.deepStrictEqual(
-    reader.listPendingTerminals().map(p => ({ run_id: p.run_id, claim_generation: p.claim_generation })),
+    byGeneration(reader.listPendingTerminals().map(p => ({ run_id: p.run_id, claim_generation: p.claim_generation }))),
     identities,
   );
   return reader;
@@ -53,10 +63,10 @@ it("issue 2009 M4: real journals serialize the duplicate-active shared fixture",
   const fixture = JSON.parse(await fs.readFile(
     new URL("../../fixtures/worker-pending-identities/duplicate-active.json", import.meta.url), "utf8",
   ));
-  assert.deepStrictEqual(JSON.parse(JSON.stringify(snapshot)), fixture);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(orderedSnapshot(snapshot))), fixture);
   assert.equal(captures, 1);
   assert.deepStrictEqual(snapshot.active.map(p => p.run_id), [runId, runId]);
-  assert.deepStrictEqual(snapshot.pending_all, identities);
+  assert.deepStrictEqual(byGeneration(snapshot.pending_all ?? []), identities);
   for (const identity of snapshot.pending_all ?? []) {
     assert.deepStrictEqual(Object.keys(identity).sort(), ["claim_generation", "run_id"]);
   }
@@ -73,10 +83,10 @@ it("issue 2009 M4: cap zero register and heartbeat keep complete journals throug
   }, () => 0);
   const register = registry.buildRegisterSnapshot();
   const heartbeat = registry.build();
-  assert.deepStrictEqual(register, {
+  assert.deepStrictEqual(orderedSnapshot(register), {
     snapshot_epoch: 1, active: [], pending_overflow: true, pending_all: identities,
   });
-  assert.deepStrictEqual(heartbeat, {
+  assert.deepStrictEqual(orderedSnapshot(heartbeat), {
     snapshot_epoch: 2, active: [], pending_overflow: true, pending_all: identities,
   });
   assert.equal(captures, 2);

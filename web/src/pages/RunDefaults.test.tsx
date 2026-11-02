@@ -43,6 +43,7 @@ vi.mock("../lib/api", async (importActual) => {
       setAttributionEnabled: vi.fn(),
       getMySettings: vi.fn(),
       putMySettings: vi.fn(),
+      setHarnessOverflow: vi.fn(),
       listAgentTemplates: vi.fn(),
       getTemplateAllocations: vi.fn(),
       vaultLock: vi.fn(),
@@ -125,8 +126,8 @@ function mockAuth(user: User, over: Partial<ReturnType<typeof useAuth>> = {}) {
 
 beforeEach(() => {
   mockApi.listSecrets.mockResolvedValue({ secrets: [] });
-  mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null } });
-  mockApi.putMySettings.mockResolvedValue({ settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: "mission" } });
+  mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null } });
+  mockApi.putMySettings.mockResolvedValue({ settings: { default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: "mission" } });
   mockApi.getMySlack.mockResolvedValue({
     slack: { member_id: null, notify: true, resolved_id: null, confirmed: false, state: "unlinked", workspace: "connected" },
   });
@@ -358,7 +359,7 @@ describe("Run defaults — judge enforced banner + per-user model (PRD #69 M4)",
   it("renders the enforced banner naming both resolved judge models and the credential opt-out", async () => {
     mockAuth(baseUser, { judgeEnforcedByAdmin: true, effectiveJudgeModel: "sonnet" });
     mockApi.getMySettings.mockResolvedValue({ settings: {
-      default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null,
+      default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null,
       appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
       judge_models: [
         { harness: "claude", model: null, default_model: "sonnet", default_source: "instance_default", resolved_model: "sonnet", source: "instance_default" },
@@ -389,10 +390,10 @@ describe("Run defaults — judge enforced banner + per-user model (PRD #69 M4)",
 
   it("saves the per-user Claude judge model through PUT /me/settings", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: "haiku", summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: "haiku", summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -422,7 +423,7 @@ describe("Run defaults — judge model per harness (PRD #3245)", () => {
   ];
   const judgeSettings = (over: Partial<UserSettings> = {}): { settings: UserSettings } => ({
     settings: {
-      default_harness: null, default_model: null, default_effort: null, summary_model: null,
+      default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, summary_model: null,
       appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
       judge_model: null, codex_judge_model: "gpt-6-sol", judge_models: cells(),
       ...over,
@@ -477,6 +478,19 @@ describe("Run defaults — judge model per harness (PRD #3245)", () => {
     const codexEffect = document.getElementById(codex.getAttribute("aria-describedby") ?? "");
     expect(claudeEffect?.textContent).toBe("In effect: sonnet \u00b7 instance default");
     expect(codexEffect?.textContent).toBe("In effect: gpt-6-sol \u00b7 your choice");
+  });
+
+  it("harness help says Default · automatic (not 'Use my default') and summary help is Claude-only (#3255)", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings());
+    renderPage();
+    await screen.findByLabelText("Claude judge model");
+    const harnessHelp = screen.getByText(/to let uzi choose your only usable/).textContent ?? "";
+    expect(harnessHelp).toContain("Default · automatic");
+    expect(harnessHelp).not.toContain("Use my default");
+    const harnessOptions = Array.from((screen.getByLabelText("Default harness") as HTMLSelectElement).options).map((o) => o.text);
+    expect(harnessOptions.some((t) => t.includes("Use my default"))).toBe(false);
+    expect(screen.getByText(/This setting applies to Claude runs/).textContent).toContain("Codex summaries use a fixed model");
   });
 
   it("saves only the dirty lane, and adopts the response's In-effect cell", async () => {
@@ -588,10 +602,10 @@ describe("Run defaults — per-user summary model (PRD #362 M2)", () => {
 
   it("saves the per-user summary model through PUT /me/settings", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: "haiku", appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: "haiku", appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -610,7 +624,7 @@ describe("Run defaults — per-user summary model (PRD #362 M2)", () => {
 describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
   it("retains a stored Codex effort but hides its control when Codex is unavailable", async () => {
     mockApi.getMySettings.mockResolvedValue({ settings: {
-      default_harness: null, default_model: null, default_effort: null, default_codex_effort: "max",
+      default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, default_codex_effort: "max",
       judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
       dark_theme: null, typeface: null, theme: null,
     } });
@@ -627,12 +641,12 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
       created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
     }] });
     mockApi.getMySettings.mockResolvedValue({ settings: {
-      default_harness: null, default_model: null, default_effort: "high", default_codex_effort: "low",
+      default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: "high", default_codex_effort: "low",
       judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
       dark_theme: null, typeface: null, theme: null,
     } });
     mockApi.putMySettings.mockResolvedValue({ settings: {
-      default_harness: null, default_model: null, default_effort: "high", default_codex_effort: "medium",
+      default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: "high", default_codex_effort: "medium",
       judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
       dark_theme: null, typeface: null, theme: null,
     } });
@@ -645,7 +659,7 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_codex_effort: "medium" }));
     expect(claude.value).toBe("max");
     mockApi.putMySettings.mockResolvedValue({ settings: {
-      default_harness: null, default_model: null, default_effort: "high", default_codex_effort: null,
+      default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: "high", default_codex_effort: null,
       judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
       dark_theme: null, typeface: null, theme: null,
     } });
@@ -656,7 +670,7 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
   });
   // PRD #3247: the ordinary worker cards offer the preference-only Runtime default.
   describe("Runtime default (PRD #3247)", () => {
-    const base = { default_harness: null, default_model: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null };
+    const base = { default_harness: null, harness_overflow_enabled: false, default_model: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null };
     const codexSecret = { id: "codex-rt", kind: "openai_api_key", label: "Codex fixture", is_default: true, enabled: true, disabled_at: null, auto_eligible: false, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
     const optionList = (el: HTMLElement) => Array.from((el as HTMLSelectElement).options).map((o) => [o.value, o.text]);
 
@@ -690,7 +704,7 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
 
   it("loads and shows the saved effort", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_harness: null, default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -704,10 +718,10 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
 
   it("changing the dropdown enables Save and sends the chosen level", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_harness: null, default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -727,10 +741,10 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
 
   it("selecting Inherit sends default_effort: null", async () => {
     mockApi.getMySettings.mockResolvedValue({
-      settings: { default_harness: null, default_model: null, default_effort: "max", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: "max", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     mockApi.putMySettings.mockResolvedValue({
-      settings: { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
+      settings: { default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
     });
     render(
       <MemoryRouter>
@@ -1247,7 +1261,7 @@ describe("Run defaults — CI autofix tri-state display (PRD #914 M3)", () => {
 
 // PRD #2603: the per-user Model-written Now line switch, tri-state like mr_rework_enabled.
 describe("Run defaults — Now line switch (PRD #2603)", () => {
-  const baseSettings = { default_harness: null, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null };
+  const baseSettings = { default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: null, judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null };
   const nowToggle = () => screen.getByLabelText("Model-written Now line") as HTMLInputElement;
   const renderPage = () =>
     render(
@@ -1314,7 +1328,7 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
   const settings = (over: Record<string, unknown> = {}) => ({
     settings: {
       default_harness: null,
-      default_model: null,
+      harness_overflow_enabled: false, default_model: null,
       default_claude_model: null,
       default_codex_model: null,
       default_effort: null,
@@ -1408,6 +1422,32 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     fireEvent.click(saveButton());
     await screen.findByText(/Defaults saved/);
     expect(mockApi.putMySettings).toHaveBeenNthCalledWith(2, patch);
+  });
+
+  it("Default options name their actual source and never echo a saved pin (#3255)", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    const base = settings();
+    mockApi.getMySettings.mockResolvedValue({
+      settings: {
+        ...base.settings,
+        default_claude_model: "sonnet",
+        cross_check_pins: [
+          { stage: "plan", harness: "claude", model: null, effort: null, worker_default_model: "sonnet", resolved_model: "sonnet",
+            resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: false },
+        ],
+      },
+    });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    const optionTexts = (el: HTMLElement) => Array.from((el as HTMLSelectElement).options).map((o) => o.text);
+    const claude = await screen.findByLabelText("Claude model");
+    expect(optionTexts(claude)[0]).toBe("Default · lead template");
+    expect(optionTexts(claude).join("|")).not.toMatch(/Default[^|]*sonnet/);
+    expect(optionTexts(screen.getByLabelText("Codex model"))[0]).toBe("Default · gpt-6.1-sol (built-in)");
+    expect(optionTexts(screen.getByLabelText("Summary model"))[0]).toBe("Default · instance default");
+    expect(optionTexts(screen.getByLabelText("Claude effort"))[0]).toBe("Default · medium (built-in)");
+    expect(optionTexts(screen.getByLabelText("Codex effort"))[0]).toBe("Default · medium (built-in)");
+    expect(optionTexts(screen.getByLabelText("Default harness"))[0]).toBe("Default · automatic");
   });
 
   it("both usable: shows the harness selector, both lanes, and the badge on the effective (Claude) lane", async () => {
@@ -1754,7 +1794,7 @@ it("usage-limit provider regression #2360: shared default has neutral copy", () 
 
 describe("B1 independent settings responses", () => {
   const initial: UserSettings = {
-    default_harness: null, default_model: null, default_claude_model: "opus", default_codex_model: "gpt-6.1-sol",
+    default_harness: null, harness_overflow_enabled: false, default_model: null, default_claude_model: "opus", default_codex_model: "gpt-6.1-sol",
     default_effort: "low", default_codex_effort: "low", judge_model: null, summary_model: null,
     appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
     cross_check_pins: [
@@ -1892,7 +1932,7 @@ describe("B1 independent settings responses", () => {
 
 describe("checker effort selects stay free of the preference-only runtime token (PRD #3247)", () => {
   it("offers runtime on the worker select but not on the checker select", async () => {
-    mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null, default_model: null, default_effort: "runtime",
+    mockApi.getMySettings.mockResolvedValue({ settings: { default_harness: null, harness_overflow_enabled: false, default_model: null, default_effort: "runtime",
       judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null,
       cross_check_pins: [
         { stage: "plan" as const, harness: "claude" as const, model: null, effort: null, worker_default_model: "opus", resolved_model: "opus", resolved_effort: "high", model_source: "worker default" as const, effort_source: "cross-check default" as const, active: false },
@@ -1907,7 +1947,7 @@ describe("checker effort selects stay free of the preference-only runtime token 
 
 describe("checker defaults follow committed worker settings", () => {
   it("refreshes the worker model and effort Defaults while retaining checker drafts", async () => {
-    const initial = { default_harness: null, default_model: null, default_claude_model: "opus",
+    const initial = { default_harness: null, harness_overflow_enabled: false, default_model: null, default_claude_model: "opus",
       default_effort: null, judge_model: null, summary_model: null, appearance_mode: null,
       light_theme: null, dark_theme: null, typeface: null, theme: null, cross_check_pins: [
       { stage: "plan" as const, harness: "claude" as const, model: null, effort: null, worker_default_model: "opus", resolved_model: "opus", resolved_effort: "medium", model_source: "worker default" as const, effort_source: "worker default" as const, active: false },
@@ -2210,5 +2250,86 @@ describe("Run defaults — weekly usage reserve (PRD #3522)", () => {
     }
     expect(pctInput().value).toBe("50");
     expect(reserveSwitch().getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+
+describe("harness overflow autosave", () => {
+  const label = "Overflow to the other harness when my default is near its limits";
+  const renderPage = () => render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+  const control = () => screen.getByRole("switch", { name: label }) as HTMLButtonElement;
+  const checked = () => control().getAttribute("aria-checked") === "true";
+
+  it("saves on and explicitly off, hydrates on reload, and keeps model saves independent", async () => {
+    let stored = false;
+    const initial = (await mockApi.getMySettings()).settings;
+    mockApi.getMySettings.mockImplementation(async () => ({ settings: { ...initial, harness_overflow_enabled: stored } }));
+    mockApi.setHarnessOverflow.mockImplementation(async enabled => {
+      stored = enabled;
+      return { harness_overflow_enabled: enabled };
+    });
+    const page = renderPage();
+    await waitFor(() => expect(checked()).toBe(false));
+    expect(document.getElementById(control().getAttribute("aria-describedby")!)?.textContent).toContain("Saves automatically");
+    control().focus();
+    expect(document.activeElement).toBe(control());
+    fireEvent.click(control());
+    await waitFor(() => expect(checked()).toBe(true));
+    expect(mockApi.setHarnessOverflow).toHaveBeenLastCalledWith(true);
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+    page.unmount();
+    renderPage();
+    await waitFor(() => expect(checked()).toBe(true));
+    fireEvent.click(control());
+    await waitFor(() => expect(checked()).toBe(false));
+    expect(mockApi.setHarnessOverflow).toHaveBeenLastCalledWith(false);
+    cleanup();
+    renderPage();
+    await waitFor(() => expect(checked()).toBe(false));
+  });
+
+  it.each([false, true])("retains saved %s on error and allows retry", async saved => {
+    const initial = (await mockApi.getMySettings()).settings;
+    mockApi.getMySettings.mockResolvedValue({ settings: { ...initial, harness_overflow_enabled: saved } });
+    mockApi.setHarnessOverflow.mockRejectedValueOnce(new ApiError(500, "overflow save failed"));
+    renderPage();
+    await waitFor(() => expect(checked()).toBe(saved));
+    fireEvent.click(control());
+    await screen.findByText("overflow save failed");
+    expect(checked()).toBe(saved);
+    expect(control().getAttribute("aria-disabled")).not.toBe("true");
+    mockApi.setHarnessOverflow.mockResolvedValueOnce({ harness_overflow_enabled: !saved });
+    fireEvent.click(control());
+    await waitFor(() => expect(checked()).toBe(!saved));
+    expect(screen.queryByText("overflow save failed")).toBeNull();
+  });
+
+  it.each([true, false])("merges only overflow while an independent settings save completes (overflow first: %s)", async overflowFirst => {
+    let finishOverflow!: (value: { harness_overflow_enabled: boolean }) => void;
+    let finishSettings!: (value: { settings: UserSettings }) => void;
+    const initial = (await mockApi.getMySettings()).settings;
+    mockApi.setHarnessOverflow.mockReturnValueOnce(new Promise(resolve => { finishOverflow = resolve; }));
+    mockApi.putMySettings.mockReturnValueOnce(new Promise(resolve => { finishSettings = resolve; }));
+    renderPage();
+    await screen.findByRole("switch", { name: label });
+    control().focus();
+    fireEvent.click(control());
+    expect(control().getAttribute("aria-disabled")).toBe("true");
+    expect(control().disabled).toBe(false);
+    expect(document.activeElement).toBe(control());
+    fireEvent.click(control());
+    expect(mockApi.setHarnessOverflow).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByLabelText("Model-written Now line"));
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalled());
+    const overflow = () => finishOverflow({ harness_overflow_enabled: true });
+    const settings = () => finishSettings({ settings: { ...initial, now_summary_enabled: false } });
+    (overflowFirst ? overflow : settings)();
+    await waitFor(() => expect(overflowFirst ? checked() : deliveredSettings.mock.lastCall?.[0].now_summary_enabled).toBe(overflowFirst ? true : false));
+    (overflowFirst ? settings : overflow)();
+    await waitFor(() => {
+      expect(checked()).toBe(true);
+      expect(deliveredSettings.mock.lastCall?.[0].harness_overflow_enabled).toBe(true);
+      expect(deliveredSettings.mock.lastCall?.[0].now_summary_enabled).toBe(false);
+    });
   });
 });

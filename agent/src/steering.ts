@@ -1655,6 +1655,38 @@ export class SteeringChannel {
     this.shutdownStop.abort();
   }
 
+  /** One bounded input observation for a refused capture disposition. Receipt-mode
+   * reads keep ACK/routing ownership with the poller and verify cancellation ownership.
+   * Legacy GET already consumed its rows, so route them here with the normal dedupe.
+   * The caller supplies the existing capture signal; this adds no retry loop. */
+  async observePendingCancellation(signal: AbortSignal): Promise<void> {
+    if (!Number.isSafeInteger(this.claimGeneration) || this.claimGeneration <= 0 ||
+        this.fence !== undefined || this.terminalLifecycle.signal.aborted) return;
+    const reply = await this.client.getInputs(this.runId, this.claimGeneration, signal, 64 * 1024);
+    signal.throwIfAborted();
+    if (this.fence !== undefined || this.terminalLifecycle.signal.aborted || reply.staleObservation ||
+        reply.terminalCancelled || !validBatch(reply.inputs)) return;
+    if (!reply.receipts) {
+      // Legacy GET already consumed this batch. Preserve its normal FIFO routing
+      // and metadata; it has no receipt ACK/APPLIED phase to replay it later.
+      for (const input of reply.inputs) {
+        if (this.routedIds.has(input.id)) continue;
+        this.routedIds.add(input.id);
+        this.route(input.kind, input.body ?? undefined, input.id, false, input.created_at, parseGateBinding(input));
+      }
+      return;
+    }
+    if (!reply.inputs.some(input => input.kind === "cancel")) return;
+    // Receipt-mode GET is read-only and does not fence its generation. Recheck the
+    // existing ownership seam after reading; generation is monotonic, and reports
+    // remain fenced server-side if ownership changes again after this observation.
+    const owner = await this.client.getRunOwnership(this.runId, signal);
+    signal.throwIfAborted();
+    if (this.fence === undefined && !this.terminalLifecycle.signal.aborted &&
+        owner.status === "running" && owner.claim_generation === this.claimGeneration &&
+        owner.claim_released === false) this.markCancelled();
+  }
+
   /** Register the re-armable pause-now interrupt (see pauseNowInterrupt, PRD #1190 rework N2).
    *  Last-wins; the runner wires it to the executor's per-run trip so a `now` pause drops the
    *  current turn even after the shared abort controller has been spent by an earlier `now`. */

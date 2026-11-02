@@ -97,8 +97,17 @@ flowchart LR
 cutting; publication watching retains its 60-minute bound, within a 120-minute
 post-push recovery allowance and enclosing job timeouts. No morning cutoff
 applies to dispatch. A single allowlisted infrastructure rerun of pre-cut main
-CI cannot replenish when main moves. Unknown steps and test/assertion failures
-stop. Existing non-gate publication retries retain their two-rerun budget when watch runs.
+CI cannot replenish when main moves. Manual preparation stops on unknown steps
+and test/assertion failures. Scheduled preparation may instead observe an outside
+rerun of an ineligible failed CI attempt until its existing absolute tip deadline
+(#3799); it never requests that rerun. Only a strictly newer attempt of the same
+run and SHA can prove success, with same-SHA smoke still required. A failed
+outside attempt stops with `tip-ci-retry-failed`; unresolved or stale evidence
+expires as `tip-not-green-by-cutoff`. Main movement reselects/replans without
+extending the deadline or restoring the infrastructure budget. Observations keep
+external provenance in the journal/report. This marker is separate from the
+unchanged 60-second start grace and failure disposition for our own infrastructure
+request. Existing non-gate publication retries retain their two-rerun budget when watch runs.
 
 **3e-3 separates observation from new recovery policy.** One Python engine and
 the existing shell entry point retain publication's per-workflow retry budgets,

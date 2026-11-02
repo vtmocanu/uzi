@@ -5861,6 +5861,7 @@ async function issue3561RunnerCase(route: "terminal settlement" | "retained capt
       f.log, 20, "local-worker-fixture", { recovery: f.coordinator });
     const r = runner as any;
     const flight: any = {
+      iterationParkState: "none" as const,
       runId: f.context.runId, claimGeneration: 7, runKind: "issue", inventoryGuarded: true,
       barePath: f.context.barePath, branch: f.context.branch, worktreePath: path.join(f.root, "kept-clone"),
       owedContext: Promise.resolve(f.context), owedAnnounced: { heads: new Set(), archived: new Set() },

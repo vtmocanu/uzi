@@ -168,9 +168,11 @@ delete, database override, attempt reset, pointer clearing or owner/custodian
 shortcut is authorized. Escalation requires a separate contract decision.
 
 External pin deletion/history rewrite can defeat restore, following ADR-1296's
-accepted external-writer residual. Pins can retain pre-purge history under
-`refs/uzi-*`; this ADR grants no history/privacy purge authorization or
-permission to erase server evidence.
+accepted external-writer residual. Separately, pins can retain pre-purge history
+under `refs/uzi-*`. O10/S7 authorizes automatic cleanup only after capture
+expiry/discard, with expected-tip CAS deletion and confirmed absence; unknown
+creates and cleanup exhaustion keep their blockers. This ADR grants no
+history/privacy purge authorization or permission to erase server evidence.
 
 ## Local evidence and remaining acceptance
 
@@ -244,3 +246,32 @@ Admission bound: each closure-backed FINAL that survives the unlocked precheck a
 Coordination with #2884: it also rebuilds the `recovery_inventory_hold_guard` function and the release-evidence CHECK. Whichever lands second must rebuild from the other's live body rather than from its own copy; neither migration may drop the other's branch or constraint value.
 
 Evidence: the store, recovery, workersvc and handler LiveDB tests listed in the PRD's C2 execution record, and the opt-in combined proof `TestPrerequisiteClosureReleaseE2E`. Exact-head CI, a full store-it sweep and any live GitHub.com observation are not claimed here.
+
+## Amendment (2026-11-01, #3728 C3): persisted owner visibility
+
+The owner capture DTO optionally projects the identity-matched persisted closure:
+eight durable states (`pending`, `invoked`, `create_unknown`, `pinned`,
+`refused`, `foreign`, `lost`, `deleted`), a bounded reason, fixed pin ref,
+optional tip, independent absence/cleanup-exhaustion flags and record update
+time. This is not worker readiness or a fresh forge probe. Unknown outcomes can
+persist indefinitely; recorded pin protection remains conditional on external
+refs surviving. Cleanup exhaustion stops automatic deletes and grants no manual
+permission, including when absence is also unconfirmed.
+
+No matching row and older APIs omit the projection; self-contained manifests
+need no pin. The owner summary retains complete history with two SQL queries,
+without a row/response-size bound or per-capture forge lookups. An available
+archive remains exportable independently of pins; CLI `verified` continues to
+mean byte-count/checksum verification. No visibility field grants custody,
+latest-local-coverage, publication or physical-retirement authority.
+
+The [restore guide](../docs/run-recovery.md#restoring-with-a-confirmed-pin)
+selects the exact capture, exports with the existing command, fetches a validated
+UUID-derived fixed ref into the same namespace and compares its full recorded tip
+before native bundle verification/import. It then checks source SHA/tree/content;
+a synthetic coverage commit is distinct from an attempted publication head.
+The [local E5 record](../prds/2506-prerequisite-closure.md#c3-local-e5-measurement-2026-11-01-3728)
+covers owned native transport, full 2,405-commit input and a generated 26-byte
+file; it is not hosted GitHub latency, a C2 FINAL or parent release acceptance.
+C3 local validation is recorded in the PRD; required exact-head landing checks,
+parent acceptance and post-roll E6 remain open.

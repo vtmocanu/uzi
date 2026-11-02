@@ -80,7 +80,7 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 		rows = append(rows, []string{"BAKED_GUIDANCE", strOr(s.BakedGuidance, "-")})
 	}
 	rows = append(rows,
-		[]string{"MODEL", strOr(s.Model, "-")},
+		[]string{"MODEL", strOr(s.Model, "default (worker model)")},
 		[]string{"APPLY_MODEL_TO_AGENTS", boolStr(s.OverrideSubagentModel != nil && *s.OverrideSubagentModel)},
 		[]string{"AUTO_APPROVE", boolStr(s.AutoApprove)},
 		[]string{"WAIT_ON_LIMIT", boolStr(s.WaitOnLimit)},

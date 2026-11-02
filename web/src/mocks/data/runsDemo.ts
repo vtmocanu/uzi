@@ -66,6 +66,7 @@ export const mockDegradedMessages: RunMessage[] = [
 
 function demoIssueRun(over: Partial<Run> & Pick<Run, "id" | "status" | "health">): Run {
   return {
+    harness_decision: null,
     repo_id: "repo-uzi",
     issue_iid: 24,
     issue_title: over.issue_title ?? "Crew roster demo run",

@@ -180,14 +180,15 @@ STUB
 # listing and passes the concrete selected clone to the capture, which is the
 # production behavior under test.
 run_backup() {
-  local dest="$WORK/out.$1"; local rid="${2:-run-4242}"
+  local dest="$WORK/out.$1"; local rid="${2:-run-4242}"; local rc=0
   rm -rf "$dest"
   UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo \
     UZI_RUNNER_BASE="${TEST_RUNNER_BASE:-$WORK/runner}" \
     UZI_REPOS_BASE="$REPOS" \
     UZI_BACKUP_DIR="$dest" UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" \
-    bash "$SCRIPT" "$rid" >/dev/null 2>&1
+    bash "$SCRIPT" "$rid" >/dev/null 2>&1 || rc=$?
   echo "$dest/latest"
+  return "$rc"
 }
 
 WID=w0rker
@@ -204,7 +205,18 @@ git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
   "{\"runId\":\"run-4242\",\"clonePath\":\"$RUNNER\"}"
 echo dirty >> "$RUNNER/f.txt"   # uncommitted change only
 
-L1="$(run_backup 1)"
+# The standalone coordinator compatibility proof supplies authentic signed bytes.
+# These are opaque untracked clone payloads, not Git-config attribution descriptors.
+if [ -n "${UZI_TEST_SIGNED_JSON_INPUT:-}${UZI_TEST_SIGNED_JSON_OUTPUT:-}" ]; then
+  [ -n "${UZI_TEST_SIGNED_JSON_INPUT:-}" ] && [ -n "${UZI_TEST_SIGNED_JSON_OUTPUT:-}" ] \
+    || fail "signed payload: both input and output directories are required"
+  for phase in before after; do
+    cp -p "$UZI_TEST_SIGNED_JSON_INPUT/$phase.json" "$RUNNER/compat-$phase.json" \
+      || fail "signed payload: copy $phase"
+  done
+fi
+
+L1="$(run_backup 1)" || fail "case1: real backup script failed"
 [ -f "$L1/issue-4242.tgz" ] || fail "case1: no .tgz produced"
 if tar tzf "$L1/issue-4242.tgz" 2>/dev/null | grep -q 'issue-4242[.]bundle'; then
   fail "case1: .tgz contains a bundle (full-history dump not skipped)"
@@ -213,6 +225,22 @@ grep -q "^.*PART .*run-4242" "$L1/backup.log" || fail "case1: expected PART in l
 tar tzf "$L1/issue-4242.tgz" 2>/dev/null | grep -q 'issue-4242[.]uncommitted[.]patch' \
   || fail "case1: uncommitted.patch missing (the work was not captured)"
 echo "PASS case1: uncommitted-only -> no bundle, PART, patch kept"
+
+if [ -n "${UZI_TEST_SIGNED_JSON_INPUT:-}" ]; then
+  mkdir "$WORK/signed-outer" "$UZI_TEST_SIGNED_JSON_OUTPUT" || fail "signed payload: output directories"
+  tar -xzf "$L1/issue-4242.tgz" -C "$WORK/signed-outer" || fail "signed payload: outer archive"
+  tar -xzf "$WORK/signed-outer/issue-4242.untracked.tar.gz" -C "$UZI_TEST_SIGNED_JSON_OUTPUT" \
+    || fail "signed payload: untracked archive"
+  for phase in before after; do
+    cmp "$UZI_TEST_SIGNED_JSON_INPUT/$phase.json" "$UZI_TEST_SIGNED_JSON_OUTPUT/compat-$phase.json" \
+      || fail "signed payload: changed $phase bytes"
+    rm "$RUNNER/compat-$phase.json" || fail "signed payload: fixture cleanup"
+  done
+  echo "PASS signed payload: authentic coordinator bytes retained through real backup archive"
+  # The historical-reader proof has a per-test budget; ordinary suite runs
+  # continue through every backup case without this explicit focused selector.
+  [ "${UZI_TEST_SIGNED_JSON_ONLY:-}" != 1 ] || exit 0
+fi
 
 # The worker container can exec as a different UID than the runner clone owner.
 # Git then refuses every clone operation unless this exact clone is trusted.

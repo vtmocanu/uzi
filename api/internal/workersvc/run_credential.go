@@ -391,7 +391,7 @@ func (s *Service) setCredentialAndPromote(ctx context.Context, observed store.Ru
 
 // resumePausedForCredential is the paused arm of `uzi run set-token`: it resumes any paused run
 // the way the owner's resume does (PRD #1497 M1), with AllowCompletionBlockedHold so a completion
-// hold still resumes here as before. A budget_exhausted wall park with no remaining budget is
+// hold still resumes here as before. Wall and iteration holds with no remaining wall budget are
 // refused by the budget guard (0 rows -> ErrCredentialSwitchRaced); the owner extends such a run
 // rather than set-token-ing it. A provider hold's streak is cleared by ResumePausedRun itself.
 func (s *Service) resumePausedForCredential(ctx context.Context, userID, runID uuid.UUID) error {

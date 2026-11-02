@@ -53,6 +53,7 @@ class LiveSocket {
 
 function fakeRun(): Run {
   return {
+    harness_decision: null,
     id: "run-1",
     repo_id: "repo-1",
     kind: "issue",

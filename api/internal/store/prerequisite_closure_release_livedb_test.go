@@ -526,11 +526,14 @@ func TestPrerequisiteClosureReleaseMigrationRoundTripLiveDB(t *testing.T) {
 
 func TestPrerequisiteClosureReleaseDownRefusalLiveDB(t *testing.T) {
 	ctx, dsn, pool := prerequisiteMigratedPool(t, "closure_release_down_")
+	// Seed through the current run projection before removing later run columns.
+	// The fixture has no policy constraint, so rolling back that migration leaves
+	// the closure evidence unchanged for the 00393 Down assertions below.
+	f := closureReady(t, ctx, prerequisiteNew(t, ctx, pool))
 	if err := store.MigrateDownTo(ctx, dsn, closureReleaseMigration); err != nil {
 		t.Fatal(err)
 	}
 	prerequisiteSchemaVersion(t, ctx, pool, closureReleaseMigration)
-	f := closureReady(t, ctx, prerequisiteNew(t, ctx, pool))
 	// A pinned closure without release evidence rolls back and forward cleanly.
 	if err := store.MigrateDownTo(ctx, dsn, closureReleasePrevMigration); err != nil {
 		t.Fatalf("Down with an unreleased closure: %v", err)

@@ -326,6 +326,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// PRD #1809 M5: the disk-only lifetime counter of counted data_volume_full parks.
 		DiskParkCount: int(r.DiskParkCount),
 		// PRD #1733: the open provider-park streak (count, and when it began; null when none).
+		PolicyHold:                  policyHoldDTO(r),
 		ProviderParkCount:           int(r.ProviderParkCount),
 		ProviderParkStreakStartedAt: timePtr(r.ProviderParkStreakStartedAt.Valid, r.ProviderParkStreakStartedAt.Time),
 		// PRD #1809 M6 (D8): the latest park's checkpoint-durability report (absent = not reported).
@@ -924,4 +925,24 @@ func overlayAdmissionReason(reason *string, queueReason string, class *string, e
 		return reason
 	}
 	return &current
+}
+
+// harnessDecisionForViewer projects quota evidence only for the owner. Generic
+// runToDTO and worker responses leave it null, including admin mutation responses.
+func harnessDecisionForViewer(r store.Run, viewer store.User) *apitypes.HarnessDecisionDTO {
+	if viewer.ID == uuid.Nil || viewer.ID != r.UserID || !r.HarnessDecisionReason.Valid || !r.HarnessPreferred.Valid {
+		return nil
+	}
+	nullableFloat := func(v pgtype.Float8) *float64 {
+		if !v.Valid {
+			return nil
+		}
+		return &v.Float64
+	}
+	return &apitypes.HarnessDecisionDTO{
+		Preferred: r.HarnessPreferred.String, Chosen: r.Harness, Reason: r.HarnessDecisionReason.String,
+		PreferredScore: nullableFloat(r.HarnessPreferredScore), OtherScore: nullableFloat(r.HarnessOtherScore),
+		PreferredMeasured: nullableFloat(r.HarnessPreferredMeasured), OtherMeasured: nullableFloat(r.HarnessOtherMeasured),
+		PreferredHeld: r.HarnessPreferredHeld.Bool, OtherHeld: r.HarnessOtherHeld.Bool,
+	}
 }

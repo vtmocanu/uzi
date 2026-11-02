@@ -184,9 +184,10 @@ A few things worth knowing:
   resend. A Slack thread reply is shorter still: anything past 2,000
   characters is cut before it is sent, so answer long data on the web or CLI.
 - **Nobody answers ⇒ the run fails**, "clarification timed out", once the
-  answer deadline passes (`QUESTION_TIMEOUT_SECONDS`, 24h by default) — there
-  is no configurable default action. The timer is held by the worker, so if
-  it dies and the run is picked up again the clock restarts. With no other
+  run has spent its answer budget parked on questions (`QUESTION_TIMEOUT_SECONDS`,
+  24h by default; time spent working or at the plan gate between questions is not
+  counted) — there is no configurable default action. The budget is held by the
+  worker, so if it dies and the run is picked up again it restarts. With no other
   fresh executor execution, worker-death retries contribute
   `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` — 96h on defaults.
   The question cap (`QUESTION_MAX`, default 5 per attempt) resets the same
@@ -219,7 +220,7 @@ plain text, never markdown), and, on an attended (non-autopilot) run, the run pa
 `awaiting_input` on a uzi-authored question headed **Plan missing**. Answering
 with guidance resumes planning in the same session, but that answer is never
 plan approval: a plan still has to be submitted and go through the approval
-gate. You can also cancel the run instead. The usual answer deadline applies.
+gate. You can also cancel the run instead. The usual answer budget applies.
 There's no "revise the PRD and retry" option here: to change the PRD or issue,
 cancel and re-dispatch. If planning is still prose-only after your guidance,
 or the run is autopilot (or otherwise has no one to ask), the run fails

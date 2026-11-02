@@ -49,6 +49,7 @@ export const chatApi = {
   createChat: async (message: string) => {
     const now = new Date().toISOString();
     const run: Run = {
+      harness_decision: null,
       id: nextRunId(),
       repo_id: null,
       forge_type: "",

@@ -92,6 +92,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
     "completion-worker-fixture", { recovery, outbox });
   const body: StateRequest = { ...wire.request, branch };
   const flight = {
+    iterationParkState: "none" as const,
     runId: receipt.run_id, claimGeneration: 1, inventoryGuarded: guarded, runKind: kind,
     terminalResolved: false, completionSendAttempted: false, successfulPushedSha: literal.final_head,
     batcher: { currentSeq: () => 7, close: async () => {}, awaitPermanentFailureSettled: async () => {}, emit: () => events.push("failed-feed") },
@@ -604,12 +605,22 @@ it("feature loss replays outbound copy without rewriting original stored body", 
   try {
     f.lose(true);
     await f.terminal();
+    const storedPath = path.join(f.root, "outbox", f.receipt.run_id, "terminal-1.json");
+    const storedBytes = await fs.readFile(storedPath);
     const original = await f.outbox!.readTerminalJournal(f.receipt.run_id, 1);
+    assert.ok(original);
+    assert.equal(original.server_settled, undefined);
+    assert.equal(original.body.completion_final_head, literal.final_head);
+    const originalBody = canonicalJson(original.body);
     f.lose(false);
     await f.disable();
     await f.replay();
     assert.equal(f.sent.at(-1)?.completion_final_head, undefined);
-    assert.equal(canonicalJson(await f.outbox!.readTerminalJournal(f.receipt.run_id, 1)), canonicalJson(original));
+    assert.deepEqual(await fs.readFile(storedPath), storedBytes);
+    const replayed = await f.outbox!.readTerminalJournal(f.receipt.run_id, 1);
+    assert.ok(replayed);
+    assert.equal(canonicalJson(replayed.body), originalBody);
+    assert.equal(replayed.server_settled, true);
   } finally { await f.close(); }
 });
 

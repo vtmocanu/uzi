@@ -461,6 +461,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
+	dto.HarnessDecision = harnessDecisionForViewer(run, user)
 	dto.CapabilityProvenance = workersvc.CapabilityProvenanceForRun(run)
 	if user.ID == run.UserID {
 		dto.CompletionPending, err = workersvc.CompletionPending(run)
@@ -733,6 +734,9 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	if reason, reporter, ok := h.wsvc.RunBlockedOutcome(run.ID); ok &&
 		run.WorkerID.Valid && uuid.UUID(run.WorkerID.Bytes) == reporter {
 		dto.OutcomePending = &apitypes.OutcomePendingDTO{Reason: reason}
+	}
+	if dto.OutcomePending == nil && h.wsvc.RunPolicyOutcomePending(run) {
+		dto.OutcomePending = &apitypes.OutcomePendingDTO{Reason: apitypes.OutcomePendingPolicyHold}
 	}
 	// PRD #37 M4-fix: resolve the owner's OWN-source roster here, on the detail read,
 	// so the plan-gate picker sources its "My agent templates" chips from exactly the

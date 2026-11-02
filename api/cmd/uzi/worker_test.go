@@ -14,6 +14,18 @@ import (
 // steady state (no outbox), the pending-message count when the worker buffered
 // updates during an api outage, and a "(blocked)"/"blocked" annotation when an
 // outcome is held.
+func TestWorkerListRootDiagnosticPreservesBlocked(t *testing.T) {
+	reason, blocked := "symlink", "reserve_exhausted"
+	w := apitypes.WorkerDTO{OutboxRootUnusable: &reason, OutboxBlocked: &blocked}
+	if got := outboxCell(w); got != "blocked (disabled:symlink)" {
+		t.Fatalf("got %q", got)
+	}
+	w.OutboxBlocked = nil
+	if got := outboxCell(w); got != "disabled:symlink" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestWorkerListShowsOutboxColumn(t *testing.T) {
 	four := 4
 	zero := 0

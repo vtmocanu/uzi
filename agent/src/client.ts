@@ -1,3 +1,4 @@
+import { validatePolicyHoldRequest, decodePolicyHoldReply, POLICY_HOLD_MAX_BYTES } from "./protocol.js";
 import { decodeCodexOperationDecision, validCodexOperationRequest } from "./codex-operation-admission.js";
 import type { CodexOperationRequest, CodexOperationDecision } from "./protocol.js";
 import { CodexAdmissionReporter } from "./codex/admission-signal.js";
@@ -64,6 +65,9 @@ import {
   type CompletionPermitRequest,
   type CompletionPermitResponse,
   type WallParkRequest,
+  type IterationParkRequest,
+  type IterationParkResult,
+  type IterationParkRefusalReason,
   type ReportFindingRequest,
   type HeartbeatRequest,
   type DindMaintenance,
@@ -1267,6 +1271,7 @@ const PUBLICATION_HOLD_REASONS: ReadonlySet<string> = new Set([
 export class WorkerClient {
   private registeredWorkerId: string | undefined;
   private hasExactHoldCapability = false;
+  private hasBindinglessHoldCapability = false;
   /** Issue #3142: this registration advertised worker_memory_authority_claim_v1. */
   private hasMemoryAuthorityClaimCapability = false;
   private memoryAuthorityLostLogged = false;
@@ -1426,7 +1431,7 @@ export class WorkerClient {
   }
 
   private sealCodexAdmission(path: string, body: unknown): void {
-    const match = /^\/api\/worker\/runs\/([^/]+)\/(state|cross-check-verdict|wall-park|pause|completion\/hold|base-attestation-hold|completion\/attempt|archives\/release)$/.exec(path);
+    const match = /^\/api\/worker\/runs\/([^/]+)\/(state|cross-check-verdict|wall-park|iteration-park|pause|completion\/hold|base-attestation-hold|completion\/attempt|archives\/release)$/.exec(path);
     if (!match || !isRecord(body)) return;
     const runId = decodeURIComponent(match[1]!);
     const owned = this.codexAdmission.get(runId);
@@ -1577,6 +1582,17 @@ export class WorkerClient {
    *  capability-aware degradation for a pre-clone forge-unreachable park. Backed by
    *  `serverFeatures` so the two views never diverge and a rollback clear empties both. The
    *  setter routes through the same set (a test that skips register can seed it directly). */
+  /** Both sides must have negotiated the compact contract; this does not advertise readiness. */
+  get supportsScopedPendingClaim(): boolean {
+    return this.hasFeature("pending_outcome_scoped_claim_v1") &&
+      this.registrationReport?.protocol_capabilities.includes("pending_outcome_scoped_claim_v1") === true;
+  }
+
+  get supportsPolicyHold(): boolean {
+    return this.hasFeature("provider_policy_hold_v1") &&
+      this.registrationReport?.protocol_capabilities.includes("provider_policy_hold_v1") === true;
+  }
+
   get protocolFeatures(): string[] {
     return [...this.serverFeatures];
   }
@@ -1754,7 +1770,11 @@ export class WorkerClient {
   }
 
   private snapshotForServer(snapshot: ActiveSnapshot): ActiveSnapshot {
-    return { ...snapshot, active: snapshot.active.map(entry => {
+    const { pending_policy_protection, pending_inventory_incomplete, ...legacy } = snapshot;
+    return { ...legacy,
+      ...(this.supportsScopedPendingClaim && pending_policy_protection !== undefined ? { pending_policy_protection } : {}),
+      ...(this.supportsScopedPendingClaim && pending_inventory_incomplete === true ? { pending_inventory_incomplete } : {}),
+      active: snapshot.active.map(entry => {
       const { account_cooldown, ...rest } = entry;
       return (this.hasFeature("codex_account_operation_admission_v1") ||
         this.operationFlights.get(entry.run_id)?.generation === entry.claim_generation) && account_cooldown !== undefined
@@ -1780,6 +1800,7 @@ export class WorkerClient {
     this.inputObservationEpoch++;
     this.registeredWorkerId = undefined;
     this.hasExactHoldCapability = false;
+    this.hasBindinglessHoldCapability = false;
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
     this.registrationReport = undefined;
@@ -1848,6 +1869,7 @@ export class WorkerClient {
     // are fenced server-side) even when a one-shot register missed the negotiated feature.
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
     this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
+    this.hasBindinglessHoldCapability = originalCapabilities?.includes("recovery_bindingless_closed_v1") ?? false;
     this.hasMemoryAuthorityClaimCapability = originalCapabilities?.includes("worker_memory_authority_claim_v1") ?? false;
     // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
     // ActiveSnapshot the worker sends. A string only (defensive); absent on an older api ⇒
@@ -1919,9 +1941,11 @@ export class WorkerClient {
     activeSnapshot?: ActiveSnapshot,
     maintenance?: { sample?: DindMeterSample | null; ack?: DindMaintenanceReadyACK },
     quarantine?: ResidueQuarantineState,
+    outboxRootUnusable?: "symlink" | "unreadable",
   ): Promise<boolean | undefined> {
     this.latestDindMaintenanceValue = undefined;
     const body: HeartbeatRequest = { version: this.version };
+    if (this.hasFeature("heartbeat_outbox_root_unusable")) body.outbox_root_unusable = outboxRootUnusable ?? null;
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
     // bytes and a collector-less tick is indistinguishable from an old worker.
@@ -1974,11 +1998,17 @@ export class WorkerClient {
       };
     }
     const includeExtension = body.protocol_refresh !== undefined || includeOutbox || includeSnapshot || body.dind_meter !== undefined ||
-      body.dind_maintenance_ready_ack !== undefined || includeQuarantine;
+      body.dind_maintenance_ready_ack !== undefined || includeQuarantine || body.outbox_root_unusable !== undefined;
     try {
       try {
         return await this.postHeartbeat(body);
       } catch (err) {
+        // A diagnostic rejected after API rollback must not strip protection fields.
+        if (body.outbox_root_unusable !== undefined && isStrictDecodeError(err)) {
+          delete body.outbox_root_unusable;
+          this.dropFeature("heartbeat_outbox_root_unusable");
+          return await this.postHeartbeat(body);
+        }
         // A stale ACK gets one ACK-free resync; sibling extensions remain intact.
         // Any failure of that request reaches the usual strict-decode fallback below.
         if (!body.dind_maintenance_ready_ack || !(err instanceof RequestError) || err.status !== 409) throw err;
@@ -2509,6 +2539,17 @@ export class WorkerClient {
     return ack;
   }
 
+  /** One bounded attempt. No legacy /state fallback or generation downgrade is safe here. */
+  async reportPolicyHold(runId: string, body: import("./protocol.js").PolicyHoldRequest, signal?: AbortSignal): Promise<import("./protocol.js").PolicyHoldReply> {
+    const request = validatePolicyHoldRequest(body);
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/policy-hold`;
+    const res = await this.fetchRaw("POST", path, request, this.httpTimeoutMs, signal);
+    if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
+    const reply = decodePolicyHoldReply(JSON.parse(await readBoundedText(res, POLICY_HOLD_MAX_BYTES, true, signal)), request);
+    if ((res.status === 409) !== (reply.disposition === "pending")) throw new Error("invalid policy hold HTTP disposition");
+    return reply;
+  }
+
   /**
    * Report a run state and return what the server made of it. Every report —
    * terminal (completed/failed) and non-terminal (running/awaiting_approval/
@@ -2535,8 +2576,21 @@ export class WorkerClient {
    * so parsing a 409's status back out of the error text would work in tests and
    * fail on real runs.
    */
-  async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
+  async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal,
+    options?: { iterationCancellation?: true }): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    if (options?.iterationCancellation) {
+      // Snapshot before any asynchronous work; only the iteration sink cancellation
+      // may bypass compatibility negotiation, with its exact claim authority intact.
+      const frozen = Object.freeze(structuredClone(body));
+      if (frozen.status !== "failed" || frozen.failure_reason !== "run cancelled" ||
+          !Number.isSafeInteger(frozen.claim_generation) || (frozen.claim_generation ?? 0) <= 0 ||
+          (frozen.session_id !== undefined && typeof frozen.session_id !== "string") ||
+          Object.keys(frozen).some(key => !["status", "failure_reason", "claim_generation", "session_id"].includes(key)))
+        throw new Error("iteration cancellation requires exact cancellation body and positive generation");
+      this.sealCodexAdmission(path, frozen);
+      return this.reportStateOnce(runId, path, frozen, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+    }
     this.sealCodexAdmission(path, body);
     if (body.source_publication !== undefined) {
       // Snapshot nested proof once, before either transport retries or caller mutation.
@@ -3465,9 +3519,57 @@ export class WorkerClient {
     if (incarnation !== this.completionIncarnation || worker !== this.registeredWorkerId ||
         !this.hasExactHoldCapability ||
         !isRecord(body) || body.run_id !== runId || !isRecord(body.exact_hold)) return undefined;
-    const value = body.exact_hold;
-    if (value.run_id !== runId || value.generation !== generation || value.hold_id !== expected.holdId ||
-        value.repo_id !== expected.repoId || value.original_worker_id !== worker ||
+    return this.validateExactRecoveryHold(body.exact_hold, runId, generation, worker, expected);
+  }
+
+  /** Authenticated observation without local hold/repo binding. Closed facts may
+   * support refusal-only persistence; never an ACK, cleanup or producer authority. */
+  async getBindinglessRecoveryHold(
+    runId: string,
+    generation: number,
+    signal?: AbortSignal,
+  ): Promise<RecoveryExactHold | undefined> {
+    const supported = () => this.hasBindinglessHoldCapability && this.hasFeature("recovery_bindingless_closed_v1");
+    const worker = this.registeredWorkerId;
+    if (!supported() || !worker || !terminalUUID(runId) || !terminalGeneration(generation) || generation <= 0)
+      return undefined;
+    const epoch = this.inputObservationEpoch;
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds?generation=${generation}`;
+    const res = await this.fetchRaw("GET", path, undefined, this.httpTimeoutMs, signal);
+    if (res.status !== 200 || res.headers.get("Uzi-Recovery-Observation") !== "recovery_bindingless_closed_v1") {
+      if (ownedResponses.has(res)) await discardResponse(res);
+      else void res.body?.cancel().catch(() => undefined);
+      MaintenanceResources.checkIfActive();
+      MaintenanceBudget.current()?.check();
+      MaintenanceBudget.signal()?.throwIfAborted();
+      signal?.throwIfAborted();
+      return undefined;
+    }
+    let body: unknown;
+    try { body = JSON.parse(await readBoundedText(res, COMPLETION_HOLDS_MAX_BYTES, true, signal)); }
+    catch {
+      MaintenanceResources.checkIfActive();
+      MaintenanceBudget.current()?.check();
+      MaintenanceBudget.signal()?.throwIfAborted();
+      signal?.throwIfAborted();
+      return undefined;
+    }
+    MaintenanceResources.checkIfActive();
+    MaintenanceBudget.current()?.check();
+    MaintenanceBudget.signal()?.throwIfAborted();
+    signal?.throwIfAborted();
+    if (epoch !== this.inputObservationEpoch || worker !== this.registeredWorkerId || !supported() ||
+        !isRecord(body) || body.run_id !== runId || !isRecord(body.exact_hold)) return undefined;
+    return this.validateExactRecoveryHold(body.exact_hold, runId, generation, worker);
+  }
+
+  private validateExactRecoveryHold(
+    value: Record<string, unknown>, runId: string, generation: number, worker: string,
+    expected?: { holdId: string; repoId: string },
+  ): RecoveryExactHold | undefined {
+    if (value.run_id !== runId || value.generation !== generation || !terminalUUID(value.hold_id) || !terminalUUID(value.repo_id) ||
+        (expected !== undefined && (value.hold_id !== expected.holdId || value.repo_id !== expected.repoId)) ||
+        value.original_worker_id !== worker ||
         typeof value.original_worker_identity !== "string" || !value.original_worker_identity.trim() ||
         value.inventory_guarded !== true || (value.run_worker_id !== undefined && !terminalUUID(value.run_worker_id)) ||
         (value.recovery_wait_cause !== undefined && typeof value.recovery_wait_cause !== "string") || !terminalGeneration(value.current_claim_generation) ||
@@ -3684,13 +3786,13 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string, claimGeneration?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
+  async getInputs(runId: string, claimGeneration?: number, signal?: AbortSignal, maxResponseBytes?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
     const epoch = this.inputObservationEpoch;
     let res: InputsResponse;
     try {
-      res = (await this.inputJSON("GET", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs${query}`)) as InputsResponse;
+      res = (await this.inputJSON("GET", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs${query}`, undefined, signal, maxResponseBytes)) as InputsResponse;
     } catch (err) {
       if (epoch !== this.inputObservationEpoch) return { inputs: [], staleObservation: true };
       throw err;
@@ -4370,6 +4472,51 @@ export class WorkerClient {
     });
   }
 
+  /** One fenced request; the caller owns episode retries. All response bodies are bounded before
+   * decoding, including errors. Unknown delivery never becomes a generic run failure. */
+  async reportIterationPark(runId: string, request: IterationParkRequest, signal?: AbortSignal): Promise<IterationParkResult> {
+    const body = { ...request };
+    const positiveGeneration = (value: unknown): value is number =>
+      typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+    const positiveInt = (value: unknown): value is number =>
+      positiveGeneration(value) && value <= 2147483647;
+    if (!isRecord(body) || !positiveGeneration(body.claim_generation) || !positiveInt(body.iteration_count)
+      || !positiveInt(body.max_iterations) || body.iteration_count < body.max_iterations
+      || body.iteration_count - body.max_iterations > 1 || typeof body.head !== "string"
+      || Buffer.from(body.head, "utf8").toString("utf8") !== body.head || Buffer.byteLength(body.head, "utf8") > 128
+      || typeof body.published !== "boolean"
+      || (body.checkpoint_contains_latest !== undefined && typeof body.checkpoint_contains_latest !== "boolean"))
+      throw new Error("invalid iteration park evidence");
+    const serialized = JSON.stringify(body);
+    const keys = ["claim_generation", "iteration_count", "max_iterations", "head", "published", "checkpoint_contains_latest"];
+    if (Buffer.byteLength(serialized, "utf8") > 16 * 1024
+      || Object.keys(body).some(key => !keys.includes(key)))
+      throw new Error("invalid iteration park evidence");
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/iteration-park`;
+    const deadline = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(this.httpTimeoutMs)]);
+    try {
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, deadline);
+      const raw = await readBoundedBytes(res, 16 * 1024, true, deadline);
+      const ack: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
+      if (!isRecord(ack)) return { outcome: "unknown" };
+      if (res.status === 200 && ack.applied === true && ack.status === "paused"
+        && ack.hold_reason === "iteration_budget_exhausted" && ack.claim_generation === body.claim_generation)
+        return { outcome: "parked" };
+      const reasons: readonly IterationParkRefusalReason[] = ["prior_attempt", "ineligible_lane", "not_running",
+        "allowance_mismatch", "stale_claim", "released_claim", "pending_control"];
+      const statuses = ["queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup",
+        "pool_wait", "limit_wait", "recovery_wait", "paused", "completed", "failed", "cancelled"];
+      if (res.status === 409 && ack.applied === false && typeof ack.reason === "string"
+        && reasons.includes(ack.reason as IterationParkRefusalReason) && typeof ack.status === "string"
+        && statuses.includes(ack.status) && positiveGeneration(ack.claim_generation) && typeof ack.hold_reason === "string")
+        return { outcome: "refused", reason: ack.reason as IterationParkRefusalReason,
+          status: ack.status, claimGeneration: ack.claim_generation };
+      return { outcome: "unknown" };
+    } catch {
+      return { outcome: "unknown" };
+    }
+  }
+
   /** Request an ordinary pause. A running ACK records intent; only a paused status confirms a park.
    * One HTTP attempt, bounded by httpTimeoutMs, with no generation or owner fallback. */
   async requestWorkerPause(runId: string, claimGeneration: number, signal?: AbortSignal): Promise<StateAck> {
@@ -4956,15 +5103,17 @@ export class WorkerClient {
 
   /** Input polling/receipts share one deadline through response-body consumption, including
    * injected transports whose Response stream does not inherit fetch's abort signal. */
-  private async inputJSON(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown> {
-    const signal = AbortSignal.timeout(this.httpTimeoutMs);
+  private async inputJSON(method: "GET" | "POST", path: string, body?: unknown, callerSignal?: AbortSignal,
+    maxResponseBytes = Number.MAX_SAFE_INTEGER): Promise<unknown> {
+    const signal = AbortSignal.any([AbortSignal.timeout(this.httpTimeoutMs), ...(callerSignal ? [callerSignal] : [])]);
+    signal.throwIfAborted();
     const res = await this.fetchRaw(method, path, body, this.httpTimeoutMs, signal);
     if (res.status >= 400) {
       const text = await readBoundedText(res, ERROR_BODY_MAX_BYTES, false, signal);
       throw new RequestError(method, path, res.status, text.slice(0, 4096), retryAfterMsOf(res.headers.get("Retry-After")));
     }
     if (res.status === 204) return undefined;
-    const text = await readBoundedText(res, Number.MAX_SAFE_INTEGER, true, signal);
+    const text = await readBoundedText(res, maxResponseBytes, true, signal);
     return text ? JSON.parse(text) : undefined;
   }
 

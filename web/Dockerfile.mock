@@ -26,6 +26,8 @@ COPY docs/ /app/docs/
 # modules; `npm run build`'s `tsc --noEmit` typechecks it, so the sibling dir must be
 # present here too (else TS2307). Mirrors web/Dockerfile.
 COPY fixtures/api-contract/ /app/fixtures/api-contract/
+# Recovery owner-pin parity cases are statically imported by the web tests.
+COPY fixtures/recovery-prerequisite-closure/ /app/fixtures/recovery-prerequisite-closure/
 # milestoneAttribution.fixture.test.ts likewise statically imports
 # fixtures/milestone-attribution/cases.json as a typed JSON module; tsc --noEmit needs it present
 # too (else TS2307). Mirrors web/Dockerfile.
