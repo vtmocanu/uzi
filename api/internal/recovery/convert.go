@@ -92,6 +92,38 @@ func captureToDTO(c store.RecoveryCapture) apitypes.RecoveryArchiveDTO {
 	return out
 }
 
+// ownerCaptureToDTO projects only the nullable, identity-matched closure from the listing.
+// ClosureID distinguishes a missing join from a persisted row with empty optional facts.
+func ownerCaptureToDTO(row store.ListCapturesForRunOwnerRow) apitypes.RecoveryArchiveDTO {
+	out := captureToDTO(row.RecoveryCapture)
+	if !row.ClosureID.Valid {
+		return out
+	}
+	switch row.ClosureState.String {
+	case "pending", "invoked", "create_unknown", "pinned", "refused", "foreign", "lost", "deleted":
+	default:
+		return out
+	}
+	closure := &apitypes.RecoveryPrerequisiteClosureDTO{
+		State:              row.ClosureState.String,
+		PinRef:             row.PinRef.String,
+		AbsenceUnconfirmed: row.ClosureState.String == "pinned" && row.AbsentSince.Valid,
+		CleanupExhausted:   row.CleanupExhaustedAt.Valid,
+		UpdatedAt:          row.ClosureUpdatedAt.Time,
+	}
+	switch row.ClosureReason.String {
+	case "closure_unsupported", "prerequisite_not_on_default", "prerequisite_ancestry_unknown",
+		"prerequisite_prepare_budget_exhausted", "pin_absence_unconfirmed", "pin_refused",
+		"pin_unknown", "pin_foreign", "archive_unavailable", "pin_lost", "pin_cleanup_exhausted":
+		closure.Reason = row.ClosureReason.String
+	}
+	if row.PinTip.Valid {
+		closure.PinTip = strPtr(row.PinTip.String)
+	}
+	out.PrerequisiteClosure = closure
+	return out
+}
+
 // Terminal lifecycle classification is independent of admission and remains used by final_inventory.go.
 var custodyRunTerminalStatuses = map[string]bool{"completed": true, "failed": true, "cancelled": true}
 

@@ -60,6 +60,7 @@ import type {
   CIJob,
   CIStep,
   RecoveryArchive,
+  RecoveryPrerequisiteClosure,
   RecoveryArchiveSummary,
   RecoveryCustodyHold,
   RecoveryCustodyAggregate,
@@ -182,6 +183,8 @@ import ciJobZero from "../../../fixtures/api-contract/ci_job.zero.json";
 import ciJobFull from "../../../fixtures/api-contract/ci_job.full.json";
 import ciStepZero from "../../../fixtures/api-contract/ci_step.zero.json";
 import ciStepFull from "../../../fixtures/api-contract/ci_step.full.json";
+import recoveryPrerequisiteClosureZero from "../../../fixtures/api-contract/recovery_prerequisite_closure.zero.json";
+import recoveryPrerequisiteClosureFull from "../../../fixtures/api-contract/recovery_prerequisite_closure.full.json";
 import recoveryArchiveZero from "../../../fixtures/api-contract/recovery_archive.zero.json";
 import recoveryArchiveFull from "../../../fixtures/api-contract/recovery_archive.full.json";
 import recoveryArchiveSummaryZero from "../../../fixtures/api-contract/recovery_archive_summary.zero.json";
@@ -1304,6 +1307,14 @@ it("recorded nested checker metadata always has the nullable member", () => {
   void _ciStepFull;
 }
 
+{
+  const missing: never = null as unknown as Exclude<keyof RecoveryPrerequisiteClosure, keyof typeof recoveryPrerequisiteClosureFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof recoveryPrerequisiteClosureFull, keyof RecoveryPrerequisiteClosure>;
+  const zero: ZeroOf<RecoveryPrerequisiteClosure> = recoveryPrerequisiteClosureZero;
+  const full: Widen<RecoveryPrerequisiteClosure> = recoveryPrerequisiteClosureFull;
+  void missing; void extra; void zero; void full;
+}
+
 // ── RecoveryArchive (PRD #1296 M1) ──────────────────────────────────────────
 // All optional fields are omitempty, so the zero.json carries no null (declared
 // nullable:false below) — the finding shape.
@@ -1710,6 +1721,7 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // PRD #1296 M1: recovery_archive is all-omitempty optionals, so its zero.json carries no
   // null (the finding shape). recovery_archive_summary's archives slice is non-omitempty,
   // so its zero.json carries a null the M2 mapper normalizes to [].
+  { stem: "recovery_prerequisite_closure", nullable: false },
   { stem: "recovery_archive", nullable: false },
   { stem: "recovery_archive_summary", nullable: true },
   // PRD #1349 M1: the owner-facing custody-hold DTOs. recovery_custody_hold's only nullable

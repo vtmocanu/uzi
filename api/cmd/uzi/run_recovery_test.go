@@ -243,15 +243,16 @@ func TestRunRecoveryCanonicalRunID(t *testing.T) {
 					}
 					const terminalCopy = "terminal record rejected after restart (MAC failure); completion is unverified; see run recovery for source custody"
 					if mode == "human" {
-						if errb != "" || client.archivesCalls != 0 {
-							t.Errorf("human stderr=%q archives=%d; want empty stderr and no archives", errb, client.archivesCalls)
+						wantWarning := "uzi: 1 capture(s) carry no hold id (server predates it) and are not listed; 'uzi run get " + recoveryHeldRunID + "' lists the available ones\n"
+						if errb != wantWarning || client.archivesCalls != 1 {
+							t.Errorf("human stderr=%q archives=%d; want canonical legacy warning %q and one capture metadata lookup", errb, client.archivesCalls, wantWarning)
 						}
 						for _, want := range []string{
 							"canonical-source", "canonical-archive",
 							"run " + recoveryHeldRunID + " hold canonical-source gen 7: " + terminalCopy + "\n",
 							"run " + recoveryHeldRunID + ": " + reason + "\n",
 							"2 hold(s) await a decision: discard with `uzi run discard " + recoveryHeldRunID + " --hold <hold-id> --yes`\n",
-							"1 hold(s) have a recovery archive: recover with `uzi run export`\n",
+							"1 hold(s) have a recovery archive: download with `uzi run export`; thin archives also need prerequisite commits and verified import\n",
 						} {
 							if !strings.Contains(out, want) {
 								t.Errorf("missing %q in stdout=%q", want, out)
@@ -847,8 +848,8 @@ func TestRunRecoveryJSONDeletedRunDegrades(t *testing.T) {
 	}
 }
 
-// TestRunRecoveryNoArchivesReadWithoutNeed proves the archives are read only when they are
-// joined: the human table and a --json run with no holds both succeed with the read failing.
+// TestRunRecoveryNoArchivesReadWithoutNeed proves an empty JSON hold list needs no
+// archive join and human hold output survives an unavailable metadata enrichment.
 func TestRunRecoveryNoArchivesReadWithoutNeed(t *testing.T) {
 	for _, args := range [][]string{
 		{"run", "recovery", recoveryHeldRunID},
@@ -859,7 +860,7 @@ func TestRunRecoveryNoArchivesReadWithoutNeed(t *testing.T) {
 			RecoveryArchivesErr: uzicli.Exitf(uzicli.ExitGeneric, "archives read failed"),
 		}
 		if _, errb, code := runCLI(t, fakeEnv(fc), args...); code != uzicli.ExitOK {
-			t.Errorf("%v: exit = %d, want 0 (no archives read needed); stderr=%q", args, code, errb)
+			t.Errorf("%v: exit = %d, want 0 (metadata enrichment must not hide holds); stderr=%q", args, code, errb)
 		}
 	}
 }
@@ -1001,7 +1002,7 @@ func TestOwnerRecoveryHintsSplitByArchive(t *testing.T) {
 	}
 	for _, want := range []string{
 		"blocked_runs: 1\n\nrun run-a hold hold-a: no recovery archive; custody of worker worker-a's local source is retained (export unavailable; it may be the only copy)",
-		"1 hold(s) have a recovery archive: recover with `uzi run export`",
+		"1 hold(s) have a recovery archive: download with `uzi run export`; thin archives also need prerequisite commits and verified import",
 		"2 hold(s) await a decision: discard with `uzi run discard <run-id> --hold <hold-id> --yes`",
 	} {
 		if !strings.Contains(out, want) {
@@ -1056,7 +1057,7 @@ func TestRecoveryHelpSeparatesExportFromAttention(t *testing.T) {
 	}
 	flat := strings.Join(strings.Fields(out), " ")
 	for _, want := range []string{
-		"An `archive_ready` hold has a recovery archive: recover it with `run export`",
+		"An `archive_ready` hold has a recovery archive: download it with `run export`; thin archives also require external commits and destination import verification.",
 		"Archive availability is independent of attention: export an available archive even for a decision hold; it may not cover the latest work.",
 		"A `source_only` or `needs_action` hold retains local inventory and awaits your decision to discard it",
 		"`source_only` means the worker's local inventory remains in custody until a final disposition",
@@ -1130,7 +1131,7 @@ func TestRunRecoveryArchiveReadyGetsExportHint(t *testing.T) {
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d", code)
 	}
-	if !strings.Contains(out, "1 hold(s) have a recovery archive: recover with `uzi run export`") {
+	if !strings.Contains(out, "1 hold(s) have a recovery archive: download with `uzi run export`; thin archives also need prerequisite commits and verified import") {
 		t.Errorf("export hint absent:\n%s", out)
 	}
 	if strings.Contains(out, "await a decision") || strings.Contains(out, "custody of worker") {

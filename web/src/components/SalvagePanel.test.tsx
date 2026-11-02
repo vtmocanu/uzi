@@ -189,7 +189,7 @@ describe("SalvagePanel fetch command", () => {
   });
 
   it("the promoted mock run shows its own salvage ref and fetch command", () => {
-    const mock = mockRuns.find((r) => r.id === "run-failed");
+    const mock = mockRuns.find((r) => r.id === "c57b3989-105a-4e08-bf74-77ebc28e5a01");
     expect(mock?.salvage_state).toBe("promoted");
     render(<SalvagePanel run={mock!} />);
     expect(screen.getByText(`git fetch origin refs/uzi-salvage/${mock!.id}`)).toBeTruthy();

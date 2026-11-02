@@ -1,7 +1,7 @@
 # PRD #2506 (option A): a pinned prerequisite closure lets a thin guarded capture release custody
 
 **Issue:** #2506 (option A only). Delivery under this PRD is **non-closing**: every PR uses `Refs #2506` and closes only its own child issue. #2506 stays open until the whole acceptance below is met. Option D shipped separately (ADR-2506) and does not complete this.
-**Current execution (2026-11-01):** C2 (#3727) is implemented on branch `agent/issue-3727` in four milestones (M1 schema, M2 API release, M3 worker mint, M4 advertisement and combined proof) and M5 documentation; its landing, exact-head CI and the full store-it sweep are pending, so nothing here claims C2 shipped (see the [C2 execution record](#c2-execution-record-2026-11-01-3727)). C1a and C1b source are merged. C1b landed in [PR #3655](https://github.com/vtmocanu/uzi/pull/3655) as `b6fab6b7`, with migration 00387; exact-head hosted checks and timing were collected before merge. The local handoff records below remain historical evidence, not the current hosted-gate status. C1b itself added no thin FINAL release, feature advertisement or agent change; C2 adds them on its branch. C3, E5 and parent acceptance remain open; E6 is post-roll reporting only. M6 operator observation is not claimed performed. See [current execution and checkbox disposition](#c1b-current-execution-2026-10-29-child-3591).
+**Current execution (2026-11-01):** C2 (#3727) merged in [PR #3748](https://github.com/vtmocanu/uzi/pull/3748); source at `a07f813708ced206cd7b8c3f9d09e259b2fff64b` is known. This current-state update makes no claim about unobserved hosted CI or full store-it results (see the historical [C2 execution record](#c2-execution-record-2026-11-01-3727)). C1a and C1b source are merged. C1b landed in [PR #3655](https://github.com/vtmocanu/uzi/pull/3655) as `b6fab6b7`, with migration 00387; exact-head hosted checks and timing were collected before merge. The local handoff records below remain historical evidence, not the current hosted-gate status. C1b itself added no thin FINAL release, feature advertisement or agent change; C2 adds them. C3 M1–M4 functional delivery is locally implemented and validated; product/documentation units are reviewed at `10ff078c` and the minimal integration-fixture repair at `287b04b9`. Required exact-head landing checks remain unobserved here. E5 is measured locally as recorded below; broad C3 and parent acceptance remain open; E6 is post-roll reporting only. M6 operator observation is not claimed performed. See [current execution and checkbox disposition](#c1b-current-execution-2026-10-29-child-3591).
 
 **Historical design status:** DRAFT, revision 18 (2026-10-28), approved C1a/C1b split and review folds, pending exact-text final review. C1a and C1b are API-only; no filing or dispatch follows from this draft. Based on the exact revision-11 artifact (SHA256 `2205e1146950263b2aa90f35863cadec3f3debfbd350590b9e65bd560a9640ec`, whose header still said revision 10). The earlier paired architecture reviews and owner decisions remain the design history; this new evidence fold requires recov6 review and is not filing, dispatch or implementation approval. **E2 ran on GitHub on 2026-10-27 and returned FINDING (one measured workflow-scope refusal, zero probe malfunctions), conclusive for the tested production credential class.** The anchor strategy is feasible in that tested case; other forges and protected/ruleset configurations remain unverified. Existing source line anchors are historical at `91647464c02bd12ae30d4fce6aa656f2245e88e1`, not refreshed line numbers for current main. The new E2 section states the exact observed scope and remaining gates.
 **Priority:** High (inherits #2506). The independent architecture review CLAUDE.md requires for priority::high applies to this PRD and to each child before dispatch; no waiver. M0 is evidence-only and is never auto-dispatched.
@@ -465,7 +465,7 @@ retention obey these same boundaries. C1a is unaffected by this clarification.
 
 ### Security and data
 
-- A history purge is defeated while a pin anchors pre-purge history; `docs/run-recovery.md` must say a purge also deletes `refs/uzi-*` refs; owner early expiry triggers S7.
+- Pins can keep pre-purge history reachable under `refs/uzi-*`, independently of the external deletion/rewrite restore residual. The run-recovery guide records this limitation without a purge recipe: O10/S7 automatic cleanup follows expiry/discard, expected-tip CAS and confirmed absence; unknown creates and cleanup exhaustion retain blockers.
 - Pins point only at default-branch commits and publish no run content. No new worker credential, endpoint or authority; the four guardrail layers unchanged.
 
 ### Out of scope
@@ -479,7 +479,7 @@ Changing held ordering; deleting pins when another route settles the hold (pins 
 | E1 | Population | done (zero verified standalone A1); user: Proceed | done |
 | E2 | Maintainer-only same-scope/same-role probe; actual production go-git helpers plus native supplement; current-tip and old-tip workflow-tree cases. | **GitHub FINDING, 2026-10-27:** compatible anchor succeeded; differing-workflow old tip refused; same-tree old tips succeeded; zero malfunctions. Other forges/configurations unverified. | evidence fold review and final architecture disposition before filing |
 | E4 | Per-capture prerequisites, guarded manifest-bound thin population, 2026-10-24 snapshot | 386 captures / 257 holds; min 1, median 1, nearest-rank p90 6, p99 16, max 16; 204 expired and 182 available (available p90 8). Source SHA256 349a1c59e4b1eac90c26b63178a73651c1bb2a79fa58ec7725d91708854747b5. Independent local recomputation; no fresh DB query. Not a latency measurement. | reported before C1b dispatch; retain max-64 tests |
-| E5 | Owner restore time on this repository | open | C3 acceptance |
+| E5 | Owner restore time on this repository | [measured locally](#c3-local-e5-measurement-2026-11-01-3728) | C3 final validation/landing remains open |
 | E6 | Two weeks hosted after the roll: releases, refusals per reason, live pins, unresolved and cleanup-exhausted rows | open | post-acceptance |
 
 ## Child issues (after architecture approval only)
@@ -885,6 +885,363 @@ the ADR amendments dated 2026-11-01.
 
 - **Depends on:** C1b (states). Parallel with C2 only with disjoint file ownership.
 - **Scope and evidence:** owner DTO, fixtures, web and CLI (`cellText`), `pin_lost` and `pin_cleanup_exhausted` visibility, restore commands, `docs/cli.md`; E5 measured.
+- **Local completion (#3728, 2026-11-01):** M1–M3 are implemented/reviewed at `60c71323`; M4 guide/product checks passed on `287b04b9` after reviewed documentation at `10ff078c` and a reviewed fixture repair. Exact-head API/repo/full store-it landing remains pending. Broad C3 acceptance and parent release remain open. Owner projection is advisory persisted history with eight states and independent absence/cleanup flags, not a fresh probe or release/cleanup authority. The [owner restore guide](../docs/run-recovery.md#restoring-with-a-confirmed-pin) uses existing export, a UUID-derived ref and full-tip comparison before native verify/import. E6 remains an unperformed post-roll observation.
+
+#### C3 local E5 measurement (2026-11-01, #3728)
+
+The explicit `TestRecoveryRestoreWorkflowLiveDB/E5FullHistory` invocation
+passed with zero SKIP/FAIL. This is a local owner-workflow measurement, not
+hosted GitHub latency, a C2 FINAL exercise or parent release acceptance.
+The ordinary `SmallNative` controls also passed; they do not substitute for E5.
+The parent and broad C3 landing acceptance remain open; completed local integration checks are recorded below.
+
+Input was a `clone --no-local` of this checkout, selected at public revision
+`a07f813708ced206cd7b8c3f9d09e259b2fff64b`: non-shallow, connectivity/full
+object checks passed, 2,405 reachable commits. The captured source added
+`recovery-generated.txt` (26 bytes, SHA-256
+`5a96308b340168c758f0ad6da84524bc09893aa989bc88bccaa22c78dc86b43b`),
+giving 2,406 commits at source
+`eeffd4ccba0fc168d69068bbe0c71a0fb545a8a5`, tree
+`b4ae331a571f7a7c46bba83bb1c442c552b76246`.
+
+| Observed component | Actual result |
+|---|---|
+| Exported thin bundle | 507 bytes; SHA-256 `809a9636aaeb1fae98af11eb7663a46c1c5d54da3da5f48767b236af9981638a` |
+| Pin fetch | 97,835,961 bytes of native upload-pack POST response bodies, including Git protocol framing, excluding advertisements, HTTP headers and transport overhead |
+| Explicit-capture CLI export | 95.414 ms |
+| Exact pin fetch to the same ref namespace | 13.741274 s |
+| Recorded-tip comparison, bundle verify and recovered-source import | 79.169 ms |
+| Owner clock: export start through import completion | 13.915937 s; includes exported-byte comparison, excludes final source/tree/file assertions |
+| Fixture setup through native pinning | 47.765507 s |
+| Owned remote rewrite/prune clock | 2.224715 s |
+| Clean consumer clone | 45.426 ms |
+| Entire case clock | 64.732682 s, including setup, prune, clone, source/tree/file assertions and negative controls |
+| Containing test / Go package test time | 159.08 s / 160.441 s; includes full-input verification and CLI driver compilation outside the case/owner clocks |
+
+The lane used real C1b sweep, broker prepare/send/readback, PostgreSQL
+constraints/transitions, encrypted archive upload/storage, authenticated owner
+metadata/download and the existing CLI export/SafeWriteVerifiedFile path.
+Both owned bare remotes had their default branch rewritten, reflogs expired and
+`gc --prune=now` run. The independently unpinned remote no longer contained
+the frozen prerequisite. The clean consumer initially failed bundle verification
+naming that prerequisite, then fetched its capture-specific pin, compared the
+recorded tip, verified/imported the advertised recovered-source ref and matched
+source SHA, tree and file content. No alternates or local-clone hardlinks supplied
+the consumer's history.
+
+Missing metadata/ref/tip, foreign capture/ref/tip, unavailable history and expired
+download controls passed with the exported archive retained. Expiry required
+HTTP 409 with `not_available`, not an arbitrary error. Read/export/import left
+capture, closure and hold rows byte-identical before the fixture's explicit expiry
+control; the native pin and captured source ref were unchanged.
+Existing S0 no-backfill/admission controls passed separately, including the
+unreviewed-host refusal. No production host policy was relaxed.
+
+Substitutions were fixture identities/configuration, generated source content,
+loopback forge discovery/URL policy, native ancestry in place of the hosted forge
+API, and a test-only Main/Env/config driver in place of the installed CLI entry.
+Upload first used the production GitHub.com S0 policy; only the fixture's pending
+binding then moved to the owned loopback remote. The driver kept HOME unchanged,
+used an owned Store/SkillHome and explicit nonsecret environment allowlist, and
+proved inherited UZI settings/credential sentinels did not reach the API.
+
+Environment: native Linux x86_64/Go linux-amd64 runner, Git 2.54.0, Go 1.27.3,
+CLI version emitted by the test build `dev`, owned PostgreSQL 17 container.
+The Alpine Git package lacked its CGI helper: the initial small control failed
+for that setup reason. The matching git-daemon 2.54.0-r0 package was fetched,
+signature-verified and extracted only under scratch (archive SHA-256
+`b376522eadb4df8dc5274687ceabe07456924d415cfcc5683c4b198e97a6c855`).
+Its native git-http-backend was added to the test PATH; no global install or
+Git exec-path change occurred. A cancelled intermediate compile and an unfinished
+component-static invocation are not passing checks.
+
+Reproduce from `api/`, after preparing a marker-guarded owned test database and
+the independently cloned/full-checked frozen source, with native git-http-backend
+available on PATH:
+
+```sh
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+  UZI_TEST_DATABASE_URL="<owned-test-database-url>" \
+  UZI_TEST_RECOVERY_RESTORE_FULL_HISTORY_SOURCE="<absolute-owned-full-source>" \
+  go test -buildvcs=false -race -count=1 -v -p 1 \
+  -run '^TestRecoveryRestoreWorkflowLiveDB$/^E5FullHistory$' ./internal/handler
+```
+
+Require the exact E5FullHistory RUN/PASS, positive archive/fetch byte counts and
+the LiveDB skip guard with zero SKIP/FAIL; an ordinary small-only pass is
+insufficient. The full-input mode rejects missing/wrong/shallow/incomplete input
+rather than falling back. Routine CI omits E5 registration when full mode is
+not requested.
+
+Evidence was collected from the candidate fixture sources with SHA-256
+`6094c38936c0487a8c4f877d7db905005dee6f089f4ef6dcc18f85fad6629b23`
+(native helper),
+`0956a91715973e0e5ee25632219509688f430a3f6fd5175ef58697ba1c861466`
+(workflow), and
+`665eff881f1d5bfdfcbe94cf25f7c026314672cc589c0ef01a24086621a9b683`
+(CLI driver). Local logs were read directly: gate-log.MnbjAQ (small),
+gate-log.v1jaiY (E5), gate-log.k3D0Gr (S0). Scratch paths are run-local,
+not durable artifacts; the sanitized results above are the committed record.
+
+These are the latest successful local passes after setup/static-check repairs,
+with warmed module and filesystem caches. An earlier full-history pass also
+succeeded; these are individual observations, not a performance average. Cache hit rates, hosted queue/cache/rerun costs and CI
+critical-path impact were not measured. The small containing test took 68.28 s
+(case 6.40 s), exposing substantial driver-preparation cost outside the restore
+clock. Full inherited store-it and required exact-head API/repo CI remain landing
+obligations. External pin deletion/history rewrite remains the accepted residual;
+this measurement grants no custody-release or cleanup authority.
+
+#### C3 M4 integration record (2026-11-01, #3728)
+
+The owner guide, CLI documentation, visibility ADR and human requirement now
+describe persisted pin observations separately from fresh verification and
+custody authority. The restore sequence selects an explicit available capture,
+compares the fetched pin's full recorded tip before bundle verification/import,
+then checks source/tree/content. Source/documentation review passed at
+`10ff078c`; a test-only UUID fixture repair passed scoped review at
+`287b04b9`. Both embedded mirrors match. The local checks below are complete;
+the broader parent C3 checkbox remains open for landing, without claiming
+hosted acceptance.
+
+- [x] C3 local M1: owner projection/contracts and authenticated read-only LiveDB controls, with complete history/order/identity and constant Summary SQL round trips.
+- [x] C3 local M2: safe existing CLI/web diagnostics, shared meanings, preserved actions and dawn/ember keyboard/layout controls.
+- [x] C3 local M3: actual full-history E5, native prune/no-pin/tip controls and retained exports; explicit E5 and routine controls PASS with zero SKIP.
+- [x] C3 local M4 guide/product checks: synced documentation, links, shipping fragment/spec note, full web gate, focused Go controls and E2E library/fake gates.
+- [ ] C3 landing: exact-head required API/repo checks and full inherited store-it, including hosted timing; not observed or waived here.
+
+Full `task gate:web` passed on frozen `287b04b9`: 386 unit files /
+8,425 tests (502.82 s Vitest duration), then 10 real Chromium files / 35 tests
+(19.63 s). Dependency, lint, dead-code, documentation/changelog/style and type
+slots passed first. The four recovery browser cases cover dawn/ember at
+375/1100 widths with keyboard/focus checks. Focused Go checks used
+`-buildvcs=false -race -count=1` and clean Git config: apitypes, uzidocs
+(including byte-equal embeds), owner-summary/status recovery tests and affected
+CLI recovery/export/landing/docs/printed-instruction tests all passed.
+The M1/M3 DB/native proofs remain applicable: their implementation sources are
+unchanged by this documentation integration. The final restored SmallNative
+after both M3 mutations passed at the committed fixture hashes, zero SKIP
+(`gate-log.j6TRGU`, package 96.358 s).
+
+The first web invocation stopped before tests because a relative TMPDIR was
+invalid for the root dependency check. Narrow candidate/base checks reproduced
+the setup failure and passed with an absolute owned scratch path. A scratch
+wrapper runs the existing native Chromium with a short relative TMPDIR to avoid
+Unix socket path limits; it changes no product code or test assertions. A
+subsequent full run exposed one stale RunView fixture expecting an unsafe
+`r1/cap-ok` copy command (8,424 other tests passed). Equivalent narrow base
+PASS / candidate FAIL confirmed that cause. The minimal canonical-UUID fixture
+repair kept the production guard and assertions intact; its three focused
+cases, lint/typecheck and all allocated scoped reviews passed before the final
+full gate rerun. These failed/setup attempts are not counted as passing gates.
+
+Local log identifiers read directly: `msJBoD` (docs/E2E), `qTvnCp`
+(focused Go), `dlqAaG` (full web), `GGeF6t` (repair), `RvY9VX` /
+`uaRUbE` (narrow candidate/base). Logs are run-local scratch artifacts;
+the sanitized results here are the durable record. Local M4 scanner callbacks
+returned no verdict; no final-head scanner pass is claimed. Source audits
+found no security defect. Required repository/API scanners and vulnerability
+checks remain part of exact-head landing acceptance.
+
+A targeted tracked E2E audit searched the changed retired output phrases and
+all recovery/prerequisite identifiers in phases, library tests and the forge
+fake. No retired phrase survived. Existing readers select capture id/state/
+checksum/byte size or tolerate absent fields; the optional projection changes
+no fake forge operation or route. No harness edit was needed. Compose phases
+52 (outage/outbox) and 72 (custody), and general CLI smoke phase 18, are unrun;
+library gates passed all six reported tallies (7/403/24/6/5/6), and the fake-forge gate passed 12 tests with zero skips. No compose acceptance is claimed.
+
+Equivalent focused component commands were run on frozen
+`a07f813708ced206cd7b8c3f9d09e259b2fff64b` and `60c71323` exports,
+baseline first, with copied provisioned dependencies, Node 26.12.1, Vitest
+4.1.12 and TZ=UTC:
+
+| RecoveryArchives test file | Baseline | Candidate |
+|---|---:|---:|
+| Cases, all passing | 28 | 57 |
+| File test time | 944 ms | 2,268 ms |
+| Vitest total | 4.95 s | 8.35 s |
+| Command wall | 7.553 s | 10.765 s |
+
+Command: `npx --no-install vitest run src/components/RecoveryArchives.test.tsx`
+from each export's web directory. Candidate includes 29 added cases; these are
+single sequential samples, not an identical-case comparison or a CI benchmark.
+Filesystem/dependency-copy warming and cache hit rates were uncontrolled.
+Hosted critical path, queue, cache and rerun costs remain unmeasured. The new
+M3 routine native fixture had no pre-existing case comparator; its driver
+preparation cost is reported in the E5 record. Worker command callbacks can
+assign fresh Go cache directories, so those preparation timings do not predict
+hosted CI cache behavior. Full inherited store-it timing and required exact-head
+API/repo checks remain landing obligations.
+
+#### C3 advisory repair evidence (2026-11-01, #3728)
+
+The follow-up confirmed and repaired D1–D5, C1 and C2. An omitted/empty
+prerequisite list means self-contained only with valid bound byte-manifest
+facts; otherwise it is unknown. CLI pending cleanup now requires a pinned
+row on an expired/discarded capture. Human recovery details follow the hold
+table with hold attribution, obey quiet mode, and warn on legacy unlinked
+captures. Relevant mock runs/history use canonical UUIDs while the executable
+command guards stay unchanged. Documentation/skill copy distinguishes byte
+export from prerequisite verification, and JSON pin facts from the smaller
+human capture-choice table. The shared table adds twelve expired/discarded
+non-pinned cases, exercised by Go, CLI and web tests.
+
+Owner-summary LiveDB seeds now use the generated invocation, cleanup,
+reservation, absence and lost/deleted transition methods. A closure-bearing
+capture is discarded with the owner store query and asserted in the complete
+history. The test records the identity-schema limitation: valid sibling rows
+prove isolation, but immutable constraints prevent constructing a mismatched
+closure for the same capture without bypassing guards. Timing substitutions
+remain fixture-only: make scheduling due, and age only the initial absence
+observation through a narrowly checked DBTX clock adapter. That adapter changes
+only the initial timestamp expression of RecordPrerequisiteAbsence; production
+state/generation/pass predicates and the real schema guard remain intact.
+An initial attempt to age an already recorded absence was rejected by the
+immutable-candidate guard; the final fixture does not overwrite it.
+
+Observed regressions failed on the unrepaired CLI and web for manifest,
+cleanup, layout and demo command defects. The final focused Go selection
+passed with race/count flags: apitypes (1.567 s), embedded docs (1.582 s),
+recovery summary/status (1.550 s), CLI recovery/prerequisite/export/landing/
+docs instructions (6.047 s), plus focused vet (`gate-log.viLgAF`). The expanded
+authenticated owner-history LiveDB control passed with zero SKIP (11.238 s
+package; `gate-log.iC7DKY`), including the unchanged two-query/read-only checks.
+The tester callback was cancelled after this completed log; its unfinished
+broad vet callback is not counted as passing. The lead read the result directly.
+
+C3's coverage-uncertainty note does not invalidate the retained local evidence:
+the lead reopened the explicit E5 PASS/measurements (`gate-log.v1jaiY`),
+blackbox baseline missing-projection failure (`gate-log.TJ6kWR`), CLI/web
+red–green logs and full-web PASS (`gate-log.dlqAaG`). All three native E5/driver
+fixture hashes still match the measured record above; no duplicate E5 run is
+claimed. C4 remains an exact-head hosted landing obligation: API/repo checks,
+full inherited store-it, native backend availability and package timeout must
+be observed before merge. Local output cannot promise those hosted results.
+
+#### D5 / C1 documentation audit (2026-11-01, #3728)
+
+This is a current-working-tree documentation audit, not new runtime, hosted,
+restore or release evidence. No acceptance checkbox or earlier measurement is
+changed. Tracked searches started with available/recover/export/prerequisite
+claims in the CLI reference, recovery guide and bundled skill, then inspected
+the matching availability/thin-archive contexts in adjacent live documentation.
+This is not an exhaustive audit of historical PRDs, ADRs, changelog entries or
+other skills.
+
+The M2 product-copy audit covered `web/src/pages/RunView.tsx` (memory,
+exhaustion and terminal recovery sections),
+`web/src/components/RecoveryHoldsSurface.tsx`,
+`web/src/components/RecoveryArchives.tsx`, `web/src/lib/recovery.ts`,
+`api/cmd/uzi/run_export.go`, `api/cmd/uzi/run_recovery.go` and their directly
+affected tests/mocks. The follow-up inspected `api/cmd/uzi/run_get.go` and
+`api/cmd/uzi/run_wait.go` routing/help: terminal get uses the shared
+summary/landing renderer; wait help points to inspection/export without an
+import-success guarantee. This is an enumerated starting point for current
+recovery claims, not a claim that every historical recovery mention was edited.
+
+The documentation file set actually inspected is:
+`docs/cli.md`, `docs/run-recovery.md`,
+`api/internal/uzicli/skill/SKILL.md`, `docs/admin-health.md`,
+`docs/configuration.md`, `docs/issue-3031-delivery.md`,
+`docs/recovery-storage-diagnosis.md`, `docs/run-recovery-wait.md`,
+`ARCHITECTURE.md`, this parent PRD (current execution/C3 integration context),
+and the corresponding `api/internal/uzidocs/embed/cli.md` and
+`api/internal/uzidocs/embed/run-recovery.md` mirrors. Adjacent-file inspection
+covers the matching claim and surrounding paragraph, not every contract in
+each file.
+
+Source boundaries inspected: `api/cmd/uzi/run_export.go`
+(`recoverySummaryLines`, `renderCaptureChoice`, selection, manifest precheck
+and result), `api/cmd/uzi/run_prerequisite.go` (capture/pin detail rendering),
+`api/cmd/uzi/run_recovery.go` (`recoveryHoldCapture`,
+`holdsWithCaptures`, per-hold human details), `api/cmd/uzi/run_get.go`
+(human summary versus JSON run object),
+`api/internal/uzicli/client_recovery.go` (owner archive endpoint),
+`api/internal/uzicli/safefile.go` (byte count/checksum before destination link),
+`api/internal/recovery/service.go` (upload stream checks, manifest binding and
+two-query Summary), and `api/internal/recovery/download.go` (owner/state/
+manifest gate). `api/cmd/uzi/run_prerequisite_test.go` was inspected for its
+JSON inspect-field assertions, not rerun as part of this documentation audit.
+No new claim that all available metadata has a usable bound manifest follows:
+export retains its own manifest precheck and download can fail. The server
+checks uploaded length/checksum; it does not independently verify Git
+dependencies. A thin export still requires destination-clone verification.
+
+Validation for this audit: `task docs:sync` exited 0; `task check-docs:web`
+exited 0 (80 docs validated, 49 line-budget warnings); both changed embed mirrors
+compare byte-for-byte with their sources. `git diff --check` passed. No Go/web
+runtime test, hosted check, new E5 measurement or acceptance decision is claimed.
+
+Per-site verdicts below concern that availability/importability distinction,
+not revalidation of unrelated retention, quota, release or cleanup mechanisms.
+Mirror verdicts apply to the same named sections after byte-for-byte sync.
+
+| Site | Verdict |
+|---|---|
+| docs/cli.md — recovery summary | updated: every retained capture, with state and recorded pin details; human view. |
+| docs/cli.md — export-choice refusal | updated: pin facts preserved in JSON; human table has id/state/source/size/created only. |
+| docs/cli.md — successful export | updated: byte verification, bound-manifest/download gate, no prerequisite guarantee. |
+| docs/cli.md — owner ARCHIVE column | already accurate: presence of an available capture, not an import proof. |
+| docs/cli.md — coverage paragraph | already accurate: an export can omit latest local work. |
+| docs/cli.md — export hint | already accurate: availability offers export independently of attention. |
+| docs/cli.md — retained-recovery exception | already accurate: available/in-flight captures do not settle owner custody. |
+| docs/cli.md — latest versus older capture | already accurate: download and latest coverage are independent. |
+| docs/cli.md — detailed recovery JSON | updated: checksum, ordered prerequisites, expiry, attempted head and optional pin snapshot; absent optional fields remain possible. |
+| docs/cli.md — terminal-record rejection | already accurate: export requires its own available capture. |
+| docs/cli.md — prerequisite-pin lifecycle | updated: recovery/get show persisted pin state; held refs remain separate. |
+| docs/cli.md — completed held alternative | already accurate: thin archive describes fallback eligibility, not standalone importability. |
+| docs/cli.md — worker-recovery exhaustion | already accurate: recorded availability is historical, not current export/coverage proof. |
+| docs/cli.md — retained exhaustion coverage | already accurate: earlier available archive does not prove latest coverage. |
+| docs/cli.md — adoption-failure export advice | already accurate: export before deciding does not promise verified import. |
+| docs/run-recovery.md — opening recovery promise | updated: bytes can outlive the worker; thin prerequisites remain separate. |
+| docs/run-recovery.md — opening guarded release | already accurate: confirmed pins are a distinct release condition. |
+| docs/run-recovery.md — owner-held memory custody | already accurate: availability does not automatically release custody. |
+| docs/run-recovery.md — held-publication-conflict export | already accurate: export can refuse. |
+| docs/run-recovery.md — Available state | updated: archive bytes ready; prerequisite verification before import. |
+| docs/run-recovery.md — needs-landing with no archive | already accurate: lack of diff/archive is unresolved, not losslessness. |
+| docs/run-recovery.md — local thin proof | already accurate: local verified dependencies do not establish remote durability. |
+| docs/run-recovery.md — source-only export limit | already accurate: manifest-bound archive required; no source download API. |
+| docs/run-recovery.md — C2 lifecycle introduction | already accurate: pinning/release distinguished from byte download. |
+| docs/run-recovery.md — confirmed-pin step 1 | updated: recovery JSON supplies inspect fields; missing linking requires owner archive metadata, not run JSON. |
+| docs/run-recovery.md — thin FINAL worker grant | already accurate: release proof is separate from owner import verification. |
+| docs/run-recovery.md — pin retention after alternate settlement | already accurate: available archive retains its pin lifecycle. |
+| docs/run-recovery.md — ready owner quota | already accurate: accounts for archive bytes, not prerequisite storage. |
+| docs/run-recovery.md — instance quota | already accurate: accounts for archive bytes/reservations. |
+| docs/run-recovery.md — thin guarded disposition | already accurate: downloadable does not imply final release. |
+| docs/run-recovery.md — selected archive after receipt | already accurate: download remains available under its retention policy. |
+| docs/run-recovery.md — forge-park history caveat | already accurate: availability alone proves no complete history. |
+| docs/run-recovery.md — prerequisite-release rollout | already accurate: API release guard precedes guarded-thin producer rollout. |
+| docs/run-recovery.md — Option D archive survival | already accurate: bytes, recorded prerequisites and expiry survive hold settlement. |
+| docs/run-recovery.md — same-issue witness archive survival | already accurate: preserves archive metadata/bytes, not external commit availability. |
+| docs/run-recovery.md — terminal rejection older export | already accurate: earlier export may omit latest work. |
+| docs/run-recovery.md — terminal rejection source-only state | already accurate: readiness is distinct from custody attention. |
+| docs/run-recovery.md — terminal rejection export guidance | updated: a pin alone is not an archive; bound manifest/download and destination verification remain required. |
+| api/internal/uzicli/skill/SKILL.md — ARCHIVE column | already accurate: reports capture availability. |
+| api/internal/uzicli/skill/SKILL.md — recovery/export contract | updated: inspect fields and human/JSON pin visibility; bytes versus Git dependencies. |
+| api/internal/uzicli/skill/SKILL.md — needs-landing export/diff | updated: download first, then verify prerequisites before import; preserved diff remains separate. |
+| api/internal/uzicli/skill/SKILL.md — adoption-failure export advice | already accurate: export precedes owner decision without guaranteeing success. |
+| api/internal/uzicli/skill/SKILL.md — source-only/available distinction | updated: pin alone is not an archive; thin exports require dependency verification. |
+| api/internal/uzicli/skill/SKILL.md — held-ref expiry | already accurate: expiring a held ref does not delete an available archive. |
+| docs/admin-health.md — per-owner recovery bytes | already accurate: byte utilization, not restore readiness. |
+| docs/admin-health.md — marker clearance | already accurate: clearance does not prove archive availability. |
+| docs/configuration.md — prerequisite forge knob | already accurate: pin admission/release has separate conditions. |
+| docs/configuration.md — held-publication knob | already accurate: thin fallback and replay are qualified. |
+| docs/configuration.md — proposal limiter | already accurate: thin FINAL listing budget, not import verification. |
+| docs/issue-3031-delivery.md — conditional thin-release invariant | correct as history: explicitly qualified by the following C2 note. |
+| docs/issue-3031-delivery.md — C2 note | already accurate: ordinary-origin closure release grants no producer authority. |
+| docs/recovery-storage-diagnosis.md — hold discard | already accurate: preserves available archive bytes under archive policy. |
+| docs/run-recovery-wait.md — adoption-failure export advice | already accurate: earlier archive can omit latest work. |
+| docs/run-recovery-wait.md — local decoded-history verification | already accurate: local proof grants no custody release. |
+| docs/run-recovery-wait.md — source-only export limit | already accurate: requires manifest-bound available archive. |
+| docs/run-recovery-wait.md — exhaustion evidence | already accurate: recorded availability leads to a hold, not restore proof. |
+| ARCHITECTURE.md — frozen-inventory archive identity | already accurate: digest identity is not server Git-ancestry proof. |
+| ARCHITECTURE.md — same-issue discard TTL | already accurate: archive retention gives no source/PVC guarantee. |
+| ARCHITECTURE.md — held-publication thin fallback | already accurate: fallback qualification, not import proof. |
+| ARCHITECTURE.md — C1b lifecycle boundary | correct as history/component boundary: the later C2 release section is separate. |
+| ARCHITECTURE.md — worker-exhaustion capture evidence | already accurate: historical evidence affects custody disposition. |
+| api/internal/uzidocs/embed/cli.md — recovery/export sections above | updated: synchronized CLI-reference mirror. |
+| api/internal/uzidocs/embed/run-recovery.md — availability/restore sections above | updated: synchronized recovery-guide mirror. |
 
 ### Parent acceptance
 

@@ -64,7 +64,7 @@ function histRun(i: number, minsBack: number): Run {
   const hasMr = status === "completed" || (!planRejected && i % 3 === 0);
   return {
     harness_decision: null,
-    id: `run-hist-${i}`,
+    id: `a015de00-0000-4000-8000-${i.toString(16).padStart(12, "0")}`,
     repo_id: HIST_REPOS[i % HIST_REPOS.length],
     issue_iid: 400 + i,
     issue_title: HIST_TITLES[i % HIST_TITLES.length],
@@ -300,7 +300,7 @@ export const mockOtherUserRuns: Run[] = [
 ];
 
 // Issue #2014: demo estimated tails of interrupted Claude sessions, attached to the
-// "run-failed" and "run-cancelled" fixtures (data/runs.ts). One priced and partial, one
+// pool-tuning and "run-cancelled" fixtures (data/runs.ts). One priced and partial, one
 // unpriced (cost unknown, never $0) and partial with an unrecognised reason.
 export const demoTailEstimated: UsageTail = {
   input_tokens: 9_200,
@@ -357,7 +357,7 @@ function demoRunUsage(r: Run): RunUsage | null {
   // History rows (ux-tweaks item 3) spread deterministically across 0.3x–2.8x so a
   // 150-run past list doesn't repeat one implausible figure down the page. The
   // hand-written fixtures keep their documented 1.33M/$1.87 exactly as before.
-  const histScale = r.id.startsWith("run-hist-") ? 0.3 + (hashCode(r.id) % 100) / 40 : 1;
+  const histScale = r.id.startsWith("a015de00-0000-4000-8000-") ? 0.3 + (hashCode(r.id) % 100) / 40 : 1;
   const scale = (r.status === "running" ? 0.4 : 1) * histScale;
   const round = (n: number) => Math.round(n * scale);
   return {
@@ -366,8 +366,8 @@ function demoRunUsage(r: Run): RunUsage | null {
     cache_creation_tokens: 0,
     output_tokens: round(48_200),
     // One legacy row has no estimate; the mixed run retains its recorded partial.
-    cost_usd: r.id === "run-closed" ? 0 : r.id === "run-failed" ? 0.61 : Math.round(187 * scale) / 100,
-    cost_status: r.id === "run-closed" ? "subscription" : r.id === "run-failed" ? "unreported" : "metered",
+    cost_usd: r.id === "c57b3989-105a-4e08-bf74-77ebc28e5a02" ? 0 : r.id === "c57b3989-105a-4e08-bf74-77ebc28e5a01" ? 0.61 : Math.round(187 * scale) / 100,
+    cost_status: r.id === "c57b3989-105a-4e08-bf74-77ebc28e5a02" ? "subscription" : r.id === "c57b3989-105a-4e08-bf74-77ebc28e5a01" ? "unreported" : "metered",
   };
 }
 

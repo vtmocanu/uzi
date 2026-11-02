@@ -1556,7 +1556,7 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
           <p className="mt-1.5 text-xs text-muted">Lifetime automatic requeues: {run.requeue_count}.</p></>)}
       {(memoryHeld || retained) && <p className="mt-1.5 text-xs text-muted">
         Retained source may remain on the assigned worker. Historical checkpoint or capture reports do not verify current availability or the latest local edits.
-        Only a verified available recovery archive can restore captured work on another worker; uncaptured work is not guaranteed.
+        An available archive can restore captured work only when its prerequisite commits are also present. Verify the bundle in the destination clone; uncaptured work is not guaranteed.
       </p>}
       {evidence ? (
         <>
@@ -1599,7 +1599,7 @@ function ProviderHoldPanel({ run, ownerProof, busy, onResume, onStop, onCancel }
   return <Card className="p-4">
     <h2 className="text-sm font-semibold text-warn">Provider unavailable — waiting for owner</h2>
     <p className="mt-1 text-xs text-muted">Automatic retries have stopped. No retry is scheduled. Resume starts a fresh attempt.</p>
-    <p className="mt-1 text-xs text-muted">Retained work may remain on the assigned worker. Only a verified available recovery archive can restore captured work on another worker; uncaptured work is not guaranteed.</p>
+    <p className="mt-1 text-xs text-muted">Retained work may remain on the assigned worker. An available archive can restore captured work only when its prerequisite commits are also present. Verify the bundle in the destination clone; uncaptured work is not guaranteed.</p>
     <p className="mt-1 text-xs text-muted">The worker claim and affinity are retained.{run.kind === "issue" ? " The issue remains locked to this run." : ""}</p>
     <p className="mt-1 text-xs text-muted">Provider parks: {run.provider_park_count}. Streak started: {run.provider_park_streak_started_at ?? "unknown"}.</p>
     <p className="mt-1 text-xs text-muted">Stop saves a scope ceiling at completed work, then resumes to finalize. Finalization may need the provider and park again.</p>
