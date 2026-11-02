@@ -361,6 +361,8 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
   readonly kind = "codex" as const;
 
   private readonly registry: ExecutionRegistry;
+  /** issue #3780: read-only registry state for the runner's tracking-repair admission predicate. */
+  registryState(): ReturnType<ExecutionRegistry["state"]> { return this.registry.state(); }
   private readonly seams: BoundarySeams;
   // PRD #1171 m4: the OPTIONAL executor-owned auth-mode reconcile step. Absent ⇒ no
   // reconcile (Claude/tests). Only its neutral {@link ReconcileOutcome} crosses back in.
