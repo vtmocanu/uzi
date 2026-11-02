@@ -634,6 +634,54 @@ done
 cap2_focused_regressions() {
   eval "$(awk '/^(assert_cap2_owner_resume|assert_cap2_crash_refusal|assert_cap2_crash_bytes|cap2_crash_local_teardown)\(\) \{/,/^\}/' "$ROOT/e2e/phases/45-bounded-concurrency.sh")"
   eval "$(awk '/^(fixture_crash_read|discard_fixture_crash_owner_holds|fixture_crash_inspect)\(\) \{/,/^\}/' "$LIB")"
+  # Execute the actual phase fragment: testing the decoder alone cannot prove
+  # that both durable receipts precede container stop/restart.
+  cap2_restart_order() {
+    local mode="$1" fragment rc=0 file="$SEQ_DIR/cap2-order"
+    fragment="$(awk '
+      /^  for i in 0 1; do$/ { start=NR }
+      /wait_status "\$run" paused/ { collecting=1 }
+      collecting && /^  for run in "\$\{PAUSE_RUNS\[@\]\}"; do apipost/ { end=NR; exit }
+      { lines[NR]=$0 }
+      END {
+        if (!collecting || !end) exit 1
+        for (i=start;i<end;i++) print lines[i]
+      }' "$ROOT/e2e/phases/45-bounded-concurrency.sh")" || fail 'missing restart fragment'
+    : > "$file"
+    (
+      set -e
+      # shellcheck disable=SC2034 # consumed by the evaluated phase fragment
+      PAUSE_RUNS=(runA runB)
+      # shellcheck disable=SC2034 # consumed by the evaluated phase fragment
+      PAUSE_GENS=(1 2)
+      COMPOSE=(cap2_compose_probe)
+      wait_status() { :; }
+      wait_worker_online() { :; }
+      cap2_compose_probe() { echo "compose $*" >> "$file"; }
+      wait_fixture_worker_event() {
+        echo "ready $1 $2 $3" >> "$file"
+        case "$1:$2:$3" in
+          'runA:1:stub: source-end ready'|'runB:2:stub: source-end ready') ;;
+          *) return 1 ;;
+        esac
+        [ "$mode" != "$1" ]
+      }
+      eval "$fragment"
+    ) || rc=$?
+    if [ "$mode" = present ]; then
+      [ "$rc" = 0 ] || fail 'ready sources failed restart'
+      printf '%s\n' 'ready runA 1 stub: source-end ready' 'ready runB 2 stub: source-end ready' \
+        'compose stop agent' 'compose up -d --wait agent' > "$file.expected"
+      cmp "$file.expected" "$file" || fail 'restart preceded both exact source receipts'
+    else
+      [ "$rc" != 0 ] || fail 'missing readiness accepted'
+      if grep -q '^compose ' "$file"; then fail 'worker restarted before positive readiness'; fi
+    fi
+    echo 'both exact source receipts precede restart'
+  }
+  for mode in present runA runB; do
+    custody_case "cap2 restart ordering $mode" pass 'both exact source receipts precede restart' cap2_restart_order "$mode"
+  done
   cap2_outcome() {
     local mode="$1" generation=2
     [ "$mode" != extra-generation ] || generation=3
