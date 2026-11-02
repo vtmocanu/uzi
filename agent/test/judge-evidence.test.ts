@@ -27,6 +27,7 @@ function bounded(e: JudgeEvidence) {
   assert.ok(e.sections.prose.length <= 58000);
   assert.ok(e.metrics.pending <= 128);
   assert.ok(e.metrics.history <= 256);
+  assert.ok(e.metrics.ordinaryIdentities <= 256);
   assert.ok(e.metrics.rows <= 48);
   assert.ok(e.metrics.toolIdentities <= 64);
   assert.ok(e.metrics.pendingRows <= 128);
@@ -115,6 +116,147 @@ test("repeated roles, interleaving and child replay keep parent and child tool i
   assert.match(e.sections.ledger, /child_tool_uses=0/);
   assert.match(e.sections.ledger, /child_tool_uses=1/);
   bounded(e);
+});
+
+test("matched ordinary lead Bash traffic preserves completed Agent evidence", () => {
+  const f = fixture();
+  f.start("A"); f.end("A");
+  for (let i = 0; i < 130; i++) {
+    const id = "lead-bash-" + i;
+    f.send("tool_use", { id, name: "Bash", input: { command: "task lint" } });
+    f.end(id, "ordinary lead output");
+  }
+  f.start("B"); f.end("B");
+  const e = f.reducer.render();
+  bounded(e);
+  assert.deepEqual({
+    success: e.counts.confirmed.success,
+    collisions: e.counts.collisions,
+    evictions: e.counts.evictions,
+  }, { success: 2, collisions: 0, evictions: 0 });
+});
+
+test("matched child Bash traffic with lead role preserves pending Agent evidence", () => {
+  const f = fixture();
+  f.start("X");
+  for (let i = 0; i < 130; i++) {
+    const id = "child-bash-" + i;
+    const lane = { agent: "lead", agent_instance: "X" };
+    f.send("tool_use", { id, name: "Bash", input: { command: "task lint" } }, lane);
+    f.end(id, "child output", false, lane);
+  }
+  f.end("X");
+  const e = f.reducer.render();
+  bounded(e);
+  assert.deepEqual({
+    success: e.counts.confirmed.success,
+    evictions: e.counts.evictions,
+  }, { success: 1, evictions: 0 });
+});
+
+test("ordinary identities collide with delegation starts in either order and retract completions", () => {
+  for (const order of ["ordinary-first", "delegation-open", "delegation-complete"]) {
+    const f = fixture();
+    if (order !== "ordinary-first") f.start("reuse");
+    if (order === "delegation-complete") {
+      f.end("reuse");
+      assert.equal(f.reducer.render().counts.confirmed.success, 1);
+    }
+    f.send("tool_use", { id: "reuse", name: "Bash" });
+    if (order === "ordinary-first") {
+      f.end("reuse");
+      f.start("reuse");
+    }
+    f.end("reuse");
+    const e = f.reducer.render();
+    assert.equal(e.counts.collisions, 1, order);
+    assert.equal(e.counts.confirmed.success, 0, order);
+    assert.equal(e.counts.provisional, 1, order);
+    assert.match(e.sections.ledger, /ambiguous/);
+    assert.equal(e.metrics.pending, 0);
+    assert.equal(e.metrics.ordinaryIdentities, 1);
+    bounded(e);
+  }
+});
+
+test("ordinary start clears result-only pending entries while Agent still pairs reordered results", () => {
+  const f = fixture();
+  f.end("ordinary");
+  assert.equal(f.reducer.render().metrics.pending, 1);
+  f.send("tool_use", { id: "ordinary", name: "Bash" });
+  assert.equal(f.reducer.render().metrics.pending, 0);
+  f.end("ordinary");
+  f.end("delegation"); f.start("delegation");
+  const e = f.reducer.render();
+  assert.equal(e.metrics.pending, 0);
+  assert.equal(e.counts.confirmed.success, 1);
+  assert.equal(e.counts.unmatchedResults, 2);
+  assert.equal(e.counts.extraResults, 0);
+  assert.equal(e.counts.evictions, 0);
+  assert.match(e.sections.coverage, /includes ordinary results/);
+});
+
+test("ordinary FIFO loss preserves tracked Agent confidence but makes new identities provisional", () => {
+  const f = fixture();
+  f.start("open");
+  for (let i = 0; i < 257; i++) {
+    f.send("tool_use", { id: "ordinary-" + i, name: "Bash" });
+    f.end("ordinary-" + i);
+  }
+  const before = f.reducer.render();
+  assert.equal(before.metrics.ordinaryIdentities, 256);
+  assert.equal(before.metrics.ordinaryIdentityLoss, true);
+  assert.equal(before.metrics.pending, 1);
+  assert.equal(before.counts.evictions, 0);
+  assert.match(before.sections.coverage, /orphanResultEvictions=0/);
+  assert.match(before.sections.coverage, /ordinaryIdentities=256 ordinaryIdentityLoss=true/);
+  f.end("open");
+  assert.equal(f.reducer.render().counts.confirmed.success, 1);
+  f.start("ordinary-0"); f.end("ordinary-0");
+  const e = f.reducer.render();
+  assert.equal(e.counts.confirmed.success, 1);
+  assert.equal(e.counts.provisional, 1);
+  assert.equal(e.counts.collisions, 0, "the oldest ordinary key was evicted");
+  bounded(e);
+});
+
+test("ordinary cache keeps exact lanes and UTF-16 identities independent", () => {
+  const f = fixture();
+  const lone = String.fromCharCode(0xd800) + "x";
+  const replacement = String.fromCharCode(0xfffd) + "x";
+  f.send("tool_use", { id: "b", name: "Bash" }, { agent_instance: "a:" });
+  f.send("tool_use", { id: lone, name: "Bash" });
+  f.send("tool_use", { id: "unknown", name: "Bash" }, { agent: null });
+  f.start("a:b"); f.end("a:b");
+  f.start(replacement); f.end(replacement);
+  f.start("unknown"); f.end("unknown");
+  assert.equal(f.reducer.render().counts.confirmed.success, 3);
+  f.start(lone); f.end(lone);
+  const e = f.reducer.render();
+  assert.equal(e.counts.confirmed.success, 3);
+  assert.equal(e.counts.collisions, 1);
+  assert.equal(e.counts.provisional, 1);
+  bounded(e);
+});
+
+test("ordinary cache rejects oversized keys and stays within the populated state budget", () => {
+  const f = fixture();
+  for (let i = 0; i < 256; i++) {
+    const id = String(i).padStart(4, "0") + "x".repeat(245);
+    f.send("tool_use", { id, name: "Bash" });
+    f.start(String(i).padStart(4, "0") + "y".repeat(245));
+  }
+  const populated = f.reducer.render();
+  assert.equal(populated.metrics.ordinaryIdentities, 256);
+  assert.equal(populated.metrics.ordinaryIdentityLoss, false);
+  assert.ok(populated.metrics.stateStringChars >= 256 * 256 * 2);
+  bounded(populated);
+  f.send("tool_use", { id: "z".repeat(257), name: "Bash" });
+  f.send("tool_use", { id: "valid", name: "Bash" }, { agent_instance: "i".repeat(257) });
+  const e = f.reducer.render();
+  assert.equal(e.metrics.ordinaryIdentities, 256);
+  assert.equal(e.metrics.ordinaryIdentityLoss, false);
+  assert.equal(e.counts.oversizedKeys, 2);
 });
 
 test("results before starts pair by exact lane; resume and seq replay do not fabricate outcomes", () => {

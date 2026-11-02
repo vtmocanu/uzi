@@ -37,6 +37,7 @@ export interface JudgeEvidence {
     unmatchedResults: number; incomplete: number; omittedRows: number;
   };
   metrics: { pending: number; history: number; historySaturated: boolean; rows: number;
+    ordinaryIdentities: number; ordinaryIdentityLoss: boolean;
     toolIdentities: number; reservoirEvents: number; retainedChars: number; stateStringChars: number;
     pendingRows: number; failedPairs: number };
 }
@@ -147,7 +148,8 @@ function compare(a: Row, b: Row): number {
 /**
  * Feed persisted messages once, in increasing seq order; page boundaries have no effect.
  * Overlapping/replayed seqs are ignored, counted, and never imply a second dispatch.
- * Retained state: 256 history keys, 128 pending entries, 48 ledger rows, 64 tool
+ * Retained state: 256 history keys, 256 ordinary identity keys, 128 pending entries,
+ * 48 ledger rows, 64 tool
  * keys, 72 prose snippets; string slots stay below 600,000 chars (including copies).
  * Identity replay at a NEW seq is a collision. Pending FIFO eviction never forgets a
  * remembered dispatch tombstone. After history saturation unremembered IDs are provisional.
@@ -173,6 +175,8 @@ export class JudgeEvidenceReducer {
   private confirmed: Record<Outcome, number> = { success: 0, failed: 0, interrupted: 0, unknown: 0 };
   private history = new Map<string, History>();
   private pending = new Map<string, Pending>();
+  private ordinaryIdentities = new Set<string>();
+  private ordinaryIdentityLoss = false;
   private rows: Row[] = [];
   private tools = new Map<string, ToolCounts>();
   private overflow: ToolCounts = { lead: 0, child: 0, unknown: 0 };
@@ -234,8 +238,9 @@ export class JudgeEvidenceReducer {
       this.boundary = { seq: m.seq, time: ownedPrefix(str(m.created_at), 64), id: ownedPrefix(str(p["id"]), 256) };
       this.afterDispatch = 0;
     }
-    if (!dispatch && m.kind !== "tool_result") return;
-    const id = str(p[dispatch ? "id" : "tool_use_id"]);
+    const ordinary = m.kind === "tool_use" && !dispatch;
+    if (!dispatch && !ordinary && m.kind !== "tool_result") return;
+    const id = str(p[m.kind === "tool_use" ? "id" : "tool_use_id"]);
     const instance = m.agent_instance ?? "";
     // Length-prefixed lane prevents delimiter collisions. Never truncate a matching key.
     const category = lane(m);
@@ -250,16 +255,34 @@ export class JudgeEvidenceReducer {
     }
     const key = ownedPrefix(category + ":" + instance.length + ":" + instance + id, 256);
     let h = this.history.get(key);
-    if (dispatch) {
+    const old = this.pending.get(key);
+    if ((dispatch && (h || this.ordinaryIdentities.has(key))) || (ordinary && (h || old?.row))) {
+      this.collisions++;
       if (h) {
-        this.collisions++;
         h.tainted = true;
         if (h.outcome) { this.confirmed[h.outcome]--; delete h.outcome; }
-        for (const row of this.activeRows()) if (row.key === key) row.ambiguous = true;
-      } else if (this.history.size < 256) {
-        h = { tainted: false, evicted: this.orphanResultEvictions > 0 }; this.history.set(key, h);
       }
-      const old = this.pending.get(key);
+      for (const row of this.activeRows()) if (row.key === key) row.ambiguous = true;
+    }
+    if (ordinary) {
+      // FIFO identities survive ordinary results to detect later cross-kind reuse.
+      // One insertion evicts at most one key; loss affects only new delegation histories.
+      if (!this.ordinaryIdentities.has(key)) {
+        if (this.ordinaryIdentities.size === 256) {
+          this.ordinaryIdentities.delete(this.ordinaryIdentities.values().next().value!);
+          this.ordinaryIdentityLoss = true;
+        }
+        this.ordinaryIdentities.add(key);
+      }
+      if (old?.result && !old.row) this.pending.delete(key);
+      return;
+    }
+    if (dispatch) {
+      if (!h && this.history.size < 256) {
+        h = { tainted: this.ordinaryIdentities.has(key),
+          evicted: this.orphanResultEvictions > 0 || this.ordinaryIdentityLoss };
+        this.history.set(key, h);
+      }
       if (old?.ambiguous && h) h.tainted = true;
       const row: Row = { key, id: ownedPrefix(id, 256), instance: ownedPrefix(instance, 256),
         role: ownedPrefix(str(record(p["input"])?.["subagent_type"]), 256) || "unknown",
@@ -273,12 +296,13 @@ export class JudgeEvidenceReducer {
         this.put(key, { row });
       }
     } else {
+      // Delegation history/rows take priority over a known ordinary identity.
+      if (this.ordinaryIdentities.has(key) && !h && !old?.row) return;
       const result = { seq: m.seq, time: ownedPrefix(str(m.created_at), 64), outcome: outcome(p), text,
         cause: typeof p["content"] === "string" && INTERRUPTIONS.has(p["content"])
           ? p["content"] === "delegation stopped by the run; child settlement not confirmed" ? "run stopped; settlement unconfirmed"
             : p["content"] === "delegation still open at turn end; child settlement not confirmed" ? "open at turn end; settlement unconfirmed"
               : "provider stream failure; settlement unconfirmed" : undefined };
-      const old = this.pending.get(key);
       if (old?.row) {
         this.match(old.row, result, h); this.pending.delete(key);
       } else if (h || old?.result) {
@@ -350,6 +374,7 @@ export class JudgeEvidenceReducer {
   private stateStringChars(): number {
     let chars = 0;
     for (const key of this.history.keys()) chars += key.length;
+    for (const key of this.ordinaryIdentities) chars += key.length;
     for (const [key, p] of this.pending) {
       chars += key.length;
       if (p.result) chars += p.result.time.length + p.result.text.length + (p.result.cause?.length ?? 0);
@@ -405,8 +430,10 @@ export class JudgeEvidenceReducer {
       + " omitted=" + counts.omitted + "; sample omissions are not unfetched events."
       + "\nPairing confirmed=" + JSON.stringify(this.confirmed) + " provisional=" + provisional
       + " incomplete=" + incomplete + " unmatched raw results=" + counts.unmatchedResults
+      + " (includes ordinary results; not an orphan delegation count)"
       + " observedExtraResults=" + this.extraResults + " orphanResultEvictions=" + this.orphanResultEvictions
       + (this.orphanResultEvictions ? " (later untracked identities provisional)" : "") + " pending=" + this.pending.size + " evictions=" + this.evictions
+      + " ordinaryIdentities=" + this.ordinaryIdentities.size + " ordinaryIdentityLoss=" + this.ordinaryIdentityLoss
       + " tombstones=" + this.history.size + " historySaturated=" + (this.history.size === 256)
       + " collisions=" + this.collisions + " oversizedKeys=" + this.oversizedKeys + " ignoredSeqs=" + this.duplicates
       + "\nLedger rows=" + this.rows.length + " omittedRows=" + counts.omittedRows
@@ -415,6 +442,7 @@ export class JudgeEvidenceReducer {
     return { sections: { coverage, ledger, aggregates, prose }, counts,
       metrics: { pending: this.pending.size, history: this.history.size, historySaturated: this.history.size === 256,
         rows: this.rows.length, toolIdentities: this.tools.size,
+        ordinaryIdentities: this.ordinaryIdentities.size, ordinaryIdentityLoss: this.ordinaryIdentityLoss,
         reservoirEvents: Object.values(this.reservoirs).reduce((n, a) => n + a.length, 0) + this.failedPairs.length * 2,
         pendingRows: Array.from(this.pending.values()).filter(p => p.row).length,
         failedPairs: this.failedPairs.length,
