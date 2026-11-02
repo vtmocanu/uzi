@@ -168,3 +168,28 @@ describe("capability advertisement", () => {
     assert.ok(none?.includes("forge_api_success_v1"));
   });
 });
+
+it("manifest adoption and publication registration retain unresolved policy protection", async () => {
+  const outbox = makeOutbox(tmpRoot());
+  await outbox.init();
+  await outbox.markSpillUnclean(RUN);
+  await ackedRecord(outbox);
+  await outbox.journalFinalize(RUN, 4);
+  assert.equal(outbox.listPublicationRegisterEntries().length, 1);
+  const token = outbox.reservePolicyFlight(RUN, 7);
+  assert.ok(token);
+  assert.equal(outbox.selectPolicyFlight(token, RUN_B), true);
+  const pending = outbox.listPendingOutcomeSources();
+  assert.equal(pending.length, 1);
+  assert.equal(outbox.hasPublicationRecords(RUN), true);
+  assert.deepEqual(outbox.listPublicationRegisterEntries(), [], "policy selection withholds publication attestation");
+  await (outbox as unknown as { loadRun(runId: string): Promise<void> }).loadRun(RUN);
+  assert.deepEqual(outbox.listPendingOutcomeSources(), pending, "manifest adoption cannot overwrite the selected policy state");
+  assert.equal(outbox.hasPublicationRecords(RUN), true, "manifest adoption cannot overwrite publication state");
+  const { snapshot } = await register(outbox);
+  assert.ok(snapshot);
+  assert.equal(snapshot.pending_overflow, true, "publication attestation never hides the policy blocker");
+  assert.equal(snapshot.publication_resume, undefined, "unresolved policy cannot attest publication-only authority");
+  assert.equal(snapshot.finalize_resume, undefined, "publication records remain excluded from the finalize allowance");
+  assert.deepEqual(outbox.listPendingOutcomeSources(), pending);
+});

@@ -126,6 +126,8 @@ ON CONFLICT (worker_id, run_id) DO UPDATE SET
 WITH candidates AS MATERIALIZED (
     SELECT r.id, r.kind FROM runs r, worker_active_runs a
     WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
+  AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
   AND (r.checkpoint_coordinates IS NULL OR EXISTS (
@@ -197,6 +199,8 @@ WITH candidates AS MATERIALIZED (
       AND lead.claim_generation = cc.lead_claim_generation
       AND EXISTS (
           SELECT 1 FROM runs r WHERE r.id = cc.checker_run_id
+  AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
             AND EXISTS (
     SELECT 1
     FROM jsonb_to_recordset(
@@ -248,6 +252,8 @@ UPDATE runs r SET
     updated_at = now()
 FROM worker_active_runs a
 WHERE a.worker_id = @worker_id AND a.run_id = r.id AND a.terminal_pending = false
+  AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
   AND r.worker_id = @worker_id
   AND r.status = 'queued'
   AND (r.checkpoint_coordinates IS NULL OR EXISTS (
@@ -318,6 +324,8 @@ RETURNING r.id, r.user_id, r.status;
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.worker_id = @worker_id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.kind <> 'chat'
   AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
@@ -392,6 +400,8 @@ WITH candidates AS MATERIALIZED (
     JOIN parent_mapping mapping ON mapping.run_id = runs.id
     CROSS JOIN parent_lock_set locks
     WHERE runs.id IN (SELECT id FROM candidates)
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
       AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
       AND runs.worker_id = @worker_id
   AND runs.kind <> 'chat'
@@ -456,6 +466,8 @@ WITH candidates AS MATERIALIZED (
     -- Recheck the refreshed locked rows, not initial candidate membership.
     SELECT runs.* FROM locked_targets runs CROSS JOIN target_lock_set locks
     WHERE runs.id = ANY(locks.ids)
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
       AND runs.worker_id = @worker_id
   AND runs.kind <> 'chat'
   AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
@@ -552,6 +564,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
 WHERE runs.worker_id = @worker_id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
   AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL                        -- #1247 fence
@@ -618,6 +632,8 @@ RETURNING runs.id, runs.user_id, runs.status;
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.worker_id = @worker_id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.kind <> 'chat'
   AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
@@ -701,6 +717,8 @@ WITH candidates AS MATERIALIZED (
       AND lead.claim_generation = cc.lead_claim_generation
       AND EXISTS (
           SELECT 1 FROM runs r WHERE r.id = cc.checker_run_id
+  AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
             AND EXISTS (
     SELECT 1
     FROM jsonb_to_recordset(
@@ -746,6 +764,8 @@ WITH candidates AS MATERIALIZED (
             AND EXISTS (
                 SELECT 1 FROM locked_parents runs
                 WHERE runs.id = exiting.id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
                   AND runs.status IN ('claimed', 'running')
                   AND runs.claim_released_at IS NULL
                   AND (runs.worker_id = @worker_id
@@ -787,6 +807,8 @@ UPDATE runs SET status = 'queued', status_since = sqlc.arg('now')::timestamptz, 
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
 WHERE runs.worker_id = @worker_id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
   AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL                        -- #1247 fence
@@ -867,6 +889,8 @@ RETURNING runs.id, runs.user_id, runs.status;
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.worker_id = @worker_id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
       AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
       AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
       AND (runs.kind = 'chat'
@@ -924,6 +948,8 @@ WITH candidates AS MATERIALIZED (
     JOIN parent_mapping mapping ON mapping.run_id = runs.id
     CROSS JOIN parent_lock_set locks
     WHERE runs.id IN (SELECT id FROM candidates)
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
       AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
       AND runs.worker_id = @worker_id
       AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
@@ -971,6 +997,8 @@ WITH candidates AS MATERIALIZED (
     -- Recheck the refreshed locked rows, not initial candidate membership.
     SELECT runs.* FROM locked_targets runs CROSS JOIN target_lock_set locks
     WHERE runs.id = ANY(locks.ids)
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
       AND runs.worker_id = @worker_id
       AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
       AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
@@ -1059,6 +1087,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     updated_at = now()
 FROM eligible_candidates candidate
 WHERE runs.claim_released_at IS NULL AND runs.id = candidate.run_id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.worker_id = @worker_id
   AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
@@ -1111,6 +1141,8 @@ RETURNING runs.id, runs.status;
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.worker_id = @worker_id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
       AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
       AND (runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
       AND (runs.kind = 'chat'
@@ -1177,6 +1209,8 @@ WITH candidates AS MATERIALIZED (
       AND lead.claim_generation = cc.lead_claim_generation
       AND EXISTS (
           SELECT 1 FROM runs r WHERE r.id = cc.checker_run_id
+  AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
             AND EXISTS (
     SELECT 1
     FROM jsonb_to_recordset(
@@ -1250,6 +1284,8 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.re
     updated_at = now()
 FROM eligible_candidates candidate
 WHERE runs.id = candidate.run_id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.worker_id = @worker_id
   AND runs.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND (runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
@@ -1312,6 +1348,8 @@ RETURNING runs.id;
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.worker_id = @worker_id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.claim_released_at IS NULL
   AND runs.status = 'running'
   AND runs.kind <> 'chat'
@@ -1371,6 +1409,8 @@ WITH candidates AS MATERIALIZED (
     JOIN parent_mapping mapping ON mapping.run_id = runs.id
     CROSS JOIN parent_lock_set locks
     WHERE runs.id IN (SELECT id FROM candidates)
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
       AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
       AND runs.worker_id = @worker_id
   AND runs.claim_released_at IS NULL
@@ -1420,6 +1460,8 @@ WITH candidates AS MATERIALIZED (
     -- Recheck the refreshed locked rows, not initial candidate membership.
     SELECT runs.* FROM locked_targets runs CROSS JOIN target_lock_set locks
     WHERE runs.id = ANY(locks.ids)
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
       AND runs.worker_id = @worker_id
   AND runs.claim_released_at IS NULL
   AND runs.status = 'running'
@@ -1505,6 +1547,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
 WHERE runs.worker_id = @worker_id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.claim_released_at IS NULL
   AND runs.status = 'running'
   AND runs.kind <> 'chat'
@@ -1557,6 +1601,8 @@ RETURNING runs.id, runs.status;
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.worker_id = @worker_id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.claim_released_at IS NULL
   AND runs.status = 'running'
   AND runs.kind <> 'chat'
@@ -1625,6 +1671,8 @@ WITH candidates AS MATERIALIZED (
       AND lead.claim_generation = cc.lead_claim_generation
       AND EXISTS (
           SELECT 1 FROM runs r WHERE r.id = cc.checker_run_id
+  AND r.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (r.policy_outcome_id IS NULL OR r.policy_resolved_at IS NOT NULL)
             AND EXISTS (
     SELECT 1
     FROM jsonb_to_recordset(
@@ -1670,6 +1718,8 @@ WITH candidates AS MATERIALIZED (
             AND EXISTS (
                 SELECT 1 FROM locked_parents runs
                 WHERE runs.id = exiting.id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
                   AND runs.status IN ('claimed', 'running')
                   AND runs.claim_released_at IS NULL
                   AND (runs.worker_id = @worker_id
@@ -1695,6 +1745,8 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.re
     codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
 WHERE runs.worker_id = @worker_id
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND runs.claim_released_at IS NULL
   AND runs.status = 'running'
   AND runs.kind <> 'chat'

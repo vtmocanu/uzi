@@ -573,14 +573,17 @@ async function main(): Promise<void> {
   // as they start/transition/finish, and the worker reads to build the ActiveSnapshot that
   // rides every heartbeat and run-lane claim. ONE instance so the snapshot epoch is a single
   // process-monotonic counter across the heartbeat and claim loops.
-  // PRD #1391 Run B M4: thread the outbox pending-terminal lister + the live server quota
+  // Include retained physical source identities in snapshots; the terminal sender
+  // continues to use the installed-only listPendingTerminals inventory.
+  // PRD #1391 Run B M4: thread the outbox pending-source lister + the live server quota
   // into the registry (function seams, so the registry stays decoupled from Outbox/WorkerClient).
   // The live cap getter reads the latest valid register or ordinary heartbeat response, so each
   // snapshot uses the current quota; before register it reads undefined (cap 0), which matters if a build
   // ran that early (it does not — snapshots build after register).
   const activeRuns = new ActiveRunRegistry(
-    () => outbox.listPendingTerminals(),
+    () => outbox.listPendingOutcomeSources(),
     () => client.workerOutboxMaxPending,
+    () => outbox.policyInventoryCoverageAvailable(),
   );
   // Pin the SDK's HOME (session transcripts under $HOME/.claude/projects) onto
   // the persistent data volume so `docker compose down && up` doesn't wipe
