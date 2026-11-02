@@ -1417,8 +1417,10 @@ export class RecoveryCoordinator {
       return { kind: "refused", reason: "invalid_input" };
     let entered = false;
     try {
-      return await MaintenanceBudget.runProducer(async budget => this.inAuthority(() =>
-        runCaptureCycle(path.resolve(this.runDir(input.runId), `generation-${input.predecessorGeneration}`), "wait", () =>
+      return await MaintenanceBudget.runProducer(async budget => this.pinRestoreSelection.run(
+        this.pinRestoreSelection.getStore() ?? { signal: budget.signal, entries: 0, bytes: 0, exhausted: false },
+        () => this.inAuthority(() =>
+          runCaptureCycle(path.resolve(this.runDir(input.runId), `generation-${input.predecessorGeneration}`), "wait", () =>
           this.withJournalLock(input.runId, async () => {
             const bounds = { signal: budget.signal, deadline: input.deadline };
             const select = async (): Promise<RecoveryRecord> => {
@@ -1493,7 +1495,7 @@ export class RecoveryCoordinator {
               if (!await revalidate()) throw new Error("saved record changed");
               return { kind: "selected" as const, value };
             } finally { live = false; await validating; }
-          }, budget.signal))),
+          }, budget.signal)))),
       { signal: input.signal, durationMs: Math.max(0, input.deadline - Date.now()) });
     } catch {
       return { kind: "refused", reason: input.signal.aborted || Date.now() >= input.deadline ? "cancelled" :
@@ -4362,6 +4364,12 @@ export class RecoveryCoordinator {
    *  captureIds this charged slot indexed, while the slot, writer exclusion and custody stay live. */
   private readonly producerPermit = new AsyncLocalStorage<{ captureIds: Set<string>; live: () => boolean }>();
 
+  // One selection, including all nested reopens and callback revalidation, shares
+  // the existing saved-metadata limits. Exhaustion is latched until the scope ends.
+  private readonly pinRestoreSelection = new AsyncLocalStorage<{
+    signal: AbortSignal; entries: number; bytes: number; exhausted: boolean;
+  }>();
+
   private readonly savedEvidenceOnly = new AsyncLocalStorage<{
     signal: AbortSignal; entries: number; bytes: number; exhausted: boolean;
   }>();
@@ -4371,16 +4379,17 @@ export class RecoveryCoordinator {
   private checkSavedMetadata(resource?: "entries" | "bytes", amount = 0): void {
     this.passSignal.getStore()?.throwIfAborted();
     M1MaintenanceResources.checkIfActive();
-    const pass = this.savedEvidenceOnly.getStore();
-    if (!pass) return;
-    MaintenanceBudget.current()?.check();
-    pass.signal.throwIfAborted();
-    if (resource) {
-      const limit = resource === "entries" ? 4096 : 32 * 1024 ** 2;
-      if (amount > limit - pass[resource]) pass.exhausted = true;
-      else pass[resource] += amount;
+    for (const pass of [this.savedEvidenceOnly.getStore(), this.pinRestoreSelection.getStore()]) {
+      if (!pass) continue;
+      MaintenanceBudget.current()?.check();
+      pass.signal.throwIfAborted();
+      if (resource) {
+        const limit = resource === "entries" ? 4096 : 32 * 1024 ** 2;
+        if (amount > limit - pass[resource]) pass.exhausted = true;
+        else pass[resource] += amount;
+      }
+      if (pass.exhausted) throw new Error("terminal journal metadata exhausted");
     }
-    if (pass.exhausted) throw new Error("terminal journal metadata exhausted");
   }
 
   /** Check existing journal scopes only; no new clock or authority is introduced. */
@@ -5991,7 +6000,7 @@ export class RecoveryCoordinator {
     // Disappearance after a positive directory check is unknown, not empty proof.
     const before = await fs.lstat(dir);
     this.checkJournalMetadata(budget);
-    if (budget || this.savedEvidenceOnly.getStore() || M1MaintenanceResources.active()) {
+    if (budget || this.savedEvidenceOnly.getStore() || this.pinRestoreSelection.getStore() || M1MaintenanceResources.active()) {
       names = [];
       for await (const name of this.journalNames(dir, budget, completeOrigin)) names.push(name);
     } else names = await fs.readdir(dir);
@@ -6035,7 +6044,7 @@ export class RecoveryCoordinator {
       if (Date.now() >= budget.deadline) throw new Error("origin journal deadline");
     }
     this.checkJournalMetadata(budget);
-    if ((budget || this.savedEvidenceOnly.getStore() || M1MaintenanceResources.active()) && (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs ||
+    if ((budget || this.savedEvidenceOnly.getStore() || this.pinRestoreSelection.getStore() || M1MaintenanceResources.active()) && (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs ||
         before.ctimeMs !== after.ctimeMs)) throw new Error("report journal directory changed");
     return records;
   }
@@ -6168,11 +6177,13 @@ export class RecoveryCoordinator {
   ): Promise<{ kind: "ok"; record: RecoveryRecord } | { kind: "absent" } | { kind: "unreadable" }> {
     if (!this.key) return { kind: "unreadable" };
     const savedPass = this.savedEvidenceOnly.getStore();
+    const selection = this.pinRestoreSelection.getStore();
+    strictContents ||= selection !== undefined;
     this.checkSavedMetadata();
-    if (savedPass || M1MaintenanceResources.active()) {
+    if (savedPass || selection || M1MaintenanceResources.active()) {
       // Every nested journal reopen uses the same byte cap and no-follow proofs.
       // Infinity selects the bounded reader without creating or renewing a deadline.
-      const signals = [savedPass?.signal, budget?.signal, MaintenanceBudget.signal(),
+      const signals = [savedPass?.signal, selection?.signal, budget?.signal, MaintenanceBudget.signal(),
         M1MaintenanceResources.signalIfActive()].filter((s): s is AbortSignal => s !== undefined);
       budget = { signal: AbortSignal.any(signals), deadline: budget?.deadline ?? Infinity };
       noFollow = true;
@@ -6195,16 +6206,17 @@ export class RecoveryCoordinator {
               this.checkSavedMetadata();
             }
             if (quiet) M1MaintenanceResources.checkIfActive();
-            const precharged = M1MaintenanceResources.active();
+            const precharged = M1MaintenanceResources.active() || selection !== undefined;
             // Reserve the entire stat bound before allocating or reading; failed/short reads keep it charged.
             if (precharged) M1MaintenanceResources.consumeIfActive("metadataBytes", Number(before.size));
+            if (selection) this.checkSavedMetadata("bytes", Number(before.size));
             const bytes = Buffer.alloc(precharged ? Number(before.size) : Math.min(1024 * 1024 + 1,
               savedPass ? 32 * 1024 ** 2 - savedPass.bytes + 1 : Infinity));
             let length = 0;
             while (length < bytes.length) {
               this.checkJournalMetadata(budget);
               const { bytesRead } = await file.read(bytes, length, bytes.length - length, null);
-              this.checkSavedMetadata("bytes", bytesRead);
+              if (!selection) this.checkSavedMetadata("bytes", bytesRead);
               this.checkJournalMetadata(budget);
               if (!bytesRead) break;
               length += bytesRead;

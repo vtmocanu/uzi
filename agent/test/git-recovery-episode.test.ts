@@ -117,6 +117,21 @@ test("protected descriptor conflicts and malformed evidence refuse detachment an
   assert.equal((await cache.readInventoryCloneHeads(bare, runId)).kind, "unknown");
 });
 
+test("protected V1 descriptors retain the original JSON decoder semantics", async () => {
+  await ready();
+  const before = journal();
+  await cache.detachTerminalRetained(bare, branch, key, before);
+  const descriptorKey = `uzi-retained.${runId}.journal`;
+  const descriptor = git(bare, ["config", descriptorKey]);
+  // JSON.parse keeps the final duplicate member; V2's strict decoder rejects it.
+  const legacyRaw = descriptor.replace('"version":1', '"version":0,"version":1');
+  assert.notEqual(legacyRaw, descriptor);
+  git(bare, ["config", descriptorKey, legacyRaw]);
+  await cache.detachTerminalRetained(bare, branch, key, before);
+  assert.equal(git(bare, ["config", descriptorKey]), legacyRaw);
+  assert.equal((await cache.readInventoryCloneHeads(bare, runId)).kind, "verified");
+});
+
 test("unrelated protected record missing .git does not block canonical seed", async () => {
   const { tip } = await ready();
   const before = journal();
@@ -505,6 +520,29 @@ test("backward and invalid clocks fail closed at reservation, capture, adoption 
       }
     }
   } finally { Date.now = realNow; }
+});
+
+test("invalid clocks still refuse malformed V2 before probing a recovery source", async t => {
+  await ready();
+  const before = journal();
+  const descriptorKey = `uzi-retained.${runId}.journal`;
+  const descriptor = JSON.stringify({ version: 2, branch, key, journal: before });
+  git(bare, ["config", descriptorKey, descriptor]);
+  let probes = 0;
+  const lstat = fs.promises.lstat.bind(fs.promises);
+  t.mock.method(fs.promises, "lstat", async (...args: Parameters<typeof lstat>) => {
+    if (String(args[0]) === source.clonePath || String(args[0]) === path.join(source.clonePath, ".git")) probes++;
+    return lstat(...args);
+  });
+  for (const now of [NaN, Infinity]) {
+    const clock = t.mock.method(Date, "now", () => now);
+    try {
+      await assert.rejects(cache.reserveRecoveryIteration(bare, branch, key, source));
+    } finally { clock.mock.restore(); }
+    assert.equal(probes, 0);
+    assert.deepEqual(journal(), before);
+    assert.equal(git(bare, ["config", descriptorKey]), descriptor);
+  }
 });
 
 test("server episode renewal persists through real Git recreation and cannot renew twice", async t => {
