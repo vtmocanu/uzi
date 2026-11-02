@@ -236,18 +236,22 @@ remain eligible.
 
 Read the resulting assessment with these limits in mind:
 
-- **Delegation identity and outcomes:** pairing uses exact invocation IDs
-  with agent instances, not guesses from repeated role names or replays.
-  Collisions, pending-entry eviction and exhausted identity history reduce
-  certainty. Confirmed outcomes, provisional pairings, incomplete starts and
-  unmatched results are distinct observations, not interchangeable failures.
-  Ordinary tool starts use a separate exact-identity cache of up to 256 keys,
-  retained after completion to recognize reuse across ordinary tools and
-  delegations. Remembered ordinary results do not consume delegation pending
-  slots. Once ordinary identity history is lost, new delegation identities
-  remain provisional; already tracked delegations can still settle unless a
-  specific identity collision is observed. Unknown orphan results remain
-  uncertain, with bounded tracking rather than assumed delegation outcomes.
+- **Delegation identity and outcomes:** pairing uses exact lane, agent-instance
+  and invocation-ID associations, not guesses from repeated role names or
+  replays. Confirmed pairs mean observed exact associations and recognized
+  recorded outcomes without detected ambiguity within available collision
+  coverage, not globally unique execution or task correctness. Collisions,
+  orphan-result or pending-entry eviction, and the 256-key delegation-history
+  limit constrain confirmation. Confirmed outcomes, provisional pairings,
+  incomplete starts and unmatched results are distinct observations, not
+  interchangeable failures. Ordinary tool starts use a separate exact-identity
+  FIFO cache of up to 256 keys, retained after completion to recognize reuse
+  across ordinary tools and delegations. Remembered ordinary results do not
+  consume delegation pending slots. After ordinary identity history is lost,
+  cross-kind reuse detection is limited to retained ordinary keys; that loss
+  alone does not suppress an observed delegation outcome. Unknown orphan
+  results remain uncertain, with bounded tracking rather than assumed
+  delegation outcomes.
 - **Time and causes:** intervals come from persisted-message timestamps,
   not measured execution time. Historical budgets and causes remain unknown
   when absent. A deadline-shaped interval is a hypothesis, not a confirmed
