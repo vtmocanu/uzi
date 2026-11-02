@@ -28,6 +28,7 @@ function retainedIdentity(before: RecoveryRecord, after: RecoveryRecord, acknowl
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true }); });
 async function setup(variant: Variant = "uploaded") {
+  await fs.mkdir(path.resolve("../.uzi/scratch"), { recursive: true });
   const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/bindingless-settlement-"));
   roots.push(root);
   const f = await fixture(root, variant);
