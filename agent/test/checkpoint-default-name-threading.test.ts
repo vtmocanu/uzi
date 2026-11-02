@@ -14,7 +14,7 @@ const restrictionFacts: NonNullable<CheckpointPublicationContext["restrictionFac
   enrolled: false, blocked: false, roots: [], flaggedOIDs: [], fingerprint: "fixture-confirmed-absence",
 };
 const policy = { version: 1 as const, blocked: false, everKnown: false, flaggedCommits: [], ciGlobs: null, extraFloors: [] };
-function fixture(defaultBranch?: string, codexBoundaryDeadlineMs?: number) {
+function fixture(defaultBranch?: string) {
   const git = new GitCache("/unused", nullLogger());
   git.readRemediationRestrictionFacts = async (bare, branch, runId) => {
     assert.deepEqual([bare, branch, runId], ["bare", "task", "test"]);
@@ -22,7 +22,7 @@ function fixture(defaultBranch?: string, codexBoundaryDeadlineMs?: number) {
   };
   const client = new WorkerClient("http://unused", "test", "test", nullLogger());
   const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch: "task" }) } }),
-    nullLogger(), 1, undefined, { codexBoundaryDeadlineMs, checkpointTestHooks: { retryBackoffMs: [0, 0] } });
+    nullLogger(), 1, undefined, { checkpointTestHooks: { retryBackoffMs: [0, 0] } });
   const claim = { repo: { default_branch: defaultBranch }, secrets: {}, last_seq: 0, kind: "issue" } as Parameters<RunRunner["buildFlight"]>[0];
   const initialized = runner["buildFlight"](claim, "test", { run: async () => ({ branch: "task" }) }, undefined, "", []);
   assert.equal(initialized.owedDefaultBranch, defaultBranch?.trim() || undefined, "custody keeps existing semantics");
@@ -119,8 +119,8 @@ for (const expireOnRetry of [false, true]) {
   it(`HTTP retry uses GitCache replay with original deadline: expired=${expireOnRetry}`, async t => {
     let now = 1_000, requests = 0;
     t.mock.method(Date, "now", () => now);
-    // Keep admission within the same 60-second lifetime this replay fixture exercises.
-    const { git, runner, flight } = fixture("server", 60_000);
+    // Replay keeps its 60-second caller clock with the default local admission bound.
+    const { git, runner, flight } = fixture("server");
     const client = runner["client"];
     const signal = new AbortController().signal;
     const deadlines: number[] = [], remaining: number[] = [];

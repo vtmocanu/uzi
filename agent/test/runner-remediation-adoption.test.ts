@@ -247,6 +247,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
     const accounting = custodyModel.snapshot;
     const mutations = [
       t.mock.method(client, "reserveRecoveryCapture"),
+      t.mock.method(client, "uploadRecoveryBundle"),
       t.mock.method(client, "releaseRecoveryCustody"),
       t.mock.method(client, "reconcileRecoveryCapture"),
       t.mock.method(client, "settleRecoveryHold"),
@@ -255,7 +256,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       t.mock.method(client, "requestBaseAttestationHold"),
     ];
     // WorkerClient has no owner-discard operation; observe the real request seam as
-    // well, including custody routes a future client method might introduce.
+    // well for JSON custody routes; the upload method above uses a separate transport.
     assert.deepEqual(Object.getOwnPropertyNames(Object.getPrototypeOf(client))
       .filter(n => /discard.*(?:custody|recovery|hold)|(?:custody|recovery|hold).*discard/i.test(n)), []);
     const requests = custodyModel.requests;

@@ -1027,3 +1027,126 @@ for (const native of [false, true]) for (const stop of ["caller", "late attempt"
     assert.equal(siblingA, true); assert.equal(siblingB, true);
   });
 }
+
+for (const transport of ["push", "pack/replay"] as const) {
+  for (const clock of ["live", "caller", "maintenance"] as const) {
+    test("Runner transport outlives admission clock: " + transport + "/" + clock, async t => {
+      const f = await fixture();
+      await git.recordRemediationScan(f.bare, BRANCH, f.source, { trusted: true, tip: f.s, flaggedOIDs: [] });
+      const { cache, runner, subject, flight } = f.fresh();
+      flight.publishedTip = f.base; flight.checkpointFloor = f.base;
+      const startedAt = Date.now();
+      let wall = startedAt, transports = 0, guards = 0;
+      t.mock.method(Date, "now", () => wall);
+      const deadline = clock === "caller" || (clock === "maintenance" && transport === "pack/replay")
+        ? wall + 300_000 : Infinity;
+      const caller = new AbortController();
+      const budget = clock === "maintenance" ? new MaintenanceBudget(300_000, () => wall) : undefined;
+      const scan = cache.secretScanCheckpointRange.bind(cache);
+      t.mock.method(cache, "secretScanCheckpointRange", (...args: Parameters<typeof scan>) => {
+        const scope = (cache as any).recoveryOperations.getStore();
+        assert.ok(scope.deadline <= wall + subject.codexBoundaryDeadlineMs, "each candidate scan is bounded");
+        guards++;
+        return scan(...args);
+      });
+      const advance = () => {
+        const scope = (cache as any).recoveryOperations.getStore();
+        assert.equal(scope.deadline, deadline, "actual Git transport inherits only the caller clock");
+        wall += 31_000;
+        assert.equal(scope.signal.aborted, false);
+        transports++;
+      };
+      const run = (cache as any).runGit.bind(cache);
+      t.mock.method(cache as any, "runGit", (bare: string, args: string[], ...rest: unknown[]) => {
+        const operation = run(bare, args, ...rest);
+        if (args[0] === "push") advance();
+        return operation;
+      });
+      const spawn = (cache as any).spawnGit.bind(cache);
+      t.mock.method(cache as any, "spawnGit", (bare: string, args: string[], ...rest: unknown[]) => {
+        const operation = spawn(bare, args, ...rest);
+        if (args[0] === "pack-objects") advance();
+        return operation;
+      });
+      subject.checkpointTestHooks = { retryBackoffMs: [0, 0] };
+      let uploads = 0;
+      t.mock.method(client, "publishCheckpoint", async (_run: string, _tip: string, pack: Parameters<typeof client.publishCheckpoint>[2]) => {
+        for await (const chunk of pack) assert.ok(chunk.length > 0);
+        return ++uploads === 1 ? { ok: false as const, httpStatus: 503 }
+          : { ok: true as const, body: { published: true, ref: "refs/uzi-checkpoints/test" } };
+      });
+      try {
+        const publish = async () => {
+          if (transport === "push") {
+            await subject.pushRemediationCandidate(flight, f.bare, BRANCH, "fixture", fx.originPath, undefined,
+              { candidate: f.s, originalHead: f.s, floor: { kind: "absent" } });
+            assert.equal(command(fx.originPath, "rev-parse", "refs/heads/" + BRANCH), f.s);
+          } else {
+            const result = await subject.publishCheckpointOutcome(flight, f.bare, BRANCH);
+            assert.equal(result.published, true);
+            assert.equal(uploads, 2, "the actual pack is replayed after an explicit 503");
+          }
+        };
+        if (clock === "caller") await cache.withRecoveryOperation(caller.signal, deadline, publish);
+        else if (budget) await MaintenanceBudget.run(budget, publish);
+        else await publish();
+        assert.equal(transports, transport === "push" ? 1 : 2);
+        assert.ok(wall - startedAt > 30_000, "transport completes beyond the admission allowance");
+        assert.ok(guards > 0, "real candidate scans precede transport");
+      } finally { budget?.dispose(); runner.shutdown(); }
+    });
+  }
+}
+
+for (const stop of ["deadline", "caller", "maintenance"] as const) {
+  test("Runner push transport cancels and joins on " + stop, async t => {
+    const f = await fixture(false);
+    const { cache, runner, subject, flight } = f.fresh();
+    let wall = Date.now(), expire: (() => void) | undefined, cancelled = false, settled = false;
+    t.mock.method(Date, "now", () => wall);
+    const deadline = wall + 90_000;
+    const realTimer = globalThis.setTimeout;
+    t.mock.method(globalThis, "setTimeout", (callback: () => void, delay?: number) => {
+      if (delay === 90_000 && !expire) expire = callback;
+      return realTimer(callback, delay);
+    });
+    const budget = stop === "maintenance" ? new MaintenanceBudget(45_000, () => wall) : undefined;
+    const caller = new AbortController();
+    const entered = latch(), closed = latch();
+    const run = (cache as any).runGit.bind(cache);
+    t.mock.method(cache as any, "runGit", (bare: string, args: string[], ...rest: unknown[]) => {
+      if (args[0] !== "push") return run(bare, args, ...rest);
+      assert.equal((cache as any).recoveryOperations.getStore().deadline, deadline);
+      return cache.withBoundaryProcessSpawner(async () => {
+        entered.release();
+        const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
+        stdout.end(); stderr.end();
+        return { stdin, stdout, stderr, completed: closed.promise.then(() => ({ code: 1 })),
+          cancel: async () => { cancelled = true; } };
+      }, new AbortController().signal, () => run(bare, args, ...rest));
+    });
+    const publish = () => cache.withRecoveryOperation(caller.signal, deadline, () =>
+      subject.pushRemediationCandidate(flight, f.bare, BRANCH, "fixture", fx.originPath, undefined,
+        { candidate: f.s, originalHead: f.s, floor: { kind: "absent" } }));
+    const operation = budget ? MaintenanceBudget.run(budget, publish) : publish();
+    const outcome = operation.then(() => "accepted", () => "rejected").finally(() => { settled = true; });
+    try {
+      assert.equal(await Promise.race([entered.promise.then(() => true), outcome.then(() => false)]), true);
+      if (stop === "deadline") {
+        assert.ok(expire);
+        wall = deadline; expire();
+      } else if (budget) {
+        wall += 45_000;
+        assert.throws(() => budget.check(), /maintenance deadline/);
+      } else caller.abort(new Error("caller cancelled"));
+      await tick();
+      assert.equal(cancelled, true);
+      assert.equal(settled, false, "cancellation retains custody until terminal close");
+    } finally {
+      closed.release();
+      await outcome;
+      budget?.dispose(); runner.shutdown();
+    }
+    assert.equal(await outcome, "rejected");
+  });
+}

@@ -18550,7 +18550,8 @@ export class RunRunner {
     };
   }
 
-  /** One bounded publication/transform attempt. A encloses all scans and B callbacks.
+  /** Publication/transform admission. A encloses all scans and B callbacks.
+   * Preparation and each guard are bounded separately; transport keeps the caller's clock.
    * B callbacks consume the supplied facts, never a public journal reader. Each distinct
    * tip is scanned once per callback; a failure stops the attempt and all sibling scans.
    * Findings latch synchronously and are persisted only after the action releases B.
@@ -18565,7 +18566,8 @@ export class RunRunner {
     signal?: AbortSignal, deadlineAt?: number,
   ): Promise<T> {
     const revision = flight.remediationRestrictions?.denialRevision ?? 0;
-    return this.inFlightAuthority(flight, () => this.withRemediationLifecycle(signal, async () => {
+    return this.inFlightAuthority(flight, () => this.git.withRecoveryOperation(
+      signal ?? this.shutdownSignal.signal, deadlineAt ?? Infinity, async () => {
       let record: RemediationRecovery | undefined;
       let facts: CheckpointPublicationContext["restrictionFacts"];
       const selected = this.remediationSource(flight);
@@ -18594,21 +18596,24 @@ export class RunRunner {
               pending.branch !== branch || !pending.requiredOIDs.every(root => record!.flaggedOIDs.includes(root)))))
           throw new SecretRemediationPendingError();
       };
-      const negative = await this.bootstrapRemediationRestrictions(flight, barePath, branch, signal, deadlineAt);
-      if (negative.kind === "unavailable") throw new SecretRemediationPendingError();
-      if (negative.enrolled || flight.remediationRestrictions) {
-        record = await this.restoreRemediationRestrictions(flight);
-        if (!selected.clonePath || !selected.attemptId) throw new SecretRemediationPendingError();
-        facts = await this.git.readRemediationRestrictionFacts(barePath, branch, flight.runId,
-          { runId: selected.runId, clonePath: selected.clonePath, attemptId: selected.attemptId });
-      }
-      check();
+      await this.withRemediationLifecycle(signal, async () => {
+        const negative = await this.bootstrapRemediationRestrictions(flight, barePath, branch, signal, deadlineAt);
+        if (negative.kind === "unavailable") throw new SecretRemediationPendingError();
+        if (negative.enrolled || flight.remediationRestrictions) {
+          record = await this.restoreRemediationRestrictions(flight);
+          if (!selected.clonePath || !selected.attemptId) throw new SecretRemediationPendingError();
+          facts = await this.git.readRemediationRestrictionFacts(barePath, branch, flight.runId,
+            { runId: selected.runId, clonePath: selected.clonePath, attemptId: selected.attemptId });
+        }
+        check();
+      }, deadlineAt);
       const identity: RemediationRestrictionIdentity = { exactRunId: flight.runId,
         ...(record ? { workerSelectedSource: { runId: selected.runId,
           clonePath: selected.clonePath!, attemptId: selected.attemptId! } } : {}) };
       const findings: Array<{ tip: string; findings: SecretFinding[] }> = [];
       try {
-        return await action({ identity, admit: async (source, candidate, floors, supplied) => {
+        return await action({ identity, admit: (source, candidate, floors, supplied) =>
+          this.withRemediationLifecycle(signal, async () => {
           check();
           // A context is fresh under B. Its fingerprint includes the authenticated body,
           // independently confirmed for this selected run/path/attempt before the action.
@@ -18644,12 +18649,12 @@ export class RunRunner {
             }
           }
           check();
-        } });
+        }, deadlineAt) });
       } finally {
         for (const finding of findings)
           await this.persistRemediationRestrictions(flight, barePath, branch, finding.tip, finding.findings);
       }
-    }, deadlineAt), { ...this.authorityWait(flight), ...(signal ? { signal } : {}),
+    }), { ...this.authorityWait(flight), ...(signal ? { signal } : {}),
       ...(deadlineAt ? { timeoutMs: Math.max(1, deadlineAt - Date.now()) } : {}) });
   }
 
