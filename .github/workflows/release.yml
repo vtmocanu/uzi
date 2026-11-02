@@ -621,6 +621,8 @@ jobs:
           path: ${{ runner.temp }}/agent-digest/${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 1
+          # A "re-run all jobs" uploads this name again in the same run.
+          overwrite: true
 
   # One index per template over the per-arch digests publish-agent pushed. The index is what
   # :<version> and :<short_sha> name, so a node of either arch pulls its own image by tag.
@@ -663,33 +665,16 @@ jobs:
           set -euo pipefail
           REPO="ghcr.io/vtmocanu/uzi/agent-${TEMPLATE}"
           dir="${RUNNER_TEMP}/agent-digest"
-          want=""
-          refs=()
-          for arch in amd64 arm64; do
-            d="$(cat "${dir}/${arch}")"
-            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad ${arch} digest '$d'" >&2; exit 1; }
-            refs+=("${REPO}@${d}")
-            want+="linux/${arch}=${d}"$'\n'
+          AMD64="$(cat "${dir}/amd64")"
+          ARM64="$(cat "${dir}/arm64")"
+          for d in "$AMD64" "$ARM64"; do
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad digest '$d'" >&2; exit 1; }
           done
-          docker buildx imagetools create -t "${REPO}:${VERSION}" -t "${REPO}:${SHORT_SHA}" "${refs[@]}"
-          # GHCR's tag read-after-write can lag a push by a moment (issue #1102): poll briefly.
-          index=""
-          for t in "${VERSION}" "${SHORT_SHA}"; do
-            got=""
-            for i in 1 2 3 4 5; do
-              got="$(docker buildx imagetools inspect "${REPO}:${t}" --format '{{.Manifest.Digest}}' 2>/dev/null)" \
-                && [ -n "$got" ] && break
-              sleep "$((i * 2))"
-            done
-            [[ "$got" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "${REPO}:${t} did not resolve" >&2; exit 1; }
-            [ -z "$index" ] || [ "$got" = "$index" ] || { echo "${REPO}: :${VERSION} and :${t} differ" >&2; exit 1; }
-            index="$got"
-          done
-          # The tag must name an index of exactly these two children, nothing else.
-          have="$(docker buildx imagetools inspect "${REPO}@${index}" --raw \
-            | jq -r '.manifests[] | "\(.platform.os)/\(.platform.architecture)=\(.digest)"' | sort)"
-          [ "$have" = "$(printf '%s' "$want" | sort)" ] \
-            || { printf 'index %s children:\n%s\nwant:\n%s' "$index" "$have" "$want" >&2; exit 1; }
+          docker buildx imagetools create -t "${REPO}:${VERSION}" -t "${REPO}:${SHORT_SHA}" \
+            "${REPO}@${AMD64}" "${REPO}@${ARM64}"
+          # Both tags must name one index of exactly these two children. A tag that still
+          # resolves to its previous index (GHCR lag, a promoted stable, rerun legs) is retried.
+          index="$(scripts/agent-index-verify.sh "$REPO" "$VERSION" "$SHORT_SHA" "$AMD64" "$ARM64")"
           echo "agent/${TEMPLATE}: :${VERSION} and :${SHORT_SHA} -> ${index}"
           echo "digest=${index}" >> "$GITHUB_OUTPUT"
       # Named "Sign image" so release-verify.sh counts it among the expected signatures.
