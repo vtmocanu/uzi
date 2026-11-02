@@ -291,7 +291,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
             runId: claim.run_id, barePath: bare, branch, worktreePath: clone.path,
             runnerClone: clone, cancel: new AbortController(),
             steering: { lifecycleSignal: () => new AbortController().signal },
-          }), /history restricted/);
+          }), /remediation continuation published floor conflict/);
         } finally { fresh.shutdown(); }
       }
       if (lateSeed) {
