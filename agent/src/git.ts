@@ -9705,7 +9705,9 @@ export class GitCache {
         }
         let journal: RecoveryJournalEntry | undefined;
         try {
-          journal = pinJournals.get(v) ?? parseRecoveryJournal(v);
+          // readRetainedPinMetadata has already strictly classified new forms.
+          // Preserve legacy metadata and its raw digest for the strict-plain guard.
+          journal = pinJournals.get(v) ?? recoveryJournalValue(JSON.parse(v), v);
         } catch {
           this.checkRecoveryInterruption();
           if (this.epochRetained.getStore()) throw new Error("unreadable epoch journal");
@@ -18132,9 +18134,12 @@ try {
           }, () => { scanComplete = true; });
         } catch (error) {
           if (newForm || !scanComplete) throw error;
-          // Legacy malformed values remain the authority parser's responsibility.
-          if (++sources > limits.maxMetadataRecords) throw new Error("epoch source record limit");
-          continue;
+          // Completed legacy classification keeps JSON.parse's last-key-wins metadata
+          // semantics; the authority parser and strict-plain guard still own acceptance.
+          try { parsed = JSON.parse(raw); } catch {
+            if (++sources > limits.maxMetadataRecords) throw new Error("epoch source record limit");
+            continue;
+          }
         }
         if (key.startsWith("uzi-retained.") && parsed && typeof parsed === "object" &&
             "version" in parsed && parsed.version === 2) {
