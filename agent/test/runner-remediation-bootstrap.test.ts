@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { syncBuiltinESMExports } from "node:module";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { MaintenanceResources, RecoveryMaintenance } from "../src/recovery-maintenance.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import { acquireWorkerLifetime } from "../src/authority-lock.js";
+import { AuthorityRuntime } from "../src/authority-runtime.js";
+import { testLockOptions } from "./authority-test-support.js";
 import { test } from "node:test";
 import { GitCache, type CheckpointRange } from "../src/git.js";
 import { RunRunner } from "../src/runner.js";
@@ -480,5 +489,425 @@ for (const late of ["confirmed", "unavailable", "blocked", "reconfirmed", "initi
       }
       assert.equal(observed, true);
     } finally { runner.shutdown(); }
+  });
+}
+
+function latch() {
+  let release!: () => void;
+  const promise = new Promise<void>(resolve => { release = resolve; });
+  return { promise, release };
+}
+const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+
+for (const stage of ["negative", "restore"] as const) {
+  for (const stop of ["cancel", "expiry"] as const) {
+    test("remediation lifecycle refuses queued launch proof: " + stage + "/" + stop, async t => {
+      const f = await fixture();
+      await git.recordRemediationScan(f.bare, BRANCH, f.source, { trusted: true, tip: f.s, flaggedOIDs: [] });
+      const { cache, runner, subject, flight } = f.fresh();
+      flight.executor = {};
+      flight.publishedTip = f.base; flight.checkpointFloor = f.base;
+      t.mock.method(cache, "secretScanCheckpointRange", async () => ({ trusted: true as const, findings: [] }));
+      const entered = latch(), release = latch();
+      let holder: Promise<void> | undefined, callbacks = 0, settled = false;
+      let queryScope: any;
+      let wall = Date.now(), expire: (() => void) | undefined;
+      t.mock.method(Date, "now", () => wall);
+      const realTimer = globalThis.setTimeout;
+      t.mock.method(globalThis, "setTimeout", (callback: () => void, delay?: number) => {
+        if (delay === subject.codexBoundaryDeadlineMs && !expire) expire = callback;
+        return realTimer(callback, delay);
+      });
+      // Bind before entering the operation so the holder and observer inherit no cancellation.
+      const hold = AsyncLocalStorage.bind(() => cache.withBareLock(f.bare, async () => {
+        entered.release(); await release.promise;
+      }));
+      const observe = AsyncLocalStorage.bind(() => cache.withBareLock(f.bare, async () => {}));
+      const method = stage === "negative" ? "readRemediationRestrictionFacts" : "readRuntimeRemediationRecovery";
+      const original = (cache[method] as (...args: any[]) => Promise<any>).bind(cache);
+      let first = true;
+      t.mock.method(cache, method, async (...args: any[]) => {
+        if (first) {
+          first = false;
+          queryScope = (cache as any).recoveryOperations.getStore();
+          holder = hold();
+          await entered.promise;
+        }
+        return original(...args);
+      });
+      // Observe actual B callbacks, rather than counting a queued public method invocation.
+      const lock = (cache as any).withLock.bind(cache);
+      t.mock.method(cache as any, "withLock", (key: string, fn: () => Promise<unknown>, signal?: AbortSignal) =>
+        lock(key, async () => { callbacks++; return fn(); }, signal));
+      let admitted = false;
+      const operation = subject.requireLaunchAuthority(flight)
+        .then((check: () => void) => { check(); admitted = true; })
+        .finally(() => { settled = true; });
+      const outcome = operation.then(() => "accepted", () => "rejected");
+      let before = 0;
+      try {
+        assert.equal(await Promise.race([entered.promise.then(() => true), outcome.then(() => false)]), true,
+          "the proof reaches the real query before settling");
+        await tick();
+        assert.equal(Number.isFinite(queryScope?.deadline), true, "query has a finite operation allowance");
+        assert.equal(queryScope?.signal instanceof AbortSignal, true, "query inherits its operation signal");
+        assert.equal(settled, false, "the real query is queued behind the independent holder");
+        before = callbacks;
+        if (stop === "cancel") flight.cancel.abort(new Error("controlled cancellation"));
+        else {
+          assert.ok(expire, "ordinary private operation timer was installed");
+          wall += subject.codexBoundaryDeadlineMs;
+          expire();
+        }
+        assert.equal(queryScope.signal.aborted, true, "the live proof observes its lifecycle stop");
+        assert.equal(await outcome, "rejected", "proof rejects while the independent holder remains held");
+        assert.equal(admitted, false);
+      } finally {
+        release.release();
+        await Promise.allSettled([operation, ...(holder ? [holder] : [])]);
+        runner.shutdown();
+      }
+      await observe();
+      assert.equal(callbacks, before + 1, "only the independent observer runs after B releases");
+      assert.equal(admitted, false, "no late launch admission");
+    });
+  }
+}
+
+for (const stop of ["cancel", "expiry"] as const) {
+  test("remediation lifecycle joins acquired validation child: " + stop, async t => {
+    const f = await fixture();
+    await git.recordRemediationScan(f.bare, BRANCH, f.source, { trusted: true, tip: f.s, flaggedOIDs: [] });
+    const { cache, runner, subject, flight } = f.fresh();
+    flight.executor = {};
+    flight.publishedTip = f.base; flight.checkpointFloor = f.base;
+    let validationStarted = false, earlierAncestry = 0, controlled = false, cancelled = false, settled = false;
+    let validationScope: any;
+    t.mock.method(cache, "secretScanCheckpointRange", async () => {
+      validationStarted = true;
+      return { trusted: true as const, findings: [] };
+    });
+    let wall = Date.now(), expire: (() => void) | undefined;
+    t.mock.method(Date, "now", () => wall);
+    const realTimer = globalThis.setTimeout;
+    t.mock.method(globalThis, "setTimeout", (callback: () => void, delay?: number) => {
+      if (delay === subject.codexBoundaryDeadlineMs && !expire) expire = callback;
+      return realTimer(callback, delay);
+    });
+    const spawned = latch(), closed = latch();
+    const ancestry = cache.ancestry.bind(cache);
+    t.mock.method(cache, "ancestry", (...args: Parameters<typeof ancestry>) => {
+      if (!validationStarted) { earlierAncestry++; return ancestry(...args); }
+      if (controlled) return ancestry(...args);
+      controlled = true;
+      validationScope = (cache as any).recoveryOperations.getStore();
+      const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
+      return cache.withBoundaryProcessSpawner(async () => {
+        spawned.release();
+        // Pipe EOF and cancellation acknowledgement are not terminal process close.
+        stdout.end(); stderr.end();
+        return { stdin, stdout, stderr, completed: closed.promise.then(() => ({ code: 1 })),
+          cancel: async () => { cancelled = true; } };
+      }, new AbortController().signal, () => ancestry(...args));
+    });
+    const operation = subject.requireLaunchAuthority(flight).finally(() => { settled = true; });
+    const outcome = operation.then(() => "accepted", () => "rejected");
+    try {
+      assert.equal(await Promise.race([spawned.promise.then(() => true), outcome.then(() => false)]), true,
+        "validation reaches its acquired child before settling");
+      assert.equal(Number.isFinite(validationScope?.deadline), true, "validation has a finite operation allowance");
+      assert.equal(validationScope?.signal instanceof AbortSignal, true, "validation inherits the live operation signal");
+      assert.ok(earlierAncestry > 0, "strict graph validation ran untouched before the scan");
+      if (stop === "cancel") flight.cancel.abort(new Error("validation cancelled"));
+      else {
+        assert.ok(expire);
+        wall += subject.codexBoundaryDeadlineMs;
+        expire();
+      }
+      await tick();
+      assert.equal(validationScope.signal.aborted, true);
+      assert.equal(cancelled, true);
+      assert.equal(settled, false, "validation retains its operation until the child completes");
+    } finally {
+      closed.release();
+      await outcome;
+      runner.shutdown();
+    }
+    assert.equal(await outcome, "rejected");
+    assert.equal(controlled, true);
+    assert.equal(settled, true);
+  });
+}
+
+for (const stage of ["negative", "restore"] as const) {
+  test("actual phaseClone rejects queued remediation proof before models: " + stage, async t => {
+    const claim = gitlabClaim(stage === "negative" ? 3748 : 3749, { claim_generation: 2 });
+    api.setOwnershipStatus(claim.run_id, "running", 2);
+    let models = 0;
+    const runner = new RunRunner(client, git, () => ({ homeDir, executor: {
+      run: async () => { models++; throw new Error("unexpected model"); },
+    } }), nullLogger(), 20, undefined, {
+      gitlab: fakeGitlab().gitlab, teardownTestDeps: portableTeardownTestDeps, recoveryRetryMs: 1,
+    });
+    const subject = runner as any;
+    const entered = latch(), release = latch(), groupRejected = latch();
+    let flight: any, holder: Promise<void> | undefined, inPhase = false, outerStarted = false;
+    let outerSignal: AbortSignal | undefined;
+    const hold = AsyncLocalStorage.bind((bare: string) => git.withBareLock(bare, async () => {
+      entered.release(); await release.promise;
+    }));
+    const phaseClone = subject.phaseClone.bind(subject);
+    t.mock.method(subject, "phaseClone", async (input: unknown, current: any) => {
+      flight = current; inPhase = true;
+      try { return await phaseClone(input, current); }
+      finally { inPhase = false; }
+    });
+    const lifecycle = subject.withRemediationLifecycle.bind(subject);
+    t.mock.method(subject, "withRemediationLifecycle", async (signal: AbortSignal | undefined, action: () => Promise<unknown>) => {
+      const outer = inPhase && !outerStarted;
+      if (outer) { outerStarted = true; outerSignal = signal; }
+      try { return await lifecycle(signal, action); }
+      catch (error) { if (outer) groupRejected.release(); throw error; }
+    });
+    const method = stage === "negative" ? "readRemediationRestrictionFacts" : "readRuntimeRemediationRecovery";
+    const query = (git[method] as (...args: any[]) => Promise<any>).bind(git);
+    let queued = false;
+    t.mock.method(git, method, async (...args: any[]) => {
+      if (inPhase && outerStarted && !queued) {
+        queued = true;
+        assert.ok((git as any).recoveryOperations.getStore());
+        holder = hold(args[0]);
+        await entered.promise;
+      }
+      return query(...args);
+    });
+    const executing = runner.execute(claim);
+    try {
+      assert.equal(await Promise.race([entered.promise.then(() => true), executing.then(() => false)]), true,
+        "the actual clone phase reaches its metadata proof before settling");
+      assert.equal(flight.branch, stage === "negative" ? "agent/issue-3748" : "agent/issue-3749");
+      assert.equal(outerSignal instanceof AbortSignal, true, "clone proof supplies its live lifecycle signal");
+      flight.cancel.abort(new Error("phase clone cancelled"));
+      assert.equal(outerSignal?.aborted, true, "clone proof stops with the flight before cleanup");
+      await groupRejected.promise;
+      assert.equal(models, 0, "real clone proof rejects while the independent B holder remains held");
+    } finally {
+      release.release();
+      await holder;
+      await executing;
+      runner.shutdown();
+    }
+    assert.equal(queued, true);
+    assert.equal(models, 0);
+  });
+}
+
+test("remediation lifecycle clock starts after A acquisition", async t => {
+  const f = await fixture(false);
+  const { cache, runner, subject, flight } = f.fresh();
+  flight.executor = {};
+  let wall = 1000, waitMs = 0, acquiredAt = 0;
+  t.mock.method(Date, "now", () => wall);
+  subject.authority = {
+    withTransaction: async (fn: () => Promise<unknown>, wait: { timeoutMs: number }) => {
+      waitMs = wait.timeoutMs;
+      wall += 60_000; // A waited longer than the existing 30s operation allowance.
+      acquiredAt = wall;
+      return fn();
+    },
+    recordAdmissions: (_paths: Set<string>, fn: () => Promise<unknown>) => fn(),
+    assertLaunchable: async () => {},
+  };
+  const query = cache.readRemediationRestrictionFacts.bind(cache);
+  t.mock.method(cache, "readRemediationRestrictionFacts", (...args: Parameters<typeof query>) => {
+    const scope = (cache as any).recoveryOperations.getStore();
+    assert.equal(scope.deadline, acquiredAt + subject.codexBoundaryDeadlineMs);
+    return query(...args);
+  });
+  try {
+    await subject.requireLaunchAuthority(flight);
+    assert.equal(waitMs, 300_000, "A keeps its five-minute acquisition contract");
+  } finally { runner.shutdown(); }
+});
+
+test("negative post-action expiry latches denial and independent private capture retains bytes", async t => {
+  const f = await fixture();
+  const { cache, runner, subject, flight } = f.fresh();
+  let wall = Date.now(), first = true;
+  t.mock.method(Date, "now", () => wall);
+  const before = f.snapshot();
+  const query = cache.readRemediationRestrictionFacts.bind(cache);
+  t.mock.method(cache, "readRemediationRestrictionFacts", async (...args: Parameters<typeof query>) => {
+    const result = await query(...args);
+    if (first) { first = false; wall += subject.codexBoundaryDeadlineMs; }
+    return result;
+  });
+  t.mock.method(subject, "quiesceRun", async () => ({ blocked: false }));
+  t.mock.method(subject, "reproveDetailAfterRunnerGit", async () => undefined);
+  try {
+    assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "unavailable" });
+    assert.equal(flight.remediationRestrictions.denialRevision, 1);
+    assert.equal(flight.preserveRecoveryClone, true);
+    const result = await subject.captureRecoveryRestorePointBody(f.claim, flight, nullLogger(),
+      "recovery_capture", { credentialFree: true, publish: false });
+    assert.equal(result.verified, true);
+    assert.equal(result.published, false);
+    assert.deepEqual(f.snapshot(), before);
+  } finally { runner.shutdown(); }
+});
+
+test("negative bootstrap inherits a shorter parent deadline without renewing it", async t => {
+  const f = await fixture();
+  const { cache, runner, subject, flight } = f.fresh();
+  let wall = Date.now();
+  t.mock.method(Date, "now", () => wall);
+  const deadline = wall + 10;
+  const query = cache.readRemediationRestrictionFacts.bind(cache);
+  t.mock.method(cache, "readRemediationRestrictionFacts", async (...args: Parameters<typeof query>) => {
+    assert.equal((cache as any).recoveryOperations.getStore().deadline, deadline);
+    const facts = await query(...args);
+    wall = deadline;
+    return facts;
+  });
+  try {
+    await assert.rejects(cache.withRecoveryOperation(new AbortController().signal, deadline, async () => {
+      assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "unavailable" });
+    }), /recovery deadline/);
+    assert.equal(flight.remediationRestrictions.denialRevision, 1);
+    assert.equal(flight.preserveRecoveryClone, true);
+  } finally { runner.shutdown(); }
+});
+
+for (const seam of ["capture", "frozen", "prepare"] as const) {
+  test("negative bootstrap consumes explicit caller cancellation at " + seam, async t => {
+    const f = await fixture();
+    const { cache, runner, subject, flight } = f.fresh();
+    const caller = new AbortController();
+    caller.abort(new Error("caller stopped"));
+    const query = t.mock.method(cache, "readRemediationRestrictionFacts");
+    const record: any = { branch: BRANCH, defaultBranch: "main" };
+    t.mock.method(subject, "quiesceRun", async () => ({ blocked: true, outcome: { process: { detail: "fixture blocked" } } }));
+    t.mock.method(subject.recovery, "captureAndUpload", async () => ({ state: "needs_action" }));
+    try {
+      if (seam === "capture")
+        await subject.captureRecoveryRestorePointBody(f.claim, flight, nullLogger(), "recovery_capture",
+          { credentialFree: true, publish: false, signal: caller.signal });
+      else if (seam === "frozen") await subject.captureFrozenInventory(f.claim, flight, record, caller.signal);
+      else assert.deepEqual(await subject.heldPublicationStep(f.claim, flight, record, caller.signal),
+        { reason: "secret_remediation_pending" });
+      assert.equal(query.mock.callCount(), 0, "scope entry refuses the earlier query");
+      assert.equal(flight.remediationRestrictions.denialRevision, 1);
+      assert.equal(flight.preserveRecoveryClone, true);
+    } finally { runner.shutdown(); }
+  });
+}
+
+// Native lifecycle fake: production spawn/abort/escalation/join code runs, but no OS
+// process is planted. Terminal close is controlled independently of cancellation.
+for (const native of [false, true]) for (const stop of ["caller", "late attempt"] as const) {
+  test("actual Runner negative query joins " + (native ? "metered native" : "supervised") + " child and retains A/B: " + stop, async t => {
+    const f = await fixture();
+    const { cache, runner, subject, flight } = f.fresh();
+    const lifetime = await acquireWorkerLifetime(fx.dataDir, testLockOptions());
+    const authority = new AuthorityRuntime({ lifetime, workerToken: "fixture-worker", timeoutMs: 5000 });
+    subject.authority = authority;
+    const spawned = latch();
+    const kills: string[] = [];
+    let escalate!: () => void, expire!: () => void, now = 0, settled = false;
+    let budget: MaintenanceBudget | undefined;
+    const realTimer = globalThis.setTimeout;
+    t.mock.method(globalThis, "setTimeout", (callback: () => void, delay?: number) => {
+      if (delay === 1000) escalate = callback;
+      return realTimer(callback, delay);
+    });
+    const child = Object.assign(new EventEmitter(), {
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+      exitCode: null, signalCode: null,
+      kill: (signal?: string) => { kills.push(signal ?? "SIGTERM"); return true; },
+    });
+    let complete!: (result: { code: number }) => void;
+    const completed = new Promise<{ code: number }>(resolve => { complete = resolve; });
+    let runNative = <T>(action: () => T): T => action();
+    if (native) {
+      const scratch = path.resolve("../.uzi/scratch");
+      fs.mkdirSync(scratch, { recursive: true });
+      const dir = fs.mkdtempSync(path.join(scratch, "runner-lifecycle-"));
+      let finish = async () => {};
+      t.after(async () => {
+        try { await finish(); }
+        finally { fs.rmSync(dir, { recursive: true, force: true }); }
+      });
+      const ledger = new RecoveryMaintenance({ root: path.join(dir, "recovery-maintenance"), workerToken: "fixture" });
+      const admitted = await ledger.admit({
+        identity: { run: "run", generation: 1, hold: "hold", repo: "repo", custodian: "worker",
+          bareBasename: "repo.git", origin: "a".repeat(64), originalSource: "b".repeat(64), sourceConfig: "c".repeat(64) },
+        config: RecoveryMaintenance.configuration(), exactCustody: true, terminalNonStopped: true, source: "b".repeat(64),
+      });
+      assert.ok(admitted.ok, JSON.stringify(admitted));
+      runNative = action => MaintenanceResources.run(admitted.value, action);
+      finish = async () => { await ledger.finish(admitted.value, "transient"); };
+      const spawn = childProcess.spawn;
+      t.mock.method(childProcess, "spawn", (...args: Parameters<typeof spawn>) => {
+        if (args[0] === "git" || args[0] === "/usr/bin/git") { spawned.release(); return child; }
+        return spawn(...args);
+      });
+      syncBuiltinESMExports();
+      t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+    }
+    const caller = new AbortController();
+    const operation = MaintenanceBudget.runAttempt("runner-query", () => budget = new MaintenanceBudget(100, () => now), () => {
+      expire = AsyncLocalStorage.bind(() => {
+        MaintenanceBudget.observeCancellation(); now = 100; assert.throws(() => budget!.check());
+      });
+      const action = () => subject.inFlightAuthority(flight, () => subject.bootstrapRemediationRestrictions(
+        flight, undefined, undefined, stop === "caller" ? caller.signal : undefined));
+      return native ? runNative(action) : cache.withBoundaryProcessSpawner(async () => {
+        spawned.release();
+        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed,
+          cancel: async () => { kills.push("cancel"); } };
+      }, new AbortController().signal, action);
+    });
+    const outcome = operation.then(
+      (value: unknown) => { settled = true; return { kind: "value" as const, value }; },
+      (error: unknown) => { settled = true; return { kind: "error" as const, error }; });
+    let siblingA = false, siblingB = false;
+    let a: Promise<unknown> | undefined, b: Promise<unknown> | undefined;
+    try {
+      // Controller-only observation; finally always joins the owned operation.
+      assert.equal(await Promise.race([spawned.promise.then(() => true), outcome.then(() => false)]), true,
+        "the actual query acquires its child before settling");
+      const currentBudget = () => budget;
+      assert.equal(currentBudget(), undefined, "attempt relay starts without an active timed budget");
+      // Created outside the aborting attempt's async context.
+      a = authority.withTransaction(async () => { siblingA = true; });
+      b = cache.withBareLock(f.bare, async () => { siblingB = true; });
+      // Drain pipes first: only terminal-close joining can retain the locks.
+      child.stdout.end(); child.stderr.end();
+      await tick();
+      assert.equal(settled, false, "pipe EOF is not terminal process close");
+      assert.equal(siblingA, false); assert.equal(siblingB, false);
+      if (stop === "caller") caller.abort(new Error("caller cancelled"));
+      else expire();
+      await tick();
+      assert.deepEqual(kills, native ? ["SIGTERM"] : ["cancel"]);
+      assert.equal(settled, false);
+      assert.equal(siblingA, false); assert.equal(siblingB, false);
+      if (native) {
+        escalate();
+        await tick();
+        assert.deepEqual(kills, ["SIGTERM", "SIGKILL"]);
+      }
+      assert.equal(settled, false, "a kill request is not terminal close");
+      assert.equal(siblingA, false); assert.equal(siblingB, false);
+    } finally {
+      child.stdout.end(); child.stderr.end(); child.emit("close", null); complete({ code: 1 });
+      await Promise.all([outcome, ...(a ? [a] : []), ...(b ? [b] : [])]);
+      budget?.dispose(); runner.shutdown();
+    }
+    const result = await outcome;
+    assert.equal(result.kind, "value");
+    assert.deepEqual(result.kind === "value" ? result.value : undefined, { kind: "unavailable" });
+    assert.equal(flight.remediationRestrictions.denialRevision, 1);
+    assert.equal(siblingA, true); assert.equal(siblingB, true);
   });
 }

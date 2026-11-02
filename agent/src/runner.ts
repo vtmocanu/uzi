@@ -3573,7 +3573,7 @@ export class RunRunner {
       }
     };
     // Restrictions apply even on workers without a source-use authority runtime.
-    await this.inFlightAuthority(flight, async () => {
+    await this.inFlightAuthority(flight, () => this.withRemediationLifecycle(this.retainedLifecycleSignal(flight), async () => {
       recordBarePath = flight.barePath;
       const negative = await this.bootstrapRemediationRestrictions(flight);
       if (negative.kind === "unavailable") throw new Error("remediation restriction facts unavailable");
@@ -3592,7 +3592,7 @@ export class RunRunner {
       for (const root of flight.remediationRestrictions!.roots)
         if (await this.git.ancestry(flight.barePath!, root, record.ownedTip) !== "divergent")
           throw new Error("remediation continuation history restricted");
-    }, this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+    }), this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
     if (this.authority && flight.runnerClone)
       await this.authority.assertLaunchable(flight.runnerClone.path, flight.sourceLease, flight.executor.executorIncarnation,
         this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
@@ -3610,19 +3610,27 @@ export class RunRunner {
     state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from), ...(record.excludedRoots ?? [])])];
   }
 
+  /** Reuse Git's inherited operation scope; the caller retains A until owned work settles. */
+  private withRemediationLifecycle<T>(signal: AbortSignal | undefined, action: () => Promise<T>): Promise<T> {
+    return this.git.withRecoveryOperation(
+      signal ? AbortSignal.any([signal, this.shutdownSignal.signal]) : this.shutdownSignal.signal,
+      Date.now() + this.codexBoundaryDeadlineMs, action);
+  }
+
   /**
    * One custody-only two-read query: no selected live source, discovery, lease or clone admission.
    * Failure latches denial but does not interrupt private byte preservation. Positive callers
    * must refuse unavailable facts and independently authenticate the current runtime body.
    */
   private async bootstrapRemediationRestrictions(
-    flight: RunFlight, barePath = flight.barePath, branch = flight.branch,
+    flight: RunFlight, barePath = flight.barePath, branch = flight.branch, signal?: AbortSignal,
   ): Promise<{ kind: "confirmed"; enrolled: boolean } | { kind: "unavailable" }> {
     if (!barePath && !branch && !flight.worktreePath && !flight.remediationRestrictions)
       return { kind: "confirmed", enrolled: false }; // Repo-less flight.
     try {
       if (!barePath || !branch) throw new Error("restriction identity unavailable");
-      const facts = await this.git.readRemediationRestrictionFacts(barePath, branch, flight.runId);
+      const facts = await this.withRemediationLifecycle(signal, () =>
+        this.git.readRemediationRestrictionFacts(barePath, branch, flight.runId));
       if (facts.enrolled) {
         const state = flight.remediationRestrictions ??= { roots: [] };
         state.roots = [...new Set([...state.roots, ...facts.roots, ...facts.flaggedOIDs])];
@@ -3716,7 +3724,9 @@ export class RunRunner {
         // keeps custody even if the earlier snapshot could be confirmed.
         await this.inFlightAuthority(flight, async () => {
           const snapshot = canonicalJson(flight.remediationRestrictions!.pending!);
-          try { remediation.kind = await this.confirmPendingRemediation(flight); }
+          try {
+            remediation.kind = await this.withRemediationLifecycle(undefined, () => this.confirmPendingRemediation(flight));
+          }
           finally {
             retire();
             if (canonicalJson(flight.remediationRestrictions!.pending!) !== snapshot) remediation.kind = "held";
@@ -7984,7 +7994,7 @@ export class RunRunner {
               claim.repo.default_branch?.trim() ||
               (await this.git.defaultBranchName(capBarePath)) ||
               "main";
-            await this.bootstrapRemediationRestrictions(flight);
+            await this.bootstrapRemediationRestrictions(flight, undefined, undefined, boundarySignal);
             const outcome = await this.recovery.captureAndUpload({
               onArchiveAccepted: record => this.archiveAccepted(flight, record),
               onCancellationObserved: () => this.observeCancellation(flight),
@@ -12342,11 +12352,11 @@ export class RunRunner {
       /^[0-9a-f]{40}$/.test(flight.runnerClone.adoptedSource) ? flight.runnerClone.adoptedSource : undefined;
     await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId, flight.runnerClone?.attemptId,
       peeledMarker);
-    await this.inFlightAuthority(flight, async () => {
+    await this.inFlightAuthority(flight, () => this.withRemediationLifecycle(this.retainedLifecycleSignal(flight), async () => {
       const negative = await this.bootstrapRemediationRestrictions(flight);
       if (negative.kind === "unavailable") throw new Error("remediation restriction facts unavailable");
       await this.restoreRemediationRestrictions(flight);
-    }, this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+    }), this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
     batcher.emit({
       kind: "status",
       agent: "worker",
@@ -15647,7 +15657,7 @@ export class RunRunner {
     const barePath = flight.barePath, branch = flight.branch;
     if (flight.cancellationCustodyUnknown || flight.keepGuardedInventoryOpen || !barePath || !branch || !claim.claim_generation || !this.recovery.enabled ||
         !isCodePublishingKind(resolveRunKind(claim.kind))) return;
-    await this.bootstrapRemediationRestrictions(flight);
+    await this.bootstrapRemediationRestrictions(flight, undefined, undefined, signal);
     // Issue #2545: once a record is deferred, EVERY later settle works on that exact record. It never
     // re-freezes: the post-send freeze would pin a different original source and mint a second record.
     if (flight.heldDeferredCapture !== undefined && opts.deferCapture !== true) {
@@ -15739,7 +15749,7 @@ export class RunRunner {
     }
     signal = MaintenanceBudget.current()?.signal ?? signal;
     MaintenanceBudget.current()?.check();
-    await this.bootstrapRemediationRestrictions(flight);
+    await this.bootstrapRemediationRestrictions(flight, undefined, undefined, signal);
     MaintenanceBudget.current()?.check();
     const barePath = flight.barePath!;
     const input = {
@@ -15753,7 +15763,7 @@ export class RunRunner {
       ? await this.recovery.captureAndUpload(input)
       : await this.recovery.operateFrozenInventory(input, {
         foreground: true, terminal: flight.heldTerminal,
-        prepare: frozen => this.heldPublicationStep(claim, flight, frozen),
+        prepare: frozen => this.heldPublicationStep(claim, flight, frozen, signal),
       });
     MaintenanceBudget.current()?.check();
     if (outcome.held === "acked") {
@@ -15867,9 +15877,9 @@ export class RunRunner {
   }
 
   private async heldPublicationStep(
-    claim: ClaimResponse, flight: RunFlight, record: RecoveryRecord,
+    claim: ClaimResponse, flight: RunFlight, record: RecoveryRecord, signal?: AbortSignal,
   ): Promise<{ pack: Buffer } | { reason: string }> {
-    const negative = await this.bootstrapRemediationRestrictions(flight, flight.barePath, record.branch);
+    const negative = await this.bootstrapRemediationRestrictions(flight, flight.barePath, record.branch, signal);
     if (negative.kind === "unavailable" || flight.remediationRestrictions)
       return { reason: "secret_remediation_pending" };
     return prepareFrozenHeld({
@@ -18735,7 +18745,7 @@ export class RunRunner {
         claim.repo.default_branch?.trim() ||
         (await this.git.defaultBranchName(barePath)) ||
         "main";
-      await this.bootstrapRemediationRestrictions(flight);
+      await this.bootstrapRemediationRestrictions(flight, undefined, undefined, signal);
       const outcome = await this.recovery.captureAndUpload({
         onArchiveAccepted: record => this.archiveAccepted(flight, record),
         onCancellationObserved: () => this.observeCancellation(flight),
@@ -20780,7 +20790,7 @@ export class RunRunner {
       );
       return { verified: false, published: false };
     }
-    await this.bootstrapRemediationRestrictions(flight);
+    await this.bootstrapRemediationRestrictions(flight, undefined, undefined, opts.signal);
     // issue #1783 (auditor M2): prove the clone quiescent BEFORE the capture (its wip marker, the
     // fetch-back and the credentialed overlay + publish). On survivors/unverified NOTHING runs:
     // the result is unverified and `residueBlocked`, which each caller treats as its

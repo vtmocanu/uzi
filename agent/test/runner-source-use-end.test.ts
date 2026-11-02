@@ -474,6 +474,49 @@ describe("pending remediation source end foundation", () => {
     return { r, bare, canonical, flight, record, subject: runner as unknown as Subject };
   }
 
+
+  for (const phase of ["read", "fallback", "combined"] as const) {
+    it("pending lifecycle expiry keeps actual source epoch active: " + phase, async t => {
+      const { r, bare, canonical, flight, record, subject } = await setup();
+      const before = await slotOf(r.rt, canonical);
+      t.mock.method(git, "recordRemediationScan", async () => { throw new Error("producer sync failed"); });
+      await assert.rejects(subject.persistRemediationScan(flight, bare, record.branch, newerQ, [{ commit: newerQ }], "pre-exit"));
+      (flight.cancel as AbortController).abort(); // Authorized cleanup must ignore flight cancellation.
+      let wall = Date.now(), deadline = 0, reads = 0, writes = 0;
+      t.mock.method(Date, "now", () => wall);
+      const scope = () => (git as unknown as {
+        recoveryOperations: { getStore(): { deadline: number; signal: AbortSignal } };
+      }).recoveryOperations.getStore();
+      // These bodies are fixture proof responses, not actual RR config fsync grants.
+      t.mock.method(git, "readRuntimeRemediationRecovery", async () => {
+        assert.ok(r.rt.active());
+        assert.equal(scope().signal.aborted, false, "cancelled flight has a healthy cleanup allowance");
+        deadline = scope().deadline;
+        reads++;
+        if (phase === "read") { wall = deadline; return record; }
+        wall = phase === "combined" ? deadline - 1 : wall;
+        return { ...record, flaggedOIDs: [q] };
+      });
+      t.mock.method(git, "blockRemediationRecovery", async () => {
+        assert.ok(r.rt.active());
+        assert.equal(scope().deadline, deadline, "fallback consumes the original read allowance");
+        writes++;
+        wall = phase === "combined" ? wall + 1 : deadline;
+        return "confirmed";
+      });
+      const publish = t.mock.method(subject, "publishFlightSource", async () => { throw new Error("must not publish"); });
+      const end = t.mock.method(r.rt, "endSourceUse");
+      const result = await subject.endFlightSourceUse(flight, nullLogger());
+      assert.equal(reads, 1); assert.equal(writes, phase === "read" ? 0 : 1);
+      assert.deepEqual(result.endedSlots, []); assert.equal(result.published, false);
+      assert.equal(publish.mock.callCount(), 0); assert.equal(end.mock.callCount(), 0);
+      assert.equal(flight.sourceAdmissionRetired, true);
+      await r.rt.withTransaction(async () => undefined);
+      const after = await slotOf(r.rt, canonical);
+      assert.equal(after?.state, "active"); assert.equal(after?.epoch, before?.epoch);
+    });
+  }
+
   for (const proof of ["read failure", "old body missing Q", "absent body"] as const) {
     it(`pending foundation: ${proof} plus failed denial keeps the same owned epoch with no queued end`, async t => {
       const { r, bare, canonical, flight, record, subject } = await setup();
@@ -528,6 +571,7 @@ describe("pending remediation source end foundation", () => {
     const { r, bare, canonical, flight, record, subject } = await setup();
     t.mock.method(git, "recordRemediationScan", async () => { throw new Error("producer failed"); });
     await assert.rejects(subject.persistRemediationScan(flight, bare, record.branch, newerQ, [{ commit: newerQ }], "pre-exit"));
+    (flight.cancel as AbortController).abort();
     t.mock.method(git, "readRuntimeRemediationRecovery", async () => ({ ...record, flaggedOIDs: [q] }));
     t.mock.method(git, "blockRemediationRecovery", async () => {
       assert.ok(r.rt.active());
