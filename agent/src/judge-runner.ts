@@ -45,7 +45,8 @@ import type {
 
 // Fetch at most 200 pages, reducing each page before asking for the next one.
 const TRACE_PAGE = 500;
-const MAX_TRACE_PAGES = 200;
+const MAX_TRACE_MESSAGES = 100_000;
+const MAX_TRACE_PAGES = MAX_TRACE_MESSAGES / TRACE_PAGE;
 
 // Internal read model: production never retains a raw message array between pages.
 type ReducedJudgeTrace = Pick<JudgeTraceResponse, "target" | "inputs"> & { evidence: JudgeEvidence };
@@ -459,7 +460,7 @@ export class JudgeRunner {
       if (complete || page === MAX_TRACE_PAGES) {
         return { target: res.target, inputs: res.inputs, evidence: reducer.render({
           pages: page, complete, reason: complete ? "short page" : "message cap reached; end unknown",
-          cap: TRACE_PAGE * MAX_TRACE_PAGES,
+          cap: MAX_TRACE_MESSAGES,
         }) };
       }
     }
