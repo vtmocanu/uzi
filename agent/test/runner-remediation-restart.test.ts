@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { test } from "node:test";
 import { GitCache } from "../src/git.js";
@@ -59,6 +60,16 @@ async function seedRemediationSource() {
     "refs/uzi-owed/", "refs/uzi-coverage/", "refs/uzi-recovery-pin/", "refs/uzi-recovery-episode/").split("\n").filter(Boolean);
   assert.ok(pins.length > 0);
   return { claim, branch, bare, base, clone, source, q, x, s, read, persisted, refsBefore, pins };
+}
+
+// Include untracked bytes and Git metadata, not just path existence or tracked diffs.
+function sourceFiles(root: string): unknown {
+  if (!fs.existsSync(root)) return null;
+  const stat = fs.lstatSync(root);
+  if (stat.isSymbolicLink()) return { mode: stat.mode, link: fs.readlinkSync(root) };
+  if (stat.isDirectory()) return { mode: stat.mode, entries: fs.readdirSync(root).sort()
+    .map(name => [name, sourceFiles(path.join(root, name))]) };
+  return { mode: stat.mode, sha256: createHash("sha256").update(fs.readFileSync(root)).digest("hex") };
 }
 
 const journalToken = "fixture-restart-journal-mac";
@@ -166,7 +177,63 @@ for (const cut of ["adopting", "ready-before-progress", "episode-complete"] as c
     const paths = [f.clone.path, saved.clonePath, saved.recovery?.successor?.clonePath]
       .filter((value): value is string => !!value);
     const pathState = paths.map(value => [value, fs.existsSync(value)]);
+    const filesBefore = paths.map(value => [value, sourceFiles(value)]);
+    // Observe real custody operations, including future JSON custody routes. Private
+    // archive byte uploads remain allowed; they grant no adoption/publication authority.
+    const custody = [
+      t.mock.method(client, "reserveRecoveryCapture"),
+      t.mock.method(client, "releaseRecoveryCustody"),
+      t.mock.method(client, "reconcileRecoveryCapture"),
+      t.mock.method(client, "proveRecoveryArchiveRedundancy"),
+      t.mock.method(client, "settleRecoveryHold"),
+      t.mock.method(client, "settleRecoveryHoldLive"),
+      t.mock.method(client, "requestCompletionHold"),
+      t.mock.method(client, "requestBaseAttestationHold"),
+    ];
+    const requests = t.mock.method(client as any, "postJSON");
+    const publication = t.mock.method(client, "publishCheckpoint");
+    const watchCache = (subject: GitCache) => [
+      t.mock.method(subject, "prepareRecoverySuccessor"),
+      t.mock.method(subject, "checkpointPack"),
+      t.mock.method(subject, "pushBranch"),
+      t.mock.method(subject, "completeRecoveryEpisode"),
+      t.mock.method(subject, "updateRemediationTrackingRef"),
+      t.mock.method(subject as any, "remediationAdoptionUnderLock"),
+    ];
+    const refusalEffects = watchCache(cache);
+    const closureEffects = [t.mock.method((runner as any).recovery, "closureMintAllowed"),
+      t.mock.method((runner as any).recovery, "releaseHeldFinal")];
+    const assertNoAuthority = (effects: ReturnType<typeof watchCache>, phase: string) => {
+      assert.deepEqual(effects.map(spy => spy.mock.callCount()), effects.map(() => 0), phase);
+      assert.deepEqual(custody.map(spy => spy.mock.callCount()), custody.map(() => 0),
+        phase + ": no custody create/release/settle/discard");
+      assert.equal(publication.mock.callCount(), 0, phase + ": no checkpoint upload");
+      assert.deepEqual(closureEffects.map(spy => spy.mock.callCount()), closureEffects.map(() => 0),
+        phase + ": no closure mint or closure-backed release");
+      assert.deepEqual(requests.mock.calls.filter((call: any) =>
+        /\/(?:archives|recovery-holds|completion\/hold|base-attestation-hold)(?:\/|$)/.test(call.arguments[0]) &&
+        !/\/archives\/[^/]+\/upload$/.test(call.arguments[0])), [],
+      phase + ": no custody mutation HTTP request");
+    };
+    let authorityCalls = 0;
+    // Attempt retirement with the original stopped actor. The enrolled-source guard
+    // must reject before successor checks or the FINAL acknowledgement callback.
+    await assert.rejects(cache.retireRunnerClone(f.bare, saved.clonePath, f.branch,
+      f.claim.run_id, { discard: true, attemptId: saved.attemptId,
+        verifiedSuccessor: { key: "issue-3747", generation: 2, expected: saved,
+          acknowledged: async () => { authorityCalls++; return false; } } }),
+      /remediation recovery retirement requires proof/);
+    assert.equal(authorityCalls, 0, "enrollment refuses before any FINAL authority callback");
+    assertNoAuthority(refusalEffects, "retirement refusal");
+    assert.equal(command(f.bare, "config", "--local", "--list"), config);
+    assert.equal(command(f.bare, "for-each-ref", "--format=%(refname) %(objectname)"), refs);
+    assert.deepEqual(await cache.enumerateOwedCandidates(f.bare, f.claim.run_id), owed);
+    assert.deepEqual(paths.map(value => [value, sourceFiles(value)]), filesBefore,
+      "refusal preserves every source file and path");
+
+    // Construct every cold actor only AFTER the actual retirement refusal.
     const coldCache = makeCache();
+    const coldEffects = watchCache(coldCache);
     let coldModels = 0, coldFlight: any, bootstrap = 0;
     const cold = new RunRunner(client, coldCache, runId => ({
       homeDir: path.join(homeDir, runId), executor: { run: async () => {
@@ -177,17 +244,9 @@ for (const cut of ["adopting", "ready-before-progress", "episode-complete"] as c
     assert.ok((cold as any).recovery instanceof RecoveryCoordinator);
     assert.notEqual((cold as any).recovery, (runner as any).recovery);
     assert.notEqual(coldCache, cache);
+    closureEffects.push(t.mock.method((cold as any).recovery, "closureMintAllowed"),
+      t.mock.method((cold as any).recovery, "releaseHeldFinal"));
     try {
-      let authorityCalls = 0;
-      await assert.rejects(coldCache.retireRunnerClone(f.bare, saved.clonePath, f.branch,
-        f.claim.run_id, { discard: true, attemptId: saved.attemptId,
-          verifiedSuccessor: { key: "issue-3747", generation: 2, expected: saved,
-            acknowledged: async () => { authorityCalls++; return false; } } }),
-        /remediation recovery retirement requires proof/);
-      assert.equal(authorityCalls, 0, "enrollment refuses before any FINAL authority callback");
-      assert.equal(command(f.bare, "config", "--local", "--list"), config);
-      assert.equal(command(f.bare, "for-each-ref", "--format=%(refname) %(objectname)"), refs);
-      assert.deepEqual(paths.map(value => [value, fs.existsSync(value)]), pathState);
       const persistedSource = { runId: saved.runId, clonePath: saved.clonePath, attemptId: saved.attemptId };
       assert.deepEqual(await coldCache.readRuntimeRemediationRecovery(f.bare, f.branch, persistedSource),
         saved.remediationRecovery);
@@ -215,6 +274,7 @@ for (const cut of ["adopting", "ready-before-progress", "episode-complete"] as c
       const tail = (cold as any).executionTails.get(f.claim.run_id);
       await execution; await tail;
       assert.equal(coldModels, 0);
+      assertNoAuthority(coldEffects, "cold uncertain execute");
       assert.ok(bootstrap > 0);
       assert.notEqual(coldFlight, flight);
       assert.deepEqual([...coldFlight.remediationRestrictions.roots].sort(),
@@ -254,5 +314,6 @@ for (const cut of ["adopting", "ready-before-progress", "episode-complete"] as c
       for (const [value, exists] of pathState) assert.equal(fs.existsSync(value as string), exists);
     } finally { await joinAndShutdown(cold); }
     assert.deepEqual(errors, []);
+    assertNoAuthority(coldEffects, "cold shutdown and launch refusal");
   });
 }
