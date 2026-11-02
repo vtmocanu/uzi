@@ -55,7 +55,7 @@
     "name": "later-incomplete",
     "round": 3,
     "plan": "## Cross-check dispositions\nFirst current finding addressed in validation; second current finding omitted.",
-    "expected": "ordinary revise for incomplete immediately preceding items",
+    "expected": "ordinary revise for the defect omission identified in the supplied plan; prior-item completeness remains unknown",
     "rules": [
       "latestItems",
       "omission"
@@ -65,7 +65,7 @@
     "name": "earlier-items-only",
     "round": 4,
     "plan": "## Cross-check dispositions\nRound-one items addressed. Current round-three finding omitted.",
-    "expected": "older items cannot satisfy current items; older history optional",
+    "expected": "assess the current defect omission identified in the supplied plan; older entries optional, prior-item completeness unknown",
     "rules": [
       "latestItems",
       "olderOptional"

@@ -96,7 +96,7 @@ across devices.
 
 For **Claude** intent and plan summaries, the instance default is **haiku**.
 From **Settings → Run defaults → Run summaries**, the **Summary model** picker
-lets you override that for your own Claude runs; leave it on **Inherit** to
+lets you override that for your own Claude runs; leave it on **Default · instance default** to
 use the instance default. See
 [Admin settings](./admin-settings.md#run-summaries) for the instance-wide setting.
 

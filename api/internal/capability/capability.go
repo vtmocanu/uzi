@@ -250,6 +250,14 @@ const CrossCheckPinsV1 = "cross_check_pins_v1"
 // offered as a repo capability.
 const CrossCheckCodexLeadV1 = "cross_check_codex_lead_v1"
 
+// CrossCheckGatedV1 identifies workers that run the checked plan loop BEFORE the human plan
+// gate (PRD #3708): they submit a gated run's plan for cross-check, follow the rounds, and
+// present the ordinary human gate with the checker outcome. It is a protocol capability, never
+// a repo capability, and deliberately NOT a ClaimRun clause: an older worker still claims a
+// gated run and simply presents the ordinary gate, which the server records as
+// worker_unsupported.
+const CrossCheckGatedV1 = "cross_check_gated_v1"
+
 // CrossCheckSemanticPlanV1 identifies workers whose Claude/Codex checker understands the
 // semantic plan-candidate digest and payload (PRD #1230 D2). It is a protocol capability and a
 // hard ClaimRun clause on a plan-stage checker child whose target run is semantic-enrolled; it
@@ -280,6 +288,11 @@ const WorkerMemoryPressureV1 = "worker_memory_pressure_v1"
 // (issue #3142): a worker that registers it reports "held" or "lost" per claim, and a
 // missing member from such a worker is treated as lost.
 const WorkerMemoryAuthorityClaimV1 = "worker_memory_authority_claim_v1"
+
+// MemoryParkSettlementV1 negotiates the memory-park settlement receipt (issue #3639): a worker that
+// registers it may POST /runs/{id}/memory/settlement and receives the claim body's
+// memory_park_reference, which lets the same worker incarnation reclaim after an owner Resume.
+const MemoryParkSettlementV1 = "memory_park_settlement_v1"
 
 // CIArtifactsV1 negotiates guarded CI artifact evidence delivery and read access.
 const CIArtifactsV1 = "ci_artifacts_v1"
@@ -314,6 +327,7 @@ var protocolVocabulary = map[string]struct{}{
 	TaskCheckpointCoordinatesV1:     {},
 	WorkerMemoryPressureV1:          {},
 	WorkerMemoryAuthorityClaimV1:    {},
+	MemoryParkSettlementV1:          {},
 	DindMaintenanceV1:               {},
 	CompletionInterlockV1:           {},
 	RecoveryArchiveV1:               {},
@@ -347,6 +361,7 @@ var protocolVocabulary = map[string]struct{}{
 	CrossCheckRoundsV1:              {},
 	CrossCheckPinsV1:                {},
 	CrossCheckCodexLeadV1:           {},
+	CrossCheckGatedV1:               {},
 	CrossCheckSemanticPlanV1:        {},
 	CompletionSemanticPublicationV1: {},
 	CrossCheckCodeV1:                {},
@@ -358,7 +373,7 @@ var protocolVocabulary = map[string]struct{}{
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryBindinglessClosedV1, RecoveryPrerequisiteClosureV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckSemanticPlanV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, CIArtifactsV1, PublicationResumeV1, ForgeAPISuccessV1}
+var protocolOrder = []string{ForgeCloneSuccessV1, TaskCheckpointCoordinatesV1, WorkerMemoryPressureV1, WorkerMemoryAuthorityClaimV1, MemoryParkSettlementV1, DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, RecoveryHeldPublicationV2, RecoveryBindinglessClosedV1, RecoveryPrerequisiteClosureV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, PlanRevisionRetryV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckGatedV1, CrossCheckSemanticPlanV1, CompletionSemanticPublicationV1, CrossCheckCodeV1, CIConfigGuardV1, CIArtifactsV1, PublicationResumeV1, ForgeAPISuccessV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

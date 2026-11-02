@@ -420,8 +420,11 @@ func TestScheduleGetDetailShowsModel(t *testing.T) {
 		t.Errorf("detail missing MODEL row with fable\n%s", out)
 	}
 	out2, _, _ := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_nm")
-	if !strings.Contains(out2, "MODEL") {
-		t.Errorf("detail missing MODEL row\n%s", out2)
+	if !strings.Contains(out2, "MODEL") || !strings.Contains(out2, "default (worker model)") {
+		t.Errorf("detail missing MODEL row with 'default (worker model)'\n%s", out2)
+	}
+	if strings.Contains(out, "default (worker model)") {
+		t.Errorf("set model must render verbatim, not the default label\n%s", out)
 	}
 }
 

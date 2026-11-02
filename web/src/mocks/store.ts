@@ -6,6 +6,7 @@
 
 import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, VaultMode, WsEvent } from "../lib/api";
 import { seedUnifiedProgress } from "./data/unifiedProgress";
+import { mockGatedCheckedMessages } from "./data/planCrossCheckGated";
 import { deriveMockProgress, foreignCooldownRun } from "./runProgress";
 import { mockScenario } from "./mockScenario";
 import {
@@ -113,6 +114,10 @@ function seed(): MockState {
   // not a feed row, so the done stream is enough to open its run view.
   messages.set("run-ci-halted", [...mockDoneMessages]);
   messages.set("run-awaiting", [...mockAwaitingMessages]);
+  // PRD #3708: the gated runs. The checked run's feed carries its three candidates; the
+  // in-progress run has no plan yet, so an empty log opens its view.
+  messages.set("run-gated-checked", mockGatedCheckedMessages.map((m) => ({ ...m })));
+  messages.set("run-gated-checking", []);
   // PRD #209 M5: the seeded-plan demo run. Its plan rides run.plan_md (SeededPlanPanel),
   // NOT a feed message, so this log carries none — see mockSeededMessages.
   messages.set("run-seeded", mockSeededMessages.map((m) => ({ ...m })));

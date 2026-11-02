@@ -612,7 +612,7 @@ A few worth knowing:
   Success is an ordinary owner-resumed pause: wall stopped, run slot freed.
   A failed publication instead asks a worker question in `awaiting_input`
   (wall wait banked, slot held), with no provider turn or park retry until
-  an explicit answer and no reset of the shared absolute `QUESTION_TIMEOUT_SECONDS`.
+  an explicit answer and no fresh window for the shared `QUESTION_TIMEOUT_SECONDS` parked-time budget.
   An unattended run needing that decision stops with a trusted refusal.
   See [Dependency waits](./run-pause.md#waiting-on-a-dependency-during-implementation)
   for compatibility, checkpoint and retention limits.
@@ -733,8 +733,8 @@ A few worth knowing:
   override) — without churning the id or
   run history the way delete-and-recreate would; `edit` now accepts
   `--model <alias|id>` to change the run model in place, valid on every
-  target and origin (an empty string clears it back to the Worker-model
-  default), and it preserves the stored `--model` and `--apply-model-to-agents`
+  target and origin (an empty string clears it back to your worker model for
+  the schedule's harness), and it preserves the stored `--model` and `--apply-model-to-agents`
   across a partial edit that does not pass those flags — a plain retime no
   longer wipes the stored model. On a **default-origin** schedule only
   the catalog-editable fields (`--cron`, `--tz`, `--auto-approve`,
@@ -3179,6 +3179,29 @@ appends the refusal sub-code with underscores shown as spaces, e.g.
 A stored checker APPROVE and a current human gate can coexist: decide against
 the displayed gate revision, not historical findings. See
 [Cross-check](./cross-check.md) for fallbacks and terminal delivery failures.
+
+For a run [checked before your review](./cross-check.md#checked-before-your-review),
+`uzi run get <id>` adds these rows. `PLAN_CHECK_MODE` and the `passed` /
+`not checked` / `checked an earlier version of this plan` results are specific
+to that mode; the `PLAN_CHECK_ROUNDS` and `PLAN_CHECK_ROUND_<n>_*` rows
+appear for any plan cross-check with recorded rounds (and `PLAN_CHECK_DEADLINE`
+while its latest round is pending), auto-approved runs included:
+
+| Row | Value |
+|---|---|
+| `PLAN_CHECK_MODE` | `checked before your review`. |
+| `PLAN_CROSS_CHECK` | The gate result, for example `plan cross-check: passed after 2 rounds`, `plan cross-check: not checked` (once a plan is presented, or on a finished run), `plan cross-check: checked an earlier version of this plan`, or `plan cross-check: unavailable, not supported on this worker`. `passed` needs no gate reason, a latest check that approved and a check of the current plan. |
+| `PLAN_CHECK_ROUNDS` | The number of rounds shown (at most 5). |
+| `PLAN_CHECK_DEADLINE` | The checker deadline in RFC 3339 UTC, while the latest round is pending. |
+| `PLAN_CHECK_ROUND_<n>_RESULT` | Round n's verdict. |
+| `PLAN_CHECK_ROUND_<n>_SUMMARY`, `_<i>_FILE`, `_<i>_SEVERITY`, `_<i>_SUMMARY`, `_<i>_RATIONALE`, `_MORE` | Round n's findings (20 items at most, then `N findings omitted`). The latest round's findings appear in the `PLAN_CHECK_*` rows above instead. |
+| `PLAN_CHECK_ROUND_<n>_RESPONSE_STATE` | `reported`, `truncated`, `not_reported`, `unknown`, `replanned_after_interruption`, `reported_in_presented_plan` or `no_following_candidate`. |
+| `PLAN_CHECK_ROUND_<n>_RESPONSE` | `lead's response (unverified claims): ` followed by the "Cross-check dispositions" text of the next candidate, sanitized. It is the lead's claim, never a verified resolution, and may include older entries. |
+
+After a human revision the `PLAN_CHECK_` rows use the `EARLIER_PLAN_CHECK_`
+prefix like the rest of the evidence. In `--json`, `plan_cross_check_gated` is `true` for such a
+run (omitted otherwise), and `plan_cross_check_summary` gains `rounds` and
+`deadline_at`; an older server omits all three and the CLI prints no new rows.
 
 ### Code cross-check evidence
 

@@ -16,15 +16,17 @@ function Harness({
   initial,
   pickerHarness,
   allowCustom,
+  defaultLabel = "Default · test",
 }: {
   initial: string;
   pickerHarness?: HarnessKind;
   allowCustom?: boolean;
+  defaultLabel?: string | null;
 }) {
   const [model, setModel] = useState(initial);
   return (
     <>
-      <ModelSelect value={model} onChange={setModel} harness={pickerHarness} allowCustom={allowCustom} />
+      <ModelSelect value={model} onChange={setModel} harness={pickerHarness} allowCustom={allowCustom} defaultLabel={defaultLabel} />
       <output data-testid="model">{model}</output>
     </>
   );
@@ -81,6 +83,22 @@ describe("ModelSelect", () => {
   });
 });
 
+describe("ModelSelect — null defaultLabel", () => {
+  it("renders no Default option and a disabled placeholder for an empty value", () => {
+    render(<Harness initial="" defaultLabel={null} />);
+    expect(screen.queryByRole("option", { name: "Default · test" })).toBeNull();
+    const placeholder = screen.getByRole("option", { name: "Choose a model" }) as HTMLOptionElement;
+    expect(placeholder.disabled).toBe(true);
+    expect(combo().value).toBe("inherit");
+  });
+
+  it("renders no placeholder once a model is chosen", () => {
+    render(<Harness initial="opus" defaultLabel={null} />);
+    expect(screen.queryByRole("option", { name: "Choose a model" })).toBeNull();
+    expect(combo().value).toBe("opus");
+  });
+});
+
 // Guards the S1 a11y fix: with Field htmlFor targeting the select's id, the
 // visible "Model" label names ONLY the select (accessible name stays "Model",
 // not "Model claude-fable-5"), and the custom input keeps its own name.
@@ -89,7 +107,7 @@ describe("ModelSelect label association", () => {
     const [model, setModel] = useState(initial);
     return (
       <Field label="Model" htmlFor="m">
-        <ModelSelect id="m" value={model} onChange={setModel} />
+        <ModelSelect id="m" value={model} onChange={setModel} defaultLabel="Default · test" />
       </Field>
     );
   }
@@ -127,7 +145,7 @@ describe("ModelSelect — harness-scoped vocabulary (PRD #1429 D6)", () => {
     expect(screen.getByRole("option", { name: "gpt-5.6-sol" })).toBeTruthy();
     expect(screen.getByRole("option", { name: "gpt-6-sol" })).toBeTruthy();
     expect(screen.getByRole("option", { name: "gpt-6.1-sol" })).toBeTruthy();
-    expect(screen.getByRole("option", { name: "Inherit (account default)" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Default · test" })).toBeTruthy();
     expect(screen.queryByRole("option", { name: /Other/ })).toBeNull();
     // No Claude alias leaks into the Codex vocabulary.
     expect(screen.queryByRole("option", { name: "opus" })).toBeNull();
@@ -158,7 +176,7 @@ describe("ModelSelect — harness-scoped vocabulary (PRD #1429 D6)", () => {
           <button type="button" onClick={() => setH("codex")}>
             switch to codex
           </button>
-          <ModelSelect value={model} onChange={setModel} harness={h} />
+          <ModelSelect value={model} onChange={setModel} harness={h} defaultLabel="Default · test" />
         </>
       );
     }
@@ -234,7 +252,7 @@ describe("ModelSelect — custom-mode report (PRD #3245)", () => {
     const seen: boolean[] = [];
     function Reporting() {
       const [model, setModel] = useState("opus");
-      return <ModelSelect value={model} onChange={setModel} onCustomModeChange={(c) => seen.push(c)} />;
+      return <ModelSelect value={model} onChange={setModel} defaultLabel="Default · test" onCustomModeChange={(c) => seen.push(c)} />;
     }
     render(<Reporting />);
     expect(seen[seen.length - 1]).toBe(false);
@@ -245,7 +263,7 @@ describe("ModelSelect — custom-mode report (PRD #3245)", () => {
   });
 
   it("wires aria-describedby onto the select", () => {
-    render(<ModelSelect value="" onChange={() => {}} ariaDescribedBy="hint" />);
+    render(<ModelSelect value="" onChange={() => {}} defaultLabel="Default · test" ariaDescribedBy="hint" />);
     expect(combo().getAttribute("aria-describedby")).toBe("hint");
   });
 });

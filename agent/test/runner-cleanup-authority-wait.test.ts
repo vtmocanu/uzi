@@ -395,15 +395,20 @@ describe("runner.ts: which sites use the cleanup wait", () => {
     assert.ok(statement(source.indexOf("this.authority!.bindSource(")).includes("this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)"));
     assert.ok(statement(source.indexOf("this.authority.assertLaunchable(")).includes("this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)"));
     assert.ok(statement(source.indexOf("const seedInAuthority =")).includes("this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)"));
+    // issue #3639: the receipt-continuation handoff classifies the receipt's clone a second time.
     const classification = starts("authority.classifySourceAdmission(").map(statement);
-    assert.equal(classification.length, 1);
-    assert.ok(classification[0]!.includes("this.authorityWait(flight)"), "memory classification uses the flight lifecycle wait");
+    assert.equal(classification.length, 2);
+    assert.ok(classification.every(s => s.includes("this.authorityWait(flight)")), "memory classification uses the flight lifecycle wait");
     // issue #3645: the terminal-owner handoff computes ONE wait for the claimant's coordinator call; it reaches A only
     // through RecoveryCoordinator.retireCompletedSourceForHandoff, which takes it as the bound of its withTransaction.
     const handoff = starts("const wait = this.authorityWait(").map(statement);
     assert.equal(handoff.length, 1);
     assert.ok(handoff[0]!.includes("this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)"), "handoff uses authorityWait(flight, CLONE_AUTHORITY_WAIT_MS)");
     assert.ok(source.slice(source.indexOf("const wait = this.authorityWait(")).includes("this.recovery.retireCompletedSourceForHandoff({"));
-    assert.equal(starts("this.authorityWait(").length, 6, "no other authorityWait caller");
+    // issue #3639: the receipt gate and its handoff each verify the settled slots under the flight lifecycle wait.
+    const receiptSlots = starts("await authority.verifyReceiptSlots(").map(statement);
+    assert.equal(receiptSlots.length, 2);
+    assert.ok(receiptSlots.every(s => s.includes("this.authorityWait(flight)")), receiptSlots.join("\n"));
+    assert.equal(starts("this.authorityWait(").length, 9, "no other authorityWait caller");
   });
 });

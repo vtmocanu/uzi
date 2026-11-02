@@ -1201,6 +1201,8 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/publication-intent", h.WorkerPublicationIntent)
 		r.Post("/runs/{id}/memory/reserve", h.WorkerMemoryReserve)
 		r.Post("/runs/{id}/memory/outcome", h.WorkerMemoryOutcome)
+		// The receipt decodes up to 512 KiB of worker-supplied JSON, so it rides the per-worker limiter.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/memory/settlement", h.WorkerMemoryParkSettlement)
 		// Bound semantic body-decoding work per worker, including while production enrollment is off.
 		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/semantic/candidate", h.WorkerSemanticCandidate)
 		// PRD #1230 D5: each call reads the run's issue from the forge (best effort), so it rides

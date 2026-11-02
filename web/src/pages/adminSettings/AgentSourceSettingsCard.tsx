@@ -8,6 +8,7 @@ import {
 } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { useAsyncData } from "../../lib/useAsyncData";
+import { templateModelDefaultLabel } from "../../lib/agentTemplates";
 import {
   Alert,
   Badge,
@@ -159,7 +160,7 @@ function AgentSourceStagedReview({
                         </>
                       )}
                       <dt className="text-faint">Model</dt>
-                      <dd className="text-muted">{role.model || "inherit"}</dd>
+                      <dd className="text-muted">{role.model || templateModelDefaultLabel(role.name)}</dd>
                       <dt className="text-faint">Tools</dt>
                       <dd className="font-mono text-muted">
                         {role.tools && role.tools.length > 0 ? role.tools.join(", ") : "inherit all"}
