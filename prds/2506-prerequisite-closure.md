@@ -1243,6 +1243,135 @@ Mirror verdicts apply to the same named sections after byte-for-byte sync.
 | api/internal/uzidocs/embed/cli.md — recovery/export sections above | updated: synchronized CLI-reference mirror. |
 | api/internal/uzidocs/embed/run-recovery.md — availability/restore sections above | updated: synchronized recovery-guide mirror. |
 
+#### Partial M3 evidence for owner completion decision (2026-11-02)
+
+**Partial record, not completion.** Candidate `f584e2cb2b17277bc4de5b1aa3c76e76ac23ae31`;
+initial `365d3f396175d038149b8970718aaed1d1f2e4dc`;
+baseline `6d6e86bb2f9e275772bc3241fddb0c2a51a9cfd5`.
+Reviewer and tester reviewed source tests on the original and repair ranges.
+The primary tree was clean. M2's mandatory aggregate gate remains unmet;
+neither M2 nor M3 is completed. No formal owner completion decision is recorded.
+The parent remains active/open and goals 1/2 remain unchecked.
+This evidence changes no production behavior, workflow or cap.
+
+**Execution identity.** Native linux/amd64: Go 1.27.3, Git 2.54.0,
+Node 26.12.1, tsx 4.23.15 and PostgreSQL 17.11.
+The following sanitized artifact names and SHA256 values identify executed
+tools and loaded artifacts; they do not assert an exact image/package pin for Git.
+The matching Alpine `git-daemon 2.54.0-r0` backend was extracted from a
+signature-verified package into owned scratch, without a global installation.
+
+| Artifact | SHA256 |
+|---|---|
+| Go executable (launcher and effective toolchain) | `159888b397dac32306b4355c52d59ae5bc9b81515d387efa30f04657fc3a4cc7` |
+| Go compiler, linux_amd64 | `ce30144a6c83f099ac67d9cce259949aaf562814c07250fb7a52dfcc78554d27` |
+| Go linker, linux_amd64 | `54f1351cb72bd285269ccae8db5c992719c6e0394cd5d1fa52032cdc8241f158` |
+| Git executable; git-upload-pack; git-receive-pack | `081e55dbb116bd5fce9b5e16df5c1bf843748f03cd5c2ddf0627a8eccda839c1` |
+| git-remote-http; git-remote-https | `cabbcc77c46ca117c5f17ca2fbcc1708f95173ae74c4d1e5e2e690bb2747c0b6` |
+| Native git-http-backend | `e217374667663b49146dc1eadeb5ba0cfc6cc8e916127e308365470683e75ce1` |
+| Node executable | `c6fa3c4a915da799b59b908e74a34f8f3307b7ec3251b211bc88d452558b3351` |
+| tsx package.json | `ab5f14c4251638844ade3905d3cfc52fc1c833644694d655a05f6d0ca746b83c` |
+| Loaded tsx dist/loader.mjs | `17e2a92c5f1f70065b01c65d5ee9ac260839d4fc0ea78fdbb4db7b1155ccd32f` |
+| agent/package-lock.json | `df076786f5bf20814f6b86e147ef25d71f5a6ec5357f50964e8216c28ce97a8f` |
+
+Separately, `api/go.mod` declares floor `go 1.26.4` and
+`toolchain go1.27.3`; the agent lock resolves tsx 4.23.15 from `^4.19.2`.
+The run guarded its owned DB and absolute source environment without printing
+DSNs/tokens; Git global/system configs were `/dev/null`,
+`GOFLAGS=-p=1`, and `TMPDIR` was owned scratch. From `api`:
+
+```sh
+: "${UZI_TEST_DATABASE_URL:?owned database required}"
+: "${UZI_TEST_RECOVERY_RESTORE_FULL_HISTORY_SOURCE:?absolute frozen source required}"
+go test -buildvcs=false -race -count=1 -p 1 -timeout 20m -v ./internal/handler -run '^TestRecoveryRestoreWorkflowLiveDB$/^E5(Released|BeforePinRefusal)FullHistory$'
+```
+
+**Full-history proof.** EXIT 0; 11 RUN/PASS, zero SKIP/FAIL.
+`TestRecoveryRestoreWorkflowLiveDB/E5ReleasedFullHistory` passed in 69.39s;
+`TestRecoveryRestoreWorkflowLiveDB/E5BeforePinRefusalFullHistory` passed in 49.99s.
+Positive: native listings 3 → 4, one create and one receive POST; real
+WorkerClient FINAL released with `prerequisite_closure` for the exact capture
+before prune; restore used that same capture and left its snapshot unchanged.
+Negative: persisted `prerequisite_not_on_default`, no create/receive,
+FINAL 409, open hold, no receipt, retained data and NULL closure binding.
+Connection base remained `https://github.com`; project URL used loopback with an exact
+two-origin policy.
+
+Owned input froze `a07f813708ced206cd7b8c3f9d09e259b2fff64b`:
+nonshallow, fsck/connectivity checked, 2,405 input commits and 2,406 with the
+generated source. Copies used no-local/no-hardlinks and no alternates.
+Original source/checkout stayed read-only; pruning targeted owned remotes.
+The unpinned control actually lost the prerequisite. Restored source SHA was
+`f56fe6e815675ba342bf7bb1c426fbca9cd15b1c`, tree
+`b4ae331a571f7a7c46bba83bb1c442c552b76246`.
+
+Positive archive: 509 bytes, exported byte-equal; generated content: 26 bytes.
+SHA256: archive `a015c8b4be9500bf77ba94ce56907e0e108c1465c3c70d5a1cac8010d6c184c1`;
+generated `5a96308b340168c758f0ad6da84524bc09893aa989bc88bccaa22c78dc86b43b`.
+Upload-pack HTTP response body: 114,899,184 bytes (not pack size or full network).
+Timings: setup 49.07015694s; prune 2.909362587s; clone 52.283312ms;
+export 102.273204ms; fetch 15.229879906s; verify/import 53.543072ms;
+owner total 15.385790858s; case wall 69.214092852s.
+CLI build 84.970082166s was outside the owner clock; command wall 8m55.23s
+included cold Go caches. Owner time runs from export start through import,
+including byte comparison and excluding final source/tree/file assertions.
+Negative setup including prune was 49.236757924s, prune 779.756346ms,
+FINAL 703.285825ms and case wall 49.940044093s; owner restore is inapplicable.
+
+**Omission controls.** Isolated candidate exports passed npm typecheck and Go
+race compilation for both omissions; no primary mutations or synthetic ACK/receipt.
+Omitting pin fetch kept valid declarations/full-tip checking: expected EXIT 1,
+owner `pin_tip` mismatch, 55.03s; restored EXIT 0, positive 75.62s,
+10 RUN/PASS, zero SKIP/FAIL.
+Omitting FINAL send, ACK observations and replay retained the actual inspect-state
+assertion: expected EXIT 1, actual=open/expected=released, 51.95s;
+restored EXIT 0, positive 68.73s, 10 RUN/PASS, zero SKIP/FAIL.
+
+**Aggregate gate remains failed.** Normal candidate seven-package
+`./e2e/run-store-it.sh` failed after 21m12.80s: cumulative store timeout
+20m (1200.106s), active `FrozenRecoveryPhasesHealthy`/readopt at 0s elapsed;
+remaining packages did not run. Narrow healthy-test runs passed on candidate
+7.97s and baseline 6.88s.
+Equivalent baseline aggregate failed after 46m16.74s: store PASS 1174.749s,
+then handler timeout 20m (1200.586s), active
+`SemanticCompletionMaximumRenewal` at 23s.
+The candidate store timeout was not reproduced on baseline; causality remains
+unresolved. No successful full seven-package sweep was observed; caps stayed unchanged.
+
+**Retained controls and static checks.** Latest controls EXIT 0:
+171 RUN/PASS, zero SKIP/FAIL; candidate handler 232.488s,
+workersvc 1.636s, recovery 227.048s. Narrow semantic completion passed on
+candidate 30.09s/baseline 34.32s. These include new small Go FINALs and retained
+auth/refusal/replay/owner-isolation controls.
+`TestPrerequisiteClosureReleaseLiveDB` is a store test, outside that focused run:
+it passed in 5.74s within the failed candidate aggregate (baseline 5.49s);
+that individual PASS does not make the aggregate successful.
+Observed PASS: `fmt-check:api`, `lint:api`, Go vet for handler/workersvc/recovery,
+setup/native focused serial race/count=1 checks, agent npm lint/typecheck,
+and `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent`.
+No full agent unit run is claimed. Landing still requires full agent suite:
+exact-head PR CI, required API/repo checks and exact published-head full store-it.
+
+Old-case equivalent comparison: candidate 22 RUN/PASS, zero SKIP/FAIL;
+baseline → candidate: C2 6.66s → 8.67s, Small 6.21s → 7.26s,
+old E5 72.28s → 65.84s, total 171.46s → 176.73s.
+Candidate CLI build was 68.927s; baseline build was not separately instrumented.
+No causal CI-performance conclusion follows: full job censored; queue, cache,
+rerun effects and hosted critical path unmeasured.
+
+**Substitution and acceptance boundary.** Allowed substitutions were fixture
+identities/data/tokens, loopback forge transport, native ancestry/project adapter
+instead of hosted forge API, fixture-only forge binding/URL policy and generated
+source content. Native listing/receive/create-only pinning, capture protection,
+WorkerClient, authenticated API, DB receipt and owner CLI remained real.
+Owner CLI used an explicit Store with allowed environment, without DefaultStore
+or HOME changes; foreign-owner summary/download were refused; snapshots immutable.
+No hosted GitHub latency/availability claim follows.
+External post-release pin deletion remains an accepted, non-restorable residual.
+E6 hosted reporting, rollout, #2969 and producer work remain out of scope.
+This sanitized summary is the durable evidence; raw logs are not tracked and
+scratch files are not durable artifact links. M2 is not waived; M3 remains partial.
+
 ### Parent acceptance
 
 - C1a, C1b, C2 **and C3** complete (C3 may be dropped only by a separate owner decision adopting P5).
