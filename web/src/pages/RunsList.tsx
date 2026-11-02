@@ -16,7 +16,7 @@
 // failed runs (PRD #33) to a calm "stopped" pill, not "failed".
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, NavLink, Outlet, useLocation, useOutletContext, useSearchParams } from "react-router-dom";
+import { Link, NavLink, Outlet, useLocation, useMatch, useOutletContext, useSearchParams } from "react-router-dom";
 import { CrossChecks, useCrossCheckScope } from "./CrossChecks";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, preferForgeUrl, type AdminWorker, type RunSummaryItem, type RunUsage } from "../lib/api";
@@ -169,7 +169,7 @@ function RunsAccountLayout() {
   const { user } = useAuth();
   const { scope, controls, notice } = useCrossCheckScope(user?.id ?? "");
   const location = useLocation();
-  const lifecycle = location.pathname === "/runs/history" ? "past" : "active";
+  const lifecycle = useMatch("/runs/history") ? "past" : "active";
   const tabParams = new URLSearchParams(location.search);
   tabParams.delete("cursor");
   const [runs, setRuns] = useState<RunSummaryItem[]>([]);

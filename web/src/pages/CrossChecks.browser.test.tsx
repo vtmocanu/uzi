@@ -1,7 +1,7 @@
 import "../index.css";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { RunsLayout, RunsList } from "./RunsList";
 import { api } from "../lib/api";
@@ -82,6 +82,38 @@ it("keeps the batch control focused after all visible continuations finish", asy
   expect(document.activeElement).toBe(batch);
   expect(batch.getAttribute("aria-disabled")).toBe("true");
   expect(api.listCrossCheckHistory).toHaveBeenLastCalledWith({ lifecycle: "active", stage: "all", attempt_cursor: ["older", "other"] });
+});
+
+it("keeps the selected older button and exact focus across a visible newest-window refresh", async () => {
+  const newest = { ...group(), parent_title: "Refresh work", total_attempts: 20, matching_attempts: 20,
+    attempts: Array.from({ length: 10 }, (_, i) => ({ ...group().attempts[0], round: i + 11 })) };
+  vi.mocked(api.listCrossCheckHistory).mockResolvedValueOnce({ groups: [newest] })
+    .mockResolvedValueOnce({ groups: [{ ...newest, older_cursor: undefined,
+      attempts: Array.from({ length: 10 }, (_, i) => ({ ...group().attempts[0], round: i + 1 })) }] })
+    .mockResolvedValueOnce({ groups: [{ ...newest, parent_status: "running",
+      attempts: newest.attempts.map(a => a.round === 11 ? { ...a, execution: "finished", effect: "Fresh effect" } : a) }] });
+  render(<MemoryRouter initialEntries={["/runs?scope=cross-checks"]}>
+    <Routes><Route element={<RunsLayout />}><Route path="/runs" element={<RunsList />} /></Route></Routes>
+  </MemoryRouter>);
+  const card = within(await screen.findByRole("article", { name: "Refresh work" }));
+  await userEvent.click(card.getByRole("button", { name: "Load older attempts" }));
+  await card.findByText("20 shown · 0 filtered · 0 remaining attempts");
+  const selected = card.getByRole("button", { name: "Plan round 1 · Running" });
+  await userEvent.click(selected);
+  expect(document.activeElement).toBe(selected);
+  act(() => document.dispatchEvent(new Event("visibilitychange")));
+  await card.findByText("Work run: running");
+  expect(card.getByRole("button", { name: "Plan round 1 · Running" })).toBe(selected);
+  expect(document.activeElement).toBe(selected);
+  expect(selected.getAttribute("aria-pressed")).toBe("true");
+  expect(card.getAllByRole("heading", { level: 3 }).map(h => h.textContent)).toEqual(["Plan round 1"]);
+  expect(within(card.getByRole("group", { name: "Attempt ladder" })).getAllByRole("button").map(b => b.getAttribute("title")))
+    .toEqual(Array.from({ length: 20 }, (_, i) => `Plan round ${i + 1}: ${i === 10 ? "Finished" : "Running"}`));
+  expect(card.getByRole("button", { name: "All matching attempts loaded" }).getAttribute("aria-disabled")).toBe("true");
+  expect(card.queryByText("Earlier rounds omitted: load older attempts")).toBeNull();
+  await userEvent.click(card.getByRole("button", { name: "Plan round 11 · Finished" }));
+  expect(card.getByText("Fresh effect", { selector: "dd" })).toBeTruthy();
+  expect(api.listCrossCheckHistory).toHaveBeenCalledTimes(3);
 });
 
 it.each([1280, 375])("preserves production layout, keyboard selection and exact focus at %ipx", async width => {

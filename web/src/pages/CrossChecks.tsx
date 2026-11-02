@@ -173,7 +173,7 @@ export function CrossChecks({ lifecycle }: { lifecycle: "active" | "past" }) {
   const cursor = params.get("cursor") || undefined;
   const query = useMemo(() => ({ lifecycle, stage, ...(lifecycle === "past" ? { outcome } : {}), ...(cursor ? { cursor } : {}) }), [lifecycle, stage, outcome, cursor]);
   const key = JSON.stringify(query);
-  const [state, setState] = useState<{ key: string; groups: Group[]; next?: string }>({ key: "", groups: [] });
+  const [state, setState] = useState<{ key: string; groups: Group[]; next?: string; continued?: string[] }>({ key: "", groups: [] });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const version = useRef(0);
@@ -188,11 +188,18 @@ export function CrossChecks({ lifecycle }: { lifecycle: "active" | "past" }) {
         setError("Cross-check lifecycle changed. Refresh this page.");
       } else {
         setState(previous => older && previous.key === key
-          ? { ...previous, groups: previous.groups.map(g => {
+          ? { ...previous, continued: [...new Set([...(previous.continued ?? []), ...result.groups.map(g => g.parent_id)])], groups: previous.groups.map(g => {
             const incoming = result.groups.find(item => item.parent_id === g.parent_id);
             return incoming ? mergeOlder(g, incoming) : g;
           }) }
-          : { key, groups: result.groups, next: result.next_cursor });
+          : { key, next: result.next_cursor, continued: previous.key === key ? previous.continued?.filter(id => result.groups.some(g => g.parent_id === id)) : [], groups: result.groups.map(fresh => {
+            const current = previous.key === key ? previous.groups.find(g => g.parent_id === fresh.parent_id) : undefined;
+            if (!current) return fresh;
+            // Fresh records win overlaps; explicitly loaded older windows keep their continuation.
+            const merged = mergeOlder(fresh, current);
+            return previous.continued?.includes(fresh.parent_id) ? merged
+              : { ...merged, older_cursor: fresh.older_cursor, omission: fresh.omission };
+          }) });
       }
     } catch (err: unknown) {
       if (version.current === requestVersion) setError(err instanceof ApiError && err.status === 404
