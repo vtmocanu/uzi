@@ -25,6 +25,23 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("cross-check history HTTP contract", () => {
+  it("requests independent availability and repeated attempt cursor parameters", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, { available: true, groups: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "" });
+    await api.crossCheckHistoryAvailability();
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/cross-checks/availability");
+    await api.listCrossCheckHistory({ lifecycle: "past", stage: "code", outcome: "passed", attempt_cursor: ["first+cursor", "second/cursor"] });
+    const url = new URL(fetchMock.mock.calls[1][0], "https://example.test");
+    expect(url.pathname).toBe("/api/cross-checks");
+    expect(url.searchParams.getAll("attempt_cursor")).toEqual(["first+cursor", "second/cursor"]);
+    expect(url.searchParams.get("cursor")).toBeNull();
+    expect(url.searchParams.get("lifecycle")).toBe("past");
+    expect(url.searchParams.get("outcome")).toBe("passed");
+  });
+});
+
 describe("vault lifecycle HTTP request contract", () => {
   it.each(["login password", "chosen OIDC passphrase"])(
     "enables protection with the password field, cookies and CSRF: %s",

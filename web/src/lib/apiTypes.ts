@@ -5,6 +5,59 @@
 
 import type { RunKind } from "./runKind";
 
+export interface CrossCheckHistoryAvailabilityDTO { available: boolean }
+export interface CrossCheckHistoryDTO {
+  groups: CrossCheckHistoryGroupDTO[];
+  next_cursor?: string;
+}
+export interface CrossCheckHistoryGroupDTO {
+  parent_id: string;
+  parent_title: string;
+  parent_status: string;
+  latest_at: string;
+  active: boolean;
+  total_attempts: number;
+  matching_attempts: number;
+  active_attempts: number;
+  active_hidden: number;
+  active_context?: string;
+  attempts: CrossCheckHistoryAttemptDTO[];
+  older_cursor?: string;
+  omission?: string;
+  refresh_needed: boolean;
+}
+export interface CrossCheckHistoryAttemptDTO {
+  stage: string;
+  round: number;
+  result: string;
+  review: string;
+  execution: string;
+  reason: string;
+  findings_count: number | null;
+  created_at: string;
+  decided_at: string | null;
+  interrupted_at: string | null;
+  deadline_at: string;
+  child_id: string | null;
+  child_status: string | null;
+  child_context: string;
+  model: string | null;
+  effort: string | null;
+  historical: boolean;
+  active: boolean;
+  effect: string;
+  next_action: string;
+}
+export interface CrossCheckHistoryParams {
+  lifecycle?: "active" | "past";
+  stage?: "all" | "plan" | "code";
+  outcome?: "any" | "didnt_finish" | "raised_issues" | "passed" | "replaced";
+  limit?: number;
+  attempt_limit?: number;
+  cursor?: string;
+  attempt_cursor?: string[];
+}
+
 export interface User {
   id: string;
   email: string;

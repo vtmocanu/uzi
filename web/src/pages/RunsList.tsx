@@ -16,7 +16,8 @@
 // failed runs (PRD #33) to a calm "stopped" pill, not "failed".
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, NavLink, Outlet, useOutletContext, useSearchParams } from "react-router-dom";
+import { Link, NavLink, Outlet, useLocation, useOutletContext, useSearchParams } from "react-router-dom";
+import { CrossChecks, useCrossCheckScope } from "./CrossChecks";
 import { useAuth } from "../auth/AuthContext";
 import { api, isTerminalRun, preferForgeUrl, type AdminWorker, type RunSummaryItem, type RunUsage } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
@@ -147,6 +148,30 @@ function useRunsData(): RunsData {
 // shows the bare label rather than a flashing 0 (past-count null); after that the
 // count exists for the layout's whole life.
 export function RunsLayout() {
+  const { user } = useAuth();
+  const [, setParams] = useSearchParams();
+  const previousAccount = useRef(user?.id);
+  useEffect(() => {
+    if (previousAccount.current !== user?.id) {
+      setParams(previous => {
+        const next = new URLSearchParams(previous);
+        next.delete("cursor");
+        return next;
+      }, { replace: true });
+      previousAccount.current = user?.id;
+    }
+  }, [user?.id, setParams]);
+  // An account switch discards all prior account rows and pending reads together.
+  return <RunsAccountLayout key={user?.id ?? ""} />;
+}
+
+function RunsAccountLayout() {
+  const { user } = useAuth();
+  const { scope, controls, notice } = useCrossCheckScope(user?.id ?? "");
+  const location = useLocation();
+  const lifecycle = location.pathname === "/runs/history" ? "past" : "active";
+  const tabParams = new URLSearchParams(location.search);
+  tabParams.delete("cursor");
   const [runs, setRuns] = useState<RunSummaryItem[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -210,12 +235,13 @@ export function RunsLayout() {
   ];
   return (
     <div className="space-y-6">
-      <PageHeader title="Runs" description="Your agent runs. Open one to watch it live." />
+      <PageHeader title="Runs" description={scope === "cross-checks" ? "Plan and code cross-checks on your runs, with retained rounds grouped together." : "Your agent runs. Open one to watch it live."} actions={controls} />
+      {notice}
       <div className="flex gap-1 overflow-x-auto border-b border-edge">
         {tabs.map((t) => (
           <NavLink
             key={t.to}
-            to={t.to}
+            to={{ pathname: t.to, search: tabParams.toString() }}
             end={t.end}
             className={({ isActive }) =>
               cx(
@@ -226,11 +252,11 @@ export function RunsLayout() {
               )
             }
           >
-            {t.label}
+            {scope === "cross-checks" ? t.end ? "Active" : "Past checks" : t.label}
           </NavLink>
         ))}
       </div>
-      <Outlet context={{ runs, loading, error, credentialCounts, reload: () => void load() } satisfies RunsData} />
+      {scope === "cross-checks" ? <CrossChecks key={user?.id} lifecycle={lifecycle} /> : <Outlet context={{ runs, loading, error, credentialCounts, reload: () => void load() } satisfies RunsData} />}
     </div>
   );
 }
