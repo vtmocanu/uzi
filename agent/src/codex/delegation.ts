@@ -35,6 +35,7 @@
 // security-relevant loop (attribution, origin, settlement, cancellation) and never
 // wires itself into runner.ts.
 
+import { formatChildTurnBudget, resolveChildTurnDeadlineMs } from "./child-budget.js";
 import {
   admitPolicyTurn,
   isPolicyRefusalTag,
@@ -156,15 +157,11 @@ export interface CodexDelegationRunnerOptions {
    *  Absent ⇒ children are bounded only by the deadline. */
   readonly signal?: AbortSignal;
   /** Wall-clock bound for a single child turn; a child that never terminates resolves
-   *  `child_timeout`. Defaults to {@link DEFAULT_CHILD_TURN_DEADLINE_MS}. */
+   *  `child_timeout`. Defaults to `DEFAULT_CHILD_TURN_DEADLINE_MS` in `child-budget.ts`. */
   readonly childTurnDeadlineMs?: number;
   /** Ceiling on the accumulated child result text (bounds a runaway child stream). */
   readonly maxChildTextBytes?: number;
 }
-
-/** Default per-child wall-clock deadline (ms). Generous for a real subagent turn while
- *  finite, so a wedged child cannot hold the parent callback open forever. */
-const DEFAULT_CHILD_TURN_DEADLINE_MS = 10 * 60 * 1000;
 
 /** Ceiling on the child's accumulated result text, mirroring the advice harness's
  *  MAX_ADVICE_TEXT_BYTES: a hostile/looping child streaming near-cap frames would
@@ -240,7 +237,7 @@ export class CodexDelegationRunner {
     this.toolHandlers = opts.toolHandlers;
     this.screenPolicy = opts.screenPolicy;
     this.signal = opts.signal;
-    this.childTurnDeadlineMs = opts.childTurnDeadlineMs ?? DEFAULT_CHILD_TURN_DEADLINE_MS;
+    this.childTurnDeadlineMs = resolveChildTurnDeadlineMs(opts.childTurnDeadlineMs);
     this.maxChildTextBytes = opts.maxChildTextBytes ?? DEFAULT_MAX_CHILD_TEXT_BYTES;
   }
 
@@ -282,6 +279,9 @@ export class CodexDelegationRunner {
       }
     }
     const deadlineTimer = setTimeout(() => {
+      // First cause wins: a deadline that elapses after a parent abort (e.g. while the
+      // interrupt is still in flight) must not relabel the cancellation as a timeout.
+      if (childAbort.signal.aborted) return;
       timedOut = true;
       childAbort.abort();
     }, this.childTurnDeadlineMs);
@@ -310,7 +310,7 @@ export class CodexDelegationRunner {
 
     // Honor a stop that already fired before any child work begins.
     if (signal.aborted) {
-      return { ok: false, code: wasTimeout() ? "child_timeout" : "child_aborted", message: "delegation cancelled before start" };
+      return this.stopResult(wasTimeout(), "before");
     }
 
     let controller: ChildThreadController;
@@ -327,7 +327,7 @@ export class CodexDelegationRunner {
       });
     } catch {
       if (signal.aborted) {
-        return { ok: false, code: wasTimeout() ? "child_timeout" : "child_aborted", message: "delegation cancelled during start" };
+        return this.stopResult(wasTimeout(), "starting");
       }
       return { ok: false, code: "child_failed", message: "the delegated child failed to start" };
     }
@@ -458,7 +458,7 @@ export class CodexDelegationRunner {
     }
 
     if (aborted) {
-      return { ok: false, code: wasTimeout() ? "child_timeout" : "child_aborted", message: "the delegated child was cancelled" };
+      return this.stopResult(wasTimeout(), "bound");
     }
     if (terminalOutcome === "success") {
       return { ok: true, output: { role: request.role, text } };
@@ -470,6 +470,30 @@ export class CodexDelegationRunner {
     }
     // No terminal was observed (clean EOF before completion): fail closed.
     return { ok: false, code: "child_failed", message: "the delegated child ended before completion" };
+  }
+
+  /** The timeout-vs-cancel result. The code is also a literal text prefix because only
+   *  `message` reaches the parent model and the run feed. The wording never claims the
+   *  child was confirmed terminated, and carries no raw error text; each string is at most
+   *  120 characters for any {@link formatChildTurnBudget} output (the broker's diagnostic cap). */
+  private stopResult(timeout: boolean, phase: "before" | "starting" | "bound"): ChildDelegationResult {
+    if (!timeout) {
+      const tail =
+        phase === "bound"
+          ? "the delegated child was cancelled by the parent turn or run"
+          : phase === "before"
+            ? "delegation cancelled by the parent turn or run before the child started"
+            : "delegation cancelled by the parent turn or run while the child was starting";
+      return { ok: false, code: "child_aborted", message: `child_aborted: ${tail}` };
+    }
+    const budget = formatChildTurnBudget(this.childTurnDeadlineMs);
+    const tail =
+      phase === "bound"
+        ? `the delegated child exceeded its ${budget} turn budget; interrupt requested, partial work may remain`
+        : phase === "before"
+          ? `the ${budget} child turn budget expired before the child started`
+          : `the ${budget} child turn budget expired while the child was starting`;
+    return { ok: false, code: "child_timeout", message: `child_timeout: ${tail}` };
   }
 
   /** Route ONE child `item/tool/call` to the child broker bound to the CHILD's honest

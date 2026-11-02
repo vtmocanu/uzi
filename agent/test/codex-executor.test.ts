@@ -107,7 +107,7 @@ import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantine
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
 import { detectRepoAgents } from "../src/repoagents.js";
-import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, COMPLETION_CONTRACT_GUIDANCE, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND } from "../src/prompt.js";
+import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, COMPLETION_CONTRACT_GUIDANCE, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND, SUBAGENT_SAFETY_APPEND } from "../src/prompt.js";
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
@@ -5852,9 +5852,21 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
     assert.equal(completions.length, 1, "the stop path emitted the completion before the run returned");
     assert.equal(completions[0]!.payload.is_error, true);
     assert.match(String(completions[0]!.payload.content), /child settlement not confirmed/);
+    // #3804: a run stop is not a child deadline, so the feed never carries timeout text.
+    assert.ok(!String(completions[0]!.payload.content).includes("child_timeout"));
 
     releaseBash();
     for (let i = 0; i < 10; i += 1) await tick();
+    // #3804: the rig's transport stays open, so exactly one parent reply is delivered: a failure
+    // carrying the cancel text, never a success or a timeout.
+    const parentReplies = rig.transport.responses.filter((x) => x.requestId === 1);
+    assert.equal(parentReplies.length, 1);
+    for (const r of parentReplies) {
+      const reply = rec(rec(r.response).result);
+      assert.equal(reply.success, false);
+      assert.match(JSON.stringify(reply), /child_aborted:/);
+      assert.ok(!JSON.stringify(reply).includes("child_timeout"));
+    }
     assert.equal(resultsFor(emitted, dispatchId).length, 1, "the later real settlement adds no second completion");
     assert.ok(
       !emitted.some((m) => m.kind === "tool_result" && m.payload.tool_use_id === dispatchId && m.payload.is_error === false),
@@ -6019,8 +6031,59 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
     assert.equal(reply.success, false);
     // The deadline is the only cancel source here (no run abort); with the rig's 5000ms default
     // this run would not settle inside the 3000ms bound above.
-    assert.match(JSON.stringify(reply), /the delegated child was cancelled/);
+    assert.match(JSON.stringify(reply), /child_timeout: the delegated child exceeded its 50 ms turn budget/);
+    assert.ok(!JSON.stringify(reply).includes("child_aborted"));
+    const completion = resultsFor(emitted, agentUses(emitted)[0]!.payload.id)[0]!;
+    assert.match(String(completion.payload.content), /child_timeout: the delegated child exceeded its 50 ms turn budget/);
+    assert.ok(!String(completion.payload.content).includes("child_aborted"));
     assert.equal(responsesFor(rig, 1), 1);
+  });
+
+  it("(m2-11b) an injected child deadline reaches the lead instructions and the child's developer instructions (#3804)", async () => {
+    const rig = makeRig({
+      responder: delegationResponder((t, th, tn) => {
+        t.push(agentMessage("done", th)).push(turnCompleted("completed", th, tn));
+      }),
+    });
+    rig.deps = { ...rig.deps, childTurnDeadlineMs: 50 };
+    rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] budget", prompt: "p" }));
+    const { ctx } = makeCtx({ agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await finishRoot(rig, [1]);
+    await withTimeout(runP, 3000, "budget propagation run");
+    const starts = rig.transport.requests.filter((r) => r.method === "thread/start");
+    assert.equal(starts.length, 2);
+    const lead = String(rec(starts[0]!.params).developerInstructions);
+    const child = String(rec(starts[1]!.params).developerInstructions);
+    assert.match(lead, /has a 50 ms per-child turn budget/);
+    assert.match(child, /Your turn has a 50 ms budget/);
+    assert.ok(child.endsWith(SUBAGENT_SAFETY_APPEND), "the safety block stays last");
+  });
+
+  it("(m2-11c) the production default is 15 minutes: prompts say so and the real runner deadline fires at 900000 ms (#3804)", async (t) => {
+    // Approach: whole-executor setTimeout mocking. The rig's 5000 ms idle/wall deadlines are
+    // lifted above the child deadline so only the child deadline can fire inside the window.
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const rig = makeRig({ responder: delegationResponder(() => undefined) });
+    rig.deps = { ...rig.deps, childTurnDeadlineMs: undefined, idleMs: 5_000_000, wallMs: 5_000_000 };
+    rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] default", prompt: "p" }));
+    const { ctx } = makeCtx({ agents });
+    const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.requests.filter((r) => r.method === "turn/start").length === 2, "child turn/start");
+    const starts = rig.transport.requests.filter((r) => r.method === "thread/start");
+    assert.match(String(rec(starts[0]!.params).developerInstructions), /has a 15-minute per-child turn budget/);
+    assert.match(String(rec(starts[1]!.params).developerInstructions), /Your turn has a 15-minute budget/);
+
+    t.mock.timers.tick(899_999);
+    for (let i = 0; i < 20; i += 1) await tick();
+    assert.equal(responsesFor(rig, 1), 0, "the child is still running 1 ms before the default deadline");
+    t.mock.timers.tick(1);
+    await waitFor(() => responsesFor(rig, 1) > 0, "child_timeout parent reply");
+    const reply = rec(rec(rig.transport.responses.find((r) => r.requestId === 1)?.response).result);
+    assert.equal(reply.success, false);
+    assert.match(JSON.stringify(reply), /child_timeout: the delegated child exceeded its 15-minute turn budget/);
+    rig.transport.push(signalDone("th-1", "tn-1")).push(turnCompleted("completed", "th-1", "tn-1")).end();
+    await runP;
   });
 
   it("(m2-12) an EMPTY subagent_type is skipped: the admitted role is the next non-empty key (role), never agent_type", async () => {

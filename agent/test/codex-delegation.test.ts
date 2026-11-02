@@ -1,4 +1,5 @@
 import { rangeScanBytes } from "../src/codex/broker.js";
+import { DEFAULT_CHILD_TURN_DEADLINE_MS, formatChildTurnBudget, resolveChildTurnDeadlineMs } from "../src/codex/child-budget.js";
 import { describe, it } from "node:test";
 import { admitPolicyTurn, type PolicyRefusalPayload } from "../src/provider-policy-refusal.js";
 import { PassThrough } from "node:stream";
@@ -55,12 +56,17 @@ class FakeController implements ChildThreadController {
   closed = false;
   private readonly notes: CodexNotification[];
   private readonly hangAfter: boolean;
+  /** When set, interrupt() waits this long (real timer) before it resolves or rejects. */
+  private readonly interruptDelayMs: number;
+  private readonly interruptRejects: boolean;
 
-  constructor(opts: { threadId?: string; turnId?: string; notes: CodexNotification[]; hangAfter?: boolean }) {
+  constructor(opts: { threadId?: string; turnId?: string; notes: CodexNotification[]; hangAfter?: boolean; interruptDelayMs?: number; interruptRejects?: boolean }) {
     this.threadId = opts.threadId ?? "child-thread";
     this.turnId = opts.turnId ?? "child-turn";
     this.notes = opts.notes;
     this.hangAfter = opts.hangAfter ?? false;
+    this.interruptDelayMs = opts.interruptDelayMs ?? 0;
+    this.interruptRejects = opts.interruptRejects ?? false;
   }
 
   notifications(): AsyncIterableIterator<CodexNotification> {
@@ -78,6 +84,8 @@ class FakeController implements ChildThreadController {
   }
   async interrupt(): Promise<void> {
     this.interrupted = true;
+    if (this.interruptDelayMs > 0) await new Promise((r) => setTimeout(r, this.interruptDelayMs));
+    if (this.interruptRejects) throw new Error("interrupt rejected");
   }
   async close(): Promise<void> {
     this.closed = true;
@@ -192,6 +200,16 @@ describe("Codex instruction guidance delivery (#2264 M1)", () => {
     }
   }
 });
+
+/** A stop message carries its own code, never the other's, claims no confirmed termination,
+ *  and fits the broker's 120-character diagnostic cap. */
+function assertStopMessage(maybe: string | undefined, own: string, other: string): void {
+  const message = maybe ?? "";
+  assert.ok(message.startsWith(`${own}: `), message);
+  assert.ok(!message.includes(other), message);
+  assert.doesNotMatch(message, /stopped|terminated/i);
+  assert.ok(message.length <= 120, `${message.length}: ${message}`);
+}
 
 function delegReq(overrides: Partial<ChildDelegationRequest> = {}): ChildDelegationRequest {
   return {
@@ -707,7 +725,7 @@ describe("CodexDelegationRunner: terminal + cancellation", () => {
     const res = await p;
     assert.equal(res.ok, false);
     assert.equal(res.code, "child_aborted");
-    assert.equal(res.message, "the delegated child was cancelled");
+    assertStopMessage(res.message, "child_aborted", "child_timeout");
     assert.equal(controller.interrupted, true);
     assert.equal(controller.closed, true);
   });
@@ -720,7 +738,8 @@ describe("CodexDelegationRunner: terminal + cancellation", () => {
     const res = await b.runner.run(delegReq());
     assert.equal(res.ok, false);
     assert.equal(res.code, "child_timeout");
-    assert.equal(res.message, "the delegated child was cancelled");
+    assertStopMessage(res.message, "child_timeout", "child_aborted");
+    assert.match(res.message ?? "", /30 ms turn budget/);
     assert.equal(controller.interrupted, true);
     assert.equal(controller.closed, true);
   });
@@ -766,6 +785,175 @@ describe("CodexDelegationRunner: terminal + cancellation", () => {
     assert.equal(res.code, "child_aborted");
     // Nothing was started; the pre-start abort short-circuits.
     assert.equal(b.startSpecs.length, 0);
+    assertStopMessage(res.message, "child_aborted", "child_timeout");
+    assert.match(res.message ?? "", /before the child started/);
+  });
+});
+
+describe("child turn budget: timeout vs cancel (#3804)", () => {
+  const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
+  async function untilStarted(b: Built): Promise<void> {
+    for (let i = 0; i < 200 && b.startSpecs.length < 1; i++) await tick();
+    assert.equal(b.startSpecs.length, 1);
+  }
+
+  it("uses the 15-minute default: running at 899999 ms, child_timeout at 900000 ms", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const controller = new FakeController({ notes: [], hangAfter: true });
+    const b = makeRunner({ controller });
+    let settled = false;
+    const p = b.runner.run(delegReq()).then((r) => { settled = true; return r; });
+    await untilStarted(b);
+    t.mock.timers.tick(899_999);
+    for (let i = 0; i < 20; i++) await tick();
+    assert.equal(settled, false);
+    t.mock.timers.tick(1);
+    const res = await p;
+    assert.equal(res.code, "child_timeout");
+    assertStopMessage(res.message, "child_timeout", "child_aborted");
+    assert.match(res.message ?? "", /15-minute turn budget/);
+  });
+
+  it("reports a timeout while the child is starting", async () => {
+    const b = makeRunner({
+      childTurnDeadlineMs: 30,
+      startImpl: (spec) => new Promise((_, reject) => {
+        spec.signal.addEventListener("abort", () => reject(new Error("start aborted")), { once: true });
+      }),
+    });
+    const res = await b.runner.run(delegReq());
+    assert.equal(res.code, "child_timeout");
+    assertStopMessage(res.message, "child_timeout", "child_aborted");
+    assert.match(res.message ?? "", /30 ms child turn budget expired while the child was starting/);
+  });
+
+  it("reports a parent abort while the child is starting as child_aborted", async () => {
+    const parent = new AbortController();
+    const b = makeRunner({
+      signal: parent.signal,
+      startImpl: (spec) => new Promise((_, reject) => {
+        spec.signal.addEventListener("abort", () => reject(new Error("start aborted")), { once: true });
+      }),
+    });
+    const p = b.runner.run(delegReq());
+    await untilStarted(b);
+    parent.abort();
+    const res = await p;
+    assert.equal(res.code, "child_aborted");
+    assertStopMessage(res.message, "child_aborted", "child_timeout");
+    assert.match(res.message ?? "", /while the child was starting/);
+  });
+
+  it("resolves child_timeout with a wedged callback and a rejecting interrupt", async () => {
+    const controller = new FakeController({ notes: [], hangAfter: true, interruptRejects: true });
+    withNotes(controller, [toolCallNote(controller, "cc-hang", "Bash", { command: "sleep infinity" })]);
+    const b = makeRunner({
+      controller,
+      childTurnDeadlineMs: 30,
+      spawnImpl: () => new Promise<SpawnCommandResult>(() => {}),
+    });
+    const res = await b.runner.run(delegReq());
+    assert.equal(res.code, "child_timeout");
+    assertStopMessage(res.message, "child_timeout", "child_aborted");
+    assert.equal(controller.interrupted, true);
+    assert.equal(controller.closed, true);
+  });
+
+  it("keeps child_aborted when the deadline elapses during the delayed interrupt (first cause wins)", async () => {
+    const parent = new AbortController();
+    const controller = new FakeController({ notes: [], hangAfter: true, interruptDelayMs: 120 });
+    const b = makeRunner({ controller, signal: parent.signal, childTurnDeadlineMs: 40 });
+    const p = b.runner.run(delegReq());
+    await untilStarted(b);
+    parent.abort();
+    const res = await p;
+    assert.equal(res.code, "child_aborted");
+    assertStopMessage(res.message, "child_aborted", "child_timeout");
+    assert.equal(controller.closed, true);
+  });
+
+  it("returns exactly one result and no late success after the deadline", async () => {
+    let closes = 0;
+    let interrupts = 0;
+    class LateSuccess extends FakeController {
+      override notifications(): AsyncIterableIterator<CodexNotification> {
+        const done = turnCompletedNote(this, "completed");
+        async function* gen(): AsyncGenerator<CodexNotification> {
+          await new Promise((r) => setTimeout(r, 80));
+          yield done;
+        }
+        return gen();
+      }
+      override async interrupt(): Promise<void> { interrupts++; }
+      override async close(): Promise<void> { closes++; await super.close(); }
+    }
+    const controller = new LateSuccess({ notes: [] });
+    const b = makeRunner({ controller, childTurnDeadlineMs: 20 });
+    const results: unknown[] = [];
+    await b.runner.run(delegReq()).then((r) => results.push(r));
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(results.length, 1);
+    assert.equal((results[0] as { code?: string }).code, "child_timeout");
+    assert.equal(interrupts, 1);
+    assert.equal(closes, 1);
+  });
+
+  it("never leaks raw start-error text into the message", async () => {
+    const canary = "sk-" + "ant-" + "canary123";
+    const failing = makeRunner({ startImpl: async () => { throw new Error(`start failed ${canary}`); } });
+    const failed = await failing.runner.run(delegReq());
+    assert.equal(failed.code, "child_failed");
+    assert.ok(!(failed.message ?? "").includes(canary));
+
+    const parent = new AbortController();
+    const aborting = makeRunner({
+      signal: parent.signal,
+      startImpl: (spec) => new Promise((_, reject) => {
+        spec.signal.addEventListener("abort", () => reject(new Error(`aborted ${canary}`)), { once: true });
+      }),
+    });
+    const p = aborting.runner.run(delegReq());
+    await untilStarted(aborting);
+    parent.abort();
+    const res = await p;
+    assert.equal(res.code, "child_aborted");
+    assert.ok(!(res.message ?? "").includes(canary));
+  });
+
+  it("keeps every timeout and cancel message within 120 characters for each budget", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    for (const ms of [30, 45_000, 90_500, 900_000, 3_600_000, 7_200_000, 2 ** 31 - 1]) {
+      const controller = new FakeController({ notes: [], hangAfter: true });
+      const b = makeRunner({ controller, childTurnDeadlineMs: ms });
+      const p = b.runner.run(delegReq());
+      await untilStarted(b);
+      t.mock.timers.tick(ms);
+      const res = await p;
+      assert.equal(res.code, "child_timeout");
+      assertStopMessage(res.message, "child_timeout", "child_aborted");
+    }
+  });
+});
+
+describe("formatChildTurnBudget (#3804)", () => {
+  it("formats compactly and boundedly", () => {
+    assert.equal(DEFAULT_CHILD_TURN_DEADLINE_MS, 900_000);
+    assert.equal(resolveChildTurnDeadlineMs(), 900_000);
+    assert.equal(resolveChildTurnDeadlineMs(50), 50);
+    assert.equal(formatChildTurnBudget(30), "30 ms");
+    assert.equal(formatChildTurnBudget(45_000), "45-second");
+    assert.equal(formatChildTurnBudget(90_000), "90-second");
+    assert.equal(formatChildTurnBudget(900_000), "15-minute");
+    assert.equal(formatChildTurnBudget(90_500), "90500 ms");
+    assert.equal(formatChildTurnBudget(3_600_000), "60-minute");
+    assert.equal(formatChildTurnBudget(0), "unknown");
+    assert.equal(formatChildTurnBudget(-5), "unknown");
+    assert.equal(formatChildTurnBudget(Number.NaN), "unknown");
+    assert.equal(formatChildTurnBudget(Number.POSITIVE_INFINITY), "unknown");
+    assert.equal(formatChildTurnBudget(1e12), "very long");
+    for (const ms of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1, 30.5, 999, 1000, 59_000, 60_000, 90_500, 5_999_940_000, 6_000_000_000, 99_999_000, 100_000_000, 999_999_999, 1e9, 1e15, Number.MAX_VALUE]) {
+      assert.ok(formatChildTurnBudget(ms).length <= 12, `${ms}: ${formatChildTurnBudget(ms)}`);
+    }
   });
 });
 
