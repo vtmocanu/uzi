@@ -7693,6 +7693,7 @@ export class GitCache {
         // A V2 field or numeric version prefix prevents malformed evidence taking that legacy path.
         let newForm = false;
         let unsupportedVersion = false;
+        let scanComplete = false;
         let value: unknown;
         try {
           value = parsePinRestoreJson(raw, GIT_MAX_BUFFER, (key, keyEnd) => {
@@ -7704,9 +7705,9 @@ export class GitCache {
               const token = version.exec(raw);
               if (token && Number(token[1]) >= 2) unsupportedVersion = true;
             }
-          });
+          }, () => { scanComplete = true; });
         } catch (error) {
-          if (newForm) throw error;
+          if (newForm || !scanComplete) throw error;
           try { value = JSON.parse(raw); } catch {
             if (!applicable && !unsupportedVersion) continue;
             throw error;
@@ -7840,6 +7841,7 @@ export class GitCache {
         const legacy = ["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources",
           "peeledMarkers", "memoryPark", "completionSourceFence"];
         let charged = false;
+        let scanComplete = false;
         let value: unknown;
         try {
           value = parsePinRestoreJson(raw, GIT_MAX_BUFFER, key => {
@@ -7847,9 +7849,9 @@ export class GitCache {
               charged = true;
               budget.consume(Buffer.byteLength(raw));
             }
-          });
+          }, () => { scanComplete = true; });
         } catch (error) {
-          if (charged) throw error;
+          if (charged || !scanComplete) throw error;
           continue;
         }
         if (!charged) continue;
@@ -18269,6 +18271,7 @@ try {
         const raw = item.slice(nl + 1);
         let parsed: unknown;
         let newForm = false;
+        let scanComplete = false;
         const legacy = ["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources",
           "peeledMarkers", "memoryPark", "completionSourceFence"];
         try {
@@ -18277,9 +18280,9 @@ try {
               newForm = true;
               budget.consume(Buffer.byteLength(raw));
             }
-          });
+          }, () => { scanComplete = true; });
         } catch (error) {
-          if (newForm) throw error;
+          if (newForm || !scanComplete) throw error;
           // Legacy malformed values remain the authority parser's responsibility.
           if (++sources > limits.maxMetadataRecords) throw this.retainedCause(new Error("epoch source record limit"), "source_record_cap");
           continue;
