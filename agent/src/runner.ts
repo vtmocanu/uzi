@@ -16627,7 +16627,7 @@ export class RunRunner {
   private ownershipRepairAdmitted(flight: RunFlight): boolean {
     const steering = flight.steering as SteeringChannel | undefined;
     if (!steering?.ownershipRepairAuthority() || flight.owedLimitStop !== undefined) return false;
-    const safety = flight.executor?.safety as { registryState?: () => string } | undefined;
+    const safety = flight.executor?.safety;
     if (safety) {
       const state = safety.registryState?.();
       if (state === undefined || state === "poisoned" || state === "disposed") return false;
