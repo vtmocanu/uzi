@@ -106,6 +106,13 @@ no open call is past the threshold or new activity has arrived. Setting
 **Long tool call after** to `0` turns this signal off. Like every flag, it
 never stops the run.
 
+On the Codex harness each subagent also has a 15-minute turn budget of its own.
+Setup and commands count against it, and it is separate from the command bound and
+from the run's wall-clock budget. A subagent that exceeds it is reported to the lead
+and in the run view as a timeout (`child_timeout`), distinct from a cancellation by
+the run. Owner cancel or the run's wall-clock budget can stop a subagent earlier.
+There is no setting to change the budget.
+
 Only the run's owner (and admins) see the reason text behind a flag; everyone
 else viewing a shared board sees just the ⚠ badge.
 
