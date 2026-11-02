@@ -2,13 +2,14 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { ProcessQuiescence } from "./run-quiescence.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { AuthorityLockBusy, AuthorityRefusal } from "./authority-lock.js";
-import type { AuthorityScope, AuthorityWait, RetirementHandle, RetirementView } from "./authority-runtime.js";
+import { AuthorityRuntime, type AuthorityScope, type AuthorityWait, type RetirementHandle, type RetirementView } from "./authority-runtime.js";
 import {
   decodeCompletionSourceShape, serializeSourceFence, sourceFenceOf, type CompletionSourceFence, type CompletionSourceV2,
 } from "./completion-source.js";
 import type { ExclusionRefusal, MaintenanceExclusion, MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { MaintenanceResources as M1MaintenanceResources, RecoveryMaintenance, type MaintenanceAdmission } from "./recovery-maintenance.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
+import { parsePinRestoreJson } from "./pin-restore-journal.js";
 import { prepareFrozenHeld, validFrozenHeldPolicy, type FrozenHeldPolicy, type HeldGit } from "./frozen-held.js";
 // Durable run recovery: worker capture, authenticated journal, and model-free
 // restart-safe upload (PRD #1296 M3, decisions D1/D3/D5/D6/D9).
@@ -374,6 +375,7 @@ export interface RecoveryArchiveClient {
 
 /** The bundle-producer subset {@link RecoveryCoordinator} needs — GitCache satisfies it. */
 export interface RecoveryBundleProducer {
+  readPinRestoreProtection?: GitCache["readPinRestoreProtection"];
   importMaintenanceTip?: GitCache["importMaintenanceTip"];
   matchMaintenanceSourceFamily?: GitCache["matchMaintenanceSourceFamily"];
   maintenanceOriginDigest?: GitCache["maintenanceOriginDigest"];
@@ -1006,6 +1008,10 @@ function applyPin(current: RecoveryRecord, input: PinInput): RecoveryRecord {
 // bounded Git work (the archived-pin cleanup, cleanupUploadedRecoveryPin, holds it from the journal
 // re-read through the destructive Git call). Process memory on
 // purpose, like recoveryJournalLocks: one worker process owns each data dir.
+class PinRestoreProtectedError extends Error {
+  constructor() { super("pin restore original retained"); }
+}
+
 const captureCycleTails = new Map<string, Promise<void>>();
 
 function maintenanceSignal(signal?: AbortSignal): AbortSignal | undefined {
@@ -1412,6 +1418,129 @@ export class RecoveryCoordinator {
     });
   }
 
+  /** A strict saved-record transaction: A -> C -> J; action may take B only, and
+   * must join its local work before returning. No RPC/model work belongs in action.
+   * This selects authenticated contents; Git must independently verify the actual pin closure. */
+  async withPinRestoreRecord<T>(input: {
+    runId: string; predecessorGeneration: number; branch: string; bareDir: string; kind?: RunKind;
+    signal: AbortSignal; deadline: number; expectedCaptureId?: string; expectedDigest?: string;
+  }, action: (selection: {
+    record: Readonly<RecoveryRecord>; digest: string; revalidate: () => Promise<boolean>;
+  }) => Promise<T>): Promise<
+    { kind: "selected"; value: T } |
+    { kind: "refused"; reason: "unsupported" | "invalid_input" | "record_unavailable" | "cancelled" | "action_failed" }
+  > {
+    if (!this.enabled || !this.key || !(this.authority instanceof AuthorityRuntime) || !this.git.readPinRestoreProtection)
+      return { kind: "refused", reason: "unsupported" };
+    if (!/^[A-Za-z0-9_-]{1,200}$/.test(input.runId) || !Number.isSafeInteger(input.predecessorGeneration) ||
+        input.predecessorGeneration <= 0 || !input.branch || !isSafeBareDirName(input.bareDir) ||
+        !Number.isFinite(input.deadline) || input.deadline <= Date.now())
+      return { kind: "refused", reason: "invalid_input" };
+    let entered = false;
+    try {
+      return await MaintenanceBudget.runProducer(async budget => this.inAuthority(() =>
+        runCaptureCycle(path.resolve(this.runDir(input.runId), `generation-${input.predecessorGeneration}`), "wait", () =>
+          this.withJournalLock(input.runId, async () => {
+            const bounds = { signal: budget.signal, deadline: input.deadline };
+            const select = async (): Promise<RecoveryRecord> => {
+              budget.check();
+              const records = await this.checkedRecords(input.runId, bounds, true, false, true);
+              if (records.some(r => !Number.isSafeInteger(r.generation) || r.generation! <= 0 ||
+                  classifyRecoveryOrigin(r.captureId) === "malformed")) throw new Error("unsupported saved record set");
+              // Historical producer custody is not a competing ordinary pin. A newer record or
+              // unresolved publication still makes this predecessor's selection uncertain.
+              if (records.some(r => r.generation! > input.predecessorGeneration ||
+                  r.heldCreateUncertain || (r.completionSource && !r.completionReceipt && !r.holdSettlement) ||
+                  (r.finalRequest && !r.finalAcknowledged && !r.holdSettlement) ||
+                  (r.generation === input.predecessorGeneration && classifyRecoveryOrigin(r.captureId) !== "ordinary")))
+                throw new Error("uncertain saved record set");
+              const cohort = records.filter(r => r.generation === input.predecessorGeneration &&
+                classifyRecoveryOrigin(r.captureId) === "ordinary");
+              if (cohort.length !== 1) throw new Error("ambiguous saved record");
+              const record = cohort[0]!;
+              // Guarded custody is also used by genuine generation-evidence/finalization pins.
+              // Aggregate metadata and producer origin, rather than the custody flag, exclude synthetic tips.
+              if (classifyRecoveryOrigin(record.captureId) !== "ordinary" || record.coverageDigest ||
+                  record.originalRoots !== undefined || record.coverageContext !== undefined ||
+                  record.originalSourceSha !== undefined || record.inventoryCurrentSha !== undefined ||
+                  record.branch !== input.branch || (input.kind !== undefined && record.kind !== input.kind) ||
+                  (record.bareDir !== undefined && record.bareDir !== input.bareDir) ||
+                  (record.recoveryPinBareDir !== undefined && record.recoveryPinBareDir !== input.bareDir) ||
+                  record.finalRequest || record.finalAcknowledged || record.heldCreateUncertain || record.holdSettlement ||
+                  record.completionReceipt || record.completionSource)
+                throw new Error("saved record refused");
+              if (record.bundlePath !== undefined) {
+                if (record.bundlePath !== this.bundlePath(record)) throw new Error("foreign saved bundle");
+                const verified = await this.verifiedLocalCapture(record, budget.signal);
+                if (!verified || canonicalJson(verified) !== canonicalJson(record)) throw new Error("unverified saved bundle");
+              } else if (record.state !== "pinned" && record.state !== "needs_action") throw new Error("no saved pin");
+              // Attention reasons describe failed maintenance, not actual pin contents. Selection
+              // grants no settlement/source proof; the later bare verifier must check ref and closure.
+              budget.check();
+              return record;
+            };
+            const record = await select();
+            const digestOf = (r: RecoveryRecord) => createHash("sha256").update(canonicalJson(r)).digest("hex");
+            const digest = digestOf(record);
+            if ((input.expectedCaptureId !== undefined && input.expectedCaptureId !== record.captureId) ||
+                (input.expectedDigest !== undefined && input.expectedDigest !== digest))
+              throw new Error("saved record changed");
+            // Freeze every nested value as well as detaching it from authenticated IO results.
+            const freeze = (value: unknown): void => {
+              if (value && typeof value === "object") {
+                for (const child of Object.values(value)) freeze(child);
+                Object.freeze(value);
+              }
+            };
+            const snapshot = structuredClone(record);
+            freeze(snapshot);
+            let live = true;
+            let validating: Promise<boolean> | undefined;
+            const revalidate = (): Promise<boolean> => {
+              if (!live) return Promise.resolve(false);
+              // Coalesce concurrent reads; the finalizer joins even an unawaited callback read.
+              if (validating) return validating;
+              validating = (async () => {
+                try {
+                  const current = await select();
+                  return live && current.captureId === record.captureId && digestOf(current) === digest;
+                } catch { return false; }
+              })().finally(() => { validating = undefined; });
+              return validating;
+            };
+            entered = true;
+            try {
+              const value = await action({ record: snapshot, digest, revalidate });
+              if (!await revalidate()) throw new Error("saved record changed");
+              return { kind: "selected" as const, value };
+            } finally { live = false; await validating; }
+          }, budget.signal))),
+      { signal: input.signal, durationMs: Math.max(0, input.deadline - Date.now()) });
+    } catch {
+      return { kind: "refused", reason: input.signal.aborted || Date.now() >= input.deadline ? "cancelled" :
+        entered ? "action_failed" : "record_unavailable" };
+    }
+  }
+
+  /** Missing support is legacy-fixture compatibility only: such producers cannot emit V2.
+   * Unknown inventories always retain. This read grants no positive source authority. */
+  private async pinRestoreDenied(runId: string, generation?: number): Promise<boolean> {
+    if (!this.git.readPinRestoreProtection) return false;
+    try {
+      const budget = MaintenanceBudget.current();
+      const result = await this.git.readPinRestoreProtection(runId, {
+        signal: maintenanceSignal() ?? new AbortController().signal,
+        deadline: Date.now() + Math.min(30_000, budget?.remainingMs() ?? 30_000),
+      });
+      return result.kind !== "complete" || (result.protectedThroughGeneration !== undefined &&
+        (generation === undefined || !Number.isSafeInteger(generation) || generation <= result.protectedThroughGeneration));
+    } catch { return true; }
+  }
+
+  private async assertPinRestoreMutable(record: Pick<RecoveryRecord, "runId" | "generation">): Promise<void> {
+    if (await this.pinRestoreDenied(record.runId, record.generation)) throw new PinRestoreProtectedError();
+  }
+
   constructor(opts: RecoveryCoordinatorOptions) {
     this.authority = opts.authority;
     this.withTerminalSourceBoundary = opts.withTerminalSourceBoundary;
@@ -1490,6 +1619,7 @@ export class RecoveryCoordinator {
       const observed = await this.findRecord(input.runId, matches);
       await this.testHooks?.afterPinObserve?.();
       return await this.withJournalLock(input.runId, async () => {
+        if (await this.pinRestoreDenied(input.runId, input.generation)) return undefined;
         let current: RecoveryRecord | null | undefined;
         if (observed) {
           current = await this.readRecord(this.recordPath(observed));
@@ -1562,6 +1692,7 @@ export class RecoveryCoordinator {
     // No A: the only authority hook this cycle reaches is assertBareClear (buildRecoveryCoverage), a read.
     return this.withCancellationAttempt({ runId: context.runId, generation: context.generation, inventoryGuarded: true } as RecoveryRecord, async () =>
       runCaptureCycle(await this.cycleKey({ runId: context.runId, generation: context.generation, captureId: "", inventoryGuarded: true }), "wait", async () => {
+      if (await this.pinRestoreDenied(context.runId, context.generation)) return undefined;
       const existing = await this.newReconstructionRecords(context.runId, context.generation);
       if (!existing || await this.settledInventoryContext(context, existing)) return undefined;
       if (!this.git.enumerateOwedCandidates || !this.git.buildRecoveryCoverage) throw new Error("inventory Git support unavailable");
@@ -1688,6 +1819,12 @@ export class RecoveryCoordinator {
   async settleUnadoptedGuardedGeneration(input: {
     runId: string; generation: number; barePath: string; signal?: AbortSignal;
   }): Promise<"settled" | "retained"> {
+    return this.inAuthority(() => this.settleUnadoptedWithinAuthority(input));
+  }
+
+  private async settleUnadoptedWithinAuthority(input: {
+    runId: string; generation: number; barePath: string; signal?: AbortSignal;
+  }): Promise<"settled" | "retained"> {
     // issue #2213: this release is the ADR-2213 "pre-clone park's hold release, where no source
     // exists" exemption: it is sent only after a positive local proof that the generation adopted
     // no source (no record, no owed candidate, no clone), so a latched worker loses nothing by it
@@ -1696,6 +1833,7 @@ export class RecoveryCoordinator {
     if (!this.enabled || !Number.isSafeInteger(generation) || generation <= 0 ||
         !this.client.hasFeature?.("recovery_inventory_v1")) return "retained";
     try {
+      if (await this.pinRestoreDenied(runId, generation)) return "retained";
       if ((await this.checkedRecords(runId)).some(r => r.generation === generation)) return "retained";
       let bareExists = true;
       try { await fs.lstat(barePath); }
@@ -1795,6 +1933,7 @@ export class RecoveryCoordinator {
   /** One read per boundary, no retries. Unknown evidence retains all sources and blocks writes.
    * A validated closed hold is settled, never a release ACK or local cleanup permission. */
   async heldOperationState(record: RecoveryRecord, signal?: AbortSignal, observeOnly = false): Promise<"open" | "settled" | "unknown"> {
+    if (await this.pinRestoreDenied(record.runId, record.generation)) return "unknown";
     if (!this.bindinglessObservations.getStore() || !MaintenanceBudget.isAttempt(`${record.runId}:${record.generation}`)) {
       return this.withCancellationAttempt(record, () => this.heldOperationState(record, signal, observeOnly));
     }
@@ -1928,6 +2067,7 @@ export class RecoveryCoordinator {
     context: InventorySourceBoundaryContext,
     action: (prove: () => Promise<boolean>) => Promise<void>,
   ): Promise<"passed" | "retained"> {
+    if (await this.pinRestoreDenied(context.runId)) return "retained";
     if (this.withInventorySourceBoundary) return this.withInventorySourceBoundary(context, action);
     // Only positive discovery of zero physical sources permits a callback-free producer.
     const refuse = inventorySourceReporter(context);
@@ -2009,6 +2149,7 @@ export class RecoveryCoordinator {
       laterHead: (head: string) => boolean) => Promise<boolean>,
     remove: (ownTailEligible: () => boolean) => Promise<void>,
   ): Promise<void> {
+    if (await this.pinRestoreDenied(runId)) return;
     if (!this.enabled || !Number.isSafeInteger(generation) || generation <= 0 ||
         !this.git.withBareLock || !this.git.withReportProofBudget ||
         !this.git.enumerateOwedUnderLock || !this.git.readInventoryCloneHeads ||
@@ -2019,6 +2160,7 @@ export class RecoveryCoordinator {
     };
     await runCaptureCycle(path.resolve(this.runDir(runId), `generation-${generation}`), "skip",
       () => reserve(ownTailEligible => this.withJournalLock(runId, async () => {
+        if (await this.pinRestoreDenied(runId)) return;
         check();
         const sources = await this.checkedRecords(runId, budget);
         const ackRecords = sources.filter(r => r.generation === generation && r.inventoryGuarded === true &&
@@ -2140,6 +2282,7 @@ export class RecoveryCoordinator {
       laterHead: (head: string) => boolean) => Promise<boolean>,
     remove: (ownTailEligible: () => boolean) => Promise<void>,
   ): Promise<void> {
+    if (await this.pinRestoreDenied(runId)) return;
     if (!this.enabled || !Number.isSafeInteger(generation) || generation <= 0 ||
         !this.git.withBareLock || !this.git.withReportProofBudget ||
         !this.git.enumerateOwedUnderLock || !this.git.readInventoryCloneHeads ||
@@ -2150,6 +2293,7 @@ export class RecoveryCoordinator {
     };
     await runCaptureCycle(path.resolve(this.runDir(runId), `generation-${generation}`), "skip",
       () => reserve(ownTailEligible => this.withJournalLock(runId, async () => {
+        if (await this.pinRestoreDenied(runId)) return;
         check();
         const sources = await this.checkedRecords(runId, budget);
         const records = sources.filter(r => r.generation === generation && r.inventoryGuarded === true &&
@@ -2305,6 +2449,7 @@ export class RecoveryCoordinator {
   }
 
   private async finalizeInventoryWithinBoundary(snapshot: RecoveryRecord, prove: () => Promise<boolean>, reconcile: boolean, closureMint: ClosureMint): Promise<RecoveryOutcome | void> {
+    if (await this.pinRestoreDenied(snapshot.runId, snapshot.generation)) return;
     let record = await this.requireRecord(snapshot);
     // issue #2213 (ADR-2213 "Nothing is uploaded or released while latched"): the guarded FINAL is a
     // custody release of an inactive run's inventory. Neither named exemption (a completed run's
@@ -2455,6 +2600,7 @@ export class RecoveryCoordinator {
    */
   private async releaseHeldFinal(record: RecoveryRecord, request: NonNullable<RecoveryRecord["finalRequest"]>,
     prove: () => Promise<boolean>): Promise<RecoveryOutcome | void> {
+    if (await this.pinRestoreDenied(record.runId, record.generation)) return;
     const kept = (reason?: string): RecoveryOutcome => ({ state: record.state, captureId: record.captureId,
       ...(reason ? { reason } : {}), held: "kept" });
     const clearHeld = async (why: string): Promise<RecoveryOutcome> => {
@@ -2569,6 +2715,7 @@ export class RecoveryCoordinator {
 
   /** `fallback_unattested` is a cleared held FINAL whose cause the server did not state (see RecoveryOutcome.heldUnattested). */
   private async releaseHeldWithinCycle(record: RecoveryRecord, publicationId: string): Promise<"acked" | "kept" | "fallback" | "fallback_unattested" | "settled"> {
+    if (await this.pinRestoreDenied(record.runId, record.generation)) return "kept";
     let latest = await this.readLatest(record);
     if (latest.kind !== "ok") return "kept" as const;
     let cur = latest.record;
@@ -2601,6 +2748,7 @@ export class RecoveryCoordinator {
 
   /** One atomic reconciliation attempt; failures keep custody and every saved identity. */
   private async reconcileInventory(record: RecoveryRecord, prove: () => Promise<boolean>, status?: RecoveryCaptureStatusResponse): Promise<RecoveryOutcome | void> {
+    if (await this.pinRestoreDenied(record.runId, record.generation)) return;
     if (!record.serverCaptureId || !record.coverageDigest || !record.generation ||
         !hasJournaledBundle(record) || !this.client.hasFeature?.("recovery_inventory_v1")) return;
     const unknown = (): RecoveryOutcome | void => record.finalRequest
@@ -2785,6 +2933,8 @@ export class RecoveryCoordinator {
   }
 
   private async frozenOperationCycle(input: CaptureInput, options: FrozenOperationOptions = {}): Promise<RecoveryOutcome> {
+    if (await this.pinRestoreDenied(input.record.runId, input.record.generation))
+      return { state: input.record.state, captureId: input.record.captureId };
     let record = await this.requireRecord(input.record);
     const outcome = (held: NonNullable<RecoveryOutcome["held"]>): RecoveryOutcome =>
       ({ state: record.state, captureId: record.captureId, held });
@@ -3013,6 +3163,7 @@ export class RecoveryCoordinator {
 
   private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal, isExecuting = this.isExecuting,
     path: RedrivePath = "live"): Promise<RecoveryOutcome | void> {
+    if (await this.pinRestoreDenied(record.runId, record.generation)) return;
     if (record.holdSettlement && !record.finalRequest && !record.finalAcknowledged && !record.completionReceipt) return this.heldStopped(record, "settled");
     if (record.completionReceipt) {
       await this.forgetCompletedGeneration(record.runId, record.generation!, isExecuting, signal);
@@ -3250,6 +3401,7 @@ export class RecoveryCoordinator {
   /** The capture cycle; the caller holds the record's capture-cycle lock. */
   private async captureCycle(input: CaptureInput, closureMint: ClosureMint): Promise<RecoveryOutcome> {
     let record = input.record;
+    if (await this.pinRestoreDenied(record.runId, record.generation)) return { state: record.state, captureId: record.captureId };
     // The bundle bytes are dropped only when the record's file is CONFIRMED absent; a record that is
     // present but unreadable keeps them (they may be the only copy) and nothing is written.
     const removed = async (err: RecordGoneError): Promise<RecoveryOutcome> => {
@@ -3452,6 +3604,7 @@ export class RecoveryCoordinator {
     const finalPath = this.bundlePath(snapshot);
     try {
       return await this.withJournalLock(snapshot.runId, async () => {
+        await this.assertPinRestoreMutable(snapshot);
         const cur = await this.requireRecord(snapshot);
         if (pinFactsDiffer(snapshot, cur)) return { kind: "source_advanced" as const };
         if (hasJournaledBundle(cur)) return { kind: "bundled" as const, record: cur };
@@ -3503,6 +3656,7 @@ export class RecoveryCoordinator {
     signal: AbortSignal | undefined,
     mode: UploadMode,
   ): Promise<RecoveryOutcome> {
+    if (await this.pinRestoreDenied(record.runId, record.generation)) return { state: record.state, captureId: record.captureId };
     const swallow = mode === "capture";
     // issue #2213: refuse before any journal write too (markFailure below), not just before the client call.
     if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
@@ -3583,7 +3737,8 @@ export class RecoveryCoordinator {
     }
     // Bytes are durable on the server; free the local copy. The small journal record stays
     // (state=uploaded) so a restart sweep skips it.
-    if (!uploaded.inventoryGuarded) await ownedRecoveryIO(() => fs.rm(current.bundlePath!, { force: true })).catch(() => undefined);
+    if (!uploaded.inventoryGuarded && !await this.pinRestoreDenied(current.runId, current.generation))
+      await ownedRecoveryIO(() => fs.rm(current.bundlePath!, { force: true })).catch(() => undefined);
     this.log.info("recovery: bundle uploaded (durable capture)", {
       run_id: current.runId,
       capture_id: current.captureId,
@@ -3603,6 +3758,7 @@ export class RecoveryCoordinator {
     record: RecoveryRecord,
     opts: { mode: UploadedPinCleanupMode; signal?: AbortSignal; deadline?: number },
   ): Promise<UploadedPinCleanupResult> {
+    if (await this.pinRestoreDenied(record.runId, record.generation)) return { state: "retained", reason: "unverified_journal" };
     const cleanup = this.git.cleanupArchivedRecoveryPin;
     if (!cleanup) return { state: "retained", reason: "unsupported" };
     const { runId, captureId } = record;
@@ -3704,6 +3860,7 @@ export class RecoveryCoordinator {
 
   /** Drop the bundle file(s) a removed record named (and its canonical path). */
   private async dropBundleFiles(record: RecoveryRecord): Promise<void> {
+    if (await this.pinRestoreDenied(record.runId, record.generation)) return;
     await ownedRecoveryIO(() => fs.rm(this.bundlePath(record), { force: true })).catch(() => undefined);
     if (record.bundlePath && record.bundlePath !== this.bundlePath(record)) {
       await ownedRecoveryIO(() => fs.rm(record.bundlePath!, { force: true })).catch(() => undefined);
@@ -3753,6 +3910,12 @@ export class RecoveryCoordinator {
     opts: { completedRun?: boolean } = {},
   ): Promise<void> {
     if (!this.enabled) return;
+    return this.inAuthority(() => this.releaseWithinAuthority(runId, generation, releaseEvidence, opts));
+  }
+
+  private async releaseWithinAuthority(runId: string, generation: number | undefined, releaseEvidence: string | undefined,
+    opts: { completedRun?: boolean }): Promise<void> {
+    if (await this.pinRestoreDenied(runId, generation)) return;
     if ((await this.listRecords(runId)).some(r => (generation === undefined || r.generation === generation) && r.inventoryGuarded)) {
       this.log.warn("recovery: guarded inventory requires final disposition; custody retained", { run_id: runId, generation });
       return;
@@ -4487,6 +4650,7 @@ export class RecoveryCoordinator {
 
   /** One boot-sweep record step; the caller holds the record's capture-cycle lock. */
   private async pendingStep(snap: RecoveryRecord, signal?: AbortSignal, path: RedrivePath = "boot"): Promise<void> {
+    if (await this.pinRestoreDenied(snap.runId, snap.generation)) return;
     // Re-read the current, authenticated state of exactly this snapshotted record.
     const record = await this.readRecord(this.recordPath(snap));
     if (!record) {
@@ -4536,7 +4700,8 @@ export class RecoveryCoordinator {
         done("needs_action", "record_unauthenticated");
         return;
       }
-      await ownedRecoveryIO(() => fs.rm(this.bundlePath(record), { force: true })).catch(() => undefined);
+      if (!await this.pinRestoreDenied(record.runId, record.generation))
+        await ownedRecoveryIO(() => fs.rm(this.bundlePath(record), { force: true })).catch(() => undefined);
       done("record_removed");
     }
   }
@@ -4807,6 +4972,7 @@ export class RecoveryCoordinator {
 
   /** One live archived-pin cleanup; the caller holds the record's capture-cycle lock. */
   private async livePinCleanupStep(snap: RecoveryRecord, opts: ResumeLiveOptions): Promise<void> {
+    if (await this.pinRestoreDenied(snap.runId, snap.generation)) return;
     this.lastAttemptAt.set(snap.captureId, this.now());
     const record = await this.readRecord(this.recordPath(snap));
     if (!record || record.state !== "uploaded" || record.inventoryGuarded || opts.isExecuting(record.runId)) return;
@@ -4826,6 +4992,7 @@ export class RecoveryCoordinator {
 
   /** One live record step; the caller holds the record's capture-cycle lock. */
   private async liveStep(snap: RecoveryRecord, opts: ResumeLiveOptions): Promise<"ok" | "transient" | "credential"> {
+    if (await this.pinRestoreDenied(snap.runId, snap.generation)) return "ok";
     const log = (outcome: string, reason?: string): void => {
       this.log.info("recovery live re-drive", {
         run_id: snap.runId,
@@ -5008,6 +5175,7 @@ export class RecoveryCoordinator {
   /** The `classify` half: the same authority checks as the retirement, none of its effects. Runs inside the cycle. */
   private classifyHandoffGeneration(runId: string, generation: number): Promise<CompletedRetirement> {
     return this.withJournalLock(runId, async (): Promise<CompletedRetirement> => {
+      if (await this.pinRestoreDenied(runId, generation)) return { kind: "pending", why: "preflight" };
       const records = await this.checkedRecords(runId);
       const selected = records.filter(r => r.generation === generation);
       const authority = selected.find(r => r.completionReceipt && r.completionSource);
@@ -5039,11 +5207,13 @@ export class RecoveryCoordinator {
    * transaction (see {@link retiringManifest}). */
   private async forgetCompletedGeneration(runId: string, generation: number, isExecuting: (runId: string) => boolean,
     signal?: AbortSignal): Promise<CompletedRetirement> {
+    if (await this.pinRestoreDenied(runId, generation)) return { kind: "pending", why: "preflight" };
     if (!this.withCompletionSourceBoundary) return { kind: "unsupported", why: "no_boundary" };
     if (isExecuting(runId) || this.isExecuting(runId)) return { kind: "pending", why: "executing" };
     let claims: PendingRedundancyClaim[] = [];
     const budget = this.startRedundancyBudget(signal);
     const outcome = await this.withJournalLock(runId, async (): Promise<CompletedRetirement> => {
+      if (await this.pinRestoreDenied(runId, generation)) return { kind: "pending", why: "preflight" };
       const records = await this.checkedRecords(runId);
       const selected = records.filter(r => r.generation === generation);
       const authority = selected.find(r => r.completionReceipt && r.completionSource);
@@ -5342,10 +5512,12 @@ export class RecoveryCoordinator {
    * covering ACK and the bounded boot/live passes retry it independently of upload eligibility. */
   private async forgetGenerationWithinCycle(runId: string, generation: number, isExecuting = this.isExecuting,
     signal?: AbortSignal): Promise<void> {
+    if (await this.pinRestoreDenied(runId, generation)) return;
     // Issue #2625: claims are built under the journal lock and submitted after it, as in forgetCompletedGeneration.
     let claims: PendingRedundancyClaim[] = [];
     const budget = this.startRedundancyBudget(signal);
     await this.withJournalLock(runId, async () => {
+      if (await this.pinRestoreDenied(runId, generation)) return;
       // Keep legacy exact-release cleanup (including opaque sibling retention) unchanged.
       // Classify under the journal lock and generation cycle so a new guarded writer cannot
       // slip between classification and removal. Guarded cleanup checks the complete inventory.
@@ -5630,6 +5802,7 @@ export class RecoveryCoordinator {
     }
     const ctx = bound.context;
     await this.withJournalLock(ctx.runId, async () => {
+      await this.assertPinRestoreMutable({ runId: ctx.runId, generation: ctx.generation });
       const first = await this.physicalGeneration(ctx.runId, ctx.generation);
       const bareDir = path.basename(ctx.barePath);
       const wanted = canonicalJson(bound), certifiedJson = canonicalJson(certified);
@@ -5701,6 +5874,7 @@ export class RecoveryCoordinator {
 
   /** MAC, write, file sync, rename: the durable variant of writeRecordUnlocked. The directory sync is the caller's. */
   private async writeRecordDurableUnlocked(record: RecoveryRecord): Promise<void> {
+    await this.assertPinRestoreMutable(record);
     this.invalidateCompletionCleanupWitness(record);
     const mac = this.computeMac(record);
     const dst = this.recordPath(record);
@@ -5853,6 +6027,7 @@ export class RecoveryCoordinator {
    * origin-proof failure still do. Failure blocks new reconstruction only. Immutable replay
    * and frozenCoverageProven retain their existing proof, including every authenticated source record. */
   private async newReconstructionRecords(runId: string, generation?: number): Promise<RecoveryRecord[] | undefined> {
+    if (await this.pinRestoreDenied(runId, generation)) return undefined;
     if (this.savedEvidenceOnly.getStore()) return undefined;
     const producer = M1MaintenanceResources.active();
     const read = async (): Promise<RecoveryRecord[] | undefined> => {
@@ -5913,7 +6088,7 @@ export class RecoveryCoordinator {
   /** One bounded pass over physical JSON files; any failed read blocks authority.
    * Paths must resolve inside this coordinator's root, with no symlink file reads. */
   private async checkedRecords(runId: string, budget?: { signal: AbortSignal; deadline: number }, completeOrigin = false,
-    ordinaryTemps = false): Promise<RecoveryRecord[]> {
+    ordinaryTemps = false, strictContents = false): Promise<RecoveryRecord[]> {
     this.checkJournalMetadata(budget);
     const dir = await this.checkedRecordDirectory(runId, budget);
     this.checkJournalMetadata(budget);
@@ -5931,7 +6106,7 @@ export class RecoveryCoordinator {
     for (const name of names) {
       if (!name.endsWith(".json")) continue;
       this.checkJournalMetadata(budget);
-      const result = await this.readRecordResult(path.join(dir, name), true, budget, completeOrigin);
+      const result = await this.readRecordResult(path.join(dir, name), true, budget, completeOrigin, strictContents);
       this.checkJournalMetadata(budget);
       if (result.kind !== "ok" || result.record.runId !== runId ||
           name !== result.record.captureId + ".json") throw new Error("unverified recovery journal");
@@ -6011,6 +6186,7 @@ export class RecoveryCoordinator {
 
   /** Atomic rename with a fresh MAC (0600 file, 0700 dir). The caller holds this run's journal lock. */
   private async writeRecordUnlocked(record: RecoveryRecord): Promise<void> {
+    await this.assertPinRestoreMutable(record);
     this.invalidateCompletionCleanupWitness(record);
     if (!this.key) throw new Error("recovery: MAC key unavailable");
     const mac = this.computeMac(record);
@@ -6026,6 +6202,7 @@ export class RecoveryCoordinator {
    * The caller owns the journal lock and has durably indexed this immutable ID. */
   private async writeProducerOriginUnlocked(record: RecoveryRecord, check: () => void,
     fresh: () => Promise<void>): Promise<void> {
+    await this.assertPinRestoreMutable(record);
     this.invalidateCompletionCleanupWitness(record);
     const sync = async (dir: string) => {
       check();
@@ -6093,6 +6270,7 @@ export class RecoveryCoordinator {
     noFollow = false,
     budget?: { signal: AbortSignal; deadline: number },
     quiet = false,
+    strictContents = false,
   ): Promise<{ kind: "ok"; record: RecoveryRecord } | { kind: "absent" } | { kind: "unreadable" }> {
     if (!this.key) return { kind: "unreadable" };
     const savedPass = this.savedEvidenceOnly.getStore();
@@ -6163,7 +6341,7 @@ export class RecoveryCoordinator {
     if (quiet) M1MaintenanceResources.checkIfActive();
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw);
+      parsed = strictContents ? parsePinRestoreJson(raw, 1024 * 1024) : JSON.parse(raw);
     } catch { MaintenanceBudget.current()?.check();
       if (!quiet) this.log.warn("recovery: unparseable journal record; refusing (needs_action)", { file: filePath });
       return { kind: "unreadable" };
@@ -6175,7 +6353,7 @@ export class RecoveryCoordinator {
     const rest = { ...obj };
     delete rest.mac;
     const record = coerceRecord(rest);
-    if (!record) {
+    if (!record || (strictContents && canonicalJson(rest) !== canonicalJson(record))) {
       if (!quiet) this.log.warn("recovery: malformed journal record; refusing (needs_action)", { file: filePath });
       return { kind: "unreadable" };
     }
@@ -6289,6 +6467,9 @@ export class RecoveryCoordinator {
     reason: string,
     swallow = false,
   ): Promise<RecoveryOutcome> {
+    const latest = await this.readRecord(this.recordPath(record));
+    if (latest && await this.pinRestoreDenied(latest.runId, latest.generation))
+      return { state: latest.state, captureId: latest.captureId };
     try {
       let alreadyUploaded = false;
       await this.writeExistingRecord(record, (cur) => {
@@ -6308,6 +6489,7 @@ export class RecoveryCoordinator {
 
   /** The caller holds this run's journal lock, including for legacy whole-run release. */
   private async removeRunDir(runId: string): Promise<void> {
+    if (await this.pinRestoreDenied(runId)) return;
     let protectedNow = true;
     try {
       protectedNow = await this.terminalRecordProtection?.(runId) ?? false;
@@ -6349,6 +6531,7 @@ export class RecoveryCoordinator {
     generation: number,
     dirMode: "sweep_if_last" | "rmdir_if_empty",
   ): Promise<void> {
+    if (await this.pinRestoreDenied(runId, generation)) return;
     const records = await this.listRecords(runId);
     let remaining = 0;
     for (const record of records) {

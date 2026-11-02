@@ -2740,6 +2740,70 @@ export class GitCache {
     cwd: string; deadline: number; live: () => boolean; checkBudget: () => void;
   }>();
   private readonly pinRestoreBudgets = new AsyncLocalStorage<PinRestoreDecodeBudget>();
+  private readonly pinProtectionReads = new AsyncLocalStorage<{ bytes: number; sources: number }>();
+
+  /** Deny data only; no source access or cleanup authority. One pass of at most 4096
+   * entries and 1024 bares; a failure stops siblings. Started IO settles before unlock. */
+  async readPinRestoreProtection(runId: string, options: { signal: AbortSignal; deadline: number }): Promise<
+    { kind: "complete"; originalGenerations: ReadonlySet<number>; protectedThroughGeneration?: number } | { kind: "unknown" }
+  > {
+    if (!CODE_ID.test(runId) || !Number.isFinite(options.deadline)) return { kind: "unknown" };
+    try {
+      return await this.withRecoveryOperation(options.signal, Math.min(options.deadline, Date.now() + 30_000), async () =>
+        this.pinProtectionReads.run({ bytes: 0, sources: 0 }, async () => {
+          const generations = new Set<number>();
+          let protectedThroughGeneration: number | undefined;
+          let rootBefore: Stats;
+          try {
+            rootBefore = await this.retainedIO(() => fs.lstat(this.reposRoot));
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "complete" as const, originalGenerations: generations };
+            throw error;
+          }
+          // Initially absent roots carry no deny metadata, not positive source-use proof.
+          // Disappearance after the successful lstat is unknown, including opendir ENOENT.
+          if (!rootBefore.isDirectory() || rootBefore.isSymbolicLink()) throw new Error("unsafe pin protection root");
+          const directory = await this.retainedIO(() => fs.opendir(this.reposRoot, { bufferSize: 1 }));
+          let entries = 0, bares = 0;
+          try {
+            for (;;) {
+              const entry = await this.retainedIO(() => directory.read());
+              if (!entry) break;
+              if (++entries > 4096) throw new Error("pin protection directory limit");
+              if (!entry.name.endsWith(".git")) continue;
+              if (!entry.isDirectory() || entry.isSymbolicLink() || ++bares > 1024)
+                throw new Error("unknown pin protection bare");
+              const bare = path.join(this.reposRoot, entry.name);
+              await this.withLock(bare, async () => {
+                for (const record of await this.readRetainedPinMetadata(bare)) {
+                  if (record.envelope.runId === runId) {
+                    for (const original of record.originals) generations.add(original.generation);
+                    protectedThroughGeneration = Math.max(protectedThroughGeneration ?? 0, record.protectedThroughGeneration);
+                  }
+                }
+              });
+            }
+          } finally { await directory.close(); }
+          const after = await this.retainedIO(() => fs.lstat(this.reposRoot));
+          if (rootBefore.dev !== after.dev || rootBefore.ino !== after.ino || rootBefore.mtimeMs !== after.mtimeMs ||
+              rootBefore.ctimeMs !== after.ctimeMs) throw new Error("pin protection inventory changed");
+          this.checkRecoveryInterruption();
+          return { kind: "complete" as const, originalGenerations: generations,
+            ...(protectedThroughGeneration === undefined ? {} : { protectedThroughGeneration }) };
+        }));
+    } catch { return { kind: "unknown" }; }
+  }
+
+  /** Caller owns B, or uses the legacy unlocked pin-delete API. Never acquires B. */
+  private async pinRestoreGenerationDenied(barePath: string, runId: string, generation?: number): Promise<boolean> {
+    try {
+      return await this.withRecoveryOperation(new AbortController().signal, Date.now() + 30_000, async () =>
+        this.pinProtectionReads.run(this.pinProtectionReads.getStore() ?? { bytes: 0, sources: 0 }, async () =>
+          (await this.readRetainedPinMetadata(barePath)).some(record =>
+            record.envelope.runId === runId && (generation === undefined || !Number.isSafeInteger(generation) ||
+              generation <= record.protectedThroughGeneration))));
+    } catch { return true; }
+  }
 
   /** Repeated reads and multiple bares share the enclosing operation's actual-decode cap. */
   private withPinRestoreBudget<T>(action: () => Promise<T>): Promise<T> {
@@ -6269,6 +6333,7 @@ export class GitCache {
       return await recoveryPinAttributionLocks.withLock(
         JSON.stringify([root, rootStat.dev, rootStat.ino, pinRef]),
         () => this.withLock(barePath, async () => {
+          if (await this.pinRestoreGenerationDenied(barePath, runId, generation)) return false;
           const present = (
             await this.runGit(barePath, ["rev-parse", "--verify", `${sha}^{commit}`]).catch(() => "")
           ).trim();
@@ -6501,6 +6566,7 @@ export class GitCache {
    */
   async deleteRecoveryPin(barePath: string, runId: string, generation: number, expectedSha?: string): Promise<void> {
     if (expectedSha === undefined) {
+      if (await this.pinRestoreGenerationDenied(barePath, runId, generation)) return;
       const pinRef = recoveryPinRef(runId, generation);
       // No lock is taken here: callers may already hold this bare's lock, as before.
       let safe = false;
@@ -6811,6 +6877,7 @@ export class GitCache {
         if (!selected) return { state: "already_absent" };
         const chosen = selected;
         return this.withLock(chosen.bare, async () => {
+          if (await this.pinRestoreGenerationDenied(chosen.bare, input.runId, input.generation)) refuse("unsafe_metadata");
           check();
           await revalidate(chosen.evidence);
           const current = await candidate(path.basename(chosen.bare));
@@ -7025,6 +7092,7 @@ export class GitCache {
   /** issue #1751 M2 — best-effort remove ONE settlement pin kind for ONE hold (a live-settle leg
    *  cleared without a release drops only its `published` pin). Never throws. */
   async deleteSettlementPin(barePath: string, runId: string, holdId: string, kind: SettlementPinKind): Promise<void> {
+    if (await this.pinRestoreGenerationDenied(barePath, runId)) return;
     const base = settlementPinBase(runId, holdId);
     if (base === null) return;
     await this.tryGit(barePath, ["update-ref", "-d", `${base}${kind}`]);
@@ -7033,6 +7101,7 @@ export class GitCache {
   /** issue #1582 M2 — best-effort remove every settlement pin for ONE hold (after the api
    *  released it), the issue #1751 `published` pin included. Never throws. */
   async deleteSettlementRefs(barePath: string, runId: string, holdId: string): Promise<void> {
+    if (await this.pinRestoreGenerationDenied(barePath, runId)) return;
     const base = settlementPinBase(runId, holdId);
     if (base === null) return;
     for (const kind of SETTLEMENT_PIN_KINDS) {
@@ -7051,6 +7120,8 @@ export class GitCache {
           parseAttemptPath(clonePath, path.resolve(this.runnerRoot))?.attemptId !== attemptId)))) throw new Error("invalid source generation");
     if (peeledMarker !== undefined && !SHA40_RE.test(peeledMarker)) throw new Error("invalid peeled marker");
     await this.withLock(barePath, async () => {
+      if (await this.pinRestoreGenerationDenied(barePath, runId, sourceGeneration))
+        throw new Error("pin restore original retained");
       // issue #1783 M2: an attempt-path seed also journals the id its path and marker carry,
       // including recovery-enabled unwired workers. Canonical sources omit the attempt id.
       await this.assertRecoveryBare(barePath);
@@ -7585,10 +7656,20 @@ export class GitCache {
     raw: string; envelope: RetainedPinEnvelope; activeRaw: string | undefined; activeJournal: RecoveryJournalEntry | undefined;
     relation: "prepared-old" | "prepared-new" | "ready-new" | "absent";
     originals: Array<{ raw: string; journal: RecoveryJournalEntry; generation: number; sourceEpoch: string }>;
+    protectedThroughGeneration: number;
   }>> {
+    if (!this.recoveryOperations.getStore())
+      return this.withRecoveryOperation(new AbortController().signal, Date.now() + 30_000,
+        () => this.readRetainedPinMetadata(barePath, config));
     await this.assertRecoveryBare(barePath);
     const entries = config ?? (await this.runGit(barePath,
       ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
+    const protection = this.pinProtectionReads.getStore();
+    if (protection) {
+      for (const entry of entries) protection.bytes += Buffer.byteLength(entry) + 1;
+      if (protection.bytes > 8 * 1024 * 1024 || entries.length > 32768)
+        throw new Error("pin protection metadata limit");
+    }
     const values = new Map<string, string>();
     const decoded = new Map<string, RecoveryJournalEntry>();
     const budget = this.pinRestoreBudgets.getStore() ?? new PinRestoreDecodeBudget();
@@ -7603,6 +7684,7 @@ export class GitCache {
       raw: string; envelope: RetainedPinEnvelope; activeRaw: string | undefined; activeJournal: RecoveryJournalEntry | undefined;
       relation: "prepared-old" | "prepared-new" | "ready-new" | "absent";
       originals: Array<{ raw: string; journal: RecoveryJournalEntry; generation: number; sourceEpoch: string }>;
+      protectedThroughGeneration: number;
     }> = [];
     let ledger: Array<[string, string]> | undefined;
     for (const [name, raw] of values) {
@@ -7619,6 +7701,8 @@ export class GitCache {
         const occurrences = 1 + (journal.retainedSources?.length ?? 0) +
           (journal.recovery ? 1 + (journal.recovery.successor ? 1 : 0) : 0);
         MaintenanceResources.consumeIfActive("sources", occurrences);
+        if (protection && (protection.sources += occurrences) > 32768)
+          throw new Error("pin protection source limit");
         decoded.set(text, journal);
         return journal;
       };
@@ -7634,9 +7718,14 @@ export class GitCache {
         raw: p.rawJournal, journal: decoded.get(p.rawJournal)!,
         generation: p.generation, sourceEpoch: p.sourceEpoch,
       }));
-      ledger ??= await this.readAllAttemptLedgerRaw(barePath);
+      // Use the same bounded config snapshot, including its ledger entries.
+      ledger ??= await this.readAllAttemptLedgerRaw(barePath, entries);
       const last = new Map<string, AttemptLedgerEntry & { branch: string }>();
       const byPath = new Map<string, AttemptLedgerEntry & { branch: string }>();
+      if (protection) {
+        for (const [branch, raw] of ledger) protection.bytes += Buffer.byteLength(branch) + Buffer.byteLength(raw);
+        if (ledger.length > 32768 || protection.bytes > 8 * 1024 * 1024) throw new Error("pin protection ledger limit");
+      }
       for (const [branch, entryRaw] of ledger) {
         const strict = parsePinRestoreJson(entryRaw, GIT_MAX_BUFFER);
         if (!strict || typeof strict !== "object" || Array.isArray(strict) ||
@@ -7675,7 +7764,23 @@ export class GitCache {
         const shape = this.clonePathShape(successor.clonePath, canonical);
         if (!shape || shape.attemptId !== successor.attemptId) throw new Error("retained pin successor path mismatch");
       }
-      records.push({ raw, envelope, activeRaw, activeJournal: activeRaw === undefined ? undefined : decoded.get(activeRaw), relation, originals });
+      // Deny-only family bound, never an attribution of a canonical secondary's generation.
+      // A future writer must prove its fresh claim is strictly above this bound before
+      // seeding or execution; metadata shape alone does not establish admission.
+      let protectedThroughGeneration = 0;
+      for (const original of originals) {
+        protectedThroughGeneration = Math.max(protectedThroughGeneration, original.generation,
+          original.journal.sourceGeneration ?? 0, original.journal.recovery?.claimGeneration ?? 0);
+        for (const source of this.recoverySources(original.journal)) {
+          if (source.attemptId === undefined) continue;
+          const generation = attemptGeneration(source.attemptId);
+          if (generation === undefined || !Number.isSafeInteger(generation) || generation < 0)
+            throw new Error("unknown retained pin family generation");
+          protectedThroughGeneration = Math.max(protectedThroughGeneration, generation);
+        }
+      }
+      records.push({ raw, envelope, activeRaw, activeJournal: activeRaw === undefined ? undefined : decoded.get(activeRaw),
+        relation, originals, protectedThroughGeneration });
     }
     // A linked active journal without its immutable predecessor envelope is incomplete.
     for (const [name, raw] of values) {
@@ -8136,6 +8241,8 @@ export class GitCache {
   }
 
   private async writeRecovery(barePath: string, branch: string, journal: RecoveryJournalEntry, guard?: () => void | Promise<void>): Promise<void> {
+    if (await this.pinRestoreGenerationDenied(barePath, journal.runId, journal.sourceGeneration))
+      throw new Error("pin restore original retained");
     const value = recoveryJournalJson(journal);
     parseRecoveryJournal(value);
     await this.assertRecoveryBare(barePath);
@@ -11110,9 +11217,9 @@ export class GitCache {
   }
 
   /** Every raw attempt-ledger value, in config order, with its branch. Throws on an unreadable config. */
-  private async readAllAttemptLedgerRaw(barePath: string): Promise<Array<[string, string]>> {
+  private async readAllAttemptLedgerRaw(barePath: string, config?: readonly string[]): Promise<Array<[string, string]>> {
     const out: Array<[string, string]> = [];
-    for (const item of (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0")) {
+    for (const item of config ?? (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0")) {
       const nl = item.indexOf("\n");
       const m = /^uzi-attempts\.(.+)\.entry$/.exec(nl < 0 ? item : item.slice(0, nl));
       // Valueless ledger keys remain malformed evidence for strict readers.
@@ -11171,6 +11278,7 @@ export class GitCache {
     state: "abandoned" | "reclaimed",
   ): Promise<void> {
     await this.withLock(barePath, async () => {
+      if (await this.pinRestoreGenerationDenied(barePath, runId)) throw new Error("pin restore original retained");
       const pending = await this.readRecoveryCapture(barePath, branch);
       if (pending?.runId !== runId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, runId);
@@ -12591,6 +12699,7 @@ export class GitCache {
     const processOpen = (): boolean => opts.processProof === undefined || opts.processProof() === true;
     if (!attemptId || !processOpen()) return false;
     return this.withLock(barePath, async () => {
+      if (await this.pinRestoreGenerationDenied(barePath, runId)) return false;
       if (!processOpen()) return false;
       const entry = (await this.readAttemptLedger(barePath, branch)).get(attemptId);
       if (!processOpen() || entry?.runId !== runId || entry.clonePath !== clonePath || entry.state !== "retired") return false;
@@ -12639,6 +12748,7 @@ export class GitCache {
     const processOpen = (): boolean => opts.processProof === undefined || opts.processProof() === true;
     if (!processOpen()) return false;
     return this.withLock(barePath, async () => {
+      if (await this.pinRestoreGenerationDenied(barePath, runId)) return false;
       if (!processOpen()) return false;
       await this.assertRecoveryBare(barePath);
       const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
@@ -12682,6 +12792,7 @@ export class GitCache {
   async completionSourceJournalAbsent(barePath: string, branch: string, runId: string, clonePath: string,
     attemptId: string | undefined): Promise<boolean> {
     return this.withLock(barePath, async () => {
+      if (await this.pinRestoreGenerationDenied(barePath, runId)) return false;
       await this.assertRecoveryBare(barePath);
       try { await fs.lstat(clonePath); return false; }
       catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
@@ -12701,8 +12812,10 @@ export class GitCache {
   async removeCompletionSkillsDir(barePath: string, clonePath: string, canDelete: () => boolean): Promise<boolean> {
     const parent = path.dirname(clonePath);
     const skills = `.uzi-skills-${path.basename(clonePath)}`;
-    return this.withLock(barePath, () =>
-      this.deleteRetainedArtifact(parent, path.join(parent, skills), name => name === skills, { canDelete, strictValidation: true }));
+    return this.withLock(barePath, async () => {
+      if ((await this.retainedPinPaths(barePath)).has(path.join(parent, skills))) return false;
+      return this.deleteRetainedArtifact(parent, path.join(parent, skills), name => name === skills, { canDelete, strictValidation: true });
+    });
   }
 
   async retireRunnerClone(
@@ -12777,6 +12890,7 @@ export class GitCache {
       //    to STILL be journaled before moving anything. A missing/malformed journal, or
       //    a lock-gap rewrite to a different runId/path, moves NOTHING and fails closed.
       checkProcessProof();
+      if (await this.pinRestoreGenerationDenied(barePath, ownerRunId)) throw new Error("pin restore original retained");
       const pending = await this.readRecoveryCapture(barePath, branch);
       stage = "journal_validation";
       if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath) {
@@ -18160,6 +18274,12 @@ try {
   ): Promise<{ stdout: string; stderr: string }> {
     const boundary = this.boundaryProcesses.getStore();
     const epoch = this.epochRetained.getStore();
+    const protection = this.pinProtectionReads.getStore();
+    if (protection) {
+      const remaining = 8 * 1024 * 1024 - protection.bytes;
+      if (remaining <= 0) throw new Error("pin protection metadata limit");
+      options = { ...options, maxBuffer: Math.min(options.maxBuffer ?? Infinity, remaining) };
+    }
     if (epoch) options = { ...options, maxBuffer: Math.min(options.maxBuffer ?? Infinity, epoch.maxMetadataBytes) };
     this.checkReportProof();
     const report = this.reportProofs.getStore();
@@ -20236,6 +20356,7 @@ try {
     if (!Number.isSafeInteger(context.generation) || context.generation <= 0) return "retained";
     await this.assertOwedBare(barePath);
     return this.withLock(barePath, async () => {
+      if (await this.pinRestoreGenerationDenied(barePath, context.runId, context.generation)) return "retained";
       const metadata = await this.readOwedMetadataUnderLock(barePath);
       if (metadata.names.some(name => name.startsWith(".tmp-"))) return "retained";
       // Enumerate all physical pins, not just the target run. An orphan candidate after a
