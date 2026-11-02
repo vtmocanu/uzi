@@ -261,6 +261,20 @@ function nonNegSafeInt(v: unknown): number | undefined {
   return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : undefined;
 }
 
+/**
+ * A Grep match count read only from the field its own mode defines, never another mode's.
+ * Content mode reports output lines (context lines and `--` separators included), not matches,
+ * so it yields a count only when nothing matched. An absent or unknown mode yields none.
+ */
+function grepMatches(structured: Record<string, unknown> | undefined): number | undefined {
+  switch (structured?.["mode"]) {
+    case "count": return nonNegSafeInt(structured?.["numMatches"]);
+    case "files_with_matches": return nonNegSafeInt(structured?.["numFiles"]);
+    case "content": return nonNegSafeInt(structured?.["totalLines"]) === 0 ? 0 : undefined;
+    default: return undefined;
+  }
+}
+
 function toolResultText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -341,8 +355,7 @@ class ActivityMapper {
       if (start !== undefined && num !== undefined && start >= 1 && num > 0) return { outcome: "ok", lines: [start, start + num - 1] };
       return { outcome: "ok" };
     }
-    const matches = tool === "Grep" ? nonNegSafeInt(structured?.["numMatches"]) ?? nonNegSafeInt(structured?.["numFiles"])
-      : nonNegSafeInt(structured?.["numFiles"]);
+    const matches = tool === "Grep" ? grepMatches(structured) : nonNegSafeInt(structured?.["numFiles"]);
     if (matches === undefined) return { outcome: "ok" };
     return tool === "Glob" && structured?.["truncated"] === true
       ? { outcome: "ok", matches, matchesTruncated: true } : { outcome: "ok", matches };

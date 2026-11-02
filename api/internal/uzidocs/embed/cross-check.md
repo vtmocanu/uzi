@@ -380,6 +380,9 @@ fail the check.
   covers a search that stopped at its time, operation, directory, entry or byte
   ceiling, or skipped a file over 1 MiB: the matches found so far are kept, the
   coverage is incomplete, and `0+` is not evidence that the text is absent.
+  A Claude-checker search that returns matching lines rather than a count or
+  file names records no count unless nothing matched, because its line total
+  includes context lines.
 - Never the search query, glob or pattern, tool arguments or file contents.
 - An attempt outside the checkout is recorded as a category with no path:
   `outside checkout`. `policy` covers a path the recorder refuses to show
