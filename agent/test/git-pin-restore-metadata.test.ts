@@ -1,0 +1,447 @@
+import { afterEach, beforeEach, describe, it, type TestContext } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import promises from "node:fs/promises";
+import path from "node:path";
+import { attemptClonePath } from "../src/attempt-path.js";
+import { GitCache, type RecoveryJournalEntry } from "../src/git.js";
+import type { PinRestoreLink, RetainedPinEnvelope } from "../src/pin-restore-journal.js";
+import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
+import { parseRecoveryJournal as baseParseRecoveryJournal } from "./fixtures/base-parse-recovery-journal.js";
+
+// M2 reader proof only: metadata below is not an authenticated restore record,
+// process-quiescence proof, execution lease, or permission to reuse an old source.
+const RUN = "run-pin-metadata";
+const BRANCH = "agent/issue-2512";
+const KEY = "issue-2512";
+const OLD_EPOCH = "0123abcd-0123-4abc-8def-0123456789ab";
+const NEW_EPOCH = "1123abcd-0123-4abc-8def-0123456789ab";
+const ATTEMPT = "20261008T171401Z-g2-0123456789abcdef";
+const OLD_ATTEMPT = "20261008T171400Z-g1-fedcba9876543210";
+const ACTIVE_KEY = `uzi-recovery.${BRANCH}.clone`;
+const RETAINED_KEY = `uzi-retained.${RUN}.journal`;
+const LEDGER_KEY = `uzi-attempts.${BRANCH}.entry`;
+const FENCE = { version: 1 as const, sourceUseEpoch: OLD_EPOCH, sourceCoreDigest: "a".repeat(64) };
+const ENV: NodeJS.ProcessEnv = Object.fromEntries(
+  Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")),
+);
+ENV.GIT_CONFIG_GLOBAL = "/dev/null";
+ENV.GIT_CONFIG_SYSTEM = "/dev/null";
+const digest = (raw: string): string => createHash("sha256").update(raw).digest("hex");
+
+let fx: Fixture;
+let cache: GitCache;
+let bare: string;
+let canonical: string;
+let oldRaw: string;
+let oldJournal: RecoveryJournalEntry;
+let link: PinRestoreLink;
+let envelope: RetainedPinEnvelope;
+
+function git(dir: string, args: string[]): string {
+  return execFileSync("git", ["-C", dir, ...args], { env: ENV, encoding: "utf8", stdio: "pipe" });
+}
+function config(key: string, raw: string): void {
+  git(bare, ["config", "--local", key, raw]);
+}
+function rawConfig(key: string): string {
+  // Remove Git's output delimiter only; raw journal whitespace is significant.
+  return git(bare, ["config", "--local", "--get", key]).slice(0, -1);
+}
+function writeOld(extra: Partial<RecoveryJournalEntry> = {}, fenced = true): void {
+  oldJournal = { runId: RUN, clonePath: canonical, sourceGeneration: 1, ...extra,
+    ...(fenced ? { completionSourceFence: FENCE } : {}) };
+  oldRaw = ` \n\t${JSON.stringify(oldJournal, null, 2)}\n \t`;
+  config(ACTIVE_KEY, oldRaw);
+}
+function prepare(): void {
+  const head = git(canonical, ["rev-parse", "HEAD"]).trim();
+  const tree = git(canonical, ["rev-parse", "HEAD^{tree}"]).trim();
+  link = {
+    version: 1, intentId: "intent-metadata", predecessorJournalDigest: digest(oldRaw),
+    predecessorGeneration: 1, predecessorEpoch: OLD_EPOCH,
+    successor: {
+      runId: RUN, claimGeneration: 2, workerId: "fixture-worker", registerNonce: "fixture-register",
+      authorityIncarnation: NEW_EPOCH, executorIncarnation: null, sourceEpoch: NEW_EPOCH,
+      attemptId: ATTEMPT, clonePath: attemptClonePath(cache.runnerClonePath(bare, KEY), ATTEMPT),
+    },
+    restore: {
+      captureId: "fixture-capture", authenticatedRecordDigest: "b".repeat(64),
+      predecessorGeneration: 1, bareDir: path.basename(bare),
+      pinRef: `refs/uzi-recovery-pin/${RUN}/1`, tip: head, contentSource: head,
+      expectedHead: head, expectedTree: tree,
+    },
+  };
+  envelope = {
+    version: 2, runId: RUN, branch: BRANCH, key: KEY,
+    predecessors: [{ journalDigest: digest(oldRaw), rawJournal: oldRaw, generation: 1, sourceEpoch: OLD_EPOCH }],
+    intent: { version: 1, phase: "prepared", link },
+  };
+  // A real ref preserves Git objects; its existence is deliberately not restore verification.
+  git(bare, ["update-ref", link.restore.pinRef, head]);
+}
+function retain(): void {
+  config(RETAINED_KEY, JSON.stringify(envelope));
+}
+function newJournal(): RecoveryJournalEntry {
+  return { runId: RUN, clonePath: link.successor.clonePath, attemptId: ATTEMPT,
+    sourceGeneration: 2, pinRestore: link };
+}
+function activate(): void {
+  git(bare, ["config", "--local", "--add", LEDGER_KEY, JSON.stringify({
+    attemptId: ATTEMPT, runId: RUN, clonePath: link.successor.clonePath, state: "live",
+  })]);
+  config(ACTIVE_KEY, JSON.stringify(newJournal()));
+}
+function snapshot() {
+  return {
+    config: fs.readFileSync(path.join(bare, "config")),
+    refs: git(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]),
+    readme: fs.readFileSync(path.join(canonical, "README.md")),
+  };
+}
+async function ack(runId = RUN) {
+  return cache.withReportProofBudget(
+    { signal: new AbortController().signal, deadline: Date.now() + 30_000 },
+    () => cache.withBareLock(bare, () => cache.readAcknowledgedReportSourcesUnderLock(bare, runId)),
+  );
+}
+
+type Internals = {
+  execScoped(command: string, args: string[], options: { cwd?: string }, identity?: unknown):
+    Promise<{ stdout: string; stderr: string }>;
+  runGitAsRunner(cwd: string | undefined, args: string[], options?: unknown): Promise<string>;
+  pathPresent(p: string): Promise<boolean>;
+  compactAttemptLedger(bare: string, branch: string): Promise<void>;
+};
+
+/** Throw AND record: production's fail-closed catches must not hide a forbidden probe. */
+function guardSources(t: TestContext, roots = [canonical]) {
+  const blocked = roots.flatMap(p => [p, path.join(path.dirname(p), `.uzi-skills-${path.basename(p)}`)]);
+  const attempts: string[] = [];
+  const observations: string[] = [];
+  const protectedPath = (value: unknown): boolean => {
+    const p = value instanceof URL ? value.pathname : Buffer.isBuffer(value) ? value.toString() : value;
+    return typeof p === "string" && blocked.some(root => p === root || p.startsWith(root + path.sep));
+  };
+  const record = (kind: string, p: unknown): void => {
+    observations.push(kind);
+    if (protectedPath(p)) {
+      attempts.push(`${kind}:${String(p)}`);
+      throw new Error("forbidden predecessor probe");
+    }
+  };
+  // git.ts imports this same default promises object.
+  const lstat = promises.lstat;
+  t.mock.method(promises, "lstat", async (...args: Parameters<typeof promises.lstat>) => {
+    record("lstat", args[0]);
+    return Reflect.apply(lstat, promises, args);
+  });
+  const readFile = promises.readFile;
+  t.mock.method(promises, "readFile", async (...args: Parameters<typeof promises.readFile>) => {
+    record("readFile", args[0]);
+    return Reflect.apply(readFile, promises, args);
+  });
+  const open = promises.open;
+  t.mock.method(promises, "open", async (...args: Parameters<typeof promises.open>) => {
+    record("open", args[0]);
+    return Reflect.apply(open, promises, args);
+  });
+  const readdir = promises.readdir;
+  t.mock.method(promises, "readdir", async (...args: Parameters<typeof promises.readdir>) => {
+    record("readdir", args[0]);
+    return Reflect.apply(readdir, promises, args);
+  });
+  const internal = cache as unknown as Internals;
+  const exec = internal.execScoped.bind(cache);
+  t.mock.method(internal, "execScoped", async (command: string, args: string[], options: { cwd?: string }, identity?: unknown) => {
+    record("exec-cwd", options.cwd);
+    if (command === "git") {
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === "-C" || args[i] === "--git-dir" || args[i] === "--work-tree") record("git-dir", args[i + 1]);
+        for (const prefix of ["--git-dir=", "--work-tree="]) {
+          if (args[i]!.startsWith(prefix)) record("git-dir", args[i]!.slice(prefix.length));
+        }
+      }
+    }
+    return exec(command, args, options, identity);
+  });
+  const runner = internal.runGitAsRunner.bind(cache);
+  t.mock.method(internal, "runGitAsRunner", async (cwd: string | undefined, args: string[], options?: unknown) => {
+    record("runner-git", cwd);
+    return runner(cwd, args, options);
+  });
+  const present = internal.pathPresent.bind(cache);
+  t.mock.method(internal, "pathPresent", async (p: string) => {
+    record("pathPresent", p);
+    return present(p);
+  });
+  return {
+    attempts, observations,
+    isLivePath: (p: string) => { record("isLivePath", p); return false; },
+    beforeTree: (p: string) => { record("beforeTree", p); },
+    assertUntouched: () => assert.deepEqual(attempts, [], "predecessor paths must never be probed"),
+  };
+}
+
+beforeEach(async () => {
+  fx = makeFixture();
+  cache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  bare = await cache.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700);
+  fs.chmodSync(bare, 0o700);
+  canonical = (await cache.createOrAttachRunnerClone(bare, 2512, noProofReseed, RUN)).path;
+  await cache.markRecoveryCapture(bare, canonical, BRANCH, RUN);
+  // The generation writer belongs to the next implementation unit.
+  writeOld();
+  prepare();
+});
+afterEach(() => fx.cleanup());
+
+describe("retained pin metadata: exact predecessor bytes and phase relations", () => {
+  for (const fenced of [false, true]) {
+    it(`reads prepared-old with${fenced ? "" : "out"} a fence without touching either source`, async t => {
+      writeOld({}, fenced);
+      prepare();
+      retain();
+      const before = snapshot();
+      const guard = guardSources(t, [canonical, link.successor.clonePath]);
+      const records = await cache.readRetainedPinMetadata(bare);
+      guard.assertUntouched();
+      assert.equal(records.length, 1);
+      assert.equal(records[0]!.relation, "prepared-old");
+      assert.equal(records[0]!.activeRaw, oldRaw);
+      assert.equal(records[0]!.originals[0]!.raw, oldRaw);
+      assert.deepEqual(records[0]!.originals[0]!.journal, oldJournal);
+      assert.equal(records[0]!.originals[0]!.sourceEpoch, OLD_EPOCH);
+      assert.equal(records[0]!.originals[0]!.generation, 1);
+      assert.equal(records[0]!.envelope.predecessors[0]!.journalDigest, digest(oldRaw));
+      assert.equal(rawConfig(ACTIVE_KEY), oldRaw);
+      assert.deepEqual(snapshot(), before);
+      assert.ok(guard.observations.includes("lstat"), "the shared filesystem instrument must see bare checks");
+    });
+  }
+
+  for (const phase of ["prepared", "ready"] as const) {
+    it(`accepts ${phase}-new from a live ledger while the new path is absent and preserves the old source`, async t => {
+      envelope.intent.phase = phase;
+      activate();
+      retain();
+      assert.equal(fs.existsSync(link.successor.clonePath), false);
+      const before = snapshot();
+      const guard = guardSources(t, [canonical, link.successor.clonePath]);
+      const records = await cache.readRetainedPinMetadata(bare);
+      guard.assertUntouched();
+      assert.equal(records.length, 1);
+      assert.equal(records[0]!.relation, `${phase}-new`);
+      assert.equal(records[0]!.activeRaw, JSON.stringify(newJournal()));
+      assert.equal(records[0]!.originals[0]!.raw, oldRaw);
+      assert.deepEqual(records[0]!.originals[0]!.journal.completionSourceFence, FENCE);
+      assert.deepEqual(snapshot(), before);
+    });
+  }
+
+  it("reports an absent active slot as metadata absence, preserving all predecessor evidence", async t => {
+    retain();
+    git(bare, ["config", "--local", "--unset-all", ACTIVE_KEY]);
+    const before = snapshot();
+    const guard = guardSources(t);
+    const records = await cache.readRetainedPinMetadata(bare);
+    guard.assertUntouched();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.relation, "absent");
+    assert.equal(records[0]!.activeRaw, undefined);
+    assert.equal(records[0]!.originals[0]!.raw, oldRaw);
+    assert.deepEqual(snapshot(), before);
+  });
+});
+
+describe("retained pin metadata refuses ambiguous or inconsistent attribution before source access", () => {
+  const cases: Array<[string, () => void]> = [
+    ["ready envelope with old active slot", () => { envelope.intent.phase = "ready"; retain(); }],
+    ["wrong exact-raw digest", () => { envelope.predecessors[0]!.journalDigest = "c".repeat(64); retain(); }],
+    ["equivalent JSON with different raw whitespace", () => { config(ACTIVE_KEY, JSON.stringify(oldJournal)); }],
+    ["unknown envelope key", () => { config(RETAINED_KEY, JSON.stringify({ ...envelope, extra: true })); }],
+    ["unknown predecessor journal key", () => {
+      oldRaw = JSON.stringify({ ...oldJournal, extra: true }); prepare(); retain(); config(ACTIVE_KEY, oldRaw);
+    }],
+    ["duplicate JSON key", () => {
+      config(RETAINED_KEY, JSON.stringify(envelope).replace('"version":2', '"version":2,"version":2'));
+    }],
+    ["duplicate retained config values", () => {
+      git(bare, ["config", "--local", "--add", RETAINED_KEY, JSON.stringify(envelope)]);
+    }],
+    ["duplicate active config values", () => { git(bare, ["config", "--local", "--add", ACTIVE_KEY, oldRaw]); }],
+    ["wrong predecessor generation", () => { envelope.predecessors[0]!.generation = 2; retain(); }],
+    ["wrong successor claim generation", () => { link.successor.claimGeneration = 3; retain(); }],
+    ["wrong predecessor pin generation", () => { link.restore.pinRef = `refs/uzi-recovery-pin/${RUN}/2`; retain(); }],
+    ["wrong bare repository identity", () => { link.restore.bareDir = "other.git"; retain(); }],
+    ["ready successor without a live ledger", () => {
+      envelope.intent.phase = "ready"; config(ACTIVE_KEY, JSON.stringify(newJournal())); retain();
+    }],
+    ["ready successor whose ledger is abandoned", () => {
+      activate(); envelope.intent.phase = "ready";
+      git(bare, ["config", "--local", "--add", LEDGER_KEY, JSON.stringify({
+        attemptId: ATTEMPT, runId: RUN, clonePath: link.successor.clonePath, state: "abandoned",
+      })]); retain();
+    }],
+    ["active successor with wrong sourceGeneration", () => {
+      activate(); config(ACTIVE_KEY, JSON.stringify({ ...newJournal(), sourceGeneration: 3 }));
+    }],
+  ];
+  for (const [name, corrupt] of cases) {
+    it(name, async t => {
+      retain();
+      corrupt();
+      const before = snapshot();
+      const guard = guardSources(t, [canonical, link.successor.clonePath]);
+      await assert.rejects(cache.readRetainedPinMetadata(bare), /pin|journal|attribution|generation|identity/i);
+      guard.assertUntouched();
+      assert.deepEqual(snapshot(), before);
+    });
+  }
+
+  it("refuses an orphan linked active journal without an immutable envelope", async t => {
+    activate();
+    const before = snapshot();
+    const guard = guardSources(t, [canonical, link.successor.clonePath]);
+    await assert.rejects(cache.readRetainedPinMetadata(bare), /orphaned pin restore active journal/);
+    guard.assertUntouched();
+    assert.deepEqual(snapshot(), before);
+  });
+
+  it("the historical parser accepts the plain journal and rejects each new rollback fence independently", () => {
+    assert.doesNotThrow(() => baseParseRecoveryJournal(JSON.stringify({ runId: RUN, clonePath: canonical })));
+    assert.throws(() => baseParseRecoveryJournal(JSON.stringify({
+      runId: RUN, clonePath: canonical, sourceGeneration: 1,
+    })), /invalid retained recovery clone journal/);
+    assert.throws(() => baseParseRecoveryJournal(JSON.stringify({
+      runId: RUN, clonePath: canonical, pinRestore: link,
+    })), /invalid retained recovery clone journal/);
+  });
+});
+
+describe("full inventory, ACK, inspection and ledger compaction preserve V2 predecessors", () => {
+  for (const ready of [false, true]) {
+    for (const selectedRun of [RUN, "foreign-inventory-reader"]) {
+      it(`${ready ? "ready-new" : "prepared-old"} returns unknown to inventory and ACK for ${selectedRun}`, async t => {
+        if (ready) { activate(); envelope.intent.phase = "ready"; }
+        retain();
+        const before = snapshot();
+        const guard = guardSources(t);
+        const inventory = await cache.readInventoryCloneHeads(bare, selectedRun);
+        const report = await ack(selectedRun);
+        guard.assertUntouched();
+        assert.deepEqual(inventory, { kind: "unknown", cause: "attribution_unreadable" });
+        assert.deepEqual(report, { kind: "unknown", cause: "retained_pin_predecessor" });
+        assert.deepEqual(snapshot(), before);
+      });
+    }
+  }
+
+  it("inspect reports unknown predecessor presence and bytes, keeps supplied holds, and never calls old-source callbacks", async t => {
+    activate();
+    envelope.intent.phase = "ready";
+    retain();
+    const before = snapshot();
+    const guard = guardSources(t);
+    const result = await cache.inspectRetainedSources({
+      barePath: bare, selector: { runId: RUN, generation: 1, attempt: "canonical" },
+      holds: { state: "read", holds: [{ id: "hold-z", generation: 1 }, { id: "hold-a", generation: 9 }] },
+      isLivePath: guard.isLivePath, beforeTree: guard.beforeTree,
+    });
+    guard.assertUntouched();
+    assert.equal(result.unreadable, 0);
+    assert.equal(result.sources.length, 1);
+    const source = result.sources[0]!;
+    assert.equal(source.kind, "protected");
+    assert.equal(source.presence, "unknown");
+    assert.equal(source.allocatedBytes, null);
+    assert.equal(source.bytesState, "unknown");
+    assert.deepEqual(source.sources.map(p => ({ path: p.clonePath, presence: p.presence, bytes: p.allocatedBytes })),
+      [{ path: canonical, presence: "unknown", bytes: null }]);
+    assert.deepEqual(source.holds, { state: "read", ids: ["hold-a", "hold-z"] });
+    assert.deepEqual(source.disposition, { kind: "refused", consumers: ["retained_pin_predecessor"] });
+    assert.ok(source.consumers.includes("immutable_pin_restore_metadata"));
+    assert.deepEqual(snapshot(), before);
+  });
+
+  it("compaction keeps a missing protected attempt row without a pathPresent or skills probe", async t => {
+    const oldAttemptPath = attemptClonePath(cache.runnerClonePath(bare, KEY), OLD_ATTEMPT);
+    const entry = { attemptId: OLD_ATTEMPT, runId: RUN, clonePath: oldAttemptPath, state: "reclaimed" };
+    git(bare, ["config", "--local", "--add", LEDGER_KEY, JSON.stringify(entry)]);
+    writeOld({ retainedSources: [{ runId: RUN, clonePath: oldAttemptPath, attemptId: OLD_ATTEMPT }] });
+    prepare();
+    activate();
+    envelope.intent.phase = "ready";
+    retain();
+    assert.equal(fs.existsSync(oldAttemptPath), false);
+    const before = snapshot();
+    const guard = guardSources(t, [canonical, oldAttemptPath]);
+    const metadata = await cache.readRetainedPinMetadata(bare);
+    assert.equal(metadata.length, 1);
+    assert.equal(metadata[0]!.relation, "ready-new");
+    assert.ok(metadata[0]!.originals[0]!.journal.retainedSources?.some(s => s.clonePath === oldAttemptPath));
+    await cache.withBareLock(bare, () => (cache as unknown as Internals).compactAttemptLedger(bare, BRANCH));
+    guard.assertUntouched();
+    assert.equal(git(bare, ["config", "--local", "--get-all", LEDGER_KEY]),
+      JSON.stringify(entry) + "\n" + JSON.stringify({
+        attemptId: ATTEMPT, runId: RUN, clonePath: link.successor.clonePath, state: "live",
+      }) + "\n");
+    assert.deepEqual(snapshot(), before);
+  });
+
+  it("the source tripwire detects the exact old path and its paired skills directory", async t => {
+    const guard = guardSources(t);
+    await assert.rejects(promises.lstat(canonical), /forbidden predecessor probe/);
+    const skills = path.join(path.dirname(canonical), `.uzi-skills-${path.basename(canonical)}`);
+    await assert.rejects(promises.lstat(skills), /forbidden predecessor probe/);
+    assert.deepEqual(guard.attempts, [`lstat:${canonical}`, `lstat:${skills}`]);
+  });
+
+  it("a normal source without V2 still executes real source reads and returns verified heads", async t => {
+    config(ACTIVE_KEY, JSON.stringify({ runId: RUN, clonePath: canonical }));
+    const before = snapshot();
+    const lstatPaths: string[] = [];
+    const original = promises.lstat;
+    t.mock.method(promises, "lstat", (...args: Parameters<typeof promises.lstat>) => {
+      lstatPaths.push(String(args[0]));
+      return Reflect.apply(original, promises, args);
+    });
+    assert.deepEqual(await cache.readRetainedPinMetadata(bare), []);
+    const expectedHead = git(canonical, ["rev-parse", "HEAD"]).trim();
+    const inventory = await cache.readInventoryCloneHeads(bare, RUN);
+    const report = await ack();
+    assert.equal(inventory.kind, "verified");
+    if (inventory.kind === "verified") assert.ok(inventory.heads.includes(expectedHead));
+    assert.equal(report.kind, "verified");
+    if (report.kind === "verified") assert.ok(report.heads.includes(expectedHead));
+    assert.ok(lstatPaths.includes(canonical), "normal readers must still inspect real source presence");
+    assert.deepEqual(snapshot(), before);
+  });
+
+  it("a V1 protected descriptor retains its physical inspection behavior", async () => {
+    const journal = { runId: RUN, clonePath: canonical, retainedSources: [{ runId: RUN, clonePath: canonical }] };
+    config(ACTIVE_KEY, JSON.stringify(journal));
+    config(RETAINED_KEY, JSON.stringify({ version: 1, branch: BRANCH, key: KEY, journal }));
+    const before = snapshot();
+    assert.deepEqual(await cache.readRetainedPinMetadata(bare), []);
+    const live: string[] = [], trees: string[] = [];
+    const result = await cache.inspectRetainedSources({
+      barePath: bare, selector: { runId: RUN, generation: "none", attempt: "canonical" },
+      holds: { state: "read", holds: [] },
+      isLivePath: p => { live.push(p); return false; }, beforeTree: p => { trees.push(p); },
+    });
+    assert.equal(result.unreadable, 0);
+    assert.equal(result.sources.length, 1);
+    assert.equal(result.sources[0]!.presence, "present");
+    assert.equal(result.sources[0]!.bytesState, "measured");
+    assert.equal(typeof result.sources[0]!.allocatedBytes, "number");
+    assert.ok(live.includes(canonical));
+    assert.ok(trees.includes(canonical));
+    assert.deepEqual(snapshot(), before);
+  });
+});

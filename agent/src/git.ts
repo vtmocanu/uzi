@@ -43,6 +43,8 @@ import {
 } from "./attempt-path.js";
 import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
 import { parseSourceFence, serializeSourceFence, type CompletionSourceFence } from "./completion-source.js";
+import { parsePinRestoreJson, parsePinRestoreLink, parseRetainedPinSnapshot,
+  PinRestoreDecodeBudget, type PinRestoreLink, type RetainedPinEnvelope } from "./pin-restore-journal.js";
 import type { GitAuthorityHooks, AuthoritySettlement } from "./git-authority-hooks.js";
 import { ownerGrant, ownerJournalBeforeMatches, ownerJournalMatches, RecoveryChargeInterruptedError, ownerReservation, parseRecoveryOwner, sameOwnerReservation, type RecoveryOwnerRecord } from "./recovery-owner.js";
 export { RecoveryChargeInterruptedError } from "./recovery-owner.js";
@@ -1588,6 +1590,10 @@ export class RetainedRecoveryBlockedError extends Error {
 }
 
 export interface RecoveryJournalEntry extends RecoverySource {
+  /** Exact owning claim, persisted before executor admission. Never inferred for old journals. */
+  sourceGeneration?: number;
+  /** Saved-work provenance only; not a source-use lease. */
+  pinRestore?: PinRestoreLink;
   recovery?: RecoveryProgress;
   retainedSources?: RecoverySource[];
   /** issue #3239: `wip(park):` markers whose content this attempt's clone was seeded from by an
@@ -1828,7 +1834,10 @@ function memoryParkRelation(existing: MemoryParkRecord | undefined, incoming: Me
 }
 
 function parseRecoveryJournal(value: string): RecoveryJournalEntry {
-  const parsed: unknown = JSON.parse(value);
+  return recoveryJournalValue(parsePinRestoreJson(value, GIT_MAX_BUFFER), value);
+}
+
+function recoveryJournalValue(parsed: unknown, value: string): RecoveryJournalEntry {
   if (typeof parsed !== "object" || parsed === null || !("runId" in parsed) || !("clonePath" in parsed)
       || typeof parsed.runId !== "string" || typeof parsed.clonePath !== "string") {
     throw new Error("invalid retained recovery clone journal");
@@ -1838,7 +1847,7 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
     throw new Error("invalid retained recovery clone journal");
   }
   const o = parsed as Record<string, unknown>;
-  if (Object.keys(o).some(k => !["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources", "peeledMarkers", "memoryPark", "completionSourceFence"].includes(k))) {
+  if (Object.keys(o).some(k => !["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources", "peeledMarkers", "memoryPark", "completionSourceFence", "sourceGeneration", "pinRestore"].includes(k))) {
     throw new Error("invalid retained recovery clone journal");
   }
   // Legacy callers classify a mismatched attempt id as CapturePathMismatchError.
@@ -1884,7 +1893,21 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
     memoryPark = parseMemoryPark(o.memoryPark);
     if (memoryPark.binding.runId !== source.runId) throw new Error("memory park run identity mismatch");
   }
-  return { ...source, ...(recovery ? { recovery } : {}), ...(retainedSources ? { retainedSources } : {}),
+  let sourceGeneration: number | undefined;
+  if (Object.hasOwn(o, "sourceGeneration")) {
+    if (!Number.isSafeInteger(o.sourceGeneration) || (o.sourceGeneration as number) < 1)
+      throw new Error("invalid source claim generation");
+    sourceGeneration = o.sourceGeneration as number;
+    if (source.attemptId !== undefined && (attemptGeneration(source.attemptId) !== sourceGeneration ||
+        !source.clonePath.endsWith(`.attempt-${source.attemptId}`))) throw new Error("source generation identity mismatch");
+  }
+  const pinRestore = o.pinRestore === undefined ? undefined : parsePinRestoreLink(o.pinRestore);
+  if (pinRestore && (Buffer.byteLength(value) > 16384 || recovery || retainedSources !== undefined ||
+      sourceGeneration !== pinRestore.successor.claimGeneration || source.runId !== pinRestore.successor.runId ||
+      source.clonePath !== pinRestore.successor.clonePath || source.attemptId !== pinRestore.successor.attemptId))
+    throw new Error("pin restore source identity mismatch");
+  return { ...source, ...(sourceGeneration === undefined ? {} : { sourceGeneration }), ...(pinRestore ? { pinRestore } : {}),
+    ...(recovery ? { recovery } : {}), ...(retainedSources ? { retainedSources } : {}),
     ...(peeledMarkers?.length ? { peeledMarkers } : {}),
     ...(memoryPark ? { memoryPark } : {}),
     ...(completionSourceFence ? { completionSourceFence } : {}) };
@@ -2010,7 +2033,7 @@ export interface RetainedSourcePart {
   clonePath: string;
   attempt: string;
   generation: number | "none";
-  presence: "present" | "missing" | "unsafe";
+  presence: "present" | "missing" | "unsafe" | "unknown";
   ledgerState: AttemptLedgerState | "none";
   live: boolean;
   allocatedBytes: number | null;
@@ -2033,7 +2056,7 @@ export interface RetainedSourceEvidence {
    *  was cleared when the marker was written). `mismatch`: an active journal names the path with
    *  another digest, or a non-plain journal names it. */
   markerState: "none" | "bound" | "detached" | "mismatch" | "malformed";
-  presence: "present" | "missing" | "unsafe";
+  presence: "present" | "missing" | "unsafe" | "unknown";
   /** sha256 over the exact ledger value, or marker (+ the active journal only when bound), or journal+descriptor, plus lstat dev:ino. */
   descriptor: string;
   allocatedBytes: number | null;
@@ -2620,7 +2643,7 @@ interface GatheredPart {
   clonePath: string;
   attemptId: string | undefined;
   generation: number | null;
-  presence: "present" | "missing" | "unsafe";
+  presence: "present" | "missing" | "unsafe" | "unknown";
   devIno: string;
   ledgerState: AttemptLedgerState | "none";
 }
@@ -3925,6 +3948,7 @@ export class GitCache {
       // #1197, verified 2026-09-08: the clone is the only remaining copy when a
       // recovery capture failed. The journal is in WORKER-owned bare config, never
       // in the runner-owned clone. An unreadable journal fails closed before rm.
+      await this.refusePinRestoreLegacy(barePath, branch);
       const pending = await this.readRecoveryCapture(barePath, branch);
       // issue #1786: a retained stopped canonical clone refuses reuse before any journal case.
       await this.assertNoStoppedMarker(barePath, clonePath, pending);
@@ -4162,6 +4186,7 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       const canonical = this.runnerClonePath(barePath, key);
       const clonePath = attemptClonePath(canonical, attempt.attemptId);
+      await this.refusePinRestoreLegacy(barePath, branch);
       const pending = await this.readRecoveryCapture(barePath, branch);
       // issue #1786: a retained stopped canonical clone refuses reuse before any journal case.
       if (pending) await this.assertNoStoppedMarker(barePath, pending.clonePath, pending);
@@ -4190,7 +4215,7 @@ export class GitCache {
       await this.compactAttemptLedger(barePath, branch);
       // The seed-time recovery sweep over every NON-LIVE path of this key. It throws to block.
       const ledger = await this.readAttemptLedger(barePath, branch);
-      await attempt.beforeSeed(await this.nonLiveKeyPaths(canonical, ledger, attempt.isLive), canonical);
+      await attempt.beforeSeed(await this.nonLiveKeyPaths(barePath, canonical, ledger, attempt.isLive), canonical);
       await fs.mkdir(path.dirname(clonePath), { recursive: true });
       // `live` BEFORE the clone: every attempt dir on disk then has a ledger identity.
       //
@@ -4251,13 +4276,14 @@ export class GitCache {
    *  ledger records for it, so the set stays bounded by what is on disk however long the ledger's
    *  history. A gone path is not swept: nothing is left there to kill or tear down by path. */
   private async nonLiveKeyPaths(
-    canonical: string,
+    barePath: string, canonical: string,
     ledger: Map<string, AttemptLedgerEntry>,
     isLive: (p: string) => boolean,
   ): Promise<string[]> {
     const parent = path.dirname(canonical);
+    const protectedPaths = await this.retainedPinPaths(barePath);
     const out = new Set<string>();
-    if (await this.pathPresent(canonical)) out.add(canonical);
+    if (!protectedPaths.has(canonical) && await this.pathPresent(canonical)) out.add(canonical);
     let names: string[] = [];
     try {
       names = await fs.readdir(parent);
@@ -4266,10 +4292,11 @@ export class GitCache {
     }
     for (const name of names) {
       const p = path.join(parent, name);
-      if (this.clonePathShape(p, canonical)?.attemptId !== undefined) out.add(p);
+      if (!protectedPaths.has(p) && this.clonePathShape(p, canonical)?.attemptId !== undefined) out.add(p);
     }
     for (const e of ledger.values()) {
-      if (this.clonePathShape(e.clonePath, canonical) && (await this.pathPresent(e.clonePath))) out.add(e.clonePath);
+      if (!protectedPaths.has(e.clonePath) && this.clonePathShape(e.clonePath, canonical) &&
+          (await this.pathPresent(e.clonePath))) out.add(e.clonePath);
     }
     return [...out].filter((p) => !isLive(p)).sort();
   }
@@ -7357,6 +7384,8 @@ export class GitCache {
         const config = options.configRead ? await options.configRead() :
           await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
         // runGit charges every raw null-list entry before delivering this snapshot.
+        if ((await this.readRetainedPinMetadata(barePath, config.split("\0"))).length)
+          throw new Error("independent retained predecessor cannot prove a maintenance family");
         const canonical = this.runnerClonePath(barePath, key);
         for (const source of known) {
           if (this.clonePathShape(source.clonePath, canonical)?.attemptId !== source.attemptId)
@@ -7529,10 +7558,129 @@ export class GitCache {
     return sources.filter((s, i) => sources.findIndex(p => sameRecoverySource(p, s)) === i);
   }
 
-  /** Protected records are custody evidence only, never seed/adoption authority. */
-  private async protectedRecoveries(barePath: string, selectedRunId?: string): Promise<Array<{ branch: string; key: string; journal: RecoveryJournalEntry }>> {
+
+  /** Strict metadata-only V2 view. It grants neither source access nor execution. */
+  async readRetainedPinMetadata(barePath: string, config?: readonly string[]): Promise<Array<{
+    raw: string; envelope: RetainedPinEnvelope; activeRaw: string | undefined;
+    relation: "prepared-old" | "prepared-new" | "ready-new" | "absent";
+    originals: Array<{ raw: string; journal: RecoveryJournalEntry; generation: number; sourceEpoch: string }>;
+  }>> {
     await this.assertRecoveryBare(barePath);
-    const records: Array<{ branch: string; key: string; journal: RecoveryJournalEntry }> = [];
+    const entries = config ?? (await this.runGit(barePath,
+      ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
+    const values = new Map<string, string>();
+    const decoded = new Map<string, RecoveryJournalEntry>();
+    const budget = new PinRestoreDecodeBudget();
+    for (const item of entries) {
+      if (!item) continue;
+      const nl = item.indexOf("\n"), name = nl < 0 ? item : item.slice(0, nl);
+      if (!name.startsWith("uzi-retained.") && !name.startsWith("uzi-recovery.")) continue;
+      if (nl < 0 || values.has(name)) throw new Error("ambiguous retained pin attribution");
+      values.set(name, item.slice(nl + 1));
+    }
+    const records: Array<{
+      raw: string; envelope: RetainedPinEnvelope; activeRaw: string | undefined;
+      relation: "prepared-old" | "prepared-new" | "ready-new" | "absent";
+      originals: Array<{ raw: string; journal: RecoveryJournalEntry; generation: number; sourceEpoch: string }>;
+    }> = [];
+    let ledger: Array<[string, string]> | undefined;
+    for (const [name, raw] of values) {
+      if (!name.startsWith("uzi-retained.")) continue;
+      const value = parsePinRestoreJson(raw, GIT_MAX_BUFFER);
+      if (!value || typeof value !== "object" || Array.isArray(value) || !("version" in value))
+        throw new Error("invalid retained pin descriptor");
+      if (value.version === 1) continue; // The original decoder still owns V1 semantics.
+      const decodeJournal = (text: string, parsed: unknown): RecoveryJournalEntry => {
+        MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(text));
+        const journal = recoveryJournalValue(parsed, text);
+        const occurrences = 1 + (journal.retainedSources?.length ?? 0) +
+          (journal.recovery ? 1 + (journal.recovery.successor ? 1 : 0) : 0);
+        MaintenanceResources.consumeIfActive("sources", occurrences);
+        decoded.set(text, journal);
+        return journal;
+      };
+      // The outer decode above has not decoded nested raw journals.
+      const outer = value as Record<string, unknown>;
+      const activeRaw = typeof outer.branch === "string" ? values.get(recoveryCaptureKey(outer.branch)) || undefined : undefined;
+      const { envelope, relation } = parseRetainedPinSnapshot(raw, activeRaw, decodeJournal, budget);
+      if (name !== `uzi-retained.${envelope.runId}.journal` ||
+          envelope.intent.link.restore.bareDir !== path.basename(barePath))
+        throw new Error("retained pin repository identity mismatch");
+      await this.runGit(barePath, ["check-ref-format", "--branch", envelope.branch]);
+      const originals = envelope.predecessors.map(p => ({
+        raw: p.rawJournal, journal: decoded.get(p.rawJournal)!,
+        generation: p.generation, sourceEpoch: p.sourceEpoch,
+      }));
+      ledger ??= await this.readAllAttemptLedgerRaw(barePath);
+      const last = new Map<string, AttemptLedgerEntry & { branch: string }>();
+      for (const [branch, entryRaw] of ledger) {
+        const entry = parseAttemptLedgerEntry(entryRaw);
+        if (!entry) throw new Error("invalid retained pin ledger");
+        const prior = last.get(entry.attemptId);
+        if (prior && (prior.branch !== branch || !sameRecoverySource(prior, entry)))
+          throw new Error("conflicting retained pin ledger");
+        last.set(entry.attemptId, { ...entry, branch });
+      }
+      const canonical = this.runnerClonePath(barePath, envelope.key);
+      const check = (source: RecoverySource, requireLive: boolean) => {
+        const shape = this.clonePathShape(source.clonePath, canonical);
+        if (!shape || shape.attemptId !== source.attemptId || source.runId !== envelope.runId)
+          throw new Error("retained pin path attribution mismatch");
+        if (source.attemptId !== undefined) {
+          const entry = last.get(source.attemptId);
+          if (!entry || entry.branch !== envelope.branch || !sameRecoverySource(entry, source) ||
+              (requireLive && entry.state !== "live")) throw new Error("retained pin attempt attribution mismatch");
+        }
+      };
+      for (const original of originals) for (const source of this.recoverySources(original.journal)) check(source, false);
+      const successor = envelope.intent.link.successor;
+      // An absent active slot may be certified retired elsewhere; absence here is never proof.
+      if (relation === "prepared-new" || relation === "ready-new") check(successor, true);
+      else {
+        const shape = this.clonePathShape(successor.clonePath, canonical);
+        if (!shape || shape.attemptId !== successor.attemptId) throw new Error("retained pin successor path mismatch");
+      }
+      records.push({ raw, envelope, activeRaw, relation, originals });
+    }
+    // A linked active journal without its immutable predecessor envelope is incomplete.
+    for (const [name, raw] of values) {
+      if (!name.startsWith("uzi-recovery.") || raw === "") continue;
+      const journal = decoded.get(raw) ?? parseRecoveryJournal(raw);
+      if (journal.pinRestore && !decoded.has(raw)) budget.consume(Buffer.byteLength(raw));
+      if (journal.pinRestore && !records.some(r => recoveryCaptureKey(r.envelope.branch) === name &&
+          r.envelope.runId === journal.runId && r.activeRaw === raw))
+        throw new Error("orphaned pin restore active journal");
+    }
+    return records;
+  }
+
+  private async retainedPinPaths(barePath: string, config?: readonly string[]): Promise<Set<string>> {
+    const paths = new Set<string>();
+    for (const record of await this.readRetainedPinMetadata(barePath, config)) {
+      for (const original of record.originals) for (const source of this.recoverySources(original.journal)) {
+        paths.add(source.clonePath);
+        paths.add(path.join(path.dirname(source.clonePath), `.uzi-skills-${path.basename(source.clonePath)}`));
+      }
+    }
+    return paths;
+  }
+
+  private async refusePinRestoreLegacy(barePath: string, branch: string): Promise<void> {
+    if ((await this.readRetainedPinMetadata(barePath)).some(r => r.envelope.branch === branch))
+      throw new Error("pin restore retained source requires independent handoff");
+  }
+
+  /** Protected records are custody evidence only, never seed/adoption authority. */
+  private async protectedRecoveries(barePath: string, selectedRunId?: string): Promise<Array<{ branch: string; key: string; journal: RecoveryJournalEntry; pinEnvelope?: RetainedPinEnvelope }>> {
+    await this.assertRecoveryBare(barePath);
+    const records: Array<{ branch: string; key: string; journal: RecoveryJournalEntry; pinEnvelope?: RetainedPinEnvelope }> = [];
+    const pinRecords = await this.readRetainedPinMetadata(barePath);
+    for (const r of pinRecords) {
+      if (selectedRunId !== undefined && r.envelope.runId !== selectedRunId) continue;
+      for (const original of r.originals) records.push({
+        branch: r.envelope.branch, key: r.envelope.key, journal: original.journal, pinEnvelope: r.envelope,
+      });
+    }
     const seen = new Set<string>();
     const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
     for (const item of config.split("\0")) {
@@ -7542,7 +7690,8 @@ export class GitCache {
       const match = /^uzi-retained\.([^.]+)\.journal$/.exec(name);
       if (!match || seen.has(name) || nl < 0) throw new Error("invalid protected recovery descriptor");
       seen.add(name);
-      const record = JSON.parse(item.slice(nl + 1));
+      const record = parsePinRestoreJson(item.slice(nl + 1), GIT_MAX_BUFFER) as Record<string, unknown>;
+      if (record?.version === 2) continue;
       if (!record || typeof record !== "object" || Array.isArray(record) || record.version !== 1 ||
           Object.keys(record).sort().join(",") !== "branch,journal,key,version" ||
           typeof record.branch !== "string" || !record.branch || typeof record.key !== "string" ||
@@ -7633,6 +7782,7 @@ export class GitCache {
     detached?: RecoveryJournalEntry, allowLegacyRepair = true,
   ): Promise<RecoveryJournalEntry> {
     const { journal, repair } = await this.attributedRecovery(barePath, branch, key, expected, detached, allowLegacyRepair);
+    await this.refusePinRestoreLegacy(barePath, branch);
     let missing = false;
     // One pass over the recorded sources, no retries. Any unsafe sibling refuses discovery.
     for (const source of this.recoverySources(journal)) {
@@ -8001,6 +8151,7 @@ export class GitCache {
     await this.assertRecoveryBare(barePath);
     return this.withLock(barePath, async () => {
       await this.assertBareOriginIdentity(barePath, repoUrl);
+      await this.refusePinRestoreLegacy(barePath, branch);
       const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
       if (expected) {
         if (!stored) throw new MemoryReceiptSourceError("absent");
@@ -9410,6 +9561,7 @@ export class GitCache {
     await this.assertRecoveryBare(barePath);
     const list = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
     const runnerRoot = path.resolve(this.runnerRoot);
+    const pinPaths = await this.retainedPinPaths(barePath, list);
     const ledger = new Map<string, AttemptLedgerEntry & { branch: string }>();
     const ledgerRaw = new Map<string, string>();
     const ledgerPaths = new Map<string, Set<string>>();
@@ -9484,7 +9636,8 @@ export class GitCache {
       return out;
     };
     const part = async (clonePath: string, attemptId: string | undefined, generation: number | null): Promise<GatheredPart> => {
-      const { presence, devIno } = await this.clonePresence(clonePath);
+      const { presence, devIno } = pinPaths.has(clonePath)
+        ? { presence: "unknown" as const, devIno: "retained-pin-unknown" } : await this.clonePresence(clonePath);
       const e = attemptId === undefined ? undefined : ledger.get(attemptId);
       return { clonePath, attemptId, generation, presence, devIno, ledgerState: e && e.clonePath === clonePath ? e.state : "none" };
     };
@@ -9492,7 +9645,7 @@ export class GitCache {
     const owned = new Set<string>();
 
     // Protected descriptors and active episode journals.
-    const protectedJournals: Array<{ branch: string; key: string; journal: RecoveryJournalEntry; descriptor: string | undefined }> =
+    const protectedJournals: Array<{ branch: string; key: string; journal: RecoveryJournalEntry; descriptor: string | undefined; pinEnvelope?: RetainedPinEnvelope }> =
       descriptors.map((d) => ({ ...d, descriptor: descriptorRaw.get(d.journal.runId) }));
     for (const [branch, a] of active) {
       const j = a.journal;
@@ -9519,12 +9672,12 @@ export class GitCache {
         owned.add(s.clonePath);
         const gen = s.attemptId === undefined ? { generation: null, unreadable: false } : attemptGenerationEvidence(s.attemptId);
         if (gen.unreadable) problems.push("attribution_unknown");
-        parts.push(await part(s.clonePath, s.attemptId, gen.generation));
+        parts.push(await part(s.clonePath, s.attemptId, s === p.journal ? p.journal.sourceGeneration ?? gen.generation : gen.generation));
       }
       const journalState: GatheredRecord["journalState"] = p.descriptor !== undefined
         ? (sameActive ? "episode_and_descriptor" : "descriptor") : "episode";
       const descriptorSnapshot = p.descriptor === undefined ? undefined
-        : JSON.stringify({ version: 1, branch: p.branch, key: p.key, journal: p.journal });
+        : p.pinEnvelope ? p.descriptor : JSON.stringify({ version: 1, branch: p.branch, key: p.key, journal: p.journal });
       const activeRaw = activeHere?.raw;
       records.push({
         kind: "protected", runId: p.journal.runId, branch: p.branch, key: p.key, parts, journal: p.journal,
@@ -9725,6 +9878,16 @@ export class GitCache {
     holdsView: RetainedSourceEvidence["holds"]; disposition: RetainedDisposition | undefined;
     epochSettlement: RetainedSourceEvidence["epochSettlement"];
   }> {
+    if (rec.parts.some(p => p.presence === "unknown")) {
+      const holds = ctx.holds;
+      const holdsView: RetainedSourceEvidence["holds"] = holds?.state === "read"
+        ? { state: "read", ids: holds.holds.map(h => h.id).sort() }
+        : { state: holds === undefined ? "not_read" : "unknown", ids: [] };
+      return { blockers: ["retained_pin_predecessor"], consumers: ["immutable_pin_restore_metadata"],
+        localRecords: await this.listLocalRecords(rec.runId), live: new Map(), holdsView,
+        disposition: holds === undefined ? undefined : { kind: "refused", consumers: ["retained_pin_predecessor"] },
+        epochSettlement: undefined };
+    }
     const blockers = [...rec.problems];
     // The exact blockers the strict-plain basis may discount, remembered at push time (never by prefix).
     let ownLedgerLive: string | undefined;
@@ -10107,7 +10270,8 @@ export class GitCache {
         barePath: g.barePath, runId: rec.runId, branch: rec.branch, key: rec.key, kind: rec.kind,
         generation: head.generation ?? "none", attempt: head.attemptId ?? "canonical", ledgerState: head.ledgerState,
         journalState: rec.journalState, markerState: rec.markerState,
-        presence: rec.parts.some((p) => p.presence === "unsafe") ? "unsafe"
+        presence: rec.parts.some((p) => p.presence === "unknown") ? "unknown"
+          : rec.parts.some((p) => p.presence === "unsafe") ? "unsafe"
           : rec.parts.every((p) => p.presence === "missing") ? "missing" : "present",
         descriptor: rec.digest, allocatedBytes: unmeasured === 0 ? total : measured === 0 ? null : total,
         bytesState: unmeasured === 0 ? "measured" : measured === 0 ? "unknown" : "partial",
@@ -10376,6 +10540,8 @@ export class GitCache {
         const foreignOwners = new Set<string>();
         // Keep the initial config read in its operation-scoped error classifier.
         const config = await atFailure("git_or_filesystem_error", () => this.runGit(barePath, ["config", "--local", "--null", "--list"]));
+        if ((await this.readRetainedPinMetadata(barePath, config.split("\0"))).length)
+          return { kind: "unknown", cause: "attribution_unreadable" };
         for (const record of await this.protectedRecoveries(barePath)) {
           await inspect(record.journal);
           if (record.journal.runId !== runId) { foreignOwners.add(record.journal.runId); continue; }
@@ -10530,6 +10696,7 @@ export class GitCache {
       MaintenanceResources.consumeMetadataEntriesIfActive(parsed.stdout, "\0");
       const entries = parsed.stdout.split("\0").filter(Boolean);
       if (entries.length > 1024) throw new Error("ACK config value count");
+      if ((await this.readRetainedPinMetadata(barePath, entries)).length) return { kind: "unknown", cause: "retained_pin_predecessor" };
       const journals = new Map<string, RecoveryJournalEntry>();
       const protectedRecords: Array<{ branch: string; key: string; journal: RecoveryJournalEntry }> = [];
       const ledgers = new Map<string, AttemptLedgerEntry & { branch: string }>();
@@ -10706,7 +10873,7 @@ export class GitCache {
     let physicalFailure = false;
     try {
       for (const record of await this.protectedRecoveries(barePath)) {
-        if (await this.recoveryPhysicalFailure(record.journal)) physicalFailure = true;
+        if (!record.pinEnvelope && await this.recoveryPhysicalFailure(record.journal)) physicalFailure = true;
         for (const source of this.recoverySources(record.journal)) out.add(source.clonePath);
       }
       for (const item of (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0")) {
@@ -10777,6 +10944,7 @@ export class GitCache {
       const namedByJournal = (p: string): boolean => journaled.some((j) => isWithinPath(j, p) || isWithinPath(p, j));
       const kept: string[] = [];
       for (const e of last.values()) {
+        if (namedByJournal(e.clonePath)) { kept.push(attemptLedgerValue(e)); continue; }
         const gone = path.isAbsolute(e.clonePath) && !(await this.pathPresent(e.clonePath));
         const droppable = gone && !namedByJournal(e.clonePath) && !(await this.hasPhysicalTerminalProtection(e.runId)) &&
           (e.state !== "reclaimed" || !(await this.custodyHeld(e.runId)));
