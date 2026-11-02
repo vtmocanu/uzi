@@ -43,7 +43,9 @@ type podEpochRecord struct {
 	deleted    bool
 	deletedAt  uint64
 	tainted    bool
-	identity   *PodEpochIdentity
+	// eventTainted is sticky; identity lookup failure alone cannot set it.
+	eventTainted bool
+	identity     *PodEpochIdentity
 	// pending is the frozen positive proof awaiting successor container IDs.
 	pending     *PodEpochEvidence
 	pendingCost int
@@ -316,7 +318,7 @@ func (s *PodEpochSession) checkDelivery(uid string, a *podEpochDelivery) bool {
 		reason = "deleted"
 	case r.terminal != 0:
 		reason = "terminal"
-	case r.tainted && (!a.identityUnverified || a.attempts != 0):
+	case r.tainted && (!a.identityUnverified || r.eventTainted):
 		reason = "tainted"
 	case s.current[a.worker] != uid:
 		reason = "superseded"
@@ -479,10 +481,7 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 	if old != nil {
 		_ = json.Unmarshal(old.raw, &prev)
 		if prev.Labels[LabelWorkerID] != p.Labels[LabelWorkerID] || !podEpochSameMounts(&prev, p) || old.deleted {
-			r.tainted = true
-			if a := s.attempts[uid]; a != nil {
-				a.identityUnverified = false
-			}
+			r.tainted, r.eventTainted = true, true
 		}
 	}
 	// Keep the union even for workers which have not been registered yet.
@@ -550,17 +549,17 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 		a, _ := json.Marshal([][]PodEpochContainer{beforeCS, beforeInit})
 		b, _ := json.Marshal([][]PodEpochContainer{cs, init})
 		if string(a) != string(b) {
-			r.tainted = true
+			r.tainted, r.eventTainted = true, true
 		}
 	}
 	if event == watch.Deleted {
 		signal = false
 	}
 	if old == nil && !baseline && event != watch.Added {
-		r.tainted = true
+		r.tainted, r.eventTainted = true, true
 	}
 	if old != nil && old.terminal != 0 && !signal && event != watch.Deleted {
-		r.tainted = true
+		r.tainted, r.eventTainted = true, true
 	}
 	if signal && r.terminal == 0 {
 		r.terminal = seq
@@ -572,7 +571,7 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 		r.deleted = true
 		r.deletedAt = seq
 		if r.terminal == 0 {
-			r.tainted = true
+			r.tainted, r.eventTainted = true, true
 		}
 	}
 	if s.bytes+delta > PodEpochMaxMetadata {
