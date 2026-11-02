@@ -16,6 +16,99 @@ the other family reads the committed code and its findings go into the merge
 request, but it never blocks publication (see
 [Code cross-check](#code-cross-check)).
 
+## Browse retained cross-checks
+
+1. Open **Runs** and choose **Cross-checks** in **What to list**. **Active**
+   stays at `/runs`; **Past checks** stays at `/runs/history`. Parent and
+   checker links open their existing run pages.
+2. Choose **All stages**, **Plan** or **Code**. On **Past checks**, optionally
+   choose **Didn't finish**, **Raised issues**, **Passed** or **Replaced**.
+3. Expand **Show attempt details**, or select a round in the attempt ladder.
+   Use **Load older attempts** for earlier rounds and **Load more groups**
+   for the next parent page.
+
+History is owner-only, including for admins: it groups your retained Plan and
+Code attempts by parent work run. Disabling either cross-check setting does
+not hide retained history. The scope control appears when the server confirms
+that your account has retained evidence, independently of current settings or
+the selected page. While availability is loading, empty, unavailable or in
+error, the page shows Runs; an error offers **Retry availability**.
+
+Clicking a scope saves a browser preference under your user ID and updates
+`scope=runs` or `scope=cross-checks` in the URL. A valid URL scope overrides
+the saved preference for that visit without saving it. Preferences and pending
+responses are guarded by account identity; blocked browser storage can prevent
+saving the choice. See [Runs navigation](./run-activity.md#find-a-run-or-cross-check).
+
+### Active groups and attempt filters
+
+A group is Active if any retained attempt is pending without a recorded
+interruption, or has a valid linked checker child whose status is not
+completed, failed or cancelled. The child must match the owner, parent,
+cross-check kind and checker harness. This union includes earlier attempts,
+independently of the parent run's status. A completed parent can therefore
+have an Active check group. Past checks have no active retained attempt.
+
+Stage and outcome filters select attempts, not lifecycle. A group with no
+matching attempts is absent from that filtered page; hiding an active attempt
+does not make the group Past. Hidden-active context explains active evidence
+outside the loaded slice or filters.
+
+Read **Check**, **Verdict** and **Effect on run** separately. Execution
+describes pending/running, finished, failed-to-finish, could-not-start,
+replaced or interrupted evidence; a recorded review can survive missing child
+metadata without proving that execution finished. Missing or unrecognized
+values remain unknown or not recorded. An absent valid child has no checker
+link. A historical approval concerns an earlier plan candidate and does not
+certify a later candidate or human revision. Cause, next action and effect
+can be unrecorded; the history view grants no new approval or policy effect.
+
+### Page sizes and continuation
+
+The group count is **groups on this page**, not a global total. Each group
+shows loaded attempts, attempts excluded by filters, remaining matching
+attempts and **Loaded range:**. **Earlier rounds omitted: load older attempts**
+means the bounded slice has more matching history. CLI counts likewise
+distinguish shown, matching retained, filtered out and total retained attempts.
+
+The default group page has up to 25 parents (maximum 25, minimum 1), ordered
+by latest retained attempt creation time, then parent ID, descending. Each
+parent initially returns up to 10 attempts (range 2–20). Selection takes the
+newest bounded window, Code before descending Plan rounds; display then runs
+chronologically through Plan rounds followed by Code. Earlier attempts need
+explicit continuation; they are not automatically drained.
+
+Active checks poll every 10 seconds while visible. For groups still on the
+same query page, refresh retains loaded older windows, uses fresh evidence
+for overlapping rounds and preserves the explicitly advanced older cursor.
+Changing filters or pages resets that loaded query. Separate requests are not
+a snapshot: groups can move, attempts can change and continuations can report
+`refresh_needed` when lifecycle no longer matches. Refresh without cursors
+using the same filters in that case.
+
+The owner-scoped API is `GET /api/cross-checks`, with availability at
+`GET /api/cross-checks/availability`. It accepts `lifecycle` (active/past),
+`stage` (all/plan/code), `outcome` (any or the Past-only choices above),
+`limit`, `attempt_limit`, `cursor` and repeated `attempt_cursor`.
+Group cursors are limited to 512 encoded bytes; attempt cursors to 256 encoded
+bytes each, at most eight distinct parents per vector and 3072 aggregate
+encoded bytes. The full request target is limited to 4096 bytes. Group and
+attempt cursors cannot be combined; keep lifecycle, stage and outcome
+unchanged when continuing. Cursors are opaque keysets, reauthorized for the
+current owner on each request, not authority or a snapshot.
+
+The JSON envelope is `groups` plus optional `next_cursor`, bounded to 2 MiB.
+Each group carries parent identity/status, `latest_at`, `active`,
+`total_attempts`, `matching_attempts`, `active_attempts`, `active_hidden`,
+optional `active_context`, `attempts`, optional `older_cursor` and
+`omission`, and `refresh_needed`. Attempts carry stage/round, raw normalized
+`result`, `review`, `execution`, cause in `reason`, nullable `findings_count`,
+`created_at`, nullable `decided_at`/`interrupted_at`, `deadline_at`,
+nullable `child_id`/`child_status`, `child_context`, nullable `model`/`effort`,
+`historical`, `active`, `effect` and `next_action`. This bounded summary
+does not fetch full findings, candidate text or checker activity.
+See [CLI history](./cli.md#cross-check-history) for explicit continuations.
+
 ## 1. Enable Plan cross-check
 
 In **Settings → Run defaults → Cross-check**, enable **Plan cross-check**.
@@ -101,7 +194,8 @@ slots. Explicitly disabling the lane with `WORKER_CROSS_CHECK_SLOTS=0` does
 not enable that fallback; incomplete lane-aware negotiation cannot fall back
 either. See [worker setup](./worker-setup.md#cross-check-slots)
 for capacity and isolation limits. Checker children remain hidden from the
-Runs list; worker capacity shows runs and cross-checks separately.
+ordinary Runs scope; the Cross-checks scope groups retained attempts by parent.
+Worker capacity shows runs and cross-checks separately.
 
 A non-null Codex model or effort pin also requires
 `cross_check_pins_v1`; a custom resolved Codex model independently requires

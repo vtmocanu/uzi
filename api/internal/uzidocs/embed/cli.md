@@ -3254,6 +3254,55 @@ The whole object is `null` for a legacy/unrecorded decision or a foreign
 viewer, including an admin viewing another user's run. Generic mutation and
 worker responses also leave it `null`; reads do not trigger a usage lookup.
 
+### Cross-check history
+
+`uzi run cross-checks` reads one owner-only page of retained Plan and Code
+attempts grouped by parent work run, including after consent is disabled.
+Active/Past describes the union of retained attempt activity, independently
+of parent status. Stage and outcome filter attempts without changing group
+lifecycle. See [Cross-check history](./cross-check.md#browse-retained-cross-checks).
+
+| Flag | Values and default |
+|---|---|
+| `--lifecycle` | `active` (default), `past` |
+| `--stage` | `all` (default), `plan`, `code` |
+| `--outcome` | `any` (default); with `past`: `didnt_finish`, `raised_issues`, `passed`, `replaced` |
+| `--limit` | Groups per page, 1–25, default 25 |
+| `--attempt-limit` | Attempts per parent, 2–20, default 10 |
+| `--cursor` | Returned next-group cursor; excludes `--attempt-cursor` |
+| `--attempt-cursor` | Returned older-attempt cursor; repeat for up to eight distinct parents |
+| `--json` | Emit the bounded API envelope |
+
+```sh
+uzi run cross-checks
+uzi run cross-checks --lifecycle past --stage plan --outcome raised_issues
+uzi run cross-checks --lifecycle past --cursor '<next_cursor>'
+uzi run cross-checks --lifecycle past \
+  --attempt-cursor '<older_cursor_for_parent_a>' \
+  --attempt-cursor '<older_cursor_for_parent_b>' --json
+```
+
+Copy opaque cursors from the preceding response and keep lifecycle, stage and
+outcome unchanged. Group cursors allow 512 encoded bytes, attempt cursors 256
+each, with at most eight and 3072 aggregate encoded bytes; the request target
+allows 4096 bytes. These are explicit continuations, not a snapshot.
+For `refresh_needed`, reload without cursors using the same filters.
+
+Human output reports groups on this page, shown/matching/filtered/total
+retained attempts, hidden active context and **Earlier rounds omitted: load
+older attempts**. Attempts display in Plan-then-Code round order after the
+API selects its bounded newest window. Check execution, recorded verdict and
+effect on run are separate; unknown or missing checker evidence does not
+prove completion. A historical approval does not certify a later candidate.
+
+`--json` returns `{"groups":[...],"next_cursor":"..."}`, with
+`next_cursor` omitted when absent. Groups include counts, `attempts`,
+optional `older_cursor`/`omission` and `refresh_needed`; the
+[API summary](./cross-check.md#page-sizes-and-continuation) describes the fields.
+The command makes one request, never drains either cursor family automatically
+and never fetches full findings or checker detail. Use `uzi run get <id>`
+and `uzi run logs <checker-id>` for the existing detail surfaces.
+
 ### Plan cross-check evidence
 
 `uzi whoami` shows your `PLAN CROSS-CHECK` consent value. Change it in

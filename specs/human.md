@@ -309,7 +309,9 @@ Tracked as GitLab issue vtmocanu/uzi#23; PRD at `prds/done/23-web-ux-live-dashbo
 
 ## Feature — Runs page IA (live console + past-runs archive)
 
-Web-only; no API/schema/agent changes. [user 2026-08-14]
+Web-only; no API/schema/agent changes in the original #2170 scope. [user 2026-08-14] (AI-synced 2026-11-02, #3811)
+
+- Narrow #3811 extension: owner-only retained Plan/Code cross-check history is grouped by parent on the existing Active/Past routes, with a bounded API and `uzi run cross-checks` CLI view. Active is the union across retained attempts of uninterrupted pending evidence or a valid nonterminal checker child, independently of parent status; stage/outcome filters do not change lifecycle. Retained history remains discoverable after disablement. Scope clicks save a per-user browser preference; valid URL scope overrides it without saving, subject to retained-history availability. Page-local counts and explicit older continuation distinguish loaded, filtered and omitted attempts; Active polling preserves loaded older windows with fresh overlapping evidence. Execution, review and effect remain separate; missing child evidence stays unknown, and historical approval does not certify later candidates. This extension changes history discovery, not cross-check execution or policy. See [Cross-check history](../docs/cross-check.md#browse-retained-cross-checks). (AI-synced 2026-11-02, #3811)
 
 - Past runs live on a separate tab from active runs.
 - Past runs are searchable: by title, repo, issue number (#iid), worker, and status.
