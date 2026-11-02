@@ -167,10 +167,9 @@ parent-proof exemption for docs or PRDs: their changed text has not passed its
 own checks. Automation does not dispatch CI, create a repair commit or select
 an older tip.
 
-Nightly attempts are scheduled for 04:47 Europe/Bucharest using GitHub's native
-timezone support, after the local maintenance window, aiming to cut near 05:00
-when on time. They are
-off until the user decides to activate and the maintainer sets
+Nightly attempts are scheduled for 01:47 Europe/Bucharest using GitHub's native
+timezone support. The earlier slot leaves room for observed scheduler delays.
+They are off until the user decides to activate and the maintainer sets
 `RELEASE_NIGHTLY_ENABLED=true`. Unset it or set it to `false` to pause nightly
 attempts; manual dispatch still works. Enablement is rechecked at job boundaries,
 so a not-yet-pushed attempt may stop there, possibly red with `nightly-disabled`.
@@ -189,7 +188,7 @@ The provisional push cutoff is strictly before 13:00 on the original run's
 Bucharest calendar date. A queued run does not gain a fresh window tomorrow.
 Scheduled tip waiting uses the lesser of three hours and the remaining time
 until 12:50, reserving a provisional 600 seconds from the existing cutter timeout,
-not a measured cut duration. An on-time 04:47 attempt can wait until 07:47; a late
+not a measured cut duration. An on-time 01:47 attempt can wait until 04:47; a late
 10:47 attempt can wait until 12:50. Waiting holds a runner under the 20-job cap.
 The prepare ceiling stays 210 minutes (180 waiting, ten cutting, 20 overhead).
 Manual waits remain 7200 seconds and their cutter timeout remains 600 seconds;
