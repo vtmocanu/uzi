@@ -276,6 +276,17 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   cross-check's reason can appear on the parent run's plan-gate message;
   code cross-check findings go to the merge request's Code cross-check
   section (see [Cross-check](./cross-check.md)).
+- **Incomplete Code cross-check**: when a completed run's advisory Code
+  cross-check failed (and was not interrupted or superseded), the run's
+  completion message in the thread adds one line such as `Code cross-check
+  incomplete: model error. Publication continued.` The reason is one of a
+  fixed set of phrases (`reason unavailable` for anything else), never
+  checker output or findings. "Publication continued." appears only when the
+  run recorded a valid merge request link. The line rides the existing
+  completion message, so it adds no separate message, mention or nudge. If
+  the run has no Slack message yet when it completes (for example Slack was
+  linked mid-run), only the top-level message is posted and the line is not
+  shown.
 - **Run health nudges**: if a run you own gets flagged (stalled, looping,
   near timeout, waiting for a worker, or stuck too long awaiting approval —
   see [Run health](./run-health.md)), the root DM's `context` block picks up

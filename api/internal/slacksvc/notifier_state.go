@@ -152,6 +152,9 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 		tblocks, tfallback, tok := renderThreadBlocks(rc, base)
 		if pp != nil {
 			tblocks, tfallback, tok = publicationThreadBlocks(rc, *pp, base)
+		} else if tok && rc.Status == "completed" {
+			// Issue #3813: disclose a failed advisory Code cross-check on this same message.
+			tblocks, tfallback = withCodeCrossCheckAdvisory(tblocks, tfallback, n.codeCrossCheckAdvisory(ctx, rc))
 		}
 		if tok && !holdAnnounced {
 			if _, perr := n.poster.PostBlocks(ctx, existing.ChannelID, existing.RootTs, tfallback, tblocks); perr != nil {
@@ -1216,13 +1219,23 @@ func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
 // mrkdwn-escaped either way (a normal URL has no & < >, so this is a no-op for legit
 // links and only neutralizes a hostile one).
 func mrLink(rc store.GetSlackRunContextRow) string {
-	if rc.MrWebUrl.Valid && isHTTPSURL(rc.MrWebUrl.String) {
-		return EscapeMrkdwn(rc.MrWebUrl.String)
+	if u := persistedMRLink(rc); u != "" {
+		return u
 	}
 	if !rc.MrIid.Valid || rc.WebUrl == "" {
 		return ""
 	}
 	return fmt.Sprintf("%s/-/merge_requests/%d", EscapeMrkdwn(strings.TrimRight(rc.WebUrl, "/")), rc.MrIid.Int64)
+}
+
+// persistedMRLink is mrLink's first branch alone: the persisted, https-guarded
+// mr_web_url, or "". Issue #3813 uses it as the proof of publication, which the GitLab
+// reconstruction from mr_iid is not.
+func persistedMRLink(rc store.GetSlackRunContextRow) string {
+	if rc.MrWebUrl.Valid && isHTTPSURL(rc.MrWebUrl.String) {
+		return EscapeMrkdwn(rc.MrWebUrl.String)
+	}
+	return ""
 }
 
 // isHTTPSURL guards a worker-supplied URL before it becomes a rendered link — the
