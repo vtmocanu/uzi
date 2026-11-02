@@ -7,7 +7,7 @@ import promises from "node:fs/promises";
 import path from "node:path";
 import { attemptClonePath } from "../src/attempt-path.js";
 import { GitCache, type RecoveryJournalEntry } from "../src/git.js";
-import type { PinRestoreLink, RetainedPinEnvelope } from "../src/pin-restore-journal.js";
+import { PinRestoreDecodeBudget, type PinRestoreLink, type RetainedPinEnvelope } from "../src/pin-restore-journal.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
 import { parseRecoveryJournal as baseParseRecoveryJournal } from "./fixtures/base-parse-recovery-journal.js";
@@ -288,6 +288,29 @@ describe("retained pin metadata refuses ambiguous or inconsistent attribution be
         attemptId: ATTEMPT, runId: RUN, clonePath: link.successor.clonePath, state: "abandoned",
       })]); retain();
     }],
+    ["foreign attempt claiming the successor path", () => {
+      activate();
+      git(bare, ["config", "--local", "--add", "uzi-attempts.agent/foreign.entry", JSON.stringify({
+        attemptId: OLD_ATTEMPT, runId: "foreign-run", clonePath: link.successor.clonePath, state: "live",
+      })]);
+    }],
+    ["duplicate ledger JSON fields", () => {
+      activate();
+      git(bare, ["config", "--local", "--add", LEDGER_KEY,
+        `{"attemptId":"${ATTEMPT}","runId":"${RUN}","clonePath":"${link.successor.clonePath}","state":"live","state":"retired"}`]);
+    }],
+    ["unknown ledger JSON fields", () => {
+      activate();
+      git(bare, ["config", "--local", "--add", LEDGER_KEY, JSON.stringify({
+        attemptId: ATTEMPT, runId: RUN, clonePath: link.successor.clonePath, state: "live", futureSchema: true,
+      })]);
+    }],
+    ["unknown active schema identifier", () => {
+      config("uzi-recovery.agent/unrelated.clone", JSON.stringify({ runId: "unrelated", clonePath: canonical, futureSchema: 3 }));
+    }],
+    ["malformed orphan link", () => {
+      config("uzi-recovery.agent/unrelated.clone", JSON.stringify({ runId: "unrelated", clonePath: canonical, pinRestore: null }));
+    }],
     ["active successor with wrong sourceGeneration", () => {
       activate(); config(ACTIVE_KEY, JSON.stringify({ ...newJournal(), sourceGeneration: 3 }));
     }],
@@ -321,6 +344,88 @@ describe("retained pin metadata refuses ambiguous or inconsistent attribution be
     assert.throws(() => baseParseRecoveryJournal(JSON.stringify({
       runId: RUN, clonePath: canonical, pinRestore: link,
     })), /invalid retained recovery clone journal/);
+  });
+});
+
+describe("metadata regression boundaries", () => {
+  for (const count of [33, 65]) {
+    it(`inspection shares validated metadata and the 1MiB decode limit for ${count} envelopes`, async t => {
+      config(ACTIVE_KEY, JSON.stringify({ runId: RUN, clonePath: canonical }));
+      for (let i = 0; i < count; i++) {
+        const runId = "run-budget-" + i, branch = "agent/budget-" + i, key = "budget-" + i;
+        const clonePath = cache.runnerClonePath(bare, key);
+        const plain = JSON.stringify({ runId, clonePath, sourceGeneration: 1 });
+        const raw = plain + " ".repeat(16384 - Buffer.byteLength(plain));
+        const l = structuredClone(link);
+        l.predecessorJournalDigest = digest(raw);
+        l.successor.runId = runId;
+        l.successor.clonePath = attemptClonePath(clonePath, ATTEMPT);
+        l.restore.pinRef = "refs/uzi-recovery-pin/" + runId + "/1";
+        config("uzi-retained." + runId + ".journal", JSON.stringify({
+          ...envelope, runId, branch, key,
+          predecessors: [{ rawJournal: raw, journalDigest: digest(raw), generation: 1, sourceEpoch: OLD_EPOCH }],
+          intent: { version: 1, phase: "prepared", link: l },
+        }));
+        config("uzi-recovery." + branch + ".clone", raw);
+      }
+      let decoded = 0;
+      const parse = JSON.parse;
+      t.mock.method(JSON, "parse", (raw: string, ...args: unknown[]) => {
+        if (Buffer.byteLength(raw) === 16384) decoded += Buffer.byteLength(raw);
+        return Reflect.apply(parse, JSON, [raw, ...args]);
+      });
+      let total = 0;
+      const consume = PinRestoreDecodeBudget.prototype.consume;
+      t.mock.method(PinRestoreDecodeBudget.prototype, "consume", function(this: PinRestoreDecodeBudget, bytes: number) {
+        total += bytes;
+        return consume.call(this, bytes);
+      });
+      const result = await cache.inspectRetainedSources({ barePath: bare, isLivePath: () => false,
+        selector: { runId: "run-budget-0", generation: 1, attempt: "canonical" } });
+      assert.equal(result.unreadable, count === 33 ? 0 : 1);
+      assert.equal(total, count * 16384);
+      assert.equal(decoded, count === 33 ? 540672 : 1048576, "charge before every actual nested decode");
+    });
+  }
+
+  it("shares the actual decode cap across repeated reads in one recovery operation", async () => {
+    writeOld({}, false);
+    const plain = JSON.stringify(oldJournal);
+    oldRaw = plain + " ".repeat(16384 - Buffer.byteLength(plain));
+    config(ACTIVE_KEY, oldRaw);
+    prepare(); retain();
+    await cache.withRecoveryOperation(new AbortController().signal, Date.now() + 30000, async () => {
+      for (let i = 0; i < 64; i++) await cache.readRetainedPinMetadata(bare);
+      await assert.rejects(cache.readRetainedPinMetadata(bare), /invalid pin restore journal/);
+    });
+    // A later independent operation has its own budget.
+    assert.equal((await cache.readRetainedPinMetadata(bare)).length, 1);
+  });
+
+  for (const episode of ["retainedSources", "recovery"] as const) {
+    it("prepared-old compaction avoids predecessor probes with " + episode, async t => {
+      const source = { runId: RUN, clonePath: canonical };
+      writeOld(episode === "retainedSources" ? { retainedSources: [source] }
+        : { recovery: { version: 1, stage: "capturing", source, attempts: 1,
+          startedAt: 1_000_000, deadline: 1_300_000, backoffMs: 1000 } });
+      prepare();
+      retain();
+      const before = snapshot();
+      const guard = guardSources(t);
+      assert.equal((await cache.readRetainedPinMetadata(bare))[0]!.relation, "prepared-old");
+      await cache.withBareLock(bare, () => (cache as unknown as Internals).compactAttemptLedger(bare, BRANCH));
+      guard.assertUntouched();
+      assert.deepEqual(snapshot(), before);
+    });
+  }
+
+  it("inspection isolates malformed unrelated V1 active journals per record", async () => {
+    config(ACTIVE_KEY, JSON.stringify({ runId: RUN, clonePath: canonical }));
+    config("uzi-recovery.agent/unrelated.clone", "{malformed-legacy-journal");
+    assert.deepEqual(await cache.readRetainedPinMetadata(bare), []);
+    const result = await cache.inspectRetainedSources({ barePath: bare,
+      selector: { runId: RUN, generation: "none", attempt: "canonical" }, isLivePath: () => false });
+    assert.equal(result.unreadable, 0);
   });
 });
 

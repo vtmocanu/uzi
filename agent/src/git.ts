@@ -2739,6 +2739,13 @@ export class GitCache {
     context: CredentialFreeCaptureContext; argv: readonly string[]; env: NodeJS.ProcessEnv;
     cwd: string; deadline: number; live: () => boolean; checkBudget: () => void;
   }>();
+  private readonly pinRestoreBudgets = new AsyncLocalStorage<PinRestoreDecodeBudget>();
+
+  /** Repeated reads and multiple bares share the enclosing operation's actual-decode cap. */
+  private withPinRestoreBudget<T>(action: () => Promise<T>): Promise<T> {
+    return this.pinRestoreBudgets.getStore() ? action() : this.pinRestoreBudgets.run(new PinRestoreDecodeBudget(), action);
+  }
+
   private readonly reportProofs = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; owedBytes: number; configBytes: number }>();
 
   /** Optional observational budget, isolated from concurrent capture/cleanup operations. */
@@ -2750,7 +2757,7 @@ export class GitCache {
     const timer = setTimeout(() => timeout.abort(new Error("report proof deadline")), Math.max(0, deadline - Date.now()));
     try {
       if (Date.now() >= deadline) timeout.abort(new Error("report proof deadline"));
-      return await this.reportProofs.run({ signal, deadline, owedBytes: parent?.owedBytes ?? 0, configBytes: parent?.configBytes ?? 0 }, action);
+      return await this.reportProofs.run({ signal, deadline, owedBytes: parent?.owedBytes ?? 0, configBytes: parent?.configBytes ?? 0 }, () => this.withPinRestoreBudget(action));
     } finally { clearTimeout(timer); }
   }
 
@@ -2954,7 +2961,7 @@ export class GitCache {
         closureBudget: parent?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes },
         closureCache: parent?.closureCache ?? { identities: new Map(), entries: 0 },
       }, async () => {
-        const result = await action(combined);
+        const result = await this.withPinRestoreBudget(() => action(combined));
         this.checkRecoveryInterruption();
         return result;
       });
@@ -7561,7 +7568,7 @@ export class GitCache {
 
   /** Strict metadata-only V2 view. It grants neither source access nor execution. */
   async readRetainedPinMetadata(barePath: string, config?: readonly string[]): Promise<Array<{
-    raw: string; envelope: RetainedPinEnvelope; activeRaw: string | undefined;
+    raw: string; envelope: RetainedPinEnvelope; activeRaw: string | undefined; activeJournal: RecoveryJournalEntry | undefined;
     relation: "prepared-old" | "prepared-new" | "ready-new" | "absent";
     originals: Array<{ raw: string; journal: RecoveryJournalEntry; generation: number; sourceEpoch: string }>;
   }>> {
@@ -7570,7 +7577,7 @@ export class GitCache {
       ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
     const values = new Map<string, string>();
     const decoded = new Map<string, RecoveryJournalEntry>();
-    const budget = new PinRestoreDecodeBudget();
+    const budget = this.pinRestoreBudgets.getStore() ?? new PinRestoreDecodeBudget();
     for (const item of entries) {
       if (!item) continue;
       const nl = item.indexOf("\n"), name = nl < 0 ? item : item.slice(0, nl);
@@ -7579,7 +7586,7 @@ export class GitCache {
       values.set(name, item.slice(nl + 1));
     }
     const records: Array<{
-      raw: string; envelope: RetainedPinEnvelope; activeRaw: string | undefined;
+      raw: string; envelope: RetainedPinEnvelope; activeRaw: string | undefined; activeJournal: RecoveryJournalEntry | undefined;
       relation: "prepared-old" | "prepared-new" | "ready-new" | "absent";
       originals: Array<{ raw: string; journal: RecoveryJournalEntry; generation: number; sourceEpoch: string }>;
     }> = [];
@@ -7613,13 +7620,22 @@ export class GitCache {
       }));
       ledger ??= await this.readAllAttemptLedgerRaw(barePath);
       const last = new Map<string, AttemptLedgerEntry & { branch: string }>();
+      const byPath = new Map<string, AttemptLedgerEntry & { branch: string }>();
       for (const [branch, entryRaw] of ledger) {
+        const strict = parsePinRestoreJson(entryRaw, GIT_MAX_BUFFER);
+        if (!strict || typeof strict !== "object" || Array.isArray(strict) ||
+            Object.keys(strict).sort().join(",") !== "attemptId,clonePath,runId,state")
+          throw new Error("invalid retained pin ledger fields");
         const entry = parseAttemptLedgerEntry(entryRaw);
         if (!entry) throw new Error("invalid retained pin ledger");
         const prior = last.get(entry.attemptId);
         if (prior && (prior.branch !== branch || !sameRecoverySource(prior, entry)))
           throw new Error("conflicting retained pin ledger");
+        const pathPrior = byPath.get(entry.clonePath);
+        if (pathPrior && (pathPrior.branch !== branch || !sameRecoverySource(pathPrior, entry)))
+          throw new Error("conflicting retained pin ledger path");
         last.set(entry.attemptId, { ...entry, branch });
+        byPath.set(entry.clonePath, { ...entry, branch });
       }
       const canonical = this.runnerClonePath(barePath, envelope.key);
       const check = (source: RecoverySource, requireLive: boolean) => {
@@ -7640,13 +7656,26 @@ export class GitCache {
         const shape = this.clonePathShape(successor.clonePath, canonical);
         if (!shape || shape.attemptId !== successor.attemptId) throw new Error("retained pin successor path mismatch");
       }
-      records.push({ raw, envelope, activeRaw, relation, originals });
+      records.push({ raw, envelope, activeRaw, activeJournal: activeRaw === undefined ? undefined : decoded.get(activeRaw), relation, originals });
     }
     // A linked active journal without its immutable predecessor envelope is incomplete.
     for (const [name, raw] of values) {
       if (!name.startsWith("uzi-recovery.") || raw === "") continue;
-      const journal = decoded.get(raw) ?? parseRecoveryJournal(raw);
-      if (journal.pinRestore && !decoded.has(raw)) budget.consume(Buffer.byteLength(raw));
+      if (decoded.has(raw)) continue;
+      // Legacy malformed records belong to each caller's per-record error handling.
+      // New fields and unknown schema identifiers still require strict validation.
+      let value: unknown;
+      try { value = JSON.parse(raw); }
+      catch {
+        if (/"(?:pinRestore|sourceGeneration)"\s*:/.test(raw)) throw new Error("invalid pin restore active journal");
+        continue;
+      }
+      if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+      const legacy = ["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources",
+        "peeledMarkers", "memoryPark", "completionSourceFence"];
+      if (Object.keys(value).every(key => legacy.includes(key))) continue;
+      budget.consume(Buffer.byteLength(raw));
+      const journal = parseRecoveryJournal(raw);
       if (journal.pinRestore && !records.some(r => recoveryCaptureKey(r.envelope.branch) === name &&
           r.envelope.runId === journal.runId && r.activeRaw === raw))
         throw new Error("orphaned pin restore active journal");
@@ -7654,9 +7683,10 @@ export class GitCache {
     return records;
   }
 
-  private async retainedPinPaths(barePath: string, config?: readonly string[]): Promise<Set<string>> {
+  private async retainedPinPaths(barePath: string, config?: readonly string[],
+    pinRecords?: Awaited<ReturnType<GitCache["readRetainedPinMetadata"]>>): Promise<Set<string>> {
     const paths = new Set<string>();
-    for (const record of await this.readRetainedPinMetadata(barePath, config)) {
+    for (const record of pinRecords ?? await this.readRetainedPinMetadata(barePath, config)) {
       for (const original of record.originals) for (const source of this.recoverySources(original.journal)) {
         paths.add(source.clonePath);
         paths.add(path.join(path.dirname(source.clonePath), `.uzi-skills-${path.basename(source.clonePath)}`));
@@ -7671,10 +7701,11 @@ export class GitCache {
   }
 
   /** Protected records are custody evidence only, never seed/adoption authority. */
-  private async protectedRecoveries(barePath: string, selectedRunId?: string): Promise<Array<{ branch: string; key: string; journal: RecoveryJournalEntry; pinEnvelope?: RetainedPinEnvelope }>> {
+  private async protectedRecoveries(barePath: string, selectedRunId?: string,
+    validatedPins?: Awaited<ReturnType<GitCache["readRetainedPinMetadata"]>>): Promise<Array<{ branch: string; key: string; journal: RecoveryJournalEntry; pinEnvelope?: RetainedPinEnvelope }>> {
     await this.assertRecoveryBare(barePath);
     const records: Array<{ branch: string; key: string; journal: RecoveryJournalEntry; pinEnvelope?: RetainedPinEnvelope }> = [];
-    const pinRecords = await this.readRetainedPinMetadata(barePath);
+    const pinRecords = validatedPins ?? await this.readRetainedPinMetadata(barePath);
     for (const r of pinRecords) {
       if (selectedRunId !== undefined && r.envelope.runId !== selectedRunId) continue;
       for (const original of r.originals) records.push({
@@ -9561,7 +9592,11 @@ export class GitCache {
     await this.assertRecoveryBare(barePath);
     const list = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
     const runnerRoot = path.resolve(this.runnerRoot);
-    const pinPaths = await this.retainedPinPaths(barePath, list);
+    const pinRecords = await this.readRetainedPinMetadata(barePath, list);
+    const pinPaths = await this.retainedPinPaths(barePath, list, pinRecords);
+    const pinJournals = new Map(pinRecords.flatMap(record =>
+      record.activeRaw !== undefined && record.activeJournal
+        ? [[record.activeRaw, record.activeJournal] as const] : []));
     const ledger = new Map<string, AttemptLedgerEntry & { branch: string }>();
     const ledgerRaw = new Map<string, string>();
     const ledgerPaths = new Map<string, Set<string>>();
@@ -9594,7 +9629,7 @@ export class GitCache {
         }
         let journal: RecoveryJournalEntry | undefined;
         try {
-          journal = parseRecoveryJournal(v);
+          journal = pinJournals.get(v) ?? parseRecoveryJournal(v);
         } catch {
           this.checkRecoveryInterruption();
           if (this.epochRetained.getStore()) throw new Error("unreadable epoch journal");
@@ -9608,7 +9643,7 @@ export class GitCache {
     }
     let descriptors: Array<{ branch: string; key: string; journal: RecoveryJournalEntry }> = [];
     try {
-      descriptors = await this.protectedRecoveries(barePath);
+      descriptors = await this.protectedRecoveries(barePath, undefined, pinRecords);
     } catch (error) {
       this.checkRecoveryInterruption();
       if (this.epochRetained.getStore()) throw this.transferRetainedCause(error, new Error("unreadable epoch protected descriptors"));
@@ -9659,7 +9694,7 @@ export class GitCache {
       const sameActive = activeHere?.journal !== undefined && JSON.stringify(activeHere.journal) === JSON.stringify(p.journal);
       const problems = runProblems(p.journal.runId);
       if (!/^[A-Za-z0-9_-]+$/.test(p.key)) problems.push("attribution_unknown");
-      else {
+      else if (!p.pinEnvelope) {
         try {
           await this.attributedRecovery(barePath, p.branch, p.key, p.journal, p.descriptor === undefined ? undefined : p.journal);
         } catch {
@@ -10872,7 +10907,13 @@ export class GitCache {
     const out = new Set<string>();
     let physicalFailure = false;
     try {
-      for (const record of await this.protectedRecoveries(barePath)) {
+      const pinRecords = await this.readRetainedPinMetadata(barePath);
+      const pinJournals = new Map(pinRecords.flatMap(record =>
+        record.activeRaw !== undefined && record.activeJournal
+          ? [[record.activeRaw, record.activeJournal] as const] : []));
+      const protectedV2 = new Set<string>();
+      for (const record of await this.protectedRecoveries(barePath, undefined, pinRecords)) {
+        if (record.pinEnvelope) for (const source of this.recoverySources(record.journal)) protectedV2.add(source.clonePath);
         if (!record.pinEnvelope && await this.recoveryPhysicalFailure(record.journal)) physicalFailure = true;
         for (const source of this.recoverySources(record.journal)) out.add(source.clonePath);
       }
@@ -10883,7 +10924,11 @@ export class GitCache {
         if (!/^uzi-recovery\..+\.clone$/.test(k)) continue;
         const v = item.slice(nl + 1);
         if (v) {
-          const journal = parseRecoveryJournal(v);
+          const journal = pinJournals.get(v) ?? parseRecoveryJournal(v);
+          if (this.recoverySources(journal).some(source => protectedV2.has(source.clonePath))) {
+            for (const source of this.recoverySources(journal)) out.add(source.clonePath);
+            continue;
+          }
           if (journal.recovery || journal.retainedSources?.length) {
             const primary = parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot));
             const branch = k.slice("uzi-recovery.".length, -".clone".length);
@@ -20497,7 +20542,7 @@ try {
       let outcome: { ok: true; value: T } | { ok: false; error: unknown };
       try {
         this.checkRecoveryInterruption();
-        const value = await fn();
+        const value = await this.withPinRestoreBudget(fn);
         this.checkRecoveryInterruption();
         outcome = { ok: true, value };
       } catch (error) {
