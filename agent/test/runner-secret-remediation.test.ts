@@ -336,14 +336,16 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
   });
 
   it("iteration resume preflight with an untrusted scan remains advisory", { skip }, async () => {
+    let scans = 0;
     await drive({
       iid: 1932_903, forge: "github",
       configure: g => {
-        g.secretScanCheckpointRange = async () => ({ trusted: false, findings: [] });
+        g.secretScanCheckpointRange = async () => { scans++; return { trusted: false, findings: [] }; };
       },
       body: async ctx => {
         commitIn(ctx.worktreePath, "work.txt", "unpublished work\n");
         assert.deepEqual(await ctx.secretRemediationGate!({ unpublishedOnly: true }), { action: "proceed" });
+        assert.ok(scans > 0, "the preflight exercised the untrusted scanner");
       },
     });
   });
