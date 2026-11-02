@@ -384,6 +384,101 @@ kexec_probe(){
   return "$rc"
 }
 
+# V2 only: bound actual config input bytes before Git, and actual Git output.
+# No stat preflight: a growing file still cannot exceed limit+1 bytes read.
+# shellcheck disable=SC2016
+V2_CONFIG_READER='
+const fs = require("node:fs");
+const {spawn} = require("node:child_process");
+const limit = Number(process.argv[2]);
+let fd;
+let chunks = [], total = 0;
+try {
+  fd = fs.openSync(process.argv[1] + "/config", fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  if (!fs.fstatSync(fd).isFile()) throw new Error("config is not a regular file");
+  while (total <= limit) {
+    const chunk = Buffer.alloc(Math.min(65536, limit + 1 - total));
+    const n = fs.readSync(fd, chunk, 0, chunk.length, null);
+    if (!n) break;
+    chunks.push(chunk.subarray(0, n));
+    total += n;
+  }
+} catch { process.exitCode = 1; }
+finally { if (fd !== undefined) fs.closeSync(fd); }
+if (process.exitCode || total > limit) process.exit(1);
+const input = Buffer.concat(chunks, total);
+chunks = []; total = 0;
+const child = spawn("git", ["config", "--file", "-", "--no-includes", "--null", "--list"],
+                    {stdio: ["pipe", "pipe", "ignore"]});
+let failed = false;
+function refuse() { failed = true; child.kill("SIGKILL"); }
+process.on("SIGTERM", refuse);
+process.on("SIGINT", refuse);
+child.on("error", () => { failed = true; });
+child.stdin.on("error", refuse);
+child.stdout.on("data", chunk => {
+  total += chunk.length;
+  if (total > limit) { refuse(); return; }
+  if (!failed) chunks.push(chunk);
+});
+child.on("close", code => {
+  if (failed || code !== 0) { process.exitCode = 1; return; }
+  const output = Buffer.concat([...chunks, Buffer.from("\0__UZI_CONFIG_RC=0")]);
+  if (output.length > limit) { process.exitCode = 1; return; }
+  process.stdout.write(output.toString("base64"));
+});
+child.stdin.end(input);
+'
+
+# V2 only. Cap actual encoded bytes before shell substitution, including NUL.
+# Optional limits are private small-cap test seams; production uses fixed defaults.
+# Overflow/cancellation kills and joins this helper's kubectl child.
+v2_config_snapshot(){
+  local ns="$1" pod="$2" bare="$3" limit="${4:-96468992}" raw_limit="${5:-67108864}"
+  python3 -c '
+import re, signal, subprocess, sys, tempfile
+dest, limit = sys.argv[1], int(sys.argv[2])
+child = None
+def cancel(*_):
+    raise InterruptedError()
+signal.signal(signal.SIGTERM, cancel)
+signal.signal(signal.SIGINT, cancel)
+try:
+    with tempfile.TemporaryFile(dir=dest) as capture:
+        child = subprocess.Popen(sys.argv[3:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        total = 0
+        while total <= limit:
+            chunk = child.stdout.read(min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            capture.write(chunk)
+            total += len(chunk)
+        if total > limit:
+            raise ValueError("oversize")
+        if child.wait() != 0:
+            raise ValueError("exec failed")
+        capture.seek(0)
+        payload = capture.read(limit + 1)
+        suffix = b"\n__uzi_probe_rc=0\n"
+        if not payload.endswith(suffix):
+            raise ValueError("missing status")
+        payload = payload[:-len(suffix)]
+        if not re.fullmatch(rb"[A-Za-z0-9+/=\r\n]*", payload):
+            raise ValueError("invalid encoding")
+        sys.stdout.buffer.write(payload)
+except (OSError, ValueError, InterruptedError):
+    sys.exit(1)
+finally:
+    if child is not None:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+        child.stdout.close()
+' "$DEST" "$limit" "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+    sh -c '"$@"; printf "\n__uzi_probe_rc=%s\n" "$?"' _ \
+    node -e "$V2_CONFIG_READER" "$bare" "$raw_limit"
+}
+
 # probe_absent <rc> <ns>/<pod>: succeed for a found result (0); fail for a genuine "not found" (1,
 # as `git show-ref --verify` and `git config --get` report it); any other code is a
 # probe that ran and errored (e.g. 128 for an unreadable repo), so mark it inconclusive.
@@ -570,9 +665,7 @@ select_clone(){
     if printf '%s' "$protected" | "$JQ" -es 'any(.[]; type == "object" and .version == 2)' >/dev/null 2>&1; then
       # Encode NUL config records across shell substitutions, including git's
       # final status so a successful encoder cannot hide a failed config read.
-      # shellcheck disable=SC2016
-      config_snapshot="$(kexec_probe "$ns" "$pod" sh -c \
-        '{ git --git-dir="$1" config --local --no-includes --null --list; rc=$?; printf "\000__UZI_CONFIG_RC=%s" "$rc"; } | base64' _ "$bare")" || {
+      config_snapshot="$(v2_config_snapshot "$ns" "$pod" "$bare")" || {
         probe_inconclusive "reading V2 config snapshot on pod $ns/$pod failed"; return 1;
       }
       protected_ok="$(printf '%s' "$config_snapshot" |

@@ -7501,6 +7501,8 @@ export class GitCache {
       const decodeJournal = (text: string, parsed: unknown): RecoveryJournalEntry => {
         MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(text));
         const journal = recoveryJournalValue(parsed, text);
+        if (journal.pinRestore && journal.pinRestore.restore.bareDir !== path.basename(barePath))
+          throw new Error("historical pin restore repository identity mismatch");
         const occurrences = 1 + (journal.retainedSources?.length ?? 0) +
           (journal.recovery ? 1 + (journal.recovery.successor ? 1 : 0) : 0);
         MaintenanceResources.consumeIfActive("sources", occurrences);
