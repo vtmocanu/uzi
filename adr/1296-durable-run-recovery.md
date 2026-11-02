@@ -822,6 +822,20 @@ FINAL, release or ACK. Ordinary divergent work, equal trees and convincing
 commit subjects supply no authority. The 2026-10-29 marker-free reuse rule and
 the 2026-11-01 C2 release amendment remain separate contracts.
 
+The refusal also applies beyond enrolled remediation: missing or unverified
+`restoreSource`, or divergent marker-free coverage without verified
+source-selection evidence, refuses before successor clone creation, retaining
+work, pins and custody. Source-bound ordinary ancestor-only adoption is
+unchanged. Source-less legacy coverage could previously seed C and then require
+a base hold; the current refusal occurs before successor creation when source
+binding is absent. Equal trees or leaf dominance cannot supply authenticated S,
+and no legacy exception grants new authority. The existing feature-gated,
+persisted-blocker, current-ownership and quiescence requirements for an
+owner-held `retained_recovery_adoption_failed` park and fresh owned retry grant
+still apply; unsupported or unproven cases keep the existing fallback and
+custody. Historical journal lineage remains unknown without the journal, and
+old captures remain held.
+
 ### Worker grant, import and source proof
 
 The worker records trusted findings and remediation decisions in the attempt-bound
