@@ -19051,6 +19051,9 @@ export class RunRunner {
     const revision = flight.remediationRestrictions?.denialRevision ?? 0;
     const selected = this.remediationSource(flight);
     const checkIdentity = () => {
+      // Preserve the caller's exact lifecycle refusal before a failed evidence
+      // read can turn it into the generic remediation-pending hold.
+      signal?.throwIfAborted();
       this.assertFlightSourceAdmissible(flight);
       const current = this.remediationSource(flight);
       if (!Number.isSafeInteger(revision) || revision < 0 ||
