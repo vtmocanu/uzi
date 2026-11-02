@@ -4097,7 +4097,8 @@ function trackingState(g: GitCache, branch: string): { tip: string | null; phase
   return { tip: refOr(bare, `refs/uzi-runner/${branch}`), phase };
 }
 
-type ReceiptStop = "pause" | "cancel" | "switch" | "pause then cancel" | "shutdown" | "shutdown past deadline";
+type ReceiptStop =
+  | "pause" | "cancel" | "switch" | "pause then disk stop" | "shutdown" | "shutdown past deadline";
 
 /** One tick whose import is stopped by `stop` right after its pending receipt is written. Returns the
  *  tracking state captured the instant the tick reported its outcome. */
@@ -4106,6 +4107,16 @@ async function receiptStopScenario(iid: number, stop: ReceiptStop): Promise<{
 }> {
   const tmp = scratchDir(`rcpt-${iid}`);
   const ctl = control();
+  // The shutdown deadline timer is captured (not armed) while runner.shutdown() runs, so the test
+  // fires it explicitly, early, instead of racing a real timer against the clock.
+  let capturing = false;
+  const captured: Array<() => void> = [];
+  const realSetTimer = ctl.setTimer;
+  ctl.setTimer = (cb, ms) => {
+    if (!capturing) return realSetTimer(cb, ms);
+    captured.push(cb);
+    return () => {};
+  };
   const g = mkGit(fx.dataDir, writeShim(tmp, "detect"));
   const claim = gitlabClaim(iid, { claim_generation: 1 });
   const branch = `agent/issue-${iid}`;
@@ -4123,13 +4134,17 @@ async function receiptStopScenario(iid: number, stop: ReceiptStop): Promise<{
     runner = mkRunner(g, turn(async (ctx) => {
       sha = commitIn(ctx.worktreePath, "S.txt", "s\n");
       restore = afterPendingReceipt(g, async () => {
-        if (stop === "pause" || stop === "pause then cancel") {
+        if (stop === "pause" || stop === "pause then disk stop") {
           api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
           await waitAbort(ctx.signal!);
-          if (stop === "pause then cancel") {
+          if (stop === "pause then disk stop") {
+            // Fires ONLY the checkpoint-authority signal: the lifecycle is already aborted by the
+            // pause, and a PauseNow reason never reaches the terminal signal.
             await yieldLoop();
-            api.setInputs(claim.run_id, [{ id: 2, kind: "cancel" }]);
-            await waitFor(() => ctx.cancelRequested?.() === true);
+            const active = (runner as unknown as {
+              activeRuns: Map<string, { steering: { requestDiskStop(): void } }>;
+            }).activeRuns;
+            [...active.values()][0]!.steering.requestDiskStop();
           }
         } else if (stop === "cancel") {
           api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
@@ -4138,14 +4153,19 @@ async function receiptStopScenario(iid: number, stop: ReceiptStop): Promise<{
           api.requestCredentialSwitch(claim.run_id, 1);
           await waitAbort(ctx.signal!);
         } else {
+          capturing = true;
           runner!.shutdown();
-          if (stop === "shutdown past deadline") await sleepMs(250);
+          capturing = false;
+          if (stop === "shutdown past deadline") {
+            assert.equal(captured.length, 1, "exactly the shutdown deadline timer was armed");
+            captured[0]!();
+          }
         }
         await yieldLoop();
       });
       ctl.advance(INTERVAL_MS + 1);
       outcome = await bounded(ctl.fire(), TEARDOWN_MS, "tick outcome");
-    }), ctl, { recoveryRetryMs: 1, shutdownPublishTimeoutMs: stop === "shutdown past deadline" ? 100 : 60_000 });
+    }), ctl, { recoveryRetryMs: 1, shutdownPublishTimeoutMs: 60_000 });
     await runner.execute(claim);
     assert.ok(state, "the tick reported an outcome");
     return { outcome, sha, state };
@@ -4164,7 +4184,7 @@ describe("mid-turn checkpoint soft stop (issue #3780)", () => {
     });
   }
 
-  const hard: ReceiptStop[] = ["cancel", "switch", "pause then cancel", "shutdown past deadline"];
+  const hard: ReceiptStop[] = ["cancel", "switch", "pause then disk stop", "shutdown past deadline"];
   for (const [i, stop] of hard.entries()) {
     it(`${stop} is a hard stop: the ownership section is aborted before the tracking-ref update`, async () => {
       const r = await receiptStopScenario(3780_110 + i, stop);
@@ -4172,6 +4192,50 @@ describe("mid-turn checkpoint soft stop (issue #3780)", () => {
       assert.notEqual(r.state.tip, r.sha, "the hard abort stopped before the CAS");
     });
   }
+
+  it("a turn-end stop() escalates to hard when the classification is hard", async () => {
+    // A graceful shutdown starts soft (deadline not yet reached, its timer never fires here). The
+    // clock then passes the deadline with no event: only stop() at the turn's end can notice.
+    const tmp = scratchDir("stop-hard");
+    let skew = 0;
+    const ctl = control({ absoluteNow: () => Date.now() + skew });
+    const g = mkGit(fx.dataDir, writeShim(tmp, "detect"));
+    const claim = gitlabClaim(3780_140, { claim_generation: 1 });
+    const branch = `agent/issue-${3780_140}`;
+    let state: { tip: string | null; phase: string | undefined } | undefined;
+    const reported = ctl.hooks.onTickOutcome!;
+    ctl.hooks.onTickOutcome = (o) => {
+      state ??= trackingState(g, branch);
+      reported(o);
+    };
+    let sha = "";
+    let runner: RunRunner | undefined;
+    let restore: (() => void) | undefined;
+    let atReceipt: () => void = () => {};
+    const receiptWritten = new Promise<void>((resolve) => { atReceipt = resolve; });
+    try {
+      runner = mkRunner(g, turn(async (ctx) => {
+        sha = commitIn(ctx.worktreePath, "S.txt", "s\n");
+        restore = afterPendingReceipt(g, async () => {
+          runner!.shutdown();
+          atReceipt();
+          // Hold the import here until the turn has ended and stop() has classified.
+          await sleepMs(600);
+        });
+        ctl.advance(INTERVAL_MS + 1);
+        ctl.fireNoWait();
+        await receiptWritten;
+        skew = 10 * 60_000_000;
+      }), ctl, { recoveryRetryMs: 1, shutdownPublishTimeoutMs: 60_000 });
+      await runner.execute(claim);
+      await ctl.settled(TEARDOWN_MS);
+      assert.deepEqual(ctl.outcomes, ["aborted"]);
+      assert.ok(state, "the tick reported an outcome");
+      assert.notEqual(state.tip, sha, "stop() aborted hard before the tracking-ref update");
+    } finally {
+      await settleAndClean({ ctl, runners: runner ? [runner] : [], restore, paths: [tmp] });
+    }
+  });
 
   it("sink-gate preemption by the ACTUAL done checkpoint leaves a committed receipt, and finalize still opens the MR", async () => {
     const tmp = scratchDir("preempt-done");
@@ -4238,16 +4302,24 @@ describe("mid-turn checkpoint soft stop (issue #3780)", () => {
       await drain(pack);
       return LANDED;
     });
-    const started = Date.now();
+    let scanStartedAt = 0;
+    let outcomeAt = 0;
+    const reported = ctl.hooks.onTickOutcome!;
+    ctl.hooks.onTickOutcome = (o) => {
+      outcomeAt = Date.now();
+      reported(o);
+    };
     try {
       await mkRunner(mkGit(fx.dataDir, shim), turn(async (ctx) => {
         commitIn(ctx.worktreePath, "C.txt", "c\n");
         ctl.advance(INTERVAL_MS + 1);
         ctl.fireNoWait();
         await waitFor(() => shimCalls(shim).length >= 1, 20_000);
+        scanStartedAt = Date.now();
       }), ctl).execute(claim);
       assert.deepEqual(ctl.outcomes, ["aborted"]);
-      assert.ok(Date.now() - started < 25_000, "the 30 s scanner was stopped by the soft stop, not waited out");
+      assert.ok(scanStartedAt > 0 && outcomeAt >= scanStartedAt, "the tick reported after the scanner started");
+      assert.ok(outcomeAt - scanStartedAt < 15_000, "the 30 s scanner was stopped by the soft stop, not waited out");
     } finally {
       await settleAndClean({ ctl, restore: pub.restore, paths: [tmp] });
     }

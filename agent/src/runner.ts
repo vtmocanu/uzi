@@ -18277,9 +18277,13 @@ export class RunRunner {
    * issue #1597 M2 — arm the MID-TURN checkpoint tick for one executor.run. A repeating timer on the
    * injectable `this.setTickTimer`; a tick that finds the previous one still running is skipped. Each
    * tick:
-   *   0. creates its AbortController FIRST — linked to flight.cancel (so shutdown() and a steering
-   *      cancel abort it), to stop(), and to a {@link MIDTURN_TICK_TIMEOUT_MS} deadline — and races
-   *      every pre-scope await against it; skips while a retained bare lock still exists;
+   *   0. creates its abort controllers FIRST and races every pre-scope await against them; skips
+   *      while a retained bare lock still exists. A tick has a HARD abort (kills children, never
+   *      masked) and a SOFT one (sink-gate preemption, stop(), a PauseNow or pre-deadline graceful
+   *      shutdown), which the checkpoint scope masks across GitCache's ownership section (#3780).
+   *      Lifecycle, terminal and checkpoint-authority aborts and the shutdown deadline are
+   *      classified with the done-path rule (checkCheckpointStop): revoked authority, the shutdown
+   *      deadline timer and the {@link MIDTURN_TICK_TIMEOUT_MS} cap abort hard, the rest soft;
    *   1. probes the runner clone for an in-progress git operation (lstat + one non-blocking gitfile
    *      read — no git child, no credentials); busy ⇒ `git_busy`, and after
    *      {@link MIDTURN_BUSY_FEED_AFTER} consecutive busy ticks ONE deduped feed line (reset once a
@@ -18293,8 +18297,9 @@ export class RunRunner {
    *      time gate → pinned scan → pack → publish with the tick signal);
    *   5. after settlement, reconciles lock files a SIGKILLed child left in the bare (proven
    *      ownership only — see tick-spawner.ts), under the per-bare lock.
-   * Every throw is caught: a tick never fails or stalls the run. `stop()` cancels the timer, aborts
-   * the in-flight tick and awaits its full settlement; it never rejects.
+   * Every throw is caught: a tick never fails or stalls the run. `stop()` cancels the timer, stops
+   * the in-flight tick softly (hard when the current classification is hard) and awaits its full
+   * settlement; it never rejects.
    */
   private startMidTurnTicker(
     flight: RunFlight,
@@ -18394,29 +18399,32 @@ export class RunRunner {
       const steering = flight.steering;
       const now = hooks?.absoluteNow ?? Date.now;
       const neverStop = new AbortController().signal;
+      // An exception here (a steering read, an unexpected stop error) is treated as "hard": it must
+      // never escape onEvent (an abort listener) or stop() (documented as never rejecting).
       const classify = (): "hard" | "soft" | "none" => {
         try {
           checkCheckpointStop({ ...checkpointStopFields(steering, now), signal: neverStop });
-        } catch (e) {
-          if (e instanceof GitBoundaryAbortError) return "hard";
-          throw e;
+          return steering.lifecycleSignal().aborted ? "soft" : "none";
+        } catch {
+          return "hard";
         }
-        return steering.lifecycleSignal().aborted ? "soft" : "none";
       };
       inFlightClassify = classify;
       const lifecycleSignal = steering.lifecycleSignal();
       const terminalSignal = steering.terminalLifecycleSignal();
       const authoritySignal = steering.checkpointAuthoritySignal();
-      let shutdownStop: AbortSignal | undefined;
+      let shutdownAttached = false;
       let cancelShutdownTimer: (() => void) | undefined;
-      // A graceful shutdown's own stop signal and its deadline are revocation events too.
+      // A graceful shutdown's stop signal IS checkpointAuthoritySignal() (subscribed below), so only
+      // its deadline needs arming here. That timer IS the deadline event: when it fires the tick is
+      // hard-aborted unconditionally, because a timer can fire slightly before Date.now() reaches
+      // deadlineAt and a reclassification would then wrongly stay soft.
       const attachShutdown = (): void => {
-        if (shutdownStop) return;
+        if (shutdownAttached) return;
         const shutdown = steering.workerShutdownCheckpoint();
         if (!shutdown) return;
-        shutdownStop = shutdown.stopSignal;
-        shutdownStop.addEventListener("abort", onEvent, { once: true });
-        cancelShutdownTimer = this.setTimer(onEvent, Math.max(0, shutdown.deadlineAt - now()));
+        shutdownAttached = true;
+        cancelShutdownTimer = this.setTimer(() => ac.abort(), Math.max(0, shutdown.deadlineAt - now()));
       };
       const onEvent = (): void => {
         attachShutdown();
@@ -18473,7 +18481,6 @@ export class RunRunner {
         cancelDeadline();
         cancelShutdownTimer?.();
         for (const s of subscribed) s.removeEventListener("abort", onEvent);
-        shutdownStop?.removeEventListener("abort", onEvent);
         if (inFlightAbort === ac) {
           inFlightAbort = undefined;
           inFlightSoftAbort = undefined;
@@ -18622,7 +18629,8 @@ export class RunRunner {
         flight.kickMidTurnTick = undefined;
         cancelTimer?.();
         cancelTimer = undefined;
-        // issue #3780: stop is cooperative unless the current classification is already hard.
+        // issue #3780: stop is cooperative unless the current classification is already hard
+        // (classify never throws; an exception reads as hard).
         if (inFlightAbort) {
           if (inFlightClassify?.() === "hard") inFlightAbort.abort();
           else inFlightSoftAbort?.abort();
