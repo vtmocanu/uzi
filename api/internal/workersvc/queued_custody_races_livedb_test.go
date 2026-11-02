@@ -281,10 +281,11 @@ func TestQueuedCustodyDiscardRaceLiveDB(t *testing.T) {
 				if err := tx.Commit(ctx); err != nil {
 					t.Fatal(err)
 				}
-				if err := <-done; err != nil {
-					t.Fatal(err)
-				}
+				resultErr := <-done
 				joined = true
+				if resultErr != nil {
+					t.Fatal(resultErr)
+				}
 
 				if statusOf(t, c.env, id) != "recovery_wait" {
 					t.Fatal("writer-first order did not retain owner hold")
@@ -496,10 +497,11 @@ func TestQueuedCustodyOwnerControlRaceLiveDB(t *testing.T) {
 	if err := owner.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
+	resultErr := <-done
 	joined = true
+	if resultErr != nil {
+		t.Fatal(resultErr)
+	}
 	after := observeQueuedCustody(t, c.env, id)
 	if !reflect.DeepEqual(before, after) {
 		t.Fatal("lost owner-control race changed cancelled state, evidence or custody")
@@ -626,10 +628,11 @@ func TestQueuedCustodySettingsRaceLiveDB(t *testing.T) {
 				if err := owner.Commit(ctx); err != nil {
 					t.Fatal(err)
 				}
-				if err := <-done; err != nil {
-					t.Fatal(err)
-				}
+				resultErr := <-done
 				joined = true
+				if resultErr != nil {
+					t.Fatal(resultErr)
+				}
 				requireQueuedCustodyPreserved(t, before, observeQueuedCustody(t, c.env, id), false)
 				if statusOf(t, c.env, id) != "queued" {
 					t.Fatal("stale cache raised an owner hold")
@@ -676,10 +679,11 @@ func TestQueuedCustodySettingsRaceLiveDB(t *testing.T) {
 				if err := tx.Commit(ctx); err != nil {
 					t.Fatal(err)
 				}
-				if err := <-done; err != nil {
-					t.Fatal(err)
-				}
+				resultErr := <-done
 				joined = true
+				if resultErr != nil {
+					t.Fatal(resultErr)
+				}
 				if statusOf(t, c.env, id) != "recovery_wait" {
 					t.Fatal("later settings change rewrote committed disposition")
 				}
@@ -1082,10 +1086,11 @@ func TestQueuedCustodyMembershipRaceLiveDB(t *testing.T) {
 				if err := tx.Commit(ctx); err != nil {
 					t.Fatal(err)
 				}
-				if err := <-done; err != nil {
-					t.Fatal(err)
-				}
+				resultErr := <-done
 				joined = true
+				if resultErr != nil {
+					t.Fatal(resultErr)
+				}
 				if statusOf(t, c.env, id) != "recovery_wait" {
 					t.Fatal("later membership drift rewrote disposition")
 				}
