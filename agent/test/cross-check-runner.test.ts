@@ -1076,6 +1076,7 @@ async function diagnosticScenario(stage: "plan" | "code", harness: "claude" | "c
  failureAt?: "usage" | "probe" | "verdict" | "terminal" | "terminal-selected" | "ambiguous";
  error?: unknown;
  post?: (messages: any[], index: number) => void;
+ authenticatedMessages?: boolean;
 } = {}) {
  const root = await fs.mkdtemp(path.resolve(import.meta.dirname, "../../.uzi/scratch/diagnostic-"));
  const recorded = recordingLogger();
@@ -1099,6 +1100,24 @@ async function diagnosticScenario(stage: "plan" | "code", harness: "claude" | "c
  if (stage === "code") c.cross_check = { ...c.cross_check!, stage: "code", round: 1,
   head_commit: "b".repeat(40), candidate_digest: "c".repeat(64), code_context: { task: "Review" }, guidance_snapshot: "" };
  const messages: any[] = [], decisions: any[] = [], terminals: any[] = [];
+ const handlerErrors: unknown[] = [];
+ let messageClient: WorkerClient | undefined;
+ const server = options.authenticatedMessages ? http.createServer(async (req, res) => {
+  try {
+   let raw = "";
+   for await (const chunk of req) raw += chunk;
+   const body = JSON.parse(raw);
+   assert.equal(req.method, "POST");
+   assert.equal(req.url, "/api/worker/runs/check/messages");
+   assert.equal(req.headers.authorization, "Bearer join-fixture");
+   assert.equal(body.claim_generation, 7);
+   messages.push(...body.messages);
+  } catch (error) {
+   handlerErrors.push(error);
+  } finally {
+   res.writeHead(204).end();
+  }
+ }) : undefined;
  let running = 0, posts = 0;
  const fail = () => { throw options.error ?? crossCheckExecutionError("provider_error"); };
  const client = {
@@ -1112,10 +1131,11 @@ async function diagnosticScenario(stage: "plan" | "code", harness: "claude" | "c
    return { applied: true };
   },
   getInputs: async () => ({ inputs: [] }),
-  postMessages: async (_id: string, batch: any[]) => {
+  postMessages: async (id: string, batch: any[], generation?: number, signal?: AbortSignal) => {
    options.post?.(batch, posts++);
    if (options.failureAt === "usage") throw new RequestError("POST", "/messages", 503, "{}");
-   messages.push(...batch);
+   if (messageClient) await messageClient.postMessages(id, batch, generation, signal);
+   else messages.push(...batch);
   },
   hasFeature: (name: string) => name === "terminal_fence",
   releaseCodex: async () => ({ auth_mode: "api_key", access_token: "released-token" }),
@@ -1156,17 +1176,35 @@ async function diagnosticScenario(stage: "plan" | "code", harness: "claude" | "c
   return stage === "code" ? '{"findings":[]}' : verdict;
  } };
  try {
+  if (server) {
+   await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+   });
+   const address = server.address() as { port: number };
+   messageClient = new WorkerClient("http://127.0.0.1:" + address.port, "join-fixture", "test", recorded.logger);
+   messageClient.hasFeature = (name) => name === "claim_generation_fence";
+  }
   await new CrossCheckRunner(client, git, recorded.logger, { homeRoot: root, outbox, rearm,
    pollMs: 1000, batchMs: 60_000, modelTimeoutMs: 5000,
    ...(harness === "codex" ? { model } : { claudeModel: model }),
   }).execute(c);
+  if (handlerErrors.length) throw new AggregateError(handlerErrors, "authenticated message handler assertions failed");
   assert.equal(instances.size, 1, "only the original batcher emitted");
   assert.deepEqual(closes, [...instances], "the original batcher closed exactly once");
   assert.equal(rearm.size, 0);
   return { messages, decisions, terminals, logs: recorded.lines,
    diagnostics: messages.filter(m => m.payload.event === "cross_check_diagnostic").map(m => m.payload),
    warnings: recorded.lines.filter((line: any) => line.event === "cross_check_diagnostic") };
- } finally { emitSpy.mock.restore(); closeSpy.mock.restore(); await fs.rm(root, { recursive: true, force: true }); }
+ } finally {
+  emitSpy.mock.restore(); closeSpy.mock.restore();
+  try {
+   if (server?.listening) {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+   }
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+ }
 }
 
 function exactDiagnostic(stage: "plan" | "code", harness: "claude" | "codex", code: DiagnosticCode) {
@@ -1188,6 +1226,12 @@ function assertDiagnostic(r: Awaited<ReturnType<typeof diagnosticScenario>>, sta
 
 for (const stage of ["plan", "code"] as const) for (const harness of ["claude", "codex"] as const) {
  for (const code of Object.keys(diagnosticPairs) as DiagnosticCode[]) {
+  it("GAP_AUTH_PATH authenticated diagnostic " + stage + " " + harness + " " + code, async () => {
+   const r = await diagnosticScenario(stage, harness, { authenticatedMessages: true, error: crossCheckExecutionError(code) });
+   assertDiagnostic(r, stage, harness, code);
+   assert.deepEqual(r.messages.map(m => m.seq), [11, 12, 13, 14]);
+   assert.ok(r.terminals.length > 0, "runner reports a terminal fence");
+  });
   it("M1 exact trusted pair " + stage + " " + harness + " " + code, async () => {
    const r = await diagnosticScenario(stage, harness, { error: crossCheckExecutionError(code) });
    assertDiagnostic(r, stage, harness, code);
