@@ -284,7 +284,7 @@ else
   PAUSE_RUNS=() PAUSE_IIDS=() PAUSE_GENS=() PAUSE_REQUEUES=()
   for repo in "$REPO_ID" "$REPO2_ID"; do
     wait_custody_headroom 1
-    iid="$(apipost "/api/repos/$repo/issues" '{"title":"E2E cap2 cooperative pause","description":"implements prds/4-agent-runtime-workers.md UZI_STUB_OUTBOX UZI_STUB_OUTBOX_FIRST_CUT_BARRIER UZI_STUB_SOURCE_END_READY"}' | jq -er '.card.iid')"
+    iid="$(apipost "/api/repos/$repo/issues" '{"title":"E2E cap2 cooperative pause","description":"implements prds/4-agent-runtime-workers.md UZI_STUB_OUTBOX UZI_STUB_OUTBOX_FIRST_CUT_BARRIER UZI_STUB_FIRST_BARRIER_CHECKPOINTABLE_WORK UZI_STUB_SOURCE_END_READY"}' | jq -er '.card.iid')"
     run="$(create_run "$repo" "$iid")" || fail "cap2 pause run-create failed"
     PAUSE_RUNS+=("$run"); PAUSE_IIDS+=("$iid")
     wait_status "$run" awaiting_approval

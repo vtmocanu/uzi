@@ -639,8 +639,7 @@ cap2_focused_regressions() {
   cap2_restart_order() {
     local mode="$1" fragment rc=0 file="$SEQ_DIR/cap2-order"
     fragment="$(awk '
-      /^  for i in 0 1; do$/ { start=NR }
-      /wait_status "\$run" paused/ { collecting=1 }
+      /^  PAUSE_RUNS=/ { start=NR; collecting=1 }
       collecting && /^  for run in "\$\{PAUSE_RUNS\[@\]\}"; do apipost/ { end=NR; exit }
       { lines[NR]=$0 }
       END {
@@ -651,11 +650,32 @@ cap2_focused_regressions() {
     (
       set -e
       # shellcheck disable=SC2034 # consumed by the evaluated phase fragment
-      PAUSE_RUNS=(runA runB)
-      # shellcheck disable=SC2034 # consumed by the evaluated phase fragment
-      PAUSE_GENS=(1 2)
+      REPO_ID=repoA REPO2_ID=repoB
       COMPOSE=(cap2_compose_probe)
-      wait_status() { :; }
+      wait_custody_headroom() { :; }
+      apipost() {
+        case "$1" in
+          /api/repos/*/issues)
+            [[ "$2" == *"UZI_STUB_OUTBOX_FIRST_CUT_BARRIER UZI_STUB_FIRST_BARRIER_CHECKPOINTABLE_WORK UZI_STUB_SOURCE_END_READY"* ]] ||
+              fail 'cooperative pair lacks explicit checkpointable work opt-in'
+            echo "opt-in $1" >> "$file"
+            echo '{"card":{"iid":1}}';;
+          /api/runs/*/inputs)
+            if [[ "$2" == *'"kind":"pause"'* ]]; then echo "pause $1" >> "$file"; fi;;
+          *) fail "unexpected phase POST $1";;
+        esac
+      }
+      create_run() { if [ "$1" = repoA ]; then echo runA; else echo runB; fi; }
+      apiget() { echo '{"run":{"requeue_count":0}}'; }
+      db_psql() { if [[ "$1" == *runA* ]]; then echo 1; else echo 2; fi; }
+      cap2_early_barrier() { echo true; }
+      wait_eq() { echo "barrier $5" >> "$file"; }
+      wait_status() {
+        if [ "$2" = paused ]; then
+          [ "$mode" != "paused-$1" ] || fail 'pause was not acknowledged'
+          echo "paused $1" >> "$file"
+        fi
+      }
       wait_worker_online() { :; }
       cap2_compose_probe() { echo "compose $*" >> "$file"; }
       wait_fixture_worker_event() {
@@ -670,7 +690,9 @@ cap2_focused_regressions() {
     ) || rc=$?
     if [ "$mode" = present ]; then
       [ "$rc" = 0 ] || fail 'ready sources failed restart'
-      printf '%s\n' 'ready runA 1 stub: source-end ready' 'ready runB 2 stub: source-end ready' \
+      printf '%s\n' 'opt-in /api/repos/repoA/issues' 'opt-in /api/repos/repoB/issues' \
+        'barrier runA' 'barrier runB' 'pause /api/runs/runA/inputs' 'pause /api/runs/runB/inputs' \
+        'paused runA' 'ready runA 1 stub: source-end ready' 'paused runB' 'ready runB 2 stub: source-end ready' \
         'compose stop agent' 'compose up -d --wait agent' > "$file.expected"
       cmp "$file.expected" "$file" || fail 'restart preceded both exact source receipts'
     else
@@ -679,7 +701,7 @@ cap2_focused_regressions() {
     fi
     echo 'both exact source receipts precede restart'
   }
-  for mode in present runA runB; do
+  for mode in present runA runB paused-runA paused-runB; do
     custody_case "cap2 restart ordering $mode" pass 'both exact source receipts precede restart' cap2_restart_order "$mode"
   done
   cap2_outcome() {

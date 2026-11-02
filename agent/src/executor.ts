@@ -1826,11 +1826,6 @@ export class StubExecutor implements Executor {
       });
     }
 
-    // PRD #47 M6: reproduce a stall / loop / long in-flight tool call so the
-    // server-side run-health detector is provable end to end with no live SDK.
-    // Gated on the UZI_STUB_* sentinels; a normal run is unaffected.
-    await this.simulateHealth(ctx);
-
     const markerPath = path.join(ctx.worktreePath, "UZI_RUN.md");
     const marker = [
       `# uzi stub run`,
@@ -1844,7 +1839,19 @@ export class StubExecutor implements Executor {
       `Claude Agent SDK.`,
       ``,
     ].join("\n");
-    await fs.writeFile(markerPath, marker, "utf8");
+    // Trusted stub fixture only: leave ordinary work dirty for commitWipMarker
+    // when phase 45 pauses at the first-generation executor barrier.
+    const preparePauseWork = ctx.issueDescription.split(/\s+/).includes("UZI_STUB_FIRST_BARRIER_CHECKPOINTABLE_WORK");
+    if (preparePauseWork && (!Number.isSafeInteger(ctx.claimGeneration) || ctx.claimGeneration! < 1))
+      throw new Error("invalid stub checkpointable work claim generation");
+    const earlyMarker = preparePauseWork && ctx.claimGeneration === 1 &&
+      ctx.issueDescription.includes(STUB_OUTBOX_SENTINEL) &&
+      ctx.issueDescription.includes("UZI_STUB_OUTBOX_FIRST_CUT_BARRIER");
+    if (earlyMarker) await fs.writeFile(markerPath, marker, "utf8");
+
+    // PRD #47 M6: reproduce health/outage fixtures before the ordinary local commit.
+    await this.simulateHealth(ctx);
+    if (!earlyMarker) await fs.writeFile(markerPath, marker, "utf8");
 
     // Local commit only. Identity is pinned per-invocation via -c so nothing is
     // written to the worktree's git config, and gpg signing is forced off so a

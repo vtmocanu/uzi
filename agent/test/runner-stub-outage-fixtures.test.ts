@@ -20,6 +20,59 @@ import { quiesceRunAttempt, type QuiesceRunOutcome } from "../src/run-quiescence
 
 installHarness();
 
+for (const optedIn of [false, true]) {
+  it(`public first-barrier pause ${optedIn ? "checkpoints work then pauses and ends its source" : "refuses the unchanged base"}`, async t => {
+    const { outbox, authority } = await setup();
+    const c = claim(`UZI_STUB_OUTBOX UZI_STUB_OUTBOX_FIRST_CUT_BARRIER UZI_STUB_SOURCE_END_READY ${optedIn ? "UZI_STUB_FIRST_BARRIER_CHECKPOINTABLE_WORK" : ""}`);
+    const events: string[] = [];
+    let clone = "";
+    const executor = new class extends StubExecutor {
+      override async run(ctx: RunContext) {
+        clone = ctx.worktreePath;
+        return super.run({ ...ctx, emit: message => {
+          ctx.emit(message);
+          if ((message.payload as { text?: string }).text === "stub: outbox waiting for API cut") {
+            events.push("barrier");
+            assert.equal(fs.existsSync(path.join(clone, "UZI_RUN.md")), optedIn);
+            api.setInputs(c.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+          }
+        } });
+      }
+    }(nullLogger(), { outboxTicks: 1, outboxTickMs: 0 });
+    const publish = t.mock.method(client, "publishCheckpoint", async (...[_runId, _tip, pack]: Parameters<typeof client.publishCheckpoint>) => {
+      for await (const _chunk of pack) { /* consume the ordinary checkpoint pack */ }
+      events.push("checkpoint");
+      return { ok: true as const, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-52007" } };
+    });
+    const report = client.reportState.bind(client);
+    t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+      const result = await report(...args);
+      if (args[1].status === "paused") events.push("paused");
+      return result;
+    });
+    const log = logger(message => { if (message === "stub: source-end ready") events.push("source-end"); });
+    await runnerWith(() => ({ executor, homeDir: path.join(homeDir, c.run_id) }), fakeGitlab().gitlab,
+      undefined, log.log, { outbox, authority, checkpointIntervalMs: 0 }).execute(c);
+    if (optedIn) {
+      assert.equal(publish.mock.callCount(), 1);
+      assert.deepEqual(events, ["barrier", "checkpoint", "paused", "source-end"]);
+      assert.deepEqual(ready(log.lines).map(l => l.fields), [{
+        run_id: c.run_id, claim_generation: 1, sources: 1,
+      }]);
+      await authority.withTransaction(async tx => {
+        const store = await openAuthorityStore(tx, { workerToken: "fixture-worker" });
+        assert.equal((await store.readSlot(tx, await store.slotKey(tx, clone)))?.state, "ineligible");
+      });
+    } else {
+      assert.equal(publish.mock.callCount(), 0);
+      assert.equal(api.states.some(s => s.runId === c.run_id && s.body.status === "paused"), false);
+      assert.ok(log.lines.some(l => JSON.stringify(l.fields).includes("ownership_unknown")));
+      assert.deepEqual(events, ["barrier", "source-end"],
+        "joined source teardown alone never proves a checkpoint or accepted pause");
+    }
+  });
+}
+
 const STOP = "UZI_STUB_PRE_ENROLLMENT_STOP";
 const FIRST = "UZI_STUB_FIRST_PRE_ENROLLMENT_STOP";
 const SOURCE = "UZI_STUB_SOURCE_END_READY";
