@@ -341,6 +341,17 @@ func TestCollectScoutHistoryCancellationPrecedence(t *testing.T) {
 				if (len(d.Logs) > 0) != share {
 					t.Errorf("logs=%v share=%v calls=%v", d.Logs, share, s.calls)
 				}
+				if strings.Contains(mode, "parent") {
+					if !slices.ContainsFunc(d.Runs, func(r scoutRun) bool {
+						return r.Run.ID == 1 && !r.JobsMissing && r.HistoryKnown &&
+							len(r.Jobs) == 1 && r.Jobs[0].ID == 1 && r.Jobs[0].Status == "failure"
+					}) {
+						t.Errorf("preceding failed job lost after parent expiry: runs=%v", d.Runs)
+					}
+					if slices.ContainsFunc(s.calls, func(c string) bool { return strings.HasPrefix(c, "log:") }) {
+						t.Errorf("log read after parent expiry: calls=%v", s.calls)
+					}
+				}
 				if slices.Contains(s.calls, "attempts:3") {
 					t.Errorf("history continued after cancellation: %v", s.calls)
 				}
