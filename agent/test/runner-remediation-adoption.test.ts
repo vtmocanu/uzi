@@ -94,6 +94,10 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
     let models = 0, callbacks = 0, scans = 0, writes = 0, underB = false;
     let oldFactsInstalled = false;
     let flight: any, callbackError: unknown;
+    const proofErrors: unknown[] = [];
+    const checkProof = async (proof: () => void | Promise<void>) => {
+      try { await proof(); } catch (error) { proofErrors.push(error); }
+    };
     const logs = recordingLogger();
     const runner = new RunRunner(client, cache, runId => ({ homeDir: path.join(homeDir, runId), executor: {
       run: async ctx => {
@@ -173,19 +177,25 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       const original = args[6]!.admitRemediationSource!;
       args[6] = { ...args[6], admitRemediationSource: async input => {
         callbacks++; underB = true;
-        assert.equal(input.executionTip ?? input.sourceTip, execution);
-        if (peel) assert.ok(input.restrictedRoots.includes(s));
-        if (mode !== "marker-plain") assert.ok(input.restrictedRoots.includes(x));
-        assert.ok(!input.flaggedOIDs.includes(x), "a proposed excluded root is not global finding evidence");
-        assert.ok(!flight.remediationRestrictions.roots.includes(x));
-        try { return await original(input); } finally { underB = false; }
+        try {
+          await checkProof(() => {
+            assert.equal(input.executionTip ?? input.sourceTip, execution);
+            if (peel) assert.ok(input.restrictedRoots.includes(s));
+            if (mode !== "marker-plain") assert.ok(input.restrictedRoots.includes(x));
+            assert.ok(!input.flaggedOIDs.includes(x), "a proposed excluded root is not global finding evidence");
+            assert.ok(!flight.remediationRestrictions.roots.includes(x));
+          });
+          return await original(input);
+        } finally { underB = false; }
       } };
       const counts = accounting();
-      assert.equal(counts.totalOpen, 3);
-      assert.equal(counts.liveClaimDiscount, 1);
-      assert.equal(counts.admissionCharged, 2);
       const oldRoots = await cache.enumerateOwedCandidates(bare, claim.run_id);
-      assert.ok(oldRoots.length > 0);
+      await checkProof(() => {
+        assert.equal(counts.totalOpen, 3);
+        assert.equal(counts.liveClaimDiscount, 1);
+        assert.equal(counts.admissionCharged, 2);
+        assert.ok(oldRoots.length > 0);
+      });
       const oldPins = command(bare, "for-each-ref", "--format=%(refname) %(objectname)",
         "refs/uzi-owed/", "refs/uzi-coverage/", "refs/uzi-recovery-pin/", "refs/uzi-recovery-episode/").split("\n").filter(Boolean);
       const mutationCounts = mutations.map(m => m.mock.callCount());
@@ -195,23 +205,25 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       try {
         result = await prepare(...args);
       } finally {
-        assert.deepEqual(accounting(), counts, "adoption alone changes no fixed custody/admission input");
-        assert.deepEqual(api.states, states, "no status transition inside adoption");
-        assert.deepEqual(mutations.map(m => m.mock.callCount()), mutationCounts,
-          "adoption neither reserves/releases custody nor creates/settles holds");
-        const custodyRequests = requests.mock.calls.slice(requestStart).filter((call: any) =>
-          /\/(?:archives|recovery-holds|completion\/hold|base-attestation-hold)(?:\/|$)/.test(call.arguments[0]));
-        assert.deepEqual(custodyRequests, [], "no custody mutation HTTP request, including discard");
-        const rootsAfter = await cache.enumerateOwedCandidates(bare, claim.run_id);
-        for (const root of oldRoots) assert.deepEqual(rootsAfter.find(r => r.sha === root.sha), root,
-          "every original root retains all original contexts");
-        const pinsAfter = command(bare, "for-each-ref", "--format=%(refname) %(objectname)",
-          "refs/uzi-owed/", "refs/uzi-coverage/", "refs/uzi-recovery-pin/", "refs/uzi-recovery-episode/").split("\n");
-        for (const pin of oldPins) {
-          assert.ok(pinsAfter.includes(pin), "original owed/coverage/episode pin unchanged: " + pin);
-          const [ref, oid] = pin.split(" ");
-          assert.equal(command(bare, "rev-parse", ref! + "^{commit}"), oid);
-        }
+        await checkProof(async () => {
+          assert.deepEqual(accounting(), counts, "adoption alone changes no fixed custody/admission input");
+          assert.deepEqual(api.states, states, "no status transition inside adoption");
+          assert.deepEqual(mutations.map(m => m.mock.callCount()), mutationCounts,
+            "adoption neither reserves/releases custody nor creates/settles holds");
+          const custodyRequests = requests.mock.calls.slice(requestStart).filter((call: any) =>
+            /\/(?:archives|recovery-holds|completion\/hold|base-attestation-hold)(?:\/|$)/.test(call.arguments[0]));
+          assert.deepEqual(custodyRequests, [], "no custody mutation HTTP request, including discard");
+          const rootsAfter = await cache.enumerateOwedCandidates(bare, claim.run_id);
+          for (const root of oldRoots) assert.deepEqual(rootsAfter.find(r => r.sha === root.sha), root,
+            "every original root retains all original contexts");
+          const pinsAfter = command(bare, "for-each-ref", "--format=%(refname) %(objectname)",
+            "refs/uzi-owed/", "refs/uzi-coverage/", "refs/uzi-recovery-pin/", "refs/uzi-recovery-episode/").split("\n");
+          for (const pin of oldPins) {
+            assert.ok(pinsAfter.includes(pin), "original owed/coverage/episode pin unchanged: " + pin);
+            const [ref, oid] = pin.split(" ");
+            assert.equal(command(bare, "rev-parse", ref! + "^{commit}"), oid);
+          }
+        });
       }
       // Trip AFTER the durable Git result. The worker must first synchronously adopt the
       // verified tuple, so credential-switch custody verification sees the new source.
@@ -291,6 +303,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
     }
     try {
       await runner.execute(claim);
+      if (proofErrors.length) throw new AggregateError(proofErrors, "remediation adoption proof failed");
       assert.equal(models, succeeds ? 1 : 0, JSON.stringify({ states: api.states, logs }));
       if (callbackError) throw callbackError;
       assert.equal(callbacks, mode === "missing-pending" || mode === "missing-RR" ? 0 : 1, JSON.stringify({ states: api.states, logs }));
