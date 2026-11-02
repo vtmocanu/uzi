@@ -58,7 +58,11 @@ func (s *PodEpochSession) dropPending(r *podEpochRecord) {
 // podEpochDelivery is a bounded tombstone after completion. Payload is released,
 // but the UID cannot acquire a fresh budget until the generation is reset.
 type podEpochDelivery struct {
-	firstSeen           time.Time
+	firstSeen time.Time
+	// Initial negatives anchor at firstSeen; positive proof waits for a changed
+	// post-Added event with IDs. hasAnchor permits even a zero-valued clock.
+	anchor              time.Time
+	hasAnchor           bool
 	context             context.Context
 	attempts, conflicts int
 	stopped             bool
@@ -68,6 +72,7 @@ type podEpochDelivery struct {
 	identityUnverified  bool
 	issued              *PodEpochDecision
 	worker              string
+	pod                 string
 }
 type PodEpochDecision struct {
 	generation               PodEpochGeneration
@@ -272,12 +277,23 @@ func (s *PodEpochSession) stopDelivery(uid string, a *podEpochDelivery, reason s
 		s.bytes -= a.issuedCost
 	}
 	a.negative, a.negativeCost, a.issuedCost, a.issued = "", 0, 0, nil
-	args := []any{"reason", reason, "attempts", a.attempts, "conflicts", a.conflicts, "elapsed", s.now().Sub(a.firstSeen)}
+	args := s.deliveryLogArgs(a)
+	args = append(args, "reason", reason, "attempts", a.attempts, "conflicts", a.conflicts)
 	if success {
 		s.logger.Info("pod epoch delivery succeeded", args...)
 	} else {
 		s.logger.Info("pod epoch delivery stopped", args...)
 	}
+}
+
+// deliveryLogArgs samples the clock once so both durations describe one instant.
+func (s *PodEpochSession) deliveryLogArgs(a *podEpochDelivery) []any {
+	now := s.now()
+	args := []any{"worker_id", a.worker, "pod", a.pod, "elapsed", now.Sub(a.firstSeen)}
+	if a.hasAnchor {
+		args = append(args, "elapsed_since_ids", now.Sub(a.anchor))
+	}
+	return args
 }
 func (s *PodEpochSession) checkDelivery(uid string, a *podEpochDelivery) bool {
 	if a == nil || a.stopped {
@@ -290,7 +306,7 @@ func (s *PodEpochSession) checkDelivery(uid string, a *podEpochDelivery) bool {
 		reason = "watch_stopped"
 	case a.context.Err() != nil:
 		reason = "canceled"
-	case s.now().Sub(a.firstSeen) >= podEpochDeliveryBudget:
+	case a.hasAnchor && s.now().Sub(a.anchor) >= podEpochDeliveryBudget:
 		reason = "time_budget"
 	case a.attempts >= 3:
 		reason = "attempt_limit"
@@ -591,14 +607,14 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 		s.current[w.ID] = uid
 	}
 	if fresh {
-		cost := 256 + len(uid) + len(w.ID)
+		cost := 256 + len(uid) + len(w.ID) + len(p.Name)
 		if s.bytes+cost > PodEpochMaxMetadata {
 			s.invalidate()
 			s.mu.Unlock()
 			return nil, nil
 		}
 		s.bytes += cost
-		s.attempts[uid] = &podEpochDelivery{firstSeen: s.now(), context: ctx, worker: w.ID}
+		s.attempts[uid] = &podEpochDelivery{firstSeen: s.now(), context: ctx, worker: w.ID, pod: p.Name}
 	}
 	// Supersession also stops issued decisions for the previous current pod.
 	for other, a := range s.attempts {
@@ -671,6 +687,7 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 			s.bytes += len(b)
 			r.pending, r.pendingCost = proof, len(b)
 		} else {
+			a.anchor, a.hasAnchor = a.firstSeen, true
 			if !s.retainNegative(a, doc) {
 				return nil, nil
 			}
@@ -697,6 +714,9 @@ func (s *PodEpochSession) handle(ctx context.Context, g PodEpochGeneration, even
 		succ := podEpochSuccessorContainers(p)
 		if len(succ) == 0 {
 			return nil, nil
+		}
+		if !a.hasAnchor {
+			a.anchor, a.hasAnchor = s.now(), true
 		}
 		doc = podEpochComplete(*r.pending, succ)
 		if doc == podEpochNegativeDoc("evidence_invalid_or_oversize") {
@@ -966,7 +986,7 @@ func (s *PodEpochSession) Deliver(ctx context.Context, d *PodEpochDecision) erro
 	if !s.checkDelivery(d.uid, a) {
 		return errors.New("stopped decision")
 	}
-	remaining := podEpochDeliveryBudget - s.now().Sub(a.firstSeen)
+	remaining := podEpochDeliveryBudget - s.now().Sub(a.anchor)
 	if remaining <= 0 {
 		s.stopDelivery(d.uid, a, "time_budget", false)
 		return errors.New("delivery budget expired")
@@ -996,7 +1016,9 @@ func (s *PodEpochSession) Deliver(ctx context.Context, d *PodEpochDecision) erro
 	if apierrors.IsConflict(err) {
 		a.conflicts++
 	}
-	s.logger.Warn("pod epoch delivery request failed", "reason", reason, "attempts", a.attempts)
+	args := s.deliveryLogArgs(a)
+	args = append(args, "reason", reason, "attempts", a.attempts)
+	s.logger.Warn("pod epoch delivery request failed", args...)
 	if !apierrors.IsConflict(err) {
 		s.stopDelivery(d.uid, a, reason, false)
 	} else {

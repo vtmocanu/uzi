@@ -272,6 +272,23 @@ Consistent with D16, a human revision of the plan triggers no new cross-family c
 
 Production coverage review reaches no model today: see the [coverage transport limitation](1225-structural-completion-interlock-invariants.md#coverage-transport-limitation) in ADR-1225. Because no enforceable bounds exist (#1231 is not planned), a production call would settle as coverage-unavailable (`semantic_park: coverage_unavailable`) rather than reach a model.
 
+## Disposition evidence amendment (2026-11-01, #3097)
+
+The maintainer chose Option B: checkers assess dispositions and inspectable
+evidence supplied in their input. Previous findings are not supplied separately,
+so a checker cannot establish completeness against the preceding check's items.
+This narrows the checker instruction in the 2026-10-17 amendment: missing or
+incomplete defect dispositions identifiable from supplied input call for REVISE,
+never BLOCK solely for omission. The lead still includes dispositions for each
+immediately preceding delivered item. Supported declines cannot waive mandatory
+defect requirements, and #3168's advisory coverage exception remains unchanged.
+
+No prior-findings transport, candidate identity, replay input, capability or
+privilege changes are added. Option A (bounded server-derived prior findings)
+is deferred unless a controlled dropped-defect-disposition evaluation shows
+benefit with that input. Instruction tests establish this contract, not improved
+live-model convergence, cost or latency; those outcomes remain unmeasured.
+
 ## Advisory plan coverage amendment (2026-10-23, #3334 / #3168 M1)
 
 This amendment records [PRD #3168](../prds/3168-plan-cross-check-coverage.md)
@@ -370,3 +387,41 @@ finding rewrite. Instruction fixtures pin text, not model behavior. Frozen repla
 inputs and baseline hashes are unchanged; only revised brief hashes are repinned.
 M1 baseline and M3b replay/hosted verification remain maintainer follow-ups; this
 amendment claims neither detection improvement nor hosted acceptance.
+
+## Amendment 2026-10-31 (#3708)
+
+[PRD #3708](../prds/3708-gated-plan-cross-check.md) revisits the "Human-gated runs"
+out-of-scope line: a run that is not auto-approved, whose owner enabled Plan cross-check,
+now goes through the checked-plan loop before its first human gate. Decisions:
+
+- **Gated mode.** A second INSERT-time snapshot, `runs.plan_cross_check_gated`, is mutually
+  exclusive with the required mode (CHECK `runs_plan_cross_check_mode_check`; kinds `issue`,
+  `prompt`, `ci_fix`; non-seeded; no isolated lane). The required predicate is unchanged and
+  existing rows are not backfilled. Enrollment records the owner's frozen choice;
+  availability is a gate-time outcome.
+- **APPROVE carries no authority.** Every checker outcome presents the ordinary human gate.
+  The agent returns `gated_pass`, never an approval grant, and the server widens the existing
+  bound human-approval arms from required to required-or-gated, narrows the "any prior
+  approve" shortcut to neither mode, and refuses `SetRunAutopilotPlan` for a gated run. A
+  "passed" verdict binds to the candidate digest presented at the gate.
+- **Gated recovery.** A same-generation retry reuses the check row, child and deadline.
+  Custody loss on a pending check ends it (the gate opens interrupted or timed out, with no
+  new round and no renewed deadline); a decided REVISE may start a new round; an unpresented
+  APPROVE derives `interrupted`; a presented gate never re-runs discovery.
+- **Version matrix.** The capability `cross_check_gated_v1` gates the mode. The server records
+  `worker_unsupported` itself for a worker lacking it, since an old worker cannot report a new
+  outcome.
+- **Trigger and rollback boundary.** The trigger `enforce_gated_plan_approval` refuses
+  `awaiting_approval` to `running` on a gated row without a current bound approve input, so the
+  rule holds for that edge under any api binary. The `claimed` to `running` reclaim edge is not
+  guarded by the trigger; under an older api it is closed by the rollback drain (stopped api plus
+  a terminal drain), which is the admission barrier for that path. A Down guard (also in
+  `scripts/gated-cross-check-drain-check.sql`) refuses rollback while any gated run is
+  non-terminal; the operator drains first with the upgraded api stopped. The per-owner toggle
+  is not an admission barrier.
+- **D16 unchanged.** A human revision still triggers no fresh checker pass; earlier results
+  stay historical. Per-round lead responses are read from the next candidate's "Cross-check
+  dispositions" prose (8 KiB cap) as untrusted claims; no structured disposition store is
+  added and dispositions never gate approval.
+
+Not shipped: live k8s acceptance of the wait and a hosted rollback rehearsal (PRD #3708 M3).

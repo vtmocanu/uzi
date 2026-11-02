@@ -24,17 +24,27 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
-	ForgeOriginReservation *ForgeOriginReservation `json:"forge_origin_reservation,omitempty"`
+	// PublicationResume (issue #1324) is the active write-ahead publication intent, sent only to
+	// a publication_resume_v1 worker while an enrollment is active. Claim assembly is otherwise
+	// unchanged, including credentials.
+	PublicationResume      *PublicationResumePayload `json:"publication_resume,omitempty"`
+	ForgeOriginReservation *ForgeOriginReservation   `json:"forge_origin_reservation,omitempty"`
+	// ForgeAPIOriginReservation (issue #1324 D9) is the half-open API-origin reservation of this
+	// claim, sent only to a forge_api_success_v1 worker.
+	ForgeAPIOriginReservation *ForgeOriginReservation `json:"forge_api_origin_reservation,omitempty"`
 	// CheckpointWriteUnresolved is admission-time evidence for validated enrolled tasks;
 	// nil leaves recovery status unknown for legacy claims.
 	CheckpointWriteUnresolved *bool                        `json:"checkpoint_write_unresolved,omitempty"`
 	CheckpointCoordinates     *CheckpointCoordinates       `json:"checkpoint_coordinates,omitempty"`
 	SemanticPlanning          *apitypes.SemanticEnrollment `json:"semantic_planning,omitempty"`
-	MemoryEpisode             int64                        `json:"memory_episode"`
-	MemoryInterventionCount   int32                        `json:"memory_intervention_count"`
-	MemoryPolicy              *MemoryPolicy                `json:"memory_policy"`
-	CrossCheck                *ClaimPlanCrossCheck         `json:"cross_check,omitempty"`
-	RunID                     string                       `json:"run_id"`
+	// MemoryParkReference (issue #3639) names the settled memory-pressure park an owner Resume lifted
+	// for exactly this worker incarnation; nil (omitted) for every other claim.
+	MemoryParkReference     *MemoryParkReference `json:"memory_park_reference,omitempty"`
+	MemoryEpisode           int64                `json:"memory_episode"`
+	MemoryInterventionCount int32                `json:"memory_intervention_count"`
+	MemoryPolicy            *MemoryPolicy        `json:"memory_policy"`
+	CrossCheck              *ClaimPlanCrossCheck `json:"cross_check,omitempty"`
+	RunID                   string               `json:"run_id"`
 	// Kind is the run kind (one of the runkind values; PRD #6). The worker branches on it: an
 	// issue run works IssueIID's card; a ci_fix run diagnoses + fixes Pipeline.
 	Kind string `json:"kind"`
@@ -94,6 +104,11 @@ type ClaimPayload struct {
 	AutoApprove bool `json:"auto_approve"`
 	// PlanCrossCheckRequired is frozen on the run at creation and re-delivered on every claim.
 	PlanCrossCheckRequired bool `json:"plan_cross_check_required,omitempty"`
+	// PlanCrossCheckGated (PRD #3708) tells a worker that advertises cross_check_gated_v1 to run
+	// the checked plan loop before the human plan gate. It is set only when the run is gated AND
+	// the claiming worker advertises the capability, so an older worker (or an older api) never
+	// sees it and presents the ordinary gate.
+	PlanCrossCheckGated    bool `json:"plan_cross_check_gated,omitempty"`
 	CodeCrossCheckRequired bool `json:"code_cross_check_required,omitempty"`
 	// PlanCrossCheckCodexLead is an additive api-capability signal (PRD #2460 rework): this
 	// api accepts a Codex lead's checked-plan submission. It is deliberately redundant with

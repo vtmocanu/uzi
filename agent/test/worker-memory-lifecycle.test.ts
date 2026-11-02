@@ -379,6 +379,8 @@ test("memory-enabled worker advertises both protocols and joins cross-check and 
     await Promise.race([entered.promise, bounded]);
     assert.equal(slots, 1);
     assert.ok(advertised.includes("worker_memory_pressure_v1"));
+    // issue #3639: the settlement capability rides with the pressure capability.
+    assert.ok(advertised.includes("memory_park_settlement_v1"));
     assert.ok(advertised.includes("cross_check_lane_v1"));
     controller.abort();
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -618,5 +620,32 @@ test("PSI-less working-set hard crossing selects only the attributable command a
     assert.equal(f.memory.commands.hasConfirmedStop(sibling), false);
   } finally {
     await f.memory.stop(); await running;
+  }
+});
+
+test("memory_park_settlement_v1 is advertised only with the memory guard (issue #3639)", async () => {
+  const cfg = config({ enabled: false });
+  let advertised: string[] | undefined;
+  const registered = deferred();
+  const f = rig({
+    register: async (_name: string, _template: string, _max: number, _caps: string[], caps: string[]) => {
+      advertised = caps;
+      registered.resolve();
+      return { worker_id: workerId };
+    },
+  });
+  const controller = new AbortController();
+  const worker = build(cfg, f.client);
+  const done = worker.run(controller.signal);
+  try {
+    await registered.promise;
+    assert.ok(advertised, "the worker registered");
+    for (const capability of ["worker_memory_pressure_v1", "worker_memory_authority_claim_v1", "memory_park_settlement_v1"]) {
+      assert.equal(advertised.includes(capability), false, capability);
+    }
+  } finally {
+    controller.abort();
+    await done;
+    await f.memory.stop();
   }
 });

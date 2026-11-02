@@ -190,6 +190,7 @@ export function AdminBranding() {
   // the uploaded asset (cache-busted by logoRev) or the FactoryIcon when none is
   // uploaded — there is NO /brand-default.svg fallback for the app slot; `default`
   // is the FactoryIcon. A null src means "render the FactoryIcon".
+  // This mirrors non-demo chrome; the preview ignores demo mode and stays real.
   const appMarkSrc: string | null =
     appLogoMode === "preset"
       ? presetAssetForSlug(appLogoPreset)
@@ -514,7 +515,8 @@ export function AdminBranding() {
 // real rendering; this is the operator's in-app equivalent of the design mock. The
 // app mark is resolved upstream (appMarkSrc) exactly as AppShell.appMarkImgSrc does,
 // so the preview cannot diverge from the chrome: a non-null src renders an <img>,
-// null renders the FactoryIcon.
+// null renders the FactoryIcon. This mirrors non-demo chrome; the preview ignores
+// demo mode and stays real.
 function BrandingPreview({
   appLogoMode,
   appLogoKeepName,

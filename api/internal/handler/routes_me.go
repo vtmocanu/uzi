@@ -49,6 +49,11 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 			// making rename, rotate and set-default Bearer-reachable as
 			// collateral damage.
 			r.Patch("/anthropic_token/{id}/auto-eligible", h.PatchAnthropicTokenAutoEligible)
+			// The Codex pool toggle (issue #3719) is the same class of write on the same
+			// reasoning: it re-points SPEND among codex_auth aliases the caller already
+			// holds. Its own route, so the Bearer-reachable surface stays one flag on
+			// one kind; there is deliberately no openai_api_key counterpart.
+			r.Patch("/codex_auth/{id}/auto-eligible", h.PatchCodexAuthAutoEligible)
 		})
 		// Every other WRITE stays cookie-only (RequireAuth), DELIBERATELY (D8): creating,
 		// rotating and deleting credentials is the CLI's exclusion zone — a
@@ -215,6 +220,15 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// runs through Bearer-reachable routes can also turn the reserve off. Identity is the
 	// session user, never the body.
 	r.With(h.requireUser()).Put("/me/usage-reserve", h.SetUsageReserve)
+
+	// Current-user Codex account mode (issue #3719): "default" binds the default alias,
+	// "auto" picks among the aliases the user pooled. RequireUser, so a uzc_ CLI Bearer
+	// works (`uzi settings codex-mode`). The pool flags are the per-alias consent and the
+	// mode only chooses among consented aliases, matching the Bearer-reachable Anthropic
+	// pool toggle and `uzi worker set-token --auto`. The write takes no secret-mutation
+	// lock: it touches no alias row, and a create racing a flip simply sees one of the
+	// two modes, both valid. Identity is the session user, never the body.
+	r.With(h.requireUser()).Put("/me/codex-account-mode", h.SetCodexAccountMode)
 
 	// Current-user Claude rate-limit meters (PRD #53): the caller's own 5h/7d
 	// windows. Self-scoped; admins use /api/admin/rate-limits for everyone.

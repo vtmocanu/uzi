@@ -29,7 +29,33 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ## [Unreleased]
 
-## [0.86.0] - 2026-10-06
+## [0.86.1] - 2026-11-01
+
+### Added
+
+- **A run that cannot publish because the forge is unreachable now parks and resumes publication-only, with no model work ([#1324](https://github.com/vtmocanu/uzi/pull/1324), [#3746](https://github.com/vtmocanu/uzi/pull/3746)).**
+  A sustained transient failure at base refresh, push or merge request create parks a run whose publication intent is enrolled (an unenrolled run fails with `publication_forge_unreachable`) with `recovery_wait_phase=publication` and keeps its source, retrying until `RUN_PROVIDER_PARK_MAX_DURATION` and then holding for an owner Resume that queues one publication-only episode; `RUN_PUBLICATION_RESUME_ENABLED` stops new enrollment only, and before an API rollback enrolled queued runs and timed waits must be converted to NULL holds.
+
+- **Codex runs can pick among your pooled ChatGPT accounts when they are created ([#3719](https://github.com/vtmocanu/uzi/pull/3719), [#3744](https://github.com/vtmocanu/uzi/pull/3744)).**
+  Opt in with `uzi settings codex-mode auto` and `uzi token pool <label> --kind codex --on`; the choice is made once at creation and a run never switches account, and `uzi token pool <label>` now needs `--kind` when a label exists in both kinds.
+
+### Changed
+
+- **Demo mode hides instance branding ([#3757](https://github.com/vtmocanu/uzi/pull/3757)).**
+  Screenshots use the stock uzi identity, tab title and favicon base, with POWERED BY and optional license credits hidden; toggling demo mode off restores real branding without changing server settings.
+
+### Fixed
+
+- **Pod-epoch evidence can recover from annotation conflicts ([#3739](https://github.com/vtmocanu/uzi/pull/3739), [#3741](https://github.com/vtmocanu/uzi/pull/3741)).**
+  Bounded retries on later pod updates allow evidence recovery after resourceVersion conflicts while preserving successor binding and stopping on ambiguous failures.
+
+- **Codex cross-checks accept commentary before a final answer ([#3745](https://github.com/vtmocanu/uzi/pull/3745), [#3749](https://github.com/vtmocanu/uzi/pull/3749)).**
+  Plan and code checkers validate one completed final answer after a successful turn, preserving per-item integrity and shared output limits; the reproduced rejection mechanism does not establish the cause of every historical failure.
+
+- **Keep oversized GitHub Release notes publishable ([#3752](https://github.com/vtmocanu/uzi/pull/3752), [#3755](https://github.com/vtmocanu/uzi/pull/3755)).**
+  Long notes now retain complete bullets and security metadata within GitHub's limit, with a link to the complete changelog.
+
+## [0.86.0] - 2026-11-01
 
 ### Changed
 
@@ -6274,7 +6300,8 @@ Re-ships the PRD #87 browser prebake + `web-ux` builtin (v0.11.0, rolled back to
 
 - Worker-side redaction now covers the `agent` and `kind` message fields, not just the payload and `agent_instance`/`agent_label`, closing a gap where a secret placed in either field reached the API, the WebSocket frame, the browser, and `uzi run logs` unscrubbed (PRD #108).
 
-[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.86.0...HEAD
+[Unreleased]: https://github.com/vtmocanu/uzi/compare/v0.86.1...HEAD
+[0.86.1]: https://github.com/vtmocanu/uzi/compare/v0.86.0...v0.86.1
 [0.86.0]: https://github.com/vtmocanu/uzi/compare/v0.85.2...v0.86.0
 [0.85.2]: https://github.com/vtmocanu/uzi/compare/v0.85.1...v0.85.2
 [0.85.1]: https://github.com/vtmocanu/uzi/compare/v0.85.0...v0.85.1

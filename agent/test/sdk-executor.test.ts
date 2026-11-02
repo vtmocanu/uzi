@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { m3Persist } from "./m3-projection-fixture.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { m3Calls } from "./m3-recovery-fixture.js";
@@ -1589,6 +1590,175 @@ describe("SdkExecutor checked canonical approval", () => {
     // Cast exercises the runtime boundary, including malformed bundles.
     return { kind: "approve", approval: "cross_check", selection: { status: "absent" }, canonical: bundle } as PlanVerdict;
   }
+
+  for (const autoApprove of [false, true]) for (const [label, milestones] of [
+    ["nested", canonical.milestones], ["empty", []], ["unavailable", undefined],
+  ] as const) it(`a pre-approved ${autoApprove ? "required-check" : "human-gated"} resume repeats its persisted contract (${label})`, async () => {
+    const { queryFn, turns } = fakeTurns([
+      [assistantText("working"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ planApproved: true, sessionId: "surviving-plan-session", autoApprove,
+      approvedPlan: canonical.plan, frozenMilestones: milestones,
+      repeatApprovedPlan: true,
+    } as Partial<RunContext>);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(probe.gated.length, 0);
+    assert.equal(turns.length, 2, "both turns implement, without replanning");
+    assert.equal(turns[0]!.options.resume, "surviving-plan-session");
+    for (const turn of turns) {
+      const prompt = turn.promptText!;
+      assert.ok(prompt.includes(canonical.plan), "the persisted plan overrides the earlier draft in the surviving session");
+      const contract = prompt.match(/<approved_milestone_contract>\n([\s\S]*?)\n<\/approved_milestone_contract>/);
+      assert.ok(contract, "the full persisted milestone contract rides every implement attempt");
+      assert.deepEqual(JSON.parse(contract[1]!), milestones ?? null, "missing evidence is not inferred to be an empty contract");
+      assert.doesNotMatch(prompt, /Your plan was cross-checked/);
+    }
+  });
+
+  for (const autoApprove of [false, true]) it(`an enrolled ${autoApprove ? "required-check" : "human-gated"} open-gate reclaim repeats the approved stored contract`, async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({ planApproved: false, resumePhase: "awaiting_approval",
+      sessionId: "surviving-draft-session", approvedPlan: canonical.plan,
+      frozenMilestones: canonical.milestones, repeatApprovedPlan: true, autoApprove,
+    }, [{ kind: "approve", approval: "human", selection: { status: "absent" } }]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(probe.gated.length, 1, "the human gate remains mandatory");
+    assert.equal(probe.gated[0], canonical.plan, "the gate re-presents the stored candidate");
+    assert.equal(turns.length, 1, "no new planning turn or checker round");
+    assert.equal(turns[0]!.options.resume, "surviving-draft-session");
+    const prompt = turns[0]!.promptText!;
+    assert.ok(prompt.includes(canonical.plan));
+    const contract = prompt.match(/<approved_milestone_contract>\n([\s\S]*?)\n<\/approved_milestone_contract>/);
+    assert.ok(contract, "approval at the reclaimed gate repeats the full presented contract");
+    assert.deepEqual(JSON.parse(contract[1]!), canonical.milestones);
+    assert.match(prompt, /supersedes the local plan in this session/);
+    assert.doesNotMatch(prompt, /Your plan was cross-checked/);
+  });
+
+  it("an enrolled open-gate reclaim cannot implement after a human rejection", async () => {
+    const { queryFn, turns } = fakeTurns([]);
+    const probe = makeCtx({ planApproved: false, resumePhase: "awaiting_approval",
+      sessionId: "surviving-draft-session", approvedPlan: canonical.plan,
+      frozenMilestones: canonical.milestones, repeatApprovedPlan: true,
+    }, [{ kind: "reject", reason: "owner denies" }]);
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /owner denies/);
+    assert.equal(probe.gated.length, 1);
+    assert.equal(turns.length, 0, "enrollment never releases an implementation turn");
+  });
+
+  for (const mode of ["checked", "enrolled", "ordinary"] as const) for (const retry of [false, true])
+    it(`owner completion scope survives later SDK turns (${mode}, retry=${retry})`, async (t) => {
+      const checked = mode === "checked";
+      const plan = "ORIGINAL-REVOKED-SDK-PLAN";
+      const milestones = [{ id: "m2", title: "ORIGINAL-DEFERRED-SDK-MILESTONE" }];
+      const pause: Script = () => (async function* () { yield* []; throw new PauseNowSignal(); })();
+      const implementation: Script[] = [
+        [signalDone("scope-session", { owner_decision_requested: { reason: "Need scope decision" } }), resultSuccess("scope-session")],
+        retry ? [askUserTurn("Which current-scope check?"), resultSuccess("scope-session")]
+          : [assistantText("checking scope", "scope-session"), resultSuccess("scope-session")],
+        ...(retry ? [pause] : []),
+        [assistantText("reviewing changes", "scope-session"), resultSuccess("scope-session")],
+        [signalDone("scope-session"), resultSuccess("scope-session")],
+      ];
+      const { queryFn, turns } = fakeTurns(checked
+        ? [[submitPlanWithMilestones(milestones, plan, "scope-session"), resultSuccess("scope-session")], ...implementation]
+        : implementation);
+      let attempts = 0;
+      let answered = false;
+      let pulled = false;
+      let pauses = 0;
+      const included: number[] = [];
+      const probe = makeCtx({ kind: "issue", completionInterlock: true,
+        planApproved: !checked, sessionId: checked ? undefined : "scope-session",
+        approvedPlan: checked ? undefined : plan, frozenMilestones: milestones,
+        claimGeneration: 7, repeatApprovedPlan: mode === "enrolled", config: { max_iterations: 10 },
+        checkpoint: async () => {},
+        recordCompletionAttempt: async () => ({ unmet: ++attempts === 1 ? ["m2"] : [], attemptCount: attempts }),
+        askCompletionQuestion: async () => { answered = true; return { outcome: "continue", guidance: "OWNER-SCOPE-SDK" }; },
+        parkForPause: async () => { pauses++; return false; },
+        askUser: async () => ({ kind: "answer", answers: ["OWNER-SCOPE-CLARIFICATION"] }),
+        pullFollowUps: () => answered && !pulled ? (pulled = true, [{ id: 43, body: "NEW-OWNER-SDK-INPUT" }]) : [],
+        followUpIncluded: id => included.push(id),
+      }, { kind: "approve", approval: "cross_check", selection: { status: "absent" },
+        canonical: { plan, milestones, candidate_digest: "a".repeat(64), claimGeneration: 7 } });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, emptyTurnBackoffBaseMs: 0 }).run(probe.ctx);
+      assert.equal(attempts, 2);
+      assert.equal(pauses, retry ? 1 : 0);
+      const start = checked ? 1 : 0;
+      if (mode !== "ordinary") assert.match(turns[start]!.promptText!, /ORIGINAL-REVOKED-SDK-PLAN/, "control: the original approved contract was sent before the decision");
+      const later = turns.slice(start + 1);
+      assert.equal(later.length, retry ? 4 : 3, "reach the second ordinary turn after the owner's answer, including retry");
+      for (const turn of later) {
+        assert.doesNotMatch(turn.promptText!, /ORIGINAL-REVOKED-SDK-PLAN|approved_milestone_contract/);
+      }
+      assert.match(later[0]!.promptText!, /OWNER-SCOPE-SDK/);
+      assert.match(later.at(-1)!.promptText!, /ORIGINAL-DEFERRED-SDK-MILESTONE/, "the pre-existing live-status milestone note stays unchanged");
+      if (mode === "ordinary") t.diagnostic("ordinary-sdk-prompt-hashes " + retry + " " + JSON.stringify(later.map(turn =>
+        createHash("sha256").update(turn.promptText!.replace(/(follow_up|owner_guidance|issue_context|issue_comments)_[a-f0-9]+/g, "$1_NONCE")).digest("hex"))));
+      assert.ok(later.some(turn => turn.promptText!.includes("NEW-OWNER-SDK-INPUT")));
+      assert.deepEqual(included, [43], "ordinary owner input is still delivered once");
+      if (retry) assert.ok(later.some(turn => turn.promptText!.includes("OWNER-SCOPE-CLARIFICATION")), "clarification input survives alongside the current owner scope");
+    });
+
+  for (const kind of ["deferred", "accepted"] as const)
+    it(`a fresh SDK claim honors persisted owner ${kind} scope without restoring the original contract`, async () => {
+      const { queryFn, turns } = fakeTurns([
+        [assistantText("rechecking current scope"), resultSuccess()], [signalDone(), resultSuccess()],
+      ]);
+      const scope = kind === "deferred" ? { deferred: [{ milestone_id: "m2", title: "OLD-CLAIM-SDK-MILESTONE", reason: "owner deferred" }] }
+        : { accepted: [{ id: "m2.c1", milestone_id: "m2", text: "old criterion", reason: "owner accepted" }] };
+      const probe = makeCtx({ planApproved: true, sessionId: "reclaimed-session", kind: "issue",
+        approvedPlan: "OLD-CLAIM-SDK-PLAN", frozenMilestones: [{ id: "m2", title: "OLD-CLAIM-SDK-MILESTONE" }],
+        repeatApprovedPlan: true, completionInterlock: true, config: { completion_scope: scope },
+        recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 2 }), checkpoint: async () => {},
+      });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.equal(probe.gated.length, 0);
+      assert.equal(turns.length, 2);
+      for (const turn of turns) {
+        assert.doesNotMatch(turn.promptText!, /OLD-CLAIM-SDK-PLAN|approved_milestone_contract/);
+        assert.match(turn.promptText!, /OLD-CLAIM-SDK-MILESTONE/, "the existing milestone-status note is unchanged");
+      }
+    });
+
+  it("an ordinary approved session resume keeps its existing prompt", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({ planApproved: true, sessionId: "ordinary-session", approvedPlan: canonical.plan,
+      frozenMilestones: canonical.milestones });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(probe.gated.length, 0);
+    assert.doesNotMatch(turns[0]!.promptText!, /Canonical scrubbed plan|<approved_milestone_contract>/);
+  });
+
+  it("repeating a persisted contract never grants approval", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones([], "new draft"), resultSuccess()], [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ planApproved: false, sessionId: "unapproved-session", approvedPlan: canonical.plan,
+      repeatApprovedPlan: true } as Partial<RunContext>);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(probe.gated.length, 1, "the normal gate still owns approval");
+    assert.doesNotMatch(turns[1]!.promptText!, /Canonical scrubbed plan/);
+    assert.ok(turns[1]!.promptText!.includes("new draft"), "only the newly approved plan is repeated");
+  });
+
+  it("a human approval implements the presented canonical bundle without checker approval", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlanWithMilestones([{ id: "local", title: "LOCAL title" }], "LOCAL raw plan"), resultSuccess()],
+      [reportProgress([], ["server-id"]), signalDone(), resultSuccess()],
+    ]);
+    const human = { ...checked(), approval: "human" } as PlanVerdict;
+    const probe = makeCtx({ claimGeneration: 7, reportProgress: async () => {} } as Partial<RunContext>, [human]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    const prompt = turns[1]!.promptText!;
+    assert.ok(prompt.includes(canonical.plan), "implementation uses the presented plan despite the existing session");
+    const contract = prompt.match(/<approved_milestone_contract>\n([\s\S]*?)\n<\/approved_milestone_contract>/);
+    assert.ok(contract);
+    assert.deepEqual(JSON.parse(contract[1]!), canonical.milestones);
+    assert.doesNotMatch(prompt, /LOCAL|cross-checked/);
+    assert.deepEqual(transitionFrames(probe.emits), ["milestone server-id started — Server scrubbed title"]);
+  });
 
   it("M1 approval advice reaches actual SDK prompts completely; empty variants preserve bytes", async () => {
     const issueDescription = "Implement criteria A, B, C and D (fourth criterion).";

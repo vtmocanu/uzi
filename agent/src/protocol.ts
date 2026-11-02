@@ -674,7 +674,27 @@ export interface ActiveSnapshot {
    *  process restart with no journaled terminal outcome. Never an outcome and never a lease: the
    *  api re-queues such a run through the ordinary claim path. Never sent on a heartbeat/claim. */
   finalize_resume?: FinalizeResumeEntry[];
+  /** Issue #1324 D6: carried ONLY on the register snapshot — each run whose authenticated
+   *  publication-intent record (an acknowledged enrollment) survived a restart. The api requeues
+   *  such a run through the ordinary orphan path, keeping its intent. A run listed here is never
+   *  also listed in finalize_resume. Never an outcome and never a lease. */
+  publication_resume?: PublicationResumeEntry[];
 }
+
+/** Issue #1324: one publication-resume attempt attested on the register snapshot (api `PublicationResumeEntry`). */
+export interface PublicationResumeEntry {
+  run_id: string;
+  claim_generation: number;
+  enrollment_seq: number;
+  candidate_seq: number;
+}
+
+/** Issue #1324 M5: why a publication-only resume holds the run for its owner instead of publishing (api
+ *  `validatePublicationPark`; any other value is a 400). */
+export type PublicationHoldReason =
+  | "publication_model_required"
+  | "publication_source_unavailable"
+  | "publication_intent_mismatch";
 
 /** Issue #1742: one finalize-pending attempt attested on the register snapshot. */
 export interface FinalizeResumeEntry {
@@ -1484,6 +1504,20 @@ export interface ClaimMemoryState {
   memory_episode?: number;
   memory_intervention_count?: number;
   memory_policy?: MemoryPolicy | null;
+  /** issue #3639: the server's reference to the settled memory park it stored for this worker incarnation. Keyed by
+   *  the PARKED generation (`claim_generation` names the park, not the current claim); sent on every later claim
+   *  until a foreign claim or a newer park supersedes it. A claim carrying a malformed one has it removed by the
+   *  client decode. The runner compares it against its own park entry; it grants no authority by itself. */
+  memory_park_reference?: MemoryParkReference;
+}
+
+/** issue #3639: `settlement_sha256` is the lowercase hex sha256 of the exact bytes the worker posted. */
+export interface MemoryParkReference {
+  claim_generation: number;
+  memory_episode: number;
+  worker_id: string;
+  register_nonce: string;
+  settlement_sha256: string;
 }
 
 export interface ForgeOriginReservation {
@@ -1495,6 +1529,18 @@ export interface ForgeOriginReservation {
 export interface ClaimResponse extends ClaimMemoryState {
   /** Optional negotiated telemetry token; grants no execution or custody authority. */
   forge_origin_reservation?: ForgeOriginReservation;
+  /** Issue #1324 D9: the half-open API-origin reservation of this claim, sent only to a worker that
+   *  advertised forge_api_success_v1. Echoed on a successful direct forge API call; grants no authority. */
+  forge_api_origin_reservation?: ForgeOriginReservation;
+  /** Issue #1324: the active publication intent, sent only to a publication_resume_v1 worker while an
+   *  enrollment is active (api `PublicationResumePayload`). `intent` and `handoff` are opaque here; parse
+   *  them with parseClaimPublicationResume (publication-intent.ts), which throws a typed mismatch. */
+  publication_resume?: {
+    enrollment_seq: number;
+    candidate_seq: number;
+    intent: unknown;
+    handoff?: unknown;
+  };
   /** Server row only; no production enrollment writer in M2. */
   semantic_planning?: import("./semantic-plan.js").SemanticPlanning;
   /** Guarded prompt repair inputs; metadata is untrusted. */
@@ -1588,6 +1634,10 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  implementation. The M1 worker parks it for human review while the checker is unavailable.
    *  Omitted by older servers and on runs without the requirement. */
   plan_cross_check_required?: boolean;
+  /** PRD #3708: this human-gated run has its plan cross-checked BEFORE the ordinary human plan
+   *  gate; every checker outcome, APPROVE included, still opens that gate. The api sends it only
+   *  to a worker that advertises cross_check_gated_v1, so an older api or worker never sees it. */
+  plan_cross_check_gated?: boolean;
   /** Independent code-check consent snapshot. Absent on older APIs means disabled. */
   code_cross_check_required?: boolean;
   /** PRD #2460 rework: additive api-capability signal that this server accepts a Codex lead's
@@ -2924,6 +2974,26 @@ export interface StateRequest {
    * recovery_cause_codex_idle_stall_v1 and a positive, stampable generation. This
    * contract never downgrades after negotiation; both idle kinds carry progress. */
   recovery_cause?: string;
+  /** Issue #1324 D3/D8: with `recovery_cause: "forge_unreachable"`, the park is a PUBLICATION-phase park of
+   *  a run with an active publication intent. Sent only to an api that advertised publication_resume_v1
+   *  and always together with publication_surface, publication_step and a positive claim_generation. An
+   *  enrolled run's legacy untyped park is refused 409 `publication_enrolled`; this typed park for a run
+   *  with no active intent is refused 409 `publication_not_enrolled` (see StateAck.reason). */
+  recovery_phase?: "publication";
+  /** Issue #1324: which forge surface the transient outage hit (the api keys its origin cooldown on it). */
+  publication_surface?: "git" | "api";
+  /** Issue #1324: the publication step that met the outage. */
+  publication_step?: "floor_refresh" | "push" | "mr_create";
+  /** Issue #1324: optional 40-hex checkpoint tip a peer may claim the run from; the api records it only
+   *  when it is the run's current published checkpoint tip. */
+  handoff_checkpoint_tip?: string;
+  /** Issue #1324 M5: a worker-reported publication OWNER HOLD, a state report and never a failure. Sent as
+   *  `recovery_wait` + `recovery_cause: "forge_unreachable"` + `recovery_phase: "publication"` with a positive
+   *  claim_generation, and with publication_surface and publication_step ABSENT (they mark a forge outage; a
+   *  hold is not one). The api stamps it NULL (no automatic retry; an owner Resume queues one publication-only
+   *  episode), keeps custody and the active intent, and leaves the forge park count alone. Refused 409
+   *  `publication_not_enrolled` when no intent is active and 409 stale_claim on a stale generation. */
+  publication_hold_reason?: PublicationHoldReason;
   /** PRD #1733: with `recovery_cause: "provider_outage"` only (the api 400s it on any other report),
    *  the count of successful model turns completed since this flight started, so the api
    *  can tell a streak of unproductive outages from one that made progress in between. Gated on
@@ -3330,6 +3400,36 @@ export interface RecoveryCaptureStatusResponse {
   checksum?: string;
   reason?: string;
   expires_at?: string;
+  /** Capture-bound prerequisite pin facts (C1b), present only for a qualifying thin capture. */
+  prerequisite_closure?: RecoveryPrerequisiteClosureStatus;
+}
+
+/** Mirrors Go apitypes.RecoveryPrerequisiteClosureStatus. */
+export interface RecoveryPrerequisiteClosureStatus {
+  state: string;
+  reason?: string;
+  prerequisite_shas?: string[];
+  checksum?: string;
+}
+
+/** The closed wire vocabulary of RecoveryPrerequisiteClosureStatus (api/internal/recovery prerequisiteStatus). */
+const PREREQUISITE_CLOSURE_STATES = ["unsupported", "pending", "pinned", "refused", "lost"] as const;
+const PREREQUISITE_CLOSURE_REASONS = [
+  "closure_unsupported", "prerequisite_not_on_default", "prerequisite_ancestry_unknown",
+  "prerequisite_prepare_budget_exhausted", "pin_absence_unconfirmed", "pin_refused", "pin_unknown",
+  "pin_foreign", "archive_unavailable", "pin_lost",
+] as const;
+
+/** Strict decode of the optional closure object: unknown states, reasons, fields or shapes are rejected. */
+export function isRecoveryPrerequisiteClosureStatus(value: unknown): value is RecoveryPrerequisiteClosureStatus {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  if (Object.keys(v).some(k => !["state", "reason", "prerequisite_shas", "checksum"].includes(k))) return false;
+  return typeof v.state === "string" && (PREREQUISITE_CLOSURE_STATES as readonly string[]).includes(v.state) &&
+    (v.reason === undefined || v.reason === "" || (typeof v.reason === "string" && (PREREQUISITE_CLOSURE_REASONS as readonly string[]).includes(v.reason))) &&
+    (v.prerequisite_shas === undefined || (Array.isArray(v.prerequisite_shas) && v.prerequisite_shas.length <= 64 &&
+      v.prerequisite_shas.every(sha => typeof sha === "string" && /^[0-9a-f]{40}$/.test(sha)))) &&
+    (v.checksum === undefined || (typeof v.checksum === "string" && /^[0-9a-f]{64}$/.test(v.checksum)));
 }
 
 /** Atomic capture reconciliation never reserves or releases custody. */

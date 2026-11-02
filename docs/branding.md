@@ -11,6 +11,11 @@ uzi instance, at runtime, with no redeploy. It's its own tab, after
 *Instance*. Only an admin can change it, but the result is visible to
 **everyone** who loads the app, including a signed-out visitor.
 
+[Demo mode](demo-mode.md) temporarily shows the stock uzi identity and
+hides POWERED BY and the optional license credit on that device. Turning
+it off restores the real branding. The admin live preview stays real so
+you can keep editing; no server settings change.
+
 ## App mark
 
 The top-left mark — the icon and `uzi` / `uzinele întunecate` wordmark —
@@ -80,7 +85,8 @@ including full white-label — can turn it on, off, or replace it. When the
 flag is on, the credit renders on the sidebar footer row (alongside the
 build/version badge), on the signed-out footer, and in the Admin →
 Branding live preview, and collapsing the sidebar hides it the same as
-everything else in that row.
+everything else in that row. Demo mode hides it in the app chrome while
+the admin preview continues to show the enabled credit.
 
 ## Setting it up
 

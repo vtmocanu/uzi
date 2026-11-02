@@ -147,6 +147,7 @@ import type {
   UserSettings,
   UserSettingsPatch,
   Worker,
+  CodexAccountMode,
 } from "./apiTypes";
 export type * from "./apiTypes";
 export { DEFAULT_AUTOPILOT_LABEL, RATE_LIMIT_SOURCES } from "./apiTypes";
@@ -738,8 +739,10 @@ const realApi = {
 
   // PRD #1147 M3 Codex/OpenAI credential CRUD. Body shapes mirror Anthropic exactly
   // (create {token,label,default} → {secret}; patch {label?,default?,token?} → {secret};
-  // delete → empty). All cookie-only (D8), like the Anthropic writes. There is NO codex
-  // pool/auto-eligible route — an `auto` worker never spends a Codex credential.
+  // delete → empty). All cookie-only (D8), like the Anthropic writes. The Codex pool
+  // toggle is its own narrow route below (setCodexAliasAutoEligible, issue #3719); an
+  // `auto` WORKER still never spends a Codex credential — Codex auto-selection happens at
+  // run creation, under the user's codex_account_mode.
   //
   // Two kinds share one card and one default: `codex_auth` (a `claude`-style Codex
   // login, status "staging" → resolver → "linked"/"failed") and `openai_api_key`
@@ -762,6 +765,24 @@ const realApi = {
     ),
   deleteCodexAuthById: (id: string) =>
     request<null>("DELETE", `/me/secrets/codex_auth/${id}`),
+  // The Codex auto-selection pool toggle (issue #3719), setTokenAutoEligible's sibling:
+  // its own narrow route for the same reason (the PATCH above stays cookie-only). Only a
+  // codex_auth alias can be pooled; an openai_api_key id is a 404. Pooling a DISABLED
+  // alias is a 409. The response's secret OMITS codex_status, so a caller refetches the
+  // list rather than replacing its cached row with it.
+  setCodexAliasAutoEligible: (id: string, autoEligible: boolean) =>
+    request<{ secret: SecretMeta }>(
+      "PATCH",
+      `/me/secrets/codex_auth/${id}/auto-eligible`,
+      { auto_eligible: autoEligible },
+    ),
+  // How a new Codex run chooses its login (issue #3719): "default" always binds the default
+  // Codex credential; "auto" picks the pooled login with the most limit headroom at run
+  // creation. Read back through getMySettings().settings.codex_account_mode.
+  setCodexAccountMode: (mode: CodexAccountMode) =>
+    request<{ codex_account_mode: CodexAccountMode }>("PUT", "/me/codex-account-mode", {
+      codex_account_mode: mode,
+    }),
   createOpenAIApiKey: (token: string, label: string, isDefault: boolean) =>
     request<{ secret: SecretMeta }>("POST", "/me/secrets/openai_api_key", {
       token,

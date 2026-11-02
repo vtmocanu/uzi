@@ -509,7 +509,9 @@ the TUI render it everywhere the Claude meters already appear. See
 [adr/1209-codex-account-meters.md](adr/1209-codex-account-meters.md) for the
 durable design decisions and
 [docs/rate-limits.md](docs/rate-limits.md#codex-account-limits) for
-user-facing behavior.
+user-facing behavior. For users who opt in (`codex_account_mode = auto`), these
+readings also pick the Codex account at run creation only, never afterwards; see
+the [ADR-1106 amendment](adr/1106-codex-harness.md#amendment-codex-account-auto-selection-at-run-creation-3719-2026-10-31).
 
 A separate survivor path can retry an original non-rejection refresh error once
 when its durable receipt authorizes reuse. Admission consumes the retry under
@@ -710,9 +712,10 @@ permitted scratch relocation alone is not a validation bypass or proof of
 harmlessness. Complete automatic revisions include `Cross-check dispositions`
 for every immediately preceding delivered item, with addressed location/method
 or declined rationale and inspectable evidence. The checker considers supported
-declines; round 2+ missing/incomplete defect dispositions mean REVISE, never
-BLOCK solely for omission. Missing or declined prior coverage dispositions
-alone never justify REVISE or BLOCK; a supported decline cannot waive a
+declines, but receives no separate prior findings and cannot establish disposition
+completeness. Round 2+ missing/incomplete defect dispositions identifiable from
+the supplied input mean REVISE, never BLOCK solely for omission. Missing or
+declined prior coverage dispositions alone never justify REVISE or BLOCK; a supported decline cannot waive a
 mandatory defect requirement.
 Uninspectable instruction claims remain explicitly unverified and cannot alone
 establish an exception to inspectable requirements; precedence is unchanged.
@@ -816,6 +819,32 @@ direction is [PRD #2460](prds/done/2460-codex-lead-plan-cross-check.md) and the
 scope through [PRD #2150](prds/done/2150-plan-cross-check-auto-revise.md) and
 [ADR-2149's dated extension](adr/2149-cross-check.md#automatic-rounds-extension-2026-10-07-2150);
 local round/recovery proofs do not establish hosted authenticated model acceptance.
+
+**Checked before the human gate (PRD #3708).** A run that is not auto-approved
+snapshots a second mode at INSERT, `runs.plan_cross_check_gated` (owner consent,
+non-seeded, kinds `issue`, `prompt` and `ci_fix`, no isolated lane); it is
+mutually exclusive with the required mode (CHECK `runs_plan_cross_check_mode_check`,
+migrations 00394/00395). It reuses the checked-plan machinery (`cross_checks`
+rows, rounds, budget, deadlines, lane, wait banking), but every checker outcome,
+APPROVE included, presents the ordinary human gate: the agent's gated path
+returns `gated_pass`, never an approval grant. Approval authority stays with the
+bound human-approval arms of `SetRunRunning`, widened from required to required
+or gated; `SetRunAutopilotPlan` refuses a gated run; and the trigger
+`enforce_gated_plan_approval` refuses `awaiting_approval` to `running` without a
+current bound approve input; that edge holds under any api binary, while the
+`claimed` to `running` reclaim path under an older api is closed by the rollback
+drain, not the trigger. `SetRunAwaitingApproval`
+binds a "passed" verdict to the candidate digest and derives `interrupted` on a
+mismatch. The capability `cross_check_gated_v1` gates the mode: a gated claim
+carries `plan_cross_check_gated` only for a worker advertising it, and the
+server itself records `worker_unsupported` for one that does not (an old worker
+cannot report a new outcome). Rounds are served to clients with the lead's
+response taken from the next candidate's "Cross-check dispositions" section
+(`ExtractCrossCheckDispositions`, 8 KiB), never inferred as resolved. Rollback
+needs the drain guard in `scripts/gated-cross-check-drain-check.sql`, repeated in
+both migrations' Down. See [Cross-check](docs/cross-check.md#checked-before-your-review),
+[PRD #3708](prds/3708-gated-plan-cross-check.md) and the
+[ADR-2149 amendment](adr/2149-cross-check.md#amendment-2026-10-31-3708).
 
 Plan checker pins live in `user_cross_check_pins`, keyed by owner, stage and
 family. Model and effort resolve independently from a claim-time statement
@@ -1211,7 +1240,14 @@ chain in the diagram above, with no intervening `running`.
   claims until due, then serializes one ordinary recovery trial. Expiry is
   unverified; safe early affinity escape requires complete guarded source
   disposition evidence. These placement hints grant no execution or custody
-  authority. See
+  authority. A forge outage met later, while publishing finished work (#1324),
+  parks the run in the same status with `recovery_wait_phase=publication`
+  instead: the agent saves an HMAC-sealed write-ahead intent and enrolls it
+  with the API (`run_publication_resume`) before any remote finalize step, the
+  park keeps custody and source, and the next claim publishes only, with no
+  model work; see
+  [docs/run-recovery-wait.md](docs/run-recovery-wait.md#forge-unreachable-while-publishing).
+  See
   [adr/1197-transient-recovery-park.md](adr/1197-transient-recovery-park.md),
   [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md) (the
   2026-09-14 PRD #1349 amendment),

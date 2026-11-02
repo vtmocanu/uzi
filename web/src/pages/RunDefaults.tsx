@@ -368,7 +368,7 @@ export function RunDefaults() {
       // PRD #1429 M4a, D3: harness-aware credential facts, computed on ALL secrets
       // (not the anthropic_token-only slice below, which the judge picker uses).
       setClaudeUsable(hasAnthropicToken(rows));
-      setCodexUsable(isCodexUsable(rows));
+      setCodexUsable(isCodexUsable(rows, settings.codex_account_mode));
       const dh = selectionFromHarness(settings.default_harness);
       setDefaultHarness(dh);
       setSavedHarness(dh);
@@ -667,7 +667,8 @@ export function RunDefaults() {
           <SectionTitle>Cross-check</SectionTitle>
           <p id="plan-cross-check-help" className="mt-2 text-sm text-muted">
             A second opinion from the other model family. For new auto-approved runs,
-            the plan must pass before implementation.
+            the plan must pass before implementation. With auto-approve off, the check
+            also runs before your review; you still approve the plan.
           </p>
         </div>
         {crossCheckError && <Alert message={crossCheckError} />}

@@ -238,6 +238,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		IssueInputReason:          textPtrValue(r.IssueInputReason.Valid, r.IssueInputReason.String),
 		CodeCrossCheckRequired:    r.CodeCrossCheckRequired,
 		PlanCrossCheckRequired:    r.PlanCrossCheckRequired,
+		PlanCrossCheckGated:       r.PlanCrossCheckGated,
 		PlanCrossCheckGateReason:  textPtrValue(r.PlanCrossCheckGateReason.Valid, r.PlanCrossCheckGateReason.String),
 		PlanCrossCheckDiffRefusal: textPtrValue(r.PlanCrossCheckDiffRefusal.Valid && r.PlanCrossCheckGateReason.String == "planning_diff_refused", r.PlanCrossCheckDiffRefusal.String),
 		TriggerSource:             r.TriggerSource,
@@ -318,6 +319,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		// is the forge-only lifetime counter; ForgeParkMax is the effective cap passed in
 		// (0 = unlimited). All four surface for every run (SC5), independent of each other.
 		RecoveryWaitCause:      textPtrValue(r.RecoveryWaitCause.Valid, r.RecoveryWaitCause.String),
+		RecoveryWaitPhase:      textPtrValue(r.RecoveryWaitPhase.Valid, r.RecoveryWaitPhase.String),
 		RecoveryRetryNotBefore: timePtr(r.RecoveryRetryNotBefore.Valid, r.RecoveryRetryNotBefore.Time),
 		ForgeParkCount:         int(r.ForgeParkCount),
 		ForgeParkMax:           forgeParkMax,
@@ -387,6 +389,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		dto.CodexSecretID = &s
 	}
 	dto.CodexSecretLabel = textPtrValue(r.CodexSecretLabel.Valid, r.CodexSecretLabel.String)
+	dto.CodexSelectReason = textPtrValue(r.CodexSelectReason.Valid, r.CodexSelectReason.String)
 	// PRD #111 M5. Mapped independently of BOTH fields above, for the same reason and
 	// one more: the reason is present on every M1-era run (all three lanes write one)
 	// while the headroom is present only on an auto pick, so a run legitimately

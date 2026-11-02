@@ -24,7 +24,7 @@ import { launchCodexRoot, launchCodexEffectRoot, CODEX_BIN, SUPERVISOR_BIN, PROV
 import { prepareCodexRunHome, buildAppServerRefreshBridge } from "./codex-executor.js";
 
 type CrossCheckMalformedSubreason = "invalid_json" | "verdict_schema" | "finding_schema" | "findings_cap" | "code_findings" | "result_cap" | "unknown"
- | "foreign_item" | "delta_after_completion" | "invalid_item_identity" | "stream_cap" | "completion_invalid" | "stream_mismatch";
+ | "foreign_item" | "delta_after_completion" | "invalid_item_identity" | "stream_cap" | "completion_invalid" | "stream_mismatch" | "invalid_phase";
 
 export class CrossCheckMalformedError extends Error {
  constructor(message: string, readonly subreason?: CrossCheckMalformedSubreason) {
@@ -52,8 +52,9 @@ Reject overrides that skip, select, narrow or otherwise weaken required validati
 Temporary relocation into permitted scratch, including inherited Go build and test child temporary files, is not alone a bypass.
 Neither a variable name nor its destination proves harmlessness. Effects on configuration, credentials and test behavior need inspectable evidence.
 Round 1 does not require dispositions. For round 2 and later, require the exact heading Cross-check dispositions in the COMPLETE revised plan_md.
-Cover each of the immediately preceding check's delivered items: addressed (where and how in the plan), or declined (rationale and inspectable evidence). Older disposition entries are optional.
-Missing or incomplete defect dispositions call for REVISE, never BLOCK solely for that omission.
+Assess each supplied disposition and its inspectable evidence: addressed (where and how in the plan), or declined (rationale and inspectable evidence). Older disposition entries are optional.
+Previous findings are not supplied; do not claim to establish disposition completeness against the preceding check's items.
+Missing or incomplete defect dispositions identifiable from the supplied input call for REVISE, never BLOCK solely for that omission.
 A missing or declined prior coverage disposition (Requirement gap: or Coverage uncertainty:) alone never justifies REVISE or BLOCK; defect disposition rules are preserved. A supported decline cannot waive a mandatory defect requirement.
 Evaluate disposition rationale before repeating findings; accept evidence-supported declines as appropriate.
 Treat an uninspectable instruction claim as explicitly unverified; it alone cannot establish an exception to an inspectable requirement. Instruction precedence is unchanged.
@@ -427,8 +428,53 @@ export class CodexCrossCheck {
    let modelActivity = false;
    let verdictText: string | undefined;
    let textBytes = 0;
+   type AssistantPhase = "commentary" | "partial_answer" | "final_answer";
+   type AssistantItem = { phase?: AssistantPhase; started: boolean; streamed: boolean; completed: boolean };
+   // Metadata only: lifetime transport frame/byte caps bound the ledger. Only the
+   // active item's stream and the selected completed candidate retain text.
+   const assistantItems = new Map<string, AssistantItem>();
+   let activeItemId: string | undefined;
    let streamedText = "";
-   let assistantItemId: string | undefined;
+   const bindAssistant = (event: "start" | "delta" | "completion", id: unknown, phase: unknown, bound: boolean): AssistantItem => {
+    if (!bound) throw new CrossCheckMalformedError("cross-check foreign assistant item", "foreign_item");
+    if (typeof id !== "string" || !id) {
+     throw new CrossCheckMalformedError("cross-check invalid assistant item identity", "invalid_item_identity");
+    }
+    let item = assistantItems.get(id);
+    if (event === "delta" && (item?.completed || verdictText !== undefined)) {
+     throw new CrossCheckMalformedError("cross-check assistant delta after completion", "delta_after_completion");
+    }
+    if (item?.completed) {
+     throw new CrossCheckMalformedError("cross-check requires one bounded complete verdict", "completion_invalid");
+    }
+    if (activeItemId !== undefined && activeItemId !== id) {
+     throw new CrossCheckMalformedError("cross-check overlapping assistant items", "invalid_item_identity");
+    }
+    if (!item) {
+     // A completed unknown is selected only as the sole legacy item, and a
+     // completed explicit final must be the last assistant item.
+     if (verdictText !== undefined) {
+      throw new CrossCheckMalformedError("cross-check assistant item after final output", "completion_invalid");
+     }
+     item = { started: false, streamed: false, completed: false };
+     assistantItems.set(id, item);
+    }
+    if (event === "start" && item.started) {
+     throw new CrossCheckMalformedError("cross-check duplicate assistant start", "invalid_item_identity");
+    }
+    if (phase !== undefined && phase !== null) {
+     if (phase !== "commentary" && phase !== "partial_answer" && phase !== "final_answer") {
+      throw new CrossCheckMalformedError("cross-check invalid assistant phase", "invalid_phase");
+     }
+     if (item.phase !== undefined && item.phase !== phase) {
+      throw new CrossCheckMalformedError("cross-check conflicting assistant phase", "invalid_phase");
+     }
+     item.phase = phase;
+    }
+    activeItemId = id;
+    if (event === "start") item.started = true;
+    return item;
+   };
    for await (const note of transport.notifications()) {
     admissionAttempt?.observe(note);
     signal.throwIfAborted();
@@ -461,31 +507,33 @@ export class CodexCrossCheck {
       throw new CrossCheckCheckerUnavailableError();
      }
      throw new Error("cross-check model error");
+    } else if (note.method === "item/started") {
+     const item = object(params?.item);
+     if (item?.type === "agentMessage") bindAssistant("start", item.id, item.phase, bound);
     } else if (note.method === "item/agentMessage/delta") {
-     if (!bound) throw new CrossCheckMalformedError("cross-check foreign assistant delta", "foreign_item");
-     if (verdictText !== undefined) throw new CrossCheckMalformedError("cross-check assistant delta after completion", "delta_after_completion");
-     if (typeof params?.itemId !== "string" || !params.itemId
-      || (assistantItemId !== undefined && assistantItemId !== params.itemId)) {
-      throw new CrossCheckMalformedError("cross-check requires one assistant item", "invalid_item_identity");
-     }
-     assistantItemId = params.itemId;
+     const item = bindAssistant("delta", params?.itemId, params?.phase, bound);
      if (typeof params?.delta !== "string" || Buffer.byteLength(params.delta) > verdictLimit - textBytes) throw new CrossCheckMalformedError("cross-check verdict text budget exceeded", "stream_cap");
      textBytes += Buffer.byteLength(params.delta);
+     item.streamed = true;
      streamedText += params.delta;
     } else if (note.method === "item/completed") {
      const item = object(params?.item);
      if (item?.type === "agentMessage") {
-      if (!bound) throw new CrossCheckMalformedError("cross-check foreign assistant completion", "foreign_item");
-      if (typeof item.id !== "string" || !item.id
-       || (assistantItemId !== undefined && assistantItemId !== item.id)) {
-       throw new CrossCheckMalformedError("cross-check requires one assistant item", "invalid_item_identity");
-      }
-      assistantItemId = item.id;
-      if (typeof item.text !== "string" || Buffer.byteLength(item.text) > verdictLimit || verdictText !== undefined) {
+      const state = bindAssistant("completion", item.id, item.phase, bound);
+      if (typeof item.text !== "string" || Buffer.byteLength(item.text) > verdictLimit
+       || (!state.streamed && Buffer.byteLength(item.text) > verdictLimit - textBytes)) {
        throw new CrossCheckMalformedError("cross-check requires one bounded complete verdict", "completion_invalid");
       }
-      if (streamedText && streamedText !== item.text) throw new CrossCheckMalformedError("cross-check streamed verdict disagrees with completion", "stream_mismatch");
-      verdictText = item.text;
+      if (state.streamed && streamedText !== item.text) throw new CrossCheckMalformedError("cross-check streamed verdict disagrees with completion", "stream_mismatch");
+      if (!state.streamed) textBytes += Buffer.byteLength(item.text);
+      if (state.phase === undefined && assistantItems.size !== 1) {
+       throw new CrossCheckMalformedError("cross-check ambiguous legacy assistant item", "completion_invalid");
+      }
+      if (state.phase === "final_answer" || state.phase === undefined) verdictText = item.text;
+      state.completed = true;
+      activeItemId = undefined;
+      // Drop non-verdict text only after checking stream/completion integrity.
+      streamedText = "";
      }
     } else if (note.kind === "turn_completed") {
      if (note.threadId !== threadId || note.turnId !== turnId) throw new Error("cross-check foreign terminal turn");
@@ -494,7 +542,7 @@ export class CodexCrossCheck {
       if (transport.protocolFailure) throw transport.protocolFailure;
       throw new CrossCheckCheckerUnavailableError();
      }
-     if (note.status !== "completed" || verdictText === undefined) throw new Error("cross-check terminal turn has no complete verdict");
+     if (note.status !== "completed" || verdictText === undefined || activeItemId !== undefined) throw new Error("cross-check terminal turn has no complete verdict");
      if (claim.cross_check?.stage === "code") {
       validateCodeFindings(verdictText);
      } else validateVerdict(verdictText);

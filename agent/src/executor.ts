@@ -329,7 +329,7 @@ export interface RunContext {
    *
    *  Set by the RUNNER, which is the only layer that can tell the eligible cases apart:
    *  the server said plan_approved, AND EITHER a session id survived issue #105's
-   *  transcript check (PRD #35 resume — the plan lives in that session) OR the run is
+   *  transcript check (PRD #35 session-preserving resume) OR the run is
    *  `seeded` (PRD #209 row 2 — the user authored the plan at create time and there is no
    *  session, by construction). Without this a park-and-resume re-plans, re-parks the run
    *  at awaiting_approval in front of a human who already approved, and can fail outright
@@ -387,10 +387,17 @@ export interface RunContext {
    *  reviewed (R1), and it supersedes the reseedNote (whose "uncommitted changes did not
    *  survive" wording is false on this path). Absent/false ⇒ no note. */
   wipRecovered?: boolean;
-  /** The already-approved plan text to seed the implement loop with (PRD #35). Only
-   *  meaningful with `planApproved`; the executor refuses to skip the gate without
-   *  it, because an empty plan would enter implement with no instructions. */
+  /** Persisted plan text from the claim. An approved resume implements it; an unapproved
+   *  awaiting_approval resume re-presents it at the gate. The text grants no approval,
+   *  and an empty value never qualifies for the pre-approved skip. */
   approvedPlan?: string;
+  /** Cross-check-enrolled runs can persist an approved plan different from the surviving
+   *  planning session's draft. Repeat the final approved plan and full milestone contract on
+   *  every implementation attempt, including approval at a reclaimed open gate. Enrollment
+   *  is not proof of a checker pass and grants no approval; the normal gate and pre-approved
+   *  eligibility checks remain authoritative.
+   *  Absent for ordinary and seeded runs. */
+  repeatApprovedPlan?: boolean;
   /** The run's persisted subagent selection, replayed on the claim (PRD #35).
    *
    *  Used on the pre-approved resume path, where there is no approve_plan verdict to

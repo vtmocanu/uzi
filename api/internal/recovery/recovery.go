@@ -53,6 +53,14 @@ var (
 	// must not write another response — it only logs. The bytes already sent are all
 	// authenticated; the download is incomplete (the client detects the short read).
 	ErrStreamAborted = errors.New("recovery: download aborted after streaming began")
+	// ErrPrerequisitePinMissing: the closure's pin ref was listed absent (or is already marked
+	// absent); the thin capture is not released.
+	ErrPrerequisitePinMissing = errors.New("recovery: prerequisite closure pin is missing")
+	// ErrPrerequisitePinForeign: the pin ref was listed at a tip other than the pinned one.
+	ErrPrerequisitePinForeign = errors.New("recovery: prerequisite closure pin is foreign")
+	// ErrPrerequisitePinUnavailable: the pin could not be observed or the request was rate
+	// limited or superseded; nothing was decided and the worker retries.
+	ErrPrerequisitePinUnavailable = errors.New("recovery: prerequisite closure pin is unavailable")
 )
 
 // Store is the SUBSET of the M1 recovery.sql query layer this service calls outside a
@@ -141,6 +149,11 @@ type Service struct {
 	custodySettled     func(runID uuid.UUID)
 	prerequisiteForges []string
 	prerequisiteKick   func(userID, captureID uuid.UUID)
+	// Closure-backed FINAL (final_closure.go): the request-owned forge port, its per-worker
+	// admission limiter, and a test-only stage hook between the unlocked phases.
+	prereqFinal      PrerequisiteFinalPort
+	prereqFinalAllow func(workerID uuid.UUID) bool
+	finalClosureHook func(stage string)
 	// Test-only failure seam after ready and S0, before the upload commits.
 	prerequisitePreCommit func(pgx.Tx) error
 	// Held-publication FINAL (issue #2545, held_final.go). heldEnabled is UZI_HELD_PUBLICATION
