@@ -86,4 +86,6 @@ type UserSettingsDTO struct {
 	// default alias, "auto" picks among the aliases the user pooled. Read-only here:
 	// PUT /api/me/codex-account-mode owns the write.
 	CodexAccountMode string `json:"codex_account_mode"`
+	// Read-only here; PUT /api/me/harness-overflow owns the write.
+	HarnessOverflowEnabled bool `json:"harness_overflow_enabled"`
 }

@@ -128,6 +128,11 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 		// and still carries the raw enum (machine-facing, D1).
 		{"HEALTH", displayHealth(r.Health)},
 	}
+	for _, line := range harnessDecisionLines(r.HarnessDecision) {
+		// Keep this key within the existing table width so the unattributed
+		// milestone/NOW region retains its byte-for-byte baseline.
+		rows = append(rows, []string{"HARNESS_PICK", "at creation: " + line})
+	}
 	rows = append(rows, leadConfigRows(r)...)
 	if len(r.AutoApproveBlockedReasons) > 0 {
 		rows = append(rows, []string{"AUTO_APPROVE_BLOCKED", strings.Join(r.AutoApproveBlockedReasons, ", ")})

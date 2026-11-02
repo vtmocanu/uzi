@@ -179,8 +179,10 @@ const codexAccountModeAuto = "auto"
 // resolvedHarness is the full result of resolveRunHarness: the chosen harness and, when
 // that harness is Codex, the selected Codex credential. Codex is nil for a Claude run.
 type resolvedHarness struct {
-	Harness Harness
-	Codex   *codexCredentialChoice
+	Harness        Harness
+	Codex          *codexCredentialChoice
+	CreationPolicy *store.GetHarnessCreationPolicyRow
+	Decision       *harnessCreationDecision
 }
 
 // harnessResolverStore is the narrow C1-frozen read surface the store-backed resolver
@@ -597,8 +599,21 @@ var errCodexCreateRequiresTx = errors.New("codex run creation requires an atomic
 // commit atomically with the run, so with no transaction there is no safe insert — it never
 // falls back to a non-atomic Codex insert. A Claude resolution with a nil txBeginner keeps the
 // existing cheap non-tx path (no freeze is needed).
-func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explicit *Harness, insert func(q *store.Queries, resolved resolvedHarness) (store.Run, error)) (store.Run, resolvedHarness, error) {
+func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explicit *Harness, insert func(q *store.Queries, resolved resolvedHarness) (store.Run, error), origins ...harnessCreationOrigin) (store.Run, resolvedHarness, error) {
+	var origin harnessCreationOrigin
+	if len(origins) > 0 {
+		origin = origins[0]
+	}
 	if s.txBeginner == nil {
+		if q, ok := s.q.(*store.Queries); ok && origin.Kind == "issue" {
+			policy, e := q.GetHarnessCreationPolicy(ctx, userID)
+			if e != nil {
+				return store.Run{}, resolvedHarness{}, e
+			}
+			if policy.HarnessOverflowEnabled && origin.eligible(policy) {
+				return store.Run{}, resolvedHarness{}, errHarnessOverflowRequiresTx
+			}
+		}
 		// No transaction available. Resolve via the ambient queries to learn the harness:
 		// Codex fails closed (it needs the atomic freeze); Claude keeps the cheap path.
 		res, err := s.resolveRunHarness(ctx, userID, explicit)
@@ -634,6 +649,32 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		return store.Run{}, resolvedHarness{}, err
 	}
 
+	policy, err := qtx.GetHarnessCreationPolicy(ctx, userID)
+	if err != nil {
+		return store.Run{}, resolvedHarness{}, err
+	}
+	overflowEligible := policy.HarnessOverflowEnabled && origin.eligible(policy)
+	if overflowEligible {
+		if s.codexSelectHook != nil {
+			s.codexSelectHook(ctx)
+		}
+		if err = store.LockSecretMutationShared(ctx, tx, userID); err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
+		if s.codexSelectLockedHook != nil {
+			s.codexSelectLockedHook(ctx)
+		}
+		// Re-resolve after the mutation lock, including default-account promotions.
+		res, err = s.resolveRunHarnessQ(ctx, userID, explicit, qtx)
+		if err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
+	}
+	res, overflowPick, err := s.evaluateCreationOverflow(ctx, qtx, userID, res, policy, origin)
+	if err != nil {
+		return store.Run{}, resolvedHarness{}, err
+	}
+
 	// Issue #3719: a pool choice picks its alias HERE, under the user's shared secret-mutation
 	// lock and BEFORE the run INSERT, so no run row is held while the lock is taken (the lock
 	// order migrate.go's LockSecretMutation documents). The shared lock fences exactly what
@@ -643,7 +684,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	// turned unusable.
 	var pick codexPoolPick
 	pooled := res.Harness == HarnessCodex && res.Codex != nil && res.Codex.Select == codexChoicePool
-	if pooled {
+	if pooled && overflowPick == nil {
 		if s.codexSelectHook != nil {
 			s.codexSelectHook(ctx)
 		}
@@ -662,9 +703,51 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		res.Codex = &choice
 	}
 
+	if overflowPick != nil {
+		pick = *overflowPick
+	}
+
 	run, err := insert(qtx, res)
 	if err != nil {
 		return store.Run{}, resolvedHarness{}, err
+	}
+
+	if overflowPick != nil {
+		d := res.Decision
+		if s.codexSelectBeforeFenceHook != nil {
+			s.codexSelectBeforeFenceHook(ctx, pick.AliasID)
+		}
+		if pick.Reason == codexselect.Reason(codexChoiceDefault) || pick.Reason == codexselect.Reason(codexChoicePoolEmpty) {
+			row, e := qtx.LockCodexPoolAliasForSelection(ctx, store.LockCodexPoolAliasForSelectionParams{ID: pick.AliasID, UserID: userID})
+			if e != nil {
+				return store.Run{}, resolvedHarness{}, e
+			}
+			if row.Kind != store.KindCodexAuth || !row.Enabled || !row.Status.Valid || row.Status.String != codexStatusLinked ||
+				!row.ProviderAccountID.Valid || uuid.UUID(row.ProviderAccountID.Bytes) != pick.AccountID ||
+				((d.Preferred != HarnessCodex || pick.Candidate.Structural) && !codexPoolAccountUsable(row.CoordState, row.ReauthRequired)) {
+				return store.Run{}, resolvedHarness{}, errHarnessOverflowFence
+			}
+		} else {
+			pick, err = s.fenceCodexPoolAlias(ctx, qtx, userID, pick)
+			if err != nil {
+				return store.Run{}, resolvedHarness{}, err
+			}
+		}
+		ce := codexOverflowEvidence(pick.Candidate, pick.Reason, d.Preferred == HarnessClaude)
+		if d.Preferred == HarnessCodex {
+			d.PreferredEvidence = ce
+		} else {
+			d.OtherEvidence = ce
+		}
+		d.Reason = overflowReason(true, true, d.PreferredEvidence, d.OtherEvidence)
+		if d.chosen() != res.Harness {
+			return store.Run{}, resolvedHarness{}, errHarnessOverflowFence
+		}
+		if res.Harness == HarnessCodex {
+			choice := *res.Codex
+			choice.SecretID = pick.AliasID
+			res.Codex = &choice
+		}
 	}
 
 	if res.Harness == HarnessCodex {
@@ -673,7 +756,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		if res.Codex == nil {
 			return store.Run{}, resolvedHarness{}, errNoUsableCredential
 		}
-		if pooled {
+		if pooled && overflowPick == nil {
 			if s.codexSelectBeforeFenceHook != nil {
 				s.codexSelectBeforeFenceHook(ctx, pick.AliasID)
 			}
@@ -702,7 +785,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			return store.Run{}, resolvedHarness{}, ferr
 		}
 		reason := codexselect.Reason(res.Codex.Select)
-		if pooled {
+		if pooled || overflowPick != nil {
 			if cerr := s.checkFrozenCodexAccount(ctx, qtx, userID, run.ID, pick); cerr != nil {
 				return store.Run{}, resolvedHarness{}, cerr
 			}
@@ -718,6 +801,9 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		run.CodexSelectReason = pgtype.Text{String: string(reason), Valid: true}
 	}
 
+	if err := s.persistHarnessDecision(ctx, qtx, &run, res.Decision); err != nil {
+		return store.Run{}, resolvedHarness{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.Run{}, resolvedHarness{}, err
 	}

@@ -8,6 +8,7 @@ afterEach(cleanup);
 
 function run(over: Partial<Run> = {}): Run {
   return {
+    harness_decision: null,
     id: "r1",
     repo_id: "repo-1",
     kind: "ci_fix",

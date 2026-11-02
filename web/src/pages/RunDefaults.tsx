@@ -13,7 +13,7 @@ import { UsageReserveSetting } from "../components/UsageReserveSetting";
 import type { UserSettings, BindMode, ModelSettingCell } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
-import { Alert, Badge, Button, Card, Field, SectionTitle, Select, Skeleton } from "../components/ui";
+import { Alert, Badge, Button, Card, Field, SectionTitle, Select, Skeleton, Toggle } from "../components/ui";
 import { DEFAULT_CODEX_MODEL, ModelSelect } from "../components/ModelSelect";
 import { EffortSelect } from "../components/EffortSelect";
 import { HarnessPicker } from "../components/HarnessPicker";
@@ -294,6 +294,23 @@ export function RunDefaults() {
   // One busy flag for the whole card: the three fields save together in one request,
   // so there is one in-flight state, not three.
   const [defaultsBusy, setDefaultsBusy] = useState(false);
+  const [overflowEnabled, setOverflowEnabled] = useState(false);
+  const [overflowBusy, setOverflowBusy] = useState(false);
+  const [overflowError, setOverflowError] = useState("");
+  const toggleOverflow = async (enabled: boolean) => {
+    setOverflowBusy(true);
+    setOverflowError("");
+    try {
+      const result = await api.setHarnessOverflow(enabled);
+      setOverflowEnabled(result.harness_overflow_enabled);
+      // Merge this endpoint's field only: other settings may save concurrently.
+      setCommittedSettings(current => current && ({ ...current, harness_overflow_enabled: result.harness_overflow_enabled }));
+    } catch (err) {
+      setOverflowError(errorMessage(err, "Failed to save harness overflow"));
+    } finally {
+      setOverflowBusy(false);
+    }
+  };
   // D2: the harness SELECTOR appears only when the user has a usable credential for
   // BOTH harnesses; a single-harness user keeps a one-lane form with no selector.
   const [claudeUsable, setClaudeUsable] = useState(false);
@@ -340,6 +357,7 @@ export function RunDefaults() {
         api.getMySettings(),
       ]);
       setCommittedSettings(settings);
+      setOverflowEnabled(settings.harness_overflow_enabled);
       // PRD #1551: seed each lane from its own explicit field, never from the
       // legacy default_model projection — the two lanes are the source of truth now.
       const claude = settings.default_claude_model ?? "";
@@ -1153,6 +1171,29 @@ export function RunDefaults() {
                 </p>
               </div>
             )}
+
+            <div className="space-y-1.5">
+              <label className="flex items-center gap-3 text-sm text-fg">
+                <Toggle
+                  checked={overflowEnabled}
+                  disabled={overflowBusy}
+                  focusableWhenDisabled
+                  onChange={enabled => void toggleOverflow(enabled)}
+                  label="Overflow to the other harness when my default is near its limits"
+                  aria-describedby="harness-overflow-scope"
+                />
+                Overflow to the other harness when my default is near its limits
+              </label>
+              <p id="harness-overflow-scope" className="text-xs text-faint">
+                Saves automatically. Applies only to new issue runs started manually, by autopilot
+                or by a schedule, when both harnesses are usable. Explicit harnesses, run model pins,
+                Anthropic credential overrides and enabled plan or code cross-checks exclude overflow.
+                Existing runs and resumes never switch. Chat and other run kinds do not use overflow.
+                Stored usage and capacity holds are compared at creation time; unknown comparison
+                scores keep the preferred harness.
+              </p>
+              {overflowError && <Alert message={overflowError} />}
+            </div>
 
             <div className={bothLanes ? "grid gap-4 sm:grid-cols-2" : "space-y-4"}>
               {showClaudeLane && (

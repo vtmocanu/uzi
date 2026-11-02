@@ -375,6 +375,54 @@ only saved Codex credential is an API key — sees no accounts at all here: no
 row, no placeholder meter, on any surface. That's the empty-set shape, not a
 status of its own.
 
+## How overflow compares headroom
+
+[Harness overflow](./worker-model.md#overflow-to-the-other-harness) is a separate,
+per-user opt-in, off by default. For an eligible new implicit issue run,
+uzi compares the preferred harness with the other usable harness at creation.
+Overflow requires a preferred score **< 20%**, a receiver score **>= 30%**,
+and a receiver advantage **>= 15 percentage points**. Unknown comparison
+evidence keeps the preferred harness.
+
+- **Codex:** evidence comes from the selected account, rechecked at the
+  credential fence, using its main `codex` bucket. It is not the best
+  hypothetical account outside that selection. A Codex receiver must be
+  structurally usable, unheld, and selected as `auto` or `best_of_pool`,
+  or be a healthy `default` account. `pool_empty`, `pool_stale` and
+  `pool_exhausted` do not qualify as receivers; their receiver comparison
+  stays unknown even if a measurement is present. An API key has no
+  subscription headroom comparison.
+- **Claude:** evidence includes every enabled, non-rejected Anthropic token,
+  including tokens outside the auto-selection pool. Each fresh token's
+  headroom is 100 minus its fullest reported 5-hour/7-day window; the 7-day
+  reading is required, while an absent 5-hour window is fine. The preferred
+  Claude comparison takes the maximum token score; a Claude receiver takes
+  the minimum. Any unheld token with unknown usage makes the comparison
+  unknown. Any held token blocks Claude as a receiver.
+- **Capacity holds:** a held preferred credential contributes a comparison
+  score of zero while its measured headroom is retained separately, possibly
+  unknown. Claude's preferred comparison still takes the maximum: a held
+  token cannot hide a healthy token, and the preferred held flag means the
+  complete token set is held. A capacity hold is a non-OK weekly-reserve
+  verdict while a threshold is set, account admission wait/cooldown, or Codex
+  `LimitReached` / not `Allowed`. Claude has no additional limit hold beyond
+  the reserve. Without a reserve threshold, a stale or missing reading remains
+  unknown. An unknown unheld token keeps that aggregate
+  unknown even beside a held token. For a receiver, a hold prevents overflow.
+
+The Claude fold is deliberately conservative: an unrelated stale token can
+make usage unknown, and a low-headroom or held token outside the pool can
+block Claude as a destination. This is a percentage heuristic across
+different account capacities, not a prediction of runnable work or a promise
+that the destination can finish the issue.
+
+The chosen harness and explanation commit together once. Overflow does not
+switch an existing run or resume. The owner sees comparison scores, measured
+headroom and holds as a stored creation snapshot in web, CLI and TUI;
+legacy/unavailable evidence is **not recorded**. Usage meters, forecasts,
+usage-independent run readers and claim/resume admission keep their existing
+behavior; inspecting a run does not recompute its decision from live usage.
+
 ## Weekly usage reserve
 
 If you share one subscription between uzi and your own work, you can keep part

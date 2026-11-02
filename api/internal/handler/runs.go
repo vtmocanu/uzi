@@ -108,6 +108,7 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			RepoPath:   row.RepoPath.String, // "" for a repo-less job run (PRD #1908)
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
 		}
+		item.HarnessDecision = harnessDecisionForViewer(row.Run, user)
 		item.ForgeType = row.ForgeType.String // "" for a repo-less job run; per-run MR/PR noun (PRD #65 D2)
 		// PRD #411: the joined forge issue web URL, nil for issue-less/uncached runs.
 		item.IssueWebURL = textPtrValue(row.IssueWebUrl.Valid, row.IssueWebUrl.String)
@@ -182,6 +183,7 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
 			OwnerEmail: &email,
 		}
+		// Admin overview carries no private harness comparison, even for an admin-owned run.
 		item.ForgeType = row.ForgeType.String // "" for a repo-less job run; per-run MR/PR noun (PRD #65 D2)
 		// PRD #411: the joined forge issue web URL, nil for issue-less/uncached runs.
 		item.IssueWebURL = textPtrValue(row.IssueWebUrl.Valid, row.IssueWebUrl.String)

@@ -82,7 +82,7 @@ var runDTOKeys = []string{
 	"id", "repo_id", "forge_type", "kind", "issue_iid", "continued_issue_iid", "issue_title", "issue_description",
 	// PRD #1429 M1 (D2): the run's actual stored harness (closed enum claude|codex), NOT NULL
 	// DEFAULT 'claude' so always on the wire ("claude" for every current run).
-	"harness",
+	"harness", "harness_decision",
 	// PRD #764 M2: server-computed PRD presence for the runs view, always on the wire
 	// (bool, false for issue-less run kinds whose description carries no prds link).
 	"has_prd_link",
@@ -1191,7 +1191,7 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		// PRD #3522: the weekly usage reserve (null threshold ⇒ off).
 		"weekly_reserve_pct", "weekly_reserve_pause_running",
 		// Issue #3719: the user's Codex account mode (default|auto).
-		"codex_account_mode")
+		"codex_account_mode", "harness_overflow_enabled")
 }
 
 func TestModelSettingCellDTOTags(t *testing.T) {

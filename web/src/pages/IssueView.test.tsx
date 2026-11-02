@@ -211,6 +211,7 @@ beforeEach(() => {
   // PRD #1429 M4a review Fix 1: the viewer's default_harness, no preference by default.
   mockApi.getMySettings.mockResolvedValue({
     settings: {
+      harness_overflow_enabled: false,
       default_harness: null,
       default_model: null,
       default_effort: null,
@@ -669,6 +670,7 @@ describe("IssueView Start gate (PRD #764)", () => {
     });
     mockApi.getMySettings.mockResolvedValue({
       settings: {
+        harness_overflow_enabled: false,
         default_harness: "codex",
         default_model: null,
         default_effort: null,

@@ -387,6 +387,7 @@ export const runsApi = {
     }
     const now = new Date().toISOString();
     const run: Run = {
+      harness_decision: null,
       id: nextRunId(),
       repo_id: repoId,
       forge_type: "gitlab",
@@ -478,6 +479,7 @@ export const runsApi = {
     if (active) throw new ApiError(409, "an active CI-fix run already exists for this ref");
     const now = new Date().toISOString();
     const run: Run = {
+      harness_decision: null,
       id: nextRunId(),
       repo_id: repoId,
       forge_type: "gitlab",

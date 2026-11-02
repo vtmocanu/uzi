@@ -266,6 +266,10 @@ type FakeClient struct {
 	LastCodexMode         string
 	CodexModeCalls        int
 
+	// SetHarnessOverflowEnabled captures the write even when Err refuses it.
+	LastHarnessOverflowEnabled bool
+	HarnessOverflowCalls       int
+
 	// SetRunPriority capture (PRD #320 M5): the run id the command targeted and the
 	// expedite bool it sent (true = `uzi run expedite`, false = `--clear`). PriorityRun
 	// is the canned success reply. SetRunPriorityErr wins over the blanket Err so a test

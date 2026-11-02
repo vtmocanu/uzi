@@ -46,6 +46,9 @@ func (m tuiModel) renderLaneRail() string {
 		// blocks is counted BEFORE appendRailBlock, so the boundary is unmoved (D6/R3).
 		appendRailBlock(&sb, m.renderProgress())
 		appendRailBlock(&sb, m.renderMilestones())
+		if d.run.HarnessDecision != nil {
+			appendRailBlock(&sb, m.railHarnessDecision(strings.Count(sb.String(), "\n")+1))
+		}
 		if sp := m.renderSpend(strings.Count(sb.String(), "\n") + 1); sp != "" {
 			appendRailBlock(&sb, sp)
 		}
@@ -57,6 +60,10 @@ func (m tuiModel) renderLaneRail() string {
 		}
 		if cl := m.railCredentialLine(strings.Count(sb.String(), "\n") + 1); cl != "" {
 			appendRailBlock(&sb, cl)
+		}
+		// Legacy absence is best-effort below existing account and credential rows.
+		if d.run.HarnessDecision == nil {
+			appendRailBlock(&sb, m.railHarnessDecision(strings.Count(sb.String(), "\n")+1))
 		}
 		return sb.String()
 	}
@@ -77,6 +84,9 @@ func (m tuiModel) renderLaneRail() string {
 	// only collapses the previously double-drawn blank separator to one row.
 	appendRailBlock(&sb, m.renderProgress())
 	appendRailBlock(&sb, m.renderMilestones())
+	if d.run.HarnessDecision != nil {
+		appendRailBlock(&sb, m.railHarnessDecision(strings.Count(sb.String(), "\n")+1))
+	}
 	if sp := m.renderSpend(strings.Count(sb.String(), "\n") + 1); sp != "" {
 		appendRailBlock(&sb, sp)
 	}
@@ -88,6 +98,9 @@ func (m tuiModel) renderLaneRail() string {
 	}
 	if cl := m.railCredentialLine(strings.Count(sb.String(), "\n") + 1); cl != "" {
 		appendRailBlock(&sb, cl)
+	}
+	if d.run.HarnessDecision == nil {
+		appendRailBlock(&sb, m.railHarnessDecision(strings.Count(sb.String(), "\n")+1))
 	}
 	return sb.String()
 }
@@ -265,7 +278,7 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 		accountFloorRows++ // ACCOUNTS header
 	}
 	codexRows, hasCodex := m.railCodexFloorRows()
-	if block == "" && !spend && accountFloorRows == 0 && !hasCodex && m.railWorkerLine() == "" && m.railWaitingLineAt(now) == "" {
+	if block == "" && !spend && accountFloorRows == 0 && !hasCodex && d.run.HarnessDecision == nil && m.railWorkerLine() == "" && m.railWaitingLineAt(now) == "" {
 		return false // empty required set: nothing below the roster to protect (D2/D5)
 	}
 	vp := m.transcriptViewport()
@@ -276,6 +289,14 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 	sb.WriteString(m.expandedRoster(now))
 	appendRailBlock(&sb, progress)
 	appendRailBlock(&sb, block)
+	// Recorded creation evidence precedes live meters and consumes the same budget.
+	if d.run.HarnessDecision != nil {
+		decisionRows := 1 + len(harnessDecisionLines(d.run.HarnessDecision))
+		if decisionRows > vp-(strings.Count(sb.String(), "\n")+1)-1 {
+			return true
+		}
+		appendRailBlock(&sb, m.railHarnessDecision(strings.Count(sb.String(), "\n")+1))
+	}
 	if spend {
 		// renderSpend drops its 4 lines whole unless they + the 1-row separator fit under usedRows.
 		usedRows := strings.Count(sb.String(), "\n") + 1

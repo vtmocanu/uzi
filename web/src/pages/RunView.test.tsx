@@ -161,6 +161,7 @@ function agent(name: string): RepoAgent {
 
 function run(over: Partial<Run>): Run {
   return {
+    harness_decision: null,
     id: "r1",
     repo_id: "repo1",
     forge_type: "gitlab",
@@ -7956,4 +7957,21 @@ it.each([
     expect(container.textContent).toContain(reason);
     expect(container.querySelector("[title]")!.getAttribute("title")).toBe("waiting: provider reported overload; account admission eligible after 2026-10-27T12:01:37Z");
   } finally { now.mockRestore(); }
+});
+
+
+describe("RunView stored harness decision placement", () => {
+  it("shows creation evidence for queued runs without a credential label", () => {
+    viewerVault(true);
+    mockUseRunStream.mockReturnValue({
+      run: run({ status: "queued", harness: "codex", anthropic_secret_label: null, codex_secret_label: null,
+        harness_decision: { preferred: "claude", chosen: "codex", reason: "overflow",
+          preferred_score: 0, other_score: 60, preferred_measured: null, other_measured: 60,
+          preferred_held: true, other_held: false } }),
+      messages: [], connected: true, error: "", submit: vi.fn(), refreshRun: vi.fn(), inputs: [], canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+    expect(screen.getByRole("region", { name: "Harness decision at creation time" }).textContent).toContain("preferred claude, chosen codex. Reason: overflow");
+  });
 });
