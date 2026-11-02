@@ -685,7 +685,8 @@ export function RunDefaults() {
           <SectionTitle>Cross-check</SectionTitle>
           <p id="plan-cross-check-help" className="mt-2 text-sm text-muted">
             A second opinion from the other model family. For new auto-approved runs,
-            the plan must pass before implementation.
+            the plan must pass before implementation. With auto-approve off, the check
+            also runs before your review; you still approve the plan.
           </p>
         </div>
         {crossCheckError && <Alert message={crossCheckError} />}
@@ -986,7 +987,7 @@ export function RunDefaults() {
       </Card>
 
       {/* Per-user run-summary model (PRD #362 M2). Each run generates short
-          plain-English summaries on the run owner's own token; leave this on Inherit
+          plain-English summaries on the run owner's own token; leave this on Default
           to use the instance summary model the admin picked, or pin one here to
           override it for YOUR runs only. Same picker + validation as the judge and
           worker models, so a bad model blocks Save rather than failing on the next run. */}
@@ -1003,11 +1004,12 @@ export function RunDefaults() {
 
         <div className="space-y-3">
           <Field label="Summary model" htmlFor="summary-model">
-            <ModelSelect id="summary-model" value={summaryModel} onChange={setSummaryModel} />
+            <ModelSelect id="summary-model" value={summaryModel} onChange={setSummaryModel} defaultLabel="Default · instance default" />
           </Field>
           <p className="text-xs text-faint">
-            The Claude model your run summaries are generated on. Leave it on <em>Inherit</em> to use the
-            instance default (haiku unless your admin changed it); pin another alias to trade cost for depth.
+            The Claude model your run summaries are generated on. <em>Default</em> uses the instance
+            setting; pin another alias to trade cost for depth. This setting applies to Claude runs
+            only (Codex summaries use a fixed model).
           </p>
           {summaryModelWarning && <Alert message={summaryModelWarning} tone="warning" />}
           <Button
@@ -1159,12 +1161,13 @@ export function RunDefaults() {
                     value={defaultHarness}
                     onChange={setDefaultHarness}
                     disabled={defaultsBusy}
+                    inheritLabel="Default · automatic"
                   />
                 </Field>
                 <p className="text-xs text-faint">
                   Used when a run or schedule doesn't choose a harness explicitly. Leave it
-                  on <em>Use my default</em> to let uzi resolve it automatically (your only
-                  usable harness, or Claude when both are usable).
+                  on <em>Default · automatic</em> to let uzi choose your only usable
+                  harness, or Claude when both are usable.
                 </p>
               </div>
             )}
@@ -1212,6 +1215,7 @@ export function RunDefaults() {
                       value={claudeModel}
                       onChange={setClaudeModel}
                       harness="claude"
+                      defaultLabel="Default · lead template"
                       customAriaLabel="Custom Claude model ID"
                     />
                   </Field>
@@ -1220,7 +1224,7 @@ export function RunDefaults() {
                     : claudeWarning && <Alert message={claudeWarning} tone="warning" />}
                   <p className="text-xs text-faint">
                     Curated Claude aliases plus a custom model ID. Leave on{" "}
-                    <em>Inherit</em> to use the lead template's model (opus by default);
+                    <em>Default</em> to use the lead template's model;
                     an unrecognized custom ID only fails on the first run.
                   </p>
                 </div>
@@ -1246,12 +1250,13 @@ export function RunDefaults() {
                       onChange={setCodexModel}
                       harness="codex"
                       allowCustom
+                      defaultLabel={`Default · ${DEFAULT_CODEX_MODEL} (built-in)`}
                       customAriaLabel="Custom Codex model ID"
                     />
                   </Field>
                   {codexWarning && <Alert message={codexWarning} tone="warning" />}
                   <p className="text-xs text-faint">
-                    Curated Codex models plus a custom model ID. Leave on <em>Inherit</em>{" "}
+                    Curated Codex models plus a custom model ID. Leave on <em>Default</em>{" "}
                     to use the Codex default (currently{" "}
                     <code className="rounded bg-raised px-1 py-0.5 text-fg">{DEFAULT_CODEX_MODEL}</code>
                     ); an unrecognized custom ID only fails on the first run.
@@ -1275,15 +1280,15 @@ export function RunDefaults() {
       </Card>
 
       {/* Per-user default reasoning effort (PRD #617 M5). A CLOSED dropdown — the SDK
-          reasoning-effort levels plus Inherit — with no custom mode and no warning
+          reasoning-effort levels plus a Default option — with no custom mode and no warning
           surface, because the enum is closed and the control can only emit a valid
-          level or "" (inherit). Leave it on Inherit to use the uzi default (medium). */}
+          level or "" (default). Leave it on Default to use the built-in uzi default (medium). */}
       <Card className="space-y-5">
         <div>
           <SectionTitle>Reasoning effort</SectionTitle>
           <p className="mt-2 text-sm text-muted">
             Choose reasoning effort independently for Claude and Codex runs. Leave it on{" "}
-            <em>Inherit</em> to use the uzi default (<code className="rounded bg-raised px-1 py-0.5 text-fg">medium</code>).
+            <em>Default</em> to use the built-in uzi default (<code className="rounded bg-raised px-1 py-0.5 text-fg">medium</code>).
             Higher levels reason more deeply and cost more. Claude's SDK can downgrade a level
             its model does not support; Codex receives the selected level directly. It applies to your
             own runs only; other users are unaffected.
@@ -1298,7 +1303,7 @@ export function RunDefaults() {
         ) : (
           <div className="space-y-3">
             <Field label="Claude effort" htmlFor="worker-effort">
-              <EffortSelect id="worker-effort" value={defaultEffort} onChange={setDefaultEffort} runtimeLabel="Runtime default · value not reported" />
+              <EffortSelect id="worker-effort" value={defaultEffort} onChange={setDefaultEffort} defaultLabel="Default · medium (built-in)" runtimeLabel="Runtime default · value not reported" />
             </Field>
             <Button type="button" disabled={effortBusy || !effortDirty} onClick={saveEffort}>
               Save Claude effort
@@ -1306,7 +1311,7 @@ export function RunDefaults() {
             {showCodexLane && (
               <>
                 <Field label="Codex effort" htmlFor="codex-effort">
-                  <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} runtimeLabel="Runtime default · Codex decides" />
+                  <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} defaultLabel="Default · medium (built-in)" runtimeLabel="Runtime default · Codex decides" />
                 </Field>
                 <Button type="button" disabled={codexEffortBusy || !codexEffortDirty} onClick={saveCodexEffort}>
                   Save Codex effort

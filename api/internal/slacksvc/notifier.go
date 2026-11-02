@@ -23,6 +23,9 @@ type NotifierStore interface {
 	PruneNotificationsForUser(ctx context.Context, arg store.PruneNotificationsForUserParams) (int64, error)
 	GetSlackRunContext(ctx context.Context, runID uuid.UUID) (store.GetSlackRunContextRow, error)
 	GetRunByID(ctx context.Context, runID uuid.UUID) (store.Run, error)
+	// GetLatestPlanCrossCheckSummary backs the one-line gated plan cross-check outcome
+	// on the gate card (PRD #3708). No row = not checked.
+	GetLatestPlanCrossCheckSummary(ctx context.Context, arg store.GetLatestPlanCrossCheckSummaryParams) (store.GetLatestPlanCrossCheckSummaryRow, error)
 	// GetActivePublicationResume reads the run's active publication intent (issue #1324): the
 	// notifier takes a publication park's hold reason from it. No row (pgx.ErrNoRows) = none.
 	GetActivePublicationResume(ctx context.Context, runID uuid.UUID) (store.RunPublicationResume, error)

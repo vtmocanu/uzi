@@ -202,6 +202,12 @@ export function isLeadTemplateName(name: string): boolean {
   return /^(lead|orchestrator)$/i.test(name);
 }
 
+// templateModelDefaultLabel names what an unset template model resolves to: the lead
+// falls through to the SDK/account default, any other template to the lead's model.
+export function templateModelDefaultLabel(name: string): string {
+  return isLeadTemplateName(name) ? "Default · SDK/account default (built-in)" : "Default · lead's model";
+}
+
 // looseSecretWarning returns a warning string if the text looks like it might
 // carry an Anthropic credential, or "" otherwise. This is deliberately looser
 // than the server guardrail (which rejects only a full token): it nudges on

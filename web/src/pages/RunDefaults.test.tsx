@@ -480,6 +480,19 @@ describe("Run defaults — judge model per harness (PRD #3245)", () => {
     expect(codexEffect?.textContent).toBe("In effect: gpt-6-sol \u00b7 your choice");
   });
 
+  it("harness help says Default · automatic (not 'Use my default') and summary help is Claude-only (#3255)", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(judgeSettings());
+    renderPage();
+    await screen.findByLabelText("Claude judge model");
+    const harnessHelp = screen.getByText(/to let uzi choose your only usable/).textContent ?? "";
+    expect(harnessHelp).toContain("Default · automatic");
+    expect(harnessHelp).not.toContain("Use my default");
+    const harnessOptions = Array.from((screen.getByLabelText("Default harness") as HTMLSelectElement).options).map((o) => o.text);
+    expect(harnessOptions.some((t) => t.includes("Use my default"))).toBe(false);
+    expect(screen.getByText(/This setting applies to Claude runs/).textContent).toContain("Codex summaries use a fixed model");
+  });
+
   it("saves only the dirty lane, and adopts the response's In-effect cell", async () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
     mockApi.getMySettings.mockResolvedValue(judgeSettings());
@@ -1409,6 +1422,32 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     fireEvent.click(saveButton());
     await screen.findByText(/Defaults saved/);
     expect(mockApi.putMySettings).toHaveBeenNthCalledWith(2, patch);
+  });
+
+  it("Default options name their actual source and never echo a saved pin (#3255)", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    const base = settings();
+    mockApi.getMySettings.mockResolvedValue({
+      settings: {
+        ...base.settings,
+        default_claude_model: "sonnet",
+        cross_check_pins: [
+          { stage: "plan", harness: "claude", model: null, effort: null, worker_default_model: "sonnet", resolved_model: "sonnet",
+            resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: false },
+        ],
+      },
+    });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    const optionTexts = (el: HTMLElement) => Array.from((el as HTMLSelectElement).options).map((o) => o.text);
+    const claude = await screen.findByLabelText("Claude model");
+    expect(optionTexts(claude)[0]).toBe("Default · lead template");
+    expect(optionTexts(claude).join("|")).not.toMatch(/Default[^|]*sonnet/);
+    expect(optionTexts(screen.getByLabelText("Codex model"))[0]).toBe("Default · gpt-6.1-sol (built-in)");
+    expect(optionTexts(screen.getByLabelText("Summary model"))[0]).toBe("Default · instance default");
+    expect(optionTexts(screen.getByLabelText("Claude effort"))[0]).toBe("Default · medium (built-in)");
+    expect(optionTexts(screen.getByLabelText("Codex effort"))[0]).toBe("Default · medium (built-in)");
+    expect(optionTexts(screen.getByLabelText("Default harness"))[0]).toBe("Default · automatic");
   });
 
   it("both usable: shows the harness selector, both lanes, and the badge on the effective (Claude) lane", async () => {

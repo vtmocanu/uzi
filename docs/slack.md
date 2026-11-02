@@ -189,9 +189,10 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   - **One reply answers the whole card.** When the agent batches several
     questions into one message, cover them in a single reply; the agent reads
     it in full. It may re-ask anything you left unaddressed.
-  - **Nobody answers ⇒ the run fails** once the answer deadline passes (24
-    hours by default, `QUESTION_TIMEOUT_SECONDS`). The timer is held by the
-    worker, so if that worker dies and the run is picked up again the clock
+  - **Nobody answers ⇒ the run fails** once its parked-time answer
+    budget is spent (24 hours by default, `QUESTION_TIMEOUT_SECONDS`, counted only
+    while the run waits on a question). The budget is held by the
+    worker, so if that worker dies and the run is picked up again it
     restarts. With no other fresh executor execution, worker-death retries
     contribute `QUESTION_TIMEOUT_SECONDS × (RUN_MAX_REQUEUES + 1)` and
     `QUESTION_MAX × (RUN_MAX_REQUEUES + 1)` (96h and 20 questions on defaults).

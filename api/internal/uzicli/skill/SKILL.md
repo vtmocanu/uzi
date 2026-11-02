@@ -1127,7 +1127,7 @@ nothing a manual start cannot.
   `--auto-approve`, `--wait-on-limit`, `--mr-rework` (set whether fired runs' MR review
   comments are auto-reworked; `--mr-rework=false` to force off), `--model <alias|id>`
   (change the run model in
-  place; an empty string clears it back to the Worker-model default; valid on every
+  place; an empty string clears it back to your worker model for the schedule's harness; valid on every
   target and origin), `--apply-model-to-agents` (toggle the subagent model override),
   `--token <label>|auto|default|inherit` (PRD #1247, change the credential override
   fired runs carry; `--token inherit` clears it), `--harness claude|codex` (PRD #1429,

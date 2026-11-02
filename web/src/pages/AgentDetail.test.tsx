@@ -103,6 +103,19 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("AgentDetail read-only model label (#3255)", () => {
+  it("shows the honest Default label for a null model to a non-admin, never 'inherit'", async () => {
+    mockUseAuth.mockReturnValue({ user: { ...ADMIN, id: "u-other", is_admin: false } } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({ template: row() });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+
+    renderPage();
+
+    expect(await screen.findByText("Default · lead's model")).toBeTruthy();
+    expect(screen.queryByText(/^inherit$/i)).toBeNull();
+  });
+});
+
 describe("AgentDetail builtin drift signal (issue #201 M4a)", () => {
   it("badges a drifted builtin and shows a shipped-vs-stored diff", async () => {
     mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);

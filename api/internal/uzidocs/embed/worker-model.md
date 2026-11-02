@@ -23,6 +23,14 @@ Both settings live together in one **Settings → Run defaults** card:
   credential yet, the card still shows the Claude lane so you can
   preconfigure it before connecting one.
 
+Each picker's empty option is a **Default · …** label naming where the value
+comes from: the Claude model picker reads `Default · lead template` (the
+`lead` template's model) and the Codex model picker reads
+`Default · gpt-6.1-sol (built-in)`. The harness picker's empty option reads
+`Default · automatic`: uzi picks your only usable harness, or Claude when both
+are usable. Schedules and the start-run form still say **Use my default** for
+the harness.
+
 Switching the default harness never clears either model. Each lane is its
 own retained preference, so alternating between Claude and Codex keeps both
 choices intact. The lane matching your effective default harness carries a
@@ -144,8 +152,11 @@ stay on your normal model.
 
 Set it in the schedule's create/edit form, in the **Model (optional)**
 control, or with `uzi schedule create --model <alias|id>`. Leaving it on
-Inherit uses your worker model for the schedule's harness. The schedule field accepts a single token of at most 100
-characters; blank means inherit. The Codex schedule picker remains curated;
+**Default** uses your worker model for the schedule's harness; the label
+names it, for example `Default · your Claude worker model`, `Default · your
+Codex worker model` or `Default · your worker model` when the harness is not
+pinned. The schedule field accepts a single token of at most 100
+characters; blank means Default. The Codex schedule picker remains curated;
 the custom Codex worker-root escape hatch does not extend to schedule pins.
 The frozen model is readable with `uzi run get <id> --field model` (or in
 `uzi run get <id> --json`); to see the model a run actually used, see [See
@@ -222,7 +233,7 @@ Where to see it:
   surfaced in that run's messages like any other agent error.
 - **Validation.** A model must be a single token: trimmed, no interior
   spaces or control characters, at most 100 characters. Blank means
-  inherit.
+  Default (the picker's empty option).
 - **Yours alone.** These settings only change runs you own; they never
   affect other users or the shared `lead` template.
 - **Cost status stays honest.** Codex uses uzi's pinned Standard price table
