@@ -197,6 +197,25 @@ func TestCreatedIssuesQueryAndRouterLiveDB(t *testing.T) {
 			t.Fatalf("list %s: %d %s", listPath, rec.Code, rec.Body.String())
 		}
 	}
+	// Authorization of the run alone must not expose proposals through a foreign connection.
+	for _, tc := range []struct {
+		name string
+		id   uuid.UUID
+		jwt  string
+	}{
+		{"owner foreign connection", wrongConnection, ownerJWT},
+		{"admin foreign connection", wrongConnection, adminJWT},
+		{"foreign run owned repository", wrongRunOwner, foreignJWT},
+		{"admin foreign run owned repository", wrongRunOwner, adminJWT},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := db.calls
+			rec := cookieReq(t, router, http.MethodGet, "/api/runs/"+tc.id.String(), tc.jwt, "")
+			if rec.Code != 200 || db.calls-before != 1 || strings.Contains(rec.Body.String(), "\"created_issues\"") {
+				t.Fatalf("cross-owner decoration: status=%d queries=%d body=%s", rec.Code, db.calls-before, rec.Body.String())
+			}
+		})
+	}
 	db.fail = true
 	before := db.calls
 	rec := cookieReq(t, router, http.MethodGet, path, ownerJWT, "")

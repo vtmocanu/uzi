@@ -90,6 +90,23 @@ func TestListCreatedIssuesForRunLiveDB(t *testing.T) {
  VALUES ($1,$2,$3,$4,'body',$5,$6,$7)`,
 			fixture.id, fixture.run, fixture.repo, fixture.title, fixture.status, fixture.iid, fixture.at)
 	}
+	// A failed best-effort stamp cannot manufacture a confirmed output on read.
+	pendingID := uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO issue_proposals (id,run_id,repo_id,title,description,status)
+ VALUES ($1,$2,$3,'failed stamp','body','pending')`, pendingID, run, repo)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := q.StampFiledProposal(cancelled, store.StampFiledProposalParams{ID: pendingID, Iid: pgtype.Int8{Int64: 97, Valid: true}}); err == nil {
+		t.Fatal("cancelled stamp unexpectedly succeeded")
+	}
+	var pendingStatus string
+	var pendingIID pgtype.Int8
+	if err := pool.QueryRow(ctx, `SELECT status,created_issue_iid FROM issue_proposals WHERE id=$1`, pendingID).Scan(&pendingStatus, &pendingIID); err != nil {
+		t.Fatal(err)
+	}
+	if pendingStatus != "pending" || pendingIID.Valid {
+		t.Fatalf("failed stamp changed pending row: status=%s iid=%v", pendingStatus, pendingIID)
+	}
 	rows, err := q.ListCreatedIssuesForRun(ctx, store.ListCreatedIssuesForRunParams{
 		RunID: run, RepoID: pgtype.UUID{Bytes: repo, Valid: true}, UserID: owner,
 	})

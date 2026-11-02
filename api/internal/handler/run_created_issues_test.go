@@ -1,9 +1,11 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -130,7 +132,7 @@ func TestGetRunCreatedIssues(t *testing.T) {
 		{name: "late error", viewer: owner, kind: "prompt", trigger: "schedule", failure: "late", status: 200, calls: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			run := store.Run{ID: uuid.New(), UserID: owner.ID, RepoID: repo, Status: "completed", Kind: tc.kind, TriggerSource: tc.trigger}
+			run := store.Run{ID: uuid.New(), UserID: owner.ID, RepoID: repo, Status: "completed", Kind: tc.kind, TriggerSource: tc.trigger, IssueIid: pgtype.Int8{Int64: 55, Valid: true}, MrIid: pgtype.Int8{Int64: 66, Valid: true}}
 			if tc.schedule {
 				run.ScheduleID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
 			}
@@ -146,7 +148,7 @@ func TestGetRunCreatedIssues(t *testing.T) {
 			case "empty":
 				db.rows = nil
 			case "query":
-				db.queryErr = errors.New("query failed")
+				db.queryErr = errors.New("query failed" + strings.Repeat("x", 2048))
 			case "scan":
 				db.scanErr = errors.New("scan failed")
 			case "late":
@@ -158,8 +160,35 @@ func TestGetRunCreatedIssues(t *testing.T) {
 			if tc.unauth {
 				req = req.WithContext(context.Background())
 			}
+			var logs bytes.Buffer
+			previousLogger := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(previousLogger) })
 			rec := httptest.NewRecorder()
 			h.GetRun(rec, req)
+			if tc.failure == "query" || tc.failure == "scan" || tc.failure == "late" {
+				var entry struct {
+					Message string `json:"msg"`
+					RunID   string `json:"run_id"`
+					Error   string `json:"error"`
+				}
+				found := false
+				for _, line := range bytes.Split(bytes.TrimSpace(logs.Bytes()), []byte("\n")) {
+					if err := json.Unmarshal(line, &entry); err != nil {
+						t.Fatalf("invalid structured log: %s (%v)", line, err)
+					}
+					if entry.Message != "resolve run created issues" {
+						continue
+					}
+					found = true
+					if entry.RunID != run.ID.String() || entry.Error == "" || len(entry.Error) > 512 {
+						t.Fatalf("projection error log lacks bounded error/run identity: %+v", entry)
+					}
+				}
+				if !found {
+					t.Fatal("missing projection error log")
+				}
+			}
 			if rec.Code != tc.status {
 				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 			}
@@ -175,6 +204,9 @@ func TestGetRunCreatedIssues(t *testing.T) {
 			var body struct{ Run apitypes.RunDTO }
 			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 				t.Fatal(err)
+			}
+			if body.Run.IssueIID == nil || *body.Run.IssueIID != 55 || body.Run.MrIID == nil || *body.Run.MrIID != 66 {
+				t.Fatalf("source issue/MR changed: issue=%v mr=%v", body.Run.IssueIID, body.Run.MrIID)
 			}
 			if len(body.Run.CreatedIssues) != tc.count {
 				t.Fatalf("issues=%+v", body.Run.CreatedIssues)
