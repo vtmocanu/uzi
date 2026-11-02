@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { afterEach, test } from "node:test";
 import { GitCache } from "../src/git.js";
+import { RequestError } from "../src/client.js";
 import { canonicalJson, type RecoveryRecord } from "../src/recovery.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { RunRunner } from "../src/runner.js";
@@ -583,3 +584,147 @@ test("settled record with an unsettled same-context journal sibling cannot suppr
   await s.e.coordinator.snapshotOwedInventory();
   assert.equal(skipped, false);
 });
+
+for (const variant of ["uploaded", "saved-final"] as const) {
+  for (const boundary of ["retained", "passed"] as const) {
+    test(`refusal-only ${variant} preserves legacy list counts at ${boundary} source boundary`, async () => {
+      const run = async (answer: "unsupported" | "open" | "unknown" | "exception") => {
+        const s = await setup(variant);
+        let observations = 0;
+        s.client.getBindinglessRecoveryHold = answer === "unsupported" ? undefined : async () => {
+          observations++;
+          if (answer === "exception") throw new Error("observation unavailable");
+          return answer === "unknown" ? undefined : { ...closed(s.f), state: "open", claim_released: false };
+        };
+        const atBoundary: number[] = [];
+        Object.assign(s.e.coordinator, { withInventorySourceBoundary: async (
+          _context: unknown, action: (prove: () => Promise<boolean>) => Promise<void>,
+        ) => {
+          atBoundary.push(s.counts().holds);
+          if (boundary === "passed") await action(async () => true);
+          return boundary;
+        } });
+        await s.e.coordinator.operateFrozenInventory(s.input());
+        const record = (await s.e.coordinator.inspect(s.f.context.runId))[0]!;
+        assert.equal(record.exactHoldBinding, undefined);
+        assert.equal(record.holdSettlement, undefined);
+        assert.equal(observations, answer === "unsupported" ? 0 : 1, "one observation per boundary attempt");
+        await sourceProof(s.f);
+        return { atBoundary, lists: s.counts().holds, effects: s.e.calls };
+      };
+      // No observation capability is the legacy control; compare each existing boundary,
+      // not just a total that could hide an inventory read moving before source admission.
+      const baseline = await run("unsupported");
+      assert.deepEqual(baseline.atBoundary, [0]);
+      assert.equal(baseline.lists, boundary === "retained" ? 0 : variant === "uploaded" ? 3 : 1);
+      if (boundary === "passed") assert.equal(baseline.effects.final, 1, "positive FINAL/replay control");
+      for (const answer of ["open", "unknown", "exception"] as const)
+        assert.deepEqual(await run(answer), baseline, answer);
+    });
+  }
+}
+
+for (const variant of ["acknowledged", "completion-receipt"] as const) {
+  test(`bindingless ${variant} closeout uses ownership cancellation without learning closure`, async () => {
+    const s = await setup(variant);
+    let ownership = 0, budgets = 0;
+    s.client.getRunOwnership = async () => {
+      ownership++;
+      return { status: "cancelled", claim_generation: 7, inventory_guarded: true };
+    };
+    Object.assign(s.e.coordinator, { testHooks: { maintenanceBudget: () => { budgets++; return new MaintenanceBudget(); } } });
+    s.e.cleanup();
+    await s.e.coordinator.resumePending();
+    assert.equal(s.counts().observations, 0);
+    assert.ok(ownership > 0, "independent closeout still checks cancellation ownership");
+    assert.equal(budgets, 1, "one existing attempt budget covers closeout");
+    assert.ok(s.e.calls.cleanup > 0, "independent closeout reaches its guarded cleanup");
+    assert.equal(s.e.calls.final + s.e.calls.reserve + s.e.calls.upload + s.e.calls.produce, 0);
+  });
+}
+
+test("bound saved FINAL retains exact observation before the source boundary", async () => {
+  const s = await setup("saved-final");
+  s.f.record = await patch(s.e.coordinator, s.f.record, { exactHoldBinding: binding });
+  let exact = 0;
+  s.client.getExactRecoveryHold = async () => { exact++; return { ...closed(s.f), state: "open", claim_released: false }; };
+  Object.assign(s.e.coordinator, { withInventorySourceBoundary: async () => {
+    assert.equal(exact, 2, "entry and early exact checks retain their existing behavior");
+    assert.equal(s.counts().holds, 0);
+    return "retained";
+  } });
+  await s.e.coordinator.operateFrozenInventory(s.input());
+  assert.equal(exact, 2);
+  assert.equal(s.counts().observations, 0);
+});
+
+for (const observation of ["settled", "unknown", "write-failure"] as const) {
+  test(`${observation} repeated FINAL diagnostics are bounded and sanitize hostile evidence`, async () => {
+    const s = await setup("saved-final");
+    const lines: Array<{ message: string; fields: unknown }> = [];
+    const log = s.e.coordinator["log"];
+    log.info = log.warn = log.error = log.debug = (message, fields) => { lines.push({ message, fields }); };
+    const hostile = "HOSTILE_RESPONSE\nsecret=fixture-only https://user:password@example.invalid/" + "x".repeat(4000);
+    if (observation === "unknown") s.client.getBindinglessRecoveryHold = async () => { throw new Error(hostile); };
+    else s.answer(Object.assign(closed(s.f), { untrusted_body: hostile }));
+    if (observation === "write-failure") {
+      const write = s.e.coordinator["writeExistingRecord"].bind(s.e.coordinator);
+      Object.assign(s.e.coordinator, { writeExistingRecord: (record: RecoveryRecord, update: Parameters<typeof write>[1]) =>
+        write(record, current => {
+          const next = update(current);
+          if (next?.holdSettlement) throw new Error(hostile);
+          return next;
+        }) });
+    }
+    let sends = 0;
+    s.client.releaseRecoveryCustody = async () => {
+      sends++;
+      throw new RequestError("POST", "/" + hostile, 409, JSON.stringify({ reason: hostile, detail: hostile }));
+    };
+    // Three explicit attempts, no timer waits or unbounded retries. A failed observation/write
+    // remains retryable while repeated unchanged diagnostic transitions stay deduplicated.
+    for (let pass = 0; pass < 3; pass++) await s.e.coordinator.operateFrozenInventory(s.input());
+    const retained = lines.filter(line => line.message === "recovery: FINAL retry retained");
+    assert.equal(retained.length, 1);
+    assert.deepEqual(retained[0]!.fields, {
+      run_id: s.f.context.runId, generation: 7, capture_id: s.f.record.captureId,
+      ...(observation === "settled" ? { hold_id: binding.holdId } : {}),
+      reason: "unknown", refusal_code: observation === "settled" ? "unknown" : 409,
+      refusing_predicate: observation === "settled" ? "inventory_hold_settled" : "final_retry_refused",
+      disposition: observation === "settled" ? "discarded" : "unknown",
+    });
+    assert.equal(JSON.stringify(lines).includes("HOSTILE_RESPONSE"), false);
+    assert.ok(JSON.stringify(lines).length < 2000, "bounded diagnostic output across repeated passes");
+    assert.equal(sends, observation === "settled" ? 0 : 3);
+    assert.equal(s.e.calls.reserve + s.e.calls.upload + s.e.calls.produce, 0);
+    const saved = (await s.e.coordinator.inspect(s.f.context.runId))[0]!;
+    assert.deepEqual(saved.finalRequest, s.f.record.finalRequest);
+    assert.equal(saved.finalAcknowledged, undefined);
+    assert.equal(!!saved.holdSettlement, observation === "settled");
+    await sourceProof(s.f);
+  });
+}
+
+for (const answer of ["open", "unknown", "exception"] as const) {
+  test(`${answer} bindingless probe cannot refuse before the legacy source boundary`, async () => {
+    const s = await setup("uploaded");
+    s.e.state.open = false;
+    let observations = 0, boundaries = 0;
+    s.client.getBindinglessRecoveryHold = async () => {
+      observations++;
+      if (answer === "exception") throw new Error("observation unavailable");
+      return answer === "unknown" ? undefined : { ...closed(s.f), state: "open", claim_released: false };
+    };
+    Object.assign(s.e.coordinator, { withInventorySourceBoundary: async () => {
+      boundaries++;
+      assert.equal(s.counts().holds, 0, "no legacy inventory read before the source boundary");
+      return "retained";
+    } });
+    await s.e.coordinator.operateFrozenInventory(s.input());
+    assert.equal(boundaries, 1);
+    assert.equal(observations, 1);
+    assert.equal(s.counts().holds, 0);
+    assert.equal(s.e.calls.final, 0);
+    await sourceProof(s.f);
+  });
+}

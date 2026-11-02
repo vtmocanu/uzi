@@ -1961,8 +1961,11 @@ export class RecoveryCoordinator {
     if (current.inventoryGuarded && !current.finalAcknowledged && !current.completionReceipt &&
         (current.holdSettlement || current.finalRequest && current.exactHoldBinding ||
           !current.exactHoldBinding && this.client.getBindinglessRecoveryHold)) {
-      const hold = await this.heldOperationState(current);
-      if ((hold === "settled" || !current.finalRequest && hold !== "open") &&
+      const bindingless = !current.exactHoldBinding;
+      const hold = await this.heldOperationState(current, undefined, bindingless);
+      // Bindingless observation only adds refusal evidence here. Unknown/open legacy
+      // paths keep their inventory checks inside finalizeInventoryWithinBoundary.
+      if ((hold === "settled" || !bindingless && !current.finalRequest && hold !== "open") &&
           !await this.finalHoldAllowsReplay(current, hold)) return this.heldStopped(current, hold);
     }
     let outcome: RecoveryOutcome | void = undefined;
@@ -2728,7 +2731,7 @@ export class RecoveryCoordinator {
                 trusted.holdSettlement.current_claim_generation >= trusted.generation!) {
               MaintenanceBudget.observeCancellation();
             } else if (trusted.captureId && trusted.inventoryGuarded && !trusted.exactHoldBinding &&
-                this.client.getBindinglessRecoveryHold) {
+                !trusted.finalAcknowledged && !trusted.completionReceipt && this.client.getBindinglessRecoveryHold) {
               if (!this.bindinglessObservations.getStore()!.has(canonicalJson([trusted.runId, trusted.generation]))) {
                 const state = await this.heldOperationState(trusted, undefined, true);
                 if (state !== "settled" && !MaintenanceBudget.current()) {

@@ -1,6 +1,6 @@
 import { after, before, it } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -59,6 +59,46 @@ for (const variant of ["pinned", "needs_action", "uploaded", "saved-final", "ack
     assert.deepEqual(f.record.attemptedHeadShas, beforeRecord.attemptedHeadShas);
     const afterRecord = structuredClone(f.record);
     const afterMetadata = await snapshot(live, path.join(caseRoot, "after-metadata"));
+    if (variant === "uploaded") {
+      // Exercise the real backup capture with authentic JSON as opaque clone payloads.
+      // The backup tool's protected Git-config descriptors are a separate schema.
+      const input = path.join(caseRoot, "backup-input"), output = path.join(caseRoot, "backup-output");
+      await fs.mkdir(input);
+      const journal = path.relative(live, writer["recordPath"](f.record));
+      for (const [phase, saved] of [["before", beforeMetadata], ["after", afterMetadata]] as const) {
+        const original = path.join(saved.directory, journal);
+        await fs.copyFile(original, path.join(input, phase + ".json"));
+        await fs.chmod(path.join(input, phase + ".json"), (await fs.stat(original)).mode & 0o777);
+      }
+      const backup = spawnSync("bash", [path.join(root, ".agents/skills/uzi-watcher/scripts/backup-runs.test.sh")], {
+        cwd: root, encoding: "utf8", timeout: 100_000, maxBuffer: 1024 * 1024,
+        env: { ...process.env, TMPDIR: scratch, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
+          UZI_TEST_SIGNED_JSON_INPUT: input, UZI_TEST_SIGNED_JSON_OUTPUT: output, UZI_TEST_SIGNED_JSON_ONLY: "1" },
+      });
+      const backupLog = path.join(caseRoot, "backup-validation.log");
+      await fs.writeFile(backupLog, (backup.stdout ?? "") + (backup.stderr ?? "") +
+        "\nEXIT=" + backup.status + "\n");
+      assert.equal(backup.error, undefined, "backup harness setup; see " + backupLog);
+      assert.equal(backup.status, 0, "real backup harness; see " + backupLog);
+      assert.ok(backup.stdout.includes("PASS signed payload:"), "signed payload case must execute");
+      for (const [phase, saved, expected] of [
+        ["before", beforeMetadata, beforeRecord], ["after", afterMetadata, afterRecord],
+      ] as const) {
+        await restore(live, saved);
+        const restored = path.join(output, "compat-" + phase + ".json");
+        const original = path.join(live, journal);
+        assert.deepEqual(await fs.readFile(restored), await fs.readFile(original), "archive bytes retained");
+        assert.equal((await fs.stat(restored)).mode & 0o777, (await fs.stat(original)).mode & 0o777,
+          "archive mode retained");
+        await fs.copyFile(restored, original); // exact original absolute path; no parse, rewrite or MAC writer
+        f.record = expected;
+        assert.deepEqual(await environment(f).coordinator.inspect(f.context.runId), [expected],
+          "real backup-restored JSON authenticates");
+        await equalInventory(live, saved.entries);
+        await sourceProof(f);
+      }
+      f.record = afterRecord;
+    }
     const results: unknown[] = [];
     for (const [phase, saved, expected] of [
       ["before", beforeMetadata, beforeRecord], ["after", afterMetadata, afterRecord],

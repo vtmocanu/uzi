@@ -167,3 +167,72 @@ prevent attributing the elapsed difference to implementation performance. These
 figures exclude queueing and do not establish a CI critical-path improvement.
 Exact-head hosted job/critical-path timing remains a landing obligation. No
 workflow, concurrency cap or production wait was changed.
+
+
+## Repair validation, 2026-11-02
+
+The early bindingless finalization probe seeks refusal evidence without falling
+back to a legacy open-inventory read. Open, unknown, unsupported and failed
+observations leave the existing inventory checks inside the source boundary.
+Bindingless records with a FINAL ACK or completion receipt use the existing
+ownership cancellation probe instead of learning closure that cannot refuse
+their independent closeout.
+
+The regression controls compare saved and unsaved FINAL paths at both retained
+and passed source boundaries. They witnessed six failures before the repair
+(extra pre-boundary inventory reads and unnecessary closeout observations),
+then passed after it. The settlement file passed 53 tests, related focused files
+passed 117, and the inventory/client run passed 763, all with zero skips or
+cancellations. Agent typechecking and scoped lint passed. Repeated settled,
+unknown and failed-write attempts each emitted one retained-FINAL diagnostic;
+hostile response/error text was absent, with exact allowlisted fields asserted.
+
+The compatibility proof now passes authentic before/after signed journal
+payloads through the real backup harness's untracked-file archive. It compares
+bytes and modes, restores the payload to its original absolute journal path,
+then checks coordinator authentication and retained source/bundle/ref contents.
+This covers opaque payload capture, not discovery of external recovery roots
+or MAC authentication by the backup script. Git-config descriptor validation
+remains separate. The extended proof passed all six variants with zero skips;
+the separate Python backup-directory test also passed. Its initial attempt ran
+the entire backup suite inside the uploaded variant and exceeded the 100-second
+subprocess limit. The proof now explicitly selects the signed-payload case;
+the ordinary backup suite still runs every case without that selector.
+
+Fresh PostgreSQL 17 fixtures executed
+`TestExactRecoveryRawCandidatesLiveDB`,
+`TestExactRecoveryProductionBearerRoutesLiveDB`,
+`TestExactHoldClosureImmutableEvidenceLiveDB`,
+`TestExactHoldClosureOrderedPrerequisitesLiveDB`, and
+`TestExactHoldArchiveHistoricalEvidenceLiveDB`, plus the other exact-observation
+controls selected by the command below. All 57 named results passed, with
+zero failures or skips. The fixture container was removed after execution.
+
+```sh
+go test -race -count=1 -p=1 -buildvcs=false -timeout=5m -v -run '^(TestExactRecovery.*LiveDB|TestExactHold.*LiveDB)$' ./internal/handler ./internal/recovery
+```
+
+This repair adds 13 settlement regression tests. The 53-test file took 50.085s
+locally, compared with the historical 40-test sample of 25.469s above. These
+are separate samples with different fixture/cache and host-load conditions,
+not a controlled CI-job comparison. The extended six-case compatibility proof
+took 34.536s; it remains outside the ordinary shard inventory. No production
+wait, workflow or concurrency cap was added. Exact-head affected-job and
+critical-path timing still belongs to landing.
+
+The earlier mutation and timing results above are historical execution records.
+Their scratch logs did not survive recovery into this clone. They are not
+newly reproduced results from this repair session, and no mutation artifacts
+are shipped as production code. Historical-reader compatibility remains an
+explicit standalone proof requiring both pinned commits; ordinary agent CI
+runs the bindingless client and settlement regression files. No workflow
+change or broader compatibility claim is made.
+
+The three unresolved checks above remain unsuccessful or unverified in-run:
+API dead-code analysis, forge operation contracts, and CI safe-path fixtures.
+Before merge, exact-head `lint-api` must pass `deadcode:api`, and
+`lint-repo` must pass both `test:forge-fake-contract` and
+`test:ci-safe-paths`. A non-closing delivery leaves #3105 open until those
+results are verified and recorded. Ordinary steering does not waive the frozen
+M2/M5 obligations; a formal owner partial decision is still required to defer
+them.
