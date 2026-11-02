@@ -67,7 +67,8 @@ func TestManualCordonHealthEntryMetadataAndPrerequisites(t *testing.T) {
 					fs.eligibility = store.CountOnlineWorkersClaimableForRunRow{}
 					want = reasonNoWorker
 				}
-				if age < th.queued && (mode == "vault" || mode == "custody" || mode == "account" || mode == "generic" || mode == "claimable continuation") {
+				// Custody blocking is owner-visible even before the queued-age threshold.
+				if age < th.queued && (mode == "vault" || mode == "account" || mode == "generic" || mode == "claimable continuation") {
 					want = ""
 				}
 				flag, got := svc.healthTargetFor(context.Background(), t0, r, th)
