@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import cases from "../../../fixtures/recovery-prerequisite-closure/cases.json";
 import { RecoveryArchivesPanel } from "./RecoveryArchives";
 import { api, type RecoveryArchive, type RecoveryArchiveSummary, type Run } from "../lib/api";
 
@@ -15,6 +16,9 @@ vi.mock("../lib/api", async (importActual) => {
   };
 });
 const mockApi = vi.mocked(api);
+const RUN_UUID = "00000000-0000-0000-0000-000000000002";
+const CAP_UUID = "00000000-0000-0000-0000-000000000001";
+const EXPORT_CMD = `uzi run export ${RUN_UUID} --output <path> --capture ${CAP_UUID}`;
 
 beforeEach(() => {
   mockApi.getRecoveryHolds.mockReset();
@@ -39,6 +43,8 @@ function archive(over: Partial<RecoveryArchive> = {}): RecoveryArchive {
     state: "available",
     source_sha: "0123456789abcdef0123456789abcdef01234567",
     created_at: "2026-09-13T00:00:00Z",
+    checksum: "a".repeat(64),
+    byte_size: 123,
     ...over,
   };
 }
@@ -111,12 +117,12 @@ describe("RecoveryArchivesPanel fixed failed-run copy", () => {
   });
 
   it("keeps actual available capture export and the CLI hint", async () => {
-    await renderPanel(aRun({ failure_reason: DIAGNOSTIC, landing_state: "needs_landing" }),
-      summary({ archives: [archive()] }));
+    await renderPanel(aRun({ id: RUN_UUID, failure_reason: DIAGNOSTIC, landing_state: "needs_landing" }),
+      summary({ archives: [archive({ id: CAP_UUID })] }));
     expect(screen.getByText(DIAGNOSTIC)).toBeTruthy();
     expect(screen.getByRole("link", { name: "Export archive" }).getAttribute("href"))
-      .toBe("/api/runs/r1/archives/cap1/download");
-    expect(screen.getByText("uzi run export r1 --output <path> --capture cap1")).toBeTruthy();
+      .toBe(`/api/runs/${RUN_UUID}/archives/${CAP_UUID}/download`);
+    expect(screen.getByText(EXPORT_CMD)).toBeTruthy();
     expect(screen.getByText(SECRET_WARNING)).toBeTruthy();
     expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
   });
@@ -358,15 +364,15 @@ describe("RecoveryArchivesPanel — untrusted-text escaping (D6)", () => {
 // appears where export could read nothing, and it leaves the ordinary recovery render
 // (non-needs_landing runs whose captures were retained) untouched.
 describe("RecoveryArchivesPanel — needs_landing export hint (issue #1418)", () => {
-  const EXPORT_CMD = "uzi run export r1 --output <path> --capture cap1";
+
 
   it("surfaces the capture id and a copyable export command beside an available capture", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
 
     await renderPanel(
-      aRun({ status: "failed", landing_state: "needs_landing" }),
-      summary({ archives: [archive({ state: "available" })] }),
+      aRun({ id: RUN_UUID, status: "failed", landing_state: "needs_landing" }),
+      summary({ archives: [archive({ id: CAP_UUID, state: "available" })] }),
     );
 
     // The capture id is surfaced as text, and the CLI hint carries the REAL run + capture ids
@@ -404,5 +410,99 @@ describe("RecoveryArchivesPanel — needs_landing export hint (issue #1418)", ()
     expect(screen.getByRole("link", { name: "Export archive" })).toBeTruthy();
     expect(screen.queryByText(/uzi run export/)).toBeNull();
     expect(screen.queryByText(/Capture id:/)).toBeNull();
+  });
+});
+
+
+// Feed the actual owner DTO, not DB hints, through the public panel.
+describe("prerequisite closure owner projection", () => {
+  it.each(["preparing", "uploading", "needs_action"].flatMap(state =>
+    [false, true].flatMap(bound =>
+      [false, true].map(emptyList => ({ state, bound, emptyList })),
+    ),
+  ))("$state bound=$bound emptyList=$emptyList renders only established self-containment", async ({ state, bound, emptyList }) => {
+    await renderPanel(aRun(), summary({ archives: [archive({
+      state,
+      prerequisite_shas: emptyList ? [] : undefined,
+      checksum: bound ? "a".repeat(64) : undefined,
+      byte_size: bound ? 123 : undefined,
+    })] }));
+    const section = screen.getByLabelText("Prerequisite protection");
+    expect(section.textContent).toContain(bound ? "Self-contained archive" : "Prerequisite protection unknown");
+    expect(section.textContent!.includes("Self-contained archive")).toBe(bound);
+    expect(section.textContent).not.toContain("git fetch origin");
+  });
+
+  const explanations: Record<string, RegExp> = {
+    pending: /Pin pending: prerequisite protection is not established/,
+    invoked: /Pin creation invoked: prerequisite protection is not established/,
+    create_unknown: /Pin creation outcome unknown: prerequisite protection is not established/,
+    pinned: /Pin recorded by the server/,
+    refused: /Pin creation refused/,
+    foreign: /A foreign ref occupies the pin name/,
+    lost: /The recorded pin was lost/,
+    deleted: /Pin deletion was recorded/,
+  };
+  it.each(cases.cases)("$name preserves semantics and independent archive actions", async c => {
+    const capture = archive({ id: CAP_UUID, state: c.input.capture_state,
+      prerequisite_shas: c.input.thin ? [cases.pin_tip] : [],
+      ...(c.expected.closure ? { prerequisite_closure: c.expected.closure } : {}),
+    });
+    await renderPanel(aRun({ id: RUN_UUID, status: "completed", landing_state: "needs_landing" }),
+      summary({ has_open_hold: false, archives: [capture] }));
+    const section = screen.getByLabelText("Prerequisite protection");
+    const text = section.textContent!;
+    if (!c.input.thin) expect(text).toContain("Self-contained archive");
+    else if (!c.expected.closure) expect(text).toContain("Prerequisite protection unknown");
+    else expect(text).toMatch(explanations[c.expected.closure.state]);
+    if (c.expected.closure?.state === "pinned") {
+      expect(text).toContain("not a fresh probe");
+      expect(text).toContain("custody release");
+    }
+    expect(text.includes("Pin absence is unconfirmed")).toBe(c.expected.closure?.absence_unconfirmed === true);
+    expect(text.includes("automatic deletes have stopped")).toBe(c.expected.cleanup === "exhausted");
+    if (c.expected.closure) {
+      expect(text).toContain(cases.pin_ref);
+      expect(text).toContain("Pin record updated: " + cases.updated_at);
+    }
+    expect(!!screen.queryByRole("link", { name: "Export archive" })).toBe((c.expected.permitted_actions as string[]).includes("download"));
+    expect(!!screen.queryByRole("button", { name: "Delete archive" })).toBe((c.expected.permitted_actions as string[]).includes("discard"));
+    expect(!!screen.queryByText(EXPORT_CMD)).toBe((c.expected.permitted_actions as string[]).includes("download"));
+    expect(section.querySelectorAll("a")).toHaveLength(1);
+  });
+
+  it.each(cases.malformed)("rejects malformed wire $name", async c => {
+    const capture = archive({ id: CAP_UUID, prerequisite_shas: [cases.pin_tip], prerequisite_closure: JSON.parse(c.wire) });
+    await renderPanel(aRun(), summary({ archives: [capture] }));
+    expect(screen.getByText(/Prerequisite protection unknown/)).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Export archive" })).toBeTruthy();
+  });
+
+  it.each(["$(echo bad)", "a;echo bad", CAP_UUID + "\n", "--help", "a".repeat(10000)])("suppresses unsafe command identifiers %s", async id => {
+    await renderPanel(aRun({ id, landing_state: "needs_landing" }), summary({ archives: [archive({ id: CAP_UUID })] }));
+    expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+    expect(screen.getByText(/Export command unavailable/)).toBeTruthy();
+  });
+
+  it("bounds untrusted plain diagnostics and never renders Markdown or control bytes", async () => {
+    const hostile = "\u001b[31m[link](https://evil.invalid) **bold**\u202e" + "x".repeat(10000);
+    const { container } = await renderPanel(aRun(), summary({ archives: [archive({ id: CAP_UUID,
+      prerequisite_shas: [hostile], source_sha: hostile, reason: hostile,
+      prerequisite_closure: { ...cases.cases[3].expected.closure!, reason: hostile, pin_ref: hostile, pin_tip: hostile },
+    })] }));
+    expect(container.querySelector('a[href="https://evil.invalid"]')).toBeNull();
+    expect(container.querySelector("strong")).toBeNull();
+    expect(container.textContent).not.toContain("\u001b");
+    expect(container.textContent).not.toContain("\u202e");
+    expect(container.textContent!.length).toBeLessThan(6500);
+    expect(screen.queryByText(/git fetch origin/)).toBeNull();
+  });
+
+  it("does not invent positive protection on an owner API error", async () => {
+    mockApi.getRunArchives.mockRejectedValueOnce(new Error("unavailable"));
+    const { container } = render(<RecoveryArchivesPanel run={aRun()} />);
+    await act(async () => { await Promise.resolve(); });
+    expect(mockApi.getRunArchives).toHaveBeenCalled();
+    expect(container.textContent).toBe("");
   });
 });

@@ -5427,7 +5427,18 @@ export interface CIRunDetail extends CIRun {
 // until the capture reaches the relevant lifecycle stage: attempted_head_sha (H') is
 // absent when no publish was attempted; byte_size/checksum are absent until the manifest
 // is bound; expires_at is absent until the artifact is available.
+export interface RecoveryPrerequisiteClosure {
+  state: string;
+  reason?: string;
+  pin_ref: string;
+  pin_tip?: string;
+  absence_unconfirmed: boolean;
+  cleanup_exhausted: boolean;
+  updated_at: string;
+}
+
 export interface RecoveryArchive {
+  prerequisite_closure?: RecoveryPrerequisiteClosure;
   id: string;
   run_id: string;
   hold_id: string;

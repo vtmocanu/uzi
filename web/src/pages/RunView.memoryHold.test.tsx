@@ -71,7 +71,7 @@ it("keeps zero as a known bound and source-only custody distinct from an archive
   }), true));
   expect(screen.getByText("Memory interventions: used 0. Maximum: 0. Remaining: 0.")).toBeTruthy();
   expect(screen.getByText(/Retained source may remain on the assigned worker/)).toBeTruthy();
-  expect(screen.getByText(/Only a verified available recovery archive can restore captured work/)).toBeTruthy();
+  expect(screen.getByText(/An available archive can restore captured work only when its prerequisite commits are also present/)).toBeTruthy();
   expect(screen.queryByText(/A recovery capture was recorded as available/)).toBeNull();
   expect(api.resumeRun).not.toHaveBeenCalled();
 });

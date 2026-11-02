@@ -837,12 +837,27 @@ uzi version
   A `source_only` or `needs_action` disposition awaits your decision;
   `archive_ready` can release after its required evidence is accepted; `active` labels
   nonterminal protection but does not prove admission eligibility.
-  Recover an available archive with `uzi run export`, or discard a held source with
-  `uzi run discard`. `--json` emits the run's raw hold DTOs, each with a `captures` array
-  (id, state, source_sha, byte_size, created_at); pass a capture id to
-  `uzi run export --capture`. A `failed` run whose
-  `landing_state` is `needs_landing` carries human-landable work: recover it with
-  `uzi run export` when an archive is available, or from the preserved diff
+  Download an available archive with `uzi run export`, or discard a held source with
+  `uzi run discard`. Availability means archive bytes can be exported, not that a thin
+  bundle's dependencies are present. Export still checks for a bound byte manifest
+  and can fail during download. `--json` emits hold rows with a `captures` array
+  (id, state, source_sha, byte_size, created_at and, when present, checksum,
+  ordered prerequisite_shas, expires_at, attempted_head_sha and prerequisite_closure);
+  pass a capture id to `uzi run export --capture`. The human `run get` summary shows
+  every retained capture with recorded pin details; the human recovery view shows
+  captures attached to the listed holds.
+  The optional pin snapshot is advisory persisted history, not a fresh forge probe;
+  its updated_at is a row update, not last verification. Missing metadata leaves
+  prerequisite availability unknown. Export-choice `--json` preserves archive DTO pin
+  facts; its human table shows only id/state/source/size/created. Successful export
+  JSON verifies bytes/checksum only. Before import or discarding retained source,
+  fetch missing prerequisites (compare the pin's full recorded tip when using it) and
+  run `git bundle verify` in the destination clone. Follow the owner restore guide in
+  `uzi docs show run-recovery`; pin facts alone grant no release or cleanup authority.
+  A `failed` run whose
+  `landing_state` is `needs_landing` carries human-landable work: download its
+  available archive with `uzi run export`, then verify prerequisites before import,
+  or inspect the preserved diff
   (`uzi run get <run-id> --field preserved_patch`) when it isn't.
   An integrity refusal is `recovery_wait` / `retained_recovery_adoption_failed`:
   local work and custody are preserved, with no automatic retry regardless of
@@ -921,7 +936,8 @@ uzi version
   archive stays exportable but may not cover the latest worker-local work. Without an
   available archive or a capture in progress, source-only custody reports:
   "no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)".
-  Export requires an available independent capture; a verified pin must first be archived.
+  Export requires an available capture, including a thin one; a pin alone is not
+  an archive. Download verification checks bytes/checksum, not Git dependencies.
   Hold discard changes database custody; it does not repair the worker journal.
   Periodic reconciliation permits cleanup only after a fresh positive, complete custody GET
   proves a nonempty exact-generation set is all released/discarded, with no open sibling

@@ -207,12 +207,16 @@ func renderCaptureChoice(env Env, gf *globalFlags, e *captureChoiceError) error 
 }
 
 // captureListLine renders one capture for the `run get` summary listing: id, state, the original
-// committed head H (short), and the byte size when bound. The state enum and the hex SHA are
-// safe, and the state is sanitized defensively; no raw bytes and no reason echo.
+// committed head H (short), and the byte size when bound. Worker-authored source
+// facts are validated before shortening; other fields use bounded terminal cells.
 func captureListLine(a apitypes.RecoveryArchiveDTO) string {
-	line := fmt.Sprintf("%s  %s", a.ID, sanitizeTTY(a.State))
+	line := fmt.Sprintf("%s  %s", cellText(a.ID), cellText(a.State))
 	if sha := strings.TrimSpace(a.SourceSha); sha != "" {
-		line += "  H=" + shortSHA(sha)
+		if recoveryObjectID(sha) {
+			line += "  H=" + shortSHA(sha)
+		} else {
+			line += "  H=invalid metadata"
+		}
 	}
 	if a.ByteSize != nil {
 		line += "  " + humanBytes(*a.ByteSize)
@@ -233,8 +237,11 @@ func renderExportResult(env Env, gf *globalFlags, runID string, a apitypes.Recov
 		"warning: this archive is the run's ORIGINAL committed history and may contain secrets — "+
 			"review it before publishing anywhere; a real credential must be revoked/rotated and removed from the history\n"+
 			"verification checks bytes only, not availability of required commits. In a fresh destination clone of your forge repo, "+
-			"run `git bundle verify <bundle-path>` before import or discarding retained source. An available archive does not resolve guarded custody.\n")
+			"run `git bundle verify <bundle-path>` before import or discarding retained source. An available archive alone does not resolve guarded custody.\n")
 
+	for _, line := range prerequisiteLines(a) {
+		_, _ = fmt.Fprintln(env.Stderr, line)
+	}
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
 		return p.JSON(map[string]any{
@@ -346,22 +353,26 @@ func availableCaptureIDs(summary apitypes.RecoveryArchiveSummaryDTO) []string {
 // and the run row actually carry keeps the guidance correct for every needs_landing sub-case.
 // Every other run — a failed run whose landing_state is "unrecoverable" or "none", and every
 // non-failed run — prints nothing, so ordinary `run get` output is byte-for-byte unchanged.
-// run.ID is a server UUID (safe), sanitized defensively for consistency with the sibling hint.
+// Validate the server run UUID before placing it in a copyable command.
 func renderLandingHint(env Env, gf *globalFlags, run apitypes.RunDTO, summary apitypes.RecoveryArchiveSummaryDTO) {
 	if run.LandingState != landingStateNeedsLanding {
 		return
 	}
 	p := env.printer(gf)
-	id := sanitizeTTY(run.ID)
+	id, err := parseRecoveryRunID(run.ID)
+	if err != nil {
+		p.Printf("\nrecovery command unavailable: invalid run id metadata; inspect recovery from the owner listing\n")
+		return
+	}
 	switch {
 	case hasAvailableArchive(summary):
 		// `uzi run export <run-id>` auto-selects a SOLE available capture, but refuses to guess
 		// between several — name a concrete `--capture <id>` then so the hint is a runnable
 		// command, not one the CLI would reject (issue #1418).
 		if ids := availableCaptureIDs(summary); len(ids) > 1 {
-			p.Printf("\nthis failed run's committed work is landable by hand: it has %d recovery archives — export one with `uzi run export %s --capture <id>` (ids: %s)\n", len(ids), id, strings.Join(ids, ", "))
+			p.Printf("\nthis failed run's committed work may be landable by hand after prerequisite and import verification: it has %d recovery archives — export one with `uzi run export %s --capture <id>` (ids: %s)\n", len(ids), id, strings.Join(ids, ", "))
 		} else {
-			p.Printf("\nthis failed run's committed work is landable by hand: export the recovery archive with `uzi run export %s`\n", id)
+			p.Printf("\nthis failed run's committed work may be landable by hand after prerequisite and import verification: export the recovery archive with `uzi run export %s`\n", id)
 		}
 	case run.PreservedPatch != nil && strings.TrimSpace(*run.PreservedPatch) != "":
 		p.Printf("\nthis failed run's committed work is landable by hand: its diff is preserved — view it with `uzi run get %s --field preserved_patch`\n", id)
@@ -371,9 +382,8 @@ func renderLandingHint(env Env, gf *globalFlags, run apitypes.RunDTO, summary ap
 }
 
 // recoverySummaryLines is the metadata-only recovery block for `uzi run get` (PRD #1296 D7):
-// a RECOVERY header with the capture count + per-state tally, then one line per available
-// capture (id, source SHA, size) so the owner knows what `uzi run export --capture` can
-// fetch. It returns nothing for a run with no captures and no open hold — a normal run whose
+// a RECOVERY header with the capture count + per-state tally, then every retained
+// capture with separate archive and prerequisite-pin observations. It returns nothing for a run with no captures and no open hold — a normal run whose
 // custody was released at successful completion prints no block, so nothing false is implied.
 func recoverySummaryLines(s apitypes.RecoveryArchiveSummaryDTO) []string {
 	if len(s.Archives) == 0 {
@@ -384,8 +394,8 @@ func recoverySummaryLines(s apitypes.RecoveryArchiveSummaryDTO) []string {
 	}
 	lines := []string{fmt.Sprintf("RECOVERY  %d archive(s): %s", len(s.Archives), stateTally(s.Counts))}
 	for _, a := range s.Archives {
-		if a.State == recoveryStateAvailable {
-			lines = append(lines, "  "+captureListLine(a))
+		for _, line := range captureDetailLines(a) {
+			lines = append(lines, "  "+line)
 		}
 	}
 	return lines

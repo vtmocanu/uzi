@@ -3126,7 +3126,9 @@ describe("RunView preserved-patch surface (PRD #377)", () => {
 // failed hero). So the hint is doubly recoverability-aware: needs_landing AND an available
 // capture. The header pill for such a run reads "needs landing" (issue #1418 part A).
 describe("RunView landing hint (issue #1418)", () => {
-  const EXPORT_CMD = "uzi run export r1 --output <path> --capture cap-ok";
+  const RUN_ID = "00000000-0000-4000-8000-000000001418";
+  const CAPTURE_ID = "00000000-0000-4000-8000-000000001419";
+  const EXPORT_CMD = `uzi run export ${RUN_ID} --output <path> --capture ${CAPTURE_ID}`;
 
   function archiveSummary(over: Record<string, unknown> = {}) {
     return {
@@ -3147,8 +3149,8 @@ describe("RunView landing hint (issue #1418)", () => {
   }
   function availableCapture(over: Record<string, unknown> = {}) {
     return {
-      id: "cap-ok",
-      run_id: "r1",
+      id: CAPTURE_ID,
+      run_id: RUN_ID,
       hold_id: "h1",
       state: "available",
       source_sha: "0123456789abcdef0123456789abcdef01234567",
@@ -3159,7 +3161,7 @@ describe("RunView landing hint (issue #1418)", () => {
 
   function renderPage(over: Partial<Run>, summary: ReturnType<typeof archiveSummary>) {
     mockUseRunStream.mockReturnValue({
-      run: run(over),
+      run: run({ id: RUN_ID, ...over }),
       messages: [],
       connected: true,
       error: "",
@@ -3173,7 +3175,7 @@ describe("RunView landing hint (issue #1418)", () => {
       summary as unknown as Awaited<ReturnType<typeof api.getRunArchives>>,
     );
     return render(
-      <MemoryRouter initialEntries={["/runs/r1"]}>
+      <MemoryRouter initialEntries={[`/runs/${RUN_ID}`]}>
         <RunView />
       </MemoryRouter>,
     );

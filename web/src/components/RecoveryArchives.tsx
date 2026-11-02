@@ -2,11 +2,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { api, runArchiveDownloadUrl, type RecoveryArchiveSummary, type Run } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
-import { stripUnsafeChars } from "../lib/safeText";
 import { useNow } from "../lib/useNow";
 import { formatCountdown } from "../lib/limitWait";
 import {
   captureView,
+  prerequisiteView,
+  recoveryExportCommand,
+  recoveryDiagnostic,
   TERMINAL_MAC_FAILURE_COPY,
   formatArchiveSize,
   recoverySectionKind,
@@ -155,13 +157,11 @@ function CaptureRow({
 }) {
   const now = useNow(60_000);
   const view = captureView(capture.state, capture.reason);
-  // The copyable CLI equivalent of the "Export archive" download, for the needs_landing
-  // recovery path. run id and capture id are server UUIDs (safe — not worker-authored, and
-  // used as element ids / React keys elsewhere in this component), so they are rendered as
-  // plain auto-escaped React text; <path> is a literal placeholder the operator fills in.
-  const exportCommand = `uzi run export ${runId} --output <path> --capture ${capture.id}`;
+  const pin = prerequisiteView(capture);
+  const exportCommand = recoveryExportCommand(runId, capture.id);
   const [copied, setCopied] = useState(false);
   const copyExport = async () => {
+    if (!exportCommand) return;
     try {
       await navigator.clipboard.writeText(exportCommand);
       setCopied(true);
@@ -218,7 +218,7 @@ function CaptureRow({
         <div className="flex flex-wrap items-center gap-2">
           <Badge tone={view.tone}>{view.label}</Badge>
           <span className="font-mono text-xs text-muted">
-            {stripUnsafeChars(shortSha(capture.source_sha))}
+            {recoveryDiagnostic(shortSha(capture.source_sha))}
           </span>
           <span className="text-xs text-faint">{formatArchiveSize(capture.byte_size)}</span>
         </div>
@@ -257,9 +257,9 @@ function CaptureRow({
           run is in the needs_landing bucket — the same recoverability-aware rule the CLI/TUI
           use (point at `uzi run export` where an available archive exists, at the preserved
           diff otherwise; the run page renders that preserved_patch inline in the failed hero).
-          run/capture ids are server UUIDs rendered as plain escaped text; <path> is a literal
-          the operator substitutes. */}
-      {showExportHint && view.downloadable && (
+          Commands require validated run/capture UUIDs; <path> is a literal placeholder. */}
+      {showExportHint && view.downloadable && !exportCommand && <p className="mt-2 text-xs text-muted">Export command unavailable: invalid run or capture identifier.</p>}
+      {showExportHint && view.downloadable && exportCommand && (
         <div className="mt-3 space-y-2 rounded-md border border-edge bg-surface/60 p-2">
           <p className="text-xs text-muted">
             Or export this capture from the command line. Replace{" "}
@@ -315,28 +315,43 @@ function CaptureRow({
 
       <p className="mt-2 text-xs text-muted">{view.description}</p>
 
+      <div className="mt-2 min-w-0 space-y-1 break-words text-xs text-muted" aria-label="Prerequisite protection">
+        <p>{pin.description}</p>
+        {pin.absence && <p>Pin absence is unconfirmed. Protection is uncertain; this observation cannot authorize release.</p>}
+        {pin.cleanup === "exhausted" && <p>Pin cleanup exhausted: automatic deletes have stopped. This does not grant permission for manual deletion, even if deletion was previously recorded.</p>}
+        {pin.cleanup === "pending" && <p>Pin cleanup pending after archive retention ended.</p>}
+        {pin.cleanup === "complete" && <p>Pin cleanup recorded complete.</p>}
+        {pin.ref && <p>Pin ref: <code className="break-all">{pin.ref}</code></p>}
+        {pin.tip && <p>Recorded pin tip: <code className="break-all">{pin.tip}</code></p>}
+        {pin.updated && <p>Pin record updated: <time dateTime={pin.updated}>{pin.updated}</time></p>}
+        {pin.reason && <p>Pin reason: {pin.reason}</p>}
+        {pin.fetchCommand && <p>Fetch recorded pin: <code className="break-all">{pin.fetchCommand}</code></p>}
+        <p>Export verification checks byte size and checksum only; it does not prove dependency import.</p>
+        <a className="underline" href="https://github.com/vtmocanu/uzi/blob/main/docs/run-recovery.md#prerequisite-pins-lifecycle-and-custody-release">Prerequisite pin restore guide</a>
+      </div>
+
       <dl className="mt-2 grid grid-cols-1 gap-x-4 gap-y-1 text-xs text-faint sm:grid-cols-2">
         <div>
           <dt className="inline text-faint">Original head: </dt>
           <dd className="inline font-mono text-muted">
-            {stripUnsafeChars(shortSha(capture.source_sha))}
+            {recoveryDiagnostic(shortSha(capture.source_sha))}
           </dd>
         </div>
         {capture.attempted_head_sha && (
           <div>
             <dt className="inline text-faint">Attempted publish: </dt>
             <dd className="inline font-mono text-muted">
-              {stripUnsafeChars(shortSha(capture.attempted_head_sha))}
+              {recoveryDiagnostic(shortSha(capture.attempted_head_sha))}
             </dd>
           </div>
         )}
-        {capture.prerequisite_shas && capture.prerequisite_shas.length > 0 && (
+        {Array.isArray(capture.prerequisite_shas) && capture.prerequisite_shas.length > 0 && (
           <div className="sm:col-span-2">
             <dt className="inline text-faint">Prerequisites: </dt>
             <dd className="inline text-muted">
               <span className="font-mono">
                 {capture.prerequisite_shas
-                  .map((s) => stripUnsafeChars(shortSha(s)))
+                  .slice(0, 64).map((s) => recoveryDiagnostic(shortSha(s)))
                   .join(", ")}
               </span>
               <p className="mt-1 text-xs text-muted">
@@ -350,7 +365,7 @@ function CaptureRow({
         )}
         {expiresIn && (
           <div>
-            <dt className="inline text-faint">Expires in: </dt>
+            <dt className="inline text-faint">Archive expires in: </dt>
             <dd className="inline text-muted">{expiresIn}</dd>
           </div>
         )}
@@ -358,9 +373,9 @@ function CaptureRow({
 
       {/* A bounded, sanitized reason (e.g. a needs_action cause). Untrusted worker text:
           escaped plain text via stripUnsafeChars, whitespace-pre-wrap, never <Markdown>. */}
-      {capture.reason && capture.reason.trim() !== "" && (
+      {typeof capture.reason === "string" && capture.reason.trim() !== "" && (
         <p className="mt-2 whitespace-pre-wrap break-words rounded-md bg-surface/60 px-2 py-1 text-xs text-muted">
-          {stripUnsafeChars(capture.reason)}
+          {recoveryDiagnostic(capture.reason)}
         </p>
       )}
     </li>

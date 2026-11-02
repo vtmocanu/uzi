@@ -1331,7 +1331,9 @@ uzi job file get <file-id> [-o path]
 When a run commits useful work but then fails to publish its head (a workflow or
 secret preflight, a rejected push, exhausted base alignment), uzi captures the run's
 original committed history into a durable, owner-only recovery archive — a real Git
-bundle that imports into a fresh clone even after the worker and its disk are gone.
+bundle retained independently of the worker and its disk. Thin bundles also need
+the declared prerequisite history in the destination clone; download verification
+alone does not establish importability. Follow the [confirmed-pin restore steps](run-recovery.md#restoring-with-a-confirmed-pin).
 `uzi run export` downloads that archive to a local file:
 
 ```
@@ -1366,10 +1368,41 @@ uzi run export <run-id> --output ./recovered.bundle
   `--json` instead prints the listed captures (archive DTOs, each with a `hold_id`) as a
   JSON array on stdout, still exiting 2 or 5.
 
-`uzi run get` also shows a metadata-only recovery summary for a terminal run that has
-captures (the archive count, per-state tally, and each available capture's id) so you
-know what `--capture` can fetch. It is metadata only and never claims an archive is
-available when it is not.
+The human `uzi run get` view also shows a metadata-only recovery summary for a terminal run that has
+captures: the archive count, per-state tally, and every retained capture's id, state,
+source, size, expiry and prerequisite-pin observations. Only `available` captures
+can be exported; the other states remain visible for inspection. These are recorded
+metadata, not a fresh forge probe or proof of Git importability.
+
+The optional owner `prerequisite_closure` is a persisted pin snapshot, with
+`state`, optional bounded `reason`, `pin_ref`, optional `pin_tip`,
+`absence_unconfirmed`, `cleanup_exhausted` and `updated_at`. It is not a
+fresh forge probe; `updated_at` is a record update, not last verification.
+
+- `pending`, `invoked` and `create_unknown`: protection not established;
+  uncertainty can persist indefinitely.
+- `pinned`: recorded protection conditional on external refs surviving;
+  `absence_unconfirmed` leaves availability uncertain.
+- `refused`, `foreign`, `lost` and `deleted`: respectively creation refused,
+  foreign content, lost pin and historical deletion; no protection by this pin.
+- `cleanup_exhausted` is independent, including alongside unconfirmed absence:
+  automatic deletes stopped; it grants no manual deletion permission.
+- No projection: older API or no matching row. Thin prerequisite availability is
+  unknown; a self-contained manifest reports no prerequisites and needs no pin.
+
+Capture details and export-choice refusals in `--json` preserve these facts.
+The human export-choice table shows only id, state, source, size and creation time;
+use `uzi run get` or `uzi run recovery <run-id>` for pin details. An available
+capture can be exported regardless of pin state, subject to a bound byte manifest
+and a successful download. Successful `export --json`
+still reports verified bytes/checksum only, with the existing result fields;
+it does not certify prerequisite availability or importability. Owner history
+is complete, with a constant two SQL queries for the summary, not bounded rows
+or response bytes. Pin metadata says nothing about latest local coverage,
+custody release, physical retirement or publication success. See the
+[restore procedure](run-recovery.md#restoring-with-a-confirmed-pin) for the
+explicit capture export, UUID-derived ref fetch and full recorded-tip comparison
+before native bundle verification/import.
 
 ### Reviewing and resolving held work: `uzi run recovery` / `uzi run discard`
 
@@ -1442,8 +1475,11 @@ uzi run recovery <run-id> [--json]
   The latest capture state and available archive are independent: an older download may
   omit latest work while a newer capture prepares/uploads. The same source, coverage,
   export and discard guidance as above follows. `--json` prints
-  the raw rows for scripting, each hold with a `captures` array (id, state, source_sha,
-  byte_size, created_at) whose ids `uzi run export --capture` takes; it's always `[]`
+  the rows for scripting, each hold with a `captures` array carrying id, state,
+  source_sha, byte_size, created_at and, when present, checksum,
+  prerequisite_shas (in recorded order), expires_at, attempted_head_sha and
+  prerequisite_closure. Its ids are accepted by
+  `uzi run export --capture`; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives
   its run) or the server predates capture-hold linking. Owner-only.
 - While the server retains the run's last published checkpoint on origin (PRD #1810), the
@@ -1491,15 +1527,16 @@ uzi run discard <run-id> --hold <hold-id> --yes
   only your own runs' holds.
 
 Prerequisite pins (`refs/uzi-prereq/<capture-id>`, #3591) are a separate
-API lifecycle. This CLI has no prerequisite-pin listing or expiry command;
-`run recovery`/`run held` do not show pin state. On a server that enables it for
-GitHub.com, a pinned thin archive can release custody through the archive FINAL
+API lifecycle. `run get` and `run recovery <run-id>` show recorded pin state
+with capture details; `run held` lists terminal held refs, not prerequisite pins.
+There is no dedicated prerequisite-pin listing or expiry command. On a server
+that enables it for GitHub.com, a pinned thin archive can release custody through the archive FINAL
 (#3727); otherwise it cannot authorize archive FINAL or local-source cleanup.
 Pinning alone never authorizes local cleanup: an ACK and the existing independent
 source, writer and shared-consumer guards still apply.
 See [prerequisite pin restore and backlog handling](run-recovery.md#prerequisite-pins-lifecycle-and-custody-release)
 for native Git restore, the release conditions and the frozen-binding/cleanup
-limits. Owner/CLI pin visibility belongs to C3.
+limits.
 
 ### Fetching and expiring terminal held refs: `uzi run held`
 
