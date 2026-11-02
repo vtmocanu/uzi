@@ -61,6 +61,33 @@ async function rig(t: TestContext) {
   return { fx, cache, bare, original, tip, envelope, link, config, retain, read, activate, activeKey };
 }
 
+it("settlement writes retain protected and unknown refs while legacy unprotected writes work", async t => {
+  const r = await rig(t);
+  const ref = "refs/uzi-settle/" + RUN + "/hold/source";
+  git(r.bare, ["update-ref", ref, r.tip]);
+  const next = git(r.bare, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+    "commit-tree", r.tip + "^{tree}", "-p", r.tip, "-m", "settlement candidate"]).trim();
+  const refs = () => git(r.bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+  const internal = r.cache as unknown as { runGit: (dir: string, args: string[]) => Promise<string> };
+  const runGit = internal.runGit.bind(r.cache);
+  let commitProbes = 0;
+  t.mock.method(internal, "runGit", async (dir: string, args: string[]) => {
+    if (args[0] === "rev-parse" && args.includes("--verify")) commitProbes++;
+    return runGit(dir, args);
+  });
+  for (const metadata of ["protected", "unknown"]) {
+    if (metadata === "protected") r.retain();
+    else r.config("uzi-retained." + RUN + ".journal", "{");
+    const before = refs();
+    assert.equal(await r.cache.pinSettlementRefs(r.bare, RUN, "hold", { source: next, adopted: next }), false);
+    assert.equal(refs(), before);
+    assert.equal(commitProbes, 0, "protection must precede ref verification");
+  }
+  git(r.bare, ["config", "--local", "--unset-all", "uzi-retained." + RUN + ".journal"]);
+  assert.equal(await r.cache.pinSettlementRefs(r.bare, RUN, "hold", { source: next }), true);
+  assert.equal(git(r.bare, ["rev-parse", ref]).trim(), next);
+});
+
 // Model ordinary recovery retaining a canonical source of unknown generation under G2.
 // No generation is assigned to that canonical source.
 function historicalFamily(r: Awaited<ReturnType<typeof rig>>, options: {

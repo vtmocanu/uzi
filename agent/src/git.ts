@@ -2797,11 +2797,17 @@ export class GitCache {
   /** Caller owns B, or uses the legacy unlocked pin-delete API. Never acquires B. */
   private async pinRestoreGenerationDenied(barePath: string, runId: string, generation?: number): Promise<boolean> {
     try {
-      return await this.withRecoveryOperation(new AbortController().signal, Date.now() + 30_000, async () =>
+      const read = async () =>
         this.pinProtectionReads.run(this.pinProtectionReads.getStore() ?? { bytes: 0, sources: 0 }, async () =>
-          (await this.readRetainedPinMetadata(barePath)).some(record =>
+          (await this.readRetainedPinMetadata(barePath, undefined, runId)).some(record =>
             record.envelope.runId === runId && (generation === undefined || !Number.isSafeInteger(generation) ||
-              generation <= record.protectedThroughGeneration))));
+              generation <= record.protectedThroughGeneration)));
+      const now = Date.now();
+      // Legacy episode clock validation must still be able to persist clock_invalid.
+      // Without a finite wall clock, retain native Git timeouts and all metadata validation.
+      return await (Number.isFinite(now)
+        ? this.withRecoveryOperation(new AbortController().signal, now + 30_000, read)
+        : read());
     } catch { return true; }
   }
 
@@ -7069,6 +7075,7 @@ export class GitCache {
     if (!entries.every(([, sha]) => /^[0-9a-f]{40}$/.test(sha))) return false;
     try {
       return await this.withLock(barePath, async () => {
+        if (await this.pinRestoreGenerationDenied(barePath, runId)) return false;
         for (const [, sha] of entries) {
           const present = (
             await this.runGit(barePath, ["rev-parse", "--verify", `${sha}^{commit}`]).catch(() => "")
@@ -7652,15 +7659,16 @@ export class GitCache {
 
 
   /** Strict metadata-only V2 view. It grants neither source access nor execution. */
-  async readRetainedPinMetadata(barePath: string, config?: readonly string[]): Promise<Array<{
+  async readRetainedPinMetadata(barePath: string, config?: readonly string[], selectedRunId?: string): Promise<Array<{
     raw: string; envelope: RetainedPinEnvelope; activeRaw: string | undefined; activeJournal: RecoveryJournalEntry | undefined;
     relation: "prepared-old" | "prepared-new" | "ready-new" | "absent";
     originals: Array<{ raw: string; journal: RecoveryJournalEntry; generation: number; sourceEpoch: string }>;
     protectedThroughGeneration: number;
   }>> {
-    if (!this.recoveryOperations.getStore())
-      return this.withRecoveryOperation(new AbortController().signal, Date.now() + 30_000,
-        () => this.readRetainedPinMetadata(barePath, config));
+    const now = Date.now();
+    if (!this.recoveryOperations.getStore() && Number.isFinite(now))
+      return this.withRecoveryOperation(new AbortController().signal, now + 30_000,
+        () => this.readRetainedPinMetadata(barePath, config, selectedRunId));
     await this.assertRecoveryBare(barePath);
     const entries = config ?? (await this.runGit(barePath,
       ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
@@ -7671,12 +7679,42 @@ export class GitCache {
         throw new Error("pin protection metadata limit");
     }
     const values = new Map<string, string>();
+    const retainedValues = new Map<string, unknown>();
     const decoded = new Map<string, RecoveryJournalEntry>();
     const budget = this.pinRestoreBudgets.getStore() ?? new PinRestoreDecodeBudget();
     for (const item of entries) {
       if (!item) continue;
       const nl = item.indexOf("\n"), name = nl < 0 ? item : item.slice(0, nl);
       if (!name.startsWith("uzi-retained.") && !name.startsWith("uzi-recovery.")) continue;
+      if (name.startsWith("uzi-retained.")) {
+        const applicable = selectedRunId === undefined || name === `uzi-retained.${selectedRunId}.journal`;
+        const raw = item.slice(nl + 1);
+        // V1 keeps protectedRecoveries' JSON semantics and selected-run isolation.
+        // Once a V2 root field is seen, malformed evidence cannot take that legacy path.
+        let newForm = false;
+        let value: unknown;
+        try {
+          value = parsePinRestoreJson(raw, GIT_MAX_BUFFER, key => {
+            if (!["version", "branch", "key", "journal"].includes(key)) newForm = true;
+          });
+        } catch (error) {
+          if (newForm) throw error;
+          try { value = JSON.parse(raw); } catch {
+            if (!applicable) continue;
+            throw error;
+          }
+          if (!value || typeof value !== "object" || Array.isArray(value) ||
+              (value as Record<string, unknown>).version !== 1) throw error;
+        }
+        if (!newForm && value && typeof value === "object" && !Array.isArray(value) &&
+            (value as Record<string, unknown>).version === 1 && !applicable) continue;
+        if (value && typeof value === "object" && "version" in value && value.version === 1 &&
+            (nl < 0 || (values.has(name) &&
+              (retainedValues.get(name) as Record<string, unknown> | undefined)?.version === 1)))
+          throw new Error("invalid protected recovery descriptor");
+        if (nl < 0 || values.has(name)) throw new Error("ambiguous retained pin attribution");
+        retainedValues.set(name, value);
+      }
       if (nl < 0 || values.has(name)) throw new Error("ambiguous retained pin attribution");
       values.set(name, item.slice(nl + 1));
     }
@@ -7689,7 +7727,7 @@ export class GitCache {
     let ledger: Array<[string, string]> | undefined;
     for (const [name, raw] of values) {
       if (!name.startsWith("uzi-retained.")) continue;
-      const value = parsePinRestoreJson(raw, GIT_MAX_BUFFER);
+      const value = retainedValues.get(name);
       if (!value || typeof value !== "object" || Array.isArray(value) || !("version" in value))
         throw new Error("invalid retained pin descriptor");
       if (value.version === 1) continue; // The original decoder still owns V1 semantics.
@@ -7828,8 +7866,8 @@ export class GitCache {
     return paths;
   }
 
-  private async refusePinRestoreLegacy(barePath: string, branch: string): Promise<void> {
-    if ((await this.readRetainedPinMetadata(barePath)).some(r => r.envelope.branch === branch))
+  private async refusePinRestoreLegacy(barePath: string, branch: string, selectedRunId?: string): Promise<void> {
+    if ((await this.readRetainedPinMetadata(barePath, undefined, selectedRunId)).some(r => r.envelope.branch === branch))
       throw new Error("pin restore retained source requires independent handoff");
   }
 
@@ -7838,7 +7876,7 @@ export class GitCache {
     validatedPins?: Awaited<ReturnType<GitCache["readRetainedPinMetadata"]>>): Promise<Array<{ branch: string; key: string; journal: RecoveryJournalEntry; pinEnvelope?: RetainedPinEnvelope }>> {
     await this.assertRecoveryBare(barePath);
     const records: Array<{ branch: string; key: string; journal: RecoveryJournalEntry; pinEnvelope?: RetainedPinEnvelope }> = [];
-    const pinRecords = validatedPins ?? await this.readRetainedPinMetadata(barePath);
+    const pinRecords = validatedPins ?? await this.readRetainedPinMetadata(barePath, undefined, selectedRunId);
     for (const r of pinRecords) {
       if (selectedRunId !== undefined && r.envelope.runId !== selectedRunId) continue;
       for (const original of r.originals) records.push({
@@ -7854,7 +7892,7 @@ export class GitCache {
       const match = /^uzi-retained\.([^.]+)\.journal$/.exec(name);
       if (!match || seen.has(name) || nl < 0) throw new Error("invalid protected recovery descriptor");
       seen.add(name);
-      const record = parsePinRestoreJson(item.slice(nl + 1), GIT_MAX_BUFFER) as Record<string, unknown>;
+      const record = JSON.parse(item.slice(nl + 1));
       if (record?.version === 2) continue;
       if (!record || typeof record !== "object" || Array.isArray(record) || record.version !== 1 ||
           Object.keys(record).sort().join(",") !== "branch,journal,key,version" ||
@@ -7946,7 +7984,7 @@ export class GitCache {
     detached?: RecoveryJournalEntry, allowLegacyRepair = true,
   ): Promise<RecoveryJournalEntry> {
     const { journal, repair } = await this.attributedRecovery(barePath, branch, key, expected, detached, allowLegacyRepair);
-    await this.refusePinRestoreLegacy(barePath, branch);
+    await this.refusePinRestoreLegacy(barePath, branch, expected.runId);
     let missing = false;
     // One pass over the recorded sources, no retries. Any unsafe sibling refuses discovery.
     for (const source of this.recoverySources(journal)) {

@@ -660,11 +660,16 @@ describe("own capture source generation durability", () => {
   });
 
   it("preserves active pin linkage while recording the identical own generation", async () => {
+    retain();
     activate();
-    const journal = { ...newJournal(), completionSourceFence: FENCE };
+    const journal = { ...newJournal(), completionSourceFence: { ...FENCE, sourceUseEpoch: NEW_EPOCH } };
     config(ACTIVE_KEY, JSON.stringify(journal));
+    assert.equal((await cache.readRetainedPinMetadata(bare))[0]!.relation, "prepared-new");
+    const retainedRaw = rawConfig(RETAINED_KEY);
     await cache.markRecoveryCapture(bare, link.successor.clonePath, BRANCH, RUN, ATTEMPT, undefined, 2);
     assert.deepEqual(JSON.parse(rawConfig(ACTIVE_KEY)), journal);
+    assert.equal(rawConfig(RETAINED_KEY), retainedRaw);
+    assert.equal((await cache.readRetainedPinMetadata(bare))[0]!.relation, "prepared-new");
   });
 
   it("validates generation and attempt path before effects", async () => {

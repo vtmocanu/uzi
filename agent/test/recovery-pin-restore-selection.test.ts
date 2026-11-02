@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { it, type TestContext } from "node:test";
 import { acquireWorkerLifetime } from "../src/authority-lock.js";
@@ -227,6 +228,121 @@ it("verifies advertised bundle bytes, header, and prerequisite facts without fab
   r.write({ ...bundled, byteSize: badHeader.length, checksum: createHash("sha256").update(badHeader).digest("hex") });
   await r.refuse();
 });
+
+it("caps every raw inventory visit before filtering", async t => {
+  const r = await rig(t);
+  const dir = path.dirname(r.file);
+  for (let i = 0; i < 8192; i++) fs.writeFileSync(path.join(dir, "untrusted-" + i), "");
+  const opendir = fsp.opendir;
+  let visits = 0;
+  t.mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+    const h = await Reflect.apply(opendir, fsp, args);
+    if (args[0] === dir) {
+      const read = h.read.bind(h);
+      t.mock.method(h, "read", async () => { visits++; return read(); });
+    }
+    return h;
+  });
+  await r.refuse();
+  assert.equal(visits, 4096);
+});
+
+it("shares the item cap across all scoped revalidations without resetting it", async t => {
+  const r = await rig(t);
+  let validations = 0, exhausted = false;
+  const result = await r.coordinator.withPinRestoreRecord({ ...r.input(), deadline: Date.now() + 30_000 }, async s => {
+    for (let i = 0; i < 4096; i++) {
+      if (!await s.revalidate()) break;
+      validations++;
+    }
+    exhausted = !await s.revalidate();
+  });
+  assert.ok(validations > 0);
+  assert.ok(validations < 2048, "each listing charges the record and EOF");
+  assert.equal(exhausted, true, "exhaustion stays latched");
+  assert.equal(result.kind, "refused");
+});
+
+async function bundledRig(t: TestContext) {
+  const r = await rig(t);
+  const fx = makeFixture();
+  t.after(() => fx.cleanup());
+  const bundlePath = path.join(path.dirname(r.file), r.initial.captureId + ".bundle");
+  const git = (args: string[]) => execFileSync("git", ["-C", fx.originPath, ...args], { encoding: "utf8",
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } }).trim();
+  const sourceSha = git(["rev-parse", "HEAD"]);
+  git(["update-ref", "refs/heads/recovered-source", sourceSha]);
+  git(["bundle", "create", bundlePath, "refs/heads/recovered-source"]);
+  const body = fs.readFileSync(bundlePath);
+  r.write({ ...r.initial, sourceSha, state: "bundled", bundlePath, byteSize: body.length,
+    checksum: createHash("sha256").update(body).digest("hex"), chunkCount: 1, prerequisiteShas: [], selfContained: true });
+  return r;
+}
+
+// Observe both legacy whole-file IO and bounded handle IO through the public selector.
+function observeRecordReads(t: TestContext, file: string, beforeOpen?: (visit: number) => void) {
+  let bytes = 0, opens = 0, wholeReads = 0;
+  const open = fsp.open, readFile = fsp.readFile;
+  t.mock.method(fsp, "readFile", async (...args: Parameters<typeof fsp.readFile>) => {
+    if (args[0] === file) { wholeReads++; beforeOpen?.(++opens); }
+    const value = await Reflect.apply(readFile, fsp, args);
+    if (args[0] === file) bytes += Buffer.byteLength(value);
+    return value;
+  });
+  t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+    if (args[0] === file) beforeOpen?.(++opens);
+    const h = await Reflect.apply(open, fsp, args);
+    if (args[0] === file) {
+      const read = h.read.bind(h);
+      t.mock.method(h, "read", async (...readArgs: Parameters<typeof h.read>) => {
+        const result = await Reflect.apply(read, h, readArgs);
+        bytes += result.bytesRead;
+        return result;
+      });
+    }
+    return h;
+  });
+  return () => ({ bytes, opens, wholeReads });
+}
+
+it("caps cumulative metadata bytes including nested bundle reopens and revalidation IO", async t => {
+  const r = await bundledRig(t);
+  const raw = fs.readFileSync(r.file, "utf8");
+  fs.writeFileSync(r.file, " ".repeat(900 * 1024) + raw);
+  const reads = observeRecordReads(t, r.file);
+  let validations = 0, exhausted = false;
+  const result = await r.coordinator.withPinRestoreRecord({ ...r.input(), deadline: Date.now() + 30_000 }, async s => {
+    for (let i = 0; i < 40; i++) {
+      if (!await s.revalidate()) break;
+      validations++;
+    }
+    exhausted = !await s.revalidate();
+  });
+  assert.ok(validations > 0 && validations < 20, "nested reads share the same byte allowance");
+  assert.equal(exhausted, true);
+  assert.equal(result.kind, "refused");
+  assert.equal(reads().wholeReads, 0);
+  assert.ok(reads().bytes > 30 * 1024 ** 2);
+  assert.ok(reads().bytes <= 32 * 1024 ** 2);
+});
+
+for (const swap of ["oversize", "symlink", "unknown-field"] as const) {
+  it("strictly bounds the nested selected-record reopen after " + swap + " swap", async t => {
+    const r = await bundledRig(t);
+    const raw = fs.readFileSync(r.file, "utf8");
+    const alternate = path.join(r.root, "alternate.json");
+    fs.writeFileSync(alternate, raw);
+    const reads = observeRecordReads(t, r.file, visit => {
+      if (visit !== 2) return;
+      if (swap === "oversize") fs.writeFileSync(r.file, " ".repeat(2 * 1024 ** 2) + raw);
+      if (swap === "unknown-field") fs.writeFileSync(r.file, raw.replace('"version":1', '"version":1,"futureSchema":true'));
+      if (swap === "symlink") { fs.unlinkSync(r.file); fs.symlinkSync(alternate, r.file); }
+    });
+    await r.refuse();
+    assert.equal(reads().wholeReads, 0);
+    assert.ok(reads().bytes <= 1024 * 1024, "no oversize record bytes are consumed");
+  });
+}
 
 it("bounds queued authority and journal waits and rejects unsupported authority", async t => {
   const r = await rig(t);
