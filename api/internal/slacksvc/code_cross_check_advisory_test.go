@@ -269,6 +269,9 @@ func TestCodeCrossCheckAdvisoryRepeatedEvent(t *testing.T) {
 	}
 	base := count(nil)
 	with := count(failedCodeCC(codeCCParent(), txt("model_error"), "codex"))
+	if len(base) < 2 {
+		t.Fatalf("baseline must post the completion message once per event, got %d posts", len(base))
+	}
 	if len(with) != len(base) {
 		t.Fatalf("advisory changed the post count: %d vs baseline %d", len(with), len(base))
 	}

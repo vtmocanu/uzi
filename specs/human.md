@@ -333,6 +333,7 @@ Tracked as GitLab issue vtmocanu/uzi#24; PRD at `prds/done/24-mr-close-rework.md
 Tracked as GitLab issue vtmocanu/uzi#25; PRD at `prds/done/25-slack-integration.md`.
 
 - Per-user Slack DMs for run state (started, awaiting approval, completed + MR link, failed, cancelled).
+- A completed run whose advisory Code cross-check failed (not interrupted or superseded) adds one line to its existing Slack completion thread message: `Code cross-check incomplete: <fixed reason text>.`, plus `Publication continued.` only when a valid https MR link was recorded. No findings, raw reasons, extra message, mention or child DM; a run with no Slack anchor yet gets no line. (AI-synced 2026-11-02, #3813)
 - Approve/reject the plan-approval gate from Slack: buttons + threaded reject reason.
 - Reply from Slack to steer a live run (thread reply becomes a follow-up correction).
 - Socket Mode only — outbound-only; no inbound HTTP, no public URL. [user 2026-07-06]
