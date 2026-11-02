@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { MaintenanceResources } from "../src/recovery-maintenance.js";
 import { GitCache, type EpochRetainedLimits } from "../src/git.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
@@ -227,7 +228,7 @@ it("measurement abort joins an uncancellable lstat before returning partial", as
   assert.equal(result.sources[0]!.allocatedBytes, null);
 });
 
-it("epoch measurement walks a physical path once when multiple descriptors name it", async () => {
+it("#3775 epoch measurement walks a physical path once when multiple descriptors name it", async () => {
   const clonePath = cache.runnerClonePath(bare, "issue-3430");
   fs.mkdirSync(clonePath, { recursive: true });
   fs.writeFileSync(path.join(clonePath, "payload"), "retained");
@@ -247,6 +248,12 @@ it("epoch measurement walks a physical path once when multiple descriptors name 
   assert.equal(result.partial, false);
   assert.equal(walks, 1);
   assert.equal(result.sources[0]!.allocatedBytes, result.sources[1]!.allocatedBytes);
+  assert.deepEqual(result.partialCauses, {});
+  const capped = await inspect({ epoch: true, maxPhysicalPaths: 1, measureCaps: { maxEntries: 0 } });
+  assert.deepEqual(capped.partialCauses, { measurement_entry_cap: 1 });
+  assert.equal(capped.partial, true);
+  assert.equal(capped.unreadable, 0);
+  assert.equal(walks, 2);
 });
 
 for (const abort of [false, true]) {
@@ -329,6 +336,13 @@ it("epoch ref-record overflow refuses authority rather than truncating the owed 
   assert.equal(result.sources.length, 1);
   assert.equal(result.sources[0]!.disposition?.kind, "refused");
   assert.ok(result.sources[0]!.consumers.includes("blocker:owed_pins_unreadable"));
+  assert.deepEqual(result.partialCauses, {});
+  assert.equal(result.partial, false);
+  assert.equal(result.unreadable, 0);
+  attempts(1, bare, 1);
+  const sibling = await inspect({ epoch: true, maxDescriptors: 1, epochLimits: { maxMetadataRecords: 32 } });
+  assert.deepEqual(sibling.partialCauses, { inspection_descriptor_cap: 1 });
+  assert.equal(sibling.partial, true);
 });
 
 for (const key of ["uzi-attempts.agent/issue-3430.entry", "uzi-recovery.agent/issue-3430.clone", "uzi-retained.epoch-run.journal", "uzi-stopped.epoch-run.entry"]) {
@@ -411,3 +425,248 @@ for (const failingFirst of [true, false]) {
     assert.equal(await pending, undefined);
   });
 }
+
+it("#3775 a child ENOENT stays a complete measurement without a partial cause", async () => {
+  const [entry] = attempts(1);
+  fs.mkdirSync(entry!.clonePath, { recursive: true });
+  const payload = path.join(entry!.clonePath, "payload");
+  fs.writeFileSync(payload, "retained");
+  const lstat = fsp.lstat;
+  let hits = 0;
+  mock.method(fsp, "lstat", async (...args: Parameters<typeof fsp.lstat>) => {
+    if (args[0] === payload) { hits++; throw Object.assign(new Error("vanished"), { code: "ENOENT" }); }
+    return lstat(...args);
+  });
+  const result = await inspect({ epoch: true });
+  assert.equal(hits, 1);
+  assert.equal(result.partial, false);
+  assert.equal(result.unreadable, 0);
+  assert.equal(result.sources[0]!.bytesState, "measured");
+  assert.deepEqual(result.partialCauses, {});
+});
+
+for (const mode of ["entry", "pending", "depth", "deadline", "root", "open", "read", "child", "close", "cap-close", "read-close"] as const) {
+  it("#3775 measurement original-site causes " + mode, async () => {
+    const [entry] = attempts(1);
+    const root = entry!.clonePath;
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, "payload"), "retained");
+    fs.mkdirSync(path.join(root, "dir"));
+    fs.mkdirSync(path.join(root, "dir2"));
+    const open = fsp.opendir, lstat = fsp.lstat;
+    let rootStats = 0, hits = 0, clock = 0;
+    mock.method(fsp, "lstat", async (...args: Parameters<typeof fsp.lstat>) => {
+      if ((mode === "root" && args[0] === root && ++rootStats === 2) ||
+          (mode === "child" && String(args[0]).startsWith(root + path.sep))) {
+        hits++; throw Object.assign(new Error("private"), { code: "EACCES" });
+      }
+      return lstat(...args);
+    });
+    mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+      if (args[0] === root && mode === "open") { hits++; throw new Error("private"); }
+      const handle = await open(...args);
+      if (args[0] === root) {
+        if (mode === "deadline") clock = 100;
+        if (mode === "read" || mode === "read-close") mock.method(handle, "read", async () => { hits++; throw new Error("private"); });
+        if (mode === "close" || mode === "cap-close" || mode === "read-close") {
+          const close = handle.close.bind(handle);
+          mock.method(handle, "close", async () => { await close(); hits++; throw new Error("private"); });
+        }
+      }
+      return handle;
+    });
+    const caps = mode === "entry" || mode === "cap-close" ? { maxEntries: 1 } :
+      mode === "pending" ? { maxPending: 0 } : mode === "depth" ? { maxDepth: 0 } : {};
+    const result = await inspect({ epoch: true, measureCaps: caps, now: () => clock, budgetMs: 100 });
+    const expected = mode === "entry" ? { measurement_entry_cap: 1 } :
+      mode === "cap-close" ? { measurement_entry_cap: 1, measurement_filesystem_error: 1 } :
+      mode === "pending" ? { measurement_pending_cap: 1 } : mode === "depth" ? { measurement_depth_cap: 1 } :
+      mode === "deadline" ? { measurement_deadline: 1 } :
+      { measurement_filesystem_error: mode === "read-close" ? 2 : 1 };
+    assert.deepEqual(result.partialCauses, expected);
+    assert.equal(result.partial, true);
+    assert.equal(result.sources.length, 1);
+    assert.equal(result.sources[0]!.allocatedBytes, null);
+    assert.equal(result.unreadable, ["read", "close", "cap-close", "read-close"].includes(mode) ? 1 : 0);
+    if (["root", "open", "read", "child", "close", "cap-close", "read-close"].includes(mode)) assert.ok(hits > 0);
+  });
+}
+
+for (const [limits, key] of [
+  [{ maxMetadataBytes: 32 }, "census_metadata_byte_cap"],
+  [{ maxMetadataRecords: 1 }, "census_metadata_record_cap"],
+  [{ maxSeenPaths: 1 }, "census_seen_path_cap"],
+] as const) {
+  it("#3775 census original-site " + key, async () => {
+    attempts(2);
+    const result = await cache.discoverEpochRetainedSources({ limits });
+    assert.equal(result.inventoryComplete, false);
+    assert.deepEqual(result.partialCauses, { [key]: 1 });
+    assert.deepEqual((await inspect()).partialCauses, {});
+  });
+}
+it("#3775 inspection budget deadline interruption and descriptor/path limits", async () => {
+  attempts(2);
+  for (const [options, expected] of [
+    [{ budgetMs: 0 }, { inspection_budget: 1 }],
+    [{ deadline: 0 }, { inspection_deadline: 1 }],
+    [{ signal: AbortSignal.abort() }, { inspection_interrupted: 1 }],
+    [{ maxDescriptors: 1 }, { inspection_descriptor_cap: 1 }],
+    [{ maxPhysicalPaths: 1 }, { inspection_physical_path_cap: 1 }],
+  ] as const) {
+    const result = await inspect({ epoch: true, ...options });
+    assert.equal(result.partial, true);
+    assert.deepEqual(result.partialCauses, expected);
+  }
+});
+it("#3775 concurrent epoch census inspection and operator calls on the SAME GitCache are isolated", async () => {
+  const [entry] = attempts(1);
+  fs.mkdirSync(entry!.clonePath, { recursive: true });
+  fs.writeFileSync(path.join(entry!.clonePath, "a"), "a");
+  fs.writeFileSync(path.join(entry!.clonePath, "b"), "b");
+  let ready!: () => void, release!: () => void;
+  const started = new Promise<void>(r => { ready = r; });
+  const held = new Promise<void>(r => { release = r; });
+  const open = fsp.opendir;
+  let hits = 0;
+  mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+    const handle = await open(...args);
+    if (args[0] === entry!.clonePath && ++hits === 1) { ready(); await held; }
+    return handle;
+  });
+  const pending = inspect({ epoch: true, measureCaps: { maxEntries: 1 } });
+  await started;
+  try {
+    const census = await cache.discoverEpochRetainedSources({ limits: { maxMetadataBytes: 32 } });
+    assert.deepEqual(census.partialCauses, { census_metadata_byte_cap: 1 });
+    const sibling = await inspect({ epoch: true });
+    assert.deepEqual(sibling.partialCauses, {});
+    assert.equal(sibling.partial, false);
+    const operator = await inspect();
+    assert.deepEqual(operator.partialCauses, {});
+    assert.equal(operator.partial, false);
+  } finally { release(); }
+  assert.deepEqual((await pending).partialCauses, { measurement_entry_cap: 1 });
+  assert.equal(hits, 3);
+});
+
+for (const mode of ["native", "metered", "boundary"] as const) {
+  it("#3775 metadata byte cap survives " + mode + " subprocess wrapping", async () => {
+    attempts(1);
+    const discover = () => cache.discoverEpochRetainedSources({ limits: { maxMetadataBytes: 32 } });
+    let launches = 0;
+    const result = mode === "metered" ? await MaintenanceResources.runDiscovery(discover) :
+      mode === "boundary" ? await cache.withBoundaryProcessSpawner(async request => {
+        launches++;
+        const child = spawn(request.argv[0]!, request.argv.slice(1), { cwd: request.cwd, env: request.env, stdio: "pipe" });
+        const completed = new Promise<{ code: number }>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("close", code => resolve({ code: code ?? 128 }));
+        });
+        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed,
+          cancel: async () => { child.kill(); await completed; } };
+      }, new AbortController().signal, discover) : await discover();
+    assert.deepEqual(result.partialCauses, { census_metadata_byte_cap: 1 });
+    assert.equal(result.inventoryComplete, false);
+    assert.equal(result.unreadable, 1);
+    assert.equal(result.groups.length, 0);
+    if (mode === "boundary") assert.ok(launches > 0);
+  });
+}
+it("#3775 source record expansion has its own cap", async () => {
+  const [entry] = attempts(1);
+  const source = { runId: entry!.runId, clonePath: entry!.clonePath, attemptId: entry!.attemptId };
+  git(bare, ["config", "--local", "uzi-recovery.agent/issue-3430.clone",
+    JSON.stringify({ ...source, retainedSources: Array.from({ length: 33 }, () => source) })]);
+  const result = await cache.discoverEpochRetainedSources({ limits: { maxMetadataRecords: 32 } });
+  assert.equal(result.inventoryComplete, false);
+  assert.deepEqual(result.partialCauses, { census_source_record_cap: 1 });
+  const inspected = await inspect({ epoch: true, epochLimits: { maxMetadataRecords: 32 } });
+  assert.deepEqual(inspected.partialCauses, { inspection_source_record_cap: 1 });
+});
+
+it("#3775 census and shared listing entry/bare caps retain exact cause families", async () => {
+  attempts(1);
+  const second = path.join(path.dirname(bare), "second.git");
+  git(path.dirname(bare), ["clone", "--bare", fixture.originPath, second]);
+  fs.chmodSync(second, 0o700);
+  for (const [limits, suffix] of [[{ maxDirectoryEntries: 1 }, "entry_cap"], [{ maxBares: 1 }, "bare_cap"]] as const) {
+    const census = await cache.discoverEpochRetainedSources({ limits });
+    assert.equal(census.inventoryComplete, false);
+    assert.deepEqual(census.partialCauses, { ["census_" + suffix]: 1 });
+    const inspection = await cache.inspectRetainedSources({ epoch: true, epochLimits: limits, isLivePath: () => false });
+    assert.equal(inspection.unreadable, 1);
+    assert.deepEqual(inspection.partialCauses, { ["inspection_" + suffix]: 1 });
+  }
+});
+it("#3775 physical census omission and inspection metadata caps are independently named", async () => {
+  attempts(2);
+  const census = await cache.discoverEpochRetainedSources({ maxPhysicalPaths: 1 });
+  assert.equal(census.inventoryComplete, true);
+  assert.equal(census.overflow, 1);
+  assert.deepEqual(census.partialCauses, { census_physical_path_cap: 1 });
+  for (const [epochLimits, suffix] of [[{ maxMetadataBytes: 32 }, "metadata_byte_cap"], [{ maxMetadataRecords: 1 }, "metadata_record_cap"]] as const) {
+    const result = await inspect({ epoch: true, epochLimits });
+    assert.equal(result.unreadable, 1);
+    assert.deepEqual(result.partialCauses, { ["inspection_" + suffix]: 1 });
+  }
+});
+it("#3775 unreadable and census deadline/interruption aggregation", async () => {
+  const interrupted = await cache.discoverEpochRetainedSources({ signal: AbortSignal.abort() });
+  assert.deepEqual(interrupted.partialCauses, { census_interrupted: 1 });
+  const deadline = await cache.discoverEpochRetainedSources({ deadline: 0 });
+  assert.deepEqual(deadline.partialCauses, { census_deadline: 1 });
+  const open = fsp.opendir;
+  let hits = 0;
+  mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+    if (args[0] === path.dirname(bare)) { hits++; throw Object.assign(new Error("private"), { code: "EACCES" }); }
+    return open(...args);
+  });
+  const unreadable = await cache.discoverEpochRetainedSources();
+  assert.deepEqual(unreadable.partialCauses, { census_unreadable: 1 });
+  assert.equal(unreadable.unreadable, 1);
+  assert.equal(hits, 1);
+  fs.appendFileSync(path.join(bare, "config"), "\n[broken\n");
+  const inspected = await inspect({ epoch: true });
+  assert.deepEqual(inspected.partialCauses, { inspection_unreadable_bare: 1 });
+  assert.equal(inspected.unreadable, 1);
+});
+it("#3775 one binding failure diagnoses once while repeated skips retain old unreadable counts", async () => {
+  const entries = attempts(3);
+  const sources = entries.map(e => ({ runId: e.runId, clonePath: e.clonePath, attemptId: e.attemptId }));
+  git(bare, ["config", "--local", "uzi-recovery.agent/issue-3430.clone", JSON.stringify({ ...sources[0], retainedSources: sources.slice(1) })]);
+  for (const entry of entries) fs.mkdirSync(entry.clonePath, { recursive: true });
+  let checks = 0;
+  const result = await inspect({ epoch: true, beforeTree: () => { checks++; throw "binding primitive"; } });
+  assert.equal(result.partial, true);
+  assert.equal(result.unreadable, 3);
+  assert.equal(checks, 1);
+  assert.deepEqual(result.partialCauses, { tree_binding_failed: 1 });
+  assert.ok(result.sources.every(s => s.disposition === undefined && s.epochSettlement === undefined));
+});
+it("#3775 shared-path throwing measurement counts original events once without caching the old thrown result", async () => {
+  const clonePath = cache.runnerClonePath(bare, "issue-3430");
+  fs.mkdirSync(clonePath, { recursive: true });
+  for (const generation of [1, 2]) {
+    const marker = { version: 1, runId: "epoch-run", branch: "agent/issue-3430", key: "issue-3430",
+      clonePath, generation, journalDigest: "a".repeat(64), reason: "stale_claim", at: new Date().toISOString() };
+    git(bare, ["config", "--local", "--add", "uzi-stopped.epoch-run.entry", JSON.stringify(marker)]);
+  }
+  const open = fsp.opendir;
+  let walks = 0;
+  mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+    const handle = await open(...args);
+    if (args[0] === clonePath) {
+      walks++;
+      mock.method(handle, "read", async () => { throw new Error("read"); });
+      const close = handle.close.bind(handle);
+      mock.method(handle, "close", async () => { await close(); throw new Error("close"); });
+    }
+    return handle;
+  });
+  const result = await inspect({ epoch: true });
+  assert.equal(walks, 2);
+  assert.equal(result.unreadable, 2);
+  assert.equal(result.partial, true);
+  assert.deepEqual(result.partialCauses, { measurement_filesystem_error: 2 });
+});
