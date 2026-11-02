@@ -31,7 +31,7 @@ import { AuthorityRefusal, SourceUseHeldRefusal } from "./authority-lock.js";
 import type { AuthorityRuntime, AuthorityWait } from "./authority-runtime.js";
 import { leaseEpoch, leaseHarness, type SourceUseLease } from "./completion-authority.js";
 import { buildClaudeSourceCore, buildCodexSourceCore, serializeSourceFence, sourceFenceOf } from "./completion-source.js";
-import type { MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
+import type { MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult, TrackingAttemptToken } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
   RecoveryChargeInterruptedError,
@@ -2491,6 +2491,8 @@ interface RunFlight {
   /** Set once the per-run owed-candidate cap refused a pin: the run is stopped through the
    *  ordinary preservation-failure path ({@link RunRunner.stopForOwedLimit}). */
   owedLimitStop: PreservationRefusedError | undefined;
+  /** issue #3780: lazily minted by owedOptions; threads GitCache's stranded-attempt repair through every import. */
+  trackingAttemptToken?: TrackingAttemptToken;
   /** Heads and archive notices this run already announced; shared across claims on this worker. */
   owedAnnounced: OwedAnnounced;
   inventoryArchiveNotices: Set<string>;
@@ -16613,7 +16615,23 @@ export class RunRunner {
       throw error;
     }
     if (context.barePath !== barePath || context.branch !== branch) throw new Error("owed candidate flight context changed");
-    return { context, remotelyConfirmedSha: flight.lastCheckpointRefTip };
+    flight.trackingAttemptToken ??= this.git.newTrackingAttemptToken(() => this.ownershipRepairAdmitted(flight));
+    return { context, remotelyConfirmedSha: flight.lastCheckpointRefTip, attemptToken: flight.trackingAttemptToken };
+  }
+
+  /** issue #3780: the admission predicate GitCache checks under the bare lock before EACH write that
+   *  finishes this flight's own stranded tracking-ownership update. Pure and synchronous. False once
+   *  anything revoked the flight's authority (see SteeringChannel.ownershipRepairAuthority), the owed
+   *  cap stopped the run, the Codex registry is unusable, or a tick group / bare lock is still retained. */
+  private ownershipRepairAdmitted(flight: RunFlight): boolean {
+    const steering = flight.steering as SteeringChannel | undefined;
+    if (!steering?.ownershipRepairAuthority() || flight.owedLimitStop !== undefined) return false;
+    const safety = flight.executor?.safety as { registryState?: () => string } | undefined;
+    if (safety) {
+      const state = safety.registryState?.();
+      if (state === undefined || state === "poisoned" || state === "disposed") return false;
+    }
+    return flight.survivingTickGroups.length === 0 && flight.retainedBareLocks.length === 0;
   }
 
   private owedAnnouncedFor(runId: string): OwedAnnounced {

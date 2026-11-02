@@ -1451,6 +1451,17 @@ export class SteeringChannel {
     return this.shutdownCheckpoint;
   }
 
+  /** issue #3780: read-only. True only while nothing has revoked this flight's authority to finish a
+   *  stranded tracking-ownership update: no terminal lifecycle, shutdown, flight end, receipt failure,
+   *  cancel, claim fence, pending credential switch, disk pause or shutdown checkpoint. A cooperative
+   *  PauseNow (terminal=false) leaves it true; a later terminal abort turns it false. */
+  ownershipRepairAuthority(): boolean {
+    return !this.lifecycleEnded && !this.terminalLifecycle.signal.aborted && !this.shutdownStop.signal.aborted &&
+      this.flightEnded === undefined && this.receiptFailure === undefined && !this.cancelled &&
+      this.fence === undefined && this.pendingSwitchGeneration === undefined && this.pauseMode !== "disk" &&
+      this.shutdownCheckpoint === undefined;
+  }
+
   /** Stop execution with existing reasons while preserving the shutdown sink's separate stop signal. */
   workerShutdown(deadlineAt: number): GracefulShutdownCheckpoint {
     if (this.shutdownCheckpoint) return this.shutdownCheckpoint;

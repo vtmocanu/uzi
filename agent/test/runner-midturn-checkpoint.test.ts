@@ -15,6 +15,7 @@ import type { BoundaryPermit, BoundaryProcessRequest, CodexExecutionSafety } fro
 import { CodexBoundaryError } from "../src/codex/safety.js";
 import { codexRig } from "./runner-codex-sinks-fixture.js";
 import { GitCache } from "../src/git.js";
+import { PauseNowSignal } from "../src/steering.js";
 import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { defaultGitleaksShim, shimCalls, writeGitleaksShim as writeShim } from "./gitleaks-shim.js";
 import { realProcfsSkip } from "./real-procfs.js";
@@ -4323,5 +4324,130 @@ describe("mid-turn checkpoint soft stop (issue #3780)", () => {
     } finally {
       await settleAndClean({ ctl, restore: pub.restore, paths: [tmp] });
     }
+  });
+});
+
+// ── issue #3780 M2 — a stranded ownership update is finished by the SAME flight's later import ──────
+//
+// The tick's 120 s hard cap fires after the pending receipt write, stranding `phase:"pending"` with the
+// ref unchanged. The same flight's done checkpoint and finalize import must finish it (not fail the run
+// with ownership_unknown), but only while the flight's repair authority holds.
+describe("stranded ownership repair across the same flight (issue #3780 M2)", () => {
+  type Stranded = {
+    claim: ReturnType<typeof gitlabClaim>; g: GitCache; branch: string; sha: string; fg: ReturnType<typeof fakeGitlab>;
+    afterTick: { tip: string | null; phase: string | undefined };
+    stamp: () => string | undefined;
+  };
+
+  /** Strand the receipt with the tick hard cap, then run `between` (still inside the turn) and let the
+   *  run end normally so its done checkpoint and finalize import. */
+  async function strandedFlight(iid: number,
+    between: (steering: { abortLifecycle(reason?: unknown, terminal?: boolean): void }, s: Stranded) => void | (() => void),
+    check: (s: Stranded) => Promise<void>): Promise<void> {
+    const tmp = scratchDir(`m2-repair-${iid}`);
+    const ctl = control();
+    let capturing = false;
+    let hardCap: (() => void) | undefined;
+    const realSetTimer = ctl.setTimer;
+    ctl.setTimer = (cb, ms) => {
+      if (capturing && ms === 120_000) { hardCap = cb; return () => {}; }
+      return realSetTimer(cb, ms);
+    };
+    const fg = fakeGitlab();
+    const g = mkGit(fx.dataDir, writeShim(tmp, "detect"));
+    const claim = gitlabClaim(iid, { claim_generation: 1 });
+    const branch = `agent/issue-${iid}`;
+    const pub = stubPublish(async (_n, _tip, pack) => { await drain(pack); return LANDED; });
+    const stampOf = (): string | undefined => {
+      try {
+        return execFileSync("git", ["-C", g.barePathFor(fx.originPath), "config", "--local", "--get",
+          `uzi-trackowner.${branch}.owner`], { encoding: "utf8", env: GIT_ENV }).trim();
+      } catch { return undefined; }
+    };
+    const s: Stranded = { claim, g, branch, sha: "", fg, afterTick: { tip: null, phase: undefined }, stamp: stampOf };
+    let restore: (() => void) | undefined;
+    let undoBetween: (() => void) | void;
+    let runner: RunRunner | undefined;
+    try {
+      const factory: ExecutorFactory = () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            await recordingTurnErrors(async () => {
+              s.sha = commitIn(ctx.worktreePath, "R.txt", "r\n");
+              restore = afterPendingReceipt(g, async () => { hardCap!(); await yieldLoop(); });
+              ctl.advance(INTERVAL_MS + 1);
+              capturing = true;
+              try { assert.equal(await bounded(ctl.fire(), TEARDOWN_MS, "hard-capped tick"), "aborted"); }
+              finally { capturing = false; }
+              s.afterTick = trackingState(g, branch);
+              assert.equal(s.afterTick.phase, "pending", "the hard cap stranded the pending receipt");
+              assert.notEqual(s.afterTick.tip, s.sha, "the hard cap stopped before the CAS");
+              const active = (runner as unknown as {
+                activeRuns: Map<string, { steering: { abortLifecycle(reason?: unknown, terminal?: boolean): void } }>;
+              }).activeRuns;
+              undoBetween = between([...active.values()][0]!.steering, s);
+            });
+            return { branch: ctx.branch };
+          },
+        },
+      });
+      runner = mkRunner(g, factory, ctl, { gitlab: fg.gitlab });
+      await runner.execute(claim);
+      await check(s);
+    } finally {
+      await settleAndClean({ ctl, runners: runner ? [runner] : [], restore: () => { restore?.(); undoBetween?.(); pub.restore(); }, paths: [tmp] });
+    }
+  }
+
+  it("(i) the same flight's done checkpoint and finalize finish the stranded update and create the MR", async () => {
+    await strandedFlight(3780_201, () => undefined, async (s) => {
+      assert.equal(finalStatus(s.claim.run_id), "completed");
+      assert.deepEqual(trackingState(s.g, s.branch), { tip: s.sha, phase: "committed" });
+      assert.equal(s.stamp(), s.claim.run_id);
+      assert.ok(s.fg.calls.some((c) => c.method === "POST"), "the finalize import succeeded and the MR was created");
+    });
+  });
+
+  const refused = async (s: Stranded): Promise<void> => {
+    assert.equal(finalStatus(s.claim.run_id), "failed");
+    assert.deepEqual(trackingState(s.g, s.branch), { tip: s.afterTick.tip, phase: "pending" }, "nothing was written");
+    assert.equal(s.stamp(), undefined);
+    assert.ok(!s.fg.calls.some((c) => c.method === "POST"), "nothing was published");
+  };
+
+  it("(ii) a terminal abort before finalize refuses the repair", async () => {
+    await strandedFlight(3780_202, (steering) => { steering.abortLifecycle(new Error("terminal fixture")); }, refused);
+  });
+
+  it("(iv) a PauseNow followed by a terminal abort before the repair is refused", async () => {
+    await strandedFlight(3780_204, (steering) => {
+      steering.abortLifecycle(new PauseNowSignal(), false);
+      steering.abortLifecycle(new Error("terminal fixture"));
+    }, refused);
+  });
+
+  it("(iii) a terminal abort right after the repair CAS stops the repair: no stamp, no committed receipt, nothing published", async () => {
+    let restoreGit: (() => void) | undefined;
+    await strandedFlight(3780_203, (steering, s) => {
+      const internals = s.g as unknown as {
+        execScoped(command: string, args: string[], options: unknown): Promise<{ stdout: string; stderr: string }>;
+      };
+      const original = internals.execScoped.bind(s.g);
+      internals.execScoped = async (command, args, options) => {
+        const result = await original(command, args, options);
+        // The tick's own CAS never ran, so the first update of the tracking ref to the incoming sha is the repair's.
+        if (command === "git" && args.includes("update-ref") && args.includes(`refs/uzi-runner/${s.branch}`) && args.includes(s.sha)) {
+          steering.abortLifecycle(new Error("terminal fixture"));
+        }
+        return result;
+      };
+      restoreGit = () => { internals.execScoped = original; };
+      return restoreGit;
+    }, async (s) => {
+      assert.equal(finalStatus(s.claim.run_id), "failed");
+      assert.deepEqual(trackingState(s.g, s.branch), { tip: s.sha, phase: "pending" }, "the CAS landed; no committed receipt followed");
+      assert.equal(s.stamp(), undefined, "no stamp write after authority was revoked");
+      assert.ok(!s.fg.calls.some((c) => c.method === "POST"), "nothing was published");
+    });
   });
 });
