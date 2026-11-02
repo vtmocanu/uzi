@@ -1995,3 +1995,15 @@ describe("harness overflow shared DTO contract", () => {
     expect(unknown.preferred_score).toBeNull();
   });
 });
+
+
+it("created issues are optional detail metadata and excluded from summaries", () => {
+  expect(runZero).not.toHaveProperty("created_issues");
+  expect(runListItemZero).not.toHaveProperty("created_issues");
+  expect(runFull.created_issues).toEqual([{ iid: 1, title: "x", web_url: "x" }]);
+  expect(runSummaryItemFull).not.toHaveProperty("created_issues");
+  const coordinate: NonNullable<Run["created_issues"]>[number] = { iid: 42, title: "Created issue", web_url: "" };
+  expect(coordinate.web_url).toBe("");
+  const excluded: never = null as unknown as Extract<keyof RunSummaryItem, "created_issues">;
+  void excluded;
+});

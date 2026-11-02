@@ -921,10 +921,9 @@ type CreateIssueProposalParams struct {
 	Labels      []byte    `json:"labels"`
 }
 
-// The worker's propose_issue tool creates a PENDING proposal (PRD #39 M3, Decision
-// 8). It NEVER touches the forge — only the browser's confirm does. The handler has
-// already verified the target run is the worker's user's chat run and repo_id is a
-// repo they own, and enforced the per-run pending cap. labels is a JSON array.
+// Persist a pending proposal for chat confirmation or scheduled prompt auto-filing.
+// Callers authorize the run and target repo; chat additionally enforces a pending cap.
+// This insert performs no forge write; labels is a JSON array.
 func (q *Queries) CreateIssueProposal(ctx context.Context, arg CreateIssueProposalParams) (IssueProposal, error) {
 	row := q.db.QueryRow(ctx, createIssueProposal,
 		arg.RunID,
@@ -1325,6 +1324,60 @@ func (q *Queries) ListChatRunsForUser(ctx context.Context, userID uuid.UUID) ([]
 			&i.UpdatedAt,
 			&i.TurnCount,
 			&i.LastMessageAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listCreatedIssuesForRun = `-- name: ListCreatedIssuesForRun :many
+SELECT p.repo_id, p.created_issue_iid::bigint AS iid, p.title, repo.web_url, c.forge_type
+FROM runs r
+JOIN issue_proposals p ON p.run_id = r.id AND p.repo_id = r.repo_id
+JOIN repos repo ON repo.id = p.repo_id
+JOIN forge_connections c ON c.id = repo.connection_id AND c.user_id = r.user_id
+WHERE r.id = $1 AND r.repo_id = $2 AND r.user_id = $3
+  AND r.kind = 'prompt' AND (r.schedule_id IS NOT NULL OR r.trigger_source = 'schedule')
+  AND p.status = 'confirmed' AND p.created_issue_iid > 0
+ORDER BY p.created_at ASC, p.id ASC
+`
+
+type ListCreatedIssuesForRunParams struct {
+	RunID  uuid.UUID   `json:"run_id"`
+	RepoID pgtype.UUID `json:"repo_id"`
+	UserID uuid.UUID   `json:"user_id"`
+}
+
+type ListCreatedIssuesForRunRow struct {
+	RepoID    uuid.UUID `json:"repo_id"`
+	Iid       int64     `json:"iid"`
+	Title     string    `json:"title"`
+	WebUrl    string    `json:"web_url"`
+	ForgeType string    `json:"forge_type"`
+}
+
+// Detail-only metadata for confirmed issues from an owned scheduled prompt run.
+// Bind both ownership boundaries and the proposal's exact run/repo; no credentials.
+func (q *Queries) ListCreatedIssuesForRun(ctx context.Context, arg ListCreatedIssuesForRunParams) ([]ListCreatedIssuesForRunRow, error) {
+	rows, err := q.db.Query(ctx, listCreatedIssuesForRun, arg.RunID, arg.RepoID, arg.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListCreatedIssuesForRunRow{}
+	for rows.Next() {
+		var i ListCreatedIssuesForRunRow
+		if err := rows.Scan(
+			&i.RepoID,
+			&i.Iid,
+			&i.Title,
+			&i.WebUrl,
+			&i.ForgeType,
 		); err != nil {
 			return nil, err
 		}

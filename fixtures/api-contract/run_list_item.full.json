@@ -15,6 +15,13 @@
     "published": true,
     "captured_head": "x"
   },
+  "created_issues": [
+    {
+      "iid": 1,
+      "title": "x",
+      "web_url": "x"
+    }
+  ],
   "forge_origin_cooldown": {
     "origin": "x",
     "cooled_until": "2020-01-02T03:04:05Z",
