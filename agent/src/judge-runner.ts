@@ -133,7 +133,10 @@ is unknown. Sampling omissions differ from unfetched events. Missing timestamps 
 time. Counts are raw observations, not effort percentages, ownership or proof of gates. Confirmed
 pairings mean observed exact associations within available collision coverage, not globally unique
 executions or correctness. After ordinary identity loss, ordinary cross-kind reuse detection covers
-only retained FIFO keys. Do not impose
+only retained FIFO keys. Anonymous results have unknown signal/ordinary/delegation class.
+Orphan coverage loss includes dropped admissions and lost collision coverage; retained reversed
+pairs then remain provisional. Start-then-result confirmations are observed associations only.
+Do not impose
 a lead-edit threshold or a blanket ban on lead edits. Distinguish unnecessary takeover from reasonable
 continuation after a child failure. Recommend independent review of lead-authored work only where the
 evidence supports it; absence of sampled review is not proof that no review occurred. Deadline-shaped

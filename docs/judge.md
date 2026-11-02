@@ -241,13 +241,25 @@ Read the resulting assessment with these limits in mind:
   replays. Confirmed pairs mean observed exact associations and recognized
   recorded outcomes without detected ambiguity within available collision
   coverage, not globally unique execution or task correctness. Collisions,
-  orphan-result or pending-entry eviction, and the 256-key delegation-history
-  limit constrain confirmation. Confirmed outcomes, provisional pairings,
-  incomplete starts and unmatched results are distinct observations, not
-  interchangeable failures. Ordinary tool starts use a separate exact-identity
-  FIFO cache of up to 256 keys, retained after completion to recognize reuse
-  across ordinary tools and delegations. Remembered ordinary results do not
-  consume delegation pending slots. After ordinary identity history is lost,
+  pending-entry eviction, and the 256-key delegation-history limit constrain
+  confirmation. Confirmed outcomes, provisional pairings, incomplete starts
+  and unmatched results are distinct observations, not interchangeable failures.
+  Open dispatches and unknown orphan results share the same 128 pending slots.
+  An incoming orphan evicts the oldest orphan, or is dropped when 128 open
+  starts fill the allocation; orphan floods cannot evict open dispatches.
+  An incoming start evicts the oldest orphan before an open start. Known
+  evicted starts remain ambiguous through bounded tombstones. Orphan coverage
+  losses include evictions and admission drops. Retained result-before-start
+  pairs matched after a loss remain provisional. Subsequently observed
+  start/result associations can confirm within available collision coverage,
+  without establishing historical uniqueness. Signal tool starts are excluded;
+  persisted `tool_result` records have `tool_use_id`, `content` and `is_error`,
+  but no signal or tool-name marker. Prose cannot classify an unknown orphan
+  as signal, ordinary or delegation activity. Ordinary tool starts use a
+  separate exact-identity FIFO cache of up to 256 keys, retained after
+  completion to recognize reuse across ordinary tools and delegations.
+  Remembered ordinary results do not consume delegation pending slots. After
+  ordinary identity history is lost,
   cross-kind reuse detection is limited to retained ordinary keys; that loss
   alone does not suppress an observed delegation outcome. Unknown orphan
   results remain uncertain, with bounded tracking rather than assumed

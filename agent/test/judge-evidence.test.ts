@@ -549,6 +549,52 @@ test("oversized identity roles and additional accounting failure facts stay boun
   bounded(e);
 });
 
+test("anonymous floods preserve open starts and fresh observed associations", () => {
+  for (const before of [false, true]) {
+    const f = fixture();
+    if (!before) { f.start("success"); f.start("failed"); }
+    for (let i = 0; i < 260; i++) f.end("anonymous-" + i);
+    if (before) { f.start("success"); f.start("failed"); }
+    f.end("success"); f.end("failed", "failed report", true);
+    const e = f.reducer.render();
+    assert.equal(e.counts.confirmed.success, 1);
+    assert.equal(e.counts.confirmed.failed, 1);
+    assert.equal(e.counts.provisional, 0);
+    bounded(e);
+  }
+});
+
+test("128 open starts reject anonymous admissions without removals", () => {
+  const f = fixture();
+  for (let i = 0; i < 128; i++) f.start("open-" + i);
+  for (let i = 0; i < 140; i++) f.end("anonymous-" + i);
+  const full = f.reducer.render();
+  assert.equal(full.metrics.pending, 128);
+  assert.equal(full.metrics.pendingRows, 128);
+  assert.equal(full.counts.evictions, 0);
+  assert.match(full.sections.coverage, /orphanResultEvictions=140/);
+  assert.match(full.sections.coverage, /dropped orphan admissions/);
+  for (let i = 0; i < 128; i++) f.end("open-" + i);
+  const e = f.reducer.render();
+  assert.equal(e.counts.confirmed.success, 128);
+  assert.equal(e.counts.provisional, 0);
+  bounded(e);
+});
+
+test("incoming dispatch evicts a result before the oldest open start", () => {
+  const f = fixture();
+  f.start("oldest");
+  for (let i = 0; i < 127; i++) f.end("anonymous-" + i);
+  f.start("newest");
+  f.end("oldest"); f.end("newest", "failure", true);
+  const e = f.reducer.render();
+  assert.equal(e.counts.confirmed.success, 1);
+  assert.equal(e.counts.confirmed.failed, 1);
+  assert.equal(e.counts.evictions, 1);
+  assert.match(e.sections.coverage, /orphanResultEvictions=1/);
+  bounded(e);
+});
+
 test("evicted result identities prevent later invented definite matches", () => {
   const f = fixture();
   f.end("X");

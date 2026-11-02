@@ -151,7 +151,7 @@ function compare(a: Row, b: Row): number {
  * Retained state: 256 history keys, 256 ordinary identity keys, 128 pending entries,
  * 48 ledger rows, 64 tool
  * keys, 72 prose snippets; string slots stay below 600,000 chars (including copies).
- * Identity replay at a NEW seq is a collision. Pending FIFO eviction never forgets a
+ * Identity replay at a NEW seq is a collision. Pending eviction never forgets a
  * remembered dispatch tombstone. After history saturation unremembered IDs are provisional.
  */
 export class JudgeEvidenceReducer {
@@ -280,7 +280,7 @@ export class JudgeEvidenceReducer {
     if (dispatch) {
       if (!h && this.history.size < 256) {
         h = { tainted: this.ordinaryIdentities.has(key),
-          evicted: this.orphanResultEvictions > 0 };
+          evicted: false };
         this.history.set(key, h);
       }
       if (old?.ambiguous && h) h.tainted = true;
@@ -290,6 +290,8 @@ export class JudgeEvidenceReducer {
         ambiguous: category === "unknown" || !h || h.tainted || h.evicted, childTools: 0, startText: text };
       this.addRow(row);
       if (old?.result && !old.row) {
+        // Lost anonymous results may conceal a replay of this reversed pair.
+        row.ambiguous ||= this.orphanResultEvictions > 0;
         this.match(row, old.result, h); this.pending.delete(key);
       } else {
         this.pending.delete(key);
@@ -322,7 +324,14 @@ export class JudgeEvidenceReducer {
   }
   private put(key: string, value: Pending): void {
     if (this.pending.size >= 128) {
-      const oldest = this.pending.keys().next().value!;
+      // At most 128 entries: anonymous results never displace an open start.
+      // Each admission removes at most one entry; sibling events are independent.
+      const orphan = Array.from(this.pending).find(([, p]) => !p.row);
+      if (!orphan && !value.row) {
+        this.orphanResultEvictions++;
+        return;
+      }
+      const oldest = orphan?.[0] ?? this.pending.keys().next().value!;
       const evicted = this.pending.get(oldest);
       if (evicted?.row) evicted.row.ambiguous = true;
       this.pending.delete(oldest);
@@ -409,12 +418,12 @@ export class JudgeEvidenceReducer {
     };
     const ledger = this.rows.slice().sort(compare).map(r =>
       clip("start=#" + r.start + " end=" + (r.end === undefined ? "unknown" : "#" + r.end)
-        + " role=" + quoted(r.role, 20) + " instance=" + quoted(r.id, 32)
+        + " role=" + quoted(r.role, 40) + " instance=" + quoted(r.id, 48)
         + " outcome=" + (r.ambiguous ? "unknown ambiguous" : r.outcome)
         + " startTime=" + quoted(Number.isFinite(timestamp(r.time)) ? r.time : "unknown", 44)
         + " endTime=" + quoted(Number.isFinite(timestamp(r.endTime ?? "")) ? r.endTime! : "unknown", 44)
         + " " + interval(r) + " child_tool_uses=" + r.childTools
-        + " deadline=unknown cause=" + (r.ambiguous || !r.cause ? "unknown" : quoted(r.cause, 50)), 374)).join("\n");
+        + " deadline=unknown cause=" + (r.ambiguous || !r.cause ? "unknown" : quoted(r.cause, 50)), 373)).join("\n");
     const aggregates = clip("Raw observations; tool uses and result-error flags are not gate, ownership or delegation-success proof.\n"
       + JSON.stringify(counts) + "\nTool identity counts:\n"
       + [...this.tools].map(([name, c]) => quoted(name, 60) + " " + JSON.stringify(c)).join("\n")
@@ -432,12 +441,14 @@ export class JudgeEvidenceReducer {
       + " incomplete=" + incomplete + " unmatched raw results=" + counts.unmatchedResults
       + " (includes ordinary results; not an orphan delegation count)"
       + " observedExtraResults=" + this.extraResults + " orphanResultEvictions=" + this.orphanResultEvictions
-      + (this.orphanResultEvictions ? " (later untracked identities provisional)" : "") + " pending=" + this.pending.size + " evictions=" + this.evictions
+      + (this.orphanResultEvictions ? " (includes dropped orphan admissions; lost collision coverage makes retained reversed pairs provisional)" : "") + " pending=" + this.pending.size + " evictions=" + this.evictions
       + " ordinaryIdentities=" + this.ordinaryIdentities.size + " ordinaryIdentityLoss=" + this.ordinaryIdentityLoss
       + " tombstones=" + this.history.size + " historySaturated=" + (this.history.size === 256)
       + " collisions=" + this.collisions + " oversizedKeys=" + this.oversizedKeys + " ignoredSeqs=" + this.duplicates
       + "\nConfirmed means observed exact associations within available collision coverage, not globally unique executions or correctness."
       + " After ordinary identity loss, ordinary cross-kind reuse detection covers only retained FIFO keys."
+      + " Anonymous result class is unknown: signal, ordinary or delegation; content does not classify it."
+      + "\nLedger fields/rows may be explicitly truncated; omitted rows are counted."
       + "\nLedger rows=" + this.rows.length + " omittedRows=" + counts.omittedRows
       + "\nTail is latest fetched eligible evidence; " + (meta?.complete ? "fetch complete." : "final delivery unknown."), 2000);
     const prose = [...observations].sort(([a], [b]) => a - b).map(([, s]) => s).join("\n");
