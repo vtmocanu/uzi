@@ -385,7 +385,14 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(4),
   },
   {
-    harness_decision: null,
+    // Creation-time overflow into Claude, before claim binds an Anthropic token.
+    // Current gauges/settings may differ from this historical comparison.
+    harness_decision: {
+      preferred: "codex", chosen: "claude", reason: "overflow",
+      preferred_score: 0, other_score: 65,
+      preferred_measured: 37.5, other_measured: 65,
+      preferred_held: true, other_held: false,
+    },
     // PRD #320 M6 demo: an EXPEDITED interactive run the owner bumped to the front, so
     // its "Expedited" pill and the "Undo" control render. Owned by the session.
     id: "run-expedited",

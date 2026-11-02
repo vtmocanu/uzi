@@ -45,6 +45,16 @@ describe("stored harness decision", () => {
       <RunHarnessDecision run={{ harness_decision: decision }} /></>);
     expect(screen.getByRole("region", { name: "Harness decision at creation time" })).toBeTruthy();
   });
+  it("removes complete terminal sequences from display text", () => {
+    render(<RunHarnessDecision run={{ harness_decision: {
+      ...decision, preferred: "\x1b[31mclaude\x1b[0m",
+      reason: "\x1b]8;;https://invalid.example\u0007overflow\x1b]8;;\u0007",
+    } }} />);
+    const region = screen.getByRole("region", { name: "Harness decision at creation time" });
+    expect(region.textContent).toContain("preferred claude, chosen codex. Reason: overflow.");
+    expect(region.textContent).not.toContain("invalid.example");
+    expect(region.textContent).not.toContain("[31m");
+  });
   it("escapes markup and strips bidi and controls from stored strings", () => {
     const { container } = render(<RunHarnessDecision run={{ harness_decision: {
       ...decision, preferred: "<script>bad</script>\u202e", chosen: "codex\u0007", reason: "<img src=x>\u2066",

@@ -13,7 +13,7 @@ import { UsageReserveSetting } from "../components/UsageReserveSetting";
 import type { UserSettings, BindMode, ModelSettingCell } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
-import { Alert, Badge, Button, Card, Field, SectionTitle, Select, Skeleton } from "../components/ui";
+import { Alert, Badge, Button, Card, Field, SectionTitle, Select, Skeleton, Toggle } from "../components/ui";
 import { DEFAULT_CODEX_MODEL, ModelSelect } from "../components/ModelSelect";
 import { EffortSelect } from "../components/EffortSelect";
 import { HarnessPicker } from "../components/HarnessPicker";
@@ -1171,12 +1171,12 @@ export function RunDefaults() {
 
             <div className="space-y-1.5">
               <label className="flex items-center gap-3 text-sm text-fg">
-                <input
-                  type="checkbox"
-                  className="h-4 w-4 accent-brand"
+                <Toggle
                   checked={overflowEnabled}
                   disabled={overflowBusy}
-                  onChange={event => void toggleOverflow(event.target.checked)}
+                  focusableWhenDisabled
+                  onChange={enabled => void toggleOverflow(enabled)}
+                  label="Overflow to the other harness when my default is near its limits"
                   aria-describedby="harness-overflow-scope"
                 />
                 Overflow to the other harness when my default is near its limits

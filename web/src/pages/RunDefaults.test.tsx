@@ -2218,7 +2218,8 @@ describe("Run defaults — weekly usage reserve (PRD #3522)", () => {
 describe("harness overflow autosave", () => {
   const label = "Overflow to the other harness when my default is near its limits";
   const renderPage = () => render(<MemoryRouter><RunDefaults /></MemoryRouter>);
-  const checkbox = () => screen.getByRole("checkbox", { name: label }) as HTMLInputElement;
+  const control = () => screen.getByRole("switch", { name: label }) as HTMLButtonElement;
+  const checked = () => control().getAttribute("aria-checked") === "true";
 
   it("saves on and explicitly off, hydrates on reload, and keeps model saves independent", async () => {
     let stored = false;
@@ -2229,23 +2230,23 @@ describe("harness overflow autosave", () => {
       return { harness_overflow_enabled: enabled };
     });
     const page = renderPage();
-    await waitFor(() => expect(checkbox().checked).toBe(false));
-    expect(document.getElementById(checkbox().getAttribute("aria-describedby")!)?.textContent).toContain("Saves automatically");
-    checkbox().focus();
-    expect(document.activeElement).toBe(checkbox());
-    fireEvent.click(checkbox());
-    await waitFor(() => expect(checkbox().checked).toBe(true));
+    await waitFor(() => expect(checked()).toBe(false));
+    expect(document.getElementById(control().getAttribute("aria-describedby")!)?.textContent).toContain("Saves automatically");
+    control().focus();
+    expect(document.activeElement).toBe(control());
+    fireEvent.click(control());
+    await waitFor(() => expect(checked()).toBe(true));
     expect(mockApi.setHarnessOverflow).toHaveBeenLastCalledWith(true);
     expect(mockApi.putMySettings).not.toHaveBeenCalled();
     page.unmount();
     renderPage();
-    await waitFor(() => expect(checkbox().checked).toBe(true));
-    fireEvent.click(checkbox());
-    await waitFor(() => expect(checkbox().checked).toBe(false));
+    await waitFor(() => expect(checked()).toBe(true));
+    fireEvent.click(control());
+    await waitFor(() => expect(checked()).toBe(false));
     expect(mockApi.setHarnessOverflow).toHaveBeenLastCalledWith(false);
     cleanup();
     renderPage();
-    await waitFor(() => expect(checkbox().checked).toBe(false));
+    await waitFor(() => expect(checked()).toBe(false));
   });
 
   it.each([false, true])("retains saved %s on error and allows retry", async saved => {
@@ -2253,14 +2254,14 @@ describe("harness overflow autosave", () => {
     mockApi.getMySettings.mockResolvedValue({ settings: { ...initial, harness_overflow_enabled: saved } });
     mockApi.setHarnessOverflow.mockRejectedValueOnce(new ApiError(500, "overflow save failed"));
     renderPage();
-    await waitFor(() => expect(checkbox().checked).toBe(saved));
-    fireEvent.click(checkbox());
+    await waitFor(() => expect(checked()).toBe(saved));
+    fireEvent.click(control());
     await screen.findByText("overflow save failed");
-    expect(checkbox().checked).toBe(saved);
-    expect(checkbox().disabled).toBe(false);
+    expect(checked()).toBe(saved);
+    expect(control().getAttribute("aria-disabled")).not.toBe("true");
     mockApi.setHarnessOverflow.mockResolvedValueOnce({ harness_overflow_enabled: !saved });
-    fireEvent.click(checkbox());
-    await waitFor(() => expect(checkbox().checked).toBe(!saved));
+    fireEvent.click(control());
+    await waitFor(() => expect(checked()).toBe(!saved));
     expect(screen.queryByText("overflow save failed")).toBeNull();
   });
 
@@ -2271,18 +2272,23 @@ describe("harness overflow autosave", () => {
     mockApi.setHarnessOverflow.mockReturnValueOnce(new Promise(resolve => { finishOverflow = resolve; }));
     mockApi.putMySettings.mockReturnValueOnce(new Promise(resolve => { finishSettings = resolve; }));
     renderPage();
-    await screen.findByRole("checkbox", { name: label });
-    fireEvent.click(checkbox());
-    expect(checkbox().disabled).toBe(true);
+    await screen.findByRole("switch", { name: label });
+    control().focus();
+    fireEvent.click(control());
+    expect(control().getAttribute("aria-disabled")).toBe("true");
+    expect(control().disabled).toBe(false);
+    expect(document.activeElement).toBe(control());
+    fireEvent.click(control());
+    expect(mockApi.setHarnessOverflow).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByLabelText("Model-written Now line"));
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalled());
     const overflow = () => finishOverflow({ harness_overflow_enabled: true });
     const settings = () => finishSettings({ settings: { ...initial, now_summary_enabled: false } });
     (overflowFirst ? overflow : settings)();
-    await waitFor(() => expect(overflowFirst ? checkbox().checked : deliveredSettings.mock.lastCall?.[0].now_summary_enabled).toBe(overflowFirst ? true : false));
+    await waitFor(() => expect(overflowFirst ? checked() : deliveredSettings.mock.lastCall?.[0].now_summary_enabled).toBe(overflowFirst ? true : false));
     (overflowFirst ? settings : overflow)();
     await waitFor(() => {
-      expect(checkbox().checked).toBe(true);
+      expect(checked()).toBe(true);
       expect(deliveredSettings.mock.lastCall?.[0].harness_overflow_enabled).toBe(true);
       expect(deliveredSettings.mock.lastCall?.[0].now_summary_enabled).toBe(false);
     });
