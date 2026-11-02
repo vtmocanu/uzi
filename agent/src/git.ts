@@ -8541,9 +8541,11 @@ export class GitCache {
       try {
         wrapped = await this.resolveMarkerWrapperAdoption(barePath, journal, tip, recovery.restoreSource, opts?.publicationCandidate);
       } catch (error) {
+        // Ordinary adoption preserves the original thrown value, including hostile getters.
+        if (opts?.publicationCandidate === undefined) throw error;
         const abort = this.boundaryAbortError(error);
         if (abort) throw abort;
-        if (opts?.publicationCandidate === undefined || error instanceof AuthorityRefusal || isCheckpointBoundaryFailure(error) ||
+        if (error instanceof AuthorityRefusal || isCheckpointBoundaryFailure(error) ||
             error instanceof CheckpointChildStartupTimeoutError || isAbortLike(error)) throw error;
         throw new PublicationCandidateRestoreRefusal(error);
       }

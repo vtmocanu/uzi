@@ -53,6 +53,8 @@ async function mkOutbox(): Promise<Outbox> {
 /** A second worker: its own data dir and bare, so it holds nothing the first one did. */
 function mkPeerGit(): GitCache {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runner-publication-peer-"));
+  // Like makeFixture, clear an inherited runner-group SGID bit before creating worker-owned config.
+  fs.chmodSync(dir, 0o700);
   roots.push(dir);
   return new GitCache(dir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
 }
