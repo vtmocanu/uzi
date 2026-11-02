@@ -1126,24 +1126,47 @@ first) nothing is sent and the worker reports `partial` / `evidence_timeout`
 (`apierrors.IsConflict`) permits a new single-use decision on a later changed
 same-UID watch event with its own resourceVersion. Duplicate objects and immediate
 resume replays spend no attempt. The bound is three total PATCH attempts per UID
-within 90 s of first observation, before identity resolution or waiting for IDs;
-each request gets min(10 s, remaining), checked again before submission. Other
+within a nonrenewable 90 s delivery window. Under #3773, positive proof anchors
+once on the first changed same-UID event after freezing that carries any nonempty
+init or regular container ID. The freezing Added never anchors positives, even
+with IDs.
+Initial negatives anchor at first observation, including identity resolution;
+a positive encoding-fallback negative retains the positive anchor, even past
+Added + 90 s. Later IDs/retries do not renew it. Expiry and each request's
+min(10 s, remaining) use that anchor, checked again before submission. Other
 errors (including 429, 5xx and ambiguous timeouts/transport failures) stop delivery.
 The UID/resourceVersion/annotation-only body, `MaxRetries(0)`, wire schema and
 RBAC are unchanged. This bounds submissions; an in-flight write may still commit
 after cancellation, expiry or reset.
 
-Late retry plus downward-API projection lag can exceed the worker's nominal
-115 s soft stop (120 s cap minus 5 s settlement reserve). The expected timing
-margin is 25 s plus pod startup, minus watch lag and projection latency; it is
-not a safety margin or a guarantee. Late evidence is ignored once the worker's
-one-shot is consumed. The controller warns for each failed request with a
-controlled reason, and logs one final stop or success with attempts, conflicts
-and elapsed time since first observation, without raw errors or additional IDs.
-The success elapsed time supports #3621 correlation with projection latency.
-The maintainer's #3621 live graceful-roll check remains pending: record
-attempts/conflicts per successor and diagnose exhaustion from watch/request
-evidence. Cap or fence changes require separate review.
+Positive startup no longer consumes delivery budget. Before anchoring, frozen
+proof is retained under the existing 4,096-identity/16 MiB caps and supersession
+rules, without startup TTL, timer eviction, rearm, proof renewal or resolver
+rerun. Unbounded frozen-proof age and no recheck of later-added pods are accepted;
+durable worker one-shot consumption, successor UID/runtime binding and pod-entry
+checks under exclusive epoch ownership remain required. A relist during a long
+wait fails closed with `reason=reset`. Permanent stops release proof/documents
+but retain charged tombstones until Reset/invalidation.
+
+The directional nominal margin against the worker's 115 s soft stop (120 s cap
+minus 5 s settlement reserve) is 25 s + (worker_wait_start − controller_anchor),
+minus delivery/watch/projection lag. This is not a safety margin or guarantee.
+Quiet after conflict, watch lag and late projection remain availability residuals,
+not regression guarantees. Late evidence cannot rearm the worker's consumed one-shot.
+
+The controller warns for each failed request with a controlled reason, and logs
+one final stop or success with attempts and conflicts. Request-failed, stopped
+and succeeded records carry `worker_id`, the Added-time `pod` name, `elapsed`
+since first observation and `elapsed_since_ids` iff an anchor exists, including
+initial negatives. Each record samples the clock once for both durations;
+neither measures server commit time or downward-API projection latency. Pod names
+can be reused and are correlation labels; UID/resourceVersion fencing remains
+authoritative. Raw errors, pod UIDs and container IDs are not logged. The captured
+pod-name length is charged to retained metadata.
+The maintainer's #3621 live graceful-roll check remains pending: collect per
+successor worker/pod labels, timestamps, both available elapsed values and
+attempts/conflicts; measure projection latency independently and diagnose
+exhaustion from watch/request evidence. Cap or fence changes require separate review.
 
 `workers.image.tag` is decoupled from the controller: a new controller
 with old workers is normal until the pin moves, and an old worker refuses

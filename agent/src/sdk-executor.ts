@@ -3586,7 +3586,8 @@ export class SdkExecutor implements Executor {
         };
         const requestPark: NonNullable<RunContext["requestParkRun"]> = async (at) => {
           const step = await this.runThroughSwitch(ctx, state, async () => {
-            // Re-entry resumes the runner's pending question, with its original deadline.
+            // Re-entry shares the run's parked-time budget: a same-id re-entry continues its open
+            // interval, while a declined park already closed it and the next attempt opens a new one.
             // Only a settled owner answer permits another attempt; lifecycle refusals keep waiting.
             for (;;) {
               try { return await ctx.requestParkRun!(at); }
@@ -3707,7 +3708,7 @@ export class SdkExecutor implements Executor {
           if (turn.parkRun) {
             if (!parkRunEnabled(ctx, "implement") || !ctx.requestParkRun) throw new Error("illicit park_run signal");
             if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
-            // The worker callback owns explicit owner retries and their absolute deadline.
+            // The worker callback owns explicit owner retries and the shared parked-time budget.
             const disposition = await requestPark(parkAt);
             if (switchReleased || walled || completionHeld || pausedAt) break;
             if (disposition.kind === "paused") { pausedAt = parkAt; break; }

@@ -23,6 +23,36 @@ import (
 
 const iterationParkBody = `{"claim_generation":4,"iteration_count":5,"max_iterations":5,"head":"","published":false}`
 
+func TestWorkerIterationParkPolicyHoldIsolationLiveDB(t *testing.T) {
+	f := iterationRoutes(t)
+	for _, scenario := range []string{"running", "replay", "direct_sql"} {
+		t.Run(scenario, func(t *testing.T) {
+			id := f.run(t, "prompt")
+			f.exec(t, `UPDATE runs SET policy_outcome_id=$2, policy_continuation_mode='fresh_from_saved_work',
+ policy_applying_worker_id=$3, policy_applying_generation=4, policy_source_generation=4,
+ policy_preserve_required=true WHERE id=$1`, id, uuid.New(), f.worker)
+			if scenario == "replay" {
+				f.exec(t, "UPDATE runs SET status='paused',hold_reason='iteration_budget_exhausted' WHERE id=$1", id)
+			}
+			before := f.snapshot(t, id)
+			if scenario == "direct_sql" {
+				n, err := f.q.SetRunIterationPark(context.Background(), store.SetRunIterationParkParams{
+					ID: id, WorkerID: pgconv.UUID(f.worker), ClaimGeneration: 4,
+					GlobalMaxIterations: 5, MaxIterations: 5, IterationCount: 5,
+				})
+				if err != nil || n != 0 {
+					t.Fatalf("iteration SQL bypassed policy fence: rows=%d err=%v", n, err)
+				}
+			} else {
+				assertIterationAck(t, f.call(id, "iteration-park", iterationParkBody, f.worker), 409, "pending_control")
+			}
+			if f.snapshot(t, id) != before {
+				t.Fatal("iteration request mutated an unresolved policy episode")
+			}
+		})
+	}
+}
+
 type iterationRouteFixture struct {
 	*jobRouteEnv
 	q            *store.Queries

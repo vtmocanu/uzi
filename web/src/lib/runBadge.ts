@@ -172,6 +172,7 @@ const PARK_LABELS = {
   credential_disabled: "waiting: credential disabled",
   iteration_budget_exhausted: "Iteration limit reached",
   provider_unavailable: "provider unavailable: owner hold",
+  codex_policy_hold: "Codex policy hold",
   base_attestation_missing: "base unverified: owner hold",
   provider_outage: "waiting for provider",
   completion_blocked: "Completion blocked",
@@ -210,6 +211,8 @@ export function effectiveRunStatus(
     recovery_wait_phase?: string | null;
   },
 ): string {
+  // The applied policy hold takes precedence over a retained completion marker.
+  if (run.status === "paused" && run.hold_reason === "codex_policy_hold") return "codex_policy_hold";
   if (run.status === "paused" && run.hold_reason === "iteration_budget_exhausted") return "iteration_budget_exhausted";
   if (run.status === "paused" && run.hold_reason === "provider_unavailable") return "provider_unavailable";
   // Issue #3181: the token-switch holds sit in raw "paused" (shared with the owner pause), so
@@ -385,7 +388,7 @@ export function runStatusTone(
   if (status === "completion_blocked") return "warning";
   // PRD #1732: held on a disabled credential. Warn like the other involuntary holds.
   if (status === "iteration_budget_exhausted") return "warning";
-  if (status === "credential_disabled" || status === "provider_unavailable" || status === "base_attestation_missing" || status === "provider_outage") return "warning";
+  if (status === "credential_disabled" || status === "provider_unavailable" || status === "codex_policy_hold" || status === "base_attestation_missing" || status === "provider_outage") return "warning";
   // Issue #3181: both token-switch holds wait on something outside the run; warn, never danger.
   if (status === "credential_switch_settling" || status === "credential_switch_unsettled") return "warning";
   if (status === "awaiting_approval" || status === "awaiting_input")
@@ -782,6 +785,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "iteration_budget_exhausted":
       return { kind: "badge", label: PARK_LABELS.iteration_budget_exhausted, tone: "warning", pulse: false,
         title: "Iteration limit reached. Only the owner can Resume with a fresh finite iteration allowance, or Cancel. Extend time first only if the remaining wall budget is spent; Extend does not resume the run." };
+    case "codex_policy_hold":
+      return { kind: "badge", label: PARK_LABELS.codex_policy_hold, tone: "warning", pulse: false,
+        title: "The run waits for its owner. Resume and policy-specific Stop are unavailable; open the run to inspect preservation evidence or Cancel." };
     case "provider_unavailable":
       return { kind: "badge", label: PARK_LABELS.provider_unavailable, tone: "warning", pulse: false,
         title: "Automatic provider retries have stopped. The run waits for its owner; open the run for Resume, Stop availability and Cancel." };
@@ -1202,6 +1208,7 @@ export function needsHumanAttention(status: string): boolean {
     status === "worker_memory_pressure" ||
     status === "iteration_budget_exhausted" ||
     status === "provider_unavailable" ||
+    status === "codex_policy_hold" ||
     status === "credential_switch_settling" ||
     status === "credential_switch_unsettled" ||
     status === "base_attestation_missing"

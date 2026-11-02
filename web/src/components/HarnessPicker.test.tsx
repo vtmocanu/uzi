@@ -27,6 +27,14 @@ describe("HarnessPicker — always renders the three states", () => {
   });
 });
 
+describe("HarnessPicker — inheritLabel", () => {
+  it("overrides the inherit option text", () => {
+    render(<HarnessPicker value="inherit" onChange={vi.fn()} label="H" inheritLabel="Default · automatic" />);
+    expect(screen.getByRole("option", { name: "Default · automatic" })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: /Use my default/ })).toBeNull();
+  });
+});
+
 describe("HarnessPicker — controlled value + change events", () => {
   it("reflects the controlled selection", () => {
     const { select } = renderPicker("codex");

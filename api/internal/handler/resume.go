@@ -41,6 +41,11 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if run.PolicyPreserveRequired || run.PolicyPendingFresh || (run.PolicyOutcomeID.Valid && !run.PolicyResolvedAt.Valid) {
+		httpx.Error(w, http.StatusConflict, "policy hold continuation is unavailable")
+		return
+	}
+
 	// auditBody is the body of the kind='resume' audit row; empty for an ordinary resume, and the
 	// recorded weekly-reserve override (PRD #3522 M4a) when the owner resumed a reserve pause.
 	var auditBody pgtype.Text

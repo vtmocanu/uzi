@@ -3923,7 +3923,7 @@ export class CodexExecutor implements Executor {
         }
         let verdict = await ctx.askUser(questions);
         questionBudget.asked++;
-        // The worker callback owns explicit owner retries and their absolute deadline.
+        // The worker callback owns explicit owner retries and the shared parked-time budget.
         if (parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && requestPark) {
           const disposition = await requestPark(parkAt);
           if (disposition.kind === "paused") { clarificationPaused = true; return ""; }

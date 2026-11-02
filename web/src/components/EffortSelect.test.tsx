@@ -12,7 +12,7 @@ function Harness({ initial }: { initial: string }) {
   const [effort, setEffort] = useState(initial);
   return (
     <>
-      <EffortSelect value={effort} onChange={setEffort} />
+      <EffortSelect value={effort} onChange={setEffort} defaultLabel="Default · test" />
       <output data-testid="effort">{effort}</output>
     </>
   );
@@ -24,21 +24,30 @@ const value = () => screen.getByTestId("effort").textContent;
 describe("EffortSelect", () => {
   // Enum-drift guard (PRD #617 SC/risk): the rendered option set equals the documented
   // closed set. The level const is UNEXPORTED, so we assert via the rendered <option>s.
-  it("renders exactly the Inherit option plus the five closed levels", () => {
+  it("renders exactly the Default option plus the five closed levels", () => {
     render(<Harness initial="" />);
     const values = Array.from(combo().options).map((o) => o.value);
     expect(values).toEqual(["", "low", "medium", "high", "xhigh", "max"]);
   });
 
+  // Label guard (issue #3255): the first option text is exactly the caller's
+  // defaultLabel and no option ever says "Inherit".
+  it("uses the passed defaultLabel as the first option and never says Inherit", () => {
+    render(<Harness initial="" />);
+    const labels = Array.from(combo().options).map((o) => o.text);
+    expect(labels[0]).toBe("Default · test");
+    expect(labels.some((t) => /inherit/i.test(t))).toBe(false);
+  });
+
   // Copy guard (issue #1157): the visible option LABELS surface uzi's default effort
-  // (medium) — the Inherit option and the medium option carry the "uzi default" copy,
+  // (medium) — the Default option and the medium option carry the "uzi default" copy,
   // the other four render their bare value. The option VALUES are unchanged (asserted
   // above), so this is a pure label check via the rendered <option>s' text.
-  it("labels the Inherit and medium options with the uzi default copy", () => {
+  it("labels the Default and medium options with the uzi default copy", () => {
     render(<Harness initial="" />);
     const labels = Array.from(combo().options).map((o) => o.text);
     expect(labels).toEqual([
-      "Inherit (uzi default: medium)",
+      "Default · test",
       "low",
       "medium (uzi default)",
       "high",
@@ -48,14 +57,14 @@ describe("EffortSelect", () => {
   });
 
   // PRD #3247: the preference-only runtime token is offered ONLY when the caller passes
-  // runtimeLabel (the ordinary worker cards); it sits right after Inherit.
-  it("offers the Runtime default option only when runtimeLabel is passed, after Inherit", () => {
-    const { unmount } = render(<EffortSelect value="" onChange={() => {}} />);
+  // runtimeLabel (the ordinary worker cards); it sits right after Default.
+  it("offers the Runtime default option only when runtimeLabel is passed, after Default", () => {
+    const { unmount } = render(<EffortSelect value="" onChange={() => {}} defaultLabel="Default · test" />);
     expect(Array.from(combo().options).map((o) => o.value)).not.toContain("runtime");
     unmount();
-    render(<EffortSelect value="" onChange={() => {}} runtimeLabel="Runtime default · Codex decides" />);
+    render(<EffortSelect value="" onChange={() => {}} defaultLabel="Default · test" runtimeLabel="Runtime default · Codex decides" />);
     expect(Array.from(combo().options).map((o) => [o.value, o.text])).toEqual([
-      ["", "Inherit (uzi default: medium)"],
+      ["", "Default · test"],
       ["runtime", "Runtime default · Codex decides"],
       ["low", "low"],
       ["medium", "medium (uzi default)"],
@@ -72,7 +81,7 @@ describe("EffortSelect", () => {
     expect(combo().value).toBe("low");
   });
 
-  it("selecting Inherit fires onChange with ''", () => {
+  it("selecting Default fires onChange with ''", () => {
     render(<Harness initial="max" />);
     fireEvent.change(combo(), { target: { value: "" } });
     expect(value()).toBe("");

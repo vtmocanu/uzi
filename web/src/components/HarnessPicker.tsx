@@ -19,6 +19,7 @@ export function HarnessPicker({
   id,
   disabled = false,
   className = "",
+  inheritLabel = "Use my default",
 }: {
   value: HarnessSelection;
   onChange: (next: HarnessSelection) => void;
@@ -28,6 +29,8 @@ export function HarnessPicker({
   id?: string;
   disabled?: boolean;
   className?: string;
+  // Text of the "inherit" option. Only Run defaults overrides it (it has no "my default" to defer to).
+  inheritLabel?: string;
 }) {
   return (
     <Select
@@ -38,7 +41,7 @@ export function HarnessPicker({
       value={value}
       onChange={(e) => onChange(e.target.value as HarnessSelection)}
     >
-      <option value="inherit">Use my default</option>
+      <option value="inherit">{inheritLabel}</option>
       <option value="claude">Claude</option>
       <option value="codex">Codex</option>
     </Select>

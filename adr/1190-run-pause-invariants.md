@@ -122,10 +122,10 @@ reason-carrying worker question. No paid/provider turn or park attempt
 restarts without an explicit owner answer: a consumed `/park` authorizes
 one attempt; prose returns to the lead; cancel wins. The fallback uses
 ordinary `awaiting_input`, whose wait is banked out of the wall budget by
-`SetRunRunning` while its run slot remains occupied. It shares
-`parkQuestion`'s absolute per-run `QUESTION_TIMEOUT_SECONDS` deadline when enabled,
-rather than granting a fresh deadline for each refusal or retry. That
-deadline is worker memory, not durable across worker death. Unattended
+`SetRunRunning` while its run slot remains occupied. It draws on
+`parkQuestion`'s shared per-run `QUESTION_TIMEOUT_SECONDS` parked-time budget when enabled,
+rather than granting a fresh window for each refusal or retry. That
+budget is worker memory, not durable across worker death. Unattended
 runs needing this owner decision throw `TrustedExecutionRefusal` instead
 of entering the question wait. Ambiguous transport or lost ownership uses
 the existing retained-recovery/stale-claim fences rather than assuming

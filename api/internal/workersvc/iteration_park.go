@@ -60,6 +60,11 @@ func (s *Service) ReportIterationPark(ctx context.Context, w store.Worker, id uu
 	if reason := iterationClaimRefusal(run, e.ClaimGeneration); reason != "" {
 		return run, false, reason, nil
 	}
+	// The policy episode is an independent continuation fence, including a
+	// replay whose iteration marker survived another lifecycle transition.
+	if activePolicyHold(run) {
+		return run, false, "pending_control", nil
+	}
 	// A replay must not certify zero-attempt eligibility after history changed.
 	if run.CompletionAttempts != 0 {
 		return run, false, "prior_attempt", nil

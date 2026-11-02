@@ -416,6 +416,9 @@ func (s *Service) submitInputForRun(ctx context.Context, userID, runID uuid.UUID
 		if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "iteration_budget_exhausted" {
 			return SubmitInputResult{}, &iterationHoldStopError{}
 		}
+		if run.HoldReason.Valid && run.HoldReason.String == "codex_policy_hold" {
+			return SubmitInputResult{}, ErrProviderHoldStopUnavailable
+		}
 		// PRD #634 M2: on a milestone-structured issue run a `stop` means "finalize what is
 		// already complete, start no further milestone" — which is exactly a scope write with
 		// ceiling = len(completed). Map it to a scope write BEFORE the interactive-task guard
@@ -1175,6 +1178,9 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 		}
 		if current.UserID != run.UserID {
 			return SubmitInputResult{}, ErrRunNotFound
+		}
+		if len(stopping) > 0 && stopping[0] && current.HoldReason.Valid && current.HoldReason.String == "codex_policy_hold" {
+			return SubmitInputResult{}, ErrProviderHoldStopUnavailable
 		}
 		priorFrozen, _ := canonicalRawJSON(run.MilestonesFrozen)
 		currentFrozen, _ := canonicalRawJSON(current.MilestonesFrozen)

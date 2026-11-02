@@ -15,7 +15,7 @@ import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { StatsCollector } from "../src/stats.js";
 import type { ClaimResponse } from "../src/protocol.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, waitForTestEvent } from "./helpers.js";
 import { sleep } from "../src/util.js";
 import os from "node:os";
 import { realpathSync } from "node:fs";
@@ -141,9 +141,42 @@ test("stalled POST and GET bodies are deadline bounded while heartbeat remains i
   }
 });
 
-test("default constructor coordinator handles a real outbox restart without pending terminal admission", async () => {
+test("default constructor coordinator handles a real outbox restart without pending terminal admission", async (t) => {
   const r = await rig();
-  let heartbeats = 0;
+  const heartbeat = deferred<void>();
+  const cleaned = deferred<number>();
+  const cleanup = r.outbox.cleanupRejectedTerminalFiles.bind(r.outbox);
+  const lockedOutbox = r.outbox as unknown as {
+    withRunLock<T>(runId: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T>;
+  };
+  let attempts = 0;
+  let forcedBusy = false;
+  let custodyGets = 0;
+  let firstCount: number | undefined;
+  let coordinator: TerminalRejectionCoordinator;
+  t.mock.method(r.outbox, "cleanupRejectedTerminalFiles", async (...args: Parameters<typeof cleanup>) => {
+    const first = attempts++ === 0;
+    const getsBefore = custodyGets;
+    const count = first
+      ? await lockedOutbox.withRunLock(args[0], () => cleanup(...args))
+      : await cleanup(...args);
+    if (first) {
+      firstCount = count;
+      assert.equal(count, 0, "the real outbox lock makes the first cleanup busy");
+      assert.ok(await fs.stat(r.file), "diagnostic POST cannot authorize deletion");
+      assert.equal(custodyGets, getsBefore, "busy cleanup cannot obtain custody authority");
+      forcedBusy = true;
+    }
+    // Model retry after transient lock contention through the public coalesced wake.
+    // Await the whole withRunLock call before waking; keep the default 30s interval.
+    // The single real watchdog below bounds all attempts, including further busy results.
+    if (count === 0) coordinator.queueReconciliation();
+    if (count > 0) {
+      assert.ok(custodyGets > getsBefore, "successful cleanup obtained fresh custody");
+      cleaned.resolve(count);
+    }
+    return count;
+  });
   let registerBody: Record<string, unknown> | undefined;
   globalThis.fetch = async (url, init) => {
     const route = String(url);
@@ -151,22 +184,41 @@ test("default constructor coordinator handles a real outbox restart without pend
       registerBody = JSON.parse(String(init?.body));
       return Response.json({ worker_id: workerId, protocol_features: ["terminal_rejection_report"] });
     }
-    if (route.endsWith("/heartbeat")) { heartbeats++; return Response.json({}); }
+    if (route.endsWith("/heartbeat")) { heartbeat.resolve(); return Response.json({}); }
     if (route.includes("/claim")) return new Response(null, { status: 204 });
     if (init?.method === "POST") {
       const body = JSON.parse(String(init.body));
       return Response.json({ dispositions: body.rejections.map((x: object) => ({ ...x, disposition: "recorded" })) });
     }
+    if (route.includes("/terminal-rejection-custody?")) custodyGets++;
     return Response.json(settled());
   };
   const client = new WorkerClient("http://worker.invalid", "join-token", "test", nullLogger());
-  const running = makeWorker(r, client).run(r.controller.signal);
+  const worker = makeWorker(r, client);
+  coordinator = (worker as unknown as { terminalRejections: TerminalRejectionCoordinator }).terminalRejections;
+  assert.ok(coordinator);
+  // Isolate default-constructor wiring from Outbox's cooperative proof clock.
+  // The watchdog and AbortSignal HTTP deadlines still use real timers.
+  const proofNow = Date.now();
+  const clock = t.mock.method(Date, "now", () => proofNow);
+  const running = worker.run(r.controller.signal);
   try {
-    await until(async () => heartbeats > 0 && !(await fs.stat(r.file).catch(() => undefined)));
+    const [, removed] = await waitForTestEvent(
+      Promise.all([heartbeat.promise, cleaned.promise]), "heartbeat and actual rejection cleanup", 5000);
+    assert.equal(firstCount, 0);
+    assert.equal(forcedBusy, true);
+    assert.ok(attempts >= 2);
+    assert.equal(removed, 1);
+    await assert.rejects(fs.stat(r.file), { code: "ENOENT" });
     assert.equal(registerBody?.active_snapshot, undefined);
     assert.equal(r.registry.size, 0);
+  } catch (error) {
+    t.diagnostic(`cleanup attempts=${attempts}, firstCount=${firstCount}, forcedBusy=${forcedBusy}, custodyGets=${custodyGets}`);
+    throw error;
   } finally {
-    r.controller.abort(); await running; await fs.rm(r.root, { recursive: true, force: true });
+    r.controller.abort();
+    try { await running; } finally { clock.mock.restore(); }
+    await fs.rm(r.root, { recursive: true, force: true });
   }
 });
 
@@ -216,9 +268,19 @@ test("claim admission holds through late response and synchronous dispatch, rele
   }
 });
 
-test("overlapping same-run worker executions keep deletion blocked when the later attempt finishes first", async () => {
+test("overlapping same-run worker executions keep deletion blocked when the later attempt finishes first", async (t) => {
   const r = await rig();
+  // Expose the rejected terminal only after both independent executions hold protection.
+  const badCandidate = await fs.readFile(r.file);
+  await fs.unlink(r.file);
   const executions = [deferred<void>(), deferred<void>()];
+  const deletion = deferred<void>();
+  const cleanup = r.outbox.cleanupRejectedTerminalFiles.bind(r.outbox);
+  t.mock.method(r.outbox, "cleanupRejectedTerminalFiles", async (...args: Parameters<typeof cleanup>) => {
+    const removed = await cleanup(...args);
+    if (removed > 0) deletion.resolve();
+    return removed;
+  });
   let started = 0;
   let claims = 0;
   let posts = 0;
@@ -234,16 +296,27 @@ test("overlapping same-run worker executions keep deletion blocked when the late
     getTerminalRejectionCustody: async () => { gets++; return settled(); },
   } as unknown as WorkerClient;
   const runner = { execute: () => executions[started++]!.promise };
-  const running = makeWorker(r, client, runner, undefined, 2).run(r.controller.signal);
+  const worker = makeWorker(r, client, runner, undefined, 2);
+  // Keep the Worker-created coordinator and its real admission/activity guard.
+  // Only the fixture retry interval changes; HTTP and assertion deadlines stay bounded.
+  const coordinator = (worker as unknown as { terminalRejections: TerminalRejectionCoordinator }).terminalRejections;
+  assert.ok(coordinator);
+  Object.defineProperty(coordinator, "intervalMs", { value: 2 });
+  const running = worker.run(r.controller.signal);
   try {
-    await until(() => started === 2 && posts > 0);
+    await until(() => started === 2);
+    await fs.writeFile(r.file, badCandidate);
+    coordinator.queueReconciliation();
+    await until(() => posts > 0);
     const before = posts;
     executions[1]!.resolve();
     await until(() => posts > before);
     assert.equal(gets, 0);
     assert.ok(await fs.stat(r.file));
     executions[0]!.resolve();
-    await until(async () => !(await fs.stat(r.file).catch(() => undefined)));
+    await waitForTestEvent(deletion.promise, "guarded cleanup completes after both executions", 5000);
+    assert.ok(gets > 0, "cleanup obtained fresh settled custody");
+    await assert.rejects(fs.stat(r.file), { code: "ENOENT" });
   } finally {
     executions.forEach(execution => execution.resolve());
     r.controller.abort(); await running;

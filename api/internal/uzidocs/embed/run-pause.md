@@ -98,8 +98,9 @@ not restart a paid/provider turn or retry parking until an explicit owner
 answer: `/park` authorizes one more attempt; prose returns to the lead;
 cancel ends the run. The fallback is ordinary `awaiting_input`: question
 wait time is banked out of the wall budget, but the worker slot stays held.
-It shares the run's absolute `QUESTION_TIMEOUT_SECONDS` deadline (when enabled);
-another question or retry does not reset it on that worker. An unattended
+It draws on the run's shared `QUESTION_TIMEOUT_SECONDS` parked-time budget (when
+enabled); a re-parked retry continues the same interval and another question gets
+only the remaining budget on that worker. An unattended
 run that needs this owner decision stops with a trusted refusal instead.
 
 ## What's durable, and where

@@ -1,3 +1,4 @@
+import { validatePolicyHoldRequest, decodePolicyHoldReply, POLICY_HOLD_MAX_BYTES } from "./protocol.js";
 import { decodeCodexOperationDecision, validCodexOperationRequest } from "./codex-operation-admission.js";
 import type { CodexOperationRequest, CodexOperationDecision } from "./protocol.js";
 import { CodexAdmissionReporter } from "./codex/admission-signal.js";
@@ -1580,6 +1581,17 @@ export class WorkerClient {
    *  capability-aware degradation for a pre-clone forge-unreachable park. Backed by
    *  `serverFeatures` so the two views never diverge and a rollback clear empties both. The
    *  setter routes through the same set (a test that skips register can seed it directly). */
+  /** Both sides must have negotiated the compact contract; this does not advertise readiness. */
+  get supportsScopedPendingClaim(): boolean {
+    return this.hasFeature("pending_outcome_scoped_claim_v1") &&
+      this.registrationReport?.protocol_capabilities.includes("pending_outcome_scoped_claim_v1") === true;
+  }
+
+  get supportsPolicyHold(): boolean {
+    return this.hasFeature("provider_policy_hold_v1") &&
+      this.registrationReport?.protocol_capabilities.includes("provider_policy_hold_v1") === true;
+  }
+
   get protocolFeatures(): string[] {
     return [...this.serverFeatures];
   }
@@ -1757,7 +1769,11 @@ export class WorkerClient {
   }
 
   private snapshotForServer(snapshot: ActiveSnapshot): ActiveSnapshot {
-    return { ...snapshot, active: snapshot.active.map(entry => {
+    const { pending_policy_protection, pending_inventory_incomplete, ...legacy } = snapshot;
+    return { ...legacy,
+      ...(this.supportsScopedPendingClaim && pending_policy_protection !== undefined ? { pending_policy_protection } : {}),
+      ...(this.supportsScopedPendingClaim && pending_inventory_incomplete === true ? { pending_inventory_incomplete } : {}),
+      active: snapshot.active.map(entry => {
       const { account_cooldown, ...rest } = entry;
       return (this.hasFeature("codex_account_operation_admission_v1") ||
         this.operationFlights.get(entry.run_id)?.generation === entry.claim_generation) && account_cooldown !== undefined
@@ -1922,9 +1938,11 @@ export class WorkerClient {
     activeSnapshot?: ActiveSnapshot,
     maintenance?: { sample?: DindMeterSample | null; ack?: DindMaintenanceReadyACK },
     quarantine?: ResidueQuarantineState,
+    outboxRootUnusable?: "symlink" | "unreadable",
   ): Promise<boolean | undefined> {
     this.latestDindMaintenanceValue = undefined;
     const body: HeartbeatRequest = { version: this.version };
+    if (this.hasFeature("heartbeat_outbox_root_unusable")) body.outbox_root_unusable = outboxRootUnusable ?? null;
     // Only attach stats when the collector produced a sample (PRD #49): an absent
     // field is the same wire shape as today, so a pre-#49 server ignores the extra
     // bytes and a collector-less tick is indistinguishable from an old worker.
@@ -1977,11 +1995,17 @@ export class WorkerClient {
       };
     }
     const includeExtension = body.protocol_refresh !== undefined || includeOutbox || includeSnapshot || body.dind_meter !== undefined ||
-      body.dind_maintenance_ready_ack !== undefined || includeQuarantine;
+      body.dind_maintenance_ready_ack !== undefined || includeQuarantine || body.outbox_root_unusable !== undefined;
     try {
       try {
         return await this.postHeartbeat(body);
       } catch (err) {
+        // A diagnostic rejected after API rollback must not strip protection fields.
+        if (body.outbox_root_unusable !== undefined && isStrictDecodeError(err)) {
+          delete body.outbox_root_unusable;
+          this.dropFeature("heartbeat_outbox_root_unusable");
+          return await this.postHeartbeat(body);
+        }
         // A stale ACK gets one ACK-free resync; sibling extensions remain intact.
         // Any failure of that request reaches the usual strict-decode fallback below.
         if (!body.dind_maintenance_ready_ack || !(err instanceof RequestError) || err.status !== 409) throw err;
@@ -2510,6 +2534,17 @@ export class WorkerClient {
         throw new Error("semantic presentation ACK does not match candidate and claim");
     }
     return ack;
+  }
+
+  /** One bounded attempt. No legacy /state fallback or generation downgrade is safe here. */
+  async reportPolicyHold(runId: string, body: import("./protocol.js").PolicyHoldRequest, signal?: AbortSignal): Promise<import("./protocol.js").PolicyHoldReply> {
+    const request = validatePolicyHoldRequest(body);
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/policy-hold`;
+    const res = await this.fetchRaw("POST", path, request, this.httpTimeoutMs, signal);
+    if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
+    const reply = decodePolicyHoldReply(JSON.parse(await readBoundedText(res, POLICY_HOLD_MAX_BYTES, true, signal)), request);
+    if ((res.status === 409) !== (reply.disposition === "pending")) throw new Error("invalid policy hold HTTP disposition");
+    return reply;
   }
 
   /**

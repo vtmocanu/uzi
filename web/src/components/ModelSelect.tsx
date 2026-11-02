@@ -36,9 +36,9 @@ function deriveMode(value: string, aliases: readonly string[]): Mode {
 }
 
 // ModelSelect is the shared model picker: a dropdown of the curated aliases plus
-// an "Inherit" (empty) option and — when custom entry is allowed — an "Other…"
-// custom free-text model ID. The effective model string is surfaced through onChange
-// ("" = inherit). An incoming value that is not one of the CURRENT harness's aliases
+// a caller-labelled Default (empty) option (omitted when defaultLabel is null) and —
+// when custom entry is allowed — an "Other…" custom free-text model ID. The effective
+// model string is surfaced through onChange ("" = default). An incoming value that is not one of the CURRENT harness's aliases
 // initializes into the custom state with its text prefilled — never silently reset to
 // inherit (PRD #17 §2) — even when custom entry is disabled, so a value that predates a
 // harness switch is still visible rather than vanishing. Submit gating stays with the
@@ -64,7 +64,11 @@ export function ModelSelect({
   value: string;
   onChange: (model: string) => void;
   id?: string;
-  defaultLabel?: string;
+  // Text of the empty-value option, naming where the default really comes from at
+  // this call site. Required: there is no generic fallback. `null` means the surface
+  // has no Default option (the value must be chosen); an empty selection then renders
+  // a disabled "Choose a model" placeholder.
+  defaultLabel: string | null;
   customAriaLabel?: string;
   // The harness this selection is validated against (PRD #1429 D6). Omitted ⇒
   // Claude, so every pre-M4a caller (the agent-template editor, the schedule modal
@@ -152,7 +156,15 @@ export function ModelSelect({
   return (
     <div className="space-y-2">
       <Select id={id} aria-describedby={ariaDescribedBy} value={mode} onChange={(e) => onSelect(e.target.value as Mode)}>
-        <option value="inherit">{defaultLabel ?? "Inherit (account default)"}</option>
+        {defaultLabel !== null ? (
+          <option value="inherit">{defaultLabel}</option>
+        ) : (
+          mode === "inherit" && (
+            <option value="inherit" disabled>
+              Choose a model
+            </option>
+          )
+        )}
         {aliases.map((m) => (
           <option key={m} value={m}>
             {m}
@@ -163,7 +175,7 @@ export function ModelSelect({
             existing custom value that predates a harness switch must still have a
             matching <option value="custom"> — otherwise a controlled <select> whose
             value names an absent option silently falls back to the first option
-            (selectedIndex 0), which would show "Inherit" while still emitting the
+            (selectedIndex 0), which would show "Default" while still emitting the
             stale custom string underneath it. */}
         {(customAllowed || mode === "custom") && <option value="custom">Other (custom model ID)…</option>}
       </Select>

@@ -45,6 +45,44 @@ for (const mode of ["aborted body", "oversize body"] as const) {
 const at = { iterationCount: 10, maxIterations: 10 };
 const bytes = "iteration work awaiting continuation\n";
 const sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+for (const admission of [false, true]) {
+  it(`iteration entry preserves an already selected policy outcome; admission=${admission}`, async t => {
+    const claim = gitlabClaim(359790 + Number(admission), { kind: "issue", claim_generation: 7,
+      config: { iteration_park_version: 1 } });
+    const { gitlab } = fakeGitlab();
+    const { logger } = recordingLogger();
+    let actualFlight: { iterationParkState: string; policyHold?: { outcomeId: string }; policyAdmission?: boolean } | undefined;
+    let episodes = 0, executions = 0;
+    const runner = runnerWith(() => ({ homeDir, executor: {
+      run: async (ctx): Promise<ExecutorResult> => {
+        try {
+          executions++;
+          assert.ok(actualFlight, "the real builder supplied the execution flight");
+          actualFlight.policyHold = { outcomeId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" };
+          actualFlight.policyAdmission = admission;
+          const outcome = await ctx.parkForIteration!(at);
+          assert.equal(outcome, "retained-stop");
+          assert.equal(actualFlight.iterationParkState, "none", "policy ownership prevents a second sink entry");
+          return { branch: ctx.branch, iterationParked: { outcome } };
+        } catch (error) { callbackErrors.push(error); throw error; }
+      },
+    } }), gitlab, undefined, logger, { checkpointIntervalMs: 0 });
+    const internal = runner as unknown as {
+      buildFlight: (...args: unknown[]) => NonNullable<typeof actualFlight>;
+      newCaptureEpisode: (...args: unknown[]) => unknown;
+    };
+    const build = internal.buildFlight.bind(runner);
+    t.mock.method(internal, "buildFlight", (...args: unknown[]) => { actualFlight = build(...args); return actualFlight; });
+    const capture = internal.newCaptureEpisode.bind(runner);
+    t.mock.method(internal, "newCaptureEpisode", (...args: unknown[]) => { episodes++; return capture(...args); });
+    await runner.execute(claim);
+    assert.equal(executions, 1);
+    assert.equal(episodes, 0, "no capture episode competes with the selected policy outcome");
+    assert.equal(api.iterationParkRequests.length, 0);
+  });
+}
+
 function readGit(dir: string, ...args: string[]): string {
   return execFileSync("git", ["-C", dir, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
 }

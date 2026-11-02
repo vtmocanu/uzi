@@ -53,6 +53,20 @@ it("preserves manual health attribution in a sanitized cell title without changi
   expect(hostile?.kind === "badge" && hostile.title).toBeUndefined();
 });
 
+it.each(["", "checking", "reworking", "blocked"] as const)("policy hold overrides retained completion %s without a retry promise", completion_phase => {
+  const r = { ...run({ status: "paused", hold_reason: "codex_policy_hold" }), completion_phase };
+  expect(effectiveRunStatus(r)).toBe("codex_policy_hold");
+  expect(parkLabel(r)).toBe("Codex policy hold");
+  expect(runBadge(r, 0)).toMatchObject({ kind: "badge", label: "Codex policy hold", tone: "warning", pulse: false });
+  expect(runStatusTone("codex_policy_hold", null)).toBe("warning");
+  expect(needsHumanAttention("codex_policy_hold")).toBe(true);
+  const badge = runBadge(r, 0);
+  expect(badge.kind === "badge" && badge.title).toContain("Resume and policy-specific Stop are unavailable");
+});
+it.each(["queued", "running", "completed", "failed", "cancelled"] as const)("old policy marker does not overlay %s", status => {
+  expect(effectiveRunStatus(run({ status, hold_reason: "codex_policy_hold" }))).toBe(status);
+});
+
 it("provider hold badge uses projection hold reason without a retry promise", () => {
   const badge = runBadge(run({ status: "paused", hold_reason: "provider_unavailable" }), 0);
   expect(badge).toMatchObject({ label: "provider unavailable: owner hold", tone: "warning", pulse: false });
