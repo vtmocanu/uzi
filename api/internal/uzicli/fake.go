@@ -44,6 +44,11 @@ type FakeClient struct {
 	VaultUnlockCalls     int
 	VaultUnlockPasswords []string
 
+	CrossCheckHistoryResult  apitypes.CrossCheckHistoryDTO
+	CrossCheckHistoryErr     error
+	CrossCheckHistoryCalls   []CrossCheckHistoryOptions
+	LastCrossCheckHistoryCtx context.Context
+
 	Runs       []apitypes.RunListItemDTO
 	RunByID    map[string]apitypes.RunDTO
 	LogsByID   map[string][]apitypes.MessageDTO
