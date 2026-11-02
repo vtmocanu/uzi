@@ -189,6 +189,7 @@ import {
 } from "./delegation.js";
 import { CODE_DISPOSITIONS_TOOL, reportCodeDispositions, type CodeCrossCheckToolAccess } from "../code-cross-check-tools.js";
 import { buildCodexRunPlan } from "./run-builder.js";
+import { resolveChildTurnDeadlineMs } from "./child-budget.js";
 import { codexSubagentWriteCapabilities, sanitizeName } from "./render.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
@@ -340,7 +341,6 @@ const DEFAULT_BOUNDARY_DEADLINE_MS = 30 * 1000;
 const DEFAULT_CACHE_RELEASE_TIMEOUT_MS = 30 * 1000;
 /** Issue #1598: the least a terminal dispose's remaining budget caps a cache wait to. */
 const MIN_CACHE_SETTLE_WAIT_MS = 1000;
-const DEFAULT_CHILD_TURN_DEADLINE_MS = 10 * 60 * 1000;
 // The implement/review iteration budget when the claim omits one, matching
 // sdk-executor's DEFAULT_MAX_ITERATIONS (PRD: RUN_MAX_ITERATIONS default 5).
 // A larger server-served milestone budget can raise this cap during execution.
@@ -3710,7 +3710,7 @@ export class CodexExecutor implements Executor {
         storeDir,
         homeRoot: this.homeRoot,
         boundaryDeadlineMs,
-        childTurnDeadlineMs: this.deps.childTurnDeadlineMs ?? DEFAULT_CHILD_TURN_DEADLINE_MS,
+        childTurnDeadlineMs: this.childTurnDeadlineMs(),
         commandEnv,
         commandSandbox,
         // D6 (PRD #1287, user-approved 2026-09-12): carry the trusted provider-HOME prefix into
@@ -6496,6 +6496,12 @@ export class CodexExecutor implements Executor {
   }
 
   // ─── request + prompt construction ────────────────────────────────────────────
+  /** The effective per-child turn deadline: the one value the delegation runner, the lead prompt
+   *  and the child request all use. */
+  private childTurnDeadlineMs(): number {
+    return resolveChildTurnDeadlineMs(this.deps.childTurnDeadlineMs);
+  }
+
   /** PRD #3244: the lead's requested model/effort for a phase, from the one worker resolver. Pure in
    *  (ctx.config, provider model), so the request built per turn and the row reported at the phase
    *  entry cannot differ. */
@@ -6575,6 +6581,7 @@ export class CodexExecutor implements Executor {
       repoSourced,
       // Issue #3272: only an implement-phase request of an owner-supplied plan gets the seeded variant.
       seeded: phase === "implement" && isSeededOwnerPlan(ctx),
+      codexChildTurnBudgetMs: this.childTurnDeadlineMs(),
     }).append;
     const leadSkills = (ctx.skills ?? []).map((s) => s.name);
     // PRD #3244: the model and effort sent below are the same LeadRequest the lead-config row reports.
@@ -6588,6 +6595,7 @@ export class CodexExecutor implements Executor {
       ciEvidencePrepared: !!ctx.ciEvidence,
       prompt: prompt + ciEvidencePrompt(ctx.ciEvidence),
       systemPrompt,
+      childTurnBudgetMs: this.childTurnDeadlineMs(),
       phase,
       ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
       parkRunSupported: ctx.parkRunSupported,

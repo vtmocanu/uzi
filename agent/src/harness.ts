@@ -390,6 +390,9 @@ export interface RunTurnRequest {
   codeCrossCheck?: CodeCrossCheckToolAccess;
   prompt: string;
   systemPrompt: string;
+  /** Codex-only: the effective per-child turn budget (ms), rendered into each subagent's
+   *  developer instructions. The Claude harness ignores it. */
+  childTurnBudgetMs?: number;
   resumeSessionId?: string;
   signal: AbortSignal;
   model?: string;
