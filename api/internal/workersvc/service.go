@@ -2627,6 +2627,10 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	queuedCustodyLimit, err := s.queuedCustodyAdmission(ctx, tx)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
 	if s.registerAfterBegin != nil {
 		s.registerAfterBegin()
 	}
@@ -2692,6 +2696,12 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	if err != nil {
 		return store.Worker{}, "", err
 	}
+	queuedRequeuedIDs := append(append([]uuid.UUID{}, requeued...), finalizeRequeued...)
+	queuedParked, err := s.parkQueuedCustody(ctx, qtx, row.ID, prior.SnapshotRegisterNonce, queuedCustodyLimit, locks, queuedRequeuedIDs, finalizeRequeued)
+	if err != nil {
+		return store.Worker{}, "", err
+	}
+	orphanFailed = append(orphanFailed, queuedParked...)
 	// (e) Commit, then publish + judge post-commit (never inside the tx).
 	if err := tx.Commit(ctx); err != nil {
 		return store.Worker{}, "", err
@@ -2886,6 +2896,10 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 			_ = tx.Rollback(ctx)
 		}
 	}()
+	queuedCustodyLimit, err := s.queuedCustodyAdmission(ctx, tx)
+	if err != nil {
+		return store.Worker{}, err
+	}
 	qtx := store.New(tx)
 	updated, err := qtx.HeartbeatWorker(ctx, arg)
 	if err != nil {
@@ -2985,6 +2999,17 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		})
 		if err != nil {
 			return store.Worker{}, err
+		}
+		requeuedIDs := make([]uuid.UUID, 0, len(missingRequeued))
+		for _, row := range missingRequeued {
+			requeuedIDs = append(requeuedIDs, row.ID)
+		}
+		queuedParked, err := s.parkQueuedCustody(ctx, qtx, updated.ID, updated.SnapshotRegisterNonce, queuedCustodyLimit, locks, requeuedIDs, nil)
+		if err != nil {
+			return store.Worker{}, err
+		}
+		for _, row := range queuedParked {
+			missingFailed = append(missingFailed, store.FrozenFailRunsMissingFromSnapshotRow{ID: row.ID, Status: row.Status})
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {

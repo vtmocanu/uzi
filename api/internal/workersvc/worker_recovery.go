@@ -27,6 +27,7 @@ func recoveryDispositionCount(rows []store.WorkerRecoveryDisposition, status str
 type workerRecoveryLockSet struct {
 	evaluated  bool
 	frozenJSON string
+	queuedJSON []byte
 	parentIDs  []uuid.UUID
 }
 
@@ -57,7 +58,11 @@ func captureWorkerRecoveryLocks(ctx context.Context, qtx *store.Queries, workerI
 	if err != nil {
 		return workerRecoveryLockSet{}, err
 	}
-	return workerRecoveryLocksFromRows(rows)
+	locks, err := workerRecoveryLocksFromRows(rows)
+	if err != nil {
+		return workerRecoveryLockSet{}, err
+	}
+	return validateQueuedCustodyLocks(ctx, qtx, locks)
 }
 
 func workerRecoveryLocksFromRows(rows []store.LockWorkerRecoveryParentsRow) (workerRecoveryLockSet, error) {

@@ -300,7 +300,7 @@ const (
 	// migration — runs.health_reason is free text). A NEW const, never a reuse of the
 	// pool_wait/recovery_wait park reasons (D4): this is an owner-admission block, not a
 	// credential-pool or transient-recovery hold, and its fix is archive retry/discard.
-	reasonCustodyLimit = "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs"
+	reasonCustodyLimit = "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity"
 	// reasonCustodyLimitUnavailable (#3150) is emitted for a queued non-cross_check run when the
 	// custody_hold_limit setting could not be read this tick. ClaimRun is refused the same way
 	// (claimLane fails closed on an unreadable limit), so no custody-gated run is admitted and
@@ -610,32 +610,16 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		if !r.IntakePauseHeld && r.ReserveHoldReason != "" {
 			return healthWaitingWorker, r.ReserveHoldReason
 		}
-		// Issue #2705: a run held for its returning worker is explained from the first tick of the
-		// hold, not after the queued threshold. Issue #2501: the unambiguous, persistent
-		// docker-allowlist block is also surfaced early. Manual cordon, owner holds and that block bypass
-		// the age gate: any other reason queuedReason resolves (vault, custody, codex, egress)
-		// stays quiet until th.queued, exactly as for an unpinned run. th.queued == 0 above still
-		// switches every queued flag off.
+		// Resolve the existing priority ladder once. Custody and the existing
+		// persistent owner/manual/docker blocks surface immediately; transient
+		// fleet diagnostics remain quiet until the configured age threshold.
 		if !olderThan(now, r.StatusSince, th.queued) {
-			_, stalePinned := s.staleRequeuePin(now, r)
-			_, ownerHeld := s.ownerHold(now, r)
-			manualBlocked := false
-			var projection *healthEligibilityResult
-			if !stalePinned && !ownerHeld {
-				counts, err := s.workerEligibilityForHealth(ctx, now, r.ID, s.capabilityAwareOn(ctx))
-				projection = &healthEligibilityResult{counts: counts, err: err}
-				manualBlocked = (err == nil && manualCordonWaitReason(counts) != "") ||
-					(err != nil && r.HealthReason.Valid && isManualCordonWaitReason(r.HealthReason.String))
+			reason := s.queuedReason(ctx, now, r, th)
+			if reason == reasonCustodyLimit || isManualCordonWaitReason(reason) ||
+				isStaleRequeuePinReason(reason) || isRepoNotDockerAllowedReason(reason) {
+				return healthWaitingWorker, reason
 			}
-			if stalePinned || ownerHeld || manualBlocked {
-				// Only a persistent hold warrants the prerequisite ladder before
-				// the age threshold; unrelated young runs retain the cheap path.
-				reason := s.queuedReasonWithEligibility(ctx, now, r, th, true, projection)
-				if isManualCordonWaitReason(reason) || isStaleRequeuePinReason(reason) {
-					return healthWaitingWorker, reason
-				}
-			}
-			return s.earlyDockerAllowlistTarget(ctx, now, r, th, projection)
+			return healthOK, ""
 		}
 		// Every queued-past-threshold reason is resolved in queuedReason, most-fundamental
 		// first (vault-lock, no online worker, no capability-eligible worker, priority-class
@@ -1189,7 +1173,7 @@ func stallBaseline(r store.ListActiveRunsForHealthRow) time.Time {
 }
 
 // queuedReason resolves the human reason a queued run past its threshold (or, via
-// earlyDockerAllowlistTarget, an online-but-ineligible one under it) is not
+// the young queued resolver, an online-but-ineligible one under it) is not
 // running, MOST-FUNDAMENTAL first (Decision 8, extended by PRD #216, #361, #84 M3, #320 D9,
 // #1226 M1 and #1296 M4): a locked owner vault (they unlock and it claims within a poll),
 // then (PRD #1296 M4) an owner at the custody-hold admission limit (another fleet-independent
@@ -1277,27 +1261,14 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 	// limit holds of its own is not exempt and gets it like new work. #3150: there is no
 	// disabled/zero limit; when the setting could not be read this tick (th.custodyLimitOK
 	// false, which is also the zero value) ClaimRun refuses too, so the rung reports
-	// reasonCustodyLimitUnavailable instead of guessing. The per-run read sits behind the
-	// queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick except for a run held by
-	// either owner hold below that threshold (healthTargetFor computes queuedReason for it, once per
-	// tick until its hold ends) and the early docker-allowlist probe; a per-run read error
+	// reasonCustodyLimitUnavailable instead of guessing. The per-run read also runs below the
+	// queued threshold so custody blocks surface immediately; a per-run read error
 	// falls through to the generic reasons below rather than inventing a reason on a failed
 	// lookup (the conservative degrade the sibling per-run lookups use).
 	// Hold-free cross-check children bypass custody admission independently of
 	// bounded code-publishing continuation; their placement and account gates remain.
-	if r.Kind != "cross_check" {
-		if !th.custodyLimitOK {
-			return reasonCustodyLimitUnavailable
-		}
-		adm, cerr := s.q.GetCustodyAdmissionForRun(ctx, store.GetCustodyAdmissionForRunParams{
-			UserID: r.UserID, RunID: r.ID, CustodyHoldLimit: th.custodyLimit,
-			HeartbeatCutoff: pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
-		})
-		if cerr != nil {
-			slog.Error("health: read custody admission", "run_id", r.ID, "error", cerr)
-		} else if !adm.ContinuationExempt && adm.AdmissionCountedHolds >= int64(th.custodyLimit) {
-			return reasonCustodyLimit
-		}
+	if reason := s.queuedCustodyReason(ctx, now, r, th); reason != "" {
+		return reason
 	}
 	// PRD #1590 M2 (D2): the run-level Codex account gate. Like the vault lock and the custody
 	// limit it is owner-account state no worker can clear, so it precedes every worker reason.
@@ -1636,7 +1607,7 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 	// otherwise take it is a Docker worker and the repo is not allowlisted — which is exactly
 	// reasonRepoNotDockerAllowedAdmin/Member, a condition that does not clear on its own the way a roll
 	// does. A repo-less run (judge, repoID invalid) never trips this. On a nil reader or any
-	// read error we degrade to the generic free-slot logic below. earlyDockerAllowlistTarget
+	// read error we degrade to the generic free-slot logic below. the young queued resolver
 	// reaches this rung under the queued threshold too, and the Admin/Member variant follows
 	// the run OWNER's is_admin (repoNotDockerAllowedReason).
 	if r.RepoID.Valid && s.dockerAllowlist != nil {
@@ -1822,53 +1793,29 @@ func (s *Service) repoNotDockerAllowedReason(ctx context.Context, ownerID uuid.U
 	return reasonRepoNotDockerAllowedMember
 }
 
-// earlyDockerAllowlistTarget surfaces the docker-allowlist block for a queued run still
-// under the queued threshold. The block is persistent (it never clears on its own), so
-// waiting out the threshold only delays the owner's actionable message. It returns
-// (healthWaitingWorker, reason) only when the owner has an online worker, no online worker
-// is eligible for the repo, and queuedReason resolves to the docker-allowlist reason (so
-// every more-fundamental rung still wins); every other path, including any probe read error (an owner-lookup failure still shows the Member wording),
-// returns (healthOK, "").
-func (s *Service) earlyDockerAllowlistTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, projection *healthEligibilityResult) (string, string) {
-	if !r.RepoID.Valid || r.EgressProfileID.Valid || s.dockerAllowlist == nil {
-		return healthOK, ""
+// queuedCustodyReason shares the claim admission formula between the early
+// custody diagnostic and the full queued reason ladder. A failed per-run read
+// falls through; an unavailable setting remains a distinct prerequisite.
+func (s *Service) queuedCustodyReason(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) string {
+	if r.Kind != "cross_check" {
+		if !th.custodyLimitOK {
+			return reasonCustodyLimitUnavailable
+		}
+		adm, cerr := s.q.GetCustodyAdmissionForRun(ctx, store.GetCustodyAdmissionForRunParams{
+			UserID: r.UserID, RunID: r.ID, CustodyHoldLimit: th.custodyLimit,
+			HeartbeatCutoff: pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
+		})
+		if cerr != nil {
+			slog.Error("health: read custody admission", "run_id", r.ID, "error", cerr)
+		} else if !adm.ContinuationExempt && adm.AdmissionCountedHolds >= int64(th.custodyLimit) {
+			return reasonCustodyLimit
+		}
 	}
-	online, err := s.q.CountOnlineWorkersForUser(ctx, r.UserID)
-	if err != nil {
-		slog.Error("health: count online workers for early docker allowlist reason", "run_id", r.ID, "error", err)
-		return healthOK, ""
-	}
-	if online == 0 {
-		return healthOK, ""
-	}
-	al, err := s.dockerAllowlist.DockerRepoAllowlist(ctx)
-	if err != nil {
-		slog.Error("health: docker allowlist for early reason", "run_id", r.ID, "error", err)
-		return healthOK, ""
-	}
-	elig, err := s.q.CountOnlineEligibleWorkersForRepo(ctx, store.CountOnlineEligibleWorkersForRepoParams{
-		UserID:               r.UserID,
-		DockerRepoAllowlist:  al,
-		RepoID:               uuid.UUID(r.RepoID.Bytes),
-		Kind:                 r.Kind,
-		RequiredCapabilities: r.RequiredCapabilities,
-		CapabilityAware:      s.capabilityAwareOn(ctx),
-	})
-	if err != nil {
-		slog.Error("health: count eligible workers for early reason", "run_id", r.ID, "error", err)
-		return healthOK, ""
-	}
-	if elig != 0 {
-		return healthOK, ""
-	}
-	if reason := s.queuedReasonWithEligibility(ctx, now, r, th, false, projection); isRepoNotDockerAllowedReason(reason) {
-		return healthWaitingWorker, reason
-	}
-	return healthOK, ""
+	return ""
 }
 
 // queuedPriorityClass resolves the display priority class of a queued run past its
-// threshold, or under it when earlyDockerAllowlistTarget probes it (PRD #320 D9) from the ONE SQL function ClaimRun's ORDER BY ranks by, so a
+// threshold, or under it when the young queued resolver probes it (PRD #320 D9) from the ONE SQL function ClaimRun's ORDER BY ranks by, so a
 // deprioritized/restored reason can never contradict the claim order. The cutoff is
 // built the SAME way service.go builds ClaimRun's — now minus WorkerBackgroundGrace —
 // so the D4 fail-open (a demoted run older than the grace collapses to `restored`)
@@ -1879,7 +1826,7 @@ func (s *Service) earlyDockerAllowlistTarget(ctx context.Context, now time.Time,
 // verdictUndelivered's degrade-to-false and toolWindow's degrade-to-zero-value: a
 // missed pill is noise, never a lost health signal. Affordable behind the
 // queued-threshold guard for the same reason verdictUndelivered is behind its own;
-// earlyDockerAllowlistTarget also reaches it, under the threshold, for an online-but-ineligible run.
+// the young queued resolver also reaches it, under the threshold, for an online-but-ineligible run.
 func (s *Service) queuedPriorityClass(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow) string {
 	class, err := s.q.RunPriorityClassForRun(ctx, store.RunPriorityClassForRunParams{
 		RunID:                 r.ID,
