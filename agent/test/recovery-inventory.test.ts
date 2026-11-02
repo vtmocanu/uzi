@@ -6416,6 +6416,354 @@ async function closureFrozen(opts: { features?: string[]; heldV2?: boolean; opti
 
 const CLOSURE_ONLY = [CLOSURE_FEATURE_NAME, "recovery_inventory_v1"];
 
+/** Restriction facts are independent of the fake's positive coverage/closure proofs. */
+function closureRestrictions(f: Awaited<ReturnType<typeof fixture>>, target: string) {
+  const state = { enrolled: true, blocked: false, unavailable: false,
+    relation: "divergent" as "ancestor" | "divergent" | "unknown",
+    roots: [H2], flaggedOIDs: [H2], reads: 0 };
+  const ancestry = f.git.ancestry;
+  Object.assign(f.git, {
+    readRemediationRestrictionFacts: async (bare: string, branch: string, run: string, source?: unknown) => {
+      state.reads++;
+      assert.equal(bare, f.context.barePath);
+      assert.equal(branch, f.context.branch);
+      assert.equal(run, f.context.runId);
+      assert.equal(source, undefined, "custody must not select or bind a live source");
+      if (state.unavailable) throw new Error("proof unavailable");
+      return { enrolled: state.enrolled, blocked: state.blocked,
+        roots: [...state.roots], flaggedOIDs: [...state.flaggedOIDs],
+        fingerprint: JSON.stringify([state.enrolled, state.blocked, state.roots, state.flaggedOIDs]) };
+    },
+    ancestry: async (bare: string, root: string, tip: string) => {
+      if (root === H2) {
+        assert.equal(tip, target, "negative roots are checked against captured C");
+        return state.relation;
+      }
+      return ancestry(bare, root, tip);
+    },
+  });
+  return state;
+}
+
+for (const override of [false, true]) {
+  for (const denial of ["flagged", "excluded", "unknown", "unavailable", "after preparation"] as const) {
+    it(`M2 C2 held transport denies ${denial}, prepare override=${override}`, async () => {
+      const f = await v2FrozenFixture("issue", true);
+      try {
+        f.state.status = "failed";
+        closureHarness(f, { features: [] });
+        const negative = closureRestrictions(f, f.record.sourceSha);
+        if (denial === "flagged" || denial === "excluded") negative.relation = "ancestor";
+        if (denial === "excluded") negative.flaggedOIDs = [];
+        if (denial === "unknown") negative.relation = "unknown";
+        if (denial === "unavailable") negative.unavailable = true;
+        let preparations = 0;
+        const pack = Reflect.get(f.git, "checkpointPack") as HeldGit["checkpointPack"];
+        Object.assign(f.git, { checkpointPack: async (...args: Parameters<typeof pack>) => {
+          preparations++;
+          const result = await pack(...args);
+          if (denial === "after preparation") negative.relation = "ancestor";
+          return result;
+        } });
+        await f.coordinator.operateFrozenInventory({
+          record: f.record, barePath: f.context.barePath, defaultBranch: "main",
+        }, override ? { prepare: async () => {
+          preparations++;
+          if (denial === "after preparation") negative.relation = "ancestor";
+          return { pack: Buffer.from("PACK") };
+        } } : {});
+        assert.equal(preparations, denial === "after preparation" ? 1 : 0);
+        assert.equal(f.order.includes("held"), false, "no actual C transport");
+        const saved = (await f.coordinator.inspect(f.context.runId))[0]!;
+        assert.equal(saved.state, "uploaded", "denial preserves private archive capture/upload");
+        assert.equal(f.state.uploads, 1);
+        assert.equal(f.finals.length, 0, "negative refusal grants no archive closure");
+        assert.equal(saved.finalRequest, undefined);
+        assert.equal(f.state.pinDeletes, 0);
+      } finally { await f.close(); }
+    });
+  }
+}
+
+it("M2 C2 held preparation rereads restrictions after scanning before packing", async () => {
+  const f = await v2FrozenFixture("issue", true);
+  try {
+    f.state.status = "failed";
+    closureHarness(f, { features: [] });
+    const negative = closureRestrictions(f, f.record.sourceSha);
+    const scan = Reflect.get(f.git, "secretScanCheckpointRange") as HeldGit["secretScanCheckpointRange"];
+    Object.assign(f.git, { secretScanCheckpointRange: async (...args: Parameters<typeof scan>) => {
+      const result = await scan(...args);
+      negative.relation = "ancestor";
+      return result;
+    } });
+    await f.operate();
+    assert.equal(f.order.includes("pack"), false);
+    assert.equal(f.order.includes("held"), false);
+    assert.equal(f.state.uploads, 1, "private preservation remains available");
+    assert.equal(f.finals.length, 0);
+    assert.equal((await f.coordinator.inspect(f.context.runId))[0]!.finalRequest, undefined);
+  } finally { await f.close(); }
+});
+
+for (const answer of ["created", "pack_invalid"] as const) {
+  it(`M2 C2 restricted uncertain held invocation remains readback-only: ${answer}`, async () => {
+    const f = await v2FrozenFixture("issue", true);
+    try {
+      f.state.status = "failed";
+      await patchAuthenticated(f, f.record, { heldCreateUncertain: true });
+      const negative = closureRestrictions(f, f.record.sourceSha);
+      negative.relation = "ancestor";
+      let probes = 0, preparations = 0;
+      Object.assign(f.client, { publishHeld: async (run: string, gen: number, tip: string, _digest: string, pack: Buffer) => {
+        probes++;
+        assert.equal(pack.length, 0, "existing invocation reconciliation may only read back");
+        return answer === "pack_invalid" ? { ok: false, reason: "pack_invalid", httpStatus: 400 } : {
+          ok: true, body: { publication_id: "00000000-0000-4000-8000-000000000009",
+            ref: `refs/uzi-held/${run}/${gen}`, tip, state: "created" },
+        };
+      } });
+      await f.coordinator.operateFrozenInventory({
+        record: f.record, barePath: f.context.barePath, defaultBranch: "main",
+      }, { prepare: async () => { preparations++; return { pack: Buffer.from("PACK") }; } });
+      const saved = (await f.coordinator.inspect(f.context.runId))[0]!;
+      assert.equal(probes, 1);
+      assert.equal(preparations, 0);
+      assert.equal(f.finals.length, 0);
+      assert.equal(saved.finalRequest, undefined);
+      assert.equal(saved.finalAcknowledged, undefined);
+      assert.equal(saved.heldCreateUncertain, true);
+      assert.equal(f.state.pinDeletes, 0);
+    } finally { await f.close(); }
+  });
+}
+
+for (const refusal of ["flagged", "excluded", "unknown", "blocked", "unavailable", "missing ancestry"] as const) {
+  for (const lane of ["mint", "retained_claim", "restart replay"] as const) {
+    it(`M2 C2 restrictions hold ${lane}: ${refusal}, despite independently pinned closure`, async () => {
+      const { f, record, operate, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+      try {
+        if (lane === "restart replay") {
+          f.state.finalError = new Error("save request");
+          await operate();
+          f.state.finalError = undefined;
+        }
+        const before = await saved();
+        const finals = f.finals.length;
+        const negative = closureRestrictions(f, record.sourceSha);
+        if (refusal === "flagged" || refusal === "excluded") negative.relation = "ancestor";
+        if (refusal === "excluded") negative.flaggedOIDs = [];
+        if (refusal === "unknown") negative.relation = "unknown";
+        if (refusal === "blocked") negative.blocked = true;
+        if (refusal === "unavailable") negative.unavailable = true;
+        if (refusal === "missing ancestry") Object.assign(f.git, { ancestry: undefined });
+        if (lane === "restart replay") await f.make(true).resumePending();
+        else if (lane === "retained_claim") await f.coordinator.captureAndUpload({
+          record, barePath: f.context.barePath, defaultBranch: "main", closureMint: "retained_claim",
+        });
+        else await operate();
+        const after = await saved();
+        assert.equal(after.state, "uploaded", "private preservation remains available");
+        assert.equal(f.state.uploads, 1);
+        assert.equal(f.finals.length, finals, "no release");
+        assert.equal(after.finalAcknowledged, undefined);
+        assert.deepEqual(after.finalRequest, before.finalRequest, "saved request is immutable while held");
+        assert.equal(f.state.pinDeletes, 0);
+        assert.ok(negative.reads > 0);
+      } finally { await f.close(); }
+    });
+  }
+}
+
+it("M2 C2 retained_claim grant does not survive capture waits as restriction authority", async () => {
+  const { f, record, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+  try {
+    const negative = closureRestrictions(f, record.sourceSha);
+    f.state.onProduce = () => { negative.blocked = true; };
+    await f.coordinator.captureAndUpload({
+      record, barePath: f.context.barePath, defaultBranch: "main", closureMint: "retained_claim",
+    });
+    assert.equal(f.state.uploads, 1);
+    assert.equal(f.finals.length, 0);
+    assert.equal((await saved()).finalRequest, undefined);
+  } finally { await f.close(); }
+});
+
+for (const lane of ["mint", "replay", "ACK"] as const) {
+  it(`M2 C2 held publication ${lane} uses the same captured-C restriction check`, async () => {
+    const { f, record, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+    const publication = "00000000-0000-4000-8000-000000000009";
+    try {
+      const negative = closureRestrictions(f, record.sourceSha);
+      if (lane === "replay") {
+        f.state.finalError = new Error("save held request");
+        await f.coordinator.releaseHeldPublication(record, publication);
+        f.state.finalError = undefined;
+        assert.equal((await saved()).finalRequest?.disposition.kind, "held_publication");
+      }
+      const before = await saved();
+      const finals = f.finals.length;
+      if (lane === "ACK") {
+        const release = f.client.releaseRecoveryCustody;
+        f.client.releaseRecoveryCustody = async (...args) => {
+          const result = await release(...args); negative.blocked = true; return result;
+        };
+      } else negative.relation = "ancestor";
+      assert.equal(await f.coordinator.releaseHeldPublication(record, publication), "kept");
+      const after = await saved();
+      assert.equal(after.finalAcknowledged, undefined);
+      assert.equal(f.finals.length, finals + (lane === "ACK" ? 1 : 0));
+      if (lane !== "ACK") assert.deepEqual(after.finalRequest, before.finalRequest);
+      assert.equal(f.state.pinDeletes, 0);
+    } finally { await f.close(); }
+  });
+}
+
+it("M2 C2 requires divergent evidence for every excluded root and rechecks after ancestry", async () => {
+  const { f, record, operate, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+  try {
+    const negative = closureRestrictions(f, record.sourceSha);
+    negative.roots = [H2, H];
+    negative.flaggedOIDs = [];
+    await operate();
+    assert.equal(f.finals.length, 0, "one divergent root cannot excuse an ancestor sibling");
+    negative.roots = [H2];
+    const ancestry = f.git.ancestry;
+    f.git.ancestry = async (...args) => {
+      const result = await ancestry(...args);
+      if (args[1] === H2) negative.blocked = true;
+      return result;
+    };
+    await operate();
+    assert.equal(f.finals.length, 0, "durable facts changed while ancestry was pending");
+    assert.equal((await saved()).finalRequest, undefined);
+    assert.equal(f.state.uploads, 1);
+  } finally { await f.close(); }
+});
+
+it("M2 C2 held divergent control still requires its independent publication policy", async () => {
+  const f = await v2FrozenFixture("issue", true);
+  try {
+    f.state.status = "failed";
+    const negative = closureRestrictions(f, f.record.sourceSha);
+    await f.operate();
+    assert.equal(f.order.filter(step => step === "held").length, 1);
+    assert.equal((f.finals[0]![3] as RecoveryFinalDisposition).kind, "held_publication");
+    assert.equal((await f.coordinator.inspect(f.context.runId))[0]!.finalAcknowledged, true);
+    assert.ok(negative.reads > 0);
+  } finally { await f.close(); }
+});
+
+it("M2 C2 restriction query rejects a changed authenticated capture snapshot", async () => {
+  const { f, record, operate, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+  try {
+    await f.coordinator.captureAndUpload({ record, barePath: f.context.barePath, defaultBranch: "main", closureMint: "deny" });
+    closureRestrictions(f, record.sourceSha);
+    const ancestry = f.git.ancestry;
+    let changed = false;
+    f.git.ancestry = async (...args) => {
+      const result = await ancestry(...args);
+      if (args[1] === H2 && !changed) {
+        changed = true;
+        await patchAuthenticated(f, await saved(), { reason: "inventory_snapshot_changed" });
+      }
+      return result;
+    };
+    await operate();
+    assert.equal(changed, true);
+    assert.equal(f.finals.length, 0);
+    assert.equal((await saved()).finalRequest, undefined);
+    assert.equal((await saved()).reason, "inventory_snapshot_changed");
+  } finally { await f.close(); }
+});
+
+for (const deny of [false, true]) {
+  it(`M2 C2 accepted reconciliation independently gates ACK: deny=${deny}`, async () => {
+    const { f, operate, saved, record } = await closureFrozen({ features: CLOSURE_ONLY });
+    try {
+      f.state.finalError = new Error("save FINAL");
+      await operate();
+      const before = await saved();
+      assert.ok(before.finalRequest);
+      f.state.finalError = undefined;
+      f.state.wrongAck = true;
+      const negative = closureRestrictions(f, record.sourceSha);
+      let reconciled = false;
+      f.client.reconcileRecoveryCapture = async (run, id, request) => {
+        reconciled = true;
+        negative.blocked = deny;
+        return { run_id: run, capture_id: id, generation: request.generation,
+          outcome: "accepted", final_receipt: before.finalRequest!.disposition,
+          release_evidence: before.finalRequest!.evidence };
+      };
+      await operate();
+      const after = await saved();
+      assert.equal(reconciled, true);
+      assert.equal(after.finalAcknowledged === true, !deny);
+      assert.deepEqual(after.finalRequest, before.finalRequest);
+      assert.equal(f.state.pinDeletes, 0);
+    } finally { await f.close(); }
+  });
+}
+
+for (const enrolled of [true, false]) {
+  it(`M2 C2 restriction evidence supplies no grant but permits independently authorized mint: enrolled=${enrolled}`, async () => {
+    const { f, record, operate, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+    try {
+      const negative = closureRestrictions(f, record.sourceSha);
+      negative.enrolled = enrolled;
+      await f.coordinator.captureAndUpload({ record, barePath: f.context.barePath, defaultBranch: "main", closureMint: "deny" });
+      assert.equal(f.finals.length, 0);
+      await operate();
+      assert.equal(f.finals.length, 1);
+      assert.equal((await saved()).finalAcknowledged, true);
+    } finally { await f.close(); }
+  });
+}
+
+for (const wait of ["status", "release", "reconciliation"] as const) {
+  it(`M2 C2 reauthenticates restrictions after ${wait} wait`, async () => {
+    const { f, record, operate, saved } = await closureFrozen({ features: CLOSURE_ONLY });
+    try {
+      const negative = closureRestrictions(f, record.sourceSha);
+      if (wait === "status") {
+        const status = f.client.getRecoveryCaptureStatus;
+        f.client.getRecoveryCaptureStatus = async (...args) => {
+          const result = await status(...args); negative.blocked = true; return result;
+        };
+      } else if (wait === "release") {
+        const release = f.client.releaseRecoveryCustody;
+        f.client.releaseRecoveryCustody = async (...args) => {
+          const result = await release(...args); negative.blocked = true; return result;
+        };
+      } else {
+        f.state.wrongAck = true;
+        f.client.reconcileRecoveryCapture = async (run, id, request) => {
+          const savedRequest = (await saved()).finalRequest!;
+          negative.blocked = true;
+          return { run_id: run, capture_id: id, generation: request.generation,
+            outcome: "accepted", final_receipt: savedRequest.disposition };
+        };
+      }
+      await operate();
+      const after = await saved();
+      assert.equal(after.finalAcknowledged, undefined);
+      assert.equal(f.state.pinDeletes, 0);
+      assert.equal(f.state.uploads, 1);
+      if (wait === "status") {
+        assert.equal(after.finalRequest, undefined);
+        assert.equal(f.finals.length, 0);
+      } else {
+        assert.ok(after.finalRequest);
+        const before = structuredClone(after.finalRequest);
+        await f.make(true).resumePending();
+        assert.deepEqual((await saved()).finalRequest, before);
+        assert.equal(f.finals.length, 1, "no replay after durable restrictions change");
+      }
+    } finally { await f.close(); }
+  });
+}
+
 for (const [name, setup, minted] of [
   ["grant 2: foreground push_secret_blocked", { features: [] as string[], options: { foreground: true, terminal: { status: "failed" as const, fail_origin: "push_secret_blocked" } } }, true],
   ["grant 2: foreground worker_residue_blocked", { features: [] as string[], options: { foreground: true, terminal: { status: "failed" as const, fail_origin: "worker_residue_blocked" } } }, true],
