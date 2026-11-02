@@ -855,6 +855,13 @@ test("execution owner ordinary observation follows tail deletion", async () => {
 for (const claimCredential of [true, false]) {
 test(`M3 late native park ACK stays owned after deadline and cannot mutate a reclaimed successor credential=${claimCredential}`, async () => {
   const f = await setup(1);
+  // This source is unenrolled. Keep unrelated remediation I/O out of the 200 ms
+  // late-ACK budget; the drained capture scope, native ACK and stale-owner fences remain real.
+  git.readRemediationRestrictionFacts = async (bare, branch, runId) => {
+    assert.deepEqual([bare, branch, runId],
+      [git.barePathFor(f.claim.repo.clone_url), "agent/issue-2396", f.claim.run_id]);
+    return { enrolled: false, blocked: false, roots: [], flaggedOIDs: [], fingerprint: "late-ack-unenrolled-fixture" };
+  };
   const successorCredential = f.claim.secrets.codex;
   const monitoring = f.memory.run();
   const release = releaseGate();
