@@ -107,7 +107,7 @@ describe("runner entry points that reach a mutating hook", () => {
       evidence: unknown, flight: unknown): Promise<{ path: string }>;
     bindFlightSource(flight: unknown, clonePath: string): Promise<void>;
     admitPredecessorSource(flight: unknown, clonePath: string, wait: object): Promise<void>;
-    requireLaunchAuthority(flight: unknown): Promise<void>;
+    requireLaunchAuthority(flight: unknown): Promise<() => void>;
     endFlightSourceUse(flight: unknown, log: unknown): Promise<void>;
     reconcileConfirmedOwed(flight: unknown, bare: string, sha: string): Promise<void>;
     settler: { cleanup: { deleteRecoveryPin(bare: string, runId: string, generation: number): Promise<void> } };

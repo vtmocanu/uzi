@@ -25,7 +25,7 @@ function command(dir: string, ...args: string[]): string {
 // The scanner reports and default-empty process view are harness seams, not hosted
 // quiescence proof. Late-seed separately checks real persisted authority epochs.
 for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "excluded", "scan-floor", "missing-pending",
-  "missing-RR", "historical", "late-scan-pending", "late-scan-root", "late-seed",
+  "missing-RR", "historical", "late-scan-pending", "late-scan-root", "late-seed", "late-launch-denial",
   "marker", "marker-plain", "marker-staged", "marker-historical", "marker-floor", "marker-exclude", "marker-published-floor",
   "marker-late-scan", "marker-late-seed", "marker-credential"] as const) {
   test("production remediation adoption: " + mode, async t => {
@@ -205,10 +205,27 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       assert.ok(flight.remediationRestrictions.pending.requiredOIDs.includes(foundOID));
       return persist(...args);
     });
+    if (mode === "late-launch-denial") {
+      const admission = (runner as any).requireLaunchAuthority.bind(runner);
+      t.mock.method(runner as any, "requireLaunchAuthority", async (f: any) => {
+        const result = await admission(f);
+        assert.equal(f.remediationRestrictions.denialRevision ?? 0, 0);
+        const readFacts = cache.readRemediationRestrictionFacts.bind(cache);
+        const faulty = t.mock.method(cache, "readRemediationRestrictionFacts",
+          (...args: Parameters<typeof readFacts>) =>
+            readFacts(args[0], args[1], args[2], undefined, { readback: async () => "different" }));
+        try {
+          // Control the promise-resolution gap at the production sink; no process proof.
+          assert.deepEqual(await (runner as any).bootstrapRemediationRestrictions(f), { kind: "unavailable" });
+        } finally { faulty.mock.restore(); }
+        assert.equal(f.remediationRestrictions.denialRevision, 1);
+        return result;
+      });
+    }
     try {
       await runner.execute(claim);
-      if (callbackError) throw callbackError;
       assert.equal(models, succeeds ? 1 : 0, JSON.stringify({ states: api.states, logs }));
+      if (callbackError) throw callbackError;
       assert.equal(callbacks, mode === "missing-pending" || mode === "missing-RR" ? 0 : 1, JSON.stringify({ states: api.states, logs }));
       if (callbacks) assert.equal(scans, 1);
       const actualPins = command(bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-owed/");
@@ -216,7 +233,21 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       if (peel && (succeeds || lateSeed || mode === "marker-credential")) assert.ok(actualPins.includes(`refs/uzi-owed/${claim.run_id}/${execution} ${execution}`));
       else assert.equal(actualPins, pins);
       assert.ok(fs.existsSync(clone.path));
-      if (!succeeds && mode !== "marker-credential") {
+      if (mode === "late-launch-denial") {
+        assert.equal(flight.remediationRestrictions.denialRevision, 1);
+        assert.equal(flight.preserveRecoveryClone, true);
+        assert.equal(flight.worktreePath, read().clonePath);
+        assert.equal(flight.attemptId, read().attemptId);
+        assert.equal(flight.remediationRestrictions.pending.clonePath, read().clonePath);
+        assert.equal(flight.remediationRestrictions.pending.attemptId, read().attemptId);
+        assert.equal(read().recovery.stage, "ready-for-model");
+        assert.equal(read().remediationRecovery.ownedTip, s);
+        assert.equal(read().remediationRecovery.active, undefined);
+        assert.deepEqual(read().remediationRecovery.edges, before.edges);
+        assert.ok(flight.remediationRestrictions.roots.includes(x));
+        assert.equal(publication.mock.callCount(), 0);
+      }
+      if (!succeeds && mode !== "marker-credential" && mode !== "late-launch-denial") {
         assert.equal(flight.remediationRestrictions.pending.clonePath, source.clonePath);
         assert.equal(flight.remediationRestrictions.pending.attemptId, source.attemptId);
         if (mode === "missing-pending") {

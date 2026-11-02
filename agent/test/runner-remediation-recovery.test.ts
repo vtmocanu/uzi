@@ -30,7 +30,7 @@ type Flight = Record<string, unknown> & {
 type Subject = {
   persistRemediationScan(flight: Flight, bare: string, branch: string, tip: string,
     findings: Array<{ commit?: string }>, origin?: "pre-exit"): Promise<void>;
-  requireLaunchAuthority(flight: Flight): Promise<void>;
+  requireLaunchAuthority(flight: Flight): Promise<() => void>;
   checkpointRemediationHold(flight: Flight, bare: string, candidate: string, reap: boolean): Promise<boolean>;
   frozenHeldPolicy(flight: Flight): FrozenHeldPolicy;
   persistRemediationRestrictions(flight: Flight, bare: string, branch: string, tip: string,

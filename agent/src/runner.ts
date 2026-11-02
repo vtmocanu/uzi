@@ -3539,7 +3539,7 @@ export class RunRunner {
    * The executor-launch gate: with an authority runtime, the executor is not started on a clone unless the
    * flight's lease is the current lease for that clone and (Codex) carries this executor's incarnation.
    */
-  private async requireLaunchAuthority(flight: RunFlight): Promise<void> {
+  private async requireLaunchAuthority(flight: RunFlight): Promise<() => void> {
     // Capture before the first wait, including source-use authority acquisition.
     const denialRevision = flight.remediationRestrictions?.denialRevision ?? 0;
     let record: RemediationRecovery | undefined;
@@ -3596,8 +3596,10 @@ export class RunRunner {
     if (this.authority && flight.runnerClone)
       await this.authority.assertLaunchable(flight.runnerClone.path, flight.sourceLease, flight.executor.executorIncarnation,
         this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
-    // No await follows: callbacks during any admission wait must be covered by this read.
+    // Cover admission waits here, then return the same captured checker for the sink:
+    // a denial can latch during the promise-resolution gap before the caller resumes.
     checkRemediation();
+    return checkRemediation;
   }
 
   private rememberRemediationRestrictions(flight: RunFlight, journal: RecoveryJournalEntry): void {
@@ -15004,8 +15006,9 @@ export class RunRunner {
         flight.evidenceProcessJoined = undefined;
         if (flight.evidenceCommands) flight.evidenceCommands.confirmed = false;
         // issue #3404 M2 U3: never start the executor on a clone whose source-use epoch is not this flight's.
-        await this.requireLaunchAuthority(flight);
+        const checkRemediation = await this.requireLaunchAuthority(flight);
         let execution: Promise<ExecutorResult>;
+        checkRemediation();
         try { execution = executor.run(ctx); }
         catch (value) {
           executionRejection.executorRejected = true;
