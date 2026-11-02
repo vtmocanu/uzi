@@ -25,6 +25,7 @@ func diagnosticLogFixtures(t *testing.T) []apitypes.MessageDTO {
 		{"unknown_execution_error", "Cross-check incomplete: execution error; specific cause not recorded."},
 	}
 	var msgs []apitypes.MessageDTO
+	var seq int32
 	for _, stage := range []string{"plan", "code"} {
 		for _, harness := range []string{"claude", "codex"} {
 			for _, pair := range pairs {
@@ -35,7 +36,8 @@ func diagnosticLogFixtures(t *testing.T) []apitypes.MessageDTO {
 				if err != nil {
 					t.Fatal(err)
 				}
-				m := statusMsg(int32(len(msgs)+1), string(raw))
+				seq++
+				m := statusMsg(seq, string(raw))
 				instance, label := "checker-instance-abcdef", "checker"
 				m.AgentInstance, m.AgentLabel = &instance, &label
 				m.CreatedAt = time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
