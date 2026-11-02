@@ -101,9 +101,12 @@ func (s *Service) ReportIterationPark(ctx context.Context, w store.Worker, id uu
 	if err != nil {
 		return run, false, "", err
 	}
-	if pending || run.StopKind.String != "" || run.CredentialSwitchRequestedAt.Valid {
+	if pending || run.StopKind.String != "" {
 		return run, false, "pending_control", nil
 	}
+	// Capture has already stopped this invocation. A concurrent credential choice
+	// applies on owner Resume/reclaim, so keep both its stamp and override. Only
+	// credential application may clear the stamp; the park does not apply a token.
 	// Pass the server fallback to the write when it applies. A frozen allowance
 	// makes it irrelevant; do not narrow an unused, potentially wider config value.
 	globalMaxIterations := e.MaxIterations

@@ -344,8 +344,12 @@ dispositions, idle handling and #3139's stall attempt remain unchanged.
   additive `iteration_park_version: 1` enables the route; absent or unknown
   support retains legacy failures, and old workers ignore the field.
   The server validates the invocation allowance, ownership, generation and
-  unreleased claim, and refuses conflicting stop/cancel or credential-switch
-  controls. `SetRunIterationPark` repeats these admission guards.
+  unreleased claim, and refuses conflicting stop/cancel controls.
+  `SetRunIterationPark` repeats these admission guards. A credential switch
+  observed before capture uses the existing switch path. If it arrives during
+  capture, the iteration park may commit, retaining the override and switch
+  stamp until owner Resume/reclaim applies the selected credential. A parked
+  acknowledgement applies no credential and must not clear that stamp.
 - **Capture and acknowledgement.** The runner preserves clone, HOME, session
   and custody before bounded best-effort capture. Failed publication or
   degraded capture may still park. Confirmation requires an applied

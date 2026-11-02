@@ -4232,7 +4232,6 @@ WITH parked AS (
       AND sqlc.arg('iteration_count')::int >= sqlc.arg('max_iterations')::int
       AND sqlc.arg('iteration_count')::bigint <= sqlc.arg('max_iterations')::bigint + 1
       AND COALESCE(runs.stop_kind, '') = ''
-      AND runs.credential_switch_requested_at IS NULL
       AND NOT EXISTS (SELECT 1 FROM run_user_inputs i WHERE i.run_id = runs.id
           AND i.kind IN ('stop', 'cancel') AND i.applied_at IS NULL
           AND i.disposition IS DISTINCT FROM 'superseded')

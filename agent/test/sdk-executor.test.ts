@@ -9267,6 +9267,89 @@ describe("SdkExecutor no-progress stall owner decision (issue #3139)", () => {
 
   // M3: finite allowance parking is distinct from completion and idle-stall decisions.
   const m3Config = { max_iterations: 2, iteration_park_version: 1 as const };
+  it("iteration park never retries capture through the switch give-up wrapper", async () => {
+    let parks = 0, switches = 0;
+    const r = await drive(m3Work, {
+      config: { max_iterations: 1, iteration_park_version: 1 }, served: 0, completionInterlock: false,
+      attemptCredentialSwitch: async () => { switches++; return "gave_up"; },
+      parkForIteration: async () => { parks++; throw new CredentialSwitchSignal(); },
+    });
+    assert.match(r.error ?? "", /credential switch/);
+    assert.equal(parks, 1);
+    assert.equal(switches, 0, "capture is outside the retry wrapper even on a misbehaving callback");
+    assert.equal(r.calls(), 1);
+  });
+  it("iteration park switch give-up repeats only idempotent settlement then captures once", async t => {
+    let notify: (() => void) | undefined;
+    let models = 0, parks = 0, switches = 0, settlements = 0, abortEffects = 0;
+    const close = SdkExecutor.prototype.closeAndSettlePlanSummary;
+    t.mock.method(SdkExecutor.prototype, "closeAndSettlePlanSummary", async function(this: SdkExecutor) {
+      if (models === 1) {
+        settlements++;
+        if (settlements === 1) {
+          const ctrl = new AbortController();
+          ctrl.signal.addEventListener("abort", () => { abortEffects++; }, { once: true });
+          const owned = this as unknown as { planFlights: Set<unknown> };
+          owned.planFlights.add({ closed: false, ctrl, done: Promise.resolve() });
+          assert.ok(notify); notify();
+        }
+      }
+      await close.call(this);
+    });
+    const r = await drive(c => { models = c; return m3Work(c); }, {
+      config: { max_iterations: 1, iteration_park_version: 1 }, served: 0, completionInterlock: false,
+      onCredentialSwitch: callback => { notify = callback; },
+      attemptCredentialSwitch: async () => { switches++; return "gave_up"; },
+      parkForIteration: async () => { parks++; return "parked"; },
+    });
+    assert.equal(r.error, null);
+    assert.deepEqual(r.result?.iterationParked, { outcome: "parked" });
+    assert.equal(models, 1);
+    assert.equal(switches, 1);
+    assert.ok(settlements >= 2, "give-up repeats the pre-entry guard and settlement");
+    assert.equal(abortEffects, 1, "real summary closure has one abort effect across retries");
+    assert.equal(parks, 1);
+  });
+  for (const when of ["before settlement", "after settlement", "during capture"] as const) {
+    it(`iteration park credential switch ${when} preserves the existing disposition`, async t => {
+      let notify: (() => void) | undefined;
+      let models = 0, parks = 0, switches = 0, tripped = false;
+      const close = SdkExecutor.prototype.closeAndSettlePlanSummary;
+      if (when !== "during capture") {
+        t.mock.method(SdkExecutor.prototype, "closeAndSettlePlanSummary", async function(this: SdkExecutor) {
+          if (when === "before settlement" && models === 1 && !tripped) {
+            assert.ok(notify); tripped = true; notify();
+          }
+          await close.call(this);
+          if (when === "after settlement" && models === 1 && !tripped) {
+            assert.ok(notify); tripped = true; notify();
+          }
+        });
+      }
+      const r = await drive(c => { models = c; return m3Work(c); }, {
+        config: { max_iterations: 1, iteration_park_version: 1 }, served: 0, completionInterlock: false,
+        onCredentialSwitch: callback => { notify = callback; },
+        attemptCredentialSwitch: async () => { switches++; return "released"; },
+        parkForIteration: async () => {
+          parks++;
+          if (when === "during capture") { assert.ok(notify); tripped = true; notify(); }
+          return "parked";
+        },
+      });
+      assert.ok(tripped);
+      assert.equal(models, 1, "no extra work turn after switch or park");
+      assert.equal(r.error, null);
+      if (when === "during capture") {
+        assert.deepEqual(r.result?.iterationParked, { outcome: "parked" });
+        assert.equal(parks, 1);
+        assert.equal(switches, 0, "committed park needs no local retained release");
+      } else {
+        assert.equal(r.result?.switchReleased, true);
+        assert.equal(parks, 0, "visible switch precedes capture");
+        assert.equal(switches, 1);
+      }
+    });
+  }
   const m3Checkpoint: (c: number) => SDKMessage[] = () => [{ type: "assistant", session_id: "sess-1", message: { content: [{ type: "tool_use", id: "ck-m3", name: "mcp__uzi__checkpoint", input: {} }] } } as unknown as SDKMessage, resultSuccess()];
   const m3Question: (c: number) => SDKMessage[] = () => [askUserTurn("Which endpoint?"), resultSuccess()];
   const m3Work: (c: number) => SDKMessage[] = c => [readTool(), assistantText(`M3 work ${c}`), resultSuccess()];

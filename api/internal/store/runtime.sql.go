@@ -22217,7 +22217,6 @@ WITH parked AS (
       AND $7::int >= $6::int
       AND $7::bigint <= $6::bigint + 1
       AND COALESCE(runs.stop_kind, '') = ''
-      AND runs.credential_switch_requested_at IS NULL
       AND NOT EXISTS (SELECT 1 FROM run_user_inputs i WHERE i.run_id = runs.id
           AND i.kind IN ('stop', 'cancel') AND i.applied_at IS NULL
           AND i.disposition IS DISTINCT FROM 'superseded')

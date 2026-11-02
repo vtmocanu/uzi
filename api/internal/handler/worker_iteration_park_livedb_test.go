@@ -188,7 +188,6 @@ func TestWorkerIterationParkLiveDB(t *testing.T) {
 		{"queued", "prompt", "status='queued'", "not_running"},
 		{"cap", "prompt", "budget_max_iterations=7", "allowance_mismatch"},
 		{"stop", "prompt", "stop_kind='stopped'", "pending_control"},
-		{"switch", "prompt", "credential_switch_requested_at=now(),credential_switch_generation=4", "pending_control"},
 	} {
 		t.Run("refusal/"+tc.name, func(t *testing.T) {
 			id := f.run(t, tc.kind)
@@ -205,6 +204,27 @@ func TestWorkerIterationParkLiveDB(t *testing.T) {
 			}
 		})
 	}
+	t.Run("switch_during_capture", func(t *testing.T) {
+		id := f.run(t, "prompt")
+		f.exec(t, "UPDATE runs SET credential_switch_requested_at=now(),credential_switch_generation=4 WHERE id=$1", id)
+		before, err := f.q.GetRunByID(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertIterationAck(t, f.call(id, "iteration-park", iterationParkBody, f.worker), 200, "")
+		after, err := f.q.GetRunByID(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.CredentialSwitchRequestedAt != before.CredentialSwitchRequestedAt || after.CredentialSwitchGeneration != before.CredentialSwitchGeneration {
+			t.Fatal("iteration park changed the pending credential switch")
+		}
+		parked := f.snapshot(t, id)
+		assertIterationAck(t, f.call(id, "iteration-park", iterationParkBody, f.worker), 200, "")
+		if f.snapshot(t, id) != parked {
+			t.Fatal("switch-bearing park replay changed state")
+		}
+	})
 	t.Run("isolated", func(t *testing.T) {
 		profile := uuid.New()
 		f.exec(t, "INSERT INTO egress_profiles(id,name,hosts) VALUES($1,$2,ARRAY['example.com'])", profile, "iteration-"+profile.String())

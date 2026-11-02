@@ -3071,10 +3071,20 @@ export class SdkExecutor implements Executor {
         // survives later zero/missing ACKs; a local false latch proves nothing.
         if (!iterationParkSupported || lastServedCompletionAttempts !== 0 ||
             completionAttempted || history.priorAttempt) return false;
-        this.throwIfTerminal(ctx);
-        if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
-        throwIfDiskStop(ctx);
-        await this.closeAndSettlePlanSummary();
+        const ready = await this.runThroughSwitch(ctx, state, async () => {
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          throwIfDiskStop(ctx);
+          if (state.tripReason) throw this.tripError(state);
+          await this.closeAndSettlePlanSummary();
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          throwIfDiskStop(ctx);
+          if (state.tripReason) throw this.tripError(state);
+        });
+        if ("released" in ready) { switchReleased = true; return true; }
+        // Capture is outside the switch retry wrapper. Once entered, a switch
+        // is deferred by the park ACK; a give-up must never re-enter capture.
         iterationParked = { outcome: await ctx.parkForIteration!({ iterationCount, maxIterations }) };
         // Every outcome stops this flight; a refusal never authorizes a redrive.
         return true;
