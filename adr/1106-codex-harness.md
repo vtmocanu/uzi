@@ -119,18 +119,20 @@ Consequences for the lifecycle are explicit:
   proven is `unknown` and must fail closed for signal latching.
 
 **Amendment (2026-11-02, #3804): per-child turn budget.** Each Codex child turn has
-a 15-minute wall-clock budget; `DEFAULT_CHILD_TURN_DEADLINE_MS` in
-`agent/src/codex/child-budget.ts` is the single source. The parent's tool result
+a 15-minute wall-clock budget, raised from 10 minutes; `DEFAULT_CHILD_TURN_DEADLINE_MS` in
+`agent/src/codex/child-budget.ts` is the single default (executor dependencies may
+still inject a test override; there is no user setting). The parent's tool result
 carries only a code-prefixed, bounded message, never the raw cause:
 `child_timeout: ...` when the deadline fires (interrupt requested, partial work may
-remain) and `child_aborted: ...` on a parent-turn or run cancel (with before/while
+remain) and `child_aborted: ...` on a parent-turn or run cancel (both with before/while
 starting variants). The first cause wins: a deadline that elapses after a parent abort
 stays a cancellation. The lead and child prompts state the budget and the
 partial-handoff rule; the child text sits before the worker-owned safety block. In the
 run feed, a timeout while the lead turn continues is one error completion with the
 timeout text; a run stop or cancel keeps "delegation stopped by the run; child
 settlement not confirmed"; a lead turn end keeps "delegation still open at turn end;
-child settlement not confirmed"; a child that never started has no feed entry and its
+child settlement not confirmed"; a provider stream failure keeps "delegation ended by a
+provider stream failure; child settlement not confirmed"; a child that never started has no feed entry and its
 outcome appears only in the parent reply. The run wall, owner cancel and the lead's turn
 end can still stop a child earlier. There is no user setting, automatic extension or
 retry, and Claude children are unchanged.

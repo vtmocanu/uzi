@@ -1472,8 +1472,11 @@ Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.
 Tracked as GitHub issue vtmocanu/uzi#1864.
 
 - A Codex delegation still open when the lead's turn ends is cancelled and its work settled before the next checkpoint; a boundary that still cannot settle fails closed, and the failure reason and worker log name the stage, the checkpoint and the unsettled work. (AI-synced 2026-09-28)
-- A Codex child turn is limited to 15 minutes; the parent gets a `child_timeout` result on expiry, distinct from `child_aborted` on a run or parent cancel, and the first cause wins. (AI-synced 2026-11-02, #3804)
 - A Codex run's finalize publish runs under its own finite boundary deadline sized for the full publish (push, PR description, merge request), not the milestone checkpoint's 30 s hard deadline; explicit reaped Codex done checkpoints use the separate 60 s soft / 90 s hard allowances above. A finalize deadline failure names the finalize step that was running when it fired, and the worker logs each finalize step's duration. (AI-synced 2026-10-19)
+
+## Issue #3804 — Codex per-child turn budget
+
+- A Codex child turn is limited to 15 minutes (raised from 10); the parent gets a `child_timeout` result on expiry, distinct from `child_aborted` on a run or parent cancel, and the first cause wins. See [ADR-1106](../adr/1106-codex-harness.md). (AI-synced 2026-11-02, #3804)
 
 ## Issue #1932 — Pre-exit secret-scan remediation before publishing
 
