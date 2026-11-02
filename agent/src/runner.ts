@@ -29,7 +29,7 @@ import { AuthorityRefusal, SourceUseHeldRefusal } from "./authority-lock.js";
 import type { AuthorityRuntime, AuthorityWait } from "./authority-runtime.js";
 import { leaseEpoch, leaseHarness, type SourceUseLease } from "./completion-authority.js";
 import { buildClaudeSourceCore, buildCodexSourceCore, serializeSourceFence, sourceFenceOf } from "./completion-source.js";
-import type { RemediationRecovery, MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
+import type { CheckpointPublicationContext, PushPublicationContext, RemediationRestrictionIdentity, RemediationRecovery, MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
   RecoveryChargeInterruptedError,
@@ -10218,13 +10218,15 @@ export class RunRunner {
             throw new CIConfigGuardRefusedSignal();
           }
           atPush = true;
-          await this.git.pushBranch(
+          await this.pushRemediationCandidate(
+            flight,
             finalizeBarePath,
             result.branch,
             claim.secrets.forge_pat,
             claim.repo.clone_url,
             claim.secrets.forge_username,
             publication,
+            boundarySignal,
           );
           flight.successfulPushedSha = sourceSha;
         },
@@ -17023,9 +17025,7 @@ export class RunRunner {
     deadlineAt?: number,
   ): Promise<BridgeOutcome> {
     const negative = await this.bootstrapRemediationRestrictions(flight, barePath, branch, signal, deadlineAt);
-    // Positive bridge admission is not wired yet. An unknown best-effort outcome keeps
-    // park/private capture callers preserving bytes without building or adopting a bridge.
-    if (negative.kind === "unavailable" || flight.remediationRestrictions) return { kind: "unknown" };
+    if (negative.kind === "unavailable") return { kind: "unknown" };
     const H = await this.checkedTrackingSnapshot(flight, barePath, branch, undefined, step, "checkpoint_bridge");
     if (H === null) {
       this.preservationRefused(flight, "ownership_unknown");
@@ -17038,6 +17038,16 @@ export class RunRunner {
     const floors = [publishedTip];
     if (flight.checkpointFloor && flight.checkpointFloor !== publishedTip) {
       floors.push(flight.checkpointFloor);
+    }
+    // Refuse unsafe/unknown required floors before constructing or adopting a bridge.
+    if (flight.remediationRestrictions) {
+      try {
+        await this.withRemediationCandidateAdmission(flight, barePath, branch,
+          admission => admission.admit(H, H, floors), signal, deadlineAt);
+      } catch (error) {
+        if (isCheckpointBoundaryFailure(error)) throw error;
+        return { kind: "unknown" };
+      }
     }
     let anyDivergent = false;
     let anyUnknown = false;
@@ -17119,7 +17129,18 @@ export class RunRunner {
     return adopt(async () => {
       try {
         const context = await this.owedOptions(flight, barePath, branch);
-        const update = await this.git.updateTrackingRef(barePath, branch, bridge, { ...context, checkpointStep: step });
+        const update = flight.remediationRestrictions
+          ? await this.withRemediationCandidateAdmission(flight, barePath, branch, async admission => {
+            const source = admission.identity.workerSelectedSource;
+            if (!source) throw new SecretRemediationPendingError();
+            const { producingSource: _producingSource, ...transformContext } = context;
+            return this.git.updateRemediationTrackingRef(barePath, branch, bridge,
+              { ...transformContext, checkpointStep: step }, source, H, { trusted: true, admit: async input => {
+                await admission.admit(input.sourceTip, input.candidateSha, floors);
+                return true;
+              } });
+          }, signal, deadlineAt)
+          : await this.git.updateTrackingRef(barePath, branch, bridge, { ...context, checkpointStep: step });
         if (update.kind === "not_updated") {
           this.preservationRefused(flight, update.reason);
           return { kind: "preservation_refused" };
@@ -17149,10 +17170,10 @@ export class RunRunner {
   /**
    * PRD #1416 M3 — the BEST-EFFORT bridge wrapper for the park / shutdown / capture sinks (C5-C8).
    * Unlike the finalize sinks (C3/C4), which throw {@link HistoryRewrittenError} on a "failed"
-   * bridge, these boundaries must NEVER throw: a park/shutdown/capture that fails is worse than one
-   * that loses a bridge (D4). It runs the bridge, logs a "failed"/"unknown" outcome, and returns —
-   * the caller then captures/publishes whatever the tracking ref points at (B on success, the
-   * un-bridged H otherwise). Swallows any thrown error too, so nothing here can undo a park.
+   * bridge, this wrapper handles ordinary bridge errors best-effort (D4). Typed checkpoint
+   * boundary failures propagate so cancellation, deadlines and authority refusal remain effective.
+   * It logs a "failed"/"unknown" outcome and returns; the caller then captures/publishes whatever
+   * the tracking ref points at (B on success, the un-bridged H otherwise), subject to ownership.
    */
   private async bridgeParkSinkBestEffort(
     barePath: string,
@@ -17183,7 +17204,7 @@ export class RunRunner {
         this.reportPublishOutcome(flight, diagnostic.key, diagnostic.text);
         return { kind: "failed" };
       }
-      // Never let a bridge failure undo a park/shutdown/capture (D4).
+      // Ordinary bridge errors leave park/shutdown/capture best-effort (D4).
       runLog.warn("PRD #1416 M3: park/capture bridge threw; continuing best-effort", {
         run_id: flight.runId,
         branch,
@@ -17832,7 +17853,8 @@ export class RunRunner {
    * BY DESIGN ordinary unenrolled park / shutdown / pause / capture publishes (and overlays) are NOT
    * scanned: permitted candidates reach the forge UNSCANNED, but #1964 holds findings
    * remembered in this flight at the shared pack/publish seam before any producer starts.
-   * Persisted remediation restrictions hold enrolled checkpoint publication unconditionally.
+   * Enrolled publications additionally scan their actual source, transformed candidate and floors
+   * at the shared pack admission seam, including producer replays.
    * The ONE scanned exception is an eligible terminal run's held publication (issues #2545/#3030,
    * {@link RunRunner.heldPublicationStep}): it uploads work the worker would otherwise archive, so it
    * runs a fresh scan of its own range; an untrusted result needs a qualifying archive or protected custody.
@@ -18516,12 +18538,122 @@ export class RunRunner {
     };
   }
 
-  /**
-   * Enrolled sources remain held until candidate admission is wired. For ordinary unenrolled
-   * sources, read the capped process-local flaggedCommits list serially, independently of display
-   * metadata: the first reachable/unknown SHA or git error holds the candidate.
-   * Clean-tip equality judges the unenrolled source, not its wrapper.
+  /** One bounded publication/transform attempt. A encloses all scans and B callbacks.
+   * B callbacks consume the supplied facts, never a public journal reader. Each distinct
+   * tip is scanned once per callback; a failure stops the attempt and all sibling scans.
+   * Findings latch synchronously and are persisted only after the action releases B.
    */
+  private async withRemediationCandidateAdmission<T>(
+    flight: RunFlight, barePath: string, branch: string,
+    action: (admission: {
+      identity: RemediationRestrictionIdentity;
+      admit(source: string, candidate: string, floors: readonly string[],
+        facts?: CheckpointPublicationContext["restrictionFacts"]): Promise<void>;
+    }) => Promise<T>,
+    signal?: AbortSignal, deadlineAt?: number,
+  ): Promise<T> {
+    const revision = flight.remediationRestrictions?.denialRevision ?? 0;
+    return this.inFlightAuthority(flight, () => this.withRemediationLifecycle(signal, async () => {
+      let record: RemediationRecovery | undefined;
+      let facts: CheckpointPublicationContext["restrictionFacts"];
+      const selected = this.remediationSource(flight);
+      const check = () => {
+        const state = flight.remediationRestrictions;
+        const current = this.remediationSource(flight);
+        if (!Number.isSafeInteger(revision) || revision < 0 ||
+            (state?.denialRevision ?? 0) !== revision || current.runId !== selected.runId ||
+            current.clonePath !== selected.clonePath || current.attemptId !== selected.attemptId ||
+            flight.barePath !== barePath || flight.branch !== branch)
+          throw new SecretRemediationPendingError();
+        if (!state) return;
+        const pending = state.pending;
+        if (flight.secretRemediation?.overflow === true || !record || !facts || facts.blocked || !facts.enrolled ||
+            selected.clonePath !== flight.worktreePath || !selected.attemptId ||
+            record.runId !== selected.runId || record.clonePath !== selected.clonePath ||
+            record.attemptId !== selected.attemptId || record.blocked !== false ||
+            !state.roots.every(root => facts!.roots.includes(root)) ||
+            !(state.flaggedOIDs ?? []).every(root => facts!.flaggedOIDs.includes(root)) ||
+            (pending && (pending.bindingUncertain || pending.requireDenial ||
+              pending.runId !== selected.runId || pending.clonePath !== selected.clonePath ||
+              pending.attemptId !== selected.attemptId || pending.barePath !== barePath ||
+              pending.branch !== branch || !pending.requiredOIDs.every(root => record!.flaggedOIDs.includes(root)))))
+          throw new SecretRemediationPendingError();
+      };
+      const negative = await this.bootstrapRemediationRestrictions(flight, barePath, branch, signal, deadlineAt);
+      if (negative.kind === "unavailable") throw new SecretRemediationPendingError();
+      if (negative.enrolled || flight.remediationRestrictions) {
+        record = await this.restoreRemediationRestrictions(flight);
+        if (!selected.clonePath || !selected.attemptId) throw new SecretRemediationPendingError();
+        facts = await this.git.readRemediationRestrictionFacts(barePath, branch, flight.runId,
+          { runId: selected.runId, clonePath: selected.clonePath, attemptId: selected.attemptId });
+      }
+      check();
+      const identity: RemediationRestrictionIdentity = { exactRunId: flight.runId,
+        ...(record ? { workerSelectedSource: { runId: selected.runId,
+          clonePath: selected.clonePath!, attemptId: selected.attemptId! } } : {}) };
+      const findings: Array<{ tip: string; findings: SecretFinding[] }> = [];
+      try {
+        return await action({ identity, admit: async (source, candidate, floors, supplied) => {
+          check();
+          // A context is fresh under B. Its fingerprint includes the authenticated body,
+          // independently confirmed for this selected run/path/attempt before the action.
+          if (supplied && (supplied.blocked || supplied.enrolled !== Boolean(record) ||
+              (facts && supplied.fingerprint !== facts.fingerprint))) throw new SecretRemediationPendingError();
+          if (!record) {
+            if (supplied?.enrolled || flight.remediationRestrictions) throw new SecretRemediationPendingError();
+            return;
+          }
+          const roots = [...new Set([...facts!.roots, ...(flight.secretRemediation?.flaggedCommits ?? [])])];
+          const tips = new Set([record.ownedTip, source, candidate, ...floors,
+            ...(flight.publishedRealTips ?? []), ...[flight.publishedTip, flight.checkpointFloor,
+              flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip].filter((x): x is string => !!x)]);
+          // The journal/parser and flight floor lists are bounded. Do not follow a mutable
+          // work queue: each input and each scan range contributes one finite pass.
+          for (const tip of tips) {
+            check();
+            const scan = await this.scanRemediationRange(flight, barePath, branch, tip, true);
+            if (scan.trusted && scan.findings.length) {
+              findings.push({ tip: scan.range.tipSha, findings: scan.findings });
+              this.latchRemediationFindings(flight, barePath, branch, scan.findings);
+              throw new SecretRemediationPendingError();
+            }
+            check();
+            if (!scan.trusted) throw new SecretRemediationPendingError();
+            for (const floor of new Set([tip, scan.range.excludeSha, ...(scan.range.scanFloorShas ?? []),
+              ...(scan.range.packExcludeShas ?? []), ...scan.floorCandidates,
+              ...(scan.range.defaultBlobSha ? [scan.range.defaultBlobSha] : [])])) {
+              for (const root of roots) {
+                check();
+                const relation = await this.git.ancestry(barePath, root, floor);
+                check();
+                if (relation !== "divergent") throw new SecretRemediationPendingError();
+              }
+            }
+          }
+          check();
+        } });
+      } finally {
+        for (const finding of findings)
+          await this.persistRemediationRestrictions(flight, barePath, branch, finding.tip, finding.findings);
+      }
+    }, deadlineAt), { ...this.authorityWait(flight), ...(signal ? { signal } : {}),
+      ...(deadlineAt ? { timeoutMs: Math.max(1, deadlineAt - Date.now()) } : {}) });
+  }
+
+  /** Final push seam, shared by plain and aligned candidates and every network retry. */
+  private async pushRemediationCandidate(flight: RunFlight, barePath: string, branch: string,
+    pat: string, repoUrl: string, username: string | undefined,
+    publication: Parameters<GitCache["pushBranch"]>[5], signal?: AbortSignal): Promise<void> {
+    await this.withRemediationCandidateAdmission(flight, barePath, branch, admission =>
+      this.git.pushBranch(barePath, branch, pat, repoUrl, username, publication,
+        async (candidate, context: PushPublicationContext) => {
+          if (!context.restrictionFacts || context.originalFloor.kind === "unverified") throw new SecretRemediationPendingError();
+          await admission.admit(context.originalHead, candidate,
+            [context.originalFloor, context.remoteFloor].flatMap(floor => floor.kind === "pinned" ? [floor.oid] : []),
+            context.restrictionFacts);
+        }, admission.identity), signal);
+  }
+
   private async checkpointRemediationHold(
     flight: RunFlight,
     barePath: string,
@@ -18529,9 +18661,17 @@ export class RunRunner {
     reap: boolean,
     sourceSha: string | null = candidate,
   ): Promise<boolean> {
-    // Until candidate admission is wired for every transform, enrollment is a publication hold.
-    // This covers wrappers and pack replays without trusting a cached clean tip.
-    if (flight.remediationRestrictions) return true;
+    if (flight.remediationRestrictions) {
+      if (!candidate || !sourceSha || !flight.branch) return true;
+      try {
+        await this.withRemediationCandidateAdmission(flight, barePath, flight.branch,
+          admission => admission.admit(sourceSha, candidate, []));
+        return false;
+      } catch (error) {
+        if (isCheckpointBoundaryFailure(error)) throw error;
+        return true;
+      }
+    }
     const state = flight.secretRemediation;
     if (!state) return false;
     if ((state.known?.length ?? 0) > 0 || (state.blocked?.length ?? 0) > 0 || state.overflow === true) return true;
@@ -18654,15 +18794,25 @@ export class RunRunner {
       if (await this.checkpointRemediationHold(flight, barePath, sourceSha, reap)) {
         throw new SecretRemediationPendingError();
       }
-      const packed = await this.git.checkpointPack(barePath, branch, overlay, pinned, onStep, sourceSha,
-        async (wantedSha) => {
-          signal?.throwIfAborted();
-          // The clean scan names the owned source, while ancestry judges the actual overlay/bridge.
-          if (await this.checkpointRemediationHold(flight, barePath, wantedSha, reap, sourceSha)) {
-            throw new SecretRemediationPendingError();
-          }
-          signal?.throwIfAborted();
-        },
+      let guard: (candidate: string, context?: CheckpointPublicationContext) => Promise<void>;
+      const produce = <T,>(start: (identity: RemediationRestrictionIdentity) => Promise<T>) =>
+        this.withRemediationCandidateAdmission(flight, barePath, branch, async admission => {
+          guard = async (wantedSha, context) => {
+            signal?.throwIfAborted();
+            if (!context?.restrictionFacts) throw new SecretRemediationPendingError();
+            await admission.admit(context.sourceSha, wantedSha,
+              [context.excludeSha, ...context.packExcludeShas,
+                ...(context.defaultBlobSha ? [context.defaultBlobSha] : [])], context.restrictionFacts);
+            // The legacy flight-only policy remains for ordinary unenrolled publications.
+            if (!flight.remediationRestrictions &&
+                await this.checkpointRemediationHold(flight, barePath, wantedSha, reap, sourceSha))
+              throw new SecretRemediationPendingError();
+            signal?.throwIfAborted();
+          };
+          return start(admission.identity);
+        }, signal);
+      const packed = await produce(identity => this.git.checkpointPack(barePath, branch, overlay, pinned, onStep, sourceSha,
+        (candidate, context) => guard(candidate, context),
         // issue #2733: chain a raw publish over a prior overlay tip so a lost-ack or confirmed
         // overlay does not wedge later tick/iteration publishes with `not_descendant`. The list is
         // ordered [attempted, confirmed]: the first candidate that is not already contained in the
@@ -18671,7 +18821,7 @@ export class RunRunner {
         flight.checkpointChainForge === true
           ? [flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip]
           : undefined,
-        { defaultBranch: flight.checkpointDefaultBranch, signal });
+        { defaultBranch: flight.checkpointDefaultBranch, signal, restrictionIdentity: identity }));
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };
@@ -18696,7 +18846,7 @@ export class RunRunner {
         onStep?.("scratch_preflight");
         await this.requireTrackingOwned(flight, barePath, branch, sourceSha, onStep, "scratch_preflight");
         signal?.throwIfAborted();
-        producer = await packed.replay();
+        producer = await produce(() => packed.replay());
         observeProducer();
         retried = true;
       }

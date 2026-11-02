@@ -81,7 +81,7 @@ async function fixture() {
   return { bare, base, clone, source, fetch, commit, freshFlight, enroll };
 }
 
-test("fresh runner restores flagged and displaced roots, admits only confirmed clean source, and freezes a publication hold", async t => {
+test("fresh runner restores flagged and displaced roots, admits only confirmed clean source, and retains unsafe held custody", async t => {
   const f = await fixture();
   const flagged = await f.enroll();
   const displaced = f.commit("displaced", flagged);
@@ -101,7 +101,7 @@ test("fresh runner restores flagged and displaced roots, admits only confirmed c
   await runner.requireLaunchAuthority(flight);
   assert.equal(scans, 1, "workers without authority still scan enrolled source");
   assert.deepEqual(new Set(flight.remediationRestrictions?.roots), new Set([flagged, displaced]));
-  assert.equal(await runner.checkpointRemediationHold(flight, f.bare, clean, true), true);
+  assert.equal(await runner.checkpointRemediationHold(flight, f.bare, clean, true), false);
   const policy = runner.frozenHeldPolicy(flight);
   assert.equal(policy.blocked, true);
   assert.deepEqual(await prepareFrozenHeld({ git, barePath: f.bare, branch: BRANCH, sourceSha: clean,
