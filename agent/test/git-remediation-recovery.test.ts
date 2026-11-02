@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { parseRecoveryJournal as oldParse } from "./fixtures/base-parse-recovery-journal.js";
 import { createHash } from "node:crypto";
-import { GitCache, type FetchAgentBranchOptions, type PositiveOwedCandidateContext, type RemediationRecovery } from "../src/git.js";
+import { GitCache, newTrackingAttemptToken, type FetchAgentBranchOptions, type PositiveOwedCandidateContext, type RemediationRecovery } from "../src/git.js";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
@@ -58,6 +58,40 @@ beforeEach(async () => {
   await fetch();
 });
 afterEach(() => fx.cleanup());
+
+test("tracking receipt repair cannot finish a prepared remediation transaction", async t => {
+  const q = commit("flagged before receipt interruption");
+  await fetch();
+  await enroll();
+  const replacement = commit("remediated replacement");
+  opts.attemptToken = newTrackingAttemptToken(() => true);
+  const internals = cache as unknown as {
+    writeOwedFile(b: string, name: string, value: unknown): Promise<void>;
+  };
+  const original = internals.writeOwedFile.bind(cache);
+  const fault = t.mock.method(internals, "writeOwedFile", async (b: string, name: string, value: unknown) => {
+    await original(b, name, value);
+    if (name.startsWith("receipt-") && (value as { phase?: string }).phase === "pending")
+      throw new Error("interrupted pending ownership receipt");
+  });
+  assert.deepEqual(await cache.fetchAgentBranch(bare, clone, BRANCH, RUN, opts),
+    { kind: "not_updated", reason: "receipt_pending_failed" });
+  fault.mock.restore();
+  assert.equal(journal().remediationRecovery.edges.at(-1).phase, "prepared");
+  const saved = raw();
+  const tracking = "refs/uzi-runner/" + BRANCH;
+  assert.equal(git(bare, "rev-parse", tracking), q);
+  const receiptPath = path.join(bare, "uzi-owed", "receipt-" + createHash("sha256").update(BRANCH).digest("hex") + ".json");
+  const pending = fs.readFileSync(receiptPath, "utf8");
+  assert.equal(JSON.parse(pending).trackingSha, replacement);
+  assert.deepEqual(await cache.fetchAgentBranch(bare, clone, BRANCH, RUN, opts),
+    { kind: "not_updated", reason: "ownership_unknown" });
+  assert.equal(raw(), saved);
+  assert.equal(git(bare, "rev-parse", tracking), q);
+  assert.equal(fs.readFileSync(receiptPath, "utf8"), pending);
+  assert.ok((await cache.enumerateOwedCandidates(bare, RUN)).some(c => c.sha === q));
+  assert.ok((await cache.enumerateOwedCandidates(bare, RUN)).some(c => c.sha === replacement));
+});
 
 for (const origin of ["checkpoint-pending", "pre-exit"] as const) {
   test(origin + ": real import, later pending head, displacement and restart query", async () => {

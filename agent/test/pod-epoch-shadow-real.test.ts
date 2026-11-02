@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { afterEach, beforeEach, test } from "node:test";
+import { afterEach, beforeEach, test, mock } from "node:test";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -40,7 +41,7 @@ beforeEach(async () => {
   fs.chmodSync(path.dirname(bare), 0o700);
   fs.chmodSync(bare, 0o700);
 });
-afterEach(() => { resetResidueQuarantineForTests(); fx.cleanup(); });
+afterEach(() => { mock.restoreAll(); resetResidueQuarantineForTests(); fx.cleanup(); });
 
 /** A live attempt seeded through production with its exact plain journal (the strict-plain basis). */
 async function seedStrictPlain() {
@@ -150,6 +151,7 @@ test("the shadow pass over a real GitCache reads a protected episode and a stric
     const plain = seen.find(s => s.runId === PLAIN_RUN)!;
     assert.deepEqual(plain.epochSettlement, { basis: "strict_plain", disposition: { kind: "local_discard" } });
     assert.equal(result.by_basis.strict_plain, 1, "the live attempt is reported under the strict-plain basis");
+    assert.deepEqual(result.partial_causes, {});
     assert.equal(result.verdict, "eligible");
     assert.equal(result.authority.result, "attested");
     assert.equal(result.by_basis.discard, 2, "both protected-episode paths are settled-hold discard candidates");
@@ -167,3 +169,110 @@ test("the shadow pass over a real GitCache reads a protected episode and a stric
   assert.deepEqual(snapshot(), before, "the pass wrote nothing to the bare config, refs or clone directories");
   assert.ok(protectedPaths.every(p => fs.existsSync(p)) && fs.existsSync(plainPath));
 });
+
+
+test("#3775 separate shadow passes on one real GitCache do not share diagnostics", async () => {
+  await seedStrictPlain();
+  const d = await daemon();
+  let capped = true;
+  const pass = () => runPodEpochShadow({
+    bootstrap: { podUid: evidence.successor, runtime: evidence.runtime, evidenceFile: "/etc/uzi/pod-epoch/evidence", firstMode: "exclusive" },
+    ownership: { mode: "exclusive", consume: async () => { throw new Error("already consumed"); },
+      matchesEntry: () => true, reacquireShared: async () => {}, close: () => {} },
+    consumption: { result: "fresh", mayEvaluate: true }, signal: new AbortController().signal,
+    dockerHost: d.host, readEvidence: async () => evidenceBytes, kernelRelease: () => "6.1.0-test",
+    client: { getRunOwnership: async () => ({ status: "completed" }),
+      listRecoveryHolds: async run_id => ({ run_id, holds: [] }) },
+    git: { discoverEpochRetainedSources: opts => git.discoverEpochRetainedSources(opts),
+      inspectRetainedSources: opts => git.inspectRetainedSources({ ...opts,
+        ...(capped ? { measureCaps: { maxEntries: 1 } } : {}) }) },
+  });
+  try {
+    const partial = (await pass())!;
+    const saved = JSON.stringify(partial.partial_causes);
+    assert.deepEqual(partial.partial_causes, { measurement_entry_cap: 1 });
+    assert.equal(partial.verdict, "partial");
+    assert.deepEqual(partial.list, []);
+    capped = false;
+    const complete = (await pass())!;
+    assert.deepEqual(complete.partial_causes, {});
+    assert.equal(complete.verdict, "eligible");
+    assert.equal(complete.authority.result, "attested");
+    assert.equal(complete.would_delete, 1);
+    assert.equal(JSON.stringify(partial.partial_causes), saved);
+  } finally { await d.close(); }
+});
+
+for (const mode of ["entries", "opendir", "ownership", "holds", "multiple"] as const) {
+  test("#3775 real shadow partial causes: " + mode, async () => {
+    const plainPath = await seedStrictPlain();
+    const protectedPaths = seedProtectedEpisode();
+    const d = await daemon();
+    const holdsCalls: string[] = [];
+    const snapshots: Array<{ run: string; lifecycle: unknown; holds: unknown }> = [];
+    const original = fsp.opendir;
+    let hits = 0;
+    if (mode === "opendir" || mode === "multiple") {
+      mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+        if (args[0] === plainPath) { hits++; throw Object.assign(new Error("private"), { code: "EACCES" }); }
+        return original(...args);
+      });
+    }
+    try {
+      const result = (await runPodEpochShadow({
+        bootstrap: { podUid: evidence.successor, runtime: evidence.runtime, evidenceFile: "/etc/uzi/pod-epoch/evidence", firstMode: "exclusive" },
+        ownership: { mode: "exclusive", consume: async () => { throw new Error("already consumed"); },
+          matchesEntry: () => true, reacquireShared: async () => {}, close: () => {} },
+        consumption: { result: "fresh", mayEvaluate: true }, signal: new AbortController().signal,
+        dockerHost: d.host, readEvidence: async () => evidenceBytes, kernelRelease: () => "6.1.0-test",
+        client: {
+          getRunOwnership: async run => {
+            if (run === PLAIN_RUN && mode === "ownership") throw { status: 503 };
+            return { status: "completed" };
+          },
+          listRecoveryHolds: async run_id => {
+            holdsCalls.push(run_id);
+            if (run_id === PLAIN_RUN && (mode === "holds" || mode === "multiple")) throw { name: "TimeoutError" };
+            return { run_id, holds: [] };
+          },
+        },
+        git: {
+          discoverEpochRetainedSources: opts => git.discoverEpochRetainedSources(opts),
+          inspectRetainedSources: opts => {
+            snapshots.push({ run: opts.selector!.runId, lifecycle: opts.lifecycle, holds: opts.holds });
+            return git.inspectRetainedSources({ ...opts,
+              ...(mode === "entries" && opts.selector!.runId === PLAIN_RUN ? { measureCaps: { maxEntries: 1 } } : {}) });
+          },
+        },
+      }))!;
+      assert.equal(result.verdict, "partial");
+      assert.equal(result.reason, "inventory_partial");
+      assert.equal(result.inventory_complete, false);
+      assert.equal(result.authority.result, "attested");
+      assert.deepEqual(result.partial_causes, mode === "entries" ? { measurement_entry_cap: 1 } :
+        mode === "opendir" ? { measurement_filesystem_error: 1 } :
+        mode === "ownership" ? { ownership_read_http_5xx: 1 } :
+        mode === "holds" ? { holds_read_timeout: 1 } : { holds_read_timeout: 1, measurement_filesystem_error: 1 });
+      assert.deepEqual(result.list.map(c => [c.run_id, c.path, c.presence, c.basis]).sort(),
+        protectedPaths.map(p => [PROTECTED_RUN, path.basename(p), "present", "discard"]).sort());
+      assert.equal(result.examined, 3);
+      assert.equal(result.would_delete, 2);
+      assert.equal(result.would_settle, 0);
+      assert.equal(result.kept, 1);
+      assert.equal(result.by_basis.discard, 2);
+      assert.equal(result.by_basis.strict_plain, 0);
+      assert.equal(result.list_overflow, 0);
+      assert.equal(result.inventory_overflow, 0);
+      assert.equal(result.bytes_state, "partial");
+      if (mode === "ownership") {
+        assert.deepEqual(holdsCalls, [PROTECTED_RUN]);
+        assert.deepEqual(snapshots.find(x => x.run === PLAIN_RUN), {
+          run: PLAIN_RUN, lifecycle: { state: "unknown" }, holds: { state: "unknown" },
+        });
+      }
+      if (mode === "holds") assert.deepEqual(snapshots.find(x => x.run === PLAIN_RUN)?.lifecycle,
+        { state: "terminal", status: "completed" });
+      if (mode === "opendir" || mode === "multiple") assert.equal(hits, 1);
+    } finally { await d.close(); }
+  });
+}

@@ -6,7 +6,7 @@ name: Release automation
 
 "on":
   schedule:
-    - cron: '47 4 * * *'
+    - cron: '47 1 * * *'
       timezone: Europe/Bucharest
   workflow_dispatch:
     inputs:

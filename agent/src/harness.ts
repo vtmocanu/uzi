@@ -614,6 +614,8 @@ export interface BoundaryProcessHandle {
 
 export interface CodexExecutionSafety {
   readonly kind: "codex";
+  /** Read-only repair admission; a facade without this capability fails closed. */
+  registryState?(): "open" | "closing" | "closed" | "poisoned" | "disposed";
   withBoundary<T>(
     request: BoundaryRequest,
     action: (permit: BoundaryPermit) => Promise<T>,

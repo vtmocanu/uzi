@@ -266,6 +266,15 @@ The line also carries `authority` (`undeclared`, `legacy_evidence`,
 `contradicted`, `unproven` or `attested`, with a fixed reason),
 `evidence_version` and, once version-2 binding and prefix checks pass, the node's kernel release.
 
+For `inventory_partial`, the log's `partial_causes` contains sparse, bounded
+event counters. `measurement_entry_cap` records a measurement limit and
+`measurement_filesystem_error` a filesystem failure; `ownership_read_` and
+`holds_read_` keys classify failures at those read stages. Counters saturate at
+**65535**; a missing counter does not establish that unvisited work was clean.
+No raw errors, URLs, paths or IDs appear in this object, and eligibility and
+authority are unchanged. See the
+[full #3775 diagnostic contract](../prds/3431-pod-epoch-reclaim.md#3775-partial-shadow-diagnostic-contract).
+
 **This is shadow reporting:** the pass deletes no attempt trees, settles no
 records, releases no recovery holds and removes no stopped containers. Existing
 startup reapers and DinD maintenance retain their separate behavior. Compose and

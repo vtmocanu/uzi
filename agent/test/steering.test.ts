@@ -2262,3 +2262,66 @@ describe("iteration capture pending-cancellation observation", () => {
     });
   }
 });
+
+// issue #3780: the read-only authority the runner's tracking-repair admission predicate reads.
+describe("issue #3780 ownershipRepairAuthority", () => {
+  const fresh = (): SteeringChannel => new SteeringChannel(fakeClient([]), "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: 7 });
+  type Private = { failReceipts(err: Error): void; endFencedFlight(reason: string): void };
+
+  it("is true on a fresh channel and after a cooperative PauseNow (terminal=false)", () => {
+    const ch = fresh();
+    assert.equal(ch.ownershipRepairAuthority(), true);
+    ch.abortLifecycle(new PauseNowSignal(), false);
+    assert.equal(ch.ownershipRepairAuthority(), true);
+    ch.rearmLifecycle();
+    assert.equal(ch.ownershipRepairAuthority(), true);
+  });
+
+  it("is false after a credential-switch delivery and after its give-up", () => {
+    const ch = fresh();
+    ch.tripCredentialSwitch(7);
+    assert.equal(ch.ownershipRepairAuthority(), false);
+    ch.rearmCredentialSwitch();
+    assert.equal(ch.ownershipRepairAuthority(), false, "a give-up leaves the shutdown stop aborted");
+  });
+
+  it("is false for a credential switch deferred in a defer window, which aborts only the shutdown stop", () => {
+    const ch = fresh();
+    ch.beginCredentialSwitchDefer();
+    ch.tripCredentialSwitch(7);
+    // Every other condition still holds, so only the shutdown stop revokes the authority.
+    assert.equal(ch.pendingCredentialSwitch(), undefined, "the switch is deferred, not pending");
+    assert.equal(ch.lifecycleSignal().aborted, false, "the lifecycle was not aborted");
+    assert.equal(ch.isCancelled(), false);
+    assert.equal(ch.ownershipRepairAuthority(), false);
+  });
+
+  it("is false after a terminal abort, also when it follows a cooperative pause", () => {
+    const direct = fresh();
+    direct.abortLifecycle(new Error("x"));
+    assert.equal(direct.ownershipRepairAuthority(), false);
+    const afterPause = fresh();
+    afterPause.abortLifecycle(new PauseNowSignal(), false);
+    assert.equal(afterPause.ownershipRepairAuthority(), true);
+    afterPause.abortLifecycle();
+    assert.equal(afterPause.ownershipRepairAuthority(), false);
+  });
+
+  it("is false after receipt failure, a claim fence, cancel, a disk stop and a worker shutdown", () => {
+    const failed = fresh();
+    (failed as unknown as Private).failReceipts(new Error("receipt"));
+    assert.equal(failed.ownershipRepairAuthority(), false);
+    const fenced = fresh();
+    (fenced as unknown as Private).endFencedFlight("stale");
+    assert.equal(fenced.ownershipRepairAuthority(), false);
+    const cancelled = fresh();
+    cancelled.markCancelled();
+    assert.equal(cancelled.ownershipRepairAuthority(), false);
+    const disk = fresh();
+    disk.requestDiskStop();
+    assert.equal(disk.ownershipRepairAuthority(), false);
+    const shutdown = fresh();
+    shutdown.workerShutdown(Date.now() + 1000);
+    assert.equal(shutdown.ownershipRepairAuthority(), false);
+  });
+});

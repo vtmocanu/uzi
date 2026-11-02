@@ -250,7 +250,7 @@ assert.call(status.success?, true, "actual prepare output fixture: #{err}")
 missing_prepare_outputs = JSON.parse(emitted) - release_auto.fetch('jobs').fetch('prepare').fetch('outputs').keys
 assert.call(missing_prepare_outputs, [], 'prepare forwards every emitted step output to needs')
 assert.call(release_auto.fetch('on').keys.sort, %w[schedule workflow_dispatch], 'manual and nightly routes are explicit')
-assert.call(release_auto.fetch('on').fetch('schedule'), [{'cron' => '47 4 * * *', 'timezone' => 'Europe/Bucharest'}], 'nightly uses local time after the sweep window')
+assert.call(release_auto.fetch('on').fetch('schedule'), [{'cron' => '47 1 * * *', 'timezone' => 'Europe/Bucharest'}], 'nightly uses 01:47 Bucharest to leave room for scheduler delays')
 assert.call(release_auto.fetch('permissions'), {}, 'automation token defaults to no permissions')
 assert.call(release_auto.fetch('concurrency'), {'group' => 'release-auto', 'cancel-in-progress' => false, 'queue' => 'max'}, 'all release routes queue without cancellation')
 auto_jobs = release_auto.fetch('jobs')

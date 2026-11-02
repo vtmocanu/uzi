@@ -32,7 +32,7 @@ name: Roles Manifest Refresh
 "on":
   schedule:
     # 06:27 UTC Mondays, off the top of the hour to dodge scheduler contention and
-    # distinct from e2e.yml (01:17) and main-guard.yml (05:43).
+    # distinct from e2e.yml (21:17) and main-guard.yml (05:43).
     - cron: "27 6 * * 1"
   workflow_dispatch: {}
 

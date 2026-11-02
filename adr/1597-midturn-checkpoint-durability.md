@@ -413,6 +413,8 @@ if the tick holds the gate when a gated path needs it, the gated path **preempts
 exited, any lock wait resolved, any in-flight publish rejected or completed — before
 proceeding. The tick, by contrast, only ever *tries* to acquire the gate
 (`tryAcquire`, non-blocking); a miss is a normal tick outcome (`gate_busy`), never an error.
+Since #3780 that preemption is a cooperative (soft) stop of the tick's scope, not a hard
+abort; see [the #3780 amendment](#amendment-2026-11-02--3780-soft-tick-stops-and-same-flight-attempt-repair).
 
 ### Amendment 2026-10-19 — #3123: completion budgets and safe stops
 
@@ -538,6 +540,119 @@ on a stopped read. Awaited filesystem writes and fsync stay uninterruptible. A
 as before. A started bridge adoption and in-import mutation stay hard-only (#3123,
 #3315). Source and local test evidence do not establish hosted acceptance. See the
 [cross-check amendment](2149-cross-check.md#amendment-2026-10-26--3304-code-head-reads-settle-at-the-snapshot-boundary).
+
+### Amendment 2026-11-02 — #3780: soft tick stops and same-flight attempt repair
+
+**Incident.** A routine mid-turn tick was hard-aborted after it wrote the pending
+ownership receipt and before the tracking-ref CAS. The inferred cause (not
+reproduced) is preemption by the done checkpoint, which aborted the tick's whole scope.
+The receipt stayed `pending` with the ref unmoved, so every later import observed no
+owner and refused with `ownership_unknown`, and finalize failed the run.
+
+**Soft tick stops.** The tick now has two controllers. Sink-gate preemption, `stop()`,
+and a cooperative lifecycle abort or pre-deadline graceful shutdown abort the soft one,
+which the checkpoint scope masks across GitCache's ownership section (the #3123 mask), so
+a started import settles its receipt before the tick yields. Lifecycle, terminal and
+checkpoint-authority events, and the worker shutdown, are classified with the done-path
+rule (`checkCheckpointStop`): cooperative stops are soft, revocations hard. `stop()`
+is soft unless the current classification is hard; a classifier exception reads as hard.
+The shutdown deadline timer hard-aborts unconditionally (a timer can fire slightly before
+the clock reaches `deadlineAt`, so reclassifying could wrongly stay soft), and the 120 s
+tick cap stays hard. Invariant: the tick's spawner and the scope's hard signal stay on
+the hard controller, so the existing mask lets a started ownership section finish while
+children are still killed on a hard stop. This amends the preemption text in
+"Per-flight sink gate and preemption", which previously aborted the scope. There is no
+cap guard on the masked section: it was optional and not implemented.
+
+**Same-flight repair (a scoped amendment of the receipt-adoption rule).** A flight owns
+an opaque `TrackingAttemptToken`, minted through a module function that registers its
+admission predicate in a module-scoped `WeakMap`; an unregistered token is never admitted.
+It rides the flight's owed options into `fetchAgentBranch` and `updateTrackingRef`. At
+mask entry, before `promoteTrackingUnderLock`'s first write, GitCache records the
+pre-mutation state per token and `bare`/branch (observed ref and raw owner stamp, prior
+receipt, incoming head, context, run, generation, the pending receipt, coverage and
+displaced-head facts). The record is dropped only on an `updated` return or when an
+owner is later observed; any other exit after a write leaves it. The records live in
+the `GitCache` instance, so a restart starts empty.
+
+When an import under the bare lock finds no observable owner, it asks the repair to
+finish that token's own attempt, only from one of three exact disk states:
+
+- **Pre-pending:** ref and stamp unchanged, no receipt, governance marker absent or
+  exact, and the record saw no prior receipt. If the original attempt had not yet passed
+  the ancestor clear, repair observes the same ancestor candidates read-only. It finishes
+  only when every observation succeeds and no ancestor tracking ref exists. Otherwise it
+  refuses without ancestor writes; an ordinary fresh import or the owner handles that
+  residual. Repair never runs ancestor cleanup, pins an ancestor, archives or deletes its
+  ref, or clears its receipt or stamp. Ordinary import cleanup is unchanged.
+  Roll-forward: marker, pending receipt, CAS, stamp, committed receipt.
+- **Ref unchanged:** marker and pending receipt exact, ref and stamp unchanged. CAS,
+  stamp, committed receipt.
+- **CAS landed:** ref equals the incoming head, stamp equals the old or new run, marker and
+  pending receipt exact. Stamp (if needed) and committed receipt.
+
+Only the committed receipt reading back as the record's run, generation and context
+counts as success. Anything else (any other disk state, a context, run or generation
+mismatch, a missing owed anchor, a duplicated stamp) refuses as before. There is no
+rollback: every write is a step the original attempt would have taken, and undoing
+under possibly revoked authority would be a new mutation. Before each roll-forward write
+(marker, pending receipt, CAS, stamp, committed receipt) the repair re-checks the admission proof and the hard boundary signal (the soft signal is
+masked for the repair); the one best-effort rewrite of the pending receipt after a failed
+committed write or readback, mirroring the original attempt's own invalidation, runs only
+while admission holds and the hard boundary signal has not aborted. Admission is true only
+while the steering channel's positive authority
+fields all hold (no terminal lifecycle, shutdown, flight end, receipt failure, cancel,
+claim fence, pending credential switch, disk pause or shutdown checkpoint), the owed
+limit has not stopped the run, the Codex registry is neither poisoned nor disposed, and
+no tick survivors or retained bare locks remain.
+
+Revocation audit (enumerated at implementation, base 59c8ee55). The terminal lifecycle
+and revocation fence (`shutdownStop`, which is `checkpointAuthoritySignal()`) are aborted
+only by:
+- message-transport permanent failure (runner, two sites);
+- cancellation observation (`observeCancellation` → `markCancelled` plus terminal
+  `abortLifecycle`) and steering cancel;
+- the owed-limit stop;
+- receipt give-up (`failReceipts`);
+- the claim fence (`endFencedFlight`);
+- the disk stop (`requestDiskStop`);
+- credential-switch delivery, including inside a defer window;
+- `workerShutdown`.
+
+Cooperative pause and credential-switch lifecycle deliveries pass `terminal = false`.
+Ordinary executor completion and `SteeringChannel.stop()` touch none of these, so a
+normally completed run keeps repair authority through its done checkpoint and finalize,
+while every listed path revokes it. If it turns false between writes, the
+repair stops with no further write and no rollback, leaving a state a later admissible
+import can finish; the import then refuses. After a success the state is re-observed,
+the repaired retained heads are merged into the result, and the CURRENT incoming is
+promoted through the normal path. A soft-stopped bridge starts no repair write.
+
+#3123's rule that a soft stop grants no receipt-adoption authority still holds. The
+proof here is the attempt's own in-memory record plus current authority, not a soft stop.
+A restart, a different run or generation, any mismatch, and revoked authority stay refused.
+
+Accepted residuals:
+
+- A receipt stranded across a restart or worker shutdown still fails the run at finalize;
+  this is to converge with #3738's park design.
+- After a credential switch has been delivered, the revocation fence stays aborted for
+  the rest of the flight, so repair is refused and turn-end tick stops classify hard, as
+  in the done path.
+- Repair runs only in the import paths (`fetchAgentBranch`, `updateTrackingRef`). Other
+  readers stay fail-closed: ownership snapshots, settle-transfer, claim-relinquish
+  retention, the reseed owner read, recovery coverage, ancestor clearing and owed GC.
+  This relies on `tipUnmovedSinceFetch` falling through to a fetch when ownership is
+  unproven.
+- Preemption latency, now up to the masked section's duration, is unmeasured.
+- A soft-stopped import can leave its private `refs/uzi-incoming/` stage ref behind, as the
+  done path already does.
+- If the repair succeeds but the follow-on promote is refused, the retained-head notice is
+  skipped; the pins remain.
+
+The #3304 amendment above is unchanged: its read-settlement rules apply to the done and
+gate paths, and this one concerns the mid-turn tick and the import ownership section.
+Source and local test evidence do not establish hosted acceptance.
 
 ### Git-busy probe
 

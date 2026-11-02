@@ -1,3 +1,4 @@
+import { countPartialCause, mergePartialCauses, type PartialCause, type PartialCauses } from "./pod-epoch-partial-causes.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { isCheckpointBoundaryFailure, CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, GitBoundaryAbortError } from "./checkpoint-stop.js";
 import { MaintenanceResources } from "./recovery-maintenance.js";
@@ -2254,6 +2255,7 @@ export interface EpochRetainedDiscoveryOptions {
 }
 
 export interface EpochRetainedDiscoveryResult {
+  partialCauses?: PartialCauses;
   groups: Array<{ barePath: string; selector: RetainedSourceSelector; paths: string[] }>;
   inventoryComplete: boolean;
   /** Unique physical paths observed, including omitted groups; a lower bound if incomplete. */
@@ -2291,6 +2293,7 @@ export interface RetainedInspectOptions {
 }
 
 export interface RetainedInspectResult {
+  partialCauses?: PartialCauses;
   sources: RetainedSourceEvidence[];
   /** True when enumeration or measurement hit the budget or the descriptor cap. */
   partial: boolean;
@@ -2675,6 +2678,42 @@ export interface FetchAgentBranchOptions {
   /** Milestone policy soft-stops only while waiting for the bare lock. */
   checkpointImportMode?: "done" | "milestone";
   checkpointStep?: (step: BoundaryStep) => void;
+  /** issue #3780: per-flight opaque token. A stranded ownership update this same token's attempt left
+   *  behind may be finished by a later import, while the token's admission predicate still holds. */
+  attemptToken?: TrackingAttemptToken;
+}
+/** issue #3780: opaque flight token. Only {@link newTrackingAttemptToken} registers an admission predicate,
+ *  and that registry is module-scoped, so `new TrackingAttemptToken()` is possible but inert: an unregistered
+ *  token is never admitted. The per-GitCache attempt records are private to GitCache. */
+export class TrackingAttemptToken {
+  declare private readonly brand: never;
+}
+const trackingAttemptAdmission = new WeakMap<TrackingAttemptToken, () => boolean>();
+/** issue #3780: mint the opaque token a flight threads through its owed options. `admission` is checked
+ *  under the bare lock before EACH repair write; it must be a pure, synchronous read. A module function
+ *  (not a GitCache method) so a caller's partial GitCache stand-in cannot make owedOptions throw. */
+export function newTrackingAttemptToken(admission: () => boolean): TrackingAttemptToken {
+  const token = new TrackingAttemptToken();
+  trackingAttemptAdmission.set(token, admission);
+  return token;
+}
+/** Everything {@link GitCache.repairTrackingAttemptUnderLock} must prove before it finishes an attempt. */
+interface TrackingAttemptRecord {
+  observedSha: string | undefined;
+  /** Raw `runnerTrackingOwnerKey(branch)` value before the attempt (undefined when absent). */
+  stamp: string | undefined;
+  priorReceipt: unknown;
+  incoming: string;
+  context: string;
+  runId: string;
+  generation: number | null;
+  pending: TrackingReceipt;
+  incomingCovered: boolean;
+  displacedSha: string | undefined;
+  displacedContext: StoredOwedContext | undefined;
+  retainedShas: string[];
+  /** Set once the attempt passed ordinary ancestor cleanup or repair's read-only absence check. */
+  ancestorsCleared: boolean;
 }
 export type TrackingUpdateResult =
   | { kind: "updated"; trackingRef: string; candidateSha: string; retainedShas: string[];
@@ -2847,6 +2886,9 @@ export class GitCache {
   // At capacity, pinning still works but returns no retirement receipt (retention).
   private readonly codeSnapshotFreshReceipts = new Set<string>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
+  /** issue #3780: attempt records, keyed token -> `barePath\0branch`. Written only under the bare lock by
+   *  promoteTrackingUnderLock; a new GitCache (a restart) starts empty, so stranded state stays refused. */
+  private readonly trackingAttempts = new WeakMap<TrackingAttemptToken, Map<string, TrackingAttemptRecord>>();
   private readonly captureSynthesis = new AsyncLocalStorage<{
     argv: readonly string[]; env: NodeJS.ProcessEnv; live: () => boolean;
   }>();
@@ -2880,6 +2922,39 @@ export class GitCache {
     signal: AbortSignal; deadline: number; budget?: MaintenanceBudget; closureBudget: ClosureBudget;
     closureCache: { identities: Map<string, Map<string, ClosureObject>>; entries: number };
   }>();
+
+  // Each public invocation owns its sidecars, including concurrent calls on this cache.
+  private readonly retainedCauseScope = new AsyncLocalStorage<{
+    prefix: "census" | "inspection"; errors: WeakMap<object, PartialCauses>; counted: Set<unknown>;
+  }>();
+
+  private retainedCause<T>(error: T, suffix: "entry_cap" | "bare_cap" | "metadata_byte_cap" | "metadata_record_cap" | "source_record_cap"): T {
+    const scope = this.retainedCauseScope.getStore();
+    if (scope && error !== null && (typeof error === "object" || typeof error === "function")) {
+      const causes = scope.errors.get(error) ?? {};
+      countPartialCause(causes, `${scope.prefix}_${suffix}`);
+      scope.errors.set(error, causes);
+    }
+    return error;
+  }
+
+  private transferRetainedCause<T extends object>(from: unknown, to: T): T {
+    const scope = this.retainedCauseScope.getStore();
+    if (scope && from !== null && (typeof from === "object" || typeof from === "function")) {
+      const causes = scope.errors.get(from);
+      if (causes) scope.errors.set(to, causes);
+    }
+    return to;
+  }
+
+  private collectRetainedCause(error: unknown, target: PartialCauses, fallback: PartialCause): void {
+    const scope = this.retainedCauseScope.getStore();
+    if (scope?.counted.has(error)) return;
+    scope?.counted.add(error);
+    const detail = error !== null && (typeof error === "object" || typeof error === "function") ? scope?.errors.get(error) : undefined;
+    if (detail) mergePartialCauses(target, detail);
+    else countPartialCause(target, fallback);
+  }
 
   private readonly epochRetained = new AsyncLocalStorage<Required<EpochRetainedLimits>>();
 
@@ -2923,7 +2998,7 @@ export class GitCache {
       for (;;) {
         const entry = await this.retainedIO(() => handle.read());
         if (!entry) return names;
-        if (names.length >= limits.maxDirectoryEntries) throw new Error("epoch directory entry limit");
+        if (names.length >= limits.maxDirectoryEntries) throw this.retainedCause(new Error("epoch directory entry limit"), "entry_cap");
         names.push(entry.name);
       }
     } finally { await handle.close(); }
@@ -2933,16 +3008,24 @@ export class GitCache {
    * One streaming pass, no retries: a failed bare or exhausted cap stops sibling discovery and
    * makes every reported count a lower bound. All started filesystem work is awaited. */
   async discoverEpochRetainedSources(opts: EpochRetainedDiscoveryOptions = {}): Promise<EpochRetainedDiscoveryResult> {
+    return this.retainedCauseScope.run({ prefix: "census", errors: new WeakMap(), counted: new Set() },
+      () => this.discoverEpochRetainedSourcesScoped(opts));
+  }
+
+  private async discoverEpochRetainedSourcesScoped(opts: EpochRetainedDiscoveryOptions): Promise<EpochRetainedDiscoveryResult> {
     const limits = this.epochLimits(opts.limits);
     const maximum = this.retainedCap(opts.maxPhysicalPaths, 200);
     const result: EpochRetainedDiscoveryResult = {
-      groups: [], inventoryComplete: true, physicalPaths: 0, overflow: 0, overflowExact: false, unreadable: 0,
+      partialCauses: {}, groups: [], inventoryComplete: true, physicalPaths: 0, overflow: 0, overflowExact: false, unreadable: 0,
     };
+    const causes = result.partialCauses!;
+    let operationDeadline = Infinity;
+    const failure = (error: unknown) => this.collectRetainedCause(error, causes, opts.signal?.aborted ? "census_interrupted" : Date.now() >= operationDeadline ? "census_deadline" : "census_unreadable");
     const seen = new Set<string>();
     const selectedPaths = new Set<string>();
     try {
       await this.epochRetained.run(limits, () => this.withRecoveryOperation(
-        opts.signal ?? new AbortController().signal, opts.deadline ?? Date.now() + RETAINED_INSPECT_BUDGET_MS,
+        opts.signal ?? new AbortController().signal, operationDeadline = opts.deadline ?? Date.now() + RETAINED_INSPECT_BUDGET_MS,
         async () => {
           this.checkRecoveryInterruption();
           let handle: Awaited<ReturnType<typeof fs.opendir>>;
@@ -2959,9 +3042,9 @@ export class GitCache {
             for (;;) {
               const ent = await this.retainedIO(() => handle.read());
               if (!ent) break;
-              if (++entries > limits.maxDirectoryEntries) { result.inventoryComplete = false; break; }
+              if (++entries > limits.maxDirectoryEntries) { countPartialCause(causes, "census_entry_cap"); result.inventoryComplete = false; break; }
               if (!ent.name.endsWith(".git") || !ent.isDirectory() || ent.isSymbolicLink()) continue;
-              if (++bares > limits.maxBares) { result.inventoryComplete = false; break; }
+              if (++bares > limits.maxBares) { countPartialCause(causes, "census_bare_cap"); result.inventoryComplete = false; break; }
               const bare = path.join(this.reposRoot, ent.name);
               try {
                 await this.withLock(bare, async () => {
@@ -2971,6 +3054,7 @@ export class GitCache {
                     const paths = [...new Set(rec.parts.map(p => p.clonePath))];
                     const fresh = paths.filter(p => !seen.has(p));
                     if (seen.size + fresh.length > limits.maxSeenPaths) {
+                      countPartialCause(causes, "census_seen_path_cap");
                       result.inventoryComplete = false;
                       return;
                     }
@@ -2979,7 +3063,7 @@ export class GitCache {
                     const unselected = paths.filter(p => !selectedPaths.has(p));
                     if (!unselected.length) continue;
                     // Keep whole groups; shared paths are charged once globally.
-                    if (selectedPaths.size + unselected.length > maximum) continue;
+                    if (selectedPaths.size + unselected.length > maximum) { countPartialCause(causes, "census_physical_path_cap"); continue; }
                     const head = rec.parts[0]!;
                     result.groups.push({ barePath: bare,
                       selector: { runId: rec.runId, generation: head.generation ?? "none", attempt: head.attemptId ?? "canonical" },
@@ -2987,8 +3071,9 @@ export class GitCache {
                     for (const p of unselected) selectedPaths.add(p);
                   }
                 });
-              } catch {
+              } catch (error) {
                 this.checkRecoveryInterruption();
+                failure(error);
                 result.unreadable++;
                 result.inventoryComplete = false;
               }
@@ -2997,6 +3082,7 @@ export class GitCache {
           } finally { await handle.close(); }
         }));
     } catch (error) {
+      failure(error);
       result.inventoryComplete = false;
       if (!opts.signal?.aborted && (error as NodeJS.ErrnoException).code !== "ENOENT") result.unreadable++;
     }
@@ -5731,10 +5817,17 @@ export class GitCache {
     };
     const promoteIncoming = async (incoming: string): Promise<TrackingUpdateResult> => {
       // No observation survives an unlocked phase: preservation and CAS use current B custody.
-      const observed = await this.observeTrackingUnderLock(barePath, branch);
+      let observed = await this.observeTrackingUnderLock(barePath, branch);
+      if (observed) this.dropTrackingAttempt(opts.attemptToken, barePath, branch);
+      let repairedRetained: string[] = [];
+      if (!observed) {
+        const repaired = await this.repairThenObserveUnderLock(barePath, branch, opts);
+        if (repaired) ({ observed, retainedShas: repairedRetained } = repaired);
+      }
       let result: TrackingUpdateResult;
       if (observed) {
-        result = await this.promoteTrackingUnderLock(barePath, branch, incoming, observed, opts);
+        result = this.withRepairedRetained(
+          await this.promoteTrackingUnderLock(barePath, branch, incoming, observed, opts), repairedRetained);
       } else {
         // The producing fetch context proves only incoming, never the unknown shared head.
         result = await this.maskCheckpointCooperation(async (): Promise<TrackingUpdateResult> => {
@@ -5818,6 +5911,29 @@ export class GitCache {
       ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
   }
 
+  /** Strict tracking-ref ancestors, deepest first, shared by observation and ordinary cleanup. */
+  private trackingAncestorRefs(dst: string): string[] {
+    if (!dst.startsWith(RUNNER_TRACKING_PREFIX)) return [];
+    const parts = dst.slice(RUNNER_TRACKING_PREFIX.length).split("/");
+    // Only strict prefixes: never the tracking namespace root or the destination itself.
+    const candidates: string[] = [];
+    let acc = "refs/uzi-runner";
+    for (const part of parts.slice(0, -1)) {
+      acc = `${acc}/${part}`;
+      candidates.push(acc);
+    }
+    return candidates.reverse();
+  }
+
+  /** Repair has no authority to normalize another tracking ref. Caller holds the bare lock. */
+  private async trackingAncestorsAbsentUnderLock(barePath: string, dst: string): Promise<boolean> {
+    for (const candidate of this.trackingAncestorRefs(dst)) {
+      const observed = await this.observeTrackingUnderLock(barePath, candidate.slice(RUNNER_TRACKING_PREFIX.length));
+      if (!observed || observed.sha !== undefined) return false;
+    }
+    return true;
+  }
+
   /**
    * issue #887 — clear a legacy FLAT tracking ref that path-blocks the fetch's dst ref.
    *
@@ -5845,23 +5961,9 @@ export class GitCache {
    * bare with several stacked ancestors is cleaned bottom-up.
    */
   private async clearConflictingAncestorTrackingRefs(barePath: string, dst: string, opts: FetchAgentBranchOptions): Promise<boolean> {
-    // Only refs inside the tracking namespace can D/F-conflict with a tracking-ref dst.
-    if (!dst.startsWith(RUNNER_TRACKING_PREFIX)) return true;
-    const suffix = dst.slice(RUNNER_TRACKING_PREFIX.length);
-    const parts = suffix.split("/");
-    // Cumulative prefixes STRICTLY shorter than the full branch: every part except the last.
-    // For suffix "uzi/self-improve/<runId>" this yields the branches "uzi" and
-    // "uzi/self-improve", i.e. the candidate refs refs/uzi-runner/uzi and
-    // refs/uzi-runner/uzi/self-improve — never the namespace root and never dst itself.
-    const candidates: string[] = [];
-    let acc = "refs/uzi-runner";
-    for (const part of parts.slice(0, -1)) {
-      acc = `${acc}/${part}`;
-      candidates.push(acc);
-    }
     // Preflight the whole ancestor set before deleting anything. A failed read is unknown.
     const conflicts: Array<{ candidate: string; sha: string; branch: string }> = [];
-    for (const candidate of candidates.reverse()) {
+    for (const candidate of this.trackingAncestorRefs(dst)) {
       const ancestorBranch = candidate.slice(RUNNER_TRACKING_PREFIX.length);
       const observed = await this.observeTrackingUnderLock(barePath, ancestorBranch);
       if (!observed) return false;
@@ -5942,11 +6044,19 @@ export class GitCache {
       opts.checkpointStep?.("checkpoint_bridge");
       if ((await this.readRecoveryCapture(barePath, branch))?.remediationRecovery)
         throw new Error("remediation tracking rebind requires proof");
-      const observed = await this.observeTrackingUnderLock(barePath, branch);
-      if (!observed) return { kind: "not_updated", reason: "ownership_unknown" };
+      let observed = await this.observeTrackingUnderLock(barePath, branch);
+      let repairedRetained: string[] = [];
+      if (observed) this.dropTrackingAttempt(opts.attemptToken, barePath, branch);
+      else {
+        this.checkCheckpointCooperation();
+        const repaired = await this.repairThenObserveUnderLock(barePath, branch, opts);
+        if (!repaired) return { kind: "not_updated", reason: "ownership_unknown" };
+        ({ observed, retainedShas: repairedRetained } = repaired);
+      }
       this.checkCheckpointCooperation();
       // Adoption stays in checkpoint_bridge; promotion's import substeps belong to fetchAgentBranch.
-      const result = await this.promoteTrackingUnderLock(barePath, branch, sha, observed, { ...opts, checkpointStep: undefined });
+      const result = this.withRepairedRetained(
+        await this.promoteTrackingUnderLock(barePath, branch, sha, observed, { ...opts, checkpointStep: undefined }), repairedRetained);
       if (result.kind === "not_updated") {
         await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
         return result;
@@ -10146,7 +10256,7 @@ export class GitCache {
         return undefined;
       });
       if (st?.isDirectory() && !st.isSymbolicLink()) {
-        if (out.length >= (this.epochRetained.getStore()?.maxBares ?? Infinity)) throw new Error("epoch bare limit");
+        if (out.length >= (this.epochRetained.getStore()?.maxBares ?? Infinity)) throw this.retainedCause(new Error("epoch bare limit"), "bare_cap");
         out.push(p);
       }
     }
@@ -10213,9 +10323,9 @@ export class GitCache {
     let descriptors: Array<{ branch: string; key: string; journal: RecoveryJournalEntry }> = [];
     try {
       descriptors = await this.protectedRecoveries(barePath);
-    } catch {
+    } catch (error) {
       this.checkRecoveryInterruption();
-      if (this.epochRetained.getStore()) throw new Error("unreadable epoch protected descriptors");
+      if (this.epochRetained.getStore()) throw this.transferRetainedCause(error, new Error("unreadable epoch protected descriptors"));
       bareProblems.push("protected_descriptors_unreadable");
     }
     const markers = await this.readStoppedMarkers(barePath, list);
@@ -10633,15 +10743,19 @@ export class GitCache {
    *  or the directory depth (the tree is runner-written and hostile), and then reports
    *  `complete: false`, never a total of zero and never a total claimed complete. */
   private async measureAllocated(
-    root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {},
+    root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {}, causes: PartialCauses = {},
   ): Promise<{ bytes: number; complete: boolean }> {
+    const filesystem = async <T>(action: () => Promise<T>): Promise<T> => {
+      try { return await action(); }
+      catch (error) { countPartialCause(causes, "measurement_filesystem_error"); throw error; }
+    };
     const maxEntries = caps.maxEntries ?? RETAINED_MEASURE_MAX_ENTRIES;
     const maxPending = caps.maxPending ?? RETAINED_MEASURE_MAX_PENDING;
     const maxDepth = caps.maxDepth ?? RETAINED_MEASURE_MAX_DEPTH;
     let bytes = 0;
     let visited = 0;
     try {
-      bytes += (await this.retainedIO(() => fs.lstat(root))).blocks * 512;
+      bytes += (await this.retainedIO(() => filesystem(() => fs.lstat(root)))).blocks * 512;
     } catch {
       this.checkRecoveryInterruption();
       return { bytes: 0, complete: false };
@@ -10652,7 +10766,7 @@ export class GitCache {
       let handle;
       try {
         this.checkRecoveryInterruption();
-        handle = await fs.opendir(dir);
+        handle = await filesystem(() => fs.opendir(dir));
       } catch {
         this.checkRecoveryInterruption();
         return { bytes, complete: false };
@@ -10660,14 +10774,22 @@ export class GitCache {
       try {
         this.checkRecoveryInterruption();
         for (;;) {
-          if (now() >= deadline) return { bytes, complete: false };
-          const ent = await this.retainedIO(() => handle.read());
+          if (now() >= deadline) { countPartialCause(causes, "measurement_deadline"); return { bytes, complete: false }; }
+          const ent = await this.retainedIO(() => filesystem(() => handle.read()));
           if (!ent) break;
-          if (++visited > maxEntries) return { bytes, complete: false };
+          if (++visited > maxEntries) { countPartialCause(causes, "measurement_entry_cap"); return { bytes, complete: false }; }
           const p = path.join(dir, ent.name);
           let st: Stats;
           try {
-            st = await this.retainedIO(() => fs.lstat(p));
+            st = await this.retainedIO(async () => {
+              try { return await fs.lstat(p); }
+              catch (error) {
+                let missing = false;
+                try { missing = (error as NodeJS.ErrnoException)?.code === "ENOENT"; } catch { /* Keep the original error. */ }
+                if (!missing) countPartialCause(causes, "measurement_filesystem_error");
+                throw error;
+              }
+            });
           } catch (err) {
             this.checkRecoveryInterruption();
             if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
@@ -10675,12 +10797,15 @@ export class GitCache {
           }
           bytes += st.blocks * 512;
           if (st.isDirectory() && !st.isSymbolicLink()) {
-            if (depth + 1 > maxDepth || stack.length >= maxPending) return { bytes, complete: false };
+            if (depth + 1 > maxDepth || stack.length >= maxPending) {
+              countPartialCause(causes, depth + 1 > maxDepth ? "measurement_depth_cap" : "measurement_pending_cap");
+              return { bytes, complete: false };
+            }
             stack.push({ dir: p, depth: depth + 1 });
           }
         }
       } finally {
-        await handle.close();
+        await filesystem(() => handle.close());
       }
     }
     return { bytes, complete: true };
@@ -10695,24 +10820,33 @@ export class GitCache {
    */
   async inspectRetainedSources(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
     const run = () => this.inspectRetainedSourcesScoped(opts);
-    return opts.epoch ? this.epochRetained.run(this.epochLimits(opts.epochLimits), run) : run();
+    return this.retainedCauseScope.run({ prefix: "inspection", errors: new WeakMap(), counted: new Set() },
+      () => opts.epoch ? this.epochRetained.run(this.epochLimits(opts.epochLimits), run) : run());
   }
 
   private async inspectRetainedSourcesScoped(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
     const maxDescriptors = opts.epoch ? this.retainedCap(opts.maxDescriptors, 200) : RETAINED_MAX_DESCRIPTORS;
     const maxPhysicalPaths = opts.epoch ? this.retainedCap(opts.maxPhysicalPaths, 200) : Infinity;
     const physicalPaths = new Set<string>();
-    const now = opts.now ?? Date.now;
+    const clock = opts.now ?? Date.now;
+    let observedNow = -Infinity;
+    const now = () => (observedNow = clock());
     const budgetMs = opts.budgetMs ?? RETAINED_INSPECT_BUDGET_MS;
     const deadline = now() + budgetMs;
     const operationDeadline = Math.min(opts.deadline ?? Infinity, Date.now() +
       (opts.now === undefined ? budgetMs : Math.max(budgetMs, RETAINED_INSPECT_BUDGET_MS)));
+    const partialCauses: PartialCauses = {};
     let partial = false;
     let unreadable = 0;
     type Evaluated = Awaited<ReturnType<GitCache["evaluateRetained"]>>;
     const found: Array<{ g: GatheredBare; rec: GatheredRecord; ev: Evaluated }> = [];
     const exhausted = (err: unknown): boolean =>
       opts.signal?.aborted === true || now() >= deadline || Date.now() >= (opts.deadline ?? Infinity) || (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError" || /deadline exhausted/.test(err.message)));
+    // Reuse the predicate's observations: diagnostic clock reads must not consume a test clock.
+    const interruption = (): PartialCause => opts.signal?.aborted ? "inspection_interrupted" :
+      observedNow >= deadline ? "inspection_budget" : Date.now() >= (opts.deadline ?? Infinity) ? "inspection_deadline" : "inspection_interrupted";
+    const failure = (error: unknown, stopped: boolean) => this.collectRetainedCause(error, partialCauses,
+      stopped ? interruption() : "inspection_unreadable_bare");
     const byIdentity = (x: { rec: GatheredRecord }, y: { rec: GatheredRecord }): number =>
       (x.rec.runId < y.rec.runId ? -1 : x.rec.runId > y.rec.runId ? 1 : 0) ||
       (x.rec.parts[0]!.clonePath < y.rec.parts[0]!.clonePath ? -1 : x.rec.parts[0]!.clonePath > y.rec.parts[0]!.clonePath ? 1 : 0);
@@ -10723,6 +10857,7 @@ export class GitCache {
       await this.withRecoveryOperation(opts.signal ?? new AbortController().signal, operationDeadline, async () => {
         for (const bare of await this.retainedBares(opts.barePath)) {
           if (now() >= deadline) {
+            countPartialCause(partialCauses, "inspection_budget");
             partial = true;
             break;
           }
@@ -10744,6 +10879,7 @@ export class GitCache {
                 if (opts.epoch) {
                   const fresh = [...new Set(rec.parts.map(p => p.clonePath))].filter(p => !physicalPaths.has(p));
                   if (found.length >= maxDescriptors || physicalPaths.size + fresh.length > maxPhysicalPaths) {
+                    countPartialCause(partialCauses, found.length >= maxDescriptors ? "inspection_descriptor_cap" : "inspection_physical_path_cap");
                     partial = true;
                     continue;
                   }
@@ -10758,7 +10894,9 @@ export class GitCache {
               }
             });
           } catch (err) {
-            if (exhausted(err)) {
+            const stopped = exhausted(err);
+            failure(err, stopped);
+            if (stopped) {
               partial = true;
               break;
             }
@@ -10768,7 +10906,9 @@ export class GitCache {
         }
       });
     } catch (err) {
-      if (exhausted(err)) partial = true;
+      const stopped = exhausted(err);
+      failure(err, stopped);
+      if (stopped) partial = true;
       else {
         unreadable++;
         this.log.warn("retained source inspection could not enumerate the bares", { error: gitErrorMessage(err) });
@@ -10776,6 +10916,7 @@ export class GitCache {
     }
     found.sort(byIdentity);
     if (found.length > maxDescriptors) {
+      countPartialCause(partialCauses, "inspection_descriptor_cap");
       partial = true;
       found.length = maxDescriptors;
     }
@@ -10799,13 +10940,20 @@ export class GitCache {
                 async () => {
                   this.checkRecoveryInterruption();
                   try { opts.beforeTree?.(p.clonePath); }
-                  catch (error) { bindingFailed = true; throw error; }
+                  catch (error) { bindingFailed = true; countPartialCause(partialCauses, "tree_binding_failed"); throw error; }
                   this.checkRecoveryInterruption();
-                  return this.measureAllocated(p.clonePath, now, deadline, opts.measureCaps);
+                  const detail: PartialCauses = {};
+                  try { return await this.measureAllocated(p.clonePath, now, deadline, opts.measureCaps, detail); }
+                  finally {
+                    // Only executed walks arrive here; cache hits bypass this callback.
+                    mergePartialCauses(partialCauses, detail);
+                  }
                 });
             if (opts.epoch) measurements.set(p.clonePath, m);
           } catch (error) {
-            if (!exhausted(error)) unreadable++;
+            const stopped = exhausted(error);
+            if (stopped) this.collectRetainedCause(error, partialCauses, interruption());
+            if (!stopped) unreadable++;
           }
           bytes = m.complete ? m.bytes : null;
           if (!m.complete) partial = true;
@@ -10842,7 +10990,7 @@ export class GitCache {
         delete source.epochSettlement;
       }
     }
-    return { sources, partial, unreadable, sampledAt: new Date(now()).toISOString() };
+    return { partialCauses, sources, partial, unreadable, sampledAt: new Date(now()).toISOString() };
   }
 
   /**
@@ -18465,8 +18613,8 @@ try {
         const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
         try {
           if (failure) return;
-          if (chunk.length > cap - bytes) throw Object.assign(new Error("git subprocess maxBuffer exceeded"),
-            { outputExceeded: true, outputStream, code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" });
+          if (chunk.length > cap - bytes) throw this.retainedCause(Object.assign(new Error("git subprocess maxBuffer exceeded"),
+            { outputExceeded: true, outputStream, code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }), "metadata_byte_cap");
           chunks.push(chunk); bytes += chunk.length;
         } catch (error) { failure ??= error; cancel(); }
       }).on("error", error => { failure ??= error; cancel(); });
@@ -18572,17 +18720,17 @@ try {
     const limits = this.epochRetained.getStore();
     if (!limits) return;
     this.checkRecoveryInterruption();
-    if (Buffer.byteLength(stdout) > limits.maxMetadataBytes) throw new Error("epoch metadata byte limit");
+    if (Buffer.byteLength(stdout) > limits.maxMetadataBytes) throw this.retainedCause(new Error("epoch metadata byte limit"), "metadata_byte_cap");
     const config = args.includes("config") && (args.includes("--list") || args.includes("--get-regexp"));
     const refs = args.includes("for-each-ref") || args.includes("show-ref");
     if (!config && !refs) return;
     const separator = config && (args.includes("--null") || args.includes("-z")) ? "\0" : "\n";
     let count = 0;
     for (let i = 0; i < stdout.length; i++) {
-      if (stdout[i] === separator && ++count > limits.maxMetadataRecords) throw new Error("epoch metadata record limit");
+      if (stdout[i] === separator && ++count > limits.maxMetadataRecords) throw this.retainedCause(new Error("epoch metadata record limit"), "metadata_record_cap");
     }
     if (stdout.length && !stdout.endsWith(separator) && ++count > limits.maxMetadataRecords)
-      throw new Error("epoch metadata record limit");
+      throw this.retainedCause(new Error("epoch metadata record limit"), "metadata_record_cap");
     if (config && separator === "\0" && args.includes("--list")) {
       let start = 0;
       let sources = 0;
@@ -18600,7 +18748,7 @@ try {
           if (Array.isArray(journal?.retainedSources)) sources += journal.retainedSources.length;
           if (journal?.recovery) sources += 2;
         } catch { /* The authority parser reports malformed values; never accept them here. */ }
-        if (sources > limits.maxMetadataRecords) throw new Error("epoch source record limit");
+        if (sources > limits.maxMetadataRecords) throw this.retainedCause(new Error("epoch source record limit"), "source_record_cap");
       }
     }
   }
@@ -18652,6 +18800,12 @@ try {
         const stdout = String(result.stdout);
         this.checkEpochMetadata(args, stdout);
         return { stdout, stderr: String(result.stderr) };
+      } catch (error) {
+        try {
+          if (epoch && (error as { code?: unknown })?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
+            this.retainedCause(error, "metadata_byte_cap");
+        } catch { /* Diagnostic access cannot replace the subprocess error. */ }
+        throw error;
       } finally {
         await closed;
         if (killTimer) clearTimeout(killTimer);
@@ -18812,6 +18966,7 @@ try {
         outputStream?: "stdout" | "stderr" };
       failure.code = terminal.code;
       if (stdout.oversized || stderr.oversized) {
+        if (epoch) this.retainedCause(failure, "metadata_byte_cap");
         failure.outputExceeded = true;
         failure.outputStream = stdout.oversized ? "stdout" : "stderr";
       }
@@ -18849,7 +19004,7 @@ try {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      const failure = this.transferRetainedCause(err, new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`));
       const stderr = (err as { stderr?: unknown })?.stderr;
       retainedGitDiagnostics.set(failure, {
         stderr: typeof stderr === "string" ? stderr : "",
@@ -19697,7 +19852,179 @@ try {
       producingSource: opts.producingSource && { ...opts.producingSource },
       withSourceAuthority: opts.withSourceAuthority,
       remotelyConfirmedSha: opts.remotelyConfirmedSha, expectedCandidateSha: opts.expectedCandidateSha,
-      checkpointImportMode: opts.checkpointImportMode, checkpointStep: opts.checkpointStep };
+      checkpointImportMode: opts.checkpointImportMode, checkpointStep: opts.checkpointStep,
+      attemptToken: opts.attemptToken instanceof TrackingAttemptToken ? opts.attemptToken : undefined };
+  }
+
+  private attemptKey(barePath: string, branch: string): string { return `${barePath}\0${branch}`; }
+
+  /** issue #3780: ordinary cleanup or the repair's read-only ancestor check succeeded. */
+  private markTrackingAncestorsCleared(token: TrackingAttemptToken | undefined, barePath: string, branch: string): void {
+    const rec = token && this.trackingAttempts.get(token)?.get(this.attemptKey(barePath, branch));
+    if (rec) rec.ancestorsCleared = true;
+  }
+
+  private dropTrackingAttempt(token: TrackingAttemptToken | undefined, barePath: string, branch: string): void {
+    if (token) this.trackingAttempts.get(token)?.delete(this.attemptKey(barePath, branch));
+  }
+
+  /** The raw `runnerTrackingOwnerKey(branch)` value: exactly one value, none (undefined), or null when
+   *  the key is duplicated (an unreadable stamp, never equal to a recorded one). */
+  private async rawTrackingStamp(barePath: string, branch: string): Promise<string | undefined | null> {
+    const key = runnerTrackingOwnerKey(branch);
+    const raw = await this.runGit(barePath, ["config", "--local", "--null", "--list"]);
+    const values = raw.split("\0").filter((item) => item.startsWith(key + "\n")).map((item) => item.slice(key.length + 1));
+    return values.length === 0 ? undefined : values.length === 1 ? values[0] : null;
+  }
+
+  /** issue #3780: record the pre-mutation state of an attempt, under the bare lock and inside the masked
+   *  section, BEFORE promoteTrackingUnderLock's first write. Best-effort: an unreadable state records
+   *  nothing (so nothing is repairable); a boundary abort propagates like every other read here. */
+  private async openTrackingAttempt(barePath: string, branch: string, incoming: string,
+    observed: { sha?: string; owner?: CheckedTrackingOwner }, opts: FetchAgentBranchOptions,
+    pending: TrackingReceipt, incomingCovered: boolean, displacedContext: StoredOwedContext | undefined): Promise<void> {
+    const token = opts.attemptToken;
+    if (!token || !trackingAttemptAdmission.has(token)) return;
+    const c = opts.context;
+    try {
+      const stamp = await this.rawTrackingStamp(barePath, branch);
+      if (stamp === null) return;
+      const hash = this.receiptName(branch);
+      const record: TrackingAttemptRecord = {
+        observedSha: observed.sha, stamp,
+        priorReceipt: await this.readOwedFile(barePath, `receipt-${hash}.json`),
+        incoming, context: this.contextName(c), runId: c.runId, generation: c.generation, pending, incomingCovered,
+        displacedSha: displacedContext ? observed.sha : undefined, displacedContext,
+        retainedShas: [...new Set([
+          ...(displacedContext && observed.sha && observed.owner?.runId === c.runId ? [observed.sha] : []),
+          ...(incomingCovered ? [] : [incoming]),
+        ])].sort(),
+        ancestorsCleared: false,
+      };
+      let byKey = this.trackingAttempts.get(token);
+      if (!byKey) this.trackingAttempts.set(token, byKey = new Map());
+      byKey.set(this.attemptKey(barePath, branch), record);
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+    }
+  }
+
+  /** issue #3780: finish an ownership update that THIS token's earlier attempt stranded, only from one of
+   *  three exact disk states (pre-pending, ref unchanged, CAS landed). Caller holds the bare lock. From the
+   *  pre-pending state an attempt that never passed the ancestor clear verifies, read-only, that no ancestor
+   *  tracking ref exists. Unknown observations or an existing ancestor refuse; repair never runs ancestor
+   *  cleanup. Before each roll-forward write the admission predicate and the HARD boundary signal are
+   *  re-checked (the soft signal is masked for the repair); once either fails it stops with no further
+   *  write and no rollback, leaving a state a later
+   *  admissible import can finish.
+   *  Returns retained pins only when the committed receipt reads back as the record's owner.
+   *  Enrolled remediation transactions require their own evidence and are not repaired here. */
+  private async repairTrackingAttemptUnderLock(barePath: string, branch: string,
+    opts: FetchAgentBranchOptions): Promise<{ retainedShas: string[] } | undefined> {
+    const token = opts.attemptToken;
+    const admission = token && trackingAttemptAdmission.get(token);
+    const rec = token && this.trackingAttempts.get(token)?.get(this.attemptKey(barePath, branch));
+    if (!token || !admission || !rec) return undefined;
+    const c = opts.context;
+    if (this.contextName(c) !== rec.context || c.runId !== rec.runId || c.generation !== rec.generation) return undefined;
+    return this.maskCheckpointCooperation(async () => {
+      const permit = (): boolean => {
+        if (!admission()) return false;
+        this.checkCheckpointCooperation();
+        return true;
+      };
+      const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+      const hash = this.receiptName(branch);
+      const markerPath = `governed-${hash}.json`, receiptPath = `receipt-${hash}.json`;
+      const marker = { version: 1, branch };
+      try {
+        if (!permit()) return undefined;
+        // An ownership receipt cannot finish or replace the separate remediation
+        // journal transaction. Prepared edges and enrolled sources retain custody.
+        if ((await this.readRecoveryCapture(barePath, branch))?.remediationRecovery) return undefined;
+        const ctxRecord = await this.readOwedFile(barePath, rec.context);
+        if (ctxRecord === undefined) return undefined;
+        const parsed = await this.parseOwedContext(barePath, ctxRecord);
+        if (this.contextName(parsed) !== rec.context) return undefined;
+        if (!rec.incomingCovered && !(await this.hasOwedAnchorUnderLock(barePath, rec.runId, rec.incoming))) return undefined;
+        if (rec.displacedContext && rec.displacedSha &&
+            !(await this.hasOwedAnchorUnderLock(barePath, rec.displacedContext.runId, rec.displacedSha))) return undefined;
+        const ref = await this.checkedTrackingSha(barePath, branch);
+        const stamp = await this.rawTrackingStamp(barePath, branch);
+        const governance = await this.checkedReceiptGovernance(barePath, branch);
+        const diskMarker = await this.readOwedFile(barePath, markerPath);
+        const diskReceipt = await this.readOwedFile(barePath, receiptPath);
+        if (stamp === null || governance !== "governed") return undefined;
+        const markerExact = same(diskMarker, marker), pendingExact = same(diskReceipt, rec.pending);
+        const unchanged = ref === rec.observedSha && stamp === rec.stamp;
+        const prePending = unchanged && diskReceipt === undefined && rec.priorReceipt === undefined &&
+          (diskMarker === undefined || markerExact);
+        const refUnchanged = unchanged && markerExact && pendingExact;
+        const casLanded = ref === rec.incoming && (stamp === rec.stamp || stamp === rec.runId) && markerExact && pendingExact;
+        if (!prePending && !refUnchanged && !casLanded) return undefined;
+        if (prePending) {
+          if (!rec.ancestorsCleared) {
+            // A later ancestor is outside this attempt's recorded transaction; never archive or delete it.
+            if (!permit()) return undefined;
+            if (!(await this.trackingAncestorsAbsentUnderLock(barePath, runnerTrackingRef(branch)))) return undefined;
+            this.markTrackingAncestorsCleared(token, barePath, branch);
+          }
+          if (diskMarker === undefined) {
+            if (!permit()) return undefined;
+            await this.writeOwedFile(barePath, markerPath, marker);
+          }
+          if (!permit()) return undefined;
+          await this.writeOwedFile(barePath, receiptPath, rec.pending);
+        }
+        if (prePending || refUnchanged) {
+          if (!permit()) return undefined;
+          await this.runGit(barePath, ["update-ref", runnerTrackingRef(branch), rec.incoming, rec.observedSha ?? "0".repeat(40)]);
+          if (await this.checkedTrackingSha(barePath, branch) !== rec.incoming) throw new Error("tracking CAS readback mismatch");
+        }
+        if (await this.rawTrackingStamp(barePath, branch) !== rec.runId) {
+          if (!permit()) return undefined;
+          await this.runGit(barePath, ["config", "--local", "--replace-all", runnerTrackingOwnerKey(branch), rec.runId]);
+        }
+        if (await this.checkedOwnerStamp(barePath, branch, false) !== rec.runId) throw new Error("owner stamp readback mismatch");
+        if (!permit()) return undefined;
+        try {
+          await this.writeOwedFile(barePath, receiptPath, { ...rec.pending, phase: "committed" });
+          const owner = await this.checkedTrackingOwner(barePath, branch, rec.incoming);
+          if (owner?.runId !== rec.runId || owner.generation !== rec.generation || owner.context !== rec.context) {
+            throw new Error("committed owner readback mismatch");
+          }
+        } catch (cause) {
+          // Same single best-effort invalidation as promoteTrackingUnderLock, but only with live authority:
+          // admission still true and the hard boundary signal not aborted.
+          if (admission() && !this.boundaryProcesses.getStore()?.signal.aborted) await this.writeOwedFile(barePath, receiptPath, rec.pending).catch(() => undefined);
+          throw cause;
+        }
+        this.dropTrackingAttempt(token, barePath, branch);
+        return { retainedShas: rec.retainedShas };
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return undefined;
+      }
+    });
+  }
+
+  /** issue #3780: where an import found no observable owner. Tries the token's repair; on success the
+   *  state is re-observed so the CURRENT incoming is promoted by the normal path. */
+  private async repairThenObserveUnderLock(barePath: string, branch: string, opts: FetchAgentBranchOptions):
+    Promise<{ observed: { sha?: string; owner?: CheckedTrackingOwner }; retainedShas: string[] } | undefined> {
+    const repaired = await this.repairTrackingAttemptUnderLock(barePath, branch, opts);
+    if (!repaired) return undefined;
+    const observed = await this.observeTrackingUnderLock(barePath, branch);
+    if (!observed) return undefined;
+    this.dropTrackingAttempt(opts.attemptToken, barePath, branch);
+    return { observed, retainedShas: repaired.retainedShas };
+  }
+
+  private withRepairedRetained(result: TrackingUpdateResult, retained: string[]): TrackingUpdateResult {
+    return result.kind === "updated" && retained.length > 0
+      ? { ...result, retainedShas: [...new Set([...retained, ...result.retainedShas])].sort() } : result;
   }
 
   private async validateOwedContext(barePath: string, branch: string, c: StoredOwedContext,
@@ -20106,8 +20433,13 @@ try {
     }
     opts.checkpointStep?.("checkpoint_import_premutation");
     this.checkCheckpointCooperation();
+    const receipt: TrackingReceipt = { version: 1, branch, runId: c.runId, generation: c.generation, context: this.contextName(c),
+      trackingSha: incoming, phase: "pending" };
     return this.maskCheckpointCooperation(async (): Promise<TrackingUpdateResult> => {
       opts.checkpointStep?.("checkpoint_import_mutation");
+      // issue #3780: the record precedes every write; it is dropped only on the `updated` return, so a
+      // not_updated return after a write, or any throw, leaves it for the same token's later repair.
+      await this.openTrackingAttempt(barePath, branch, incoming, observed, opts, receipt, incomingCovered, displacedContext);
       try {
         if (displacedContext && observed.sha) {
           // Only this run's confirmation can discharge its own debt.
@@ -20138,6 +20470,7 @@ try {
       try {
         const cleared = await this.clearConflictingAncestorTrackingRefs(barePath, runnerTrackingRef(branch), opts);
         if (!cleared) return { kind: "not_updated", reason: "ownership_unknown" };
+        this.markTrackingAncestorsCleared(opts.attemptToken, barePath, branch);
       } catch (cause) {
         const abort = this.boundaryAbortError(cause);
         if (abort) throw abort;
@@ -20205,8 +20538,6 @@ try {
           }
         }
       }
-      const receipt: TrackingReceipt = { version: 1, branch, runId: c.runId, generation: c.generation, context: this.contextName(c),
-        trackingSha: incoming, phase: "pending" };
       try {
         await this.writeOwedFile(barePath, `governed-${this.receiptName(branch)}.json`, { version: 1, branch });
         await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, receipt);
@@ -20251,6 +20582,7 @@ try {
         const edges = prepared ? record.edges.map((e, i) => i === record.edges.length - 1 ? { ...e, phase: "committed" as const } : e) : record.edges;
         await this.writeRemediationUnderLock(barePath, branch, current, { ...record, ownedTip: incoming, edges });
       }
+      this.dropTrackingAttempt(opts.attemptToken, barePath, branch);
       return { kind: "updated", trackingRef: runnerTrackingRef(branch), candidateSha: incoming,
         retainedShas: [...new Set(retainedShas)].sort(), displacedSha: observed.sha, divergence };
     });
