@@ -29,7 +29,7 @@ FROM jsonb_to_recordset(@frozen_targets::jsonb) AS f(
           stop_reason text,
           hold_reason text)
 JOIN runs r ON r.id = f.id
-WHERE r.id = ANY(@locked_parent_ids::uuid[]) AND r.kind NOT IN ('chat', 'cross_check')
+WHERE r.id = ANY(@locked_parent_ids::uuid[]) AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND r.egress_profile_id IS NULL
   AND f.id IS NOT DISTINCT FROM r.id
   AND f.kind IS NOT DISTINCT FROM r.kind
   AND f.target_run_id IS NOT DISTINCT FROM r.target_run_id
@@ -52,27 +52,66 @@ WHERE r.id = ANY(@locked_parent_ids::uuid[]) AND r.kind NOT IN ('chat', 'cross_c
   AND ((f.status IS NOT DISTINCT FROM r.status
         AND f.status_since IS NOT DISTINCT FROM r.status_since
         AND f.requeue_count = r.requeue_count)
-       OR (r.id = ANY(@requeued_ids::uuid[]) AND f.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+       OR (r.id = ANY(@requeued_ids::uuid[]) AND f.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
            AND r.status = 'queued' AND r.requeue_count = f.requeue_count + 1));
 
+-- name: DiscoverStaleQueuedCustodyTargets :many
+-- Read-only keyset discovery. The cursor advances by the last discovered ID,
+-- including batches whose captured tuples are superseded before locks arrive.
+SELECT r.id, r.worker_id, jsonb_build_object(
+    'id', r.id,
+    'kind', r.kind,
+    'target_run_id', r.target_run_id,
+    'worker_id', r.worker_id,
+    'user_id', r.user_id,
+    'status', r.status,
+    'status_since', r.status_since,
+    'requeue_count', r.requeue_count,
+    'claimed_at', r.claimed_at,
+    'claim_generation', r.claim_generation,
+    'worker_recovery_episode', r.worker_recovery_episode,
+    'requeue_episode_baseline', r.requeue_episode_baseline,
+    'claim_released_at', r.claim_released_at,
+    'released_worker_id', r.released_worker_id,
+    'released_worker_nonce', r.released_worker_nonce,
+    'pause_requested_at', r.pause_requested_at,
+    'pause_mode', r.pause_mode,
+    'credential_switch_requested_at', r.credential_switch_requested_at,
+    'credential_switch_generation', r.credential_switch_generation,
+    'stop_kind', r.stop_kind,
+    'stop_reason', r.stop_reason,
+    'hold_reason', r.hold_reason)::jsonb AS frozen_target
+FROM runs r JOIN workers w ON w.id = r.worker_id AND w.user_id = r.user_id
+WHERE r.id > @after_id::uuid AND r.created_at <= @sweep_started::timestamptz
+  AND (w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < @cutoff::timestamptz)
+  AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND r.egress_profile_id IS NULL AND r.status = 'queued'
+  AND r.claim_generation > 0
+  AND (r.requeue_count - r.requeue_episode_baseline) >= @max_requeues
+  AND EXISTS (SELECT 1 FROM recovery_custody_holds h
+      WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.state = 'open'
+        AND h.generation BETWEEN 1 AND r.claim_generation)
+ORDER BY r.id LIMIT 32;
+
 -- name: LockStaleQueuedCustodyWorkers :many
--- Settings admission precedes every worker lock. Lock the full worker set before
--- any recovery parent locks; the caller rechecks staleness under these locks.
-SELECT w.id FROM workers w
-WHERE (w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < @cutoff)
-  AND EXISTS (SELECT 1 FROM runs r WHERE r.worker_id = w.id
-      AND r.status = 'queued' AND r.claim_generation > 0)
+-- Settings admission precedes this bounded, globally ordered worker lock set.
+SELECT w.* FROM workers w
+WHERE w.id = ANY(@worker_ids::uuid[])
+  AND (w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < @cutoff::timestamptz)
 ORDER BY w.id FOR UPDATE OF w;
 
 -- name: LockFrozenQueuedCustodyHolds :many
 -- Parents (including every non-checker target) are already locked. This is an
 -- independent statement before the writer's fresh count. NO KEY UPDATE excludes
 -- custody settlement while allowing FK key-share readers.
-SELECT h.id FROM recovery_custody_holds h
-JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
-WHERE h.state = 'open' AND h.generation BETWEEN 1 AND r.claim_generation
-  AND r.worker_id = @worker_id
-  AND r.kind NOT IN ('chat','cross_check') AND r.status = 'queued'
+WITH chosen AS MATERIALIZED (
+SELECT picked.id FROM runs r
+CROSS JOIN LATERAL (
+    SELECT own.id FROM recovery_custody_holds own
+    WHERE own.run_id = r.id AND own.user_id = r.user_id AND own.state = 'open'
+      AND own.generation BETWEEN 1 AND r.claim_generation
+    ORDER BY own.id LIMIT LEAST(GREATEST(@custody_hold_limit::integer, 0), 1000)
+) picked
+WHERE r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND r.egress_profile_id IS NULL AND r.status = 'queued'
   AND r.id = ANY(@locked_parent_ids::uuid[])
   AND EXISTS (
       SELECT 1 FROM jsonb_to_recordset(@frozen_targets::jsonb) AS f(
@@ -120,6 +159,9 @@ WHERE h.state = 'open' AND h.generation BETWEEN 1 AND r.claim_generation
         AND f.stop_kind IS NOT DISTINCT FROM r.stop_kind
         AND f.stop_reason IS NOT DISTINCT FROM r.stop_reason
         AND f.hold_reason IS NOT DISTINCT FROM r.hold_reason)
+)
+SELECT h.id FROM recovery_custody_holds h
+WHERE h.id IN (SELECT id FROM chosen)
 ORDER BY h.run_id, h.id FOR NO KEY UPDATE OF h;
 
 -- name: ParkFrozenQueuedCustodyExhausted :many
@@ -138,7 +180,7 @@ UPDATE runs r SET status = 'recovery_wait', status_since = now(),
     updated_at = now()
 WHERE r.worker_id = @worker_id AND r.id = ANY(@locked_parent_ids::uuid[])
   AND r.status = 'queued' AND r.claim_generation > 0
-  AND r.kind NOT IN ('chat','cross_check')
+  AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND r.egress_profile_id IS NULL
   AND r.pause_requested_at IS NULL AND r.credential_switch_requested_at IS NULL
   AND r.stop_reason IS NULL AND r.stop_kind IS NULL AND r.hold_reason IS NULL
   AND (r.requeue_count - r.requeue_episode_baseline) >= @max_requeues
@@ -204,11 +246,11 @@ WHERE r.worker_id = @worker_id AND r.id = ANY(@locked_parent_ids::uuid[])
              OR (a.terminal_pending AND a.terminal_pending_until > now())))
   AND NOT EXISTS (SELECT 1 FROM workers w
       WHERE w.id = r.worker_id AND w.pending_overflow_until > now())
-  -- Durable publication enrollment and historical finalize generation marks
-  -- do not prove live authority. Only an attested requeue in this transaction
-  -- carries a usable finalize continuation into the queued write.
-  AND NOT (r.id = ANY(COALESCE(@finalize_requeued_ids::uuid[], ARRAY[]::uuid[]))
-      AND @max_requeues > 0 AND r.worker_recovery_episode = 0
+  -- FrozenRequeueAttestedFinalizeRuns leaves this usable one-shot tuple until
+  -- a subsequent claim, release or Resume invalidates its authority.
+  AND NOT (@max_requeues > 0 AND r.worker_recovery_episode = 0
       AND (r.requeue_count - r.requeue_episode_baseline) > @max_requeues
-      AND r.finalize_resume_generation = r.claim_generation)
+      AND r.claim_generation > 0
+      AND COALESCE(r.finalize_resume_generation = r.claim_generation, false)
+      AND r.claim_released_at IS NULL)
 RETURNING r.id, r.status;

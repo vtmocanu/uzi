@@ -186,77 +186,91 @@ func TestQueuedCustodyPublishBoundaryLiveDB(t *testing.T) {
 		count int
 	}{{"belowcap", 2}, {"atcap", 3}, {"overcap", 4}} {
 		for _, ready := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/ready_%v", budget.name, ready), func(t *testing.T) {
-				f := newLiveAttemptFix(t) // retains the real custody hold; do not discard it
-				// Adapt the existing publication fixture without manufacturing a publish row.
-				env := codexTestEnv{ctx: f.e.ctx, pool: f.e.pool, q: f.e.q, exec: func(sql string, args ...any) { f.e.exec(t, sql, args...) }}
-				queuedCustodyCache(t, env, f.svc1, 1)
-				f.svc1.p.RunMaxRequeues = 3
-				r, err := f.e.q.GetRunByID(f.e.ctx, f.oldRun)
-				if err != nil {
-					t.Fatal(err)
-				}
-				w := f.rf.wkr(uuid.UUID(r.WorkerID.Bytes))
-				env.exec("UPDATE workers SET snapshot_register_nonce=$2,snapshot_epoch=0,last_heartbeat_at=now() WHERE id=$1", w.ID, exhaustionNonce)
-				entered := make(chan struct{})
-				release := make(chan struct{})
-				var once sync.Once
-				unblock := func() { once.Do(func() { close(release) }) }
-				ctx, cancel := context.WithTimeout(f.e.ctx, 20*time.Second)
-				defer cancel()
-				f.svc1.SetPublishFn(func(ctx context.Context, _ pushbroker.Options) (pushbroker.Result, error) {
-					close(entered)
+			for _, live := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/ready_%v/live_%v", budget.name, ready, live), func(t *testing.T) {
+					f := newLiveAttemptFix(t) // retains the real custody hold; do not discard it
+					// Adapt the existing publication fixture without manufacturing a publish row.
+					env := codexTestEnv{ctx: f.e.ctx, pool: f.e.pool, q: f.e.q, exec: func(sql string, args ...any) { f.e.exec(t, sql, args...) }}
+					queuedCustodyCache(t, env, f.svc1, 1)
+					f.svc1.p.RunMaxRequeues = 3
+					r, err := f.e.q.GetRunByID(f.e.ctx, f.oldRun)
+					if err != nil {
+						t.Fatal(err)
+					}
+					w := f.rf.wkr(uuid.UUID(r.WorkerID.Bytes))
+					env.exec("UPDATE workers SET snapshot_register_nonce=$2,snapshot_epoch=0,last_heartbeat_at=now() WHERE id=$1", w.ID, exhaustionNonce)
+					entered := make(chan struct{})
+					release := make(chan struct{})
+					var once sync.Once
+					unblock := func() { once.Do(func() { close(release) }) }
+					ctx, cancel := context.WithTimeout(f.e.ctx, 20*time.Second)
+					defer cancel()
+					f.svc1.SetPublishFn(func(ctx context.Context, _ pushbroker.Options) (pushbroker.Result, error) {
+						close(entered)
+						select {
+						case <-release:
+						case <-ctx.Done():
+						}
+						return pushbroker.Result{Disposition: pushbroker.PublishOutcomeUnknown}, errors.New("M1 unknown forge outcome")
+					})
+					out := exhaustionPublishStart(ctx, f, w)
+					joined := false
+					defer func() {
+						unblock()
+						cancel()
+						if !joined {
+							<-out
+						}
+					}()
 					select {
-					case <-release:
+					case <-entered:
 					case <-ctx.Done():
+						t.Fatal(ctx.Err())
 					}
-					return pushbroker.Result{Disposition: pushbroker.PublishOutcomeUnknown}, errors.New("M1 unknown forge outcome")
+					if ready {
+						unblock()
+						result := recvPublish(t, out)
+						joined = true
+						if result.err == nil && result.res.Published {
+							t.Fatalf("unknown publish unexpectedly succeeded: %+v", result)
+						}
+					}
+					var n int
+					var isReady bool
+					if err := env.pool.QueryRow(ctx, "SELECT count(*),bool_and(reconcile_ready_at IS NOT NULL) FROM checkpoint_publish_attempts WHERE run_id=$1", f.oldRun).Scan(&n, &isReady); err != nil {
+						t.Fatal(err)
+					}
+					if n != 1 || isReady != ready {
+						t.Fatalf("committed boundary n=%d ready=%v want %v", n, isReady, ready)
+					}
+					if live {
+						snap := &ActiveSnapshot{SnapshotEpoch: 1, RegisterNonce: exhaustionNonce, Active: []ActiveRunEntry{entry(f.oldRun, r.ClaimGeneration, "running", false)}}
+						if applied, err := applySnapshot(t, f.svc1, env, w.ID, snap, snapshotModeHeartbeat); err != nil || !applied {
+							t.Fatalf("publication lease=%v %v", applied, err)
+						}
+					}
+					env.exec("UPDATE runs SET status='queued',requeue_count=$2,requeue_episode_baseline=0 WHERE id=$1", f.oldRun, budget.count)
+					before := observeQueuedCustody(t, env, f.oldRun)
+					c := &claimantExhaustion{custodyContinuationFixture: &custodyContinuationFixture{env: env, svc: f.svc1, workerID: w.ID, wkr: w}}
+					if live {
+						if n := runQueuedCustodyFrozen(t, c); n != 0 {
+							t.Fatal("live publication authority was parked")
+						}
+					} else {
+						queuedCustodyTrigger(t, c, "heartbeat")
+					}
+					after := observeQueuedCustody(t, env, f.oldRun)
+					parked := budget.name != "belowcap" && !live
+					want := `"queued"`
+					if parked {
+						want = `"recovery_wait"`
+					}
+					if string(after.run["status"]) != want {
+						t.Fatalf("publish boundary status=%s want %s", after.run["status"], want)
+					}
+					requireQueuedCustodyPreserved(t, before, after, parked)
 				})
-				out := exhaustionPublishStart(ctx, f, w)
-				joined := false
-				defer func() {
-					unblock()
-					cancel()
-					if !joined {
-						<-out
-					}
-				}()
-				select {
-				case <-entered:
-				case <-ctx.Done():
-					t.Fatal(ctx.Err())
-				}
-				if ready {
-					unblock()
-					result := recvPublish(t, out)
-					joined = true
-					if result.err == nil && result.res.Published {
-						t.Fatalf("unknown publish unexpectedly succeeded: %+v", result)
-					}
-				}
-				var n int
-				var isReady bool
-				if err := env.pool.QueryRow(ctx, "SELECT count(*),bool_and(reconcile_ready_at IS NOT NULL) FROM checkpoint_publish_attempts WHERE run_id=$1", f.oldRun).Scan(&n, &isReady); err != nil {
-					t.Fatal(err)
-				}
-				if n != 1 || isReady != ready {
-					t.Fatalf("committed boundary n=%d ready=%v want %v", n, isReady, ready)
-				}
-				env.exec("UPDATE runs SET status='queued',requeue_count=$2,requeue_episode_baseline=0 WHERE id=$1", f.oldRun, budget.count)
-				before := observeQueuedCustody(t, env, f.oldRun)
-				c := &claimantExhaustion{custodyContinuationFixture: &custodyContinuationFixture{env: env, svc: f.svc1, workerID: w.ID, wkr: w}}
-				queuedCustodyTrigger(t, c, "heartbeat")
-				after := observeQueuedCustody(t, env, f.oldRun)
-				parked := budget.name != "belowcap"
-				want := `"queued"`
-				if parked {
-					want = `"recovery_wait"`
-				}
-				if string(after.run["status"]) != want {
-					t.Fatalf("publish boundary status=%s want %s", after.run["status"], want)
-				}
-				requireQueuedCustodyPreserved(t, before, after, parked)
-			})
+			}
 		}
 	}
 }
