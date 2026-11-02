@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -84,7 +85,13 @@ func (f *restoreForge) CompareAncestry(ctx context.Context, _ int64, head, sha s
 
 // Discovery/ancestry are substituted; receive-pack and upload-pack use Git's
 // native smart HTTP CGI backend, exactly as the workersvc native fixture does.
-func restoreRemote(t *testing.T, tmp, root string) (*httptest.Server, *atomic.Int64) {
+type restoreTraffic struct {
+	listings, receivePosts, creates atomic.Int64
+	mu                              sync.Mutex
+	createRef, createTip            string
+}
+
+func restoreRemote(t *testing.T, tmp, root string, observations ...*restoreTraffic) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 	backend, err := exec.LookPath("git-http-backend")
 	if err != nil {
@@ -101,6 +108,30 @@ func restoreRemote(t *testing.T, tmp, root string) (*httptest.Server, *atomic.In
 		if err != nil {
 			http.Error(w, "request too large", http.StatusBadRequest)
 			return
+		}
+		for _, observation := range observations {
+			if strings.HasSuffix(r.URL.Path, "/info/refs") {
+				observation.listings.Add(1)
+			}
+			if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git-receive-pack") {
+				observation.receivePosts.Add(1)
+				// Receive commands precede the pack. Count only native create commands.
+				packets := body
+				for len(packets) >= 4 {
+					n, parseErr := strconv.ParseUint(string(packets[:4]), 16, 16)
+					if parseErr != nil || n < 4 || int(n) > len(packets) {
+						break
+					}
+					fields := strings.Fields(strings.SplitN(string(packets[4:n]), "\x00", 2)[0])
+					if len(fields) == 3 && fields[0] == strings.Repeat("0", 40) && strings.HasPrefix(fields[2], "refs/uzi-prereq/") {
+						observation.creates.Add(1)
+						observation.mu.Lock()
+						observation.createRef, observation.createTip = fields[2], fields[1]
+						observation.mu.Unlock()
+					}
+					packets = packets[n:]
+				}
+			}
 		}
 		cmd := exec.CommandContext(ctx, backend)
 		cmd.Env = append(restoreEnv(tmp), "GIT_PROJECT_ROOT="+root, "GIT_HTTP_EXPORT_ALL=1",
