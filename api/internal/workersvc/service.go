@@ -3615,7 +3615,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	}
 	pending := s.validatePendingAll(locked, snapshot)
 	pending.scoped = &scopedPendingClaim{}
-	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{}, pending.ids)
+	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, pending.ids)
 	if err != nil {
 		return nil, err
 	}
