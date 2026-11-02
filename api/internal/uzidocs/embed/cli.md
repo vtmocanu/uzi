@@ -346,6 +346,18 @@ A few worth knowing:
 - **`run get` names the repository.** The `REPO` row shows its full path;
   `--json` and `--field repo_path` expose the same value. A repo-less run or an
   unavailable repository has an empty `repo_path` and no `REPO` row.
+- **`run get` lists created proposal issues.** A scheduled prompt run adds one
+  `CREATED_ISSUE` row per returned output: `Created issue #<iid>`, its sanitized
+  title and a safe HTTPS URL when available; otherwise the coordinate stays
+  plain text. `uzi run get <id> --json` retains the optional `created_issues`
+  array of `{iid, title, web_url}`; an unsafe stored repository URL leaves
+  `web_url` blank. Missing or empty results add no rows. This best-effort,
+  detail-only lookup can be omitted on failure and excludes pending or unstamped
+  proposals. Historical stamped results remain discoverable without rerunning,
+  even after schedule deletion or output-mode changes. Source-issue fields keep
+  their originating meaning, independent of created outputs or an MR. See
+  [proposal output](./scheduling.md#proposal-output-mr-or-issues) for record scope
+  and ordering; run lists and summaries do not carry this field.
 - **`run approve` picks the subagent roster explicitly.** By default a run
   uses its own default roster; `--agent-source own|repo` overrides it
   (`own` = your template roster, `repo` = the agents the worker detected in

@@ -197,10 +197,9 @@ JOIN forge_connections c ON c.id = r.connection_id
 WHERE r.path_with_namespace = @path AND c.user_id = @user_id;
 
 -- name: CreateIssueProposal :one
--- The worker's propose_issue tool creates a PENDING proposal (PRD #39 M3, Decision
--- 8). It NEVER touches the forge — only the browser's confirm does. The handler has
--- already verified the target run is the worker's user's chat run and repo_id is a
--- repo they own, and enforced the per-run pending cap. labels is a JSON array.
+-- Persist a pending proposal for chat confirmation or scheduled prompt auto-filing.
+-- Callers authorize the run and target repo; chat additionally enforces a pending cap.
+-- This insert performs no forge write; labels is a JSON array.
 INSERT INTO issue_proposals (run_id, repo_id, title, description, labels)
 VALUES (@run_id, @repo_id, @title, @description, @labels)
 RETURNING *;
@@ -269,3 +268,16 @@ RETURNING id;
 UPDATE issue_proposals SET status = 'dismissed', resolved_at = now()
 WHERE id = @id AND status = 'pending'
 RETURNING *;
+
+-- name: ListCreatedIssuesForRun :many
+-- Detail-only metadata for confirmed issues from an owned scheduled prompt run.
+-- Bind both ownership boundaries and the proposal's exact run/repo; no credentials.
+SELECT p.repo_id, p.created_issue_iid::bigint AS iid, p.title, repo.web_url, c.forge_type
+FROM runs r
+JOIN issue_proposals p ON p.run_id = r.id AND p.repo_id = r.repo_id
+JOIN repos repo ON repo.id = p.repo_id
+JOIN forge_connections c ON c.id = repo.connection_id AND c.user_id = r.user_id
+WHERE r.id = @run_id AND r.repo_id = @repo_id AND r.user_id = @user_id
+  AND r.kind = 'prompt' AND (r.schedule_id IS NOT NULL OR r.trigger_source = 'schedule')
+  AND p.status = 'confirmed' AND p.created_issue_iid > 0
+ORDER BY p.created_at ASC, p.id ASC;

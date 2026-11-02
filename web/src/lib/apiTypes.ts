@@ -3340,6 +3340,8 @@ export interface Run {
   /** Forge-supplied issue web URL (PRD #411), null for issue-less runs or when the
    *  issue is no longer cached. Rendered through isHttpsUrl into the #<iid> link. */
   issue_web_url: string | null;
+  /** Confirmed issues created by a scheduled prompt; detail read only. */
+  created_issues?: { iid: number; title: string; web_url: string }[];
   /** PRD #764 M2: whether the run's issue links a `prds/*.md` file, so the run view can
    *  show a neutral "PRD" presence badge. OPTIONAL for api/web rollout skew: a pre-#764
    *  api pod omits the key, and an absent value reads as no PRD (the badge stays hidden). */
@@ -4227,7 +4229,7 @@ export type RunSummaryItem = Omit<
   "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
-  | "capability_provenance" | "lead_config"
+  | "capability_provenance" | "lead_config" | "created_issues"
 >;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).

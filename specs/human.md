@@ -1558,6 +1558,7 @@ Tracked as GitHub issue vtmocanu/uzi#2012.
 ## Proposal agent output modes
 
 - Feature-bingo and refactor-scout default to issues (supersedes PRD #929 D5); global fallback stays mr; stored mr/issues modes remain authoritative, NULL inherits the catalog default, and reset adopts that default; no migration. (AI-synced 2026-10-02)
+- Scheduled prompt run detail optionally lists confirmed, positively stamped proposal issues (`created_issues`: `iid`, `title`, `web_url`), scoped to the run/repo owner, in stable order without duplicate coordinates. Historical rows survive schedule deletion/mode changes without reruns. Web and human `uzi run get` show `Created issue #<iid>` with sanitized title and safe HTTPS URL or plain coordinate; JSON preserves the field. Lists/summaries, pending/unstamped rows and failed lookups omit it; source issue/MR meanings stay unchanged. (AI-synced 2026-11-02, #3784)
 
 ## Feature #3225 — CI scout
 

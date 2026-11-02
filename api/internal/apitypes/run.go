@@ -217,9 +217,18 @@ type HarnessDecisionDTO struct {
 	OtherHeld         bool     `json:"other_held"`
 }
 
+// CreatedIssueDTO is a confirmed issue created by this scheduled prompt run.
+// WebURL is empty when the stored repository URL cannot safely form a link.
+type CreatedIssueDTO struct {
+	IID    int64  `json:"iid"`
+	Title  string `json:"title"`
+	WebURL string `json:"web_url"`
+}
+
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
-	PolicyHold *PolicyHoldDTO `json:"policy_hold,omitempty"`
+	PolicyHold    *PolicyHoldDTO    `json:"policy_hold,omitempty"`
+	CreatedIssues []CreatedIssueDTO `json:"created_issues,omitempty"`
 	// Optional advisory cooldown for the assigned worker and current authorized origin.
 	ForgeOriginCooldown *ForgeOriginCooldownDTO `json:"forge_origin_cooldown,omitempty"`
 	// Detail-only detector provenance; never approval authority or summary polling data.
