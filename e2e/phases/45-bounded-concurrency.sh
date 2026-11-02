@@ -316,7 +316,7 @@ else
     fixture_worker_log "$dir/seed-log" || fail "crash seed identity log unavailable"
     # Branch is bound by this just-created issue/run; the guarded inspection must
     # independently confirm the resulting selector's run/generation/path.
-    attempt="$(jq -Rse --arg branch "agent/issue-$iid" --argjson gen "$gen" '
+    attempt="$(jq -Rrse --arg branch "agent/issue-$iid" --argjson gen "$gen" '
       [split("\n")[]|sub("^[^{]*";"")|fromjson?|
         select(.msg=="runner clone: seeding" and .branch==$branch)|.path]|unique|
       if length!=1 then error("ambiguous original seed") else .[0] end |

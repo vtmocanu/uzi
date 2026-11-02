@@ -796,6 +796,65 @@ cap2_focused_regressions() {
   custody_case "cap2 refused local disposition cannot delete protected source" pass 'protected bytes retained' cap2_local_retention refused
   custody_case "cap2 local teardown refuses foreign sibling" fail 'source changed identity' cap2_local_retention foreign
 
+  # Run the shipped producer, then the real selector admission and receipt checks.
+  # Only the read transport is faked; rejected seeds must never reach that RPC.
+  cap2_seed_selector() {
+    local mode="$1" fragment attempt expected=canonical rc=0
+    # shellcheck disable=SC2034 # consumed by the extracted phase producer
+    local iid=7 gen=1 dir="$SEQ_DIR/cap2-seed-$1"
+    local COMPOSE=(fake_cap2_seed_inspect)
+    mkdir -p "$dir"
+    fragment="$(awk '
+      /^    attempt="\$\(jq .*--arg branch/ { collecting=1 }
+      collecting { print }
+      collecting && /crash original attempt identity unavailable/ { found=1; exit }
+      END { if (!found) exit 1 }
+    ' "$ROOT/e2e/phases/45-bounded-concurrency.sh")" || fail 'missing seed producer'
+    case "$mode" in
+      canonical) ;;
+      attempt) expected=20261102T010203Z-g1-0123456789abcdef ;;
+      ambiguous|missing|nonmatching-branch|invalid-attempt|wrong-generation) ;;
+      *) fail 'unknown seed fixture' ;;
+    esac
+    jq -nc --arg mode "$mode" '
+      {msg:"runner clone: seeding",branch:"agent/issue-7",path:"/data/runner/issue-7"} |
+      if $mode=="attempt" then .path+=".attempt-20261102T010203Z-g1-0123456789abcdef"
+      elif $mode=="invalid-attempt" then .path+=".attempt-invalid"
+      elif $mode=="wrong-generation" then .path+=".attempt-20261102T010203Z-g2-0123456789abcdef"
+      elif $mode=="nonmatching-branch" then .branch="agent/issue-8"
+      elif $mode=="missing" then .msg="unrelated"
+      elif $mode=="ambiguous" then ., (.path+="-other")
+      else . end' > "$dir/seed-log"
+    fixture_crash_read() { local file="$1"; shift; "$@" > "$file"; }
+    fake_cap2_seed_inspect() {
+      printf 'called\n' >> "$dir/rpc"
+      [ "${17}" = "$expected" ] || fail 'RPC received quoted or incorrect selector'
+      jq -nc --arg run "$UUID" --arg attempt "${17}" '
+        {ok:true,op:"inspect",partial:false,unreadable:0,holdsRead:"read",lifecycleRead:"not_terminal",
+         sources:[{runId:$run,generation:1,attempt:$attempt,descriptor:("a"*64),
+                   presence:"present",sources:[{clonePath:"/data/runner/issue-7"}]}]}'
+    }
+    # A child keeps the production fail/exit semantics while retaining its output.
+    ( eval "$fragment"; printf '%s' "$attempt" > "$dir/selector"
+      fixture_crash_inspect "$UUID" "$gen" "$dir/original" "$attempt"
+    ) > "$dir/output" 2>&1 || rc=$?
+    case "$mode" in
+      canonical|attempt)
+        [ "$rc" = 0 ] || fail 'seed selector rejected before guarded inspection'
+        [ "$(cat "$dir/selector")" = "$expected" ] || fail 'producer did not emit raw selector'
+        [ "$(cat "$dir/rpc")" = called ] || fail 'selector admission did not reach exactly one RPC'
+        ;;
+      *)
+        [ "$rc" != 0 ] || fail 'unsafe seed accepted'
+        [ ! -e "$dir/rpc" ] || fail 'unsafe seed reached inspection RPC'
+        ;;
+    esac
+    echo 'seed selector contract verified'
+  }
+  for mode in canonical attempt ambiguous missing nonmatching-branch invalid-attempt wrong-generation; do
+    custody_case "cap2 actual seed producer $mode" pass 'seed selector contract verified' cap2_seed_selector "$mode"
+  done
+
   cap2_inspection() {
     local mode="$1" COMPOSE=(fake_cap2_inspect)
     : > "$SEQ_DIR/cap2-inspect-generations"
