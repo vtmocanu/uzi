@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import { GitCache, type CheckpointRange } from "../src/git.js";
 import { RunRunner } from "../src/runner.js";
 import { acquireWorkerLifetime } from "../src/authority-lock.js";
@@ -21,6 +21,110 @@ function command(dir: string, ...args: string[]): string {
     encoding: "utf8", stdio: "pipe",
   }).trim();
 }
+
+const custodyRoute = /\/(?:archives|recovery-holds|completion\/hold|base-attestation-hold)(?:\/|$)/;
+
+// This is a local wire fixture, not store SQL. Unscripted requests are observations
+// with unknown outcome, even when the delegated HTTP request rejects. Only an
+// explicitly accepted fixture response below may mutate modeled custody.
+function custodyFixture(t: TestContext, runId: string) {
+  const baseline = {
+    claim: { runId, generation: 2, worker: "fixture-worker", status: "running" },
+    heartbeat: { worker: "fixture-worker", fresh: true },
+    holds: [{ id: "current", runId, generation: 2, open: true },
+      { id: "prior", runId, generation: 1, open: true },
+      { id: "other", runId: "other-run", generation: 1, open: true }],
+    captures: [{ id: "fixed-capture", status: "available", generation: 1 }],
+  } as const;
+  // All updates target this clone; baseline inputs never alias mutable state.
+  const custody: {
+    claim: { runId: string; generation: number; worker: string; status: string };
+    heartbeat: { worker: string; fresh: boolean };
+    holds: { id: string; runId: string; generation: number; open: boolean }[];
+    captures: { id: string; status: string; generation: number }[];
+  } = structuredClone({
+    ...baseline,
+    holds: baseline.holds.map(h => ({ ...h })),
+    captures: baseline.captures.map(c => ({ ...c })),
+  });
+  const observations: { path: string; body: unknown; outcome: "accepted-fixture" | "unknown" }[] = [];
+  let accepted: "close" | "create" | undefined;
+  const postJSON = (client as any).postJSON.bind(client);
+  const requests = t.mock.method(client as any, "postJSON", async (route: string, body: any, ...rest: any[]) => {
+    if (!custodyRoute.test(route)) return postJSON(route, body, ...rest);
+    const observation = { path: route, body: structuredClone(body),
+      outcome: "unknown" as "accepted-fixture" | "unknown" };
+    observations.push(observation);
+    // These exact scripted responses are the only fixture acceptance rules.
+    if (accepted === "close" && route === `/api/worker/runs/${runId}/archives/release`) {
+      accepted = undefined;
+      const hold = custody.holds.find(h => h.runId === runId && h.generation === body.generation && h.open);
+      assert.ok(hold, "accepted fixture release must name an open hold");
+      hold.open = false;
+      observation.outcome = "accepted-fixture";
+      return { run_id: runId, released: true, holds_released: 1, generation: body.generation };
+    }
+    if (accepted === "create" && route === `/api/worker/runs/${runId}/archives/reserve`) {
+      accepted = undefined;
+      custody.captures.push({ id: body.idempotency_key, status: "preparing", generation: body.generation });
+      observation.outcome = "accepted-fixture";
+      return { capture_id: body.idempotency_key, state: "preparing" };
+    }
+    return postJSON(route, body, ...rest);
+  });
+  return {
+    requests,
+    acceptNext: (effect: "close" | "create") => { accepted = effect; },
+    snapshot: () => {
+      // FakeApi records accepted state reports; attempted HTTP reports are not status facts.
+      const status = api.states.findLast(s => s.runId === runId)?.body.status ?? custody.claim.status;
+      const open = custody.holds.filter(h => h.open);
+      const live = custody.heartbeat.fresh && custody.claim.worker === custody.heartbeat.worker && status === "running";
+      const discount = live ? new Set(open.filter(h => h.runId === custody.claim.runId &&
+        h.generation === custody.claim.generation).map(h => h.runId)).size : 0;
+      return structuredClone({ custody: { ...custody, claim: { ...custody.claim, status } },
+        totalOpen: open.length, liveClaimDiscount: discount, admissionCharged: open.length - discount,
+        captureCount: custody.captures.length, observations,
+        uncertainAttempts: observations.filter(o => o.outcome === "unknown").length });
+    },
+  };
+}
+
+test("custody accounting sensitivity: accepted close and create at client postJSON", async t => {
+  const model = custodyFixture(t, "fixture-run");
+  const before = model.snapshot();
+  model.acceptNext("close");
+  await client.releaseRecoveryCustody("fixture-run", 1);
+  assert.equal(model.snapshot().totalOpen, 2);
+  assert.equal(model.snapshot().admissionCharged, 1);
+  assert.equal(before.totalOpen, 3, "snapshots do not alias the model");
+  model.acceptNext("create");
+  await client.reserveRecoveryCapture("fixture-run", {
+    run_id: "fixture-run", generation: 2, idempotency_key: "new-capture", source_sha: "a".repeat(40),
+  });
+  assert.equal(model.snapshot().captureCount, 2);
+  assert.equal(model.snapshot().uncertainAttempts, 0);
+  assert.equal(model.requests.mock.callCount(), 2);
+});
+
+test("custody accounting sensitivity: rejected custody attempt retains counts with uncertainty", async t => {
+  const model = custodyFixture(t, "fixture-run");
+  await assert.rejects(client.releaseRecoveryCustody("fixture-run", 1));
+  const after = model.snapshot();
+  assert.equal(after.totalOpen, 3);
+  assert.equal(after.admissionCharged, 2);
+  assert.equal(after.uncertainAttempts, 1);
+  assert.equal(model.requests.mock.callCount(), 1);
+});
+
+test("custody accounting sensitivity: accepted fake status invalidates live claim", async t => {
+  const model = custodyFixture(t, "fixture-run");
+  await client.reportState("fixture-run", { status: "failed" });
+  const after = model.snapshot();
+  assert.equal(after.totalOpen, 3);
+  assert.equal(after.liveClaimDiscount, 0);
+  assert.equal(after.admissionCharged, 3);
+});
 
 // The scanner reports and default-empty process view are harness seams, not hosted
 // quiescence proof. Late-seed separately checks real persisted authority epochs.
@@ -139,25 +243,8 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       args[5] = mode === "marker-plain" ? s : coverage.sha; args[6] = s;
       return capture(...args);
     });
-    // Fixed accounting inputs model the live-claim discount, not execution of store SQL.
-    // Two open holds on this live run discount only ONE; total open holds stay three.
-    const custody = {
-      claim: { runId: claim.run_id, generation: 2, worker: "fixture-worker", status: "running" },
-      heartbeat: { worker: "fixture-worker", fresh: true },
-      holds: [{ id: "current", runId: claim.run_id, generation: 2, open: true },
-        { id: "prior", runId: claim.run_id, generation: 1, open: true },
-        { id: "other", runId: "other-run", generation: 1, open: true }],
-      captures: [{ id: "fixed-capture", status: "available", generation: 1 }],
-    };
-    const accounting = () => {
-      const open = custody.holds.filter(h => h.open);
-      const live = custody.heartbeat.fresh && custody.claim.worker === custody.heartbeat.worker &&
-        custody.claim.status === "running";
-      const discount = live ? new Set(open.filter(h => h.runId === custody.claim.runId &&
-        h.generation === custody.claim.generation).map(h => h.runId)).size : 0;
-      return structuredClone({ custody, totalOpen: open.length, liveClaimDiscount: discount,
-        admissionCharged: open.length - discount });
-    };
+    const custodyModel = custodyFixture(t, claim.run_id);
+    const accounting = custodyModel.snapshot;
     const mutations = [
       t.mock.method(client, "reserveRecoveryCapture"),
       t.mock.method(client, "releaseRecoveryCustody"),
@@ -171,7 +258,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
     // well, including custody routes a future client method might introduce.
     assert.deepEqual(Object.getOwnPropertyNames(Object.getPrototypeOf(client))
       .filter(n => /discard.*(?:custody|recovery|hold)|(?:custody|recovery|hold).*discard/i.test(n)), []);
-    const requests = t.mock.method(client as any, "postJSON");
+    const requests = custodyModel.requests;
     const prepare = cache.prepareRecoverySuccessor.bind(cache);
     t.mock.method(cache, "prepareRecoverySuccessor", async (...args: Parameters<typeof prepare>) => {
       const original = args[6]!.admitRemediationSource!;
@@ -206,12 +293,12 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
         result = await prepare(...args);
       } finally {
         await checkProof(async () => {
-          assert.deepEqual(accounting(), counts, "adoption alone changes no fixed custody/admission input");
+          assert.deepEqual(accounting(), counts, "adoption changes no modeled custody/admission input or request uncertainty");
           assert.deepEqual(api.states, states, "no status transition inside adoption");
           assert.deepEqual(mutations.map(m => m.mock.callCount()), mutationCounts,
             "adoption neither reserves/releases custody nor creates/settles holds");
           const custodyRequests = requests.mock.calls.slice(requestStart).filter((call: any) =>
-            /\/(?:archives|recovery-holds|completion\/hold|base-attestation-hold)(?:\/|$)/.test(call.arguments[0]));
+            custodyRoute.test(call.arguments[0]));
           assert.deepEqual(custodyRequests, [], "no custody mutation HTTP request, including discard");
           const rootsAfter = await cache.enumerateOwedCandidates(bare, claim.run_id);
           for (const root of oldRoots) assert.deepEqual(rootsAfter.find(r => r.sha === root.sha), root,
