@@ -9990,7 +9990,6 @@ export class GitCache {
     }
     const sources: RetainedSourceEvidence[] = [];
     const measurements = new Map<string, { bytes: number; complete: boolean }>();
-    const diagnosedMeasurements = new Set<string>();
     let bindingFailed = false;
     for (const { g, rec, ev } of found) {
       const parts: RetainedSourcePart[] = [];
@@ -10014,10 +10013,8 @@ export class GitCache {
                   const detail: PartialCauses = {};
                   try { return await this.measureAllocated(p.clonePath, now, deadline, opts.measureCaps, detail); }
                   finally {
-                    if (!opts.epoch || !diagnosedMeasurements.has(p.clonePath)) {
-                      diagnosedMeasurements.add(p.clonePath);
-                      mergePartialCauses(partialCauses, detail);
-                    }
+                    // Only executed walks arrive here; cache hits bypass this callback.
+                    mergePartialCauses(partialCauses, detail);
                   }
                 });
             if (opts.epoch) measurements.set(p.clonePath, m);

@@ -644,7 +644,7 @@ it("#3775 one binding failure diagnoses once while repeated skips retain old unr
   assert.deepEqual(result.partialCauses, { tree_binding_failed: 1 });
   assert.ok(result.sources.every(s => s.disposition === undefined && s.epochSettlement === undefined));
 });
-it("#3775 shared-path throwing measurement counts original events once without caching the old thrown result", async () => {
+it("#3775 each executed shared-path measurement reports its failures without changing retries", async () => {
   const clonePath = cache.runnerClonePath(bare, "issue-3430");
   fs.mkdirSync(clonePath, { recursive: true });
   for (const generation of [1, 2]) {
@@ -668,5 +668,64 @@ it("#3775 shared-path throwing measurement counts original events once without c
   assert.equal(walks, 2);
   assert.equal(result.unreadable, 2);
   assert.equal(result.partial, true);
-  assert.deepEqual(result.partialCauses, { measurement_filesystem_error: 2 });
+  assert.deepEqual(result.partialCauses, { measurement_filesystem_error: 4 });
+});
+
+for (const kind of ["bytes", "unterminated-record"] as const) {
+  it("#3775 protected-descriptor wrapping preserves " + kind + " cause in each scope", async () => {
+    attempts(1);
+    const seam = cache as unknown as {
+      protectedRecoveries: (bare: string) => Promise<unknown[]>;
+      checkEpochMetadata: (args: string[], output: string) => void;
+    };
+    let hits = 0;
+    mock.method(seam, "protectedRecoveries", async () => {
+      hits++;
+      // Produce a known original-site failure after the initial config gather succeeded.
+      seam.checkEpochMetadata(["config", "--get-regexp", "^uzi-retained"],
+        kind === "bytes" ? "x".repeat(4097) : "x\n".repeat(16) + "last");
+      return [];
+    });
+    const limits = { maxMetadataBytes: 4096, maxMetadataRecords: 16 };
+    const suffix = kind === "bytes" ? "metadata_byte_cap" : "metadata_record_cap";
+    const census = await cache.discoverEpochRetainedSources({ limits });
+    assert.equal(census.inventoryComplete, false);
+    assert.equal(census.unreadable, 1);
+    assert.deepEqual(census.partialCauses, { ["census_" + suffix]: 1 });
+    const inspected = await inspect({ epoch: true, epochLimits: limits });
+    assert.equal(inspected.unreadable, 1);
+    assert.deepEqual(inspected.partialCauses, { ["inspection_" + suffix]: 1 });
+    assert.equal(hits, 2);
+  });
+}
+
+it("#3775 interruption during measurement close joins cleanup and reports interruption", async () => {
+  const [entry] = attempts(1);
+  fs.mkdirSync(entry!.clonePath, { recursive: true });
+  const stop = new AbortController();
+  const open = fsp.opendir;
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+    const handle = await open(...args);
+    if (args[0] === entry!.clonePath) {
+      const close = handle.close.bind(handle);
+      mock.method(handle, "close", async () => { await close(); entered(); await held; });
+    }
+    return handle;
+  });
+  let settled = false;
+  const pending = inspect({ epoch: true, signal: stop.signal }).then(result => { settled = true; return result; });
+  await started;
+  try {
+    stop.abort();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(settled, false);
+  } finally { release(); }
+  const result = await pending;
+  assert.equal(result.partial, true);
+  assert.equal(result.unreadable, 0);
+  assert.equal(result.sources[0]!.allocatedBytes, null);
+  assert.deepEqual(result.partialCauses, { inspection_interrupted: 1 });
 });
