@@ -1027,7 +1027,8 @@ export interface ClaimConfig {
    *  PLAN_MAX_REVISIONS). The worker enforces the same cap the server does. */
   plan_max_revisions?: number;
   /** PRD #88 clarification bounds: how many times one run may stop to ask the human,
-   *  and how long a single park waits before the run fails "clarification timed out".
+   *  and the cumulative time parked at awaiting_input (per worker execution) before the
+   *  run fails "clarification timed out".
    *  Both enforced worker-side (a question is an in-process ask_user signal, so unlike
    *  a revise_plan there is no input row for the server to count) but configured
    *  server-side and shipped here, because a worker env var is unreachable on hosted
@@ -1504,6 +1505,20 @@ export interface ClaimMemoryState {
   memory_episode?: number;
   memory_intervention_count?: number;
   memory_policy?: MemoryPolicy | null;
+  /** issue #3639: the server's reference to the settled memory park it stored for this worker incarnation. Keyed by
+   *  the PARKED generation (`claim_generation` names the park, not the current claim); sent on every later claim
+   *  until a foreign claim or a newer park supersedes it. A claim carrying a malformed one has it removed by the
+   *  client decode. The runner compares it against its own park entry; it grants no authority by itself. */
+  memory_park_reference?: MemoryParkReference;
+}
+
+/** issue #3639: `settlement_sha256` is the lowercase hex sha256 of the exact bytes the worker posted. */
+export interface MemoryParkReference {
+  claim_generation: number;
+  memory_episode: number;
+  worker_id: string;
+  register_nonce: string;
+  settlement_sha256: string;
 }
 
 export interface ForgeOriginReservation {
@@ -1620,6 +1635,10 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  implementation. The M1 worker parks it for human review while the checker is unavailable.
    *  Omitted by older servers and on runs without the requirement. */
   plan_cross_check_required?: boolean;
+  /** PRD #3708: this human-gated run has its plan cross-checked BEFORE the ordinary human plan
+   *  gate; every checker outcome, APPROVE included, still opens that gate. The api sends it only
+   *  to a worker that advertises cross_check_gated_v1, so an older api or worker never sees it. */
+  plan_cross_check_gated?: boolean;
   /** Independent code-check consent snapshot. Absent on older APIs means disabled. */
   code_cross_check_required?: boolean;
   /** PRD #2460 rework: additive api-capability signal that this server accepts a Codex lead's

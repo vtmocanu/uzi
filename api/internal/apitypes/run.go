@@ -283,7 +283,11 @@ type RunDTO struct {
 	CodeCrossCheckRequired    bool         `json:"code_cross_check_required"`
 	// PlanCrossCheckRequired is the run's snapshot of the owner's plan cross-check
 	// setting at creation. It remains true after the approval gate is decided.
-	PlanCrossCheckRequired   bool    `json:"plan_cross_check_required"`
+	PlanCrossCheckRequired bool `json:"plan_cross_check_required"`
+	// PlanCrossCheckGated (PRD #3708) is the run's snapshot of "checked before the human plan
+	// gate": the owner consented, the run is not auto-approved, and the plan is agent-written.
+	// An older api omits it, and clients then render nothing for it.
+	PlanCrossCheckGated      bool    `json:"plan_cross_check_gated,omitempty"`
 	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
 	// PlanCrossCheckDiffRefusal is the planning-diff refusal sub-code. It is set only
 	// while PlanCrossCheckGateReason is planning_diff_refused; otherwise nil.
@@ -1193,7 +1197,11 @@ type RunSummaryItemDTO struct {
 	CodeCrossCheckRequired    bool         `json:"code_cross_check_required"`
 	// PlanCrossCheckRequired is the run's snapshot of the owner's plan cross-check
 	// setting at creation. It remains true after the approval gate is decided.
-	PlanCrossCheckRequired   bool    `json:"plan_cross_check_required"`
+	PlanCrossCheckRequired bool `json:"plan_cross_check_required"`
+	// PlanCrossCheckGated (PRD #3708) is the run's snapshot of "checked before the human plan
+	// gate": the owner consented, the run is not auto-approved, and the plan is agent-written.
+	// An older api omits it, and clients then render nothing for it.
+	PlanCrossCheckGated      bool    `json:"plan_cross_check_gated,omitempty"`
 	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
 	// PlanCrossCheckDiffRefusal is the planning-diff refusal sub-code. It is set only
 	// while PlanCrossCheckGateReason is planning_diff_refused; otherwise nil.
@@ -1993,6 +2001,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		AutoApproveBlockedReasons:     item.AutoApproveBlockedReasons,
 		IssueInputReason:              item.IssueInputReason,
 		PlanCrossCheckRequired:        item.PlanCrossCheckRequired,
+		PlanCrossCheckGated:           item.PlanCrossCheckGated,
 		PlanCrossCheckGateReason:      item.PlanCrossCheckGateReason,
 		PlanCrossCheckDiffRefusal:     item.PlanCrossCheckDiffRefusal,
 		PlanCrossCheckSummary:         item.PlanCrossCheckSummary,
@@ -2178,6 +2187,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			AutoApproveBlockedReasons:     s.AutoApproveBlockedReasons,
 			IssueInputReason:              s.IssueInputReason,
 			PlanCrossCheckRequired:        s.PlanCrossCheckRequired,
+			PlanCrossCheckGated:           s.PlanCrossCheckGated,
 			PlanCrossCheckGateReason:      s.PlanCrossCheckGateReason,
 			PlanCrossCheckDiffRefusal:     s.PlanCrossCheckDiffRefusal,
 			PlanCrossCheckSummary:         s.PlanCrossCheckSummary,

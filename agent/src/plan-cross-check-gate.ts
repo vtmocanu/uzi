@@ -25,6 +25,10 @@ type CandidateResponse = Extract<PlanCrossCheckResponse, { result: "candidate" }
 export type CheckedPlanDecision =
   | { kind: "approve"; response: CandidateResponse }
   | { kind: "revise"; response: CandidateResponse }
+  /** PRD #3708 gated mode only: the checker approved, and the run still opens the ordinary human
+   * gate. Carries the checker's canonical candidate (response.candidate) and keeps the transport
+   * reservation until the applied gate fences it; it never grants an approval. */
+  | { kind: "gated_pass"; response: CandidateResponse; reservation: CandidateTransportReservation }
   | { kind: "human"; fields: PlanCrossCheckStateRequest; reservation?: CandidateTransportReservation;
       completePreparation?: (signal: AbortSignal) => Promise<void> };
 
@@ -36,10 +40,19 @@ interface CheckPlanOptions {
   batcher: MessageBatcher; signal: AbortSignal; timing?: PlanCrossCheckTiming;
   round?: number;
   allowAutomaticRevision?: boolean;
+  /** "required" (default): an APPROVE releases the autopilot approval. "gated": an APPROVE yields
+   * gated_pass and a human still approves. */
+  mode?: "required" | "gated";
 }
 
-export function checkPlan(options: CheckPlanOptions & { allowAutomaticRevision?: false }):
-  Promise<Exclude<CheckedPlanDecision, { kind: "revise" }>>;
+export function checkPlan(options: CheckPlanOptions & { mode: "gated"; allowAutomaticRevision?: false }):
+  Promise<Exclude<CheckedPlanDecision, { kind: "approve" | "revise" }>>;
+export function checkPlan(options: CheckPlanOptions & { mode: "gated" }):
+  Promise<Exclude<CheckedPlanDecision, { kind: "approve" }>>;
+export function checkPlan(options: CheckPlanOptions & { mode?: "required"; allowAutomaticRevision?: false }):
+  Promise<Exclude<CheckedPlanDecision, { kind: "revise" | "gated_pass" }>>;
+export function checkPlan(options: CheckPlanOptions & { mode?: "required" }):
+  Promise<Exclude<CheckedPlanDecision, { kind: "gated_pass" }>>;
 export function checkPlan(options: CheckPlanOptions): Promise<CheckedPlanDecision>;
 export async function checkPlan(options: CheckPlanOptions): Promise<CheckedPlanDecision> {
   const { client, runId, generation, candidate, batcher, signal } = options;
@@ -220,6 +233,12 @@ export async function checkPlan(options: CheckPlanOptions): Promise<CheckedPlanD
       current = validated;
     }
     if (!await checkTransport()) return heldHuman();
+    if (current.verdict === "approve" && options.mode === "gated") {
+      // The server decided APPROVE before its deadline; no approval is released from it and a
+      // human still reviews, so a local clock re-check would only discard a valid pass. The
+      // reservation stays held until the applied human gate fences it.
+      return { kind: "gated_pass", response: current, reservation };
+    }
     if (current.verdict === "approve") {
       if (Date.now() >= Date.parse(current.deadline_at)) return await human("timed_out");
       if (!reservation.release(current))

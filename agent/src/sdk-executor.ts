@@ -153,6 +153,7 @@ import {
   updateCompletionStreak,
   routeCompletionHold,
   buildCompletionReworkFollowUp,
+  hasClaimedOwnerCompletionScope,
 } from "./completion-attempt.js";
 
 // Fallbacks used only when the claim omits `config`. Wire units are SECONDS
@@ -877,7 +878,11 @@ interface DriveState {
   approvedPlan?: string;
   /** Checked canonical instructions replace the local plan carried by the planning session. */
   checkedPlan?: boolean;
+  /** A human approved a presented canonical bundle; checker approval remains false. */
+  humanCanonicalPlan?: boolean;
   checkedFindings?: PlanCrossCheckFindings | null;
+  /** Once owner scope changes, the repeated approved contract stays suppressed through restarts. */
+  approvedContractSuperseded?: boolean;
   /** Issue #3178: the plan gate approved (non-cross_check) while NO session exists to carry the
    *  plan (post-gate `resumeId` undefined), e.g. a re-presented stored plan after the SDK
    *  session was dropped. The first implement turn then opens a fresh session, so the approved
@@ -2748,13 +2753,16 @@ export class SdkExecutor implements Executor {
           throw new TrustedExecutionRefusal(
             `unexpected plan verdict: ${(verdict as { kind: string }).kind}`,
           );
-        if (verdict.approval === "cross_check") {
+        if (verdict.approval === "cross_check" || verdict.canonical !== undefined) {
           // Validate the entire bundle before adopting either value (checked-plan.ts).
           const canonical = validateCheckedPlanBundle(verdict.canonical, ctx.claimGeneration);
           approvedPlan = canonical.plan;
           candidateMilestones = canonical.milestones;
-          drive.checkedPlan = true;
-          drive.checkedFindings = verdict.findings;
+          drive.humanCanonicalPlan = verdict.approval !== "cross_check";
+          if (verdict.approval === "cross_check") {
+            drive.checkedPlan = true;
+            drive.checkedFindings = verdict.findings;
+          }
         }
         // Issue #3178: keyed on the post-gate resumeId (a revise turn may have produced a
         // session), never ctx.sessionId. Cross-check approvals carry the canonical contract.
@@ -2963,7 +2971,13 @@ export class SdkExecutor implements Executor {
       // Repeat the checked server contract on every implement attempt: an interrupted
       // first attempt may not have delivered it to the model or updated the old session.
       // Serialize the entire approved list, including nested values and explicit [].
-      const checkedContext = drive.checkedPlan ? checkedImplementationContext(approvedPlan, frozenMilestones) + renderPlanApprovalAdvice(drive.checkedFindings) : "";
+      // Until an owner completion decision supersedes it, repeat the enrolled contract, including a
+      // human approval arriving after reclaim at an open gate with a surviving draft session.
+      // Missing frozen milestones remain unknown (null), never an inferred empty list.
+      const repeatingContract = drive.checkedPlan || drive.humanCanonicalPlan || ctx.repeatApprovedPlan === true;
+      if (repeatingContract && hasClaimedOwnerCompletionScope(ctx)) drive.approvedContractSuperseded = true;
+      const checkedContext = repeatingContract
+        ? checkedImplementationContext(approvedPlan, frozenMilestones ?? null) + renderPlanApprovalAdvice(drive.checkedFindings) : "";
       const seededPlanBody = embedSeededPlan({
         preApproved,
         seeded: ctx.seeded === true,
@@ -3303,6 +3317,7 @@ export class SdkExecutor implements Executor {
         // in its slot for the next ordinary turn.
         const reworkForTurn = completionRework;
         completionRework = undefined;
+        if (repeatingContract && reworkForTurn?.answered) drive.approvedContractSuperseded = true;
         if (followUp === undefined && !reworkForTurn) ownerBatch ??= fillOwnerBatch(queuedOwner, ctx);
         const ownerRides = followUp === undefined && !reworkForTurn ? ownerBatch : undefined;
         const ownerFirstEvent = ownerRides
@@ -3395,7 +3410,7 @@ export class SdkExecutor implements Executor {
           implementConfig,
           "implement",
           resumeId,
-          (reworkForTurn?.answered ? "" : checkedContext) + buildImplementPrompt({
+          (reworkForTurn?.answered || drive.approvedContractSuperseded ? "" : checkedContext) + buildImplementPrompt({
             branch: ctx.branch,
             subagentNames: selectedNames,
             // PRD #266 M1: the implement roster's OWN capability map (selectedCanWrite),
@@ -3524,7 +3539,8 @@ export class SdkExecutor implements Executor {
         };
         const requestPark: NonNullable<RunContext["requestParkRun"]> = async (at) => {
           const step = await this.runThroughSwitch(ctx, state, async () => {
-            // Re-entry resumes the runner's pending question, with its original deadline.
+            // Re-entry shares the run's parked-time budget: a same-id re-entry continues its open
+            // interval, while a declined park already closed it and the next attempt opens a new one.
             // Only a settled owner answer permits another attempt; lifecycle refusals keep waiting.
             for (;;) {
               try { return await ctx.requestParkRun!(at); }
@@ -3641,7 +3657,7 @@ export class SdkExecutor implements Executor {
           if (turn.parkRun) {
             if (!parkRunEnabled(ctx, "implement") || !ctx.requestParkRun) throw new Error("illicit park_run signal");
             if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
-            // The worker callback owns explicit owner retries and their absolute deadline.
+            // The worker callback owns explicit owner retries and the shared parked-time budget.
             const disposition = await requestPark(parkAt);
             if (switchReleased || walled || completionHeld || pausedAt) break;
             if (disposition.kind === "paused") { pausedAt = parkAt; break; }

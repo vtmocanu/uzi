@@ -49,6 +49,13 @@ rules and, for `fact-checker`, its forge tools on top (both explained below):
 | `web-ux` | `opus` | Validates web interfaces in a real browser (agent-browser), reviewing UX, accessibility, and visual consistency; reports findings only. |
 | `ux-designer` | `opus` | Sets opinionated visual and information-architecture direction, then builds and browser-validates the frontend/UI; owns the design layer and defers backend logic to the coder. |
 
+A template with no model set shows a **Default · …** label naming where its
+model comes from: `Default · SDK/account default (built-in)` for the `lead`
+(or orchestrator) and `Default · lead's model` for subagents. This appears in
+the list, the detail page, the editor, the builtin diff and the agent-source
+review. In the `lead` editor, a note says a user's worker model (**Settings →
+Run defaults**) overrides the template's model for their own runs.
+
 The `lead` is the orchestrator: the main agent thread. It runs on `opus`
 by default unless you set a personal override in
 [Worker model](./worker-model.md). Editing a template's prompt only tunes

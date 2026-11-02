@@ -463,12 +463,12 @@ function KindPill({ s }: { s: Schedule }) {
   return null;
 }
 
-// A default row's chips (D4): model or "inherit model", the sealed sweep labels, max
+// A default row's chips (D4): model or "default model", the sealed sweep labels, max
 // issues, then the run flags, all read from the row's own effective values.
 function DefaultOptions({ s, showApprove }: { s: Schedule; showApprove: boolean }) {
   return (
     <>
-      <OptionChip>{s.model ? `model ${s.model}` : "inherit model"}</OptionChip>
+      <OptionChip>{s.model ? `model ${s.model}` : "default model"}</OptionChip>
       {s.target === "sweep" && s.labels?.map((l) => <OptionChip key={l}>label {l}</OptionChip>)}
       <CapacityOptions s={s} />
       {s.wait_on_limit && <OptionChip>wait-on-limit</OptionChip>}

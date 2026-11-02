@@ -348,7 +348,8 @@ export function ScheduleModal({
   // A sweep default's baked catalog guidance is read-only and travels in a SEPARATE
   // DTO field (issue #675); the editable `guidance` state above is the owner overlay.
   const bakedGuidance = editing?.baked_guidance ?? "";
-  // Per-schedule model override; "" = inherit the owner's per-user Worker default.
+  // Per-schedule model override; "" = use the owner's worker model (Run defaults →
+  // Harness and worker models) for the schedule's harness.
   // Applies to ALL targets (unlike guidance). Injection-suspect custom IDs are gated
   // below (modelWarning) mirroring the server's ValidateModel reject.
   const [model, setModel] = useState<string>(editing?.model ?? "");
@@ -445,6 +446,13 @@ export function ScheduleModal({
     codexUsableForHarness,
     ownerDefaultHarness,
   );
+  // The harness the model picker's vocabulary and Default label follow; undefined when
+  // the effective harness is not resolvable at edit time (inherit, resolved at fire time).
+  const scheduleModelHarness: Harness | undefined = scheduleStartsOnCodex
+    ? "codex"
+    : harnessSel === "inherit"
+      ? undefined
+      : harnessSel;
   // PRD #929 M1: per-schedule output mode for prompt-target schedules. "" = inherit the
   // catalog/job default; "mr" opens a merge request from an idea file, "issues" files issues.
   const [outputMode, setOutputMode] = useState<string>(
@@ -1397,11 +1405,19 @@ export function ScheduleModal({
               id="sched-model"
               value={model}
               onChange={setModel}
-              harness={scheduleStartsOnCodex ? "codex" : harnessSel === "inherit" ? undefined : harnessSel}
+              harness={scheduleModelHarness}
+              defaultLabel={
+                scheduleModelHarness === "claude"
+                  ? "Default · your Claude worker model"
+                  : scheduleModelHarness === "codex"
+                    ? "Default · your Codex worker model"
+                    : "Default · your worker model"
+              }
             />
             <p className="mt-1 text-[11px] text-faint">
-              Runs fired by this schedule use this model on every target. Leave on Inherit to
-              use your per-user Worker default.
+              Runs fired by this schedule use this model on every target. Leave on Default to use
+              your worker model for this schedule's harness (Settings → Run defaults → Harness and
+              worker models).
             </p>
           </Field>
           {modelWarning && <Alert message={modelWarning} tone="warning" />}
