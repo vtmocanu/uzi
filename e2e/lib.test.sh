@@ -80,6 +80,7 @@ else
   echo "FAIL: wait_regated not defined — extraction failed or the helper was removed"
 fi
 mkdir -p "$ROOT/.uzi/scratch"
+export TMPDIR="$ROOT/.uzi/scratch"
 SEQ_DIR="$(mktemp -d "$ROOT/.uzi/scratch/e2e-lib.XXXXXX")"
 trap 'rm -rf "$SEQ_DIR"' EXIT
 
@@ -628,30 +629,241 @@ for variant in wrong-generation wrong-order two-captures missing-id extra-claim 
   custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' f42_assert_capture_resume R 2 0
 done
 
-cap2_recovery_contract() {
-  local mode="$1" RUN_KA=R RUN_KB=S fixture_generation=2
-  # shellcheck disable=SC2034  # used by the old real phase statements in the regression
-  local RWC_KA RWC_KB
-  [ "$mode" != extra-generation ] || fixture_generation=3
-  db_psql() { case "$1" in *claim_generation*) echo "$fixture_generation";; *) echo 0;; esac; }
-  wait_same_claim_capture_resume() {
-    [ "$mode" != missing-capture ] || fail 'cap2 recovery missing exact capture'
-    [ "$2:$4" = 2:agent/fixture ] || fail 'cap2 recovery lost generation or branch'
+# Phase 45 focused regressions. Kept in one extractable function so main can run
+# just this unit without replaying unrelated phase-52 and custody model suites.
+cap2_focused_regressions() {
+  eval "$(awk '/^(assert_cap2_owner_resume|assert_cap2_crash_refusal|assert_cap2_crash_bytes|cap2_crash_local_teardown)\(\) \{/,/^\}/' "$ROOT/e2e/phases/45-bounded-concurrency.sh")"
+  eval "$(awk '/^(fixture_crash_read|discard_fixture_crash_owner_holds|fixture_crash_inspect)\(\) \{/,/^\}/' "$LIB")"
+  cap2_outcome() {
+    local mode="$1" generation=2
+    [ "$mode" != extra-generation ] || generation=3
+    db_psql() { echo "$generation"; }
+    apiget() {
+      jq -nc --arg mode "$mode" '{run:{status:"completed",requeue_count:0,branch:"agent/issue-7",mr_iid:9}} |
+        if $mode=="charged" then .run.requeue_count=1
+        elif $mode=="wrong-branch" then .run.branch="agent/issue-8" else . end'
+    }
+    fake_state() { echo '{"mrs":[{"source_branch":"agent/issue-7","project_id":2}]}'; }
+    assert_cap2_owner_resume R 1 0 7 2
+    echo 'owner pause resumed'
   }
-  local definition
-  definition="$(awk '/^assert_cap2_recovered_run\(\) \{/,/^\}/' "$ROOT/e2e/phases/45-bounded-concurrency.sh")"
-  if [ -n "$definition" ]; then
-    eval "$definition"
-    assert_cap2_recovered_run R 1 agent/fixture
-  else
-    # Run the old real counter assertion against a valid same-claim recovery.
-    eval "$(awk '/^  RWC_KA=/ { inside=1 } inside {print} /^  pass "restarted worker/ {inside=0}' "$ROOT/e2e/phases/45-bounded-concurrency.sh")"
-  fi
-  echo 'cap2 capture verified inside the one successor claim'
+  custody_case "cap2 owner pause succeeds without charging requeue" pass 'owner pause resumed' cap2_outcome valid
+  custody_case "cap2 owner pause refuses extra generation" fail 'generation mismatch' cap2_outcome extra-generation
+  for mode in charged wrong-branch; do
+    custody_case "cap2 owner pause refuses $mode" fail 'outcome/branch/requeue mismatch' cap2_outcome "$mode"
+  done
+  cap2_refusal() {
+    local mode="$1" generation=2
+    [ "$mode" != extra-generation ] || generation=3
+    db_psql() { echo "$generation"; }
+    apiget() {
+      jq -nc --arg mode "$mode" '{run:{status:"failed",requeue_count:1,
+        failure_reason:"Retained recovery blocked: preservation failed; local work and custody retained"}} |
+        if $mode=="generic-failure" then .run.failure_reason="unrelated" else . end'
+    }
+    jq -nc --arg mode "$mode" '
+      [{run_id:"R",msg:"run claimed"},
+       {run_id:"R",msg:"run claimed"},
+       {run_id:"R",msg:"retained predecessor refused by source-use admission; capture not started",
+        error:"source is active under another worker incarnation"},
+       {run_id:"R",claim_generation:2,status:"failed",msg:"outbox: terminal journaled write-ahead"}] |
+      if $mode=="wrong-run" then .[2].run_id="S"
+      elif $mode=="wrong-gen" then .[3].claim_generation=3
+      elif $mode=="wrong-error" then .[2].error="timeout"
+      elif $mode=="missing-terminal" then del(.[3])
+      elif $mode=="captured" then .+=[{run_id:"R",msg:"recovery: bundle uploaded (durable capture)"}]
+      elif $mode=="seeded" then .+=[{branch:"agent/issue-7",msg:"runner clone: seeding"}]
+      elif $mode=="executed" then .+=[{run_id:"R",msg:"stub executor committed marker"}]
+      elif $mode=="extra-claim" then .+=[{run_id:"R",msg:"run claimed"}]
+      else . end | .[]' > "$SEQ_DIR/cap2-log"
+    assert_cap2_crash_refusal R 1 agent/issue-7 "$SEQ_DIR/cap2-log"
+    echo 'foreign-active refused'
+  }
+  custody_case "cap2 active crash requires precise foreign-active refusal" pass 'foreign-active refused' cap2_refusal valid
+  custody_case "cap2 crash refuses generation drift" fail 'generation mismatch' cap2_refusal extra-generation
+  custody_case "cap2 crash refuses generic failed outcome" fail 'failure_reason/budget mismatch' cap2_refusal generic-failure
+  for mode in wrong-run wrong-gen wrong-error missing-terminal captured seeded executed extra-claim; do
+    custody_case "cap2 crash refuses $mode" fail 'lacks exact foreign-active refusal' cap2_refusal "$mode"
+  done
+
+  cap2_bytes() {
+    local mode="$1"
+    echo '{"head":"original","digest":"bytes","core":{"runId":"R","clonePath":"/data/runner/own"},"pins":["own original pin"]}' > "$SEQ_DIR/cap2-before"
+    jq --arg mode "$mode" 'if $mode=="new-pin" then .pins+=["own successor pin"]
+      elif $mode=="lost-pin" then .pins=[]
+      elif $mode=="bytes" then .digest="changed"
+      elif $mode=="journal" then .core.runId="foreign"
+      elif $mode=="head" then .head="changed" else . end' "$SEQ_DIR/cap2-before" > "$SEQ_DIR/cap2-after"
+    assert_cap2_crash_bytes "$SEQ_DIR/cap2-before" "$SEQ_DIR/cap2-after"
+    echo 'original bytes retained'
+  }
+  custody_case "cap2 permits new generation pins while preserving originals" pass 'original bytes retained' cap2_bytes new-pin
+  for mode in lost-pin bytes journal head; do
+    custody_case "cap2 preservation detects changed $mode" fail 'bytes/head/journal/pins changed' cap2_bytes "$mode"
+  done
+
+  cap2_local_retention() {
+    local mode="$1" calls=0
+    fixture_crash_inspect() {
+      calls=$((calls+1))
+      jq -nc --arg mode "$mode" '{sources:[{runId:"R",barePath:"/data/repos/own",branch:"agent/issue-7",attempt:"canonical",
+        sources:[{clonePath:"/data/runner/own"}],disposition:{kind:"resolve_local_record"},
+        localRecords:[{kind:"recovery",resolution:"normal worker recovery"}]}]} |
+        if $mode=="foreign" then .sources[0].runId="foreign"
+        elif $mode=="refused" then .sources[0].disposition.kind="refused" else . end' > "$3"
+    }
+    fixture_crash_snapshot() { cp "$SEQ_DIR/cap2-local/before" "$2"; }
+    fixture_crash_read() { fail 'protected sibling must never be discarded'; }
+    sleep() { :; }
+    mkdir -p "$SEQ_DIR/cap2-local"
+    echo '{"sources":[{"runId":"R","barePath":"/data/repos/own","branch":"agent/issue-7","attempt":"canonical","sources":[{"clonePath":"/data/runner/own"}]}]}' > "$SEQ_DIR/cap2-local/original"
+    echo '{"head":"own","core":{"runId":"R"},"pins":["own pin"],"digest":"bytes"}' > "$SEQ_DIR/cap2-local/before"
+    cap2_crash_local_teardown R 1 "$SEQ_DIR/cap2-local/original" "$SEQ_DIR/cap2-local"
+    [ "$calls" = 3 ] || fail 'unbounded local cleanup attempts'
+    echo 'protected bytes retained with unresolved records'
+  }
+  custody_case "cap2 unresolved crash records retain bytes after bounded attempts" pass 'protected bytes retained' cap2_local_retention record
+  custody_case "cap2 refused local disposition cannot delete protected source" pass 'protected bytes retained' cap2_local_retention refused
+  custody_case "cap2 local teardown refuses foreign sibling" fail 'source changed identity' cap2_local_retention foreign
+
+  cap2_inspection() {
+    local mode="$1" COMPOSE=(fake_cap2_inspect)
+    : > "$SEQ_DIR/cap2-inspect-generations"
+    fixture_crash_read() { local file="$1"; shift; "$@" > "$file"; }
+    fake_cap2_inspect() {
+      local g="${15}"
+      echo "$g" >> "$SEQ_DIR/cap2-inspect-generations"
+      jq -nc --arg run "$UUID" --arg mode "$mode" --arg gen "$g" '
+        {ok:true,op:"inspect",partial:false,unreadable:0,holdsRead:"read",lifecycleRead:"terminal",
+        sources:[{runId:$run,generation:(if $gen=="none" then "none" else ($gen|tonumber) end),attempt:"canonical",
+          descriptor:("a"*64),presence:"present",sources:[{clonePath:"/data/runner/own"}]}]} |
+        if $mode=="none" and $gen!="none" then .sources=[]
+        elif $mode=="absent" then .sources=[]
+        elif $mode=="foreign" then .sources[0].runId="foreign"
+        elif $mode=="ambiguous" then .sources+=.sources
+        elif $mode=="partial" then .partial=true
+        elif $mode=="unknown-holds" then .holdsRead="unknown"
+        elif $mode=="unknown-lifecycle" then .lifecycleRead="unknown"
+        else . end'
+    }
+    local rc=0
+    fixture_crash_inspect "$UUID" 1 "$SEQ_DIR/cap2-inspection" || rc=$?
+    if [ "$mode" = absent ]; then
+      [ "$rc" = 2 ] && [ "$(wc -l < "$SEQ_DIR/cap2-inspect-generations")" = 2 ] || fail 'absence lacked both positive reads'
+    else
+      [ "$rc" = 0 ] || fail 'inspection refused unsafe/ambiguous evidence'
+      [ "$mode" != none ] || [ "$(wc -l < "$SEQ_DIR/cap2-inspect-generations")" = 2 ] || fail 'none fallback not observed'
+    fi
+    echo 'exact inspection landed'
+  }
+  for mode in valid none absent; do
+    custody_case "cap2 exact inspection $mode" pass 'exact inspection landed' cap2_inspection "$mode"
+  done
+  for mode in foreign ambiguous partial unknown-holds unknown-lifecycle; do
+    custody_case "cap2 inspection refuses $mode" fail 'inspection refused' cap2_inspection "$mode"
+  done
+
+  cap2_guarded_discard() {
+    local mode="$1" COMPOSE=(fake_cap2_discard)
+    local dir="$SEQ_DIR/cap2-discard"
+    mkdir -p "$dir"
+    echo '{"sources":[{"runId":"R","barePath":"/data/repos/own","branch":"agent/issue-7","attempt":"canonical","sources":[{"clonePath":"/data/runner/own"}]}]}' > "$dir/original"
+    echo original > "$dir/state"
+    [ "$mode" != vanished ] || echo gone > "$dir/state"
+    fixture_crash_inspect() {
+      [ "$(cat "$dir/state")" = original ] || return 2
+      jq --arg mode "$mode" '.sources[0] += {descriptor:("a"*64),generation:"none",
+        disposition:{kind:(if $mode=="protected" then "local_protected_discard" else "local_discard" end)}}' "$dir/original" > "$3"
+    }
+    fixture_crash_read() { local file="$1"; shift; "$@" > "$file"; }
+    fake_cap2_discard() {
+      [ "${13}:${15}:${17}:${19}" = "R:none:canonical:$(printf '%064d' 0 | tr 0 a)" ] || fail 'discard lost fresh descriptor/selector'
+      if [ "$mode" = protected ]; then [ "${20:-}" = --protected ] || fail 'protected flag missing';
+      else [ -z "${20:-}" ] || fail 'unexpected protected flag'; fi
+      echo gone > "$dir/state"
+      jq -nc --arg mode "$mode" '{ok:true,op:"discard",result:{kind:"done",metadata:"retired",
+        sources:[{clonePath:"/data/runner/own",outcome:"removed"}]}} |
+        if $mode=="wrong-path" then .result.sources[0].clonePath="/data/runner/foreign" else . end'
+    }
+    fixture_crash_snapshot() {
+      [ "$3" = absent ] && [ "$(cat "$dir/state")" = gone ] || fail 'missing physical source absence proof'
+      echo '{"absent":true}' > "$2"
+    }
+    cap2_crash_local_teardown R 1 "$dir/original" "$dir"
+    echo 'fresh exact local discard verified'
+  }
+  custody_case "cap2 source cannot disappear before guarded local discard" fail 'disappeared before guarded local discard' cap2_guarded_discard vanished
+  custody_case "cap2 local discard requires fresh exact descriptor and physical absence" pass 'fresh exact local discard verified' cap2_guarded_discard plain
+  custody_case "cap2 protected local discard adds explicit protected flag" pass 'fresh exact local discard verified' cap2_guarded_discard protected
+  custody_case "cap2 local discard rejects foreign sibling outcome" fail 'not acknowledged for exact original path' cap2_guarded_discard wrong-path
+
+  # Bound real external output before parsing, including overflow.
+  cap2_output_bound() {
+    if fixture_crash_read "$SEQ_DIR/cap2-bound" head -c "$1" /dev/zero; then echo accepted; else echo rejected; fi
+  }
+  custody_case "cap2 RPC accepts exact byte cap" pass accepted cap2_output_bound 4194304
+  custody_case "cap2 RPC rejects overflow before parsing" pass rejected cap2_output_bound 4194305
+
+  cap2_owner_teardown() {
+    local mode="$1" target=b4dec5cf-e6d4-413b-b3a8-0005a2835770 sibling=b4dec5cf-e6d4-413b-b3a8-0005a2835771
+    local foreign=b4dec5cf-e6d4-413b-b3a8-0005a2835772
+    jq -nc --arg run "$UUID" --arg a "$target" --arg b "$sibling" --arg foreign "$foreign" --arg mode "$mode" '
+      [{id:$a,run_id:$run,generation:1,state:"open",has_available_capture:true,captures:[{id:"archive",state:"available"}]},
+       {id:$b,run_id:$run,generation:2,state:"open",has_available_capture:false,captures:[]},
+       {id:$foreign,run_id:$foreign,generation:1,state:"open"}] |
+      if $mode=="missing-gen" then del(.[1].generation)
+      elif $mode=="omitted-generation" then del(.[1])
+      elif $mode=="wrong-run" then .[0].run_id=$foreign else . end' > "$SEQ_DIR/cap2-holds"
+    echo '{"archives":[{"id":"archive","state":"available","hold_id":"hold","checksum":"digest","byte_size":123,"expires_at":"future","prerequisites":{"base":"stable"}}]}' > "$SEQ_DIR/cap2-archives"
+    cp "$SEQ_DIR/cap2-archives" "$SEQ_DIR/cap2-archives-original"
+    : > "$SEQ_DIR/cap2-discards"
+    # The transport is fake; the real owner helper and jq validation run unchanged.
+    fixture_crash_read() { local file="$1"; shift; "$@" > "$file"; }
+    apiget() {
+      case "$1" in
+        "/api/runs/$UUID") jq -nc --arg run "$UUID" '{run:{id:$run,status:"failed"}}' ;;
+        "/api/runs/$UUID/archives") cat "$SEQ_DIR/cap2-archives" ;;
+        *) fail 'unexpected crash owner endpoint' ;;
+      esac
+    }
+    uzi_cli() {
+      if [ "$2" = recovery ]; then
+        [ "$mode" != malformed ] || { echo '{}'; return; }
+        if [ "$mode" = wrong-run ]; then jq '.[0:2]' "$SEQ_DIR/cap2-holds";
+        else jq --arg run "$UUID" '[.[]|select(.run_id==$run)]' "$SEQ_DIR/cap2-holds"; fi
+        return
+      fi
+      [ "$1:$2:$3:$4:$6:$7" = "run:discard:$UUID:--hold:--yes:--json" ] || fail 'unscoped crash discard'
+      [ "$5" = "$target" ] || [ "$5" = "$sibling" ] || fail 'foreign sibling touched'
+      echo "$5" >> "$SEQ_DIR/cap2-discards"
+      jq --arg id "$5" '(.[]|select(.id==$id)).state="discarded"' "$SEQ_DIR/cap2-holds" > "$SEQ_DIR/cap2-next"
+      mv "$SEQ_DIR/cap2-next" "$SEQ_DIR/cap2-holds"
+      [ "$mode" != archive-expiry ] || { jq '.archives[0].expires_at="changed"' "$SEQ_DIR/cap2-archives" > "$SEQ_DIR/cap2-next"; mv "$SEQ_DIR/cap2-next" "$SEQ_DIR/cap2-archives"; }
+      [ "$mode" != archive-prereqs ] || { jq '.archives[0].prerequisites.base="changed"' "$SEQ_DIR/cap2-archives" > "$SEQ_DIR/cap2-next"; mv "$SEQ_DIR/cap2-next" "$SEQ_DIR/cap2-archives"; }
+      jq -nc --arg run "$UUID" --arg id "$5" --arg mode "$mode" '
+        {run_id:$run,hold_id:$id,discarded:true} |
+        if $mode=="wrong-run-ack" then .run_id="foreign"
+        elif $mode=="wrong-hold-ack" then .hold_id="foreign"
+        elif $mode=="false-ack" then .discarded=false else . end'
+    }
+    discard_fixture_crash_owner_holds "$UUID" 2
+    [ "$(wc -l < "$SEQ_DIR/cap2-discards")" = 2 ] || fail 'missing generation discard'
+    jq -e --arg foreign "$foreign" '[.[]|select(.run_id==$foreign)]|length==1 and .[0].state=="open"' "$SEQ_DIR/cap2-holds" >/dev/null || fail 'foreign hold changed'
+    cmp "$SEQ_DIR/cap2-archives" "$SEQ_DIR/cap2-archives-original" || fail 'archive changed'
+    echo 'all generations disposed, archive and foreign sibling protected'
+  }
+  custody_case "cap2 explicit owner disposes available plus crash custody across generations" pass 'all generations disposed' cap2_owner_teardown valid
+  for mode in wrong-run missing-gen omitted-generation malformed; do
+    custody_case "cap2 owner teardown refuses $mode" fail 'identity missing/malformed' cap2_owner_teardown "$mode"
+  done
+  for mode in wrong-run-ack wrong-hold-ack false-ack; do
+    custody_case "cap2 owner teardown refuses $mode" fail 'not acknowledged' cap2_owner_teardown "$mode"
+  done
+  for mode in archive-expiry archive-prereqs; do
+    custody_case "cap2 owner teardown preserves $mode" fail 'changed an available archive' cap2_owner_teardown "$mode"
+  done
 }
-custody_case "cap2 kill recovery accepts same-claim capture without a park" pass 'cap2 capture verified' cap2_recovery_contract valid
-custody_case "cap2 kill recovery refuses an extra generation" fail 'recovery generation' cap2_recovery_contract extra-generation
-custody_case "cap2 kill recovery requires capture evidence" fail 'missing exact capture' cap2_recovery_contract missing-capture
+cap2_focused_regressions
 
 # The spent finalize allowance preserves recoverable work after #2426. Exercise
 # the phase's exact outcome assertions without a stack or timing dependency.
@@ -1259,7 +1471,8 @@ fixture_phase_boundary() {
     || fail 'completed outage case lost its evidence'
   echo 'own phase relieved capacity while completed outage evidence stayed open'
 }
-for phase in 42-api-outage-readoption 45-bounded-concurrency 52-api-outage-outbox; do
+# Phase 45 now has dynamic explicit crash-owner teardown, exercised above.
+for phase in 42-api-outage-readoption 52-api-outage-outbox; do
   custody_case "$phase resolves only its intentional fixture obligations" pass 'own phase relieved capacity' fixture_phase_boundary "$phase"
 done
 

@@ -13,7 +13,8 @@
 # PRD #1349 M7 — the dedicated custody-lifecycle regression. It reproduces the
 # 2026-09-14 GitLab-lane wedge that #1349 fixes and PROVES the fix keeps later claims
 # unblocked. The incident (GitHub Actions run 34813174866, sanitized): stub-failed code
-# runs plus phase 45's SIGKILL/reclaim left EIGHT open custody holds for one owner, and
+# runs plus the historical phase 45 SIGKILL/reclaim left EIGHT open custody holds
+# for one owner (phase 45 now explicitly disposes its own crash fixture holds), and
 # ClaimRun's owner-scoped custody-admission gate (the default custody_hold_limit, 8) then refused
 # every subsequent code-run claim for that owner — ten later phases timed out queued
 # against a healthy, idle, freshly-registered worker, and direct database mutation was
