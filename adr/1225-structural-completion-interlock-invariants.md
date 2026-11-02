@@ -365,6 +365,17 @@ dispositions, idle handling and #3139's stall attempt remain unchanged.
 - **Retention boundary.** The hold has no expiry and holds its lane and
   run-bound worker. Local retention is not a durable backup and does not
   establish a verified recovery copy, published checkpoint or custody release.
+- **Remediation guidance after resume (2026-11-02).** On the first work turn
+  of a resumed, iteration-park-capable invocation, both harnesses re-run the
+  existing secret gate over unpublished commits above its published-only
+  floors. A fully published range skips the secret scan. This uses the
+  invocation's resume flag, including attempt-path restores with no surviving
+  provider session, and also covers wall/pause resumes with unpublished work.
+  Only `remediate` supplies system guidance for the existing first turn;
+  `proceed` and `fail` are advisory here. No clean-state guarantee, extra turn,
+  persistent obligation or publication authority is created. The done gate,
+  checkpoint suppression and finalization scan remain authoritative. A new
+  invocation recomputes guidance after a crash before model evidence.
 
 Implementation evidence: `api/internal/workersvc/iteration_park.go`,
 `SetRunIterationPark` and `ResumePausedRun` in

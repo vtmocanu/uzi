@@ -3064,6 +3064,7 @@ export class SdkExecutor implements Executor {
       const iterationParkSupported = ctx.config?.iteration_park_version === 1 &&
         !!ctx.parkForIteration && !ctx.interactive &&
         ["issue", "mr_rework", "ci_fix", "task", "prompt", "self_improve"].some(kind => kind === ctx.kind);
+      let resumeSecretPreflightPending = iterationParkSupported && ctx.resumed === true;
       let iterationParked: ExecutorResult["iterationParked"];
       const parkIteration = async (iterationCount: number): Promise<boolean> => {
         // Only the latest authoritative zero admits a park. A historical positive
@@ -3337,6 +3338,20 @@ export class SdkExecutor implements Executor {
         // Issue #1800: fill the owner slot (only when empty) and decide who owns this turn. A system
         // text owns it outright: the owner follow-up is neither pulled nor rendered then and waits
         // in its slot for the next ordinary turn.
+        // A resumed invocation can have lost the previous turn's remediation text
+        // when iteration capture ended it. Re-derive guidance before its first work
+        // turn, including an attempt-path restore with no surviving provider session.
+        // Only remediate owns the prompt; the done/finalize gates remain authoritative.
+        if (resumeSecretPreflightPending && !state.tripReason) {
+          const decision = await ctx.secretRemediationGate?.({ unpublishedOnly: true });
+          resumeSecretPreflightPending = false;
+          this.throwIfTerminal(ctx);
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          throwIfDiskStop(ctx);
+          if (decision?.action === "remediate") followUp = decision.followUp;
+          // A switch/pause/wall arriving during the await still goes through the
+          // ordinary turn's interruption checks before any model event.
+        }
         const reworkForTurn = completionRework;
         completionRework = undefined;
         if (repeatingContract && reworkForTurn?.answered) drive.approvedContractSuperseded = true;

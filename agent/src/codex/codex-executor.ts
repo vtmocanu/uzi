@@ -4260,6 +4260,7 @@ export class CodexExecutor implements Executor {
       const iterationParkSupported = ctx.config?.iteration_park_version === 1 &&
         !!ctx.parkForIteration && !ctx.interactive &&
         ["issue", "mr_rework", "ci_fix", "task", "prompt", "self_improve"].some(kind => kind === ctx.kind);
+      let resumeSecretPreflightPending = iterationParkSupported && ctx.resumed === true;
       let iterationParked: ExecutorResult["iterationParked"];
       const parkIteration = async (iterationCount: number): Promise<boolean> => {
         // Require a fresh authoritative zero as well as the sticky prior-attempt
@@ -4481,6 +4482,15 @@ export class CodexExecutor implements Executor {
         // answer gets a neutral recheck turn because the old frozen scope may have changed.
         // Issue #1800: a system text (completion-rework, secret-remediation or clarification)
         // owns the turn outright, so the owner follow-up is neither pulled nor rendered on it.
+        // Re-derive lost remediation guidance on a resumed invocation, without
+        // requiring a surviving thread. The ordinary turn wrapper retains control
+        // precedence for interruptions that arrive during this advisory await.
+        if (resumeSecretPreflightPending && this.pendingInterruption(ctx, pauseNow, wall) === undefined) {
+          const decision = await ctx.secretRemediationGate?.({ unpublishedOnly: true });
+          resumeSecretPreflightPending = false;
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          if (decision?.action === "remediate") completionFollowUp = decision.followUp;
+        }
         let systemFollowUp = clarificationPrompt ?? completionFollowUp;
         if (repeatingContract && completionAnswered) approvedContractSuperseded = true;
         if (systemFollowUp !== undefined && completionAnswered && isIssueRun && ctx.completionInterlock && !ctx.interactive) {

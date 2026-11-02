@@ -15352,8 +15352,8 @@ export class RunRunner {
         });
       },
       // issue #1932 D2: the pre-exit secret remediation gate, serialized with the mid-turn tick.
-      secretRemediationGate: () =>
-        this.runGatedSink(flight, () => this.runSecretRemediationGate(flight, barePath, runnerClone)),
+      secretRemediationGate: (options) =>
+        this.runGatedSink(flight, () => this.runSecretRemediationGate(flight, barePath, runnerClone, options)),
       ...(claim.code_cross_check_required === true
         && isCodePublishingKind(claim.kind ?? "issue") ? {
         codeCrossCheckGate: async (completion: { interlocked: boolean; reportOnly?: boolean; repairAvailable?: boolean; notCode?: boolean; confirmedEmptyPrompt?: boolean }) => {
@@ -17678,9 +17678,10 @@ export class RunRunner {
     barePath: string,
     branch: string,
     expectedTip: string,
+    unpublishedOnly = false,
   ): Promise<
     | { trusted: true; range: CheckpointRange; findings: SecretFinding[]; floorCandidates: string[] }
-    | { trusted: false; why: string }
+    | { trusted: false; why: string; publishedOnly?: true }
   > {
     // PUBLISHED-ONLY floors: never a bare flight.checkpointFloor (it can be a local-only bridge that
     // contains a flagged commit). lastAttemptedCheckpointRefTip is an ambiguous publish and counts as
@@ -17697,6 +17698,9 @@ export class RunRunner {
       extraFloors: floorCandidates,
     });
     if (!range || range.tipSha !== expectedTip) return { trusted: false, why: "range_unresolved" };
+    if (unpublishedOnly && (range.tipSha === range.excludeSha || range.scanFloorShas?.includes(range.tipSha))) {
+      return { trusted: false, why: "published_only", publishedOnly: true };
+    }
     const scan = await this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() });
     if (!scan.trusted) return { trusted: false, why: scan.reason ?? "scan_untrusted" };
     return { trusted: true, range, findings: scan.findings, floorCandidates };
@@ -17785,6 +17789,7 @@ export class RunRunner {
     flight: RunFlight,
     barePath: string | undefined,
     runnerClone: RunnerClone,
+    options?: { unpublishedOnly: true },
   ): Promise<SecretRemediationDecision> {
     const { runLog, runId } = flight;
     const state = (flight.secretRemediation ??= { attempts: 0 });
@@ -17833,7 +17838,10 @@ export class RunRunner {
       if (fetched.kind !== "updated" || cloneTip === null || trackTip === null || cloneTip !== trackTip) {
         return await failOrProceed("tracking_tip_stale");
       }
-      const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip);
+      const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip, options?.unpublishedOnly);
+      // An advisory first-turn check must neither scan published history nor clear
+      // prior findings when there is no unpublished range to inspect.
+      if (!scanned.trusted && scanned.publishedOnly) return { action: "proceed" };
       if (!scanned.trusted) return await failOrProceed(scanned.why, cloneTip);
       const { range, floorCandidates } = scanned;
       let findings = scanned.findings;

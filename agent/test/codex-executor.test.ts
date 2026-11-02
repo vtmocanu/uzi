@@ -17349,6 +17349,99 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
       .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
   const REMEDIATE = "REMEDIATE-SECRET-MARKER: rewrite the flagged commit";
 
+  for (const resumed of [false, true]) {
+    it(`Codex preflight requires resume and park capability; resumed=${resumed}`, async () => {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(81, th, tn)]])]);
+      let preflights = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", resumed,
+        config: { max_iterations: 1, ...(resumed ? {} : { iteration_park_version: 1 }) },
+        parkForIteration: async () => "parked",
+        secretRemediationGate: async options => { if (options) preflights++; return { action: "proceed" }; },
+      });
+      await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      assert.equal(preflights, 0);
+    });
+  }
+
+  it("Codex preflight is regenerated after a crash before first model evidence", async () => {
+    let checks = 0;
+    for (const crash of [true, false]) {
+      const rig = makeMultiEpochRig([script("th-1", [() => [agentMessage("work")]])]);
+      const { ctx } = makeCtx({
+        kind: "issue", resumed: true, sessionId: null,
+        config: { max_iterations: 1, iteration_park_version: 1 },
+        reportIteration: async () => ({ completionAttempts: 0 }), parkForIteration: async () => "parked",
+        secretRemediationGate: async () => {
+          checks++;
+          if (crash) throw new Error("simulated crash before model evidence");
+          return { action: "remediate", followUp: REMEDIATE };
+        },
+      });
+      if (crash) {
+        await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), /simulated crash/);
+        assert.equal(rig.epochs.flatMap(epoch => turnTexts(epoch.transport)).length, 0);
+      } else {
+        await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        assert.ok(rig.epochs.flatMap(epoch => turnTexts(epoch.transport))[0]!.includes(REMEDIATE));
+      }
+    }
+    assert.equal(checks, 2);
+  });
+
+  for (const control of ["cancel", "wall"] as const) {
+    it(`Codex preflight preserves ${control} arriving during its await`, async () => {
+      const rig = makeMultiEpochRig([script("th-1", [() => [agentMessage("work")]])]);
+      const abort = new AbortController();
+      let mode: "wall" | null = null;
+      const { ctx } = makeCtx({
+        kind: "issue", resumed: true, signal: abort.signal,
+        config: { max_iterations: 1, iteration_park_version: 1 },
+        parkForIteration: async () => "parked", parkForWall: async () => "parked",
+        pauseModeRequested: () => mode,
+        secretRemediationGate: async () => {
+          if (control === "wall") mode = "wall";
+          abort.abort(control === "wall" ? new PauseNowSignal() : new Error("cancel"));
+          return { action: "remediate", followUp: REMEDIATE };
+        },
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (control === "cancel") await assert.rejects(running, /cancel/i);
+      else assert.ok((await running).walled);
+      assert.equal(rig.epochs.flatMap(epoch => turnTexts(epoch.transport)).length, 0);
+    });
+  }
+
+  for (const sessionId of ["th-1", null]) {
+    for (const action of ["remediate", "proceed", "fail"] as const) {
+      it(`Codex preflight session=${sessionId} action=${action} owns only the first work turn`, async () => {
+        const rig = makeMultiEpochRig([script("th-1", [() => [agentMessage("work")]])]);
+        let checks = 0;
+        let ownerPulls = 0;
+        const { ctx } = makeCtx({
+          kind: "issue", resumed: true, sessionId,
+          config: { max_iterations: 2, iteration_park_version: 1 },
+          reportIteration: async () => ({ completionAttempts: 0 }),
+          parkForIteration: async () => "parked",
+          pullFollowUps: () => { ownerPulls++; return []; },
+          secretRemediationGate: async options => {
+            checks++;
+            assert.deepEqual(options, { unpublishedOnly: true });
+            return action === "remediate" ? { action, followUp: REMEDIATE } : { action };
+          },
+        });
+        const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        const texts = rig.epochs.flatMap(epoch => turnTexts(epoch.transport));
+        assert.equal(checks, 1);
+        assert.equal(texts.length, 2, "preflight adds no model turn");
+        assert.equal(texts[0]!.includes(REMEDIATE), action === "remediate");
+        assert.equal(texts[1]!.includes(REMEDIATE), false);
+        if (action === "remediate") assert.equal(ownerPulls, 1);
+        assert.deepEqual(result.iterationParked, { outcome: "parked" });
+      });
+    }
+  }
+
   for (const interlocked of [false, true]) {
     it(`code repair recreates epoch with persisted session before both done paths: ${interlocked}`, async () => {
       const rig = makeMultiEpochRig([

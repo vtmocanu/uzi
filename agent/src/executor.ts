@@ -572,8 +572,12 @@ export interface RunContext {
    * commit, then it gates again on the next done; `fail` exits WITHOUT the done checkpoint so the
    * flagged commit is never published, and the runner reports `push_secret_blocked` at finalize.
    * Absent on the stub/test executors (treated as `proceed`).
+   * An iteration-park-capable resumed invocation may also call with unpublishedOnly
+   * before its first work turn to regenerate lost guidance. That advisory call skips
+   * fully published ranges; only remediate changes the prompt, never the turn budget
+   * or the authority of the done/checkpoint/finalize guards.
    */
-  secretRemediationGate?(): Promise<SecretRemediationDecision>;
+  secretRemediationGate?(options?: { unpublishedOnly: true }): Promise<SecretRemediationDecision>;
   /** Advisory code gate at a finalizing done exit; permits one repair pass. `repairAvailable: false` means no
    *  implementation iteration remains: the gate must not start a repair (findings stay unreported) and never
    *  extends the iteration budget. Absent is treated as available. */
