@@ -13,6 +13,10 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+it.each(ids)("iteration-hold fixture %s has authoritative zero completion attempts", (id) => {
+  expect(getRun(id)).toMatchObject({ hold_reason: "iteration_budget_exhausted", completion_attempts: 0 });
+});
+
 it("iteration mock Resume refuses spent wall before mutation; Extend leaves it paused until explicit Resume", async () => {
   vi.useFakeTimers();
   const id = "run-iteration-spent";

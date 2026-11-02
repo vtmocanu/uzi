@@ -135,6 +135,10 @@ func (s *Service) ReportIterationPark(ctx context.Context, w store.Worker, id uu
 	if err := tx.Commit(ctx); err != nil {
 		return run, false, "", err
 	}
+	if s.bcast != nil {
+		s.bcast.PublishState(id, run.Status)
+	}
+	s.notify(id, run.Status)
 	return run, true, "", nil
 }
 

@@ -1655,17 +1655,27 @@ export class SteeringChannel {
     this.shutdownStop.abort();
   }
 
-  /** One read-only observation for a refused capture disposition. The poller retains
-   * ACK/routing ownership; only an explicit cancel in a current receipt-mode reply
-   * becomes sticky. The caller supplies the existing capture signal, with no retry. */
+  /** One bounded input observation for a refused capture disposition. Receipt-mode
+   * reads keep ACK/routing ownership with the poller and verify cancellation ownership.
+   * Legacy GET already consumed its rows, so route them here with the normal dedupe.
+   * The caller supplies the existing capture signal; this adds no retry loop. */
   async observePendingCancellation(signal: AbortSignal): Promise<void> {
     if (!Number.isSafeInteger(this.claimGeneration) || this.claimGeneration <= 0 ||
         this.fence !== undefined || this.terminalLifecycle.signal.aborted) return;
     const reply = await this.client.getInputs(this.runId, this.claimGeneration, signal, 64 * 1024);
     signal.throwIfAborted();
     if (this.fence !== undefined || this.terminalLifecycle.signal.aborted || reply.staleObservation ||
-        !reply.receipts || reply.terminalCancelled ||
-        !validBatch(reply.inputs)) return;
+        reply.terminalCancelled || !validBatch(reply.inputs)) return;
+    if (!reply.receipts) {
+      // Legacy GET already consumed this batch. Preserve its normal FIFO routing
+      // and metadata; it has no receipt ACK/APPLIED phase to replay it later.
+      for (const input of reply.inputs) {
+        if (this.routedIds.has(input.id)) continue;
+        this.routedIds.add(input.id);
+        this.route(input.kind, input.body ?? undefined, input.id, false, input.created_at, parseGateBinding(input));
+      }
+      return;
+    }
     if (!reply.inputs.some(input => input.kind === "cancel")) return;
     // Receipt-mode GET is read-only and does not fence its generation. Recheck the
     // existing ownership seam after reading; generation is monotonic, and reports

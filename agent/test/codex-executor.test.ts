@@ -26584,15 +26584,15 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
     assert.match(r.prompts[1]!, /Use the existing endpoint/);
   });
 
-  it("M3 park Resume new invocation genuine work then repeat park needs another Resume", async () => {
+  it("M3 fresh executor invocations do finite genuine work and park again", async () => {
     const io = await import("node:fs/promises");
     const root = await io.mkdtemp(path.join(process.cwd(), "../.uzi/scratch/m3-resume-"));
     const file = path.join(root, "work.txt");
     let fingerprint = 0;
-    let resumes = 0, parks = 0;
+    let parks = 0;
     try {
+      // Each drive is a fresh invocation; service/HTTP Resume is covered in M4.
       for (let flight = 0; flight < 3; flight++) {
-        if (flight) resumes++; // runner/server Resume is M4; each call is a fresh executor invocation.
         const before = fingerprint;
         const r = await drive((c, th, tn) => {
           writeFileSync(file, String(++fingerprint));
@@ -26601,10 +26601,10 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
           worktreeFingerprint: async () => io.readFile(file, "utf8").catch(() => "unstarted"),
           parkForIteration: async at => { parks++; assert.deepEqual(at, { iterationCount: 2, maxIterations: 2 }); return "parked"; } });
         m3AssertPark(r, "parked");
-        assert.equal(r.calls(), 2, "each explicit Resume gets genuine finite work, then stops");
+        assert.equal(r.calls(), 2, "each fresh invocation gets genuine finite work, then stops");
         assert.ok(fingerprint > before, "real worktree activity prevents idle-stall masking");
       }
-      assert.equal(resumes, 2); assert.equal(parks, 3);
+      assert.equal(parks, 3);
     } finally { await io.rm(root, { recursive: true, force: true }); }
   });
 

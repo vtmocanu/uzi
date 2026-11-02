@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -804,5 +805,91 @@ func TestWorkerIterationCancelReportLiveDB(t *testing.T) {
 	if err != nil || after.Status != "cancelled" || after.FailOrigin.Valid || after.ClaimReleasedAt.Valid ||
 		after.ClaimGeneration != before.ClaimGeneration || after.SessionID != before.SessionID || after.WorkerID != before.WorkerID {
 		t.Fatalf("owner cancel did not win without releasing the retained claim: %+v %v", after, err)
+	}
+}
+
+// Other broadcaster calls remain loud through the embedded interface.
+type iterationParkNoticeRecorder struct {
+	workersvc.Broadcaster
+	t      *testing.T
+	q      *store.Queries
+	events []string
+}
+
+func (r *iterationParkNoticeRecorder) record(kind string, id uuid.UUID, status string) {
+	r.t.Helper()
+	persisted, err := r.q.GetRunByID(context.Background(), id)
+	if err != nil || persisted.Status != status || status != "paused" {
+		r.t.Errorf("notification before committed pause: kind=%s status=%s persisted=%s err=%v", kind, status, persisted.Status, err)
+	}
+	r.events = append(r.events, kind)
+}
+func (r *iterationParkNoticeRecorder) PublishState(id uuid.UUID, status string) {
+	r.record("broadcast", id, status)
+}
+func (r *iterationParkNoticeRecorder) Notify(id uuid.UUID, status string) {
+	r.record("lifecycle", id, status)
+}
+
+func TestWorkerIterationParkNotificationsLiveDB(t *testing.T) {
+	for _, scenario := range []string{"new_and_replay", "refused", "commit_failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := iterationRoutes(t)
+			id := f.run(t, "prompt")
+			recorder := &iterationParkNoticeRecorder{t: t, q: f.q}
+			commitFailure := errors.New("injected iteration commit failure")
+			commits, expectedBeforeCommit := 0, 0
+			svc := workersvc.New(f.q, newHandlerTestBox(t), workersvc.Params{RunMaxIterations: 5, RunTimeout: time.Hour})
+			svc.SetTxBeginner(pauseTestBeginner{pool: f.pool, beforeCommit: func() error {
+				commits++
+				if len(recorder.events) != expectedBeforeCommit {
+					t.Errorf("notification escaped before commit: %v", recorder.events)
+				}
+				if scenario == "commit_failure" {
+					return commitFailure
+				}
+				return nil
+			}})
+			svc.SetBroadcaster(recorder)
+			svc.SetLifecycle(recorder)
+			f.router = (&Handler{q: f.q, wsvc: svc}).WorkerRoutes(mw.NewLimiter(10000, time.Minute, nil))
+			if scenario == "refused" {
+				f.exec(t, "UPDATE runs SET completion_attempts=1 WHERE id=$1", id)
+			}
+			reply := f.call(id, "iteration-park", iterationParkBody, f.worker)
+			if scenario != "new_and_replay" {
+				if scenario == "refused" {
+					assertIterationAck(t, reply, http.StatusConflict, "prior_attempt")
+				} else if reply.Code != http.StatusInternalServerError || commits != 1 {
+					t.Fatalf("commit failure: code=%d commits=%d body=%s", reply.Code, commits, reply.Body.String())
+				}
+				if len(recorder.events) != 0 {
+					t.Fatalf("uncommitted/refused transition notified: %v", recorder.events)
+				}
+				persisted, err := f.q.GetRunByID(context.Background(), id)
+				if err != nil || persisted.Status != "running" {
+					t.Fatalf("refusal/failure changed status: %s %v", persisted.Status, err)
+				}
+				return
+			}
+			assertIterationAck(t, reply, http.StatusOK, "")
+			checkExactlyOnce := func() {
+				t.Helper()
+				counts := map[string]int{}
+				for _, kind := range recorder.events {
+					counts[kind]++
+				}
+				if !reflect.DeepEqual(counts, map[string]int{"broadcast": 1, "lifecycle": 1}) {
+					t.Errorf("new transition must notify exactly once per sink: %v", counts)
+				}
+			}
+			checkExactlyOnce()
+			expectedBeforeCommit = len(recorder.events)
+			assertIterationAck(t, f.call(id, "iteration-park", iterationParkBody, f.worker), http.StatusOK, "")
+			checkExactlyOnce()
+			if commits != 2 {
+				t.Fatalf("new and replay must each commit: %d", commits)
+			}
+		})
 	}
 }
