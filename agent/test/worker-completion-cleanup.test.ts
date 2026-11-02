@@ -428,7 +428,7 @@ it("completed generation finalize must retire after receipt cleanup", async () =
     assert.equal(await current.runner.recoveryInventoryPending(f.runId, f.generation + 1), true,
       "receipt success is scoped to the exact generation");
     await (current.runner as unknown as { retireFinalizeRecord(flight: unknown, site: string): Promise<void> })
-      .retireFinalizeRecord({ runId: f.runId, claimGeneration: f.generation }, "completion-cleanup-regression");
+      .retireFinalizeRecord({ runId: f.runId, claimGeneration: f.generation, iterationParkState: "none" as const }, "completion-cleanup-regression");
     assert.deepEqual(await outbox.listPendingFinalizes(), [], "completed generation finalize must retire after receipt cleanup");
     assert.equal(f.rpc(), 0, "completion cleanup and finalize retirement require no custody RPC");
   } finally { await f.close(); }
@@ -793,7 +793,7 @@ for (const layout of ["scratch", "attempt-parent"] as const) for (const count of
         assert.equal(f.cmd(f.bare, ["rev-parse", pin]), f.head);
         assert.equal(await current.runner.recoveryInventoryPending(f.runId, f.generation), false);
         await (current.runner as unknown as { retireFinalizeRecord(flight: unknown, site: string): Promise<void> })
-          .retireFinalizeRecord({ runId: f.runId, claimGeneration: f.generation }, "completion-predecessor-regression");
+          .retireFinalizeRecord({ runId: f.runId, claimGeneration: f.generation, iterationParkState: "none" as const }, "completion-predecessor-regression");
         assert.deepEqual(await outbox.listPendingFinalizes(), []);
         assert.deepEqual(await fs.readFile(path.join(f.bare, "config")), config);
         assert.deepEqual(await fs.readFile(f.journal), receiptBytes);

@@ -92,6 +92,7 @@ async function fixture(kind: RunKind = "issue", mode: "journal" | "none" | "rese
     "completion-worker-fixture", { recovery, outbox });
   const body: StateRequest = { ...wire.request, branch };
   const flight = {
+    iterationParkState: "none" as const,
     runId: receipt.run_id, claimGeneration: 1, inventoryGuarded: guarded, runKind: kind,
     terminalResolved: false, completionSendAttempted: false, successfulPushedSha: literal.final_head,
     batcher: { currentSeq: () => 7, close: async () => {}, awaitPermanentFailureSettled: async () => {}, emit: () => events.push("failed-feed") },
