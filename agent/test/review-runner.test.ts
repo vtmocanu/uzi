@@ -800,3 +800,57 @@ it("stale initial subscription review releases its operation scope and active re
   } finally { next.close(); }
   assert.equal(retained, 0);
 });
+
+
+import * as r1fs from "node:fs/promises";
+import * as r1os from "node:os";
+import * as r1path from "node:path";
+import { makeScratchRoot } from "./fixture-repo.js";
+
+const r1Modes = ["empty", "other-policy", "other-unknown", "same-policy", "same-unknown"] as const;
+async function r1DisabledStore(mode: typeof r1Modes[number]) {
+  const root = makeScratchRoot("r1-producer-", await r1fs.realpath(r1os.tmpdir()));
+  const storeRoot = r1path.join(root, "outbox");
+  const options = { root: storeRoot, log: nullLogger(), runMaxBytes: mode.endsWith("unknown") ? 1 : 1e6,
+    maxBytes: mode.endsWith("unknown") ? 1 : 1e6, retentionMs: 86400000 };
+  await new Outbox(options).init();
+  await r1fs.writeFile(r1path.join(storeRoot, ".key"), "invalid");
+  const outbox = new Outbox(options);
+  await outbox.init();
+  assert.equal(outbox.isDisabled(), true);
+  assert.deepEqual(outbox.listPendingTerminals(), [], "construct the runner with an empty disabled store");
+  return { root, outbox };
+}
+async function r1LateEvidence(outbox: Outbox, mode: typeof r1Modes[number], current: string) {
+  if (mode === "empty") return;
+  const result = await outbox.journalPolicyHold(mode.startsWith("same") ? current : "cccccccc-cccc-4ccc-8ccc-cccccccccccc", {
+    outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", source_generation: 1, claim_generation: 1,
+    detail: "refused", continuation_mode: "same_conversation", published: false,
+    tag: "cyberPolicy", phase: "implementation", correlation_id: "pr-" + "a".repeat(32) + "-1",
+  });
+  assert.equal(result.journaled, false);
+  assert.equal(outbox.listPendingTerminals()[0]?.outcome_kind, mode.endsWith("unknown") ? "unknown" : "policy_hold");
+}
+
+for (const mode of r1Modes) it("R1 disabled review-runner cached empty then " + mode, async () => {
+  const { root, outbox } = await r1DisabledStore(mode);
+  const current = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const expected = mode.startsWith("same") ? 0 : 1;
+  try {
+
+  const { client, calls } = journalingClient(false);
+  let sends = 0;
+  client.reportState = async (_id, body) => {
+    if (body.status === "completed" || body.status === "failed") sends++;
+    return { applied: true, status: body.status };
+  };
+  const { git } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");
+  const actual = new ReviewRunner(client, git, nullLogger(), { homeRoot: PASS_HOME_ROOT,
+    queryFn: replyingQueryFn(goodModelJson), outbox, outboxTerminalMaxBytes: 1 << 20, gapFillMax: 100 });
+  await r1LateEvidence(outbox, mode, current);
+  await actual.execute(reviewClaim({ run_id: current, claim_generation: 8 }));
+  assert.equal(calls.reviewPosts, 1, "the actual reviewer posted its result");
+  assert.equal(sends, expected, "actual review terminal HTTP calls");
+
+  } finally { await r1fs.rm(root, { recursive: true, force: true }); }
+});

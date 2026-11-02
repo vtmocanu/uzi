@@ -148,7 +148,7 @@ for (const unavailable of ["unreadable", "key_unavailable"] as const) {
   });
 }
 
-it("unit 1: malformed selected winner falls back to the caller body and retains invalid bytes", async () => {
+it("unit 1: malformed selected winner defers unjournaled fallback and retains invalid bytes", async () => {
   const { outbox, root } = await mkOutbox();
   await outbox.journalTerminal("r1", 7, "running", 1, { status: "completed", branch: "agent/original" });
   const file = path.join(root, "r1", "terminal-7.json");
@@ -157,8 +157,9 @@ it("unit 1: malformed selected winner falls back to the caller body and retains 
   client.features.add("terminal_fence");
   const { send, bodies } = scriptedSend([{ applied: true, status: "failed" }]);
   await journalAndResolveTerminal(depsFor(outbox, client), { runId: "r1", claimGeneration: 7, phase: "running", messagesThroughSeq: 42, body: { status: "failed" }, send });
-  assert.deepEqual(bodies, [{ status: "failed", messages_through_seq: 42 }]);
+  assert.deepEqual(bodies, []);
   assert.equal(outbox.hasPendingTerminal("r1", 7), false);
+  assert.equal(await outbox.hasPendingPolicyOutcome("r1"), true);
   assert.equal(await fs.readFile(file, "utf8"), "{");
 });
 

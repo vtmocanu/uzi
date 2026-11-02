@@ -45,11 +45,51 @@ func TestWorkerRegisterAdvertisesHeartbeatOutboxFeature(t *testing.T) {
 	if !has("heartbeat_outbox") {
 		t.Fatalf("protocol_features = %v, must contain heartbeat_outbox (the M2 agent gates its heartbeat outbox field on it)", resp.ProtocolFeatures)
 	}
+	if !has("heartbeat_outbox_root_unusable") {
+		t.Fatal("root diagnostic feature not advertised")
+	}
 	// `claim_generation_fence` (#1247) and now `terminal_fence` (#1391 Run B M3c) are both
 	// advertised — the api implements each fence, so a fence-capable worker may send the field.
 	for _, required := range []string{"claim_generation_fence", "terminal_fence"} {
 		if !has(required) {
 			t.Fatalf("protocol_features = %v, must contain %q (its server-side fence has landed)", resp.ProtocolFeatures, required)
+		}
+	}
+}
+
+func TestWorkerHeartbeatRootDiagnosticIsIndependentAndClears(t *testing.T) {
+	h := newProtocolHandler(t, &protocolStore{})
+	for _, tc := range []struct{ body, want string }{
+		{`{"outbox_root_unusable":"symlink"}`, "symlink"},
+		{`{"outbox_root_unusable":"unreadable"}`, "unreadable"},
+		{`{"outbox_root_unusable":"arbitrary"}`, ""},
+		{`{"outbox_root_unusable":"symlink"}`, "symlink"},
+		{`{"outbox_root_unusable":null}`, ""},
+		{`{"outbox_root_unusable":"symlink"}`, "symlink"},
+		{`{}`, ""},
+		{`{"outbox_root_unusable":{}}`, ""},
+	} {
+		rec := httptest.NewRecorder()
+		h.WorkerHeartbeat(rec, workerReq(http.MethodPost, tc.body, uuid.Nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			Worker struct {
+				Root    *string `json:"outbox_root_unusable"`
+				Blocked *string `json:"outbox_blocked"`
+				Pending *int    `json:"outbox_pending_messages"`
+			} `json:"worker"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		got := ""
+		if resp.Worker.Root != nil {
+			got = *resp.Worker.Root
+		}
+		if got != tc.want || resp.Worker.Blocked != nil || resp.Worker.Pending != nil {
+			t.Fatalf("input %s: root=%q, blocked=%v pending=%v", tc.body, got, resp.Worker.Blocked, resp.Worker.Pending)
 		}
 	}
 }
