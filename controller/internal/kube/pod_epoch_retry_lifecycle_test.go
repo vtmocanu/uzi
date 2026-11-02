@@ -241,7 +241,7 @@ func TestPodEpochRetryFrozenResolverAndFallback(t *testing.T) {
 	}
 }
 
-func TestPodEpochRetryIdentityUnverifiedOnce(t *testing.T) {
+func TestPodEpochRetryIdentityUnverifiedLaterEvent(t *testing.T) {
 	h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 	h.session.resolver = nil
 	d := h.event(watch.Added, epochPod(epochB))
@@ -253,8 +253,12 @@ func TestPodEpochRetryIdentityUnverifiedOnce(t *testing.T) {
 	if !apierrors.IsConflict(h.session.Deliver(context.Background(), d)) || *n != 1 {
 		t.Fatal("initial negative not delivered once")
 	}
-	if h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://")) != nil || h.session.Deliver(context.Background(), d) == nil || *n != 1 {
-		t.Fatal("tainted negative retried")
+	retry := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
+	if retry == nil || retry.Document() != d.Document() || h.session.Deliver(context.Background(), d) == nil || *n != 1 {
+		t.Fatal("frozen negative missing or old decision resubmitted")
+	}
+	if !apierrors.IsConflict(h.session.Deliver(context.Background(), retry)) || *n != 2 {
+		t.Fatal("later negative did not retry")
 	}
 }
 

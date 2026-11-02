@@ -911,6 +911,8 @@ export interface LatestRun {
   // the issue #3181 token-switch holds ('credential_switch_settling' / 'credential_switch_unsettled')
   // so they read "settling: token switch" / "held: token switch".
   // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
+  // 'iteration_budget_exhausted' is a nonterminal owner hold: "Iteration limit reached".
+  // Resume grants a fresh finite allowance; Extend adds wall time without resuming; Cancel ends it.
   // Optional for api/web rollout skew: an absent key reads as no hold.
   hold_reason?: string | null;
   owner_name: string;
@@ -3870,6 +3872,9 @@ export interface Run {
    *  Issue #3194: 'base_attestation_missing' for a --require-base run that adopted retained work no
    *  checkpoint attests to the planned base (issue #3194; the agent was not started, nothing
    *  automatic leaves the hold, Resume and extend are refused; recover or start a successor).
+   *  'iteration_budget_exhausted' is a nonterminal iteration hold: owner Resume or Cancel,
+   *  never completed-scope Stop. Extend wall time first only when remaining wall is spent;
+   *  Extend leaves it paused, and credential changes never retry it automatically.
    *  Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and

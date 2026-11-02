@@ -174,6 +174,7 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 	cfg := ClaimConfig{
 		RunTimeoutSeconds:      wall,
 		IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
+		IterationParkVersion:   1,
 		MaxIterations:          s.p.RunMaxIterations,
 		PlanMaxRevisions:       s.p.PlanMaxRevisions,
 		QuestionMax:            s.p.QuestionMax,

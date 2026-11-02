@@ -521,6 +521,7 @@ describe("the held decision follows the durable first winner", () => {
     assert.equal((await outbox.journalTerminal(claim.run_id, 53, "finalize", 0, { status: "completed", claim_generation: 53 })).journaled, true);
     const prepared: Array<unknown> = [];
     const flight = {
+      iterationParkState: "none" as const,
       runId: claim.run_id, claimGeneration: 53, batcher: { currentSeq: () => 0 },
       steering: { claimFence: () => undefined }, runLog: { info() {}, warn() {}, error() {} },
       completionSendAttempted: false, terminalResolved: false,

@@ -2174,3 +2174,154 @@ describe("SteeringChannel — plan-gate receipts, round 3 (issue #1604)", () => 
       assert.ok(ids.every((id) => revises.has(id)) || ids.every((id) => !revises.has(id)), `a mixed batch: ${JSON.stringify(appliedCalls)}`);
   });
 });
+
+
+describe("iteration capture pending-cancellation observation", () => {
+  it("routes a consumed legacy batch FIFO and preserves cancel without ACK or APPLIED", async t => {
+    const first = { ...inp("follow_up", "first"), created_at: "2026-11-01T00:00:00Z" };
+    const cancelRow = inp("cancel");
+    let unread = [first, cancelRow];
+    let cancellations = 0;
+    const legacy = {
+      getInputs: async () => { const inputs = unread; unread = []; return { inputs }; },
+      ackInputs: async () => assert.fail("legacy observation must not ACK"),
+      applyInputs: async () => assert.fail("legacy observation must not mark APPLIED"),
+      getRunOwnership: async () => assert.fail("legacy routing uses its existing consume-on-read contract"),
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(legacy, "run-1", 1, nullLogger(), new AbortController(), {
+      claimGeneration: 3, onCancel: () => { cancellations++; },
+    });
+    const route = t.mock.method(ch as unknown as { route(...args: unknown[]): void }, "route");
+    await ch.observePendingCancellation(new AbortController().signal);
+    assert.equal(unread.length, 0, "the server already consumed this batch");
+    assert.deepEqual(ch.pullFollowUp(), { id: first.id, body: "first" });
+    assert.equal(ch.pullFollowUp(), undefined);
+    assert.equal(ch.isCancelled(), true);
+    assert.equal(cancellations, 1);
+    assert.deepEqual(route.mock.calls.map(c => c.arguments.slice(0, 4)), [
+      ["follow_up", "first", first.id, false], ["cancel", undefined, cancelRow.id, false],
+    ]);
+    assert.equal(route.mock.calls[0]!.arguments[4], first.created_at);
+  });
+
+  it("deduplicates repeated legacy rows and keeps follow-up order", async () => {
+    const first = inp("follow_up", "first"), second = inp("follow_up", "second");
+    let gets = 0;
+    const legacy = {
+      getInputs: async () => ({ inputs: ++gets === 1 ? [first] : [first, second] }),
+      ackInputs: async () => assert.fail("legacy observation must not ACK"),
+      applyInputs: async () => assert.fail("legacy observation must not mark APPLIED"),
+    } as unknown as WorkerClient;
+    const ch = new SteeringChannel(legacy, "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: 3 });
+    const signal = new AbortController().signal;
+    await ch.observePendingCancellation(signal);
+    await ch.observePendingCancellation(signal);
+    assert.equal(gets, 2);
+    assert.deepEqual(ch.pullFollowUp(), { id: first.id, body: "first" });
+    assert.deepEqual(ch.pullFollowUp(), { id: second.id, body: "second" });
+    assert.equal(ch.pullFollowUp(), undefined);
+  });
+
+  for (const owner of ["current", "new_generation", "released"] as const) {
+    it(`keeps receipt-mode ownership verification for ${owner}`, async () => {
+      let ownershipReads = 0, cancellations = 0;
+      const client = {
+        getInputs: async () => ({ receipts: true, inputs: [inp("cancel")] }),
+        getRunOwnership: async () => { ownershipReads++; return {
+          status: "running", claim_generation: owner === "new_generation" ? 4 : 3,
+          claim_released: owner === "released",
+        }; },
+        ackInputs: async () => assert.fail("read-only receipt observation must not ACK"),
+        applyInputs: async () => assert.fail("read-only receipt observation must not mark APPLIED"),
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), {
+        claimGeneration: 3, onCancel: () => { cancellations++; },
+      });
+      await ch.observePendingCancellation(new AbortController().signal);
+      assert.equal(ownershipReads, 1);
+      assert.equal(ch.isCancelled(), owner === "current");
+      assert.equal(cancellations, 0, "receipt observation leaves reporting/abort ownership with the capture join");
+    });
+  }
+
+  for (const kind of ["stale", "invalid", "ended", "fenced"] as const) {
+    it(`does not route a ${kind} observation`, async () => {
+      const row = inp("cancel");
+      const client = {
+        getInputs: async () => ({ inputs: kind === "invalid" ? [{ ...row, id: -1 }] : [row], staleObservation: kind === "stale" }),
+        getRunOwnership: async () => assert.fail("invalid observation must not read ownership"),
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: 3 });
+      if (kind === "ended") ch.abortLifecycle(new Error("fixture lifecycle ended"));
+      if (kind === "fenced") {
+        (ch as unknown as { endFencedFlight(reason: string): void }).endFencedFlight("terminal_cancelled");
+        assert.equal(ch.claimFence(), "terminal_cancelled");
+      }
+      await ch.observePendingCancellation(new AbortController().signal);
+      assert.equal(ch.isCancelled(), false);
+    });
+  }
+});
+
+// issue #3780: the read-only authority the runner's tracking-repair admission predicate reads.
+describe("issue #3780 ownershipRepairAuthority", () => {
+  const fresh = (): SteeringChannel => new SteeringChannel(fakeClient([]), "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: 7 });
+  type Private = { failReceipts(err: Error): void; endFencedFlight(reason: string): void };
+
+  it("is true on a fresh channel and after a cooperative PauseNow (terminal=false)", () => {
+    const ch = fresh();
+    assert.equal(ch.ownershipRepairAuthority(), true);
+    ch.abortLifecycle(new PauseNowSignal(), false);
+    assert.equal(ch.ownershipRepairAuthority(), true);
+    ch.rearmLifecycle();
+    assert.equal(ch.ownershipRepairAuthority(), true);
+  });
+
+  it("is false after a credential-switch delivery and after its give-up", () => {
+    const ch = fresh();
+    ch.tripCredentialSwitch(7);
+    assert.equal(ch.ownershipRepairAuthority(), false);
+    ch.rearmCredentialSwitch();
+    assert.equal(ch.ownershipRepairAuthority(), false, "a give-up leaves the shutdown stop aborted");
+  });
+
+  it("is false for a credential switch deferred in a defer window, which aborts only the shutdown stop", () => {
+    const ch = fresh();
+    ch.beginCredentialSwitchDefer();
+    ch.tripCredentialSwitch(7);
+    // Every other condition still holds, so only the shutdown stop revokes the authority.
+    assert.equal(ch.pendingCredentialSwitch(), undefined, "the switch is deferred, not pending");
+    assert.equal(ch.lifecycleSignal().aborted, false, "the lifecycle was not aborted");
+    assert.equal(ch.isCancelled(), false);
+    assert.equal(ch.ownershipRepairAuthority(), false);
+  });
+
+  it("is false after a terminal abort, also when it follows a cooperative pause", () => {
+    const direct = fresh();
+    direct.abortLifecycle(new Error("x"));
+    assert.equal(direct.ownershipRepairAuthority(), false);
+    const afterPause = fresh();
+    afterPause.abortLifecycle(new PauseNowSignal(), false);
+    assert.equal(afterPause.ownershipRepairAuthority(), true);
+    afterPause.abortLifecycle();
+    assert.equal(afterPause.ownershipRepairAuthority(), false);
+  });
+
+  it("is false after receipt failure, a claim fence, cancel, a disk stop and a worker shutdown", () => {
+    const failed = fresh();
+    (failed as unknown as Private).failReceipts(new Error("receipt"));
+    assert.equal(failed.ownershipRepairAuthority(), false);
+    const fenced = fresh();
+    (fenced as unknown as Private).endFencedFlight("stale");
+    assert.equal(fenced.ownershipRepairAuthority(), false);
+    const cancelled = fresh();
+    cancelled.markCancelled();
+    assert.equal(cancelled.ownershipRepairAuthority(), false);
+    const disk = fresh();
+    disk.requestDiskStop();
+    assert.equal(disk.ownershipRepairAuthority(), false);
+    const shutdown = fresh();
+    shutdown.workerShutdown(Date.now() + 1000);
+    assert.equal(shutdown.ownershipRepairAuthority(), false);
+  });
+});

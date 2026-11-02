@@ -189,6 +189,7 @@ import {
 } from "./delegation.js";
 import { CODE_DISPOSITIONS_TOOL, reportCodeDispositions, type CodeCrossCheckToolAccess } from "../code-cross-check-tools.js";
 import { buildCodexRunPlan } from "./run-builder.js";
+import { resolveChildTurnDeadlineMs } from "./child-budget.js";
 import { codexSubagentWriteCapabilities, sanitizeName } from "./render.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
@@ -340,7 +341,6 @@ const DEFAULT_BOUNDARY_DEADLINE_MS = 30 * 1000;
 const DEFAULT_CACHE_RELEASE_TIMEOUT_MS = 30 * 1000;
 /** Issue #1598: the least a terminal dispose's remaining budget caps a cache wait to. */
 const MIN_CACHE_SETTLE_WAIT_MS = 1000;
-const DEFAULT_CHILD_TURN_DEADLINE_MS = 10 * 60 * 1000;
 // The implement/review iteration budget when the claim omits one, matching
 // sdk-executor's DEFAULT_MAX_ITERATIONS (PRD: RUN_MAX_ITERATIONS default 5).
 // A larger server-served milestone budget can raise this cap during execution.
@@ -3710,7 +3710,7 @@ export class CodexExecutor implements Executor {
         storeDir,
         homeRoot: this.homeRoot,
         boundaryDeadlineMs,
-        childTurnDeadlineMs: this.deps.childTurnDeadlineMs ?? DEFAULT_CHILD_TURN_DEADLINE_MS,
+        childTurnDeadlineMs: this.childTurnDeadlineMs(),
         commandEnv,
         commandSandbox,
         // D6 (PRD #1287, user-approved 2026-09-12): carry the trusted provider-HOME prefix into
@@ -4256,6 +4256,23 @@ export class CodexExecutor implements Executor {
       let latestProgress: ReducedTurnResult["progress"];
       let iteration = 0;
       let completionHeld: { reason: string } | undefined;
+      // The runner withholds this capability on review targets and isolated fetches.
+      const iterationParkSupported = ctx.config?.iteration_park_version === 1 &&
+        !!ctx.parkForIteration && !ctx.interactive &&
+        ["issue", "mr_rework", "ci_fix", "task", "prompt", "self_improve"].some(kind => kind === ctx.kind);
+      let resumeSecretPreflightPending = iterationParkSupported && ctx.resumed === true;
+      let iterationParked: ExecutorResult["iterationParked"];
+      const parkIteration = async (iterationCount: number): Promise<boolean> => {
+        // Require a fresh authoritative zero as well as the sticky prior-attempt
+        // history. Neither a local false latch nor lifetime accounting proves zero.
+        if (!iterationParkSupported || lastServedCompletionAttempts !== 0 ||
+            completionAttempted || completion.history.priorAttempt) return false;
+        if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+        // Iteration capture reaps the provider just like the wall sink.
+        await beforeReapingSink();
+        iterationParked = { outcome: await ctx.parkForIteration!({ iterationCount, maxIterations }) };
+        return true; // All outcomes retain the flight; none authorizes a redrive.
+      };
       let walledAtRequest = false;
       const stopAtWall = async (reason = REASON_WALL): Promise<boolean> => {
         if (!ctx.completionInterlock || !isIssueRun || !(completionAttempted || completion.history.priorAttempt)) return false;
@@ -4330,6 +4347,7 @@ export class CodexExecutor implements Executor {
         branch: ctx.branch,
         agentSelection,
         ...(completionHeld ? { completionHeld } : {}),
+        ...(iterationParked ? { iterationParked } : {}),
         ...(walledAtRequest ? { walled: { reason: REASON_WALL } } : {}),
         ...(pausedAt ? { pausedAt } : {}),
         ...(isIssueRun && scopeCapped ? { scopeCapped } : {}),
@@ -4437,6 +4455,11 @@ export class CodexExecutor implements Executor {
             pauseNow.consume(pauseToken);
           }
         }
+        // Checkpoints bypass the post-turn limit. The current clarification turn
+        // is uncompleted, so only iteration - 1 counts at this refreshed boundary.
+        if (iteration - 1 >= maxIterations &&
+            this.pendingInterruption(ctx, pauseNow, wall) === undefined &&
+            await parkIteration(iteration - 1)) break;
         // Issue #1764: an implement turn runs now, so mint the deferred fresh provider epoch (new
         // registry, freshly-released credential, adopted session) and fully dispose the reaped one.
         // A loop-top wall park or completion hold that was refused/declined above may already have
@@ -4459,6 +4482,15 @@ export class CodexExecutor implements Executor {
         // answer gets a neutral recheck turn because the old frozen scope may have changed.
         // Issue #1800: a system text (completion-rework, secret-remediation or clarification)
         // owns the turn outright, so the owner follow-up is neither pulled nor rendered on it.
+        // Re-derive lost remediation guidance on a resumed invocation, without
+        // requiring a surviving thread. The ordinary turn wrapper retains control
+        // precedence for interruptions that arrive during this advisory await.
+        if (resumeSecretPreflightPending && this.pendingInterruption(ctx, pauseNow, wall) === undefined) {
+          const decision = await ctx.secretRemediationGate?.({ unpublishedOnly: true });
+          resumeSecretPreflightPending = false;
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          if (decision?.action === "remediate") completionFollowUp = decision.followUp;
+        }
         let systemFollowUp = clarificationPrompt ?? completionFollowUp;
         if (repeatingContract && completionAnswered) approvedContractSuperseded = true;
         if (systemFollowUp !== undefined && completionAnswered && isIssueRun && ctx.completionInterlock && !ctx.interactive) {
@@ -4899,6 +4931,7 @@ export class CodexExecutor implements Executor {
             completionHeld = { reason: REASON_MAX_ITERATIONS };
             break;
           }
+          if (await parkIteration(iteration)) break;
           throw new Error(REASON_MAX_ITERATIONS);
         }
         // Issue #1674 (PRD #390 M3 parity): only a normal work turn reaches here. On a
@@ -6463,6 +6496,12 @@ export class CodexExecutor implements Executor {
   }
 
   // ─── request + prompt construction ────────────────────────────────────────────
+  /** The effective per-child turn deadline: the one value the delegation runner, the lead prompt
+   *  and the child request all use. */
+  private childTurnDeadlineMs(): number {
+    return resolveChildTurnDeadlineMs(this.deps.childTurnDeadlineMs);
+  }
+
   /** PRD #3244: the lead's requested model/effort for a phase, from the one worker resolver. Pure in
    *  (ctx.config, provider model), so the request built per turn and the row reported at the phase
    *  entry cannot differ. */
@@ -6542,6 +6581,7 @@ export class CodexExecutor implements Executor {
       repoSourced,
       // Issue #3272: only an implement-phase request of an owner-supplied plan gets the seeded variant.
       seeded: phase === "implement" && isSeededOwnerPlan(ctx),
+      codexChildTurnBudgetMs: this.childTurnDeadlineMs(),
     }).append;
     const leadSkills = (ctx.skills ?? []).map((s) => s.name);
     // PRD #3244: the model and effort sent below are the same LeadRequest the lead-config row reports.
@@ -6555,6 +6595,7 @@ export class CodexExecutor implements Executor {
       ciEvidencePrepared: !!ctx.ciEvidence,
       prompt: prompt + ciEvidencePrompt(ctx.ciEvidence),
       systemPrompt,
+      childTurnBudgetMs: this.childTurnDeadlineMs(),
       phase,
       ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
       parkRunSupported: ctx.parkRunSupported,

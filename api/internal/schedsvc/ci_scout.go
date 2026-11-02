@@ -108,7 +108,7 @@ func (e *Scheduler) ciScoutSection(ctx context.Context, sched store.RunSchedule)
 	defer cancel()
 	ctx = forge.WithCIRepairReadLimits(ctx)
 	now := e.now()
-	data := collectScout(ctx, f, repo.ForgeType, repo.ForgeProjectID, branch, now)
+	data := collectScout(ctx, f, repo.ForgeType, repo.ForgeProjectID, branch, now, scoutCollectorConfig{scoutTailReserve: e.scoutDeadlineOrDefault() / 5})
 	return renderScout(data, repo.ForgeType, now)
 }
 
@@ -131,7 +131,74 @@ func scoutStop(ctx context.Context, err error, d *scoutData) bool {
 	return false
 }
 
-func collectScout(ctx context.Context, f forge.Forge, forgeType string, projectID int64, branch string, now time.Time) scoutData {
+var errScoutHistoryShare = errors.New("CI scout job history share expired")
+
+type scoutCollectorConfig struct {
+	scoutTailReserve time.Duration
+	historyContext   func(context.Context, time.Duration) (context.Context, context.CancelFunc)
+}
+
+func scoutHistoryContext(parent context.Context, reserve time.Duration) (context.Context, context.CancelFunc) {
+	if deadline, ok := parent.Deadline(); ok {
+		return context.WithDeadlineCause(parent, deadline.Add(-reserve), errScoutHistoryShare)
+	}
+	return context.WithCancel(parent)
+}
+
+// scoutVisit identifies an entry in the selected population, independently of run IDs.
+type scoutVisit struct {
+	pop   string
+	index int
+}
+
+// scoutVisitOrder rotates through four buckets until every selected entry is visited.
+// Each bucket owns a copy of its indices; neither input slice is modified.
+func scoutVisitOrder(main, pr []forge.WorkflowRun, now time.Time) []scoutVisit {
+	var buckets [4][]scoutVisit
+	for p, runs := range [][]forge.WorkflowRun{main, pr} {
+		pop := scoutPopMain
+		if p == 1 {
+			pop = scoutPopPR
+		}
+		for i, r := range runs {
+			bucket := p
+			if now.Sub(r.CreatedAt) > scoutWeek {
+				bucket += 2
+			}
+			buckets[bucket] = append(buckets[bucket], scoutVisit{pop: pop, index: i})
+		}
+	}
+	for b := range buckets {
+		runs := main
+		if b%2 == 1 {
+			runs = pr
+		}
+		slices.SortStableFunc(buckets[b], func(a, b scoutVisit) int {
+			ar, br := runs[a.index], runs[b.index]
+			return cmp.Or(br.CreatedAt.Compare(ar.CreatedAt), cmp.Compare(br.ID, ar.ID))
+		})
+	}
+	out := make([]scoutVisit, 0, len(main)+len(pr))
+	for round := 0; len(out) < len(main)+len(pr); round++ {
+		for _, bucket := range buckets {
+			if round < len(bucket) {
+				out = append(out, bucket[round])
+			}
+		}
+	}
+	return out
+}
+
+func collectScout(ctx context.Context, f forge.Forge, forgeType string, projectID int64, branch string, now time.Time, configs ...scoutCollectorConfig) scoutData {
+	config := scoutCollectorConfig{}
+	if len(configs) > 0 {
+		config = configs[0]
+	}
+	if config.historyContext == nil {
+		config.historyContext = scoutHistoryContext
+	}
+	historyCtx, cancelHistory := config.historyContext(ctx, config.scoutTailReserve)
+	defer cancelHistory()
 	d := scoutData{Selected: map[string]int{}, Collected: map[string]int{}}
 	main, stop := listScoutRuns(ctx, f, projectID, forge.ListWorkflowRunsOptions{Branch: branch, Limit: scoutListLimit}, now, &d)
 	var pr []forge.WorkflowRun
@@ -145,33 +212,64 @@ func collectScout(ctx context.Context, f forge.Forge, forgeType string, projectI
 	pr = pr[:min(len(pr), scoutPRRuns)]
 	d.Selected[scoutPopMain], d.Selected[scoutPopPR] = len(main), len(pr)
 
-	calls := 0
 	for _, sel := range []struct {
 		pop  string
 		runs []forge.WorkflowRun
 	}{{scoutPopMain, main}, {scoutPopPR, pr}} {
 		for _, r := range sel.runs {
-			sr := scoutRun{Pop: sel.pop, Run: r, CreatedReported: scoutCreatedReported(forgeType), JobsMissing: true}
-			if !stop && calls < scoutJobCalls {
-				calls++
-				jobs, err := f.ListPipelineJobAttempts(ctx, projectID, r.ID)
-				history := err == nil
-				if errors.Is(err, forge.ErrJobAttemptsUnsupported) {
-					d.note("this forge cannot return complete attempt history; earlier attempts are unknown")
-					jobs, err = f.ListPipelineJobs(ctx, projectID, r.ID)
-				}
-				switch {
-				case err == nil:
-					sr.Jobs, sr.HistoryKnown, sr.JobsMissing = jobs, history, false
-					d.Collected[sel.pop]++
-				case scoutStop(ctx, err, &d):
-					stop = true
-				default:
-					d.note("some job listings failed and are missing")
-				}
-			}
-			d.Runs = append(d.Runs, sr)
+			d.Runs = append(d.Runs, scoutRun{Pop: sel.pop, Run: r, CreatedReported: scoutCreatedReported(forgeType), JobsMissing: true})
 		}
+	}
+	// A budget hit or expired parent stops siblings too. Only our own history
+	// cause with a live parent leaves the parent available for log tails.
+	historyStopped := func(err error) bool {
+		if errors.Is(err, forge.ErrCIReadBudget) || ctx.Err() != nil {
+			stop = scoutStop(ctx, err, &d)
+			return true
+		}
+		if errors.Is(context.Cause(historyCtx), errScoutHistoryShare) {
+			d.note("job history stopped at its share of the collection deadline")
+			return true
+		}
+		if scoutStop(ctx, err, &d) {
+			stop = true
+			return true
+		}
+		if historyCtx.Err() != nil {
+			stop = scoutStop(historyCtx, err, &d)
+			return true
+		}
+		return false
+	}
+	// At most scoutJobCalls selected entries are read, sequentially. An ordinary
+	// listing failure skips that entry; cancellation stops subsequent history.
+	for calls, visit := range scoutVisitOrder(main, pr, now) {
+		if stop || calls >= scoutJobCalls || historyStopped(nil) {
+			break
+		}
+		index := visit.index
+		if visit.pop == scoutPopPR {
+			index += len(main)
+		}
+		sr := &d.Runs[index]
+		jobs, err := f.ListPipelineJobAttempts(historyCtx, projectID, sr.Run.ID)
+		history := err == nil
+		if err != nil && historyStopped(err) {
+			break
+		}
+		if errors.Is(err, forge.ErrJobAttemptsUnsupported) {
+			d.note("this forge cannot return complete attempt history; earlier attempts are unknown")
+			jobs, err = f.ListPipelineJobs(historyCtx, projectID, sr.Run.ID)
+		}
+		if err != nil {
+			if historyStopped(err) {
+				break
+			}
+			d.note("some job listings failed and are missing")
+			continue
+		}
+		sr.Jobs, sr.HistoryKnown, sr.JobsMissing = jobs, history, false
+		d.Collected[visit.pop]++
 	}
 	if !stop {
 		collectScoutLogs(ctx, f, projectID, &d, now)
@@ -182,6 +280,9 @@ func collectScout(ctx context.Context, f forge.Forge, forgeType string, projectI
 // listScoutRuns reads one page of runs and keeps the terminal ones created in the window,
 // newest first.
 func listScoutRuns(ctx context.Context, f forge.Forge, projectID int64, opts forge.ListWorkflowRunsOptions, now time.Time, d *scoutData) ([]forge.WorkflowRun, bool) {
+	if scoutStop(ctx, nil, d) {
+		return nil, true
+	}
 	runs, err := f.ListWorkflowRuns(ctx, projectID, opts)
 	if err != nil {
 		if scoutStop(ctx, err, d) {
@@ -231,6 +332,9 @@ func collectScoutLogs(ctx context.Context, f forge.Forge, projectID int64, d *sc
 		return r.FailedRefs[len(r.FailedRefs)-1], true
 	})
 	for _, p := range picks {
+		if scoutStop(ctx, nil, d) {
+			return
+		}
 		tail, err := f.JobLogTail(ctx, projectID, p.Job.ID, scoutLogBytes)
 		if err != nil {
 			if scoutStop(ctx, err, d) {
@@ -287,6 +391,7 @@ func renderScoutWithin(d scoutData, forgeType string, now time.Time, maxBytes in
 		int(scoutWindow/(24*time.Hour)), now.UTC().Format(time.RFC3339), scoutMainRuns, scoutPRRuns)
 	fmt.Fprintf(&h, "- Collected: default branch %d of %d selected runs, merge/pull requests %d of %d, with job history.\n",
 		d.Collected[scoutPopMain], d.Selected[scoutPopMain], d.Collected[scoutPopPR], d.Selected[scoutPopPR])
+	fmt.Fprintf(&h, "- Coverage with job history: default branch %s, merge/pull requests %s\n", scoutCoverage(d.Runs, scoutPopMain), scoutCoverage(d.Runs, scoutPopPR))
 	fmt.Fprintf(&h, "- Bounds: %d job-history calls and %d log tails at most (each tail cut to %d bytes; each "+
 		"log download may transfer up to the driver's own ceiling before the cut), one shared JSON read "+
 		"budget, and a collection deadline. HTTP requests per call also include pagination, repository "+
@@ -545,6 +650,35 @@ func renderScoutEvidence(b *strings.Builder, d scoutData, ev *scoutEvidence, lim
 			}
 		}
 	}
+}
+
+// scoutCoverage uses only successful listings and actual reported creation times.
+func scoutCoverage(runs []scoutRun, pop string) string {
+	var oldest, newest time.Time
+	collected := false
+	for _, r := range runs {
+		if r.Pop != pop || r.JobsMissing {
+			continue
+		}
+		collected = true
+		if !r.CreatedReported || r.Run.CreatedAt.IsZero() {
+			continue
+		}
+		at := r.Run.CreatedAt
+		if oldest.IsZero() || at.Before(oldest) {
+			oldest = at
+		}
+		if newest.IsZero() || at.After(newest) {
+			newest = at
+		}
+	}
+	if !collected {
+		return "unknown (none collected)"
+	}
+	if oldest.IsZero() {
+		return "unknown (creation time not reported)"
+	}
+	return scoutTime(oldest) + " to " + scoutTime(newest)
 }
 
 func scoutTime(t time.Time) string {

@@ -1171,5 +1171,247 @@ class Nightly(unittest.TestCase):
         self.assertEqual((status, data['outcome']), (0, 'watch-admitted'))
 
 
+class ExternalTipRetry(unittest.TestCase):
+    def fixture(self, heads=None):
+        release, fixture, api = Nightly().release(heads=heads, now='2026-10-27T10:48:00Z')
+        api.pages.return_value = [job('test:web (vitest --coverage)')]
+        return release, fixture, api
+
+    @staticmethod
+    def ci(status='completed', conclusion='success', number=10, attempt=1):
+        return run(status, conclusion, number, attempt)
+
+    def test_external_retry_can_start_after_sixty_seconds_without_a_request(self):
+        release, fixture, api = self.fixture()
+        def read(workflow, sha, branch):
+            if workflow != 'ci.yml':
+                return run()
+            if fixture.now < 75:
+                return self.ci(conclusion='failure')
+            if fixture.now < 90:
+                return self.ci('in_progress', None, attempt=2)
+            return self.ci(attempt=2)
+        api.run.side_effect = read
+        try:
+            result = release.tip()
+        except auto.Stop as error:
+            self.fail('outside observation stopped early: ' + error.reason)
+        self.assertEqual(result[0], H)
+        self.assertEqual(fixture.now, 90)
+        self.assertFalse(any(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls))
+        self.assertEqual(api.pages.call_count, 1)
+        self.assertEqual(len(release.retries), 1)
+        self.assertEqual(release.retries[0].get('origin'), 'external')
+        self.assertEqual(release.retries[0]['final_attempt'], 2)
+        self.assertNotIn(release.retries[0]['result'], ('requesting', 'requested'))
+
+    def no_requests(self, fixture):
+        self.assertFalse(any(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls))
+
+    def test_original_failed_attempt_waits_until_the_existing_cutoff(self):
+        release, fixture, api = self.fixture()
+        api.run.side_effect = lambda workflow, *_: self.ci(conclusion='failure') if workflow == 'ci.yml' else run()
+        with self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-cutoff') as stopped:
+            release.tip()
+        self.assertEqual(stopped.exception.outcome, 'defer')
+        self.assertEqual(fixture.now, 120)
+        self.no_requests(fixture)
+        self.assertEqual(api.pages.call_count, 1)
+        self.assertEqual(release.retries[0].get('origin'), 'external')
+        self.assertNotIn('final_attempt', release.retries[0])
+
+    def test_failed_outside_attempt_stops_without_retrying_even_infrastructure(self):
+        release, fixture, api = self.fixture()
+        api.run.side_effect = lambda workflow, *_: self.ci(conclusion='failure', attempt=1 if fixture.index == 0 else 2) if workflow == 'ci.yml' else run()
+        api.pages.side_effect = [[job('Test API')], [job()]]
+        with self.assertRaisesRegex(auto.Stop, 'tip-ci-retry-failed'):
+            release.tip()
+        self.assertEqual(fixture.now, 15)
+        self.no_requests(fixture)
+        self.assertEqual(api.pages.call_count, 1, 'a failed outside attempt must not be reclassified for a request')
+        self.assertEqual(release.retries[0].get('origin'), 'external')
+        self.assertEqual(release.retries[0]['result'], 'failed after external retry')
+        self.assertEqual(release.retries[0]['final_attempt'], 2)
+
+    def test_late_outside_success_never_extends_the_deadline(self):
+        release, fixture, api = self.fixture()
+        def read(workflow, *_):
+            if workflow != 'ci.yml':
+                return run()
+            if fixture.index == 0:
+                return self.ci(conclusion='failure')
+            fixture.now = 121
+            return self.ci(attempt=2)
+        api.run.side_effect = read
+        with self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-cutoff'):
+            release.tip()
+        self.assertEqual(fixture.now, 121)
+        self.no_requests(fixture)
+
+    def test_stale_success_and_wrong_run_do_not_satisfy_observation(self):
+        for newer in [self.ci(), self.ci(number=11, attempt=2)]:
+            with self.subTest(newer=newer):
+                release, fixture, api = self.fixture()
+                api.run.side_effect = lambda workflow, *_: (self.ci(conclusion='failure') if fixture.index == 0 else newer) if workflow == 'ci.yml' else run()
+                with self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-cutoff'):
+                    release.tip()
+                self.assertEqual(fixture.now, 120)
+                self.no_requests(fixture)
+                self.assertNotIn('final_attempt', release.retries[0])
+
+    def test_real_api_thin_records_accept_matching_sha_and_filter_another_sha(self):
+        for returned_sha in [H, NEW]:
+            with self.subTest(returned_sha=returned_sha):
+                release, fixture, _ = self.fixture()
+                api = auto.policy.GitHub('vtmocanu/uzi')
+                def pages(endpoint, field):
+                    if field == 'jobs':
+                        return [job('Test API')]
+                    workflow = 'ci.yml' if '/ci.yml/' in endpoint else 'kind-smoke.yml'
+                    second = workflow == 'ci.yml' and fixture.index > 0
+                    return [dict(self.ci(conclusion='failure' if workflow == 'ci.yml' and not second else 'success',
+                                         attempt=2 if second else 1),
+                                 head_sha=returned_sha if second else H, event='push', head_branch='main',
+                                 repository={'full_name': 'vtmocanu/uzi'}, head_repository={'full_name': 'vtmocanu/uzi'},
+                                 path='.github/workflows/' + workflow)]
+                api.pages = Mock(side_effect=pages)
+                release.api = api
+                if returned_sha == H:
+                    try:
+                        result = release.tip()
+                    except auto.Stop as error:
+                        self.fail('valid thin API proof was not accepted: ' + error.reason)
+                    self.assertEqual(result[0], H)
+                    self.assertEqual(fixture.now, 15)
+                else:
+                    with self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-cutoff'):
+                        release.tip()
+                    self.assertEqual(fixture.now, 120)
+                self.no_requests(fixture)
+
+    def test_attempt_metadata_cannot_regress_after_a_newer_attempt_was_seen(self):
+        release, fixture, api = self.fixture()
+        states = [self.ci(conclusion='failure'), self.ci('queued', None, attempt=3),
+                  self.ci(attempt=2), self.ci(attempt=3)]
+        api.run.side_effect = lambda workflow, *_: states[min(fixture.index, 3)] if workflow == 'ci.yml' else run()
+        self.assertEqual(release.tip()[0], H)
+        self.assertEqual(fixture.now, 45)
+        self.assertEqual(release.retries[0]['final_attempt'], 3)
+        self.no_requests(fixture)
+
+    def test_main_move_replans_and_keeps_the_unused_infrastructure_budget(self):
+        release, fixture, api = self.fixture(heads=[H, H, NEW, NEW])
+        def read(workflow, sha, *_):
+            if workflow != 'ci.yml':
+                return run()
+            return self.ci(conclusion='failure' if fixture.index < 3 else 'success',
+                           number=10 if sha == H else 11, attempt=2 if fixture.index >= 3 else 1)
+        api.run.side_effect = read
+        api.pages.side_effect = lambda *_: [job('Test API')] if fixture.head == H else [job()]
+        self.assertEqual(release.tip()[0], NEW)
+        self.assertEqual(sum(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls), 1)
+        self.assertEqual(release.retries[0]['result'], 'superseded by newer main tip')
+        self.assertEqual(release.retries[1]['result'], 'passed on retry')
+        self.assertEqual(fixture.now, 45)
+
+    def test_main_move_does_not_restart_the_observation_deadline(self):
+        release, fixture, api = self.fixture(heads=[H, NEW])
+        api.run.side_effect = lambda workflow, sha, *_: self.ci(conclusion='failure', number=10 if sha == H else 11) if workflow == 'ci.yml' else run()
+        with self.assertRaisesRegex(auto.Stop, 'tip-not-green-by-cutoff'):
+            release.tip()
+        self.assertEqual(fixture.now, 120)
+        self.assertEqual(api.pages.call_count, 2)
+        self.assertEqual([entry['sha'] for entry in release.retries], [H, NEW])
+        self.no_requests(fixture)
+
+    def spent_budget_fixture(self, last_head):
+        release, fixture, api = self.fixture(heads=[H, H, NEW, last_head])
+        def read(workflow, sha, *_):
+            if workflow != 'ci.yml':
+                return run('queued', None) if fixture.index == 1 else run()
+            if fixture.index == 1:
+                return self.ci(attempt=2)
+            if fixture.index >= 3 and last_head == NEW:
+                return self.ci(attempt=2, number=11)
+            return self.ci(conclusion='failure', number={H: 10, NEW: 11, CANDIDATE: 12}[sha])
+        api.run.side_effect = read
+        api.pages.side_effect = lambda *_: [job('Test API')] if fixture.head == NEW else [job()]
+        return release, fixture, api
+
+    def test_another_run_can_be_observed_after_the_own_request_budget_is_spent(self):
+        release, fixture, _ = self.spent_budget_fixture(NEW)
+        self.assertEqual(release.tip()[0], NEW)
+        self.assertEqual(sum(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls), 1)
+        self.assertEqual(release.retries[-1].get('origin'), 'external')
+        self.assertEqual(release.retries[-1]['result'], 'passed on external retry')
+
+    def test_observation_and_main_move_never_restore_a_spent_request_budget(self):
+        release, fixture, _ = self.spent_budget_fixture(CANDIDATE)
+        with self.assertRaisesRegex(auto.Stop, 'tip-ci-retry-failed'):
+            release.tip()
+        self.assertEqual(sum(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls), 1)
+        self.assertEqual(fixture.now, 45)
+
+    def test_manual_ineligible_failure_still_stops_at_once(self):
+        release, fixture, api = self.fixture()
+        release.config['scheduled'] = False
+        api.run.side_effect = lambda workflow, *_: self.ci(conclusion='failure') if workflow == 'ci.yml' else run()
+        with self.assertRaisesRegex(auto.Stop, 'tip-ci-not-retryable'):
+            release.tip()
+        self.assertEqual(fixture.now, 0)
+        self.assertEqual(release.retries, [])
+        self.no_requests(fixture)
+
+    def test_own_infrastructure_failure_still_stops_without_outside_wait(self):
+        release, fixture, api = self.fixture()
+        api.pages.return_value = [job()]
+        api.run.side_effect = lambda workflow, *_: self.ci(conclusion='failure', attempt=1 if fixture.index == 0 else 2) if workflow == 'ci.yml' else run()
+        with self.assertRaisesRegex(auto.Stop, 'tip-ci-retry-failed'):
+            release.tip()
+        self.assertEqual(fixture.now, 15)
+        self.assertEqual(len(release.retries), 1)
+        self.assertNotIn('origin', release.retries[0])
+        self.assertEqual(release.retries[0]['result'], 'failed after retry')
+        self.assertEqual(api.pages.call_count, 1)
+
+    def test_own_request_start_grace_is_still_sixty_seconds(self):
+        release, fixture, api = self.fixture()
+        api.pages.return_value = [job()]
+        api.run.side_effect = lambda workflow, *_: self.ci(conclusion='failure' if fixture.index == 0 else 'success') if workflow == 'ci.yml' else run()
+        with self.assertRaisesRegex(auto.Stop, 'tip-ci-retry-not-started'):
+            release.tip()
+        self.assertEqual(fixture.now, 60)
+        self.assertEqual(sum(call[:3] == ('gh', 'run', 'rerun') for call in fixture.calls), 1)
+
+    def test_smoke_failure_and_skip_marked_missing_proof_keep_priority(self):
+        release, fixture, api = self.fixture()
+        api.run.side_effect = lambda workflow, *_: self.ci(conclusion='failure', attempt=1 if fixture.index == 0 else 2) if workflow == 'ci.yml' else run(conclusion='success' if fixture.index == 0 else 'failure')
+        with self.assertRaisesRegex(auto.Stop, 'tip-smoke-failed'):
+            release.tip()
+        self.no_requests(fixture)
+        self.assertEqual(release.retries[0].get('final_attempt'), 2)
+        self.assertEqual(release.retries[0]['result'], 'failed after external retry')
+        release, fixture, api = self.fixture()
+        fixture.messages[H] = '[' + 'skip ci' + ']'
+        api.run.side_effect = lambda workflow, *_: self.ci(conclusion='failure') if workflow == 'ci.yml' else None
+        with self.assertRaisesRegex(auto.Stop, 'tip-ci-not-retryable'):
+            release.tip()
+        self.assertEqual(fixture.now, 0)
+        self.assertEqual(release.retries, [])
+
+    def test_observed_failure_provenance_survives_outputs_and_summary(self):
+        release, fixture, api = self.fixture()
+        api.run.side_effect = lambda workflow, *_: self.ci(conclusion='failure', attempt=1 if fixture.index == 0 else 2) if workflow == 'ci.yml' else run()
+        release.prepare = lambda _directory: release.tip()
+        status, data, note, _ = Nightly().cli(Nightly().env(), 'prepare', release)
+        self.assertEqual((status, data['reason']), (1, 'tip-ci-retry-failed'))
+        rows = json.loads(data['retry_log'])
+        self.assertEqual(rows[0].get('origin'), 'external')
+        self.assertEqual(rows[0]['result'], 'failed after external retry')
+        self.assertEqual(rows[0]['final_attempt'], 2)
+        self.assertIn('external', note)
+        self.no_requests(fixture)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

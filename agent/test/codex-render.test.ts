@@ -551,6 +551,20 @@ describe("renderCodexRun — prompts", () => {
     );
   });
 
+  it("renders the child turn budget and partial-handoff rule before the safety block when requested (#3804)", () => {
+    const run = renderCodexRun(runRequest({
+      childTurnBudgetMs: 900_000,
+      agents: { a: agent({ prompt: "BODY" }), b: agent({ prompt: "OTHER" }) },
+    }));
+    for (const name of ["a", "b"]) {
+      const prompt = run.perRolePrompts.get(name)!;
+      assert.match(prompt, /a 15-minute budget/);
+      assert.match(prompt, /truthful partial handoff/);
+      assert.match(prompt, /not a passed check or a completed milestone/);
+      assert.ok(prompt.endsWith(SUBAGENT_SAFETY_APPEND));
+    }
+  });
+
   it("carries the command-lifetime rule but not the Claude-only long-command recipe", () => {
     const run = renderCodexRun(runRequest({ agents: { a: agent({ prompt: "BODY" }) } }));
     const prompt = run.perRolePrompts.get("a") ?? "";

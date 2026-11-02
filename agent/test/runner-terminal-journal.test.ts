@@ -79,6 +79,7 @@ function minimalFailFlight(opts: {
   const cancel = new AbortController();
   cancel.signal.addEventListener("abort", () => opts.events.push("abort"));
   return {
+    iterationParkState: "none" as const,
     runId: opts.runId,
     claimGeneration: opts.gen,
     // barePath present so reapRecoveryProviderForSettle passes its guard and reaps.

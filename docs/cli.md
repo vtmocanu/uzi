@@ -3570,9 +3570,17 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   page or `uzi run resume <id>`. The requester does not determine the display
   path: `park_run` and the owner's `/park` answer share the lead-park execution
   path; `uzi run pause` uses the owner path. See [Pausing and resuming a
-  run](run-pause.md). An ordinary pause does **not** auto-resume. A `paused` run can instead
-  be a **completion-blocked hold** on a run whose [structural completion
-  interlock](run-completion-hold.md) couldn't finish a frozen milestone —
+  run](run-pause.md). An ordinary pause does **not** auto-resume. A `paused` run can also
+  show **Iteration limit reached** (`hold_reason: iteration_budget_exhausted`):
+  eligible runs with negotiated `iteration_park_version: 1` and authoritative
+  persisted `completion_attempts = 0` park at iteration exhaustion. The owner chooses
+  **Resume** or **Cancel**. Resume grants a fresh finite invocation allowance with
+  no added wall time; if the wall budget is spent, **Extend**, then **Resume**.
+  Extend alone leaves this hold paused; **Stop** is unavailable. See
+  [Paused at the iteration limit](run-pause.md#paused-at-the-iteration-limit).
+  Prior-attempt, excluded and legacy runs keep their existing dispositions.
+  A `paused` run can instead be a **completion-blocked hold** on a run whose
+  [structural completion interlock](run-completion-hold.md) couldn't finish a frozen milestone —
   same status, a different reason, and a different resume path
   (`uzi run decide <id> --continue`, not `run resume`). `run get` prints the
   distinction as a `COMPLETION` row reading `Completion blocked`, alongside

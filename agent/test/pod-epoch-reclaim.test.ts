@@ -1005,3 +1005,42 @@ test("one path observed twice is never double counted", async () => {
     } finally { await d.close(); }
   }
 });
+
+test("#3775 shadow grouping selector and legacy fallback causes preserve candidates", async () => {
+  const d = await daemon();
+  try {
+    for (const mode of ["group", "paths", "selector", "census", "census-empty", "inspection", "inspection-empty", "unknown", "malformed-holds"] as const) {
+      const { options } = setup();
+      options.dockerHost = d.host;
+      const groups = inventory(options, 1);
+      if (mode === "group") {
+        for (let i = 1; i <= 200; i++) groups.push({ ...groups[0]!, paths: ["/tree/0"] });
+      }
+      if (mode === "paths") groups.push({ ...groups[0]!, paths: Array.from({ length: 200 }, (_, i) => "/extra/" + i) });
+      if (mode === "selector") groups[0]!.selector.runId = "../invalid";
+      if (mode === "census" || mode === "census-empty") {
+        const discover = options.git.discoverEpochRetainedSources;
+        options.git.discoverEpochRetainedSources = async opts => ({ ...await discover(opts), inventoryComplete: false, unreadable: 1,
+          ...(mode === "census-empty" ? { partialCauses: {} } : {}) });
+      }
+      if (mode === "inspection" || mode === "inspection-empty") {
+        const inspect = options.git.inspectRetainedSources;
+        options.git.inspectRetainedSources = async opts => ({ ...await inspect(opts), partial: true,
+          ...(mode === "inspection-empty" ? { partialCauses: {} } : {}) });
+      }
+      if (mode === "unknown") options.client.getRunOwnership = async () => ({ status: "running" });
+      if (mode === "malformed-holds") options.client.listRecoveryHolds = async () => ({ run_id: "wrong", holds: [] });
+      const result = (await runPodEpochShadow(options))!;
+      const causes = mode === "group" ? { group_cap: 1 } : mode === "paths" ? { group_physical_path_cap: 1 } :
+        mode === "selector" ? { selector_refused: 1 } : mode.startsWith("census") ? { census_unclassified: 1 } :
+        mode.startsWith("inspection") ? { inspection_unclassified: 1 } : {};
+      assert.deepEqual(result.partial_causes, causes);
+      assert.equal(result.authority.result, "attested");
+      assert.equal(result.verdict, ["unknown", "malformed-holds"].includes(mode) ? "eligible" : "partial");
+      assert.equal(result.reason, ["unknown", "malformed-holds"].includes(mode) ? "shadow_complete" : "inventory_partial");
+      assert.equal(result.would_delete, ["group", "paths", "census", "census-empty"].includes(mode) ? 1 : 0);
+      assert.equal(result.examined, 1);
+      assert.equal(result.kept, result.would_delete ? 0 : 1);
+    }
+  } finally { await d.close(); }
+});

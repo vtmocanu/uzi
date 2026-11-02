@@ -1308,6 +1308,7 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 		Config: ClaimConfig{
 			RunTimeoutSeconds:      int(s.p.RunTimeout.Seconds()),
 			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
+			IterationParkVersion:   1,
 			MaxIterations:          s.p.RunMaxIterations,
 			PlanMaxRevisions:       s.p.PlanMaxRevisions,
 			QuestionMax:            s.p.QuestionMax,

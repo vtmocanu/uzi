@@ -288,6 +288,68 @@ const trackingOf = (bare: string, branch: string): string =>
   execFileSync("git", ["--git-dir", bare, "rev-parse", `refs/uzi-runner/${branch}`], { encoding: "utf8" }).trim();
 
 describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
+  it("iteration resume preflight skips a published-only range without a secret scan", { skip }, async () => {
+    let scans = 0;
+    await drive({
+      iid: 1932_901, forge: "github",
+      configure: g => {
+        const original = g.secretScanCheckpointRange.bind(g);
+        g.secretScanCheckpointRange = async (...args) => { scans++; return original(...args); };
+      },
+      body: async ctx => {
+        const before = scans;
+        assert.deepEqual(await ctx.secretRemediationGate!({ unpublishedOnly: true }), { action: "proceed" });
+        assert.equal(scans, before, "published history is not scanned by advisory preflight");
+      },
+    });
+  });
+
+  it("iteration resume preflight regenerates guidance from unpublished commits", { skip }, async t => {
+    let elapsed = 0;
+    await drive({
+      iid: 1932_902, forge: "github",
+      body: async ctx => {
+        commitIn(ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        const started = performance.now();
+        const decision = await ctx.secretRemediationGate!({ unpublishedOnly: true });
+        elapsed = performance.now() - started;
+        assert.equal(decision.action, "remediate");
+        if (decision.action === "remediate") assert.match(decision.followUp, /rewrite|fixup/);
+        // This test exercises guidance, not permission to publish a flagged tip.
+      },
+    });
+    t.diagnostic(`unpublished-range preflight elapsed_ms=${elapsed.toFixed(1)}`);
+  });
+
+  it("iteration resume preflight never requests a rewrite at the published floor", { skip }, async () => {
+    let published = "";
+    await drive({
+      iid: 1932_904, forge: "github",
+      seedFlight: flight => { if (published) flight.publishedRealTips = [published]; },
+      body: async (ctx, gate) => {
+        published = commitIn(ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        // Seed the same published-only floor used by the existing done gate.
+        assert.equal((await gate()).action, "proceed");
+        assert.deepEqual(await ctx.secretRemediationGate!({ unpublishedOnly: true }), { action: "proceed" });
+      },
+    });
+  });
+
+  it("iteration resume preflight with an untrusted scan remains advisory", { skip }, async () => {
+    let scans = 0;
+    await drive({
+      iid: 1932_903, forge: "github",
+      configure: g => {
+        g.secretScanCheckpointRange = async () => { scans++; return { trusted: false, findings: [] }; };
+      },
+      body: async ctx => {
+        commitIn(ctx.worktreePath, "work.txt", "unpublished work\n");
+        assert.deepEqual(await ctx.secretRemediationGate!({ unpublishedOnly: true }), { action: "proceed" });
+        assert.ok(scans > 0, "the preflight exercised the untrusted scanner");
+      },
+    });
+  });
+
   it("(a) a flagged final commit above the floor is remediated by a fixup rewrite, then the run completes with a push", { skip }, async () => {
     const decisions: SecretRemediationDecision[] = [];
     let flagged = "";

@@ -15,6 +15,7 @@
 
 import { useEffect, useId, useRef, useState } from "react";
 import {
+  budgetRightLabel,
   extendBudgetView,
   formatBudgetDuration,
   formatLocalTime,
@@ -255,7 +256,7 @@ export function ExtendTimePopover({
                 <div className="flex justify-between gap-2">
                   <dt>Used</dt>
                   <dd className="tabular-nums text-fg">
-                    {formatBudgetDuration(view.usedSec)} of {formatBudgetDuration(view.wallSec)}
+                    {formatBudgetDuration(view.usedSec)} of {budgetRightLabel(view)}
                   </dd>
                 </div>
                 <div className="flex justify-between gap-2">

@@ -549,6 +549,7 @@ export const RUN_STATUS_TONES: Record<
    *  work until the credential is enabled. Label below. */
   credential_disabled: { tone: "warning" },
   // Provider holds are parked: owner attention and outage retry share a static warning.
+  iteration_budget_exhausted: { tone: "warning" },
   provider_unavailable: { tone: "warning" },
   codex_policy_hold: { tone: "warning" },
   // Issue #3194: a --require-base run held because its adopted work is not attested to the planned base.
@@ -618,6 +619,7 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   // PRD #1732: kept in step with runBadge's matching label.
   credential_disabled: "waiting: credential disabled",
   // Kept in step with runBadge's parked wording by the label-agreement test.
+  iteration_budget_exhausted: "Iteration limit reached",
   provider_unavailable: "provider unavailable: owner hold",
   codex_policy_hold: "Codex policy hold",
   base_attestation_missing: "base unverified: owner hold",

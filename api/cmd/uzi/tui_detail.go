@@ -1000,7 +1000,11 @@ func (m tuiModel) renderDetail() string {
 	// show on such a parked run too, matching the web's pending chip and `run get`'s
 	// PAUSE_REQUESTED row. On a limit_wait run both this and the rate-limit park line above
 	// draw: the run is held on a limit AND carries a pending pause.
-	if line := credentialSwitchHoldLine(d.run); line != "" {
+	if isIterationHold(d.run) {
+		for _, line := range m.iterationDetailLines() {
+			sb.WriteString(line + "\n")
+		}
+	} else if line := credentialSwitchHoldLine(d.run); line != "" {
 		// Issue #3181: a credential-switch hold is a server park, not an owner pause.
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)), m.width) + "\n")
 	} else if line := credentialDisabledLine(d.run); line != "" {
@@ -1280,4 +1284,24 @@ func (d *detailState) rememberPauseEpoch() {
 	if d.pauseMetaReady && d.run.Status == statusPaused && d.run.StatusSince != nil {
 		d.pauseLastSince = *d.run.StatusSince
 	}
+}
+
+// iterationDetailLines preserves every owner action when the detail pane is narrow.
+// The fixed copy and renderer-capped ID bound wrapping work.
+func (m tuiModel) iterationDetailLines() []string {
+	r := m.detail.run
+	if !isIterationHold(r) {
+		return nil
+	}
+	r.ID = m.renderer.Plain(r.ID, 240)
+	clauses := append([]string{"Iteration limit reached"}, strings.Split(iterationHoldAction(r), "; ")...)
+	var rows []string
+	for _, clause := range clauses {
+		plain := m.renderer.Plain(clause, len([]rune(clause)))
+		wrapped := ansi.Hardwrap(ansi.Wrap(plain, max(1, m.width), " "), max(1, m.width), true)
+		for _, row := range strings.Split(wrapped, "\n") {
+			rows = append(rows, m.pal.state(crewWaiting).Render(row))
+		}
+	}
+	return rows
 }

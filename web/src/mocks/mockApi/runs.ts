@@ -786,6 +786,15 @@ export const runsApi = {
       updated_at: new Date().toISOString(),
       ...(switchHold === "unsettled" ? { status: "queued" as const, hold_reason: null, status_since: new Date().toISOString() } : {}),
     });
+    // This per-run owner action explicitly sets a token AND resumes a paused run.
+    // Availability changes alone do not release an iteration hold.
+    if (run.status === "paused" && run.hold_reason === "iteration_budget_exhausted") {
+      const total = run.budget_total_seconds ??
+        (run.budget_wall_seconds ?? 6 * 3600) + (run.budget_extension_seconds ?? 0) + (run.budget_finalize_seconds ?? 0);
+      if (run.budget_used_seconds != null && total - run.budget_used_seconds <= 0)
+        throw new ApiError(409, "credential switch: run state changed, retry");
+      patchRun(id, { status: "queued", hold_reason: null, hold_context: null, status_since: new Date().toISOString() });
+    }
     const updated = { ...getRun(id)! };
     const pooledEligible = mockSecrets.some((s) => s.kind === "anthropic_token" && s.auto_eligible);
     const warning =
@@ -1001,6 +1010,13 @@ export const runsApi = {
     const memoryHeld = run.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
     if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld)
       throw new ApiError(409, `run is ${run.status}`);
+    const iterationHeld = run.status === "paused" && run.hold_reason === "iteration_budget_exhausted";
+    if (iterationHeld) {
+      const total = run.budget_total_seconds ??
+        (run.budget_wall_seconds ?? 6 * 3600) + (run.budget_extension_seconds ?? 0) + (run.budget_finalize_seconds ?? 0);
+      if (run.budget_used_seconds != null && total - run.budget_used_seconds <= 0)
+        throw new ApiError(409, `this run is out of time; extend it to resume: uzi run extend ${id} --by 2h`);
+    }
     // Issue #3181: mirrors the server's ErrRunHoldSettling refusal; an unsettled hold resumes.
     const switchHold = credentialSwitchHold(run);
     if (switchHold === "settling") throw new ApiError(409, CREDENTIAL_SWITCH_SETTLING_REFUSAL);
@@ -1008,6 +1024,7 @@ export const runsApi = {
     // reset (the mock stands in with seven days).
     const reserveHeld = run.status === "paused" && run.hold_reason === "weekly_reserve";
     patchRun(id, { status: "queued", updated_at: new Date().toISOString(),
+      ...(iterationHeld ? { hold_reason: null, hold_context: null, status_since: new Date().toISOString() } : {}),
       ...(reserveHeld
         ? { hold_reason: null, reserve_exempt_until: new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString() }
         : {}),
@@ -1185,6 +1202,9 @@ export const runsApi = {
       throw new ApiError(404, "run not found");
     const current = getRun(id);
     if (!current) throw new ApiError(404, "run not found");
+    // The real endpoint also accepts Stop from CLI clients, outside the web input union.
+    if ((kind as string) === "stop" && current.status === "paused" && current.hold_reason === "iteration_budget_exhausted")
+      throw new ApiError(409, "Stop is unavailable for an iteration hold; Resume to keep working, or Cancel the run");
     // PRD #1795 D5: mirror the server's expected-revision contract. A revision on any kind
     // other than a plan verdict is a 400; a verdict bound to a revision the run no longer
     // shows (a different gate_revision, or no open gate at all) is the typed 409 with the

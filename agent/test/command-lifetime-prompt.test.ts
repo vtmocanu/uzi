@@ -61,6 +61,19 @@ describe("command-lifetime and worker-toolbox rules reach every agent", () => {
     assert.ok(!append.includes("run_in_background"));
   });
 
+  it("the Codex lead states the child turn budget only when the option is set (#3804)", () => {
+    const plain = buildLeadSystemPrompt("LEAD BODY", { kind: "issue", harness: "codex" }).append;
+    assert.ok(!plain.includes("per-child turn budget"));
+    const withBudget = buildLeadSystemPrompt("LEAD BODY", { kind: "issue", harness: "codex", codexChildTurnBudgetMs: 900_000 }).append;
+    assert.match(withBudget, /has a 15-minute per-child turn budget/);
+    assert.match(withBudget, /not the 60-minute command bound/);
+    assert.match(withBudget, /After a child_timeout, inventory partial work/);
+    assert.match(withBudget, /independent committed-range review/);
+    const claudeBase = buildLeadSystemPrompt("LEAD BODY", { kind: "issue", harness: "claude" }).append;
+    const claudeWith = buildLeadSystemPrompt("LEAD BODY", { kind: "issue", harness: "claude", codexChildTurnBudgetMs: 900_000 }).append;
+    assert.equal(claudeWith, claudeBase);
+  });
+
   it("an absent harness keeps the neutral rules without either recipe", () => {
     const append = buildLeadSystemPrompt("LEAD BODY", { kind: "issue" }).append;
     assert.ok(append.includes(LIFETIME));

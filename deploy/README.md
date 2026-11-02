@@ -167,10 +167,9 @@ parent-proof exemption for docs or PRDs: their changed text has not passed its
 own checks. Automation does not dispatch CI, create a repair commit or select
 an older tip.
 
-Nightly attempts are scheduled for 04:47 Europe/Bucharest using GitHub's native
-timezone support, after the local maintenance window, aiming to cut near 05:00
-when on time. They are
-off until the user decides to activate and the maintainer sets
+Nightly attempts are scheduled for 01:47 Europe/Bucharest using GitHub's native
+timezone support. The earlier slot leaves room for observed scheduler delays.
+They are off until the user decides to activate and the maintainer sets
 `RELEASE_NIGHTLY_ENABLED=true`. Unset it or set it to `false` to pause nightly
 attempts; manual dispatch still works. Enablement is rechecked at job boundaries,
 so a not-yet-pushed attempt may stop there, possibly red with `nightly-disabled`.
@@ -189,7 +188,7 @@ The provisional push cutoff is strictly before 13:00 on the original run's
 Bucharest calendar date. A queued run does not gain a fresh window tomorrow.
 Scheduled tip waiting uses the lesser of three hours and the remaining time
 until 12:50, reserving a provisional 600 seconds from the existing cutter timeout,
-not a measured cut duration. An on-time 04:47 attempt can wait until 07:47; a late
+not a measured cut duration. An on-time 01:47 attempt can wait until 04:47; a late
 10:47 attempt can wait until 12:50. Waiting holds a runner under the 20-job cap.
 The prepare ceiling stays 210 minutes (180 waiting, ten cutting, 20 overhead).
 Manual waits remain 7200 seconds and their cutter timeout remains 600 seconds;
@@ -1064,6 +1063,14 @@ ledger saturation reports `consumption_full` without evaluation while preserving
 SH startup.
 A would-delete entry requires terminal ownership, fresh empty holds and an
 eligible retained-source disposition; a verdict grants no deletion authority.
+
+For `inventory_partial`, `partial_causes` supplies sparse, bounded event counters:
+`measurement_entry_cap` and `measurement_filesystem_error` explain measurement
+limits or filesystem failures; `ownership_read_` and `holds_read_` keys classify
+failures at those read stages. Each counter saturates at **65535**; a missing
+counter is not evidence that unvisited work was clean. The object carries no raw
+errors, URLs, paths or IDs and changes no eligibility or authority. See the
+[full #3775 diagnostic contract](../prds/3431-pod-epoch-reclaim.md#3775-partial-shadow-diagnostic-contract).
 
 **Authority and counts (PRD #3431 M1a).** The log line also carries
 `authority: {result, reason}`, `evidence_version` and, once version-2 binding

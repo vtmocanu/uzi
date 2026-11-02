@@ -531,6 +531,10 @@ uzi version
   `vault_locked` recovery park still waits: a bare wait keeps waiting through it
   until the run owner's explicit unlock queues it and a worker resumes it, or the
   scheduled retry provides the fallback.
+  A paused `iteration_budget_exhausted` hold requires an explicit owner Resume
+  or Cancel. If wall time is spent, Extend first, then Resume; Extend alone leaves
+  it paused. Completed-scope Stop is unavailable for this hold. A default
+  `run wait` keeps waiting through this paused hold; its optional timeout still applies.
   Both credential-switch holds stop a wait, and a re-run wait against a run still in either
   hold returns immediately (exit 0), including while `credential_switch_settling`: poll
   `uzi run get <id>` for the hold to lift, or Cancel.
@@ -541,8 +545,8 @@ uzi version
   polls `GET /api/runs/:id` every `--interval` (default 3s) client-side, and
   prints each transition to **stderr**; `--json` prints the final run object (the
   same shape as `run get --json`) to **stdout**. `--timeout <dur>` is opt-in and
-  gives **exit 7** if it elapses first (there is no default timeout — a healthy
-  gated run stops at its gate, so a bare wait cannot hang). A single transient
+  gives **exit 7** if it elapses first (there is no default timeout; owner-held
+  pauses can keep a bare wait waiting until the owner acts). A single transient
   `6` (server blip) is ridden out, not fatal. `--until <a,b>` overrides the stop
   set (validated against the thirteen statuses).
 
@@ -1502,8 +1506,12 @@ of which seeding is one mode (the "Seed & ship" option).
    verdict.** A seeded plan is already approved for this run; state that
    implementation starts immediately. Preserve product approval requirements,
    safety gates, and validation commands. Stale plan-gate wording can make the
-   lead wait for a verdict that never comes, until the iteration budget fails
-   the run with no file changed.
+   lead wait for a verdict that never comes, spending its iteration budget
+   with no file changed. At iteration exhaustion, eligible runs with negotiated
+   `iteration_park_version: 1` and authoritative persisted `completion_attempts = 0`
+   park under `iteration_budget_exhausted`, needing explicit owner Resume or Cancel.
+   Prior-attempt, excluded and legacy runs
+   keep their existing dispositions, including possible completion holds or failure.
 3. **Read the roster off the clone, not from memory, if you're naming one.**
    `--agent-source repo` means the roster in the clone's `.claude/agents/`
    (`ls .claude/agents/` there to see it — one role per file, named by its
