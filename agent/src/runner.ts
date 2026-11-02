@@ -2723,9 +2723,11 @@ interface RunFlight {
   /** issue #1932: per-flight state of the pre-exit secret remediation gate (see
    *  RunRunner.runSecretRemediationGate). `known` = findings of the last trusted gate scan that
    *  suppress every checkpoint publication and make finalize fail (`push_secret_blocked`, no push)
-   *  while non-empty. Park / shutdown / pause / capture sinks remain unscanned (#1597), but hold
-   *  remembered findings in this flight. This memory does not survive a new flight/reclaim and
-   *  does not contain never-flagged content, including trees copied into an overlay.
+   *  while non-empty. For unenrolled flights, park / shutdown / pause / capture sinks remain
+   *  unscanned (#1597), but hold remembered findings in this flight. This process-local state
+   *  does not survive a new flight/reclaim or contain never-flagged overlay content. Enrolled
+   *  remediationRecovery separately persists negative facts and requires fresh source, history
+   *  and actual-candidate/floor guards through remediationRestrictions.
    *  `blocked` = findings that make finalize fail terminally
    *  (cap exhausted, or an untrusted gate scan after a known finding); `cleanTip` = the tracking tip
    *  of the last CLEAN trusted gate scan, used by the reap-publish hold and to decide at finalize

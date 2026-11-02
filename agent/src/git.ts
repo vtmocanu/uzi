@@ -12849,7 +12849,8 @@ export class GitCache {
    *  - {@link verifyWrapperOnlyHistory}(P, realTip): everything P adds beyond realTip is a verified
    *    workflow-only wrapper, so the pack carries no new non-workflow content beyond realTip's own
    *    history. That is not "nothing unscanned": P's workflow blobs come from the default branch,
-   *    and the unpinned park/shutdown sinks publish realTip's history unscanned anyway.
+   *    and unenrolled park/shutdown sinks retain their unscanned-history residual. Enrolled
+   *    sources additionally require the caller's fresh source/candidate/floor guards.
    * When lastParent(P) === realTip nothing is new since P: P itself is returned (a re-declare).
    * The chain tree MAY equal realTip's tree (the branch caught up with main's workflows): it is
    * still emitted so the ref keeps advancing. The structural check is not provenance: ADR-1036's
