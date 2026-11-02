@@ -1,7 +1,7 @@
 # PRD #2506 (option A): a pinned prerequisite closure lets a thin guarded capture release custody
 
 **Issue:** #2506 (option A only). Delivery under this PRD is **non-closing**: every PR uses `Refs #2506` and closes only its own child issue. #2506 stays open until the whole acceptance below is met. Option D shipped separately (ADR-2506) and does not complete this.
-**Current execution (2026-11-02):** C1a [#3601](https://github.com/vtmocanu/uzi/pull/3601), C1b [#3655](https://github.com/vtmocanu/uzi/pull/3655), C2 [#3748](https://github.com/vtmocanu/uzi/pull/3748) and C3 [#3778](https://github.com/vtmocanu/uzi/pull/3778) are merged, with exact-head child CI/lander acceptance recorded below. E5 is the scoped local full-history measurement, not a production release. The first two [parent goals](#acceptance-assessment-after-the-child-merges-2026-11-02) remain open for a combined large-history release/native-prune/restore proof. E6 remains two weeks of hosted post-roll reporting only; no release or operator observation is claimed or authorized by this update. The parent stays active and non-closing. Earlier worker-handoff records remain historical, not the current landing status.
+**Current execution (2026-11-02):** C1a [#3601](https://github.com/vtmocanu/uzi/pull/3601), C1b [#3655](https://github.com/vtmocanu/uzi/pull/3655), C2 [#3748](https://github.com/vtmocanu/uzi/pull/3748) and C3 [#3778](https://github.com/vtmocanu/uzi/pull/3778) are merged, with exact-head child CI/lander acceptance recorded below. E5 is the scoped local full-history measurement, not a production release. The first two [parent goals](#acceptance-assessment-after-the-child-merges-2026-11-02) are met by the #3803 combined large-history release/native-prune/restore proof (landed in [#3821](https://github.com/vtmocanu/uzi/pull/3821); see "#3803 landing"). E6 remains two weeks of hosted post-roll reporting only; no release or operator observation is claimed or authorized by this update. The parent stays active and non-closing. Earlier worker-handoff records remain historical, not the current landing status.
 
 **Historical design status:** DRAFT, revision 18 (2026-10-28), approved C1a/C1b split and review folds, pending exact-text final review. C1a and C1b are API-only; no filing or dispatch follows from this draft. Based on the exact revision-11 artifact (SHA256 `2205e1146950263b2aa90f35863cadec3f3debfbd350590b9e65bd560a9640ec`, whose header still said revision 10). The earlier paired architecture reviews and owner decisions remain the design history; this new evidence fold requires recov6 review and is not filing, dispatch or implementation approval. **E2 ran on GitHub on 2026-10-27 and returned FINDING (one measured workflow-scope refusal, zero probe malfunctions), conclusive for the tested production credential class.** The anchor strategy is feasible in that tested case; other forges and protected/ruleset configurations remain unverified. Existing source line anchors are historical at `91647464c02bd12ae30d4fce6aa656f2245e88e1`, not refreshed line numbers for current main. The new E2 section states the exact observed scope and remaining gates.
 **Priority:** High (inherits #2506). The independent architecture review CLAUDE.md requires for priority::high applies to this PRD and to each child before dispatch; no waiver. M0 is evidence-only and is never auto-dispatched.
@@ -56,12 +56,14 @@ Producer records (#3031) are not on main as a freeze path, but their identity cl
 
 ## Goal and acceptance (from #2506, qualified)
 
-- [ ] A thin guarded capture on a large-history repository reaches released custody without owner action, with prerequisite-lifetime evidence and native-Git restore **demonstrated by tests** (P1 replaces the issue's per-release restore verification with the trust contract plus tests; see "Trust contract"). If preservation cannot be shown, custody is retained with a specific typed refusal.
-- [ ] After a force-push that prunes the cached prerequisites, a released archive still imports into a clean clone plus a fetch of its pin ref, or release was refused. **Qualified:** this holds against default-branch rewrites and uzi's own writers; deletion of `refs/uzi-prereq/*` or rewriting of that history by a party outside uzi **after** a closure release is an accepted preservation residual (user decision 2026-10-25), following ADR-1296's existing "Later user deletion or rewriting is outside the proof" (`adr/1296-durable-run-recovery.md`, ~589-590).
+- [x] A thin guarded capture on a large-history repository reaches released custody without owner action, with prerequisite-lifetime evidence and native-Git restore **demonstrated by tests** (P1 replaces the issue's per-release restore verification with the trust contract plus tests; see "Trust contract"). If preservation cannot be shown, custody is retained with a specific typed refusal. Demonstrated by #3803 (see "#3803 landing" below).
+- [x] After a force-push that prunes the cached prerequisites, a released archive still imports into a clean clone plus a fetch of its pin ref, or release was refused. **Qualified:** this holds against default-branch rewrites and uzi's own writers; deletion of `refs/uzi-prereq/*` or rewriting of that history by a party outside uzi **after** a closure release is an accepted preservation residual (user decision 2026-10-25), following ADR-1296's existing "Later user deletion or rewriting is outside the proof" (`adr/1296-durable-run-recovery.md`, ~589-590). Demonstrated by #3803 (see "#3803 landing" below).
 - [x] No runner-clone or agent-writable ref is used as a prerequisite or as release evidence.
 - [x] Records produced by each real freeze path have a stated and tested outcome; no record gains held-publication authority; no binding or policy is reconstructed; the v2 refusal is unchanged; producer-origin records never mint a closure FINAL.
 
 ### Acceptance assessment after the child merges (2026-11-02)
+
+**Historical for goals 1 and 2:** the two **Open** rows and the remaining-work paragraph below are the pre-#3803 assessment, superseded by "#3803 landing" below. The other rows, E6 and the release limits stand.
 
 Reviewed against main `6d6e86bb2f9e275772bc3241fddb0c2a51a9cfd5`.
 All four implementation children are merged. This does not establish the two
@@ -620,6 +622,7 @@ they do not assert that hosted checks were available at that earlier time.
 - [x] C1b final exact-head hosted acceptance: required API/repo checks and the full store-it sweep passed, all 62 required names PASS with zero SKIP; advisory timing recorded below. This is not a post-deployment runtime result.
 - [x] C2 thin FINAL release, feature/worker advertisement, permission/replay/reconciliation and real freeze-path authority acceptance. Landed in [#3748](https://github.com/vtmocanu/uzi/pull/3748), merge `a07f813708ced206cd7b8c3f9d09e259b2fff64b`; final head `b6672fc5c50d7f3799936829e9ed286d3999f8ec`, [CI run 41316452742](https://github.com/vtmocanu/uzi/actions/runs/41316452742). The landing record below supersedes the historical worker-handoff gaps, not the open combined parent goals.
 - [x] C3 owner/web/CLI pin visibility and E5 restore-time acceptance. Landed in [#3778](https://github.com/vtmocanu/uzi/pull/3778), merge `11b072e83c123ae209485901d1c2298ee461a253`; final head `d26ff555a78b12e77157cdde75c2e45a691ea4e3`, [CI run 41422943989](https://github.com/vtmocanu/uzi/actions/runs/41422943989). E5 remains the explicitly scoped local full-history owner workflow recorded below, not a hosted release measurement.
+- [x] #3803 combined large-history proof (released capture through pin, FINAL, native prune and owner restore; refusal before preparation). Landed in [#3821](https://github.com/vtmocanu/uzi/pull/3821), merge `861068032794551922a2ec5587ec1ca81a1f2b1c`; final head `347dcd36560b3c7af12bf089e856e57c3b22b32b`, [CI run 41502176074](https://github.com/vtmocanu/uzi/actions/runs/41502176074). See "#3803 landing" below.
 - [ ] E6 two weeks of hosted post-roll counts and growth, including unresolved/exhausted pins and removal blockers (reporting only, not a closure gate).
 - [ ] Parent release/acceptance: all child acceptance and remaining end-to-end/rollout criteria below.
 
@@ -1279,7 +1282,7 @@ baseline `6d6e86bb2f9e275772bc3241fddb0c2a51a9cfd5`.
 Reviewer and tester reviewed source tests on the original and repair ranges.
 The primary tree was clean. M2's mandatory aggregate gate remains unmet;
 neither M2 nor M3 is completed. No formal owner completion decision is recorded.
-The parent remains active/open and goals 1/2 remain unchecked.
+At the time of this record the parent was active/open and goals 1/2 were unchecked; see "#3803 landing" below for the landing verification that ticked them.
 This evidence changes no production behavior, workflow or cap.
 
 **Execution identity.** Native linux/amd64: Go 1.27.3, Git 2.54.0,
@@ -1400,6 +1403,28 @@ E6 hosted reporting, rollout, #2969 and producer work remain out of scope.
 This sanitized summary is the durable evidence; raw logs are not tracked and
 scratch files are not durable artifact links. M2 is not waived; M3 remains partial.
 
+#### #3803 landing (2026-11-02)
+
+The owner partial decision kept M1 and deferred M2/M3 only for the aggregate
+sweep (both sweeps timed out in the worker; the cause is not established), and
+required this landing verification before ticking goals 1 and 2. PR #3821 does
+not close #3803.
+
+- The exact-head full store-it sweep passed at `347dcd36`, CI run 41502176074:
+  all seven packages `ok`, zero `--- SKIP`/`--- FAIL` at any indentation, and the
+  named retained controls listed above PASS. The opt-in proof leg also ran
+  `TestPrerequisiteClosureReleaseE2E` and
+  `TestRecoveryRestoreWorkerClientSmallE2E` (added to the store-it selector at
+  landing; it previously ran in no lane) to PASS. The full agent suite passed on
+  that head.
+- The full-history proofs and both omission controls recorded above executed at
+  candidate `f584e2cb`. The proof test files and fixture are byte-identical
+  between `f584e2cb` and merge `86106803` (`git diff` empty), so the recorded
+  results apply to the landed code. They are worker-executed, not CI-reproduced:
+  CI has no frozen full-history source.
+- Goals 1 and 2 are ticked on that basis. E6, parent release/acceptance and the
+  accepted external pin-deletion residual are unchanged; #2506 stays open.
+
 ### Parent acceptance
 
 - C1a, C1b, C2 **and C3** complete (C3 may be dropped only by a separate owner decision adopting P5).
@@ -1436,8 +1461,8 @@ recorded main median (46m34s), with about 44s of driver compilation; it is not
 relabelled as the final d26ff555 measurement. E5's owner clock excludes driver
 compilation and remains the separate local transport measurement above.
 
-No child merge establishes a hosted GitHub.com rollout, two weeks of E6 counts,
-or the two combined parent restore goals. Release remains an owner decision;
+No child merge establishes a hosted GitHub.com rollout or two weeks of E6 counts.
+The two combined parent restore goals were established later by #3803 (see "#3803 landing"). Release remains an owner decision;
 this progress-only change requests none.
 
 ## Simplification proposals still open
