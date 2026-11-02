@@ -242,6 +242,14 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 			s.persistFail.evict(r.ID)
 		}
 
+		queuedParked, err := s.parkStaleQueuedCustody(ctx, failCutoff)
+		if err != nil {
+			return res, fmt.Errorf("park stale queued custody: %w", err)
+		}
+		for _, row := range queuedParked {
+			s.publishSwept(row.ID, row.Status)
+		}
+
 		// Issue #1324 D5: a queued run whose publication intent only its custodian worker may
 		// resume is held for its owner once that worker can no longer serve it. It reads worker
 		// liveness, so it sits with the other stale-worker passes inside the boot grace.

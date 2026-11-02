@@ -189,19 +189,32 @@ func (q *Queries) HasPendingPlanCrossCheck(ctx context.Context, leadRunID uuid.U
 
 const lockWorkerRecoveryParents = `-- name: LockWorkerRecoveryParents :many
 WITH candidates AS MATERIALIZED (
-    SELECT r.id, r.kind, r.target_run_id, r.worker_id, r.claim_generation, r.user_id
+    SELECT r.id, r.kind, r.target_run_id, r.worker_id, r.claim_generation, r.user_id,
+           r.status, r.status_since, r.requeue_count, r.claimed_at,
+           r.released_worker_id, r.released_worker_nonce, r.stop_kind,
+           r.pause_mode, r.credential_switch_generation,
+           r.worker_recovery_episode, r.requeue_episode_baseline, r.claim_released_at,
+           r.pause_requested_at, r.credential_switch_requested_at, r.stop_reason, r.hold_reason
     FROM runs r
     JOIN workers w ON w.id = r.worker_id AND w.user_id = r.user_id
-    WHERE r.worker_id = $1
+    WHERE (r.worker_id = $1 OR r.worker_id = ANY($2::uuid[]))
       AND (
           r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-          OR r.id = ANY($2::uuid[])
-          OR (r.id = ANY($3::uuid[])
-              AND r.claim_generation = ($4::bigint[])[
-                  array_position($3::uuid[], r.id)])
+          OR (r.status = 'queued' AND r.claim_generation > 0 AND r.kind NOT IN ('chat','cross_check')
+              AND EXISTS (SELECT 1 FROM recovery_custody_holds h
+                  WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.state = 'open'))
+          OR r.id = ANY($3::uuid[])
+          OR (r.id = ANY($4::uuid[])
+              AND r.claim_generation = ($5::bigint[])[
+                  array_position($4::uuid[], r.id)])
       )
 ), frozen_targets AS MATERIALIZED (
-    SELECT c.id, c.kind, c.target_run_id, c.worker_id, c.claim_generation,
+    SELECT c.id, c.kind, c.target_run_id, c.worker_id, c.claim_generation, c.user_id,
+           c.status, c.status_since, c.requeue_count, c.claimed_at,
+           c.released_worker_id, c.released_worker_nonce, c.stop_kind,
+           c.pause_mode, c.credential_switch_generation,
+           c.worker_recovery_episode, c.requeue_episode_baseline, c.claim_released_at,
+           c.pause_requested_at, c.credential_switch_requested_at, c.stop_reason, c.hold_reason,
            cc.id AS cross_check_id, parent.id AS parent_lead_id
     FROM candidates c
     LEFT JOIN cross_checks cc ON c.kind = 'cross_check' AND cc.checker_run_id = c.id
@@ -221,8 +234,13 @@ WITH candidates AS MATERIALIZED (
     SELECT COALESCE(array_agg(id ORDER BY id), ARRAY[]::uuid[])::uuid[] AS locked_parent_ids
     FROM locked_parents
 )
-SELECT target.id, target.kind, target.target_run_id, target.worker_id,
-       target.claim_generation, target.cross_check_id, target.parent_lead_id,
+SELECT target.id, target.kind, target.target_run_id, target.worker_id, target.user_id,
+       target.status, target.status_since, target.requeue_count, target.claimed_at,
+       target.released_worker_id, target.released_worker_nonce, target.stop_kind,
+       target.pause_mode, target.credential_switch_generation,
+       target.claim_generation, target.worker_recovery_episode, target.requeue_episode_baseline,
+       target.claim_released_at, target.pause_requested_at, target.credential_switch_requested_at, target.stop_reason, target.hold_reason,
+       target.cross_check_id, target.parent_lead_id,
        -- Return the parent set once, avoiding targets × parents output growth.
        CASE WHEN row_number() OVER (ORDER BY target.id, target.cross_check_id) = 1
            THEN locks.locked_parent_ids ELSE ARRAY[]::uuid[] END AS locked_parent_ids
@@ -232,20 +250,38 @@ ORDER BY target.id, target.cross_check_id
 
 type LockWorkerRecoveryParentsParams struct {
 	WorkerID                 pgtype.UUID `json:"worker_id"`
+	AdditionalWorkerIds      []uuid.UUID `json:"additional_worker_ids"`
 	SnapshotRunIds           []uuid.UUID `json:"snapshot_run_ids"`
 	AttestedRunIds           []uuid.UUID `json:"attested_run_ids"`
 	AttestedClaimGenerations []int64     `json:"attested_claim_generations"`
 }
 
 type LockWorkerRecoveryParentsRow struct {
-	ID              uuid.UUID   `json:"id"`
-	Kind            string      `json:"kind"`
-	TargetRunID     pgtype.UUID `json:"target_run_id"`
-	WorkerID        pgtype.UUID `json:"worker_id"`
-	ClaimGeneration int64       `json:"claim_generation"`
-	CrossCheckID    pgtype.UUID `json:"cross_check_id"`
-	ParentLeadID    pgtype.UUID `json:"parent_lead_id"`
-	LockedParentIds []uuid.UUID `json:"locked_parent_ids"`
+	ID                          uuid.UUID          `json:"id"`
+	Kind                        string             `json:"kind"`
+	TargetRunID                 pgtype.UUID        `json:"target_run_id"`
+	WorkerID                    pgtype.UUID        `json:"worker_id"`
+	UserID                      uuid.UUID          `json:"user_id"`
+	Status                      string             `json:"status"`
+	StatusSince                 pgtype.Timestamptz `json:"status_since"`
+	RequeueCount                int32              `json:"requeue_count"`
+	ClaimedAt                   pgtype.Timestamptz `json:"claimed_at"`
+	ReleasedWorkerID            pgtype.UUID        `json:"released_worker_id"`
+	ReleasedWorkerNonce         pgtype.Text        `json:"released_worker_nonce"`
+	StopKind                    pgtype.Text        `json:"stop_kind"`
+	PauseMode                   pgtype.Text        `json:"pause_mode"`
+	CredentialSwitchGeneration  pgtype.Int8        `json:"credential_switch_generation"`
+	ClaimGeneration             int64              `json:"claim_generation"`
+	WorkerRecoveryEpisode       int64              `json:"worker_recovery_episode"`
+	RequeueEpisodeBaseline      int32              `json:"requeue_episode_baseline"`
+	ClaimReleasedAt             pgtype.Timestamptz `json:"claim_released_at"`
+	PauseRequestedAt            pgtype.Timestamptz `json:"pause_requested_at"`
+	CredentialSwitchRequestedAt pgtype.Timestamptz `json:"credential_switch_requested_at"`
+	StopReason                  pgtype.Text        `json:"stop_reason"`
+	HoldReason                  pgtype.Text        `json:"hold_reason"`
+	CrossCheckID                pgtype.UUID        `json:"cross_check_id"`
+	ParentLeadID                pgtype.UUID        `json:"parent_lead_id"`
+	LockedParentIds             []uuid.UUID        `json:"locked_parent_ids"`
 }
 
 // Internal transaction seam: the caller holds the worker row before this query.
@@ -255,6 +291,7 @@ type LockWorkerRecoveryParentsRow struct {
 func (q *Queries) LockWorkerRecoveryParents(ctx context.Context, arg LockWorkerRecoveryParentsParams) ([]LockWorkerRecoveryParentsRow, error) {
 	rows, err := q.db.Query(ctx, lockWorkerRecoveryParents,
 		arg.WorkerID,
+		arg.AdditionalWorkerIds,
 		arg.SnapshotRunIds,
 		arg.AttestedRunIds,
 		arg.AttestedClaimGenerations,
@@ -271,7 +308,24 @@ func (q *Queries) LockWorkerRecoveryParents(ctx context.Context, arg LockWorkerR
 			&i.Kind,
 			&i.TargetRunID,
 			&i.WorkerID,
+			&i.UserID,
+			&i.Status,
+			&i.StatusSince,
+			&i.RequeueCount,
+			&i.ClaimedAt,
+			&i.ReleasedWorkerID,
+			&i.ReleasedWorkerNonce,
+			&i.StopKind,
+			&i.PauseMode,
+			&i.CredentialSwitchGeneration,
 			&i.ClaimGeneration,
+			&i.WorkerRecoveryEpisode,
+			&i.RequeueEpisodeBaseline,
+			&i.ClaimReleasedAt,
+			&i.PauseRequestedAt,
+			&i.CredentialSwitchRequestedAt,
+			&i.StopReason,
+			&i.HoldReason,
 			&i.CrossCheckID,
 			&i.ParentLeadID,
 			&i.LockedParentIds,
