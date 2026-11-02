@@ -8941,6 +8941,12 @@ export class RunRunner {
     captureContinuation?: FinalizeCaptureContinuation,
   ): Promise<void> {
     const { runLog, batcher, redactText, executor, runHome } = flight;
+    // A naturally completed executor may finalize during graceful shutdown. Its
+    // publication still obeys terminal revocation and the existing shutdown deadline.
+    const publicationSignal = boundarySignal ?? flight.active?.gracefulShutdownCheckpoint?.stopSignal ??
+      flight.steering.terminalLifecycleSignal();
+    const publicationWait = (): AuthorityWait => ({ signal: publicationSignal,
+      timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, (this.shutdownDeadlineAt ?? Infinity) - Date.now())) });
     // PRD #1296 M3 — the source pinned at the finalization boundary (set below, after the
     // fetch-back). Undefined until then and for non-code-publishing / early-return kinds, so
     // the terminal drive is a no-op for report-only / not_code / pause / empty-diff exits.
@@ -9571,7 +9577,7 @@ export class RunRunner {
     // depend on the (soon torn-down) runner clone. `trackingRef` is what push +
     // changedFiles read; the runner clone is never a git source for either.
     steps?.enter("fetch_back");
-    const { trackingRef } = await this.fetchTracking(flight, barePath, runnerClone.path, result.branch);
+    const { trackingRef } = await this.fetchTracking(flight, barePath, runnerClone.path, result.branch, {}, undefined, publicationWait());
 
     // The reaped run clone owns H; another run may replace shared tracking after fetch-back.
     // A publication-only resume has no run clone holding H (its clone sits at the candidate), so H is the
@@ -10585,7 +10591,8 @@ export class RunRunner {
             claim.repo.clone_url,
             claim.secrets.forge_username,
             publication,
-            boundarySignal,
+            publicationSignal,
+            this.shutdownDeadlineAt,
           );
           flight.successfulPushedSha = sourceSha;
         },
@@ -11003,7 +11010,7 @@ export class RunRunner {
               // filter or merge driver. Re-prove BEFORE the refetch and the PAT push; blocked throws
               // RunResidueBlockedError, which every push catch below rethrows unchanged.
               await this.reproveFinalizeOrThrow(flight, "finalize_align");
-              await this.fetchTracking(flight, alignBarePath, runnerClone.path, result.branch);
+              await this.fetchTracking(flight, alignBarePath, runnerClone.path, result.branch, {}, undefined, publicationWait());
               // PRD #1416 M3 (C4): the align chain re-fetched the CLONE's aligned tip into the
               // tracking ref — and a rebase-fallback align rewrites P (fact 14), so the aligned tip
               // can itself be divergent below P. Bridge it here, AFTER the re-fetch and BEFORE the
@@ -11017,6 +11024,7 @@ export class RunRunner {
                 result.branch,
                 flight,
                 runLog,
+                undefined, undefined, publicationSignal, this.shutdownDeadlineAt,
               );
               if (o.kind === "preservation_refused") throw new PreservationRefusedError();
               if (o.kind === "failed") throw new HistoryRewrittenError(flight.publishedTip!);
@@ -11338,6 +11346,7 @@ export class RunRunner {
         result.branch,
         flight,
         runLog,
+        undefined, undefined, publicationSignal, this.shutdownDeadlineAt,
       );
       if (o.kind === "preservation_refused") throw new PreservationRefusedError();
       if (o.kind === "failed") {
@@ -16541,6 +16550,7 @@ export class RunRunner {
    */
   /** Cancellation observation changes metadata and stops the model, never grants custody authority. */
   private observeCancellation(flight: RunFlight): MaintenanceBudget {
+    const reason = new DOMException("run cancelled", "AbortError");
     try {
       const budget = flight.cancellationBudget ??= MaintenanceBudget.current() ?? this.cancellationBudgetFactory();
       MaintenanceBudget.attachObserved(`${flight.runId}:${flight.claimGeneration}`, budget);
@@ -16549,8 +16559,8 @@ export class RunRunner {
     finally {
       try { flight.steering.markCancelled(); }
       finally {
-        try { if (!flight.cancel.signal.aborted) flight.cancel.abort(); }
-        finally { flight.steering.abortLifecycle(); }
+        try { if (!flight.cancel.signal.aborted) flight.cancel.abort(reason); }
+        finally { flight.steering.abortLifecycle(reason); }
       }
     }
   }
@@ -19050,8 +19060,9 @@ export class RunRunner {
         throw new SecretRemediationPendingError();
     };
     checkIdentity();
-    return this.git.withRecoveryOperation(
-      signal ?? this.shutdownSignal.signal, deadlineAt ?? Infinity, async () => {
+    // Bound the evidence reads below individually. The consumer retains its own
+    // checkpoint soft/hard clock; a soft stop must not become a recovery hard abort.
+    return (async () => {
       // This bounded query selects no source and conveys only negative knowledge.
       const preliminary = await this.bootstrapRemediationRestrictions(flight, barePath, branch, signal, deadlineAt);
       checkIdentity();
@@ -19151,21 +19162,22 @@ export class RunRunner {
         ? this.inFlightAuthority(flight, execute, { ...this.authorityWait(flight), ...(signal ? { signal } : {}),
           ...(deadlineAt ? { timeoutMs: Math.max(1, deadlineAt - Date.now()) } : {}) })
         : execute();
-    });
+    })();
   }
 
   /** Final push seam, shared by plain and aligned candidates and every network retry. */
   private async pushRemediationCandidate(flight: RunFlight, barePath: string, branch: string,
     pat: string, repoUrl: string, username: string | undefined,
-    publication: Parameters<GitCache["pushBranch"]>[5], signal?: AbortSignal): Promise<void> {
+    publication: Parameters<GitCache["pushBranch"]>[5], signal?: AbortSignal, deadlineAt?: number): Promise<void> {
     await this.withRemediationCandidateAdmission(flight, barePath, branch, admission =>
+      this.git.withRecoveryOperation(signal ?? this.shutdownSignal.signal, deadlineAt ?? Infinity, () =>
       this.git.pushBranch(barePath, branch, pat, repoUrl, username, publication,
         async (candidate, context: PushPublicationContext) => {
           if (!context.restrictionFacts || context.originalFloor.kind === "unverified") throw new SecretRemediationPendingError();
           await admission.admit(context.originalHead, candidate,
             [context.originalFloor, context.remoteFloor].flatMap(floor => floor.kind === "pinned" ? [floor.oid] : []),
             context.restrictionFacts);
-        }, admission.identity), signal);
+        }, admission.identity)), signal, deadlineAt);
   }
 
   private async checkpointRemediationHold(
@@ -20061,7 +20073,8 @@ export class RunRunner {
     // failure (unlike the void fetchBackBestEffort), so a failed transfer is caught here.
     let fetched: Extract<TrackingUpdateResult, { kind: "updated" }>;
     try {
-      fetched = await this.fetchTracking(flight, barePath, worktreePath, branch);
+      fetched = await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
+        heldCapture ? { signal: heldCapture.signal, timeoutMs: Math.max(1, heldCapture.deadlineAt - Date.now()) } : undefined);
       check();
     } catch (e) {
       runLog.warn("recovery: settle transfer fetch-back failed", { error: errMessage(e) });
@@ -22427,7 +22440,9 @@ export class RunRunner {
       );
       return { verified: false, published: false };
     }
-    await this.bootstrapRemediationRestrictions(flight, undefined, undefined, opts.signal);
+    const captureDeadline = Math.min(opts.episode?.deadlineAt ?? Infinity,
+      opts.heldCapture?.deadlineAt ?? Infinity, opts.heldAuthenticated?.deadlineAt ?? Infinity);
+    await this.bootstrapRemediationRestrictions(flight, undefined, undefined, opts.signal, captureDeadline);
     // issue #1783 (auditor M2): prove the clone quiescent BEFORE the capture (its wip marker, the
     // fetch-back and the credentialed overlay + publish). On survivors/unverified NOTHING runs:
     // the result is unverified and `residueBlocked`, which each caller treats as its
@@ -22489,7 +22504,9 @@ export class RunRunner {
     // failed fetch-back is caught here rather than being swallowed.
     try {
       await opts.beforeMutation?.();
-      await this.fetchTracking(flight, barePath, worktreePath, branch);
+      const held = opts.heldCapture ?? opts.heldAuthenticated;
+      await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
+        held ? { signal: held.signal, timeoutMs: Math.max(1, held.deadlineAt - Date.now()) } : undefined);
       await opts.beforeMutation?.();
     } catch (e) {
       if (opts.beforeMutation) throw e;
@@ -23608,7 +23625,9 @@ export class RunRunner {
     // fetchAgentBranch THROWS on failure (unlike the void fetchBackBestEffort), so a failed
     // fetch-back is caught here rather than swallowed.
     try {
-      await this.fetchTracking(flight, barePath, worktreePath, branch);
+      const held = options.heldCapture ?? options.heldAuthenticated;
+      await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
+        held ? { signal: held.signal, timeoutMs: Math.max(1, held.deadlineAt - Date.now()) } : undefined);
     } catch (e) {
       if (options.heldAuthenticated || options.heldCapture) throw e;
       runLog.warn("completion hold capture: fetch-back failed", { error: errMessage(e) });

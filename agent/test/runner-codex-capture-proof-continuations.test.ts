@@ -76,8 +76,13 @@ for (const route of ["uncertain-ACK", "guarded-question", "outer-owner-question"
     };
     const recoveryOperation = git.withRecoveryOperation.bind(git);
     t.mock.method(git, "withRecoveryOperation", (async (...args: Parameters<typeof recoveryOperation>) => {
-      if (continuing) recoveryDeadlines.push(args[1]);
-      return recoveryOperation(...args);
+      return recoveryOperation(args[0], args[1], async signal => {
+        if (continuing) {
+          const current = (git as unknown as { recoveryOperation(): { deadline: number } }).recoveryOperation();
+          recoveryDeadlines.push(current.deadline);
+        }
+        return args[2](signal);
+      }, args[3]);
     }) as typeof recoveryOperation);
     const branchTip = git.branchTip.bind(git);
     t.mock.method(git, "branchTip", async (...args: Parameters<typeof branchTip>) => {

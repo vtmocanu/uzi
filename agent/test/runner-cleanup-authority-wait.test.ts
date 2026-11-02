@@ -384,7 +384,10 @@ describe("runner.ts: which sites use the cleanup wait", () => {
     const deletions = starts("this.inAuthority(() => this.git.deleteRecoveryPin(").map(statement);
     assert.equal(deletions.length, 2);
     assert.ok(deletions.every(s => s.includes("this.cleanupAuthorityWait(")), deletions.join("\n"));
-    assert.equal(starts("this.cleanupAuthorityWait(").length, 2, "no other caller");
+    const endSource = source.slice(source.indexOf("private async endFlightSourceUse("), source.indexOf("private async endFlightSourceUse(") + 4000);
+    assert.ok(endSource.includes("this.cleanupAuthorityWait(this.sourceUseEndWaitMs)"),
+      "pending remediation confirmation at source-use end uses the bounded cleanup lifecycle");
+    assert.equal(starts("this.cleanupAuthorityWait(").length, 3, "only the two deletions and source-use end");
     assert.equal(deletions.filter(s => s.includes("flight.barePath!, flight.runId, gen)")).length, 1);
     assert.equal(deletions.filter(s => s.includes("record.sourceSha")).length, 1);
   });
@@ -410,6 +413,8 @@ describe("runner.ts: which sites use the cleanup wait", () => {
     const receiptSlots = starts("await authority.verifyReceiptSlots(").map(statement);
     assert.equal(receiptSlots.length, 2);
     assert.ok(receiptSlots.every(s => s.includes("this.authorityWait(flight)")), receiptSlots.join("\n"));
-    assert.equal(starts("this.authorityWait(").length, 9, "no other authorityWait caller");
+    assert.ok(statement(source.indexOf("await this.inFlightAuthority(flight, () => this.git.recordRemediationRestrictions(")).includes("this.authorityWait(flight)"));
+    assert.ok(statement(source.indexOf("await this.inFlightAuthority(flight, () => this.git.recordRemediationScan(")).includes("this.authorityWait(flight)"));
+    assert.equal(starts("this.authorityWait(").length, 15, "live source, remediation and existing admission waits remain enumerated");
   });
 });

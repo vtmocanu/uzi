@@ -5787,15 +5787,22 @@ export class GitCache {
     if (opts.checkpointImportMode === "milestone") await this.maskCheckpointCooperation(prepare);
     else await prepare();
     opts.checkpointStep?.("checkpoint_import_lock_wait");
-    const authenticate = async (): Promise<void> => {
+    const authenticate = async (): Promise<boolean> => {
       this.checkCheckpointCooperation();
-      const enrolled = await this.readRecoveryCapture(barePath, branch);
+      let enrolled: RecoveryJournalEntry | undefined;
+      try { enrolled = await this.readRecoveryCapture(barePath, branch); }
+      catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return false;
+      }
       if (enrolled?.remediationRecovery && !opts.producingSource) throw new Error("remediation producing source required");
       if (opts.producingSource) {
         if (opts.producingSource.clonePath !== clonePath || opts.producingSource.runId !== runId)
           throw new Error("remediation producing source mismatch");
         await this.remediationSourceUnderLock(barePath, branch, opts.producingSource);
       }
+      return true;
     };
     const stage = `refs/uzi-incoming/${randomUUID()}`;
     const acquireIncoming = async (): Promise<string> => {
@@ -5815,12 +5822,12 @@ export class GitCache {
       this.checkCheckpointCooperation();
       return incoming;
     };
-    const promoteIncoming = async (incoming: string): Promise<TrackingUpdateResult> => {
+    const promoteIncoming = async (incoming: string, authenticated = true): Promise<TrackingUpdateResult> => {
       // No observation survives an unlocked phase: preservation and CAS use current B custody.
-      let observed = await this.observeTrackingUnderLock(barePath, branch);
+      let observed = authenticated ? await this.observeTrackingUnderLock(barePath, branch) : undefined;
       if (observed) this.dropTrackingAttempt(opts.attemptToken, barePath, branch);
       let repairedRetained: string[] = [];
-      if (!observed) {
+      if (!observed && authenticated) {
         // issue #3780: finish this flight's own stranded attempt, then promote the CURRENT incoming normally.
         const repaired = await this.repairThenObserveUnderLock(barePath, branch, opts);
         if (repaired) ({ observed, retainedShas: repairedRetained } = repaired);
@@ -5884,8 +5891,8 @@ export class GitCache {
       // Canonical imports keep their single B section and need no source authority.
       return this.withLock(barePath, () => {
         const importBranch = async () => {
-          await authenticate();
-          return promoteIncoming(await acquireIncoming());
+          const authenticated = await authenticate();
+          return promoteIncoming(await acquireIncoming(), authenticated);
         };
         return opts.checkpointImportMode === "milestone"
           ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
@@ -5895,17 +5902,21 @@ export class GitCache {
       !this.authority && !this.authorityRequired ? <T>(action: () => Promise<T>) => action() : undefined);
     if (!withSourceAuthority) throw new Error("producing source requires trusted authority callback");
     // A -> B only for proof. The awaited transport owns B and the flight source use,
-    // but holds no A. A refusal or uncertain join retains the unique private stage.
-    await withSourceAuthority(() => this.withLock(barePath, () =>
+    // but holds no A. Refusal keeps the caller's source clone; acquired input
+    // follows the existing private-stage and owed-anchor preservation rules.
+    const authenticated = await withSourceAuthority(() => this.withLock(barePath, () =>
       opts.checkpointImportMode === "milestone" ? this.maskCheckpointCooperation(authenticate) : authenticate()));
+    // No transport has started. fetchTracking retains the producing clone and
+    // HOME on this refusal; no imported incoming pin is claimed on this path.
+    if (!authenticated) return { kind: "not_updated", reason: "ownership_unknown" };
     const importBranch = async () => {
       const incoming = await this.withLock(barePath, acquireIncoming);
       return withSourceAuthority(() => this.withLock(barePath, async () => {
-        await authenticate();
+        const authenticated = await authenticate();
         if (await this.resolveCommitStrict(barePath, stage) !== incoming)
           throw new Error("checkpoint private stage changed before promotion");
         await this.requireOwedCommit(barePath, incoming);
-        return promoteIncoming(incoming);
+        return promoteIncoming(incoming, authenticated);
       }));
     };
     return opts.checkpointImportMode === "milestone"
