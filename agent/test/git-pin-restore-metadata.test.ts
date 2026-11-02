@@ -458,6 +458,113 @@ describe("metadata regression boundaries", () => {
     });
   });
 
+  for (const mode of ["ordinary", "epoch", "census"] as const) {
+    for (const large of [false, true]) {
+      it(`bounds actual standalone native decode bodies for ${mode} ${large ? "400093 bytes" : "16KiB journals"}`, async t => {
+        config(ACTIVE_KEY, JSON.stringify({ runId: RUN, clonePath: canonical }));
+        const raws = new Set<string>();
+        const count = large ? 1 : mode === "ordinary" ? 33 : 22;
+        const size = large ? 400093 : 16384;
+        for (let i = 0; i < count; i++) {
+          const plain = JSON.stringify({ runId: "run-standalone-" + i,
+            clonePath: i === 0 ? canonical : cache.runnerClonePath(bare, "standalone-" + i),
+            sourceGeneration: 1 });
+          const raw = plain + " ".repeat(size - Buffer.byteLength(plain));
+          raws.add(raw);
+          // Write the real config value without the platform's single-argv size limit.
+          fs.appendFileSync(path.join(bare, "config"),
+            '\n[uzi-recovery "agent/standalone-' + i + '"]\nclone = "' +
+            raw.replaceAll("\\", "\\\\").replaceAll('"', '\\"') + '"\n');
+        }
+        let actual = 0, charged = 0, admitted = 0;
+        const parse = JSON.parse;
+        const consume = PinRestoreDecodeBudget.prototype.consume;
+        t.mock.method(JSON, "parse", (raw: string, ...args: unknown[]) => {
+          if (raws.has(raw)) actual += Buffer.byteLength(raw);
+          return Reflect.apply(parse, JSON, [raw, ...args]);
+        });
+        t.mock.method(PinRestoreDecodeBudget.prototype, "consume", function(this: PinRestoreDecodeBudget, bytes: number) {
+          charged += bytes;
+          consume.call(this, bytes);
+          admitted += bytes;
+        });
+        let unreadable: number;
+        if (mode === "census") {
+          const result = await cache.discoverEpochRetainedSources({ deadline: Date.now() + 60000 });
+          unreadable = result.unreadable;
+          assert.equal(result.inventoryComplete, false);
+        } else {
+          const result = await cache.inspectRetainedSources({ barePath: bare, epoch: mode === "epoch",
+            budgetMs: 60000, isLivePath: () => false,
+            selector: { runId: "run-standalone-0", generation: 1, attempt: "canonical" } });
+          unreadable = result.unreadable;
+        }
+        assert.ok(actual > 0, "instrument the actual native body parser");
+        assert.ok(actual <= 1048576, `actual native body bytes: ${actual}`);
+        assert.equal(actual, admitted, "every native new-form body must spend decode budget");
+        assert.equal(actual, mode === "ordinary" ? count * size : Math.floor(1048576 / size) * size);
+        assert.equal(charged, actual + (mode === "ordinary" ? 0 : size));
+        // protectedRecoveries reads config again: epoch preflight must refuse that
+        // later read before its next native body would overflow the operation.
+        assert.equal(unreadable, mode === "ordinary" ? 0 : 1);
+      });
+    }
+  }
+
+  for (const corrupt of ["foreign-key", "orphan", "changed-binding"] as const) {
+    it("does not reuse gathered validation after " + corrupt, async t => {
+      activate(); retain();
+      const guard = guardSources(t);
+      const inspect = () => cache.inspectRetainedSources({ barePath: bare, epoch: true,
+        selector: { runId: RUN, generation: 1, attempt: "canonical" },
+        budgetMs: 60000, isLivePath: guard.isLivePath, beforeTree: guard.beforeTree });
+      assert.equal((await inspect()).unreadable, 0);
+      if (corrupt === "foreign-key") config("uzi-recovery.agent/foreign.clone", JSON.stringify(newJournal()));
+      if (corrupt === "orphan") git(bare, ["config", "--local", "--unset-all", RETAINED_KEY]);
+      if (corrupt === "changed-binding")
+        config(ACTIVE_KEY, JSON.stringify({ ...newJournal(), sourceGeneration: 3 }));
+      const result = await inspect();
+      assert.equal(result.unreadable, 1);
+      assert.deepEqual(result.sources, []);
+      guard.assertUntouched();
+    });
+  }
+
+  it("keeps actual decode budget across bares but never a parse cache across operations", async t => {
+    const second = path.join(path.dirname(bare), "second.git");
+    git(path.dirname(bare), ["clone", "--bare", "--no-hardlinks", fx.originPath, second]);
+    fs.chmodSync(second, 0o700);
+    const plain = JSON.stringify({ runId: RUN, clonePath: canonical, sourceGeneration: 1 });
+    const raw = plain + " ".repeat(400093 - Buffer.byteLength(plain));
+    for (const target of [bare, second]) {
+      // Identical bytes in another bare must still undergo its own metadata read.
+      if (target === bare) git(bare, ["config", "--local", "--unset-all", ACTIVE_KEY]);
+      fs.appendFileSync(path.join(target, "config"),
+        '\n[uzi-recovery "agent/large"]\nclone = "' +
+        raw.replaceAll("\\", "\\\\").replaceAll('"', '\\"') + '"\n');
+    }
+    let actual = 0;
+    const parse = JSON.parse;
+    t.mock.method(JSON, "parse", (text: string, ...args: unknown[]) => {
+      if (text === raw) actual += Buffer.byteLength(text);
+      return Reflect.apply(parse, JSON, [text, ...args]);
+    });
+    await cache.withRecoveryOperation(new AbortController().signal, Date.now() + 60000, async () => {
+      for (const target of [bare, second]) {
+        await cache.inspectRetainedSources({ barePath: target, budgetMs: 60000, isLivePath: () => false });
+      }
+      assert.equal(actual, 800186, "each bare must decode its own captured snapshot");
+      const refused = await cache.inspectRetainedSources({ barePath: second, budgetMs: 60000, isLivePath: () => false });
+      assert.equal(actual, 800186, "the shared operation must refuse before native overflow");
+      assert.equal(refused.unreadable, 1);
+    });
+    for (const target of [bare, second]) {
+      actual = 0;
+      await cache.inspectRetainedSources({ barePath: target, budgetMs: 60000, isLivePath: () => false });
+      assert.equal(actual, 400093, "each independent operation must actually decode its own snapshot");
+    }
+  });
+
   for (const count of [33, 65]) {
     it(`inspection shares validated metadata and the 1MiB decode limit for ${count} envelopes`, async t => {
       config(ACTIVE_KEY, JSON.stringify({ runId: RUN, clonePath: canonical }));

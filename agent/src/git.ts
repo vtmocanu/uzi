@@ -7546,7 +7546,8 @@ export class GitCache {
 
 
   /** Strict metadata-only V2 view. It grants neither source access nor execution. */
-  async readRetainedPinMetadata(barePath: string, config?: readonly string[], selectedRunId?: string): Promise<Array<{
+  async readRetainedPinMetadata(barePath: string, config?: readonly string[], selectedRunId?: string,
+    validatedActive?: Map<string, RecoveryJournalEntry>): Promise<Array<{
     raw: string; envelope: RetainedPinEnvelope; activeRaw: string | undefined; activeJournal: RecoveryJournalEntry | undefined;
     relation: "prepared-old" | "prepared-new" | "ready-new" | "absent";
     originals: Array<{ raw: string; journal: RecoveryJournalEntry; generation: number; sourceEpoch: string }>;
@@ -7555,7 +7556,7 @@ export class GitCache {
     const now = Date.now();
     if (!this.recoveryOperations.getStore() && Number.isFinite(now))
       return this.withRecoveryOperation(new AbortController().signal, now + 30_000,
-        () => this.readRetainedPinMetadata(barePath, config, selectedRunId));
+        () => this.readRetainedPinMetadata(barePath, config, selectedRunId, validatedActive));
     await this.assertRecoveryBare(barePath);
     const entries = config ?? (await this.runGit(barePath,
       ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
@@ -7743,11 +7744,19 @@ export class GitCache {
         }
         if (!charged) continue;
         journal = recoveryJournalValue(value, raw);
+        decoded.set(raw, journal);
       }
       // Cached raw bytes do not establish attribution for another config key.
       if (journal.pinRestore && !records.some(r => recoveryCaptureKey(r.envelope.branch) === name &&
           r.envelope.runId === journal.runId && r.activeRaw === raw))
         throw new Error("orphaned pin restore active journal");
+    }
+    // Publish only after every config key and crosslink in this snapshot passed.
+    // This transient parse cache carries no authority across reads or operations.
+    if (validatedActive) for (const [name, raw] of values) {
+      if (!name.startsWith("uzi-recovery.")) continue;
+      const journal = decoded.get(raw);
+      if (journal) validatedActive.set(raw, journal);
     }
     return records;
   }
@@ -9668,11 +9677,9 @@ export class GitCache {
     await this.assertRecoveryBare(barePath);
     const list = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
     const runnerRoot = path.resolve(this.runnerRoot);
-    const pinRecords = await this.readRetainedPinMetadata(barePath, list);
+    const pinJournals = new Map<string, RecoveryJournalEntry>();
+    const pinRecords = await this.readRetainedPinMetadata(barePath, list, undefined, pinJournals);
     const pinPaths = await this.retainedPinPaths(barePath, list, pinRecords);
-    const pinJournals = new Map(pinRecords.flatMap(record =>
-      record.activeRaw !== undefined && record.activeJournal
-        ? [[record.activeRaw, record.activeJournal] as const] : []));
     const ledger = new Map<string, AttemptLedgerEntry & { branch: string }>();
     const ledgerRaw = new Map<string, string>();
     const ledgerPaths = new Map<string, Set<string>>();
