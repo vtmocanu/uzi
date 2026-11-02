@@ -76,7 +76,19 @@ test("bad MAC retains attempts above the diagnostic limit, every ledger state, a
     assert.ok(fs.existsSync(seeded.path));
     assert.equal(JSON.parse(cmd(bare, "config", "--get", `uzi-recovery.${branch}.clone`)).runId, run);
     await assert.rejects(git.removeRunnerClone(seeded.path, run), /terminal record custody/);
-    fs.unlinkSync(terminal);
+    const heldTerminal = path.join(root, "retained-terminal-record");
+    fs.renameSync(terminal, heldTerminal);
+    await assert.rejects(git.retireRunnerClone(bare, seeded.path, branch, run, { discard: true }), /terminal record custody/);
+    assert.ok(fs.existsSync(seeded.path), "physical disappearance cannot release retained uncertainty");
+    fs.renameSync(heldTerminal, terminal);
+    const observation = await box.observeTerminalAuthentication(run, 3);
+    const workerId = "22222222-2222-4222-8222-222222222222";
+    assert.equal(await box.cleanupRejectedTerminalFiles(run, 3, workerId, [observation], async () => ({
+      run_id: run, worker_id: workerId, generation: 3, outcome: "settled",
+      complete: true, exact_complete: true, sibling_complete: true,
+      exact_count: 1, sibling_count: 0, sibling_holds: [],
+      exact_holds: [{ id: "33333333-3333-4333-8333-333333333333", state: "released" }],
+    })), 1, "only guarded exact rejection disposal releases custody");
     await git.retireRunnerClone(bare, seeded.path, branch, run, { discard: true });
     assert.equal(fs.existsSync(seeded.path), false);
   } finally {
