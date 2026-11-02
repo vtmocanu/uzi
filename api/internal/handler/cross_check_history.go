@@ -163,7 +163,7 @@ func crossCheckHistoryText(s string, max int) string {
 }
 
 func historyStatus(s string) string {
-	if historyMember(s, "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "completed", "failed", "cancelled") {
+	if historyMember(s, "queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait", "paused", "recovery_wait", "completed", "failed", "cancelled") {
 		return s
 	}
 	return "unknown"
