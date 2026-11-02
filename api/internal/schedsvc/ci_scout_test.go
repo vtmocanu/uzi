@@ -31,6 +31,7 @@ type scoutFake struct {
 	block               bool
 	calls               []string
 	unlimited           int
+	onRead              func(context.Context, string) error
 }
 
 func (s *scoutFake) record(ctx context.Context, call string) error {
@@ -40,6 +41,11 @@ func (s *scoutFake) record(ctx context.Context, call string) error {
 		s.unlimited++
 	}
 	s.mu.Unlock()
+	if s.onRead != nil {
+		if err := s.onRead(ctx, call); err != nil {
+			return err
+		}
+	}
 	if s.block {
 		<-ctx.Done()
 		return ctx.Err()
@@ -89,6 +95,369 @@ func (f *fakeForge) JobLogTail(ctx context.Context, _ int64, id int64, _ int) (s
 		return "", err
 	}
 	return f.scout.tails[id], nil
+}
+
+// History cancellation is synchronous: no timer or wall-clock wait drives these tests.
+func scoutInjectedHistory(cancelOut *context.CancelCauseFunc, released *bool) scoutCollectorConfig {
+	return scoutCollectorConfig{historyContext: func(parent context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+		ctx, cancel := context.WithCancelCause(parent)
+		*cancelOut = cancel
+		return ctx, func() {
+			*released = true
+			cancel(context.Canceled)
+		}
+	}}
+}
+
+func TestCollectScoutSpreadsHistoryAcrossPopulationsWeeksAndTails(t *testing.T) {
+	s := newScoutFake()
+	for i := 0; i < 70; i++ {
+		id := int64(i + 1)
+		age := time.Duration(i+1) * time.Hour
+		if i >= 30 && i < 50 {
+			age = 8*24*time.Hour + time.Duration(i-30)*time.Hour
+		}
+		if i >= 60 {
+			age = 8*24*time.Hour + time.Duration(i-60)*time.Hour
+		}
+		r := ghRun(id, "ci", fmt.Sprint(id), scoutT0.Add(-age))
+		if i < 50 {
+			s.main = append(s.main, r)
+		} else {
+			r.Event, r.Branch = "pull_request", "feature"
+			s.pr = append(s.pr, r)
+		}
+		status := "success"
+		if id == 31 {
+			status = "failure"
+			s.tails[id] = "prior main failure"
+		}
+		s.jobs[id] = []forge.Job{job(id, "unit", status, attempt(1), r.CreatedAt, r.CreatedAt.Add(time.Minute))}
+	}
+	parent := forge.WithCIRepairReadLimits(context.Background())
+	var cancel context.CancelCauseFunc
+	released := false
+	calls := 0
+	s.onRead = func(ctx context.Context, call string) error {
+		if strings.HasPrefix(call, "attempts:") {
+			calls++
+			if calls == 13 {
+				cancel(errScoutHistoryShare)
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+	d := collectScout(parent, &fakeForge{scout: s}, "github", 42, "main", scoutT0, scoutInjectedHistory(&cancel, &released))
+	if parent.Err() != nil || !released {
+		t.Errorf("parent err=%v, constructor released=%v", parent.Err(), released)
+	}
+	if calls != 13 || d.Collected[scoutPopMain]+d.Collected[scoutPopPR] != 12 {
+		t.Errorf("history calls=%d collected=%v, want 13 calls / 12 successes", calls, d.Collected)
+	}
+	if d.Collected[scoutPopPR] == 0 {
+		t.Error("no PR history collected")
+	}
+	for _, pop := range []string{scoutPopMain, scoutPopPR} {
+		for _, recent := range []bool{true, false} {
+			if !slices.ContainsFunc(d.Runs, func(r scoutRun) bool {
+				return r.Pop == pop && !r.JobsMissing && (scoutT0.Sub(r.Run.CreatedAt) <= scoutWeek) == recent
+			}) {
+				t.Errorf("missing history for population %s recent=%v", pop, recent)
+			}
+		}
+	}
+	if !slices.Contains(s.calls, "log:31") || len(d.Logs) == 0 {
+		t.Errorf("reserved tails missing: calls=%v logs=%v", s.calls, d.Logs)
+	}
+	if !slices.Contains(d.Notes, "job history stopped at its share of the collection deadline") {
+		t.Errorf("share note missing: %v", d.Notes)
+	}
+	if slices.ContainsFunc(d.Notes, func(n string) bool { return strings.Contains(n, "collection deadline passed") }) {
+		t.Errorf("live parent reported expired: %v", d.Notes)
+	}
+	if d.Selected[scoutPopMain] != 50 || d.Selected[scoutPopPR] != 20 || len(d.Runs) != 70 {
+		t.Errorf("selection changed: selected=%v runs=%d", d.Selected, len(d.Runs))
+	}
+	for i, r := range d.Runs {
+		wantPop := scoutPopMain
+		if i >= 50 {
+			wantPop = scoutPopPR
+		}
+		if r.Pop != wantPop || r.Run.ID != int64(i+1) {
+			t.Errorf("stored entry %d = %s/%d, want %s/%d", i, r.Pop, r.Run.ID, wantPop, i+1)
+			break
+		}
+	}
+	if s.unlimited != 0 {
+		t.Errorf("%d reads lost inherited limits", s.unlimited)
+	}
+}
+
+func TestScoutVisitOrder(t *testing.T) {
+	// Inputs are deliberately unsorted, with tied times and the inclusive boundary.
+	main := []forge.WorkflowRun{
+		ghRun(1, "", "", scoutT0.Add(-8*24*time.Hour)),
+		ghRun(2, "", "", scoutT0.Add(-scoutWeek)),
+		ghRun(3, "", "", scoutT0.Add(-time.Hour)),
+		ghRun(4, "", "", scoutT0.Add(-time.Hour)),
+	}
+	pr := []forge.WorkflowRun{
+		ghRun(5, "", "", scoutT0.Add(-9*24*time.Hour)),
+		ghRun(6, "", "", scoutT0.Add(-2*time.Hour)),
+		ghRun(7, "", "", scoutT0.Add(-scoutWeek-time.Nanosecond)),
+	}
+	for _, tc := range []struct {
+		name     string
+		main, pr []forge.WorkflowRun
+		want     []scoutVisit
+	}{
+		{"all", main, pr, []scoutVisit{{scoutPopMain, 3}, {scoutPopPR, 1}, {scoutPopMain, 0}, {scoutPopPR, 2}, {scoutPopMain, 2}, {scoutPopPR, 0}, {scoutPopMain, 1}}},
+		{"empty", nil, nil, []scoutVisit{}},
+		{"single bucket", main[2:], nil, []scoutVisit{{scoutPopMain, 1}, {scoutPopMain, 0}}},
+		{"empty intervening buckets", main[:1], pr[1:2], []scoutVisit{{scoutPopPR, 0}, {scoutPopMain, 0}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mainBefore, prBefore := slices.Clone(tc.main), slices.Clone(tc.pr)
+			first := scoutVisitOrder(tc.main, tc.pr, scoutT0)
+			for prefix := 0; prefix <= len(tc.want); prefix++ {
+				again := scoutVisitOrder(tc.main, tc.pr, scoutT0)
+				if len(again) != len(tc.want) || !slices.Equal(again[:prefix], tc.want[:prefix]) {
+					t.Errorf("prefix %d: order=%v want=%v", prefix, again, tc.want)
+				}
+				if !slices.Equal(first, again) {
+					t.Errorf("order changed across repeated calls: %v vs %v", first, again)
+				}
+			}
+			if !slices.EqualFunc(tc.main, mainBefore, func(a, b forge.WorkflowRun) bool { return a.ID == b.ID && a.CreatedAt.Equal(b.CreatedAt) }) ||
+				!slices.EqualFunc(tc.pr, prBefore, func(a, b forge.WorkflowRun) bool { return a.ID == b.ID && a.CreatedAt.Equal(b.CreatedAt) }) {
+				t.Error("visit ordering mutated input")
+			}
+		})
+	}
+}
+
+// Done and Value come from WithCancelCause; Err supplies the deterministic deadline
+// state a real expiring parent exposes, without waiting for a clock.
+type scoutExpiredParent struct{ context.Context }
+
+func (c scoutExpiredParent) Err() error {
+	if c.Context.Err() != nil {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+func TestCollectScoutHistoryCancellationPrecedence(t *testing.T) {
+	for _, mode := range []string{"share", "parent", "budget", "unsupported share", "unsupported parent", "fallback share", "fallback parent", "listings consumed allocation"} {
+		t.Run(mode, func(t *testing.T) {
+			s := newScoutFake()
+			s.main = []forge.WorkflowRun{ghRun(1, "ci", "a", at(-1)), ghRun(2, "ci", "b", at(-2)), ghRun(3, "ci", "c", at(-3))}
+			for _, r := range s.main {
+				s.jobs[r.ID] = []forge.Job{job(r.ID, "unit", "failure", attempt(1), at(-1), at(0))}
+				s.tails[r.ID] = "tail"
+			}
+			base, cancelParent := context.WithCancelCause(context.Background())
+			defer cancelParent(context.Canceled)
+			parent := scoutExpiredParent{forge.WithCIRepairReadLimits(base)}
+			var cancelHistory context.CancelCauseFunc
+			released := false
+			config := scoutInjectedHistory(&cancelHistory, &released)
+			if mode == "listings consumed allocation" {
+				constructor := config.historyContext
+				config.historyContext = func(ctx context.Context, reserve time.Duration) (context.Context, context.CancelFunc) {
+					child, cancel := constructor(ctx, reserve)
+					cancelHistory(errScoutHistoryShare)
+					return child, cancel
+				}
+			}
+			s.onRead = func(ctx context.Context, call string) error {
+				trigger := call == "attempts:2"
+				if strings.HasPrefix(mode, "fallback") {
+					if call == "attempts:2" {
+						return forge.ErrJobAttemptsUnsupported
+					}
+					trigger = call == "jobs:2"
+				}
+				if !trigger {
+					return nil
+				}
+				if strings.Contains(mode, "parent") {
+					cancelParent(context.DeadlineExceeded)
+					select {
+					case <-parent.Done():
+					default:
+						t.Error("parent Done is still open after expiry")
+					}
+					select {
+					case <-ctx.Done():
+					default:
+						t.Error("history Done is still open after parent expiry")
+					}
+					// WithCancelCause propagates Canceled in Err and the deadline in Cause.
+					if ctx.Err() != context.Canceled || context.Cause(ctx) != context.DeadlineExceeded ||
+						parent.Err() != context.DeadlineExceeded || context.Cause(parent) != context.DeadlineExceeded {
+						t.Errorf("deadline propagation: child err=%v cause=%v parent err=%v cause=%v", ctx.Err(), context.Cause(ctx), parent.Err(), context.Cause(parent))
+					}
+					if mode == "unsupported parent" {
+						return forge.ErrJobAttemptsUnsupported
+					}
+					return context.DeadlineExceeded
+				}
+				cancelHistory(errScoutHistoryShare)
+				if mode == "budget" {
+					return forge.ErrCIReadBudget
+				}
+				if mode == "unsupported share" {
+					return forge.ErrJobAttemptsUnsupported
+				}
+				return ctx.Err()
+			}
+			d := collectScout(parent, &fakeForge{scout: s}, "github", 42, "main", scoutT0, config)
+			share := !strings.Contains(mode, "parent") && mode != "budget"
+			if !released {
+				t.Error("constructor cancel was not released")
+			}
+			wantNote := "job history stopped at its share of the collection deadline"
+			if mode == "budget" {
+				wantNote = "the CI read budget was exhausted; collection stopped early"
+			} else if strings.Contains(mode, "parent") {
+				wantNote = "the collection deadline passed; collection stopped early"
+			}
+			if !slices.Contains(d.Notes, wantNote) {
+				t.Errorf("notes=%v want %q", d.Notes, wantNote)
+			}
+			if !share && slices.Contains(d.Notes, "job history stopped at its share of the collection deadline") {
+				t.Errorf("share incorrectly won precedence: %v", d.Notes)
+			}
+			if mode == "listings consumed allocation" {
+				if slices.ContainsFunc(s.calls, func(c string) bool { return strings.HasPrefix(c, "attempts:") || strings.HasPrefix(c, "jobs:") }) {
+					t.Errorf("history called after allocation expired: %v", s.calls)
+				}
+				if !slices.Contains(s.calls, "runs:pull_request") {
+					t.Errorf("parent listings stopped by history cancellation: %v", s.calls)
+				}
+			} else {
+				if (len(d.Logs) > 0) != share {
+					t.Errorf("logs=%v share=%v calls=%v", d.Logs, share, s.calls)
+				}
+				if slices.Contains(s.calls, "attempts:3") {
+					t.Errorf("history continued after cancellation: %v", s.calls)
+				}
+				if strings.HasPrefix(mode, "unsupported") && slices.Contains(s.calls, "jobs:2") {
+					t.Errorf("fallback called after cancellation: %v", s.calls)
+				}
+			}
+		})
+	}
+}
+
+func TestCollectScoutDuplicateIDsAcrossPopulations(t *testing.T) {
+	s := newScoutFake()
+	s.main = []forge.WorkflowRun{ghRun(1, "main-workflow", "a", at(-1))}
+	s.pr = []forge.WorkflowRun{ghRun(1, "pr-workflow", "b", at(-2))}
+	s.jobs[1] = []forge.Job{job(1, "unit", "success", attempt(1), at(-1), at(0))}
+	d := collectScout(context.Background(), &fakeForge{scout: s}, "github", 42, "main", scoutT0)
+	if len(d.Runs) != 2 {
+		t.Fatalf("runs=%v", d.Runs)
+	}
+	for i, pop := range []string{scoutPopMain, scoutPopPR} {
+		if d.Runs[i].Pop != pop || d.Runs[i].JobsMissing || !d.Runs[i].HistoryKnown || len(d.Runs[i].Jobs) != 1 || d.Collected[pop] != 1 {
+			t.Errorf("duplicate ID lost population %s: runs=%v collected=%v", pop, d.Runs, d.Collected)
+		}
+	}
+}
+
+func TestScoutHistoryContextDeadlineAndRelease(t *testing.T) {
+	deadline := scoutT0.Add(100 * 365 * 24 * time.Hour)
+	parent, cancelParent := context.WithDeadline(forge.WithCIRepairReadLimits(context.Background()), deadline)
+	defer cancelParent()
+	child, cancel := scoutHistoryContext(parent, 3*time.Second)
+	defer cancel()
+	got, ok := child.Deadline()
+	if !ok || !got.Equal(deadline.Add(-3*time.Second)) || !hasCIReadLimits(child) {
+		t.Errorf("child deadline=%v ok=%v inherited limits=%v", got, ok, hasCIReadLimits(child))
+	}
+	// A past child deadline exposes its cause immediately, without waiting.
+	expired, cancelExpired := scoutHistoryContext(parent, 200*365*24*time.Hour)
+	defer cancelExpired()
+	if expired.Err() != context.DeadlineExceeded || context.Cause(expired) != errScoutHistoryShare || parent.Err() != nil {
+		t.Errorf("child err=%v cause=%v parent err=%v", expired.Err(), context.Cause(expired), parent.Err())
+	}
+	plain, cancelPlain := scoutHistoryContext(context.Background(), time.Second)
+	if _, ok := plain.Deadline(); ok {
+		t.Error("deadline invented without parent deadline")
+	}
+	cancelPlain()
+	if plain.Err() != context.Canceled {
+		t.Errorf("plain child not cancellable: %v", plain.Err())
+	}
+}
+
+func TestFirePromptCIScoutReservesConfiguredDuration(t *testing.T) {
+	for _, duration := range []time.Duration{0, 25 * time.Second} {
+		h, s := newScoutHarness()
+		h.sched.scoutDeadline = duration
+		var parentDeadline time.Time
+		seen := false
+		s.onRead = func(ctx context.Context, call string) error {
+			if strings.HasPrefix(call, "runs:") {
+				parentDeadline, _ = ctx.Deadline()
+			}
+			if strings.HasPrefix(call, "attempts:") {
+				seen = true
+				childDeadline, ok := ctx.Deadline()
+				wantReserve := h.sched.scoutDeadlineOrDefault() / 5
+				if !ok || parentDeadline.Sub(childDeadline) != wantReserve || !hasCIReadLimits(ctx) {
+					t.Errorf("duration=%v reserve=%v want=%v limits=%v", duration, parentDeadline.Sub(childDeadline), wantReserve, hasCIReadLimits(ctx))
+				}
+			}
+			return nil
+		}
+		if _, err := h.sched.firePrompt(context.Background(), h.scoutSchedule()); err != nil {
+			t.Fatal(err)
+		}
+		if !seen {
+			t.Error("no history context observed")
+		}
+	}
+}
+
+func TestRenderScoutCoverageUsesReportedCreationOfCollectedRuns(t *testing.T) {
+	s := newScoutFake()
+	s.attemptsUnsupported = true
+	s.main = []forge.WorkflowRun{ghRun(1, "hostile", "a", at(-5)), ghRun(2, "ci", "b", at(-10))}
+	s.main[0].Name = "hostile " + strings.Repeat("`", 9) + " heading"
+	s.jobs[1] = []forge.Job{job(11, "unit", "failure", attempt(1), at(200), at(201))}
+	s.tails[11] = "untrusted tail"
+	d := collectScout(context.Background(), &fakeForge{scout: s}, "github", 42, "main", scoutT0)
+	if d.Runs[0].HistoryKnown || d.Runs[0].JobsMissing {
+		t.Fatalf("latest fallback not collected: %+v", d.Runs[0])
+	}
+	d.Runs = append(d.Runs,
+		scoutRun{Pop: scoutPopMain, Run: ghRun(3, "", "", at(-100)), JobsMissing: true, CreatedReported: true},
+		scoutRun{Pop: scoutPopMain, Run: ghRun(4, "", "", time.Time{}), CreatedReported: true},
+		scoutRun{Pop: scoutPopMain, Run: ghRun(5, "", "", at(100))},
+	)
+	out := renderScout(d, "github", scoutT0)
+	line := "- Coverage with job history: default branch 2026-10-20T11:50:00Z to 2026-10-20T11:55:00Z, merge/pull requests unknown (none collected)\n"
+	header, fenced, ok := strings.Cut(out, "\n\n"+strings.Repeat("`", 3))
+	// Find the opening fence independently of its variable length.
+	if !ok || !strings.Contains(header, line) || strings.Contains(fenced, line) || strings.Count(out, "- Coverage with job history:") != 1 {
+		t.Errorf("coverage line not uniquely outside fence:\n%s", out)
+	}
+	if strings.Contains(header, "hostile") || !strings.Contains(fenced, "hostile") {
+		t.Errorf("untrusted workflow escaped fence:\n%s", out)
+	}
+	unknown := scoutData{Runs: []scoutRun{{Pop: scoutPopMain, CreatedReported: true}}}
+	if got := renderScout(unknown, "github", scoutT0); !strings.Contains(got, "- Coverage with job history: default branch unknown (creation time not reported), merge/pull requests unknown (none collected)") {
+		t.Errorf("zero creation coverage missing from rendered header: %q", got)
+	}
+	forgejo := collectScout(context.Background(), &fakeForge{scout: s}, "forgejo", 42, "main", scoutT0)
+	want := "- Coverage with job history: default branch unknown (creation time not reported), merge/pull requests unknown (none collected)"
+	if !strings.Contains(renderScout(forgejo, "forgejo", scoutT0), want) {
+		t.Error("Forgejo mapped start time was claimed as creation coverage")
+	}
 }
 
 var scoutT0 = time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
