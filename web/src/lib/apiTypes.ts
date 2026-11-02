@@ -3289,7 +3289,7 @@ export interface Run {
   worker_id: string | null;
   branch: string | null;
   /** PRD #300: the per-schedule model a schedule froze onto this run at fire time;
-   *  null = the run inherited the owner's per-user Worker default. Applies to all
+   *  null = the run inherited the owner's worker model (Run defaults). Applies to all
    *  schedule targets (unlike guidance). */
   model: string | null;
   /** PRD #305: the frozen "apply model also to agents" flag; true means this run's

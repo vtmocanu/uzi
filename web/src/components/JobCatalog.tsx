@@ -143,7 +143,7 @@ function JobCard({
       </p>
 
       <div className="mb-3 mt-2 flex flex-wrap gap-1">
-        {entry.model ? <Chip>model {entry.model}</Chip> : <Chip>inherit model</Chip>}
+        {entry.model ? <Chip>model {entry.model}</Chip> : <Chip>default model</Chip>}
         {entry.target === "sweep" && assigned && <Chip>assigned to uzi</Chip>}
         {entry.target === "sweep" && !assigned && entry.labels?.map((l) => <Chip key={l}>label {l}</Chip>)}
         {entry.target === "sweep" && entry.max_issues > 0 && <Chip>max {entry.max_issues}{entry.capacity_limit != null ? " at a time" : ""}</Chip>}

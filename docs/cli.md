@@ -733,8 +733,8 @@ A few worth knowing:
   override) — without churning the id or
   run history the way delete-and-recreate would; `edit` now accepts
   `--model <alias|id>` to change the run model in place, valid on every
-  target and origin (an empty string clears it back to the Worker-model
-  default), and it preserves the stored `--model` and `--apply-model-to-agents`
+  target and origin (an empty string clears it back to your worker model for
+  the schedule's harness), and it preserves the stored `--model` and `--apply-model-to-agents`
   across a partial edit that does not pass those flags — a plain retime no
   longer wipes the stored model. On a **default-origin** schedule only
   the catalog-editable fields (`--cron`, `--tz`, `--auto-approve`,

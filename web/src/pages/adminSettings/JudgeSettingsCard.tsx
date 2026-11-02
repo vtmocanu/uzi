@@ -4,6 +4,7 @@ import { errorMessage } from "../../lib/apiError";
 import { ModelSelect } from "../../components/ModelSelect";
 import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
 import { CODEX_ROLE_MODELS } from "../../lib/codexModels";
+import { modelFieldWarning } from "../../lib/agentTemplates";
 
 type JudgeKey = "judge_model" | "codex_judge_model";
 
@@ -65,7 +66,15 @@ export function JudgeSettingsCard({
   // the picker still shows Other: refuse to save until the ID is filled or Default chosen.
   const claudeCustomEmpty = modelCustom && model.trim() === "";
   const codexCustomEmpty = codexCustom && codexModel.trim() === "";
-  const blocked = claudeCustomEmpty || codexCustomEmpty;
+  const claudeWarning = modelFieldWarning(model);
+  const codexWarning = modelFieldWarning(codexModel);
+  // A malformed ID blocks only when it is the change being saved (parity with Run defaults):
+  // an untouched stored value is never sent, so it must not lock the kill-switch.
+  const blocked =
+    claudeCustomEmpty ||
+    codexCustomEmpty ||
+    (model !== pinned && claudeWarning !== "") ||
+    (codexModel !== codexPinned && codexWarning !== "");
   // PRD #3245 legacy warning: the stored instance Claude value is a Codex id, which
   // Claude judges skip in favour of the built-in. Shown until the admin changes it.
   const legacyCodexInClaude = pinned !== "" && model === pinned && CODEX_ROLE_MODELS.includes(pinned.trim());
@@ -164,6 +173,7 @@ export function JudgeSettingsCard({
                   {CUSTOM_EMPTY_MESSAGE}
                 </p>
               )}
+              {claudeWarning && <Alert tone="warning" message={claudeWarning} />}
             </div>
             <div className="space-y-1.5">
               <Field label="Codex judge model" htmlFor="codex-judge-model-admin">
@@ -186,12 +196,12 @@ export function JudgeSettingsCard({
                   {CUSTOM_EMPTY_MESSAGE}
                 </p>
               )}
+              {codexWarning && <Alert tone="warning" message={codexWarning} />}
             </div>
           </div>
           <p className="text-xs text-faint">
             The judge runs on the harness of the run it reviews, so each harness has its own judge model.
-            Default follows uzi&rsquo;s built-in model, including future changes to it; the built-ins are the
-            strongest models because judge recommendations feed self-improvement. Pin a cheaper model, such
+            Default follows uzi&rsquo;s built-in model, including future changes to it. Pin a cheaper model, such
             as <code className="rounded bg-raised px-1 py-0.5 text-fg">sonnet</code> for Claude, to spend less.
             A user&rsquo;s own choice under Settings &rarr; Run defaults wins over these.
           </p>
@@ -218,8 +228,9 @@ export function JudgeSettingsCard({
             With this on, EVERY user&rsquo;s finished runs are judged — bypassing their per-user opt-in — and
             each is spent on <strong className="text-fg">that user&rsquo;s own credential for the run&rsquo;s
             harness (Anthropic or Codex) without their opt-in</strong>. A user with no usable credential for
-            that harness is skipped. On a subscription plan it also eats their rate-limit quota. Pin a
-            cheaper judge model (the built-in default is the strongest) before enforcing. The per-user judge toggle on the Users page becomes inert
+            that harness is skipped. On a subscription plan it also eats their rate-limit quota. Before
+            enforcing, consider choosing a cheaper model in the Claude and Codex judge model pickers above;
+            Default follows the built-in model. The per-user judge toggle on the Users page becomes inert
             while this is on.
           </p>
         </div>

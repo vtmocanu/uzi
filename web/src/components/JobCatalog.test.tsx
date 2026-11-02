@@ -109,7 +109,7 @@ describe("JobCatalog — cards", () => {
     expect(within(bug).getByText(/catalog default/).parentElement!.textContent).toBe("Every day at 02:00 · UTC · catalog default");
     expect(within(bug).getByText("label bug")).toBeTruthy();
     expect(within(bug).getByText("max 3")).toBeTruthy();
-    expect(within(bug).getByText("inherit model")).toBeTruthy();
+    expect(within(bug).getByText("default model")).toBeTruthy();
     expect(within(bug).getByLabelText("Baked prompt, read-only")).toBeTruthy();
     expect(within(bug).getByText("sweep")).toBeTruthy();
     expect(within(card("docs-hygiene")).getByText("prompt")).toBeTruthy();
