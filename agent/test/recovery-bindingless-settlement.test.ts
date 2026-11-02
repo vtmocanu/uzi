@@ -235,7 +235,7 @@ for (const [variant, fenced] of [["pinned", false], ["completion-receipt", false
       captureFrozenInventory: async () => { captures++; },
     });
     s.e.coordinator.inventoryCleanupState = async () => "pending";
-    const flight = { heldDeferredCapture: s.f.record.captureId, preserveRecoveryClone: false,
+    const flight = { heldDeferredCapture: s.f.record.captureId, preserveRecoveryClone: false, iterationParkState: "none",
       steering: { claimFence: () => fenced ? { kind: "stale" } : undefined }, runLog: nullLogger() };
     await instance["settleHeldDeferred"](
       { run_id: s.f.context.runId, claim_generation: 7 } as Parameters<RunRunner["settleHeldDeferred"]>[0],
