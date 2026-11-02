@@ -3611,10 +3611,12 @@ export class RunRunner {
   }
 
   /** Reuse Git's inherited operation scope; the caller retains A until owned work settles. */
-  private withRemediationLifecycle<T>(signal: AbortSignal | undefined, action: () => Promise<T>): Promise<T> {
+  private withRemediationLifecycle<T>(signal: AbortSignal | undefined, action: () => Promise<T>, deadlineAt?: number): Promise<T> {
+    // Explicit cleanup selects its bounded lifecycle; ordinary live work defaults to global shutdown.
+    // Selecting a lifecycle does not authenticate a source or grant source-use permission.
     return this.git.withRecoveryOperation(
-      signal ? AbortSignal.any([signal, this.shutdownSignal.signal]) : this.shutdownSignal.signal,
-      Date.now() + this.codexBoundaryDeadlineMs, action);
+      signal ?? this.shutdownSignal.signal,
+      Math.min(Date.now() + this.codexBoundaryDeadlineMs, deadlineAt ?? Infinity), action);
   }
 
   /**
@@ -3623,14 +3625,14 @@ export class RunRunner {
    * must refuse unavailable facts and independently authenticate the current runtime body.
    */
   private async bootstrapRemediationRestrictions(
-    flight: RunFlight, barePath = flight.barePath, branch = flight.branch, signal?: AbortSignal,
+    flight: RunFlight, barePath = flight.barePath, branch = flight.branch, signal?: AbortSignal, deadlineAt?: number,
   ): Promise<{ kind: "confirmed"; enrolled: boolean } | { kind: "unavailable" }> {
     if (!barePath && !branch && !flight.worktreePath && !flight.remediationRestrictions)
       return { kind: "confirmed", enrolled: false }; // Repo-less flight.
     try {
       if (!barePath || !branch) throw new Error("restriction identity unavailable");
       const facts = await this.withRemediationLifecycle(signal, () =>
-        this.git.readRemediationRestrictionFacts(barePath, branch, flight.runId));
+        this.git.readRemediationRestrictionFacts(barePath, branch, flight.runId), deadlineAt);
       if (facts.enrolled) {
         const state = flight.remediationRestrictions ??= { roots: [] };
         state.roots = [...new Set([...state.roots, ...facts.roots, ...facts.flaggedOIDs])];
@@ -5350,7 +5352,8 @@ export class RunRunner {
                   // PRD #1416 M3 (C6): bridge a divergent tracking tip BEFORE the shutdown publish so
                   // a resume adopts B, not the published tip. Best-effort — a shutdown checkpoint must
                   // never throw (it is inside the k8s termination grace race, D4).
-                  if ((await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "shutdown")).kind === "preservation_refused") return;
+                  if ((await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "shutdown",
+                    permit?.signal ?? cause.stopSignal, cause.deadlineAt)).kind === "preservation_refused") return;
                   // PRD #1062 M2 (#1036): the path is reaped above, so the overlay's PAT
                   // default-fetch is permitted — a behind-on-workflows branch checkpoints durably.
                   check();
@@ -16130,8 +16133,10 @@ export class RunRunner {
     runLog: Logger,
     adopt: <T>(action: () => Promise<T>) => Promise<T> = action => action(),
     step?: (step: BoundaryStep) => void,
+    signal?: AbortSignal,
+    deadlineAt?: number,
   ): Promise<BridgeOutcome> {
-    const negative = await this.bootstrapRemediationRestrictions(flight, barePath, branch);
+    const negative = await this.bootstrapRemediationRestrictions(flight, barePath, branch, signal, deadlineAt);
     // Positive bridge admission is not wired yet. An unknown best-effort outcome keeps
     // park/private capture callers preserving bytes without building or adopting a bridge.
     if (negative.kind === "unavailable" || flight.remediationRestrictions) return { kind: "unknown" };
@@ -16269,9 +16274,11 @@ export class RunRunner {
     flight: RunFlight,
     runLog: Logger,
     sink: string,
+    signal?: AbortSignal,
+    deadlineAt?: number,
   ): Promise<BridgeOutcome> {
     try {
-      const o = await this.bridgeBareTrackingRefIfDivergent(barePath, branch, flight, runLog);
+      const o = await this.bridgeBareTrackingRefIfDivergent(barePath, branch, flight, runLog, undefined, undefined, signal, deadlineAt);
       if (o.kind === "failed" || o.kind === "unknown") {
         runLog.info("PRD #1416 M3: park/capture bridge did not advance the tracking ref", {
           run_id: flight.runId,

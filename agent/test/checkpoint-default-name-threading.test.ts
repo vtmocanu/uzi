@@ -13,6 +13,10 @@ const TIP = "a".repeat(40), FLOOR = "b".repeat(40), DEFAULT = "c".repeat(40);
 const policy = { version: 1 as const, blocked: false, everKnown: false, flaggedCommits: [], ciGlobs: null, extraFloors: [] };
 function fixture(defaultBranch?: string) {
   const git = new GitCache("/unused", nullLogger());
+  git.readRemediationRestrictionFacts = async (bare, branch, runId) => {
+    assert.deepEqual([bare, branch, runId], ["bare", "task", "test"]);
+    return { enrolled: false, blocked: false, roots: [], flaggedOIDs: [], fingerprint: "fixture-confirmed-absence" };
+  };
   const client = new WorkerClient("http://unused", "test", "test", nullLogger());
   const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch: "task" }) } }),
     nullLogger(), 1, undefined, { checkpointTestHooks: { retryBackoffMs: [0, 0] } });

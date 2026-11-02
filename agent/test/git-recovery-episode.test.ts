@@ -1905,7 +1905,7 @@ test("issue #3194: the journal parser binds a restore source to a restore tip", 
     /invalid retained recovery progress/);
 });
 
-test("issue #3194: an unmapped coverage wrapper is held by the --require-base decision, never accepted", async () => {
+test("issue #3194: an unmapped coverage wrapper refuses before successor creation", async () => {
   const reservation = await cache.reserveRecoveryIteration(bare, branch, key, source);
   const tip = await capture();
   const wrapper = wrapperOver(tip, git(bare, ["rev-parse", `${tip}^`]));
@@ -1913,21 +1913,15 @@ test("issue #3194: an unmapped coverage wrapper is held by the --require-base de
   const unrelated = git(bare, ["-c", "user.name=t", "-c", "user.email=t@example.test", "commit-tree",
     `${tip}^{tree}`, "-m", "unrelated root"]);
   await cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, wrapper, unrelated);
-  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2));
-  assert.equal(successor.adoptedContentSource, undefined);
-  const identity = successor.adoptedContentSource ?? successor.adoptedSource;
-  assert.equal(identity, wrapper, "the guard compares the raw wrapper");
-  // The run DID attest its real source; the wrapper still cannot be vouched for.
-  assert.throws(() => evaluateRequiredBase({
-    plannedBase: git(bare, ["rev-parse", `${tip}^`]),
-    identity,
-    attestedSource: tip,
-    continuation: successor.seededFrom === "tracking" || successor.seededFrom === "checkpoint",
-    wipCherryPicked: successor.wipCherryPicked === true,
-    planned: { kind: "resolved", sha: git(bare, ["rev-parse", `${tip}^`]) },
-    identityTree: git(bare, ["rev-parse", `${identity}^{tree}`]),
-    materializedTree: git(successor.path, ["write-tree"]),
-  }), BaseAttestationMissingError);
+  const before = fs.readFileSync(path.join(bare, "config"), "utf8");
+  const pins = git(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+  const siblings = fs.readdirSync(path.dirname(source.clonePath)).sort();
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2)),
+    /successor recovery verification failed/);
+  assert.equal(fs.existsSync(source.clonePath + ".attempt-" + aid(2)), false);
+  assert.ok(fs.readFileSync(path.join(bare, "config"), "utf8") === before, "journal and ledger stay unchanged");
+  assert.ok(git(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]) === pins, "capture pins remain");
+  assert.deepEqual(fs.readdirSync(path.dirname(source.clonePath)).sort(), siblings);
 });
 
 // ── issue #3194 acceptance: recovery-coverage shapes through the real journal and successor ─────
@@ -2089,7 +2083,7 @@ test("issue #3194 coverage: extra unattested committed work inside the restore i
   assert.equal(journal().recovery.stage, "captured");
 });
 
-test("issue #3194 coverage: a legacy journal without restoreSource leaves the wrapper unvouched and is held", async () => {
+test("issue #3194 coverage: a legacy journal without restoreSource refuses before successor creation", async () => {
   const reservation = await cache.reserveRecoveryIteration(bare, branch, key, source);
   const s = await capture();
   const planned = git(bare, ["rev-parse", `${s}^`]);
@@ -2099,9 +2093,15 @@ test("issue #3194 coverage: a legacy journal without restoreSource leaves the wr
   const legacy = journal();
   delete legacy.recovery.restoreSource;
   writeJournal(legacy);
-  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2));
-  assert.equal(successor.adoptedContentSource, undefined);
   assert.equal(git(bare, ["rev-parse", `${wrapper}^{tree}`]), git(bare, ["rev-parse", `${s}^{tree}`]),
     "sanity: the wrapper's tree equals the attested source's, so only the missing binding holds it");
-  await assert.rejects(guardOn(successor, planned, s), BaseAttestationMissingError);
+  const before = fs.readFileSync(path.join(bare, "config"), "utf8");
+  const pins = git(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+  const siblings = fs.readdirSync(path.dirname(source.clonePath)).sort();
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2)),
+    /successor recovery verification failed/);
+  assert.equal(fs.existsSync(source.clonePath + ".attempt-" + aid(2)), false);
+  assert.ok(fs.readFileSync(path.join(bare, "config"), "utf8") === before, "journal and ledger stay unchanged");
+  assert.ok(git(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]) === pins, "capture pins remain");
+  assert.deepEqual(fs.readdirSync(path.dirname(source.clonePath)).sort(), siblings);
 });

@@ -730,6 +730,63 @@ test("remediation lifecycle clock starts after A acquisition", async t => {
   } finally { runner.shutdown(); }
 });
 
+test("default live remediation query remains unavailable after global shutdown", async t => {
+  const f = await fixture(false);
+  const { cache, runner, subject, flight } = f.fresh();
+  const query = t.mock.method(cache, "readRemediationRestrictionFacts");
+  runner.shutdown();
+  assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "unavailable" });
+  assert.equal(query.mock.callCount(), 0);
+  assert.equal(flight.preserveRecoveryClone, true);
+});
+
+for (const mode of ["healthy", "revoked", "expired", "existing cap"] as const) {
+  test("shutdown bridge uses the exact workerShutdown handoff: " + mode, async t => {
+    const f = await fixture(false);
+    const { cache, runner, subject, flight } = f.fresh();
+    let wall = Date.now();
+    t.mock.method(Date, "now", () => wall);
+    const active: any = { steering: flight.steering };
+    subject.activeRuns.set(flight.runId, active);
+    // The production shutdown path creates the frozen handoff before stopping global live work.
+    runner.shutdown();
+    const cause = active.gracefulShutdownCheckpoint;
+    assert.equal(cause, flight.steering.workerShutdownCheckpoint());
+    assert.equal(Object.isFrozen(cause), true);
+    assert.equal(subject.shutdownSignal.signal.aborted, true);
+    assert.equal(flight.cancel.signal.aborted, true);
+    assert.equal(cause.stopSignal.aborted, false);
+    const deadlineAt = mode === "existing cap" ? wall + 2 * subject.codexBoundaryDeadlineMs : cause.deadlineAt;
+    if (mode === "revoked") flight.steering.abortLifecycle(new Error("cleanup revoked"));
+    if (mode === "expired") wall = cause.deadlineAt;
+    const read = cache.readRemediationRestrictionFacts.bind(cache);
+    const query = t.mock.method(cache, "readRemediationRestrictionFacts", (...args: Parameters<typeof read>) => {
+      const scope = (cache as any).recoveryOperations.getStore();
+      assert.equal(scope.signal.aborted, false);
+      assert.equal(scope.deadline, Math.min(wall + subject.codexBoundaryDeadlineMs, deadlineAt));
+      return read(...args);
+    });
+    // No published floor needs a bridge, but the real custody query and ownership proof still run.
+    flight.publishedTip = undefined;
+    try {
+      const result = await subject.bridgeParkSinkBestEffort(f.bare, BRANCH, flight, nullLogger(),
+        "shutdown", cause.stopSignal, deadlineAt);
+      if (mode === "revoked" || mode === "expired") {
+        assert.deepEqual(result, { kind: "unknown" });
+        assert.equal(query.mock.callCount(), 0);
+        assert.equal(flight.preserveRecoveryClone, true);
+      } else {
+        assert.deepEqual(result, { kind: "clean" });
+        assert.equal(query.mock.callCount(), 1);
+        assert.equal(flight.remediationRestrictions, undefined);
+      }
+    } finally {
+      subject.activeRuns.delete(flight.runId);
+      runner.shutdown();
+    }
+  });
+}
+
 test("negative post-action expiry latches denial and independent private capture retains bytes", async t => {
   const f = await fixture();
   const { cache, runner, subject, flight } = f.fresh();
