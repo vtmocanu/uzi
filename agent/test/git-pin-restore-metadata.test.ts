@@ -9,6 +9,7 @@ import { attemptClonePath } from "../src/attempt-path.js";
 import { GitCache, type RecoveryJournalEntry } from "../src/git.js";
 import { PinRestoreDecodeBudget, type PinRestoreLink, type RetainedPinEnvelope } from "../src/pin-restore-journal.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
 import { parseRecoveryJournal as baseParseRecoveryJournal } from "./fixtures/base-parse-recovery-journal.js";
 
@@ -195,7 +196,7 @@ beforeEach(async () => {
   fs.chmodSync(bare, 0o700);
   canonical = (await cache.createOrAttachRunnerClone(bare, 2512, noProofReseed, RUN)).path;
   await cache.markRecoveryCapture(bare, canonical, BRANCH, RUN);
-  // The generation writer belongs to the next implementation unit.
+  // Reader fixtures preserve deliberately noncanonical raw predecessor bytes.
   writeOld();
   prepare();
 });
@@ -294,6 +295,15 @@ describe("retained pin metadata refuses ambiguous or inconsistent attribution be
         attemptId: OLD_ATTEMPT, runId: "foreign-run", clonePath: link.successor.clonePath, state: "live",
       })]);
     }],
+    ["foreign ledger entry claiming the canonical predecessor path", () => {
+      git(bare, ["config", "--local", "--add", "uzi-attempts.agent/foreign.entry", JSON.stringify({
+        attemptId: OLD_ATTEMPT, runId: "foreign-run", clonePath: canonical, state: "live",
+      })]);
+    }],
+    ["identical linked active journal on an unrelated branch", () => {
+      activate();
+      config("uzi-recovery.agent/foreign.clone", JSON.stringify(newJournal()));
+    }],
     ["duplicate ledger JSON fields", () => {
       activate();
       git(bare, ["config", "--local", "--add", LEDGER_KEY,
@@ -348,6 +358,31 @@ describe("retained pin metadata refuses ambiguous or inconsistent attribution be
 });
 
 describe("metadata regression boundaries", () => {
+  it("charges standalone generation journal decoding once before parsing, including escaped keys", async t => {
+    const plain = JSON.stringify(oldJournal).replace('"sourceGeneration"', '"\\u0073ourceGeneration"');
+    const raw = plain + " ".repeat(16384 - Buffer.byteLength(plain));
+    config(ACTIVE_KEY, raw);
+    let actual = 0, charged = 0;
+    const parse = JSON.parse;
+    const consume = PinRestoreDecodeBudget.prototype.consume;
+    t.mock.method(JSON, "parse", (text: string, ...args: unknown[]) => {
+      if (text === raw) actual += Buffer.byteLength(text);
+      return Reflect.apply(parse, JSON, [text, ...args]);
+    });
+    t.mock.method(PinRestoreDecodeBudget.prototype, "consume", function(this: PinRestoreDecodeBudget, bytes: number) {
+      charged += bytes;
+      return consume.call(this, bytes);
+    });
+    await cache.withRecoveryOperation(new AbortController().signal, Date.now() + 60000, async () => {
+      for (let i = 0; i < 64; i++) await cache.readRetainedPinMetadata(bare);
+      assert.equal(actual, 1048576);
+      assert.equal(actual, charged);
+      await assert.rejects(cache.readRetainedPinMetadata(bare), /invalid pin restore journal/);
+      assert.equal(actual, 1048576, "refuse the next actual decode before parsing");
+      assert.equal(charged, 1064960, "charge failed read attempts too");
+    });
+  });
+
   for (const count of [33, 65]) {
     it(`inspection shares validated metadata and the 1MiB decode limit for ${count} envelopes`, async t => {
       config(ACTIVE_KEY, JSON.stringify({ runId: RUN, clonePath: canonical }));
@@ -381,7 +416,7 @@ describe("metadata regression boundaries", () => {
         return consume.call(this, bytes);
       });
       const result = await cache.inspectRetainedSources({ barePath: bare, isLivePath: () => false,
-        selector: { runId: "run-budget-0", generation: 1, attempt: "canonical" } });
+        budgetMs: 60000, selector: { runId: "run-budget-0", generation: 1, attempt: "canonical" } });
       assert.equal(result.unreadable, count === 33 ? 0 : 1);
       assert.equal(total, count * 16384);
       assert.equal(decoded, count === 33 ? 540672 : 1048576, "charge before every actual nested decode");
@@ -549,4 +584,110 @@ describe("full inventory, ACK, inspection and ledger compaction preserve V2 pred
     assert.ok(trees.includes(canonical));
     assert.deepEqual(snapshot(), before);
   });
+});
+
+describe("own capture source generation durability", () => {
+  for (const generation of [undefined, 2]) {
+    it(`reconstructs a legacy successor using only the actual episode generation ${generation}`, async () => {
+      writeOld({}, false);
+      const source = { runId: RUN, clonePath: canonical };
+      const reservation = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, source, 1, generation, 0, 0);
+      await fixtureFetchTracking(cache, bare, canonical, BRANCH, RUN);
+      const tip = git(canonical, ["rev-parse", "HEAD"]).trim();
+      await cache.recordRecoveryCapture(bare, BRANCH, KEY, source, reservation.attempts, tip);
+      const successor = await cache.prepareRecoverySuccessor(bare, BRANCH, KEY, source, reservation.attempts, ATTEMPT);
+      const journal = JSON.parse(rawConfig(ACTIVE_KEY));
+      assert.equal(journal.clonePath, successor.path);
+      assert.equal(journal.sourceGeneration, generation);
+      assert.equal(Object.hasOwn(journal, "sourceGeneration"), generation !== undefined);
+    });
+  }
+
+  it("adds an actual own generation only when explicitly supplied", async () => {
+    writeOld({ sourceGeneration: undefined });
+    await cache.markRecoveryCapture(bare, canonical, BRANCH, RUN);
+    assert.equal(Object.hasOwn(JSON.parse(rawConfig(ACTIVE_KEY)), "sourceGeneration"), false);
+    await cache.markRecoveryCapture(bare, canonical, BRANCH, RUN, undefined, undefined, 1);
+    assert.equal(JSON.parse(rawConfig(ACTIVE_KEY)).sourceGeneration, 1);
+  });
+
+  it("persists the own generation and preserves the fence and all pending fields", async () => {
+    writeOld({ memoryPark: {
+      version: 1, binding: { runId: RUN, claimGeneration: 1, workerId: "worker", registerNonce: "nonce", memoryEpisode: 1 },
+      ack: "sent_unconfirmed",
+      origin: { flightId: OLD_EPOCH, attemptId: null, executorIncarnation: null,
+        authorityIncarnation: OLD_EPOCH, sourceEpoch: OLD_EPOCH },
+    } });
+    const before = JSON.parse(rawConfig(ACTIVE_KEY));
+    await cache.markRecoveryCapture(bare, canonical, BRANCH, RUN, undefined, undefined, 1);
+    assert.deepEqual(JSON.parse(rawConfig(ACTIVE_KEY)), before);
+    assert.equal(JSON.parse(rawConfig(ACTIVE_KEY)).sourceGeneration, 1);
+    const raw = rawConfig(ACTIVE_KEY);
+    await assert.rejects(cache.markRecoveryCapture(bare, canonical, BRANCH, RUN, undefined, undefined, 2), /cannot be overwritten/);
+    assert.equal(rawConfig(ACTIVE_KEY), raw);
+  });
+
+  it("preserves active pin linkage while recording the identical own generation", async () => {
+    activate();
+    const journal = { ...newJournal(), completionSourceFence: FENCE };
+    config(ACTIVE_KEY, JSON.stringify(journal));
+    await cache.markRecoveryCapture(bare, link.successor.clonePath, BRANCH, RUN, ATTEMPT, undefined, 2);
+    assert.deepEqual(JSON.parse(rawConfig(ACTIVE_KEY)), journal);
+  });
+
+  it("validates generation and attempt path before effects", async () => {
+    const before = snapshot();
+    for (const generation of [0, -1, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      await assert.rejects(cache.markRecoveryCapture(bare, canonical, BRANCH, RUN, undefined, undefined, generation), /invalid source generation/);
+    }
+    await assert.rejects(cache.markRecoveryCapture(bare, canonical, BRANCH, RUN, ATTEMPT, undefined, 2), /invalid source generation/);
+    await assert.rejects(cache.markRecoveryCapture(bare, link.successor.clonePath, BRANCH, RUN, ATTEMPT, undefined, 1), /invalid source generation/);
+    assert.deepEqual(snapshot(), before);
+  });
+
+  it("syncs config then directory before exact raw readback", async t => {
+    const events: string[] = [];
+    const open = promises.open;
+    t.mock.method(promises, "open", async (...args: Parameters<typeof promises.open>) => {
+      const h = await Reflect.apply(open, promises, args);
+      if (String(args[0]) === path.join(bare, "config") || String(args[0]) === bare) {
+        const what = String(args[0]) === bare ? "directory" : "config";
+        const sync = h.sync.bind(h);
+        t.mock.method(h, "sync", async () => { events.push(what); await sync(); });
+      }
+      return h;
+    });
+    const internal = cache as unknown as { readRecoveryCaptureRaw(b: string, branch: string): Promise<string | undefined> };
+    const read = internal.readRecoveryCaptureRaw.bind(cache);
+    t.mock.method(internal, "readRecoveryCaptureRaw", async (b: string, branch: string) => {
+      if (events.length) events.push("readback");
+      return read(b, branch);
+    });
+    await cache.markRecoveryCapture(bare, canonical, BRANCH, RUN, undefined, undefined, 1);
+    assert.deepEqual(events, ["config", "directory", "readback"]);
+  });
+
+  for (const fail of ["config", "directory", "readback"]) {
+    it(`refuses generation admission on ${fail} failure`, async t => {
+      if (fail === "readback") {
+        const internal = cache as unknown as { readRecoveryCaptureRaw(b: string, branch: string): Promise<string | undefined> };
+        const read = internal.readRecoveryCaptureRaw.bind(cache);
+        t.mock.method(internal, "readRecoveryCaptureRaw", async (b: string, branch: string) => {
+          const value = await read(b, branch);
+          return value + " ";
+        });
+      } else {
+        const open = promises.open;
+        t.mock.method(promises, "open", async (...args: Parameters<typeof promises.open>) => {
+          const h = await Reflect.apply(open, promises, args);
+          if (String(args[0]) === (fail === "config" ? path.join(bare, "config") : bare)) {
+            t.mock.method(h, "sync", async () => { throw new Error("injected generation fsync"); });
+          }
+          return h;
+        });
+      }
+      await assert.rejects(cache.markRecoveryCapture(bare, canonical, BRANCH, RUN, undefined, undefined, 1),
+        fail === "readback" ? /read-back differs/ : /injected generation fsync/);
+    });
+  }
 });

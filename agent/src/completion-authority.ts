@@ -654,6 +654,21 @@ export function processWorkerIncarnation(): string { return PROCESS_INCARNATION;
 export async function peekAuthoritySlot(
   options: { dataDir: string; workerToken: string; uid?: number }, sourcePath: string,
 ): Promise<SlotSnapshot | null> {
+  const store = await initializeAuthorityPeek(options);
+  return store === null ? null : store.peekSlot(sourcePath);
+}
+
+/** Metadata identity only: grants no source presence, access, or admission authority. */
+export async function peekAuthoritySlotMetadata(
+  options: { dataDir: string; workerToken: string; uid?: number }, sourcePath: string,
+): Promise<SlotSnapshot | null> {
+  const store = await initializeAuthorityPeek(options);
+  return store === null ? null : store.peekSourceSlotMetadata(sourcePath);
+}
+
+async function initializeAuthorityPeek(
+  options: { dataDir: string; workerToken: string; uid?: number },
+): Promise<AuthorityStore | null> {
   if (options.workerToken === "") throw new AuthorityRefusal("worker token required to authenticate authority state");
   const dataDir = options.dataDir;
   const uid = options.uid ?? process.getuid?.() ?? -1;
@@ -684,11 +699,10 @@ export async function peekAuthoritySlot(
     throw new AuthorityRefusal("authority store was replaced after this process enrolled it");
   }
   enrolledStorage.set(dataDir, enrollment.storageId);
-  const store = new AuthorityStore(storeBrand, {
+  return new AuthorityStore(storeBrand, {
     key, storageId: enrollment.storageId, ctxDir: authorityDir, dataDir, uid,
     incarnation: PROCESS_INCARNATION, ops: realOps, maxHeadBytes: MAX_SLOT_BYTES,
   });
-  return store.peekSlot(sourcePath);
 }
 
 interface StoreInit {
@@ -849,8 +863,8 @@ export class AuthorityStore {
     return dir;
   }
 
-  /** Canonical relative layout identity of a source path; refuses anything unsafe. */
-  async #relative(sourcePath: string): Promise<string> {
+  /** Pure lexical identity; deliberately makes no claim about the source filesystem. */
+  #lexicalRelative(sourcePath: string): string {
     const root = this.#init.dataDir;
     if (typeof sourcePath !== "string" || sourcePath.includes("\0") || !path.isAbsolute(sourcePath) ||
         path.resolve(sourcePath) !== sourcePath) {
@@ -860,8 +874,15 @@ export class AuthorityStore {
     if (rel === "" || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
       throw new AuthorityRefusal("source path is outside the data root");
     }
+    if (rel.split(path.sep)[0] === AUTHORITY_DIR_NAME) throw new AuthorityRefusal("source path is inside authority storage");
+    return rel;
+  }
+
+  /** Canonical relative layout identity of a source path; refuses anything unsafe. */
+  async #relative(sourcePath: string): Promise<string> {
+    const root = this.#init.dataDir;
+    const rel = this.#lexicalRelative(sourcePath);
     const parts = rel.split(path.sep);
-    if (parts[0] === AUTHORITY_DIR_NAME) throw new AuthorityRefusal("source path is inside authority storage");
     let current = root;
     for (const [index, part] of parts.entries()) {
       current = path.join(current, part);
@@ -884,7 +905,10 @@ export class AuthorityStore {
   }
 
   async #slotKeyOf(sourcePath: string): Promise<string> {
-    const rel = await this.#relative(sourcePath);
+    return this.#keyForRelative(await this.#relative(sourcePath));
+  }
+
+  #keyForRelative(rel: string): string {
     return createHmac("sha256", this.#init.key).update(`slot\0${this.#init.storageId}\0${rel}`).digest("hex");
   }
 
@@ -897,7 +921,15 @@ export class AuthorityStore {
    * never moves the in-process high-water mark. Not for any decision that must be atomic with a write.
    */
   async peekSlot(sourcePath: string): Promise<SlotSnapshot | null> {
-    const key = await this.#slotKeyOf(sourcePath);
+    return this.#peekKey(await this.#slotKeyOf(sourcePath));
+  }
+
+  /** Read authenticated metadata without probing the source or its ancestors. Non-authorizing. */
+  async peekSourceSlotMetadata(sourcePath: string): Promise<SlotSnapshot | null> {
+    return this.#peekKey(this.#keyForRelative(this.#lexicalRelative(sourcePath)));
+  }
+
+  async #peekKey(key: string): Promise<SlotSnapshot | null> {
     const dir = path.join(this.#init.ctxDir, SLOTS_DIR);
     for (let attempt = 0; ; attempt++) {
       try { return await this.#load(dir, key, true); }

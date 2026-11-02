@@ -128,11 +128,22 @@
  *    a late `close` of an unsettled child settles it as residue. A rejected ok-settlement of a
  *    delete (in-process, or the spawned rm that exited 0) surfaces as an authority error, never as a failed delete.
  */
+import type { PinRestoreLink } from "./pin-restore-journal.js";
+
+export interface OwnedBareMutation extends AuthoritySettlement {
+  assertCurrent(): Promise<void>;
+  assertSettled(): Promise<void>;
+}
+
 export interface AuthoritySettlement {
   settle(outcome: { ok: true } | { ok: false; residue: string[] }): Promise<void>;
 }
 
 export interface GitAuthorityHooks {
+  /** Borrow the caller's A; validate actual leases without admitting or ending a source. */
+  validatePinRestoreSources?(link: PinRestoreLink, predecessorPath: string): Promise<void>;
+  /** Borrow A throughout admission, assertions and settlement; effects must be positively joined before settle. */
+  beginPinRestoreBareMutation?(barePath: string, op: string, footprint: readonly string[]): Promise<OwnedBareMutation>;
   admitSourceUse(clonePath: string, op: string): Promise<void>;
   beginBareMutation(barePath: string, op: string, footprint: readonly string[]): Promise<AuthoritySettlement>;
   assertBareClear(barePath: string, op: string): Promise<void>;

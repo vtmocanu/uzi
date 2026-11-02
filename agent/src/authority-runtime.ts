@@ -7,14 +7,15 @@ import {
   type AuthorityTransaction, type WorkerLifetime,
 } from "./authority-lock.js";
 import {
-  leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot, processWorkerIncarnation,
+  leaseEpoch, leaseHarness, openAuthorityStore, peekAuthoritySlot, peekAuthoritySlotMetadata, processWorkerIncarnation,
   type AuthorityFsOps, type AuthorityStore, type EndedSlotReceipt, type SlotCohort, type SlotSnapshot, type SourceUseLease,
 } from "./completion-authority.js";
 import {
   sourceCoreDigest, sourceFenceOf, verifyCertifiedSource, verifyPublishedSource,
   type CompletionSourceFence, type CompletionSourceV2,
 } from "./completion-source.js";
-import type { AuthoritySettlement, GitAuthorityHooks } from "./git-authority-hooks.js";
+import type { PinRestoreLink } from "./pin-restore-journal.js";
+import type { AuthoritySettlement, GitAuthorityHooks, OwnedBareMutation } from "./git-authority-hooks.js";
 
 // issue #3404 M2 U3 — the process runtime that turns the completion-authority store into the
 // GitAuthorityHooks GitCache calls, and the single place a production entry point asks for A.
@@ -166,6 +167,8 @@ interface PendingPart {
   /** Bare-mutator slots leave `active` once their mutation is settled ok, so a successor is not wedged. */
   readonly bareSlot: boolean;
   settled: boolean;
+  /** A failed bare transition cannot serve as a durable settlement receipt, even if its rename landed. */
+  bareTransitionFailed?: boolean;
 }
 
 export class AuthorityRuntime implements AuthorityScope {
@@ -201,6 +204,8 @@ export class AuthorityRuntime implements AuthorityScope {
   constructor(options: AuthorityRuntimeOptions) {
     this.#options = options;
     this.hooks = {
+      validatePinRestoreSources: (link, predecessor) => this.#validatePinRestoreSources(link, predecessor),
+      beginPinRestoreBareMutation: (bare, op, footprint) => this.#beginPinRestoreBare(bare, op, footprint),
       admitSourceUse: (clonePath, op) => this.#admit(clonePath, op),
       beginBareMutation: (bare, op, footprint) => this.#beginBare(bare, op, footprint),
       assertBareClear: (bare, op) => this.#assertBareClear(bare, op),
@@ -492,6 +497,32 @@ export class AuthorityRuntime implements AuthorityScope {
     } catch {
       return { kind: "other" };
     }
+  }
+
+  /** Non-authorizing predecessor metadata classification. W is assumed; A serializes the read only.
+   * No settlement drain, healing, source probe, or positive source-access claim is made.
+   */
+  async classifyPinRestorePredecessor(
+    sourcePath: string, wait: AuthorityWait = {},
+  ): Promise<{ kind: "foreign_active" | "other"; owner?: { worker: string; epoch: string } }> {
+    const read = async (): Promise<{ kind: "foreign_active" | "other"; owner?: { worker: string; epoch: string } }> => {
+      const slot = await peekAuthoritySlotMetadata({
+        dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken,
+      }, sourcePath);
+      if (!slot) return { kind: "other" };
+      const owner = { worker: slot.owner.worker, epoch: slot.epoch };
+      const incarnation = this.authorityIncarnation() ?? processWorkerIncarnation();
+      return { kind: slot.state === "active" && slot.owner.worker !== incarnation &&
+        slot.pending === null && slot.publication === null && slot.retiring === null &&
+        !this.#owners.has(sourcePath) && !this.#leases.has(sourcePath) ? "foreign_active" : "other", owner };
+    };
+    try {
+      if (this.active()) return await read();
+      return await withAuthorityTransaction(this.#options.lifetime, {
+        ...(wait.signal ? { signal: wait.signal } : {}),
+        timeoutMs: wait.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_WAIT_MS,
+      }, read);
+    } catch { return { kind: "other" }; }
   }
 
   /** Whether `clonePath` is owned by a sink other than `sink` whose end has not been confirmed. Read-only. */
@@ -1022,6 +1053,94 @@ export class AuthorityRuntime implements AuthorityScope {
     return this.#mint(tx, store, key, { destructive: true });
   }
 
+  async #validatePinRestoreSources(link: PinRestoreLink, predecessor: string): Promise<void> {
+    const tx = this.#requireActive("pin restore sources");
+    this.#assertSinkLive();
+    const key = path.resolve(link.successor.clonePath);
+    if (key === path.resolve(predecessor)) throw new AuthorityRefusal("pin restore source paths coincide");
+    this.#assertNotOwnedByOther(key);
+    const store = await this.#storeFor(tx);
+    const lease = this.#leases.get(key);
+    const slot = lease ? await this.#slotOf(tx, store, key) : null;
+    const successor = link.successor;
+    if (!lease || !slot || this.#ends.get(key) === lease || !this.#ownedActive(store, slot, lease) ||
+        slot.pending !== null || slot.owner.worker !== successor.authorityIncarnation ||
+        slot.epoch !== successor.sourceEpoch || slot.owner.executor !== successor.executorIncarnation ||
+        leaseHarness(lease) !== (successor.executorIncarnation === null ? "claude" : "codex")) {
+      throw new AuthorityRefusal("pin restore successor lease differs");
+    }
+    // Metadata only: no predecessor source access and no slot/head crash-window repair.
+    const old = await peekAuthoritySlotMetadata({
+      dataDir: this.#options.lifetime.dataDir, workerToken: this.#options.workerToken,
+    }, predecessor);
+    if (!old || old.state !== "active" || old.owner.worker === store.workerIncarnation ||
+        old.epoch !== link.predecessorEpoch || old.pending !== null || old.publication !== null || old.retiring !== null) {
+      throw new AuthorityRefusal("pin restore predecessor slot differs");
+    }
+    this.#assertSinkLive();
+    this.#assertNotOwnedByOther(key);
+    if (this.#leases.get(key) !== lease || this.#ends.get(key) === lease) {
+      throw new AuthorityRefusal("pin restore successor lease changed during validation");
+    }
+  }
+
+  async #beginPinRestoreBare(bare: string, op: string, footprint: readonly string[]): Promise<OwnedBareMutation> {
+    const tx = this.#requireActive(op);
+    this.#assertSinkLive();
+    const key = path.resolve(bare);
+    this.#assertNotOwnedByOther(key);
+    const store = await this.#storeFor(tx);
+    const held = this.#leases.get(key);
+    const slot = held ? await this.#slotOf(tx, store, key) : null;
+    if (held && this.#ends.get(key) === held) throw new AuthorityRefusal("bare lease has a queued end");
+    const covers = [...footprint];
+    const text = boundedText(`${op}: ${covers.join(", ")}`, MAX_FOOTPRINT);
+    this.#assertSinkLive();
+    this.#assertNotOwnedByOther(key);
+    const admitted = held && slot && this.#ownedActive(store, slot, held)
+      ? { lease: held, operation: await store.beginPending(tx, held, { kind: "bare_mutation", footprint: text }) }
+      : await store.admitBareMutation(tx, key, { footprint: text });
+    this.#leases.set(key, admitted.lease);
+    const part: PendingPart = { ...admitted, covers, bareSlot: true, settled: false };
+    const sink = this.#collector.getStore();
+    const settlement = this.#settlement(store, [part]);
+    const inspect = async (): Promise<SlotSnapshot> => {
+      const active = this.#requireActive(op);
+      if (this.#collector.getStore() !== sink) throw new AuthorityRefusal("pin restore bare sink differs");
+      this.#assertSinkLive();
+      this.#assertNotOwnedByOther(key);
+      await this.#storeFor(active);
+      const actual = await this.#slotOf(active, store, key);
+      if (this.#leases.get(key) !== part.lease || this.#ends.get(key) === part.lease || !actual ||
+          actual.epoch !== leaseEpoch(part.lease) || actual.owner.worker !== store.workerIncarnation) {
+        throw new AuthorityRefusal("pin restore bare lease differs");
+      }
+      this.#assertSinkLive();
+      return actual;
+    };
+    const assertCurrent = async (): Promise<void> => {
+      const actual = await inspect();
+      if (part.settled || actual.state !== "active" || actual.pending?.kind !== "bare_mutation" ||
+          actual.pending.operation !== part.operation || actual.pending.status !== "running") {
+        throw new AuthorityRefusal("pin restore bare operation differs");
+      }
+    };
+    return {
+      assertCurrent,
+      assertSettled: async () => {
+        const actual = await inspect();
+        // settlePending(ok) clears pending; transition(ineligible) must also have succeeded.
+        if (!part.settled || part.bareTransitionFailed || actual.state !== "ineligible" || actual.pending !== null) {
+          throw new AuthorityRefusal("pin restore bare operation is not durably settled");
+        }
+      },
+      settle: async (outcome) => {
+        await assertCurrent();
+        await settlement.settle(outcome);
+      },
+    };
+  }
+
   async #beginBare(bare: string, op: string, footprint: readonly string[]): Promise<AuthoritySettlement> {
     const tx = this.#requireActive(op);
     const store = await this.#storeFor(tx);
@@ -1094,6 +1213,7 @@ export class AuthorityRuntime implements AuthorityScope {
           if (part.bareSlot) {
             // Leave `active` so a successor worker is not refused by a slot with nothing pending.
             await store.transition(tx, part.lease, "ineligible").catch((error: unknown) => {
+              part.bareTransitionFailed = true;
               this.#options.log?.warn("bare-mutator slot could not leave active", { error: error instanceof Error ? error.message : String(error) });
             });
           }
