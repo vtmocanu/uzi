@@ -110,12 +110,12 @@ Separately from these flags, which never stop anything: on the Codex harness
 each subagent has a 15-minute turn budget of its own (raised from 10 minutes).
 The subagent's setup and commands count against it, and it is independent of a
 command's own time limit and of the run's wall-clock budget. When a subagent
-reaches it, uzi requests an interrupt and tells the lead the subagent timed out
+reaches it, uzi requests an interrupt if the subagent is running and tells the lead the subagent timed out
 (`child_timeout`), which is distinct from a cancellation (`child_aborted`). If the
 subagent had started and the lead's turn is still running, the run view shows the
 same timeout on that delegation; if the lead's turn ended or the run stopped first,
-the run view shows the delegation as still open at turn end or stopped by the run
-instead. Owner cancel, the end of the lead's turn or the run's wall-clock budget can
+the run view shows the delegation as still open at turn end, stopped by the run or
+ended by a provider stream failure instead. Owner cancel, the end of the lead's turn or the run's wall-clock budget can
 stop a subagent earlier. There is no setting to change the budget.
 
 Only the run's owner (and admins) see the reason text behind a flag; everyone

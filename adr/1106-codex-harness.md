@@ -123,8 +123,8 @@ a 15-minute wall-clock budget, raised from 10 minutes; `DEFAULT_CHILD_TURN_DEADL
 `agent/src/codex/child-budget.ts` is the single default (executor dependencies may
 still inject a test override; there is no user setting). The parent's tool result
 carries only a code-prefixed, bounded message, never the raw cause:
-`child_timeout: ...` when the deadline fires (interrupt requested, partial work may
-remain) and `child_aborted: ...` on a parent-turn or run cancel (both with before/while
+`child_timeout: ...` when the deadline fires (an interrupt is requested only once the
+child is running; partial work may remain) and `child_aborted: ...` on a parent-turn or run cancel (both with before/while
 starting variants). The first cause wins: a deadline that elapses after a parent abort
 stays a cancellation. The lead and child prompts state the budget and the
 partial-handoff rule; the child text sits before the worker-owned safety block. In the
