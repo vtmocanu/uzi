@@ -3164,15 +3164,22 @@ export class RunRunner {
    *  24h per round). Cleared when the gate resolves terminally (approve/reject/cancel/
    *  timeout) and, defensively, when the run reaches a terminal state. */
   private readonly gateDeadlines = new Map<string, number>();
-  /** PRD #88: per-run ABSOLUTE answer deadline, shaped exactly like gateDeadlines —
-   *  one budget for the run, not a fresh clock per question, so N questions cannot
-   *  extend a parked run indefinitely.
+  /** PRD #88 / issue #3140: per-run parked-time budget for clarification answers — one
+   *  budget for the run, not a fresh clock per question, so N questions cannot extend a
+   *  parked run indefinitely. Only time parked at awaiting_input is charged: `spentMs`
+   *  accumulates closed intervals and `open` is the interval of the question currently
+   *  parked (same question id keeps its `since`). Working time between questions is free.
    *
    *  Not durable, and that is worth stating rather than implying: the map is worker
    *  memory, so a worker death re-queues the run and the resuming worker starts a
-   *  fresh budget. The honest worst case is QUESTION_TIMEOUT x (RUN_MAX_REQUEUES + 1); a run that
-   *  used the issue #1742 one-shot finalize-resume allowance gets one more attempt, so x (RUN_MAX_REQUEUES + 2). */
-  private readonly questionDeadlines = new Map<string, number>();
+   *  fresh budget. With no other fresh executor execution, worker-death retries contribute
+   *  QUESTION_TIMEOUT x (RUN_MAX_REQUEUES + 1), or x (RUN_MAX_REQUEUES + 2) for a run that used the
+   *  issue #1742 one-shot finalize-resume allowance. Ordinary transient/limit/credential redispatch
+   *  also starts a fresh execute() and so a fresh budget: this is not an unconditional bound. */
+  private readonly questionParkBudgets = new Map<
+    string,
+    { spentMs: number; open?: { questionId: string; since: number } }
+  >();
   /** PRD #88: the question id a run is currently parked on. Seeded from the claim on a
    *  resume so a re-park re-uses the SAME id rather than minting a new one — which is
    *  what lets an answer submitted before a worker death still be honoured. */
@@ -5190,6 +5197,7 @@ export class RunRunner {
         // `awaiting_input` report whose question feed line was already emitted (it stays, a
         // known cosmetic wart); the park lands from `running`, so no question is open: forget its id.
         this.openQuestionIds.delete(runId);
+        this.closeParkCharge(runId);
         flight.parked = await recoveryDisposition(() => this.handleRecoveryExhausted(
           err,
           claim,
@@ -5979,8 +5987,10 @@ export class RunRunner {
       // gate maps above, and for the same reason main gives below — these are
       // in-memory per-run entries that would otherwise be held for the whole length of
       // a park. Correct on the resume path too: openQuestionIds is re-seeded from
-      // claim.open_question_id, so clearing it here loses nothing a resume needs.
-      this.questionDeadlines.delete(runId);
+      // claim.open_question_id, so clearing it here loses nothing a resume needs; the
+      // parked-time budget (questionParkBudgets) is worker memory and starts fresh on a
+      // fresh execute().
+      this.questionParkBudgets.delete(runId);
       this.openQuestionIds.delete(runId);
       this.questionCounts.delete(runId);
       // Evict this run's secrets from the logger (Decision 7). Reaching this finally
@@ -25264,6 +25274,12 @@ export class RunRunner {
       if (!associated || isCheckedLifecycleControl(error)) throw error;
       throw new Error("plan cross-check: human-presentation ACK unrecoverable", { cause: error });
     }
+    if (ack.applied === true && ack.status === "awaiting_approval") {
+      // A restarted planning turn can submit a plan without settling its interrupted question.
+      // Match SetRunAwaitingApproval's ID clear and stop charging before the plan-gate wait.
+      this.closeParkCharge(runId);
+      this.openQuestionIds.delete(runId);
+    }
     if (associated && (ack.applied !== true || ack.status !== "awaiting_approval" ||
         !Number.isSafeInteger(ack.gateRevision) || (ack.gateRevision ?? 0) <= 0))
       throw new Error("plan cross-check: human-presentation ACK unrecoverable");
@@ -25405,8 +25421,9 @@ export class RunRunner {
    * PRD #88 M1 clarification park: emit the question, park the run at
    * awaiting_input, and resolve with the human's answer.
    *
-   * Structured to mirror gatePlan, including the ABSOLUTE deadline shared across all
-   * of a run's questions. Three things differ, each for a stated reason:
+   * Structured to mirror gatePlan, except that QUESTION_TIMEOUT is a parked-time budget
+   * shared across all of a run's questions (only time parked at awaiting_input is charged;
+   * working time between questions is not). Three things differ, each for a stated reason:
    *
    *  - The question id is minted ONCE per park and REUSED on a resume re-park (seeded
    *    from the claim). Everything about the stale-answer guard rests on that
@@ -25470,7 +25487,7 @@ export class RunRunner {
    * model text is passed in, so the lead's prose cannot reach the question. The lead's last
    * message reaches the owner only on the executor's status card, as untrusted data.
    *
-   * Shares askUser's park body and per-run answer deadline (REASON_QUESTION_TIMEOUT),
+   * Shares askUser's park body and per-run parked-time budget (REASON_QUESTION_TIMEOUT),
    * including its optional confirmed `running` settlement. It does not count
    * against question_max; that cap lives in the executors. An autopilot run never parks: it
    * returns `unattended` WITHOUT reporting awaiting_input, and the executor fails the run.
@@ -25502,6 +25519,23 @@ export class RunRunner {
       options,
     );
     return v.kind === "answer" ? { kind: "answer", answers: v.answers } : { kind: "cancel" };
+  }
+
+  /** Open a parked-time interval for `questionId` (issue #3140). A same-id interval is kept. */
+  private openParkCharge(runId: string, questionId: string): number {
+    const budget = this.questionParkBudgets.get(runId) ?? { spentMs: 0 };
+    this.questionParkBudgets.set(runId, budget);
+    if (budget.open !== undefined && budget.open.questionId !== questionId) this.closeParkCharge(runId);
+    if (budget.open === undefined) budget.open = { questionId, since: this.now() };
+    return budget.spentMs + (this.now() - budget.open.since);
+  }
+
+  /** Close the open parked-time interval, charging it to the run's budget. Idempotent. */
+  private closeParkCharge(runId: string): void {
+    const budget = this.questionParkBudgets.get(runId);
+    if (budget?.open === undefined) return;
+    budget.spentMs += this.now() - budget.open.since;
+    budget.open = undefined;
   }
 
   /**
@@ -25588,6 +25622,7 @@ export class RunRunner {
     if (options.requireRunning && parked === undefined) throw new RetainedRecoveryStop();
     if (parked !== "awaiting_input" || (options.requireRunning && !(ack as StateAck).applied)) {
       this.openQuestionIds.delete(runId);
+      this.closeParkCharge(runId);
       if (options.requireRunning && ((ack as StateAck).reason === "wall_pending" || (ack as StateAck).reason === "wall_expired")) {
         steering.seedPauseRequested("wall");
         throw new PauseNowSignal();
@@ -25602,6 +25637,11 @@ export class RunRunner {
         `${REASON_QUESTION_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
       );
     }
+    // The server is parked at awaiting_input from the ACK on, so the budget clock starts here,
+    // before the guarded question's emit/flush (that time is parked, hence charged). The later
+    // openParkCharge for the same id keeps `since` and returns the up-to-date charge.
+    const timeoutMs = questionTimeoutMs(config, this.questionTimeoutMs);
+    if (timeoutMs > 0) this.openParkCharge(runId, questionId);
     if (options.requireRunning) {
       emitQuestion();
       await batcher.flush().catch(() => undefined);
@@ -25620,6 +25660,8 @@ export class RunRunner {
     // runtime.sql (SetRunRunning and SetRunAwaitingApproval); this is the worker's
     // half of the same invariant — no resolved id is left behind anywhere.
     const settle = async (v: AnswerVerdict): Promise<AnswerVerdict> => {
+      // The charge stops exactly when the verdict settles, before the running report below.
+      this.closeParkCharge(runId);
       this.openQuestionIds.delete(runId);
       if (v.kind === "answer") {
         // PRD #307: a plan-phase clarification resumes into more PLANNING turns, so
@@ -25650,15 +25692,12 @@ export class RunRunner {
       return v;
     };
 
-    const timeoutMs = questionTimeoutMs(config, this.questionTimeoutMs);
     if (timeoutMs <= 0) return settle(await steering.awaitAnswer(questionId));
 
-    let deadlineAt = this.questionDeadlines.get(runId);
-    if (deadlineAt === undefined) {
-      deadlineAt = this.now() + timeoutMs;
-      this.questionDeadlines.set(runId, deadlineAt);
-    }
-    const remaining = Math.max(0, deadlineAt - this.now());
+    // Only parked time is charged (issue #3140): the interval was opened at the ACK above.
+    // The same question id continues its interval (a same-id re-park keeps the
+    // server at awaiting_input, so the gap is parked time too); a different id closes the old one.
+    const remaining = Math.max(0, timeoutMs - this.openParkCharge(runId, questionId));
     let cancel: (() => void) | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
       cancel = this.setTimer(
@@ -25686,8 +25725,8 @@ export class RunRunner {
    *  - askUser's timeout REJECTS with REASON_QUESTION_TIMEOUT (fail-closed). This window must NEVER
    *    throw: expiry is a normal outcome that routes to the verified park, so the timer here
    *    RESOLVES with `{ outcome: "expired" }` instead.
-   *  - askUser's #88 `questionDeadlines`/`questionCounts` bookkeeping. This window is timed by the
-   *    completion-hold config, not the clarification deadline, and its own deadline is local. It
+   *  - askUser's #88 `questionParkBudgets`/`questionCounts` bookkeeping. This window is timed by the
+   *    completion-hold config, not the clarification parked-time budget, and its own deadline is local. It
    *    shares ONLY `openQuestionIds` — the resume-safe question-id map — because a resumed worker
    *    re-parks on the SAME question id, and clearing it on resolution keeps a later ask_user
    *    unaffected (mirroring askUser's settle cleanup).
@@ -25711,6 +25750,10 @@ export class RunRunner {
   ): Promise<{ outcome: "continue"; guidance?: string } | { outcome: "expired" }> {
     // Reuse the id this run is already parked on (a resume re-parks on the SAME question); mint one
     // only for a genuinely new question. Same resume-safe map askUser uses.
+    // The completion window is never charged to the clarification budget: stop any clarification
+    // parked-time interval still open (a CredentialSwitchSignal/PauseNowSignal rejection leaves
+    // one open) before this window reuses openQuestionIds.
+    this.closeParkCharge(runId);
     let questionId = this.openQuestionIds.get(runId);
     if (questionId === undefined) {
       questionId = randomUUID();
@@ -25787,6 +25830,7 @@ export class RunRunner {
     const parked = (ack as { status?: string } | undefined)?.status;
     if (parked !== "awaiting_input") {
       this.openQuestionIds.delete(runId);
+      this.closeParkCharge(runId);
       runLog.warn("completion question: park not acknowledged, routing to hold", {
         run_id: runId,
         question_id: questionId,
@@ -25800,7 +25844,7 @@ export class RunRunner {
       question_id: questionId,
     });
 
-    // OWN deadline bookkeeping — NOT this.questionDeadlines/questionCounts (those are #88-specific).
+    // OWN deadline bookkeeping — NOT this.questionParkBudgets/questionCounts (those are #88-specific).
     // The window is sourced from completion_hold_window_seconds (default 900s), NOT
     // question_timeout_seconds.
     const windowMs = completionHoldWindowMs(config, COMPLETION_HOLD_WINDOW_DEFAULT_MS);
@@ -25846,8 +25890,10 @@ export class RunRunner {
     } finally {
       cancelTimer?.();
       // Drop the open question id (mirrors askUser's settle cleanup) so a later ask_user mints a
-      // fresh id and is unaffected. We do NOT touch questionDeadlines — this window never wrote it.
+      // fresh id and is unaffected. We do NOT open questionParkBudgets — this window is never
+      // charged against QUESTION_TIMEOUT (any open clarification interval was closed at entry).
       this.openQuestionIds.delete(runId);
+      this.closeParkCharge(runId);
     }
   }
 }

@@ -1027,7 +1027,8 @@ export interface ClaimConfig {
    *  PLAN_MAX_REVISIONS). The worker enforces the same cap the server does. */
   plan_max_revisions?: number;
   /** PRD #88 clarification bounds: how many times one run may stop to ask the human,
-   *  and how long a single park waits before the run fails "clarification timed out".
+   *  and the cumulative time parked at awaiting_input (per worker execution) before the
+   *  run fails "clarification timed out".
    *  Both enforced worker-side (a question is an in-process ask_user signal, so unlike
    *  a revise_plan there is no input row for the server to count) but configured
    *  server-side and shipped here, because a worker env var is unreachable on hosted

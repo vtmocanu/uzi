@@ -1519,7 +1519,7 @@ chain in the diagram above, with no intervening `running`.
   resume guard is keyed on the open **question's identity**, not a timestamp: a
   requeue re-parks on the same question id, so an answer submitted just before a
   crash still resumes and an answer to a superseded question is rejected. Bounds
-  are an absolute answer deadline (`QUESTION_TIMEOUT_SECONDS`, default 24h) and a
+  are a cumulative parked-time answer budget (`QUESTION_TIMEOUT_SECONDS`, default 24h, charged only while parked on a question) and a
   per-attempt cap (`QUESTION_MAX`, default 5), both worker-in-memory (a requeue
   resets both). With no other fresh executor execution, worker-death retries
   contribute **× (RUN_MAX_REQUEUES + 1)**, or **× (RUN_MAX_REQUEUES + 2)**

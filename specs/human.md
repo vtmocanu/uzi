@@ -819,6 +819,7 @@ Tracked as GitHub issue vtmocanu/uzi#1392; PRD at `prds/done/1392-forge-unreacha
 
 Tracked as GitLab issue vtmocanu/uzi#88; PRD at `prds/done/88-ask-user-clarification.md`.
 
+- The clarification answer budget `QUESTION_TIMEOUT_SECONDS` is charged only for time parked at `awaiting_input` on a question, not as an absolute deadline from the first question: working, plan-gate and owner-pause time between questions is not charged, a re-park of the same question continues the same interval, a different question draws on the same remaining budget, and exhaustion still fails "clarification timed out". Still worker memory, reset by a fresh executor execution. Maintainer decision 2026-10-19, Option A, #3140. (AI-synced 2026-11-01)
 - An agent can ask the user a clarifying question and wait for the answer, before
   and during a run. [user, the originating ask on #88]
 - One PRD owns the whole mechanism — pre-run and mid-run both. [user 2026-07-19]
