@@ -329,10 +329,9 @@ toolchain, as with the other Go test targets.
   lacking a valid `Authorization: Basic` (`uzi-bot:PAT`)**. A run that reaches
   `completed` with its branch on the bare therefore proves the worker sent Basic; a
   credential-injection regression turns the run red. (The opt-in
-  `E2E_GIT_SMART_HTTP=1` variant routes the *whole* suite over smart-HTTP; because
-  `forge-fake` collapses every repo path to one bare, that variant's #42 phase
-  asserts against the one shared bare — the default run keeps the full independent-
-  bare check.)
+  `E2E_GIT_SMART_HTTP=1` variant routes the *whole* suite over smart-HTTP.
+  The fake routes each configured project to its own bare, so phase #42 verifies
+  independent repositories under both transports.)
 - **`main` is never touched — and the fake remote enforces it** (PRD #97 M1). Each
   seeded bare carries a `pre-receive` hook that refuses `refs/heads/main`, so the
   "push to main is refused" assertion is real, not vacuous. The backstop is

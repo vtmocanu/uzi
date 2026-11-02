@@ -245,39 +245,22 @@ else
     || fail "both concurrent runs must open an MR (got A=$MRA B=$MRB)"
   # Each branch landed on its OWN repo's bare — proving the two runs used
   # independent git caches (repo2's branch is NOT in repo1's bare, and vice versa).
-  #
-  # This REMOTE-bare independence check holds only for the default (insteadOf) transport,
-  # where repo.git and repo2.git are two distinct local bares. Under E2E_GIT_SMART_HTTP
-  # forge-fake routes EVERY repo path onto the ONE shared bare (forge-fake.mjs
-  # PATH_INFO=/repo.git${rest}), so both branches necessarily land on repo.git and this
-  # check is unsatisfiable by construction — the pre-#97-M1 opt-in smart-HTTP full run was
-  # already red here (PRD #97 M1 confirm-and-fix). The WORKER-side cache independence — the
-  # actual #42 property — still holds under smart-HTTP (repo and repo2 have DISTINCT clone
-  # URLs ⇒ distinct worker bare dirs, no per-repo GitCache lock shared) and is proven by the
-  # concurrency asserts above (both parked at once on the one worker) plus the per-project
-  # MR attribution below. So gate the remote-bare check to the default transport; under
-  # smart-HTTP assert only that both branches reached the shared bare.
-  if [ -z "${E2E_GIT_SMART_HTTP:-}" ]; then
-    git --git-dir="$RUNROOT/fakeremote/repo.git"  show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
-      || fail "run A branch not on the repo1 bare"
-    git --git-dir="$RUNROOT/fakeremote/repo2.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
-      || fail "run B branch not on the repo2 bare (independent bare-cache check)"
-    git --git-dir="$RUNROOT/fakeremote/repo.git"  show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
-      && fail "run B's branch leaked into the repo1 bare (caches not independent)"
-  else
-    git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
-      || fail "run A branch not on the shared smart-HTTP bare"
-    git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
-      || fail "run B branch not on the shared smart-HTTP bare (forge-fake collapses repo/repo2 — see comment)"
-  fi
+  # Both local-path and smart-HTTP transports select the same independent bares.
+  git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
+    || fail "run A branch not on the repo1 bare"
+  git --git-dir="$RUNROOT/fakeremote/repo2.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
+    || fail "run B branch not on the repo2 bare (independent bare-cache check)"
+  git --git-dir="$RUNROOT/fakeremote/repo.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_B" \
+    && fail "run B's branch leaked into the repo1 bare (caches not independent)"
+  git --git-dir="$RUNROOT/fakeremote/repo2.git" show-ref --verify --quiet "refs/heads/agent/issue-$IID_A" \
+    && fail "run A's branch leaked into the repo2 bare (caches not independent)"
   FS="$(fake_state)"
   [ "$(echo "$FS" | jq --arg b "agent/issue-$IID_A" '[.mrs[]|select(.source_branch==$b)]|length')" -ge 1 ] \
     || fail "fake recorded no MR for run A's branch"
   # The repo2 MR is attributed to project 2 (the multi-project fake resolves :id).
   [ "$(echo "$FS" | jq --arg b "agent/issue-$IID_B" '[.mrs[]|select(.source_branch==$b)][-1].project_id')" = 2 ] \
     || fail "run B's MR not attributed to forge project 2 (group/repo2)"
-  if [ -z "${E2E_GIT_SMART_HTTP:-}" ]; then bare_note="each on its own independent bare"; else bare_note="both on the one shared smart-HTTP bare"; fi
-  pass "both runs completed: MRs !$MRA (repo) + !$MRB (repo2, project 2), $bare_note"
+  pass "both runs completed: MRs !$MRA (repo) + !$MRB (repo2, project 2), each on its own independent bare"
 
   # --- A: cooperative pause, positive source end, restart, owner resume --------
   say "PRD #42: two running owners pause now before worker restart"
