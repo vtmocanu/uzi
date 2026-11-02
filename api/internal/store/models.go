@@ -1235,6 +1235,7 @@ type Run struct {
 	ForgeAdmission              []byte             `json:"forge_admission"`
 	CodexSelectReason           pgtype.Text        `json:"codex_select_reason"`
 	RecoveryWaitPhase           pgtype.Text        `json:"recovery_wait_phase"`
+	PlanCrossCheckGated         bool               `json:"plan_cross_check_gated"`
 	HarnessPreferred            pgtype.Text        `json:"harness_preferred"`
 	HarnessDecisionReason       pgtype.Text        `json:"harness_decision_reason"`
 	HarnessPreferredScore       pgtype.Float8      `json:"harness_preferred_score"`
@@ -1243,7 +1244,6 @@ type Run struct {
 	HarnessOtherMeasured        pgtype.Float8      `json:"harness_other_measured"`
 	HarnessPreferredHeld        pgtype.Bool        `json:"harness_preferred_held"`
 	HarnessOtherHeld            pgtype.Bool        `json:"harness_other_held"`
-	PlanCrossCheckGated         bool               `json:"plan_cross_check_gated"`
 }
 
 type RunCompletionAttempt struct {
