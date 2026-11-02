@@ -232,9 +232,9 @@ case " $* " in
     esac
     printf 'ok\t%s\t0.01s\n' "$root"
     exit 0 ;;
-  *" ^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease)E2E$ "*)
+  *" ^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease|RecoveryRestoreWorkerClientSmall)E2E$ "*)
     if [ "$SCENARIO" = retained-go-fail ]; then echo "retained process failed"; exit 9; fi
-    for name in TestCodexRefreshLostReplyE2E TestCodexRetainedStopE2E TestPrerequisiteClosureReleaseE2E; do
+    for name in TestCodexRefreshLostReplyE2E TestCodexRetainedStopE2E TestPrerequisiteClosureReleaseE2E TestRecoveryRestoreWorkerClientSmallE2E; do
       if { [ "$name" != TestCodexRetainedStopE2E ] || [ "$SCENARIO" != retained-missing-run ]; } &&
         { [ "$name" != TestPrerequisiteClosureReleaseE2E ] || [ "$SCENARIO" != retained-missing-closure-run ]; }; then
         echo "=== RUN   $name"
@@ -308,7 +308,7 @@ for scenario in success optional retained-missing-run retained-missing-closure-r
   done
   if [ "$scenario" = optional ] || [[ "$scenario" = retained-* ]]; then
     # The optional leg retains its own selector and Go's default timeout policy.
-    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-run\t^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease)E2E$\t./internal/handler/...\n' \
+    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-run\t^Test(Codex(RefreshLostReply|RetainedStop)|PrerequisiteClosureRelease|RecoveryRestoreWorkerClientSmall)E2E$\t./internal/handler/...\n' \
       "$dsn" >> "$case_dir/expected"
   fi
   assert_case "ordered calls, exact flags, timeout reset and shared DSN" \
