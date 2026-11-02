@@ -1251,13 +1251,12 @@ it("maintenance expiry after held ACK journal completion cannot notify release o
   const f = await v2FrozenFixture();
   let now = 0, released = 0;
   const budget = new MaintenanceBudget(600_000, () => now);
-  const write = f.coordinator["writeExistingRecord"].bind(f.coordinator);
+  const write = f.coordinator["writeRecordUnlocked"].bind(f.coordinator);
   Object.assign(f.coordinator, {
     onAuthoritativeGenerationReleased: () => { released++; },
-    writeExistingRecord: async (...args: Parameters<typeof write>) => {
-      const result = await write(...args);
-      if (result.finalAcknowledged) now = 600_000;
-      return result;
+    writeRecordUnlocked: async (...args: Parameters<typeof write>) => {
+      await write(...args);
+      if (args[0].finalAcknowledged) now = 600_000;
     },
   });
   try {
