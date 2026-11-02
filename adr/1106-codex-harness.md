@@ -1346,3 +1346,90 @@ The user contract is
 
 Out of scope: pooling OpenAI API keys, Codex chat, and any change of account
 for a run that already exists.
+
+## Amendment: opt-in cross-harness overflow at creation (2026-11-02)
+
+The ordinary implicit harness resolver remains the starting point. A separate
+per-user boolean, `harness_overflow_enabled`, defaults false and permits a
+one-time comparison before an eligible issue run is committed. Creation passes
+an explicit origin (kind, trigger source, explicit harness, model pin and
+Anthropic override presence) to this separate policy; unknown origin is excluded.
+The pure resolver and usage-independent settings/scheduler readers keep their
+existing input and behavior. The exact
+user-facing label is **Overflow to the other harness when my default is near its limits**.
+Settings saves it independently; `uzi settings harness-overflow on|off`
+writes the dedicated endpoint and `uzi settings get` reads it.
+
+**Eligibility is narrow.** Both harnesses must be usable. The run must be a
+new issue run with an implicit harness and trigger `manual`, `autopilot`
+or `schedule`. An explicit harness (including an issue label), a nonempty
+run/schedule model pin, an Anthropic credential override, or either raw saved
+`plan_cross_check_enabled` / `code_cross_check_enabled` flag excludes it.
+The flag exclusion is independent of whether the checker would be effective
+for this preferred harness. Other kinds and origins, including chat, jobs,
+tasks, prompts, review, rework, CI fixes and cross-check children, retain
+their existing resolution. A saved worker-model default is a per-harness
+lane, not a run model pin.
+
+**Comparison and measurement are different evidence.** Overflow requires
+preferred comparison headroom < 20%, receiver comparison headroom >= 30%
+and receiver advantage >= 15 percentage points. Unknown comparison evidence
+retains the preferred harness. Capacity holds give a preferred credential a
+comparison zero while retaining measured headroom separately, including
+unknown measurement. A held receiver is inadmissible.
+
+- Codex evidence is the selected account's score, with the existing alias
+  fence rechecking that choice, not a scan for an unrelated account's best
+  score. The main `codex` bucket supplies headroom. A receiver must be
+  structurally usable and unheld with reason `auto` or `best_of_pool`,
+  or a healthy `default`. `pool_empty`, `pool_stale` and
+  `pool_exhausted` receiver comparisons remain unknown even when a raw
+  measurement exists. API-key auth supplies no subscription comparison.
+  An unavailable default account does not turn an otherwise valid Claude
+  creation into a destination-resolution failure. An already preferred
+  default Codex account retains its pre-existing resolution behavior; its
+  measured score need not be erased by structural receiver restrictions.
+- Claude evidence enumerates the complete enabled, non-rejected token set,
+  including unpooled tokens. Fresh 7-day usage is required; headroom is 100
+  minus the fullest reported 7-day/optional 5-hour window. The preferred
+  comparison is the maximum token score; the receiver comparison is the
+  minimum. An unheld unknown token makes either aggregate unknown, including
+  a mixed held/unknown set. Preferred held means the complete set is held;
+  any held token blocks a Claude receiver. Measured aggregation is separate
+  and unknown if a constituent measurement is missing.
+
+This conservative Claude fold can be blocked by an unrelated stale,
+low-headroom or held token, including one outside the pool. Comparing
+percentages across different capacities is a heuristic, not a prediction of
+runnable work. It does not promise destination admission or completion.
+
+**Atomic freeze and privacy.** The
+[creation transaction](../api/internal/workersvc/harness_resolver.go)
+captures policy/checker flags, takes the shared secret-mutation lock before
+run/branch/alias locks, re-resolves under that lock, compares evidence,
+inserts the run, fences the selected Codex alias/account and freezes any
+Codex binding, then persists the explanation in the same commit. If the
+fence would change the chosen harness, creation refuses and rolls back.
+This does not eliminate the existing refresher-after-fence window described
+in the account-selection amendment. Overflow evaluates once: existing runs,
+usage-limit parks and resumes keep their stored harness.
+
+The owner's web run page, human/JSON `uzi run get` and TUI detail rail show
+the creation snapshot: preferred/chosen harness, reason, comparison scores,
+measured headroom and hold flags. Reasons are `off`, `excluded`,
+`unknown_usage`, `preferred` and `overflow`. Nullable numeric fields keep
+unknown distinct from zero. Legacy/unavailable evidence is not recorded.
+The [viewer projection](../api/internal/handler/runs_dto.go) exposes this
+quota evidence to the run owner; foreign viewers, including admins, receive
+null. Generic mutation/worker DTOs leave it null. Usage-independent run
+readers do not fetch live usage or recompute the snapshot; meters, forecasts
+and claim/resume admission retain their existing contracts.
+
+Source map: [policy and evidence fold](../api/internal/workersvc/harness_overflow.go),
+[decision DTO](../api/internal/apitypes/run.go),
+[CLI setting](../api/cmd/uzi/settings_harness_overflow.go),
+[web setting](../web/src/pages/RunDefaults.tsx) and
+[web explanation](../web/src/components/RunHarnessDecision.tsx).
+User contracts: [Worker model](../docs/worker-model.md#overflow-to-the-other-harness),
+[headroom comparison](../docs/rate-limits.md#how-overflow-compares-headroom)
+and [CLI](../docs/cli.md#harness-overflow).

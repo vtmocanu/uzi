@@ -17,7 +17,7 @@ Both settings live together in one **Settings → Run defaults** card:
 
 - A **default harness** picker, shown only when you have a usable credential
   for both Claude and Codex. It decides which harness a run uses when
-  nothing else names one.
+  nothing else names one, subject to the optional creation-time overflow below.
 - One **model lane per usable harness**: Anthropic and Codex side by side
   when both are usable, or a single lane when only one is. With no usable
   credential yet, the card still shows the Claude lane so you can
@@ -31,11 +31,40 @@ both lanes together, in one request.
 
 ![Settings, Run defaults, showing the grouped Harness and worker models card with side-by-side Claude and Codex model lanes](img/worker-model-settings.png)
 
+## Overflow to the other harness
+
+In **Settings → Run defaults**, turn on **Overflow to the other harness when my default is near its limits**.
+This per-user boolean is off by default and saves automatically, separately
+from **Save defaults**. The CLI equivalent is
+`uzi settings harness-overflow on|off`; `uzi settings get` reads it back.
+
+Overflow applies at creation to **new issue runs** started manually, by
+autopilot or by a schedule, when both harnesses are usable and the harness
+choice is implicit. An explicit harness (including an issue harness label),
+a run/schedule model pin, an Anthropic credential override, or either saved
+Plan or Code cross-check enable flag excludes it, even if that checker
+would be inactive for the preferred harness. Chat, jobs, tasks, prompts,
+reviews, rework, CI fixes and other origins do not use overflow.
+
+uzi compares stored usage and capacity holds. The preferred comparison
+score must be **below 20%**, the other harness **at least 30%**, and the
+advantage **at least 15 percentage points**. An unknown comparison keeps
+the preferred harness. See [How overflow compares headroom](./rate-limits.md#how-overflow-compares-headroom)
+for account selection, conservative Claude aggregation and hold handling.
+
+The harness and creation explanation are frozen atomically. Existing runs,
+including resumes and usage-limit parks, never switch harness through
+overflow. The owner's run page, `uzi run get <id>` (human and `--json`) and
+TUI detail rail show the stored preferred/chosen harness, reason, comparison
+scores, measured headroom and holds. This is creation-time evidence, not
+live usage; legacy or unavailable evidence reads **not recorded**.
+
 ## Model precedence
 
 For a given run, uzi resolves the harness first (an explicit run/schedule
 choice, then your default harness, then whichever harness you have a
-credential for), and only then reads that harness's model lane:
+credential for, with eligible overflow applied at creation), and only then
+reads that harness's model lane:
 
 1. The **schedule's model**, if the run was started by a
    [schedule](./scheduling.md) that pins one compatible with the run's

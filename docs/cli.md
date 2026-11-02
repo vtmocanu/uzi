@@ -235,6 +235,7 @@ uzi admin maintenance status [--json]
 uzi settings get
 uzi settings reserve --threshold <1..100|off> [--pause-running[=true|false]]
 uzi settings codex-mode default|auto
+uzi settings harness-overflow on|off
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -283,7 +284,8 @@ A few worth knowing:
   resolve one.** `run create --harness claude|codex` and `schedule create
   --harness claude|codex` request a specific harness outright; omitting the
   flag leaves the server's own resolution in charge (your effective default,
-  or whichever harness you have a usable credential for). `schedule edit
+  or whichever harness you have a usable credential for, with
+  [optional overflow](#harness-overflow) for eligible new issue runs). `schedule edit
   --harness ""` clears a schedule's pin back to per-fire resolution; leaving
   the flag unset on edit leaves the stored pin unchanged. The resolved
   harness shows as a `HARNESS` row on `uzi run get`; on `uzi run list` it's
@@ -3076,8 +3078,9 @@ prints the result, for example `Weekly usage reserve: 70% (pause running runs:
 on)` or `Weekly usage reserve: off`; `--json` returns
 `weekly_reserve_pct` (`null` = off) and `weekly_reserve_pause_running`.
 
-`uzi settings get` ends with the same `Weekly usage reserve:` line (after the
-`Now summary:` line), and its `--json` carries both fields.
+`uzi settings get` shows the same `Weekly usage reserve:` line after the
+`Now summary:` line, followed by Codex account mode and harness overflow;
+its `--json` carries both reserve fields.
 
 On a run the reserve touches, `uzi run get` shows:
 
@@ -3145,6 +3148,62 @@ and an automatic MR rework is skipped. When every Codex login you hold is
 disabled, the existing disabled-credential refusal applies instead (a 422 with
 no reason; a schedule records `credential_disabled`). `uzi settings get` shows `Codex account
 mode:` after the reserve line, and `--json` carries `codex_account_mode`.
+
+### Harness overflow
+
+```sh
+uzi settings harness-overflow on
+uzi settings harness-overflow off
+uzi settings get
+uzi settings get --json
+```
+
+`uzi settings harness-overflow on|off` controls the per-user boolean
+`harness_overflow_enabled`, off by default. It matches **Settings → Run
+defaults → Overflow to the other harness when my default is near its limits**.
+The command writes `PUT /api/me/harness-overflow` with
+`{"harness_overflow_enabled":true}` (or `false`); `--json` returns that
+single boolean field. Other arguments are usage errors (exit 2). Human
+output reads `Harness overflow: on (new runs, at creation)` or
+`Harness overflow: off (new runs, at creation)`. `uzi settings get` shows
+the same line after Codex account mode; its decoded settings JSON includes
+`harness_overflow_enabled`.
+
+Overflow applies at creation to new implicit issue runs started manually,
+by autopilot or by a schedule, with both harnesses usable. Explicit
+harnesses (including issue harness labels), run/schedule model pins,
+Anthropic credential overrides and either raw saved Plan or Code cross-check
+enable flag exclude it, even when a checker would be inactive for that
+harness. Other run kinds and origins do not use overflow. A preferred score
+below 20%, an other-harness score of at least 30%, and an advantage of at
+least 15 percentage points are required; unknown comparisons keep the
+preferred harness. The decision freezes atomically with creation; overflow
+never changes an existing run or resume. See
+[Worker model](./worker-model.md#overflow-to-the-other-harness) for setup and
+[rate limits](./rate-limits.md#how-overflow-compares-headroom) for selected
+accounts, Claude aggregation and capacity holds.
+
+`uzi run get <id>` shows `HARNESS_PICK` rows headed `at creation:`;
+the TUI detail rail has **HARNESS at creation**, fitted as a whole block
+when space permits. The web run page shows the same stored explanation.
+These are owner-only readings, independent of live usage and claim-time
+credential metadata. Legacy or unavailable decisions read `not recorded`.
+
+In `uzi run get <id> --json`, `harness_decision` is an object with:
+
+| Field | Meaning |
+|---|---|
+| `preferred`, `chosen` | Preferred harness before overflow and the run's stored harness. |
+| `reason` | `off`, `excluded`, `unknown_usage`, `preferred` or `overflow`. |
+| `preferred_score`, `other_score` | Nullable comparison percentages used for the thresholds. |
+| `preferred_measured`, `other_measured` | Nullable measured headroom, kept separately from capacity holds. |
+| `preferred_held`, `other_held` | Capacity-hold flags; Claude preferred means the complete token set is held, Claude receiver means any token is held. |
+
+Unknown numeric evidence is `null`, distinct from a measured zero. A hold
+can make a preferred comparison zero with measured headroom still unknown.
+The whole object is `null` for a legacy/unrecorded decision or a foreign
+viewer, including an admin viewing another user's run. Generic mutation and
+worker responses also leave it `null`; reads do not trigger a usage lookup.
 
 ### Plan cross-check evidence
 
