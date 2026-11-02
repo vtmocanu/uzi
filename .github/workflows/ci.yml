@@ -1322,14 +1322,21 @@ jobs:
   # so waiting for it made an agent PR ~3 min slower. Nothing is dropped: test-agent is
   # still a required check, this build is not, and it pushes nothing. validate-agent
   # (~20 s: lint, typecheck) stays as the cheap fail-fast.
+  #
+  # Both published arches, each on a native runner (release.yml publish-agent): nix and
+  # Chromium are impractical under QEMU. arm64 reads release.yml's -arm64 cache refs; until
+  # the first multi-arch release writes them that leg runs cold.
   build-agent:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     needs: [changes, validate-agent]
     if: needs.changes.outputs.agent == 'true'
     strategy:
       fail-fast: false
       matrix:
         template: [base, jvm]
+        arch: [amd64, arm64]
+    env:
+      CACHE_SUFFIX: ${{ matrix.arch == 'arm64' && '-arm64' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       # The builder image comes from mirror.gcr.io (driver-opts below); this pre-pull falls
@@ -1347,12 +1354,12 @@ jobs:
           context: .
           file: agent/templates/${{ matrix.template }}/Dockerfile
           push: false
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.arch }}
           # :buildcache holds the runtime-stage layers, :buildcache-release the release
           # stage's (release.yml writes both since #1720); read-only here, as above.
           cache-from: |
-            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache
-            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache-release
+            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache${{ env.CACHE_SUFFIX }}
+            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache-release${{ env.CACHE_SUFFIX }}
           build-args: |
             UZI_SRC_SHA=${{ github.sha }}
           tags: uzi-agent-${{ matrix.template }}:pr

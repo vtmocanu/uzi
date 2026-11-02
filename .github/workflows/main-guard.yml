@@ -33,7 +33,7 @@ name: Main Guard
 "on":
   schedule:
     # 05:43 UTC, off the top of the hour to avoid the scheduler's high-load
-    # contention and distinct from e2e.yml's 01:17 slot. Daily is a deliberate
+    # contention and distinct from e2e.yml's 21:17 slot. Daily is a deliberate
     # cadence choice, not a floor -- raise it (or add more hours) freely if faster
     # detection is worth the runner minutes.
     - cron: "43 5 * * *"

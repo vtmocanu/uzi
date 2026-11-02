@@ -8,8 +8,9 @@ name: Codex packaged proof
 # (`task test:codex-proof`).
 #
 # A second leg, arm64-package-exec, runs e2e/codex-proof/package-exec.sh on a native arm64 runner:
-# the arm64 artifact's SHA256, members and manifest, and `codex --version` as the runner uid. Only
-# amd64 images ship, so it guards the lock's arm64 entry, not an arm64 image (#3212).
+# the arm64 artifact's SHA256, members and manifest, and `codex --version` as the runner uid. It
+# guards the lock's arm64 entry without an image build; the arm64 worker image's own build-time
+# assert-codex.sh runs in ci.yml's build-agent and release.yml's publish-agent (#3212).
 #
 # The `codex-packaged-proof-gate` job is the stable REQUIRED context (kind-smoke-gate precedent):
 # every PR runs this workflow, a `changes` job decides which legs the PR needs, and the gate
