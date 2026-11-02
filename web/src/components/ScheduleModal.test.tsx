@@ -67,6 +67,7 @@ beforeEach(async () => {
   // PRD #1429 M4a review Fix 1: no owner default_harness preference by default.
   mockApi.getMySettings.mockResolvedValue({
     settings: {
+      harness_overflow_enabled: false,
       default_harness: null,
       default_model: null,
       default_effort: null,

@@ -42,6 +42,7 @@ const mockApi = vi.mocked(api);
 beforeEach(() => {
   mockApi.getMySettings.mockResolvedValue({
     settings: {
+      harness_overflow_enabled: false,
       default_harness: null,
       default_model: null,
       default_effort: null,

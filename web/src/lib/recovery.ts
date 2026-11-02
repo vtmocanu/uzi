@@ -93,7 +93,7 @@ export function captureView(state: string, reason?: string): CaptureView {
       return {
         label: "Available",
         tone: "ok",
-        description: "The original committed history is ready to download.",
+        description: "The archive bytes are ready to download. Restore also requires any prerequisite commits.",
         downloadable: true,
       };
     case "needs_action":
@@ -151,6 +151,7 @@ export function formatArchiveSize(bytes: number | null | undefined): string {
 // shorter or non-hex value untouched. The caller still routes the result through
 // stripUnsafeChars — this only shortens, it does not sanitize.
 export function shortSha(sha: string): string {
+  if (typeof sha !== "string") return "Invalid metadata";
   return sha.length > 12 ? sha.slice(0, 12) : sha;
 }
 
@@ -534,4 +535,70 @@ export function groupHoldsByWorker(holds: RecoveryCustodyHold[]): WorkerHoldGrou
     return (a.workerName ?? a.workerId).localeCompare(b.workerName ?? b.workerId);
   });
   return groups;
+}
+
+// Commands accept only complete identifiers; display clipping never feeds a command.
+export function recoveryExportCommand(runId: string, captureId: string): string | null {
+  return validRecoveryUUID(runId) && validRecoveryUUID(captureId)
+    ? `uzi run export ${runId} --output <path> --capture ${captureId}` : null;
+}
+function validRecoveryUUID(value: unknown): value is string {
+  return typeof value === "string" && value.length === 36 && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+export function recoveryDiagnostic(value: unknown): string {
+  return typeof value === "string" ? stripUnsafeChars(value.slice(0, 512)) : "Invalid metadata";
+}
+
+function validRecordTime(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 40 ||
+    !/^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(value) ||
+    value.trim() !== value || !Number.isFinite(Date.parse(value)) || Date.parse(value) === Date.parse("0001-01-01T00:00:00Z")) return null;
+  // Date.parse normalizes impossible calendar days, so check the date separately.
+  const day = new Date(value.slice(0, 10) + "T00:00:00Z");
+  return day.toISOString().slice(0, 10) === value.slice(0, 10) ? value : null;
+}
+
+// This is a recorded server observation, never a live forge probe or release decision.
+export function prerequisiteView(capture: RecoveryArchive) {
+  const raw: unknown = capture.prerequisite_closure;
+  const row = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? raw as Record<string, unknown> : null;
+  const ref = validRecoveryUUID(capture.id) ? `refs/uzi-prereq/${capture.id}` : null;
+  const safeRef = row && ref === row.pin_ref ? ref : null;
+  const safeTip = row && typeof row.pin_tip === "string" && row.pin_tip.length === 40 && /^[0-9a-f]{40}$/.test(row.pin_tip) && row.pin_tip !== "0".repeat(40) ? row.pin_tip : null;
+  const updated = validRecordTime(row?.updated_at);
+  const valid = !!(row && safeRef && updated && typeof row.absence_unconfirmed === "boolean" &&
+    typeof row.cleanup_exhausted === "boolean" && (row.reason === undefined || typeof row.reason === "string") && (row.pin_tip === undefined || safeTip) &&
+    (row.state !== "pinned" || safeTip));
+  const state = valid && typeof row?.state === "string" ? row.state : "unknown";
+  const descriptions: Record<string, string> = {
+    pending: "Pin pending: prerequisite protection is not established; this may persist indefinitely.",
+    invoked: "Pin creation invoked: prerequisite protection is not established; this may persist indefinitely.",
+    create_unknown: "Pin creation outcome unknown: prerequisite protection is not established; this may persist indefinitely.",
+    pinned: "Pin recorded by the server. Protection depends on the external ref and its history surviving. This is not a fresh probe, a complete bundle guarantee, or custody release.",
+    refused: "Pin creation refused; prerequisites are not protected by this record.",
+    foreign: "A foreign ref occupies the pin name; this record does not protect prerequisites.",
+    lost: "The recorded pin was lost; prerequisites are not protected by this record.",
+    deleted: "Pin deletion was recorded; this is historical cleanup evidence, not current prerequisite protection.",
+  };
+  // RecoveryArchive exposes checksum and byte_size only after manifest binding.
+  // An absent prerequisite list before that point says nothing about the bundle.
+  const manifestBound = typeof capture.checksum === "string" && /^[0-9a-f]{64}$/i.test(capture.checksum) &&
+    capture.checksum.length === 64 && typeof capture.byte_size === "number" && Number.isSafeInteger(capture.byte_size) && capture.byte_size >= 0;
+  const selfContained = manifestBound && (capture.prerequisite_shas === undefined ||
+    (Array.isArray(capture.prerequisite_shas) && capture.prerequisite_shas.length === 0));
+  const protection = selfContained ? "self_contained" : state === "pinned" && row?.absence_unconfirmed === false && safeTip
+    ? "protected" : ["refused", "foreign", "lost", "deleted"].includes(state) ? "unprotected" : "uncertain";
+  const cleanup = row?.cleanup_exhausted === true ? "exhausted" : state === "deleted" ? "complete"
+    : state === "pinned" && ["expired", "discarded"].includes(capture.state) ? "pending" : "none";
+  return {
+    protection, cleanup,
+    description: selfContained ? "Self-contained archive: no prerequisite commits are recorded."
+      : Object.prototype.hasOwnProperty.call(descriptions, state) ? descriptions[state] : "Prerequisite protection unknown: no usable server pin record. A thin archive alone is insufficient for restore.",
+    absence: row?.absence_unconfirmed === true,
+    ref: safeRef, tip: safeTip, updated,
+    reason: row?.reason ? recoveryDiagnostic(row.reason) : null,
+    fetchCommand: valid && state === "pinned" && protection === "protected" && safeRef && safeTip
+      ? `git fetch origin '${safeRef}:${safeRef}'` : null,
+  };
 }

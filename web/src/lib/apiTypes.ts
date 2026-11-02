@@ -253,6 +253,8 @@ export interface UserSettings {
   /** Issue #3719: how a new Codex run chooses its login. "default" binds the default alias;
    *  "auto" picks among the pooled aliases. Absent on a server that predates the setting. */
   codex_account_mode?: CodexAccountMode | string;
+  /** Owner opt-in, written only through PUT /me/harness-overflow. */
+  harness_overflow_enabled: boolean;
   /** Per-user default harness (PRD #1429 M1 / D3); null = "no preference", so implicit run
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
@@ -3172,6 +3174,19 @@ export interface RunLeadConfig {
   phases: LeadPhaseConfig[];
 }
 
+/** Stored creation-time evidence; null on legacy or redacted run responses. */
+export interface HarnessDecision {
+  preferred: string;
+  chosen: string;
+  reason: string;
+  preferred_score: number | null;
+  other_score: number | null;
+  preferred_measured: number | null;
+  other_measured: number | null;
+  preferred_held: boolean;
+  other_held: boolean;
+}
+
 export interface Run {
   policy_hold?: {
     preserve_required: boolean;
@@ -3231,6 +3246,7 @@ export interface Run {
    *  "claude"). The web marks every run with its provider chip (HarnessBadge, PRD #1653
    *  D-W5), and keys the model/effort vocabulary on it (M4). */
   harness: Harness;
+  harness_decision: HarnessDecision | null;
   /** Chat conversation title (PRD #39), first-message derived; null for other kinds
    *  and until derived. resume_of_run_id points a continued chat at the ended one. */
   title: string | null;
@@ -5432,7 +5448,18 @@ export interface CIRunDetail extends CIRun {
 // until the capture reaches the relevant lifecycle stage: attempted_head_sha (H') is
 // absent when no publish was attempted; byte_size/checksum are absent until the manifest
 // is bound; expires_at is absent until the artifact is available.
+export interface RecoveryPrerequisiteClosure {
+  state: string;
+  reason?: string;
+  pin_ref: string;
+  pin_tip?: string;
+  absence_unconfirmed: boolean;
+  cleanup_exhausted: boolean;
+  updated_at: string;
+}
+
 export interface RecoveryArchive {
+  prerequisite_closure?: RecoveryPrerequisiteClosure;
   id: string;
   run_id: string;
   hold_id: string;

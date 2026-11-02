@@ -813,7 +813,7 @@ schedules.push({ ...capacityDemo, id: "sch-recent-fires", labels: ["Planned"], c
       started: [
         { issue_iid: 1003, run_id: "run-awaiting", title: "Plan gate shows a stale diff",
           web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/1003" },
-        { issue_iid: 1004, run_id: "run-closed", title: "Mobile nav traps focus" },
+        { issue_iid: 1004, run_id: "c57b3989-105a-4e08-bf74-77ebc28e5a02", title: "Mobile nav traps focus" },
       ] },
   ] });
 

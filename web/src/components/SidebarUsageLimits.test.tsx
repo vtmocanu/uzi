@@ -33,6 +33,7 @@ const mockApi = vi.mocked(api);
 
 const settings = (tokenIds: string[], codexIds: string[]): { settings: UserSettings } => ({
   settings: {
+    harness_overflow_enabled: false,
     default_harness: null,
     default_model: null,
     default_effort: null,

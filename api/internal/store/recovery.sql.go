@@ -1032,9 +1032,17 @@ func (q *Queries) ListCaptureSourceShasForHold(ctx context.Context, arg ListCapt
 }
 
 const listCapturesForRunOwner = `-- name: ListCapturesForRunOwner :many
-SELECT id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds, redundancy_proof, redundancy_refused_at, redundancy_refusal FROM recovery_captures
-WHERE run_id = $1 AND user_id = $2
-ORDER BY created_at
+SELECT c.id, c.hold_id, c.run_id, c.user_id, c.original_worker_id, c.original_worker_identity, c.source_sha, c.attempted_head_sha, c.idempotency_key, c.state, c.manifest_bound, c.byte_size, c.checksum, c.chunk_count, c.prerequisite_shas, c.reason, c.context, c.expires_at, c.created_at, c.updated_at, c.reserved_bytes, c.coverage_digest, c.local_replica_worker_id, c.ready_retention_seconds, c.redundancy_proof, c.redundancy_refused_at, c.redundancy_refusal, p.id AS closure_id, p.state AS closure_state,
+    p.reason AS closure_reason, p.pin_ref, p.pin_tip, p.absent_since,
+    p.cleanup_exhausted_at, p.updated_at AS closure_updated_at
+FROM recovery_captures c
+LEFT JOIN recovery_prerequisite_closures p
+    ON p.capture_id = c.id AND p.user_id = c.user_id AND p.run_id = c.run_id
+    AND p.hold_id = c.hold_id
+    AND p.repo_id = (SELECT h.repo_id FROM recovery_custody_holds h WHERE h.id = c.hold_id)
+    AND p.checksum = c.checksum AND p.prerequisite_shas = c.prerequisite_shas
+WHERE c.run_id = $1 AND c.user_id = $2
+ORDER BY c.created_at
 `
 
 type ListCapturesForRunOwnerParams struct {
@@ -1042,45 +1050,65 @@ type ListCapturesForRunOwnerParams struct {
 	UserID uuid.UUID `json:"user_id"`
 }
 
+type ListCapturesForRunOwnerRow struct {
+	RecoveryCapture    RecoveryCapture    `json:"recovery_capture"`
+	ClosureID          pgtype.UUID        `json:"closure_id"`
+	ClosureState       pgtype.Text        `json:"closure_state"`
+	ClosureReason      pgtype.Text        `json:"closure_reason"`
+	PinRef             pgtype.Text        `json:"pin_ref"`
+	PinTip             pgtype.Text        `json:"pin_tip"`
+	AbsentSince        pgtype.Timestamptz `json:"absent_since"`
+	CleanupExhaustedAt pgtype.Timestamptz `json:"cleanup_exhausted_at"`
+	ClosureUpdatedAt   pgtype.Timestamptz `json:"closure_updated_at"`
+}
+
 // D7: every retained capture for one run, owner-scoped, oldest-first. Feeds the run's
 // Recovery archives section (all states shown, not gated on availability).
-func (q *Queries) ListCapturesForRunOwner(ctx context.Context, arg ListCapturesForRunOwnerParams) ([]RecoveryCapture, error) {
+func (q *Queries) ListCapturesForRunOwner(ctx context.Context, arg ListCapturesForRunOwnerParams) ([]ListCapturesForRunOwnerRow, error) {
 	rows, err := q.db.Query(ctx, listCapturesForRunOwner, arg.RunID, arg.UserID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []RecoveryCapture{}
+	items := []ListCapturesForRunOwnerRow{}
 	for rows.Next() {
-		var i RecoveryCapture
+		var i ListCapturesForRunOwnerRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.HoldID,
-			&i.RunID,
-			&i.UserID,
-			&i.OriginalWorkerID,
-			&i.OriginalWorkerIdentity,
-			&i.SourceSha,
-			&i.AttemptedHeadSha,
-			&i.IdempotencyKey,
-			&i.State,
-			&i.ManifestBound,
-			&i.ByteSize,
-			&i.Checksum,
-			&i.ChunkCount,
-			&i.PrerequisiteShas,
-			&i.Reason,
-			&i.Context,
-			&i.ExpiresAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.ReservedBytes,
-			&i.CoverageDigest,
-			&i.LocalReplicaWorkerID,
-			&i.ReadyRetentionSeconds,
-			&i.RedundancyProof,
-			&i.RedundancyRefusedAt,
-			&i.RedundancyRefusal,
+			&i.RecoveryCapture.ID,
+			&i.RecoveryCapture.HoldID,
+			&i.RecoveryCapture.RunID,
+			&i.RecoveryCapture.UserID,
+			&i.RecoveryCapture.OriginalWorkerID,
+			&i.RecoveryCapture.OriginalWorkerIdentity,
+			&i.RecoveryCapture.SourceSha,
+			&i.RecoveryCapture.AttemptedHeadSha,
+			&i.RecoveryCapture.IdempotencyKey,
+			&i.RecoveryCapture.State,
+			&i.RecoveryCapture.ManifestBound,
+			&i.RecoveryCapture.ByteSize,
+			&i.RecoveryCapture.Checksum,
+			&i.RecoveryCapture.ChunkCount,
+			&i.RecoveryCapture.PrerequisiteShas,
+			&i.RecoveryCapture.Reason,
+			&i.RecoveryCapture.Context,
+			&i.RecoveryCapture.ExpiresAt,
+			&i.RecoveryCapture.CreatedAt,
+			&i.RecoveryCapture.UpdatedAt,
+			&i.RecoveryCapture.ReservedBytes,
+			&i.RecoveryCapture.CoverageDigest,
+			&i.RecoveryCapture.LocalReplicaWorkerID,
+			&i.RecoveryCapture.ReadyRetentionSeconds,
+			&i.RecoveryCapture.RedundancyProof,
+			&i.RecoveryCapture.RedundancyRefusedAt,
+			&i.RecoveryCapture.RedundancyRefusal,
+			&i.ClosureID,
+			&i.ClosureState,
+			&i.ClosureReason,
+			&i.PinRef,
+			&i.PinTip,
+			&i.AbsentSince,
+			&i.CleanupExhaustedAt,
+			&i.ClosureUpdatedAt,
 		); err != nil {
 			return nil, err
 		}

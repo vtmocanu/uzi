@@ -161,6 +161,7 @@ function agent(name: string): RepoAgent {
 
 function run(over: Partial<Run>): Run {
   return {
+    harness_decision: null,
     id: "r1",
     repo_id: "repo1",
     forge_type: "gitlab",
@@ -3126,7 +3127,9 @@ describe("RunView preserved-patch surface (PRD #377)", () => {
 // failed hero). So the hint is doubly recoverability-aware: needs_landing AND an available
 // capture. The header pill for such a run reads "needs landing" (issue #1418 part A).
 describe("RunView landing hint (issue #1418)", () => {
-  const EXPORT_CMD = "uzi run export r1 --output <path> --capture cap-ok";
+  const RUN_ID = "00000000-0000-4000-8000-000000001418";
+  const CAPTURE_ID = "00000000-0000-4000-8000-000000001419";
+  const EXPORT_CMD = `uzi run export ${RUN_ID} --output <path> --capture ${CAPTURE_ID}`;
 
   function archiveSummary(over: Record<string, unknown> = {}) {
     return {
@@ -3147,8 +3150,8 @@ describe("RunView landing hint (issue #1418)", () => {
   }
   function availableCapture(over: Record<string, unknown> = {}) {
     return {
-      id: "cap-ok",
-      run_id: "r1",
+      id: CAPTURE_ID,
+      run_id: RUN_ID,
       hold_id: "h1",
       state: "available",
       source_sha: "0123456789abcdef0123456789abcdef01234567",
@@ -3159,7 +3162,7 @@ describe("RunView landing hint (issue #1418)", () => {
 
   function renderPage(over: Partial<Run>, summary: ReturnType<typeof archiveSummary>) {
     mockUseRunStream.mockReturnValue({
-      run: run(over),
+      run: run({ id: RUN_ID, ...over }),
       messages: [],
       connected: true,
       error: "",
@@ -3173,7 +3176,7 @@ describe("RunView landing hint (issue #1418)", () => {
       summary as unknown as Awaited<ReturnType<typeof api.getRunArchives>>,
     );
     return render(
-      <MemoryRouter initialEntries={["/runs/r1"]}>
+      <MemoryRouter initialEntries={[`/runs/${RUN_ID}`]}>
         <RunView />
       </MemoryRouter>,
     );
@@ -7954,4 +7957,21 @@ it.each([
     expect(container.textContent).toContain(reason);
     expect(container.querySelector("[title]")!.getAttribute("title")).toBe("waiting: provider reported overload; account admission eligible after 2026-10-27T12:01:37Z");
   } finally { now.mockRestore(); }
+});
+
+
+describe("RunView stored harness decision placement", () => {
+  it("shows creation evidence for queued runs without a credential label", () => {
+    viewerVault(true);
+    mockUseRunStream.mockReturnValue({
+      run: run({ status: "queued", harness: "codex", anthropic_secret_label: null, codex_secret_label: null,
+        harness_decision: { preferred: "claude", chosen: "codex", reason: "overflow",
+          preferred_score: 0, other_score: 60, preferred_measured: null, other_measured: 60,
+          preferred_held: true, other_held: false } }),
+      messages: [], connected: true, error: "", submit: vi.fn(), refreshRun: vi.fn(), inputs: [], canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+    expect(screen.getByRole("region", { name: "Harness decision at creation time" }).textContent).toContain("preferred claude, chosen codex. Reason: overflow");
+  });
 });

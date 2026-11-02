@@ -818,6 +818,10 @@ const realApi = {
   vaultDisable: () => request<VaultDisableResponse>("POST", "/vault/disable"),
   getMySettings: (passive = false) =>
     request<{ settings: UserSettings }>("GET", "/me/settings", undefined, passive ? { "X-Uzi-Passive": "1" } : undefined),
+  setHarnessOverflow: (enabled: boolean) =>
+    request<{ harness_overflow_enabled: boolean }>("PUT", "/me/harness-overflow", {
+      harness_overflow_enabled: enabled,
+    }),
   putMySettings: (patch: UserSettingsPatch) =>
     request<{ settings: UserSettings }>("PUT", "/me/settings", patch),
   // Slack linking (PRD #25 M3), own-user only. member_id null clears the override

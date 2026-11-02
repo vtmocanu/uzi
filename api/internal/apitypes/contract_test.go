@@ -128,6 +128,7 @@ func contractCases() []contractCase {
 		// normalizes to []). Their nested RecoveryArchiveStateCountsDTO rides inside the
 		// summary fixtures (no standalone row — it is never returned alone).
 		newContractCase[RecoveryArchiveDTO]("recovery_archive"),
+		newContractCase[RecoveryPrerequisiteClosureDTO]("recovery_prerequisite_closure"),
 		newContractCase[RecoveryArchiveSummaryDTO]("recovery_archive_summary"),
 		// PRD #1349 M1: the owner-facing custody-hold DTOs. RecoveryCustodyHoldDTO's only
 		// nullable field is released_at (*time.Time omitempty, dropped on the zero value) and

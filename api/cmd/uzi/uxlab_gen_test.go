@@ -130,6 +130,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"detail-plan-running-bottom":    func(d bool) string { return detailLongPlan(d, now, "running", true).View().Content },
 		"detail-plan-completed-top":     func(d bool) string { return detailLongPlan(d, now, "completed", false).View().Content },
 		"detail-plan-completed-bottom":  func(d bool) string { return detailLongPlan(d, now, "completed", true).View().Content },
+		"detail-harness-at-creation":    func(d bool) string { return harnessDecisionScene(d, now).View().Content },
 		"detail-running":                func(d bool) string { return detailRunning(d, now) },
 		"detail-accounting-backfill":    func(d bool) string { return detailAccountingBackfill(d, now).View().Content },
 		"detail-codex":                  func(d bool) string { return detailCodex(d, now) },

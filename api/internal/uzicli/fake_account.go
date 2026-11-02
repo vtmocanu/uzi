@@ -66,6 +66,16 @@ func (f *FakeClient) SetCodexAccountMode(_ context.Context, mode string) (string
 	return mode, nil
 }
 
+func (f *FakeClient) SetHarnessOverflowEnabled(_ context.Context, enabled bool) (bool, error) {
+	f.LastHarnessOverflowEnabled = enabled
+	f.HarnessOverflowCalls++
+	if f.Err != nil {
+		return false, f.Err
+	}
+	f.Settings.HarnessOverflowEnabled = enabled
+	return enabled, nil
+}
+
 func (f *FakeClient) SelfUsage(context.Context) (apitypes.SelfUsageDTO, error) {
 	if f.Err != nil {
 		return apitypes.SelfUsageDTO{}, f.Err

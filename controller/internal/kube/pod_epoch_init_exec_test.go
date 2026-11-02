@@ -3,9 +3,11 @@
 package kube
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -63,6 +65,10 @@ elif command == "seed":
 elif command == "prepare":
     event("prepare")
     s = os.stat(lock)
+    if "EPOCH_FIXTURE_READY_FD" in os.environ and os.environ.get("EPOCH_FIXTURE_SKIP_READY") != "1":
+        os.write(int(os.environ["EPOCH_FIXTURE_READY_FD"]), b"R")
+        if os.read(int(os.environ["EPOCH_FIXTURE_GO_FD"]), 1) != b"G":
+            raise RuntimeError("fixture start barrier closed")
     print(str(s.st_dev) + ":" + str(s.st_ino))
     if os.environ.get("EPOCH_FIXTURE_REMOVE_ON_PREPARE") == "1":
         os.unlink(lock)
@@ -86,6 +92,8 @@ else:
 type epochInitHost struct {
 	t                                                    *testing.T
 	data, nix, src, marker, layout, helper, python, node string
+	// Test seam for proving when the operation budget is armed, without sleeping.
+	raceContext func(context.Context) (context.Context, context.CancelFunc)
 }
 
 func newEpochInitHost(t *testing.T) *epochInitHost {
@@ -195,29 +203,130 @@ func (h *epochInitHost) posture() {
 // fixture proved its injected unlink: execution evidence, never race evidence.
 var errEpochRaceSetup = errors.New("missing-after-prepare race did not run")
 
+// Bootstrap includes scheduling, interpreter startup and the real root validator.
+// It is not the missing-file race. The operation keeps its original 8s budget,
+// armed only after prepare has statted the original lock and is waiting for GO.
+const epochFixtureBootstrapTimeout = 30 * time.Second
+const epochFixtureRaceTimeout = 8 * time.Second
+
 // missingAfterPrepare runs the rendered shell with the lock unlinked inside
 // prepare and classifies the outcome. The shell and every fixture process share
-// one process group, which cancellation kills whole; CombinedOutput returns only
+// one process group, which cancellation kills whole; Wait returns only
 // after every holder of its pipe has exited, so the snapshot below cannot race a
 // surviving fixture.
 func (h *epochInitHost) missingAfterPrepare(ctx context.Context, seed bool, extraEnv ...string) error {
 	h.t.Helper()
+	readyRead, readyWrite, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("%w: readiness pipe: %v", errEpochRaceSetup, err)
+	}
+	defer func() { _ = readyRead.Close(); _ = readyWrite.Close() }()
+	goRead, goWrite, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("%w: start pipe: %v", errEpochRaceSetup, err)
+	}
+	defer func() { _ = goRead.Close(); _ = goWrite.Close() }()
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	bootstrapCtx, cancelBootstrap := context.WithTimeout(ctx, epochFixtureBootstrapTimeout)
+	defer cancelBootstrap()
+	stopBootstrap := context.AfterFunc(bootstrapCtx, cancelRun)
+	defer stopBootstrap()
 	script := h.script(seed)
-	// Failure precedes UID-specific writes, including on a root host.
-	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", script) //nolint:gosec // G204: only fixed rendered source and test-owned paths.
-	cmd.Env = append(append(os.Environ(), "UZI_EPOCH_LOCK=1", "UZI_POD_UID=pod-race", "EPOCH_FIXTURE_REMOVE_ON_PREPARE=1", "LC_ALL=C"), extraEnv...)
+	// Failure precedes UID-specific writes, including on a root host. ExtraFiles
+	// are inherited as FD3 (READY writer) and FD4 (GO reader); the real lock is FD9.
+	cmd := exec.CommandContext(runCtx, "/bin/bash", "-c", script) //nolint:gosec // G204: only fixed rendered source and test-owned paths.
+	cmd.ExtraFiles = []*os.File{readyWrite, goRead}
+	cmd.Env = append(append(os.Environ(), "UZI_EPOCH_LOCK=1", "UZI_POD_UID=pod-race", "EPOCH_FIXTURE_REMOVE_ON_PREPARE=1", "LC_ALL=C", "EPOCH_FIXTURE_READY_FD=3", "EPOCH_FIXTURE_GO_FD=4"), extraEnv...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	out, runErr := cmd.CombinedOutput()
+	var output bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, &output
+	phase := "bootstrap"
+	operationStarted := false
+	var phaseErr, readyErr error
+	runErr := cmd.Start()
+	if runErr != nil {
+		phaseErr = bootstrapCtx.Err()
+	}
+	_ = readyWrite.Close()
+	_ = goRead.Close()
+	if runErr == nil {
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		ready := make(chan error, 1)
+		go func() {
+			var mark [1]byte
+			_, rerr := io.ReadFull(readyRead, mark[:])
+			if rerr == nil && mark[0] != 'R' {
+				rerr = errors.New("invalid readiness marker")
+			}
+			ready <- rerr
+		}()
+		readinessRead := false
+		select {
+		case readyErr = <-ready:
+			readinessRead = true
+			if readyErr != nil || bootstrapCtx.Err() != nil || !stopBootstrap() {
+				phaseErr = bootstrapCtx.Err()
+				cancelRun()
+				runErr = <-done
+			} else {
+				cancelBootstrap()
+				phase = "race"
+				arm := h.raceContext
+				if arm == nil {
+					arm = func(parent context.Context) (context.Context, context.CancelFunc) {
+						return context.WithTimeout(parent, epochFixtureRaceTimeout)
+					}
+				}
+				raceCtx, cancelRace := arm(ctx)
+				stopRace := context.AfterFunc(raceCtx, cancelRun)
+				if raceCtx.Err() != nil {
+					cancelRun()
+				} else if _, werr := goWrite.Write([]byte("G")); werr != nil {
+					readyErr = werr
+					cancelRun()
+				} else {
+					operationStarted = true
+				}
+				runErr = <-done
+				phaseErr = raceCtx.Err()
+				stopRace()
+				cancelRace()
+			}
+		case runErr = <-done:
+		case <-bootstrapCtx.Done():
+			phaseErr = bootstrapCtx.Err()
+			cancelRun()
+			runErr = <-done
+		}
+		// Join the readiness reader too. Closing this owned FD unblocks it even if
+		// the child exited before READY; its buffered result cannot leak a goroutine.
+		_ = readyRead.Close()
+		if !readinessRead {
+			readyErr = <-ready
+		}
+	}
+	out := output.Bytes()
 	events := h.events()
 	_, lockErr := os.Lstat(filepath.Join(h.data, ".uzi-epoch.lock"))
 	tail := out
 	if len(tail) > 4096 {
 		tail = tail[len(tail)-4096:]
 	}
-	diag := fmt.Sprintf("err=%v ctx=%v lock=%v events=%q output=%q", runErr, ctx.Err(), lockErr, events, tail)
-	if ctx.Err() != nil {
+	// Internal cancellation also joins an invalid/closed readiness channel. Do
+	// not misreport that cleanup as an external cancellation or expired budget.
+	contextErr := ctx.Err()
+	if contextErr == nil {
+		contextErr = phaseErr
+	}
+	diag := fmt.Sprintf("phase=%s err=%v ctx=%v ready=%v lock=%v events=%q output=%q", phase, runErr, contextErr, readyErr, lockErr, events, tail)
+	if contextErr != nil {
 		return fmt.Errorf("%w: context ended during execution: %s", errEpochRaceSetup, diag)
+	}
+	if !operationStarted {
+		return fmt.Errorf("%w: fixture never completed READY/GO: %s", errEpochRaceSetup, diag)
 	}
 	if !strings.Contains(events, "prepare-unlinked\n") {
 		return fmt.Errorf("%w: fixture never reached the injected unlink: %s", errEpochRaceSetup, diag)
@@ -249,10 +358,87 @@ func TestPodEpochInitExecMissingAfterPrepareNeverCreatesState(t *testing.T) {
 		t.Run(fmt.Sprintf("seed=%v", seed), func(t *testing.T) {
 			h := newEpochInitHost(t)
 			h.posture()
-			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-			defer cancel()
-			if err := h.missingAfterPrepare(ctx, seed); err != nil {
+			if err := h.missingAfterPrepare(t.Context(), seed); err != nil {
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestPodEpochInitExecMissingAfterPrepareRequiresReadyBeforeJudgingUnlink(t *testing.T) {
+	for _, seed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("seed=%v", seed), func(t *testing.T) {
+			h := newEpochInitHost(t)
+			h.posture()
+			err := h.missingAfterPrepare(t.Context(), seed, "EPOCH_FIXTURE_SKIP_READY=1")
+			if !errors.Is(err, errEpochRaceSetup) || !strings.Contains(err.Error(), "READY/GO") {
+				t.Fatalf("unready unlink accepted as race evidence: %v", err)
+			}
+			if !strings.Contains(h.events(), "prepare-unlinked\n") {
+				t.Fatal("fault control did not execute the injected unlink")
+			}
+			if _, err := os.Lstat(filepath.Join(h.data, ".uzi-epoch.lock")); !os.IsNotExist(err) {
+				t.Fatalf("fault control did not remove the original lock: %v", err)
+			}
+		})
+	}
+}
+
+func TestPodEpochInitExecMissingAfterPrepareBudgetStartsAtReady(t *testing.T) {
+	for _, seed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("seed=%v", seed), func(t *testing.T) {
+			h := newEpochInitHost(t)
+			h.posture()
+			original, err := os.Lstat(filepath.Join(h.data, ".uzi-epoch.lock"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			armed := 0
+			var eventsAtArm string
+			var sameOriginal bool
+			h.raceContext = func(parent context.Context) (context.Context, context.CancelFunc) {
+				armed++
+				eventsAtArm = h.events()
+				current, statErr := os.Lstat(filepath.Join(h.data, ".uzi-epoch.lock"))
+				sameOriginal = statErr == nil && os.SameFile(original, current)
+				// Observe arming directly, without a wall-time sleep.
+				return context.WithCancel(parent)
+			}
+			if err := h.missingAfterPrepare(t.Context(), seed); err != nil {
+				t.Fatal(err)
+			}
+			want := "prepare\n"
+			if seed {
+				want = "record-EX\n" + want
+			}
+			if armed != 1 || eventsAtArm != want || !sameOriginal {
+				t.Fatalf("operation budget armed outside READY-before-GO: calls=%d events=%q same_original=%v", armed, eventsAtArm, sameOriginal)
+			}
+		})
+	}
+}
+
+func TestPodEpochInitExecMissingAfterPrepareCancellationAtReadyJoinsFixture(t *testing.T) {
+	for _, seed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("seed=%v", seed), func(t *testing.T) {
+			h := newEpochInitHost(t)
+			h.posture()
+			armed := 0
+			h.raceContext = func(parent context.Context) (context.Context, context.CancelFunc) {
+				armed++
+				ctx, cancel := context.WithCancel(parent)
+				cancel()
+				return ctx, cancel
+			}
+			err := h.missingAfterPrepare(t.Context(), seed)
+			if !errors.Is(err, errEpochRaceSetup) || armed != 1 || !strings.Contains(err.Error(), "phase=race") {
+				t.Fatalf("cancel at READY was not joined/classified: armed=%d err=%v", armed, err)
+			}
+			if strings.Contains(h.events(), "prepare-unlinked") {
+				t.Fatal("fixture unlinked after cancellation at READY")
+			}
+			if _, err := os.Lstat(filepath.Join(h.data, ".uzi-epoch.lock")); err != nil {
+				t.Fatal("original lock changed after cancellation at READY")
 			}
 		})
 	}
@@ -266,7 +452,12 @@ func TestPodEpochInitExecMissingAfterPrepareDiagnosesEarlyExit(t *testing.T) {
 			t.Run(fmt.Sprintf("seed=%v/%s", seed, fault), func(t *testing.T) {
 				h := newEpochInitHost(t)
 				h.posture()
-				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				armed := false
+				h.raceContext = func(parent context.Context) (context.Context, context.CancelFunc) {
+					armed = true
+					return context.WithCancel(parent)
+				}
+				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
 				var env []string
 				var want string
@@ -296,6 +487,11 @@ func TestPodEpochInitExecMissingAfterPrepareDiagnosesEarlyExit(t *testing.T) {
 					want = "record-EX\n" + want
 				}
 				err := h.missingAfterPrepare(ctx, seed, env...)
+				// Stop the event observer even when bootstrap ended before the stall.
+				cancel()
+				if armed {
+					t.Fatal("operation budget armed before fixture readiness")
+				}
 				if !errors.Is(err, errEpochRaceSetup) {
 					t.Fatalf("early exit accepted or misclassified: %v", err)
 				}

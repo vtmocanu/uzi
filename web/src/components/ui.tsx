@@ -287,8 +287,8 @@ export function Toggle({
    *  request is in flight keeps keyboard focus (a browser blurs a disabled button). */
   focusableWhenDisabled?: boolean;
   /** Optional id of an element describing this switch, so a screen reader reads the
-   *  caveat/consequence copy alongside the accessible name. Every existing caller omits
-   *  it, so it is backward-compatible. */
+   *  caveat/consequence copy alongside the accessible name. Optional for callers without
+   *  supplementary description copy. */
   "aria-describedby"?: string;
 }) {
   return (

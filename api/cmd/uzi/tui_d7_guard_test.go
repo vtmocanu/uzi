@@ -250,6 +250,8 @@ var d7UntrustedFields = []string{
 	// (railRateMeters). The hostile-reason case in TestRailCodexSnapshotShowsReasonTag is the
 	// render-level proof; these entries are the tripwire for a direct draw.
 	"CodexSelectReason", "AnthropicSelectReason",
+	// Stored harness-decision strings remain untrusted, including future reason values.
+	"Preferred", "Chosen", "Reason",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:

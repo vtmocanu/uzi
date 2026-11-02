@@ -55,8 +55,8 @@ function demoFailureRecency(hours: number, origin: string, completed: number) {
 const demoLinkedFailure = {
   ...demoFailureRecency(13.2, "workflow_scope_missing", 14),
   // Match the existing drill-in fixture's actual end time and failure reason.
-  last_failed_at: getRun("run-workflow-scope")?.finished_at ?? new Date(recencyDemoNow - 13.2 * 3_600_000).toISOString(),
-  last_failed_run_id: "run-workflow-scope",
+  last_failed_at: getRun("c57b3989-105a-4e08-bf74-77ebc28e5a03")?.finished_at ?? new Date(recencyDemoNow - 13.2 * 3_600_000).toISOString(),
+  last_failed_run_id: "c57b3989-105a-4e08-bf74-77ebc28e5a03",
 };
 
 function listRunsFor(): Run[] {
@@ -387,6 +387,7 @@ export const runsApi = {
     }
     const now = new Date().toISOString();
     const run: Run = {
+      harness_decision: null,
       id: nextRunId(),
       repo_id: repoId,
       forge_type: "gitlab",
@@ -478,6 +479,7 @@ export const runsApi = {
     if (active) throw new ApiError(409, "an active CI-fix run already exists for this ref");
     const now = new Date().toISOString();
     const run: Run = {
+      harness_decision: null,
       id: nextRunId(),
       repo_id: repoId,
       forge_type: "gitlab",
@@ -1082,7 +1084,7 @@ export const runsApi = {
   getRunArchives: async (id: string) => {
     const r = getRun(id);
     if (!r) throw new ApiError(404, "run not found");
-    const capId = `${id}-cap1`;
+    const capId = `00000000-0000-0000-0000-${([...state.runs.keys()].indexOf(id) + 1).toString(16).padStart(12, "0")}`;
     if (r.status === "failed" && !discardedCaptures.has(capId)) {
       return delay(
         {
@@ -1106,7 +1108,13 @@ export const runsApi = {
               source_sha: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
               attempted_head_sha: "f0e1d2c3b4a5968778695a4b3c2d1e0f01234567",
               byte_size: 4718592,
-              checksum: "sha256:3f786850e387550fdab836ed7e6dc881de23001b",
+              checksum: "3f786850e387550fdab836ed7e6dc881de23001b3f786850e387550fdab836ed7e6d",
+              prerequisite_closure: {
+                state: "pinned", pin_ref: `refs/uzi-prereq/${capId}`,
+                pin_tip: "1111111111111111111111111111111111111111",
+                absence_unconfirmed: false, cleanup_exhausted: false,
+                updated_at: new Date(Date.now() - 3_600_000).toISOString(),
+              },
               prerequisite_shas: ["9988776655443322110099887766554433221100"],
               created_at: new Date(Date.now() - 3_600_000).toISOString(),
               expires_at: new Date(Date.now() + 6 * 86_400_000).toISOString(),
@@ -1135,12 +1143,12 @@ export const runsApi = {
     );
   },
   // Issue #2545: one acknowledged held-work publication for the failed mock run
-  // run-workflow-scope; every other run has none.
+  // workflow-scope run; every other run has none.
   getRunHeldPublications: async (id: string) => {
     const r = getRun(id);
     if (!r) throw new ApiError(404, "run not found");
     const publications =
-      id === "run-workflow-scope" && r.status === "failed"
+      id === "c57b3989-105a-4e08-bf74-77ebc28e5a03" && r.status === "failed"
         ? [
             {
               id: "pub-mock-1",

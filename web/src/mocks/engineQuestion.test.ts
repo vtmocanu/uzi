@@ -372,8 +372,8 @@ it("syncs base rejection origin to the board alongside raw failed status", () =>
 it("seeds a distinct rejection card with a matching full run", () => {
   const board = state.boards.get("repo-atlas")!;
   expect(new Set(board.cards.map((c) => c.iid)).size).toBe(board.cards.length);
-  const card = board.cards.find((c) => c.latest_run?.id === "run-rejected")!;
-  const run = state.runs.get("run-rejected")!;
+  const card = board.cards.find((c) => c.latest_run?.id === "c57b3989-105a-4e08-bf74-77ebc28e5a04")!;
+  const run = state.runs.get("c57b3989-105a-4e08-bf74-77ebc28e5a04")!;
   expect(card.iid).toBe(10);
   expect(card.web_url).toMatch(/\/10$/);
   expect(board.cards.find((c) => c.iid === 9)?.title).toBe("Rate-limit the public search endpoint");

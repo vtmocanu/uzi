@@ -75,6 +75,7 @@ function renderRuns(initialPath = "/runs") {
 
 function aRun(over: Partial<RunListItem> = {}): RunListItem {
   return {
+    harness_decision: null,
     id: "run-1",
     repo_id: "repo-1",
     forge_type: "gitlab",
