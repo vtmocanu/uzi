@@ -369,6 +369,7 @@ func newRunStopCmd(env Env, gf *globalFlags) *cobra.Command {
 			"directives in earlier commits hold publication before push instead of opening the partial PR. " +
 			"A Stop gets no further lead turn to reword them: cancel and manually deliver the preserved " +
 			"work with corrected messages. Partial or accept decisions do not fix this hold.\n\n" +
+			"Stop is unavailable for Iteration limit reached; use Resume or Cancel.\n\n" +
 			"An optional message can accompany the stop (pass -m or pipe it on stdin). A stop on a " +
 			"run that has already finished answers 409 (exit 5).",
 		Args: cobra.ExactArgs(1),

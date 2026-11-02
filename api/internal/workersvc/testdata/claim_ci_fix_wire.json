@@ -61,6 +61,7 @@
   "config": {
     "run_timeout_seconds": 7200,
     "idle_timeout_seconds": 600,
+    "iteration_park_version": 1,
     "max_iterations": 5,
     "plan_max_revisions": 3,
     "question_max": 5,

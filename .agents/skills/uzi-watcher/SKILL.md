@@ -190,9 +190,12 @@ plain answer cannot exempt a frozen milestone. Record the decision with `uzi run
 live question or on a run already parked in the completion hold. Then re-arm the poller with
 the answered question's seq as its 6th arg (`min-question-seq`, script header). **Never answer with "keep waiting"**
 (e.g. for a dependency PR to merge): an answer resumes the run, and a run with nothing to do spends
-its iteration budget on no-op turns and fails (#2657). Leave the question unanswered, or answer and
-immediately `uzi run pause RUN --now`. A run at `limit_wait` is parked on an Anthropic
-usage limit and resumes itself — keep waiting. `recovery_wait` with cause
+its iteration budget on no-op turns (#2657). At iteration exhaustion, eligible runs with
+negotiated `iteration_park_version: 1` and authoritative persisted `completion_attempts = 0`
+park needing explicit owner Resume. Prior-attempt, excluded and legacy runs keep their
+existing dispositions, including possible completion holds or failure. Leave the question
+unanswered, or answer and immediately `uzi run pause RUN --now`. A run at `limit_wait` is
+parked on an Anthropic usage limit and resumes itself — keep waiting. `recovery_wait` with cause
 `worker_requeue_exhausted` never resumes itself: the poller always stops on it
 (`STOP=recovery_wait:worker_requeue_exhausted`, exit 0, whatever the stop set, even one naming `recovery_wait`). Back up the
 work (*Recovering a failed run's work*), then `uzi run resume` or cancel. It stops the same way on

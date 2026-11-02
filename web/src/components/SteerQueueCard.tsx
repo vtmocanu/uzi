@@ -372,7 +372,7 @@ export function SteerQueueCard({
           ) : (
             <p className="text-sm text-muted">A job takes no follow-ups. Stopping it cancels the job.</p>
           )}
-          <p className="text-xs text-faint">{takesFollowUps ? "Pause or stop this run from the header." : "Stop this job from the header."}</p>
+          <p className="text-xs text-faint">{run?.status === "paused" && run.hold_reason === "iteration_budget_exhausted" ? "Resume or cancel this run from its owner actions." : takesFollowUps ? "Pause or stop this run from the header." : "Stop this job from the header."}</p>
         </>
       )}
     </Card>
@@ -384,11 +384,13 @@ export function RunControls({ run, busy, terminal, canSteer, onPause, onStop }: 
   onPause: (mode: "milestone" | "now") => void; onStop: () => void;
 }) {
   if (terminal || !canSteer) return null;
+  const stopLabel = run.status === "paused" && run.hold_reason === "iteration_budget_exhausted"
+    ? "Cancel" : run.kind === "job" ? "Stop this job" : "Stop run";
   return <div className="flex flex-wrap items-center gap-2">
     {run.status === "running" && !run.pause_requested_at && isPausableRun(run) && <PauseMenu run={run} busy={busy} onPause={onPause} />}
     <Button variant="danger" size="sm" disabled={busy} onClick={onStop}
-      aria-label={run.kind === "job" ? "Stop this job" : "Stop run"}>
-      {run.kind === "job" ? "Stop this job" : "Stop run"}
+      aria-label={stopLabel}>
+      {stopLabel}
     </Button>
   </div>;
 }

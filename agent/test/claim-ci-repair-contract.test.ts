@@ -15,6 +15,7 @@ const apiDir = join(import.meta.dirname, "..", "..", "api", "internal", "workers
 
 test("ci repair claim wire contract: the worker reads config.ci_config_guard and ci_config_paths", () => {
   const claim = JSON.parse(readFileSync(join(apiDir, "testdata", "claim_ci_repair_wire.json"), "utf8")) as ClaimResponse;
+  assert.equal(claim.config?.iteration_park_version, 1);
   assert.equal(claim.config?.ci_config_guard, true);
   assert.ok((claim.config?.ci_config_paths ?? []).length > 0);
   // The worker floor covers everything the server sends for this lane, so a missing server list
@@ -36,6 +37,7 @@ test("ci repair claim wire contract: the Go producer's json tag is exactly ci_co
 
 test("artifact-bearing Go claim preserves canonical aliases and unknown remainder", () => {
   const claim = JSON.parse(readFileSync(join(apiDir, "testdata", "claim_ci_artifacts_wire.json"), "utf8")) as ClaimResponse;
+  assert.equal(claim.config?.iteration_park_version, 1);
   validateCIRepairClaim({ ...claim, config: claim.config ?? undefined }, claim.claim_generation);
   assert.equal(claim.repo.forge_type, "github");
   assert.equal(claim.config?.ci_config_guard, true);

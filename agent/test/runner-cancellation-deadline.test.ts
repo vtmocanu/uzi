@@ -228,7 +228,7 @@ for (const testCase of [
     claim.repo.id = "00000000-0000-4000-8000-000000000072";
     const holdId = "00000000-0000-4000-8000-000000000071";
     const settle = RunRunner.prototype["settleRecoveryGeneration"];
-    const flight = { runId: claim.run_id, claimGeneration: 7, barePath: "/trusted/fixture.git" } as unknown as Parameters<typeof settle>[1];
+    const flight = { iterationParkState: "none" as const, runId: claim.run_id, claimGeneration: 7, barePath: "/trusted/fixture.git" } as unknown as Parameters<typeof settle>[1];
     const calls: string[] = [];
     const receiver = {
       completionReceipts: new Map(), completionKey: () => "fixture:7",

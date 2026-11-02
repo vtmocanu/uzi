@@ -114,9 +114,8 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				_, _ = fmt.Fprintf(env.Stderr,
 					"run %s: parked at its time limit; waiting for the owner (uzi run extend %s --by 2h)\n", runID, runID)
 			}
-			// PRD #1732 D14: likewise a run held because a credential it needs is disabled. It
-			// resumes by itself once that credential is enabled, so the wait keeps going.
-			if isProviderUnavailableHold(run) {
+			// Iteration and provider holds require an owner action; paused remains nonterminal.
+			if isIterationHold(run) || isProviderUnavailableHold(run) {
 				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
 			}
 			if isCredentialSwitchHold(run) {

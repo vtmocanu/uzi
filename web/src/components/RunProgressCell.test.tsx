@@ -226,6 +226,7 @@ describe("RunProgressCell (PRD #2602)", () => {
     ["pool_wait", {}, "waiting for pool"],
     ["recovery_wait", {}, "recovery wait"],
     ["paused", {}, "paused"],
+    ["paused", { hold_reason: "iteration_budget_exhausted" }, "Iteration limit reached"],
     ["paused", { hold_reason: "credential_disabled" }, "waiting: credential disabled"],
   ] as const)("parked (%s): sr-only `Progress: <today's park word>`", (status, extra, text) => {
     const { container } = renderCell({ status, ...extra, progress: progress({ state: "parked" }) });

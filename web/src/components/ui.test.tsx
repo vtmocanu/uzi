@@ -140,6 +140,11 @@ describe("StatusPill", () => {
 
   it.each([
     {
+      name: "iteration owner hold",
+      run: { status: "paused", hold_reason: "iteration_budget_exhausted" },
+      label: "Iteration limit reached", tone: "text-warn", pulse: false,
+    },
+    {
       name: "provider owner hold",
       run: { status: "paused", hold_reason: "provider_unavailable" },
       label: "provider unavailable: owner hold", tone: "text-warn", pulse: false,

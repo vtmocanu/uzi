@@ -2310,6 +2310,7 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     issue_iid: number;
     is_revising?: boolean;
     queue_reason?: import("../lib/api").QueueReason;
+    hold_reason?: string | null;
     codex_admission_class?: "rate_limit" | "overload";
     codex_admission_eligible_at?: string;
   }) =>
@@ -2370,6 +2371,15 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
     renderBoard();
     await screen.findByText("1 run needs approval");
     expect(mockApi.listRuns).toHaveBeenCalledWith({ repoId: "repo-1", view: "summary" });
+  });
+
+  it("counts an iteration hold once and never calls its stale health stuck", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ id: "iteration", status: "paused",
+      hold_reason: "iteration_budget_exhausted", health: "waiting_worker", issue_iid: 7 })] });
+    renderBoard();
+    await screen.findByText("1 run: Iteration limit reached");
+    expect(screen.queryByText(/looks stuck/)).toBeNull();
+    expect(screen.getAllByRole("link", { name: "Open run for issue #7: Fix the parser" })).toHaveLength(1);
   });
 
   it("does not double-list an awaiting_approval run flagged waiting_worker", async () => {
@@ -3497,6 +3507,15 @@ it.each([
   const healthy = renderCard({ latest_run: { ...latest_run, health: "ok" } });
   expect(healthy.container.querySelector("[data-attention]")).not.toBeNull();
   expect(healthy.container.querySelector(".ring-2")).not.toBeNull();
+});
+
+it("iteration-held board card has a static warning and owner attention", () => {
+  const { container } = renderCard({ latest_run: { ...aCard().latest_run!, id: "iteration",
+    status: "paused", hold_reason: "iteration_budget_exhausted", health: "ok" } });
+  expect(screen.getByText("Iteration limit reached")).toBeTruthy();
+  expect(container.querySelector("[data-attention]")).not.toBeNull();
+  expect(container.querySelector(".animate-pulse")).toBeNull();
+  expect(screen.getByTitle(/Only the owner can Resume with a fresh finite iteration allowance/)).toBeTruthy();
 });
 
 it.each([false, true])("account cooldown card keeps quiet chrome (revising=%s)", is_revising => {

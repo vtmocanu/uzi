@@ -645,6 +645,9 @@ func rootBlocksLabelled(rc store.GetSlackRunContextRow, base, emoji, label strin
 		slack.NewTextBlockObject(slack.MarkdownType, sectionText, false, false), nil, nil)}
 
 	var ctxElems []slack.MixedElement
+	if detail := iterationStateDetail(rc); detail != "" {
+		ctxElems = append(ctxElems, threadMrkdwnElem(ScrubSecrets(detail)))
+	}
 	if detail := providerStateDetail(rc); detail != "" {
 		ctxElems = append(ctxElems, threadMrkdwnElem(ScrubSecrets(detail)))
 	}
@@ -992,6 +995,14 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 		return blocks, fmt.Sprintf("Paused · usage limit · %s#%d", repo, iid(rc.IssueIid)), true
 
 	case "paused":
+		if iterationHold(rc) {
+			blocks = []slack.Block{threadSectionBlock("⚠️ *Iteration limit reached*"),
+				slack.NewContextBlock("slack_thread_iteration_hold_ctx", threadMrkdwnElem(ScrubSecrets(iterationStateDetail(rc))))}
+			if el, has := linkElem(); has {
+				blocks = append(blocks, slack.NewContextBlock("slack_thread_iteration_link_ctx", el))
+			}
+			return blocks, fmt.Sprintf("Iteration limit reached · %s#%d", repo, iid(rc.IssueIid)), true
+		}
 		if providerHold(rc) {
 			blocks = []slack.Block{threadSectionBlock("⚠️ *Needs your attention · provider unavailable*"),
 				slack.NewContextBlock("slack_thread_provider_hold_ctx", threadMrkdwnElem(ScrubSecrets(providerStateDetail(rc))))}
@@ -1156,6 +1167,9 @@ func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
 	case "limit_wait":
 		return "⏸️", "Paused · usage limit"
 	case "paused":
+		if iterationHold(rc) {
+			return "⚠️", "Iteration limit reached"
+		}
 		if providerHold(rc) {
 			return "⚠️", "Needs your attention · provider unavailable"
 		}
@@ -1245,4 +1259,26 @@ func iid(v pgtype.Int8) int64 {
 		return v.Int64
 	}
 	return 0
+}
+
+func iterationHold(rc store.GetSlackRunContextRow) bool {
+	return rc.Status == "paused" && rc.HoldReason.Valid && rc.HoldReason.String == "iteration_budget_exhausted"
+}
+
+// iterationStateDetail uses the frozen wall budget only when every input is known.
+// A NULL wall budget depends on global configuration unavailable to the notifier.
+func iterationStateDetail(rc store.GetSlackRunContextRow) string {
+	if !iterationHold(rc) {
+		return ""
+	}
+	detail := "Paused; Resume to request another iteration allowance, or Cancel from the run page. " +
+		"CLI: `uzi run resume " + rc.ID.String() + "` or `uzi run cancel " + rc.ID.String() + "`."
+	if rc.BudgetWallSeconds.Valid && rc.BudgetWallSeconds.Int32 > 0 && rc.StartedAt.Valid && rc.StatusSince.Valid {
+		used := max(0, int64(rc.StatusSince.Time.Sub(rc.StartedAt.Time).Seconds())-int64(rc.BudgetPausedSeconds))
+		total := int64(rc.BudgetWallSeconds.Int32) + int64(rc.BudgetExtensionSeconds) + int64(rc.BudgetFinalizeSeconds)
+		if used >= total {
+			detail += " Wall time exhausted; add time with `uzi run extend " + rc.ID.String() + " --by 2h`. Extend adds time only; then Resume."
+		}
+	}
+	return detail
 }

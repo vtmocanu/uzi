@@ -165,7 +165,7 @@ function CurrentStartedRun({ runId }: { runId: string }) {
   return <span className="text-[11.5px] text-muted">
     {current?.run ? `Current: ${parkLabel(current.run)}` : current?.unavailable ? "Current state unavailable" : "Loading current state…"}
     {current?.run && (
-      (current.run.status === "paused" && current.run.hold_reason === "provider_unavailable") ||
+      (current.run.status === "paused" && (current.run.hold_reason === "provider_unavailable" || current.run.hold_reason === "iteration_budget_exhausted")) ||
       credentialSwitchHold(current.run) !== null) &&
       <Link className="ml-2 underline" to={`/runs/${runId}`}>View owner actions</Link>}
   </span>;

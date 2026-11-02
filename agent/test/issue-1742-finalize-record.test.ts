@@ -384,6 +384,8 @@ describe("issue #1742 finalize record: isFinalizeBoundResult", () => {
     ["completionHeld", { reason: "no_progress" }],
     ["walled", { reason: "wall" }],
     ["switchReleased", true],
+    ["iterationParked", { outcome: "parked" }],
+    ["iterationParked", { outcome: "retained-stop" }],
   ] as const) {
     it(`is false when ${field} is set`, () => {
       assert.equal(isFinalizeBoundResult({ ...base, [field]: value }), false);
@@ -479,6 +481,8 @@ describe("issue #1742 finalize record: runner write and retirement", () => {
     ["completionHeld", { reason: "no_progress" }],
     ["walled", { reason: "wall" }],
     ["switchReleased", true],
+    ["iterationParked", { outcome: "parked" }],
+    ["iterationParked", { outcome: "retained-stop" }],
   ] as const) {
     it(`writes no record when the executor result sets ${field}`, async () => {
       const root = tmpRoot();
