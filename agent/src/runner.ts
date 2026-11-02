@@ -3,7 +3,7 @@ import { validatePolicyHoldRequest } from "./protocol.js";
 import { checkpointCoordinatesForClaim, type CheckpointCoordinates } from "./checkpoint-coordinates.js";
 import { prepareCIEvidence, validateCIRepairClaim, type PreparedCIEvidence } from "./ci-evidence.js";
 import { acceptsHeldCaptureCleanup, acceptsJoinedCaptureCleanup, settleHeldCaptureCleanup } from "./codex/safety.js";
-import { CheckpointUnsafeCleanupError, GitBoundaryAbortError, isCheckpointBoundaryFailure, type CheckpointStop } from "./checkpoint-stop.js";
+import { checkCheckpointStop, CheckpointUnsafeCleanupError, GitBoundaryAbortError, isCheckpointBoundaryFailure, type CheckpointStop } from "./checkpoint-stop.js";
 import { prepareFrozenHeld, type FrozenHeldPolicy } from "./frozen-held.js";
 import { interruptedSnapshot, prepareInterruptedCalls } from "./interrupted-calls.js";
 import { CodeCrossCheckGate, persistedCodeCrossCheckSummary } from "./code-cross-check-gate.js";
@@ -980,6 +980,21 @@ const MIDTURN_BUSY_FEED_AFTER = 3;
 
 function isAbortLikeError(err: unknown): boolean {
   return err instanceof Error && err.name === "AbortError";
+}
+
+/** issue #3780: the steering-derived part of a {@link CheckpointStop}, shared by the done checkpoint
+ *  (withDoneAttempt) and the mid-turn tick's stop classification so both classify a revocation
+ *  identically. The caller supplies its own `signal` (the soft one). */
+function checkpointStopFields(steering: SteeringChannel, now: () => number): Omit<CheckpointStop, "signal"> {
+  return {
+    lifecycleSignal: steering.lifecycleSignal(),
+    now,
+    workerShutdown: () => steering.workerShutdownCheckpoint(),
+    terminalSignal: AbortSignal.any([steering.terminalLifecycleSignal(), steering.checkpointAuthoritySignal()]),
+    cooperativeLifecycleReason: reason => reason instanceof PauseNowSignal,
+    authorityRevoked: () => steering.isCancelled() || steering.claimFence() !== undefined ||
+      steering.pendingCredentialSwitch() !== undefined || steering.getPauseMode() === "disk",
+  };
 }
 
 /** Marks checked-gate failures whose escalation may be refused by held transport. */
@@ -13917,12 +13932,7 @@ export class RunRunner {
       const hardMs = this.checkpointTestHooks?.doneHardDeadlineMs ?? DONE_CHECKPOINT_HARD_MS;
       const controller = new AbortController();
       const lifecycle = steering.lifecycleSignal();
-      const stop: CheckpointStop = { signal: controller.signal, lifecycleSignal: lifecycle, now,
-        workerShutdown: () => steering.workerShutdownCheckpoint(),
-        terminalSignal: AbortSignal.any([steering.terminalLifecycleSignal(), steering.checkpointAuthoritySignal()]),
-        cooperativeLifecycleReason: reason => reason instanceof PauseNowSignal,
-        authorityRevoked: () => steering.isCancelled() || steering.claimFence() !== undefined ||
-          steering.pendingCredentialSwitch() !== undefined || steering.getPauseMode() === "disk" };
+      const stop: CheckpointStop = { signal: controller.signal, ...checkpointStopFields(steering, now) };
       const interrupt = () => controller.abort();
       lifecycle.addEventListener("abort", interrupt, { once: true });
       this.shutdownSignal.signal.addEventListener("abort", interrupt, { once: true });
@@ -18300,6 +18310,8 @@ export class RunRunner {
     let cancelTimer: (() => void) | undefined;
     let inFlight: Promise<void> | undefined;
     let inFlightAbort: AbortController | undefined;
+    let inFlightSoftAbort: AbortController | undefined;
+    let inFlightClassify: (() => "hard" | "soft" | "none") | undefined;
     let busyStreak = 0;
     let busyLineEmitted = false;
     let gateRetryUsed = false;
@@ -18367,20 +18379,66 @@ export class RunRunner {
       // shutdown, via the lifecycle controller) can abort a tick still in its pre-scope phase. That phase
       // spawns nothing and holds nothing, so its awaits are RACED against the abort: teardown never
       // waits on it, even if an fs op there were somehow stuck.
+      //
+      // issue #3780: a tick has TWO stops. `ac` is the HARD abort (kills children, never masked); `softAc`
+      // is the cooperative one (sink-gate preemption, stop(), a PauseNow / graceful-shutdown lifecycle
+      // abort before its deadline), which the checkpoint scope masks across GitCache's ownership
+      // section so a preempted import settles its pending receipt instead of stranding it. Every
+      // revocation event is classified with the done-path rule (checkCheckpointStop); a hard
+      // classification, the 120 s cap, and a late revocation after a soft stop abort `ac`.
       const ac = new AbortController();
+      const softAc = new AbortController();
+      const tickStop = AbortSignal.any([ac.signal, softAc.signal]);
       inFlightAbort = ac;
-      const lifecycleSignal = flight.steering.lifecycleSignal();
-      const onFlightAbort = (): void => ac.abort();
-      if (lifecycleSignal.aborted) ac.abort();
-      else lifecycleSignal.addEventListener("abort", onFlightAbort, { once: true });
+      inFlightSoftAbort = softAc;
+      const steering = flight.steering;
+      const now = hooks?.absoluteNow ?? Date.now;
+      const neverStop = new AbortController().signal;
+      const classify = (): "hard" | "soft" | "none" => {
+        try {
+          checkCheckpointStop({ ...checkpointStopFields(steering, now), signal: neverStop });
+        } catch (e) {
+          if (e instanceof GitBoundaryAbortError) return "hard";
+          throw e;
+        }
+        return steering.lifecycleSignal().aborted ? "soft" : "none";
+      };
+      inFlightClassify = classify;
+      const lifecycleSignal = steering.lifecycleSignal();
+      const terminalSignal = steering.terminalLifecycleSignal();
+      const authoritySignal = steering.checkpointAuthoritySignal();
+      let shutdownStop: AbortSignal | undefined;
+      let cancelShutdownTimer: (() => void) | undefined;
+      // A graceful shutdown's own stop signal and its deadline are revocation events too.
+      const attachShutdown = (): void => {
+        if (shutdownStop) return;
+        const shutdown = steering.workerShutdownCheckpoint();
+        if (!shutdown) return;
+        shutdownStop = shutdown.stopSignal;
+        shutdownStop.addEventListener("abort", onEvent, { once: true });
+        cancelShutdownTimer = this.setTimer(onEvent, Math.max(0, shutdown.deadlineAt - now()));
+      };
+      const onEvent = (): void => {
+        attachShutdown();
+        const verdict = classify();
+        if (verdict === "hard") ac.abort();
+        else if (verdict === "soft") softAc.abort();
+      };
+      const subscribed = [lifecycleSignal, terminalSignal, authoritySignal];
+      for (const s of subscribed) s.addEventListener("abort", onEvent, { once: true });
+      // Initial state: only THIS generation's lifecycle abort counts. The terminal/authority signals are
+      // sticky for the flight (a given-up credential switch leaves the authority one aborted), so a
+      // tick starting later must not read them as a fresh revocation; they only matter as events.
+      attachShutdown();
+      if (lifecycleSignal.aborted) onEvent();
       const cancelDeadline = this.setTimer(() => ac.abort(), MIDTURN_TICK_TIMEOUT_MS);
       const abortedP = new Promise<typeof ABORTED>((resolve) => {
-        if (ac.signal.aborted) resolve(ABORTED);
-        else ac.signal.addEventListener("abort", () => resolve(ABORTED), { once: true });
+        if (tickStop.aborted) resolve(ABORTED);
+        else tickStop.addEventListener("abort", () => resolve(ABORTED), { once: true });
       });
       const raceAbort = <T>(p: Promise<T>): Promise<T | typeof ABORTED> => Promise.race([p, abortedP]);
       try {
-        if (stopped || ac.signal.aborted) return "aborted";
+        if (stopped || tickStop.aborted) return "aborted";
         if (this.tickSurvivorsRemain(flight)) return "tick_process_survived";
         const blocked = await raceAbort(this.retainedBareLockRemains(flight));
         if (blocked === ABORTED) return "aborted";
@@ -18388,7 +18446,7 @@ export class RunRunner {
         if ((await raceAbort(hooks?.beforeBusyProbe?.() ?? Promise.resolve())) === ABORTED) return "aborted";
         const probe = await raceAbort(this.git.runnerCloneBusy(clonePath, branch));
         // Re-check after the probe: no full tick may start once the turn has ended.
-        if (probe === ABORTED || stopped || ac.signal.aborted) return "aborted";
+        if (probe === ABORTED || stopped || tickStop.aborted) return "aborted";
         if (probe.busy) {
           busyStreak++;
           runLog.info("mid-turn checkpoint deferred: git busy in the runner clone", {
@@ -18410,16 +18468,24 @@ export class RunRunner {
         }
         busyStreak = 0;
         busyLineEmitted = false;
-        return await scopedTick(ac);
+        return await scopedTick(ac, softAc, tickStop);
       } finally {
         cancelDeadline();
-        lifecycleSignal.removeEventListener("abort", onFlightAbort);
-        if (inFlightAbort === ac) inFlightAbort = undefined;
+        cancelShutdownTimer?.();
+        for (const s of subscribed) s.removeEventListener("abort", onEvent);
+        shutdownStop?.removeEventListener("abort", onEvent);
+        if (inFlightAbort === ac) {
+          inFlightAbort = undefined;
+          inFlightSoftAbort = undefined;
+          inFlightClassify = undefined;
+        }
       }
     };
 
     // Steps 2-5: the supervised scope, the gate, the quiet checkpoint body, settlement, lock custody.
-    const scopedTick = async (ac: AbortController): Promise<MidTurnTickOutcome> => {
+    // `ac` stays the TickSpawner / boundary-spawner signal (hard); `tickStop` (hard or soft) drives
+    // the body, the scan scope and outcome mapping; `softAc.signal` is the scope's masked softSignal.
+    const scopedTick = async (ac: AbortController, softAc: AbortController, tickStop: AbortSignal): Promise<MidTurnTickOutcome> => {
       const spawner = new TickSpawner({
         signal: ac.signal,
         barePath,
@@ -18433,12 +18499,14 @@ export class RunRunner {
       // Settle + reconcile WHILE the per-bare lock is still held (GitCache.withLock's pre-release
       // hook), so no other bare mutation can run between a SIGKILLed child and its lock's removal.
       const beforeLockRelease = async (key: string): Promise<void> => {
-        if (key !== barePath || !ac.signal.aborted) return;
+        if (key !== barePath || !tickStop.aborted) return;
         await spawner.settled();
         if (handleSurvivors(spawner.survivors())) survivedHere = true;
         if (handleLocks(await spawner.reconcileLocks())) retainedHere = true;
       };
-      const release = flight.sinkGate.tryAcquire(() => ac.abort());
+      // issue #3780: preemption is cooperative (soft), so an import inside GitCache's ownership
+      // section finishes settling its receipt before the tick yields the gate.
+      const release = flight.sinkGate.tryAcquire(() => softAc.abort());
       try {
         if (!release) return "gate_busy";
         let outcome: MidTurnTickOutcome;
@@ -18448,12 +18516,12 @@ export class RunRunner {
             ac.signal,
             () =>
               body({
-                signal: ac.signal,
+                signal: tickStop,
                 scanScope: <T>(fn: () => Promise<T>): Promise<T> => {
                   const scanAc = new AbortController();
                   const onTick = (): void => scanAc.abort();
-                  if (ac.signal.aborted) scanAc.abort();
-                  else ac.signal.addEventListener("abort", onTick, { once: true });
+                  if (tickStop.aborted) scanAc.abort();
+                  else tickStop.addEventListener("abort", onTick, { once: true });
                   const cancelScan = this.setTimer(() => scanAc.abort(), this.scanDeadlineMs());
                   return this.git
                     .withBoundaryProcessSpawner(spawner.scoped(scanAc.signal), scanAc.signal, fn, {
@@ -18461,17 +18529,17 @@ export class RunRunner {
                     })
                     .finally(() => {
                       cancelScan();
-                      ac.signal.removeEventListener("abort", onTick);
+                      tickStop.removeEventListener("abort", onTick);
                     });
                 },
               }),
-            { beforeLockRelease },
+            { beforeLockRelease, softSignal: softAc.signal },
           );
         } catch (e) {
           runLog.warn("mid-turn checkpoint tick threw", { run_id: runId, error: errMessage(e) });
-          outcome = ac.signal.aborted ? "aborted" : "publish_failed:error";
+          outcome = tickStop.aborted ? "aborted" : "publish_failed:error";
         }
-        if (ac.signal.aborted && outcome !== "published") outcome = "aborted";
+        if (tickStop.aborted && outcome !== "published") outcome = "aborted";
         // FULL settlement before the gate is released: every child exited, then lock custody for a
         // child cancelled outside a withLock section (pack-objects, rev-parse), under the bare lock.
         await spawner.settled();
@@ -18554,7 +18622,11 @@ export class RunRunner {
         flight.kickMidTurnTick = undefined;
         cancelTimer?.();
         cancelTimer = undefined;
-        inFlightAbort?.abort();
+        // issue #3780: stop is cooperative unless the current classification is already hard.
+        if (inFlightAbort) {
+          if (inFlightClassify?.() === "hard") inFlightAbort.abort();
+          else inFlightSoftAbort?.abort();
+        }
         await inFlight?.catch(() => undefined);
       },
     };

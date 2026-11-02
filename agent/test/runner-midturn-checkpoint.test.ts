@@ -4,7 +4,7 @@ import { AsyncResource } from "node:async_hooks";
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { PassThrough, type Readable } from "node:stream";
@@ -4051,6 +4051,205 @@ describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", 
     } finally {
       pub.restore();
       fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── issue #3780 — a tick's stop is SOFT unless authority is revoked ───────────────────────────
+//
+// A hard abort between GitCache.promoteTrackingUnderLock's pending receipt write and its tracking-ref
+// CAS strands a `phase:"pending"` receipt (later imports: ownership_unknown; finalize fails). The tick
+// therefore stops cooperatively (sink-gate preemption, stop(), PauseNow, graceful shutdown before its
+// deadline), which the scope masks across the ownership section, and hard only on a revocation.
+
+/** Replace the GitCache's receipt writer so that ONLY the first `phase:"pending"` receipt write runs
+ *  the original and then `hook` (the point where a hard abort would strand the receipt). */
+function afterPendingReceipt(g: GitCache, hook: () => Promise<void>): () => void {
+  const internals = g as unknown as { writeOwedFile(bare: string, name: string, value: unknown): Promise<void> };
+  const original = internals.writeOwedFile.bind(g);
+  let fired = false;
+  internals.writeOwedFile = async (bare, name, value) => {
+    await original(bare, name, value);
+    if (!fired && name.startsWith("receipt-") && (value as { phase?: string }).phase === "pending") {
+      fired = true;
+      await hook();
+    }
+  };
+  return () => {
+    internals.writeOwedFile = original;
+  };
+}
+
+const yieldLoop = async (n = 10): Promise<void> => {
+  for (let i = 0; i < n; i++) await new Promise<void>((resolve) => setImmediate(resolve));
+};
+
+/** The bare's tracking ref and the branch's receipt phase, read synchronously. */
+function trackingState(g: GitCache, branch: string): { tip: string | null; phase: string | undefined } {
+  const bare = g.barePathFor(fx.originPath);
+  const receipt = path.join(bare, "uzi-owed", `receipt-${createHash("sha256").update(branch).digest("hex")}.json`);
+  let phase: string | undefined;
+  try {
+    phase = (JSON.parse(fs.readFileSync(receipt, "utf8")) as { phase?: string }).phase;
+  } catch {
+    phase = undefined;
+  }
+  return { tip: refOr(bare, `refs/uzi-runner/${branch}`), phase };
+}
+
+type ReceiptStop = "pause" | "cancel" | "switch" | "pause then cancel" | "shutdown" | "shutdown past deadline";
+
+/** One tick whose import is stopped by `stop` right after its pending receipt is written. Returns the
+ *  tracking state captured the instant the tick reported its outcome. */
+async function receiptStopScenario(iid: number, stop: ReceiptStop): Promise<{
+  outcome: string; sha: string; state: { tip: string | null; phase: string | undefined };
+}> {
+  const tmp = scratchDir(`rcpt-${iid}`);
+  const ctl = control();
+  const g = mkGit(fx.dataDir, writeShim(tmp, "detect"));
+  const claim = gitlabClaim(iid, { claim_generation: 1 });
+  const branch = `agent/issue-${iid}`;
+  let state: { tip: string | null; phase: string | undefined } | undefined;
+  const reported = ctl.hooks.onTickOutcome!;
+  ctl.hooks.onTickOutcome = (o) => {
+    state ??= trackingState(g, branch);
+    reported(o);
+  };
+  let sha = "";
+  let outcome = "";
+  let runner: RunRunner | undefined;
+  let restore: (() => void) | undefined;
+  try {
+    runner = mkRunner(g, turn(async (ctx) => {
+      sha = commitIn(ctx.worktreePath, "S.txt", "s\n");
+      restore = afterPendingReceipt(g, async () => {
+        if (stop === "pause" || stop === "pause then cancel") {
+          api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+          await waitAbort(ctx.signal!);
+          if (stop === "pause then cancel") {
+            await yieldLoop();
+            api.setInputs(claim.run_id, [{ id: 2, kind: "cancel" }]);
+            await waitFor(() => ctx.cancelRequested?.() === true);
+          }
+        } else if (stop === "cancel") {
+          api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+          await waitFor(() => ctx.cancelRequested?.() === true);
+        } else if (stop === "switch") {
+          api.requestCredentialSwitch(claim.run_id, 1);
+          await waitAbort(ctx.signal!);
+        } else {
+          runner!.shutdown();
+          if (stop === "shutdown past deadline") await sleepMs(250);
+        }
+        await yieldLoop();
+      });
+      ctl.advance(INTERVAL_MS + 1);
+      outcome = await bounded(ctl.fire(), TEARDOWN_MS, "tick outcome");
+    }), ctl, { recoveryRetryMs: 1, shutdownPublishTimeoutMs: stop === "shutdown past deadline" ? 100 : 60_000 });
+    await runner.execute(claim);
+    assert.ok(state, "the tick reported an outcome");
+    return { outcome, sha, state };
+  } finally {
+    await settleAndClean({ ctl, runners: runner ? [runner] : [], restore, paths: [tmp] });
+  }
+}
+
+describe("mid-turn checkpoint soft stop (issue #3780)", () => {
+  for (const stop of ["pause", "shutdown"] as const) {
+    it(`a ${stop} during the ownership section is soft: the pending receipt reaches committed and the tick is aborted`, async () => {
+      const r = await receiptStopScenario(stop === "pause" ? 3780_101 : 3780_102, stop);
+      assert.equal(r.outcome, "aborted");
+      assert.equal(r.state.tip, r.sha, "the tracking ref was promoted to the incoming tip");
+      assert.equal(r.state.phase, "committed", "no pending receipt is stranded");
+    });
+  }
+
+  const hard: ReceiptStop[] = ["cancel", "switch", "pause then cancel", "shutdown past deadline"];
+  for (const [i, stop] of hard.entries()) {
+    it(`${stop} is a hard stop: the ownership section is aborted before the tracking-ref update`, async () => {
+      const r = await receiptStopScenario(3780_110 + i, stop);
+      assert.equal(r.outcome, "aborted");
+      assert.notEqual(r.state.tip, r.sha, "the hard abort stopped before the CAS");
+    });
+  }
+
+  it("sink-gate preemption by the ACTUAL done checkpoint leaves a committed receipt, and finalize still opens the MR", async () => {
+    const tmp = scratchDir("preempt-done");
+    const shim = writeShim(tmp, "detect");
+    const ctl = control();
+    const codex = fakeCodex();
+    const fg = fakeGitlab();
+    const g = mkGit(fx.dataDir, shim);
+    const iid = 3780_120;
+    const claim = gitlabClaim(iid);
+    const branch = `agent/issue-${iid}`;
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    let state: { tip: string | null; phase: string | undefined } | undefined;
+    const reported = ctl.hooks.onTickOutcome!;
+    ctl.hooks.onTickOutcome = (o) => {
+      state ??= trackingState(g, branch);
+      reported(o);
+    };
+    let sha = "";
+    let done: Promise<void> | undefined;
+    let restore: (() => void) | undefined;
+    try {
+      const factory: ExecutorFactory = () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            await recordingTurnErrors(async () => {
+              sha = commitIn(ctx.worktreePath, "D.txt", "d\n");
+              restore = afterPendingReceipt(g, async () => {
+                // The run's real done checkpoint, NOT awaited: withDoneAttempt preempts this tick
+                // through flight.sinkGate while it sits between the pending receipt and the CAS.
+                done = ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
+                done.catch(() => undefined);
+                await yieldLoop();
+              });
+              ctl.advance(INTERVAL_MS + 1);
+              assert.equal(await bounded(ctl.fire(), TEARDOWN_MS, "preempted tick"), "aborted");
+              await bounded(done!, TEARDOWN_MS, "done checkpoint");
+            });
+            return { branch: ctx.branch };
+          },
+          safety: codex.safety,
+          withCredentialFreeCapture: codex.withCredentialFreeCapture,
+          settleForCredentialFreeCapture: codex.settleForCredentialFreeCapture,
+        },
+      });
+      await mkRunner(g, factory, ctl, { gitlab: fg.gitlab }).execute(claim);
+      assert.deepEqual(state, { tip: sha, phase: "committed" }, "tracking state when the preempted tick settled");
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.ok(fg.calls.some((c) => c.method === "POST"), "the finalize import succeeded and the MR was created");
+    } finally {
+      await settleAndClean({ ctl, restore: () => { restore?.(); pub.restore(); }, paths: [tmp] });
+    }
+  });
+
+  it("a turn ending during the secret scan stops the scan promptly", async () => {
+    const tmp = scratchDir("scan-soft");
+    const shim = writeShim(tmp, "slowclean", { sleepMs: 30_000 });
+    const ctl = control();
+    const claim = gitlabClaim(3780_130);
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    const started = Date.now();
+    try {
+      await mkRunner(mkGit(fx.dataDir, shim), turn(async (ctx) => {
+        commitIn(ctx.worktreePath, "C.txt", "c\n");
+        ctl.advance(INTERVAL_MS + 1);
+        ctl.fireNoWait();
+        await waitFor(() => shimCalls(shim).length >= 1, 20_000);
+      }), ctl).execute(claim);
+      assert.deepEqual(ctl.outcomes, ["aborted"]);
+      assert.ok(Date.now() - started < 25_000, "the 30 s scanner was stopped by the soft stop, not waited out");
+    } finally {
+      await settleAndClean({ ctl, restore: pub.restore, paths: [tmp] });
     }
   });
 });
