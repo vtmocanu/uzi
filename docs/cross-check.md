@@ -729,7 +729,7 @@ cross-checked." An incomplete check renders as prose instead, for example
 
 The run page has a **Code cross-check** panel with the same evidence, and
 `uzi run get <id>` prints it (see [CLI](./cli.md#code-cross-check-evidence)).
-When a check failed and was not interrupted, the run's Slack completion
+When a check failed and was not interrupted or superseded, the run's Slack completion
 message adds one line naming the reason, with no findings (see
 [Slack](./slack.md#using-it)).
 
