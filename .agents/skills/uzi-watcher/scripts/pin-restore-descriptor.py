@@ -467,23 +467,53 @@ class Decoder:
         return list(dict.fromkeys((s.get("attemptId", ""), s["clonePath"]) for s in sources))
 
 
+def config_records():
+    # One bounded transport parser for legacy queries and the strict V2 consumer.
+    limit = 92 * 1024 * 1024
+    payload = sys.stdin.buffer.read(limit + 1)
+    require(len(payload) <= limit)
+    require(re.fullmatch(rb"[A-Za-z0-9+/=\r\n]*", payload) is not None)
+    config = base64.b64decode(payload.replace(b"\r", b"").replace(b"\n", b""), validate=True)
+    suffix = b"\0__UZI_CONFIG_RC=0"
+    require(len(config) <= 64 * 1024 * 1024 and config.endswith(suffix))
+    body = config[:-len(suffix)]
+    require(not body or body.endswith(b"\0"))
+    records = []
+    for record in body.split(b"\0")[:-1]:
+        require(bool(record))
+        name, separator, value = record.decode("utf-8", errors="strict").partition("\n")
+        require(bool(name))
+        records.append((name, separator, value))
+    return records
+
+
+def config_query(records, mode, key):
+    # Match Git's last-value --get and ordered --get-all/--get-regexp output.
+    if mode == "--get-regexp":
+        rows = [(n, sep, v) for n, sep, v in records
+                if n.startswith("uzi-attempts.") and n.endswith(".entry")]
+    else:
+        require(mode in ("--get", "--get-all"))
+        rows = [(n, sep, v) for n, sep, v in records if n == key]
+        if mode == "--get":
+            rows = rows[-1:]
+    for name, separator, value in rows:
+        if mode == "--get-regexp":
+            sys.stdout.write(name + (" " if separator else ""))
+        sys.stdout.write(value + "\n")
+    # Equivalent to kexec_probe's additional framing newline, even for absence.
+    sys.stdout.write("\n")
+    return 0 if rows else 1
+
+
 def main():
     try:
+        records = config_records()
+        if sys.argv[1:2] == ["--config-query"]:
+            return config_query(records, *sys.argv[2:])
         rid, branch, stem, root, bare_dir, budget = sys.argv[1:]
-        # Git's worker buffer is 64 MiB. Base64 with wrapping fits this encoded
-        # bound. Read at most limit+1 before allocating decoded bytes or text.
-        limit = 92 * 1024 * 1024
-        payload = sys.stdin.buffer.read(limit + 1)
-        require(len(payload) <= limit)
-        encoded = b"".join(payload.split())
-        config = base64.b64decode(encoded, validate=True)
-        require(len(config) <= 64 * 1024 * 1024 and config.endswith(b"\0__UZI_CONFIG_RC=0"))
-        records = config[:-len(b"\0__UZI_CONFIG_RC=0")].decode("utf-8", errors="strict").split("\0")
         values, ledger = {}, []
-        for record in records:
-            if not record:
-                continue
-            name, separator, value = record.partition("\n")
+        for name, separator, value in records:
             if name.startswith(("uzi-recovery.", "uzi-retained.")):
                 require(separator and name not in values)
                 values[name] = value
@@ -502,7 +532,7 @@ def main():
     except (ValueError, KeyError, TypeError, OverflowError, OSError, RecursionError,
             UnicodeError, binascii.Error):
         print("invalid or unreadable V2 protected descriptor", file=sys.stderr)
-        return 1
+        return 2 if sys.argv[1:2] == ["--config-query"] else 1
     return 0
 
 
