@@ -550,9 +550,11 @@ Only the committed receipt reading back as the record's run, generation and cont
 counts as success. Anything else (any other disk state, a context, run or generation
 mismatch, a missing owed anchor, a duplicated stamp) refuses as before. There is no
 rollback: every write is a step the original attempt would have taken, and undoing
-under possibly revoked authority would be a new mutation. Before each write the repair
-re-checks the admission proof and the hard boundary signal (the soft signal is masked for
-the repair). Admission is true only while the steering channel's positive authority
+under possibly revoked authority would be a new mutation. Before each roll-forward write
+the repair re-checks the admission proof and the hard boundary signal (the soft signal is
+masked for the repair); the one best-effort rewrite of the pending receipt after a failed
+committed write, mirroring the original attempt's own invalidation, re-checks admission
+only. Admission is true only while the steering channel's positive authority
 fields all hold (no terminal lifecycle, shutdown, flight end, receipt failure, cancel,
 claim fence, pending credential switch, disk pause or shutdown checkpoint), the owed
 limit has not stopped the run, the Codex registry is neither poisoned nor disposed, and
