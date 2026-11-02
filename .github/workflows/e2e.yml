@@ -28,9 +28,12 @@ name: E2E
 # Quoted so yamllint's `truthy` rule does not read the key as the boolean `on`.
 "on":
   schedule:
-    # 01:17 UTC == 03:17 EET / 04:17 EEST. Off the top of the hour to avoid the
+    # 21:17 UTC == 23:17 EET / 00:17 EEST. GitHub has started this schedule
+    # 4.7-6.4h late (measured 2026-10-24..11-02). At that worst delay plus a
+    # 100-minute run it ends about 05:22 UTC (07:22 EET, 08:22 EEST): an
+    # estimate, not a guaranteed finish time. Off the top of the hour to avoid the
     # scheduler's high-load contention. Adjust freely.
-    - cron: "17 1 * * *"
+    - cron: "17 21 * * *"
   workflow_dispatch: {}
 
 permissions:
