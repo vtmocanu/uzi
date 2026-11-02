@@ -27687,10 +27687,54 @@ describe("issue3472 M1 Codex repository instruction snapshot", () => {
 
 
 describe("M2 lazy root operation admission", () => {
+  // Startup awaits real checkout I/O. Like #3492, bound readiness by an unmocked
+  // clock rather than a turn count that can expire before the I/O completes.
   const ready = async (check: () => boolean): Promise<void> => {
-    for (let n = 0; n < 1000; n++) { if (check()) return; await tick(); }
-    assert.fail("M2 event barrier did not settle");
+    const deadline = performance.now() + 5000;
+    while (!check() && performance.now() < deadline) await tick();
+    assert.ok(check(), "M2 event barrier did not settle");
   };
+
+  it("admission readiness waits for checkout I/O beyond a fixed turn count", async t => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    let releaseIO!: () => void;
+    const ioReady = new Promise<void>(resolve => { releaseIO = resolve; });
+    const realpath = fs.realpath.bind(fs);
+    let checkoutReads = 0, admissions = 0;
+    t.mock.method(fs, "realpath", async (...args: Parameters<typeof fs.realpath>) => {
+      if (args[0] === WORKSPACE) { checkoutReads++; await ioReady; }
+      return realpath(...args);
+    });
+    let releaseAdmission!: () => void;
+    let closing = false;
+    const { ctx } = makeCtx({ prepareCodexRootDispatch: async (_signal, check) => {
+      admissions++;
+      if (!closing) await new Promise<void>(resolve => { releaseAdmission = resolve; });
+      check(); return check;
+    } });
+    t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 0 });
+    const delayedIO = (async () => {
+      for (let n = 0; n < 4000; n++) await tick();
+      releaseIO();
+    })();
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await ready(() => admissions === 1);
+      assert.equal(checkoutReads, 1, "the executor reached the delayed filesystem seam");
+      assert.equal(Date.now(), 0, "readiness does not advance lifecycle time");
+      assert.equal(rig.transport.turnStartCount, 0);
+      releaseAdmission();
+      await running;
+      assert.equal(rig.transport.turnStartCount, 1);
+    } finally {
+      closing = true;
+      releaseIO(); releaseAdmission?.(); rig.transport.end();
+      await delayedIO;
+      await running.catch(() => undefined);
+      t.mock.timers.reset();
+    }
+  });
 
   for (const fallback of [false, true]) it(`gates after thread setup, idle stays disarmed, fresh fallback=${fallback}`, async t => {
     const rig = makeRig();
