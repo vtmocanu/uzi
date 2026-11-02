@@ -192,9 +192,13 @@ ADRs are read by doc validation. A 30-day first-parent audit found 38 skip-marke
 tips among 1030 main commits, all touching checked PRD text. The parent bridge
 is parked; existing exact-tip and 1/2 metadata-hop policies remain unchanged.
 
-3e-2 adds opt-in scheduling after the proven live RC. Cron `47 4 * * *` uses
-GitHub's native `timezone: Europe/Bucharest`, targeting a cut near 05:00 when on time, after
-the local maintenance window ([schedule syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onschedule)).
+3e-2 adds opt-in scheduling after the proven live RC. Cron `47 1 * * *` uses
+GitHub's native `timezone: Europe/Bucharest`, requesting an attempt at 01:47 local
+([schedule syntax](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onschedule)).
+The earlier slot accommodates observed seven-to-eight-hour scheduler delays.
+Even though 01:47 falls on the previous UTC date in both seasons, its Bucharest
+date is the same date used for the 13:00 cutoff; the existing original-date and
+60-second future-skew guards remain unchanged.
 Only exact `RELEASE_NIGHTLY_ENABLED=true` enables nightly attempts; unset/false
 is a reported no-op. Activation requires the user's decision. Enablement is
 rechecked at job boundaries; pausing may stop a not-yet-pushed attempt there,
@@ -214,7 +218,7 @@ respins retain the cutter's rules. The provisional cutoff is strictly before
 reserving a provisional fixed 600 seconds without resetting on tip changes.
 This is the existing cutter timeout, not a measured cut duration; it is an
 approved rollout deviation from D6 until timing evidence supports adjustment.
-An on-time 04:47 start can wait until 07:47; a six-hour-late 10:47 start can wait
+An on-time 01:47 start can wait until 04:47; a late 10:47 start can wait
 until 12:50 (7380 seconds). Eligible polling still holds a runner under the
 account's 20-job cap. The prepare ceiling stays 210 minutes: 180 for waiting,
 ten for cutting and 20 for setup/overhead. Manual waiting stays 7200 seconds
