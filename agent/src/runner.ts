@@ -35,6 +35,7 @@ import type { MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, Git
 import {
   CheckpointSoftDeadlineError,
   RecoveryChargeInterruptedError,
+  PublicationCandidateRestoreRefusal,
   RetainedReadinessCleanupUnconfirmedError,
   formatRetainedRecoveryDiagnostic,
   annotateRetainedSuccessorError,
@@ -24978,6 +24979,9 @@ export class RunRunner {
           await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username,
             flight.runKind === "task" ? flight.checkpointCoordinates?.checkpoint_key : undefined);
           await check();
+          const publicationRecovery = claim.publication_resume !== undefined && claim.inventory_guarded === true && this.recovery.enabled;
+          let publicationCandidate: string | undefined;
+          let publicationRefusal: PublicationHoldReason = "publication_source_unavailable";
           const captureResult = await this.runFreeCapture(claim, flight, iteration.deadline, signal, async held => {
             const check = async () => {
               this.assertHeldFreeCapture(flight, held);
@@ -25034,6 +25038,7 @@ export class RunRunner {
               const local = await this.recovery.verifiedLocalCapture(record!, held.signal);
               if (outcome.reason === "oversized") { blocker = "oversize"; throw finalize; }
               if (!local?.bundlePath || !local.checksum || !Array.isArray(local.prerequisiteShas)) {
+                if (publicationRecovery) return "publication_source_unavailable" as const;
                 if (outcome.reason === "bundle_failed" || outcome.reason === "capture_error") throw new Error("local bundle capture temporarily unavailable");
                 blocker = "prerequisites_unavailable"; throw finalize;
               }
@@ -25042,9 +25047,46 @@ export class RunRunner {
               // records itself as its source, which is never attested: the guard holds it (fail closed).
               capturedSource = local!.runId === claim.run_id && local!.generation === options.context.generation &&
                 local!.inventoryCurrentSha === tip ? local!.inventoryCurrentSha : undefined;
+              // Authenticate the exact capture mapping and active enrollment before allowing a
+              // metadata-only restoration. phasePublicationOnly still validates the full intent,
+              // ancestry, floor and exact workspace; this grants no publication authority itself.
+              if (claim.publication_resume !== undefined && capturedSource !== undefined) {
+                try {
+                  const server = parseClaimPublicationResume(claim.publication_resume, flight.runKind === "task" ? "task" : "issue");
+                  if (server.run_id !== claim.run_id || server.repo_id !== claim.repo.id || server.branch !== branch ||
+                      server.claim_generation > flight.claimGeneration) publicationRefusal = "publication_intent_mismatch";
+                  else if (server.candidate !== null && server.candidate !== capturedSource &&
+                      await this.git.ancestry(bare, server.candidate, capturedSource) === "ancestor") {
+                    publicationRefusal = "publication_model_required";
+                  }
+                  if (server.run_id === claim.run_id && server.repo_id === claim.repo.id && server.branch === branch &&
+                      server.claim_generation <= flight.claimGeneration && server.candidate === capturedSource &&
+                      this.outbox && !this.outbox.isDisabled()) {
+                    const locals: PublicationRecord[] = [];
+                    let usable = true;
+                    const generations = new Set([server.claim_generation]);
+                    for (const entry of this.outbox.listPublicationRecords()) if (entry.run_id === claim.run_id) generations.add(entry.claim_generation);
+                    for (const generation of generations) {
+                      const loaded = await this.outbox.loadPublicationRecord(claim.run_id, generation);
+                      if (loaded.kind === "ok") locals.push(loaded.record);
+                      else if (loaded.kind !== "absent") usable = false;
+                    }
+                    const choice = chooseResumeRecord(locals, claim.publication_resume, server);
+                    if (choice.kind === "mismatch") publicationRefusal = "publication_intent_mismatch";
+                    if (usable && choice.kind !== "mismatch" && choice.kind !== "resend_local" &&
+                        (choice.kind !== "use_local" || choice.record.candidate === server.candidate)) {
+                      publicationCandidate = capturedSource;
+                    }
+                  }
+                } catch (error) {
+                  if (!(error instanceof PublicationIntentMismatchError)) throw error;
+                  publicationRefusal = "publication_intent_mismatch";
+                }
+              }
               tip = local!.sourceSha;
               for (const prerequisite of local!.prerequisiteShas!) {
                 if (!await this.git.verifyRecoveryClosure(bare, prerequisite)) {
+                  if (publicationRecovery) return "publication_source_unavailable" as const;
                   blocker = "prerequisites_unavailable"; throw finalize;
                 }
                 await check();
@@ -25057,11 +25099,29 @@ export class RunRunner {
           if (captureResult.kind !== "observed_empty") { blocker = "quiescence_failed"; throw finalize; }
           await check();
           blocker = "adoption_failed";
+          // A guarded publication-only successor may restore only its positively bound candidate.
+          // In particular, ordinary marker peeling could leave HEAD at C with genuine staged work;
+          // the publication phase's HEAD equality is not authority to discard that work.
+          if (publicationRecovery && (captureResult.value !== undefined || publicationCandidate === undefined)) {
+            await this.holdPublicationOnly(flight, captureResult.value ?? publicationRefusal,
+              "the retained source cannot be bound to the exact enrolled publication candidate");
+            throw new RetainedRecoveryStop();
+          }
           const attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
-          const successor = await this.inFlightAuthority(flight, () => this.git.prepareRecoverySuccessor(bare, branch, key, source,
-            iteration.attempts, attemptId, { checkpointWriteUnresolved: flight.checkpointClaimEvidence.writeUnresolved, checkpointKey: flight.checkpointCoordinates?.checkpoint_key ??
-              (flight.runKind === "task" ? null : undefined), selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.plan_cross_check_gated === true }),
-            { signal, timeoutMs: Math.max(1, iteration.deadline - Date.now()) });
+          let successor: RunnerClone;
+          try {
+            successor = await this.inFlightAuthority(flight, () => this.git.prepareRecoverySuccessor(bare, branch, key, source,
+              iteration.attempts, attemptId, { publicationCandidate, checkpointWriteUnresolved: flight.checkpointClaimEvidence.writeUnresolved, checkpointKey: flight.checkpointCoordinates?.checkpoint_key ??
+                (flight.runKind === "task" ? null : undefined), selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.plan_cross_check_gated === true }),
+              { signal, timeoutMs: Math.max(1, iteration.deadline - Date.now()) });
+          } catch (error) {
+            if (!publicationRecovery || !(error instanceof PublicationCandidateRestoreRefusal)) throw error;
+            // The verifier refused before admission/writes; its authority transaction has unwound.
+            await check();
+            await this.holdPublicationOnly(flight, "publication_source_unavailable",
+              "the retained publication metadata could not be verified");
+            throw new RetainedRecoveryStop({ cause: error });
+          }
           expectedSource = { ...source, clonePath: successor.path, attemptId: successor.attemptId };
           flight.runnerClone = successor;
           flight.worktreePath = successor.path;

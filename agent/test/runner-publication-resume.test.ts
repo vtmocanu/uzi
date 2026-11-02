@@ -822,3 +822,110 @@ it("a flight with no branch is refused as an intent mismatch instead of skipping
   await r.execute(resumeClaim(claim, last));
   assert.deepEqual(parks(claim.run_id).filter(b => b.publication_hold_reason !== undefined).map(h => h.publication_hold_reason), ["publication_intent_mismatch"]);
 });
+
+for (const mode of ["clean", "empty commit", "committed work", "dirty", "untracked", "wrong capture run", "wrong capture generation", "wrong capture inventory", "missing capture", "wrong enrollment", "no coverage pin", "hold refused", "hold unavailable"] as const) {
+  it(`M3 guarded retained publication: ${mode}`, async t => {
+    const iid = 5388, outbox = await mkOutbox();
+    const { claim, last } = await enrolAndPark(iid, outbox);
+    const bare = git.barePathFor(fx.originPath), branch = `agent/issue-${iid}`;
+    const retained = JSON.parse(gitIn(bare, ["config", "--get", `uzi-recovery.${branch}.clone`])) as { clonePath: string };
+    assert.ok(retained);
+    assert.equal(gitIn(retained.clonePath, ["rev-parse", "HEAD"]), last.candidate);
+    assert.equal(gitIn(retained.clonePath, ["status", "--porcelain"]), "");
+    if (mode === "empty commit") gitIn(retained.clonePath, [...IDENT, "commit", "--allow-empty", "-m", "genuine empty work"]);
+    if (mode === "committed work" || mode === "dirty" || mode === "untracked") {
+      fs.writeFileSync(path.join(retained.clonePath, "extra.txt"), "genuine extra work\n");
+      if (mode !== "untracked") gitIn(retained.clonePath, ["add", "extra.txt"]);
+      if (mode === "committed work") gitIn(retained.clonePath, [...IDENT, "commit", "-m", "extra work"]);
+    }
+    const laterHead = gitIn(retained.clonePath, ["rev-parse", "HEAD"]);
+    const archive = Object.assign(new FakeRecoveryClient(), { hasFeature: (name: string) => name === "recovery_inventory_v1", getRunOwnership: (runId: string) => client.getRunOwnership(runId) });
+    archive.holds = [{ generation: GEN + 1, inventory_guarded: true, hold_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" }] as never;
+    const recovery = new RecoveryCoordinator({ client: archive, git, log: nullLogger(),
+      recoveryRoot: git.recoveryRoot, workerToken: "publication-resume-worker-fixture" });
+    const verify = recovery.verifiedLocalCapture.bind(recovery);
+    recovery.verifiedLocalCapture = async (...args) => {
+      const local = await verify(...args);
+      if (!local || mode === "missing capture") return undefined;
+      return { ...local, ...(["wrong capture run", "hold refused", "hold unavailable"].includes(mode) ? { runId: "other-run" } : {}),
+        ...(mode === "wrong capture generation" ? { generation: 999 } : {}),
+        ...(mode === "wrong capture inventory" ? { inventoryCurrentSha: "e".repeat(40) } : {}) };
+    };
+    let wrapper: string | undefined;
+    const record = git.recordRecoveryCapture.bind(git);
+    git.recordRecoveryCapture = async (...args) => {
+      wrapper = args[5];
+      if (mode === "clean" || mode === "wrong enrollment") assert.equal(args[6], last.candidate, "authenticated inventory maps wrapper to exact candidate");
+      assert.notEqual(wrapper, last.candidate);
+      if (mode === "clean") {
+        assert.equal(gitIn(bare, ["rev-parse", `${wrapper}^{tree}`]), gitIn(bare, ["rev-parse", `${last.candidate}^{tree}`]));
+        assert.equal(gitIn(bare, ["rev-list", `${last.candidate}..${wrapper}`]).split("\n").length, 1);
+      }
+      assert.match(gitIn(bare, ["log", "-1", "--format=%s", wrapper!]), /^uzi recovery coverage /);
+      t.diagnostic(JSON.stringify({ candidate: last.candidate, wrapper, source: args[6] }));
+      await record(...args);
+      if (mode === "no coverage pin") {
+        for (const ref of gitIn(bare, ["for-each-ref", "--format=%(refname)", `refs/uzi-coverage/${claim.run_id}/`]).split("\n")) {
+          gitIn(bare, ["update-ref", "-d", ref]);
+        }
+      }
+    };
+    let preparations = 0;
+    const prepare = git.prepareRecoverySuccessor.bind(git);
+    git.prepareRecoverySuccessor = async (...args) => { preparations++; return prepare(...args); };
+    let holdAttempts = 0;
+    if (mode === "hold refused" || mode === "hold unavailable") {
+      const report = client.reportState.bind(client);
+      t.mock.method(client, "reportState", async (...args: Parameters<typeof client.reportState>) => {
+        if (args[0] === claim.run_id && args[1].publication_hold_reason !== undefined) {
+          holdAttempts++;
+          if (mode === "hold unavailable") throw new Error("fixture hold report unavailable");
+          return { status: "running", reason: "publication_not_enrolled" };
+        }
+        return report(...args);
+      });
+    }
+    reset();
+    const c = counts(), forge = fakeGitlab();
+    await build(tripwireExecutor(c), { gitlab: forge.gitlab }, outbox, { c, extra: { recovery }, log: { ...nullLogger(), warn: (msg, fields) => t.diagnostic(JSON.stringify({ msg, fields })) } })
+      .execute(resumeClaim(claim, mode === "wrong enrollment" ? { ...last, v: 999 } : last, { inventory_guarded: true }));
+    assert.deepEqual(c, counts());
+    t.diagnostic(JSON.stringify(states(claim.run_id)));
+    if (mode !== "clean") {
+      assert.equal(completed(claim.run_id).length, 0);
+      assert.equal(failed(claim.run_id).length, 0, "publication refusals never become terminal failures");
+      const holds = parks(claim.run_id).filter(s => s.claim_generation === GEN + 1);
+      const reason = mode === "wrong enrollment" ? "publication_intent_mismatch"
+        : ["empty commit", "committed work", "dirty", "untracked"].includes(mode) ? "publication_model_required"
+        : "publication_source_unavailable";
+      if (mode === "hold refused" || mode === "hold unavailable") {
+        assert.equal(holdAttempts, 1);
+        assert.equal(holds.length, 0, "unconfirmed holds retain without claiming a park");
+      } else {
+        assert.equal(holds.length, 1, "this resume, not its earlier flight, holds for its owner");
+        assert.equal(holds[0]!.recovery_phase, "publication");
+        assert.equal(holds[0]!.publication_hold_reason, reason);
+      }
+      assert.equal(preparations, mode === "no coverage pin" ? 1 : 0, "eligibility refusals precede successor preparation");
+      assert.equal(originBranch(iid), undefined);
+      assert.equal(forge.calls.length, 0);
+      assert.ok(fs.existsSync(retained.clonePath), "source preserved");
+      if (["committed work", "dirty", "untracked"].includes(mode)) {
+        assert.equal(fs.readFileSync(path.join(retained.clonePath, "extra.txt"), "utf8"), "genuine extra work\n");
+      }
+      assert.equal(archive.releaseCalls.length, 0, "custody preserved");
+      assert.equal((await outbox.loadPublicationRecord(claim.run_id, GEN)).kind, "ok", "publication record preserved");
+      assert.equal(gitIn(retained.clonePath, ["merge-base", "--is-ancestor", laterHead, "HEAD"]), "", "later commits remain reachable");
+      if (mode === "no coverage pin") {
+        const journal = JSON.parse(gitIn(bare, ["config", "--get", `uzi-recovery.${branch}.clone`]));
+        assert.equal(journal.recovery.stage, "captured", "verifier refusal never adopts a successor");
+      }
+      return;
+    }
+    assert.ok(wrapper, "production retained capture ran");
+    assert.equal(completed(claim.run_id).length, 1, "exact candidate must complete publication");
+    assert.equal(originBranch(iid), last.candidate);
+    assert.equal(gitIn(fx.originPath, ["rev-list", branch]).split("\n").includes(wrapper!), false);
+    assert.equal(forge.calls.filter(q => q.method === "POST").length, 1, "one MR");
+  });
+}

@@ -9,6 +9,8 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
 import { fixtureFetchTracking, fixtureTrackingOptions } from "./runner-tracking-fixture.js";
 import { TickSpawner } from "../src/tick-spawner.js";
+import { AuthorityRefusal } from "../src/authority-lock.js";
+import { CheckpointSoftDeadlineError, GitBoundaryAbortError } from "../src/checkpoint-stop.js";
 
 /** Capture through the production boundary and settle every owned child, including on refusal. */
 async function captureRecovered(cache: GitCache, clone: { path: string; baseCommit: string }, bare: string): Promise<string> {
@@ -99,11 +101,11 @@ function rawCommit(parent: string, msg: Buffer, tree = sha(`${parent}^{tree}`)):
   }).trim();
 }
 /** Assert a refused successor: nothing written, no clone, source untouched. */
-async function assertRefused(attempts: number, attempt: string, reason?: string): Promise<void> {
+async function assertRefused(attempts: number, attempt: string, reason?: string, publicationCandidate?: string): Promise<void> {
   const head = sha("HEAD", source.clonePath);
   const before = journal();
   const ledgerBefore = ledger();
-  await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, attempts, attempt),
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, attempts, attempt, { publicationCandidate }),
     error => {
       assert.ok(error instanceof Error);
       assert.equal(error.message, "successor recovery verification failed");
@@ -699,4 +701,90 @@ for (const seam of ["pin", "seed"] as const) {
       assert.equal(fs.readFileSync(path.join(source.clonePath, "work.txt"), "utf8"), "work.txt\n");
     });
   }
+}
+
+for (const mode of ["abort", "checkpoint", "authority"] as const) {
+  test(`M3 publication verifier preserves ${mode} control flow`, async t => {
+    const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+    const candidate = sha("HEAD", source.clonePath);
+    const tip = (await genuine([candidate], candidate)).sha;
+    await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, tip, candidate);
+    const before = journal(), ledgerBefore = ledger();
+    const error = mode === "abort" ? new DOMException("fixture cancellation", "AbortError")
+      : mode === "checkpoint" ? new CheckpointSoftDeadlineError() : new AuthorityRefusal("fixture authority refused");
+    t.mock.method(cache as any, "resolveMarkerWrapperAdoption", async () => { throw error; });
+    await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2),
+      { publicationCandidate: candidate }), actual => mode === "abort"
+        ? actual instanceof GitBoundaryAbortError && actual.cause === error : actual === error);
+    assert.deepEqual(journal(), before);
+    assert.equal(ledger(), ledgerBefore);
+    assert.ok(fs.existsSync(source.clonePath));
+  });
+}
+
+// The marker-free publication exception uses the same proofs as marker peeling. These fixtures
+// enter the public successor seam with an exact candidate grant; ordinary adoption above keeps C.
+for (const mode of ["genuine", "no pin", "other run pin", "wrong author", "wrong committer", "wrong date", "fingerprint",
+  "tree", "unrelated leaf", "graph bound", "byte bound", "read failure"] as const) {
+  test(`M3 marker-free publication proof: ${mode}`, async t => {
+    const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+    const candidate = sha("HEAD", source.clonePath);
+    let tip: string;
+    if (mode === "genuine" || mode === "no pin" || mode === "other run pin" || mode === "read failure") {
+      tip = (await genuine([candidate], candidate)).sha;
+      if (mode === "no pin" || mode === "other run pin") {
+        const refs = git(bare, ["for-each-ref", "--format=%(refname)", `refs/uzi-coverage/${runId}/`]).split("\n");
+        for (const ref of refs) git(bare, ["update-ref", "-d", ref]);
+        if (mode === "other run pin") {
+          const fp = git(bare, ["log", "-1", "--format=%s", tip]).split(" ")[3]!;
+          git(bare, ["update-ref", `refs/uzi-coverage/other-run/1/${fp}`, tip]);
+        }
+      }
+    } else if (mode === "unrelated leaf") {
+      tip = (await genuine([candidate, sibling(candidate, "genuine same-tree extra work")], candidate)).sha;
+    } else if (mode === "graph bound") {
+      tip = candidate;
+      for (let i = 0; i < 9; i++) tip = lookalike(tip, { pin: false, fp: "0".repeat(64) });
+    } else if (mode === "byte bound") {
+      tip = rawCommit(candidate, Buffer.from("uzi recovery coverage oversized\n" + "x".repeat(65536)));
+    } else {
+      let tree: string | undefined;
+      if (mode === "tree") {
+        fs.writeFileSync(path.join(source.clonePath, "different.txt"), "different\n");
+        git(source.clonePath, ["add", "different.txt"]);
+        tree = git(bare, ["mktree"], {}, "");
+      }
+      tip = lookalike(candidate, { pin: true,
+        ...(mode === "wrong author" ? { author: "forged" } : {}),
+        ...(mode === "wrong committer" ? { committer: "forged" } : {}),
+        ...(mode === "wrong date" ? { date: "2000-01-02T00:00:00Z" } : {}),
+        ...(mode === "fingerprint" ? { fp: "0".repeat(64) } : {}), ...(tree ? { tree } : {}) });
+    }
+    await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, tip, candidate);
+    if (mode === "read failure") {
+      const run = (cache as any).runGit.bind(cache);
+      let hit = false;
+      t.mock.method(cache as any, "runGit", async (dir: string, args: string[], ...rest: unknown[]) => {
+        if (args.includes("cat-file") && args.includes(tip)) { hit = true; throw new Error("object read failed"); }
+        return run(dir, args, ...rest);
+      });
+      await assertRefused(r.attempts, aid(2), "wrapper_commit_read", candidate);
+      assert.equal(hit, true);
+    } else if (mode === "genuine") {
+      const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2), { publicationCandidate: candidate });
+      assert.equal(sha("HEAD", successor.path), candidate);
+      assert.equal(git(successor.path, ["status", "--porcelain"]), "");
+      assert.equal(sha(`refs/uzi-recovery-episode/${runId}/${tip}`), tip);
+      assert.ok(fs.existsSync(source.clonePath));
+    } else {
+      const reason = mode === "no pin" || mode === "other run pin" ? "wrapper_pin"
+        : mode === "wrong author" || mode === "wrong date" ? "wrapper_author"
+        : mode === "wrong committer" ? "wrapper_committer"
+        : mode === "fingerprint" ? "wrapper_fingerprint"
+        : mode === "tree" ? "wrapper_tree"
+        : mode === "unrelated leaf" ? "wrapper_lineage_marker"
+        : mode === "graph bound" ? "wrapper_aggregate_bound" : "wrapper_tip_bound";
+      await assertRefused(r.attempts, aid(2), reason, candidate);
+    }
+  });
 }
