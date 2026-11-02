@@ -24,6 +24,11 @@ import "regexp"
 //     families); slackRefresh covers xoxe- refresh tokens, which fall OUTSIDE the
 //     x(?:ox[bpoas]|app)- shape;
 //   - anthropic covers sk-ant- keys;
+//   - openai covers classic sk- keys and project / service-account keys. Its
+//     16-character minimum applies to the body AFTER any proj- / svcacct- prefix,
+//     preserving short display prefixes. Classic bodies are alphanumeric; scoped
+//     bodies also admit URL-safe '_' and '-'. No upper bound: redact the whole
+//     credential rather than leave a suffix when provider lengths change;
 //   - gitlabPAT covers the GitLab 9-family set (glpat-/gloas-/glrt-/glcbt-/glptt-/
 //     glsoat-/glimt-/glagent-/gldt-), matching the snapshot list — widened from
 //     glpat- alone to close a live outbound-Slack scrub gap;
@@ -43,6 +48,7 @@ var (
 	slackTokenPattern      = regexp.MustCompile(`x(?:ox[bpoas]|app)-[A-Za-z0-9-]+`)
 	slackRefreshPattern    = regexp.MustCompile(`xoxe-[A-Za-z0-9-]+`)
 	anthropicPattern       = regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]+`)
+	openaiPattern          = regexp.MustCompile(`sk-(?:(?:proj|svcacct)-[A-Za-z0-9_-]{16,}|[A-Za-z0-9]{16,})`)
 	gitlabPATPattern       = regexp.MustCompile(`gl(pat|oas|rt|cbt|ptt|soat|imt|agent|dt)-[A-Za-z0-9_-]{16,}`)
 	githubClassicPattern   = regexp.MustCompile(`gh[pousr]_[A-Za-z0-9_]{16,}`)
 	githubFineGrainPattern = regexp.MustCompile(`github_pat_[A-Za-z0-9_]{16,}`)
@@ -54,6 +60,7 @@ func Scrub(s string) string {
 	s = slackTokenPattern.ReplaceAllString(s, "[redacted]")
 	s = slackRefreshPattern.ReplaceAllString(s, "[redacted]")
 	s = anthropicPattern.ReplaceAllString(s, "[redacted]")
+	s = openaiPattern.ReplaceAllString(s, "[redacted]")
 	s = gitlabPATPattern.ReplaceAllString(s, "[redacted]")
 	s = githubClassicPattern.ReplaceAllString(s, "[redacted]")
 	s = githubFineGrainPattern.ReplaceAllString(s, "[redacted]")
