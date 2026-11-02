@@ -27,7 +27,7 @@ function command(dir: string, ...args: string[]): string {
 for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "excluded", "scan-floor", "missing-pending",
   "missing-RR", "historical", "late-scan-pending", "late-scan-root", "late-seed", "late-launch-denial",
   "marker", "marker-plain", "marker-staged", "marker-historical", "marker-floor", "marker-exclude", "marker-published-floor",
-  "marker-late-scan", "marker-late-seed", "marker-credential"] as const) {
+  "marker-late-scan", "marker-late-seed", "marker-credential", "marker-pack-floor", "marker-default-blob"] as const) {
   test("production remediation adoption: " + mode, async t => {
     const peel = mode.startsWith("marker");
     const lateSeed = mode === "late-seed" || mode === "marker-late-seed";
@@ -184,6 +184,8 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
     const range = cache.resolveCheckpointRange.bind(cache);
     t.mock.method(cache, "resolveCheckpointRange", async (...args: Parameters<typeof range>) => {
       const value = await range(...args);
+      if (underB && value && mode === "marker-pack-floor") return { ...value, packExcludeShas: [s] };
+      if (underB && value && mode === "marker-default-blob") return { ...value, defaultBlobSha: s };
       if (underB && value && mode === "marker-exclude") return { ...value, excludeSha: s };
       if (underB && value && mode === "marker-floor") return { ...value, scanFloorShas: [s] };
       if (underB && value && mode === "excluded") return { ...value, excludeSha: q };

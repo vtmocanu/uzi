@@ -125,6 +125,36 @@ test("fresh runner restores flagged and displaced roots, admits only confirmed c
   await assert.rejects(runner.requireLaunchAuthority(flight), /enrollment disappeared/);
 });
 
+for (const floor of ["default-ref", "exclude", "scan", "pack", "default-blob"] as const) {
+  test("launch refuses a flagged resolved floor with empty flight floors: " + floor, async t => {
+    const f = await fixture();
+    const flagged = await f.enroll();
+    const clean = f.commit("clean source excluding flagged default history");
+    assert.equal((await f.fetch()).kind, "updated");
+    await git.recordRemediationScan(f.bare, BRANCH, f.source,
+      { trusted: true, tip: clean, flaggedOIDs: [] });
+    if (floor === "default-ref") command(f.bare, "update-ref", "refs/remotes/origin/main", flagged);
+    const resolve = git.resolveCheckpointRange.bind(git);
+    t.mock.method(git, "resolveCheckpointRange", async (...args: Parameters<typeof resolve>) => {
+      const range = await resolve(...args);
+      assert.ok(range);
+      if (floor === "exclude") return { ...range, excludeSha: flagged };
+      if (floor === "scan") return { ...range, scanFloorShas: [flagged] };
+      if (floor === "pack") return { ...range, packExcludeShas: [flagged] };
+      if (floor === "default-blob") return { ...range, defaultBlobSha: flagged };
+      assert.ok([range.excludeSha, range.defaultBlobSha, ...(range.scanFloorShas ?? [])].includes(flagged));
+      return range;
+    });
+    t.mock.method(git, "secretScanCheckpointRange", async () => ({ trusted: true, findings: [] }));
+    const runner = freshRunner(), flight = f.freshFlight();
+    assert.deepEqual(flight.publishedRealTips ?? [], []);
+    const before = command(f.bare, "for-each-ref", "--format=%(refname) %(objectname)");
+    assert.equal(await git.ancestry(f.bare, flagged, clean), "divergent");
+    await assert.rejects(runner.requireLaunchAuthority(flight), /remediation continuation published floor conflict/);
+    assert.equal(command(f.bare, "for-each-ref", "--format=%(refname) %(objectname)"), before);
+  });
+}
+
 test("launch pending admission: old readable recovery cannot cover an unpersisted divergent finding", async t => {
   const f = await fixture();
   const q1 = await f.enroll();

@@ -3733,7 +3733,7 @@ export class RunRunner {
       if (scan.trusted && scan.findings.length)
         await this.persistRemediationRestrictions(flight, flight.barePath!, flight.branch!, scan.range.tipSha, scan.findings);
       if (!scan.trusted || scan.findings.length) throw new Error("remediation continuation history unavailable");
-      for (const floor of scan.floorCandidates)
+      for (const floor of this.remediationRangeFloors(scan.range, scan.floorCandidates))
         for (const root of flight.remediationRestrictions!.roots)
           if (await this.git.ancestry(flight.barePath!, root, floor) !== "divergent")
             throw new Error("remediation continuation published floor conflict");
@@ -17992,6 +17992,12 @@ export class RunRunner {
     return { trusted: true, range, findings: scan.findings, floorCandidates };
   }
 
+  /** The same resolved floors protect model launch, successor admission and publication. */
+  private remediationRangeFloors(range: CheckpointRange, published: readonly string[]): string[] {
+    return [...new Set([...published, range.excludeSha, ...(range.scanFloorShas ?? []),
+      ...(range.packExcludeShas ?? []), ...(range.defaultBlobSha ? [range.defaultBlobSha] : [])])];
+  }
+
   /** issue #1932: remember a CONFIRMED-published real-branch tip (validated 40-hex, deduped, capped). */
   private recordPublishedRealTip(flight: RunFlight, sha: string | null | undefined): void {
     if (typeof sha !== "string" || !/^[0-9a-f]{40}$/.test(sha)) return;
@@ -18565,6 +18571,9 @@ export class RunRunner {
             current.clonePath !== selected.clonePath || current.attemptId !== selected.attemptId ||
             flight.barePath !== barePath || flight.branch !== branch)
           throw new SecretRemediationPendingError();
+        // Enrolled predecessor capture has private custody only. Publication and
+        // tracking transforms wait until verified successor handoff clears this phase.
+        if (record && flight.predecessorCapture) throw new SecretRemediationPendingError();
         if (!state) return;
         const pending = state.pending;
         if (flight.secretRemediation?.overflow === true || !record || !facts || facts.blocked || !facts.enrolled ||
@@ -18619,9 +18628,7 @@ export class RunRunner {
             }
             check();
             if (!scan.trusted) throw new SecretRemediationPendingError();
-            for (const floor of new Set([tip, scan.range.excludeSha, ...(scan.range.scanFloorShas ?? []),
-              ...(scan.range.packExcludeShas ?? []), ...scan.floorCandidates,
-              ...(scan.range.defaultBlobSha ? [scan.range.defaultBlobSha] : [])])) {
+            for (const floor of new Set([tip, ...this.remediationRangeFloors(scan.range, scan.floorCandidates)])) {
               for (const root of roots) {
                 check();
                 const relation = await this.git.ancestry(barePath, root, floor);
@@ -25232,8 +25239,8 @@ export class RunRunner {
                     if (!scan.trusted) return false;
                     const roots = [...new Set([...input.restrictedRoots, ...(flight.remediationRestrictions?.roots ?? [])])];
                     const executionTip = input.executionTip ?? input.sourceTip;
-                    const floors = [...new Set([executionTip, ...scan.floorCandidates,
-                      scan.range.excludeSha, ...(scan.range.scanFloorShas ?? [])])];
+                    const floors = [...new Set([executionTip,
+                      ...this.remediationRangeFloors(scan.range, scan.floorCandidates)])];
                     // Only the newly peeled S is exempt from the CONTENT-S check. Old live
                     // restrictions must still be divergent from S; all roots, including S,
                     // must be divergent from execution P and every actual published/range floor.
