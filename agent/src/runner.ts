@@ -5528,7 +5528,11 @@ export class RunRunner {
                     barePath,
                     branch,
                     shutdownOverlay,
-                    permit?.signal,
+                    permit?.signal ?? cause.stopSignal,
+                    undefined,
+                    undefined,
+                    true,
+                    cause.deadlineAt,
                   );
                 },
                 // issue #1783 (auditor M2): the flight rides along, so the shutdown sink first proves
@@ -18669,12 +18673,14 @@ export class RunRunner {
     candidate: string | null,
     reap: boolean,
     sourceSha: string | null = candidate,
+    signal?: AbortSignal,
+    deadlineAt?: number,
   ): Promise<boolean> {
     if (flight.remediationRestrictions) {
       if (!candidate || !sourceSha || !flight.branch) return true;
       try {
         await this.withRemediationCandidateAdmission(flight, barePath, flight.branch,
-          admission => admission.admit(sourceSha, candidate, []));
+          admission => admission.admit(sourceSha, candidate, []), signal, deadlineAt);
         return false;
       } catch (error) {
         if (isCheckpointBoundaryFailure(error)) throw error;
@@ -18755,6 +18761,7 @@ export class RunRunner {
     pinned?: CheckpointRange,
     onStep?: (step: BoundaryStep) => void,
     reap = true,
+    deadlineAt?: number,
   ): Promise<PublishOutcome> {
     if (flight.runKind === "task" && !flight.checkpointCoordinates)
       return { published: false, reason: "skipped", skipLabel: "unsupported" };
@@ -18800,7 +18807,7 @@ export class RunRunner {
         return { published: false, reason: "skipped", skipLabel: "ci_config_guard" };
       }
       signal?.throwIfAborted();
-      if (await this.checkpointRemediationHold(flight, barePath, sourceSha, reap)) {
+      if (await this.checkpointRemediationHold(flight, barePath, sourceSha, reap, sourceSha, signal, deadlineAt)) {
         throw new SecretRemediationPendingError();
       }
       let guard: (candidate: string, context?: CheckpointPublicationContext) => Promise<void>;
@@ -18814,12 +18821,12 @@ export class RunRunner {
                 ...(context.defaultBlobSha ? [context.defaultBlobSha] : [])], context.restrictionFacts);
             // The legacy flight-only policy remains for ordinary unenrolled publications.
             if (!flight.remediationRestrictions &&
-                await this.checkpointRemediationHold(flight, barePath, wantedSha, reap, sourceSha))
+                await this.checkpointRemediationHold(flight, barePath, wantedSha, reap, sourceSha, signal, deadlineAt))
               throw new SecretRemediationPendingError();
             signal?.throwIfAborted();
           };
           return start(admission.identity);
-        }, signal);
+        }, signal, deadlineAt);
       const packed = await produce(identity => this.git.checkpointPack(barePath, branch, overlay, pinned, onStep, sourceSha,
         (candidate, context) => guard(candidate, context),
         // issue #2733: chain a raw publish over a prior overlay tip so a lost-ack or confirmed

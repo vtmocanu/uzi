@@ -788,6 +788,64 @@ for (const mode of ["healthy", "revoked", "expired", "existing cap"] as const) {
   });
 }
 
+for (const mode of ["healthy", "unenrolled", "revoked", "expired", "unsafe", "retry expiry", "default live"] as const) {
+  test("shutdown checkpoint admission retains handoff and deadline: " + mode, async t => {
+    const f = await fixture(mode !== "unenrolled");
+    if (mode !== "unenrolled")
+      await git.recordRemediationScan(f.bare, BRANCH, f.source, { trusted: true, tip: f.s, flaggedOIDs: [] });
+    const { cache, runner, subject, flight } = f.fresh();
+    flight.publishedTip = f.base; flight.checkpointFloor = f.base;
+    assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight),
+      { kind: "confirmed", enrolled: mode !== "unenrolled" });
+    let wall = Date.now();
+    t.mock.method(Date, "now", () => wall);
+    const active: any = { steering: flight.steering };
+    subject.activeRuns.set(flight.runId, active);
+    runner.shutdown();
+    const cause = active.gracefulShutdownCheckpoint;
+    subject.checkpointTestHooks = { retryBackoffMs: [0, 0] };
+    if (mode === "revoked") flight.steering.abortLifecycle(new Error("cleanup revoked"));
+    if (mode === "expired") wall = cause.deadlineAt;
+    if (mode === "unsafe") flight.checkpointFloor = f.q;
+    const deadlines: number[] = [];
+    const read = cache.readRemediationRestrictionFacts.bind(cache);
+    t.mock.method(cache, "readRemediationRestrictionFacts", (...args: Parameters<typeof read>) => {
+      const scope = (cache as any).recoveryOperations.getStore();
+      assert.equal(scope.signal.aborted, false);
+      assert.ok(scope.deadline <= cause.deadlineAt, "no admission renews the shutdown deadline");
+      deadlines.push(scope.deadline);
+      return read(...args);
+    });
+    let uploads = 0;
+    t.mock.method(client, "publishCheckpoint", async (_run: string, _tip: string, pack: Parameters<typeof client.publishCheckpoint>[2]) => {
+      for await (const chunk of pack) assert.ok(chunk.length > 0);
+      uploads++;
+      if (uploads === 1) {
+        wall = mode === "retry expiry" ? cause.deadlineAt : wall + 1;
+        return { ok: false as const, httpStatus: 503 };
+      }
+      return { ok: true as const, body: { published: true, ref: "refs/uzi-checkpoints/test" } };
+    });
+    try {
+      const result = await subject.publishCheckpointOutcome(flight, f.bare, BRANCH, undefined,
+        mode === "default live" ? undefined : cause.stopSignal, undefined, undefined, true,
+        mode === "default live" ? undefined : cause.deadlineAt);
+      const healthy = mode === "healthy" || mode === "unenrolled";
+      assert.equal(result.published, healthy);
+      assert.equal(uploads, healthy ? 2 : mode === "retry expiry" ? 1 : 0);
+      if (healthy) {
+        assert.ok(deadlines.length >= 2, "real admission runs before packing and replay");
+        assert.equal(deadlines.at(-1), cause.deadlineAt, "retry retains the original absolute cap");
+      }
+      if (mode === "expired" || mode === "revoked" || mode === "default live")
+        assert.equal(deadlines.length, 0, "no custody query after authority ends");
+    } finally {
+      subject.activeRuns.delete(flight.runId);
+      runner.shutdown();
+    }
+  });
+}
+
 test("negative post-action expiry latches denial and independent private capture retains bytes", async t => {
   const f = await fixture();
   const { cache, runner, subject, flight } = f.fresh();
