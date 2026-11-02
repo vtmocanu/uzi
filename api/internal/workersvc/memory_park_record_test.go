@@ -352,6 +352,8 @@ func TestMemoryParkReceiptRules(t *testing.T) {
 		"two matching sources": {func(m map[string]any) {
 			mapAt(m, "origin")["attemptId"] = nil
 			sourcesOf(m)[1].(map[string]any)["attemptId"] = nil
+			// Both matching sources must pass the epoch check to exercise the exact-one count rule.
+			sourcesOf(m)[0].(map[string]any)["epoch"] = mapAt(m, "origin")["sourceEpoch"]
 		}, typicalRunID, typicalWorkerID},
 		"non-uuid intervention": {func(m map[string]any) { mapAt(m, "settlement", "evidence")["interventionIds"] = []any{"not-a-uuid"} }, typicalRunID, typicalWorkerID},
 		"nonce over 128": {func(m map[string]any) {

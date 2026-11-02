@@ -612,7 +612,7 @@ A few worth knowing:
   Success is an ordinary owner-resumed pause: wall stopped, run slot freed.
   A failed publication instead asks a worker question in `awaiting_input`
   (wall wait banked, slot held), with no provider turn or park retry until
-  an explicit answer and no reset of the shared absolute `QUESTION_TIMEOUT_SECONDS`.
+  an explicit answer and no fresh window for the shared `QUESTION_TIMEOUT_SECONDS` parked-time budget.
   An unattended run needing that decision stops with a trusted refusal.
   See [Dependency waits](./run-pause.md#waiting-on-a-dependency-during-implementation)
   for compatibility, checkpoint and retention limits.
@@ -733,8 +733,8 @@ A few worth knowing:
   override) — without churning the id or
   run history the way delete-and-recreate would; `edit` now accepts
   `--model <alias|id>` to change the run model in place, valid on every
-  target and origin (an empty string clears it back to the Worker-model
-  default), and it preserves the stored `--model` and `--apply-model-to-agents`
+  target and origin (an empty string clears it back to your worker model for
+  the schedule's harness), and it preserves the stored `--model` and `--apply-model-to-agents`
   across a partial edit that does not pass those flags — a plain retime no
   longer wipes the stored model. On a **default-origin** schedule only
   the catalog-editable fields (`--cron`, `--tz`, `--auto-approve`,

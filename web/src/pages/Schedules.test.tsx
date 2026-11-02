@@ -50,7 +50,7 @@ const mockApi = vi.mocked(api);
 
 const EMPTY_CATALOG = { entries: [], enablements: [] };
 
-// One shipped sweep entry. Its catalog cadence (UTC, 02:00 daily, inherit model) is
+// One shipped sweep entry. Its catalog cadence (UTC, 02:00 daily, default model) is
 // deliberately DIFFERENT from what the default-row fixtures below carry, so a row that
 // rendered catalog values instead of its own would fail.
 const CATALOG = {
@@ -947,10 +947,10 @@ describe("Schedules — default rows on the unified list (PRD #1645 D4)", () => 
     expect(within(row).getByText("30 7 * * 1-5")).toBeTruthy();
     expect(within(row).getByText(/Europe\/Bucharest/)).toBeTruthy();
     expect(within(row).getByText("model claude-sonnet-4-5")).toBeTruthy();
-    // The catalog's values (0 2 * * *, UTC, inherit model) appear nowhere on the row.
+    // The catalog's values (0 2 * * *, UTC, default model) appear nowhere on the row.
     expect(within(row).queryByText("0 2 * * *")).toBeNull();
     expect(within(row).queryByText(/UTC/)).toBeNull();
-    expect(within(row).queryByText("inherit model")).toBeNull();
+    expect(within(row).queryByText("default model")).toBeNull();
     // Sealed labels and the max-issues cap are chips from the row too.
     expect(within(row).getByText("label bug")).toBeTruthy();
     expect(within(row).getByText("3 at a time")).toBeTruthy();

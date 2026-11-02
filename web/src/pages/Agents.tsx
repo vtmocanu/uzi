@@ -18,6 +18,7 @@ import {
   SYNCED_BADGE_LABEL,
   SYNCED_BADGE_TONE,
   TEMPLATE_SCOPE_LABEL,
+  templateModelDefaultLabel,
   templateScopeBadgeTone,
 } from "../lib/agentTemplates";
 import { Alert, Badge, Button, Card, ListSkeleton, PageHeader } from "../components/ui";
@@ -282,7 +283,7 @@ function AgentRow({
         <Badge tone={templateScopeBadgeTone(t.scope)}>{TEMPLATE_SCOPE_LABEL[t.scope]}</Badge>
       </td>
       <td className="max-w-md px-4 py-3 text-muted">{t.description}</td>
-      <td className="px-4 py-3 text-muted">{t.model ?? "inherit"}</td>
+      <td className="px-4 py-3 text-muted">{t.model ?? templateModelDefaultLabel(t.name)}</td>
       <td className="max-w-xs truncate px-4 py-3 font-mono text-xs text-muted">{summarizeTools(t)}</td>
       <td className="px-4 py-3 text-center">
         <input

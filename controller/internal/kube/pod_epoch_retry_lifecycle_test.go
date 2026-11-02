@@ -47,49 +47,91 @@ func TestPodEpochRetryClockBudget(t *testing.T) {
 			h.event(watch.Added, epochPod(epochB))
 			now = now.Add(offset)
 			d := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
-			if offset < 90*time.Second {
-				if d == nil {
-					t.Fatal("stopped before boundary")
-				}
-			} else if d != nil || !h.session.attempts[epochB].stopped {
-				t.Fatal("budget renewed while waiting for IDs")
+			if d == nil || h.session.attempts[epochB].stopped {
+				t.Fatal("startup consumed positive delivery budget")
 			}
 		})
 	}
-	t.Run("identity-time-counts", func(t *testing.T) {
-		h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
-		now := time.Now()
-		h.session.now = func() time.Time { return now }
-		delegate := h.session.resolver
-		h.session.resolver = epochResolverFunc(func(ctx context.Context, w PodEpochWorker, p *corev1.Pod, f bool) (PodEpochIdentity, error) {
-			now = now.Add(90 * time.Second)
-			return delegate.ResolvePodEpoch(ctx, w, p, f)
+	for _, positive := range []bool{false, true} {
+		t.Run(fmt.Sprintf("identity-time-counts/positive=%v", positive), func(t *testing.T) {
+			h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
+			if !positive {
+				h = newEpochHarness(t, epochPod(epochA))
+			}
+			now := time.Now()
+			h.session.now = func() time.Time { return now }
+			delegate := h.session.resolver
+			h.session.resolver = epochResolverFunc(func(ctx context.Context, w PodEpochWorker, p *corev1.Pod, f bool) (PodEpochIdentity, error) {
+				now = now.Add(90 * time.Second)
+				return delegate.ResolvePodEpoch(ctx, w, p, f)
+			})
+			if h.event(watch.Added, epochPod(epochB)) != nil || h.session.attempts[epochB].stopped == positive {
+				t.Fatal("incorrect resolver-time budget")
+			}
+			if positive && h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://")) == nil {
+				t.Fatal("positive expired during resolver")
+			}
 		})
-		if h.event(watch.Added, epochPod(epochB)) != nil || !h.session.attempts[epochB].stopped {
-			t.Fatal("identity resolution renewed budget")
-		}
-	})
-	t.Run("duplicate-expiry", func(t *testing.T) {
-		h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
-		now := time.Now()
-		h.session.now = func() time.Time { return now }
-		p := epochPod(epochB)
-		h.event(watch.Added, p)
-		now = now.Add(90 * time.Second)
-		if h.event(watch.Added, p) != nil || !h.session.attempts[epochB].stopped || h.session.records[epochB].pending != nil {
-			t.Fatal("duplicate bypassed expiry")
-		}
-	})
+	}
+	for _, positive := range []bool{false, true} {
+		t.Run(fmt.Sprintf("duplicate-expiry/positive=%v", positive), func(t *testing.T) {
+			h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
+			now := time.Now()
+			h.session.now = func() time.Time { return now }
+			if !positive {
+				h = newEpochHarness(t, epochPod(epochA))
+				h.session.now = func() time.Time { return now }
+			}
+			p := epochPod(epochB)
+			h.event(watch.Added, p)
+			now = now.Add(90 * time.Second)
+			if h.event(watch.Added, p) != nil || h.session.attempts[epochB].stopped == positive {
+				t.Fatal("incorrect duplicate expiry")
+			}
+			if positive && h.event(watch.Modified, epochWithIDs(p, "containerd://")) == nil {
+				t.Fatal("duplicate expired unanchored positive")
+			}
+		})
+	}
 	t.Run("deliver-expiry", func(t *testing.T) {
 		h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 		now := time.Now()
 		h.session.now = func() time.Time { return now }
-		d := h.successor(epochPod(epochB))
+		var logs bytes.Buffer
+		h.session.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+		h.event(watch.Added, epochPod(epochB))
+		now = now.Add(120 * time.Second)
+		d := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
+		epochAssertPendingPositive(t, d)
 		now = now.Add(90 * time.Second)
 		if h.session.Deliver(context.Background(), d) == nil || len(h.patches) != 0 {
 			t.Fatal("expired issued decision submitted")
 		}
+		_ = h.session.Deliver(context.Background(), d)
+		epochAssertBudgetStop(t, &logs)
 	})
+}
+
+func epochAssertPendingPositive(t *testing.T, d *PodEpochDecision) {
+	t.Helper()
+	if d == nil {
+		t.Fatal("delayed IDs did not issue a decision")
+	}
+	e, negative := epochReason(t, d)
+	if e == nil || negative != nil {
+		t.Fatal("delayed IDs did not issue positive evidence")
+	}
+}
+
+func epochAssertBudgetStop(t *testing.T, logs *bytes.Buffer) {
+	t.Helper()
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &record); err != nil {
+		t.Fatalf("expected exactly one stop log: %v: %s", err, logs.String())
+	}
+	if record["msg"] != "pod epoch delivery stopped" || record["reason"] != "time_budget" || record["attempts"] != float64(0) {
+		t.Fatal(record)
+	}
 }
 
 type epochRetryTransport func(*http.Request) (*http.Response, error)
@@ -102,7 +144,10 @@ func TestPodEpochRetryDeadlineAndLastMoment(t *testing.T) {
 			h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 			now := time.Now()
 			h.session.now = func() time.Time { return now }
-			d := h.successor(epochPod(epochB))
+			h.event(watch.Added, epochPod(epochB))
+			now = now.Add(120 * time.Second)
+			d := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
+			epochAssertPendingPositive(t, d)
 			now = now.Add(90*time.Second - remaining)
 			requests := 0
 			client, err := kubernetes.NewForConfig(&rest.Config{Host: "http://example.invalid", Transport: epochRetryTransport(func(r *http.Request) (*http.Response, error) {
@@ -127,19 +172,28 @@ func TestPodEpochRetryDeadlineAndLastMoment(t *testing.T) {
 	t.Run("last-moment", func(t *testing.T) {
 		h := epochReadyHarness(t, epochTerminal(epochPod(epochA)))
 		start := time.Now()
-		h.session.now = func() time.Time { return start }
-		d := h.successor(epochPod(epochB))
+		now := start
+		h.session.now = func() time.Time { return now }
+		var logs bytes.Buffer
+		h.session.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+		h.event(watch.Added, epochPod(epochB))
+		anchor := start.Add(120 * time.Second)
+		now = anchor
+		d := h.event(watch.Modified, epochWithIDs(epochPod(epochB), "containerd://"))
+		epochAssertPendingPositive(t, d)
 		checks := 0
 		h.session.now = func() time.Time {
 			checks++
 			if checks >= 3 {
-				return start.Add(90 * time.Second)
+				return anchor.Add(90 * time.Second)
 			}
-			return start
+			return anchor.Add(90*time.Second - time.Nanosecond)
 		}
 		if h.session.Deliver(context.Background(), d) == nil || len(h.patches) != 0 || h.session.attempts[epochB].attempts != 0 {
 			t.Fatal("last-moment expiry submitted")
 		}
+		_ = h.session.Deliver(context.Background(), d)
+		epochAssertBudgetStop(t, &logs)
 	})
 }
 
@@ -354,8 +408,18 @@ func TestPodEpochRetryLogsAndAccounting(t *testing.T) {
 			if requests != wantRequests || stops+success != 1 || (outcome == "success" && success != 1) {
 				t.Fatalf("unexpected lifecycle records %s", text)
 			}
-			if strings.Contains(text, epochB) || strings.Contains(text, "private request") || strings.Contains(text, "containerd://") {
-				t.Fatal("identifiers or errors leaked")
+			for _, record := range records {
+				if record["worker_id"] != "w" || record["pod"] != "pod-"+epochB || record["elapsed"] == nil || record["elapsed_since_ids"] == nil {
+					t.Fatal("missing delivery context", record)
+				}
+				for _, value := range record {
+					if value == epochB || value == "containerd://worker2" || value == "containerd://seed2" {
+						t.Fatal("identifier leaked", record)
+					}
+				}
+			}
+			if strings.Contains(text, "private request") {
+				t.Fatal("raw error leaked")
 			}
 			_ = h.session.Deliver(context.Background(), d)
 			if outcome != "reset" && outcome != "maintenance-overflow" {
