@@ -124,8 +124,8 @@ Treat it as Renovate-class, plus:
 
 - It tracks `nixpkgs-unstable`, so it can carry MAJOR tool bumps: read the lock delta. This
   is intended (workers should get current, patched tools).
-- The checks that validate it are **`build-agent` (base + jvm)**, which builds the worker
-  image and runs the toolchain guard, and **`lint-repo`**, which installs the lock's
+- The checks that validate it are **`build-agent` (base + jvm, each on amd64 and arm64)**,
+  which builds the worker image and runs the toolchain guard, and **`lint-repo`**, which installs the lock's
   semgrep and runs the SAST gate with it.
 - The workflow opens it with `GITHUB_TOKEN`, so the PR may not trigger its own CI
   (GitHub's recursion guard). Push an empty commit with your own token so both checks run
