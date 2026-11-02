@@ -77,6 +77,22 @@ func TestRunGetCreatedIssuesHuman(t *testing.T) {
 	}
 }
 
+func TestRunGetCreatedIssuesLongURL(t *testing.T) {
+	rawURL := "https://forge.example/hosted/prefix/" + strings.Repeat("nested-group/", 20) + "repo/-/issues/42"
+	run := apitypes.RunDTO{ID: "r1", CreatedIssues: []apitypes.CreatedIssueDTO{
+		{IID: 42, Title: strings.Repeat("界", 210), WebURL: rawURL},
+	}}
+	want := "Created issue #42 " + strings.Repeat("界", 200) + "… " + rawURL
+	got := createdIssuesCells(createdIssuesRunGet(t, run))
+	if len(got) != 1 {
+		t.Fatalf("created issue cell count = %d, want 1", len(got))
+	}
+	if got[0] != want {
+		t.Fatalf("CREATED_ISSUE cell mismatch: got %d runes, want %d; full URL preserved = %t",
+			len([]rune(got[0])), len([]rune(want)), strings.HasSuffix(got[0], rawURL))
+	}
+}
+
 func TestRunGetCreatedIssuesAbsent(t *testing.T) {
 	var oldAPI apitypes.RunDTO
 	if err := json.Unmarshal([]byte(`{"id":"r1","kind":"prompt","status":"completed"}`), &oldAPI); err != nil {

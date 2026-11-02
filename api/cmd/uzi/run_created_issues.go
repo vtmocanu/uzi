@@ -18,9 +18,9 @@ func createdIssueRows(issues []apitypes.CreatedIssueDTO) [][]string {
 		if title := cellText(issue.Title); title != "" {
 			cell += " " + title
 		}
-		// Validate the original URL before cellText can strip unsafe characters.
+		// Preserve the complete validated URL; cellText would truncate it.
 		if safeCreatedIssueURL(issue.WebURL) {
-			cell += " " + cellText(issue.WebURL)
+			cell += " " + issue.WebURL
 		}
 		rows = append(rows, []string{"CREATED_ISSUE", cell})
 	}
