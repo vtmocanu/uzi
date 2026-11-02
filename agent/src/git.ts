@@ -5821,6 +5821,7 @@ export class GitCache {
       if (observed) this.dropTrackingAttempt(opts.attemptToken, barePath, branch);
       let repairedRetained: string[] = [];
       if (!observed) {
+        // issue #3780: finish this flight's own stranded attempt, then promote the CURRENT incoming normally.
         const repaired = await this.repairThenObserveUnderLock(barePath, branch, opts);
         if (repaired) ({ observed, retainedShas: repairedRetained } = repaired);
       }
@@ -6048,6 +6049,8 @@ export class GitCache {
       let repairedRetained: string[] = [];
       if (observed) this.dropTrackingAttempt(opts.attemptToken, barePath, branch);
       else {
+        // issue #3780: same repair entry as fetchAgentBranch; a soft-stopped bridge starts no repair write,
+        // and no repair falls through to the refusal.
         this.checkCheckpointCooperation();
         const repaired = await this.repairThenObserveUnderLock(barePath, branch, opts);
         if (!repaired) return { kind: "not_updated", reason: "ownership_unknown" };
