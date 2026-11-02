@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,9 +22,27 @@ type restoreSetup struct {
 	Full, Node                                                                 bool
 }
 
+// Read the parsed Go flag so both -test.run=value and -test.run value work.
+func restoreSubtestFilter() *regexp.Regexp {
+	run := flag.Lookup("test.run")
+	if run == nil {
+		return nil
+	}
+	parts := strings.SplitN(run.Value.String(), "/", 2)
+	if len(parts) != 2 {
+		return nil
+	}
+	filter, _ := regexp.Compile(strings.SplitN(parts[1], "/", 2)[0])
+	return filter
+}
+
 func restoreFullSelected() bool {
-	for _, arg := range os.Args {
-		if strings.HasPrefix(arg, "-test.run=") && strings.Contains(arg, "FullHistory") {
+	filter := restoreSubtestFilter()
+	if filter == nil {
+		return false
+	}
+	for _, name := range []string{"E5FullHistory", "E5ReleasedFullHistory", "E5BeforePinRefusalFullHistory"} {
+		if filter.MatchString(name) {
 			return true
 		}
 	}
@@ -32,17 +51,8 @@ func restoreFullSelected() bool {
 
 // Respect an explicitly selected restore-only E5 case, which does not need Node.
 func restoreClientSelected() bool {
-	for _, arg := range os.Args {
-		if strings.HasPrefix(arg, "-test.run=") {
-			parts := strings.SplitN(strings.TrimPrefix(arg, "-test.run="), "/", 2)
-			if len(parts) == 2 {
-				pattern := strings.SplitN(parts[1], "/", 2)[0]
-				match, err := regexp.Compile(pattern)
-				return err == nil && (match.MatchString("E5ReleasedFullHistory") || match.MatchString("E5BeforePinRefusalFullHistory"))
-			}
-		}
-	}
-	return true
+	filter := restoreSubtestFilter()
+	return filter == nil || filter.MatchString("E5ReleasedFullHistory") || filter.MatchString("E5BeforePinRefusalFullHistory")
 }
 
 func restoreSetupFor(root, tmp, source string, full bool) restoreSetup {
@@ -236,11 +246,18 @@ func TestRecoveryRestoreRequestedModeValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Selecting a named full-history proof must fail before the ordinary DB skip.
-	for _, name := range []string{"E5ReleasedFullHistory", "E5BeforePinRefusalFullHistory", "E5(Released|BeforePinRefusal)FullHistory"} {
-		t.Run(name, func(t *testing.T) {
+	for _, selection := range []struct{ name, pattern string }{
+		{"E5ReleasedFullHistory", "^E5ReleasedFullHistory$"},
+		{"E5BeforePinRefusalFullHistory", "^E5BeforePinRefusalFullHistory$"},
+		{"combined", "^E5(Released|BeforePinRefusal)FullHistory$"},
+		{"released_prefix", "^E5Released"},
+		{"refusal_prefix", "^E5BeforePinRefusal"},
+		{"original_prefix", "^E5Full"},
+	} {
+		t.Run(selection.name, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			cmd := exec.CommandContext(ctx, executable, "-test.run=^TestRecoveryRestoreWorkflowLiveDB$/^"+name+"$", "-test.count=1") // #nosec G204 -- Own test executable and enumerated literal subtest selectors, never shell input.
+			cmd := exec.CommandContext(ctx, executable, "-test.run=^TestRecoveryRestoreWorkflowLiveDB$/"+selection.pattern, "-test.count=1") // #nosec G204 -- Own test executable and enumerated literal subtest selectors, never shell input.
 			cmd.Dir, cmd.Env = filepath.Join(root, "api", "internal", "handler"), restoreEnv(tmp)
 			out, err := cmd.CombinedOutput()
 			if err == nil || !strings.Contains(string(out), "absent_source:") || strings.Contains(string(out), "--- SKIP") {
