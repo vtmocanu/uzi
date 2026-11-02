@@ -1104,8 +1104,12 @@ async function diagnosticScenario(stage: "plan" | "code", harness: "claude" | "c
  let messageClient: WorkerClient | undefined;
  const server = options.authenticatedMessages ? http.createServer(async (req, res) => {
   try {
-   let raw = "";
-   for await (const chunk of req) raw += chunk;
+   let raw = "", bytes = 0;
+   for await (const chunk of req) {
+    bytes += Buffer.byteLength(chunk);
+    assert.ok(bytes <= 64 * 1024, "diagnostic fixture request exceeds 64 KiB");
+    raw += chunk;
+   }
    const body = JSON.parse(raw);
    assert.equal(req.method, "POST");
    assert.equal(req.url, "/api/worker/runs/check/messages");
