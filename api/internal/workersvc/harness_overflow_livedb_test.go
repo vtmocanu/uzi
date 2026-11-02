@@ -230,8 +230,25 @@ func TestHarnessOverflowCodexDefaultAndHoldsLiveDB(t *testing.T) {
 				if run.Harness != "codex" || run.HarnessDecisionReason.String != "overflow" {
 					t.Fatalf("fresh default: %s/%v", run.Harness, run.HarnessDecisionReason)
 				}
-			} else if run.Harness != "claude" {
-				t.Fatalf("%s admitted destination", scenario)
+			} else if run.Harness != "claude" || run.HarnessDecisionReason.String != "unknown_usage" {
+				t.Fatalf("%s admitted destination or wrong reason: %s/%v", scenario, run.Harness, run.HarnessDecisionReason)
+			}
+			measured := pgtype.Float8{Float64: 90, Valid: true}
+			held := scenario == "cooldown" || scenario == "spread" || scenario == "limit" || scenario == "reserve unknown"
+			switch scenario {
+			case "stale", "unknown", "reserve unknown":
+				measured = pgtype.Float8{}
+			case "limit":
+				measured.Float64 = 0
+			}
+			comparison := pgtype.Float8{}
+			if scenario == "fresh" {
+				comparison = measured
+			}
+			if run.HarnessOtherScore != comparison || run.HarnessOtherMeasured != measured ||
+				!run.HarnessOtherHeld.Valid || run.HarnessOtherHeld.Bool != held {
+				t.Fatalf("%s destination evidence: comparison=%v want=%v measured=%v want=%v held=%v want=%v",
+					scenario, run.HarnessOtherScore, comparison, run.HarnessOtherMeasured, measured, run.HarnessOtherHeld, held)
 			}
 		})
 	}
@@ -399,9 +416,20 @@ func TestHarnessOverflowCodexPreferredDefaultLiveDB(t *testing.T) {
 			} else if run.HarnessDecisionReason.String != "overflow" {
 				t.Fatalf("expected overflow: %v", run.HarnessDecisionReason)
 			}
-			if scenario == "cooldown" && (!run.HarnessPreferredHeld.Bool || run.HarnessPreferredScore.Float64 != 0 ||
-				!run.HarnessPreferredMeasured.Valid || run.HarnessPreferredMeasured.Float64 < 30) {
-				t.Fatal("hold lost measured score")
+			if scenario == "cooldown" || scenario == "limit" || scenario == "reserve unknown" {
+				measured := pgtype.Float8{Float64: 90, Valid: true}
+				switch scenario {
+				case "limit":
+					measured.Float64 = 0
+				case "reserve unknown":
+					measured = pgtype.Float8{}
+				}
+				if !run.HarnessPreferredHeld.Valid || !run.HarnessPreferredHeld.Bool ||
+					run.HarnessPreferredScore != (pgtype.Float8{Float64: 0, Valid: true}) ||
+					run.HarnessPreferredMeasured != measured {
+					t.Fatalf("%s preferred evidence: comparison=%v measured=%v want=%v held=%v",
+						scenario, run.HarnessPreferredScore, run.HarnessPreferredMeasured, measured, run.HarnessPreferredHeld)
+				}
 			}
 		})
 	}
@@ -561,8 +589,16 @@ func TestHarnessOverflowCodexSelectorOutcomesLiveDB(t *testing.T) {
 						run.Harness, run.HarnessDecisionReason, run.HarnessPreferredScore, run.HarnessPreferredMeasured)
 				}
 			default:
-				if run.Harness != "claude" {
-					t.Fatalf("disqualified destination received overflow: %s", run.Harness)
+				measured := pgtype.Float8{}
+				held := scenario == "not_allowed"
+				if held {
+					measured = pgtype.Float8{Float64: 90, Valid: true}
+				}
+				if run.Harness != "claude" || run.HarnessDecisionReason.String != "unknown_usage" ||
+					run.HarnessOtherScore.Valid || run.HarnessOtherMeasured != measured ||
+					!run.HarnessOtherHeld.Valid || run.HarnessOtherHeld.Bool != held {
+					t.Fatalf("disqualified destination: harness=%s reason=%v comparison=%v measured=%v want=%v held=%v",
+						run.Harness, run.HarnessDecisionReason, run.HarnessOtherScore, run.HarnessOtherMeasured, measured, run.HarnessOtherHeld)
 				}
 			}
 		})
