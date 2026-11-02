@@ -155,6 +155,8 @@ for (const cut of ["adopting", "ready-before-progress", "episode-complete"] as c
     assert.deepEqual(saved.remediationRecovery.edges, f.persisted.edges);
     assert.deepEqual(saved.remediationRecovery.flaggedOIDs, f.persisted.flaggedOIDs);
     assert.equal(saved.remediationRecovery.active, undefined);
+    if (cut !== "adopting") assert.ok(saved.remediationRecovery.excludedRoots.includes(f.x),
+      "independent excluded predecessor X persisted");
     assert.equal((runner as any).executionTails.size, 0, "every owned execution tail settled");
 
     // Snapshot ALL persisted config (including journal + attempt ledger), refs and source paths.
@@ -199,9 +201,10 @@ for (const cut of ["adopting", "ready-before-progress", "episode-complete"] as c
       });
       // Even a clean scanner with a floor hiding Q cannot erase persisted negative facts.
       const range = coldCache.resolveCheckpointRange.bind(coldCache);
+      let hiddenFloor = f.q;
       t.mock.method(coldCache, "resolveCheckpointRange", async (...args: Parameters<typeof range>) => {
         const value = await range(...args);
-        return value ? { ...value, excludeSha: f.q } : value;
+        return value ? { ...value, excludeSha: hiddenFloor } : value;
       });
       t.mock.method(coldCache, "secretScanCheckpointRange", async () => ({ trusted: true as const, findings: [] }));
       const ancestry = coldCache.ancestry.bind(coldCache);
@@ -218,6 +221,8 @@ for (const cut of ["adopting", "ready-before-progress", "episode-complete"] as c
         [...new Set([...saved.remediationRecovery.flaggedOIDs,
           ...saved.remediationRecovery.edges.map((edge: { from: string }) => edge.from),
           ...(saved.remediationRecovery.excludedRoots ?? [])])].sort());
+      if (cut !== "adopting") assert.ok(coldFlight.remediationRestrictions.roots.includes(f.x),
+        "independent excluded predecessor X reconstructed");
       uncertain.mock.restore();
       // Exercise launch independently too: persisted attribution selects the source;
       // no predecessor flight, session, restrictions or current attempt is copied.
@@ -229,6 +234,14 @@ for (const cut of ["adopting", "ready-before-progress", "episode-complete"] as c
       };
       await assert.rejects((cold as any).requireLaunchAuthority(selected),
         /remediation continuation published floor conflict/);
+      if (cut !== "adopting") {
+        hiddenFloor = f.x;
+        assert.equal(await coldCache.ancestry(f.bare, f.q, f.x), "divergent",
+          "Q alone cannot reject the X-only floor");
+        await assert.rejects((cold as any).requireLaunchAuthority(selected),
+          /remediation continuation published floor conflict/,
+          "persisted X independently rejects an X-only floor");
+      }
       assert.ok(coldFlight.remediationRestrictions.roots.includes(f.q));
       for (const oid of saved.remediationRecovery.excludedRoots ?? [])
         assert.ok(coldFlight.remediationRestrictions.roots.includes(oid));
