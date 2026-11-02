@@ -487,3 +487,80 @@ test("unenrolled recovery writer order confirms absence without weakening enroll
   await assert.rejects(held());
   assert.deepEqual(snapshot(), changed, "enrolled noncanonical bytes remain held without repair");
 });
+
+function callbackBarrier() {
+  let release!: () => void;
+  const promise = new Promise<void>(resolve => { release = resolve; });
+  return { promise, release };
+}
+
+test("restriction callback retains B from durable readback through consumer completion", async () => {
+  const entered = callbackBarrier(), release = callbackBarrier(), order: string[] = [];
+  const consuming = cache.withRemediationRestrictionFacts(bare, BRANCH, RUN, async facts => {
+    assert.equal(facts.enrolled, false);
+    assert.deepEqual(order, ["config", "directory"]);
+    order.push("consumer");
+    // ancestry is deliberately safe under B.
+    assert.equal(await cache.ancestry(bare, base, base), "ancestor");
+    entered.release();
+    await release.promise;
+    order.push("journal-complete");
+    return "consumed";
+  }, undefined, { sync: async (handle, kind) => { order.push(kind); await handle.sync(); } });
+  await entered.promise;
+  let finished = false;
+  const negative = enroll().then(() => { finished = true; order.push("negative"); });
+  try {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(finished, false, "negative persistence cannot cross the consuming callback");
+    assert.equal(journal().remediationRecovery, undefined);
+  } finally { release.release(); }
+  assert.equal(await consuming, "consumed");
+  await negative;
+  assert.deepEqual(order, ["config", "directory", "consumer", "journal-complete", "negative"]);
+  assert.equal((await held()).enrolled, true);
+});
+
+test("restriction callback snapshots source before B wait and reads newly persisted negatives", async () => {
+  const entered = callbackBarrier(), release = callbackBarrier();
+  const holder = cache.withBareLock(bare, async () => { entered.release(); await release.promise; });
+  await entered.promise;
+  // The negative writer is ahead of the consumer in B's existing queue.
+  const negative = enroll();
+  const selected = source();
+  let observed = false;
+  const consuming = cache.withRemediationRestrictionFacts(bare, BRANCH, RUN, async facts => {
+    observed = true;
+    assert.equal(facts.enrolled, true);
+    assert.deepEqual(facts.flaggedOIDs, [base]);
+    assert.ok(facts.roots.includes(base));
+  }, selected);
+  selected.attemptId = OTHER;
+  release.release();
+  await Promise.all([holder, negative, consuming]);
+  assert.equal(observed, true);
+});
+
+test("restriction callback persistence failure never enters consumer and releases B", async () => {
+  let entered = false;
+  await assert.rejects(cache.withRemediationRestrictionFacts(bare, BRANCH, RUN, async () => {
+    entered = true;
+  }, undefined, { sync: async () => { throw new Error("sync unavailable"); } }), /facts unavailable/);
+  assert.equal(entered, false);
+  assert.equal((await held()).enrolled, false);
+});
+
+test("restriction callback aborted before B acquisition never consumes later", async () => {
+  const entered = callbackBarrier(), release = callbackBarrier();
+  const holder = cache.withBareLock(bare, async () => { entered.release(); await release.promise; });
+  await entered.promise;
+  const controller = new AbortController();
+  let consumed = false;
+  const pending = cache.withRecoveryOperation(controller.signal, Infinity, () =>
+    cache.withRemediationRestrictionFacts(bare, BRANCH, RUN, async () => { consumed = true; }));
+  const rejected = assert.rejects(pending);
+  controller.abort(new Error("owner stopped"));
+  try { await rejected; } finally { release.release(); await holder; }
+  await cache.withBareLock(bare, async () => {});
+  assert.equal(consumed, false);
+});

@@ -15,7 +15,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { RecoveryCoordinator, canonicalJson, type FrozenOperationOptions, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type RecoveryArchiveClient, type RecoveryRecord, type RecoveryCoordinatorOptions } from "../src/recovery.js";
+import { RecoveryCoordinator, canonicalJson, type FrozenOperationOptions, type InventorySourceBoundaryContext, type InventorySourceDiagnostic, type RecoveryArchiveClient, type RecoveryRecord, type RecoveryCoordinatorOptions, type RecoveryBundleProducer } from "../src/recovery.js";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { GitCache, RecoveryBundleTooLargeError, type OwedCandidate, type PositiveOwedCandidateContext } from "../src/git.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
@@ -6434,6 +6434,10 @@ function closureRestrictions(f: Awaited<ReturnType<typeof fixture>>, target: str
         roots: [...state.roots], flaggedOIDs: [...state.flaggedOIDs],
         fingerprint: JSON.stringify([state.enrolled, state.blocked, state.roots, state.flaggedOIDs]) };
     },
+    // Explicit adapter for this in-memory producer fake; production GitCache owns B.
+    withRemediationRestrictionFacts: async (_bare: string, _branch: string, _run: string,
+      consume: (facts: Awaited<ReturnType<GitCache["readRemediationRestrictionFacts"]>>) => Promise<unknown>) =>
+      consume(await (f.git as Pick<RecoveryBundleProducer, "readRemediationRestrictionFacts" | "withRemediationRestrictionFacts">).readRemediationRestrictionFacts!(_bare, _branch, _run)),
     ancestry: async (bare: string, root: string, tip: string) => {
       if (root === H2) {
         assert.equal(tip, target, "negative roots are checked against captured C");
@@ -7631,5 +7635,152 @@ it("#3727 M3 deny site: the no-held-attempt exit (no publishHeld) captures but n
     await f.operate();
     assert.equal((await f.coordinator.inspect(f.context.runId))[0]!.state, "uploaded");
     assert.equal(f.finals.length, 0);
+  } finally { await f.close(); }
+});
+
+function restrictionBarrier() {
+  let release!: () => void;
+  const promise = new Promise<void>(resolve => { release = resolve; });
+  return { promise, release };
+}
+
+async function restrictionWriteFixture(lane: "mint" | "ACK" = "mint") {
+  const setup = await closureFrozen({ features: CLOSURE_ONLY });
+  const { f, record, operate, saved } = setup;
+  if (lane === "ACK") {
+    f.state.finalError = new Error("save request");
+    await operate();
+  } else {
+    await f.coordinator.captureAndUpload({ record, barePath: f.context.barePath, defaultBranch: "main", closureMint: "deny" });
+  }
+  const negative = closureRestrictions(f, record.sourceSha), before = await saved();
+  const write = () => f.coordinator["writeRestrictionCheckedRecord"](before, cur => lane === "ACK"
+    ? { ...cur, finalAcknowledged: true }
+    : { ...cur, finalRequest: { disposition: { kind: "archive", capture_id: cur.serverCaptureId!,
+      source_sha: cur.sourceSha, coverage_digest: cur.coverageDigest! } } });
+  return { ...setup, negative, before, write };
+}
+
+for (const lane of ["mint", "ACK"] as const) {
+  it(`M2 C2 journal wait consumes current negative evidence for ${lane}`, async () => {
+    const { f, record, negative, before, write, saved } = await restrictionWriteFixture(lane);
+    const entered = restrictionBarrier(), release = restrictionBarrier(), queued = restrictionBarrier();
+    const lock = f.coordinator["withJournalLock"].bind(f.coordinator);
+    const holder = lock(record.runId, async () => { entered.release(); await release.promise; });
+    await entered.promise;
+    Object.assign(f.coordinator, { withJournalLock: (...args: Parameters<typeof lock>) => {
+      queued.release(); return lock(...args);
+    } });
+    const pending = write();
+    try {
+      await queued.promise;
+      negative.blocked = true;
+    } finally { release.release(); await holder; }
+    try {
+      await pending;
+      assert.deepEqual(await saved(), before, "unchanged capture bytes cannot excuse newly blocked restrictions");
+    } finally { await f.close(); }
+  });
+}
+
+it("M2 C2 bare wait reads current negative evidence after J acquisition", async () => {
+  const { f, before, negative, write, saved } = await restrictionWriteFixture();
+  const cache = new GitCache(f.root, nullLogger(), undefined, testGitCacheOptions());
+  const entered = restrictionBarrier(), release = restrictionBarrier(), queued = restrictionBarrier();
+  const holder = cache.withBareLock(f.context.barePath, async () => { entered.release(); await release.promise; });
+  await entered.promise;
+  const consume = (f.git as Pick<RecoveryBundleProducer, "readRemediationRestrictionFacts" | "withRemediationRestrictionFacts">).withRemediationRestrictionFacts!;
+  Object.assign(f.git, { withRemediationRestrictionFacts: (...args: Parameters<typeof consume>) => {
+    queued.release(); return cache.withBareLock(f.context.barePath, () => consume(...args));
+  } });
+  const pending = write();
+  try {
+    await queued.promise;
+    negative.blocked = true;
+  } finally { release.release(); await holder; }
+  try {
+    await pending;
+    assert.deepEqual(await saved(), before);
+  } finally { await f.close(); }
+});
+
+it("M2 C2 B excludes negative writers through journal completion and existing J->B cleanup drains", async () => {
+  const { f, write, saved } = await restrictionWriteFixture("ACK");
+  const cache = new GitCache(f.root, nullLogger(), undefined, testGitCacheOptions());
+  const consume = (f.git as Pick<RecoveryBundleProducer, "readRemediationRestrictionFacts" | "withRemediationRestrictionFacts">).withRemediationRestrictionFacts!;
+  Object.assign(f.git, { withRemediationRestrictionFacts: (...args: Parameters<typeof consume>) =>
+    cache.withBareLock(f.context.barePath, () => consume(...args)) });
+  const entered = restrictionBarrier(), release = restrictionBarrier();
+  const persist = f.coordinator["writeRecordUnlocked"].bind(f.coordinator);
+  Object.assign(f.coordinator, { writeRecordUnlocked: async (...args: Parameters<typeof persist>) => {
+    entered.release(); await release.promise; await persist(...args);
+  } });
+  const pending = write();
+  await entered.promise;
+  let negativeWriter = false, cleanup = false;
+  const sibling = cache.withBareLock(f.context.barePath, async () => { negativeWriter = true; });
+  Object.assign(f.git, { cleanupRecoveryGeneration: async () =>
+    cache.withBareLock(f.context.barePath, async () => { cleanup = true; return "retained"; }) });
+  const retirement = f.coordinator["forgetGenerationWithinCycle"](f.context.runId, f.context.generation);
+  try {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(negativeWriter, false);
+    assert.equal(cleanup, false);
+  } finally { release.release(); }
+  try {
+    await Promise.all([pending, sibling, retirement]);
+    assert.ok((await saved()).finalRequest);
+    assert.equal(negativeWriter, true);
+    assert.equal(cleanup, true);
+  } finally { await f.close(); }
+});
+
+for (const stop of ["abort", "deadline"] as const) {
+  it(`M2 C2 ${stop} during bare consumption prevents late journal writes`, async () => {
+    const { f, before, write, saved } = await restrictionWriteFixture();
+    const entered = restrictionBarrier(), release = restrictionBarrier();
+    const consume = (f.git as Pick<RecoveryBundleProducer, "readRemediationRestrictionFacts" | "withRemediationRestrictionFacts">).withRemediationRestrictionFacts!;
+    Object.assign(f.git, { withRemediationRestrictionFacts: async (...args: Parameters<typeof consume>) => {
+      entered.release(); await release.promise; return consume(...args);
+    } });
+    let mono = 0;
+    const budget = new MaintenanceBudget(1000, () => mono), controller = new AbortController();
+    const pending = MaintenanceBudget.runOwned(controller.signal, () => MaintenanceBudget.run(budget, write));
+    const rejected = assert.rejects(pending, stop === "abort" ? /owner stopped/ : /maintenance deadline/);
+    try {
+      await entered.promise;
+      if (stop === "abort") controller.abort(new Error("owner stopped"));
+      else mono = 1000;
+    } finally { release.release(); }
+    try {
+      await rejected;
+      assert.deepEqual(await saved(), before);
+    } finally { budget.dispose(); await f.close(); }
+  });
+}
+
+for (const refusal of ["unknown", "persistence", "missing-callback"] as const) {
+  it(`M2 C2 atomic write holds on ${refusal}`, async () => {
+    const { f, negative, before, write, saved } = await restrictionWriteFixture();
+    try {
+      if (refusal === "unknown") negative.relation = "unknown";
+      if (refusal === "persistence") negative.unavailable = true;
+      if (refusal === "missing-callback") delete (f.git as Pick<RecoveryBundleProducer, "readRemediationRestrictionFacts" | "withRemediationRestrictionFacts">).withRemediationRestrictionFacts;
+      await write();
+      assert.deepEqual(await saved(), before);
+    } finally { await f.close(); }
+  });
+}
+
+it("M2 C2 atomic journal persistence error propagates and releases J and B", async () => {
+  const { f, before, write, saved } = await restrictionWriteFixture();
+  const persist = f.coordinator["writeRecordUnlocked"].bind(f.coordinator);
+  Object.assign(f.coordinator, { writeRecordUnlocked: async () => { throw new Error("journal unavailable"); } });
+  try {
+    await assert.rejects(write(), /journal unavailable/);
+    assert.deepEqual(await saved(), before);
+    Object.assign(f.coordinator, { writeRecordUnlocked: persist });
+    await write();
+    assert.ok((await saved()).finalRequest);
   } finally { await f.close(); }
 });

@@ -7422,11 +7422,27 @@ export class GitCache {
   async readRemediationRestrictionFacts(barePath: string, branch: string, exactRunId: string,
     workerSelectedSource?: { runId: string; clonePath: string; attemptId: string },
     durability: MemoryParkDurability = {}): Promise<RemediationRestrictionFacts> {
+    return this.withRemediationRestrictionFacts(barePath, branch, exactRunId,
+      async facts => facts, workerSelectedSource, durability);
+  }
+
+  /** Consume negative evidence while retaining B through awaited consumer completion.
+   * Consumers may use ancestry (which does not acquire B), but must not acquire J or
+   * call another B-taking query. This query supplies no source-use or publication grant.
+   * The caller's lifecycle and authority scope remain inherited; no work is detached.
+   */
+  async withRemediationRestrictionFacts<T>(barePath: string, branch: string, exactRunId: string,
+    consume: (facts: RemediationRestrictionFacts) => Promise<T>,
+    workerSelectedSource?: { runId: string; clonePath: string; attemptId: string },
+    durability: MemoryParkDurability = {}): Promise<T> {
     // A caller-owned options object cannot redirect the identity while waiting for B.
     const source = workerSelectedSource && { runId: workerSelectedSource.runId,
       clonePath: workerSelectedSource.clonePath, attemptId: workerSelectedSource.attemptId };
-    return this.withLock(barePath, () => this.remediationRestrictionFactsUnderLock(
-      barePath, branch, exactRunId, source, durability));
+    return this.withLock(barePath, async () => {
+      const facts = await this.remediationRestrictionFactsUnderLock(
+        barePath, branch, exactRunId, source, durability);
+      return await consume(facts);
+    });
   }
 
   /** Admission consumes fresh negative evidence under B; false blocked is never a grant. */

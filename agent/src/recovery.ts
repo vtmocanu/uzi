@@ -62,6 +62,8 @@ import type {
 } from "./protocol.js";
 import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, RecoveryCoverageReuseRefused, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidateContext, type HistoricalOwedContext, type OwedCandidate, type RecoveryCoverage, type RecoveryCoverageClaim, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
 
+type RemediationRestrictionFacts = Awaited<ReturnType<GitCache["readRemediationRestrictionFacts"]>>;
+
 /** Ephemeral execution metadata only; never custody or production admission authority. */
 export type ClosedSourceObservation = Readonly<{
   genesis: Readonly<{ runId: string; generation: number; clonePath: string; attemptId: string }>;
@@ -396,6 +398,7 @@ export interface RecoveryBundleProducer {
   committedTrackingOwnership?: GitCache["committedTrackingOwnership"];
   ancestry?: GitCache["ancestry"];
   readRemediationRestrictionFacts?: GitCache["readRemediationRestrictionFacts"];
+  withRemediationRestrictionFacts?: GitCache["withRemediationRestrictionFacts"];
   enumerateOwedCandidates?(barePath: string, runId: string): Promise<OwedCandidate[]>;
   discoverOwedCandidates?(): ReturnType<GitCache["discoverOwedCandidates"]>;
   retainCurrentOwedCandidate?(barePath: string, options: FetchAgentBranchOptions): Promise<TrackingUpdateResult>;
@@ -2372,14 +2375,7 @@ export class RecoveryCoordinator {
       const read = () => ownedRecoveryIO(() => this.git.readRemediationRestrictionFacts!(
         context.barePath, context.branch, current.runId));
       const facts = await read();
-      if (facts.blocked) return false;
-      if (facts.enrolled) {
-        if (!this.git.ancestry || !Array.isArray(facts.roots) || !Array.isArray(facts.flaggedOIDs) ||
-            facts.flaggedOIDs.some(oid => !facts.roots.includes(oid))) return false;
-        for (const root of facts.roots) {
-          if (await ownedRecoveryIO(() => this.git.ancestry!(context.barePath, root, current.sourceSha)) !== "divergent") return false;
-        }
-      }
+      if (!await this.restrictionFactsAllowCapturedC(current, facts)) return false;
       // An ancestry wait must not carry stale durable evidence into release or ACK.
       const after = await read();
       return !after.blocked && after.fingerprint === facts.fingerprint &&
@@ -2387,17 +2383,61 @@ export class RecoveryCoordinator {
     } catch { MaintenanceBudget.current()?.check(); return false; }
   }
 
-  /** Query B before taking the journal lock, then compare the complete authenticated
-   * snapshot under the journal lock. No Git lock or mutable evidence crosses that lock.
+  /** Each excluded root must be divergent from actual captured C. One bounded pass
+   * over the query's root limit; any unavailable relation holds the whole record.
+   */
+  private async restrictionFactsAllowCapturedC(record: RecoveryRecord, facts: RemediationRestrictionFacts): Promise<boolean> {
+    if (facts.blocked) return false;
+    if (!facts.enrolled) return true;
+    if (!record.coverageContext || !this.git.ancestry || !Array.isArray(facts.roots) ||
+        !Array.isArray(facts.flaggedOIDs) || facts.flaggedOIDs.some(oid => !facts.roots.includes(oid))) return false;
+    for (const root of facts.roots) {
+      if (await ownedRecoveryIO(() => this.git.ancestry!(record.coverageContext!.barePath, root, record.sourceSha)) !== "divergent")
+        return false;
+    }
+    return true;
+  }
+
+  /** J -> B, as for custody cleanup: authenticate the complete expected snapshot
+   * before consuming fresh negative evidence, retaining both locks through the write.
+   * No RPC, source-use acquisition, J acquisition or B-taking query runs in the consumer.
    */
   private async writeRestrictionCheckedRecord(
     record: RecoveryRecord,
     mutate: (current: RecoveryRecord) => RecoveryRecord | undefined,
   ): Promise<RecoveryRecord> {
     const snapshot = canonicalJson(record);
-    if (!await this.restrictionsAllowCapturedC(record)) return this.requireRecord(record);
-    return this.writeExistingRecord(record, current =>
-      canonicalJson(current) === snapshot ? mutate(current) : undefined);
+    return this.withJournalLock(record.runId, async () => {
+      const current = await this.requireRecord(record);
+      if (canonicalJson(current) !== snapshot) return current;
+      const context = current.coverageContext;
+      let writing = false;
+      const consume = async (facts?: RemediationRestrictionFacts): Promise<RecoveryRecord> => {
+        if (facts && !await this.restrictionFactsAllowCapturedC(current, facts)) return current;
+        // An ancestry wait may observe lifecycle expiry or an externally changed journal.
+        const latest = await ownedRecoveryIO(() => this.requireRecord(current));
+        if (canonicalJson(latest) !== snapshot || residueQuarantine() !== undefined) return latest;
+        const next = mutate(latest);
+        if (!next) return latest;
+        writing = true;
+        await ownedRecoveryIO(() => this.writeRecordUnlocked(next));
+        return next;
+      };
+      if (!this.git.withRemediationRestrictionFacts) {
+        // Explicit legacy producer fakes have neither seam. A query alone cannot
+        // atomically consume mutable evidence and must never authorize a write.
+        return this.git.readRemediationRestrictionFacts ? current : consume();
+      }
+      if (!context || context.runId !== current.runId || context.generation !== current.generation ||
+          !/^[0-9a-f]{40}$/.test(current.sourceSha)) return current;
+      try {
+        return await ownedRecoveryIO(() => this.git.withRemediationRestrictionFacts!(
+          context.barePath, context.branch, current.runId, consume));
+      } catch (error) {
+        if (writing) throw error;
+        return ownedRecoveryIO(() => this.requireRecord(current));
+      }
+    });
   }
 
   /** Mint requirements 1-4 for a NEW thin archive FINAL (5 and 6 follow the status read). */
