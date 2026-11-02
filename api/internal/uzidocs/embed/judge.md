@@ -241,6 +241,13 @@ Read the resulting assessment with these limits in mind:
   Collisions, pending-entry eviction and exhausted identity history reduce
   certainty. Confirmed outcomes, provisional pairings, incomplete starts and
   unmatched results are distinct observations, not interchangeable failures.
+  Ordinary tool starts use a separate exact-identity cache of up to 256 keys,
+  retained after completion to recognize reuse across ordinary tools and
+  delegations. Remembered ordinary results do not consume delegation pending
+  slots. Once ordinary identity history is lost, new delegation identities
+  remain provisional; already tracked delegations can still settle unless a
+  specific identity collision is observed. Unknown orphan results remain
+  uncertain, with bounded tracking rather than assumed delegation outcomes.
 - **Time and causes:** intervals come from persisted-message timestamps,
   not measured execution time. Historical budgets and causes remain unknown
   when absent. A deadline-shaped interval is a hypothesis, not a confirmed
