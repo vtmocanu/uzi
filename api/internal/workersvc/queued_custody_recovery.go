@@ -2,8 +2,10 @@ package workersvc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -20,7 +22,19 @@ type custodyTransactionRowsReader interface {
 // queuedCustodyAdmission is called before any worker lock. A settings failure or
 // stale cache disables only this recovery classification, never liveness updates.
 // The transaction rows, not a cache refresh, are the admission evidence.
-func (s *Service) queuedCustodyAdmission(ctx context.Context, tx pgx.Tx) (int32, error) {
+func (s *Service) queuedCustodyCachedLimit(ctx context.Context) int32 {
+	if _, ok := s.p.CustodyHoldLimit.(custodyTransactionRowsReader); !ok {
+		return 0
+	}
+	n, err := s.custodyLimit(ctx)
+	if err != nil {
+		slog.Warn("queued recovery: custody setting unavailable", "error", err)
+		return 0
+	}
+	return n
+}
+
+func (s *Service) queuedCustodyAdmission(ctx context.Context, tx pgx.Tx, cached int32) (int32, error) {
 	if err := store.LockSettingsAdmission(ctx, tx); err != nil {
 		return 0, err
 	}
@@ -37,9 +51,8 @@ func (s *Service) queuedCustodyAdmission(ctx context.Context, tx pgx.Tx) (int32,
 		slog.Warn("queued recovery: custody setting unavailable", "error", err)
 		return 0, nil
 	}
-	cached, err := s.custodyLimit(ctx)
-	if err != nil || cached != fresh {
-		slog.Warn("queued recovery: custody setting cache disagrees with transaction", "error", err)
+	if cached <= 0 || fresh > 1000 || cached != fresh {
+		slog.Warn("queued recovery: custody setting cache disagrees with transaction")
 		return 0, nil
 	}
 	return fresh, nil
@@ -60,7 +73,7 @@ func validateQueuedCustodyLocks(ctx context.Context, qtx *store.Queries, locks w
 
 // parkQueuedCustody operates only inside the captured parent set. The hold-lock
 // statement finishes before the fresh owner/own-hold recount in the state writer.
-func (s *Service) parkQueuedCustody(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, nonce pgtype.Text, limit int32, locks workerRecoveryLockSet, requeuedIDs, finalizeRequeuedIDs []uuid.UUID) ([]store.WorkerRecoveryDisposition, error) {
+func (s *Service) parkQueuedCustody(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, nonce pgtype.Text, limit int32, locks workerRecoveryLockSet, requeuedIDs []uuid.UUID) ([]store.WorkerRecoveryDisposition, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
@@ -78,16 +91,19 @@ func (s *Service) parkQueuedCustody(ctx context.Context, qtx *store.Queries, wor
 		return nil, err
 	}
 	holdIDs, err := qtx.LockFrozenQueuedCustodyHolds(ctx, store.LockFrozenQueuedCustodyHoldsParams{
-		WorkerID: pgconv.UUID(workerID), FrozenTargets: frozen, LockedParentIds: parents,
+		FrozenTargets: frozen, LockedParentIds: parents, CustodyHoldLimit: limit,
 	})
 	if err != nil {
 		return nil, err
 	}
-	now := s.now()
+	return s.parkQueuedCustodyWithHolds(ctx, qtx, workerID, nonce, limit, frozen, parents, holdIDs, s.now())
+}
+
+func (s *Service) parkQueuedCustodyWithHolds(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, nonce pgtype.Text, limit int32, frozen []byte, parents, holdIDs []uuid.UUID, now time.Time) ([]store.WorkerRecoveryDisposition, error) {
 	rows, err := qtx.ParkFrozenQueuedCustodyExhausted(ctx, store.ParkFrozenQueuedCustodyExhaustedParams{
 		WorkerID: pgconv.UUID(workerID), ReleasedWorkerNonce: nonce,
 		FrozenTargets: frozen, LockedParentIds: parents, CustodyHoldLimit: limit,
-		LockedHoldIds: holdIDs, FinalizeRequeuedIds: finalizeRequeuedIDs,
+		LockedHoldIds:       holdIDs,
 		MaxRequeues:         int32(s.p.RunMaxRequeues), //nolint:gosec // bounded configuration, as in the active-run recovery paths.
 		HeartbeatCutoff:     pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
 		SnapshotFreshCutoff: pgconv.Time(now.Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval))),
@@ -102,30 +118,84 @@ func (s *Service) parkQueuedCustody(ctx context.Context, qtx *store.Queries, wor
 	return result, nil
 }
 
-// parkStaleQueuedCustody follows the stale requeue pass. All worker locks are
-// acquired before any parent locks. Each finite worker set is visited once;
-// failure rolls back the complete pass, and the sweep reports it to its caller.
-func (s *Service) parkStaleQueuedCustody(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.WorkerRecoveryDisposition, error) {
+// parkStaleQueuedCustody discovers at most 32 targets before each transaction.
+// Each page locks settings, all workers, sorted parents, then globally sorted
+// holds. Errors stop later pages; committed pages publish immediately and count.
+// The local UUID cursor and creation fence bound this sweep's traversal; memory
+// and lock acquisition are bounded per batch, not by a fleet-sized collection.
+func (s *Service) parkStaleQueuedCustody(ctx context.Context, cutoff pgtype.Timestamptz, sweepStarted time.Time) (int64, error) {
 	if s.txBeginner == nil {
-		return nil, nil
+		return 0, nil
 	}
+	q, ok := s.q.(*store.Queries)
+	if !ok {
+		return 0, nil
+	}
+	var count int64
+	var cursor uuid.UUID
+	for {
+		if err := ctx.Err(); err != nil {
+			return count, err
+		}
+		discovered, err := q.DiscoverStaleQueuedCustodyTargets(ctx, store.DiscoverStaleQueuedCustodyTargetsParams{
+			AfterID: cursor, SweepStarted: pgconv.Time(sweepStarted), Cutoff: cutoff,
+			MaxRequeues: int32(s.p.RunMaxRequeues), //nolint:gosec // bounded configuration, as in active-run recovery.
+		})
+		if err != nil {
+			return count, err
+		}
+		if len(discovered) == 0 {
+			return count, nil
+		}
+		cursor = discovered[len(discovered)-1].ID
+		ids := make([]uuid.UUID, 0, len(discovered))
+		workers := make([]uuid.UUID, 0, len(discovered))
+		frozen := make([]json.RawMessage, 0, len(discovered))
+		seen := make(map[uuid.UUID]bool)
+		for _, row := range discovered {
+			ids = append(ids, row.ID)
+			frozen = append(frozen, json.RawMessage(row.FrozenTarget))
+			if !seen[row.WorkerID.Bytes] {
+				workers = append(workers, row.WorkerID.Bytes)
+				seen[row.WorkerID.Bytes] = true
+			}
+		}
+		captured, err := json.Marshal(frozen)
+		if err != nil {
+			return count, err
+		}
+		rows, err := s.parkStaleQueuedCustodyBatch(ctx, cutoff, sweepStarted, ids, workers, captured)
+		if err != nil {
+			return count, err
+		}
+		for _, row := range rows {
+			s.publishSwept(row.ID, row.Status)
+		}
+		count += int64(len(rows))
+	}
+}
+
+func (s *Service) parkStaleQueuedCustodyBatch(ctx context.Context, cutoff pgtype.Timestamptz, sweepStarted time.Time, ids, workerIDs []uuid.UUID, captured []byte) ([]store.WorkerRecoveryDisposition, error) {
+	cachedLimit := s.queuedCustodyCachedLimit(ctx)
 	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	limit, err := s.queuedCustodyAdmission(ctx, tx)
+	limit, err := s.queuedCustodyAdmission(ctx, tx, cachedLimit)
 	if err != nil || limit == 0 {
 		return nil, err
 	}
 	qtx := store.New(tx)
-	workers, err := qtx.LockStaleQueuedCustodyWorkers(ctx, cutoff)
+	workers, err := qtx.LockStaleQueuedCustodyWorkers(ctx, store.LockStaleQueuedCustodyWorkersParams{WorkerIds: workerIDs, Cutoff: cutoff})
 	if err != nil {
 		return nil, err
 	}
-	// Freeze the complete union and acquire every parent in global ID order
-	// before any hold lock, including parents shared by different workers.
-	frozenRows, err := qtx.LockWorkerRecoveryParents(ctx, store.LockWorkerRecoveryParentsParams{AdditionalWorkerIds: workers})
+	lockedWorkerIDs := make([]uuid.UUID, 0, len(workers))
+	for _, worker := range workers {
+		lockedWorkerIDs = append(lockedWorkerIDs, worker.ID)
+	}
+	frozenRows, err := qtx.LockWorkerRecoveryParents(ctx, store.LockWorkerRecoveryParentsParams{BoundedTargetIds: ids, AdditionalWorkerIds: lockedWorkerIDs})
 	if err != nil {
 		return nil, err
 	}
@@ -133,22 +203,23 @@ func (s *Service) parkStaleQueuedCustody(ctx context.Context, cutoff pgtype.Time
 	if err != nil {
 		return nil, err
 	}
+	// Keep discovery evidence, never replace it with the post-wait capture.
+	locks.frozenJSON = string(captured)
 	locks, err = validateQueuedCustodyLocks(ctx, qtx, locks)
 	if err != nil {
 		return nil, err
 	}
-	var result []store.WorkerRecoveryDisposition
-	for _, id := range workers {
-		worker, err := qtx.GetWorkerByID(ctx, id)
+	holdIDs, err := qtx.LockFrozenQueuedCustodyHolds(ctx, store.LockFrozenQueuedCustodyHoldsParams{
+		FrozenTargets: locks.queuedJSON, LockedParentIds: locks.parentIDs, CustodyHoldLimit: limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	result := make([]store.WorkerRecoveryDisposition, 0, len(ids))
+	for _, worker := range workers {
+		rows, err := s.parkQueuedCustodyWithHolds(ctx, qtx, worker.ID, worker.SnapshotRegisterNonce, limit, locks.queuedJSON, locks.parentIDs, holdIDs, sweepStarted)
 		if err != nil {
 			return nil, err
-		}
-		if worker.LastHeartbeatAt.Valid && !worker.LastHeartbeatAt.Time.Before(cutoff.Time) {
-			continue
-		}
-		rows, err := s.parkQueuedCustody(ctx, qtx, id, worker.SnapshotRegisterNonce, limit, locks, nil, nil)
-		if err != nil {
-			return nil, fmt.Errorf("park stale queued custody: %w", err)
 		}
 		result = append(result, rows...)
 	}
@@ -156,4 +227,14 @@ func (s *Service) parkStaleQueuedCustody(ctx context.Context, cutoff pgtype.Time
 		return nil, err
 	}
 	return result, nil
+}
+
+// queuedCustodyCandidates applies the same guards before the bounded queued-only
+// discovery. The mutation still revalidates all evidence under the row locks.
+func (s *Service) queuedCustodyCandidates(limit int32) store.LockWorkerRecoveryParentsParams {
+	return store.LockWorkerRecoveryParentsParams{
+		CustodyHoldLimit:    limit,
+		MaxRequeues:         int32(s.p.RunMaxRequeues), //nolint:gosec // bounded server configuration.
+		SnapshotFreshCutoff: pgconv.Time(s.now().Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval))),
+	}
 }

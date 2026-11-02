@@ -188,7 +188,31 @@ func (q *Queries) HasPendingPlanCrossCheck(ctx context.Context, leadRunID uuid.U
 }
 
 const lockWorkerRecoveryParents = `-- name: LockWorkerRecoveryParents :many
-WITH candidates AS MATERIALIZED (
+WITH queued_continuations AS MATERIALIZED (
+    -- Only the newly added queued population is bounded here. Existing active,
+    -- snapshot and attested discovery retains its conservative parent union.
+    SELECT r.id FROM runs r JOIN workers w ON w.id = r.worker_id AND w.user_id = r.user_id
+    WHERE $1::uuid[] IS NULL AND r.worker_id = $2
+      AND $3::integer > 0
+      AND r.status = 'queued' AND r.claim_generation > 0 AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND r.egress_profile_id IS NULL
+      AND r.requeue_count - r.requeue_episode_baseline >= $4::integer
+      AND r.pause_requested_at IS NULL AND r.credential_switch_requested_at IS NULL
+      AND r.stop_kind IS NULL AND r.stop_reason IS NULL AND r.hold_reason IS NULL
+      AND (SELECT count(*) FROM recovery_custody_holds h
+          WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.state = 'open'
+            AND h.generation BETWEEN 1 AND r.claim_generation) >= $3
+      AND (w.pending_overflow_until IS NULL OR w.pending_overflow_until <= now())
+      AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+          WHERE a.worker_id = r.worker_id AND a.run_id = r.id AND a.claim_generation = r.claim_generation
+            AND r.claim_released_at IS NULL
+            AND (a.reported_at >= $5::timestamptz
+                OR (a.terminal_pending AND a.terminal_pending_until > now())))
+      AND NOT ($4 > 0 AND r.worker_recovery_episode = 0
+          AND r.requeue_count - r.requeue_episode_baseline > $4
+          AND COALESCE(r.finalize_resume_generation = r.claim_generation, false)
+          AND r.claim_released_at IS NULL)
+    ORDER BY r.id LIMIT 32
+), candidates AS MATERIALIZED (
     SELECT r.id, r.kind, r.target_run_id, r.worker_id, r.claim_generation, r.user_id,
            r.status, r.status_since, r.requeue_count, r.claimed_at,
            r.released_worker_id, r.released_worker_nonce, r.stop_kind,
@@ -197,16 +221,28 @@ WITH candidates AS MATERIALIZED (
            r.pause_requested_at, r.credential_switch_requested_at, r.stop_reason, r.hold_reason
     FROM runs r
     JOIN workers w ON w.id = r.worker_id AND w.user_id = r.user_id
-    WHERE (r.worker_id = $1 OR r.worker_id = ANY($2::uuid[]))
+    WHERE $1::uuid[] IS NOT NULL
+      AND r.id = ANY($1::uuid[])
+      AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND r.egress_profile_id IS NULL
+      AND r.worker_id = ANY($6::uuid[])
+    UNION ALL
+    SELECT r.id, r.kind, r.target_run_id, r.worker_id, r.claim_generation, r.user_id,
+           r.status, r.status_since, r.requeue_count, r.claimed_at,
+           r.released_worker_id, r.released_worker_nonce, r.stop_kind,
+           r.pause_mode, r.credential_switch_generation,
+           r.worker_recovery_episode, r.requeue_episode_baseline, r.claim_released_at,
+           r.pause_requested_at, r.credential_switch_requested_at, r.stop_reason, r.hold_reason
+    FROM runs r
+    JOIN workers w ON w.id = r.worker_id AND w.user_id = r.user_id
+    WHERE $1::uuid[] IS NULL
+      AND (r.worker_id = $2 OR r.worker_id = ANY($6::uuid[]))
       AND (
           r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
-          OR (r.status = 'queued' AND r.claim_generation > 0 AND r.kind NOT IN ('chat','cross_check')
-              AND EXISTS (SELECT 1 FROM recovery_custody_holds h
-                  WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.state = 'open'))
-          OR r.id = ANY($3::uuid[])
-          OR (r.id = ANY($4::uuid[])
-              AND r.claim_generation = ($5::bigint[])[
-                  array_position($4::uuid[], r.id)])
+          OR r.id IN (SELECT id FROM queued_continuations)
+          OR r.id = ANY($7::uuid[])
+          OR (r.id = ANY($8::uuid[])
+              AND r.claim_generation = ($9::bigint[])[
+                  array_position($8::uuid[], r.id)])
       )
 ), frozen_targets AS MATERIALIZED (
     SELECT c.id, c.kind, c.target_run_id, c.worker_id, c.claim_generation, c.user_id,
@@ -249,11 +285,15 @@ ORDER BY target.id, target.cross_check_id
 `
 
 type LockWorkerRecoveryParentsParams struct {
-	WorkerID                 pgtype.UUID `json:"worker_id"`
-	AdditionalWorkerIds      []uuid.UUID `json:"additional_worker_ids"`
-	SnapshotRunIds           []uuid.UUID `json:"snapshot_run_ids"`
-	AttestedRunIds           []uuid.UUID `json:"attested_run_ids"`
-	AttestedClaimGenerations []int64     `json:"attested_claim_generations"`
+	BoundedTargetIds         []uuid.UUID        `json:"bounded_target_ids"`
+	WorkerID                 pgtype.UUID        `json:"worker_id"`
+	CustodyHoldLimit         int32              `json:"custody_hold_limit"`
+	MaxRequeues              int32              `json:"max_requeues"`
+	SnapshotFreshCutoff      pgtype.Timestamptz `json:"snapshot_fresh_cutoff"`
+	AdditionalWorkerIds      []uuid.UUID        `json:"additional_worker_ids"`
+	SnapshotRunIds           []uuid.UUID        `json:"snapshot_run_ids"`
+	AttestedRunIds           []uuid.UUID        `json:"attested_run_ids"`
+	AttestedClaimGenerations []int64            `json:"attested_claim_generations"`
 }
 
 type LockWorkerRecoveryParentsRow struct {
@@ -285,12 +325,17 @@ type LockWorkerRecoveryParentsRow struct {
 }
 
 // Internal transaction seam: the caller holds the worker row before this query.
-// Freeze the conservative union before snapshot replacement can clear leases.
+// A non-NULL bounded_target_ids selects exclusively those non-checker targets.
+// Otherwise freeze the conservative union before snapshot replacement clears leases.
 // Phase-specific custody, lease, overflow and budget guards belong to later writes.
 // No checker or cross_checks row is locked here, and no recovery is performed.
 func (q *Queries) LockWorkerRecoveryParents(ctx context.Context, arg LockWorkerRecoveryParentsParams) ([]LockWorkerRecoveryParentsRow, error) {
 	rows, err := q.db.Query(ctx, lockWorkerRecoveryParents,
+		arg.BoundedTargetIds,
 		arg.WorkerID,
+		arg.CustodyHoldLimit,
+		arg.MaxRequeues,
+		arg.SnapshotFreshCutoff,
 		arg.AdditionalWorkerIds,
 		arg.SnapshotRunIds,
 		arg.AttestedRunIds,

@@ -2618,6 +2618,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	// subquery must see a credential_switch_settling hold committed while the GetWorkerForUpdate
 	// below waited on the worker lock. That needs BOTH this isolation level (a fresh statement
 	// snapshot per statement) and the lock being taken by a statement EARLIER than RegisterWorker.
+	cachedCustodyLimit := s.queuedCustodyCachedLimit(ctx)
 	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
 		return store.Worker{}, "", err
@@ -2628,7 +2629,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 			_ = tx.Rollback(ctx)
 		}
 	}()
-	queuedCustodyLimit, err := s.queuedCustodyAdmission(ctx, tx)
+	queuedCustodyLimit, err := s.queuedCustodyAdmission(ctx, tx, cachedCustodyLimit)
 	if err != nil {
 		return store.Worker{}, "", err
 	}
@@ -2663,7 +2664,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	if snapshotValid {
 		pending = s.validatePendingAll(store.Worker(row), snapshot)
 	}
-	locks, err := captureWorkerRecoveryLocks(ctx, qtx, row.ID, entries, attested, pending.ids)
+	locks, err := captureWorkerRecoveryLocksWithQueued(ctx, qtx, row.ID, entries, attested, s.queuedCustodyCandidates(queuedCustodyLimit), pending.ids)
 	if err != nil {
 		return store.Worker{}, "", err
 	}
@@ -2698,7 +2699,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 		return store.Worker{}, "", err
 	}
 	queuedRequeuedIDs := append(append([]uuid.UUID{}, requeued...), finalizeRequeued...)
-	queuedParked, err := s.parkQueuedCustody(ctx, qtx, row.ID, prior.SnapshotRegisterNonce, queuedCustodyLimit, locks, queuedRequeuedIDs, finalizeRequeued)
+	queuedParked, err := s.parkQueuedCustody(ctx, qtx, row.ID, prior.SnapshotRegisterNonce, queuedCustodyLimit, locks, queuedRequeuedIDs)
 	if err != nil {
 		return store.Worker{}, "", err
 	}
@@ -2887,6 +2888,7 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		s.replaceRunDisk(ctx, updated, stats)
 		return updated, nil
 	}
+	cachedCustodyLimit := s.queuedCustodyCachedLimit(ctx)
 	tx, err := s.txBeginner.Begin(ctx)
 	if err != nil {
 		return store.Worker{}, err
@@ -2897,7 +2899,7 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 			_ = tx.Rollback(ctx)
 		}
 	}()
-	queuedCustodyLimit, err := s.queuedCustodyAdmission(ctx, tx)
+	queuedCustodyLimit, err := s.queuedCustodyAdmission(ctx, tx, cachedCustodyLimit)
 	if err != nil {
 		return store.Worker{}, err
 	}
@@ -2934,7 +2936,7 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	if valid {
 		// Include omitted owned leads before any snapshot child or FK write.
 		pending := s.validatePendingAll(updated, snapshot)
-		locks, err = captureWorkerRecoveryLocks(ctx, qtx, updated.ID, entries, validatedFinalizeResume{}, pending.ids)
+		locks, err = captureWorkerRecoveryLocksWithQueued(ctx, qtx, updated.ID, entries, validatedFinalizeResume{}, s.queuedCustodyCandidates(queuedCustodyLimit), pending.ids)
 		if err != nil {
 			return store.Worker{}, err
 		}
@@ -3005,7 +3007,7 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		for _, row := range missingRequeued {
 			requeuedIDs = append(requeuedIDs, row.ID)
 		}
-		queuedParked, err := s.parkQueuedCustody(ctx, qtx, updated.ID, updated.SnapshotRegisterNonce, queuedCustodyLimit, locks, requeuedIDs, nil)
+		queuedParked, err := s.parkQueuedCustody(ctx, qtx, updated.ID, updated.SnapshotRegisterNonce, queuedCustodyLimit, locks, requeuedIDs)
 		if err != nil {
 			return store.Worker{}, err
 		}
