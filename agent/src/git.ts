@@ -6932,7 +6932,10 @@ export class GitCache {
    * The runner clears this journal only after atomically retiring the clone
    * (retireRunnerClone), never before the rename. */
   async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string, attemptId?: string,
-    peeledMarker?: string): Promise<void> {
+    peeledMarker?: string, sourceGeneration?: number): Promise<void> {
+    if (sourceGeneration !== undefined && (!Number.isSafeInteger(sourceGeneration) || sourceGeneration < 1 ||
+        (attemptId !== undefined && (attemptGeneration(attemptId) !== sourceGeneration ||
+          parseAttemptPath(clonePath, path.resolve(this.runnerRoot))?.attemptId !== attemptId)))) throw new Error("invalid source generation");
     if (peeledMarker !== undefined && !SHA40_RE.test(peeledMarker)) throw new Error("invalid peeled marker");
     await this.withLock(barePath, async () => {
       // issue #1783 M2: an attempt-path seed also journals the id its path and marker carry,
@@ -6941,11 +6944,22 @@ export class GitCache {
       const source = recoverySource({ runId, clonePath, ...(attemptId === undefined ? {} : { attemptId }) });
       const pending = await this.readRecoveryCapture(barePath, branch);
       if (pending && !sameRecoverySource(pending, source)) throw new Error("recovery attribution cannot be overwritten");
+      if (sourceGeneration !== undefined && pending?.sourceGeneration !== undefined &&
+          pending.sourceGeneration !== sourceGeneration) throw new Error("source generation cannot be overwritten");
       // issue #3239: the seed's adopt-time `reset --soft` leg peeled this marker out of the clone's
       // history; journal it as lineage for a later coverage wrapper over this attempt's successor marker.
       const peeled = peeledMarker === undefined ? pending?.peeledMarkers : unionPeeledMarkers(pending?.peeledMarkers, [peeledMarker]);
-      const value: RecoveryJournalEntry = { ...pending, ...source, ...(peeled?.length ? { peeledMarkers: peeled } : {}) };
-      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), recoveryJournalJson(value)]);
+      const value: RecoveryJournalEntry = { ...pending, ...source, ...(peeled?.length ? { peeledMarkers: peeled } : {}),
+        ...(sourceGeneration === undefined ? {} : { sourceGeneration }) };
+      const raw = recoveryJournalJson(value);
+      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), raw]);
+      if (sourceGeneration !== undefined) {
+        const config = await fs.open(path.join(barePath, "config"), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+        try { await config.sync(); } finally { await config.close(); }
+        const dir = await fs.open(barePath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+        try { await dir.sync(); } finally { await dir.close(); }
+        if (await this.readRecoveryCaptureRaw(barePath, branch) !== raw) throw new Error("source generation read-back differs");
+      }
     });
   }
 
@@ -7529,6 +7543,9 @@ export class GitCache {
         const shape = this.clonePathShape(source.clonePath, canonical);
         if (!shape || shape.attemptId !== source.attemptId || source.runId !== envelope.runId)
           throw new Error("retained pin path attribution mismatch");
+        const pathEntry = byPath.get(source.clonePath);
+        if (pathEntry && (pathEntry.branch !== envelope.branch || !sameRecoverySource(pathEntry, source)))
+          throw new Error("conflicting retained pin source path");
         if (source.attemptId !== undefined) {
           const entry = last.get(source.attemptId);
           if (!entry || entry.branch !== envelope.branch || !sameRecoverySource(entry, source) ||
@@ -7548,21 +7565,30 @@ export class GitCache {
     // A linked active journal without its immutable predecessor envelope is incomplete.
     for (const [name, raw] of values) {
       if (!name.startsWith("uzi-recovery.") || raw === "") continue;
-      if (decoded.has(raw)) continue;
-      // Legacy malformed records belong to each caller's per-record error handling.
-      // New fields and unknown schema identifiers still require strict validation.
-      let value: unknown;
-      try { value = JSON.parse(raw); }
-      catch {
-        if (/"(?:pinRestore|sourceGeneration)"\s*:/.test(raw)) throw new Error("invalid pin restore active journal");
-        continue;
+      let journal = decoded.get(raw);
+      if (!journal) {
+        // Classify decoded root keys during the lexical pass, before decoding the
+        // object. New forms are charged once and validated from that SAME value.
+        // Legacy errors stay with each caller's existing per-record handling.
+        const legacy = ["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources",
+          "peeledMarkers", "memoryPark", "completionSourceFence"];
+        let charged = false;
+        let value: unknown;
+        try {
+          value = parsePinRestoreJson(raw, GIT_MAX_BUFFER, key => {
+            if (!charged && !legacy.includes(key)) {
+              charged = true;
+              budget.consume(Buffer.byteLength(raw));
+            }
+          });
+        } catch (error) {
+          if (charged) throw error;
+          continue;
+        }
+        if (!charged) continue;
+        journal = recoveryJournalValue(value, raw);
       }
-      if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
-      const legacy = ["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources",
-        "peeledMarkers", "memoryPark", "completionSourceFence"];
-      if (Object.keys(value).every(key => legacy.includes(key))) continue;
-      budget.consume(Buffer.byteLength(raw));
-      const journal = parseRecoveryJournal(raw);
+      // Cached raw bytes do not establish attribution for another config key.
       if (journal.pinRestore && !records.some(r => recoveryCaptureKey(r.envelope.branch) === name &&
           r.envelope.runId === journal.runId && r.activeRaw === raw))
         throw new Error("orphaned pin restore active journal");
@@ -8749,7 +8775,8 @@ export class GitCache {
       if (!await this.recoveryClockCurrent(barePath, branch, { ...journal, retainedSources,
         recovery: { ...recovery, successor, stage: "adopting" } })) throw annotateRetainedSuccessorError(new Error("successor iteration is not current"), "iteration_after");
       if (owner) await this.writeRecoveryOwner(barePath, { ...owner, successor });
-      await this.writeRecovery(barePath, branch, { ...successor, retainedSources,
+      const readyJournal: RecoveryJournalEntry = { ...successor, retainedSources,
+        ...(recovery.claimGeneration === undefined ? {} : { sourceGeneration: recovery.claimGeneration }),
         // issue #3239: the lineage of what this seed peeled: the wrapper's accepted markers, or the tip
         // itself when the tip is the marker the seed's `reset --soft` removed from history.
         ...(wrapped ? (wrapped.peeledMarkers.length ? { peeledMarkers: wrapped.peeledMarkers } : {})
@@ -8757,7 +8784,11 @@ export class GitCache {
         // issue #3404 M2: this fresh object does not spread `journal` and is deliberately NOT given its
         // fence: the successor is a different source (new path and attempt), and a predecessor's fence
         // would make the successor's own installCompletionSourceFence refuse as "a different fence".
-        recovery: { ...recovery, successor, stage: "ready-for-model" } });
+        recovery: { ...recovery, successor, stage: "ready-for-model" } };
+      await this.writeRecovery(barePath, branch, readyJournal);
+      if (recovery.claimGeneration !== undefined) {
+        await this.syncJournalAndReadBack(barePath, branch, recoveryJournalJson(readyJournal), {});
+      }
       if (owner) {
         const ready = await this.readRecoveryCapture(barePath, branch);
         if (!ready || ready.recovery?.stage !== "ready-for-model" ||
@@ -17902,6 +17933,18 @@ try {
     if (config && separator === "\0" && args.includes("--list")) {
       let start = 0;
       let sources = 0;
+      const budget = this.pinRestoreBudgets.getStore() ?? new PinRestoreDecodeBudget();
+      const values = new Map<string, string>();
+      for (const entry of stdout.split("\0")) {
+        const nl = entry.indexOf("\n");
+        if (nl >= 0) values.set(entry.slice(0, nl), entry.slice(nl + 1));
+      }
+      const chargeSources = (journal: RecoveryJournalEntry): void => {
+        // Count raw occurrences before recoverySources deduplicates identities.
+        sources += 1 + (journal.retainedSources?.length ?? 0) +
+          (journal.recovery ? 1 + (journal.recovery.successor ? 1 : 0) : 0);
+        if (sources > limits.maxMetadataRecords) throw new Error("epoch source record limit");
+      };
       for (let i = 0; i <= stdout.length; i++) {
         if (i < stdout.length && stdout[i] !== "\0") continue;
         const item = stdout.slice(start, i);
@@ -17909,13 +17952,48 @@ try {
         const nl = item.indexOf("\n");
         const key = item.slice(0, nl);
         if (!/^(uzi-recovery\.|uzi-retained\.|uzi-attempts\.|uzi-stopped\.)/.test(key)) continue;
-        sources++;
+        const raw = item.slice(nl + 1);
+        let parsed: unknown;
+        let newForm = false;
+        const legacy = ["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources",
+          "peeledMarkers", "memoryPark", "completionSourceFence"];
         try {
-          const parsed = JSON.parse(item.slice(nl + 1));
-          const journal = key.startsWith("uzi-retained.") ? parsed?.journal : parsed;
-          if (Array.isArray(journal?.retainedSources)) sources += journal.retainedSources.length;
-          if (journal?.recovery) sources += 2;
-        } catch { /* The authority parser reports malformed values; never accept them here. */ }
+          parsed = parsePinRestoreJson(raw, GIT_MAX_BUFFER, name => {
+            if (!newForm && key.startsWith("uzi-recovery.") && !legacy.includes(name)) {
+              newForm = true;
+              budget.consume(Buffer.byteLength(raw));
+            }
+          });
+        } catch (error) {
+          if (newForm) throw error;
+          // Legacy malformed values remain the authority parser's responsibility.
+          if (++sources > limits.maxMetadataRecords) throw new Error("epoch source record limit");
+          continue;
+        }
+        if (key.startsWith("uzi-retained.") && parsed && typeof parsed === "object" &&
+            "version" in parsed && parsed.version === 2) {
+          const outer = parsed as Record<string, unknown>;
+          const active = typeof outer.branch === "string" ? values.get(recoveryCaptureKey(outer.branch)) || undefined : undefined;
+          const predecessors = Array.isArray(outer.predecessors) ? outer.predecessors.length : 0;
+          let occurrence = 0;
+          parseRetainedPinSnapshot(raw, active, (text, value) => {
+            const journal = recoveryJournalValue(value, text);
+            // The active config entry is counted in its own iteration below (or above).
+            // Every actual decode, including this validation of active, spends budget.
+            if (occurrence++ < predecessors) chargeSources(journal);
+            return journal;
+          }, budget);
+          continue;
+        }
+        if (newForm) {
+          chargeSources(recoveryJournalValue(parsed, raw));
+          continue;
+        }
+        sources++;
+        const value = parsed as { journal?: RecoveryJournalEntry } & RecoveryJournalEntry | null;
+        const journal = key.startsWith("uzi-retained.") ? value?.journal : value;
+        if (Array.isArray(journal?.retainedSources)) sources += journal.retainedSources.length;
+        if (journal?.recovery) sources += 1 + (journal.recovery.successor ? 1 : 0);
         if (sources > limits.maxMetadataRecords) throw new Error("epoch source record limit");
       }
     }
