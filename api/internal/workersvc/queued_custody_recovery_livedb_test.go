@@ -34,7 +34,7 @@ func queuedCustodyCache(t *testing.T, env codexTestEnv, svc *Service, limit int)
 	})
 	cache := settings.New(env.q, time.Hour)
 	svc.p.CustodyHoldLimit = cache
-	if got, err := cache.CustodyHoldLimit(env.ctx); err != nil || got != int32(limit) {
+	if got, err := cache.CustodyHoldLimit(env.ctx); err != nil || int(got) != limit {
 		t.Fatalf("DB-backed custody limit=%d err=%v, want %d", got, err, limit)
 	}
 }

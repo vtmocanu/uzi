@@ -451,7 +451,7 @@ func taskCheckpointHistoricalRefusal(t *testing.T, f *custodyContinuationFixture
 				params = coordinateClaimParams(f)
 			}
 			if name == "FrozenReadoptRunsFromSnapshot" {
-				locks, err := captureWorkerRecoveryLocks(env.ctx, q, f.workerID, []validatedEntry{{runID: id}}, validatedFinalizeResume{})
+				locks, err := captureWorkerRecoveryLocks(env.ctx, q, f.workerID, []validatedEntry{{runID: id}})
 				if err != nil {
 					t.Fatal(err)
 				}

@@ -264,7 +264,7 @@ func TestQueuedCustodyDiscardRaceLiveDB(t *testing.T) {
 					cancel()
 					_ = tx.Rollback(context.Background())
 					if !joined {
-						<-done
+						_ = <-done
 					}
 				}()
 				go func() {
@@ -468,7 +468,7 @@ func TestQueuedCustodyOwnerControlRaceLiveDB(t *testing.T) {
 		cancel()
 		_ = owner.Rollback(context.Background())
 		if !joined {
-			<-done
+			_ = <-done
 		}
 	}()
 	go func() {
@@ -609,7 +609,7 @@ func TestQueuedCustodySettingsRaceLiveDB(t *testing.T) {
 					cancel()
 					_ = owner.Rollback(context.Background())
 					if !joined {
-						<-done
+						_ = <-done
 					}
 				}()
 				go func() {
@@ -659,7 +659,7 @@ func TestQueuedCustodySettingsRaceLiveDB(t *testing.T) {
 					cancel()
 					_ = tx.Rollback(context.Background())
 					if !joined {
-						<-done
+						_ = <-done
 					}
 				}()
 				go func() {
@@ -952,7 +952,7 @@ it("candidate pre-model retained stop drives real database heartbeat",async t=>{
 	}
 	ctx, cancel := context.WithTimeout(env.ctx, 90*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "node", "--import", "tsx", "--test", "--test-timeout=60000", file)
+	cmd := exec.CommandContext(ctx, "node", "--import", "tsx", "--test", "--test-timeout=60000", file) //nolint:gosec // G204: fixed node command runs only the fixed-content test scene just written in t.TempDir.
 	cmd.Dir = filepath.Join(root, "agent")
 	cmd.Env = append(os.Environ(), "M1_REPO_ROOT="+root, "M1_RUN_ID="+id.String(), "M1_BRIDGE="+server.URL, "M1_REGISTER_NONCE="+hbWorker(t, env, c.workerID).SnapshotRegisterNonce.String)
 	output, err := cmd.CombinedOutput()
@@ -1068,7 +1068,7 @@ func TestQueuedCustodyMembershipRaceLiveDB(t *testing.T) {
 					cancel()
 					_ = tx.Rollback(context.Background())
 					if !joined {
-						<-done
+						_ = <-done
 					}
 				}()
 				go func() {
@@ -1139,7 +1139,7 @@ func TestQueuedCustodyRecoveryWaitsForDiscardLiveDB(t *testing.T) {
 		cancel()
 		_ = owner.Rollback(context.Background())
 		if !joined {
-			<-done
+			_ = <-done
 		}
 	}()
 	pid := tx.Conn().PgConn().PID()
