@@ -136,6 +136,42 @@ test("matched ordinary lead Bash traffic preserves completed Agent evidence", ()
   }, { success: 2, collisions: 0, evictions: 0 });
 });
 
+test("ordinary FIFO churn before and between complete Agent pairs preserves confirmed outcomes", () => {
+  const f = fixture();
+  function ordinaryPairs(prefix: string) {
+    for (let i = 0; i < 300; i++) {
+      const id = prefix + i;
+      f.send("tool_use", { id, name: "Bash", input: { command: "task lint" } });
+      f.end(id, "ordinary lead output");
+    }
+  }
+  ordinaryPairs("before-");
+  const successStart = f.start("successful-agent");
+  const successEnd = f.end("successful-agent", "review passed");
+  ordinaryPairs("between-");
+  const failedStart = f.start("failed-agent");
+  const failedEnd = f.end("failed-agent", "review failed", true);
+  const e = f.reducer.render();
+  bounded(e);
+  assert.equal(e.metrics.ordinaryIdentities, 256);
+  assert.equal(e.metrics.ordinaryIdentityLoss, true);
+  assert.match(e.sections.coverage, /ordinaryIdentities=256 ordinaryIdentityLoss=true/);
+  assert.equal(e.metrics.pending, 0);
+  assert.equal(e.counts.collisions, 0);
+  assert.equal(e.counts.evictions, 0);
+  assert.deepEqual(e.counts.confirmed, { success: 1, failed: 1, interrupted: 0, unknown: 0 },
+    "fully matched ordinary churn must preserve both confirmed Agent outcomes");
+  assert.equal(e.counts.provisional, 0);
+  const rows = e.sections.ledger.split("\n");
+  assert.equal(rows.length, 2);
+  assert.ok(rows.some(row => row.startsWith("start=#" + successStart.seq + " end=#" + successEnd.seq + " ")
+    && row.includes('instance="successful-agent" outcome=success ')),
+  "successful Agent pair must remain available as success in its ledger row");
+  assert.ok(rows.some(row => row.startsWith("start=#" + failedStart.seq + " end=#" + failedEnd.seq + " ")
+    && row.includes('instance="failed-agent" outcome=failed ')),
+  "failed Agent pair must remain available as failed in its ledger row");
+});
+
 test("matched child Bash traffic with lead role preserves pending Agent evidence", () => {
   const f = fixture();
   f.start("X");
@@ -196,7 +232,7 @@ test("ordinary start clears result-only pending entries while Agent still pairs 
   assert.match(e.sections.coverage, /includes ordinary results/);
 });
 
-test("ordinary FIFO loss preserves tracked Agent confidence but makes new identities provisional", () => {
+test("ordinary FIFO loss permits observed exact Agent pairs for evicted keys with limited collision coverage", () => {
   const f = fixture();
   f.start("open");
   for (let i = 0; i < 257; i++) {
@@ -214,9 +250,13 @@ test("ordinary FIFO loss preserves tracked Agent confidence but makes new identi
   assert.equal(f.reducer.render().counts.confirmed.success, 1);
   f.start("ordinary-0"); f.end("ordinary-0");
   const e = f.reducer.render();
-  assert.equal(e.counts.confirmed.success, 1);
-  assert.equal(e.counts.provisional, 1);
-  assert.equal(e.counts.collisions, 0, "the oldest ordinary key was evicted");
+  assert.equal(e.counts.confirmed.success, 2);
+  assert.equal(e.counts.provisional, 0);
+  assert.equal(e.counts.collisions, 0, "reuse of the evicted ordinary key cannot be detected");
+  assert.match(e.sections.ledger, /instance="ordinary-0" outcome=success/);
+  assert.equal(e.metrics.ordinaryIdentityLoss, true);
+  assert.match(e.sections.coverage, /Confirmed means observed exact associations within available collision coverage, not globally unique executions or correctness\./);
+  assert.match(e.sections.coverage, /After ordinary identity loss, ordinary cross-kind reuse detection covers only retained FIFO keys\./);
   bounded(e);
 });
 

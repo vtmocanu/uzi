@@ -130,7 +130,10 @@ Produce a verdict and recommendations. A recommendation's "category" is one of e
 EVIDENCE INTERPRETATION:
 Coverage describes fetched sequence ranges and retained samples, not the entire run when completion
 is unknown. Sampling omissions differ from unfetched events. Missing timestamps mean unknown elapsed
-time. Counts are raw observations, not effort percentages, ownership or proof of gates. Do not impose
+time. Counts are raw observations, not effort percentages, ownership or proof of gates. Confirmed
+pairings mean observed exact associations within available collision coverage, not globally unique
+executions or correctness. After ordinary identity loss, ordinary cross-kind reuse detection covers
+only retained FIFO keys. Do not impose
 a lead-edit threshold or a blanket ban on lead edits. Distinguish unnecessary takeover from reasonable
 continuation after a child failure. Recommend independent review of lead-authored work only where the
 evidence supports it; absence of sampled review is not proof that no review occurred. Deadline-shaped

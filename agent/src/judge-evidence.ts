@@ -266,7 +266,7 @@ export class JudgeEvidenceReducer {
     }
     if (ordinary) {
       // FIFO identities survive ordinary results to detect later cross-kind reuse.
-      // One insertion evicts at most one key; loss affects only new delegation histories.
+      // One insertion evicts at most one key; after loss, only retained keys detect cross-kind reuse.
       if (!this.ordinaryIdentities.has(key)) {
         if (this.ordinaryIdentities.size === 256) {
           this.ordinaryIdentities.delete(this.ordinaryIdentities.values().next().value!);
@@ -280,7 +280,7 @@ export class JudgeEvidenceReducer {
     if (dispatch) {
       if (!h && this.history.size < 256) {
         h = { tainted: this.ordinaryIdentities.has(key),
-          evicted: this.orphanResultEvictions > 0 || this.ordinaryIdentityLoss };
+          evicted: this.orphanResultEvictions > 0 };
         this.history.set(key, h);
       }
       if (old?.ambiguous && h) h.tainted = true;
@@ -436,6 +436,8 @@ export class JudgeEvidenceReducer {
       + " ordinaryIdentities=" + this.ordinaryIdentities.size + " ordinaryIdentityLoss=" + this.ordinaryIdentityLoss
       + " tombstones=" + this.history.size + " historySaturated=" + (this.history.size === 256)
       + " collisions=" + this.collisions + " oversizedKeys=" + this.oversizedKeys + " ignoredSeqs=" + this.duplicates
+      + "\nConfirmed means observed exact associations within available collision coverage, not globally unique executions or correctness."
+      + " After ordinary identity loss, ordinary cross-kind reuse detection covers only retained FIFO keys."
       + "\nLedger rows=" + this.rows.length + " omittedRows=" + counts.omittedRows
       + "\nTail is latest fetched eligible evidence; " + (meta?.complete ? "fetch complete." : "final delivery unknown."), 2000);
     const prose = [...observations].sort(([a], [b]) => a - b).map(([, s]) => s).join("\n");
