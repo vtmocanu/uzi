@@ -1844,6 +1844,8 @@ export class RecoveryCoordinator {
       if (exact.state === "open") return "open";
       if (exact.state !== "released" && exact.state !== "discarded") return "unknown";
       const settlement = exact;
+      // coerceRecord accepts only canonical lowercase IDs; persisting any other form would make the journal unreadable.
+      if (!HELD_PUBLICATION_ID_RE.test(settlement.hold_id) || !HELD_PUBLICATION_ID_RE.test(settlement.repo_id)) return "unknown";
       const binding = current.exactHoldBinding ?? { holdId: settlement.hold_id, repoId: settlement.repo_id };
       await this.writeExistingRecord(current, cur =>
         settlementIdentity(cur) === identity && !cur.holdSettlement &&

@@ -121,6 +121,21 @@ for (const answer of ["unknown", "open", "bound"] as const) {
   });
 }
 
+test("closed observation with non-canonical uppercase IDs stays unknown and keeps the journal readable", async () => {
+  const s = await setup("pinned");
+  const proof = closed(s.f);
+  // Hex letters make the case observable; the fixture's canonical IDs are digits only.
+  s.answer({ ...proof, hold_id: "3105ABCD-0000-4000-8000-0000000000EF", repo_id: "3105ABCD-0000-4000-8000-0000000000FA" });
+  const before = (await s.e.coordinator.inspect(s.f.context.runId))[0]!;
+  assert.equal(await s.e.coordinator.heldOperationState(before), "unknown");
+  const after = (await s.e.coordinator.inspect(s.f.context.runId))[0];
+  assert.ok(after, "journal remains coercible after a non-canonical closed observation");
+  assert.deepEqual(after, before);
+  assert.equal(after.exactHoldBinding, undefined);
+  assert.equal(after.holdSettlement, undefined);
+  assert.equal(s.counts().observations, 1);
+});
+
 for (const failure of ["write", "refused", "identity"] as const) {
   test(`closed observation ${failure} cannot report nondurable settlement`, async () => {
     const s = await setup();
