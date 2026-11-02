@@ -7704,7 +7704,8 @@ export class GitCache {
             throw error;
           }
           if (!value || typeof value !== "object" || Array.isArray(value) ||
-              (value as Record<string, unknown>).version !== 1) throw error;
+              (value as Record<string, unknown>).version !== 1 ||
+              Object.keys(value).some(key => !["version", "branch", "key", "journal"].includes(key))) throw error;
         }
         if (!newForm && value && typeof value === "object" && !Array.isArray(value) &&
             (value as Record<string, unknown>).version === 1 && !applicable) continue;
