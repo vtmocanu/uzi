@@ -27,7 +27,11 @@ case "$4" in
     [ "$5" = --raw ]
     f="$AIV_FIXTURE/index-${4##*@sha256:}.json"
     [ -f "$f" ] || { echo "no such manifest $4" >&2; exit 1; }
-    cat "$f";;
+    cat "$f"
+    # <index>.fail holds how many more raw reads print the manifest and then exit nonzero.
+    if [ -f "$f.fail" ] && [ "$(cat "$f.fail")" -gt 0 ]; then
+      echo "$(( $(cat "$f.fail") - 1 ))" > "$f.fail"; exit 17
+    fi;;
   *)
     [ "$6" = '{{.Manifest.Digest}}' ]
     f="$AIV_FIXTURE/tag-${4##*:}"
@@ -68,6 +72,11 @@ reset; d 9 > "$work/tag-abc1234"; reject 'a tag stuck on its previous index'
 [ "$(wc -l < "$work/sleeps" | tr -d ' ')" = 4 ] || { echo 'FAIL: did not retry with backoff' >&2; exit 1; }
 reset; index 1 2 7; reject 'an index whose arm64 child is not this release'
 reset; printf '{"config":{}}\n' > "$work/index-$(printf '%064d' 1).json"; reject 'a single-arch manifest'
+# An inspection that fails must not pass on output it printed before failing.
+idx1="$work/index-$(printf '%064d' 1).json"
+reset; echo 99 > "$idx1.fail"; reject 'an inspector that prints the expected index, then exits nonzero'
+reset; printf '{bad\n' >> "$idx1"; reject 'the expected index followed by malformed trailing JSON'
+reset; echo 1 > "$idx1.fail"; accept 'a failed inspection, then a successful one'
 reset; if "$script" "$repo" 0.86.0 abc1234 bogus "$(d 3)" > /dev/null 2>&1; then echo 'FAIL: accepted a bad digest' >&2; exit 1; fi
 cases=$((cases + 1)); echo 'PASS: rejects a malformed digest argument'
 echo "cases=$cases passed=$cases"

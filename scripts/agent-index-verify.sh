@@ -27,11 +27,12 @@ children() {
 
 index=""
 for t in "$version" "$short_sha"; do
-  got="" ok=0
+  got="" have="" ok=0
   for i in 1 2 3 4 5; do
     if got="$("$docker_bin" buildx imagetools inspect "${repo}:${t}" --format '{{.Manifest.Digest}}' 2>/dev/null)" \
        && [[ "$got" =~ ^sha256:[0-9a-f]{64}$ ]] \
-       && [ "$(children "${repo}@${got}" 2>/dev/null)" = "$want" ]; then
+       && have="$(children "${repo}@${got}" 2>/dev/null)" \
+       && [ "$have" = "$want" ]; then
       ok=1; break
     fi
     [ "$i" -eq 5 ] || "$sleep_bin" "$((i * 2))"
