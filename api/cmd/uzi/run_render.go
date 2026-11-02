@@ -133,6 +133,7 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 		// milestone/NOW region retains its byte-for-byte baseline.
 		rows = append(rows, []string{"HARNESS_PICK", "at creation: " + line})
 	}
+	rows = append(rows, createdIssueRows(r.CreatedIssues)...)
 	rows = append(rows, leadConfigRows(r)...)
 	if len(r.AutoApproveBlockedReasons) > 0 {
 		rows = append(rows, []string{"AUTO_APPROVE_BLOCKED", strings.Join(r.AutoApproveBlockedReasons, ", ")})

@@ -81,6 +81,7 @@ import { HeldPublicationPanel } from "../components/HeldPublicationPanel";
 import { SalvagePanel } from "../components/SalvagePanel";
 import { RunIssueRef } from "../components/RunIssueRef";
 import { RunHarnessDecision } from "../components/RunHarnessDecision";
+import { RunCreatedIssues } from "../components/RunCreatedIssues";
 import { RunCredential } from "../components/RunCredential";
 import { HarnessBadge } from "../components/HarnessBadge";
 import {
@@ -2677,6 +2678,7 @@ export function RunView() {
               <span className="text-muted">Run</span>
             </nav>
             <RunHeading run={run} />
+            <RunCreatedIssues issues={run.created_issues} />
             <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
               {/* A stopped run (cancel or stop-shaped failure) reads as a neutral
                   "stopped" pill — StatusPill's default tone — so it stays calm and
