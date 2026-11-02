@@ -56,8 +56,8 @@ Producer records (#3031) are not on main as a freeze path, but their identity cl
 
 ## Goal and acceptance (from #2506, qualified)
 
-- [ ] A thin guarded capture on a large-history repository reaches released custody without owner action, with prerequisite-lifetime evidence and native-Git restore **demonstrated by tests** (P1 replaces the issue's per-release restore verification with the trust contract plus tests; see "Trust contract"). If preservation cannot be shown, custody is retained with a specific typed refusal.
-- [ ] After a force-push that prunes the cached prerequisites, a released archive still imports into a clean clone plus a fetch of its pin ref, or release was refused. **Qualified:** this holds against default-branch rewrites and uzi's own writers; deletion of `refs/uzi-prereq/*` or rewriting of that history by a party outside uzi **after** a closure release is an accepted preservation residual (user decision 2026-10-25), following ADR-1296's existing "Later user deletion or rewriting is outside the proof" (`adr/1296-durable-run-recovery.md`, ~589-590).
+- [x] A thin guarded capture on a large-history repository reaches released custody without owner action, with prerequisite-lifetime evidence and native-Git restore **demonstrated by tests** (P1 replaces the issue's per-release restore verification with the trust contract plus tests; see "Trust contract"). If preservation cannot be shown, custody is retained with a specific typed refusal. Demonstrated by #3803 (see "#3803 landing" below).
+- [x] After a force-push that prunes the cached prerequisites, a released archive still imports into a clean clone plus a fetch of its pin ref, or release was refused. **Qualified:** this holds against default-branch rewrites and uzi's own writers; deletion of `refs/uzi-prereq/*` or rewriting of that history by a party outside uzi **after** a closure release is an accepted preservation residual (user decision 2026-10-25), following ADR-1296's existing "Later user deletion or rewriting is outside the proof" (`adr/1296-durable-run-recovery.md`, ~589-590). Demonstrated by #3803 (see "#3803 landing" below).
 - [x] No runner-clone or agent-writable ref is used as a prerequisite or as release evidence.
 - [x] Records produced by each real freeze path have a stated and tested outcome; no record gains held-publication authority; no binding or policy is reconstructed; the v2 refusal is unchanged; producer-origin records never mint a closure FINAL.
 
@@ -620,6 +620,7 @@ they do not assert that hosted checks were available at that earlier time.
 - [x] C1b final exact-head hosted acceptance: required API/repo checks and the full store-it sweep passed, all 62 required names PASS with zero SKIP; advisory timing recorded below. This is not a post-deployment runtime result.
 - [x] C2 thin FINAL release, feature/worker advertisement, permission/replay/reconciliation and real freeze-path authority acceptance. Landed in [#3748](https://github.com/vtmocanu/uzi/pull/3748), merge `a07f813708ced206cd7b8c3f9d09e259b2fff64b`; final head `b6672fc5c50d7f3799936829e9ed286d3999f8ec`, [CI run 41316452742](https://github.com/vtmocanu/uzi/actions/runs/41316452742). The landing record below supersedes the historical worker-handoff gaps, not the open combined parent goals.
 - [x] C3 owner/web/CLI pin visibility and E5 restore-time acceptance. Landed in [#3778](https://github.com/vtmocanu/uzi/pull/3778), merge `11b072e83c123ae209485901d1c2298ee461a253`; final head `d26ff555a78b12e77157cdde75c2e45a691ea4e3`, [CI run 41422943989](https://github.com/vtmocanu/uzi/actions/runs/41422943989). E5 remains the explicitly scoped local full-history owner workflow recorded below, not a hosted release measurement.
+- [x] #3803 combined large-history proof (released capture through pin, FINAL, native prune and owner restore; refusal before preparation). Landed in [#3821](https://github.com/vtmocanu/uzi/pull/3821), merge `861068032794551922a2ec5587ec1ca81a1f2b1c`; final head `347dcd36560b3c7af12bf089e856e57c3b22b32b`, [CI run 41502176074](https://github.com/vtmocanu/uzi/actions/runs/41502176074). See "#3803 landing" below.
 - [ ] E6 two weeks of hosted post-roll counts and growth, including unresolved/exhausted pins and removal blockers (reporting only, not a closure gate).
 - [ ] Parent release/acceptance: all child acceptance and remaining end-to-end/rollout criteria below.
 
@@ -1279,7 +1280,7 @@ baseline `6d6e86bb2f9e275772bc3241fddb0c2a51a9cfd5`.
 Reviewer and tester reviewed source tests on the original and repair ranges.
 The primary tree was clean. M2's mandatory aggregate gate remains unmet;
 neither M2 nor M3 is completed. No formal owner completion decision is recorded.
-The parent remains active/open and goals 1/2 remain unchecked.
+At the time of this record the parent was active/open and goals 1/2 were unchecked; see "#3803 landing" below for the landing verification that ticked them.
 This evidence changes no production behavior, workflow or cap.
 
 **Execution identity.** Native linux/amd64: Go 1.27.3, Git 2.54.0,
@@ -1399,6 +1400,28 @@ External post-release pin deletion remains an accepted, non-restorable residual.
 E6 hosted reporting, rollout, #2969 and producer work remain out of scope.
 This sanitized summary is the durable evidence; raw logs are not tracked and
 scratch files are not durable artifact links. M2 is not waived; M3 remains partial.
+
+#### #3803 landing (2026-11-02)
+
+The owner partial decision kept M1 and deferred M2/M3 only for the aggregate
+sweep (both sweeps timed out in the worker; the cause is not established), and
+required this landing verification before ticking goals 1 and 2. PR #3821 does
+not close #3803.
+
+- The exact-head full store-it sweep passed at `347dcd36`, CI run 41502176074:
+  all seven packages `ok`, zero `--- SKIP`/`--- FAIL` at any indentation, and the
+  named retained controls listed above PASS. The opt-in proof leg also ran
+  `TestPrerequisiteClosureReleaseE2E` and
+  `TestRecoveryRestoreWorkerClientSmallE2E` (added to the store-it selector at
+  landing; it previously ran in no lane) to PASS. The full agent suite passed on
+  that head.
+- The full-history proofs and both omission controls recorded above executed at
+  candidate `f584e2cb`. The proof test files and fixture are byte-identical
+  between `f584e2cb` and merge `86106803` (`git diff` empty), so the recorded
+  results apply to the landed code. They are worker-executed, not CI-reproduced:
+  CI has no frozen full-history source.
+- Goals 1 and 2 are ticked on that basis. E6, parent release/acceptance and the
+  accepted external pin-deletion residual are unchanged; #2506 stays open.
 
 ### Parent acceptance
 
