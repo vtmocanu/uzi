@@ -1,3 +1,4 @@
+import { countPartialCause, mergePartialCauses, type PartialCause, type PartialCauses } from "./pod-epoch-partial-causes.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { isCheckpointBoundaryFailure, CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, GitBoundaryAbortError } from "./checkpoint-stop.js";
 import { MaintenanceResources } from "./recovery-maintenance.js";
@@ -2078,6 +2079,7 @@ export interface EpochRetainedDiscoveryOptions {
 }
 
 export interface EpochRetainedDiscoveryResult {
+  partialCauses?: PartialCauses;
   groups: Array<{ barePath: string; selector: RetainedSourceSelector; paths: string[] }>;
   inventoryComplete: boolean;
   /** Unique physical paths observed, including omitted groups; a lower bound if incomplete. */
@@ -2115,6 +2117,7 @@ export interface RetainedInspectOptions {
 }
 
 export interface RetainedInspectResult {
+  partialCauses?: PartialCauses;
   sources: RetainedSourceEvidence[];
   /** True when enumeration or measurement hit the budget or the descriptor cap. */
   partial: boolean;
@@ -2701,6 +2704,39 @@ export class GitCache {
     closureCache: { identities: Map<string, Map<string, ClosureObject>>; entries: number };
   }>();
 
+  // Each public invocation owns its sidecars, including concurrent calls on this cache.
+  private readonly retainedCauseScope = new AsyncLocalStorage<{
+    prefix: "census" | "inspection"; errors: WeakMap<object, PartialCauses>; counted: Set<unknown>;
+  }>();
+
+  private retainedCause<T>(error: T, suffix: "entry_cap" | "bare_cap" | "metadata_byte_cap" | "metadata_record_cap" | "source_record_cap"): T {
+    const scope = this.retainedCauseScope.getStore();
+    if (scope && error !== null && (typeof error === "object" || typeof error === "function")) {
+      const causes = scope.errors.get(error) ?? {};
+      countPartialCause(causes, `${scope.prefix}_${suffix}`);
+      scope.errors.set(error, causes);
+    }
+    return error;
+  }
+
+  private transferRetainedCause<T extends object>(from: unknown, to: T): T {
+    const scope = this.retainedCauseScope.getStore();
+    if (scope && from !== null && (typeof from === "object" || typeof from === "function")) {
+      const causes = scope.errors.get(from);
+      if (causes) scope.errors.set(to, causes);
+    }
+    return to;
+  }
+
+  private collectRetainedCause(error: unknown, target: PartialCauses, fallback: PartialCause): void {
+    const scope = this.retainedCauseScope.getStore();
+    if (scope?.counted.has(error)) return;
+    scope?.counted.add(error);
+    const detail = error !== null && (typeof error === "object" || typeof error === "function") ? scope?.errors.get(error) : undefined;
+    if (detail) mergePartialCauses(target, detail);
+    else countPartialCause(target, fallback);
+  }
+
   private readonly epochRetained = new AsyncLocalStorage<Required<EpochRetainedLimits>>();
 
   private epochLimits(limits: EpochRetainedLimits = {}): Required<EpochRetainedLimits> {
@@ -2743,7 +2779,7 @@ export class GitCache {
       for (;;) {
         const entry = await this.retainedIO(() => handle.read());
         if (!entry) return names;
-        if (names.length >= limits.maxDirectoryEntries) throw new Error("epoch directory entry limit");
+        if (names.length >= limits.maxDirectoryEntries) throw this.retainedCause(new Error("epoch directory entry limit"), "entry_cap");
         names.push(entry.name);
       }
     } finally { await handle.close(); }
@@ -2753,16 +2789,24 @@ export class GitCache {
    * One streaming pass, no retries: a failed bare or exhausted cap stops sibling discovery and
    * makes every reported count a lower bound. All started filesystem work is awaited. */
   async discoverEpochRetainedSources(opts: EpochRetainedDiscoveryOptions = {}): Promise<EpochRetainedDiscoveryResult> {
+    return this.retainedCauseScope.run({ prefix: "census", errors: new WeakMap(), counted: new Set() },
+      () => this.discoverEpochRetainedSourcesScoped(opts));
+  }
+
+  private async discoverEpochRetainedSourcesScoped(opts: EpochRetainedDiscoveryOptions): Promise<EpochRetainedDiscoveryResult> {
     const limits = this.epochLimits(opts.limits);
     const maximum = this.retainedCap(opts.maxPhysicalPaths, 200);
     const result: EpochRetainedDiscoveryResult = {
-      groups: [], inventoryComplete: true, physicalPaths: 0, overflow: 0, overflowExact: false, unreadable: 0,
+      partialCauses: {}, groups: [], inventoryComplete: true, physicalPaths: 0, overflow: 0, overflowExact: false, unreadable: 0,
     };
+    const causes = result.partialCauses!;
+    let operationDeadline = Infinity;
+    const failure = (error: unknown) => this.collectRetainedCause(error, causes, opts.signal?.aborted ? "census_interrupted" : Date.now() >= operationDeadline ? "census_deadline" : "census_unreadable");
     const seen = new Set<string>();
     const selectedPaths = new Set<string>();
     try {
       await this.epochRetained.run(limits, () => this.withRecoveryOperation(
-        opts.signal ?? new AbortController().signal, opts.deadline ?? Date.now() + RETAINED_INSPECT_BUDGET_MS,
+        opts.signal ?? new AbortController().signal, operationDeadline = opts.deadline ?? Date.now() + RETAINED_INSPECT_BUDGET_MS,
         async () => {
           this.checkRecoveryInterruption();
           let handle: Awaited<ReturnType<typeof fs.opendir>>;
@@ -2779,9 +2823,9 @@ export class GitCache {
             for (;;) {
               const ent = await this.retainedIO(() => handle.read());
               if (!ent) break;
-              if (++entries > limits.maxDirectoryEntries) { result.inventoryComplete = false; break; }
+              if (++entries > limits.maxDirectoryEntries) { countPartialCause(causes, "census_entry_cap"); result.inventoryComplete = false; break; }
               if (!ent.name.endsWith(".git") || !ent.isDirectory() || ent.isSymbolicLink()) continue;
-              if (++bares > limits.maxBares) { result.inventoryComplete = false; break; }
+              if (++bares > limits.maxBares) { countPartialCause(causes, "census_bare_cap"); result.inventoryComplete = false; break; }
               const bare = path.join(this.reposRoot, ent.name);
               try {
                 await this.withLock(bare, async () => {
@@ -2791,6 +2835,7 @@ export class GitCache {
                     const paths = [...new Set(rec.parts.map(p => p.clonePath))];
                     const fresh = paths.filter(p => !seen.has(p));
                     if (seen.size + fresh.length > limits.maxSeenPaths) {
+                      countPartialCause(causes, "census_seen_path_cap");
                       result.inventoryComplete = false;
                       return;
                     }
@@ -2799,7 +2844,7 @@ export class GitCache {
                     const unselected = paths.filter(p => !selectedPaths.has(p));
                     if (!unselected.length) continue;
                     // Keep whole groups; shared paths are charged once globally.
-                    if (selectedPaths.size + unselected.length > maximum) continue;
+                    if (selectedPaths.size + unselected.length > maximum) { countPartialCause(causes, "census_physical_path_cap"); continue; }
                     const head = rec.parts[0]!;
                     result.groups.push({ barePath: bare,
                       selector: { runId: rec.runId, generation: head.generation ?? "none", attempt: head.attemptId ?? "canonical" },
@@ -2807,8 +2852,9 @@ export class GitCache {
                     for (const p of unselected) selectedPaths.add(p);
                   }
                 });
-              } catch {
+              } catch (error) {
                 this.checkRecoveryInterruption();
+                failure(error);
                 result.unreadable++;
                 result.inventoryComplete = false;
               }
@@ -2817,6 +2863,7 @@ export class GitCache {
           } finally { await handle.close(); }
         }));
     } catch (error) {
+      failure(error);
       result.inventoryComplete = false;
       if (!opts.signal?.aborted && (error as NodeJS.ErrnoException).code !== "ENOENT") result.unreadable++;
     }
@@ -9277,7 +9324,7 @@ export class GitCache {
         return undefined;
       });
       if (st?.isDirectory() && !st.isSymbolicLink()) {
-        if (out.length >= (this.epochRetained.getStore()?.maxBares ?? Infinity)) throw new Error("epoch bare limit");
+        if (out.length >= (this.epochRetained.getStore()?.maxBares ?? Infinity)) throw this.retainedCause(new Error("epoch bare limit"), "bare_cap");
         out.push(p);
       }
     }
@@ -9344,9 +9391,9 @@ export class GitCache {
     let descriptors: Array<{ branch: string; key: string; journal: RecoveryJournalEntry }> = [];
     try {
       descriptors = await this.protectedRecoveries(barePath);
-    } catch {
+    } catch (error) {
       this.checkRecoveryInterruption();
-      if (this.epochRetained.getStore()) throw new Error("unreadable epoch protected descriptors");
+      if (this.epochRetained.getStore()) throw this.transferRetainedCause(error, new Error("unreadable epoch protected descriptors"));
       bareProblems.push("protected_descriptors_unreadable");
     }
     const markers = await this.readStoppedMarkers(barePath, list);
@@ -9764,15 +9811,19 @@ export class GitCache {
    *  or the directory depth (the tree is runner-written and hostile), and then reports
    *  `complete: false`, never a total of zero and never a total claimed complete. */
   private async measureAllocated(
-    root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {},
+    root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {}, causes: PartialCauses = {},
   ): Promise<{ bytes: number; complete: boolean }> {
+    const filesystem = async <T>(action: () => Promise<T>): Promise<T> => {
+      try { return await action(); }
+      catch (error) { countPartialCause(causes, "measurement_filesystem_error"); throw error; }
+    };
     const maxEntries = caps.maxEntries ?? RETAINED_MEASURE_MAX_ENTRIES;
     const maxPending = caps.maxPending ?? RETAINED_MEASURE_MAX_PENDING;
     const maxDepth = caps.maxDepth ?? RETAINED_MEASURE_MAX_DEPTH;
     let bytes = 0;
     let visited = 0;
     try {
-      bytes += (await this.retainedIO(() => fs.lstat(root))).blocks * 512;
+      bytes += (await this.retainedIO(() => filesystem(() => fs.lstat(root)))).blocks * 512;
     } catch {
       this.checkRecoveryInterruption();
       return { bytes: 0, complete: false };
@@ -9783,7 +9834,7 @@ export class GitCache {
       let handle;
       try {
         this.checkRecoveryInterruption();
-        handle = await fs.opendir(dir);
+        handle = await filesystem(() => fs.opendir(dir));
       } catch {
         this.checkRecoveryInterruption();
         return { bytes, complete: false };
@@ -9791,14 +9842,22 @@ export class GitCache {
       try {
         this.checkRecoveryInterruption();
         for (;;) {
-          if (now() >= deadline) return { bytes, complete: false };
-          const ent = await this.retainedIO(() => handle.read());
+          if (now() >= deadline) { countPartialCause(causes, "measurement_deadline"); return { bytes, complete: false }; }
+          const ent = await this.retainedIO(() => filesystem(() => handle.read()));
           if (!ent) break;
-          if (++visited > maxEntries) return { bytes, complete: false };
+          if (++visited > maxEntries) { countPartialCause(causes, "measurement_entry_cap"); return { bytes, complete: false }; }
           const p = path.join(dir, ent.name);
           let st: Stats;
           try {
-            st = await this.retainedIO(() => fs.lstat(p));
+            st = await this.retainedIO(async () => {
+              try { return await fs.lstat(p); }
+              catch (error) {
+                let missing = false;
+                try { missing = (error as NodeJS.ErrnoException)?.code === "ENOENT"; } catch { /* Keep the original error. */ }
+                if (!missing) countPartialCause(causes, "measurement_filesystem_error");
+                throw error;
+              }
+            });
           } catch (err) {
             this.checkRecoveryInterruption();
             if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
@@ -9806,12 +9865,15 @@ export class GitCache {
           }
           bytes += st.blocks * 512;
           if (st.isDirectory() && !st.isSymbolicLink()) {
-            if (depth + 1 > maxDepth || stack.length >= maxPending) return { bytes, complete: false };
+            if (depth + 1 > maxDepth || stack.length >= maxPending) {
+              countPartialCause(causes, depth + 1 > maxDepth ? "measurement_depth_cap" : "measurement_pending_cap");
+              return { bytes, complete: false };
+            }
             stack.push({ dir: p, depth: depth + 1 });
           }
         }
       } finally {
-        await handle.close();
+        await filesystem(() => handle.close());
       }
     }
     return { bytes, complete: true };
@@ -9826,24 +9888,33 @@ export class GitCache {
    */
   async inspectRetainedSources(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
     const run = () => this.inspectRetainedSourcesScoped(opts);
-    return opts.epoch ? this.epochRetained.run(this.epochLimits(opts.epochLimits), run) : run();
+    return this.retainedCauseScope.run({ prefix: "inspection", errors: new WeakMap(), counted: new Set() },
+      () => opts.epoch ? this.epochRetained.run(this.epochLimits(opts.epochLimits), run) : run());
   }
 
   private async inspectRetainedSourcesScoped(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
     const maxDescriptors = opts.epoch ? this.retainedCap(opts.maxDescriptors, 200) : RETAINED_MAX_DESCRIPTORS;
     const maxPhysicalPaths = opts.epoch ? this.retainedCap(opts.maxPhysicalPaths, 200) : Infinity;
     const physicalPaths = new Set<string>();
-    const now = opts.now ?? Date.now;
+    const clock = opts.now ?? Date.now;
+    let observedNow = -Infinity;
+    const now = () => (observedNow = clock());
     const budgetMs = opts.budgetMs ?? RETAINED_INSPECT_BUDGET_MS;
     const deadline = now() + budgetMs;
     const operationDeadline = Math.min(opts.deadline ?? Infinity, Date.now() +
       (opts.now === undefined ? budgetMs : Math.max(budgetMs, RETAINED_INSPECT_BUDGET_MS)));
+    const partialCauses: PartialCauses = {};
     let partial = false;
     let unreadable = 0;
     type Evaluated = Awaited<ReturnType<GitCache["evaluateRetained"]>>;
     const found: Array<{ g: GatheredBare; rec: GatheredRecord; ev: Evaluated }> = [];
     const exhausted = (err: unknown): boolean =>
       opts.signal?.aborted === true || now() >= deadline || Date.now() >= (opts.deadline ?? Infinity) || (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError" || /deadline exhausted/.test(err.message)));
+    // Reuse the predicate's observations: diagnostic clock reads must not consume a test clock.
+    const interruption = (): PartialCause => opts.signal?.aborted ? "inspection_interrupted" :
+      observedNow >= deadline ? "inspection_budget" : Date.now() >= (opts.deadline ?? Infinity) ? "inspection_deadline" : "inspection_interrupted";
+    const failure = (error: unknown, stopped: boolean) => this.collectRetainedCause(error, partialCauses,
+      stopped ? interruption() : "inspection_unreadable_bare");
     const byIdentity = (x: { rec: GatheredRecord }, y: { rec: GatheredRecord }): number =>
       (x.rec.runId < y.rec.runId ? -1 : x.rec.runId > y.rec.runId ? 1 : 0) ||
       (x.rec.parts[0]!.clonePath < y.rec.parts[0]!.clonePath ? -1 : x.rec.parts[0]!.clonePath > y.rec.parts[0]!.clonePath ? 1 : 0);
@@ -9854,6 +9925,7 @@ export class GitCache {
       await this.withRecoveryOperation(opts.signal ?? new AbortController().signal, operationDeadline, async () => {
         for (const bare of await this.retainedBares(opts.barePath)) {
           if (now() >= deadline) {
+            countPartialCause(partialCauses, "inspection_budget");
             partial = true;
             break;
           }
@@ -9875,6 +9947,7 @@ export class GitCache {
                 if (opts.epoch) {
                   const fresh = [...new Set(rec.parts.map(p => p.clonePath))].filter(p => !physicalPaths.has(p));
                   if (found.length >= maxDescriptors || physicalPaths.size + fresh.length > maxPhysicalPaths) {
+                    countPartialCause(partialCauses, found.length >= maxDescriptors ? "inspection_descriptor_cap" : "inspection_physical_path_cap");
                     partial = true;
                     continue;
                   }
@@ -9889,7 +9962,9 @@ export class GitCache {
               }
             });
           } catch (err) {
-            if (exhausted(err)) {
+            const stopped = exhausted(err);
+            failure(err, stopped);
+            if (stopped) {
               partial = true;
               break;
             }
@@ -9899,7 +9974,9 @@ export class GitCache {
         }
       });
     } catch (err) {
-      if (exhausted(err)) partial = true;
+      const stopped = exhausted(err);
+      failure(err, stopped);
+      if (stopped) partial = true;
       else {
         unreadable++;
         this.log.warn("retained source inspection could not enumerate the bares", { error: gitErrorMessage(err) });
@@ -9907,6 +9984,7 @@ export class GitCache {
     }
     found.sort(byIdentity);
     if (found.length > maxDescriptors) {
+      countPartialCause(partialCauses, "inspection_descriptor_cap");
       partial = true;
       found.length = maxDescriptors;
     }
@@ -9930,13 +10008,20 @@ export class GitCache {
                 async () => {
                   this.checkRecoveryInterruption();
                   try { opts.beforeTree?.(p.clonePath); }
-                  catch (error) { bindingFailed = true; throw error; }
+                  catch (error) { bindingFailed = true; countPartialCause(partialCauses, "tree_binding_failed"); throw error; }
                   this.checkRecoveryInterruption();
-                  return this.measureAllocated(p.clonePath, now, deadline, opts.measureCaps);
+                  const detail: PartialCauses = {};
+                  try { return await this.measureAllocated(p.clonePath, now, deadline, opts.measureCaps, detail); }
+                  finally {
+                    // Only executed walks arrive here; cache hits bypass this callback.
+                    mergePartialCauses(partialCauses, detail);
+                  }
                 });
             if (opts.epoch) measurements.set(p.clonePath, m);
           } catch (error) {
-            if (!exhausted(error)) unreadable++;
+            const stopped = exhausted(error);
+            if (stopped) this.collectRetainedCause(error, partialCauses, interruption());
+            if (!stopped) unreadable++;
           }
           bytes = m.complete ? m.bytes : null;
           if (!m.complete) partial = true;
@@ -9973,7 +10058,7 @@ export class GitCache {
         delete source.epochSettlement;
       }
     }
-    return { sources, partial, unreadable, sampledAt: new Date(now()).toISOString() };
+    return { partialCauses, sources, partial, unreadable, sampledAt: new Date(now()).toISOString() };
   }
 
   /**
@@ -17568,8 +17653,8 @@ try {
         const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
         try {
           if (failure) return;
-          if (chunk.length > cap - bytes) throw Object.assign(new Error("git subprocess maxBuffer exceeded"),
-            { outputExceeded: true, outputStream, code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" });
+          if (chunk.length > cap - bytes) throw this.retainedCause(Object.assign(new Error("git subprocess maxBuffer exceeded"),
+            { outputExceeded: true, outputStream, code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }), "metadata_byte_cap");
           chunks.push(chunk); bytes += chunk.length;
         } catch (error) { failure ??= error; cancel(); }
       }).on("error", error => { failure ??= error; cancel(); });
@@ -17675,17 +17760,17 @@ try {
     const limits = this.epochRetained.getStore();
     if (!limits) return;
     this.checkRecoveryInterruption();
-    if (Buffer.byteLength(stdout) > limits.maxMetadataBytes) throw new Error("epoch metadata byte limit");
+    if (Buffer.byteLength(stdout) > limits.maxMetadataBytes) throw this.retainedCause(new Error("epoch metadata byte limit"), "metadata_byte_cap");
     const config = args.includes("config") && (args.includes("--list") || args.includes("--get-regexp"));
     const refs = args.includes("for-each-ref") || args.includes("show-ref");
     if (!config && !refs) return;
     const separator = config && (args.includes("--null") || args.includes("-z")) ? "\0" : "\n";
     let count = 0;
     for (let i = 0; i < stdout.length; i++) {
-      if (stdout[i] === separator && ++count > limits.maxMetadataRecords) throw new Error("epoch metadata record limit");
+      if (stdout[i] === separator && ++count > limits.maxMetadataRecords) throw this.retainedCause(new Error("epoch metadata record limit"), "metadata_record_cap");
     }
     if (stdout.length && !stdout.endsWith(separator) && ++count > limits.maxMetadataRecords)
-      throw new Error("epoch metadata record limit");
+      throw this.retainedCause(new Error("epoch metadata record limit"), "metadata_record_cap");
     if (config && separator === "\0" && args.includes("--list")) {
       let start = 0;
       let sources = 0;
@@ -17703,7 +17788,7 @@ try {
           if (Array.isArray(journal?.retainedSources)) sources += journal.retainedSources.length;
           if (journal?.recovery) sources += 2;
         } catch { /* The authority parser reports malformed values; never accept them here. */ }
-        if (sources > limits.maxMetadataRecords) throw new Error("epoch source record limit");
+        if (sources > limits.maxMetadataRecords) throw this.retainedCause(new Error("epoch source record limit"), "source_record_cap");
       }
     }
   }
@@ -17755,6 +17840,12 @@ try {
         const stdout = String(result.stdout);
         this.checkEpochMetadata(args, stdout);
         return { stdout, stderr: String(result.stderr) };
+      } catch (error) {
+        try {
+          if (epoch && (error as { code?: unknown })?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
+            this.retainedCause(error, "metadata_byte_cap");
+        } catch { /* Diagnostic access cannot replace the subprocess error. */ }
+        throw error;
       } finally {
         await closed;
         if (killTimer) clearTimeout(killTimer);
@@ -17915,6 +18006,7 @@ try {
         outputStream?: "stdout" | "stderr" };
       failure.code = terminal.code;
       if (stdout.oversized || stderr.oversized) {
+        if (epoch) this.retainedCause(failure, "metadata_byte_cap");
         failure.outputExceeded = true;
         failure.outputStream = stdout.oversized ? "stdout" : "stderr";
       }
@@ -17952,7 +18044,7 @@ try {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      const failure = this.transferRetainedCause(err, new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`));
       const stderr = (err as { stderr?: unknown })?.stderr;
       retainedGitDiagnostics.set(failure, {
         stderr: typeof stderr === "string" ? stderr : "",

@@ -1065,6 +1065,14 @@ SH startup.
 A would-delete entry requires terminal ownership, fresh empty holds and an
 eligible retained-source disposition; a verdict grants no deletion authority.
 
+For `inventory_partial`, `partial_causes` supplies sparse, bounded event counters:
+`measurement_entry_cap` and `measurement_filesystem_error` explain measurement
+limits or filesystem failures; `ownership_read_` and `holds_read_` keys classify
+failures at those read stages. Each counter saturates at **65535**; a missing
+counter is not evidence that unvisited work was clean. The object carries no raw
+errors, URLs, paths or IDs and changes no eligibility or authority. See the
+[full #3775 diagnostic contract](../prds/3431-pod-epoch-reclaim.md#3775-partial-shadow-diagnostic-contract).
+
 **Authority and counts (PRD #3431 M1a).** The log line also carries
 `authority: {result, reason}`, `evidence_version` and, once version-2 binding
 and prefix checks pass, `observations.kernel`. `authority.result` is one of `undeclared`,
