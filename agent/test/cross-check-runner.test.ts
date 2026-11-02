@@ -1071,6 +1071,24 @@ for (const stage of ["plan", "code"] as const) {
 type DiagnosticCode = keyof typeof diagnosticPairs;
 type Checker = Pick<CodexCrossCheck, "run">;
 
+async function diagnosticRequestBody(chunks: AsyncIterable<Buffer | string>): Promise<string> {
+ let raw = "", bytes = 0;
+ for await (const chunk of chunks) {
+  bytes += Buffer.byteLength(chunk);
+  assert.ok(bytes <= 64 * 1024, "diagnostic fixture request exceeds 64 KiB");
+  raw += chunk;
+ }
+ return raw;
+}
+
+it("diagnostic fixture request body enforces the byte limit", async () => {
+ const boundary = Buffer.alloc(64 * 1024, "a");
+ const chunks = async function* (...values: (Buffer | string)[]) { yield* values; };
+ assert.equal(await diagnosticRequestBody(chunks(boundary)), boundary.toString());
+ await assert.rejects(diagnosticRequestBody(chunks(boundary, "x")), /diagnostic fixture request exceeds 64 KiB/);
+ await assert.rejects(diagnosticRequestBody(chunks("é".repeat(32 * 1024 + 1))), /diagnostic fixture request exceeds 64 KiB/);
+});
+
 async function diagnosticScenario(stage: "plan" | "code", harness: "claude" | "codex", options: {
  model?: (client: WorkerClient, log: Logger) => Checker;
  failureAt?: "usage" | "probe" | "verdict" | "terminal" | "terminal-selected" | "ambiguous";
@@ -1104,13 +1122,7 @@ async function diagnosticScenario(stage: "plan" | "code", harness: "claude" | "c
  let messageClient: WorkerClient | undefined;
  const server = options.authenticatedMessages ? http.createServer(async (req, res) => {
   try {
-   let raw = "", bytes = 0;
-   for await (const chunk of req) {
-    bytes += Buffer.byteLength(chunk);
-    assert.ok(bytes <= 64 * 1024, "diagnostic fixture request exceeds 64 KiB");
-    raw += chunk;
-   }
-   const body = JSON.parse(raw);
+   const body = JSON.parse(await diagnosticRequestBody(req));
    assert.equal(req.method, "POST");
    assert.equal(req.url, "/api/worker/runs/check/messages");
    assert.equal(req.headers.authorization, "Bearer join-fixture");
