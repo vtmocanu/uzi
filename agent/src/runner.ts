@@ -2587,6 +2587,8 @@ interface RunFlight {
   /** Restriction latch only. Never authorizes source use; launch re-reads durable proofs. */
   remediationRestrictions?: {
     roots: string[];
+    /** Process-only denial version; a failed read invalidates every admission already waiting. */
+    denialRevision?: number;
     /** Global negative findings, never a substitute for the current positive body. */
     flaggedOIDs?: string[];
     /** Worker-selected identity and bounded negative knowledge; never a consumer confirmation cache. */
@@ -3538,9 +3540,14 @@ export class RunRunner {
    * flight's lease is the current lease for that clone and (Codex) carries this executor's incarnation.
    */
   private async requireLaunchAuthority(flight: RunFlight): Promise<void> {
+    // Capture before the first wait, including source-use authority acquisition.
+    const denialRevision = flight.remediationRestrictions?.denialRevision ?? 0;
     let record: RemediationRecovery | undefined;
     let recordBarePath: string | undefined;
     const checkRemediation = (): void => {
+      const currentRevision = flight.remediationRestrictions?.denialRevision ?? 0;
+      if (!Number.isSafeInteger(currentRevision) || currentRevision < 0 || currentRevision !== denialRevision)
+        throw new Error("remediation restriction confirmation changed");
       const proof = record;
       const selected = this.remediationSource(flight);
       const pending = flight.remediationRestrictions?.pending;
@@ -3622,7 +3629,11 @@ export class RunRunner {
       if (facts.blocked) throw new Error("restriction evidence is custody only");
       return { kind: "confirmed", enrolled: facts.enrolled };
     } catch {
-      flight.remediationRestrictions ??= { roots: [] };
+      const state = flight.remediationRestrictions ??= { roots: [] };
+      const revision = state.denialRevision ?? 0;
+      // Never wrap or clear a denial. A new admission still needs fresh durable proofs.
+      state.denialRevision = Number.isSafeInteger(revision) && revision >= 0 && revision < Number.MAX_SAFE_INTEGER
+        ? revision + 1 : -1;
       flight.preserveRecoveryClone = true;
       return { kind: "unavailable" };
     }

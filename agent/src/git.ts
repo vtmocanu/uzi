@@ -7427,7 +7427,10 @@ export class GitCache {
           throw new Error("ambiguous restriction journal");
         const activeRaw = activeEntries[0]?.slice(key.length + 1) || undefined;
         const active = activeRaw === undefined ? undefined : parseRecoveryJournal(activeRaw);
-        if (active && recoveryJournalJson(active) !== activeRaw) throw new Error("noncanonical restriction journal");
+        // Ordinary journals retain their legacy writer order. Strict parsing and the two
+        // identical raw reads prove absence; only enrolled evidence requires canonical bytes.
+        if (active?.remediationRecovery && recoveryJournalJson(active) !== activeRaw)
+          throw new Error("noncanonical restriction journal");
         if (workerSelectedSource) {
           const authenticated = await this.remediationSourceUnderLock(barePath, branch, workerSelectedSource);
           if (authenticated.raw !== activeRaw) throw new Error("restriction source changed");

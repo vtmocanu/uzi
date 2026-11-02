@@ -340,3 +340,75 @@ test("launch still scans full applicable history below a local floor", async t =
     assert.ok(flight.remediationRestrictions.roots.includes(historical));
   } finally { runner.shutdown(); }
 });
+
+for (const late of ["confirmed", "unavailable", "blocked", "reconfirmed", "initial-wait", "overflow"] as const) {
+  test("launch observes negative custody changes across authority waits: " + late, async t => {
+    const f = await fixture();
+    await git.recordRemediationScan(f.bare, BRANCH, f.source, { trusted: true, tip: f.s, flaggedOIDs: [] });
+    const { cache, runner, subject, flight } = f.fresh();
+    flight.publishedTip = f.base; flight.checkpointFloor = f.base;
+    flight.executor = {};
+    if (late === "overflow") flight.remediationRestrictions = { roots: [], denialRevision: Number.MAX_SAFE_INTEGER };
+    if (late === "initial-wait")
+      assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "confirmed", enrolled: true });
+    t.mock.method(cache, "secretScanCheckpointRange", async () => ({ trusted: true as const, findings: [] }));
+    let observed = false;
+    const observe = async () => {
+      if (observed) return;
+      observed = true;
+      let restoreRead: (() => void) | undefined;
+      if (late === "blocked") {
+        const live = fs.readFileSync(path.join(f.bare, "config"), "utf8");
+        await f.detach();
+        const key = "uzi-retained." + f.claim.run_id + ".journal";
+        const protectedCopy = JSON.parse(command(f.bare, "config", key));
+        fs.writeFileSync(path.join(f.bare, "config"), live);
+        protectedCopy.journal.remediationRecovery.blocked = true;
+        command(f.bare, "config", key, JSON.stringify(protectedCopy));
+        assert.equal((await cache.readRemediationRestrictionFacts(f.bare, BRANCH, f.claim.run_id)).blocked, true);
+      } else if (late !== "confirmed") {
+        const read = cache.readRemediationRestrictionFacts.bind(cache);
+        const faulty = t.mock.method(cache, "readRemediationRestrictionFacts", (...args: Parameters<typeof read>) =>
+          read(args[0], args[1], args[2], undefined, { readback: async () => "different" }));
+        restoreRead = () => faulty.mock.restore();
+      }
+      assert.deepEqual(await subject.bridgeBareTrackingRefIfDivergent(f.bare, BRANCH, flight, nullLogger()), { kind: "unknown" });
+      if (late !== "confirmed") {
+        assert.equal(flight.preserveRecoveryClone, true);
+        assert.ok(flight.remediationRestrictions.roots.includes(f.q));
+        assert.ok(flight.remediationRestrictions.roots.includes(f.d));
+        assert.ok(flight.remediationRestrictions.flaggedOIDs.includes(f.q));
+      }
+      if (late === "reconfirmed" || late === "initial-wait" || late === "overflow") {
+        restoreRead!();
+        assert.deepEqual(await subject.bootstrapRemediationRestrictions(flight), { kind: "confirmed", enrolled: true });
+      }
+    };
+    // This authority seam controls interleaving only; it does not prove process quiescence.
+    subject.authority = {
+      withTransaction: async (fn: () => Promise<unknown>) => {
+        if (late === "initial-wait") await observe();
+        return fn();
+      },
+      recordAdmissions: (_paths: Set<string>, fn: () => Promise<unknown>) => fn(),
+      assertLaunchable: async () => { if (late !== "initial-wait") await observe(); },
+    };
+    try {
+      if (late === "confirmed") await subject.requireLaunchAuthority(flight);
+      else await assert.rejects(subject.requireLaunchAuthority(flight),
+        { message: "remediation restriction confirmation changed" },
+        "an unavailable read invalidates the admission already waiting");
+      if (late === "reconfirmed") {
+        assert.equal(flight.remediationRestrictions.denialRevision, 1);
+        await subject.requireLaunchAuthority(flight);
+        assert.equal(flight.remediationRestrictions.denialRevision, 1, "fresh confirmation never resets a denial");
+      }
+      if (late === "overflow") {
+        assert.equal(flight.remediationRestrictions.denialRevision, -1);
+        await assert.rejects(subject.requireLaunchAuthority(flight), { message: "remediation restriction confirmation changed" });
+        assert.equal(flight.remediationRestrictions.denialRevision, -1, "overflow never wraps or clears");
+      }
+      assert.equal(observed, true);
+    } finally { runner.shutdown(); }
+  });
+}

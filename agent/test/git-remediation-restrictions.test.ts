@@ -458,3 +458,32 @@ test("query snapshots the worker-selected identity before awaited confirmation",
   assert.deepEqual(facts, expected, "the supplied object's mutation cannot redirect source authentication");
   await assert.rejects(cache.readRemediationRestrictionFacts(bare, BRANCH, RUN, supplied));
 });
+
+test("unenrolled recovery writer order confirms absence without weakening enrolled canonical proof", async () => {
+  const reservation = await cache.reserveRecoveryIteration(bare, BRANCH, KEY, source());
+  await cache.recordRecoveryCapture(bare, BRANCH, KEY, source(), reservation.attempts, base, base);
+  const { recovery, ...rest } = journal();
+  // Ordinary successor writers also put recovery after retainedSources/peeledMarkers.
+  // This is a valid unenrolled spelling, not a new authority or repaired identity.
+  write({ ...rest, retainedSources: [], peeledMarkers: [], recovery });
+  const before = snapshot(), syncs: string[] = [];
+  for (const selected of [undefined, source()]) {
+    const facts = await cache.readRemediationRestrictionFacts(bare, BRANCH, RUN, selected, {
+      sync: async (h, kind) => { syncs.push(kind); await h.sync(); },
+    });
+    assert.equal(facts.enrolled, false);
+    assert.equal(facts.blocked, false);
+    assert.deepEqual(facts.roots, []);
+    assert.deepEqual(facts.flaggedOIDs, []);
+  }
+  assert.deepEqual(syncs, ["config", "directory", "config", "directory"]);
+  assert.deepEqual(snapshot(), before);
+  await assert.rejects(cache.readRemediationRestrictionFacts(bare, BRANCH, RUN, { ...source(), attemptId: OTHER }));
+  assert.equal(await cache.readRuntimeRemediationRecovery(bare, BRANCH, source()), undefined);
+  await enroll();
+  const { runId, ...enrolled } = journal();
+  write({ ...enrolled, runId });
+  const changed = snapshot();
+  await assert.rejects(held());
+  assert.deepEqual(snapshot(), changed, "enrolled noncanonical bytes remain held without repair");
+});
