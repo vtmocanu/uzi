@@ -358,6 +358,49 @@ describe("retained pin metadata refuses ambiguous or inconsistent attribution be
 });
 
 describe("metadata regression boundaries", () => {
+  const epochRefusals: Array<[string, () => void]> = [
+    ["duplicate sourceGeneration", () => {
+      config(ACTIVE_KEY, JSON.stringify(oldJournal).replace('"sourceGeneration":1',
+        '"sourceGeneration":1,"sourceGeneration":1'));
+    }],
+    ["duplicate pinRestore", () => {
+      config(ACTIVE_KEY, JSON.stringify(newJournal()).replace('"pinRestore":',
+        '"pinRestore":null,"pinRestore":'));
+    }],
+    ["duplicate unknown metadata", () => {
+      config(ACTIVE_KEY, JSON.stringify({ runId: RUN, clonePath: canonical }).replace(
+        '"runId":', '"futureSchema":1,"futureSchema":1,"runId":'));
+    }],
+    ["duplicate V2 version", () => {
+      retain();
+      config(RETAINED_KEY, JSON.stringify(envelope).replace('"version":2', '"version":2,"version":2'));
+    }],
+    ["malformed V2", () => {
+      config(RETAINED_KEY, JSON.stringify(envelope).slice(0, -1));
+    }],
+    ["incomplete lexical classification", () => {
+      config(ACTIVE_KEY, '{"runId":' + "[".repeat(33));
+    }],
+  ];
+  for (const [name, corrupt] of epochRefusals) {
+    it("epoch inspection refuses " + name + " before source access", async t => {
+      corrupt();
+      const before = snapshot();
+      const guard = guardSources(t, [canonical, link.successor.clonePath]);
+      const result = await cache.inspectRetainedSources({
+        barePath: bare, epoch: true,
+        selector: { runId: RUN, generation: 1, attempt: "canonical" },
+        holds: { state: "read", holds: [] },
+        lifecycle: { state: "terminal", status: "completed" },
+        isLivePath: guard.isLivePath, beforeTree: guard.beforeTree,
+      });
+      assert.equal(result.unreadable, 1);
+      assert.deepEqual(result.sources, []);
+      guard.assertUntouched();
+      assert.deepEqual(snapshot(), before);
+    });
+  }
+
   it("binds historical links to the actual bare even with consistent history digests", async t => {
     activate();
     const second = newJournal();
