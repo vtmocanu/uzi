@@ -132,6 +132,66 @@ test("protected V1 descriptors retain the original JSON decoder semantics", asyn
   assert.equal((await cache.readInventoryCloneHeads(bare, runId)).kind, "verified");
 });
 
+for (const raw of [
+  '{"version":2,"version":2,"intent":',
+  '{"version":2,"version":2,',
+  '{"version":2',
+  '{"version":1,"version":2,',
+  '{"\\u0076ersion" \t:\r\n2e0,"version":2,',
+  '{"version":3,"version":3,',
+  '{"version":2,"version":1,"intent":{}}',
+]) {
+  test("version prefix classification refuses foreign " + raw, async t => {
+    await ready();
+    const before = journal();
+    await cache.detachTerminalRetained(bare, branch, key, before);
+    const foreign = "uzi-retained.run-foreign.journal";
+    git(bare, ["config", foreign, raw]);
+    const descriptorKey = "uzi-retained." + runId + ".journal";
+    const descriptor = git(bare, ["config", descriptorKey]);
+    const refs = git(bare, ["for-each-ref"]);
+    const probes: string[] = [];
+    for (const method of ["lstat", "stat", "readFile", "realpath"] as const) {
+      const real = fs.promises[method].bind(fs.promises) as (...args: any[]) => Promise<any>;
+      t.mock.method(fs.promises, method, async (...args: any[]) => {
+        if (String(args[0]).startsWith(source.clonePath)) probes.push(method);
+        return real(...args);
+      });
+    }
+    const internal = cache as unknown as { runGit: (dir: string, args: string[]) => Promise<string> };
+    const runGit = internal.runGit.bind(cache);
+    t.mock.method(internal, "runGit", async (dir: string, args: string[]) => {
+      if (dir.startsWith(source.clonePath)) probes.push("git");
+      return runGit(dir, args);
+    });
+    await assert.rejects(cache.discardRetainedRecovery(bare, branch, key, before, true));
+    assert.deepEqual(probes, [], "classification must precede old-source access");
+    assert.equal(git(bare, ["config", foreign]), raw.trim());
+    assert.equal(git(bare, ["config", descriptorKey]), descriptor);
+    assert.equal(git(bare, ["for-each-ref"]), refs);
+  });
+}
+
+test("version prefix classification preserves foreign legacy isolation and V1 duplicates", async () => {
+  await ready();
+  const before = journal();
+  await cache.detachTerminalRetained(bare, branch, key, before);
+  const descriptorKey = "uzi-retained." + runId + ".journal";
+  const descriptor = git(bare, ["config", descriptorKey]);
+  for (const prefix of ['"version":1,"version":1', '"version":2,"version":1']) {
+    const raw = descriptor.replace('"version":1', prefix);
+    git(bare, ["config", descriptorKey, raw]);
+    await cache.detachTerminalRetained(bare, branch, key, before);
+    assert.equal(git(bare, ["config", descriptorKey]), raw);
+  }
+  for (const raw of ["{", '{"version":1,', '{"version":0,"version":1,']) {
+    git(bare, ["config", "uzi-retained.run-foreign.journal", raw]);
+    assert.deepEqual(await cache.readRetainedPinMetadata(bare, undefined, runId), []);
+  }
+  await cache.discardRetainedRecovery(bare, branch, key, before, true);
+  assert.equal(git(bare, ["config", "uzi-retained.run-foreign.journal"]), '{"version":0,"version":1,');
+});
+
 test("unrelated protected record missing .git does not block canonical seed", async () => {
   const { tip } = await ready();
   const before = journal();

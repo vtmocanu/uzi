@@ -7690,17 +7690,25 @@ export class GitCache {
         const applicable = selectedRunId === undefined || name === `uzi-retained.${selectedRunId}.journal`;
         const raw = item.slice(nl + 1);
         // V1 keeps protectedRecoveries' JSON semantics and selected-run isolation.
-        // Once a V2 root field is seen, malformed evidence cannot take that legacy path.
+        // A V2 field or numeric version prefix prevents malformed evidence taking that legacy path.
         let newForm = false;
+        let unsupportedVersion = false;
         let value: unknown;
         try {
-          value = parsePinRestoreJson(raw, GIT_MAX_BUFFER, key => {
+          value = parsePinRestoreJson(raw, GIT_MAX_BUFFER, (key, keyEnd) => {
             if (!["version", "branch", "key", "journal"].includes(key)) newForm = true;
+            if (key === "version") {
+              // Anchor at the key without copying the remaining (potentially large) raw value.
+              const version = /[ \t\r\n]*:[ \t\r\n]*(-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)(?=[ \t\r\n,}\]]|$)/y;
+              version.lastIndex = keyEnd;
+              const token = version.exec(raw);
+              if (token && Number(token[1]) >= 2) unsupportedVersion = true;
+            }
           });
         } catch (error) {
           if (newForm) throw error;
           try { value = JSON.parse(raw); } catch {
-            if (!applicable) continue;
+            if (!applicable && !unsupportedVersion) continue;
             throw error;
           }
           if (!value || typeof value !== "object" || Array.isArray(value) ||

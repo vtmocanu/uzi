@@ -102,6 +102,19 @@ test("strict JSON refuses decoded duplicate aliases at every nesting level and b
   assert.throws(() => parsePinRestoreJson(legacy, 16384));
 });
 
+test("root key observer exposes value positions before duplicate failure without decoding the value", () => {
+  const raw = '{"\\u0076ersion" \t:\r\n2e0,"version":2,"intent":';
+  const seen: Array<[string, number]> = [];
+  assert.throws(() => parsePinRestoreJson(raw, 65536, (key, keyEnd) => {
+    seen.push([key, keyEnd]);
+  }));
+  assert.deepEqual(seen, [["version", raw.indexOf(" \t:")], ["version", raw.indexOf('":2') + 1]]);
+  assert.throws(() => parsePinRestoreJson(raw, 1, () => assert.fail("size check must precede observation")));
+  const sentinel = new Error("observer");
+  assert.throws(() => parsePinRestoreJson('{"version":2}', 65536, () => { throw sentinel; }),
+    error => error === sentinel);
+});
+
 test("unknown fields, omitted fields and unsupported versions fail throughout the persisted shape", () => {
   const locations = [
     (e: RetainedPinEnvelope) => e,
