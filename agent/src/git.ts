@@ -2529,9 +2529,8 @@ interface TrackingAttemptRecord {
   displacedSha: string | undefined;
   displacedContext: StoredOwedContext | undefined;
   retainedShas: string[];
-  /** Set once the original attempt passed clearConflictingAncestorTrackingRefs. A pre-pending disk state
-   *  left by a refused clear (`cleared === false`) is indistinguishable from an interrupted attempt, so
-   *  only an attempt that passed the clear may be finished from the pre-pending state. */
+  /** Set once the attempt passed clearConflictingAncestorTrackingRefs. When false at repair time the
+   *  repair runs the clear itself before finishing from the pre-pending state. */
   ancestorsCleared: boolean;
 }
 export type TrackingUpdateResult =
@@ -18916,8 +18915,9 @@ try {
   }
 
   /** issue #3780: finish an ownership update that THIS token's earlier attempt stranded, only from one of
-   *  three exact disk states (pre-pending, ref unchanged, CAS landed). Caller holds the bare lock. The
-   *  pre-pending state counts only after the original attempt passed the ancestor clear. Before EACH write
+   *  three exact disk states (pre-pending, ref unchanged, CAS landed). Caller holds the bare lock. From the
+   *  pre-pending state an attempt that never passed the ancestor clear runs that clear itself first (a
+   *  refused clear refuses the repair with no further write). Before EACH write
    *  the admission predicate and the HARD boundary signal are re-checked (the soft signal is masked for the
    *  repair); once either fails it stops with no further write and no rollback, leaving a state a later
    *  admissible import can finish.
@@ -18958,11 +18958,18 @@ try {
         const markerExact = same(diskMarker, marker), pendingExact = same(diskReceipt, rec.pending);
         const unchanged = ref === rec.observedSha && stamp === rec.stamp;
         const prePending = unchanged && diskReceipt === undefined && rec.priorReceipt === undefined &&
-          rec.ancestorsCleared && (diskMarker === undefined || markerExact);
+          (diskMarker === undefined || markerExact);
         const refUnchanged = unchanged && markerExact && pendingExact;
         const casLanded = ref === rec.incoming && (stamp === rec.stamp || stamp === rec.runId) && markerExact && pendingExact;
         if (!prePending && !refUnchanged && !casLanded) return undefined;
         if (prePending) {
+          if (!rec.ancestorsCleared) {
+            // The original attempt stopped before (or at) its ancestor clear: run that remaining step
+            // itself. A refused clear leaves the same disk state, so it must refuse again here.
+            if (!permit()) return undefined;
+            if (!(await this.clearConflictingAncestorTrackingRefs(barePath, runnerTrackingRef(branch), opts))) return undefined;
+            this.markTrackingAncestorsCleared(token, barePath, branch);
+          }
           if (diskMarker === undefined) {
             if (!permit()) return undefined;
             await this.writeOwedFile(barePath, markerPath, marker);
@@ -18988,8 +18995,9 @@ try {
             throw new Error("committed owner readback mismatch");
           }
         } catch (cause) {
-          // Same single best-effort invalidation as promoteTrackingUnderLock, but only with live authority.
-          if (admission()) await this.writeOwedFile(barePath, receiptPath, rec.pending).catch(() => undefined);
+          // Same single best-effort invalidation as promoteTrackingUnderLock, but only with live authority:
+          // admission still true and the hard boundary signal not aborted.
+          if (admission() && !this.boundaryProcesses.getStore()?.signal.aborted) await this.writeOwedFile(barePath, receiptPath, rec.pending).catch(() => undefined);
           throw cause;
         }
         this.dropTrackingAttempt(token, barePath, branch);

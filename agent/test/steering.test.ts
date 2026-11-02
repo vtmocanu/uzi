@@ -2285,6 +2285,17 @@ describe("issue #3780 ownershipRepairAuthority", () => {
     assert.equal(ch.ownershipRepairAuthority(), false, "a give-up leaves the shutdown stop aborted");
   });
 
+  it("is false for a credential switch deferred in a defer window, which aborts only the shutdown stop", () => {
+    const ch = fresh();
+    ch.beginCredentialSwitchDefer();
+    ch.tripCredentialSwitch(7);
+    // Every other condition still holds, so only the shutdown stop revokes the authority.
+    assert.equal(ch.pendingCredentialSwitch(), undefined, "the switch is deferred, not pending");
+    assert.equal(ch.lifecycleSignal().aborted, false, "the lifecycle was not aborted");
+    assert.equal(ch.isCancelled(), false);
+    assert.equal(ch.ownershipRepairAuthority(), false);
+  });
+
   it("is false after a terminal abort, also when it follows a cooperative pause", () => {
     const direct = fresh();
     direct.abortLifecycle(new Error("x"));

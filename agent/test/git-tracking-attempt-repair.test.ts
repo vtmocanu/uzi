@@ -202,6 +202,30 @@ describe("issue #3780 repaired imports", () => {
     await assertRepairedImport(h2);
   });
 
+  it("a legacy bare hard-aborted right after the governance write, before the ancestor clear, is finished by the next import", async () => {
+    const { h2 } = await strandLegacyBeforeClear();
+    await assertRepairedImport(h2);
+  });
+
+  it("a hard abort between the repair's committed write and its owner readback does not rewrite the receipt to pending", async () => {
+    root("H"); updated(await fetch());
+    const h2 = root("H2");
+    const strand = faultGit((args) => args.includes("update-ref") && args.includes(TRACKING));
+    try { assert.equal((await fetch()).kind, "not_updated"); } finally { strand(); }
+    assert.equal(receipt().phase, "pending");
+    const ctl = new AbortController();
+    const writes: Array<{ name: string; phase?: string }> = [];
+    const restore = hookDisk((name, value) => {
+      writes.push({ name, phase: (value as { phase?: string }).phase });
+      if (name.startsWith("receipt-") && (value as { phase?: string }).phase === "committed") ctl.abort();
+    });
+    try { await assert.rejects(scoped(ctl, () => fetch())); } finally { restore(); }
+    const receiptWrites = writes.filter((w) => w.name.startsWith("receipt-")).map((w) => w.phase);
+    assert.deepEqual(receiptWrites, ["committed"], "no pending rewrite after the hard abort");
+    assert.equal(receipt().phase, "committed");
+    assert.equal(receipt().trackingSha, h2);
+  });
+
   it("a foreign owner displaced by a stranded attempt is finished by the next import (stamp rewritten)", async () => {
     const { h2 } = await strandDisplacingForeign();
     assert.equal(stamp(), OTHER);
@@ -218,6 +242,22 @@ async function strandLegacyBeforeMarker(): Promise<{ legacy: string; h2: string 
   const h2 = root("H2");
   const restore = hookDisk(() => undefined, { afterWrite: false, match: (name) => name.startsWith("governed-") });
   try { assert.deepEqual(await fetch(), { kind: "not_updated", reason: "receipt_pending_failed" }); } finally { restore(); }
+  assert.equal(tip(), legacy);
+  return { legacy, h2 };
+}
+/** A legacy stamp-only bare; a hard boundary abort lands right after the governance write, before the ancestor clear. */
+async function strandLegacyBeforeClear(): Promise<{ legacy: string; h2: string }> {
+  const legacy = root("legacy H");
+  gitIn(bare, ["-c", "protocol.file.allow=user", "fetch", "--no-tags", "--no-write-fetch-head",
+    `file://${clone}`, `refs/heads/${BRANCH}:${TRACKING}`]);
+  gitIn(bare, ["config", "--local", OWNER_KEY, RUN]);
+  const h2 = root("H2");
+  const ctl = new AbortController();
+  await assert.rejects(scoped(ctl, () => fetch(), (argv) => {
+    if (argv.includes("--replace-all") && argv.includes(`uzi-trackowner.${BRANCH}.receiptversion`)) ctl.abort();
+  }));
+  assert.equal(gitIn(bare, ["config", "--local", "--get", `uzi-trackowner.${BRANCH}.receiptversion`]), "1");
+  assert.equal(fs.existsSync(owedPath("receipt")), false);
   assert.equal(tip(), legacy);
   return { legacy, h2 };
 }
@@ -294,6 +334,8 @@ describe("issue #3780 refusals leave the disk untouched", () => {
     ["runId", (r: Record<string, unknown>) => { r.runId = "other-run"; }],
     ["generation", (r: Record<string, unknown>) => { r.generation = 2; }],
     ["context", (r: Record<string, unknown>) => { r.context = `context-${"0".repeat(64)}.json`; }],
+    ["branch", (r: Record<string, unknown>) => { r.branch = "agent/other"; }],
+    ["version", (r: Record<string, unknown>) => { r.version = 2; }],
     ["trackingSha", (r: Record<string, unknown>) => { r.trackingSha = base; }],
     ["phase", (r: Record<string, unknown>) => { r.phase = "committed"; }],
   ] as const) {
@@ -352,19 +394,17 @@ describe("issue #3780 refusals leave the disk untouched", () => {
     await refused();
   });
 
-  it("a legacy bare stranded BEFORE the ancestor clear (same disk as a refused clear) stays refused", async () => {
-    root("legacy H");
-    gitIn(bare, ["-c", "protocol.file.allow=user", "fetch", "--no-tags", "--no-write-fetch-head",
-      `file://${clone}`, `refs/heads/${BRANCH}:${TRACKING}`]);
-    gitIn(bare, ["config", "--local", OWNER_KEY, RUN]);
-    root("H2");
-    const ctl = new AbortController();
-    await assert.rejects(scoped(ctl, () => fetch(), (argv) => {
-      if (argv.includes("--replace-all") && argv.includes(`uzi-trackowner.${BRANCH}.receiptversion`)) ctl.abort();
-    }));
-    assert.equal(gitIn(bare, ["config", "--local", "--get", `uzi-trackowner.${BRANCH}.receiptversion`]), "1");
-    assert.equal(fs.existsSync(owedPath("receipt")), false);
+  it("a legacy bare stranded BEFORE the ancestor clear is refused when the repair's own clear returns false", async () => {
+    await strandLegacyBeforeClear();
+    // An unreadable ancestor sidecar (a governed marker that is not this ancestor's) makes
+    // clearConflictingAncestorTrackingRefs return false, exactly as it would have originally.
+    const ancestorMarker = path.join(bare, "uzi-owed", `governed-${createHash("sha256").update("agent").digest("hex")}.json`);
+    fs.writeFileSync(ancestorMarker, JSON.stringify({ version: 1, branch: "agent/other" }), { mode: 0o600 });
+    const markerBefore = fs.readFileSync(ancestorMarker, "utf8");
     await refused();
+    assert.equal(fs.readFileSync(ancestorMarker, "utf8"), markerBefore);
+    assert.equal(fs.existsSync(owedPath("receipt")), false);
+    assert.equal(fs.existsSync(owedPath("governed")), false);
   });
 
   it("a second token on the SAME GitCache cannot repair token A's attempt; A then completes it", async () => {

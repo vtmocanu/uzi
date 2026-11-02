@@ -538,9 +538,10 @@ When an import under the bare lock finds no observable owner, it asks the repair
 finish that token's own attempt, only from one of three exact disk states:
 
 - **Pre-pending:** ref and stamp unchanged, no receipt, governance marker absent or
-  exact. Counts only if the original attempt had passed the ancestor clear, because a
-  refused clear leaves the same state. Roll-forward: marker, pending receipt, CAS, stamp,
-  committed receipt.
+  exact, and the record saw no prior receipt. If the original attempt had not yet passed
+  the ancestor clear (a refused clear leaves the same state), the repair first re-runs that
+  clear under admission and refuses with no further write when it does not pass.
+  Roll-forward: marker, pending receipt, CAS, stamp, committed receipt.
 - **Ref unchanged:** marker and pending receipt exact, ref and stamp unchanged. CAS,
   stamp, committed receipt.
 - **CAS landed:** ref equals the incoming head, stamp equals the old or new run, marker and
@@ -553,12 +554,31 @@ rollback: every write is a step the original attempt would have taken, and undoi
 under possibly revoked authority would be a new mutation. Before each roll-forward write
 the repair re-checks the admission proof and the hard boundary signal (the soft signal is
 masked for the repair); the one best-effort rewrite of the pending receipt after a failed
-committed write, mirroring the original attempt's own invalidation, re-checks admission
-only. Admission is true only while the steering channel's positive authority
+committed write or readback, mirroring the original attempt's own invalidation, runs only
+while admission holds and the hard boundary signal has not aborted. Admission is true only
+while the steering channel's positive authority
 fields all hold (no terminal lifecycle, shutdown, flight end, receipt failure, cancel,
 claim fence, pending credential switch, disk pause or shutdown checkpoint), the owed
 limit has not stopped the run, the Codex registry is neither poisoned nor disposed, and
-no tick survivors or retained bare locks remain. If it turns false between writes, the
+no tick survivors or retained bare locks remain.
+
+Revocation audit (enumerated at implementation, base 59c8ee55). The terminal lifecycle
+and revocation fence (`shutdownStop`, which is `checkpointAuthoritySignal()`) are aborted
+only by:
+- message-transport permanent failure (runner, two sites);
+- cancellation observation (`observeCancellation` → `markCancelled` plus terminal
+  `abortLifecycle`) and steering cancel;
+- the owed-limit stop;
+- receipt give-up (`failReceipts`);
+- the claim fence (`endFencedFlight`);
+- the disk stop (`requestDiskStop`);
+- credential-switch delivery, including inside a defer window;
+- `workerShutdown`.
+
+Cooperative pause and credential-switch lifecycle deliveries pass `terminal = false`.
+Ordinary executor completion and `SteeringChannel.stop()` touch none of these, so a
+normally completed run keeps repair authority through its done checkpoint and finalize,
+while every listed path revokes it. If it turns false between writes, the
 repair stops with no further write and no rollback, leaving a state a later admissible
 import can finish; the import then refuses. After a success the state is re-observed,
 the repaired retained heads are merged into the result, and the CURRENT incoming is

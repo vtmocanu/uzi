@@ -4343,7 +4343,8 @@ describe("stranded ownership repair across the same flight (issue #3780 M2)", ()
    *  run end normally so its done checkpoint and finalize import. */
   async function strandedFlight(iid: number,
     between: (steering: { abortLifecycle(reason?: unknown, terminal?: boolean): void }, s: Stranded) => void | (() => void),
-    check: (s: Stranded) => Promise<void>): Promise<void> {
+    check: (s: Stranded) => Promise<void>,
+    inTurn?: (s: Stranded, ctx: RunContext) => Promise<void>): Promise<void> {
     const tmp = scratchDir(`m2-repair-${iid}`);
     const ctl = control();
     let capturing = false;
@@ -4386,6 +4387,7 @@ describe("stranded ownership repair across the same flight (issue #3780 M2)", ()
                 activeRuns: Map<string, { steering: { abortLifecycle(reason?: unknown, terminal?: boolean): void } }>;
               }).activeRuns;
               undoBetween = between([...active.values()][0]!.steering, s);
+              await inTurn?.(s, ctx);
             });
             return { branch: ctx.branch };
           },
@@ -4405,6 +4407,20 @@ describe("stranded ownership repair across the same flight (issue #3780 M2)", ()
       assert.deepEqual(trackingState(s.g, s.branch), { tip: s.sha, phase: "committed" });
       assert.equal(s.stamp(), s.claim.run_id);
       assert.ok(s.fg.calls.some((c) => c.method === "POST"), "the finalize import succeeded and the MR was created");
+    });
+  });
+
+  // Claude-style executor (no Codex safety registry): the approved plan does not require a Codex executor here.
+  it("(v) the run's explicit done checkpoint repairs the stranded update; finalize then creates the MR", async () => {
+    await strandedFlight(3780_205, () => undefined, async (s) => {
+      assert.equal(finalStatus(s.claim.run_id), "completed");
+      assert.deepEqual(trackingState(s.g, s.branch), { tip: s.sha, phase: "committed" });
+      assert.ok(s.fg.calls.some((c) => c.method === "POST"), "the finalize import succeeded and the MR was created");
+    }, async (s, ctx) => {
+      await bounded(ctx.checkpoint!({ reap: true, sink: "done_checkpoint" }), TEARDOWN_MS, "done checkpoint");
+      assert.deepEqual(trackingState(s.g, s.branch), { tip: s.sha, phase: "committed" },
+        "the done checkpoint itself repaired the stranded state");
+      assert.equal(s.stamp(), s.claim.run_id);
     });
   });
 
