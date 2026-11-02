@@ -90,6 +90,11 @@ it("settlement writes retain protected and unknown refs while legacy unprotected
   git(r.bare, ["config", "--local", "--unset-all", "uzi-retained." + RUN + ".journal"]);
   const foreign = "uzi-retained.run-foreign.journal";
   for (const raw of [
+    '{"version":1,"version":1,"version":2,"intent":',
+    '{"branch":"old","branch":"old","version":2,',
+    '{"branch":"old","branch":"old","intent":',
+    '{"branch":' + "[".repeat(33) + '0' + "]".repeat(33) + ',"version":2,"intent":',
+    '{"bad\\q":0,"version":2,"intent":',
     '{"version":2,"version":2,"intent":',
     '{"version":2,"version":2,',
     '{"version":2',

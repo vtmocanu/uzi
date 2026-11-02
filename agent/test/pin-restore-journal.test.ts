@@ -108,11 +108,38 @@ test("root key observer exposes value positions before duplicate failure without
   assert.throws(() => parsePinRestoreJson(raw, 65536, (key, keyEnd) => {
     seen.push([key, keyEnd]);
   }));
-  assert.deepEqual(seen, [["version", raw.indexOf(" \t:")], ["version", raw.indexOf('":2') + 1]]);
+  assert.deepEqual(seen, [["version", raw.indexOf(" \t:")], ["version", raw.indexOf('":2') + 1], ["intent", raw.length - 1]]);
   assert.throws(() => parsePinRestoreJson(raw, 1, () => assert.fail("size check must precede observation")));
   const sentinel = new Error("observer");
   assert.throws(() => parsePinRestoreJson('{"version":2}', 65536, () => { throw sentinel; }),
     error => error === sentinel);
+});
+
+test("root classification completes past duplicates but lexical limits never complete or decode the document", t => {
+  const raw = '{"version":1,"version":1,"version":2,"intent":';
+  const seen: string[] = [];
+  let complete = false;
+  const native = JSON.parse;
+  let documentDecodes = 0;
+  t.mock.method(JSON, "parse", (text: string) => {
+    if (text === raw) documentDecodes++;
+    return native(text);
+  });
+  assert.throws(() => parsePinRestoreJson(raw, 65536, key => { seen.push(key); }, () => { complete = true; }));
+  assert.deepEqual(seen, ["version", "version", "version", "intent"]);
+  assert.equal(complete, true);
+  assert.equal(documentDecodes, 0, "duplicates must reject before native document decoding");
+  for (const [text, cap] of [
+    ["{", 65536], ['{"version":1,', 65536],
+    ['{"branch":' + "[".repeat(33) + '0' + "]".repeat(33) + ',"intent":', 65536],
+    ['{"bad\\q":0,"intent":', 65536],
+    ['{"version":1}', 1],
+    ['{"bad":"' + String.fromCharCode(0xd800) + '"}', 65536],
+  ] as const) {
+    let finished = false;
+    assert.throws(() => parsePinRestoreJson(text, cap, () => {}, () => { finished = true; }));
+    assert.equal(finished, text === "{" || text === '{"version":1,', text);
+  }
 });
 
 test("unknown fields, omitted fields and unsupported versions fail throughout the persisted shape", () => {

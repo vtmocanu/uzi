@@ -133,6 +133,12 @@ test("protected V1 descriptors retain the original JSON decoder semantics", asyn
 });
 
 for (const raw of [
+  '{"version":1,"version":1,"version":2,"intent":',
+  '{"branch":"old","branch":"old","version":2,',
+  '{"branch":"old","branch":"old","intent":',
+  '{"branch":{"x":1,"x":1},"version":3,',
+  '{"branch":' + "[".repeat(33) + '0' + "]".repeat(33) + ',"version":2,"intent":',
+  '{"bad\\q":0,"version":2,"intent":',
   '{"version":2,"version":2,"intent":',
   '{"version":2,"version":2,',
   '{"version":2',
