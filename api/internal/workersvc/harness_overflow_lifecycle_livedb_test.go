@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 func TestHarnessOverflowClaimParkPromoteReclaimFrozenLiveDB(t *testing.T) {
 	fx := newOverflowFix(t)
 	env := fx.env
+	cleanupOverflowLifecycleUser(t, env, fx.userID)
 	resealBotPAT(t, env, fx.userID)
 	// The creation-only fixture has a gauge placeholder; make Claude usable too,
 	// so a harness reevaluation cannot hide behind a credential assembly failure.
@@ -178,4 +180,52 @@ func TestHarnessOverflowClaimParkPromoteReclaimFrozenLiveDB(t *testing.T) {
 			control.Harness, control.HarnessPreferred, control.HarnessDecisionReason)
 	}
 	assertFrozen("after reverse-choice control", "claimed")
+}
+
+// cleanupOverflowLifecycleUser disposes of this test's own recovery custody
+// before the user is deleted. Claim opens custody holds whose live-run and
+// live-worker FKs are ON DELETE RESTRICT, so the inherited pool-fixture cleanup
+// (an unchecked user delete) would fail and leave the user, its runs and holds
+// in the shared LiveDB sweep. Registered after the fixture, so it runs first.
+func cleanupOverflowLifecycleUser(t *testing.T, env codexTestEnv, userID uuid.UUID) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		tx, err := env.pool.Begin(ctx)
+		if err != nil {
+			t.Errorf("cleanup begin: %v", err)
+			return
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		holds := `SELECT id FROM recovery_custody_holds WHERE user_id = $1`
+		for _, q := range []string{
+			`DELETE FROM recovery_captures WHERE hold_id IN (` + holds + `)`,
+			`DELETE FROM run_held_publications WHERE hold_id IN (` + holds + `)`,
+			`DELETE FROM recovery_prerequisite_closures WHERE hold_id IN (` + holds + `)`,
+			`DELETE FROM run_salvage WHERE live_run_id IN (SELECT id FROM runs WHERE user_id = $1)`,
+			`DELETE FROM recovery_custody_holds WHERE user_id = $1`,
+			`DELETE FROM users WHERE id = $1`,
+		} {
+			if _, err := tx.Exec(ctx, q, userID); err != nil {
+				t.Errorf("cleanup %q: %v", q, err)
+				return
+			}
+		}
+		var users, runs, holdsLeft int
+		if err := tx.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM users WHERE id = $1),
+			(SELECT count(*) FROM runs WHERE user_id = $1),
+			(SELECT count(*) FROM recovery_custody_holds WHERE user_id = $1)`, userID).Scan(&users, &runs, &holdsLeft); err != nil {
+			t.Errorf("cleanup verify: %v", err)
+			return
+		}
+		if users+runs+holdsLeft != 0 {
+			t.Errorf("cleanup left users=%d runs=%d holds=%d", users, runs, holdsLeft)
+			return
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Errorf("cleanup commit: %v", err)
+		}
+	})
 }
