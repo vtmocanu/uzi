@@ -148,7 +148,7 @@ func TestGetRunCreatedIssues(t *testing.T) {
 			case "empty":
 				db.rows = nil
 			case "query":
-				db.queryErr = errors.New("query failed" + strings.Repeat("x", 2048))
+				db.queryErr = errors.New(strings.Repeat("x", 511) + "😀" + strings.Repeat("x", 2048))
 			case "scan":
 				db.scanErr = errors.New("scan failed")
 			case "late":

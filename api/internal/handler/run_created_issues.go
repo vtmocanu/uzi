@@ -95,7 +95,7 @@ func (h *Handler) overlayCreatedIssues(ctx context.Context, run store.Run, dto *
 		RunID: run.ID, RepoID: run.RepoID, UserID: run.UserID,
 	})
 	if err != nil {
-		slog.Error("resolve run created issues", "run_id", run.ID, "error", termsafe.SanitizeBounded(err.Error(), 512))
+		slog.Error("resolve run created issues", "run_id", run.ID, "error", capUTF8(termsafe.SanitizeBounded(err.Error(), 512), 512))
 		return
 	}
 	type coordinate struct {

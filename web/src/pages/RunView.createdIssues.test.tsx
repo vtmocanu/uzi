@@ -24,6 +24,27 @@ vi.mock("../lib/api", async original => {
 });
 afterEach(cleanup);
 
+it.each(["running", "completed"] as const)("shows outputs on a %s prompt without a source issue or MR", async status => {
+  const run: Run = {
+    ...mockRuns[0], id: "prompt-output", kind: "prompt", status,
+    issue_iid: null, issue_title: "Scheduled idea", issue_web_url: null,
+    mr_iid: null, mr_state: null, branch: null,
+    created_issues: [{ iid: 51, title: "Proposed work", web_url: "https://github.com/org/repo/issues/51" }],
+  };
+  vi.mocked(useRunStream).mockReturnValue({
+    run, messages: [], connected: true, error: "", submit: vi.fn(),
+    refreshRun: vi.fn().mockResolvedValue(undefined), inputs: [], refreshInputs: vi.fn(),
+    canSteer: false, confirmedOwner: false,
+  } as unknown as ReturnType<typeof useRunStream>);
+  render(<MemoryRouter initialEntries={["/runs/prompt-output"]}>
+    <Routes><Route path="/runs/:id" element={<RunView />} /></Routes>
+  </MemoryRouter>);
+  await act(async () => {});
+  expect(screen.getByRole("link", { name: "Created issue #51" }).getAttribute("href"))
+    .toBe("https://github.com/org/repo/issues/51");
+  expect(screen.queryByRole("link", { name: /Open issue #/ })).toBeNull();
+});
+
 it("shows created issues independently of source issue, status and MR/branch displays", async () => {
   const run: Run = {
     ...mockRuns[0], id: "created-issues", kind: "issue", status: "completed",
