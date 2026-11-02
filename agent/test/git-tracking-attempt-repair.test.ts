@@ -301,6 +301,19 @@ describe("issue #3780 refusals leave the disk untouched", () => {
     assert.deepEqual(disk(), before);
   }
 
+  for (const state of ["ref-unchanged", "pre-pending"] as const) {
+    it(`a foreign stamp (${state}) stays refused without changing disk`, async () => {
+      if (state === "ref-unchanged") await strandRefUnchanged();
+      else await strandLegacyBeforeMarker();
+      gitIn(bare, ["config", "--local", "--replace-all", OWNER_KEY, OTHER]);
+      assert.equal(stamp(), OTHER);
+      // Removing the stamp equality from `unchanged` would roll this own-token
+      // attempt forward over a foreign stamp and return updated instead of refusing.
+      await refused();
+      assert.equal(stamp(), OTHER, "the foreign stamp survives the refused repair");
+    });
+  }
+
   it("a restart (new GitCache, fresh token) stays refused", async () => {
     await strandRefUnchanged();
     cache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
