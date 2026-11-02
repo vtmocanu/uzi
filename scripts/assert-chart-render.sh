@@ -1043,6 +1043,58 @@ awk '
   { print }
 ' "$CHART_DIR/Chart.yaml" > "$STRIPPED/Chart.yaml"
 
+# Prerequisite pinning defaults off; legacy explicit Secret and ConfigMap routes
+# retain precedence over the plain chart value without duplicate env entries.
+for closure_case in default github list secret config both; do
+  closure_mode=plain
+  closure_value='""'
+  set --
+  case "$closure_case" in
+    github) set -- --set-string api.prerequisiteClosureForges=github; closure_value='"github"' ;;
+    list) set -- --set-string 'api.prerequisiteClosureForges=github\,gitlab'; closure_value='"github,gitlab"' ;;
+    secret|both)
+      set -- --set-string api.prerequisiteClosureForges=github \
+        --set-string api.secretEnv.UZI_PREREQUISITE_CLOSURE_FORGES=PREREQUISITE_FORGES
+      closure_mode=secret
+      ;;
+    config)
+      set -- --set-string api.prerequisiteClosureForges=github
+      closure_mode=config
+      ;;
+  esac
+  if [ "$closure_case" = config ] || [ "$closure_case" = both ]; then
+    set -- "$@" --set-string api.config.UZI_PREREQUISITE_CLOSURE_FORGES=gitlab
+    helm template uzi "$STRIPPED" --show-only templates/api-configmap.yaml "$@" > "$WORK/closure-config.yaml"
+    awk '
+      $1 == "UZI_PREREQUISITE_CLOSURE_FORGES:" { count++; if ($2 != "\"gitlab\"") bad=1 }
+      END { if (count != 1 || bad) { print "FAIL: legacy prerequisite ConfigMap setting changed"; exit 1 } }
+    ' "$WORK/closure-config.yaml"
+  fi
+  helm template uzi "$STRIPPED" --show-only templates/api-deployment.yaml "$@" > "$WORK/closure-api.yaml"
+  awk -v mode="$closure_mode" -v expected="$closure_value" -v scenario="$closure_case" '
+    /^kind: Deployment$/ { deployments++ }
+    $1 == "-" && $2 == "name:" {
+      target = ($3 == "UZI_PREREQUISITE_CLOSURE_FORGES")
+      if (target) count++
+      next
+    }
+    target && $1 == "value:" { values++; value=$2 }
+    target && $1 == "valueFrom:" { sources++ }
+    target && $1 == "key:" { key=$2 }
+    END {
+      if (deployments != 1) { print "BROKEN: prerequisite check needs one API Deployment"; exit 2 }
+      if (mode == "config") {
+        if (count != 0) { print "FAIL: prerequisite chart value overrides legacy api.config"; exit 1 }
+      } else if (count != 1 || (mode == "plain" && (values != 1 || value != expected || sources != 0)) ||
+                 (mode == "secret" && (sources != 1 || values != 0 || key != "\"PREREQUISITE_FORGES\""))) {
+        printf "FAIL: prerequisite forge env case %s must render exactly one %s entry\n", scenario, mode
+        exit 1
+      }
+    }
+  ' "$WORK/closure-api.yaml"
+done
+echo "OK: prerequisite forge default, overrides and legacy Secret/ConfigMap precedence"
+
 
 # Pod-epoch runtime: exact enum even with Docker disabled. Each render is one
 # attempt; failure stops the matrix. Docker alone gains pod watch/patch.

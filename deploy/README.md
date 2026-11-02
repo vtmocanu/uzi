@@ -564,6 +564,17 @@ cookies, no CSRF), so it works through the TLS ingress unchanged. The token is
 shown once at issuance. See `docs/worker-setup.md` for the full procedure and
 `ARCHITECTURE.md` for the trust model.
 
+## Prerequisite closure pinning
+
+Set `api.prerequisiteClosureForges: "github"` to opt the API into prerequisite
+pinning and closure-backed release; the empty default is off. This is a comma
+list, but only `github` at `https://github.com` is admitted today; `gitlab` and
+`forgejo` parse but admission is refused. Existing `api.secretEnv` entries for
+`UZI_PREREQUISITE_CLOSURE_FORGES` take precedence, followed by `api.config`, then
+this plain value. Remove a legacy entry when migrating to the plain value.
+See [ADR-3591](../adr/3591-prerequisite-closure.md) and the
+[configuration reference](../docs/configuration.md).
+
 ## Hosted workers (PRD #58)
 
 **Shipped and OFF.** The chart carries the whole feature — the worker namespace and
