@@ -1,12 +1,17 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
-import { GitCache, ScratchPublicationError } from "../src/git.js";
+import { GitCache, ScratchPublicationError, type CheckpointPublicationContext } from "../src/git.js";
 import { WorkerClient } from "../src/client.js";
 import { RunRunner } from "../src/runner.js";
 import { nullLogger } from "./helpers.js";
 
 const TIP = "a".repeat(40);
+const publicationContext: CheckpointPublicationContext = {
+  sourceSha: TIP, candidateSha: TIP, excludeSha: TIP, packExcludeShas: [TIP],
+  restrictionFacts: { enrolled: false, blocked: false, roots: [], flaggedOIDs: [],
+    fingerprint: "fixture-confirmed-absence" },
+};
 const ACK = { ok: true, body: { published: true } };
 const FAIL = { ok: false, httpStatus: 500 };
 
@@ -33,6 +38,11 @@ function start(opts: {
 } = {}) {
   const abort = new AbortController();
   const git = new GitCache("/unused", nullLogger());
+  // Transport fixtures declare confirmed absence; real runner admission still checks the binding.
+  git.readRemediationRestrictionFacts = async (bare, branch, exactRunId) => {
+    assert.deepEqual([bare, branch, exactRunId], ["bare", "branch", "retry"]);
+    return publicationContext.restrictionFacts!;
+  };
   const client = new WorkerClient("http://unused", "test", "test", nullLogger());
   const backoff = opts.backoffMs ?? (opts.abort === "backoff" ? [60_000, 60_000] as const : [0, 0] as const);
   const hooks = backoff === "production" ? undefined : { retryBackoffMs: backoff };
@@ -67,7 +77,7 @@ function start(opts: {
     const replay = async () => {
       if (opts.packThrows) throw new Error("local pack failure");
       if (producers && opts.refusal === "scratch") throw new ScratchPublicationError("refused");
-      await guard?.(TIP);
+      await guard?.(TIP, publicationContext);
       producers++;
       events.push("open");
       return { pack: Readable.from(["exact-pack"]), exited,
@@ -105,7 +115,7 @@ function start(opts: {
   const runLog = { ...nullLogger(), warn: (msg: string, fields?: Record<string, unknown>) => {
     if (msg === "checkpoint publish retry") retryLogs.push({ attempt: fields?.attempt, backoff_ms: fields?.backoff_ms });
   } };
-  const flight = { runId: "retry", runKind: "issue", lastCheckpointRefTip: "OLD",
+  const flight = { cancel: abort, steering: { lifecycleSignal: () => abort.signal }, runId: "retry", runKind: "issue", barePath: "bare", branch: "branch", lastCheckpointRefTip: "OLD",
     lastAttemptedCheckpointRefTip: undefined as string | undefined,
     reportedPublishOutcomes: new Set<string>(), runLog,
     batcher: { emit: (value: unknown) => feed.push(value) } };

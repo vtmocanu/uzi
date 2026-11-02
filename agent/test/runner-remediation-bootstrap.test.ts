@@ -451,7 +451,8 @@ for (const late of ["confirmed", "unavailable", "blocked", "reconfirmed", "initi
           read(args[0], args[1], args[2], undefined, { readback: async () => "different" }));
         restoreRead = () => faulty.mock.restore();
       }
-      assert.deepEqual(await subject.bridgeBareTrackingRefIfDivergent(f.bare, BRANCH, flight, nullLogger()), { kind: "unknown" });
+      assert.deepEqual(await subject.bridgeBareTrackingRefIfDivergent(f.bare, BRANCH, flight, nullLogger()),
+        { kind: late === "confirmed" ? "clean" : "unknown" });
       if (late !== "confirmed") {
         assert.equal(flight.preserveRecoveryClone, true);
         assert.ok(flight.remediationRestrictions.roots.includes(f.q));

@@ -759,7 +759,20 @@ for (const unsafeAt of [0, 1, 2]) {
     const { RunRunner } = await import("../src/runner.js");
     const { WorkerClient } = await import("../src/client.js");
     const git = cache();
-    Object.assign(git, { prepareCheckpointObjects: async () => Buffer.from(TIP + "\n") });
+    // This broker lifecycle fixture has a bound legacy, unenrolled repository.
+    const restrictionFacts = { enrolled: false, blocked: false, roots: [], flaggedOIDs: [],
+      fingerprint: "fixture-confirmed-absence" };
+    git.readRemediationRestrictionFacts = async (bare, branch, runId) => {
+      assert.deepEqual([bare, branch, runId], ["bare", "task", "retry-cleanup"]);
+      return restrictionFacts;
+    };
+    Object.assign(git, {
+      remediationRestrictionFactsUnderLock: async (bare: string, branch: string, runId: string) => {
+        assert.deepEqual([bare, branch, runId], ["bare", "task", "retry-cleanup"]);
+        return restrictionFacts;
+      },
+      prepareCheckpointObjects: async () => Buffer.from(TIP + "\n"),
+    });
     const cancelling = deferred(), release = deferred();
     const failure = new CheckpointUnsafeCleanupError("producer cancellation disposal unverified");
     let launches = 0, requests = 0;
@@ -786,16 +799,18 @@ for (const unsafeAt of [0, 1, 2]) {
       nullLogger(), 1, undefined, { checkpointTestHooks: { retryBackoffMs: [0, 0] } });
     Object.assign(runner, {
       requireTrackingOwned: async () => TIP,
-      checkpointRemediationHold: async () => false,
-      ciConfigGuardBlocksPublication: async () => false,
     });
-    const flight = { runId: "retry-cleanup", runKind: "issue", lastCheckpointRefTip: "old",
+    const lifecycle = new AbortController();
+    const flight = { cancel: lifecycle, steering: { lifecycleSignal: () => lifecycle.signal }, runId: "retry-cleanup", runKind: "issue", barePath: "bare", branch: "task", lastCheckpointRefTip: "old",
       reportedPublishOutcomes: new Set<string>(), runLog: nullLogger(), batcher: { emit() {} } };
     const result = git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
       runner["publishCheckpointOutcome"](flight as never, "bare", "task"))
       .then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
     try {
-      await cancelling.promise;
+      assert.deepEqual(await Promise.race([
+        cancelling.promise.then(() => ({ kind: "cancellation" })),
+        result.then(outcome => ({ kind: "publication", outcome })),
+      ]), { kind: "cancellation" }, "publication must reach producer cancellation before returning");
       assert.equal(launches, 1, "no successor producer before cancellation settles");
       release.resolve();
       const outcome = await result;
