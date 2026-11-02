@@ -18,7 +18,7 @@ import (
 // ObserveExactHold reads one snapshot, independently of the held-publication write switch.
 // Missing or unverified scope is unknown; no current-run ownership is required.
 func (s *Service) ObserveExactHold(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64) (*apitypes.RecoveryExactHold, error) {
-	if generation <= 0 || !slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV2) {
+	if generation <= 0 || (!slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV2) && !slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryBindinglessClosedV1)) {
 		return nil, nil
 	}
 	var raw []byte
@@ -110,7 +110,14 @@ func validExactClosedObservation(out apitypes.RecoveryExactHold, owner uuid.UUID
 	}
 }
 
+// raw_candidates deliberately counts custody before any authorization or proof predicate.
+// MATERIALIZED plus LIMIT 2 bounds ambiguity detection in this same statement snapshot.
 const exactHoldObservationSQL = `
+WITH raw_candidates AS MATERIALIZED (
+ SELECT * FROM recovery_custody_holds WHERE run_id=$1 AND generation=$2 LIMIT 2
+), sole_candidate AS (
+ SELECT * FROM raw_candidates WHERE (SELECT count(*) FROM raw_candidates)=1
+)
 SELECT jsonb_strip_nulls(jsonb_build_object(
  'run_id', h.run_id, 'hold_id', h.id, 'generation', h.generation, 'repo_id', h.repo_id,
  'original_worker_id', h.original_worker_id, 'original_worker_identity', h.original_worker_identity,
@@ -124,14 +131,14 @@ SELECT jsonb_strip_nulls(jsonb_build_object(
    'publication_id', h.final_publication_id, 'source_sha', h.final_source_sha,
    'coverage_digest', h.final_coverage_digest) END,
  'completed_publication_receipt', h.completed_publication_receipt))
-FROM recovery_custody_holds h
-JOIN runs r ON r.id=h.run_id AND r.user_id=h.user_id AND r.repo_id=h.repo_id
-JOIN workers w ON w.id=h.original_worker_id AND w.user_id=h.user_id
+FROM sole_candidate h
+JOIN runs r ON r.id=$1 AND r.user_id=$4 AND r.user_id=h.user_id AND r.repo_id=h.repo_id
+JOIN workers w ON w.id=$3 AND w.user_id=$4 AND w.id=h.original_worker_id
 WHERE h.run_id=$1 AND h.generation=$2 AND h.original_worker_id=$3 AND h.user_id=$4
  AND h.inventory_guarded AND h.generation > 0 AND r.claim_generation >= h.generation
  AND (r.egress_profile_id IS NOT NULL)=$5 AND w.isolated_lane=$5
  AND NOT (r.kind='cross_check' AND r.claim_generation=0)
- AND h.original_worker_identity <> ''
+ AND btrim(h.original_worker_identity) <> ''
  AND ((h.state='open' AND h.live_worker_id=h.original_worker_id AND h.live_run_id=h.run_id
        AND h.release_evidence IS NULL AND h.final_disposition IS NULL)
    OR (h.state IN ('released','discarded') AND h.live_worker_id IS NULL AND h.live_run_id IS NULL
@@ -150,10 +157,14 @@ WHERE h.run_id=$1 AND h.generation=$2 AND h.original_worker_id=$3 AND h.user_id=
          OR (h.final_disposition='archive' AND (h.release_evidence='archive'
            OR (h.release_evidence='prerequisite_closure' AND h.final_closure_id IS NOT NULL AND EXISTS (
             SELECT 1 FROM recovery_prerequisite_closures pc WHERE pc.id=h.final_closure_id
-             AND pc.capture_id=h.final_capture_id AND pc.hold_id=h.id)))
+             AND pc.capture_id=h.final_capture_id AND pc.hold_id=h.id
+             AND pc.run_id=h.run_id AND pc.user_id=h.user_id AND pc.repo_id=h.repo_id
+             AND EXISTS (SELECT 1 FROM recovery_captures cc WHERE cc.id=pc.capture_id
+              AND pc.checksum=cc.checksum AND pc.prerequisite_shas=cc.prerequisite_shas))))
           AND h.final_publication_id IS NULL AND EXISTS (
            SELECT 1 FROM recovery_captures c WHERE c.id=h.final_capture_id AND c.hold_id=h.id
             AND c.run_id=h.run_id AND c.user_id=h.user_id AND c.original_worker_id=h.original_worker_id
+            AND c.manifest_bound AND c.original_worker_identity=h.original_worker_identity
             AND c.source_sha=h.final_source_sha AND c.coverage_digest=h.final_coverage_digest))
          OR (h.final_disposition='held_publication' AND h.release_evidence='held_publication'
           AND h.final_capture_id IS NULL AND EXISTS (
