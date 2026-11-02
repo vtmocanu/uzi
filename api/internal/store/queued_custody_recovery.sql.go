@@ -12,12 +12,92 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const discoverStaleQueuedCustodyTargets = `-- name: DiscoverStaleQueuedCustodyTargets :many
+SELECT r.id, r.worker_id, jsonb_build_object(
+    'id', r.id,
+    'kind', r.kind,
+    'target_run_id', r.target_run_id,
+    'worker_id', r.worker_id,
+    'user_id', r.user_id,
+    'status', r.status,
+    'status_since', r.status_since,
+    'requeue_count', r.requeue_count,
+    'claimed_at', r.claimed_at,
+    'claim_generation', r.claim_generation,
+    'worker_recovery_episode', r.worker_recovery_episode,
+    'requeue_episode_baseline', r.requeue_episode_baseline,
+    'claim_released_at', r.claim_released_at,
+    'released_worker_id', r.released_worker_id,
+    'released_worker_nonce', r.released_worker_nonce,
+    'pause_requested_at', r.pause_requested_at,
+    'pause_mode', r.pause_mode,
+    'credential_switch_requested_at', r.credential_switch_requested_at,
+    'credential_switch_generation', r.credential_switch_generation,
+    'stop_kind', r.stop_kind,
+    'stop_reason', r.stop_reason,
+    'hold_reason', r.hold_reason)::jsonb AS frozen_target
+FROM runs r JOIN workers w ON w.id = r.worker_id AND w.user_id = r.user_id
+WHERE r.id > $1::uuid AND r.created_at <= $2::timestamptz
+  AND (w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < $3::timestamptz)
+  AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND r.egress_profile_id IS NULL AND r.status = 'queued'
+  AND r.claim_generation > 0
+  AND (r.requeue_count - r.requeue_episode_baseline) >= $4
+  AND EXISTS (SELECT 1 FROM recovery_custody_holds h
+      WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.state = 'open'
+        AND h.generation BETWEEN 1 AND r.claim_generation)
+ORDER BY r.id LIMIT 32
+`
+
+type DiscoverStaleQueuedCustodyTargetsParams struct {
+	AfterID      uuid.UUID          `json:"after_id"`
+	SweepStarted pgtype.Timestamptz `json:"sweep_started"`
+	Cutoff       pgtype.Timestamptz `json:"cutoff"`
+	MaxRequeues  int32              `json:"max_requeues"`
+}
+
+type DiscoverStaleQueuedCustodyTargetsRow struct {
+	ID           uuid.UUID   `json:"id"`
+	WorkerID     pgtype.UUID `json:"worker_id"`
+	FrozenTarget []byte      `json:"frozen_target"`
+}
+
+// Read-only keyset discovery. The cursor advances by the last discovered ID,
+// including batches whose captured tuples are superseded before locks arrive.
+func (q *Queries) DiscoverStaleQueuedCustodyTargets(ctx context.Context, arg DiscoverStaleQueuedCustodyTargetsParams) ([]DiscoverStaleQueuedCustodyTargetsRow, error) {
+	rows, err := q.db.Query(ctx, discoverStaleQueuedCustodyTargets,
+		arg.AfterID,
+		arg.SweepStarted,
+		arg.Cutoff,
+		arg.MaxRequeues,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []DiscoverStaleQueuedCustodyTargetsRow{}
+	for rows.Next() {
+		var i DiscoverStaleQueuedCustodyTargetsRow
+		if err := rows.Scan(&i.ID, &i.WorkerID, &i.FrozenTarget); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockFrozenQueuedCustodyHolds = `-- name: LockFrozenQueuedCustodyHolds :many
-SELECT h.id FROM recovery_custody_holds h
-JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
-WHERE h.state = 'open' AND h.generation BETWEEN 1 AND r.claim_generation
-  AND r.worker_id = $1
-  AND r.kind NOT IN ('chat','cross_check') AND r.status = 'queued'
+WITH chosen AS MATERIALIZED (
+SELECT picked.id FROM runs r
+CROSS JOIN LATERAL (
+    SELECT own.id FROM recovery_custody_holds own
+    WHERE own.run_id = r.id AND own.user_id = r.user_id AND own.state = 'open'
+      AND own.generation BETWEEN 1 AND r.claim_generation
+    ORDER BY own.id LIMIT LEAST(GREATEST($1::integer, 0), 1000)
+) picked
+WHERE r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND r.egress_profile_id IS NULL AND r.status = 'queued'
   AND r.id = ANY($2::uuid[])
   AND EXISTS (
       SELECT 1 FROM jsonb_to_recordset($3::jsonb) AS f(
@@ -65,20 +145,23 @@ WHERE h.state = 'open' AND h.generation BETWEEN 1 AND r.claim_generation
         AND f.stop_kind IS NOT DISTINCT FROM r.stop_kind
         AND f.stop_reason IS NOT DISTINCT FROM r.stop_reason
         AND f.hold_reason IS NOT DISTINCT FROM r.hold_reason)
+)
+SELECT h.id FROM recovery_custody_holds h
+WHERE h.id IN (SELECT id FROM chosen)
 ORDER BY h.run_id, h.id FOR NO KEY UPDATE OF h
 `
 
 type LockFrozenQueuedCustodyHoldsParams struct {
-	WorkerID        pgtype.UUID `json:"worker_id"`
-	LockedParentIds []uuid.UUID `json:"locked_parent_ids"`
-	FrozenTargets   []byte      `json:"frozen_targets"`
+	CustodyHoldLimit int32       `json:"custody_hold_limit"`
+	LockedParentIds  []uuid.UUID `json:"locked_parent_ids"`
+	FrozenTargets    []byte      `json:"frozen_targets"`
 }
 
 // Parents (including every non-checker target) are already locked. This is an
 // independent statement before the writer's fresh count. NO KEY UPDATE excludes
 // custody settlement while allowing FK key-share readers.
 func (q *Queries) LockFrozenQueuedCustodyHolds(ctx context.Context, arg LockFrozenQueuedCustodyHoldsParams) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, lockFrozenQueuedCustodyHolds, arg.WorkerID, arg.LockedParentIds, arg.FrozenTargets)
+	rows, err := q.db.Query(ctx, lockFrozenQueuedCustodyHolds, arg.CustodyHoldLimit, arg.LockedParentIds, arg.FrozenTargets)
 	if err != nil {
 		return nil, err
 	}
@@ -98,28 +181,106 @@ func (q *Queries) LockFrozenQueuedCustodyHolds(ctx context.Context, arg LockFroz
 }
 
 const lockStaleQueuedCustodyWorkers = `-- name: LockStaleQueuedCustodyWorkers :many
-SELECT w.id FROM workers w
-WHERE (w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < $1)
-  AND EXISTS (SELECT 1 FROM runs r WHERE r.worker_id = w.id
-      AND r.status = 'queued' AND r.claim_generation > 0)
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch, w.dind_register_floor, w.dind_meter_epoch, w.dind_meter_at, w.dind_pressure_streak, w.dind_meter_over, w.dind_below_threshold, w.maintenance_owns_drain, w.nix_pressure, w.data_pressure, w.maintenance_id, w.maintenance_nonce, w.maintenance_phase, w.maintenance_deployment_uid, w.maintenance_pvc_uid, w.maintenance_register_nonce, w.maintenance_fenced, w.maintenance_ready_ack, w.maintenance_ack_at, w.maintenance_activity_floor, w.max_cross_check_slots, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason, w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason FROM workers w
+WHERE w.id = ANY($1::uuid[])
+  AND (w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < $2::timestamptz)
 ORDER BY w.id FOR UPDATE OF w
 `
 
-// Settings admission precedes every worker lock. Lock the full worker set before
-// any recovery parent locks; the caller rechecks staleness under these locks.
-func (q *Queries) LockStaleQueuedCustodyWorkers(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, lockStaleQueuedCustodyWorkers, cutoff)
+type LockStaleQueuedCustodyWorkersParams struct {
+	WorkerIds []uuid.UUID        `json:"worker_ids"`
+	Cutoff    pgtype.Timestamptz `json:"cutoff"`
+}
+
+// Settings admission precedes this bounded, globally ordered worker lock set.
+func (q *Queries) LockStaleQueuedCustodyWorkers(ctx context.Context, arg LockStaleQueuedCustodyWorkersParams) ([]Worker, error) {
+	rows, err := q.db.Query(ctx, lockStaleQueuedCustodyWorkers, arg.WorkerIds, arg.Cutoff)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []uuid.UUID{}
+	items := []Worker{}
 	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		var i Worker
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.Name,
+			&i.TokenHash,
+			&i.Status,
+			&i.LastHeartbeatAt,
+			&i.Version,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.TemplateDeclared,
+			&i.TemplateReported,
+			&i.MaxConcurrentRuns,
+			&i.StatsCpuPct,
+			&i.StatsMemBytes,
+			&i.StatsMemLimitBytes,
+			&i.StatsSource,
+			&i.Kind,
+			&i.HostedSize,
+			&i.HostedGeneration,
+			&i.DockerEnabled,
+			&i.AnthropicSecretID,
+			&i.AnthropicBindMode,
+			&i.OnlineSince,
+			&i.DrainingSince,
+			&i.Capabilities,
+			&i.Ephemeral,
+			&i.EphemeralRunID,
+			&i.StatsDiskNixBytes,
+			&i.StatsDiskNixTotalBytes,
+			&i.StatsDiskDataBytes,
+			&i.StatsDiskDataTotalBytes,
+			&i.StatsDiskPressureStreak,
+			&i.ProtocolCapabilities,
+			&i.SnapshotEpoch,
+			&i.SnapshotRegisterNonce,
+			&i.PendingOverflow,
+			&i.PendingOverflowUntil,
+			&i.StatsDiskDindBytes,
+			&i.StatsDiskDindTotalBytes,
+			&i.StatsDiskDindInodes,
+			&i.StatsDiskDindTotalInodes,
+			&i.StatsDiskDataInodes,
+			&i.StatsDiskDataTotalInodes,
+			&i.IsolatedLane,
+			&i.LeaseSince,
+			&i.LeaseRepoID,
+			&i.LeaseBranch,
+			&i.DindRegisterFloor,
+			&i.DindMeterEpoch,
+			&i.DindMeterAt,
+			&i.DindPressureStreak,
+			&i.DindMeterOver,
+			&i.DindBelowThreshold,
+			&i.MaintenanceOwnsDrain,
+			&i.NixPressure,
+			&i.DataPressure,
+			&i.MaintenanceID,
+			&i.MaintenanceNonce,
+			&i.MaintenancePhase,
+			&i.MaintenanceDeploymentUid,
+			&i.MaintenancePvcUid,
+			&i.MaintenanceRegisterNonce,
+			&i.MaintenanceFenced,
+			&i.MaintenanceReadyAck,
+			&i.MaintenanceAckAt,
+			&i.MaintenanceActivityFloor,
+			&i.MaxCrossCheckSlots,
+			&i.RegisteredPodUid,
+			&i.RollHeartbeatAt,
+			&i.DrainingReason,
+			&i.ManualCordonedAt,
+			&i.ManualCordonedBy,
+			&i.ManualCordonedByLabel,
+			&i.ManualCordonReason,
+		); err != nil {
 			return nil, err
 		}
-		items = append(items, id)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -140,7 +301,7 @@ UPDATE runs r SET status = 'recovery_wait', status_since = now(),
     updated_at = now()
 WHERE r.worker_id = $2 AND r.id = ANY($3::uuid[])
   AND r.status = 'queued' AND r.claim_generation > 0
-  AND r.kind NOT IN ('chat','cross_check')
+  AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND r.egress_profile_id IS NULL
   AND r.pause_requested_at IS NULL AND r.credential_switch_requested_at IS NULL
   AND r.stop_reason IS NULL AND r.stop_kind IS NULL AND r.hold_reason IS NULL
   AND (r.requeue_count - r.requeue_episode_baseline) >= $4
@@ -206,10 +367,13 @@ WHERE r.worker_id = $2 AND r.id = ANY($3::uuid[])
              OR (a.terminal_pending AND a.terminal_pending_until > now())))
   AND NOT EXISTS (SELECT 1 FROM workers w
       WHERE w.id = r.worker_id AND w.pending_overflow_until > now())
-  -- Durable publication enrollment and historical finalize generation marks
-  -- do not prove live authority. Only an attested requeue in this transaction
-  -- carries a usable finalize continuation into the queued write.
-  AND NOT (r.id = ANY(COALESCE($10::uuid[], ARRAY[]::uuid[])))
+  -- FrozenRequeueAttestedFinalizeRuns leaves this usable one-shot tuple until
+  -- a subsequent claim, release or Resume invalidates its authority.
+  AND NOT ($4 > 0 AND r.worker_recovery_episode = 0
+      AND (r.requeue_count - r.requeue_episode_baseline) > $4
+      AND r.claim_generation > 0
+      AND COALESCE(r.finalize_resume_generation = r.claim_generation, false)
+      AND r.claim_released_at IS NULL)
 RETURNING r.id, r.status
 `
 
@@ -223,7 +387,6 @@ type ParkFrozenQueuedCustodyExhaustedParams struct {
 	LockedHoldIds       []uuid.UUID        `json:"locked_hold_ids"`
 	HeartbeatCutoff     pgtype.Timestamptz `json:"heartbeat_cutoff"`
 	SnapshotFreshCutoff pgtype.Timestamptz `json:"snapshot_fresh_cutoff"`
-	FinalizeRequeuedIds []uuid.UUID        `json:"finalize_requeued_ids"`
 }
 
 type ParkFrozenQueuedCustodyExhaustedRow struct {
@@ -245,7 +408,6 @@ func (q *Queries) ParkFrozenQueuedCustodyExhausted(ctx context.Context, arg Park
 		arg.LockedHoldIds,
 		arg.HeartbeatCutoff,
 		arg.SnapshotFreshCutoff,
-		arg.FinalizeRequeuedIds,
 	)
 	if err != nil {
 		return nil, err
@@ -292,7 +454,7 @@ FROM jsonb_to_recordset($1::jsonb) AS f(
           stop_reason text,
           hold_reason text)
 JOIN runs r ON r.id = f.id
-WHERE r.id = ANY($2::uuid[]) AND r.kind NOT IN ('chat', 'cross_check')
+WHERE r.id = ANY($2::uuid[]) AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND r.egress_profile_id IS NULL
   AND f.id IS NOT DISTINCT FROM r.id
   AND f.kind IS NOT DISTINCT FROM r.kind
   AND f.target_run_id IS NOT DISTINCT FROM r.target_run_id
@@ -315,7 +477,7 @@ WHERE r.id = ANY($2::uuid[]) AND r.kind NOT IN ('chat', 'cross_check')
   AND ((f.status IS NOT DISTINCT FROM r.status
         AND f.status_since IS NOT DISTINCT FROM r.status_since
         AND f.requeue_count = r.requeue_count)
-       OR (r.id = ANY($3::uuid[]) AND f.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+       OR (r.id = ANY($3::uuid[]) AND f.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
            AND r.status = 'queued' AND r.requeue_count = f.requeue_count + 1))
 `
 

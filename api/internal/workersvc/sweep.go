@@ -242,12 +242,12 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 			s.persistFail.evict(r.ID)
 		}
 
-		queuedParked, err := s.parkStaleQueuedCustody(ctx, failCutoff)
+		queuedParked, err := s.parkStaleQueuedCustody(ctx, failCutoff, now)
 		if err != nil {
-			return res, fmt.Errorf("park stale queued custody: %w", err)
+			return res, fmt.Errorf("park stale queued custody (committed %d): %w", queuedParked, err)
 		}
-		for _, row := range queuedParked {
-			s.publishSwept(row.ID, row.Status)
+		if queuedParked > 0 {
+			slog.Info("parked stale queued custody", "count", queuedParked)
 		}
 
 		// Issue #1324 D5: a queued run whose publication intent only its custodian worker may

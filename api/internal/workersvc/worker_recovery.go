@@ -47,14 +47,19 @@ func validatedSnapshotIDs(entries []validatedEntry) []uuid.UUID {
 }
 
 func captureWorkerRecoveryLocks(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, entries []validatedEntry, attested validatedFinalizeResume, pendingIDs ...[]uuid.UUID) (workerRecoveryLockSet, error) {
+	return captureWorkerRecoveryLocksWithQueued(ctx, qtx, workerID, entries, attested, store.LockWorkerRecoveryParentsParams{}, pendingIDs...)
+}
+
+func captureWorkerRecoveryLocksWithQueued(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, entries []validatedEntry, attested validatedFinalizeResume, admission store.LockWorkerRecoveryParentsParams, pendingIDs ...[]uuid.UUID) (workerRecoveryLockSet, error) {
 	ids := validatedSnapshotIDs(entries)
 	for _, pending := range pendingIDs {
 		ids = append(ids, pending...)
 	}
-	rows, err := qtx.LockWorkerRecoveryParents(ctx, store.LockWorkerRecoveryParentsParams{
-		WorkerID: pgconv.UUID(workerID), SnapshotRunIds: ids,
-		AttestedRunIds: attested.ids, AttestedClaimGenerations: attested.generations,
-	})
+	admission.WorkerID = pgconv.UUID(workerID)
+	admission.SnapshotRunIds = ids
+	admission.AttestedRunIds = attested.ids
+	admission.AttestedClaimGenerations = attested.generations
+	rows, err := qtx.LockWorkerRecoveryParents(ctx, admission)
 	if err != nil {
 		return workerRecoveryLockSet{}, err
 	}

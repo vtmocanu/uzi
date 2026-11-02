@@ -1193,13 +1193,7 @@ func stallBaseline(r store.ListActiveRunsForHealthRow) time.Time {
 // re-label, so a demoted-but-unplaceable run still reports the actionable capability block
 // rather than a yield message.
 func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) string {
-	return s.queuedReasonBeforeAge(ctx, now, r, th, false)
-}
-
-// queuedReasonBeforeAge shares prerequisite and manual evidence ordering with the
-// ordinary ladder. early stops before transient fleet diagnostics for young runs.
-func (s *Service) queuedReasonBeforeAge(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, early bool) string {
-	return s.queuedReasonWithEligibility(ctx, now, r, th, early, nil)
+	return s.queuedReasonWithEligibility(ctx, now, r, th, nil)
 }
 
 // healthEligibilityResult belongs to one evaluation, including a failed read.
@@ -1222,7 +1216,7 @@ func QueuedReasonPrecedesCodexAdmission(reason string) bool {
 	}
 }
 
-func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, early bool, projection *healthEligibilityResult) string {
+func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds, projection *healthEligibilityResult) string {
 	// PRD #3454: the instance intake pause outranks every rung, the handoff one included, since the
 	// pause is the reason ClaimRun matches nothing.
 	if r.IntakePauseHeld {
@@ -1317,9 +1311,6 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 		// A failed projection cannot prove that the prior manual block ended.
 		// Account prerequisites and independent stale requeue pins retain priority.
 		return r.HealthReason.String
-	}
-	if early {
-		return ""
 	}
 	if eligibilityErr == nil && eligibility.ForgeBlocked > 0 && eligibility.Claimable == 0 {
 		return reasonForgeOriginWait
