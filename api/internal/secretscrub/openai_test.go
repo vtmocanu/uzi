@@ -37,6 +37,34 @@ func TestScrubOpenAIKeys(t *testing.T) {
 	}
 }
 
+func TestScrubOverlappingCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"project-containing-slack", "sk-" + "proj-" + strings.Repeat("A", 8) + "xoxb-" + strings.Repeat("A", 61) + "T3BlbkFJ" + strings.Repeat("B", 74), "[redacted]"},
+		{"gitlab-containing-openai", "glpat-" + "Ab12" + "sk-" + strings.Repeat("C", 20) + "_D34", "[redacted]"},
+		{"worker-containing-openai", "uzw_" + strings.Repeat("A", 15) + "sk-" + strings.Repeat("B", 16) + "_" + strings.Repeat("C", 7) + "A", "[redacted]"},
+		{"github-crossing-openai", "ghp_" + strings.Repeat("A", 16) + "sk-" + strings.Repeat("B", 20), "[redacted]"},
+		{"classic-self-crossing", "sk-" + strings.Repeat("A", 46) + "sk-" + strings.Repeat("B", 48), "[redacted]"},
+		{"classic-self-chain", "sk-" + strings.Repeat("A", 46) + "sk-" + strings.Repeat("B", 46) + "sk-" + strings.Repeat("C", 48), "[redacted]"},
+		{"separate-credentials", "glpat-" + strings.Repeat("A", 20) + ", " + "sk-" + strings.Repeat("B", 20), "[redacted], [redacted]"},
+		{"slack-positive-control", "xoxb-" + strings.Repeat("A", 20), "[redacted]"},
+		{"display-prefixes", "glpat-Ab12 sk-" + strings.Repeat("C", 15) + " uzw_A1 ghp_B2", "glpat-Ab12 sk-" + strings.Repeat("C", 15) + " uzw_A1 ghp_B2"},
+		{"prose", "OpenAI, GitLab and Slack credentials", "OpenAI, GitLab and Slack credentials"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "project-containing-slack" && len(tc.input) != 164 {
+				t.Fatal("overlapping project fixture must be 164 bytes")
+			}
+			if got := secretscrub.Scrub("before (" + tc.input + "), after"); got != "before ("+tc.want+"), after" {
+				t.Fatal("Scrub must remove the union of overlapping credentials and preserve surrounding text")
+			}
+		})
+	}
+}
+
 func TestScrubOpenAIPreservesProseAndDisplayPrefixes(t *testing.T) {
 	for _, input := range []string{
 		"OpenAI project and service-account keys are configured separately.",

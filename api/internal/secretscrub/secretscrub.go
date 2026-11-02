@@ -15,7 +15,11 @@
 // line of defense, never a licence to route a secret through a surface.
 package secretscrub
 
-import "regexp"
+import (
+	"regexp"
+	"sort"
+	"strings"
+)
 
 // The credential families uzi handles. Kept close to slacksvc's originals so the
 // extraction is behaviour-preserving, then widened (PRD #954 M1, change A):
@@ -57,15 +61,55 @@ var (
 
 // Scrub replaces every recognised secret family with a placeholder.
 func Scrub(s string) string {
-	s = slackTokenPattern.ReplaceAllString(s, "[redacted]")
-	s = slackRefreshPattern.ReplaceAllString(s, "[redacted]")
-	s = anthropicPattern.ReplaceAllString(s, "[redacted]")
-	s = openaiPattern.ReplaceAllString(s, "[redacted]")
-	s = gitlabPATPattern.ReplaceAllString(s, "[redacted]")
-	s = githubClassicPattern.ReplaceAllString(s, "[redacted]")
-	s = githubFineGrainPattern.ReplaceAllString(s, "[redacted]")
-	s = uziTokenPattern.ReplaceAllString(s, "[redacted]")
-	return s
+	// Match the original input and merge overlapping spans so Scrub cannot
+	// expose credential fragments by replacing another family first.
+	var matches [][]int
+	for _, pattern := range []*regexp.Regexp{
+		slackTokenPattern, slackRefreshPattern, anthropicPattern, openaiPattern,
+		gitlabPATPattern, githubClassicPattern, githubFineGrainPattern, uziTokenPattern,
+	} {
+		for offset := 0; offset < len(s); {
+			match := pattern.FindStringIndex(s[offset:])
+			if match == nil {
+				break
+			}
+			match[0] += offset
+			match[1] += offset
+			matches = append(matches, match)
+			// A classic OpenAI body excludes hyphens: another sk- prefix can
+			// cross its end by two bytes. Other registered families include
+			// their prefix alphabet in their body, so internal matches cannot
+			// extend beyond the greedy match. Keep only that two-byte overlap
+			// instead of rescanning whole bodies (which would be quadratic).
+			offset = max(match[0]+1, match[1]-2)
+		}
+	}
+	if len(matches) == 0 {
+		return s
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i][0] < matches[j][0]
+	})
+
+	var result strings.Builder
+	previousEnd := 0
+	start, end := matches[0][0], matches[0][1]
+	for _, match := range matches[1:] {
+		if match[0] < end {
+			if match[1] > end {
+				end = match[1]
+			}
+			continue
+		}
+		result.WriteString(s[previousEnd:start])
+		result.WriteString("[redacted]")
+		previousEnd = end
+		start, end = match[0], match[1]
+	}
+	result.WriteString(s[previousEnd:start])
+	result.WriteString("[redacted]")
+	result.WriteString(s[end:])
+	return result.String()
 }
 
 // ScrubSlackTokens replaces only Slack token substrings — the bot/app/user families

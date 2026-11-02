@@ -177,7 +177,7 @@ func TestCrossCheckHistoryWindowsAndReadPurityLiveDB(t *testing.T) {
 	// Schema-valid legacy nonautomatic rounds: never widen the automatic budget.
 	for round := 1; round <= 31; round++ {
 		child := any(nil)
-		if round == 1 {
+		if round == 1 || round == 31 {
 			child = f.child(parent, "running")
 		}
 		result, reason := "revise", "revise"
@@ -199,12 +199,15 @@ func TestCrossCheckHistoryWindowsAndReadPurityLiveDB(t *testing.T) {
 	}
 	before := snapshot()
 	defaultWindow := f.list("", false).Groups[0]
-	if len(defaultWindow.Attempts) != 10 || defaultWindow.Attempts[8].Round != 31 ||
+	if len(defaultWindow.Attempts) != 10 || defaultWindow.Attempts[8].Stage != "plan" || defaultWindow.Attempts[8].Round != 31 ||
+		defaultWindow.Attempts[8].ChildStatus == nil || *defaultWindow.Attempts[8].ChildStatus != "running" || defaultWindow.Attempts[8].Execution != "running" ||
 		defaultWindow.Attempts[9].Stage != "code" || defaultWindow.OlderCursor == "" {
 		t.Fatal("default window hid newest running Plan or retained Code")
 	}
 	maxWindow := f.list("attempt_limit=20", true).Groups[0]
-	if len(maxWindow.Attempts) != 20 || maxWindow.Attempts[18].Round != 31 || maxWindow.Attempts[19].Stage != "code" {
+	if len(maxWindow.Attempts) != 20 || maxWindow.Attempts[18].Stage != "plan" || maxWindow.Attempts[18].Round != 31 ||
+		maxWindow.Attempts[18].ChildStatus == nil || *maxWindow.Attempts[18].ChildStatus != "running" || maxWindow.Attempts[18].Execution != "running" ||
+		maxWindow.Attempts[19].Stage != "code" {
 		t.Fatal("maximum window exceeded cap or hid newest evidence")
 	}
 	got := f.list("attempt_limit=2", false)
