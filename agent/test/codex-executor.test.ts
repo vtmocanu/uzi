@@ -20434,7 +20434,8 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       if (typed) t.mock.timers.enable({ apis: ["setTimeout"] });
       const executing = new RunRunner(client, git,
         () => ({ executor, homeDir }), diagnostics.log, 20, undefined, {
-          pollMs: 5, recoveryRetryMs: 5, codexBoundaryDeadlineMs: 200,
+          // Allow real durable restriction reads without changing the separate provider-idle trigger.
+          pollMs: 5, recoveryRetryMs: 5, codexBoundaryDeadlineMs: 1000,
           quiesceRun: async () => ({
             process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
             docker: { state: "not_wired", removed: [], detail: "not wired" },
