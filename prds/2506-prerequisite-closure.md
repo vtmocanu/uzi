@@ -1,7 +1,7 @@
 # PRD #2506 (option A): a pinned prerequisite closure lets a thin guarded capture release custody
 
 **Issue:** #2506 (option A only). Delivery under this PRD is **non-closing**: every PR uses `Refs #2506` and closes only its own child issue. #2506 stays open until the whole acceptance below is met. Option D shipped separately (ADR-2506) and does not complete this.
-**Current execution (2026-11-02):** C1a [#3601](https://github.com/vtmocanu/uzi/pull/3601), C1b [#3655](https://github.com/vtmocanu/uzi/pull/3655), C2 [#3748](https://github.com/vtmocanu/uzi/pull/3748) and C3 [#3778](https://github.com/vtmocanu/uzi/pull/3778) are merged, with exact-head child CI/lander acceptance recorded below. E5 is the scoped local full-history measurement, not a production release. The first two [parent goals](#acceptance-assessment-after-the-child-merges-2026-11-02) remain open for a combined large-history release/native-prune/restore proof. E6 remains two weeks of hosted post-roll reporting only; no release or operator observation is claimed or authorized by this update. The parent stays active and non-closing. Earlier worker-handoff records remain historical, not the current landing status.
+**Current execution (2026-11-02):** C1a [#3601](https://github.com/vtmocanu/uzi/pull/3601), C1b [#3655](https://github.com/vtmocanu/uzi/pull/3655), C2 [#3748](https://github.com/vtmocanu/uzi/pull/3748) and C3 [#3778](https://github.com/vtmocanu/uzi/pull/3778) are merged, with exact-head child CI/lander acceptance recorded below. E5 is the scoped local full-history measurement, not a production release. The first two [parent goals](#acceptance-assessment-after-the-child-merges-2026-11-02) are met by the #3803 combined large-history release/native-prune/restore proof (landed in [#3821](https://github.com/vtmocanu/uzi/pull/3821); see "#3803 landing"). E6 remains two weeks of hosted post-roll reporting only; no release or operator observation is claimed or authorized by this update. The parent stays active and non-closing. Earlier worker-handoff records remain historical, not the current landing status.
 
 **Historical design status:** DRAFT, revision 18 (2026-10-28), approved C1a/C1b split and review folds, pending exact-text final review. C1a and C1b are API-only; no filing or dispatch follows from this draft. Based on the exact revision-11 artifact (SHA256 `2205e1146950263b2aa90f35863cadec3f3debfbd350590b9e65bd560a9640ec`, whose header still said revision 10). The earlier paired architecture reviews and owner decisions remain the design history; this new evidence fold requires recov6 review and is not filing, dispatch or implementation approval. **E2 ran on GitHub on 2026-10-27 and returned FINDING (one measured workflow-scope refusal, zero probe malfunctions), conclusive for the tested production credential class.** The anchor strategy is feasible in that tested case; other forges and protected/ruleset configurations remain unverified. Existing source line anchors are historical at `91647464c02bd12ae30d4fce6aa656f2245e88e1`, not refreshed line numbers for current main. The new E2 section states the exact observed scope and remaining gates.
 **Priority:** High (inherits #2506). The independent architecture review CLAUDE.md requires for priority::high applies to this PRD and to each child before dispatch; no waiver. M0 is evidence-only and is never auto-dispatched.
@@ -62,6 +62,8 @@ Producer records (#3031) are not on main as a freeze path, but their identity cl
 - [x] Records produced by each real freeze path have a stated and tested outcome; no record gains held-publication authority; no binding or policy is reconstructed; the v2 refusal is unchanged; producer-origin records never mint a closure FINAL.
 
 ### Acceptance assessment after the child merges (2026-11-02)
+
+**Historical for goals 1 and 2:** the two **Open** rows and the remaining-work paragraph below are the pre-#3803 assessment, superseded by "#3803 landing" below. The other rows, E6 and the release limits stand.
 
 Reviewed against main `6d6e86bb2f9e275772bc3241fddb0c2a51a9cfd5`.
 All four implementation children are merged. This does not establish the two
@@ -1459,8 +1461,8 @@ recorded main median (46m34s), with about 44s of driver compilation; it is not
 relabelled as the final d26ff555 measurement. E5's owner clock excludes driver
 compilation and remains the separate local transport measurement above.
 
-No child merge establishes a hosted GitHub.com rollout, two weeks of E6 counts,
-or the two combined parent restore goals. Release remains an owner decision;
+No child merge establishes a hosted GitHub.com rollout or two weeks of E6 counts.
+The two combined parent restore goals were established later by #3803 (see "#3803 landing"). Release remains an owner decision;
 this progress-only change requests none.
 
 ## Simplification proposals still open
