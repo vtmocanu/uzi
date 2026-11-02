@@ -4,10 +4,15 @@ import { stripDisplayCell } from "../lib/safeText";
 // Reject raw ambiguity before URL can trim controls or normalize paths/authorities.
 function safeIssueUrl(raw: string): boolean {
   if (!raw.startsWith("https://") || /[\s\p{Cc}\p{Cf}\\\\?#]/u.test(raw)) return false;
+  const parts = /^https:\/\/([A-Za-z0-9.-]+|\[[A-Fa-f0-9:.]+\])(?::(0|[1-9][0-9]*))?(\/.*)$/.exec(raw);
+  if (!parts) return false;
+  const [, host, , pathname] = parts;
   try {
     const url = new URL(raw);
     if (url.protocol !== "https:" || !url.hostname || url.username || url.password ||
-        url.search || url.hash || url.href !== raw) return false;
+        url.search || url.hash || url.pathname !== pathname) return false;
+    // Only DNS case folding and valid IPv6 serialization may change the host.
+    if (!host.startsWith("[") && url.hostname !== host.toLowerCase()) return false;
     return url.pathname.slice(1).split("/").every(segment => {
       const decoded = decodeURIComponent(segment);
       return decoded !== "" && decoded !== "." && decoded !== ".." &&

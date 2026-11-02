@@ -38,6 +38,17 @@ it.each([
 });
 
 it.each([
+  "https://FORGE.EXAMPLE/group/repo/issues/1",
+  "https://forge.example:443/group/repo/issues/1",
+  "https://FORGE.EXAMPLE:443/group/repo/issues/1",
+  "https://[2001:0DB8:0000:0000:0000:0000:0000:0001]/group/repo/issues/1",
+  "https://[2001:0DB8:0000:0000:0000:0000:0000:0001]:443/group/repo/issues/1",
+])("preserves valid authority serialization in %j", web_url => {
+  render(<RunCreatedIssues issues={[{ iid: 1, title: "", web_url }]} />);
+  expect(screen.getByRole("link", { name: "Created issue #1" }).getAttribute("href")).toBe(web_url);
+});
+
+it.each([
   "", " ", "http://forge.example/issues/1", "javascript:alert(1)", "//forge.example/issues/1",
   "https://user:password@forge.example/issues/1", "https://@forge.example/issues/1",
   " https://forge.example/issues/1", "https://forge.example/issues/1 ",
@@ -50,6 +61,15 @@ it.each([
   "https://forge.example/issues/%0a1", "https://forge.example/issues/%C2%85",
   "https://forge.example/issues/%E2%80%AE", "https://forge.example/issues/%252f1",
   "https://forge.example/issues/%", "https:///forge.example/issues/1",
+  "https://forge.example", "https://forge.example:443", "https://forge.example/",
+  "https:////forge.example/issues/1", "https://forge.example/issues/1/",
+  "https://FORGE.EXAMPLE:443/a/%2E/issues/1",
+  "https://[2001:DB8::1]:443/a/.%2e/issues/1",
+  "https://127.1/issues/1", "https://2130706433/issues/1",
+  "https://0177.0.0.1/issues/1", "https://0x7f000001/issues/1",
+  "https://%66orge.example/issues/1", "https://forge%2eexample/issues/1",
+  "https://ｆorge.example/issues/1", "https://forgé.example/issues/1",
+  "https://forge.example:/issues/1", "https://forge.example:0443/issues/1",
 ])("uses a plain coordinate for unsafe URL %j", web_url => {
   render(<RunCreatedIssues issues={[{ iid: 7, title: "Still visible", web_url }]} />);
   expect(screen.getByText("Created issue #7").tagName).toBe("SPAN");
