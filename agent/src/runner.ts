@@ -251,6 +251,7 @@ import {
   type PublicationFloor,
   classifyPlanningCaptureError,
   classifyGitStderr,
+  newTrackingAttemptToken,
 } from "./git.js";
 import {
   buildCheckEnv,
@@ -16615,7 +16616,7 @@ export class RunRunner {
       throw error;
     }
     if (context.barePath !== barePath || context.branch !== branch) throw new Error("owed candidate flight context changed");
-    flight.trackingAttemptToken ??= this.git.newTrackingAttemptToken(() => this.ownershipRepairAdmitted(flight));
+    flight.trackingAttemptToken ??= newTrackingAttemptToken(() => this.ownershipRepairAdmitted(flight));
     return { context, remotelyConfirmedSha: flight.lastCheckpointRefTip, attemptToken: flight.trackingAttemptToken };
   }
 

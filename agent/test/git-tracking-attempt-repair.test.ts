@@ -7,9 +7,10 @@ import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { CheckpointSoftDeadlineError } from "../src/checkpoint-stop.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
-import { GitCache, type BoundaryProcessSpawner, type FetchAgentBranchOptions, type TrackingUpdateResult } from "../src/git.js";
+import { GitCache, newTrackingAttemptToken, type BoundaryProcessSpawner, type FetchAgentBranchOptions, type TrackingUpdateResult } from "../src/git.js";
 
 const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
 const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
@@ -17,6 +18,7 @@ const BRANCH = "agent/issue-3780";
 const TRACKING = `refs/uzi-runner/${BRANCH}`;
 const OWNER_KEY = `uzi-trackowner.${BRANCH}.owner`;
 const RUN = "37803780-1111-2222-3333-444444444444";
+const OTHER = "37803780-aaaa-bbbb-cccc-dddddddddddd";
 let fx: Fixture;
 let cache: GitCache;
 let bare: string;
@@ -114,12 +116,12 @@ beforeEach(async () => {
   admit = { on: true };
   opts = { context: { runId: RUN, generation: 1, branch: BRANCH, kind: "issue", barePath: bare,
     defaultIdentity: { ref: "refs/remotes/origin/main", sha: base } },
-  attemptToken: cache.newTrackingAttemptToken(() => admit.on) };
+  attemptToken: newTrackingAttemptToken(() => admit.on) };
 });
 afterEach(() => fx.cleanup());
 
 /** A later import at a NEW tip must finish the stranded update and then promote that tip normally. */
-async function assertRepairedImport(stranded: string): Promise<void> {
+async function assertRepairedImport(stranded: string, prior?: string): Promise<void> {
   const current = root("current after failure");
   const result = updated(await fetch());
   assert.equal(result.candidateSha, current);
@@ -129,27 +131,30 @@ async function assertRepairedImport(stranded: string): Promise<void> {
   assert.equal(stamp(), RUN);
   assert.ok(result.retainedShas.includes(stranded), "the repaired attempt's pin is part of the result");
   assert.ok(result.retainedShas.includes(current));
+  // The displaced prior tip was pinned by the stranded attempt; the follow-on promote (which displaces the
+  // repaired tip, not the prior one) cannot re-derive it, so only the repaired attempt's record reports it.
+  if (prior) assert.ok(result.retainedShas.includes(prior), "the prior tip the stranded attempt pinned is reported too");
   assert.equal((await cache.committedTrackingOwnership(bare, BRANCH, RUN, current, 1)).kind, "owned");
 }
 
 describe("issue #3780 repaired imports", () => {
   it("tracking_update_failed (ref unchanged) is finished by the next import", async () => {
-    root("H"); updated(await fetch());
+    const h = root("H"); updated(await fetch());
     const h2 = root("H2");
     const restore = faultGit((args) => args.includes("update-ref") && args.includes(TRACKING));
     assert.deepEqual(await fetch(), { kind: "not_updated", reason: "tracking_update_failed" });
     restore();
-    await assertRepairedImport(h2);
+    await assertRepairedImport(h2, h);
   });
 
   it("owner_stamp_failed (CAS landed, stale stamp) is finished by the next import", async () => {
-    root("H"); updated(await fetch());
+    const h = root("H"); updated(await fetch());
     const h2 = root("H2");
     const restore = faultGit((args) => args.includes("config") && args.includes("--replace-all") && args.includes(OWNER_KEY));
     assert.deepEqual(await fetch(), { kind: "not_updated", reason: "owner_stamp_failed" });
     restore();
     assert.equal(tip(), h2);
-    await assertRepairedImport(h2);
+    await assertRepairedImport(h2, h);
   });
 
   for (const afterWrite of [false, true]) {
@@ -190,22 +195,45 @@ describe("issue #3780 repaired imports", () => {
     await assertRepairedImport(h2);
   });
 
-  it("a legacy stamp-only bare aborted after the governance write (pre-pending) is finished by the next import", async () => {
-    const legacy = root("legacy H");
-    gitIn(bare, ["-c", "protocol.file.allow=user", "fetch", "--no-tags", "--no-write-fetch-head",
-      `file://${clone}`, `refs/heads/${BRANCH}:${TRACKING}`]);
-    gitIn(bare, ["config", "--local", OWNER_KEY, RUN]);
-    const h2 = root("H2");
-    const ctl = new AbortController();
-    await assert.rejects(scoped(ctl, () => fetch(), (argv) => {
-      if (argv.includes("--replace-all") && argv.includes(`uzi-trackowner.${BRANCH}.receiptversion`)) ctl.abort();
-    }));
-    assert.equal(tip(), legacy);
+  it("a legacy stamp-only bare stranded after the ancestor clear, before the marker (pre-pending) is finished by the next import", async () => {
+    const { h2 } = await strandLegacyBeforeMarker();
+    assert.equal(fs.existsSync(owedPath("governed")), false);
     assert.equal(fs.existsSync(owedPath("receipt")), false);
-    assert.equal(gitIn(bare, ["config", "--local", "--get", `uzi-trackowner.${BRANCH}.receiptversion`]), "1");
+    await assertRepairedImport(h2);
+  });
+
+  it("a foreign owner displaced by a stranded attempt is finished by the next import (stamp rewritten)", async () => {
+    const { h2 } = await strandDisplacingForeign();
+    assert.equal(stamp(), OTHER);
     await assertRepairedImport(h2);
   });
 });
+
+/** A legacy stamp-only bare (tracking ref + stamp, no receipt); the attempt then fails writing the marker. */
+async function strandLegacyBeforeMarker(): Promise<{ legacy: string; h2: string }> {
+  const legacy = root("legacy H");
+  gitIn(bare, ["-c", "protocol.file.allow=user", "fetch", "--no-tags", "--no-write-fetch-head",
+    `file://${clone}`, `refs/heads/${BRANCH}:${TRACKING}`]);
+  gitIn(bare, ["config", "--local", OWNER_KEY, RUN]);
+  const h2 = root("H2");
+  const restore = hookDisk(() => undefined, { afterWrite: false, match: (name) => name.startsWith("governed-") });
+  try { assert.deepEqual(await fetch(), { kind: "not_updated", reason: "receipt_pending_failed" }); } finally { restore(); }
+  assert.equal(tip(), legacy);
+  return { legacy, h2 };
+}
+/** RUN displaces a FOREIGN committed owner; the CAS then fails, leaving a pending receipt over the foreign tip. */
+async function strandDisplacingForeign(): Promise<{ foreign: string; h2: string }> {
+  const foreign = root("foreign H");
+  const other: FetchAgentBranchOptions = { context: { ...opts.context, runId: OTHER } };
+  updated(await cache.fetchAgentBranch(bare, clone, BRANCH, OTHER, other));
+  assert.equal(stamp(), OTHER);
+  const h2 = root("H2");
+  const restore = faultGit((args) => args.includes("update-ref") && args.includes(TRACKING));
+  try { assert.deepEqual(await fetch(), { kind: "not_updated", reason: "tracking_update_failed" }); } finally { restore(); }
+  assert.equal(tip(), foreign);
+  assert.equal(receipt().phase, "pending");
+  return { foreign, h2 };
+}
 
 describe("issue #3780 refusals leave the disk untouched", () => {
   /** ref unchanged: CAS fault leaves the old tip and a pending receipt. */
@@ -236,7 +264,7 @@ describe("issue #3780 refusals leave the disk untouched", () => {
   it("a restart (new GitCache, fresh token) stays refused", async () => {
     await strandRefUnchanged();
     cache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
-    opts = { ...opts, attemptToken: cache.newTrackingAttemptToken(() => true) };
+    opts = { ...opts, attemptToken: newTrackingAttemptToken(() => true) };
     await refused();
   });
 
@@ -318,6 +346,36 @@ describe("issue #3780 refusals leave the disk untouched", () => {
     await refused();
   });
 
+  it("a removed displaced-owner pin (foreign owner) stays refused", async () => {
+    const { foreign } = await strandDisplacingForeign();
+    gitIn(bare, ["update-ref", "-d", `refs/uzi-owed/${OTHER}/${foreign}`]);
+    await refused();
+  });
+
+  it("a legacy bare stranded BEFORE the ancestor clear (same disk as a refused clear) stays refused", async () => {
+    root("legacy H");
+    gitIn(bare, ["-c", "protocol.file.allow=user", "fetch", "--no-tags", "--no-write-fetch-head",
+      `file://${clone}`, `refs/heads/${BRANCH}:${TRACKING}`]);
+    gitIn(bare, ["config", "--local", OWNER_KEY, RUN]);
+    root("H2");
+    const ctl = new AbortController();
+    await assert.rejects(scoped(ctl, () => fetch(), (argv) => {
+      if (argv.includes("--replace-all") && argv.includes(`uzi-trackowner.${BRANCH}.receiptversion`)) ctl.abort();
+    }));
+    assert.equal(gitIn(bare, ["config", "--local", "--get", `uzi-trackowner.${BRANCH}.receiptversion`]), "1");
+    assert.equal(fs.existsSync(owedPath("receipt")), false);
+    await refused();
+  });
+
+  it("a second token on the SAME GitCache cannot repair token A's attempt; A then completes it", async () => {
+    const tokenA = opts.attemptToken;
+    const { h, h2 } = await strandRefUnchanged();
+    opts = { ...opts, attemptToken: newTrackingAttemptToken(() => true) };
+    await refused();
+    opts = { ...opts, attemptToken: tokenA };
+    await assertRepairedImport(h2, h);
+  });
+
   it("an opts.context with a different generation stays refused", async () => {
     await strandRefUnchanged();
     opts = { ...opts, context: { ...opts.context, generation: 2 } as FetchAgentBranchOptions["context"] };
@@ -366,5 +424,100 @@ describe("issue #3780 admission revoked between repair writes", () => {
     assert.equal(receipt().phase, "committed");
     assert.equal(stamp(), RUN);
     assert.ok(result.retainedShas.includes(h2));
+  });
+
+  /** Revoke authority right after the first git call matching `trigger` and return what the import wrote. */
+  async function revokedAfter(trigger: (args: string[]) => boolean): Promise<{ writes: Array<{ name: string; phase?: string }>; gitCalls: string[][] }> {
+    const gitCalls: string[][] = [];
+    const writes: Array<{ name: string; phase?: string }> = [];
+    const internals = cache as unknown as Internals;
+    const originalGit = internals.execScoped.bind(cache);
+    internals.execScoped = async (command, args, options) => {
+      const result = await originalGit(command, args, options);
+      if (command === "git") { gitCalls.push(args); if (trigger(args)) admit.on = false; }
+      return result;
+    };
+    const restoreDisk = hookDisk((name, value) => {
+      writes.push({ name, phase: (value as { phase?: string }).phase });
+      if (name.startsWith("governed-") && trigger(["marker-written"])) admit.on = false;
+    });
+    try { assert.deepEqual(await fetch(), { kind: "not_updated", reason: "ownership_unknown" }); }
+    finally { restoreDisk(); internals.execScoped = originalGit; }
+    return { writes, gitCalls };
+  }
+
+  it("stops after the stamp write (foreign owner displaced): no committed receipt, no rollback; a later admitted import completes", async () => {
+    const { h2 } = await strandDisplacingForeign();
+    const current = root("current after failure");
+    const { writes } = await revokedAfter((a) => a.includes("--replace-all") && a.includes(OWNER_KEY) && a.includes(RUN));
+    assert.equal(stamp(), RUN, "the stamp write landed and is left in place");
+    assert.equal(tip(), h2, "the CAS landed and is left in place");
+    assert.equal(receipt().phase, "pending");
+    assert.ok(!writes.some((w) => w.name.startsWith("receipt-")), JSON.stringify(writes));
+    admit.on = true;
+    const result = updated(await fetch());
+    assert.equal(result.candidateSha, current);
+    assert.equal(receipt().phase, "committed");
+  });
+
+  it("stops after the marker write (pre-pending): no pending receipt, no CAS, no rollback; a later admitted import completes", async () => {
+    const { legacy } = await strandLegacyBeforeMarker();
+    const current = root("current after failure");
+    const { writes, gitCalls } = await revokedAfter((a) => a[0] === "marker-written");
+    assert.equal(fs.existsSync(owedPath("governed")), true, "the marker write landed and is left in place");
+    assert.equal(fs.existsSync(owedPath("receipt")), false, "no pending receipt after revocation");
+    assert.equal(tip(), legacy, "no CAS");
+    assert.ok(!writes.some((w) => w.name.startsWith("receipt-")), JSON.stringify(writes));
+    assert.ok(!gitCalls.some((a) => a.includes("update-ref") && a.includes(TRACKING)), "no ref write");
+    admit.on = true;
+    const result = updated(await fetch());
+    assert.equal(result.candidateSha, current);
+    assert.equal(receipt().phase, "committed");
+  });
+});
+
+describe("issue #3780 bridge path (updateTrackingRef)", () => {
+  async function strandAndBridge(): Promise<{ h: string; h2: string; bridge: string }> {
+    const h = root("H"); updated(await fetch());
+    const h2 = root("H2");
+    const restore = faultGit((args) => args.includes("update-ref") && args.includes(TRACKING));
+    try { assert.equal((await fetch()).kind, "not_updated"); } finally { restore(); }
+    const tree = gitIn(bare, ["rev-parse", `${base}^{tree}`]);
+    const bridge = gitIn(bare, [...IDENT, "commit-tree", tree, "-p", h2, "-m", "bridge"]);
+    return { h, h2, bridge };
+  }
+
+  it("repairs the stranded attempt first, then promotes the bridge SHA", async () => {
+    const { h, h2, bridge } = await strandAndBridge();
+    const result = updated(await cache.updateTrackingRef(bare, BRANCH, bridge, opts));
+    assert.equal(result.candidateSha, bridge);
+    assert.equal(tip(), bridge);
+    assert.equal(receipt().phase, "committed");
+    assert.equal(receipt().trackingSha, bridge);
+    assert.equal(stamp(), RUN);
+    assert.ok(result.retainedShas.includes(h2) && result.retainedShas.includes(bridge) && result.retainedShas.includes(h));
+  });
+
+  it("without an admitted token it keeps the ownership_unknown refusal and writes nothing", async () => {
+    const { bridge } = await strandAndBridge();
+    const before = disk();
+    assert.deepEqual(await cache.updateTrackingRef(bare, BRANCH, bridge, { ...opts, attemptToken: undefined }),
+      { kind: "not_updated", reason: "ownership_unknown" });
+    assert.deepEqual(disk(), before);
+  });
+
+  it("a soft stop between observation and repair starts no repair write", async () => {
+    const { bridge } = await strandAndBridge();
+    const before = disk();
+    const soft = new AbortController();
+    const internals = cache as unknown as { observeTrackingUnderLock(b: string, br: string): Promise<unknown> };
+    const observe = internals.observeTrackingUnderLock.bind(cache);
+    internals.observeTrackingUnderLock = async (b, br) => { const value = await observe(b, br); soft.abort(); return value; };
+    try {
+      await assert.rejects(cache.withBoundaryProcessSpawner(realSpawner(), new AbortController().signal,
+        () => cache.updateTrackingRef(bare, BRANCH, bridge, opts), { softSignal: soft.signal }),
+      CheckpointSoftDeadlineError);
+    } finally { internals.observeTrackingUnderLock = observe; }
+    assert.deepEqual(disk(), before);
   });
 });

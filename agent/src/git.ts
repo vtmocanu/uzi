@@ -2499,20 +2499,27 @@ export interface FetchAgentBranchOptions {
    *  behind may be finished by a later import, while the token's admission predicate still holds. */
   attemptToken?: TrackingAttemptToken;
 }
-/** issue #3780: opaque. Created only by {@link GitCache.newTrackingAttemptToken}; the admission predicate
- *  and every attempt record live in GitCache-private WeakMaps, so a caller can neither forge nor read one. */
+/** issue #3780: opaque flight token. Only {@link newTrackingAttemptToken} registers an admission predicate,
+ *  and that registry is module-scoped, so `new TrackingAttemptToken()` is possible but inert: an unregistered
+ *  token is never admitted. The per-GitCache attempt records are private to GitCache. */
 export class TrackingAttemptToken {
   declare private readonly brand: never;
 }
 const trackingAttemptAdmission = new WeakMap<TrackingAttemptToken, () => boolean>();
+/** issue #3780: mint the opaque token a flight threads through its owed options. `admission` is checked
+ *  under the bare lock before EACH repair write; it must be a pure, synchronous read. A module function
+ *  (not a GitCache method) so a caller's partial GitCache stand-in cannot make owedOptions throw. */
+export function newTrackingAttemptToken(admission: () => boolean): TrackingAttemptToken {
+  const token = new TrackingAttemptToken();
+  trackingAttemptAdmission.set(token, admission);
+  return token;
+}
 /** Everything {@link GitCache.repairTrackingAttemptUnderLock} must prove before it finishes an attempt. */
 interface TrackingAttemptRecord {
   observedSha: string | undefined;
   /** Raw `runnerTrackingOwnerKey(branch)` value before the attempt (undefined when absent). */
   stamp: string | undefined;
   priorReceipt: unknown;
-  priorMarker: unknown;
-  priorGovernance: "absent" | "governed" | "invalid";
   incoming: string;
   context: string;
   runId: string;
@@ -2522,7 +2529,10 @@ interface TrackingAttemptRecord {
   displacedSha: string | undefined;
   displacedContext: StoredOwedContext | undefined;
   retainedShas: string[];
-  divergence: "none" | "ancestor" | "divergent" | "unknown" | "foreign";
+  /** Set once the original attempt passed clearConflictingAncestorTrackingRefs. A pre-pending disk state
+   *  left by a refused clear (`cleared === false`) is indistinguishable from an interrupted attempt, so
+   *  only an attempt that passed the clear may be finished from the pre-pending state. */
+  ancestorsCleared: boolean;
 }
 export type TrackingUpdateResult =
   | { kind: "updated"; trackingRef: string; candidateSha: string; retainedShas: string[];
@@ -5751,7 +5761,9 @@ export class GitCache {
       let repairedRetained: string[] = [];
       if (observed) this.dropTrackingAttempt(opts.attemptToken, barePath, branch);
       else {
-        // issue #3780: same repair entry as fetchAgentBranch; no repair falls through to the refusal.
+        // issue #3780: same repair entry as fetchAgentBranch; a soft-stopped bridge starts no repair write,
+        // and no repair falls through to the refusal.
+        this.checkCheckpointCooperation();
         const repaired = await this.repairThenObserveUnderLock(barePath, branch, opts);
         if (!repaired) return { kind: "not_updated", reason: "ownership_unknown" };
         ({ observed, retainedShas: repairedRetained } = repaired);
@@ -18849,15 +18861,13 @@ try {
       attemptToken: opts.attemptToken instanceof TrackingAttemptToken ? opts.attemptToken : undefined };
   }
 
-  /** issue #3780: mint the opaque token a flight threads through its owed options. `admission` is checked
-   *  under the bare lock before EACH repair write; it must be a pure, synchronous read. */
-  newTrackingAttemptToken(admission: () => boolean): TrackingAttemptToken {
-    const token = new TrackingAttemptToken();
-    trackingAttemptAdmission.set(token, admission);
-    return token;
-  }
-
   private attemptKey(barePath: string, branch: string): string { return `${barePath}\0${branch}`; }
+
+  /** issue #3780: the original attempt passed clearConflictingAncestorTrackingRefs. */
+  private markTrackingAncestorsCleared(token: TrackingAttemptToken | undefined, barePath: string, branch: string): void {
+    const rec = token && this.trackingAttempts.get(token)?.get(this.attemptKey(barePath, branch));
+    if (rec) rec.ancestorsCleared = true;
+  }
 
   private dropTrackingAttempt(token: TrackingAttemptToken | undefined, barePath: string, branch: string): void {
     if (token) this.trackingAttempts.get(token)?.delete(this.attemptKey(barePath, branch));
@@ -18877,8 +18887,7 @@ try {
    *  nothing (so nothing is repairable); a boundary abort propagates like every other read here. */
   private async openTrackingAttempt(barePath: string, branch: string, incoming: string,
     observed: { sha?: string; owner?: CheckedTrackingOwner }, opts: FetchAgentBranchOptions,
-    pending: TrackingReceipt, incomingCovered: boolean, displacedContext: StoredOwedContext | undefined,
-    divergence: TrackingAttemptRecord["divergence"]): Promise<void> {
+    pending: TrackingReceipt, incomingCovered: boolean, displacedContext: StoredOwedContext | undefined): Promise<void> {
     const token = opts.attemptToken;
     if (!token || !trackingAttemptAdmission.has(token)) return;
     const c = opts.context;
@@ -18889,15 +18898,13 @@ try {
       const record: TrackingAttemptRecord = {
         observedSha: observed.sha, stamp,
         priorReceipt: await this.readOwedFile(barePath, `receipt-${hash}.json`),
-        priorMarker: await this.readOwedFile(barePath, `governed-${hash}.json`),
-        priorGovernance: await this.checkedReceiptGovernance(barePath, branch),
         incoming, context: this.contextName(c), runId: c.runId, generation: c.generation, pending, incomingCovered,
         displacedSha: displacedContext ? observed.sha : undefined, displacedContext,
         retainedShas: [...new Set([
           ...(displacedContext && observed.sha && observed.owner?.runId === c.runId ? [observed.sha] : []),
           ...(incomingCovered ? [] : [incoming]),
         ])].sort(),
-        divergence,
+        ancestorsCleared: false,
       };
       let byKey = this.trackingAttempts.get(token);
       if (!byKey) this.trackingAttempts.set(token, byKey = new Map());
@@ -18909,9 +18916,11 @@ try {
   }
 
   /** issue #3780: finish an ownership update that THIS token's earlier attempt stranded, only from one of
-   *  three exact disk states (pre-pending, ref unchanged, CAS landed). Caller holds the bare lock. Before
-   *  EACH write the admission predicate and the current boundary scope are re-checked; once either fails
-   *  it stops with no further write and no rollback, leaving a state a later admissible import can finish.
+   *  three exact disk states (pre-pending, ref unchanged, CAS landed). Caller holds the bare lock. The
+   *  pre-pending state counts only after the original attempt passed the ancestor clear. Before EACH write
+   *  the admission predicate and the HARD boundary signal are re-checked (the soft signal is masked for the
+   *  repair); once either fails it stops with no further write and no rollback, leaving a state a later
+   *  admissible import can finish.
    *  Returns true only when the committed receipt reads back as the record's owner. */
   private async repairTrackingAttemptUnderLock(barePath: string, branch: string,
     opts: FetchAgentBranchOptions): Promise<{ retainedShas: string[] } | undefined> {
@@ -18949,7 +18958,7 @@ try {
         const markerExact = same(diskMarker, marker), pendingExact = same(diskReceipt, rec.pending);
         const unchanged = ref === rec.observedSha && stamp === rec.stamp;
         const prePending = unchanged && diskReceipt === undefined && rec.priorReceipt === undefined &&
-          (diskMarker === undefined || markerExact);
+          rec.ancestorsCleared && (diskMarker === undefined || markerExact);
         const refUnchanged = unchanged && markerExact && pendingExact;
         const casLanded = ref === rec.incoming && (stamp === rec.stamp || stamp === rec.runId) && markerExact && pendingExact;
         if (!prePending && !refUnchanged && !casLanded) return undefined;
@@ -19422,7 +19431,7 @@ try {
       opts.checkpointStep?.("checkpoint_import_mutation");
       // issue #3780: the record precedes every write; it is dropped only on the `updated` return, so a
       // not_updated return after a write, or any throw, leaves it for the same token's later repair.
-      await this.openTrackingAttempt(barePath, branch, incoming, observed, opts, receipt, incomingCovered, displacedContext, divergence);
+      await this.openTrackingAttempt(barePath, branch, incoming, observed, opts, receipt, incomingCovered, displacedContext);
       try {
         if (displacedContext && observed.sha) {
           // Only this run's confirmation can discharge its own debt.
@@ -19453,6 +19462,7 @@ try {
       try {
         const cleared = await this.clearConflictingAncestorTrackingRefs(barePath, runnerTrackingRef(branch), opts);
         if (!cleared) return { kind: "not_updated", reason: "ownership_unknown" };
+        this.markTrackingAncestorsCleared(opts.attemptToken, barePath, branch);
       } catch (cause) {
         const abort = this.boundaryAbortError(cause);
         if (abort) throw abort;

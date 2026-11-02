@@ -4451,3 +4451,34 @@ describe("stranded ownership repair across the same flight (issue #3780 M2)", ()
     });
   });
 });
+
+// issue #3780 M2 — the admission predicate GitCache checks before each repair write.
+describe("ownershipRepairAdmitted (issue #3780 M2)", () => {
+  type Flight = Record<string, unknown>;
+  const admitted = (flight: Flight): boolean =>
+    (RunRunner.prototype as unknown as { ownershipRepairAdmitted(f: Flight): boolean }).ownershipRepairAdmitted.call(undefined, flight);
+  const base = (over: Flight = {}): Flight => ({
+    steering: { ownershipRepairAuthority: () => true }, owedLimitStop: undefined, executor: undefined,
+    survivingTickGroups: [], retainedBareLocks: [], ...over,
+  });
+  const safety = (state: string): Flight => ({ executor: { safety: { registryState: () => state } } });
+
+  it("admits a flight with authority, no stop, no survivors and no retained lock", () => {
+    assert.equal(admitted(base()), true);
+  });
+  it("refuses when steering authority is revoked or the owed cap stopped the run", () => {
+    assert.equal(admitted(base({ steering: { ownershipRepairAuthority: () => false } })), false);
+    assert.equal(admitted(base({ owedLimitStop: new Error("owed cap") })), false);
+  });
+  it("refuses while a surviving tick group is still tracked", () => {
+    assert.equal(admitted(base({ survivingTickGroups: [{ pgid: 1 }] })), false);
+  });
+  it("refuses while a retained bare lock is held", () => {
+    assert.equal(admitted(base({ retainedBareLocks: ["/bare.git"] })), false);
+  });
+  it("refuses a poisoned or disposed Codex registry and admits a closed one", () => {
+    assert.equal(admitted(base(safety("poisoned"))), false);
+    assert.equal(admitted(base(safety("disposed"))), false);
+    assert.equal(admitted(base(safety("closed"))), true);
+  });
+});
