@@ -407,10 +407,10 @@ describe("issue #3780 refusals leave the disk untouched", () => {
     await refused();
   });
 
-  it("a legacy bare stranded BEFORE the ancestor clear is refused when the repair's own clear returns false", async () => {
+  it("a legacy bare stranded BEFORE the ancestor clear is refused when an ancestor observation is unknown", async () => {
     await strandLegacyBeforeClear();
     // An unreadable ancestor sidecar (a governed marker that is not this ancestor's) makes
-    // clearConflictingAncestorTrackingRefs return false, exactly as it would have originally.
+    // the read-only check refuse, exactly as ordinary cleanup would have originally.
     const ancestorMarker = path.join(bare, "uzi-owed", `governed-${createHash("sha256").update("agent").digest("hex")}.json`);
     fs.writeFileSync(ancestorMarker, JSON.stringify({ version: 1, branch: "agent/other" }), { mode: 0o600 });
     const markerBefore = fs.readFileSync(ancestorMarker, "utf8");
@@ -418,6 +418,53 @@ describe("issue #3780 refusals leave the disk untouched", () => {
     assert.equal(fs.readFileSync(ancestorMarker, "utf8"), markerBefore);
     assert.equal(fs.existsSync(owedPath("receipt")), false);
     assert.equal(fs.existsSync(owedPath("governed")), false);
+  });
+
+  it("an ancestor arriving after the stranded attempt stays untouched, including on admission loss", async () => {
+    root("first incoming");
+    const ctl = new AbortController();
+    await assert.rejects(scoped(ctl, () => fetch(), argv => {
+      if (argv.includes("--replace-all") && argv.includes(`uzi-trackowner.${BRANCH}.receiptversion`)) ctl.abort();
+    }));
+    const ancestor = "refs/uzi-runner/agent";
+    const ancestorOwner = "uzi-trackowner.agent.owner";
+    gitIn(bare, ["update-ref", ancestor, base]);
+    gitIn(bare, ["config", "--local", ancestorOwner, OTHER]);
+    const ancestorState = () => ({
+      refs: gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)", ancestor]),
+      owner: gitIn(bare, ["config", "--local", "--null", "--list"]).split("\0")
+        .find(entry => entry.startsWith(`${ancestorOwner}\n`)),
+      archives: gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-archive/"]),
+    });
+    const before = ancestorState();
+    const internals = cache as unknown as Internals & {
+      checkedTrackingSha(b: string, branch: string): Promise<string | undefined>;
+    };
+    const trackingSha = internals.checkedTrackingSha.bind(cache);
+    const execute = internals.execScoped.bind(cache);
+    let failObservation = true;
+    internals.checkedTrackingSha = async (b, branch) => {
+      if (failObservation && branch === BRANCH) {
+        failObservation = false;
+        throw new Error("injected transient tracking read failure");
+      }
+      return trackingSha(b, branch);
+    };
+    internals.execScoped = async (command, args, options) => {
+      const result = await execute(command, args, options);
+      if (command === "git" && args.includes("update-ref") && args.includes(`refs/uzi-archive/agent/${base}`))
+        admit.on = false;
+      return result;
+    };
+    try {
+      assert.deepEqual(await fetch(), { kind: "not_updated", reason: "ownership_unknown" });
+      assert.equal(failObservation, false, "the unknown observation exercised the repair fallback");
+      assert.deepEqual(ancestorState(), before, "repair never archives or removes the later ancestor");
+      assert.equal(admit.on, true, "no archive write ran the revocation hook");
+    } finally {
+      internals.checkedTrackingSha = trackingSha;
+      internals.execScoped = execute;
+    }
   });
 
   it("a second token on the SAME GitCache cannot repair token A's attempt; A then completes it", async () => {

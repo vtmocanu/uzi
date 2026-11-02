@@ -2529,8 +2529,7 @@ interface TrackingAttemptRecord {
   displacedSha: string | undefined;
   displacedContext: StoredOwedContext | undefined;
   retainedShas: string[];
-  /** Set once the attempt passed clearConflictingAncestorTrackingRefs. When false at repair time the
-   *  repair runs the clear itself before finishing from the pre-pending state. */
+  /** Set once the attempt passed ordinary ancestor cleanup or repair's read-only absence check. */
   ancestorsCleared: boolean;
 }
 export type TrackingUpdateResult =
@@ -5634,6 +5633,29 @@ export class GitCache {
     });
   }
 
+  /** Strict tracking-ref ancestors, deepest first, shared by observation and ordinary cleanup. */
+  private trackingAncestorRefs(dst: string): string[] {
+    if (!dst.startsWith(RUNNER_TRACKING_PREFIX)) return [];
+    const parts = dst.slice(RUNNER_TRACKING_PREFIX.length).split("/");
+    // Only strict prefixes: never the tracking namespace root or the destination itself.
+    const candidates: string[] = [];
+    let acc = "refs/uzi-runner";
+    for (const part of parts.slice(0, -1)) {
+      acc = `${acc}/${part}`;
+      candidates.push(acc);
+    }
+    return candidates.reverse();
+  }
+
+  /** Repair has no authority to normalize another tracking ref. Caller holds the bare lock. */
+  private async trackingAncestorsAbsentUnderLock(barePath: string, dst: string): Promise<boolean> {
+    for (const candidate of this.trackingAncestorRefs(dst)) {
+      const observed = await this.observeTrackingUnderLock(barePath, candidate.slice(RUNNER_TRACKING_PREFIX.length));
+      if (!observed || observed.sha !== undefined) return false;
+    }
+    return true;
+  }
+
   /**
    * issue #887 — clear a legacy FLAT tracking ref that path-blocks the fetch's dst ref.
    *
@@ -5661,23 +5683,9 @@ export class GitCache {
    * bare with several stacked ancestors is cleaned bottom-up.
    */
   private async clearConflictingAncestorTrackingRefs(barePath: string, dst: string, opts: FetchAgentBranchOptions): Promise<boolean> {
-    // Only refs inside the tracking namespace can D/F-conflict with a tracking-ref dst.
-    if (!dst.startsWith(RUNNER_TRACKING_PREFIX)) return true;
-    const suffix = dst.slice(RUNNER_TRACKING_PREFIX.length);
-    const parts = suffix.split("/");
-    // Cumulative prefixes STRICTLY shorter than the full branch: every part except the last.
-    // For suffix "uzi/self-improve/<runId>" this yields the branches "uzi" and
-    // "uzi/self-improve", i.e. the candidate refs refs/uzi-runner/uzi and
-    // refs/uzi-runner/uzi/self-improve — never the namespace root and never dst itself.
-    const candidates: string[] = [];
-    let acc = "refs/uzi-runner";
-    for (const part of parts.slice(0, -1)) {
-      acc = `${acc}/${part}`;
-      candidates.push(acc);
-    }
     // Preflight the whole ancestor set before deleting anything. A failed read is unknown.
     const conflicts: Array<{ candidate: string; sha: string; branch: string }> = [];
-    for (const candidate of candidates.reverse()) {
+    for (const candidate of this.trackingAncestorRefs(dst)) {
       const ancestorBranch = candidate.slice(RUNNER_TRACKING_PREFIX.length);
       const observed = await this.observeTrackingUnderLock(barePath, ancestorBranch);
       if (!observed) return false;
@@ -18862,7 +18870,7 @@ try {
 
   private attemptKey(barePath: string, branch: string): string { return `${barePath}\0${branch}`; }
 
-  /** issue #3780: the original attempt passed clearConflictingAncestorTrackingRefs. */
+  /** issue #3780: ordinary cleanup or the repair's read-only ancestor check succeeded. */
   private markTrackingAncestorsCleared(token: TrackingAttemptToken | undefined, barePath: string, branch: string): void {
     const rec = token && this.trackingAttempts.get(token)?.get(this.attemptKey(barePath, branch));
     if (rec) rec.ancestorsCleared = true;
@@ -18916,12 +18924,11 @@ try {
 
   /** issue #3780: finish an ownership update that THIS token's earlier attempt stranded, only from one of
    *  three exact disk states (pre-pending, ref unchanged, CAS landed). Caller holds the bare lock. From the
-   *  pre-pending state an attempt that never passed the ancestor clear runs that clear itself first (a
-   *  refused clear refuses the repair with no further write). That clear runs as ONE step behind a single
-   *  admission + HARD-signal check, as in the original attempt: splitting it (e.g. between an ancestor delete
-   *  and its receipt unlink) would leave a state every later import refuses. Before each other roll-forward
-   *  write the admission predicate and the HARD boundary signal are re-checked (the soft signal is masked for
-   *  the repair); once either fails it stops with no further write and no rollback, leaving a state a later
+   *  pre-pending state an attempt that never passed the ancestor clear verifies, read-only, that no ancestor
+   *  tracking ref exists. Unknown observations or an existing ancestor refuse; repair never runs ancestor
+   *  cleanup. Before each roll-forward write the admission predicate and the HARD boundary signal are
+   *  re-checked (the soft signal is masked for the repair); once either fails it stops with no further
+   *  write and no rollback, leaving a state a later
    *  admissible import can finish.
    *  Returns true only when the committed receipt reads back as the record's owner. */
   private async repairTrackingAttemptUnderLock(barePath: string, branch: string,
@@ -18966,10 +18973,9 @@ try {
         if (!prePending && !refUnchanged && !casLanded) return undefined;
         if (prePending) {
           if (!rec.ancestorsCleared) {
-            // The original attempt stopped before (or at) its ancestor clear: run that remaining step
-            // itself. A refused clear leaves the same disk state, so it must refuse again here.
+            // A later ancestor is outside this attempt's recorded transaction; never archive or delete it.
             if (!permit()) return undefined;
-            if (!(await this.clearConflictingAncestorTrackingRefs(barePath, runnerTrackingRef(branch), opts))) return undefined;
+            if (!(await this.trackingAncestorsAbsentUnderLock(barePath, runnerTrackingRef(branch)))) return undefined;
             this.markTrackingAncestorsCleared(token, barePath, branch);
           }
           if (diskMarker === undefined) {
