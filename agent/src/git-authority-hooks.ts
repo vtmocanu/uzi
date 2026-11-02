@@ -107,8 +107,9 @@
  *  refuses fail-closed on a slot one ahead of its head shard instead of completing that crash window.
  *  With a transaction active (the seed and replace sites all hold A) it reads through the transactional
  *  load, which completes that window, so one failed head write cannot block a repository's seeds
- *  permanently. Runner sites that therefore lost their A wrapper (their only hook is this one):
- *  fetchAgentBranch, updateTrackingRef, retainCurrentOwedCandidate (two sites) and anchorRecoveryHead;
+ *  permanently. Runner sites without a whole-call A wrapper:
+ *  fetchAgentBranch (attempt imports use short A -> B source proof phases around B-only transport),
+ *  updateTrackingRef, retainCurrentOwedCandidate (two sites) and anchorRecoveryHead (only this hook);
  *  in recovery.ts freezeInventory (buildRecoveryCoverage) and the inventory source boundary around it.
  *  - "seed-canonical", "seed-attempt", "replace": GitCache.runnerCloneForBranch, attemptCloneForBranch
  *    and prepareRecoverySuccessor, immediately before their admitSourceUse.

@@ -8,7 +8,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { MaintenanceResources, RecoveryMaintenance } from "../src/recovery-maintenance.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
-import { acquireWorkerLifetime } from "../src/authority-lock.js";
+import { acquireWorkerLifetime, activeAuthorityTransaction } from "../src/authority-lock.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { testLockOptions } from "./authority-test-support.js";
 import { test } from "node:test";
@@ -65,13 +65,15 @@ async function fixture(enrolled = true) {
     await git.recordRecoveryCapture(bare, BRANCH, KEY, source, reservation.attempts, s, s);
     await git.detachTerminalRetained(bare, BRANCH, KEY, journal());
   };
-  const fresh = () => {
+  const fresh = (authority?: AuthorityRuntime) => {
     const cache = new GitCache(fx.dataDir, nullLogger(), undefined,
-      testGitCacheOptions({ gitleaksBin: (git as any).gitleaksBin }));
+      testGitCacheOptions({ gitleaksBin: (git as any).gitleaksBin,
+        ...(authority ? { authority: authority.hooks, authorityRequired: true } : {}),
+      }));
     const runner = new RunRunner(client, cache, () => ({ homeDir, executor: {
       run: async () => { throw new Error("unused executor"); },
     } }), nullLogger(), 20, undefined, {
-      gitlab: fakeGitlab().gitlab, teardownTestDeps: portableTeardownTestDeps, recoveryRetryMs: 1,
+      gitlab: fakeGitlab().gitlab, teardownTestDeps: portableTeardownTestDeps, recoveryRetryMs: 1, authority,
     });
     const cancel = new AbortController();
     const steering = new SteeringChannel(client, claim.run_id, 5, nullLogger(), cancel, { claimGeneration: 2 });
@@ -1028,6 +1030,30 @@ for (const native of [false, true]) for (const stop of ["caller", "late attempt"
   });
 }
 
+test("publication findings persistence keeps a local bounded lifecycle", async t => {
+  const f = await fixture();
+  await git.recordRemediationScan(f.bare, BRANCH, f.source, { trusted: true, tip: f.s, flaggedOIDs: [] });
+  const { cache, runner, subject, flight } = f.fresh();
+  flight.publishedTip = f.base; flight.checkpointFloor = f.base;
+  const wall = Date.now();
+  t.mock.method(Date, "now", () => wall);
+  const persist = cache.recordRemediationRestrictions.bind(cache);
+  let writes = 0;
+  t.mock.method(cache, "recordRemediationRestrictions", (...args: Parameters<typeof persist>) => {
+    assert.equal((cache as any).recoveryOperations.getStore().deadline,
+      wall + subject.codexBoundaryDeadlineMs);
+    writes++;
+    return persist(...args);
+  });
+  t.mock.method(cache, "secretScanCheckpointRange", async () => ({ trusted: true as const,
+    findings: [{ file: "fixture.txt", startLine: 1, commit: f.s, ruleId: "fixture" }] }));
+  try {
+    assert.equal((await subject.publishCheckpointOutcome(flight, f.bare, BRANCH)).published, false);
+    assert.equal(writes, 1);
+    assert.ok(f.journal().remediationRecovery.flaggedOIDs.includes(f.s));
+  } finally { runner.shutdown(); }
+});
+
 for (const transport of ["push", "pack/replay"] as const) {
   for (const clock of ["live", "caller", "maintenance"] as const) {
     test("Runner transport outlives admission clock: " + transport + "/" + clock, async t => {
@@ -1148,5 +1174,248 @@ for (const stop of ["deadline", "caller", "maintenance"] as const) {
       budget?.dispose(); runner.shutdown();
     }
     assert.equal(await outcome, "rejected");
+  });
+}
+
+
+async function sourceImportFixture(enrolled = false) {
+  const f = await fixture(enrolled);
+  const lifetime = await acquireWorkerLifetime(fx.dataDir, testLockOptions());
+  const authority = new AuthorityRuntime({ lifetime, workerToken: "fixture-worker", timeoutMs: 5000 });
+  const fresh = f.fresh(authority);
+  fresh.flight.executor = {};
+  // Bind the selected genuine clone, then authenticate only this same flight-owned lease.
+  await fresh.subject.bindFlightSource(fresh.flight, f.clone.path);
+  const epoch = authority.ownedSourceEpoch(f.clone.path, fresh.flight.sourceUsePaths);
+  assert.ok(epoch);
+  return { ...f, ...fresh, lifetime, authority, epoch };
+}
+
+for (const change of ["none", "remediation", "journal", "attempt", "lease", "tracking", "unknown tracking"] as const) {
+  test("source import releases A across actual transport and reauthenticates: " + change, async t => {
+    const f = await sourceImportFixture(change === "remediation");
+    const incoming = f.commit("import candidate", f.s);
+    const enter = f.subject.inFlightAuthority.bind(f.subject);
+    let proofs = 0;
+    t.mock.method(f.subject, "inFlightAuthority", async (...args: any[]) => {
+      if (++proofs === 2 && change === "tracking") {
+        // A real same-cache B mutation in the unlocked gap, before promotion asks for A.
+        await f.cache.updateTrackingRef(f.bare, BRANCH, f.d, {
+          context: { runId: f.claim.run_id, generation: 2, kind: "issue", branch: BRANCH, barePath: f.bare,
+            defaultIdentity: { ref: "refs/remotes/origin/main", sha: f.base } },
+        });
+      }
+      return enter(...args);
+    });
+    const started = latch(), resume = latch();
+    const caller = new AbortController();
+    const deadline = Date.now() + 300_000;
+    let wall = Date.now(), settled = false, transports = 0;
+    t.mock.method(Date, "now", () => wall);
+    const run = (f.cache as any).runGit.bind(f.cache);
+    t.mock.method(f.cache as any, "runGit", async (bare: string, args: string[], ...rest: unknown[]) => {
+      if (args.includes("fetch") && args.includes("file://" + f.clone.path)) {
+        transports++;
+        assert.equal(activeAuthorityTransaction(f.lifetime), undefined, "actual file transport has no A");
+        assert.equal((f.cache as any).recoveryOperations.getStore().deadline, deadline);
+        assert.deepEqual(args.slice(0, 7), ["-c", "protocol.file.allow=user", "fetch", "--refmap=",
+          "--no-tags", "--no-write-fetch-head", "file://" + f.clone.path]);
+        assert.match(args[7]!, /^\+refs\/heads\/agent\/issue-3747:refs\/uzi-incoming\/[0-9a-f-]+$/);
+        started.release();
+        await resume.promise;
+        wall += 31_000; // Transport consumes its parent budget, not a fresh admission clock.
+      }
+      return run(bare, args, ...rest);
+    });
+    const action = f.subject.fetchTracking(f.flight, f.bare, f.clone.path, BRANCH,
+      { expectedCandidateSha: incoming },
+      (fn: () => Promise<unknown>) => f.cache.withRecoveryOperation(caller.signal, deadline, fn));
+    const outcome = action.then((value: unknown) => { settled = true; return { value }; },
+      (error: unknown) => { settled = true; return { error }; });
+    let sameBare = false, otherBare = false;
+    let sibling: Promise<void> | undefined;
+    try {
+      assert.equal(await Promise.race([started.promise.then(() => true), outcome.then(() => false)]), true);
+      // This A -> different B must progress; an A waiter on the transport's B would obstruct it.
+      const different = path.join(fx.dataDir, "sibling-import.git");
+      command(fx.dataDir, "init", "--bare", different);
+      await f.authority.withTransaction(() => f.cache.withBareLock(different, async () => { otherBare = true; }));
+      sibling = f.cache.withBareLock(f.bare, async () => { sameBare = true; });
+      await tick();
+      assert.equal(otherBare, true); assert.equal(sameBare, false); assert.equal(settled, false);
+      assert.equal(command(f.bare, "rev-parse", "refs/uzi-runner/" + BRANCH), f.s);
+      assert.equal(f.authority.ownedSourceEpoch(f.clone.path, f.flight.sourceUsePaths), f.epoch);
+      if (change === "journal") f.write({ ...f.journal(), runId: "another-run" });
+      if (change === "attempt") {
+        const key = "uzi-attempts." + BRANCH + ".entry";
+        const entries = command(f.bare, "config", "--get-all", key).split("\n").map(v => JSON.parse(v));
+        const selected = entries.findLast(e => e.attemptId === ATTEMPT);
+        assert.ok(selected);
+        command(f.bare, "config", "--add", key, JSON.stringify({ ...selected, state: "abandoned" }));
+      }
+      if (change === "lease") {
+        const ended = await f.authority.endSourceUse([f.clone.path], { sink: f.flight.sourceUsePaths });
+        assert.equal(ended.endedSlots.length, 1);
+      }
+      if (change === "unknown tracking") command(f.bare, "update-ref", "refs/uzi-runner/" + BRANCH, f.d);
+    } finally {
+      resume.release();
+      await Promise.all([outcome, ...(sibling ? [sibling] : [])]);
+      f.runner.shutdown();
+    }
+    const result = await outcome;
+    assert.equal(transports, 1); assert.equal(sameBare, true);
+    const stages = command(f.bare, "for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/");
+    if (change === "none" || change === "remediation" || change === "tracking") {
+      assert.ok("value" in result, String("error" in result ? result.error : ""));
+      assert.equal(command(f.bare, "rev-parse", "refs/uzi-runner/" + BRANCH), incoming);
+      if (change === "remediation") {
+        assert.equal(f.journal().remediationRecovery.ownedTip, incoming);
+        assert.equal(f.journal().remediationRecovery.edges.length, 1, "existing committed edge survives");
+      } else assert.equal(f.journal().remediationRecovery, undefined, "import invents no remediation grant");
+      assert.equal(stages, "", "independent tracking anchor permits stage cleanup");
+      if (change === "tracking") {
+        const owned = await f.cache.enumerateOwedCandidates(f.bare, f.claim.run_id);
+        assert.ok(owned.some(c => c.sha === f.d), "fresh displacement preserves the intervening candidate");
+        assert.equal((result.value as any).displacedSha, f.d);
+      }
+      assert.equal(f.authority.ownedSourceEpoch(f.clone.path, f.flight.sourceUsePaths), f.epoch);
+    } else {
+      assert.ok("error" in result, "changed proof refuses import");
+      assert.equal(command(f.bare, "rev-parse", "refs/uzi-runner/" + BRANCH),
+        change === "unknown tracking" ? f.d : f.s);
+      if (change !== "unknown tracking") assert.equal(stages, incoming, "uncertain source proof retains stage");
+    }
+  });
+}
+
+test("source import refuses a changed private stage before promotion", async t => {
+  const f = await sourceImportFixture();
+  const incoming = f.commit("staged candidate", f.s);
+  const enter = f.subject.inFlightAuthority.bind(f.subject);
+  let proofs = 0;
+  t.mock.method(f.subject, "inFlightAuthority", async (...args: any[]) => {
+    if (++proofs === 2) {
+      const ref = command(f.bare, "for-each-ref", "--format=%(refname)", "refs/uzi-incoming/");
+      assert.ok(ref.startsWith("refs/uzi-incoming/"));
+      command(f.bare, "update-ref", ref, f.base, incoming);
+    }
+    return enter(...args);
+  });
+  try {
+    await assert.rejects(f.subject.fetchTracking(f.flight, f.bare, f.clone.path, BRANCH,
+      { expectedCandidateSha: incoming }), /private stage changed/);
+    assert.equal(proofs, 2);
+    assert.equal(command(f.bare, "rev-parse", "refs/uzi-runner/" + BRANCH), f.s);
+    assert.equal(command(f.clone.path, "rev-parse", "HEAD"), incoming);
+    assert.equal(f.authority.ownedSourceEpoch(f.clone.path, f.flight.sourceUsePaths), f.epoch);
+    assert.equal(f.journal().remediationRecovery, undefined);
+  } finally { f.runner.shutdown(); }
+});
+
+test("source import requires an authority callback before transport", async t => {
+  const f = await sourceImportFixture();
+  let transports = 0;
+  const run = (f.cache as any).runGit.bind(f.cache);
+  t.mock.method(f.cache as any, "runGit", (bare: string, args: string[], ...rest: unknown[]) => {
+    if (args.includes("fetch")) transports++;
+    return run(bare, args, ...rest);
+  });
+  try {
+    await assert.rejects(f.cache.fetchAgentBranch(f.bare, f.clone.path, BRANCH, f.claim.run_id, {
+      context: { runId: f.claim.run_id, generation: 2, kind: "issue", branch: BRANCH, barePath: f.bare,
+        defaultIdentity: { ref: "refs/remotes/origin/main", sha: f.base } }, producingSource: f.source,
+    }), /requires trusted authority callback/);
+    assert.equal(transports, 0);
+    assert.equal(f.authority.ownedSourceEpoch(f.clone.path, f.flight.sourceUsePaths), f.epoch);
+  } finally { f.runner.shutdown(); }
+});
+
+test("source import cancellation joins terminal close before ending flight source use", async t => {
+  const f = await sourceImportFixture();
+  const spawned = latch();
+  const child = { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() };
+  let complete!: (result: { code: number }) => void;
+  const completed = new Promise<{ code: number }>(resolve => { complete = resolve; });
+  let cancelled = false, settled = false, sameBare = false;
+  const caller = new AbortController();
+  const run = (f.cache as any).runGit.bind(f.cache);
+  t.mock.method(f.cache as any, "runGit", (bare: string, args: string[], ...rest: unknown[]) => {
+    if (!args.includes("fetch")) return run(bare, args, ...rest);
+    assert.equal(activeAuthorityTransaction(f.lifetime), undefined);
+    return f.cache.withBoundaryProcessSpawner(async () => {
+      spawned.release();
+      return { ...child, completed, cancel: async () => { cancelled = true; } };
+    }, caller.signal, () => run(bare, args, ...rest));
+  });
+  const operation = f.subject.fetchTracking(f.flight, f.bare, f.clone.path, BRANCH, {},
+    (fn: () => Promise<unknown>) => f.cache.withRecoveryOperation(caller.signal, Infinity, fn));
+  const outcome = operation.then((value: unknown) => { settled = true; return { value }; },
+    (error: unknown) => { settled = true; return { error }; });
+  let sibling: Promise<void> | undefined;
+  try {
+    assert.equal(await Promise.race([spawned.promise.then(() => true), outcome.then(() => false)]), true);
+    sibling = f.cache.withBareLock(f.bare, async () => { sameBare = true; });
+    child.stdout.end(); child.stderr.end(); caller.abort(new Error("caller cancelled"));
+    await tick();
+    assert.equal(cancelled, true); assert.equal(settled, false); assert.equal(sameBare, false);
+    await f.authority.withTransaction(async () => {});
+    assert.notEqual(f.flight.sourceTailsJoined, true);
+    const end = await f.subject.endFlightSourceUse(f.flight, nullLogger());
+    assert.deepEqual(end.endedSlots, [], "EOF/cancel is not a joined source tail");
+    assert.equal(f.authority.ownedSourceEpoch(f.clone.path, f.flight.sourceUsePaths), f.epoch);
+  } finally {
+    complete({ code: 1 });
+    await Promise.all([outcome, ...(sibling ? [sibling] : [])]);
+    f.runner.shutdown();
+  }
+  assert.ok("error" in await outcome);
+  assert.equal(sameBare, true);
+  f.flight.sourceTailsJoined = true; // Controller now has the actual terminal-close join.
+  const end = await f.subject.endFlightSourceUse(f.flight, nullLogger());
+  assert.equal(end.endedSlots.length, 1);
+});
+
+
+for (const mode of ["done", "milestone"] as const) for (const stop of ["soft", "hard"] as const) {
+  test("source import preserves checkpoint stop scopes: " + mode + "/" + stop, async t => {
+    const f = await sourceImportFixture();
+    const incoming = f.commit("checkpoint candidate", f.s);
+    const soft = new AbortController(), hard = new AbortController();
+    let transported = false;
+    const run = (f.cache as any).runGit.bind(f.cache);
+    t.mock.method(f.cache as any, "runGit", async (bare: string, args: string[], ...rest: unknown[]) => {
+      const result = await run(bare, args, ...rest);
+      if (args.includes("fetch")) {
+        assert.equal(activeAuthorityTransaction(f.lifetime), undefined);
+        transported = true;
+        (stop === "soft" ? soft : hard).abort();
+      }
+      return result;
+    });
+    const action = () => f.subject.fetchTracking(f.flight, f.bare, f.clone.path, BRANCH,
+      { expectedCandidateSha: incoming, checkpointImportMode: mode },
+      (fn: () => Promise<unknown>) => f.cache.withBoundaryProcessSpawner(async request => {
+        const child = childProcess.spawn(request.argv[0]!, request.argv.slice(1), { cwd: request.cwd, env: request.env });
+        const completed = new Promise<{ code: number }>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("close", code => resolve({ code: code ?? -1 }));
+        });
+        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed,
+          cancel: async () => { child.kill("SIGTERM"); await completed; } };
+      }, hard.signal, fn, { softSignal: soft.signal }));
+    try {
+      // Milestone import settles through a soft stop; the runner's subsequent
+      // requireTrackingOwned guard still observes that stop and must refuse progress.
+      await assert.rejects(action(), stop === "soft" ? /soft deadline/ : /aborted/);
+      const settledImport = mode === "milestone" && stop === "soft";
+      assert.equal(command(f.bare, "rev-parse", "refs/uzi-runner/" + BRANCH), settledImport ? incoming : f.s);
+      assert.equal(command(f.bare, "for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"),
+        settledImport ? "" : incoming);
+      if (settledImport) assert.equal((await f.cache.committedTrackingOwnership(f.bare, BRANCH,
+        f.claim.run_id, incoming)).kind, "owned");
+      assert.equal(transported, true);
+      assert.equal(f.authority.ownedSourceEpoch(f.clone.path, f.flight.sourceUsePaths), f.epoch);
+    } finally { f.runner.shutdown(); }
   });
 }

@@ -3613,7 +3613,8 @@ export class RunRunner {
    * beginDestructive) needs this. A site whose only hook is assertBareClear does not: that hook is a
    * read-only load that needs no transaction. Legacy imports, updateTrackingRef,
    * retainCurrentOwedCandidate and anchorRecoveryHead run without A. Attempt-bound imports and
-   * remediation scans hold A outside the bare lock to authenticate their producing source.
+   * remediation scans take A before B to authenticate their producing source. Attempt-bound
+   * imports use short proof phases around their B-only transport.
    *
    * `wait` bounds the wait for A: pass the caller's signal and the deadline of the surrounding boundary.
    */
@@ -16855,11 +16856,14 @@ export class RunRunner {
     options.checkpointStep?.("checkpoint_import_context");
     const owed = await this.owedOptions(flight, barePath, branch);
     return importScope(async () => {
-      const acquire = () => this.git.fetchAgentBranch(
-        barePath, worktreePath, branch, flight.runId, { ...owed, ...options },
+      const result = await this.git.fetchAgentBranch(
+        barePath, worktreePath, branch, flight.runId, { ...owed, ...options,
+          // Git invokes this only outside B, before transport and again before promotion.
+          // The transport inherits the existing import scope and caller budget without A.
+          withSourceAuthority: action => this.inFlightAuthority(flight, action,
+            sourceAuthorityWait ?? this.authorityWait(flight)),
+        },
       );
-      const result = owed.producingSource
-        ? await this.inFlightAuthority(flight, acquire, sourceAuthorityWait ?? this.authorityWait(flight)) : await acquire();
       if (result.kind === "not_updated") throw this.preservationRefused(flight, result.reason);
       if (result.divergence === "divergent") {
         const heads = result.displacedSha && result.retainedShas.includes(result.displacedSha) ? [result.displacedSha] : [];
@@ -18652,7 +18656,8 @@ export class RunRunner {
         }, deadlineAt) });
       } finally {
         for (const finding of findings)
-          await this.persistRemediationRestrictions(flight, barePath, branch, finding.tip, finding.findings);
+          await this.withRemediationLifecycle(signal, () =>
+            this.persistRemediationRestrictions(flight, barePath, branch, finding.tip, finding.findings), deadlineAt);
       }
     }), { ...this.authorityWait(flight), ...(signal ? { signal } : {}),
       ...(deadlineAt ? { timeoutMs: Math.max(1, deadlineAt - Date.now()) } : {}) });

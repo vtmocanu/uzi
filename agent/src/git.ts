@@ -2667,6 +2667,8 @@ export interface FetchAgentBranchOptions {
   context: OwedCandidateContext;
   /** Independently authenticated producing source; omitted by legacy/canonical imports. */
   producingSource?: { runId: string; clonePath: string; attemptId: string };
+  /** Trusted runner scope: called only outside B, for short source authentication phases. */
+  withSourceAuthority?<T>(action: () => Promise<T>): Promise<T>;
   remotelyConfirmedSha?: string;
   /** Worker-captured candidate; never substitute a newer branch head. */
   expectedCandidateSha?: string;
@@ -5699,89 +5701,121 @@ export class GitCache {
     if (opts.checkpointImportMode === "milestone") await this.maskCheckpointCooperation(prepare);
     else await prepare();
     opts.checkpointStep?.("checkpoint_import_lock_wait");
-    return this.withLock(barePath, async () => {
-      const importBranch = async (): Promise<TrackingUpdateResult> => {
-        this.checkCheckpointCooperation();
-        const enrolled = await this.readRecoveryCapture(barePath, branch);
-        if (enrolled?.remediationRecovery && !opts.producingSource) throw new Error("remediation producing source required");
-        if (opts.producingSource) {
-          if (opts.producingSource.clonePath !== clonePath || opts.producingSource.runId !== runId)
-            throw new Error("remediation producing source mismatch");
-          await this.remediationSourceUnderLock(barePath, branch, opts.producingSource);
-        }
-        const observed = await this.observeTrackingUnderLock(barePath, branch);
-        const stage = `refs/uzi-incoming/${randomUUID()}`;
-        opts.checkpointStep?.("checkpoint_import_transport");
-        // Ordinary transport failures (including boundary aborts) deliberately throw.
-        await this.runGit(barePath, [
-          "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags",
-          "--no-write-fetch-head", `file://${clonePath}`, `+refs/heads/${branch}:${stage}`,
-        ]);
-        opts.checkpointStep?.("checkpoint_import_poststage");
-        const incoming = await this.resolveCommitStrict(barePath, stage);
-        await this.requireOwedCommit(barePath, incoming);
-        if (opts.expectedCandidateSha !== undefined && incoming !== opts.expectedCandidateSha) {
-          throw new Error("checkpoint candidate changed during acquisition");
-        }
-        this.checkCheckpointCooperation();
-        let result: TrackingUpdateResult;
-        if (observed) {
-          result = await this.promoteTrackingUnderLock(barePath, branch, incoming, observed, opts);
-        } else {
-          // The producing fetch context proves only incoming, never the unknown shared head.
-          result = await this.maskCheckpointCooperation(async (): Promise<TrackingUpdateResult> => {
-            try {
-              await this.pinOwedUnderLock(opts.context, incoming);
-              return { kind: "not_updated", reason: "ownership_unknown" };
-            } catch (cause) {
-              const abort = this.boundaryAbortError(cause);
-              if (abort) throw abort;
-              return { kind: "not_updated", reason: preservationReason(cause) };
-            }
-          });
-        }
-        // Ownership has settled. A stop now retains the private stage rather than
-        // moving a stall into optional anchor lookup or staging cleanup.
-        if (result.kind === "not_updated") {
-          await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
-          if (checkpointScope?.softSignal?.aborted ||
-              (checkpointScope?.softDeadlineAt ?? Infinity) <= (checkpointScope?.now ?? Date.now)()) return result;
-        }
-        this.checkCheckpointCooperation();
-        {
-          // A refusal can leave stage as the sole anchor if metadata/pinning failed.
-          // Delete it only after an independently verified durable anchor exists.
+    const authenticate = async (): Promise<void> => {
+      this.checkCheckpointCooperation();
+      const enrolled = await this.readRecoveryCapture(barePath, branch);
+      if (enrolled?.remediationRecovery && !opts.producingSource) throw new Error("remediation producing source required");
+      if (opts.producingSource) {
+        if (opts.producingSource.clonePath !== clonePath || opts.producingSource.runId !== runId)
+          throw new Error("remediation producing source mismatch");
+        await this.remediationSourceUnderLock(barePath, branch, opts.producingSource);
+      }
+    };
+    const stage = `refs/uzi-incoming/${randomUUID()}`;
+    const acquireIncoming = async (): Promise<string> => {
+      this.checkCheckpointCooperation();
+      opts.checkpointStep?.("checkpoint_import_transport");
+      // Ordinary transport failures (including boundary aborts) deliberately throw.
+      await this.runGit(barePath, [
+        "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags",
+        "--no-write-fetch-head", `file://${clonePath}`, `+refs/heads/${branch}:${stage}`,
+      ]);
+      opts.checkpointStep?.("checkpoint_import_poststage");
+      const incoming = await this.resolveCommitStrict(barePath, stage);
+      await this.requireOwedCommit(barePath, incoming);
+      if (opts.expectedCandidateSha !== undefined && incoming !== opts.expectedCandidateSha) {
+        throw new Error("checkpoint candidate changed during acquisition");
+      }
+      this.checkCheckpointCooperation();
+      return incoming;
+    };
+    const promoteIncoming = async (incoming: string): Promise<TrackingUpdateResult> => {
+      // No observation survives an unlocked phase: preservation and CAS use current B custody.
+      const observed = await this.observeTrackingUnderLock(barePath, branch);
+      let result: TrackingUpdateResult;
+      if (observed) {
+        result = await this.promoteTrackingUnderLock(barePath, branch, incoming, observed, opts);
+      } else {
+        // The producing fetch context proves only incoming, never the unknown shared head.
+        result = await this.maskCheckpointCooperation(async (): Promise<TrackingUpdateResult> => {
           try {
-            if (result.kind === "updated" && await this.checkedTrackingSha(barePath, branch) === incoming) {
-              await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
-            } else if (await this.hasOwedAnchorUnderLock(barePath, opts.context.runId, incoming)) {
-              await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
-            } else if (result.kind === "not_updated" && result.reason === "owed_limit") {
-              // At the cap the incoming head is deliberately unpreserved (the run is stopped and its
-              // clone kept), so its stage must not accumulate one ref per refused attempt.
-              await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
-            }
+            await this.pinOwedUnderLock(opts.context, incoming);
+            return { kind: "not_updated", reason: "ownership_unknown" };
           } catch (cause) {
-            // An inconclusive owner with a successfully preserved incoming pin is
-            // not a mutation failure: its cleanup stop must still propagate.
-            if (result.kind === "not_updated" && (observed || result.reason !== "ownership_unknown") &&
-                cause instanceof CheckpointSoftDeadlineError) {
-              await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
-              return result;
-            }
             const abort = this.boundaryAbortError(cause);
             if (abort) throw abort;
-            if (result.kind === "updated") throw cause;
-            // One cleanup attempt; a harmless stage must not erase the refusal reason.
+            return { kind: "not_updated", reason: preservationReason(cause) };
           }
+        });
+      }
+      // Ownership has settled. A stop now retains the private stage rather than
+      // moving a stall into optional anchor lookup or staging cleanup.
+      if (result.kind === "not_updated") {
+        await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+        if (checkpointScope?.softSignal?.aborted ||
+            (checkpointScope?.softDeadlineAt ?? Infinity) <= (checkpointScope?.now ?? Date.now)()) return result;
+      }
+      this.checkCheckpointCooperation();
+      {
+        // A refusal can leave stage as the sole anchor if metadata/pinning failed.
+        // Delete it only after an independently verified durable anchor exists.
+        try {
+          if (result.kind === "updated" && await this.checkedTrackingSha(barePath, branch) === incoming) {
+            await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+          } else if (await this.hasOwedAnchorUnderLock(barePath, opts.context.runId, incoming)) {
+            await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+          } else if (result.kind === "not_updated" && result.reason === "owed_limit") {
+            // At the cap the incoming head is deliberately unpreserved; the stopped clone is kept.
+            await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+          }
+        } catch (cause) {
+          // An inconclusive owner with a successfully preserved incoming pin is
+          // not a mutation failure: its cleanup stop must still propagate.
+          if (result.kind === "not_updated" && (observed || result.reason !== "ownership_unknown") &&
+              cause instanceof CheckpointSoftDeadlineError) {
+            await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+            return result;
+          }
+          const abort = this.boundaryAbortError(cause);
+          if (abort) throw abort;
+          if (result.kind === "updated") throw cause;
+          // One cleanup attempt; a harmless stage must not erase the refusal reason.
         }
-        if (result.kind === "not_updated") await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
-        else this.checkCheckpointCooperation();
-        return result;
-      };
-      return opts.checkpointImportMode === "milestone"
-        ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
-    });
+      }
+      if (result.kind === "not_updated") await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+      else this.checkCheckpointCooperation();
+      return result;
+    };
+    if (!opts.producingSource) {
+      // Canonical imports keep their single B section and need no source authority.
+      return this.withLock(barePath, () => {
+        const importBranch = async () => {
+          await authenticate();
+          return promoteIncoming(await acquireIncoming());
+        };
+        return opts.checkpointImportMode === "milestone"
+          ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
+      });
+    }
+    const withSourceAuthority = opts.withSourceAuthority ?? (
+      !this.authority && !this.authorityRequired ? <T>(action: () => Promise<T>) => action() : undefined);
+    if (!withSourceAuthority) throw new Error("producing source requires trusted authority callback");
+    // A -> B only for proof. The awaited transport owns B and the flight source use,
+    // but holds no A. A refusal or uncertain join retains the unique private stage.
+    await withSourceAuthority(() => this.withLock(barePath, () =>
+      opts.checkpointImportMode === "milestone" ? this.maskCheckpointCooperation(authenticate) : authenticate()));
+    const importBranch = async () => {
+      const incoming = await this.withLock(barePath, acquireIncoming);
+      return withSourceAuthority(() => this.withLock(barePath, async () => {
+        await authenticate();
+        if (await this.resolveCommitStrict(barePath, stage) !== incoming)
+          throw new Error("checkpoint private stage changed before promotion");
+        await this.requireOwedCommit(barePath, incoming);
+        return promoteIncoming(incoming);
+      }));
+    };
+    return opts.checkpointImportMode === "milestone"
+      ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
   }
 
   /**
@@ -19661,6 +19695,7 @@ try {
     const c = opts.context;
     return { context: { ...c, defaultIdentity: c?.defaultIdentity && { ...c.defaultIdentity } },
       producingSource: opts.producingSource && { ...opts.producingSource },
+      withSourceAuthority: opts.withSourceAuthority,
       remotelyConfirmedSha: opts.remotelyConfirmedSha, expectedCandidateSha: opts.expectedCandidateSha,
       checkpointImportMode: opts.checkpointImportMode, checkpointStep: opts.checkpointStep };
   }
