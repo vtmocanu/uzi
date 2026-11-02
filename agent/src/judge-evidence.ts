@@ -40,9 +40,16 @@ export interface JudgeEvidence {
     pendingRows: number; failedPairs: number };
 }
 
+/** Own bounded string storage: V8 slices can otherwise retain an entire payload.
+ * JSON round-tripping preserves exact UTF-16 identities, including lone surrogates;
+ * UTF-8 conversion would silently change those keys. */
+function ownedPrefix(s: string, cap: number): string {
+  return JSON.parse(JSON.stringify(s.slice(0, cap))) as string;
+}
+
 /** Escapes at the boundary, before enforcing the rendered character budget. */
 function clip(s: string, cap: number): string {
-  return s.length <= cap ? s : s.slice(0, cap - 12) + "…[truncated]";
+  return s.length <= cap ? ownedPrefix(s, cap) : ownedPrefix(s, cap - 12) + "…[truncated]";
 }
 function quoted(s: string, cap: number): string {
   return clip(JSON.stringify(s.slice(0, cap)).replace(/[\u007f-\u009f\u061c\u200e-\u200f\u2028-\u202e\u2066-\u2069]/g,
@@ -205,7 +212,7 @@ export class JudgeEvidenceReducer {
       const category = lane(m);
       let counts = name.length <= 256 ? this.tools.get(name) : undefined;
       if (!counts && name.length > 0 && name.length <= 256 && this.tools.size < 64) {
-        counts = { lead: 0, child: 0, unknown: 0 }; this.tools.set(name, counts);
+        counts = { lead: 0, child: 0, unknown: 0 }; this.tools.set(ownedPrefix(name, 256), counts);
       }
       (counts ?? this.overflow)[category]++;
       if (category === "lead" && this.boundary) this.afterDispatch++;
@@ -218,7 +225,7 @@ export class JudgeEvidenceReducer {
     if (m.kind === "tool_result") this.toolResults++;
     if (dispatch) {
       this.dispatches++;
-      this.boundary = { seq: m.seq, time: str(m.created_at).slice(0, 64), id: str(p["id"]).slice(0, 256) };
+      this.boundary = { seq: m.seq, time: ownedPrefix(str(m.created_at), 64), id: ownedPrefix(str(p["id"]), 256) };
       this.afterDispatch = 0;
     }
     if (!dispatch && m.kind !== "tool_result") return;
@@ -229,12 +236,13 @@ export class JudgeEvidenceReducer {
     const keyLength = category.length + 1 + String(instance.length).length + 1 + instance.length + id.length;
     if (!id || id.length > 256 || instance.length > 256 || keyLength > 256) {
       this.oversizedKeys++;
-      if (dispatch) this.addRow({ key: "#" + m.seq, id: clip(id, 80), role: str(record(p["input"])?.["subagent_type"]).slice(0, 256) || "unknown",
-        instance: clip(instance, 80), start: m.seq, time: str(m.created_at).slice(0, 64),
+      if (dispatch) this.addRow({ key: "#" + m.seq, id: clip(id, 80),
+        role: ownedPrefix(str(record(p["input"])?.["subagent_type"]), 256) || "unknown",
+        instance: clip(instance, 80), start: m.seq, time: ownedPrefix(str(m.created_at), 64),
         outcome: "incomplete", ambiguous: true, childTools: 0, startText: text });
       return;
     }
-    const key = category + ":" + instance.length + ":" + instance + id;
+    const key = ownedPrefix(category + ":" + instance.length + ":" + instance + id, 256);
     let h = this.history.get(key);
     if (dispatch) {
       if (h) {
@@ -247,8 +255,9 @@ export class JudgeEvidenceReducer {
       }
       const old = this.pending.get(key);
       if (old?.ambiguous && h) h.tainted = true;
-      const row: Row = { key, id, instance, role: str(record(p["input"])?.["subagent_type"]).slice(0, 256) || "unknown",
-        start: m.seq, time: str(m.created_at).slice(0, 64), outcome: "incomplete",
+      const row: Row = { key, id: ownedPrefix(id, 256), instance: ownedPrefix(instance, 256),
+        role: ownedPrefix(str(record(p["input"])?.["subagent_type"]), 256) || "unknown",
+        start: m.seq, time: ownedPrefix(str(m.created_at), 64), outcome: "incomplete",
         ambiguous: category === "unknown" || !h || h.tainted || h.evicted, childTools: 0, startText: text };
       this.addRow(row);
       if (old?.result && !old.row) {
@@ -258,7 +267,7 @@ export class JudgeEvidenceReducer {
         this.put(key, { row });
       }
     } else {
-      const result = { seq: m.seq, time: str(m.created_at).slice(0, 64), outcome: outcome(p), text,
+      const result = { seq: m.seq, time: ownedPrefix(str(m.created_at), 64), outcome: outcome(p), text,
         cause: typeof p["content"] === "string" && INTERRUPTIONS.has(p["content"])
           ? p["content"] === "delegation stopped by the run; child settlement not confirmed" ? "run stopped; settlement unconfirmed"
             : p["content"] === "delegation still open at turn end; child settlement not confirmed" ? "open at turn end; settlement unconfirmed"

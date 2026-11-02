@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 import { JudgeEvidenceReducer } from "../src/judge-evidence.js";
 import type { JudgeEvidence, JudgeFetchMeta } from "../src/judge-evidence.js";
 import type { WorkerRunMessage } from "../src/protocol.js";
@@ -35,6 +36,46 @@ function bounded(e: JudgeEvidence) {
   assert.equal(e.counts.eligible, e.counts.retained + e.counts.omitted);
   for (const line of e.sections.prose.split("\n")) assert.ok(line.length <= 800);
 }
+
+test("bounded metadata copies release large source-string backing stores", () => {
+  const moduleUrl = new URL("../src/judge-evidence.ts", import.meta.url).href;
+  const script = `
+    import assert from "node:assert/strict";
+    const { JudgeEvidenceReducer } = await import(${JSON.stringify(moduleUrl)});
+    const reducer = new JudgeEvidenceReducer();
+    for (let i = 0; i < 3; i++) globalThis.gc();
+    const before = process.memoryUsage().heapUsed;
+    for (let i = 0; i < 48; i++) {
+      reducer.accept({ seq: i + 1, kind: "tool_use", agent: "lead",
+        created_at: "time-" + i + "-" + "t".repeat(1000000),
+        payload: { id: i % 2 ? "valid-" + i : "x".repeat(257), name: "Agent",
+          input: { subagent_type: "role-" + i + "-" + "r".repeat(1000000) } } });
+    }
+    for (let i = 0; i < 3; i++) globalThis.gc();
+    const retainedHeapBytes = process.memoryUsage().heapUsed - before;
+    const state = reducer.render();
+    console.log(JSON.stringify({ retainedHeapBytes, rows: state.metrics.rows }));
+    assert.equal(state.metrics.rows, 48);
+    assert.ok(retainedHeapBytes < 20 * 1024 * 1024,
+      "bounded metadata must release multi-megabyte source backing strings");
+  `;
+  const result = spawnSync(process.execPath,
+    ["--expose-gc", "--import", "tsx", "--input-type=module", "-e", script],
+    { encoding: "utf8", timeout: 30000, maxBuffer: 1024 * 1024 });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+});
+
+test("owned metadata preserves exact UTF-16 tool correlation identities", () => {
+  const f = fixture();
+  const lone = String.fromCharCode(0xd800) + "x";
+  const replacement = String.fromCharCode(0xfffd) + "x";
+  f.start(lone); f.start(replacement);
+  f.end(replacement);
+  assert.equal(f.reducer.render().counts.confirmed.success, 1);
+  f.end(lone);
+  assert.equal(f.reducer.render().counts.confirmed.success, 2);
+});
 
 test("repeated roles, interleaving and child replay keep parent and child tool identities independent", () => {
   const f = fixture();
