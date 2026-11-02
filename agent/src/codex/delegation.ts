@@ -308,7 +308,9 @@ export class CodexDelegationRunner {
     // when the parent supplied no dedicated instruction field.
     const taskInput = delegationTaskInput(request.args) ?? "";
 
-    // Honor a stop that already fired before any child work begins.
+    // Honor a stop that already fired before any child work begins. Only a parent abort can be
+    // observed here today (the deadline timer is armed synchronously just before), but the code
+    // still follows wasTimeout() so the label can never disagree with the cause.
     if (signal.aborted) {
       return this.stopResult(wasTimeout(), "before");
     }

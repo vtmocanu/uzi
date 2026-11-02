@@ -29,7 +29,7 @@ export function codexLeadChildBudgetAppend(ms: number): string {
     "Child turn budget:",
     `- Each spawn_agent child has a ${budget} per-child turn budget. Child setup and command execution consume it; it is not the 60-minute command bound. Owner cancel, the end of your turn or the run wall may stop a child earlier.`,
     "- Size each assignment to finish within it.",
-    "- After a child_timeout, inventory partial work (worktree status and diff, the child's reported artifacts) before choosing a smaller executable reassignment or a deliberate takeover. Do not blindly replay edits and do not retry automatically.",
+    "- After a child_timeout, inventory partial work (worktree status and diff, files and commits the child left) before choosing a smaller executable reassignment or a deliberate takeover. Do not blindly replay edits and do not retry automatically.",
     "- Lead-authored changes still need independent committed-range review.",
   ].join("\n");
 }

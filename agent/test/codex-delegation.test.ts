@@ -56,16 +56,16 @@ class FakeController implements ChildThreadController {
   closed = false;
   private readonly notes: CodexNotification[];
   private readonly hangAfter: boolean;
-  /** When set, interrupt() waits this long (real timer) before it resolves or rejects. */
-  private readonly interruptDelayMs: number;
+  /** When set, interrupt() waits for this test-controlled gate before it resolves or rejects. */
+  private readonly interruptGate: Promise<void> | undefined;
   private readonly interruptRejects: boolean;
 
-  constructor(opts: { threadId?: string; turnId?: string; notes: CodexNotification[]; hangAfter?: boolean; interruptDelayMs?: number; interruptRejects?: boolean }) {
+  constructor(opts: { threadId?: string; turnId?: string; notes: CodexNotification[]; hangAfter?: boolean; interruptGate?: Promise<void>; interruptRejects?: boolean }) {
     this.threadId = opts.threadId ?? "child-thread";
     this.turnId = opts.turnId ?? "child-turn";
     this.notes = opts.notes;
     this.hangAfter = opts.hangAfter ?? false;
-    this.interruptDelayMs = opts.interruptDelayMs ?? 0;
+    this.interruptGate = opts.interruptGate;
     this.interruptRejects = opts.interruptRejects ?? false;
   }
 
@@ -84,7 +84,7 @@ class FakeController implements ChildThreadController {
   }
   async interrupt(): Promise<void> {
     this.interrupted = true;
-    if (this.interruptDelayMs > 0) await new Promise((r) => setTimeout(r, this.interruptDelayMs));
+    if (this.interruptGate) await this.interruptGate;
     if (this.interruptRejects) throw new Error("interrupt rejected");
   }
   async close(): Promise<void> {
@@ -859,13 +859,22 @@ describe("child turn budget: timeout vs cancel (#3804)", () => {
     assert.equal(controller.closed, true);
   });
 
-  it("keeps child_aborted when the deadline elapses during the delayed interrupt (first cause wins)", async () => {
+  it("keeps child_aborted when the deadline elapses during the delayed interrupt (first cause wins)", async (t) => {
+    // Event-driven: mocked setTimeout makes the deadline fire only on tick, and the interrupt
+    // stays pending until the test releases it, so the order abort → deadline → settle is fixed.
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    let releaseInterrupt!: () => void;
+    const interruptGate = new Promise<void>((r) => { releaseInterrupt = r; });
     const parent = new AbortController();
-    const controller = new FakeController({ notes: [], hangAfter: true, interruptDelayMs: 120 });
+    const controller = new FakeController({ notes: [], hangAfter: true, interruptGate });
     const b = makeRunner({ controller, signal: parent.signal, childTurnDeadlineMs: 40 });
     const p = b.runner.run(delegReq());
     await untilStarted(b);
     parent.abort();
+    for (let i = 0; i < 200 && !controller.interrupted; i++) await tick();
+    assert.equal(controller.interrupted, true);
+    t.mock.timers.tick(40);
+    releaseInterrupt();
     const res = await p;
     assert.equal(res.code, "child_aborted");
     assertStopMessage(res.message, "child_aborted", "child_timeout");
@@ -922,7 +931,7 @@ describe("child turn budget: timeout vs cancel (#3804)", () => {
 
   it("keeps every timeout and cancel message within 120 characters for each budget", async (t) => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
-    for (const ms of [30, 45_000, 90_500, 900_000, 3_600_000, 7_200_000, 2 ** 31 - 1]) {
+    for (const ms of [30, 45_000, 90_500, 900_000, 3_600_000, 7_200_000, 99_999_000, 999_999_999, 2 ** 31 - 1]) {
       const controller = new FakeController({ notes: [], hangAfter: true });
       const b = makeRunner({ controller, childTurnDeadlineMs: ms });
       const p = b.runner.run(delegReq());
