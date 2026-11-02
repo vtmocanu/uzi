@@ -18917,9 +18917,11 @@ try {
   /** issue #3780: finish an ownership update that THIS token's earlier attempt stranded, only from one of
    *  three exact disk states (pre-pending, ref unchanged, CAS landed). Caller holds the bare lock. From the
    *  pre-pending state an attempt that never passed the ancestor clear runs that clear itself first (a
-   *  refused clear refuses the repair with no further write). Before EACH write
-   *  the admission predicate and the HARD boundary signal are re-checked (the soft signal is masked for the
-   *  repair); once either fails it stops with no further write and no rollback, leaving a state a later
+   *  refused clear refuses the repair with no further write). That clear runs as ONE step behind a single
+   *  admission + HARD-signal check, as in the original attempt: splitting it (e.g. between an ancestor delete
+   *  and its receipt unlink) would leave a state every later import refuses. Before each other roll-forward
+   *  write the admission predicate and the HARD boundary signal are re-checked (the soft signal is masked for
+   *  the repair); once either fails it stops with no further write and no rollback, leaving a state a later
    *  admissible import can finish.
    *  Returns true only when the committed receipt reads back as the record's owner. */
   private async repairTrackingAttemptUnderLock(barePath: string, branch: string,

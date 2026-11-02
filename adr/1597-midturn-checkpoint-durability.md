@@ -540,7 +540,10 @@ finish that token's own attempt, only from one of three exact disk states:
 - **Pre-pending:** ref and stamp unchanged, no receipt, governance marker absent or
   exact, and the record saw no prior receipt. If the original attempt had not yet passed
   the ancestor clear (a refused clear leaves the same state), the repair first re-runs that
-  clear under admission and refuses with no further write when it does not pass.
+  clear and refuses with no further write when it does not pass. The clear runs as one
+  step behind a single admission and hard-signal check, as in the original attempt;
+  splitting it (between an ancestor delete and its receipt unlink) would leave a state
+  every later import refuses.
   Roll-forward: marker, pending receipt, CAS, stamp, committed receipt.
 - **Ref unchanged:** marker and pending receipt exact, ref and stamp unchanged. CAS,
   stamp, committed receipt.
@@ -551,8 +554,8 @@ Only the committed receipt reading back as the record's run, generation and cont
 counts as success. Anything else (any other disk state, a context, run or generation
 mismatch, a missing owed anchor, a duplicated stamp) refuses as before. There is no
 rollback: every write is a step the original attempt would have taken, and undoing
-under possibly revoked authority would be a new mutation. Before each roll-forward write
-the repair re-checks the admission proof and the hard boundary signal (the soft signal is
+under possibly revoked authority would be a new mutation. Before each other roll-forward write
+(marker, pending receipt, CAS, stamp, committed receipt) the repair re-checks the admission proof and the hard boundary signal (the soft signal is
 masked for the repair); the one best-effort rewrite of the pending receipt after a failed
 committed write or readback, mirroring the original attempt's own invalidation, runs only
 while admission holds and the hard boundary signal has not aborted. Admission is true only
