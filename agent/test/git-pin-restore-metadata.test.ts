@@ -358,6 +358,38 @@ describe("retained pin metadata refuses ambiguous or inconsistent attribution be
 });
 
 describe("metadata regression boundaries", () => {
+  it("binds historical links to the actual bare even with consistent history digests", async t => {
+    activate();
+    const second = newJournal();
+    let raw = JSON.stringify(second);
+    envelope.predecessors.push({ journalDigest: digest(raw), rawJournal: raw,
+      generation: 2, sourceEpoch: NEW_EPOCH });
+    const next = structuredClone(link);
+    next.predecessorGeneration = 2;
+    next.predecessorEpoch = NEW_EPOCH;
+    next.predecessorJournalDigest = digest(raw);
+    next.successor.claimGeneration = 3;
+    next.successor.attemptId = ATTEMPT.replace("-g2-", "-g3-");
+    next.successor.clonePath = attemptClonePath(canonical, next.successor.attemptId);
+    next.successor.sourceEpoch = "2123abcd-0123-4abc-8def-0123456789ab";
+    next.restore.predecessorGeneration = 2;
+    next.restore.pinRef = `refs/uzi-recovery-pin/${RUN}/2`;
+    envelope.intent = { version: 1, phase: "prepared", link: next };
+    retain();
+    const guard = guardSources(t, [canonical, link.successor.clonePath, next.successor.clonePath]);
+    assert.equal((await cache.readRetainedPinMetadata(bare))[0]!.originals.length, 2);
+    second.pinRestore = structuredClone(link);
+    second.pinRestore.restore.bareDir = "other.git";
+    raw = JSON.stringify(second);
+    envelope.predecessors[1] = { journalDigest: digest(raw), rawJournal: raw,
+      generation: 2, sourceEpoch: NEW_EPOCH };
+    next.predecessorJournalDigest = digest(raw);
+    config(ACTIVE_KEY, raw);
+    retain();
+    await assert.rejects(cache.readRetainedPinMetadata(bare), /historical pin restore repository identity/);
+    guard.assertUntouched();
+  });
+
   it("charges standalone generation journal decoding once before parsing, including escaped keys", async t => {
     const plain = JSON.stringify(oldJournal).replace('"sourceGeneration"', '"\\u0073ourceGeneration"');
     const raw = plain + " ".repeat(16384 - Buffer.byteLength(plain));

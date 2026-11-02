@@ -34,6 +34,109 @@ trap 'rm -rf "$WORK"' EXIT
 # fail <msg>: print and abort the test run non-zero.
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+
+# Exercise the private V2 transport seams at small caps with actual binary streams.
+python3 - "$SCRIPT" "$WORK" <<'PY'
+import base64
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+source = Path(sys.argv[1]).read_text()
+work = Path(sys.argv[2])
+remote = source.split("V2_CONFIG_READER='\n", 1)[1].split("\n'\n", 1)[0]
+helper = source.split("v2_config_snapshot(){", 1)[1].split("\n}\n", 1)[0]
+bare = work / "bounded.git"
+bare.mkdir()
+config = bare / "config"
+
+def remote_run(data, cap=256):
+    config.write_bytes(data)
+    return subprocess.run(["node", "-e", remote, str(bare), str(cap)], capture_output=True)
+
+for length in (255, 256, 257):
+    result = remote_run(b"#" + b"x" * (length - 2) + b"\n")
+    assert (result.returncode == 0) == (length <= 256), (length, result.stderr)
+    if result.returncode == 0:
+        assert base64.b64decode(result.stdout) == b"\0__UZI_CONFIG_RC=0"
+# Count decoded Git stdout plus its status, at and around the output cap.
+data = b"[x]\na=" + b"v" * 64 + b"\n"
+size = len(base64.b64decode(remote_run(data, 1024).stdout))
+for cap in (size - 1, size, size + 1):
+    result = remote_run(data, cap)
+    assert (result.returncode == 0) == (cap >= size), (cap, result.stderr)
+# UTF-8 comment bytes count before decoding, rather than counting characters.
+assert remote_run(b"#" + "µ".encode() * 128 + b"\n").returncode != 0
+assert remote_run(b"[broken\n").returncode != 0
+# Input is below cap, but Git repeats section names and expands actual output.
+assert remote_run(b"[longsectionname]\n" + b"x=\n" * 30).returncode != 0
+assert remote_run(b"[x]\na=one\\ntwo\n").returncode == 0
+config.unlink()
+# Grow a real regular file immediately after its first actual read. Delegating
+# readSync still reads real bytes; the hook gives deterministic growth, no sleeps.
+config.write_bytes(b"# initial\n")
+grow = """
+const growFs = require("node:fs");
+const actualRead = growFs.readSync;
+let grew = false, readBytes = 0;
+growFs.readSync = (...args) => {
+  const n = actualRead(...args); readBytes += n;
+  if (!grew) {
+    grew = true;
+    growFs.appendFileSync(process.argv[1] + "/config", Buffer.alloc(2048, 120));
+  }
+  return n;
+};
+process.on("exit", () => process.stderr.write("READ_BYTES=" + readBytes));
+"""
+result = subprocess.run(["node", "-e", grow + remote, str(bare), "256"], capture_output=True)
+assert result.returncode != 0 and result.stderr == b"READ_BYTES=257", result
+assert config.stat().st_size > 256
+config.unlink()
+# A nonregular input cannot block open/read or cancellation.
+os.mkfifo(config)
+result = subprocess.run(["node", "-e", remote, str(bare), "256"], capture_output=True, timeout=5)
+assert result.returncode != 0
+config.unlink()
+# Refuse symlinks, even when the target is small and valid.
+target = work / "bounded-target"
+target.write_bytes(b"# safe\n")
+config.symlink_to(target)
+assert subprocess.run(["node", "-e", remote, str(bare), "256"], capture_output=True).returncode != 0
+
+fake = work / "bounded-kubectl"
+fake.write_text("""#!/usr/bin/env python3
+import os, sys
+data = bytes.fromhex(os.environ["BOUNDED_OUTPUT"])
+for start in range(0, len(data), 7):
+    os.write(1, data[start:start+7])
+sys.exit(int(os.environ.get("BOUNDED_RC", "0")))
+""")
+fake.chmod(0o700)
+env = dict(os.environ, DEST=str(work), KUBECTL=str(fake), CTX="test",
+           V2_CONFIG_READER=remote)
+command = "v2_config_snapshot(){" + helper + '\n}\nv2_config_snapshot ns pod unused 64 256'
+suffix = b"\n__uzi_probe_rc=0\n"
+def host_run(data, rc="0"):
+    return subprocess.run(["bash", "-c", command], env=dict(env, BOUNDED_OUTPUT=data.hex(),
+                          BOUNDED_RC=rc), capture_output=True)
+for length in (63, 64, 65):
+    result = host_run(b"A" * (length - len(suffix)) + suffix)
+    assert (result.returncode == 0) == (length <= 64), (length, result.stderr)
+    if result.returncode == 0:
+        assert result.stdout == b"A" * (length - len(suffix))
+for data in (b"A" * 4096 + suffix, b"\0" * 4096 + suffix,
+             b"A" + suffix[:-1], b"A" + suffix + b"junk", b"A\0" + suffix,
+             b"A\n__uzi_probe_rc=1\n"):
+    result = host_run(data)
+    assert result.returncode != 0 and not result.stdout, (data[:32], result)
+assert host_run(b"A" + suffix, "1").returncode != 0
+assert host_run(b"AA\nAA" + suffix).stdout == b"AA\nAA"
+print("PASS V2 bounded remote input/output and host byte capture/framing")
+PY
+[ "$?" -eq 0 ] || fail "bounded V2 transport"
+
 # git_q <dir> <git-args...>: run git in <dir>, silencing all output.
 git_q() { git -C "$1" "${@:2}" >/dev/null 2>&1; }
 

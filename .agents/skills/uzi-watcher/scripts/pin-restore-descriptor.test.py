@@ -149,6 +149,8 @@ class DescriptorTests(unittest.TestCase):
         self.decode(e, raw)
         self.refused(e, raw.rstrip())
         e["predecessors"][0]["journalDigest"] = hashlib.sha256(raw.rstrip().encode()).hexdigest()
+        # Keep the outer cross-link consistent so only raw-byte hashing can refuse.
+        e["intent"]["link"]["predecessorJournalDigest"] = e["predecessors"][0]["journalDigest"]
         self.refused(e, raw)
         for field in ("completionSourceFence", "memoryPark"):
             bad = copy.deepcopy(j)
@@ -434,6 +436,16 @@ class DescriptorTests(unittest.TestCase):
             append(bad, dump(active))
             self.refused(bad)
         e["intent"]["link"]["restore"]["bareDir"] = "other.git"
+        self.refused(e)
+
+    def test_historical_link_binds_actual_bare_with_consistent_digests(self):
+        e = envelope()
+        append(e)
+        j = json.loads(e["predecessors"][1]["rawJournal"])
+        j["pinRestore"]["restore"]["bareDir"] = "other.git"
+        raw = dump(j)
+        e["predecessors"][1] = entry(raw, 2)
+        e["intent"]["link"] = link(raw, 2)
         self.refused(e)
 
     def test_predecessor_listing_never_probes_source_files_or_runs_commands(self):

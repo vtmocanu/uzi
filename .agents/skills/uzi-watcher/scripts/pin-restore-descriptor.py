@@ -433,7 +433,8 @@ class Decoder:
             if "pinRestore" in j:
                 previous = j["pinRestore"]
                 referenced = seen.get(previous["predecessorJournalDigest"])
-                require(referenced is not None
+                require(previous["restore"]["bareDir"] == self.bare_dir
+                        and referenced is not None
                         and referenced["generation"] == previous["predecessorGeneration"]
                         and referenced["sourceEpoch"] == previous["predecessorEpoch"]
                         and previous["successor"]["sourceEpoch"] == entry["sourceEpoch"])
