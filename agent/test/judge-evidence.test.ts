@@ -294,6 +294,39 @@ test("long malformed keys and payloads cannot exceed retained state budgets", ()
   bounded(f.reducer.render());
 });
 
+test("oversized identity roles and additional accounting failure facts stay bounded and visible", () => {
+  const f = fixture();
+  f.send("tool_use", { id: "x".repeat(257), name: "Agent", input: { subagent_type: "r".repeat(1000000) } });
+  f.send("status", { event: "codex_response_usage", usage: {}, errors: ["distinct failure fact"] });
+  f.send("text", { text: "\u200f\u2028\u061c" });
+  const e = f.reducer.render();
+  assert.equal(e.counts.excluded, 0);
+  assert.match(e.sections.prose, /distinct failure fact/);
+  for (const char of ["\u200f", "\u2028", "\u061c"]) assert.ok(!e.sections.prose.includes(char));
+  bounded(e);
+});
+
+test("evicted result identities prevent later invented definite matches", () => {
+  const f = fixture();
+  f.end("X");
+  for (let i = 0; i < 128; i++) f.end("orphan" + i);
+  f.end("X", "a second result"); f.start("X");
+  const e = f.reducer.render();
+  assert.equal(e.counts.confirmed.success, 0);
+  assert.equal(e.counts.provisional, 1);
+  assert.match(e.sections.coverage, /orphanResultEvictions=2/);
+  assert.match(e.sections.ledger, /outcome=unknown ambiguous/);
+  bounded(e);
+});
+
+test("successful dispatch reports preserve middle review evidence without severity parsing", () => {
+  const f = fixture();
+  for (let i = 0; i < 100; i++) f.send("text", { text: "before" });
+  f.start("review"); f.end("review", "REVIEW REPORT: unresolved validation finding", false);
+  for (let i = 0; i < 100; i++) f.send("text", { text: "after" });
+  assert.match(f.reducer.render().sections.prose, /unresolved validation finding/);
+});
+
 test("timestamps, known causes and representative successes remain visible under floods", () => {
   const f = fixture();
   const time = "2026-11-02T12:00:00.123456789+00:00";

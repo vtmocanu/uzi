@@ -45,7 +45,7 @@ function clip(s: string, cap: number): string {
   return s.length <= cap ? s : s.slice(0, cap - 12) + "…[truncated]";
 }
 function quoted(s: string, cap: number): string {
-  return clip(JSON.stringify(s.slice(0, cap)).replace(/[\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g,
+  return clip(JSON.stringify(s.slice(0, cap)).replace(/[\u007f-\u009f\u061c\u200e-\u200f\u2028-\u202e\u2066-\u2069]/g,
     c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")), cap);
 }
 function record(v: unknown): Record<string, unknown> | undefined {
@@ -99,7 +99,12 @@ const ACCOUNTING_KEYS = new Set(["event", "subtype", "num_turns", "duration_ms",
   "usage", "modelUsage", "usage_basis", "leg_id", "usage_through"]);
 function accountingOnly(m: WorkerRunMessage, p: Record<string, unknown>): boolean {
   if (m.kind !== "status") return false;
-  if (p["event"] === "codex_response_usage") return true;
+  if (p["event"] === "codex_response_usage") {
+    const keys = new Set(["event", "usage_response_id", "usage", "model"]);
+    let visited = 0;
+    for (const key in p) if (Object.hasOwn(p, key) && (++visited > 4 || !keys.has(key))) return false;
+    return true;
+  }
   if (p["event"] !== "result" || p["subtype"] !== "success") return false;
   let visited = 0;
   for (const key in p) if (Object.hasOwn(p, key) && (++visited > 12 || !ACCOUNTING_KEYS.has(key))) return false;
@@ -153,6 +158,7 @@ export class JudgeEvidenceReducer {
   private oversizedKeys = 0;
   private evictions = 0;
   private extraResults = 0;
+  private orphanResultEvictions = 0;
   private resultPairs = 0;
   private matchedStarts = 0;
   private confirmed: Record<Outcome, number> = { success: 0, failed: 0, interrupted: 0, unknown: 0 };
@@ -223,7 +229,7 @@ export class JudgeEvidenceReducer {
     const keyLength = category.length + 1 + String(instance.length).length + 1 + instance.length + id.length;
     if (!id || id.length > 256 || instance.length > 256 || keyLength > 256) {
       this.oversizedKeys++;
-      if (dispatch) this.addRow({ key: "#" + m.seq, id: clip(id, 80), role: str(record(p["input"])?.["subagent_type"]),
+      if (dispatch) this.addRow({ key: "#" + m.seq, id: clip(id, 80), role: str(record(p["input"])?.["subagent_type"]).slice(0, 256) || "unknown",
         instance: clip(instance, 80), start: m.seq, time: str(m.created_at).slice(0, 64),
         outcome: "incomplete", ambiguous: true, childTools: 0, startText: text });
       return;
@@ -237,7 +243,7 @@ export class JudgeEvidenceReducer {
         if (h.outcome) { this.confirmed[h.outcome]--; delete h.outcome; }
         for (const row of this.activeRows()) if (row.key === key) row.ambiguous = true;
       } else if (this.history.size < 256) {
-        h = { tainted: false, evicted: false }; this.history.set(key, h);
+        h = { tainted: false, evicted: this.orphanResultEvictions > 0 }; this.history.set(key, h);
       }
       const old = this.pending.get(key);
       if (old?.ambiguous && h) h.tainted = true;
@@ -283,6 +289,7 @@ export class JudgeEvidenceReducer {
       this.pending.delete(oldest);
       const h = this.history.get(oldest);
       if (h) h.evicted = true;
+      else if (evicted?.result) this.orphanResultEvictions++;
       this.evictions++;
     }
     this.pending.set(key, value);
@@ -295,6 +302,10 @@ export class JudgeEvidenceReducer {
     if (!row.ambiguous && result.outcome !== "unknown") {
       this.confirmed[result.outcome]++; h!.outcome = result.outcome;
     }
+    // Successful dispatch results can be the only available review/validation report.
+    // Preserve the correlated brief/result, without parsing its prose for findings.
+    this.keep("review", { seq: row.start, text: row.startText });
+    this.keep("review", { seq: result.seq, text: result.text });
     if (result.outcome !== "success") {
       // Six earliest failed pairs, kept atomically, independent of generic error floods.
       this.failedPairs.push({ start: { seq: row.start, text: row.startText },
@@ -378,7 +389,8 @@ export class JudgeEvidenceReducer {
       + " omitted=" + counts.omitted + "; sample omissions are not unfetched events."
       + "\nPairing confirmed=" + JSON.stringify(this.confirmed) + " provisional=" + provisional
       + " incomplete=" + incomplete + " unmatched raw results=" + counts.unmatchedResults
-      + " extraResults=" + this.extraResults + " pending=" + this.pending.size + " evictions=" + this.evictions
+      + " observedExtraResults=" + this.extraResults + " orphanResultEvictions=" + this.orphanResultEvictions
+      + (this.orphanResultEvictions ? " (later untracked identities provisional)" : "") + " pending=" + this.pending.size + " evictions=" + this.evictions
       + " tombstones=" + this.history.size + " historySaturated=" + (this.history.size === 256)
       + " collisions=" + this.collisions + " oversizedKeys=" + this.oversizedKeys + " ignoredSeqs=" + this.duplicates
       + "\nLedger rows=" + this.rows.length + " omittedRows=" + counts.omittedRows
