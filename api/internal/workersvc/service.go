@@ -2747,14 +2747,18 @@ func (s *Service) publishRegisterOutcome(ctx context.Context, finalizeFailed, or
 // and maybeEnqueueJudgeByID for the committed-terminal fails (PRD #46 Decision 2, the same
 // worker-lost runs the sweeper funnels). Both are best-effort and never fail the register.
 func (s *Service) publishRegisterSweeps(ctx context.Context, failed []store.WorkerRecoveryDisposition, requeued []uuid.UUID) {
+	final := make(map[uuid.UUID]bool, len(failed))
 	for _, row := range failed {
+		final[row.ID] = true
 		s.publishSwept(row.ID, row.Status)
 		if row.Status == "failed" {
 			s.maybeEnqueueJudgeByID(ctx, row.ID)
 		}
 	}
 	for _, id := range requeued {
-		s.publishSwept(id, "queued")
+		if !final[id] {
+			s.publishSwept(id, "queued")
+		}
 	}
 }
 
@@ -3043,14 +3047,18 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		}
 		s.retainOrDeleteCheckpoint(ctx, id, cancelled.Kind, cancelled.IssueIid)
 	}
+	final := make(map[uuid.UUID]bool, len(missingFailed))
 	for _, r := range missingFailed {
+		final[r.ID] = true
 		s.publishSwept(r.ID, r.Status)
 		if r.Status == "failed" {
 			s.maybeEnqueueJudgeByID(ctx, r.ID)
 		}
 	}
 	for _, r := range missingRequeued {
-		s.publishSwept(r.ID, r.Status)
+		if !final[r.ID] {
+			s.publishSwept(r.ID, r.Status)
+		}
 	}
 	s.replaceRunDisk(ctx, updated, stats)
 	return updated, nil

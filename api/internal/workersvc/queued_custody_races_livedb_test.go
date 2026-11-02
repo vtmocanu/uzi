@@ -1104,3 +1104,98 @@ func TestQueuedCustodyMembershipRaceLiveDB(t *testing.T) {
 		})
 	}
 }
+
+// Recovery must recount after its hold-lock statement waits on an owner discard.
+// The returned ID remains in the lock result even though the winning UPDATE
+// changed the row to discarded; that ID alone is not fresh capacity evidence.
+func TestQueuedCustodyRecoveryWaitsForDiscardLiveDB(t *testing.T) {
+	c, id := seededQueuedCustody(t, 1, 1, 1, []int64{1}, 1)
+	tx, q, w, locks, limit := freezeQueuedCustody(t, c)
+	ctx, cancel := context.WithTimeout(c.env.ctx, 10*time.Second)
+	defer cancel()
+	owner, err := c.env.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = owner.Rollback(context.Background()) }()
+	var hold uuid.UUID
+	if err := owner.QueryRow(ctx, "SELECT id FROM recovery_custody_holds WHERE run_id=$1", id).Scan(&hold); err != nil {
+		t.Fatal(err)
+	}
+	n, err := store.New(owner).DiscardCustodyHoldForOwner(ctx, store.DiscardCustodyHoldForOwnerParams{
+		HoldID: hold, RunID: id, UserID: c.userID, ReleaseEvidence: pgconv.TextOrNull("owner_discard"),
+	})
+	if err != nil || n != 1 {
+		t.Fatalf("owner discard=%d %v", n, err)
+	}
+	// Keep the owner UPDATE uncommitted until the recovery backend is waiting.
+	type result struct {
+		rows []store.WorkerRecoveryDisposition
+		err  error
+	}
+	done := make(chan result, 1)
+	joined := false
+	defer func() {
+		cancel()
+		_ = owner.Rollback(context.Background())
+		if !joined {
+			<-done
+		}
+	}()
+	pid := tx.Conn().PgConn().PID()
+	go func() {
+		rows, err := c.svc.parkQueuedCustody(ctx, q, w.ID, w.SnapshotRegisterNonce, limit, locks, nil)
+		done <- result{rows, err}
+	}()
+	waitQueuedOwnBackendLock(t, c.env, ctx, pid)
+	if err := owner.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := observeQueuedCustody(t, c.env, id)
+	r := <-done
+	joined = true
+	if r.err != nil || len(r.rows) != 0 {
+		t.Fatalf("discard winning hold wait=%+v %v", r.rows, r.err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	requireQueuedCustodyPreserved(t, before, observeQueuedCustody(t, c.env, id), false)
+	if statusOf(t, c.env, id) != "queued" {
+		t.Fatal("winning discard must leave queued admission available")
+	}
+	var state string
+	if err := c.env.pool.QueryRow(ctx, "SELECT state FROM recovery_custody_holds WHERE id=$1", hold).Scan(&state); err != nil || state != "discarded" {
+		t.Fatalf("owner disposition=%s %v", state, err)
+	}
+}
+
+// A requeue followed by exhaustion parking in the same transaction has only one
+// committed status to announce. Consumers must never receive a trailing queued.
+func TestQueuedCustodyFinalStatusPublicationLiveDB(t *testing.T) {
+	for _, path := range []string{"register", "heartbeat"} {
+		t.Run(path, func(t *testing.T) {
+			env := setupCodexLiveDB(t)
+			c := newClaimantExhaustion(t, env, true, 1)
+			queuedCustodyCache(t, env, c.svc, 1)
+			id := c.seedKind(t, "issue")
+			c.claimAndRun(t, c.wkr, id, 1, true)
+			spy := &stateSpy{}
+			c.svc.SetBroadcaster(spy)
+			queuedCustodyTrigger(t, c, path)
+			if got := statusOf(t, env, id); got != "recovery_wait" {
+				t.Fatalf("committed status=%s", got)
+			}
+			var states []string
+			for _, e := range spy.events {
+				if e.id == id {
+					states = append(states, e.status)
+				}
+			}
+			if !reflect.DeepEqual(states, []string{"recovery_wait"}) {
+				t.Fatalf("committed state events=%v", states)
+			}
+			c.requireAllHoldsOpen(t, id, 1)
+		})
+	}
+}
