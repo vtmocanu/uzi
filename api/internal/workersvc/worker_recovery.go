@@ -46,8 +46,8 @@ func validatedSnapshotIDs(entries []validatedEntry) []uuid.UUID {
 	return ids
 }
 
-func captureWorkerRecoveryLocks(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, entries []validatedEntry, attested validatedFinalizeResume, pendingIDs ...[]uuid.UUID) (workerRecoveryLockSet, error) {
-	return captureWorkerRecoveryLocksWithQueued(ctx, qtx, workerID, entries, attested, store.LockWorkerRecoveryParentsParams{}, pendingIDs...)
+func captureWorkerRecoveryLocks(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, entries []validatedEntry, pendingIDs ...[]uuid.UUID) (workerRecoveryLockSet, error) {
+	return captureWorkerRecoveryLocksWithQueued(ctx, qtx, workerID, entries, validatedFinalizeResume{}, store.LockWorkerRecoveryParentsParams{}, pendingIDs...)
 }
 
 func captureWorkerRecoveryLocksWithQueued(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, entries []validatedEntry, attested validatedFinalizeResume, admission store.LockWorkerRecoveryParentsParams, pendingIDs ...[]uuid.UUID) (workerRecoveryLockSet, error) {
