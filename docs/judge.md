@@ -209,6 +209,66 @@ a saving that would drop a real verification pass is never recommended). The
 improve-uzi category feeds the `self-improve` [default
 job](./scheduling.md#default-jobs), if you've enabled it on a repo.
 
+## Reading a review with bounded evidence
+
+The judge remains a single-run advisory pass: one model call, no tools and
+no code changes. It streams the trace in pages of 500 messages, reducing
+each page before fetching the next, up to 100,000 messages (200 pages).
+An empty or short page establishes the fetched end. A full page at the cap
+leaves the end unknown, even if the run had exactly 100,000 messages: there
+is no extra probe. The latest fetched tail is not proof of terminal delivery;
+a missing terminal outcome is disclosed as unknown.
+
+The judge's prompt and evidence fit within a fixed envelope of at most
+120,000 characters. Coverage, a factual delegation ledger and raw aggregates
+have separate budgets before the event-aware prose samples: opening and
+latest fetched eligible events, middle plans and revisions, owner steering,
+failed delegation starts with results, available review reports, and recorded
+delivery or validation claims. Snippets, ledger rows, sample reservoirs and
+tracking state are bounded; meaningful events can still be omitted.
+Coverage tells the judge the fetched sequence range, count and pages,
+eligible/excluded/retained/omitted evidence, and pairing and row omissions
+or unknowns. These are model inputs, not new run-page or API fields.
+Sampling omissions differ from events that were never fetched.
+`progress_note`, `summary_usage` and accounting-only status messages do not
+consume behavioral prose slots; status messages carrying failure facts
+remain eligible.
+
+Read the resulting assessment with these limits in mind:
+
+- **Delegation identity and outcomes:** pairing uses exact invocation IDs
+  with agent instances, not guesses from repeated role names or replays.
+  Collisions, pending-entry eviction and exhausted identity history reduce
+  certainty. Confirmed outcomes, provisional pairings, incomplete starts and
+  unmatched results are distinct observations, not interchangeable failures.
+- **Time and causes:** intervals come from persisted-message timestamps,
+  not measured execution time. Historical budgets and causes remain unknown
+  when absent. A deadline-shaped interval is a hypothesis, not a confirmed
+  timeout.
+- **Tool activity:** lead/child/unknown counts, including lead activity after
+  the last observed dispatch, are signals — not effort percentages,
+  productivity, source ownership or test-success evidence. There is no
+  blanket ban on lead implementation. The judge is instructed to distinguish
+  reasonable continuation after a child failure from unnecessary takeover,
+  and to recommend independent review where recorded evidence supports it.
+  Missing sampled review does not prove that no review occurred.
+- **Recorded claims:** retained delivery and validation text supplies
+  available claims and sequence anchors. The reducer does not parse shell
+  text into gate verdicts.
+
+A review may optionally use the existing `improve_uzi` or `adjust_template`
+categories for a limitation in the judge's own evidence, compaction or
+assessment. It should identify the affected conclusion, sequence anchors or
+coverage, and an actionable remedy — or state honest uncertainty.
+This does not require a recommendation, add a category or invoke another
+judge. Matching known `improve_uzi` targets are reused unchanged so recurring
+findings group together.
+
+Event-derived evidence and known targets stay inside nonce-delimited
+untrusted-data fences: they are inert evidence, never instructions.
+The no-tools boundary, secret scrubbing and instruction to summarize rather
+than quote raw file or command output remain in place.
+
 ## The deterministic fallback
 
 Separately from the LLM call, uzi scans the run's own tool output for
