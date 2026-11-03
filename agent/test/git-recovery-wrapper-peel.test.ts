@@ -178,7 +178,7 @@ test("issue #3239 (c): a leaf of committed work outside the marker's history is 
   await assertRefused(r.attempts, aid(2), "wrapper_lineage_marker");
 });
 
-test("issue #3239 (d): a genuine wrapper over a clean milestone still adopts the wrapper and keeps the content source", async () => {
+test("issue #3239 (d): a genuine wrapper over a clean milestone adopts the source and preserves recovery roots through publication", async () => {
   const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
   fs.writeFileSync(path.join(source.clonePath, "work.txt"), "milestone\n");
   git(source.clonePath, ["add", "work.txt"]);
@@ -187,11 +187,30 @@ test("issue #3239 (d): a genuine wrapper over a clean milestone still adopts the
   const t = sha("HEAD", source.clonePath);
   const c = (await genuine([t], t)).sha;
   await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, t);
+  const pins = git(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
   const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2));
   assert.equal(successor.adoptedSource, c);
   assert.equal(successor.adoptedContentSource, t);
-  assert.equal(sha("HEAD", successor.path), c);
+  assert.equal(sha("HEAD", successor.path), t);
+  assert.equal(successor.baseCommit, t);
+  assert.equal(git(successor.path, ["status", "--porcelain"]), "");
   assert.equal(journal().peeledMarkers, undefined);
+  assert.ok(pins.includes(c), "the wrapper has durable recovery pins");
+  assert.equal(git(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]), pins,
+    "preparation preserves every coverage, episode and owed pin");
+  assert.ok(pins.includes(t), "the source root remains durably pinned");
+  assert.equal(journal().recovery.restoreTip, c);
+  assert.equal(journal().recovery.restoreSource, t);
+  assert.ok(fs.existsSync(source.clonePath), "the retained predecessor remains");
+  fs.writeFileSync(path.join(successor.path, "next.txt"), "new committed work\n");
+  git(successor.path, ["add", "next.txt"]);
+  git(successor.path, [...IDENT, "commit", "-m", "new real work after recovery"]);
+  const published = "refs/heads/recovered-ordinary";
+  git(successor.path, ["push", fx.originPath, `HEAD:${published}`]);
+  assert.equal(sha(published, fx.originPath), sha("HEAD", successor.path));
+  const history = git(fx.originPath, ["rev-list", published]).split("\n");
+  assert.ok(history.includes(t), "the published work descends from the source");
+  assert.ok(!history.includes(c), "the recovery wrapper stays out of published ancestry");
 });
 
 /** Episode 1 peels M1 into the attempt A2, whose own WIP marker M2 sits on M1's parent. */
@@ -373,7 +392,7 @@ test("M2 unbound marker-free divergent coverage refuses before successor effects
   await assertRefused(r.attempts, aid(2), "wrapper_source_missing");
 });
 
-test("M2 source-bound clean ancestor coverage keeps ordinary wrapper behavior", async () => {
+test("M1 source-bound clean ancestor coverage adopts the verified source", async () => {
   const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
   const parent = sha("HEAD", source.clonePath);
   const s = sibling(parent, "clean ordinary progress");
@@ -382,7 +401,9 @@ test("M2 source-bound clean ancestor coverage keeps ordinary wrapper behavior", 
   const c = (await genuine([parent, s], s)).sha;
   await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, s);
   const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2));
-  assert.equal(sha("HEAD", successor.path), c);
+  assert.equal(sha("HEAD", successor.path), s);
+  assert.equal(successor.adoptedSource, c);
+  assert.equal(successor.adoptedContentSource, s);
   assert.equal(sha("HEAD^{tree}", successor.path), sha(s + "^{tree}"));
 });
 
@@ -438,6 +459,63 @@ test("issue #3239 (l): a thrown read of an inner aggregate in a multi-round wrap
   fs.writeFileSync(obj, "garbage");
   await assertRefused(r.attempts, aid(2), "wrapper_commit_read");
 });
+
+
+for (const [name, options] of [
+  ["missing exact pin", { pin: false }],
+  ["wrong author", { pin: true, author: "other" }],
+  ["wrong date", { pin: true, date: "2000-01-02T00:00:00Z" }],
+  ["wrong fingerprint", { pin: true, fp: "0".repeat(64) }],
+] as const) {
+  test("M1 ordinary definite ineligibility keeps wrapper: " + name, async () => {
+    const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+    const s = sha("HEAD", source.clonePath);
+    const wrapper = lookalike(s, options);
+    await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, wrapper, s);
+    const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2));
+    assert.equal(sha("HEAD", successor.path), wrapper);
+    assert.equal(successor.adoptedSource, wrapper);
+    assert.equal(successor.adoptedContentSource, s);
+  });
+}
+
+for (const seam of ["pin", "tree", "commit", "ancestry", "source"] as const) {
+  test("M1 ordinary uncertainty refuses instead of fallback: " + seam, async t => {
+    const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+    const s = sha("HEAD", source.clonePath);
+    const wrapper = (await genuine([s], s)).sha;
+    await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, wrapper, s);
+    const error = new Error("successor recovery verification failed");
+    let reached = false;
+    if (seam === "source") {
+      const value = journal(); delete value.recovery.restoreSource; writeJournal(value);
+      reached = true;
+    } else if (seam === "ancestry") {
+      t.mock.method(cache as any, "ancestry", async () => { reached = true; return "unknown"; });
+    } else if (seam === "tree") {
+      const exec = (cache as any).execScoped.bind(cache);
+      t.mock.method(cache as any, "execScoped", async (file: string, args: string[], ...rest: unknown[]) => {
+        if (file === "git" && args.includes("--no-replace-objects") && args.includes(`${s}^{tree}`)) {
+          reached = true; throw error;
+        }
+        return exec(file, args, ...rest);
+      });
+    } else {
+      const run = (cache as any).runGit.bind(cache);
+      t.mock.method(cache as any, "runGit", async (dir: string, args: string[], ...rest: unknown[]) => {
+        if (seam === "pin" ? args.includes(`refs/uzi-coverage/${runId}/`)
+          : args.includes("cat-file") && args.includes(wrapper)) {
+          reached = true; throw error;
+        }
+        return run(dir, args, ...rest);
+      });
+    }
+    await assertRefused(r.attempts, aid(2), seam === "pin" ? "wrapper_pin_read"
+      : seam === "tree" ? "wrapper_source_tree" : seam === "commit" ? "wrapper_commit_read"
+      : seam === "source" ? "wrapper_source_missing" : "wrapper_lineage_ancestry");
+    assert.equal(reached, true);
+  });
+}
 
 // M1: assertions use only baseline-existing APIs so these tests also prove the baseline red.
 function successorDiagnostic(error: unknown, reason: string): boolean {

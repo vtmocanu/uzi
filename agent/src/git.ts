@@ -9272,15 +9272,16 @@ export class GitCache {
 
   /**
    * issue #3239: decide what a retained-recovery successor may adopt when the episode restore tip is a
-   * recovery-coverage wrapper that may carry a `wip(park):` marker. Returns undefined for the
-   * unchanged ordinary ancestor-only shapes (or when the tip itself is a marker),
-   * which keep the plain adoption of the tip. Otherwise the wrapper must be provably the worker's own
+   * recovery-coverage wrapper that may carry a `wip(park):` marker. Ordinary marker-free,
+   * ancestor-only shapes adopt the journaled source only after full provenance verification;
+   * definite ineligibility keeps plain tip adoption. A tip that is itself a marker also returns
+   * undefined. Otherwise the wrapper must be provably the worker's own
    * coverage of the journaled source. Divergent leaves need independently verified remediation
    * evidence. The successor adopts the SOURCE (a marker is then peeled by
-   * the seed's `reset --soft`, so neither marker nor wrapper enters history); any failed proof throws
-   * `successor recovery verification failed`, before a ledger entry or clone exists.
+   * the seed's `reset --soft`, so neither marker nor wrapper enters history). Outside the ordinary
+   * fallback, failed proof throws `successor recovery verification failed` before ledger or clone effects.
    *
-   * Fail closed: once the tip is a coverage commit (or the source is a marker), any inability to verify
+   * Fail closed: once the tip is a coverage commit (or the source is a marker), any inability to read
    * refuses: an unreadable tip, more than 8 aggregates, or more than MAX_OWED_CANDIDATES_PER_RUN + 2
    * leaves, or ANY failed read. Only a non-tip commit for which {@link readBoundedCommit} RETURNS
    * undefined (over 64 KiB, or a body that does not survive the UTF-8 round trip) is demoted to a leaf
@@ -9309,52 +9310,60 @@ export class GitCache {
       if (relation === "unknown") return fail("wrapper_lineage_ancestry");
       if (relation === "divergent") { divergent = true; excludedRoots.add(leaf); }
     }
-    if (!srcMarker && markerLeaves.size === 0 && !divergent && !remediation) return undefined;
-    if (lookalike) return fail("wrapper_lookalike");
-
-    // Markers and divergent marker-free wrappers require the same full provenance proof.
-    if (!aggregates.length) return fail("wrapper_aggregate_missing");
-    const fp = aggregates[0]!.fp;
-    if (aggregates.some(a => a.fp !== fp)) return fail("wrapper_fingerprint_mismatch");
-    // The source (and a marker leaf) is read by plumbing, not readBoundedCommit: a clean source may be
-    // oversized or non-UTF-8 and must still be comparable.
-    if (!OWED_OID.test(src)) return fail("wrapper_source_oid");
+    const ordinary = !srcMarker && markerLeaves.size === 0 && !divergent && !remediation;
     const sha1Of = async (rev: string, reason: string): Promise<string> => {
       const out = await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-parse", "--verify", rev]);
       return OWED_OID.test(out) ? out : fail(reason);
     };
-    const srcTree = await sha1Of(`${src}^{tree}`, "wrapper_source_tree");
-    const identity = (kind: string) => `${kind} ${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
-    for (const a of aggregates) {
-      if (a.tree !== srcTree) return fail("wrapper_tree");
-      if (a.author !== identity("author")) return fail("wrapper_author");
-      if (a.committer !== identity("committer")) return fail("wrapper_committer");
-    }
     const sortedLeaves = [...leaves].sort();
-    if (!leaves.has(src)) return fail("wrapper_source_leaf");
-    // The roots are the leaves, with or without the current source (the producer passes both forms).
-    const fingerprints = [sortedLeaves, sortedLeaves.filter(l => l !== src)].filter(r => r.length > 0)
-      .map(roots => createHash("sha256").update(JSON.stringify({ roots, currentSha: src, tree: srcTree })).digest("hex"));
-    if (!fingerprints.includes(fp)) return fail("wrapper_fingerprint");
-    // Provenance: only the worker's own pin of this very wrapper, for this run, proves it is genuine.
-    let pins: string;
-    try {
-      pins = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
-        `refs/uzi-coverage/${journal.runId}/`]);
-    } catch (error) {
+    // Share the bounded proof without converting read failures into ordinary fallback.
+    const provenance = await (async (): Promise<{ verified: true; srcTree: string } | { verified: false; reason: string }> => {
+      if (lookalike) return { verified: false, reason: "wrapper_lookalike" };
+
+      if (!aggregates.length) return { verified: false, reason: "wrapper_aggregate_missing" };
+      const fp = aggregates[0]!.fp;
+      if (aggregates.some(a => a.fp !== fp)) return { verified: false, reason: "wrapper_fingerprint_mismatch" };
+      // The source (and a marker leaf) is read by plumbing, not readBoundedCommit: a clean source may be
+      // oversized or non-UTF-8 and must still be comparable.
+      if (!OWED_OID.test(src)) return fail("wrapper_source_oid");
+      const srcTree = await sha1Of(`${src}^{tree}`, "wrapper_source_tree");
+      const identity = (kind: string) => `${kind} ${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
+      for (const a of aggregates) {
+        if (a.tree !== srcTree) return { verified: false, reason: "wrapper_tree" };
+        if (a.author !== identity("author")) return { verified: false, reason: "wrapper_author" };
+        if (a.committer !== identity("committer")) return { verified: false, reason: "wrapper_committer" };
+      }
+      if (!leaves.has(src)) return { verified: false, reason: "wrapper_source_leaf" };
+      // The roots are the leaves, with or without the current source (the producer passes both forms).
+      const fingerprints = [sortedLeaves, sortedLeaves.filter(l => l !== src)].filter(r => r.length > 0)
+        .map(roots => createHash("sha256").update(JSON.stringify({ roots, currentSha: src, tree: srcTree })).digest("hex"));
+      if (!fingerprints.includes(fp)) return { verified: false, reason: "wrapper_fingerprint" };
+      // Provenance: only the worker's own pin of this very wrapper, for this run, proves it is genuine.
+      let pins: string;
       try {
-        if (!this.boundaryProcesses.getStore()?.signal.aborted && !isCheckpointBoundaryFailure(error) &&
-            !(error instanceof CheckpointChildStartupTimeoutError) && !isAbortLike(error)) {
-          annotateRetainedSuccessorError(error, "wrapper_pin_read");
-        }
-      } catch { /* Diagnostics must not replace the original failure. */ }
-      throw error;
+        pins = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
+          `refs/uzi-coverage/${journal.runId}/`]);
+      } catch (error) {
+        try {
+          if (!this.boundaryProcesses.getStore()?.signal.aborted && !isCheckpointBoundaryFailure(error) &&
+              !(error instanceof CheckpointChildStartupTimeoutError) && !isAbortLike(error)) {
+            annotateRetainedSuccessorError(error, "wrapper_pin_read");
+          }
+        } catch { /* Diagnostics must not replace the original failure. */ }
+        throw error;
+      }
+      const pinned = pins.split("\n").some(line => {
+        const [ref, oid] = line.split(" ");
+        return oid === tip && ref !== undefined && ref.startsWith(`refs/uzi-coverage/${journal.runId}/`) && new RegExp(`^refs/uzi-coverage/[^/]+/[^/]+/${fp}$`).test(ref);
+      });
+      if (!pinned) return { verified: false, reason: "wrapper_pin" };
+      return { verified: true, srcTree };
+    })();
+    if (!provenance.verified) {
+      if (ordinary) return undefined;
+      return fail(provenance.reason);
     }
-    const pinned = pins.split("\n").some(line => {
-      const [ref, oid] = line.split(" ");
-      return oid === tip && ref !== undefined && new RegExp(`^refs/uzi-coverage/[^/]+/[^/]+/${fp}$`).test(ref);
-    });
-    if (!pinned) return fail("wrapper_pin");
+    const { srcTree } = provenance;
     // Leaves: the source, history of the source, or a marker this attempt's lineage proves superseded.
     const lineage = new Set(journal.peeledMarkers ?? []);
     const accepted: string[] = [];
@@ -9617,7 +9626,11 @@ export class GitCache {
           throw new Error("recovery handoff readback mismatch");
       }
       // issue #3194: hand the guard the content source this wrapper verifiably stands for.
-      return { ...seeded, attemptId, ...(recovery.restoreSource ? { adoptedContentSource: recovery.restoreSource } : {}) };
+      return { ...seeded, attemptId,
+        // Ordinary verified wrappers keep capture attribution while execution starts at the source.
+        ...(wrapped && !marker && !remediation && wrapped.peeledMarkers.length === 0 && wrapped.excludedRoots.length === 0
+          ? { adoptedSource: tip } : {}),
+        ...(recovery.restoreSource ? { adoptedContentSource: recovery.restoreSource } : {}) };
     });
   }
 
@@ -21105,8 +21118,8 @@ try {
     });
   }
 
-  /** Coverage shape is not provenance. Only the resolver's bounded marker-free
-   * branch is pin-independent, so marker involvement must keep legacy wrapping. */
+  /** Coverage shape is not adoption provenance. This bounded marker-free reuse check remains
+   * pin-independent after cleanup; marker involvement must keep legacy wrapping. */
   private async reusableRecoveryCoverage(barePath: string, currentSha: string, tree: string): Promise<boolean> {
     const commit = await this.readBoundedCommit(barePath, currentSha, 64 * 1024);
     const identity = (kind: string) => `${kind} ${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
