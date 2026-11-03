@@ -620,8 +620,8 @@ for kind in protected ordinary; do
       origin-missing) filter='del(.remediationRecovery.active.originSource.attemptId)' ;;
       control) filter='.remediationRecovery.branch="agent/\u202eunsafe"' ;;
       bounds) filter='.remediationRecovery.sequence=9007199254740992' ;;
-      flags) filter='.remediationRecovery.flaggedOIDs = [range(65) | ("a"*40)]' ;;
-      edges) filter='.remediationRecovery.edges |= (. as $e | [range(65) | $e[0]])' ;;
+      flags) filter='.remediationRecovery.flaggedOIDs = [("a"*40)] + [range(64) | tostring | "0"*(40-length)+.]' ;;
+      edges) filter='.remediationRecovery.edges |= (. as $e | [range(65) as $i | $e[0] | .from = ($i | tostring | "0"*(40-length)+.)])' ;;
       grant) filter='.remediationRecovery.active.origin="request"' ;;
       conflict) filter='.remediationRecovery.active.scannedTip=("d"*40)' ;;
       cycle) filter='.remediationRecovery.edges += [(.remediationRecovery.edges[0] | .from=("b"*40) | .to=("a"*40))]' ;;
