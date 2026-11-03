@@ -339,8 +339,8 @@ func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outco
 // a non-pooled one. It never returns a token that is not AutoEligible or is
 // rejected.
 //
-// It differs from Select in two ways. Select ranks by headroom (headroom_first;
-// its order depends on Policy.Order, reset_first by default) and returns nothing
+// It differs from Select in two ways. Select ranks by Policy.Order (reset_first by
+// default, headroom_first as the escape hatch) and returns nothing
 // when no token is measurable (ReasonPoolStale) or below MinHeadroom-with-no-best;
 // Floor ranks the WHOLE pooled set — including stale, unmeasured, and
 // below-threshold tokens — because a last resort has no headroom to rank on. There

@@ -160,7 +160,9 @@ func TestAutoselectOrder(t *testing.T) {
 			// Register restoration of any ambient value, then drop it so the unset
 			// case does not depend on the environment.
 			t.Setenv("UZI_AUTOSELECT_ORDER", "")
-			os.Unsetenv("UZI_AUTOSELECT_ORDER")
+			if err := os.Unsetenv("UZI_AUTOSELECT_ORDER"); err != nil {
+				t.Fatal(err)
+			}
 			if tc.set {
 				t.Setenv("UZI_AUTOSELECT_ORDER", tc.env)
 			}

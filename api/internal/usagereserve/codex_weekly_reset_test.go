@@ -13,6 +13,7 @@ func TestCodexMainWeeklyReset(t *testing.T) {
 	soon := now.Add(10 * time.Hour)
 	later := now.Add(60 * time.Hour)
 	passed := now.Add(-30 * time.Second) // after readAt, before now: reset since the reading
+	stale := now.Add(-2 * time.Minute)   // before readAt: already past when read
 
 	wk := func(resetAt time.Time) *apitypes.CodexRateLimitWindowDTO {
 		return win(40, week, resetAt.Unix())
@@ -36,6 +37,8 @@ func TestCodexMainWeeklyReset(t *testing.T) {
 		{"reset_after_seconds relative to the reading", []apitypes.CodexRateLimitBucketDTO{main(relative, nil)}, tp(readAt.Add(time.Hour))},
 		{"pre-reset window is skipped", []apitypes.CodexRateLimitBucketDTO{main(wk(passed), nil)}, nil},
 		{"pre-reset window skipped, other weekly kept", []apitypes.CodexRateLimitBucketDTO{main(wk(passed), wk(later))}, tp(later)},
+		{"reset past before the reading is skipped", []apitypes.CodexRateLimitBucketDTO{main(wk(stale), nil)}, nil},
+		{"stale weekly does not mask a future weekly", []apitypes.CodexRateLimitBucketDTO{main(wk(stale), wk(soon))}, tp(soon)},
 		{"non-main bucket ignored", []apitypes.CodexRateLimitBucketDTO{{ID: "codex_other", Primary: wk(soon)}, main(wk(later), nil)}, tp(later)},
 		{"only a non-main bucket", []apitypes.CodexRateLimitBucketDTO{{ID: "codex_other", Primary: wk(soon)}}, nil},
 		{"5h-only main bucket", []apitypes.CodexRateLimitBucketDTO{main(win(10, fiveH, soon.Unix()), nil)}, nil},
