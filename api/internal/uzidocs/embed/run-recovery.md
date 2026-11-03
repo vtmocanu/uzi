@@ -585,6 +585,17 @@ archive or prerequisite failure. Transient capture, forge and disk failures
 spend the same reservation budget. These bounds are separate from healthy
 provider/empty-turn parks and the owner worker-recovery-exhaustion hold.
 
+Before seeding a fresh attempt, the worker also checks that the data volume has
+room for it. When current or projected usage would reach the disk hard-stop
+threshold, it refuses the seed, keeps the predecessor work and custody, and
+posts a feed message beginning "retained recovery deferred:" with the observed
+and projected usage. The refusal is not a disk park and spends one of the same
+three reservations; the worker frees reclaimable space and re-checks before
+refusing. If the volume stays full, automatic retries end in the existing
+retained-recovery park, and the owner can Resume once space is freed. The
+projection is an estimate and applies only when the API supports both the disk
+and retained-recovery park causes.
+
 A verified thin bundle within the cap, with its needed prerequisites locally
 available and verified, permits local adoption and model execution even
 when remote publication is unknown. Nonempty prerequisites alone do not
