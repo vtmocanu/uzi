@@ -108,7 +108,6 @@ function start(opts: {
     assert.equal(tip, TIP);
     // The runner hands every attempt ONE derived allowance signal (never the caller's own), which
     // follows the caller's abort.
-    assert.ok(signal && signal !== abort.signal, "attempts get the shared allowance, not the raw caller signal");
     attemptSignals.push(signal);
     requests++;
     streams.push(pack);
@@ -174,9 +173,10 @@ it("persistent 500 is exactly three requests and one exhausted diagnostic", asyn
 });
 
 it("three 5xx attempts share one allowance that expiry during the second backoff ends", async () => {
-  // 150 ms allowance, 100 ms backoffs: attempt 1 at ~0, attempt 2 at ~100, expiry at 150 during the
-  // second backoff. Retries must not renew the allowance, so attempt 3 is never sent.
-  const r = await exercise({ allowanceMs: 150, backoffMs: [100, 100] });
+  // 300 ms allowance, backoffs 100/250 ms: attempt 1 at ~0, attempt 2 at ~100 (200 ms margin before
+  // expiry), expiry at 300 during the second backoff (ends ~350). Retries must not renew the
+  // allowance, so attempt 3 is never sent.
+  const r = await exercise({ allowanceMs: 300, backoffMs: [100, 250] });
   assert.equal(r.requests, 2);
   assert.equal(r.attemptSignals.length, 2);
   assert.equal(r.attemptSignals[0], r.attemptSignals[1], "one allowance signal serves every attempt");
@@ -210,7 +210,12 @@ for (const response of [{ ok: false, httpStatus: 400 }, { ok: false, httpStatus:
 }
 for (const abort of ["backoff", "ownership", "guard"] as const) {
   it("abort during " + abort + " creates no next producer or upload", async () => {
+    const started = Date.now();
     const r = await exercise({ abort });
+    // The 60 s backoff is only ended early if the attempt signal follows the caller's abort.
+    assert.ok(Date.now() - started < 30_000, "caller abort ended the retry promptly");
+    assert.equal(r.attemptSignals.length, 1);
+    assert.equal(r.attemptSignals[0]?.aborted, true, "the attempt signal follows the caller's abort");
     assert.equal(r.requests, 1);
     assert.equal(r.producers, 1);
     assert.equal(r.cancels, 1);

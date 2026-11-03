@@ -368,13 +368,17 @@ export const HELD_PUBLICATION_TIMEOUT_MS = 330_000;
  *   2 Claude milestone, deferred post-permit publish, iteration boundary (reap:false): no signal -> 480 s
  *   3 mid-turn tick: tick signal, MIDTURN_TICK_TIMEOUT_MS 120 s cap
  *   4 done checkpoint: any(permit.signal, soft) -> 60 s soft / 90 s hard
- *   5 shutdown: permit.signal ?? cause.stopSignal, deadlineAt (<= 15 s shutdownPublishTimeoutMs)
+ *   5 shutdown: Codex bounded by the boundary permit signal; Claude: the 15 s shutdown race
+ *     (shutdownPublishTimeoutMs) abandons the wait, but the request itself is bounded only by the
+ *     allowance or process exit (cause.deadlineAt feeds remediation hold/admission, never the request
+ *     signal, and the workerShutdown stopSignal has no timer)
  *   6 limit-wait park: permit?.signal (Codex boundary 30 s); none on Claude -> 480 s
- *   7 pause park: held.signal (Codex: capture-context deadline; Claude: caller signal, may be none)
- *   8 recovery capture, credential-free: opts.signal (episode signal, may be none)
- *   9 recovery capture, overlay: opts.signal ?? permit?.signal
- *  10 completion hold: heldAuthenticated?.signal ?? permit?.signal
+ *   7 pause park: held.signal (Codex: capture-context deadline; Claude: caller signal, may be none -> 480 s)
+ *   8 recovery capture, credential-free: opts.signal (episode signal; none or never fired -> 480 s)
+ *   9 recovery capture, overlay: opts.signal ?? permit?.signal (same fallback)
+ *  10 completion hold: heldAuthenticated?.signal ?? permit?.signal (same fallback)
  *  11 retained free capture: held.signal (same rule as 7)
+ *  Any caller whose signal never fires (rows 2, 6 on Claude, 7-11) is bounded by this 480 s alone.
  *  A MaintenanceBudget (600 s default) becomes current only once a cancellation was observed for the
  *  attempt (observeCancellation), so rows 1-4 normally run without one. */
 export const CHECKPOINT_PUBLISH_TIMEOUT_MS = 480_000;
@@ -1380,9 +1384,9 @@ export class WorkerClient {
   private operationNegotiation = 0;
   private readonly operationFlights = new Map<string, { generation: number; token: symbol; reportingUnavailable?: boolean }>();
 
-  /** Positive negotiation serial survives feature clearing and worker re-registration. */
   /** The allowance of one checkpoint publish; the runner shares one of this length across its retries. */
   get checkpointPublishTimeoutMs(): number { return this.checkpointPublishTimeoutValue; }
+  /** Positive negotiation serial survives feature clearing and worker re-registration. */
   get codexOperationNegotiation(): number { return this.operationNegotiation; }
 
   retainCodexOperationFlight(runId: string, generation: number): () => void {
