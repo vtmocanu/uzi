@@ -220,8 +220,8 @@ drops this advice. This adds no wire/API/schema fields, capability or
 persistence. During mixed-worker rollout, an old lead drops approving findings;
 an old checker supplies no new coverage account, and a new lead renders the
 findings it receives. The code-stage revision prompt's bytes are unchanged
-(#3832, 2026-11-03, later appended a Code batching clarification; see
-[Code cross-check](#code-cross-check)).
+by that amendment; #3832 (2026-11-03) later appended a Code batching
+clarification (see [Code cross-check](#code-cross-check)).
 See the [dated ADR amendment](../adr/2149-cross-check.md#advisory-plan-coverage-amendment-2026-10-23-3334--3168-m1)
 and [PRD #3168](../prds/3168-plan-cross-check-coverage.md) for validation and
 remaining replay scope.
@@ -727,17 +727,19 @@ SHA, the checker's family, model and effort, then either "no findings" or
 finding has no disposition. One line per finding follows, with its
 disposition and reason.
 
-Findings whose title starts exactly with `Coverage uncertainty:` are grouped
-after the graded findings under "Verification caveats (evidence the read-only
+In the merge request section, findings whose title starts exactly with
+`Coverage uncertainty:` are grouped after the graded findings under "Verification caveats (evidence the read-only
 checker could not verify; a disposition never marks a criterion met or waives
 a landing obligation):". The match is on the title only, with no trimming;
 `Requirement gap:` and all other findings stay graded. With at least one
 caveat the counts read "N findings: G graded (A addressed, D declined, U not
 reported), C verification caveats (...)", the "not reported" part appearing
-only when nonzero. With no graded findings an extra line says "No graded
-findings; verification caveats are not a certification that the change has no
-defects." With no caveats the section is unchanged. Dispositions stay per
-finding ID and the stored findings are unchanged.
+only when nonzero. With caveats but no graded findings an extra line says
+"No graded findings; verification caveats are not a certification that the
+change has no defects." With no caveats the counts and finding lines are
+unchanged. Dispositions stay per finding ID and the stored findings are
+unchanged. The run page and `uzi run get` list the same findings without this
+grouping.
 
 The section stays within 4 KiB. When it does not fit, unassessed paths drop
 first, then caveat lines, then graded lines. Omissions are counted in "K graded
