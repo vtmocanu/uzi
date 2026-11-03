@@ -1149,6 +1149,17 @@ describe("GitCache.hasCommittedCheckpoint (#2967 floor-tree recovery coverage)",
     gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, cn]);
     assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true,
       "a chain whose real tip is committed work still blocks");
+    // The peel's history check: a real side parent is committed work, so no peel.
+    const cx = mkCommit(f.bare, wipTree, [n, m2], chainSubject);
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, cx]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true,
+      "a chain with a real committed side parent still blocks");
+    // A merge-shaped look-alike marker as the peeled tip is not a park marker.
+    const forged = mkCommit(f.bare, wipTree, [f.floor, n], `${subject} forged`);
+    const cf = mkCommit(f.bare, wipTree, [m, forged], chainSubject);
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, cf]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true,
+      "a two-parent marker under a chain still blocks");
   });
 
   it("#2967 still allows an absent checkpoint without a confirmed publication", async () => {

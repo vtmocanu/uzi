@@ -18084,7 +18084,11 @@ try {
       const parents = (await this.tryGitStdout(barePath, ["rev-list", "--parents", "-n", "1", tip]))
         .trim().split(/\s+/).filter(Boolean).slice(1);
       const last = parents[parents.length - 1];
-      if (parents.length >= 2 && last !== undefined && SHA40_RE.test(last) &&
+      // A park marker has exactly one parent; a merge-shaped look-alike is not peeled.
+      const lastParents = last !== undefined && SHA40_RE.test(last)
+        ? (await this.tryGitStdout(barePath, ["rev-list", "--parents", "-n", "1", last])).trim().split(/\s+/).filter(Boolean).length - 1
+        : 0;
+      if (parents.length >= 2 && last !== undefined && SHA40_RE.test(last) && lastParents === 1 &&
           (await this.isWipParkMarker(barePath, last)) &&
           (await this.verifyWrapperOnlyHistory(barePath, tip, last, 1, { allowParkMarkers: true }))) {
         tip = last;
