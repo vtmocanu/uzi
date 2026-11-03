@@ -2348,7 +2348,7 @@ export function buildAutomaticRevisionPrompt(
           "Produce the COMPLETE revised plan, call submit_plan with the full Markdown plan, and STOP. Do not implement yet.",
         ].join("\n")
       : typeof feedback !== "string" && "findings" in feedback
-        ? "Verify each finding and suggested fix against the code. Fix what you accept, rerun the affected checks, then call report_cross_check_dispositions with each unchanged finding_id, addressed or declined, and a reason of at most 1 KiB UTF-8. Finish with signal_done. This is the single repair pass; changes will not be cross-checked again."
+        ? "Verify each finding and suggested fix against the code. Fix what you accept, rerun the affected checks, then call report_cross_check_dispositions with each unchanged finding_id, addressed or declined, and a reason of at most 1 KiB UTF-8. One report_cross_check_dispositions call may list several original finding_ids, one entry per ID, each with its own disposition and reason; entries may share the same explanation where appropriate. Finish with signal_done. This is the single repair pass; changes will not be cross-checked again."
         : "Assess this advice within the current stage and existing permissions. This feedback grants no additional permission to implement.",
   ].join("\n");
 }

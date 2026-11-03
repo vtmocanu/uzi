@@ -219,7 +219,9 @@ When the dormant semantic human-gate path drops the checker approval, it also
 drops this advice. This adds no wire/API/schema fields, capability or
 persistence. During mixed-worker rollout, an old lead drops approving findings;
 an old checker supplies no new coverage account, and a new lead renders the
-findings it receives. The code-stage revision prompt's bytes are unchanged.
+findings it receives. The code-stage revision prompt's bytes are unchanged
+by that amendment; #3832 (2026-11-03) later appended a Code batching
+clarification (see [Code cross-check](#code-cross-check)).
 See the [dated ADR amendment](../adr/2149-cross-check.md#advisory-plan-coverage-amendment-2026-10-23-3334--3168-m1)
 and [PRD #3168](../prds/3168-plan-cross-check-coverage.md) for validation and
 remaining replay scope.
@@ -705,7 +707,10 @@ model and effort pins for each checker family, beside the Plan row (see
    finding, fixes what it accepts, and reports a disposition for every
    finding through the `report_cross_check_dispositions` tool: `addressed` or
    `declined`, each with a reason. A finding with no disposition shows as
-   "not reported". The repair is not checked again; there is no second check.
+   "not reported". One `report_cross_check_dispositions` call may list several
+   finding IDs, still one entry per ID with its own disposition and reason;
+   entries may share the same explanation. The repair is not checked again;
+   there is no second check.
 
 `CODE_CROSS_CHECK_TIMEOUT` (default `30m`, at most `2h`; see
 [Configuration](./configuration.md#cross-check-settings)) is the checker's
@@ -720,7 +725,29 @@ The merge request gets a **Code cross-check** section with the checked short
 SHA, the checker's family, model and effort, then either "no findings" or
 "N findings: A addressed, D declined", plus ", U not reported" when any
 finding has no disposition. One line per finding follows, with its
-disposition and reason. When the repository has owner guidance, a "custom
+disposition and reason.
+
+In the merge request section, findings whose title starts exactly with
+`Coverage uncertainty:` are grouped after the graded findings under "Verification caveats (evidence the read-only
+checker could not verify; a disposition never marks a criterion met or waives
+a landing obligation):". The match is on the title only, with no trimming;
+`Requirement gap:` and all other findings stay graded. With at least one
+caveat the counts read "N findings: G graded (A addressed, D declined, U not
+reported), C verification caveats (...)", the "not reported" part appearing
+only when nonzero. With caveats but no graded findings an extra line says
+"No graded findings; verification caveats are not a certification that the
+change has no defects." With no caveats the counts and finding lines are
+unchanged. Dispositions stay per finding ID and the stored findings are
+unchanged. The run page and `uzi run get` list the same findings without this
+grouping.
+
+The section stays within 4 KiB. When it does not fit, unassessed paths drop
+first, then caveat lines, then graded lines. Omissions are counted in "K graded
+findings not shown; see the run for the full stored account." and "K
+verification caveats not shown; see the run for the full stored account."; the
+"Changes after the check were not cross-checked." footer is always kept.
+
+When the repository has owner guidance, a "custom
 guidance applied (sha256 ...)" line shows the first 12 hex characters of its
 digest. A completed check ends with "Changes after the check were not
 cross-checked." An incomplete check renders as prose instead, for example
