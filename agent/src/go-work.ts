@@ -235,6 +235,8 @@ export interface GoWorkRemovalOptions {
 }
 
 const DEFAULT_MAX_ENTRIES = 10_000;
+/** Selected leaves one call attempts to remove; the rest are reported as skipped for a later pass. */
+export const GO_WORK_MAX_SELECTED = 64;
 const MAX_LOGGED_NAMES = 8;
 
 /**
@@ -315,11 +317,14 @@ async function removeInto(home: string, opts: GoWorkRemovalOptions, result: GoWo
   }
 
   selected.sort((a, b) => a[0] - b[0]);
+  let attempted = 0;
   for (const [, leaf] of selected) {
-    if (Date.now() >= opts.deadline) {
+    // Over the per-call cap or past the deadline the leaf is left for a later pass (and the result is not clean).
+    if (attempted >= GO_WORK_MAX_SELECTED || Date.now() >= opts.deadline) {
       result.skipped.push(leaf);
       continue;
     }
+    attempted++;
     const rel = `${GO_WORK_PARENT}/${leaf}`;
     if (!isParkScratchSubtree(rel)) {
       result.failed.push(leaf);
@@ -350,7 +355,8 @@ function finish(log: Logger, opts: GoWorkRemovalOptions, r: GoWorkRemoval): GoWo
     failedNames: names(r.failed),
     skippedNames: names(r.skipped),
   };
-  if (isGoWorkClean(r)) log.info("managed Go work dir cleanup", fields);
+  if (r.parent === "absent") log.debug("managed Go work dir cleanup: nothing to do", fields);
+  else if (isGoWorkClean(r)) log.info("managed Go work dir cleanup", fields);
   else log.warn("managed Go work dir cleanup incomplete", fields);
   return r;
 }

@@ -6598,7 +6598,7 @@ export class RunRunner {
             // whatever the cache drop returned. removeGoWorkLeaves never throws.
             await this.runCancellationMaintenance(flight, () => removeGoWorkLeaves(runHome, runLog, {
               select: { kind: "all" },
-              deadline: Date.now() + 60_000,
+              deadline: Date.now() + Math.min(60_000, flight.cancellationBudget?.remainingMs() ?? 60_000),
               reason: "process_ended_park",
             })).catch(() => undefined);
           } else { flight.sourceJoinFailed = true; parkReapIncomplete = true; }

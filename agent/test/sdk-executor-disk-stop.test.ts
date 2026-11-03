@@ -723,6 +723,9 @@ describe("SdkExecutor — issue #1830 reclaimCachesInPlace", () => {
     const leaf = path.join(homeDir, ".uzi-go-work", "g3", "go-build1", "x.o");
     fs.mkdirSync(path.dirname(leaf), { recursive: true });
     fs.writeFileSync(leaf, "obj");
+    // The managed shape (single-uid mode 0700), so removeGoWorkLeaves WOULD remove the leaf: the
+    // assertion below then proves the in-place drop leaves it, not that the parent was refused.
+    fs.chmodSync(path.join(homeDir, ".uzi-go-work"), 0o700);
     const exec = new SdkExecutor(nullLogger(), homeDir, {
       queryFn: spawningTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]),
       spawn: () => ({ pid: 8201 }),

@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import {
   type GoWorkFsOps,
+  GO_WORK_MAX_SELECTED,
   GO_WORK_PARENT,
   goWorkLeafName,
   isGoWorkClean,
@@ -442,6 +443,19 @@ describe("removeGoWorkLeaves", () => {
     const exact = await run({ kind: "all" }, { maxEntries: 2 });
     assert.strictEqual(exact.r.truncated, false, "exactly maxEntries entries is a complete enumeration");
     assert.ok(isGoWorkClean(exact.r));
+  });
+
+  it("attempts at most GO_WORK_MAX_SELECTED leaves per call; the rest are skipped and the result is not clean", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    await prepareParent();
+    for (let g = 1; g <= 70; g++) await fs.mkdir(path.join(parentDir(), `g${g}`));
+    let calls = 0;
+    const { r } = await run({ kind: "all" }, { removeSubtree: async () => (calls++, "removed") });
+    assert.strictEqual(GO_WORK_MAX_SELECTED, 64);
+    assert.strictEqual(calls, 64);
+    assert.strictEqual(r.removed.length, 64);
+    assert.strictEqual(r.skipped.length, 6);
+    assert.strictEqual(isGoWorkClean(r), false);
   });
 
   it("a removal that throws is failed and not clean; siblings still get their turn", async (t) => {
