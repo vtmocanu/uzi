@@ -240,6 +240,7 @@ function createRuntime(options = {}) {
     if (firstMode !== 'shared' && firstMode !== 'exclusive') throw new Error('invalid epoch mode');
     const participates = supported(); // Before any epoch-file open or flock.
     let fd;
+    let heldIdentity;
     let mode = 'unsupported';
     if (participates) {
       fd = open(names.epoch);
@@ -247,17 +248,86 @@ function createRuntime(options = {}) {
         mode = firstMode;
         const acquired = await lock(fd, mode, 120000, signal, mode === 'exclusive');
         if (!acquired) { mode = 'shared'; await lock(fd, mode, 120000, signal); }
-        verify(fd, names.epoch);
+        heldIdentity = identity(verify(fd, names.epoch));
       } catch (error) { io.closeSync(fd); throw error; }
     }
     let closed = false;
     let pending = false;
+    let activeScope;
+    let stickyStop = false;
     const requireIdle = () => { requireLive(); if (pending) throw new Error('epoch operation pending'); };
     const requireLive = () => { if (closed) throw new Error('epoch ownership closed'); };
+    const requireUnscoped = () => {
+      requireIdle();
+      if (stickyStop) throw new Error('epoch reclaim stopped');
+      if (activeScope) throw new Error('epoch reclaim active');
+    };
+    function beginReclaim() {
+      requireUnscoped();
+      if (mode !== 'exclusive' || fd === undefined) throw new Error('exclusive epoch ownership required');
+      let finished = false;
+      let mutations = 0;
+      const stop = () => {
+        if (finished) throw new Error('epoch reclaim finished');
+        stickyStop = true;
+      };
+      const assertExclusive = () => {
+        requireLive();
+        if (finished) throw new Error('epoch reclaim finished');
+        if (stickyStop) throw new Error('epoch reclaim stopped');
+        try {
+          aborted(signal);
+          if (mode !== 'exclusive' || fd === undefined) throw new Error('exclusive epoch ownership required');
+          verify(fd, names.epoch, 0o600, heldIdentity);
+        } catch (error) { stop(); throw error; }
+      };
+      const assertSettled = () => {
+        assertExclusive();
+        if (mutations) throw new Error('epoch mutations pending');
+      };
+      const scope = {
+        assertExclusive,
+        get pendingMutations() { return mutations; },
+        beginMutation() {
+          assertExclusive();
+          mutations++;
+          let settled = false;
+          return {
+            // A ticket records definitive settlement, including a settled refusal.
+            // Uncertain work must call stop(); settlement never clears that latch.
+            settle() {
+              if (settled) return;
+              settled = true;
+              mutations--;
+            },
+          };
+        },
+        inheritStdio(stdio = ['pipe', 'pipe', 'pipe']) {
+          assertExclusive();
+          if (!mutations) throw new Error('epoch mutation ticket required');
+          if (!Array.isArray(stdio) || stdio.length < 3) throw new Error('explicit initial stdio required');
+          // Trusted worker spawn options only. Passing this fd duplicates the
+          // acquired open description; opening names.epoch would lose ownership.
+          return [...stdio, fd];
+        },
+        stop,
+        stopped() { return stickyStop; },
+        assertSettled,
+        finish() {
+          assertSettled();
+          finished = true;
+          activeScope = undefined;
+        },
+      };
+      assertExclusive();
+      activeScope = scope;
+      return scope;
+    }
     return {
       get mode() { requireLive(); return mode; },
+      beginReclaim,
       async consume(podUid) {
-        requireIdle();
+        requireUnscoped();
         pending = true;
         try {
           const result = await consume(podUid, signal);
@@ -266,13 +336,14 @@ function createRuntime(options = {}) {
       },
       matchesEntry(current, previous) {
         requireIdle();
+        activeScope?.assertExclusive();
         uuid(current); uuid(previous);
         if (mode !== 'exclusive') return false;
         const record = readRecord();
         return !!record && record.current === current && record.previous === previous;
       },
       async reacquireShared() {
-        requireIdle();
+        requireUnscoped();
         if (mode !== 'exclusive') return;
         // Deliberately no conversion: admission must remain closed across this gap.
         io.closeSync(fd);
@@ -286,7 +357,7 @@ function createRuntime(options = {}) {
         closed = false;
       },
       close() {
-        requireIdle();
+        requireUnscoped();
         closed = true;
         if (fd !== undefined) io.closeSync(fd);
       },

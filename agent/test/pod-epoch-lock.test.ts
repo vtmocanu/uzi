@@ -258,6 +258,133 @@ test("future EX is explicit; busy EX falls back to SH; reacquisition closes old 
   assert.throws(() => exclusive.mode, /closed/);
 });
 
+test("reclaim lease requires verified live EX and leaves ordinary ownership unchanged", async (t) => {
+  const f = fixture(t);
+  await f.runtime.seed(S);
+  const shared = await f.runtime.acquire();
+  assert.ok(shared.beginReclaim);
+  assert.throws(() => shared.beginReclaim!(), /exclusive/);
+  shared.close();
+  assert.throws(() => shared.beginReclaim!(), /closed/);
+  const unsupported = createPodEpoch({ ...f.options, io: {
+    ...f.options.io, statfsSync: () => ({ type: 0x6969 }),
+  } as unknown as typeof fs });
+  const absent = await unsupported.acquire({ firstMode: "exclusive" });
+  assert.ok(absent.beginReclaim);
+  assert.throws(() => absent.beginReclaim!(), /exclusive/);
+  absent.close();
+  const exclusive = await f.runtime.acquire({ firstMode: "exclusive" });
+  fs.renameSync(path.join(f.root, epochName), path.join(f.root, "old-lock"));
+  fs.writeFileSync(path.join(f.root, epochName), "", { mode: 0o600 });
+  fs.chownSync(path.join(f.root, epochName), process.getuid!(), process.getgid!());
+  assert.ok(exclusive.beginReclaim);
+  assert.throws(() => exclusive.beginReclaim!(), /inode changed/);
+  assert.throws(() => exclusive.close(), /stopped/);
+  await assert.rejects(exclusive.reacquireShared(), /stopped/);
+});
+
+test("reclaim scope counts idempotent tickets, keeps proof reads live and gates release", async (t) => {
+  const f = fixture(t);
+  await f.runtime.seed(S);
+  await f.runtime.seed(T);
+  const held = await f.runtime.acquire({ firstMode: "exclusive" });
+  assert.ok(held.beginReclaim);
+  const scope = held.beginReclaim();
+  scope.assertExclusive();
+  assert.equal(held.matchesEntry(T, S), true);
+  assert.throws(() => held.beginReclaim!(), /active/);
+  assert.throws(() => held.close(), /active/);
+  await assert.rejects(held.reacquireShared(), /active/);
+  await assert.rejects(held.consume(T), /active/);
+  assert.throws(() => scope.inheritStdio(["pipe", "pipe", "pipe"]), /mutation/);
+  const first = scope.beginMutation();
+  const second = scope.beginMutation();
+  assert.equal(scope.pendingMutations, 2);
+  assert.equal(held.matchesEntry(T, S), true);
+  assert.throws(() => scope.assertSettled(), /pending/);
+  assert.throws(() => scope.finish(), /pending/);
+  first.settle();
+  first.settle();
+  assert.equal(scope.pendingMutations, 1);
+  assert.throws(() => scope.finish(), /pending/);
+  second.settle();
+  scope.assertSettled();
+  scope.finish();
+  assert.throws(() => scope.beginMutation(), /finished/);
+  assert.throws(() => scope.inheritStdio(["pipe", "pipe", "pipe"]), /finished/);
+  const next = held.beginReclaim();
+  next.finish();
+  await held.reacquireShared();
+  assert.equal(held.mode, "shared");
+  held.close();
+});
+
+test("stopped reclaim stays sticky after all mutation tickets settle", async (t) => {
+  const f = fixture(t);
+  await f.runtime.seed(S);
+  const held = await f.runtime.acquire({ firstMode: "exclusive" });
+  assert.ok(held.beginReclaim);
+  const scope = held.beginReclaim();
+  const ticket = scope.beginMutation();
+  scope.stop();
+  scope.stop();
+  assert.equal(scope.stopped(), true);
+  ticket.settle();
+  ticket.settle();
+  assert.equal(scope.pendingMutations, 0);
+  assert.throws(() => scope.assertExclusive(), /stopped/);
+  assert.throws(() => scope.beginMutation(), /stopped/);
+  assert.throws(() => scope.inheritStdio(["pipe", "pipe", "pipe"]), /stopped/);
+  assert.throws(() => scope.assertSettled(), /stopped/);
+  assert.throws(() => scope.finish(), /stopped/);
+  assert.throws(() => held.close(), /stopped/);
+  await assert.rejects(held.reacquireShared(), /stopped/);
+  assert.throws(() => held.beginReclaim!(), /stopped/);
+});
+
+test("trusted stdio decoration copies pipes and appends the acquired open description only", async (t) => {
+  const f = fixture(t);
+  await f.runtime.seed(S);
+  const held = await f.runtime.acquire({ firstMode: "exclusive" });
+  const acquired = f.calls.at(-1)!.fd;
+  assert.equal(typeof acquired, "number");
+  assert.ok(held.beginReclaim);
+  const scope = held.beginReclaim();
+  const ticket = scope.beginMutation();
+  const pipes = ["pipe", "pipe", "pipe", "ignore"] as const;
+  const before = f.calls.length;
+  const stdio = scope.inheritStdio(pipes);
+  assert.notEqual(stdio, pipes);
+  assert.deepEqual(pipes, ["pipe", "pipe", "pipe", "ignore"]);
+  assert.deepEqual(stdio, [...pipes, acquired]);
+  assert.equal(f.calls.length, before, "decoration does not acquire another lock");
+  assert.deepEqual(scope.inheritStdio(), ["pipe", "pipe", "pipe", acquired]);
+  assert.throws(() => scope.inheritStdio([]), /stdio/);
+  ticket.settle();
+  scope.finish();
+  held.close();
+});
+
+test("active reclaim revalidates the held inode before proof and child inheritance", async (t) => {
+  const f = fixture(t);
+  await f.runtime.seed(S);
+  await f.runtime.seed(T);
+  const held = await f.runtime.acquire({ firstMode: "exclusive" });
+  assert.ok(held.beginReclaim);
+  const scope = held.beginReclaim();
+  const ticket = scope.beginMutation();
+  const epoch = path.join(f.root, epochName);
+  fs.renameSync(epoch, epoch + ".old");
+  fs.writeFileSync(epoch, "", { mode: 0o600 });
+  fs.chownSync(epoch, process.getuid!(), process.getgid!());
+  assert.throws(() => scope.inheritStdio(), /inode changed/);
+  assert.equal(scope.stopped(), true);
+  assert.throws(() => held.matchesEntry(T, S), /stopped/);
+  ticket.settle();
+  assert.throws(() => scope.finish(), /stopped/);
+  assert.throws(() => held.close(), /stopped/);
+});
+
 test("full ledger and existing UID fsync without append; exact bound is 151560", async (t) => {
   const f = fixture(t);
   await f.runtime.seed(S);
