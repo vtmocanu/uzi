@@ -317,6 +317,48 @@ func TestCodexSelectResetFirstPrefersSoonerWeeklyResetLiveDB(t *testing.T) {
 	}
 }
 
+// TestCodexSelectResetFirstRanksOnWeeklyNotBindingResetLiveDB (#3844): when the 5-hour window
+// binds (fuller than the weekly one) the binding reset is the 5-hour reset. reset_first must
+// still rank on the WEEKLY reset, so the account with the sooner weekly reset wins even though
+// its 5-hour (binding) reset is the later one. The winner is the higher account key so a
+// key tie-break cannot mask a wrong ranking key.
+func TestCodexSelectResetFirstRanksOnWeeklyNotBindingResetLiveDB(t *testing.T) {
+	fx := newPoolFix(t)
+	fx.svc.p.Autoselect.Order = autoselect.OrderResetFirst
+	def := fx.newAccount("def")
+	fx.makeDefault(def.alias)
+	a, b := fx.newAccount("a"), fx.newAccount("b")
+	fx.pool(a.alias, b.alias)
+	lo, hi := lowerAccount(a, b)
+	// Both: 5h window 80% used (binds, 20 headroom), weekly 40% used.
+	// lo: sooner 5h reset (1000s), later weekly reset (100000s).
+	fx.readingRaw(lo, poolBuckets(true, false, poolWindow(fiveHourSecs, 80, 1000), poolWindow(weekSecs, 40, 100000)), "1 minute")
+	// hi: later 5h reset (9000s), sooner weekly reset (50000s): must win.
+	fx.readingRaw(hi, poolBuckets(true, false, poolWindow(fiveHourSecs, 80, 9000), poolWindow(weekSecs, 40, 50000)), "1 minute")
+	fx.mode("auto")
+	assertBound(t, fx.mustCreate(), hi.alias, codexselect.ReasonAuto)
+}
+
+// TestCodexSelectPoolExhaustedReleaseFollowsBindingResetLiveDB (#3844): pool_exhausted release
+// timing keeps using the binding (5-hour) reset of a limit-reached account; the weekly reset that
+// reset_first ranks on must not leak into it. Each account's weekly reset order is the opposite of
+// its binding reset order, and the winner is the higher account key.
+func TestCodexSelectPoolExhaustedReleaseFollowsBindingResetLiveDB(t *testing.T) {
+	fx := newPoolFix(t)
+	fx.svc.p.Autoselect.Order = autoselect.OrderResetFirst
+	def := fx.newAccount("def")
+	fx.makeDefault(def.alias)
+	a, b := fx.newAccount("a"), fx.newAccount("b")
+	fx.pool(a.alias, b.alias)
+	lo, hi := lowerAccount(a, b)
+	// lo: binding 5h reset late (7200s) but weekly reset soon (1000s).
+	fx.readingRaw(lo, poolBuckets(false, true, poolWindow(fiveHourSecs, 100, 7200), poolWindow(weekSecs, 40, 1000)), "1 minute")
+	// hi: binding 5h reset soon (1800s) but weekly reset late (90000s): releases first.
+	fx.readingRaw(hi, poolBuckets(false, true, poolWindow(fiveHourSecs, 100, 1800), poolWindow(weekSecs, 40, 90000)), "1 minute")
+	fx.mode("auto")
+	assertBound(t, fx.mustCreate(), hi.alias, codexselect.ReasonPoolExhausted)
+}
+
 // TestCodexSelectPoolStaleLiveDB: with the reserve off, accounts with no measurable reading
 // (none, aged out, or polling disabled) fall to the lowest account key with 'pool_stale'.
 func TestCodexSelectPoolStaleLiveDB(t *testing.T) {

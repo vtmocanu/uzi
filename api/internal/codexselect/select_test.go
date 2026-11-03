@@ -1,6 +1,7 @@
 package codexselect
 
 import (
+	"math/rand"
 	"testing"
 	"time"
 
@@ -278,5 +279,99 @@ func TestSelectHeadroomFirstIgnoresWeeklyReset(t *testing.T) {
 	}
 	if out.AccountKey != id(2) {
 		t.Fatalf("got %+v, want the 90-headroom account", out)
+	}
+}
+
+func selectResetFirst(t *testing.T, cands []Candidate) Outcome {
+	t.Helper()
+	out, err := Select(cands, resetFirstPolicy, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func withInFlight(c Candidate, n int) Candidate {
+	c.InFlight = n
+	return c
+}
+
+// A weekly reset at or before now is as good as unknown: it sorts after a future reset even
+// when the future-reset account has much less headroom.
+func TestSelectResetFirstPastWeeklyResetSortsAfterFuture(t *testing.T) {
+	past := withWeekly(normal(1, 90), -time.Hour)
+	future := withWeekly(normal(2, 20), 72*time.Hour)
+	out := selectResetFirst(t, []Candidate{past, future})
+	if out.AccountKey != id(2) || out.Reason != ReasonAuto {
+		t.Fatalf("got %+v, want account 2 (future weekly reset), auto", out)
+	}
+}
+
+// A below-floor account is not eligible however soon its weekly reset is.
+func TestSelectResetFirstBelowFloorSoonestResetIsSkipped(t *testing.T) {
+	below := withWeekly(normal(1, 5), time.Minute)
+	ok := withWeekly(normal(2, 50), 48*time.Hour)
+	out := selectResetFirst(t, []Candidate{below, ok})
+	if out.AccountKey != id(2) || out.Reason != ReasonAuto {
+		t.Fatalf("got %+v, want account 2, auto", out)
+	}
+}
+
+// An exactly equal weekly reset falls to the in-flight-penalised score, then the account key.
+func TestSelectResetFirstWeeklyTieBreaksOnPenalisedScoreThenKey(t *testing.T) {
+	// Leg 1: account 1 has the higher raw score and the lower key, but one in-flight run
+	// (penalty 5) puts its rank (57) under account 2's (60).
+	a := withInFlight(withWeekly(normal(1, 62), 24*time.Hour), 1)
+	b := withWeekly(normal(2, 60), 24*time.Hour)
+	if out := selectResetFirst(t, []Candidate{a, b}); out.AccountKey != id(2) {
+		t.Fatalf("penalised-score leg: got %+v, want account 2", out)
+	}
+	// Leg 2: equal penalised rank (50 each) with different raw scores; the lowest key wins
+	// whichever way the raw scores point.
+	c := withWeekly(normal(4, 50), 24*time.Hour)
+	d := withInFlight(withWeekly(normal(5, 55), 24*time.Hour), 1)
+	if out := selectResetFirst(t, []Candidate{d, c}); out.AccountKey != id(4) {
+		t.Fatalf("key leg: got %+v, want account 4", out)
+	}
+	e := withInFlight(withWeekly(normal(4, 55), 24*time.Hour), 1)
+	f := withWeekly(normal(5, 50), 24*time.Hour)
+	if out := selectResetFirst(t, []Candidate{f, e}); out.AccountKey != id(4) {
+		t.Fatalf("key leg (swapped scores): got %+v, want account 4", out)
+	}
+}
+
+// In-flight runs penalise only within an equal-reset tie; they never hand the pick to an
+// account whose weekly reset is later.
+func TestSelectResetFirstInFlightDoesNotOverrideSoonerReset(t *testing.T) {
+	busy := withInFlight(withWeekly(normal(1, 60), time.Hour), 4)
+	empty := withWeekly(normal(2, 100), 48*time.Hour)
+	out := selectResetFirst(t, []Candidate{empty, busy})
+	if out.AccountKey != id(1) || out.Reason != ReasonAuto {
+		t.Fatalf("got %+v, want account 1 despite 4 in-flight runs", out)
+	}
+}
+
+// The outcome is independent of input order.
+func TestSelectResetFirstDeterministicUnderShuffle(t *testing.T) {
+	cands := []Candidate{
+		withWeekly(normal(1, 80), 48*time.Hour),
+		withWeekly(normal(2, 40), 24*time.Hour),
+		withInFlight(withWeekly(normal(3, 45), 24*time.Hour), 1),
+		withWeekly(normal(4, 40), 24*time.Hour),
+		normal(5, 99),
+		withWeekly(normal(6, 95), -time.Hour),
+		withWeekly(normal(7, 3), time.Minute),
+	}
+	want := selectResetFirst(t, cands)
+	if !want.Picked || want.AccountKey != id(2) {
+		t.Fatalf("baseline got %+v, want account 2", want)
+	}
+	rng := rand.New(rand.NewSource(3844))
+	for i := 0; i < 500; i++ {
+		shuffled := append([]Candidate(nil), cands...)
+		rng.Shuffle(len(shuffled), func(a, b int) { shuffled[a], shuffled[b] = shuffled[b], shuffled[a] })
+		if got := selectResetFirst(t, shuffled); got != want {
+			t.Fatalf("shuffle %d: got %+v, want %+v", i, got, want)
+		}
 	}
 }
