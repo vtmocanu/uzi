@@ -273,12 +273,14 @@ test("reclaim lease requires verified live EX and leaves ordinary ownership unch
   assert.ok(absent.beginReclaim);
   assert.throws(() => absent.beginReclaim!(), /exclusive/);
   absent.close();
+  await f.runtime.seed(T);
   const exclusive = await f.runtime.acquire({ firstMode: "exclusive" });
   fs.renameSync(path.join(f.root, epochName), path.join(f.root, "old-lock"));
   fs.writeFileSync(path.join(f.root, epochName), "", { mode: 0o600 });
   fs.chownSync(path.join(f.root, epochName), process.getuid!(), process.getgid!());
   assert.ok(exclusive.beginReclaim);
   assert.throws(() => exclusive.beginReclaim!(), /inode changed/);
+  assert.throws(() => exclusive.matchesEntry(T, S), /stopped/, "failed scope initialization revokes affirmative entry proof");
   assert.throws(() => exclusive.close(), /stopped/);
   await assert.rejects(exclusive.reacquireShared(), /stopped/);
 });
@@ -340,6 +342,43 @@ test("stopped reclaim stays sticky after all mutation tickets settle", async (t)
   assert.throws(() => held.close(), /stopped/);
   await assert.rejects(held.reacquireShared(), /stopped/);
   assert.throws(() => held.beginReclaim!(), /stopped/);
+});
+
+test("abort before reclaim scope publication stops entry proof and ownership release", async (t) => {
+  const f = fixture(t);
+  await f.runtime.seed(S);
+  await f.runtime.seed(T);
+  const abort = new AbortController();
+  const held = await f.runtime.acquire({ firstMode: "exclusive", signal: abort.signal });
+  assert.equal(held.matchesEntry(T, S), true);
+  abort.abort(new Error("aborted before reclaim initialization"));
+  assert.ok(held.beginReclaim);
+  assert.throws(() => held.beginReclaim!(), /aborted before reclaim initialization/);
+  assert.throws(() => held.matchesEntry(T, S), /stopped/);
+  assert.throws(() => held.close(), /stopped/);
+  await assert.rejects(held.reacquireShared(), /stopped/);
+});
+
+test("abort during active reclaim permanently stops proof and release after ticket settlement", async (t) => {
+  const f = fixture(t);
+  await f.runtime.seed(S);
+  await f.runtime.seed(T);
+  const abort = new AbortController();
+  const held = await f.runtime.acquire({ firstMode: "exclusive", signal: abort.signal });
+  assert.ok(held.beginReclaim);
+  const scope = held.beginReclaim();
+  const ticket = scope.beginMutation();
+  assert.equal(held.matchesEntry(T, S), true);
+  abort.abort(new Error("aborted active reclaim"));
+  assert.throws(() => scope.assertExclusive(), /aborted active reclaim/);
+  assert.equal(scope.stopped(), true);
+  ticket.settle();
+  assert.equal(scope.pendingMutations, 0);
+  assert.throws(() => held.matchesEntry(T, S), /stopped/);
+  assert.throws(() => scope.inheritStdio(), /stopped/);
+  assert.throws(() => scope.finish(), /stopped/);
+  assert.throws(() => held.close(), /stopped/);
+  await assert.rejects(held.reacquireShared(), /stopped/);
 });
 
 test("trusted stdio decoration copies pipes and appends the acquired open description only", async (t) => {
