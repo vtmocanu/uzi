@@ -172,6 +172,27 @@ describe("worker epoch discard registration (automatic effects remain disabled)"
     assert.throws(() => git.createEpochDiscardProof({ ...input, deadline: Date.now() - 1 }), /invalid/);
   });
 
+  it("revokes an already registered proof after abort", async () => {
+    const controller = new AbortController();
+    const proof = git.createEpochDiscardProof({ ...input, signal: controller.signal });
+    git.assertEpochDiscardSettled(proof);
+    controller.abort(new Error("registered proof cancelled"));
+    await refusal(proof, "stale_epoch_proof");
+    assert.throws(() => git.assertEpochDiscardSettled(proof), /registered proof cancelled/);
+    assert.equal(journal(), raw);
+  });
+
+  it("revokes an already registered proof when its deadline expires", async t => {
+    const proof = git.createEpochDiscardProof(input);
+    git.assertEpochDiscardSettled(proof);
+    const clock = t.mock.method(Date, "now", () => input.deadline);
+    try {
+      await refusal(proof, "stale_epoch_proof");
+      assert.throws(() => git.assertEpochDiscardSettled(proof), /deadline exhausted/);
+    } finally { clock.mock.restore(); }
+    assert.equal(journal(), raw);
+  });
+
   it("rechecks fresh consumers rather than trusting the registration decision", async () => {
     const proof = git.createEpochDiscardProof(input);
     const tip = gitIn(["rev-parse", "HEAD"]);
