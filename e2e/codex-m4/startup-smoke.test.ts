@@ -22,7 +22,6 @@ import assert from "node:assert/strict";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 
@@ -38,6 +37,7 @@ import {
 } from "./fake-provider.js";
 import { resolveCodexBin } from "./provision.js";
 import { buildProviderLaunchPlan } from "./provider-launch-plan.js";
+import { cleanupP } from "./p-cleanup.js";
 import { recordEvidence } from "./evidence.js";
 import { P_LAYER_SKIP } from "./p-platform.js";
 import { CODEX_STARTUP_SMOKE_TITLE } from "./titles.js";
@@ -122,6 +122,20 @@ function makeDirectCodexSpawn(codexBin: string, expectUid: number): SpawnSupervi
     const emitter = new EventEmitter();
     let disposing = false;
     let exited = false;
+    const ownedPid = child.pid;
+    let killDelivered = false;
+    let disposalFinished = false;
+    let realClose: [number | null, NodeJS.Signals | null] | undefined;
+    const forwardClose = (): void => {
+      if (realClose && disposalFinished) {
+        emitter.emit("close", ...realClose);
+        realClose = undefined;
+      }
+    };
+    child.once("close", (code, signal) => {
+      realClose = [code, signal];
+      forwardClose();
+    });
 
     const writeEvidence = (frame: Record<string, unknown>): void => {
       evidence.write(`${JSON.stringify(frame)}\n`);
@@ -133,7 +147,7 @@ function makeDirectCodexSpawn(codexBin: string, expectUid: number): SpawnSupervi
       writeEvidence({
         event: "started",
         supervisorPid: child.pid,
-        childPid: child.pid,
+        childPid: ownedPid,
         subreaper: true,
         nondumpable: true,
         uid: expectUid,
@@ -171,14 +185,28 @@ function makeDirectCodexSpawn(codexBin: string, expectUid: number): SpawnSupervi
         } else if (frame.op === "dispose") {
           disposing = true;
           const finish = (): void => {
-            writeEvidence({ event: "dispose", id: frame.id, state: "drained", authority: "ECHILD+__WALL" });
-            // The launcher requires a clean supervisor exit (0) after a drained report.
+            // Only the exact owned child's observed exit can complete this report.
+            writeEvidence({
+              event: "dispose", id: frame.id, state: "drained", authority: "ECHILD+__WALL",
+              killed: killDelivered ? [ownedPid] : [],
+              reaped: exited && ownedPid !== undefined ? [ownedPid] : [],
+            });
+            evidence.end();
+            disposalFinished = true;
+            // Synthetic supervisor success is separate from the real child's exit/signal.
             emitter.emit("exit", 0, null);
+            // PassThrough data parsing is synchronous: the final response is consumed first.
+            forwardClose();
           };
           if (exited) finish();
           else {
             child.once("exit", finish);
-            child.kill("SIGKILL");
+            try {
+              killDelivered = child.kill("SIGKILL");
+              if (!killDelivered) emitter.emit("error", new Error("owned child SIGKILL was not delivered"));
+            } catch (error) {
+              emitter.emit("error", error);
+            }
           }
         }
         nl = controlBuf.indexOf("\n");
@@ -221,187 +249,184 @@ const fakeRemoveRunnerTree: RemoveRunnerTree = (request) => {
 
 test(CODEX_STARTUP_SMOKE_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   const startedAt = Date.now();
-
-  // 1. Resolve the real pinned binary (image-baked on this worker; else a rootless cache install).
-  // The executable path may differ from the immutable production contract path because this P-layer
-  // test injects the direct process spawn; resolveCodexBin has already verified its version/layout.
-  const resolved = resolveCodexBin();
-  assert.ok(
-    resolved.source === "image-baked" || resolved.source === "cache-install",
-    "the binary came from a verified provisioner source",
-  );
-
-  const runnerUid = process.getuid?.() ?? 10001;
-  const model = "gpt-6-astra";
-  const credential = dummyCredential();
-  const bashArg = bashArgCanary();
-
-  // 2. Loopback fake provider on an EPHEMERAL port; scripts ONE allowed uzi_bash call then finish.
-  const provider = await FakeProvider.start({ credential, respond: scriptedAllowedBashResponder(bashArg) });
-
-  // Isolated fresh trees (canonical, disjoint root/cwd) so parallel runs never collide.
-  const base = realpathSync(mkdtempSync(path.join(tmpdir(), "codex-m4-smoke-")));
-  const ownedDataRoot = path.join(base, "root");
-  const cwd = path.join(base, "cwd");
-  mkdirSync(cwd, { recursive: true, mode: 0o700 });
-
-  // 3. A REAL CodexCallbackBroker with an injected spawnCommand spy + a fileop seam (unused by Bash).
-  const spawnCalls: { argv: readonly string[]; cwd?: string }[] = [];
-  const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
-  const grants: RunGrants = {
-    role: "coder",
-    phase: "implement",
-    allowedTools: new Set(["Bash"]),
-    allowedSkills: new Set<string>(),
-    isRoot: true,
-  };
-  const broker = new CodexCallbackBroker({
-    registry,
-    spawnCommand: async (argv, opts) => {
-      spawnCalls.push({ argv, cwd: opts.cwd });
-      return { code: 0, stdout: `${bashArg}\n`, stderr: "" };
-    },
-    fileop: { op: async () => ({ ok: true }) },
-    worktreePath: cwd,
-    grants,
-    delegate: async () => ({ ok: false, code: "child_denied", message: "delegation is not exercised by the smoke" }),
-    allowedRoles: new Set<string>(),
-    screenPolicy: {},
-  });
-
+  let provider: FakeProvider | undefined;
+  let base: string | undefined;
   let handle: CodexRootHandle | undefined;
   let transport: CodexTransport | undefined;
+  let primaryFailure: { error: unknown } | undefined;
+  let smokePassed = false;
+  // Register before acquiring anything so partial setup failures still release resources.
   t.after(async () => {
-    try {
-      await transport?.close();
-    } catch {
-      /* best effort */
-    }
-    try {
-      if (handle !== undefined) await handle.dispose();
-    } catch {
-      /* best effort — the shim SIGKILLs the codex child on dispose */
-    }
-    try {
-      await provider.close();
-    } catch {
-      /* best effort */
-    }
-    rmSync(base, { recursive: true, force: true });
+    await cleanupP({ transport, handle, provider, base }, primaryFailure);
+    if (smokePassed) recordEvidence(CODEX_STARTUP_SMOKE_TITLE, "pass");
   });
 
-  // 4. Launch the REAL app-server through the PRODUCTION launcher + loopback config builder.
-  const launchPlan = buildProviderLaunchPlan(
-    { CODEX_BIN, SUPERVISOR_BIN, PROVIDER_CHILD_ARGV },
-    {
-      executableBin: resolved.codexBin,
-      provider: { name: "openai", baseUrl: provider.baseUrl, envKey: "FAKE_PROVIDER_API_KEY" },
+  try {
+    // 1. Resolve the real pinned binary (image-baked on this worker; else a rootless cache install).
+    // The executable path may differ from the immutable production contract path because this P-layer
+    // test injects the direct process spawn; resolveCodexBin has already verified its version/layout.
+    const resolved = resolveCodexBin();
+    assert.ok(
+      resolved.source === "image-baked" || resolved.source === "cache-install",
+      "the binary came from a verified provisioner source",
+    );
+
+    const runnerUid = process.getuid?.() ?? 10001;
+    const model = "gpt-6-astra";
+    const credential = dummyCredential();
+    const bashArg = bashArgCanary();
+
+    // 2. Loopback fake provider on an EPHEMERAL port; scripts ONE allowed uzi_bash call then finish.
+    provider = await FakeProvider.start({ credential, respond: scriptedAllowedBashResponder(bashArg) });
+
+    // Isolated fresh trees (canonical, disjoint root/cwd) so parallel runs never collide.
+    const scratch = path.resolve(__dirname, "../../.uzi/scratch");
+    mkdirSync(scratch, { recursive: true });
+    base = realpathSync(mkdtempSync(path.join(scratch, "codex-m4-smoke-")));
+    const ownedDataRoot = path.join(base, "root");
+    const cwd = path.join(base, "cwd");
+    mkdirSync(cwd, { recursive: true, mode: 0o700 });
+
+    // 3. A REAL CodexCallbackBroker with an injected spawnCommand spy + a fileop seam (unused by Bash).
+    const spawnCalls: { argv: readonly string[]; cwd?: string }[] = [];
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const grants: RunGrants = {
+      role: "coder",
+      phase: "implement",
+      allowedTools: new Set(["Bash"]),
+      allowedSkills: new Set<string>(),
+      isRoot: true,
+    };
+    const broker = new CodexCallbackBroker({
+      registry,
+      spawnCommand: async (argv, opts) => {
+        spawnCalls.push({ argv, cwd: opts.cwd });
+        return { code: 0, stdout: `${bashArg}\n`, stderr: "" };
+      },
+      fileop: { op: async () => ({ ok: true }) },
+      worktreePath: cwd,
+      grants,
+      delegate: async () => ({ ok: false, code: "child_denied", message: "delegation is not exercised by the smoke" }),
+      allowedRoles: new Set<string>(),
+      screenPolicy: {},
+    });
+
+    // 4. Launch the REAL app-server through the PRODUCTION launcher + loopback config builder.
+    const launchPlan = buildProviderLaunchPlan(
+      { CODEX_BIN, SUPERVISOR_BIN, PROVIDER_CHILD_ARGV },
+      {
+        executableBin: resolved.codexBin,
+        provider: { name: "openai", baseUrl: provider.baseUrl, envKey: "FAKE_PROVIDER_API_KEY" },
+        model,
+        cwd,
+        ownedDataRoot,
+      },
+    );
+    assert.equal(
+      launchPlan.spec.codexBin,
+      CODEX_BIN,
+      "the provider spec keeps the immutable production target",
+    );
+    const deps: LauncherDeps = {
+      env: { UZI_UID_SPLIT: "1" }, // this worker is single-uid; the smoke injects the profile gate input
+      resolveRunnerUid: () => runnerUid,
+      makeRunnerTrees: fakeMakeRunnerTrees,
+      removeRunnerTree: fakeRemoveRunnerTree,
+      spawnSupervisor: makeDirectCodexSpawn(launchPlan.executableBin, runnerUid),
+      appServerAuthOpenAIBaseUrlForTest: provider.baseUrl, // → buildCodexLoopbackTestConfigToml
+      deadlines: { started: 60_000 }, // the 258 MB pinned binary can be slow to cold-start
+    };
+    handle = await launchCodexRoot(launchPlan.spec, deps);
+    assert.ok(handle.transport.stdin && handle.transport.stdout, "the app-server transport is available");
+
+    // 5. Production transport + production app-server auth handshake (initialize/login).
+    transport = createCodexTransport({ inbound: handle.transport.stdout, outbound: handle.transport.stdin });
+    const auth = createCodexAppServerAuth({ mode: "api_key", apiKey: credential });
+    await auth.authenticate(transport);
+
+    // 6. Consume the notification stream: route item/tool/call to the broker, track turn/completed.
+    const brokerCalls: string[] = [];
+    let threadId: string | undefined;
+    let turnId: string | undefined;
+    let turnStatus: string | undefined;
+    const notes = transport.notifications();
+    const consume = (async (): Promise<void> => {
+      for await (const note of notes) {
+        if (
+          note.kind === "turn_completed"
+          && note.threadId === threadId
+          && note.turnId === turnId
+        ) {
+          turnStatus = note.status;
+          return;
+        }
+        if (note.kind === "activity" && note.requestId !== undefined && note.method === "item/tool/call") {
+          const p = (note.params ?? {}) as Record<string, unknown>;
+          const rt = { threadId: String(p.threadId), turnId: String(p.turnId), callId: String(p.callId) };
+          brokerCalls.push(String(p.tool));
+          const result = await broker.handleToolCall(rt, p.tool, p.arguments, "root");
+          const text = result.ok ? JSON.stringify(result.output) : result.message;
+          transport!.respond(note.requestId, { result: { success: result.ok, contentItems: [{ type: "inputText", text }] } });
+        }
+      }
+    })();
+    // A background rejection during setup must not become an unhandled rejection.
+    void consume.catch(() => undefined);
+
+    // 7. thread/start + turn/start against the loopback provider, advertising the real dynamic tools.
+    const threadRes = await transport.request<{ thread?: { id?: string } }>("thread/start", {
       model,
+      modelProvider: CODEX_M3B_LOOPBACK_PROVIDER_NAME,
       cwd,
-      ownedDataRoot,
-    },
-  );
-  assert.equal(
-    launchPlan.spec.codexBin,
-    CODEX_BIN,
-    "the provider spec keeps the immutable production target",
-  );
-  const deps: LauncherDeps = {
-    env: { UZI_UID_SPLIT: "1" }, // this worker is single-uid; the smoke injects the profile gate input
-    resolveRunnerUid: () => runnerUid,
-    makeRunnerTrees: fakeMakeRunnerTrees,
-    removeRunnerTree: fakeRemoveRunnerTree,
-    spawnSupervisor: makeDirectCodexSpawn(launchPlan.executableBin, runnerUid),
-    appServerAuthOpenAIBaseUrlForTest: provider.baseUrl, // → buildCodexLoopbackTestConfigToml
-    deadlines: { started: 60_000 }, // the 258 MB pinned binary can be slow to cold-start
-  };
-  handle = await launchCodexRoot(launchPlan.spec, deps);
-  assert.ok(handle.transport.stdin && handle.transport.stdout, "the app-server transport is available");
+      approvalPolicy: "never",
+      approvalsReviewer: "user",
+      sandbox: "danger-full-access",
+      ephemeral: false,
+      environments: [],
+      dynamicTools: buildCodexDynamicTools(grants),
+      config: { project_doc_max_bytes: 0, projects: { [cwd]: { trust_level: "untrusted" } } },
+      developerInstructions: "M4 P smoke developer instructions",
+    });
+    threadId = threadRes.thread?.id;
+    assert.ok(threadId, "thread/start returned a thread id");
 
-  // 5. Production transport + production app-server auth handshake (initialize/login).
-  transport = createCodexTransport({ inbound: handle.transport.stdout, outbound: handle.transport.stdin });
-  const auth = createCodexAppServerAuth({ mode: "api_key", apiKey: credential });
-  await auth.authenticate(transport);
+    const turnRes = await transport.request<{ turn?: { id?: string } }>("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "M4 smoke: run the one allowed shell command" }],
+      environments: [],
+      model,
+    });
+    turnId = turnRes.turn?.id;
+    assert.ok(turnId, "turn/start returned a turn id");
 
-  // 6. Consume the notification stream: route item/tool/call to the broker, track turn/completed.
-  const brokerCalls: string[] = [];
-  let threadId: string | undefined;
-  let turnId: string | undefined;
-  let turnStatus: string | undefined;
-  const notes = transport.notifications();
-  const consume = (async (): Promise<void> => {
-    for await (const note of notes) {
-      if (
-        note.kind === "turn_completed"
-        && note.threadId === threadId
-        && note.turnId === turnId
-      ) {
-        turnStatus = note.status;
-        return;
-      }
-      if (note.kind === "activity" && note.requestId !== undefined && note.method === "item/tool/call") {
-        const p = (note.params ?? {}) as Record<string, unknown>;
-        const rt = { threadId: String(p.threadId), turnId: String(p.turnId), callId: String(p.callId) };
-        brokerCalls.push(String(p.tool));
-        const result = await broker.handleToolCall(rt, p.tool, p.arguments, "root");
-        const text = result.ok ? JSON.stringify(result.output) : result.message;
-        transport!.respond(note.requestId, { result: { success: result.ok, contentItems: [{ type: "inputText", text }] } });
-      }
-    }
-  })();
-  // A background rejection during setup must not become an unhandled rejection.
-  void consume.catch(() => undefined);
+    // 8. Await the bounded turn completion.
+    await deadline(consume, "codex turn completion", 60_000);
 
-  // 7. thread/start + turn/start against the loopback provider, advertising the real dynamic tools.
-  const threadRes = await transport.request<{ thread?: { id?: string } }>("thread/start", {
-    model,
-    modelProvider: CODEX_M3B_LOOPBACK_PROVIDER_NAME,
-    cwd,
-    approvalPolicy: "never",
-    approvalsReviewer: "user",
-    sandbox: "danger-full-access",
-    ephemeral: false,
-    environments: [],
-    dynamicTools: buildCodexDynamicTools(grants),
-    config: { project_doc_max_bytes: 0, projects: { [cwd]: { trust_level: "untrusted" } } },
-    developerInstructions: "M4 P smoke developer instructions",
-  });
-  threadId = threadRes.thread?.id;
-  assert.ok(threadId, "thread/start returned a thread id");
+    const elapsed = Date.now() - startedAt;
+    console.log(`[codex-m4 P smoke] source=${resolved.source} startup+turn=${elapsed}ms`);
+    t.diagnostic(`codex-m4 P smoke startup+turn=${elapsed}ms (source=${resolved.source})`);
 
-  const turnRes = await transport.request<{ turn?: { id?: string } }>("turn/start", {
-    threadId,
-    input: [{ type: "text", text: "M4 smoke: run the one allowed shell command" }],
-    environments: [],
-    model,
-  });
-  turnId = turnRes.turn?.id;
-  assert.ok(turnId, "turn/start returned a turn id");
+    // 9. Assertions: (a) the tool result was delivered back, (b) the turn completed, (c) the
+    //    spawnCommand seam ran for the allowed command (reachability through the REAL broker).
+    assert.equal(turnStatus, "completed", "the turn completed successfully");
+    assert.deepEqual(brokerCalls, ["uzi_bash"], "exactly one allowed uzi_bash callback reached the broker");
+    assert.equal(spawnCalls.length, 1, "the broker's spawnCommand seam ran once (reachability)");
+    assert.deepEqual(
+      spawnCalls[0]?.argv,
+      ["/bin/sh", "-c", `echo ${bashArg}`],
+      "the broker spawned the exact allowed argv",
+    );
+    assert.ok(countToolCallbacks(provider.requests) >= 1, "the app-server fed a tool result back to the provider");
+    assert.ok(
+      toolCallbackTexts(provider.requests, SMOKE_BASH_CALL_ID).length >= 1,
+      "the uzi_bash function_call_output was delivered back to the model",
+    );
+    assert.deepEqual(provider.errors, [], "the fake provider recorded no errors");
+    assert.ok(elapsed < SUITE_DEADLINE_MS, `startup+turn ${elapsed}ms is under the ${SUITE_DEADLINE_MS}ms bound`);
 
-  // 8. Await the bounded turn completion.
-  await deadline(consume, "codex turn completion", 60_000);
-
-  const elapsed = Date.now() - startedAt;
-  console.log(`[codex-m4 P smoke] source=${resolved.source} startup+turn=${elapsed}ms`);
-  t.diagnostic(`codex-m4 P smoke startup+turn=${elapsed}ms (source=${resolved.source})`);
-
-  // 9. Assertions: (a) the tool result was delivered back, (b) the turn completed, (c) the
-  //    spawnCommand seam ran for the allowed command (reachability through the REAL broker).
-  assert.equal(turnStatus, "completed", "the turn completed successfully");
-  assert.deepEqual(brokerCalls, ["uzi_bash"], "exactly one allowed uzi_bash callback reached the broker");
-  assert.equal(spawnCalls.length, 1, "the broker's spawnCommand seam ran once (reachability)");
-  assert.deepEqual(
-    spawnCalls[0]?.argv,
-    ["/bin/sh", "-c", `echo ${bashArg}`],
-    "the broker spawned the exact allowed argv",
-  );
-  assert.ok(countToolCallbacks(provider.requests) >= 1, "the app-server fed a tool result back to the provider");
-  assert.ok(
-    toolCallbackTexts(provider.requests, SMOKE_BASH_CALL_ID).length >= 1,
-    "the uzi_bash function_call_output was delivered back to the model",
-  );
-  assert.deepEqual(provider.errors, [], "the fake provider recorded no errors");
-  assert.ok(elapsed < SUITE_DEADLINE_MS, `startup+turn ${elapsed}ms is under the ${SUITE_DEADLINE_MS}ms bound`);
-
-  recordEvidence(CODEX_STARTUP_SMOKE_TITLE, "pass");
+    smokePassed = true;
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  }
 });
