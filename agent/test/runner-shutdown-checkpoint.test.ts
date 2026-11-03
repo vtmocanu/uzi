@@ -14,6 +14,7 @@ import { skillsPluginDir } from "../src/skills-plugin.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import {
   api,
+  fx,
   client,
   deferred,
   fakeGitlab,
@@ -23,6 +24,10 @@ import {
   runnerWith,
   worktreeDirFor,
 } from "./runner-harness.js";
+
+import { acquireWorkerLifetime } from "../src/authority-lock.js";
+import { AuthorityRuntime } from "../src/authority-runtime.js";
+import { testLockOptions } from "./authority-test-support.js";
 
 installHarness();
 
@@ -838,4 +843,31 @@ describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () 
       restore();
     }
   });
+});
+
+
+it("M1 attempt shutdown imports committed work under its bounded checkpoint authority", async () => {
+  const { gitlab } = fakeGitlab();
+  const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-m1-shutdown-"));
+  const { calls, restore } = spyPublish();
+  try {
+    const lifetime = await acquireWorkerLifetime(fs.realpathSync(fx.dataDir), testLockOptions());
+    const authority = new AuthorityRuntime({ lifetime, workerToken: "fixture-shutdown-authority", timeoutMs: 5000 });
+    const iid = 3747_201;
+    const bare = await git.ensureClone(fx.originPath);
+    execFileSync("git", ["-C", bare, "config", `uzi-attemptmode.issue-${iid}.enabled`, "true"], { env: GIT_ENV });
+    const { factory, started, sha } = shutdownFactory(homeRoot, iid, "M1-SHUTDOWN.txt");
+    const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { authority });
+    const claim = gitlabClaim(iid);
+    const running = runner.execute(claim);
+    await started;
+    runner.shutdown();
+    await running;
+    assert.equal(calls.length, 1, "final shutdown import reaches the broker despite the aborted run lifecycle");
+    assert.equal(calls[0]?.tipOid, sha(), "fresh committed work is the checkpoint source");
+    assert.equal(terminal(claim.run_id), false);
+  } finally {
+    restore();
+    fs.rmSync(homeRoot, { recursive: true, force: true });
+  }
 });

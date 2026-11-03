@@ -62,6 +62,8 @@ import type {
 } from "./protocol.js";
 import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, RecoveryCoverageReuseRefused, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidateContext, type HistoricalOwedContext, type OwedCandidate, type RecoveryCoverage, type RecoveryCoverageClaim, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
 
+type RemediationRestrictionFacts = Awaited<ReturnType<GitCache["readRemediationRestrictionFacts"]>>;
+
 /** Ephemeral execution metadata only; never custody or production admission authority. */
 export type ClosedSourceObservation = Readonly<{
   genesis: Readonly<{ runId: string; generation: number; clonePath: string; attemptId: string }>;
@@ -396,6 +398,8 @@ export interface RecoveryBundleProducer {
   readInventoryCloneHeads?: GitCache["readInventoryCloneHeads"];
   committedTrackingOwnership?: GitCache["committedTrackingOwnership"];
   ancestry?: GitCache["ancestry"];
+  readRemediationRestrictionFacts?: GitCache["readRemediationRestrictionFacts"];
+  withRemediationRestrictionFacts?: GitCache["withRemediationRestrictionFacts"];
   enumerateOwedCandidates?(barePath: string, runId: string): Promise<OwedCandidate[]>;
   discoverOwedCandidates?(skipContext?: (context: OwedCandidateContext | HistoricalOwedContext) => Promise<boolean>): ReturnType<GitCache["discoverOwedCandidates"]>;
   retainCurrentOwedCandidate?(barePath: string, options: FetchAgentBranchOptions): Promise<TrackingUpdateResult>;
@@ -2313,6 +2317,7 @@ export class RecoveryCoordinator {
     if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
     if (!record.inventoryGuarded || record.finalAcknowledged || record.reason === "inventory_quiescence_breach" || !record.coverageDigest ||
         !(await this.inactiveInventory(record))) return;
+    if (!await this.restrictionsAllowCapturedC(record)) return;
     // Archive FINAL releases local custody only with positive, retained-byte evidence.
     // Settled FINAL has its own independently verified empty-inventory proof.
     // Issue #2545: a held_publication FINAL rests on the forge ref the api verified, not on retained
@@ -2328,7 +2333,8 @@ export class RecoveryCoordinator {
         if (record.prerequisiteShas.length !== 0 || !header.selfContained || header.prerequisiteShas.length !== 0) return;
       } else if (record.selfContained === false) {
         // A saved thin archive FINAL replays on the MAC-authenticated record plus an exact header match;
-        // it depends on no pin, expiry, knob, capability or closure status and mints nothing. A NEW thin
+        // it depends on no pin, expiry, knob, capability or closure status and mints nothing.
+        // Fresh negative restriction evidence still gates replay and ACK. A NEW thin
         // FINAL needs the transient grant and every mint requirement.
         if (record.prerequisiteShas.length === 0 || header.selfContained ||
             canonicalJson(header.prerequisiteShas) !== canonicalJson(record.prerequisiteShas)) return;
@@ -2359,7 +2365,7 @@ export class RecoveryCoordinator {
       const hold = await this.heldOperationState(record);
       if (hold !== "open") return this.heldStopped(record, hold);
       if (!(await this.openInventoryHold(record)) || !await prove() || residueQuarantine() !== undefined) return;
-      record = await this.writeExistingRecord(record, cur => {
+      record = await this.writeRestrictionCheckedRecord(record, cur => {
         // Refuse only a new archive mint. Saved requests retain their exact replay
         // identity, and held-publication mint sites keep their separate policy.
         if (cur.finalRequest || cur.finalAcknowledged || cur.reason === "inventory_snapshot_changed") return undefined;
@@ -2380,6 +2386,7 @@ export class RecoveryCoordinator {
       const hold = await this.heldOperationState(record);
       if (hold !== "open" && !await this.finalHoldAllowsReplay(record, hold)) return this.heldStopped(record, hold);
       if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
+      if (!await this.restrictionsAllowCapturedC(record)) return;
       const ack = await this.recoveryRPC(() => (MaintenanceBudget.current() ? this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition, MaintenanceBudget.current()!.signal) : this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition)));
       if (ack.run_id !== record.runId || ack.generation !== record.generation || ack.released !== true ||
           ack.holds_released !== 1 || ack.retained) {
@@ -2392,7 +2399,10 @@ export class RecoveryCoordinator {
           { run_id: record.runId, generation: record.generation });
         return quarantinedOutcome(record.captureId);
       }
-      await this.writeExistingRecord(record, cur => ({ ...cur, finalAcknowledged: true }));
+      const acknowledged = await this.writeRestrictionCheckedRecord(record, cur =>
+        canonicalJson(cur.finalRequest) === canonicalJson(request)
+          ? { ...cur, finalAcknowledged: true } : undefined);
+      if (!acknowledged.finalAcknowledged) return;
       MaintenanceBudget.current()?.check();
       this.onAuthoritativeGenerationReleased?.(record.runId, record.generation!);
       await this.forgetGenerationWithinCycle(record.runId, record.generation!);
@@ -2412,6 +2422,89 @@ export class RecoveryCoordinator {
       return { state: record.state, captureId: record.captureId,
         reason: cls.kind === "transient" ? cls.reason ?? "upload_transient" : cls.reason };
     }
+  }
+
+  /** Negative evidence only: never supplies a closure grant or changes the saved FINAL.
+   * Custody queries use the authenticated record, without selecting a live source.
+   * Each root is checked once per read pair (bounded by the Git query's root limit);
+   * one unavailable or non-divergent result holds this record.
+   */
+  private async restrictionsAllowCapturedC(record: RecoveryRecord): Promise<boolean> {
+    // Older producer fakes have no restriction seam. GitCache always implements it.
+    if (!this.git.readRemediationRestrictionFacts) return true;
+    try {
+      const current = await this.requireRecord(record);
+      const identity = (r: RecoveryRecord) => canonicalJson(r);
+      if (identity(current) !== identity(record)) return false;
+      const context = current.coverageContext;
+      if (!context || context.runId !== current.runId || context.generation !== current.generation ||
+          !/^[0-9a-f]{40}$/.test(current.sourceSha)) return false;
+      const read = () => ownedRecoveryIO(() => this.git.readRemediationRestrictionFacts!(
+        context.barePath, context.branch, current.runId));
+      const facts = await read();
+      if (!await this.restrictionFactsAllowCapturedC(current, facts)) return false;
+      // An ancestry wait must not carry stale durable evidence into release or ACK.
+      const after = await read();
+      return !after.blocked && after.fingerprint === facts.fingerprint &&
+        identity(await this.requireRecord(current)) === identity(current) && residueQuarantine() === undefined;
+    } catch { MaintenanceBudget.current()?.check(); return false; }
+  }
+
+  /** Each excluded root must be divergent from actual captured C. One bounded pass
+   * over the query's root limit; any unavailable relation holds the whole record.
+   */
+  private async restrictionFactsAllowCapturedC(record: RecoveryRecord, facts: RemediationRestrictionFacts): Promise<boolean> {
+    if (facts.blocked) return false;
+    if (!facts.enrolled) return true;
+    if (!record.coverageContext || !this.git.ancestry || !Array.isArray(facts.roots) ||
+        !Array.isArray(facts.flaggedOIDs) || facts.flaggedOIDs.some(oid => !facts.roots.includes(oid))) return false;
+    for (const root of facts.roots) {
+      if (await ownedRecoveryIO(() => this.git.ancestry!(record.coverageContext!.barePath, root, record.sourceSha)) !== "divergent")
+        return false;
+    }
+    return true;
+  }
+
+  /** J -> B, as for custody cleanup: authenticate the complete expected snapshot
+   * before consuming fresh negative evidence, retaining both locks through the write.
+   * No RPC, source-use acquisition, J acquisition or B-taking query runs in the consumer.
+   */
+  private async writeRestrictionCheckedRecord(
+    record: RecoveryRecord,
+    mutate: (current: RecoveryRecord) => RecoveryRecord | undefined,
+  ): Promise<RecoveryRecord> {
+    const snapshot = canonicalJson(record);
+    return this.withJournalLock(record.runId, async () => {
+      const current = await this.requireRecord(record);
+      if (canonicalJson(current) !== snapshot) return current;
+      const context = current.coverageContext;
+      let writing = false;
+      const consume = async (facts?: RemediationRestrictionFacts): Promise<RecoveryRecord> => {
+        if (facts && !await this.restrictionFactsAllowCapturedC(current, facts)) return current;
+        // An ancestry wait may observe lifecycle expiry or an externally changed journal.
+        const latest = await ownedRecoveryIO(() => this.requireRecord(current));
+        if (canonicalJson(latest) !== snapshot || residueQuarantine() !== undefined) return latest;
+        const next = mutate(latest);
+        if (!next) return latest;
+        writing = true;
+        await ownedRecoveryIO(() => this.writeRecordUnlocked(next));
+        return next;
+      };
+      if (!this.git.withRemediationRestrictionFacts) {
+        // Explicit legacy producer fakes have neither seam. A query alone cannot
+        // atomically consume mutable evidence and must never authorize a write.
+        return this.git.readRemediationRestrictionFacts ? current : consume();
+      }
+      if (!context || context.runId !== current.runId || context.generation !== current.generation ||
+          !/^[0-9a-f]{40}$/.test(current.sourceSha)) return current;
+      try {
+        return await ownedRecoveryIO(() => this.git.withRemediationRestrictionFacts!(
+          context.barePath, context.branch, current.runId, consume));
+      } catch (error) {
+        if (writing) throw error;
+        return ownedRecoveryIO(() => this.requireRecord(current));
+      }
+    });
   }
 
   /** Mint requirements 1-4 for a NEW thin archive FINAL (5 and 6 follow the status read). */
@@ -2461,7 +2554,7 @@ export class RecoveryCoordinator {
       const hold = await this.heldOperationState(record);
       if (hold !== "open") return this.heldStopped(record, hold);
       if (!this.newProductionAllowed(record)) return kept();
-      const cleared = await this.writeExistingRecord(record, cur =>
+      const cleared = await this.writeRestrictionCheckedRecord(record, cur =>
         !cur.finalAcknowledged && canonicalJson(cur.finalRequest) === canonicalJson(request)
           ? (() => { const next = { ...cur }; delete next.finalRequest; delete next.reason; return next; })()
           : undefined);
@@ -2495,6 +2588,7 @@ export class RecoveryCoordinator {
             (request.evidence !== undefined && request.evidence !== settled.release_evidence)) return this.heldStopped(record, "settled");
         replayProof = settled;
       }
+      if (!await this.restrictionsAllowCapturedC(record)) return kept();
       const ack = await this.recoveryRPC(() => replayProof
         ? this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition, MaintenanceBudget.current()?.signal, replayProof)
         : (MaintenanceBudget.current() ? this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition, MaintenanceBudget.current()!.signal) : this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition)));
@@ -2518,7 +2612,10 @@ export class RecoveryCoordinator {
           { run_id: record.runId, generation: record.generation });
         return { ...quarantinedOutcome(record.captureId), held: "kept" };
       }
-      await this.writeExistingRecord(record, cur => ({ ...cur, finalAcknowledged: true }));
+      const acknowledged = await this.writeRestrictionCheckedRecord(record, cur =>
+        canonicalJson(cur.finalRequest) === canonicalJson(request)
+          ? { ...cur, finalAcknowledged: true } : undefined);
+      if (!acknowledged.finalAcknowledged) return kept();
       MaintenanceBudget.current()?.check();
       this.onAuthoritativeGenerationReleased?.(record.runId, record.generation!);
       await this.forgetGenerationWithinCycle(record.runId, record.generation!);
@@ -2583,7 +2680,7 @@ export class RecoveryCoordinator {
     if (!cur.finalRequest) {
       if (!(await this.openInventoryHold(cur)) || residueQuarantine() !== undefined) return "kept" as const;
       if (!this.newProductionAllowed(cur)) return "kept" as const;
-      cur = await this.writeExistingRecord(cur, c => c.finalRequest || c.finalAcknowledged ? undefined : ({
+      cur = await this.writeRestrictionCheckedRecord(cur, c => c.finalRequest || c.finalAcknowledged ? undefined : ({
         ...c, finalRequest: { disposition: { kind: "held_publication", publication_id: publicationId,
           source_sha: c.sourceSha, coverage_digest: c.coverageDigest! } },
       }));
@@ -2613,6 +2710,7 @@ export class RecoveryCoordinator {
         checksum: record.checksum!, byte_size: record.byteSize!,
       }, ...this.passSignalArgs()));
       if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
+      if (!await this.restrictionsAllowCapturedC(record)) return;
       if (!response || typeof response !== "object" || Array.isArray(response) ||
           response.run_id !== record.runId || response.generation !== record.generation ||
           response.capture_id !== record.serverCaptureId!) return unknown();
@@ -2634,7 +2732,7 @@ export class RecoveryCoordinator {
             response.release_evidence !== saved.evidence ||
             (receipt.kind !== "archive" && receipt.kind !== "settled" && receipt.kind !== "held_publication")) return unknown();
         if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
-        const current = await this.writeExistingRecord(record, cur =>
+        const current = await this.writeRestrictionCheckedRecord(record, cur =>
           residueQuarantine() === undefined && canonicalJson(cur.finalRequest) === canonicalJson(saved) &&
           cur.generation === record.generation && cur.serverCaptureId === record.serverCaptureId && !cur.finalAcknowledged
             ? { ...cur, finalAcknowledged: true } : undefined);
@@ -2670,7 +2768,7 @@ export class RecoveryCoordinator {
       if (!await this.openInventoryHold(record)) return;
       if (!this.newProductionAllowed(record)) return { state: record.state, captureId: record.captureId, held: "kept" };
       if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
-      await this.writeExistingRecord(record, cur => {
+      await this.writeRestrictionCheckedRecord(record, cur => {
         if (residueQuarantine() !== undefined || cur.finalAcknowledged ||
             !cur.inventoryGuarded || cur.generation !== record.generation ||
             canonicalJson(cur.coverageContext) !== canonicalJson(record.coverageContext) ||
@@ -2830,7 +2928,7 @@ export class RecoveryCoordinator {
           if (body.tip !== record.sourceSha || body.ref !== `refs/uzi-held/${record.runId}/${record.generation}` ||
               !HELD_PUBLICATION_ID_RE.test(body.publication_id)) return outcome("kept");
           if (body.state === "created") {
-            record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false,
+            record = await this.writeRestrictionCheckedRecord(record, cur => ({ ...cur, heldCreateUncertain: false,
               finalRequest: { disposition: { kind: "held_publication", publication_id: body.publication_id,
                 source_sha: cur.sourceSha, coverage_digest: cur.coverageDigest! } } }));
             const released = await this.releaseHeldWithinCycle(record, body.publication_id);
@@ -2922,12 +3020,16 @@ export class RecoveryCoordinator {
     let attested = false;
     const publish = async (prove: () => Promise<boolean>) => {
       if (!await prove() || !await this.frozenCoverageProven(record)) { result = "kept"; return; }
+      // A frozen policy may predate durable excluded-root knowledge. This denial
+      // gates overrides too; it never attests a held refusal or grants closure.
+      if (!await this.restrictionsAllowCapturedC(record)) { result = "fallback"; attested = false; return; }
       const git = this.git;
       const prepare = async () => options.prepare ? options.prepare(record) :
         git.resolveCheckpointRange && git.secretScanCheckpointRange && git.ancestry &&
         git.rangeTouchesWorkflows && git.changedFilesNoRenames && git.checkpointPack
           ? await prepareFrozenHeld({ git: git as HeldGit, barePath: input.barePath,
-            branch: record.branch, sourceSha: record.sourceSha, policy: record.heldPolicy!, deadlineMs: 30_000 })
+            branch: record.branch, sourceSha: record.sourceSha, policy: record.heldPolicy!, deadlineMs: 30_000,
+            remediationHold: async () => !await this.restrictionsAllowCapturedC(record) })
           : { reason: "preparation_unavailable" };
       const prepared = await prepare().catch(() => ({ reason: "preparation_failed" }));
       if (!("pack" in prepared)) {
@@ -2948,6 +3050,13 @@ export class RecoveryCoordinator {
       // V2 reconciles lost create answers before any retry. V1 retains its legacy
       // archive fallback, whose FINAL supplies the generation settlement authority.
       if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: true }));
+      if (!await this.restrictionsAllowCapturedC(record)) {
+        // This invocation has not sent a create. Preserve older uncertainty, but
+        // do not turn a refused proof into a fictitious lost create response.
+        if (v2 && !uncertainCreate)
+          record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false }));
+        result = uncertainCreate ? "kept" : "fallback"; attested = false; return;
+      }
       result = v2 || uncertainCreate ? "kept" : "fallback";
       const response = await this.recoveryRPC(() => this.client.publishHeld!(record.runId, record.generation!, record.sourceSha,
         record.coverageDigest!, prepared.pack, maintenanceSignal(input.signal)));
@@ -2977,7 +3086,7 @@ export class RecoveryCoordinator {
       if (body.state !== "created") return;
       publicationId = body.publication_id;
       // Save FINAL before leaving the source boundary, without recursively acquiring the cycle.
-      record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false,
+      record = await this.writeRestrictionCheckedRecord(record, cur => ({ ...cur, heldCreateUncertain: false,
         finalRequest: { disposition: { kind: "held_publication", publication_id: publicationId!,
           source_sha: cur.sourceSha, coverage_digest: cur.coverageDigest! } } }));
     };

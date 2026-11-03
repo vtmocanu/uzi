@@ -514,6 +514,8 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     const feed: string[] = [];
     const flight = {
       runId: "R1",
+      barePath: bare,
+      branch,
       claimGeneration: 1,
       runKind: "issue",
       owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
@@ -564,6 +566,8 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     const feed: string[] = [];
     const flight = {
       runId: "R1",
+      barePath: bare,
+      branch,
       claimGeneration: 1,
       runKind: "issue",
       owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),
@@ -981,6 +985,8 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     const lines: string[] = [];
     const flight = {
       runId: "R1",
+      barePath: bare,
+      branch,
       claimGeneration: 1,
       runKind: "issue",
       owedContext: Promise.resolve((await fixtureTrackingOptions(git, bare, branch, "R1")).context),

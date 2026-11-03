@@ -250,8 +250,15 @@ describe("CI-config guard: single publication path", () => {
     assert.equal(pushes.length, 1, "runner.ts has exactly one pushBranch call site");
     const guardAt = src.indexOf("refuseOnCIConfigGuard(finalizeBarePath, sourceSha)");
     assert.ok(guardAt > 0, "the final-push guard is present");
-    const between = src.slice(guardAt, pushes[0]!.index);
-    assert.ok(between.length < 400 && !between.includes("pushToOrigin"), "the guard sits immediately before the push, in the same closure");
+    const admittedPushAt = src.indexOf("await this.pushRemediationCandidate(", guardAt);
+    const between = src.slice(guardAt, admittedPushAt);
+    assert.ok(admittedPushAt > guardAt && between.length < 400 && !between.includes("pushToOrigin"),
+      "the CI guard sits immediately before the remediation-guarded push, in the same closure");
+    const wrapperStart = src.indexOf("private async pushRemediationCandidate(");
+    const wrapper = src.slice(wrapperStart, src.indexOf("private async checkpointRemediationHold(", wrapperStart));
+    assert.ok(wrapper.includes("this.withRemediationCandidateAdmission("));
+    assert.ok(wrapper.includes("this.git.pushBranch("));
+    assert.ok(wrapper.includes("await admission.admit("), "the sole push consumes the current candidate restriction proof");
     assert.ok((src.match(/await pushToOrigin\(\)/g) ?? []).length >= 2, "the align/bridge path and the normal path both call pushToOrigin");
   });
 });

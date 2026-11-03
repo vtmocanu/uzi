@@ -2775,7 +2775,7 @@ for (const state of ["persisted", "absent", "attempt-only"] as const) {
     const broker = brokerPublish(fx.originPath, ref, () => undefined,
       () => state === "persisted" ? tip : undefined);
     const pub = stubPublish(broker.impl);
-    const flight = { runId: "same-tip", runKind: "issue", claimGeneration: 1,
+    const flight = { runId: "same-tip", runKind: "issue", claimGeneration: 1, barePath: bare, branch,
       owedContext: Promise.resolve(context), lastCheckpointRefTip: state === "persisted" ? tip : "OLD",
       lastAttemptedCheckpointRefTip: state === "attempt-only" ? tip : undefined,
       reportedPublishOutcomes: new Set<string>(), runLog: nullLogger(), batcher: { emit() {} } };

@@ -184,6 +184,7 @@ services:
       # The MR-close phase (PRD #24) overrides this to ~2s via E2E_FORGE_POLL_INTERVAL
       # and recreates the api, so the MR-state watcher actually ticks. Overlay-only;
       # the production default (config.go) is untouched.
+      RUN_PUBLICATION_RESUME_ENABLED: ${E2E_RUN_PUBLICATION_RESUME_ENABLED:-}
       FORGE_POLL_INTERVAL: ${E2E_FORGE_POLL_INTERVAL:-24h}
       # Chat idle backstop (PRD #39): the server-side not-trusting-the-worker sweep,
       # set ABOVE the worker's own idle window (WORKER_CHAT_IDLE_TIMEOUT, agent below) so
