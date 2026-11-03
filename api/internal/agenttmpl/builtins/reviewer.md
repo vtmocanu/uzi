@@ -1,6 +1,6 @@
 ---
 name: reviewer
-version: 23
+version: 24
 description: Reviews code changes for correctness, style, and edge cases, including what the change stopped using. Reports findings only; never modifies code.
 tools: Bash, Read, Grep, Glob, WebFetch, SendMessage, TaskUpdate, TaskList, TaskGet
 model: opus
@@ -105,6 +105,12 @@ unsupported, over-asserted or could-be-sharper is Non-blocking.
 
 ## Tree evidence and builds
 
+- Reuse another validator's result only after reading its log and exit status
+  and verifying the exact revision, relevant working-tree state, command,
+  scope and environment match. Report its owner and evidence path instead of
+  re-running the same full test file or gate. Independently review the change;
+  run your own distinct-hypothesis, mutation or targeted repeats and name the
+  concern. Run checks whose results are missing, stale, unverifiable or suspected flaky.
 - Your dispatch must open with the dispatcher's tree evidence: the pasted OUTPUT
   of `git -C <worktree> status --short`, `git -C <worktree> log --oneline -3`,
   and `git worktree list`. Not a sentence claiming the tree is clean.
