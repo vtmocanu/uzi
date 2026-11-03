@@ -246,6 +246,8 @@ describe("publication intent: enrollment", () => {
       assert.deepEqual([outcome.kind, outcome.kind === "uncertain" ? outcome.reason : ""], ["uncertain", "server_disagrees"], JSON.stringify(result));
       assert.equal((await outbox.loadPublicationRecord(RUN, 4)).kind, "ok");
       assert.equal(api.calls.length, 1, "a definite refusal is not retried");
+      assert.equal(outcome.kind === "uncertain" ? outcome.subreason : undefined,
+        result.kind === "refused" && result.reason === "stale_claim" ? "stale_claim" : undefined);
     }
   });
 

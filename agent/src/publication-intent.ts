@@ -742,7 +742,7 @@ export type PublicationUncertainReason =
 export type PublicationEnrollOutcome =
   | { kind: "enrolled"; record: EnrolledPublicationRecord }
   | { kind: "not_enrolled"; reason: PublicationNotEnrolledReason; diagnostic: typeof PUBLICATION_RESUME_UNAVAILABLE; detail?: string }
-  | { kind: "uncertain"; reason: PublicationUncertainReason; record?: PublicationRecord; detail?: string };
+  | { kind: "uncertain"; reason: PublicationUncertainReason; record?: PublicationRecord; detail?: string; subreason?: "stale_claim" };
 
 export type PublicationAdvanceOutcome =
   | PublicationEnrollOutcome
@@ -863,7 +863,9 @@ export async function enrollPublicationIntent(deps: PublicationDeps, intent: Pub
       const declined = definitive || (neverSent && (result.kind === "unsupported" || (result.kind === "refused" && result.reason === "publication_resume_unsupported")));
       if (!declined) {
         const detail = result.kind === "refused" ? `${result.status} ${result.reason}` : "publication_resume_v1 is not negotiated";
-        return uncertain(result.kind === "unsupported" ? "ack_unknown" : "server_disagrees", held, detail);
+        return { ...uncertain(result.kind === "unsupported" ? "ack_unknown" : "server_disagrees", held, detail),
+          ...(result.kind === "refused" && result.reason === "stale_claim" ? { subreason: "stale_claim" as const } : {}),
+        };
       }
       // The sequence-less record never reached the api (or the api holds nothing), so removing it retires nothing.
       if (!(await deps.store.discardPublicationRecord(held.run_id, held.claim_generation, {}))) {

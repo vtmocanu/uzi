@@ -119,6 +119,77 @@ func TestReadoptRestoresEachPhaseLiveDB(t *testing.T) {
 	}
 }
 
+// TestPublicationEnrollmentWaitingSnapshotAccountingLiveDB pins the API accounting
+// for a listed flight while worker-side publication enrollment is waiting.
+func TestPublicationEnrollmentWaitingSnapshotAccountingLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, _, repoID := env.seedCodexInfra(t)
+	svc := snapshotSvc(env, testParams())
+	nonce := "publication-wait-" + uuid.NewString()
+	wk := seedSnapshotWorker(t, env, userID, nonce)
+	const generation int64 = 7
+	// Enrollment is still waiting locally, but the flight remains running at G.
+	// Keep an earlier retry charge to distinguish a provenance refund from a reset.
+	run := seedOutageRun(t, env, userID, repoID, wk, "running", "issue", generation, 1)
+	initial := mustRun(t, env, run)
+	beat := func(epoch int64) {
+		t.Helper()
+		if _, err := svc.Heartbeat(env.ctx, hbWorker(t, env, wk), nil, nil, &ActiveSnapshot{
+			SnapshotEpoch: epoch, RegisterNonce: nonce,
+			Active: []ActiveRunEntry{entry(run, generation, "running", false)},
+		}); err != nil {
+			t.Fatalf("waiting publication Heartbeat epoch %d: %v", epoch, err)
+		}
+		if got := hbWorker(t, env, wk).SnapshotEpoch; got != epoch {
+			t.Fatalf("snapshot epoch = %d, want applied epoch %d", got, epoch)
+		}
+	}
+	assertFlight := func(status string, count int32, provenance bool) {
+		t.Helper()
+		r := mustRun(t, env, run)
+		if r.Status != status || r.UserID != initial.UserID || r.WorkerID != initial.WorkerID ||
+			r.ClaimGeneration != generation || r.ClaimReleasedAt.Valid || r.RequeueCount != count ||
+			r.StaleRequeueGeneration.Valid != provenance ||
+			(provenance && r.StaleRequeueGeneration.Int64 != generation) {
+			t.Fatalf("waiting publication: status=%s owner=%v worker=%v G=%d released=%v count=%d provenance=%v; want %s, original owner/worker, G=%d, unreleased, count=%d provenance=%v",
+				r.Status, r.UserID, r.WorkerID, r.ClaimGeneration, r.ClaimReleasedAt,
+				r.RequeueCount, r.StaleRequeueGeneration, status, generation, count, provenance)
+		}
+	}
+	// The old missing-run window is already elapsed in seedOutageRun. Listing
+	// the running flight must prevent a missing-execution charge or refund.
+	beat(1)
+	assertFlight("running", 1, false)
+
+	// API stays up while the worker is partitioned beyond stale-heartbeat.
+	// Only elapsed-time fixture columns change: the production sweeper writes
+	// the queued state, charge and matching-generation refund provenance.
+	env.exec("UPDATE workers SET last_heartbeat_at=now()-interval '3 hours' WHERE id=$1", wk)
+	rows, err := env.q.RequeueRunsOfStaleWorkers(env.ctx, store.RequeueRunsOfStaleWorkersParams{
+		MaxRequeues: 5, Cutoff: pgconv.Time(time.Now().Add(-time.Hour)),
+	})
+	if err != nil {
+		t.Fatalf("RequeueRunsOfStaleWorkers: %v", err)
+	}
+	found := false
+	for _, row := range rows {
+		if row.ID == run {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("production stale-worker requeue did not return the waiting flight")
+	}
+	assertFlight("queued", 2, true)
+
+	// Reconnection readopts at G and refunds only the sweeper's one charge.
+	beat(2)
+	assertFlight("running", 1, false)
+	// A newer identical snapshot has no provenance left to refund.
+	beat(3)
+	assertFlight("running", 1, false)
+}
+
 // TestReadoptRefundProvenanceLiveDB (D2): requeue_count is refunded (-1, floored at 0) ONLY when
 // stale_requeue_generation = claim_generation; a NULL or mismatched provenance never refunds. After
 // a readopt stale_requeue_generation is always cleared.

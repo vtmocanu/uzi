@@ -73,6 +73,8 @@ describe("client.registerPublicationIntent", () => {
       [409, { error: "publication_intent_mismatch", reason: "publication_intent_mismatch" }, { status: 409, reason: "publication_intent_mismatch" }],
       [409, { error: "publication_enrollment_retired", reason: "publication_enrollment_retired" }, { status: 409, reason: "publication_enrollment_retired" }],
       [409, { disposition: "stale_claim" }, { status: 409, reason: "stale_claim" }],
+      [409, { error: "stale_claim" }, { status: 409, reason: "http_409" }],
+      [409, { disposition: "stale_claim_other" }, { status: 409, reason: "http_409" }],
       [400, { error: "publication_resume_unsupported", reason: "publication_resume_unsupported" }, { status: 400, reason: "publication_resume_unsupported" }],
       [400, { error: "publication_kind_unsupported", reason: "publication_kind_unsupported" }, { status: 400, reason: "publication_kind_unsupported" }],
       [400, { error: "invalid request body" }, { status: 400, reason: "http_400" }],

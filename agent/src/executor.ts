@@ -49,6 +49,54 @@ import { unmarkedSpawnEnv, type RecordedRoot } from "./worker-spawn-mark.js";
 
 const execFileAsync = promisify(execFile);
 
+/** A single exact-marker fixture wait, bounded to 180 seconds and the original abort signal. */
+export async function waitForStubOutboxCut(
+  runId: string,
+  signal: AbortSignal | undefined,
+  ready: () => void,
+): Promise<void> {
+  if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(runId))
+    throw new Error("invalid stub outbox barrier run id");
+  const name = `cdr-outbox-cut-${runId}`;
+  const file = path.join("/tmp", name);
+  try {
+    signal?.throwIfAborted();
+    await new Promise<void>((resolve, reject) => {
+      let done = false;
+      let watcher: ReturnType<typeof watch> | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (failed: boolean, error?: unknown) => {
+        if (done) return;
+        done = true;
+        watcher?.close();
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        if (failed) reject(error); else resolve();
+      };
+      const abort = () => finish(true, signal?.reason ?? new Error("stub outbox barrier aborted"));
+      const check = () => {
+        if (done) return;
+        void fs.access(file).then(() => finish(false), error => {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") finish(true, error);
+        });
+      };
+      try {
+        watcher = watch("/tmp", (_event, changed) => { if (changed === name) check(); });
+        watcher.on("error", error => finish(true, error));
+        timer = setTimeout(() => finish(true, new Error("stub outbox cut barrier timeout")), 180_000);
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) { abort(); return; }
+        check();
+        ready();
+      } catch (error) { finish(true, error); }
+    });
+    signal?.throwIfAborted();
+  } finally {
+    // Marker removal is best-effort and must not replace the original abort/failure.
+    await fs.unlink(file).catch(() => undefined);
+  }
+}
+
 /**
  * The resolution of an interactive-task follow-up park (PRD #517 M3). Returned by
  * `RunContext.awaitFollowUp`. Discriminated so the loop can tell "keep going with a new
@@ -1938,32 +1986,9 @@ export class StubExecutor implements Executor {
       if (firstClaimBarrier && (!Number.isSafeInteger(ctx.claimGeneration) || ctx.claimGeneration! < 1))
         throw new Error("invalid stub outbox barrier claim generation");
       if (cutBarrier || (firstClaimBarrier && ctx.claimGeneration === 1)) {
-        if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(ctx.runId))
-          throw new Error("invalid stub outbox barrier run id");
-        const name = `cdr-outbox-cut-${ctx.runId}`;
-        const file = path.join("/tmp", name);
-        await new Promise<void>((resolve, reject) => {
-          let done = false;
-          const finish = (error?: unknown) => {
-            if (done) return;
-            done = true;
-            watcher.close();
-            clearTimeout(timer);
-            ctx.signal?.removeEventListener("abort", abort);
-            if (error) reject(error); else resolve();
-          };
-          const abort = () => finish(ctx.signal?.reason ?? new Error("stub outbox barrier aborted"));
-          const check = () => { void fs.access(file).then(() => finish(), error => {
-            if ((error as NodeJS.ErrnoException).code !== "ENOENT") finish(error);
-          }); };
-          const watcher = watch("/tmp", (_event, changed) => { if (changed === name) check(); });
-          watcher.on("error", finish);
-          const timer = setTimeout(() => finish(new Error("stub outbox cut barrier timeout")), 180_000);
-          ctx.signal?.addEventListener("abort", abort, { once: true });
-          if (ctx.signal?.aborted) abort(); else check();
+        await waitForStubOutboxCut(ctx.runId, ctx.signal, () => {
           ctx.emit({ kind: "status", agent: "worker", payload: { text: "stub: outbox waiting for API cut" } });
         });
-        await fs.unlink(file).catch(() => undefined);
       }
       return;
     }
