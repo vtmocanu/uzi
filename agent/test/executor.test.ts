@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   StubExecutor,
+  waitForStubOutboxCut,
   STUB_INFLIGHT_SENTINEL,
   STUB_INTERLEAVE_SENTINEL,
   STUB_INTERLEAVE_STREAM,
@@ -634,5 +635,75 @@ describe("StubExecutor — provision dir cleanup (PRD #1809 M3)", () => {
     assert.equal(fs.existsSync(path.join(dataDir, "provision", runId)), process.platform !== "linux",
       "Linux removes the provision dir; unsupported platforms retain it");
     if (process.platform !== "linux") assert.ok(lines.some((line) => JSON.stringify(line).includes("provision dir cleanup failed")));
+  });
+});
+
+describe("shared stub outbox cut marker", () => {
+  const watchers = () => process.getActiveResourcesInfo().filter(r => r === "FSEventWrap" || r === "FSWatcher").length;
+  it("arms before readiness, ignores another marker, and consumes the exact marker", async () => {
+    const runId = randomUUID(), marker = `/tmp/cdr-outbox-cut-${runId}`, wrong = `/tmp/cdr-outbox-cut-${randomUUID()}`;
+    const before = watchers();
+    let settled = false;
+    const work = waitForStubOutboxCut(runId, undefined, () => {
+      assert.ok(watchers() > before, "watcher armed before readiness");
+      fs.writeFileSync(wrong, "cut");
+    }).then(() => { settled = true; });
+    try {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal(settled, false);
+      fs.writeFileSync(marker, "cut");
+      await work;
+      assert.equal(fs.existsSync(marker), false);
+    } finally { fs.rmSync(wrong, { force: true }); fs.rmSync(marker, { force: true }); }
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(watchers(), before);
+  });
+  it("accepts an already existing exact marker", async () => {
+    const runId = randomUUID(), marker = `/tmp/cdr-outbox-cut-${runId}`;
+    fs.writeFileSync(marker, "cut");
+    await waitForStubOutboxCut(runId, undefined, () => {});
+    assert.equal(fs.existsSync(marker), false);
+  });
+  for (const when of ["before", "during", "throw"] as const) {
+    it(`cleans up on ${when} with the original reason`, async () => {
+      const runId = randomUUID(), marker = `/tmp/cdr-outbox-cut-${runId}`;
+      const controller = new AbortController(), reason = new Error("original fixture reason");
+      const before = watchers();
+      const timersBefore = process.getActiveResourcesInfo().filter(r => r === "Timeout").length;
+      if (when === "before") { fs.writeFileSync(marker, "cut"); controller.abort(reason); }
+      await assert.rejects(waitForStubOutboxCut(runId, controller.signal, () => {
+        if (when === "throw") { fs.writeFileSync(marker, "cut"); throw reason; }
+        controller.abort(reason);
+      }), error => error === reason);
+      assert.equal(fs.existsSync(marker), false);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(watchers(), before);
+      assert.equal(process.getActiveResourcesInfo().filter(r => r === "Timeout").length, timersBefore);
+    });
+  }
+  it("does not replace the original abort when best-effort marker removal fails", async t => {
+    const original = new Error("original cancellation");
+    const controller = new AbortController();
+    controller.abort(original);
+    t.mock.method(fs.promises, "unlink", async () => {
+      throw Object.assign(new Error("marker removal denied"), { code: "EACCES" });
+    });
+    await assert.rejects(waitForStubOutboxCut(randomUUID(), controller.signal, () => {
+      assert.fail("aborted fixture must not announce readiness");
+    }), error => error === original);
+  });
+  it("expires at the unchanged fixture deadline and removes its timer and watcher", async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const clear = t.mock.method(globalThis, "clearTimeout");
+    const before = watchers();
+    const work = waitForStubOutboxCut(randomUUID(), undefined, () => {});
+    const rejection = assert.rejects(work, /stub outbox cut barrier timeout/);
+    t.mock.timers.tick(180_000);
+    await rejection;
+    assert.equal(clear.mock.calls.length, 1, "fixture timer explicitly cleared on expiry");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(watchers(), before);
+    // Advancing again must have no residual fixture callback or active watcher.
+    t.mock.timers.tick(180_000);
   });
 });

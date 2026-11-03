@@ -10,7 +10,7 @@ import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBoo
 import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { WorkerClient, RequestError } from "./client.js";
 import { GitCache, type GitCacheOptions } from "./git.js";
-import { StubExecutor } from "./executor.js";
+import { StubExecutor, waitForStubOutboxCut } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
 import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
 import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProductionCodexAdviceHarnessFactory } from "./codex/codex-executor.js";
@@ -72,6 +72,22 @@ export function buildWorkerGitCache(
     authority: authority.hooks,
     authorityRequired: true,
   });
+}
+
+/** The publication fixture is inert outside the stub lane and its exclusive sentinel. */
+export function buildAfterPublicationEnrolled(
+  executor: ExecutorKind,
+  log: Logger,
+): RunnerOptions["afterPublicationEnrolled"] {
+  if (executor !== "stub") return undefined;
+  return async ({ runId, claimGeneration, issueDescription, signal }) => {
+    if (!issueDescription.includes("UZI_STUB_OUTBOX_PUBLICATION_CUT_BARRIER")) return;
+    await waitForStubOutboxCut(runId, signal, () => {
+      log.info("stub: outbox publication enrolled waiting for API cut", {
+        run_id: runId, claim_generation: claimGeneration,
+      });
+    });
+  };
 }
 
 /** Only the stub lane may accelerate retry spacing. No predicates or pass cap change. */
@@ -696,6 +712,7 @@ async function main(): Promise<void> {
     // issue #3639: the guard timing the memory-receipt gate derives its sample wait from.
     ...(memoryGuardTiming ? { memoryGuardTiming } : {}),
     recoveryLiveTiming: buildRecoveryLiveTiming(config.executor, log),
+    afterPublicationEnrolled: buildAfterPublicationEnrolled(config.executor, log),
     pollMs: config.pollIntervalMs,
     onSourceRetained: () => notifyRetained?.(),
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
