@@ -351,7 +351,7 @@ func TestSemanticHeadlessOwnerDeferral(t *testing.T) {
 		{"m1 completed", valid, idsJSON(t, "m1"), true},
 		{"m1 undeclared", valid, idsJSON(t), false},
 		{"only deferred completed", valid, idsJSON(t, "m2"), false},
-		{"bad partition", &scopeBlock{In: []string{"m1"}}, idsJSON(t, "m1"), false},
+		{"bad partition", &scopeBlock{In: []string{"m1"}}, idsJSON(t, "m1", "m2"), false},
 		{"out revision zero", &scopeBlock{In: []string{"m1"}, Out: out(0)}, idsJSON(t, "m1"), false},
 		{"out revision above contract", &scopeBlock{In: []string{"m1"}, Out: out(3)}, idsJSON(t, "m1"), false},
 		{"empty in-scope", &scopeBlock{Out: []deferredEntry{
