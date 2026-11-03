@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { decodeCodeCoverage, type CodeCoverage } from "./code-cross-check-coverage.js";
 import { parseSemanticCandidate, SEMANTIC_ENVELOPE_MAX_BYTES } from "./semantic-plan.js";
-import type { ClaimPlanCrossCheck, ClaimCodeCrossCheck } from "./protocol.js";
+import type { ClaimPlanCrossCheck, ClaimCodeCrossCheck, ClaimOwnerSteering } from "./protocol.js";
 
 /** Cap on the repository-instructions text carried through a code cross-check; the same 64 KiB
  *  as REPO_INSTRUCTIONS_MAX_BYTES (repo-instructions.ts), restated here so this wire contract
@@ -116,6 +116,81 @@ function record(v: unknown): v is Record<string, unknown> {
 }
 function utf8(v: unknown): v is string {
   return typeof v === "string" && Buffer.from(v, "utf8").toString("utf8") === v;
+}
+/** Bytes the owner-steering field may add to a cross-check claim on the wire. Mirrors the server's
+ *  ownerSteeringWireMaxBytes (6 * 65536 snapshot bytes at worst-case JSON escaping, a 64 character
+ *  digest and the 57 byte wrapper); fixtures/cross-check-owner-steering/v1.json pins the value. */
+export const OWNER_STEERING_WIRE_MAX_BYTES = 6 * 65536 + 64 + 57;
+const OWNER_STEERING_SNAPSHOT_MAX_BYTES = 65536;
+/** The response header the server sets when a claim carries owner steering. */
+export const OWNER_STEERING_HEADER = "X-Uzi-Owner-Steering";
+
+export interface OwnerSteeringSnapshot {
+  version: 1;
+  cutoff_input_id: number;
+  owner_entries: Array<Record<string, unknown>>;
+  question_context: Array<Record<string, unknown>>;
+  omitted_entries: number;
+  overflow: boolean;
+  overflow_reason: string;
+}
+
+/** Strictly validate a v1 owner-steering snapshot text; throws on any deviation. */
+export function parseOwnerSteeringSnapshot(text: string): OwnerSteeringSnapshot {
+  const invalid = (): never => { throw new Error("invalid owner steering"); };
+  let v: unknown;
+  try { v = JSON.parse(text); } catch { return invalid(); }
+  const keys = (o: Record<string, unknown>, names: string) => Object.keys(o).sort().join(",") === names;
+  const int = (n: unknown) => Number.isSafeInteger(n) && (n as number) >= 0;
+  const str = (n: unknown) => utf8(n);
+  const nullableStr = (n: unknown) => n === null || utf8(n);
+  const rows = (a: unknown): Array<Record<string, unknown>> => {
+    if (!Array.isArray(a) || a.length > 64 || !a.every(record)) return invalid();
+    return a as Array<Record<string, unknown>>;
+  };
+  if (!record(v) || !keys(v, "cutoff_input_id,omitted_entries,overflow,overflow_reason,owner_entries,question_context,version")
+    || v.version !== 1 || !int(v.cutoff_input_id) || !int(v.omitted_entries) || typeof v.overflow !== "boolean"
+    || !["", "entry_cap", "byte_cap"].includes(v.overflow_reason as string)) return invalid();
+  const entries = rows(v.owner_entries);
+  const context = rows(v.question_context);
+  for (const e of entries) {
+    if (!int(e.input_id) || typeof e.truncated !== "boolean") return invalid();
+    if (e.kind === "answer") {
+      if (!keys(e, "answers,answers_status,input_id,kind,question_id,truncated") || !str(e.question_id)
+        || !["ok", "unparseable", "malformed", "oversized"].includes(e.answers_status as string)
+        || !(e.answers === null || (Array.isArray(e.answers) && e.answers.length <= 64 && e.answers.every(str)))) return invalid();
+    } else if (e.kind === "revise") {
+      if (!keys(e, "feedback,gate_binding,gate_revision,input_id,kind,truncated")
+        || !(e.gate_binding === null || e.gate_binding === "bound" || e.gate_binding === "unbound")
+        || !(e.gate_revision === null || int(e.gate_revision)) || !nullableStr(e.feedback)) return invalid();
+    } else return invalid();
+  }
+  for (const c of context) {
+    if (!int(c.answer_input_id) || !str(c.question_id)) return invalid();
+    if (c.status === "bound") {
+      if (!keys(c, "answer_input_id,author,question_id,questions,status,truncated") || !["lead", "worker"].includes(c.author as string)
+        || typeof c.truncated !== "boolean" || !Array.isArray(c.questions) || c.questions.length > 64
+        || !c.questions.every((q: unknown) => record(q) && keys(q, "header,multi_select,options,question")
+          && str(q.header) && str(q.question) && typeof q.multi_select === "boolean"
+          && Array.isArray(q.options) && q.options.length <= 64 && q.options.every(str))) return invalid();
+    } else if (!keys(c, "answer_input_id,question_id,status") || !["unavailable", "ambiguous", "malformed", "oversized"].includes(c.status as string)) {
+      return invalid();
+    }
+  }
+  return v as unknown as OwnerSteeringSnapshot;
+}
+
+/** Validate the optional owner-steering sibling of a cross-check claim. Present only on a plan
+ *  stage claim; the snapshot is bounded, its digest is the lowercase hex sha256 of its exact text
+ *  and it must be a well-formed v1 snapshot. Returns undefined when the field is absent. */
+export function decodeOwnerSteering(v: unknown, stage: unknown): ClaimOwnerSteering | undefined {
+  if (v === undefined) return undefined;
+  const invalid = (): never => { throw new Error("invalid owner steering"); };
+  if (stage !== "plan" || !record(v) || Object.keys(v).sort().join(",") !== "digest,snapshot"
+    || !utf8(v.snapshot) || Buffer.byteLength(v.snapshot) > OWNER_STEERING_SNAPSHOT_MAX_BYTES
+    || typeof v.digest !== "string" || !/^[a-f0-9]{64}$/.test(v.digest) || v.digest !== sha256Hex(v.snapshot)) return invalid();
+  parseOwnerSteeringSnapshot(v.snapshot);
+  return { snapshot: v.snapshot, digest: v.digest };
 }
 /** Stage-discriminated wire validation shared by the production claim client and runner. */
 export function decodeCrossCheckClaim(v: unknown): ClaimPlanCrossCheck | ClaimCodeCrossCheck {
