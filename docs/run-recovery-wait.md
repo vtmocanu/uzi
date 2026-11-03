@@ -514,23 +514,73 @@ file is `publication-<G>.json` in the worker outbox, sealed with an HMAC
 (domain `uzi.outbox.publication.v1`), and carries neither credentials nor
 filesystem paths. The intent is at most 64 KiB; the sealed local record,
 which adds the sequence numbers and the MAC, may be up to 1 KiB larger. The server copy lives in a side table,
-`run_publication_resume`. Only an acknowledged enrollment lets the remote
-steps run:
+`run_publication_resume`. Enrollment outcomes control whether remote finalize
+steps may run:
 
 - **Known not enrolled** (for example no outbox, an oversized record, or a
   server without the feature): ordinary finalize runs, with the diagnostic
   `publication_resume_unavailable` and no resume guarantee.
-- **Uncertain, or already enrolled**: no external attempt is made and the
-  work is retained until the record is reconciled.
+- **Initial enrollment ACK unknown**: the original live flight stays pending
+  at claim generation G, keeping its ordinary active-run snapshot entry and
+  durable intent. After the short enrollment retries, it waits with backoff
+  and probes authenticated ownership. This applies to a sequence-less record
+  with `ack_unknown`, or a typed HTTP 409 `disposition: stale_claim`; a
+  reason string alone does not qualify.
+- **Already enrolled**: the worker reconciles that exact enrollment and
+  candidate before continuing; it does not blindly replay or replace them.
+- **Other uncertainty**: conflicts, arbitrary server disagreements and a
+  failure to persist the ACK locally (`ack_not_recorded`) keep the
+  conservative retain outcome, without entering the initial-enrollment wait.
 - A **transformed candidate** (base alignment, bridge) is saved and
-  acknowledged before its push.
+  acknowledged before its push. An uncertain candidate update keeps its
+  conservative handling; it does not enter the initial-enrollment wait.
 
-The worker advertises `publication_resume_v1` and lists enrolled runs under
-`publication_resume` in its register snapshot. Those runs are withheld from
-the one-shot finalize-resume allowance ([ADR-1742](../adr/1742-finalize-resume-allowance.md))
-and take the ordinary orphan requeue, which keeps the intent. The intent
-stays active across automatic parks, owner pause or resume and requeues. It
-is completed on completion and retired on terminal failure, on cancel, and
+During the initial-enrollment wait, a fresh ownership response must say
+`running`, `claim_generation = G` and explicitly `claim_released = false`
+before one retry of the exact durable intent body. A `queued` response at
+that same G with the claim explicitly unreleased waits for ordinary heartbeat
+re-adoption ([ADR-1390](../adr/1390-outage-requeue-readoption.md)); it permits
+no resend. Unavailable or incomplete ownership evidence also permits no
+resend. A later unknown ACK or typed stale-claim response requires another
+backoff and fresh ownership check. The worker does not rerun the executor or
+models. While enrollment remains uncertain, it makes no remote finalize
+attempt and reports neither a terminal outcome nor a recovery park. After a
+matching ACK is recorded locally, publication continues through the
+applicable guards before forge steps.
+
+The worker log line is `publication intent reconciliation waiting`, with
+`run_id`, `claim_generation` (G) and one of two closed reasons:
+
+- `ack_unknown`: the enrollment ACK or the required ownership evidence is
+  still uncertain.
+- `readoption_pending`: ownership is queued at the same G and explicitly
+  unreleased, so the live flight is waiting for re-adoption.
+
+The line is emitted when the waiting reason changes, rather than on each
+probe. Cancellation, worker shutdown, the original finalize deadline or
+flight abort stop the wait through the existing interruption handling,
+retaining the source and session. Ownership loss (404, a changed generation,
+a released claim or a terminal run) also stops the flight without publishing.
+The wait does not extend the deadline or grant another execution budget.
+This is live-flight recovery (#3833); it does not promise recovery after
+SIGKILL, shutdown or deadline expiry. The lost-flight residual remains
+tracked separately in #3834.
+
+Coverage residual: **feature-on terminal-send loss after enrollment ACK
+remains unproved**. Feature-off terminal replay and feature-on case 3's
+normal ordering do not establish that coverage. Hosted acceptance cases are
+not claimed as executed here.
+
+The worker advertises `publication_resume_v1` and lists acknowledged
+enrollments under `publication_resume` in its register snapshot. A local
+publication record or detected publication file withholds the run from
+`finalize_resume`, even without an ACK or successful authentication. An
+unlistable run directory is not detected by that file check. The one-shot
+finalize-resume allowance ([ADR-1742](../adr/1742-finalize-resume-allowance.md))
+is unchanged; withheld runs take the ordinary orphan requeue, which keeps
+the intent. The intent stays active across automatic parks, owner pause or
+resume and requeues. It is completed on completion and retired on terminal
+failure, on cancel, and
 on the owner's completion-hold `--continue`.
 
 ### Publication park
