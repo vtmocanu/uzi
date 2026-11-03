@@ -1076,6 +1076,48 @@ for (const exit of ["404", "generation", "released", "terminal", "cancel", "shut
   });
 }
 
+for (const status of [400, 401, 403, 404, 405, 409, 410, 422]) {
+  it(`permanent ownership HTTP ${status} stops enrollment reconciliation without a resend`, async () => {
+    client.protocolFeatures = FEATURES;
+    const outbox = await mkOutbox();
+    const claim = claimFor(5154), flight = reconciliationFlight(claim.run_id);
+    api.publicationIntentWire = () => "drop";
+    const runner = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+    let probes = 0;
+    (runner as unknown as { getObservedRunOwnership: () => Promise<unknown> }).getObservedRunOwnership = async () => {
+      // A second 404 bounds the unfixed path so red is an assertion, not a timeout.
+      throw new RequestError("GET", "/ownership", ++probes === 1 ? status : 404, "");
+    };
+    await assert.rejects((runner as unknown as EnrollSeam).enrollPublication(claim, flight,
+      intentInput(false, "agent/issue-5154")), StaleClaimError);
+    assert.equal(probes, 1, "a permanent ownership refusal must end the original flight");
+    assert.equal(api.publicationIntentRequests.length, 3, "no enrollment resend without ownership");
+    assert.equal(flight.completionHoldOutcome, "none", "existing stale-claim dispatch remains reachable");
+    assert.equal(outbox.hasPublicationRecords(claim.run_id), true, "uncertain intent remains protected");
+  });
+}
+
+for (const status of [408, 429, 500, 503]) {
+  it(`retryable ownership HTTP ${status} waits for fresh proof before resending enrollment`, async () => {
+    client.protocolFeatures = FEATURES;
+    const outbox = await mkOutbox();
+    const claim = claimFor(5155), flight = reconciliationFlight(claim.run_id);
+    api.publicationIntentWire = () => api.publicationIntentRequests.length <= 3 ? "drop"
+      : { status: 200, body: { enrollment_seq: 1, candidate_seq: 1, state: "active" } };
+    const runner = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+    let probes = 0;
+    (runner as unknown as { getObservedRunOwnership: () => Promise<unknown> }).getObservedRunOwnership = async () => {
+      if (++probes === 1) throw new RequestError("GET", "/ownership", status, "");
+      return { status: "running", claim_generation: GEN, claim_released: false };
+    };
+    assert.equal(await (runner as unknown as EnrollSeam).enrollPublication(claim, flight,
+      intentInput(false, "agent/issue-5155")), "proceed");
+    assert.equal(probes, 2);
+    assert.equal(api.publicationIntentRequests.length, 4, "only fresh running proof permits the later POST");
+    assert.equal(flight.completionHoldOutcome, "none");
+  });
+}
+
 it("exact stale_claim retries once per fresh running probe and stops when ownership changes after unknown resend", async () => {
   client.protocolFeatures = FEATURES;
   const outbox = await mkOutbox();

@@ -561,6 +561,8 @@ probe. Cancellation, worker shutdown, the original finalize deadline or
 flight abort stop the wait through the existing interruption handling,
 retaining the source and session. Ownership loss (404, a changed generation,
 a released claim or a terminal run) also stops the flight without publishing.
+Other definitive ownership-read HTTP 4xx refusals stop conservatively too;
+408 and 429 remain retryable, as do transport failures and 5xx responses.
 The wait does not extend the deadline or grant another execution budget.
 This is live-flight recovery (#3833); it does not promise recovery after
 SIGKILL, shutdown or deadline expiry. The lost-flight residual remains

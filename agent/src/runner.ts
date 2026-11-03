@@ -8688,7 +8688,8 @@ export class RunRunner {
             own = await this.getObservedRunOwnership(flight, signal);
           } catch (error) {
             interrupted();
-            if (error instanceof RequestError && error.status === 404) return stop();
+            if (error instanceof RequestError && error.status >= 400 && error.status < 500 &&
+                error.status !== 408 && error.status !== 429) return stop();
             waiting("ack_unknown");
             continue;
           }
