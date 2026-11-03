@@ -196,14 +196,33 @@ func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.
 	if err != nil {
 		return err
 	}
+	var steering *ClaimOwnerSteering
+	if cc.Stage == "plan" {
+		// Issue #3841: a round frozen with owner steering delivers those exact bytes. No row is a
+		// legacy round and carries no field; a row that fails its size, UTF-8 or digest check
+		// refuses the claim rather than deliver altered steering.
+		row, e := q.GetOwnerSteering(ctx, cc.ID)
+		if e != nil && !errors.Is(e, pgx.ErrNoRows) {
+			return e
+		}
+		if e == nil {
+			steering = &ClaimOwnerSteering{Snapshot: row.Snapshot, Digest: hex.EncodeToString(row.Digest)}
+			if verifyOwnerSteering(steering) != nil {
+				return ErrCrossCheckRefused
+			}
+		}
+	}
 	payload.CrossCheck = input
+	payload.CrossCheckOwnerSteering = steering
 	if _, err := MarshalCrossCheckClaim(payload); err != nil {
 		payload.CrossCheck = nil
+		payload.CrossCheckOwnerSteering = nil
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
 	payload.CrossCheck = input
+	payload.CrossCheckOwnerSteering = steering
 	return nil
 }

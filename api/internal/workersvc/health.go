@@ -259,6 +259,10 @@ const (
 	// and a semantic-enrolled lead needs completion_semantic_publication_v1; both are ClaimRun
 	// clauses outside required_capabilities. A checker with no capable worker stays unclaimable until
 	// its deadline, then takes the existing deadline-to-human path (never a structural fallback).
+	// reasonNoOwnerSteeringCapableWorker (issue #3841) is emitted for a queued plan-stage checker child
+	// whose round froze an owner-steering snapshot while the owner has no online worker advertising
+	// cross_check_owner_steering_v1, the hard ClaimRun clause the child carries.
+	reasonNoOwnerSteeringCapableWorker       = "Plan cross-check is waiting: no online worker supports owner-steering checks (cross_check_owner_steering_v1). Workers pick it up when they next roll while idle; until one does, the check falls back to the human plan gate at its deadline."
 	reasonNoSemanticPlanCheckerCapableWorker = "no online worker supports semantic plan cross-check (cross_check_semantic_plan_v1); update or provision a capable worker"
 	reasonNoSemanticPublicationCapableWorker = "no online worker supports semantic completion publication (completion_semantic_publication_v1); update or provision a capable worker"
 	// reasonWaitingIsolatedLane (PRD #1906 M5) is the queued reason for a PROFILE-BOUND run: only
@@ -1516,6 +1520,8 @@ func (s *Service) queuedReasonWithEligibility(ctx context.Context, now time.Time
 			slog.Error("health: read semantic enrollment", "run_id", r.ID, "error", serr)
 		} else if sem.PlanCheckerEnrolled && sem.PlanCheckerCapable == 0 {
 			return reasonNoSemanticPlanCheckerCapableWorker
+		} else if sem.OwnerSteeringEnrolled && sem.OwnerSteeringCapable == 0 {
+			return reasonNoOwnerSteeringCapableWorker
 		} else if sem.LeadEnrolled && r.Kind != runkind.CrossCheck && sem.PublicationCapable == 0 {
 			return reasonNoSemanticPublicationCapableWorker
 		}
