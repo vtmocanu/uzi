@@ -93,6 +93,10 @@ export interface SdkEnv {
  *                   sidecar is wired.
  * @param attempt    issue #1783 (R2): the execution attempt marker (see
  *                   {@link SdkAttemptEnv}). Undefined ⇒ no marker keys are emitted.
+ * @param goWorkDir  issue #3870: the managed Go work dir (`RunContext.managedGoWorkDir`).
+ *                   Set as GOTMPDIR AFTER the toolEnv fold and the Go concurrency env, so
+ *                   a provisioned GOTMPDIR cannot override it. Undefined ⇒ no key from
+ *                   this parameter (a provisioned GOTMPDIR behaves as before).
  */
 export function buildSdkEnv(
   oauthToken: string,
@@ -100,6 +104,7 @@ export function buildSdkEnv(
   toolEnv: Record<string, string> = {},
   dockerHost?: string,
   attempt?: SdkAttemptEnv,
+  goWorkDir?: string,
 ): SdkEnv {
   const env: SdkEnv = {
     CLAUDE_CODE_OAUTH_TOKEN: oauthToken,
@@ -148,6 +153,8 @@ export function buildSdkEnv(
   // GOMAXPROCS=N). Worker-set, applied AFTER the fold so a provisioned var cannot
   // override them; absent settings add no key at all. Not protected keys.
   Object.assign(env, goConcurrencyEnv());
+  // Issue #3870: the managed Go work dir, last among the Go keys so nothing provisioned wins.
+  if (goWorkDir) env.GOTMPDIR = goWorkDir;
   // DOCKER_HOST is worker-set (not agent-set) and NOT in PROTECTED_ENV_KEYS: the
   // provision allowlist never emits it, so the fold above cannot carry it. Set it AFTER
   // the fold so a provisioned var can never clobber the worker's wired endpoint.
@@ -196,6 +203,7 @@ export function buildCheckEnv(
   source: NodeJS.ProcessEnv,
   homeDir: string,
   toolEnv?: Record<string, string>,
+  goWorkDir?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     // The RUNNER PATH (PRD #51 M4): the provisioned toolchain PATH when present, else
@@ -220,6 +228,8 @@ export function buildCheckEnv(
   }
   // Issue #3382: the worker's optional Go build concurrency defaults reach checks too.
   Object.assign(env, goConcurrencyEnv());
+  // Issue #3870: the managed Go work dir (absent ⇒ no key; buildCheckEnv never carries a provisioned one).
+  if (goWorkDir) env.GOTMPDIR = goWorkDir;
   return env;
 }
 
