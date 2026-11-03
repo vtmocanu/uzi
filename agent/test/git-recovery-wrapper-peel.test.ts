@@ -99,14 +99,19 @@ function rawCommit(parent: string, msg: Buffer, tree = sha(`${parent}^{tree}`)):
   }).trim();
 }
 /** Assert a refused successor: nothing written, no clone, source untouched. */
-async function assertRefused(attempts: number, attempt: string, reason?: string): Promise<void> {
+async function assertRefused(attempts: number, attempt: string, reason?: string,
+  expected?: { original?: unknown; message?: string }): Promise<void> {
   const head = sha("HEAD", source.clonePath);
   const before = journal();
   const ledgerBefore = ledger();
+  const refs = git(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+  const predecessor = git(source.clonePath, ["status", "--porcelain=v1", "--untracked-files=all"]);
+  const tree = sha("HEAD^{tree}", source.clonePath);
   await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, attempts, attempt),
     error => {
       assert.ok(error instanceof Error);
-      assert.equal(error.message, "successor recovery verification failed");
+      assert.equal(error.message, expected?.message ?? "successor recovery verification failed");
+      if (expected && "original" in expected) assert.equal(error, expected.original);
       if (reason) assert.deepEqual(formatRetainedRecoveryDiagnostic(error, s => s), {
         diagnostic_stage: "successor", diagnostic_code: "retained_successor_" + reason, cause: "",
       });
@@ -118,6 +123,9 @@ async function assertRefused(attempts: number, attempt: string, reason?: string)
   assert.ok(!ledger().includes(attempt));
   assert.ok(!fs.readdirSync(path.dirname(source.clonePath)).some(n => n.includes(attempt)), "no successor clone dir");
   assert.equal(sha("HEAD", source.clonePath), head, "the source clone is unchanged");
+  assert.equal(sha("HEAD^{tree}", source.clonePath), tree);
+  assert.equal(git(source.clonePath, ["status", "--porcelain=v1", "--untracked-files=all"]), predecessor);
+  assert.equal(git(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]), refs, "all refs survive refusal");
 }
 
 beforeEach(async () => {
@@ -188,6 +196,8 @@ test("issue #3239 (d): a genuine wrapper over a clean milestone adopts the sourc
   const c = (await genuine([t], t)).sha;
   await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, t);
   const pins = git(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+  const owed = await cache.enumerateOwedCandidates(bare, runId);
+  assert.ok(owed.some(candidate => candidate.sha === t), "the unpublished milestone is owed before preparation");
   const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2));
   assert.equal(successor.adoptedSource, c);
   assert.equal(successor.adoptedContentSource, t);
@@ -211,6 +221,24 @@ test("issue #3239 (d): a genuine wrapper over a clean milestone adopts the sourc
   const history = git(fx.originPath, ["rev-list", published]).split("\n");
   assert.ok(history.includes(t), "the published work descends from the source");
   assert.ok(!history.includes(c), "the recovery wrapper stays out of published ancestry");
+
+  // Adoption alone kept every pin. A separate real remote confirmation now
+  // authorizes the existing owed-candidate reconciler, not archive/custody release.
+  const confirmed = git(successor.path, ["ls-remote", "--exit-code", fx.originPath, published]).split(/\s+/)[0];
+  assert.ok(confirmed);
+  assert.equal(confirmed, sha("HEAD", successor.path));
+  // Import the independently observed published object so ancestry can be proved locally.
+  git(bare, ["fetch", "--no-tags", fx.originPath, published]);
+  const reconciled = await cache.reconcileOwedCandidates(bare, runId, confirmed);
+  assert.deepEqual(reconciled.removedShas.sort(), owed.map(candidate => candidate.sha).sort());
+  assert.deepEqual(reconciled.retainedShas, []);
+  assert.deepEqual(await cache.enumerateOwedCandidates(bare, runId), []);
+  const envelopePins = pins.split("\n").filter(line => line.endsWith(" " + c));
+  assert.ok(envelopePins.length >= 2, "coverage and episode pins are independent of owed settlement");
+  for (const line of envelopePins) assert.equal(sha(line.split(" ")[0]!), c);
+  assert.equal(journal().recovery.restoreTip, c);
+  assert.equal(journal().recovery.restoreSource, t);
+  assert.equal(sha("HEAD", source.clonePath), t, "owed reconciliation grants no predecessor deletion");
 });
 
 /** Episode 1 peels M1 into the attempt A2, whose own WIP marker M2 sits on M1's parent. */
@@ -472,10 +500,7 @@ for (const [name, options] of [
     const s = sha("HEAD", source.clonePath);
     const wrapper = lookalike(s, options);
     await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, wrapper, s);
-    const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2));
-    assert.equal(sha("HEAD", successor.path), wrapper);
-    assert.equal(successor.adoptedSource, wrapper);
-    assert.equal(successor.adoptedContentSource, s);
+    await assertOrdinaryAdoption(r.attempts, wrapper, s, wrapper);
   });
 }
 
@@ -513,6 +538,192 @@ for (const seam of ["pin", "tree", "commit", "ancestry", "source"] as const) {
     await assertRefused(r.attempts, aid(2), seam === "pin" ? "wrapper_pin_read"
       : seam === "tree" ? "wrapper_source_tree" : seam === "commit" ? "wrapper_commit_read"
       : seam === "source" ? "wrapper_source_missing" : "wrapper_lineage_ancestry");
+    assert.equal(reached, true);
+  });
+}
+
+
+// Ordinary eligibility is narrower than marker-free shape recognition: only a complete,
+// source-bound proof may remove W. These fixtures exercise prepareRecoverySuccessor.
+async function ordinaryCapture(record = true) {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const s = sha("HEAD", source.clonePath);
+  const coverage = await genuine([s], s);
+  if (record) await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, coverage.sha, s);
+  return { r, s, ...coverage };
+}
+async function assertOrdinaryAdoption(attempts: number, wrapper: string, content: string, expectedHead: string) {
+  const refs = git(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+  const frozen = await cache.enumerateOwedCandidates(bare, runId);
+  const before = journal().recovery;
+  const predecessor = sha("HEAD", source.clonePath);
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, attempts, aid(2));
+  assert.equal(sha("HEAD", successor.path), expectedHead);
+  assert.equal(successor.baseCommit, expectedHead);
+  assert.equal(successor.adoptedSource, wrapper);
+  assert.equal(successor.adoptedContentSource, content);
+  assert.equal(git(successor.path, ["status", "--porcelain"]), "");
+  assert.equal(git(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]), refs);
+  assert.deepEqual(await cache.enumerateOwedCandidates(bare, runId), frozen, "frozen roots survive preparation");
+  assert.equal(journal().recovery.restoreTip, before.restoreTip);
+  assert.equal(journal().recovery.restoreSource, before.restoreSource);
+  assert.equal(sha("HEAD", source.clonePath), predecessor);
+}
+
+for (const damage of ["committer", "tree", "malformed", "foreign pin", "different wrapper pin"] as const) {
+  test("M2 ordinary definite ineligibility retains W: " + damage, async () => {
+    const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+    const s = sha("HEAD", source.clonePath);
+    const wrapper = damage === "malformed" ? sibling(s, "uzi recovery coverage malformed")
+      : lookalike(s, { pin: damage !== "foreign pin" && damage !== "different wrapper pin",
+        ...(damage === "committer" ? { committer: "foreign" } : {}),
+        ...(damage === "tree" ? { tree: git(bare, ["mktree"], {}, "") } : {}) });
+    const fp = createHash("sha256").update(JSON.stringify({ roots: [s], currentSha: s, tree: sha(s + "^{tree}") })).digest("hex");
+    if (damage === "foreign pin") git(bare, ["update-ref", `refs/uzi-coverage/other-run/1/${fp}`, wrapper]);
+    if (damage === "different wrapper pin") {
+      const other = lookalike(s, { pin: false, committer: "other" });
+      assert.notEqual(other, wrapper);
+      git(bare, ["update-ref", `refs/uzi-coverage/${runId}/1/${fp}`, other]);
+    }
+    await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, wrapper, s);
+    await assertOrdinaryAdoption(r.attempts, wrapper, s, wrapper);
+  });
+}
+
+test("M2 ordinary changed episode pin refuses before effects", async () => {
+  const { r, s, sha: wrapper } = await ordinaryCapture();
+  git(bare, ["update-ref", `refs/uzi-recovery-episode/${runId}/${wrapper}`, s]);
+  await assertRefused(r.attempts, aid(2), "episode_pin_changed", { message: "recovery pin changed" });
+});
+
+for (const missing of ["source", "inner aggregate"] as const) {
+  test("M2 ordinary actual missing object refuses: " + missing, async () => {
+    const { r, s, sha: wrapper } = await ordinaryCapture(false);
+    const tip = missing === "source" ? wrapper : lookalike(wrapper, { pin: false });
+    if (missing === "inner aggregate") await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, tip, s);
+    // Synthetic coverage commits are loose and owned by this fixture.
+    const absent = missing === "source" ? s : wrapper;
+    const object = path.join(bare, "objects", absent.slice(0, 2), absent.slice(2));
+    if (missing === "source") {
+      // The initial source may be packed: create a distinct loose source before removing it.
+      const loose = sibling(s, "missing ordinary source");
+      const c = lookalike(loose, { pin: true });
+      await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, loose);
+      fs.unlinkSync(path.join(bare, "objects", loose.slice(0, 2), loose.slice(2)));
+    } else fs.unlinkSync(object);
+    // git log resolves the parent while reading the tip subject, so real missing
+    // objects refuse earlier than an injected bounded-read failure.
+    await assertRefused(r.attempts, aid(2), "wrapper_tip_subject");
+  });
+}
+
+for (const shape of ["common", "different", "aggregate source"] as const) {
+  test("M2 ordinary nested aggregate proof: " + shape, async () => {
+    const { r, s, sha: inner, fingerprint } = await ordinaryCapture(false);
+    const outer = lookalike(inner, { pin: true, fp: shape === "different" ? "0".repeat(64) : fingerprint });
+    const binding = shape === "aggregate source" ? inner : s;
+    await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, outer, binding);
+    await assertOrdinaryAdoption(r.attempts, outer, binding, shape === "common" ? s : outer);
+  });
+}
+
+for (const bound of ["aggregate", "lookalike", "leaf", "walk", "object", "inner object"] as const) {
+  test("M2 ordinary graph limits refuse before fallback: " + bound, async () => {
+    const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+    let s = sha("HEAD", source.clonePath);
+    if (bound === "leaf" || bound === "walk") {
+      for (let i = 0; i < 74; i++) s = sibling(s, `ordinary ancestor ${i}`);
+    }
+    let tip = s;
+    if (bound === "aggregate" || bound === "lookalike") {
+      for (let i = 0; i < 9; i++) tip = bound === "aggregate"
+        ? lookalike(tip, { pin: false }) : sibling(tip, `uzi recovery coverage malformed ${i}`);
+    } else if (bound === "leaf" || bound === "walk") {
+      // Every leaf is an ancestor of S, so the limit is the only reason to refuse.
+      const leaves = [s];
+      let parent = s;
+      const count = bound === "leaf" ? 67 : 74;
+      for (let i = 1; i < count; i++) {
+        parent = sha(parent + "^");
+        leaves.push(parent);
+      }
+      tip = git(bare, [...IDENT, "commit-tree", s + "^{tree}", ...leaves.flatMap(p => ["-p", p]),
+        "-m", `uzi recovery coverage ${"0".repeat(64)} round 0 batch 0`]);
+    } else {
+      tip = rawCommit(s, Buffer.from("uzi recovery coverage oversized\n" + "x".repeat(65536)));
+      if (bound === "inner object") tip = lookalike(tip, { pin: false });
+    }
+    await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, tip, s);
+    await assertRefused(r.attempts, aid(2), bound === "object" ? "wrapper_tip_bound"
+      : bound === "inner object" ? "wrapper_coverage_leaf_bound" : `wrapper_${bound}_bound`);
+  });
+}
+
+for (const property of ["checkpointBoundary", "name", "ordinary"] as const) {
+  test("M2 ordinary pin read preserves thrown identity: " + property, async t => {
+    const { r } = await ordinaryCapture();
+    const original = new Error("ordinary pin read failed");
+    if (property !== "ordinary") Object.defineProperty(original, property, {
+      get() { throw new Error("hostile classification getter"); },
+    });
+    const run = (cache as any).runGit.bind(cache);
+    let reached = false;
+    t.mock.method(cache as any, "runGit", async (dir: string, args: string[], ...rest: unknown[]) => {
+      if (args.includes(`refs/uzi-coverage/${runId}/`)) { reached = true; throw original; }
+      return run(dir, args, ...rest);
+    });
+    await assertRefused(r.attempts, aid(2), property === "ordinary" ? "wrapper_pin_read" : undefined,
+      { original, message: original.message });
+    assert.equal(reached, true);
+  });
+}
+
+
+
+test("M2 ordinary divergent real work refuses and retains its objects", async () => {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const s = sha("HEAD", source.clonePath);
+  const blob = git(bare, ["hash-object", "-w", "--stdin"], {}, "retained divergent work\n");
+  const entries = git(bare, ["ls-tree", s + "^{tree}"]);
+  const tree = git(bare, ["mktree"], {}, entries + "\n100644 blob " + blob + "\tdivergent.txt\n");
+  const divergent = git(bare, [...IDENT, "commit-tree", tree, "-p", s, "-m", "real work outside source ancestry"]);
+  const wrapper = (await genuine([s, divergent], s)).sha;
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, wrapper, s);
+  await assertRefused(r.attempts, aid(2), "wrapper_lineage_marker");
+  assert.equal(git(bare, ["show", divergent + ":divergent.txt"]), "retained divergent work");
+  git(bare, ["merge-base", "--is-ancestor", divergent, wrapper]);
+});
+
+test("M2 ordinary stale capture binding refuses before effects", async () => {
+  const { r, s, sha: wrapper } = await ordinaryCapture(false);
+  const stale = sibling(s, "uncovered later source");
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, wrapper, stale);
+  assert.equal(journal().recovery.restoreSource, undefined, "capture rejects an uncovered source association");
+  await assertRefused(r.attempts, aid(2), "wrapper_source_missing");
+});
+
+test("M2 ordinary eight common-fingerprint aggregates still select S", async () => {
+  const { r, s, sha: inner, fingerprint } = await ordinaryCapture(false);
+  let tip = inner;
+  for (let i = 1; i < 8; i++) tip = lookalike(tip, { pin: true, fp: fingerprint });
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, tip, s);
+  await assertOrdinaryAdoption(r.attempts, tip, s, s);
+});
+
+for (const subject of ["tip", "source", "leaf"] as const) {
+  test("M2 ordinary subject read uncertainty refuses: " + subject, async t => {
+    const { r, s, sha: wrapper } = await ordinaryCapture();
+    const run = (cache as any).runGit.bind(cache);
+    let sourceReads = 0, reached = false;
+    t.mock.method(cache as any, "runGit", async (dir: string, args: string[], ...rest: unknown[]) => {
+      const isSubject = args.includes("--format=%s");
+      if (isSubject && args.includes(s + "^{commit}")) sourceReads++;
+      const hit = isSubject && (subject === "tip" ? args.includes(wrapper + "^{commit}")
+        : args.includes(s + "^{commit}") && (subject === "source" || sourceReads === 2));
+      if (hit) { reached = true; throw new Error("ordinary subject read failed"); }
+      return run(dir, args, ...rest);
+    });
+    await assertRefused(r.attempts, aid(2), `wrapper_${subject}_subject`);
     assert.equal(reached, true);
   });
 }
