@@ -389,7 +389,7 @@ describe("code cross-check verification caveats", () => {
 });
 
 const ZW = "\u200B";
-const HEAD ="e4020cc0123456789abcdef0123456789abcdef0";
+const HEAD = "e4020cc0123456789abcdef0123456789abcdef0";
 const SIZE = "**Size:** code +3 \u22121 \u00b7 1 file";
 
 // ── Minting REAL SanitizedPrDescriptionFields instances ────────────────────────────────────

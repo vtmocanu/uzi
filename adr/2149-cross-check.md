@@ -340,7 +340,11 @@ lost on reclaim; the dormant semantic human-gate path drops it when it drops
 approving findings, old checkers supply no new coverage account, and new leads
 render received findings. These are instruction and delivery contracts, not
 behavioral convergence guarantees. Code-stage revision prompt bytes stay
-unchanged.
+unchanged. Later amendment (2026-11-03, #3832): the Code repair prompt appends
+a batching clarification (one list call, one entry per original finding ID);
+per-ID dispositions, the dispositions tool and the Plan stage are unchanged,
+and the PR section groups `Coverage uncertainty:` findings as verification
+caveats.
 
 Instruction-contract tests and captured provider requests verify guidance and
 both-executor delivery; they do not prove model behavior. Fixed-nonce goldens
