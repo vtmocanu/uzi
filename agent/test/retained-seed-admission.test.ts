@@ -267,6 +267,80 @@ describe("measureRetainedSeedFootprint", () => {
     );
   });
 
+  it("a directory close error without a code still throws", async () => {
+    const clone = tree();
+    const g = cache();
+    await assert.rejects(
+      withNestedHandle(
+        h => { h.close = (async () => { throw new Error("close no code"); }) as typeof h.close; },
+        () => g.measureRetainedSeedFootprint(clone, { includeGitObjects: true, deadline: far() }),
+      ),
+      /close no code/,
+    );
+  });
+
+  it("a failed directory walk is not turned into a partial by a coded close error", async () => {
+    const clone = tree();
+    const g = cache();
+    await assert.rejects(
+      withNestedHandle(
+        h => {
+          h.read = (async () => { throw new Error("walk no code"); }) as typeof h.read;
+          h.close = (async () => { throw Object.assign(new Error("io"), { code: "EIO" }); }) as typeof h.close;
+        },
+        () => g.measureRetainedSeedFootprint(clone, { includeGitObjects: true, deadline: far() }),
+      ),
+    );
+  });
+
+  it("a coded close error does not mask a recovery interruption", async () => {
+    const clone = tree();
+    const g = cache();
+    const ac = new AbortController();
+    // withRecoveryOperation re-checks for an interruption after its action returns, so a swallowed
+    // interruption would still reject there; observe the measurement's own outcome inside it.
+    let inner: "returned" | "threw" | undefined;
+    await assert.rejects(
+      g.withRecoveryOperation(ac.signal, Infinity, async () => {
+        try {
+          await withNestedHandle(
+            h => {
+              h.close = (async () => {
+                ac.abort(new Error("stop"));
+                throw Object.assign(new Error("io"), { code: "EIO" });
+              }) as typeof h.close;
+            },
+            () => g.measureRetainedSeedFootprint(clone, { includeGitObjects: true, deadline: far() }),
+          );
+          inner = "returned";
+        } catch (e) {
+          inner = (e as Error).message === "io" ? undefined : "threw";
+        }
+      }),
+    );
+    assert.equal(inner, "threw");
+  });
+
+  it("a coded close error after a failed walk does not mask a recovery interruption", async () => {
+    const clone = tree();
+    const g = cache();
+    const ac = new AbortController();
+    await assert.rejects(
+      g.withRecoveryOperation(ac.signal, Infinity, () =>
+        withNestedHandle(
+          h => {
+            h.read = (async () => { throw new Error("walk no code"); }) as typeof h.read;
+            h.close = (async () => {
+              ac.abort(new Error("stop"));
+              throw Object.assign(new Error("io"), { code: "EIO" });
+            }) as typeof h.close;
+          },
+          () => g.measureRetainedSeedFootprint(clone, { includeGitObjects: true, deadline: far() }),
+        )),
+      (e: Error) => e.message !== "io",
+    );
+  });
+
   it("does not swallow a recovery interruption", async () => {
     const clone = tree();
     const g = cache();

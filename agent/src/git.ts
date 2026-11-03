@@ -10892,10 +10892,13 @@ export class GitCache {
       try { outcome = await walk(); } catch (err) { bodyFailed = true; bodyError = err; }
       try { await filesystem(() => handle.close()); }
       catch (err) {
-        // Under partialOnIoError a coded close failure keeps the bytes already measured, but only
-        // when the walk itself did not throw (an interruption must not be swallowed here).
-        if (!partialOnIoError || bodyFailed) throw err;
+        // Without partialOnIoError the close error wins, as before. With it, a recovery interruption
+        // always surfaces first (even when the walk already failed, so a coded close error cannot mask
+        // it); then a failed walk rethrows the close error, and only a coded close error after a clean
+        // walk keeps the bytes already measured.
+        if (!partialOnIoError) throw err;
         this.checkRecoveryInterruption();
+        if (bodyFailed) throw err;
         if (typeof (err as NodeJS.ErrnoException | undefined)?.code !== "string") throw err;
         return { bytes, entries: visited + 1, complete: false };
       }
