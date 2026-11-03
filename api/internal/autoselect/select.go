@@ -121,8 +121,9 @@ func (r Reason) FellBackFromAuto() bool {
 // Headroom and Ranked are deliberately BOTH kept. Headroom is the raw
 // min(100-five, 100-seven) — what the eligibility gate tested and what M5 renders
 // as "N% headroom", because that is the number the user's own meters show. Ranked
-// is the same value after the in-flight penalty — what actually decided the pick,
-// and diagnostics only. Rendering Ranked would show a percentage that appears
+// is the same value after the in-flight penalty — what decided the pick under
+// headroom_first (under reset_first it only breaks exact weekly-reset ties), and
+// diagnostics only. Rendering Ranked would show a percentage that appears
 // nowhere else in the product, and moves when somebody else's run starts. It has no
 // production reader and is kept because TestSelectGateReadsRawHeadroomNotRank asserts
 // on it: the gate/rank asymmetry is invisible without a way to see both numbers.
@@ -338,7 +339,8 @@ func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outco
 // a non-pooled one. It never returns a token that is not AutoEligible or is
 // rejected.
 //
-// It differs from Select in two ways. Select ranks by headroom and returns nothing
+// It differs from Select in two ways. Select ranks by headroom (headroom_first;
+// its order depends on Policy.Order, reset_first by default) and returns nothing
 // when no token is measurable (ReasonPoolStale) or below MinHeadroom-with-no-best;
 // Floor ranks the WHOLE pooled set — including stale, unmeasured, and
 // below-threshold tokens — because a last resort has no headroom to rank on. There

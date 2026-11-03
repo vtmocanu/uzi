@@ -11,6 +11,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/usagereserve"
 )
 
 // #3844 — the reset_first order (the default Policy.Order), from each lane's side.
@@ -92,6 +93,39 @@ func TestAutoResumeExclusionResetFirstPicksNextSoonest(t *testing.T) {
 	}
 	f.claim(t)
 	assertRecordedAuto(t, f, f.emptyID, 30)
+}
+
+// The weekly usage reserve is a pre-filter, not a ranking input: a pooled token it blocks is
+// dropped before reset_first ranks, so the soonest-reset token being blocked yields the
+// next-soonest unblocked one (reason auto), not the blocked one.
+func TestAutoChoiceResetFirstReserveDropsBlockedSoonestReset(t *testing.T) {
+	f := newAutoFixture(t)
+	blocked := uuid.New() // soonest weekly reset, blocked by the reserve
+	next := f.fullID      // next-soonest, unblocked
+	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
+		weeklyReset(candRow(blocked, "blocked-key", true, 80, time.Minute, 0), time.Hour),
+		weeklyReset(candRow(next, "next-key", true, 40, time.Minute, 0), 5*time.Hour),
+		weeklyReset(candRow(f.emptyID, "late-key", true, 95, time.Minute, 0), 100*time.Hour),
+	}
+	snap := &reserveSnap{
+		userID: f.owner,
+		claude: map[uuid.UUID]usagereserve.Verdict{
+			blocked: held(90), next: okV(), f.emptyID: okV(),
+		},
+		pooled: []uuid.UUID{blocked, next, f.emptyID},
+	}
+	ctx := (&reserveGate{snap: snap, now: autoNow}).attach(context.Background())
+
+	choice, err := f.svc.autoChoice(ctx, store.Run{UserID: f.owner})
+	if err != nil {
+		t.Fatalf("autoChoice: %v", err)
+	}
+	if choice.secretID == nil || *choice.secretID != next {
+		t.Fatalf("secretID = %v, want the next-soonest unblocked token %v", choice.secretID, next)
+	}
+	if choice.reason != string(autoselect.ReasonAuto) || choice.headroom == nil || *choice.headroom != 40 {
+		t.Fatalf("reason %q headroom %v, want auto and the raw 40", choice.reason, choice.headroom)
+	}
 }
 
 func TestJudgeChoiceAutoResetFirstPrefersSoonerWeeklyReset(t *testing.T) {

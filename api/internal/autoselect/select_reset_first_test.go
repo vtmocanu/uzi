@@ -172,7 +172,7 @@ func TestResetFirstFallbacksMatchHeadroomFirst(t *testing.T) {
 		cands   []Candidate
 		exclude uuid.UUID
 	}{
-		{"best_of_pool", []Candidate{weekly(1, 10, at(time.Hour)), weekly(2, 12, at(72*time.Hour))}, uuid.Nil},
+		{"best_of_pool", []Candidate{weekly(1, 2, at(time.Hour)), weekly(2, 12, at(72*time.Hour))}, uuid.Nil},
 		{"pool_empty", nil, uuid.Nil},
 		{"sole excluded", []Candidate{weekly(1, 80, at(time.Hour))}, id(1)},
 		{"exclusion skips the soonest", []Candidate{weekly(1, 80, at(time.Hour)), weekly(2, 60, at(2*time.Hour)), weekly(3, 90, at(3*time.Hour))}, id(1)},

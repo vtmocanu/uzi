@@ -366,7 +366,7 @@ func TestSelectResetFirstDeterministicUnderShuffle(t *testing.T) {
 	if !want.Picked || want.AccountKey != id(2) {
 		t.Fatalf("baseline got %+v, want account 2", want)
 	}
-	rng := rand.New(rand.NewSource(3844))
+	rng := rand.New(rand.NewSource(3844)) //nolint:gosec // G404: deterministic seed; this asserts order independence, not security
 	for i := 0; i < 500; i++ {
 		shuffled := append([]Candidate(nil), cands...)
 		rng.Shuffle(len(shuffled), func(a, b int) { shuffled[a], shuffled[b] = shuffled[b], shuffled[a] })
