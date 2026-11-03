@@ -6179,3 +6179,39 @@ func TestSaveMemoryNormalizesBasisAtWrite(t *testing.T) {
 		})
 	}
 }
+
+func TestAgentsFromTemplatesHarnessPins(t *testing.T) {
+	rows := []store.AgentTemplate{
+		{Name: "legacy", Model: pgconv.TextOrNull("gpt-6-sol")},
+		{Name: "sonnet-only", Model: pgconv.TextOrNull("sonnet")},
+		{Name: "codex-only", CodexModel: pgconv.TextOrNull("gpt-6-luna")},
+		{Name: "dual", Model: pgconv.TextOrNull("custom-claude"), CodexModel: pgconv.TextOrNull("gpt-6-sol")},
+		{Name: "lead", Model: pgconv.TextOrNull("opus"), CodexModel: pgconv.TextOrNull("gpt-6.1-sol")},
+	}
+	for _, tc := range []struct {
+		harness string
+		want    []string
+	}{
+		{"claude", []string{"", "sonnet", "", "custom-claude", "opus"}},
+		{"codex", []string{"", "", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"}},
+	} {
+		t.Run(tc.harness, func(t *testing.T) {
+			agents := agentsFromTemplates(rows, nil, tc.harness)
+			if len(agents) != len(rows) {
+				t.Fatalf("agents=%d", len(agents))
+			}
+			for i, agent := range agents {
+				got := ""
+				if agent.Model != nil {
+					got = *agent.Model
+				}
+				if got != tc.want[i] {
+					t.Errorf("%s model=%q, want %q", agent.Name, got, tc.want[i])
+				}
+				if tc.want[i] == "" && agent.Model != nil {
+					t.Errorf("%s must omit model", agent.Name)
+				}
+			}
+		})
+	}
+}

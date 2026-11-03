@@ -38,6 +38,7 @@ const driftFixture = "../../../fixtures/agent-template-drift/cases.json"
 type driftContent struct {
 	Description string   `json:"description"`
 	Model       string   `json:"model"`
+	CodexModel  string   `json:"codex_model"`
 	Tools       []string `json:"tools"`
 	PromptBody  string   `json:"prompt_body"`
 }
@@ -48,6 +49,7 @@ func (c driftContent) definition() agenttmpl.Definition {
 	return agenttmpl.Definition{
 		Description: c.Description,
 		Model:       c.Model,
+		CodexModel:  c.CodexModel,
 		Tools:       c.Tools,
 		PromptBody:  c.PromptBody,
 	}

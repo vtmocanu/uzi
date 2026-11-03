@@ -180,9 +180,10 @@ The endpoints that call out to the forge on a user's behalf (`.../verify`, `.../
 ## Agent templates
 
 An agent template (`agent_templates` table) is the definition of one role an
-agent can play: name, description, an optional model override, an optional
-tools allowlist, and a prompt body. It is not itself an agent; it is the
-recipe a later release renders into a running one.
+agent can play: name, description, optional per-harness model pins (`model`
+for Claude, `codex_model` for Codex), an optional tools allowlist, and a prompt
+body. It is not itself an agent; it is the recipe a later release renders into
+a running one.
 
 - **`builtins/` is the single source of truth.** Twelve builtin roles, the
   `lead` orchestrator (`model: opus`) plus eleven subagents (`coder`, `reviewer`,
@@ -199,14 +200,31 @@ recipe a later release renders into a running one.
 - **The `lead` is the main thread, not a subagent.** The worker
   (`agent/src/agents.ts`) partitions templates by name (`LEAD_NAME_RE`, matching
   `lead`/`orchestrator`) and routes the matched template's `prompt_body`/`model`
-  into the run's main SDK thread rather than an invokable subagent. Main-thread
-  model precedence: the owner's per-user default (`users.default_model`) → the
-  `lead` template's `model` → the SDK/account default. A subagent's own `model`
-  wins for it when set, else inherits the resolved main-thread model. See
-  [docs/worker-model.md](docs/worker-model.md). The same claim carries the owner's
+  into the run's main SDK thread rather than an invokable subagent. Run model
+  defaults come from the frozen schedule pin or the owner's per-harness model
+  lane. A subagent's delivered pin wins when set;
+  otherwise it follows the resolved main-thread model, subject to the schedule's
+  subagent override. See [docs/worker-model.md](docs/worker-model.md). The same
+  claim carries the owner's
   per-user **reasoning effort** (`users.default_effort`, PRD #617): set, it applies
   to the SDK top-level effort for the main thread and its subagents; unset, the SDK
   default (`high`) applies. See [docs/worker-effort.md](docs/worker-effort.md).
+- **Per-harness pins (PRD #3249, M1a).** The template API validates `model` as
+  a Claude pin (custom IDs allowed except Codex role IDs) and `codex_model`
+  against `agenttmpl.CodexRoleModels`, including `gpt-6-luna`. Null or blank
+  clears a pin; an update omitting `codex_model` preserves its stored value
+  before both the customized decision and the write. The migration moves
+  recognized stored Codex role IDs from `model` to `codex_model`. Claim assembly
+  projects the pin for the run's frozen `run.Harness` into the existing wire
+  `model` field, independent of the user's current default or original harness
+  preference. `agenttmpl.PinForHarness` filters again at delivery: Claude drops
+  Codex role IDs, Codex accepts only role IDs, and an empty result omits the pin.
+  Both pins participate in builtin content comparison and customization; a
+  changed pin stops pristine refresh until Reset restores shipped content,
+  including the empty Codex pin. The Claude Markdown renderer remains
+  Claude-only and does not emit `codex_model`. The lead's Codex root fallback
+  is reserved for M2. See [PRD #3249](prds/3249-per-harness-template-pins.md)
+  for the delivery boundaries and rationale.
 - **Scopes + per-user ownership (PRD #18).** Each template has a `scope`
   (`builtin`/`global`/`user`) and, for user scope, a `user_id`, mirroring skills.
   Builtin and global are visible to everyone and admin-managed; a `user` template

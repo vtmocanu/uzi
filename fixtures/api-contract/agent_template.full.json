@@ -3,6 +3,7 @@
   "name": "x",
   "description": "x",
   "model": "x",
+  "codex_model": "x",
   "tools": [
     "x"
   ],
