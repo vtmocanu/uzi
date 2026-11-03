@@ -40,7 +40,28 @@ function fixture(defaultBranch?: string) {
   return { git, runner, flight };
 }
 
-for (const name of ["開発/server", "開発/custom\u00a0", " 開発/custom ", undefined]) {
+for (const github of [false, true]) {
+  it(`#2753 chain wiring: github=${github} chains on every forge, trusts only the confirmed tip`, async () => {
+    const { git, runner, flight } = fixture(undefined);
+    const confirmed = "d".repeat(40), attempted = "e".repeat(40);
+    flight.checkpointChainForge = github;
+    flight.lastCheckpointRefTip = confirmed;
+    flight.lastAttemptedCheckpointRefTip = attempted;
+    let seen: Parameters<GitCache["checkpointPack"]> | undefined;
+    git.checkpointPack = async (...args) => {
+      seen = args;
+      return { tipOid: TIP, pack: Readable.from(["PACK"]), exited: Promise.resolve(0), cancel() {},
+        replay: async () => { throw new Error("unexpected replay"); } };
+    };
+    await runner["publishCheckpointOutcome"](flight, "bare", "task", undefined, new AbortController().signal);
+    assert.ok(seen, "checkpointPack was called");
+    assert.deepEqual(seen[7], [attempted, confirmed]);
+    assert.equal(seen[8]?.markerTrustedTip, confirmed, "never the attempted tip");
+    assert.equal(seen[8]?.chainWorkflowSwap, github);
+  });
+}
+
+for (const name of ["開発/server","開発/custom\u00a0", " 開発/custom ", undefined]) {
   for (const overlay of [false, true]) for (const pinned of [false, true]) {
     it(`shared tick/park/pause publication: server=${name ?? "absent"} overlay=${overlay} pinned=${pinned}`, async () => {
       const { git, runner, flight } = fixture(name);
