@@ -193,9 +193,12 @@ describe("RunRunner — checkpoint on the limit-park path (PRD #628 M2)", () => 
     let calls = 0;
     client.publishCheckpoint = async (_run, _tip, pack, signal) => {
       calls++;
-      assert.equal(signal, abort.signal, "park forwards the original permit signal");
+      // The runner derives one allowance signal from the permit signal: live now, aborted with it.
+      assert.ok(signal && !signal.aborted, "park publishes under a live derived allowance signal");
       await drain(pack);
       setTimeout(() => abort.abort(), 10);
+      await new Promise(resolve => setTimeout(resolve, 30));
+      assert.equal(signal.aborted, true, "the derived signal follows the original permit signal");
       return { ok: false, httpStatus: 500 };
     };
     try {

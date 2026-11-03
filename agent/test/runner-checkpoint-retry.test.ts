@@ -35,6 +35,8 @@ function start(opts: {
   realClient?: { body: Uint8Array };
   /** Opt in: `exited` stays pending until the returned `resolveExit` is called. */
   deferredExit?: boolean;
+  /** Opt in: a short per-logical-publish allowance, read by the runner from the client. */
+  allowanceMs?: number;
 } = {}) {
   const abort = new AbortController();
   const git = new GitCache("/unused", nullLogger());
@@ -43,7 +45,8 @@ function start(opts: {
     assert.deepEqual([bare, branch, exactRunId], ["bare", "branch", "retry"]);
     return publicationContext.restrictionFacts!;
   };
-  const client = new WorkerClient("http://unused", "test", "test", nullLogger());
+  const client = new WorkerClient("http://unused", "test", "test", nullLogger(),
+    opts.allowanceMs === undefined ? {} : { checkpointPublishTimeoutMs: opts.allowanceMs });
   const backoff = opts.backoffMs ?? (opts.abort === "backoff" ? [60_000, 60_000] as const : [0, 0] as const);
   const hooks = backoff === "production" ? undefined : { retryBackoffMs: backoff };
   const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch: "branch" }) } }), nullLogger(), 1,
@@ -55,6 +58,7 @@ function start(opts: {
   };
   let ownership = 0, guards = 0, requests = 0, producers = 0, cancels = 0;
   const streams: Readable[] = [];
+  const attemptSignals: Array<AbortSignal | undefined> = [];
   let resolveExit: (code: number) => void = () => undefined;
   const exited = opts.deferredExit
     ? new Promise<number>(resolve => { resolveExit = resolve; })
@@ -102,7 +106,10 @@ function start(opts: {
     }) as typeof fetch;
   } else client.publishCheckpoint = async (_run, tip, pack, signal) => {
     assert.equal(tip, TIP);
-    assert.equal(signal, abort.signal);
+    // The runner hands every attempt ONE derived allowance signal (never the caller's own), which
+    // follows the caller's abort.
+    assert.ok(signal && signal !== abort.signal, "attempts get the shared allowance, not the raw caller signal");
+    attemptSignals.push(signal);
     requests++;
     streams.push(pack);
     let body = "";
@@ -127,7 +134,7 @@ function start(opts: {
       settled = true; globalThis.fetch = realFetch;
       assert.ok(publicationGuards.every(guard => typeof guard === "function"), "runner must supply every retry publication guard");
     });
-  return { done, flight, feed, streams, bytes, events, retryLogs, resolveExit,
+  return { done, flight, feed, streams, bytes, attemptSignals, events, retryLogs, resolveExit,
     get settled() { return settled; }, get ackCancelled() { return ack?.cancelled() ?? false; },
     get requests() { return requests; }, get producers() { return producers; }, get cancels() { return cancels; } };
 }
@@ -164,6 +171,23 @@ it("persistent 500 is exactly three requests and one exhausted diagnostic", asyn
   assert.equal(r.feed.length, 1);
   assert.equal(r.flight.lastCheckpointRefTip, "OLD");
   assert.equal(r.flight.lastAttemptedCheckpointRefTip, TIP);
+});
+
+it("three 5xx attempts share one allowance that expiry during the second backoff ends", async () => {
+  // 150 ms allowance, 100 ms backoffs: attempt 1 at ~0, attempt 2 at ~100, expiry at 150 during the
+  // second backoff. Retries must not renew the allowance, so attempt 3 is never sent.
+  const r = await exercise({ allowanceMs: 150, backoffMs: [100, 100] });
+  assert.equal(r.requests, 2);
+  assert.equal(r.attemptSignals.length, 2);
+  assert.equal(r.attemptSignals[0], r.attemptSignals[1], "one allowance signal serves every attempt");
+  assert.deepEqual(r.outcome, { published: false, reason: "error" });
+  assert.equal(r.producers, 2, "no third producer is created after the allowance expired");
+});
+
+it("an unexpired allowance leaves the three-attempt behaviour unchanged", async () => {
+  const r = await exercise({ allowanceMs: 60_000 });
+  assert.equal(r.requests, 3);
+  assert.equal(r.attemptSignals[0], r.attemptSignals[2]);
 });
 
 it("production backoff is 250 ms then 1000 ms when no test hook is set", async () => {

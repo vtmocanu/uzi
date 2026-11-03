@@ -23,7 +23,7 @@ import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, MemoryParkReference, WorkerMemoryPressureResult } from "./protocol.js";
 import { BASE_ATTESTATION_HOLD_REASON, CAPABILITY_INFERENCE_EVIDENCE_FEATURE } from "./protocol.js";
 import { PublicationContextLatch, publicationContextReason } from "./publication-context.js";
-import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CREDENTIAL_SWITCH_HOLD_FEATURE } from "./client.js";
+import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE, CHECKPOINT_PUBLISH_TIMEOUT_MS, CREDENTIAL_SWITCH_HOLD_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
 import { MaintenanceResources } from "./recovery-maintenance.js";
@@ -2108,6 +2108,9 @@ function checkpointErrorDiagnostic(
         case "ETIMEDOUT": case "UND_ERR_CONNECT_TIMEOUT":
         case "UND_ERR_HEADERS_TIMEOUT": case "UND_ERR_BODY_TIMEOUT": causeClass = "timeout"; break;
         case "UND_ERR_SOCKET": case "UND_ERR_CLOSED": case "ECONNABORTED": causeClass = "connection_closed"; break;
+        // Node's HTTP/2 client surfaces a peer RST_STREAM (the api resetting an upload past its write
+        // deadline) as this code, one cause below the fetch TypeError; undici has no code of its own.
+        case "ERR_HTTP2_STREAM_ERROR": causeClass = "stream_reset"; break;
         case "EHOSTUNREACH": case "ENETUNREACH": case "EHOSTDOWN": case "ENETDOWN": causeClass = "network_unreachable"; break;
         case "CERT_HAS_EXPIRED": case "UNABLE_TO_VERIFY_LEAF_SIGNATURE": case "DEPTH_ZERO_SELF_SIGNED_CERT":
         case "SELF_SIGNED_CERT_IN_CHAIN": case "UNABLE_TO_GET_ISSUER_CERT_LOCALLY":
@@ -19498,23 +19501,26 @@ export class RunRunner {
       observeProducer();
       packedTip = packed.tipOid;
       let res;
-      // Only an explicit 5xx is retriable. Three requests share the caller's deadline;
-      // any failed guard, transport exception or abort stops this logical operation.
+      // Only an explicit 5xx is retriable. Three requests share the caller's deadline AND one
+      // request allowance, created once here and never renewed by a retry; any failed guard,
+      // transport exception or abort stops this logical operation.
+      const allowanceMs = this.client.checkpointPublishTimeoutMs ?? CHECKPOINT_PUBLISH_TIMEOUT_MS;
+      const allowance = AbortSignal.any([AbortSignal.timeout(allowanceMs), ...(signal ? [signal] : [])]);
       for (let attempt = 1; attempt <= 3; attempt++) {
-        signal?.throwIfAborted();
+        allowance.throwIfAborted();
         onStep?.("checkpoint_upload");
-        res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, producer!.pack, signal, flight.claimGeneration, attestedSource);
+        res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, producer!.pack, allowance, flight.claimGeneration, attestedSource);
         if (res.ok || typeof res.httpStatus !== "number" || res.httpStatus < 500 || res.httpStatus > 599 || attempt === 3) break;
         flight.lastAttemptedCheckpointRefTip = packed.tipOid;
         const [firstBackoffMs, secondBackoffMs] = this.checkpointTestHooks?.retryBackoffMs ?? [250, 1_000];
         const backoffMs = attempt === 1 ? firstBackoffMs : secondBackoffMs;
         flight.runLog.warn("checkpoint publish retry", { run_id: flight.runId, attempt, backoff_ms: backoffMs, http_status: res.httpStatus });
         await abandon(true);
-        await sleep(backoffMs, signal);
-        signal?.throwIfAborted();
+        await sleep(backoffMs, allowance);
+        allowance.throwIfAborted();
         onStep?.("scratch_preflight");
         await this.requireTrackingOwned(flight, barePath, branch, sourceSha, onStep, "scratch_preflight");
-        signal?.throwIfAborted();
+        allowance.throwIfAborted();
         producer = await produce(() => packed.replay());
         observeProducer();
         retried = true;

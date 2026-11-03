@@ -355,6 +355,30 @@ export interface InputReceipt {
  *  30 s of margin lets an answer written at the server's deadline still arrive. */
 export const HELD_PUBLICATION_TIMEOUT_MS = 330_000;
 
+/** The logical-operation allowance of one checkpoint publish (POST .../runs/{id}/publish), and of no
+ *  other route: a streamed pack upload can legitimately outlive WORKER_HTTP_TIMEOUT (30 s), which is
+ *  deliberately NOT raised. The api extends this route's own write deadline to cover 60 s of upload,
+ *  the service bound and a 15 s answer grace; this value adds transit margin on top, so an answer
+ *  written at the api's deadline still arrives (the committed fixture fixtures/checkpoint-publish-budget.json
+ *  pins both numbers). It is an UPPER bound only: the caller's boundary signal, a current
+ *  MaintenanceBudget (see maintenanceSignal) and the runner's shared allowance all win when earlier.
+ *
+ *  Callers of publishCheckpointOutcome and the limit that actually applies (verified in runner.ts):
+ *   1 Codex milestone, in a permit: any(permit.signal, soft) -> 10 s soft / 30 s hard
+ *   2 Claude milestone, deferred post-permit publish, iteration boundary (reap:false): no signal -> 480 s
+ *   3 mid-turn tick: tick signal, MIDTURN_TICK_TIMEOUT_MS 120 s cap
+ *   4 done checkpoint: any(permit.signal, soft) -> 60 s soft / 90 s hard
+ *   5 shutdown: permit.signal ?? cause.stopSignal, deadlineAt (<= 15 s shutdownPublishTimeoutMs)
+ *   6 limit-wait park: permit?.signal (Codex boundary 30 s); none on Claude -> 480 s
+ *   7 pause park: held.signal (Codex: capture-context deadline; Claude: caller signal, may be none)
+ *   8 recovery capture, credential-free: opts.signal (episode signal, may be none)
+ *   9 recovery capture, overlay: opts.signal ?? permit?.signal
+ *  10 completion hold: heldAuthenticated?.signal ?? permit?.signal
+ *  11 retained free capture: held.signal (same rule as 7)
+ *  A MaintenanceBudget (600 s default) becomes current only once a cancellation was observed for the
+ *  attempt (observeCancellation), so rows 1-4 normally run without one. */
+export const CHECKPOINT_PUBLISH_TIMEOUT_MS = 480_000;
+
 /** The held-publication feature string, advertised by the worker and by the api's protocol_features. */
 export const HELD_PUBLICATION_FEATURE = "recovery_held_publication_v1";
 
@@ -921,6 +945,8 @@ export interface ClientOptions {
   /** Monotonic clock in ms, for the permit retry deadline. Injected by tests. */
   now?: () => number;
   httpTimeoutMs?: number;
+  /** Test seam: overrides {@link CHECKPOINT_PUBLISH_TIMEOUT_MS}, the allowance of one checkpoint publish. */
+  checkpointPublishTimeoutMs?: number;
   /** Codex external-auth worker→API slice. Kept below app-server's fixed 10s callback
    *  deadline; the API finishes within 7.5s, leaving response-delivery margin. */
   codexHTTPTimeoutMs?: number;
@@ -1341,6 +1367,7 @@ export class WorkerClient {
   private readonly permitRetryBudgetMs: number;
   private readonly now: () => number;
   private readonly httpTimeoutMs: number;
+  private readonly checkpointPublishTimeoutValue: number;
   private readonly codexHTTPTimeoutMs: number;
   private readonly interruptedCallsTimeoutMs: number;
   /**
@@ -1354,6 +1381,8 @@ export class WorkerClient {
   private readonly operationFlights = new Map<string, { generation: number; token: symbol; reportingUnavailable?: boolean }>();
 
   /** Positive negotiation serial survives feature clearing and worker re-registration. */
+  /** The allowance of one checkpoint publish; the runner shares one of this length across its retries. */
+  get checkpointPublishTimeoutMs(): number { return this.checkpointPublishTimeoutValue; }
   get codexOperationNegotiation(): number { return this.operationNegotiation; }
 
   retainCodexOperationFlight(runId: string, generation: number): () => void {
@@ -1726,6 +1755,7 @@ export class WorkerClient {
     this.permitRetryBudgetMs = opts.permitRetryBudgetMs ?? DEFAULT_PERMIT_RETRY_BUDGET_MS;
     this.now = opts.now ?? (() => performance.now());
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
+    this.checkpointPublishTimeoutValue = opts.checkpointPublishTimeoutMs ?? CHECKPOINT_PUBLISH_TIMEOUT_MS;
     this.codexHTTPTimeoutMs = opts.codexHTTPTimeoutMs ?? 8_000;
     this.interruptedCallsTimeoutMs = opts.interruptedCallsTimeoutMs ?? 2_000;
   }
@@ -3097,9 +3127,10 @@ export class WorkerClient {
    * (`published: false`). The acknowledgment is read through {@link readBoundedText} under
    * {@link CHECKPOINT_PUBLISH_ACK_MAX_BYTES}: an oversized body, a read failure or an abort
    * THROWS (a `ResponseBodyOverflowError` for overflow), which leaves the publish outcome
-   * ambiguous for the caller. The bearer/version header assembly mirrors fetchRaw; the same
-   * per-request timeout is used — generous enough for a real pack, and an abort is just
-   * another best-effort miss (it throws, caught by the caller's warn-and-swallow).
+   * ambiguous for the caller. The bearer/version header assembly mirrors fetchRaw; the request
+   * is bounded by {@link CHECKPOINT_PUBLISH_TIMEOUT_MS} (not httpTimeoutMs, which is too short for
+   * a real pack), or earlier by the caller's boundary signal or a current MaintenanceBudget. An abort
+   * is just another best-effort miss (it throws, caught by the caller's warn-and-swallow).
    */
   async publishCheckpoint(
     runId: string,
@@ -3114,8 +3145,8 @@ export class WorkerClient {
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/publish${query}`;
     const signal = boundarySignal
-      ? AbortSignal.any([boundarySignal, maintenanceSignal(this.httpTimeoutMs)])
-      : maintenanceSignal(this.httpTimeoutMs);
+      ? AbortSignal.any([boundarySignal, maintenanceSignal(this.checkpointPublishTimeoutMs)])
+      : maintenanceSignal(this.checkpointPublishTimeoutMs);
     const init: RequestInit = {
       method: "POST",
       headers: {
