@@ -1461,7 +1461,8 @@ describe("RunRunner — park, resume, park again (issue #2753)", () => {
       const dirty = rd(rc.path, "status", "--porcelain");
       assert.match(dirty, /wip2\.txt/, "the second park's work is uncommitted");
       assert.equal(fs.readFileSync(path.join(rc.path, "wip2.txt"), "utf8"), "second parked work\n");
-      assert.equal(isAncestor(bareB, m, "HEAD"), false, "M is not an ancestor of HEAD");
+      assert.equal(isAncestor(bareB, m, rd(rc.path, "rev-parse", "HEAD")), false, "M is not an ancestor of the worktree HEAD");
+      assert.match(dirty, /(^|\s)wip\.txt/m, "the first park's work survives the second park");
     } finally {
       pub.restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });

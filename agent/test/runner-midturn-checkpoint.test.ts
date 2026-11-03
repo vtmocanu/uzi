@@ -3086,7 +3086,8 @@ describe("issue #2753 checkpoints advance after a marker-restored resume", () =>
   function assertRestored(ctx: RunContext, g: GitCache, seed: Seed): void {
     assert.equal(gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]), seed.r, "HEAD is R, the marker's parent");
     assert.match(gitIn(ctx.worktreePath, ["status", "--porcelain"]), /wip\.txt/, "M's work is uncommitted");
-    assert.equal(reaches(g.barePathFor(fx.originPath), seed.m, "HEAD"), false, "M is not an ancestor of HEAD");
+    assert.equal(reaches(g.barePathFor(fx.originPath), seed.m, gitIn(ctx.worktreePath, ["rev-parse", "HEAD"])), false,
+      "M is not an ancestor of the worktree HEAD");
   }
 
   for (const forge of ["gitlab", "github"] as const) {
