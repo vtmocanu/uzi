@@ -1972,7 +1972,7 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 	fs := &fakeStore{
 		claimRun: store.Run{
 			ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, IssueTitle: "Do the thing",
-			IssueDescription: "see prds/4.md", Status: "claimed",
+			IssueDescription: "see prds/4.md", Status: "claimed", Harness: "claude",
 			LastSeq: 7, IterationCount: 2, RequeueCount: 1,
 			SessionID: pgconv.TextOrNull("sess-abc"), Branch: pgconv.TextOrNull(branch),
 		},
@@ -2301,7 +2301,7 @@ func scheduleModelStore(t *testing.T, runModel, userDefault pgtype.Text) *fakeSt
 	return &fakeStore{
 		claimRun: store.Run{
 			ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 30, Valid: true}, Status: "claimed",
-			Model: runModel,
+			Model: runModel, Harness: "claude",
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",

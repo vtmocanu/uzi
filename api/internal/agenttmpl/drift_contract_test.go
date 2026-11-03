@@ -126,6 +126,9 @@ func TestDriftFixtureIsWellFormed(t *testing.T) {
 		"tools-null-vs-empty-agree",
 		"prompt-body-trailing-newline-not-trimmed",
 		"all-four-differ-in-display-order",
+		"codex-model-value-change",
+		"codex-model-null-vs-empty-agree",
+		"model-moved-between-harnesses",
 	} {
 		if !names[required] {
 			t.Errorf("load-bearing case %q is missing -- do not tidy the fixture", required)
