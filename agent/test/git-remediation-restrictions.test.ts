@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { GitCache, type FetchAgentBranchOptions, type MemoryParkDurability } from "../src/git.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
+import { MaintenanceResources } from "../src/recovery-maintenance.js";
 import { acquireWorkerLifetime } from "../src/authority-lock.js";
 import { testLockOptions } from "./authority-test-support.js";
 import { formatAttemptId } from "../src/attempt-path.js";
@@ -218,6 +219,35 @@ for (const selectedSource of [false, true]) {
     }
   });
 }
+
+test("strict recovery snapshot charges config names and refuses at the metadata-entry cap", async t => {
+  const internals = cache as unknown as { readRecoverySnapshot(barePath: string): Promise<unknown> };
+  const expectedNames = git(bare, "config", "--local", "--no-includes", "--name-only", "--list").split("\n");
+  const consume = MaintenanceResources.consumeIfActive.bind(MaintenanceResources);
+  const consumeEntries = MaintenanceResources.consumeMetadataEntriesIfActive.bind(MaintenanceResources);
+  let charged = 0;
+  const names: string[][] = [];
+  t.mock.method(MaintenanceResources, "consumeIfActive", (...args: Parameters<typeof consume>) => {
+    if (args[0] === "adminEntries") charged += args[1];
+    return consume(...args);
+  });
+  t.mock.method(MaintenanceResources, "consumeMetadataEntriesIfActive", (...args: Parameters<typeof consumeEntries>) => {
+    if (args[1] === "\n") names.push(args[0].split("\n").filter(Boolean));
+    return consumeEntries(...args);
+  });
+  await MaintenanceResources.runDiscovery(() => internals.readRecoverySnapshot(bare));
+  assert.deepEqual(names, [expectedNames], "bare validation still charges names separately from full config rows");
+  const snapshotCharge = charged;
+  assert.ok(snapshotCharge >= 2 * expectedNames.length);
+  await MaintenanceResources.runDiscovery(async () => {
+    consume("adminEntries", 4096 - snapshotCharge);
+    await internals.readRecoverySnapshot(bare);
+  });
+  await assert.rejects(MaintenanceResources.runDiscovery(async () => {
+    consume("adminEntries", 4096 - snapshotCharge + 1);
+    await internals.readRecoverySnapshot(bare);
+  }), /maintenance_resource_exhausted/);
+});
 
 test("fresh fact evaluations observe enrollment and later malformed ledger state", async () => {
   const absent = await held();

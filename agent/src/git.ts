@@ -8342,10 +8342,12 @@ export class GitCache {
   private async readRecoverySnapshot(barePath: string): Promise<RecoveryReadSnapshot> {
     await this.assertRecoveryBareStorage(barePath);
     const entries = (await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
-    this.assertRecoveryConfigKeys(entries.map(item => {
+    const names = entries.map(item => {
       const newline = item.indexOf("\n");
       return newline < 0 ? item : item.slice(0, newline);
-    }));
+    });
+    MaintenanceResources.consumeMetadataEntriesIfActive(names.join("\n"), "\n");
+    this.assertRecoveryConfigKeys(names);
     return Object.freeze({ barePath, entries: Object.freeze(entries) });
   }
 
