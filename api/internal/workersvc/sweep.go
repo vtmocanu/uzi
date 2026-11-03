@@ -66,6 +66,25 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		}
 	}
 
+	// Issue #3859: a retained-custody continuation whose flight provably departed without ever
+	// reporting running is charged (and at the cap parked) BEFORE the uncharged reset below,
+	// which excludes exactly these runs. No judge: neither disposition is a failure.
+	charged, err := s.q.ChargeClaimedNeverStartedContinuations(ctx, store.ChargeClaimedNeverStartedContinuationsParams{
+		Cutoff: claimCutoff, MaxRequeues: max,
+	})
+	if err != nil {
+		return res, fmt.Errorf("charge claimed-never-started continuations: %w", err)
+	}
+	for _, r := range charged {
+		if r.Status == "recovery_wait" {
+			res.ClaimedExhausted++
+		} else {
+			res.ClaimedCharged++
+		}
+		s.publishSwept(r.ID, r.Status)
+		s.persistFail.evict(r.ID)
+	}
+
 	claimed, err := s.q.SweepClaimedNeverStarted(ctx, claimCutoff)
 	if err != nil {
 		return res, fmt.Errorf("sweep claimed-never-started: %w", err)

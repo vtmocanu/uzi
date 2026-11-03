@@ -1040,6 +1040,12 @@ func (f *autoStopSweepStore) PruneExpiredPendingOutcomeIdentities(context.Contex
 func (f *autoStopSweepStore) MarkStaleWorkersOffline(context.Context, pgtype.Timestamptz) (int64, error) {
 	return 0, nil
 }
+func (f *autoStopSweepStore) ChargeClaimedNeverStartedContinuations(context.Context, store.ChargeClaimedNeverStartedContinuationsParams) ([]store.ChargeClaimedNeverStartedContinuationsRow, error) {
+	return nil, nil
+}
+func (f *autoStopSweepStore) RecordRunRegistrationEvidence(context.Context, store.RecordRunRegistrationEvidenceParams) (int64, error) {
+	return 0, nil
+}
 func (f *autoStopSweepStore) SweepClaimedNeverStarted(context.Context, pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error) {
 	return f.claimed, nil
 }

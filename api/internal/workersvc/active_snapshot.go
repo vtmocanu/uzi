@@ -679,6 +679,26 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 		}
 	}
 
+	// Issue #3859 departure witness. Only an ACCEPTED heartbeat or claim snapshot stamps: the
+	// register path has no earlier witnessed epoch to compare with and rotated the nonce, and an
+	// ignored or invalid snapshot never reaches this function. It runs BEFORE the prior rows are
+	// deleted and before SetWorkerSnapshotState advances the worker epoch, because both are the
+	// evidence the statement reads.
+	if mode != snapshotModeRegister {
+		listedIDs := make([]uuid.UUID, 0, len(entries))
+		listedGenerations := make([]int64, 0, len(entries))
+		for _, e := range entries {
+			listedIDs = append(listedIDs, e.runID)
+			listedGenerations = append(listedGenerations, e.claimGeneration)
+		}
+		if _, err := qtx.StampSnapshotDepartures(ctx, store.StampSnapshotDeparturesParams{
+			WorkerID: pgconv.UUID(wkr.ID), RegisterNonce: snap.RegisterNonce, SnapshotEpoch: snap.SnapshotEpoch,
+			LockedParentIds: parents, ListedRunIds: listedIDs, ListedGenerations: listedGenerations,
+		}); err != nil {
+			return false, err
+		}
+	}
+
 	if mode == snapshotModeRegister {
 		// Preserve leased rows; drop only ordinary rows the snapshot no longer lists.
 		keep := make([]uuid.UUID, 0, len(entries))
