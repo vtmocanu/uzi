@@ -531,6 +531,7 @@ func (s *Service) checkFleetCapacityWithWorkers(ctx context.Context, now time.Ti
 func (s *Service) checkFleetDisk(now time.Time, workers []store.ListAllWorkersRow) apitypes.HealthCheckDTO {
 	c := s.base("fleet.disk")
 	var affected, pending int
+	var dockerDataPressure bool
 	for _, row := range workers {
 		w := row.Worker
 		// Keep the legacy heartbeat/streak count unchanged, including its clock semantics.
@@ -539,6 +540,10 @@ func (s *Service) checkFleetDisk(now time.Time, workers []store.ListAllWorkersRo
 			w.DindMeterAt.Valid && !w.DindMeterAt.Time.After(now) && now.Sub(w.DindMeterAt.Time) <= 45*time.Second
 		if (fresh && w.StatsDiskPressureStreak >= diskPressureStreakWarn) || dind {
 			affected++
+		}
+		if fresh && w.StatsDiskPressureStreak >= diskPressureStreakWarn &&
+			w.Kind == "hosted" && w.DockerEnabled.Valid && w.DockerEnabled.Bool && w.DataPressure {
+			dockerDataPressure = true
 		}
 		cleanup := dind
 		if w.MaintenanceID.Valid {
@@ -563,6 +568,9 @@ func (s *Service) checkFleetDisk(now time.Time, workers []store.ListAllWorkersRo
 		c.Severity = sevWarn
 		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Cleanup pending", Value: fmt.Sprintf("%d worker(s)", pending)})
 		c.Action = strPtr("DinD cleanup pending can be report-only or waiting safely for active work and retained unpublished work to clear. An active operation can outlast fresh telemetry. Inspect uzi admin workers; wait for safe cleanup, or increase volume capacity.")
+	}
+	if dockerDataPressure {
+		c.Action = strPtr(*c.Action + " Automatic Docker data-PVC pressure recycling is disabled; this protection requires the fixed controller deployment. Preserve work first: use uzi run recovery to identify open holds and uzi run export <run-id> --output FILE for available archives. For retained sources with no open hold, use worker-local inspect first; see docs/run-recovery.md, Retained sources with no open hold (worker-local inspect and discard). Stop if inspect is refused, source coverage is unproven, or removal fails with not permitted. Discard only through supported hold discard (uzi run discard <run-id> --hold <hold-id> --yes) or worker-local discard after its checks; see Reviewing and resolving held work in docs/run-recovery.md. Enlarge the PVC where the StorageClass allows it. Do not delete the PVC or pod by hand to free space.")
 	}
 	return c
 }
