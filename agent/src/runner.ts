@@ -6591,6 +6591,16 @@ export class RunRunner {
               () => dropRunCaches(runHome, runLog, flight.cachesDroppedEarly ? { quietNoop: true } : {}))
               .catch(() => undefined);
             if (!result || result.failed.length || result.skipped.length) flight.sourceJoinFailed = true;
+            // issue #3870: the reap is complete, so no process can still write the managed Go work
+            // leaves; remove them all (the `.uzi-go-work` parent stays). The result is deliberately
+            // NOT folded into sourceJoinFailed: that flag governs source join/custody, and this
+            // scratch is disposable (the D7 disk reclaim retries a parked run's leftovers). It runs
+            // whatever the cache drop returned. removeGoWorkLeaves never throws.
+            await this.runCancellationMaintenance(flight, () => removeGoWorkLeaves(runHome, runLog, {
+              select: { kind: "all" },
+              deadline: Date.now() + 60_000,
+              reason: "process_ended_park",
+            })).catch(() => undefined);
           } else { flight.sourceJoinFailed = true; parkReapIncomplete = true; }
         } else { flight.sourceJoinFailed = true; parkReapIncomplete = true; }
       }
@@ -21019,6 +21029,13 @@ export class RunRunner {
       if (mayDrop && flight.runHome && !executor.safety) {
         await dropRunCaches(flight.runHome, runLog, { message: "run caches dropped before the disk park's capture" });
         flight.cachesDroppedEarly = true;
+        // issue #3870: the same complete reap makes the managed Go work leaves safe to remove
+        // before the capture; never throws, and its result does not gate the park.
+        await removeGoWorkLeaves(flight.runHome, runLog, {
+          select: { kind: "all" },
+          deadline: Date.now() + 60_000,
+          reason: "disk_park_pre_capture",
+        });
       }
     }
     // Track independent writes, including true -> true, across capture and terminal disposal.

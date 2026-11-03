@@ -10,7 +10,9 @@ import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { GoWorkFsOps } from "../src/go-work.js";
 import type { Logger } from "../src/log.js";
 import { nullLogger, recordingLogger, makeClaim } from "./helpers.js";
-import { api, fakeGitlab, fx, gitlabClaim, input, installHarness, planThenDoneQuery, runnerWith, simulateCommittedWork } from "./runner-harness.js";
+import { LimitReachedError } from "../src/limit.js";
+import { DiskParkSignal } from "../src/cache-cap.js";
+import { api, client, fakeGitlab, fx, gitlabClaim, input, installHarness, planThenDoneQuery, runnerWith, simulateCommittedWork } from "./runner-harness.js";
 
 installHarness();
 
@@ -224,5 +226,265 @@ describe("RunRunner: managed Go work dir (issue #3870 M2)", { skip: process.plat
         checkRunner: async (check) => ({ name: check.name, status: "skipped", detail: "not run" }),
       }).execute(claim);
       assert.equal(fs.readFileSync(seen, "utf8"), path.join(home, ".uzi-go-work", "g4"));
+    }));
+});
+
+// Issue #3870 M3 (D5): park routing. A park that ENDED the run's process removes every managed Go work
+// leaf after the complete attributed reap (the process-ended park, and the disk park before its capture);
+// a park that keeps a live or re-claimable executor keeps them. The `.uzi-go-work` parent itself stays.
+
+const PARENT = ".uzi-go-work";
+const PARK_CACHES = [".cache/go-build", "go/pkg/mod", ".npm/_cacache"];
+const PARK_KEPT = [".claude.json", path.join(".claude", "projects", "-data-runner-clone", "sid.jsonl")];
+
+function seedParkHome(home: string): void {
+  for (const rel of [...PARK_CACHES.map((c) => path.join(c, "x")), ...PARK_KEPT]) {
+    fs.mkdirSync(path.dirname(path.join(home, rel)), { recursive: true });
+    fs.writeFileSync(path.join(home, rel), "data\n");
+  }
+}
+
+/** A leaf with a Go-like build tree inside it. */
+function writeLeaf(home: string, name: string): string {
+  const leaf = path.join(home, PARENT, name);
+  fs.mkdirSync(path.join(leaf, "go-build1", "b001"), { recursive: true });
+  fs.writeFileSync(path.join(leaf, "go-build1", "b001", "x.o"), "obj");
+  return leaf;
+}
+
+const leavesOf = (home: string): string[] => (fs.existsSync(path.join(home, PARENT)) ? fs.readdirSync(path.join(home, PARENT)).sort() : []);
+const cachesPresent = (home: string): boolean[] => PARK_CACHES.map((rel) => fs.existsSync(path.join(home, rel)));
+const keptPresent = (home: string): boolean[] => PARK_KEPT.map((rel) => fs.existsSync(path.join(home, rel)));
+const parkStatus = (runId: string): string | undefined =>
+  api.states.find((s) => s.runId === runId && (s.body.status === "limit_wait" || s.body.status === "recovery_wait"))?.body.status;
+const cleanupLines = (lines: unknown[], msg: string, reason: string): unknown[] =>
+  (lines as Array<{ msg?: string; reason?: unknown }>).filter((l) => l.msg === msg && l.reason === reason);
+
+interface ParkOpts {
+  reap?: "complete" | "left" | "incomplete";
+  /** Runs inside the executor after the HOME is seeded; `leaf` is this generation's managed leaf. */
+  inRun?: (home: string, leaf: string) => void;
+  /** Park with a disk park signal instead of a usage limit. */
+  disk?: boolean;
+}
+interface Parked {
+  home: string;
+  leaf: string;
+  runId: string;
+  lines: unknown[];
+  /** `flight.sourceJoinFailed` as the source use ends, after the park drops. */
+  sourceJoinFailed: boolean | undefined;
+  /** Whether this generation's leaf still existed when the disk park's capture began. */
+  leafAtCapture: boolean | undefined;
+}
+
+async function park(iid: number, generation: number, homeRoot: string, opts: ParkOpts = {}): Promise<Parked> {
+  const { gitlab } = fakeGitlab();
+  let home = "";
+  let leaf = "";
+  const factory: ExecutorFactory = (id) => {
+    home = path.join(homeRoot, id);
+    leaf = path.join(home, PARENT, `g${generation}`);
+    return {
+      homeDir: home,
+      executor: {
+        run: async (): Promise<ExecutorResult> => {
+          seedParkHome(home);
+          opts.inRun?.(home, leaf);
+          throw opts.disk ? new DiskParkSignal(true) : new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+        },
+        killAgentTree: () => undefined,
+        ...(opts.reap
+          ? { reapAttributedProcesses: async () => ({ killed: [], left: opts.reap === "left" ? [4242] : [], complete: opts.reap !== "incomplete" }) }
+          : {}),
+      },
+    };
+  };
+  if (opts.disk) client.protocolFeatures = ["recovery_cause_data_volume_full", "claim_generation_fence"];
+  const { logger, lines } = recordingLogger();
+  const runner = runnerWith(factory, gitlab, undefined, logger);
+  const spy = runner as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+  const out: Parked = { home: "", leaf: "", runId: lastRunId(iid), lines, sourceJoinFailed: undefined, leafAtCapture: undefined };
+  let ended = false;
+  const end = spy.endFlightSourceUse!.bind(runner);
+  spy.endFlightSourceUse = async (...a) => {
+    ended = true;
+    out.sourceJoinFailed = (a[0] as { sourceJoinFailed?: boolean }).sourceJoinFailed;
+    return end(...a);
+  };
+  const capture = spy.captureRecoveryRestorePoint!.bind(runner);
+  spy.captureRecoveryRestorePoint = async (...a) => {
+    out.leafAtCapture ??= fs.existsSync(leaf);
+    return capture(...a);
+  };
+  await runner.execute(gitlabClaim(iid, { run_id: out.runId, claim_generation: generation, wait_on_limit: true }));
+  assert.ok(ended, "precondition: the flight's source use ended after the park drops");
+  out.home = home;
+  out.leaf = leaf;
+  return out;
+}
+
+describe("RunRunner: park routing of the managed Go work leaves (issue #3870 M3)", { skip: process.platform !== "linux" || !HAS_PROC_FD }, () => {
+  it("(p1) a usage-limit park after a complete reap removes every leaf, drops the caches, keeps the resume state and the parent", () =>
+    withRoot(async (homeRoot) => {
+      const p = await park(3890, 3, homeRoot, { reap: "complete", inRun: (home) => writeLeaf(home, "g1") });
+      assert.equal(parkStatus(p.runId), "limit_wait", "precondition: parked at limit_wait");
+      assert.deepEqual(leavesOf(p.home), [], "the older leaf and this generation's leaf are both gone");
+      assert.ok(fs.existsSync(path.join(p.home, PARENT)), "the parent stays");
+      assert.deepEqual(cachesPresent(p.home), [false, false, false]);
+      assert.deepEqual(keptPresent(p.home), [true, true]);
+      assert.equal(cleanupLines(p.lines, "managed Go work dir cleanup", "process_ended_park").length, 1);
+    }));
+
+  for (const [label, reap] of [
+    ["left a live process", "left"],
+    ["was incomplete", "incomplete"],
+  ] as const) {
+    it(`(p2) a park whose attributed reap ${label} keeps the leaves and the caches`, () =>
+      withRoot(async (homeRoot) => {
+        // Generation 1: a first claim skips the claim-time HOME reap, which would otherwise fail the run.
+        const p = await park(label === "was incomplete" ? 3892 : 3891, 1, homeRoot, { reap, inRun: (home) => writeLeaf(home, "g7") });
+        assert.equal(parkStatus(p.runId), "limit_wait");
+        assert.deepEqual(leavesOf(p.home), ["g1", "g7"]);
+        assert.deepEqual(cachesPresent(p.home), [true, true, true]);
+        assert.deepEqual(cleanupLines(p.lines, "managed Go work dir cleanup", "process_ended_park"), []);
+      }));
+  }
+
+  it("(p3) a worker-shutdown interrupt keeps the leaves", () =>
+    withRoot(async (homeRoot) => {
+      const { gitlab } = fakeGitlab();
+      let home = "";
+      let started!: () => void;
+      const startedP = new Promise<void>((r) => (started = r));
+      const factory: ExecutorFactory = (id) => {
+        home = path.join(homeRoot, id);
+        return {
+          homeDir: home,
+          executor: {
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              seedParkHome(home);
+              writeLeaf(home, "g1");
+              started();
+              await new Promise<void>((_, reject) => ctx.signal!.addEventListener("abort", () => reject(new Error("aborted mid-run")), { once: true }));
+              return { branch: ctx.branch };
+            },
+            reapAttributedProcesses: async () => ({ killed: [], left: [], complete: true }),
+          },
+        };
+      };
+      const runner = runnerWith(factory, gitlab);
+      const claim = gitlabClaim(3893, { run_id: lastRunId(3893), claim_generation: 3, wait_on_limit: true });
+      const done = runner.execute(claim);
+      await startedP;
+      runner.shutdown();
+      await done;
+      assert.deepEqual(leavesOf(home), ["g1", "g3"]);
+      assert.deepEqual(cachesPresent(home), [true, true, true]);
+    }));
+
+  it("(p3) a plan-gate park with its executor still live keeps the leaves", () =>
+    withRoot(async (homeRoot) => {
+      const { gitlab } = fakeGitlab();
+      let home = "";
+      const stub = new StubExecutor(nullLogger(), { planGate: true });
+      const factory: ExecutorFactory = (id) => {
+        home = path.join(homeRoot, id);
+        return {
+          homeDir: home,
+          executor: {
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              seedParkHome(home);
+              writeLeaf(home, "g1");
+              return stub.run(ctx);
+            },
+            reapAttributedProcesses: async () => ({ killed: [], left: [], complete: true }),
+          },
+        };
+      };
+      const claim = gitlabClaim(3894, { run_id: lastRunId(3894), claim_generation: 3 });
+      const execution = runnerWith(factory, gitlab, undefined, undefined, { planApprovalTimeoutMs: 60_000 }).execute(claim);
+      const deadline = Date.now() + 10_000;
+      while (!api.states.some((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval")) {
+        assert.ok(Date.now() < deadline, "precondition: the run parked at the plan gate");
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      await new Promise((r) => setTimeout(r, 300));
+      assert.deepEqual(leavesOf(home), ["g1", "g3"]);
+      assert.deepEqual(cachesPresent(home), [true, true, true]);
+      api.setInputs(claim.run_id, [input("approve_plan")]);
+      await execution;
+    }));
+
+  it("(p4) a scratch removal failure leaves sourceJoinFailed as a clean park has it; a cache drop failure still sets it", () =>
+    withRoot(async (homeRoot) => {
+      const control = await park(3895, 3, homeRoot, { reap: "complete" });
+      assert.equal(parkStatus(control.runId), "limit_wait");
+      assert.ok(!control.sourceJoinFailed, "precondition: a clean park does not set sourceJoinFailed");
+
+      // The leaf is replaced by a symlink: the pinned removal refuses it, so the removal fails.
+      const elsewhere = path.join(homeRoot, "elsewhere");
+      fs.mkdirSync(path.join(elsewhere, "keep"), { recursive: true });
+      const scratch = await park(3896, 3, homeRoot, {
+        reap: "complete",
+        inRun: (_home, leaf) => {
+          fs.rmSync(leaf, { recursive: true, force: true });
+          fs.symlinkSync(elsewhere, leaf);
+        },
+      });
+      assert.equal(parkStatus(scratch.runId), "limit_wait");
+      assert.equal(cleanupLines(scratch.lines, "managed Go work dir cleanup incomplete", "process_ended_park").length, 1, "the removal reported failure");
+      assert.ok(fs.lstatSync(scratch.leaf).isSymbolicLink(), "the symlink was not followed or removed");
+      assert.ok(fs.existsSync(path.join(elsewhere, "keep")), "nothing outside the HOME was touched");
+      assert.deepEqual(cachesPresent(scratch.home), [false, false, false], "the caches were still dropped");
+      assert.ok(!scratch.sourceJoinFailed, "a scratch failure is not a source join failure");
+
+      // Counterpart: a failed cache drop does set it (the scratch is still removed: independent).
+      const cacheOther = path.join(homeRoot, "cache-elsewhere");
+      fs.mkdirSync(cacheOther);
+      const cache = await park(3897, 3, homeRoot, {
+        reap: "complete",
+        inRun: (home) => {
+          fs.rmSync(path.join(home, "go", "pkg", "mod"), { recursive: true, force: true });
+          fs.mkdirSync(path.join(home, "go", "pkg"), { recursive: true });
+          fs.symlinkSync(cacheOther, path.join(home, "go", "pkg", "mod"));
+        },
+      });
+      assert.equal(cache.sourceJoinFailed, true, "a cache drop failure still sets sourceJoinFailed");
+      assert.deepEqual(leavesOf(cache.home), [], "the scratch removal ran regardless of the cache drop");
+    }));
+
+  it("(p5) a disk park removes the leaves BEFORE its capture", () =>
+    withRoot(async (homeRoot) => {
+      const p = await park(3898, 3, homeRoot, { reap: "complete", disk: true, inRun: (home) => writeLeaf(home, "g1") });
+      assert.equal(parkStatus(p.runId), "recovery_wait", "precondition: the disk park was taken");
+      assert.equal(p.leafAtCapture, false, "this generation's leaf was gone when the capture began");
+      assert.deepEqual(leavesOf(p.home), []);
+      assert.ok(fs.existsSync(path.join(p.home, PARENT)));
+      assert.deepEqual(cachesPresent(p.home), [false, false, false]);
+      assert.equal(cleanupLines(p.lines, "managed Go work dir cleanup", "disk_park_pre_capture").length, 1);
+    }));
+
+  it("(p6) a terminal run removes its whole HOME, the Go work parent included", () =>
+    withRoot(async (homeRoot) => {
+      const { gitlab } = fakeGitlab();
+      let home = "";
+      let leafSeen = false;
+      const factory: ExecutorFactory = (id) => {
+        home = path.join(homeRoot, id);
+        return {
+          homeDir: home,
+          executor: {
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              seedParkHome(home);
+              leafSeen = fs.existsSync(path.join(home, PARENT, "g3"));
+              return { branch: ctx.branch };
+            },
+          },
+        };
+      };
+      await runnerWith(factory, gitlab).execute(gitlabClaim(3899, { run_id: lastRunId(3899), claim_generation: 3 }));
+      assert.ok(leafSeen, "precondition: the managed leaf existed during the run");
+      assert.equal(fs.existsSync(home), false);
     }));
 });

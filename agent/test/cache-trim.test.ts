@@ -301,4 +301,17 @@ describe("trimRunCaches — npm cache and module cache (PRD #1809 D4 stages b, c
     assert.strictEqual(result.moduleCacheRemoved, false);
     assert.ok(fs.existsSync(path.join(home, "go", "pkg", "mod", "example.com", "m@v1.0.0", "m.go")));
   });
+
+  it("never touches the managed Go work leaves (issue #3870): they are park scratch, not a trimmed cache", async (t) => {
+    if (!HAS_PROC_FD) return t.skip(skipReason);
+    seedGoBuild(2);
+    put(path.join("go", "pkg", "mod", "example.com", "m@v1.0.0", "m.go"), 512 * KIB, 0);
+    const leaf = path.join(".uzi-go-work", "g3", "go-build1", "b001", "x.o");
+    put(leaf, 64 * KIB, -1000); // the oldest file on the HOME, so any age-ordered eviction would take it first
+    fs.chmodSync(path.join(home, ".uzi-go-work"), 0o700);
+    const total = await cacheBytes();
+    const result = await trimRunCaches(home, { totalBytes: total, capBytes: 128 * KIB, lowWaterBytes: 64 * KIB }, nullLogger());
+    assert.strictEqual(result.moduleCacheRemoved, true, "precondition: the most aggressive stage ran");
+    assert.strictEqual(fs.readFileSync(path.join(home, leaf)).length, 64 * KIB, "the leaf is untouched");
+  });
 });
