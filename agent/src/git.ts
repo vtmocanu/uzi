@@ -1,3 +1,4 @@
+import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
 import { countPartialCause, mergePartialCauses, type PartialCause, type PartialCauses } from "./pod-epoch-partial-causes.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { isCheckpointBoundaryFailure, CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, GitBoundaryAbortError } from "./checkpoint-stop.js";
@@ -2405,7 +2406,31 @@ export interface RetainedInspectResult {
   sampledAt: string;
 }
 
+/** Worker-only capability; copied objects and JSON carry no registered authority. */
+declare const epochDiscardProofBrand: unique symbol;
+export interface EpochDiscardProof {
+  readonly [epochDiscardProofBrand]: true;
+}
+
+export interface EpochDiscardProofOptions {
+  readonly decision: { readonly eligible: true; readonly attested: true };
+  readonly scope: PodEpochReclaimScope;
+  readonly selector: Readonly<RetainedSourceSelector>;
+  readonly barePath: string;
+  readonly paths: readonly string[];
+  readonly confirm: string;
+  readonly expectedRawJournal: string;
+  /** Throws when the caller's reservation, epoch or source binding is no longer live. */
+  readonly checkLive: () => void;
+  readonly signal: AbortSignal;
+  readonly deadline: number;
+}
+
+type EpochDiscardProofState = Omit<EpochDiscardProofOptions, "decision">;
+
 export interface RetainedDiscardOptions {
+  /** In-process worker authority only; never deserialize from an operator request. */
+  epochProof?: EpochDiscardProof;
   selector: RetainedSourceSelector;
   /** The descriptor digest inspect reported; the exact value, or nothing is deleted. */
   confirm: string;
@@ -3063,6 +3088,77 @@ export class GitCache {
   }
 
   private readonly epochRetained = new AsyncLocalStorage<Required<EpochRetainedLimits>>();
+  private readonly epochDiscardProofs = new WeakMap<EpochDiscardProof, EpochDiscardProofState>();
+
+  /**
+   * Registers a copied, immutable binding for the worker coordinator. Raw journal bytes stay
+   * private, outside the capability and inspect output. Registration alone permits no effects.
+   */
+  createEpochDiscardProof(input: EpochDiscardProofOptions): EpochDiscardProof {
+    const invalid = (): never => { throw new Error("invalid epoch discard proof"); };
+    if (!input || input.decision?.eligible !== true || input.decision.attested !== true ||
+        !input.selector || typeof input.selector.runId !== "string" ||
+        !/^[A-Za-z0-9_-]{1,160}$/.test(input.selector.runId) || typeof input.selector.attempt !== "string" ||
+        (input.selector.generation !== "none" && (!Number.isSafeInteger(input.selector.generation) || input.selector.generation < 0)) ||
+        (input.selector.attempt !== "canonical" && !ATTEMPT_ID_RE.test(input.selector.attempt)) ||
+        typeof input.barePath !== "string" || !path.isAbsolute(input.barePath) ||
+        path.resolve(input.barePath) !== input.barePath ||
+        !Array.isArray(input.paths) || input.paths.length !== 1 ||
+        input.paths.some(p => typeof p !== "string" || !path.isAbsolute(p) || path.resolve(p) !== p) ||
+        typeof input.confirm !== "string" || !/^[0-9a-f]{64}$/.test(input.confirm) ||
+        typeof input.expectedRawJournal !== "string" ||
+        Buffer.byteLength(input.expectedRawJournal) > STOPPED_MARKER_MAX_BYTES ||
+        typeof input.checkLive !== "function" || !(input.signal instanceof AbortSignal) ||
+        !Number.isFinite(input.deadline) || input.deadline <= Date.now()) return invalid();
+    const scope = input.scope;
+    if (!scope || ["assertExclusive", "beginMutation", "inheritStdio", "stop", "stopped", "assertSettled", "finish"]
+      .some(name => typeof scope[name as keyof PodEpochReclaimScope] !== "function")) return invalid();
+    let raw: unknown;
+    try { raw = JSON.parse(input.expectedRawJournal); } catch { return invalid(); }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return invalid();
+    const journal = raw as Record<string, unknown>;
+    const attempt = input.selector.attempt;
+    const keys = attempt === "canonical" ? ["clonePath", "runId"] : ["attemptId", "clonePath", "runId"];
+    if (JSON.stringify(Object.keys(journal).sort()) !== JSON.stringify(keys) ||
+        journal.runId !== input.selector.runId || journal.clonePath !== input.paths[0] ||
+        (attempt !== "canonical" && journal.attemptId !== attempt) ||
+        JSON.stringify(journal) !== input.expectedRawJournal) return invalid();
+    const state: EpochDiscardProofState = Object.freeze({
+      selector: Object.freeze({ runId: input.selector.runId, generation: input.selector.generation, attempt }),
+      barePath: input.barePath, paths: Object.freeze([...input.paths]), confirm: input.confirm,
+      expectedRawJournal: input.expectedRawJournal, scope, checkLive: input.checkLive,
+      signal: input.signal, deadline: input.deadline,
+    });
+    this.checkEpochDiscardLive(state);
+    scope.assertSettled();
+    if (scope.pendingMutations !== 0) return invalid();
+    const proof = Object.freeze({}) as EpochDiscardProof;
+    this.epochDiscardProofs.set(proof, state);
+    return proof;
+  }
+
+  private checkEpochDiscardLive(state: EpochDiscardProofState): void {
+    state.signal.throwIfAborted();
+    if (Date.now() >= state.deadline) throw new Error("epoch discard deadline exhausted");
+    state.scope.assertExclusive();
+    if (state.scope.stopped() || residueQuarantine() !== undefined) throw new Error("epoch discard stopped");
+    state.checkLive();
+  }
+
+  /** Call before finishing the reclaim scope; this never releases or settles a ticket. */
+  assertEpochDiscardSettled(proof: EpochDiscardProof): void {
+    const state = this.epochDiscardProofs.get(proof);
+    if (!state) throw new Error("unregistered epoch discard proof");
+    this.checkEpochDiscardLive(state);
+    for (const pending of this.unsettledDeletes.keys()) {
+      if (state.paths.some(p => [p, path.join(path.dirname(p), `.uzi-skills-${path.basename(p)}`)]
+        .some(target => isWithinPath(pending, target) || isWithinPath(target, pending)))) {
+        throw new Error("epoch discard has unsettled deletes");
+      }
+    }
+    state.scope.assertSettled();
+    if (state.scope.pendingMutations !== 0) throw new Error("epoch discard has pending mutations");
+  }
 
   private epochLimits(limits: EpochRetainedLimits = {}): Required<EpochRetainedLimits> {
     const cap = (value: number | undefined, maximum: number): number => {
@@ -11309,6 +11405,42 @@ export class GitCache {
     const sel = opts.selector;
     const refused = (reason: string, consumers: string[] = [], disposition?: RetainedDisposition): RetainedDiscardResult =>
       ({ kind: "refused", reason, consumers, ...(disposition ? { disposition } : {}) });
+    const proof = opts.epochProof;
+    const epoch = proof === undefined ? undefined : this.epochDiscardProofs.get(proof);
+    if (proof !== undefined) {
+      if (!epoch || mode !== "plain" || opts.barePath !== epoch.barePath || opts.confirm !== epoch.confirm ||
+          sel.runId !== epoch.selector.runId || sel.generation !== epoch.selector.generation ||
+          sel.attempt !== epoch.selector.attempt) return refused("invalid_epoch_proof");
+      try { this.checkEpochDiscardLive(epoch); } catch { return refused("stale_epoch_proof"); }
+      if (opts.holds?.state !== "read" || !Array.isArray(opts.holds.holds) || opts.holds.holds.length !== 0 ||
+          opts.lifecycle?.state !== "terminal") return refused("epoch_authority_refused");
+      try {
+        return await this.epochRetained.run(this.epochLimits(), () => this.withRecoveryOperation(
+          epoch.signal, epoch.deadline, () => this.withLock(epoch.barePath, async () => {
+            this.checkEpochDiscardLive(epoch);
+            const g = await this.gatherRetainedUnderLock(epoch.barePath);
+            const matches = g.records.filter(rec => this.matchesRetainedSelector(rec, epoch.selector));
+            if (matches.length !== 1) return refused(matches.length ? "ambiguous" : "not_found");
+            const rec = matches[0]!;
+            if (rec.digest !== epoch.confirm) return refused("descriptor_changed");
+            if (rec.activeRaw !== epoch.expectedRawJournal) return refused("epoch_journal_changed");
+            if (rec.parts.length !== epoch.paths.length ||
+                rec.parts.some((part, i) => part.clonePath !== epoch.paths[i])) return refused("invalid_epoch_proof");
+            if (rec.kind === "protected" || rec.markerState !== "none") return refused("wrong_discard_kind");
+            const ev = await this.evaluateRetained(g, rec, {
+              holds: opts.holds, lifecycle: opts.lifecycle, isLivePath: opts.isLivePath,
+            });
+            const disposition = rec.kind === "attempt" ? ev.epochSettlement?.disposition : ev.disposition;
+            if (disposition?.kind !== "local_discard") return refused("epoch_source_refused", ev.blockers, disposition);
+            this.checkEpochDiscardLive(epoch);
+            // Serial integration guard: native descendant joining and durable retirement must
+            // land before worker epoch authority can enter the existing disposal algorithm.
+            return refused("epoch_discard_unavailable");
+          })));
+      } catch {
+        return refused("stale_epoch_proof");
+      }
+    }
     if (!/^[A-Za-z0-9_-]{1,160}$/.test(sel.runId) || !/^[0-9a-f]{64}$/.test(opts.confirm) ||
         (sel.generation !== "none" && (!Number.isSafeInteger(sel.generation) || sel.generation < 0)) ||
         (sel.attempt !== "canonical" && !ATTEMPT_ID_RE.test(sel.attempt))) return refused("invalid_request");
