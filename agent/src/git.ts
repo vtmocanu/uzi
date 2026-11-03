@@ -1664,6 +1664,12 @@ export interface RecoveryJournalEntry extends RecoverySource {
   memoryPark?: MemoryParkRecord;
 }
 
+/** Immutable metadata for one B-held read phase only. Never retained between phases or lock holds. */
+interface RecoveryReadSnapshot {
+  readonly barePath: string;
+  readonly entries: readonly string[];
+}
+
 export interface RemediationGrant {
   id: number;
   origin: "checkpoint-pending" | "pre-exit";
@@ -7335,10 +7341,12 @@ export class GitCache {
    * The runner clears this journal only after atomically retiring the clone
    * (retireRunnerClone), never before the rename. */
   private async remediationSourceUnderLock(barePath: string, branch: string,
-    source: { runId: string; clonePath: string; attemptId: string }): Promise<{ journal: RecoveryJournalEntry; raw: string }> {
-    const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
+    source: { runId: string; clonePath: string; attemptId: string },
+    snapshot?: RecoveryReadSnapshot): Promise<{ journal: RecoveryJournalEntry; raw: string }> {
+    const entries = snapshot && this.recoverySnapshotEntries(barePath, snapshot);
+    const stored = await this.readRecoveryCaptureWithRaw(barePath, branch, entries);
     const shape = parseAttemptPath(source.clonePath, path.resolve(this.runnerRoot));
-    const ledger = (await this.readAttemptLedger(barePath, branch)).get(source.attemptId);
+    const ledger = (await this.readAttemptLedger(barePath, branch, entries)).get(source.attemptId);
     if (!stored || !sameRecoverySource(stored.journal, source) || shape?.attemptId !== source.attemptId ||
         path.resolve(source.clonePath) !== source.clonePath || !await this.realCloneDir(source.clonePath) ||
         ledger?.runId !== source.runId || ledger.clonePath !== source.clonePath || ledger.state !== "live")
@@ -7630,9 +7638,9 @@ export class GitCache {
       if (workerSelectedSource && workerSelectedSource.runId !== exactRunId)
         throw new Error("restriction source run mismatch");
       const read = async () => {
-        await this.assertRecoveryBare(barePath);
+        const snapshot = await this.readRecoverySnapshot(barePath);
         // Unlike the legacy last-value reader, negative absence cannot ignore duplicates.
-        const entries = (await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
+        const entries = snapshot.entries;
         const key = recoveryCaptureKey(branch);
         const activeEntries = entries.filter(e => e === key || e.startsWith(key + "\n"));
         if (activeEntries.length > 1 || activeEntries.some(e => !e.startsWith(key + "\n")))
@@ -7644,17 +7652,17 @@ export class GitCache {
         if (active?.remediationRecovery && recoveryJournalJson(active) !== activeRaw)
           throw new Error("noncanonical restriction journal");
         if (workerSelectedSource) {
-          const authenticated = await this.remediationSourceUnderLock(barePath, branch, workerSelectedSource);
+          const authenticated = await this.remediationSourceUnderLock(barePath, branch, workerSelectedSource, snapshot);
           if (authenticated.raw !== activeRaw) throw new Error("restriction source changed");
         }
         const protectedRaw: string[] = [];
-        const protectedRecords = await this.protectedRecoveries(barePath, exactRunId, raw => protectedRaw.push(raw));
+        const protectedRecords = await this.protectedRecoveries(barePath, exactRunId, raw => protectedRaw.push(raw), snapshot);
         if (protectedRecords.some(r => r.branch !== branch)) throw new Error("restriction custody branch mismatch");
         const relevant = active?.runId === exactRunId ? [active] : [];
         for (const journal of relevant) {
           const shape = parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot));
           const sourceKey = shape?.key ?? path.basename(journal.clonePath);
-          await this.attributedRecovery(barePath, branch, sourceKey, journal, journal);
+          await this.attributedRecovery(barePath, branch, sourceKey, journal, journal, false, snapshot);
         }
         relevant.push(...protectedRecords.map(r => r.journal));
         if (relevant.some(j => j.remediationRecovery && j.remediationRecovery.branch !== branch))
@@ -8216,12 +8224,14 @@ export class GitCache {
    * All existing callers retain the strict active/protected conflict check and return shape.
    */
   private async protectedRecoveries(barePath: string, selectedRunId?: string,
-    negativeSnapshot?: (raw: string) => void): Promise<Array<{ branch: string; key: string; journal: RecoveryJournalEntry }>> {
-    await this.assertRecoveryBare(barePath);
+    negativeSnapshot?: (raw: string) => void,
+    snapshot?: RecoveryReadSnapshot): Promise<Array<{ branch: string; key: string; journal: RecoveryJournalEntry }>> {
+    if (!snapshot) await this.assertRecoveryBare(barePath);
     const records: Array<{ branch: string; key: string; journal: RecoveryJournalEntry }> = [];
     const seen = new Set<string>();
-    const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
-    for (const item of config.split("\0")) {
+    const entries = snapshot ? this.recoverySnapshotEntries(barePath, snapshot)
+      : (await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
+    for (const item of entries) {
       const nl = item.indexOf("\n");
       const name = nl < 0 ? item : item.slice(0, nl);
       if (selectedRunId !== undefined ? name !== `uzi-retained.${selectedRunId}.journal` : !name.startsWith("uzi-retained.")) continue;
@@ -8236,8 +8246,8 @@ export class GitCache {
       const journal = parseRecoveryJournal(JSON.stringify(record.journal));
       if (journal.runId !== match[1] || (!journal.recovery && !journal.retainedSources?.length)) throw new Error("protected recovery run mismatch");
       await this.runGit(barePath, ["check-ref-format", "--branch", record.branch]);
-      await this.attributedRecovery(barePath, record.branch, record.key, journal, journal);
-      const active = await this.readRecoveryCapture(barePath, record.branch);
+      await this.attributedRecovery(barePath, record.branch, record.key, journal, journal, false, snapshot);
+      const active = await this.readRecoveryCapture(barePath, record.branch, snapshot?.entries);
       if (!negativeSnapshot && active?.runId === journal.runId && JSON.stringify(active) !== JSON.stringify(journal)) {
         throw new Error("conflicting active and protected recovery descriptor");
       }
@@ -8304,7 +8314,7 @@ export class GitCache {
     });
   }
 
-  private async assertRecoveryBare(barePath: string): Promise<void> {
+  private async assertRecoveryBareStorage(barePath: string): Promise<void> {
     const st = await this.retainedIO(() => fs.lstat(path.join(barePath, "config")));
     if (!st.isFile() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o002) !== 0 ||
         ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() || (uidSplitActive() && st.gid === RUNNER_UID)))) {
@@ -8312,11 +8322,36 @@ export class GitCache {
     }
     if (await this.resolveRecoveryBareDir(path.basename(barePath)) !== barePath) throw new Error("invalid recovery bare");
     await this.assertOwedBare(barePath);
+  }
+
+  private assertRecoveryConfigKeys(entries: Iterable<string>): void {
+    for (const key of entries) {
+      if (/^(include\.|includeif\.|core\.worktree$|core\.hookspath$|core\.sshcommand$)/i.test(key))
+        throw new Error("unsafe recovery bare config");
+    }
+  }
+
+  private async assertRecoveryBare(barePath: string): Promise<void> {
+    await this.assertRecoveryBareStorage(barePath);
     const entries = await this.runGit(barePath, ["config", "--local", "--no-includes", "--name-only", "--list"]);
     MaintenanceResources.consumeMetadataEntriesIfActive(entries, "\n");
-    if (entries.split("\n").some(k => /^(include\.|includeif\.|core\.worktree$|core\.hookspath$|core\.sshcommand$)/i.test(k))) {
-      throw new Error("unsafe recovery bare config");
-    }
+    this.assertRecoveryConfigKeys(entries.split("\n"));
+  }
+
+  /** Caller owns B. This view is consumed only inside the current read phase. */
+  private async readRecoverySnapshot(barePath: string): Promise<RecoveryReadSnapshot> {
+    await this.assertRecoveryBareStorage(barePath);
+    const entries = (await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"])).split("\0");
+    this.assertRecoveryConfigKeys(entries.map(item => {
+      const newline = item.indexOf("\n");
+      return newline < 0 ? item : item.slice(0, newline);
+    }));
+    return Object.freeze({ barePath, entries: Object.freeze(entries) });
+  }
+
+  private recoverySnapshotEntries(barePath: string, snapshot: RecoveryReadSnapshot): readonly string[] {
+    if (snapshot.barePath !== barePath) throw new Error("recovery read snapshot names another bare");
+    return snapshot.entries;
   }
 
   private async checkedRecovery(
@@ -8530,17 +8565,19 @@ export class GitCache {
   private async attributedRecovery(
     barePath: string, branch: string, key: string, expected: RecoverySource,
     detached?: RecoveryJournalEntry, allowLegacyRepair = false,
+    snapshot?: RecoveryReadSnapshot,
   ): Promise<{ journal: RecoveryJournalEntry; repair?: RecoverySource }> {
-    await this.assertRecoveryBare(barePath);
+    if (!snapshot) await this.assertRecoveryBare(barePath);
+    const entries = snapshot && this.recoverySnapshotEntries(barePath, snapshot);
     recoverySource({ runId: expected.runId, clonePath: expected.clonePath,
       ...(expected.attemptId === undefined ? {} : { attemptId: expected.attemptId }) });
-    const journal = detached ?? await this.readRecoveryCapture(barePath, branch);
+    const journal = detached ?? await this.readRecoveryCapture(barePath, branch, entries);
     if (!journal || !sameRecoverySource(journal, expected)) throw new Error("recovery identity changed");
     if (!/^[A-Za-z0-9_-]+$/.test(key)) throw new Error("invalid recovery key");
     const canonical = this.runnerClonePath(barePath, key);
     if (journal.recovery || journal.retainedSources?.length || detached) {
       const sources = this.recoverySources(journal);
-      for (const [ledgerBranch, raw] of await this.readAllAttemptLedgerRaw(barePath)) {
+      for (const [ledgerBranch, raw] of await this.readAllAttemptLedgerRaw(barePath, entries)) {
         const entry = parseAttemptLedgerEntry(raw);
         if (!entry) throw new Error(journal.recovery?.stage === "adopting"
           ? "unreadable or conflicting recovery successor ledger" : "unreadable recovery source ledger");
@@ -8558,7 +8595,9 @@ export class GitCache {
       if (!shape || shape.attemptId !== source.attemptId || source.runId !== journal.runId) {
         throw new Error("recovery source does not belong to this key");
       }
-      if (await this.classifyOwnerClonePath(barePath, branch, key, source.runId, source.clonePath)) continue;
+      if (await (snapshot
+        ? this.classifyOwnerClonePathFromSnapshot(barePath, branch, key, source.runId, source.clonePath, entries)
+        : this.classifyOwnerClonePath(barePath, branch, key, source.runId, source.clonePath))) continue;
       // Old prepareRecoverySuccessor wrote adopting before its ledger entry. Only
       // that distinct, not-yet-created successor can recover the missing attribution.
       if (!allowLegacyRepair || detached || journal.recovery?.stage !== "adopting" || !journal.recovery.successor ||
@@ -8568,7 +8607,7 @@ export class GitCache {
       }
       // One ledger scan, no retries; malformed evidence or any conflicting
       // identity (including another branch) refuses repair before any append.
-      for (const [, raw] of await this.readAllAttemptLedgerRaw(barePath)) {
+      for (const [, raw] of await this.readAllAttemptLedgerRaw(barePath, entries)) {
         const entry = parseAttemptLedgerEntry(raw);
         if (!entry || entry.attemptId === source.attemptId || entry.clonePath === source.clonePath) {
           throw new Error("unreadable or conflicting recovery successor ledger");
@@ -9874,8 +9913,8 @@ export class GitCache {
   }
 
   /** The EXACT stored journal of `branch` with its parse, or undefined. */
-  private async readRecoveryCaptureWithRaw(barePath: string, branch: string): Promise<{ journal: RecoveryJournalEntry; raw: string } | undefined> {
-    const raw = await this.readRecoveryCaptureRaw(barePath, branch);
+  private async readRecoveryCaptureWithRaw(barePath: string, branch: string, snapshot?: readonly string[]): Promise<{ journal: RecoveryJournalEntry; raw: string } | undefined> {
+    const raw = await this.readRecoveryCaptureRaw(barePath, branch, snapshot);
     return raw === undefined ? undefined : { journal: parseRecoveryJournal(raw), raw };
   }
 
@@ -11561,14 +11600,14 @@ export class GitCache {
   }
 
   /** The EXACT stored value of one branch's recovery journal (undefined when absent or cleared). */
-  private async readRecoveryCaptureRaw(barePath: string, branch: string): Promise<string | undefined> {
-    const entries = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
+  private async readRecoveryCaptureRaw(barePath: string, branch: string, snapshot?: readonly string[]): Promise<string | undefined> {
+    const entries = snapshot ?? (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
     const prefix = `${recoveryCaptureKey(branch)}\n`;
     const value = entries.filter((item) => item.startsWith(prefix)).at(-1)?.slice(prefix.length);
     return value ? value : undefined;
   }
 
-  private async readRecoveryCapture(barePath: string, branch: string, snapshot?: string[]): Promise<RecoveryJournalEntry | undefined> {
+  private async readRecoveryCapture(barePath: string, branch: string, snapshot?: readonly string[]): Promise<RecoveryJournalEntry | undefined> {
     // Unlike tryGitStdout, --list succeeds when the key is absent and throws on
     // an unreadable/corrupt config. Never interpret a failed read as no journal.
     const entries = snapshot ?? (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
@@ -11718,9 +11757,9 @@ export class GitCache {
   /** issue #1783 M2: one branch's attempt ledger, the LAST value per attemptId winning.
    *  Unparseable values are skipped (the ledger is advisory for backups, and every consumer
    *  here fails closed on a missing entry); an unreadable config throws. */
-  private async readAttemptLedger(barePath: string, branch: string): Promise<Map<string, AttemptLedgerEntry>> {
+  private async readAttemptLedger(barePath: string, branch: string, snapshot?: readonly string[]): Promise<Map<string, AttemptLedgerEntry>> {
     const out = new Map<string, AttemptLedgerEntry>();
-    for (const [b, e] of (await this.readAllAttemptLedgerValues(barePath))) {
+    for (const [b, e] of (await this.readAllAttemptLedgerValues(barePath, snapshot))) {
       if (b === branch) out.set(e.attemptId, e);
     }
     return out;
@@ -11734,9 +11773,9 @@ export class GitCache {
     return out;
   }
 
-  private async readAllAttemptLedgerValues(barePath: string): Promise<Array<[string, AttemptLedgerEntry]>> {
+  private async readAllAttemptLedgerValues(barePath: string, snapshot?: readonly string[]): Promise<Array<[string, AttemptLedgerEntry]>> {
     const out: Array<[string, AttemptLedgerEntry]> = [];
-    for (const [branch, v] of await this.readAllAttemptLedgerRaw(barePath)) {
+    for (const [branch, v] of await this.readAllAttemptLedgerRaw(barePath, snapshot)) {
       const e = parseAttemptLedgerEntry(v);
       if (e) out.push([branch, e]);
     }
@@ -11744,9 +11783,10 @@ export class GitCache {
   }
 
   /** Every raw attempt-ledger value, in config order, with its branch. Throws on an unreadable config. */
-  private async readAllAttemptLedgerRaw(barePath: string): Promise<Array<[string, string]>> {
+  private async readAllAttemptLedgerRaw(barePath: string, snapshot?: readonly string[]): Promise<Array<[string, string]>> {
     const out: Array<[string, string]> = [];
-    for (const item of (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0")) {
+    const entries = snapshot ?? (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
+    for (const item of entries) {
       const nl = item.indexOf("\n");
       const m = /^uzi-attempts\.(.+)\.entry$/.exec(nl < 0 ? item : item.slice(0, nl));
       // Valueless ledger keys remain malformed evidence for strict readers.
@@ -11859,11 +11899,18 @@ export class GitCache {
     ownerRunId: string,
     journaledPath: string,
   ): Promise<"canonical" | "attempt" | undefined> {
+    return this.classifyOwnerClonePathFromSnapshot(barePath, branch, ownerKey, ownerRunId, journaledPath);
+  }
+
+  private async classifyOwnerClonePathFromSnapshot(
+    barePath: string, branch: string, ownerKey: string, ownerRunId: string,
+    journaledPath: string, snapshot?: readonly string[],
+  ): Promise<"canonical" | "attempt" | undefined> {
     const canonical = this.runnerClonePath(barePath, ownerKey);
     const shape = this.clonePathShape(journaledPath, canonical);
     if (!shape) return undefined;
     if (shape.attemptId === undefined) return "canonical";
-    const entry = (await this.readAttemptLedger(barePath, branch)).get(shape.attemptId);
+    const entry = (await this.readAttemptLedger(barePath, branch, snapshot)).get(shape.attemptId);
     return entry?.runId === ownerRunId && entry.clonePath === journaledPath ? "attempt" : undefined;
   }
 

@@ -195,6 +195,69 @@ test("confirmed absence is synced every time, frozen and never enrolls or writes
   assert.deepEqual(snapshot(), absent);
 });
 
+for (const selectedSource of [false, true]) {
+  test(`ordinary unenrolled fact evaluation bounds Git subprocesses (selected source=${selectedSource})`, async t => {
+    const internals = cache as unknown as { execScoped(...args: unknown[]): Promise<unknown> };
+    const execute = internals.execScoped.bind(cache);
+    let children = 0, configReads = 0;
+    t.mock.method(internals, "execScoped", async (...args: unknown[]) => {
+      if (args[0] === "git") {
+        children++;
+        const argv = args[1] as string[];
+        if (argv.includes("config") && argv.includes("--list")) configReads++;
+      }
+      return execute(...args);
+    });
+    for (let evaluation = 0; evaluation < 2; evaluation++) {
+      children = 0; configReads = 0;
+      const facts = await cache.readRemediationRestrictionFacts(bare, BRANCH, RUN,
+        selectedSource ? source() : undefined);
+      assert.equal(facts.enrolled, false);
+      assert.ok(children > 0 && children <= 6, `fresh evaluation used ${children} Git subprocesses (budget 6)`);
+      assert.equal(configReads, 3, "two fresh config snapshots and the independent sync readback run every evaluation");
+    }
+  });
+}
+
+test("fresh fact evaluations observe enrollment and later malformed ledger state", async () => {
+  const absent = await held();
+  assert.equal(absent.enrolled, false);
+  await enroll();
+  const enrolled = await held();
+  assert.equal(enrolled.enrolled, true);
+  assert.notEqual(enrolled.fingerprint, absent.fingerprint);
+  git(bare, "config", "--add", "uzi-attempts." + BRANCH + ".entry", "{}");
+  await assert.rejects(held(), /restriction facts unavailable/);
+});
+
+test("enrolled fact evaluations retain independent sync and readback on every call", async () => {
+  await enroll();
+  const syncs: string[] = [];
+  for (let i = 0; i < 2; i++) {
+    const facts = await held({ sync: async (handle, kind) => { syncs.push(kind); await handle.sync(); } });
+    assert.equal(facts.enrolled, true);
+    assert.deepEqual(facts.flaggedOIDs, [base]);
+  }
+  assert.deepEqual(syncs, ["config", "directory", "config", "directory"]);
+});
+
+for (const change of ["protected descriptor", "bare safety config"] as const) {
+  test(`second read phase refuses a changed ${change} despite an unchanged active journal`, async () => {
+    const active = git(bare, "config", "--get", ACTIVE);
+    let changed = false;
+    await assert.rejects(held({ sync: async (handle, kind) => {
+      if (!changed && kind === "config") {
+        changed = true;
+        if (change === "protected descriptor") git(bare, "config", PROTECTED, "{}");
+        else git(bare, "config", "core.hooksPath", "/tmp/unused-recovery-reader-hooks");
+      }
+      await handle.sync();
+    } }), /restriction facts unavailable/);
+    assert.equal(changed, true);
+    assert.equal(git(bare, "config", "--get", ACTIVE), active);
+  });
+}
+
 test("HEAD alignment and staged candidate Q preserve negative facts while strict runtime refuses", async () => {
   const { q, d } = await rewritten();
   const before = journal().remediationRecovery;
