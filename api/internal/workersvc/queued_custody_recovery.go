@@ -3,12 +3,14 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -19,9 +21,7 @@ type custodyTransactionRowsReader interface {
 	CustodyHoldLimitFromRows([]store.AppSetting) (int32, error)
 }
 
-// queuedCustodyAdmission is called before any worker lock. A settings failure or
-// stale cache disables only this recovery classification, never liveness updates.
-// The transaction rows, not a cache refresh, are the admission evidence.
+// queuedCustodyCachedLimit supplies a cache comparison, never admission evidence.
 func (s *Service) queuedCustodyCachedLimit(ctx context.Context) int32 {
 	if _, ok := s.p.CustodyHoldLimit.(custodyTransactionRowsReader); !ok {
 		return 0
@@ -34,6 +34,11 @@ func (s *Service) queuedCustodyCachedLimit(ctx context.Context) int32 {
 	return n
 }
 
+// queuedCustodyAdmission takes the settings lock before any savepoint or worker
+// lock. A recoverable settings statement failure disables classification after a
+// successful savepoint rollback; transaction management, context and connection
+// failures still propagate, so liveness is not guaranteed on those failures.
+// Only fresh transaction rows authorize admission; a stale cache never does.
 func (s *Service) queuedCustodyAdmission(ctx context.Context, tx pgx.Tx, cached int32) (int32, error) {
 	if err := store.LockSettingsAdmission(ctx, tx); err != nil {
 		return 0, err
@@ -42,8 +47,27 @@ func (s *Service) queuedCustodyAdmission(ctx context.Context, tx pgx.Tx, cached 
 	if !ok {
 		return 0, nil
 	}
-	rows, err := store.New(tx).ListAppSettings(ctx)
+	settingsTx, err := tx.Begin(ctx)
 	if err != nil {
+		return 0, err
+	}
+	rows, err := store.New(settingsTx).ListAppSettings(ctx)
+	if err != nil {
+		// One cleanup attempt, bounded independently of a canceled request.
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 250*time.Millisecond)
+		defer cancel()
+		if rollbackErr := settingsTx.Rollback(cleanup); rollbackErr != nil {
+			return 0, errors.Join(err, rollbackErr)
+		}
+		var sqlErr *pgconn.PgError
+		if ctx.Err() != nil || tx.Conn().IsClosed() || !errors.As(err, &sqlErr) ||
+			sqlErr.Severity != "ERROR" || len(sqlErr.Code) != 5 || sqlErr.Code[:2] == "08" {
+			return 0, err
+		}
+		slog.Warn("queued recovery: custody settings statement failed")
+		return 0, nil
+	}
+	if err := settingsTx.Commit(ctx); err != nil {
 		return 0, err
 	}
 	fresh, err := reader.CustodyHoldLimitFromRows(rows)
