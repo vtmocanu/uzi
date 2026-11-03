@@ -64,6 +64,8 @@ interface Opts {
   onMeasure?: (set: (used: number) => void) => void;
   /** Stub the predecessor measurement. */
   estimate?: { bytes: number; inodes: number; complete: boolean };
+  /** Make the predecessor measurement throw this error. */
+  measureError?: Error;
 }
 
 async function drive(o: Opts, prepare?: (ctx: { claim: ReturnType<typeof gitlabClaim>; bare: string; clone: { path: string; branch: string } }) => void) {
@@ -83,6 +85,7 @@ async function drive(o: Opts, prepare?: (ctx: { claim: ReturnType<typeof gitlabC
     r.measures++;
     r.measureOpts.push({ includeGitObjects: opts?.includeGitObjects });
     o.onMeasure?.(used => { state.used = used; });
+    if (o.measureError) throw o.measureError;
     return o.estimate ?? measure(p, opts);
   };
   const guard = new DataVolumeGuard({
@@ -182,6 +185,26 @@ it("(b) current below the threshold but projected at or over it refuses the same
   assertRefusedWindow(r);
   assert.equal(r.measures, 6, "a measurement before and after each iteration's reclaim");
   assert.ok(feed(r).every(t => /projected \d+\.\d%/.test(t)), JSON.stringify(feed(r)));
+});
+
+it("control: a filesystem failure (string code) in the measurement uses the fallback estimate and refuses", async () => {
+  // 0.855 used plus the 1 GiB fallback x1.25 and the 1% allowance crosses 0.87; a near-zero estimate would admit.
+  const r = await drive({ used: 0.855, measureError: Object.assign(new Error("x"), { code: "EIO" }) });
+  assertRefusedWindow(r);
+  assert.equal(r.measures, 6);
+});
+
+it("control: a non-filesystem measurement error is not admitted silently and never reads as a capacity deferral", async () => {
+  const r = await drive({ used: 0.30, measureError: new Error("not a filesystem error") });
+  assert.equal(r.models, 0, "no model call");
+  assert.equal(r.prepares, 0, "no successor prepared");
+  assert.deepEqual(attemptDirs(r.clone), [], "no attempt dir next to the predecessor");
+  assert.equal(r.releases, 0, "custody is never released");
+  assertNoDiskPark();
+  assert.equal(r.measures, 3, "one measurement per charged iteration");
+  assert.deepEqual(feed(r).filter(t => /retained recovery deferred/.test(t)), []);
+  assert.equal(journal(r.bare, r.clone.branch).recovery.attempts, 3);
+  assert.equal(r.parks.length, 1, "the third charged failure ends as the exhausted park");
 });
 
 it("control: headroom seeds exactly as before", async () => {
@@ -367,20 +390,17 @@ it("control: a stale generation during the refusal takes the existing stop path"
 
 it("control: a second execute after the exhausted park is finite and seeds nothing", async () => {
   // Custody holds are server-owned (one per claimed generation) and are not counted by the worker; the
-  // finite claim count asserted here is the number of executes and exhausted-park reports.
+  // finite claim count asserted here is the number of exhausted-park reports.
   const r = await drive({ used: 0.89 });
   assertRefusedWindow(r);
-  let executes = 1;
   api.setOwnershipStatus(r.claim.run_id, "running", 3);
-  executes++;
   await r.runner.execute({ ...r.claim, claim_generation: 3 });
   assert.equal(r.models, 0);
   assert.equal(r.prepares, 0);
   assert.deepEqual(attemptDirs(r.clone), []);
   assert.equal(r.releases, 0);
   assertNoDiskPark();
-  assert.ok(r.parks.length <= 2, `at most one further exhausted park, got ${r.parks.length}`);
-  assert.equal(executes, 2);
+  assert.equal(r.parks.length, 2, "exactly one further exhausted park");
 });
 
 it("control: a self-contained (Codex-shaped) claim measures with git objects included", async () => {
