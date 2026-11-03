@@ -355,6 +355,13 @@ export interface InputReceipt {
  *  30 s of margin lets an answer written at the server's deadline still arrive. */
 export const HELD_PUBLICATION_TIMEOUT_MS = 330_000;
 
+/** Issue #3847: the per-request allowance of the live checkpoint publish (`publishCheckpoint`), and of
+ *  no other route. The api's /publish route extends its own deadlines to a 60 s upload + a 190 s
+ *  service budget (livePublishPrePushBudget 2 min + broker 60 s + 10 s) + a 15 s answer grace = 265 s;
+ *  15 s of margin lets an answer written at that deadline still arrive. Per request the earliest
+ *  deadline wins (caller boundary signals, MaintenanceBudget). The generic httpTimeoutMs is not raised. */
+export const CHECKPOINT_PUBLISH_TIMEOUT_MS = 280_000;
+
 /** The held-publication feature string, advertised by the worker and by the api's protocol_features. */
 export const HELD_PUBLICATION_FEATURE = "recovery_held_publication_v1";
 
@@ -921,6 +928,9 @@ export interface ClientOptions {
   /** Monotonic clock in ms, for the permit retry deadline. Injected by tests. */
   now?: () => number;
   httpTimeoutMs?: number;
+  /** Test hook only (not wired to config or env): the per-request allowance of publishCheckpoint.
+   *  Defaults to {@link CHECKPOINT_PUBLISH_TIMEOUT_MS}; the larger of this and httpTimeoutMs applies. */
+  checkpointPublishTimeoutMs?: number;
   /** Codex external-auth worker→API slice. Kept below app-server's fixed 10s callback
    *  deadline; the API finishes within 7.5s, leaving response-delivery margin. */
   codexHTTPTimeoutMs?: number;
@@ -1341,6 +1351,7 @@ export class WorkerClient {
   private readonly permitRetryBudgetMs: number;
   private readonly now: () => number;
   private readonly httpTimeoutMs: number;
+  private readonly checkpointPublishTimeoutMs: number;
   private readonly codexHTTPTimeoutMs: number;
   private readonly interruptedCallsTimeoutMs: number;
   /**
@@ -1726,6 +1737,7 @@ export class WorkerClient {
     this.permitRetryBudgetMs = opts.permitRetryBudgetMs ?? DEFAULT_PERMIT_RETRY_BUDGET_MS;
     this.now = opts.now ?? (() => performance.now());
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
+    this.checkpointPublishTimeoutMs = opts.checkpointPublishTimeoutMs ?? CHECKPOINT_PUBLISH_TIMEOUT_MS;
     this.codexHTTPTimeoutMs = opts.codexHTTPTimeoutMs ?? 8_000;
     this.interruptedCallsTimeoutMs = opts.interruptedCallsTimeoutMs ?? 2_000;
   }
@@ -3097,8 +3109,10 @@ export class WorkerClient {
    * (`published: false`). The acknowledgment is read through {@link readBoundedText} under
    * {@link CHECKPOINT_PUBLISH_ACK_MAX_BYTES}: an oversized body, a read failure or an abort
    * THROWS (a `ResponseBodyOverflowError` for overflow), which leaves the publish outcome
-   * ambiguous for the caller. The bearer/version header assembly mirrors fetchRaw; the same
-   * per-request timeout is used — generous enough for a real pack, and an abort is just
+   * ambiguous for the caller. The bearer/version header assembly mirrors fetchRaw; the request
+   * is bounded by max(httpTimeoutMs, {@link CHECKPOINT_PUBLISH_TIMEOUT_MS}) (issue #3847: the api's
+   * /publish route extends its own deadlines past the generic timeout), still combined with the caller's
+   * boundary signal and the MaintenanceBudget so the earliest deadline wins; an abort is just
    * another best-effort miss (it throws, caught by the caller's warn-and-swallow).
    */
   async publishCheckpoint(
@@ -3113,9 +3127,10 @@ export class WorkerClient {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/publish${query}`;
+    const allowanceMs = Math.max(this.httpTimeoutMs, this.checkpointPublishTimeoutMs);
     const signal = boundarySignal
-      ? AbortSignal.any([boundarySignal, maintenanceSignal(this.httpTimeoutMs)])
-      : maintenanceSignal(this.httpTimeoutMs);
+      ? AbortSignal.any([boundarySignal, maintenanceSignal(allowanceMs)])
+      : maintenanceSignal(allowanceMs);
     const init: RequestInit = {
       method: "POST",
       headers: {

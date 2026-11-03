@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
 import { afterEach, describe, it } from "node:test";
-import { WorkerClient } from "../src/client.js";
+import { CHECKPOINT_PUBLISH_TIMEOUT_MS, WorkerClient } from "../src/client.js";
 import { nullLogger } from "./helpers.js";
 
 // Issue #2888: the checkpoint publication acknowledgment is read under a streamed-byte cap.
@@ -215,5 +215,68 @@ describe("checkpoint publication acknowledgment", () => {
     setTimeout(() => boundary.abort(), 20);
     await assert.rejects(pending, { name: "AbortError" });
     assert.equal(cancelled, true);
+  });
+});
+
+// Issue #3847: the live publish is bounded by max(httpTimeoutMs, checkpointPublishTimeoutMs).
+describe("checkpoint publication per-request allowance", () => {
+  it("defaults the allowance above the generic 30 s timeout and below the api's 265 s deadline margin", () => {
+    assert.equal(CHECKPOINT_PUBLISH_TIMEOUT_MS, 280_000);
+  });
+
+  /** Real server that answers `{published:true}` after `delayMs` (or never when null). */
+  async function withServer(delayMs: number | null, body: (url: string) => Promise<void>): Promise<void> {
+    const timers: NodeJS.Timeout[] = [];
+    const server: Server = createServer((req, res) => {
+      req.resume();
+      if (delayMs === null) return;
+      timers.push(setTimeout(() => {
+        if (!res.destroyed) { res.writeHead(200, { "Content-Type": "application/json" }); res.end('{"published":true}'); }
+      }, delayMs));
+    });
+    await new Promise<void>(r => server.listen(0, "127.0.0.1", r));
+    try {
+      await body(`http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+    } finally {
+      for (const t of timers) clearTimeout(t);
+      server.closeAllConnections();
+      await new Promise<void>(r => server.close(() => r()));
+    }
+  }
+  const mk = (url: string, opts: { httpTimeoutMs: number; checkpointPublishTimeoutMs: number }) =>
+    new WorkerClient(url, "tok", "test", nullLogger(), opts);
+  const pub = (c: WorkerClient, boundary?: AbortSignal) => c.publishCheckpoint("run-1", TIP, Readable.from(["pack"]), boundary);
+
+  it("lets a slow answer past httpTimeoutMs succeed within the allowance", async () => {
+    await withServer(500, async url => {
+      const r = await pub(mk(url, { httpTimeoutMs: 100, checkpointPublishTimeoutMs: 5_000 }));
+      assert.deepEqual(r, { ok: true, body: { published: true } });
+    });
+  });
+
+  it("still honours an earlier caller boundary abort", async () => {
+    await withServer(2_000, async url => {
+      const boundary = new AbortController();
+      setTimeout(() => boundary.abort(), 150).unref();
+      const start = Date.now();
+      await assert.rejects(pub(mk(url, { httpTimeoutMs: 100, checkpointPublishTimeoutMs: 10_000 }), boundary.signal));
+      assert.ok(Date.now() - start < 1_500, `elapsed ${Date.now() - start}`);
+    });
+  });
+
+  it("bounds a hung server by the allowance", async () => {
+    await withServer(null, async url => {
+      const start = Date.now();
+      await assert.rejects(pub(mk(url, { httpTimeoutMs: 50, checkpointPublishTimeoutMs: 300 })));
+      const elapsed = Date.now() - start;
+      assert.ok(elapsed >= 250 && elapsed < 3_000, `elapsed ${elapsed}`);
+    });
+  });
+
+  it("uses the larger httpTimeoutMs when it exceeds the allowance", async () => {
+    await withServer(500, async url => {
+      const r = await pub(mk(url, { httpTimeoutMs: 5_000, checkpointPublishTimeoutMs: 100 }));
+      assert.deepEqual(r, { ok: true, body: { published: true } });
+    });
   });
 });
