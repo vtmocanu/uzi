@@ -56,11 +56,11 @@ judge for everyone — into three effective modes:
   **Admin → Users** — one flag can't tell "an admin disabled you" from "you
   opted out," so enforcement wins whenever it's on.
 
-**The only real opt-out from enforced mode is deleting your Anthropic
-token.** That also stops your own runs, since both spend the same
-credential — there's no separate "opt out of enforced judging" switch. Your
-lever under enforced mode is the *model* it runs on, not the on/off toggle —
-see the next section.
+**Enforced mode has no separate user opt-out switch.** Judging still depends
+on a usable credential for the reviewed run's own harness. Removing Anthropic
+credentials does not prevent a Codex run from being judged when a usable
+Codex credential remains. Your lever under enforced mode is the *model* it
+runs on, not the on/off toggle; see the next section.
 
 ## Which token the judge spends
 
@@ -168,9 +168,8 @@ Anthropic token is a **subscription plan** rather than a metered console key,
 an opus judge spends **plan/rate-limit quota, not dollars** — under enforced
 mode especially, a busy judge can eat into the quota your real runs need.
 Pinning your Claude judge model to `haiku` or `sonnet` is the fix if that's a
-problem; short of that, deleting your token is the only way to stop the
-judge from running under enforced mode (see [Judge
-mode](#judge-mode-off-optional-enforced) above).
+problem. Enforced mode has no separate per-user opt-out switch; see [Judge
+mode](#judge-mode-off-optional-enforced) above.
 
 ## What you get
 
@@ -208,6 +207,90 @@ or agents without weakening any check (quality and correctness come first, so
 a saving that would drop a real verification pass is never recommended). The
 improve-uzi category feeds the `self-improve` [default
 job](./scheduling.md#default-jobs), if you've enabled it on a repo.
+
+## Reading a review with bounded evidence
+
+The judge remains a single-run advisory pass: one model call, no tools and
+no code changes. It streams the trace in pages of 500 messages, reducing
+each page before fetching the next, up to 100,000 messages (200 pages).
+An empty or short page establishes the fetched end. A full page at the cap
+leaves the end unknown, even if the run had exactly 100,000 messages: there
+is no extra probe. The latest fetched tail is not proof of terminal delivery;
+a missing terminal outcome is disclosed as unknown.
+
+The judge's user prompt, including its evidence, fits within a fixed envelope
+of at most 120,000 characters. The fixed system instructions are separate
+from this user-prompt limit. Coverage, a factual delegation ledger and raw aggregates
+have separate budgets before the event-aware prose samples: opening and
+latest fetched eligible events, middle plans and revisions, owner steering,
+failed delegation starts with results, available review reports, and recorded
+delivery or validation claims. Snippets, ledger rows, sample reservoirs and
+tracking state are bounded; meaningful events can still be omitted.
+Coverage tells the judge the fetched sequence range, count and pages,
+eligible/excluded/retained/omitted evidence, and pairing and row omissions
+or unknowns. These are model inputs, not new run-page or API fields.
+Sampling omissions differ from events that were never fetched.
+`progress_note`, `summary_usage` and accounting-only status messages do not
+consume behavioral prose slots; status messages carrying failure facts
+remain eligible.
+
+Read the resulting assessment with these limits in mind:
+
+- **Delegation identity and outcomes:** pairing uses exact lane, agent-instance
+  and invocation-ID associations, not guesses from repeated role names or
+  replays. Confirmed pairs mean observed exact associations and recognized
+  recorded outcomes without detected ambiguity within available collision
+  coverage, not globally unique execution or task correctness. Collisions,
+  pending-entry eviction, and the 256-key delegation-history limit constrain
+  confirmation. Confirmed outcomes, provisional pairings, incomplete starts
+  and unmatched results are distinct observations, not interchangeable failures.
+  Open dispatches and unknown orphan results share the same 128 pending slots.
+  An incoming orphan evicts the oldest orphan, or is dropped when 128 open
+  starts fill the allocation; orphan floods cannot evict open dispatches.
+  An incoming start evicts the oldest orphan before an open start. Known
+  evicted starts remain ambiguous through bounded tombstones. Orphan coverage
+  losses include evictions and admission drops. Retained result-before-start
+  pairs matched after a loss remain provisional. Subsequently observed
+  start/result associations can confirm within available collision coverage,
+  without establishing historical uniqueness. Signal tool starts are excluded;
+  persisted `tool_result` records have `tool_use_id`, `content` and `is_error`,
+  but no signal or tool-name marker. Prose cannot classify an unknown orphan
+  as signal, ordinary or delegation activity. Ordinary tool starts use a
+  separate exact-identity FIFO cache of up to 256 keys, retained after
+  completion to recognize reuse across ordinary tools and delegations.
+  Remembered ordinary results do not consume delegation pending slots. After
+  ordinary identity history is lost,
+  cross-kind reuse detection is limited to retained ordinary keys; that loss
+  alone does not suppress an observed delegation outcome. Unknown orphan
+  results remain uncertain, with bounded tracking rather than assumed
+  delegation outcomes.
+- **Time and causes:** intervals come from persisted-message timestamps,
+  not measured execution time. Historical budgets and causes remain unknown
+  when absent. A deadline-shaped interval is a hypothesis, not a confirmed
+  timeout.
+- **Tool activity:** lead/child/unknown counts, including lead activity after
+  the last observed dispatch, are signals, not effort percentages,
+  productivity, source ownership or test-success evidence. There is no
+  blanket ban on lead implementation. The judge is instructed to distinguish
+  reasonable continuation after a child failure from unnecessary takeover,
+  and to recommend independent review where recorded evidence supports it.
+  Missing sampled review does not prove that no review occurred.
+- **Recorded claims:** retained delivery and validation text supplies
+  available claims and sequence anchors. The reducer does not parse shell
+  text into gate verdicts.
+
+A review may optionally use the existing `improve_uzi` or `adjust_template`
+categories for a limitation in the judge's own evidence, compaction or
+assessment. It should identify the affected conclusion, sequence anchors or
+coverage, and an actionable remedy, or state honest uncertainty.
+This does not require a recommendation, add a category or invoke another
+judge. Matching known `improve_uzi` targets are reused unchanged so recurring
+findings group together.
+
+Event-derived evidence and known targets stay inside nonce-delimited
+untrusted-data fences: they are inert evidence, never instructions.
+The no-tools boundary, secret scrubbing and instruction to summarize rather
+than quote raw file or command output remain in place.
 
 ## The deterministic fallback
 
