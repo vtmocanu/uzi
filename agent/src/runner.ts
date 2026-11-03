@@ -9646,12 +9646,13 @@ export class RunRunner {
     };
 
     // issue #1932: the ONE terminal reporter for a secret-remediation block, shared by D5 below and by
-    // the post-bridge re-check at both finalize bridge sites. `findings` undefined = an untrusted
-    // re-scan after a known finding (fixed reason, no finding data). Nothing is pushed, no
+    // the post-bridge re-check at both finalize bridge sites. With no findings, use a fixed
+    // reason that distinguishes prior findings from unavailable publication proof. Nothing is pushed, no
     // preserved_patch is attached (the diff may carry the secret).
     const reportRemediationBlocked = async (
       findings: SecretFinding[] | undefined,
       withholdFromState: boolean,
+      knownFinding = true,
     ): Promise<void> => {
       let reason: string;
       let statusText: string;
@@ -9666,7 +9667,7 @@ export class RunRunner {
             findings: findings.map((f) => renderSecretFinding(f, { redact: redactText, withholdPaths })),
           },
         );
-      } else {
+      } else if (knownFinding) {
         reason =
           "This run's branch was not pushed: a secret finding was flagged earlier in the run and the final branch could not be verified clean. " +
           "The diff is withheld because it may carry the detected secret; if a durable-recovery archive of this run is available, export it with `uzi run export`.";
@@ -9675,6 +9676,11 @@ export class RunRunner {
         runLog.info("run failed: the final branch could not be verified clean after a flagged secret finding; withholding diff", {
           run_id: runId,
         });
+      } else {
+        reason = "This run's branch was not pushed because current secret-remediation publication evidence could not be verified. " +
+          "The diff is withheld because it may contain a secret.";
+        statusText = "secret-remediation publication evidence could not be verified; failing without pushing and withholding the diff";
+        runLog.info("run failed: secret-remediation publication evidence unavailable; withholding diff", { run_id: runId });
       }
       batcher.emit({ kind: "status", agent: "worker", payload: { text: statusText } });
       await closeBatcher();
@@ -10613,6 +10619,11 @@ export class RunRunner {
       } catch (error) {
         // A deadline/cancel abort stays permanent: an aborted fetch classifies transient but is not an outage.
         if (boundarySignal?.aborted) throw error;
+        if (error instanceof SecretRemediationPendingError) {
+          await reportRemediationBlocked(undefined, false, flight.secretRemediation?.everKnown === true ||
+            Boolean(flight.remediationRestrictions?.flaggedOIDs?.length));
+          throw new PushSecretBlockedSignal();
+        }
         if (error instanceof ScratchPublicationError && error.kind === "floor_unreachable") {
           throw publicationForgeUnreachable(flight.redactText, "git", "floor_refresh", error);
         }
@@ -11369,6 +11380,7 @@ export class RunRunner {
         await pushToOrigin();
       } catch (e) {
         rethrowWorkflowAbort(e);
+        if (e instanceof PushSecretBlockedSignal) return;
         if (e instanceof PublicationRefusedSignal) {
           if (e instanceof ClosingCommitRefusedSignal) await refusePrepush("closing", e.head, e.shas);
           if (e instanceof PublicationContextRefusedSignal) await refusePrepush("context", e.head, null, e.reason);
