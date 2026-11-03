@@ -329,12 +329,12 @@ func TestSemanticHeadlessOwnerDeferral(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	build := func(rev int, scope *scopeBlock) store.Run {
+	build := func(rev int32, scope *scopeBlock) store.Run {
 		run := base
 		cc := c
-		cc.Revision, cc.Scope = rev, scope
+		cc.Revision, cc.Scope = int(rev), scope
 		run.CompletionContract = semanticJSON(t, cc)
-		run.ContractRevision = pgtype.Int4{Int32: int32(rev), Valid: true}
+		run.ContractRevision = pgtype.Int4{Int32: rev, Valid: true}
 		run.MilestonesFrozen = frozenJSON(t, "m1", "m2")
 		return run
 	}
