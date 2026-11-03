@@ -8,7 +8,9 @@ import { MaintenanceBudget } from "./maintenance-budget.js";
 // keep, unless it deliberately changes it, is its environment: the SDK env sets HOME to the run's
 // private HOME (`agent-home/<runId>`), and every child inherits it. So a process is ATTRIBUTED to the
 // run when its `/proc/<pid>/environ` holds the exact entry `HOME=<runHome>`, or when its working
-// directory is inside the run's worktree or HOME.
+// directory is inside the run's worktree or HOME, or when its environ holds a `GOTMPDIR=` entry inside
+// the run's managed Go work leaf (`<runHome>/.uzi-go-work/g<N>`), which a process that reset HOME (a
+// `go build` helper run with its own HOME) still carries.
 //
 // Only the `runner` uid is scanned. This is the Claude executor's attribution, and the Claude CLI is
 // spawned as `runner` (sdk-spawn.ts spawnDetached -> runner-uid.ts runnerSpawn: setpriv to `runner`
@@ -62,6 +64,8 @@ const MAX_SPAWNED = 64;
  * process holds no files and is skipped; the helper itself and `<workerPid>` are skipped. Otherwise
  * it reads `environ` (at most 4 MiB, bounded reads) and `cwd`:
  *  - `home`: environ holds the NUL-separated entry `HOME=<home>` exactly;
+ *  - `gotmpdir`: environ holds the NUL-separated entry `GOTMPDIR=<home>/.uzi-go-work/<leaf>` (or a
+ *    path below it), `<leaf>` matching `^g[1-9][0-9]{0,15}$`;
  *  - `cwd`: the working directory is `<home>` or `<worktree>` or inside either;
  *  - `unreadable`: either read failed while the pid still exists, or environ is over 4 MiB. It is
  *    attributed only when LINKED (see the file comment): its session or process group is one of a
@@ -71,7 +75,7 @@ const MAX_SPAWNED = 64;
  *  - otherwise not the run's; a pid that vanished mid-read is skipped.
  *
  * Mode `scan` prints `A\t<pid>\t<why>` per attributed process. Mode `kill` SIGKILLs every process
- * attributed by `home` or `cwd` (never an `unreadable` one: that is not known to be the run's, and
+ * attributed by `home`, `gotmpdir` or `cwd` (never an `unreadable` one: that is not known to be the run's, and
  * never a direct child of `<workerPid>`: the worker's own git or helper children), in rounds until a
  * round kills nothing (at most 5; the links found in earlier rounds are kept, so a linked process
  * whose linking parent was just killed stays linked): immediately before each kill it re-reads
@@ -216,13 +220,36 @@ function hasHome(buf) {
   }
   return false;
 }
-// "home" | "cwd" | "unreadable" | "none" | "gone"
+// The managed Go work dir: an exact NUL-delimited entry GOTMPDIR=<home>/.uzi-go-work/<leaf>, or a
+// path inside that leaf, where <leaf> is g<generation> (same grammar as go-work.ts).
+const gotmpPrefix = Buffer.from("GOTMPDIR=");
+const gotmpRoot = home + "/.uzi-go-work/";
+function hasGotmpdir(buf) {
+  let i = 0;
+  while ((i = buf.indexOf(gotmpPrefix, i)) !== -1) {
+    if (i === 0 || buf[i - 1] === 0) {
+      let end = buf.indexOf(0, i);
+      if (end === -1) end = buf.length;
+      const v = buf.toString("latin1", i + gotmpPrefix.length, end);
+      if (v.startsWith(gotmpRoot)) {
+        const rest = v.slice(gotmpRoot.length);
+        const slash = rest.indexOf("/");
+        const leaf = slash === -1 ? rest : rest.slice(0, slash);
+        if (/^g[1-9][0-9]{0,15}$/.test(leaf)) return true;
+      }
+    }
+    i += 1;
+  }
+  return false;
+}
+// "home" | "gotmpdir" | "cwd" | "unreadable" | "none" | "gone"
 function attribution(pid) {
   let unreadable = false;
   try {
     const env = readBounded(root + "/" + pid + "/environ", ENV_MAX);
     if (env === null) unreadable = true;
     else if (hasHome(env)) return "home";
+    else if (hasGotmpdir(env)) return "gotmpdir";
   } catch {
     if (!exists(pid)) return "gone";
     unreadable = true;

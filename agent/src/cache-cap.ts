@@ -8,7 +8,8 @@
 //    used entries first, run-caches.ts trimRunCaches) only at a proven quiet point: between turns
 //    AND with no process of the run alive, never judged from file mtimes. "Alive" is the executor's
 //    probe: its CLI process groups, plus every process attributed to the run by environment
-//    (`HOME=<run HOME>`) or working directory (run-procs.ts), since the CLI runs each Bash command
+//    (`HOME=<run HOME>` or a `GOTMPDIR` inside the run's managed Go work leaf) or working directory
+//    (run-procs.ts), since the CLI runs each Bash command
 //    detached, outside its groups; an unknown answer is alive. A run that stays over the cap is
 //    parked preventively (see {@link SOFT_PARK_RULE}).
 //  - the HARD layer, the per-tick pressure action. {@link DiskGovernor.observe} runs on every stats
