@@ -261,6 +261,22 @@ describe("code cross-check verification caveats", () => {
     assert.doesNotMatch(s, /no findings/);
   });
 
+  it("keeps criterion references in rendered titles and leaves stored details untouched", () => {
+    const findings = [
+      fnd("G1", "Requirement gap: AC3 omission count missing", { detail: "See acceptance criterion AC3." }),
+      fnd("C1", "Coverage uncertainty: AC7 hosted CI not verifiable", { severity: "minor", detail: "Criterion AC7 needs exact-head CI." }),
+    ];
+    const summary = noCoverage({ findings, dispositions: [disp("C1", "declined", "landing obligation")] });
+    const before = structuredClone(summary);
+    const s = sectionOf(summary);
+    assert.ok(s.includes("- `G1` \u00B7 major \u00B7 src/G1.ts:3 \u00B7 Requirement gap: AC3 omission count missing \u2014 not reported"));
+    assert.ok(s.includes("- `C1` \u00B7 minor \u00B7 src/C1.ts:3 \u00B7 Coverage uncertainty: AC7 hosted CI not verifiable \u2014 declined: landing obligation"));
+    assert.ok(s.indexOf("`G1`") < s.indexOf(CAVEAT_HEADER) && s.indexOf(CAVEAT_HEADER) < s.indexOf("`C1`"));
+    // Detail is not rendered and no criterion mapping is derived from it.
+    assert.doesNotMatch(s, /acceptance criterion AC3|Criterion AC7 needs/);
+    assert.deepStrictEqual(summary, before);
+  });
+
   it("puts graded lines before the caveat header and counts each group", () => {
     const findings = [fnd("C1", "Coverage uncertainty: x"), fnd("G1", "Real defect"), fnd("G2", "Another defect")];
     const s = sectionOf(noCoverage({ findings, dispositions: [disp("C1", "declined", "n/a"), disp("G1", "addressed", "patched")] }));
