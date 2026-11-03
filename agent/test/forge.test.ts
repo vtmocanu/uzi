@@ -16,6 +16,43 @@ import {
   type FetchFn,
 } from "../src/forge.js";
 
+describe("forge error property contracts", () => {
+  it("preserves ForgeError fields, descriptors, key order and inheritance", () => {
+    const error = new ForgeError(403, "denied");
+    assert.ok(error instanceof Error);
+    assert.ok(error instanceof ForgeError);
+    assert.equal(Object.getPrototypeOf(error), ForgeError.prototype);
+    assert.deepEqual(Object.keys(error), ["status", "detail", "name"]);
+    for (const [key, value] of Object.entries({ status: 403, detail: "denied", name: "ForgeError" })) {
+      assert.deepEqual(Object.getOwnPropertyDescriptor(error, key), {
+        value, writable: true, enumerable: true, configurable: true,
+      });
+    }
+    assert.deepEqual(Object.getOwnPropertyDescriptor(error, "message"), {
+      value: "forge API returned 403: denied", writable: true, enumerable: false, configurable: true,
+    });
+  });
+
+  it("preserves ForgeResponseTooLarge fields, descriptors, key order and inheritance", () => {
+    const error = new ForgeResponseTooLarge(1024);
+    assert.ok(error instanceof Error);
+    assert.ok(error instanceof ForgeError);
+    assert.ok(error instanceof ForgeResponseTooLarge);
+    assert.equal(Object.getPrototypeOf(error), ForgeResponseTooLarge.prototype);
+    assert.deepEqual(Object.keys(error), ["status", "detail", "name", "maxBytes"]);
+    for (const [key, value] of Object.entries({
+      status: 0, detail: "response too large (over 1024 bytes)", name: "ForgeResponseTooLarge", maxBytes: 1024,
+    })) {
+      assert.deepEqual(Object.getOwnPropertyDescriptor(error, key), {
+        value, writable: true, enumerable: true, configurable: true,
+      });
+    }
+    assert.deepEqual(Object.getOwnPropertyDescriptor(error, "message"), {
+      value: "forge API returned 0: response too large (over 1024 bytes)", writable: true, enumerable: false, configurable: true,
+    });
+  });
+});
+
 // The MR/PR path is exercised up to — never across — the network boundary via an
 // injected fake transport (testing-credentials policy). The PAT rides an auth
 // header only, never the URL or body.

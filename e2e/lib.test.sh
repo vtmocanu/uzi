@@ -474,6 +474,8 @@ echo 0 > "$SEQ_DIR/claims"
 export REPO_ID=repo
 apipost() { printf '%s\n' '{"card":{"iid":1}}'; }
 wait_status() { :; }
+# Registration is exercised in outage-cut.test.sh; this fixture isolates custody admission.
+wait_outbox_feature() { :; }
 tick_count() { echo 3; }
 create_run() {
   local calls expected

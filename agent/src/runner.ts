@@ -2922,6 +2922,10 @@ export interface RunnerOptions {
   cancellationBudgetFactory?: () => MaintenanceBudget;
   /** Stub-only E2E redrive spacing; omitted for production and all other phases. */
   recoveryLiveTiming?: Pick<RecoveryCoordinatorOptions, "liveBackoffBaseMs" | "liveBackoffCapMs">;
+  /** Stub fixture boundary after durable, matching publication enrollment. */
+  afterPublicationEnrolled?: (input: Readonly<{
+    runId: string; claimGeneration: number; issueDescription: string; signal?: AbortSignal;
+  }>) => Promise<void>;
   /** Test-only timing overrides; production uses the approved bounded retry/poll policy. */
   planCrossCheckTiming?: PlanCrossCheckTiming;
   /** Explicit bounded fixture transport only; never wired by worker runtime. */
@@ -3192,6 +3196,7 @@ export class RunRunner {
   private readonly planCrossCheckTiming: PlanCrossCheckTiming | undefined;
   private readonly semanticCoverageTestTransport: BoundedCoverageTestTransport | undefined;
   private readonly recoveryRetryMs: number;
+  private readonly afterPublicationEnrolled: RunnerOptions["afterPublicationEnrolled"];
   private readonly completionHoldReconcileTimeoutMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
   private readonly codexBoundaryDeadlineMs: number;
@@ -3454,6 +3459,7 @@ export class RunRunner {
     this.checkpointTickIntervalMs = opts.checkpointTickIntervalMs ?? 5 * 60_000;
     this.checkpointTestHooks = opts.checkpointTestHooks;
     this.planCrossCheckTiming = opts.planCrossCheckTiming;
+    this.afterPublicationEnrolled = opts.afterPublicationEnrolled;
     this.semanticCoverageTestTransport = opts.semanticCoverageTestTransport;
     this.teardownTestDeps = opts.teardownTestDeps;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
@@ -8837,6 +8843,75 @@ export class RunRunner {
     const deps = this.publicationDeps(flight, signal);
     let outcome: Awaited<ReturnType<typeof enrollPublicationIntent>> | Awaited<ReturnType<typeof resendPublicationRecord>> =
       await enrollPublicationIntent(deps, intent);
+    // Only initial sequence-less enrollment reconciles here. Each later call sends once,
+    // after backoff and fresh ownership evidence, from the durable original body.
+    // The original finalize signal bounds this loop; it has no separate retry budget.
+    if (outcome.kind === "uncertain" && outcome.record && outcome.record.enrollment_seq === undefined &&
+        (outcome.reason === "ack_unknown" || outcome.subreason === "stale_claim")) {
+      const held = outcome.record;
+      const { owner_kind: _owner, enrollment_seq: _enrollment, candidate_seq: _candidate, ...heldBody } = held;
+      let waitingReason: "ack_unknown" | "readoption_pending" | undefined;
+      const waiting = (reason: "ack_unknown" | "readoption_pending"): void => {
+        if (waitingReason === reason) return;
+        waitingReason = reason;
+        runLog.info("publication intent reconciliation waiting", {
+          run_id: flight.runId, claim_generation: held.claim_generation, reason,
+        });
+      };
+      const interrupted = (): void => {
+        signal?.throwIfAborted();
+        if (flight.steering.claimFence() !== undefined) throw new StaleClaimError();
+        if (flight.steering.isCancelled()) throw new Error("run cancelled");
+        if (flight.active?.shuttingDown || this.shuttingDownGlobal) throw new Error("worker shutdown");
+        for (const lifecycle of this.retainedLifecycleSignals(flight)) lifecycle.throwIfAborted();
+      };
+      const stop = (): never => { throw new StaleClaimError(); };
+      waiting("ack_unknown");
+      try {
+        for (;;) {
+          interrupted();
+          // A consumed pause can leave cancel.signal sticky. Still pay the backoff.
+          await this.waitRecoveryRetry(flight, false, this.recoveryRetryMs, signal);
+          interrupted();
+          let own: RunOwnershipResponse;
+          try {
+            own = await this.getObservedRunOwnership(flight, signal);
+          } catch (error) {
+            interrupted();
+            if (error instanceof RequestError && error.status >= 400 && error.status < 500 &&
+                error.status !== 408 && error.status !== 429) return stop();
+            waiting("ack_unknown");
+            continue;
+          }
+          interrupted();
+          if ((own.claim_generation !== undefined && own.claim_generation !== held.claim_generation) ||
+              own.claim_released === true || TERMINAL_RUN_STATUSES.has(own.status)) return stop();
+          if (own.claim_generation !== held.claim_generation || own.claim_released !== false) {
+            waiting("ack_unknown");
+            continue;
+          }
+          if (own.status === "queued") {
+            waiting("readoption_pending");
+            continue;
+          }
+          if (own.status !== "running") {
+            waiting("ack_unknown");
+            continue;
+          }
+          outcome = await enrollPublicationIntent({ ...deps, retryDelaysMs: [0] }, heldBody);
+          interrupted();
+          if (outcome.kind !== "uncertain" ||
+              (outcome.reason !== "ack_unknown" && outcome.subreason !== "stale_claim")) break;
+          waiting("ack_unknown");
+        }
+      } catch (error) {
+        // Preserve custody without suppressing dispatchFailure's interruption arms.
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
+        flight.stoppedSourceKept = true;
+        throw error;
+      }
+    }
     if (outcome.kind === "uncertain" && outcome.reason === "already_enrolled" && outcome.record?.enrollment_seq !== undefined &&
         outcome.record.candidate_seq !== undefined) {
       // A record of this run and generation survives (a completion-hold continue, a park). Ask the api
@@ -8865,6 +8940,17 @@ export class RunRunner {
         runLog.info("publication intent enrolled", {
           run_id: flight.runId, enrollment_seq: outcome.record.enrollment_seq, candidate_seq: outcome.record.candidate_seq,
         });
+        if (this.afterPublicationEnrolled) {
+          const fixtureSignal = AbortSignal.any([
+            ...this.retainedLifecycleSignals(flight), this.shutdownSignal.signal, ...(signal ? [signal] : []),
+          ]);
+          fixtureSignal.throwIfAborted();
+          await this.afterPublicationEnrolled(Object.freeze({
+            runId: flight.runId, claimGeneration: flight.claimGeneration,
+            issueDescription: claim.issue_description ?? "", signal: fixtureSignal,
+          }));
+          fixtureSignal.throwIfAborted();
+        }
         return "proceed";
       case "not_enrolled":
         return unavailable(outcome.reason, outcome.detail);
