@@ -196,6 +196,7 @@ uzi context set <name> --url <url>
 uzi context rm <name>
 
 uzi run list
+uzi run cross-checks [--lifecycle active|past] [--stage all|plan|code] [--outcome any|didnt_finish|raised_issues|passed|replaced] [--cursor <cursor>] [--limit <n>] [--attempt-cursor <cursor>]... [--attempt-limit <n>]
 uzi run get <run-id> [--field <name>]...
 uzi run logs <run-id> [--follow] [--after <seq>] [--tail <n>]
 uzi run plan <run-id> [--version N] [--diff] [--json]

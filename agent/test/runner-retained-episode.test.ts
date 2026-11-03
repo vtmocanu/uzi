@@ -918,6 +918,122 @@ for (const stage of ["reservation", "discovery"] as const) {
   });
 }
 
+for (const control of ["cancel", "deadline", "child cancel"] as const) {
+  it(`retained bootstrap ${control} settles its scoped query on lifecycle stop`, async t => {
+    const { claim, bare, clone, key } = await seed();
+    const source = readJournal(bare, clone.branch);
+    await git.reserveRecoveryIteration(bare, clone.branch, key, source, 1, claim.claim_generation);
+    const before = readJournal(bare, clone.branch);
+    const expire = control === "deadline" ? episodeDeadline(t, before.recovery.deadline) : undefined;
+    git.recoveryAttemptMode = async () => false;
+    git.discoverRetainedRecovery = async () => ({ barePath: bare, journal: before });
+    let reserved!: () => void, acquired!: () => void, release!: () => void, queried!: () => void;
+    const reservationDone = new Promise<void>(resolve => { reserved = resolve; });
+    const held = new Promise<void>(resolve => { acquired = resolve; });
+    const entry = new Promise<void>(resolve => { queried = resolve; });
+    let reservationCompleted = false, holderActive = false, childEntered = false;
+    let queryPhase: { stage: string; finiteDeadline: boolean; liveSignal: boolean; holderActive: boolean } | undefined;
+    const reserve = git.reserveRecoveryIteration.bind(git);
+    t.mock.method(git, "reserveRecoveryIteration", async (...args: Parameters<typeof reserve>) => {
+      const result = await reserve(...args);
+      reservationCompleted = true;
+      reserved();
+      await held;
+      return result;
+    });
+    let childCancelled = false, childSettled = false;
+    const childStop = new AbortController();
+    let finish!: (value: { code: number }) => void;
+    const completed = new Promise<{ code: number }>(resolve => { finish = resolve; });
+    const read = git.readRemediationRestrictionFacts.bind(git);
+    let queries = 0;
+    t.mock.method(git, "readRemediationRestrictionFacts", (...args: Parameters<typeof read>) => {
+      queries++;
+      const scope = (git as any).recoveryOperations.getStore();
+      queryPhase = {
+        stage: reservationCompleted ? "post-reservation query" : "early bootstrap query",
+        finiteDeadline: Number.isFinite(scope?.deadline),
+        liveSignal: scope?.signal instanceof AbortSignal && !scope.signal.aborted,
+        holderActive,
+      };
+      if (control === "child cancel") return git.withBoundaryProcessSpawner(async () => {
+        childEntered = true;
+        queried();
+        return {
+          stdout: Readable.from([]), stderr: Readable.from([]), stdin: null, completed,
+          cancel: async () => { childCancelled = true; childSettled = true; finish({ code: -1 }); },
+        };
+      }, childStop.signal, () => read(...args));
+      const result = read(...args);
+      queried();
+      return result;
+    });
+    const retainedHome = path.join(homeDir, claim.run_id);
+    fs.mkdirSync(retainedHome, { recursive: true });
+    const session = path.join(retainedHome, "retained-session.jsonl");
+    fs.writeFileSync(session, "predecessor session evidence\n");
+    const pins = command(bare, "for-each-ref", "--format=%(refname) %(objectname)");
+    let models = 0, admissions = 0, captures = 0, proofs = 0, settled = false;
+    const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
+      fakeGitlab().gitlab, undefined, nullLogger(), { codexBoundaryDeadlineMs: 100 });
+    t.mock.method(r as any, "admitPredecessorSource", async () => { admissions++; throw new Error("must not admit"); });
+    t.mock.method(r as any, "runFreeCapture", async () => { captures++; throw new Error("must not capture"); });
+    t.mock.method(r as any, "quiesceRun", async () => { proofs++; throw new Error("must not prove"); });
+    const execution = r.execute(claim).finally(() => { settled = true; });
+    let holder: Promise<void> | undefined;
+    let config: Buffer | undefined;
+    try {
+      await requireEpisodeEntry(reservationDone, execution);
+      // Start the holder from the test's context AFTER the real reservation released B.
+      // It must not inherit the recovery operation's cancellation signal.
+      if (control === "child cancel") acquired();
+      else {
+        holder = git.withBareLock(bare, async () => {
+          holderActive = true;
+          try {
+            acquired();
+            await new Promise<void>(resolve => { release = resolve; });
+          } finally {
+            holderActive = false;
+          }
+        });
+        await held;
+      }
+      config = fs.readFileSync(path.join(bare, "config"));
+      await requireEpisodeEntry(entry, execution);
+      assert.deepEqual(queryPhase, {
+        stage: "post-reservation query", finiteDeadline: true, liveSignal: true,
+        holderActive: control !== "child cancel",
+      }, "query enters after real reservation in a live finite recovery scope");
+      if (control === "child cancel") {
+        assert.equal(childEntered, true, "real query acquired its native child before cancellation");
+      } else {
+        assert.equal(holderActive, true, "independent bare lock holder remains active at cancellation");
+      }
+      if (expire) expire();
+      else (r as any).activeRuns.get(claim.run_id).cancel.abort();
+      await execution;
+      assert.equal(settled, true, "query and execute settle before the independent holder is released");
+      assert.equal(queries, 1);
+      if (control === "child cancel") {
+        assert.equal(childCancelled, true);
+        assert.equal(childSettled, true, "fake child completion was signalled during cancellation");
+      }
+    } finally {
+      (r as any).activeRuns.get(claim.run_id)?.cancel.abort(new Error("fixture cleanup"));
+      childStop.abort(new Error("fixture cleanup"));
+      release?.();
+      await Promise.allSettled([execution, ...(holder ? [holder] : [])]);
+    }
+    await git.withBareLock(bare, async () => {});
+    assert.deepEqual(fs.readFileSync(path.join(bare, "config")), config, "no late query or finalization mutation after unlock");
+    assert.equal(command(bare, "for-each-ref", "--format=%(refname) %(objectname)"), pins);
+    assert.equal(fs.readFileSync(session, "utf8"), "predecessor session evidence\n");
+    assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+    assert.deepEqual({ models, admissions, captures, proofs }, { models: 0, admissions: 0, captures: 0, proofs: 0 });
+  });
+}
+
 it("lifecycle cancellation settles the actual attempt-mode child without discovery or a terminal", async () => {
   const { claim, bare, clone } = await seed();
   const before = fs.readFileSync(path.join(bare, "config"));

@@ -170,7 +170,7 @@ What the gauges mean:
   fill. It is sampled by the `dind-meter` sidecar and reported by
   the worker on its own heartbeat. On eligible persistent hosted workers,
   fresh sustained byte or inode pressure also drives gated DinD maintenance;
-  this is separate from the legacy `/nix`+`/data` recycle. **DinD state,
+  this is separate from legacy pressure recycling (Docker: nix only; plain: nix/data). **DinD state,
   including named volumes, can be lost; the shared run directory `/data/runner` is on the data PVC and is kept on pod replacement.** See
   [Docker inside a worker](./worker-docker.md#dind-data-metering-and-automatic-pruning).
 - A dropped or malformed sample self-clears the gauge for that one tick (by
@@ -292,11 +292,16 @@ and switches are unchanged. Five mechanisms:
    for the policy boundary.
 
 **The [disk self-heal recycle](hosted-workers.md#disk-self-heal) (PRD #837)
-is still the last resort**, unchanged by any of the above: a hosted worker's
-volume that fills up anyway (sustained at or above the disk-pressure
-threshold) still gets drained and recycled, losing everything on `/data`.
-Everything in this section exists to make that outcome rare, not to replace
-it — none of these mechanisms touch `/nix` or trigger a recycle themselves.
+remains a last resort on plain hosted workers**, where sustained pressure can
+drain and recycle nix/data, losing everything on `/data`. After the fixed #3852
+controller deploys, hosted Docker workers keep their data PVC: explicit nix
+pressure permits nix-only recycle; other causes defer with
+`disk-recycle-skipped-docker-data`. A full Docker data volume therefore relies
+on the run's park-and-trim and supported manual cleanup until #3431 M1b and
+#3329's idle roll land. Use the inspect/discard procedures in
+[Run recovery](run-recovery.md#retained-sources-with-no-open-hold-worker-local-inspect-and-discard),
+or enlarge the PVC where the StorageClass allows it; do not delete the PVC or
+pod by hand to free space. These worker-local mechanisms do not recycle `/nix`.
 See [configuration.md](configuration.md#worker-disk-safety-prd-1809) for
 every tunable in this section and its default.
 

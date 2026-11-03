@@ -298,6 +298,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 
 	cmd.AddCommand(
+		newRunCrossChecksCmd(env, gf),
 		newRunListCmd(env, gf), newRunGetCmd(env, gf), newRunLogsCmd(env, gf), newRunPlanCmd(env, gf), newRunWaitCmd(env, gf),
 		newRunReviewCmd(env, gf), newRunCreateCmd(env, gf), newRunApproveCmd(env, gf), newRunRejectCmd(env, gf),
 		newRunReviseCmd(env, gf), newRunCancelCmd(env, gf), newRunStopCmd(env, gf), newRunScopeCmd(env, gf),

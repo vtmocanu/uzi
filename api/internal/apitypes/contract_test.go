@@ -74,6 +74,8 @@ func contractCases() []contractCase {
 		newContractCase[RunDTO]("run"),
 		newContractCase[RunListItemDTO]("run_list_item"),
 		newContractCase[RunSummaryItemDTO]("run_summary_item"),
+		newContractCase[CrossCheckHistoryDTO]("cross_check_history"),
+		newContractCase[CrossCheckHistoryAvailabilityDTO]("cross_check_history_availability"),
 		// M2 — the rest of the apitypes hot set.
 		newContractCase[RepoDTO]("repo"),
 		newContractCase[AdminDockerAllowlistRepoDTO]("admin_docker_allowlist_repo"),

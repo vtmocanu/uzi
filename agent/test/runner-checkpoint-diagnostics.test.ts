@@ -2,13 +2,18 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import { RunRunner } from "../src/runner.js";
-import { GitCache, ScratchPublicationError } from "../src/git.js";
+import { GitCache, ScratchPublicationError, type CheckpointPublicationContext } from "../src/git.js";
 import { WorkerClient } from "../src/client.js";
 import { GitBoundaryAbortError } from "../src/checkpoint-stop.js";
 import { makeTextRedactor } from "../src/redact.js";
 import { nullLogger } from "./helpers.js";
 
 const TIP = "a".repeat(40);
+const publicationContext: CheckpointPublicationContext = {
+  sourceSha: TIP, candidateSha: TIP, excludeSha: TIP, packExcludeShas: [TIP],
+  restrictionFacts: { enrolled: false, blocked: false, roots: [], flaggedOIDs: [],
+    fingerprint: "fixture-confirmed-absence" },
+};
 const secret = "glpat-" + "1234567890abcdefghij";
 const redact = makeTextRedactor([secret]);
 const label = (phase: string, cause: string) =>
@@ -19,18 +24,24 @@ function harness(redactor: ((s: string) => string) | undefined = redact) {
   const logs: Array<{ msg: string; fields: Record<string, unknown> }> = [];
   const feed: Array<{ payload: { text: string } }> = [];
   const git = new GitCache("/unused", nullLogger());
+  // Transport fixtures declare confirmed absence; real runner admission still checks the binding.
+  git.readRemediationRestrictionFacts = async (bare, branch, exactRunId) => {
+    assert.deepEqual([bare, branch, exactRunId], ["bare", "branch", "diagnostics"]);
+    return publicationContext.restrictionFacts!;
+  };
   const client = new WorkerClient("http://unused", "test", "test", nullLogger());
   const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch: "branch" }) } }), nullLogger(), 1);
   const seam = runner as unknown as {
     requireTrackingOwned: () => Promise<string>;
-    checkpointRemediationHold: () => Promise<boolean>;
     publishCheckpointOutcome: (flight: unknown, bare: string, branch: string, overlay?: undefined, signal?: AbortSignal) => Promise<unknown>;
   };
   seam.requireTrackingOwned = async () => TIP;
-  seam.checkpointRemediationHold = async () => false;
   let error: unknown;
   let packing = false, success = false, requests = 0, cancels = 0, exits = 0;
-  git.checkpointPack = async () => {
+  const guards: unknown[] = [];
+  git.checkpointPack = async (_bare, _branch, _overlay, _pinned, _step, _source, guard) => {
+    guards.push(guard);
+    await guard?.(TIP, publicationContext);
     if (packing) throw error;
     return { tipOid: TIP, pack: Readable.from(["pack"]),
       exited: Promise.resolve(0).then(code => { exits++; return code; }),
@@ -42,20 +53,23 @@ function harness(redactor: ((s: string) => string) | undefined = redact) {
     if (success) return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/branch" } };
     throw error;
   };
-  const flight = { runId: "diagnostics", runKind: "issue", lastCheckpointRefTip: "OLD",
+  const lifecycle = new AbortController();
+  const flight = { cancel: lifecycle, steering: { lifecycleSignal: () => lifecycle.signal }, runId: "diagnostics", runKind: "issue", barePath: "bare", branch: "branch", lastCheckpointRefTip: "OLD",
     lastAttemptedCheckpointRefTip: undefined as string | undefined,
     reportedPublishOutcomes: new Set<string>(), redactText: redactor,
     runLog: { ...nullLogger(), warn: (msg: string, fields: Record<string, unknown> = {}) => logs.push({ msg, fields }) },
     batcher: { emit: (event: unknown) => feed.push(event as typeof feed[number]) } };
+  const publish = (signal?: AbortSignal) => seam.publishCheckpointOutcome(flight, "bare", "branch", undefined, signal)
+    .finally(() => assert.ok(guards.every(guard => typeof guard === "function"), "runner must supply every publication guard"));
   return { logs, feed, flight, client,
     get requests() { return requests; }, get cancels() { return cancels; }, get exits() { return exits; },
     fail: (e: unknown, pack = false, signal?: AbortSignal) => {
       error = e; packing = pack; success = false;
-      return seam.publishCheckpointOutcome(flight, "bare", "branch", undefined, signal);
+      return publish(signal);
     },
     confirm: () => {
       packing = false; success = true;
-      return seam.publishCheckpointOutcome(flight, "bare", "branch");
+      return publish();
     },
   };
 }

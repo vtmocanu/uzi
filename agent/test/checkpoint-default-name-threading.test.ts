@@ -2,7 +2,7 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough, Readable } from "node:stream";
 import { performance } from "node:perf_hooks";
-import { GitCache, type CheckpointRange } from "../src/git.js";
+import { GitCache, type CheckpointRange, type CheckpointPublicationContext } from "../src/git.js";
 import { WorkerClient } from "../src/client.js";
 import { RunRunner } from "../src/runner.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
@@ -10,9 +10,16 @@ import { prepareFrozenHeld, type HeldGit } from "../src/frozen-held.js";
 import { nullLogger } from "./helpers.js";
 
 const TIP = "a".repeat(40), FLOOR = "b".repeat(40), DEFAULT = "c".repeat(40);
+const restrictionFacts: NonNullable<CheckpointPublicationContext["restrictionFacts"]> = {
+  enrolled: false, blocked: false, roots: [], flaggedOIDs: [], fingerprint: "fixture-confirmed-absence",
+};
 const policy = { version: 1 as const, blocked: false, everKnown: false, flaggedCommits: [], ciGlobs: null, extraFloors: [] };
 function fixture(defaultBranch?: string) {
   const git = new GitCache("/unused", nullLogger());
+  git.readRemediationRestrictionFacts = async (bare, branch, runId) => {
+    assert.deepEqual([bare, branch, runId], ["bare", "task", "test"]);
+    return restrictionFacts;
+  };
   const client = new WorkerClient("http://unused", "test", "test", nullLogger());
   const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch: "task" }) } }),
     nullLogger(), 1, undefined, { checkpointTestHooks: { retryBackoffMs: [0, 0] } });
@@ -21,7 +28,7 @@ function fixture(defaultBranch?: string) {
   assert.equal(initialized.owedDefaultBranch, defaultBranch?.trim() || undefined, "custody keeps existing semantics");
   const flight = {
     ...initialized,
-    runId: "test", runKind: "issue", barePath: "bare",
+    runId: "test", runKind: "issue", barePath: "bare", branch: "task",
     checkpointChainForge: false, runLog: nullLogger(), reportedPublishOutcomes: new Set<string>(),
     batcher: { emit() {} },
   } as unknown as Parameters<RunRunner["publishCheckpointOutcome"]>[0];
@@ -33,27 +40,53 @@ function fixture(defaultBranch?: string) {
   return { git, runner, flight };
 }
 
-for (const name of ["開発/server", "開発/custom\u00a0", " 開発/custom ", undefined]) {
+for (const github of [false, true]) {
+  it(`#2753 chain wiring: github=${github} chains on every forge, trusts only the confirmed tip`, async () => {
+    const { git, runner, flight } = fixture(undefined);
+    const confirmed = "d".repeat(40), attempted = "e".repeat(40);
+    flight.checkpointChainForge = github;
+    flight.lastCheckpointRefTip = confirmed;
+    flight.lastAttemptedCheckpointRefTip = attempted;
+    let seen: Parameters<GitCache["checkpointPack"]> | undefined;
+    git.checkpointPack = async (...args) => {
+      seen = args;
+      return { tipOid: TIP, pack: Readable.from(["PACK"]), exited: Promise.resolve(0), cancel() {},
+        replay: async () => { throw new Error("unexpected replay"); } };
+    };
+    await runner["publishCheckpointOutcome"](flight, "bare", "task", undefined, new AbortController().signal);
+    assert.ok(seen, "checkpointPack was called");
+    assert.deepEqual(seen[7], [attempted, confirmed]);
+    assert.equal(seen[8]?.markerTrustedTip, confirmed, "never the attempted tip");
+    assert.equal(seen[8]?.chainWorkflowSwap, github);
+  });
+}
+
+for (const name of ["開発/server","開発/custom\u00a0", " 開発/custom ", undefined]) {
   for (const overlay of [false, true]) for (const pinned of [false, true]) {
     it(`shared tick/park/pause publication: server=${name ?? "absent"} overlay=${overlay} pinned=${pinned}`, async () => {
       const { git, runner, flight } = fixture(name);
       const signal = new AbortController().signal;
       const range: CheckpointRange = { tipSha: TIP, excludeSha: FLOOR, defaultBlobSha: DEFAULT };
-      let calls = 0;
+      let calls = 0, suppliedGuard: unknown;
       git.checkpointPack = async (...args) => {
         calls++;
+        suppliedGuard = args[6];
         assert.equal(args[2]?.defaultBranch, overlay ? "untrusted-overlay-fallback" : undefined);
         assert.equal(args[3], pinned ? range : undefined, "preserve the scanned range object including defaultBlobSha");
         assert.equal(args[5], TIP);
         assert.equal(args[8]?.defaultBranch, name, "only the server flight name authorizes omission");
         assert.equal(args[8]?.signal, signal);
-        await args[6]?.(TIP);
+        await args[6]?.(TIP, {
+          sourceSha: TIP, candidateSha: TIP, excludeSha: FLOOR, packExcludeShas: [FLOOR],
+          ...(pinned ? { defaultBlobSha: DEFAULT } : {}), restrictionFacts,
+        });
         return { tipOid: TIP, pack: Readable.from(["PACK"]), exited: Promise.resolve(0), cancel() {},
           replay: async () => { throw new Error("unexpected replay"); } };
       };
       assert.deepEqual(await runner["publishCheckpointOutcome"](flight, "bare", "task",
         overlay ? { defaultBranch: "untrusted-overlay-fallback" } : undefined, signal, pinned ? range : undefined),
       { published: true });
+      assert.equal(typeof suppliedGuard, "function", "runner must supply the publication guard");
       assert.equal(calls, 1);
     });
   }
@@ -109,11 +142,17 @@ for (const expireOnRetry of [false, true]) {
   it(`HTTP retry uses GitCache replay with original deadline: expired=${expireOnRetry}`, async t => {
     let now = 1_000, requests = 0;
     t.mock.method(Date, "now", () => now);
+    // Replay keeps its 60-second caller clock with the default local admission bound.
     const { git, runner, flight } = fixture("server");
     const client = runner["client"];
     const signal = new AbortController().signal;
     const deadlines: number[] = [], remaining: number[] = [];
     Object.assign(git, {
+      // The replay uses real pack admission over synthetic, unenrolled metadata.
+      remediationRestrictionFactsUnderLock: async (bare: string, branch: string, runId: string) => {
+        assert.deepEqual([bare, branch, runId], ["bare", "task", "test"]);
+        return restrictionFacts;
+      },
       captureCheckpointDefault: async () => DEFAULT,
       trackingTip: async () => TIP,
       scratchPublicationPreflight: async () => TIP,

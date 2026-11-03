@@ -339,6 +339,12 @@ for (const sibling of ["none", "unreadable", "uncovered"] as const) {
       retireFinalizeRecord(flight: { runId: string; claimGeneration: number; iterationParkState: "none" }, site: string): Promise<void>;
     };
     const runId = "cleanup-ack", generation = 7, sha = "a".repeat(40);
+    git.readRemediationRestrictionFacts = async (bare, branch, exactRunId) => {
+      assert.deepEqual([bare, branch, exactRunId], [git.barePathFor(fx.originPath), "task", runId]);
+      return { enrolled: false, blocked: false, roots: [], flaggedOIDs: [], fingerprint: "empty-inventory-fixture" };
+    };
+    git.withRemediationRestrictionFacts = async (bare, branch, exactRunId, consume) =>
+      consume(await git.readRemediationRestrictionFacts(bare, branch, exactRunId));
     client.hasFeature = name => name === "recovery_inventory_v1";
     client.getRunOwnership = async () => ({ status: "completed", claim_generation: generation, inventory_guarded: true });
     client.listRecoveryHolds = async () => ({ run_id: runId, holds: [

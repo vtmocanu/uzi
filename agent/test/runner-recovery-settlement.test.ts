@@ -889,6 +889,8 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
   }
 
   async function preparePublication(r: LiveRig, flight: Record<string, unknown>): Promise<void> {
+    flight.barePath = r.bare;
+    flight.branch = "agent/issue-1751";
     execFileSync("git", ["-C", fx.originPath, "update-ref", "refs/heads/agent/issue-1751", r.published]);
     flight.owedContext = Promise.resolve(await establishTrackingOwnership(
       git, r.bare, fx.originPath, "agent/issue-1751", String(flight.runId),

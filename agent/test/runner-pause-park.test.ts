@@ -1363,3 +1363,109 @@ describe("unsafe WIP flight quarantine", () => {
     });
   }
 });
+
+// issue #2753 — park, resume, park again. A first park published a `wip(park):` marker M (parent R) to
+// the checkpoint ref. The resume restores M's work uncommitted at R. An owner pause then captures a NEW
+// marker M2 (parent R); a raw M2 was refused `not_descendant` (it does not descend M), so the pause
+// reported `pause_failed`. The publish now chains over the confirmed M: C = [M, M2].
+describe("RunRunner — park, resume, park again (issue #2753)", () => {
+  const rd = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-C", cwd, ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" }).trim();
+  const isAncestor = (dir: string, a: string, d: string): boolean => {
+    rd(dir, "cat-file", "-e", `${a}^{commit}`);
+    rd(dir, "cat-file", "-e", `${d}^{commit}`);
+    try { rd(dir, "merge-base", "--is-ancestor", a, d); return true; } catch { return false; }
+  };
+
+  /** A publisher with the api broker's strict-descendant rule: apply the pack, refuse `not_descendant`
+   *  (a 2xx skip) when the ref is set and the tip does not descend it, else advance with a CAS. */
+  function ancestryPublish(originPath: string, ref: string): { answers: Array<{ tip: string; body: unknown }>; restore: () => void } {
+    const answers: Array<{ tip: string; body: unknown }> = [];
+    const orig = client.publishCheckpoint.bind(client);
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (_runId: string, tip: string, pack: Readable) => {
+      const bytes = await drain(pack);
+      execFileSync("git", ["-C", originPath, "index-pack", "--stdin", "--fix-thin"], { env: GIT_ENV, input: bytes });
+      let cur: string | null = null;
+      try { cur = rd(originPath, "rev-parse", "--verify", "--quiet", ref); } catch { cur = null; }
+      let body: unknown;
+      if (cur === tip || (cur !== null && !isAncestor(originPath, cur, tip))) {
+        body = { published: false, ref, skipped: "not_descendant" };
+      } else {
+        rd(originPath, "update-ref", ref, tip, cur ?? "");
+        body = { published: true, ref };
+      }
+      answers.push({ tip, body });
+      return { ok: true, body };
+    };
+    return { answers, restore: () => { (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig; } };
+  }
+
+  it("an owner pause after a marker-restored resume reports paused, chains over M, and the next resume restores at R", async () => {
+    const iid = 2753_300;
+    const ref = `refs/uzi-checkpoints/agent/issue-${iid}`;
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-2753-park-"));
+    const seedDir = path.join(homeRoot, "seed");
+    execFileSync("git", ["clone", "-q", fx.originPath, seedDir], { env: GIT_ENV });
+    const r = rd(seedDir, "rev-parse", "HEAD");
+    fs.writeFileSync(path.join(seedDir, "wip.txt"), "first parked work\n");
+    rd(seedDir, "add", "-A");
+    rd(seedDir, ...IDENT, "commit", "-m", "wip(park): interrupted work auto-saved (test)");
+    const m = rd(seedDir, "rev-parse", "HEAD");
+    rd(seedDir, "push", "-q", "origin", `${m}:${ref}`);
+    const { gitlab } = fakeGitlab();
+    const pub = ancestryPublish(fx.originPath, ref);
+    const seen: { parked?: boolean; headIsR?: boolean; status?: string; mReachable?: boolean } = {};
+    try {
+      const factory: ExecutorFactory = (runId) => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: { run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+          seen.headIsR = rd(ctx.worktreePath, "rev-parse", "HEAD") === r;
+          seen.status = rd(ctx.worktreePath, "status", "--porcelain");
+          seen.mReachable = isAncestor(git.barePathFor(fx.originPath), m, rd(ctx.worktreePath, "rev-parse", "HEAD"));
+          // Park again: only the restored (uncommitted) work, plus a little more, is in the tree.
+          fs.writeFileSync(path.join(ctx.worktreePath, "wip2.txt"), "second parked work\n");
+          const at = { completedCount: 1, total: 2 };
+          seen.parked = await ctx.parkForPause?.(at);
+          return seen.parked ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+        } },
+      });
+      const claim = gitlabClaim(iid, { run_id: "27530000-0000-4000-8000-000000002753", session_id: "sess-a", checkpoint_tip: m });
+      await runnerWithGit(factory, gitlab).execute(claim);
+
+      assert.equal(seen.headIsR, true, "the resume sits at R");
+      assert.match(seen.status ?? "", /wip\.txt/, "M's work is restored uncommitted");
+      assert.equal(seen.mReachable, false, "M is not an ancestor of the branch");
+      const statuses = stateStatuses(claim.run_id);
+      assert.ok(!statuses.includes("pause_failed"), `no pause_failed, got ${JSON.stringify(statuses)}`);
+      assert.ok(statuses.includes("paused"), `paused reported, got ${JSON.stringify(statuses)}`);
+      assert.equal(seen.parked, true);
+      const tip = rd(fx.originPath, "rev-parse", ref);
+      assert.notEqual(tip, m, "the ref advanced");
+      assert.equal(isAncestor(fx.originPath, m, tip), true, "the new tip descends M");
+      const parents = rd(fx.originPath, "rev-list", "--parents", "-n", "1", tip).split(" ").slice(1);
+      assert.equal(parents[0], m, "first parent is the confirmed M");
+      const m2 = parents.at(-1)!;
+      assert.ok(rd(fx.originPath, "log", "-1", "--format=%s", m2).startsWith("wip(park):"), "last parent is the new pause marker");
+      assert.deepEqual(rd(fx.originPath, "rev-list", "--parents", "-n", "1", m2).split(" ").slice(1), [r], "the new marker's parent is R");
+      assert.equal(pub.answers.filter((a) => (a.body as { published?: boolean }).published === true).length, 1);
+
+      // The NEXT resume, from that ref on a fresh worker: HEAD is R, the work is uncommitted, M is out of history.
+      const dataB = path.join(homeRoot, "worker-b");
+      fs.mkdirSync(dataB, { recursive: true });
+      const gitB = new GitCache(dataB, nullLogger(), undefined, testGitCacheOptions());
+      const bareB = await gitB.ensureClone(fx.originPath);
+      const rc = await gitB.createOrAttachRunnerClone(bareB, iid, noProofReseed, "run-B", true, tip);
+      assert.equal(rc.seededFrom, "checkpoint");
+      assert.equal(rd(rc.path, "rev-parse", "HEAD"), r, "the next resume's HEAD is R");
+      const dirty = rd(rc.path, "status", "--porcelain");
+      assert.match(dirty, /wip2\.txt/, "the second park's work is uncommitted");
+      assert.equal(fs.readFileSync(path.join(rc.path, "wip2.txt"), "utf8"), "second parked work\n");
+      assert.equal(isAncestor(bareB, m, rd(rc.path, "rev-parse", "HEAD")), false, "M is not an ancestor of the worktree HEAD");
+      assert.match(dirty, /(^|\s)wip\.txt/m, "the first park's work survives the second park");
+    } finally {
+      pub.restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+});

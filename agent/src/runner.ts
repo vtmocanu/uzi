@@ -31,7 +31,7 @@ import { AuthorityRefusal, SourceUseHeldRefusal } from "./authority-lock.js";
 import type { AuthorityRuntime, AuthorityWait } from "./authority-runtime.js";
 import { leaseEpoch, leaseHarness, type SourceUseLease } from "./completion-authority.js";
 import { buildClaudeSourceCore, buildCodexSourceCore, serializeSourceFence, sourceFenceOf } from "./completion-source.js";
-import type { MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult, TrackingAttemptToken } from "./git.js";
+import type { CheckpointPublicationContext, PushPublicationContext, RemediationRestrictionIdentity, RemediationRecovery, MemoryParkRecord, WipIncompleteInfo, CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult, TrackingAttemptToken } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
   RecoveryChargeInterruptedError,
@@ -2652,9 +2652,10 @@ interface RunFlight {
    *  clears it. In-memory only — NOT seeded from the claim: `claim.checkpoint_tip` is a
    *  server-confirmed anchor, and a resume self-heals via `lastCheckpointRefTip`. */
   lastAttemptedCheckpointRefTip: string | undefined;
-  /** issue #2733: the run's repo is on GitHub, the only forge with checkpoint workflow overlays and
-   *  so the only one whose raw tick/iteration publishes are chained over a prior overlay tip
-   *  (`checkpointPack`'s `chainFrom`). Optional: absent ⇒ no chaining. */
+  /** issue #2733/#2753: swap the workflow subtree (GitHub). The run's repo is on GitHub, the only
+   *  forge with checkpoint workflow overlays; its chain swaps P's `.github/workflows` subtree in
+   *  (`checkpointPack`'s `chainWorkflowSwap`). Chaining itself runs on every forge; absent/false
+   *  ⇒ the chain takes realTip's own tree and skips the workflow gate. */
   checkpointChainForge?: boolean;
   /** Guarded default-branch CI repair runs (claim.config.ci_config_guard): the protected-path globs
    *  every checkpoint and held publication is checked against, over the exact candidate SHA, before
@@ -2746,12 +2747,28 @@ interface RunFlight {
    *  checkpoint ticks within a flight (a fresh flight after a restart re-detects, which is fine —
    *  the finalize bridge in M3 is the correctness backstop). */
   steeredTips?: Set<string>;
+  /** Restriction latch only. Never authorizes source use; launch re-reads durable proofs. */
+  remediationRestrictions?: {
+    roots: string[];
+    /** Process-only denial version; a failed read invalidates every admission already waiting. */
+    denialRevision?: number;
+    /** Global negative findings, never a substitute for the current positive body. */
+    flaggedOIDs?: string[];
+    /** Worker-selected identity and bounded negative knowledge; never a consumer confirmation cache. */
+    pending?: {
+      runId: string; clonePath?: string; attemptId?: string; barePath?: string; branch?: string;
+      requiredOIDs: string[]; requireDenial: boolean; bindingUncertain: boolean;
+    };
+  };
+  remediationPredecessorAttempt?: string;
   /** issue #1932: per-flight state of the pre-exit secret remediation gate (see
    *  RunRunner.runSecretRemediationGate). `known` = findings of the last trusted gate scan that
    *  suppress every checkpoint publication and make finalize fail (`push_secret_blocked`, no push)
-   *  while non-empty. Park / shutdown / pause / capture sinks remain unscanned (#1597), but hold
-   *  remembered findings in this flight. This memory does not survive a new flight/reclaim and
-   *  does not contain never-flagged content, including trees copied into an overlay.
+   *  while non-empty. For unenrolled flights, park / shutdown / pause / capture sinks remain
+   *  unscanned (#1597), but hold remembered findings in this flight. This process-local state
+   *  does not survive a new flight/reclaim or contain never-flagged overlay content. Enrolled
+   *  remediationRecovery separately persists negative facts and requires fresh source, history
+   *  and actual-candidate/floor guards through remediationRestrictions.
    *  `blocked` = findings that make finalize fail terminally
    *  (cap exhausted, or an untrusted gate scan after a known finding); `cleanTip` = the tracking tip
    *  of the last CLEAN trusted gate scan, used by the reap-publish hold and to decide at finalize
@@ -2906,6 +2923,10 @@ export interface RunnerOptions {
   cancellationBudgetFactory?: () => MaintenanceBudget;
   /** Stub-only E2E redrive spacing; omitted for production and all other phases. */
   recoveryLiveTiming?: Pick<RecoveryCoordinatorOptions, "liveBackoffBaseMs" | "liveBackoffCapMs">;
+  /** Stub fixture boundary after durable, matching publication enrollment. */
+  afterPublicationEnrolled?: (input: Readonly<{
+    runId: string; claimGeneration: number; issueDescription: string; signal?: AbortSignal;
+  }>) => Promise<void>;
   /** Test-only timing overrides; production uses the approved bounded retry/poll policy. */
   planCrossCheckTiming?: PlanCrossCheckTiming;
   /** Explicit bounded fixture transport only; never wired by worker runtime. */
@@ -3176,6 +3197,7 @@ export class RunRunner {
   private readonly planCrossCheckTiming: PlanCrossCheckTiming | undefined;
   private readonly semanticCoverageTestTransport: BoundedCoverageTestTransport | undefined;
   private readonly recoveryRetryMs: number;
+  private readonly afterPublicationEnrolled: RunnerOptions["afterPublicationEnrolled"];
   private readonly completionHoldReconcileTimeoutMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
   private readonly codexBoundaryDeadlineMs: number;
@@ -3438,6 +3460,7 @@ export class RunRunner {
     this.checkpointTickIntervalMs = opts.checkpointTickIntervalMs ?? 5 * 60_000;
     this.checkpointTestHooks = opts.checkpointTestHooks;
     this.planCrossCheckTiming = opts.planCrossCheckTiming;
+    this.afterPublicationEnrolled = opts.afterPublicationEnrolled;
     this.semanticCoverageTestTransport = opts.semanticCoverageTestTransport;
     this.teardownTestDeps = opts.teardownTestDeps;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
@@ -3642,8 +3665,10 @@ export class RunRunner {
    *
    * Only a site whose call can reach a mutating hook (admitSourceUse, beginBareMutation,
    * beginDestructive) needs this. A site whose only hook is assertBareClear does not: that hook is a
-   * read-only load that needs no transaction, so fetchAgentBranch, updateTrackingRef,
-   * retainCurrentOwedCandidate and anchorRecoveryHead run without A.
+   * read-only load that needs no transaction. Legacy imports, updateTrackingRef,
+   * retainCurrentOwedCandidate and anchorRecoveryHead run without A. Attempt-bound imports and
+   * remediation scans take A before B to authenticate their producing source. Attempt-bound
+   * imports use short proof phases around their B-only transport.
    *
    * `wait` bounds the wait for A: pass the caller's signal and the deadline of the surrounding boundary.
    */
@@ -3720,10 +3745,144 @@ export class RunRunner {
    * The executor-launch gate: with an authority runtime, the executor is not started on a clone unless the
    * flight's lease is the current lease for that clone and (Codex) carries this executor's incarnation.
    */
-  private async requireLaunchAuthority(flight: RunFlight): Promise<void> {
-    if (!this.authority || !flight.runnerClone) return;
-    await this.authority.assertLaunchable(flight.runnerClone.path, flight.sourceLease, flight.executor.executorIncarnation,
-      this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+  private async requireLaunchAuthority(flight: RunFlight): Promise<() => void> {
+    // Capture before the first wait, including source-use authority acquisition.
+    const denialRevision = flight.remediationRestrictions?.denialRevision ?? 0;
+    let record: RemediationRecovery | undefined;
+    let recordBarePath: string | undefined;
+    const checkRemediation = (): void => {
+      const currentRevision = flight.remediationRestrictions?.denialRevision ?? 0;
+      if (!Number.isSafeInteger(currentRevision) || currentRevision < 0 || currentRevision !== denialRevision)
+        throw new Error("remediation restriction confirmation changed");
+      const proof = record;
+      const selected = this.remediationSource(flight);
+      const pending = flight.remediationRestrictions?.pending;
+      // An older readable record cannot discharge facts retained after a failed write.
+      if (pending && (!proof || pending.bindingUncertain || pending.requireDenial || proof.blocked !== false ||
+          !selected.runId || !selected.clonePath || !selected.attemptId || !flight.barePath || !flight.branch ||
+          pending.runId !== selected.runId || pending.clonePath !== selected.clonePath ||
+          pending.attemptId !== selected.attemptId || pending.barePath !== flight.barePath ||
+          pending.branch !== flight.branch ||
+          !pending.requiredOIDs.every(q => proof.flaggedOIDs.includes(q))))
+        throw new Error("remediation pending persistence unconfirmed");
+      if (proof && (proof.runId !== selected.runId || proof.clonePath !== selected.clonePath ||
+          proof.clonePath !== flight.worktreePath || proof.attemptId !== selected.attemptId ||
+          proof.branch !== flight.branch || recordBarePath !== flight.barePath))
+        throw new Error("remediation source identity unavailable");
+      const restrictions = flight.remediationRestrictions;
+      if (restrictions) {
+        const bodyRoots = proof && new Set([...proof.flaggedOIDs, ...proof.edges.map(edge => edge.from),
+          ...(proof.excludedRoots ?? [])]);
+        if (!proof || !restrictions.roots.every(root => bodyRoots!.has(root)) ||
+            !(restrictions.flaggedOIDs ?? []).every(q => proof.flaggedOIDs.includes(q)))
+          throw new Error("remediation current restriction metadata unavailable");
+      }
+    };
+    // Restrictions apply even on workers without a source-use authority runtime.
+    await this.inFlightAuthority(flight, () => this.withRemediationLifecycle(this.retainedLifecycleSignal(flight), async () => {
+      recordBarePath = flight.barePath;
+      const negative = await this.bootstrapRemediationRestrictions(flight);
+      if (negative.kind === "unavailable") throw new Error("remediation restriction facts unavailable");
+      record = await this.restoreRemediationRestrictions(flight);
+      checkRemediation();
+      if (!record) return;
+      const scan = await this.scanRemediationRange(flight, flight.barePath!, flight.branch!, record.ownedTip, { explicitTip: true });
+      if (scan.trusted && scan.findings.length)
+        await this.persistRemediationRestrictions(flight, flight.barePath!, flight.branch!, scan.range.tipSha, scan.findings);
+      if (!scan.trusted || scan.findings.length) throw new Error("remediation continuation history unavailable");
+      for (const floor of this.remediationRangeFloors(scan.range, scan.floorCandidates))
+        for (const root of flight.remediationRestrictions!.roots)
+          if (await this.git.ancestry(flight.barePath!, root, floor) !== "divergent")
+            throw new Error("remediation continuation published floor conflict");
+      // One pass over the durable, parser-bounded set; any failed proof stops launch.
+      for (const root of flight.remediationRestrictions!.roots)
+        if (await this.git.ancestry(flight.barePath!, root, record.ownedTip) !== "divergent")
+          throw new Error("remediation continuation history restricted");
+    }), this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+    if (this.authority && flight.runnerClone)
+      await this.authority.assertLaunchable(flight.runnerClone.path, flight.sourceLease, flight.executor.executorIncarnation,
+        this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
+    // Cover admission waits here, then return the same captured checker for the sink:
+    // a denial can latch during the promise-resolution gap before the caller resumes.
+    checkRemediation();
+    return checkRemediation;
+  }
+
+  private rememberRemediationRestrictions(flight: RunFlight, journal: RecoveryJournalEntry): void {
+    const record = journal.remediationRecovery;
+    if (!record) return;
+    const state = flight.remediationRestrictions ??= { roots: [] };
+    state.flaggedOIDs = [...new Set([...(state.flaggedOIDs ?? []), ...record.flaggedOIDs])];
+    state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from), ...(record.excludedRoots ?? [])])];
+  }
+
+  /** Reuse Git's inherited operation scope; the caller retains A until owned work settles. */
+  private withRemediationLifecycle<T>(signal: AbortSignal | undefined, action: () => Promise<T>, deadlineAt?: number): Promise<T> {
+    // Explicit cleanup selects its bounded lifecycle; ordinary live work defaults to global shutdown.
+    // Selecting a lifecycle does not authenticate a source or grant source-use permission.
+    return this.git.withRecoveryOperation(
+      signal ?? this.shutdownSignal.signal,
+      Math.min(Date.now() + this.codexBoundaryDeadlineMs, deadlineAt ?? Infinity), action);
+  }
+
+  /**
+   * One custody-only two-read query: no selected live source, discovery, lease or clone admission.
+   * Failure latches denial but does not interrupt private byte preservation. Positive callers
+   * must refuse unavailable facts and independently authenticate the current runtime body.
+   */
+  private async bootstrapRemediationRestrictions(
+    flight: RunFlight, barePath = flight.barePath, branch = flight.branch, signal?: AbortSignal, deadlineAt?: number,
+  ): Promise<{ kind: "confirmed"; enrolled: boolean } | { kind: "unavailable" }> {
+    if (!barePath && !branch && !flight.worktreePath && !flight.remediationRestrictions)
+      return { kind: "confirmed", enrolled: false }; // Repo-less flight.
+    try {
+      if (!barePath || !branch) throw new Error("restriction identity unavailable");
+      const facts = await this.withRemediationLifecycle(signal, () =>
+        this.git.readRemediationRestrictionFacts(barePath, branch, flight.runId), deadlineAt);
+      if (facts.enrolled) {
+        const state = flight.remediationRestrictions ??= { roots: [] };
+        state.roots = [...new Set([...state.roots, ...facts.roots, ...facts.flaggedOIDs])];
+        state.flaggedOIDs = [...new Set([...(state.flaggedOIDs ?? []), ...facts.flaggedOIDs])];
+      }
+      if (facts.blocked) throw new Error("restriction evidence is custody only");
+      return { kind: "confirmed", enrolled: facts.enrolled };
+    } catch {
+      const state = flight.remediationRestrictions ??= { roots: [] };
+      const revision = state.denialRevision ?? 0;
+      // Never wrap or clear a denial. A new admission still needs fresh durable proofs.
+      state.denialRevision = Number.isSafeInteger(revision) && revision >= 0 && revision < Number.MAX_SAFE_INTEGER
+        ? revision + 1 : -1;
+      flight.preserveRecoveryClone = true;
+      return { kind: "unavailable" };
+    }
+  }
+
+  /** Query the journal without discovery or normalization side effects. The exact attempt
+   * comes from the worker-selected source, not from the evidence being authenticated. */
+  private async restoreRemediationRestrictions(flight: RunFlight): Promise<RemediationRecovery | undefined> {
+    if (!flight.barePath && !flight.branch && !flight.worktreePath) {
+      if (flight.remediationRestrictions) throw new Error("remediation source identity unavailable");
+      return undefined; // Repo-less flights have no recovery journal.
+    }
+    try {
+      if (!flight.barePath || !flight.branch || !flight.worktreePath ||
+          (!flight.predecessorCapture && flight.runnerClone?.path !== flight.worktreePath))
+        throw new Error("remediation source identity unavailable");
+      const attemptId = flight.predecessorCapture ? flight.remediationPredecessorAttempt : flight.runnerClone?.attemptId;
+      const record = await this.git.readRuntimeRemediationRecovery(flight.barePath, flight.branch,
+        { runId: flight.runId, clonePath: flight.worktreePath, ...(attemptId ? { attemptId } : {}) });
+      if (!record) {
+        if (flight.remediationRestrictions) throw new Error("remediation enrollment disappeared");
+        return undefined;
+      }
+      const state = flight.remediationRestrictions ??= { roots: [] };
+      state.roots = [...new Set([...state.roots, ...record.flaggedOIDs, ...record.edges.map(edge => edge.from), ...(record.excludedRoots ?? [])])];
+      return record;
+    } catch (error) {
+      // An unreadable enrollment is held, rather than silently treated as absent.
+      flight.remediationRestrictions ??= { roots: [] };
+      throw error;
+    }
   }
 
   /**
@@ -3759,11 +3918,38 @@ export class RunRunner {
     const authority = this.authority;
     const none: FlightSourceEnd = { paths: [], endedSlots: [], published: false, ownedEpochs: {} };
     if (!authority) return none;
-    // Retired at the very entry, before any early return: a callback this flight left behind (a late git hook)
-    // can no longer admit, whatever happens to the end below. Keys it admitted stay owned until a confirmed end.
     const sink = flight.sourceUsePaths ??= new Set();
-    authority.retireSink(sink);
-    flight.sourceAdmissionRetired = true;
+    const retire = (): void => {
+      authority.retireSink(sink);
+      flight.sourceAdmissionRetired = true;
+    };
+    const remediation: { kind: "confirmed" | "denied" | "held" } = { kind: "confirmed" };
+    if (flight.remediationRestrictions?.pending && flight.sourceTailsJoined === true) {
+      remediation.kind = "held";
+      try {
+        // One bounded acquisition/confirmation attempt. Retire under the same owning A.
+        // A callback can latch synchronously while the Git proof awaits; changed knowledge
+        // keeps custody even if the earlier snapshot could be confirmed.
+        await this.inFlightAuthority(flight, async () => {
+          const snapshot = canonicalJson(flight.remediationRestrictions!.pending!);
+          try {
+            remediation.kind = await this.withRemediationLifecycle(undefined, () => this.confirmPendingRemediation(flight));
+          }
+          finally {
+            retire();
+            if (canonicalJson(flight.remediationRestrictions!.pending!) !== snapshot) remediation.kind = "held";
+          }
+        }, this.cleanupAuthorityWait(this.sourceUseEndWaitMs));
+      } catch {
+        remediation.kind = "held";
+        runLog.warn("source use left active: remediation durability unconfirmed");
+      } finally {
+        // Acquisition can fail before the callback runs.
+        retire();
+      }
+    } else {
+      retire();
+    }
     // Barrier: an admission that passed its entry check before the retirement may still be running under A. Taking A
     // once proves it finished (its path is in the sink and its owner recorded) before the snapshot below.
     const quiescent = await authority.awaitSinkQuiescent({ timeoutMs: this.sourceUseEndWaitMs });
@@ -3786,12 +3972,14 @@ export class RunRunner {
         sources: paths.size });
       return { paths: allPaths, endedSlots: [], published: false, ownedEpochs };
     }
+    if (remediation.kind === "held")
+      return { paths: allPaths, endedSlots: [], published: false, ownedEpochs };
     // U4: a flight whose completing source the journal durably bound publishes it (Codex: sealed; Claude:
     // claude_ready) instead of ending it. Publication moves the slot out of `active` itself and returns its
     // lease, so only the paths that did NOT publish still need the ineligible step below.
     const bound = flight.completionSourceBound;
     let published = false;
-    if (bound && paths.has(resolvePath(bound.clonePath))) {
+    if (remediation.kind !== "denied" && bound && paths.has(resolvePath(bound.clonePath))) {
       // "ended": a failed publication already moved the slot to ineligible under its own A.
       const outcome = await this.publishFlightSource(flight, bound, runLog);
       if (outcome !== "unpublished") { paths.delete(resolvePath(bound.clonePath)); published = true; }
@@ -5414,13 +5602,18 @@ export class RunRunner {
                   check();
                   // issue #3239: an unvetted marker (rollback refused) is never fetched back or published.
                   if (flight.wipMarkerUnsafe && await this.wipSafeTip(flight, worktreePath, branch) === null) return;
-                  const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, flight, runLog);
+                  const cause = flight.active!.gracefulShutdownCheckpoint!;
+                  if (cause.stopSignal.aborted || Date.now() >= cause.deadlineAt) return;
+                  const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, flight, runLog,
+                    {}, undefined, { signal: permit?.signal ?? cause.stopSignal,
+                      timeoutMs: Math.max(1, cause.deadlineAt - Date.now()) });
                   check();
                   if (fetched.kind === "refused") return;
                   // PRD #1416 M3 (C6): bridge a divergent tracking tip BEFORE the shutdown publish so
                   // a resume adopts B, not the published tip. Best-effort — a shutdown checkpoint must
                   // never throw (it is inside the k8s termination grace race, D4).
-                  if ((await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "shutdown")).kind === "preservation_refused") return;
+                  if ((await this.bridgeParkSinkBestEffort(barePath, branch, flight, runLog, "shutdown",
+                    permit?.signal ?? cause.stopSignal, cause.deadlineAt)).kind === "preservation_refused") return;
                   // PRD #1062 M2 (#1036): the path is reaped above, so the overlay's PAT
                   // default-fetch is permitted — a behind-on-workflows branch checkpoints durably.
                   check();
@@ -5431,7 +5624,11 @@ export class RunRunner {
                     barePath,
                     branch,
                     shutdownOverlay,
-                    permit?.signal,
+                    permit?.signal ?? cause.stopSignal,
+                    undefined,
+                    undefined,
+                    true,
+                    cause.deadlineAt,
                   );
                 },
                 // issue #1783 (auditor M2): the flight rides along, so the shutdown sink first proves
@@ -8647,6 +8844,75 @@ export class RunRunner {
     const deps = this.publicationDeps(flight, signal);
     let outcome: Awaited<ReturnType<typeof enrollPublicationIntent>> | Awaited<ReturnType<typeof resendPublicationRecord>> =
       await enrollPublicationIntent(deps, intent);
+    // Only initial sequence-less enrollment reconciles here. Each later call sends once,
+    // after backoff and fresh ownership evidence, from the durable original body.
+    // The original finalize signal bounds this loop; it has no separate retry budget.
+    if (outcome.kind === "uncertain" && outcome.record && outcome.record.enrollment_seq === undefined &&
+        (outcome.reason === "ack_unknown" || outcome.subreason === "stale_claim")) {
+      const held = outcome.record;
+      const { owner_kind: _owner, enrollment_seq: _enrollment, candidate_seq: _candidate, ...heldBody } = held;
+      let waitingReason: "ack_unknown" | "readoption_pending" | undefined;
+      const waiting = (reason: "ack_unknown" | "readoption_pending"): void => {
+        if (waitingReason === reason) return;
+        waitingReason = reason;
+        runLog.info("publication intent reconciliation waiting", {
+          run_id: flight.runId, claim_generation: held.claim_generation, reason,
+        });
+      };
+      const interrupted = (): void => {
+        signal?.throwIfAborted();
+        if (flight.steering.claimFence() !== undefined) throw new StaleClaimError();
+        if (flight.steering.isCancelled()) throw new Error("run cancelled");
+        if (flight.active?.shuttingDown || this.shuttingDownGlobal) throw new Error("worker shutdown");
+        for (const lifecycle of this.retainedLifecycleSignals(flight)) lifecycle.throwIfAborted();
+      };
+      const stop = (): never => { throw new StaleClaimError(); };
+      waiting("ack_unknown");
+      try {
+        for (;;) {
+          interrupted();
+          // A consumed pause can leave cancel.signal sticky. Still pay the backoff.
+          await this.waitRecoveryRetry(flight, false, this.recoveryRetryMs, signal);
+          interrupted();
+          let own: RunOwnershipResponse;
+          try {
+            own = await this.getObservedRunOwnership(flight, signal);
+          } catch (error) {
+            interrupted();
+            if (error instanceof RequestError && error.status >= 400 && error.status < 500 &&
+                error.status !== 408 && error.status !== 429) return stop();
+            waiting("ack_unknown");
+            continue;
+          }
+          interrupted();
+          if ((own.claim_generation !== undefined && own.claim_generation !== held.claim_generation) ||
+              own.claim_released === true || TERMINAL_RUN_STATUSES.has(own.status)) return stop();
+          if (own.claim_generation !== held.claim_generation || own.claim_released !== false) {
+            waiting("ack_unknown");
+            continue;
+          }
+          if (own.status === "queued") {
+            waiting("readoption_pending");
+            continue;
+          }
+          if (own.status !== "running") {
+            waiting("ack_unknown");
+            continue;
+          }
+          outcome = await enrollPublicationIntent({ ...deps, retryDelaysMs: [0] }, heldBody);
+          interrupted();
+          if (outcome.kind !== "uncertain" ||
+              (outcome.reason !== "ack_unknown" && outcome.subreason !== "stale_claim")) break;
+          waiting("ack_unknown");
+        }
+      } catch (error) {
+        // Preserve custody without suppressing dispatchFailure's interruption arms.
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
+        flight.stoppedSourceKept = true;
+        throw error;
+      }
+    }
     if (outcome.kind === "uncertain" && outcome.reason === "already_enrolled" && outcome.record?.enrollment_seq !== undefined &&
         outcome.record.candidate_seq !== undefined) {
       // A record of this run and generation survives (a completion-hold continue, a park). Ask the api
@@ -8675,6 +8941,17 @@ export class RunRunner {
         runLog.info("publication intent enrolled", {
           run_id: flight.runId, enrollment_seq: outcome.record.enrollment_seq, candidate_seq: outcome.record.candidate_seq,
         });
+        if (this.afterPublicationEnrolled) {
+          const fixtureSignal = AbortSignal.any([
+            ...this.retainedLifecycleSignals(flight), this.shutdownSignal.signal, ...(signal ? [signal] : []),
+          ]);
+          fixtureSignal.throwIfAborted();
+          await this.afterPublicationEnrolled(Object.freeze({
+            runId: flight.runId, claimGeneration: flight.claimGeneration,
+            issueDescription: claim.issue_description ?? "", signal: fixtureSignal,
+          }));
+          fixtureSignal.throwIfAborted();
+        }
         return "proceed";
       case "not_enrolled":
         return unavailable(outcome.reason, outcome.detail);
@@ -8753,6 +9030,12 @@ export class RunRunner {
     captureContinuation?: FinalizeCaptureContinuation,
   ): Promise<void> {
     const { runLog, batcher, redactText, executor, runHome } = flight;
+    // A naturally completed executor may finalize during graceful shutdown. Its
+    // publication still obeys terminal revocation and the existing shutdown deadline.
+    const publicationSignal = boundarySignal ?? flight.active?.gracefulShutdownCheckpoint?.stopSignal ??
+      flight.steering.terminalLifecycleSignal();
+    const publicationWait = (): AuthorityWait => ({ signal: publicationSignal,
+      timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, (this.shutdownDeadlineAt ?? Infinity) - Date.now())) });
     // PRD #1296 M3 — the source pinned at the finalization boundary (set below, after the
     // fetch-back). Undefined until then and for non-code-publishing / early-return kinds, so
     // the terminal drive is a no-op for report-only / not_code / pause / empty-diff exits.
@@ -8812,6 +9095,7 @@ export class RunRunner {
               claim.repo.default_branch?.trim() ||
               (await this.git.defaultBranchName(capBarePath)) ||
               "main";
+            await this.bootstrapRemediationRestrictions(flight, undefined, undefined, boundarySignal);
             const outcome = await this.recovery.captureAndUpload({
               onArchiveAccepted: record => this.archiveAccepted(flight, record),
               onCancellationObserved: () => this.observeCancellation(flight),
@@ -9382,7 +9666,7 @@ export class RunRunner {
     // depend on the (soon torn-down) runner clone. `trackingRef` is what push +
     // changedFiles read; the runner clone is never a git source for either.
     steps?.enter("fetch_back");
-    const { trackingRef } = await this.fetchTracking(flight, barePath, runnerClone.path, result.branch);
+    const { trackingRef } = await this.fetchTracking(flight, barePath, runnerClone.path, result.branch, {}, undefined, publicationWait());
 
     // The reaped run clone owns H; another run may replace shared tracking after fetch-back.
     // A publication-only resume has no run clone holding H (its clone sits at the candidate), so H is the
@@ -9451,12 +9735,13 @@ export class RunRunner {
     };
 
     // issue #1932: the ONE terminal reporter for a secret-remediation block, shared by D5 below and by
-    // the post-bridge re-check at both finalize bridge sites. `findings` undefined = an untrusted
-    // re-scan after a known finding (fixed reason, no finding data). Nothing is pushed, no
+    // the post-bridge re-check at both finalize bridge sites. With no findings, use a fixed
+    // reason that distinguishes prior findings from unavailable publication proof. Nothing is pushed, no
     // preserved_patch is attached (the diff may carry the secret).
     const reportRemediationBlocked = async (
       findings: SecretFinding[] | undefined,
       withholdFromState: boolean,
+      knownFinding = true,
     ): Promise<void> => {
       let reason: string;
       let statusText: string;
@@ -9471,7 +9756,7 @@ export class RunRunner {
             findings: findings.map((f) => renderSecretFinding(f, { redact: redactText, withholdPaths })),
           },
         );
-      } else {
+      } else if (knownFinding) {
         reason =
           "This run's branch was not pushed: a secret finding was flagged earlier in the run and the final branch could not be verified clean. " +
           "The diff is withheld because it may carry the detected secret; if a durable-recovery archive of this run is available, export it with `uzi run export`.";
@@ -9480,6 +9765,11 @@ export class RunRunner {
         runLog.info("run failed: the final branch could not be verified clean after a flagged secret finding; withholding diff", {
           run_id: runId,
         });
+      } else {
+        reason = "This run's branch was not pushed because current secret-remediation publication evidence could not be verified. " +
+          "The diff is withheld because it may contain a secret.";
+        statusText = "secret-remediation publication evidence could not be verified; failing without pushing and withholding the diff";
+        runLog.info("run failed: secret-remediation publication evidence unavailable; withholding diff", { run_id: runId });
       }
       batcher.emit({ kind: "status", agent: "worker", payload: { text: statusText } });
       await closeBatcher();
@@ -10388,13 +10678,16 @@ export class RunRunner {
             throw new CIConfigGuardRefusedSignal();
           }
           atPush = true;
-          await this.git.pushBranch(
+          await this.pushRemediationCandidate(
+            flight,
             finalizeBarePath,
             result.branch,
             claim.secrets.forge_pat,
             claim.repo.clone_url,
             claim.secrets.forge_username,
             publication,
+            publicationSignal,
+            this.shutdownDeadlineAt,
           );
           flight.successfulPushedSha = sourceSha;
         },
@@ -10415,6 +10708,11 @@ export class RunRunner {
       } catch (error) {
         // A deadline/cancel abort stays permanent: an aborted fetch classifies transient but is not an outage.
         if (boundarySignal?.aborted) throw error;
+        if (error instanceof SecretRemediationPendingError) {
+          await reportRemediationBlocked(undefined, false, flight.secretRemediation?.everKnown === true ||
+            Boolean(flight.remediationRestrictions?.flaggedOIDs?.length));
+          throw new PushSecretBlockedSignal();
+        }
         if (error instanceof ScratchPublicationError && error.kind === "floor_unreachable") {
           throw publicationForgeUnreachable(flight.redactText, "git", "floor_refresh", error);
         }
@@ -10812,7 +11110,7 @@ export class RunRunner {
               // filter or merge driver. Re-prove BEFORE the refetch and the PAT push; blocked throws
               // RunResidueBlockedError, which every push catch below rethrows unchanged.
               await this.reproveFinalizeOrThrow(flight, "finalize_align");
-              await this.fetchTracking(flight, alignBarePath, runnerClone.path, result.branch);
+              await this.fetchTracking(flight, alignBarePath, runnerClone.path, result.branch, {}, undefined, publicationWait());
               // PRD #1416 M3 (C4): the align chain re-fetched the CLONE's aligned tip into the
               // tracking ref — and a rebase-fallback align rewrites P (fact 14), so the aligned tip
               // can itself be divergent below P. Bridge it here, AFTER the re-fetch and BEFORE the
@@ -10826,6 +11124,7 @@ export class RunRunner {
                 result.branch,
                 flight,
                 runLog,
+                undefined, undefined, publicationSignal, this.shutdownDeadlineAt,
               );
               if (o.kind === "preservation_refused") throw new PreservationRefusedError();
               if (o.kind === "failed") throw new HistoryRewrittenError(flight.publishedTip!);
@@ -11147,6 +11446,7 @@ export class RunRunner {
         result.branch,
         flight,
         runLog,
+        undefined, undefined, publicationSignal, this.shutdownDeadlineAt,
       );
       if (o.kind === "preservation_refused") throw new PreservationRefusedError();
       if (o.kind === "failed") {
@@ -11169,6 +11469,7 @@ export class RunRunner {
         await pushToOrigin();
       } catch (e) {
         rethrowWorkflowAbort(e);
+        if (e instanceof PushSecretBlockedSignal) return;
         if (e instanceof PublicationRefusedSignal) {
           if (e instanceof ClosingCommitRefusedSignal) await refusePrepush("closing", e.head, e.shas);
           if (e instanceof PublicationContextRefusedSignal) await refusePrepush("context", e.head, null, e.reason);
@@ -13373,6 +13674,11 @@ export class RunRunner {
       /^[0-9a-f]{40}$/.test(flight.runnerClone.adoptedSource) ? flight.runnerClone.adoptedSource : undefined;
     await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId, flight.runnerClone?.attemptId,
       peeledMarker);
+    await this.inFlightAuthority(flight, () => this.withRemediationLifecycle(this.retainedLifecycleSignal(flight), async () => {
+      const negative = await this.bootstrapRemediationRestrictions(flight);
+      if (negative.kind === "unavailable") throw new Error("remediation restriction facts unavailable");
+      await this.restoreRemediationRestrictions(flight);
+    }), this.authorityWait(flight, CLONE_AUTHORITY_WAIT_MS));
     batcher.emit({
       kind: "status",
       agent: "worker",
@@ -16084,8 +16390,9 @@ export class RunRunner {
         flight.evidenceProcessJoined = undefined;
         if (flight.evidenceCommands) flight.evidenceCommands.confirmed = false;
         // issue #3404 M2 U3: never start the executor on a clone whose source-use epoch is not this flight's.
-        await this.requireLaunchAuthority(flight);
+        const checkRemediation = await this.requireLaunchAuthority(flight);
         let execution: Promise<ExecutorResult>;
+        checkRemediation();
         try { execution = executor.run(ctx); }
         catch (value) {
           executionRejection.executorRejected = true;
@@ -16344,6 +16651,7 @@ export class RunRunner {
    */
   /** Cancellation observation changes metadata and stops the model, never grants custody authority. */
   private observeCancellation(flight: RunFlight): MaintenanceBudget {
+    const reason = new DOMException("run cancelled", "AbortError");
     try {
       const budget = flight.cancellationBudget ??= MaintenanceBudget.current() ?? this.cancellationBudgetFactory();
       MaintenanceBudget.attachObserved(`${flight.runId}:${flight.claimGeneration}`, budget);
@@ -16352,8 +16660,8 @@ export class RunRunner {
     finally {
       try { flight.steering.markCancelled(); }
       finally {
-        try { if (!flight.cancel.signal.aborted) flight.cancel.abort(); }
-        finally { flight.steering.abortLifecycle(); }
+        try { if (!flight.cancel.signal.aborted) flight.cancel.abort(reason); }
+        finally { flight.steering.abortLifecycle(reason); }
       }
     }
   }
@@ -16619,7 +16927,10 @@ export class RunRunner {
     }
     if (context.barePath !== barePath || context.branch !== branch) throw new Error("owed candidate flight context changed");
     flight.trackingAttemptToken ??= newTrackingAttemptToken(() => this.ownershipRepairAdmitted(flight));
-    return { context, remotelyConfirmedSha: flight.lastCheckpointRefTip, attemptToken: flight.trackingAttemptToken };
+    const selected = this.remediationSource(flight);
+    return { context, remotelyConfirmedSha: flight.lastCheckpointRefTip, attemptToken: flight.trackingAttemptToken,
+      ...(selected.attemptId && selected.clonePath === flight.worktreePath
+        ? { producingSource: { runId: flight.runId, clonePath: selected.clonePath!, attemptId: selected.attemptId } } : {}) };
   }
 
   /** issue #3780: the admission predicate GitCache checks under the bare lock before EACH write that
@@ -16738,6 +17049,7 @@ export class RunRunner {
     const barePath = flight.barePath, branch = flight.branch;
     if (flight.cancellationCustodyUnknown || flight.keepGuardedInventoryOpen || !barePath || !branch || !claim.claim_generation || !this.recovery.enabled ||
         !isCodePublishingKind(resolveRunKind(claim.kind))) return;
+    await this.bootstrapRemediationRestrictions(flight, undefined, undefined, signal);
     // Issue #2545: once a record is deferred, EVERY later settle works on that exact record. It never
     // re-freezes: the post-send freeze would pin a different original source and mint a second record.
     if (flight.heldDeferredCapture !== undefined && opts.deferCapture !== true) {
@@ -16829,6 +17141,8 @@ export class RunRunner {
     }
     signal = MaintenanceBudget.current()?.signal ?? signal;
     MaintenanceBudget.current()?.check();
+    await this.bootstrapRemediationRestrictions(flight, undefined, undefined, signal);
+    MaintenanceBudget.current()?.check();
     const barePath = flight.barePath!;
     const input = {
       onArchiveAccepted: (accepted: RecoveryRecord) => this.archiveAccepted(flight, accepted),
@@ -16842,7 +17156,7 @@ export class RunRunner {
       ? await this.recovery.captureAndUpload(input)
       : await this.recovery.operateFrozenInventory(input, {
         foreground: true, terminal: flight.heldTerminal,
-        prepare: frozen => this.heldPublicationStep(claim, flight, frozen),
+        prepare: frozen => this.heldPublicationStep(claim, flight, frozen, signal),
       });
     MaintenanceBudget.current()?.check();
     if (outcome.held === "acked") {
@@ -16950,7 +17264,7 @@ export class RunRunner {
     const state = flight.secretRemediation;
     return {
       version: 1,
-      blocked: !!((state?.known?.length ?? 0) || (state?.blocked?.length ?? 0) || state?.overflow),
+      blocked: !!(flight.remediationRestrictions || (state?.known?.length ?? 0) || (state?.blocked?.length ?? 0) || state?.overflow),
       everKnown: state?.everKnown === true,
       ...(state?.cleanTip ? { cleanTip: state.cleanTip } : {}),
       flaggedCommits: [...(state?.flaggedCommits ?? [])],
@@ -16963,8 +17277,11 @@ export class RunRunner {
   }
 
   private async heldPublicationStep(
-    claim: ClaimResponse, flight: RunFlight, record: RecoveryRecord,
+    claim: ClaimResponse, flight: RunFlight, record: RecoveryRecord, signal?: AbortSignal,
   ): Promise<{ pack: Buffer } | { reason: string }> {
+    const negative = await this.bootstrapRemediationRestrictions(flight, flight.barePath, record.branch, signal);
+    if (negative.kind === "unavailable" || flight.remediationRestrictions)
+      return { reason: "secret_remediation_pending" };
     return prepareFrozenHeld({
       git: this.git, barePath: flight.barePath!, branch: record.branch, sourceSha: record.sourceSha,
       policy: record.heldPolicy!, deadlineMs: this.scanDeadlineMs(),
@@ -17063,7 +17380,7 @@ export class RunRunner {
     return sha;
   }
 
-  private async fetchTracking(flight: RunFlight, barePath: string, worktreePath: string, branch: string, options: Pick<FetchAgentBranchOptions, "expectedCandidateSha" | "checkpointImportMode" | "checkpointStep"> = {}, importScope: <T>(action: () => Promise<T>) => Promise<T> = action => action()): Promise<Extract<TrackingUpdateResult, { kind: "updated" }>> {
+  private async fetchTracking(flight: RunFlight, barePath: string, worktreePath: string, branch: string, options: Pick<FetchAgentBranchOptions, "expectedCandidateSha" | "checkpointImportMode" | "checkpointStep"> = {}, importScope: <T>(action: () => Promise<T>) => Promise<T> = action => action(), sourceAuthorityWait?: AuthorityWait): Promise<Extract<TrackingUpdateResult, { kind: "updated" }>> {
     if (flight.wipMarkerUnsafe || flight.wipUnsafeMarkers?.size) {
       const safeTip = await this.wipSafeTip(flight, worktreePath, branch);
       if (safeTip === null || (options.expectedCandidateSha !== undefined && options.expectedCandidateSha !== safeTip))
@@ -17074,10 +17391,13 @@ export class RunRunner {
     options.checkpointStep?.("checkpoint_import_context");
     const owed = await this.owedOptions(flight, barePath, branch);
     return importScope(async () => {
-      // No A across the fetch: its only authority hook is assertBareClear (a transaction-free read), so the
-      // model-sized pack transport never holds A.
       const result = await this.git.fetchAgentBranch(
-        barePath, worktreePath, branch, flight.runId, { ...owed, ...options },
+        barePath, worktreePath, branch, flight.runId, { ...owed, ...options,
+          // Git invokes this only outside B, before transport and again before promotion.
+          // The transport inherits the existing import scope and caller budget without A.
+          withSourceAuthority: action => this.inFlightAuthority(flight, action,
+            sourceAuthorityWait ?? this.authorityWait(flight)),
+        },
       );
       if (result.kind === "not_updated") throw this.preservationRefused(flight, result.reason);
       if (result.divergence === "divergent") {
@@ -17105,9 +17425,10 @@ export class RunRunner {
     runLog: Logger,
     options: Pick<FetchAgentBranchOptions, "expectedCandidateSha" | "checkpointImportMode" | "checkpointStep"> = {},
     importScope?: <T>(action: () => Promise<T>) => Promise<T>,
+    sourceAuthorityWait?: AuthorityWait,
   ): Promise<FetchBackOutcome> {
     try {
-      await this.fetchTracking(flight, barePath, worktreePath, branch, options, importScope);
+      await this.fetchTracking(flight, barePath, worktreePath, branch, options, importScope, sourceAuthorityWait);
       return { kind: "updated" };
     } catch (e) {
       if (isCheckpointBoundaryFailure(e)) throw e;
@@ -17245,7 +17566,11 @@ export class RunRunner {
     runLog: Logger,
     adopt: <T>(action: () => Promise<T>) => Promise<T> = action => action(),
     step?: (step: BoundaryStep) => void,
+    signal?: AbortSignal,
+    deadlineAt?: number,
   ): Promise<BridgeOutcome> {
+    const negative = await this.bootstrapRemediationRestrictions(flight, barePath, branch, signal, deadlineAt);
+    if (negative.kind === "unavailable") return { kind: "unknown" };
     const H = await this.checkedTrackingSnapshot(flight, barePath, branch, undefined, step, "checkpoint_bridge");
     if (H === null) {
       this.preservationRefused(flight, "ownership_unknown");
@@ -17258,6 +17583,16 @@ export class RunRunner {
     const floors = [publishedTip];
     if (flight.checkpointFloor && flight.checkpointFloor !== publishedTip) {
       floors.push(flight.checkpointFloor);
+    }
+    // Refuse unsafe/unknown required floors before constructing or adopting a bridge.
+    if (flight.remediationRestrictions) {
+      try {
+        await this.withRemediationCandidateAdmission(flight, barePath, branch,
+          admission => admission.admit(H, H, floors), signal, deadlineAt);
+      } catch (error) {
+        if (isCheckpointBoundaryFailure(error)) throw error;
+        return { kind: "unknown" };
+      }
     }
     let anyDivergent = false;
     let anyUnknown = false;
@@ -17339,7 +17674,18 @@ export class RunRunner {
     return adopt(async () => {
       try {
         const context = await this.owedOptions(flight, barePath, branch);
-        const update = await this.git.updateTrackingRef(barePath, branch, bridge, { ...context, checkpointStep: step });
+        const update = flight.remediationRestrictions
+          ? await this.withRemediationCandidateAdmission(flight, barePath, branch, async admission => {
+            const source = admission.identity.workerSelectedSource;
+            if (!source) throw new SecretRemediationPendingError();
+            const { producingSource: _producingSource, ...transformContext } = context;
+            return this.git.updateRemediationTrackingRef(barePath, branch, bridge,
+              { ...transformContext, checkpointStep: step }, source, H, { trusted: true, admit: async input => {
+                await admission.admit(input.sourceTip, input.candidateSha, floors);
+                return true;
+              } });
+          }, signal, deadlineAt)
+          : await this.git.updateTrackingRef(barePath, branch, bridge, { ...context, checkpointStep: step });
         if (update.kind === "not_updated") {
           this.preservationRefused(flight, update.reason);
           return { kind: "preservation_refused" };
@@ -17369,10 +17715,10 @@ export class RunRunner {
   /**
    * PRD #1416 M3 — the BEST-EFFORT bridge wrapper for the park / shutdown / capture sinks (C5-C8).
    * Unlike the finalize sinks (C3/C4), which throw {@link HistoryRewrittenError} on a "failed"
-   * bridge, these boundaries must NEVER throw: a park/shutdown/capture that fails is worse than one
-   * that loses a bridge (D4). It runs the bridge, logs a "failed"/"unknown" outcome, and returns —
-   * the caller then captures/publishes whatever the tracking ref points at (B on success, the
-   * un-bridged H otherwise). Swallows any thrown error too, so nothing here can undo a park.
+   * bridge, this wrapper handles ordinary bridge errors best-effort (D4). Typed checkpoint
+   * boundary failures propagate so cancellation, deadlines and authority refusal remain effective.
+   * It logs a "failed"/"unknown" outcome and returns; the caller then captures/publishes whatever
+   * the tracking ref points at (B on success, the un-bridged H otherwise), subject to ownership.
    */
   private async bridgeParkSinkBestEffort(
     barePath: string,
@@ -17380,9 +17726,11 @@ export class RunRunner {
     flight: RunFlight,
     runLog: Logger,
     sink: string,
+    signal?: AbortSignal,
+    deadlineAt?: number,
   ): Promise<BridgeOutcome> {
     try {
-      const o = await this.bridgeBareTrackingRefIfDivergent(barePath, branch, flight, runLog);
+      const o = await this.bridgeBareTrackingRefIfDivergent(barePath, branch, flight, runLog, undefined, undefined, signal, deadlineAt);
       if (o.kind === "failed" || o.kind === "unknown") {
         runLog.info("PRD #1416 M3: park/capture bridge did not advance the tracking ref", {
           run_id: flight.runId,
@@ -17401,7 +17749,7 @@ export class RunRunner {
         this.reportPublishOutcome(flight, diagnostic.key, diagnostic.text);
         return { kind: "failed" };
       }
-      // Never let a bridge failure undo a park/shutdown/capture (D4).
+      // Ordinary bridge errors leave park/shutdown/capture best-effort (D4).
       runLog.warn("PRD #1416 M3: park/capture bridge threw; continuing best-effort", {
         run_id: flight.runId,
         branch,
@@ -17931,6 +18279,108 @@ export class RunRunner {
     return still.length > 0;
   }
 
+  /** Independent consumer confirmation, under the flight's owning A before sink retirement.
+   * One read and at most one denial write; unconfirmed denial keeps the source epoch active. */
+  private async confirmPendingRemediation(flight: RunFlight): Promise<"confirmed" | "denied"> {
+    const pending = flight.remediationRestrictions!.pending!;
+    const { runId, clonePath, attemptId, barePath, branch } = pending;
+    const selected = this.remediationSource(flight);
+    if (pending.bindingUncertain || !runId || !clonePath || !attemptId || !barePath || !branch ||
+        flight.runId !== runId || flight.worktreePath !== clonePath ||
+        (!flight.predecessorCapture && flight.runnerClone?.path !== clonePath) ||
+        selected.attemptId !== attemptId ||
+        flight.barePath !== barePath || flight.branch !== branch)
+      throw new Error("remediation pending source identity unavailable");
+    const source = { runId, clonePath, attemptId };
+    if (!pending.requireDenial) {
+      try {
+        const record = await this.git.readRuntimeRemediationRecovery(barePath, branch, source);
+        if (!pending.requireDenial && !pending.bindingUncertain && record?.blocked === false &&
+            pending.requiredOIDs.every(q => record.flaggedOIDs.includes(q)))
+          return "confirmed";
+      } catch {
+        // A failed positive proof may still be replaced by independently confirmed permanent denial.
+      }
+    }
+    if (pending.bindingUncertain) throw new Error("remediation pending source identity unavailable");
+    if (await this.git.blockRemediationRecovery(barePath, branch, source) !== "confirmed" || pending.bindingUncertain)
+      throw new Error("remediation denial unconfirmed");
+    return "denied";
+  }
+
+  /** Identity comes only from the worker's selected source, never recovery evidence. */
+  private remediationSource(flight: RunFlight): { runId: string; clonePath?: string; attemptId?: string } {
+    return { runId: flight.runId, clonePath: flight.predecessorCapture ? flight.worktreePath : flight.runnerClone?.path,
+      attemptId: flight.predecessorCapture ? flight.remediationPredecessorAttempt : flight.runnerClone?.attemptId };
+  }
+
+  /** Synchronous negative-knowledge latch: at most 64 required OIDs and a sticky denial.
+   * The transient writer list keeps at most 65 IDs to let Git prove representational overflow. */
+  private latchRemediationFindings(flight: RunFlight, barePath: string, branch: string,
+    findings: readonly SecretFinding[]): string[] | undefined {
+    this.assertFlightSourceAdmissible(flight);
+    const source = this.remediationSource(flight);
+    if (!source.attemptId && !flight.remediationRestrictions) return undefined;
+    if (findings.length) flight.preserveRecoveryClone = true;
+    if (!findings.length && !flight.remediationRestrictions && flight.runId && source.attemptId &&
+        source.clonePath && source.clonePath === flight.worktreePath &&
+        flight.barePath === barePath && flight.branch === branch) return [];
+    const restrictions = flight.remediationRestrictions ??= { roots: [] };
+    const pending = restrictions.pending ??= {
+      runId: flight.runId, clonePath: source.clonePath, attemptId: source.attemptId,
+      barePath: flight.barePath, branch: flight.branch,
+      requiredOIDs: [], requireDenial: false, bindingUncertain: false,
+    };
+    if (!source.attemptId || !source.clonePath || source.clonePath !== flight.worktreePath ||
+        (!flight.predecessorCapture && flight.runnerClone?.path !== source.clonePath) ||
+        pending.runId !== flight.runId || pending.clonePath !== source.clonePath ||
+        pending.attemptId !== source.attemptId || pending.barePath !== flight.barePath ||
+        pending.branch !== flight.branch || barePath !== pending.barePath || branch !== pending.branch ||
+        !pending.runId || !pending.barePath || !pending.branch)
+      pending.bindingUncertain = true;
+    // Latch before validation and before any await. Only OIDs enter memory, never finding content.
+    // At most 64 distinct requirements fit the journal; overflow needs permanent denial instead.
+    const flaggedOIDs: string[] = [];
+    let invalid = false;
+    for (const finding of findings) {
+      const q = finding && typeof finding.commit === "string" ? finding.commit.toLowerCase() : undefined;
+      if (q === undefined || !/^[0-9a-f]{40}$/.test(q)) {
+        pending.requireDenial = true;
+        invalid = true;
+        continue;
+      }
+      if (!flaggedOIDs.includes(q) && flaggedOIDs.length < 65) flaggedOIDs.push(q);
+      if (!pending.requiredOIDs.includes(q)) {
+        if (pending.requiredOIDs.length < 64) pending.requiredOIDs.push(q);
+        else pending.requireDenial = true;
+      }
+    }
+    restrictions.roots = [...new Set([...restrictions.roots, ...pending.requiredOIDs])];
+    if (pending.bindingUncertain) throw new Error("remediation source identity unavailable");
+    if (invalid) throw new Error("remediation finding identity unavailable");
+    return flaggedOIDs;
+  }
+
+  private async persistRemediationRestrictions(flight: RunFlight, barePath: string, branch: string,
+    tip: string, findings: readonly SecretFinding[]): Promise<void> {
+    const flaggedOIDs = this.latchRemediationFindings(flight, barePath, branch, findings);
+    if (flaggedOIDs === undefined) return;
+    const source = this.remediationSource(flight);
+    await this.inFlightAuthority(flight, () => this.git.recordRemediationRestrictions(barePath, branch,
+      { runId: source.runId, clonePath: source.clonePath!, attemptId: source.attemptId! },
+      { trusted: true, tip, flaggedOIDs }), this.authorityWait(flight));
+  }
+
+  private async persistRemediationScan(flight: RunFlight, barePath: string, branch: string,
+    tip: string, findings: readonly SecretFinding[], origin?: "checkpoint-pending" | "pre-exit"): Promise<void> {
+    const flaggedOIDs = this.latchRemediationFindings(flight, barePath, branch, findings);
+    if (flaggedOIDs === undefined) return;
+    const source = this.remediationSource(flight);
+    await this.inFlightAuthority(flight, () => this.git.recordRemediationScan(barePath, branch,
+      { runId: source.runId, clonePath: source.clonePath!, attemptId: source.attemptId! },
+      { trusted: true, tip, flaggedOIDs, ...(origin ? { origin } : {}) }), this.authorityWait(flight));
+  }
+
   /**
    * issue #1597 M2 — the pinned SCAN-then-pack gate for an overlay-less checkpoint publish.
    * Resolves the range to SHAs (the same floor checkpointPack excludes), scans exactly that range
@@ -17945,9 +18395,11 @@ export class RunRunner {
    * A tracking tip whose floor does not resolve is `secret_scan_untrusted` — an unscanned range is
    * never published. Never throws.
    *
-   * BY DESIGN the park / shutdown / pause / capture publishes (and every overlay publish) are NOT
+   * BY DESIGN ordinary unenrolled park / shutdown / pause / capture publishes (and overlays) are NOT
    * scanned: permitted candidates reach the forge UNSCANNED, but #1964 holds findings
    * remembered in this flight at the shared pack/publish seam before any producer starts.
+   * Enrolled publications additionally scan their actual source, transformed candidate and floors
+   * at the shared pack admission seam, including producer replays.
    * The ONE scanned exception is an eligible terminal run's held publication (issues #2545/#3030,
    * {@link RunRunner.heldPublicationStep}): it uploads work the worker would otherwise archive, so it
    * runs a fresh scan of its own range; an untrusted result needs a qualifying archive or protected custody.
@@ -17996,7 +18448,9 @@ export class RunRunner {
         // holds later checkpoint candidates while reachable, including through a local bridge;
         // remediation and finalize also consult the retained findings.
         if (scan.trusted) {
+          this.latchRemediationFindings(flight, barePath, branch, scan.findings);
           this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), scan.findings, flight.runLog);
+          await this.persistRemediationScan(flight, barePath, branch, range.tipSha, scan.findings, "checkpoint-pending");
         }
         // D6(c) on this log surface too: a committed filename can itself be a secret. The path
         // scan runs in the same scope as the range scan, and fails closed (withholds) on abort.
@@ -18015,6 +18469,7 @@ export class RunRunner {
         return { kind: "blocked", outcome: "secret_found" };
       }
       if (!scan.trusted) return untrusted(scan.reason ?? "scan_untrusted");
+      await this.persistRemediationScan(flight, barePath, branch, range.tipSha, []);
       await this.checkpointTestHooks?.afterCheckpointScan?.({ barePath, branch, range });
       return { kind: "pinned", range };
     } catch (e) {
@@ -18056,7 +18511,7 @@ export class RunRunner {
     barePath: string,
     branch: string,
     expectedTip: string,
-    unpublishedOnly = false,
+    options?: { explicitTip?: boolean; unpublishedOnly?: boolean },
   ): Promise<
     | { trusted: true; range: CheckpointRange; findings: SecretFinding[]; floorCandidates: string[] }
     | { trusted: false; why: string; publishedOnly?: true }
@@ -18074,14 +18529,21 @@ export class RunRunner {
       defaultBranch: flight.checkpointDefaultBranch,
       confirmedTip: flight.lastCheckpointRefTip,
       extraFloors: floorCandidates,
+      ...(options?.explicitTip ? { tipSha: expectedTip } : {}),
     });
     if (!range || range.tipSha !== expectedTip) return { trusted: false, why: "range_unresolved" };
-    if (unpublishedOnly && (range.tipSha === range.excludeSha || range.scanFloorShas?.includes(range.tipSha))) {
+    if (options?.unpublishedOnly && (range.tipSha === range.excludeSha || range.scanFloorShas?.includes(range.tipSha))) {
       return { trusted: false, why: "published_only", publishedOnly: true };
     }
     const scan = await this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() });
     if (!scan.trusted) return { trusted: false, why: scan.reason ?? "scan_untrusted" };
     return { trusted: true, range, findings: scan.findings, floorCandidates };
+  }
+
+  /** The same resolved floors protect model launch, successor admission and publication. */
+  private remediationRangeFloors(range: CheckpointRange, published: readonly string[]): string[] {
+    return [...new Set([...published, range.excludeSha, ...(range.scanFloorShas ?? []),
+      ...(range.packExcludeShas ?? []), ...(range.defaultBlobSha ? [range.defaultBlobSha] : [])])];
   }
 
   /** issue #1932: remember a CONFIRMED-published real-branch tip (validated 40-hex, deduped, capped). */
@@ -18177,7 +18639,7 @@ export class RunRunner {
     // `authoritativeTip` is the clone tip when the fetch-back succeeded and matches the tracking tip
     // (the scan itself was untrusted but the tip is real); undefined in the stale-tip / thrown case.
     const failOrProceed = async (why: string, authoritativeTip?: string): Promise<SecretRemediationDecision> => {
-      if (state.known && state.known.length > 0) {
+      if (flight.remediationRestrictions?.pending || (state.known && state.known.length > 0)) {
         state.blocked = state.known;
         runLog.warn("pre-exit secret scan could not be trusted after a known finding; failing", { run_id: runId, why });
         return { action: "fail" };
@@ -18216,7 +18678,7 @@ export class RunRunner {
       if (fetched.kind !== "updated" || cloneTip === null || trackTip === null || cloneTip !== trackTip) {
         return await failOrProceed("tracking_tip_stale");
       }
-      const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip, options?.unpublishedOnly);
+      const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip, options);
       // An advisory first-turn check must neither scan published history nor clear
       // prior findings when there is no unpublished range to inspect.
       if (!scanned.trusted && scanned.publishedOnly) return { action: "proceed" };
@@ -18228,12 +18690,21 @@ export class RunRunner {
         // (possibly a local-only bridge) hid it from this range: keep it known.
         const still = await this.reachableFlaggedFindings(state, barePath, cloneTip);
         if (still.length === 0) {
+          await this.persistRemediationScan(flight, barePath, branch, range.tipSha, []);
           state.known = undefined;
           state.cleanTip = range.tipSha;
           return { action: "proceed" };
         }
         findings = still;
       }
+      const required = this.latchRemediationFindings(flight, barePath, branch, findings);
+      if (required !== undefined) {
+        // Until the path scanner succeeds, every early return must withhold filenames.
+        state.withholdPaths = true;
+        state.known = findings;
+        state.everKnown = true;
+      }
+      await this.persistRemediationRestrictions(flight, barePath, branch, range.tipSha, findings);
       this.recordFlaggedCommits(state, findings, runLog);
       if (state.overflow) {
         state.known = findings;
@@ -18289,6 +18760,7 @@ export class RunRunner {
         runLog.warn("pre-exit secret scan: remediation attempts exhausted; failing", { run_id: runId });
         return { action: "fail" };
       }
+      await this.persistRemediationScan(flight, barePath, branch, range.tipSha, findings, "pre-exit");
       state.attempts++;
       // An ancestor-verified floor: the checkpoint floor when it is one of the range's scan floors,
       // else the range's exclude SHA.
@@ -18694,18 +19166,177 @@ export class RunRunner {
     };
   }
 
-  /**
-   * Hold only process-local remembered findings, independently of finding-display metadata.
-   * At most the capped flaggedCommits list is read, serially; the first reachable/unknown SHA
-   * or git error holds the whole candidate. Clean-tip equality judges the source, not its wrapper.
+  /** Publication/transform admission. Enrolled preparation, scans and transport retain A.
+   * Confirmed unenrolled work uses custody-only evidence and the existing B transport.
+   * Preparation and each guard are bounded separately; transport keeps the caller's clock.
+   * B callbacks consume the supplied facts, never a public journal reader. Each distinct
+   * tip is scanned once per callback; a failure stops the attempt and all sibling scans.
+   * Findings latch synchronously and are persisted only after the action releases B.
    */
+  private async withRemediationCandidateAdmission<T>(
+    flight: RunFlight, barePath: string, branch: string,
+    action: (admission: {
+      identity: RemediationRestrictionIdentity;
+      admit(source: string, candidate: string, floors: readonly string[],
+        facts?: CheckpointPublicationContext["restrictionFacts"]): Promise<void>;
+    }) => Promise<T>,
+    signal?: AbortSignal, deadlineAt?: number,
+  ): Promise<T> {
+    const revision = flight.remediationRestrictions?.denialRevision ?? 0;
+    const selected = this.remediationSource(flight);
+    const checkIdentity = () => {
+      // Preserve the caller's exact lifecycle refusal before a failed evidence
+      // read can turn it into the generic remediation-pending hold.
+      signal?.throwIfAborted();
+      this.assertFlightSourceAdmissible(flight);
+      const current = this.remediationSource(flight);
+      if (!Number.isSafeInteger(revision) || revision < 0 ||
+          (flight.remediationRestrictions?.denialRevision ?? 0) !== revision ||
+          current.runId !== selected.runId || current.clonePath !== selected.clonePath ||
+          current.attemptId !== selected.attemptId || flight.barePath !== barePath || flight.branch !== branch)
+        throw new SecretRemediationPendingError();
+    };
+    checkIdentity();
+    // Bound the evidence reads below individually. The consumer retains its own
+    // checkpoint soft/hard clock; a soft stop must not become a recovery hard abort.
+    return (async () => {
+      // This bounded query selects no source and conveys only negative knowledge.
+      const preliminary = await this.bootstrapRemediationRestrictions(flight, barePath, branch, signal, deadlineAt);
+      checkIdentity();
+      if (preliminary.kind === "unavailable") throw new SecretRemediationPendingError();
+      const needsAuthority = preliminary.enrolled || Boolean(flight.remediationRestrictions);
+      const execute = async () => {
+        let record: RemediationRecovery | undefined;
+        let facts: CheckpointPublicationContext["restrictionFacts"];
+        const check = () => {
+          const state = flight.remediationRestrictions;
+          checkIdentity();
+          // Enrolled predecessor capture has private custody only. Publication and
+          // tracking transforms wait until verified successor handoff clears this phase.
+          if (record && flight.predecessorCapture) throw new SecretRemediationPendingError();
+          if (!state) return;
+          const pending = state.pending;
+          if (flight.secretRemediation?.overflow === true || !record || !facts || facts.blocked || !facts.enrolled ||
+              selected.clonePath !== flight.worktreePath || !selected.attemptId ||
+              record.runId !== selected.runId || record.clonePath !== selected.clonePath ||
+              record.attemptId !== selected.attemptId || record.blocked !== false ||
+              !state.roots.every(root => facts!.roots.includes(root)) ||
+              !(state.flaggedOIDs ?? []).every(root => facts!.flaggedOIDs.includes(root)) ||
+              (pending && (pending.bindingUncertain || pending.requireDenial ||
+                pending.runId !== selected.runId || pending.clonePath !== selected.clonePath ||
+                pending.attemptId !== selected.attemptId || pending.barePath !== barePath ||
+                pending.branch !== branch || !pending.requiredOIDs.every(root => record!.flaggedOIDs.includes(root)))))
+            throw new SecretRemediationPendingError();
+        };
+        await this.withRemediationLifecycle(signal, async () => {
+          checkIdentity();
+          if (needsAuthority) {
+            // Reconfirm under A before authenticating the selected source.
+            const negative = await this.bootstrapRemediationRestrictions(flight, barePath, branch, signal, deadlineAt);
+            checkIdentity();
+            if (negative.kind === "unavailable") throw new SecretRemediationPendingError();
+            if (negative.enrolled || flight.remediationRestrictions) {
+              record = await this.restoreRemediationRestrictions(flight);
+              checkIdentity();
+              if (!selected.clonePath || !selected.attemptId) throw new SecretRemediationPendingError();
+              facts = await this.git.readRemediationRestrictionFacts(barePath, branch, flight.runId,
+                { runId: selected.runId, clonePath: selected.clonePath, attemptId: selected.attemptId });
+            }
+          }
+          check();
+        }, deadlineAt);
+        const identity: RemediationRestrictionIdentity = { exactRunId: flight.runId,
+          ...(record ? { workerSelectedSource: { runId: selected.runId,
+            clonePath: selected.clonePath!, attemptId: selected.attemptId! } } : {}) };
+        const findings: Array<{ tip: string; findings: SecretFinding[] }> = [];
+        try {
+          check();
+          return await action({ identity, admit: (source, candidate, floors, supplied) =>
+            this.withRemediationLifecycle(signal, async () => {
+            check();
+            // A context is fresh under B. Its fingerprint includes the authenticated body,
+            // independently confirmed for this selected run/path/attempt before the action.
+            if (supplied && (supplied.blocked || supplied.enrolled !== Boolean(record) ||
+                (facts && supplied.fingerprint !== facts.fingerprint))) throw new SecretRemediationPendingError();
+            if (!record) {
+              if (supplied?.enrolled || flight.remediationRestrictions) throw new SecretRemediationPendingError();
+              return;
+            }
+            const roots = [...new Set([...facts!.roots, ...(flight.secretRemediation?.flaggedCommits ?? [])])];
+            const tips = new Set([record.ownedTip, source, candidate, ...floors,
+              ...(flight.publishedRealTips ?? []), ...[flight.publishedTip, flight.checkpointFloor,
+                flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip].filter((x): x is string => !!x)]);
+            // The journal/parser and flight floor lists are bounded. Do not follow a mutable
+            // work queue: each input and each scan range contributes one finite pass.
+            for (const tip of tips) {
+              check();
+              const scan = await this.scanRemediationRange(flight, barePath, branch, tip, { explicitTip: true });
+              if (scan.trusted && scan.findings.length) {
+                findings.push({ tip: scan.range.tipSha, findings: scan.findings });
+                this.latchRemediationFindings(flight, barePath, branch, scan.findings);
+                throw new SecretRemediationPendingError();
+              }
+              check();
+              if (!scan.trusted) throw new SecretRemediationPendingError();
+              for (const floor of new Set([tip, ...this.remediationRangeFloors(scan.range, scan.floorCandidates)])) {
+                for (const root of roots) {
+                  check();
+                  const relation = await this.git.ancestry(barePath, root, floor);
+                  check();
+                  if (relation !== "divergent") throw new SecretRemediationPendingError();
+                }
+              }
+            }
+            check();
+          }, deadlineAt) });
+        } finally {
+          for (const finding of findings)
+            await this.withRemediationLifecycle(signal, () =>
+              this.persistRemediationRestrictions(flight, barePath, branch, finding.tip, finding.findings), deadlineAt);
+        }
+      };
+      return needsAuthority
+        ? this.inFlightAuthority(flight, execute, { ...this.authorityWait(flight), ...(signal ? { signal } : {}),
+          ...(deadlineAt ? { timeoutMs: Math.max(1, deadlineAt - Date.now()) } : {}) })
+        : execute();
+    })();
+  }
+
+  /** Final push seam, shared by plain and aligned candidates and every network retry. */
+  private async pushRemediationCandidate(flight: RunFlight, barePath: string, branch: string,
+    pat: string, repoUrl: string, username: string | undefined,
+    publication: Parameters<GitCache["pushBranch"]>[5], signal?: AbortSignal, deadlineAt?: number): Promise<void> {
+    await this.withRemediationCandidateAdmission(flight, barePath, branch, admission =>
+      this.git.withRecoveryOperation(signal ?? this.shutdownSignal.signal, deadlineAt ?? Infinity, () =>
+      this.git.pushBranch(barePath, branch, pat, repoUrl, username, publication,
+        async (candidate, context: PushPublicationContext) => {
+          if (!context.restrictionFacts || context.originalFloor.kind === "unverified") throw new SecretRemediationPendingError();
+          await admission.admit(context.originalHead, candidate,
+            [context.originalFloor, context.remoteFloor].flatMap(floor => floor.kind === "pinned" ? [floor.oid] : []),
+            context.restrictionFacts);
+        }, admission.identity)), signal, deadlineAt);
+  }
+
   private async checkpointRemediationHold(
     flight: RunFlight,
     barePath: string,
     candidate: string | null,
     reap: boolean,
     sourceSha: string | null = candidate,
+    signal?: AbortSignal,
+    deadlineAt?: number,
   ): Promise<boolean> {
+    if (flight.remediationRestrictions) {
+      if (!candidate || !sourceSha || !flight.branch) return true;
+      try {
+        await this.withRemediationCandidateAdmission(flight, barePath, flight.branch,
+          admission => admission.admit(sourceSha, candidate, []), signal, deadlineAt);
+        return false;
+      } catch (error) {
+        if (isCheckpointBoundaryFailure(error)) throw error;
+        return true;
+      }
+    }
     const state = flight.secretRemediation;
     if (!state) return false;
     if ((state.known?.length ?? 0) > 0 || (state.blocked?.length ?? 0) > 0 || state.overflow === true) return true;
@@ -18780,6 +19411,7 @@ export class RunRunner {
     pinned?: CheckpointRange,
     onStep?: (step: BoundaryStep) => void,
     reap = true,
+    deadlineAt?: number,
   ): Promise<PublishOutcome> {
     if (flight.runKind === "task" && !flight.checkpointCoordinates)
       return { published: false, reason: "skipped", skipLabel: "unsupported" };
@@ -18825,27 +19457,40 @@ export class RunRunner {
         return { published: false, reason: "skipped", skipLabel: "ci_config_guard" };
       }
       signal?.throwIfAborted();
-      if (await this.checkpointRemediationHold(flight, barePath, sourceSha, reap)) {
+      if (await this.checkpointRemediationHold(flight, barePath, sourceSha, reap, sourceSha, signal, deadlineAt)) {
         throw new SecretRemediationPendingError();
       }
-      const packed = await this.git.checkpointPack(barePath, branch, overlay, pinned, onStep, sourceSha,
-        async (wantedSha) => {
-          signal?.throwIfAborted();
-          // The clean scan names the owned source, while ancestry judges the actual overlay/bridge.
-          if (await this.checkpointRemediationHold(flight, barePath, wantedSha, reap, sourceSha)) {
-            throw new SecretRemediationPendingError();
-          }
-          signal?.throwIfAborted();
-        },
+      let guard: (candidate: string, context?: CheckpointPublicationContext) => Promise<void>;
+      const produce = <T,>(start: (identity: RemediationRestrictionIdentity) => Promise<T>) =>
+        this.withRemediationCandidateAdmission(flight, barePath, branch, async admission => {
+          guard = async (wantedSha, context) => {
+            signal?.throwIfAborted();
+            if (!context?.restrictionFacts) throw new SecretRemediationPendingError();
+            await admission.admit(context.sourceSha, wantedSha,
+              [context.excludeSha, ...context.packExcludeShas,
+                ...(context.defaultBlobSha ? [context.defaultBlobSha] : [])], context.restrictionFacts);
+            // The legacy flight-only policy remains for ordinary unenrolled publications.
+            if (!flight.remediationRestrictions &&
+                await this.checkpointRemediationHold(flight, barePath, wantedSha, reap, sourceSha, signal, deadlineAt))
+              throw new SecretRemediationPendingError();
+            signal?.throwIfAborted();
+          };
+          return start(admission.identity);
+        }, signal, deadlineAt);
+      const packed = await produce(identity => this.git.checkpointPack(barePath, branch, overlay, pinned, onStep, sourceSha,
+        (candidate, context) => guard(candidate, context),
         // issue #2733: chain a raw publish over a prior overlay tip so a lost-ack or confirmed
         // overlay does not wedge later tick/iteration publishes with `not_descendant`. The list is
         // ordered [attempted, confirmed]: the first candidate that is not already contained in the
         // raw tip and verifies as wrapper-only is used. (The reap overlay's own base still uses
-        // `attempted ?? confirmed`, unchanged #1086 behaviour.) GitHub only, like the overlay.
-        flight.checkpointChainForge === true
-          ? [flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip]
-          : undefined,
-        { defaultBranch: flight.checkpointDefaultBranch, signal });
+        // `attempted ?? confirmed`, unchanged #1086 behaviour.) issue #2753: chaining runs on every
+        // forge (a park marker leaves the same not_descendant wedge anywhere); only GitHub swaps the
+        // workflow subtree (checkpointChainForge), other forges chain over realTip's own tree. Park
+        // markers are tolerated only for the confirmed tip (markerTrustedTip).
+        [flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip],
+        { defaultBranch: flight.checkpointDefaultBranch, signal, restrictionIdentity: identity,
+          markerTrustedTip: flight.lastCheckpointRefTip,
+          chainWorkflowSwap: flight.checkpointChainForge === true }));
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };
@@ -18870,7 +19515,7 @@ export class RunRunner {
         onStep?.("scratch_preflight");
         await this.requireTrackingOwned(flight, barePath, branch, sourceSha, onStep, "scratch_preflight");
         signal?.throwIfAborted();
-        producer = await packed.replay();
+        producer = await produce(() => packed.replay());
         observeProducer();
         retried = true;
       }
@@ -19568,7 +20213,8 @@ export class RunRunner {
     // failure (unlike the void fetchBackBestEffort), so a failed transfer is caught here.
     let fetched: Extract<TrackingUpdateResult, { kind: "updated" }>;
     try {
-      fetched = await this.fetchTracking(flight, barePath, worktreePath, branch);
+      fetched = await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
+        heldCapture ? { signal: heldCapture.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, heldCapture.deadlineAt - Date.now())) } : undefined);
       check();
     } catch (e) {
       runLog.warn("recovery: settle transfer fetch-back failed", { error: errMessage(e) });
@@ -19844,6 +20490,7 @@ export class RunRunner {
         claim.repo.default_branch?.trim() ||
         (await this.git.defaultBranchName(barePath)) ||
         "main";
+      await this.bootstrapRemediationRestrictions(flight, undefined, undefined, signal);
       const outcome = await this.recovery.captureAndUpload({
         onArchiveAccepted: record => this.archiveAccepted(flight, record),
         onCancellationObserved: () => this.observeCancellation(flight),
@@ -21933,6 +22580,9 @@ export class RunRunner {
       );
       return { verified: false, published: false };
     }
+    const captureDeadline = Math.min(opts.episode?.deadlineAt ?? Infinity,
+      opts.heldCapture?.deadlineAt ?? Infinity, opts.heldAuthenticated?.deadlineAt ?? Infinity);
+    await this.bootstrapRemediationRestrictions(flight, undefined, undefined, opts.signal, captureDeadline);
     // issue #1783 (auditor M2): prove the clone quiescent BEFORE the capture (its wip marker, the
     // fetch-back and the credentialed overlay + publish). On survivors/unverified NOTHING runs:
     // the result is unverified and `residueBlocked`, which each caller treats as its
@@ -21994,7 +22644,9 @@ export class RunRunner {
     // failed fetch-back is caught here rather than being swallowed.
     try {
       await opts.beforeMutation?.();
-      await this.fetchTracking(flight, barePath, worktreePath, branch);
+      const held = opts.heldCapture ?? opts.heldAuthenticated;
+      await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
+        held ? { signal: held.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, held.deadlineAt - Date.now())) } : undefined);
       await opts.beforeMutation?.();
     } catch (e) {
       if (opts.beforeMutation) throw e;
@@ -23113,7 +23765,9 @@ export class RunRunner {
     // fetchAgentBranch THROWS on failure (unlike the void fetchBackBestEffort), so a failed
     // fetch-back is caught here rather than swallowed.
     try {
-      await this.fetchTracking(flight, barePath, worktreePath, branch);
+      const held = options.heldCapture ?? options.heldAuthenticated;
+      await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
+        held ? { signal: held.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, held.deadlineAt - Date.now())) } : undefined);
     } catch (e) {
       if (options.heldAuthenticated || options.heldCapture) throw e;
       runLog.warn("completion hold capture: fetch-back failed", { error: errMessage(e) });
@@ -25003,6 +25657,8 @@ export class RunRunner {
     flight.retainedEpisodeCustody = true;
     flight.retainedLocalCustody = true;
     flight.predecessorCapture = true;
+    flight.remediationPredecessorAttempt = source.attemptId;
+    this.rememberRemediationRestrictions(flight, source);
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;
@@ -25113,6 +25769,9 @@ export class RunRunner {
         await checkOwnership();
         try {
           await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), deadline, async signal => {
+            await this.bootstrapRemediationRestrictions(flight);
+            this.retainedLifecycleGuard(flight);
+            await this.requireRetainedOwnership(flight, deadline, signal);
             // No capture is performed on a rehold. Every source, including a partial
             // successor, still needs a fresh credential-free quiescence boundary.
             const proof = await this.runFreeCapture(claim, flight, deadline, signal, async held => {
@@ -25235,6 +25894,11 @@ export class RunRunner {
         await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), iteration.deadline, async signal => {
           const check = () => this.requireRetainedOwnership(flight, iteration.deadline, signal);
           await check();
+          // Preservation is precharged independently; restore current custody before source work,
+          // with the same lifecycle and episode bound as the capture that consumes it.
+          await this.bootstrapRemediationRestrictions(flight);
+          this.retainedLifecycleGuard(flight);
+          await check();
           // issue #3404 M2 U3: admit the predecessor path (a fresh epoch carrying the capturing executor)
           // under a short A BEFORE the capture's first effect. A foreign active slot refuses the capture.
           try {
@@ -25336,6 +26000,8 @@ export class RunRunner {
               });
               await check();
               if (!record) { blocker = "preservation_failed"; throw finalize; }
+              await this.bootstrapRemediationRestrictions(flight);
+              await check();
               const outcome = await this.recovery.captureAndUpload({
                 onArchiveAccepted: record => this.archiveAccepted(flight, record),
                 onCancellationObserved: () => this.observeCancellation(flight),
@@ -25373,18 +26039,122 @@ export class RunRunner {
           await check();
           blocker = "adoption_failed";
           const attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
-          const successor = await this.inFlightAuthority(flight, () => this.git.prepareRecoverySuccessor(bare, branch, key, source,
-            iteration.attempts, attemptId, { checkpointWriteUnresolved: flight.checkpointClaimEvidence.writeUnresolved, checkpointKey: flight.checkpointCoordinates?.checkpoint_key ??
-              (flight.runKind === "task" ? null : undefined), selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.plan_cross_check_gated === true }),
-            { signal, timeoutMs: Math.max(1, iteration.deadline - Date.now()) });
-          expectedSource = { ...source, clonePath: successor.path, attemptId: successor.attemptId };
-          flight.runnerClone = successor;
-          flight.worktreePath = successor.path;
-          flight.attemptId = attemptId;
-          flight.predecessorCapture = false;
-          flight.publicationFloor = successor.publicationFloor ?? { kind: "unverified" };
-          flight.publishedTip = flight.publicationFloor.kind === "pinned" ? flight.publicationFloor.oid : undefined;
-          flight.checkpointFloor = flight.publishedTip;
+          let deferredRestrictions: { tip: string; findings: SecretFinding[] } | undefined;
+          let admittedSourceTip: string | undefined;
+          let admittedExecutionTip: string | undefined;
+          let successor: RunnerClone;
+          try {
+            successor = await this.inFlightAuthority(flight, async () => {
+              const denialRevision = flight.remediationRestrictions?.denialRevision ?? 0;
+              // Capture may retain bytes with custody-only facts; successor admission may not.
+              const negative = await this.bootstrapRemediationRestrictions(flight);
+              this.retainedLifecycleGuard(flight);
+              if (negative.kind === "unavailable") throw finalize;
+              // Independently restore the selected predecessor before entering Git's bare lock.
+              const record = await this.restoreRemediationRestrictions(flight);
+              const snapshot = canonicalJson(flight.remediationRestrictions ?? null);
+              const assertOldFacts = (flags: readonly string[]): void => {
+                this.assertFlightSourceAdmissible(flight);
+                const selected = this.remediationSource(flight);
+                const pending = flight.remediationRestrictions?.pending;
+                if (!Number.isSafeInteger(denialRevision) || denialRevision < 0 ||
+                    (flight.remediationRestrictions?.denialRevision ?? 0) !== denialRevision ||
+                    selected.runId !== source.runId || selected.clonePath !== source.clonePath ||
+                    selected.attemptId !== source.attemptId || flight.worktreePath !== source.clonePath ||
+                    flight.barePath !== bare || flight.branch !== branch ||
+                    canonicalJson(flight.remediationRestrictions ?? null) !== snapshot ||
+                    (pending && (!record || pending.requireDenial || pending.bindingUncertain ||
+                      pending.runId !== source.runId || pending.clonePath !== source.clonePath ||
+                      pending.attemptId !== source.attemptId || pending.barePath !== bare ||
+                      pending.branch !== branch || !pending.requiredOIDs.every(q => flags.includes(q)))))
+                  throw new Error("remediation predecessor facts changed or unconfirmed");
+              };
+              this.retainedLifecycleGuard(flight);
+              assertOldFacts(record?.flaggedOIDs ?? []);
+              let admittedFlags: readonly string[] | undefined;
+              const prepared = await this.git.prepareRecoverySuccessor(bare, branch, key, source,
+                iteration.attempts, attemptId, {
+                  checkpointWriteUnresolved: flight.checkpointClaimEvidence.writeUnresolved,
+                  checkpointKey: flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : undefined),
+                  selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.plan_cross_check_gated === true,
+                  admitRemediationSource: async input => {
+                    this.retainedLifecycleGuard(flight);
+                    assertOldFacts(input.flaggedOIDs);
+                    if (!record || input.runId !== source.runId || input.clonePath !== source.clonePath ||
+                        input.attemptId !== source.attemptId || input.branch !== branch ||
+                        input.sourceTip !== record.ownedTip) return false;
+                    const scan = await this.scanRemediationRange(flight, bare, branch, input.sourceTip, { explicitTip: true });
+                    // Latch before validation or another await. Persist only after Git releases B.
+                    if (scan.trusted && scan.findings.length) {
+                      deferredRestrictions = { tip: input.sourceTip, findings: scan.findings };
+                      this.latchRemediationFindings(flight, bare, branch, scan.findings);
+                      return false;
+                    }
+                    this.retainedLifecycleGuard(flight);
+                    assertOldFacts(input.flaggedOIDs);
+                    if (!scan.trusted) return false;
+                    const roots = [...new Set([...input.restrictedRoots, ...(flight.remediationRestrictions?.roots ?? [])])];
+                    const executionTip = input.executionTip ?? input.sourceTip;
+                    const floors = [...new Set([executionTip,
+                      ...this.remediationRangeFloors(scan.range, scan.floorCandidates)])];
+                    // Only the newly peeled S is exempt from the CONTENT-S check. Old live
+                    // restrictions must still be divergent from S; all roots, including S,
+                    // must be divergent from execution P and every actual published/range floor.
+                    const contentRoots = roots.filter(root => root !== input.sourceTip ||
+                      executionTip === input.sourceTip || record.excludedRoots?.includes(root) ||
+                      record.flaggedOIDs.includes(root) || record.edges.some(e => e.from === root) ||
+                      flight.remediationRestrictions?.roots.includes(root));
+                    for (const root of contentRoots) {
+                      const relation = await this.git.ancestry(bare, root, input.sourceTip);
+                      this.retainedLifecycleGuard(flight);
+                      assertOldFacts(input.flaggedOIDs);
+                      if (relation !== "divergent") return false;
+                    }
+                    // Parser-bounded roots and range/published floors; a failed proof stops adoption.
+                    // Every probe retains the existing recovery signal and deadline.
+                    for (const floor of floors)
+                      for (const root of roots) {
+                        const relation = await this.git.ancestry(bare, root, floor);
+                        this.retainedLifecycleGuard(flight);
+                        assertOldFacts(input.flaggedOIDs);
+                        if (relation !== "divergent") return false;
+                      }
+                    this.retainedLifecycleGuard(flight);
+                    assertOldFacts(input.flaggedOIDs);
+                    admittedFlags = input.flaggedOIDs;
+                    admittedSourceTip = input.sourceTip;
+                    admittedExecutionTip = executionTip;
+                    return true;
+                  },
+                });
+              // Git awaits seed and durable readback after admission. A readable ready record
+              // cannot discharge facts arriving in those waits. Confirm them and reflect the
+              // completed durable handoff synchronously before the next lifecycle check, so a
+              // stop verifies the successor tuple already journaled by prepareRecoverySuccessor.
+              assertOldFacts(admittedFlags ?? record?.flaggedOIDs ?? []);
+              if (record && (!admittedFlags || admittedSourceTip !== record.ownedTip))
+                throw new Error("remediation source admission unavailable");
+              const pending = flight.remediationRestrictions?.pending;
+              if (pending) {
+                pending.clonePath = prepared.path;
+                pending.attemptId = prepared.attemptId;
+              }
+              expectedSource = { ...source, clonePath: prepared.path, attemptId: prepared.attemptId };
+              flight.runnerClone = prepared;
+              flight.worktreePath = prepared.path;
+              flight.attemptId = attemptId;
+              flight.predecessorCapture = false;
+              flight.publicationFloor = prepared.publicationFloor ?? { kind: "unverified" };
+              flight.publishedTip = flight.publicationFloor.kind === "pinned" ? flight.publicationFloor.oid : undefined;
+              flight.checkpointFloor = flight.publishedTip;
+              return prepared;
+            }, { signal, timeoutMs: Math.max(1, iteration.deadline - Date.now()) });
+          } catch (error) {
+            if (deferredRestrictions)
+              await this.persistRemediationRestrictions(flight, bare, branch,
+                deferredRestrictions.tip, deferredRestrictions.findings);
+            throw error;
+          }
           const attempt = newRunAttempt(claim.run_id, claim.claim_generation, successor.path,
             () => flight.executor.recordedRootPids?.() ?? [], new Date(this.now()), attemptId);
           flight.attempt = attempt;
@@ -25413,6 +26183,23 @@ export class RunRunner {
           }
           // The (possibly new) executor is bound to the successor's epoch before it runs anything there.
           await this.bindFlightSource(flight, successor.path);
+          await this.inFlightAuthority(flight, async () => {
+            const restored = await this.restoreRemediationRestrictions(flight);
+            if (!admittedSourceTip) return;
+            const pending = flight.remediationRestrictions?.pending;
+            if (!restored || restored.ownedTip !== admittedExecutionTip ||
+                restored.runId !== source.runId || restored.clonePath !== successor.path ||
+                restored.attemptId !== successor.attemptId || restored.branch !== branch ||
+                (pending && (pending.requireDenial || pending.bindingUncertain ||
+                  pending.runId !== restored.runId || pending.clonePath !== restored.clonePath ||
+                  pending.attemptId !== restored.attemptId || pending.barePath !== bare ||
+                  pending.branch !== branch || !pending.requiredOIDs.every(q => restored.flaggedOIDs.includes(q)))))
+              throw new Error("remediation successor facts unconfirmed");
+          }, { signal, timeoutMs: Math.max(1, Math.min(CLONE_AUTHORITY_WAIT_MS, iteration.deadline - Date.now())) });
+          // Close old active permission under the independently restored new binding. The exact
+          // immutable S was scanned clean; this writer creates no origin grant.
+          if (admittedSourceTip && admittedExecutionTip === admittedSourceTip)
+            await this.persistRemediationScan(flight, bare, branch, admittedSourceTip, []);
           flight.batcher.emit({ kind: "status", agent: "worker", payload: {
             text: "retained work verified on a fresh local attempt; predecessor sources and custody retained",
           } });

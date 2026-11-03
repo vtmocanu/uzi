@@ -45,6 +45,8 @@
  *    Footprint: the fresh attempt dir. Owner: the bare lock.
  *  - "normalize": GitCache.normalizeRetainedSourceObjects, after attribution and before the
  *    supervised helper writes object permissions into the clone's objects and the bare's.
+ *  - "remediation-recovery": authenticate the current executor-bound lease before recording or
+ *    reading attempt-bound remediation evidence. Never mints an epoch or consumes a publication.
  *  - "replace": GitCache.prepareRecoverySuccessor, before the successor ledger/journal writes and
  *    clone. Footprint: the successor path and the journal that names the retained predecessors.
  *  - "discard": GitCache.discardRetainedSource, after the disposition check and before the first
@@ -105,8 +107,9 @@
  *  refuses fail-closed on a slot one ahead of its head shard instead of completing that crash window.
  *  With a transaction active (the seed and replace sites all hold A) it reads through the transactional
  *  load, which completes that window, so one failed head write cannot block a repository's seeds
- *  permanently. Runner sites that therefore lost their A wrapper (their only hook is this one):
- *  fetchAgentBranch, updateTrackingRef, retainCurrentOwedCandidate (two sites) and anchorRecoveryHead;
+ *  permanently. Runner sites without a whole-call A wrapper:
+ *  fetchAgentBranch (attempt imports use short A -> B source proof phases around B-only transport),
+ *  updateTrackingRef, retainCurrentOwedCandidate (two sites) and anchorRecoveryHead (only this hook);
  *  in recovery.ts freezeInventory (buildRecoveryCoverage) and the inventory source boundary around it.
  *  - "seed-canonical", "seed-attempt", "replace": GitCache.runnerCloneForBranch, attemptCloneForBranch
  *    and prepareRecoverySuccessor, immediately before their admitSourceUse.

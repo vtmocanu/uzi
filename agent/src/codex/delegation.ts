@@ -36,6 +36,7 @@
 // wires itself into runner.ts.
 
 import { formatChildTurnBudget, resolveChildTurnDeadlineMs } from "./child-budget.js";
+import { CHILD_TIMEOUT_BOUND_PREFIX, CHILD_TIMEOUT_BOUND_SUFFIX } from "./dispatch-diagnostics.js";
 import {
   admitPolicyTurn,
   isPolicyRefusalTag,
@@ -489,12 +490,15 @@ export class CodexDelegationRunner {
       return { ok: false, code: "child_aborted", message: `child_aborted: ${tail}` };
     }
     const budget = formatChildTurnBudget(this.childTurnDeadlineMs);
+    // The bound message is the one a persisted completion can carry; the judge reads its shape
+    // from the same shared constants.
+    if (phase === "bound") {
+      return { ok: false, code: "child_timeout", message: CHILD_TIMEOUT_BOUND_PREFIX + budget + CHILD_TIMEOUT_BOUND_SUFFIX };
+    }
     const tail =
-      phase === "bound"
-        ? `the delegated child exceeded its ${budget} turn budget; interrupt requested, partial work may remain`
-        : phase === "before"
-          ? `the ${budget} child turn budget expired before the child started`
-          : `the ${budget} child turn budget expired while the child was starting`;
+      phase === "before"
+        ? `the ${budget} child turn budget expired before the child started`
+        : `the ${budget} child turn budget expired while the child was starting`;
     return { ok: false, code: "child_timeout", message: `child_timeout: ${tail}` };
   }
 

@@ -77,7 +77,8 @@ On Docker-lane hosted workers, the run's working clones and `$TMPDIR` (`/data/ru
 - The Docker lane uses the existing data-volume thresholds. No Docker-specific values; measured thresholds are deferred to live acceptance.
 - Admission fails open on an unknown sample and reopens after the bounded wait `UZI_DISK_ADMISSION_MAX_WAIT` (default 15m, `agent/src/config.ts`). **No admission headroom is claimed.**
 - `workerDefaultDockerEphemeralRequest` stays 5Gi (not remeasured). Data PVC sizes are unchanged (presets 5/25/50Gi, run-bound 40Gi) pending live measurement.
-- A data-PVC recycle of a non-custody worker (legacy `{nix,data}` pressure recycle, ephemeral-worker removal) deletes runner contents, which is plain-lane parity. A DinD-only maintenance recycle keeps `/data/runner` and loses only DinD state.
+- Since #3852, automatic pressure recycle preserves Docker `/data` regardless of custody or runner layout: explicit Nix pressure selects Nix only; data pressure without Nix defers. This protection requires the fixed controller; old controllers can still delete data. Ephemeral teardown and manual data-PVC deletion still physically remove runner contents. A DinD-only maintenance recycle keeps `/data/runner` and loses only DinD state.
+- Full Docker data now degrades capacity. Existing run park-and-trim and supported manual settled-tree cleanup remain the reclaim paths; D9's custody procedure remains binding for protected sources. PRD #3431 M1b settlement/deletion is not started and #3329's genuine-idle reclaim roll remains deferred. No new reclaim authority is granted; see [ADR-837 D9](0837-worker-disk-lifecycle.md#d9--recycle-defaults-on-over-recorded-reviewer-dissent).
 
 ### D9. Availability residual: daemon-owned bytes on a custody-held worker (maintainer wording)
 

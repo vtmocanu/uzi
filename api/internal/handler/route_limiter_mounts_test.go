@@ -217,7 +217,8 @@ var limiterNames = [...]string{
 // /api/admin/cli-tokens.
 // PRD #3244 M1 added POST /api/worker/runs/{id}/lead-config (noLimiter, like decisions-memo);
 // the table had 388 rows after it. PRD #3244 M3 added GET /api/runs/{id}/lead-config (noLimiter, an
-// owner-or-admin read like /review), making it 389 rows. The earlier history figures above were not re-tallied.
+// owner-or-admin read like /review), making it 389 rows. Issue #3811 adds the two owner-only
+// cross-check history reads, making it 391 rows. The earlier history figures above were not re-tallied.
 // THIS SENTENCE IS DOWNSTREAM OF ANY NEW ROUTE — see the note above wantRouteMounts for
 // which lines a mount-adder owns.
 //
@@ -521,6 +522,9 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/repos/{id}/ci/runs", limForge},
 	{"GET", "/api/repos/{id}/ci/runs/{run_id}", limForge},
 	{"GET", "/api/repos/{id}/tool-profile", noLimiter},
+	// Issue #3811: owner-only bounded local history reads, no forge call or token spend.
+	{"GET", "/api/cross-checks", noLimiter},
+	{"GET", "/api/cross-checks/availability", noLimiter},
 	{"GET", "/api/runs/", noLimiter},
 	{"GET", "/api/runs/{id}", noLimiter},
 	// PRD #1296 M2 owner recovery-archive routes. noLimiter — owner-scoped DB reads/writes
