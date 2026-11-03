@@ -674,7 +674,8 @@ chmod +x "$SCRATCH/broken-compose/docker"
 for unavailable in no-docker broken-compose; do
   env PATH="$SCRATCH/$unavailable" CI= GITHUB_ACTIONS= /bin/bash "$render_test" > "$SCRATCH/render-local.log" 2>&1
   grep -F 'SKIP: E2E overlay renders need Docker Compose' "$SCRATCH/render-local.log" >/dev/null
-  ! grep -F 'PASS:' "$SCRATCH/render-local.log" >/dev/null
+  ! grep -F 'PASS:' "$SCRATCH/render-local.log" >/dev/null \
+    || { echo 'FAIL: unavailable local Compose reported PASS'; exit 1; }
   for context in CI GITHUB_ACTIONS; do
     if env PATH="$SCRATCH/$unavailable" CI= GITHUB_ACTIONS= "$context=true" \
         /bin/bash "$render_test" > "$SCRATCH/render-ci.log" 2>&1; then
@@ -691,5 +692,6 @@ SH
 rc=0
 env PATH="$SCRATCH/broken-compose:$PATH" CI=true GITHUB_ACTIONS= /bin/bash "$render_test" > "$SCRATCH/render-failed.log" 2>&1 || rc=$?
 [ "$rc" = 23 ] || { echo "FAIL: Compose render failure changed exit $rc"; exit 1; }
-! grep -F 'PASS:' "$SCRATCH/render-failed.log" >/dev/null
+! grep -F 'PASS:' "$SCRATCH/render-failed.log" >/dev/null \
+  || { echo 'FAIL: failed Compose render reported PASS'; exit 1; }
 echo 'PASS: separate Compose renders visibly skip locally, are mandatory in CI, and preserve render failures'
