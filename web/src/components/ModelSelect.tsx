@@ -106,6 +106,9 @@ export function ModelSelect({
   // back to inherit. Only an externally-driven change (async load, reset)
   // re-syncs the internal state.
   const lastEmitted = useRef(value);
+  // Pair this render's value with its emitted snapshot. An event between commit
+  // and the passive effect may already have advanced lastEmitted.current.
+  const emittedAtRender = lastEmitted.current;
   // The harness this instance last re-derived against, so a harness switch (which
   // moves the SAME value between "curated" and "custom" under the two vocabularies,
   // e.g. "opus" is curated under Claude but custom under Codex) is never missed.
@@ -119,7 +122,7 @@ export function ModelSelect({
     const aliasesChanged = aliasesKey !== lastAliasesKey.current;
     lastAliasesKey.current = aliasesKey;
     // An equal new array must preserve an intentionally empty custom input.
-    if (!harnessChanged && !aliasesChanged && value === lastEmitted.current) return;
+    if (!harnessChanged && !aliasesChanged && value === emittedAtRender) return;
     lastEmitted.current = value;
     const m = deriveMode(value, aliases);
     setMode(m);

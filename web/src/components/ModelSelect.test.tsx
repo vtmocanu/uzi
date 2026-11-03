@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect } from "vitest";
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { Harness as HarnessKind } from "../lib/api";
 import { ModelSelect } from "./ModelSelect";
@@ -109,6 +109,30 @@ const combo = () => screen.getByRole("combobox") as HTMLSelectElement;
 const value = () => screen.getByTestId("model").textContent;
 
 describe("ModelSelect", () => {
+  it.each([undefined, "claude"] as const)("preserves custom selected before initial passive effects with harness %s", (pickerHarness) => {
+    function EarlySelection() {
+      const [model, setModel] = useState("sonnet");
+      const root = useRef<HTMLDivElement>(null);
+      useLayoutEffect(() => {
+        const select = root.current!.querySelector("select")!;
+        select.value = "custom";
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      }, []);
+      return (
+        <div ref={root}>
+          <ModelSelect value={model} onChange={setModel} harness={pickerHarness} defaultLabel="Default · test" />
+          <output data-testid="model">{model}</output>
+        </div>
+      );
+    }
+
+    render(<EarlySelection />);
+    expect(value()).toBe("");
+    expect(screen.getByRole("textbox", { name: "Custom model ID" })).toBeTruthy();
+    expect(combo().value).toBe("custom");
+    expect((screen.getByRole("textbox", { name: "Custom model ID" }) as HTMLInputElement).value).toBe("");
+  });
+
   it("shows inherit and no custom input for an empty value", () => {
     render(<Harness initial="" />);
     expect(combo().value).toBe("inherit");
