@@ -4,7 +4,7 @@ import { useState } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { Harness as HarnessKind } from "../lib/api";
 import { ModelSelect } from "./ModelSelect";
-import { CODEX_CURATED_MODELS } from "../lib/codexModels";
+import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../lib/codexModels";
 import { Field } from "./ui";
 
 afterEach(cleanup);
@@ -16,21 +16,94 @@ function Harness({
   initial,
   pickerHarness,
   allowCustom,
+  models,
   defaultLabel = "Default · test",
 }: {
   initial: string;
   pickerHarness?: HarnessKind;
   allowCustom?: boolean;
+  models?: readonly string[];
   defaultLabel?: string | null;
 }) {
   const [model, setModel] = useState(initial);
   return (
     <>
-      <ModelSelect value={model} onChange={setModel} harness={pickerHarness} allowCustom={allowCustom} defaultLabel={defaultLabel} />
+      <ModelSelect value={model} onChange={setModel} harness={pickerHarness} allowCustom={allowCustom} models={models} defaultLabel={defaultLabel} />
       <output data-testid="model">{model}</output>
     </>
   );
 }
+
+describe("ModelSelect — closed models override", () => {
+  it.each([undefined, "claude", "codex"] as const)("offers exactly the five role options for harness %s", (pickerHarness) => {
+    render(<Harness initial="" pickerHarness={pickerHarness} models={CODEX_ROLE_MODELS} />);
+    expect(Array.from(combo().options, (o) => o.value)).toEqual(["inherit", ...CODEX_ROLE_MODELS]);
+    fireEvent.change(combo(), { target: { value: "gpt-6-luna" } });
+    expect(value()).toBe("gpt-6-luna");
+    expect(screen.queryByLabelText("Custom model ID")).toBeNull();
+  });
+
+  it("allows custom entry only with explicit opt-in", () => {
+    render(<Harness initial="" models={CODEX_ROLE_MODELS} allowCustom />);
+    fireEvent.change(combo(), { target: { value: "custom" } });
+    fireEvent.change(screen.getByLabelText("Custom model ID"), { target: { value: "custom-id" } });
+    expect(value()).toBe("custom-id");
+  });
+
+  it("treats an empty override as a closed empty list", () => {
+    render(<Harness initial="" models={[]} />);
+    expect(Array.from(combo().options, (o) => o.value)).toEqual(["inherit"]);
+  });
+
+  it("re-derives for list changes and external values without emitting a replacement", () => {
+    const emitted: string[] = [];
+    const onChange = (v: string) => emitted.push(v);
+    const { rerender } = render(
+      <ModelSelect value="gpt-6-luna" onChange={onChange} models={CODEX_CURATED_MODELS} allowCustom defaultLabel="Default" />,
+    );
+    expect(combo().value).toBe("custom");
+    rerender(<ModelSelect value="gpt-6-luna" onChange={onChange} models={CODEX_ROLE_MODELS} allowCustom defaultLabel="Default" />);
+    expect(combo().value).toBe("gpt-6-luna");
+    rerender(<ModelSelect value="gpt-6-luna" onChange={onChange} models={CODEX_CURATED_MODELS} allowCustom defaultLabel="Default" />);
+    expect(combo().value).toBe("custom");
+    rerender(<ModelSelect value="gpt-6-sol" onChange={onChange} models={CODEX_ROLE_MODELS} allowCustom defaultLabel="Default" />);
+    expect(combo().value).toBe("gpt-6-sol");
+    expect(emitted).toEqual([]);
+  });
+
+  it("keeps an emptied custom field through equal new arrays and parent renders", () => {
+    function FreshLists() {
+      const [model, setModel] = useState("custom-id");
+      const [renders, setRenders] = useState(0);
+      return <>
+        <button onClick={() => setRenders(renders + 1)}>render {renders}</button>
+        <ModelSelect value={model} onChange={setModel} models={[...CODEX_ROLE_MODELS]} allowCustom defaultLabel="Default" />
+      </>;
+    }
+    render(<FreshLists />);
+    fireEvent.change(screen.getByLabelText("Custom model ID"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "render 0" }));
+    expect(combo().value).toBe("custom");
+    expect((screen.getByLabelText("Custom model ID") as HTMLInputElement).value).toBe("");
+  });
+
+  it("shows an unsupported stored value without enabling custom entry on a closed list", () => {
+    render(<Harness initial="legacy-custom" models={CODEX_ROLE_MODELS} />);
+    expect(combo().value).toBe("custom");
+    expect((screen.getByRole("option", { name: "legacy-custom" }) as HTMLOptionElement).disabled).toBe(true);
+    expect(screen.queryByRole("option", { name: /Other/ })).toBeNull();
+    expect(screen.queryByLabelText("Custom model ID")).toBeNull();
+    expect(value()).toBe("legacy-custom");
+  });
+
+  it("reverts to harness options when the override is removed", () => {
+    const { rerender } = render(<Harness initial="gpt-6-luna" pickerHarness="codex" models={CODEX_ROLE_MODELS} />);
+    expect(combo().value).toBe("gpt-6-luna");
+    rerender(<Harness initial="gpt-6-luna" pickerHarness="codex" />);
+    expect(combo().value).toBe("custom");
+    expect((screen.getByLabelText("Custom model ID") as HTMLInputElement).value).toBe("gpt-6-luna");
+  });
+});
 
 const combo = () => screen.getByRole("combobox") as HTMLSelectElement;
 const value = () => screen.getByTestId("model").textContent;
@@ -63,6 +136,19 @@ describe("ModelSelect", () => {
     expect(value()).toBe("");
     expect(combo().value).toBe("custom");
     expect(screen.getByLabelText("Custom model ID")).not.toBeNull();
+  });
+
+  it("loads external values and a simultaneous harness change when models is omitted", () => {
+    const onChange = () => {};
+    const { rerender } = render(<ModelSelect value="" onChange={onChange} defaultLabel="Default" />);
+    rerender(<ModelSelect value="claude-custom-v1" onChange={onChange} defaultLabel="Default" />);
+    expect(combo().value).toBe("custom");
+    expect((screen.getByLabelText("Custom model ID") as HTMLInputElement).value).toBe("claude-custom-v1");
+    rerender(<ModelSelect value="gpt-6-sol" harness="codex" onChange={onChange} defaultLabel="Default" />);
+    expect(combo().value).toBe("gpt-6-sol");
+    expect(screen.queryByLabelText("Custom model ID")).toBeNull();
+    rerender(<ModelSelect value="" harness="codex" onChange={onChange} defaultLabel="Default" />);
+    expect(combo().value).toBe("inherit");
   });
 
   it("emits the raw custom text as typed", () => {

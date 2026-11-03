@@ -7,7 +7,70 @@ import {
   TEMPLATE_SCOPE_LABEL,
   templateScopeBadgeTone,
   templateModelDefaultLabel,
+  templateModelFieldWarning,
+  templateModelsLabel,
 } from "./agentTemplates";
+
+describe("templateModelFieldWarning", () => {
+  it.each(["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"])(
+    "rejects %s on Claude and accepts it on Codex", (model) => {
+      expect(templateModelFieldWarning(model, "claude")).toMatch(/Claude.*template/);
+      expect(templateModelFieldWarning(model, "codex")).toBe("");
+      expect(templateModelFieldWarning(`  ${model}  `, "codex")).toBe("");
+    },
+  );
+
+  it.each(["sonnet", "claude-custom-v1", "us.anthropic.claude-x:v1", "gpt-6-luna-custom", "gpt-6-solar", "GPT-6-SOL"])(
+    "accepts custom Claude ID %s but rejects it on Codex", (model) => {
+      expect(templateModelFieldWarning(model, "claude")).toBe("");
+      expect(templateModelFieldWarning(model, "codex")).toMatch(/Codex.*template/);
+    },
+  );
+
+  it("accepts Default on either harness", () => {
+    for (const harness of ["claude", "codex"] as const) {
+      expect(templateModelFieldWarning("", harness)).toBe("");
+      expect(templateModelFieldWarning("   ", harness)).toBe("");
+    }
+  });
+
+  it("uses syntax warnings before checking the family", () => {
+    for (const model of ["two words", "gpt-6-sol\u200b", "x".repeat(MAX_MODEL_LEN + 1)]) {
+      expect(modelFieldWarning(model)).not.toBe("");
+      for (const harness of ["claude", "codex"] as const) {
+        expect(templateModelFieldWarning(model, harness)).toBe(modelFieldWarning(model));
+      }
+    }
+  });
+
+  it("applies the API byte limit only to template pins", () => {
+    expect(templateModelFieldWarning("é".repeat(50), "claude")).toBe("");
+    expect(templateModelFieldWarning("é".repeat(51), "claude")).toMatch(/100 bytes/);
+    expect(modelFieldWarning("é".repeat(51))).toBe("");
+    expect(templateModelFieldWarning("x".repeat(100), "claude")).toBe("");
+  });
+});
+
+describe("templateModelsLabel", () => {
+  it("shows both stored pins in harness order", () => {
+    expect(templateModelsLabel({ name: "coder", model: "sonnet", codex_model: "gpt-6-sol" }))
+      .toBe("Claude: sonnet · Codex: gpt-6-sol");
+  });
+
+  it.each(["lead", "ORCHESTRATOR"])("shows the built-in defaults for %s", (name) => {
+    expect(templateModelsLabel({ name, model: null, codex_model: "" }))
+      .toBe("Claude: Default · SDK/account default (built-in) · Codex: Default · built-in (gpt-6.1-sol)");
+  });
+
+  it("shows inherited and explicitly pinned lanes independently", () => {
+    expect(templateModelsLabel({ name: "coder", model: "", codex_model: null }))
+      .toBe("Claude: Default · lead's model · Codex: Default · lead's model");
+    expect(templateModelsLabel({ name: "coder", model: "haiku", codex_model: null }))
+      .toBe("Claude: haiku · Codex: Default · lead's model");
+    expect(templateModelsLabel({ name: "coder", model: null, codex_model: "gpt-6-luna" }))
+      .toBe("Claude: Default · lead's model · Codex: gpt-6-luna");
+  });
+});
 
 describe("template scope helpers", () => {
   it("labels each scope for the UI", () => {

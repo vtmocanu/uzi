@@ -6,6 +6,7 @@
 
 import type { AgentTemplate, AgentTemplateScope, Harness } from "./api";
 import { DEFAULT_CODEX_MODEL } from "../components/ModelSelect";
+import { CODEX_ROLE_MODELS } from "./codexModels";
 
 // TEMPLATE_SCOPE_LABEL / templateScopeBadgeTone mirror the skills scope helpers
 // (lib/skills.ts) so agent templates and skills badge scope identically (PRD #18
@@ -173,6 +174,27 @@ export function modelFieldWarning(model: string): string {
   return "";
 }
 
+// templateModelFieldWarning mirrors ValidateTemplatePin for editor feedback;
+// the server remains authoritative. Generic modelFieldWarning callers keep their
+// existing syntax rules; template pins also enforce the API's UTF-8 byte cap.
+export function templateModelFieldWarning(model: string, harness: Harness): string {
+  const syntaxWarning = modelFieldWarning(model);
+  if (syntaxWarning) return syntaxWarning;
+  const m = model.trim();
+  if (new TextEncoder().encode(m).length > MAX_MODEL_LEN) {
+    return `Model is too long (max ${MAX_MODEL_LEN} bytes); use a shorter alias or model ID.`;
+  }
+  if (m === "") return "";
+  const codexRole = CODEX_ROLE_MODELS.includes(m);
+  if (harness === "claude" && codexRole) {
+    return "Claude template model must not be a Codex role model ID.";
+  }
+  if (harness === "codex" && !codexRole) {
+    return "Codex template model must be a supported Codex role model ID.";
+  }
+  return "";
+}
+
 // frontmatterFieldWarning mirrors the server rejection of newline/control
 // characters (and commas in tool names) in the single-line frontmatter fields,
 // plus the tightened model rules (modelFieldWarning). The server is
@@ -210,6 +232,12 @@ export function templateModelDefaultLabel(name: string, harness: Harness = "clau
   return harness === "codex"
     ? `Default · built-in (${DEFAULT_CODEX_MODEL})`
     : "Default · SDK/account default (built-in)";
+}
+
+// templateModelsLabel is shared by the list and detail surfaces so both pins
+// and their harness-specific Default labels have one presentation.
+export function templateModelsLabel(t: Pick<AgentTemplate, "name" | "model" | "codex_model">): string {
+  return `Claude: ${t.model || templateModelDefaultLabel(t.name, "claude")} · Codex: ${t.codex_model || templateModelDefaultLabel(t.name, "codex")}`;
 }
 
 // looseSecretWarning returns a warning string if the text looks like it might

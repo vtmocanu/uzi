@@ -58,6 +58,7 @@ export function ModelSelect({
   customAriaLabel = "Custom model ID",
   harness,
   allowCustom,
+  models,
   ariaDescribedBy,
   onCustomModeChange,
 }: {
@@ -80,14 +81,21 @@ export function ModelSelect({
   // and dedicated plan cross-check pins pass `allowCustom` to open that escape hatch
   // (PRD #1551 D5 and #2151).
   allowCustom?: boolean;
+  // Closed curated-list override (PRD #3248). Custom entry requires explicit
+  // allowCustom when provided; omission preserves the harness defaults.
+  models?: readonly string[];
   // Id(s) of a hint that describes the select (e.g. an "In effect" line), PRD #3245.
   ariaDescribedBy?: string;
   // Reports whether the picker is in "Other (custom model ID)" mode, so a caller can
   // refuse to save an empty custom ID instead of silently sending "" (= Default).
   onCustomModeChange?: (custom: boolean) => void;
 }) {
-  const aliases = aliasesForHarness(harness);
-  const customAllowed = allowCustom ?? harness !== "codex";
+  const aliases = models ?? aliasesForHarness(harness);
+  const customAllowed = allowCustom ?? (models === undefined && harness !== "codex");
+  // Compare list contents rather than array identity: callers may build a fresh
+  // array each render without changing the vocabulary.
+  const aliasesKey = JSON.stringify(aliases);
+  const lastAliasesKey = useRef(aliasesKey);
   // A provider-specific placeholder example, so the custom input hints at the right
   // vocabulary (a Codex id looks like gpt-…, a Claude id like claude-…).
   const customPlaceholder = harness === "codex" ? "gpt-…" : "claude-…";
@@ -103,34 +111,24 @@ export function ModelSelect({
   // e.g. "opus" is curated under Claude but custom under Codex) is never missed.
   const lastHarness = useRef(harness);
 
-  // ONE effect keyed on BOTH [value, harness], not two separate effects each keyed
-  // on one (PRD #1429 M4a). A harness switch and an externally-driven value change can
-  // land in the same render (an async settings load seeds both at once). Two
-  // independent single-dependency effects would each see only
-  // ITS OWN dependency change and recompute mode/custom from a value/harness pair
-  // that was current when THAT effect last fired — reading the other, unchanged
-  // half from a potentially stale closure. A single effect that always recomputes
-  // from the CURRENT render's value+harness+aliases together, and fires whenever
-  // either changes, cannot go stale relative to itself no matter how renders batch.
-  // (RunDefaults.test.tsx's flake under `vitest --coverage` that surfaced this design
-  // turned out to be a separate, test-side timing gap — asserting on the derived
-  // <select> value before its OWN effect had flushed, fixed there with a `waitFor`
-  // — not proof this exact race fired; this merge is still the more defensible
-  // design and worth keeping on its own correctness grounds.)
+  // Re-derive from the current value, harness and vocabulary together so async
+  // loads and list changes cannot leave a selection from the previous vocabulary.
   useEffect(() => {
     const harnessChanged = harness !== lastHarness.current;
     lastHarness.current = harness;
-    // Skip re-derivation only when NEITHER the harness changed NOR the value is a
-    // genuinely external change (differs from what this instance last emitted).
-    if (!harnessChanged && value === lastEmitted.current) return;
+    const aliasesChanged = aliasesKey !== lastAliasesKey.current;
+    lastAliasesKey.current = aliasesKey;
+    // An equal new array must preserve an intentionally empty custom input.
+    if (!harnessChanged && !aliasesChanged && value === lastEmitted.current) return;
     lastEmitted.current = value;
     const m = deriveMode(value, aliases);
     setMode(m);
     setCustom(m === "custom" ? value : "");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [value, harness]);
+  }, [value, harness, aliasesKey]);
 
   const isCustom = mode === "custom";
+  const customVisible = isCustom && (models === undefined || customAllowed);
   useEffect(() => {
     onCustomModeChange?.(isCustom);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -170,16 +168,13 @@ export function ModelSelect({
             {m}
           </option>
         ))}
-        {/* Rendered whenever Claude (always allows custom) OR the picker is ALREADY in
-            custom mode (Codex: no NEW custom entry is offered from the menu, but an
-            existing custom value that predates a harness switch must still have a
-            matching <option value="custom"> — otherwise a controlled <select> whose
-            value names an absent option silently falls back to the first option
-            (selectedIndex 0), which would show "Default" while still emitting the
-            stale custom string underneath it. */}
-        {(customAllowed || mode === "custom") && <option value="custom">Other (custom model ID)…</option>}
+        {/* Preserve existing values without opening custom entry on a closed list.
+            A disabled current value prevents the select from displaying Default
+            while the parent still holds an unsupported pin. */}
+        {isCustom && !customVisible && <option value="custom" disabled>{value}</option>}
+        {(customAllowed || customVisible) && <option value="custom">Other (custom model ID)…</option>}
       </Select>
-      {mode === "custom" && (
+      {customVisible && (
         <Input
           value={custom}
           onChange={(e) => onCustom(e.target.value)}
