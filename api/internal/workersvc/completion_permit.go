@@ -349,8 +349,7 @@ func scopeCapEligibility(run store.Run) (eligible, verifiable bool) {
 		int64(len(done)) >= int64(run.ScopeCeiling.Int32) && len(done) < len(ms), true
 }
 
-// headlessCompletedUnion validates delivery of every frozen milestone that is not owner-deferred
-// (Scope.Out), independently of scope eligibility.
+// headlessCompletedUnion validates full structural delivery independently of scope eligibility.
 func headlessCompletedUnion(run store.Run, req StateRequest) ([]byte, bool) {
 	if c, err := parseCompletionContract(run.CompletionContract); err == nil && c.Profile == "semantic" {
 		return semanticHeadlessCompletedUnion(run, req)
@@ -381,44 +380,20 @@ func headlessCompletedUnion(run store.Run, req StateRequest) ([]byte, bool) {
 	}
 	declared, _ := progressParams(run.Kind, run.MilestonesFrozen, req.MilestonesCompleted, nil)
 	merged := unionMilestoneIDs(run.MilestonesCompleted, declared)
-	if !deliversNonDeferred(run, members, merged) {
-		return nil, false
-	}
-	return merged, true
-}
-
-// deliversNonDeferred reports whether the merged completed union covers every member not
-// owner-deferred by the contract's Scope.Out (the partition itself is validated by the
-// caller). It refuses a scoped contract whose every member is deferred. Without a Scope
-// every member must be done.
-func deliversNonDeferred(run store.Run, members map[string]bool, merged []byte) bool {
 	ids, err := DecodeMilestoneIDs(merged)
-	if err != nil {
-		return false
+	if err != nil || len(ids) != len(frozen) {
+		return nil, false
 	}
 	done := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		done[id] = true
 	}
-	deferred := map[string]bool{}
-	scoped := false
-	if c, err := parseCompletionContract(run.CompletionContract); err == nil && c.Scope != nil {
-		scoped = true
-		for _, d := range c.Scope.Out {
-			deferred[d.MilestoneID] = true
-		}
-	}
-	inScope := 0
-	for id := range members {
-		if deferred[id] {
-			continue
-		}
-		inScope++
+	for id := range frozen {
 		if !done[id] {
-			return false
+			return nil, false
 		}
 	}
-	return inScope > 0 || !scoped || len(members) == 0
+	return merged, true
 }
 
 // frozenMilestoneIDs returns the ids of a run's frozen milestone list (nil/empty when none),
@@ -842,8 +817,8 @@ func unionMilestoneIDs(existing, declared []byte) []byte {
 
 // completeRunWithPermitLease runs an INTERLOCKED run's terminal completion through a single pgx
 // transaction (PRD #1226 M2, D4). Publication completion consumes the permit issued for
-// the exact (run, contract_revision, head) identity. A headless report-only issue
-// delivery of every non-deferred milestone instead validates its frozen contract and positive claim generation under the
+// the exact (run, contract_revision, head) identity. A headless full report-only issue
+// delivery instead validates its frozen contract and positive claim generation under the
 // same run lock. Both paths write `completed` atomically with terminal lease handling.
 //
 // It returns (rows, idempotent, lease, err):
