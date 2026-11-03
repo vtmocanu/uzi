@@ -38,8 +38,9 @@
 # fenced on `runs.last_seq` at the api, so a run that finishes while the api is down replays its
 # messages first and its outcome only once the trace is contiguous — no false `failed`, nothing
 # redone. The M6 cases use the SAME UZI_STUB_OUTBOX sentinel with a SHORTER stream
-# (UZI_STUB_OUTBOX_TICKS, e2e-only, exported below) so the run reaches its terminal INSIDE a
-# bounded outage that stays under the raised heartbeat-stale window:
+# (UZI_STUB_OUTBOX_TICKS, e2e-only, exported below) so the run reaches its intent or terminal
+# boundary during a bounded outage under the raised heartbeat-stale window. Feature-on case 3
+# waits for enrollment reconciliation; legacy feature-off cases 4-5 journal a terminal offline:
 #   3. INTENT-RECONCILIATION: useful work finishes with a durable local publication intent;
 #      unknown enrollment waits without publication or guessed terminal/park decisions.
 #      Restore on its same-generation waiting event, then complete with a gapless fence,

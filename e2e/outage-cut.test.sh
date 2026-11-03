@@ -662,16 +662,34 @@ for observation in unchanged pushed gitfailed mrfailed statusfailed; do
   [ "$rc" = "$expected" ] || { echo "FAIL: offline $observation rc=$rc"; exit 1; }
 done
 echo 'PASS: CASE 3 judges remote push and all offline observation failures only after API restore'
-# Real Compose rendering, no daemon or hosted stack. All inputs are dummy and isolated.
-for setting in default false true; do
-  args=()
-  [ "$setting" = default ] || args+=("E2E_RUN_PUBLICATION_RESUME_ENABLED=$setting")
-  env -i PATH="$PATH" HOME="$SCRATCH" JWT_SECRET=fixture-jwt-secret-000000000000000000 \
-    UZI_SECRET_KEY=fixture-key POSTGRES_PASSWORD=fixture-password UZI_WORKER_TOKEN=fixture-token \
-    E2E_RUN_DIR="$SCRATCH" E2E_WEB_PORT=28080 E2E_FAKE_PORT=28443 "${args[@]}" \
-    docker compose --env-file /dev/null -p cdr-outbox-render \
-    -f "$ROOT/docker-compose.yml" -f "$ROOT/e2e/docker-compose.e2e.yml" config --format json > "$SCRATCH/render.json"
-  expected="$setting"; [ "$setting" != default ] || expected=''
-  jq -e --arg expected "$expected" '.services.api.environment.RUN_PUBLICATION_RESUME_ENABLED == $expected' "$SCRATCH/render.json" >/dev/null
- done
-echo 'PASS: real Compose renders default empty, explicit off and on without touching base defaults'
+# Compose renders have a separate target; its availability policy is tested here
+# with missing/broken clients, so this helper suite still needs no Docker client.
+render_test="$ROOT/e2e/compose-config.test.sh"
+mkdir -p "$SCRATCH/no-docker" "$SCRATCH/broken-compose"
+cat > "$SCRATCH/broken-compose/docker" <<'SH'
+#!/bin/sh
+exit 127
+SH
+chmod +x "$SCRATCH/broken-compose/docker"
+for unavailable in no-docker broken-compose; do
+  env PATH="$SCRATCH/$unavailable" CI= GITHUB_ACTIONS= /bin/bash "$render_test" > "$SCRATCH/render-local.log" 2>&1
+  grep -F 'SKIP: E2E overlay renders need Docker Compose' "$SCRATCH/render-local.log" >/dev/null
+  ! grep -F 'PASS:' "$SCRATCH/render-local.log" >/dev/null
+  for context in CI GITHUB_ACTIONS; do
+    if env PATH="$SCRATCH/$unavailable" CI= GITHUB_ACTIONS= "$context=true" \
+        /bin/bash "$render_test" > "$SCRATCH/render-ci.log" 2>&1; then
+      echo "FAIL: $context accepted unavailable Compose"; exit 1
+    fi
+    grep -F 'FAIL: Docker Compose is required' "$SCRATCH/render-ci.log" >/dev/null
+  done
+done
+cat > "$SCRATCH/broken-compose/docker" <<'SH'
+#!/bin/sh
+[ "$*" != 'compose version' ] || exit 0
+exit 23
+SH
+rc=0
+env PATH="$SCRATCH/broken-compose:$PATH" CI=true GITHUB_ACTIONS= /bin/bash "$render_test" > "$SCRATCH/render-failed.log" 2>&1 || rc=$?
+[ "$rc" = 23 ] || { echo "FAIL: Compose render failure changed exit $rc"; exit 1; }
+! grep -F 'PASS:' "$SCRATCH/render-failed.log" >/dev/null
+echo 'PASS: separate Compose renders visibly skip locally, are mandatory in CI, and preserve render failures'
