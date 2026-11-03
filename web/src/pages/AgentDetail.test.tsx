@@ -54,6 +54,7 @@ const SHIPPED: BuiltinDefinition = {
   name: "coder",
   description: "Implements features.",
   model: null,
+  codex_model: null,
   tools: ["Bash", "Read"],
   prompt_body: "You are the coder.\nStay in the repo you were given.\nNever touch main.\n",
 };
@@ -64,6 +65,7 @@ function row(over: Partial<AgentTemplate> = {}): AgentTemplate {
     name: "coder",
     description: SHIPPED.description,
     model: SHIPPED.model,
+    codex_model: SHIPPED.codex_model,
     tools: SHIPPED.tools,
     prompt_body: SHIPPED.prompt_body,
     is_builtin: true,
@@ -78,7 +80,7 @@ function row(over: Partial<AgentTemplate> = {}): AgentTemplate {
 }
 
 // The drifted row: one edited line in the prompt body plus a changed description,
-// so the diff has something to show in two of the four columns.
+// so the diff has something to show in two of the five columns.
 const DRIFTED = row({
   differs_from_builtin: true,
   description: "Implements features, carefully.",

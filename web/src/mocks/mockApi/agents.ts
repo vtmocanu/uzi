@@ -54,7 +54,7 @@ function shippedBuiltin(name: string): BuiltinDefinition | undefined {
   return mockShippedBuiltins.find((d) => d.name === name);
 }
 
-// sameContent mirrors the server's agenttmpl.SameContent over the four mutable
+// sameContent mirrors the server's agenttmpl.SameContent over the five mutable
 // columns. It is a SECOND IMPLEMENTATION of that comparison and that is
 // deliberate: the mock has no server to ask, and a hard-coded flag would make
 // every drift the fixture claims unfalsifiable. The rules it must keep in step
@@ -70,6 +70,7 @@ export function sameContent(row: AgentTemplate, def: BuiltinDefinition): boolean
   return (
     row.description === def.description &&
     (row.model ?? "") === (def.model ?? "") &&
+    (row.codex_model ?? "") === (def.codex_model ?? "") &&
     row.prompt_body === def.prompt_body &&
     a.length === b.length &&
     a.every((t, i) => t === b[i])
@@ -189,6 +190,7 @@ export const agentsApi = {
       name: input.name,
       description: input.description,
       model: input.model,
+      codex_model: input.codex_model?.trim() || null,
       tools: input.tools,
       prompt_body: input.prompt_body,
       is_builtin: false,
@@ -238,6 +240,8 @@ export const agentsApi = {
     if (!t) throw new ApiError(404, "template not found");
     t.description = input.description;
     t.model = input.model;
+    // Old clients omit the pin; merge it before comparing with the shipped content.
+    if (input.codex_model !== undefined) t.codex_model = input.codex_model?.trim() || null;
     t.tools = input.tools;
     t.prompt_body = input.prompt_body;
     t.updated_by = requireSession().email;
@@ -264,6 +268,7 @@ export const agentsApi = {
     Object.assign(t, {
       description: shipped.description,
       model: shipped.model,
+      codex_model: shipped.codex_model,
       tools: shipped.tools,
       prompt_body: shipped.prompt_body,
       // Reset restores the embedded default in every sense, including provenance:

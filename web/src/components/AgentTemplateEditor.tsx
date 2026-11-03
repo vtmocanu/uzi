@@ -31,6 +31,7 @@ export interface EditorInitial {
   name: string;
   description: string;
   model: string | null;
+  codex_model?: string | null;
   tools: string[] | null;
   prompt_body: string;
 }
@@ -132,10 +133,11 @@ export const AgentTemplateEditor = forwardRef<
     () => ({
       description,
       model: model.trim() || null,
+      codex_model: initial.codex_model ?? null,
       tools: tools.length ? tools : null,
       prompt_body: promptBody,
     }),
-    [description, model, tools, promptBody],
+    [description, model, initial.codex_model, tools, promptBody],
   );
 
   useImperativeHandle(ref, () => ({ currentContent: () => currentContent }), [currentContent]);
@@ -405,6 +407,14 @@ function BuiltinDiff({
           <span className="text-ok">{shipped.model ?? templateModelDefaultLabel(shipped.name)}</span>
           <span className="text-faint"> → </span>
           <span className="text-danger">{current.model ?? templateModelDefaultLabel(shipped.name)}</span>
+        </DiffField>
+      )}
+
+      {changed.includes("codex model") && (
+        <DiffField label="Codex model">
+          <span className="text-ok">{shipped.codex_model || "Default"}</span>
+          <span className="text-faint"> → </span>
+          <span className="text-danger">{current.codex_model || "Default"}</span>
         </DiffField>
       )}
 

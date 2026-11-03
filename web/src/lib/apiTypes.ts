@@ -388,13 +388,14 @@ export interface SlackLink {
 }
 
 // AgentTemplate is a stored agent definition. tools is null when the template
-// inherits all tools; model is null when it inherits the model. scope/user_id
+// inherits all tools; model/codex_model are the nullable Claude/Codex pins. scope/user_id
 // carry the M6 ownership model; is_builtin is retained (== scope 'builtin').
 export interface AgentTemplate {
   id: string;
   name: string;
   description: string;
   model: string | null;
+  codex_model: string | null;
   tools: string[] | null;
   prompt_body: string;
   is_builtin: boolean;
@@ -402,7 +403,7 @@ export interface AgentTemplate {
   user_id: string | null;
   updated_by: string | null;
   // differs_from_builtin is computed server-side per request (issue #201 M4a):
-  // whether this row's four mutable columns still match the definition the
+  // whether this row's five mutable columns still match the definition the
   // running release ships under the same name. It is false for anything that has
   // no shipped counterpart — a global row, a user row that merely shares a
   // builtin's name, and a builtin this release no longer ships.
@@ -438,6 +439,7 @@ export interface BuiltinDefinition {
   name: string;
   description: string;
   model: string | null;
+  codex_model: string | null;
   tools: string[] | null;
   prompt_body: string;
 }
@@ -450,6 +452,8 @@ export interface AgentTemplateInput {
   name?: string;
   description: string;
   model: string | null;
+  // Omitted on PUT preserves the stored pin; null or blank clears it.
+  codex_model?: string | null;
   tools: string[] | null;
   prompt_body: string;
   scope?: "global" | "user";

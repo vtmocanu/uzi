@@ -47,6 +47,7 @@ function tmpl(over: Partial<AgentTemplate> & Pick<AgentTemplate, "id" | "name" |
   return {
     description: `desc ${over.name}`,
     model: null,
+    codex_model: null,
     tools: null,
     prompt_body: "body",
     is_builtin: over.scope === "builtin",

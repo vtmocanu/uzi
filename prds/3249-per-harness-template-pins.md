@@ -2,7 +2,7 @@
 
 **Issue:** #3249  
 **Sibling issues (children of #1703):** A #3255, B #3247, B2 #3251, C #3245, D #3248, E #3257, F #3254, G #3249, H #3244, I #3263, J1 #3256, J2 #3260, K #3261, L #3262, M #3259, N #3258, O #3264, P #3250, Q-spike #3246, Q-claude #3252, Q-codex #3253.  
-**Status:** Refreshed r4 2026-11-03 (child G of #1703), against main `f74b2c531f0315dc56fc6637071435c17ba32f13`. Child C (#3245, PR #3288) and H's implementation (#3244, PR #3695) have landed; H's remaining live acceptance is not a code dependency. A (#3255, PR #3777) has also landed: preserve its honest Default wording through the existing shared helper. No implementation has started for G.  
+**Status:** Refreshed r4 2026-11-03 (child G of #1703), against main `f74b2c531f0315dc56fc6637071435c17ba32f13`. Child C (#3245, PR #3288) and H's implementation (#3244, PR #3695) have landed; H's remaining live acceptance is not a code dependency. A (#3255, PR #3777) has also landed: preserve its honest Default wording through the existing shared helper. Implementation has started with M1a; later milestones remain pending.
 **Priority:** Normal.  
 **Parent:** #1703.  
 **Blocked by:** none for implementation. The prerequisite code from #3244 and #3245 is on main: claim `default_model_source`, worker `resolveLeadRequest` in `agent/src/lead-config-report.ts`, `fixtures/codex-models/models.json` (`curated` and `role`), `agenttmpl.CodexRoleModels`, and `agenttmpl.ValidateClaudeLaneModel`. Reuse C's agent `isCodexRoleModel(model)` in `agent/src/codex/render.ts` and web `CODEX_ROLE_MODELS` / `CODEX_CURATED_MODELS` in `web/src/lib/codexModels.ts`. G adds no vocabulary export of its own.  
