@@ -11,9 +11,11 @@ import { client, fakeGitlab, fx, git, homeDir, installHarness, runnerWith } from
 installHarness();
 const BRANCH = "agent/issue-3747", KEY = "issue-3747", RUN = "run-3747";
 const ATTEMPT = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
+const GIT_TEST_ENV = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
 function command(dir: string, ...args: string[]): string {
   return execFileSync("git", ["-C", dir, ...args], {
-    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+    env: GIT_TEST_ENV,
     encoding: "utf8", stdio: "pipe",
   }).trim();
 }
@@ -98,7 +100,7 @@ async function inspectPack(pack: AsyncIterable<Uint8Array>, candidate: string, e
     command(receiver, "clone", "--bare", "--no-hardlinks", fx.originPath, ".");
     execFileSync("git", ["-C", receiver, "index-pack", "--stdin", "--fix-thin"], {
       input: Buffer.concat(chunks), stdio: "pipe",
-      env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+      env: GIT_TEST_ENV,
     });
     const commits = new Set<string>();
     for (const index of fs.readdirSync(path.join(receiver, "objects", "pack")).filter(name => name.endsWith(".idx"))) {
@@ -204,18 +206,47 @@ for (const mode of ["checkpoint", "push"] as const) {
   for (const failure of ["floor", "default", "unknown scan", "untrusted binding", "late pending", "late denial"] as const) {
     test(`${mode}: ${failure} refuses before publication and leaves refs unchanged`, async t => {
       const f = await safeFixture(), runner = freshRunner(), flight = f.freshFlight();
+      let scans = 0, lateMutation = false;
       t.mock.method(git, "secretScanCheckpointRange", async () => {
-        if (failure === "late pending") flight.remediationRestrictions!.pending = { requiredOIDs: [f.clean], requireDenial: false };
-        if (failure === "late denial") flight.remediationRestrictions!.denialRevision = 1;
+        scans++;
+        if (failure === "late pending") {
+          assert.ok(flight.remediationRestrictions);
+          flight.remediationRestrictions.pending = { requiredOIDs: [f.clean], requireDenial: false };
+          lateMutation = true;
+        }
+        if (failure === "late denial") {
+          assert.ok(flight.remediationRestrictions);
+          flight.remediationRestrictions.denialRevision = 1;
+          lateMutation = true;
+        }
         return { trusted: failure !== "unknown scan", findings: [] };
       });
       if (failure === "floor") flight.checkpointFloor = f.displaced;
       if (failure === "default") command(f.bare, "update-ref", "refs/remotes/origin/main", f.flagged);
       if (failure === "untrusted binding") flight.runnerClone = { ...f.clone, attemptId: ATTEMPT + "wrong" };
+      const binding = failure === "untrusted binding" ? t.mock.method(git, "readRuntimeRemediationRecovery") : undefined;
       const before = refs(f.bare), remote = refs(fx.originPath), tips = uploads([f.flagged, f.displaced]);
       const started = packStarts(t);
-      if (mode === "checkpoint") assert.equal((await runner.publishCheckpointOutcome(flight, f.bare, BRANCH)).published, false);
-      else await assert.rejects(push(runner, flight, f));
+      if (mode === "checkpoint") assert.deepEqual(await runner.publishCheckpointOutcome(flight, f.bare, BRANCH),
+        { published: false, reason: failure === "default" ? "preservation_refused" :
+          failure === "untrusted binding" ? "error" : "secret_remediation_pending" });
+      else if (failure === "untrusted binding")
+        await assert.rejects(push(runner, flight, f), /remediation source binding unavailable/);
+      else await assert.rejects(push(runner, flight, f), error => error instanceof Error &&
+        error.constructor.name === "SecretRemediationPendingError");
+      if (binding) {
+        const errors = await Promise.all(binding.mock.calls.map(async call => {
+          try { await call.result; return undefined; } catch (error) { return error; }
+        }));
+        assert.ok(errors.some(error => error instanceof Error && error.message === "remediation source binding unavailable"),
+          "the selected source binding is the refusal");
+      }
+      if (failure === "floor" || failure === "unknown scan")
+        assert.ok(scans > 0, "the floor/scan refusal reaches the candidate scanner");
+      if (failure === "late pending" || failure === "late denial") {
+        assert.ok(scans > 0, "late restriction changes happen during the scan");
+        assert.equal(lateMutation, true, "the intended late mutation completed without a setup error");
+      }
       assert.deepEqual(tips, []);
       assert.equal(started(), 0, "refused candidate starts no pack producer");
       assert.equal(refs(f.bare), before);

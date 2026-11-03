@@ -73,10 +73,12 @@ function start(opts: {
     if (++guards === 3 && opts.abort === "guard") abort.abort();
     return guards === 3 && opts.refusal === "remediation";
   };
+  const publicationGuards: unknown[] = [];
   git.checkpointPack = async (_bare, _branch, _overlay, _pinned, _step, _source, guard) => {
     const replay = async () => {
       if (opts.packThrows) throw new Error("local pack failure");
       if (producers && opts.refusal === "scratch") throw new ScratchPublicationError("refused");
+      publicationGuards.push(guard);
       await guard?.(TIP, publicationContext);
       producers++;
       events.push("open");
@@ -121,7 +123,10 @@ function start(opts: {
     batcher: { emit: (value: unknown) => feed.push(value) } };
   let settled = false;
   const done = seam.publishCheckpointOutcome(flight, "bare", "branch", undefined, abort.signal)
-    .finally(() => { settled = true; globalThis.fetch = realFetch; });
+    .finally(() => {
+      settled = true; globalThis.fetch = realFetch;
+      assert.ok(publicationGuards.every(guard => typeof guard === "function"), "runner must supply every retry publication guard");
+    });
   return { done, flight, feed, streams, bytes, events, retryLogs, resolveExit,
     get settled() { return settled; }, get ackCancelled() { return ack?.cancelled() ?? false; },
     get requests() { return requests; }, get producers() { return producers; }, get cancels() { return cancels; } };

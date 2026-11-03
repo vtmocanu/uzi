@@ -11,7 +11,8 @@ function fixture() {
   fs.mkdirSync(scratch, { recursive: true });
   const root = fs.mkdtempSync(path.join(scratch, "admission-"));
   const bare = path.join(root, "repo.git"), remote = path.join(root, "remote.git");
-  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
+  const env = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+    GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
     GIT_AUTHOR_NAME: "Test", GIT_AUTHOR_EMAIL: "test@example.org",
     GIT_COMMITTER_NAME: "Test", GIT_COMMITTER_EMAIL: "test@example.org" };
   const git = (dir: string, args: string[], input?: string | Buffer) =>

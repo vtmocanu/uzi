@@ -38,7 +38,9 @@ function harness(redactor: ((s: string) => string) | undefined = redact) {
   seam.requireTrackingOwned = async () => TIP;
   let error: unknown;
   let packing = false, success = false, requests = 0, cancels = 0, exits = 0;
+  const guards: unknown[] = [];
   git.checkpointPack = async (_bare, _branch, _overlay, _pinned, _step, _source, guard) => {
+    guards.push(guard);
     await guard?.(TIP, publicationContext);
     if (packing) throw error;
     return { tipOid: TIP, pack: Readable.from(["pack"]),
@@ -57,15 +59,17 @@ function harness(redactor: ((s: string) => string) | undefined = redact) {
     reportedPublishOutcomes: new Set<string>(), redactText: redactor,
     runLog: { ...nullLogger(), warn: (msg: string, fields: Record<string, unknown> = {}) => logs.push({ msg, fields }) },
     batcher: { emit: (event: unknown) => feed.push(event as typeof feed[number]) } };
+  const publish = (signal?: AbortSignal) => seam.publishCheckpointOutcome(flight, "bare", "branch", undefined, signal)
+    .finally(() => assert.ok(guards.every(guard => typeof guard === "function"), "runner must supply every publication guard"));
   return { logs, feed, flight, client,
     get requests() { return requests; }, get cancels() { return cancels; }, get exits() { return exits; },
     fail: (e: unknown, pack = false, signal?: AbortSignal) => {
       error = e; packing = pack; success = false;
-      return seam.publishCheckpointOutcome(flight, "bare", "branch", undefined, signal);
+      return publish(signal);
     },
     confirm: () => {
       packing = false; success = true;
-      return seam.publishCheckpointOutcome(flight, "bare", "branch");
+      return publish();
     },
   };
 }

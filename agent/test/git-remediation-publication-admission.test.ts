@@ -17,7 +17,8 @@ import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
 const BRANCH = "agent/issue-3747", RUN = "run-3747", KEY = "issue-3747";
 const ATTEMPT = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
 const OTHER = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "fedcba9876543210");
-const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+const ENV = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+  GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
 const IDENT = ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"];
 const ACTIVE = "uzi-recovery." + BRANCH + ".clone";
 let fx: Fixture, cache: GitCache, bare: string, clone: string, base: string, opts: FetchAgentBranchOptions;

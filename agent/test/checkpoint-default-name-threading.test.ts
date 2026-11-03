@@ -46,9 +46,10 @@ for (const name of ["開発/server", "開発/custom\u00a0", " 開発/custom ", u
       const { git, runner, flight } = fixture(name);
       const signal = new AbortController().signal;
       const range: CheckpointRange = { tipSha: TIP, excludeSha: FLOOR, defaultBlobSha: DEFAULT };
-      let calls = 0;
+      let calls = 0, suppliedGuard: unknown;
       git.checkpointPack = async (...args) => {
         calls++;
+        suppliedGuard = args[6];
         assert.equal(args[2]?.defaultBranch, overlay ? "untrusted-overlay-fallback" : undefined);
         assert.equal(args[3], pinned ? range : undefined, "preserve the scanned range object including defaultBlobSha");
         assert.equal(args[5], TIP);
@@ -64,6 +65,7 @@ for (const name of ["開発/server", "開発/custom\u00a0", " 開発/custom ", u
       assert.deepEqual(await runner["publishCheckpointOutcome"](flight, "bare", "task",
         overlay ? { defaultBranch: "untrusted-overlay-fallback" } : undefined, signal, pinned ? range : undefined),
       { published: true });
+      assert.equal(typeof suppliedGuard, "function", "runner must supply the publication guard");
       assert.equal(calls, 1);
     });
   }

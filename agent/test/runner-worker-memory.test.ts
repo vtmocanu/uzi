@@ -21,12 +21,17 @@ import { codexRig } from "./runner-codex-sinks-fixture.js";
 
 installHarness();
 
-function mockUnenrolledSource(t: TestContext, claim: ClaimResponse): void {
+function mockUnenrolledSource(t: TestContext, claim: ClaimResponse): () => void {
+  const expected = [git.barePathFor(claim.repo.clone_url), "agent/issue-2396", claim.run_id];
+  const calls: string[][] = [];
   t.mock.method(git, "readRemediationRestrictionFacts", async (bare: string, branch: string, runId: string) => {
-    assert.deepEqual([bare, branch, runId],
-      [git.barePathFor(claim.repo.clone_url), "agent/issue-2396", claim.run_id]);
+    calls.push([bare, branch, runId]);
     return { enrolled: false, blocked: false, roots: [], flaggedOIDs: [], fingerprint: "memory-unenrolled-fixture" };
   });
+  return () => {
+    assert.ok(calls.length > 0, "the unenrolled source fixture must observe a restriction read");
+    for (const call of calls) assert.deepEqual(call, expected, "restriction reads use the exact source identity");
+  };
 }
 
 function realCapture(prepare: () => void | Promise<void> = () => {}): NonNullable<Executor["withCredentialFreeCapture"]> {
@@ -865,7 +870,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
   const f = await setup(1);
   // This source is unenrolled. Keep unrelated remediation I/O out of the 200 ms
   // late-ACK budget; the drained capture scope, native ACK and stale-owner fences remain real.
-  mockUnenrolledSource(t, f.claim);
+  const verifyUnenrolledReads = mockUnenrolledSource(t, f.claim);
   const successorCredential = f.claim.secrets.codex;
   const monitoring = f.memory.run();
   const release = releaseGate();
@@ -1054,6 +1059,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
     await f.memory.stop(); await monitoring;
     await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
   }
+  verifyUnenrolledReads();
 });
 }
 
@@ -1685,7 +1691,8 @@ for (const mode of ["now", "milestone"] as const) for (const originalFailure of 
 for (const scenario of ["wall", "disk", "withdrawn", "cancel", "shutdown", "claim-fence", "credential-switch", "registration", "unsettled", "expired", "already-parked"] as const) {
   test(`memory pause handoff retains custody without an owner-pause disposition (${scenario})`, async t => {
     const f = await setup(1);
-    if (scenario === "unsettled" || scenario === "expired") mockUnenrolledSource(t, f.claim);
+    const verifyUnenrolledReads = scenario === "unsettled" || scenario === "expired"
+      ? mockUnenrolledSource(t, f.claim) : undefined;
     const monitoring = f.memory.run();
     const release = releaseGate();
     let context: RunContext | undefined, captured: MemoryFlightProof | undefined;
@@ -1766,6 +1773,7 @@ for (const scenario of ["wall", "disk", "withdrawn", "cancel", "shutdown", "clai
       await captured?.workerMemory?.operation;
       await f.memory.stop(); await monitoring;
     }
+    verifyUnenrolledReads?.();
   });
 }
 
