@@ -331,7 +331,7 @@ body[data-scenario="calm"] .station.gate-st .st-count { color: rgb(var(--fg)); }
 /* per-user table (Factory scope): today's PerUserUsageTable, trimmed */
 .by-user { margin-top: 20px; padding-top: 18px; border-top: 1px solid rgb(var(--edge)); }
 .tbl-wrap { overflow-x: auto; margin-top: 8px; }
-.tbl { width: 100%; min-width: 620px; border-collapse: collapse; font-size: 13px; }
+.tbl { width: 100%; min-width: 780px; border-collapse: collapse; font-size: 13px; }
 .tbl th { text-align: right; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: rgb(var(--faint)); padding: 6px 10px; border-bottom: 1px solid rgb(var(--edge)); white-space: nowrap; }
 .tbl th:first-child, .tbl td:first-child { text-align: left; padding-left: 0; }
 .tbl th:last-child, .tbl td:last-child { padding-right: 0; }
@@ -813,7 +813,7 @@ body[data-scenario="calm"] .station.gate-st .st-count { color: rgb(var(--fg)); }
           <p class="u-h">By user<span class="faint" id="by-user-note">last 7 days</span></p>
           <div class="tbl-wrap">
             <table class="tbl">
-              <thead><tr><th scope="col">User</th><th scope="col" title="Runs with recorded usage in the period (today’s run_count)">Runs</th><th scope="col">Failed</th><th scope="col">PRs</th><th scope="col">Cost</th><th scope="col">Claude / Codex <span class="tag-proposed" title="Share of each user's runs by harness: needs a per-user aggregate by harness the API does not serve today">Proposed</span></th></tr></thead>
+              <thead><tr><th scope="col">User</th><th scope="col" title="Runs with recorded usage in the period (today’s run_count)">Runs</th><th scope="col">Failed</th><th scope="col" title="Failed of finished runs in the period">Fail rate</th><th scope="col" title="Last failure time is served for all time only, so this column is the same in both windows">Since last failure <span class="faint" style="text-transform:none;letter-spacing:0;font-weight:400">all time</span></th><th scope="col">PRs</th><th scope="col">Cost</th><th scope="col">Claude / Codex <span class="tag-proposed" title="Share of each user's runs by harness: needs a per-user aggregate by harness the API does not serve today">Proposed</span></th></tr></thead>
               <tbody id="by-user-rows"></tbody>
               <tfoot id="by-user-foot"></tfoot>
             </table>
@@ -996,11 +996,11 @@ body[data-scenario="calm"] .station.gate-st .st-count { color: rgb(var(--fg)); }
       d7: { prs: 236, perPr: '$22.09', cost: 5214, rate: '4.5%', failed: 14, finished: 312, delta: '−5.1 pp vs all-time 9.6%',
         tokens: '15.6B', tin: '604.2M', tcache: '14.92B', tout: '75.8M',
         out: { completed: 251, cancelled: 41, rejected: 6, failed: 14 }, causes: [['agent failure', 9], ['data volume full', 2], ['worker residue blocked', 2]], more: 1,
-        runCount: 327, users: [['Robin Diaz', 101, 96, 5, 61, 1842, 70, true], ['Sam Chen', 92, 88, 4, 69, 1410, 40], ['Priya Nair', 74, 71, 3, 55, 1106, 85], ['Alex Morgan', 41, 39, 1, 33, 598, 0], ['Jordan Lee', 19, 18, 1, 18, 258, 50]] },
+        runCount: 327, users: [['Robin Diaz', 101, 96, 5, 61, 1842, 70, '3h', true], ['Sam Chen', 92, 88, 4, 69, 1410, 40, '1d 4h'], ['Priya Nair', 74, 71, 3, 55, 1106, 85, '2d'], ['Alex Morgan', 41, 39, 1, 33, 598, 0, '6d'], ['Jordan Lee', 19, 18, 1, 18, 258, 50, '11d']] },
       all: { prs: 2840, perPr: '$23.28', cost: 66120, rate: '9.6%', failed: 466, finished: 4850, delta: 'across every user since July',
         tokens: '251.3B', tin: '9.4B', tcache: '236.6B', tout: '5.3B',
         out: { completed: 3702, cancelled: 593, rejected: 89, failed: 466 }, causes: [['agent failure', 201], ['worker lost', 88], ['data volume full', 71]], more: 106,
-        runCount: 5016, users: [['Robin Diaz', 1254, 1210, 138, 702, 19540, 62, true], ['Sam Chen', 1431, 1384, 121, 853, 18210, 48], ['Priya Nair', 1139, 1102, 104, 671, 14890, 80], ['Alex Morgan', 770, 744, 66, 412, 9020, 10], ['Jordan Lee', 422, 410, 37, 202, 4460, 55]] }
+        runCount: 5016, users: [['Robin Diaz', 1254, 1210, 138, 702, 19540, 62, '3h', true], ['Sam Chen', 1431, 1384, 121, 853, 18210, 48, '1d 4h'], ['Priya Nair', 1139, 1102, 104, 671, 14890, 80, '2d'], ['Alex Morgan', 770, 744, 66, 412, 9020, 10, '6d'], ['Jordan Lee', 422, 410, 37, 202, 4460, 55, '11d']] }
     }
   };
   var sel = { scope: 'you', win: 'd7' };
@@ -1032,12 +1032,13 @@ body[data-scenario="calm"] .station.gate-st .st-count { color: rgb(var(--fg)); }
     if (d.users) {
       document.getElementById('by-user-note').textContent = sel.win === 'd7' ? 'last 7 days, by cost' : 'all time, by cost';
       document.getElementById('by-user-rows').innerHTML = d.users.map(function (u) {
-        return '<tr><td>' + u[0] + (u[7] ? ' <span class="you">(you)</span>' : '') + '</td><td>' + fmtN(u[1]) + '</td>' +
-          '<td>' + fmtN(u[3]) + '<span class="sub">' + pct(u[3], u[2]) + ' of ' + fmtN(u[2]) + ' finished</span></td><td>' + fmtN(u[4]) + '</td>' +
+        return '<tr><td>' + u[0] + (u[8] ? ' <span class="you">(you)</span>' : '') + '</td><td>' + fmtN(u[1]) + '</td>' +
+          '<td>' + fmtN(u[3]) + '</td><td title="' + fmtN(u[3]) + ' of ' + fmtN(u[2]) + ' finished runs">' + pct(u[3], u[2]) + '<span class="sub">of ' + fmtN(u[2]) + ' finished</span></td>' +
+          '<td>' + u[7] + '</td><td>' + fmtN(u[4]) + '</td>' +
           '<td class="mono">' + fmt$(u[5]) + '</td>' +
           '<td><span class="prov"><span class="pb" aria-hidden="true"><i class="cl" style="width:' + u[6] + '%"></i><i class="cx" style="width:' + (100 - u[6]) + '%"></i></span><span>' + u[6] + ' / ' + (100 - u[6]) + '</span></span></td></tr>';
       }).join('');
-      document.getElementById('by-user-foot').innerHTML = '<tr><td>Factory</td><td>' + fmtN(d.runCount) + '</td><td>' + fmtN(d.failed) + '<span class="sub">' + d.rate + ' of ' + fmtN(d.finished) + ' finished</span></td><td>' + fmtN(d.prs) + '</td><td class="mono">' + fmt$(d.cost) + '</td><td></td></tr>';
+      document.getElementById('by-user-foot').innerHTML = '<tr><td>Factory</td><td>' + fmtN(d.runCount) + '</td><td>' + fmtN(d.failed) + '</td><td>' + d.rate + '<span class="sub">of ' + fmtN(d.finished) + ' finished</span></td><td>3h</td><td>' + fmtN(d.prs) + '</td><td class="mono">' + fmt$(d.cost) + '</td><td></td></tr>';
     }
     document.querySelectorAll('[data-scope]').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.scope === sel.scope)); });
     document.querySelectorAll('[data-win]').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.win === sel.win)); });
