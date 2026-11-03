@@ -205,4 +205,3 @@ Resolved since the issue was filed: ci_fix and mr_rework placement (D21), Shadow
 - Trigger.dev live runs, stable rows that update in place: https://trigger.dev/changelog/live-runs-page
 - Vercel Observability, a time-scoped summary leading into ranked detail: https://vercel.com/docs/observability
 - Railway metrics, telemetry inside the selected service: https://docs.railway.com/observability/metrics
-

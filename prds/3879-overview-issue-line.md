@@ -36,11 +36,12 @@ Capacity and held work (#3880), usage (#3881), the command menu (#3875). No new 
 - **`issueLineStage(run)`** (pure, `web/src/lib`): one of `queued`, `planning`, `review`, `building`, `asking`, `parked`, `other`, `pr` or `none`. Rules, in order:
   - terminal (`completed`, `failed`, `cancelled`): `pr` when #3878's `openPrs` includes it (the viewer's own completed issue run with an open PR); otherwise `none`. This comes first, so finished jobs, tasks and self-improve runs never inflate Other work.
   - `kind` other than `issue` → `other` (only the listed kinds reach here, brief Run populations; this includes `ci_fix` and `mr_rework`, brief D21).
+  - an account cooldown (`isAccountCooldownWaiting`, `web/src/lib/runBadge.ts:533`) → `parked`. It comes before the rules below because a cooldown run can be `claimed` or `awaiting_approval`.
   - `queued`, `claimed` → `queued`.
   - effective planning (`is_planning`), or `awaiting_approval` with `is_revising` → `planning`.
   - `awaiting_approval` → `review`.
   - `awaiting_input`, `awaiting_followup` → `asking`.
-  - `limit_wait`, `pool_wait`, `recovery_wait`, `paused`, or an account cooldown → `parked`, with #3878's `parkDisposition` deciding automatic or owner. No second rule lives here.
+  - `limit_wait`, `pool_wait`, `recovery_wait`, `paused` → `parked`. For every parked run, #3878's `parkDisposition` decides automatic or owner; no second rule lives here.
   - `running`, including an empty `progress.phase` or `progress.state` `stalled` → `building`.
   - Any non-terminal status this list does not name → `building`, so a run never drops off the line.
 - **`IssueLine`** component and the bays; the selected stage is page state on the preview page, shared with the Runs widget.
