@@ -77,6 +77,34 @@ for (const c of fixtures) test(`plan checker instructions decide ${c.name}: ${c.
   assert.match(trusted(revision), /Cross-check dispositions/);
 });
 
+// Shared property clauses mirror TestLeadPlanCrashClaimGuidance; the final
+// cases pin the checker's defect-versus-coverage handling. Each clause and tool
+// family gets its own independently run case.
+const crashClaimClauses = [
+  ["claim_scope", "For every atomic, durable, or crash-recoverable claim, state the exact property and failure model."],
+  ["atomic_readers", "Atomic means readers never observe partial state."],
+  ["process_crash", "State whether durability is across a process crash or across storage or power loss."],
+  ["crash_recovery", "Specify the state recovered after a crash."],
+  ["mechanism_and_ordering", "Cite the matching file:line mechanism and required ordering for each claimed property and failure model."],
+  ["rename_not_durability", "An atomic rename provides atomic replacement, not storage durability."],
+  ["file_and_directory_sync", "For filesystem durability, sync the file and the directory containing each new or renamed entry in the required order."],
+  ["database_commit", "For database durability, identify the transaction commit guarantees and configuration relied on."],
+  ["recovery_rediscovery", "For crash recovery, explain recovery ordering and how recovery rediscovers the required state at each crash point."],
+  ["read_back_insufficient", "Read-back alone does not prove durability."],
+  ["process_test_not_storage_proof", "A process-crash test is not proof of storage-crash survival."],
+  ["narrow_unsupported_claim", "If the mechanism or evidence does not support the claimed failure model, narrow the claim."],
+  ["missing_mechanism_revise", "A missing mechanism for a claimed property is a defect: error, REVISE."],
+  ["inaccessible_evidence_coverage", "Cited evidence that is inaccessible follows the existing coverage rules for unreadable or external sources; inaccessibility alone is not a defect."],
+] as const;
+for (const tools of ["Read and Search", "Read, Grep and Glob"]) {
+  for (const [name, phrase] of crashClaimClauses) {
+    test(`plan checker crash-claim guidance ${tools}: ${name}`, () => {
+      assert.ok(trusted(crossCheckBrief(tools)).includes(phrase),
+        `trusted plan instruction missing: ${phrase}`);
+    });
+  }
+}
+
 const revisionRules: (keyof typeof rules)[] = [
   "effects", "rejectBypass", "scratch", "goChildren", "reliedEffects", "noNameProof", "sensitiveEffects",
   "coverageDisposition", "latestItems", "olderOptional", "declines", "unverified", "noPrecedence", "completePlan", "addressed", "heading",
