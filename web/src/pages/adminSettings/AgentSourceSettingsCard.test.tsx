@@ -60,6 +60,23 @@ describe("AgentSourceSettingsCard staged review model label (#3255)", () => {
     expect(row.queryByText("Model", { exact: true })).toBeNull();
   });
 
+  it("uses derived review pins even when the sanitized raw model looks pinned", async () => {
+    const snapshot = structuredClone(view);
+    snapshot.staged!.roles = [{
+      name: "coder", ok: true, model: "gpt-6-sol", claude_model: "",
+      codex_model: "", prompt_body: "coder body",
+    }];
+    snapshot.staged!.diff = [{ name: "coder", action: "add" }];
+    mockApi.getAgentSource.mockResolvedValue({ agent_source: snapshot });
+    render(<AgentSourceSettingsCard />);
+    const button = await screen.findByRole("button", { name: "Show body" });
+    fireEvent.click(button);
+    const row = within(button.closest("li")!);
+    expect(row.getByText("Claude model").nextElementSibling?.textContent).toBe("Default · lead's model");
+    expect(row.getByText("Codex model").nextElementSibling?.textContent).toBe("Default · lead's model");
+    expect(row.queryByText("gpt-6-sol")).toBeNull();
+  });
+
   it("shows the honest Default label for a role with no model, never 'inherit'", async () => {
     mockApi.getAgentSource.mockResolvedValue({ agent_source: view });
     render(<AgentSourceSettingsCard />);
