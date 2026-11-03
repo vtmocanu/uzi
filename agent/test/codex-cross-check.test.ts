@@ -915,7 +915,8 @@ for (const stage of ["plan", "code"] as const) {
  }
  for (const status of ["failed", "incomplete", null, undefined]) {
   it(`3745 ${stage} refuses terminal status ${String(status)}`, async () => {
-   await refuse([...final(), assistantTerminal({ turn: { id: "turn", status } })], /^cross-check terminal turn has no complete verdict$/);
+   await refuse([...final(), assistantTerminal({ turn: { id: "turn", status } })], status === "failed"
+    ? /^cross-check model error: terminal turn unsuccessful$/ : /^cross-check terminal turn has no complete verdict$/);
   });
  }
  it(`3745 ${stage} absent terminal refuses on existing provider-failure seam`, async () => {

@@ -37,6 +37,7 @@ import {
   type IsolationSurface,
 } from "./isolated-executor.js";
 import { buildSdkEnv } from "./sdk-env.js";
+import { crossCheckExecutionError } from "./cross-check-diagnostic.js";
 import { defaultQueryFn, isErrorResult, isResult, mapSdkMessage, promptStream } from "./sdk-messages.js";
 import { killProcessGroup, killProcessGroupOnly, processGroupPresent, spawnDetached } from "./sdk-spawn.js";
 import { CrossCheckConfinementError, priorCrossCheckFailure } from "./cross-check-confinement.js";
@@ -390,6 +391,16 @@ export interface ClaudeCrossCheckOptions {
   maxTurns?: number;
 }
 
+// Pinned SDKAssistantMessageError literals; arbitrary assistant errors remain unclassified.
+const ASSISTANT_ERRORS = new Set<string>([
+  "authentication_failed", "oauth_org_not_allowed", "account_on_hold", "verification_required",
+  "billing_error", "rate_limit", "overloaded", "invalid_request", "model_not_found",
+  "server_error", "unknown", "max_output_tokens", "cloud_credential_error",
+]);
+const ERROR_RESULTS = new Set<string>([
+  "error_during_execution", "error_max_turns", "error_max_budget_usd", "error_max_structured_output_retries",
+]);
+
 export class ClaudeCrossCheck {
   private readonly queryFn: SdkQueryFn;
   private readonly spawn: (opts: SpawnOptions) => { pid?: number };
@@ -489,6 +500,7 @@ export class ClaudeCrossCheck {
             // PINNED model rejected before any model content is the user's configuration; any
             // other error, or the same classification on a worker-default model, stays model_error.
             if (error === "model_not_found" && modelPinned && !sawContent) throw new CrossCheckCheckerUnavailableError();
+            if (typeof error === "string" && ASSISTANT_ERRORS.has(error)) throw crossCheckExecutionError("provider_error");
             throw new Error("cross-check model error");
           }
           if (hasContent(frame)) sawContent = true;
@@ -497,11 +509,15 @@ export class ClaudeCrossCheck {
       }
       // A result without a passing init frame means the tool set was never verified.
       if (!gate.passed) throw new CrossCheckConfinementError("no_init");
-      if (!resultFrame) throw new Error("cross-check ended without a result");
+      if (!resultFrame) throw crossCheckExecutionError("transport_ended");
       for (const em of mapSdkMessage(resultFrame)) {
         if (em.payload["event"] === "result") { resultPosted = true; await postUsage({ ...em.payload, is_error: isErrorResult(resultFrame) }); }
       }
-      if (isErrorResult(resultFrame)) throw new Error("cross-check model error");
+      if (isErrorResult(resultFrame)) {
+        if (typeof resultFrame["is_error"] === "boolean" && typeof resultFrame["subtype"] === "string"
+          && ERROR_RESULTS.has(resultFrame["subtype"])) throw crossCheckExecutionError("checker_error_result");
+        throw new Error("cross-check model error");
+      }
       const text = resultFrame["result"];
       if (typeof text !== "string" || Buffer.byteLength(text) > (code ? CODE_COVERAGE_LIMITS.verdictBytes : MAX_VERDICT_BYTES)) {
         throw new CrossCheckMalformedError("cross-check requires one bounded complete verdict", "result_cap");

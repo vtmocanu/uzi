@@ -1,3 +1,4 @@
+import { crossCheckDiagnostic } from "./cross-check-diagnostic.js";
 import { acquireCodexOperationScope } from "./codex-operation-scope.js";
 import fs from "node:fs/promises";
 import { collectCodeInventory, normalizeCodeCoverage, type CodeInventory } from "./code-cross-check-coverage.js";
@@ -353,6 +354,12 @@ export class CrossCheckRunner {
       else if (/confinement|cleanup unconfirmed/.test(errMessage(err))) reason = "confinement_failed";
       if (timer) clearTimeout(timer);
       timer = undefined;
+      if (reason === "model_error") {
+        const diagnostic = crossCheckDiagnostic(batcherClosed ? undefined : err,
+          code ? "code" : "plan", familyName === "claude" ? "claude" : "codex");
+        if (batcher && !batcherClosed) batcher.emit({ kind: "status", agent: "cross-checker", payload: diagnostic });
+        this.log.warn("cross-check execution incomplete", { run_id: runId, ...diagnostic });
+      }
       await finishTelemetry();
       if (reason === "malformed") {
         this.log.warn("cross-check verdict malformed", { run_id: runId, stage: code ? "code" : "plan",

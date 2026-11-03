@@ -1,3 +1,4 @@
+import { crossCheckExecutionError } from "../cross-check-diagnostic.js";
 import { acquireCodexOperationScope } from "../codex-operation-scope.js";
 // Dedicated one-turn checker lifecycle. It never enters CodexExecutor's lead loop.
 import { CODE_COVERAGE_LIMITS } from "../code-cross-check-coverage.js";
@@ -487,7 +488,7 @@ export class CodexCrossCheck {
      if (hasOutput(note.usage)) modelActivity = true;
      accountant.record(threadId, note.usage);
     } else if (note.method === "item/tool/call" && note.kind === "activity" && note.requestId !== undefined) {
-     if (++calls > 200) throw new Error("cross-check cumulative tool budget exceeded");
+     if (++calls > 200) throw crossCheckExecutionError("tool_budget_exceeded");
      if (!bound || typeof params?.callId !== "string") throw new Error("cross-check foreign tool callback");
      const activityKind = activity ? beginActivity(activity, params.callId, params.tool, params.arguments) : undefined;
      const result = await broker.handleToolCall({ threadId, turnId, callId: params.callId },
@@ -506,6 +507,7 @@ export class CodexCrossCheck {
       if (transport.protocolFailure) throw transport.protocolFailure;
       throw new CrossCheckCheckerUnavailableError();
      }
+     if (authenticatedNotes.has(note) && bound && note.kind === "codex_error") throw crossCheckExecutionError("provider_error");
      throw new Error("cross-check model error");
     } else if (note.method === "item/started") {
      const item = object(params?.item);
@@ -542,7 +544,12 @@ export class CodexCrossCheck {
       if (transport.protocolFailure) throw transport.protocolFailure;
       throw new CrossCheckCheckerUnavailableError();
      }
-     if (note.status !== "completed" || verdictText === undefined || activeItemId !== undefined) throw new Error("cross-check terminal turn has no complete verdict");
+     if (authenticatedNotes.has(note) && note.status === "failed") throw crossCheckExecutionError("checker_error_result");
+     if (note.status !== "completed") throw new Error("cross-check terminal turn has no complete verdict");
+     if (verdictText === undefined || activeItemId !== undefined) {
+      if (authenticatedNotes.has(note)) throw crossCheckExecutionError("no_complete_verdict");
+      throw new Error("cross-check terminal turn has no complete verdict");
+     }
      if (claim.cross_check?.stage === "code") {
       validateCodeFindings(verdictText);
      } else validateVerdict(verdictText);
@@ -556,7 +563,7 @@ export class CodexCrossCheck {
      throw new Error("cross-check malformed lifecycle frame");
     }
    }
-   if (!succeeded) throw new Error("cross-check ended without terminal turn");
+   if (!succeeded) throw crossCheckExecutionError("transport_ended");
   } catch (error) {
    failure = { error };
   } finally {

@@ -31,6 +31,7 @@ type Emit = (frame: unknown) => void;
 // only its dictionary root. This proves functional wiring, not kernel isolation.
 function rig(options: {
  notes?: (emit: Emit) => void;
+ beforeResponse?: (frame: Frame, emit: Emit) => void;
  onToolReply?: (frame: Frame, emit: Emit) => void;
  clean?: boolean;
  failDispose?: boolean;
@@ -78,6 +79,7 @@ function rig(options: {
  };
  const provider = roots("provider", (frame, emit) => {
   requests.push(frame);
+  options.beforeResponse?.(frame, emit);
   if (frame.method === "initialize") emit({ id: frame.id, result: { userAgent: "fake", codexHome: "/owned", platformFamily: "unix", platformOs: "linux" } });
   else if (frame.method === "account/login/start") emit({ id: frame.id, result: { type: options.subscription ? "chatgptAuthTokens" : "apiKey" } });
   else if (frame.method === "thread/start") emit({ id: frame.id, result: { thread: { id: "thread" } } });
@@ -90,6 +92,7 @@ function rig(options: {
   const op = frame as unknown as { id: number; op: string; path: string };
   ops.push(op.op);
   if (op.op === "stat" && options.holdStat) return;
+  if (op.op === "list") { emit({ id: op.id, ok: true, entries: [] }); return; }
   emit({ id: op.id, ok: op.op === "stat" || (op.op === "read" && op.path === "anchor.ts"),
    data: Buffer.from("export const anchor = true;").toString("base64"), size: Buffer.byteLength("export const anchor = true;") });
  });
@@ -111,7 +114,8 @@ function rig(options: {
  };
  const log = { addSecret: (s: string) => secrets.add(s), removeSecret: (s: string) => secrets.delete(s) } as unknown as Logger;
  const checker = new CodexCrossCheck(client, log, deps);
- return { deps, log, requests, ops, specs, disposed, secrets, usage, refreshes, terminal, fail: () => failProvider(new Error("root failed")),
+ return { deps, log, requests, ops, specs, disposed, secrets, usage, refreshes, terminal,
+  end: () => (provider.transport.stdout as PassThrough).end(), fail: () => failProvider(new Error("root failed")),
   run: (signal = new AbortController().signal) => checker.run(claim(options.subscription), "/checkout", "/owned", signal,
    async (payload) => { usage.push(payload); }) };
 }
@@ -203,6 +207,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
    for await (const chunk of req) raw += chunk;
    const body = raw ? JSON.parse(raw) : {};
    if (req.method === "POST") posts.push({ url: req.url!, body });
+   if (req.url?.endsWith("/messages")) assert.equal(req.headers.authorization, "Bearer join-fixture");
    res.setHeader("Content-Type", "application/json");
    if (req.url?.endsWith("/codex/release")) response = JSON.stringify({ auth_mode: "api_key", access_token: "released-token" });
    else if (req.url?.endsWith("/inputs")) response = JSON.stringify({ inputs: [] });
@@ -229,7 +234,7 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
      assert.equal(journal?.body.claim_generation, 7);
      // marker, init, result and summary all ride the batcher; the fence is its closed tail. The modes
      // whose model reaches the real Read broker also record one check_activity row (PRD #3166).
-     assert.equal(journal?.messagesThroughSeq, mode === "invalid-effort" ? 2 : rejected ? 4 : 5);
+     assert.equal(journal?.messagesThroughSeq, mode === "invalid-effort" ? 2 : rejected ? (expectedReason === "model_error" ? 5 : 4) : 5);
     }
    }
   } catch (error) {
@@ -279,10 +284,15 @@ it("outer checker uses real Read broker, actual HTTP verdict delivery and journa
   const delivered = posts.filter((p) => p.url.endsWith("/messages")).flatMap((p) => p.body.messages as any[]);
   // A mode whose model reaches the real Read broker also records that read as one check_activity row.
   const events = mode === "invalid-effort" ? ["check_activity_start", "check_activity_summary"]
-   : rejected ? ["check_activity_start", "init", "result", "check_activity_summary"]
+   : rejected ? ["check_activity_start", "init", "result", ...(expectedReason === "model_error" ? ["cross_check_diagnostic"] : []), "check_activity_summary"]
    : ["check_activity_start", "init", "check_activity", "result", "check_activity_summary"];
   assert.deepEqual(delivered.map((m) => m.seq), events.map((_e, i) => i + 1));
   assert.deepEqual(delivered.map((m) => m.payload.event), events);
+  assert.deepEqual(delivered.filter(m => m.payload.event === "cross_check_diagnostic").map(m => m.payload),
+   expectedReason === "model_error" ? [{
+    event: "cross_check_diagnostic", stage: "plan", harness: "codex", reason_class: "model_error",
+    code: "provider_error", text: "Cross-check incomplete: provider reported an error.",
+   }] : []);
   if (mode !== "invalid-effort") assert.equal(delivered.find((m) => m.payload.event === "result")!.payload.is_error, !approves);
   if (!rejected) {
    const read = delivered.find((m) => m.payload.event === "check_activity")!.payload;
@@ -668,7 +678,7 @@ it("checker delivery: a failed check still persists the summary and the result f
   await usage({ event: "result", is_error: true });
   throw new Error("boom");
  } });
- assert.deepEqual(r.events, ["check_activity_start", "init", "check_activity", "result", "check_activity_summary"]);
+ assert.deepEqual(r.events, ["check_activity_start", "init", "check_activity", "result", "cross_check_diagnostic", "check_activity_summary"]);
  assert.deepEqual(r.calls.filter((x) => x !== "messages"), ["verdict:failed:model_error", "terminal:failed"]);
  assert.ok(r.calls.lastIndexOf("messages") < r.calls.indexOf("verdict:failed:model_error"));
  assertClosedThenFenced(r, "failed");
@@ -968,3 +978,392 @@ for (const mode of r1Modes) it("R1 disabled cross-check-runner cached empty then
 
   } finally { await r1fs.rm(root, { recursive: true, force: true }); }
 });
+
+// M1 diagnostics: assert actual posted payloads as well as the closed fence.
+import { crossCheckDiagnostic, crossCheckExecutionError } from "../src/cross-check-diagnostic.js";
+import { ClaudeCrossCheck } from "../src/claude-cross-check.js";
+import type { SdkQueryFn } from "../src/sdk-executor.js";
+
+const diagnosticPairs = {
+ provider_error: "Cross-check incomplete: provider reported an error.",
+ checker_error_result: "Cross-check incomplete: checker returned an unsuccessful result.",
+ transport_ended: "Cross-check incomplete: checker event stream ended without a terminal result.",
+ no_complete_verdict: "Cross-check incomplete: terminal result contained no complete verdict.",
+ tool_budget_exceeded: "Cross-check incomplete: Codex checker exceeded its tool-call budget.",
+ unknown_execution_error: "Cross-check incomplete: execution error; specific cause not recorded.",
+} as const;
+for (const stage of ["plan", "code"] as const) {
+ for (const error of ["authentication_failed", "oauth_org_not_allowed", "account_on_hold", "verification_required",
+  "billing_error", "rate_limit", "overloaded", "invalid_request", "model_not_found",
+  "server_error", "unknown", "max_output_tokens", "cloud_credential_error"]) {
+  it("M1 supported Claude assistant error " + stage + " " + error, async () => {
+   const r = await diagnosticScenario(stage, "claude", { model: (_client, log) => new ClaudeCrossCheck(log, {
+    secretPaths: ["/run/secrets/"], queryFn: (() => (async function* () {
+     yield sdkInit; yield { type: "assistant", parent_tool_use_id: null, error };
+    })()) as unknown as SdkQueryFn,
+   }) });
+   assertDiagnostic(r, stage, "claude", "provider_error");
+  });
+ }
+ for (const subtype of ["error_during_execution", "error_max_turns", "error_max_budget_usd", "error_max_structured_output_retries"]) {
+  for (const is_error of [true, false, undefined, "true"]) {
+   it("M1 recognized Claude result requires boolean error " + stage + " " + subtype + " " + is_error, async () => {
+    const r = await diagnosticScenario(stage, "claude", { model: (_client, log) => new ClaudeCrossCheck(log, {
+     secretPaths: ["/run/secrets/"], queryFn: (() => (async function* () {
+      yield sdkInit; yield { type: "result", subtype, is_error };
+     })()) as unknown as SdkQueryFn,
+    }) });
+    assertDiagnostic(r, stage, "claude", typeof is_error === "boolean" ? "checker_error_result" : "unknown_execution_error");
+   });
+  }
+ }
+}
+for (const stage of ["plan", "code"] as const) for (const is_error of [false, undefined, "future"]) {
+ it("M1 existing Claude success outcome " + stage + " " + is_error, async () => {
+  const result = stage === "code" ? '{"findings":[]}' : verdict;
+  const r = await diagnosticScenario(stage, "claude", { model: (_client, log) => new ClaudeCrossCheck(log, {
+   secretPaths: ["/run/secrets/"], queryFn: (() => (async function* () {
+    yield sdkInit; yield { type: "result", subtype: "success", is_error, result };
+   })()) as unknown as SdkQueryFn,
+  }) });
+  assert.deepEqual(r.diagnostics, []);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.decisions[0][stage === "code" ? "outcome" : "verdict"], stage === "code" ? "completed" : "approve");
+ });
+}
+for (const mode of ["transient", "fatal", "no-progress"] as const) {
+ it("M1 original open batcher diagnostic delivery " + mode, async () => {
+  const r = await diagnosticScenario("plan", "codex", {
+   error: crossCheckExecutionError("provider_error"),
+   post: (_messages, index) => {
+    if (mode === "fatal") throw new RequestError("POST", "/messages", 401, "{}");
+    if (mode === "no-progress" || index === 0) throw new RequestError("POST", "/messages", 503, "{}");
+   },
+  });
+  if (mode === "transient") assertDiagnostic(r, "plan", "codex", "provider_error");
+  else {
+   assert.deepEqual(r.messages, []);
+   assert.deepEqual(r.warnings, [{ level: "warn", msg: "cross-check execution incomplete", run_id: "check",
+    ...exactDiagnostic("plan", "codex", "provider_error") }]);
+   assert.equal(r.terminals[0].fence, 14, "failed delivery does not reopen the original batcher");
+  }
+ });
+}
+for (const stage of ["plan", "code"] as const) {
+ it("M1 stale checker emits no diagnostic " + stage, async () => {
+  const r = await diagnosticScenario(stage, "codex", {
+   error: new RequestError("POST", "/messages", 409, '{"disposition":"stale_claim"}'),
+  });
+  assert.deepEqual(r.diagnostics, []); assert.deepEqual(r.warnings, []);
+  assert.deepEqual(r.decisions, []); assert.deepEqual(r.terminals, []);
+ });
+ it("M1 arbitrary Claude transport exception remains unknown " + stage, async () => {
+  const r = await diagnosticScenario(stage, "claude", { model: (_client, log) => new ClaudeCrossCheck(log, {
+   secretPaths: ["/run/secrets/"], queryFn: (() => (async function* () {
+    yield sdkInit; throw Object.assign(new Error("private excerpt"), { code: "provider_error" });
+   })()) as unknown as SdkQueryFn,
+  }) });
+  assertDiagnostic(r, stage, "claude", "unknown_execution_error");
+  assert.equal(JSON.stringify(r).includes("private excerpt"), false);
+ });
+}
+
+type DiagnosticCode = keyof typeof diagnosticPairs;
+type Checker = Pick<CodexCrossCheck, "run">;
+
+async function diagnosticRequestBody(chunks: AsyncIterable<Buffer | string>): Promise<string> {
+ let raw = "", bytes = 0;
+ for await (const chunk of chunks) {
+  bytes += Buffer.byteLength(chunk);
+  assert.ok(bytes <= 64 * 1024, "diagnostic fixture request exceeds 64 KiB");
+  raw += chunk;
+ }
+ return raw;
+}
+
+it("diagnostic fixture request body enforces the byte limit", async () => {
+ const boundary = Buffer.alloc(64 * 1024, "a");
+ const chunks = async function* (...values: (Buffer | string)[]) { yield* values; };
+ assert.equal(await diagnosticRequestBody(chunks(boundary)), boundary.toString());
+ await assert.rejects(diagnosticRequestBody(chunks(boundary, "x")), /diagnostic fixture request exceeds 64 KiB/);
+ await assert.rejects(diagnosticRequestBody(chunks("é".repeat(32 * 1024 + 1))), /diagnostic fixture request exceeds 64 KiB/);
+});
+
+async function diagnosticScenario(stage: "plan" | "code", harness: "claude" | "codex", options: {
+ model?: (client: WorkerClient, log: Logger) => Checker;
+ failureAt?: "usage" | "probe" | "verdict" | "terminal" | "terminal-selected" | "ambiguous";
+ error?: unknown;
+ post?: (messages: any[], index: number) => void;
+ authenticatedMessages?: boolean;
+} = {}) {
+ const root = await fs.mkdtemp(path.resolve(import.meta.dirname, "../../.uzi/scratch/diagnostic-"));
+ const recorded = recordingLogger();
+ const outbox = new Outbox({ root: path.join(root, "outbox"), log: recorded.logger,
+  runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86400000 });
+ await outbox.init();
+ const journalTerminal = outbox.journalTerminal.bind(outbox);
+ outbox.journalTerminal = async (...args) => options.failureAt === "terminal" && args[4].status === "completed"
+  ? { journaled: false, reason: "reserve_exhausted" } : journalTerminal(...args);
+ const retireTerminal = outbox.retireTerminal.bind(outbox);
+ let retirementFailed = false;
+ outbox.retireTerminal = async (...args) => {
+  if (options.failureAt === "terminal-selected" && !retirementFailed) {
+   retirementFailed = true;
+   throw crossCheckExecutionError("provider_error");
+  }
+  return retireTerminal(...args);
+ };
+ const c = { ...claim(), claim_generation: 7, last_seq: 10 };
+ if (harness === "claude") c.secrets = { forge_pat: "", anthropic_oauth_token: "fixture-claude" };
+ if (stage === "code") c.cross_check = { ...c.cross_check!, stage: "code", round: 1,
+  head_commit: "b".repeat(40), candidate_digest: "c".repeat(64), code_context: { task: "Review" }, guidance_snapshot: "" };
+ const messages: any[] = [], decisions: any[] = [], terminals: any[] = [];
+ const handlerErrors: unknown[] = [];
+ let messageClient: WorkerClient | undefined;
+ const server = options.authenticatedMessages ? http.createServer(async (req, res) => {
+  try {
+   const body = JSON.parse(await diagnosticRequestBody(req));
+   assert.equal(req.method, "POST");
+   assert.equal(req.url, "/api/worker/runs/check/messages");
+   assert.equal(req.headers.authorization, "Bearer join-fixture");
+   assert.equal(body.claim_generation, 7);
+   messages.push(...body.messages);
+  } catch (error) {
+   handlerErrors.push(error);
+  } finally {
+   res.writeHead(204).end();
+  }
+ }) : undefined;
+ let running = 0, posts = 0;
+ const fail = () => { throw options.error ?? crossCheckExecutionError("provider_error"); };
+ const client = {
+  reportState: async (_id: string, body: any) => {
+   if (body.status === "running") {
+    if (++running === 2 && options.failureAt === "probe") fail();
+    return { applied: true };
+   }
+   terminals.push({ ...body, fence: (await outbox.readTerminalJournal(c.run_id, 7))?.messagesThroughSeq ?? body.messages_through_seq });
+   if (body.status === "completed" && options.failureAt === "terminal") fail();
+   return { applied: true };
+  },
+  getInputs: async () => ({ inputs: [] }),
+  postMessages: async (id: string, batch: any[], generation?: number, signal?: AbortSignal) => {
+   options.post?.(batch, posts++);
+   if (options.failureAt === "usage") throw new RequestError("POST", "/messages", 503, "{}");
+   if (messageClient) await messageClient.postMessages(id, batch, generation, signal);
+   else messages.push(...batch);
+  },
+  hasFeature: (name: string) => name === "terminal_fence",
+  releaseCodex: async () => ({ auth_mode: "api_key", access_token: "released-token" }),
+  getCodeSnapshotCleanup: async () => ({ row_present: false }),
+  reportCrossCheckVerdict: async (_id: string, _g: number, body: any) => {
+   decisions.push(body);
+   if (body.verdict !== "failed" && ["verdict", "ambiguous"].includes(options.failureAt ?? "")) fail();
+   if (body.verdict === "failed" && options.failureAt === "ambiguous")
+    throw new RequestError("POST", "/cross-check-verdict", 409, '{"reason":"cross_check_refused"}');
+  },
+  reportCodeCrossCheckVerdict: async (_id: string, _g: number, body: any) => {
+   decisions.push(body);
+   if (body.outcome !== "failed" && ["verdict", "ambiguous"].includes(options.failureAt ?? "")) fail();
+   if (body.outcome === "failed" && options.failureAt === "ambiguous")
+    throw new RequestError("POST", "/code-cross-check-verdict", 409, '{"reason":"cross_check_refused"}');
+  },
+ } as unknown as WorkerClient;
+ const git = { ensureClone: async () => "/bare", existingBarePathFor: async () => "/bare",
+  runnerCloneAtCommit: async () => "/checkout", removeRunnerClone: async () => {},
+  readBare: async () => ({ text: "", bytes: Buffer.alloc(0), truncated: false }),
+ } as unknown as GitCache;
+ const instances = new Set<MessageBatcher>();
+ const closes: MessageBatcher[] = [];
+ const emit = MessageBatcher.prototype.emit;
+ const close = MessageBatcher.prototype.close;
+ const emitSpy = mock.method(MessageBatcher.prototype, "emit", function(this: MessageBatcher, ...args: Parameters<typeof emit>) {
+  instances.add(this); return emit.apply(this, args);
+ });
+ const closeSpy = mock.method(MessageBatcher.prototype, "close", function(this: MessageBatcher) {
+  closes.push(this); return close.call(this);
+ });
+ const rearm = new Map<string, () => void>();
+ const model: Checker = options.model?.(client, recorded.logger) ?? { run: async (_c, _co, _h, _s, usage, confirm, activity) => {
+  activity?.modelStarted(); confirm?.();
+  await usage({ event: "init" });
+  if (!options.failureAt) throw options.error;
+  await usage({ event: "result", is_error: false });
+  return stage === "code" ? '{"findings":[]}' : verdict;
+ } };
+ try {
+  if (server) {
+   await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+   });
+   const address = server.address() as { port: number };
+   messageClient = new WorkerClient("http://127.0.0.1:" + address.port, "join-fixture", "test", recorded.logger);
+   messageClient.hasFeature = (name) => name === "claim_generation_fence";
+  }
+  await new CrossCheckRunner(client, git, recorded.logger, { homeRoot: root, outbox, rearm,
+   pollMs: 1000, batchMs: 60_000, modelTimeoutMs: 5000,
+   ...(harness === "codex" ? { model } : { claudeModel: model }),
+  }).execute(c);
+  if (handlerErrors.length) throw new AggregateError(handlerErrors, "authenticated message handler assertions failed");
+  assert.equal(instances.size, 1, "only the original batcher emitted");
+  assert.deepEqual(closes, [...instances], "the original batcher closed exactly once");
+  assert.equal(rearm.size, 0);
+  return { messages, decisions, terminals, logs: recorded.lines,
+   diagnostics: messages.filter(m => m.payload.event === "cross_check_diagnostic").map(m => m.payload),
+   warnings: recorded.lines.filter((line: any) => line.event === "cross_check_diagnostic") };
+ } finally {
+  emitSpy.mock.restore(); closeSpy.mock.restore();
+  try {
+   if (server?.listening) {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+   }
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+ }
+}
+
+function exactDiagnostic(stage: "plan" | "code", harness: "claude" | "codex", code: DiagnosticCode) {
+ return { event: "cross_check_diagnostic", stage, harness, reason_class: "model_error", code, text: diagnosticPairs[code] };
+}
+function assertDiagnostic(r: Awaited<ReturnType<typeof diagnosticScenario>>, stage: "plan" | "code",
+ harness: "claude" | "codex", code: DiagnosticCode, open = true) {
+ const payload = exactDiagnostic(stage, harness, code);
+ assert.deepEqual(r.diagnostics, open ? [payload] : []);
+ assert.deepEqual(r.warnings, [{ level: "warn", msg: "cross-check execution incomplete", run_id: "check", ...payload }]);
+ if (open) {
+  const diagnostic = r.messages.find(m => m.payload.event === "cross_check_diagnostic")!;
+  assert.equal(diagnostic.kind, "status");
+  assert.equal(diagnostic.agent, "cross-checker");
+  assert.equal(r.decisions.at(-1).reason_class, "model_error");
+ }
+ if (r.messages.length) assert.ok(r.terminals.every(t => t.fence === r.messages.at(-1).seq), "fence includes actual payload");
+}
+
+for (const stage of ["plan", "code"] as const) for (const harness of ["claude", "codex"] as const) {
+ for (const code of Object.keys(diagnosticPairs) as DiagnosticCode[]) {
+  it("GAP_AUTH_PATH authenticated diagnostic " + stage + " " + harness + " " + code, async () => {
+   const r = await diagnosticScenario(stage, harness, { authenticatedMessages: true, error: crossCheckExecutionError(code) });
+   assertDiagnostic(r, stage, harness, code);
+   assert.deepEqual(r.messages.map(m => m.seq), [11, 12, 13, 14]);
+   assert.ok(r.terminals.length > 0, "runner reports a terminal fence");
+  });
+  it("M1 exact trusted pair " + stage + " " + harness + " " + code, async () => {
+   const r = await diagnosticScenario(stage, harness, { error: crossCheckExecutionError(code) });
+   assertDiagnostic(r, stage, harness, code);
+  });
+ }
+ for (const failureAt of ["usage", "probe", "verdict", "terminal", "terminal-selected", "ambiguous"] as const) {
+  it("M1 closed batcher " + stage + " " + harness + " " + failureAt, async () => {
+   const r = await diagnosticScenario(stage, harness, { failureAt });
+   // Code retains its existing malformed precedence after verdict validation starts.
+   if (stage === "code" && failureAt !== "usage") {
+    assert.deepEqual(r.diagnostics, []); assert.deepEqual(r.warnings, []);
+   } else assertDiagnostic(r, stage, harness, "unknown_execution_error", false);
+   assert.deepEqual(r.messages.map(m => m.seq), failureAt === "usage" ? [] : [11, 12, 13, 14]);
+   assert.ok(r.terminals.every(t => t.fence === 14));
+   if (failureAt === "terminal" || failureAt === "terminal-selected") {
+    assert.equal(r.decisions.length, 1, "delivered verdict is never overwritten");
+    assert.equal(r.decisions[0][stage === "code" ? "outcome" : "verdict"], stage === "code" ? "completed" : "approve");
+   }
+   if (failureAt === "ambiguous") assert.equal(r.decisions.length, 2);
+   assert.deepEqual(r.terminals.map(t => t.status),
+    failureAt === "terminal-selected" ? ["completed", "completed"] : failureAt === "terminal" ? ["completed", "failed"] : ["failed"]);
+   if (failureAt === "terminal-selected") {
+    assert.deepEqual(r.terminals[0], r.terminals[1], "the existing terminal winner keeps its body and fence");
+   } else if (failureAt !== "terminal") {
+    assert.equal(r.decisions.at(-1).reason_class, stage === "code" && failureAt !== "usage" ? "malformed" : "model_error");
+   }
+  });
+ }
+}
+
+it("M1 unknown throws cannot brand themselves or leak arbitrary data", async () => {
+ const data = ["glpat-", "A".repeat(20), " excerpt https://example.test/private /secret/path\n\t\u001b"].join("");
+ const known = crossCheckExecutionError("provider_error");
+ const values: unknown[] = [undefined, null, 42, data, new Error(data),
+  Object.assign(new Error(data), { name: data, code: "provider_error", reason_class: "model_error", cause: known }),
+  Object.create(Object.getPrototypeOf(known)), { constructor: { name: "CrossCheckExecutionError" }, code: "provider_error" },
+  Object.defineProperty({}, "code", { get() { throw new Error("must not inspect"); } })];
+ for (const stage of ["plan", "code"] as const) for (const harness of ["claude", "codex"] as const) for (const value of values) {
+  assert.deepEqual(crossCheckDiagnostic(value, stage, harness), exactDiagnostic(stage, harness, "unknown_execution_error"));
+  const r = await diagnosticScenario(stage, harness, { error: value });
+  assertDiagnostic(r, stage, harness, "unknown_execution_error");
+  assert.equal(JSON.stringify(r).includes(data), false);
+ }
+ Object.assign(known, { message: data, name: data, stack: data, cause: data, code: "transport_ended" });
+ assert.deepEqual(crossCheckDiagnostic(known, "plan", "codex"), exactDiagnostic("plan", "codex", "provider_error"));
+ assert.ok(Object.isFrozen(crossCheckDiagnostic(known, "plan", "codex")));
+});
+
+const sdkInit = { type: "system", subtype: "init", session_id: "s", model: "sonnet",
+ tools: ["Read", "Grep", "Glob"], mcp_servers: [], plugins: [], agents: [], skills: [] };
+const sdkRead = { type: "assistant", parent_tool_use_id: null, message: { content: [
+ { type: "tool_use", id: "read", name: "Read", input: { file_path: "anchor.ts" } }] } };
+const sdkReadDone = { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "read", content: "excerpt" }] } };
+
+for (const stage of ["plan", "code"] as const) {
+ for (const [name, frames, code] of [
+  ["provider after Read", [sdkInit, sdkRead, sdkReadDone, { type: "assistant", parent_tool_use_id: null, error: "rate_limit" }], "provider_error"],
+  ["provider after Search", [sdkInit, { ...sdkRead, message: { content: [{ type: "tool_use", id: "read", name: "Grep", input: { path: ".", pattern: "anchor" } }] } }, sdkReadDone,
+   { type: "assistant", parent_tool_use_id: null, error: "rate_limit" }], "provider_error"],
+  ["clean exhaustion", [sdkInit], "transport_ended"],
+  ["checker result", [sdkInit, { type: "result", subtype: "error_max_turns", is_error: true }], "checker_error_result"],
+  ["unsupported result", [sdkInit, { type: "result", subtype: "future", is_error: true }], "unknown_execution_error"],
+  ["inconsistent result", [sdkInit, { type: "result", subtype: "success", is_error: true }], "unknown_execution_error"],
+  ["unsupported assistant", [sdkInit, { type: "assistant", error: { code: "rate_limit" } }], "unknown_execution_error"],
+ ] as const) it("M1 composed Claude " + stage + " " + name, async () => {
+  const r = await diagnosticScenario(stage, "claude", { model: (_client, log) => new ClaudeCrossCheck(log, {
+   secretPaths: ["/run/secrets/"], queryFn: (() => (async function* () { yield* frames; })()) as unknown as SdkQueryFn,
+  }) });
+  assertDiagnostic(r, stage, "claude", code);
+  assert.ok(r.messages.some(m => m.payload.event === "result"), "result accounting survives failure");
+  if (name === "provider after Read" || name === "provider after Search") assert.ok(r.messages.some(m => m.payload.event === "check_activity" && m.payload.outcome === "ok"));
+ });
+
+ for (const mode of ["provider", "provider-search", "failed", "no-verdict", "active", "exhausted", "foreign", "future", "preauth", "interrupted", "absent-status", "future-status", "budget200", "budget201"] as const) {
+  it("M1 composed Codex " + stage + " " + mode, async () => {
+   const providerError = (emit: Emit, params: Record<string, unknown> = {}) => emit({ method: "error", params: {
+    threadId: "thread", turnId: "turn", willRetry: false, error: { message: ["glpat-", "B".repeat(20), " excerpt https://example.test/private /private/path\\n"].join(""), codexErrorInfo: "serverOverloaded" }, ...params } });
+   let count = 0;
+   let r: ReturnType<typeof rig>;
+   const send = (emit: Emit) => {
+    if (mode === "exhausted") { r.end(); return; }
+    if (mode === "foreign" || mode === "future") { providerError(emit, mode === "foreign" ? { threadId: "foreign" } : { willRetry: "future" }); return; }
+    if (mode === "preauth") return;
+    if (mode === "no-verdict" || mode === "failed" || mode === "interrupted" || mode === "active" || mode === "absent-status" || mode === "future-status") {
+     if (mode === "active") emit({ method: "item/started", params: { threadId: "thread", turnId: "turn",
+      item: { id: "unfinished", type: "agentMessage", phase: "final_answer" } } });
+     emit({ method: "turn/completed", params: { threadId: "thread", turn: { id: "turn",
+      status: mode === "failed" ? "failed" : mode === "interrupted" ? "interrupted" : mode === "absent-status" ? undefined : mode === "future-status" ? "future" : "completed" } } }); return;
+    }
+    emit({ id: ++count, method: "item/tool/call", params: { threadId: "thread", turnId: "turn",
+     callId: "read-" + count, tool: mode === "provider-search" ? "Search" : "Read",
+     arguments: mode === "provider-search" ? { path: ".", query: "anchor" } : { path: "anchor.ts" } } });
+   };
+   r = rig({ notes: send,
+    beforeResponse: (frame, emit) => { if (mode === "preauth" && frame.method === "account/login/start") providerError(emit); },
+    onToolReply: (frame, emit) => {
+     assert.equal(frame.result.success, true);
+     if (mode === "provider" || mode === "provider-search") providerError(emit);
+     else if (count < (mode === "budget201" ? 201 : 200)) send(emit);
+     else r.terminal(emit, stage === "code" ? '{"findings":[]}' : verdict);
+    },
+   });
+   const result = await diagnosticScenario(stage, "codex", { model: (client, log) => new CodexCrossCheck(client, log, r.deps) });
+   if (mode === "budget200") {
+    assert.deepEqual(result.diagnostics, []); assert.deepEqual(result.warnings, []);
+    assert.equal(result.decisions[0][stage === "code" ? "outcome" : "verdict"], stage === "code" ? "completed" : "approve");
+   } else {
+    const code = mode === "provider" || mode === "provider-search" ? "provider_error" : mode === "failed" ? "checker_error_result"
+     : mode === "no-verdict" || mode === "active" ? "no_complete_verdict" : mode === "exhausted" ? "transport_ended"
+     : mode === "budget201" ? "tool_budget_exceeded" : "unknown_execution_error";
+    assertDiagnostic(result, stage, "codex", code);
+   }
+   assert.deepEqual(r.disposed, ["provider", "fileop"]);
+   assert.equal(JSON.stringify(result).includes("B".repeat(20)), false, "provider data never enters logs or diagnostics");
+   if (mode === "provider" || mode === "provider-search") assert.ok(result.messages.some(m => m.payload.event === "check_activity" && m.payload.outcome === "ok"));
+   if (mode.startsWith("budget")) assert.equal(count, mode === "budget200" ? 200 : 201);
+  });
+ }
+}
