@@ -58,6 +58,10 @@ interface Opts {
   dev?: (p: string, predecessorClone: string) => number;
   /** Called after each reclaim pass (1-based count). */
   onReclaim?: (n: number, set: (used: number) => void) => void;
+  /** Called when the admission starts its reclaim wait (1-based), before the reclaim pass, with the live flight. */
+  onWait?: (n: number, flight: { steering: { markCancelled(): void } }, set: (used: number) => void) => void;
+  /** Called inside each predecessor measurement. */
+  onMeasure?: (set: (used: number) => void) => void;
   /** Stub the predecessor measurement. */
   estimate?: { bytes: number; inodes: number; complete: boolean };
 }
@@ -66,7 +70,10 @@ async function drive(o: Opts, prepare?: (ctx: { claim: ReturnType<typeof gitlabC
   const { claim, bare, clone } = await seed();
   client.protocolFeatures = o.features ?? ALL_FEATURES;
   const state = { used: o.used };
-  const r = { models: 0, ensureClones: 0, prepares: 0, reclaims: 0, releases: 0, parks: [] as StateRequest[], measures: 0 };
+  const r = {
+    models: 0, ensureClones: 0, prepares: 0, reclaims: 0, releases: 0, parks: [] as StateRequest[], measures: 0,
+    measureOpts: [] as Array<{ includeGitObjects?: boolean }>,
+  };
   const ensure = git.ensureClone.bind(git);
   git.ensureClone = async (...args) => { r.ensureClones++; return ensure(...args); };
   const prep = git.prepareRecoverySuccessor.bind(git);
@@ -74,6 +81,8 @@ async function drive(o: Opts, prepare?: (ctx: { claim: ReturnType<typeof gitlabC
   const measure = git.measureRetainedSeedFootprint.bind(git);
   git.measureRetainedSeedFootprint = async (p, opts) => {
     r.measures++;
+    r.measureOpts.push({ includeGitObjects: opts?.includeGitObjects });
+    o.onMeasure?.(used => { state.used = used; });
     return o.estimate ?? measure(p, opts);
   };
   const guard = new DataVolumeGuard({
@@ -105,10 +114,17 @@ async function drive(o: Opts, prepare?: (ctx: { claim: ReturnType<typeof gitlabC
     thresholdOf: () => 0.9,
   });
   prepare?.({ claim, bare, clone });
-  await runnerWith(factory(async () => { r.models++; throw new Error("model interrupted before settled completion"); }),
+  const runner = runnerWith(factory(async () => { r.models++; throw new Error("model interrupted before settled completion"); }),
     fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 1, dataVolume: guard, ...(diskGovernor ? { diskGovernor } : {}) },
-  ).execute(claim);
-  return { ...r, claim, bare, clone, state };
+  );
+  let waits = 0;
+  const wait = (runner as any).awaitDataVolumeReclaim.bind(runner);
+  (runner as any).awaitDataVolumeReclaim = (g: unknown, flight: any, op: string, signal?: AbortSignal) => {
+    if (op === "retained_seed_admission") o.onWait?.(++waits, flight, used => { state.used = used; });
+    return wait(g, flight, op, signal);
+  };
+  await runner.execute(claim);
+  return { ...r, claim, bare, clone, state, runner };
 }
 
 type Result = Awaited<ReturnType<typeof drive>>;
@@ -306,7 +322,80 @@ it("control: a renewed adoption_failed episode refused for capacity ends budget_
   assertNoDiskPark();
 });
 
-it("control: an owner cancel during the refusal takes the existing cancel path without a successor or a disk park", async () => {
+it("control: usage rising during the predecessor measurement refuses on the fresh post-measurement sample", async () => {
+  // Sample 1 (0.80 + a small estimate) would admit; only the re-sample taken after the measurement sees 0.89.
+  const r = await drive({
+    used: 0.80,
+    estimate: { bytes: 1024 ** 3, inodes: 10, complete: true },
+    onMeasure: set => set(0.89),
+  });
+  assertRefusedWindow(r);
+  assert.equal(r.measures, 1, "later iterations refuse on current pressure before measuring");
+});
+
+it("control: a steering cancel observed by the reclaim wait ends the admission without a re-sample, successor or park", async () => {
+  const r = await drive({
+    used: 0.89,
+    // Usage also drops, so a (wrongly) re-assessed admission would measure and admit instead of refusing.
+    onWait: (_n, flight, set) => { flight.steering.markCancelled(); set(0.30); },
+  });
+  assert.equal(r.models, 0);
+  assert.equal(r.prepares, 0);
+  assert.deepEqual(attemptDirs(r.clone), []);
+  assert.equal(r.measures, 0, "refused on current pressure before measuring, and never re-assessed after the cancelled wait");
+  assert.equal(r.parks.length, 0, "a cancelled run is not parked");
+  assert.equal(r.releases, 0);
+  assert.equal(journal(r.bare, r.clone.branch).recovery.attempts, 1, "no further iteration was charged");
+  assertNoDiskPark();
+});
+
+it("control: a stale generation during the refusal takes the existing stop path", async () => {
+  let runId = "";
+  const r = await drive({
+    used: 0.89,
+    onReclaim: () => { api.setOwnershipStatus(runId, "running", 3); },
+  }, c => { runId = c.claim.run_id; });
+  assert.equal(r.models, 0);
+  assert.equal(r.prepares, 0);
+  assert.deepEqual(attemptDirs(r.clone), []);
+  assert.equal(r.reclaims, 1, "no further iteration after the fence");
+  assert.equal(r.parks.length, 0);
+  assert.equal(journal(r.bare, r.clone.branch).recovery.attempts, 1, "no further iteration was charged");
+  assert.equal(r.releases, 0);
+  assertNoDiskPark();
+});
+
+it("control: a second execute after the exhausted park is finite and seeds nothing", async () => {
+  // Custody holds are server-owned (one per claimed generation) and are not counted by the worker; the
+  // finite claim count asserted here is the number of executes and exhausted-park reports.
+  const r = await drive({ used: 0.89 });
+  assertRefusedWindow(r);
+  let executes = 1;
+  api.setOwnershipStatus(r.claim.run_id, "running", 3);
+  executes++;
+  await r.runner.execute({ ...r.claim, claim_generation: 3 });
+  assert.equal(r.models, 0);
+  assert.equal(r.prepares, 0);
+  assert.deepEqual(attemptDirs(r.clone), []);
+  assert.equal(r.releases, 0);
+  assertNoDiskPark();
+  assert.ok(r.parks.length <= 2, `at most one further exhausted park, got ${r.parks.length}`);
+  assert.equal(executes, 2);
+});
+
+it("control: a self-contained (Codex-shaped) claim measures with git objects included", async () => {
+  const r = await drive({ used: 0.30 }, c => { (c.claim as any).plan_cross_check_required = true; });
+  assertSeeded(r);
+  assert.deepEqual(r.measureOpts.map(o => o.includeGitObjects), [true]);
+});
+
+it("control: the default claim measures without git objects", async () => {
+  const r = await drive({ used: 0.30 });
+  assertSeeded(r);
+  assert.deepEqual(r.measureOpts.map(o => o.includeGitObjects), [false]);
+});
+
+it("control: an owner cancel flipping server ownership during the refusal takes the existing ownership-lost path without a successor or a disk park", async () => {
   let runId = "";
   const r = await drive({
     used: 0.89,

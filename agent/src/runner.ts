@@ -8178,10 +8178,12 @@ export class RunRunner {
           deadline: Math.min(iteration.deadline, Date.now() + RETAINED_SEED_MEASURE_BUDGET_MS),
         });
       } catch (error) {
-        // An interruption or an expired iteration propagates; any other failure falls back.
+        // An interruption or an expired iteration propagates; only a filesystem failure (an error
+        // with a string `code`, e.g. ENOENT/EACCES/EMFILE/EIO) falls back to the estimate.
         signal.throwIfAborted();
         this.retainedLifecycleGuard(flight);
         if (Date.now() >= iteration.deadline) throw error;
+        if (typeof (error as { code?: unknown } | null)?.code !== "string") throw error;
         flight.runLog.warn("retained seed footprint measurement failed; using the fallback estimate",
           formatRetainedRecoveryDiagnostic(error, flight.redactText));
         estimate = undefined;
@@ -25823,7 +25825,7 @@ export class RunRunner {
             await this.git.blockRecoveryEpisode(bare, branch, key, expectedSource, blocker, episode ?? null,
               () => this.retainedLifecycleGuard(flight));
             this.retainedLifecycleGuard(flight);
-            if ((this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_exhausted") ||
+            if ((this.client?.protocolFeatures?.includes(RETAINED_EXHAUSTED_FEATURE) ||
                 this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_adoption_failed")) &&
                 Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0) {
               const snapshot = await this.git.terminalRetainedSnapshot(bare, branch, key, expectedSource);
@@ -25901,7 +25903,7 @@ export class RunRunner {
       }
       if (persistence === "" && persisted?.recovery?.stage === "blocked" && persisted.recovery.blocker === "budget_exhausted" &&
           Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 &&
-          this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_exhausted")) {
+          this.client?.protocolFeatures?.includes(RETAINED_EXHAUSTED_FEATURE)) {
         if (await this.parkRetainedRecoveryExhausted(flight)) throw new RetainedRecoveryStop();
       }
       await this.reportGenericFailure(claim, flight,
