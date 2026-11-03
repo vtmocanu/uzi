@@ -177,6 +177,30 @@ describe("prepareManagedGoWork", () => {
     assert.deepStrictEqual(await fs.readdir(leaf), ["keep"]);
   });
 
+  it("a swapped-in directory with a fresh-looking mode but existing entries is refused and never chmodded", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    await prepareParent();
+    const swapped = path.join(home, "swapped-0700");
+    await fs.mkdir(swapped, { mode: 0o700 });
+    await fs.chmod(swapped, 0o700);
+    await fs.writeFile(path.join(swapped, "keep"), "k\n");
+    const { logger } = recordingLogger();
+    const r = await prepareManagedGoWork(home, 1, logger, {
+      mkdir: async (p: string, o: { mode: number }) => {
+        await fs.mkdir(p, o);
+        if (p.endsWith("/g1")) {
+          await fs.rename(p, `${p}-away`);
+          await fs.rename(swapped, p);
+        }
+        return undefined;
+      },
+    });
+    assert.deepStrictEqual(r, { skipped: true, reason: "leaf_refused" });
+    const leaf = path.join(parentDir(), "g1");
+    assert.strictEqual(((await fs.lstat(leaf)).mode & 0o7777).toString(8), "700", "swapped-in dir not chmodded");
+    assert.deepStrictEqual(await fs.readdir(leaf), ["keep"]);
+  });
+
   it("steps are fd-relative: renaming HOME away and symlinking its old path elsewhere cannot redirect the create", async (t) => {
     if (noProcFd) return t.skip(NO_PROC_FD);
     const outside = makeScratchRoot("uzi-go-work-out-");
@@ -195,8 +219,8 @@ describe("prepareManagedGoWork", () => {
         },
       });
       assert.deepStrictEqual(await fs.readdir(outside), [], "nothing created through the swapped path");
-      assert.ok("dir" in r || "skipped" in r);
-      if ("dir" in r) assert.ok(existsSync(path.join(moved, GO_WORK_PARENT, "g1")), "landed in the pinned HOME");
+      assert.ok("dir" in r, JSON.stringify(r));
+      assert.ok(existsSync(path.join(moved, GO_WORK_PARENT, "g1")), "landed in the pinned HOME");
     } finally {
       await fs.rm(home, { force: true });
       await fs.rename(moved, home).catch(() => undefined);

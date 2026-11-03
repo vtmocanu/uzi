@@ -11,8 +11,8 @@
 // existing shared-UID posture and is accepted here; what this module guarantees is narrower: each step
 // is relative to a pinned directory descriptor (HOME, then the parent), so a swap of an ancestor path
 // cannot redirect a later create or open outside the pinned directory; a directory this call created is
-// verified fresh on its reopened descriptor before the only chmod (a swap in that window is refused, not
-// adopted); an existing parent or leaf with the wrong shape is refused rather than repaired (never
+// verified fresh on its reopened descriptor before the only chmod (a swapped-in directory that does not
+// look freshly made is refused, not chmodded; an empty one that does is indistinguishable and is adopted); an existing parent or leaf with the wrong shape is refused rather than repaired (never
 // chown, never recursive chmod); and no function here throws.
 
 import fs from "node:fs/promises";
@@ -103,7 +103,8 @@ class Skip extends Error {
  * (non-recursive, mode 2770 under the uid split, 0700 otherwise) and opened below it, and the leaf is
  * created non-recursively below the pinned parent. mkdir and the reopen are by name, so a directory
  * this call created is chmodded only after the reopened descriptor passes a freshness check (ours,
- * empty, nlink 2, no mode bits beyond the requested ones); a swapped-in directory is refused untouched.
+ * empty, no mode bits beyond the requested ones); a swapped-in directory that does not look freshly
+ * made is refused untouched.
  * An existing parent with the wrong owner, group or mode is refused, never repaired. An existing leaf
  * is a refusal too (`leaf_exists`): a generation's leaf is made once.
  */
@@ -154,7 +155,8 @@ export async function prepareManagedGoWork(
     if (created) {
       // The open is by name, so a same-uid process could have swapped another directory into place
       // between our mkdir and the open. Before the fd is chmodded, require it to look like what our
-      // mkdir just made: ours, a directory, empty, no hard-link extras, and no mode bits beyond the
+      // mkdir just made: ours, a directory, empty (checked by listing, not by link count, which btrfs
+      // reports as 1 for every directory), and no mode bits beyond the
       // requested ones (setgid may be inherited from the parent) with the owner rwx bits present.
       let fresh: boolean;
       try {
@@ -162,7 +164,6 @@ export async function prepareManagedGoWork(
         fresh =
           st.isDirectory() &&
           st.uid === process.getuid?.() &&
-          st.nlink === 2 &&
           (st.mode & 0o700) === 0o700 &&
           (st.mode & ~(mode | 0o2000) & 0o7777) === 0 &&
           (await fs.readdir(fdPath(handle.fd))).length === 0;
