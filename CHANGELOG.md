@@ -39,10 +39,46 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Codex runs can pick among your pooled ChatGPT accounts when they are created ([#3719](https://github.com/vtmocanu/uzi/pull/3719), [#3744](https://github.com/vtmocanu/uzi/pull/3744)).**
   Opt in with `uzi settings codex-mode auto` and `uzi token pool <label> --kind codex --on`; the choice is made once at creation and a run never switches account, and `uzi token pool <label>` now needs `--kind` when a label exists in both kinds.
 
+- **Plans that stop at your review are now cross-checked first ([#3708](https://github.com/vtmocanu/uzi/pull/3708), [#3743](https://github.com/vtmocanu/uzi/pull/3743)).**
+  With Plan cross-check on, a run that is not auto-approved goes through the opposite-family check and automatic revision rounds before its first human gate, then always stops there: an APPROVE never starts implementation. The first gate can wait up to 5 checks x 30 min by default (10 h at the 2 h maximum timeout) plus the lead's revision turns; rolling back across migrations 00394/00395 needs the drain check in docs/cross-check.md first.
+
+- **Slack completion messages disclose an incomplete Code cross-check ([#3813](https://github.com/vtmocanu/uzi/pull/3813), [#3820](https://github.com/vtmocanu/uzi/pull/3820)).**
+  A completed run whose advisory Code cross-check failed adds one fixed-reason line to its existing Slack completion message, saying publication continued only when a merge request link was recorded.
+
+- **Owners can inspect recorded prerequisite pin protection and follow verified restore steps ([#3728](https://github.com/vtmocanu/uzi/pull/3728), [#3778](https://github.com/vtmocanu/uzi/pull/3778)).**
+  Persisted pin snapshots preserve uncertainty and cleanup exhaustion; existing export plus full pin-tip comparison precedes native bundle verification without granting custody or deletion authority.
+
+- **New issue runs can opt into creation-time harness overflow ([#3720](https://github.com/vtmocanu/uzi/pull/3720), [#3789](https://github.com/vtmocanu/uzi/pull/3789)).**
+  A default-off user setting compares stored headroom and capacity holds before atomically choosing a harness; owner-only web, CLI and TUI explanations retain the decision, and existing runs never switch.
+
+- **Scheduled prompt run detail reveals created proposal issues ([#3784](https://github.com/vtmocanu/uzi/pull/3784), [#3814](https://github.com/vtmocanu/uzi/pull/3814)).**
+  Web and CLI show confirmed stamped outputs, including historical records; best-effort lookup may omit them, and unsafe links retain plain issue numbers.
+
+- **A thin guarded recovery archive can release its custody hold once its prerequisites are pinned on GitHub.com ([#3727](https://github.com/vtmocanu/uzi/pull/3727), [#3748](https://github.com/vtmocanu/uzi/pull/3748)).**
+  The API confirms the `refs/uzi-prereq/<capture>` pin with one forge listing before it releases; a missing, foreign or unlistable pin keeps the hold, and its schema migration takes a brief exclusive lock on `recovery_custody_holds`.
+
+- **The agent worker images (`agent-base`, `agent-jvm`) are published for `linux/arm64` as well as `linux/amd64`.**
+  Each tag is now a multi-arch index, built natively per architecture and signed as an index and per architecture. The chart still pins workers to amd64 nodes by default (`workers.nodeSelector`) until its worker pin names a multi-arch release.
+
 ### Changed
 
 - **Demo mode hides instance branding ([#3757](https://github.com/vtmocanu/uzi/pull/3757)).**
   Screenshots use the stock uzi identity, tab title and favicon base, with POWERED BY and optional license credits hidden; toggling demo mode off restores real branding without changing server settings.
+
+- **A memory-pressure park the worker fully settled now continues on the same worker incarnation after owner Resume, instead of waiting for another worker or a worker restart ([#3639](https://github.com/vtmocanu/uzi/pull/3639), [#3750](https://github.com/vtmocanu/uzi/pull/3750)).**
+  The worker reports a write-once settlement receipt and Resume lifts the released-worker exclusion only when a current receipt matches, and the claiming worker still re-parks the run for its owner if its local checks fail; parks made before this change, receipts arriving after Resume, other workers and worker restarts behave as before.
+
+- **Eligible runs pause at their iteration limit for an owner decision ([#3738](https://github.com/vtmocanu/uzi/pull/3738), [#3774](https://github.com/vtmocanu/uzi/pull/3774)).**
+  Negotiated zero-attempt runs retain local work and require explicit Resume for another finite invocation allowance; wall budget, prior-attempt dispositions and publication authority stay unchanged. Running and paused budget labels and Extend details also include the known finalization reserve, including ordinary pauses and wall-limit holds.
+
+- **Codex subagent turn budget raised to 15 minutes, with distinct timeout and cancel results ([#3804](https://github.com/vtmocanu/uzi/pull/3804), [#3815](https://github.com/vtmocanu/uzi/pull/3815)).**
+  The per-child budget was 10 minutes; a child that exceeds it now returns child_timeout to the lead, a run or parent cancel returns child_aborted, the first cause wins, and there is no setting, extension or retry.
+
+- **Model pickers say where "Default" comes from ([#3255](https://github.com/vtmocanu/uzi/pull/3255), [#3777](https://github.com/vtmocanu/uzi/pull/3777)).**
+  The empty option now reads, for example, `Default · lead template`, `Default · gpt-6.1-sol (built-in)` or `Default · your Claude worker model` instead of "Inherit (account default)", and the admin Summary model is a curated Claude picker with a custom-ID option that blocks blank or invalid IDs before save. `uzi schedule get` now shows an unset MODEL as `default (worker model)` instead of `-`.
+
+- **Runs get clearer planning and guardrail guidance ([#296](https://github.com/vtmocanu/uzi/pull/296), [#3759](https://github.com/vtmocanu/uzi/pull/3759)).**
+  The lead prompt now asks leads to check scope and verification costs before freezing a plan, and mass-signal denials explain supported file input for falsely flagged literal heredoc prose; command screening is unchanged.
 
 ### Fixed
 
@@ -54,6 +90,39 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Keep oversized GitHub Release notes publishable ([#3752](https://github.com/vtmocanu/uzi/pull/3752), [#3755](https://github.com/vtmocanu/uzi/pull/3755)).**
   Long notes now retain complete bullets and security metadata within GitHub's limit, with a link to the complete changelog.
+
+- **The Claude cross-checker no longer records content-mode searches as "0 matches" ([#3794](https://github.com/vtmocanu/uzi/pull/3794), [#3795](https://github.com/vtmocanu/uzi/pull/3795)).**
+  A search that returned matching lines now records no count instead of a false 0, and earlier Claude-checker "0 matches" values for such searches are unreliable.
+
+- **Preserve pending policy outcomes without blocking unrelated work ([#3607](https://github.com/vtmocanu/uzi/pull/3607)).**
+  Keep policy and unknown first writers protected through outbox pressure, resolve deferred authenticated records, preserve permanent blocked reasons and deliver cancellation follow-ups. Scoped claims require the independent pending_outcome_scoped_claim_v1 protocol, complete source coverage and current ownership; provider_policy_hold_v1 readiness and policy Resume/Stop remain disabled.
+
+- **Recovery skips redundant work after verified custody closure ([#3105](https://github.com/vtmocanu/uzi/pull/3105), [#3792](https://github.com/vtmocanu/uzi/pull/3792)).**
+  Verified closure survives worker restarts while saved release requests and acknowledged cleanup keep their existing safeguards.
+
+- **Clarification answer budget counts only time parked on a question ([#3140](https://github.com/vtmocanu/uzi/pull/3140), [#3771](https://github.com/vtmocanu/uzi/pull/3771)).**
+  `QUESTION_TIMEOUT_SECONDS` is now charged from the accepted `awaiting_input` park until the answer or cancel settles, instead of an absolute deadline from a run's first question; later questions share the remaining budget, and the budget is still worker memory that a fresh executor execution resets.
+
+- **Isolate pending policy evidence and preserve outcome resolution metadata ([#3607](https://github.com/vtmocanu/uzi/pull/3607)).**
+  Bound live policy identities independently of ordinary terminal quotas, retain deferred authentication and guarded source/finalize retry evidence, permit negotiated scoped claims with complete current-owner proof, and preserve committed cancel follow-ups and permanent discard reasons. Explicit incomplete inventory permits unrelated intake while retaining the exclusion of all work attributed to that worker; exhausted local capacity still stops claims. Compact hold reporting and CLI/web preservation details remain preparatory: the independent pending_outcome_scoped_claim_v1 protocol contract does not enable provider_policy_hold_v1 readiness; policy Resume and Stop remain unavailable. Workers with a symlinked or unreadable outbox root stop taking new work and report the root fault in worker health and the CLI. Repair preserves the original key and journals before restart; existing claims remain operator-held.
+
+- **CI scout spreads history reads across both run populations and comparison weeks ([#3783](https://github.com/vtmocanu/uzi/pull/3783), [#3800](https://github.com/vtmocanu/uzi/pull/3800)).**
+  Reads rotate through the selected runs while one fifth of the collection deadline is reserved for failed-job log tails.
+
+- **Slow-starting workers receive the full evidence delivery window after eligible container IDs appear ([#3773](https://github.com/vtmocanu/uzi/pull/3773), [#3776](https://github.com/vtmocanu/uzi/pull/3776)).**
+  Positive handoffs start their nonrenewable 90-second window on the first eligible changed pod event, preserving frozen proof, conflict-only retries and worker safety checks.
+
+- **New Docker workers can receive frozen negative evidence after a conflict ([#3818](https://github.com/vtmocanu/uzi/pull/3818), [#3819](https://github.com/vtmocanu/uzi/pull/3819)).**
+  Later changed pod events can retry delivery of the same identity-unverified negative, reducing evidence wait when delivery succeeds within the existing attempt and time limits.
+
+- **Plan cross-check disposition judgments match the supplied evidence ([#3097](https://github.com/vtmocanu/uzi/pull/3097), [#3770](https://github.com/vtmocanu/uzi/pull/3770)).**
+  Checkers assess visible dispositions without claiming completeness against prior findings they do not receive, preserving mandatory defect requirements and advisory coverage handling.
+
+- **A checkpoint interrupted mid-update no longer fails a finished run ([#3780](https://github.com/vtmocanu/uzi/pull/3780), [#3805](https://github.com/vtmocanu/uzi/pull/3805)).**
+  Mid-turn tick preemption and stop are now cooperative so a started ownership update finishes, and the same flight can complete its own stranded pending receipt under exact in-memory proof and current authority; a stranded receipt across a restart or worker shutdown still fails at finalize.
+
+- **Partial shadow inventory names bounded cap, API and filesystem causes ([#3775](https://github.com/vtmocanu/uzi/pull/3775), [#3810](https://github.com/vtmocanu/uzi/pull/3810)).**
+  Sparse diagnostic counters explain observed partial work without changing reclaim candidates or authority.
 
 ## [0.86.0] - 2026-11-01
 
