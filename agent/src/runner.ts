@@ -25920,6 +25920,11 @@ export class RunRunner {
           let successor: RunnerClone;
           try {
             successor = await this.inFlightAuthority(flight, async () => {
+              const denialRevision = flight.remediationRestrictions?.denialRevision ?? 0;
+              // Capture may retain bytes with custody-only facts; successor admission may not.
+              const negative = await this.bootstrapRemediationRestrictions(flight);
+              this.retainedLifecycleGuard(flight);
+              if (negative.kind === "unavailable") throw finalize;
               // Independently restore the selected predecessor before entering Git's bare lock.
               const record = await this.restoreRemediationRestrictions(flight);
               const snapshot = canonicalJson(flight.remediationRestrictions ?? null);
@@ -25927,7 +25932,9 @@ export class RunRunner {
                 this.assertFlightSourceAdmissible(flight);
                 const selected = this.remediationSource(flight);
                 const pending = flight.remediationRestrictions?.pending;
-                if (selected.runId !== source.runId || selected.clonePath !== source.clonePath ||
+                if (!Number.isSafeInteger(denialRevision) || denialRevision < 0 ||
+                    (flight.remediationRestrictions?.denialRevision ?? 0) !== denialRevision ||
+                    selected.runId !== source.runId || selected.clonePath !== source.clonePath ||
                     selected.attemptId !== source.attemptId || flight.worktreePath !== source.clonePath ||
                     flight.barePath !== bare || flight.branch !== branch ||
                     canonicalJson(flight.remediationRestrictions ?? null) !== snapshot ||

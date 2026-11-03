@@ -131,13 +131,16 @@ test("custody accounting sensitivity: accepted fake status invalidates live clai
 for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "excluded", "scan-floor", "missing-pending",
   "missing-RR", "historical", "late-scan-pending", "late-scan-root", "late-seed", "late-launch-denial",
   "marker", "marker-plain", "marker-staged", "marker-historical", "marker-floor", "marker-exclude", "marker-published-floor",
-  "marker-late-scan", "marker-late-seed", "marker-credential", "marker-pack-floor", "marker-default-blob"] as const) {
+  "marker-late-scan", "marker-late-seed", "marker-credential", "marker-pack-floor", "marker-default-blob",
+  "admission-unavailable", "admission-blocked", "restore-denial", "historical-revision"] as const) {
   test("production remediation adoption: " + mode, async t => {
     const peel = mode.startsWith("marker");
     const lateSeed = mode === "late-seed" || mode === "marker-late-seed";
     const lateScan = mode === "late-scan-pending" || mode === "marker-late-scan";
     const finding = mode === "historical" || mode === "marker-historical" || mode === "marker-staged";
-    const succeeds = mode === "clean" || mode === "clean-no-pending" || mode === "marker" || mode === "marker-plain";
+    const admissionRefusal = mode === "admission-unavailable" || mode === "admission-blocked" || mode === "restore-denial";
+    const succeeds = mode === "clean" || mode === "clean-no-pending" || mode === "marker" || mode === "marker-plain" ||
+      mode === "historical-revision";
     const claim = gitlabClaim(3747, { claim_generation: 2, session_id: "predecessor-session" });
     const branch = "agent/issue-3747";
     const attemptId = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0123456789abcdef");
@@ -229,6 +232,30 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       teardownTestDeps: portableTeardownTestDeps, recoveryRetryMs: 1, authority });
     const endSource = authority ? t.mock.method(authority, "endSourceUse") : undefined;
     const publication = t.mock.method(runner as any, "publishFlightSource");
+    let retained = false, captured = false, admissionQueries = 0, unavailableQueries = 0;
+    let capturedRestrictions: unknown;
+    let restoreDenial: string | undefined;
+    const recover = (runner as any).recoverRetainedClaim.bind(runner);
+    t.mock.method(runner as any, "recoverRetainedClaim", async (...args: any[]) => {
+      if (mode === "historical-revision") args[1].remediationRestrictions = { roots: [], denialRevision: 7 };
+      retained = true;
+      try { return await recover(...args); } finally { retained = false; }
+    });
+    const facts = cache.readRemediationRestrictionFacts.bind(cache);
+    t.mock.method(cache, "readRemediationRestrictionFacts", async (...args: Parameters<typeof facts>) => {
+      const result = await facts(...args);
+      if (retained && captured) admissionQueries++;
+      if (retained && mode === "admission-unavailable") {
+        unavailableQueries++;
+        throw new Error("custody facts temporarily unavailable");
+      }
+      if (retained && mode === "admission-blocked") {
+        unavailableQueries++;
+        // Defensive custody-only input: blocked must deny even if enrollment is false.
+        return { ...result, enrolled: false, blocked: true };
+      }
+      return result;
+    });
     if (mode === "marker-credential") client.protocolFeatures = ["claim_generation_fence"];
     api.setOwnershipStatus(claim.run_id, "running", 2);
     const latch = () => (runner as any).latchRemediationFindings(flight, bare, branch, [{ commit: q }]);
@@ -241,7 +268,10 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
         defaultIdentity: { ref: "refs/remotes/origin/main", sha: base },
       }, [q, x, s], s);
       args[5] = mode === "marker-plain" ? s : coverage.sha; args[6] = s;
-      return capture(...args);
+      const result = await capture(...args);
+      captured = true;
+      if (admissionRefusal) capturedRestrictions = structuredClone(read().remediationRecovery);
+      return result;
     });
     const custodyModel = custodyFixture(t, claim.run_id);
     const accounting = custodyModel.snapshot;
@@ -261,7 +291,7 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
       .filter(n => /discard.*(?:custody|recovery|hold)|(?:custody|recovery|hold).*discard/i.test(n)), []);
     const requests = custodyModel.requests;
     const prepare = cache.prepareRecoverySuccessor.bind(cache);
-    t.mock.method(cache, "prepareRecoverySuccessor", async (...args: Parameters<typeof prepare>) => {
+    const prepareCalls = t.mock.method(cache, "prepareRecoverySuccessor", async (...args: Parameters<typeof prepare>) => {
       const original = args[6]!.admitRemediationSource!;
       args[6] = { ...args[6], admitRemediationSource: async input => {
         callbacks++; underB = true;
@@ -331,7 +361,14 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
               [{ commit: mode === "missing-pending" ? x : q }]);
         else assert.equal(f.remediationRestrictions.pending, undefined);
       }
-      return restore(f);
+      const result = await restore(f);
+      if (mode === "restore-denial" && retained && captured && restoreDenial === undefined) {
+        const faulty = t.mock.method(cache, "readRemediationRestrictionFacts", (...args: Parameters<typeof facts>) =>
+          facts(args[0], args[1], args[2], undefined, { readback: async () => "different" }));
+        try { restoreDenial = (await (runner as any).bootstrapRemediationRestrictions(f)).kind; }
+        finally { faulty.mock.restore(); }
+      }
+      return result;
     });
     // Trusted scanner stub: Git range resolution, history and adoption remain real.
     t.mock.method(cache, "secretScanCheckpointRange", async (_bare: string, range: CheckpointRange) => {
@@ -392,7 +429,29 @@ for (const mode of ["clean", "clean-no-pending", "untrusted", "unknown", "exclud
     try {
       await runner.execute(claim);
       if (proofErrors.length) throw new AggregateError(proofErrors, "remediation adoption proof failed");
+      if (admissionRefusal) {
+        assert.equal(captured, true, "private capture completes despite custody-only facts");
+        assert.equal(models, 0, "unconfirmed facts grant no model admission");
+        assert.equal(prepareCalls.mock.callCount(), 0, "refuse before Git can persist any successor");
+        assert.equal(read().recovery.successor, undefined);
+        assert.notEqual(read().recovery.stage, "ready-for-model");
+        assert.equal(read().clonePath, source.clonePath);
+        assert.equal(read().attemptId, source.attemptId);
+        assert.deepEqual(read().remediationRecovery, capturedRestrictions, "the captured predecessor evidence is retained");
+        assert.ok(fs.existsSync(clone.path));
+        const retainedPins = command(bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-owed/").split("\n");
+        for (const pin of pins.split("\n")) assert.ok(retainedPins.includes(pin));
+        if (mode === "restore-denial") assert.equal(restoreDenial, "unavailable");
+        else assert.ok(unavailableQueries > 0, "preservation consumed the unavailable or blocked facts");
+        assert.equal(admissionQueries, 1, "admission consumes one additional fresh custody read");
+        assert.equal(mutations[2]!.mock.callCount(), 0, "no custody release");
+        assert.equal(mutations[4]!.mock.callCount(), 0, "no hold settlement");
+        return;
+      }
       assert.equal(models, succeeds ? 1 : 0, JSON.stringify({ states: api.states, logs }));
+      if (mode === "historical-revision") {
+        assert.equal(flight.remediationRestrictions.denialRevision, 7, "fresh proof never resets historical denials");
+      }
       if (callbackError) throw callbackError;
       assert.equal(callbacks, mode === "missing-pending" || mode === "missing-RR" ? 0 : 1, JSON.stringify({ states: api.states, logs }));
       if (callbacks) assert.equal(scans, 1);
