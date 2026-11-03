@@ -1886,6 +1886,16 @@ WHERE runs.id = (SELECT id FROM forge_admitted)
   AND runs.claim_generation = (SELECT claim_generation FROM forge_admitted)
 RETURNING runs.*;
 
+-- name: ListHealthCustodyCandidateOwners :many
+-- Raw open holds bound the discounted admission count from above. This is only
+-- a health-pass prefilter, never claim or reconciliation authority. Owners at the
+-- bound still need the exact per-run admission and continuation-exemption read.
+SELECT h.user_id
+FROM recovery_custody_holds h
+WHERE h.user_id = ANY(@owner_ids::uuid[]) AND h.state = 'open'
+GROUP BY h.user_id
+HAVING count(*) >= @custody_hold_limit::int AND @custody_hold_limit::int > 0;
+
 -- name: GetCustodyAdmissionForRun :one
 -- Issue #1751 / ADR-1751: the per-run custody-admission facts the health resolver reads so
 -- its reasonCustodyLimit pill agrees with ClaimRun. open_holds is total open custody;

@@ -422,6 +422,45 @@ type healthThresholds struct {
 	// without the read can never be mistaken for a configured or disabled limit (#3150).
 	custodyLimit   int32
 	custodyLimitOK bool
+	// nil means unobserved/failed: retain the exact per-run read. A non-nil
+	// set is fresh for this health pass only; omitted owners are below the raw
+	// open-hold bound and cannot be blocked by discounted admission.
+	custodyOwners map[uuid.UUID]struct{}
+}
+
+type healthCustodyOwnerReader interface {
+	ListHealthCustodyCandidateOwners(context.Context, store.ListHealthCustodyCandidateOwnersParams) ([]uuid.UUID, error)
+}
+
+func (s *Service) healthCustodyOwners(ctx context.Context, runs []store.ListActiveRunsForHealthRow, th healthThresholds) map[uuid.UUID]struct{} {
+	reader, ok := s.q.(healthCustodyOwnerReader)
+	if !ok || !th.custodyLimitOK || th.custodyLimit <= 0 {
+		return nil
+	}
+	seen := make(map[uuid.UUID]struct{})
+	var owners []uuid.UUID
+	for _, r := range runs {
+		if r.Status != "queued" || r.Kind == "cross_check" {
+			continue
+		}
+		if _, exists := seen[r.UserID]; !exists {
+			seen[r.UserID] = struct{}{}
+			owners = append(owners, r.UserID)
+		}
+	}
+	if len(owners) == 0 {
+		return nil
+	}
+	rows, err := reader.ListHealthCustodyCandidateOwners(ctx, store.ListHealthCustodyCandidateOwnersParams{OwnerIds: owners, CustodyHoldLimit: th.custodyLimit})
+	if err != nil {
+		slog.Error("health: prefilter custody owners", "error", err)
+		return nil
+	}
+	candidates := make(map[uuid.UUID]struct{}, len(rows))
+	for _, owner := range rows {
+		candidates[owner] = struct{}{}
+	}
+	return candidates
 }
 
 // detectRunHealth runs one health pass over every active run and returns the number
@@ -449,6 +488,7 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		return 0
 	}
 	th := s.healthThresholds(ctx)
+	th.custodyOwners = s.healthCustodyOwners(ctx, runs, th)
 	cooldown := healthDur(s.healthSettings.HealthNudgeCooldownSeconds(ctx))
 
 	var changed int64
@@ -1865,6 +1905,11 @@ func (s *Service) queuedCustodyReason(ctx context.Context, now time.Time, r stor
 	if r.Kind != "cross_check" {
 		if !th.custodyLimitOK {
 			return reasonCustodyLimitUnavailable
+		}
+		if th.custodyOwners != nil {
+			if _, possible := th.custodyOwners[r.UserID]; !possible {
+				return ""
+			}
 		}
 		adm, cerr := s.q.GetCustodyAdmissionForRun(ctx, store.GetCustodyAdmissionForRunParams{
 			UserID: r.UserID, RunID: r.ID, CustodyHoldLimit: th.custodyLimit,
