@@ -38,6 +38,23 @@ function bounded(e: JudgeEvidence) {
   for (const line of e.sections.prose.split("\n")) assert.ok(line.length <= 800);
 }
 
+test("fetch completion alone leaves terminal delivery unknown", () => {
+  const f = fixture();
+  f.send("text", { text: "work observed without a terminal outcome" });
+  for (const complete of [true, false]) {
+    const e = f.reducer.render({ pages: 1, complete, reason: complete ? "short page" : "cap reached" });
+    assert.match(e.sections.coverage, /final delivery unknown/);
+    assert.match(e.sections.coverage, /Fetch completion is not terminal-delivery evidence/);
+    if (complete) assert.match(e.sections.coverage, /fetch complete\./);
+    bounded(e);
+  }
+  f.send("text", { text: "retained terminal delivery claim marker" });
+  const withClaim = f.reducer.render({ pages: 1, complete: true, reason: "short page" });
+  assert.match(withClaim.sections.prose, /retained terminal delivery claim marker/);
+  assert.match(withClaim.sections.coverage, /without retained terminal evidence/);
+  bounded(withClaim);
+});
+
 test("bounded metadata copies release large source-string backing stores", () => {
   const moduleUrl = new URL("../src/judge-evidence.ts", import.meta.url).href;
   const script = `

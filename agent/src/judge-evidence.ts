@@ -450,7 +450,8 @@ export class JudgeEvidenceReducer {
       + " Anonymous result class is unknown: signal, ordinary or delegation; content does not classify it."
       + "\nLedger fields/rows may be explicitly truncated; omitted rows are counted."
       + "\nLedger rows=" + this.rows.length + " omittedRows=" + counts.omittedRows
-      + "\nTail is latest fetched eligible evidence; " + (meta?.complete ? "fetch complete." : "final delivery unknown."), 2000);
+      + "\nTail is latest fetched eligible evidence; " + (meta?.complete ? "fetch complete." : "fetch end unknown.")
+      + " Fetch completion is not terminal-delivery evidence; final delivery unknown without retained terminal evidence.", 2000);
     const prose = [...observations].sort(([a], [b]) => a - b).map(([, s]) => s).join("\n");
     return { sections: { coverage, ledger, aggregates, prose }, counts,
       metrics: { pending: this.pending.size, history: this.history.size, historySaturated: this.history.size === 256,

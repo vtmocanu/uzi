@@ -218,8 +218,9 @@ leaves the end unknown, even if the run had exactly 100,000 messages: there
 is no extra probe. The latest fetched tail is not proof of terminal delivery;
 a missing terminal outcome is disclosed as unknown.
 
-The judge's prompt and evidence fit within a fixed envelope of at most
-120,000 characters. Coverage, a factual delegation ledger and raw aggregates
+The judge's user prompt, including its evidence, fits within a fixed envelope
+of at most 120,000 characters. The fixed system instructions are separate
+from this user-prompt limit. Coverage, a factual delegation ledger and raw aggregates
 have separate budgets before the event-aware prose samples: opening and
 latest fetched eligible events, middle plans and revisions, owner steering,
 failed delegation starts with results, available review reports, and recorded
