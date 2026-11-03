@@ -459,7 +459,10 @@ replacing the pod keeps the run clones (a reschedule to another node also
 depends on the data StorageClass supporting reattach, which has not been
 verified); manual deletion of the data PVC or ephemeral-worker teardown
 still deletes them. Automatic Docker pressure recycle preserves that PVC
-with the fixed controller. A rootless dind
+with the fixed controller. This guarantee covers the migrated layout only: on a
+pod still on the old layout, `/data/runner` is a pod-lifetime `emptyDir`, so
+any pod replacement, including an eligible explicit Nix-volume recycle, deletes
+its checkouts even though the data PVC is kept. A rootless dind
 container cannot write into worker-created run checkouts through bind
 mounts by default; that predates this layout in both uid modes. In single-uid
 mode it also lost writes at the `/data/runner` and `TMPDIR` roots (owner
