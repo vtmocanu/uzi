@@ -53,4 +53,29 @@ describe("mock template Codex pin contract", () => {
       codex_model: null, differs_from_builtin: false, origin: "embedded",
     });
   });
+
+  it("seeds Codex-only and dual-pin non-builtin examples", async () => {
+    const { api } = await fresh();
+    const { templates } = await api.listAgentTemplates();
+    expect(templates.find((t) => t.id === "t-migration-writer")).toMatchObject({
+      model: null, codex_model: "gpt-6-luna", scope: "global", differs_from_builtin: false,
+    });
+    expect(templates.find((t) => t.id === "t-my-coder")).toMatchObject({
+      model: "sonnet", codex_model: "gpt-6-sol", scope: "user", differs_from_builtin: false,
+    });
+  });
+
+  it.each([
+    { model: "gpt-6-luna", codex_model: null },
+    { model: null, codex_model: "sonnet" },
+    { model: null, codex_model: "gpt-custom" },
+  ])("rejects wrong-family create and update without mutating stored content: %j", async (pins) => {
+    const { api } = await fresh();
+    const content = { description: "d", tools: null, prompt_body: "b", ...pins };
+    await expect(api.createAgentTemplate({ name: "invalid-pin", ...content })).rejects.toMatchObject({ status: 400 });
+    const before = (await api.getAgentTemplate("t-coder")).template;
+    await expect(api.updateAgentTemplate("t-coder", content)).rejects.toMatchObject({ status: 400 });
+    expect((await api.getAgentTemplate("t-coder")).template).toEqual(before);
+  });
+
 });

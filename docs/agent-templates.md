@@ -62,11 +62,16 @@ template's prompt only tunes its persona and workflow; the primary-directive
 guardrails (never touch `main`, no `git push`, the plan gate) are enforced by
 the worker regardless.
 
-An empty Claude pin keeps the **Default · …** label in the list, detail page,
-editor, builtin diff and agent-source review: `Default · SDK/account default
-(built-in)` for the lead (or orchestrator), and `Default · lead's model` for
-subagents. The lead editor notes that your worker model (**Settings → Run
-defaults**) overrides the template's Claude pin for your runs.
+The list and detail page name both harnesses, for example **Claude: sonnet ·
+Codex: gpt-6-sol**. Empty pins use the same honest **Default · …** labels in the
+editor, builtin diff and agent-source review:
+
+- Subagents: **Default · lead's model** for either harness.
+- Lead (or orchestrator), Claude: **Default · SDK/account default (built-in)**.
+- Lead (or orchestrator), Codex: **Default · built-in (gpt-6.1-sol)**.
+
+Your worker model (**Settings → Run defaults**) takes precedence over the
+matching lead-template pin for your runs.
 
 ## Model pins
 
@@ -107,9 +112,10 @@ On upgrade, the migration moves recognized Codex role IDs already stored in
 `model` into `codex_model` and clears `model`. Surrounding whitespace is trimmed
 when recognizing those IDs; other stored model values are left unchanged.
 
-The editor's two model selects remain pending M4 of #3249; the existing
-list and **Default · …** labels are unchanged pending separate UI work.
-See the [approved PRD](../prds/3249-per-harness-template-pins.md).
+Use **Claude model** and **Codex model** to edit the pins independently.
+Claude's **Other (custom model ID)…** option accepts custom IDs; Codex offers
+only the five role IDs above. The editor warns and blocks Save for a pin in
+the wrong family. See the [approved PRD](../prds/3249-per-harness-template-pins.md).
 
 The builtin `fact-checker` also gets six `mcp__forge__*` read tools, so it
 alone can read the run's own forge (issues, merge requests, pipelines, label
@@ -202,9 +208,12 @@ with a `shadowed` badge). Delete and recreate it under a different name to use i
 
 1. Open **Agents**, click **New agent** (or a template's name to edit).
 2. Pick the scope (admins only — yours is always **Mine**), then set the
-   name (kebab-case, immutable after creation), description, and prompt
-   body; optionally override the model or restrict its tools.
-3. The detail page shows a live preview of the rendered Markdown.
+   name (kebab-case, immutable after creation), description, and prompt body.
+3. Optionally set **Claude model** and **Codex model**, or restrict tools.
+   Leave either harness on **Default** so a subagent follows the lead on that
+   harness. **Apply model also to agents** on a schedule overrides these pins.
+4. The live Markdown preview exports the Claude definition, including its
+   Claude pin. The Codex pin is saved separately.
 
 ![Editing an agent template, with the rendered Markdown preview alongside](img/agent-templates-editor.png)
 

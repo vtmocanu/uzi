@@ -74,6 +74,8 @@ Tracked as GitLab issue vtmocanu/uzi#2; PRD at `prds/done/2-forge-integration-ka
 Tracked as GitLab issue vtmocanu/uzi#3; PRD at `prds/done/3-agent-templates-anthropic-tokens.md`.
 
 - Agent templates stored in the DB, editable via the UI (the agents themselves sit with the code).
+- Every template stores a Claude pin and a Codex pin, validated by family and projected for the run's actual frozen harness. Claude allows custom IDs except Codex role IDs; Codex pins use the closed five-role vocabulary, including `gpt-6-luna`. (AI-synced 2026-11-03)
+- An empty subagent pin follows the resolved lead model; editing either builtin pin customizes the template, and Reset restores both shipped pins. The editor, list, detail, drift and source approval show both pins. A schedule's Apply model also to agents overrides subagent pins. (AI-synced 2026-11-03)
 - Admin-only template writes; all authenticated users can read/preview. [AI-proposed, user-confirmed 2026-07-03]
 - Each user stores their own Anthropic OAuth token via the webui, encrypted in the DB.
 - A doc explaining how to obtain the token.
@@ -194,7 +196,8 @@ Tracked as GitLab issue vtmocanu/uzi#17; PRD at `prds/done/17-lead-template-and-
 - Builtin templates are the single source of truth; `.claude/agents/` is the dev team's own roster only. Decouples the former 1:1 mirror. [user, 2026-07-05, supersedes the earlier "both dirs" choice]
 - Per-user worker-model defaults are retained separately for Claude and Codex and saved together with the default harness in Settings. (AI-synced 2026-09-23)
 - Both worker-model defaults offer curated models plus a custom model ID; Codex custom IDs apply to the worker root and the dedicated Plan cross-check checker pin, not schedule or role pins. Cross-check pins also configure the Claude checker of a Codex lead. (AI-synced 2026-10-08)
-- Precedence: the user's default for the run's selected harness wins over the lead template's model (unset = inherit the lead template's model, opus by default). (AI-synced 2026-09-23)
+- Root model precedence: schedule override → user's lane for the run's actual harness → selected lead template's matching pin → SDK/account default (Claude) or gpt-6.1-sol (Codex). The shipped lead's Claude pin is opus; its Codex pin is empty. (AI-synced 2026-11-03)
+- Both harnesses use the first delivered own template named `lead` or `orchestrator`, case-insensitively; every own lead-shaped template is withheld from subagents. An unpinned checker also uses its matching lead pin after its family lane, while checker effort remains independent. (AI-synced 2026-11-03)
 - The lead overlaps the integration gate with the read-only review wave by default, but after review invalidates a candidate with a costly full gate it finishes repair reviews and focused checks before repeating the gate, and triages a failed gate (narrowest reproducer on candidate and base) before rerunning; prompt-level guidance, still blocking. (AI-synced 2026-10-09)
 - On a memory-guard Claude run, guarded shell calls are serialized by the CLI, so the lead keeps that overlap by delegating the gate to one gate owner in the review Agent batch (worktree frozen until it reports; the delegated run is the gate, still blocking; lead runs it after the wave when no suitable subagent exists). The sequencing policy itself is unchanged, and the guarded tool never declares readOnlyHint. (AI-synced 2026-10-31, #3722)
 - Sequence this PRD before PRD #16 so #16 inherits the decoupled-builtins convention.
@@ -372,7 +375,7 @@ Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/done/37-run-agent-selectio
 - The repo roster may also come from `.codex/agents/*.toml`; the run's native folder is preferred, never merged (issue #2085). (AI-synced 2026-10-02)
 - Show whether repo agents were detected and which ones. [user 2026-07-10]
 - Default to the detected repo agents; if the user does not want them, they can choose their own templates instead. [user 2026-07-10]
-- Repo agents run with the tools and model their files declare (honored as they would be under Claude Code), still subject to uzi's guardrails. [user 2026-07-10; a review-round proposal to deny WebFetch/WebSearch and clamp the model to aliases was rejected by the user the same day — `Agent`/nested-spawn and the async-deferral tools stay denied]
+- Repo agents retain their declared tools under uzi's guardrails. A well-formed Markdown `model:` maps to Codex only for a supported Codex role ID, otherwise to Claude (custom Claude IDs remain supported); the other harness silently follows the lead. TOML agents have no pin, and repo lead names remain ordinary subagents. This refines the original broad model wording under G3/G4; it does not impose alias-only Claude models. [user 2026-07-10; the proposal to deny WebFetch/WebSearch and clamp models to aliases was rejected — `Agent`/nested-spawn and async-deferral tools stay denied] (AI-synced 2026-11-03)
 - Codex 0.159.3 permits native nonblocking async questions and read-only UTC on root start/resume and worker-created children; these grant no worker effect or workflow signal. The historical Claude async-deferral denial above remains. (AI-synced 2026-10-04) [AI-synced, #1566]
 - Either/or source with per-agent exclusions; no mixing the two sources in one run. [user 2026-07-10]
 - Autopilot runs apply the default automatically (repo agents if detected, else the user's templates) and record which roster they used, with no human interaction. [user 2026-07-10]

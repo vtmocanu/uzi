@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { convertChangesToXML, diffWords } from "diff";
 import { AgentDetail } from "./AgentDetail";
@@ -113,8 +113,132 @@ describe("AgentDetail read-only model label (#3255)", () => {
 
     renderPage();
 
-    expect(await screen.findByText("Default · lead's model")).toBeTruthy();
+    expect(await screen.findByText("Claude: Default · lead's model · Codex: Default · lead's model")).toBeTruthy();
     expect(screen.queryByText(/^inherit$/i)).toBeNull();
+  });
+});
+
+describe("AgentDetail real editor model pins", () => {
+  it.each([
+    ["gpt-6-luna", "claude-private-v2"],
+    ["gpt-6-luna", null],
+    [null, "claude-private-v2"],
+    [null, null],
+  ])("saves both independent pins Codex=%j Claude=%j through the page API", async (codexModel, model) => {
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({
+      template: row({ model: "sonnet", codex_model: "gpt-6-sol" }),
+    });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+    mockApi.updateAgentTemplate.mockResolvedValue({
+      template: row({ model, codex_model: codexModel, updated_at: "2026-01-03T00:00:00Z" }),
+    });
+    renderPage();
+    const claude = await screen.findByRole("combobox", { name: "Claude model" });
+    const codex = screen.getByRole("combobox", { name: "Codex model" });
+    expect((claude as HTMLSelectElement).value).toBe("sonnet");
+    expect((codex as HTMLSelectElement).value).toBe("gpt-6-sol");
+    fireEvent.change(claude, { target: { value: "custom" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Custom model ID" }), {
+      target: { value: "claude-private-v2" },
+    });
+    fireEvent.change(codex, { target: { value: "gpt-6-luna" } });
+    if (model === null) fireEvent.change(claude, { target: { value: "inherit" } });
+    if (codexModel === null) fireEvent.change(codex, { target: { value: "inherit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect(await screen.findByText("Saved.")).toBeTruthy();
+    expect(mockApi.updateAgentTemplate).toHaveBeenCalledExactlyOnceWith("t-coder", {
+      description: SHIPPED.description, model, codex_model: codexModel,
+      tools: SHIPPED.tools, prompt_body: SHIPPED.prompt_body,
+    });
+    expect((screen.getByRole("combobox", { name: "Claude model" }) as HTMLSelectElement).value).toBe(model === null ? "inherit" : "custom");
+    expect((screen.getByRole("combobox", { name: "Codex model" }) as HTMLSelectElement).value).toBe(codexModel ?? "inherit");
+    expect(mockApi.getAgentTemplate).toHaveBeenCalledTimes(1);
+  });
+
+  it("diffs Codex-only drift and compares live values before restoring both shipped pins", async () => {
+    const shipped = { ...SHIPPED, model: "sonnet", codex_model: "gpt-6.1-sol" };
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({
+      template: row({ model: "sonnet", codex_model: "gpt-6-luna", differs_from_builtin: true }),
+    });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: shipped });
+    mockApi.resetAgentTemplate.mockResolvedValue({
+      template: row({ ...shipped, updated_at: "2026-01-03T00:00:00Z" }),
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderPage();
+    const claude = await screen.findByRole("combobox", { name: "Claude model" });
+    const codex = screen.getByRole("combobox", { name: "Codex model" });
+    const diff = screen.getByText("Codex model", { selector: "span" }).parentElement!;
+    expect(diff.textContent).toBe("Codex modelgpt-6.1-sol → gpt-6-luna");
+
+    // The stored row drifts only in Codex; this unsaved edit also changes Claude.
+    fireEvent.change(claude, { target: { value: "haiku" } });
+    fireEvent.change(codex, { target: { value: "inherit" } });
+    expect(screen.getByText(/— model, codex model\./)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default" }));
+    expect(confirm).toHaveBeenLastCalledWith(
+      'Reset "coder" to the definition shipped in this release?\n\nThis discards the current model, codex model and cannot be undone.',
+    );
+    expect(mockApi.resetAgentTemplate).not.toHaveBeenCalled();
+
+    // Returning Claude to shipped removes it from the LIVE warning.
+    fireEvent.change(claude, { target: { value: "sonnet" } });
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default" }));
+    expect(confirm).toHaveBeenLastCalledWith(
+      'Reset "coder" to the definition shipped in this release?\n\nThis discards the current codex model and cannot be undone.',
+    );
+    fireEvent.change(claude, { target: { value: "inherit" } });
+    confirm.mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: "Reset to default" }));
+
+    expect(await screen.findByText("Reset to the shipped definition.")).toBeTruthy();
+    expect(mockApi.resetAgentTemplate).toHaveBeenCalledExactlyOnceWith("t-coder");
+    expect((screen.getByRole("combobox", { name: "Claude model" }) as HTMLSelectElement).value).toBe("sonnet");
+    expect((screen.getByRole("combobox", { name: "Codex model" }) as HTMLSelectElement).value).toBe("gpt-6.1-sol");
+    expect(screen.getByText("Matches the shipped definition.")).toBeTruthy();
+    expect(screen.queryByText("differs from shipped")).toBeNull();
+    expect(mockApi.updateAgentTemplate).not.toHaveBeenCalled();
+    expect(mockApi.getAgentTemplate).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["gpt-6-luna", null, "Claude template model must not be a Codex role model ID."],
+    [null, "sonnet", "Codex template model must be a supported Codex role model ID."],
+  ])("blocks an invalid stored pin Claude=%j Codex=%j even on programmatic submit", async (model, codexModel, warning) => {
+    mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({ template: row({ model, codex_model: codexModel }) });
+    mockApi.getBuiltinAgentTemplate.mockResolvedValue({ builtin: SHIPPED });
+    const { container } = renderPage();
+    expect(await screen.findByText(warning)).toBeTruthy();
+    const submit = screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    fireEvent.click(submit);
+    fireEvent.submit(container.querySelector("form")!);
+    expect(mockApi.updateAgentTemplate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Saved.")).toBeNull();
+    // Unsupported Codex values stay visible, rather than masquerading as Default.
+    const picker = screen.getByRole("combobox", { name: model ? "Claude model" : "Codex model" });
+    expect((picker as HTMLSelectElement).value).toBe("custom");
+    if (codexModel) expect(within(picker).getByRole("option", { name: codexModel })).toBeTruthy();
+  });
+});
+
+describe("AgentDetail read-only pin labels match the Agents list", () => {
+  it.each([
+    { name: "coder", model: null, codex_model: "gpt-6-luna", label: "Claude: Default · lead's model · Codex: gpt-6-luna" },
+    { name: "coder", model: "sonnet", codex_model: "gpt-6-sol", label: "Claude: sonnet · Codex: gpt-6-sol" },
+    { name: "lead", model: null, codex_model: null, label: "Claude: Default · SDK/account default (built-in) · Codex: Default · built-in (gpt-6.1-sol)" },
+  ])("renders $label", async ({ label, ...pins }) => {
+    mockUseAuth.mockReturnValue({ user: { ...ADMIN, is_admin: false } } as ReturnType<typeof useAuth>);
+    mockApi.getAgentTemplate.mockResolvedValue({ template: row(pins) });
+    renderPage();
+    expect(await screen.findByText(label)).toBeTruthy();
+    expect(screen.queryByRole("combobox")).toBeNull();
+    expect(mockApi.getBuiltinAgentTemplate).not.toHaveBeenCalled();
+    expect(mockApi.updateAgentTemplate).not.toHaveBeenCalled();
   });
 });
 
@@ -367,7 +491,7 @@ describe("AgentDetail builtin drift signal (issue #201 M4a)", () => {
   });
 
   it("names only the columns that actually differ", async () => {
-    // A confirmation that always listed all four would be as uninformative as a
+    // A confirmation that always listed every content column would be as uninformative as a
     // generic one, and would misstate what is at stake.
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     mockUseAuth.mockReturnValue({ user: ADMIN } as ReturnType<typeof useAuth>);
@@ -381,6 +505,7 @@ describe("AgentDetail builtin drift signal (issue #201 M4a)", () => {
 
     const message = confirm.mock.calls[0][0] as string;
     expect(message).toContain("model");
+    expect(message).not.toContain("codex model");
     expect(message).not.toContain("prompt body");
     expect(message).not.toContain("description");
     expect(message).not.toContain("tools");

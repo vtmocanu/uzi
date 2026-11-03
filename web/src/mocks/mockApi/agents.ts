@@ -12,6 +12,7 @@ import type {
   User,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
+import { templateModelFieldWarning } from "../../lib/agentTemplates";
 import { bodyError, descriptionError, SKILL_NAME_RE } from "../../lib/skills";
 import { mockAllocations, mockShippedBuiltins, mockSkills, mockTemplates } from "../data";
 import { delay, requireSession } from "./shared";
@@ -184,12 +185,15 @@ export const agentsApi = {
     if (clash) {
       throw new ApiError(409, "a template with this name already exists");
     }
+    const pinWarning = templateModelFieldWarning(input.model ?? "", "claude") ||
+      templateModelFieldWarning(input.codex_model ?? "", "codex");
+    if (pinWarning) throw new ApiError(400, pinWarning);
     const now = new Date().toISOString();
     const t: AgentTemplate = {
       id: `t-custom-${++templateCounter}`,
       name: input.name,
       description: input.description,
-      model: input.model,
+      model: input.model?.trim() || null,
       codex_model: input.codex_model?.trim() || null,
       tools: input.tools,
       prompt_body: input.prompt_body,
@@ -238,13 +242,17 @@ export const agentsApi = {
   updateAgentTemplate: async (id: string, input: AgentTemplateInput) => {
     const t = templates.find((x) => x.id === id);
     if (!t) throw new ApiError(404, "template not found");
+    const me = requireSession();
+    const pinWarning = templateModelFieldWarning(input.model ?? "", "claude") ||
+      templateModelFieldWarning(input.codex_model ?? "", "codex");
+    if (pinWarning) throw new ApiError(400, pinWarning);
     t.description = input.description;
-    t.model = input.model;
+    t.model = input.model?.trim() || null;
     // Old clients omit the pin; merge it before comparing with the shipped content.
     if (input.codex_model !== undefined) t.codex_model = input.codex_model?.trim() || null;
     t.tools = input.tools;
     t.prompt_body = input.prompt_body;
-    t.updated_by = requireSession().email;
+    t.updated_by = me.email;
     t.updated_at = new Date().toISOString();
     return delay({ template: withDrift(t) });
   },

@@ -110,10 +110,23 @@ describe("Agents page unset model label (#3255)", () => {
     });
     render(<MemoryRouter><Agents /></MemoryRouter>);
     const leadRow = (await screen.findByRole("link", { name: "lead" })).closest("tr")!;
-    expect(within(leadRow).getByText("Default · SDK/account default (built-in)")).toBeTruthy();
+    expect(within(leadRow).getByText("Claude: Default · SDK/account default (built-in) · Codex: Default · built-in (gpt-6.1-sol)")).toBeTruthy();
     const coderRow = screen.getByRole("link", { name: "coder" }).closest("tr")!;
-    expect(within(coderRow).getByText("Default · lead's model")).toBeTruthy();
+    expect(within(coderRow).getByText("Claude: Default · lead's model · Codex: Default · lead's model")).toBeTruthy();
     expect(screen.queryByText("inherit")).toBeNull();
+  });
+});
+
+describe("Agents page per-harness pins", () => {
+  it.each([
+    { model: "sonnet", codex_model: "gpt-6-sol", label: "Claude: sonnet · Codex: gpt-6-sol" },
+    { model: null, codex_model: "gpt-6-luna", label: "Claude: Default · lead's model · Codex: gpt-6-luna" },
+  ])("shows both stored pins: $label", async ({ model, codex_model, label }) => {
+    mockUseAuth.mockReturnValue({ user: MEMBER } as ReturnType<typeof useAuth>);
+    mockApi.listAgentTemplates.mockResolvedValue({ templates: [tmpl({ id: "b-coder", name: "coder", scope: "builtin", model, codex_model })] });
+    mockApi.getTemplateAllocations.mockResolvedValue({ templates: [] });
+    render(<MemoryRouter><Agents /></MemoryRouter>);
+    expect(await screen.findByText(label)).toBeTruthy();
   });
 });
 
