@@ -33,16 +33,16 @@ func (f *queuedSettingsFault) Begin(ctx context.Context) (pgx.Tx, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &queuedSettingsTx{Tx: tx, fault: f}, nil
+	return &queuedCustodySettingsReadFaultTx{Tx: tx, fault: f}, nil
 }
 
-type queuedSettingsTx struct {
+type queuedCustodySettingsReadFaultTx struct {
 	pgx.Tx
 	fault  *queuedSettingsFault
 	nested bool
 }
 
-func (tx *queuedSettingsTx) Begin(ctx context.Context) (pgx.Tx, error) {
+func (tx *queuedCustodySettingsReadFaultTx) Begin(ctx context.Context) (pgx.Tx, error) {
 	f := tx.fault
 	if f.guards != 1 {
 		return nil, errors.New("settings savepoint preceded settings lock")
@@ -55,10 +55,10 @@ func (tx *queuedSettingsTx) Begin(ctx context.Context) (pgx.Tx, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &queuedSettingsTx{Tx: sp, fault: f, nested: true}, nil
+	return &queuedCustodySettingsReadFaultTx{Tx: sp, fault: f, nested: true}, nil
 }
 
-func (tx *queuedSettingsTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+func (tx *queuedCustodySettingsReadFaultTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	if sql == "SELECT pg_advisory_xact_lock_shared($1)" && len(args) == 1 && args[0] == store.SettingsMutationLockKey {
 		tx.fault.guards++
 		if tx.fault.mode == "lock" {
@@ -68,7 +68,7 @@ func (tx *queuedSettingsTx) Exec(ctx context.Context, sql string, args ...any) (
 	return tx.Tx.Exec(ctx, sql, args...)
 }
 
-func (tx *queuedSettingsTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+func (tx *queuedCustodySettingsReadFaultTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	if !strings.HasPrefix(sql, "-- name: ListAppSettings ") {
 		return tx.Tx.Query(ctx, sql, args...)
 	}
@@ -96,7 +96,7 @@ func (tx *queuedSettingsTx) Query(ctx context.Context, sql string, args ...any) 
 	}
 }
 
-func (tx *queuedSettingsTx) Rollback(ctx context.Context) error {
+func (tx *queuedCustodySettingsReadFaultTx) Rollback(ctx context.Context) error {
 	if tx.nested {
 		tx.fault.rollbacks++
 	}
@@ -114,7 +114,7 @@ func (tx *queuedSettingsTx) Rollback(ctx context.Context) error {
 	return err
 }
 
-func (tx *queuedSettingsTx) Commit(ctx context.Context) error {
+func (tx *queuedCustodySettingsReadFaultTx) Commit(ctx context.Context) error {
 	if tx.nested && tx.fault.mode == "release" {
 		return tx.fault.managementErr
 	}
