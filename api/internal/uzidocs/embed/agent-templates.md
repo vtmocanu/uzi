@@ -215,7 +215,7 @@ with a `shadowed` badge). Delete and recreate it under a different name to use i
 4. The live Markdown preview exports the Claude definition, including its
    Claude pin. The Codex pin is saved separately.
 
-![Editing an agent template, with the rendered Markdown preview alongside](img/agent-templates-editor.png)
+![Creating an agent template with both harness pins and the Claude Markdown preview](img/agent-templates-editor.png)
 
 Never paste a credential into a description or prompt: uzi rejects anything
 that looks like a real Anthropic token. Credentials belong in
