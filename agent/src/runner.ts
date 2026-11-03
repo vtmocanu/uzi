@@ -20077,7 +20077,7 @@ export class RunRunner {
     let fetched: Extract<TrackingUpdateResult, { kind: "updated" }>;
     try {
       fetched = await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
-        heldCapture ? { signal: heldCapture.signal, timeoutMs: Math.max(1, heldCapture.deadlineAt - Date.now()) } : undefined);
+        heldCapture ? { signal: heldCapture.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, heldCapture.deadlineAt - Date.now())) } : undefined);
       check();
     } catch (e) {
       runLog.warn("recovery: settle transfer fetch-back failed", { error: errMessage(e) });
@@ -22509,7 +22509,7 @@ export class RunRunner {
       await opts.beforeMutation?.();
       const held = opts.heldCapture ?? opts.heldAuthenticated;
       await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
-        held ? { signal: held.signal, timeoutMs: Math.max(1, held.deadlineAt - Date.now()) } : undefined);
+        held ? { signal: held.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, held.deadlineAt - Date.now())) } : undefined);
       await opts.beforeMutation?.();
     } catch (e) {
       if (opts.beforeMutation) throw e;
@@ -23630,7 +23630,7 @@ export class RunRunner {
     try {
       const held = options.heldCapture ?? options.heldAuthenticated;
       await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
-        held ? { signal: held.signal, timeoutMs: Math.max(1, held.deadlineAt - Date.now()) } : undefined);
+        held ? { signal: held.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, held.deadlineAt - Date.now())) } : undefined);
     } catch (e) {
       if (options.heldAuthenticated || options.heldCapture) throw e;
       runLog.warn("completion hold capture: fetch-back failed", { error: errMessage(e) });
