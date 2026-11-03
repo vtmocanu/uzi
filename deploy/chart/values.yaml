@@ -197,8 +197,10 @@ api:
   # Paired with strategy: Recreate below (RollingUpdate's surge would briefly run two).
   replicaCount: 1
   # PRD #837 M4 disk-pressure threshold. The used/total fraction in (0,1] at or above
-  # which the api flags a hosted worker's volume as under disk pressure (default 0.90),
-  # which the controller then drains-then-recycles (workers.diskRecycleEnabled above).
+  # which the api flags a hosted worker's volume as under disk pressure (default 0.90).
+  # Eligible pressure drains/recycles under workers.diskRecycleEnabled below:
+  # plain workers lose nix+data; Docker workers recycle only explicit nix pressure
+  # and preserve /data (#3852). Data-only Docker pressure defers without a new drain.
   # A soft-parsed tuning knob: config.go keeps 0.90 on a bad/empty value.
   #
   # DELIBERATELY DIFFERENT from the web UI's 85% `danger` tone (PRD #837 M2): we act
@@ -583,16 +585,23 @@ workers:
 
   # PRD #837 M4 disk-pressure recycle (self-healing worker disk). When a hosted worker
   # reports disk pressure (a volume at used/total >= the api's diskPressureThreshold
-  # across >=2 fresh heartbeats), the controller drains it and recycles its PVCs.
+  # across >=2 fresh heartbeats), eligible plain workers drain and recycle nix+data
+  # (workspace loss; revisit #3710). Docker workers preserve /data regardless of
+  # custody/layout/ForceRoll/deadline: explicit nix pressure selects Nix only;
+  # causes without nix defer and log disk-recycle-skipped-docker-data before cooldown.
+  # Protection requires the fixed controller (#3852); old controllers can delete data.
+  # Deferral neither requests nor clears drains; existing pressure drains persist
+  # until pressure clears. Full Docker data degrades capacity pending supported reclaim.
   #
   # diskRecycleEnabled: the master toggle over BOTH the M3 size-drift arm and this M4
   #   pressure arm. Defaults true (Decision D9 — self-heal on by default over recorded
-  #   reviewer dissent; the drain-first + cooldown + ephemeral-exclusion guards make it
-  #   safe). Set false to observe pressure without any automated teardown. Always sent
+  #   reviewer dissent). Gates Nix size drift, eligible pressure recycle and DinD
+  #   maintenance/pruning; false cancels requested/ready maintenance with
+  #   recycle_disabled, while a safe operation already stopping finishes. Always sent
   #   explicitly (it is not `with`-gated), so an explicit false is honoured.
   #   Also gates the docker-tier DinD build-cache prune (issue #1759, ADR-1759): the
   #   same flag renders UZI_DIND_PRUNE_ENABLED into docker workers, so flipping it
-  #   rolls every non-ephemeral docker worker's pod, not only the /nix+/data recycle.
+  #   rolls non-ephemeral docker worker pods; it is not just a controller-side switch.
   diskRecycleEnabled: true
   # diskRecycleCooldown: the PVC-age thrash guard (Decision D6). A worker back at pressure
   #   within this window is a CAPACITY problem (working set exceeds nixSize) — it is
