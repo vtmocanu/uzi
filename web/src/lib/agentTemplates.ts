@@ -4,7 +4,8 @@
 // /rendered endpoint) and the hard secret guardrail; these mirror that behavior
 // for live UI feedback only.
 
-import type { AgentTemplate, AgentTemplateScope } from "./api";
+import type { AgentTemplate, AgentTemplateScope, Harness } from "./api";
+import { DEFAULT_CODEX_MODEL } from "../components/ModelSelect";
 
 // TEMPLATE_SCOPE_LABEL / templateScopeBadgeTone mirror the skills scope helpers
 // (lib/skills.ts) so agent templates and skills badge scope identically (PRD #18
@@ -202,10 +203,13 @@ export function isLeadTemplateName(name: string): boolean {
   return /^(lead|orchestrator)$/i.test(name);
 }
 
-// templateModelDefaultLabel names what an unset template model resolves to: the lead
-// falls through to the SDK/account default, any other template to the lead's model.
-export function templateModelDefaultLabel(name: string): string {
-  return isLeadTemplateName(name) ? "Default · SDK/account default (built-in)" : "Default · lead's model";
+// templateModelDefaultLabel names what an unset pin resolves to: the lead uses
+// its harness's built-in default, any other template follows the lead's model.
+export function templateModelDefaultLabel(name: string, harness: Harness = "claude"): string {
+  if (!isLeadTemplateName(name)) return "Default · lead's model";
+  return harness === "codex"
+    ? `Default · built-in (${DEFAULT_CODEX_MODEL})`
+    : "Default · SDK/account default (built-in)";
 }
 
 // looseSecretWarning returns a warning string if the text looks like it might

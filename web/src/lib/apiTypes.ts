@@ -1376,7 +1376,11 @@ export interface AgentSourceStagedRole {
   ok: boolean;
   reason?: string;
   description?: string;
+  // Raw source model remains optional for compatibility with older staged JSON.
   model?: string;
+  // Review pins are always present; empty means Default for that harness.
+  claude_model: string;
+  codex_model: string;
   tools?: string[];
   prompt_body?: string;
   // True when the displayed `prompt_body` differs from the raw applied body because

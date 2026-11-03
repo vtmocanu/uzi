@@ -6,6 +6,7 @@ import {
   modelFieldWarning,
   TEMPLATE_SCOPE_LABEL,
   templateScopeBadgeTone,
+  templateModelDefaultLabel,
 } from "./agentTemplates";
 
 describe("template scope helpers", () => {
@@ -62,6 +63,20 @@ describe("frontmatterFieldWarning model gating", () => {
   it("surfaces the tightened model rule through the shared submit gate", () => {
     expect(frontmatterFieldWarning({ description: "d", model: "claude 3", tools: [] })).not.toBe("");
     expect(frontmatterFieldWarning({ description: "d", model: "opus", tools: [] })).toBe("");
+  });
+});
+
+describe("templateModelDefaultLabel", () => {
+  it("keeps omitted harness compatible with Claude for leads and subagents", () => {
+    for (const name of ["lead", "ORCHESTRATOR"]) {
+      expect(templateModelDefaultLabel(name)).toBe("Default · SDK/account default (built-in)");
+      expect(templateModelDefaultLabel(name, "claude")).toBe("Default · SDK/account default (built-in)");
+      expect(templateModelDefaultLabel(name, "codex")).toBe("Default · built-in (gpt-6.1-sol)");
+    }
+    expect(templateModelDefaultLabel("coder")).toBe("Default · lead's model");
+    for (const harness of ["claude", "codex"] as const) {
+      expect(templateModelDefaultLabel("coder", harness)).toBe("Default · lead's model");
+    }
   });
 });
 
