@@ -2428,6 +2428,12 @@ export interface EpochDiscardProofOptions {
 
 type EpochDiscardProofState = Omit<EpochDiscardProofOptions, "decision">;
 
+/** Internal content-proof mode; epoch inspection alone never selects it. */
+interface AutomaticPreservation {
+  checkLive: () => void;
+  roots: readonly string[];
+}
+
 export interface RetainedDiscardOptions {
   /** In-process worker authority only; never deserialize from an operator request. */
   epochProof?: EpochDiscardProof;
@@ -10410,6 +10416,101 @@ export class GitCache {
     return false;
   }
 
+  /** Join each read before observing revocation; never launch a sibling after failure. */
+  private async automaticPreservationRead<T>(automatic: AutomaticPreservation | undefined, action: () => Promise<T>): Promise<T> {
+    if (!automatic) return action();
+    this.checkRecoveryInterruption();
+    automatic.checkLive();
+    try { return await action(); }
+    finally {
+      this.checkRecoveryInterruption();
+      automatic.checkLive();
+    }
+  }
+
+  private automaticCollection(out: string, separator: string): void {
+    const limits = this.epochRetained.getStore()!;
+    let count = 0;
+    for (const char of out) {
+      if (char === separator && ++count > limits.maxMetadataRecords) throw new Error("automatic content record limit");
+    }
+    if (out && !out.endsWith(separator) && ++count > limits.maxMetadataRecords) throw new Error("automatic content record limit");
+  }
+
+  /** One entry at most, one joined close. Only absence before opening may mean empty. */
+  private async automaticDirectoryEmpty(dir: string, automatic: AutomaticPreservation, missing: boolean): Promise<boolean> {
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    try {
+      const before = await read(() => fs.lstat(dir)).catch((err: NodeJS.ErrnoException) => {
+        if (missing && err.code === "ENOENT") return undefined;
+        throw err;
+      });
+      if (!before) return true;
+      if (!before.isDirectory() || before.isSymbolicLink() || await read(() => fs.realpath(dir)) !== dir) return false;
+      automatic.checkLive();
+      this.checkRecoveryInterruption();
+      const handle = await fs.opendir(dir, { bufferSize: 1 });
+      let empty: boolean;
+      try {
+        automatic.checkLive();
+        this.checkRecoveryInterruption();
+        empty = await read(() => handle.read()) === null;
+      } finally {
+        // Close must still be joined when a read or liveness check failed.
+        await handle.close();
+      }
+      automatic.checkLive();
+      this.checkRecoveryInterruption();
+      const after = await read(() => fs.lstat(dir));
+      return empty && after.isDirectory() && !after.isSymbolicLink() &&
+        before.dev === after.dev && before.ino === after.ino &&
+        await read(() => fs.realpath(dir)) === dir;
+    } catch { return false; }
+  }
+
+  /** Default history only: other runs' refs, loose objects and reflogs prove no publication. */
+  private async automaticContentPreserved(epoch: EpochDiscardProofState): Promise<boolean> {
+    const automatic: AutomaticPreservation = { roots: [], checkLive: () => this.checkEpochDiscardLive(epoch) };
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    const cwd = epoch.paths[0]!;
+    const skills = path.join(path.dirname(cwd), `.uzi-skills-${path.basename(cwd)}`);
+    try {
+      const presence = await read(() => this.clonePresence(cwd));
+      // Skills are generated, attributed footprint, not another Git worktree. Their
+      // content need not be empty; the discard core still validates their path before removal.
+      const skillsPresence = await read(() => this.clonePresence(skills));
+      if (skillsPresence.presence === "unsafe" ||
+          skillsPresence.presence === "present" && await read(() => fs.realpath(skills)) !== skills) return false;
+      if (presence.presence === "missing") return true;
+      if (presence.presence !== "present" || !(await read(() => this.realCloneDir(cwd))) ||
+          await read(() => fs.realpath(cwd)) !== cwd ||
+          await read(() => fs.realpath(path.join(cwd, ".git"))) !== path.join(cwd, ".git")) return false;
+      // Resolve the trusted default using the existing lookup, but reject its HEAD-only fallback.
+      const db = await read(() => this.defaultBranchName(epoch.barePath));
+      if (!db || !(await read(() => this.isPlainBranchName(epoch.barePath, db)))) return false;
+      let rootRef: string | undefined;
+      for (const ref of [`refs/remotes/origin/${db}`, `refs/heads/${db}`]) {
+        if (await read(() => this.refExists(epoch.barePath, ref))) { rootRef = ref; break; }
+      }
+      if (!rootRef) return false;
+      const root = async () => (await read(() => this.runGitWithEnv(epoch.barePath,
+        ["rev-parse", "--verify", `${rootRef}^{commit}`], NO_REPLACE_ENV))).trim();
+      const rootSha = await root();
+      if (!SHA40_RE.test(rootSha)) return false;
+      automatic.roots = [rootSha];
+      const head = await read(() => this.worktreeHead(cwd));
+      if (!head || !SHA40_RE.test(head)) return false;
+      if (!(await this.worktreeCleanHardened(cwd, automatic)) ||
+          !(await this.localRefsReachableFrom(epoch.barePath, cwd, head, automatic))) return false;
+      if (await read(() => this.worktreeHead(cwd)) !== head || await root() !== rootSha) return false;
+      const after = await read(() => this.clonePresence(cwd));
+      return after.presence === "present" && after.devIno === presence.devIno &&
+        await read(() => this.realCloneDir(cwd)) &&
+        await read(() => fs.realpath(cwd)) === cwd &&
+        await read(() => fs.realpath(path.join(cwd, ".git"))) === path.join(cwd, ".git");
+    } catch { return false; }
+  }
+
   /**
    * Is every local ref of the clone, in every namespace (heads, tags, notes, `refs/remotes/` and
    * any other), already held by the worker bare, and is there no stash? A ref value is acceptable
@@ -10436,16 +10537,19 @@ export class GitCache {
    * bare ref (the forge or other flows keep their own copy), whereas the head anchor in
    * {@link verifyStoppedSourceCovered} must be owned by this run and generation, be an owed pin, or be an ancestor of the bare's default-branch ref.
    */
-  private async localRefsReachableFrom(barePath: string, cwd: string, head: string): Promise<boolean> {
+  private async localRefsReachableFrom(barePath: string, cwd: string, head: string, automatic?: AutomaticPreservation): Promise<boolean> {
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
     try {
       // Per-worktree HEADs and refs of a linked worktree are invisible to for-each-ref and status,
       // so any `.git/worktrees/` entry (or an unreadable directory) makes coverage unprovable.
-      const wt = await fs.readdir(path.join(cwd, ".git", "worktrees")).then((n) => n, (err: NodeJS.ErrnoException) => {
+      if (automatic && !(await this.automaticDirectoryEmpty(path.join(cwd, ".git", "worktrees"), automatic, true))) return false;
+      const wt = automatic ? [] : await fs.readdir(path.join(cwd, ".git", "worktrees")).then((n) => n, (err: NodeJS.ErrnoException) => {
         if (err.code === "ENOENT") return [] as string[];
         throw err;
       });
       if (wt.length > 0) return false;
-      const out = await this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
+      const refs = () => read(() => this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
+      const out = await refs();
       const shas = new Set<string>();
       for (const line of out.split("\n")) {
         if (line === "") continue;
@@ -10455,13 +10559,17 @@ export class GitCache {
         if (ref === "refs/stash") return false;
         shas.add(sha);
       }
-      if (shas.size > MAX_LOCAL_REF_SHAS) return false;
+      if (automatic) shas.add(head);
+      if (shas.size > Math.min(MAX_LOCAL_REF_SHAS, automatic ? this.epochRetained.getStore()!.maxMetadataRecords : Infinity)) return false;
       const all = [...shas];
       for (let i = 0; i < all.length; i += LOCAL_REF_REVLIST_CHUNK) {
         const chunk = all.slice(i, i + LOCAL_REF_REVLIST_CHUNK);
-        const extra = await this.runGitWithEnv(barePath, ["rev-list", "--objects", "-n", "1", ...chunk, "--not", head, `--exclude=${RECOVERY_BUNDLE_REF}`, "--all"], NO_REPLACE_ENV);
+        const roots = automatic ? [...automatic.roots] : [head, `--exclude=${RECOVERY_BUNDLE_REF}`, "--all"];
+        if (automatic && roots.length === 0) return false;
+        const extra = await read(() => this.runGitWithEnv(barePath, ["rev-list", "--objects", "-n", "1", ...chunk, "--not", ...roots], NO_REPLACE_ENV));
         if (extra.trim() !== "") return false;
       }
+      if (automatic && await refs() !== out) return false;
       return true;
     } catch (err) {
       this.log.debug("stopped source local refs could not be proven held", { cwd, error: gitErrorMessage(err) });
@@ -10486,21 +10594,22 @@ export class GitCache {
    * `--ignore-submodules=none`, and a `.git/modules` store or a populated (non-empty or non-directory)
    * gitlink path is `false`, since the parent proof cannot cover a submodule's own files, commits and refs.
    */
-  private async worktreeCleanHardened(cwd: string): Promise<boolean> {
+  private async worktreeCleanHardened(cwd: string, automatic?: AutomaticPreservation): Promise<boolean> {
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
     const hardened = [
       "-c", "core.excludesFile=/dev/null", "-c", `core.worktree=${cwd}`, "-c", "core.trustctime=true",
       "-c", "core.checkStat=default", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
       "-c", "status.showUntrackedFiles=all", "-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false",
     ];
     try {
-      const attributes = await fs.lstat(path.join(cwd, ".git", "info", "attributes")).then(() => true, (err: NodeJS.ErrnoException) => {
+      const attributes = await read(() => fs.lstat(path.join(cwd, ".git", "info", "attributes"))).then(() => true, (err: NodeJS.ErrnoException) => {
         if (err.code === "ENOENT") return false;
         throw err;
       });
       if (attributes) return false;
       // Scope-less read (global/system are pinned to /dev/null): it follows include/includeIf and
       // config.worktree exactly as `status` does, which `--local` would not.
-      const config = await this.runGitAsRunner(cwd, ["config", "--null", "--list"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
+      const config = await read(() => this.runGitAsRunner(cwd, ["config", "--null", "--list"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
       const entries = config.split("\0");
       if (entries.some((e) => /^(filter\.|include\.|includeif\.|extensions\.worktreeconfig|core\.attributesfile)/i.test(e))) return false;
       // A case-folding clone could hide a tracked `readme` behind an untracked `README`. The
@@ -10521,27 +10630,32 @@ export class GitCache {
       // a populated submodule's own files, commits or refs, so any trace of one is not provable: a
       // `.git/modules` store, or an index gitlink (mode 160000) whose worktree path holds anything but
       // nothing or an empty real directory (an uninitialized submodule).
-      const modules = await fs.lstat(path.join(cwd, ".git", "modules")).then(() => true, (err: NodeJS.ErrnoException) => {
+      const modules = await read(() => fs.lstat(path.join(cwd, ".git", "modules"))).then(() => true, (err: NodeJS.ErrnoException) => {
         if (err.code === "ENOENT") return false;
         throw err;
       });
       if (modules) return false;
-      const staged = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
+      const staged = await read(() => this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
+      if (automatic) this.automaticCollection(staged, "\0");
       for (const entry of staged.split("\0")) {
         const m = /^160000 [0-9a-f]+ [0-3]\t([\s\S]+)$/.exec(entry);
         if (!m) continue;
         const gitlink = path.join(cwd, m[1]!);
-        const st = await fs.lstat(gitlink).catch((err: NodeJS.ErrnoException) => {
+        const st = await read(() => fs.lstat(gitlink)).catch((err: NodeJS.ErrnoException) => {
           if (err.code === "ENOENT") return undefined;
           throw err;
         });
         if (st === undefined) continue;
         if (!st.isDirectory() || st.isSymbolicLink()) return false;
-        if ((await fs.readdir(gitlink)).length > 0) return false;
+        if (automatic) {
+          if (!(await this.automaticDirectoryEmpty(gitlink, automatic, false))) return false;
+        } else if ((await fs.readdir(gitlink)).length > 0) return false;
       }
-      const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], { env: { ...READ_ONLY_STATUS.env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
+      const status = await read(() => this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], { env: { ...READ_ONLY_STATUS.env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
+      if (automatic) this.automaticCollection(status, "\n");
       if (status.split("\n").some((l) => l.length > 0)) return false;
-      const flags = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } });
+      const flags = await read(() => this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
+      if (automatic) this.automaticCollection(flags, "\0");
       for (const entry of flags.split("\0")) {
         if (entry.length === 0) continue;
         // `H` is a normal entry; a lowercase tag is assume-unchanged and `S`/`s` is skip-worktree.
@@ -11419,6 +11533,7 @@ export class GitCache {
           epoch.signal, epoch.deadline, () => this.withLock(epoch.barePath, async () => {
             this.checkEpochDiscardLive(epoch);
             const g = await this.gatherRetainedUnderLock(epoch.barePath);
+            this.checkEpochDiscardLive(epoch);
             const matches = g.records.filter(rec => this.matchesRetainedSelector(rec, epoch.selector));
             if (matches.length !== 1) return refused(matches.length ? "ambiguous" : "not_found");
             const rec = matches[0]!;
@@ -11432,6 +11547,11 @@ export class GitCache {
             });
             const disposition = rec.kind === "attempt" ? ev.epochSettlement?.disposition : ev.disposition;
             if (disposition?.kind !== "local_discard") return refused("epoch_source_refused", ev.blockers, disposition);
+            this.checkEpochDiscardLive(epoch);
+            if (!(await this.automaticContentPreserved(epoch))) {
+              this.checkEpochDiscardLive(epoch);
+              return refused("epoch_content_unproven");
+            }
             this.checkEpochDiscardLive(epoch);
             // Serial integration guard: native descendant joining and durable retirement must
             // land before worker epoch authority can enter the existing disposal algorithm.
