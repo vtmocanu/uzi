@@ -1,11 +1,8 @@
 import type { WorkerRunMessage } from "./protocol.js";
+import { DISPATCH_OPEN_AT_TURN_END, DISPATCH_STOPPED, DISPATCH_STREAM_FAILED } from "./codex/dispatch-diagnostics.js";
 
 // Read-side evidence only. No inferred shell gates, ownership, timeout or budget.
-const INTERRUPTIONS = new Set([
-  "delegation stopped by the run; child settlement not confirmed",
-  "delegation still open at turn end; child settlement not confirmed",
-  "delegation ended by a provider stream failure; child settlement not confirmed",
-]);
+const INTERRUPTIONS = new Set([DISPATCH_STOPPED, DISPATCH_OPEN_AT_TURN_END, DISPATCH_STREAM_FAILED]);
 // 60 single-event slots plus six atomic failed pairs (12 snippets): <= 57,671 prose chars.
 const QUOTAS = { opening: 6, tail: 12, plan: 4, revision: 4, steering: 4, failure: 8, review: 10, signals: 12 } as const;
 type Class = keyof typeof QUOTAS;
@@ -302,8 +299,8 @@ export class JudgeEvidenceReducer {
       if (this.ordinaryIdentities.has(key) && !h && !old?.row) return;
       const result = { seq: m.seq, time: ownedPrefix(str(m.created_at), 64), outcome: outcome(p), text,
         cause: typeof p["content"] === "string" && INTERRUPTIONS.has(p["content"])
-          ? p["content"] === "delegation stopped by the run; child settlement not confirmed" ? "run stopped; settlement unconfirmed"
-            : p["content"] === "delegation still open at turn end; child settlement not confirmed" ? "open at turn end; settlement unconfirmed"
+          ? p["content"] === DISPATCH_STOPPED ? "run stopped; settlement unconfirmed"
+            : p["content"] === DISPATCH_OPEN_AT_TURN_END ? "open at turn end; settlement unconfirmed"
               : "provider stream failure; settlement unconfirmed" : undefined };
       if (old?.row) {
         this.match(old.row, result, h); this.pending.delete(key);
