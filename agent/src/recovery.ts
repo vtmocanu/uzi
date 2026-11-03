@@ -3051,6 +3051,10 @@ export class RecoveryCoordinator {
       // archive fallback, whose FINAL supplies the generation settlement authority.
       if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: true }));
       if (!await this.restrictionsAllowCapturedC(record)) {
+        // This invocation has not sent a create. Preserve older uncertainty, but
+        // do not turn a refused proof into a fictitious lost create response.
+        if (v2 && !uncertainCreate)
+          record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false }));
         result = uncertainCreate ? "kept" : "fallback"; attested = false; return;
       }
       result = v2 || uncertainCreate ? "kept" : "fallback";

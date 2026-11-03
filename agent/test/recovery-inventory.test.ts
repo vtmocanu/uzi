@@ -757,6 +757,39 @@ async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "iss
   return { ...f, order, record, operate, setHold: (state: typeof hold) => { hold = state; } };
 }
 
+for (const initiallyUncertain of [false, true]) {
+  it(`held restriction denial retains only prior create uncertainty (${initiallyUncertain})`, async () => {
+    const f = await v2FrozenFixture();
+    try {
+      f.state.status = "failed";
+      if (initiallyUncertain) await patchAuthenticated(f, f.record, { heldCreateUncertain: true });
+      let denied = 0, probes = 0, creates = 0;
+      Object.assign(f.git, { readRemediationRestrictionFacts: async () => {
+        const current = (await f.coordinator.inspect(f.context.runId))[0]!;
+        if (current.heldCreateUncertain) { denied++; throw new Error("restriction evidence unavailable"); }
+        return { enrolled: false, blocked: false, roots: [], flaggedOIDs: [], fingerprint: "unenrolled" };
+      } });
+      Object.assign(f.client, { publishHeld: async (_run: string, _gen: number, _tip: string,
+        _digest: string, pack: unknown) => {
+        if (Buffer.isBuffer(pack) && pack.length === 0) probes++; else creates++;
+        return { ok: false, reason: "pack_invalid", httpStatus: 400 };
+      } });
+      await f.operate();
+      assert.ok(denied > 0, "the current restriction proof refuses the uncertain record");
+      const after = (await f.coordinator.inspect(f.context.runId))[0]!;
+      assert.equal(after.heldCreateUncertain === true, initiallyUncertain);
+      assert.equal(creates, 0, "restriction denial never invokes a held create");
+      assert.equal(probes, initiallyUncertain ? 1 : 0);
+      assert.equal(after.finalRequest, undefined, "denial grants no FINAL or release");
+      f.state.now += 3_600_000;
+      await f.operate();
+      assert.equal(probes === 0, !initiallyUncertain, "a denied first create never causes a later reconciliation probe");
+      assert.equal(creates, 0);
+      assert.equal(f.state.pinDeletes, 0);
+    } finally { await f.close(); }
+  });
+}
+
 function closedExactFixture(record: RecoveryRecord, exact: RecoveryExactHold, state: "released" | "discarded"): RecoveryExactHold {
   return { ...exact, state, live_worker_id: undefined, live_run_id: undefined,
     release_evidence: state === "discarded" ? "owner_discard" : "held_publication",
