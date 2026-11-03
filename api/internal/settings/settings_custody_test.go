@@ -9,6 +9,49 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// The transaction accessor must never refresh or reuse cached DB evidence.
+func TestCustodyHoldLimitFromRows(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, env, fresh string
+		want             int32
+	}{
+		{"fresh DB beats stale cache", "", "3", 3},
+		{"ENV beats fresh DB", "5", "3", 5},
+		{"absent row uses default", "", "", 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeStore{rows: []store.AppSetting{row(KeyCustodyHoldLimit, "12")}}
+			c := New(fs, time.Hour)
+			c.ConfigureSecrets(nil, map[string]string{KeyCustodyHoldLimit: tc.env})
+			if _, err := c.CustodyHoldLimit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			fs.err = errors.New("transaction accessor must not read cache store")
+			n, err := c.CustodyHoldLimitFromRows([]store.AppSetting{row(KeyCustodyHoldLimit, tc.fresh)})
+			if err != nil || n != tc.want {
+				t.Fatalf("transaction value=%d err=%v, want %d", n, err, tc.want)
+			}
+			cached, err := c.CustodyHoldLimit(ctx)
+			wantCached := int32(12)
+			if tc.env != "" {
+				wantCached = 5
+			}
+			if err != nil || cached != wantCached {
+				t.Fatalf("transaction rows contaminated cache: %d, %v", cached, err)
+			}
+		})
+	}
+	c := New(&fakeStore{}, time.Minute)
+	if n, err := c.CustodyHoldLimitFromRows([]store.AppSetting{row(KeyCustodyHoldLimit, "invalid")}); n != 0 || !errors.Is(err, ErrCustodyHoldLimitUnavailable) {
+		t.Fatalf("malformed authoritative row=%d %v", n, err)
+	}
+	var absent *Cache
+	if n, err := absent.CustodyHoldLimitFromRows(nil); n != 0 || !errors.Is(err, ErrCustodyHoldLimitUnavailable) {
+		t.Fatalf("nil accessor=%d %v", n, err)
+	}
+}
+
 // TestCustodyHoldLimitDefaultPinned pins #3150's acceptance: unset behaves exactly as the
 // former compile-time constant (8).
 func TestCustodyHoldLimitDefaultPinned(t *testing.T) {
