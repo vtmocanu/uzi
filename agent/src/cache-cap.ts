@@ -123,6 +123,11 @@ export function hardStopThreshold(apiThreshold: number | undefined, margin: numb
   return hard > 0 ? hard : threshold;
 }
 
+/** Whether a used fraction is at the hard layer's stop point: at or over `threshold`, not just over. */
+export function atHardStopPressure(usedFraction: number, threshold: number): boolean {
+  return usedFraction >= threshold;
+}
+
 /** What the governor needs from the rest of the worker; every I/O is a seam for tests. */
 export interface DiskGovernorOptions {
   config: CacheCapConfig;
@@ -409,6 +414,12 @@ export class DiskGovernor {
     return "continue";
   }
 
+  /** The hard layer's stop threshold right now: the api's threshold (latest heartbeat) minus the
+   *  configured margin. The one expression {@link observe} judges pressure against. */
+  effectiveHardThreshold(): number {
+    return hardStopThreshold(this.opts.thresholdOf(), this.opts.config.hardMargin);
+  }
+
   /**
    * The HARD layer, on every stats tick: the data volume's used fraction (undefined = unknown,
    * never acts). At or over {@link hardStopThreshold}, and with no earlier stop still in flight,
@@ -432,8 +443,8 @@ export class DiskGovernor {
     }
     if (usedFraction === undefined) return;
     if (sampledAtMs < Math.max(this.lastStopEndedAt, this.lastReclaimEndedAt)) return;
-    const threshold = hardStopThreshold(this.opts.thresholdOf(), this.opts.config.hardMargin);
-    if (usedFraction < threshold) {
+    const threshold = this.effectiveHardThreshold();
+    if (!atHardStopPressure(usedFraction, threshold)) {
       this.warnedNothingToStop = false;
       this.lastSelectionAt = Number.NEGATIVE_INFINITY;
       for (const r of this.runs.values()) r.inPlaceSkipped = false;

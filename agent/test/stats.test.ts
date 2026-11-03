@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { dataVolumeUsedFraction, StatsCollector, type StatfsSample, type StatsCollectorOptions } from "../src/stats.js";
+import { dataVolumeStatsFromStatfs, dataVolumeUsedFraction, StatsCollector, type StatfsSample, type StatsCollectorOptions } from "../src/stats.js";
 import { readDindMeterSample } from "../src/dind-meter.js";
 
 // Unit tests over fixture cgroup v2 trees (PRD #49 M1). Each test writes a throwaway
@@ -219,6 +219,31 @@ describe("StatsCollector — disk sampling (PRD #837 M1)", () => {
     assert.strictEqual(s.disk_nix_total_bytes, 4_096_000, "nix total = blocks×bsize");
     assert.strictEqual(s.disk_data_bytes, 2_048_000, "data used = (blocks−bfree)×bsize");
     assert.strictEqual(s.disk_data_total_bytes, 8_192_000, "data total = blocks×bsize");
+  });
+
+  it("dataVolumeStatsFromStatfs equals the heartbeat's data-volume fields for the same statfs (issue #3865)", () => {
+    const cases: StatfsSample[] = [
+      { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400, files: 1000, ffree: 400 },
+      { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400, files: 0, ffree: 0 },
+      { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400 },
+      { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400, files: 10, ffree: 11 },
+      { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400, files: 10, ffree: -1 },
+      { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400, files: Number.NaN, ffree: 1 },
+      { bsize: 4096, blocks: 2000, bfree: 2500, bavail: 1400, files: 10, ffree: 1 },
+      { bsize: Number.NaN, blocks: 2000, bfree: 1500, bavail: 1400, files: 10, ffree: 1 },
+    ];
+    for (const raw of cases) {
+      const c = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs: () => raw, dataDir: "/data" });
+      const s = c.collect();
+      assert.ok(s);
+      const heartbeat = {
+        ...(s.disk_data_bytes !== undefined ? { disk_data_bytes: s.disk_data_bytes } : {}),
+        ...(s.disk_data_total_bytes !== undefined ? { disk_data_total_bytes: s.disk_data_total_bytes } : {}),
+        ...(s.disk_data_inodes !== undefined ? { disk_data_inodes: s.disk_data_inodes } : {}),
+        ...(s.disk_data_total_inodes !== undefined ? { disk_data_total_inodes: s.disk_data_total_inodes } : {}),
+      };
+      assert.deepStrictEqual(dataVolumeStatsFromStatfs(raw), heartbeat, JSON.stringify(raw));
+    }
   });
 
   it("targets the injected dataDir, not a hardcoded /data, and the fixed /nix constant", () => {

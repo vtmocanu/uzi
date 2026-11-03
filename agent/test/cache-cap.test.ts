@@ -1,7 +1,16 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { type CacheCapConfig, DiskGovernor, type DiskGovernorOptions, hardStopThreshold, runCacheCapBytes } from "../src/cache-cap.js";
+import {
+  atHardStopPressure,
+  type CacheCapConfig,
+  DiskGovernor,
+  type DiskGovernorOptions,
+  hardStopThreshold,
+  runCacheCapBytes,
+} from "../src/cache-cap.js";
+import { decideRetainedSeedAdmission } from "../src/retained-seed-admission.js";
 import type { RunCacheDropResult, TrimResult, TrimTarget } from "../src/run-caches.js";
+import { dataVolumeStatsFromStatfs, dataVolumeUsedFraction, type StatfsSample } from "../src/stats.js";
 import { nullLogger } from "./helpers.js";
 import type { Logger } from "../src/log.js";
 
@@ -137,6 +146,63 @@ describe("cache cap math (PRD #1809 D4)", () => {
     assert.ok(Math.abs(hardStopThreshold(undefined, 0.03) - 0.87) < 1e-9);
     assert.ok(Math.abs(hardStopThreshold(0.8, 0.03) - 0.77) < 1e-9);
     assert.strictEqual(hardStopThreshold(0.02, 0.03), 0.02, "a margin past the threshold falls back to it");
+  });
+});
+
+describe("hard layer and retained-seed admission share one pressure predicate (issue #3865)", () => {
+  const sample = (blocks: number, used: number, inodes?: { files: number; used: number }): StatfsSample => ({
+    bsize: 4096,
+    blocks,
+    bfree: blocks - used,
+    bavail: blocks - used,
+    ...(inodes ? { files: inodes.files, ffree: inodes.files - inodes.used } : {}),
+  });
+  const samples: { name: string; raw: StatfsSample }[] = [
+    { name: "bytes low", raw: sample(1_000_000, 500_000, { files: 1000, used: 100 }) },
+    { name: "bytes just under 0.87", raw: sample(1_000_000, 869_999, { files: 1000, used: 100 }) },
+    { name: "bytes at 0.87", raw: sample(1000, 870, { files: 1000, used: 100 }) },
+    { name: "bytes at 0.77", raw: sample(1000, 770, { files: 1000, used: 100 }) },
+    { name: "bytes at 0.9 with files 0", raw: sample(1000, 900, { files: 0, used: 0 }) },
+    { name: "bytes at 0.9 with no inode fields", raw: sample(1000, 900) },
+    { name: "inodes high, bytes low", raw: sample(1000, 100, { files: 1000, used: 950 }) },
+    { name: "bytes unusable, inodes high", raw: { bsize: 4096, blocks: Number.NaN, bfree: 0, bavail: 0, files: 1000, ffree: 50 } },
+    { name: "ffree above files (invalid pair), bytes low", raw: { ...sample(1000, 100), files: 1000, ffree: 2000 } },
+    { name: "nothing usable", raw: sample(0, 0, { files: 0, used: 0 }) },
+  ];
+  const thresholds: { apiThreshold: number | undefined; hardMargin: number }[] = [
+    { apiThreshold: undefined, hardMargin: 0.03 },
+    { apiThreshold: 0.8, hardMargin: 0.03 },
+    { apiThreshold: 0.9, hardMargin: 0.05 },
+    { apiThreshold: 0.02, hardMargin: 0.03 },
+  ];
+
+  it("the governor requests a stop, and the admission refuses current pressure, on exactly the same rows", async () => {
+    for (const { apiThreshold, hardMargin } of thresholds) {
+      for (const { name, raw } of samples) {
+        const h = harness({ threshold: apiThreshold, config: { hardMargin } });
+        watch(h, "r1", 3 * GIB);
+        await h.gov.boundary("r1", quiet);
+        const threshold = h.gov.effectiveHardThreshold();
+        const fraction = dataVolumeUsedFraction(dataVolumeStatsFromStatfs(raw));
+        const expected = fraction !== undefined && atHardStopPressure(fraction, threshold);
+        const row = `${name} @ api ${apiThreshold} margin ${hardMargin}`;
+
+        h.gov.observe(fraction);
+        await settle();
+        assert.strictEqual(h.stops.length > 0, expected, `governor: ${row}`);
+
+        const d = decideRetainedSeedAdmission({ raw, threshold, estimate: undefined });
+        assert.strictEqual(d.kind === "refuse_current", expected, `admission: ${row}`);
+        assert.strictEqual(d.kind === "unknown", fraction === undefined, `unknown: ${row}`);
+      }
+    }
+  });
+
+  it("the effective threshold is the one the governor judges against", () => {
+    const h = harness({ threshold: 0.8, config: { hardMargin: 0.03 } });
+    assert.strictEqual(h.gov.effectiveHardThreshold(), hardStopThreshold(0.8, 0.03));
+    assert.strictEqual(atHardStopPressure(0.5, 0.5), true, "at the threshold is pressure");
+    assert.strictEqual(atHardStopPressure(0.4999, 0.5), false);
   });
 });
 
