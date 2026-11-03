@@ -5618,6 +5618,10 @@ WITH candidates AS MATERIALIZED (
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  AND NOT (EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+      AND runs.snapshot_departed_generation = runs.claim_generation
+      AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.snapshot_register_nonce IS NOT NULL AND runs.snapshot_departed_nonce = w.snapshot_register_nonce AND runs.snapshot_departed_epoch <= w.snapshot_epoch)
+      AND NOT EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation))
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
