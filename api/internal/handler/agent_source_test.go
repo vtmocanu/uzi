@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/agentsource"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -85,5 +86,56 @@ func TestStagedToDTOBodySanitizedFlag(t *testing.T) {
 	}
 	if strings.Count(s, `"body_sanitized":false`) != 1 {
 		t.Errorf("expected 1 body_sanitized:false, got JSON: %s", s)
+	}
+}
+
+func TestStagedToDTODerivedModelPins(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw, model, claude, codex string
+	}{
+		{"codex", "gpt-6-sol", "gpt-6-sol", "", "gpt-6-sol"},
+		{"luna", "gpt-6-luna", "gpt-6-luna", "", "gpt-6-luna"},
+		{"claude", "custom-claude", "custom-claude", "custom-claude", ""},
+		{"empty", "", "", "", ""},
+		{"control-format", "cus\x1btom\u202E-model", "custom-model", "custom-model", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal([]agentsource.StagedRole{{
+				Name: "coder", OK: true, Model: tc.raw, PromptBody: "raw\u202E body\n",
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			dto := stagedToDTO(store.AgentSourceStaged{Roles: raw}, "")
+			if len(dto.Roles) != 1 {
+				t.Fatalf("roles: %+v", dto.Roles)
+			}
+			got := dto.Roles[0]
+			if got.Model != tc.model || got.ClaudeModel != tc.claude || got.CodexModel != tc.codex {
+				t.Fatalf("pins: %+v", got)
+			}
+			if !got.BodySanitized || got.PromptBody != "raw body\n" {
+				t.Fatalf("body honesty changed: %+v", got)
+			}
+			wire, err := json.Marshal(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var shared apitypes.AgentSourceRoleDTO
+			dec := json.NewDecoder(strings.NewReader(string(wire)))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&shared); err != nil {
+				t.Fatalf("shared DTO parity: %v", err)
+			}
+			roundTrip, err := json.Marshal(shared)
+			if err != nil || string(roundTrip) != string(wire) {
+				t.Fatalf("shared DTO lost fields: %s -> %s (%v)", wire, roundTrip, err)
+			}
+			// The stored snapshot remains raw even when its display was sanitized.
+			var stored []agentsource.StagedRole
+			if err := json.Unmarshal(raw, &stored); err != nil || stored[0].Model != tc.raw {
+				t.Fatalf("raw snapshot changed: %+v (%v)", stored, err)
+			}
+		})
 	}
 }

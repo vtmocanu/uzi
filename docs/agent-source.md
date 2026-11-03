@@ -171,8 +171,28 @@ approve-before-apply step is the primary control on this feature: a role
 body is a system prompt for an agent that runs `Bash` and edits files, so a
 human reads the diff before it can run anywhere.
 
+### How a source's model maps
+
+A source role has one `model:` value, which selects a pin for one harness:
+
+- A recognized Codex role model — `gpt-5.6-sol`, `gpt-6-astra`,
+  `gpt-6-luna`, `gpt-6-sol`, or `gpt-6.1-sol` — sets the Codex pin and
+  leaves the Claude pin on **Default**.
+- Any other valid, nonempty model sets the Claude pin and leaves the Codex
+  pin on **Default**.
+- An empty model leaves both pins on **Default**.
+
+The same mapping is used for previews, diffs, and applying a snapshot.
+The staged review shows separate **Claude model** and **Codex model** rows
+so you can review both pins before approving changes to shared templates.
+Staged snapshots retain the raw `model` value for compatibility; snapshots
+staged before the upgrade use this mapping when applied too.
+
 ### What approving does
 
+- Approving a synced role replaces both stored model pins with the mapped
+  values, including a locally set Codex pin. A pin left on **Default** by
+  the source clears the corresponding stored pin.
 - A synced role sharing a name with an existing **builtin** overrides that
   builtin's body — the synced body is what's shown and run, not the shipped
   default. It stays a builtin — still labeled and grouped as one, still
@@ -255,3 +275,8 @@ other `uzi admin` command — see [uzi CLI](./cli.md#commands). Setting up
 the source, and clicking **Sync now**, **Check for updates**, **Bump pin**,
 and **Approve & apply** stay web-only actions, from **Admin → Instance
 settings → Agent source** in the browser.
+
+`uzi admin agent-source status --json` includes derived `claude_model` and
+`codex_model` fields for staged roles, using the same mapping shown in the
+approval review. It keeps `model` as the raw source value for compatibility.
+The command's text output is unchanged.
