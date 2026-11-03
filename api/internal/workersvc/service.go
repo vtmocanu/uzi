@@ -2891,8 +2891,13 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		s.replaceRunDisk(ctx, updated, stats)
 		return updated, nil
 	}
-	cachedCustodyLimit := s.queuedCustodyCachedLimit(ctx)
-	tx, err := s.txBeginner.Begin(ctx)
+	var cachedCustodyLimit int32
+	if snapshot != nil {
+		cachedCustodyLimit = s.queuedCustodyCachedLimit(ctx)
+	}
+	// Admission reads after the settings lock need a fresh statement snapshot,
+	// even when the connection defaults to a stricter isolation level.
+	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
 		return store.Worker{}, err
 	}
@@ -2902,9 +2907,12 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 			_ = tx.Rollback(ctx)
 		}
 	}()
-	queuedCustodyLimit, err := s.queuedCustodyAdmission(ctx, tx, cachedCustodyLimit)
-	if err != nil {
-		return store.Worker{}, err
+	var queuedCustodyLimit int32
+	if snapshot != nil {
+		queuedCustodyLimit, err = s.queuedCustodyAdmission(ctx, tx, cachedCustodyLimit)
+		if err != nil {
+			return store.Worker{}, err
+		}
 	}
 	qtx := store.New(tx)
 	updated, err := qtx.HeartbeatWorker(ctx, arg)
