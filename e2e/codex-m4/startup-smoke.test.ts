@@ -257,7 +257,7 @@ test(CODEX_STARTUP_SMOKE_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   let smokePassed = false;
   // Register before acquiring anything so partial setup failures still release resources.
   t.after(async () => {
-    await cleanupP({ transport, handle, provider, base }, primaryFailure);
+    await cleanupP({ transport, handle, provider, base }, primaryFailure, message => t.diagnostic(message));
     if (smokePassed) recordEvidence(CODEX_STARTUP_SMOKE_TITLE, "pass");
   });
 

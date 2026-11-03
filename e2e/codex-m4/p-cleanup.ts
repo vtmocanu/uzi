@@ -10,7 +10,7 @@ export interface CleanupResult {
 }
 export interface PCleanupResources {
   transport?: { close(): void | Promise<void> };
-  handle?: Pick<CodexRootHandle, "dispose" | "started">;
+  handle?: Pick<CodexRootHandle, "dispose" | "started" | "supervisorPid">;
   provider?: { close(): void | Promise<void> };
   base?: string;
   /** Test-only seam for verifying removal failures without leaking a directory. */
@@ -45,6 +45,7 @@ export class PCleanupError extends AggregateError {
 export async function cleanupP(
   resources: PCleanupResources,
   primaryFailure?: { error: unknown },
+  diagnostic?: (message: string) => void,
 ): Promise<void> {
   const results: CleanupResult[] = [];
   let disposalError: unknown;
@@ -61,7 +62,12 @@ export async function cleanupP(
   if (resources.handle) await attempt("dispose", async () => {
     const outcome: DisposeOutcome = await resources.handle!.dispose();
     assert.ok(outcome.clean, outcome.clean ? "confirmed clean disposal" : outcome.reason);
-    const ownedPid = resources.handle!.started.childPid;
+    // The P shims spawn the app-server directly: this is the process-bound PID.
+    const ownedPid = resources.handle!.supervisorPid;
+    assert.ok(ownedPid !== undefined && Number.isSafeInteger(ownedPid) && ownedPid > 0,
+      "P cleanup requires a positive safe process PID");
+    assert.equal(resources.handle!.started.childPid, ownedPid,
+      "started child PID matches the spawned process");
     assert.deepEqual(outcome.event.killed, [ownedPid], "dispose killed the exact owned live child");
     assert.deepEqual(outcome.event.reaped, [ownedPid], "dispose observed the exact owned child exit");
   });
@@ -72,7 +78,17 @@ export async function cleanupP(
     assert.equal(existsSync(resources.base!), false, "P temporary directory was removed");
   });
   if (results.some(result => !result.completed)) {
-    throw new PCleanupError(results, resources.base,
+    const error = new PCleanupError(results, resources.base,
       resources.base === undefined || !existsSync(resources.base), disposalError, primaryFailure);
+    if (primaryFailure && diagnostic) {
+      // node:test can omit an after-hook rejection when the test body already failed.
+      // Report only after every cleanup attempt; reporting must never replace the error.
+      try {
+        diagnostic(`${error.message}; cleanup results: ${results.map(result =>
+          `${result.step}=${result.completed ? "completed" : "failed"}`).join(", ")}; ` +
+          `base=${String(error.base)}; baseAbsent=${error.baseAbsent}`);
+      } catch { /* Preserve the primary and teardown failures if reporting faults. */ }
+    }
+    throw error;
   }
 }

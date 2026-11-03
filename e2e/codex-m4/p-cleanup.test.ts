@@ -1,15 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { cleanupP, PCleanupError, type PCleanupResources } from "./p-cleanup.js";
 
 const scratch = path.resolve(__dirname, "../../.uzi/scratch");
 const childPid = 4242;
 type Adapter = (resources: PCleanupResources, work?: () => Promise<void>) => Promise<void>;
 
-// Mirror the startup adapter: registration happens before resource acquisition;
-// the hook receives the primary failure as well as the partially acquired resources.
+// Model startup helper plumbing: registration precedes acquisition and receives the
+// primary failure and partial resources. This try/finally does not model node:test
+// reporting of simultaneous body/hook failures; the child-process regression below does.
 const startup: Adapter = async (resources, work = async () => {}) => {
   let after!: () => Promise<void>;
   const registerAfter = (hook: () => Promise<void>): void => { after = hook; };
@@ -24,7 +27,7 @@ const startup: Adapter = async (resources, work = async () => {}) => {
     await after();
   }
 };
-// Mirror the harness adapter: finally must preserve a primary error if teardown also fails.
+// Model harness helper plumbing: finally preserves a primary error if teardown also fails.
 const harness: Adapter = async (resources, work = async () => {}) => {
   let primaryFailure: { error: unknown } | undefined;
   try {
@@ -46,6 +49,7 @@ function fixture() {
     base,
     transport: { close: async () => { completed.push("transport"); } },
     handle: {
+      supervisorPid: childPid,
       started: {
         event: "started", supervisorPid: childPid, childPid, subreaper: true,
         nondumpable: true, uid: 10001, liveCapsZero: true,
@@ -146,6 +150,26 @@ for (const [style, adapter] of [["startup after hook", startup], ["harness final
     await adapter({}); // failure before the first acquisition requires no cleanup
   });
 
+  test(`P cleanup ${style}: rejects self-consistent evidence for a different process`, async () => {
+    const f = fixture();
+    const wrongPid = childPid + 1;
+    const dispose = f.resources.handle!.dispose;
+    f.resources.handle = { ...f.resources.handle!,
+      started: { ...f.resources.handle!.started, childPid: wrongPid } };
+    f.resources.handle!.dispose = async () => {
+      const outcome = await dispose();
+      assert.ok(outcome.clean);
+      return { ...outcome, event: { ...outcome.event, killed: [wrongPid], reaped: [wrongPid] } };
+    };
+    await assert.rejects(adapter(f.resources), (error: unknown) => {
+      assert.ok(error instanceof PCleanupError);
+      assert.match(String(error.disposalError), /started child PID matches the spawned process/);
+      return true;
+    });
+    assert.deepEqual(f.completed, ["transport", "dispose", "provider", "remove"]);
+    assert.equal(existsSync(f.base), false);
+  });
+
   for (const field of ["killed", "reaped"] as const) {
     test(`P cleanup ${style}: rejects incorrect ${field} despite clean:true`, async () => {
       const f = fixture();
@@ -181,6 +205,110 @@ for (const [style, adapter] of [["startup after hook", startup], ["harness final
     assert.equal(existsSync(f.base), false);
   });
 }
+
+test("P cleanup: rejects missing or invalid process PIDs after sibling cleanup", async () => {
+  for (const pid of [undefined, 0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    const f = fixture();
+    f.resources.handle = { ...f.resources.handle!, supervisorPid: pid };
+    await assert.rejects(cleanupP(f.resources), (error: unknown) => {
+      assert.ok(error instanceof PCleanupError);
+      assert.match(String(error.disposalError), /requires a positive safe process PID/);
+      return true;
+    });
+    assert.deepEqual(f.completed, ["transport", "dispose", "provider", "remove"]);
+    assert.equal(existsSync(f.base), false);
+  }
+});
+
+test("P cleanup: a diagnostic fault preserves primary and disposal error identities", async () => {
+  const f = fixture();
+  const primary = new Error("primary failed");
+  const disposal = new Error("dispose failed");
+  f.resources.handle!.dispose = async () => { throw disposal; };
+  let reports = 0;
+  await assert.rejects(cleanupP(f.resources, { error: primary }, () => {
+    reports++;
+    throw new Error("diagnostic failed");
+  }), (error: unknown) => {
+    assert.ok(error instanceof PCleanupError);
+    assert.equal(error.cause, primary);
+    assert.deepEqual(error.errors, [primary, disposal]);
+    assert.equal(error.disposalError, disposal);
+    return true;
+  });
+  assert.equal(reports, 1);
+  assert.deepEqual(f.completed, ["transport", "provider", "remove"]);
+  assert.equal(existsSync(f.base), false);
+});
+
+test("P cleanup: real node:test reports body and cleanup diagnostics after sibling cleanup", () => {
+  const f = fixture();
+  const fixtureDir = mkdtempSync(path.join(scratch, "p-cleanup-node-test-"));
+  const fixturePath = path.join(fixtureDir, "body-and-hook.test.mts");
+  const completedPath = path.join(fixtureDir, "completed");
+  try {
+    // Use cleanupP's reporting path exactly as startup's t.after does. The fixture
+    // supplies only t.diagnostic, so removing helper reporting loses the sentinel.
+    writeFileSync(fixturePath, `
+import { test } from "node:test";
+import { appendFileSync, rmSync } from "node:fs";
+import { cleanupP } from ${JSON.stringify(pathToFileURL(path.resolve(__dirname, "p-cleanup.ts")).href)};
+const base = ${JSON.stringify(f.base)};
+const completed = step => appendFileSync(${JSON.stringify(completedPath)}, step + "\\n");
+test("body and after-hook failure", async t => {
+  let primaryFailure;
+  const resources = {
+    base,
+    transport: { close() { completed("transport"); } },
+    handle: {
+      supervisorPid: ${childPid},
+      started: ${JSON.stringify(f.resources.handle!.started)},
+      async dispose() {
+        completed("dispose");
+        return { clean: false, reason: "M3849_CLEANUP_SENTINEL" };
+      },
+    },
+    provider: { close() { completed("provider"); } },
+    remove(directory) {
+      rmSync(directory, { recursive: true, force: true });
+      completed("remove");
+    },
+  };
+  t.after(async () => {
+    await cleanupP(resources, primaryFailure, message => t.diagnostic(message));
+  });
+  try {
+    throw new Error("M3849_PRIMARY_SENTINEL");
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  }
+});
+`);
+    // A nested test process must use its own reporter rather than the parent's IPC.
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const child = spawnSync(process.execPath, [
+      "--import", "tsx", "--test", "--test-reporter=tap", "--test-timeout=120000", fixturePath,
+    ], {
+      cwd: path.resolve(__dirname, "../../agent"), env, encoding: "utf8", timeout: 125_000,
+    });
+    assert.ifError(child.error);
+    assert.equal(child.signal, null);
+    assert.equal(child.status, 1, "the body and cleanup failures remain failures");
+    const output = child.stdout + child.stderr;
+    assert.match(output, /M3849_PRIMARY_SENTINEL/);
+    assert.match(output, /# P cleanup failed: dispose: .*M3849_CLEANUP_SENTINEL/);
+    assert.match(output, /cleanup results: transport=completed, dispose=failed, provider=completed, remove=completed/);
+    assert.match(output, /baseAbsent=true/);
+    assert.deepEqual(readFileSync(completedPath, "utf8").trim().split("\n"),
+      ["transport", "dispose", "provider", "remove"]);
+    assert.equal(existsSync(f.base), false);
+  } finally {
+    rmSync(f.base, { recursive: true, force: true });
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
 
 test("P cleanup: removal that leaves a directory fails with final absence diagnostics", async () => {
   const f = fixture();
