@@ -601,6 +601,14 @@ fs.openSync = function (p, ...rest) {
     assert.deepStrictEqual(onlyForeign.incompleteReasons, ["unresolved"], "an unexplained flag falls back");
   });
 
+  it("a hostile helper summary with a huge why array neither throws nor drops what other passes found", async () => {
+    const clean = fakeHelper("clean.cjs", `K\t4242\thome\nA\t4343\tunreadable\n${summary({})}`);
+    const huge = fakeHelper("huge.cjs", summary({ truncated: true, why: Array.from({ length: 200_000 }, () => "pid_budget") }));
+    const r = await reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 1, wrappers: [clean, huge] });
+    consistent(r);
+    assert.deepStrictEqual(r, { killed: [4242], left: [4343], leftReasons: { 4343: "unreadable" }, complete: false, incompleteReasons: ["pid_budget"] });
+  });
+
   it("reasons aggregate across passes in canonical order, and survive a later throw", async () => {
     const exit7 = fakeHelper("e7.cjs", "", 7);
     const budgetOut = fakeHelper("pb.cjs", summary({ truncated: true, why: ["pid_budget"] }));

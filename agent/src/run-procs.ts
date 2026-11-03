@@ -383,8 +383,9 @@ export interface RunProcessReap {
  * `helper_output_overflow`, `helper_failed` (the helper rejected); `proc_root_unreadable` (exit 7),
  * `helper_bad_arguments` (exit 6), `helper_exit` (any other exit: an uncaught helper throw, a
  * failed setpriv/sudo wrapper and node's own fatal codes alike); `no_summary`,
- * `malformed_summary`, `malformed_line`, `unknown_record` (its output); `maintenance_budget` (the
- * maintenance budget ran out mid-pass), `scan_exception` (anything else that threw).
+ * `malformed_summary`, `malformed_line`, `unknown_record` (its output); `maintenance_budget` (a
+ * throw while the maintenance budget's signal is aborted: it ran out or was cancelled),
+ * `scan_exception` (anything else that threw).
  */
 export const INCOMPLETE_REASONS = [
   "pid_budget", "time_budget", "dir_read", "truncated",
@@ -410,7 +411,9 @@ function orderedReasons(found: ReadonlySet<IncompleteReason>): IncompleteReason[
 /** The helper summary's reasons: only allowlisted tokens whose own flag is set, plus the flag's
  *  fallback when a set flag has none (so an incomplete summary always names a reason). */
 function summaryReasons(summary: { truncated?: unknown; unresolved?: unknown; procMount?: unknown; why?: unknown }): IncompleteReason[] {
-  const tokens = Array.isArray(summary.why) ? summary.why.filter((t): t is string => typeof t === "string") : [];
+  // Deduplicated first: the helper's output is bounded only by the stdout cap, and a huge `why`
+  // must never throw here (that would drop what the passes already collected).
+  const tokens = Array.isArray(summary.why) ? [...new Set(summary.why.filter((t): t is string => typeof t === "string"))] : [];
   const out: IncompleteReason[] = [];
   const flag = (set: boolean, allowed: ReadonlySet<string>, fallback: IncompleteReason): void => {
     if (!set) return;
