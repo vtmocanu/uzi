@@ -72,7 +72,7 @@ test("same raw grant with a derived rise reholds repeatedly without capture/mode
     assert.equal(h.flight.parked, true);
     assert.deepEqual(h.f.read(), before);
   }
-  assert.deepEqual(h.counts(), { captures: 0, models: 0, proofs: 2, ownership: 4, terminal: 0, sends: 2 });
+  assert.deepEqual(h.counts(), { captures: 0, models: 0, proofs: 2, ownership: 6, terminal: 0, sends: 2 });
   assert.deepEqual(h.reports[0], { status: "recovery_wait", recovery_cause: cause, claim_generation: 2 });
 });
 
@@ -218,7 +218,7 @@ for (const field of ["device", "inode", "path"] as const) {
     await assert.rejects(h.run());
     assert.equal(h.counts().terminal, 0, "accounting identity drift must not terminalize an already-blocked adoption journal");
     assert.equal(h.flight.parked, true);
-    assert.deepEqual(h.counts(), { captures: 0, models: 0, proofs: 1, ownership: 2, terminal: 0, sends: 1 });
+    assert.deepEqual(h.counts(), { captures: 0, models: 0, proofs: 1, ownership: 3, terminal: 0, sends: 1 });
     assert.deepEqual(h.f.read(), originalJournal);
     assert.equal(h.f.values.get(h.f.ownerKey)![0], originalRecord, "rehold must not rebind or consume owner accounting");
     await assert.rejects(h.f.reserve(3, 2, 100, h.runner.git), /binding changed/);

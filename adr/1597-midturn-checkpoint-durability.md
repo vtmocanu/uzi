@@ -17,10 +17,12 @@ api-brokered checkpoint push this ADR's tick reuses without changing the broker)
 overlay-less publish path deliberately does not build — see below).
 
 **Supersession (#1964, 2026-10-07)**: The original #1597 decision left unscanned
-checkpoint sinks able to publish a finding seen by a scanned sink. #1964 supersedes
-that current-policy claim with a shared, process-local remediation hold at the upload
-seam. Scanning coverage is unchanged; the hold and its explicit residual boundaries
-are recorded below.
+checkpoint sinks able to publish a finding seen by a scanned sink. #1964 superseded
+that policy with a shared, process-local remediation hold at the upload seam.
+For unenrolled flights, scanning coverage and the process-local residual remain as
+recorded below. [ADR-1296's 2026-11-02 source-selection amendment](1296-durable-run-recovery.md#amendment-2026-11-02--durable-remediation-source-selection)
+adds the narrow enrolled-source exception: durable restrictions and fresh proofs,
+not a repository-wide scan policy or a publication/release grant.
 
 ## Decision (summary)
 
@@ -52,9 +54,10 @@ whole turn, in the worst case. This closes that gap **inside** the turn:
    packed, minus content already public, before the pack is built; a finding or an
    untrusted scan skips the remote publish and falls back to the local fetch-back only. On
    a Codex run such an overlay-less (non-GitHub) milestone publish is instead deferred
-   (`scan_deferred`) rather than scanned inside the boundary permit; a GitHub milestone —
-   Codex or otherwise — always carries an overlay context and, when the #1964 hold
-   permits publication, publishes unscanned.
+   (`scan_deferred`) rather than scanned inside the boundary permit. For unenrolled
+   flights, a GitHub milestone carries an overlay context and, when the #1964 hold
+   permits publication, publishes unscanned. Enrolled sources additionally require
+   the ADR-1296 proofs described below.
 5. **The tick runs in a cancellable process scope**: a quiescing run, shutdown, or a
    preempting sink waits for every tick child to exit, every lock wait to resolve, and any
    in-flight publish to settle before the clone or bare is touched again.
@@ -186,8 +189,9 @@ holds only while the tick actually runs (the clone is not git-busy, the sink gat
 and no retained bare lock remains), the scan of the pinned range is trusted and finding-free, and the broker accepts the
 publish. A git-busy marker defers the tick for as long as it is present, whatever its age; a
 finding or an untrusted scan keeps that tick's work on worker-local storage. Under #1964,
-remembered findings also hold unscanned checkpoint uploads in the current flight; that
-memory is lost on reclaim or a new flight, so this is not durable containment (see the
+remembered findings also hold unscanned checkpoint uploads in the current flight. For
+unenrolled flights, that memory is lost on reclaim or a new flight, so it is not durable
+containment; enrolled sources retain restrictions under the ADR-1296 amendment (see the
 explicit residual boundaries below). The tick starts a failed publish's next logical
 operation at most once per `CHECKPOINT_INTERVAL`. In each of those cases the work is at
 risk from a worker-disk loss, and is never reported as durable.
@@ -199,9 +203,11 @@ alone — with the remote publish skipped or failing — is never reported as du
 shutdown feed (see the reason classes below): it is exactly the pre-existing PRD #267
 local-only fallback, unchanged.
 
-### The claim boundary that does not move: park/shutdown/pause/capture and every GitHub milestone stay unscanned
+### Unenrolled scan boundary: park/shutdown/pause/capture and GitHub milestones stay unscanned
 
-**This is unchanged by design, not an oversight.** Scanning covers every checkpoint publish
+**For unenrolled flights, the #1597 scan policy is unchanged.** The enrolled-source
+exception is specified in the ADR-1296 amendment linked above and summarized below.
+For unenrolled flights, scanning covers every checkpoint publish
 that goes through the checkpoint body **without** an overlay context: the mid-turn tick, the
 time-gated iteration-boundary tier, and milestone publishes on non-GitHub forges. On a Codex
 run such a milestone publish is deferred (`scan_deferred`) instead of being scanned inside
@@ -219,8 +225,9 @@ highest-frequency, highest-exposure publish path uzi has. Concretely: **a secret
 and then removed within the same single turn is caught by any scanned publish whose range
 contains the adding commit**, because gitleaks git mode scans each commit's patch. The
 original unscanned publishers (park/shutdown/pause/capture, and GitHub milestone publishes)
-could ship it under #1597. #1964 supersedes that policy: a finding remembered in the current
-flight holds those uploads too, while never-flagged content remains outside that hold.
+could ship it under #1597. #1964 superseded that policy: for unenrolled flights today,
+a finding remembered in the current flight holds those uploads too, while never-flagged
+content remains outside that hold.
 **uzi's push-protection handling runs only at finalize** — it is not relied on as a
 backstop for this path (`agent/src/secret-scan-guard.ts`'s pre-push scan plus the `GH013`
 remote parse). It cannot undo content already shipped by an earlier checkpoint to the
@@ -236,10 +243,12 @@ are added — the same as gitleaks git mode for ordinary commits, and now for me
 
 ### The #1964 remediation hold at the upload seam
 
-Every checkpoint upload goes through `RunRunner.publishCheckpointOutcome`: usage-limit
+Checkpoint uploads go through `RunRunner.publishCheckpointOutcome`: usage-limit
 park, graceful shutdown, pause, credentialed and credential-free recovery, credential
 switch, completion-hold/wall parks, and checkpoint-body publishes, including overlay and
-pinned-range variants. `checkpointRemediationHold` holds a candidate while the current
+pinned-range variants. At this shared seam, enrolled sources require the durable-source
+and candidate proofs summarized below. For unenrolled flights,
+`checkpointRemediationHold` holds a candidate while the current
 `RunFlight.secretRemediation` has nonempty `known` or `blocked` findings, overflow, or a
 retained flagged SHA that is an ancestor of the candidate. Unknown ancestry, an unresolved
 candidate when retained SHAs need checking, or a git error holds the upload too.
@@ -257,18 +266,50 @@ existing capture paths, but a held upload provides no origin durability. A fresh
 whose upload is held fails and the run continues; the already-durable pause shortcut is
 unchanged.
 
+### Enrolled-source exception (ADR-1296, 2026-11-02)
+
+[ADR-1296's source-selection amendment](1296-durable-run-recovery.md#amendment-2026-11-02--durable-remediation-source-selection)
+is authoritative for attempt-bound sources enrolled in `remediationRecovery`.
+The worker persists flagged OIDs, displaced-head edges and excluded roots across
+successor readiness and episode completion. Cold runner, GitCache and recovery
+consumers independently confirm source identity, the attempt ledger, tracking
+ownership and config readback, including config and directory sync confirmation.
+A readable record alone supplies no clean grant.
+
+The enrolled path requires trusted merge-aware continuation history scans before
+successor admission/model launch, plus fresh checks of the actual source, transformed
+candidate and resolved floors before bridge, pack, push and producer replay. Unknown
+or unavailable proof holds the operation. Required floors remain intact; a conflicting
+floor holds rather than being removed. See `readRemediationUnderLock` in
+[git.ts](../agent/src/git.ts) and `requireLaunchAuthority`,
+`withRemediationCandidateAdmission` in [runner.ts](../agent/src/runner.ts);
+the amendment specifies the full proof boundaries.
+
+Selecting clean execution source S while retaining coverage envelope C grants no
+publication, prerequisite closure, FINAL, release or ACK authority over C.
+The independent closure proof remains required, and captured-C guards apply to
+new FINAL mint, saved replay, release, receipt reconciliation, ACK and held
+publication (see `restrictionsAllowCapturedC` in [recovery.ts](../agent/src/recovery.ts)).
+Enrolled retirement/reanchor and unproven metadata-loss rebind refuse. A successful
+path is unimplemented and needs a reviewed authority design. The worker manages the
+existing journal and authority bindings; no new configuration knob or user action is required.
+
 ### Explicit residual boundaries (#1964)
 
-The park/shutdown/pause/capture and GitHub-milestone sinks remain **UNSCANNED**; #1964
-adds no scan. Unknown, never-flagged content is outside the remembered-finding hold.
-Ancestry containment also does not cover workflow tree content copied into an overlay from
-a non-parent commit: copying its tree does not make that commit an ancestor.
+For unenrolled flights, the park/shutdown/pause/capture and GitHub-milestone sinks
+remain **UNSCANNED**; #1964 itself added no scan. Unknown, never-flagged content is
+outside the remembered-finding hold. Ancestry containment also does not cover workflow
+tree content copied into an overlay from a non-parent commit: copying its tree does not
+make that commit an ancestor.
 
-Remediation memory is process-local `RunFlight` state and is **lost on reclaim or a new
-flight**, including same-worker reclaim. Local commits can survive on that worker; a later
-unscanned publish before another finding is recorded may ship the previously flagged
-content. Persisting remediation evidence or mandating resume scans remains separate work
-under the approved plan's explicit residual boundaries; neither is provided by #1964.
+Unenrolled remediation memory is process-local `RunFlight` state and is **lost on reclaim
+or a new flight**, including same-worker reclaim. Local commits can survive on that
+worker; a later unscanned publish before another finding is recorded may ship the
+previously flagged content. Persisting that unenrolled evidence or mandating resume scans
+remains separate work; neither was provided by #1964. The enrolled exception above
+changes neither repository-wide scan policy nor the exposure of already-published
+content. Private local captures, archive upload and export remain available under their
+existing guards; retained private bytes establish no publication or release authority.
 
 ### The scan hardening
 
@@ -782,11 +823,13 @@ substitute for.
   (ADR-122) and the workflow overlay (ADR-1036) are both reused byte-unchanged.
 - **No durability claim is made while every publish sink is unreachable**; a fetch-back
   with no successful remote publish is reported exactly as before (never `published`).
-- **The claim boundary intentionally does not widen**: park/shutdown/pause/capture and every
-  GitHub milestone publish remain unscanned, by design, not oversight — see the dedicated
-  section above. #1964 holds current-flight remembered findings at the shared upload seam,
-  but does not persist that memory or add resume scans. A future decision to scan these
-  sinks or persist remediation evidence is separate work.
+- **The unenrolled claim boundary does not widen**: park/shutdown/pause/capture and GitHub
+  milestone publishes remain unscanned for unenrolled flights. #1964 holds their
+  current-flight remembered findings at the shared upload seam but did not persist
+  that memory or add resume scans; extending those unenrolled guarantees remains
+  separate work. Enrolled sources instead require the durable restrictions and fresh
+  proofs in [ADR-1296's source-selection amendment](1296-durable-run-recovery.md#amendment-2026-11-02--durable-remediation-source-selection).
+  Neither policy remediates already-published content or forbids private capture/upload/export.
 - **Neither `CHECKPOINT_TICK_INTERVAL` nor `CHECKPOINT_INTERVAL` is exposed via the chart or
   the controller**, so hosted workers run the defaults (`5m`/`20m`); overriding either needs
   a worker-env change outside the chart's current surface.

@@ -879,10 +879,12 @@ for (const cancel of [false, true]) {
   const { CrossCheckRunner } = await import("../src/cross-check-runner.js");
   const { ActiveRunRegistry } = await import("../src/active-run-registry.js");
   const { acquireCodexOperationScope } = await import("../src/codex-operation-scope.js");
-  const { AdmissionClock, flushUntil } = await import("./operation-admission-clock.js");
+  const { AdmissionClock } = await import("./operation-admission-clock.js");
   await fs.mkdir(new URL("../../.uzi/scratch/", import.meta.url), { recursive: true });
   const root = await fs.mkdtemp(fileURLToPath(new URL("../../.uzi/scratch/m3-checker-", import.meta.url)));
   const clock = new AdmissionClock();
+  let enteredWait!: () => void;
+  const waiting = new Promise<void>(resolve => { enteredWait = resolve; });
   const registry = new ActiveRunRegistry();
   const c = claim(true); c.claim_generation = 7;
   const owner = new AbortController();
@@ -901,13 +903,24 @@ for (const cancel of [false, true]) {
    reportState: async () => ({ applied: true }), getInputs: async () => ({ inputs: [] }),
    postMessages: async () => {}, reportCrossCheckVerdict: async () => {},
   } as unknown as WorkerClient;
-  const scope = acquireCodexOperationScope(client, c.run_id, 7, { now: () => clock.now, sleep: clock.sleep });
+  const scope = acquireCodexOperationScope(client, c.run_id, 7, { now: () => clock.now, sleep: (ms, signal) => {
+   const slept = clock.sleep(ms, signal);
+   enteredWait();
+   return slept;
+  } });
   const git = { ensureClone: async () => "bare", runnerCloneAtCommit: async () => "checkout", removeRunnerClone: async () => {} } as never;
   const runner = new CrossCheckRunner(client, git, { ...r.log, warn() {}, info() {}, error() {}, debug() {} } as Logger,
    { homeRoot: root, activeRuns: registry, pollMs: 1000, model: new CodexCrossCheck(client, r.log, r.deps) });
   const done = runner.execute(c, owner.signal);
+  let waitDeadline: ReturnType<typeof setTimeout> | undefined;
   try {
-   await flushUntil(() => clock.sleepers.size === 1);
+   await Promise.race([waiting,
+    done.then(() => { throw new Error("checker ended before entering its admission wait"); }),
+    new Promise<never>((_resolve, reject) => {
+     waitDeadline = setTimeout(() => reject(new Error("checker admission wait did not start")), 1000);
+    })]);
+   clearTimeout(waitDeadline);
+   assert.equal(clock.sleepers.size, 1);
    assert.equal(registry.build().active[0]?.account_cooldown?.kind, "checker");
    assert.equal(r.requests.some(f => f.method === "turn/start"), false);
    if (cancel) owner.abort(); else clock.advance(1000);
@@ -916,7 +929,7 @@ for (const cancel of [false, true]) {
    assert.equal(reads, cancel ? 1 : 2);
    assert.equal(registry.size, 0);
    assert.deepEqual(r.disposed.sort(), ["fileop", "provider"]);
-  } finally { owner.abort(); await done; scope.close(); await fs.rm(root, { recursive: true, force: true }); }
+  } finally { clearTimeout(waitDeadline); owner.abort(); await done; scope.close(); await fs.rm(root, { recursive: true, force: true }); }
  });
 }
 

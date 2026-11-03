@@ -177,9 +177,12 @@ archive copy.
 
 ### The exposure tradeoff
 
-[ADR-1597](1597-midturn-checkpoint-durability.md) documents that GitHub
-milestone checkpoints, and park/shutdown/pause/capture checkpoints, are
-published **without** the pre-publish secret scan. Keeping a salvage copy
+[ADR-1597](1597-midturn-checkpoint-durability.md) documents that, for unenrolled
+flights, GitHub milestone checkpoints and park/shutdown/pause/capture checkpoints
+are published **without** the pre-publish secret scan. Enrolled attempt-bound
+sources instead require the fresh restriction and candidate proofs in
+[ADR-1296's source-selection amendment](1296-durable-run-recovery.md#amendment-2026-11-02--durable-remediation-source-selection).
+Those guards do not erase content already published. Keeping a salvage copy
 adds discoverability of an already-published, possibly unscanned tip for
 up to the retention period (`UZI_RECOVERY_READY_RETENTION`, default 168h)
 — the same tradeoff #1810's retention already accepts for the branch and

@@ -1245,6 +1245,7 @@ describe("RunRunner — reap precedes the #1036 overlay's credentialed fetch (RE
 describe("issue #1086: two-tip checkpoint reconciliation (F2)", () => {
   interface TestFlight {
     runId: string;
+    barePath: string;
     branch: string;
     claimGeneration: number;
     owedContext: Promise<OwedCandidateContext>;
@@ -1272,8 +1273,13 @@ describe("issue #1086: two-tip checkpoint reconciliation (F2)", () => {
       defaultIdentity: { ref: "refs/remotes/origin/main", sha: "a".repeat(40) },
     };
     git.committedTrackingOwnership = async () => ({ kind: "owned", sha: "b".repeat(40), context });
+    git.readRemediationRestrictionFacts = async (bare, branch, runId) => {
+      assert.deepEqual([bare, branch, runId], ["bare", "branch", "run-1086"]);
+      return { enrolled: false, blocked: false, roots: [], flaggedOIDs: [], fingerprint: "unit-confirmed-absence" };
+    };
     return {
       runId: "run-1086",
+      barePath: "bare",
       branch: "branch",
       claimGeneration: 9,
       owedContext: Promise.resolve(context),

@@ -742,7 +742,7 @@ The "1–7 ... at 8" bound and "The limit remains 8" in the 2026-10-15 checker a
 
 Coverage still covers the `wip(park):` marker: the guarded inventory, bundle and held publication key on it, and coverage construction is unchanged. At successor adopt (`prepareRecoverySuccessor`), a restore tip that is a coverage wrapper over a marker is verified and peeled: all aggregates share one fingerprint, tree == tree(source), the worker identity at the fixed 2000-01-01 date, the fingerprint recomputes, and a `refs/uzi-coverage/<runId>/…/<fp>` pin resolves to the tip (provenance). The successor then adopts the marker as it adopts a plain marker tip (`reset --soft` to its parent: content uncommitted, neither marker nor wrapper in history).
 
-Leaves other than the source must be the source's ancestors or lineage-proven superseded markers. The worker-owned journal field `peeledMarkers` records markers peeled into the attempt that produced the source. Anything else (look-alike provenance, divergent committed work, a marker without lineage, lineage on another attempt) refuses before any write, keeping the source, pins and custody; the adopt attempt is recorded on the episode as `adoption_failed`. The original generic terminal failure is qualified by the #3527 amendment in [ADR-1197](1197-transient-recovery-park.md#amendment-2026-10-27-3527-owner-held-retained-adoption-retry): exact persisted evidence, API support, current ownership and proven quiescence permit an owner-held `retained_recovery_adoption_failed` park. A fresh owner grant and fresh owned claim authorize another charged attempt; without that grant it reholds without capture or model execution, and another adoption failure reholds. Unsupported or unproven cases keep the fail-closed fallback and custody. Past the episode deadline the stored blocker is instead `budget_exhausted`; the #3495 amendment in [ADR-1197](1197-transient-recovery-park.md) permits feature-negotiated bounded retries followed by an owner-held park for that confirmed persisted blocker. This reclassification does not prove the underlying adoption problem transient; renewed attempts must prove quiescence again.
+Under the original #3239 rule, leaves other than the source must be the source's ancestors or lineage-proven superseded markers. The [2026-11-02 source-selection amendment](#amendment-2026-11-02--durable-remediation-source-selection) adds a narrow authenticated remediation exception to the divergent-work refusal below. The worker-owned journal field `peeledMarkers` records markers peeled into the attempt that produced the source. Anything else (look-alike provenance, divergent committed work, a marker without lineage, lineage on another attempt) refuses before any write, keeping the source, pins and custody; the adopt attempt is recorded on the episode as `adoption_failed`. The original generic terminal failure is qualified by the #3527 amendment in [ADR-1197](1197-transient-recovery-park.md#amendment-2026-10-27-3527-owner-held-retained-adoption-retry): exact persisted evidence, API support, current ownership and proven quiescence permit an owner-held `retained_recovery_adoption_failed` park. A fresh owner grant and fresh owned claim authorize another charged attempt; without that grant it reholds without capture or model execution, and another adoption failure reholds. Unsupported or unproven cases keep the fail-closed fallback and custody. Past the episode deadline the stored blocker is instead `budget_exhausted`; the #3495 amendment in [ADR-1197](1197-transient-recovery-park.md) permits feature-negotiated bounded retries followed by an owner-held park for that confirmed persisted blocker. This reclassification does not prove the underlying adoption problem transient; renewed attempts must prove quiescence again.
 
 With #3239 a coverage-wrapper tip that cannot be fully verified (unreadable tip, more than 8 aggregates, more than 66 leaves = 64 owed roots + the original source + the current source, or any failed git read) is refused even over a clean source, rather than adopted as before. A non-tip commit the walk cannot read within bounds (over 64 KiB or not valid UTF-8) is treated as a leaf under the leaf rule, unless its subject claims to be a coverage commit (then it refuses). The walk goes through a readable commit whose message claims the coverage prefix without the exact coverage message; once any such look-alike is walked, the adopt refuses if a marker is involved at all (any marker leaf, or a marker source), and more than 8 look-alikes refuse outright. Because a look-alike's parents are walked, a shape with no marker can also refuse where it used to be adopted (walk bounds or a failed read), always keeping the source. A peeled marker that is itself the restore tip is journaled as lineage too, and the watcher backup script accepts the new `peeledMarkers` journal field.
 
@@ -750,7 +750,7 @@ Limitations: lineage does not survive a retired clone (an earlier marker still o
 
 ## Amendment 2026-10-29: reuse covered marker-free recovery sources
 
-Repeated provider retries without model progress must not nest another recovery wrapper merely because a clean successor adopted the preceding aggregate as its HEAD. New guarded inventories may reuse that current aggregate when its bounded commit shape and worker identity match and every original root is positively ancestral to it. The shared bounded wrapper walk must establish the exact marker-free case in which successor adoption does not consult provenance pins. A coverage-looking header is shape, not provenance; marker involvement, divergent roots or unproven eligibility never gain reuse authority. The original successor verifier, including its eight-aggregate bound, remains unchanged.
+Repeated provider retries without model progress must not nest another recovery wrapper merely because a clean successor adopted the preceding aggregate as its HEAD. New guarded inventories may reuse that current aggregate when its bounded commit shape and worker identity match and every original root is positively ancestral to it. The shared bounded wrapper walk must establish the exact marker-free case in which successor adoption does not consult provenance pins. A coverage-looking header is shape, not provenance; marker involvement, divergent roots or unproven eligibility never gain reuse authority. This reuse amendment leaves the original successor verifier, including its eight-aggregate bound, unchanged. The separate [2026-11-02 source-selection amendment](#amendment-2026-11-02--durable-remediation-source-selection) permits proven divergent adoption; it does not widen marker-free reuse.
 
 Reuse preserves the current tree and all frozen roots, recomputes the inventory fingerprint, and writes a separate ref in the existing run/generation/fingerprint namespace. It does not share ref ownership across generations or release any source, archive or custody. Eligibility depends on immutable objects and ancestry, not on whether an earlier generation's coverage pin survives cleanup. A new inventory fingerprint need not equal the reused commit's embedded fingerprint, so the optional archive-redundancy reader may return no claim. Full frozen-source proof and ordinary archive FINAL do not depend on that optimization.
 
@@ -796,7 +796,7 @@ the implementing PR.
 
 D5's refusal of a thin archive FINAL is narrowed, not removed. For an inventory-guarded **archive** FINAL only, a capture that lists prerequisites may release its hold when the API proves, at release time, that the capture's closure is pinned: the closure row is bound to the exact capture and hold, its checksum and prerequisites match the capture, no absence is recorded, and one fresh listing of `refs/uzi-prereq/<capture-id>` on GitHub.com shows the recorded tip. The hold then records `release_evidence = prerequisite_closure` with a `final_closure_id`. Without a positive listing the hold stays open: a recorded absence is refused as `prerequisite_pin_missing`, a different tip as `prerequisite_pin_foreign` (409), and an unlistable pin, timeout or limiter refusal as `prerequisite_pin_unavailable` (503). The proof is archive-only; it adds nothing for publication, held-publication or empty-inventory dispositions, and the server still does not parse bundle bytes (T1-T5 of ADR-3591 are unchanged).
 
-The worker mints a thin archive FINAL only under a transient grant and only against a pinned, matching closure; an unknown or transient result never grants. There are two grantors. The frozen path (`frozenOperationCycle`) can pass four grants: (1) missing v2 held metadata on a non-uncertain create; (2) proven held ineligibility; (3) an attested held-publication fallback in the same pass; (4) a feature snapshot naming the closure feature and neither held feature. The #2969 retained-claim caller (`captureAndUpload` with `closureMint: "retained_claim"`) is limited to grants 1 and 4; it runs while the run still executes, so it captures without minting and the mint comes from the later frozen pass. A committed release replays to its original ACK without forge I/O or admission, and a saved thin FINAL replays on its MAC and bundle header independent of the pin, expiry or knob.
+The worker mints a thin archive FINAL only under a transient grant and only against a pinned, matching closure; an unknown or transient result never grants. There are two grantors. The frozen path (`frozenOperationCycle`) can pass four grants: (1) missing v2 held metadata on a non-uncertain create; (2) proven held ineligibility; (3) an attested held-publication fallback in the same pass; (4) a feature snapshot naming the closure feature and neither held feature. The #2969 retained-claim caller (`captureAndUpload` with `closureMint: "retained_claim"`) is limited to grants 1 and 4; it runs while the run still executes, so it captures without minting and the mint comes from the later frozen pass. At the API, a committed release replays to its original ACK without forge I/O or admission. A saved thin FINAL's worker replay uses its MAC and bundle header independent of the pin, expiry or knob, subject to the fresh captured-C restriction guards in the [2026-11-02 amendment](#amendment-2026-11-02--durable-remediation-source-selection).
 
 Mixed-version limits, all fail closed:
 
@@ -811,3 +811,177 @@ Deploy-window cost: the schema migration (00393, renumbered at landing from draf
 Admission bound: each closure-backed FINAL that survives the unlocked precheck and is admitted spends one unit of a per-worker bucket (`prereq-final-list|<worker>`) on the proposal limiter, never refunded. Replays and precheck refusals are not charged. The limiter is a fixed window per API process, so the bound is `PROPOSAL_RATE_LIMIT_MAX` per window per worker per API process, up to twice that across a window edge, multiplied by the number of API replicas. An admitted request costs at most two `GetProject` calls and one `ls-remote` on the owner's stored token; it can stop before the listing when under 3 s of the 6 s budget remain or the reservation fence is lost.
 
 Coordination with #2884: it also rebuilds the `recovery_inventory_hold_guard` function and the release-evidence CHECK. Whichever lands second must rebuild from the other's live body rather than from its own copy; neither migration may drop the other's branch or constraint value.
+
+## Amendment 2026-11-02 — durable remediation source selection
+
+This amendment narrows #3239's divergent-leaf refusal for source selection. A
+worker may continue from an exactly identified, remediated source S while a
+coverage envelope C retains excluded history for custody. S and C are distinct:
+the proof admits neither execution of C nor its publication, archive coverage,
+FINAL, release or ACK. Ordinary divergent work, equal trees and convincing
+commit subjects supply no authority. The 2026-10-29 marker-free reuse rule and
+the 2026-11-01 C2 release amendment remain separate contracts.
+
+The refusal also applies beyond enrolled remediation: missing or unverified
+`restoreSource`, or divergent marker-free coverage without verified
+source-selection evidence, refuses before successor clone creation, retaining
+work, pins and custody. Source-bound ordinary ancestor-only adoption is
+unchanged. Source-less legacy coverage could previously seed C and then require
+a base hold; the current refusal occurs before successor creation when source
+binding is absent. Equal trees or leaf dominance cannot supply authenticated S,
+and no legacy exception grants new authority. The existing feature-gated,
+persisted-blocker, current-ownership and quiescence requirements for an
+owner-held `retained_recovery_adoption_failed` park and fresh owned retry grant
+still apply; unsupported or unproven cases keep the existing fallback and
+custody. Historical journal lineage remains unknown without the journal, and
+old captures remain held.
+
+### Worker grant, import and source proof
+
+The worker records trusted findings and remediation decisions in the attempt-bound
+optional version-1 `remediationRecovery` journal. A positive grant has origin
+`checkpoint-pending` or `pre-exit`, its sequence identity, immutable original
+run/clone/attempt binding, scanned tip T and flagged commits Q. Persisting a
+negative finding alone opens no grant. The bounded parser accepts at most 64
+edges and 64 distinct flagged OIDs, with a 64 KiB serialized record cap; excluded
+roots additionally have a 1524-entry ceiling within that byte cap. Identifiers
+have field-specific byte and syntax limits (run 128, branch 1024, clone path
+4096, attempt 256 bytes), normalized absolute current clone paths, 40-hex OIDs
+and canonical context names. Identifier validation rejects control characters,
+line/paragraph separators and bidi marks/embeddings/overrides/isolates through
+`sanitizeForLog` equality; branch syntax is checked separately. Unknown keys or
+versions, duplicate/conflicting edges, cycles and overflow refuse; evidence is
+never evicted to fit. The worker and watcher backup parser enforce the bounds.
+Only the existing authenticated clone-path identity is stored, with no secret
+text, finding paths, commit subjects or credentials. Older strict workers reject
+the new key and retain the journal; rollback must not strip it to regain use.
+
+An authorized displacement records D → R, from preserved displaced source D
+to imported replacement R. The worker proves Q → T → D by ancestry, checks
+that the grant belongs to the same producing attempt, preserves D under its
+owed context, and writes a `prepared` edge before the import. Ownership and
+tracking receipt readback precede the `committed` edge write. A prepared edge,
+missing objects, unknown ancestry, changed identity or incomplete proof refuses
+source adoption. The current tracking head is custody evidence, not an
+attempt identity or permission to rewrite the source journal.
+
+Writes fsync the config and its directory and require exact readback. Consumers
+repeat both syncs under the bare-repository lock and require canonical first-read/
+second-read equality for the whole record; reading never promotes prepared edges.
+They independently re-confirm the
+live current attempt ledger, original grant bindings, current HEAD, tracking
+ownership, preserved contexts and Q → T → D. A readable old record cannot
+discharge newer pending negative facts. An exact current owned-tip trusted scan
+closes an active grant only when its applicable history is clean and every
+persisted flagged OID is positively divergent. Closure keeps completed edges;
+subsequent ordinary divergence gains no authority. These checks are implemented by
+`parseRemediationRecovery`, `recordRemediationScan`,
+`readRemediationUnderLock` and the import path in
+[git.ts](../agent/src/git.ts).
+
+For adoption, each divergent non-marker leaf must be an authorized displaced
+head or its ancestor. Each authenticated edge's replacement must reach S,
+directly by ancestry or through later independently authorized displacement
+hops in recorded order; an earlier replacement may have ordinary progress
+before the later displacement. A later hop still needs its own edge proof,
+even when one active grant authorizes several partial rewrites. A lineage-proven
+marker must be in the same attempt's preserved `peeledMarkers`, and its parent
+must be covered by source ancestry or an authorized displacement. Marker-free
+divergent wrappers require the same full fingerprint, worker identity, tree,
+coverage-pin and leaf proof. Marker-free shape alone does not bypass it.
+The eight-aggregate and bounded wrapper-walk checks remain.
+
+The non-marker source path seeds exact HEAD S with a clean index matching S
+and verifies no unstaged diff, without importing C's excluded parents. The existing #3239 marker
+path instead soft-resets to the marker's parent, retaining its content in the
+index; the remediation path additionally proves forward reachability to that
+execution parent and excludes the peeled source. Neither path infers permission
+from a clean tree. See `resolveMarkerWrapperAdoption`,
+`proveRemediationForwardTarget` and `prepareRecoverySuccessor` in
+[git.ts](../agent/src/git.ts).
+
+### Continuation, publication and cold consumers
+
+Before successor admission and model launch, the enrolled path requires a
+trusted merge-aware history scan and positive divergence of the restricted
+roots from the execution source and resolved floors. The shared floor union
+includes published candidates, range exclusion, scan floors, pack exclusions
+and the default-blob tip; an empty flight-local floor list cannot hide a flagged
+default-branch ancestor. Before bridge, pack creation, push and producer replay,
+the worker checks the actual source, transformed candidate and floors again.
+Untrusted scans, unknown ancestry or changed evidence hold the operation.
+Required publication floors remain intact; a conflicting floor causes a hold.
+[runner.ts](../agent/src/runner.ts) implements these boundaries in
+`requireLaunchAuthority`, `remediationRangeFloors` and
+`withRemediationCandidateAdmission`; Git's locked admission checks retain the
+candidate/tracking binding through their writes.
+
+A verified successor transfer preserves immutable grant origins and records the
+new current clone/attempt binding, with synchronized readback before use.
+Flagged OIDs, displaced heads and excluded roots survive `ready-for-model`
+and episode completion; clearing the episode removes no restriction record.
+Fresh runner, GitCache and recovery-coordinator consumers must authenticate
+those persisted facts rather than restoring a process-local clean grant.
+Enrolled-source retirement/reanchor and ordinary metadata-loss rebind
+**refuse**. Protected or retired records confer custody evidence alone.
+A successful enrolled-source retirement/reanchor/rebinding path is not
+implemented and needs a reviewed authority design; this amendment promises no
+such transfer. The relevant guards are `assertRemediationPreserved` and
+`retireRunnerClone` in [git.ts](../agent/src/git.ts).
+
+An uploaded RecoveryRecord proves retained bytes, not quiescence. Source-use
+admission still requires joined execution cleanup and the existing process
+proof; an unresolved tail or surviving in-scope writer supplies no adoption
+authority. The focused incident, publication, quiescence and cold-restart
+fixtures are in
+[git-remediation-incident.test.ts](../agent/test/git-remediation-incident.test.ts),
+[runner-remediation-publication.test.ts](../agent/test/runner-remediation-publication.test.ts),
+[runner-remediation-quiescence.test.ts](../agent/test/runner-remediation-quiescence.test.ts)
+and [runner-remediation-restart.test.ts](../agent/test/runner-remediation-restart.test.ts).
+The restart fixture covers adopting, ready-before-progress and episode-complete
+cuts, then fresh consumers after an actual refused enrolled retirement; it
+does not demonstrate successful reanchor.
+
+### C1b and C2 remain independent
+
+Private capture, upload and export are unchanged. Such a capture may trigger
+independent C1b T1–T5 prerequisite proof and a fresh default-tip D pin, after
+that proof's own checks. D is not the recovery envelope C. Adoption supplies
+no prerequisite-pin or closure authority, and an independently existing pin
+does not authorize flagged or excluded C.
+
+C2 still requires its own transient grant, verified ordinary local thin capture,
+feature and pinned matching closure, plus the grantor-specific checks in the
+[2026-11-01 appendix](#amendment-2026-11-01-3727-c2-d5-thin-archive-final-on-a-pinned-prerequisite-closure)
+and [ADR-3591](3591-prerequisite-closure.md#amendment-2026-11-01-3727-c2-release-consumes-the-pin).
+Source adoption grants no FINAL mint, replay, release, ACK or archive coverage.
+The coordinator evaluates restrictions against the actual captured C, not
+clean S, for new mint, saved FINAL replay, release, receipt reconciliation
+and ACK. Held-publication preparation and transport likewise guard actual C.
+A blocked or unavailable record, or a restricted root not proven divergent
+from C, holds those effects even if C has an independent prerequisite pin.
+Checked journal writes acquire the journal lock then the bare lock and retain
+both through the fresh negative-proof check and write; reads around awaited
+work re-confirm the record and restriction fingerprint.
+See `restrictionsAllowCapturedC` and `writeRestrictionCheckedRecord` in
+[recovery.ts](../agent/src/recovery.ts).
+The independent #3727 closure proof remains necessary.
+
+There is no database or accounting change here. Existing admission and custody
+logic remains unchanged; worker-call spies and fixed-input fixture counters
+are not SQL hold-count evidence.
+
+### Historical incident boundary
+
+The supplied sanitized incident chronology records `secret_found` at 21:35 and
+`secret_remediation_pending` at 22:00. The 00:06 rebase/amend removed reported
+text; the first displacement at 00:08 excluded `6230950e` (including `dc9c064d`,
+on `a871f5ec`) while the checkpoint gate was pending, before the 04:55 pre-exit
+prompt. A later rewrite displaced `91bdbe51` and produced `a338f6f5`. The earlier
+`c7459622` → `dd3f4f10` marker peel was not remediation authority.
+Legacy incidents lack the new attempt-bound grant/edge records and remain held.
+Without the GitCache journal, marker lineage membership is unknown, not a
+passing proof. The sanitized trace establishes neither adopt nor release
+authority. #3583 independently owns its historical publication investigation
+and any release of rewritten roots; this change neither diagnoses it nor depends
+on publishing those roots.

@@ -94,6 +94,8 @@ async function child(mode: Mode): Promise<void> {
   if (mode === "success-refused") batcher.reserveCandidateTransport().cancel();
   const flight = {
     runId: "run-1725",
+    barePath: bare,
+    branch,
     retainedEpisode: mode === "retained-early500",
     runKind: "issue",
     claimGeneration: 1,
