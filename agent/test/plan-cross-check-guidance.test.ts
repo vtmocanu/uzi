@@ -85,7 +85,7 @@ const crashClaimClauses = [
   ["atomic_readers", "Atomic means readers never observe partial state."],
   ["process_crash", "Check that the plan states whether durability is across a process crash or across storage or power loss."],
   ["crash_recovery", "Check that the plan specifies the state recovered after a crash."],
-  ["mechanism_and_ordering", "Check that the plan cites the matching file:line mechanism and required ordering for each claimed property and failure model."],
+  ["mechanism_and_ordering", "Check that the plan cites the file:line of each existing mechanism it relies on, specifies each new mechanism it introduces and how that will be verified, and states the required ordering for each claimed property and failure model."],
   ["rename_not_durability", "An atomic rename provides atomic replacement, not storage durability."],
   ["file_and_directory_sync", "For filesystem durability across storage or power loss, check that the plan requires syncing the file and the directory containing each new or renamed entry in the required order."],
   ["database_commit", "For database durability, check that the plan identifies the transaction commit guarantees and configuration relied on."],

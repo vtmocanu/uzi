@@ -415,7 +415,7 @@ func TestLeadPlanCrashClaimGuidance(t *testing.T) {
 		{"atomic_readers", "Atomic means readers never observe partial state."},
 		{"process_crash", "State whether durability is across a process crash or across storage or power loss."},
 		{"crash_recovery", "Specify the state recovered after a crash."},
-		{"mechanism_and_ordering", "Cite the matching file:line mechanism and required ordering for each claimed property and failure model."},
+		{"mechanism_and_ordering", "Cite the file:line of each existing mechanism you rely on, specify each new mechanism you introduce and how it will be verified, and state the required ordering for each claimed property and failure model."},
 		{"rename_not_durability", "An atomic rename provides atomic replacement, not storage durability."},
 		{"file_and_directory_sync", "For filesystem durability across storage or power loss, sync the file and the directory containing each new or renamed entry in the required order."},
 		{"database_commit", "For database durability, identify the transaction commit guarantees and configuration relied on."},

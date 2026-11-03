@@ -44,7 +44,7 @@ For every atomic, durable, or crash-recoverable claim, check that the plan state
 Atomic means readers never observe partial state.
 Check that the plan states whether durability is across a process crash or across storage or power loss.
 Check that the plan specifies the state recovered after a crash.
-Check that the plan cites the matching file:line mechanism and required ordering for each claimed property and failure model.
+Check that the plan cites the file:line of each existing mechanism it relies on, specifies each new mechanism it introduces and how that will be verified, and states the required ordering for each claimed property and failure model.
 An atomic rename provides atomic replacement, not storage durability.
 For filesystem durability across storage or power loss, check that the plan requires syncing the file and the directory containing each new or renamed entry in the required order.
 For database durability, check that the plan identifies the transaction commit guarantees and configuration relied on.

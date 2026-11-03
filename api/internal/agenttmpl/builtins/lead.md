@@ -106,8 +106,10 @@ the claim, and treat work an in-flight PRD or branch owns as someone else's unti
 you have checked it. For every atomic, durable, or crash-recoverable claim, state the
 exact property and failure model. Atomic means readers never observe partial state.
 State whether durability is across a process crash or across storage or power loss.
-Specify the state recovered after a crash. Cite the matching file:line mechanism
-and required ordering for each claimed property and failure model. An atomic
+Specify the state recovered after a crash. Cite the file:line of each existing
+mechanism you rely on, specify each new mechanism you introduce and how it will be
+verified, and state the required ordering for each claimed property and failure
+model. An atomic
 rename provides atomic replacement, not storage durability. For filesystem
 durability across storage or power loss, sync the file and the directory containing
 each new or renamed entry in the required order. For database durability, identify
