@@ -110,6 +110,38 @@ func TestOwnerSteeringFreezeAcrossRoundsLiveDB(t *testing.T) {
 	}
 
 	decideRevise(t, env, svc, w, cc1)
+
+	// The real owner-scoped write path. SubmitInput accepts an answer only from a parked run, and
+	// round 1 had to freeze while the lead ran, so the park happens here, between the rounds: the
+	// lead parks on q3, a foreign user's answer is refused, the owner's is stored, the lead resumes.
+	q3 := "q3-" + uuid.NewString()
+	env.exec(`INSERT INTO run_messages (run_id, seq, kind, agent, payload, created_at)
+		VALUES ($1, 19003, 'question', 'lead', $2::jsonb, now() - interval '5 seconds')`, lead, fmt.Sprintf(steeringLeadQuestion, q3))
+	env.exec(`UPDATE runs SET status='awaiting_input', open_question_id=$2 WHERE id=$1`, lead, q3)
+	countInputs := func() int {
+		var n int
+		if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='answer'`, lead).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	before := countInputs()
+	foreignBody := fmt.Sprintf(`{"question_id":%q,"answers":["foreign answer"]}`, q3)
+	if _, err := svc.SubmitInput(env.ctx, uuid.New(), lead, "answer", foreignBody, nil); !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("a foreign user's answer must be refused as not found, got %v", err)
+	}
+	if got := countInputs(); got != before {
+		t.Fatalf("the refused foreign answer wrote %d row(s)", got-before)
+	}
+	ownerBody := fmt.Sprintf(`{"question_id":%q,"answers":["owner answer via submit"]}`, q3)
+	if _, err := svc.SubmitInput(env.ctx, w.UserID, lead, "answer", ownerBody, nil); err != nil {
+		t.Fatalf("owner answer: %v", err)
+	}
+	if got := countInputs(); got != before+1 {
+		t.Fatalf("answers stored = %d, want %d", got, before+1)
+	}
+	env.exec(`UPDATE runs SET status='running', open_question_id=NULL WHERE id=$1`, lead)
+
 	cc2, err := svc.SubmitPlanCrossCheck(env.ctx, w, lead, 1, c, 2)
 	if err != nil {
 		t.Fatal(err)
@@ -117,6 +149,12 @@ func TestOwnerSteeringFreezeAcrossRoundsLiveDB(t *testing.T) {
 	second := storedSteering(t, env, cc2)
 	if !strings.Contains(second, q1) || !strings.Contains(second, q2) || !strings.Contains(second, "yes, add an index") {
 		t.Fatalf("round 2 lacks the new answer: %s", second)
+	}
+	if !strings.Contains(second, "owner answer via submit") || strings.Contains(second, "foreign answer") {
+		t.Fatalf("round 2 must hold the owner's SubmitInput answer and not the foreign one: %s", second)
+	}
+	if strings.Contains(first, q3) || strings.Contains(first, "owner answer via submit") {
+		t.Fatal("round 1 snapshot contains an answer submitted after it froze")
 	}
 	if got := storedSteering(t, env, cc1); got != first {
 		t.Fatal("round 1 bytes changed after round 2 froze")

@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -481,6 +483,46 @@ func TestInsertOwnerSteeringLiveDB(t *testing.T) {
 	}
 	if _, err := fx.q.GetOwnerSteering(fx.ctx, plan); err == nil {
 		t.Fatal("steering row outlived its round")
+	}
+}
+
+// A claimable code-stage checker child keeps its existing eligibility for a worker advertising exactly
+// today's code-checker capabilities and NOT cross_check_owner_steering_v1: the steering clause is
+// scoped to plan-stage children.
+func TestOwnerSteeringCodeChildUnaffectedLiveDB(t *testing.T) {
+	fx := steeringFixture(t)
+	w := fx.worker("code-host", capOf(1), false)
+	caps := []string{"cross_check_v1", "cross_check_lane_v1", "cross_check_code_v1", "codex_harness_v1", "codex_runtime_v2"}
+	mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET protocol_capabilities=$2, max_cross_check_slots=1 WHERE id=$1`, w, caps)
+	lead := fx.queuedRun()
+	mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET kind='task',interactive=true,status='awaiting_followup',issue_iid=NULL,
+		branch='uzi/interactive-test',worker_id=$2,claim_generation=1,code_cross_check_required=true WHERE id=$1`, lead, w)
+	child := fx.queuedRun()
+	mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET kind='cross_check',issue_iid=NULL,target_run_id=$2,harness='codex',
+		report_only=true,budget_wall_seconds=1800,required_capabilities='{}',required_tools='{}',
+		status_since=now()-interval '1 hour',worker_id=$3 WHERE id=$1`, child, lead, w)
+	mustExec(fx.ctx, t, fx.pool, `INSERT INTO cross_checks
+		(lead_run_id,checker_run_id,stage,round,lead_claim_generation,verdict,
+		 head_commit,base_commit,candidate_digest,outcome,reason_class,code_context,
+		 guidance_snapshot,guidance_text,guidance_digest,repo_instructions_text,repo_instructions_digest,
+		 checker_harness,created_at,deadline_at,decided_at)
+		VALUES ($1,$2,'code',1,1,'failed',repeat('b',40),repeat('a',40),$3,'pending',NULL,'{}','',
+		 '',sha256(convert_to('', 'UTF8')),'',sha256(convert_to('', 'UTF8')),'codex',
+		 now()-interval '10 seconds',now()+interval '5 minutes',NULL)`, lead, child, []byte("digest"))
+	if got := claimableCount(fx, child, leaseInterval(leaseTwoHours)); got != 1 {
+		t.Fatalf("code child claimable=%d, want 1 for a worker without cross_check_owner_steering_v1", got)
+	}
+	// A code checker is claimed through the cross_check lane.
+	now := time.Now()
+	got, err := fx.q.ClaimRun(fx.ctx, store.ClaimRunParams{WorkerID: pgU(w), Lane: "cross_check", UserID: fx.userID,
+		CrossCheckEvaluatedAt:    pgtype.Timestamptz{Time: now, Valid: true},
+		CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+		AffinityCutoff:           pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+		SpreadCutoff:             pgtype.Timestamptz{Time: now.Add(-time.Minute), Valid: true},
+		HeartbeatCutoff:          pgtype.Timestamptz{Time: now.Add(-time.Minute), Valid: true},
+		WorkerCaps:               []string{}, WorkerProtocolCaps: caps, CapabilityAware: false})
+	if err != nil || got.ID != child {
+		t.Fatalf("code child claim: run=%s err=%v", got.ID, err)
 	}
 }
 
