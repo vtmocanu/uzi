@@ -336,6 +336,7 @@ function createRuntime(options = {}) {
       },
       matchesEntry(current, previous) {
         requireIdle();
+        if (stickyStop) throw new Error('epoch reclaim stopped');
         activeScope?.assertExclusive();
         uuid(current); uuid(previous);
         if (mode !== 'exclusive') return false;
