@@ -107,6 +107,11 @@ def decoder(budget=None):
 
 
 class DescriptorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Fresh checkouts do not contain the worker-provisioned scratch directory.
+        (HERE.parents[3] / ".uzi" / "scratch").mkdir(parents=True, exist_ok=True)
+
     def decode(self, e, active=None, rows=None, budget=None):
         return decoder(budget).decode(dump(e), active, ledger(e, active) if rows is None else rows)
 
