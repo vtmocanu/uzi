@@ -126,6 +126,7 @@ import type { ExecutionRegistry, RegisteredRoot } from "./registry.js";
 import { CodexTransportError, isProviderTurnMethod, type CodexNotification, type CodexTransport } from "./transport.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
 import type { RenderedCodexRun } from "./render.js";
+import { DISPATCH_OPEN_AT_TURN_END, DISPATCH_STOPPED, DISPATCH_STREAM_FAILED } from "./dispatch-diagnostics.js";
 
 // --- typed harness error ------------------------------------------------------
 
@@ -428,13 +429,6 @@ interface ChildBinding {
   capped: boolean;
 }
 
-/** The synthesized lead completion for a bound dispatch the run stopped (abort/stop/close). */
-const DISPATCH_STOPPED = "delegation stopped by the run; child settlement not confirmed";
-/** The synthesized lead completion for a bound dispatch still open when its turn finished. */
-const DISPATCH_OPEN_AT_TURN_END = "delegation still open at turn end; child settlement not confirmed";
-/** The synthesized lead completion for a bound dispatch whose turn stream failed (a protocol or
- *  transport throw, e.g. an unexpected provider EOF). */
-const DISPATCH_STREAM_FAILED = "delegation ended by a provider stream failure; child settlement not confirmed";
 /** The lead tool name a dispatch is projected under (the server's milestone-lane contract). */
 const DISPATCH_TOOL_NAME = "Agent";
 /** The per-dispatch budget of projected child items and of their JSON-serialized bytes. A child
