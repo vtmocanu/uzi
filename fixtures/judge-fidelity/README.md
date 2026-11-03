@@ -1,6 +1,6 @@
 # judge-fidelity: the mock/server golden fixture (PRD #98, seam 6)
 
-`web/src/mocks/mockApi.ts` is not a stub. It reimplements the Judge backlog's dedup, the
+`web/src/mocks/mockApi/judge.ts` is not a stub. It reimplements the Judge backlog's dedup, the
 `dismissed > done > filed > todo` rollup, `run_count`, the rationale preview and the
 `?bucket=` filter, all of which also exist in Go. Until this fixture existed, the agreement
 between the two was verified only by reading -- and when it drifts, two things break at once
@@ -81,7 +81,7 @@ No `-update` flag on the Go side. No `toMatchSnapshot()` on the vitest side -- v
 rots into a snapshot" mechanism this fixture exists to prevent, so it is disqualified by
 construction rather than by discipline.
 
-The fixture is **authored to discriminate, never snapshotted from `web/src/mocks/data.ts`**.
+The fixture is **authored to discriminate, never snapshotted from `web/src/mocks/data/judge.ts`**.
 A golden derived from `mockReviews` would lock in the demo's own blind spot (measured
 2026-07-21: zero instances of `occurrences > run_count`, zero fully-settled groups with
 disagreeing members), agree on everything it covered, and read as full coverage.

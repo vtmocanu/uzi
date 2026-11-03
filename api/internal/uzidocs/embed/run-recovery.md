@@ -52,7 +52,7 @@ Automatic model-free preservation of blocked or orphaned terminal work
 remains disabled, and its capacity remains unverified. This change adds no
 new automatic preservation guarantee for uncommitted or local-only work.
 Local sources keep their existing protection and inspection/discard paths. See the
-[terminal-producer delivery hold](../adr/1197-transient-recovery-park.md#terminal-producer-delivery-hold-issue-3031-2026-10-20)
+[terminal-producer delivery hold](../adr/1197-transient-recovery-park.md#historical-terminal-producer-delivery-hold-issue-3031-2026-10-20)
 for the implementation boundary and outstanding acceptance.
 
 This is a safety net for a run that already produced real commits, not a
