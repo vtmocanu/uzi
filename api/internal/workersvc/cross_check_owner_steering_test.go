@@ -186,9 +186,10 @@ func TestOwnerSteeringScrubsSecrets(t *testing.T) {
 }
 
 func TestOwnerSteeringUTF8Truncation(t *testing.T) {
-	long := strings.Repeat("é", 5000) // 10000 bytes, two bytes per rune
-	odd := "x" + strings.Repeat("é", 5000)
-	row := answerRow(1, "q1", long, odd)
+	// Answers stay within the per-answer character cap the query enforces, so only the byte budget cuts.
+	long := strings.Repeat("é", 2048) // 4096 bytes, two bytes per rune
+	odd := "x" + strings.Repeat("é", 2047)
+	row := answerRow(1, "q1", long, odd, "é")
 	row.Questions[0].Question = strings.Repeat("é", 4000)
 	revise := strings.Repeat("日", 4000)
 	raw, err := buildOwnerSteeringSnapshot(ownerSteeringInput{Cutoff: 2, Total: 2, Rows: []ownerSteeringRow{row, {InputID: 2, Kind: "revise_plan", ReviseBody: &revise}}})
@@ -216,7 +217,8 @@ func TestOwnerSteeringUTF8Truncation(t *testing.T) {
 		}
 		total += len(a)
 	}
-	if total != ownerSteeringAnswerBytes || !snap.Entries[0].Truncated {
+	// 8191 bytes kept: the last answer's two-byte rune does not fit the one byte left, so it is dropped whole.
+	if total != ownerSteeringAnswerBytes-1 || !snap.Entries[0].Truncated {
 		t.Fatalf("answers total %d bytes, truncated=%v", total, snap.Entries[0].Truncated)
 	}
 	f := *snap.Entries[1].Feedback
@@ -480,4 +482,82 @@ func TestOwnerSteeringEnvelopeBoundaries(t *testing.T) {
 			})
 		}
 	}
+}
+
+// steeringTokenFor builds a GitHub-classic-shaped token at runtime so no complete token literal
+// sits in source.
+func steeringTokenFor(body string) string { return "gh" + "p_" + body }
+
+// sqlDelivered mimics left(text, cap + margin): the text SnapshotOwnerSteering hands the builder.
+func sqlDelivered(s string, capChars int) string {
+	cut, _ := cutRunes(s, capChars+ownerSteeringTestMargin)
+	return cut
+}
+
+// ownerSteeringTestMargin is the query's per-field margin beyond the authoritative cap.
+const ownerSteeringTestMargin = 1024
+
+// A token that begins at, just before or just after each cap position, or that the query's own cut
+// splits, never leaves token-body characters in the snapshot: the builder scrubs before it cuts.
+func TestOwnerSteeringScrubBeforeCapStraddlingToken(t *testing.T) {
+	body := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcd" // 30 characters
+	token := steeringTokenFor(body)
+	fields := []struct {
+		name  string
+		chars int
+		build func(delivered string) ownerSteeringRow
+		text  func(raw []byte) string
+	}{
+		{"revise", ownerSteeringReviseChars, func(d string) ownerSteeringRow {
+			return ownerSteeringRow{InputID: 1, Kind: "revise_plan", ReviseBody: &d}
+		}, nil},
+		{"answer", ownerSteeringAnswerChars, func(d string) ownerSteeringRow { return answerRow(1, "q1", d) }, nil},
+		{"header", ownerSteeringHeaderChars, func(d string) ownerSteeringRow {
+			r := answerRow(1, "q1", "a")
+			r.Questions = []steeringQuestion{{Header: d, Question: "Q?", Options: []string{"a"}}}
+			return r
+		}, nil},
+		{"question", ownerSteeringQuestionChars, func(d string) ownerSteeringRow {
+			r := answerRow(1, "q1", "a")
+			r.Questions = []steeringQuestion{{Header: "H", Question: d, Options: []string{"a"}}}
+			return r
+		}, nil},
+		{"option", ownerSteeringOptionChars, func(d string) ownerSteeringRow {
+			r := answerRow(1, "q1", "a")
+			r.Questions = []steeringQuestion{{Header: "H", Question: "Q?", Options: []string{d}}}
+			return r
+		}, nil},
+	}
+	for _, f := range fields {
+		// start offsets relative to the cap, and relative to the query's own cut at cap+margin
+		starts := []int{f.chars - 40, f.chars - 5, f.chars, f.chars + 5, f.chars + ownerSteeringTestMargin - 5, f.chars + ownerSteeringTestMargin - 20}
+		for _, start := range starts {
+			if start < 0 {
+				continue
+			}
+			original := strings.Repeat("a", start) + token + strings.Repeat("z", f.chars+3*ownerSteeringTestMargin)
+			row := f.build(sqlDelivered(original, f.chars))
+			raw, err := buildOwnerSteeringSnapshot(ownerSteeringInput{Cutoff: 1, Total: 1, Rows: []ownerSteeringRow{row}})
+			if err != nil {
+				t.Fatalf("%s start=%d: %v", f.name, start, err)
+			}
+			// No run of three token-body characters from the body may survive (the filler is a/z only).
+			for i := 0; i+3 <= len(body); i++ {
+				if frag := body[i : i+3]; strings.Contains(string(raw), frag) {
+					t.Fatalf("%s start=%d: token body fragment %q survived: ...%s", f.name, start, frag, tail(string(raw), 200))
+				}
+			}
+			// The cut point leaves no bare prefix: at most the redaction marker, never "ghp_" fragments.
+			if strings.Contains(string(raw), "gh"+"p_") {
+				t.Fatalf("%s start=%d: token prefix survived", f.name, start)
+			}
+		}
+	}
+}
+
+func tail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }

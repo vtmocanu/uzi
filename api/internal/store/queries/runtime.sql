@@ -12434,7 +12434,8 @@ SELECT
      AND NOT w.ephemeral AND NOT w.isolated_lane
      AND 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))::bigint AS plan_checker_capable,
   -- Issue #3841: a plan-stage checker child whose round froze an owner-steering snapshot needs a
-  -- worker advertising cross_check_owner_steering_v1 (the same clause ClaimRun carries).
+  -- worker advertising cross_check_owner_steering_v1 (the same clause ClaimRun carries); the capable
+  -- count requires the semantic capability as well when the child is semantic plan-checker enrolled.
   EXISTS (SELECT 1 FROM cross_checks pc
             JOIN cross_check_owner_steering s ON s.cross_check_id = pc.id
            WHERE pc.checker_run_id = @run_id AND pc.stage = 'plan') AS owner_steering_enrolled,
@@ -12442,7 +12443,14 @@ SELECT
      AND w.status = 'online'
      AND fn_worker_accepts_new_intake(w)
      AND NOT w.ephemeral AND NOT w.isolated_lane
-     AND 'cross_check_owner_steering_v1' = ANY(w.protocol_capabilities))::bigint AS owner_steering_capable;
+     AND 'cross_check_owner_steering_v1' = ANY(w.protocol_capabilities)
+     -- a semantic-enrolled plan checker also needs the semantic capability (the plan_checker_enrolled
+     -- predicate above), so a split fleet is not counted as able to claim the child
+     AND (NOT EXISTS (SELECT 1 FROM runs c
+                        JOIN semantic_planning sp ON sp.run_id = c.target_run_id
+                        JOIN cross_checks pc ON pc.checker_run_id = c.id AND pc.stage = 'plan'
+                       WHERE c.id = @run_id AND c.kind = 'cross_check')
+          OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities)))::bigint AS owner_steering_capable;
 
 -- name: SaveCIArtifactAdmission :one
 UPDATE runs SET ci_artifact_manifest = @manifest::jsonb, issue_description = @description

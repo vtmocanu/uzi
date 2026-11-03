@@ -31,6 +31,15 @@ const (
 	ownerSteeringReviseBytes  = 8 * 1024
 	ownerSteeringContextBytes = 4 * 1024
 
+	// Per-field character caps: the authoritative caps SnapshotOwnerSteering's *_truncated flags
+	// are defined against. The query delivers each field cut at the cap plus ownerSteeringCutMargin
+	// characters, so the builder scrubs first and applies these caps second.
+	ownerSteeringReviseChars   = 8192
+	ownerSteeringAnswerChars   = 2048
+	ownerSteeringHeaderChars   = 128
+	ownerSteeringQuestionChars = 2048
+	ownerSteeringOptionChars   = 256
+
 	// ownerSteeringWireMaxBytes bounds the bytes the steering field adds to a checker claim.
 	// Derivation: the snapshot text is at most 65536 bytes and the claim encoder (json.Marshal,
 	// HTML escaping on) writes any one byte as at most 6 bytes (a control character or <, >, &
@@ -146,11 +155,30 @@ func cutUTF8(s string, n int) (string, bool) {
 	return s[:n], true
 }
 
-// scrubCut scrubs first and cuts second, so a secret straddling the cap is never half-kept.
-func scrubCut(s string, budget *int) (string, bool) {
-	out, cut := cutUTF8(secretscrub.Scrub(s), *budget)
+// cutRunes returns s cut to at most n characters (runes).
+func cutRunes(s string, n int) (string, bool) {
+	if n < 0 {
+		n = 0
+	}
+	i := 0
+	for count := 0; i < len(s); count++ {
+		if count == n {
+			return s[:i], true
+		}
+		_, w := utf8.DecodeRuneInString(s[i:])
+		i += w
+	}
+	return s, false
+}
+
+// scrubCut scrubs first, then applies the field's character cap and the remaining byte budget.
+// The query delivers the field with a margin beyond the character cap, so a secret that straddles
+// the cap is whole when scrubbed and no token prefix survives the cut.
+func scrubCut(s string, chars int, budget *int) (string, bool) {
+	scrubbed, cutChars := cutRunes(secretscrub.Scrub(s), chars)
+	out, cutBytes := cutUTF8(scrubbed, *budget)
 	*budget -= len(out)
-	return out, cut
+	return out, cutChars || cutBytes
 }
 
 func steeringAuthor(agent string) string {
@@ -167,14 +195,15 @@ func buildSteeringUnit(r ownerSteeringRow) (steeringUnit, bool) {
 		e := steeringReviseEntry{InputID: r.InputID, Kind: "revise", GateBinding: r.GateBinding, GateRevision: r.GateRevision, Truncated: r.ReviseTruncated}
 		if r.ReviseBody != nil {
 			budget := ownerSteeringReviseBytes
-			text, cut := scrubCut(*r.ReviseBody, &budget)
+			text, cut := scrubCut(*r.ReviseBody, ownerSteeringReviseChars, &budget)
 			e.Feedback = &text
 			e.Truncated = e.Truncated || cut
 		}
 		return steeringUnit{entry: e}, true
 	}
 	if r.Kind != "answer" || r.CompletionQuestion {
-		// Completion-continue answers are guidance for the lead's completion interlock, not plan
+		// Completion-continue answers (marked by the query from the completion_decision input written
+		// in the same transaction) are guidance for the lead's completion interlock, not plan
 		// steering for the checker.
 		return steeringUnit{}, false
 	}
@@ -184,7 +213,7 @@ func buildSteeringUnit(r ownerSteeringRow) (steeringUnit, bool) {
 		answers := make([]string, 0, len(r.Answers))
 		truncated := r.AnswersTruncated
 		for _, a := range r.Answers {
-			text, cut := scrubCut(a, &budget)
+			text, cut := scrubCut(a, ownerSteeringAnswerChars, &budget)
 			truncated = truncated || cut
 			answers = append(answers, text)
 		}
@@ -218,9 +247,9 @@ func buildSteeringContext(r ownerSteeringRow, questionID string) any {
 		}
 		var cut, anyCut bool
 		out := steeringQuestion{Options: []string{}, MultiSelect: q.MultiSelect}
-		out.Header, cut = scrubCut(q.Header, &budget)
+		out.Header, cut = scrubCut(q.Header, ownerSteeringHeaderChars, &budget)
 		anyCut = anyCut || cut
-		out.Question, cut = scrubCut(q.Question, &budget)
+		out.Question, cut = scrubCut(q.Question, ownerSteeringQuestionChars, &budget)
 		anyCut = anyCut || cut
 		for _, o := range q.Options {
 			if budget <= 0 {
@@ -228,7 +257,7 @@ func buildSteeringContext(r ownerSteeringRow, questionID string) any {
 				break
 			}
 			var label string
-			label, cut = scrubCut(o, &budget)
+			label, cut = scrubCut(o, ownerSteeringOptionChars, &budget)
 			anyCut = anyCut || cut
 			out.Options = append(out.Options, label)
 		}

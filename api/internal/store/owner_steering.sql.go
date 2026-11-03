@@ -88,25 +88,34 @@ WITH cut AS (
                END
            END AS status
     FROM kept k
+), qmsg AS MATERIALIZED (
+    -- the run's question messages, read once for occ and first_occ
+    SELECT m.seq, m.agent, m.payload, m.created_at, m.payload ->> 'question_id' AS qid
+    FROM run_messages m
+    WHERE m.run_id = $1 AND m.kind = 'question'
 ), occ AS (
     SELECT k.id AS answer_id,
            count(*)::bigint AS occurrences,
-           count(DISTINCT (m.payload -> 'questions', m.agent))::bigint AS variants,
-           COALESCE(bool_or(m.payload -> 'questions' -> 0 ->> 'header' = 'Completion blocked'), false) AS completion_question
+           count(DISTINCT (m.payload -> 'questions', m.agent))::bigint AS variants
     FROM kept k
-    JOIN run_messages m ON m.run_id = $1 AND m.kind = 'question'
-                       AND m.payload ->> 'question_id' = k.question_id
-                       AND m.created_at <= k.created_at
+    JOIN qmsg m ON m.qid = k.question_id AND m.created_at <= k.created_at
     WHERE k.kind = 'answer'
     GROUP BY k.id
 ), first_occ AS (
     SELECT DISTINCT ON (k.id) k.id AS answer_id, m.agent, m.payload
     FROM kept k
-    JOIN run_messages m ON m.run_id = $1 AND m.kind = 'question'
-                       AND m.payload ->> 'question_id' = k.question_id
-                       AND m.created_at <= k.created_at
+    JOIN qmsg m ON m.qid = k.question_id AND m.created_at <= k.created_at
     WHERE k.kind = 'answer'
     ORDER BY k.id, m.seq
+), dec AS MATERIALIZED (
+    SELECT d.created_at
+    FROM run_user_inputs d
+    WHERE d.run_id = $1 AND d.kind = 'completion_decision'
+), comp AS (
+    SELECT k.id AS answer_id,
+           EXISTS (SELECT 1 FROM dec WHERE dec.created_at = k.created_at) AS completion_question
+    FROM kept k
+    WHERE k.kind = 'answer'
 ), qctx AS (
     SELECT f.answer_id, f.agent, f.payload,
            CASE
@@ -135,11 +144,11 @@ WITH cut AS (
     FROM first_occ f
 ), proj AS (
     SELECT k.id AS input_id,
-           (CASE WHEN k.kind = 'revise_plan' THEN left(k.body, 8192) END)::text AS revise_body,
+           (CASE WHEN k.kind = 'revise_plan' THEN left(k.body, 8192 + 1024) END)::text AS revise_body,
            (CASE WHEN k.kind = 'revise_plan' THEN char_length(k.body) > 8192 END)::boolean AS revise_truncated,
            ans.status::text AS answers_status,
            (CASE WHEN ans.status = 'ok' THEN
-               (SELECT COALESCE(jsonb_agg(left(e #>> '{}', 2048) ORDER BY ord), '[]'::jsonb)
+               (SELECT COALESCE(jsonb_agg(left(e #>> '{}', 2048 + 1024) ORDER BY ord), '[]'::jsonb)
                   FROM jsonb_array_elements(k.body::jsonb -> 'answers') WITH ORDINALITY t(e, ord))
            END)::jsonb AS answers,
            (CASE WHEN ans.status = 'ok' THEN
@@ -148,14 +157,14 @@ WITH cut AS (
            END)::boolean AS answers_truncated,
            COALESCE(occ.occurrences, 0)::bigint AS occurrences,
            COALESCE(occ.variants, 0)::bigint AS variants,
-           COALESCE(occ.completion_question, false)::boolean AS completion_question,
+           COALESCE(comp.completion_question, false)::boolean AS completion_question,
            qctx.agent AS question_agent,
            qctx.status::text AS questions_status,
            (CASE WHEN qctx.status = 'ok' THEN
                (SELECT COALESCE(jsonb_agg(jsonb_build_object(
-                           'header', left(COALESCE(q ->> 'header', ''), 128),
-                           'question', left(q ->> 'question', 2048),
-                           'options', COALESCE((SELECT jsonb_agg(left(o ->> 'label', 256) ORDER BY oord)
+                           'header', left(COALESCE(q ->> 'header', ''), 128 + 1024),
+                           'question', left(q ->> 'question', 2048 + 1024),
+                           'options', COALESCE((SELECT jsonb_agg(left(o ->> 'label', 256 + 1024) ORDER BY oord)
                                                   FROM jsonb_array_elements(q -> 'options') WITH ORDINALITY ot(o, oord)), '[]'::jsonb),
                            'multi_select', COALESCE((q ->> 'multiSelect')::boolean, false)
                        ) ORDER BY qord), '[]'::jsonb)
@@ -171,6 +180,7 @@ WITH cut AS (
     FROM kept k
     LEFT JOIN ans ON ans.id = k.id
     LEFT JOIN occ ON occ.answer_id = k.id
+    LEFT JOIN comp ON comp.answer_id = k.id
     LEFT JOIN qctx ON qctx.answer_id = k.id
 )
 SELECT cut.cutoff,
@@ -248,12 +258,18 @@ type SnapshotOwnerSteeringRow struct {
 // and never stringifies a non-string element.
 //
 // Limits mirrored from the writers: maxAnswerCount = 10 (workersvc submitAnswer), MAX_QUESTIONS
-// and MAX_OPTIONS = 10 (agent/src/signals.ts). Text is cut here only to bound the transfer; the
-// Go builder applies the authoritative per-entry byte caps and the secret scrub.
+// and MAX_OPTIONS = 10 (agent/src/signals.ts). Text is cut here only to bound the transfer, and
+// every left() keeps 1024 characters beyond the authoritative cap (revise 8192, answers 2048,
+// header 128, question 2048, option labels 256) so a secret that straddles the cap is delivered
+// whole to the Go builder, which scrubs FIRST and applies the authoritative caps second. A cut at
+// the cap itself would leave a short token prefix that no scrub pattern matches. The *_truncated
+// flags stay defined against the ORIGINAL caps, never the margin.
 //
-// completion_question marks an answer whose question is the worker-authored completion-blocked
-// question (header 'Completion blocked'); such answers are completion-continue guidance, not
-// plan steering, and the builder drops them.
+// completion_question marks an answer written by resumeCompletionBlocked: that function writes the
+// answer and a completion_decision input in one transaction, so the two rows share created_at
+// (now() is the transaction start). Such an answer is completion-continue guidance, not plan
+// steering, and the builder drops it. The marker is a server-written fact, never lead-authored
+// question text.
 func (q *Queries) SnapshotOwnerSteering(ctx context.Context, arg SnapshotOwnerSteeringParams) ([]SnapshotOwnerSteeringRow, error) {
 	rows, err := q.db.Query(ctx, snapshotOwnerSteering, arg.RunID, arg.MaxEntries)
 	if err != nil {

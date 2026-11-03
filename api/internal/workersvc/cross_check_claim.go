@@ -200,7 +200,8 @@ func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.
 	if cc.Stage == "plan" {
 		// Issue #3841: a round frozen with owner steering delivers those exact bytes. No row is a
 		// legacy round and carries no field; a row that fails its size, UTF-8 or digest check
-		// refuses the claim rather than deliver altered steering.
+		// refuses the claim rather than deliver corrupted steering. The digest is an integrity
+		// check against corruption, not tamper-proofing: it is stored in the same row as the snapshot.
 		row, e := q.GetOwnerSteering(ctx, cc.ID)
 		if e != nil && !errors.Is(e, pgx.ErrNoRows) {
 			return e

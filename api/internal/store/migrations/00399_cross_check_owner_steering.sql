@@ -2,7 +2,10 @@
 -- Issue #3841: frozen owner steering for plan cross-check checker children (ADR-2149). One row per
 -- checked plan round holds the bounded snapshot of the run owner's in-run answers and revise_plan
 -- feedback, written in the same transaction as the round's cross_checks row and never changed
--- afterwards, so every claim of the checker child delivers byte-identical text.
+-- afterwards (a trigger refuses UPDATE), so every claim of the checker child delivers
+-- byte-identical text. The digest is an integrity check against corruption of the stored text;
+-- it sits in the same row as the snapshot, so it is not tamper-proofing against a writer of
+-- that row.
 --
 -- Additive: one new table, no existing table is altered. The statements time out rather than
 -- queue behind a long transaction.
