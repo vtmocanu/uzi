@@ -1368,6 +1368,8 @@ tasks:
       - ./scripts/release-scripts-test.sh
       - python3 -I -B scripts/release-notes.test.py
       - ./scripts/worker-roll-target.test.sh
+      - ./scripts/agent-image-assert.test.sh
+      - ./scripts/agent-index-verify.test.sh
       - task: test:release-ci-coverage
       - task: test:release-auto
       - task: test:release-watch

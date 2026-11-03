@@ -133,6 +133,7 @@ func renderRunDetailAt(p *uzicli.Printer, r apitypes.RunDTO, now time.Time, orig
 		// milestone/NOW region retains its byte-for-byte baseline.
 		rows = append(rows, []string{"HARNESS_PICK", "at creation: " + line})
 	}
+	rows = append(rows, createdIssueRows(r.CreatedIssues)...)
 	rows = append(rows, leadConfigRows(r)...)
 	if len(r.AutoApproveBlockedReasons) > 0 {
 		rows = append(rows, []string{"AUTO_APPROVE_BLOCKED", strings.Join(r.AutoApproveBlockedReasons, ", ")})
@@ -579,7 +580,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	}
 	// Resume retains this marker through queued/claimed until the running report.
 	// Only the paused state is still an owner hold.
-	if *r.HoldReason == holdProviderUnavailable && !isProviderUnavailableHold(r) {
+	if (*r.HoldReason == holdProviderUnavailable && !isProviderUnavailableHold(r)) ||
+		(*r.HoldReason == holdIterationExhausted && !isIterationHold(r)) {
 		return nil
 	}
 	if *r.HoldReason == holdCodexPolicy && !isCodexPolicyHold(r) {
@@ -590,6 +592,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, fmt.Sprintf("%d/%d milestones", done, total))
 	}
 	switch *r.HoldReason {
+	case holdIterationExhausted:
+		clauses = append(clauses, iterationHoldAction(r))
 	case holdCodexPolicy:
 		clauses = append(clauses, policyCaptureClause(r), policyHoldAction(r))
 	case holdBudgetExhausted:
@@ -612,6 +616,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 // in unknown reasons so a newer server still gets one terminal-safe notice.
 func holdReasonLabel(reason string) string {
 	switch reason {
+	case holdIterationExhausted:
+		return "Iteration limit reached"
 	case holdCodexPolicy:
 		return "Codex policy hold confirmed by server"
 	case holdBudgetExhausted:
@@ -703,6 +709,8 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 	}
 	id := cellText(r.ID)
 	switch reason := strOr(r.HoldReason, ""); reason {
+	case holdIterationExhausted:
+		return "Iteration limit reached; " + iterationHoldAction(r)
 	case holdCodexPolicy:
 		if !isCodexPolicyHold(r) {
 			return ""
@@ -2822,4 +2830,20 @@ func accountCooldownLineAt(r apitypes.RunDTO, now time.Time) string {
 		return ""
 	}
 	return apitypes.AccountCooldownLine(*r.AccountCooldownClass, *r.AccountCooldownEligibleAt)
+}
+
+// isIterationHold requires the paused state; a retained reason after Resume is not a hold.
+func isIterationHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdIterationExhausted
+}
+
+// iterationHoldAction uses the server's frozen wall projection. Missing budget fields
+// leave Resume authoritative rather than guessing the server's global timeout.
+func iterationHoldAction(r apitypes.RunDTO) string {
+	id := cellText(r.ID)
+	action := "Resume: uzi run resume " + id + "; Cancel: uzi run cancel " + id
+	if r.BudgetTotalSeconds != nil && r.BudgetUsedSeconds != nil && *r.BudgetUsedSeconds >= *r.BudgetTotalSeconds {
+		action += "; wall time exhausted; add time: uzi run extend " + id + " --by 2h; Extend adds time only, then Resume"
+	}
+	return action
 }

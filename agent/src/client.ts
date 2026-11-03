@@ -65,6 +65,9 @@ import {
   type CompletionPermitRequest,
   type CompletionPermitResponse,
   type WallParkRequest,
+  type IterationParkRequest,
+  type IterationParkResult,
+  type IterationParkRefusalReason,
   type ReportFindingRequest,
   type HeartbeatRequest,
   type DindMaintenance,
@@ -1428,7 +1431,7 @@ export class WorkerClient {
   }
 
   private sealCodexAdmission(path: string, body: unknown): void {
-    const match = /^\/api\/worker\/runs\/([^/]+)\/(state|cross-check-verdict|wall-park|pause|completion\/hold|base-attestation-hold|completion\/attempt|archives\/release)$/.exec(path);
+    const match = /^\/api\/worker\/runs\/([^/]+)\/(state|cross-check-verdict|wall-park|iteration-park|pause|completion\/hold|base-attestation-hold|completion\/attempt|archives\/release)$/.exec(path);
     if (!match || !isRecord(body)) return;
     const runId = decodeURIComponent(match[1]!);
     const owned = this.codexAdmission.get(runId);
@@ -2573,9 +2576,21 @@ export class WorkerClient {
    * so parsing a 409's status back out of the error text would work in tests and
    * fail on real runs.
    */
-
-  async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
+  async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal,
+    options?: { iterationCancellation?: true }): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    if (options?.iterationCancellation) {
+      // Snapshot before any asynchronous work; only the iteration sink cancellation
+      // may bypass compatibility negotiation, with its exact claim authority intact.
+      const frozen = Object.freeze(structuredClone(body));
+      if (frozen.status !== "failed" || frozen.failure_reason !== "run cancelled" ||
+          !Number.isSafeInteger(frozen.claim_generation) || (frozen.claim_generation ?? 0) <= 0 ||
+          (frozen.session_id !== undefined && typeof frozen.session_id !== "string") ||
+          Object.keys(frozen).some(key => !["status", "failure_reason", "claim_generation", "session_id"].includes(key)))
+        throw new Error("iteration cancellation requires exact cancellation body and positive generation");
+      this.sealCodexAdmission(path, frozen);
+      return this.reportStateOnce(runId, path, frozen, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+    }
     this.sealCodexAdmission(path, body);
     if (body.source_publication !== undefined) {
       // Snapshot nested proof once, before either transport retries or caller mutation.
@@ -3771,13 +3786,13 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string, claimGeneration?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
+  async getInputs(runId: string, claimGeneration?: number, signal?: AbortSignal, maxResponseBytes?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
     const epoch = this.inputObservationEpoch;
     let res: InputsResponse;
     try {
-      res = (await this.inputJSON("GET", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs${query}`)) as InputsResponse;
+      res = (await this.inputJSON("GET", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs${query}`, undefined, signal, maxResponseBytes)) as InputsResponse;
     } catch (err) {
       if (epoch !== this.inputObservationEpoch) return { inputs: [], staleObservation: true };
       throw err;
@@ -4457,6 +4472,51 @@ export class WorkerClient {
     });
   }
 
+  /** One fenced request; the caller owns episode retries. All response bodies are bounded before
+   * decoding, including errors. Unknown delivery never becomes a generic run failure. */
+  async reportIterationPark(runId: string, request: IterationParkRequest, signal?: AbortSignal): Promise<IterationParkResult> {
+    const body = { ...request };
+    const positiveGeneration = (value: unknown): value is number =>
+      typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+    const positiveInt = (value: unknown): value is number =>
+      positiveGeneration(value) && value <= 2147483647;
+    if (!isRecord(body) || !positiveGeneration(body.claim_generation) || !positiveInt(body.iteration_count)
+      || !positiveInt(body.max_iterations) || body.iteration_count < body.max_iterations
+      || body.iteration_count - body.max_iterations > 1 || typeof body.head !== "string"
+      || Buffer.from(body.head, "utf8").toString("utf8") !== body.head || Buffer.byteLength(body.head, "utf8") > 128
+      || typeof body.published !== "boolean"
+      || (body.checkpoint_contains_latest !== undefined && typeof body.checkpoint_contains_latest !== "boolean"))
+      throw new Error("invalid iteration park evidence");
+    const serialized = JSON.stringify(body);
+    const keys = ["claim_generation", "iteration_count", "max_iterations", "head", "published", "checkpoint_contains_latest"];
+    if (Buffer.byteLength(serialized, "utf8") > 16 * 1024
+      || Object.keys(body).some(key => !keys.includes(key)))
+      throw new Error("invalid iteration park evidence");
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/iteration-park`;
+    const deadline = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(this.httpTimeoutMs)]);
+    try {
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, deadline);
+      const raw = await readBoundedBytes(res, 16 * 1024, true, deadline);
+      const ack: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
+      if (!isRecord(ack)) return { outcome: "unknown" };
+      if (res.status === 200 && ack.applied === true && ack.status === "paused"
+        && ack.hold_reason === "iteration_budget_exhausted" && ack.claim_generation === body.claim_generation)
+        return { outcome: "parked" };
+      const reasons: readonly IterationParkRefusalReason[] = ["prior_attempt", "ineligible_lane", "not_running",
+        "allowance_mismatch", "stale_claim", "released_claim", "pending_control"];
+      const statuses = ["queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup",
+        "pool_wait", "limit_wait", "recovery_wait", "paused", "completed", "failed", "cancelled"];
+      if (res.status === 409 && ack.applied === false && typeof ack.reason === "string"
+        && reasons.includes(ack.reason as IterationParkRefusalReason) && typeof ack.status === "string"
+        && statuses.includes(ack.status) && positiveGeneration(ack.claim_generation) && typeof ack.hold_reason === "string")
+        return { outcome: "refused", reason: ack.reason as IterationParkRefusalReason,
+          status: ack.status, claimGeneration: ack.claim_generation };
+      return { outcome: "unknown" };
+    } catch {
+      return { outcome: "unknown" };
+    }
+  }
+
   /** Request an ordinary pause. A running ACK records intent; only a paused status confirms a park.
    * One HTTP attempt, bounded by httpTimeoutMs, with no generation or owner fallback. */
   async requestWorkerPause(runId: string, claimGeneration: number, signal?: AbortSignal): Promise<StateAck> {
@@ -5043,15 +5103,17 @@ export class WorkerClient {
 
   /** Input polling/receipts share one deadline through response-body consumption, including
    * injected transports whose Response stream does not inherit fetch's abort signal. */
-  private async inputJSON(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown> {
-    const signal = AbortSignal.timeout(this.httpTimeoutMs);
+  private async inputJSON(method: "GET" | "POST", path: string, body?: unknown, callerSignal?: AbortSignal,
+    maxResponseBytes = Number.MAX_SAFE_INTEGER): Promise<unknown> {
+    const signal = AbortSignal.any([AbortSignal.timeout(this.httpTimeoutMs), ...(callerSignal ? [callerSignal] : [])]);
+    signal.throwIfAborted();
     const res = await this.fetchRaw(method, path, body, this.httpTimeoutMs, signal);
     if (res.status >= 400) {
       const text = await readBoundedText(res, ERROR_BODY_MAX_BYTES, false, signal);
       throw new RequestError(method, path, res.status, text.slice(0, 4096), retryAfterMsOf(res.headers.get("Retry-After")));
     }
     if (res.status === 204) return undefined;
-    const text = await readBoundedText(res, Number.MAX_SAFE_INTEGER, true, signal);
+    const text = await readBoundedText(res, maxResponseBytes, true, signal);
     return text ? JSON.parse(text) : undefined;
   }
 

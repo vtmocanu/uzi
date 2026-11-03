@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Native-architecture Codex package execution check (#1565 scope 5). Runs the image build's own
 # install-codex.sh and assert-codex.sh for <arch> inside the worker templates' pinned runtime base,
-# with no image build. codex-packaged-proof.yml runs it for arm64 on a native arm64 runner; only
-# amd64 images ship, so this is the only check that downloads and executes the arm64 artifact.
+# with no image build. codex-packaged-proof.yml runs it for arm64 on a native arm64 runner, on
+# any lock change, which is cheaper than the full arm64 image build that also executes it.
 #
 # What a pass proves, exactly: the <arch> artifact's SHA256, members and manifest fields match the
 # lock; `codex --version` executes as the cap-less runner uid and prints the pinned version; the

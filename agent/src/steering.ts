@@ -1451,6 +1451,17 @@ export class SteeringChannel {
     return this.shutdownCheckpoint;
   }
 
+  /** issue #3780: read-only. True only while nothing has revoked this flight's authority to finish a
+   *  stranded tracking-ownership update: no terminal lifecycle, shutdown, flight end, receipt failure,
+   *  cancel, claim fence, pending credential switch, disk pause or shutdown checkpoint. A cooperative
+   *  PauseNow (terminal=false) leaves it true; a later terminal abort turns it false. */
+  ownershipRepairAuthority(): boolean {
+    return !this.lifecycleEnded && !this.terminalLifecycle.signal.aborted && !this.shutdownStop.signal.aborted &&
+      this.flightEnded === undefined && this.receiptFailure === undefined && !this.cancelled &&
+      this.fence === undefined && this.pendingSwitchGeneration === undefined && this.pauseMode !== "disk" &&
+      this.shutdownCheckpoint === undefined;
+  }
+
   /** Stop execution with existing reasons while preserving the shutdown sink's separate stop signal. */
   workerShutdown(deadlineAt: number): GracefulShutdownCheckpoint {
     if (this.shutdownCheckpoint) return this.shutdownCheckpoint;
@@ -1653,6 +1664,38 @@ export class SteeringChannel {
   markCancelled(): void {
     this.cancelled = true;
     this.shutdownStop.abort();
+  }
+
+  /** One bounded input observation for a refused capture disposition. Receipt-mode
+   * reads keep ACK/routing ownership with the poller and verify cancellation ownership.
+   * Legacy GET already consumed its rows, so route them here with the normal dedupe.
+   * The caller supplies the existing capture signal; this adds no retry loop. */
+  async observePendingCancellation(signal: AbortSignal): Promise<void> {
+    if (!Number.isSafeInteger(this.claimGeneration) || this.claimGeneration <= 0 ||
+        this.fence !== undefined || this.terminalLifecycle.signal.aborted) return;
+    const reply = await this.client.getInputs(this.runId, this.claimGeneration, signal, 64 * 1024);
+    signal.throwIfAborted();
+    if (this.fence !== undefined || this.terminalLifecycle.signal.aborted || reply.staleObservation ||
+        reply.terminalCancelled || !validBatch(reply.inputs)) return;
+    if (!reply.receipts) {
+      // Legacy GET already consumed this batch. Preserve its normal FIFO routing
+      // and metadata; it has no receipt ACK/APPLIED phase to replay it later.
+      for (const input of reply.inputs) {
+        if (this.routedIds.has(input.id)) continue;
+        this.routedIds.add(input.id);
+        this.route(input.kind, input.body ?? undefined, input.id, false, input.created_at, parseGateBinding(input));
+      }
+      return;
+    }
+    if (!reply.inputs.some(input => input.kind === "cancel")) return;
+    // Receipt-mode GET is read-only and does not fence its generation. Recheck the
+    // existing ownership seam after reading; generation is monotonic, and reports
+    // remain fenced server-side if ownership changes again after this observation.
+    const owner = await this.client.getRunOwnership(this.runId, signal);
+    signal.throwIfAborted();
+    if (this.fence === undefined && !this.terminalLifecycle.signal.aborted &&
+        owner.status === "running" && owner.claim_generation === this.claimGeneration &&
+        owner.claim_released === false) this.markCancelled();
   }
 
   /** Register the re-armable pause-now interrupt (see pauseNowInterrupt, PRD #1190 rework N2).

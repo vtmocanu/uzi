@@ -25,6 +25,16 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// iterationHoldStopError unwraps to the parked-Stop conflict category handled by
+// CreateRunInput, carrying an iteration-specific message.
+type iterationHoldStopError struct{}
+
+func (*iterationHoldStopError) Error() string {
+	return "Stop is unavailable for an iteration hold; Resume to keep working, or Cancel the run"
+}
+
+func (*iterationHoldStopError) Unwrap() error { return ErrWallParkStopUnavailable }
+
 // SubmitInput records a steering input (approve/reject/follow-up/cancel) for a
 // run the user owns. When the target is a cancel or plan rejection and no live
 // poller exists (the run is still queued, or its worker has gone stale), the
@@ -403,6 +413,9 @@ func (s *Service) submitInputForRun(ctx context.Context, userID, runID uuid.UUID
 	// helpful, not mandatory); the same message is co-written to run_user_inputs.body, NUL-
 	// stripped to avoid Postgres 22021 aborting the CTE.
 	if kind == "stop" {
+		if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "iteration_budget_exhausted" {
+			return SubmitInputResult{}, &iterationHoldStopError{}
+		}
 		if run.HoldReason.Valid && run.HoldReason.String == "codex_policy_hold" {
 			return SubmitInputResult{}, ErrProviderHoldStopUnavailable
 		}
@@ -1176,6 +1189,10 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 		}
 		if terminalStatuses[current.Status] {
 			return SubmitInputResult{}, ErrRunTerminal
+		}
+		if len(stopping) > 0 && stopping[0] && current.Status == "paused" &&
+			current.HoldReason.Valid && current.HoldReason.String == "iteration_budget_exhausted" {
+			return SubmitInputResult{}, &iterationHoldStopError{}
 		}
 		frozen, err := DecodeMilestones(current.MilestonesFrozen)
 		if err != nil {

@@ -49,6 +49,7 @@ it("LastRun reads only displayed started runs and preserves immutable fire snaps
 // Issue #3181: a token-switch hold is an owner decision too, so the started-run line links to
 // the run's owner actions like the provider hold does; an owner pause does not (control).
 it.each([
+  ["iteration_budget_exhausted", "Current: Iteration limit reached", true],
   ["credential_switch_settling", "Current: settling: token switch", true],
   ["credential_switch_unsettled", "Current: held: token switch", true],
   [null, "Current: paused", false],

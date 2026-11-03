@@ -29,7 +29,7 @@ for (const damage of ["mac", "unreadable", "malformed-guard", "dangling-dir", "l
       recovery: RecoveryCoordinator;
       outbox: TerminalOutboxDeps["outbox"];
       terminalDeps(): TerminalOutboxDeps;
-      retireFinalizeRecord(flight: { runId: string; claimGeneration: number }, site: string): Promise<void>;
+      retireFinalizeRecord(flight: { runId: string; claimGeneration: number; iterationParkState: "none" }, site: string): Promise<void>;
     };
     const runId = "cleanup-run", generation = 7;
     enableGuardedJournalCreation(runId, generation);
@@ -81,7 +81,7 @@ for (const damage of ["mac", "unreadable", "malformed-guard", "dangling-dir", "l
       retireFinalize: async () => { finalizeRetires++; },
     } as unknown as TerminalOutboxDeps["outbox"];
     await internals.terminalDeps().outbox.retireTerminal(runId, generation);
-    await internals.retireFinalizeRecord({ runId, claimGeneration: generation }, "regression");
+    await internals.retireFinalizeRecord({ runId, claimGeneration: generation, iterationParkState: "none" }, "regression");
     const expected = damage === "legacy" ? 1 : 0;
     assert.equal(terminalRetires, expected, "terminal cleanup needs checked authority");
     assert.equal(finalizeRetires, expected, "finalize cleanup needs checked authority");
@@ -96,7 +96,7 @@ it(`${pendingTracking ? "rework-2464: pending tracking consumer " : "M2 "}normal
   const internals = r as unknown as {
     client: WorkerClient; recovery: RecoveryCoordinator; outbox: TerminalOutboxDeps["outbox"];
     terminalDeps(): TerminalOutboxDeps;
-    retireFinalizeRecord(flight: { runId: string; claimGeneration: number }, site: string): Promise<void>;
+    retireFinalizeRecord(flight: { runId: string; claimGeneration: number; iterationParkState: "none" }, site: string): Promise<void>;
   };
   const runId = "11111111-1111-4111-8111-111111111111", generation = 7;
   const bare = await git.ensureClone(fx.originPath);
@@ -195,13 +195,13 @@ it(`${pendingTracking ? "rework-2464: pending tracking consumer " : "M2 "}normal
     retireFinalize: async () => { finalizeRetires++; },
   } as unknown as TerminalOutboxDeps["outbox"];
   await internals.terminalDeps().outbox.retireTerminal(runId, generation);
-  await internals.retireFinalizeRecord({ runId, claimGeneration: generation }, "M2 same process");
+  await internals.retireFinalizeRecord({ runId, claimGeneration: generation, iterationParkState: "none" }, "M2 same process");
   assert.equal(terminalRetires, 1);
   assert.equal(finalizeRetires, 1);
   internals.client = new WorkerClient("http://retirement.test", "join-token", "test", nullLogger());
   await internals.client.register("test");
   await internals.terminalDeps().outbox.retireTerminal(runId, generation);
-  await internals.retireFinalizeRecord({ runId, claimGeneration: generation }, "M2 fresh transport");
+  await internals.retireFinalizeRecord({ runId, claimGeneration: generation, iterationParkState: "none" }, "M2 fresh transport");
   assert.equal(terminalRetires, 2);
   assert.equal(finalizeRetires, 2);
 });
@@ -224,7 +224,7 @@ for (const scenario of ["discarded", "released", "absent-released", "absent-lega
     const internals = r as unknown as {
       client: WorkerClient; recovery: RecoveryCoordinator; outbox: TerminalOutboxDeps["outbox"];
       terminalDeps(): TerminalOutboxDeps;
-      retireFinalizeRecord(flight: { runId: string; claimGeneration: number }, site: string): Promise<void>;
+      retireFinalizeRecord(flight: { runId: string; claimGeneration: number; iterationParkState: "none" }, site: string): Promise<void>;
     };
     const runId = "11111111-1111-4111-8111-111111111111", generation = 7;
     const workerId = "22222222-2222-4222-8222-222222222222";
@@ -275,7 +275,7 @@ for (const scenario of ["discarded", "released", "absent-released", "absent-lega
       retireFinalize: async () => { finalizeRetires++; },
     } as unknown as TerminalOutboxDeps["outbox"];
     await internals.terminalDeps().outbox.retireTerminal(runId, generation);
-    await internals.retireFinalizeRecord({ runId, claimGeneration: generation }, "M1 regression");
+    await internals.retireFinalizeRecord({ runId, claimGeneration: generation, iterationParkState: "none" }, "M1 regression");
     const expected = ["discarded", "absent-released", "absent-legacy"].includes(scenario) ? 1 : 0;
     assert.equal(terminalRetires, expected);
     assert.equal(finalizeRetires, expected);
@@ -291,7 +291,7 @@ it("stale terminal supersession preserves guarded recovery and finalize custody"
   const r = runner({ run: async () => ({ branch: "task" }) }, gitlab, "journal-key");
   const internals = r as unknown as {
     client: WorkerClient; recovery: RecoveryCoordinator; outbox: Outbox; terminalDeps(): TerminalOutboxDeps;
-    retireFinalizeRecord(flight: { runId: string; claimGeneration: number }, site: string): Promise<void>;
+    retireFinalizeRecord(flight: { runId: string; claimGeneration: number; iterationParkState: "none" }, site: string): Promise<void>;
   };
   const runId = "11111111-1111-4111-8111-111111111111", generation = 7;
   t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
@@ -322,7 +322,7 @@ it("stale terminal supersession preserves guarded recovery and finalize custody"
     send: async () => ({ applied: false, staleClaim: true, status: "completed" }), signal: new AbortController().signal });
   assert.equal(internals.outbox.hasPendingTerminal(runId, generation), false);
   assert.equal(internals.client.knowsInventoryGuardedClaim(runId, generation), true);
-  await internals.retireFinalizeRecord({ runId, claimGeneration: generation }, "stale regression");
+  await internals.retireFinalizeRecord({ runId, claimGeneration: generation, iterationParkState: "none" }, "stale regression");
   assert.deepEqual(internals.outbox.listPendingFinalizes(), [{ run_id: runId, claim_generation: generation }]);
   assert.equal(fs.readFileSync(journal, "utf8"), before);
 });
@@ -336,7 +336,7 @@ for (const sibling of ["none", "unreadable", "uncovered"] as const) {
       recovery: RecoveryCoordinator;
       outbox: TerminalOutboxDeps["outbox"];
       terminalDeps(): TerminalOutboxDeps;
-      retireFinalizeRecord(flight: { runId: string; claimGeneration: number }, site: string): Promise<void>;
+      retireFinalizeRecord(flight: { runId: string; claimGeneration: number; iterationParkState: "none" }, site: string): Promise<void>;
     };
     const runId = "cleanup-ack", generation = 7, sha = "a".repeat(40);
     client.hasFeature = name => name === "recovery_inventory_v1";
@@ -388,7 +388,7 @@ for (const sibling of ["none", "unreadable", "uncovered"] as const) {
       retireFinalize: async () => { finalizeRetires++; },
     } as unknown as TerminalOutboxDeps["outbox"];
     await internals.terminalDeps().outbox.retireTerminal(runId, generation);
-    await internals.retireFinalizeRecord({ runId, claimGeneration: generation }, "regression");
+    await internals.retireFinalizeRecord({ runId, claimGeneration: generation, iterationParkState: "none" }, "regression");
     assert.equal(terminalRetires, sibling === "none" ? 1 : 0);
     assert.equal(finalizeRetires, sibling === "none" ? 1 : 0);
   });

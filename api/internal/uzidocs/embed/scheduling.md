@@ -278,6 +278,25 @@ unattended 02:00 sweep cannot pick it up. Promoting a proposal to real work is
 a deliberate human act — add the `uzi` label (or a sweep selector), the same
 promote flow any issue uses, and it becomes runnable like anything else.
 
+**Finding created issues.** Open the scheduled prompt run's detail page to see
+**`Created issue #<iid>`** with its sanitized title, or use `uzi run get <id>`
+(see [the CLI reference](./cli.md#commands)). The web label links to the issue
+when its URL is safe HTTPS; otherwise it stays plain text. An unsafe stored
+repository URL leaves `web_url` blank without hiding the issue number.
+
+Run detail's optional `created_issues` array contains `{iid, title, web_url}`
+from confirmed proposal records stamped with a positive issue number for
+that run, its repository and the repository's owning connection. Results
+have stable order and duplicate issue coordinates are removed. Historical
+stamped records appear without rerunning, including after schedule deletion
+or output-mode changes. Pending or unstamped records are not evidence of
+successful filing and do not appear. Lookup is best effort: a failure omits
+this field while preserving normal run detail, so absence is not proof that
+no forge issue was filed. Missing or empty results add no display. Run lists
+and summaries do not include this detail. Source-issue fields still identify
+the run's originating issue; created issues are separate outputs, independent
+of any MR.
+
 **Dedup at fire time.** An issues-mode schedule does not re-file a proposal it
 already filed. Each time it fires, uzi lists that schedule's existing
 `proposal::<slug>` issues — open **and** closed, newest first, capped — and
@@ -870,10 +889,13 @@ attempts or logs:
   tails of failed jobs. Only timestamps the forge reported are used; a figure
   missing some durations is shown as a lower bound with its unknown count.
 - **Bounds**: collection stops at a 15-second deadline, a cap on forge calls or
-  the shared CI read budget, and the snapshot then says what is partial. It is
-  capped at 48 KiB; anything trimmed leaves a marker. Each fire collects
-  synchronously, so one scheduler tick collects for at most two CI scouts and
-  holds any further due scout until a later tick.
+  the shared CI read budget, and the snapshot then says what is partial. History
+  reads rotate across the selected default-branch and merge/pull request runs in
+  both the latest week and the week before. One fifth of the collection deadline
+  is reserved for log tails. The snapshot is capped at 48 KiB; anything trimmed
+  leaves a marker. Each fire collects synchronously, so one scheduler tick
+  collects for at most two CI scouts and holds any further due scout until a
+  later tick.
 - **The proposal**: one issue (`proposal::ci-scout`) with a short summary and an
   implementation spec ready for a run, picked from duration regressions, slow
   feedback, slow jobs, suspected flakes, infrastructure failures and

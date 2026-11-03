@@ -2230,6 +2230,14 @@ for (const [id, max, sourceOnly] of [
   });
 }
 mockRuns.push(
+  { ...pausedBase, id: "run-iteration-hold", hold_reason: "iteration_budget_exhausted",
+    budget_wall_seconds: null, budget_total_seconds: 3600, budget_used_seconds: 1800,
+    budget_extension_seconds: 0, budget_extension_cap_seconds: 7200,
+    completion_phase: "", completion_attempts: 0 },
+  { ...pausedBase, id: "run-iteration-spent", hold_reason: "iteration_budget_exhausted",
+    budget_wall_seconds: null, budget_total_seconds: 3600, budget_used_seconds: 3600,
+    budget_extension_seconds: 0, budget_extension_cap_seconds: 7200,
+    completion_phase: "", completion_attempts: 0 },
   { ...pausedBase, id: "run-provider-hold", hold_reason: "provider_unavailable",
     provider_park_count: 12, provider_park_streak_started_at: daysAgo(2),
     can_stop_at_provider_hold: true },

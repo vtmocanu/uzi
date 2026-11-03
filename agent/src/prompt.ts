@@ -26,6 +26,7 @@ import type {
   RunKind,
 } from "./protocol.js";
 import { resolveRunKind } from "./run-kind.js";
+import { codexLeadChildBudgetAppend } from "./codex/child-budget.js";
 import { reportIncidentalIssueToolName } from "./findings-tools.js";
 import { clampToDirCharset } from "./util.js";
 import { SEEDED_PLAN_RULES } from "./seeded-plan.js";
@@ -728,6 +729,9 @@ export interface LeadSystemPromptOptions {
    *  is an implement-phase prompt. Swaps the gated plan-first lifecycle paragraphs for the
    *  seeded one. Only `true` selects it; absent leaves the output byte-identical. */
   seeded?: boolean;
+  /** Codex harness only: the effective per-child turn budget (ms). When set, the Codex lead
+   *  append also states it; absent leaves the output byte-identical. */
+  codexChildTurnBudgetMs?: number;
 }
 
 // isMrReworkKind reports whether the run kind is the PRD #700 mr_rework kind (the
@@ -783,7 +787,10 @@ export function buildLeadSystemPrompt(
     // overlaps the gate by delegating it. Unguarded prompts stay byte-identical.
     if (opts.guardedCommand) parts.push(CLAUDE_GUARDED_LEAD_GATE_APPEND);
   }
-  if (opts.harness === "codex") parts.push(CODEX_LONG_COMMAND_APPEND, CODEX_LEAD_DISPATCH_APPEND);
+  if (opts.harness === "codex") {
+    parts.push(CODEX_LONG_COMMAND_APPEND, CODEX_LEAD_DISPATCH_APPEND);
+    if (opts.codexChildTurnBudgetMs !== undefined) parts.push(codexLeadChildBudgetAppend(opts.codexChildTurnBudgetMs));
+  }
   if (resolveRunKind(opts.kind) === "issue") parts.push(PRD_LIFECYCLE_APPEND);
   // PRD #700 M4: the mr_rework run-lifecycle note. Gated on the kind so an issue/
   // ci_fix/self_improve run's prompt is byte-identical to before.

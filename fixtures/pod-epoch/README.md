@@ -124,7 +124,14 @@ All new Go code lives in `controller/internal/kube/pod_epoch*.go`.
    refresh only successor containers and attestation, without rerunning `produce`,
    predecessor selection or the resolver. Negative bytes remain fixed after late
    proof/remint. An encoding-fallback negative replaces positive proof and stays
-   negative; a tainted `identity_unverified` negative is initial-only.
+   negative. Under #3818, Added-time identity-failure taint alone permits the
+   frozen `identity_unverified` negative to retry after an explicit conflict on a
+   later changed same-UID event, using that event's current resourceVersion.
+   Retries preserve byte-identical negative evidence even if a later resolver
+   call would succeed; they do not rerun identity, `produce` or predecessor
+   selection, or upgrade to positive. The three-attempt limit and nonrenewable
+   initial-negative 90 s `firstSeen` budget, including resolver time, still apply.
+   #3773 positive anchoring, wire schema and RBAC are unchanged.
 5. The existing maintenance owner can call
    `RecordMaintenanceRemint(generation, workerID, PodEpochRemint)` after observing
    an operation's old/new DinD claim UID binding. Only matching receipts permit
@@ -167,8 +174,12 @@ during a long wait fails closed with `reason=reset`. Pending proof survives
 conflicts; success or permanent stop releases payloads. Stopped bookkeeping and
 tombstones remain until Reset/invalidation; quiet watches have no timer eviction.
 Delivery stops on deletion, terminal phase including unaudited termination,
-taint (apart from the initial identity-unverified negative), supersession,
-reset/generation stop, cancellation or caps, without resurrection. Expiry is
+taint (except Added-time identity-failure taint alone for the frozen negative
+above), supersession, reset/generation stop, cancellation or caps, without
+resurrection. Nonidentity event taint, including label or mount drift, is sticky
+and stops delivery permanently, including before submission. Aggregate taint
+remains conservative in predecessor and concurrent-pod proof checks; this
+delivery exception does not clear it. Expiry is
 observed on the next event/Handle/Deliver, without a quiet timer. Failed attempts
 warn with controlled reasons; one final info stop or success reports attempts,
 conflicts. Request-failed, stopped and succeeded records carry `worker_id`,

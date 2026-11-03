@@ -1467,3 +1467,34 @@ func TestRecoverySettleTargetValues(t *testing.T) {
 		}
 	}
 }
+
+func TestRunCreatedIssuesWire(t *testing.T) {
+	for _, issues := range [][]CreatedIssueDTO{nil, {}} {
+		raw, err := json.Marshal(RunDTO{CreatedIssues: issues})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "\"created_issues\"") {
+			t.Fatal("absent issues must be omitted")
+		}
+	}
+	want := []CreatedIssueDTO{{IID: 17, Title: "unsafe URL stays a coordinate", WebURL: ""}}
+	raw, err := json.Marshal(RunDTO{CreatedIssues: want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	if string(body["created_issues"]) != `[{"iid":17,"title":"unsafe URL stays a coordinate","web_url":""}]` {
+		t.Fatalf("wire=%s", body["created_issues"])
+	}
+	var decoded RunDTO
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.CreatedIssues) != 1 || decoded.CreatedIssues[0] != want[0] {
+		t.Fatalf("roundtrip=%+v", decoded.CreatedIssues)
+	}
+}

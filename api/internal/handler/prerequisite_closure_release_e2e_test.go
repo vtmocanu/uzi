@@ -113,10 +113,10 @@ func TestPrerequisiteClosureReleaseE2E(t *testing.T) {
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, "node", "--import", "tsx", "test/fixtures/prerequisite-closure-release-e2e.ts")
 	cmd.Dir = filepath.Join(root, "agent")
-	cmd.Env = append(os.Environ(), "UZI_CLOSURE_RELEASE_FIXTURE="+string(cfg))
+	cmd.Env = append(restoreEnv(filepath.Join(root, ".uzi", "scratch")), "UZI_CLOSURE_RELEASE_FIXTURE="+string(cfg))
 	out, err := cmd.CombinedOutput()
 	// Never print the worker token, including on a failing assertion.
-	t.Logf("worker fixture: %s", strings.ReplaceAll(string(out), token, "[redacted]"))
+	t.Logf("worker fixture output bytes=%d", len(out))
 	if err != nil {
 		t.Fatalf("worker fixture exit: %v", err)
 	}

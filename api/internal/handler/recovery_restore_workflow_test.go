@@ -47,6 +47,13 @@ func TestRecoveryRestoreWorkflowLiveDB(t *testing.T) {
 	t.Logf("retained_artifacts=%s", tmp)
 	t.Setenv("TMPDIR", tmp)
 	full := os.Getenv("UZI_TEST_RECOVERY_RESTORE_FULL_HISTORY_SOURCE")
+	if full != "" || restoreFullSelected() {
+		setup := restoreSetupFor(root, tmp, full, true)
+		setup.Node = restoreClientSelected()
+		if err := restorePreflight(setup); err != nil {
+			t.Fatal(err)
+		}
+	}
 	// Validate explicitly requested full input before any live-DB skip.
 	if full != "" {
 		if !filepath.IsAbs(full) {
@@ -70,17 +77,26 @@ func TestRecoveryRestoreWorkflowLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal("the pinned Go tool must be available on PATH")
 	}
+	buildStarted := time.Now()
 	out, err := restoreCommand(tmp, filepath.Join(root, "api"), goTool, "test", "-buildvcs=false", "-c", "-vet=off", "-o", binary, "./cmd/uzi")
 	if err != nil {
 		t.Fatalf("compile test driver: %v (output bytes %d)", err, len(out))
 	}
+	t.Logf("CLI_build=%s (outside owner restore clock)", time.Since(buildStarted))
 	t.Run("SmallNative", func(t *testing.T) { restoreWorkflow(t, tmp, binary, "") })
 	if full != "" {
 		t.Run("E5FullHistory", func(t *testing.T) { restoreWorkflow(t, tmp, binary, full) })
+		t.Run("E5ReleasedFullHistory", func(t *testing.T) { restoreWorkflow(t, tmp, binary, full, "released") })
+		t.Run("E5BeforePinRefusalFullHistory", func(t *testing.T) { restoreWorkflow(t, tmp, binary, full, "refusal") })
 	}
 }
 
-func restoreWorkflow(t *testing.T, tmp, binary, full string) {
+func restoreWorkflow(t *testing.T, tmp, binary, full string, modes ...string) {
+	node := (full != "" && len(modes) > 0) || (len(modes) > 1 && modes[1] == "workerclient")
+	mode := ""
+	if len(modes) != 0 {
+		mode = modes[0]
+	}
 	started := time.Now()
 	e := newPrerequisiteClosureEnv(t)
 	dir, err := os.MkdirTemp(tmp, "case-")
@@ -125,8 +141,12 @@ func restoreWorkflow(t *testing.T, tmp, binary, full string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !bytes.Contains(data, []byte("\n-"+prerequisite+" ")) || !bytes.Contains(data, []byte(source+" refs/heads/recovered-source\n")) {
+		t.Fatal("bundle header does not name exact prerequisite and advertised source")
+	}
 	restoreGit(t, tmp, bare, "config", "http.receivepack", "true")
-	remote, transferred := restoreRemote(t, tmp, dir)
+	traffic := new(restoreTraffic)
+	remote, transferred := restoreRemote(t, tmp, dir, traffic)
 	sealed, err := e.box.Seal([]byte("fixture-credential"))
 	if err != nil {
 		t.Fatal(err)
@@ -140,7 +160,7 @@ func restoreWorkflow(t *testing.T, tmp, binary, full string) {
 	h := e.handler()
 	h.cfg.PrerequisiteClosureForges = []string{"github"}
 	h.wsvc.SetTxBeginner(e.pool)
-	h.wsvc.SetForgeBaseURLAllowed(func(s string) bool { return s == remote.URL })
+	h.wsvc.SetForgeBaseURLAllowed(func(s string) bool { return s == remote.URL || (mode != "" && s == "https://github.com") })
 	h.wsvc.SetForges(pinForgeBuilder{f: &restoreForge{tmp: tmp, work: work, project: forge.Project{ForgeProjectID: 1, PathWithNamespace: "forge", WebURL: remote.URL + "/forge", DefaultBranch: "main"}}})
 	svc := h.RecoveryService()
 	// Drive the scheduler synchronously so upload cannot race the measured sweep.
@@ -156,13 +176,84 @@ func restoreWorkflow(t *testing.T, tmp, binary, full string) {
 	if _, err := svc.Upload(e.ctx, e.worker, e.run, capture, m, bytes.NewReader(data)); err != nil {
 		t.Fatal(err)
 	}
-	e.mustExec("UPDATE forge_connections SET base_url=$2 WHERE user_id=$1", e.user, remote.URL)
+	if mode == "" {
+		e.mustExec("UPDATE forge_connections SET base_url=$2 WHERE user_id=$1", e.user, remote.URL)
+	}
 	e.mustExec("UPDATE repos SET web_url=$2 WHERE id=$1", e.repo, remote.URL+"/forge")
+	rewrite := func() string {
+		restoreGit(t, tmp, work, "checkout", "--orphan", "replacement")
+		restoreGit(t, tmp, work, "rm", "-rf", ".")
+		replacement := commit("replacement.txt", "unrelated\n")
+		restoreGit(t, tmp, work, "update-ref", "refs/heads/main", replacement)
+		// Independent repos created here; neither failure is ignored. All commands have restoreCommand's two-minute bound.
+		for _, repo := range []string{bare, control} {
+			restoreGit(t, tmp, work, "push", repo, "HEAD:refs/heads/main", "--force")
+			refs := strings.Fields(restoreGit(t, tmp, repo, "for-each-ref", "--format=%(refname)"))
+			expected := []string{"refs/heads/main"}
+			if repo == bare && mode != "refusal" {
+				expected = append(expected, "refs/uzi-prereq/"+capture.String())
+			}
+			if strings.Join(refs, "\n") != strings.Join(expected, "\n") {
+				t.Fatal("unexpected fixture-owned reachability before prune")
+			}
+			restoreGit(t, tmp, repo, "reflog", "expire", "--expire=now", "--all")
+			if restoreGit(t, tmp, repo, "reflog", "show", "--all", "--format=%H") != "" {
+				t.Fatal("fixture reflogs still retain history before prune")
+			}
+			restoreGit(t, tmp, repo, "gc", "--prune=now")
+		}
+		if restoreGit(t, tmp, control, "rev-parse", "main") != replacement {
+			t.Fatal("control rewrite failed")
+		}
+		if _, err := restoreCommand(tmp, control, "git", "cat-file", "-e", prerequisite); err == nil {
+			t.Fatal("unpinned control retained prerequisite")
+		}
+		return replacement
+	}
+	var refusalPrune time.Duration
+	if mode == "refusal" {
+		pruneStart := time.Now()
+		rewrite()
+		refusalPrune = time.Since(pruneStart)
+	}
 	if n, err := h.wsvc.SweepPrerequisiteClosures(context.Background()); err != nil || n != 1 {
 		t.Fatalf("sweep changed=%d error=%v", n, err)
 	}
 	row, err := store.New(e.pool).GetPrerequisiteClosureForCapture(e.ctx, capture)
 	pin := "refs/uzi-prereq/" + capture.String()
+	if mode == "refusal" {
+		if err != nil || row.State != "refused" || row.Reason != "prerequisite_not_on_default" || row.NormalizedBaseUrl.Valid {
+			t.Fatalf("before-pin refusal: state=%s reason=%s binding_valid=%t error=%v", row.State, row.Reason, row.NormalizedBaseUrl.Valid, err)
+		}
+		if traffic.creates.Load() != 0 || traffic.receivePosts.Load() != 0 {
+			t.Fatal("refused closure sent native pin commands")
+		}
+		finalStart := time.Now()
+		restoreFinal(t, e, h, capture, row.ID, source, pin, tip, bare, tmp, traffic, node, true)
+		finalTime := time.Since(finalStart)
+		consumer := filepath.Join(dir, "refused-consumer")
+		restoreGit(t, tmp, dir, "clone", "--no-local", "--no-hardlinks", remote.URL+"/forge.git", consumer)
+		restoreMissing(t, tmp, consumer, bundle, prerequisite)
+		if _, err := restoreCommand(tmp, consumer, "git", "cat-file", "-e", prerequisite); err == nil {
+			t.Fatal("refusal consumer has prerequisite")
+		}
+		if _, err := os.Stat(filepath.Join(consumer, ".git", "objects", "info", "alternates")); !os.IsNotExist(err) {
+			t.Fatal("refusal consumer alternates")
+		}
+		if restoreGit(t, tmp, work, "rev-parse", "recovered-source") != source {
+			t.Fatal("refusal lost source")
+		}
+		if restoreGit(t, tmp, work, "rev-parse", "recovered-source^{tree}") != tree || restoreGit(t, tmp, work, "show", "recovered-source:recovery-generated.txt") != strings.TrimSpace(generated) {
+			t.Fatal("refusal did not retain original source tree/content")
+		}
+		if _, err := restoreCommand(tmp, bare, "git", "show-ref", "--verify", pin); err == nil {
+			t.Fatal("refusal unexpectedly created a native pin")
+		}
+		t.Logf("before-pin refusal retained capture and source; native listings=%d receive_posts=%d creates=%d", traffic.listings.Load(), traffic.receivePosts.Load(), traffic.creates.Load())
+		t.Logf("source_frozen=%s source_count=%s archive_bytes=%d generated_bytes=%d setup_including_prune=%s prune=%s FINAL=%s wall=%s full=%t owner_restore=not_applicable", restoreFrozen, restoreGit(t, tmp, work, "rev-list", "--count", source), len(data), len(generated), time.Since(started)-finalTime, refusalPrune, finalTime, time.Since(started), full != "")
+		return
+	}
+
 	if err != nil || row.State != "pinned" || row.PinRef != pin || row.PinTip.String != tip {
 		t.Fatalf("persisted closure not pinned: state=%s error=%v", row.State, err)
 	}
@@ -170,23 +261,19 @@ func restoreWorkflow(t *testing.T, tmp, binary, full string) {
 		t.Fatal("native fixed ref differs from persisted tip")
 	}
 	setupTime := time.Since(started)
-	restoreGit(t, tmp, work, "checkout", "--orphan", "replacement")
-	restoreGit(t, tmp, work, "rm", "-rf", ".")
-	replacement := commit("replacement.txt", "unrelated\n")
+	if mode != "" {
+		if !row.NormalizedBaseUrl.Valid || row.NormalizedBaseUrl.String != "https://github.com" {
+			t.Fatal("positive frozen GitHub binding missing")
+		}
+		restoreFinal(t, e, h, capture, row.ID, source, pin, tip, bare, tmp, traffic, node, false)
+		after, err := store.New(e.pool).GetPrerequisiteClosureForCapture(e.ctx, capture)
+		if err != nil || after.NormalizedBaseUrl != row.NormalizedBaseUrl {
+			t.Fatal("release changed frozen binding")
+		}
+	}
 	pruneStart := time.Now()
-	// Both bare repositories were created here. Never prune the supplied full source.
-	for _, repo := range []string{bare, control} {
-		restoreGit(t, tmp, work, "push", repo, "HEAD:refs/heads/main", "--force")
-		restoreGit(t, tmp, repo, "reflog", "expire", "--expire=now", "--all")
-		restoreGit(t, tmp, repo, "gc", "--prune=now")
-	}
+	replacement := rewrite()
 	pruneTime := time.Since(pruneStart)
-	if restoreGit(t, tmp, control, "rev-parse", "main") != replacement {
-		t.Fatal("control rewrite failed")
-	}
-	if _, err := restoreCommand(tmp, control, "git", "cat-file", "-e", prerequisite); err == nil {
-		t.Fatal("unpinned control retained prerequisite after pruning")
-	}
 	cloneStart := time.Now()
 	consumer := filepath.Join(dir, "consumer")
 	restoreGit(t, tmp, dir, "clone", "--no-local", "--no-hardlinks", remote.URL+"/forge.git", consumer)
@@ -195,6 +282,20 @@ func restoreWorkflow(t *testing.T, tmp, binary, full string) {
 	}
 	cloneTime := time.Since(cloneStart)
 	restoreMissing(t, tmp, consumer, bundle, prerequisite)
+	if _, err := restoreCommand(tmp, consumer, "git", "cat-file", "-e", prerequisite); err == nil {
+		t.Fatal("fresh consumer retained old prerequisite")
+	}
+	snapshot := func() string {
+		t.Helper()
+		var facts string
+		if err := e.pool.QueryRow(e.ctx, `SELECT jsonb_build_array(to_jsonb(c),to_jsonb(p),to_jsonb(h))::text
+ FROM recovery_captures c JOIN recovery_prerequisite_closures p ON p.capture_id=c.id
+ JOIN recovery_custody_holds h ON h.id=c.hold_id WHERE c.id=$1`, capture).Scan(&facts); err != nil {
+			t.Fatal(err)
+		}
+		return facts
+	}
+	before := snapshot()
 	ownerHandler, router, _ := cliLiveDB(t)
 	jwtSecret := ownerHandler.cfg.JWTSecret
 	ownerHandler.cfg = recoveryTestCfg()
@@ -215,6 +316,9 @@ func restoreWorkflow(t *testing.T, tmp, binary, full string) {
 	}))
 	t.Cleanup(apiServer.Close)
 	api := apiServer.URL
+	if mode != "" {
+		restoreOwnerIsolation(t, e, tmp, dir, binary, api, capture)
+	}
 	config := uzicli.NewStore(filepath.Join(dir, "config"))
 	if err := config.SaveConfig(&uzicli.Config{Current: "default", Contexts: map[string]uzicli.Context{"default": {URL: api}}}); err != nil {
 		t.Fatal(err)
@@ -255,18 +359,6 @@ func restoreWorkflow(t *testing.T, tmp, binary, full string) {
 	if err != nil || json.Unmarshal(versionOutput, &cliVersion) != nil || cliVersion.Version == "" {
 		t.Fatal("test driver did not emit its CLI version")
 	}
-	// Read/export/import must not modify durable custody, capture or pin facts.
-	snapshot := func() string {
-		t.Helper()
-		var facts string
-		if err := e.pool.QueryRow(e.ctx, `SELECT jsonb_build_array(to_jsonb(c),to_jsonb(p),to_jsonb(h))::text
- FROM recovery_captures c JOIN recovery_prerequisite_closures p ON p.capture_id=c.id
- JOIN recovery_custody_holds h ON h.id=c.hold_id WHERE c.id=$1`, capture).Scan(&facts); err != nil {
-			t.Fatal(err)
-		}
-		return facts
-	}
-	before := snapshot()
 	output := filepath.Join(dir, "export.bundle")
 	exportStart := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -282,14 +374,14 @@ func restoreWorkflow(t *testing.T, tmp, binary, full string) {
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatal("CLI export bytes differ")
 	}
-	transferred.Store(0)
+	beforeTransfer := transferred.Load()
 	fetchTime, importTime, err := restoreOwnerImport(tmp, consumer, output, capture.String(), projection)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ownerTime := time.Since(exportStart)
-	ownerTransferred := transferred.Load()
-	if transferred.Load() <= 0 || len(data) == 0 {
+	ownerTransferred := transferred.Load() - beforeTransfer
+	if ownerTransferred <= 0 || len(data) == 0 {
 		t.Fatal("archive and upload-pack response bytes must be positive")
 	}
 	if restoreGit(t, tmp, consumer, "rev-parse", "recovered-source") != source || restoreGit(t, tmp, consumer, "rev-parse", "recovered-source^{tree}") != tree || restoreGit(t, tmp, consumer, "show", "recovered-source:recovery-generated.txt") != strings.TrimSpace(generated) {
@@ -337,29 +429,31 @@ func restoreWorkflow(t *testing.T, tmp, binary, full string) {
 	if snapshot() != before || restoreGit(t, tmp, bare, "rev-parse", pin) != tip || restoreGit(t, tmp, work, "rev-parse", "recovered-source") != source {
 		t.Fatal("display/export/import changed durable facts or fixture pin/source")
 	}
-	t.Run("expired_download", func(t *testing.T) {
-		e.mustExec("UPDATE recovery_captures SET state='expired', expires_at=now()-interval '1 second' WHERE id=$1", capture)
-		req, err := http.NewRequest(http.MethodGet, api+"/api/runs/"+e.run.String()+"/archives/"+capture.String()+"/download", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var failure struct {
-			Reason string `json:"reason"`
-		}
-		decodeErr := json.NewDecoder(resp.Body).Decode(&failure)
-		if err := resp.Body.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if resp.StatusCode != http.StatusConflict || decodeErr != nil || failure.Reason != "not_available" {
-			t.Fatalf("expired download status=%d", resp.StatusCode)
-		}
-		t.Logf("expired download rejected status=%d", resp.StatusCode)
-	})
+	if mode == "" {
+		t.Run("expired_download", func(t *testing.T) {
+			e.mustExec("UPDATE recovery_captures SET state='expired', expires_at=now()-interval '1 second' WHERE id=$1", capture)
+			req, err := http.NewRequest(http.MethodGet, api+"/api/runs/"+e.run.String()+"/archives/"+capture.String()+"/download", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var failure struct {
+				Reason string `json:"reason"`
+			}
+			decodeErr := json.NewDecoder(resp.Body).Decode(&failure)
+			if err := resp.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusConflict || decodeErr != nil || failure.Reason != "not_available" {
+				t.Fatalf("expired download status=%d", resp.StatusCode)
+			}
+			t.Logf("expired download rejected status=%d", resp.StatusCode)
+		})
+	}
 	retained, err := os.ReadFile(output) // #nosec G304 -- Re-read only the fixture-owned export destination to prove retention.
 	if err != nil || !bytes.Equal(retained, data) {
 		t.Fatal("controls did not retain exported archive")

@@ -217,9 +217,18 @@ type HarnessDecisionDTO struct {
 	OtherHeld         bool     `json:"other_held"`
 }
 
+// CreatedIssueDTO is a confirmed issue created by this scheduled prompt run.
+// WebURL is empty when the stored repository URL cannot safely form a link.
+type CreatedIssueDTO struct {
+	IID    int64  `json:"iid"`
+	Title  string `json:"title"`
+	WebURL string `json:"web_url"`
+}
+
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
-	PolicyHold *PolicyHoldDTO `json:"policy_hold,omitempty"`
+	PolicyHold    *PolicyHoldDTO    `json:"policy_hold,omitempty"`
+	CreatedIssues []CreatedIssueDTO `json:"created_issues,omitempty"`
 	// Optional advisory cooldown for the assigned worker and current authorized origin.
 	ForgeOriginCooldown *ForgeOriginCooldownDTO `json:"forge_origin_cooldown,omitempty"`
 	// Detail-only detector provenance; never approval authority or summary polling data.
@@ -450,6 +459,7 @@ type RunDTO struct {
 	CompletionUnmet []string `json:"completion_unmet"`
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
+	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
@@ -1366,6 +1376,7 @@ type RunSummaryItemDTO struct {
 	CompletionUnmet []string `json:"completion_unmet"`
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
+	// 'iteration_budget_exhausted' for an iteration park (Resume/Cancel; Extend adds time only),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
 	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),

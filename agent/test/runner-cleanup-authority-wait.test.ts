@@ -120,6 +120,7 @@ describe("cancellation/park cleanup waits for A without the flight's aborted sig
   function cancelledFlight() {
     const cancel = new AbortController();
     const flight = {
+      iterationParkState: "none" as const,
       runId: RUN, claimGeneration: GEN, executor: { withCredentialFreeCapture: () => undefined } as unknown as Executor,
       cancel, cancellationBudget: budget, runLog: nullLogger(),
       worktreePath: path.join(fx.dataDir, "unused-worktree"), barePath: bare, trustedPublishedStart: sha,

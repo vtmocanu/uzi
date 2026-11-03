@@ -30,19 +30,23 @@ type fakeNotifStore struct {
 	ccSummary      *store.GetLatestPlanCrossCheckSummaryRow
 	ccSummaryErr   error
 	ccSummaryAsked []store.GetLatestPlanCrossCheckSummaryParams
-	pubSide        *store.RunPublicationResume
-	pubSideErr     error
-	runErr         error
-	rcErr          error
-	delivery       pgtype.Text
-	deliveryErr    error
-	msg            store.SlackRunMessage
-	msgErr         error
-	upserted       []store.UpsertSlackRunMessageParams
-	gateSet        []store.SetSlackRunGateParams
-	gateSetGen     []store.SetSlackRunGateGenParams
-	planCount      int64
-	planCountErr   error
+	// Code cross-check summary (issue #3813): nil + nil error models no row.
+	codeCC       *store.CrossCheck
+	codeCCErr    error
+	codeCCAsked  []store.GetCodeCrossCheckForOwnerParams
+	pubSide      *store.RunPublicationResume
+	pubSideErr   error
+	runErr       error
+	rcErr        error
+	delivery     pgtype.Text
+	deliveryErr  error
+	msg          store.SlackRunMessage
+	msgErr       error
+	upserted     []store.UpsertSlackRunMessageParams
+	gateSet      []store.SetSlackRunGateParams
+	gateSetGen   []store.SetSlackRunGateGenParams
+	planCount    int64
+	planCountErr error
 	// PRD #88 M3: the latest kind='question' payload and the anchor write recording
 	// which question the thread already carries. A nil question with no error models
 	// "no row" the way the generated :one query surfaces it.
@@ -129,6 +133,19 @@ func (f *fakeNotifStore) GetLatestPlanCrossCheckSummary(_ context.Context, arg s
 		return store.GetLatestPlanCrossCheckSummaryRow{}, pgx.ErrNoRows
 	}
 	return *f.ccSummary, nil
+}
+
+// GetCodeCrossCheckForOwner models the :one owner-bound read: with no staged row it
+// returns pgx.ErrNoRows (not recorded). codeCCAsked captures the scoped read.
+func (f *fakeNotifStore) GetCodeCrossCheckForOwner(_ context.Context, arg store.GetCodeCrossCheckForOwnerParams) (store.CrossCheck, error) {
+	f.codeCCAsked = append(f.codeCCAsked, arg)
+	if f.codeCCErr != nil {
+		return store.CrossCheck{}, f.codeCCErr
+	}
+	if f.codeCC == nil {
+		return store.CrossCheck{}, pgx.ErrNoRows
+	}
+	return *f.codeCC, nil
 }
 
 // GetActivePublicationResume models the run's active publication intent (issue #1324): a nil

@@ -59,7 +59,7 @@ python3 - "$ROOT/.github/workflows/release.yml" <<'PY'
 import pathlib, sys
 text = pathlib.Path(sys.argv[1]).read_text()
 lines = [line for line in text.splitlines() if not line.lstrip().startswith('#')]
-assert sum(line.count('./scripts/cosign-sign-retry.sh ') for line in lines) == 6
+assert sum(line.count('./scripts/cosign-sign-retry.sh ') for line in lines) == 7
 assert not any('cosign sign --yes' in line for line in lines)
 PY
-echo 'PASS: all six release signing sites use the shared retry helper'
+echo 'PASS: all seven release signing sites use the shared retry helper'
