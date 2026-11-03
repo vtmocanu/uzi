@@ -104,11 +104,13 @@ export interface MergeRequestDetail {
 }
 
 export class ForgeError extends Error {
-  constructor(
-    readonly status: number,
-    readonly detail: string,
-  ) {
+  declare readonly status: number;
+  declare readonly detail: string;
+
+  constructor(status: number, detail: string) {
     super(`forge API returned ${status}: ${detail}`);
+    this.status = status;
+    this.detail = detail;
     this.name = "ForgeError";
   }
 }
@@ -118,8 +120,11 @@ export class ForgeError extends Error {
  *  classifyForgeError checks for it before reading a bare status 0 as a transport failure. Every
  *  caller treats it as an unreadable MR/PR. */
 export class ForgeResponseTooLarge extends ForgeError {
-  constructor(readonly maxBytes: number) {
+  declare readonly maxBytes: number;
+
+  constructor(maxBytes: number) {
     super(0, `response too large (over ${maxBytes} bytes)`);
+    this.maxBytes = maxBytes;
     this.name = "ForgeResponseTooLarge";
   }
 }

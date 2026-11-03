@@ -1177,10 +1177,11 @@ tasks:
     desc: offline production Go and worker forge operation contracts over real HTTPS
     preconditions:
       - sh: command -v node
-        msg: forge operation contracts require Node with built-in TypeScript transform support
+        msg: forge operation contracts require Node with built-in TypeScript strip support
     cmds:
-      # Ordinary Node script emits node:test TAP and probes built-in TS transform
-      # capability (Node 22.13+); no Docker or additional npm/loader tooling.
+      # Ordinary Node script emits node:test TAP and capability-probes built-in TS
+      # stripping of erasable syntax; unsupported syntax fails loudly.
+      # No Docker or additional npm/loader tooling.
       # Node runs this exact Go argv directly from api: no shell or flag copy.
       # buildvcs=false supports linked worktrees; count=1 avoids fixture-invisible
       # test caching; v proves the named test ran with zero skips; timeout bounds
