@@ -305,7 +305,7 @@ func TestQueuedCustodyBoundedDiscoveryAndLostTupleLiveDB(t *testing.T) {
 	c, id := seededQueuedCustody(t, 1, 1, 1, []int64{1}, 1)
 	c.env.exec("UPDATE workers SET last_heartbeat_at=now()-interval '1 hour' WHERE id=$1", c.workerID)
 	at := time.Now()
-	rows, err := c.env.q.DiscoverStaleQueuedCustodyTargets(c.env.ctx, store.DiscoverStaleQueuedCustodyTargetsParams{AfterID: uuid.Nil, SweepStarted: pgconv.Time(at), Cutoff: pgconv.Time(at.Add(-10 * time.Minute)), MaxRequeues: 1})
+	rows, err := c.env.q.DiscoverStaleQueuedCustodyTargets(c.env.ctx, store.DiscoverStaleQueuedCustodyTargetsParams{AfterID: uuid.Nil, SweepStarted: pgconv.Time(at), Cutoff: pgconv.Time(at.Add(-10 * time.Minute)), MaxRequeues: 1, CustodyHoldLimit: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +348,7 @@ func TestQueuedCustodyBatchBoundsLiveDB(t *testing.T) {
 	c.env.exec("UPDATE workers SET last_heartbeat_at=now()-interval '1 hour' WHERE id=$1", c.workerID)
 	at := time.Now()
 	cutoff := pgconv.Time(at.Add(-10 * time.Minute))
-	page, err := c.env.q.DiscoverStaleQueuedCustodyTargets(c.env.ctx, store.DiscoverStaleQueuedCustodyTargetsParams{AfterID: uuid.Nil, SweepStarted: pgconv.Time(at), Cutoff: cutoff, MaxRequeues: 1})
+	page, err := c.env.q.DiscoverStaleQueuedCustodyTargets(c.env.ctx, store.DiscoverStaleQueuedCustodyTargetsParams{AfterID: uuid.Nil, SweepStarted: pgconv.Time(at), Cutoff: cutoff, MaxRequeues: 1, CustodyHoldLimit: 1})
 	if err != nil || len(page) != 32 {
 		t.Fatalf("bounded page=%d %v", len(page), err)
 	}
@@ -517,7 +517,7 @@ func TestQueuedCustodyClaimWinsDiscoveryLiveDB(t *testing.T) {
 	c.env.exec("UPDATE workers SET last_heartbeat_at=now()-interval '1 hour' WHERE id=$1", c.workerID)
 	at := time.Now()
 	cutoff := pgconv.Time(at.Add(-10 * time.Minute))
-	page, err := c.env.q.DiscoverStaleQueuedCustodyTargets(c.env.ctx, store.DiscoverStaleQueuedCustodyTargetsParams{AfterID: uuid.Nil, SweepStarted: pgconv.Time(at), Cutoff: cutoff, MaxRequeues: 1})
+	page, err := c.env.q.DiscoverStaleQueuedCustodyTargets(c.env.ctx, store.DiscoverStaleQueuedCustodyTargetsParams{AfterID: uuid.Nil, SweepStarted: pgconv.Time(at), Cutoff: cutoff, MaxRequeues: 1, CustodyHoldLimit: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

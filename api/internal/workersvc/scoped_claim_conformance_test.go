@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 	"testing"
 
@@ -182,11 +181,6 @@ func TestScopedClaimAccounting(t *testing.T) {
 			}
 			if name == "three grouped plus ordinary" && tx.identityWrites[pendingOutcomeTuple{ordinary, 2}] != 1 {
 				t.Fatal("ordinary tuple was not independently attributed")
-			}
-			if name == "group frozen target excluded" || name == "ordinary frozen target excluded" {
-				if tx.queuedRefreshes != 1 || !slices.Contains(tx.queuedRefreshIDs, tx.excludedTarget) {
-					t.Fatal("the custody refresh must retain the locked target; snapshot exclusion remains an independent guard")
-				}
 			}
 			if !tx.worker.PendingOverflowUntil.Valid {
 				t.Fatal("conservative overflow not persisted")

@@ -58,6 +58,7 @@ WHERE r.id = ANY(@locked_parent_ids::uuid[]) AND r.kind IN ('issue', 'ci_fix', '
 -- name: DiscoverStaleQueuedCustodyTargets :many
 -- Read-only keyset discovery. The cursor advances by the last discovered ID,
 -- including batches whose captured tuples are superseded before locks arrive.
+-- Below-bound own custody cannot qualify; do not enter the locking transaction.
 SELECT r.id, r.worker_id, jsonb_build_object(
     'id', r.id,
     'kind', r.kind,
@@ -87,9 +88,10 @@ WHERE r.id > @after_id::uuid AND r.created_at <= @sweep_started::timestamptz
   AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND r.egress_profile_id IS NULL AND r.status = 'queued'
   AND r.claim_generation > 0
   AND (r.requeue_count - r.requeue_episode_baseline) >= @max_requeues
-  AND EXISTS (SELECT 1 FROM recovery_custody_holds h
+  AND @custody_hold_limit::integer > 0
+  AND (SELECT count(*) FROM recovery_custody_holds h
       WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.state = 'open'
-        AND h.generation BETWEEN 1 AND r.claim_generation)
+        AND h.generation BETWEEN 1 AND r.claim_generation) >= @custody_hold_limit
 ORDER BY r.id LIMIT 32;
 
 -- name: LockStaleQueuedCustodyWorkers :many

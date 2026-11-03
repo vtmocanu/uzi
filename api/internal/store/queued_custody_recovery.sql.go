@@ -42,17 +42,19 @@ WHERE r.id > $1::uuid AND r.created_at <= $2::timestamptz
   AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework') AND r.egress_profile_id IS NULL AND r.status = 'queued'
   AND r.claim_generation > 0
   AND (r.requeue_count - r.requeue_episode_baseline) >= $4
-  AND EXISTS (SELECT 1 FROM recovery_custody_holds h
+  AND $5::integer > 0
+  AND (SELECT count(*) FROM recovery_custody_holds h
       WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.state = 'open'
-        AND h.generation BETWEEN 1 AND r.claim_generation)
+        AND h.generation BETWEEN 1 AND r.claim_generation) >= $5
 ORDER BY r.id LIMIT 32
 `
 
 type DiscoverStaleQueuedCustodyTargetsParams struct {
-	AfterID      uuid.UUID          `json:"after_id"`
-	SweepStarted pgtype.Timestamptz `json:"sweep_started"`
-	Cutoff       pgtype.Timestamptz `json:"cutoff"`
-	MaxRequeues  int32              `json:"max_requeues"`
+	AfterID          uuid.UUID          `json:"after_id"`
+	SweepStarted     pgtype.Timestamptz `json:"sweep_started"`
+	Cutoff           pgtype.Timestamptz `json:"cutoff"`
+	MaxRequeues      int32              `json:"max_requeues"`
+	CustodyHoldLimit int32              `json:"custody_hold_limit"`
 }
 
 type DiscoverStaleQueuedCustodyTargetsRow struct {
@@ -63,12 +65,14 @@ type DiscoverStaleQueuedCustodyTargetsRow struct {
 
 // Read-only keyset discovery. The cursor advances by the last discovered ID,
 // including batches whose captured tuples are superseded before locks arrive.
+// Below-bound own custody cannot qualify; do not enter the locking transaction.
 func (q *Queries) DiscoverStaleQueuedCustodyTargets(ctx context.Context, arg DiscoverStaleQueuedCustodyTargetsParams) ([]DiscoverStaleQueuedCustodyTargetsRow, error) {
 	rows, err := q.db.Query(ctx, discoverStaleQueuedCustodyTargets,
 		arg.AfterID,
 		arg.SweepStarted,
 		arg.Cutoff,
 		arg.MaxRequeues,
+		arg.CustodyHoldLimit,
 	)
 	if err != nil {
 		return nil, err

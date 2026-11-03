@@ -34,18 +34,19 @@ func (s *Service) queuedCustodyCachedLimit(ctx context.Context) int32 {
 	return n
 }
 
-// queuedCustodyAdmission takes the settings lock before any savepoint or worker
-// lock. A recoverable settings statement failure disables classification after a
+// Positive supported queued admission takes the settings lock before any savepoint
+// or worker lock. Disabled admission performs no settings DB work. A recoverable
+// settings statement failure disables classification after a
 // successful savepoint rollback; transaction management, context and connection
 // failures still propagate, so liveness is not guaranteed on those failures.
 // Only fresh transaction rows authorize admission; a stale cache never does.
 func (s *Service) queuedCustodyAdmission(ctx context.Context, tx pgx.Tx, cached int32) (int32, error) {
+	reader, ok := s.p.CustodyHoldLimit.(custodyTransactionRowsReader)
+	if !ok || cached <= 0 {
+		return 0, nil
+	}
 	if err := store.LockSettingsAdmission(ctx, tx); err != nil {
 		return 0, err
-	}
-	reader, ok := s.p.CustodyHoldLimit.(custodyTransactionRowsReader)
-	if !ok {
-		return 0, nil
 	}
 	settingsTx, err := tx.Begin(ctx)
 	if err != nil {
@@ -161,9 +162,14 @@ func (s *Service) parkStaleQueuedCustody(ctx context.Context, cutoff pgtype.Time
 		if err := ctx.Err(); err != nil {
 			return count, err
 		}
+		limit := s.queuedCustodyCachedLimit(ctx)
+		if limit <= 0 {
+			return count, nil
+		}
 		discovered, err := q.DiscoverStaleQueuedCustodyTargets(ctx, store.DiscoverStaleQueuedCustodyTargetsParams{
 			AfterID: cursor, SweepStarted: pgconv.Time(sweepStarted), Cutoff: cutoff,
-			MaxRequeues: int32(s.p.RunMaxRequeues), //nolint:gosec // bounded configuration, as in active-run recovery.
+			MaxRequeues:      int32(s.p.RunMaxRequeues), //nolint:gosec // bounded configuration, as in active-run recovery.
+			CustodyHoldLimit: limit,
 		})
 		if err != nil {
 			return count, err

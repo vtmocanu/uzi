@@ -67,6 +67,9 @@ func captureWorkerRecoveryLocksWithQueued(ctx context.Context, qtx *store.Querie
 	if err != nil {
 		return workerRecoveryLockSet{}, err
 	}
+	if admission.CustodyHoldLimit <= 0 {
+		return locks, nil
+	}
 	return validateQueuedCustodyLocks(ctx, qtx, locks)
 }
 
