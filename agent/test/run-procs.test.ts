@@ -312,6 +312,8 @@ describe("run process attribution (PRD #1809 D4)", () => {
         [`GOTMPDIR=${other}/.uzi-go-work/g2`],
         [`GOTMPDIR=${runHome}/.uzi-go-work`],
         [`GOTMPDIR=${runHome}/.uzi-go-work/`],
+        [`GOTMPDIR=${runHome}/.uzi-go-work-x/g1`],
+        [`GOTMPDIR=${runHome}/g1/x`],
       ];
       cases.forEach((env, i) => fake(4700 + i, { env: ["HOME=/elsewhere", ...env], cwd: "/tmp" }));
       const r = await scan();

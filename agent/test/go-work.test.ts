@@ -153,6 +153,57 @@ describe("prepareManagedGoWork", () => {
     assert.deepStrictEqual(await prepareManagedGoWork("relative/home", 1, logger), { skipped: true, reason: "home_unavailable" });
   });
 
+  it("a different directory swapped into the leaf name before the reopen is refused and never chmodded", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    await prepareParent();
+    const swapped = path.join(home, "swapped");
+    await fs.mkdir(swapped, { mode: 0o755 });
+    await fs.chmod(swapped, 0o755);
+    await fs.writeFile(path.join(swapped, "keep"), "k\n");
+    const { logger } = recordingLogger();
+    const r = await prepareManagedGoWork(home, 1, logger, {
+      mkdir: async (p: string, o: { mode: number }) => {
+        await fs.mkdir(p, o);
+        if (p.endsWith("/g1")) {
+          await fs.rename(p, `${p}-away`);
+          await fs.rename(swapped, p);
+        }
+        return undefined;
+      },
+    });
+    assert.deepStrictEqual(r, { skipped: true, reason: "leaf_refused" });
+    const leaf = path.join(parentDir(), "g1");
+    assert.strictEqual(((await fs.lstat(leaf)).mode & 0o7777).toString(8), "755", "swapped-in dir not chmodded");
+    assert.deepStrictEqual(await fs.readdir(leaf), ["keep"]);
+  });
+
+  it("steps are fd-relative: renaming HOME away and symlinking its old path elsewhere cannot redirect the create", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const outside = makeScratchRoot("uzi-go-work-out-");
+    const moved = `${home}-moved`;
+    let first = true;
+    try {
+      const { logger } = recordingLogger();
+      const r = await prepareManagedGoWork(home, 1, logger, {
+        mkdir: async (p: string, o: { mode: number }) => {
+          if (first) {
+            first = false;
+            await fs.rename(home, moved);
+            await fs.symlink(outside, home, "dir");
+          }
+          return fs.mkdir(p, o);
+        },
+      });
+      assert.deepStrictEqual(await fs.readdir(outside), [], "nothing created through the swapped path");
+      assert.ok("dir" in r || "skipped" in r);
+      if ("dir" in r) assert.ok(existsSync(path.join(moved, GO_WORK_PARENT, "g1")), "landed in the pinned HOME");
+    } finally {
+      await fs.rm(home, { force: true });
+      await fs.rename(moved, home).catch(() => undefined);
+      await fs.rm(outside, { recursive: true, force: true });
+    }
+  });
+
   describe("injected syscall failures each skip with one diagnostic", () => {
     const boom = (code: string) => Object.assign(new Error("boom"), { code });
     const cases: Array<[string, string, () => GoWorkFsOps]> = [];
@@ -306,7 +357,7 @@ describe("removeGoWorkLeaves", () => {
     assert.ok(existsSync(path.join(parentDir(), "g1")));
   });
 
-  it("an unreadable parent (readdir denied) is refused, not clean", async (t) => {
+  it("a parent whose mode is wrong for a managed parent (0300) is refused by the shape check, not clean", async (t) => {
     if (noProcFd) return t.skip(NO_PROC_FD);
     if (process.getuid?.() === 0) return t.skip("root reads any directory");
     await prepareParent();
@@ -320,6 +371,40 @@ describe("removeGoWorkLeaves", () => {
       await fs.chmod(parentDir(), 0o700);
     }
   });
+
+  it("an enumeration error mid-stream is not clean and deletes nothing", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    await prepareParent();
+    await seedLeaves([1, 2]);
+    const { r } = await run(
+      { kind: "all" },
+      {
+        opendir: async () => ({
+          async *[Symbol.asyncIterator]() {
+            yield { name: "g1" };
+            throw Object.assign(new Error("EIO"), { code: "EIO" });
+          },
+          close: async () => undefined,
+        }),
+      },
+    );
+    assert.strictEqual(r.parent, "refused");
+    assert.strictEqual(isGoWorkClean(r), false);
+    assert.deepStrictEqual((await fs.readdir(parentDir())).sort(), ["g1", "g2"]);
+  });
+
+  for (const bad of [undefined, Number.NaN, 0, -1, 1.5] as unknown as number[]) {
+    it(`olderThan with an invalid generation (${String(bad)}) is refused, not clean, and deletes nothing`, async (t) => {
+      if (noProcFd) return t.skip(NO_PROC_FD);
+      await prepareParent();
+      await seedLeaves([1, 2]);
+      const { r, lines } = await run({ kind: "olderThan", generation: bad });
+      assert.strictEqual(r.parent, "refused");
+      assert.strictEqual(isGoWorkClean(r), false);
+      assert.deepStrictEqual((await fs.readdir(parentDir())).sort(), ["g1", "g2"]);
+      assert.strictEqual(warnings(lines).length, 1);
+    });
+  }
 
   it("stops enumerating at maxEntries and is not clean", async (t) => {
     if (noProcFd) return t.skip(NO_PROC_FD);

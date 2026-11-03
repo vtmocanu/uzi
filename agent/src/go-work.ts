@@ -8,10 +8,12 @@
 // Boundary, stated plainly. `.uzi-go-work` is a disposable scratch root, NOT cross-run isolation. A run
 // HOME is group-writable and not sticky, so any same-uid process (this run's, or another run's on the
 // same worker, which shares the `runner` uids) can rename or replace the parent or a leaf. That is the
-// existing shared-UID posture and is accepted here; what this module guarantees is narrower: every step
-// is relative to a pinned directory descriptor (so a swap cannot redirect a create, chmod or open onto a
-// path outside what was pinned), an existing parent or leaf with the wrong shape is refused rather than
-// repaired (never chown, never recursive chmod), and no function here throws.
+// existing shared-UID posture and is accepted here; what this module guarantees is narrower: each step
+// is relative to a pinned directory descriptor (HOME, then the parent), so a swap of an ancestor path
+// cannot redirect a later create or open outside the pinned directory; a directory this call created is
+// verified fresh on its reopened descriptor before the only chmod (a swap in that window is refused, not
+// adopted); an existing parent or leaf with the wrong shape is refused rather than repaired (never
+// chown, never recursive chmod); and no function here throws.
 
 import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
@@ -98,10 +100,12 @@ class Skip extends Error {
  * one bounded warning, and the caller launches without `GOTMPDIR`.
  *
  * Steps run through descriptors: HOME is opened `O_DIRECTORY|O_NOFOLLOW` and held, the parent is created
- * (non-recursive, mode 2770 under the uid split, 0700 otherwise; chmod only on creation) and opened
- * pinned below it, and the leaf is created non-recursively below the pinned parent. An existing parent
- * with the wrong owner, group or mode is refused, never repaired. An existing leaf is a refusal too
- * (`leaf_exists`): a generation's leaf is made once.
+ * (non-recursive, mode 2770 under the uid split, 0700 otherwise) and opened below it, and the leaf is
+ * created non-recursively below the pinned parent. mkdir and the reopen are by name, so a directory
+ * this call created is chmodded only after the reopened descriptor passes a freshness check (ours,
+ * empty, nlink 2, no mode bits beyond the requested ones); a swapped-in directory is refused untouched.
+ * An existing parent with the wrong owner, group or mode is refused, never repaired. An existing leaf
+ * is a refusal too (`leaf_exists`): a generation's leaf is made once.
  */
 export async function prepareManagedGoWork(
   home: string,
@@ -148,6 +152,24 @@ export async function prepareManagedGoWork(
   };
   const settle = async (handle: Handle, created: boolean, onFail: GoWorkSkipReason, onRefuse: GoWorkSkipReason) => {
     if (created) {
+      // The open is by name, so a same-uid process could have swapped another directory into place
+      // between our mkdir and the open. Before the fd is chmodded, require it to look like what our
+      // mkdir just made: ours, a directory, empty, no hard-link extras, and no mode bits beyond the
+      // requested ones (setgid may be inherited from the parent) with the owner rwx bits present.
+      let fresh: boolean;
+      try {
+        const st = await handle.stat();
+        fresh =
+          st.isDirectory() &&
+          st.uid === process.getuid?.() &&
+          st.nlink === 2 &&
+          (st.mode & 0o700) === 0o700 &&
+          (st.mode & ~(mode | 0o2000) & 0o7777) === 0 &&
+          (await fs.readdir(fdPath(handle.fd))).length === 0;
+      } catch (err) {
+        throw new Skip(onRefuse, errCode(err));
+      }
+      if (!fresh) throw new Skip(onRefuse);
       try {
         await chmod(handle, mode);
       } catch (err) {
@@ -207,6 +229,8 @@ export interface GoWorkRemovalOptions {
   maxEntries?: number;
   /** Test seam: defaults to {@link rmHomeSubtree}. */
   removeSubtree?: typeof rmHomeSubtree;
+  /** Test seam: defaults to `fs.opendir`; lets a test fail the enumeration mid-stream. */
+  opendir?: (target: string) => Promise<AsyncIterable<{ name: string }> & { close(): Promise<void> }>;
 }
 
 const DEFAULT_MAX_ENTRIES = 10_000;
@@ -221,6 +245,12 @@ const MAX_LOGGED_NAMES = 8;
 export async function removeGoWorkLeaves(home: string, log: Logger, opts: GoWorkRemovalOptions): Promise<GoWorkRemoval> {
   const result: GoWorkRemoval = { parent: "absent", removed: [], absent: [], failed: [], skipped: [], truncated: false };
   try {
+    if (opts.select.kind === "olderThan" && !(Number.isSafeInteger(opts.select.generation) && opts.select.generation > 0)) {
+      // A bad cutoff would select nothing and look clean; refuse instead of deleting or reporting success.
+      result.parent = "refused";
+      log.warn("managed Go work dir cleanup refused: invalid olderThan generation", { reason: sanitizeForLog(opts.reason, 64) });
+      return result;
+    }
     await removeInto(home, opts, result);
   } catch {
     // Defensive: nothing below is expected to throw; an unexpected error is not a clean result.
@@ -258,7 +288,7 @@ async function removeInto(home: string, opts: GoWorkRemovalOptions, result: GoWo
     }
     result.parent = "ok";
     // Streamed: entries are consumed one at a time and only selected names are kept.
-    const dir = await fs.opendir(fdPath(parent.fd));
+    const dir = await (opts.opendir ?? ((p: string) => fs.opendir(p)))(fdPath(parent.fd));
     let seen = 0;
     try {
       for await (const ent of dir) {
