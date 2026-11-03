@@ -4754,6 +4754,26 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     }
   });
 
+  it("issue #3870: the install env carries GOTMPDIR from ctx.managedGoWorkDir, and none without it", async () => {
+    const goWork = path.join(homeDir, ".uzi-go-work", "g1");
+    const seen: Array<NodeJS.ProcessEnv> = [];
+    for (const managedGoWorkDir of [goWork, undefined]) {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const installDeps: SdkExecutorOptions["installDeps"] = async (_root, env) => {
+        seen.push(env);
+        return { results: [], truncated: false };
+      };
+      const probe = makeCtx(managedGoWorkDir ? { managedGoWorkDir } : {});
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+    }
+    assert.equal(seen.length, 2);
+    assert.strictEqual(seen[0]!.GOTMPDIR, goWork);
+    assert.strictEqual(seen[1]!.GOTMPDIR, undefined);
+  });
+
   it("says so plainly when the repo has no JS dependencies to install", async () => {
     const { queryFn } = fakeTurns([
       [submitPlan("# plan"), resultSuccess()],
