@@ -9267,6 +9267,15 @@ SELECT locked.id, 'approve_plan', @body,
 FROM locked
 RETURNING *;
 
+-- name: CreateCompletionDecisionInput :one
+-- Issue #3841: the completion_decision AUDIT row for an owner completion-continue that was
+-- delivered as an ANSWER. It carries that answer's question_id so SnapshotOwnerSteering can
+-- recognise the answer as completion guidance rather than plan steering. Every other
+-- completion_decision write keeps using CreateRunInput (no question_id).
+INSERT INTO run_user_inputs (run_id, kind, body, question_id)
+VALUES (@run_id, 'completion_decision', @body, @question_id)
+RETURNING *;
+
 -- name: CreateRunAnswerInput :one
 -- PRD #88 M1: enqueue an `answer` for the live worker. A plain insert like
 -- CreateRunInput — no stop signal, no cap, no runs-row write — but it additionally

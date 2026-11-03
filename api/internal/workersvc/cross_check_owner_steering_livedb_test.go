@@ -24,12 +24,14 @@ import (
 
 const steeringLeadQuestion = `{"question_id":%q,"questions":[{"header":"DB","question":"Which database?","options":[{"label":"pg"},{"label":"sqlite"}]}]}`
 
-// seedSteeringAnswer inserts a lead question and the owner's answer to it through exec.
-func seedSteeringAnswer(t *testing.T, exec func(string, ...any), lead uuid.UUID, qid, answer string) {
+// seedSteeringAnswer inserts a lead question at an explicit run_messages seq and the owner's answer
+// to it through exec. The seq is explicit because two inserts that each pick max(seq)+1 (one in an
+// uncommitted transaction) would collide on UNIQUE(run_id, seq) and block.
+func seedSteeringAnswer(t *testing.T, exec func(string, ...any), lead uuid.UUID, seq int, qid, answer string) {
 	t.Helper()
 	exec(`INSERT INTO run_messages (run_id, seq, kind, agent, payload, created_at)
-		VALUES ($1, (SELECT COALESCE(max(seq),0)+1 FROM run_messages WHERE run_id=$1), 'question', 'lead', $2::jsonb, now() - interval '5 seconds')`,
-		lead, fmt.Sprintf(steeringLeadQuestion, qid))
+		VALUES ($1, $3, 'question', 'lead', $2::jsonb, now() - interval '5 seconds')`,
+		lead, fmt.Sprintf(steeringLeadQuestion, qid), seq)
 	exec(`INSERT INTO run_user_inputs (run_id, kind, body, question_id) VALUES ($1, 'answer', $2, $3)`,
 		lead, fmt.Sprintf(`{"question_id":%q,"answers":[%q]}`, qid, answer), qid)
 }
@@ -59,7 +61,7 @@ func decideRevise(t *testing.T, env codexTestEnv, svc *Service, w store.Worker, 
 func TestOwnerSteeringFreezeAcrossRoundsLiveDB(t *testing.T) {
 	env, svc, w, lead, c := newAutomaticRoundsHarnessFixture(t, 2, "codex")
 	q1, q2 := "q1-"+uuid.NewString(), "q2-"+uuid.NewString()
-	seedSteeringAnswer(t, env.exec, lead, q1, "use postgres")
+	seedSteeringAnswer(t, env.exec, lead, 9001, q1, "use postgres")
 	// A real pre-gate revise: SubmitInput permits it while the lead runs and labels it unbound.
 	if _, err := svc.SubmitInput(env.ctx, w.UserID, lead, "revise_plan", "tighten the scope", nil); err != nil {
 		t.Fatalf("pre-gate revise: %v", err)
@@ -74,11 +76,15 @@ func TestOwnerSteeringFreezeAcrossRoundsLiveDB(t *testing.T) {
 	first := storedSteering(t, env, cc1)
 	var snap struct {
 		Entries []struct {
-			Kind, QuestionID, GateBinding, Feedback string
-			Answers                                 []string
+			Kind        string   `json:"kind"`
+			QuestionID  string   `json:"question_id"`
+			GateBinding string   `json:"gate_binding"`
+			Feedback    string   `json:"feedback"`
+			Answers     []string `json:"answers"`
 		} `json:"owner_entries"`
 		Context []struct {
-			Status, Author string
+			Status string `json:"status"`
+			Author string `json:"author"`
 		} `json:"question_context"`
 		Cutoff int64 `json:"cutoff_input_id"`
 	}
@@ -94,7 +100,7 @@ func TestOwnerSteeringFreezeAcrossRoundsLiveDB(t *testing.T) {
 	}
 
 	// A new answer after the freeze: the same-round retry returns the same round and bytes.
-	seedSteeringAnswer(t, env.exec, lead, q2, "yes, add an index")
+	seedSteeringAnswer(t, env.exec, lead, 9002, q2, "yes, add an index")
 	retry, err := svc.SubmitPlanCrossCheck(env.ctx, w, lead, 1, c, 1)
 	if err != nil || retry.ID != cc1.ID {
 		t.Fatalf("retry: %v", err)
@@ -131,7 +137,7 @@ func TestOwnerSteeringWaitsForInFlightAnswerLiveDB(t *testing.T) {
 		if _, err := tx.Exec(env.ctx, sql, args...); err != nil {
 			t.Fatal(err)
 		}
-	}, lead, q, "late but committed")
+	}, lead, 9001, q, "late but committed")
 	done := make(chan store.CrossCheck, 1)
 	go func() {
 		cc, err := svc.SubmitPlanCrossCheck(env.ctx, w, lead, 1, c, 1)
@@ -172,8 +178,8 @@ func TestOwnerSteeringConcurrentInsertFrozenLiveDB(t *testing.T) {
 		if _, err := tx.Exec(env.ctx, sql, args...); err != nil {
 			t.Fatal(err)
 		}
-	}, lead, inflight, "uncommitted answer")
-	seedSteeringAnswer(t, env.exec, lead, committed, "committed answer")
+	}, lead, 9001, inflight, "uncommitted answer")
+	seedSteeringAnswer(t, env.exec, lead, 9002, committed, "committed answer")
 
 	cc1, err := svc.SubmitPlanCrossCheck(env.ctx, w, lead, 1, c, 1)
 	if err != nil {

@@ -65,11 +65,14 @@ WITH cut AS (
     WHERE i.run_id = $1
       AND i.id <= cut.cutoff
       AND ((i.kind = 'answer' AND i.question_id IS NOT NULL) OR i.kind = 'revise_plan')
+      AND NOT (i.kind = 'answer' AND EXISTS (
+            SELECT 1 FROM run_user_inputs d
+            WHERE d.run_id = $1 AND d.kind = 'completion_decision' AND d.question_id = i.question_id))
 ), tot AS (
     SELECT count(*)::bigint AS total FROM sel
 ), kept AS (
     SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported FROM sel ORDER BY id DESC LIMIT $2::int
-), ans AS (
+), ans AS MATERIALIZED (
     SELECT k.id,
            CASE
                WHEN k.kind <> 'answer' THEN NULL
@@ -89,11 +92,12 @@ WITH cut AS (
            END AS status
     FROM kept k
 ), qmsg AS MATERIALIZED (
-    -- the run's question messages, read once for occ and first_occ
+    -- the run's question messages for the kept answers' question ids, read once for occ and first_occ
     SELECT m.seq, m.agent, m.payload, m.created_at, m.payload ->> 'question_id' AS qid
     FROM run_messages m
     WHERE m.run_id = $1 AND m.kind = 'question'
-), occ AS (
+      AND m.payload ->> 'question_id' IN (SELECT question_id FROM kept WHERE kind = 'answer')
+), occ AS MATERIALIZED (
     SELECT k.id AS answer_id,
            count(*)::bigint AS occurrences,
            count(DISTINCT (m.payload -> 'questions', m.agent))::bigint AS variants
@@ -101,22 +105,13 @@ WITH cut AS (
     JOIN qmsg m ON m.qid = k.question_id AND m.created_at <= k.created_at
     WHERE k.kind = 'answer'
     GROUP BY k.id
-), first_occ AS (
+), first_occ AS MATERIALIZED (
     SELECT DISTINCT ON (k.id) k.id AS answer_id, m.agent, m.payload
     FROM kept k
     JOIN qmsg m ON m.qid = k.question_id AND m.created_at <= k.created_at
     WHERE k.kind = 'answer'
     ORDER BY k.id, m.seq
-), dec AS MATERIALIZED (
-    SELECT d.created_at
-    FROM run_user_inputs d
-    WHERE d.run_id = $1 AND d.kind = 'completion_decision'
-), comp AS (
-    SELECT k.id AS answer_id,
-           EXISTS (SELECT 1 FROM dec WHERE dec.created_at = k.created_at) AS completion_question
-    FROM kept k
-    WHERE k.kind = 'answer'
-), qctx AS (
+), qctx AS MATERIALIZED (
     SELECT f.answer_id, f.agent, f.payload,
            CASE
                WHEN jsonb_typeof(f.payload -> 'questions') IS DISTINCT FROM 'array' THEN 'malformed'
@@ -142,7 +137,7 @@ WITH cut AS (
                END
            END AS status
     FROM first_occ f
-), proj AS (
+), proj AS MATERIALIZED (
     SELECT k.id AS input_id,
            (CASE WHEN k.kind = 'revise_plan' THEN left(k.body, 8192 + 1024) END)::text AS revise_body,
            (CASE WHEN k.kind = 'revise_plan' THEN char_length(k.body) > 8192 END)::boolean AS revise_truncated,
@@ -157,7 +152,6 @@ WITH cut AS (
            END)::boolean AS answers_truncated,
            COALESCE(occ.occurrences, 0)::bigint AS occurrences,
            COALESCE(occ.variants, 0)::bigint AS variants,
-           COALESCE(comp.completion_question, false)::boolean AS completion_question,
            qctx.agent AS question_agent,
            qctx.status::text AS questions_status,
            (CASE WHEN qctx.status = 'ok' THEN
@@ -180,7 +174,6 @@ WITH cut AS (
     FROM kept k
     LEFT JOIN ans ON ans.id = k.id
     LEFT JOIN occ ON occ.answer_id = k.id
-    LEFT JOIN comp ON comp.answer_id = k.id
     LEFT JOIN qctx ON qctx.answer_id = k.id
 )
 SELECT cut.cutoff,
@@ -198,7 +191,6 @@ SELECT cut.cutoff,
        proj.answers_truncated,
        proj.occurrences,
        proj.variants,
-       proj.completion_question,
        proj.question_agent,
        proj.questions_status,
        proj.questions,
@@ -231,7 +223,6 @@ type SnapshotOwnerSteeringRow struct {
 	AnswersTruncated   pgtype.Bool        `json:"answers_truncated"`
 	Occurrences        pgtype.Int8        `json:"occurrences"`
 	Variants           pgtype.Int8        `json:"variants"`
-	CompletionQuestion pgtype.Bool        `json:"completion_question"`
 	QuestionAgent      pgtype.Text        `json:"question_agent"`
 	QuestionsStatus    pgtype.Text        `json:"questions_status"`
 	Questions          []byte             `json:"questions"`
@@ -265,11 +256,17 @@ type SnapshotOwnerSteeringRow struct {
 // the cap itself would leave a short token prefix that no scrub pattern matches. The *_truncated
 // flags stay defined against the ORIGINAL caps, never the margin.
 //
-// completion_question marks an answer written by resumeCompletionBlocked: that function writes the
-// answer and a completion_decision input in one transaction, so the two rows share created_at
-// (now() is the transaction start). Such an answer is completion-continue guidance, not plan
-// steering, and the builder drops it. The marker is a server-written fact, never lead-authored
-// question text.
+// A completion-continue answer is NOT plan steering and is excluded in sel itself, so it takes no
+// kept slot and is not counted in tot. resumeCompletionBlocked (workersvc) writes that answer
+// against the run's open completion question and then writes the completion_decision audit row
+// carrying the SAME question_id (CreateCompletionDecisionInput); the two writes are
+// non-transactional on the default continue path, so their timestamps differ and the shared
+// question_id is the only link. sel drops an answer whose question_id has a completion_decision
+// row on the run. The link is a server-written fact, never lead-authored question text.
+//
+// Every CTE that is referenced more than once or runs under a locked lead row is MATERIALIZED:
+// under pgx statement caching Postgres can pick a generic plan in which an inlined CTE is
+// re-evaluated per outer row (measured 2.5 s against 16 ms).
 func (q *Queries) SnapshotOwnerSteering(ctx context.Context, arg SnapshotOwnerSteeringParams) ([]SnapshotOwnerSteeringRow, error) {
 	rows, err := q.db.Query(ctx, snapshotOwnerSteering, arg.RunID, arg.MaxEntries)
 	if err != nil {
@@ -295,7 +292,6 @@ func (q *Queries) SnapshotOwnerSteering(ctx context.Context, arg SnapshotOwnerSt
 			&i.AnswersTruncated,
 			&i.Occurrences,
 			&i.Variants,
-			&i.CompletionQuestion,
 			&i.QuestionAgent,
 			&i.QuestionsStatus,
 			&i.Questions,

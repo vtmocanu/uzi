@@ -3549,6 +3549,45 @@ func (q *Queries) CreateApprovePlanInput(ctx context.Context, arg CreateApproveP
 	return i, err
 }
 
+const createCompletionDecisionInput = `-- name: CreateCompletionDecisionInput :one
+INSERT INTO run_user_inputs (run_id, kind, body, question_id)
+VALUES ($1, 'completion_decision', $2, $3)
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported
+`
+
+type CreateCompletionDecisionInputParams struct {
+	RunID      uuid.UUID   `json:"run_id"`
+	Body       pgtype.Text `json:"body"`
+	QuestionID pgtype.Text `json:"question_id"`
+}
+
+// Issue #3841: the completion_decision AUDIT row for an owner completion-continue that was
+// delivered as an ANSWER. It carries that answer's question_id so SnapshotOwnerSteering can
+// recognise the answer as completion guidance rather than plan steering. Every other
+// completion_decision write keeps using CreateRunInput (no question_id).
+func (q *Queries) CreateCompletionDecisionInput(ctx context.Context, arg CreateCompletionDecisionInputParams) (RunUserInput, error) {
+	row := q.db.QueryRow(ctx, createCompletionDecisionInput, arg.RunID, arg.Body, arg.QuestionID)
+	var i RunUserInput
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.Kind,
+		&i.Body,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+		&i.QuestionID,
+		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
+		&i.GateBinding,
+		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
+	)
+	return i, err
+}
+
 const createExtendInput = `-- name: CreateExtendInput :one
 WITH extended AS (
     UPDATE runs SET budget_extension_seconds = budget_extension_seconds + $3::int,

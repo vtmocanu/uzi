@@ -1279,6 +1279,9 @@ type Store interface {
 	// (PRD #88 M1). The question id is a column, not a JSON field, because
 	// SetRunRunning's resume guard compares it in SQL.
 	CreateRunAnswerInput(ctx context.Context, arg store.CreateRunAnswerInputParams) (store.RunUserInput, error)
+	// CreateCompletionDecisionInput writes the completion_decision audit row that links an
+	// owner completion-continue ANSWER by question_id (issue #3841).
+	CreateCompletionDecisionInput(ctx context.Context, arg store.CreateCompletionDecisionInputParams) (store.RunUserInput, error)
 	ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ConsumeRunInputsRow, error)
 	ListReplayRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ListReplayRunInputsRow, error)
 	// ListConsumedFollowUpInputsForRun reads the run's already-consumed follow_up inputs,

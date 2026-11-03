@@ -151,25 +151,6 @@ func TestOwnerSteeringContextBindingAndAuthor(t *testing.T) {
 	}
 }
 
-func TestOwnerSteeringCompletionAnswersExcluded(t *testing.T) {
-	completion := answerRow(2, "qc", "continue")
-	completion.CompletionQuestion = true
-	raw, err := buildOwnerSteeringSnapshot(ownerSteeringInput{Cutoff: 3, Total: 2, Rows: []ownerSteeringRow{answerRow(1, "q1", "a"), completion}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	snap := decodeSteering(t, raw)
-	if n := len(snap["owner_entries"].([]any)); n != 1 {
-		t.Fatalf("completion answer kept: %d entries", n)
-	}
-	if n := len(snap["question_context"].([]any)); n != 1 {
-		t.Fatalf("completion context kept: %d", n)
-	}
-	if strings.Contains(string(raw), "continue") {
-		t.Fatal("completion guidance leaked into the snapshot")
-	}
-}
-
 func TestOwnerSteeringScrubsSecrets(t *testing.T) {
 	secret := "sk-ant-" + "api03-abcdefghijklmnop"
 	body := "use key " + secret

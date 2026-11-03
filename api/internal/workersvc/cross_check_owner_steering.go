@@ -76,7 +76,6 @@ type ownerSteeringRow struct {
 
 	Occurrences        int64              `json:"occurrences,omitempty"`
 	Variants           int64              `json:"variants,omitempty"`
-	CompletionQuestion bool               `json:"completion_question,omitempty"`
 	QuestionAgent      string             `json:"question_agent,omitempty"`
 	QuestionsStatus    string             `json:"questions_status,omitempty"`
 	Questions          []steeringQuestion `json:"questions,omitempty"`
@@ -201,10 +200,7 @@ func buildSteeringUnit(r ownerSteeringRow) (steeringUnit, bool) {
 		}
 		return steeringUnit{entry: e}, true
 	}
-	if r.Kind != "answer" || r.CompletionQuestion {
-		// Completion-continue answers (marked by the query from the completion_decision input written
-		// in the same transaction) are guidance for the lead's completion interlock, not plan
-		// steering for the checker.
+	if r.Kind != "answer" {
 		return steeringUnit{}, false
 	}
 	e := steeringAnswerEntry{InputID: r.InputID, Kind: "answer", QuestionID: secretscrub.Scrub(r.QuestionID), AnswersStatus: r.AnswersStatus}
@@ -330,7 +326,7 @@ func ownerSteeringInputFromRows(rows []store.SnapshotOwnerSteeringRow) (ownerSte
 		}
 		row := ownerSteeringRow{InputID: r.InputID.Int64, Kind: r.InputKind.String, QuestionID: r.QuestionID.String,
 			AnswersStatus: r.AnswersStatus.String, AnswersTruncated: r.AnswersTruncated.Bool,
-			Occurrences: r.Occurrences.Int64, Variants: r.Variants.Int64, CompletionQuestion: r.CompletionQuestion.Bool,
+			Occurrences: r.Occurrences.Int64, Variants: r.Variants.Int64,
 			QuestionAgent: r.QuestionAgent.String, QuestionsStatus: r.QuestionsStatus.String, QuestionsTruncated: r.QuestionsTruncated.Bool,
 			ReviseTruncated: r.ReviseTruncated.Bool}
 		if r.GateBinding.Valid {

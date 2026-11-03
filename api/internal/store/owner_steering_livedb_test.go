@@ -110,17 +110,17 @@ func TestOwnerSteeringCapAndTruncationLiveDB(t *testing.T) {
 	}
 
 	trunc := fx.queuedRun()
-	long := strings.Repeat("é", 9000)
+	long := strings.Repeat("é", 10000) // beyond cap+margin: delivered as 8192+1024 characters
 	steeringInput(fx, trunc, "revise_plan", long, nil)
 	steeringInput(fx, trunc, "revise_plan", nil, nil)
 	steeringInput(fx, trunc, "revise_plan", strings.Repeat("x", 8192), nil)
-	bigAnswer, _ := json.Marshal(map[string]any{"answers": []string{strings.Repeat("y", 3000), "short"}})
+	bigAnswer, _ := json.Marshal(map[string]any{"answers": []string{strings.Repeat("y", 4000), "short"}})
 	steeringInput(fx, trunc, "answer", string(bigAnswer), "qt")
 	r := snapshotSteering(fx, trunc, 32)
 	if len(r) != 4 {
 		t.Fatalf("got %d rows", len(r))
 	}
-	if !r[0].ReviseTruncated.Bool || len([]rune(r[0].ReviseBody.String)) != 8192 {
+	if !r[0].ReviseTruncated.Bool || len([]rune(r[0].ReviseBody.String)) != 8192+1024 {
 		t.Fatalf("long revise: truncated=%v chars=%d", r[0].ReviseTruncated.Bool, len([]rune(r[0].ReviseBody.String)))
 	}
 	if r[1].ReviseBody.Valid {
@@ -130,7 +130,7 @@ func TestOwnerSteeringCapAndTruncationLiveDB(t *testing.T) {
 		t.Fatal("exactly 8192 characters is not truncated")
 	}
 	var answers []string
-	if err := json.Unmarshal(r[3].Answers, &answers); err != nil || len(answers) != 2 || len(answers[0]) != 2048 || answers[1] != "short" || !r[3].AnswersTruncated.Bool {
+	if err := json.Unmarshal(r[3].Answers, &answers); err != nil || len(answers) != 2 || len(answers[0]) != 2048+1024 || answers[1] != "short" || !r[3].AnswersTruncated.Bool {
 		t.Fatalf("answer truncation: %v err=%v truncated=%v", len(answers), err, r[3].AnswersTruncated.Bool)
 	}
 }
@@ -229,7 +229,7 @@ func TestOwnerSteeringWrongShapeQuestionsLiveDB(t *testing.T) {
 	}
 	// An ok projection is bounded and shaped for the builder.
 	run := fx.queuedRun()
-	steeringQuestion(fx, run, 1, "worker", fmt.Sprintf(`{"question_id":"q1","questions":[{"header":%q,"question":"q","multiSelect":true,"options":[{"label":"a"}]}]}`, strings.Repeat("h", 300)), 20)
+	steeringQuestion(fx, run, 1, "worker", fmt.Sprintf(`{"question_id":"q1","questions":[{"header":%q,"question":"q","multiSelect":true,"options":[{"label":"a"}]}]}`, strings.Repeat("h", 2000)), 20)
 	steeringAnswerAt(fx, run, `{"answers":["a"]}`, "q1", 10)
 	r := snapshotSteering(fx, run, 32)
 	var qs []struct {
@@ -238,7 +238,7 @@ func TestOwnerSteeringWrongShapeQuestionsLiveDB(t *testing.T) {
 		Options     []string `json:"options"`
 		MultiSelect bool     `json:"multi_select"`
 	}
-	if err := json.Unmarshal(r[0].Questions, &qs); err != nil || len(qs) != 1 || len(qs[0].Header) != 128 || !qs[0].MultiSelect ||
+	if err := json.Unmarshal(r[0].Questions, &qs); err != nil || len(qs) != 1 || len(qs[0].Header) != 128+1024 || !qs[0].MultiSelect ||
 		len(qs[0].Options) != 1 || qs[0].Options[0] != "a" || !r[0].QuestionsTruncated.Bool || r[0].QuestionAgent.String != "worker" {
 		t.Fatalf("projection wrong: %+v err=%v truncated=%v", qs, err, r[0].QuestionsTruncated.Bool)
 	}
@@ -296,17 +296,93 @@ func TestOwnerSteeringContextBindingLiveDB(t *testing.T) {
 			t.Fatalf("unavailable context carries data: %+v", r)
 		}
 	})
-	t.Run("completion question is flagged", func(t *testing.T) {
+	t.Run("completion continue answer is excluded and uncounted", func(t *testing.T) {
 		run := fx.queuedRun()
 		steeringQuestion(fx, run, 1, "lead", `{"question_id":"qc","questions":[{"header":"Completion blocked","question":"unmet"}]}`, 30)
 		steeringAnswerAt(fx, run, `{"answers":["continue"]}`, "qc", 10)
+		// The audit row is written later and non-transactionally: only the shared question_id links it.
+		mustExec(fx.ctx, t, fx.pool, `INSERT INTO run_user_inputs (run_id, kind, body, question_id, created_at)
+			VALUES ($1, 'completion_decision', 'continue', 'qc', now() - interval '5 seconds')`, run)
 		steeringQuestion(fx, run, 2, "lead", q("q2", "ordinary"), 30)
-		steeringAnswerAt(fx, run, `{"answers":["a"]}`, "q2", 10)
-		r := snapshotSteering(fx, run, 32)
-		if !r[0].CompletionQuestion.Bool || r[1].CompletionQuestion.Bool {
-			t.Fatalf("completion flags: %v %v", r[0].CompletionQuestion.Bool, r[1].CompletionQuestion.Bool)
+		keptID := steeringAnswerAt(fx, run, `{"answers":["a"]}`, "q2", 10)
+		r := snapshotSteering(fx, run, 1)
+		if len(r) != 1 || r[0].InputID.Int64 != keptID || r[0].Total != 1 {
+			t.Fatalf("rows=%d first=%d total=%d: the completion answer must take no slot and not count", len(r), r[0].InputID.Int64, r[0].Total)
 		}
 	})
+	t.Run("answer with a different question id than the completion decision is kept", func(t *testing.T) {
+		run := fx.queuedRun()
+		mustExec(fx.ctx, t, fx.pool, `INSERT INTO run_user_inputs (run_id, kind, body, question_id)
+			VALUES ($1, 'completion_decision', 'continue', 'qc')`, run)
+		steeringAnswerAt(fx, run, `{"answers":["a"]}`, "q-other", 10)
+		// A completion_decision on ANOTHER run never excludes this run's answer.
+		other := fx.queuedRun()
+		mustExec(fx.ctx, t, fx.pool, `INSERT INTO run_user_inputs (run_id, kind, body, question_id)
+			VALUES ($1, 'completion_decision', 'continue', 'q-other')`, other)
+		if r := snapshotSteering(fx, run, 32); len(r) != 1 || !r[0].InputID.Valid || r[0].Total != 1 {
+			t.Fatalf("answer must be kept: %+v", r)
+		}
+	})
+}
+
+// Under pgx statement caching Postgres can switch to a generic plan; the snapshot must stay
+// bounded by the kept entries there too (no CTE re-run per outer row).
+// snapshotStatementSQL returns the SnapshotOwnerSteering statement text from queries/, with sqlc's
+// named parameters rewritten to positional ones.
+func snapshotStatementSQL(t *testing.T) string {
+	t.Helper()
+	body, ok := namedQueryBodies(t)["SnapshotOwnerSteering"]
+	if !ok {
+		t.Fatal("SnapshotOwnerSteering not found in queries/")
+	}
+	_, body, _ = strings.Cut(body, "\n")
+	body = strings.ReplaceAll(body, "@run_id", "$1")
+	body = strings.ReplaceAll(body, "@max_entries", "$2")
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(body), ";"))
+}
+
+func TestOwnerSteeringGenericPlanBoundedLiveDB(t *testing.T) {
+	fx := steeringFixture(t)
+	run := fx.queuedRun()
+	for i := 0; i < 32; i++ {
+		qid := fmt.Sprintf("qg%d", i)
+		steeringQuestion(fx, run, i+1, "lead", fmt.Sprintf(`{"question_id":%q,"questions":[{"question":"q"}]}`, qid), 100)
+		steeringAnswerAt(fx, run, `{"answers":["a"]}`, qid, 10)
+	}
+	tx, err := fx.pool.Begin(fx.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(fx.ctx) }()
+	if _, err := tx.Exec(fx.ctx, `SET LOCAL plan_cache_mode = force_generic_plan`); err != nil {
+		t.Fatal(err)
+	}
+	// Run the statement through a cached prepared statement so the generic plan is actually used.
+	if _, err := tx.Exec(fx.ctx, `PREPARE steer_probe(uuid, int) AS `+snapshotStatementSQL(t)); err != nil {
+		t.Fatal(err)
+	}
+	var plan []byte
+	// EXPLAIN is a utility statement and takes no bind parameters, so the uuid is inlined.
+	if err := tx.QueryRow(fx.ctx, fmt.Sprintf(`EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE steer_probe('%s', 32)`, run)).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	var doc []struct{ Plan map[string]any }
+	if err := json.Unmarshal(plan, &doc); err != nil || len(doc) != 1 {
+		t.Fatalf("plan json: %v", err)
+	}
+	var walk func(n map[string]any)
+	walk = func(n map[string]any) {
+		if loops, _ := n["Actual Loops"].(float64); loops > 32 {
+			t.Errorf("node %v ran %v loops under a generic plan, want <= 32", n["Node Type"], loops)
+		}
+		kids, _ := n["Plans"].([]any)
+		for _, k := range kids {
+			if m, ok := k.(map[string]any); ok {
+				walk(m)
+			}
+		}
+	}
+	walk(doc[0].Plan)
 }
 
 func steeringPlanRound(fx *fleetFixture, stage string) uuid.UUID {

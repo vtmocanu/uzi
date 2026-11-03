@@ -2,7 +2,7 @@
   "description": "Drift fixture for the owner-steering v1 builder (issue #3841). The agent side reads this file too: snapshot is the canonical v1 text and digest its hex sha256.",
   "input": {
     "cutoff": 20,
-    "total": 10,
+    "total": 9,
     "rows": [
       {
         "input_id": 11,
@@ -79,28 +79,6 @@
         "input_id": 16,
         "kind": "revise_plan",
         "gate_binding": "unbound"
-      },
-      {
-        "input_id": 17,
-        "kind": "answer",
-        "question_id": "qc",
-        "answers_status": "ok",
-        "answers": [
-          "continue"
-        ],
-        "occurrences": 1,
-        "variants": 1,
-        "question_agent": "lead",
-        "questions_status": "ok",
-        "questions": [
-          {
-            "header": "Completion blocked",
-            "question": "unmet",
-            "options": [],
-            "multi_select": false
-          }
-        ],
-        "completion_question": true
       },
       {
         "input_id": 18,
