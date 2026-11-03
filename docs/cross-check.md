@@ -335,15 +335,16 @@ the next round. The question an answer responded to is shown as lead- or
 worker-authored context, never as your words. Automatic system answers (such as
 a completion continue) are not included.
 
-Limits: the 32 newest entries, 8 KiB per answer or revise entry, 4 KiB per
-question and 64 KiB in total; anything cut is marked. An entry that is missing,
-truncated or unparseable, or an answer whose question is unavailable,
-ambiguous or truncated, cannot by itself establish an exception, so such a
+Limits: the 32 newest entries, 8 KiB per answer or revise entry, 4 KiB of
+question context per answer and 64 KiB in total; anything cut is marked. An
+entry that is missing, truncated or unparseable, or an answer whose question is
+unavailable, ambiguous, malformed or truncated, cannot by itself establish an exception, so such a
 claim stays unverified. Code cross-check is unchanged.
 
 Rollout: only plan checks with such a snapshot need a worker that advertises
-`cross_check_owner_steering_v1`. Workers pick it up when they next roll while
-idle. Until one is online the run shows "Plan cross-check is waiting: no online
+`cross_check_owner_steering_v1`. Hosted workers pick it up when they next roll
+while idle; other workers when they are upgraded. Until one is online the plan
+cross-check run shows "Plan cross-check is waiting: no online
 worker supports owner-steering checks", and at the deadline the check falls
 back to the ordinary human plan gate. See the
 [dated ADR amendment](../adr/2149-cross-check.md#amendment-2026-11-03--3841-owner-steering-in-plan-checker-input).

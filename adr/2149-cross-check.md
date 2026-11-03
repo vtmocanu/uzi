@@ -484,3 +484,6 @@ answers and revise feedback for the checker. Decisions:
   `owner_steering_questions` (lead or worker authored, never owner), and states that an absent,
   omitted, truncated or unparseable owner entry, or an answer whose question context is
   unavailable, ambiguous, malformed or truncated, cannot by itself establish an exception.
+  Because issue and lead-authored text could carry a lookalike `owner_steering` block, the plan
+  prompt opens with a worker-authored line naming the two genuine fence suffixes, and the brief
+  says only those blocks are supplied steering.
