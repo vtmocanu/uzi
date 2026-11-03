@@ -813,7 +813,7 @@ body[data-scenario="calm"] .station.gate-st .st-count { color: rgb(var(--fg)); }
           <p class="u-h">By user<span class="faint" id="by-user-note">last 7 days</span></p>
           <div class="tbl-wrap">
             <table class="tbl">
-              <thead><tr><th scope="col">User</th><th scope="col" title="Runs with recorded usage in the period (today’s run_count)">Runs</th><th scope="col">Failed</th><th scope="col" title="Failed of finished runs in the period">Fail rate</th><th scope="col" title="Last failure time is served for all time only, so this column is the same in both windows">Since last failure <span class="faint" style="text-transform:none;letter-spacing:0;font-weight:400">all time</span></th><th scope="col">PRs</th><th scope="col">Cost</th><th scope="col">Claude / Codex <span class="tag-proposed" title="Share of each user's runs by harness: needs a per-user aggregate by harness the API does not serve today">Proposed</span></th></tr></thead>
+              <thead><tr><th scope="col">User</th><th scope="col" title="Runs with recorded usage in the period (today’s run_count)">Runs</th><th scope="col">PRs</th><th scope="col">Failed</th><th scope="col" title="Failed of finished runs in the period">Fail rate</th><th scope="col" title="Last failure time is served for all time only, so this column is the same in both windows">Since last failure <span class="faint" style="text-transform:none;letter-spacing:0;font-weight:400">all time</span></th><th scope="col">Cost</th><th scope="col">Claude / Codex <span class="tag-proposed" title="Share of each user's runs by harness: needs a per-user aggregate by harness the API does not serve today">Proposed</span></th></tr></thead>
               <tbody id="by-user-rows"></tbody>
               <tfoot id="by-user-foot"></tfoot>
             </table>
@@ -1032,13 +1032,13 @@ body[data-scenario="calm"] .station.gate-st .st-count { color: rgb(var(--fg)); }
     if (d.users) {
       document.getElementById('by-user-note').textContent = sel.win === 'd7' ? 'last 7 days, by cost' : 'all time, by cost';
       document.getElementById('by-user-rows').innerHTML = d.users.map(function (u) {
-        return '<tr><td>' + u[0] + (u[8] ? ' <span class="you">(you)</span>' : '') + '</td><td>' + fmtN(u[1]) + '</td>' +
+        return '<tr><td>' + u[0] + (u[8] ? ' <span class="you">(you)</span>' : '') + '</td><td>' + fmtN(u[1]) + '</td><td>' + fmtN(u[4]) + '</td>' +
           '<td>' + fmtN(u[3]) + '</td><td title="' + fmtN(u[3]) + ' of ' + fmtN(u[2]) + ' finished runs">' + pct(u[3], u[2]) + '<span class="sub">of ' + fmtN(u[2]) + ' finished</span></td>' +
-          '<td>' + u[7] + '</td><td>' + fmtN(u[4]) + '</td>' +
+          '<td>' + u[7] + '</td>' +
           '<td class="mono">' + fmt$(u[5]) + '</td>' +
           '<td><span class="prov"><span class="pb" aria-hidden="true"><i class="cl" style="width:' + u[6] + '%"></i><i class="cx" style="width:' + (100 - u[6]) + '%"></i></span><span>' + u[6] + ' / ' + (100 - u[6]) + '</span></span></td></tr>';
       }).join('');
-      document.getElementById('by-user-foot').innerHTML = '<tr><td>Factory</td><td>' + fmtN(d.runCount) + '</td><td>' + fmtN(d.failed) + '</td><td>' + d.rate + '<span class="sub">of ' + fmtN(d.finished) + ' finished</span></td><td>3h</td><td>' + fmtN(d.prs) + '</td><td class="mono">' + fmt$(d.cost) + '</td><td></td></tr>';
+      document.getElementById('by-user-foot').innerHTML = '<tr><td>Factory</td><td>' + fmtN(d.runCount) + '</td><td>' + fmtN(d.prs) + '</td><td>' + fmtN(d.failed) + '</td><td>' + d.rate + '<span class="sub">of ' + fmtN(d.finished) + ' finished</span></td><td>3h</td><td class="mono">' + fmt$(d.cost) + '</td><td></td></tr>';
     }
     document.querySelectorAll('[data-scope]').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.scope === sel.scope)); });
     document.querySelectorAll('[data-win]').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.win === sel.win)); });
