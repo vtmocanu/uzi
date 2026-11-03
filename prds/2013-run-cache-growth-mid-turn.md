@@ -1,0 +1,250 @@
+# PRD #2013: Bound a Claude run's Go cache growth inside a long implement turn
+
+**Status**: Proposed (design run complete; implementation pending owner acceptance)
+**Issue**: #2013
+**Related**: #1809, #1829, #1783, #1830/#2072, #2206, #2471, #2964, #3076/#3675, #2969, #3329; epic #2026
+**Priority**: High (high-priority architecture review pending)
+**Builds on**: `adr/1809-per-run-cache-bounds.md` (per-run caches, named subtrees, descriptor-pinned removal, soft and hard layers), `adr/1783-run-quiescence-and-attempt-clone-paths.md`, `adr/2396-worker-memory-guard.md` (the guarded command lane), `adr/3076-codex-command-cache-budget.md` (the Codex rotation precedent).
+
+This PRD is the output of a design-only run. It records measurements, evaluates the issue's four options, and chooses one for a separate implementation dispatch. It changes no runtime code.
+
+## Problem
+
+ADR-1809's soft layer trims a run's rebuildable caches (`.cache/go-build`, `go/pkg/mod`, `.npm/_cacache`) only at turn boundaries, because only there can it prove that no process is using them. A Claude lead can keep one implement turn open for hours. Inside that turn, every Go edit writes new build-cache entries and supersedes old ones, and nothing removes them. The volume reaches the hard layer, which parks the run, and repeated parks fail it.
+
+Owner-reported evidence (from the issue body and comments; owner-reported, not verified by this run):
+
+- Run `2dc4d842` (PRD #1909): 25 GiB volume, 2 concurrent runs, soft cap about 6.25 GiB per run. A hard stop at used_fraction 0.878 with cache_bytes 21,948,706,816; the run resumed in a fresh directory without context, and about 2 h after its caches were dropped it hit a second hard stop with cache_bytes 21,943,070,720. Those windows held 41 exports or worktrees and 58 `-race` invocations.
+- 2026-10-03: changing only the export path added about 750 MB per `-race` build (api, go1.27.1); a same-path control added nothing. `-trimpath` restored reuse but broke `TestMirrorsWebPipelineBadge`. Stable export slots shipped (#2206).
+- 2026-10-14, after #2206: run `84ed3050` grew from 3.7 to 17.7 GB in about 2 h with a single source root (about 60 explicit `go test`, 25 with `-race`, 10 source mutations and 7 SQL/sqlc mutation attempts in the first window). At the 23:48 trim go-build was 6.9 of 10.7 GB. The second park failed the run (retained recovery blocked, budget exhausted). A live run, `11e97b82`, held about 10 GB of caches: go-build about 7 GB, `go/pkg/mod` about 2.8 GB (including sqlc-dev 544 MB and the go1.27.2 toolchain 253 MB), `.npm` about 0.3 GB; about 70 package archives of 10 to 367 MB made up about 4.7 GB of go-build, with the same sizes recurring under different mtimes. Age-only trimming was reproduced as unsafe on go1.27.2.
+- 2026-10-14, 40 GiB run-bound workers: the soft cap fired as designed for one run; no hard stops.
+- 2026-10-16: Codex runs kept Go caches outside `/data`; since rotated (#3675).
+- 2026-11-03: 49 GiB volumes; a Claude run's HOME build cache of about 14 GiB drove `/data` to 90% twice; two runs reached the park cap 3/3; owner-wide custody holds stood at 13 against a limit of 8. Which components grew there is owner-reported only as "mostly `.cache/go-build`".
+
+## Required findings
+
+**(a) This run is guard-bound (observed).** Its shell tool was `mcp__uzi_cmd__bash`, not native `Bash`. The mechanism, verified at HEAD 620fdc36:
+
+| Where | Verified content |
+|---|---|
+| `agent/src/claude-command/grants.ts` line 10 | `export const GUARDED_COMMAND_TOOL = "mcp__uzi_cmd__bash";` |
+| `agent/src/claude-harness.ts` line 262 | `options.toolAliases = { Bash: GUARDED_COMMAND_TOOL };` (line 263 adds `"Bash"` and `"Monitor"` to `disallowedTools`) |
+| `agent/src/sdk-executor.ts` line 1735 | `const guarded = ctx.capturedMemory !== undefined;` (decided once per flight) |
+| `agent/src/runner.ts` line 14957 | `capturedMemory: () => this.captureWorkerMemory(flight),` (passed only when the flight has a worker-memory binding) |
+| `agent/src/config.ts` `memoryGuardConfig`, line 578 | `const flag = env.WORKER_MEMORY_GUARD_ENABLED?.trim().toLowerCase() ?? "";` (empty means disabled) |
+| `deploy/chart/values.yaml` `memoryGuard:` | `enabled: false` (the chart default) |
+
+So a run is guard-bound only on a worker that opted in to the memory guard and whose claim the api enrolled (`runner.ts` throws "Worker memory enrollment requires the full worker claim and registration" otherwise). The guard is off by default.
+
+**(b) Whether the recurrence runs were guard-bound: not supplied.** The owner has not supplied whether `84ed3050`, `11e97b82` or the 2026-11-03 runs were guard-bound. Also not supplied: the fleet's effective cap configuration (`WORKER_MAX_CONCURRENT_RUNS`, `UZI_RUN_CACHE_CAP_FRACTION`) and the per-turn durations of the 2026-11-03 runs. This run cannot read worker logs, fleet configuration or the cluster. These remain owner inputs (Open questions).
+
+## Measurements (M1)
+
+### Method
+
+- Environment: go1.27.3 linux/amd64, `nproc` 4, `GOMAXPROCS` unset, `GOTOOLCHAIN=auto` (no toolchain download occurred), `CGO_ENABLED=1`. The inherited `GOFLAGS` was empty; `-modcacherw` was appended so the scratch caches could be deleted.
+- Confinement: every experiment used its own scratch directory under the run's untracked scratch area, with `GOCACHE`, `GOMODCACHE`, `GOTMPDIR`/`TMPDIR`, `GOLANGCI_LINT_CACHE` and `GOBIN` relocated into it (plus `UZI_GOLANGCI_LINT_DIR`, `UZI_SQLC_DIR` and `XDG_CACHE_HOME` for the tool step). Sizes are `du -sb` bytes per component before and after each step. One command ran at a time, in this run's guarded command lane, on a 40G `/data` volume (one 4-CPU worker).
+- Edits were made in a scratch export of 620fdc36 at a stable path (path churn excluded, per #2206). Each edit step reran `go test [-race] -count=1 -run '^$' ./...` in `api/`. A **comment edit** appends one `//` line to a non-test `.go` file; a **compiled edit** appends one unexported function. A comment-only edit barely changes object code, so it cannot establish the cost of real source churn; the compiled edits model it. Reverse-dependency counts (packages whose deps include the edited one, test variants included, an overcount): runkind 61, store 105, handler 13 (non-test: 18, 32, 3).
+- Disk bound: an 8 GiB (8,589,934,592 B) per-directory bound was **sampled by a 5 s watchdog, not enforced**. The guardrail denied a process-group kill inside a command, so the watchdog could only report. In experiment A the edit series was not stopped at the bound: seven steps ran to completion past it and the directory peaked at 8,885,864,947 B (about 0.3 GB over the bound). Those seven steps' growth was not individually recorded; they were re-measured in a second scratch directory (A2b). In experiment B the last step (race compiled handler edit) crossed the bound at 8,731,432,994 B; its figure below is derived, not a sampled post-step delta. `/data` never exceeded about 45% used (available space never below about 16.4 GB).
+- During a step, peak `du` exceeded the post-step total by about 1 GB (transient link and temporary output).
+- Cleanup: the read-only `/proc` probe was not permitted, so cleanup relied on the lane's confirmed disposal of each producing command plus `kill -0` on the awaited pids. All five scratch directories were removed in separate later commands; none were retained.
+- This run's own HOME caches (governor-visible): go-build and `go/pkg/mod` absent at the start (14:31Z) and at the end of M1; `.npm/_cacache` 298,404,002 B at both points; `/data` used 1,745,502,208 B of 41,956,900,864 at the start and 1,748,852,736 after M1. M1 left the run's real caches untouched.
+
+### Cold working set, `api/`, non-race (experiment A)
+
+| Step | Time | go-build delta | `go/pkg/mod` delta | Post-step total | Peak during step |
+|---|---|---|---|---|---|
+| 1a `go build ./...` | 73 s | +527,047,270 (0.53 GB) | +347,260,013 (0.35 GB) | 874,311,476 | 1,527,598,381 |
+| 1b `go vet ./...` | 118 s | +794,305,289 (0.79 GB) | +0 | 1,668,616,765 | 2,469,551,968 |
+| 1c `go test -count=1 -run '^$' ./...` | 99 s | +680,537,558 (0.68 GB) | +0 | 2,349,161,640 | 3,415,400,324 |
+| 1c control (same command, same path) | 26 s | +0 | +0 | 2,349,168,957 | 2,423,191,511 |
+| 2 test compile at a new (export) path, warm | 217 s | +1,611,535,494 (1.61 GB) | +0 | 4,115,297,748 | 5,721,716,055 |
+
+Cumulative cold go-build after 1a to 1c: 2,001,890,117 B (2.0 GB). The control confirms full reuse at a stable path; step 2 reproduces the owner's path-churn observation (a new path reused little).
+
+### Cold working set, `api/` with `-race`, and `controller/`
+
+| Step | Time | go-build delta | `go/pkg/mod` delta |
+|---|---|---|---|
+| B 1d `api` race test compile, cold (fresh cache, export path) | 395 s | +2,236,732,867 (2.24 GB) | +347,260,013 (0.35 GB) |
+| B 1d control | 57 s | +0 | +0 |
+| C c1 `controller` test, cold, non-race | 82 s | +790,105,000 (0.79 GB) | +171,128,398 (0.17 GB) |
+| C c2 `controller` test, `-race` (same cache) | 104 s | +859,894,304 (0.86 GB) | +0 |
+| C c3 race control | 10 s | +0 | +0 |
+
+### Growth per edit, `api/` test compile (experiments A, A2b, B)
+
+Each comment edit was repeated three times; the deltas repeated to within a few hundred bytes, so superseded entries accumulate linearly.
+
+| Package (revdeps, test-incl) | Edit | Non-race delta per edit | `-race` delta per edit |
+|---|---|---|---|
+| `internal/runkind` (61) | comment | +329,786 (0.33 MB), 21-26 s | +386,592 (0.39 MB), 52-57 s |
+| `internal/runkind` | compiled | +1,231,293,381 and +1,231,294,931 (1.23 GB), 158-164 s | +1,391,750,177 (1.39 GB), 260 s |
+| `internal/store` (105) | comment | +43,290,738 (43 MB), 26-27 s | +57,552,209 / +57,552,034 (58 MB), 62 s |
+| `internal/store` | compiled | +1,528,729,762 (1.53 GB), 191 s (A2b) | +1,725,414,898 (1.73 GB), 301 s |
+| `internal/handler` (13) | comment | +311,221,978 / +311,221,803 (311 MB), 57-62 s (A2b) | +349,685,988 / +349,685,813 (350 MB), 119-125 s |
+| `internal/handler` | compiled | +397,716,529 (0.40 GB), 68 s (A2b) | about +1,652,715,818 (1.65 GB), derived: directory size at the bound (8,731,432,994) minus the previous total (7,078,717,176); includes transient output, not comparable |
+
+A2b ran in a second scratch directory seeded at the export path (+1,980,279,999 B go-build, +347,260,013 B `go/pkg/mod`, 259 s; the log does not record the seeding command beyond its label).
+
+Reading, marked by kind:
+- [Measured] A compiled edit to a widely imported package costs 1.2 to 1.7 GB of go-build per edit; a compiled edit to a top-level package costs about 0.4 GB. Comment edits cost 0.3 MB to 350 MB.
+- [Inference, not verified] Comment-edit cost tracks the edited package's own archive size (a new archive entry is written although the object code barely changes), while compiled-edit cost tracks the number of importers whose test binaries must be relinked. The follow-up should classify go-build entries (package archives versus link outputs and executables) to confirm this.
+- [Measured] `-race` adds about 12-13% on the comparable steps (cold 2.24 vs 2.00 GB; runkind compiled 1.39 vs 1.23 GB; store compiled 1.73 vs 1.53 GB; handler comment 350 vs 311 MB).
+
+### Tools
+
+| Step | Time | go-build delta | `go/pkg/mod` delta | Other |
+|---|---|---|---|---|
+| `golangci-lint run` on `api/` (repo script, fresh cache) | 333 s | +2,006,213,058 (2.0 GB) | +347,260,013 | golangci-lint's own cache +1,693,691 (1.7 MB) |
+| `golangci-lint` on `api/` again, unratcheted (warm cache) | 6 s, rc=1 (backlog findings, expected for the unratcheted run) | +0 | +0 | |
+| sqlc via `scripts/sqlc.sh` (binary, `version`) | 5 s | +0 | +0 | binary +15,075,333 (15 MB) |
+| sqlc via `go run` (not what the repo does) | 87 s | +395,136,341 (0.40 GB) | +324,173,625 (0.32 GB) | |
+| `go install` govulncheck | 11 s | +33,590,920 | +18,243,939 | binary 16,055,363 |
+| `go install` deadcode | 5 s | +23,295,181 | +15,593,531 | binary 17,416,497 |
+
+`scripts/golangci-lint.sh` and `scripts/sqlc.sh` fetch pinned, sha256-verified release binaries; neither builds the tool with `go run`. The lint step's 2.0 GB go-build growth is the api build graph lint loads, not lint's own cache (1.7 MB). The owner's 544 MB sqlc-dev entry in `go/pkg/mod` is consistent with an earlier `go run` invocation; the current script fetches a binary.
+
+Not measured: npm growth (only point-in-time `.npm/_cacache`, 298,404,002 B at start and end, unchanged; the worker's dependency install had already run, and a fresh install needs the network and would grow the governor-visible cache); web and agent caches; `lint:controller`; `sqlc generate` (writes files).
+
+### Limits
+
+- One 4-CPU worker; go1.27.3 only.
+- Synthetic edits, not real source churn; three packages only.
+- No hosted fleet data; owner evidence is quoted, not reproduced.
+- npm growth not attributed (above).
+- The disk bound was sampled, not enforced, with the overshoot described under Method.
+
+### Attribution reading
+
+- A cold `api` working set (build, vet and test compile) is about 2.0 GB go-build plus 0.35 GB `go/pkg/mod`; the `-race` test compile adds about 2.24 GB; `controller` adds about 1.65 GB plus 0.17 GB for both modes. The sum of every measured cold component plus `.npm/_cacache` is 6,705,414,701 B (6.2 GiB), excluding lint's overlap with the build cache (not measured). That fits comfortably under a 12 GiB cap (49 GiB volume / 2 runs x 0.5, the `UZI_RUN_CACHE_CAP_FRACTION` default). It is close to the 6.25 GiB cap of the 25 GiB / 2-run case.
+- So a warm working set is not what exceeds a 12 GiB cap. The cap is exceeded by accumulated superseded entries, which only a trim can reclaim.
+- Consistency check, not proof: at the owner-reported cadence (about 60 explicit `go test` in about 2 h, with 10 source and 7 SQL mutations), a per-compiled-edit growth of 0.4 to 1.7 GB is enough to explain growth from 3.7 to 17.7 GB without any path churn.
+
+## Options evaluated
+
+1. **Guarded-lane quiet-point trim (hold-and-drain), triggered by the governor.** Chosen (D1). The guarded lane already serializes every Bash call of the lead and its subagents through one per-run object, so it can offer a quiet point: no command past launch, new commands waiting, not refused. The governor trims through the existing pinned helpers inside that window and reopens. LRU trim keeps the hot entries.
+2. **Rotation (the Codex #3675 variant).** Rejected (D2). The Codex design relies on per-command cache variables from a reservation, a per-generation drain proof and Landlock exact-directory grants (ADR-1598). The Claude lane builds per-command environment, but `agent/src/claude-command/env.ts` says "this is parity with native Bash, not isolation", and there is no Landlock: a later command can name an older generation by path, so non-use of a retiring generation cannot be proven. Rotation also still deletes only at a quiet point (ADR-3076: overlapping commands keep writing a closed generation) and discards the hot cache each rotation. It would require an ADR-1809 D2 amendment, because `isRunCacheSubtree` (`agent/src/rmtree.ts`) matches the exact names in `RUN_CACHE_SUBTREES`, the go-build lister hard-codes `.cache/go-build`, and the park drop, periodic reclaim and the `rmHomeSubtree` refusal key on the fixed list.
+3. **Guidance, flag or layout remedy.** Not sufficient (D4). The M1 data rule out each lever: `-race` adds only about 12-13%, so dropping it is not a lever; comment-only edits are cheap and compiled edits are not, so real churn is the driver and no flag removes it; stable paths (#2206) already shipped; sqlc and golangci-lint are already binaries. One candidate for later guidance, **unmeasured**: test only the affected packages rather than `./...`, which would reduce relinking per edit. It is advisory and does not bound growth.
+4. **No safe point; shorter turns.** Rejected (D3). `max_iterations` limits the number of turns, not their length: `agent/src/sdk-executor.ts` line 1659 reads `let maxIterations = positive(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);` with `DEFAULT_MAX_ITERATIONS = 5`, scaled by the api up to 60 (`api/internal/workersvc/budget.go`, "run_max_iterations*milestoneBudgetCap = 60 iters / 24h on defaults"). The lead decides when a turn ends. Forcing turn ends would make `quiesce` abort live commands (a 40-minute gate would be lost) and would bring the three-boundary soft-park streak sooner.
+
+Not evaluated: a worker-owned `GOCACHEPROG` with per-process leases on cache entries (the issue lists it as optional and unverified). This run has no evidence for or against it.
+
+## Chosen design (for the follow-up)
+
+Facts it rests on, verified at HEAD 620fdc36:
+- The soft layer runs only at turn boundaries: `agent/src/sdk-executor.ts` line 3322, `const capVerdict = await ctx.cacheCapBoundary?.(() => this.runProcessAlive());`. `runProcessAlive` (line 5490) is documented "Only meaningful between turns": mid-turn the live CLI makes it always true.
+- The cap: `agent/src/cache-cap.ts` line 112, `return Math.floor((volumeTotalBytes * fraction) / Math.max(1, maxConcurrentRuns));`. The streak: `SOFT_PARK_BOUNDARIES = 3` (line 75), `run.overStreak += 1;` (line 394).
+- One lane per guard-bound run, built once (`lane = new ClaudeCommandLane({` at `sdk-executor.ts` line 1876); `quiesce` aborts live commands (`agent/src/claude-command/lane.ts` line 278, `live.ac.abort(new Error("lane quiesce"))`); the live set is `private readonly live = new Map<string, LiveCommand>();` (line 197). The lane is foreground only (`agent/src/claude-command/server.ts` line 21, "Foreground only: run_in_background is refused …").
+- The memory-pressure path already waits rather than refuses: `lane.ts` line 404, `commands.waitForPressure(context, { deadlineAt, phaseRevision, signal, now: this.now })`, then re-validates (line 409) and re-screens.
+- Deletion allowlist and helpers: `agent/src/rmtree.ts` line 279, `RUN_CACHE_SUBTREES = [".cache/go-build", "go/pkg/mod", ".npm/_cacache"]`; `trimRunCaches` in `agent/src/run-caches.ts` line 248.
+- The background dependency install is joined before the implement roster (`depsJoined = true` in `sdk-executor.ts`), so it is live only during planning.
+
+The contract, which the follow-up implements (names are illustrative):
+
+- **Lane quiet-point primitive.** The lane offers a quiet point; trim policy stays in the governor. Inputs: an arm deadline and the caller's trim function. Outcome: either "quiet" (admission closed, zero launched commands; the caller runs its trim, then the lane reopens) or "gave up" (nothing deleted). The primitive refuses to start when the lane is poisoned, the turn is not open, authority is lost, or a quiet point is already in progress.
+- **Counter.** Quiet means a new `launched` counter is zero: commands past the launch gate. Not `live.size`, which also holds pressure waiters and hold waiters; a `live.size` predicate would deadlock.
+- **Gate placement.** One gate immediately before `this.launch(` (`lane.ts` line 428), after the deny hooks, screening, admission and the pressure wait. `launched` is incremented synchronously there, so closing admission and the drain check are atomic on the event loop. Order: pressure wait first, then the hold gate, as one re-validated chain.
+- **Waiters.** Waiters follow the pressure-wait pattern: the same abort sources, and on wake the same re-validation and re-screen. The wait is charged to the command's own deadline, as the pressure path does, because the transport bound leaves no slack: `worstCaseCallMs` for the 3,600,000 ms maximum against `GUARDED_SERVER_TIMEOUT_MS = MAX_COMMAND_TIMEOUT_MS + 60_000`.
+- **Arming.** Opportunistic: the hold begins at the first moment `launched` is zero, within a bounded arm period; otherwise give up. Whether to close admission actively after the arm period is an open question.
+- **Second proof inside the hold.** The lane proves only its own command trees drained. Inside the hold the trim also requires a process scan: the existing run-process scan, excluding only the exact Claude CLI root pids. Any other attributed process counts as alive, and an incomplete scan counts as alive.
+- **Reopen.** Reopen only after the trim helpers have exited. Under the uid split the worker cannot kill a blocked foreign-uid helper (`rmtree.ts`: "the worker cannot kill a blocked foreign-uid helper under the split"), and a timeout only rejects the promise. If exit is not confirmed within a bound, keep admission closed and take the existing preventive park (fail closed).
+- **Turn close and run join.** `quiesce` joins an in-progress trim and never reopens mid-trim. The trim joins `joinOwnedOperations`, so a park's cache drop never overlaps it.
+- **Trigger.** A mid-turn leg of the governor, beside the existing sampling (`agent/src/main.ts`: `onSample: (usedFraction, sampledAtMs) => diskGovernor.observe(...)`). It runs only for runs that declare the capability: guard-bound, implement phase, turn open, dependency install joined. It measures at a minimum interval (proposal: 2-5 min, to be measured) and requests a quiet point when over the cap. It trims under a mid-turn deadline (proposal: about 60 s, to be measured; today's `TRIM_DEADLINE_MS = 3 * 60_000` is too long against a 120 s default command deadline).
+- **Serialization.** One single-flight lock per run across the boundary trim, the mid-turn trim and the hard layer's `reclaimInPlace`, which can already overlap the first implement turn (the approve-to-first-report window in `cache-cap.ts`).
+- **Streak.** The mid-turn leg never writes `overStreak`; giving up is a log line only. After a successful mid-turn trim the next boundary resets the streak through its existing branches.
+- **Rollout.** Worker-local only: no api, schema or protocol change, and no new capability. A mixed fleet is safe in either rollout order, because old workers keep boundary-only trim.
+
+Riskiest assumption: mid-turn on a drained guarded lane, the Claude CLI has no persistent attributed children (other than its own root). If that is false, the scan never passes, the mid-turn trim never fires, and the behaviour falls back to today's boundary-only trim. F1 validates it first.
+
+Coverage limit: only guard-bound runs benefit, and the guard is off by default (D5).
+
+## Safety invariants
+
+Carried verbatim from the issue:
+
+**Safety invariants the design must not weaken:**
+- Never delete cache entries while a process might be reading or writing them; an unknown state counts as alive (`agent/src/cache-cap.ts`).
+- File age never establishes that concurrent deletion is safe. Age may still select entries after a proven quiet point.
+- Keep the session drop on an attempt-path change (`agent/src/runner.ts`, `cwd_changed_attempt_path`).
+- Keep the hard layer's parkable rule.
+- Delete only the named subtrees, through the descriptor-pinned helpers.
+- Any hold sits after the Bash deny hook. Do not relax the lane's poison behavior.
+- The hard layer's in-place drop during revision or finalize is an accepted hazard (ADR-1809 Consequences), not a precedent for implement turns.
+
+How the chosen design meets each:
+1. **No deletion while possibly in use.** Deletion requires both the lane drain (`launched` zero, confirmed disposals) and a process scan in which any attributed process other than the CLI roots, or an incomplete scan, counts as alive.
+2. **File age.** mtime only orders the LRU trim after the quiet point is proven, as today.
+3. **Session drop.** Untouched (`runner.ts` line 13768, `reason: "cwd_changed_attempt_path",`).
+4. **Parkable rule.** The hard layer is unchanged and serialized with the mid-turn trim through the single-flight lock; a trim interrupted by a stop is joined before the park drop.
+5. **Named subtrees.** The trim uses `trimRunCaches` and the existing pinned helpers on `RUN_CACHE_SUBTREES`; no D2 change.
+6. **Deny hook and poison.** The gate is immediately before launch, after every deny: `lane.ts` denies at screening (`if (screen.denied)`, lines 293 and 360) before any attribution or launch. A poisoned lane refuses the hold, and poison during a hold aborts the waiters.
+7. **In-place drop.** The design never drops caches mid-command; it runs the existing trim behind a proof.
+
+## Rejected, with evidence
+
+Carried verbatim from the issue (D6):
+
+**Rejected, with evidence.** Revisit any of these only with new evidence and the maintainer's acknowledgement:
+- `-trimpath`: it breaks tests that use `runtime.Caller`;
+- file-age or age-only eviction: the reproduction deleted an archive a live build was using. Separately, Go refreshes an entry's mtime at most hourly, so an old mtime does not prove the entry is unused;
+- a per-subagent `GOCACHE`: subagents share the CLI's environment;
+- a stable `GOCACHE` symlink to a swapped generation: Go hands archive paths on as text;
+- rewriting commands in the native-Bash PreToolUse hook: it is a guardrail layer;
+- a `GOCACHE` outside HOME with its own bound: ADR-1598 forbids an emptyDir `sizeLimit`, and without one the growth moves to node storage, outside the `/data` governor;
+- a shared cache: ADR-1809 D1;
+
+Optional to evaluate: a worker-owned `GOCACHEPROG` with per-process leases on cache entries (unverified).
+
+## Follow-up implementation milestones (separate dispatch)
+
+- **F1: Real-CLI scan fixture (riskiest assumption first).** During an open implement turn with the guarded lane drained, scan the run's processes and prove that no persistent attributed CLI children exist beyond the exact CLI root pids. Also measure one governor measurement pass on a realistic cache (10 to 20 GB) to calibrate the interval. If the scan fails, stop and re-plan.
+- **F2: Lane quiet-point primitive with unit tests.** The `launched` counter, gate placement, waiter deadline, quiesce join, poison, abort and drain atomicity.
+- **F3: Governor mid-turn trigger and wiring.** The capability declaration (guarded, implement phase, depsJoined), the scan variant, the single-flight lock, the mid-turn trim deadline, the join in `joinOwnedOperations`, and a measurement-cost fixture.
+- **F4: ADR-1809 amendment.** A decision record of the mid-turn leg and its proofs; no D2 change.
+
+Tests, carried verbatim from the issue:
+
+**The follow-up implementation (separate dispatch) carries tests for the mechanism the PRD chooses. If it chooses mid-turn trimming through a synchronization point, these tests apply:**
+- caches exceed the cap during one implement iteration and are trimmed back under the low-water mark without a park and without ending the turn;
+- a command arriving during a trim waits for it to finish;
+- a command that never drains makes the trim give up without deleting anything, with the soft-park streak unchanged;
+- a hold timeout or lane poison fails closed;
+- runs not bound by the guard keep today's boundary-only trim;
+- `.npm/_cacache` stays kept until the dependency install is joined;
+- the `cwd_changed_attempt_path` session drop and the hard stop are unchanged.
+
+Hosted acceptance, carried verbatim from the issue:
+
+**The follow-up's hosted acceptance:** verify the chosen remedy on a hosted run: one long Claude run with no cache-driven counted parks, reporting how long holds and trims took. Its landing obligation is `full agent suite: exact-head PR CI`.
+
+## Out of scope
+
+- Codex command caches: the #3675 rotation already shipped (`adr/3076-codex-command-cache-budget.md`).
+- Changing the hard layer (thresholds, the parkable rule, the counted stop).
+- The cap fraction policy. Input for a later decision: the measured cold working set (about 6.2 GiB for api, race, controller and npm together) fits under a 12 GiB per-run cap, but sits at the 6.25 GiB cap of a 25 GiB / 2-run volume, where only accumulation headroom, not a trim, is missing.
+- Enabling the memory guard by default (an open owner question below, not decided here).
+
+## Open questions for the owner
+
+1. **Coverage.** The guard is off by default (`deploy/chart/values.yaml`, `memoryGuard: enabled: false`), so on a default deployment the chosen remedy does nothing. Should the follow-up also enable the guard by default or for the hosted fleet, or does the owner accept boundary-only coverage for non-guarded runs?
+2. **Escalation of the hold.** Opportunistic only (wait for `launched` to reach zero), or actively close admission after a bounded arm period, at the cost of waiting commands possibly hitting "deadline expired before launch"?
+3. **Numbers.** The 2-5 min measurement interval and the about 60 s mid-turn trim deadline are proposals, not measurements; F1 and F3 measure them. Does the owner want other starting values?
+4. **Hosted inputs.** Please supply whether the recurrence runs were guard-bound, the fleet's `WORKER_MAX_CONCURRENT_RUNS` and `UZI_RUN_CACHE_CAP_FRACTION`, and the per-turn durations of the 2026-11-03 runs. A later revision of this PRD folds them in.
+
+## Decision Log
+
+- **D1 (2026-11-03): Choose a guarded-lane quiet-point trim, triggered by the governor's mid-turn leg.** Why: the lane is the one per-run choke point all guarded Bash calls pass through, the pressure path already shows that admission can wait instead of refusing, and an LRU trim keeps the hot entries. Evidence: M1 shows accumulation of superseded entries, not the working set, exceeds the cap; the lane citations under Chosen design.
+- **D2 (2026-11-03): Reject rotation for Claude runs.** Why: there is no Landlock-equivalent confinement (`claude-command/env.ts`, "parity with native Bash, not isolation"), so non-use of a retiring generation cannot be proven; it needs an ADR-1809 D2 amendment (`isRunCacheSubtree` exact names, the fixed go-build lister); it still needs a quiet point to delete; and it discards the hot cache. More work for a weaker proof.
+- **D3 (2026-11-03): Reject shorter turns via `max_iterations`.** Why: it bounds turn count, not turn length (`sdk-executor.ts` line 1659; up to 60 iterations in `budget.go`); forced turn ends abort live commands in `quiesce`; more boundaries bring the three-boundary streak sooner.
+- **D4 (2026-11-03): No guidance-only remedy is sufficient.** Why: per M1, `-race` adds only about 12-13%; compiled edits drive growth (0.4-1.7 GB each); #2206 already removed path churn; sqlc and golangci-lint are already binaries. "Test only affected packages" stays an unmeasured guidance candidate.
+- **D5 (2026-11-03): Boundary-only trim remains for runs that are not guard-bound. OPEN OWNER QUESTION.** Why: the mechanism needs the guarded lane, which exists only when the worker opts in and the api enrolls the claim; the chart default is off. Whether the follow-up should also enable the guard by default or for the fleet, or accept limited coverage, is for the owner (Open question 1).
+- **D6 (2026-11-03): Carry the issue's rejected list forward unchanged.** Why: no new evidence was found against any item; M1 adds that `-race` and tool choices are not levers.
+- **D7 (2026-11-03): Quiet means a new `launched` counter is zero, not `live.size`.** Why: `live` also holds pressure waiters and hold waiters, so a `live.size` predicate would deadlock the hold on its own waiters.
+- **D8 (2026-11-03): One gate immediately before launch, after the deny hooks, screening, admission and the pressure wait; the wait is charged to the command's own deadline.** Why: the hold must sit after every deny (invariant 6), the increment must be atomic with the drain check, and the transport bound (`worstCaseCallMs` against `GUARDED_SERVER_TIMEOUT_MS`) leaves no room for an uncharged wait.
+- **D9 (2026-11-03): Reopen only after the trim helpers have exited; otherwise keep admission closed and take the existing preventive park.** Why: under the uid split a blocked foreign-uid helper cannot be killed, and a timeout only rejects the promise; reopening early could let a command use a subtree a helper is still deleting.
+- **D10 (2026-11-03): The mid-turn leg never writes the soft-park streak.** Why: giving up must not bring a park sooner (issue test list); the boundary already resets the streak when a trim succeeded.
+- **D11 (2026-11-03): One single-flight lock per run across the boundary trim, the mid-turn trim and `reclaimInPlace`.** Why: `reclaimInPlace` already covers the approve-to-first-report window, which can overlap the first implement turn.
+- **D12 (2026-11-03): The mid-turn leg runs only in the implement phase with the dependency install joined.** Why: the background install is live during planning, which is why `.npm/_cacache` is kept until `depsJoined`.
+- **D13 (2026-11-03): Inside the hold, also require a process scan that excludes only the exact CLI root pids; an unknown or incomplete scan counts as alive.** Why: the lane proves only its own trees drained. Native `Bash` is kept out only by the alias plus `disallowedTools`; the lane's PreToolUse hook screens a native `Bash` call (`lane.ts` line 289) but does not route it, so a CLI regression that offered native `Bash` again would run commands outside the lane's drain accounting (inference, not tested). The routing must not be the only barrier. F1 validates that the scan can pass mid-turn.
+- **D14 (2026-11-03): The interval (2-5 min) and the mid-turn trim deadline (about 60 s) are proposals to be measured.** Why: the measurement cost on a 10-20 GB cache is extrapolated, not measured (`MEASURE_MAX_ENTRIES = 500_000` in `rmtree.ts`, `MEASURE_DEADLINE_MS = 60_000` in `cache-cap.ts`).
