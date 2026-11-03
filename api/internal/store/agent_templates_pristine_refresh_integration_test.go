@@ -4,13 +4,88 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+// TestPristineEmbeddedLeadCrashClaimRefreshLiveDB exercises shipped lead delivery
+// through the real reconciler. All fixture and reconciliation writes roll back.
+func TestPristineEmbeddedLeadCrashClaimRefreshLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate before transaction: %v", err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(pool).WithTx(tx)
+	lead, ok := agenttmpl.BuiltinByName("lead")
+	if !ok {
+		t.Fatal("embedded lead missing")
+	}
+	const oldBody = "Old embedded lead before crash-claim guidance.\n"
+	if _, err := q.InsertBuiltinAgentTemplate(ctx, store.InsertBuiltinAgentTemplateParams{
+		Name: "lead", Description: lead.Description, PromptBody: oldBody,
+	}); err != nil {
+		t.Fatalf("seed actual lead: %v", err)
+	}
+	// Force the old pristine embedded fixture even when migrations already seeded
+	// lead. This setup and every other builtin touched by reconciliation use tx.
+	if _, err := tx.Exec(ctx, `UPDATE agent_templates
+		SET prompt_body = $1, customized = false, origin = 'embedded'
+		WHERE name = 'lead' AND scope = 'builtin'`, oldBody); err != nil {
+		t.Fatalf("arrange old embedded lead: %v", err)
+	}
+	before, err := q.GetSharedAgentTemplateByName(ctx, "lead")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	if before.PromptBody != oldBody || before.Customized || !before.IsBuiltin ||
+		before.Scope != "builtin" || !before.Origin.Valid || before.Origin.String != "embedded" {
+		t.Fatal("precondition: actual lead must have old pristine embedded body")
+	}
+	if _, err := store.ReconcileBuiltinTemplates(ctx, q); err != nil {
+		t.Fatalf("reconcile embedded templates: %v", err)
+	}
+	after, err := q.GetSharedAgentTemplateByName(ctx, "lead")
+	if err != nil {
+		t.Fatalf("read reconciled lead: %v", err)
+	}
+	t.Run("body_equals_embedded_lead", func(t *testing.T) {
+		if after.PromptBody != lead.PromptBody {
+			t.Error("reconciled lead body must equal embedded BuiltinByName lead PromptBody")
+		}
+	})
+	t.Run("new_crash_claim_rule_delivered", func(t *testing.T) {
+		const rule = "For every atomic, durable, or crash-recoverable claim, state the exact property and failure model."
+		if !strings.Contains(strings.Join(strings.Fields(after.PromptBody), " "), rule) {
+			t.Errorf("reconciled lead missing new rule: %q", rule)
+		}
+	})
+	t.Run("remains_pristine_and_embedded", func(t *testing.T) {
+		if after.ID != before.ID || after.Customized || !after.IsBuiltin ||
+			after.Scope != "builtin" || !after.Origin.Valid || after.Origin.String != "embedded" {
+			t.Error("refresh must preserve actual lead identity and pristine embedded status")
+		}
+	})
+}
 
 // TestPristineBuiltinRefreshLiveDB pins the PRD #275 (M4b) boot-time delivery
 // contract that the in-memory reconcilerFake cannot model — the customized flag,

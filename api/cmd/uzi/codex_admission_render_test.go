@@ -14,6 +14,18 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
+func TestQueuedCustodyCLIWithoutCodexCooldown(t *testing.T) {
+	reason := "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity"
+	run := apitypes.RunDTO{ID: "custody", Kind: "issue", Status: "queued", HealthReason: &reason}
+	srv := newListViewServer(t, []apitypes.RunListItemDTO{{RunDTO: run}})
+	for _, args := range [][]string{{"run", "list"}, {"admin", "runs"}} {
+		out, errs, code := runCLI(t, httpEnv(srv.Server), args...)
+		if code != 0 || !strings.Contains(out, "queued ("+reason+")") {
+			t.Fatalf("%v exit=%d stderr=%s output=%s", args, code, errs, out)
+		}
+	}
+}
+
 func TestCodexAdmissionCLIConsumers(t *testing.T) {
 	at := time.Date(2099, 1, 2, 3, 4, 5, 123456789, time.FixedZone("fixture", 3600))
 	for _, tc := range []struct{ class, copy string }{
@@ -59,7 +71,7 @@ func TestCodexAdmissionQueuedBlockerPriority(t *testing.T) {
 			{"queued account unavailable", "queued", "codex_" + class, unavailable, "queued (" + unavailable + ")"},
 			{"queued handoff", "queued", "codex_" + class, "handoff setup has not finished", "queued (handoff setup has not finished)"},
 			{"queued vault", "queued", "codex_" + class, "your vault is locked, so this run can't start", "queued (your vault is locked, so this run can't start)"},
-			{"queued custody", "queued", "codex_" + class, "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs", "queued (you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs)"},
+			{"queued custody", "queued", "codex_" + class, "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity", "queued (recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity)"},
 			{"queued custody unavailable", "queued", "codex_" + class, "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings", "queued (new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings)"},
 			{"maintenance coexistence", "queued", "maintenance", unavailable, "queued (maintenance (uzi is in maintenance mode))"},
 			{"recovery wait", "recovery_wait", "codex_" + class, unavailable, "recovery_wait (Codex reconciling)"},
@@ -77,7 +89,7 @@ func TestCodexAdmissionQueuedBlockerPriority(t *testing.T) {
 						run.CodexAccountAction = sp(codexActionReconciling)
 					}
 					want := tc.want
-					if strings.HasPrefix(tc.name, "queued ") && tc.name != "queued account unavailable" && delta <= 0 {
+					if strings.HasPrefix(tc.name, "queued ") && tc.name != "queued account unavailable" && tc.name != "queued custody" && delta <= 0 {
 						// The existing compact list only adds these blockers alongside active admission.
 						want = "queued"
 					}

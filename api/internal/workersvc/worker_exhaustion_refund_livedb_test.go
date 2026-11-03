@@ -36,7 +36,7 @@ func TestWorkerExhaustionEpisodeRefundLiveDB(t *testing.T) {
 					t.Fatal(err)
 				}
 				if frozen {
-					locks, err := captureWorkerRecoveryLocks(env.ctx, q, worker, []validatedEntry{{runID: run}}, validatedFinalizeResume{})
+					locks, err := captureWorkerRecoveryLocks(env.ctx, q, worker, []validatedEntry{{runID: run}})
 					if err != nil {
 						t.Fatal(err)
 					}

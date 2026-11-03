@@ -27,6 +27,7 @@ func recoveryDispositionCount(rows []store.WorkerRecoveryDisposition, status str
 type workerRecoveryLockSet struct {
 	evaluated  bool
 	frozenJSON string
+	queuedJSON []byte
 	parentIDs  []uuid.UUID
 }
 
@@ -45,19 +46,31 @@ func validatedSnapshotIDs(entries []validatedEntry) []uuid.UUID {
 	return ids
 }
 
-func captureWorkerRecoveryLocks(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, entries []validatedEntry, attested validatedFinalizeResume, pendingIDs ...[]uuid.UUID) (workerRecoveryLockSet, error) {
+func captureWorkerRecoveryLocks(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, entries []validatedEntry, pendingIDs ...[]uuid.UUID) (workerRecoveryLockSet, error) {
+	return captureWorkerRecoveryLocksWithQueued(ctx, qtx, workerID, entries, validatedFinalizeResume{}, store.LockWorkerRecoveryParentsParams{}, pendingIDs...)
+}
+
+func captureWorkerRecoveryLocksWithQueued(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, entries []validatedEntry, attested validatedFinalizeResume, admission store.LockWorkerRecoveryParentsParams, pendingIDs ...[]uuid.UUID) (workerRecoveryLockSet, error) {
 	ids := validatedSnapshotIDs(entries)
 	for _, pending := range pendingIDs {
 		ids = append(ids, pending...)
 	}
-	rows, err := qtx.LockWorkerRecoveryParents(ctx, store.LockWorkerRecoveryParentsParams{
-		WorkerID: pgconv.UUID(workerID), SnapshotRunIds: ids,
-		AttestedRunIds: attested.ids, AttestedClaimGenerations: attested.generations,
-	})
+	admission.WorkerID = pgconv.UUID(workerID)
+	admission.SnapshotRunIds = ids
+	admission.AttestedRunIds = attested.ids
+	admission.AttestedClaimGenerations = attested.generations
+	rows, err := qtx.LockWorkerRecoveryParents(ctx, admission)
 	if err != nil {
 		return workerRecoveryLockSet{}, err
 	}
-	return workerRecoveryLocksFromRows(rows)
+	locks, err := workerRecoveryLocksFromRows(rows)
+	if err != nil {
+		return workerRecoveryLockSet{}, err
+	}
+	if admission.CustodyHoldLimit <= 0 {
+		return locks, nil
+	}
+	return validateQueuedCustodyLocks(ctx, qtx, locks)
 }
 
 func workerRecoveryLocksFromRows(rows []store.LockWorkerRecoveryParentsRow) (workerRecoveryLockSet, error) {
