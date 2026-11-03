@@ -2604,10 +2604,11 @@ export interface RunnerClone {
   /** issue #1783 M2: the attempt id when the clone was seeded at an ATTEMPT path (a
    *  Docker-wired or recovery-enabled worker); absent for a canonical-path seed. */
   attemptId?: string;
-  /** issue #3194: the raw adopted source the clone was cut from — the base AFTER the structural
-   *  overlay peel and BEFORE the `wip(park)` unwrap, so a recovered marker is its own identity and
-   *  covers the staged tree the executor receives. The `--require-base` guard compares this, not
-   *  `baseCommit`. */
+  /** issue #3194: the raw adopted source after structural overlay peeling and before the
+   *  `wip(park)` unwrap; a recovered marker retains its identity for the staged content. For an
+   *  ordinary verified recovery wrapper W, this retains W for capture attribution even though
+   *  execution HEAD is the authenticated journaled source S. The `--require-base` guard compares
+   *  `adoptedContentSource` when present, otherwise this field, rather than `baseCommit`. */
   adoptedSource: string;
   /** issue #3194: the content source a recovery-coverage wrapper verifiably stands for (the
    *  episode journal's restoreSource), set only on a verified recovery adoption. When present the
