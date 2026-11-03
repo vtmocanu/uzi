@@ -3,6 +3,7 @@ package kube
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -221,8 +222,17 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 	return true, nil
 }
 
+// pressureRecycleEligible is shared by legacy scheduling and execution. Docker's
+// /data is durable: only explicit nix pressure permits a legacy pressure recycle.
+func (m *Materializer) pressureRecycleEligible(w protocol.DesiredWorker, o reconcile.ObservedWorker) bool {
+	return m.recycle.Enabled && !w.Ephemeral && !w.CustodyHeld && w.DiskPressure &&
+		o.HasNixPVC && o.HasDataPVC && (!w.Docker || slices.Contains(w.DiskPressureVolumes, "nix")) &&
+		!m.withinRecycleCooldown(o)
+}
+
 func (m *Materializer) legacyRecycleDue(w protocol.DesiredWorker, o reconcile.ObservedWorker, spec preset.Spec) bool {
-	return m.recycle.Enabled && !w.Ephemeral && ((o.HasNixPVC && o.NixPVCSize != nil && o.NixPVCSize.Cmp(spec.NixSize) < 0) || (w.DiskPressure && !w.CustodyHeld && !m.withinRecycleCooldown(o)))
+	return (m.recycle.Enabled && !w.Ephemeral && o.HasNixPVC && o.NixPVCSize != nil && o.NixPVCSize.Cmp(spec.NixSize) < 0) ||
+		m.pressureRecycleEligible(w, o)
 }
 
 func (m *Materializer) reconcileReplacement(ctx context.Context, w protocol.DesiredWorker, o reconcile.ObservedWorker) error {

@@ -366,7 +366,7 @@ in **Settings → Workers** and the Dashboard's "Worker load" card gain a Disk
 bar per volume (`/nix`, `/data`); see [Resource stats and
 sizing](./worker-setup.md#resource-stats-and-sizing).
 
-Two things now self-heal without you deleting and re-provisioning by hand:
+Automatic recycle handles these cases:
 
 - **A tools cache smaller than the current size** (provisioned before a size
   bump, like the one above) gets reconciled to the current size automatically:
@@ -375,12 +375,27 @@ Two things now self-heal without you deleting and re-provisioning by hand:
   volumes and build cache survive) and, on a worker already on the #3153
   layout, `/data/runner` (a subPath of the `/data` PVC); running DinD
   containers stop with the pod.
-- **A volume that fills up** (at or above 90% used, sustained across a couple
-  of heartbeats) gets recycled: the worker is drained first if it's busy —
-  same cordon behavior as above — then **both** its volumes are deleted and
-  re-provisioned fresh: the `/nix` tools cache re-downloads, and everything on
-  the `/data` workspace is permanently lost. A worker recycled this way shows
-  the same draining/cordoned pills while it happens.
+- **Sustained disk pressure** (at or above 90% used across fresh heartbeats)
+  on a plain hosted worker still drains and recycles **both** `/nix` and
+  `/data`: the tools cache re-downloads and the workspace is permanently lost
+  (policy revisit #3710). On an eligible non-ephemeral, non-custody
+  Docker-capable worker, explicit `nix` in the latest pressure-volume list
+  permits **Nix-only** recycle, subject to the toggle and cooldown. Docker `/data`
+  is preserved regardless of custody or runner layout, including under
+  ForceRoll or an elapsed deadline. Data-only, data+DinD, DinD-only and
+  nil/empty/unknown or stale flags without `nix` select no legacy pressure recycle.
+  The controller logs `disk-recycle-skipped-docker-data worker=<id>` before
+  admission, DinD handling or cooldown for enabled, non-ephemeral,
+  non-custody Docker workers with disk pressure but no `nix` cause.
+
+**Deploy the fixed controller to protect Docker data (#3852).** An old
+controller can still delete it; upgrading the API or worker alone does not
+establish this protection. Deferral neither requests nor clears a drain.
+Existing `pressure_recycle` drains, including old-controller drains and
+mixed Nix/data Nix-recycle drains, remain while pressure persists. Controller
+release requires pressure to clear; server uncordon also requires the
+pressure streak to drop. A data-full worker stays excluded from roll coverage
+and roll-hold release while pressure remains.
 
 A **persistent Docker-capable worker** also has a separate DinD-only
 pressure recycle. It preserves the `/nix` and `/data` PVCs, worker UUID,
@@ -397,13 +412,17 @@ work while letting this worker's own parked runs and pinned plan checkers
 finish; maintenance fencing still closes claims. It then fences claims and
 requires fresh custody clearance and zero local activity before gated
 anonymous-volume pruning or stop. No timer, forced park, or force-roll
-override bypasses this DinD gate. Legacy `/nix` + `/data` recycle associated with
+override bypasses this DinD gate. Legacy recycle (plain nix/data; Docker Nix-only) associated with
 spec-hash/generation drift also waits indefinitely for idle. Only independent
 nondrifted pressure/nix-size maintenance retains the compatible deadline; global
 ForceRoll can bypass its busy deferral, while custody-held data remains protected.
+Independent Nix pressure can therefore still deadline-interrupt a busy Docker
+pod; changing that policy is an unresolved owner question outside #3852.
 
-If legacy and DinD pressure coincide, the legacy recycle goes first; the
+If eligible Nix and DinD pressure coincide, Nix-only recycle goes first; the
 pending DinD intent resumes on a later tick before another legacy recycle.
+Docker data-only pressure yields to DinD: requested data+DinD maintenance
+advances without waiting for a forbidden data recycle.
 The legacy cooldown does not delay DinD cleanup, whose cooldown reads its
 own PVC's creation time. Older workers are report-only; ephemeral Docker
 workers report metering/admin pending state but use terminal teardown
@@ -412,26 +431,38 @@ instead of prune/recycle. See
 
 These are cluster-driven; there is no self-heal button. An admin can set
 `UZI_WORKER_DISK_RECYCLE_ENABLED=false` to opt out before DinD stop;
-an operation already stopping finishes safely. Upgrade the chart's Docker
+requested/ready maintenance cancels with `recycle_disabled`, while an operation
+already stopping finishes safely. The default remains enabled for Nix recycle
+and DinD maintenance/pruning; flipping the rendered prune flag rolls
+non-ephemeral Docker worker pods. Upgrade the chart's Docker
 controller Role with the controller: replacement readiness requires
 `apps/replicasets` `list` in the Docker namespace only, with no Secret
 read permission. An observation limit or list failure leaves maintenance
 pending/fenced rather than granting cleanup; see
 [ADR-1759](../adr/1759-dind-data-metering-and-prune.md#d9--fresh-bounded-observation-and-replacement-readiness).
 
-The legacy nix/data full-volume recycle is the **last resort**. Before that data volume gets anywhere
-near it, a run's own build caches are bounded and reclaimed on their own —
-see [Worker disk safety](./worker-setup.md#worker-disk-safety-prd-1809) for
-the cache drop, in-run cache cap, periodic reclaim, admission stop, and the
-bounded `data_volume_full` park that exist to make this recycle rare.
+Plain hosted nix/data recycle remains the **last resort**. A full Docker
+`/data` PVC instead leaves capacity degraded until existing run park-and-trim
+or supported manual settled-tree cleanup frees space. See
+[Worker disk safety](./worker-setup.md#worker-disk-safety-prd-1809) for cache
+bounds, periodic reclaim, admission stop and the bounded `data_volume_full`
+park, and [Run recovery](./run-recovery.md) for supported inspect/discard
+procedures; pressure does not authorize deleting protected sources.
+[PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b settlement/deletion is not
+started, and #3329's genuine-idle reclaim roll is deferred. This policy adds
+no reclaim authority.
 
 ### Docker workers: run directory on the data volume
 
 On a Docker-capable worker `/data/runner` is a subPath of the `/data` PVC, so
 replacing the pod keeps the run clones (a reschedule to another node also
 depends on the data StorageClass supporting reattach, which has not been
-verified); deleting or recycling the PVC itself (the full-volume recycle
-above, or removing an ephemeral worker) still deletes them. A rootless dind
+verified); manual deletion of the data PVC or ephemeral-worker teardown
+still deletes them. Automatic Docker pressure recycle preserves that PVC
+with the fixed controller. This guarantee covers the migrated layout only: on a
+pod still on the old layout, `/data/runner` is a pod-lifetime `emptyDir`, so
+any pod replacement, including an eligible explicit Nix-volume recycle, deletes
+its checkouts even though the data PVC is kept. A rootless dind
 container cannot write into worker-created run checkouts through bind
 mounts by default; that predates this layout in both uid modes. In single-uid
 mode it also lost writes at the `/data/runner` and `TMPDIR` roots (owner
