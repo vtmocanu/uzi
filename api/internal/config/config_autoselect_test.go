@@ -1,7 +1,10 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -117,15 +120,59 @@ func TestAutoselectPolicyIsOneMapping(t *testing.T) {
 	t.Setenv("UZI_AUTOSELECT_HEADROOM_TIE_PCT", "22")
 	t.Setenv("UZI_AUTOSELECT_INFLIGHT_PENALTY", "23")
 	t.Setenv("UZI_AUTOSELECT_MAX_STALENESS", "24m")
+	t.Setenv("UZI_AUTOSELECT_ORDER", "headroom_first")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load(): %v", err)
 	}
 	want := autoselect.Policy{
 		MinHeadroom: 21, HeadroomTiePct: 22, InflightPenalty: 23, MaxStaleness: 24 * time.Minute,
+		Order: autoselect.OrderHeadroomFirst,
 	}
 	if got := cfg.AutoselectPolicy(); got != want {
 		t.Fatalf("AutoselectPolicy() = %+v, want %+v — a knob is wired to the wrong field, which "+
 			"the settings page and the selector would agree about while both being wrong", got, want)
+	}
+}
+
+// TestAutoselectOrder pins UZI_AUTOSELECT_ORDER (#3844): reset_first by default, both
+// valid values honoured (surrounding whitespace trimmed), and an unknown value falling
+// back to reset_first with a boot warning rather than failing startup or silently
+// selecting the escape hatch.
+func TestAutoselectOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		env      string
+		set      bool
+		want     autoselect.Order
+		wantWarn bool
+	}{
+		{"unset defaults to reset_first", "", false, autoselect.OrderResetFirst, false},
+		{"reset_first", "reset_first", true, autoselect.OrderResetFirst, false},
+		{"headroom_first", "headroom_first", true, autoselect.OrderHeadroomFirst, false},
+		{"whitespace is trimmed", "  headroom_first ", true, autoselect.OrderHeadroomFirst, false},
+		{"unknown falls back", "soonest", true, autoselect.OrderResetFirst, true},
+		{"matching is case sensitive", "HEADROOM_FIRST", true, autoselect.OrderResetFirst, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			autoselectEnv(t)
+			if tc.set {
+				t.Setenv("UZI_AUTOSELECT_ORDER", tc.env)
+			}
+			var logs bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load(): %v", err)
+			}
+			if cfg.AutoselectOrder != tc.want || cfg.AutoselectPolicy().Order != tc.want {
+				t.Fatalf("AutoselectOrder = %q, policy order %q, want %q", cfg.AutoselectOrder, cfg.AutoselectPolicy().Order, tc.want)
+			}
+			if warned := strings.Contains(logs.String(), "UZI_AUTOSELECT_ORDER"); warned != tc.wantWarn {
+				t.Fatalf("warned = %v, want %v; logs: %s", warned, tc.wantWarn, logs.String())
+			}
+		})
 	}
 }

@@ -66,6 +66,11 @@ func FromRateLimitRow(row store.ListRateLimitsForUserRow) autoselect.Candidate {
 	if row.SevenDayResetsAt.Valid {
 		t := row.SevenDayResetsAt.Time
 		c.SevenResetsAt = &t
+		// A Claude pool reports only the weekly window, so the seven-day reset is the
+		// reset_first ranking key (#3844). A separate copy keeps it from aliasing
+		// SevenResetsAt, which is the binding-window reset.
+		w := row.SevenDayResetsAt.Time
+		c.WeeklyResetsAt = &w
 	}
 	return c
 }

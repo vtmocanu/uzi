@@ -284,6 +284,39 @@ func TestCodexSelectRanksByHeadroomLiveDB(t *testing.T) {
 	}
 }
 
+// TestCodexSelectResetFirstPrefersSoonerWeeklyResetLiveDB (#3844): with two eligible accounts the
+// one whose weekly window resets sooner wins under the default reset_first order even though it
+// has LESS headroom; headroom_first, the escape hatch, still picks the emptier account. The
+// 5-hour window of each is nearly empty so the weekly window binds and decides headroom.
+func TestCodexSelectResetFirstPrefersSoonerWeeklyResetLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		order autoselect.Order
+		want  string // "a" (sooner weekly reset, 30% headroom) | "b" (later reset, 90% headroom)
+	}{
+		{"reset_first picks the sooner weekly reset", autoselect.OrderResetFirst, "a"},
+		{"default order is reset_first", "", "a"},
+		{"headroom_first picks the emptier account", autoselect.OrderHeadroomFirst, "b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newPoolFix(t)
+			fx.svc.p.Autoselect.Order = tc.order
+			def := fx.newAccount("def")
+			fx.makeDefault(def.alias)
+			a, b := fx.newAccount("a"), fx.newAccount("b")
+			fx.pool(a.alias, b.alias)
+			fx.readingRaw(a, poolBuckets(true, false, poolWindow(fiveHourSecs, 5, 100000), poolWindow(weekSecs, 70, 5000)), "1 minute")
+			fx.readingRaw(b, poolBuckets(true, false, poolWindow(fiveHourSecs, 5, 100000), poolWindow(weekSecs, 10, 200000)), "1 minute")
+			fx.mode("auto")
+			want := a
+			if tc.want == "b" {
+				want = b
+			}
+			assertBound(t, fx.mustCreate(), want.alias, codexselect.ReasonAuto)
+		})
+	}
+}
+
 // TestCodexSelectPoolStaleLiveDB: with the reserve off, accounts with no measurable reading
 // (none, aged out, or polling disabled) fall to the lowest account key with 'pool_stale'.
 func TestCodexSelectPoolStaleLiveDB(t *testing.T) {

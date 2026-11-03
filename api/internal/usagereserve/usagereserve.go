@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/codexauth"
 )
 
 // WeeklyWindowSeconds is the reported duration that identifies a Codex 7-day window. A Codex
@@ -218,6 +219,34 @@ func CodexWindowReset(w *apitypes.CodexRateLimitWindowDTO, readAt time.Time) *ti
 	case w.ResetAfterSeconds != nil && *w.ResetAfterSeconds >= 0:
 		t := readAt.Add(time.Duration(*w.ResetAfterSeconds) * time.Second).UTC()
 		return &t
+	}
+	return nil
+}
+
+// CodexMainWeeklyReset is the soonest upcoming weekly reset of the Codex main bucket, the
+// reset_first ranking key (#3844). Only the main bucket's primary or secondary windows whose
+// reported duration is exactly WeeklyWindowSeconds count, never chosen by position. A window
+// whose reset is unknown, or already passed since readAt (PreReset), is skipped: its reading
+// describes the old window. Nil when no window qualifies.
+func CodexMainWeeklyReset(buckets []apitypes.CodexRateLimitBucketDTO, readAt, now time.Time) *time.Time {
+	for i := range buckets {
+		if buckets[i].ID != codexauth.CodexMainBucketID {
+			continue
+		}
+		var soonest *time.Time
+		for _, w := range []*apitypes.CodexRateLimitWindowDTO{buckets[i].Primary, buckets[i].Secondary} {
+			if w == nil || w.LimitWindowSeconds == nil || *w.LimitWindowSeconds != WeeklyWindowSeconds {
+				continue
+			}
+			reset := CodexWindowReset(w, readAt)
+			if reset == nil || PreReset(reset, readAt, now) {
+				continue
+			}
+			if soonest == nil || reset.Before(*soonest) {
+				soonest = reset
+			}
+		}
+		return soonest
 	}
 	return nil
 }

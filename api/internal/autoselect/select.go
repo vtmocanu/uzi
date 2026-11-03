@@ -169,7 +169,11 @@ type Outcome struct {
 // shuffling cands cannot change the result, which is not a nicety but the property
 // that makes the ranking testable at all.
 //
-// 🔴 THE ONE THING NOT TO REWRITE AS A COMPARATOR. The PRD's rule reads like a
+// Under the default Policy.Order (reset_first, #3844) the ReasonAuto set is ranked by
+// the soonest weekly reset (resetFirstLess) and the anchor/cluster machinery below is
+// bypassed; it still runs for best_of_pool and for Order == OrderHeadroomFirst.
+//
+// 🔴 THE ONE THING NOT TO REWRITE AS A COMPARATOR (headroom_first). The PRD's rule reads like a
 // pairwise `less`: "within T points of each other, prefer the sooner reset;
 // otherwise prefer more headroom". Written that way it is INTRANSITIVE — with
 // T=5 and A=80, B=75, C=70, A ties B and B ties C but A does not tie C — so it is
@@ -198,14 +202,6 @@ type Outcome struct {
 // half of M2; the fallback half (when Select picks nothing) lives in autoChoice,
 // because that branch never consults Select's pick.
 func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outcome {
-	// scored is one pooled, measurable candidate with the two numbers that decide
-	// its fate: the gate's raw headroom and the ranker's penalized key.
-	type scored struct {
-		c    Candidate
-		e    Eligibility
-		rank int
-	}
-
 	var pooled bool
 	var poolNonEmpty bool
 	var measured []scored
@@ -267,6 +263,27 @@ func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outco
 			if m.e.Status == StatusEligible {
 				set = append(set, m)
 			}
+		}
+	}
+
+	// reset_first (#3844, the default): among the eligible set only, pick the soonest
+	// weekly reset. best_of_pool keeps the headroom ranking below, because nothing
+	// cleared MinHeadroom and "least consumed" is the only meaningful answer there.
+	if reason == ReasonAuto && p.Order != OrderHeadroomFirst {
+		best := 0
+		for i := 1; i < len(set); i++ {
+			if resetFirstLess(set[i], set[best], now) {
+				best = i
+			}
+		}
+		pick := set[best]
+		return Outcome{
+			Picked:       true,
+			SecretID:     pick.c.SecretID,
+			Headroom:     pick.e.Headroom,
+			Ranked:       pick.rank,
+			Reason:       reason,
+			PoolNonEmpty: poolNonEmpty,
 		}
 	}
 
@@ -360,6 +377,40 @@ func Floor(cands []Candidate, exclude uuid.UUID, now time.Time) (secretID uuid.U
 		return uuid.Nil, false
 	}
 	return best.SecretID, true
+}
+
+// scored is one pooled, measurable candidate with the two numbers that decide its
+// fate: the gate's raw headroom (e) and the ranker's in-flight-penalized key (rank).
+type scored struct {
+	c    Candidate
+	e    Eligibility
+	rank int
+}
+
+// resetFirstLess is the reset_first order (#3844), a strict TOTAL order so a single
+// keep-the-best pass is input-order independent: a known future weekly reset beats
+// an unknown or already-passed one; then the earlier reset; then the higher
+// penalized rank; then the lower secret id. A reset at or before now is treated as
+// unknown, since a stale value carries no information about when allowance returns.
+func resetFirstLess(a, b scored, now time.Time) bool {
+	ra, rb := futureReset(a.c.WeeklyResetsAt, now), futureReset(b.c.WeeklyResetsAt, now)
+	switch {
+	case (ra != nil) != (rb != nil):
+		return ra != nil
+	case ra != nil && !ra.Equal(*rb):
+		return ra.Before(*rb)
+	case a.rank != b.rank:
+		return a.rank > b.rank
+	}
+	return compareUUID(a.c.SecretID, b.c.SecretID) < 0
+}
+
+// futureReset returns r when it is strictly after now, else nil.
+func futureReset(r *time.Time, now time.Time) *time.Time {
+	if r != nil && r.After(now) {
+		return r
+	}
+	return nil
 }
 
 // tieLess is the within-cluster order: soonest reset of the BINDING window, then

@@ -289,6 +289,12 @@ type Config struct {
 	// inside one poll interval do not all pile onto the same emptiest credential.
 	// Default 3. 0 disables the bias, leaving pure headroom ranking.
 	AutoselectInflightPenalty int
+	// AutoselectOrder is how the eligible set is ranked (UZI_AUTOSELECT_ORDER, #3844):
+	// "reset_first" (default) picks the soonest weekly reset, because Claude and Codex
+	// pools now report only a weekly window; "headroom_first" is the earlier
+	// most-headroom ranking. Under reset_first HeadroomTiePct is ignored. An unknown
+	// value falls back to reset_first with a boot warning.
+	AutoselectOrder autoselect.Order
 	// UsageProbe enables the ~1-token Messages header probe fallback (PRD #53 D2).
 	// Default true; false makes users the free usage endpoint refuses show
 	// `unavailable` rather than spend a token. A security/spend control, so a
@@ -1078,6 +1084,15 @@ func Load() (Config, error) {
 	// 0 — nothing is ever fresh — which is the correct answer for a gauge nothing
 	// updates, and matches what rateLimitStale already reports for the same case.
 	cfg.AutoselectMaxStaleness = parseNonNegDuration("UZI_AUTOSELECT_MAX_STALENESS", 3*cfg.UsagePollInterval)
+	// Ordering (#3844). A typo falls back to the default with a boot warning rather than
+	// failing startup, the same shape as UZI_EPHEMERAL_DEFAULT_SIZE.
+	cfg.AutoselectOrder = autoselect.Order(strings.TrimSpace(getenv("UZI_AUTOSELECT_ORDER", string(autoselect.OrderResetFirst))))
+	if cfg.AutoselectOrder != autoselect.OrderResetFirst && cfg.AutoselectOrder != autoselect.OrderHeadroomFirst {
+		slog.Warn("UZI_AUTOSELECT_ORDER is not a known order; falling back to \"reset_first\"",
+			"configured", string(cfg.AutoselectOrder),
+			"valid", []string{string(autoselect.OrderResetFirst), string(autoselect.OrderHeadroomFirst)})
+		cfg.AutoselectOrder = autoselect.OrderResetFirst
+	}
 
 	usageProbe, err := parseBool("UZI_USAGE_PROBE", true)
 	if err != nil {
@@ -1539,7 +1554,7 @@ func (c Config) OIDCEnabled() bool { return c.OIDCIssuerURL != "" }
 // (fetcher_control.go), so nothing could serve a profile-bound run anyway.
 func (c Config) IsolatedLaneEnabled() bool { return len(c.FetcherTokenSHA256) != 0 }
 
-// AutoselectPolicy assembles the four UZI_AUTOSELECT_* knobs into the pure ranker's
+// AutoselectPolicy assembles the UZI_AUTOSELECT_* knobs into the pure ranker's
 // Policy (PRD #111 D6).
 //
 // 🔴 IT IS A METHOD SO THERE CAN ONLY BE ONE. The policy is read in two places that
@@ -1555,6 +1570,7 @@ func (c Config) AutoselectPolicy() autoselect.Policy {
 		HeadroomTiePct:  c.AutoselectHeadroomTiePct,
 		MaxStaleness:    c.AutoselectMaxStaleness,
 		InflightPenalty: c.AutoselectInflightPenalty,
+		Order:           c.AutoselectOrder,
 	}
 }
 

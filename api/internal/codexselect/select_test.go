@@ -11,7 +11,9 @@ import (
 
 func id(n byte) uuid.UUID { return uuid.UUID{15: n} }
 
-var policy = autoselect.Policy{MinHeadroom: 10, HeadroomTiePct: 5, MaxStaleness: 0, InflightPenalty: 5}
+// policy is pinned to the pre-#3844 headroom_first order: the tests in this file were
+// written for it. The reset_first (default) tests set their own policy.
+var policy = autoselect.Policy{Order: autoselect.OrderHeadroomFirst, MinHeadroom: 10, HeadroomTiePct: 5, MaxStaleness: 0, InflightPenalty: 5}
 
 func normal(n byte, score float64) Candidate {
 	return Candidate{AccountKey: id(n), AliasID: id(100 + n), Structural: true, Score: score, ScoreKnown: true}
@@ -214,5 +216,67 @@ func TestSelectDeterministicUnderShuffle(t *testing.T) {
 	}
 	if out := mustSelect(t, sets[4]); out.AccountKey != id(4) || out.AliasID != id(140) {
 		t.Fatalf("duplicate key should resolve to the lowest alias id: %+v", out)
+	}
+}
+
+var resetFirstPolicy = autoselect.Policy{Order: autoselect.OrderResetFirst, MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 5}
+
+func withWeekly(c Candidate, d time.Duration) Candidate {
+	r := t0.Add(d)
+	c.WeeklyResetAt = &r
+	return c
+}
+
+// reset_first orders eligible accounts by WeeklyResetAt even when the sooner one has far
+// less headroom, and never reads ResetAt (the binding reset).
+func TestSelectResetFirstOrdersByWeeklyReset(t *testing.T) {
+	sooner := withWeekly(normal(1, 30), time.Hour)
+	later := withWeekly(normal(2, 90), 48*time.Hour)
+	// The binding resets point the opposite way: they must not matter.
+	bs, bl := t0.Add(72*time.Hour), t0.Add(time.Minute)
+	sooner.ResetAt, later.ResetAt = &bs, &bl
+	out, err := Select([]Candidate{later, sooner}, resetFirstPolicy, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.AccountKey != id(1) || out.Reason != ReasonAuto || out.Headroom != 30 {
+		t.Fatalf("got %+v, want account 1 (soonest weekly reset), auto, headroom 30", out)
+	}
+}
+
+// Below-floor accounts are not eligible, so best_of_pool still ranks by headroom.
+func TestSelectResetFirstBestOfPoolStaysHeadroomRanked(t *testing.T) {
+	a := withWeekly(normal(1, 2), time.Hour)
+	b := withWeekly(normal(2, 9), 48*time.Hour)
+	out, err := Select([]Candidate{a, b}, resetFirstPolicy, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.AccountKey != id(2) || out.Reason != ReasonBestOfPool {
+		t.Fatalf("got %+v", out)
+	}
+}
+
+// An account with no known weekly reset sorts after one that has it.
+func TestSelectResetFirstUnknownWeeklyResetLast(t *testing.T) {
+	out, err := Select([]Candidate{normal(1, 95), withWeekly(normal(2, 20), 100*time.Hour)}, resetFirstPolicy, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.AccountKey != id(2) {
+		t.Fatalf("got %+v", out)
+	}
+}
+
+// headroom_first ignores WeeklyResetAt and reproduces the old pick.
+func TestSelectHeadroomFirstIgnoresWeeklyReset(t *testing.T) {
+	sooner := withWeekly(normal(1, 30), time.Hour)
+	later := withWeekly(normal(2, 90), 48*time.Hour)
+	out, err := Select([]Candidate{sooner, later}, policy, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.AccountKey != id(2) {
+		t.Fatalf("got %+v, want the 90-headroom account", out)
 	}
 }
