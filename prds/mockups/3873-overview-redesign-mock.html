@@ -623,8 +623,8 @@ body[data-scenario="calm"] .station.gate-st .st-count { color: rgb(var(--fg)); }
             <span class="bay-text"><span class="bay-title"><b data-count="parked">1</b>Parked</span><span class="bay-sub" data-sub="parked">Resumes on its own in 1 h 25 min</span></span>
           </button>
           <button class="bay" type="button" data-stage="other" aria-pressed="false">
-            <span class="dtile t-plan" aria-hidden="true"><svg class="ic"><use href="#i-scale"/></svg></span>
-            <span class="bay-text"><span class="bay-title"><b data-count="other">1</b>Other work</span><span class="bay-sub">Judge, chat and job runs</span></span>
+            <span class="dtile t-neutral" aria-hidden="true"><svg class="ic"><use href="#i-runs"/></svg></span>
+            <span class="bay-text"><span class="bay-title"><b data-count="other">1</b>Other work</span><span class="bay-sub">Jobs, self-improve, CI fixes, reworks</span></span>
           </button>
         </div>
       </section>
@@ -666,13 +666,13 @@ body[data-scenario="calm"] .station.gate-st .st-count { color: rgb(var(--fg)); }
               </div>
               <div class="run-side"><a class="btn btn-secondary btn-sm" href="#">Answer</a><span class="badge t-warn"><span class="bd pulse"></span>needs your answer</span></div>
             </li>
-            <li class="run" data-stage="other" data-ref="judge" data-owner="me" data-exec="1">
+            <li class="run" data-stage="other" data-ref="CI fix" data-owner="me" data-exec="1">
               <div class="run-main">
-                <p class="run-title"><a href="#">Judge review of run <span class="mono">3f9a1c2e</span></a></p>
-                <p class="now"><span class="dot pulse" aria-hidden="true"></span><span class="agent">judge</span><span class="what">Reading the run trace</span><span class="when">8s</span></p>
-                <p class="meta"><span>vtmocanu/atlas-api</span><span>Codex</span></p>
+                <p class="run-title"><a href="#">Fix the failing lint check on PR #398</a></p>
+                <p class="now"><span class="dot pulse" aria-hidden="true"></span><span class="agent">coder</span><span class="what">Running golangci-lint on internal/export</span><span class="when">8s</span></p>
+                <p class="meta"><span>vtmocanu/atlas-api #398</span><span>Codex</span></p>
               </div>
-              <div class="run-side"><span class="badge t-plan">judge</span><span class="badge t-info"><span class="bd pulse"></span>running</span></div>
+              <div class="run-side"><span class="badge t-neutral">CI fix</span><span class="badge t-info"><span class="bd pulse"></span>running</span></div>
             </li>
             <li class="run busy-only" data-stage="pr" data-ref="#405" data-owner="me" hidden>
               <div class="run-main">
