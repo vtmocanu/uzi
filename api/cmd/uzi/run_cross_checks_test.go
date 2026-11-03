@@ -346,6 +346,41 @@ func TestRunCrossChecksLeavesRunListUnchanged(t *testing.T) {
 	}
 }
 
+func TestRunCrossChecksOmitsOversizedContinuationTokens(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		groupBytes   int
+		attemptBytes int
+	}{
+		{"group", 513, 256},
+		{"attempt", 512, 257},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			page := crossChecksFixture()
+			page.NextCursor = strings.Repeat("g", tc.groupBytes)
+			page.Groups[0].OlderCursor = strings.Repeat("o", tc.attemptBytes)
+			out, stderr, code := runCLI(t, fakeEnv(&uzicli.FakeClient{CrossCheckHistoryResult: page}), "run", "cross-checks")
+			if code != 0 {
+				t.Fatalf("code=%d stderr=%s", code, stderr)
+			}
+			if !strings.Contains(out, "Continuation cursor omitted: the server returned an oversized token.") {
+				t.Fatal("oversized server cursor was not explicitly omitted")
+			}
+			if tc.groupBytes > 512 && strings.Contains(out, page.NextCursor) {
+				t.Fatal("oversized group cursor flooded human output")
+			}
+			if tc.attemptBytes > 256 && strings.Contains(out, page.Groups[0].OlderCursor) {
+				t.Fatal("oversized attempt cursor flooded human output")
+			}
+			jsonOut, jsonErr, jsonCode := runCLI(t, fakeEnv(&uzicli.FakeClient{CrossCheckHistoryResult: page}), "--json", "run", "cross-checks")
+			var got apitypes.CrossCheckHistoryDTO
+			if jsonCode != 0 || json.Unmarshal([]byte(jsonOut), &got) != nil || !reflect.DeepEqual(got, page) {
+				t.Fatalf("JSON evidence changed: code=%d stderr=%s", jsonCode, jsonErr)
+			}
+		})
+	}
+}
+
 func crossChecksHumanContains(out, want string) bool {
 	for _, line := range strings.Split(out, "\n") {
 		if strings.Contains(strings.Join(strings.Fields(line), " "), want) {

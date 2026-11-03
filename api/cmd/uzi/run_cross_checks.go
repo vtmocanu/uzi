@@ -215,6 +215,14 @@ func printCrossCheckAttempt(p *uzicli.Printer, a apitypes.CrossCheckHistoryAttem
 }
 
 func printCrossCheckCursor(p *uzicli.Printer, flag, cursor string, opts uzicli.CrossCheckHistoryOptions) {
+	limit := 256
+	if flag == "--cursor" {
+		limit = 512
+	}
+	if len(cursor) > limit {
+		p.Printf("Continuation cursor omitted: the server returned an oversized token.\n")
+		return
+	}
 	// Opaque tokens must not use the prose cap or secret redactor: valid tokens
 	// can be 512 bytes. Shell quoting preserves punctuation in copyable values.
 	token := termsafe.CellText(cursor)
