@@ -4,7 +4,8 @@ import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { type RunProcsOptions, reapRunProcesses, scanRunProcesses } from "../src/run-procs.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import { INCOMPLETE_REASONS, type RunProcsOptions, helperRejectionReason, reapRunProcesses, scanRunProcesses } from "../src/run-procs.js";
 import type { CommandWrapper } from "../src/rmtree.js";
 import { realProcfsSkip } from "./real-procfs.js";
 
@@ -143,6 +144,7 @@ describe("run process attribution (PRD #1809 D4)", () => {
     const r = await scan();
     assert.deepStrictEqual(r.pids, [4101]);
     assert.strictEqual(r.complete, true);
+    assert.deepStrictEqual(r.incompleteReasons, [], "a complete scan names no reason");
   });
 
   it("a process of another run (a different HOME, cwd elsewhere) is not this run's", async () => {
@@ -167,6 +169,7 @@ describe("run process attribution (PRD #1809 D4)", () => {
     const r = await scan();
     assert.deepStrictEqual(r.pids, []);
     assert.strictEqual(r.complete, true, "an unrelated non-dumpable process does not deny the quiet point");
+    assert.deepStrictEqual(r.incompleteReasons, []);
   });
 
   it("an unreadable process sharing a session or process group with an attributed one is the run's", async () => {
@@ -212,29 +215,44 @@ describe("run process attribution (PRD #1809 D4)", () => {
     fake(4112, {});
     const r = await scan({ maxPids: 1 });
     assert.strictEqual(r.complete, false);
+    assert.deepStrictEqual(r.incompleteReasons, ["pid_budget"]);
   });
 
   it("a proc mount with hidepid or subset, or one it cannot confirm, makes the scan incomplete (N-d)", async () => {
     fake(4113, { env: [`HOME=${runHome}`] });
-    for (const [mountOpts, superOpts, fstype, want] of [
-      ["rw,relatime", "rw", "proc", true],
-      ["rw,relatime", "rw,hidepid=0", "proc", true],
-      ["rw,relatime", "rw,hidepid=off", "proc", true],
-      ["rw,relatime", "rw,hidepid=2", "proc", false],
-      ["rw,relatime", "rw,hidepid=invisible", "proc", false],
-      ["rw,relatime,hidepid=1", "rw", "proc", false],
-      ["rw,relatime", "rw,subset=pid", "proc", false],
-      ["rw,relatime", "rw", "tmpfs", false],
+    for (const [mountOpts, superOpts, fstype, want, reason] of [
+      ["rw,relatime", "rw", "proc", true, undefined],
+      ["rw,relatime", "rw,hidepid=0", "proc", true, undefined],
+      ["rw,relatime", "rw,hidepid=off", "proc", true, undefined],
+      ["rw,relatime", "rw,hidepid=2", "proc", false, "mount_hidden"],
+      ["rw,relatime", "rw,hidepid=invisible", "proc", false, "mount_hidden"],
+      ["rw,relatime,hidepid=1", "rw", "proc", false, "mount_hidden"],
+      ["rw,relatime", "rw,subset=pid", "proc", false, "mount_hidden"],
+      ["rw,relatime", "rw", "tmpfs", false, "mount_not_proc"],
     ] as const) {
       mountinfo(mountOpts, superOpts, fstype);
       const r = await scan();
       assert.strictEqual(r.complete, want, `${fstype} ${mountOpts} / ${superOpts}`);
       assert.deepStrictEqual(r.pids, [4113], "what it can see is still reported");
+      assert.deepStrictEqual(r.incompleteReasons, reason ? [reason] : [], `${fstype} ${mountOpts} / ${superOpts}`);
     }
-    fs.rmSync(path.join(procRoot, "self", "mountinfo"));
-    assert.strictEqual((await scan()).complete, false, "no mountinfo: unknown");
-    fs.writeFileSync(path.join(procRoot, "self", "mountinfo"), "21 1 0:5 / / rw - ext4 /dev/sda1 rw\n");
-    assert.strictEqual((await scan()).complete, false, "no mount at the proc root: unknown");
+    const mountCase = async (label: string, reason: string) => {
+      const r = await scan();
+      assert.strictEqual(r.complete, false, label);
+      assert.deepStrictEqual(r.pids, [4113], `${label}: what it can see is still reported`);
+      assert.deepStrictEqual(r.incompleteReasons, [reason], label);
+    };
+    const info = path.join(procRoot, "self", "mountinfo");
+    fs.rmSync(info);
+    await mountCase("no mountinfo: unknown", "mount_unreadable");
+    fs.writeFileSync(info, "21 1 0:5 / / rw - ext4 /dev/sda1 rw\n");
+    await mountCase("no mount at the proc root: unknown", "mount_missing");
+    fs.writeFileSync(info, "21 1 0:5 / / rw shared:1 ext4 /dev/sda1 rw\n");
+    await mountCase("a line with no separator: malformed", "mount_malformed");
+    fs.writeFileSync(info, "21 1 0:5 / - ext4 /dev/sda1 rw\n");
+    await mountCase("a line with too few fields: malformed", "mount_malformed");
+    fs.writeFileSync(info, "#".repeat(4 * 1024 * 1024 + 1));
+    await mountCase("a mountinfo over its read bound: unknown", "mount_unreadable");
   });
 
   it("a helper that cannot run is incomplete, never a throw", async () => {
@@ -242,7 +260,7 @@ describe("run process attribution (PRD #1809 D4)", () => {
       procRoot,
       wrappers: [() => ({ command: path.join(root, "no-such-binary"), args: [] })],
     });
-    assert.deepStrictEqual(r, { pids: [], complete: false });
+    assert.deepStrictEqual(r, { pids: [], complete: false, incompleteReasons: ["helper_failed"] });
   });
 
   it("the reap SIGKILLs an attributed process by its exact pid, and never an unreadable one, linked or not", async () => {
@@ -364,7 +382,7 @@ process.kill = function (pid, sig) {
       procRoot,
       wrappers: [() => ({ command: path.join(root, "no-such-binary"), args: [] })],
     });
-    assert.deepStrictEqual(r, { killed: [], left: [], leftReasons: {}, complete: false });
+    assert.deepStrictEqual(r, { killed: [], left: [], leftReasons: {}, complete: false, incompleteReasons: ["helper_failed"] });
   });
 
   it("this host's real proc tree: a detached child with the run's HOME is found and reaped; another HOME is not", { skip: realTreeSkip("real proc tree: detached child with the run's HOME") }, async () => {
@@ -374,14 +392,14 @@ process.kill = function (pid, sig) {
     await new Promise((r) => setTimeout(r, 100)); // let both exec
     const found = await scanRunProcesses(runHome, undefined);
     assert.ok(found.pids.includes(mine.pid!), `the run's detached child is attributed (${JSON.stringify(found)})`);
-    assert.ok(!found.pids.includes(other.pid!), "another HOME is not");
+    assert.ok(!found.pids.includes(other.pid!), `another HOME is not (${JSON.stringify(found)})`);
     assert.strictEqual(found.complete, true, `the real scan completed, so the negative above is proven (${JSON.stringify(found)})`);
     // The test process is the "worker" here and both children are its direct children, so name
     // another worker pid for the reap.
     const exited = new Promise<NodeJS.Signals | null>((resolve) => mine.once("exit", (_c, sig) => resolve(sig)));
     const reaped = await reapRunProcesses(runHome, undefined, [], { workerPid: 0 });
-    assert.ok(reaped.killed.includes(mine.pid!));
-    assert.ok(!reaped.killed.includes(other.pid!));
+    assert.ok(reaped.killed.includes(mine.pid!), `the reap killed the run's child (${JSON.stringify(reaped)})`);
+    assert.ok(!reaped.killed.includes(other.pid!), `the reap spared another HOME (${JSON.stringify(reaped)})`);
     assert.strictEqual(await exited, "SIGKILL");
   });
 
@@ -400,7 +418,7 @@ process.kill = function (pid, sig) {
     if (!environUnreadable(nd.pid!)) return t.skip("a non-dumpable process's environ is readable by this uid here");
     const found = await scanRunProcesses(runHome, worktree);
     assert.ok(!found.pids.includes(nd.pid!), `the unrelated non-dumpable process is not the run's (${JSON.stringify(found)})`);
-    assert.deepStrictEqual(found.pids, [], "nothing of this run is alive");
+    assert.deepStrictEqual(found.pids, [], `nothing of this run is alive (${JSON.stringify(found)})`);
     assert.strictEqual(found.complete, true, `the real scan completed: a scan that failed outright is not a quiet point (${JSON.stringify(found)})`);
   });
 
@@ -422,5 +440,213 @@ process.kill = function (pid, sig) {
     const found = await scanRunProcesses(runHome, worktree);
     assert.ok(found.pids.includes(sh.pid!), `the run's shell is attributed by HOME (${JSON.stringify(found)})`);
     assert.ok(found.pids.includes(child), `its non-dumpable child is linked by ppid/session (${JSON.stringify(found)})`);
+  });
+});
+
+// issue #2953: an incomplete scan names WHICH existing condition made it so, from a fixed vocabulary
+// (diagnostics only: the reasons never change `complete`, the pids, or the reap).
+describe("run process scan incompleteness reasons (issue #2953)", () => {
+  /** A wrapper that loads `preload` into the helper (node --require). */
+  const preloading = (name: string, body: string): CommandWrapper => {
+    const preload = path.join(root, name);
+    fs.writeFileSync(preload, body);
+    return (command, args) => ({ command, args: ["--require", preload, ...args] });
+  };
+  /** A fake helper that prints `out` and exits `code`. */
+  const fakeHelper = (name: string, out: string, code = 0): CommandWrapper => {
+    const script = path.join(root, name);
+    fs.writeFileSync(script, `process.stdout.write(${JSON.stringify(out)}); process.exitCode = ${code};\n`);
+    return () => ({ command: process.execPath, args: [script] });
+  };
+  const summary = (fields: Record<string, unknown>) =>
+    `H\t${JSON.stringify({ scanned: 1, truncated: false, unresolved: 0, procMount: "ok", ...fields })}\n`;
+  /** The invariant the real functions keep: incomplete exactly when a reason is named. */
+  const consistent = (r: { complete: boolean; incompleteReasons?: string[] }) => {
+    assert.ok(Array.isArray(r.incompleteReasons), "the real functions always set the reasons");
+    assert.strictEqual(r.complete, r.incompleteReasons.length === 0, `complete iff no reason (${JSON.stringify(r)})`);
+    for (const reason of r.incompleteReasons) assert.ok((INCOMPLETE_REASONS as readonly string[]).includes(reason), reason);
+  };
+
+  it("a pass that runs out of its time budget is incomplete with time_budget", async () => {
+    fake(4601, {});
+    // The helper reads the clock once for its deadline; every later read is far past it.
+    const late = preloading("late.cjs", "const real = Date.now; let n = 0; Date.now = () => (n++ === 0 ? real() : real() + 1e9);\n");
+    const r = await scan({ wrappers: [late] });
+    consistent(r);
+    assert.deepStrictEqual(r.incompleteReasons, ["time_budget"]);
+  });
+
+  it("a directory read that fails mid-listing is incomplete with dir_read", async () => {
+    fake(4602, {});
+    const failing = preloading(
+      "readdir.cjs",
+      'const fs = require("node:fs"); fs.Dir.prototype.readSync = function () { const e = new Error("io"); e.code = "EIO"; throw e; };\n',
+    );
+    const r = await scan({ wrappers: [failing] });
+    consistent(r);
+    assert.deepStrictEqual(r.incompleteReasons, ["dir_read"]);
+  });
+
+  it("a pid whose status or stat cannot be read, while it still exists, names which read failed", async () => {
+    fake(4603, {});
+    fake(4604, {});
+    const denied = [path.join(procRoot, "4603", "status"), path.join(procRoot, "4604", "stat")];
+    const deny = preloading(
+      "eacces.cjs",
+      `const fs = require("node:fs"); const orig = fs.openSync; const denied = ${JSON.stringify(denied)};
+fs.openSync = function (p, ...rest) { if (denied.includes(p)) { const e = new Error("denied"); e.code = "EACCES"; throw e; } return orig.call(this, p, ...rest); };
+`,
+    );
+    const r = await scan({ wrappers: [deny] });
+    consistent(r);
+    assert.deepStrictEqual(r.incompleteReasons, ["status_read", "stat_read"]);
+  });
+
+  it("an oversized status or stat, a status with no Uid line, and a malformed stat each name their cause", async () => {
+    for (const [label, plant, reason] of [
+      ["oversized status", (dir: string) => fs.appendFileSync(path.join(dir, "status"), "x".repeat(70_000)), "status_oversize"],
+      ["oversized stat", (dir: string) => fs.writeFileSync(path.join(dir, "stat"), "x".repeat(70_000)), "stat_oversize"],
+      ["no Uid line", (dir: string) => fs.writeFileSync(path.join(dir, "status"), "Name:\tgo\nState:\tS (sleeping)\n"), "uid_missing"],
+      ["malformed stat", (dir: string) => fs.writeFileSync(path.join(dir, "stat"), "4605 (go) S 1 2\n"), "stat_malformed"],
+    ] as const) {
+      fs.rmSync(path.join(procRoot, "4605"), { recursive: true, force: true });
+      fake(4605, { env: [`HOME=${runHome}`] });
+      plant(path.join(procRoot, "4605"));
+      const r = await scan();
+      consistent(r);
+      assert.deepStrictEqual(r.pids, [], `${label}: an unresolved pid is not attributed`);
+      assert.deepStrictEqual(r.incompleteReasons, [reason], label);
+    }
+  });
+
+  it("the kill pass's re-verify uncertainty is a survivor, never an incompleteness reason; a separately unresolved pid still is", async () => {
+    // The re-verify's status read (the second open of this pid's status) is oversized: the pid
+    // stays as an unreadable survivor, and the scan itself stays complete.
+    const statusPath = path.join(procRoot, "4801", "status");
+    const corrupt = preloading(
+      "reverify.cjs",
+      `const fs = require("node:fs"); const orig = fs.openSync; let opens = 0, busy = false;
+fs.openSync = function (p, ...rest) {
+  if (p === ${JSON.stringify(statusPath)} && !busy) { opens++; if (opens === 2) { busy = true; fs.appendFileSync(p, "x".repeat(70000)); busy = false; } }
+  return orig.call(this, p, ...rest);
+};
+`,
+    );
+    fake(4801, { env: [`HOME=${runHome}`] });
+    const alone = await reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 1, wrappers: [corrupt] });
+    consistent(alone);
+    assert.deepStrictEqual(alone.killed, []);
+    assert.deepStrictEqual(alone.left, [4801]);
+    assert.deepStrictEqual(alone.leftReasons, { 4801: "unreadable" });
+    assert.strictEqual(alone.complete, true, "the re-verify does not change completeness");
+    assert.deepStrictEqual(alone.incompleteReasons, []);
+
+    fs.rmSync(path.join(procRoot, "4801"), { recursive: true });
+    fake(4801, { env: [`HOME=${runHome}`] });
+    fake(4802, {});
+    fs.writeFileSync(path.join(procRoot, "4802", "status"), "Name:\tgo\nState:\tS (sleeping)\n");
+    const both = await reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 1, wrappers: [corrupt] });
+    consistent(both);
+    assert.deepStrictEqual(both.left, [4801]);
+    assert.deepStrictEqual(both.leftReasons, { 4801: "unreadable" });
+    assert.strictEqual(both.complete, false);
+    assert.deepStrictEqual(both.incompleteReasons, ["uid_missing"], "only the listing's unresolved pid names a reason");
+  });
+
+  it("a kill pass that exhausts its pid budget on a later round is incomplete with pid_budget", async () => {
+    const c = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+    children.push(c);
+    fake(c.pid!, { env: [`HOME=${runHome}`], cwd: "/tmp" });
+    // Round 1 looks at its one pid and kills it; round 2's first pid is over the budget.
+    const r = await reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 1, maxPids: 1 });
+    consistent(r);
+    assert.deepStrictEqual(r.killed, [c.pid]);
+    assert.strictEqual(r.complete, false);
+    assert.deepStrictEqual(r.incompleteReasons, ["pid_budget"]);
+  });
+
+  it("helper exits name their cause: an unreadable proc root, bad arguments, any other exit", async () => {
+    const missing = await scanRunProcesses(runHome, worktree, [], { procRoot: path.join(root, "no-proc"), workerPid: 1 });
+    consistent(missing);
+    assert.deepStrictEqual(missing, { pids: [], complete: false, incompleteReasons: ["proc_root_unreadable"] });
+    const relative = await scanRunProcesses(runHome, worktree, [], { procRoot: "relative/proc", workerPid: 1 });
+    assert.deepStrictEqual(relative, { pids: [], complete: false, incompleteReasons: ["helper_bad_arguments"] });
+    const other = await scan({ wrappers: [fakeHelper("exit3.cjs", summary({}), 3)] });
+    assert.deepStrictEqual(other, { pids: [], complete: false, incompleteReasons: ["helper_exit"] });
+  });
+
+  it("malformed helper output names its shape", async () => {
+    for (const [out, reason] of [
+      ["A\t4242\thome\n", "no_summary"],
+      ["H\t{not json\n", "malformed_summary"],
+      [`A\tx\thome\n${summary({})}`, "malformed_line"],
+      [`Z\t4242\thome\n${summary({})}`, "unknown_record"],
+    ] as const) {
+      const r = await scan({ wrappers: [fakeHelper("out.cjs", out)] });
+      consistent(r);
+      assert.strictEqual(r.complete, false, reason);
+      assert.deepStrictEqual(r.incompleteReasons, [reason], reason);
+    }
+  });
+
+  it("summary reasons: a flag with no explaining token falls back; a clean flag's token and unknown tokens are dropped", async () => {
+    const old = await scan({ wrappers: [fakeHelper("old.cjs", summary({ truncated: true, unresolved: 2, procMount: "hidden" }))] });
+    consistent(old);
+    assert.deepStrictEqual(old.incompleteReasons, ["truncated", "unresolved", "mount_unknown"], "an older helper with no why");
+    const stray = await scan({ wrappers: [fakeHelper("stray.cjs", `A\t4242\thome\n${summary({ why: ["pid_budget", "mount_hidden", "uid_missing"] })}`)] });
+    assert.deepStrictEqual(stray, { pids: [4242], complete: true, incompleteReasons: [] }, "tokens for clean flags never make a scan incomplete");
+    const foreign = await scan({ wrappers: [fakeHelper("foreign.cjs", summary({ truncated: true, why: ["/home/u/.ssh/id_rsa", "HOME=/x", 7, "pid_budget"] }))] });
+    assert.deepStrictEqual(foreign.incompleteReasons, ["pid_budget"], "only allowlisted tokens pass");
+    const onlyForeign = await scan({ wrappers: [fakeHelper("foreign2.cjs", summary({ unresolved: 1, why: ["secret text"] }))] });
+    assert.deepStrictEqual(onlyForeign.incompleteReasons, ["unresolved"], "an unexplained flag falls back");
+  });
+
+  it("a hostile helper summary with a huge why array neither throws nor drops what other passes found", async () => {
+    const clean = fakeHelper("clean.cjs", `K\t4242\thome\nA\t4343\tunreadable\n${summary({})}`);
+    const huge = fakeHelper("huge.cjs", summary({ truncated: true, why: Array.from({ length: 200_000 }, () => "pid_budget") }));
+    const r = await reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 1, wrappers: [clean, huge] });
+    consistent(r);
+    assert.deepStrictEqual(r, { killed: [4242], left: [4343], leftReasons: { 4343: "unreadable" }, complete: false, incompleteReasons: ["pid_budget"] });
+  });
+
+  it("reasons aggregate across passes in canonical order, and survive a later throw", async () => {
+    const exit7 = fakeHelper("e7.cjs", "", 7);
+    const budgetOut = fakeHelper("pb.cjs", summary({ truncated: true, why: ["pid_budget"] }));
+    const r = await scan({ wrappers: [exit7, budgetOut] });
+    consistent(r);
+    assert.deepStrictEqual(r.incompleteReasons, ["pid_budget", "proc_root_unreadable"]);
+
+    const throwing = { *[Symbol.iterator]() { yield exit7; throw new Error("boom"); } } as unknown as CommandWrapper[];
+    const thrown = await scan({ wrappers: throwing });
+    consistent(thrown);
+    assert.deepStrictEqual(thrown, { pids: [], complete: false, incompleteReasons: ["proc_root_unreadable", "scan_exception"] });
+    const thrownReap = await reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 1, wrappers: throwing });
+    assert.deepStrictEqual(thrownReap, { killed: [], left: [], leftReasons: {}, complete: false, incompleteReasons: ["proc_root_unreadable", "scan_exception"] });
+  });
+
+  it("a maintenance budget that runs out between passes reads maintenance_budget, keeping earlier reasons", async () => {
+    let now = 0;
+    const budget = new MaintenanceBudget(60_000, () => now);
+    const exit7 = fakeHelper("e7b.cjs", "", 7);
+    const expiring = { *[Symbol.iterator]() { yield exit7; now = 120_000; yield exit7; } } as unknown as CommandWrapper[];
+    const r = await MaintenanceBudget.run(budget, () => scan({ wrappers: expiring }));
+    consistent(r);
+    assert.deepStrictEqual(r, { pids: [], complete: false, incompleteReasons: ["proc_root_unreadable", "maintenance_budget"] });
+  });
+
+  it("helper rejections map by their exact fixed messages, never echoing the text", () => {
+    for (const [msg, reason] of [
+      ["agent-uid helper timed out (killed by SIGKILL)", "helper_timeout"],
+      ["agent-uid helper timed out (killed by a signal)", "helper_timeout"],
+      ["maintenance helper operation expired", "helper_timeout"],
+      ["maintenance helper timed out", "helper_timeout"],
+      ["agent-uid helper printed more than 1048576 bytes", "helper_output_overflow"],
+      ["agent-uid helper timed out or could not run", "helper_failed"],
+      ["agent-uid helper could not run or was not waited for (ENOENT)", "helper_failed"],
+      ["agent-uid helper ended by SIGTERM", "helper_failed"],
+      ["maintenance helper cancelled", "helper_failed"],
+      ["maintenance deadline exhausted", "helper_failed"],
+    ] as const) assert.strictEqual(helperRejectionReason(new Error(msg)), reason, msg);
+    assert.strictEqual(helperRejectionReason("not an error"), "helper_failed");
   });
 });

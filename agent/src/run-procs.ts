@@ -81,7 +81,10 @@ const MAX_SPAWNED = 64;
  * `worker_child`, `restarted` or `kill_failed`; see {@link LeftReason}), and the caller keeps only those four
  * values. When a pid appears under two uid passes (two wrappers) the last wrapper's class wins. Both modes end with ONE `H\t<json>` summary (`scanned`,
  * `truncated`: the pid or time budget ran out, `unresolved`: pids whose uid could not be read,
- * `procMount`). Exit 0; 6 on bad arguments; 7 when `<procRoot>` cannot be read.
+ * `procMount`, and `why`: fixed tokens naming which of those conditions fired, see
+ * {@link IncompleteReason}; diagnostics only, the three fields above still decide completeness).
+ * An unresolved token is recorded only where the listing counts the pid unresolved, never by the
+ * kill pass's re-verify. Exit 0; 6 on bad arguments; 7 when `<procRoot>` cannot be read.
  */
 const RUN_PROCS_SCRIPT = `
 const fs = require("node:fs");
@@ -105,6 +108,8 @@ const ENV_MAX = 4 * 1024 * 1024;
 const MAX_DEPTH = 64;
 const w = (line) => process.stdout.write(line + "\\n");
 const gone = (e) => e && (e.code === "ENOENT" || e.code === "ESRCH");
+// Fixed-vocabulary tokens naming which condition made this pass incomplete (diagnostics only).
+const causes = new Set();
 // Read at most max + 1 bytes; null when there are more than max.
 function readBounded(p, max) {
   const fd = fs.openSync(p, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
@@ -129,9 +134,10 @@ function procMount() {
   let text;
   try {
     const b = readBounded(root + "/self/mountinfo", ENV_MAX);
-    if (b === null) return "unknown";
+    if (b === null) { causes.add("mount_unreadable"); return "unknown"; }
     text = b.toString("latin1");
   } catch {
+    causes.add("mount_unreadable");
     return "unknown";
   }
   const unesc = (s) => s.replace(/\\\\([0-7]{3})/g, (_, o) => String.fromCharCode(parseInt(o, 8)));
@@ -139,22 +145,23 @@ function procMount() {
   for (const line of text.split("\\n")) {
     if (line === "") continue;
     const cut = line.indexOf(" - ");
-    if (cut < 0) return "unknown";
+    if (cut < 0) { causes.add("mount_malformed"); return "unknown"; }
     const lf = line.slice(0, cut).split(" ").filter((x) => x !== "");
     const rf = line.slice(cut + 3).split(" ").filter((x) => x !== "");
-    if (lf.length < 6 || rf.length < 3) return "unknown";
+    if (lf.length < 6 || rf.length < 3) { causes.add("mount_malformed"); return "unknown"; }
     if (unesc(lf[4]) !== root) continue;
     found = true;
-    if (rf[0] !== "proc") return "unknown";
+    if (rf[0] !== "proc") { causes.add("mount_not_proc"); return "unknown"; }
     for (const opts of [lf[5], rf[2]]) {
       for (const opt of opts.split(",")) {
         const eq = opt.indexOf("=");
         const k = eq < 0 ? opt : opt.slice(0, eq);
         const v = eq < 0 ? "" : opt.slice(eq + 1);
-        if ((k === "hidepid" && v !== "0" && v !== "off") || k === "subset") return "hidden";
+        if ((k === "hidepid" && v !== "0" && v !== "off") || k === "subset") { causes.add("mount_hidden"); return "hidden"; }
       }
     }
   }
+  if (!found) causes.add("mount_missing");
   return found ? "ok" : "unknown";
 }
 const exists = (pid) => { try { fs.lstatSync(root + "/" + pid); return true; } catch { return false; } };
@@ -173,23 +180,32 @@ function statOf(pid) {
     return undefined;
   }
 }
-// undefined: vanished, not this uid's, or a zombie. "unknown": its uid could not be read.
+// undefined: vanished, not this uid's, or a zombie. "unknown": its uid could not be read, and
+// unknownWhy names why (committed as a diagnostic only where the listing counts it unresolved).
+let unknownWhy = "unresolved";
 function info(pid) {
   let status, stat;
+  let reading = "status_read";
   try {
     status = readBounded(root + "/" + pid + "/status", 65536);
+    reading = "stat_read";
     stat = readBounded(root + "/" + pid + "/stat", 65536);
   } catch (e) {
-    return gone(e) || !exists(pid) ? undefined : "unknown";
+    if (gone(e) || !exists(pid)) return undefined;
+    unknownWhy = reading;
+    return "unknown";
   }
-  if (status === null || stat === null) return "unknown";
+  if (status === null) { unknownWhy = "status_oversize"; return "unknown"; }
+  if (stat === null) { unknownWhy = "stat_oversize"; return "unknown"; }
   const s = status.toString("latin1");
   const u = /^Uid:\\s+(\\d+)\\s+(\\d+)/m.exec(s);
-  if (!u) return "unknown";
+  if (!u) { unknownWhy = "uid_missing"; return "unknown"; }
   if (Number(u[1]) !== uid && Number(u[2]) !== uid) return undefined;
   const st = /^State:\\s+(\\S)/m.exec(s);
   if (st && (st[1] === "Z" || st[1] === "X" || st[1] === "x")) return undefined;
-  return parseStat(stat) ?? "unknown";
+  const parsed = parseStat(stat);
+  if (parsed === undefined) { unknownWhy = "stat_malformed"; return "unknown"; }
+  return parsed;
 }
 function hasHome(buf) {
   let i = 0;
@@ -239,7 +255,8 @@ function linked(pi) {
 let scanned = 0, truncated = false, unresolved = 0;
 const spend = () => {
   if (truncated) return false;
-  if (scanned >= maxPids || Date.now() > deadline) { truncated = true; return false; }
+  if (scanned >= maxPids) { truncated = true; causes.add("pid_budget"); return false; }
+  if (Date.now() > deadline) { truncated = true; causes.add("time_budget"); return false; }
   scanned++;
   return true;
 };
@@ -252,7 +269,7 @@ function round() {
   try {
     for (;;) {
       let e;
-      try { e = dir.readSync(); } catch { truncated = true; break; }
+      try { e = dir.readSync(); } catch { truncated = true; causes.add("dir_read"); break; }
       if (e === null) break;
       if (!/^[1-9][0-9]*$/.test(e.name)) continue;
       if (!spend()) break;
@@ -260,7 +277,7 @@ function round() {
       if (pid === self || pid === workerPid) continue;
       const pi = info(pid);
       if (pi === undefined) continue;
-      if (pi === "unknown") { unresolved++; continue; }
+      if (pi === "unknown") { unresolved++; causes.add(unknownWhy); continue; }
       const why = attribution(pid);
       if (why === "gone" || why === "none") continue;
       if (why === "unreadable") { unreadable.push([pid, why, pi]); continue; }
@@ -308,7 +325,7 @@ if (mode === "scan") {
   }
   for (const [pid, why] of left) w("A\\t" + pid + "\\t" + why);
 }
-w("H\\t" + JSON.stringify({ scanned, truncated, unresolved, procMount: mount }));
+w("H\\t" + JSON.stringify({ scanned, truncated, unresolved, procMount: mount, why: [...causes] }));
 `;
 
 /** Test seams for {@link scanRunProcesses} / {@link reapRunProcesses}. */
@@ -336,6 +353,11 @@ export interface RunProcessScan {
    *  the proc mount hides nothing. A scan that is not complete is "unknown", and unknown is not
    *  quiet. */
   complete: boolean;
+  /** issue #2953: which existing conditions made the scan incomplete (diagnostics only: never
+   *  authority, never a quiet point). Set by {@link scanRunProcesses}: `[]` exactly when
+   *  `complete`, otherwise deduplicated in {@link INCOMPLETE_REASONS} order. Absent from fakes
+   *  and callers' own fallback results. */
+  incompleteReasons?: IncompleteReason[];
 }
 
 /** What one reap did. */
@@ -347,6 +369,71 @@ export interface RunProcessReap {
    *  A pid the helper did not classify is simply missing from the map. */
   leftReasons?: Record<number, LeftReason>;
   complete: boolean;
+  /** As {@link RunProcessScan.incompleteReasons}, set by {@link reapRunProcesses}. */
+  incompleteReasons?: IncompleteReason[];
+}
+
+/**
+ * issue #2953: the fixed vocabulary naming why a scan or reap is incomplete, in canonical order.
+ * Helper summary (`why`): `pid_budget`, `time_budget`, `dir_read` (truncated); `status_read`,
+ * `stat_read`, `status_oversize`, `stat_oversize`, `uid_missing`, `stat_malformed` (a pid's uid
+ * unresolved); `mount_hidden`, `mount_unreadable`, `mount_malformed`, `mount_not_proc`,
+ * `mount_missing` (the proc mount). `truncated`, `unresolved`, `mount_unknown`: the summary flag
+ * was set but no token explained it (an older or foreign helper). Worker side: `helper_timeout`,
+ * `helper_output_overflow`, `helper_failed` (the helper rejected); `proc_root_unreadable` (exit 7),
+ * `helper_bad_arguments` (exit 6), `helper_exit` (any other exit: an uncaught helper throw, a
+ * failed setpriv/sudo wrapper and node's own fatal codes alike); `no_summary`,
+ * `malformed_summary`, `malformed_line`, `unknown_record` (its output); `maintenance_budget` (a
+ * throw while the maintenance budget's signal is aborted: it ran out or was cancelled),
+ * `scan_exception` (anything else that threw).
+ */
+export const INCOMPLETE_REASONS = [
+  "pid_budget", "time_budget", "dir_read", "truncated",
+  "status_read", "stat_read", "status_oversize", "stat_oversize", "uid_missing", "stat_malformed", "unresolved",
+  "mount_hidden", "mount_unreadable", "mount_malformed", "mount_not_proc", "mount_missing", "mount_unknown",
+  "helper_timeout", "helper_output_overflow", "helper_failed",
+  "proc_root_unreadable", "helper_bad_arguments", "helper_exit",
+  "no_summary", "malformed_summary", "malformed_line", "unknown_record",
+  "maintenance_budget", "scan_exception",
+] as const;
+
+export type IncompleteReason = (typeof INCOMPLETE_REASONS)[number];
+
+const TRUNCATION_TOKENS: ReadonlySet<string> = new Set(["pid_budget", "time_budget", "dir_read"]);
+const UNRESOLVED_TOKENS: ReadonlySet<string> = new Set(["status_read", "stat_read", "status_oversize", "stat_oversize", "uid_missing", "stat_malformed"]);
+const MOUNT_TOKENS: ReadonlySet<string> = new Set(["mount_hidden", "mount_unreadable", "mount_malformed", "mount_not_proc", "mount_missing"]);
+
+/** The reasons in canonical order, each once. */
+function orderedReasons(found: ReadonlySet<IncompleteReason>): IncompleteReason[] {
+  return INCOMPLETE_REASONS.filter((r) => found.has(r));
+}
+
+/** The helper summary's reasons: only allowlisted tokens whose own flag is set, plus the flag's
+ *  fallback when a set flag has none (so an incomplete summary always names a reason). */
+function summaryReasons(summary: { truncated?: unknown; unresolved?: unknown; procMount?: unknown; why?: unknown }): IncompleteReason[] {
+  // Deduplicated first: the helper's output is bounded only by the stdout cap, and a huge `why`
+  // must never throw here (that would drop what the passes already collected).
+  const tokens = Array.isArray(summary.why) ? [...new Set(summary.why.filter((t): t is string => typeof t === "string"))] : [];
+  const out: IncompleteReason[] = [];
+  const flag = (set: boolean, allowed: ReadonlySet<string>, fallback: IncompleteReason): void => {
+    if (!set) return;
+    const named = tokens.filter((t) => allowed.has(t)) as IncompleteReason[];
+    out.push(...(named.length > 0 ? named : [fallback]));
+  };
+  flag(summary.truncated !== false, TRUNCATION_TOKENS, "truncated");
+  flag(summary.unresolved !== 0, UNRESOLVED_TOKENS, "unresolved");
+  flag(summary.procMount !== "ok", MOUNT_TOKENS, "mount_unknown");
+  return out;
+}
+
+/** TEST ONLY export: which reason a runAgentHelper rejection is, by its exact fixed messages
+ *  (rmtree.ts helperFailure / runAgentHelper). Never echoes the error text itself. */
+export function helperRejectionReason(err: unknown): IncompleteReason {
+  const msg = err instanceof Error ? err.message : "";
+  if (msg.startsWith("agent-uid helper timed out (killed by ")) return "helper_timeout";
+  if (msg === "maintenance helper operation expired" || msg === "maintenance helper timed out") return "helper_timeout";
+  if (/^agent-uid helper printed more than \d+ bytes$/.test(msg)) return "helper_output_overflow";
+  return "helper_failed";
 }
 
 /** The survivor classes the kill pass emits: `unreadable` (attribution could not be read, or the
@@ -383,12 +470,18 @@ function isLeftReason(v: string | undefined): v is LeftReason {
   return v === "unreadable" || v === "worker_child" || v === "restarted" || v === "kill_failed";
 }
 
+/** The reason for a throw out of {@link passes}: the maintenance budget, or anything else. */
+function thrownReason(): IncompleteReason {
+  return MaintenanceBudget.current()?.signal.aborted ? "maintenance_budget" : "scan_exception";
+}
+
 async function passes(
   mode: "scan" | "kill",
   home: string,
   worktree: string | undefined,
   spawnedPids: readonly number[],
   opts: RunProcsOptions,
+  causes: Set<IncompleteReason>,
 ): Promise<{ attributed: number[]; killed: number[]; complete: boolean; reasons: Record<number, LeftReason> }> {
   const budget = MaintenanceBudget.current();
   const wrappers = opts.wrappers ?? [runnerCommand];
@@ -415,7 +508,8 @@ async function passes(
     try {
       result = await runAgentHelper(wrap, RUN_PROCS_SCRIPT, args, duration + HELPER_SLACK_MS);
       budget?.check();
-    } catch {
+    } catch (err) {
+      causes.add(helperRejectionReason(err));
       budget?.check();
       complete = false;
       continue;
@@ -423,21 +517,25 @@ async function passes(
     const lines = result.stdout.split("\n").filter((l) => l !== "");
     const last = lines.pop();
     if (result.code !== 0 || !last?.startsWith("H\t")) {
+      causes.add(result.code === 7 ? "proc_root_unreadable" : result.code === 6 ? "helper_bad_arguments" : result.code !== 0 ? "helper_exit" : "no_summary");
       complete = false;
       continue;
     }
-    let summary: { truncated?: unknown; unresolved?: unknown; procMount?: unknown };
+    let summary: { truncated?: unknown; unresolved?: unknown; procMount?: unknown; why?: unknown };
     try {
       summary = JSON.parse(last.slice(2)) as typeof summary;
     } catch {
+      causes.add("malformed_summary");
       complete = false;
       continue;
     }
     if (summary.truncated !== false || summary.unresolved !== 0 || summary.procMount !== "ok") complete = false;
+    for (const r of summaryReasons(summary)) causes.add(r);
     for (const line of lines) {
       const f = line.split("\t");
       const pid = Number(f[1]);
       if (f.length !== 3 || !Number.isSafeInteger(pid) || pid <= 0) {
+        causes.add("malformed_line");
         complete = false;
         continue;
       }
@@ -446,7 +544,10 @@ async function passes(
         if (mode === "kill" && isLeftReason(f[2])) reasons[pid] = f[2];
       }
       else if (f[0] === "K") killed.add(pid);
-      else complete = false;
+      else {
+        causes.add("unknown_record");
+        complete = false;
+      }
     }
   }
   return { attributed: [...attributed], killed: [...killed], complete, reasons };
@@ -465,11 +566,13 @@ export async function scanRunProcesses(
   spawnedPids: readonly number[] = [],
   opts: RunProcsOptions = {},
 ): Promise<RunProcessScan> {
+  const causes = new Set<IncompleteReason>();
   try {
-    const r = await passes("scan", home, worktree, spawnedPids, opts);
-    return { pids: r.attributed, complete: r.complete };
+    const r = await passes("scan", home, worktree, spawnedPids, opts, causes);
+    return { pids: r.attributed, complete: r.complete, incompleteReasons: orderedReasons(causes) };
   } catch {
-    return { pids: [], complete: false };
+    causes.add(thrownReason());
+    return { pids: [], complete: false, incompleteReasons: orderedReasons(causes) };
   }
 }
 
@@ -486,10 +589,12 @@ export async function reapRunProcesses(
   spawnedPids: readonly number[] = [],
   opts: RunProcsOptions = {},
 ): Promise<RunProcessReap> {
+  const causes = new Set<IncompleteReason>();
   try {
-    const r = await passes("kill", home, worktree, spawnedPids, opts);
-    return { killed: r.killed, left: r.attributed, leftReasons: r.reasons, complete: r.complete };
+    const r = await passes("kill", home, worktree, spawnedPids, opts, causes);
+    return { killed: r.killed, left: r.attributed, leftReasons: r.reasons, complete: r.complete, incompleteReasons: orderedReasons(causes) };
   } catch {
-    return { killed: [], left: [], leftReasons: {}, complete: false };
+    causes.add(thrownReason());
+    return { killed: [], left: [], leftReasons: {}, complete: false, incompleteReasons: orderedReasons(causes) };
   }
 }
