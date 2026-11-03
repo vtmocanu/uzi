@@ -230,6 +230,10 @@ for (const move of ["unchanged", "foreign", "same-generation"] as const) {
       const terminal = api.states.find(s => s.runId === claim.run_id && s.body.status === "failed")?.body;
       assert.ok(terminal);
       assert.match(terminal.failure_reason ?? "", /tracking preservation refused/);
+      assert.deepEqual(api.messages(claim.run_id)
+        .map(m => (m.payload as { text?: string }).text ?? "")
+        .filter(text => text.startsWith("tracking preservation refused (reason=")),
+      ["tracking preservation refused (reason=ownership_unknown); inspect retained-work status with uzi run recovery."]);
       assert.equal(terminal.branch_moved, undefined);
       assert.equal(cmd(remote, "rev-parse", branch), P);
       assert.equal(api.states.some(s => s.body.status === "completed"), false);
