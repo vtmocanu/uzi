@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -92,6 +93,10 @@ func (f templatePinsLive) exec(t *testing.T, sql string, args ...any) {
 // existing handler LiveDB tests; production HTTP handlers and transactions run.
 func (f templatePinsLive) call(ctx context.Context, actor *store.User, method string, id uuid.UUID, body any, reset bool) *httptest.ResponseRecorder {
 	raw, _ := json.Marshal(body)
+	return f.callReader(ctx, actor, method, id, strings.NewReader(string(raw)), reset)
+}
+
+func (f templatePinsLive) callReader(ctx context.Context, actor *store.User, method string, id uuid.UUID, body io.Reader, reset bool) *httptest.ResponseRecorder {
 	path := "/agent-templates"
 	if id != uuid.Nil {
 		path += "/" + id.String()
@@ -99,7 +104,7 @@ func (f templatePinsLive) call(ctx context.Context, actor *store.User, method st
 	if reset {
 		path += "/reset"
 	}
-	req := httptest.NewRequest(method, path, strings.NewReader(string(raw))).WithContext(ctx)
+	req := httptest.NewRequest(method, path, body).WithContext(ctx)
 	req.Header.Set("Content-Type", "application/json")
 	if actor != nil {
 		req = req.WithContext(mw.ContextWithUser(req.Context(), *actor))
@@ -304,6 +309,112 @@ func TestAgentTemplatePinsBuiltinLifecycleLiveDB(t *testing.T) {
 	})
 	if err != nil || n != 1 {
 		t.Fatalf("Reset did not restore pristine refresh: rows=%d: %v", n, err)
+	}
+}
+
+// The fixture pool is isolated and all requests in this test are synchronous,
+// so an acquired connection during Read belongs to the handler under test.
+type templatePinsBodyReader struct {
+	t     *testing.T
+	pool  *pgxpool.Pool
+	body  io.Reader
+	reads int
+}
+
+func (r *templatePinsBodyReader) Read(p []byte) (int, error) {
+	r.t.Helper()
+	r.reads++
+	if acquired := r.pool.Stat().AcquiredConns(); acquired != 0 {
+		r.t.Errorf("UpdateAgentTemplate held %d database connections during body Read; want 0", acquired)
+	}
+	return r.body.Read(p)
+}
+
+func TestAgentTemplatePinsBodyReadBeforeTransactionLiveDB(t *testing.T) {
+	f := newTemplatePinsLive(t)
+	owner := store.User{ID: uuid.New(), IsActive: true}
+	other := store.User{ID: uuid.New(), IsActive: true}
+	for _, user := range []store.User{owner, other} {
+		f.exec(t, "INSERT INTO users (id,email,password_hash,is_admin) VALUES ($1,$2,'x',false)", user.ID, user.ID.String()+"@example.test")
+	}
+	body := map[string]any{
+		"name": "body-read-" + uuid.NewString(), "scope": "user",
+		"description": "before", "prompt_body": "fixture body\n",
+		"model": "opus", "codex_model": "gpt-6-luna",
+	}
+	dto := templatePinsResponse(t, f.call(f.ctx, &owner, http.MethodPost, uuid.Nil, body, false), http.StatusCreated)
+	id := uuid.MustParse(dto.ID)
+	// Establish customized=true through the real update path before checking
+	// that an update omitting the Codex pin retains both pieces of state.
+	templatePinsResponse(t, f.call(f.ctx, &owner, http.MethodPut, id, body, false), http.StatusOK)
+	f.checkRow(t, id, "opus", "gpt-6-luna", true, "")
+	delete(body, "codex_model")
+	body["description"] = "after"
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &templatePinsBodyReader{t: t, pool: f.pool, body: strings.NewReader(string(raw))}
+	dto = templatePinsResponse(t, f.callReader(f.ctx, &owner, http.MethodPut, id, reader, false), http.StatusOK)
+	if reader.reads == 0 {
+		t.Fatal("PUT did not exercise the body reader")
+	}
+	if dto.Description != "after" {
+		t.Fatalf("description=%q want after", dto.Description)
+	}
+	templatePinsCheckDTO(t, dto, "opus", "gpt-6-luna")
+	f.checkRow(t, id, "opus", "gpt-6-luna", true, "")
+
+	body["name"] = "body-read-global-" + uuid.NewString()
+	body["scope"] = "global"
+	global := templatePinsResponse(t, f.call(f.ctx, &f.admin, http.MethodPost, uuid.Nil, body, false), http.StatusCreated)
+	globalID := uuid.MustParse(global.ID)
+	missingID := uuid.New()
+	for _, tc := range []struct {
+		name   string
+		actor  *store.User
+		id     uuid.UUID
+		status int
+	}{
+		{"authorized", &owner, id, http.StatusBadRequest},
+		{"forbidden-global", &owner, globalID, http.StatusForbidden},
+		{"forbidden-admin-private", &f.admin, id, http.StatusForbidden},
+		{"hidden-private", &other, id, http.StatusNotFound},
+		{"missing", &owner, missingID, http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := make([]store.AgentTemplate, 0, 2)
+			for _, existingID := range []uuid.UUID{id, globalID} {
+				row, err := f.h.q.GetAgentTemplate(f.ctx, existingID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				before = append(before, row)
+			}
+			malformed := &templatePinsBodyReader{
+				t: t, pool: f.pool,
+				body: strings.NewReader(`{"description":"must not persist","codex_model":"gpt-6-sol","prompt_body":`),
+			}
+			out := f.callReader(f.ctx, tc.actor, http.MethodPut, tc.id, malformed, false)
+			if malformed.reads == 0 {
+				t.Fatal("malformed PUT did not exercise the body reader")
+			}
+			if out.Code != tc.status {
+				t.Fatalf("malformed PUT: HTTP %d want %d: %s", out.Code, tc.status, out.Body.String())
+			}
+			if tc.status != http.StatusBadRequest && strings.Contains(out.Body.String(), "invalid request body") {
+				t.Fatalf("decode error revealed before authorization: %s", out.Body.String())
+			}
+			for _, row := range before {
+				after, err := f.h.q.GetAgentTemplate(f.ctx, row.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(row, after) {
+					t.Fatal("malformed PUT caused a partial row update")
+				}
+			}
+		})
 	}
 }
 

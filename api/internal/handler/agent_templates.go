@@ -538,6 +538,10 @@ func (h *Handler) UpdateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Read the bounded body before acquiring a connection, but reveal decode
+	// errors only after the locked row lookup and write authorization.
+	var req templateWriteRequest
+	decodeErr := httpx.DecodeJSON(r, &req)
 	ctx := r.Context()
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
@@ -561,8 +565,7 @@ func (h *Handler) UpdateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, status, templateWriteDenyMessage(status))
 		return
 	}
-	var req templateWriteRequest
-	if err := httpx.DecodeJSON(r, &req); err != nil {
+	if decodeErr != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
