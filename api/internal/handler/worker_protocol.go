@@ -7,7 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
+	"os"
 	"regexp"
 	"slices"
 	"strconv"
@@ -2442,20 +2444,35 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 		}
 		claimGeneration = &generation
 	}
+	svc := h.checkpointPublisher()
+	if svc == nil {
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	// The listener's base timeouts are too short for a pack upload plus a forge push, so this
+	// route extends its own deadlines (see publishUploadBudget in worker_publish_deadline.go).
+	start := time.Now()
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(start.Add(publishUploadBudget))
+	_ = rc.SetWriteDeadline(start.Add(publishUploadBudget + publishServiceBudget + publishResponseGrace))
 	// Raw octet-stream body, NOT JSON: httpx.DecodeJSON is JSON+1 MiB only. Cap with
 	// MaxBytesReader so an over-cap pack is a truthful 413 (a split/too-large signal),
 	// not a silently truncated — and thus malformed — pack.
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxPackBytes))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
+		var netErr net.Error
+		switch {
+		case errors.As(err, &tooLarge):
 			httpx.Error(w, http.StatusRequestEntityTooLarge, "checkpoint pack too large")
-			return
+		case errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()):
+			httpx.Error(w, http.StatusRequestTimeout, "checkpoint pack upload timed out")
+		default:
+			httpx.Error(w, http.StatusBadRequest, "could not read checkpoint pack")
 		}
-		httpx.Error(w, http.StatusBadRequest, "could not read checkpoint pack")
 		return
 	}
-	res, err := h.wsvc.PublishAttested(r.Context(), wkr, runID, tip, attestedSource, body, claimGeneration)
+	res, err := runPublishWithDeadline(r.Context(), svc, wkr, runID, tip, attestedSource, body, claimGeneration)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrMissingClaimGeneration) || errors.Is(err, workersvc.ErrStaleClaim) {
 			httpx.ErrorReason(w, http.StatusConflict, "checkpoint publish claim is stale", "stale_claim")

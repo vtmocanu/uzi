@@ -33,6 +33,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/handler"
 	"github.com/vtmocanu/uzi/api/internal/healthsvc"
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
+	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/hub"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
@@ -1523,8 +1524,8 @@ func run() error {
 		Addr:              cfg.Addr,
 		Handler:           routes,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
+		ReadTimeout:       httpx.ServerReadTimeout,
+		WriteTimeout:      httpx.ServerWriteTimeout,
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -1559,8 +1560,8 @@ func run() error {
 			Handler:           stripXFF(h.WorkerRoutes(proposalLimiter)),
 			TLSConfig:         reloader.ServerConfig(),
 			ReadHeaderTimeout: 10 * time.Second,
-			ReadTimeout:       15 * time.Second,
-			WriteTimeout:      15 * time.Second,
+			ReadTimeout:       httpx.ServerReadTimeout,
+			WriteTimeout:      httpx.ServerWriteTimeout,
 			IdleTimeout:       60 * time.Second,
 		}
 	}
@@ -1614,11 +1615,13 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	// CONCURRENTLY, against the shared deadline — not one after the other. Draining
-	// them in sequence lets the plain listener consume the whole budget (WriteTimeout
-	// is 15s, LONGER than the 10s here), leaving tlsSrv.Shutdown an already-expired
+	// them in sequence lets the plain listener consume the whole budget (the base
+	// WriteTimeout, httpx.ServerWriteTimeout, is 15s, LONGER than the 10s here), leaving tlsSrv.Shutdown an already-expired
 	// context: it would close the listener and return WITHOUT draining in-flight TLS
 	// requests, and the deferred pool.Close() would then race an in-flight worker
-	// claim. Each server gets the full 10s this way, which is what the budget meant.
+	// claim. Each server gets the full 10s this way, which is what the budget meant. The 10s drain
+	// does not wait out a long /publish or held publication, which extend their own write
+	// deadlines past it: such a request is cut at the drain deadline, as before.
 	var drainWG sync.WaitGroup
 	var drainMu sync.Mutex
 	drain := func(s *http.Server) {

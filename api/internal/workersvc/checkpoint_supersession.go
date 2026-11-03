@@ -82,6 +82,12 @@ func (s *Service) claimCheckpointSlot(ctx context.Context, run store.Run, branch
 		if r.NextAttemptAt.Valid && r.NextAttemptAt.Time.After(now) {
 			return "not_descendant"
 		}
+		// Stops LATER iterations once cancellation is observed (the handler's service
+		// deadline). It is not an atomic guarantee that cancellation cannot race entry into
+		// one detached operation: that one operation remains part of the bounded cleanup tail.
+		if ctx.Err() != nil {
+			return "not_descendant"
+		}
 		freed, acquired, err := s.supersedeRetainedCheckpoint(ctx, r.RunID)
 		if err != nil {
 			slog.Warn("checkpoint retention: supersede", "run", r.RunID, "for_run", run.ID, "error", secretscrub.Scrub(err.Error()))
@@ -118,6 +124,11 @@ func (s *Service) freeCheckpointSlot(ctx context.Context, run store.Run, branch 
 		return false
 	}
 	for _, r := range rows {
+		// Same guard as claimCheckpointSlot: it stops later iterations once cancellation is
+		// observed, and does not make entry into one detached operation atomic with it.
+		if ctx.Err() != nil {
+			return false
+		}
 		freed, acquired, err := s.supersedeRetainedCheckpoint(ctx, r.RunID)
 		if err != nil {
 			slog.Warn("checkpoint retention: supersede", "run", r.RunID, "for_run", run.ID, "error", secretscrub.Scrub(err.Error()))

@@ -130,7 +130,8 @@ type Handler struct {
 	productSkillsSyncing atomic.Bool
 	svc                  *forgesvc.Service
 	wsvc                 *workersvc.Service
-	heldSvc              heldPublisher // test seam for WorkerRunHeldPublication; nil = wsvc
+	heldSvc              heldPublisher       // test seam for WorkerRunHeldPublication; nil = wsvc
+	publishSvc           checkpointPublisher // test seam for WorkerRunPublish; nil = wsvc
 	// pcheck runs the PAT least-privilege checks (PRD #5): the save-time token
 	// gate and the on-demand full connection check.
 	pcheck *privcheck.Service

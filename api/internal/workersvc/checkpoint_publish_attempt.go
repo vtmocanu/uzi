@@ -86,6 +86,16 @@ const (
 // to uint).
 const _ = uint(checkpointSupersessionCooling - livePublishPrePushBudget - pushbroker.MaxPublishDuration - supersessionCoolingSlack - 1)
 
+// PublishServiceBudget is the one deadline the handler gives a brokered checkpoint publish's
+// service work (WorkerRunPublish): the live pre-push budget, plus the broker's own push ceiling
+// (pushbroker.MaxPublishDuration), plus a 10 s margin for the bookkeeping around them. The
+// handler's write deadline is sized from it.
+const PublishServiceBudget = livePublishPrePushBudget + pushbroker.MaxPublishDuration + 10*time.Second
+
+// Compile-time: PublishServiceBudget > pushbroker.MaxPublishDuration (a negative constant does
+// not convert to uint).
+const _ = uint(PublishServiceBudget - pushbroker.MaxPublishDuration - 1)
+
 // errPushRefused is a push Publish refused to send (the live pre-push budget elapsed, or the
 // attempt record or the push's compare-and-set base could not be written or read). Publish answers it with the benign not_descendant skip:
 // no forge call was made, and the worker retries on its next tick.

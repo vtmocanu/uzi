@@ -218,10 +218,11 @@ const maxCreateRefDuration = 30 * time.Second
 
 // maxPublishDuration is a hard wall-clock ceiling on ONE brokered publish — the
 // untrusted-pack budget scan (single-core zlib inflation), the origin fetch, and the
-// non-forced push combined. /publish carries no request timeout of its own, and a
-// worst-case pack can force tens of seconds of otherwise-uncancellable CPU; this
-// makes any one publish cancellable and time-bounded regardless of pack contents or
-// a slow forge. Generous for a legitimate checkpoint push, tight enough that a single
+// non-forced push combined. The listener's base timeouts apply to /publish, which extends
+// them per route (the handler's publishServiceBudget); a worst-case pack can force tens
+// of seconds of otherwise-uncancellable CPU, and this ceiling keeps any one publish
+// cancellable and time-bounded regardless of pack contents, a slow forge or that
+// extension. Generous for a legitimate checkpoint push, tight enough that a single
 // request can never run unbounded.
 const maxPublishDuration = 60 * time.Second
 
