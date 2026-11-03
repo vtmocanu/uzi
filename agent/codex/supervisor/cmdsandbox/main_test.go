@@ -481,7 +481,7 @@ func TestAddFdRuleUsesTheFd(t *testing.T) {
 	if avail != landlockAvailable {
 		t.Skip("Landlock is not available on this kernel")
 	}
-	attr := unix.LandlockRulesetAttr{Access_fs: baseRights}
+	attr := unix.LandlockRulesetAttr{Handled_access_fs: baseRights}
 	rs, _, errno := syscall.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET, uintptr(unsafe.Pointer(&attr)), unsafe.Sizeof(attr), 0)
 	if errno != 0 {
 		t.Fatalf("create ruleset: %v", errno)
