@@ -1640,7 +1640,7 @@ export class WorkerClient {
     }
     const reason = typeof parsed.reason === "string" ? parsed.reason
       : typeof parsed.error === "string" && /^publication_[a-z_]+$/.test(parsed.error) ? parsed.error : "";
-    if (res.status === 409 && parsed.disposition === "stale_claim") return { kind: "refused", status: 409, reason: "stale_claim" };
+    if (res.status === 409 && parsed.disposition === "stale_claim") return { kind: "refused", status: 409, reason: "stale_claim", disposition: "stale_claim" };
     // The api's 503 for a disabled feature is a definite refusal; any other 5xx, and 429, may be transient.
     if (res.status === 503 && reason === "publication_resume_disabled") return { kind: "refused", status: 503, reason };
     if (res.status >= 500 || res.status === 429) return { kind: "unknown", detail: `http ${res.status}` };
