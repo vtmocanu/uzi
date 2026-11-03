@@ -36,7 +36,7 @@ Capacity and held work (#3880), usage (#3881), the command menu (#3875). No new 
 - **`issueLineStage(run)`** (pure, `web/src/lib`): one of `queued`, `planning`, `review`, `building`, `asking`, `parked`, `other`, `pr` or `none`. Rules, in order:
   - terminal (`completed`, `failed`, `cancelled`): `pr` when #3878's `openPrs` includes it (the viewer's own completed issue run with an open PR); otherwise `none`. This comes first, so finished jobs, tasks and self-improve runs never inflate Other work.
   - `kind` other than `issue` → `other` (only the listed kinds reach here, brief Run populations; this includes `ci_fix` and `mr_rework`, brief D21).
-  - an account cooldown (`isAccountCooldownWaiting`, `web/src/lib/runBadge.ts:533`) → `parked`. It comes before the rules below because a cooldown run can be `claimed` or `awaiting_approval`.
+  - an account cooldown (`isAccountCooldownWaiting`, `web/src/lib/runBadge.ts:533`) → `parked`. It comes before the rules below because a cooldown run can be `claimed`, `running` or `awaiting_approval`; today's Overview also counts it as waiting, not executing.
   - `queued`, `claimed` → `queued`.
   - effective planning (`is_planning`), or `awaiting_approval` with `is_revising` → `planning`.
   - `awaiting_approval` → `review`.
