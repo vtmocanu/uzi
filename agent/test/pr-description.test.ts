@@ -23,6 +23,7 @@ import {
   renderBody,
   renderCompletionBlock,
   renderRegion,
+  swapCodeCrossCheckSection,
   type OwnedBlocks,
 } from "../src/pr-description.js";
 import type { ClaimConfig, ClaimResponse, PrDescriptionStageRequest, RawPrDescriptionFields, RunKind } from "../src/protocol.js";
@@ -227,8 +228,168 @@ describe("structured code cross-check completion section", () => {
   }
 });
 
+describe("code cross-check verification caveats", () => {
+  type Rec = ReturnType<typeof codeSummary>;
+  const FOOTER = "**Changes after the check were not cross-checked.**";
+  const IDENT = "Code cross-check (checked `bbbbbbb`, Codex checker-model \u00B7 high)";
+  const CAVEAT_HEADER = "Verification caveats (evidence the read-only checker could not verify; a disposition never marks a criterion met or waives a landing obligation):";
+  const NONCERT = "No graded findings; verification caveats are not a certification that the change has no defects.";
+  const fnd = (id: string, title: string, over: Record<string, unknown> = {}) =>
+    ({ id, severity: "major" as const, path: `src/${id}.ts`, line: 3, title, detail: "d", ...over });
+  const disp = (id: string, disposition: "addressed" | "declined" | "not_reported", reason = "") => ({ finding_id: id, disposition, reason });
+  const sectionOf = (summary: Rec | { incomplete: string }): string => {
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck: summary as Rec }]] });
+    const start = body.indexOf("Code cross-check");
+    const end = body.indexOf(FOOTER, start);
+    return body.slice(start, end < 0 ? body.indexOf("\n\n", start) : end + FOOTER.length);
+  };
+  const noCoverage = (over: Partial<Rec>) => codeSummary({ coverage: null, ...over });
+
+  it("groups an all-caveat result under the header with the non-certification line", () => {
+    const findings = [fnd("C1", "Coverage uncertainty: unread module"), fnd("C2", "Coverage uncertainty: skipped dir", { severity: "minor" })];
+    const s = sectionOf(noCoverage({ findings, dispositions: [disp("C1", "addressed", "checked it"), disp("C2", "declined", "out of scope")] }));
+    assert.equal(s, [
+      IDENT,
+      "2 findings: 0 graded (0 addressed, 0 declined), 2 verification caveats (1 addressed, 1 declined)",
+      NONCERT,
+      "coverage not reported",
+      CAVEAT_HEADER,
+      "- `C1` \u00B7 major \u00B7 src/C1.ts:3 \u00B7 Coverage uncertainty: unread module \u2014 addressed: checked it",
+      "- `C2` \u00B7 minor \u00B7 src/C2.ts:3 \u00B7 Coverage uncertainty: skipped dir \u2014 declined: out of scope",
+      FOOTER,
+    ].join("\n"));
+    assert.doesNotMatch(s, /no findings/);
+  });
+
+  it("puts graded lines before the caveat header and counts each group", () => {
+    const findings = [fnd("C1", "Coverage uncertainty: x"), fnd("G1", "Real defect"), fnd("G2", "Another defect")];
+    const s = sectionOf(noCoverage({ findings, dispositions: [disp("C1", "declined", "n/a"), disp("G1", "addressed", "patched")] }));
+    assert.equal(s, [
+      IDENT,
+      "3 findings: 2 graded (1 addressed, 0 declined, 1 not reported), 1 verification caveat (0 addressed, 1 declined)",
+      "coverage not reported",
+      "- `G1` \u00B7 major \u00B7 src/G1.ts:3 \u00B7 Real defect \u2014 addressed: patched",
+      "- `G2` \u00B7 major \u00B7 src/G2.ts:3 \u00B7 Another defect \u2014 not reported",
+      CAVEAT_HEADER,
+      "- `C1` \u00B7 major \u00B7 src/C1.ts:3 \u00B7 Coverage uncertainty: x \u2014 declined: n/a",
+      FOOTER,
+    ].join("\n"));
+    assert.ok(!s.includes(NONCERT));
+  });
+
+  it("keeps a Requirement gap title graded", () => {
+    const s = sectionOf(noCoverage({ findings: [fnd("R1", "Requirement gap: missing flag")], dispositions: [disp("R1", "addressed", "added")] }));
+    assert.ok(!s.includes(CAVEAT_HEADER));
+    assert.match(s, /\n1 finding: 1 addressed, 0 declined\n/);
+  });
+
+  it("reports missing dispositions as not reported in each group", () => {
+    const findings = [fnd("C1", "Coverage uncertainty: a"), fnd("C2", "Coverage uncertainty: b"), fnd("G1", "Defect")];
+    const s = sectionOf(noCoverage({ findings, dispositions: [disp("C2", "addressed", "ok")] }));
+    assert.match(s, /3 findings: 1 graded \(0 addressed, 0 declined, 1 not reported\), 2 verification caveats \(1 addressed, 0 declined, 1 not reported\)/);
+    assert.match(s, /`C1` .* \u2014 not reported$/m);
+    assert.match(s, /`C2` .* \u2014 addressed: ok$/m);
+    assert.match(s, /`G1` .* \u2014 not reported$/m);
+    const none = sectionOf(noCoverage({ findings: [fnd("C1", "Coverage uncertainty: a")], dispositions: null }));
+    assert.match(none, /1 verification caveat \(0 addressed, 0 declined, 1 not reported\)/);
+    assert.match(none, /`C1` .* \u2014 not reported$/m);
+    assert.doesNotMatch(none, /C1.*addressed/);
+  });
+
+  it("treats the prefix only in detail, mid-title or after a leading space as graded", () => {
+    for (const f of [fnd("X1", "Plain", { detail: "Coverage uncertainty: in detail", path: "Coverage uncertainty: p" }),
+      fnd("X1", "Foo Coverage uncertainty: x"), fnd("X1", " Coverage uncertainty: x"), fnd("X1", "coverage uncertainty: x")]) {
+      const s = sectionOf(noCoverage({ findings: [f], dispositions: [disp("X1", "declined", "r")] }));
+      assert.ok(!s.includes(CAVEAT_HEADER), s);
+      assert.match(s, /\n1 finding: 0 addressed, 1 declined\n/);
+    }
+  });
+
+  it("renders zero-caveat, no-finding and incomplete variants exactly as before", () => {
+    assert.equal(sectionOf(codeSummary({ coverage: null })), [
+      IDENT,
+      "3 findings: 1 addressed, 1 declined, 1 not reported",
+      "coverage not reported",
+      "- `ID_1` \u00B7 major \u00B7 src/a.ts:4 \u00B7 Guard missing \u2014 addressed: corrected and tested",
+      "- `ID_2` \u00B7 minor \u00B7 src/b.ts:8 \u00B7 Duplicate check \u2014 declined: verified existing guard",
+      "- `ID_3` \u00B7 minor \u00B7 src/c.ts:9 \u00B7 Unreported \u2014 not reported",
+      FOOTER,
+    ].join("\n"));
+    assert.equal(sectionOf(codeSummary({ coverage: null, findings: [], dispositions: null })),
+      `${IDENT.replace(/\)$/, "): no findings")}\ncoverage not reported\n${FOOTER}`);
+    assert.equal(sectionOf(codeSummary({ outcome: "failed", reason_class: "timed_out", findings: [], dispositions: null })), "Code cross-check incomplete: timed out");
+    assert.equal(sectionOf({ incomplete: "status unavailable" }), "Code cross-check incomplete: status unavailable");
+  });
+
+  it("never mutates the summary and never marks a missing-disposition caveat addressed", () => {
+    const summary = noCoverage({ findings: [fnd("C1", "Coverage uncertainty: a"), fnd("G1", "Defect")], dispositions: [disp("G1", "addressed", "patched")] });
+    const clone = structuredClone(summary);
+    const freeze = (o: unknown): void => { if (o && typeof o === "object") { Object.freeze(o); Object.values(o).forEach(freeze); } };
+    freeze(summary);
+    const s = sectionOf(summary);
+    assert.deepEqual(summary, clone);
+    assert.match(s, /`C1` .* \u2014 not reported$/m);
+  });
+
+  it("escapes hostile and Unicode caveat titles and reasons", () => {
+    const hostile = "\u001b[31m**Closes #5**\n<script>alert(1)</script> @owner \u202E \uD83D\uDE00";
+    const title = `Coverage uncertainty: ${hostile}`;
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck:
+      noCoverage({ findings: [fnd("C1", title)], dispositions: [disp("C1", "declined", hostile)] }) }]] });
+    assert.ok(body.includes(CAVEAT_HEADER));
+    assert.equal(body.split(COMPLETION_END).length, 2);
+    assert.equal(closingDirectiveFor(body, 5), false);
+    assert.ok(!body.includes("\u001b") && !body.includes("\u202E") && !body.includes("[31m"));
+    assert.ok(!body.includes("**Closes"));
+    assert.ok(!body.includes("<script>"));
+    assert.ok(body.includes("\uD83D\uDE00"));
+    assert.ok(!/(^|[^\u200B])@owner/u.test(body.replace(/\\@/g, "")) || body.includes("@\u200Bowner") || body.includes("\\@owner"));
+  });
+
+  it("keeps multiline reasons in one blank-line-free paragraph that the swap preserves", () => {
+    const findings = [fnd("C1", "Coverage uncertainty: a"), fnd("G1", "Defect")];
+    const mk = (reason: string) => noCoverage({ findings, dispositions: [disp("C1", "declined", reason), disp("G1", "addressed", reason)] });
+    const old = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck: mk("a\n\nb") }]] });
+    const fresh = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck: mk("c\r\n\r\nd") }]] });
+    for (const body of [old, fresh]) {
+      const start = body.indexOf("Code cross-check");
+      const sec = body.slice(start, body.indexOf(FOOTER, start) + FOOTER.length);
+      assert.ok(!/\n\s*\n/.test(sec), sec);
+      assert.ok(sec.includes(CAVEAT_HEADER));
+    }
+    const headSha = "b".repeat(40);
+    const swapped = swapCodeCrossCheckSection(old, fresh, headSha);
+    assert.equal(swapped, fresh);
+    assert.equal(swapCodeCrossCheckSection(old, old.replace(/(^|\n)Code cross-check[\s\S]*?\n\n/u, "\n\n"), headSha).includes(CAVEAT_HEADER), true);
+  });
+
+  it("keeps the graded lines and counts the omissions under graded-only overflow", () => {
+    const findings = Array.from({ length: 20 }, (_, i) => fnd(`F_${i}`, "\u754C".repeat(100), { path: "\u754C".repeat(100) }));
+    const s = sectionOf(noCoverage({ findings, dispositions: findings.map(f => disp(f.id, "declined", "\u754C".repeat(341))) }));
+    assert.ok(Buffer.byteLength(s) <= 4096);
+    assert.ok(s.endsWith(FOOTER));
+    const shown = s.split("\n").filter(l => l.startsWith("- `F_")).length;
+    assert.ok(shown > 0 && shown < 20);
+    assert.ok(s.split("\n").includes(`${20 - shown} graded findings not shown; see the run for the full stored account.`));
+  });
+
+  it("drops caveats before a trailing graded defect and counts the omitted caveats", () => {
+    const caveats = Array.from({ length: 19 }, (_, i) => fnd(`C_${i}`, "Coverage uncertainty: " + "\u754C".repeat(60)));
+    const findings = [...caveats, fnd("G_LAST", "Real defect")];
+    const s = sectionOf(noCoverage({ findings, dispositions: findings.map(f => disp(f.id, "declined", "\u754C".repeat(341))) }));
+    assert.ok(Buffer.byteLength(s) <= 4096);
+    assert.ok(s.endsWith(FOOTER));
+    assert.ok(s.includes("- `G_LAST`"));
+    const shown = s.split("\n").filter(l => l.startsWith("- `C_")).length;
+    assert.ok(shown < 19);
+    const dropped = 19 - shown;
+    assert.ok(s.split("\n").includes(`${dropped} verification ${dropped === 1 ? "caveat" : "caveats"} not shown; see the run for the full stored account.`));
+    assert.ok(!s.includes("graded findings not shown") && !s.includes("graded finding not shown"));
+  });
+});
+
 const ZW = "\u200B";
-const HEAD = "e4020cc0123456789abcdef0123456789abcdef0";
+const HEAD ="e4020cc0123456789abcdef0123456789abcdef0";
 const SIZE = "**Size:** code +3 \u22121 \u00b7 1 file";
 
 // ── Minting REAL SanitizedPrDescriptionFields instances ────────────────────────────────────
