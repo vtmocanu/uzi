@@ -1126,6 +1126,7 @@ func TestLayoutMigrationDiskPressureRecycleSkipsCustodyHeldOldLayoutWorker(t *te
 			// The old pod is still observed, so the helper first removes only
 			// the Deployment and waits for pod absence before any nix PVC delete.
 			if !del["deployments/"+deploymentName(w.ID)] ||
+				del["persistentvolumeclaims/"+nixPVCName(w.ID)] ||
 				del["persistentvolumeclaims/"+dataPVCName(w.ID)] ||
 				del["persistentvolumeclaims/"+dindDataPVCName(w.ID)] {
 				t.Fatalf("positive control must start a nix-only recycle: %v", keysOf(del))
