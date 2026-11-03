@@ -589,10 +589,11 @@ Before seeding a fresh attempt, the worker also checks that the data volume has
 room for it. When current or projected usage would reach the disk hard-stop
 threshold, it refuses the seed, keeps the predecessor work and custody, and
 posts a feed message beginning "retained recovery deferred:" with the observed
-and projected usage. The refusal is not a disk park and spends one of the same
-three reservations; the worker frees reclaimable space and re-checks before
-refusing. If the volume stays full, automatic retries end in the existing
-retained-recovery park, and the owner can Resume once space is freed. The
+usage (and the projected usage when it was computed). The refusal is not a disk
+park and spends one of the same three reservations; the worker runs one reclaim
+pass and re-checks before refusing. If the volume stays full, the iterations end
+in the existing retained-recovery park, whose automatic retries stop for owner
+Resume once the retained-park allowance is spent. The
 projection is an estimate and applies only when the API supports both the disk
 and retained-recovery park causes.
 
