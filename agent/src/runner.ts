@@ -186,6 +186,7 @@ import type { RunDiskLocks } from "./run-disk-locks.js";
 import type { CachesDroppedMemo } from "./disk-reclaim.js";
 import { DataVolumeFullError, type DataVolumeGuard } from "./disk-full.js";
 import { DiskParkSignal, type DiskGovernor } from "./cache-cap.js";
+import { decideRetainedSeedAdmission, type RetainedSeedAdmission, type RetainedSeedEstimate } from "./retained-seed-admission.js";
 import {
   SteeringChannel,
   PauseNowSignal,
@@ -1271,6 +1272,16 @@ class RetainedRecoveryStop extends Error {
 }
 
 class RetainedRecoveryCancelled extends RetainedRecoveryStop {}
+
+/** issue #3865: a retained successor seed refused for data-volume capacity. An ordinary retryable
+ *  failure of the reserved iteration: it is never an adoption failure, a disk park or a stop. */
+class RetainedSeedCapacityShortfall extends Error {
+  constructor() { super("retained successor seed deferred: data volume capacity"); }
+}
+
+const RETAINED_EXHAUSTED_FEATURE = "recovery_cause_retained_recovery_exhausted";
+/** Wall-clock budget of one predecessor footprint measurement (the retained inspection budget). */
+const RETAINED_SEED_MEASURE_BUDGET_MS = 5_000;
 
 /** issue #3645: thrown by {@link RunRunner.reclaimTerminalOrphan} when the terminal owner's journal changed or was
  *  retired under it, so the claimant's admission must be re-read (see the phaseClone loop). It carries no effect:
@@ -3176,6 +3187,8 @@ export class RunRunner {
   private readonly dataVolume: DataVolumeGuard | undefined;
   /** PRD #1809 D4 — see RunnerOptions.diskGovernor. */
   private readonly diskGovernor: DiskGovernor | undefined;
+  /** issue #3865: the configured governor even when disabled; read only for `effectiveHardThreshold()`. */
+  private readonly diskThresholdSource: DiskGovernor | undefined;
   private readonly detect: (
     worktreePath: string,
     harness: RepoAgentHarness,
@@ -3452,6 +3465,7 @@ export class RunRunner {
     this.cachesDropped = opts.cachesDropped;
     this.dataVolume = opts.dataVolume;
     this.diskGovernor = opts.diskGovernor?.enabled ? opts.diskGovernor : undefined;
+    this.diskThresholdSource = opts.diskGovernor;
     this.dataVolumeReclaimWaitMs =
       opts.dataVolumeReclaimWaitMs && opts.dataVolumeReclaimWaitMs > 0
         ? opts.dataVolumeReclaimWaitMs
@@ -8114,6 +8128,93 @@ export class RunRunner {
     const wait = await this.awaitDataVolumeReclaim(guard, flight, "preflight", recoverySignal);
     if (wait === "cancelled") throw new DataVolumeFullError("preflight");
     if (guard.preflight() === "data_volume_full") throw new DataVolumeFullError("preflight");
+  }
+
+  /** Whether the retained successor is seeded self-contained (no shared objects with the bare). */
+  private retainedSuccessorSelfContained(claim: ClaimResponse, flight: RunFlight): boolean {
+    return flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true ||
+      claim.plan_cross_check_gated === true;
+  }
+
+  /**
+   * issue #3865 — capacity admission for a retained successor seed, inside the iteration the caller
+   * already reserved. Refuses (throws {@link RetainedSeedCapacityShortfall}) when the successor's
+   * volume is already at the governor's effective hard threshold, or when the predecessor's measured
+   * footprint would not stay strictly below it. A refusal creates no successor, requests no disk park
+   * and releases no custody: it spends the reserved iteration like any retryable failure, so the third
+   * one ends as the existing `budget_exhausted` blocker and `retained_recovery_exhausted` park. Runs
+   * only against an api that has both causes, with a data-volume guard and a governor configuration;
+   * an unattributable or other-volume destination, or an unreadable sample, admits as before.
+   */
+  private async admitRetainedSeedCapacity(
+    claim: ClaimResponse, flight: RunFlight, bare: string, key: string, source: RecoveryJournalEntry,
+    iteration: { attempts: number; deadline: number }, signal: AbortSignal,
+  ): Promise<void> {
+    const guard = this.dataVolume;
+    const governor = this.diskThresholdSource;
+    if (!guard || !governor || !this.dataVolumeParkable(claim)) return;
+    const features = this.client.protocolFeatures;
+    if (!features.includes(DATA_VOLUME_FULL_FEATURE) || !features.includes(RETAINED_EXHAUSTED_FEATURE)) return;
+    const threshold = governor.effectiveHardThreshold();
+    if (!Number.isFinite(threshold)) return;
+    const destination = pathDirname(this.git.runnerClonePath(bare, key));
+    const selfContained = this.retainedSuccessorSelfContained(claim, flight);
+    // One assessment: sample, bail on current pressure before measuring, else measure the
+    // predecessor and judge a FRESH sample so writes during the measurement count.
+    const assess = async (): Promise<Exclude<RetainedSeedAdmission, { kind: "unknown" }> | undefined> => {
+      const first = await guard.attributedStatfs(destination);
+      if (first.kind !== "sample") {
+        flight.runLog.debug("retained seed capacity check skipped: destination volume not attributable", {
+          run_id: flight.runId, outcome: first.kind });
+        return undefined;
+      }
+      const early = decideRetainedSeedAdmission({ raw: first.raw, threshold, estimate: undefined });
+      if (early.kind === "unknown") return undefined;
+      if (early.kind === "refuse_current") return early;
+      let estimate: RetainedSeedEstimate | undefined;
+      try {
+        estimate = await this.git.measureRetainedSeedFootprint(source.clonePath, {
+          includeGitObjects: selfContained,
+          deadline: Math.min(iteration.deadline, Date.now() + RETAINED_SEED_MEASURE_BUDGET_MS),
+        });
+      } catch (error) {
+        // An interruption or an expired iteration propagates; any other failure falls back.
+        signal.throwIfAborted();
+        this.retainedLifecycleGuard(flight);
+        if (Date.now() >= iteration.deadline) throw error;
+        flight.runLog.warn("retained seed footprint measurement failed; using the fallback estimate",
+          formatRetainedRecoveryDiagnostic(error, flight.redactText));
+        estimate = undefined;
+      }
+      const second = await guard.attributedStatfs(destination);
+      if (second.kind !== "sample") return undefined;
+      const decision = decideRetainedSeedAdmission({ raw: second.raw, threshold, estimate });
+      return decision.kind === "unknown" ? undefined : decision;
+    };
+    let decision = await assess();
+    if (!decision || decision.kind === "admit") return;
+    const wait = await this.awaitDataVolumeReclaim(guard, flight, "retained_seed_admission", signal);
+    if (wait !== "cancelled") {
+      decision = await assess();
+      if (!decision || decision.kind === "admit") return;
+    }
+    const pct = (value: number): string => `${(value * 100).toFixed(1)}%`;
+    const projected = decision.kind === "refuse_projected" ? decision.projected : undefined;
+    flight.runLog.warn("retained successor seed refused for data volume capacity; reserved iteration retained", {
+      run_id: flight.runId,
+      used_fraction: decision.current,
+      projected_fraction: projected,
+      hard_threshold: threshold,
+      estimate_complete: decision.kind === "refuse_projected" ? decision.estimateComplete : undefined,
+      iteration: iteration.attempts,
+      decision: decision.kind,
+    });
+    flight.batcher.emit({ kind: "status", agent: "worker", payload: {
+      text: `retained recovery deferred: data volume at ${pct(decision.current)}` +
+        `${projected === undefined ? "" : `, projected ${pct(projected)}`} (hard threshold ${pct(threshold)}); ` +
+        "not seeding a fresh attempt this iteration; predecessor work and custody retained",
+    } });
+    throw new RetainedSeedCapacityShortfall();
   }
 
   /**
@@ -25952,6 +26053,8 @@ export class RunRunner {
           // Retained forge/disk failures are charged to this reservation, never to a park.
           await this.preflightDataVolume(claim, flight, signal);
           await check();
+          await this.admitRetainedSeedCapacity(claim, flight, bare, key, source, iteration, signal);
+          await check();
           await this.checkWorkerResidueBeforeFetch(claim.run_id, "retained_recovery", flight.runLog);
           await check();
           await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username,
@@ -26076,7 +26179,7 @@ export class RunRunner {
                 iteration.attempts, attemptId, {
                   checkpointWriteUnresolved: flight.checkpointClaimEvidence.writeUnresolved,
                   checkpointKey: flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : undefined),
-                  selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.plan_cross_check_gated === true,
+                  selfContained: this.retainedSuccessorSelfContained(claim, flight),
                   admitRemediationSource: async input => {
                     this.retainedLifecycleGuard(flight);
                     assertOldFacts(input.flaggedOIDs);
@@ -26228,7 +26331,7 @@ export class RunRunner {
           if (ownershipError instanceof RetainedRecoveryStop || ownershipError instanceof CredentialSwitchSignal) throw ownershipError;
         }
         if (Date.now() >= iteration.deadline) { blocker = "budget_exhausted"; await fail(); }
-        if (blocker === "adoption_failed") await fail();
+        if (blocker === "adoption_failed" && !(error instanceof RetainedSeedCapacityShortfall)) await fail();
         if (iteration.attempts >= 3 || Date.now() >= iteration.deadline) {
           blocker = "budget_exhausted";
           await fail();

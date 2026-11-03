@@ -177,6 +177,10 @@ describe("measureRetainedSeedFootprint", () => {
     assert.equal(withObjects.complete, true);
     // Omitted: objects' children (pack dir, big.pack). The objects directory itself is still counted.
     assert.equal(withObjects.inodes - without.inodes, 2);
+    // Absolute counts pin the +1 root: root, .git, HEAD, objects, pack, big.pack, node_modules, dep,
+    // index.js, README.md is 10 entries; without objects' two children it is 8.
+    assert.equal(withObjects.inodes, 10);
+    assert.equal(without.inodes, 8);
     assert.ok(withObjects.bytes - without.bytes >= 256 * 1024, `delta ${withObjects.bytes - without.bytes}`);
     assert.ok(without.bytes >= 32 * 1024, "node_modules is part of the estimate");
   });
@@ -185,6 +189,12 @@ describe("measureRetainedSeedFootprint", () => {
     const m = await cache().measureRetainedSeedFootprint(tree(), { includeGitObjects: true, deadline: far(), caps: { maxEntries: 2 } });
     assert.equal(m.complete, false);
     assert.ok(m.bytes > 0 && m.inodes > 0);
+  });
+
+  it("an explicit undefined maxEntries keeps the default cap", async () => {
+    const m = await cache().measureRetainedSeedFootprint(tree(), { includeGitObjects: true, deadline: far(), caps: { maxEntries: undefined } });
+    assert.equal(m.complete, true);
+    assert.equal(m.inodes, 10);
   });
 
   it("a small depth cap is incomplete with the bytes seen so far", async () => {

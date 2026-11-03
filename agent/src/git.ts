@@ -10802,7 +10802,8 @@ export class GitCache {
   }
 
   /** Sum of allocated bytes under `root` by an lstat walk that never follows a symlink. `entries` is
-   *  the inode count seen (the root plus every entry lstat-counted; 0 when the root is unreadable).
+   *  the entries read: the root plus every directory entry read, including vanished and cap-overflow
+   *  entries (so it errs high; 0 when the root is unreadable).
    *  `skip` gets a directory's path relative to `root` (posix-joined) and, when true, omits its
    *  contents (the directory itself is still counted). Stops at the
    *  deadline of the injected clock, or at a cap on the entries visited, the pending-directory stack
@@ -10891,7 +10892,7 @@ export class GitCache {
     clonePath: string,
     opts: { includeGitObjects: boolean; deadline: number; now?: () => number; caps?: RetainedMeasureCaps },
   ): Promise<{ bytes: number; inodes: number; complete: boolean }> {
-    const caps = { maxEntries: RETAINED_SEED_MEASURE_MAX_ENTRIES, ...opts.caps };
+    const caps = { ...opts.caps, maxEntries: opts.caps?.maxEntries ?? RETAINED_SEED_MEASURE_MAX_ENTRIES };
     const skip = opts.includeGitObjects ? undefined : (rel: string) => rel === ".git/objects";
     const m = await this.measureAllocated(clonePath, opts.now ?? Date.now, opts.deadline, caps, {}, skip);
     return { bytes: m.bytes, inodes: m.entries, complete: m.complete };

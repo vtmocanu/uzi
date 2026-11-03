@@ -232,6 +232,17 @@ describe("StatsCollector — disk sampling (PRD #837 M1)", () => {
       { bsize: 4096, blocks: 2000, bfree: 2500, bavail: 1400, files: 10, ffree: 1 },
       { bsize: Number.NaN, blocks: 2000, bfree: 1500, bavail: 1400, files: 10, ffree: 1 },
     ];
+    // Fixed literals for the first (fully valid) sample: used = (blocks - bfree) x bsize, inodes = files - ffree.
+    const fixed = {
+      disk_data_bytes: 2_048_000, disk_data_total_bytes: 8_192_000, disk_data_inodes: 600, disk_data_total_inodes: 1000,
+    };
+    assert.deepStrictEqual(dataVolumeStatsFromStatfs(cases[0]!), fixed);
+    const fixedCollected = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs: () => cases[0]!, dataDir: "/data" }).collect();
+    assert.ok(fixedCollected);
+    assert.strictEqual(fixedCollected.disk_data_bytes, fixed.disk_data_bytes);
+    assert.strictEqual(fixedCollected.disk_data_total_bytes, fixed.disk_data_total_bytes);
+    assert.strictEqual(fixedCollected.disk_data_inodes, fixed.disk_data_inodes);
+    assert.strictEqual(fixedCollected.disk_data_total_inodes, fixed.disk_data_total_inodes);
     for (const raw of cases) {
       const c = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs: () => raw, dataDir: "/data" });
       const s = c.collect();
