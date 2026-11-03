@@ -512,6 +512,16 @@ body[data-scenario="calm"] .station.gate-st .st-count { color: rgb(var(--fg)); }
     </div>
 
     <main class="content">
+      <div class="ph">
+        <div>
+          <h1 id="greet">Welcome, Robin</h1>
+          <p id="lede"><b>3 decisions</b> and <b>2 pull requests</b> are waiting on you. 4 runs are executing across the factory, 1 is queued and 1 is parked until its usage window reopens.</p>
+        </div>
+        <div class="ph-actions">
+          <a class="health" id="health-chip" href="#"><span class="badge t-ok"><span class="bd"></span>OK</span>23 of 23 checks passing</a>
+          <button class="btn btn-secondary btn-sm" id="open-palette" type="button"><svg class="ic"><use href="#i-search"/></svg>Search<kbd>⌘K</kbd></button>
+        </div>
+      </div>
       <div class="banners" id="banners" hidden>
         <div class="banner b-warn" data-banner="vault" hidden>
           <div><p class="bt">Your vault is locked</p><p class="bs">Unlock it so your agents can use your stored credentials.</p></div>
@@ -527,16 +537,6 @@ body[data-scenario="calm"] .station.gate-st .st-count { color: rgb(var(--fg)); }
         <div class="banner b-warn" data-banner="attention" hidden>
           <div><p class="bt">Admin health: 2 checks need attention</p><p class="bs">A worker image roll is waiting for idle. One schedule has not fired for 2 days.</p></div>
           <div class="acts"><a href="#">Open health</a></div>
-        </div>
-      </div>
-      <div class="ph">
-        <div>
-          <h1 id="greet">Welcome, Robin</h1>
-          <p id="lede"><b>3 decisions</b> and <b>2 pull requests</b> are waiting on you. 4 runs are executing across the factory, 1 is queued and 1 is parked until its usage window reopens.</p>
-        </div>
-        <div class="ph-actions">
-          <a class="health" id="health-chip" href="#"><span class="badge t-ok"><span class="bd"></span>OK</span>23 of 23 checks passing</a>
-          <button class="btn btn-secondary btn-sm" id="open-palette" type="button"><svg class="ic"><use href="#i-search"/></svg>Search<kbd>⌘K</kbd></button>
         </div>
       </div>
 
