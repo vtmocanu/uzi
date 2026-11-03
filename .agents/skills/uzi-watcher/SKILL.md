@@ -85,6 +85,10 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
      alarms only, if no split yields independently valuable pieces, record the reason in the
      PRD's Decision Log, commit and push that PRD-only edit to `main` (as `/prd-create`
      commits a PRD), and continue once the push lands: the run clones the remote.
+   - **Owner decisions that shape the plan go in before dispatch.** Write them into the
+     issue body or the PRD's Decision Log, the latter committed and pushed to `main`,
+     then create the run. Do not send them as a follow-up after create: the planning
+     lead may not see it, and the Plan cross-check reads only the issue, plan and diff.
 2. **Decide MR-rework, then create gated** (no `--plan-file`):
 
    ```
