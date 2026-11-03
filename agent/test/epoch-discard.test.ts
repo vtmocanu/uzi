@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
@@ -78,6 +79,208 @@ async function refusal(proof: EpochDiscardProof, reason: string, over: Partial<R
     { kind: "refused", reason, consumers: [] });
   assert.ok(fs.existsSync(clonePath));
 }
+
+
+function cloneGit(...args: string[]): string {
+  return execFileSync("git", ["-C", clonePath, ...args], { env: ENV, encoding: "utf8", stdio: "pipe" }).trim();
+}
+const IDENTITY = ["-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "-c", "commit.gpgsign=false"];
+function bareOnlyCommit(): string {
+  return gitIn([...IDENTITY, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "unpublished"]);
+}
+async function contentRefusal(reason = "epoch_content_unproven"): Promise<void> {
+  const ledger = gitIn(["config", "--get-all", `uzi-attempts.${BRANCH}.entry`]);
+  const proof = git.createEpochDiscardProof(input);
+  await refusal(proof, reason);
+  git.assertEpochDiscardSettled(proof);
+  assert.equal(journal(), raw);
+  assert.equal(gitIn(["config", "--get-all", `uzi-attempts.${BRANCH}.entry`]), ledger);
+}
+function seedGitlink(): string {
+  const head = cloneGit("rev-parse", "HEAD");
+  cloneGit("update-index", "--add", "--cacheinfo", `160000,${head},sub`);
+  cloneGit(...IDENTITY, "commit", "-m", "uninitialized submodule");
+  gitIn(["fetch", clonePath, "HEAD:refs/heads/main"]);
+  const published = cloneGit("rev-parse", "HEAD");
+  if (gitIn(["for-each-ref", "--format=%(refname)", "refs/remotes/origin/main"]))
+    gitIn(["update-ref", "refs/remotes/origin/main", published]);
+  return path.join(clonePath, "sub");
+}
+
+async function legacyCoverage(): Promise<"covered" | "not_covered"> {
+  return git.verifyStoppedSourceCovered(bare, BRANCH, "issue-3431",
+    { runId: RUN, clonePath, attemptId: options.selector.attempt },
+    cloneGit("rev-parse", "HEAD"), { runId: RUN, generation: 1 }, async () => true);
+}
+
+describe("legacy coverage keeps its directory and reachability semantics", () => {
+  for (const target of ["worktrees", "gitlink"] as const) {
+    for (const state of ["missing", "empty", "populated", "unreadable"] as const) {
+      it(`preserves default ${target} ${state} behavior without automatic probes`, async t => {
+        const dir = target === "gitlink" ? seedGitlink() : path.join(clonePath, ".git", "worktrees");
+        if (state !== "missing") fs.mkdirSync(dir);
+        if (state === "populated") fs.writeFileSync(path.join(dir, "retained"), "");
+        const opendir = fsp.opendir.bind(fsp);
+        t.mock.method(fsp, "opendir", async (name: string, ...args: Parameters<typeof fsp.opendir> extends [unknown, ...infer R] ? R : never) => {
+          assert.notEqual(name, dir, "automatic directory probe must not run for coverage or inspection");
+          return opendir(name, ...args);
+        });
+        const readdir = fsp.readdir.bind(fsp);
+        t.mock.method(fsp, "readdir", async (...args: Parameters<typeof fsp.readdir>) => {
+          if (state === "unreadable" && args[0] === dir) throw Object.assign(new Error("unreadable"), { code: "EACCES" });
+          return readdir(...args);
+        });
+        const expected = state === "empty" || target === "worktrees" && state === "missing";
+        assert.equal(await legacyCoverage(), expected ? "covered" : "not_covered");
+      });
+    }
+  }
+  it("does not select automatic content proof for read-only epoch inspection", async () => {
+    fs.writeFileSync(path.join(clonePath, "private.txt"), "uncommitted work");
+    const inspection = await git.inspectRetainedSources({
+      selector: options.selector, barePath: bare, holds: options.holds, lifecycle: options.lifecycle,
+      epoch: true, isLivePath: () => false,
+    });
+    assert.equal(inspection.partial, false);
+    assert.equal(inspection.sources[0]?.epochSettlement?.disposition.kind, "local_discard");
+    await contentRefusal();
+  });
+  it("continues accepting a bare-owned side ref for diagnostic coverage only", async () => {
+    const sha = bareOnlyCommit();
+    gitIn(["update-ref", "refs/unpublished/held", sha]);
+    cloneGit("update-ref", "refs/private/side", sha);
+    assert.equal(await legacyCoverage(), "covered");
+    await contentRefusal();
+  });
+});
+
+describe("automatic content preservation through registered authority", () => {
+  it("accepts a clean published tree and published side refs only up to the effects guard", async () => {
+    cloneGit("branch", "published-side", "HEAD");
+    await contentRefusal("epoch_discard_unavailable");
+  });
+  it("keeps generated nonempty skills eligible for the existing footprint checks", async () => {
+    const skills = path.join(path.dirname(clonePath), ".uzi-skills-" + path.basename(clonePath));
+    fs.mkdirSync(skills);
+    fs.writeFileSync(path.join(skills, "generated.md"), "generated skill");
+    await contentRefusal("epoch_discard_unavailable");
+    assert.equal(fs.readFileSync(path.join(skills, "generated.md"), "utf8"), "generated skill");
+  });
+  it("leaves an attributed skills sibling for the discard core when the clone is missing", async () => {
+    const skills = path.join(path.dirname(clonePath), ".uzi-skills-" + path.basename(clonePath));
+    fs.mkdirSync(skills);
+    fs.writeFileSync(path.join(skills, "generated.md"), "generated skill");
+    fs.rmSync(clonePath, { recursive: true });
+    const inspection = await git.inspectRetainedSources({
+      selector: options.selector, barePath: bare, holds: options.holds, lifecycle: options.lifecycle,
+      epoch: true, isLivePath: () => false,
+    });
+    const confirm = inspection.sources[0]!.descriptor;
+    const proof = git.createEpochDiscardProof({ ...input, confirm });
+    assert.deepEqual(await git.discardStoppedSource({ ...options, confirm, epochProof: proof }),
+      { kind: "refused", reason: "epoch_discard_unavailable", consumers: [] });
+    assert.equal(journal(), raw);
+    assert.equal(fs.readFileSync(path.join(skills, "generated.md"), "utf8"), "generated skill");
+  });
+  for (const shape of ["file", "symlink"] as const) {
+    it(`refuses an unsafe skills sibling: ${shape}`, async () => {
+      const skills = path.join(path.dirname(clonePath), ".uzi-skills-" + path.basename(clonePath));
+      if (shape === "file") fs.writeFileSync(skills, "unsafe");
+      else fs.symlinkSync(clonePath, skills);
+      await contentRefusal();
+    });
+  }
+  for (const dirty of ["tracked", "untracked", "assume-unchanged", "skip-worktree", "stash", "filter", "include", "attributes", "modules"] as const) {
+    it(`retains ${dirty} content without changing journal or ledger`, async () => {
+      const tracked = cloneGit("ls-files").split("\n")[0]!;
+      if (dirty === "tracked" || dirty === "stash" || dirty === "assume-unchanged" || dirty === "skip-worktree") {
+        fs.appendFileSync(path.join(clonePath, tracked), "\nprivate work\n");
+        if (dirty === "stash") cloneGit(...IDENTITY, "stash", "push");
+        if (dirty === "assume-unchanged" || dirty === "skip-worktree") cloneGit("update-index", "--" + dirty, tracked);
+      } else if (dirty === "untracked") fs.writeFileSync(path.join(clonePath, "private.txt"), "private work");
+      else if (dirty === "filter") cloneGit("config", "filter.hostile.clean", "false");
+      else if (dirty === "include") cloneGit("config", "include.path", "/dev/null");
+      else if (dirty === "attributes") fs.writeFileSync(path.join(clonePath, ".git", "info", "attributes"), "");
+      else fs.mkdirSync(path.join(clonePath, ".git", "modules"));
+      await contentRefusal();
+    });
+  }
+  for (const extra of ["head", "side", "arbitrary-remote", "blob"] as const) {
+    it(`rejects bare-owned but unpublished ${extra} objects`, async () => {
+      const sha = extra === "blob"
+        ? execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"], { env: ENV, input: "unpublished blob", encoding: "utf8" }).trim()
+        : bareOnlyCommit();
+      gitIn(["update-ref", "refs/unpublished/held", sha]);
+      if (extra === "head") cloneGit("checkout", "--detach", sha);
+      else cloneGit("update-ref", extra === "arbitrary-remote" ? "refs/remotes/other/main" : "refs/private/side", sha);
+      await contentRefusal();
+    });
+  }
+
+  for (const state of ["absent", "empty", "populated", "symlink", "file"] as const) {
+    it(`checks automatic linked worktrees: ${state}`, async () => {
+      const dir = path.join(clonePath, ".git", "worktrees");
+      if (state === "empty" || state === "populated") fs.mkdirSync(dir);
+      if (state === "populated") for (let i = 0; i < 2000; i++) fs.writeFileSync(path.join(dir, String(i)), "");
+      if (state === "symlink") fs.symlinkSync(path.join(clonePath, ".git", "objects"), dir);
+      if (state === "file") fs.writeFileSync(dir, "");
+      await contentRefusal(state === "absent" || state === "empty" ? "epoch_discard_unavailable" : "epoch_content_unproven");
+    });
+  }
+  for (const state of ["missing", "empty", "populated", "symlink", "file"] as const) {
+    it(`checks automatic gitlinks: ${state}`, async () => {
+      const dir = seedGitlink();
+      if (state === "empty" || state === "populated") fs.mkdirSync(dir);
+      if (state === "populated") fs.writeFileSync(path.join(dir, "private"), "submodule content");
+      if (state === "symlink") fs.symlinkSync(path.join(clonePath, ".git"), dir);
+      if (state === "file") fs.writeFileSync(dir, "private");
+      // An absent tracked gitlink is a deletion in Git status; the directory probe itself skips it.
+      await contentRefusal(state === "empty" ? "epoch_discard_unavailable" : "epoch_content_unproven");
+    });
+  }
+
+  for (const target of ["worktrees", "gitlink"] as const) {
+    for (const fault of ["many", "open", "read", "close", "vanish"] as const) {
+      it(`bounds ${target} reads and joins ${fault} refusal`, async t => {
+        const dir = target === "gitlink" ? seedGitlink() : path.join(clonePath, ".git", "worktrees");
+        fs.mkdirSync(dir);
+        if (fault === "many") for (let i = 0; i < 2000; i++) fs.writeFileSync(path.join(dir, String(i)), "");
+        const original = fsp.opendir.bind(fsp);
+        let reads = 0, closes = 0;
+        t.mock.method(fsp, "opendir", async (name: string, opts: { bufferSize: number }) => {
+          if (name !== dir) return original(name, opts);
+          assert.equal(opts.bufferSize, 1);
+          if (fault === "open" || fault === "vanish") throw Object.assign(new Error("open failed"), { code: fault === "vanish" ? "ENOENT" : "EACCES" });
+          const handle = await original(name, opts);
+          return {
+            async read() { reads++; if (fault === "read") throw new Error("read failed"); return handle.read(); },
+            async close() { closes++; await handle.close(); if (fault === "close") throw new Error("close failed"); },
+          };
+        });
+        await contentRefusal();
+        assert.equal(reads, fault === "open" || fault === "vanish" ? 0 : 1);
+        assert.equal(closes, fault === "open" || fault === "vanish" ? 0 : 1);
+      });
+    }
+  }
+
+  it("revokes authority during a joined directory read", async t => {
+    const dir = path.join(clonePath, ".git", "worktrees");
+    fs.mkdirSync(dir);
+    const original = fsp.opendir.bind(fsp);
+    let closed = false;
+    t.mock.method(fsp, "opendir", async (name: string, opts: { bufferSize: number }) => {
+      const handle = await original(name, opts);
+      if (name !== dir) return handle;
+      return {
+        async read() { live = false; return handle.read(); },
+        async close() { await handle.close(); closed = true; },
+      };
+    });
+    await refusal(git.createEpochDiscardProof(input), "stale_epoch_proof");
+    assert.equal(closed, true);
+  });
+});
 
 describe("worker epoch discard registration (automatic effects remain disabled)", () => {
   it("keeps raw bytes outside the frozen opaque proof and refuses effects after fresh real-Git checks", async () => {
@@ -200,6 +403,7 @@ describe("worker epoch discard registration (automatic effects remain disabled)"
     const result = await git.discardStoppedSource({ ...options, epochProof: proof });
     assert.equal(result.kind, "refused");
     if (result.kind === "refused") assert.equal(result.reason, "epoch_source_refused");
+    git.assertEpochDiscardSettled(proof);
     assert.equal(journal(), raw);
     assert.ok(fs.existsSync(clonePath));
   });
