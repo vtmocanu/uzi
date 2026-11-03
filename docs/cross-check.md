@@ -324,6 +324,30 @@ See the [dated ADR amendment](../adr/2149-cross-check.md#advisory-plan-coverage-
 and [PRD #3168](../prds/3168-plan-cross-check-coverage.md) for validation and
 remaining replay scope.
 
+### Owner steering in the plan check
+
+Each plan check round also receives a frozen, bounded snapshot of your own
+answers to the lead's questions and your plan revise feedback, so the checker
+can verify a plan claim such as "the owner agreed to X" instead of leaving it
+unverified. The snapshot is taken when the round starts and is identical for
+every claim of that round; an answer or revise you send afterwards appears in
+the next round. The question an answer responded to is shown as lead- or
+worker-authored context, never as your words. Automatic system answers (such as
+a completion continue) are not included.
+
+Limits: the 32 newest entries, 8 KiB per answer or revise entry, 4 KiB per
+question and 64 KiB in total; anything cut is marked. An entry that is missing,
+truncated or unparseable, or an answer whose question is unavailable,
+ambiguous or truncated, cannot by itself establish an exception, so such a
+claim stays unverified. Code cross-check is unchanged.
+
+Rollout: only plan checks with such a snapshot need a worker that advertises
+`cross_check_owner_steering_v1`. Workers pick it up when they next roll while
+idle. Until one is online the run shows "Plan cross-check is waiting: no online
+worker supports owner-steering checks", and at the deadline the check falls
+back to the ordinary human plan gate. See the
+[dated ADR amendment](../adr/2149-cross-check.md#amendment-2026-11-03--3841-owner-steering-in-plan-checker-input).
+
 ## Checked before your review
 
 With **Plan cross-check** enabled, a run that is not auto-approved is checked

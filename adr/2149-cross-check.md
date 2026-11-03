@@ -429,3 +429,58 @@ now goes through the checked-plan loop before its first human gate. Decisions:
   added and dispositions never gate approval.
 
 Not shipped: live k8s acceptance of the wait and a hosted rollback rehearsal (PRD #3708 M3).
+
+## Amendment 2026-11-03 — #3841: owner steering in plan checker input
+
+A plan checker could not verify a plan claim attributed to the run owner (for example "the
+owner answered that the migration may be skipped"), so such claims stayed uninspectable and
+unverified. Each new plan-stage round now freezes a bounded snapshot of the run owner's own
+answers and revise feedback for the checker. Decisions:
+
+- **Source and attribution.** Owner attribution comes from the write path, not from content.
+  Answers come from the owner-scoped answer writer (`CreateRunAnswerInput` via the owner's
+  `submitAnswer`); revise feedback comes from `CreateRunReviseInputIfUnderCap`. System
+  completion-continue answers are excluded through a `completion_decision` audit row carrying
+  the `question_id`, written before the answer so no answer is ever visible without its mark.
+  The question text is context, attributed to the lead or worker that asked it, never to the
+  owner. Documented gap: a generic `CreateRunInput` call with a variable kind is not guarded at
+  Go level; today's callers are the two writers above.
+- **One-statement cutoff.** One SQL statement (`SnapshotOwnerSteering`, one MVCC snapshot)
+  takes the cutoff as the highest committed input id visible to that statement and reads the
+  entries up to it. An insert still in flight lands in the next round. The snapshot is written
+  in the same transaction as the round row; a retry writes nothing, so every claim of a round
+  delivers identical bytes with a sha256 digest. The digest is an integrity check, not
+  tamper-proofing.
+- **Shape guards and caps.** A malformed answer or question context gets a status marker and
+  never fails the round. Owner text is scrubbed before the cap. Caps: the 32 newest entries,
+  8 KiB per answer or revise entry, 4 KiB per question context, 64 KiB per snapshot; overflow
+  is marked `entry_cap` or `byte_cap`.
+- **Context binding.** An answer is paired with its question context by `question_id`: no
+  occurrence is `unavailable`; more than one distinct variant is `ambiguous`; a context whose
+  status is not ok is `malformed` or `oversized`; identical re-emissions share one context.
+  Only a bound, complete context lets a checker rely on what an answer meant.
+- **Revise binding.** Each revise entry carries its gate binding: `bound`, `unbound`, or null
+  when none applies, so the checker can tell which plan the feedback addressed.
+- **Child table.** The snapshot lives in the child table `cross_check_owner_steering`, not on
+  the hot `cross_checks` row: the existing row is untouched, no row means "none supplied" for
+  legacy rounds, and the immutability trigger is scoped to the child. Migration files are
+  drafts renumbered at landing, so they are not named here.
+- **Owner decision 2026-11-03: capability rollout accepted.** Only plan-stage checker children
+  with an owner-steering row require the new capability `cross_check_owner_steering_v1`.
+  Legacy rows and code-stage checks keep today's eligibility. Availability cost: the api rolls
+  first and from then every new plan round has a row, while workers move to the new image only
+  when they next roll while idle, so a new api can face an all-old checker pool. Until a
+  capable worker registers, steering-bearing plan checks are not claimed; the health reason
+  "Plan cross-check is waiting: no online worker supports owner-steering checks
+  (cross_check_owner_steering_v1)" explains the wait, and at the deadline the check takes the
+  existing fallback to the ordinary human plan gate.
+- **Envelope allowance, header-scoped.** The server's existing claim-size limit is evaluated on
+  the payload without steering; the steering bytes are bounded separately (6 x 65536 + 64 + 57
+  = 393337 wire bytes). The claim response carries `X-Uzi-Owner-Steering: v1` only when the
+  field is present, and the worker applies its larger read allowance only on the claim read
+  carrying that header. All other boundaries are unchanged.
+- **Unchanged.** `candidate_digest` and the code-stage checks are unchanged. The checker
+  brief renders two nonce-fenced data sections, `owner_steering` (owner-authored) and
+  `owner_steering_questions` (lead or worker authored, never owner), and states that an absent,
+  omitted, truncated or unparseable owner entry, or an answer whose question context is
+  unavailable, ambiguous, malformed or truncated, cannot by itself establish an exception.
