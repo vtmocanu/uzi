@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import type { Executor } from "../src/executor.js";
 import type { FetchAgentBranchOptions, TrackingUpdateResult } from "../src/git.js";
 import { LimitReachedError } from "../src/limit.js";
-import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, deferred, homeDir } from "./runner-harness.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith, deferred, homeDir } from "./runner-harness.js";
 
 installHarness();
 
@@ -152,7 +152,7 @@ for (const sink of ["finalize", "limit-park", "shutdown"] as const) {
     fs.writeFileSync(marker, "retained session");
     const started = deferred();
     let clone = "";
-    const r = runner({
+    const executor: Executor = {
       run: async ctx => {
         clone = ctx.worktreePath;
         commit(clone);
@@ -164,7 +164,8 @@ for (const sink of ["finalize", "limit-park", "shutdown"] as const) {
         }
         return { branch: ctx.branch };
       },
-    }, gitlab);
+    };
+    const r = runnerWith(() => ({ executor, homeDir }), gitlab);
     const execution = r.execute(claim);
     if (sink === "shutdown") {
       await started.promise;

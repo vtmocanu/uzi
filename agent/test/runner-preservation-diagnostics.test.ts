@@ -20,19 +20,30 @@ const seam = RunRunner.prototype as unknown as {
 };
 function probe(deliver?: (message: unknown, flight: Flight) => void) {
   const messages: unknown[] = [];
+  const deliveries: Array<{
+    preserveRecoveryClone: boolean;
+    preserveSession: boolean;
+    owedLimitStop: Error | undefined;
+    owedMarked: boolean;
+  }> = [];
   const logs: unknown[] = [];
   const flight: Flight = {
     runId: "preservation-diagnostic", preserveRecoveryClone: false, preserveSession: false,
     runLog: { warn(message, fields) { logs.push({ message, fields }); } },
     batcher: { emit(message) {
-      assert.equal(flight.preserveRecoveryClone, true);
-      assert.equal(flight.preserveSession, true);
+      // Observe inside delivery, assert outside the production catch boundary.
+      deliveries.push({
+        preserveRecoveryClone: flight.preserveRecoveryClone,
+        preserveSession: flight.preserveSession,
+        owedLimitStop: flight.owedLimitStop,
+        owedMarked: flight.reportedPreservationRefusals?.has("owed_limit") ?? false,
+      });
       messages.push(message);
       deliver?.(message, flight);
     } },
   };
   const refuse = (reason: unknown) => seam.preservationRefused.call(RunRunner.prototype, flight, reason);
-  return { flight, messages, logs, refuse };
+  return { flight, messages, deliveries, logs, refuse };
 }
 const reasons = [
   "ownership_unknown", "preservation_failed", "owed_limit", "receipt_pending_failed",
@@ -56,6 +67,11 @@ it("emits exactly one fixed-class status per reason per flight and keeps the war
     }
   }
   assert.deepEqual(p.messages, reasons.map(status));
+  assert.equal(p.deliveries.length, reasons.length);
+  for (const delivery of p.deliveries) {
+    assert.equal(delivery.preserveRecoveryClone, true);
+    assert.equal(delivery.preserveSession, true);
+  }
   assert.deepEqual(p.logs, reasons.flatMap(reason => Array.from({ length: 2 }, () => ({
     message: "tracking preservation refused", fields: { run_id: p.flight.runId, reason },
   }))));
@@ -98,12 +114,13 @@ it("marks closed-feed attempts without delivery or later retry", () => {
 
 for (const error of [new Error("arbitrary delivery error"), new CandidateReservationRefusedError("cancelled"), "delivery throw"]) {
   it(`contains ${typeof error === "string" ? "non-Error throws" : error.name} and latches owed_limit before delivery`, () => {
-    const p = probe((_message, flight) => {
-      assert.ok(flight.owedLimitStop);
-      assert.ok(flight.reportedPreservationRefusals?.has("owed_limit"), "marked before emit");
-      throw error;
-    });
+    const p = probe(() => { throw error; });
     const first = p.refuse("owed_limit");
+    assert.equal(p.deliveries.length, 1);
+    assert.equal(p.deliveries[0]!.preserveRecoveryClone, true);
+    assert.equal(p.deliveries[0]!.preserveSession, true);
+    assert.equal(p.deliveries[0]!.owedMarked, true, "marked before emit");
+    assert.strictEqual(p.deliveries[0]!.owedLimitStop, first, "latched before emit");
     assert.strictEqual(first, p.flight.owedLimitStop);
     assert.match(first.message, /retained owed-head limit/);
     assert.strictEqual(p.refuse("owed_limit"), first);
