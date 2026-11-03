@@ -128,14 +128,17 @@ func TestDinDSimultaneousLegacyFirstThenRefreshAndDinDPriority(t *testing.T) {
 	if f.op == nil || f.op.Phase != "requested" {
 		t.Fatal("no initial server binding")
 	}
-	deleted := 0
-	for _, a := range client.Actions() {
-		if a.GetVerb() == "delete" {
-			deleted++
+	// #3852: explicit nix pressure still services legacy first, retaining /data.
+	deleted := deletedSet(client)
+	for name, want := range map[string]bool{
+		"deployments/" + dep.Name:                         true,
+		"persistentvolumeclaims/" + nixPVCName(w.ID):      true,
+		"persistentvolumeclaims/" + dataPVCName(w.ID):     false,
+		"persistentvolumeclaims/" + dindDataPVCName(w.ID): false,
+	} {
+		if deleted[name] != want {
+			t.Fatalf("legacy deletion %s = %v, want %v", name, deleted[name], want)
 		}
-	}
-	if deleted != 3 {
-		t.Fatalf("initial persisted request must service legacy same tick: deletes=%d", deleted)
 	}
 	client.ClearActions()
 	tick() // rebuilding after same-tick legacy deletion, request survives

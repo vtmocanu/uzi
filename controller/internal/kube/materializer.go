@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -609,6 +610,12 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 	desiredIDs := make(map[string]bool, len(desired))
 	for _, w := range desired {
 		desiredIDs[w.ID] = true
+		// Report durable-data deferral before image admission or DinD handling
+		// can consume the tick, and independently of the recycle cooldown.
+		if m.recycle.Enabled && !w.Ephemeral && !w.CustodyHeld && w.Docker &&
+			w.DiskPressure && !slices.Contains(w.DiskPressureVolumes, "nix") {
+			m.log.Info(fmt.Sprintf("disk-recycle-skipped-docker-data worker=%s", w.ID))
+		}
 	}
 
 	observedByID := make(map[string]reconcile.ObservedWorker, len(observed))
@@ -688,7 +695,7 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 }
 
 // recycleVolumes selects which of a worker's PVCs a recycle tears down: {Nix} for the
-// size-drift arm, {Nix, Data} for legacy disk pressure. DinD is handled by its
+// size-drift arm and Docker pressure, {Nix, Data} for plain disk pressure. DinD is handled by its
 // separately fenced lifecycle; legacy deletion refuses selectors containing it.
 type recycleVolumes struct {
 	Pressure bool
@@ -719,6 +726,14 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	// DinD destruction requires its fenced lifecycle; this legacy helper fails
 	// closed even for combined selectors and force/deadline overrides.
 	if vols.DinD {
+		return nil
+	}
+	// Docker /data holds durable work independently of custody, force and deadline.
+	// Filter before busy handling so a data-only request cannot even drain a worker.
+	if w.Docker {
+		vols.Data = false
+	}
+	if !vols.Nix && !vols.Data {
 		return nil
 	}
 	// Phase 0, first of all: scaling to zero or deleting the Deployment replaces the
@@ -927,6 +942,10 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		}
 	}
 
+	// Deferring durable data recycling does not defer DinD maintenance.
+	// Reconcile has already logged the deferral before image admission.
+	dockerDataPressure := legacy && m.recycle.Enabled && !w.Ephemeral && !w.CustodyHeld &&
+		w.Docker && w.DiskPressure && !slices.Contains(w.DiskPressureVolumes, "nix")
 	if legacy {
 		if handled, err := m.reconcileDinD(ctx, w, obs, ns, spec); handled || err != nil {
 			return err
@@ -944,9 +963,9 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true})
 	}
 
-	// M4: disk-pressure recycle (nix + data). Ephemeral (run-bound) workers excluded.
-	// Within-cooldown = a just-recycled worker back at pressure = a CAPACITY signal, surfaced
-	// via a fixed token, NOT recycled again. Otherwise drain-then-recycle both volumes.
+	// M4: plain pressure recycles nix + data; Docker recycles only explicitly
+	// pressured nix. Ephemeral workers are excluded. Within-cooldown pressure is
+	// a capacity signal surfaced via a fixed token rather than another recycle.
 	// PRD #1296 D3: a custody-held worker is ALSO excluded (effectively `&& !w.CustodyHeld`)
 	// — its /data may hold unpublished committed work, and disk pressure is never consent to
 	// discard it. It falls through to normal reconcile (like the cooldown case) with a fixed
@@ -957,11 +976,13 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		case w.CustodyHeld:
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-custody worker=%s", w.ID))
 			// custody protects unpublished work: fall through to normal reconcile; do NOT recycle.
+		case dockerDataPressure:
+			// The durable-data deferral was already logged before DinD handling.
 		case m.withinRecycleCooldown(obs):
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-cooldown worker=%s", w.ID))
 			// display-only capacity-warn: fall through to normal reconcile; do NOT return.
-		default:
-			return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true, Data: true, Pressure: true})
+		case m.pressureRecycleEligible(w, obs):
+			return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true, Data: !w.Docker, Pressure: true})
 		}
 	}
 
