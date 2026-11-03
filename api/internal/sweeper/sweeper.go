@@ -124,10 +124,14 @@ func (e *Engine) runOnce(ctx context.Context) {
 	}
 	// Only log when the pass actually did something, to keep the log quiet on an
 	// idle system.
-	if res.WorkersOffline+res.ClaimedReset+res.WallParkRequested+res.WallParked+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.LimitReevaluated+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.CheckpointRetentionsReconciled+res.RecoveryStalled+res.RecoveryExpired+res.TaskUndispatchedFailed+res.CodexRefreshRecovered+res.CodexAccountParked+res.CodexAccountPromoted+res.CodexAccountFailed+res.ReserveMarked > 0 {
+	if res.WorkersOffline+res.ClaimedReset+res.ClaimedCharged+res.ClaimedExhausted+res.WallParkRequested+res.WallParked+res.StaleFailed+res.StaleRequeued+res.ChatIdleCompleted+res.ProposalsRecovered+res.HealthChanged+res.AutoStopped+res.LimitPromoted+res.PoolResumed+res.LimitReevaluated+res.RecoveryPromoted+res.CompletionBudgetExhausted+res.CustodyReleased+res.CheckpointRetentionsReconciled+res.RecoveryStalled+res.RecoveryExpired+res.TaskUndispatchedFailed+res.CodexRefreshRecovered+res.CodexAccountParked+res.CodexAccountPromoted+res.CodexAccountFailed+res.ReserveMarked > 0 {
 		slog.Info("sweeper pass",
 			"workers_offline", res.WorkersOffline,
 			"claimed_reset", res.ClaimedReset,
+			// Issue #3859: retained-custody continuations whose flight departed unreported are
+			// charged (requeued) or, past the episode budget, parked for the owner.
+			"claimed_charged", res.ClaimedCharged,
+			"claimed_exhausted", res.ClaimedExhausted,
 			// PRD #1497 M1: the wall no longer fails a run — it parks it. wall_park_requested counts
 			// runs asked to self-park (live capable worker); wall_parked counts runs parked
 			// server-side (dead/incapable/unresponsive worker). Both in the sum above and emitted

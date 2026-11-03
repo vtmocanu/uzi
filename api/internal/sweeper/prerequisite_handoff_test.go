@@ -42,6 +42,14 @@ func (q *prerequisiteHandoffLiveness) MarkStaleWorkersOffline(ctx context.Contex
 	return 0, nil
 }
 
+func (q *prerequisiteHandoffLiveness) ChargeClaimedNeverStartedContinuations(context.Context, store.ChargeClaimedNeverStartedContinuationsParams) ([]store.ChargeClaimedNeverStartedContinuationsRow, error) {
+	return nil, nil
+}
+
+func (q *prerequisiteHandoffLiveness) RecordRunRegistrationEvidence(context.Context, store.RecordRunRegistrationEvidenceParams) (int64, error) {
+	return 0, nil
+}
+
 func (q *prerequisiteHandoffLiveness) SweepClaimedNeverStarted(context.Context, pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error) {
 	return nil, nil
 }
