@@ -1926,10 +1926,20 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 	// starts at the same rune offset on every line.
 	payload := compactPayload(m.Payload)
 	// Cross-check activity events (PRD #3166) print as a human line built from validated
-	// fields, through the same capCell(cellText(...)) composition as renderer.Plain. Any
-	// other status payload, including an event this client does not know, keeps the generic row.
+	// fields, through the same capCell(cellText(...)) composition as renderer.Plain.
+	// Diagnostics use that sanitizer too; other payloads keep the generic row.
 	if line, ok := activityMessageLine(m.Kind, m.Payload); ok {
 		payload = capCell(cellText(line), 200)
+	} else if m.Kind == "status" {
+		var diagnostic struct {
+			Event string  `json:"event"`
+			Text  *string `json:"text"`
+		}
+		// Display worker-authored text without interpreting its code or cause.
+		// Missing, null or nonstring text keeps the generic payload row.
+		if json.Unmarshal(m.Payload, &diagnostic) == nil && diagnostic.Event == "cross_check_diagnostic" && diagnostic.Text != nil {
+			payload = capCell(cellText(*diagnostic.Text), 200)
+		}
 	}
 	p.Printf("#%-4d %-16s %-*s %s\n", m.Seq, m.Kind, actorCellWidth, actorCell(m), payload)
 	return nil

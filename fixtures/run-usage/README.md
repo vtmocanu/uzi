@@ -31,7 +31,7 @@ fixtures/run-usage/README.md                     this file
 
 The 84b6a933 pair pins the vanished-model property (below); the 02854d5e pair pins a
 different, independent bug and is documented in its own section, ["The `02854d5e`
-pair"](#the-02854d5e-pair-per-leg-sum-vs-cumulative-max), further down.
+pair"](#the-02854d5e-pair-per-leg-sum-vs-cumulative-max-issue-1079), further down.
 
 Repo root, **owned by neither runtime** — same placement and the same reason as
 `fixtures/judge-fidelity/`. Not `api/internal/workersvc/testdata/`, which is where a

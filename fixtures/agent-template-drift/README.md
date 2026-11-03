@@ -7,7 +7,7 @@ it exists to prevent:
 | | answers | file |
 |---|---|---|
 | server | `SameContent(shipped, stored) bool` | `api/internal/agenttmpl/compare.go:49` |
-| mock (web dev/test double) | `sameContent(row, def) bool` | `web/src/mocks/mockApi.ts` |
+| mock (web dev/test double) | `sameContent(row, def) bool` | `web/src/mocks/mockApi/agents.ts` |
 | client (editor diff panel) | `driftedColumns(shipped, current) string[]` | `web/src/lib/agentTemplates.ts` |
 
 No divergence can be **constructed** today — all three fold `null`/`""` and `null`/`[]`
