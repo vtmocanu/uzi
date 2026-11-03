@@ -100,8 +100,11 @@ func TestOwnerSteeringCapAndTruncationLiveDB(t *testing.T) {
 		ids = append(ids, steeringInput(fx, run, "answer", fmt.Sprintf(`{"answers":["a%d"]}`, i), fmt.Sprintf("q%d", i)))
 	}
 	rows := snapshotSteering(fx, run, 3)
-	if len(rows) != 3 || rows[0].Total != 5 {
-		t.Fatalf("kept %d rows, total %d; want 3 of 5", len(rows), rows[0].Total)
+	if len(rows) != 3 {
+		t.Fatalf("kept %d rows; want 3 of 5", len(rows))
+	}
+	if rows[0].Total != 5 {
+		t.Fatalf("total %d; want 5", rows[0].Total)
 	}
 	for i, r := range rows {
 		if r.InputID.Int64 != ids[2+i] {
@@ -132,6 +135,24 @@ func TestOwnerSteeringCapAndTruncationLiveDB(t *testing.T) {
 	var answers []string
 	if err := json.Unmarshal(r[3].Answers, &answers); err != nil || len(answers) != 2 || len(answers[0]) != 2048+1024 || answers[1] != "short" || !r[3].AnswersTruncated.Bool {
 		t.Fatalf("answer truncation: %v err=%v truncated=%v", len(answers), err, r[3].AnswersTruncated.Bool)
+	}
+
+	// In-between band: past the authoritative cap but inside cap+margin, delivered whole and
+	// still flagged truncated so the Go builder applies the cap after scrubbing.
+	band := fx.queuedRun()
+	steeringInput(fx, band, "revise_plan", strings.Repeat("r", 9000), nil)
+	bandAnswer, _ := json.Marshal(map[string]any{"answers": []string{strings.Repeat("z", 2500)}})
+	steeringInput(fx, band, "answer", string(bandAnswer), "qb")
+	b := snapshotSteering(fx, band, 32)
+	if len(b) != 2 {
+		t.Fatalf("band run returned %d rows, want 2", len(b))
+	}
+	if !b[0].ReviseTruncated.Bool || len(b[0].ReviseBody.String) != 9000 {
+		t.Fatalf("9000-char revise: truncated=%v chars=%d, want whole and flagged", b[0].ReviseTruncated.Bool, len(b[0].ReviseBody.String))
+	}
+	var bandAnswers []string
+	if err := json.Unmarshal(b[1].Answers, &bandAnswers); err != nil || len(bandAnswers) != 1 || len(bandAnswers[0]) != 2500 || !b[1].AnswersTruncated.Bool {
+		t.Fatalf("2500-char answer: %d elements err=%v truncated=%v, want whole and flagged", len(bandAnswers), err, b[1].AnswersTruncated.Bool)
 	}
 }
 
@@ -166,8 +187,11 @@ func TestOwnerSteeringWrongShapeAnswersLiveDB(t *testing.T) {
 			run := fx.queuedRun()
 			steeringInput(fx, run, "answer", tc.body, "q")
 			r := snapshotSteering(fx, run, 32)
-			if len(r) != 1 || r[0].AnswersStatus.String != tc.want {
-				t.Fatalf("status %q, want %q (rows=%d)", r[0].AnswersStatus.String, tc.want, len(r))
+			if len(r) != 1 {
+				t.Fatalf("rows=%d, want 1", len(r))
+			}
+			if r[0].AnswersStatus.String != tc.want {
+				t.Fatalf("status %q, want %q", r[0].AnswersStatus.String, tc.want)
 			}
 			if tc.text != (r[0].Answers != nil) {
 				t.Fatalf("answers projection present=%v, want %v: %s", r[0].Answers != nil, tc.text, r[0].Answers)
@@ -219,7 +243,10 @@ func TestOwnerSteeringWrongShapeQuestionsLiveDB(t *testing.T) {
 			steeringQuestion(fx, run, 1, "lead", payload, 20)
 			steeringAnswerAt(fx, run, `{"answers":["a"]}`, "q1", 10)
 			r := snapshotSteering(fx, run, 32)
-			if len(r) != 1 || r[0].QuestionsStatus.String != tc.want || r[0].Occurrences.Int64 != 1 {
+			if len(r) != 1 {
+				t.Fatalf("rows=%d, want 1", len(r))
+			}
+			if r[0].QuestionsStatus.String != tc.want || r[0].Occurrences.Int64 != 1 {
 				t.Fatalf("status %q occurrences %d, want %q", r[0].QuestionsStatus.String, r[0].Occurrences.Int64, tc.want)
 			}
 			if (tc.want == "ok") != (r[0].Questions != nil) {
@@ -298,16 +325,21 @@ func TestOwnerSteeringContextBindingLiveDB(t *testing.T) {
 	})
 	t.Run("completion continue answer is excluded and uncounted", func(t *testing.T) {
 		run := fx.queuedRun()
-		steeringQuestion(fx, run, 1, "lead", `{"question_id":"qc","questions":[{"header":"Completion blocked","question":"unmet"}]}`, 30)
-		steeringAnswerAt(fx, run, `{"answers":["continue"]}`, "qc", 10)
-		// The audit row is written later and non-transactionally: only the shared question_id links it.
-		mustExec(fx.ctx, t, fx.pool, `INSERT INTO run_user_inputs (run_id, kind, body, question_id, created_at)
-			VALUES ($1, 'completion_decision', 'continue', 'qc', now() - interval '5 seconds')`, run)
 		steeringQuestion(fx, run, 2, "lead", q("q2", "ordinary"), 30)
 		keptID := steeringAnswerAt(fx, run, `{"answers":["a"]}`, "q2", 10)
+		// The completion answer is the NEWEST input, so with MaxEntries=1 a regression would take
+		// the kept slot. The audit row is written non-transactionally: only the shared
+		// question_id links it.
+		steeringQuestion(fx, run, 1, "lead", `{"question_id":"qc","questions":[{"header":"Completion blocked","question":"unmet"}]}`, 30)
+		mustExec(fx.ctx, t, fx.pool, `INSERT INTO run_user_inputs (run_id, kind, body, question_id)
+			VALUES ($1, 'completion_decision', 'continue', 'qc')`, run)
+		steeringAnswerAt(fx, run, `{"answers":["continue"]}`, "qc", 0)
 		r := snapshotSteering(fx, run, 1)
-		if len(r) != 1 || r[0].InputID.Int64 != keptID || r[0].Total != 1 {
-			t.Fatalf("rows=%d first=%d total=%d: the completion answer must take no slot and not count", len(r), r[0].InputID.Int64, r[0].Total)
+		if len(r) != 1 {
+			t.Fatalf("rows=%d: want exactly the ordinary answer", len(r))
+		}
+		if r[0].InputID.Int64 != keptID || r[0].Total != 1 {
+			t.Fatalf("first=%d total=%d: the completion answer must take no slot and not count", r[0].InputID.Int64, r[0].Total)
 		}
 	})
 	t.Run("answer with a different question id than the completion decision is kept", func(t *testing.T) {
@@ -325,8 +357,6 @@ func TestOwnerSteeringContextBindingLiveDB(t *testing.T) {
 	})
 }
 
-// Under pgx statement caching Postgres can switch to a generic plan; the snapshot must stay
-// bounded by the kept entries there too (no CTE re-run per outer row).
 // snapshotStatementSQL returns the SnapshotOwnerSteering statement text from queries/, with sqlc's
 // named parameters rewritten to positional ones.
 func snapshotStatementSQL(t *testing.T) string {
@@ -341,6 +371,8 @@ func snapshotStatementSQL(t *testing.T) string {
 	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(body), ";"))
 }
 
+// Under pgx statement caching Postgres can switch to a generic plan; the snapshot must stay
+// bounded by the kept entries there too (no CTE re-run per outer row).
 func TestOwnerSteeringGenericPlanBoundedLiveDB(t *testing.T) {
 	fx := steeringFixture(t)
 	run := fx.queuedRun()

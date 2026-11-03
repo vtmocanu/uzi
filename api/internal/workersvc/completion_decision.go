@@ -221,7 +221,6 @@ func resumeCompletionBlocked(ctx context.Context, q Store, run store.Run, userID
 		return ErrCompletionNotBlocked
 	}
 
-	answered := false
 	if live {
 		answers := []string{followupGuidance}
 		if followupGuidance == "" {
@@ -231,12 +230,19 @@ func resumeCompletionBlocked(ctx context.Context, q Store, run store.Run, userID
 		if merr != nil {
 			return fmt.Errorf("encode completion continue answer: %w", merr)
 		}
+		// The audit row goes FIRST: it carries the answer's question_id, which is how
+		// SnapshotOwnerSteering recognises the answer as completion guidance. The continue path is
+		// not transactional, so writing the answer first would let a snapshot see it unmarked.
+		if _, err := q.CreateCompletionDecisionInput(ctx, store.CreateCompletionDecisionInputParams{
+			RunID: run.ID, Body: pgconv.TextOrNull(auditBody), QuestionID: pgconv.TextOrNull(run.OpenQuestionID.String),
+		}); err != nil {
+			return err
+		}
 		if _, err := q.CreateRunAnswerInput(ctx, store.CreateRunAnswerInputParams{
 			RunID: run.ID, Body: pgconv.TextOrNull(string(encoded)), QuestionID: pgconv.TextOrNull(run.OpenQuestionID.String),
 		}); err != nil {
 			return err
 		}
-		answered = true
 	} else if followupGuidance != "" {
 		if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{
 			RunID: run.ID, Kind: "follow_up", Body: pgconv.TextOrNull(followupGuidance),
@@ -244,19 +250,13 @@ func resumeCompletionBlocked(ctx context.Context, q Store, run store.Run, userID
 			return err
 		}
 	}
-	if answered {
-		// The audit row carries the continue answer's question_id: that shared id is how
-		// SnapshotOwnerSteering recognises the answer as completion guidance, not plan steering
-		// (the writes are not transactional on the default continue path, so no timestamp links them).
-		if _, err := q.CreateCompletionDecisionInput(ctx, store.CreateCompletionDecisionInputParams{
-			RunID: run.ID, Body: pgconv.TextOrNull(auditBody), QuestionID: pgconv.TextOrNull(run.OpenQuestionID.String),
+	if !live {
+		// The audit row of the answer branch was written above, before the answer.
+		if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{
+			RunID: run.ID, Kind: "completion_decision", Body: pgconv.TextOrNull(auditBody),
 		}); err != nil {
 			return err
 		}
-	} else if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{
-		RunID: run.ID, Kind: "completion_decision", Body: pgconv.TextOrNull(auditBody),
-	}); err != nil {
-		return err
 	}
 	if _, err := q.ClearCompletionBudgetExhausted(ctx, run.ID); err != nil {
 		return err

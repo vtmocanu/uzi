@@ -26,15 +26,18 @@
 --
 -- A completion-continue answer is NOT plan steering and is excluded in sel itself, so it takes no
 -- kept slot and is not counted in tot. resumeCompletionBlocked (workersvc) writes that answer
--- against the run's open completion question and then writes the completion_decision audit row
--- carrying the SAME question_id (CreateCompletionDecisionInput); the two writes are
--- non-transactional on the default continue path, so their timestamps differ and the shared
--- question_id is the only link. sel drops an answer whose question_id has a completion_decision
--- row on the run. The link is a server-written fact, never lead-authored question text.
+-- against the run's open completion question and writes the completion_decision audit row
+-- carrying the SAME question_id (CreateCompletionDecisionInput), the audit row FIRST so a
+-- snapshot never sees the answer without its marker; the two writes are non-transactional on the
+-- default continue path, so their timestamps differ and the shared question_id is the only link.
+-- sel drops an answer whose question_id has a completion_decision row on the run
+-- (idx_run_user_inputs_completion_qid supports that probe). The link is a server-written fact,
+-- never lead-authored question text.
 --
--- Every CTE that is referenced more than once or runs under a locked lead row is MATERIALIZED:
--- under pgx statement caching Postgres can pick a generic plan in which an inlined CTE is
--- re-evaluated per outer row (measured 2.5 s against 16 ms).
+-- The CTEs from ans onward are explicitly MATERIALIZED; sel and kept are referenced more than
+-- once, so Postgres materializes them by default. Under pgx statement caching Postgres can pick
+-- a generic plan in which an inlined CTE is re-evaluated per outer row (measured 2.5 s against
+-- 16 ms).
 WITH cut AS (
     SELECT COALESCE(max(u.id), 0)::bigint AS cutoff
     FROM run_user_inputs u

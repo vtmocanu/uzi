@@ -46,8 +46,11 @@ func TestOwnerSteeringExcludesCompletionContinueAnswerLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].Total != 1 || rows[0].QuestionID.String != ordinary {
-		t.Fatalf("snapshot rows=%d total=%d: want only the ordinary answer %q", len(rows), rows[0].Total, ordinary)
+	if len(rows) != 1 {
+		t.Fatalf("snapshot rows=%d: want only the ordinary answer %q", len(rows), ordinary)
+	}
+	if rows[0].Total != 1 || rows[0].QuestionID.String != ordinary {
+		t.Fatalf("snapshot total=%d question=%q: want only the ordinary answer %q", rows[0].Total, rows[0].QuestionID.String, ordinary)
 	}
 }
 
