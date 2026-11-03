@@ -10808,10 +10808,12 @@ export class GitCache {
    *  contents (the directory itself is still counted). Stops at the
    *  deadline of the injected clock, or at a cap on the entries visited, the pending-directory stack
    *  or the directory depth (the tree is runner-written and hostile), and then reports
-   *  `complete: false`, never a total of zero and never a total claimed complete. */
+   *  `complete: false`, never a total of zero and never a total claimed complete.
+   *  `partialOnIoError` (default off): a directory read or close error carrying a string `code` returns
+   *  the partial total with `complete: false` instead of throwing; an interruption still propagates. */
   private async measureAllocated(
     root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {}, causes: PartialCauses = {},
-    skip?: (rel: string) => boolean,
+    skip?: (rel: string) => boolean, partialOnIoError = false,
   ): Promise<{ bytes: number; entries: number; complete: boolean }> {
     const filesystem = async <T>(action: () => Promise<T>): Promise<T> => {
       try { return await action(); }
@@ -10839,11 +10841,19 @@ export class GitCache {
         this.checkRecoveryInterruption();
         return { bytes, entries: visited + 1, complete: false };
       }
-      try {
+      type Walk = { bytes: number; entries: number; complete: boolean };
+      const walk = async (): Promise<Walk | undefined> => {
         this.checkRecoveryInterruption();
         for (;;) {
           if (now() >= deadline) { countPartialCause(causes, "measurement_deadline"); return { bytes, entries: visited + 1, complete: false }; }
-          const ent = await this.retainedIO(() => filesystem(() => handle.read()));
+          let ent;
+          try { ent = await this.retainedIO(() => filesystem(() => handle.read())); }
+          catch (err) {
+            if (!partialOnIoError) throw err;
+            this.checkRecoveryInterruption();
+            if (typeof (err as NodeJS.ErrnoException | undefined)?.code !== "string") throw err;
+            return { bytes, entries: visited + 1, complete: false };
+          }
           if (!ent) break;
           if (++visited > maxEntries) { countPartialCause(causes, "measurement_entry_cap"); return { bytes, entries: visited + 1, complete: false }; }
           const p = path.join(dir, ent.name);
@@ -10874,9 +10884,23 @@ export class GitCache {
             stack.push({ dir: p, depth: depth + 1, rel: childRel });
           }
         }
-      } finally {
-        await filesystem(() => handle.close());
+        return undefined;
+      };
+      let outcome: Walk | undefined;
+      let bodyFailed = false;
+      let bodyError: unknown;
+      try { outcome = await walk(); } catch (err) { bodyFailed = true; bodyError = err; }
+      try { await filesystem(() => handle.close()); }
+      catch (err) {
+        // Under partialOnIoError a coded close failure keeps the bytes already measured, but only
+        // when the walk itself did not throw (an interruption must not be swallowed here).
+        if (!partialOnIoError || bodyFailed) throw err;
+        this.checkRecoveryInterruption();
+        if (typeof (err as NodeJS.ErrnoException | undefined)?.code !== "string") throw err;
+        return { bytes, entries: visited + 1, complete: false };
       }
+      if (bodyFailed) throw bodyError;
+      if (outcome) return outcome;
     }
     return { bytes, entries: visited + 1, complete: true };
   }
@@ -10894,7 +10918,7 @@ export class GitCache {
   ): Promise<{ bytes: number; inodes: number; complete: boolean }> {
     const caps = { ...opts.caps, maxEntries: opts.caps?.maxEntries ?? RETAINED_SEED_MEASURE_MAX_ENTRIES };
     const skip = opts.includeGitObjects ? undefined : (rel: string) => rel === ".git/objects";
-    const m = await this.measureAllocated(clonePath, opts.now ?? Date.now, opts.deadline, caps, {}, skip);
+    const m = await this.measureAllocated(clonePath, opts.now ?? Date.now, opts.deadline, caps, {}, skip, true);
     return { bytes: m.bytes, inodes: m.entries, complete: m.complete };
   }
 

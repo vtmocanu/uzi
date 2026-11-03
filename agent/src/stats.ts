@@ -216,6 +216,7 @@ export class StatsCollector {
       const derived = dataVolumeStatsFromStatfs(this.statfs(path));
       const used = derived.disk_data_bytes;
       const total = derived.disk_data_total_bytes;
+      // The byte pair gates everything: an invalid byte pair emits nothing, even a valid inode pair.
       if (used === undefined || total === undefined) return;
       stats[usedKey] = used;
       stats[totalKey] = total;
@@ -349,12 +350,14 @@ export class StatsCollector {
 }
 
 /**
- * One statfs sample as the heartbeat's data-volume fields: used = (blocks - bfree) x bsize, total =
- * blocks x bsize (both finite and non-negative, else both omitted), and the inode pair
- * (files - ffree, files) only when it is valid (`files` > 0, 0 <= `ffree` <= `files`, finite), both
- * or neither. A filesystem without inode accounting reports `files` 0 and a bytes-only fake none:
- * the inode pair is then omitted. The single derivation behind {@link StatsCollector}'s heartbeat
- * and the retained-seed admission, so they cannot disagree on a sample.
+ * One statfs sample as data-volume fields: the byte pair (used = (blocks - bfree) x bsize, total =
+ * blocks x bsize; both finite and non-negative, else both omitted) and the inode pair
+ * (files - ffree, files; valid when `files` > 0, 0 <= `ffree` <= `files`, finite; both or neither)
+ * are derived independently, so an invalid byte pair no longer drops a valid inode pair. A
+ * filesystem without inode accounting reports `files` 0 and a bytes-only fake none: the inode pair
+ * is then omitted. The retained-seed admission reads the full result; {@link StatsCollector}'s
+ * heartbeat still emits nothing for the data volume unless the byte pair is valid (the server
+ * contract is unchanged), so admission can be stricter than the heartbeat-driven governor.
  */
 export function dataVolumeStatsFromStatfs(
   raw: StatfsSample,
@@ -362,8 +365,11 @@ export function dataVolumeStatsFromStatfs(
   const { bsize, blocks, bfree, files, ffree } = raw;
   const total = blocks * bsize;
   const used = (blocks - bfree) * bsize;
-  if (!Number.isFinite(total) || !Number.isFinite(used) || total < 0 || used < 0) return {};
-  const out: ReturnType<typeof dataVolumeStatsFromStatfs> = { disk_data_bytes: used, disk_data_total_bytes: total };
+  const out: ReturnType<typeof dataVolumeStatsFromStatfs> = {};
+  if (Number.isFinite(total) && Number.isFinite(used) && total >= 0 && used >= 0) {
+    out.disk_data_bytes = used;
+    out.disk_data_total_bytes = total;
+  }
   if (
     typeof files === "number" &&
     typeof ffree === "number" &&

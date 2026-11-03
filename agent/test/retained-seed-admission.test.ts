@@ -92,9 +92,14 @@ describe("decideRetainedSeedAdmission", () => {
     assert.ok(d.kind === "admit" && Math.abs(d.projected - 0.9225) < 1e-9);
   });
 
-  it("an unusable byte pair leaves the heartbeat's sample unknown, inode fields included", () => {
-    const raw: StatfsSample = { bsize: BSIZE, blocks: Number.NaN, bfree: 0, bavail: 0, files: 1000, ffree: 100 };
-    assert.deepEqual(decideRetainedSeedAdmission({ raw, threshold: 0.95, estimate: COMPLETE(0, 10) }), { kind: "unknown" });
+  it("an unusable byte pair still uses a valid inode pair (stricter than the heartbeat, which omits both)", () => {
+    const raw: StatfsSample = { bsize: BSIZE, blocks: Number.NaN, bfree: 0, bavail: 0, files: 1000, ffree: 50 };
+    // inodes: (1000 - 50) / 1000 = 0.95 current, at or over 0.87.
+    assert.deepEqual(decideRetainedSeedAdmission({ raw, threshold: 0.87, estimate: COMPLETE(0, 10) }), {
+      kind: "refuse_current",
+      current: 0.95,
+      threshold: 0.87,
+    });
   });
 
   it("an invalid or absent inode pair falls back to bytes", () => {
@@ -212,6 +217,54 @@ describe("measureRetainedSeedFootprint", () => {
       deadline: far(),
     });
     assert.deepEqual(missing, { bytes: 0, inodes: 0, complete: false });
+  });
+
+  /** Run `body` with fs.opendir patched so the handle of the `node_modules` directory is altered. */
+  async function withNestedHandle<T>(alter: (h: fs.Dir) => void, body: () => Promise<T>): Promise<T> {
+    const fsp = (await import("node:fs/promises")).default;
+    const real = fsp.opendir;
+    fsp.opendir = (async (p: any, o?: any) => {
+      const h = await real.call(fsp, p, o);
+      if (path.basename(String(p)) === "node_modules") alter(h);
+      return h;
+    }) as typeof fsp.opendir;
+    try { return await body(); } finally { fsp.opendir = real; }
+  }
+
+  it("a coded directory read error keeps the bytes measured so far and reports incomplete", async () => {
+    const clone = tree();
+    const g = cache();
+    const full = await g.measureRetainedSeedFootprint(clone, { includeGitObjects: true, deadline: far() });
+    const m = await withNestedHandle(
+      h => { h.read = (async () => { throw Object.assign(new Error("io"), { code: "EIO" }); }) as typeof h.read; },
+      () => g.measureRetainedSeedFootprint(clone, { includeGitObjects: true, deadline: far() }),
+    );
+    assert.equal(m.complete, false);
+    assert.ok(m.bytes > 0 && m.bytes < full.bytes, `partial ${m.bytes} of ${full.bytes}`);
+    assert.ok(m.inodes > 0 && m.inodes < full.inodes);
+  });
+
+  it("a coded directory close error keeps the bytes measured so far and reports incomplete", async () => {
+    const clone = tree();
+    const g = cache();
+    const m = await withNestedHandle(
+      h => { h.close = (async () => { throw Object.assign(new Error("io"), { code: "EIO" }); }) as typeof h.close; },
+      () => g.measureRetainedSeedFootprint(clone, { includeGitObjects: true, deadline: far() }),
+    );
+    assert.equal(m.complete, false);
+    assert.ok(m.bytes > 0);
+  });
+
+  it("a directory read error without a code still throws", async () => {
+    const clone = tree();
+    const g = cache();
+    await assert.rejects(
+      withNestedHandle(
+        h => { h.read = (async () => { throw new Error("no code"); }) as typeof h.read; },
+        () => g.measureRetainedSeedFootprint(clone, { includeGitObjects: true, deadline: far() }),
+      ),
+      /no code/,
+    );
   });
 
   it("does not swallow a recovery interruption", async () => {

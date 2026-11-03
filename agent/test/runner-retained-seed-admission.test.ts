@@ -102,7 +102,7 @@ async function drive(o: Opts, prepare?: (ctx: { claim: ReturnType<typeof gitlabC
   client.reportState = async (runId, body, signal) => {
     if (body.status === "recovery_wait" && body.recovery_cause === "retained_recovery_exhausted") {
       r.parks.push(body);
-      api.setOwnershipStatus(runId, "recovery_wait", 2);
+      api.setOwnershipStatus(runId, "recovery_wait", body.claim_generation as number);
       return { applied: true, status: "recovery_wait", recoveryCause: "retained_recovery_exhausted" };
     }
     return report(runId, body, signal);

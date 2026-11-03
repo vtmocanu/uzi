@@ -243,7 +243,19 @@ describe("StatsCollector — disk sampling (PRD #837 M1)", () => {
     assert.strictEqual(fixedCollected.disk_data_total_bytes, fixed.disk_data_total_bytes);
     assert.strictEqual(fixedCollected.disk_data_inodes, fixed.disk_data_inodes);
     assert.strictEqual(fixedCollected.disk_data_total_inodes, fixed.disk_data_total_inodes);
-    for (const raw of cases) {
+    // Invalid byte pair, valid inode pair: the pure derivation keeps the inode pair (admission uses
+    // it), the heartbeat emits NOTHING for the data volume (server contract unchanged).
+    const badBytes = cases[7]!;
+    assert.deepStrictEqual(dataVolumeStatsFromStatfs(badBytes), { disk_data_inodes: 9, disk_data_total_inodes: 10 });
+    const badCollected = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs: () => badBytes, dataDir: "/data" }).collect();
+    assert.ok(badCollected);
+    assert.strictEqual(badCollected.disk_data_bytes, undefined);
+    assert.strictEqual(badCollected.disk_data_total_bytes, undefined);
+    assert.strictEqual(badCollected.disk_data_inodes, undefined);
+    assert.strictEqual(badCollected.disk_data_total_inodes, undefined);
+    const nanBlocks: StatfsSample = { bsize: 4096, blocks: Number.NaN, bfree: 0, bavail: 0, files: 1000, ffree: 50 };
+    assert.deepStrictEqual(dataVolumeStatsFromStatfs(nanBlocks), { disk_data_inodes: 950, disk_data_total_inodes: 1000 });
+    for (const raw of cases.slice(0, 7)) {
       const c = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs: () => raw, dataDir: "/data" });
       const s = c.collect();
       assert.ok(s);
@@ -253,6 +265,12 @@ describe("StatsCollector — disk sampling (PRD #837 M1)", () => {
         ...(s.disk_data_inodes !== undefined ? { disk_data_inodes: s.disk_data_inodes } : {}),
         ...(s.disk_data_total_inodes !== undefined ? { disk_data_total_inodes: s.disk_data_total_inodes } : {}),
       };
+      if (raw.bfree > raw.blocks) {
+        // Negative used bytes: invalid byte pair, so the heartbeat is empty though the inode pair is valid.
+        assert.deepStrictEqual(heartbeat, {}, JSON.stringify(raw));
+        assert.deepStrictEqual(dataVolumeStatsFromStatfs(raw), { disk_data_inodes: 9, disk_data_total_inodes: 10 });
+        continue;
+      }
       assert.deepStrictEqual(dataVolumeStatsFromStatfs(raw), heartbeat, JSON.stringify(raw));
     }
   });

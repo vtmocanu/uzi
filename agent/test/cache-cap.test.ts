@@ -183,8 +183,14 @@ describe("hard layer and retained-seed admission share one pressure predicate (i
         watch(h, "r1", 3 * GIB);
         await h.gov.boundary("r1", quiet);
         const threshold = h.gov.effectiveHardThreshold();
-        const fraction = dataVolumeUsedFraction(dataVolumeStatsFromStatfs(raw));
+        const stats = dataVolumeStatsFromStatfs(raw);
+        // The governor reads the heartbeat, which omits the whole data volume (inodes included)
+        // when the byte pair is invalid; the admission reads the full derivation.
+        const bytesInvalid = stats.disk_data_bytes === undefined;
+        const fraction = dataVolumeUsedFraction(bytesInvalid ? {} : stats);
+        const admissionFraction = dataVolumeUsedFraction(stats);
         const expected = fraction !== undefined && atHardStopPressure(fraction, threshold);
+        const admissionExpected = admissionFraction !== undefined && atHardStopPressure(admissionFraction, threshold);
         const row = `${name} @ api ${apiThreshold} margin ${hardMargin}`;
 
         h.gov.observe(fraction);
@@ -192,10 +198,25 @@ describe("hard layer and retained-seed admission share one pressure predicate (i
         assert.strictEqual(h.stops.length > 0, expected, `governor: ${row}`);
 
         const d = decideRetainedSeedAdmission({ raw, threshold, estimate: undefined });
-        assert.strictEqual(d.kind === "refuse_current", expected, `admission: ${row}`);
-        assert.strictEqual(d.kind === "unknown", fraction === undefined, `unknown: ${row}`);
+        assert.strictEqual(d.kind === "refuse_current", admissionExpected, `admission: ${row}`);
+        assert.strictEqual(d.kind === "unknown", admissionFraction === undefined, `unknown: ${row}`);
+        // Parity holds for every row with a valid byte pair; the invalid-byte rows are
+        // admission-stricter only (never looser).
+        if (!bytesInvalid) assert.strictEqual(d.kind === "refuse_current", expected, `parity: ${row}`);
+        else assert.ok(!expected, `governor never stops on an omitted volume: ${row}`);
       }
     }
+  });
+
+  it("invalid bytes with high inodes: the governor (heartbeat) does not stop but admission refuses at 0.87", async () => {
+    const raw: StatfsSample = { bsize: 4096, blocks: Number.NaN, bfree: 0, bavail: 0, files: 1000, ffree: 50 };
+    const h = harness({ threshold: undefined, config: { hardMargin: 0.03 } });
+    watch(h, "r1", 3 * GIB);
+    await h.gov.boundary("r1", quiet);
+    h.gov.observe(undefined);
+    await settle();
+    assert.strictEqual(h.stops.length, 0);
+    assert.strictEqual(decideRetainedSeedAdmission({ raw, threshold: 0.87, estimate: undefined }).kind, "refuse_current");
   });
 
   it("the effective threshold is the one the governor judges against", () => {
