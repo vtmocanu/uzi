@@ -462,7 +462,7 @@ body[data-scenario="calm"] .station.gate-st .st-count { color: rgb(var(--fg)); }
         <a class="nav-item" href="#"><svg class="ic" aria-label="GitLab"><use href="#i-gl"/></svg>team-beta/billing-service</a>
         <a class="nav-item" href="#"><svg class="ic" aria-label="GitHub"><use href="#i-gh"/></svg>vtmocanu/atlas-api</a>
       </div>
-      <a class="nav-item" href="#"><svg class="ic lg"><use href="#i-runs"/></svg>Runs<span class="countpill" aria-label="5 of your runs are active">5</span></a>
+      <a class="nav-item" href="#"><svg class="ic lg"><use href="#i-runs"/></svg>Runs<span class="countpill" id="nav-runs" aria-label="5 of your runs are active">5</span></a>
       <a class="nav-item" href="#"><svg class="ic lg"><use href="#i-bug"/></svg>Findings<span class="countpill" aria-label="More than 99 findings to triage">99+</span></a>
       <a class="nav-item" href="#"><svg class="ic lg"><use href="#i-clock"/></svg>Schedules<span class="countpill" aria-label="12 enabled schedules">12</span></a>
       <a class="nav-item" href="#"><svg class="ic lg"><use href="#i-chat"/></svg>Chat</a>
@@ -964,6 +964,9 @@ body[data-scenario="calm"] .station.gate-st .st-count { color: rgb(var(--fg)); }
       if (k === 'asking') { el.textContent = n('asking') ? by.asking[0].dataset.ref + ' paused on a question' : 'No open questions'; return; }
       el.textContent = subs[k][n(k) ? 0 : 1];
     });
+    var mineActive = rows.filter(function (r) { return inScope(r) && r.dataset.owner === 'me' && r.dataset.stage !== 'pr'; }).length;
+    var navRuns = document.getElementById('nav-runs');
+    navRuns.textContent = mineActive; navRuns.setAttribute('aria-label', mineActive + ' of your runs are active');
     var onLine = n('queued') + n('planning') + n('review') + n('building') + n('asking') + n('parked');
     document.getElementById('line-note').textContent = onLine + ' runs on the line, ' + n('other') + ' other, all users';
     var exec = rows.filter(function (r) { return inScope(r) && r.dataset.exec === '1'; }).length;
