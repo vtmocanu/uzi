@@ -952,6 +952,11 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// Do NOT wrap the whole /runs group in RequireUser — that shortcut passes the trio
 		// 404 and the admin checks while silently exposing those two; the inner split is the
 		// point.
+		r.Group(func(r chi.Router) {
+			r.Use(h.requireUser())
+			r.Get("/cross-checks/availability", h.CrossCheckHistoryAvailability)
+			r.Get("/cross-checks", h.ListCrossCheckHistory)
+		})
 		r.Route("/runs", func(r chi.Router) {
 			r.Group(func(r chi.Router) {
 				r.Use(h.requireUser())

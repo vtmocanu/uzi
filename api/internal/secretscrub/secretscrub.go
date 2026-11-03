@@ -15,7 +15,11 @@
 // line of defense, never a licence to route a secret through a surface.
 package secretscrub
 
-import "regexp"
+import (
+	"regexp"
+	"sort"
+	"strings"
+)
 
 // The credential families uzi handles. Kept close to slacksvc's originals so the
 // extraction is behaviour-preserving, then widened (PRD #954 M1, change A):
@@ -24,6 +28,11 @@ import "regexp"
 //     families); slackRefresh covers xoxe- refresh tokens, which fall OUTSIDE the
 //     x(?:ox[bpoas]|app)- shape;
 //   - anthropic covers sk-ant- keys;
+//   - history-only openai covers classic sk- keys and project / service-account keys. Its
+//     16-character minimum applies to the body AFTER any proj- / svcacct- prefix,
+//     preserving short display prefixes. Classic bodies are alphanumeric; scoped
+//     bodies also admit URL-safe '_' and '-'. No upper bound: redact the whole
+//     credential rather than leave a suffix when provider lengths change;
 //   - gitlabPAT covers the GitLab 9-family set (glpat-/gloas-/glrt-/glcbt-/glptt-/
 //     glsoat-/glimt-/glagent-/gldt-), matching the snapshot list — widened from
 //     glpat- alone to close a live outbound-Slack scrub gap;
@@ -43,6 +52,7 @@ var (
 	slackTokenPattern      = regexp.MustCompile(`x(?:ox[bpoas]|app)-[A-Za-z0-9-]+`)
 	slackRefreshPattern    = regexp.MustCompile(`xoxe-[A-Za-z0-9-]+`)
 	anthropicPattern       = regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]+`)
+	openaiPattern          = regexp.MustCompile(`sk-(?:(?:proj|svcacct)-[A-Za-z0-9_-]{16,}|[A-Za-z0-9]{16,})`)
 	gitlabPATPattern       = regexp.MustCompile(`gl(pat|oas|rt|cbt|ptt|soat|imt|agent|dt)-[A-Za-z0-9_-]{16,}`)
 	githubClassicPattern   = regexp.MustCompile(`gh[pousr]_[A-Za-z0-9_]{16,}`)
 	githubFineGrainPattern = regexp.MustCompile(`github_pat_[A-Za-z0-9_]{16,}`)
@@ -59,6 +69,61 @@ func Scrub(s string) string {
 	s = githubFineGrainPattern.ReplaceAllString(s, "[redacted]")
 	s = uziTokenPattern.ReplaceAllString(s, "[redacted]")
 	return s
+}
+
+// ScrubHistory applies conservative, overlap-safe credential redaction only to
+// history displays. It deliberately recognizes credential shapes within text;
+// callers scrub the complete normalized value before applying display bounds.
+func ScrubHistory(s string) string {
+	// Match the original input and merge overlapping spans so history scrubbing cannot
+	// expose credential fragments by replacing another family first.
+	var matches [][]int
+	for _, pattern := range []*regexp.Regexp{
+		slackTokenPattern, slackRefreshPattern, anthropicPattern, openaiPattern,
+		gitlabPATPattern, githubClassicPattern, githubFineGrainPattern, uziTokenPattern,
+	} {
+		for offset := 0; offset < len(s); {
+			match := pattern.FindStringIndex(s[offset:])
+			if match == nil {
+				break
+			}
+			match[0] += offset
+			match[1] += offset
+			matches = append(matches, match)
+			// A classic OpenAI body excludes hyphens: another sk- prefix can
+			// cross its end by two bytes. Other registered families include
+			// their prefix alphabet in their body, so internal matches cannot
+			// extend beyond the greedy match. Keep only that two-byte overlap
+			// instead of rescanning whole bodies (which would be quadratic).
+			offset = max(match[0]+1, match[1]-2)
+		}
+	}
+	if len(matches) == 0 {
+		return s
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i][0] < matches[j][0]
+	})
+
+	var result strings.Builder
+	previousEnd := 0
+	start, end := matches[0][0], matches[0][1]
+	for _, match := range matches[1:] {
+		if match[0] < end {
+			if match[1] > end {
+				end = match[1]
+			}
+			continue
+		}
+		result.WriteString(s[previousEnd:start])
+		result.WriteString("[redacted]")
+		previousEnd = end
+		start, end = match[0], match[1]
+	}
+	result.WriteString(s[previousEnd:start])
+	result.WriteString("[redacted]")
+	result.WriteString(s[end:])
+	return result.String()
 }
 
 // ScrubSlackTokens replaces only Slack token substrings — the bot/app/user families

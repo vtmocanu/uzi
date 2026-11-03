@@ -37,6 +37,7 @@ type Client interface {
 	// is additive to Whoami, which stays `{user}`-only so `uzi whoami` is unchanged.
 	WhoamiVault(ctx context.Context) (apitypes.UserDTO, bool, error)
 	ListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, error)
+	CrossCheckHistory(ctx context.Context, opts CrossCheckHistoryOptions) (apitypes.CrossCheckHistoryDTO, error)
 	// ListRunSummaries is ListRuns' compact projection (GET /api/runs?view=summary, issue
 	// #2661): the same rows without the heavy detail fields (plan_md, repo_agents,
 	// issue_description, preserved_patch). The TUI board polls this; `uzi run list --json`

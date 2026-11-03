@@ -1,4 +1,28 @@
-import type { FileFindingRequest, FindingGroupFileRequest } from "./apiTypes";
+import type { CrossCheckHistoryDTO, CrossCheckHistoryAvailabilityDTO, FileFindingRequest, FindingGroupFileRequest } from "./apiTypes";
+import crossHistoryFull from "../../../fixtures/api-contract/cross_check_history.full.json";
+import crossHistoryZero from "../../../fixtures/api-contract/cross_check_history.zero.json";
+import crossAvailabilityFull from "../../../fixtures/api-contract/cross_check_history_availability.full.json";
+import crossAvailabilityZero from "../../../fixtures/api-contract/cross_check_history_availability.zero.json";
+
+it("consumes cross-check history full and zero contracts", () => {
+  const full: CrossCheckHistoryDTO = crossHistoryFull;
+  const historyKeys: never = null as unknown as Exclude<keyof CrossCheckHistoryDTO, keyof typeof crossHistoryFull> | Exclude<keyof typeof crossHistoryFull, keyof CrossCheckHistoryDTO>;
+  type Group = CrossCheckHistoryDTO["groups"][number];
+  type RecordedGroup = typeof crossHistoryFull.groups[number];
+  const groupKeys: never = null as unknown as Exclude<keyof Group, keyof RecordedGroup> | Exclude<keyof RecordedGroup, keyof Group>;
+  type Attempt = Group["attempts"][number];
+  type RecordedAttempt = RecordedGroup["attempts"][number];
+  const attemptKeys: never = null as unknown as Exclude<keyof Attempt, keyof RecordedAttempt> | Exclude<keyof RecordedAttempt, keyof Attempt>;
+  const availabilityKeys: never = null as unknown as Exclude<keyof CrossCheckHistoryAvailabilityDTO, keyof typeof crossAvailabilityFull> | Exclude<keyof typeof crossAvailabilityFull, keyof CrossCheckHistoryAvailabilityDTO>;
+  void [historyKeys, groupKeys, attemptKeys, availabilityKeys];
+  const zero: Omit<CrossCheckHistoryDTO, "groups"> & { groups: CrossCheckHistoryDTO["groups"] | null } = crossHistoryZero;
+  const available: CrossCheckHistoryAvailabilityDTO = crossAvailabilityFull;
+  const empty: CrossCheckHistoryAvailabilityDTO = crossAvailabilityZero;
+  expect(full.groups[0].attempts[0].stage).toBe("x");
+  expect(zero.groups).toBeNull();
+  expect(available.available).toBe(true);
+  expect(empty.available).toBe(false);
+});
 import fileFindingRequestZero from "../../../fixtures/api-contract/file_finding_request.zero.json";
 import fileFindingRequestFull from "../../../fixtures/api-contract/file_finding_request.full.json";
 import findingGroupFileRequestZero from "../../../fixtures/api-contract/finding_group_file_request.zero.json";

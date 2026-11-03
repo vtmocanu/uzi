@@ -11,6 +11,25 @@ with its own status dot, collapsed-by-default logs so a live run doesn't
 drag your scroll position around, and a steer queue that tells you whether
 a follow-up you sent actually reached the worker.
 
+## Find a run or cross-check
+
+Open **Runs** at `/runs` for active work and **Past runs** at
+`/runs/history` for the archive. Open a work run to reach this activity pane.
+
+When your account has retained cross-check evidence, **What to list** offers
+**Runs** and **Cross-checks**. In Cross-checks scope the same routes show
+**Active** and **Past checks**, with Plan and Code attempts grouped by parent
+work run. The view is owner-only, including for admins. Parent and checker
+links use the existing run detail routes.
+
+A scope click updates the URL and saves a browser preference per user ID.
+A valid `scope=runs` or `scope=cross-checks` URL overrides that preference
+without saving it. The retained-history availability guard falls back to
+Runs while loading, empty or unavailable, and offers retry on an error.
+Disabling cross-check settings does not remove retained evidence.
+See [Browse retained cross-checks](./cross-check.md#browse-retained-cross-checks)
+for lifecycle, filters, page counts and loading earlier attempts.
+
 ## Plan approval gate
 
 Before implementation starts, a run parks at `awaiting_approval` with the

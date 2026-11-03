@@ -23,6 +23,9 @@ export const MOCK_MODE = import.meta.env.VITE_UZI_MOCK === "1";
 // type import below names only the DTOs this module's own code (realApi, the
 // request helpers, ProjectSyncVisibility) references in its signatures.
 import type {
+  CrossCheckHistoryDTO,
+  CrossCheckHistoryAvailabilityDTO,
+  CrossCheckHistoryParams,
   AdminBlockedRepos,
   AdminMaintenance,
   MaintenanceState,
@@ -1269,6 +1272,15 @@ const realApi = {
   createCIFixRun: (repoId: string, ref: string) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/ci-fix-runs`, { ref }),
   listRuns,
+  crossCheckHistoryAvailability: () => request<CrossCheckHistoryAvailabilityDTO>("GET", "/cross-checks/availability"),
+  listCrossCheckHistory: (params: CrossCheckHistoryParams = {}) => {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (Array.isArray(value)) for (const cursor of value) query.append(key, cursor);
+      else if (value !== undefined) query.set(key, String(value));
+    }
+    return request<CrossCheckHistoryDTO>("GET", `/cross-checks?${query}`);
+  },
   getRun: (id: string, reconciliationBeforeGateRevision?: number, passive = false) =>
     request<{ run: Run }>("GET", `/runs/${id}${reconciliationBeforeGateRevision === undefined ? "" : `?reconciliation_before_gate_revision=${reconciliationBeforeGateRevision}`}`, undefined, passive ? { "X-Uzi-Passive": "1" } : undefined),
   /** The caller's own token/cost usage (PRD #40): lifetime + last-7-days + run count. */
