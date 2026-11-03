@@ -290,8 +290,9 @@ headers, not the rows.
 ## How the fakes are wired (no real GitLab, no live session)
 
 Run `task test:forge-fake-contract` standalone without Compose or Docker. It
-requires Go, Git, OpenSSL with IP SAN support, and Node with built-in TypeScript
-transform support (22.13+; capability-probed). It drives production worker MR
+requires Go, Git, OpenSSL with IP SAN support, and Node with capability-probed
+built-in TypeScript strip support for erasable production TypeScript. Future
+unsupported syntax fails loudly. It drives production worker MR
 create/read/description-update/head operations and Go forge reads, refs, ancestry,
 MR summaries and paginated issue comments across GitLab, GitHub and Forgejo,
 using real HTTPS and independently seeded bare Git repos. Go has no MR create or
