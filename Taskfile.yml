@@ -360,6 +360,9 @@ tasks:
       # welded onto / bled into a db_psql scalar read is stripped (#1351). Tally-guarded like the two
       # siblings above so a gutted run cannot read green.
       - task: test:e2e-lib
+      # Compose CLI rendering is separate from the Docker-free helper suite.
+      # CI requires it; local hosts without Compose get an explicit SKIP, never a fake PASS.
+      - task: test:e2e-compose-config
       # hermetic (~instant, fake docker, no daemon): the strict verdict of the scheduled Codex
       # packaged proof (#3148), so a proof that skips, fails a control or loses its image identity
       # cannot read green. Tally-guarded like test:e2e-lib.
@@ -1249,6 +1252,11 @@ tasks:
       # asserts the tally exists, c == p, and c >= 8 (the 8 PRD #966 M2 driver behaviours;
       # the test emits more as sub-cases are added). See the script header.
       - ./scripts/check-e2e-driver.sh
+
+  test:e2e-compose-config:
+    desc: E2E Compose overlay rendering (no daemon; required in CI, visible local skip without Compose)
+    cmds:
+      - bash ./e2e/compose-config.test.sh
 
   test:e2e-lib:
     desc: hermetic regression for e2e DB reads, custody waits, storage evidence and meter fixtures (no stack, no docker)
