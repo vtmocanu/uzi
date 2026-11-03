@@ -2665,6 +2665,8 @@ interface RunFlight {
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
    *  not spam the feed. */
   reportedPublishOutcomes: Set<string>;
+  /** Normalized preservation diagnostic attempts for this flight; never reset by publication. */
+  reportedPreservationRefusals?: Set<string>;
   /** issue #1597 M2: the per-flight SINK GATE. Every path that moves the run's durable state while
    *  the turn is live (the checkpoint closure, parkForPause, parkForWall, enterCompletionHold and
    *  the credential-switch attempt) runs under `sinkGate.run`; the mid-turn checkpoint tick only
@@ -16980,17 +16982,50 @@ export class RunRunner {
   private preservationRefused(flight: RunFlight, reason: string): PreservationRefusedError {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
-    flight.runLog.warn("tracking preservation refused", {
-      run_id: flight.runId, reason: sanitizeForLog(reason, 80),
-    });
-    if (reason !== "owed_limit") return new PreservationRefusedError();
+    if (reason !== "owed_limit") {
+      this.reportPreservationRefusal(flight, reason);
+      return new PreservationRefusedError();
+    }
     // The per-run owed-candidate cap is permanent for this run: a checkpoint that merely skips
     // would let the agent keep rewriting unpreserved heads. Remember the stop; the live-executor
     // checkpoint sites act on it (stopForOwedLimit) and dispatchFailure reports it.
     flight.owedLimitStop ??= new PreservationRefusedError(
       `tracking preservation refused: the retained owed-head limit (${MAX_OWED_CANDIDATES_PER_RUN}) was reached; ` +
       "existing retained heads and the working clone are kept. Use uzi run recovery or uzi run export.");
+    this.reportPreservationRefusal(flight, reason);
     return flight.owedLimitStop;
+  }
+
+  private reportPreservationRefusal(flight: RunFlight, input: unknown): void {
+    let reason: string;
+    switch (input) {
+      case "ownership_unknown":
+      case "preservation_failed":
+      case "owed_limit":
+      case "receipt_pending_failed":
+      case "tracking_update_failed":
+      case "owner_stamp_failed":
+      case "receipt_commit_failed":
+      case "wip_marker_unsafe":
+        reason = input;
+        break;
+      default:
+        reason = "unknown";
+    }
+    flight.runLog.warn("tracking preservation refused", { run_id: flight.runId, reason });
+    const attempted = flight.reportedPreservationRefusals ??= new Set<string>();
+    if (attempted.has(reason)) return;
+    // Mark before delivery, including closed or failed feeds: at most nine attempts per flight.
+    attempted.add(reason);
+    if (flight.owedFeedClosed) return;
+    try {
+      flight.batcher.emit({ kind: "status", agent: "worker", payload: {
+        text: `tracking preservation refused (reason=${reason}); inspect retained-work status with uzi run recovery.`,
+      } });
+    } catch {
+      // Diagnostic delivery cannot replace the preservation result. A transport overflow
+      // may still fail/abort its reservation; keep that authority veto intact.
+    }
   }
 
   /** Called after every executor-driven checkpoint (mid-turn tick and ctx.checkpoint). A cap

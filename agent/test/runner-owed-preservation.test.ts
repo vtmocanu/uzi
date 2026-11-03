@@ -6,9 +6,17 @@ import { execFileSync } from "node:child_process";
 import type { Executor } from "../src/executor.js";
 import type { FetchAgentBranchOptions, TrackingUpdateResult } from "../src/git.js";
 import { LimitReachedError } from "../src/limit.js";
-import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, deferred } from "./runner-harness.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith, deferred, homeDir } from "./runner-harness.js";
 
 installHarness();
+
+function refusalMessages(runId: string): string[] {
+  return api.messages(runId).map(m => (m.payload as { text?: string }).text ?? "")
+    .filter(text => text.startsWith("tracking preservation refused (reason="));
+}
+function refusalStatus(reason: string): string {
+  return `tracking preservation refused (reason=${reason}); inspect retained-work status with uzi run recovery.`;
+}
 
 function commit(dir: string): void {
   fs.writeFileSync(path.join(dir, "OWED.txt"), "owed work\n");
@@ -53,6 +61,7 @@ for (const reason of ["preservation_failed", "owner_stamp_failed", "receipt_comm
       },
     };
     await runner(exec, gitlab).execute(claim);
+    assert.deepEqual(refusalMessages(claim.run_id), [refusalStatus(reason)]);
     assert.equal(fs.existsSync(clone), true, "refused preservation retains the source clone");
     assert.equal(options?.context.generation, 7);
     assert.equal(options?.context.kind, "issue");
@@ -61,6 +70,47 @@ for (const reason of ["preservation_failed", "owner_stamp_failed", "receipt_comm
     assert.equal(options?.remotelyConfirmedSha, undefined);
   });
 }
+
+it("a confirmed checkpoint does not reset preservation diagnostic attempts", async () => {
+  const claim = gitlabClaim(1935);
+  const { gitlab } = fakeGitlab();
+  const fetch = git.fetchAgentBranch.bind(git);
+  let fetches = 0;
+  let confirmed = 0;
+  let publishedTip = "";
+  let expectedTip = "";
+  let continued = false;
+  let clock = Date.now();
+  git.fetchAgentBranch = async (...args) => {
+    if (++fetches !== 2) return { kind: "not_updated", reason: "preservation_failed" };
+    return fetch(...args);
+  };
+  client.publishCheckpoint = async (_run, _tip, pack) => {
+    for await (const _chunk of pack) {}
+    confirmed++;
+    return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/diagnostic-success" } };
+  };
+  await runner({ run: async ctx => {
+    commit(ctx.worktreePath);
+    expectedTip = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
+    await ctx.checkpoint!({ reap: false }); // Refusal.
+    await ctx.checkpoint!({ reap: false }); // Real owned fetch, pack and confirmed publication.
+    assert.equal(confirmed, 1);
+    fs.writeFileSync(path.join(ctx.worktreePath, "LATER.txt"), "later work\n");
+    gitIn(ctx.worktreePath, ["add", "LATER.txt"]);
+    gitIn(ctx.worktreePath, ["-c", "user.name=test", "-c", "user.email=test@example.com",
+      "-c", "commit.gpgsign=false", "commit", "-m", "later work"]);
+    await ctx.checkpoint!({ reap: false }); // Same class after success.
+    continued = true;
+    throw new Error("stop after diagnostic persistence assertions");
+  } }, gitlab, undefined, { checkpointIntervalMs: 1, now: () => clock += 1000,
+    checkpointTestHooks: { afterPinnedPublish: state => { publishedTip = state.lastPublishedTip ?? ""; } },
+  }).execute(claim);
+  assert.equal(continued, true);
+  assert.equal(publishedTip, expectedTip);
+  assert.ok(fetches >= 3);
+  assert.deepEqual(refusalMessages(claim.run_id), [refusalStatus("preservation_failed")]);
+});
 
 it("same SHA with a lost owner stamp fetches again and never publishes an unowned head", async () => {
   const claim = gitlabClaim(1925);
@@ -98,9 +148,11 @@ for (const sink of ["finalize", "limit-park", "shutdown"] as const) {
     const { gitlab } = fakeGitlab();
     const publication = forbidPublication();
     git.fetchAgentBranch = (async (): Promise<TrackingUpdateResult> => ({ kind: "not_updated", reason: "preservation_failed" })) as unknown as typeof git.fetchAgentBranch;
+    const marker = path.join(homeDir, "preservation-session");
+    fs.writeFileSync(marker, "retained session");
     const started = deferred();
     let clone = "";
-    const r = runner({
+    const executor: Executor = {
       run: async ctx => {
         clone = ctx.worktreePath;
         commit(clone);
@@ -112,7 +164,8 @@ for (const sink of ["finalize", "limit-park", "shutdown"] as const) {
         }
         return { branch: ctx.branch };
       },
-    }, gitlab);
+    };
+    const r = runnerWith(() => ({ executor, homeDir }), gitlab);
     const execution = r.execute(claim);
     if (sink === "shutdown") {
       await started.promise;
@@ -122,6 +175,8 @@ for (const sink of ["finalize", "limit-park", "shutdown"] as const) {
     assert.equal(publication.packs(), 0);
     assert.equal(publication.brokers(), 0);
     assert.equal(fs.existsSync(clone), true);
+    assert.equal(fs.readFileSync(marker, "utf8"), "retained session");
+    assert.deepEqual(refusalMessages(claim.run_id), [refusalStatus("preservation_failed")]);
     assert.equal(api.states.some(s => s.body.status === "completed"), false);
     assert.equal(api.states.some(s => s.body.checkpoint_contains_latest === true), false);
     if (sink === "limit-park") assert.equal(api.states.some(s => s.body.status === "limit_wait"), true);
