@@ -1,5 +1,8 @@
 import type { WorkerRunMessage } from "./protocol.js";
-import { DISPATCH_OPEN_AT_TURN_END, DISPATCH_STOPPED, DISPATCH_STREAM_FAILED } from "./codex/dispatch-diagnostics.js";
+import {
+  CHILD_TIMEOUT_BOUND_PREFIX, CHILD_TIMEOUT_BOUND_SUFFIX,
+  DISPATCH_OPEN_AT_TURN_END, DISPATCH_STOPPED, DISPATCH_STREAM_FAILED,
+} from "./codex/dispatch-diagnostics.js";
 
 // Read-side evidence only. No inferred shell gates, ownership, timeout or budget.
 const INTERRUPTIONS = new Set([DISPATCH_STOPPED, DISPATCH_OPEN_AT_TURN_END, DISPATCH_STREAM_FAILED]);
@@ -98,6 +101,30 @@ function outcome(p: Record<string, unknown>): Outcome {
       return r?.["type"] === "text" && typeof r["text"] === "string";
     }));
   return recognized ? (p["is_error"] ? "failed" : "success") : "unknown";
+}
+// Exactly the labels formatChildTurnBudget (codex/child-budget.ts) can emit, fractional
+// overrides included: a whole minute always renders as minutes, so N-second excludes N % 60 == 0.
+function budgetLabel(label: string): boolean {
+  if (label === "unknown" || label === "very long") return true;
+  if (/^[1-9]\d{0,3}-minute$/.test(label) || /^[1-9]\d{0,8} ms$/.test(label)) return true;
+  return /^[1-9]\d{0,4}-second$/.test(label) && Number.parseInt(label, 10) % 60 !== 0;
+}
+// A recorded cause only for an exact worker-authored completion; never from prose keywords.
+// The budget expiry is reported by the worker, not a confirmed termination; its budget is
+// deliberately not extracted (the ledger keeps deadline=unknown).
+function cause(p: Record<string, unknown>): string | undefined {
+  const content = p["content"];
+  if (typeof content !== "string") return undefined;
+  if (content === DISPATCH_STOPPED) return "run stopped; settlement unconfirmed";
+  if (content === DISPATCH_OPEN_AT_TURN_END) return "open at turn end; settlement unconfirmed";
+  if (content === DISPATCH_STREAM_FAILED) return "provider stream failure; settlement unconfirmed";
+  if (p["is_error"] === true && content.length <= 120 && content.startsWith(CHILD_TIMEOUT_BOUND_PREFIX)
+    && content.endsWith(CHILD_TIMEOUT_BOUND_SUFFIX)
+    && content.length > CHILD_TIMEOUT_BOUND_PREFIX.length + CHILD_TIMEOUT_BOUND_SUFFIX.length
+    && budgetLabel(content.slice(CHILD_TIMEOUT_BOUND_PREFIX.length, content.length - CHILD_TIMEOUT_BOUND_SUFFIX.length))) {
+    return "reported budget expiry; termination unconfirmed";
+  }
+  return undefined;
 }
 // Exact accounting capsule keys from harness-messages/projectResult and usage stamps.
 // Any additional field keeps the status eligible; in particular failure facts survive.
@@ -297,11 +324,7 @@ export class JudgeEvidenceReducer {
     } else {
       // Delegation history/rows take priority over a known ordinary identity.
       if (this.ordinaryIdentities.has(key) && !h && !old?.row) return;
-      const result = { seq: m.seq, time: ownedPrefix(str(m.created_at), 64), outcome: outcome(p), text,
-        cause: typeof p["content"] === "string" && INTERRUPTIONS.has(p["content"])
-          ? p["content"] === DISPATCH_STOPPED ? "run stopped; settlement unconfirmed"
-            : p["content"] === DISPATCH_OPEN_AT_TURN_END ? "open at turn end; settlement unconfirmed"
-              : "provider stream failure; settlement unconfirmed" : undefined };
+      const result = { seq: m.seq, time: ownedPrefix(str(m.created_at), 64), outcome: outcome(p), text, cause: cause(p) };
       if (old?.row) {
         this.match(old.row, result, h); this.pending.delete(key);
       } else if (h || old?.result) {
