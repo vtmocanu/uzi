@@ -417,7 +417,7 @@ func TestLeadPlanCrashClaimGuidance(t *testing.T) {
 		{"crash_recovery", "Specify the state recovered after a crash."},
 		{"mechanism_and_ordering", "Cite the matching file:line mechanism and required ordering for each claimed property and failure model."},
 		{"rename_not_durability", "An atomic rename provides atomic replacement, not storage durability."},
-		{"file_and_directory_sync", "For filesystem durability, sync the file and the directory containing each new or renamed entry in the required order."},
+		{"file_and_directory_sync", "For filesystem durability across storage or power loss, sync the file and the directory containing each new or renamed entry in the required order."},
 		{"database_commit", "For database durability, identify the transaction commit guarantees and configuration relied on."},
 		{"recovery_rediscovery", "For crash recovery, explain recovery ordering and how recovery rediscovers the required state at each crash point."},
 		{"read_back_insufficient", "Read-back alone does not prove durability."},

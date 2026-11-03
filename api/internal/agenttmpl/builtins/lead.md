@@ -109,9 +109,9 @@ State whether durability is across a process crash or across storage or power lo
 Specify the state recovered after a crash. Cite the matching file:line mechanism
 and required ordering for each claimed property and failure model. An atomic
 rename provides atomic replacement, not storage durability. For filesystem
-durability, sync the file and the directory containing each new or renamed entry
-in the required order. For database durability, identify the transaction commit
-guarantees and configuration relied on. For crash recovery, explain recovery
+durability across storage or power loss, sync the file and the directory containing
+each new or renamed entry in the required order. For database durability, identify
+the transaction commit guarantees and configuration relied on. For crash recovery, explain recovery
 ordering and how recovery rediscovers the required state at each crash point.
 Read-back alone does not prove durability. A process-crash test is not proof of
 storage-crash survival. If the mechanism or evidence does not support the
