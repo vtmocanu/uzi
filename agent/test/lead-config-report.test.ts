@@ -18,7 +18,10 @@ import {
   type LeadRequest,
   type LeadRequestInput,
 } from "../src/lead-config-report.js";
-import type { ClaimConfig, LeadConfigReportBody } from "../src/protocol.js";
+import type { AgentTemplate, ClaimConfig, LeadConfigReportBody } from "../src/protocol.js";
+import { assembleAgents, selectLeadTemplate } from "../src/agents.js";
+import { renderCodexRun } from "../src/codex/render.js";
+import type { RunTurnRequest } from "../src/harness.js";
 import { CodexExecutor } from "../src/codex/codex-executor.js";
 import { selectCodexBinding } from "../src/codex/select.js";
 import type { CodexProviderConfig } from "../src/codex/codex-harness.js";
@@ -33,6 +36,7 @@ interface RequestCase {
   phase: "plan" | "implement";
   config: ClaimConfig;
   templateModel?: string;
+  agents?: Array<{ name: string; model?: string | null }>;
   providerDefaultModel?: string;
   expect: LeadRequest;
 }
@@ -41,6 +45,15 @@ const contract = JSON.parse(
   readFileSync(join(import.meta.dirname, "..", "..", "fixtures", "lead-config", "contract.json"), "utf8"),
 ) as { request_cases: RequestCase[] };
 const LEAD_REQUEST_CASES: RequestCase[] = contract.request_cases;
+
+// Roster cases are authoritative, including a null first pin; legacy templateModel cases
+// still model a single owner lead. Bodies are unique so requests can prove root selection.
+function requestAgents(c: RequestCase): AgentTemplate[] {
+  return (c.agents ?? [{ name: "lead", model: c.templateModel }]).map((t, i) => ({
+    name: t.name, description: `fixture ${c.id} ${i}`, prompt_body: `OWNER ${c.id} BODY ${i}`,
+    ...(t.model != null ? { model: t.model } : {}),
+  }));
+}
 
 function codexExecutorFor(providerModel: string): CodexExecutor {
   const selection = selectCodexBinding({
@@ -58,28 +71,65 @@ describe("lead request matrix (fixtures/lead-config/contract.json request_cases)
   it("resolves every case, and the executors send what is resolved", () => {
     const visited = new Set<string>();
     for (const c of LEAD_REQUEST_CASES) {
+      const templates = requestAgents(c);
+      const selected = selectLeadTemplate(templates);
       const input: LeadRequestInput = {
         harness: c.harness, phase: c.phase, config: c.config,
-        ...(c.templateModel !== undefined ? { templateModel: c.templateModel } : {}),
+        templateModel: selected?.model ?? undefined,
         ...(c.providerDefaultModel !== undefined ? { providerDefaultModel: c.providerDefaultModel } : {}),
       };
       assert.deepEqual(resolveLeadRequest(input), c.expect, `resolveLeadRequest ${c.id}`);
-      // Claude cases: what the SdkExecutor sends (model and effort in the SDK query options) is
-      // asserted by driving the real executor in sdk-executor.test.ts over this same list.
+      const assembled = assembleAgents(templates);
+      assert.equal(assembled.leadSystemPrompt, selected?.prompt_body, c.id);
+      if (c.harness === "claude") {
+        assert.deepEqual(resolveLeadRequest({ ...input, templateModel: assembled.leadModel }), c.expect, c.id);
+      }
+      // Full SDK/Codex run and report adapters must also use these rosters in their executor tests.
       if (c.harness !== "claude") {
         const exec = codexExecutorFor(c.providerDefaultModel!);
-        const ctx = { runId: "r", config: c.config, agents: [] } as unknown as RunContext;
-        const selection = c.phase === "plan" ? undefined : { source: "own" as const, exclusions: [] };
-        const request = (exec as unknown as {
-          buildRunRequest(...a: unknown[]): { model: string; effort?: string };
-        }).buildRunRequest(ctx, c.phase, "p", undefined, new AbortController().signal, selection);
-        assert.equal(request.model, c.expect.model, `codex sent model ${c.id}`);
-        assert.equal(request.effort, c.expect.effort, `codex sent effort ${c.id}`);
+        const ctx = { runId: "r", config: c.config, agents: templates,
+          repoAgents: [{ name: "lead", description: "repo", prompt_body: "REPO ROOT MUST NOT WIN", model: "gpt-6-astra" }],
+        } as unknown as RunContext;
+        for (const phase of ["plan", "implement"] as const) {
+          const selections = phase === "plan" ? [undefined] : [
+            { source: "own" as const, exclusions: [] }, { source: "repo" as const, exclusions: [] },
+          ];
+          for (const selection of selections) {
+            const request = (exec as unknown as {
+              buildRunRequest(...a: unknown[]): RunTurnRequest;
+            }).buildRunRequest(ctx, phase, "p", "continuation", new AbortController().signal, selection);
+            assert.equal(request.model, c.expect.model, `codex sent model ${c.id} ${phase}`);
+            assert.equal(request.effort, c.expect.effort, `codex sent effort ${c.id} ${phase}`);
+            assert.equal(request.modelSource, c.config.default_model ? "worker_default" : undefined, c.id);
+            if (selected) assert.ok(request.systemPrompt.includes(selected.prompt_body), c.id);
+            assert.ok(!request.systemPrompt.includes("REPO ROOT MUST NOT WIN"), c.id);
+            assert.equal(request.resumeSessionId, "continuation", c.id);
+            if (selection?.source !== "repo") {
+              const expectedNames = templates.filter((t) =>
+                !["lead", "orchestrator"].includes(t.name.toLowerCase())).map((t) => t.name);
+              assert.deepEqual(Object.keys(request.agents), expectedNames, c.id);
+            } else {
+              assert.ok("lead" in request.agents, c.id);
+            }
+            const rendered = renderCodexRun(request);
+            assert.equal(rendered.lead.model, c.expect.model, c.id);
+            assert.equal(rendered.diagnostics.some((d) => d.kind === "unknown_model"), false, c.id);
+            if (selection?.source !== "repo") {
+              for (const t of templates.filter((t) => t.name === "coder")) {
+                const expectedModel = c.config.override_subagent_model || !t.model ? c.expect.model : t.model;
+                assert.equal(rendered.perRoleModels.get(t.name)?.model, expectedModel, c.id);
+                assert.equal(request.agents[t.name]?.model,
+                  c.config.override_subagent_model ? undefined : t.model ?? undefined, c.id);
+              }
+            }
+          }
+        }
       }
       visited.add(c.id);
     }
     assert.deepEqual([...visited].sort(), LEAD_REQUEST_CASES.map((c) => c.id).sort());
-    assert.ok(visited.size >= 10, "the matrix is loaded, not empty");
+    assert.equal(LEAD_REQUEST_CASES.length, 26);
+    assert.equal(visited.size, 26, "all shared request cases exercised");
   });
 
   it("a blank claim model falls back to the template (|| not ??), and nothing resolves to no model", () => {

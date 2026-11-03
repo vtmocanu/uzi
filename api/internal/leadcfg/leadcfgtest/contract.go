@@ -52,7 +52,7 @@ type DisplayCase struct {
 }
 
 // Contract is fixtures/lead-config/contract.json. RequestCases stay raw: each case is
-// {id, harness, phase, config, templateModel?, providerDefaultModel?, expect}.
+// {id, harness, phase, config, templateModel?, agents?, providerDefaultModel?, expect}.
 type Contract struct {
 	Vocabulary   Vocabulary        `json:"vocabulary"`
 	FixedAt      map[string]string `json:"fixed_at"`
