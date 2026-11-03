@@ -1036,6 +1036,16 @@ describe("checkpoint chain over a confirmed park marker (issue #2753)", () => {
     assert.strictEqual(packed.tipOid, sc.n, "raw tip shipped");
   });
 
+  it("refuses a marker stacked on another marker (outer parent not an ancestor of N)", async () => {
+    const sc = await markerScene();
+    const tree = gitIn(sc.bare, ["rev-parse", `${sc.m}^{tree}`]);
+    const inner = rawCommit(sc.bare, tree, [sc.r], MARKER_SUBJECT);
+    const outer = rawCommit(sc.bare, tree, [inner], MARKER_SUBJECT);
+    const packed = await chainPack(sc, [undefined, outer], { markerTrustedTip: outer });
+    assert.ok(packed);
+    assert.strictEqual(packed.tipOid, sc.n, "raw tip shipped");
+  });
+
   it("refuses a marker whose parent is the real tip (nothing recommitted)", async () => {
     const sc = await markerScene();
     const over = rawCommit(sc.bare, gitIn(sc.bare, ["rev-parse", `${sc.m}^{tree}`]), [sc.n], MARKER_SUBJECT);

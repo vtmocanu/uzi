@@ -13101,7 +13101,9 @@ export class GitCache {
    *  - GATE 3 (as in the overlay): the branch must not itself modify a workflow file.
    *  - {@link verifyWrapperOnlyHistory}(P, realTip): everything P adds beyond realTip is a verified
    *    workflow-only wrapper, so the pack carries no new non-workflow content beyond realTip's own
-   *    history. That is not "nothing unscanned": P's workflow blobs come from the default branch,
+   *    history. That is not "nothing unscanned": P's workflow subtree comes from P itself (a
+   *    default-branch overlay, or the confirmed marker's own tree, which may include the WIP's
+   *    workflow edits; that subtree is already on the remote and the adoption peel discards it),
    *    and unenrolled park/shutdown sinks retain their unscanned-history residual. Enrolled
    *    sources additionally require the caller's fresh source/candidate/floor guards.
    *  - issue #2753: `wip(park):` markers are accepted in P's exclusive history only when P is the
@@ -18072,8 +18074,22 @@ try {
     const refStatus = await this.tryGitExit(barePath, ["show-ref", "--verify", "--quiet", ref]);
     if (refStatus === 1) return false; // Proven absence, not an unreadable ref or failed command.
     if (refStatus !== 0) return true;
-    const tip = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
+    let tip = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
     if (!tip) return true;
+    // issue #2753: a chain over a confirmed park marker (`ckpt(overlay):` C with parents [M, ...,
+    // L], L the real tip) is peeled to L when L is a park marker and C verifiably adds only
+    // workflow-subtree swaps / already-published markers over L. Anything unverifiable keeps the
+    // tip as is (the guard then blocks).
+    if (SHA40_RE.test(tip) && (await this.isOverlayMarker(barePath, tip))) {
+      const parents = (await this.tryGitStdout(barePath, ["rev-list", "--parents", "-n", "1", tip]))
+        .trim().split(/\s+/).filter(Boolean).slice(1);
+      const last = parents[parents.length - 1];
+      if (parents.length >= 2 && last !== undefined && SHA40_RE.test(last) &&
+          (await this.isWipParkMarker(barePath, last)) &&
+          (await this.verifyWrapperOnlyHistory(barePath, tip, last, 1, { allowParkMarkers: true }))) {
+        tip = last;
+      }
+    }
     if (!(await this.isWipParkMarker(barePath, tip)))
       return !(await this.checkpointHasOnlyBoundaryTrees(barePath, branch, tip));
     // 3) The tip IS a `wip(park):` marker. The committed work (if any) is its parent and
