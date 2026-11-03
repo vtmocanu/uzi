@@ -144,6 +144,69 @@ function spyAlign(): string[] {
   return strategies;
 }
 
+for (const route of ["plain", "align", "retry", "known", "boundary"] as const) {
+  it(`final push remediation proof refusal reports a blocked outcome (${route})`, async t => {
+    if (route === "align") {
+      seedWorkflowsOnOrigin();
+      t.mock.method(git, "changedFiles", async () => null);
+    }
+    const { github, calls } = fakeGitHub();
+    const r = githubRunner(github, committingExecutor({ "proof.ts": "export const proof = 1;\n" },
+      route === "align" ? { ".github/workflows/ci.yml": CI_V2 } : undefined));
+    const subject = r as unknown as { pushRemediationCandidate(...args: unknown[]): Promise<void>;
+      reportGenericFailure(...args: unknown[]): Promise<void>; forgeRetrySleep: () => Promise<void> };
+    subject.forgeRetrySleep = async () => {};
+    const original = subject.pushRemediationCandidate.bind(r);
+    const boundary = new DOMException("fixture publication boundary aborted", "AbortError");
+    const generic = t.mock.method(subject, "reportGenericFailure");
+    let attempts = 0;
+    t.mock.method(subject, "pushRemediationCandidate", async (...args: unknown[]) => {
+      attempts++;
+      if (route === "boundary") throw boundary;
+      if (route === "known") (args[0] as { secretRemediation?: unknown }).secretRemediation = { everKnown: true };
+      if (route !== "retry" || attempts > 1)
+        t.mock.method(git, "readRemediationRestrictionFacts", async () => { throw new Error("fixture proof unavailable"); });
+      return original(...args);
+    });
+    if (route === "retry") {
+      const wire = git as unknown as { execScoped(command: string, args: string[], ...rest: unknown[]): Promise<unknown> };
+      const execute = wire.execScoped.bind(git);
+      t.mock.method(wire, "execScoped", async (command: string, args: string[], ...rest: unknown[]) => {
+        if (command === "git" && args.includes("push")) throw Object.assign(new Error("push failed"), {
+          code: 128, stderr: "fatal: unable to access remote: Connection reset by peer",
+        });
+        return execute(command, args, ...rest);
+      });
+    }
+    const push = t.mock.method(git, "pushBranch");
+    const align = t.mock.method(git, "alignBranchWithDefault");
+    const claim = githubClaim(37470);
+    await r.execute(claim);
+    assert.equal(attempts, route === "retry" ? 2 : 1);
+    assert.equal(align.mock.callCount() > 0, route === "align");
+    assert.equal(push.mock.callCount(), route === "retry" ? 1 : 0);
+    assert.equal(gitIn(fx.originPath, ["for-each-ref", "--format=%(refname)", "refs/heads/agent/issue-37470"]), "",
+      "no push succeeds before the proof refusal");
+    assert.equal(calls.length, 0);
+    const failed = api.states.filter(s => s.runId === claim.run_id && s.body.status === "failed");
+    assert.equal(failed.length, 1, "a blocked push has one terminal report");
+    if (route === "boundary") {
+      assert.ok(generic.mock.calls.some(call => call.arguments[2] === boundary), "preserve the exact boundary error");
+      assert.notEqual(failed[0]!.body.fail_origin, "push_secret_blocked");
+      return;
+    }
+    assert.equal(generic.mock.callCount(), 0, "typed blocked reporting never enters the generic reporter");
+    assert.equal(failed[0]!.body.fail_origin, "push_secret_blocked");
+    if (route === "known") assert.match(failed[0]!.body.failure_reason!, /flagged earlier/);
+    else {
+      assert.match(failed[0]!.body.failure_reason!, /publication evidence could not be verified/);
+      assert.doesNotMatch(failed[0]!.body.failure_reason!, /flagged earlier/);
+    }
+    assert.equal(failed[0]!.body.preserved_patch, undefined);
+    assert.equal(api.states.some(s => s.runId === claim.run_id && s.body.status === "completed"), false);
+  });
+}
+
 /** Count fetchDefaultTip invocations, delegating to the real one. */
 function spyFetchDefaultTip(): { count: () => number } {
   let n = 0;

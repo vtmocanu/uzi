@@ -5,9 +5,66 @@ import path from "node:path";
 import type { Executor } from "../src/executor.js";
 import { SinkGate } from "../src/sink-gate.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
-import { api, client, fakeGitlab, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
+
+it("legacy Claude capture waits for queued authority with a finite timeout", { skip: process.platform !== "linux" }, async t => {
+  const { acquireWorkerLifetime } = await import("../src/authority-lock.js");
+  const { AuthorityRuntime } = await import("../src/authority-runtime.js");
+  const { testLockOptions } = await import("./authority-test-support.js");
+  const lifetime = await acquireWorkerLifetime(fs.realpathSync(fx.dataDir), testLockOptions());
+  const authority = new AuthorityRuntime({ lifetime, workerToken: "finite-capture-wait", timeoutMs: 5000 });
+  const claim = gitlabClaim(285203);
+  const executor: Executor = { run: async () => { throw new Error("unused"); } };
+  const flight = { runId: claim.run_id, executor, runLog: nullLogger(), barePath: "fixture-bare",
+    worktreePath: "fixture-source", branch: "issue-285203", survivingTickGroups: [], sinkGate: new SinkGate() };
+  const runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+    { codexBoundaryDeadlineMs: 5000 });
+  const owner = runner as unknown as {
+    bootstrapRemediationRestrictions(...args: unknown[]): Promise<unknown>;
+    quiesceRun(...args: unknown[]): Promise<unknown>;
+    reproveDetailAfterRunnerGit(...args: unknown[]): Promise<unknown>;
+    fetchTracking(...args: unknown[]): Promise<unknown>;
+    captureRecoveryRestorePoint(...args: unknown[]): Promise<unknown>;
+  };
+  t.mock.method(owner, "bootstrapRemediationRestrictions", async () => ({ kind: "confirmed", enrolled: false }));
+  t.mock.method(owner, "quiesceRun", async () => ({ blocked: false }));
+  t.mock.method(owner, "reproveDetailAfterRunnerGit", async () => undefined);
+  t.mock.method(git, "worktreeStatus", async () => []);
+  let release!: () => void, holding!: () => void;
+  const held = new Promise<void>(resolve => { holding = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const competitor = authority.withTransaction(async () => { holding(); await gate; });
+  await held;
+  let calls = 0, admitted = false, probeError: unknown;
+  let acquisition: Promise<void> | undefined;
+  t.mock.method(owner, "fetchTracking", async (...args: unknown[]) => {
+    calls++;
+    const wait = args[6] as { signal?: AbortSignal; timeoutMs?: number };
+    try {
+      let settled = false;
+      acquisition = authority.withTransaction(async () => { admitted = true; }, wait);
+      void acquisition.then(() => { settled = true; }, () => { settled = true; });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      assert.equal(settled, false, "queued capture must not expire after a 1 ms overflowed timer");
+      release();
+      await acquisition;
+      assert.ok(Number.isFinite(wait.timeoutMs) && wait.timeoutMs! > 0 && wait.timeoutMs! <= 5000);
+    } catch (error) { probeError = error; throw error; }
+    throw new Error("fixture stops after the source-authority wait");
+  });
+  try {
+    await owner.captureRecoveryRestorePoint(claim, flight, flight.runLog, "recovery_capture", { credentialFree: true });
+    assert.equal(calls, 1);
+    assert.ifError(probeError);
+    assert.equal(admitted, true);
+  } finally {
+    release();
+    await competitor;
+    await acquisition?.catch(() => undefined);
+  }
+});
 
 // Warn entries in this matrix already have real caller coverage:
 // runner-pause-park.test.ts: "Claude owner pause publishes current work despite

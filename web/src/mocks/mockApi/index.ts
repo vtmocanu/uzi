@@ -15,6 +15,7 @@ import { judgeApi } from "./judge";
 import { memoryApi } from "./memory";
 import { findingsApi } from "./findings";
 import { runsApi } from "./runs";
+import { crossChecksApi } from "./crossChecks";
 import { chatApi } from "./chat";
 import { secretsApi } from "./secrets";
 import { workersApi } from "./workers";
@@ -62,6 +63,7 @@ export const mockApi = {
   ...workersApi,
 
   ...runsApi,
+  ...crossChecksApi,
 
   ...judgeApi,
 
