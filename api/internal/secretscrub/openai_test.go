@@ -7,7 +7,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 )
 
-func TestScrubOpenAIKeys(t *testing.T) {
+func TestScrubHistoryOpenAIKeys(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		token string
@@ -27,7 +27,7 @@ func TestScrubOpenAIKeys(t *testing.T) {
 				t.Fatal("auditor fixture must be 164 bytes")
 			}
 			input := "before (" + tc.token + "), after"
-			if got := secretscrub.Scrub(input); got != "before ([redacted]), after" {
+			if got := secretscrub.ScrubHistory(input); got != "before ([redacted]), after" {
 				t.Fatal("Scrub must replace the entire credential and preserve surrounding text")
 			}
 			if got := secretscrub.ScrubSlackTokens(input); got != input {
@@ -37,7 +37,7 @@ func TestScrubOpenAIKeys(t *testing.T) {
 	}
 }
 
-func TestScrubOverlappingCredentials(t *testing.T) {
+func TestScrubHistoryOverlappingCredentials(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		input string
@@ -58,14 +58,14 @@ func TestScrubOverlappingCredentials(t *testing.T) {
 			if tc.name == "project-containing-slack" && len(tc.input) != 164 {
 				t.Fatal("overlapping project fixture must be 164 bytes")
 			}
-			if got := secretscrub.Scrub("before (" + tc.input + "), after"); got != "before ("+tc.want+"), after" {
+			if got := secretscrub.ScrubHistory("before (" + tc.input + "), after"); got != "before ("+tc.want+"), after" {
 				t.Fatal("Scrub must remove the union of overlapping credentials and preserve surrounding text")
 			}
 		})
 	}
 }
 
-func TestScrubOpenAIPreservesProseAndDisplayPrefixes(t *testing.T) {
+func TestScrubHistoryOpenAIPreservesProseAndDisplayPrefixes(t *testing.T) {
 	for _, input := range []string{
 		"OpenAI project and service-account keys are configured separately.",
 		"Use sk- for a classic key, sk-proj- for a project, sk-svcacct- for a service account.",
@@ -77,8 +77,31 @@ func TestScrubOpenAIPreservesProseAndDisplayPrefixes(t *testing.T) {
 		"sk-" + "proj-" + strings.Repeat("A", 15),
 		"sk-" + "svcacct-" + strings.Repeat("A", 15),
 	} {
-		if got := secretscrub.Scrub(input); got != input {
+		if got := secretscrub.ScrubHistory(input); got != input {
 			t.Fatal("Scrub changed harmless prose or a short display prefix")
 		}
+	}
+}
+
+func TestScrubLegacyPreservesWritePathProse(t *testing.T) {
+	for _, input := range []string{
+		"task-" + "0123456789abcdef",
+		"risk-" + "assessmentupdates",
+		"desk-" + strings.Repeat("documentation", 8),
+		"sk-" + strings.Repeat("A", 48),
+		"sk-" + "proj-" + strings.Repeat("B", 160),
+		"sk-" + "svcacct-" + strings.Repeat("C", 160),
+	} {
+		if got := secretscrub.Scrub(input); got != input {
+			t.Fatal("legacy Scrub changed write-path prose or OpenAI behavior")
+		}
+	}
+	// Legacy replacement order intentionally differs from history's span union.
+	input := "sk-ant-" + "AAAA" + "xoxb-" + strings.Repeat("B", 20)
+	if got := secretscrub.Scrub(input); got != "[redacted][redacted]" {
+		t.Fatal("legacy Scrub replacement order changed")
+	}
+	if got := secretscrub.ScrubHistory(input); got != "[redacted]" {
+		t.Fatal("history must retain non-OpenAI overlap protection")
 	}
 }

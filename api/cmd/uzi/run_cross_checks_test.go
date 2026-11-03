@@ -241,6 +241,31 @@ func TestRunCrossChecksScrubsBeforeHumanCap(t *testing.T) {
 	}
 }
 
+func TestRunCrossChecksOpenAIScrubBeforeHumanCap(t *testing.T) {
+	for _, token := range []string{
+		"sk-" + strings.Repeat("aB3d", 5) + "T3BlbkFJ" + strings.Repeat("eF7h", 5),
+		"sk-" + "proj-" + strings.Repeat("aB_9-", 20),
+		"sk-" + "svcacct-" + strings.Repeat("aB_9-", 20),
+	} {
+		value := strings.Repeat("界", 189) + "\u001b\u202e\n" + token + " end"
+		page := crossChecksFixture()
+		g := &page.Groups[0]
+		g.ParentTitle, g.ActiveContext, g.Omission = value, value, value
+		a := &g.Attempts[0]
+		a.Reason, a.Effect, a.NextAction, a.ChildContext = value, value, value, value
+		a.Model, a.Effort = &value, &value
+		out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{CrossCheckHistoryResult: page}), "run", "cross-checks")
+		if code != 0 || !utf8.ValidString(out) || !strings.Contains(out, "[redacted]") {
+			t.Fatal("CLI OpenAI cap fixture must render valid redacted output")
+		}
+		for _, forbidden := range []string{"sk-", "T3BlbkFJ", "\u001b", "\u202e"} {
+			if strings.Contains(out, forbidden) {
+				t.Fatal("CLI OpenAI cap output leaked a credential fragment or control")
+			}
+		}
+	}
+}
+
 func TestRunCrossChecksHTTPRefusalAndOneGET(t *testing.T) {
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

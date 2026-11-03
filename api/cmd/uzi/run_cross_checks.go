@@ -59,7 +59,7 @@ func newRunCrossChecksCmd(env Env, gf *globalFlags) *cobra.Command {
 
 // crossCheckText scrubs the complete single-line value before bounding human prose.
 func crossCheckText(s string) string {
-	s = secretscrub.Scrub(termsafe.CellText(s))
+	s = secretscrub.ScrubHistory(termsafe.CellText(s))
 	r := []rune(s)
 	if len(r) > 200 {
 		return string(r[:200]) + "..."

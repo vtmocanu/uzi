@@ -81,6 +81,10 @@ explicit continuation; they are not automatically drained.
 Active checks poll every 10 seconds while visible. For groups still on the
 same query page, refresh retains loaded older windows, uses fresh evidence
 for overlapping rounds and preserves the explicitly advanced older cursor.
+Older loaded attempts outside the refreshed window show **Last observed** and
+**not refreshed** labels. Their previous active flags do not count as current
+activity; the group explains active evidence outside its refreshed attempts.
+Reload the page, then load older attempts again to refresh that evidence.
 Changing filters or pages resets that loaded query. Separate requests are not
 a snapshot: groups can move, attempts can change and continuations can report
 `refresh_needed` when lifecycle no longer matches. Refresh without cursors

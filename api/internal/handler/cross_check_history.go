@@ -152,7 +152,7 @@ func (h *Handler) ListCrossCheckHistory(w http.ResponseWriter, r *http.Request) 
 // All untrusted metadata is SQL-bounded before transfer. Normalize and scrub the
 // entire accepted value before applying this UTF-8 byte cap.
 func crossCheckHistoryText(s string, max int) string {
-	s = secretscrub.Scrub(termsafe.CellText(s))
+	s = secretscrub.ScrubHistory(termsafe.CellText(s))
 	if len(s) <= max {
 		return s
 	}

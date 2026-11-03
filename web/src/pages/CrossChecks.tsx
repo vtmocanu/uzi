@@ -2,10 +2,13 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { ApiError } from "../lib/apiError";
-import type { CrossCheckHistoryAttemptDTO as Attempt, CrossCheckHistoryGroupDTO as Group, CrossCheckHistoryParams as Params } from "../lib/apiTypes";
+import type { CrossCheckHistoryAttemptDTO as AttemptDTO, CrossCheckHistoryGroupDTO as GroupDTO, CrossCheckHistoryParams as Params } from "../lib/apiTypes";
 import { stripDisplayCell } from "../lib/safeText";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { cx } from "../components/ui";
+
+type Attempt = AttemptDTO & { notRefreshed?: boolean };
+type Group = Omit<GroupDTO, "attempts"> & { attempts: Attempt[] };
 
 type Scope = "runs" | "cross-checks";
 type Availability = "loading" | "available" | "empty" | "unavailable" | "error" | "compatibility";
@@ -55,9 +58,9 @@ export function useCrossCheckScope(userID: string) {
     setParams(next);
   }
   const controls = availability === "available" ? (
-    <div role="group" aria-label="What to list" className="inline-flex rounded-lg border border-edge p-0.5">
+    <div role="group" aria-label="What to list" className="inline-flex overflow-hidden rounded-lg border border-edge text-sm">
       {(["runs", "cross-checks"] as const).map(value => <button key={value} type="button" aria-pressed={scope === value}
-        onClick={() => choose(value)} className={cx("rounded-md px-3 py-1.5 text-sm", scope === value ? "bg-raised text-fg" : "text-muted hover:text-fg")}>
+        onClick={() => choose(value)} className={cx("px-3 py-1.5 transition-colors", value === "cross-checks" && "border-l border-edge", scope === value ? "bg-raised font-medium text-fg" : "text-muted hover:bg-raised/60")}>
         {value === "runs" ? "Runs" : "Cross-checks"}
       </button>)}
     </div>
@@ -94,9 +97,16 @@ function ordered(attempts: Attempt[]): Attempt[] {
 }
 function mergeOlder(current: Group, older: Group): Group {
   const attempts = new Map(current.attempts.map(a => [identity(a), a]));
-  // The current slice wins duplicate identities, including newer execution evidence.
-  for (const a of older.attempts) if (!attempts.has(identity(a))) attempts.set(identity(a), a);
+  // Current evidence wins duplicates; a fresh continuation can replace stale evidence.
+  for (const a of older.attempts) {
+    const existing = attempts.get(identity(a));
+    if (!existing || (existing.notRefreshed && !a.notRefreshed)) attempts.set(identity(a), a);
+  }
   return { ...current, older_cursor: older.older_cursor, omission: older.omission, attempts: ordered([...attempts.values()]) };
+}
+
+function observed(a: Attempt, value: string): string {
+  return a.notRefreshed ? `Last observed: ${value} (not refreshed)` : value;
 }
 
 function CheckCard({ group: g, loadOlder, busy }: { group: Group; loadOlder: () => void; busy: boolean }) {
@@ -107,7 +117,7 @@ function CheckCard({ group: g, loadOlder, busy }: { group: Group; loadOlder: () 
   if (g.older_cursor) hadOlder.current = true;
   const attempts = ordered(g.attempts);
   const shown = attempts.length;
-  const activeLoaded = attempts.filter(a => a.active).length;
+  const activeLoaded = attempts.filter(a => !a.notRefreshed && a.active).length;
   const activeHidden = Math.max(0, g.active_attempts - activeLoaded);
   const parentPath = runPath(g.parent_id);
   const title = text(g.parent_title, "Untitled work run");
@@ -122,14 +132,15 @@ function CheckCard({ group: g, loadOlder, busy }: { group: Group; loadOlder: () 
     <div className="space-y-2 px-4 pb-4 text-sm text-muted">
       <p>{shown} shown · {Math.max(0, g.total_attempts - g.matching_attempts)} filtered · {Math.max(0, g.matching_attempts - shown)} remaining attempts</p>
       <p className="break-words">Loaded range: {attempts.length ? attempts.map(a => `${a.stage === "plan" ? "Plan" : a.stage === "code" ? "Code" : "Unknown stage"} ${a.round}`).join(", ") : "No attempts loaded"}</p>
-      {activeHidden > 0 && <p>{activeHidden} active attempts hidden by filters or not loaded. {text(g.active_context, "Additional active attempts are outside this loaded slice.")}</p>}
+      {activeHidden > 0 && <p>{activeHidden} {attempts.some(a => a.notRefreshed) ? "active attempts outside refreshed evidence or hidden by filters." : "active attempts hidden by filters or not loaded."} {text(g.active_context, "Additional active attempts are outside this loaded slice.")}</p>}
+      {attempts.some(a => a.notRefreshed) && <p>Older retained evidence was not refreshed. Active counts use current evidence only; retained rows do not identify which older attempts remain active. Reload this page to reset the loaded history, then load older attempts to check their latest evidence.</p>}
       {g.older_cursor && <p>Earlier rounds omitted: load older attempts</p>}
       <div className="flex flex-wrap gap-2" role="group" aria-label="Attempt ladder">
         {attempts.map(a => {
           const name = `${a.stage === "plan" ? "Plan" : a.stage === "code" ? "Code" : "Unknown stage"} round ${a.round}`;
-          const exec = label(executionLabels, a.execution, "Unknown execution");
+          const exec = observed(a, label(executionLabels, a.execution, "Unknown execution"));
           const verdict = label(verdictLabels, a.review, "Unknown verdict");
-          const tone = a.active ? "text-info" : ["didnt_finish", "couldnt_start"].includes(a.execution) ? "text-danger"
+          const tone = a.notRefreshed ? "text-muted" : a.active ? "text-info" : ["didnt_finish", "couldnt_start"].includes(a.execution) ? "text-danger"
             : a.review === "approved" ? "text-ok" : ["changes_requested", "blocked"].includes(a.review) ? "text-warn" : "text-muted";
           return <button type="button" key={identity(a)} title={`${name}: ${exec}`}
             aria-pressed={selected === identity(a)} aria-controls={detailsID}
@@ -144,16 +155,17 @@ function CheckCard({ group: g, loadOlder, busy }: { group: Group; loadOlder: () 
     </div>
     {expanded && <div id={detailsID} className="border-t border-edge bg-raised/30 p-4">
       {(picked ? [picked] : attempts).map(a => <section key={identity(a)} className="mb-4 min-w-0 space-y-2 break-words last:mb-0">
+        {a.notRefreshed && <p className="text-sm text-muted">Last observed evidence: this attempt was not refreshed.</p>}
         <h3 className="font-medium">{a.stage === "plan" ? "Plan" : a.stage === "code" ? "Code" : "Unknown stage"} round {a.round}</h3>
         <dl className="grid min-w-0 gap-3 text-sm sm:grid-cols-3">
-          <div><dt className="text-muted">Check</dt><dd>{label(executionLabels, a.execution, "Unknown execution")}</dd></div>
-          <div><dt className="text-muted">Verdict</dt><dd>{label(verdictLabels, a.review, "Unknown verdict")}</dd></div>
-          <div><dt className="text-muted">Effect on run</dt><dd>{text(a.effect, "Effect not recorded")}</dd></div>
+          <div><dt className="text-muted">Check</dt><dd>{observed(a, label(executionLabels, a.execution, "Unknown execution"))}</dd></div>
+          <div><dt className="text-muted">{a.notRefreshed ? "Last observed verdict (not refreshed)" : "Verdict"}</dt><dd>{label(verdictLabels, a.review, "Unknown verdict")}</dd></div>
+          <div><dt className="text-muted">{a.notRefreshed ? "Last observed effect on run (not refreshed)" : "Effect on run"}</dt><dd>{text(a.effect, "Effect not recorded")}</dd></div>
         </dl>
         {a.historical && <p className="text-sm text-muted">{a.stage === "plan" && a.review === "approved" ? "Historical approval of an earlier plan candidate." : "Historical attempt retained as evidence."}</p>}
         <p className="text-sm">Cause: {text(a.reason, "Cause not recorded for this attempt")}</p>
         <p className="text-sm">Next action: {text(a.next_action, "No action recorded")}</p>
-        <p className="text-sm text-muted">Checker: {text(a.model)} · {text(a.effort)} · {text(a.child_status, "Status not recorded")}</p>
+        <p className="text-sm text-muted">Checker: {text(a.model)} · {text(a.effort)} · {observed(a, text(a.child_status, "Status not recorded"))}</p>
         <p className="text-sm text-muted">Created: {text(a.created_at)} · Decided: {text(a.decided_at)} · Interrupted: {text(a.interrupted_at)} · Deadline: {text(a.deadline_at)}</p>
         {a.findings_count !== null && <p className="text-sm">{a.findings_count} findings recorded</p>}
         {runPath(a.child_id) ? <Link className="text-sm text-brand hover:underline" to={runPath(a.child_id)!}>Open checker</Link>
@@ -196,7 +208,7 @@ export function CrossChecks({ lifecycle }: { lifecycle: "active" | "past" }) {
             const current = previous.key === key ? previous.groups.find(g => g.parent_id === fresh.parent_id) : undefined;
             if (!current) return fresh;
             // Fresh records win overlaps; explicitly loaded older windows keep their continuation.
-            const merged = mergeOlder(fresh, current);
+            const merged = mergeOlder(fresh, { ...current, attempts: current.attempts.map(a => ({ ...a, notRefreshed: true })) });
             return previous.continued?.includes(fresh.parent_id) ? merged
               : { ...merged, older_cursor: fresh.older_cursor, omission: fresh.omission };
           }) });

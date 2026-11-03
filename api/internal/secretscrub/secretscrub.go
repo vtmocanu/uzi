@@ -28,7 +28,7 @@ import (
 //     families); slackRefresh covers xoxe- refresh tokens, which fall OUTSIDE the
 //     x(?:ox[bpoas]|app)- shape;
 //   - anthropic covers sk-ant- keys;
-//   - openai covers classic sk- keys and project / service-account keys. Its
+//   - history-only openai covers classic sk- keys and project / service-account keys. Its
 //     16-character minimum applies to the body AFTER any proj- / svcacct- prefix,
 //     preserving short display prefixes. Classic bodies are alphanumeric; scoped
 //     bodies also admit URL-safe '_' and '-'. No upper bound: redact the whole
@@ -61,7 +61,21 @@ var (
 
 // Scrub replaces every recognised secret family with a placeholder.
 func Scrub(s string) string {
-	// Match the original input and merge overlapping spans so Scrub cannot
+	s = slackTokenPattern.ReplaceAllString(s, "[redacted]")
+	s = slackRefreshPattern.ReplaceAllString(s, "[redacted]")
+	s = anthropicPattern.ReplaceAllString(s, "[redacted]")
+	s = gitlabPATPattern.ReplaceAllString(s, "[redacted]")
+	s = githubClassicPattern.ReplaceAllString(s, "[redacted]")
+	s = githubFineGrainPattern.ReplaceAllString(s, "[redacted]")
+	s = uziTokenPattern.ReplaceAllString(s, "[redacted]")
+	return s
+}
+
+// ScrubHistory applies conservative, overlap-safe credential redaction only to
+// history displays. It deliberately recognizes credential shapes within text;
+// callers scrub the complete normalized value before applying display bounds.
+func ScrubHistory(s string) string {
+	// Match the original input and merge overlapping spans so history scrubbing cannot
 	// expose credential fragments by replacing another family first.
 	var matches [][]int
 	for _, pattern := range []*regexp.Regexp{

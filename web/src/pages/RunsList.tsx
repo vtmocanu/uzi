@@ -170,8 +170,19 @@ function RunsAccountLayout() {
   const { scope, controls, notice } = useCrossCheckScope(user?.id ?? "");
   const location = useLocation();
   const lifecycle = useMatch("/runs/history") ? "past" : "active";
-  const tabParams = new URLSearchParams(location.search);
-  tabParams.delete("cursor");
+  const sourceParams = new URLSearchParams(location.search);
+  const tabParams = new URLSearchParams();
+  if (scope === "cross-checks" || sourceParams.get("scope") === "cross-checks") {
+    // Retain an explicit choice while its independent availability probe is pending.
+    tabParams.set("scope", "cross-checks");
+    const stage = sourceParams.get("stage");
+    const outcome = sourceParams.get("outcome");
+    if (stage && ["all", "plan", "code"].includes(stage)) tabParams.set("stage", stage);
+    if (outcome && ["any", "didnt_finish", "raised_issues", "passed", "replaced"].includes(outcome)) tabParams.set("outcome", outcome);
+  } else if (sourceParams.get("scope") === "runs") {
+    // Keep an explicit Runs override stable against a saved Cross-checks preference.
+    tabParams.set("scope", "runs");
+  }
   const [runs, setRuns] = useState<RunSummaryItem[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);

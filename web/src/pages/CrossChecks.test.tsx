@@ -85,6 +85,16 @@ it("retains disabled-setting history, separates execution/verdict/effect, and va
   expect(screen.getAllByText("Effect not recorded").length).toBeGreaterThan(0);
   expect(screen.getByText("Work run: completed")).toBeTruthy();
 });
+it("uses the Judge flush segmented control styles", async () => {
+  render(<Tree />);
+  const controls = await screen.findByRole("group", { name: "What to list" });
+  expect(controls.className).toBe("inline-flex overflow-hidden rounded-lg border border-edge text-sm");
+  expect(within(controls).getByRole("button", { name: "Runs" }).className)
+    .toBe("px-3 py-1.5 transition-colors text-muted hover:bg-raised/60");
+  expect(within(controls).getByRole("button", { name: "Cross-checks" }).className)
+    .toBe("px-3 py-1.5 transition-colors border-l border-edge bg-raised font-medium text-fg");
+});
+
 it("URL wins saved preference and explicit scope selection preserves lifecycle", async () => {
   localStorage.setItem("uzi.runs.scope.a", JSON.stringify("runs"));
   render(<Tree path="/runs/history?scope=cross-checks&stage=plan&outcome=passed" />);
@@ -100,6 +110,37 @@ it("URL wins saved preference and explicit scope selection preserves lifecycle",
   await waitFor(() => expect(mocked.listCrossCheckHistory).toHaveBeenLastCalledWith({ lifecycle: "active", stage: "plan" }));
   expect(mocked.crossCheckHistoryAvailability).toHaveBeenCalledTimes(1);
 });
+it.each(["runs", "cross-checks"])("cleans lifecycle tabs for explicit %s despite the opposite saved scope", async scope => {
+  localStorage.setItem("uzi.runs.scope.a", JSON.stringify(scope === "runs" ? "cross-checks" : "runs"));
+  render(<Tree path={`/runs?scope=${scope}&q=needle&status=failed&arbitrary=value&cursor=old&stage=code&outcome=passed`} />);
+  await screen.findByRole("button", { name: "Cross-checks" });
+  const past = await screen.findByRole("link", { name: scope === "runs" ? "Past runs · 0" : "Past checks" });
+  const query = scope === "runs" ? "scope=runs" : "scope=cross-checks&stage=code&outcome=passed";
+  expect(past.getAttribute("href")).toBe(`/runs/history?${query}`);
+  fireEvent.click(past);
+  await waitFor(() => expect(screen.getByTestId("location").textContent).toBe(`/runs/history?${query}`));
+  expect(screen.getByRole("button", { name: scope === "runs" ? "Runs" : "Cross-checks" }).getAttribute("aria-pressed")).toBe("true");
+  fireEvent.click(screen.getByRole("link", { name: "Active" }));
+  expect(screen.getByTestId("location").textContent).toBe(`/runs?${query}`);
+});
+it("preserves explicit cross-check intent when switching lifecycle before availability resolves", async () => {
+  const availability = deferred<{ available: boolean }>();
+  mocked.crossCheckHistoryAvailability.mockReturnValue(availability.promise);
+  render(<Tree path="/runs?scope=cross-checks&stage=plan&q=needle&cursor=old" />);
+  const past = await screen.findByRole("link", { name: "Past runs · 0" });
+  expect(past.getAttribute("href")).toBe("/runs/history?scope=cross-checks&stage=plan");
+  fireEvent.click(past);
+  await act(async () => availability.resolve({ available: true }));
+  await screen.findByRole("article", { name: "Retained work" });
+  expect(screen.getByTestId("location").textContent).toBe("/runs/history?scope=cross-checks&stage=plan");
+  expect(screen.getByRole("button", { name: "Cross-checks" }).getAttribute("aria-pressed")).toBe("true");
+});
+
+it("drops invalid cross-check tab filters", async () => {
+  render(<Tree path="/runs?scope=cross-checks&stage=bogus&outcome=bogus&q=needle&status=failed" />);
+  expect((await screen.findByRole("link", { name: "Past checks" })).getAttribute("href")).toBe("/runs/history?scope=cross-checks");
+});
+
 it.each(["null", "[]", "{}", '"bad"', "{"])("ignores malformed preference %s", async value => {
   localStorage.setItem("uzi.runs.scope.a", value);
   render(<Tree path="/runs" />);
@@ -380,8 +421,8 @@ it("preserves explicitly loaded history and selection on a visible refresh with 
   await screen.findByText("Work run: running");
   const ladder = within(screen.getByRole("group", { name: "Attempt ladder" }));
   expect(ladder.getAllByRole("button").map(b => b.getAttribute("title"))).toEqual(
-    Array.from({ length: 20 }, (_, i) => `Plan round ${i + 11}: ${i === 10 ? "Finished" : "Couldn't start"}`));
-  expect(screen.getByRole("button", { name: "Plan round 11 · Couldn't start" })).toBe(selected);
+    Array.from({ length: 20 }, (_, i) => `Plan round ${i + 11}: ${i < 10 ? "Last observed: Couldn't start (not refreshed)" : i === 10 ? "Finished" : "Couldn't start"}`));
+  expect(screen.getByRole("button", { name: "Plan round 11 · Last observed: Couldn't start (not refreshed)" })).toBe(selected);
   expect(document.activeElement).toBe(selected);
   expect(selected.getAttribute("aria-pressed")).toBe("true");
   expect(screen.getAllByRole("heading", { level: 3 }).map(h => h.textContent)).toEqual(["Plan round 11"]);
@@ -392,6 +433,43 @@ it("preserves explicitly loaded history and selection on a visible refresh with 
   fireEvent.click(screen.getByRole("button", { name: "Load older attempts" }));
   await waitFor(() => expect(mocked.listCrossCheckHistory).toHaveBeenCalledTimes(4));
   expect(mocked.listCrossCheckHistory).toHaveBeenLastCalledWith({ lifecycle: "active", stage: "all", attempt_cursor: ["older-10"] });
+});
+
+it("qualifies retained active evidence without hiding current hidden activity and clears fresh overlaps", async () => {
+  const newest = group({ total_attempts: 4, matching_attempts: 4, active_attempts: 3, older_cursor: "older",
+    attempts: [attempt("plan", 4, { active: true, execution: "running" })] });
+  const older = attempt("plan", 2, { active: true, execution: "running", child_status: "running", child_id: "00000000-0000-4000-8000-000000000002", model: null, effort: null });
+  mocked.listCrossCheckHistory.mockResolvedValueOnce({ groups: [newest] })
+    .mockResolvedValueOnce({ groups: [{ ...newest, attempts: [older], older_cursor: undefined }] })
+    .mockResolvedValueOnce({ groups: [{ ...newest, active_attempts: 2, parent_status: "running",
+      active_context: "Another current attempt is outside the newest slice." }] })
+    .mockResolvedValueOnce({ groups: [{ ...newest, active_attempts: 1, parent_status: "completed",
+      attempts: [{ ...older, active: false, execution: "finished", child_status: "completed", effect: "Fresh settled effect" }] }] });
+  render(<Tree />);
+  fireEvent.click(await screen.findByRole("button", { name: "Load older attempts" }));
+  const selected = await screen.findByRole("button", { name: "Plan round 2 · Running" });
+  fireEvent.click(selected);
+  selected.focus();
+  vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+  act(() => document.dispatchEvent(new Event("visibilitychange")));
+  await screen.findByText("Work run: running");
+  expect(screen.getByRole("button", { name: "Plan round 2 · Last observed: Running (not refreshed)" })).toBe(selected);
+  expect(selected.querySelector("span")?.className).toContain("text-muted");
+  expect(document.activeElement).toBe(selected);
+  expect(selected.getAttribute("aria-pressed")).toBe("true");
+  expect(screen.getByText(/1 active attempts outside refreshed evidence or hidden by filters/)).toBeTruthy();
+  expect(screen.getByText("2 shown · 0 filtered · 2 remaining attempts")).toBeTruthy();
+  expect(screen.getByText(/Another current attempt is outside the newest slice/)).toBeTruthy();
+  expect(screen.getByText("Last observed: Running (not refreshed)", { selector: "dd" })).toBeTruthy();
+  expect(screen.getByText(/Reload this page to reset the loaded history/)).toBeTruthy();
+  expect(screen.getByText("Checker: Not recorded · Not recorded · Last observed: running (not refreshed)")).toBeTruthy();
+  act(() => document.dispatchEvent(new Event("visibilitychange")));
+  await screen.findByText("Fresh settled effect", { selector: "dd" });
+  expect(screen.getByRole("button", { name: "Plan round 2 · Finished" })).toBe(selected);
+  expect(document.activeElement).toBe(selected);
+  expect(screen.getByText("Finished", { selector: "dd" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Plan round 4 · Last observed: Running (not refreshed)" })).toBeTruthy();
+  expect(mocked.listCrossCheckHistory).toHaveBeenCalledTimes(4);
 });
 
 it("refreshes the group-page cursor from the fresh response", async () => {
