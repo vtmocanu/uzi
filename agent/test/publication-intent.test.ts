@@ -247,7 +247,20 @@ describe("publication intent: enrollment", () => {
       assert.equal((await outbox.loadPublicationRecord(RUN, 4)).kind, "ok");
       assert.equal(api.calls.length, 1, "a definite refusal is not retried");
       assert.equal(outcome.kind === "uncertain" ? outcome.subreason : undefined,
-        result.kind === "refused" && result.reason === "stale_claim" ? "stale_claim" : undefined);
+        undefined, "a diagnostic reason grants no readoption authority");
+    }
+  });
+
+  it("only the exact typed 409 disposition marks a stale claim for readoption", async () => {
+    for (const [status, subreason] of [[409, "stale_claim"], [403, undefined]] as const) {
+      const root = tmpRoot();
+      const result: PublicationIntentResult = { kind: "refused", status, reason: "stale_claim", disposition: "stale_claim" };
+      const { outbox, d } = deps(root, scriptedApi(result));
+      await outbox.init();
+      const outcome = await enrollPublicationIntent(d, intent());
+      assert.equal(outcome.kind, "uncertain");
+      assert.equal(outcome.kind === "uncertain" ? outcome.subreason : undefined, subreason);
+      assert.equal((await outbox.loadPublicationRecord(RUN, 4)).kind, "ok");
     }
   });
 

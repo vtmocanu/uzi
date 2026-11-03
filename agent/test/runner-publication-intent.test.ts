@@ -1095,6 +1095,31 @@ it("exact stale_claim retries once per fresh running probe and stops when owners
   assert.deepEqual(api.publicationIntentRequests[0]!.body, api.publicationIntentRequests[1]!.body);
 });
 
+for (const [status, body] of [
+  [403, { reason: "stale_claim" }],
+  [409, { reason: "stale_claim" }],
+  [403, { disposition: "stale_claim" }],
+] as const) {
+  it(`untyped or wrong-status stale claim retains without reconciling: ${status} ${JSON.stringify(body)}`, async () => {
+    client.protocolFeatures = FEATURES;
+    const outbox = await mkOutbox();
+    const claim = claimFor(5199);
+    const flight = reconciliationFlight(claim.run_id);
+    api.publicationIntentWire = () => ({ status, body });
+    const runner = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+    let probes = 0;
+    // If authority regresses, one running probe permits a resend, then changed G stops the loop.
+    (runner as unknown as { getObservedRunOwnership: () => Promise<unknown> }).getObservedRunOwnership = async () => ({
+      status: "running", claim_generation: ++probes === 1 ? GEN : GEN + 1, claim_released: false,
+    });
+    const result = await (runner as unknown as EnrollSeam).enrollPublication(claim, flight, intentInput(false, "agent/issue-5199"))
+      .catch(error => error instanceof StaleClaimError ? "stale-stop" : Promise.reject(error));
+    assert.deepEqual({ result, probes, posts: api.publicationIntentRequests.length },
+      { result: "retain", probes: 0, posts: 1 });
+    assert.equal(outbox.hasPublicationRecords(claim.run_id), true, "conservative retain keeps the durable record");
+  });
+}
+
 for (const reason of ["publication_intent_mismatch", "publication_enrollment_retired", "other_disagreement"]) {
   it(`does not reconcile arbitrary server disagreement: ${reason}`, async () => {
     client.protocolFeatures = FEATURES;

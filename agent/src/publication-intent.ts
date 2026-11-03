@@ -686,7 +686,7 @@ export interface PublicationIntentRequest {
 export type PublicationIntentResult =
   | { kind: "acked"; enrollment_seq: number; candidate_seq: number; state: string }
   /** A definite api answer that stored nothing: the status and the machine-readable reason. */
-  | { kind: "refused"; status: number; reason: string }
+  | { kind: "refused"; status: number; reason: string; disposition?: "stale_claim" }
   /** The feature was not negotiated; nothing was sent. */
   | { kind: "unsupported" }
   /** Transport failure, timeout, a 5xx or an unreadable ack AFTER the request may have been applied. */
@@ -864,7 +864,7 @@ export async function enrollPublicationIntent(deps: PublicationDeps, intent: Pub
       if (!declined) {
         const detail = result.kind === "refused" ? `${result.status} ${result.reason}` : "publication_resume_v1 is not negotiated";
         return { ...uncertain(result.kind === "unsupported" ? "ack_unknown" : "server_disagrees", held, detail),
-          ...(result.kind === "refused" && result.reason === "stale_claim" ? { subreason: "stale_claim" as const } : {}),
+          ...(result.kind === "refused" && result.status === 409 && result.disposition === "stale_claim" ? { subreason: "stale_claim" as const } : {}),
         };
       }
       // The sequence-less record never reached the api (or the api holds nothing), so removing it retires nothing.
