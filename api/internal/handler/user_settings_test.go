@@ -72,7 +72,7 @@ func (f *fakeSettingsDB) Query(_ context.Context, sql string, _ ...any) (pgx.Row
 		for _, cell := range []struct{ stage, harness string }{{"plan", "claude"}, {"plan", "codex"}, {"code", "claude"}, {"code", "codex"}} {
 			rows.scans = append(rows.scans, func(dest ...any) error {
 				*dest[0].(*string), *dest[1].(*string) = cell.stage, cell.harness
-				values := []pgtype.Text{{}, {}, f.claudeModel, f.codexModel, f.effort, f.codexEffort, {}}
+				values := []pgtype.Text{{}, {}, f.claudeModel, f.codexModel, f.effort, f.codexEffort, {}, {}}
 				for i, v := range values {
 					*dest[i+2].(*pgtype.Text) = v
 				}

@@ -50,10 +50,17 @@ rules and, for `fact-checker`, its forge tools on top (both explained below):
 | `ux-designer` | `opus` | Sets opinionated visual and information-architecture direction, then builds and browser-validates the frontend/UI; owns the design layer and defers backend logic to the coder. |
 
 The table lists the shipped Claude pins; shipped builtin Codex pins are empty.
-The `lead` is the orchestrator: the main agent thread. For run model settings,
-see [Worker model](./worker-model.md). Editing a template's prompt only tunes
-its persona and workflow; the primary-directive guardrails (never touch
-`main`, no `git push`, the plan gate) are enforced by the worker regardless.
+The lead is the orchestrator: the main agent thread. Both harnesses select
+the first delivered own template whose name is exactly `lead` or
+`orchestrator`, case-insensitively, preserving delivered order. All own
+templates with either name are withheld from the subagent roster, including
+later matches. Repo-sourced templates, including a repo `lead`, remain
+ordinary subagents; they do not replace the root.
+
+For run model settings, see [Worker model](./worker-model.md). Editing a
+template's prompt only tunes its persona and workflow; the primary-directive
+guardrails (never touch `main`, no `git push`, the plan gate) are enforced by
+the worker regardless.
 
 An empty Claude pin keeps the **Default · …** label in the list, detail page,
 editor, builtin diff and agent-source review: `Default · SDK/account default
@@ -65,10 +72,19 @@ defaults**) overrides the template's Claude pin for your runs.
 
 A template stores two independent pins: `model` is the **Claude pin**, and
 `codex_model` is the **Codex pin**. A run receives the pin for its own harness.
-For a subagent, an empty pin means **Default · lead's model**: it follows the
-model the run resolved for the lead. On the lead, Default means the harness's
-built-in fallback (the SDK/account default for Claude, `gpt-6.1-sol` for Codex),
-subject to the run's model settings. The shipped lead has a Claude pin of `opus`.
+For a subagent, an empty pin follows the model the run resolved for the lead.
+The schedule's model takes precedence over your worker-model lane, then the
+selected lead template's pin for the run's harness. An empty lead pin falls
+back to the SDK/account default for Claude or `gpt-6.1-sol` for Codex. The
+shipped lead has a Claude pin of `opus` and an empty Codex pin.
+
+A subagent's own pin for the run's harness takes precedence over following
+the resolved root unless the schedule's **Apply model also to agents** is
+set; then subagents follow the resolved root too. The lead's Codex fallback
+needs a worker from this release; older Codex workers use the built-in
+provider model when no higher-priority setting applies. See
+[Model precedence](./worker-model.md#model-precedence) for rollout and the
+pending hosted validation.
 
 Save-time rules apply to builtin, global and personal templates:
 
@@ -91,9 +107,9 @@ On upgrade, the migration moves recognized Codex role IDs already stored in
 `model` into `codex_model` and clears `model`. Surrounding whitespace is trimmed
 when recognizing those IDs; other stored model values are left unchanged.
 
-These storage, API and claim rules are M1a of #3249. Using the lead's Codex pin
-as the root fallback is reserved for M2; the editor's two model selects are
-reserved for M4. See the [approved PRD](../prds/3249-per-harness-template-pins.md).
+The editor's two model selects remain pending M4 of #3249; the existing
+list and **Default · …** labels are unchanged pending separate UI work.
+See the [approved PRD](../prds/3249-per-harness-template-pins.md).
 
 The builtin `fact-checker` also gets six `mcp__forge__*` read tools, so it
 alone can read the run's own forge (issues, merge requests, pipelines, label
