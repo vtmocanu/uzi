@@ -226,8 +226,10 @@ func CodexWindowReset(w *apitypes.CodexRateLimitWindowDTO, readAt time.Time) *ti
 // CodexMainWeeklyReset is the soonest upcoming weekly reset of the Codex main bucket, the
 // reset_first ranking key (#3844). Only the main bucket's primary or secondary windows whose
 // reported duration is exactly WeeklyWindowSeconds count, never chosen by position. A window
-// whose reset is unknown, or already passed since readAt (PreReset), is skipped: its reading
-// describes the old window. Nil when no window qualifies.
+// whose reset is unknown, or that passed after readAt and at or before now (PreReset), is
+// skipped: its reading describes the old window. A reset at or before readAt is not PreReset
+// and IS returned, even when it is not after now; the ranker (autoselect's futureReset) treats
+// a reset at or before its own now as unknown. Nil when no window qualifies.
 func CodexMainWeeklyReset(buckets []apitypes.CodexRateLimitBucketDTO, readAt, now time.Time) *time.Time {
 	for i := range buckets {
 		if buckets[i].ID != codexauth.CodexMainBucketID {

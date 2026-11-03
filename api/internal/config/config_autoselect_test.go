@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -156,6 +157,10 @@ func TestAutoselectOrder(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			autoselectEnv(t)
+			// Register restoration of any ambient value, then drop it so the unset
+			// case does not depend on the environment.
+			t.Setenv("UZI_AUTOSELECT_ORDER", "")
+			os.Unsetenv("UZI_AUTOSELECT_ORDER")
 			if tc.set {
 				t.Setenv("UZI_AUTOSELECT_ORDER", tc.env)
 			}

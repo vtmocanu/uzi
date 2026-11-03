@@ -54,6 +54,7 @@ func assertRecordedAuto(t *testing.T, f autoFixture, want uuid.UUID, headroom in
 
 func TestAutoClaimResetFirstPrefersSoonerWeeklyReset(t *testing.T) {
 	f := newAutoFixture(t)
+	f.svc.p.Autoselect.Order = autoselect.OrderResetFirst
 	f.fs.autoCandidates = resetFirstPool(f)
 	f.claim(t)
 	assertRecordedAuto(t, f, f.fullID, 20)
@@ -71,6 +72,7 @@ func TestAutoClaimHeadroomFirstPolicyStillPrefersHeadroom(t *testing.T) {
 
 func TestRunOverrideAutoResetFirstPrefersSoonerWeeklyReset(t *testing.T) {
 	f := newAutoFixture(t)
+	f.svc.p.Autoselect.Order = autoselect.OrderResetFirst
 	f.worker.AnthropicBindMode = BindModePinned
 	f.worker.AnthropicSecretID = pgtype.UUID{Bytes: f.emptyID, Valid: true}
 	f.fs.claimRun.CredentialOverrideMode = pgtype.Text{String: "auto", Valid: true}
@@ -83,6 +85,7 @@ func TestRunOverrideAutoResetFirstPrefersSoonerWeeklyReset(t *testing.T) {
 // reset, so the next-soonest eligible token is picked, not the emptiest.
 func TestAutoResumeExclusionResetFirstPicksNextSoonest(t *testing.T) {
 	f := newAutoFixture(t)
+	f.svc.p.Autoselect.Order = autoselect.OrderResetFirst
 	dead := uuid.New() // soonest reset; excluded, never opened
 	f.fs.claimRun.LimitDeadSecretID = pgtype.UUID{Bytes: dead, Valid: true}
 	f.fs.claimRun.RetryNotBefore = pgtype.Timestamptz{Time: autoNow.Add(time.Hour), Valid: true}
@@ -100,6 +103,7 @@ func TestAutoResumeExclusionResetFirstPicksNextSoonest(t *testing.T) {
 // next-soonest unblocked one (reason auto), not the blocked one.
 func TestAutoChoiceResetFirstReserveDropsBlockedSoonestReset(t *testing.T) {
 	f := newAutoFixture(t)
+	f.svc.p.Autoselect.Order = autoselect.OrderResetFirst
 	blocked := uuid.New() // soonest weekly reset, blocked by the reserve
 	next := f.fullID      // next-soonest, unblocked
 	f.fs.autoCandidates = []store.ListAutoSelectCandidatesRow{
@@ -130,6 +134,7 @@ func TestAutoChoiceResetFirstReserveDropsBlockedSoonestReset(t *testing.T) {
 
 func TestJudgeChoiceAutoResetFirstPrefersSoonerWeeklyReset(t *testing.T) {
 	f := newAutoFixture(t)
+	f.svc.p.Autoselect.Order = autoselect.OrderResetFirst
 	f.fs.judgeBindMode = BindModeAuto
 	f.fs.autoCandidates = resetFirstPool(f)
 	choice, err := f.svc.judgeChoice(context.Background(), f.judgeRun())
@@ -146,6 +151,7 @@ func TestJudgeChoiceAutoResetFirstPrefersSoonerWeeklyReset(t *testing.T) {
 
 func TestSelfImproveAutoResetFirstPrefersSoonerWeeklyReset(t *testing.T) {
 	f := newAutoFixture(t)
+	f.svc.p.Autoselect.Order = autoselect.OrderResetFirst
 	f.fs.claimRun.Kind = runkind.SelfImprove
 	f.fs.judgeBindMode = BindModeAuto
 	f.fs.autoCandidates = resetFirstPool(f)

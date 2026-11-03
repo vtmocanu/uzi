@@ -48,7 +48,7 @@ func newPoolFix(t *testing.T) *poolFix {
 	// global, so a leftover owner would leak into later reserve LiveDB tests in this package.
 	t.Cleanup(func() { _, _ = env.pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, userID) })
 	svc := atomicSvc(env)
-	svc.p.Autoselect = autoselect.Policy{MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10}
+	svc.p.Autoselect = autoselect.Policy{Order: autoselect.OrderHeadroomFirst, MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10}
 	svc.p.CodexUsagePollInterval = 10 * time.Minute
 	cfg, err := pgxpool.ParseConfig(os.Getenv("UZI_TEST_DATABASE_URL"))
 	if err != nil {
@@ -803,7 +803,7 @@ func TestCodexSelectMRReworkUsesPoolLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	userID, workerID, repoID := env.seedCodexInfra(t)
 	fx := &poolFix{t: t, env: env, userID: userID, repoID: repoID, svc: atomicMRReworkSvc(env), iid: 100}
-	fx.svc.p.Autoselect = autoselect.Policy{MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10}
+	fx.svc.p.Autoselect = autoselect.Policy{Order: autoselect.OrderHeadroomFirst, MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10}
 	fx.svc.p.CodexUsagePollInterval = 10 * time.Minute
 
 	def := fx.newAccount("def")
@@ -832,7 +832,7 @@ func TestCodexSelectMRReworkUsesPoolLiveDB(t *testing.T) {
 func TestCodexSelectPlanCrossCheckChildUsesPoolLiveDB(t *testing.T) {
 	f, w := admissionCheckerBase(t, "plan")
 	fx := &poolFix{t: t, env: f.env, userID: f.userID, svc: f.svc}
-	f.svc.p.Autoselect = autoselect.Policy{MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10}
+	f.svc.p.Autoselect = autoselect.Policy{Order: autoselect.OrderHeadroomFirst, MinHeadroom: 10, HeadroomTiePct: 5, InflightPenalty: 10}
 	f.svc.p.CodexUsagePollInterval = 10 * time.Minute
 	def := poolAccount{alias: f.aliasID, account: fx.accountOf(f.aliasID)}
 	other := fx.newAccount("other")
