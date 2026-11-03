@@ -60,7 +60,7 @@ judge for everyone — into three effective modes:
 on a usable credential for the reviewed run's own harness. Removing Anthropic
 credentials does not prevent a Codex run from being judged when a usable
 Codex credential remains. Your lever under enforced mode is the *model* it
-runs on, not the on/off toggle — see the next section.
+runs on, not the on/off toggle; see the next section.
 
 ## Which token the judge spends
 
@@ -168,9 +168,8 @@ Anthropic token is a **subscription plan** rather than a metered console key,
 an opus judge spends **plan/rate-limit quota, not dollars** — under enforced
 mode especially, a busy judge can eat into the quota your real runs need.
 Pinning your Claude judge model to `haiku` or `sonnet` is the fix if that's a
-problem; short of that, deleting your token is the only way to stop the
-judge from running under enforced mode (see [Judge
-mode](#judge-mode-off-optional-enforced) above).
+problem. Enforced mode has no separate per-user opt-out switch; see [Judge
+mode](#judge-mode-off-optional-enforced) above.
 
 ## What you get
 
@@ -269,7 +268,7 @@ Read the resulting assessment with these limits in mind:
   when absent. A deadline-shaped interval is a hypothesis, not a confirmed
   timeout.
 - **Tool activity:** lead/child/unknown counts, including lead activity after
-  the last observed dispatch, are signals — not effort percentages,
+  the last observed dispatch, are signals, not effort percentages,
   productivity, source ownership or test-success evidence. There is no
   blanket ban on lead implementation. The judge is instructed to distinguish
   reasonable continuation after a child failure from unnecessary takeover,
@@ -282,7 +281,7 @@ Read the resulting assessment with these limits in mind:
 A review may optionally use the existing `improve_uzi` or `adjust_template`
 categories for a limitation in the judge's own evidence, compaction or
 assessment. It should identify the affected conclusion, sequence anchors or
-coverage, and an actionable remedy — or state honest uncertainty.
+coverage, and an actionable remedy, or state honest uncertainty.
 This does not require a recommendation, add a category or invoke another
 judge. Matching known `improve_uzi` targets are reused unchanged so recurring
 findings group together.
