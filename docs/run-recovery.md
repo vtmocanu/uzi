@@ -2421,7 +2421,7 @@ receipt matching this record's saved FINAL request, with or without the ACK alre
 A discarded hold, or custody released without this record's matching receipt, is refused
 (typically `case_b_pending_owner_review`; the first failing check wins, so an earlier
 blocker such as `cleanup_pending`, `binding_missing` or `holds_unknown` can be reported instead);
-no supported resolver exists for it, and it is [proposed, not accepted](../adr/2417-guarded-local-retention.md#proposed-not-accepted--case-b-local-record-disposition-3885).
+no supported resolver exists for it, and it is [proposed, not accepted](../adr/2417-guarded-local-retention.md#proposed-not-accepted-case-b-local-record-disposition-3885).
 The tested failure model is an abrupt process kill; storage or power-loss behaviour is
 unspecified (record writes are rename-atomic, not fsynced).
 

@@ -4,7 +4,7 @@
 **Date**: 2026-10-07
 **Issue**: [vtmocanu/uzi#2417](https://github.com/vtmocanu/uzi/issues/2417)
 
-## Amendment 2026-11-04 — operator resolution of guarded local records (#3885)
+## Amendment 2026-11-04: operator resolution of guarded local records (#3885)
 
 **Status**: Accepted for Case A. Case B is proposed, not accepted and not
 implemented (next section).
@@ -80,7 +80,7 @@ re-inspects before retrying; the digest changes after any mutation. The 5 s
 channel close/shutdown wait neither establishes settlement nor releases
 ownership.
 
-## Proposed (not accepted) — Case B local-record disposition (#3885)
+## Proposed (not accepted): Case B local-record disposition (#3885)
 
 Not accepted and not implemented. Today a generation in Case B refuses
 (typically `case_b_pending_owner_review`; the first failing check wins), and issue #3885 stays open for it. This section

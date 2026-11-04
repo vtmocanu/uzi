@@ -249,7 +249,11 @@ async function boundaryWorld(identityOf: (read: number) => string = () => "stabl
     tails: () => (runner as unknown as { executionTails: Map<string, unknown> })["executionTails"] };
 }
 
-test("A2 through the production boundary: a quiescent, stable source is the positive control (one POST, retired)", async () => {
+// The production source proof is Linux-only (it refuses `non_linux_host` elsewhere), so the
+// cases that need it to pass run on Linux; the control below pins the refusal everywhere else.
+const LINUX_ONLY = { skip: process.platform === "linux" ? false : "Linux only: the production source proof refuses non_linux_host" };
+
+test("A2 through the production boundary: a quiescent, stable source is the positive control (one POST, retired)", LINUX_ONLY, async () => {
   const b = await boundaryWorld();
   assert.deepEqual(await b.w.resolve(await b.w.digest()), { kind: "retired", generation: 7, remaining: 0 });
   assert.equal(b.entered(), 1, "the production boundary ran");
@@ -257,6 +261,17 @@ test("A2 through the production boundary: a quiescent, stable source is the posi
   assert.equal(b.w.posts.length, 1);
   assert.deepEqual(b.diagnostics, []);
   assert.equal(b.tails().size, 0, "the boundary released its execution tail");
+});
+
+test("A2 through the production boundary: a non-Linux host refuses before the POST", { skip: process.platform === "linux" ? "non-Linux control" : false }, async () => {
+  const b = await boundaryWorld();
+  const digest = await b.w.digest();
+  const before = await b.w.state();
+  assert.deepEqual(await b.w.resolve(digest), { kind: "refused", reason: "source_boundary_retained" });
+  assert.deepEqual(b.diagnostics, [{ check: "non_linux_host" }]);
+  assert.equal(b.w.posts.length, 0, "no release request was sent");
+  await b.w.assertUntouched(before);
+  assert.equal(b.tails().size, 0);
 });
 
 test("A2 through the production boundary: an execution tail already present refuses before the POST", async () => {
@@ -271,7 +286,7 @@ test("A2 through the production boundary: an execution tail already present refu
   assert.ok(b.tails().has(b.w.runId), "the other lane's tail is left alone");
 });
 
-test("A2 through the production boundary: a live process attributed to the clone refuses before the POST", async () => {
+test("A2 through the production boundary: a live process attributed to the clone refuses before the POST", LINUX_ONLY, async () => {
   const b = await boundaryWorld();
   const digest = await b.w.digest();
   const proc = makeFakeProcRoot();
@@ -287,7 +302,7 @@ test("A2 through the production boundary: a live process attributed to the clone
   assert.equal(b.tails().size, 0);
 });
 
-test("A2 through the production boundary: a source identity that changes inside the boundary's own proof refuses", async () => {
+test("A2 through the production boundary: a source identity that changes inside the boundary's own proof refuses", LINUX_ONLY, async () => {
   // Reads 1 and 2 are the two reads of the first proof; the second differs.
   const b = await boundaryWorld(read => (read === 1 ? "before" : "after"));
   const digest = await b.w.digest();
@@ -297,7 +312,7 @@ test("A2 through the production boundary: a source identity that changes inside 
   await b.w.assertUntouched(before);
 });
 
-test("A2 through the production boundary: a source identity that changes between the two proofs refuses before the POST", async () => {
+test("A2 through the production boundary: a source identity that changes between the two proofs refuses before the POST", LINUX_ONLY, async () => {
   // The first proof (reads 1 and 2) is stable; the finalizer's own re-proof sees a different source.
   const b = await boundaryWorld(read => (read <= 2 ? "first-proof" : "second-proof"));
   const digest = await b.w.digest();
