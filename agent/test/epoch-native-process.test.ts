@@ -7,6 +7,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
 import { createCaptureContext, GitCache, type EpochDiscardProof } from "../src/git.js";
+import { runnerCommand } from "../src/runner-uid.js";
 import { MaintenanceResources } from "../src/recovery-maintenance.js";
 import { nullLogger } from "./helpers.js";
 
@@ -24,7 +25,7 @@ interface PrivateCache {
   beginDestructive: () => Promise<{ settle(result: { ok: boolean }): Promise<void> }>;
 }
 
-function fixture(deleteLaunch = false) {
+function fixture(deleteLaunch = false, identity: Identity = "worker_pat") {
   const git = new GitCache(path.join(process.env.TMPDIR!, "cache"), nullLogger());
   const internal = git as unknown as PrivateCache;
   let pending = 0, stopped = false, inherited = 0, alive = true, killed = 0;
@@ -52,7 +53,7 @@ function fixture(deleteLaunch = false) {
     selector: { runId: "epoch-native", generation: "none", attempt: "canonical" },
     barePath: path.join(process.env.TMPDIR!, "bare"), paths: [target], confirm: "a".repeat(64),
     expectedRawJournal: JSON.stringify({ clonePath: target, runId: "epoch-native" }),
-    checkLive() {}, signal: controller.signal, deadline: Date.now() + 10_000,
+    beforeEffect: async () => {}, checkLive() {}, signal: controller.signal, deadline: Date.now() + 10_000,
   });
   const child = Object.assign(new EventEmitter(), {
     pid: 12345, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
@@ -66,6 +67,7 @@ function fixture(deleteLaunch = false) {
       assert.deepEqual(options.stdio, ["pipe", "pipe", "pipe", 42]);
       if (deleteLaunch) assert.deepEqual(options.env, { PATH: "/usr/bin:/bin" });
       else {
+        assert.equal(options.env.TMPDIR, identity === "command" ? process.env.UZI_RUNNER_TMPDIR ?? process.env.TMPDIR : process.env.TMPDIR);
         assert.equal(options.env.PATH, "/usr/bin:/bin");
         assert.equal(options.env.GIT_OPTIONAL_LOCKS, "0");
         assert.equal(options.env.GIT_CONFIG_GLOBAL, "/dev/null");
@@ -78,8 +80,10 @@ function fixture(deleteLaunch = false) {
     kill: pid => { assert.equal(pid, 12345); killed++; },
     joinMs: 60,
   };
-  const invoke = (options: Omit<Options, "env"> = {}) => internal.withEpochNativeReads(proof,
-    () => internal.execScoped("/usr/bin/git", ["version"], { env: {}, ...options }));
+  const invoke = (options: Omit<Options, "env"> = {}) => internal.withEpochNativeReads(proof, () => {
+    const command = identity === "command" ? runnerCommand("/usr/bin/git", ["version"]) : { command: "/usr/bin/git", args: ["version"] };
+    return internal.execScoped(command.command, command.args, { env: {}, ...options }, identity);
+  });
   const close = (code = 0) => {
     child.stdout.end(); child.stderr.end(); child.emit("close", code, null);
   };
@@ -89,6 +93,35 @@ function fixture(deleteLaunch = false) {
     inherited: () => inherited, killed: () => killed };
 }
 
+it("native runner preflight preserves its validated TMPDIR independently of worker TMPDIR", async () => {
+  const old = process.env.UZI_RUNNER_TMPDIR;
+  process.env.UZI_RUNNER_TMPDIR = path.join(process.env.TMPDIR!, "runner-private");
+  try {
+    const f = fixture();
+    const internal = f.git as unknown as {
+      withEpochNativeReads<T>(proof: EpochDiscardProof, action: () => Promise<T>): Promise<T>;
+      preflightEpochNative(command: string, args: string[], env: NodeJS.ProcessEnv, identity: Identity): NodeJS.ProcessEnv;
+    };
+    await internal.withEpochNativeReads(f.proof, async () => {
+      const runner = internal.preflightEpochNative("/usr/bin/git", ["version"], {}, "command");
+      const worker = internal.preflightEpochNative("/usr/bin/git", ["version"], {}, "worker_pat");
+      assert.equal(runner.TMPDIR, process.env.UZI_RUNNER_TMPDIR);
+      assert.equal(worker.TMPDIR, process.env.TMPDIR);
+      assert.notEqual(runner.TMPDIR, worker.TMPDIR);
+    });
+    for (const identity of ["command", "worker_pat"] as const) {
+      const launched = fixture(false, identity);
+      const result = launched.invoke();
+      await launched.launched;
+      launched.gone(); launched.exit(); launched.close();
+      await result;
+      launched.scope.assertSettled();
+    }
+  } finally {
+    if (old === undefined) delete process.env.UZI_RUNNER_TMPDIR;
+    else process.env.UZI_RUNNER_TMPDIR = old;
+  }
+});
 it("exit starts group cleanup before close; success waits for descendant absence and IO", async () => {
   const f = fixture();
   let done = false;
