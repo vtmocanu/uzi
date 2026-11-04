@@ -14762,6 +14762,31 @@ func (q *Queries) LockPlanCrossCheckLeadForVerdict(ctx context.Context, arg Lock
 	return i, err
 }
 
+const lockPlanCrossCheckLeadWorkerForVerdict = `-- name: LockPlanCrossCheckLeadWorkerForVerdict :one
+SELECT w.id FROM workers w
+WHERE w.id = (SELECT lead.worker_id FROM runs lead
+              JOIN cross_checks cc ON cc.lead_run_id = lead.id
+              WHERE cc.checker_run_id = $1 AND cc.stage = 'plan'
+                AND lead.claim_generation = cc.lead_claim_generation
+              LIMIT 1)
+FOR KEY SHARE OF w
+`
+
+// Issue #3859: take the lead's worker row (FOR KEY SHARE, what the foreign-key re-check would take
+// later) BEFORE the lead and check locks, so a verdict follows the lock order the sweeps and the
+// snapshot apply use: workers, runs, cross_checks. The verdict transaction updates the lead row
+// twice (BankPlanCrossCheckWait, then UpdateRunLastSeq); the second update re-checks runs.worker_id
+// against workers because the old tuple was written by the same transaction, which would
+// otherwise queue it behind a sweep that holds the worker FOR UPDATE while that sweep waits for
+// the lead lock this transaction already holds. The worker id is stable within a claim
+// generation; the locking statement below still fences the generation.
+func (q *Queries) LockPlanCrossCheckLeadWorkerForVerdict(ctx context.Context, childID pgtype.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockPlanCrossCheckLeadWorkerForVerdict, childID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const lockRunForInputReceipt = `-- name: LockRunForInputReceipt :one
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
@@ -17178,6 +17203,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted'
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -17237,6 +17263,7 @@ WHERE runs.id = $1 AND runs.user_id = $2 AND runs.status = 'recovery_wait'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted'
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -17284,6 +17311,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
   AND runs.recovery_retry_not_before <= $1
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -17337,6 +17365,7 @@ WHERE runs.status = 'recovery_wait' AND runs.recovery_wait_cause IS DISTINCT FRO
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
   AND runs.recovery_retry_not_before <= $1
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -20510,7 +20539,7 @@ const resumeWorkerRecoveryEpisode = `-- name: ResumeWorkerRecoveryEpisode :one
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = $1 AND runs.user_id = $2
-  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
        OR (COALESCE(runs.budget_wall_seconds, $3::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
@@ -20559,7 +20588,9 @@ UPDATE runs SET
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
                ELSE 0 END,
     -- Retained recovery preserves affinity even though its execution claim is released.
-    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted' AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed' THEN NULL ELSE runs.worker_id END,
+    -- retained_continuation_unwitnessed keeps it too: the retained source it parks over lives on
+    -- that worker's disk, so the resumed run must requeue back to the same worker.
+    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted' AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed' AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed' THEN NULL ELSE runs.worker_id END,
     hold_reason = NULL,
     hold_captured_head = NULL,
     worker_recovery_episode = runs.worker_recovery_episode + 1,
@@ -20570,7 +20601,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
 WHERE runs.id = $1 AND runs.user_id = $2
-  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
   -- Honor the wall sweep's chat/judge/interactive exemptions; timed runs still need remaining budget.
   -- Extending does not itself release this hold; checker parent/deadline guards below still apply.
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL

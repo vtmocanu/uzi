@@ -70,6 +70,10 @@ $$;
 -- +goose StatementEnd
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
+-- Serialise against live run writers while the Down rewrites rows and narrows the CHECKs; a held
+-- lock fails the rollback after 5s rather than queueing every runs writer behind it.
+LOCK TABLE runs IN ACCESS EXCLUSIVE MODE;
 -- The extra observation keys are not representable by the prior check: drop them first.
 UPDATE runs SET worker_recovery_evidence = worker_recovery_evidence - ARRAY['presence','registration_evidence_epoch','worker_snapshot_epoch','deadline']
 WHERE worker_recovery_evidence ? 'presence';
