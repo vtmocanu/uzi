@@ -442,7 +442,8 @@ instead of starting on a different harness than was decided. A refresher
 quarantine or re-login written after the fence is not caught (the existing
 refresher-after-fence window). A pool pick that no longer holds at the fence
 is first re-selected from the pool and the replacement is scored normally; the
-Codex side is unknown only when no pool alias remains, and any other error
+Codex side is unknown only when no pool alias remains or the bounded
+re-selection gives up, and any other error
 fails creation. A default-account pick that no longer holds counts as an
 unknown Codex side.
 

@@ -30,8 +30,10 @@ comes from: the Claude model picker reads `Default · lead template` (the
 `Default · gpt-6.1-sol (built-in)`. The harness picker's empty option reads
 `Default · automatic`: uzi picks your only usable harness, or, when both are
 usable, chooses by weekly limits for eligible new issue runs (started
-manually, by autopilot or by a schedule, with no model pin, Anthropic
-credential override or Plan/Code cross-check; other runs keep Claude when both are usable). It picks the harness whose weekly allowance
+manually, by autopilot or by a schedule, with no explicit harness or issue
+harness label, model pin, Anthropic credential override or Plan/Code
+cross-check; other runs keep the usual resolution: an explicit harness, else
+Claude). It picks the harness whose weekly allowance
 resets soonest, falling back to Claude when usage is unknown; see [How the
 automatic default picks a harness](./rate-limits.md#how-the-automatic-default-picks-a-harness).
 Schedules and the start-run form still say **Use my default** for

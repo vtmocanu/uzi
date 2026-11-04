@@ -77,7 +77,7 @@ applies only to an explicit default (below).
   that no longer holds counts as an unknown Codex side. A pool pick that
   fails is first re-selected from the pool (`fenceCodexPoolAlias`) and the
   replacement is scored normally; the side is unknown only when no pool alias
-  remains (`errCodexPoolUnavailable`), and any other error fails creation. The
+  remains or the bounded re-selection gives up (`errCodexPoolUnavailable`), and any other error fails creation. The
   decision is recomputed with the earlier Claude side. If the recomputed decision would
   choose a different harness, creation refuses (`errHarnessOverflowFence`) and
   the transaction rolls back. If Codex degrades but Claude stays chosen, the

@@ -285,10 +285,11 @@ A few worth knowing:
   --harness claude|codex` request a specific harness outright; omitting the
   flag leaves the server's own resolution in charge (your effective default,
   or whichever harness you have a usable credential for; with both usable and
-  no default, eligible new issue runs (manual, autopilot or schedule; no model
-  pin, Anthropic credential override or Plan/Code cross-check) are
+  no default, eligible new issue runs (manual, autopilot or schedule; no
+  explicit harness or issue harness label, model pin, Anthropic credential
+  override or Plan/Code cross-check) are
   [chosen by weekly limits](./rate-limits.md#how-the-automatic-default-picks-a-harness)
-  and other runs keep Claude; with an explicit default, [optional overflow](#harness-overflow) for
+  and other runs keep the usual resolution; with an explicit default, [optional overflow](#harness-overflow) for
   eligible new issue runs). `schedule edit
   --harness ""` clears a schedule's pin back to per-fire resolution; leaving
   the flag unset on edit leaves the stored pin unchanged. The resolved
