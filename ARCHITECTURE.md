@@ -511,7 +511,9 @@ durable design decisions and
 [docs/rate-limits.md](docs/rate-limits.md#codex-account-limits) for
 user-facing behavior. For users who opt in (`codex_account_mode = auto`), these
 readings also pick the Codex account at run creation only, never afterwards; see
-the [ADR-1106 amendment](adr/1106-codex-harness.md#amendment-codex-account-auto-selection-at-run-creation-3719-2026-10-31).
+the [ADR-1106 amendment](adr/1106-codex-harness.md#amendment-codex-account-auto-selection-at-run-creation-3719-2026-10-31);
+the default order is the soonest weekly reset, see
+[ADR-3844](adr/3844-reset-first-pool-order.md).
 
 A separate survivor path can retry an original non-rejection refresh error once
 when its durable receipt authorizes reuse. Admission consumes the retry under
@@ -616,8 +618,14 @@ releasing the claim; see
 [adr/1247-per-run-token-selection.md](adr/1247-per-run-token-selection.md).
 
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
-— and `auto` ranks the owner's opted-in tokens by rate-limit headroom
-(`api/internal/autoselect`, fed by the same gauge the meters render). The
+— and `auto` ranks the owner's opted-in tokens, by default the soonest weekly
+reset among those with enough headroom (`UZI_AUTOSELECT_ORDER=reset_first`; the
+previous most-headroom order is `headroom_first`; under `reset_first`, for
+picks above the headroom floor, the in-flight penalty only breaks
+exact weekly-reset ties, so a burst can
+concentrate on one token just above the floor, see
+[ADR-3844](adr/3844-reset-first-pool-order.md)), in `api/internal/autoselect`,
+fed by the same gauge the meters render. The
 ranker is **pure**: the store query ends at `[]autoselect.Candidate` and
 everything after it is arithmetic over already-fetched rows with an injected
 clock, which is what keeps the ranking testable without a database. It sits

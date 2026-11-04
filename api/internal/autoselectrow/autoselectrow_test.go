@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -240,4 +241,35 @@ func TestFromAdminRateLimitRow_UnwrapsNullables(t *testing.T) {
 	if got.SevenResetsAt != nil {
 		t.Errorf("SevenResetsAt = %v, want nil (invalid column)", got.SevenResetsAt)
 	}
+}
+
+// WeeklyResetsAt is the reset_first ranking key (#3844): it equals the seven-day reset,
+// is nil when that column is invalid, and never aliases SevenResetsAt.
+func TestWeeklyResetsAt_FromSevenDayResetOnBothConverters(t *testing.T) {
+	seven := time.Date(2026, 8, 8, 10, 0, 0, 0, time.UTC)
+	check := func(t *testing.T, c autoselect.Candidate) {
+		t.Helper()
+		if c.WeeklyResetsAt == nil || !c.WeeklyResetsAt.Equal(seven) {
+			t.Fatalf("WeeklyResetsAt = %v, want %v", c.WeeklyResetsAt, seven)
+		}
+		if c.SevenResetsAt == nil || !c.SevenResetsAt.Equal(seven) {
+			t.Fatalf("SevenResetsAt = %v, want %v", c.SevenResetsAt, seven)
+		}
+		if c.WeeklyResetsAt == c.SevenResetsAt {
+			t.Fatal("WeeklyResetsAt aliases SevenResetsAt (same pointer)")
+		}
+	}
+	valid := pgtype.Timestamptz{Time: seven, Valid: true}
+	t.Run("rate limit row", func(t *testing.T) {
+		check(t, FromRateLimitRow(store.ListRateLimitsForUserRow{SevenDayResetsAt: valid}))
+		if c := FromRateLimitRow(store.ListRateLimitsForUserRow{}); c.WeeklyResetsAt != nil {
+			t.Fatalf("invalid seven-day reset: WeeklyResetsAt = %v, want nil", c.WeeklyResetsAt)
+		}
+	})
+	t.Run("candidate row", func(t *testing.T) {
+		check(t, FromCandidateRow(store.ListAutoSelectCandidatesRow{SevenDayResetsAt: valid}))
+		if c := FromCandidateRow(store.ListAutoSelectCandidatesRow{}); c.WeeklyResetsAt != nil {
+			t.Fatalf("invalid seven-day reset: WeeklyResetsAt = %v, want nil", c.WeeklyResetsAt)
+		}
+	})
 }

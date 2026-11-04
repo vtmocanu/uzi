@@ -39,6 +39,10 @@ type Candidate struct {
 	Score      float64
 	ScoreKnown bool
 	ResetAt    *time.Time
+	// WeeklyResetAt is the account's soonest weekly-window reset, nil when none is known.
+	// It is the reset_first ranking key only; ResetAt stays the binding reset and keeps
+	// driving release timing (#3844).
+	WeeklyResetAt *time.Time
 	// ReleaseAt and ReleaseKnown order pool_exhausted: the maximum of the account's known
 	// per-cause release times, computed by the caller. ReleaseKnown is false when any
 	// cause's time is unknown.
@@ -124,8 +128,10 @@ func selectNormal(normal []Candidate, p autoselect.Policy, now time.Time) (Outco
 			SevenDayPct:   &pct,
 			FiveResetsAt:  c.ResetAt,
 			SevenResetsAt: c.ResetAt,
-			SyncedAt:      &synced,
-			InFlight:      c.InFlight,
+			// Ranking-only weekly key; the binding resets above stay ResetAt.
+			WeeklyResetsAt: c.WeeklyResetAt,
+			SyncedAt:       &synced,
+			InFlight:       c.InFlight,
 		})
 	}
 	if len(known) == 0 {

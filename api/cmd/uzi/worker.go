@@ -307,8 +307,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			"  <label>     pin the worker to that named token\n" +
 			"  --default   use your default token\n" +
 			"  --auto      let uzi pick per claim, from the tokens you opted into the\n" +
-			"              pool with `uzi token pool` — preferring the account with the\n" +
-			"              most rate-limit headroom\n\n" +
+			"              pool with `uzi token pool` that still have headroom to spare\n\n" +
 			"An --auto worker spends ONLY pooled tokens: if the pool has tokens it\n" +
 			"floors onto the best available one (never your out-of-pool default); if\n" +
 			"the pool is genuinely empty the run HOLDS, waiting for a token to be\n" +

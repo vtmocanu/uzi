@@ -80,7 +80,7 @@ const REASON_PHRASES: Record<SelectReason, Phrase> = {
   },
   auto: {
     mode: "auto",
-    hint: "Auto-selection picked this token from your pool as the one with the most rate-limit headroom.",
+    hint: "Auto-selection picked this token from your pool.",
   },
   best_of_pool: {
     // Named rather than folded into `auto`: every pooled token was under the headroom
@@ -221,12 +221,12 @@ const CODEX_REASON_PHRASES: Record<CodexSelectReason, Phrase> = {
   pool_empty: {
     // A fallback the user can act on (pool a login), hence info and a link.
     mode: "default (auto: no pooled login)",
-    hint: "Your Codex setting is \"Pick by headroom\", but no Codex login was in the pool, so this run used your default Codex credential. Pool a login on Settings → OpenAI / Codex credentials to let uzi choose.",
+    hint: "Your Codex setting is \"Pick from pool\", but no Codex login was in the pool, so this run used your default Codex credential. Pool a login on Settings → OpenAI / Codex credentials to let uzi choose.",
     tone: "info",
   },
   auto: {
     mode: "auto",
-    hint: "When the run was created, uzi picked this pooled Codex login as the one with the most limit headroom.",
+    hint: "When the run was created, uzi picked this Codex login from your pool.",
   },
   best_of_pool: {
     mode: "auto (best of pool)",
