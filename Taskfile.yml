@@ -1658,6 +1658,18 @@ tasks:
       # helm-chart job enforces it without a workflow edit.
       - ./scripts/assert-openshift-render.sh
       - ./scripts/assert-db-capacity-render.sh
+      # Also runs the PVC expansion render check (issue #3890: the DinD data-size env and
+      # ceiling guards, and the controller's single get-only StorageClass ClusterRole), the
+      # same no-workflow-edit wiring as the DB capacity check above.
+      - ./scripts/assert-pvc-expansion-render.sh
+
+  render:pvc-expansion-check:
+    desc: assert the chart renders the PVC expansion surface (DinD data-size env, ceiling guards, the get-only StorageClass ClusterRole)
+    cmds:
+      # Standalone, NOT wired into gate:repo/gate: the lint job lacks helm. Offline
+      # (CNPG subchart stripped), non-vacuous, needs helm + yq. Also run by
+      # render:openshift-check.
+      - ./scripts/assert-pvc-expansion-render.sh
 
   render:db-capacity-check:
     desc: assert the chart renders the api's DB_STORAGE_CAPACITY_BYTES from the database storage size

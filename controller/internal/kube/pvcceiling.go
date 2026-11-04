@@ -199,7 +199,7 @@ func ValidatePVCCeilings(cfg RenderConfig, resolver preset.Resolver) error {
 		"Raise the tier's limitRange.maxPVCStorage in deploy/chart/values.yaml — and its quota.requestsStorage with "+
 		"it, or the tier runs out of storage budget instead — or lower the offending size (-data and -nix come from "+
 		"the preset table in controller/internal/preset; -dind-data from workers.docker.dindDataSize, or the "+
-		"controller's built-in default when that is unset; an ephemeral (run-bound) worker's -data from "+
+		"preset table's per-size DinD default when that is unset; an ephemeral (run-bound) worker's -data from "+
 		"UZI_WORKER_EPHEMERAL_DATA_SIZE, chart key workers.ephemeralWorkerDataSize, or the controller's "+
 		"built-in default when that is unset)",
 		strings.Join(problems, "\n  "))
