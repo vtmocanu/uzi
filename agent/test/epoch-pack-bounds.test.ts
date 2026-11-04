@@ -163,9 +163,33 @@ for (const format of ["OFS", "REF", "forwardREF"] as const) {
     assert.ok(attempts() > 0);
   });
 }
-for (const damage of ["compressed-bomb", "lying-inflated-bomb", "lying-size", "trailing", "result-bomb", "lying-result", "zero-opcode",
-  "copy-outside", "insert-truncated", "duplicate-offset", "missing-offset", "interior-OFS", "self-REF", "two-REF",
-  "missing-REF", "base-length", "physical-bomb", "reconstructed-bomb", "outside-offset", "truncated-zlib", "overlong-integer", "overlong-header", "short-delta"] as const) {
+// Each damage case must be refused by the check it names, not by an earlier one.
+const REASONS = {
+  "compressed-bomb": /pack entry size limit/,
+  "lying-inflated-bomb": /ERR_BUFFER_TOO_LARGE|Cannot create a Buffer larger/i,
+  "lying-size": /pack compressed span or size/,
+  "trailing": /pack compressed span or size/,
+  "result-bomb": /delta logical byte limit/,
+  "lying-result": /delta generated size mismatch/,
+  "zero-opcode": /invalid delta insert/,
+  "copy-outside": /delta copy outside base/,
+  "insert-truncated": /invalid delta insert/,
+  "duplicate-offset": /invalid pack offsets/,
+  "missing-offset": /invalid pack offsets/,
+  "interior-OFS": /OFS base is not an earlier record/,
+  "self-REF": /cyclic pack delta graph/,
+  "two-REF": /cyclic pack delta graph/,
+  "missing-REF": /missing same-pack REF base/,
+  "base-length": /delta base length mismatch/,
+  "physical-bomb": /object metadata byte limit/,
+  "reconstructed-bomb": /delta logical byte limit/,
+  "outside-offset": /invalid pack offsets/,
+  "truncated-zlib": /unexpected end of file/i,
+  "overlong-integer": /delta integer overflow/,
+  "overlong-header": /pack entry size integer overflow/,
+  "short-delta": /short delta program/,
+} as const;
+for (const damage of Object.keys(REASONS) as (keyof typeof REASONS)[]) {
   it("rejects " + damage + " before any native verifier and preserves core evidence", async t => {
     let full = { id: oid(base), data: entry(3, Buffer.from(base)) };
     let delta = { id: oid(target), data: entry(7, program, Buffer.from(oid(base), "hex")) };
@@ -178,7 +202,7 @@ for (const damage of ["compressed-bomb", "lying-inflated-bomb", "lying-size", "t
     if (damage === "trailing") full.data = Buffer.concat([full.data, Buffer.from([1])]);
     if (damage === "result-bomb") delta.data = entry(7, Buffer.concat([integer(8), integer(16 * 1024 * 1024), Buffer.from([0x90, 8])]), Buffer.from(oid(base), "hex"));
     if (damage === "lying-result") delta.data = entry(7, Buffer.from([8, 7, ...program.subarray(2)]), Buffer.from(oid(base), "hex"));
-    if (damage === "zero-opcode") delta.data = entry(7, Buffer.from([8, 0, 0]), Buffer.from(oid(base), "hex"));
+    if (damage === "zero-opcode") delta.data = entry(7, Buffer.from([8, 8, 0, 0]), Buffer.from(oid(base), "hex"));
     if (damage === "copy-outside") delta.data = entry(7, Buffer.from([8, 8, 0x91, 7, 8]), Buffer.from(oid(base), "hex"));
     if (damage === "insert-truncated") delta.data = entry(7, Buffer.from([8, 8, 8, 65]), Buffer.from(oid(base), "hex"));
     if (damage === "duplicate-offset") offsets = [12, 12];
@@ -190,11 +214,13 @@ for (const damage of ["compressed-bomb", "lying-inflated-bomb", "lying-size", "t
     if (damage === "base-length") delta.data = entry(7, Buffer.from([9, ...program.subarray(1)]), Buffer.from(oid(base), "hex"));
     if (damage === "physical-bomb") full.data = entry(3, randomBytes(8 * 1024 * 1024));
     if (damage === "reconstructed-bomb") {
-      full.data = entry(3, Buffer.alloc(65536, 65));
-      delta.data = entry(7, Buffer.concat([integer(65536), integer(16 * 1024 * 1024), Buffer.alloc(256, 0x80)]),
+      // The base fits the budget; the delta's declared 16 MiB reconstruction is what refuses.
+      full.data = entry(3, Buffer.alloc(8000, 65));
+      delta.data = entry(7, Buffer.concat([integer(8000), integer(16 * 1024 * 1024), Buffer.from([0xb0, 0x40, 0x1f])]),
         Buffer.from(oid(base), "hex"));
     }
-    if (damage === "outside-offset") offsets = [12, 0xffffffff];
+    // A 31-bit offset past the pack end (the 0xffffffff form is refused earlier as an invalid large-offset slot).
+    if (damage === "outside-offset") offsets = [12, 0x7fffffff];
     if (damage === "truncated-zlib") delta.data = delta.data.subarray(0, -1);
     if (damage === "overlong-integer") delta.data = entry(7, Buffer.alloc(20, 0xff), Buffer.from(oid(base), "hex"));
     if (damage === "overlong-header") full.data = Buffer.concat([
@@ -205,7 +231,12 @@ for (const damage of ["compressed-bomb", "lying-inflated-bomb", "lying-size", "t
     const config = fs.readFileSync(path.join(bare, "config"));
     const ledger = await git["readAllAttemptLedgerRaw"](bare);
     const attempts = verifierSpy(t);
-    await assert.rejects(observation({ maxMetadataBytes: 65536 }), error => (error as Error).constructor.name === "AutomaticCompletenessUnknown");
+    await assert.rejects(observation({ maxMetadataBytes: 65536 }), error => {
+      assert.equal((error as Error).constructor.name, "AutomaticCompletenessUnknown");
+      const e = error as Error & { cause?: { code?: string; message?: string } };
+      assert.match(`${e.message} ${e.cause?.code ?? ""} ${e.cause?.message ?? ""}`, REASONS[damage]);
+      return true;
+    });
     assert.equal(attempts(), 0);
     const result = await git.discardStoppedSource({ ...options, epochProof: git.createEpochDiscardProof(input) });
     assert.equal(result.kind, "unknown"); assert.equal(stopped, true);
@@ -215,6 +246,32 @@ for (const damage of ["compressed-bomb", "lying-inflated-bomb", "lying-size", "t
     assert.equal(attempts(), 0);
   });
 }
+function statusSpy(t: TestContext): () => number {
+  const original = git["runGitAsRunner"].bind(git); let launches = 0;
+  t.mock.method(git as unknown as { runGitAsRunner: typeof original }, "runGitAsRunner", async (...args: Parameters<typeof original>) => {
+    if (args[1].includes("status")) launches++;
+    return original(...args);
+  });
+  return () => launches;
+}
+it("keeps the source before any status when a tracked file exceeds the byte budget", async t => {
+  // Sparse and index-matched: no object is written, so object prechecks pass, yet an unbounded
+  // `git status` would hash it because the mtime differs from the index.
+  const tracked = path.join(clonePath, "base");
+  fs.truncateSync(tracked, 1024 * 1024);
+  command(clonePath, "update-index", "--info-only", "base");
+  const future = new Date(Date.now() + 3600_000);
+  fs.utimesSync(tracked, future, future);
+  const launches = statusSpy(t);
+  assert.equal(await observation({ maxMetadataBytes: 65536 }), false);
+  assert.equal(launches(), 0, "status must not run on an over-budget tracked file");
+  assert.equal(journal(), raw);
+});
+it("still proves a normal clean tree under the default budget, running status", async t => {
+  const launches = statusSpy(t);
+  assert.equal(await observation(), true);
+  assert.equal(launches(), 1);
+});
 it("charges aggregate inflation across stores before verifying an earlier pair", async t => {
   // Leave room for fixture metadata: each object fits 256 KiB, their sum does not.
   pair([{ id: oid("source"), data: entry(3, Buffer.alloc(150000, 65)) }]);
