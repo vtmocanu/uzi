@@ -54,6 +54,13 @@ categories as one set.
 
 Pull the category's open recs (`uzi review backlog --category C --bucket todo
 --json`, plus `uzi review show {run-id} --json` for each full `rationale_md`).
+Fetch the selected category from both views. Retain all-users-only groups for
+investigation. Use `show` only for available own-run IDs; for other groups,
+disclose that only the aggregate preview is available and leave conclusions
+requiring fuller evidence unverified. Check `truncated` on both responses and
+fetch categories separately where useful. Treat capped counts as observed lower
+bounds. Compare matching coordinates and filters using refreshed results; do
+not infer other-user counts from incomplete or differently timed snapshots.
 Then:
 
 1. **Bundle by disposition, not by arrival order:**
@@ -159,10 +166,10 @@ disposition via uzi-cli — never before the user confirms, and never silently:
   every run the rec appears in at once).
 - False positive → `uzi review dismiss --category C --target T --reason not-an-issue`.
 - Valid but skipped / already covered → `… --reason wont-do`.
-- These verbs settle only your own runs' occurrences. When the all-users group
-  has more open than your view (`open_count` differs), the rest belong to other
-  users: the CLI cannot settle them (the admin aggregate is read-only); tell
-  the user to use the web All users judge view.
+- These verbs settle only your own runs' occurrences; the admin aggregate is
+  read-only. Cross-user Mark done and Undo are cookie-only in the web All users
+  view. Cross-user Dismiss is unsupported; do not silently substitute Mark done
+  for `not-an-issue` or `wont-do`.
 
 Triage spends no token and writes nothing to the forge; it is instant and
 reversible with `uzi review undo {run-id} {rec-id}` (the resolve/dismiss output
