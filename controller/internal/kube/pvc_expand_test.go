@@ -923,3 +923,33 @@ func TestExpandPatchBodyIsJSON(t *testing.T) {
 		}
 	}
 }
+
+func TestExpandSecondUpsizeOfSameClaimLogsAgain(t *testing.T) {
+	f := newExpandFx(t, expandOpt{expand: boolp(true)})
+	f.mustTick() // converge both claims to 50Gi, logs the first request
+	f.mustTick() // observed at target: the reporter forgets the request
+	f.m.cfg.DinDDataSize = "60Gi"
+	f.mustTick()
+	if f.request(dindDataPVCName(f.w.ID)) != "60Gi" {
+		t.Fatalf("dind claim not raised to 60Gi: %s", f.request(dindDataPVCName(f.w.ID)))
+	}
+	needle := "pvc-expand-requested worker=w1 pvc=" + dindDataPVCName("w1")
+	if n := strings.Count(f.logs.String(), needle); n != 2 {
+		t.Fatalf("want 2 requested lines for the dind claim, got %d:\n%s", n, f.logs)
+	}
+}
+
+func TestExpandDropsDedupStateForUnobservedClaims(t *testing.T) {
+	f := newExpandFx(t, expandOpt{expand: boolp(true)})
+	gone := f.ns + "/" + dindDataPVCName("gone") + "#expand"
+	f.m.claimLogMu.Lock()
+	f.m.claimLog = map[string]string{gone: "pvc-expand-deferred|maintenance"}
+	f.m.claimLogMu.Unlock()
+	f.mustTick()
+	f.m.claimLogMu.Lock()
+	_, kept := f.m.claimLog[gone]
+	f.m.claimLogMu.Unlock()
+	if kept {
+		t.Fatal("dedup state for a claim that is no longer observed was kept")
+	}
+}

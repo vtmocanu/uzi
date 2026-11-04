@@ -1186,8 +1186,9 @@ workers:
     #
     # Existing claims are converged UPWARD non-destructively by the controller on
     # StorageClasses that allow expansion (issue #3890; it reads the class through
-    # workers.storageClassRead); a claim is never shrunk or recreated. The pod's spec hash covers the claim's NAME and never its size, so a
-    # size change rolls no pod.
+    # workers.storageClassRead); a claim is never shrunk or recreated. The pod's
+    # spec hash covers the claim's NAME and never its size, so a size change rolls
+    # no pod.
     #
     # THE CACHE PERSISTS ACROSS ROLLS AND NOTHING GC's IT beyond the worker's gated
     # `docker` prune, the same residual the controller documents for /nix. The

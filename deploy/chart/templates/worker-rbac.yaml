@@ -84,7 +84,9 @@ rules:
     # is otherwise invisible entirely (Pods get/list does not cover it: an orphan
     # Deployment scaled to zero has no pods).
     # Preserve the roll marker on retained /data through DinD Deployment deletion.
-    # Reads use list; get remains ungranted. Patch is not RBAC-limited to metadata.
+    # Reads use list; get remains ungranted. Patch is not RBAC-limited to metadata:
+    # it also carries the #3890 monotonic size expansion of
+    # spec.resources.requests.storage on existing data/DinD claims.
     verbs: ["create", "list", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
@@ -178,7 +180,9 @@ imagePullSecrets:
   from a widened verb no less catastrophic here than there.
 
   The controller's ServiceAccount is unchanged: one identity bound to the restricted
-  default, the privileged docker tier, and the optional isolated lane below.
+  default, the privileged docker tier, and the optional isolated lane below. It is
+  also bound to the get-only storageclass-read ClusterRole (when
+  workers.storageClassRead.create).
 */}}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -209,7 +213,9 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     # Preserve the roll marker on retained /data through DinD Deployment deletion.
-    # Reads use list; get remains ungranted. Patch is not RBAC-limited to metadata.
+    # Reads use list; get remains ungranted. Patch is not RBAC-limited to metadata:
+    # it also carries the #3890 monotonic size expansion of
+    # spec.resources.requests.storage on existing data/DinD claims.
     verbs: ["create", "list", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
@@ -278,7 +284,9 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     # Preserve the roll marker on retained /data through DinD Deployment deletion.
-    # Reads use list; get remains ungranted. Patch is not RBAC-limited to metadata.
+    # Reads use list; get remains ungranted. Patch is not RBAC-limited to metadata:
+    # it also carries the #3890 monotonic size expansion of
+    # spec.resources.requests.storage on existing data/DinD claims.
     verbs: ["create", "list", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
