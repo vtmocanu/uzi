@@ -56,7 +56,7 @@ func TestClaimedNeverStartedCohortRunningReportLockOrderLiveDB(t *testing.T) {
 	defer func() {
 		_ = a.Rollback(context.Background())
 		if !joined {
-			<-done
+			_ = <-done
 		}
 	}()
 

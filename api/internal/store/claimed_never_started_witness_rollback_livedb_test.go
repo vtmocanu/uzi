@@ -17,7 +17,7 @@ import (
 // runs the exact shipped Down text in a single simple-protocol Exec.
 func migration00401DownSQL(t *testing.T) string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("migrations", "00401_claimed_never_started_witness.sql")) //nolint:gosec // G304: fixed repo-local migration name
+	b, err := os.ReadFile(filepath.Join("migrations", "00401_claimed_never_started_witness.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}

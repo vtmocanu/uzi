@@ -141,11 +141,11 @@ func (f *cncFixture) cnuAssertDecisionCustody(t *testing.T, run uuid.UUID, wantA
 	if seen != len(holds) {
 		t.Fatalf("%s: fn_custody_admission_members listed %d of the run's %d holds", what, seen, len(holds))
 	}
-	var count int64
-	if err := f.env.pool.QueryRow(ctx, `SELECT fn_custody_admission_count($1, $2)`, f.userID, cutoff).Scan(&count); err != nil {
+	var count int32
+	if err := f.env.pool.QueryRow(ctx, `SELECT fn_custody_admission_count($1, $2)::int`, f.userID, cutoff).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if want := f.openHolds(t); count != want {
+	if want := f.openHolds(t); int64(count) != want {
 		t.Fatalf("%s: fn_custody_admission_count = %d, want every open hold (%d) counted", what, count, want)
 	}
 
@@ -154,11 +154,11 @@ func (f *cncFixture) cnuAssertDecisionCustody(t *testing.T, run uuid.UUID, wantA
 	fresh := f.seedRun("queued", 0)
 	f.plainHeartbeat(t)
 	origLimit := f.svc.p.CustodyHoldLimit
-	f.svc.p.CustodyHoldLimit = &fakeCustodyLimit{n: int32(count)}
+	f.svc.p.CustodyHoldLimit = &fakeCustodyLimit{n: count}
 	if got, _ := f.claim(t); got != uuid.Nil {
 		t.Fatalf("%s: claimed %s at custody_hold_limit=%d with %d parked holds, want the parked holds to count against it", what, got, count, count)
 	}
-	f.svc.p.CustodyHoldLimit = &fakeCustodyLimit{n: int32(count) + 1}
+	f.svc.p.CustodyHoldLimit = &fakeCustodyLimit{n: count + 1}
 	if got, _ := f.claim(t); got != fresh {
 		t.Fatalf("%s: claimed %s at custody_hold_limit=%d, want the fresh run %s admitted one above the held count", what, got, count+1, fresh)
 	}
