@@ -95,6 +95,35 @@ func (p *unwitnessedParkFixture) holdStates(t *testing.T) string {
 	return s
 }
 
+// custodySnapshot is every server-side custody table for the run, serialised in a stable order:
+// holds, captures, capture chunks and prerequisite closures. A Cancel must leave it byte for byte
+// unchanged (no release, discard or deletion).
+func (p *unwitnessedParkFixture) custodySnapshot(t *testing.T) string {
+	t.Helper()
+	var s string
+	q := `SELECT jsonb_build_object(
+        'holds', COALESCE((SELECT jsonb_agg(to_jsonb(h) ORDER BY h.id) FROM recovery_custody_holds h WHERE h.run_id=$1), '[]'::jsonb),
+        'captures', COALESCE((SELECT jsonb_agg(to_jsonb(c) ORDER BY c.id) FROM recovery_captures c WHERE c.run_id=$1), '[]'::jsonb),
+        'chunks', COALESCE((SELECT jsonb_agg(to_jsonb(k) ORDER BY k.capture_id, k.chunk_index) FROM recovery_capture_chunks k
+            JOIN recovery_captures c ON c.id=k.capture_id WHERE c.run_id=$1), '[]'::jsonb),
+        'closures', COALESCE((SELECT jsonb_agg(to_jsonb(z) ORDER BY z.id) FROM recovery_prerequisite_closures z WHERE z.run_id=$1), '[]'::jsonb)
+    )::text`
+	if err := p.fx.pool.QueryRow(p.fx.ctx, q, p.run).Scan(&s); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// cancelOwner sends the owner's cancel steering input and requires the server-side 202.
+func (p *unwitnessedParkFixture) cancelOwner(t *testing.T, h *Handler) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.CreateRunInput(rec, inputReq(store.User{ID: p.fx.userID, IsActive: true}, p.run, `{"kind":"cancel","body":"end it"}`))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("owner Cancel = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestUnwitnessedParkOwnerResumeLiveDB: the owner's Resume moves the park to queued with a new
 // worker-recovery episode, keeps worker affinity (the retained source lives on that worker's
 // disk) and the open holds; a foreign user is refused and nothing changes; a second Resume is a
@@ -184,6 +213,7 @@ func TestUnwitnessedParkOwnerCancelLiveDB(t *testing.T) {
 	}
 	held := p.get(t)
 	holdsBefore := p.holdStates(t)
+	custodyBefore := p.custodySnapshot(t)
 
 	for _, u := range []store.User{foreign, admin} {
 		rec := httptest.NewRecorder()
@@ -217,6 +247,9 @@ func TestUnwitnessedParkOwnerCancelLiveDB(t *testing.T) {
 	}
 	if got := p.holdStates(t); got != holdsBefore {
 		t.Fatalf("Cancel changed custody holds:\n%s\n%s", holdsBefore, got)
+	}
+	if got := p.custodySnapshot(t); got != custodyBefore {
+		t.Fatalf("Cancel changed server-side custody rows:\n%s\n%s", custodyBefore, got)
 	}
 	var capsAfter string
 	if err := p.fx.pool.QueryRow(p.fx.ctx, capsQuery, p.run).Scan(&capsAfter); err != nil || capsAfter != capsBefore {
@@ -284,5 +317,44 @@ func TestUnwitnessedParkPromotersLeaveItAloneLiveDB(t *testing.T) {
 				t.Fatalf("control: PromoteRecoveryWaitRunNow rows=%d err=%v, want 1", n, err)
 			}
 		}
+	}
+}
+
+// TestChargedQueuedContinuationOwnerCancelLiveDB: a continuation the claimed-never-started
+// charge pass put back to queued (requeue_count + 1, claim NOT released, worker kept, Codex
+// capability revoked, holds untouched) is ended by the owner's Cancel with every custody row
+// byte for byte as it was. The row is seeded with the shape the charge statement writes.
+func TestChargedQueuedContinuationOwnerCancelLiveDB(t *testing.T) {
+	p := seedUnwitnessedPark(t)
+	h := p.handler()
+	if _, err := p.fx.pool.Exec(p.fx.ctx, `UPDATE runs SET status='queued', recovery_wait_cause=NULL,
+        claim_released_at=NULL, released_worker_id=NULL, released_worker_nonce=NULL,
+        requeue_count=3, codex_cap_hash=NULL, codex_claim_epoch=codex_claim_epoch+1,
+        status_since=now() WHERE id=$1`, p.run); err != nil {
+		t.Fatal(err)
+	}
+	capture := uuid.New()
+	if _, err := p.fx.pool.Exec(p.fx.ctx, `INSERT INTO recovery_captures
+        (id,hold_id,run_id,user_id,original_worker_id,original_worker_identity,source_sha,idempotency_key,state)
+        VALUES ($1,$2,$3,$4,$5,'parked incarnation','H0','k','needs_action')`, capture, p.holds[0], p.run, p.fx.userID, p.worker); err != nil {
+		t.Fatal(err)
+	}
+	held := p.get(t)
+	if held.Status != "queued" || held.RequeueCount != 3 || !held.WorkerID.Valid {
+		t.Fatalf("precondition: status=%s requeue_count=%d worker=%v", held.Status, held.RequeueCount, held.WorkerID)
+	}
+	custodyBefore := p.custodySnapshot(t)
+
+	p.cancelOwner(t, h)
+
+	r := p.get(t)
+	if r.Status != "cancelled" || !r.FinishedAt.Valid {
+		t.Fatalf("owner Cancel did not end the charged queued run: status=%s finished=%v", r.Status, r.FinishedAt.Valid)
+	}
+	if r.RequeueCount != held.RequeueCount || r.WorkerID != held.WorkerID {
+		t.Fatalf("Cancel changed requeue_count/worker_id: %d/%v", r.RequeueCount, r.WorkerID)
+	}
+	if got := p.custodySnapshot(t); got != custodyBefore {
+		t.Fatalf("Cancel changed server-side custody rows:\n%s\n%s", custodyBefore, got)
 	}
 }
