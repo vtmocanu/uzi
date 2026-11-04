@@ -6,9 +6,13 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, test } from "node:test";
+import { afterEach, test as nodeTest } from "node:test";
 import { binding, closed, environment, fixture, git, inventory, patch, type Fixture } from "./fixtures/recovery-bindingless-compat.js";
 import type { ChildSpec, KillAt, ServerState } from "./fixtures/recovery-local-record-restart-child.js";
+
+// The child takes authority locks through /proc/self/fd (agent/src/authority-lock.ts), so these kill/restart
+// cases need Linux; CI runs them there.
+const test = process.platform === "linux" ? nodeTest : nodeTest.skip;
 
 // issue #3885 M2 U3: the approved failure model is an abrupt worker-process kill (no handler, no finally, no
 // atexit runs); storage and power loss are unspecified. Every kill below is a REAL SIGKILL of a child process
@@ -161,9 +165,13 @@ async function runChild(w: World, action: ChildSpec["action"], killAt?: KillAt):
     marker: path.join(w.ctl, `${tag}.marker`), result: path.join(w.ctl, `${tag}.result.json`), apiUrl: w.apiUrl };
   const specFile = path.join(w.ctl, `${tag}.spec.json`);
   await fs.writeFile(specFile, JSON.stringify(spec));
+  // A SIGKILLed child never runs the hermetic-proc preload's cleanup, so give each child its own temp dir,
+  // removed by afterEach, instead of leaving `uzi-hermetic-proc-*` behind in the shared TMPDIR.
+  const childTmp = await fs.mkdtemp(path.join(os.tmpdir(), "rlr-restart-child-"));
+  roots.push(childTmp);
   const child = spawn(process.execPath, ["--import", "tsx", "--import", "./test/setup/hermetic-proc.ts", CHILD, specFile], {
     cwd: AGENT_DIR, stdio: ["ignore", "ignore", "pipe"],
-    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", TMPDIR: childTmp, TMP: childTmp, TEMP: childTmp },
   });
   children.add(child);
   let stderr = "";
