@@ -11142,7 +11142,10 @@ export class GitCache {
                 charge(n); MaintenanceResources.consumeIfActive("metadataBytes", n);
               };
               // Each span and instruction is bounded by the shared observation
-              // budget. A failure aborts before any pair verifier.
+              // budget. A failure aborts before any pair verifier. That before-verifier
+              // guarantee relies on the epoch writer-exclusion contract: the pack and idx
+              // are not re-checked between this snapshot and each verify-pack launch, and
+              // finalStoreCheck refuses a change afterwards.
               for (let i = 0; i < starts.length; i++) {
                 automatic.checkLive(); this.checkRecoveryInterruption();
                 const start = starts[i]!, end = starts[i + 1] ?? pack.length - 20;
@@ -11481,8 +11484,32 @@ export class GitCache {
         throw err;
       });
       if (modules) return false;
+      // Automatic mode: `status` hashes any tracked file whose stat differs from the index (git also
+      // compares a truncated 32-bit size), so no unbounded file or index may reach a Git read. Charge
+      // the index and then every tracked regular file's lstat size to one per-observation budget
+      // (the epoch metadata byte limit) before ls-files/status run; over budget is an unknown keep.
+      let budget = automatic ? this.epochRetained.getStore()!.maxMetadataBytes : Infinity;
+      const chargeBytes = (n: number) => {
+        if ((budget -= n) < 0) throw new AutomaticCompletenessUnknown("tracked content byte limit");
+      };
+      if (automatic) {
+        const index = await read(() => fs.lstat(path.join(cwd, ".git", "index")));
+        if (!index.isFile()) return false;
+        chargeBytes(index.size);
+      }
       const staged = await read(() => this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
-      if (automatic) this.automaticCollection(staged, "\0");
+      if (automatic) {
+        this.automaticCollection(staged, "\0");
+        for (const entry of staged.split("\0")) {
+          const m = /^(\d{6}) [0-9a-f]+ [0-3]\t([\s\S]+)$/.exec(entry);
+          if (!m || m[1] === "160000") continue;
+          const st = await read(() => fs.lstat(path.join(cwd, m[2]!))).catch((err: NodeJS.ErrnoException) => {
+            if (err.code === "ENOENT") return undefined; // a missing tracked file is a status entry, never a hash
+            throw err;
+          });
+          if (st?.isFile()) chargeBytes(st.size);
+        }
+      }
       for (const entry of staged.split("\0")) {
         const m = /^160000 [0-9a-f]+ [0-3]\t([\s\S]+)$/.exec(entry);
         if (!m) continue;
