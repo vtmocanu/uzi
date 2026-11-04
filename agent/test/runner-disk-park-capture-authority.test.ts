@@ -5,7 +5,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
-import type { RunRunner, ExecutorFactory } from "../src/runner.js";
+import { RunRunner, type ExecutorFactory } from "../src/runner.js";
+import { GitCache } from "../src/git.js";
+import { defaultGitleaksShim } from "./gitleaks-shim.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import type { Logger } from "../src/log.js";
 import type { StateRequest } from "../src/protocol.js";
 import { type CacheCapConfig, DiskGovernor, DiskParkSignal } from "../src/cache-cap.js";
@@ -14,7 +17,7 @@ import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { SteeringChannel } from "../src/steering.js";
 import { dataVolumeUsedFraction } from "../src/stats.js";
 import { testLockOptions } from "./authority-test-support.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, input, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
@@ -160,9 +163,27 @@ async function drive(t: { skip(msg?: string): void }, o: Drive = {}): Promise<Dr
     };
   };
   const { gitlab } = fakeGitlab();
-  const runner = runnerWith(factory, gitlab, undefined, logger, {
-    diskGovernor: gov, ...(rt ? { authority: rt } : {}), recoveryRetryMs: 5, checkpointIntervalMs: 0,
-  });
+  const extra = { diskGovernor: gov, ...(rt ? { authority: rt } : {}), recoveryRetryMs: 5, checkpointIntervalMs: 0 };
+  // With the production authority runtime the runner's GitCache carries the runtime's hooks and demands
+  // them, like production; the shared harness cache has none. Same data dir, so trackingSha reads the
+  // bare this cache fetches into.
+  const authorityGit = rt
+    ? new GitCache(fs.realpathSync(fx.dataDir), nullLogger(), undefined, testGitCacheOptions({
+      authority: rt.hooks, authorityRequired: true, gitleaksBin: defaultGitleaksShim(),
+    }))
+    : undefined;
+  const runner = authorityGit
+    ? new RunRunner(client, authorityGit, factory, logger, 20, undefined, {
+      pollMs: 5,
+      planApprovalTimeoutMs: 0,
+      questionTimeoutMs: 600,
+      prDescriptionHeadLagMs: 0,
+      gitlab,
+      teardownTestDeps: portableTeardownTestDeps,
+      ...extra,
+      checkpointTestHooks: { retryBackoffMs: [0, 0] },
+    })
+    : runnerWith(factory, gitlab, undefined, logger, extra);
   Object.assign(runner, { attemptPaths: true });
   const captures: unknown[] = [];
   let calls = 0;
@@ -489,10 +510,12 @@ describe("RunRunner - issue #3916: precedence while a disk park retries its capt
   });
 
   it("a credential switch after the disk stop does not stop the disk park from completing", async (t) => {
-    // Pinned behaviour: the disk stop already spent the flight's cancel controller, so the switch only
-    // records its pending generation; the park still lands.
-    const d = await drive(t, { onCapture: onSecond((flight) => flight.steering.maybeTripCredentialSwitch(flight.claimGeneration)) });
+    // Delivered during the FIRST capture, so it is recorded before the park is decided.
+    const d = await drive(t, {
+      onCapture: (n, flight) => { if (n === 1) flight.steering.maybeTripCredentialSwitch(flight.claimGeneration); },
+    });
     if (!d) return;
+    assert.strictEqual(d.flight.steering.pendingCredentialSwitch(), d.flight.claimGeneration, "the switch was recorded");
     assert.strictEqual(d.outcome, "done");
     assert.strictEqual(d.parks.length, 1);
     assert.strictEqual(d.parks[0]!.recovery_cause, "data_volume_full");
