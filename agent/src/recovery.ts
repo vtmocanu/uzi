@@ -685,7 +685,7 @@ export type ForgetOutcome =
 
 /** The operator's client left (or its request was otherwise cancelled) before the first mutation: nothing was
  * touched. Thrown by the `beforeFirstMutation` callback and by every pre-destruction checkpoint. */
-export class OperatorCancelledBeforeMutation extends Error {
+class OperatorCancelledBeforeMutation extends Error {
   constructor() { super("operator request ended before any mutation"); this.name = "OperatorCancelledBeforeMutation"; }
 }
 
