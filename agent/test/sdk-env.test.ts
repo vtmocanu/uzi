@@ -222,4 +222,32 @@ describe("Go concurrency defaults (issue #3382)", () => {
     assert.equal(only.GOMAXPROCS, "4");
     assert.equal(Object.hasOwn(only, "GOFLAGS"), false);
   });
+  it("issue #3870: GOTMPDIR is set last when given and absent otherwise; nothing else changes", () => {
+    configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
+    try {
+      const tool = { PATH: "/nix/bin", GOTMPDIR: "/provisioned/tmp", GOFLAGS: "-x" };
+      const without = buildSdkEnv(FAKE_OAUTH, HOME_DIR, tool, "unix:///run/dind.sock");
+      assert.equal(without.GOTMPDIR, "/provisioned/tmp", "no managed dir: a provisioned GOTMPDIR passes as before");
+      const withDir = buildSdkEnv(FAKE_OAUTH, HOME_DIR, tool, "unix:///run/dind.sock", undefined, "/home/run/.uzi-go-work/g3");
+      assert.equal(withDir.GOTMPDIR, "/home/run/.uzi-go-work/g3", "the managed dir overrides a provisioned GOTMPDIR");
+      assert.deepEqual({ ...withDir, GOTMPDIR: undefined }, { ...without, GOTMPDIR: undefined });
+      const bare = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+      assert.equal(Object.hasOwn(bare, "GOTMPDIR"), false);
+      const bareWith = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {}, undefined, undefined, "/w/g1");
+      assert.equal(bareWith.GOTMPDIR, "/w/g1");
+      assert.deepEqual({ ...bareWith, GOTMPDIR: undefined }, { ...bare, GOTMPDIR: undefined });
+    } finally {
+      configureGoConcurrency({});
+    }
+  });
+
+  it("issue #3870: buildCheckEnv sets GOTMPDIR last when given and adds no key otherwise", () => {
+    const src = { PATH: "/img" };
+    const tool = { PATH: "/nix/bin", GOTMPDIR: "/provisioned/tmp" };
+    const without = buildCheckEnv(src, HOME_DIR, tool);
+    assert.equal(Object.hasOwn(without, "GOTMPDIR"), false, "buildCheckEnv never carried a provisioned GOTMPDIR");
+    const withDir = buildCheckEnv(src, HOME_DIR, tool, "/home/run/.uzi-go-work/g2");
+    assert.equal(withDir.GOTMPDIR, "/home/run/.uzi-go-work/g2");
+    assert.deepEqual({ ...withDir, GOTMPDIR: undefined }, { ...without, GOTMPDIR: undefined });
+  });
 });

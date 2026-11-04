@@ -180,6 +180,7 @@ import {
   type TerminalOutboxDeps,
 } from "./terminal-resolve.js";
 import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
+import { prepareManagedGoWork, removeGoWorkLeaves, type GoWorkFsOps } from "./go-work.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { dropRunCaches } from "./run-caches.js";
 import type { RunDiskLocks } from "./run-disk-locks.js";
@@ -2464,6 +2465,9 @@ interface RunFlight {
   retainedDiscoveryRetries?: number;
   ciEvidence?: PreparedCIEvidence;
   readonly runHome: string | undefined;
+  /** Issue #3870: this claim's managed Go work leaf (`<runHome>/.uzi-go-work/g<gen>`), set in
+   *  phasePreflightHandoff for a Claude flight only; undefined when none was prepared. */
+  managedGoWorkDir?: string;
   readonly runScopedSecrets: string[];
   readonly runLog: Logger;
   readonly redact: ReturnType<typeof makeRedactor>;
@@ -2944,6 +2948,8 @@ export interface RunnerOptions {
   semanticCoverageTestTransport?: BoundedCoverageTestTransport;
   /** Test-only teardown seams; production uses the pinned walk with one 120 s deadline. */
   teardownTestDeps?: TeardownTestDeps;
+  /** Test-only: inject a syscall failure into the managed Go work dir creation (issue #3870). */
+  goWorkTestDeps?: { fsOps?: GoWorkFsOps };
   queueTerminalRejectionReconciliation?: (runId: string, generation: number) => void;
   /** How often the steering channel polls /inputs (default 3s). */
   pollMs?: number;
@@ -3205,6 +3211,7 @@ export class RunRunner {
   private readonly checkpointTickIntervalMs: number;
   /** Issue #1831: test-only teardown seams; production always uses pinned removal. */
   private readonly teardownTestDeps: TeardownTestDeps | undefined;
+  private readonly goWorkTestDeps: { fsOps?: GoWorkFsOps } | undefined;
   /** issue #1597 M2: test-only seams (undefined in production). */
   private readonly checkpointTestHooks: CheckpointTestHooks | undefined;
   private readonly planCrossCheckTiming: PlanCrossCheckTiming | undefined;
@@ -3477,6 +3484,7 @@ export class RunRunner {
     this.afterPublicationEnrolled = opts.afterPublicationEnrolled;
     this.semanticCoverageTestTransport = opts.semanticCoverageTestTransport;
     this.teardownTestDeps = opts.teardownTestDeps;
+    this.goWorkTestDeps = opts.goWorkTestDeps;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
     const holdBudget = opts.completionHoldReconcileTimeoutMs === undefined
@@ -6597,6 +6605,16 @@ export class RunRunner {
               () => dropRunCaches(runHome, runLog, flight.cachesDroppedEarly ? { quietNoop: true } : {}))
               .catch(() => undefined);
             if (!result || result.failed.length || result.skipped.length) flight.sourceJoinFailed = true;
+            // issue #3870: the reap is complete, so no process can still write the managed Go work
+            // leaves; remove them all (the `.uzi-go-work` parent stays). The result is deliberately
+            // NOT folded into sourceJoinFailed: that flag governs source join/custody, and this
+            // scratch is disposable (the D7 disk reclaim retries a parked run's leftovers). It runs
+            // whatever the cache drop returned. removeGoWorkLeaves never throws.
+            await this.runCancellationMaintenance(flight, () => removeGoWorkLeaves(runHome, runLog, {
+              select: { kind: "all" },
+              deadline: Date.now() + Math.min(60_000, flight.cancellationBudget?.remainingMs() ?? 60_000),
+              reason: "process_ended_park",
+            })).catch(() => undefined);
           } else { flight.sourceJoinFailed = true; parkReapIncomplete = true; }
         } else { flight.sourceJoinFailed = true; parkReapIncomplete = true; }
       }
@@ -10174,6 +10192,7 @@ export class RunRunner {
         process.env,
         runHome ?? os.tmpdir(),
         result.toolEnv,
+        runHome ? flight.managedGoWorkDir : undefined,
       );
       // Issue #1830: the governor's in-place drop keeps `.npm/_cacache` while this install runs.
       flight.jsDepsInstalling = true;
@@ -13561,6 +13580,15 @@ export class RunRunner {
         });
         throw new RunResidueBlockedError(cause.detail, { preClone: "home_reap" });
       }
+      // issue #3870: with the reap complete, no older attempt's process can still write its Go work
+      // leaf, so remove the leaves of earlier generations. Only logged; never fails the claim.
+      if (Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0) {
+        await removeGoWorkLeaves(flight.runHome, runLog, {
+          select: { kind: "olderThan", generation: flight.claimGeneration },
+          deadline: Date.now() + 30_000,
+          reason: "claim_older_generations",
+        });
+      }
     }
     // issue #2213: the HOME reap above cannot see a survivor nothing ties to this run, and it skips
     // a run's first claim and every Codex run. The worker-wide check runs on EVERY claim.
@@ -15109,8 +15137,31 @@ export class RunRunner {
     const semanticPlanning = claim.semantic_planning === undefined ? undefined : parseSemanticEnrollment(claim.semantic_planning);
     const semanticGate = semanticPlanning ? new SemanticPlanningGate(this.client, runId, flight.claimGeneration,
       steering.lifecycleSignal(), this.semanticCoverageTestTransport) : undefined;
+    // issue #3870: the managed Go work leaf for a Claude flight on Linux. A Codex executor's `safety`
+    // is only populated inside run(), so it is excluded here by the signals known before launch
+    // (`claim.secrets.codex`, `sandboxesCommands`), as isCodexCapture does. Only an ordinary
+    // root-creation failure falls back to launching without GOTMPDIR; this block wraps nothing else.
+    if (!flight.executor.safety && flight.executor.sandboxesCommands !== true && !claim.secrets.codex &&
+      flight.runHome && process.platform === "linux") {
+      let homeReady = true;
+      try {
+        await fs.mkdir(flight.runHome, { recursive: true });
+      } catch (err) {
+        homeReady = false;
+        runLog.warn("managed Go work dir unavailable; launching without GOTMPDIR", {
+          reason: "home_unavailable",
+          generation: Number.isFinite(flight.claimGeneration) ? flight.claimGeneration : null,
+          ...(typeof (err as NodeJS.ErrnoException)?.code === "string" ? { code: sanitizeForLog((err as NodeJS.ErrnoException).code!, 32) } : {}),
+        });
+      }
+      if (homeReady) {
+        const prepared = await prepareManagedGoWork(flight.runHome, flight.claimGeneration, runLog, this.goWorkTestDeps?.fsOps);
+        if ("dir" in prepared) flight.managedGoWorkDir = prepared.dir;
+      }
+    }
     const ctx: RunContext = {
       semanticPlanning,
+      managedGoWorkDir: flight.managedGoWorkDir,
       ...(claim.kind === "prompt" && claim.config?.ci_config_guard === true && claim.ci_repair != null ? {
         prepareCIEvidence: async () => {
           if (!flight.runHome) throw new Error("CI evidence requires a prepared run home");
@@ -21083,6 +21134,13 @@ export class RunRunner {
       if (mayDrop && flight.runHome && !executor.safety) {
         await dropRunCaches(flight.runHome, runLog, { message: "run caches dropped before the disk park's capture" });
         flight.cachesDroppedEarly = true;
+        // issue #3870: the same complete reap makes the managed Go work leaves safe to remove
+        // before the capture; never throws, and its result does not gate the park.
+        await removeGoWorkLeaves(flight.runHome, runLog, {
+          select: { kind: "all" },
+          deadline: Date.now() + 60_000,
+          reason: "disk_park_pre_capture",
+        });
       }
     }
     // Track independent writes, including true -> true, across capture and terminal disposal.
