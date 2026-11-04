@@ -288,6 +288,20 @@ func TestDeleteWorkerCustodyListsLiveHolderHoldsLiveDB(t *testing.T) {
 	           VALUES ($1, $2, NULL, $3, 1, 'open', $4, 'ident', $5)`,
 		foreign, uuid.New(), uuid.New(), uuid.New(), w)
 
+	// (v) a hold of THIS owner, live on Y, whose run_id names ANOTHER owner's run: the join
+	// to runs is owner-scoped, so that run's kind and title never leak into the listing.
+	y := e.seedWorker(t, nil)
+	otherUser := uuid.New()
+	e.exec(t, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		otherUser, "r3921-"+otherUser.String()+"@e2e")
+	foreignRun := uuid.New()
+	foreignIID := *e.nextIID
+	*e.nextIID++
+	e.exec(t, `INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, title)
+	           VALUES ($1, $2, $3, 'issue', $4, 'foreign-issue-title', 'd', 'failed', 'Foreign owner title')`,
+		foreignRun, otherUser, e.repoID, foreignIID)
+	crossOwner := mhOpenHold(t, e, foreignRun, 1, y)
+
 	custodyErr := func(worker uuid.UUID) *WorkerHasCustodyError {
 		t.Helper()
 		err := svc.DeleteWorker(e.ctx, e.userID, worker)
@@ -312,11 +326,22 @@ func TestDeleteWorkerCustodyListsLiveHolderHoldsLiveDB(t *testing.T) {
 		t.Fatalf("X: Holds=%d List=%+v, want the moved hold %s", cx.Holds, cx.List, moved)
 	}
 
+	cy := custodyErr(y)
+	if cy.Holds != 1 || len(cy.List) != 1 || cy.List[0].ID != crossOwner {
+		t.Fatalf("Y: Holds=%d List=%+v, want the cross-owner-run hold %s", cy.Holds, cy.List, crossOwner)
+	}
+	if got := cy.List[0]; got.RunKind != "" || got.RunTitle != "" {
+		t.Fatalf("Y: List[0] kind=%q title=%q, want both empty: another owner's run must not leak", got.RunKind, got.RunTitle)
+	}
+
 	// (iv) more than the cap live on W: the list is capped at 10, oldest first, and Holds is
 	// the full total.
 	for g := int64(2); g <= 12; g++ {
 		mhOpenHold(t, e, run, g, w)
 	}
+	// Pin created_at to the generation so "oldest" is unambiguous (no microsecond ties).
+	e.exec(t, `UPDATE recovery_custody_holds SET created_at = now() - interval '1 hour' + generation * interval '1 second'
+	           WHERE run_id = $1 AND live_worker_id = $2`, run, w)
 	ce = custodyErr(w)
 	if ce.Holds != 12 {
 		t.Fatalf("W: Holds = %d, want the total 12", ce.Holds)
@@ -326,6 +351,16 @@ func TestDeleteWorkerCustodyListsLiveHolderHoldsLiveDB(t *testing.T) {
 	}
 	if ce.List[0].ID != live {
 		t.Fatalf("W: List[0] = %s, want the oldest hold %s first", ce.List[0].ID, live)
+	}
+	// created_at follows the generation, so the 10 oldest are exactly generations 1..10.
+	seen := map[int64]bool{}
+	for _, r := range ce.List {
+		seen[r.Generation] = true
+	}
+	for g := int64(1); g <= 10; g++ {
+		if !seen[g] {
+			t.Fatalf("W: List generations = %v, want exactly the 10 oldest (1..10)", seen)
+		}
 	}
 	for _, r := range ce.List {
 		if r.ID == foreign || r.ID == moved {

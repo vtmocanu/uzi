@@ -827,7 +827,8 @@ type workerActiveRunDTO struct {
 }
 
 // workerBlockingHoldDTO is one open custody hold blocking a worker delete in the 409 body
-// (#3921). kind and title are empty when the hold's run row no longer exists.
+// (#3921). kind and title are empty when the hold's run row no longer exists or belongs
+// to another owner (the join is owner-scoped).
 type workerBlockingHoldDTO struct {
 	HoldID     string `json:"hold_id"`
 	RunID      string `json:"run_id"`
