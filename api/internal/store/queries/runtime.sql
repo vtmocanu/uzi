@@ -1010,7 +1010,26 @@ FROM runs WHERE id = @id AND user_id = @user_id AND repo_id = @repo_id;
 -- statement is `UPDATE runs ... RETURNING *`, so the :one result is still store.Run — the
 -- hold is a side effect. target and hold share target's single snapshot/lock, so the hold's
 -- t.claim_generation + 1 equals the UPDATE's own increment.
-WITH claimant AS MATERIALIZED (
+-- Materialize the template value once per owner, not per checker row. Keeping
+-- the expensive selection out of the row-correlated predicate also avoids
+-- inflating health/placement plan cost into an earlier JIT threshold.
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT DISTINCT r.user_id FROM runs r
+        WHERE r.kind = 'cross_check' AND r.harness = 'codex'
+          AND r.status = 'queued' AND r.user_id = @user_id
+    ) owners
+), claimant AS MATERIALIZED (
     SELECT * FROM workers WHERE id = @worker_id FOR UPDATE
 ), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id,
@@ -1320,15 +1339,7 @@ WITH claimant AS MATERIALIZED (
               AND r.review_target_run_id IS NULL
               AND COALESCE(
                   NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
-                      (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                       FROM agent_templates t
-                       LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = r.user_id
-                       LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                       WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = r.user_id))
-                         AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                         AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                         AND lower(t.name) IN ('lead', 'orchestrator')
-                       ORDER BY t.name LIMIT 1)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
+                      (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
                              ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
                        = ANY(@codex_curated_models::text[])),
                   false)
@@ -1587,15 +1598,7 @@ WITH claimant AS MATERIALIZED (
                         AND r.review_target_run_id IS NULL
                         AND COALESCE(
                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
-                                (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                                 FROM agent_templates t
-                                 LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = r.user_id
-                                 LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                                 WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = r.user_id))
-                                   AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                                   AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                                   AND lower(t.name) IN ('lead', 'orchestrator')
-                                 ORDER BY t.name LIMIT 1)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
+                                (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
                                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
                                  = ANY(@codex_curated_models::text[])),
                             false)
@@ -10359,6 +10362,23 @@ WHERE id = @id;
 -- owner row is gone (COALESCE keeps the scan target a plain string).
 -- #3000: owner_hold_pinnable projects ClaimRun's independent draining/maintenance
 -- hold; Go applies the inclusive updated_at + affinity ceiling and reuses the owner name.
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT DISTINCT r.user_id FROM runs r
+        WHERE r.kind = 'cross_check' AND r.harness = 'codex'
+          AND r.status IN ('queued', 'claimed', 'running', 'awaiting_approval')
+    ) owners
+)
 SELECT id, runs.user_id, status, auto_approve,
        admission.codex_admission_class, admission.codex_admission_eligible_at,
        cooldown.account_cooldown_class, cooldown.account_cooldown_eligible_at,
@@ -10394,15 +10414,7 @@ SELECT id, runs.user_id, status, auto_approve,
         AND runs.review_target_run_id IS NULL
         AND COALESCE(
             NOT ((CASE WHEN runs.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id),
-                (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                 FROM agent_templates t
-                 LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = runs.user_id
-                 LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                 WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = runs.user_id))
-                   AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                   AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                   AND lower(t.name) IN ('lead', 'orchestrator')
-                 ORDER BY t.name LIMIT 1)) WHEN runs.model = ANY(@codex_curated_models::text[]) THEN runs.model
+                (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = runs.user_id)) WHEN runs.model = ANY(@codex_curated_models::text[]) THEN runs.model
                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id) END)
                  = ANY(@codex_curated_models::text[])),
             false))::boolean AS codex_custom_root,
@@ -10592,7 +10604,22 @@ WHERE w.user_id = @user_id
 -- any worker's availability, and the health resolver reports it through its own queued-run reason
 -- (ListActiveRunsForHealth.reserve_hold_reason, read by healthTargetFor), so folding it in here
 -- would turn "weekly reserve" into a bogus "no worker can claim" reading.
-WITH candidates AS (
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT r.user_id FROM runs r
+        WHERE r.id = @run_id AND r.kind = 'cross_check' AND r.harness = 'codex'
+    ) owners
+), candidates AS (
 SELECT w.id,
        fn_forge_origin_eligible(w,run,@cross_check_evaluated_at::timestamptz)::boolean AS forge_eligible,
        EXISTS (SELECT 1 FROM authorized_forge_origins a JOIN forge_origin_cooldowns c
@@ -10739,15 +10766,7 @@ WHERE run.id = @run_id
           AND run.review_target_run_id IS NULL
           AND COALESCE(
               NOT ((CASE WHEN run.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = run.id WHERE pin.user_id = run.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id),
-                  (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                   FROM agent_templates t
-                   LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = run.user_id
-                   LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                   WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = run.user_id))
-                     AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                     AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                     AND lower(t.name) IN ('lead', 'orchestrator')
-                   ORDER BY t.name LIMIT 1)) WHEN run.model = ANY(@codex_curated_models::text[]) THEN run.model
+                  (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = run.user_id)) WHEN run.model = ANY(@codex_curated_models::text[]) THEN run.model
                          ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id) END)
                    = ANY(@codex_curated_models::text[])),
               false)
@@ -11095,6 +11114,23 @@ WHERE w.user_id = @user_id
 --
 -- Effective run priority comes first, then created_at breaks equal-rank ties by age; LIMIT
 -- @max_rows bounds the work per tick.
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT DISTINCT r.user_id FROM runs r
+        JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
+        WHERE r.kind = 'cross_check' AND r.harness = 'codex' AND r.status = 'queued'
+    ) owners
+)
 SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
@@ -11199,15 +11235,7 @@ WHERE r.status = 'queued'
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
                              NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
-                                 (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                                  FROM agent_templates t
-                                  LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = r.user_id
-                                  LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                                  WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = r.user_id))
-                                    AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                                    AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                                    AND lower(t.name) IN ('lead', 'orchestrator')
-                                  ORDER BY t.name LIMIT 1)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
+                                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
                                   = ANY(@codex_curated_models::text[])),
                              false)
@@ -11344,6 +11372,23 @@ LIMIT @max_rows;
 --
 -- Effective run priority comes first, then status_since (the debounce clock) breaks
 -- equal-rank ties by longest queue wait. LIMIT @max_rows bounds the work per tick.
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT DISTINCT r.user_id FROM runs r
+        JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
+        WHERE r.kind = 'cross_check' AND r.harness = 'codex' AND r.status = 'queued'
+    ) owners
+)
 SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
@@ -11436,15 +11481,7 @@ WHERE r.status = 'queued'
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
                              NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
-                                 (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                                  FROM agent_templates t
-                                  LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = r.user_id
-                                  LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                                  WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = r.user_id))
-                                    AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                                    AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                                    AND lower(t.name) IN ('lead', 'orchestrator')
-                                  ORDER BY t.name LIMIT 1)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
+                                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
                                   = ANY(@codex_curated_models::text[])),
                              false)
@@ -11529,15 +11566,7 @@ WHERE r.status = 'queued'
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
                              NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
-                                 (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                                  FROM agent_templates t
-                                  LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = r.user_id
-                                  LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                                  WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = r.user_id))
-                                    AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                                    AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                                    AND lower(t.name) IN ('lead', 'orchestrator')
-                                  ORDER BY t.name LIMIT 1)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
+                                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
                                   = ANY(@codex_curated_models::text[])),
                              false)

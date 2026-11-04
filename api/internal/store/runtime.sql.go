@@ -924,7 +924,23 @@ func (q *Queries) ClaimAutopilotTerminalComment(ctx context.Context, id uuid.UUI
 }
 
 const claimRun = `-- name: ClaimRun :one
-WITH claimant AS MATERIALIZED (
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT DISTINCT r.user_id FROM runs r
+        WHERE r.kind = 'cross_check' AND r.harness = 'codex'
+          AND r.status = 'queued' AND r.user_id = $3
+    ) owners
+), claimant AS MATERIALIZED (
     SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason, manual_cordoned_at, manual_cordoned_by, manual_cordoned_by_label, manual_cordon_reason FROM workers WHERE id = $1 FOR UPDATE
 ), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id,
@@ -1234,15 +1250,7 @@ WITH claimant AS MATERIALIZED (
               AND r.review_target_run_id IS NULL
               AND COALESCE(
                   NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
-                      (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                       FROM agent_templates t
-                       LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = r.user_id
-                       LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                       WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = r.user_id))
-                         AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                         AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                         AND lower(t.name) IN ('lead', 'orchestrator')
-                       ORDER BY t.name LIMIT 1)) WHEN r.model = ANY($30::text[]) THEN r.model
+                      (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY($30::text[]) THEN r.model
                              ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
                        = ANY($30::text[])),
                   false)
@@ -1501,15 +1509,7 @@ WITH claimant AS MATERIALIZED (
                         AND r.review_target_run_id IS NULL
                         AND COALESCE(
                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
-                                (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                                 FROM agent_templates t
-                                 LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = r.user_id
-                                 LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                                 WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = r.user_id))
-                                   AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                                   AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                                   AND lower(t.name) IN ('lead', 'orchestrator')
-                                 ORDER BY t.name LIMIT 1)) WHEN r.model = ANY($30::text[]) THEN r.model
+                                (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY($30::text[]) THEN r.model
                                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
                                  = ANY($30::text[])),
                             false)
@@ -1916,6 +1916,9 @@ type ClaimRunParams struct {
 // statement is `UPDATE runs ... RETURNING *`, so the :one result is still store.Run — the
 // hold is a side effect. target and hold share target's single snapshot/lock, so the hold's
 // t.claim_generation + 1 equals the UPDATE's own increment.
+// Materialize the template value once per owner, not per checker row. Keeping
+// the expensive selection out of the row-correlated predicate also avoids
+// inflating health/placement plan cost into an earlier JIT threshold.
 func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, claimRun,
 		arg.WorkerID,
@@ -2596,36 +2599,51 @@ func (q *Queries) CountOnlineEligibleWorkersForRepo(ctx context.Context, arg Cou
 }
 
 const countOnlineWorkersClaimableForRun = `-- name: CountOnlineWorkersClaimableForRun :one
-WITH candidates AS (
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT r.user_id FROM runs r
+        WHERE r.id = $1 AND r.kind = 'cross_check' AND r.harness = 'codex'
+    ) owners
+), candidates AS (
 SELECT w.id,
-       fn_forge_origin_eligible(w,run,$1::timestamptz)::boolean AS forge_eligible,
+       fn_forge_origin_eligible(w,run,$2::timestamptz)::boolean AS forge_eligible,
        EXISTS (SELECT 1 FROM authorized_forge_origins a JOIN forge_origin_cooldowns c
                ON c.user_id = a.user_id AND c.origin IN (a.origin, a.api_origin) AND c.worker_id = w.id
                WHERE a.repo_id = run.repo_id AND a.user_id = run.user_id)::boolean AS has_cooldown,
        COALESCE(codex_admission_run_eligible_at(run.id) <= now(), true)::boolean AS admission_eligible,
-       (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), $1::timestamptz, $2::timestamptz))::boolean AS strict_candidate,
+       (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), $2::timestamptz, $3::timestamptz))::boolean AS strict_candidate,
        fn_worker_accepts_new_intake(w)::boolean AS accepts_intake,
        w.maintenance_fenced AS hard_fenced,
        (w.draining_since IS NOT NULL OR w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling')) AS automatic_hold,
        w.manual_cordoned_at, w.manual_cordoned_by, w.manual_cordoned_by_label, w.manual_cordon_reason,
        rh.pacing, rh.pacing_observed_at, rh.blocking_reason, rh.phase,
-       (w.last_heartbeat_at IS NOT NULL AND w.last_heartbeat_at >= $3)::boolean AS heartbeat_recent,
+       (w.last_heartbeat_at IS NOT NULL AND w.last_heartbeat_at >= $4)::boolean AS heartbeat_recent,
        (run.egress_profile_id IS NULL)::boolean AS diagnostic_lane,
        (run.kind <> 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
-        OR run.updated_at < $2::timestamptz)::boolean AS diagnostic_affinity,
-       (w.kind = 'hosted' AND rh.pacing_observed_at <= $1::timestamptz
-        AND rh.pacing_observed_at >= ($1::timestamptz) - interval '60 seconds'
+        OR run.updated_at < $3::timestamptz)::boolean AS diagnostic_affinity,
+       (w.kind = 'hosted' AND rh.pacing_observed_at <= $2::timestamptz
+        AND rh.pacing_observed_at >= ($2::timestamptz) - interval '60 seconds'
         AND rh.pacing->>'state' IN ('held','active','waiting_evidence','override')
         AND NOT w.maintenance_fenced AND NOT w.maintenance_owns_drain
         AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
         AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.live_worker_id = w.id AND h.state = 'open')
         AND (w.draining_since IS NULL OR w.draining_reason = 'image_roll')
-        AND (w.status <> 'online' OR w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < $3
+        AND (w.status <> 'online' OR w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < $4
              OR (w.draining_since IS NOT NULL AND w.draining_reason = 'image_roll')
              OR rh.phase IN ('rolling','stuck'))) IS TRUE AS through_roll,
        CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
        (w.status = 'online') AS online,
-       (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), $1::timestamptz, $2::timestamptz)
+       (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), $2::timestamptz, $3::timestamptz)
              ELSE w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs END) AS free_slot,
        -- Counterfactual capacity for diagnostics only; free_slot retains admission filtering.
        (CASE WHEN run.kind = 'cross_check' AND w.max_cross_check_slots IS NOT NULL THEN
@@ -2634,24 +2652,24 @@ SELECT w.id,
              ELSE w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs END) AS capacity_free,
        (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, NOT fn_worker_accepts_new_intake(w),
-              $4::interval, now(),
+              $5::interval, now(),
               run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $5::boolean, run.repo_id, run.kind, run.egress_profile_id, $6::uuid[]) OR COALESCE(w.docker_enabled, false)))) AS advisory_binding,
+                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $6::boolean, run.repo_id, run.kind, run.egress_profile_id, $7::uuid[]) OR COALESCE(w.docker_enabled, false)))) AS advisory_binding,
        (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
            (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-              $4::interval, now(),
+              $5::interval, now(),
               run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $5::boolean, run.repo_id, run.kind, run.egress_profile_id, $6::uuid[]) OR COALESCE(w.docker_enabled, false)))
+                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $6::boolean, run.repo_id, run.kind, run.egress_profile_id, $7::uuid[]) OR COALESCE(w.docker_enabled, false)))
            AND NOT EXISTS (SELECT 1 FROM workers bw WHERE bw.ephemeral AND bw.ephemeral_run_id = run.id)
            AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds ch WHERE ch.live_worker_id = w.id AND ch.state = 'open')
        )) AS strict_binding,
        (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
            (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, false,
-              $4::interval, now(),
+              $5::interval, now(),
               run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $5::boolean, run.repo_id, run.kind, run.egress_profile_id, $6::uuid[]) OR COALESCE(w.docker_enabled, false)))
+                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $6::boolean, run.repo_id, run.kind, run.egress_profile_id, $7::uuid[]) OR COALESCE(w.docker_enabled, false)))
            AND NOT EXISTS (SELECT 1 FROM workers bw WHERE bw.ephemeral AND bw.ephemeral_run_id = run.id)
            AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds ch WHERE ch.live_worker_id = w.id AND ch.state = 'open')
        )) AS manual_binding,
@@ -2659,14 +2677,14 @@ SELECT w.id,
        (NOT w.ephemeral) AS persistent,
        (run.kind = 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
-                       AND fn_forge_origin_owner_pins(ow, run, $1::timestamptz)
+                       AND fn_forge_origin_owner_pins(ow, run, $2::timestamptz)
                        AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
-                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $3)
+                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $4)
                             -- #2705 pin P, mirroring ClaimRun's stale-requeue grace arm.
                             OR (run.kind <> 'cross_check'
                                 AND run.stale_requeue_generation = run.claim_generation
-                                AND COALESCE(run.status_since > $7::timestamptz, false))))
-        OR run.updated_at < $8) AS affinity
+                                AND COALESCE(run.status_since > $8::timestamptz, false))))
+        OR run.updated_at < $9) AS affinity
 FROM runs run
 JOIN users owner ON owner.id = run.user_id
 JOIN workers w ON w.user_id = run.user_id
@@ -2677,13 +2695,13 @@ CROSS JOIN LATERAL (
       AND pr.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
       AND pr.kind <> 'chat' AND NOT pr.cross_check_lane
 ) wa
-WHERE run.id = $9
+WHERE run.id = $1
   -- Manual diagnostics include statically suitable hard-fenced peers in their denominator.
   -- strict_candidate retains fn_cross_check_child_eligible's actual fence for existing counts.
-  AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(jsonb_populate_record(w, '{"maintenance_fenced":false}'::jsonb), run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), $1::timestamptz, $2::timestamptz))
+  AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(jsonb_populate_record(w, '{"maintenance_fenced":false}'::jsonb), run, false, 'any', (SELECT stage FROM cross_checks WHERE checker_run_id = run.id), $2::timestamptz, $3::timestamptz))
   AND fn_worker_can_claim(
         COALESCE(w.docker_enabled, false),
-        $6::uuid[],
+        $7::uuid[],
         run.repo_id,
         run.kind,
         COALESCE(w.capabilities, '{}')::text[],
@@ -2743,15 +2761,7 @@ WHERE run.id = $9
           AND run.review_target_run_id IS NULL
           AND COALESCE(
               NOT ((CASE WHEN run.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = run.id WHERE pin.user_id = run.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id),
-                  (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                   FROM agent_templates t
-                   LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = run.user_id
-                   LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                   WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = run.user_id))
-                     AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                     AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                     AND lower(t.name) IN ('lead', 'orchestrator')
-                   ORDER BY t.name LIMIT 1)) WHEN run.model = ANY($11::text[]) THEN run.model
+                  (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = run.user_id)) WHEN run.model = ANY($11::text[]) THEN run.model
                          ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id) END)
                    = ANY($11::text[])),
               false)
@@ -2803,6 +2813,7 @@ FROM candidates
 `
 
 type CountOnlineWorkersClaimableForRunParams struct {
+	RunID                    uuid.UUID          `json:"run_id"`
 	CrossCheckEvaluatedAt    pgtype.Timestamptz `json:"cross_check_evaluated_at"`
 	CrossCheckAffinityCutoff pgtype.Timestamptz `json:"cross_check_affinity_cutoff"`
 	HeartbeatCutoff          pgtype.Timestamptz `json:"heartbeat_cutoff"`
@@ -2811,7 +2822,6 @@ type CountOnlineWorkersClaimableForRunParams struct {
 	DockerRepoAllowlist      []uuid.UUID        `json:"docker_repo_allowlist"`
 	StaleRequeueCutoff       pgtype.Timestamptz `json:"stale_requeue_cutoff"`
 	AffinityCutoff           pgtype.Timestamptz `json:"affinity_cutoff"`
-	RunID                    uuid.UUID          `json:"run_id"`
 	CapabilityAware          bool               `json:"capability_aware"`
 	CodexCuratedModels       []string           `json:"codex_curated_models"`
 }
@@ -2866,6 +2876,7 @@ type CountOnlineWorkersClaimableForRunRow struct {
 // would turn "weekly reserve" into a bogus "no worker can claim" reading.
 func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg CountOnlineWorkersClaimableForRunParams) (CountOnlineWorkersClaimableForRunRow, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersClaimableForRun,
+		arg.RunID,
 		arg.CrossCheckEvaluatedAt,
 		arg.CrossCheckAffinityCutoff,
 		arg.HeartbeatCutoff,
@@ -2874,7 +2885,6 @@ func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg Cou
 		arg.DockerRepoAllowlist,
 		arg.StaleRequeueCutoff,
 		arg.AffinityCutoff,
-		arg.RunID,
 		arg.CapabilityAware,
 		arg.CodexCuratedModels,
 	)
@@ -10119,6 +10129,23 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff p
 
 const listActiveRunsForHealth = `-- name: ListActiveRunsForHealth :many
 
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT DISTINCT r.user_id FROM runs r
+        WHERE r.kind = 'cross_check' AND r.harness = 'codex'
+          AND r.status IN ('queued', 'claimed', 'running', 'awaiting_approval')
+    ) owners
+)
 SELECT id, runs.user_id, status, auto_approve,
        admission.codex_admission_class, admission.codex_admission_eligible_at,
        cooldown.account_cooldown_class, cooldown.account_cooldown_eligible_at,
@@ -10154,15 +10181,7 @@ SELECT id, runs.user_id, status, auto_approve,
         AND runs.review_target_run_id IS NULL
         AND COALESCE(
             NOT ((CASE WHEN runs.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id),
-                (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                 FROM agent_templates t
-                 LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = runs.user_id
-                 LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                 WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = runs.user_id))
-                   AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                   AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                   AND lower(t.name) IN ('lead', 'orchestrator')
-                 ORDER BY t.name LIMIT 1)) WHEN runs.model = ANY($1::text[]) THEN runs.model
+                (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = runs.user_id)) WHEN runs.model = ANY($1::text[]) THEN runs.model
                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id) END)
                  = ANY($1::text[])),
             false))::boolean AS codex_custom_root,
@@ -12591,6 +12610,23 @@ func (q *Queries) ListRunsPendingUsageRefold(ctx context.Context, arg ListRunsPe
 }
 
 const listSaturationQueuedRunsForEphemeral = `-- name: ListSaturationQueuedRunsForEphemeral :many
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT DISTINCT r.user_id FROM runs r
+        JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
+        WHERE r.kind = 'cross_check' AND r.harness = 'codex' AND r.status = 'queued'
+    ) owners
+)
 SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
@@ -12683,15 +12719,7 @@ WHERE r.status = 'queued'
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
                              NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
-                                 (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                                  FROM agent_templates t
-                                  LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = r.user_id
-                                  LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                                  WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = r.user_id))
-                                    AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                                    AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                                    AND lower(t.name) IN ('lead', 'orchestrator')
-                                  ORDER BY t.name LIMIT 1)) WHEN r.model = ANY($9::text[]) THEN r.model
+                                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY($9::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
                                   = ANY($9::text[])),
                              false)
@@ -12776,15 +12804,7 @@ WHERE r.status = 'queued'
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
                              NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
-                                 (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                                  FROM agent_templates t
-                                  LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = r.user_id
-                                  LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                                  WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = r.user_id))
-                                    AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                                    AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                                    AND lower(t.name) IN ('lead', 'orchestrator')
-                                  ORDER BY t.name LIMIT 1)) WHEN r.model = ANY($9::text[]) THEN r.model
+                                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY($9::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
                                   = ANY($9::text[])),
                              false)
@@ -12985,6 +13005,23 @@ func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg 
 }
 
 const listUnplaceableQueuedRunsForEphemeral = `-- name: ListUnplaceableQueuedRunsForEphemeral :many
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT DISTINCT r.user_id FROM runs r
+        JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
+        WHERE r.kind = 'cross_check' AND r.harness = 'codex' AND r.status = 'queued'
+    ) owners
+)
 SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
@@ -13089,15 +13126,7 @@ WHERE r.status = 'queued'
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
                              NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
-                                 (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
-                                  FROM agent_templates t
-                                  LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = r.user_id
-                                  LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
-                                  WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = r.user_id))
-                                    AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
-                                    AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
-                                    AND lower(t.name) IN ('lead', 'orchestrator')
-                                  ORDER BY t.name LIMIT 1)) WHEN r.model = ANY($8::text[]) THEN r.model
+                                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY($8::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
                                   = ANY($8::text[])),
                              false)
