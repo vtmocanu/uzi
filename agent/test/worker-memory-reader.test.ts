@@ -242,6 +242,11 @@ test("malformed or duplicate optional lines are only recorded and never invalida
   assert.equal("file" in detail, false, "a duplicated value is dropped, not guessed");
   assert.equal(detail.missing.includes("file"), false);
   assert.equal(detail.missing.includes("sock"), false);
+  // A key stays malformed once marked: a third duplicate or a later valid line never resurrects it.
+  const repeated = detailOf(CORE_STAT + "file 5\nfile 6\nfile 7\nsock -1\nsock 4\n");
+  assert.deepEqual([...repeated.malformed].sort(), ["file", "sock"]);
+  assert.equal("file" in repeated, false);
+  assert.equal("sock" in repeated, false);
   // A malformed required line still invalidates the sample.
   unavailable({ "/fake/memory.stat": CORE_STAT + "anon 1\n" }, "malformed");
 });

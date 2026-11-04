@@ -50,7 +50,8 @@ function copyPressure(p: Pressure, freeze = false): Pressure {
 }
 
 type StatDetail = NonNullable<Available["statDetail"]>;
-/** Frozen deep copy. An uncopyable statDetail is kept by reference, so the diagnostics build fails closed. */
+/** Frozen deep copy. An uncopyable statDetail is kept by reference so observe() never throws; a deterministic
+ * copy failure then also fails the diagnostics build, which reports unavailable:"error". */
 function copyDetail(d: StatDetail): StatDetail {
   try { return Object.freeze({ ...d, missing: Object.freeze([...d.missing]), malformed: Object.freeze([...d.malformed]) }); }
   catch { return d; }
@@ -436,7 +437,7 @@ export class WorkerMemoryMonitor {
     if (!entries?.length) return;
     const deadline = now + this.config.responseBudgetMs;
     // In-memory trigger copy for diagnostics only; the deadline and authority path are unchanged.
-    // A copy failure only drops the trigger record; it never suppresses the intervention.
+    // Defensive: snapshot() already succeeded on this input above; a failure here only drops the trigger record.
     let trigger: Trigger | undefined;
     try { trigger = input.available ? Object.freeze({ sample: snapshot(input), decision: decisionRecord(decision) }) : undefined; }
     catch { trigger = undefined; }
@@ -682,10 +683,10 @@ export class WorkerMemoryMonitor {
       if (!ack.admitted || !ack.authorizing || commands.remaining(a.context) === undefined) throw new Error("memory admission denied");
       preserve = ack.allowance.remaining === 0;
       const observation = await this.bounded((signal, remainingMs) => entry.observe({ signal, remainingMs }), deadline);
-      cancelObservation = observation;
       const authorized = () => this.ports.now() < deadline && this.current(a)
         && commands.checkBeforeCancel(selected, observation, this.ports.now(), this.config.responseBudgetMs);
       if (!authorized()) throw new Error("stale memory authority");
+      cancelObservation = observation; // recorded only once checkBeforeCancel validated its rows
       outcome = "unknown"; // invoking cancellation can have an ambiguous signal result
       await this.bounded((signal, remainingMs) => {
         if (!authorized()) throw new Error("stale memory authority");

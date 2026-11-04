@@ -1558,6 +1558,33 @@ test("a denied admission never observed the tree again: cancel_check is not_obse
   await f.monitor.stop();
 });
 
+test("a cancel-time observation rejected by checkBeforeCancel is reported as not_observed, never as zero or error", async () => {
+  const base = { available: true, complete: true, startedAtMs: 0, completedAtMs: 0 };
+  const rejected: Array<[string, unknown]> = [
+    ["empty rows", { ...base, rows: [] }],
+    ["non-array rows", { ...base, rows: "not-rows" }],
+  ];
+  for (const [label, bad] of rejected) {
+    let diagnostics: unknown;
+    let observes = 0;
+    const good: TreeObservation = { ...base, rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] };
+    const f = await fixture({ sampleOf: withDetail,
+      observe: async () => ++observes === 1 ? good : bad as TreeObservation,
+      prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+    f.monitor.tick();
+    await until(() => f.requests.length === 1);
+    f.reservation.resolve(f.ack());
+    await f.monitor.settle();
+    assert.equal(observes, 2, `${label}: the cancel-time observation ran`);
+    assert.equal(f.signals(), 0, `${label}: no signal was sent`);
+    const d = norm(diagnostics);
+    assert.notDeepEqual(d, { version: 1, unavailable: "error" }, `${label}: diagnostics did not collapse`);
+    assert.deepEqual(d.tree.cancel_check, { unavailable: "not_observed" }, label);
+    assert.equal(d.tree.selected_rss_bytes_approx, 100, label);
+    await f.monitor.stop();
+  }
+});
+
 type Variant = "control" | "diagnostics" | "throws";
 async function runBranch(branch: "a" | "b" | "c", variant: Variant) {
   const order: string[] = [];
