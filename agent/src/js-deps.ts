@@ -18,8 +18,7 @@
 // + the user's Anthropic token and its own env carries the join token, none of which may
 // ever reach repo-authored install code. This module widens WHICH dirs get installed; it
 // widens nothing about who runs the install or what it can see. (pnpm's
-// repo-configurable virtual store location is pinned into the clone; see the
-// pnpm entry below for what is and is not pinned.)
+// repo-configurable store locations are pinned; see the pnpm entry below.)
 //
 // ─── Repo-authored code execution: a REDUCTION, not a close ───────────────────
 //
@@ -64,18 +63,22 @@
 //          dependency's hook is suppressed by `--ignore-pnpmfile` IN THE CASES THE IMAGE PROOF
 //          EXERCISES; that is not a claim that no fetched config dependency can ever lead to
 //          code execution.
-//          WRITE LOCATION, NOT CLAIMED CLOSED: the `--config.virtual-store-dir`
-//          pin keeps the package files in the clone, but a repo
-//          `.npmrc` / workspace `store-dir=<abs>` still makes the install write pnpm's
-//          store index (and any package content pnpm imports: content-addressed files, not a
-//          repo-chosen layout) at that path, outside the clone (measured on 10.34.9). The
-//          default store is under pnpm's home dir (the scrubbed HOME unless XDG_DATA_HOME /
-//          PNPM_HOME is set) only when that dir and the clone share a filesystem; otherwise pnpm picks `<clone mount point>/.pnpm-store` (read in pnpm's
-//          source, not measured here). A relative in-clone store pin would close the escape
-//          but moves every pnpm repo's store into the clone, so a later plain `pnpm install`
-//          in a non-TTY shell aborts on the store mismatch (measured); it is deferred rather
-//          than folded in here (issue #3906 review). `cache-dir` / `state-dir` showed no
-//          writes in an offline `file:`-only install, which does not exercise them.
+//          WRITE LOCATIONS (issue #3906, owner decisions 2026-11-04): two repo-configurable
+//          pnpm write locations are pinned by CLI flags, which beat a repo `.npmrc` and a
+//          workspace `pnpm-workspace.yaml` (measured on 10.34.9, each with a flag-removal
+//          control): the virtual store (`--config.virtual-store-dir=node_modules/.pnpm`,
+//          package files stay in the clone) and the content store (`--config.store-dir=
+//          <per-run HOME>/.local/share/pnpm/store`, built by `pnpmStoreArgs` from the
+//          worker-controlled HOME, never from repo config). INVARIANT: the repository cannot
+//          select the store destination, and runs do not share it. Consequences, both
+//          owner-accepted: (1) a repo that sets its OWN virtual store or store-dir makes a
+//          later ordinary non-TTY `pnpm install` abort with
+//          ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY (`CI=true` or removing node_modules
+//          recovers); (2) when the per-run HOME and the clone are on different filesystems
+//          pnpm copies instead of hard-linking, and a later plain install can report a store
+//          mismatch. Not claimed: that default repos are unchanged everywhere.
+//          `cache-dir` / `state-dir` showed no writes in an offline `file:`-only install,
+//          which does not exercise them.
 //   npm   no equivalent found. Measured: a `packageManager: "npm@9.0.0"` field caused no
 //          handoff (offline, exit 0), and the auditor separately measured that a repo
 //          `.npmrc` with `ignore-scripts=false` does not override the CLI flag.
@@ -188,6 +191,29 @@ interface InstallSpec {
   command: string;
   args: string[];
   env?: Record<string, string>;
+  /** Extra argv derived from the caller's scrubbed env (worker-controlled, never from repo
+   *  config). Throws when the env cannot supply it; the install is then refused, not run
+   *  without the pin. */
+  envArgs?: (env: NodeJS.ProcessEnv) => string[];
+}
+
+/** pnpm's per-run store location under the worker-controlled HOME. The invariant: the
+ *  repository cannot select the store destination (the flag overrides repo `.npmrc` /
+ *  workspace `store-dir`), and runs do not share it (HOME is per run). The path is
+ *  built here from HOME, with no `pnpm store path` discovery subprocess and no
+ *  reimplementation of pnpm's mount selection; pnpm appends its own `v10` store-version
+ *  directory. */
+function pnpmStoreArgs(env: NodeJS.ProcessEnv): string[] {
+  const home = env.HOME;
+  if (!home || !isAbsolute(home) || resolve(home) !== home || home.includes("\0")) {
+    throw new Error("pnpm install needs a clean absolute per-run HOME for its private store");
+  }
+  return [`--config.store-dir=${join(home, ".local", "share", "pnpm", "store")}`];
+}
+
+/** The full argv for one spec under `env`: the fixed args plus any env-derived ones. */
+function installArgv(spec: InstallSpec, env: NodeJS.ProcessEnv): string[] {
+  return [...spec.args, ...(spec.envArgs?.(env) ?? [])];
 }
 
 // INSTALL_COMMANDS is the frozen, execution-suppressed install per manager. Every flag
@@ -207,9 +233,12 @@ interface InstallSpec {
 //          repo that sets its OWN virtual store (even inside the clone) gets this one
 //          instead, and a later plain `pnpm install` in a non-TTY shell then aborts with
 //          ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY (measured; `CI=true` or removing
-//          node_modules recovers): an accepted cost of closing the escape. An absolute
-//          `modules-dir` showed no escape of its own once the virtual store was pinned: pnpm
-//          resolved it under the project dir).
+//          node_modules recovers): an owner decision (2026-11-04), not an oversight. An
+//          absolute `modules-dir` showed no escape of its own once the virtual store was
+//          pinned: pnpm resolved it under the project dir) + `--config.store-dir=<abs>`
+//          appended by `installArgv` from `pnpmStoreArgs` (the per-run private store; see
+//          the header's WRITE LOCATIONS note). The install is refused, not run unpinned,
+//          when the env carries no clean absolute HOME.
 //   yarn — `--ignore-scripts` covers lifecycle scripts on yarn CLASSIC (1.x), which is
 //          also the only line that accepts `--frozen-lockfile`. It does NOT cover
 //          `yarnPath`, so the env overlay carries `YARN_IGNORE_PATH=1`.
@@ -238,6 +267,7 @@ const INSTALL_COMMANDS: Record<JsPackageManager, InstallSpec> = {
       "--config.manage-package-manager-versions=false",
       "--config.virtual-store-dir=node_modules/.pnpm",
     ],
+    envArgs: pnpmStoreArgs,
   },
   // THE SPLIT BELOW IS DELIBERATE: `--ignore-scripts` is ARGV, `YARN_IGNORE_PATH` is the
   // env overlay, and the two are NOT interchangeable despite reading as siblings. Folding
@@ -365,16 +395,25 @@ function sameInstallEnv(actual: NodeJS.ProcessEnv, expected: NodeJS.ProcessEnv):
     (actual[key] === undefined || (typeof actual[key] === "string" && !actual[key]!.includes("\0"))));
 }
 
-function canonicalInstallSpec(command: InstallCommand, baseEnv: NodeJS.ProcessEnv): InstallSpec {
+function canonicalInstallSpec(
+  command: InstallCommand,
+  baseEnv: NodeJS.ProcessEnv,
+): { spec: InstallSpec; argv: string[] } {
   if (!isAbsolute(command.cwd) || resolve(command.cwd) !== command.cwd || command.cwd.includes("\0") ||
     !Number.isFinite(command.timeoutMs) || command.timeoutMs <= 0) {
     throw new Error("installer requires a clean absolute cwd and positive finite timeout");
   }
   // At most the fixed manager table's entries; no manager or dispatcher comes from argv.
   for (const spec of Object.values(INSTALL_COMMANDS)) {
-    const wrapped = runnerCommand(spec.command, spec.args);
+    let argv: string[];
+    try {
+      argv = installArgv(spec, baseEnv);
+    } catch {
+      continue; // this manager cannot be built from this env; it matches nothing
+    }
+    const wrapped = runnerCommand(spec.command, argv);
     if (command.command === wrapped.command && sameInstallArgs(command.args, wrapped.args) &&
-      sameInstallEnv(command.env, { ...baseEnv, ...spec.env })) return spec;
+      sameInstallEnv(command.env, { ...baseEnv, ...spec.env })) return { spec, argv };
   }
   throw new Error("installer command or environment is not canonical");
 }
@@ -393,10 +432,10 @@ export function prepareSupervisedInstall(
     env: Object.freeze({ ...command.env }),
   });
   Object.freeze(original.args);
-  const spec = canonicalInstallSpec(original, capturedBase);
+  const { spec, argv } = canonicalInstallSpec(original, capturedBase);
   const request = Object.freeze({
     command: "/usr/bin/env" as const,
-    args: Object.freeze([spec.command, ...spec.args]),
+    args: Object.freeze([spec.command, ...argv]),
     cwd: original.cwd,
     env: original.env,
     timeoutMs: original.timeoutMs,
@@ -411,9 +450,9 @@ export function prepareSupervisedInstall(
 export function assertSupervisedInstallRequest(request: SupervisedInstallRequest): void {
   const binding = supervisedInstalls.get(request);
   if (!binding) throw new Error("installer request has no preparation provenance");
-  const spec = canonicalInstallSpec(binding.original, binding.baseEnv);
+  const { spec, argv } = canonicalInstallSpec(binding.original, binding.baseEnv);
   if (spec !== binding.spec || request.command !== "/usr/bin/env" ||
-    !sameInstallArgs(request.args, [spec.command, ...spec.args]) ||
+    !sameInstallArgs(request.args, [spec.command, ...argv]) ||
     request.cwd !== binding.original.cwd || request.timeoutMs !== binding.original.timeoutMs ||
     request.signal !== binding.original.signal ||
     !sameInstallEnv(request.env, { ...binding.baseEnv, ...spec.env })) {
@@ -601,16 +640,28 @@ export async function installJsDeps(
     }
 
     const spec = INSTALL_COMMANDS[project.manager];
+    let argv: string[];
+    try {
+      argv = installArgv(spec, env);
+    } catch (err) {
+      results.push({
+        dir: project.dir,
+        manager: project.manager,
+        ok: false,
+        detail: `could not run: ${errText(err)} — node_modules absent, gates skip honestly`,
+      });
+      continue;
+    }
     // Rendered shell-style, WITH any env overlay, because this string is what a human
     // reads on the run feed and in the logs. Showing only the argv would display a yarn
     // install as `yarn install --frozen-lockfile --ignore-scripts` — which, as displayed,
     // is the command that executes a repo-committed yarnPath. The half that closes it
     // would be invisible to exactly the person debugging whether it was applied.
-    const label = [...Object.entries(spec.env ?? {}).map(([k, v]) => `${k}=${v}`), spec.command, ...spec.args].join(" ");
+    const label = [...Object.entries(spec.env ?? {}).map(([k, v]) => `${k}=${v}`), spec.command, ...argv].join(" ");
     // PRD #51 M4: the install runs repo-authored package.json/lockfile resolution — an
     // untrusted surface — so under the `runner` uid (setpriv wrapper); a #58 single-uid
     // start runs it directly.
-    const wrapped = runnerCommand(spec.command, spec.args);
+    const wrapped = runnerCommand(spec.command, argv);
     const cwd = project.dir === "." ? rootPath : join(rootPath, project.dir);
     // The caller's env, untouched, unless this manager needs a hardening key.
     const installEnv = spec.env ? { ...env, ...spec.env } : env;

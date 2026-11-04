@@ -26351,8 +26351,12 @@ describe("#2852 default installer binding", () => {
           try {
             await withTimeout(fx.native.disposing, 3000, `canonical ${manager} root`);
             const call = fx.native.calls[0]!;
-            assert.deepEqual(call.args.slice(-(args.length + 5)),
-              ["--expect-uid", "10002", "--", "/usr/bin/env", manager, ...args]);
+            // pnpm alone appends the worker-controlled per-run store (issue #3906).
+            const argv = manager === "pnpm"
+              ? [...args, `--config.store-dir=${path.join(path.dirname(fx.ctx.worktreePath), "home", ".local/share/pnpm/store")}`]
+              : [...args];
+            assert.deepEqual(call.args.slice(-(argv.length + 5)),
+              ["--expect-uid", "10002", "--", "/usr/bin/env", manager, ...argv]);
             assert.deepEqual(call.options.env, {
               HOME: path.join(path.dirname(fx.ctx.worktreePath), "home"), PATH: "/fixture/bin",
               TMPDIR: "/fixture/tmp", GIT_TERMINAL_PROMPT: "0", NIX_SSL_CERT_FILE: "/fixture/nix.pem",

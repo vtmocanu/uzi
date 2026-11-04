@@ -558,10 +558,13 @@ RUN mkdir -p /usr/share/uzi-git-nohooks && chmod 0555 /usr/share/uzi-git-nohooks
 # the release build avoids exporting/loading the multi-GB image just for a probe.
 # Issue #3906: EXECUTE the baked pnpm through the worker's real js-deps install path,
 # offline (loopback only), proving --ignore-scripts / --ignore-pnpmfile / the
-# packageManager-handoff flag / the virtual-store pin hold, each with a flag-removal
-# control. MIRRORED in both templates.
+# packageManager-handoff flag / the virtual-store and per-run store pins hold, each with
+# a flag-removal control. UZI_PNPM_XFS_DIR=/dev/shm (the tmpfs every build container has,
+# a second filesystem) lets the test prove the private store still imports across
+# filesystems; UZI_PNPM_XFS_REQUIRED=1 fails the build if that tmpfs is unusable.
+# MIRRORED in both templates.
 USER runner
-RUN --network=none set -eu; cd /app; UZI_PNPM_IMAGE_PROOF=1 node --import tsx --test --test-timeout=120000 /opt/uzi-src/agent/test/js-deps-pnpm-real.test.ts
+RUN --network=none set -eu; cd /app; UZI_PNPM_IMAGE_PROOF=1 UZI_PNPM_XFS_DIR=/dev/shm UZI_PNPM_XFS_REQUIRED=1 node --import tsx --test --test-timeout=120000 /opt/uzi-src/agent/test/js-deps-pnpm-real.test.ts
 RUN --network=none set -eu; cd /opt/uzi-src; \
     which -a go; test "$(which -a go | wc -l)" -eq 1; \
     go version; \

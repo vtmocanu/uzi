@@ -2,7 +2,7 @@
 //
 // Nothing here mocks pnpm. Each protection (`--ignore-scripts`, `--ignore-pnpmfile`,
 // `--config.manage-package-manager-versions=false`, `--config.virtual-store-dir=
-// node_modules/.pnpm`) is proven twice: a PROTECTED run (through startDepsInstall, the
+// node_modules/.pnpm`, `--config.store-dir=<per-run HOME>/.local/share/pnpm/store`) is proven twice: a PROTECTED run (through startDepsInstall, the
 // provisioning seam the executor uses) must be ok with the vector NOT taken, and a
 // POSITIVE CONTROL in a fresh copy of the same fixture drops exactly that one flag and
 // must show the vector live: the repo-authored code DOES execute, the handoff fails, or
@@ -20,7 +20,7 @@
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -40,6 +40,8 @@ const FLAG_SCRIPTS = "--ignore-scripts";
 const FLAG_PNPMFILE = "--ignore-pnpmfile";
 const FLAG_MANAGE = "--config.manage-package-manager-versions=false";
 const FLAG_VSTORE = "--config.virtual-store-dir=node_modules/.pnpm";
+/** The per-run store flag carries a HOME-derived value, so a control drops it by prefix. */
+const FLAG_STORE_PREFIX = "--config.store-dir=";
 
 const imageProof = process.env.UZI_PNPM_IMAGE_PROOF === "1";
 
@@ -171,10 +173,12 @@ async function protectedRun(root: string, home = mkHome()): Promise<JsDepsInstal
 /** POSITIVE CONTROL: the same real install minus exactly one flag, which must have been there. */
 async function controlRun(root: string, dropped: string, home = mkHome()): Promise<JsDepsInstall> {
   const seen: string[][] = [];
+  // A trailing "=" names a flag by prefix (its value is derived per run).
+  const isDropped = (a: string): boolean => a === dropped || (dropped.endsWith("=") && a.startsWith(dropped));
   const exec: InstallExec = (cmd) => {
-    assert.ok(cmd.args.includes(dropped), `the install argv must carry ${dropped} before the control drops it`);
+    assert.ok(cmd.args.some(isDropped), `the install argv must carry ${dropped} before the control drops it`);
     seen.push([...cmd.args]);
-    return execInstall({ ...cmd, args: cmd.args.filter((a) => a !== dropped) });
+    return execInstall({ ...cmd, args: cmd.args.filter((a) => !isDropped(a)) });
   };
   const result = await installJsDeps(root, buildCheckEnv(process.env, home), {
     timeoutMs: 100_000,
@@ -201,6 +205,54 @@ function modulesYaml(root: string): { packageManager?: string } {
   return JSON.parse(fs.readFileSync(path.join(root, "node_modules", ".modules.yaml"), "utf8")) as {
     packageManager?: string;
   };
+}
+
+/** The private store the worker pins for a HOME (pnpm appends its own `v10` directory). */
+function privateStore(home: string): string {
+  return path.join(home, ".local", "share", "pnpm", "store");
+}
+
+/**
+ * An ORDINARY non-TTY `pnpm install`: no protective flags, the same scrubbed env the worker
+ * uses (so the same per-run HOME), stdio piped (not a TTY). What a later user or agent
+ * command in the clone would run.
+ */
+function ordinaryInstall(root: string, home: string, extraEnv: Record<string, string> = {}) {
+  const r = spawnSync("pnpm", ["install"], {
+    cwd: root,
+    env: { ...buildCheckEnv(process.env, home), ...extraEnv },
+    encoding: "utf8",
+    timeout: 100_000,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return { status: r.status, out: `${r.stdout}\n${r.stderr}` };
+}
+
+const NO_TTY_ABORT = "ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY";
+
+/** Minimal deterministic ustar archive (mtime 0, fixed modes) gzip-compressed. */
+function tarball(files: [string, string][]): Buffer {
+  const blocks: Buffer[] = [];
+  for (const [name, content] of files) {
+    const body = Buffer.from(content);
+    const header = Buffer.alloc(512);
+    header.write(name, 0, "utf8");
+    header.write("0000644\0", 100);
+    header.write("0000000\0", 108);
+    header.write("0000000\0", 116);
+    header.write(`${body.length.toString(8).padStart(11, "0")}\0`, 124);
+    header.write("00000000000\0", 136);
+    header.write("        ", 148);
+    header.write("0", 156);
+    header.write("ustar\0", 257);
+    header.write("00", 263);
+    let sum = 0;
+    for (const byte of header) sum += byte;
+    header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148);
+    blocks.push(header, body, Buffer.alloc((512 - (body.length % 512)) % 512));
+  }
+  blocks.push(Buffer.alloc(1024));
+  return zlib.gzipSync(Buffer.concat(blocks), { level: 9, mtime: 0 } as zlib.ZlibOptions);
 }
 
 describe("real pnpm through js-deps (issue #3906)", { skip: skipReason }, () => {
@@ -341,31 +393,6 @@ describe("real pnpm through js-deps (issue #3906)", { skip: skipReason }, () => 
   describe("(e) configDependencies through a loopback registry", () => {
     const PLUGIN = "pnpm-plugin-uzi-probe";
 
-    /** Minimal deterministic ustar archive (mtime 0, fixed modes) gzip-compressed. */
-    function tarball(files: [string, string][]): Buffer {
-      const blocks: Buffer[] = [];
-      for (const [name, content] of files) {
-        const body = Buffer.from(content);
-        const header = Buffer.alloc(512);
-        header.write(name, 0, "utf8");
-        header.write("0000644\0", 100);
-        header.write("0000000\0", 108);
-        header.write("0000000\0", 116);
-        header.write(`${body.length.toString(8).padStart(11, "0")}\0`, 124);
-        header.write("00000000000\0", 136);
-        header.write("        ", 148);
-        header.write("0", 156);
-        header.write("ustar\0", 257);
-        header.write("00", 263);
-        let sum = 0;
-        for (const byte of header) sum += byte;
-        header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148);
-        blocks.push(header, body, Buffer.alloc((512 - (body.length % 512)) % 512));
-      }
-      blocks.push(Buffer.alloc(1024));
-      return zlib.gzipSync(Buffer.concat(blocks), { level: 9, mtime: 0 } as zlib.ZlibOptions);
-    }
-
     let server: http.Server | undefined;
     let port = 0;
     let requests: string[] = [];
@@ -485,5 +512,216 @@ describe("real pnpm through js-deps (issue #3906)", { skip: skipReason }, () => 
         });
       }
     }
+  });
+
+  describe("(g) repo-chosen content store outside the clone", () => {
+    // INVARIANT under test: the repository cannot select the store destination. A repo
+    // `.npmrc` / workspace `store-dir=<abs>` is overridden by the worker's per-run
+    // `--config.store-dir`; dropping only that flag (the control) lets the repo win.
+    for (const source of [".npmrc", "pnpm-workspace.yaml"]) {
+      const build = () => {
+        const target = path.join(mkdir("store-escape"), "s");
+        const root =
+          source === ".npmrc"
+            ? mkFixture({ npmrc: `registry=http://127.0.0.1:9/\nstore-dir=${target}\n` })
+            : mkFixture({ files: { "pnpm-workspace.yaml": `storeDir: ${target}\n` } });
+        return { root, target };
+      };
+      it(`store-dir in ${source}: protected run writes nothing at the repo-chosen path`, async () => {
+        const f = build();
+        const home = mkHome();
+        assertPnpmResult(await protectedRun(f.root, home), true);
+        assert.equal(fs.existsSync(f.target), false, `something was written at ${f.target}`);
+        assert.equal(fs.existsSync(privateStore(home)), true, "the private per-run store was not used");
+        const required = execFileSync(process.execPath, ["-p", 'require("dep")'], { cwd: f.root, encoding: "utf8" }).trim();
+        assert.equal(required, "dep-installed");
+      });
+      it(`store-dir in ${source}: control without ${FLAG_STORE_PREFIX}<per-run store> writes there`, async () => {
+        const f = build();
+        await controlRun(f.root, FLAG_STORE_PREFIX);
+        assert.equal(fs.existsSync(f.target), true, "control wrote nothing at the repo-chosen path: the fixture proves nothing");
+      });
+    }
+  });
+
+  describe("(h) default repos: the private store is the store an ordinary install resolves", () => {
+    // Linux only: pnpm's default store is `$XDG_DATA_HOME|~/.local/share` + pnpm/store there,
+    // but ~/Library/pnpm/store on macOS, so on a laptop the two legitimately differ. This
+    // runs where it matters: the Linux image build (UZI_PNPM_IMAGE_PROOF=1). Everything
+    // lives under one tmpdir, so clone and HOME share a filesystem here; the cross-filesystem
+    // case is (j).
+    const skip = process.platform === "linux" ? false : `pnpm's default store on ${process.platform} is not under HOME/.local/share/pnpm (runs on Linux)`;
+    it("protected and ordinary installs agree on the store, and a later ordinary non-TTY install succeeds", { skip }, async () => {
+      const home = mkHome();
+      const root = mkFixture();
+      assertPnpmResult(await protectedRun(root, home), true);
+      const ordinaryStore = execFileSync("pnpm", ["store", "path"], {
+        cwd: root,
+        env: buildCheckEnv(process.env, home),
+        encoding: "utf8",
+        timeout: 30_000,
+      }).trim();
+      assert.equal(
+        fs.realpathSync(ordinaryStore),
+        fs.realpathSync(path.join(privateStore(home), "v10")),
+        "an ordinary install resolves a different store than the protected one",
+      );
+      const later = ordinaryInstall(root, home);
+      assert.equal(later.status, 0, `a later ordinary non-TTY install failed:\n${later.out}`);
+    });
+  });
+
+  describe("(i) repos that configure their own store or virtual store: owner-accepted outcome", () => {
+    // Owner decision 2026-11-04: pinning the stores is accepted to cost these repos an
+    // ordinary non-TTY `pnpm install` after the worker's protected one (pnpm sees a store
+    // mismatch and refuses to purge node_modules without a TTY). The protected install
+    // itself must succeed, and the documented recovery must work: `CI=true`, or removing
+    // node_modules.
+    const variants: { label: string; fixture: () => FixtureOptions }[] = [
+      {
+        label: "store-dir in .npmrc",
+        fixture: () => ({ npmrc: `registry=http://127.0.0.1:9/\nstore-dir=${path.join(mkdir("own-store"), "s")}\n` }),
+      },
+      {
+        label: "virtual-store-dir in .npmrc, INSIDE the clone",
+        fixture: () => ({ npmrc: "registry=http://127.0.0.1:9/\nvirtual-store-dir=node_modules/.own-virtual-store\n" }),
+      },
+    ];
+    for (const v of variants) {
+      it(`${v.label}: protected install succeeds, a later ordinary non-TTY install aborts with the no-TTY purge error`, async () => {
+        const home = mkHome();
+        const root = mkFixture(v.fixture());
+        assertPnpmResult(await protectedRun(root, home), true);
+        const later = ordinaryInstall(root, home);
+        assert.notEqual(later.status, 0, "the ordinary install unexpectedly succeeded; the accepted outcome changed, re-decide it");
+        assert.ok(later.out.includes(NO_TTY_ABORT), `expected ${NO_TTY_ABORT}, got:\n${later.out}`);
+      });
+      it(`${v.label}: recovery with CI=true succeeds`, async () => {
+        const home = mkHome();
+        const root = mkFixture(v.fixture());
+        assertPnpmResult(await protectedRun(root, home), true);
+        const recovered = ordinaryInstall(root, home, { CI: "true" });
+        assert.equal(recovered.status, 0, `CI=true recovery failed:\n${recovered.out}`);
+        const required = execFileSync(process.execPath, ["-p", 'require("dep")'], { cwd: root, encoding: "utf8" }).trim();
+        assert.equal(required, "dep-installed");
+      });
+      it(`${v.label}: recovery by removing node_modules succeeds`, async () => {
+        const home = mkHome();
+        const root = mkFixture(v.fixture());
+        assertPnpmResult(await protectedRun(root, home), true);
+        fs.rmSync(path.join(root, "node_modules"), { recursive: true, force: true });
+        const recovered = ordinaryInstall(root, home);
+        assert.equal(recovered.status, 0, `node_modules removal recovery failed:\n${recovered.out}`);
+        const required = execFileSync(process.execPath, ["-p", 'require("dep")'], { cwd: root, encoding: "utf8" }).trim();
+        assert.equal(required, "dep-installed");
+      });
+    }
+  });
+
+  describe("(j) private store on a different filesystem than the clone", () => {
+    // pnpm cannot hard-link across filesystems and copies instead; the protected install
+    // must still import the package. This cannot be shown on a single-filesystem machine, so
+    // the case needs a second filesystem: UZI_PNPM_XFS_DIR, else /dev/shm. The release-stage
+    // image proof (UZI_PNPM_IMAGE_PROOF=1) points it at /dev/shm, the tmpfs every build
+    // container has, and sets UZI_PNPM_XFS_REQUIRED=1 so a missing second filesystem FAILS
+    // the build there. Anywhere else it skips with its reason (a laptop with one filesystem).
+    const PKG_NAME = "uzi-xfs-pkg";
+    function writableOtherFs(): { dir: string | null; reason: string } {
+      const clonesDev = fs.statSync(scratchRoot).dev;
+      const tried: string[] = [];
+      for (const cand of [process.env.UZI_PNPM_XFS_DIR, "/dev/shm"]) {
+        if (!cand) continue;
+        try {
+          const dir = fs.mkdtempSync(path.join(cand, "uzi-pnpm-xfs-"));
+          if (fs.statSync(dir).dev === clonesDev) {
+            fs.rmSync(dir, { recursive: true, force: true });
+            tried.push(`${cand} is on the clone's filesystem`);
+            continue;
+          }
+          return { dir, reason: "" };
+        } catch (err) {
+          tried.push(`${cand}: ${(err as Error).message.split("\n")[0]}`);
+        }
+      }
+      return { dir: null, reason: `no writable directory on a second filesystem (${tried.join("; ") || "UZI_PNPM_XFS_DIR unset and /dev/shm unusable"})` };
+    }
+    const xfs = writableOtherFs();
+    const required = process.env.UZI_PNPM_XFS_REQUIRED === "1";
+    const skip = xfs.dir !== null ? false : xfs.reason; // when required, the test above fails loudly
+    after(() => {
+      if (xfs.dir) fs.rmSync(xfs.dir, { recursive: true, force: true });
+    });
+
+    it("the second filesystem is available when the build requires it", { skip: required ? false : "UZI_PNPM_XFS_REQUIRED is not set" }, () => {
+      assert.notEqual(xfs.dir, null, xfs.reason);
+    });
+
+    it("protected install imports a registry package into a store on another filesystem; later ordinary install outcome recorded", { skip }, async (t) => {
+      const archive = tarball([
+        ["package/package.json", JSON.stringify({ name: PKG_NAME, version: "1.0.0" })],
+        ["package/index.js", 'module.exports = "xfs-installed";\n'],
+      ]);
+      const integrity = `sha512-${crypto.createHash("sha512").update(archive).digest("base64")}`;
+      const server = http.createServer((req, res) => {
+        if (req.url === `/${PKG_NAME}/-/${PKG_NAME}-1.0.0.tgz`) {
+          res.setHeader("content-type", "application/octet-stream");
+          res.end(archive);
+        } else {
+          res.statusCode = 404;
+          res.end("{}");
+        }
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;
+        const home = path.join(xfs.dir!, "home");
+        fs.mkdirSync(home, { recursive: true });
+        fs.writeFileSync(path.join(home, ".npmrc"), `registry=${url}\n`);
+        const root = mkFixture({
+          npmrc: `registry=${url}\n`,
+          pkg: { dependencies: { [PKG_NAME]: "1.0.0" } },
+          files: {
+            "pnpm-lock.yaml": `lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      ${PKG_NAME}:
+        specifier: 1.0.0
+        version: 1.0.0
+
+packages:
+
+  ${PKG_NAME}@1.0.0:
+    resolution: {integrity: ${integrity}}
+
+snapshots:
+
+  ${PKG_NAME}@1.0.0: {}
+`,
+          },
+        });
+        assert.notEqual(fs.statSync(root).dev, fs.statSync(home).dev, "clone and per-run HOME must be on different filesystems");
+        const [r] = (await protectedRun(root, home)).results;
+        assert.equal(r!.ok, true, r!.detail);
+        const loaded = execFileSync(process.execPath, ["-p", `require(${JSON.stringify(PKG_NAME)})`], { cwd: root, encoding: "utf8" }).trim();
+        assert.equal(loaded, "xfs-installed");
+        assert.equal(fs.existsSync(path.join(privateStore(home), "v10")), true, "the private store on the other filesystem was not used");
+        // RECORD (do not gate on) what an ordinary install does afterwards: pnpm may pick a
+        // different store for a cross-filesystem HOME and refuse without a TTY. Owner-accepted
+        // either way; anything else is a new behaviour that should be looked at.
+        const later = ordinaryInstall(root, home);
+        const outcome = later.status === 0 ? "succeeded" : later.out.includes(NO_TTY_ABORT) ? `aborted with ${NO_TTY_ABORT}` : "failed some other way";
+        t.diagnostic(`later ordinary non-TTY install across filesystems: ${outcome}`);
+        assert.ok(later.status === 0 || later.out.includes(NO_TTY_ABORT), `unexpected ordinary-install failure:\n${later.out}`);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
   });
 });

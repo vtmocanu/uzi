@@ -817,7 +817,7 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       assert.notEqual(userRunner, -1, `${name}/Dockerfile release stage must drop to the runner uid for its proofs`);
       assert.equal(
         lines[userRunner + 1],
-        "RUN --network=none set -eu; cd /app; UZI_PNPM_IMAGE_PROOF=1 node --import tsx --test --test-timeout=120000 /opt/uzi-src/agent/test/js-deps-pnpm-real.test.ts",
+        "RUN --network=none set -eu; cd /app; UZI_PNPM_IMAGE_PROOF=1 UZI_PNPM_XFS_DIR=/dev/shm UZI_PNPM_XFS_REQUIRED=1 node --import tsx --test --test-timeout=120000 /opt/uzi-src/agent/test/js-deps-pnpm-real.test.ts",
         `${name}/Dockerfile must run the real-pnpm js-deps proof immediately after USER runner, offline, from /app (where tsx resolves)`,
       );
       const goProof = lines.findIndex((l) => /^RUN --network=none set -eu; cd \/opt\/uzi-src; \\$/.test(l));
