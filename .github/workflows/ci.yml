@@ -325,16 +325,18 @@ jobs:
   # combined proofs on the same database, as ADR-1766 requires). This job runs nothing:
   # it turns that single execution's result into this required context. It fails unless
   # the producer's result is exactly `success`, so a failed, cancelled, timed-out or
-  # (when this job runs) skipped producer reddens BOTH contexts. Its `if` is the
-  # producer's, so a component-safe PR skips the pair together and a legitimate
-  # path-filter skip stays a skip. `needs:` names the producer, so renaming or removing
-  # it makes the workflow invalid instead of silently green.
+  # (when this job runs) skipped producer reddens BOTH contexts. Like `test-agent`, it
+  # uses always(): only the audited component-safe PR case in which the producer
+  # itself skipped may skip it, so a cancelled workflow or producer cannot leave it
+  # skipped. `needs:` names the producer, so renaming or removing it makes the workflow
+  # invalid instead of silently green.
   test-api-store-it:
     needs: [changes, test-codex-refresh-lostreply-e2e]
     if: >-
-      !cancelled() &&
+      always() &&
       (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
-      needs.changes.outputs.skip_components != '1')
+      needs.changes.outputs.skip_components != '1' ||
+      needs.test-codex-refresh-lostreply-e2e.result != 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -362,12 +364,11 @@ jobs:
       (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
       needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
-    # One full sweep plus the bridge and proofs. Measured: this job alone took 25m on
-    # main (2026-10-22), 31-33m after #3120, 23-43m on main by 2026-10-30, and 2,600-3,613s
-    # (43-60m) in recent runs, cancelled at the old 60m cap on PR #3888; the separate
-    # store-it job (now merged into this execution) took about 45m. Consolidating removes
-    # that duplicate sweep, so one execution is about 52m, up to about 57m. 75 leaves
-    # headroom over the worst observed 57; a run nearing it is a re-measurement signal.
+    # One full sweep plus the bridge and proofs. Measured history of this job (before
+    # consolidation): 25m on main (2026-10-22), 31-33m after #3120, 23-43m on main by
+    # 2026-10-30, and 2,600-3,613s in recent runs, cancelled at its old 60m cap on PR
+    # #3888. The duration of the consolidated execution is not yet measured; 75 is
+    # headroom over that history, and a run nearing it is a re-measurement signal.
     timeout-minutes: 75
     env:
       # Same engine as docker-compose.yml (scripts/check-postgres-pin-parity.sh gates
@@ -398,13 +399,17 @@ jobs:
         working-directory: agent
         run: npm ci --ignore-scripts
       # --print-ref pulls the pinned digest (mirror first, Docker Hub fallback) and
-      # prints the ref actually pulled; run-store-it.sh finds it locally and skips its
-      # own pull, then starts the throwaway database from exactly that digest.
+      # prints the ref actually pulled. That image is then tagged locally and the step
+      # fails unless the tag resolves, so run-store-it.sh's `docker image inspect` hits
+      # and it never does a raw registry pull without the fallback; the tag points at
+      # exactly the pinned digest.
       - name: Pull the pinned Postgres (mirror first, Docker Hub fallback)
         id: pg
         run: |
           ref=$(./scripts/docker-pull-fallback.sh --print-ref "${UZI_CI_PG_IMAGE#mirror.gcr.io/}")
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          docker tag "$ref" uzi-ci-pg:pinned
+          docker image inspect uzi-ci-pg:pinned > /dev/null
+          echo "ref=uzi-ci-pg:pinned" >> "$GITHUB_OUTPUT"
       - name: LiveDB sweep and combined Codex lost refresh reply proof
         env:
           UZI_STORE_IT_PG_IMAGE: ${{ steps.pg.outputs.ref }}

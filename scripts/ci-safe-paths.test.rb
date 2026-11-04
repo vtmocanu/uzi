@@ -91,7 +91,8 @@ context = {
   'github.event_name' => 'pull_request', 'needs.changes.result' => 'success',
   'needs.changes.outputs.skip_components' => '1',
   'needs.changes.outputs.worker_uid' => 'false', 'needs.validate-agent.result' => 'success',
-  'needs.test-agent-shard.result' => 'skipped', 'needs.test-agent-worker-uid.result' => 'skipped'
+  'needs.test-agent-shard.result' => 'skipped', 'needs.test-agent-worker-uid.result' => 'skipped',
+  'needs.test-codex-refresh-lostreply-e2e.result' => 'skipped'
 }
 run_job = lambda do |job, overrides = {}|
   source = jobs.fetch(job)['if']
@@ -113,7 +114,8 @@ components.each do |job|
     assert.call(run_job.call(job, 'needs.changes.outputs.skip_components' => output), true, "#{job} rejects #{output.inspect}")
   end
   assert.call(run_job.call(job, 'github.event_name' => 'push', 'needs.changes.result' => 'skipped'), true, "main runs #{job}")
-  assert.call(run_job.call(job, 'cancelled' => true), false, "supersession cancels #{job}")
+  # test-api-store-it uses always() (the test-agent pattern) and is asserted below.
+  assert.call(run_job.call(job, 'cancelled' => true), false, "supersession cancels #{job}") unless job == 'test-api-store-it'
 end
 assert.call(jobs.fetch('lint-repo').key?('needs'), false, 'repo gate remains independent')
 assert.call(jobs.fetch('lint-repo').key?('if'), false, 'repo gate remains unconditional')
@@ -184,7 +186,6 @@ assert.call(File.read(File.join(root, 'e2e/run-store-it.sh')).include?('"$ROOT/s
 assert.call(jobs.values.flat_map { |j| j.fetch('steps', []).map { |s| s['run'].to_s } }.grep(/livedb-skip-guard|-run 'LiveDB\$'|run-store-it/), [], 'no workflow step carries a second LiveDB sweep')
 aggregator = jobs.fetch('test-api-store-it')
 assert.call(Array(aggregator['needs']).sort, %w[changes test-codex-refresh-lostreply-e2e], 'store-it context waits for the single execution')
-assert.call(aggregator['if'], producer['if'], 'both contexts share one skip predicate')
 assert.call(producer.fetch('timeout-minutes'), 75, 'producer headroom for one full sweep')
 agg_run = aggregator.fetch('steps').first.fetch('run')
 assert.call(aggregator.fetch('steps').first.fetch('env'), {'PRODUCER_RESULT' => "${{ needs['test-codex-refresh-lostreply-e2e'].result }}"}, 'aggregator reads the producer result')
@@ -192,12 +193,23 @@ assert.call(aggregator.fetch('steps').first.fetch('env'), {'PRODUCER_RESULT' => 
   _, _, status = Open3.capture3({'PRODUCER_RESULT' => result}, 'bash', '-e', '-c', agg_run)
   assert.call(status.success?, ok, "store-it context for producer result #{result.inspect}")
 end
-# Producer failure/cancellation must still run the aggregator (so its context is red,
-# not skipped); a producer skipped with the aggregator running is red via the check above.
-%w[failure cancelled skipped].each do |result|
-  assert.call(run_job.call('test-api-store-it', 'needs.test-codex-refresh-lostreply-e2e.result' => result), false, 'safe PR skips both contexts together')
-  assert.call(run_job.call('test-api-store-it', 'needs.test-codex-refresh-lostreply-e2e.result' => result, 'needs.changes.outputs.skip_components' => '0'), true, "aggregator runs after producer #{result}")
+# Activation fails closed: only the audited component-safe case with a skipped producer
+# may skip the aggregator. Cancellation (evaluator `cancelled` true), a failed, cancelled
+# or missing producer, and unknown classification all run it (and the check above is red).
+store_it = 'test-api-store-it'
+producer_result = 'needs.test-codex-refresh-lostreply-e2e.result'
+assert.call(run_job.call(store_it), false, 'safe PR with skipped producer skips both contexts together')
+%w[failure cancelled success].each do |result|
+  assert.call(run_job.call(store_it, producer_result => result), true, "safe PR still runs aggregator after producer #{result}")
+  assert.call(run_job.call(store_it, producer_result => result, 'needs.changes.outputs.skip_components' => '0'), true, "aggregator runs after producer #{result}")
 end
+assert.call(run_job.call(store_it, producer_result => 'skipped', 'needs.changes.outputs.skip_components' => '0'), true, 'non-safe PR runs aggregator (red) even if producer skipped')
+assert.call(run_job.call(store_it, 'cancelled' => true), false, 'cancelled workflow with a skipped safe producer: nothing to report')
+[['cancelled', true, 'failure'], ['cancelled', true, 'cancelled'], ['cancelled', true, '']].each do |_, cancelled, result|
+  assert.call(run_job.call(store_it, 'cancelled' => cancelled, producer_result => result, 'needs.changes.outputs.skip_components' => '0'), true, "workflow cancellation still runs aggregator (producer #{result.inspect})")
+end
+assert.call(jobs.fetch(store_it)['if'].include?('always()'), true, 'aggregator uses always()')
+assert.call(jobs.fetch(store_it)['if'].include?('cancelled()'), false, 'aggregator never keys skipping on cancelled()')
 brew_workflow = YAML.safe_load(File.read(File.join(root, '.github/workflows/brew.yml')))
 assert.call(brew_workflow['concurrency'], nil, 'publication proof runs without the tap lock')
 brew = brew_workflow.fetch('jobs')
