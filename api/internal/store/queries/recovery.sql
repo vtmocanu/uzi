@@ -157,7 +157,7 @@ WHERE target.id = @id AND target.state = 'open' AND NOT target.inventory_guarded
   AND NOT EXISTS (
       SELECT 1 FROM locked_run r
       WHERE r.status = 'recovery_wait'
-        AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
+        AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
   );
 
 -- name: DiscardCaptureForOwner :one
@@ -280,7 +280,7 @@ WHERE h.state = 'open' AND NOT h.inventory_guarded
   AND NOT EXISTS (SELECT 1 FROM runs r
                     WHERE r.id = h.run_id
                       AND r.status = 'recovery_wait'
-                      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed'))
+                      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed'))
   AND (
       EXISTS (SELECT 1 FROM runs r
                 WHERE r.id = h.run_id
@@ -377,7 +377,7 @@ WHERE run_id = @run_id
   AND live_worker_id = @worker_id::uuid
   AND state = 'open' AND NOT inventory_guarded
   AND NOT EXISTS (SELECT 1 FROM locked_run r WHERE r.status = 'recovery_wait'
-      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed'));
+      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed'));
 
 -- name: GetCustodyHoldForSettle :one
 -- Issue #1582 M1: the exact hold the predecessor-settle endpoint names, scoped to its run so a
@@ -994,7 +994,7 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
       (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL)))
     AND NOT (r.status = 'recovery_wait' AND r.recovery_wait_cause IS NOT NULL
       AND r.recovery_wait_cause IN ('worker_requeue_exhausted',
-      'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')))
+      'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')))
   AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id = @final_capture_id::uuid
     AND c.hold_id = h.id AND c.run_id = h.run_id AND c.user_id = h.user_id
     AND c.original_worker_id = h.original_worker_id AND c.source_sha = @final_source_sha::text
