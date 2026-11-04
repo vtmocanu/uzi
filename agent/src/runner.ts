@@ -7904,10 +7904,7 @@ export class RunRunner {
   }
 
   /** Recheck higher-priority interruptions throughout the terminal-failure policy. */
-  /** `midRunDiskPark` is the mid-run disk park's own capture loop (issue #3916): the disk stop already
-   *  aborted the flight's cancel controller with its PauseNowSignal for good, so that one reason is the
-   *  park's own pause there and is not an interruption. Every other check is unchanged. */
-  private terminalDiskInterruption(flight: RunFlight, midRunDiskPark = false): void {
+  private terminalDiskInterruption(flight: RunFlight): void {
     if (flight.steering.claimFence() !== undefined) {
       // The clears below only drop the session keep. issue #1786: the StaleClaimError (or the claim-fence
       // arm, which a set fence reaches first) re-latches preserveRecoveryClone through
@@ -7929,10 +7926,21 @@ export class RunRunner {
     const pause = flight.steering.getPauseMode();
     if (pause === "now" || pause === "milestone") throw new PauseNowSignal();
     if (flight.cancel.signal.aborted) {
-      const reason: unknown = flight.cancel.signal.reason;
-      if (midRunDiskPark && reason instanceof PauseNowSignal && pause === "disk") return;
-      throw reason;
+      throw flight.cancel.signal.reason;
     }
+  }
+
+  /** The mid-run disk park's final-proof interruption check (issue #3916). The park already ends the
+   *  flight, so an owner pause or wall park stays pending server-side for the resume and the disk stop's
+   *  own PauseNowSignal is not an interruption. A claim fence throws StaleClaimError; a shutdown or a
+   *  cancel returns true so the capture loop's top routes it (retained posture / cancel report). */
+  private midRunDiskProofStopped(flight: RunFlight): boolean {
+    if (flight.steering.claimFence() !== undefined) {
+      flight.preserveRecoveryClone = false;
+      flight.preserveSession = false;
+      throw new StaleClaimError();
+    }
+    return !!(this.shuttingDownGlobal || flight.active?.shuttingDown || flight.steering.isCancelled());
   }
 
   private async deferTerminalExecutionForDisk(
@@ -8005,10 +8013,12 @@ export class RunRunner {
       return !proof.blocked && (flight.executor.safety && !flight.predecessorCapture
         ? true : process.platform === "linux" && proof.outcome.process?.state === "quiescent");
     } catch (error) {
-      this.terminalDiskInterruption(flight, midRunDiskPark);
-      // The mid-run park's own disk-stop pause is not an interruption of its proof: unproven, so the
-      // bounded proof loop retries or fails closed.
-      if (midRunDiskPark && error instanceof PauseNowSignal && flight.steering.getPauseMode() === "disk") return false;
+      if (midRunDiskPark) {
+        // Unproven: the proof loop's mid-run check routes a shutdown or cancel; only a fence throws.
+        this.midRunDiskProofStopped(flight);
+        return false;
+      }
+      this.terminalDiskInterruption(flight);
       if (canonicalRecoveryInterruption(error)) throw error;
       return false;
     }
@@ -21668,8 +21678,8 @@ export class RunRunner {
           blockedCaptures = blockedDetail === undefined ? 0 : blockedCaptures + 1;
           if (opts.terminalDisk) this.terminalDiskInterruption(flight);
           // Issue #3916: a mid-run disk park (counted or preventive) bounds its unverified captures like the
-          // terminal-disk one. Its interruption checks stay below: the disk stop's own PauseNowSignal would
-          // trip terminalDiskInterruption here, so only the bound's proof loop uses the parameterised form.
+          // terminal-disk one. Its proof loop uses midRunDiskProofStopped, never terminalDiskInterruption:
+          // the disk stop's own PauseNowSignal and any pending owner pause are not interruptions of the park.
           if ((opts.terminalDisk || diskBounded()) && !capture && blockedDetail === undefined) unverifiedCaptures++;
           // Cancellation/shutdown may have arrived during local git or publish. Either takes
           // precedence over the blocked bound below: the loop's top routes a shutdown to the
@@ -21711,13 +21721,21 @@ export class RunRunner {
             // Up to four blocked calls can precede each of three nonblocked failures (15 total).
             // Final proof is separately bounded to five calls and performs no capture/git mutation.
             let quiescent = false;
+            let proofStopped = false;
+            const proofInterrupted = (): boolean => {
+              if (midRunDisk) return this.midRunDiskProofStopped(flight);
+              this.terminalDiskInterruption(flight);
+              return false;
+            };
             for (let proof = 0; proof < RECOVERY_CAPTURE_BLOCKED_ATTEMPTS; proof++) {
-              this.terminalDiskInterruption(flight, midRunDisk);
+              if ((proofStopped = proofInterrupted())) break;
               quiescent = await this.terminalDiskQuiescence(flight, opts.heldAuthenticated ?? opts.heldCapture, midRunDisk);
-              this.terminalDiskInterruption(flight, midRunDisk);
+              if ((proofStopped = proofInterrupted())) break;
               if (quiescent) break;
               if (proof + 1 < RECOVERY_CAPTURE_BLOCKED_ATTEMPTS) await retryWait();
             }
+            // Shutdown or cancel (mid-run arm only): the loop top routes it, never another capture.
+            if (proofStopped) continue;
             if (!quiescent) {
               await failCapture(
                 new RunResidueBlockedError("terminal disk capture: final quiescence unproven"), { keepCustody: true });

@@ -349,6 +349,8 @@ describe("RunRunner - issue #3916: a mid-run disk park bounds its unverified cap
     assert.strictEqual(d.failed.length, 1);
     assert.strictEqual(d.failed[0]!.fail_origin, "worker_residue_blocked");
     assert.ok(String(d.failed[0]!.failure_reason).includes("authenticated settlement incomplete"));
+    // No custody observable here: keepCustody is inert for RunResidueBlockedError (reportGenericFailure
+    // forces reaped=false for that error type), so custody retention is not asserted for this bound.
     assert.ok(fs.existsSync(d.clone), "the clone is kept");
   });
 });
@@ -399,7 +401,63 @@ describe("RunRunner - issue #3916: precedence while a disk park retries its capt
     if (!d) return;
     assert.strictEqual(d.outcome, "done");
     assert.deepStrictEqual(d.parks, []);
+    assert.deepStrictEqual(d.failed, [], "a shutdown never reports a failure");
     assert.ok(fs.existsSync(d.clone), "the clone is kept for the requeue");
+  });
+
+  for (const mode of ["milestone", "now", "wall"]) {
+    it(`a preventive park with an owner ${mode} pause pending still ends in the bounded degraded park`, async (t) => {
+      // The park already ends the flight, so the pending owner pause is not an interruption of its proof.
+      const d = await drive(t, {
+        preventive: true,
+        tweak: failFetch,
+        onCapture: (n, flight) => { if (n === 1) flight.steering.route("pause", mode, 991, false, undefined); },
+      });
+      if (!d) return;
+      assert.strictEqual(d.outcome, "done", "execute() resolved instead of rejecting");
+      assert.strictEqual(d.parks.length, 1, "the degraded park was reported");
+      assert.strictEqual(d.parks[0]!.recovery_cause, "data_volume_full");
+      assert.strictEqual(d.parks[0]!.disk_park_preventive, true);
+      assert.deepStrictEqual(d.failed, []);
+      assert.ok(degradedFeed(d), "the degraded notice is on the feed");
+      assert.ok(fs.existsSync(d.clone), "the clone is retained");
+    });
+  }
+
+  const unprovenProof = (during: (flight: Any, runner: Any) => void) => (runner: Any): void => {
+    failFetch(runner);
+    const quiesce = runner.quiesceRun.bind(runner);
+    let first = true;
+    runner.quiesceRun = (flight: Any, executor: unknown, opts: { site: string }) => {
+      if (opts.site !== "terminal_disk:after_runner_git") return quiesce(flight, executor, opts);
+      if (first) { first = false; during(flight, runner); }
+      return Promise.resolve({
+        outcome: { process: { state: "unverified", processes: [], killed: [], detail: "stub: not provable" }, docker: { state: "not_wired", removed: [], detail: "" } },
+        blocked: true,
+      });
+    };
+  };
+
+  it("a worker shutdown during the final proof resolves with no park and no failed report, keeping the clone", async (t) => {
+    let proofs = 0;
+    const d = await drive(t, { tweak: unprovenProof((_f, r) => { proofs++; r.shutdown(); }) });
+    if (!d) return;
+    assert.strictEqual(proofs, 1, "the proof ran once");
+    assert.strictEqual(d.outcome, "done", "execute() resolved instead of rejecting");
+    assert.strictEqual(d.captureCalls(), 3, "no capture reran after the proof");
+    assert.deepStrictEqual(d.parks, []);
+    assert.deepStrictEqual(d.failed, []);
+    assert.ok(fs.existsSync(d.clone), "the clone is kept for the requeue");
+  });
+
+  it("a cancel during the final proof reports cancelled and never parks", async (t) => {
+    const d = await drive(t, { tweak: unprovenProof((flight) => flight.steering.markCancelled()) });
+    if (!d) return;
+    assert.strictEqual(d.outcome, "done");
+    assert.strictEqual(d.captureCalls(), 3, "no capture reran after the proof");
+    assert.deepStrictEqual(d.parks, []);
+    assert.strictEqual(d.failed.length, 1);
+    assert.strictEqual(d.failed[0]!.failure_reason, "run cancelled");
   });
 
   it("a credential switch after the disk stop does not stop the disk park from completing", async (t) => {
