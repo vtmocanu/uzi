@@ -2469,7 +2469,8 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 		}
 		claimGeneration = &generation
 	}
-	// Ownership gate before admission (the WorkerRunHeldPublication HeldPublishGate precedent): a
+	// Ownership gate before admission (WorkerRunHeldPublication gates before its body read and
+	// deadline extension; this route also gates before taking a slot): a
 	// worker naming a run it does not hold takes no slot, extends no deadline and has no body read.
 	// It answers exactly as PublishAttested's not-owned path below. It is a TOCTOU pre-check;
 	// PublishAttested's own ownership and claim-generation checks stay authoritative.

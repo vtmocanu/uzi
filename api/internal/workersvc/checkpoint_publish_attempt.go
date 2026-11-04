@@ -101,11 +101,13 @@ const (
 	PublishContextBudget = livePublishPrePushBudget + pushbroker.MaxPublishDuration + publishContextSlack
 	// publishTailBookkeepingWindows is the number of detached bookkeeping windows (each a fresh
 	// retentionRecordTimeout, retentionBookkeepingCtx) the service bound allows for the request path
-	// after the request context is done. The window that can actually follow the expiry is the
-	// single clearPreparedAttempt in pushOnce, run after recordAttempt fails on the dead context: a
-	// push itself ends by pushbroker.MaxPublishDuration, inside PublishContextBudget, so pushOnce's
-	// readiness mark and publishOutcome's attempt clear are not reached after the context expires.
-	// N=2 is a conservative over-count of that one window, kept as headroom. The windows in
+	// after the request context is done. At most one such window follows the expiry, by mutually
+	// exclusive paths: the clearPreparedAttempt in pushOnce, run after recordAttempt fails on the
+	// dead context; or publishOutcome's attempt clear, when the request-context tip persist and
+	// track writes succeed just before the expiry (a push itself ends by
+	// pushbroker.MaxPublishDuration, inside PublishContextBudget, so pushOnce's readiness mark is
+	// not reached after it). N=2 is a conservative over-count of that one window, kept as headroom.
+	// The windows in
 	// checkpoint_publish_live.go and deferPublishAttempt belong to the sweeper, not this route.
 	publishTailBookkeepingWindows = 2
 	// PublishServiceBound bounds PublishAttested from entry to return. After PublishContextBudget

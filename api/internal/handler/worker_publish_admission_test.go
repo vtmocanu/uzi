@@ -202,6 +202,16 @@ func TestWorkerRunPublishUnownedRunTakesNoSlotAndReadsNoBody(t *testing.T) {
 	stub := &publishStub{}
 	h := newPublishHandler(t, &publishStore{ownedErr: pgx.ErrNoRows}, newBox(t), func(string) bool { return true }, stub.publish)
 	workerID := uuid.New()
+	// Hold the worker's whole share first: a gate that ran after admission would answer 429 busy
+	// instead of the not-owned 404.
+	var share []func()
+	for i := 0; i < 2; i++ {
+		rel, ok := h.wsvc.AcquireCheckpointPublishSlot(workerID)
+		if !ok {
+			t.Fatalf("pre-acquire %d for the worker was refused", i)
+		}
+		share = append(share, rel)
+	}
 	body := &recordingBody{r: strings.NewReader("pack")}
 	for i := 0; i < 8; i++ { // more attempts than the per-worker share and the global cap together
 		runID := uuid.New()
@@ -222,6 +232,9 @@ func TestWorkerRunPublishUnownedRunTakesNoSlotAndReadsNoBody(t *testing.T) {
 	}
 	if n := stub.calls.Load(); n != 0 {
 		t.Fatalf("the publisher ran %d times for an unowned run", n)
+	}
+	for _, rel := range share {
+		rel()
 	}
 	// The worker's full share is still available, and so is the rest of the process-wide cap.
 	var releases []func()
