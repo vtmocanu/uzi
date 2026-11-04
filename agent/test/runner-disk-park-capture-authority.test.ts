@@ -255,9 +255,12 @@ describe("RunRunner - issue #3916: a disk-park capture acquires A despite the ab
     if (!d) return;
     assert.notStrictEqual(d.trackingBeforeStop, d.headBeforeStop, "the tracking ref does not yet cover the clone HEAD");
     assert.strictEqual(d.outcome, "done", "the park completed under the deadline instead of retrying an unverified capture");
-    assert.strictEqual(d.captures.length, 1, "exactly one capture attempt");
+    // Verified, non-degraded and tracking-advanced come first: with the root fix reverted and the bound
+    // kept, the run still parks (degraded), so these are the assertions that must go red.
     assert.strictEqual((d.captures[0] as { verified: boolean }).verified, true, "the capture verified");
     assert.strictEqual(trackingSha(IID), d.headBeforeStop, "the tracking ref equals the pre-stop clone HEAD");
+    assert.strictEqual(degradedFeed(d), false, "the feed carries no degraded capture notice");
+    assert.strictEqual(d.captures.length, 1, "exactly one capture attempt");
     assert.deepStrictEqual(d.warns.filter((w) => w.msg.includes("recovery capture: fetch-back failed")), [], "no fetch-back failure was logged");
     assert.ok(
       !d.warns.some((w) => JSON.stringify(w.fields ?? {}).includes("run paused (now)")),
@@ -266,7 +269,6 @@ describe("RunRunner - issue #3916: a disk-park capture acquires A despite the ab
     assert.strictEqual(d.parks.length, 1, "one park");
     assert.strictEqual(d.parks[0]!.recovery_cause, "data_volume_full");
     assert.strictEqual("disk_park_preventive" in d.parks[0]!, false, "the hard stop is a counted park");
-    assert.strictEqual(degradedFeed(d), false, "the feed carries no degraded capture notice");
     assert.ok(bootstrapSignals.length >= 1, "the capture bootstrapped the remediation restrictions");
     assert.deepStrictEqual(bootstrapSignals.filter((live) => !live), [], "bootstrapRemediationRestrictions gets a live signal");
     assert.ok(publishSignals.length >= 1, "the capture published its checkpoint");
@@ -332,7 +334,9 @@ describe("RunRunner - issue #3916: a mid-run disk park bounds its unverified cap
     assert.ok(fs.existsSync(d.clone), "the clone is kept");
   });
 
-  it("a final quiescence proof that throws a plain error fails worker_residue_blocked and never escapes", async (t) => {
+  // A typed error is a canonical recovery interruption, so this also pins the `held &&` guard: only a
+  // held capture rethrows from the mid-run proof.
+  it("a final quiescence proof that throws a typed error fails worker_residue_blocked and never escapes", async (t) => {
     let proofs = 0;
     const d = await drive(t, {
       tweak: (runner) => {
@@ -341,7 +345,7 @@ describe("RunRunner - issue #3916: a mid-run disk park bounds its unverified cap
         runner.quiesceRun = (flight: unknown, executor: unknown, opts: { site: string }) => {
           if (opts.site !== "terminal_disk:after_runner_git") return quiesce(flight, executor, opts);
           proofs++;
-          return Promise.reject(new Error("stub: proof probe failed"));
+          return Promise.reject(new TypeError("stub: proof probe failed"));
         };
       },
     });

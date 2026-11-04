@@ -8013,8 +8013,8 @@ export class RunRunner {
     } catch (error) {
       if (midRunDiskPark) {
         // Unproven: the proof loop's mid-run check routes a shutdown or cancel; only a fence throws.
-        // A held scope's own interruption (expired scope, aborted signal, refusal) takes the held
-        // region's path, as on the terminal arm; the disk stop's PauseNowSignal is not one.
+        // A held capture rethrows canonical interruptions (its expired scope, aborted signal or refusal
+        // among them) to the held region, as the terminal arm does; the disk stop's PauseNowSignal is not one.
         this.midRunDiskProofStopped(flight);
         if (held && !(error instanceof PauseNowSignal) && canonicalRecoveryInterruption(error)) throw error;
         return false;
