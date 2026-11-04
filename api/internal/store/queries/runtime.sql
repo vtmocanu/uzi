@@ -962,6 +962,27 @@ ORDER BY w.created_at DESC;
 SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id
   AND (kind <> 'cross_check' OR claim_generation > 0);
 
+-- name: GetRunOwnershipByWorker :one
+-- Issue #3860: GetRunOwnedByWorker plus a READ-ONLY signal for the worker's held-seam cancel.
+-- cancellation_requested is true only when the run carries the server-stamped
+-- stop_kind='cancelled' AND at least one cancel input is still deliverable, i.e. unapplied,
+-- not superseded and not covered by a milestone-reconciliation stop_cutoff (the same
+-- deliverability triple as ListReplayRunInputs). The COALESCE is mandatory: a NULL stop_kind
+-- would otherwise make the whole predicate NULL, and the field must be false, never NULL.
+-- Nothing is written, applied or consumed here.
+SELECT sqlc.embed(runs),
+       (COALESCE(runs.stop_kind = 'cancelled', false)
+        AND EXISTS (
+            SELECT 1 FROM run_user_inputs i
+            WHERE i.run_id = runs.id AND i.kind = 'cancel'
+              AND i.applied_at IS NULL AND i.disposition IS DISTINCT FROM 'superseded'
+              AND NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations a
+                              WHERE a.run_id = i.run_id AND i.id <= a.stop_cutoff)
+        ))::boolean AS cancellation_requested
+FROM runs
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0);
+
 -- name: GetRunOrphanIdentity :one
 -- Orphan-classification read (issue #1319): DISTINCT from GetRunOwnedByWorker. Scoped to
 -- the worker's OWNER (user) and the claimant's repo, NOT worker_id, so a terminal owner
@@ -5348,6 +5369,75 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_che
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND runs.id IN (SELECT run_id FROM eligible_candidates);
+
+-- name: CancelRunByWorkerSettlingCancel :one
+-- Issue #3860: CancelRunByWorker plus the settlement of the run's still-unapplied cancel
+-- inputs in the SAME statement, for SetState's stop_kind='cancelled' arm only. A held-seam
+-- cancel report must never leave the run cancelled with its cancel row pending, and the
+-- row must never be applied without the terminal transition: a declined transition (stale
+-- generation, already-terminal run) leaves every input untouched. Follows the precedent
+-- SetRunFailedPlanRejected: the `cancelled` CTE MUST stay in lockstep with CancelRunByWorker
+-- (candidates chain, every SET field and every WHERE guard copied from it). The result counts
+-- TRANSITIONED RUNS (0 or 1), never the settled inputs, so a run whose cancel row an older
+-- worker already APPLIED still reports 1.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
+  AND runs.claim_released_at IS NULL
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+), cancelled AS (
+    UPDATE runs SET
+        plan_cross_check_gate_reason = NULL,
+        status             = 'cancelled',
+        status_since       = now(),
+        fail_origin        = NULL,
+        move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END,
+        finished_at        = now(),
+        -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+        milestones_in_progress = NULL,
+        milestones_agents = NULL,
+        -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+        pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+        credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
+        -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+        health = 'ok', health_reason = NULL, health_since = NULL,
+        updated_at         = now()
+    WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+      AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
+      AND runs.claim_released_at IS NULL
+      AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+      AND runs.id IN (SELECT run_id FROM eligible_candidates)
+    RETURNING runs.id
+),
+settled AS (
+    UPDATE run_user_inputs SET applied_at = now(), consumed_at = COALESCE(consumed_at, now())
+    WHERE run_id IN (SELECT id FROM cancelled) AND kind = 'cancel' AND applied_at IS NULL
+      AND disposition IS DISTINCT FROM 'superseded'
+    RETURNING 1
+)
+SELECT count(*) FROM cancelled;
 
 -- name: SupersedeRunByWorker :execrows
 -- SetState allowlists mr_rework/ci_fix branch_moved reports and composes the bounded

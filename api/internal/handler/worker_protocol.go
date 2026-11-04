@@ -1850,7 +1850,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		h.workerCodeSnapshotCleanup(w, r, wkr, runID)
 		return
 	}
-	status, recoveryRetryNotBefore, claimGeneration, holdReason, claimReleased, gateRevision, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
+	status, recoveryRetryNotBefore, claimGeneration, holdReason, claimReleased, gateRevision, cancellationRequested, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
@@ -1873,7 +1873,11 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded, "hold_reason": holdReason, "claim_released": claimReleased, "gate_revision": gateRevision}
+	// Issue #3860: cancellation_requested is the read-only signal the worker's held-seam
+	// refusal path reads. It is true only for a stop_kind='cancelled' run with a deliverable
+	// cancel input at the run's current claim generation; the worker also checks
+	// claim_released before acting on it. Always present, false when unknown.
+	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded, "hold_reason": holdReason, "claim_released": claimReleased, "gate_revision": gateRevision, "cancellation_requested": cancellationRequested}
 	if recoveryRetryNotBefore != nil || status == "recovery_wait" {
 		body["recovery_retry_not_before"] = recoveryRetryNotBefore
 	}

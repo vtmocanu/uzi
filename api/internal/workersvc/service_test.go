@@ -1705,6 +1705,13 @@ func (f *fakeStore) CancelRunByWorker(_ context.Context, arg store.CancelRunByWo
 	return 1, nil
 }
 
+// CancelRunByWorkerSettlingCancel (issue #3860) is the settling variant SetState's
+// stop_kind='cancelled' arm uses. It records into the same cancelledByWorker slot with the
+// same rows semantics, so the tests that assert the cancelled arm keep their meaning.
+func (f *fakeStore) CancelRunByWorkerSettlingCancel(ctx context.Context, arg store.CancelRunByWorkerSettlingCancelParams) (int64, error) {
+	return f.CancelRunByWorker(ctx, store.CancelRunByWorkerParams(arg))
+}
+
 // SupersedeRunByWorker records a live-worker branch_moved supersession and its
 // server-composed reason. Returns 1 (applied) like the CancelRunByWorker fake.
 func (f *fakeStore) SupersedeRunByWorker(_ context.Context, arg store.SupersedeRunByWorkerParams) (int64, error) {

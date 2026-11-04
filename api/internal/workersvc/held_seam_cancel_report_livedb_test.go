@@ -109,6 +109,10 @@ func TestHeldSeamCancelReportFanOutLiveDB(t *testing.T) {
 			if r.status != "cancelled" || r.failOrigin != "<nil>" || r.stopKind != "cancelled" || r.stopReason != "operator stop" {
 				t.Fatalf("row = %+v, want cancelled / fail_origin NULL / stop_reason preserved", r)
 			}
+			// Issue #3860: the same statement settled the cancel row.
+			if total, unapplied := heldSeamCancelInputs(t, env, id); total != 1 || unapplied != 0 {
+				t.Fatalf("cancel inputs total/unapplied after the report = %d/%d, want 1/0", total, unapplied)
+			}
 			if len(lc.notes) != 1 || lc.notes[0].runID != id || lc.notes[0].status != "cancelled" {
 				t.Fatalf("lifecycle notes = %+v, want exactly one cancelled for the run", lc.notes)
 			}
@@ -155,6 +159,10 @@ func TestHeldSeamCancelReportStaleGenerationLiveDB(t *testing.T) {
 	if tot, un := heldSeamCancelInputs(t, env, id); tot != inTotal || un != inUnapplied {
 		t.Fatalf("stale report changed cancel inputs: %d/%d -> %d/%d", inTotal, inUnapplied, tot, un)
 	}
+	// Issue #3860: a refused stale report must leave the cancel row pending.
+	if inTotal != 1 || inUnapplied != 1 {
+		t.Fatalf("cancel inputs before the stale report total/unapplied = %d/%d, want 1/1", inTotal, inUnapplied)
+	}
 
 	run, applied, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "failed", ClaimGeneration: i64Ptr(g)})
 	if err != nil || !applied || run.Status != "cancelled" {
@@ -162,6 +170,10 @@ func TestHeldSeamCancelReportStaleGenerationLiveDB(t *testing.T) {
 	}
 	if r := heldSeamRead(t, env, id); r.failOrigin != "<nil>" || r.stopReason != "stale-gen stop" {
 		t.Fatalf("row after the G report = %+v, want fail_origin NULL and stop_reason preserved", r)
+	}
+	// Issue #3860: the applied G report settled the cancel row atomically with the transition.
+	if tot, un := heldSeamCancelInputs(t, env, id); tot != 1 || un != 0 {
+		t.Fatalf("cancel inputs after the G report total/unapplied = %d/%d, want 1/0", tot, un)
 	}
 }
 
