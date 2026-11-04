@@ -20999,15 +20999,24 @@ export class RunRunner {
 
   /**
    * #1197, verified 2026-09-08: keep the execution and steering poller active
-   * while retrying local capture, and report a promotable recovery_wait ONLY
-   * after current HEAD is verified in the worker-owned tracking ref. A failed
-   * park report is retried too: live worker heartbeats preclude stale requeue.
+   * while retrying local capture, and report a promotable recovery_wait after
+   * current HEAD is verified in the worker-owned tracking ref (the disk arm below
+   * is the one exception). A failed park report is retried too: live worker
+   * heartbeats preclude stale requeue.
    *
    * issue #1783 M3: the capture retry is BOUNDED for noncredential causes, including transient and disk parks. A capture skipped because its
    * quiescence proof blocked does not clear by waiting, so after
    * RECOVERY_CAPTURE_BLOCKED_ATTEMPTS consecutive blocked proofs the run fails with fail_origin
-   * `worker_residue_blocked` (the clone and session kept). Other unverified captures (a failed WIP
-   * commit, fetch-back or verify) still retry until an exit below.
+   * `worker_residue_blocked` (the clone and session kept). Outside a disk park, other unverified
+   * captures (a failed WIP commit, fetch-back or verify) still retry until an exit below.
+   *
+   * Issue #3916: a disk-cause park (terminal-disk, counted or preventive, not credential-deferred)
+   * also bounds those: after COMPLETION_HOLD_CAPTURE_ATTEMPTS nonblocked unverified captures it runs
+   * a separate, bounded quiescence proof that performs no capture or git mutation. An unproven proof
+   * fails with `worker_residue_blocked`, custody kept; a mid-run shutdown or cancel returns to the
+   * loop top. A proven proof parks degraded: the original clone, journal and session stay on this
+   * worker as local retention only, never reported as verified, published or the latest checkpoint,
+   * and captures do not restart after it.
    *
    * The worker-owned clone journal fences destructive reseeding after restart.
    * Shutdown retains an unverified clone and its session; cancellation and a
