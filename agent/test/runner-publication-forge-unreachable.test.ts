@@ -42,12 +42,12 @@ type Seam = { runGit(cwd: string, args: string[], ...rest: unknown[]): Promise<s
 type ExecSeam = { execScoped(cmd: string, args: string[], ...rest: unknown[]): Promise<unknown> };
 
 /** Fail one git subcommand at the process boundary with the given stderr, so runGit retains it as it does live. */
-function failGit(sub: string, stderr: string, onHit: () => void): void {
+function failGit(sub: string, stderr: string, onHit: (args: string[]) => void): void {
   const seam = git as unknown as ExecSeam;
   const real = seam.execScoped.bind(git);
   seam.execScoped = async (cmd, args, ...rest) => {
     if (cmd === "git" && args.includes(sub)) {
-      onHit();
+      onHit(args);
       throw Object.assign(new Error(`Command failed: git ${args.join(" ")}`), { code: 128, stderr });
     }
     return real(cmd, args, ...rest);
@@ -261,6 +261,133 @@ it("a permanent MR create rejection (401) is not retried and not typed", async t
 // GitHub claim whose workflows moved ahead during the turn: the finalize base-align overlay path pushes
 // through the same pushToOrigin. The typed error must cross every inner align catch unchanged and reach
 // the single hook exactly once.
+// #3929: GitHub's bare `(failed)` remote rejection (no stated reason) is a transient ref-update hiccup and
+// retries on the schedule; every rejection that states a reason keeps failing fast. The controls below
+// must behave identically before and after the change.
+const FAKE_SHA = "0123456789abcdef0123456789abcdef01234567";
+const bareStatus = (branch: string, reason = "failed") => ` ! [remote rejected] ${FAKE_SHA} -> ${branch} (${reason})\n`;
+const framed = (_branch: string, status: string, remote = "") =>
+  `To https://github.com/org/repo.git\n${status}${remote}error: failed to push some refs to 'https://github.com/org/repo.git'\n`;
+
+/** Record each push's argv, then fail it with `stderr`; `failFirstOnly` lets later pushes through to the real git. */
+function recordPushes(stderr: string, opts: { performRealPush?: boolean; failFirstOnly?: boolean } = {}): string[][] {
+  const argvs: string[][] = [];
+  const seam = git as unknown as ExecSeam;
+  const real = seam.execScoped.bind(git);
+  seam.execScoped = async (cmd, args, ...rest) => {
+    if (cmd === "git" && args.includes("push")) {
+      argvs.push([...args]);
+      if (!opts.failFirstOnly || argvs.length === 1) {
+        if (opts.performRealPush) await real(cmd, args, ...rest);
+        throw Object.assign(new Error(`Command failed: git ${args.join(" ")}`), { code: 128, stderr });
+      }
+    }
+    return real(cmd, args, ...rest);
+  };
+  return argvs;
+}
+
+const refspecOf = (argv: string[]) => argv.find(a => /^[0-9a-f]{40}:refs\/heads\//.test(a));
+
+function assertIdenticalNonForcedPushes(argvs: string[][], branch: string): void {
+  const specs = argvs.map(refspecOf);
+  assert.ok(specs[0], "a push carried a sha:refs/heads/<branch> refspec");
+  assert.match(specs[0]!, new RegExp(`^[0-9a-f]{40}:refs/heads/${branch}$`));
+  assert.ok(specs.every(s => s === specs[0]), "every attempt pushed the identical candidate refspec");
+  assert.ok(argvs.every(a => a.every(arg => !arg.startsWith("--force") && arg !== "-f" && !arg.startsWith("+"))), "no force flags or forced refspec");
+}
+
+const completed = (runId: string) => api.states.some(s => s.runId === runId && s.body.status === "completed");
+
+it("a bare (failed) push rejection on the plain arm retries the whole schedule and is typed git/push", async t => {
+  const claim = gitlabClaim(4301);
+  const branch = "agent/issue-4301";
+  const argvs = recordPushes(framed(branch, bareStatus(branch)));
+  const preflights = countPreflights();
+  const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
+  instantRetries(r);
+  const seen = hookRecorder(t, r);
+  await r.execute(claim);
+  assert.equal(argvs.length, ATTEMPTS);
+  assertIdenticalNonForcedPushes(argvs, branch);
+  assert.equal(preflights(), ATTEMPTS + 1, "one frozen-candidate preflight plus one per pushBranch attempt");
+  assert.deepEqual(seen.map(s => [s.surface, s.step]), [["git", "push"]]);
+  assert.match(failedReason(claim.run_id), /publication_forge_unreachable: push/);
+});
+
+it("a bare (failed) push rejection on branch agent/issue-404 is still retried (plain arm)", async t => {
+  const claim = gitlabClaim(404);
+  const branch = "agent/issue-404";
+  const argvs = recordPushes(framed(branch, bareStatus(branch)));
+  const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
+  instantRetries(r);
+  const seen = hookRecorder(t, r);
+  await r.execute(claim);
+  assert.equal(argvs.length, ATTEMPTS);
+  assertIdenticalNonForcedPushes(argvs, branch);
+  assert.deepEqual(seen.map(s => [s.surface, s.step]), [["git", "push"]]);
+  assert.match(failedReason(claim.run_id), /publication_forge_unreachable: push/);
+});
+
+it("one bare (failed) push rejection followed by a real push completes the run", async t => {
+  const claim = gitlabClaim(4302);
+  const branch = "agent/issue-4302";
+  const argvs = recordPushes(framed(branch, bareStatus(branch)), { failFirstOnly: true });
+  const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
+  instantRetries(r);
+  const seen = hookRecorder(t, r);
+  await r.execute(claim);
+  assert.equal(argvs.length, 2);
+  assertIdenticalNonForcedPushes(argvs, branch);
+  assert.equal(seen.length, 0);
+  assert.ok(completed(claim.run_id), "the retry published and the run completed");
+});
+
+it("a (failed) rejection thrown AFTER the push really landed is recognised on retry and the run completes", async t => {
+  const claim = gitlabClaim(4303);
+  const branch = "agent/issue-4303";
+  const argvs = recordPushes(framed(branch, bareStatus(branch)), { performRealPush: true, failFirstOnly: true });
+  const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
+  instantRetries(r);
+  const seen = hookRecorder(t, r);
+  await r.execute(claim);
+  assert.equal(argvs.length, 2);
+  assertIdenticalNonForcedPushes(argvs, branch);
+  assert.equal(seen.length, 0);
+  assert.ok(completed(claim.run_id), "remote already at the candidate; the retry is accepted");
+});
+
+const PERMANENT_CONTROLS: Array<[string, (b: string) => string, string?]> = [
+  ["protected branch hook declined", b => framed(b, bareStatus(b, "protected branch hook declined"))],
+  ["pre-receive hook declined", b => framed(b, bareStatus(b, "pre-receive hook declined"))],
+  ["failed to update ref", b => framed(b, bareStatus(b, "failed to update ref"))],
+  ["repository rule violations with GH013 remote lines", b => framed(b, bareStatus(b, "push declined due to repository rule violations"),
+    "remote: error: GH013: Repository rule violations found for refs/heads/" + b + ".\nremote: \n"), "push_secret_blocked"],
+  ["bare (failed) plus GH006 remote error", b => framed(b, bareStatus(b), `remote: error: GH006: Protected branch update failed for refs/heads/${b}.\n`)],
+  ["bare (failed) plus GH001 remote error", b => framed(b, bareStatus(b), "remote: error: GH001: Large files detected.\n")],
+  ["bare (failed) mixed with a hook-declined status line", b => framed(b, bareStatus(b) + bareStatus(b + "-2", "pre-receive hook declined"))],
+];
+
+PERMANENT_CONTROLS.forEach(([name, build, failOrigin], i) => {
+  it(`control: ${name} is pushed exactly once and is not typed publication_forge_unreachable`, async t => {
+    const iid = 4310 + i;
+    const claim = gitlabClaim(iid);
+    const branch = `agent/issue-${iid}`;
+    const argvs = recordPushes(build(branch));
+    const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
+    instantRetries(r);
+    const seen = hookRecorder(t, r);
+    await r.execute(claim);
+    assert.equal(argvs.length, 1);
+    assertIdenticalNonForcedPushes(argvs, branch);
+    assert.equal(seen.length, 0);
+    assert.doesNotMatch(failedReason(claim.run_id), /publication_forge_unreachable/);
+    if (failOrigin) {
+      assert.equal(api.states.find(s => s.runId === claim.run_id && s.body.status === "failed")?.body.fail_origin, failOrigin);
+    }
+  });
+});
+
 const CI_V1 = "name: ci\non: [push]\njobs: {}\n";
 const CI_V2 = "name: ci\non: [pull_request]\njobs: {}\n";
 const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
@@ -275,6 +402,62 @@ function commitToOriginMain(files: Record<string, string>, msg: string): void {
   gitIn(fx.originPath, ["add", "."]);
   gitIn(fx.originPath, [...IDENT, "commit", "-m", msg]);
 }
+
+/** GitHub claim whose workflows moved ahead during the turn, so finalize takes the base-align overlay arm. */
+function githubOverlayRunner(iid: number): { claim: ReturnType<typeof gitlabClaim>; r: RunRunner; strategies: string[] } {
+  commitToOriginMain({ ".github/workflows/ci.yml": CI_V1 }, "seed workflows");
+  const claim = gitlabClaim(iid, {
+    repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
+  });
+  const executor: Executor = {
+    run: async (ctx: RunContext): Promise<ExecutorResult> => {
+      fs.writeFileSync(path.join(ctx.worktreePath, "impl.ts"), "task content\n");
+      execFileSync("git", ["-C", ctx.worktreePath, "add", "."], { env: ENV });
+      execFileSync("git", ["-C", ctx.worktreePath, ...IDENT, "commit", "-m", "agent work"], { env: ENV });
+      commitToOriginMain({ ".github/workflows/ci.yml": CI_V2 }, "main advances");
+      return { branch: ctx.branch };
+    },
+  };
+  const strategies: string[] = [];
+  const orig = git.alignBranchWithDefault.bind(git);
+  git.alignBranchWithDefault = (async (...args: Parameters<typeof git.alignBranchWithDefault>) => {
+    strategies.push(args[4]);
+    return orig(...args);
+  }) as typeof git.alignBranchWithDefault;
+  const r = new RunRunner(client, git, () => ({ executor }), nullLogger(), 20, undefined,
+    { pollMs: 5, planApprovalTimeoutMs: 0, github: fakeGitHub().github });
+  instantRetries(r);
+  return { claim, r, strategies };
+}
+
+it("a bare (failed) push rejection on the GitHub overlay arm retries the overlay candidate and is typed git/push", async t => {
+  const { claim, r, strategies } = githubOverlayRunner(4304);
+  const branch = "agent/issue-4304";
+  const argvs = recordPushes(framed(branch, bareStatus(branch)));
+  const preflights = countPreflights();
+  const seen = hookRecorder(t, r);
+  await r.execute(claim);
+  assert.equal(argvs.length, ATTEMPTS, "the overlay push was the one retried publication hop");
+  assertIdenticalNonForcedPushes(argvs, branch);
+  assert.ok(preflights() >= ATTEMPTS, "the proof reran per attempt");
+  assert.deepEqual(seen.map(s => [s.surface, s.step]), [["git", "push"]]);
+  assert.match(failedReason(claim.run_id), /publication_forge_unreachable: push/);
+  assert.ok(!strategies.includes("merge") && !strategies.includes("rebase"), `no merge/rebase fallback: ${strategies.join(",")}`);
+});
+
+it("control: a workflow-scope push rejection on the overlay arm is not retried at the overlay candidate", async t => {
+  const { claim, r } = githubOverlayRunner(4305);
+  const branch = "agent/issue-4305";
+  const reason = "refusing to allow a Personal Access Token to create or update workflow `.github/workflows/ci.yml` without `workflow` scope";
+  const argvs = recordPushes(framed(branch, bareStatus(branch, reason)));
+  const seen = hookRecorder(t, r);
+  await r.execute(claim);
+  const first = refspecOf(argvs[0]!);
+  assert.equal(argvs.filter(a => refspecOf(a) === first).length, 1, "the overlay candidate was pushed once");
+  assert.ok(argvs.every(a => a.every(arg => !arg.startsWith("--force") && arg !== "-f" && !arg.startsWith("+"))));
+  assert.equal(seen.length, 0);
+  assert.doesNotMatch(failedReason(claim.run_id), /publication_forge_unreachable/);
+});
 
 it("a GitHub align-path push outage invokes the hook once and surfaces the typed error", async t => {
   commitToOriginMain({ ".github/workflows/ci.yml": CI_V1 }, "seed workflows");

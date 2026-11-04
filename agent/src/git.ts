@@ -28,7 +28,7 @@ import { validateCaptureGitRequest } from "./credential-free-capture.js";
 import { RUNNER_UID, WORKER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
-import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
+import { classifyForgeError, matchesPermanentForgePattern, withForgeRetry } from "./forge-retry.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import {
   ATTEMPT_ID_RE,
@@ -482,7 +482,50 @@ export function annotateRetainedSuccessorError<T>(error: T, reason: string): T {
 export function classifyGitStderr(error: unknown): "transient" | "permanent" {
   const retained = error instanceof Error ? retainedGitDiagnostics.get(error) : undefined;
   const stderr = retained?.stderr.trim();
-  return stderr ? classifyForgeError(new Error(stderr)) : "permanent";
+  return stderr ? classifyGitStderrText(stderr) : "permanent";
+}
+
+const BARE_REMOTE_REJECTED_FAILED = /^\s*!\s+\[remote rejected\]\s+\S+\s+->\s+\S+\s+\(failed\)\s*$/;
+const PUSH_FRAMING_LINES: RegExp[] = [
+  /^To \S+\s*$/,
+  BARE_REMOTE_REJECTED_FAILED,
+  /^error: failed to push some refs to '[^']*'\s*$/,
+  /^remote:\s*$/,
+  /^\s*$/,
+];
+
+/**
+ * Classify push stderr text (#3929, ADR-0284 amendment). GitHub reports a transient server-side
+ * ref-update hiccup as a bare ` ! [remote rejected] <sha> -> <branch> (failed)` with no stated reason,
+ * which the permanent `remote rejected` pattern would otherwise fail fast. That exact shape is
+ * transient only when it is the SOLE rejection and nothing else in the text states a reason: any other
+ * `remote rejected` line, any `[rejected]` line, a pattern hit in the text left after dropping the
+ * whole framing lines (`To <url>`, the bare status line, `error: failed to push some refs`, empty
+ * `remote:`), a `remote: error|fatal:` line, or a `GHnnn` token keeps today's classification. Framing
+ * lines carry the branch and URL, so they are removed whole before matching (`agent/issue-404` must
+ * not decide); nothing inside any other line is masked.
+ */
+export function classifyGitStderrText(stderr: string): "transient" | "permanent" {
+  if (!stderr.trim()) return "permanent";
+  const lines = stderr.split(/\r?\n|\r/);
+  const remoteRejected = lines.filter((l) => /remote rejected/i.test(l));
+  if (
+    remoteRejected.length > 0 &&
+    remoteRejected.every((l) => BARE_REMOTE_REJECTED_FAILED.test(l)) &&
+    !lines.some((l) => /\[rejected\]/i.test(l))
+  ) {
+    const rest = lines.filter((l) => !PUSH_FRAMING_LINES.some((re) => re.test(l))).join("\n");
+    if (
+      !matchesPermanentForgePattern(rest) &&
+      !isPushProtectionRejection(rest) &&
+      !isWorkflowScopeRejection(rest) &&
+      !/^remote:\s*(error|fatal):/im.test(rest) &&
+      !/\bGH\d{3}\b/.test(rest)
+    ) {
+      return "transient";
+    }
+  }
+  return classifyForgeError(new Error(stderr));
 }
 
 const RETAINED_DIAGNOSTIC_INPUT_MAX = 64 * 1024;
