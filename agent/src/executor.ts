@@ -195,6 +195,10 @@ export interface RunContext {
   leadConfig?: import("./lead-config-report.js").LeadConfigReporter;
   /** Negotiated before execution/capture; remains binding if registration features shrink. */
   codexIdleStallRecovery?: boolean;
+  /** Policy-held (preserve-only) claim: every root lead turn may continue its saved session but must
+   *  never start or fall back to a fresh conversation (carried to RunTurnRequest.preserveConversation).
+   *  Absent means false, the unconstrained behaviour. */
+  preserveConversation?: boolean;
   /** Claim support assertion; absent means false. The runner separately gates root and phase. */
   parkRunSupported?: boolean;
   /** Request a park and await its authoritative outcome or a racing owner answer. */

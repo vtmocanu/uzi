@@ -8,7 +8,10 @@ import { prepareFrozenHeld, type FrozenHeldPolicy } from "./frozen-held.js";
 import { interruptedSnapshot, prepareInterruptedCalls } from "./interrupted-calls.js";
 import { CodeCrossCheckGate, persistedCodeCrossCheckSummary } from "./code-cross-check-gate.js";
 import { readRepoInstructionsAtCommit } from "./repo-instructions-at-commit.js";
-import { ProviderPolicyRefusal, policyRefusalMessage, validatePolicyRefusal } from "./provider-policy-refusal.js";
+import {
+  PolicyContinuationRejected, ProviderPolicyRefusal, policyRefusalMessage, validatePolicyRefusal,
+  type PolicyContinuationCause,
+} from "./provider-policy-refusal.js";
 import { isParkAnswer } from "./park-run.js";
 import { TrustedExecutionRefusal, legacyTrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { AsyncResource } from "node:async_hooks";
@@ -345,6 +348,9 @@ const QUEUED_DUPLICATE_END_LOG = "queued duplicate claim ended without executing
  *  Ordinary callers clear preserve flags and return false on capture exhaustion. Prepush refusals
  *  instead request an empty-head hold while retaining the live clone and session. */
 const COMPLETION_HOLD_CAPTURE_ATTEMPTS = 3;
+/** Total attempts (and linear backoff base) for the policy recovery-verified record before a model turn. */
+const POLICY_VERIFY_ATTEMPTS = 3;
+const POLICY_VERIFY_BACKOFF_MS = 250;
 
 /** PRD #1247 M5b (D3): bounded in-call attempts to capture a VERIFIED restore point before a
  *  held-state credential-switch RELEASE. Mirrors COMPLETION_HOLD_CAPTURE_ATTEMPTS — the same
@@ -2341,6 +2347,38 @@ type MemoryFlight = {
   authorityLost?: Set<(stop: Error) => void>;
 };
 
+/**
+ * Per-writer attribution for the three retention booleans (preserveRecoveryClone, preserveSession,
+ * keepGuardedInventoryOpen). Every existing writer assigns the flight property, which is the "flight"
+ * writer; the pending-policy admission is a second, independent writer. A flag reads true while any
+ * writer holds it, so releasing the admission after a successful reconciliation clears only what the
+ * admission itself added: retained recovery, capture seeding and the retainedEpisode/predecessorCapture
+ * vetoes keep theirs.
+ */
+class RetentionFlag {
+  private byFlight = false;
+  private byAdmission = false;
+  get value(): boolean { return this.byFlight || this.byAdmission; }
+  setFlight(on: boolean): void { this.byFlight = on; }
+  setAdmission(on: boolean): void { this.byAdmission = on; }
+}
+class FlightRetention {
+  readonly recoveryClone = new RetentionFlag();
+  readonly session = new RetentionFlag();
+  readonly guardedInventoryOpen = new RetentionFlag();
+  holdForPolicyAdmission(): void {
+    for (const flag of [this.recoveryClone, this.session, this.guardedInventoryOpen]) flag.setAdmission(true);
+  }
+  releasePolicyAdmission(): void {
+    for (const flag of [this.recoveryClone, this.session, this.guardedInventoryOpen]) flag.setAdmission(false);
+  }
+}
+
+/** What selected a policy hold. `capture` is false for a re-hold decided before any model work. */
+type PolicyHoldTrigger =
+  | { readonly kind: "refused"; readonly error: ProviderPolicyRefusal }
+  | { readonly kind: "resume_rejected"; readonly cause: PolicyContinuationCause; readonly capture: boolean };
+
 /** Private execution provenance only; never claim input or maintenance authority. */
 type TerminalSource = Readonly<{
   executor: Executor; safety: CodexExecutionSafety; runId: string; generation: number;
@@ -2370,6 +2408,8 @@ type SourceGenesis = Readonly<{
 type ClaimCheckpointEvidence = Readonly<{ tip?: string; attestedSource?: string; writeUnresolved?: boolean }>;
 
 interface RunFlight {
+  /** Per-writer attribution behind preserveRecoveryClone, preserveSession and keepGuardedInventoryOpen. */
+  readonly retention: FlightRetention;
   registrationToken?: symbol;
   /** Irrevocable local selection, independent of delivery ACK or source cleanup proof. */
   policyHold?: { readonly outcomeId: string; body?: Readonly<import("./protocol.js").PolicyHoldRequest> };
@@ -5172,9 +5212,7 @@ export class RunRunner {
     if (admission) {
       flight.policyAdmission = true;
       flight.policyHold = { outcomeId: admission.outcome_id, body: admission };
-      flight.preserveRecoveryClone = true;
-      flight.preserveSession = true;
-      flight.keepGuardedInventoryOpen = true;
+      flight.retention.holdForPolicyAdmission();
     }
     onFlight(flight);
     const { runLog, batcher, reportState, steering } = flight;
@@ -6041,7 +6079,21 @@ export class RunRunner {
         }
         if (this.policyHoldEligible(claim, flight, err)) {
           flight.sourceDispatchDenied = priorSourceExitDenied;
-          await this.enterPolicyHold(claim, flight, err as ProviderPolicyRefusal);
+          await this.enterPolicyHold(claim, flight, err instanceof PolicyContinuationRejected
+            ? { kind: "resume_rejected", cause: err.cause, capture: !err.beforeModelWork }
+            : { kind: "refused", error: err as ProviderPolicyRefusal });
+          return;
+        }
+        if (err instanceof PolicyContinuationRejected && !flight.steering.isCancelled()) {
+          // A rejected continuation is never a terminal failure and never a fresh conversation. Without a
+          // hold that can be reported now (shutdown, a fenced claim, a pending outcome) leave the run
+          // non-terminal with its clone and session retained; Cancel keeps its ordinary arm below.
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+          flight.keepGuardedInventoryOpen = true;
+          runLog.warn("policy continuation rejected but no hold can be reported; leaving the run non-terminal", {
+            cause: err.cause });
+          await batcher.close().catch(() => undefined);
           return;
         }
         if (allowDiskDeferral && executionRejection.rejected && Object.is(executionRejection.value, err)
@@ -6976,7 +7028,8 @@ export class RunRunner {
   }
 
   private policyHoldEligible(claim: ClaimResponse, flight: RunFlight, error: unknown): boolean {
-    if (!(error instanceof ProviderPolicyRefusal) || !this.outbox || !this.snapshotRegistry || !flight.policyReservation ||
+    const rejected = error instanceof PolicyContinuationRejected;
+    if ((!rejected && !(error instanceof ProviderPolicyRefusal)) || !this.outbox || !this.snapshotRegistry || !flight.policyReservation ||
         !flight.initiallyCodex || claim.interactive === true ||
         !["issue", "task", "prompt", "self_improve"].includes(flight.runKind) ||
         !Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration <= 0 ||
@@ -6984,16 +7037,24 @@ export class RunRunner {
         this.outbox.hasPendingTerminal(flight.runId, flight.claimGeneration) ||
         flight.steering.claimFence() !== undefined || flight.steering.isCancelled() ||
         flight.cancel.signal.aborted || flight.steering.terminalLifecycleSignal().aborted ||
-        flight.steering.lifecycleSignal().aborted || flight.active?.shuttingDown || this.shuttingDownGlobal ||
-        flight.steering.getPauseMode() !== null) return false;
-    const refusal = validatePolicyRefusal(error.policyRefusal);
+        flight.active?.shuttingDown || this.shuttingDownGlobal) return false;
+    if (rejected) {
+      // A pending owner pause keeps the hold (it never turns the rejection into a terminal failure);
+      // Cancel, a fenced claim and shutdown were refused above. Any other lifecycle stop is not ours.
+      const lifecycle = flight.steering.lifecycleSignal();
+      return !lifecycle.aborted || lifecycle.reason instanceof PauseNowSignal;
+    }
+    if (flight.steering.lifecycleSignal().aborted || flight.steering.getPauseMode() !== null) return false;
+    const refusal = validatePolicyRefusal((error as ProviderPolicyRefusal).policyRefusal);
     return refusal?.origin === "root" &&
       (refusal.phase === "implementation" || flight.initialPlanningEligible === true);
   }
 
-  /** This producer selects once. Delivery and source retention have independent lifetimes. */
-  private async enterPolicyHold(claim: ClaimResponse, flight: RunFlight, error: ProviderPolicyRefusal): Promise<void> {
-    const refusal = validatePolicyRefusal(error.policyRefusal)!;
+  /** This producer selects once. Delivery and source retention have independent lifetimes.
+   *  `refused` reports the validated provider refusal; `resume_rejected` re-holds a preserve-only claim
+   *  that could not continue its conversation and carries no refusal metadata. */
+  private async enterPolicyHold(claim: ClaimResponse, flight: RunFlight, trigger: PolicyHoldTrigger): Promise<void> {
+    const refusal = trigger.kind === "refused" ? validatePolicyRefusal(trigger.error.policyRefusal)! : undefined;
     const outcomeId = randomUUID();
     if (!flight.policyReservation || !this.outbox?.selectPolicyFlight(flight.policyReservation, outcomeId)) return;
     const selected = flight.policyHold = { outcomeId } as NonNullable<RunFlight["policyHold"]>;
@@ -7017,44 +7078,59 @@ export class RunRunner {
         if (result.verified || result.residueBlocked) return result;
       }
     };
-    try {
-      // No new sender can enter after selection. Join the actual outstanding HTTP
-      // requests before the policy report so their earlier informational states finish first.
+    // A re-hold decided before any model work of this claim has nothing new to capture: the saved
+    // work is whatever the claim's clone seeded, and publishing that snapshot could stand in for the
+    // held work. It reports no head and keeps the exact source, session and custody.
+    const capturing = trigger.kind === "refused" || trigger.capture;
+    if (!capturing) {
+      flight.runLog.info("policy re-hold before model work; capture skipped and source retained", {
+        cause: trigger.kind === "resume_rejected" ? trigger.cause : undefined });
       await Promise.allSettled(flight.stateSenders ?? []);
-      const result = await this.runCaptureRegion(claim, flight, episode,
-        async held => {
-          const quiescence = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "completion_hold" });
-          if (quiescence.blocked) throw new RunResidueBlockedError("policy capture process proof unavailable");
-          // Three attempts total across primary and fallback, sharing this episode's
-          // original deadlines and signals. An exception leaves capture to the boundary owner.
-          return capture({ episode, heldAuthenticated: held });
-        },
-        held => {
-          usedFreeCapture = true;
-          return capture({ episode, heldCapture: held, publishCheckpoint: false });
-        });
-      this.validateJoinedCapture(flight, episode);
-      const local = this.captureProgressFor(flight, episode).local;
-      captured = usedFreeCapture ? result : local?.kind === "hold" ? local.result : undefined;
-    } catch (captureError) {
-      flight.runLog.warn("policy capture unavailable", { error: errMessage(captureError) });
-      // A failed/unknown boundary never supplies a verified head. The exact source,
-      // HOME, session and custody stay retained even when delivery later succeeds.
-      captured = undefined;
       this.retainCaptureSource(flight);
-      interrupted = flight.steering.claimFence() !== undefined || flight.steering.isCancelled() ||
-        flight.cancel.signal.aborted || flight.steering.terminalLifecycleSignal().aborted ||
-        flight.active?.shuttingDown === true || this.shuttingDownGlobal;
+    } else {
+      try {
+        // No new sender can enter after selection. Join the actual outstanding HTTP
+        // requests before the policy report so their earlier informational states finish first.
+        await Promise.allSettled(flight.stateSenders ?? []);
+        const result = await this.runCaptureRegion(claim, flight, episode,
+          async held => {
+            const quiescence = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "completion_hold" });
+            if (quiescence.blocked) throw new RunResidueBlockedError("policy capture process proof unavailable");
+            // Three attempts total across primary and fallback, sharing this episode's
+            // original deadlines and signals. An exception leaves capture to the boundary owner.
+            return capture({ episode, heldAuthenticated: held });
+          },
+          held => {
+            usedFreeCapture = true;
+            return capture({ episode, heldCapture: held, publishCheckpoint: false });
+          });
+        this.validateJoinedCapture(flight, episode);
+        const local = this.captureProgressFor(flight, episode).local;
+        captured = usedFreeCapture ? result : local?.kind === "hold" ? local.result : undefined;
+      } catch (captureError) {
+        flight.runLog.warn("policy capture unavailable", { error: errMessage(captureError) });
+        // A failed/unknown boundary never supplies a verified head. The exact source,
+        // HOME, session and custody stay retained even when delivery later succeeds.
+        captured = undefined;
+        this.retainCaptureSource(flight);
+        interrupted = flight.steering.claimFence() !== undefined || flight.steering.isCancelled() ||
+          flight.cancel.signal.aborted || flight.steering.terminalLifecycleSignal().aborted ||
+          flight.active?.shuttingDown === true || this.shuttingDownGlobal;
+      }
     }
-    const observedSession = flight.observedSessionId;
+    // A re-hold keeps the saved session it was holding; a refusal reports the session it observed.
+    const observedSession = flight.observedSessionId ?? (refusal ? undefined : claim.session_id ?? undefined);
     const session = observedSession && Buffer.byteLength(observedSession, "utf8") <= 1024 &&
       !observedSession.includes("\0") && Buffer.from(observedSession, "utf8").toString("utf8") === observedSession
       ? observedSession : undefined;
     const body = selected.body = Object.freeze({
       outcome_id: selected.outcomeId, source_generation: flight.claimGeneration,
-      claim_generation: flight.claimGeneration, detail: "refused" as const,
+      claim_generation: flight.claimGeneration,
+      detail: refusal ? "refused" as const : "resume_rejected" as const,
+      cause: trigger.kind === "refused" ? "refused" as const : trigger.cause,
       continuation_mode: flight.effectiveAttemptPaths ? "fresh_from_saved_work" as const : "same_conversation" as const,
-      tag: refusal.policy_tag, phase: refusal.phase, correlation_id: refusal.correlation_id,
+      // Refusal metadata only on the original refusal; a re-hold must not rewrite the stored one.
+      ...(refusal ? { tag: refusal.policy_tag, phase: refusal.phase, correlation_id: refusal.correlation_id } : {}),
       ...(session ? { session_id: session } : {}),
       ...(captured?.verified && captured.head ? { head: captured.head } : {}),
       published: captured?.verified === true && captured.published,
@@ -7137,6 +7213,9 @@ export class RunRunner {
     if (await this.outbox!.hasPendingPolicyOutcome(flight.runId) || !await this.provePolicyClaim(claim)) return false;
     flight.policyHold = undefined;
     flight.policyAdmission = false;
+    // Drop only what the admission itself retained. A retained recovery, a capture seed or a
+    // retainedEpisode/predecessorCapture veto set the same flags as their own writers and keep them.
+    flight.retention.releasePolicyAdmission();
     return true;
   }
 
@@ -12494,7 +12573,15 @@ export class RunRunner {
       writeUnresolved: typeof claim.checkpoint_write_unresolved === "boolean"
         ? claim.checkpoint_write_unresolved : undefined,
     });
+    const retention = new FlightRetention();
     const flight: RunFlight = {
+      retention,
+      get keepGuardedInventoryOpen(): boolean { return retention.guardedInventoryOpen.value; },
+      set keepGuardedInventoryOpen(on: boolean) { retention.guardedInventoryOpen.setFlight(on); },
+      get preserveSession(): boolean { return retention.session.value; },
+      set preserveSession(on: boolean) { retention.session.setFlight(on); },
+      get preserveRecoveryClone(): boolean { return retention.recoveryClone.value; },
+      set preserveRecoveryClone(on: boolean) { retention.recoveryClone.setFlight(on); },
       initiallyCodex: this.requiresFreeCaptureScope(claim, { executor }),
       flightId: randomUUID(),
       runId,
@@ -12517,7 +12604,6 @@ export class RunRunner {
       owedLimitStop: undefined,
       owedAnnounced: this.owedAnnouncedFor(runId),
       inventoryArchiveNotices: new Set(),
-      keepGuardedInventoryOpen: false,
       stoppedSourceKept: false,
       terminalInventoryQuiesced: false,
       inventoryGuarded: claim.inventory_guarded === true,
@@ -12813,11 +12899,10 @@ export class RunRunner {
       // a same-worker re-claim within the affinity grace can resume the SDK session. It is
       // a distinct flag from `parked` on purpose: `parked` also drives park-only report
       // semantics, resume seeding, and the park log, none of which apply to a shutdown.
-      preserveSession: false,
+      // (preserveSession, like preserveRecoveryClone and keepGuardedInventoryOpen, is an accessor above.)
       // PRD #1392 M2: set true ONLY by the pre-clone forge-unreachable park. false everywhere
       // else, so no other path's HOME preservation semantics change.
       preClonePark: false,
-      preserveRecoveryClone: false,
       attempt: undefined,
       attemptId: undefined,
       predecessorCapture: false,
@@ -13839,6 +13924,67 @@ export class RunRunner {
     });
   }
 
+  /**
+   * Admission predicate for a claim that may only preserve its earlier conversation. Throws
+   * PolicyContinuationRejected (a re-hold, never a failure or a fresh start) on the first failing rule:
+   *  1. an attempt-path flight cannot reuse the cwd-keyed session (fresh_from_saved_work needs the owner);
+   *  2. when the claim names the held head R, the recovered clone must provably contain R (see
+   *     {@link policyHeadRecovered}); on success the proof is recorded server-side before any model turn;
+   *  3. the saved session id must exist and its Codex transcript must be present on this worker.
+   * Without R (a degraded capture) rule 2 is skipped. Nothing is deleted on a rejection.
+   */
+  private async admitPolicyPreserveOnly(claim: ClaimResponse, flight: RunFlight, runnerClone: RunnerClone): Promise<void> {
+    if (flight.effectiveAttemptPaths) throw new PolicyContinuationRejected("attempt_path", true);
+    const required = claim.policy_expected_head;
+    if (required !== undefined) {
+      if (!await this.policyHeadRecovered(runnerClone, required)) throw new PolicyContinuationRejected("saved_work_missing", true);
+      await this.recordPolicyRecoveryVerified(claim, flight, required);
+    } else {
+      flight.runLog.info("policy preserve-only claim carries no held head; skipping recovery verification");
+    }
+    if (!claim.session_id) throw new PolicyContinuationRejected("session_missing", true);
+    if (claim.secrets.codex &&
+        (!flight.runHome || await CodexSessionStore.inspectSession(join(flight.runHome, "codex-session-store"), claim.session_id) !== "present"))
+      throw new PolicyContinuationRejected("transcript_unknown", true);
+  }
+
+  /** True only when the recovered clone provably contains the held head `required`: it is reachable from
+   *  the clone's HEAD, or it is (or lies beneath) the WIP marker the seed restored. A malformed head or any
+   *  git error is "not recovered". */
+  private async policyHeadRecovered(runnerClone: RunnerClone, required: string): Promise<boolean> {
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(required)) return false;
+    try {
+      if (await this.git.cloneHasAncestor(runnerClone.path, required, "HEAD")) return true;
+      const marker = runnerClone.wipRecovered === true ? runnerClone.recoveredMarkerSha : undefined;
+      if (!marker) return false;
+      return marker === required || await this.git.cloneHasAncestor(runnerClone.path, required, marker);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Records, with a small bounded retry, that this claim's clone contains `requiredHead`. The record only
+   *  enables a later server-side supersede and never clears the requirement, so a lost or refused reply is
+   *  logged and tolerated: the claim carries on and a later generation re-verifies. */
+  private async recordPolicyRecoveryVerified(claim: ClaimResponse, flight: RunFlight, requiredHead: string): Promise<void> {
+    const client = this.client;
+    const generation = claim.claim_generation;
+    if (!client.supportsPolicyHold || typeof client.reportPolicyRecoveryVerified !== "function" ||
+        !Number.isSafeInteger(generation) || (generation ?? 0) <= 0) return;
+    for (let attempt = 1; attempt <= POLICY_VERIFY_ATTEMPTS; attempt++) {
+      try {
+        const reply = await client.reportPolicyRecoveryVerified(claim.run_id,
+          { claim_generation: generation as number, required_head: requiredHead }, flight.cancel.signal);
+        flight.runLog.info("policy recovery verification reported", { disposition: reply.disposition, attempt });
+        if (reply.disposition !== "pending") return;
+      } catch (error) {
+        flight.runLog.warn("policy recovery verification not delivered", { attempt, error: errMessage(error) });
+      }
+      if (flight.cancel.signal.aborted) return;
+      if (attempt < POLICY_VERIFY_ATTEMPTS) await sleep(POLICY_VERIFY_BACKOFF_MS * attempt, flight.cancel.signal);
+    }
+  }
+
   private async phaseResume(
     claim: ClaimResponse,
     flight: RunFlight,
@@ -13846,6 +13992,10 @@ export class RunRunner {
     const { runLog, reportState, batcher, runHome } = flight;
     const runId = claim.run_id;
     const runnerClone = flight.runnerClone!;
+    // Preserve-only admission runs first: right after the clone result is known and before any lineage
+    // notice, the seeded_from_default report, session handling, follow-up consumption or model turn, so a
+    // re-hold-only claim changes nothing the owner or the next claim could observe.
+    if (claim.policy_preserve_only === true) await this.admitPolicyPreserveOnly(claim, flight, runnerClone);
     // PRD #218 M3 / #759 M5: say what a resume recovered, in a WORKER status rather than by
     // the lead noticing the tree changed under it. Two axes cross here — WHAT kind of work
     // was recovered, committed vs. uncommitted, and each is honest about a distinct outcome:
@@ -16288,6 +16438,8 @@ export class RunRunner {
       // its `now`-pause turn catch.
       // issue #1597 M2: gated — a tick can never fetch/publish the wip marker this path commits.
       parkRunSupported: claim.park_run_supported === true,
+      // A policy-held claim continues its saved conversation or re-holds; every root lead turn is guarded.
+      ...(claim.policy_preserve_only === true ? { preserveConversation: true } : {}),
       requestParkRun: async (pausedAt) => {
         const supported = claim.park_run_supported === true;
         const checkLifecycle = (): void => {

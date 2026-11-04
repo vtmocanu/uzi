@@ -117,6 +117,7 @@ import type {
 import {
   admitPolicyTurn,
   isPolicyRefusalTag,
+  PolicyContinuationRejected,
   ProviderPolicyRefusal,
   validatePolicyRefusal,
 } from "../provider-policy-refusal.js";
@@ -1274,6 +1275,10 @@ export class CodexHarness implements RunHarness {
       // 2. Start (or resume) the thread with the explicit untrusted / doc-max config —
       //    and NEVER a hook-trust bypass. Reused across turns once established.
       if (this.threadId === undefined) {
+        // The single authoritative fresh-thread branch: a preserve-only turn with no session to resume
+        // must re-hold, never start a new conversation (no thread/start is sent).
+        if (request.preserveConversation === true && request.resumeSessionId === undefined)
+          throw new PolicyContinuationRejected("session_missing");
         const resumed = request.resumeSessionId !== undefined;
         this.resumedRoot = resumed;
         this.threadId = resumed

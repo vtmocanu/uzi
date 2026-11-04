@@ -57,7 +57,7 @@ import {
   type CodexCommittedGenerationCell,
 } from "../src/codex/codex-executor.js";
 import { WorkerClient, RequestError, CodexRequestFailure } from "../src/client.js";
-import { ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
+import { PolicyContinuationRejected, ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
 import { RunRunner } from "../src/runner.js";
 import { Worker } from "../src/worker.js";
 import type { Config } from "../src/config.js";
@@ -3884,7 +3884,7 @@ describe("compact policy hold production producer", () => {
         }
         assert.match(packets[0]!.head ?? "", /^[0-9a-f]{40}$/, JSON.stringify(captureLog.lines.filter(line => rec(line).level === "warn")));
         assert.deepEqual(packets[0], {
-          outcome_id: packets[0]!.outcome_id, source_generation: 7, claim_generation: 7, detail: "refused",
+          outcome_id: packets[0]!.outcome_id, source_generation: 7, claim_generation: 7, detail: "refused", cause: "refused",
           continuation_mode: "same_conversation", tag, phase: phase === "plan" ? "planning" : "implementation",
           correlation_id: packets[0]!.correlation_id,
           ...(mode === "long_session" ? {} : { session_id: "th-1" }),
@@ -28913,5 +28913,91 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
     // An inactive reporter gets no entry and the harness gets no runtime-config callback.
     assert.equal(entered, 0);
     assert.equal(observedCalls, 0);
+  });
+});
+
+// A policy-held (preserve-only) claim may continue its saved conversation or re-hold, never start a fresh
+// one. The guard lives in CodexHarness.startTurn's single fresh-thread branch and the executor's
+// resume-rejection catch, and every root lead request of such a claim carries it.
+describe("CodexExecutor: a preserve-only conversation never starts a fresh provider thread", () => {
+  const routes = (t: FakeTransport) => t.requests.filter((r) => r.method === "thread/start" || r.method === "thread/resume");
+  const rpcRejection = () => new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" });
+  const rejectsWith = (cause: PolicyContinuationRejected["cause"]) => (error: unknown): boolean =>
+    error instanceof PolicyContinuationRejected && error.cause === cause;
+
+  it("no session to resume: the root turn rejects before any thread/start", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx } = makeCtx({ preserveConversation: true });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "preserve without session"),
+      rejectsWith("session_missing"));
+    assert.deepEqual(routes(rig.transport), [], "neither thread/start nor thread/resume was sent");
+    assert.equal(rig.transport.requests.filter((r) => r.method === "turn/start").length, 0);
+  });
+
+  it("unconstrained control: the same claim without the preserving fact starts a fresh thread", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "unconstrained fresh start");
+    assert.deepEqual(routes(rig.transport).map((r) => r.method), ["thread/start"]);
+  });
+
+  it("a provider-rejected resume re-holds: no lineage-break notice and no fresh thread", async () => {
+    const rig = makeRig();
+    rig.transport.requestOverride = (c) => c.method === "thread/resume" ? Promise.reject(rpcRejection()) : undefined;
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx, emitted } = makeCtx({ sessionId: "claimed-thread", preserveConversation: true });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "preserve rejected resume"),
+      rejectsWith("provider_resume_rejected"));
+    assert.deepEqual(routes(rig.transport).map((r) => r.method), ["thread/resume"]);
+    assert.equal(emitted.some((m) => m.payload.event === "resume_lineage_break"), false,
+      "a lineage break is announced only after an actual fresh admission");
+  });
+
+  it("a successfully resumed preserving root runs normally on the claimed thread", async () => {
+    const rig = makeRig();
+    rig.transport.requestOverride = (c) => c.method === "thread/resume" ? Promise.resolve({ thread: { id: "claimed-thread" } }) : undefined;
+    rig.transport.push(threadStarted("claimed-thread")).push(signalDone("claimed-thread", "tn-1")).push(turnCompleted("completed", "claimed-thread")).end();
+    const { ctx } = makeCtx({ sessionId: "claimed-thread", preserveConversation: true });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "preserve resumed");
+    assert.deepEqual(routes(rig.transport).map((r) => r.method), ["thread/resume"]);
+  });
+
+  it("epoch recreation after a checkpoint reap resumes the saved session or re-holds, never thread/start", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt")).push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-1", "tn-2", () => {}),
+    ]);
+    rig.epochs[1]!.transport.requestOverride = (c) => c.method === "thread/resume" ? Promise.reject(rpcRejection()) : undefined;
+    let exec!: CodexExecutor;
+    const { ctx } = makeCtx({
+      sessionId: "th-1", preserveConversation: true,
+      checkpoint: async (opts) => {
+        if (opts.reap) await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+      },
+    });
+    exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    await assert.rejects(withTimeout(exec.run(ctx), 5000, "preserve epoch recreation"), rejectsWith("provider_resume_rejected"));
+    assert.equal(rig.providerLaunches(), 2, "the checkpoint reap recreated the epoch");
+    assert.deepEqual(routes(rig.epochs[0]!.transport).map((r) => r.method), ["thread/resume"]);
+    assert.deepEqual(routes(rig.epochs[1]!.transport).map((r) => r.method), ["thread/resume"], "the recreated root never started a thread");
+  });
+
+  it("plan to implement recreation resumes the planning session or re-holds, never thread/start", async () => {
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "the plan" }, th, tn, "c-plan")).push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-1", "tn-2", () => {}),
+    ]);
+    rig.epochs[1]!.transport.requestOverride = (c) => c.method === "thread/resume" ? Promise.reject(rpcRejection()) : undefined;
+    const gatePlan: NonNullable<RunContext["gatePlan"]> = async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never);
+    const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan, sessionId: "th-1", preserveConversation: true });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "preserve plan to implement"),
+      rejectsWith("provider_resume_rejected"));
+    assert.equal(rig.providerLaunches(), 2, "approval recreated the epoch for implementation");
+    assert.deepEqual(routes(rig.epochs[1]!.transport).map((r) => r.method), ["thread/resume"]);
   });
 });

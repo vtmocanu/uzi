@@ -1,12 +1,15 @@
 package handler
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -21,8 +24,10 @@ import (
 // read returns 404 for foreign/absent runs. Each status-scoped write refuses races
 // and ineligible holds with 409; successful transitions write a resume audit row.
 //
-// A POST verb with no payload: there is nothing to configure (unlike expedite's expedite/clear),
-// so it deliberately reads NO request body.
+// The ordinary verbs take no payload: an empty body is today's path and nothing in it is read.
+// A non-empty body is the compact policy-hold continuation (issue #3607): a strict
+// {mode, expected_episode_id, guidance} that resolves exactly one applied codex_policy_hold
+// episode (see resumePolicyHold). An empty request never consents to a policy continuation.
 func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -41,8 +46,19 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if run.PolicyPreserveRequired || run.PolicyPendingFresh || (run.PolicyOutcomeID.Valid && !run.PolicyResolvedAt.Valid) {
-		httpx.Error(w, http.StatusConflict, "policy hold continuation is unavailable")
+	raw, err := io.ReadAll(io.LimitReader(r.Body, policyResumeBodyLimit+1))
+	if err != nil || int64(len(raw)) > policyResumeBodyLimit {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if len(bytes.TrimSpace(raw)) > 0 {
+		h.resumePolicyHold(w, r, user.ID, runID, raw)
+		return
+	}
+	// Only an unresolved episode blocks the ordinary resume; a resolved preserving run keeps its
+	// constraint and resumes ordinary holds normally.
+	if workersvc.UnresolvedPolicyEpisode(run) {
+		httpx.Error(w, http.StatusConflict, "policy hold continuation is unavailable without an explicit mode; resume it with mode and expected_episode_id")
 		return
 	}
 
@@ -233,11 +249,60 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("write resume audit row", "run", runID, "error", err)
 	}
 
-	// Re-read owner-scoped so the DTO shows the resumed (queued) status.
-	run, err = h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: user.ID})
+	h.writeResumedRun(w, r, user.ID, runID)
+}
+
+// writeResumedRun re-reads the run owner-scoped so the DTO shows the resumed (queued) status.
+func (h *Handler) writeResumedRun(w http.ResponseWriter, r *http.Request, userID, runID uuid.UUID) {
+	run, err := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: userID})
 	if err != nil {
 		httpx.Error(w, http.StatusNotFound, "run not found")
 		return
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
+}
+
+// policyResumeBodyLimit bounds the optional resume body: 16,000 bytes of guidance can
+// expand up to sixfold under JSON escaping, plus the fixed fields.
+const policyResumeBodyLimit int64 = 128 * 1024
+
+// policyResumeBody is the closed owner request for a compact policy-hold continuation.
+type policyResumeBody struct {
+	Mode              string `json:"mode"`
+	ExpectedEpisodeID string `json:"expected_episode_id"`
+	Guidance          string `json:"guidance"`
+}
+
+// resumePolicyHold resolves one exact applied policy episode. Every refusal is zero-mutation: the
+// service transaction repeats owner, status, hold reason, episode id and lane predicates.
+func (h *Handler) resumePolicyHold(w http.ResponseWriter, r *http.Request, userID, runID uuid.UUID, raw []byte) {
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	var body policyResumeBody
+	if err := httpx.DecodeJSONStrictBounded(r, &body, policyResumeBodyLimit); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	episode, err := uuid.Parse(body.ExpectedEpisodeID)
+	if err != nil || episode == uuid.Nil || episode.String() != body.ExpectedEpisodeID {
+		httpx.Error(w, http.StatusBadRequest, "expected_episode_id must be a canonical UUID")
+		return
+	}
+	_, err = h.wsvc.ResumePolicyHold(r.Context(), userID, runID, workersvc.PolicyResumeRequest{
+		Mode: body.Mode, ExpectedEpisodeID: episode, Guidance: body.Guidance,
+	})
+	switch {
+	case err == nil:
+		h.writeResumedRun(w, r, userID, runID)
+	case errors.Is(err, workersvc.ErrInvalidState):
+		httpx.Error(w, http.StatusBadRequest, "invalid policy resume request")
+	case errors.Is(err, workersvc.ErrPolicyFreshUnavailable):
+		httpx.Error(w, http.StatusConflict, workersvc.ErrPolicyFreshUnavailable.Error())
+	case errors.Is(err, workersvc.ErrPolicyResumeConflict):
+		httpx.Error(w, http.StatusConflict, "policy hold changed or does not match this mode; refresh the run and choose again")
+	case errors.Is(err, workersvc.ErrRunNotFound):
+		httpx.Error(w, http.StatusNotFound, "run not found")
+	default:
+		slog.Error("resume policy hold", "run", runID, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	}
 }

@@ -69,9 +69,15 @@ type ClaimPayload struct {
 	// it under a per-prompt nonce fence (M4).
 	ReviewComments *ReviewCommentsSnapshot `json:"review_comments,omitempty"`
 	Status         string                  `json:"status"`
-	Branch         *string                 `json:"branch"`                   // resume: attach existing branch
-	SessionID      *string                 `json:"session_id"`               // resume: continue SDK session
-	CheckpointTip  *string                 `json:"checkpoint_tip,omitempty"` // resume: own-checkpoint anchor (owner-anchor guard)
+	Branch         *string                 `json:"branch"`     // resume: attach existing branch
+	SessionID      *string                 `json:"session_id"` // resume: continue SDK session
+	// PolicyPreserveOnly is true iff the run still carries the compact policy preserving
+	// constraint (runs.policy_preserve_required). PolicyExpectedHead is the required recovery
+	// head (runs.policy_required_head) when that constraint holds and a head is recorded. Both
+	// are omitted otherwise, so an unconstrained claim stays byte-identical to today's wire.
+	PolicyPreserveOnly bool    `json:"policy_preserve_only,omitempty"`
+	PolicyExpectedHead *string `json:"policy_expected_head,omitempty"`
+	CheckpointTip      *string `json:"checkpoint_tip,omitempty"` // resume: own-checkpoint anchor (owner-anchor guard)
 	// CheckpointAttestedSource (issue #3194) is the source OID a flight of THIS run published
 	// after its --require-base guard strictly accepted (runs.checkpoint_attested_source, set-only).
 	// A continuation may adopt exactly this source. nil (omitted) for legacy, unattested and

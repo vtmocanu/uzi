@@ -2626,6 +2626,10 @@ export interface RunnerClone {
    *  new floor, so the materialized content is no single adopted source. `--require-base` refuses
    *  this shape. */
   wipCherryPicked?: boolean;
+  /** The recovered `wip(park)` marker whose uncommitted content this seed restored: the adopted marker on the
+   *  `reset --soft` leg, the cherry-picked checkpoint marker on the diverged leg. Absent when no WIP marker was
+   *  recovered. A preserve-only claim accepts it as proof of the held head (or a descendant of it). */
+  recoveredMarkerSha?: string;
 }
 
 /**
@@ -5459,8 +5463,12 @@ export class GitCache {
       // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
       // M4/M5.
+      // The marker whose content this seed recovered: baseSha on the reset --soft leg (the adopted tip IS the
+      // marker), the cherry-picked checkpoint marker on the diverged leg, none otherwise.
+      const recoveredMarkerSha = willRecoverMarker ? baseSha : recoveredCheckpointMarkerSha;
       return { path: clonePath, branch, publicationFloor, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered,
-        adoptedSource: baseSha, ...(recoveredCheckpointMarkerSha !== "" ? { wipCherryPicked: true } : {}) };
+        adoptedSource: baseSha, ...(recoveredCheckpointMarkerSha !== "" ? { wipCherryPicked: true } : {}),
+        ...(wipRecovered && recoveredMarkerSha !== "" ? { recoveredMarkerSha } : {}) };
     }
   }
 
@@ -6261,6 +6269,26 @@ export class GitCache {
       })
     ).trim();
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  }
+
+  /**
+   * True only when `ancestor` names a commit the runner clone can resolve and `descendant` descends from
+   * it (equal counts), read as the RUNNER uid like every clone read. Both must be full 40/64-hex object
+   * ids, except `descendant` may be `HEAD`. Any git error, a missing object or malformed input answers
+   * false, never a guess: the caller treats "not proven" as "not recovered". A hard boundary abort still
+   * propagates, as in {@link worktreeHead}.
+   */
+  async cloneHasAncestor(clonePath: string, ancestor: string, descendant: string): Promise<boolean> {
+    const id = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+    if (!id.test(ancestor) || (descendant !== "HEAD" && !id.test(descendant))) return false;
+    try {
+      await this.runGitAsRunner(clonePath, ["merge-base", "--is-ancestor", ancestor, descendant]);
+      return true;
+    } catch (cause: unknown) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return false;
+    }
   }
 
   /**

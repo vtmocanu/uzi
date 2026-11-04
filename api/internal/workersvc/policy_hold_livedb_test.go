@@ -109,7 +109,7 @@ func TestPolicyHoldApplyReplayAndFencesLiveDB(t *testing.T) {
 	}
 	old := req
 	old.OutcomeID = uuid.NewString()
-	old.Detail = "resume_rejected"
+	old.Detail, old.Cause = "resume_rejected", "attempt_path"
 	old.PolicyTag = nil
 	old.Phase = nil
 	old.CorrelationID = nil
@@ -162,7 +162,7 @@ func TestPolicyHoldAdmissionAndConversionLiveDB(t *testing.T) {
 		t.Fatalf("stale: %+v %v", got, err)
 	}
 	req.ClaimGeneration = 3
-	req.Detail = "resume_rejected"
+	req.Detail, req.Cause = "resume_rejected", "attempt_path"
 	req.PolicyTag = nil
 	req.Phase = nil
 	req.CorrelationID = nil

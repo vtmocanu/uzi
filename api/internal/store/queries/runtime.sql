@@ -4138,9 +4138,11 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
-  AND NOT runs.policy_preserve_required AND NOT runs.policy_pending_fresh
-  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
-  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  -- #3607 M2a: refuse ONLY an unresolved policy episode (its own owner resume is ResumePolicyHold).
+  -- A resolved preserving run still resumes ordinary holds and keeps its constraint: this writer
+  -- touches no policy column.
+  AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'codex_policy_hold' OR runs.policy_pending_fresh
+           OR (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NULL))
   -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
   AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
@@ -4230,9 +4232,11 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
-  AND NOT runs.policy_preserve_required AND NOT runs.policy_pending_fresh
-  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
-  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  -- #3607 M2a: refuse ONLY an unresolved policy episode (its own owner resume is ResumePolicyHold).
+  -- A resolved preserving run still resumes ordinary holds and keeps its constraint: this writer
+  -- touches no policy column.
+  AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'codex_policy_hold' OR runs.policy_pending_fresh
+           OR (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NULL))
   -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
   AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
@@ -4272,6 +4276,20 @@ WITH parked AS (
     UPDATE runs SET status = 'paused', status_since = now(),
         hold_reason = 'iteration_budget_exhausted',
         hold_captured_head = sqlc.narg('hold_captured_head'),
+        -- #3607 M2a: supersede the required recovery head only with publication evidence persisted in THIS
+        -- statement, bound to the verification record for this claim generation and the current head.
+        policy_required_head = CASE WHEN runs.policy_preserve_required AND sqlc.arg('published')::boolean
+              AND COALESCE(sqlc.narg('checkpoint_contains_latest')::boolean, false)
+              AND sqlc.narg('hold_captured_head')::text ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+              AND runs.policy_recovery_verified_generation = sqlc.arg('claim_generation')::bigint
+              AND runs.policy_recovery_verified_head = runs.policy_required_head
+            THEN sqlc.narg('hold_captured_head')::text ELSE runs.policy_required_head END,
+        policy_recovery_verified_head = CASE WHEN runs.policy_preserve_required AND sqlc.arg('published')::boolean
+              AND COALESCE(sqlc.narg('checkpoint_contains_latest')::boolean, false)
+              AND sqlc.narg('hold_captured_head')::text ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+              AND runs.policy_recovery_verified_generation = sqlc.arg('claim_generation')::bigint
+              AND runs.policy_recovery_verified_head = runs.policy_required_head
+            THEN sqlc.narg('hold_captured_head')::text ELSE runs.policy_recovery_verified_head END,
         pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
         health = 'ok', health_reason = NULL, health_since = NULL, updated_at = now()
     WHERE runs.id = @id AND runs.worker_id = @worker_id
@@ -4363,6 +4381,22 @@ UPDATE runs SET
     session_id         = COALESCE(sqlc.narg('session_id'), runs.session_id),
     hold_reason        = 'budget_exhausted',
     hold_captured_head = sqlc.narg('hold_captured_head'),
+    -- #3607 M2a: supersede the required recovery head only with publication evidence persisted in THIS
+    -- statement, bound to the verification record for this claim generation and the current head.
+    policy_required_head = CASE WHEN runs.policy_preserve_required AND sqlc.arg('published')::boolean
+          AND COALESCE(sqlc.narg('checkpoint_contains_latest')::boolean, false)
+          AND sqlc.narg('hold_captured_head')::text ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+          AND sqlc.narg('claim_generation')::bigint IS NOT NULL
+          AND runs.policy_recovery_verified_generation = runs.claim_generation
+          AND runs.policy_recovery_verified_head = runs.policy_required_head
+        THEN sqlc.narg('hold_captured_head')::text ELSE runs.policy_required_head END,
+    policy_recovery_verified_head = CASE WHEN runs.policy_preserve_required AND sqlc.arg('published')::boolean
+          AND COALESCE(sqlc.narg('checkpoint_contains_latest')::boolean, false)
+          AND sqlc.narg('hold_captured_head')::text ~ '^([0-9a-f]{40}|[0-9a-f]{64})$'
+          AND sqlc.narg('claim_generation')::bigint IS NOT NULL
+          AND runs.policy_recovery_verified_generation = runs.claim_generation
+          AND runs.policy_recovery_verified_head = runs.policy_required_head
+        THEN sqlc.narg('hold_captured_head')::text ELSE runs.policy_recovery_verified_head END,
     pause_requested_at = NULL,
     pause_mode         = NULL,
     pause_after_count  = NULL,
@@ -4937,6 +4971,8 @@ UPDATE runs SET
     finished_at        = now(),
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
@@ -5029,6 +5065,8 @@ UPDATE runs SET
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (policy_outcome_id IS NULL OR policy_resolved_at IS NOT NULL)
@@ -5087,6 +5125,8 @@ WITH failed AS (
         credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
         -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
         health = 'ok', health_reason = NULL, health_since = NULL,
+        -- #3607 M2a: a terminal run carries no required-recovery identity.
+        policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
         updated_at         = now()
     WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
@@ -5142,6 +5182,8 @@ UPDATE runs SET
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE id = @id
   AND status NOT IN ('completed', 'failed', 'cancelled');
@@ -5191,6 +5233,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
@@ -5275,6 +5319,8 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
@@ -5367,6 +5413,8 @@ UPDATE runs SET
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
@@ -5427,6 +5475,8 @@ WITH candidates AS MATERIALIZED (
         credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
         -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
         health = 'ok', health_reason = NULL, health_since = NULL,
+        -- #3607 M2a: a terminal run carries no required-recovery identity.
+        policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
         updated_at         = now()
     WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
       AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
@@ -5497,6 +5547,8 @@ UPDATE runs SET
     pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
     credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
     health = 'ok', health_reason = NULL, health_since = NULL,
+    -- #3607 M2a: a terminal run carries no required-recovery identity.
+    policy_required_head = NULL, policy_recovery_verified_generation = NULL, policy_recovery_verified_head = NULL,
     updated_at         = now()
 WHERE runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
   AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)

@@ -44,7 +44,7 @@ function assertUnprovenPolicySnapshot(registry: ActiveRunRegistry): void {
 const run = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const original: PolicyHoldRequest = {
   outcome_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", source_generation: 7, claim_generation: 7,
-  detail: "refused", continuation_mode: "same_conversation", tag: "cyberPolicy", phase: "implementation",
+  detail: "refused", cause: "refused", continuation_mode: "same_conversation", tag: "cyberPolicy", phase: "implementation",
   correlation_id: "pr-" + "a".repeat(32) + "-1", session_id: "session", head: "a".repeat(40),
   published: true, checkpoint_contains_latest: true,
 };
@@ -120,8 +120,8 @@ it("closed request validation matches the server fields and rejects invalid/over
     Object.create(original),
   ]) assert.throws(() => validatePolicyHoldRequest(bad));
   assert.deepEqual(validatePolicyHoldRequest({ outcome_id: original.outcome_id, source_generation: 7,
-    claim_generation: 8, detail: "resume_rejected", continuation_mode: "fresh_from_saved_work", published: false }),
-    { outcome_id: original.outcome_id, source_generation: 7, claim_generation: 8, detail: "resume_rejected",
+    claim_generation: 8, detail: "resume_rejected", cause: "pending_conversion" as const, continuation_mode: "fresh_from_saved_work", published: false }),
+    { outcome_id: original.outcome_id, source_generation: 7, claim_generation: 8, detail: "resume_rejected", cause: "pending_conversion" as const,
       continuation_mode: "fresh_from_saved_work", published: false });
 });
 
@@ -208,7 +208,7 @@ it("lost ACK and current-claim conversion preserve original journal and omit ref
     count++;
     if (count === 1) { assert.deepEqual(body, original); throw new Error("lost ACK"); }
     assert.deepEqual(body, { outcome_id: original.outcome_id, source_generation: 7, claim_generation: 9,
-      detail: "resume_rejected", continuation_mode: "fresh_from_saved_work", published: false });
+      detail: "resume_rejected", cause: "pending_conversion" as const, continuation_mode: "fresh_from_saved_work", published: false });
     return { ...receipt("already_applied"), observed_status: "queued", observed_generation: 10 };
   });
   await resolvePendingTerminal(d, args); // boot has no independent authority

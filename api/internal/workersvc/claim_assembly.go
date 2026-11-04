@@ -790,6 +790,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		Branch:         textPtr(branch),
 		SessionID:      sessionID,
 		CheckpointTip:  textPtr(run.CheckpointTip),
+		// Compact policy hold (#3607 M2a): the preserving fact and the required recovery head,
+		// read off the claimed row. Only a still-preserving run carries either.
+		PolicyPreserveOnly: run.PolicyPreserveRequired,
+		PolicyExpectedHead: policyExpectedHead(run),
 		// Issue #3194: read off the claimed run row, never derived from ownership or the tip.
 		CheckpointAttestedSource: textPtr(run.CheckpointAttestedSource),
 		// PRD #1247 M9 (task c): the last_seq recordRunCredential actually landed — bumped past any
@@ -1369,4 +1373,13 @@ func (e legacyReviewClaimError) Unwrap() error { return errGuardrailBlockedClaim
 // checked before its human gate.
 func planCrossCheckCodexLeadSupported(run store.Run) bool {
 	return (run.PlanCrossCheckRequired || run.PlanCrossCheckGated) && run.Harness == harnessCodex
+}
+
+// policyExpectedHead projects policy_required_head onto the claim only while the run still carries
+// the preserving constraint.
+func policyExpectedHead(run store.Run) *string {
+	if !run.PolicyPreserveRequired || !run.PolicyRequiredHead.Valid || run.PolicyRequiredHead.String == "" {
+		return nil
+	}
+	return textPtr(run.PolicyRequiredHead)
 }

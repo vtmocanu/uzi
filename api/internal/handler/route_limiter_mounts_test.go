@@ -944,6 +944,8 @@ var wantRouteMounts = []routeMount{
 	// Bounded local lifecycle report, no forge/provider I/O; both actual router
 	// chains are also pinned by TestPolicyHoldRouteHasNoRateLimiter.
 	{"POST", "/api/worker/runs/{id}/policy-hold", noLimiter},
+	// Same bounded local lifecycle class as policy-hold: a 1 KiB per-generation verification record.
+	{"POST", "/api/worker/runs/{id}/policy-recovery-verified", noLimiter},
 	// Semantic planning uses worker authentication and claim-generation fences.
 	// Writes ride proposalLimiter.PerWorkerMiddleware; this per-USER table reads
 	// them as noLimiter. TestSemanticWorkerWritesUseWorkerLimiter proves their worker buckets.
