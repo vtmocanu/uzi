@@ -623,7 +623,7 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       // HOME: the shim creates its run-private XDG dirs under a writable HOME on every call, so
       // a call under the image HOME would bake /home/worker/.uzi-agent-browser as root.
       for (const m of text.matchAll(/^.*timeout \d+ agent-browser\b.*$/gm)) {
-        const start = text.lastIndexOf("&&", m.index);
+        const start = text.lastIndexOf("&&", m.index! + m[0].length);
         assert.match(
           text.slice(start, m.index! + m[0].length),
           /HOME=\/tmp\/uzi-ab-home\b/,

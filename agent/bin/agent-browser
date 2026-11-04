@@ -84,8 +84,8 @@ export AGENT_BROWSER_EXECUTABLE_PATH AGENT_BROWSER_ARGS AGENT_BROWSER_IDLE_TIMEO
 # rc=133 (SIGTRAP) at the crashpad handler — BEFORE the SUID check, so --no-sandbox does NOT
 # fix it — when it cannot create its crashpad DB: the image bakes $HOME/.config
 # (/home/worker/.config) root:worker 0755, which the non-root runner uid (10001) cannot write.
-# Point the XDG base dirs at a guaranteed-writable location under TMPDIR (the runner's own 0700
-# tmp under the uid split, else /tmp) so the launch is robust to WHATEVER $HOME agent-browser
+# Point the XDG base dirs at a guaranteed-writable, run-private location (under a writable $HOME,
+# else a fresh mktemp dir under TMPDIR — see below) so the launch is robust to WHATEVER $HOME agent-browser
 # inherits — this closes the crash even for a direct/non-SDK/compose invocation that keeps the
 # image HOME, not only the SDK path where sdk-env.ts happens to repoint HOME to a writable dir.
 # Only-if-unset so an explicit caller value wins; the mkdir is best-effort (dir may pre-exist

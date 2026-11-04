@@ -258,6 +258,12 @@ describe("agent-browser crash-close shim (PRD #87 M1)", () => {
     }
   });
 
+  it("leaves XDG unset (no predictable fallback path) when HOME is unset and mktemp fails", async () => {
+    const a = await xdgFor({ HOME: "", TMPDIR: path.join(tmp, "does-not-exist-tmp") }, "nomktemp");
+    assert.equal(a.cfg, "");
+    assert.equal(a.cache, "");
+  });
+
   it("a writable HOME with an existing unwritable .uzi-agent-browser falls back to a per-invocation dir", async (t) => {
     if (process.getuid!() === 0) {
       t.skip("root can write a 0555 dir");
