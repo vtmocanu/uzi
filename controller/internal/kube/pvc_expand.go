@@ -216,11 +216,12 @@ func (m *Materializer) expandClaims(ctx context.Context, w protocol.DesiredWorke
 			skip(why)
 			continue
 		}
-		uid, _ := json.Marshal(snap.UID)
-		rv, _ := json.Marshal(snap.ResourceVersion)
-		qty, _ := json.Marshal(desired.String())
-		body := fmt.Sprintf(`{"metadata":{"uid":%s,"resourceVersion":%s},"spec":{"resources":{"requests":{"storage":%s}}}}`, uid, rv, qty)
-		got, err := m.client.CoreV1().PersistentVolumeClaims(ns).Patch(ctx, pvc.Name, types.MergePatchType, []byte(body), metav1.PatchOptions{})
+		body, err := pvcExpandPatchBody(snap.UID, snap.ResourceVersion, desired.String())
+		if err != nil {
+			m.claimEvent(w.ID, ns, pvc.Name, "expand", "pvc-expand-failed", "encode", truncateClaimError(err))
+			continue
+		}
+		got, err := m.client.CoreV1().PersistentVolumeClaims(ns).Patch(ctx, pvc.Name, types.MergePatchType, body, metav1.PatchOptions{})
 		if err != nil {
 			m.claimEvent(w.ID, ns, pvc.Name, "expand", "pvc-expand-failed", patchFailureReason(err), truncateClaimError(err))
 			continue
@@ -231,6 +232,32 @@ func (m *Materializer) expandClaims(ctx context.Context, w protocol.DesiredWorke
 		from, to := snap.Requested, desired
 		m.claimEvent(w.ID, ns, pvc.Name, "expand", "pvc-expand-requested", "desired-larger", fmt.Sprintf("from=%s to=%s", from.String(), to.String()))
 	}
+}
+
+// pvcExpandPatchBody encodes the fenced merge patch whole, so no value is spliced into
+// hand-written JSON. Field order is fixed by the struct: metadata.uid, then
+// metadata.resourceVersion (the apiserver's preconditions), then the storage request.
+func pvcExpandPatchBody(uid, resourceVersion, storage string) ([]byte, error) {
+	type requests struct {
+		Storage string `json:"storage"`
+	}
+	type resources struct {
+		Requests requests `json:"requests"`
+	}
+	type spec struct {
+		Resources resources `json:"resources"`
+	}
+	type metadata struct {
+		UID             string `json:"uid"`
+		ResourceVersion string `json:"resourceVersion"`
+	}
+	return json.Marshal(struct {
+		Metadata metadata `json:"metadata"`
+		Spec     spec     `json:"spec"`
+	}{
+		Metadata: metadata{UID: uid, ResourceVersion: resourceVersion},
+		Spec:     spec{Resources: resources{Requests: requests{Storage: storage}}},
+	})
 }
 
 func patchFailureReason(err error) string {
