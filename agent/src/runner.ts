@@ -528,14 +528,22 @@ function codexBoundaryFieldsOf(
 class BoundaryStepTracker {
   private active: { step: BoundaryStep; startedAt: number } | undefined;
 
+  /** `enterLog` switches to enter-logging mode: one info line per `enter` (fields from
+   *  `fields`), and no close or duration lines. */
   constructor(
     private readonly log: Logger,
     private readonly now: () => number,
     private readonly event: "finalize step" | "checkpoint step",
     private readonly sink?: BoundarySink,
+    private readonly enterLog?: { event: string; fields: Record<string, unknown> },
   ) {}
 
   enter(step: BoundaryStep): void {
+    if (this.enterLog) {
+      this.active = { step, startedAt: this.now() };
+      this.log.info(this.enterLog.event, { ...this.enterLog.fields, step });
+      return;
+    }
     this.close();
     this.active = { step, startedAt: this.now() };
   }
@@ -552,6 +560,7 @@ class BoundaryStepTracker {
     const active = this.active;
     if (!active) return;
     this.active = undefined;
+    if (this.enterLog) return;
     const elapsed = this.now() - active.startedAt;
     const fields: Record<string, unknown> = { step: active.step, durationMs: Number.isFinite(elapsed) ? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, elapsed)) : 0,
       ...(this.sink ? { sink: this.sink } : {}) };
@@ -962,6 +971,8 @@ type MidTurnTickOutcome =
 type CheckpointBodyOpts = Parameters<NonNullable<RunContext["checkpoint"]>>[0] & {
   /** No `running` reportState (the mid-turn tick). */
   quiet?: boolean;
+  /** Set only by the mid-turn ticker: log one "mid-turn checkpoint tick step" line per step entered. */
+  tickSteps?: boolean;
   donePermit?: BoundaryPermit;
   doneAttempt?: { stop: CheckpointStop; deadlineAt: number; softDeadlineAt?: number; now: () => number; steps: BoundaryStepTracker };
   /** The tick's cancellation signal: checked between steps and handed to the publish RPC. */
@@ -14461,7 +14472,11 @@ export class RunRunner {
       // `barePath` is the outer `let` (string | undefined); it is set before the run
       // reaches the executor, but narrow it so the closure is honest rather than `!`.
       if (!barePath) return "no_new_work";
-      const checkpointSteps = opts.doneAttempt?.steps ?? (opts.reap ? new BoundaryStepTracker(runLog, this.now, "checkpoint step", opts.sink) : undefined);
+      const checkpointSteps = opts.doneAttempt?.steps ?? (opts.reap
+        ? new BoundaryStepTracker(runLog, this.now, "checkpoint step", opts.sink)
+        : opts.tickSteps
+          ? new BoundaryStepTracker(runLog, this.now, "checkpoint step", undefined, { event: "mid-turn checkpoint tick step", fields: { run_id: runId } })
+          : undefined);
       if (opts.doneAttempt) checkpointSteps?.enter("checkpoint_code_head_runner_tip");
       // Decision 6 tip-movement check: has the runner clone's branch tip moved since the
       // last checkpoint wrote the tracking ref? A null trackTip (never checkpointed) or a
@@ -16504,7 +16519,7 @@ export class RunRunner {
     // settlement happens before the shutdown branch runs.
     const ticker = barePath
       ? this.startMidTurnTicker(flight, barePath, runnerClone.path, runnerClone.branch, (tickOpts) =>
-          checkpointBody({ reap: false, quiet: true, ...tickOpts }),
+          checkpointBody({ reap: false, quiet: true, tickSteps: true, ...tickOpts }),
         )
       : undefined;
     let result: ExecutorResult;
