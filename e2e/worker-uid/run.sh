@@ -47,6 +47,8 @@ node e2e/worker-uid/inventory.mjs single > "$REPORT_DIR/single-expected.json"
 SINGLE_PATTERN="$(node e2e/worker-uid/pattern.mjs "$REPORT_DIR/single-expected.json")"
 node e2e/worker-uid/inventory.mjs shared > "$REPORT_DIR/shared-expected.json"
 SHARED_PATTERN="$(node e2e/worker-uid/pattern.mjs "$REPORT_DIR/shared-expected.json")"
+node e2e/worker-uid/inventory.mjs browser > "$REPORT_DIR/browser-expected.json"
+BROWSER_PATTERN="$(node e2e/worker-uid/pattern.mjs "$REPORT_DIR/browser-expected.json")"
 if [ "${WORKER_UID_SKIP_BUILD:-}" != 1 ]; then
   phase image-build timeout --kill-after=5s 60s docker build -f agent/templates/base/Dockerfile -t "$IMAGE" .
 fi
@@ -196,6 +198,51 @@ python3 e2e/worker-uid/check.py "$REPORT_DIR/shared-expected.json" "$REPORT_DIR/
 if [ "$shared_rc" -ne 0 ]; then
   printf 'worker UID shared node/container exit: %s\n' "$shared_rc" >&2
 fi
-if [ "$rc" -ne 0 ] || [ "$checker_rc" -ne 0 ] || [ "$command_rc" -ne 0 ] || [ "$command_checker_rc" -ne 0 ] || [ "$single_failed" -ne 0 ] || [ "$shared_rc" -ne 0 ] || [ "$shared_checker_rc" -ne 0 ]; then
+# Issue #3907: the ONE container that leaves /nix unmasked. Every container above masks /nix with
+# tmpfs, so the baked Chromium (/opt/uzi-toolchain -> /nix/store) is absent there; this phase runs
+# browser-discovery-real.test.mts, which launches it through the exported discovery paths. /nix is an
+# invocation-labelled named volume instead: Docker populates an empty named volume from the image's
+# /nix on first mount. The name is journaled BEFORE creation (so a lost ACK is still cleaned up by
+# exact name), cleanup verifies its label, and the container is journaled after it so the container
+# is removed first. Otherwise the same posture as worker-proof: root-started through the real
+# entrypoint, the same five capabilities and no others, no-new-privileges, no network.
+# Deadline: 420s capture / 415s watchdog covers populating /nix on first mount plus two tests
+# (each at most 240s and 180s by its own timeout, in practice a few Chromium launches).
+browser_rc=0
+browser_checker_rc=0
+browser_name="$NAME-browser"
+browser_volume="$NAME-nix"
+owned_request volume "$browser_volume"
+if browser_receipt=$(phase browser-volume timeout --kill-after=5s 5s docker volume create \
+     --label "io.uzi.worker-uid.invocation=$TOKEN" "$browser_volume") \
+   && [ "$browser_receipt" = "$browser_volume" ] \
+   && phase browser-volume-owner python3 "$REPO/e2e/worker-uid/bounded.py" verify-volume "$REPORT_DIR" "$TOKEN" "$browser_volume"; then
+  owned_request container "$browser_name"
+  phase browser-proof capture "$REPORT_DIR/browser-results.xml" 420 \
+    timeout --kill-after=5s 415s docker run --pull never --network none \
+    --label "io.uzi.worker-uid.invocation=$TOKEN" --name "$browser_name" --cap-drop ALL \
+    --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
+    --security-opt no-new-privileges --tmpfs /data --mount "type=volume,src=$browser_volume,dst=/nix" --workdir /proof \
+    --tmpfs /app/uzi-worker-uid-proof:exec,uid=10001,gid=10001,mode=0755 \
+    --tmpfs /proof/.uzi/scratch:exec,uid=10001,gid=10001,mode=0700 \
+    --mount "type=bind,src=$REPO/e2e/worker-uid,dst=/app/uzi-worker-uid-proof/e2e/worker-uid,readonly" \
+    --mount "type=bind,src=$REPO/agent/src,dst=/app/uzi-worker-uid-proof/agent/src,readonly" \
+    --mount "type=bind,src=$REPO/agent/test,dst=/app/uzi-worker-uid-proof/agent/test,readonly" \
+    --mount "type=bind,src=$REPO/agent/templates,dst=/app/uzi-worker-uid-proof/agent/templates,readonly" \
+    --entrypoint /usr/local/sbin/uzi-entrypoint "$IMAGE" \
+    /usr/local/bin/node --import /app/node_modules/tsx/dist/loader.mjs --import /app/uzi-worker-uid-proof/e2e/worker-uid/image-layout.mjs --import /app/uzi-worker-uid-proof/agent/test/setup/hermetic-proc.ts \
+    --test --test-concurrency=1 --test-timeout=240000 --test-reporter=junit \
+    --test-name-pattern "$BROWSER_PATTERN" \
+    /app/uzi-worker-uid-proof/e2e/worker-uid/browser-discovery-real.test.mts || browser_rc=$?
+  python3 e2e/worker-uid/check.py "$REPORT_DIR/browser-expected.json" "$REPORT_DIR/browser-results.xml" || browser_checker_rc=$?
+else
+  printf 'worker UID browser volume setup failed\n' >&2
+  browser_rc=1
+  browser_checker_rc=1
+fi
+if [ "$browser_rc" -ne 0 ]; then
+  printf 'worker UID browser node/container exit: %s\n' "$browser_rc" >&2
+fi
+if [ "$rc" -ne 0 ] || [ "$checker_rc" -ne 0 ] || [ "$command_rc" -ne 0 ] || [ "$command_checker_rc" -ne 0 ] || [ "$single_failed" -ne 0 ] || [ "$shared_rc" -ne 0 ] || [ "$shared_checker_rc" -ne 0 ] || [ "$browser_rc" -ne 0 ] || [ "$browser_checker_rc" -ne 0 ]; then
   exit 1
 fi

@@ -29,6 +29,9 @@ COMMAND_EXPECTED = [{"file": "e2e/worker-uid/memory-command-real.test.mts", "nam
 SINGLE_EXPECTED = [{"file": "e2e/worker-uid/single-uid-preflight.test.mts", "names": ["single leaf"]}]
 SHARED_EXPECTED = [{"file": "e2e/worker-uid/runner-shared-real.test.mts", "names": ["shared leaf"]},
                    {"file": "e2e/worker-uid/pod-epoch-real.test.mts", "names": ["epoch leaf"]}]
+BROWSER_EXPECTED = [{"file": "e2e/worker-uid/browser-discovery-real.test.mts", "names": ["browser leaf"]}]
+BROWSER_PASS = ('<testsuites><testcase name="browser leaf" '
+                'file="/app/uzi-worker-uid-proof/e2e/worker-uid/browser-discovery-real.test.mts"/></testsuites>')
 SHARED_PASS = ('<testsuites><testcase name="shared leaf" '
                'file="/app/uzi-worker-uid-proof/e2e/worker-uid/runner-shared-real.test.mts"/>'
                '<testcase name="epoch leaf" file="/app/uzi-worker-uid-proof/e2e/worker-uid/pod-epoch-real.test.mts"/></testsuites>')
@@ -202,11 +205,11 @@ class RunnerTest(unittest.TestCase):
         self.stub("node", """
 from pathlib import Path
 if args[0] == "e2e/worker-uid/inventory.mjs":
-    print(os.environ[{"command": "COMMAND_EXPECTED", "single": "SINGLE_EXPECTED", "shared": "SHARED_EXPECTED"}.get(args[1] if args[1:] else "", "EXPECTED")])
+    print(os.environ[{"command": "COMMAND_EXPECTED", "single": "SINGLE_EXPECTED", "shared": "SHARED_EXPECTED", "browser": "BROWSER_EXPECTED"}.get(args[1] if args[1:] else "", "EXPECTED")])
 elif args[0] == "e2e/worker-uid/pattern.mjs":
-    key = {"command-expected.json": "COMMAND_EXPECTED", "single-expected.json": "SINGLE_EXPECTED", "shared-expected.json": "SHARED_EXPECTED"}.get(Path(args[1]).name, "EXPECTED")
+    key = {"command-expected.json": "COMMAND_EXPECTED", "single-expected.json": "SINGLE_EXPECTED", "shared-expected.json": "SHARED_EXPECTED", "browser-expected.json": "BROWSER_EXPECTED"}.get(Path(args[1]).name, "EXPECTED")
     assert json.loads(Path(args[1]).read_text()) == json.loads(os.environ[key])
-    print({"COMMAND_EXPECTED": "^command leaf$", "SINGLE_EXPECTED": "^single leaf$", "SHARED_EXPECTED": "^shared leaf$"}.get(key, "^suite leaf$"))
+    print({"COMMAND_EXPECTED": "^command leaf$", "SINGLE_EXPECTED": "^single leaf$", "SHARED_EXPECTED": "^shared leaf$", "BROWSER_EXPECTED": "^browser leaf$"}.get(key, "^suite leaf$"))
 else:
     raise AssertionError(args)
 """)
@@ -237,13 +240,19 @@ if args[0] == "run" or args[:2] == ["volume", "create"]:
                    "Config": {"Labels": {"io.uzi.worker-uid.invocation": token}}}
     if not volume:
         masked = {args[i + 1].split(":")[0] for i, arg in enumerate(args) if arg == "--tmpfs"}
+        # An explicit NAMED volume mounted at a path leaves no anonymous volume for it either.
+        for i, arg in enumerate(args):
+            if arg == "--mount":
+                fields = dict(p.split("=", 1) for p in args[i + 1].split(",") if "=" in p)
+                if fields.get("type") == "volume" and fields.get("src"):
+                    masked.add(fields["dst"])
         state[name]["AnonymousVolumes"] = [p for p in ("/data", "/nix") if p not in masked]
     if os.environ["OWNERSHIP_MISMATCH"] and name.endswith(os.environ["OWNERSHIP_MISMATCH"]):
         state[name]["Labels"] = state[name]["Config"]["Labels"] = {}
     state_path.write_text(json.dumps(state))
     if volume:
         print(name)
-        sys.exit(int(os.environ["VOLUME_RC"]))
+        sys.exit(int(os.environ["BROWSER_VOLUME_RC"] if name.endswith("-nix") else os.environ["VOLUME_RC"]))
     if name.endswith("-provision"):
         image = args[args.index("--entrypoint") + 2]
         derived = next(v for v in state.values() if v.get("Id") == image)
@@ -254,6 +263,13 @@ if args[0] == "run" or args[:2] == ["volume", "create"]:
     command = name.endswith("-command")
     prefix = "COMMAND_" if command else ""
     print("container stderr fixture", file=sys.stderr)
+    if name.endswith("-browser"):
+        if os.environ["BROWSER_XML_MODE"] == "missing":
+            reports = list(Path(".uzi/scratch").glob("worker-uid.*/browser-results.xml"))
+            max(reports, key=lambda path: path.stat().st_mtime_ns).unlink()
+        else:
+            print(os.environ["BROWSER_XML"], flush=True)
+        sys.exit(int(os.environ["BROWSER_CONTAINER_RC"]))
     if name.endswith("-shared"):
         if os.environ["SHARED_XML_MODE"] == "missing":
             reports = list(Path(".uzi/scratch").glob("worker-uid.*/shared-results.xml"))
@@ -331,7 +347,7 @@ operation = args[3]
 if operation == "run":
     name = args[args.index("--name") + 1]
     if name.endswith("-provision"): assert 0 < seconds <= 5, args
-    else: assert seconds == (415 if name.endswith("-shared") else 115 if name.endswith("-command") else 65 if "-single-" in name else 7), args
+    else: assert seconds == (415 if name.endswith(("-shared", "-browser")) else 115 if name.endswith("-command") else 65 if "-single-" in name else 7), args
 elif operation == "build":
     assert (0 < seconds < 20) if "--builder" in args else seconds == 60, args
 else:
@@ -342,7 +358,8 @@ signal.signal(signal.SIGTERM, lambda *_: proc.terminate())
 rc = proc.wait(timeout=5)
 key = "TIMEOUT_RC" if operation == "run" and seconds == 7 else (
     "COMMAND_TIMEOUT_RC" if operation == "run" and seconds == 115 else (
-    "SHARED_TIMEOUT_RC" if operation == "run" and seconds == 415 else ""))
+    ("BROWSER_TIMEOUT_RC" if name.endswith("-browser") else "SHARED_TIMEOUT_RC")
+    if operation == "run" and seconds == 415 else ""))
 if operation == "run" and seconds == 65:
     cfg = json.loads(os.environ["SINGLE"]).get(args[args.index("--name") + 1].rsplit("-", 1)[1], {})
     if cfg.get("timeout"):
@@ -372,7 +389,8 @@ sys.exit(rc)
                  command_xml=COMMAND_PASS, command_rc=0, command_timeout="", command_mode="",
                  metadata_rc=0, provision_rc=0, build_rc=0, cleanup_rc=0,
                  volume_rc=0, ownership_mismatch="", single=None,
-                 shared_xml=SHARED_PASS, shared_rc=0, shared_timeout="", shared_mode=""):
+                 shared_xml=SHARED_PASS, shared_rc=0, shared_timeout="", shared_mode="",
+                 browser_xml=BROWSER_PASS, browser_rc=0, browser_timeout="", browser_mode="", browser_volume_rc=0):
         (self.repo / "resources.json").unlink(missing_ok=True)
         env = {
             "PATH": str(self.bin) + os.pathsep + os.defpath,
@@ -381,6 +399,9 @@ sys.exit(rc)
             "SINGLE_EXPECTED": json.dumps(SINGLE_EXPECTED), "SINGLE_PASS": SINGLE_PASS,
             "SHARED_EXPECTED": json.dumps(SHARED_EXPECTED), "SHARED_XML": shared_xml, "SHARED_XML_MODE": shared_mode,
             "SHARED_CONTAINER_RC": str(shared_rc), "SHARED_TIMEOUT_RC": str(shared_timeout),
+            "BROWSER_EXPECTED": json.dumps(BROWSER_EXPECTED), "BROWSER_XML": browser_xml, "BROWSER_XML_MODE": browser_mode,
+            "BROWSER_CONTAINER_RC": str(browser_rc), "BROWSER_TIMEOUT_RC": str(browser_timeout),
+            "BROWSER_VOLUME_RC": str(browser_volume_rc),
             "SINGLE": json.dumps(single or {}),
             "COMMAND_XML": command_xml, "COMMAND_XML_MODE": command_mode,
             "COMMAND_CONTAINER_RC": str(command_rc), "COMMAND_TIMEOUT_RC": str(command_timeout),
@@ -405,7 +426,7 @@ sys.exit(rc)
             if call[0] == "docker":
                 self.assertEqual(calls[index - 1][0], "timeout", call)
                 self.assertEqual(calls[index - 1][3:], call)
-        if metadata_rc or provision_rc or build_rc or volume_rc or ownership_mismatch:
+        if metadata_rc or provision_rc or build_rc or volume_rc or browser_volume_rc or ownership_mismatch:
             self.assertNotEqual(result.returncode, 0, result.stderr)
             removals = [call for call in calls if call[:2] == ["docker", "rm"] or call[:3] == ["docker", "volume", "rm"]]
             if metadata_rc or build_rc:
@@ -416,20 +437,20 @@ sys.exit(rc)
                 self.assertTrue(removals)
             return result, calls
         self.assertNotIn("must not set ReadOnly mode when using anonymous volumes", result.stderr)
-        self.assertEqual(len(runs), 7, result.stderr)
-        provision, run, command, *singles, shared = runs
+        self.assertEqual(len(runs), 8, result.stderr)
+        provision, run, command, *singles, shared, browser = runs
         name = run[run.index("--name") + 1]
         self.assertTrue(name.startswith("wuid-2134-"), name)
         state = json.loads((self.repo / "resources.json").read_text())
         self.assertEqual([call for call in calls if call[:2] == ["docker", "rm"]],
                          [["docker", "rm", "-f", "--volumes", state[n]["Id"]]
-                          for n in (name + "-shared", name + "-single-3", name + "-single-2", name + "-single-1",
+                          for n in (name + "-browser", name + "-shared", name + "-single-3", name + "-single-2", name + "-single-1",
                                    name + "-command", name, name + "-provision")])
         self.assertRegex(name, r"^wuid-2134-[0-9a-f]{32}$")
-        for n in (name, name + "-command", name + "-provision", name + "-shared", *(f"{name}-single-{i}" for i in (1, 2, 3))):
+        for n in (name, name + "-command", name + "-provision", name + "-shared", name + "-browser", name + "-nix", *(f"{name}-single-{i}" for i in (1, 2, 3))):
             self.assertEqual(state[n]["Labels"]["io.uzi.worker-uid.invocation"], name.removeprefix("wuid-2134-"))
         self.assertEqual([call for call in calls if call[:3] == ["docker", "volume", "rm"]],
-                         [["docker", "volume", "rm", name + suffix] for suffix in ("-task", "-go")])
+                         [["docker", "volume", "rm", name + suffix] for suffix in ("-nix", "-task", "-go")])
         self.assertEqual(command[command.index("--name") + 1], name + "-command")
         self.assertEqual(command[command.index("--user") + 1], "10003:10003")
         self.assertEqual(command[command.index("--cap-drop") + 1], "ALL")
@@ -457,7 +478,7 @@ sys.exit(rc)
                                ("agent/package.json", "/app/uzi-worker-uid-proof/agent/package.json"),
                                ("agent/codex/supervisor", "/app/uzi-worker-uid-proof/agent/codex/supervisor")):
             self.assertIn(f"type=bind,src={self.repo}/{source},dst={target},readonly", mounts)
-        self.assertEqual(len([c for c in calls if c[:3] == ["docker", "volume", "create"]]), 2)
+        self.assertEqual(len([c for c in calls if c[:3] == ["docker", "volume", "create"]]), 3)
         self.assertIn('lstatSync("/app/uzi-worker-uid-proof")', provision[-1])
         self.assertIn('e.code!=="ENOENT"', provision[-1])
         self.assertIn('require.resolve("tsx")', provision[-1])
@@ -476,6 +497,14 @@ sys.exit(rc)
         self.assert_single_containers(name, singles, calls)
         self.assertTrue(Path(report, "shared-expected.json").is_file())
         self.assert_shared_container(name, shared)
+        self.assertTrue(Path(report, "browser-expected.json").is_file())
+        self.assert_browser_container(name, browser)
+        # The volume is journaled BEFORE it is created, the container after it, so the container is
+        # removed first and the labelled volume by exact name.
+        journal = Path(report, "attempted").read_text().splitlines()
+        self.assertLess(journal.index("volume " + name + "-nix"), journal.index("container " + name + "-browser"))
+        create = next(i for i, c in enumerate(calls) if c[:3] == ["docker", "volume", "create"] and c[-1] == name + "-nix")
+        self.assertLess(create, calls.index(browser))
         for i in (1, 2, 3):
             if (single or {}).get(str(i), {}).get("mode") != "missing":
                 self.assertTrue(Path(report, f"single-{i}-results.xml").is_file())
@@ -516,7 +545,7 @@ sys.exit(rc)
         run_index = next(i for i, c in enumerate(calls) if c[:2] == ["docker", "run"] and
                          c[c.index("--name") + 1] == name + "-command")
         order = [c[c.index("--name") + 1] for c in calls[run_index:] if c[:2] == ["docker", "run"]]
-        self.assertEqual(order, [name + "-command", *(f"{name}-single-{i}" for i in (1, 2, 3)), name + "-shared"])
+        self.assertEqual(order, [name + "-command", *(f"{name}-single-{i}" for i in (1, 2, 3)), name + "-shared", name + "-browser"])
         for call, (posture, no_new_privs, caps) in zip(singles, postures):
             self.assertEqual(call[call.index("--user") + 1], "10001:10001")
             self.assertEqual(call[call.index("--cap-drop") + 1], "ALL")
@@ -570,6 +599,38 @@ sys.exit(rc)
                        "controller/internal/kube/testdata/runner-shared-init.sh"):
             self.assertIn(f"type=bind,src={self.repo}/{source},dst=/app/uzi-worker-uid-proof/{source},readonly", mounts)
 
+    def assert_browser_container(self, name, call):
+        # Same posture as worker-proof (root-started through the real entrypoint, the same five
+        # capabilities, no network), except /nix is a labelled named volume instead of tmpfs.
+        token = name.removeprefix("wuid-2134-")
+        self.assertEqual(call[call.index("--name") + 1], name + "-browser")
+        self.assertNotIn("--user", call)
+        self.assertEqual(call[call.index("--entrypoint") + 1], "/usr/local/sbin/uzi-entrypoint")
+        self.assertEqual(call[call.index("--entrypoint") + 2], "sha256:" + "a" * 64)
+        self.assertEqual(call[call.index("--network") + 1], "none")
+        self.assertEqual(call[call.index("--cap-drop") + 1], "ALL")
+        self.assertEqual([call[i + 1] for i, a in enumerate(call) if a == "--cap-add"],
+                         ["CHOWN", "DAC_OVERRIDE", "SETPCAP", "SETUID", "SETGID"])
+        self.assertEqual([call[i + 1] for i, a in enumerate(call) if a == "--security-opt"], ["no-new-privileges"])
+        self.assertEqual(call[call.index("--label") + 1], "io.uzi.worker-uid.invocation=" + token)
+        self.assertEqual(call[call.index("--workdir") + 1], "/proof")
+        self.assertEqual([call[i + 1] for i, a in enumerate(call) if a == "--tmpfs"],
+                         ["/data", "/app/uzi-worker-uid-proof:exec,uid=10001,gid=10001,mode=0755",
+                          "/proof/.uzi/scratch:exec,uid=10001,gid=10001,mode=0700"])
+        mounts = [call[i + 1] for i, a in enumerate(call) if a == "--mount"]
+        self.assertEqual([m for m in mounts if m.startswith("type=volume,")], ["type=volume,src=" + name + "-nix,dst=/nix"])
+        for source in ("e2e/worker-uid", "agent/src", "agent/test", "agent/templates"):
+            self.assertIn(f"type=bind,src={self.repo}/{source},dst=/app/uzi-worker-uid-proof/{source},readonly", mounts)
+        self.assertEqual(call[call.index("--entrypoint") + 3:call.index("--test")], [
+            "/usr/local/bin/node", "--import", "/app/node_modules/tsx/dist/loader.mjs",
+            "--import", "/app/uzi-worker-uid-proof/e2e/worker-uid/image-layout.mjs",
+            "--import", "/app/uzi-worker-uid-proof/agent/test/setup/hermetic-proc.ts",
+        ])
+        self.assertIn("--test-timeout=240000", call)
+        self.assertIn("--test-reporter=junit", call)
+        self.assertEqual(call[call.index("--test-name-pattern") + 1], "^browser leaf$")
+        self.assertEqual(call[-1], "/app/uzi-worker-uid-proof/e2e/worker-uid/browser-discovery-real.test.mts")
+
     def test_ownership_failure_and_ambiguous_create(self):
         for options in ({"ownership_mismatch": "-command"}, {"ownership_mismatch": "-go"}, {"provision_rc": 23}):
             with self.subTest(options=options):
@@ -616,23 +677,33 @@ sys.exit(rc)
         for command in [c for c in calls if c[:2] == ["docker", "run"]]:
             mounts = {command[i + 1].split(":")[0] for i, arg in enumerate(command) if arg == "--tmpfs"}
             self.assertIn("/data", mounts)
-            self.assertIn("/nix", mounts)
+            if command[command.index("--name") + 1].endswith("-browser"):
+                # The one unmasked /nix is an explicit named volume, never an anonymous one.
+                self.assertNotIn("/nix", mounts)
+                self.assertTrue(any(arg.startswith("type=volume,src=") and arg.endswith(",dst=/nix")
+                                    for arg in command))
+            else:
+                self.assertIn("/nix", mounts)
 
     def test_readonly_tools_use_named_owned_volumes(self):
         result, calls = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         creates = [call for call in calls if call[:3] == ["docker", "volume", "create"]]
-        self.assertEqual(len(creates), 2)
+        self.assertEqual(len(creates), 3)
         for command in creates:
             self.assertIn("--label", command)
-            self.assertRegex(command[-1], r"^wuid-2134-[0-9a-f]{32}-(go|task)$")
+            self.assertRegex(command[-1], r"^wuid-2134-[0-9a-f]{32}-(go|task|nix)$")
+        # Every volume carries this invocation's ownership label, the browser /nix volume included.
+        for command in creates:
+            self.assertRegex(command[command.index("--label") + 1], r"^io\.uzi\.worker-uid\.invocation=[0-9a-f]{32}$")
 
     def test_only_static_tool_directories_use_copyup_volumes(self):
         result, calls = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         creates = [c for c in calls if c[:3] == ["docker", "volume", "create"]]
-        self.assertEqual(len(creates), 2)
-        self.assertTrue(all(c[-1].endswith(("-go", "-task")) for c in creates))
+        self.assertEqual(len(creates), 3)
+        # go and task are static tool directories; -nix is the browser phase's whole /nix.
+        self.assertTrue(all(c[-1].endswith(("-go", "-task", "-nix")) for c in creates))
 
     def test_success_and_build(self):
         result, calls = self.run_lane(skip_build="")
@@ -704,7 +775,60 @@ sys.exit(rc)
                         self.assertIn("deadline: phase=shared-proof command=capture", result.stderr)
                 else:
                     self.assertIn("worker UID lane FAIL", result.stderr)
-                self.assertEqual(len([c for c in calls if c[:2] == ["docker", "run"]]), 7)
+                self.assertEqual(len([c for c in calls if c[:2] == ["docker", "run"]]), 8)
+
+    def test_browser_outcomes(self):
+        failing = BROWSER_PASS.replace("/>", '><failure message="browser fixture"/></testcase>')
+        for mode in ("failure", "skip", "missing", "timeout", "status", "malformed", "empty"):
+            with self.subTest(mode=mode):
+                self.calls.unlink(missing_ok=True)
+                kwargs = {}
+                if mode == "failure":
+                    kwargs["browser_xml"] = failing
+                elif mode == "skip":
+                    kwargs["browser_xml"] = BROWSER_PASS.replace("/>", "><skipped/></testcase>")
+                elif mode == "missing":
+                    kwargs.update(browser_mode="missing", browser_rc=1)
+                elif mode == "timeout":
+                    kwargs.update(browser_xml="", browser_timeout=124)
+                elif mode == "status":
+                    kwargs["browser_rc"] = 23
+                elif mode == "malformed":
+                    kwargs["browser_xml"] = "<testsuites>"
+                else:
+                    kwargs["browser_xml"] = "<testsuites/>"
+                result, calls = self.run_lane(**kwargs)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                # Every earlier proof still ran and passed; the browser container is individually fatal.
+                self.assertGreaterEqual(result.stdout.count("1 required leaves passed"), 5)
+                if mode in ("status", "timeout", "missing"):
+                    code = {"status": 23, "timeout": 124, "missing": 1}[mode]
+                    self.assertIn(f"worker UID browser node/container exit: {code}", result.stderr)
+                    if mode == "timeout":
+                        self.assertIn("deadline: phase=browser-proof command=capture", result.stderr)
+                else:
+                    self.assertIn("worker UID lane FAIL", result.stderr)
+                self.assertEqual(len([c for c in calls if c[:2] == ["docker", "run"]]), 8)
+
+    def test_browser_volume_setup_failures_skip_the_container(self):
+        for options in ({"browser_volume_rc": 23}, {"ownership_mismatch": "-nix"}):
+            with self.subTest(options=options):
+                self.calls.unlink(missing_ok=True)
+                result, calls = self.run_lane(**options)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("worker UID browser volume setup failed", result.stderr)
+                # The seven earlier containers ran; the browser container never started.
+                names = [c[c.index("--name") + 1] for c in calls if c[:2] == ["docker", "run"]]
+                self.assertEqual(len(names), 7, names)
+                self.assertFalse(any(n.endswith("-browser") for n in names))
+                removed_volumes = [c[-1] for c in calls if c[:3] == ["docker", "volume", "rm"]]
+                if "ownership_mismatch" in options:
+                    # Label-verified cleanup refuses a volume that does not carry this invocation's label.
+                    self.assertFalse(any(v.endswith("-nix") for v in removed_volumes), removed_volumes)
+                    self.assertIn("ownership mismatch", result.stderr)
+                else:
+                    # A failed create (lost ACK) was journaled first, so exact-name cleanup still removes it.
+                    self.assertTrue(any(v.endswith("-nix") for v in removed_volumes), removed_volumes)
 
     def test_single_uid_outcomes(self):
         failing = SINGLE_PASS.replace("/>", '><failure message="single fixture"/></testcase>')
@@ -730,7 +854,7 @@ sys.exit(rc)
                             self.assertIn("deadline: phase=single-", result.stderr)
                     else:
                         self.assertIn("worker UID lane FAIL", result.stderr)
-                    self.assertEqual(len([c for c in calls if c[:2] == ["docker", "run"]]), 7)
+                    self.assertEqual(len([c for c in calls if c[:2] == ["docker", "run"]]), 8)
 
     def test_single_uid_checker_failure_with_clean_container(self):
         result, _ = self.run_lane(single={"2": {"xml": "<testsuites/>"}})
@@ -741,12 +865,12 @@ sys.exit(rc)
     def test_single_uid_passing_runs_succeed_and_failure_keeps_going(self):
         result, _ = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.count("1 required leaves passed"), 5)
+        self.assertEqual(result.stdout.count("1 required leaves passed"), 6)
         self.assertEqual(result.stdout.count("2 required leaves passed"), 1)
         self.calls.unlink(missing_ok=True)
         result, _ = self.run_lane(single={"1": {"rc": 9}, "3": {"rc": 8}})
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout.count("1 required leaves passed"), 5)
+        self.assertEqual(result.stdout.count("1 required leaves passed"), 6)
         self.assertEqual(result.stdout.count("2 required leaves passed"), 1)
         for number, code in (("1", 9), ("3", 8)):
             self.assertIn(f"worker UID single-{number} node/container exit: {code}", result.stderr)
@@ -762,7 +886,7 @@ sys.exit(rc)
         result, calls = self.run_lane(cleanup_rc=124)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Docker rm -f exit: 124", result.stderr)
-        self.assertEqual(len([c for c in calls if c[:3] == ["docker", "volume", "rm"]]), 2,
+        self.assertEqual(len([c for c in calls if c[:3] == ["docker", "volume", "rm"]]), 3,
                          "a failed container removal must not suppress owned volume cleanup attempts")
 
     def test_worker_skip(self):
