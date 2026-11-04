@@ -482,7 +482,36 @@ export function annotateRetainedSuccessorError<T>(error: T, reason: string): T {
 export function classifyGitStderr(error: unknown): "transient" | "permanent" {
   const retained = error instanceof Error ? retainedGitDiagnostics.get(error) : undefined;
   const stderr = retained?.stderr.trim();
-  return stderr ? classifyForgeError(new Error(stderr)) : "permanent";
+  return stderr ? classifyGitStderrText(stderr) : "permanent";
+}
+
+const BARE_REMOTE_REJECTED_FAILED = /^\s*!\s+\[remote rejected\]\s+\S+\s+->\s+\S+\s+\(failed\)\s*$/;
+const PUSH_FRAMING_LINES: RegExp[] = [
+  /^To \S+\s*$/,
+  BARE_REMOTE_REJECTED_FAILED,
+  /^error: failed to push some refs to '[^']*'\s*$/,
+  /^remote:\s*$/,
+  /^\s*$/,
+];
+
+/**
+ * Classify push stderr text (#3929, ADR-0284 amendment). GitHub was observed refusing a push with a
+ * bare ` ! [remote rejected] <sha> -> <branch> (failed)` and no stated reason (cause undocumented and
+ * unproven); the permanent `remote rejected` pattern would fail that fast. By decision, that shape is
+ * transient only when at least one bare `(failed)` status line is present and every line is a whole git
+ * framing line (`To <url>`, the bare status line, `error: failed to push some refs`, empty `remote:`).
+ * Any other line, a `remote:` diagnostic included, may state a reason and keeps today's classification.
+ * Framing lines carry the branch and URL, so they are matched whole (`agent/issue-404` must not decide);
+ * nothing inside any other line is masked.
+ */
+export function classifyGitStderrText(stderr: string): "transient" | "permanent" {
+  if (!stderr.trim()) return "permanent";
+  const lines = stderr.split(/\r?\n|\r/);
+  // Every other line, any other `remote rejected` reason or a `[rejected]` line included, is not framing.
+  if (lines.some((l) => BARE_REMOTE_REJECTED_FAILED.test(l)) && lines.every((l) => PUSH_FRAMING_LINES.some((re) => re.test(l)))) {
+    return "transient";
+  }
+  return classifyForgeError(new Error(stderr));
 }
 
 const RETAINED_DIAGNOSTIC_INPUT_MAX = 64 * 1024;

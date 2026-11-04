@@ -450,6 +450,39 @@ it("a non-enrolled run keeps the existing typed failure for the same outage", as
   assert.match(String(failed(claim.run_id)[0]?.failure_reason), /publication_forge_unreachable: push/);
 });
 
+// #3929: GitHub's bare ` ! [remote rejected] <sha> -> <branch> (failed)` is classified transient (cause unproven).
+const BARE_FAILED_STDERR =
+  "To https://github.com/org/repo.git\n ! [remote rejected] 0123456789abcdef0123456789abcdef01234567 -> agent/issue-5113 (failed)\n" +
+  "error: failed to push some refs to 'https://github.com/org/repo.git'\n";
+
+it("a sustained bare remote-rejected (failed) push on an enrolled run parks on the git surface", async () => {
+  client.protocolFeatures = FEATURES;
+  const outbox = await mkOutbox();
+  ackIntents([]);
+  let pushes = 0;
+  failGit("push", BARE_FAILED_STDERR, () => { pushes++; });
+  const claim = claimFor(5113);
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, outbox);
+  await r.execute(claim);
+  assert.equal(pushes, ATTEMPTS);
+  const park = parks(claim.run_id);
+  assert.equal(park.length, 1);
+  assert.deepEqual([park[0]!.recovery_phase, park[0]!.publication_surface, park[0]!.publication_step], ["publication", "git", "push"]);
+  assert.equal(failed(claim.run_id).length, 0);
+});
+
+it("a sustained bare remote-rejected (failed) push on a non-enrolled run fails typed publication_forge_unreachable: push", async () => {
+  client.protocolFeatures = ["recovery_park_cause"];
+  let pushes = 0;
+  failGit("push", BARE_FAILED_STDERR, () => { pushes++; });
+  const claim = claimFor(5114);
+  const r = build(new StubExecutor(nullLogger()), { gitlab: fakeGitlab().gitlab }, await mkOutbox());
+  await r.execute(claim);
+  assert.equal(pushes, ATTEMPTS);
+  assert.equal(parks(claim.run_id).length, 0);
+  assert.match(String(failed(claim.run_id)[0]?.failure_reason), /publication_forge_unreachable: push/);
+});
+
 it("a lost park ACK is reconciled through the ownership probe: parked once, record kept, no failure", async () => {
   client.protocolFeatures = FEATURES;
   const outbox = await mkOutbox();
