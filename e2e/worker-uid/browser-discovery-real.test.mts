@@ -48,7 +48,12 @@ function browserProcesses(uid: number): string[] {
       const comm = fs.readFileSync(`/proc/${entry}/comm`, "utf8").trim();
       const argv0 = path.basename(fs.readFileSync(`/proc/${entry}/cmdline`, "utf8").split("\0")[0] ?? "");
       if (BROWSER_NAME.test(comm) || BROWSER_NAME.test(argv0)) found.push(`${entry}:${comm}:${argv0}`);
-    } catch { /* the process exited while being read */ }
+    } catch (err) {
+      // Only "the process exited while being read" is benign; any other read failure on a candidate
+      // process must not let a live browser pass unseen.
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ESRCH") found.push(`${entry}:unreadable:${String(code)}`);
+    }
   }
   return found;
 }

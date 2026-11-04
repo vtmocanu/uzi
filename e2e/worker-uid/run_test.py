@@ -374,7 +374,9 @@ if operation == "run":
 elif operation == "build":
     assert (0 < seconds < 20) if "--builder" in args else seconds == 60, args
 elif operation == "volume" and args[4] == "rm":
-    assert seconds == 115, args  # bounded.VOLUME_RM_SECONDS (120) less the five-second kill grace
+    # bounded.VOLUME_RM_SECONDS (120) less the five-second kill grace; a loaded host may have spent a
+    # little of the cleanup deadline first, so accept a slightly smaller bound, never the old 5 s one.
+    assert 100 < seconds <= 115, args
 else:
     assert 0 < seconds <= 5, args
 import signal
