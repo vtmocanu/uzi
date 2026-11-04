@@ -506,6 +506,19 @@ permission errors, history or movement proofs, local git errors, aborts and
 residue blocks. The hops after the merge request exists are unchanged and
 are not covered: description publish, title read/write and PR-head verify.
 
+One refusal that looks permanent is retried: a push refused only with git's
+bare `! [remote rejected] <src> -> <dst> (failed)` line, with no other
+diagnostic (observed from GitHub, reason undocumented). It is treated as
+transient and the same non-forced push is retried on the same schedule, with
+the full publication proof on every attempt. If it keeps failing, it is
+classified `publication_forge_unreachable` like any other exhausted push. Any
+other reason, a `[rejected]` line, authentication, protected-branch or hook
+refusals, workflow scope and push protection stay permanent. A deterministic
+refusal that prints only `(failed)` is therefore retried too: a run that is not
+enrolled pays about 31 s of backoff before failing, and an enrolled run retries
+until the hold threshold (`RUN_PROVIDER_PARK_MAX_DURATION`). See
+[ADR-284](../adr/0284-forge-push-retry-classifier.md).
+
 ### Write-ahead publication intent
 
 Before any remote finalize step, the worker saves a local record and enrolls
