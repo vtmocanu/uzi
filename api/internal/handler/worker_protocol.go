@@ -1875,8 +1875,9 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	}
 	// Issue #3860: cancellation_requested is the read-only signal the worker's held-seam
 	// refusal path reads. It is true only for a stop_kind='cancelled' run with a deliverable
-	// cancel input at the run's current claim generation; the worker also checks
-	// claim_released before acting on it. Always present, false when unknown.
+	// cancel input; it carries no generation or status filter of its own, so the worker acts
+	// on it only with a claimed/running status, its own claim_generation and
+	// claim_released=false from this same body. Always present, false when unknown.
 	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded, "hold_reason": holdReason, "claim_released": claimReleased, "gate_revision": gateRevision, "cancellation_requested": cancellationRequested}
 	if recoveryRetryNotBefore != nil || status == "recovery_wait" {
 		body["recovery_retry_not_before"] = recoveryRetryNotBefore

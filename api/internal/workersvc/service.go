@@ -5621,13 +5621,15 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		case owned.StopKind.Valid && owned.StopKind.String == "cancelled":
 			// Route to a `cancelled` transition (status 'cancelled', fail_origin NULL),
 			// converging with the server-side CancelRunServerSide path. SetRunFailed is NOT
-			// called. rows drives the same applied/not-applied logic below (execrows, like
-			// SetRunFailed).
+			// called. rows (count of transitioned runs, 0 or 1) drives the same
+			// applied/not-applied logic below as SetRunFailed's row count.
 			// Issue #3860: the same statement settles the run's still-unapplied cancel
-			// inputs, so on this path the run never ends cancelled with its cancel row
-			// pending, and the row is never applied without the terminal transition (a
-			// declined transition leaves every input untouched). The stopped arm below
-			// keeps CancelRunByWorker and settles nothing.
+			// inputs, so on this path the run never ends cancelled with a cancel row that was
+			// committed before the report still pending, and the row is never applied without
+			// the terminal transition (a declined transition leaves every input untouched). A
+			// cancel inserted concurrently with the report, or a report handled by an older
+			// api, can still leave an inert unapplied row on the terminal run. The stopped arm
+			// below keeps CancelRunByWorker and settles nothing.
 			rows, err = q.CancelRunByWorkerSettlingCancel(ctx, store.CancelRunByWorkerSettlingCancelParams{
 				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
@@ -5639,7 +5641,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// cancel win in steering and the worker threw REASON_CANCELLED. Either way it is a
 			// deliberate wind-down, not an agent bug, so it must NOT default to
 			// fail_origin='agent_failure' and must NOT be judged. Route to CancelRunByWorker
-			// exactly like the 'cancelled' arm: status 'cancelled', fail_origin NULL (CHECK-safe,
+			// (the 'cancelled' arm's transition without its #3860 input settlement): status 'cancelled', fail_origin NULL (CHECK-safe,
 			// no new vocabulary value), which Gate 0 of maybeEnqueueJudge excludes from judging.
 			rows, err = q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
 				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
