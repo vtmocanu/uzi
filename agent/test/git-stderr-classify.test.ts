@@ -41,6 +41,11 @@ describe("classifyGitStderrText", () => {
     ["bare (failed) plus remote: fatal: (fatal-prefix guard alone)", full("agent/issue-7", "failed", "remote: fatal: weird thing\n")],
     ["bare (failed) plus a push protection notice (push-protection guard alone)", full("agent/issue-7", "failed", "remote: push protection notice\n")],
     ["bare (failed) plus a workflow scope notice (workflow-scope guard alone)", full("agent/issue-7", "failed", "remote: update refused without workflow scope\n")],
+    // GitHub's own workflow-scope wording backticks the scope name, so isWorkflowScopeRejection's
+    // literal "workflow scope" misses it; a separate remote: line beside a bare (failed) must stay permanent.
+    ["bare (failed) plus GitHub's backticked workflow-scope refusal line", full("agent/issue-7", "failed",
+      "remote: refusing to allow a Personal Access Token to create or update workflow `.github/workflows/ci.yml` without `workflow` scope\n")],
+    ["bare (failed) plus a refusing-to-allow line (refusal guard alone)", full("agent/issue-7", "failed", "remote: refusing to allow this update\n")],
     ["one (failed) and one hook-declined status", `To ${URL}\n${status("a")}${status("b", "pre-receive hook declined")}${trailer()}`],
     ["[rejected] fetch first", `To ${URL}\n ! [rejected]        main -> main (fetch first)\n${trailer()}`],
     ["empty stderr", ""],

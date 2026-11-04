@@ -171,8 +171,9 @@ all of these hold:
    (`To <url>`, those ref-status lines, `error: failed to push some refs to
    '<url>'` with nothing after it, and empty `remote:` lines), the remainder
    matches no permanent pattern, no push-protection (`GH013`) or
-   workflow-scope marker, no `remote: error:` / `remote: fatal:` line and no
-   `GHnnn` code.
+   workflow-scope marker, no `refusing to allow` line (GitHub's workflow-scope
+   refusal backticks the scope name, so the literal marker alone misses it), no
+   `remote: error:` / `remote: fatal:` line and no `GHnnn` code.
 
 `/remote rejected/i` **stays** in `PERMANENT_PATTERNS`; the exception is a
 narrow, format-based pre-check, with no forge identity in the classifier.

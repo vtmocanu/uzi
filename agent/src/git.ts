@@ -501,7 +501,8 @@ const PUSH_FRAMING_LINES: RegExp[] = [
  * transient only when every `remote rejected` line is the bare `(failed)` shape and nothing else in the
  * text states a reason: any `remote rejected` line that states a reason, any `[rejected]` line, a pattern hit in the text left after dropping the
  * whole framing lines (`To <url>`, the bare status line, `error: failed to push some refs`, empty
- * `remote:`), a `remote: error|fatal:` line, or a `GHnnn` token keeps today's classification. Framing
+ * `remote:`), a `refusing to allow` line (GitHub's backticked workflow-scope wording), a
+ * `remote: error|fatal:` line, or a `GHnnn` token keeps today's classification. Framing
  * lines carry the branch and URL, so they are removed whole before matching (`agent/issue-404` must
  * not decide); nothing inside any other line is masked.
  */
@@ -519,6 +520,9 @@ export function classifyGitStderrText(stderr: string): "transient" | "permanent"
       !matchesPermanentForgePattern(rest) &&
       !isPushProtectionRejection(rest) &&
       !isWorkflowScopeRejection(rest) &&
+      // GitHub's workflow-scope refusal backticks the scope (`workflow` scope), which the literal
+      // "workflow scope" match above misses; any "refusing to allow" line is a stated refusal.
+      !/refusing to allow/i.test(rest) &&
       !/^remote:\s*(error|fatal):/im.test(rest) &&
       !/\bGH\d{3}\b/.test(rest)
     ) {
