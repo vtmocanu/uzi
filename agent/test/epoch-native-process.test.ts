@@ -77,7 +77,7 @@ function fixture(deleteLaunch = false, identity: Identity = "worker_pat") {
         assert.equal(options.env.GIT_OPTIONAL_LOCKS, "0");
         assert.equal(options.env.GIT_CONFIG_GLOBAL, "/dev/null");
         for (const pin of ["core.multiPackIndex=false", "core.commitGraph=false", "pack.writeReverseIndex=false",
-          "pack.readReverseIndex=false", "pack.threads=1", "index.threads=1"]) {
+          "pack.readReverseIndex=false", "pack.threads=1", "index.threads=1", "core.deltaBaseCacheLimit=8388608"]) {
           const at = _args.indexOf(pin);
           assert.ok(at > 0);
           assert.equal(_args[at - 1], "-c");
