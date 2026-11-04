@@ -48,6 +48,9 @@ describe("classifyGitStderrText", () => {
     ["non-push stderr", "fatal: the remote end hung up on policy grounds"],
     ["authentication failed trailer", `error: failed to push some refs to '${URL}': authentication failed`],
     ["permission denied To line", `To ${URL} permission denied`],
+    // With a bare (failed) status, so an over-broad (prefix) framing removal would turn these transient.
+    ["bare (failed) plus a trailer carrying authentication failed", `To ${URL}\n${status("agent/issue-7")}error: failed to push some refs to '${URL}': authentication failed\n`],
+    ["bare (failed) plus a To line carrying permission denied", `To ${URL} permission denied\n${status("agent/issue-7")}${trailer()}`],
     ["PR hint carrying 403", full("agent/test", "failed", "remote:     https://github.com/org/403/pull/new/agent/test\n")],
     ["PR hint carrying a GH013 branch", full("GH013", "failed", "remote: Create a pull request for 'GH013' on GitHub by visiting:\n")],
     ["PR hint carrying agent/issue-404", full("agent/issue-404", "failed", "remote:      https://github.com/org/repo/pull/new/agent/issue-404\n")],

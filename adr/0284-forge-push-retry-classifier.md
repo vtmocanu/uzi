@@ -156,7 +156,9 @@ by the discriminating test cases above, not just documented in a comment.
 only git's bare ref-status line, `! [remote rejected] <src> -> <dst> (failed)`,
 and no other diagnostic. GitHub does not document the reason. Because
 `remote rejected` is in `PERMANENT_PATTERNS` (D9 above), the run failed at
-once on what was a forge-side hiccup.
+once. Whether that refusal was transient is unproven (a maintainer pushed
+the same content later without issue); this amendment treats the shape as
+transient by decision, not because its cause is known.
 
 **Decision.** `classifyGitStderrText` (`agent/src/git.ts`, called by
 `classifyGitStderr`) now classifies a push as transient when, and only when,
@@ -210,7 +212,8 @@ That is deliberate fail-closed behaviour.
 refusal), it is retried needlessly. A run that is not enrolled pays about 31 s
 of backoff plus per-attempt push and proof time. An enrolled run retries
 publication without a model until the configurable hold threshold
-(`RUN_PROVIDER_PARK_MAX_DURATION`, default 24h; `0` disables).
+(`RUN_PROVIDER_PARK_MAX_DURATION`, default 24h; `0` disables) is evaluated
+at a later park, so that duration is not a hard bound.
 
 **Scope.** Worker-only; older workers keep the old behaviour, and there is no
 API or schema change. Out of scope: checkpoint publication through the api push
