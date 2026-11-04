@@ -93,7 +93,7 @@ class RunShTest(unittest.TestCase):
     def test_pass_shape_and_cleanup(self):
         result, calls = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("worker env lane: 6 required leaves passed", result.stdout)
+        self.assertIn(f"worker env lane: {len(PROOFS['leaves'])} required leaves passed", result.stdout)
         for phase in ("image-identity", "nix-volume-create", "nix-seed", "worker-env-proof"):
             self.assertRegex(result.stderr, rf"worker env phase end: {phase} elapsed=\d+s exit=0")
         runs = [c for c in calls if c[0] == "run"]

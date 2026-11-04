@@ -38,7 +38,7 @@ import { workerSpawnEnv } from "../../agent/src/worker-spawn-mark.js";
 // it sets the same umask under the same condition; it grants nothing the production worker lacks.
 if (uidSplitActive()) process.umask(0o002);
 
-type ProofId = "preflight" | "toolchain" | "forgeFake" | "claudePrivate" | "claudeShared" | "codexBroker";
+type ProofId = "preflight" | "toolchain" | "timezone" | "forgeFake" | "claudePrivate" | "claudeShared" | "codexBroker";
 const PROOFS = JSON.parse(fs.readFileSync(new URL("./proofs.json", import.meta.url), "utf8")) as { leaves: Record<ProofId, string> };
 
 /** Register one required leaf under the exact name proofs.json declares (check.py counts them). */
@@ -47,9 +47,12 @@ function proof(id: ProofId, timeoutMs: number, body: () => Promise<void>): void 
   assert.ok(name, `proofs.json has no leaf ${id}`);
   void test(name, { timeout: timeoutMs }, async () => {
     const started = performance.now();
-    try { await body(); } finally { console.log(`worker-env-timing ${id} ${((performance.now() - started) / 1000).toFixed(1)}s`); }
+    try { await body(); } finally { note(`worker-env-timing ${id} ${((performance.now() - started) / 1000).toFixed(1)}s`); }
   });
 }
+
+/** Diagnostics go to stderr: the JUnit reporter owns stdout, and a passing leaf's stdout never reaches the job log. */
+function note(...parts: unknown[]): void { process.stderr.write(parts.join(" ") + "\n"); }
 
 const BASE_PATH = "/usr/local/bin:/usr/bin:/bin";
 const CHECKOUT_REL = "checkout";
@@ -90,12 +93,12 @@ function mustRunAsRunner(command: string, args: readonly string[], env?: NodeJS.
   assert.equal(result.status, 0, `${command} ${args.join(" ")} failed (status ${String(result.status)}): ${result.stderr}${result.error?.message ?? ""}`);
   return result.stdout;
 }
-const diag = (label: string, text: string) => { for (const line of text.split("\n")) if (line.length > 0) console.log(`worker-env-diagnostic ${label}: ${line}`); };
+const diag = (label: string, text: string) => { for (const line of text.split("\n")) if (line.length > 0) note(`worker-env-diagnostic ${label}: ${line}`); };
 
 const productionLikeLogger = {
-  debug() {}, info(message: string, fields?: Record<string, unknown>) { console.log("worker-env-provision info:", message, JSON.stringify(fields ?? {})); },
-  warn(message: string, fields?: Record<string, unknown>) { console.log("worker-env-provision WARN:", message, JSON.stringify(fields ?? {})); },
-  error(message: string, fields?: Record<string, unknown>) { console.log("worker-env-provision ERROR:", message, JSON.stringify(fields ?? {})); },
+  debug() {}, info(message: string, fields?: Record<string, unknown>) { note("worker-env-provision info:", message, JSON.stringify(fields ?? {})); },
+  warn(message: string, fields?: Record<string, unknown>) { note("worker-env-provision WARN:", message, JSON.stringify(fields ?? {})); },
+  error(message: string, fields?: Record<string, unknown>) { note("worker-env-provision ERROR:", message, JSON.stringify(fields ?? {})); },
   addSecret() {}, removeSecret() {},
 } as unknown as Logger;
 
@@ -107,7 +110,7 @@ function tail(text: string, lines = 40): string { return text.split("\n").slice(
  * command's own TMPDIR, so the wrapper also exercises that layout.
  */
 function evidenceCommand(command: string, evidence: string): string {
-  return `out="$(mktemp)"; ${command} >"$out" 2>&1; rc=$?; grep -E ${quote(evidence)} "$out" | tail -n 5; echo '--- tail'; tail -n 40 "$out"; echo "worker-env-rc=$rc"; rm -f "$out"; exit $rc`;
+  return `out="$(mktemp)"; ${command} >"$out" 2>&1; rc=$?; grep -E ${quote(evidence)} "$out" | tail -n 5; echo '--- tail'; tail -n 80 "$out"; echo "worker-env-rc=$rc"; rm -f "$out"; exit $rc`;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -179,7 +182,7 @@ proof("preflight", 120_000, async () => {
   assert.equal(process.getuid?.(), WORKER_UID, "the proof runs as the worker uid after the root entrypoint drop");
   assert.equal(process.env.UZI_UID_SPLIT, "1", "the root-start entrypoint established the worker/runner split");
   assert.match(process.env.WORKER_ENV_IMAGE_ID ?? "", /^sha256:[0-9a-f]{64}$/, "the host harness passes the image identity");
-  console.log(`worker-env-identity image=${process.env.WORKER_ENV_IMAGE_ID} node=${process.version}`);
+  note(`worker-env-identity image=${process.env.WORKER_ENV_IMAGE_ID} node=${process.version}`);
   assert.equal(fs.readFileSync("/etc/uzi-runner-layout", "utf8").trim(), "runner-shared-v1");
 
   // The image's real Nix store on a docker volume: not a tmpfs mask.
@@ -239,7 +242,7 @@ proof("toolchain", 360_000, async () => {
   const started = performance.now();
   const result = await provisionRunTools(ctx, { provisionRoot: "/data/provision", homeDir: "/data/agent-home", log: productionLikeLogger });
   const seconds = (performance.now() - started) / 1000;
-  console.log(`worker-env-timing provisionRunTools ${seconds.toFixed(1)}s`);
+  note(`worker-env-timing provisionRunTools ${seconds.toFixed(1)}s`);
   diag("provision events", events.join("\n"));
 
   // Production provisioning degrades silently after a tier-2 failure: assert it did not.
@@ -282,14 +285,35 @@ proof("toolchain", 360_000, async () => {
   diag("TZDIR", origin.stdout + origin.stderr);
 });
 
+proof("timezone", 120_000, async () => {
+  // The nightly-window fixtures run a Ruby `date` that needs TZ=Europe/Bucharest to resolve to a real
+  // zoneinfo entry. 2026-10-27T10:00:00Z is after the 2026-10-25 DST end (last Sunday of October),
+  // so Bucharest is on EET, +0200 exactly. A runtime without a reachable zoneinfo silently yields +0000.
+  const epoch = Date.UTC(2026, 9, 27, 10, 0, 0) / 1000;
+  const cliEnv: Record<string, string> = { ...claudeCliEnv(), TZ: "Europe/Bucharest" };
+  diag("TZDIR", `worker process TZDIR=${process.env.TZDIR ?? "<unset>"}; claude command env TZDIR=${cliEnv.TZDIR ?? "<unset>"}; codex command env TZDIR=${buildCommandEnv("/tmp", needTools()).TZDIR ?? "<unset>"}`);
+  const probe = asRunner("sh", ["-c", [
+    'echo "/usr/share/zoneinfo/Europe/Bucharest: $([ -e /usr/share/zoneinfo/Europe/Bucharest ] && echo present || echo absent)"',
+    'echo "nix zoneinfo entries:"; find /nix/store -maxdepth 6 -path "*/zoneinfo/Europe/Bucharest" 2>/dev/null | head -n 5',
+    'echo "date: $(command -v date)"',
+  ].join("; ")], cliEnv);
+  diag("zoneinfo", probe.stdout + probe.stderr);
+  const rubyOffset = mustRunAsRunner("ruby", ["-e", 'puts Time.utc(2026, 10, 27, 10).getlocal.strftime("%z")'], cliEnv).trim();
+  const dateOffset = mustRunAsRunner("date", ["-d", `@${String(epoch)}`, "+%z"], cliEnv).trim();
+  diag("offsets", `ruby=${rubyOffset} date=${dateOffset}`);
+  assert.equal(rubyOffset, "+0200", "the provisioned ruby resolves TZ=Europe/Bucharest (zoneinfo reachable)");
+  assert.equal(dateOffset, "+0200", "date resolves TZ=Europe/Bucharest");
+  assert.equal(rubyOffset, dateOffset, "ruby and date agree");
+});
+
 // ---------------------------------------------------------------------------------------------
 // M1 focused proofs (Claude lane)
 // ---------------------------------------------------------------------------------------------
 proof("forgeFake", 330_000, async () => {
   // #3823: the contract bootstrap rejected transform mode on the worker's Node 26. Run the real
   // task, over the real image Node, through the guarded lane; the Go contract must run and pass.
-  const text = await runViaClaudeLane(evidenceCommand("task test:forge-fake-contract", "^--- PASS: TestForgeFakeOperationContracts|^# Node "), claudeCliEnv(), 300_000);
-  assertGateRan(text, /^--- PASS: TestForgeFakeOperationContracts /m, "test:forge-fake-contract");
+  const text = await runViaClaudeLane(evidenceCommand("task test:forge-fake-contract", "--- PASS: TestForgeFakeOperationContracts \\(|# Node v"), claudeCliEnv(), 300_000);
+  assertGateRan(text, /--- PASS: TestForgeFakeOperationContracts \(/, "test:forge-fake-contract");
   assert.ok(text.includes(`# Node ${process.version}`), "the contract bootstrap ran under the image's Node");
 });
 
