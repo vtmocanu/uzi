@@ -498,8 +498,8 @@ const PUSH_FRAMING_LINES: RegExp[] = [
  * Classify push stderr text (#3929, ADR-0284 amendment). GitHub reports a transient server-side
  * ref-update hiccup as a bare ` ! [remote rejected] <sha> -> <branch> (failed)` with no stated reason,
  * which the permanent `remote rejected` pattern would otherwise fail fast. That exact shape is
- * transient only when it is the SOLE rejection and nothing else in the text states a reason: any other
- * `remote rejected` line, any `[rejected]` line, a pattern hit in the text left after dropping the
+ * transient only when every `remote rejected` line is the bare `(failed)` shape and nothing else in the
+ * text states a reason: any `remote rejected` line that states a reason, any `[rejected]` line, a pattern hit in the text left after dropping the
  * whole framing lines (`To <url>`, the bare status line, `error: failed to push some refs`, empty
  * `remote:`), a `remote: error|fatal:` line, or a `GHnnn` token keeps today's classification. Framing
  * lines carry the branch and URL, so they are removed whole before matching (`agent/issue-404` must

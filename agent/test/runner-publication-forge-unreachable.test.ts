@@ -258,15 +258,12 @@ it("a permanent MR create rejection (401) is not retried and not typed", async t
   assert.doesNotMatch(failedReason(claim.run_id), /publication_forge_unreachable/);
 });
 
-// GitHub claim whose workflows moved ahead during the turn: the finalize base-align overlay path pushes
-// through the same pushToOrigin. The typed error must cross every inner align catch unchanged and reach
-// the single hook exactly once.
 // #3929: GitHub's bare `(failed)` remote rejection (no stated reason) is a transient ref-update hiccup and
 // retries on the schedule; every rejection that states a reason keeps failing fast. The controls below
 // must behave identically before and after the change.
 const FAKE_SHA = "0123456789abcdef0123456789abcdef01234567";
 const bareStatus = (branch: string, reason = "failed") => ` ! [remote rejected] ${FAKE_SHA} -> ${branch} (${reason})\n`;
-const framed = (_branch: string, status: string, remote = "") =>
+const framed = (status: string, remote = "") =>
   `To https://github.com/org/repo.git\n${status}${remote}error: failed to push some refs to 'https://github.com/org/repo.git'\n`;
 
 /** Record each push's argv, then fail it with `stderr`; `failFirstOnly` lets later pushes through to the real git. */
@@ -302,7 +299,7 @@ const completed = (runId: string) => api.states.some(s => s.runId === runId && s
 it("a bare (failed) push rejection on the plain arm retries the whole schedule and is typed git/push", async t => {
   const claim = gitlabClaim(4301);
   const branch = "agent/issue-4301";
-  const argvs = recordPushes(framed(branch, bareStatus(branch)));
+  const argvs = recordPushes(framed(bareStatus(branch)));
   const preflights = countPreflights();
   const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
   instantRetries(r);
@@ -318,7 +315,7 @@ it("a bare (failed) push rejection on the plain arm retries the whole schedule a
 it("a bare (failed) push rejection on branch agent/issue-404 is still retried (plain arm)", async t => {
   const claim = gitlabClaim(404);
   const branch = "agent/issue-404";
-  const argvs = recordPushes(framed(branch, bareStatus(branch)));
+  const argvs = recordPushes(framed(bareStatus(branch)));
   const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
   instantRetries(r);
   const seen = hookRecorder(t, r);
@@ -332,7 +329,7 @@ it("a bare (failed) push rejection on branch agent/issue-404 is still retried (p
 it("one bare (failed) push rejection followed by a real push completes the run", async t => {
   const claim = gitlabClaim(4302);
   const branch = "agent/issue-4302";
-  const argvs = recordPushes(framed(branch, bareStatus(branch)), { failFirstOnly: true });
+  const argvs = recordPushes(framed(bareStatus(branch)), { failFirstOnly: true });
   const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
   instantRetries(r);
   const seen = hookRecorder(t, r);
@@ -346,7 +343,7 @@ it("one bare (failed) push rejection followed by a real push completes the run",
 it("a (failed) rejection thrown AFTER the push really landed is recognised on retry and the run completes", async t => {
   const claim = gitlabClaim(4303);
   const branch = "agent/issue-4303";
-  const argvs = recordPushes(framed(branch, bareStatus(branch)), { performRealPush: true, failFirstOnly: true });
+  const argvs = recordPushes(framed(bareStatus(branch)), { performRealPush: true, failFirstOnly: true });
   const r = runner(new StubExecutor(nullLogger()), fakeGitlab().gitlab);
   instantRetries(r);
   const seen = hookRecorder(t, r);
@@ -358,14 +355,14 @@ it("a (failed) rejection thrown AFTER the push really landed is recognised on re
 });
 
 const PERMANENT_CONTROLS: Array<[string, (b: string) => string, string?]> = [
-  ["protected branch hook declined", b => framed(b, bareStatus(b, "protected branch hook declined"))],
-  ["pre-receive hook declined", b => framed(b, bareStatus(b, "pre-receive hook declined"))],
-  ["failed to update ref", b => framed(b, bareStatus(b, "failed to update ref"))],
-  ["repository rule violations with GH013 remote lines", b => framed(b, bareStatus(b, "push declined due to repository rule violations"),
+  ["protected branch hook declined", b => framed(bareStatus(b, "protected branch hook declined"))],
+  ["pre-receive hook declined", b => framed(bareStatus(b, "pre-receive hook declined"))],
+  ["failed to update ref", b => framed(bareStatus(b, "failed to update ref"))],
+  ["repository rule violations with GH013 remote lines", b => framed(bareStatus(b, "push declined due to repository rule violations"),
     "remote: error: GH013: Repository rule violations found for refs/heads/" + b + ".\nremote: \n"), "push_secret_blocked"],
-  ["bare (failed) plus GH006 remote error", b => framed(b, bareStatus(b), `remote: error: GH006: Protected branch update failed for refs/heads/${b}.\n`)],
-  ["bare (failed) plus GH001 remote error", b => framed(b, bareStatus(b), "remote: error: GH001: Large files detected.\n")],
-  ["bare (failed) mixed with a hook-declined status line", b => framed(b, bareStatus(b) + bareStatus(b + "-2", "pre-receive hook declined"))],
+  ["bare (failed) plus GH006 remote error", b => framed(bareStatus(b), `remote: error: GH006: Protected branch update failed for refs/heads/${b}.\n`)],
+  ["bare (failed) plus GH001 remote error", b => framed(bareStatus(b), "remote: error: GH001: Large files detected.\n")],
+  ["bare (failed) mixed with a hook-declined status line", b => framed(bareStatus(b) + bareStatus(b + "-2", "pre-receive hook declined"))],
 ];
 
 PERMANENT_CONTROLS.forEach(([name, build, failOrigin], i) => {
@@ -382,9 +379,12 @@ PERMANENT_CONTROLS.forEach(([name, build, failOrigin], i) => {
     assertIdenticalNonForcedPushes(argvs, branch);
     assert.equal(seen.length, 0);
     assert.doesNotMatch(failedReason(claim.run_id), /publication_forge_unreachable/);
-    if (failOrigin) {
-      assert.equal(api.states.find(s => s.runId === claim.run_id && s.body.status === "failed")?.body.fail_origin, failOrigin);
-    }
+    const failedState = api.states.find(s => s.runId === claim.run_id && s.body.status === "failed");
+    assert.ok(failedState, "the run reached failed");
+    // Today's outcome, identical before and after #3929: a typed secret block, else an untyped raw push failure.
+    assert.equal(failedState.body.fail_origin, failOrigin);
+    if (failOrigin) assert.match(failedState.body.failure_reason ?? "", /Push Protection \(GH013\)/);
+    else assert.match(failedState.body.failure_reason ?? "", /^git push origin [0-9a-f]{40}:refs\/heads\/agent\/issue-\d+ failed: /);
   });
 });
 
@@ -433,32 +433,62 @@ function githubOverlayRunner(iid: number): { claim: ReturnType<typeof gitlabClai
 it("a bare (failed) push rejection on the GitHub overlay arm retries the overlay candidate and is typed git/push", async t => {
   const { claim, r, strategies } = githubOverlayRunner(4304);
   const branch = "agent/issue-4304";
-  const argvs = recordPushes(framed(branch, bareStatus(branch)));
+  const argvs = recordPushes(framed(bareStatus(branch)));
   const preflights = countPreflights();
   const seen = hookRecorder(t, r);
   await r.execute(claim);
   assert.equal(argvs.length, ATTEMPTS, "the overlay push was the one retried publication hop");
   assertIdenticalNonForcedPushes(argvs, branch);
-  assert.ok(preflights() >= ATTEMPTS, "the proof reran per attempt");
+  assert.equal(preflights(), ATTEMPTS + 1, "one frozen-candidate preflight plus one per pushBranch attempt");
+  assert.ok(strategies.includes("workflow-subtree"), `the overlay arm ran: ${strategies.join(",")}`);
   assert.deepEqual(seen.map(s => [s.surface, s.step]), [["git", "push"]]);
   assert.match(failedReason(claim.run_id), /publication_forge_unreachable: push/);
   assert.ok(!strategies.includes("merge") && !strategies.includes("rebase"), `no merge/rebase fallback: ${strategies.join(",")}`);
 });
 
-it("control: a workflow-scope push rejection on the overlay arm is not retried at the overlay candidate", async t => {
-  const { claim, r } = githubOverlayRunner(4305);
+const WORKFLOW_SCOPE_PLAIN = "refusing to allow a Personal Access Token to create or update workflow `.github/workflows/ci.yml` without workflow scope";
+
+it("control: a workflow-scope push rejection on the overlay arm is not retried at the overlay candidate and falls back to merge", async t => {
+  const { claim, r, strategies } = githubOverlayRunner(4305);
   const branch = "agent/issue-4305";
-  const reason = "refusing to allow a Personal Access Token to create or update workflow `.github/workflows/ci.yml` without `workflow` scope";
-  const argvs = recordPushes(framed(branch, bareStatus(branch, reason)));
+  const argvs = recordPushes(framed(bareStatus(branch, WORKFLOW_SCOPE_PLAIN)));
   const seen = hookRecorder(t, r);
   await r.execute(claim);
+  const failed = api.states.find(s => s.runId === claim.run_id && s.body.status === "failed");
+  assert.equal(failed?.body.fail_origin, "finalize_base_align_conflict", "merge and rebase pushes were refused too, so the run fails typed");
+  assert.ok(strategies.includes("workflow-subtree"), `the overlay arm ran: ${strategies.join(",")}`);
+  assert.ok(strategies.includes("merge"), `the merge fallback ran: ${strategies.join(",")}`);
   const first = refspecOf(argvs[0]!);
-  assert.equal(argvs.filter(a => refspecOf(a) === first).length, 1, "the overlay candidate was pushed once");
+  assert.equal(argvs.filter(a => refspecOf(a) === first).length, 1, "the overlay candidate was pushed once, not retried");
   assert.ok(argvs.every(a => a.every(arg => !arg.startsWith("--force") && arg !== "-f" && !arg.startsWith("+"))));
   assert.equal(seen.length, 0);
   assert.doesNotMatch(failedReason(claim.run_id), /publication_forge_unreachable/);
 });
 
+// Pins existing behaviour (unchanged by #3929): GitHub's real wording quotes `workflow` in backticks, which
+// isWorkflowScopeRejection (the literal "workflow scope") does not match, so the overlay push error is
+// rethrown with no merge/rebase fallback.
+it("control: the backticked GitHub workflow-scope wording ends publication after one overlay push (existing behaviour)", async t => {
+  const { claim, r, strategies } = githubOverlayRunner(4306);
+  const branch = "agent/issue-4306";
+  const reason = "refusing to allow a Personal Access Token to create or update workflow `.github/workflows/ci.yml` without `workflow` scope";
+  const argvs = recordPushes(framed(bareStatus(branch, reason)));
+  const seen = hookRecorder(t, r);
+  await r.execute(claim);
+  const failedState = api.states.find(s => s.runId === claim.run_id && s.body.status === "failed");
+  assert.equal(failedState?.body.fail_origin, undefined);
+  assert.match(failedState?.body.failure_reason ?? "", /^git push origin [0-9a-f]{40}:refs\/heads\/agent\/issue-4306 failed: .*without `workflow` scope/);
+  assert.ok(failedState, "the run reached failed");
+  assert.ok(strategies.includes("workflow-subtree"), `the overlay arm ran: ${strategies.join(",")}`);
+  assert.ok(!strategies.includes("merge") && !strategies.includes("rebase"), `no merge/rebase fallback: ${strategies.join(",")}`);
+  assert.equal(argvs.length, 1, "exactly one overlay push");
+  assert.equal(seen.length, 0);
+  assert.doesNotMatch(failedReason(claim.run_id), /publication_forge_unreachable/);
+});
+
+// GitHub claim whose workflows moved ahead during the turn: the finalize base-align overlay path pushes
+// through the same pushToOrigin. The typed error must cross every inner align catch unchanged and reach
+// the single hook exactly once.
 it("a GitHub align-path push outage invokes the hook once and surfaces the typed error", async t => {
   commitToOriginMain({ ".github/workflows/ci.yml": CI_V1 }, "seed workflows");
   const claim = gitlabClaim(4107, {
