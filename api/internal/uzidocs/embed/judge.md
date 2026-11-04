@@ -201,10 +201,16 @@ places you see it.
 Recommendations use a fixed taxonomy: enable an existing tool or skill,
 install a missing worker tool, adjust an agent template or prompt, improve an
 existing agent (including a repo agent living in git), propose a missing
-agent for the repo, improve uzi itself, or flag a cost-efficiency improvement
-— a way the run could have reached the same outcome for fewer tokens, turns,
-or agents without weakening any check (quality and correctness come first, so
-a saving that would drop a real verification pass is never recommended). The
+agent for the repo, improve uzi itself, or flag an efficiency improvement
+(labelled "Efficiency", category `cost_efficiency`): a way the run could
+have reached the same outcome with fewer tokens, turns or agents, or less
+wall-clock time, without weakening any check (quality and correctness come
+first, so a saving that would drop a real verification pass is never
+recommended). Elapsed-time claims cite the trace's observed timestamps. Queue,
+limit, owner-wait and parked time is reported separately and is not attributed
+to agent inefficiency unless observed evidence shows an avoidable agent action
+caused or extended it. A remedy that needs a factory change (runtime, worker image,
+provisioning, CI) is filed under improve uzi instead. The
 improve-uzi category feeds the `self-improve` [default
 job](./scheduling.md#default-jobs), if you've enabled it on a repo.
 

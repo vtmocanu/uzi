@@ -44,7 +44,7 @@ export const RECOMMENDATION_LABELS: Record<RecommendationCategory, string> = {
   improve_agent: "Improve an agent",
   add_agent: "Add a missing agent",
   improve_uzi: "Improve uzi",
-  cost_efficiency: "Cost efficiency",
+  cost_efficiency: "Efficiency",
 };
 
 export function recommendationLabel(category: string): string {
