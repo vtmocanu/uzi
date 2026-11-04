@@ -1879,10 +1879,17 @@ chain in the diagram above, with no intervening `running`.
 - **Cancel/reject with no live poller** (a `queued` run, or one whose worker
   has gone stale) is transitioned straight to `cancelled`/`failed`
   server-side rather than waiting on a `GET /api/worker/runs/:id/inputs` poll
-  that would never arrive. **Accepted residual:** a live-run cancel (the
-  worker is actively polling) still ends as `failed` with reason "run
-  cancelled" — the worker protocol has no settable `cancelled` state, only
-  the server-side no-poller path yields a true `cancelled`.
+  that would never arrive. A live worker reports `failed` after observing the
+  cancel; the API uses its persisted `stop_kind='cancelled'` to transition the
+  run to `cancelled` with no failure origin. At the two retained-predecessor
+  refusal sites before capture or execution, the worker can instead read the
+  positive `cancellation_requested` signal from the existing ownership probe,
+  without consuming inputs. It rechecks local pending-outcome and execution-tail
+  safety before reporting through the same cancellation path, keeping source
+  custody. The new API settles pending cancel inputs atomically with that
+  terminal transition; an old pod in a mixed rollout can leave an inert unapplied
+  cancel row on the terminal run. Unknown evidence or an old API without the
+  signal retains the stop. See [run recovery](docs/run-recovery.md).
 - The full message history (`run_messages`, gapless per-run `seq`) and any
   captured plan/session id survive every transition above, so a resumed run
   continues exactly where it left off — see Live message stream, below.

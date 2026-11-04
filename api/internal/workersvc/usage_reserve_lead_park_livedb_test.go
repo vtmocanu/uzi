@@ -62,7 +62,7 @@ func TestReserveLeadParkOverlappingReserveRequestParksOrdinaryLiveDB(t *testing.
 	}
 
 	// The lost-ACK read: paused with a null hold, i.e. an ordinary pause to the agent.
-	status, _, _, hold, _, _, err := fx.svc.RunOwnership(fx.env.ctx, wkr, run)
+	status, _, _, hold, _, _, _, err := fx.svc.RunOwnership(fx.env.ctx, wkr, run)
 	if err != nil || status != "paused" || hold != nil {
 		t.Fatalf("RunOwnership = (%s, hold %v, %v), want paused with a null hold", status, hold, err)
 	}
@@ -95,7 +95,7 @@ func TestReserveWorkerOwnershipHidesReserveHoldLiveDB(t *testing.T) {
 		{"completion_blocked", "completion_blocked"},
 	} {
 		run := fx.pauseRun(pauseRun{cred: &tok, status: "paused", hold: tc.hold})
-		_, _, _, hold, _, _, err := fx.svc.RunOwnership(fx.env.ctx, wkr, run)
+		_, _, _, hold, _, _, _, err := fx.svc.RunOwnership(fx.env.ctx, wkr, run)
 		if err != nil {
 			t.Fatalf("%s: RunOwnership: %v", tc.hold, err)
 		}

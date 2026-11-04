@@ -3013,6 +3013,8 @@ export interface RunnerOptions {
   recoveryRetryMs?: number;
   /** TEST-ONLY budget for the single ambiguous completion-hold ownership read. */
   completionHoldReconcileTimeoutMs?: number;
+  /** TEST-ONLY bound (ms) for the single owner-cancel read at a held-predecessor refusal. Default 10s. */
+  heldSeamCancelObserveMs?: number;
   /** PRD #1171 m4: the bounded absolute deadline (ms) for a Codex durability-sink
    *  `withBoundary` (quiesce → reap → action). NEVER unbounded. Default 30s. Only used when the
    *  executor is Codex-selected (`executor.safety`); a Claude/stub run ignores it. The finalize
@@ -3230,6 +3232,7 @@ export class RunRunner {
   private readonly recoveryRetryMs: number;
   private readonly afterPublicationEnrolled: RunnerOptions["afterPublicationEnrolled"];
   private readonly completionHoldReconcileTimeoutMs: number;
+  private readonly heldSeamCancelObserveMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
   private readonly codexBoundaryDeadlineMs: number;
   /** issue #3181: see RunnerOptions.retainedSwitchSettlementMs. */
@@ -3504,6 +3507,8 @@ export class RunRunner {
       throw new Error("completionHoldReconcileTimeoutMs must be positive and finite");
     }
     this.completionHoldReconcileTimeoutMs = holdBudget;
+    this.heldSeamCancelObserveMs = opts.heldSeamCancelObserveMs !== undefined && opts.heldSeamCancelObserveMs > 0
+      ? opts.heldSeamCancelObserveMs : 10_000;
     // PRD #1171 m4: bounded, never unbounded. Clamp a caller-supplied 0/negative to the default.
     this.codexBoundaryDeadlineMs =
       opts.codexBoundaryDeadlineMs && opts.codexBoundaryDeadlineMs > 0
@@ -24996,6 +25001,63 @@ export class RunRunner {
     if (signals.some(signal => signal.aborted)) throw new RetainedRecoveryStop();
   }
 
+  /** Outcome-safety predicate for the held-predecessor seam: true only when every synchronous
+   *  precondition positively holds, so a cancel report cannot race any other outcome of this run.
+   *  Any throw or missing component is unsafe. Mirrors reportGenericFailure's silent-return gates. */
+  private heldSeamSyncSafe(flight: RunFlight): boolean {
+    try {
+      const outbox = this.outbox;
+      if (!outbox || outbox.isDisabled() || !outbox.policyInventoryCoverageAvailable()) return false;
+      if (flight.steering.claimFence() !== undefined || flight.active?.shuttingDown || this.shuttingDownGlobal ||
+          flight.steering.terminalLifecycleSignal().aborted) return false;
+      if (flight.executionTail === undefined || this.executionTails.get(flight.runId) !== flight.executionTail) return false;
+      const runId = flight.runId.toLowerCase();
+      if (outbox.listPendingOutcomeSources().some(entry => entry.run_id.toLowerCase() === runId)) return false;
+      if (outbox.listPendingFinalizeGenerations(true).some(entry => entry.run_id.toLowerCase() === runId)) return false;
+      if (outbox.isTerminalResolveHeld(flight.runId, flight.claimGeneration)) return false;
+      if (flight.policyHold || flight.iterationParkState !== "none" || flight.workerMemory?.hold ||
+          flight.completionHoldOutcome === "unresolved") return false;
+      if (flight.terminalResolved || flight.completionSendAttempted) return false;
+      return true;
+    } catch { return false; }
+  }
+
+  private async heldSeamPolicySafe(flight: RunFlight): Promise<boolean> {
+    try { return !!this.outbox && !(await this.outbox.hasPendingPolicyOutcome(flight.runId)); }
+    catch { return false; }
+  }
+
+  /** At a held-predecessor refusal the flight stops before steering's first poll can route an
+   *  already-persisted owner cancel. Ask the server once (bounded, no retry, one read-only ownership
+   *  probe) whether a cancel is requested for this claim and, only when every outcome-safety condition
+   *  still holds at the commit instant, convert the stop into a cancellation (RetainedRecoveryCancelled);
+   *  otherwise return and let the caller throw today's stop. */
+  private async observeCancelAtHeldSeam(claim: ClaimResponse, flight: RunFlight): Promise<void> {
+    if (claim.run_id !== flight.runId) return;
+    let cause: unknown;
+    try {
+      if (!this.heldSeamSyncSafe(flight) || !await this.heldSeamPolicySafe(flight)) return;
+      const signal = AbortSignal.any([AbortSignal.timeout(this.heldSeamCancelObserveMs), ...this.retainedLifecycleSignals(flight)]);
+      const result = await flight.steering.readCancellationRequested(signal, ["running", "claimed"]);
+      if (result === "cancel") {
+        if (await this.heldSeamPolicySafe(flight)) {
+          // One synchronous block: no await between the last safety check and the commit.
+          if (this.heldSeamSyncSafe(flight)) {
+            flight.steering.markCancelled();
+            cause = new Error("owner cancel observed at held-predecessor refusal");
+            this.observeCancellation(flight);
+            flight.runLog.info("retained predecessor held; owner cancel observed at the refusal, reporting cancellation",
+              { claim_generation: flight.claimGeneration });
+          }
+        }
+      }
+    } catch {
+      flight.runLog.warn("owner cancel read at the held-predecessor refusal did not complete; stopping without cancel",
+        { claim_generation: flight.claimGeneration });
+    }
+    if (cause !== undefined) throw new RetainedRecoveryCancelled({ cause });
+  }
+
   /** One bounded, credential-free verification pass over EXISTING evidence. Every outcome
    * stops this flight; neither an ACK nor a verification failure grants cleanup authority.
    *
@@ -25856,6 +25918,7 @@ export class RunRunner {
       this.retainedLifecycleGuard(flight);
       flight.runLog.warn("retained predecessor held by an earlier flight's unended source use; stopping claim for retry", {
         claim_generation: flight.claimGeneration });
+      await this.observeCancelAtHeldSeam(claim, flight);
       throw new RetainedRecoveryStop();
     }
     await this.logPredecessorMemorySettlement(flight, bare, branch, source);
@@ -26087,6 +26150,7 @@ export class RunRunner {
               // missing-flight requeue cap bounds it.
               flight.runLog.warn("retained predecessor held by an earlier flight's unended source use; stopping claim for retry", {
                 error: errMessage(error), claim_generation: flight.claimGeneration });
+              await this.observeCancelAtHeldSeam(claim, flight);
               throw new RetainedRecoveryStop({ cause: error });
             }
             if (error instanceof AuthorityRefusal) {

@@ -1388,6 +1388,62 @@ func TestWorkerRunOwnershipTerminalReturnsStatus(t *testing.T) {
 	}
 }
 
+// TestWorkerRunOwnershipCarriesCancellationRequested pins issue #3860's additive field: the
+// probe always carries cancellation_requested as an explicit boolean. protocolStore has no
+// GetRunOwnershipByWorker, so the service falls back to GetRunOwnedByWorker and reports false.
+func TestWorkerRunOwnershipCarriesCancellationRequested(t *testing.T) {
+	runID := uuid.New()
+	h := newProtocolHandler(t, &protocolStore{ownedRun: store.Run{
+		ID: runID, Status: "running", ClaimGeneration: 3,
+		StopKind: pgtype.Text{String: "cancelled", Valid: true},
+	}})
+	rec := httptest.NewRecorder()
+	h.WorkerRunOwnership(rec, workerReq(http.MethodGet, "", runID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	v, present := got["cancellation_requested"]
+	if !present {
+		t.Fatalf("ownership probe missing cancellation_requested (body %q)", rec.Body.String())
+	}
+	if b, isBool := v.(bool); !isBool || b {
+		t.Fatalf("cancellation_requested = %v, want false from the fallback read", v)
+	}
+}
+
+// Unlike protocolStore, this store implements the optional signal-bearing query.
+type cancellationProtocolStore struct {
+	*protocolStore
+}
+
+func (p *cancellationProtocolStore) GetRunOwnershipByWorker(context.Context, store.GetRunOwnershipByWorkerParams) (store.GetRunOwnershipByWorkerRow, error) {
+	return store.GetRunOwnershipByWorkerRow{Run: p.ownedRun, CancellationRequested: true}, nil
+}
+
+func TestWorkerRunOwnershipCarriesRequestedCancellation(t *testing.T) {
+	runID := uuid.New()
+	h := newProtocolHandler(t, &cancellationProtocolStore{protocolStore: &protocolStore{ownedRun: store.Run{
+		ID: runID, Status: "running", ClaimGeneration: 3,
+		StopKind: pgtype.Text{String: "cancelled", Valid: true},
+	}}})
+	rec := httptest.NewRecorder()
+	h.WorkerRunOwnership(rec, workerReq(http.MethodGet, "", runID))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if v, present := got["cancellation_requested"]; !present || v != true {
+		t.Fatalf("cancellation_requested = %v (present=%v), want true from the signal-bearing query", v, present)
+	}
+}
+
 func TestWorkerRunMessageGapsRequiresClaimGeneration(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
