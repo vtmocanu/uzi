@@ -507,7 +507,7 @@ RUN mkdir /tmp/uzi-epoch-bootstrap \
 COPY --chown=0:0 --chmod=0644 agent/templates/pod-epoch-init.cjs /usr/local/lib/uzi/pod-epoch-init.cjs
 COPY --chown=0:0 --chmod=0644 agent/templates/pod-epoch-init.cjs /app/templates/pod-epoch-init.cjs
 # COPY --chmod can synthesize the parent as 0644; restore traversal after COPY.
-RUN chown root:root /app/templates && chmod 0755 /app/templates
+RUN chown root:root /app/templates && chmod 0755 /app/templates && chmod g-s /app/templates
 COPY --chmod=0755 agent/templates/entrypoint.sh /usr/local/sbin/uzi-entrypoint
 VOLUME ["/data", "/nix"]
 
