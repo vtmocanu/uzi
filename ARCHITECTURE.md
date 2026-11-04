@@ -2863,6 +2863,14 @@ pressure. All non-terminal worker-owned runs, including parks and approval waits
 block it. Requested maintenance drains unrelated run, chat and cross-check
 claims while owned runs and pinned plan checkers may finish; only an atomic terminal-only claim fence, drained local activity and fresh
 custody clearance permit gated anonymous-volume prune and stop authorization.
+One narrow exception (#3891): a separate worker-side pressure-only leg runs
+exactly `docker volume prune -f` (server API >=1.42, request pinned to 1.42 in
+its own child env) on a busy or custody-held non-ephemeral worker after two
+fresh samples at or above 85%, without closing the claim gate or waiting for
+idle, terminal runs or custody; it defers only while maintenance holds its
+fence and touches no PVC. It rides the same default-on flag. See ADR-1759 D8,
+"Exception — #3891", in
+[adr/1759-dind-data-metering-and-prune.md](adr/1759-dind-data-metering-and-prune.md).
 The controller observes the old Deployment and pods gone before deleting only
 `dind-data`, then publishes replacement readiness before reopening claims.
 DinD is scratch, including named volumes; this DinD maintenance recycle loses

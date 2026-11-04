@@ -3,13 +3,13 @@
 **Status**: Accepted (issue #1759, M1-M4 landed)
 **Date**: 2026-09-27
 **Deciders**: agent team (issue #1759 milestones + review waves)
-**Policy update**: issue #1760; maintainer decision 2026-10-04 (AI-synced 2026-10-05). D7-D9 supersede the original cache-only scope below.
+**Policy update**: issue #1760; maintainer decision 2026-10-04 (AI-synced 2026-10-05). D7-D9 supersede the original cache-only scope below. Issue #3891; maintainer decision 2026-11-04 (AI-synced 2026-11-04) adds one narrow, pressure-only anonymous-volume exception to the D7/D8 gates (see "Exception — #3891" under D8).
 **Amended by**: [ADR-3153](3153-runner-shared-pvc-subpath.md) (dind now mounts the `runner-shared` subPath of `data` at `/data/runner`, so Decision 3's "mounts none of its own crown jewels" is narrowed to the mount view; DinD-only maintenance keeps `/data/runner`)
 **Related**: [ADR-837](0837-worker-disk-lifecycle.md) (the `/nix`/`/data` disk-observability and pressure-recycle design this one narrows the "Known gap" of)
 
 ## Decision (summary)
 
-A docker-tier hosted worker now gets a second, unprivileged native sidecar, `dind-meter`, that mounts the `dind-data` PVC **read-only** and publishes a periodic statfs sample (bytes + inodes) for the worker to read and display as a "Disk dind" gauge. The worker itself never mounts `dind-data`. Separately, the worker watches that sample and, only when the volume is under sustained pressure, it is provably idle, and the api's heartbeat confirms it holds no unpublished work, runs a short allowlisted sequence of `docker image prune`/`docker builder prune` commands against the daemon. The legacy `disk_pressure` boolean remains `/nix`+`/data`-only. Separate per-volume wire flags now drive a DinD-only pressure-recycle arm under the stricter terminal-run maintenance gate (D7-D9), including optional anonymous-volume pruning.
+A docker-tier hosted worker now gets a second, unprivileged native sidecar, `dind-meter`, that mounts the `dind-data` PVC **read-only** and publishes a periodic statfs sample (bytes + inodes) for the worker to read and display as a "Disk dind" gauge. The worker itself never mounts `dind-data`. Separately, the worker watches that sample and, only when the volume is under sustained pressure, it is provably idle, and the api's heartbeat confirms it holds no unpublished work, runs a short allowlisted sequence of `docker image prune`/`docker builder prune` commands against the daemon. The legacy `disk_pressure` boolean remains `/nix`+`/data`-only. Separate per-volume wire flags now drive a DinD-only pressure-recycle arm under the stricter terminal-run maintenance gate (D7-D9), including optional anonymous-volume pruning. One exception (#3891, AI-synced 2026-11-04): a separate pressure-only leg runs the same frozen `docker volume prune -f` on a busy or custody-held non-ephemeral worker without closing the claim gate and without waiting for idle, terminal runs or custody (D8, "Exception — #3891"). The terminal/custody gates stay mandatory for PVC recycle, maintenance and everything else.
 
 ## Context (original #1759 scope)
 
@@ -27,7 +27,7 @@ Rejected: mounting `dind-data` (even read-only) directly into the worker, which 
 
 ### D2 — The sample is an untrusted, versioned, bounded contract; the worker validates every field
 
-The sample crosses a privilege boundary the daemon posture makes explicit: in the non-rootless posture the daemon runs as real, privileged node root (`prds/done/89-optional-nonrootless-dind.md`'s accepted residual), and a container breakout there lands as node root, which **can** write to the meter emptyDir's node-side backing directory — mount-namespace separation only keeps the daemon's own mount namespace, and any container it runs, from reaching that file; it does nothing against node root reading or writing it directly (`agent/src/dind-meter.ts`'s header states this plainly). So the worker-side reader (`dind-meter.ts`) treats the file as fully untrusted input unconditionally, not as a defense of last resort: bounded read (no unbounded slurp), regular-file-only (`O_NOFOLLOW`, rejects a planted symlink or FIFO), one strict versioned line pattern (`v1 <epoch> <frsize> <blocks> <bfree> <files> <ffree>`), every integer exactly representable, statfs relations that must hold (`bfree <= blocks`, `ffree <= files`), and a freshness window (90s) plus a small future-skew allowance. Any violation returns "no sample," never a throw and never the raw line logged. What bounds the damage from even a successfully forged sample is this validation together with D4's frozen allowlist and D5's idle/custody gate: in the original cache-prune path, a forged sample can trigger or suppress only the allowlisted cache-prune sequence. Under the current policy it can also affect pressure-driven maintenance intent, but cannot bypass the server's terminal-run claim fence, identity checks, local quiescence, fresh custody clearance, or controller stop-before-PVC-delete gate (D7-D9).
+The sample crosses a privilege boundary the daemon posture makes explicit: in the non-rootless posture the daemon runs as real, privileged node root (`prds/done/89-optional-nonrootless-dind.md`'s accepted residual), and a container breakout there lands as node root, which **can** write to the meter emptyDir's node-side backing directory — mount-namespace separation only keeps the daemon's own mount namespace, and any container it runs, from reaching that file; it does nothing against node root reading or writing it directly (`agent/src/dind-meter.ts`'s header states this plainly). So the worker-side reader (`dind-meter.ts`) treats the file as fully untrusted input unconditionally, not as a defense of last resort: bounded read (no unbounded slurp), regular-file-only (`O_NOFOLLOW`, rejects a planted symlink or FIFO), one strict versioned line pattern (`v1 <epoch> <frsize> <blocks> <bfree> <files> <ffree>`), every integer exactly representable, statfs relations that must hold (`bfree <= blocks`, `ffree <= files`), and a freshness window (90s) plus a small future-skew allowance. Any violation returns "no sample," never a throw and never the raw line logged. What bounds the damage from even a successfully forged sample is this validation together with D4's frozen allowlist and D5's idle/custody gate: in the original cache-prune path, a forged sample can trigger or suppress only the allowlisted cache-prune sequence. Under the current policy it can also affect pressure-driven maintenance intent, but cannot bypass the server's terminal-run claim fence, identity checks, local quiescence, fresh custody clearance, or controller stop-before-PVC-delete gate (D7-D9). **Amendment 2026-11-04 (#3891):** a forged sample can also trigger the pressure-only anonymous-volume leg (D8, "Exception — #3891") on a busy or custody-held worker. Its bound: after one attempt the leg is disarmed until a sample below 75% re-arms it (or 1h elapses), so under forged oscillation (one sample below 75%, then two at or above 85%) it can run about one anonymous `volume prune` per ~90s plus prune time; after an `unknown` outcome the full hour applies. It gains no privilege: node root already owns the daemon, and the model can already run `docker volume prune` itself.
 
 ### D3 — Prune is worker-local, gated on an exclusion claim, never dependent on the controller or the recycle machinery
 
@@ -35,7 +35,7 @@ Reclaiming build cache is an ordinary daemon operation (`docker image/builder pr
 
 ### D4 — The original cache-prune allowlist; nothing is removed by name
 
-The original cache-prune module's allowlisted argv is the read-only `ps -q` idle check plus the prunes `image prune -f`, `builder prune -f`, and — only if still over threshold after those two — `image prune -a -f --filter until=24h`. `until` filters on the image's `Created` (build) timestamp, not when it was pulled or last used, so a freshly *pulled* image that was *built* more than a day ago **is** swept if nothing references it — the filter is about the image's age, not its provenance in this cache. A runtime guard re-validates every argv against the frozen table before exec: it rejects any argv token that exactly matches (case-insensitively) `volume`, `volumes`, `--volumes`, `system`, `container`, or `rm`, or that carries one of them as a `token=value` flag, and separately requires the whole argv to equal one of the frozen entries — that second, exact-allowlist check is what actually blocks every other docker subcommand, not the forbidden-token list alone (which only catches the tokens above, wherever they'd appear). The table itself is asserted against both checks at module load, so an edit that ever adds a forbidden command fails at import, not in production. Nothing here removes a container (stopped or running) or a volume by name: the run harness creates no containers this worker could prove it owns, so a stopped container may be a user's own deliberate state, and volumes are outside this cache-prune module's scope. The separate strict maintenance gate now allows exactly `docker volume prune -f` after a server API version check, and the controller can delete-and-remint the entire PVC (D7-D9).
+The original cache-prune module's allowlisted argv is the read-only `ps -q` idle check plus the prunes `image prune -f`, `builder prune -f`, and — only if still over threshold after those two — `image prune -a -f --filter until=24h`. `until` filters on the image's `Created` (build) timestamp, not when it was pulled or last used, so a freshly *pulled* image that was *built* more than a day ago **is** swept if nothing references it — the filter is about the image's age, not its provenance in this cache. A runtime guard re-validates every argv against the frozen table before exec: it rejects any argv token that exactly matches (case-insensitively) `volume`, `volumes`, `--volumes`, `system`, `container`, or `rm`, or that carries one of them as a `token=value` flag, and separately requires the whole argv to equal one of the frozen entries — that second, exact-allowlist check is what actually blocks every other docker subcommand, not the forbidden-token list alone (which only catches the tokens above, wherever they'd appear). The table itself is asserted against both checks at module load, so an edit that ever adds a forbidden command fails at import, not in production. Nothing here removes a container (stopped or running) or a volume by name: the run harness creates no containers this worker could prove it owns, so a stopped container may be a user's own deliberate state, and volumes are outside this cache-prune module's scope. The separate strict maintenance gate now allows exactly `docker volume prune -f` after a server API version check, and the controller can delete-and-remint the entire PVC (D7-D9). This module's own allowlist is unchanged: it still rejects `volume prune -f`. The #3891 pressure leg is a separate module with its own exact-match guard over its two frozen argv (D8, "Exception — #3891").
 
 ### D5 — Custody is fail-closed, sourced from the same custody flag PRD #1296 already built, now also carried on the heartbeat response
 
@@ -79,6 +79,11 @@ and registration identity (`agent/src/dind-maintenance.ts`). Neither
 `ForceRoll` nor `DrainDeadline` bypasses DinD readiness; ordinary rolls and
 legacy nix/data recycling keep their existing override behavior.
 
+**Exception (#3891, AI-synced 2026-11-04):** this terminal-only readiness gate
+and the D5 custody gate remain mandatory for DinD maintenance, PVC recycle and
+every other cleanup. The only carve-out is the narrow pressure-only
+anonymous-volume leg described under D8, "Exception — #3891".
+
 ### D8 — Optional prune, then UID-bound stop and DinD-only remint
 
 Eligible cache prune is tried first, but its skip, failure, timeout or
@@ -121,6 +126,97 @@ legacy cooldown allows immediate eligible DinD maintenance. Disabling
 finishes safely even if disabled. See
 `controller/internal/kube/maintenance.go` for the phase boundaries.
 
+#### Exception — #3891: pressure-only anonymous-volume prune on busy or custody-held workers
+
+**Maintainer decision 2026-11-04 (AI-synced 2026-11-04), issue #3891.** The
+D7/D8 requirement of terminal runs plus fresh custody clearance for every
+anonymous-volume prune is narrowly superseded by one separate, pressure-only
+leg (`agent/src/dind-volume-prune.ts`). A worker that is always busy or
+custody-held never reaches the strict gate or the cache prune, so leaked
+anonymous volumes could fill its data root with no reclaim path. The strict
+terminal/custody gates are **unchanged** for PVC recycle, DinD maintenance and
+everything else; image and build-cache pruning is unchanged (#3653 stays
+parked).
+
+- **Scope.** Controlled by `UZI_DIND_PRUNE_ENABLED` (the same flag and wired
+  Docker predicate as the cache prune; the controller renders it only for
+  non-ephemeral workers, so ephemeral workers have no leg). It triggers on two
+  distinct fresh meter samples at or above 85% of bytes **or** inodes. It runs
+  exactly one `docker version --format {{.Server.APIVersion}}` check, which
+  must report API >=1.42, then exactly `docker volume prune -f`. Timeouts are
+  30s for the version check and 5 min for the prune; it is single-flight. It
+  never closes the claim gate and never waits for idle, terminal runs or
+  custody; claims, parked resumes and model commands proceed throughout. It
+  defers (`dind-volume-prune-deferred`) only while DinD maintenance holds its
+  fence. It does not touch images, build cache, containers, named volumes or
+  networks, and it does not settle custody.
+- **Backoff.** Every attempt outcome disarms the leg for 1h; it re-arms when
+  both bytes and inodes are below 75%. After an `unknown` outcome the full
+  hour always applies, even if a below-75% sample arrives.
+- **Default-on.** The leg rides the existing flag, so already-enabled
+  persistent Docker workers get it once the fixed worker deploys. The opt-out
+  is `workers.diskRecycleEnabled: false` / `UZI_WORKER_DISK_RECYCLE_ENABLED=false`.
+  It is not leg-only: it also disables PVC recycle and the cache prune, and
+  flipping it rolls non-ephemeral Docker worker pods.
+- **API pin (owner decision D-1, 2026-11-04).** Kept the exact frozen argv pair
+  and the server >=1.42 check, and set `DOCKER_API_VERSION=1.42` in this leg's
+  own child environment only. The pinned daemon keys anonymous-only prune on
+  the **request's** API version, and the `docker-cli` in the worker image is not
+  version-pinned, so a server-only check would not stop a lower request version
+  from also pruning unused named volumes. The environment is built from scratch
+  (the minimal worker docker env plus the pin, never a `process.env` spread), so
+  an ambient `DOCKER_API_VERSION`, `DOCKER_CONTEXT` or `DOCKER_HOST` cannot
+  override it. It fails closed: one prune exec per attempt, no downgrade retry.
+  A server below 1.42 is `refused`; a daemon or client that rejects 1.42 ends the
+  attempt as non-success with the backoff; a daemon whose configured minimum
+  exceeds 1.42 therefore never prunes. The cache prune and maintenance command
+  environments are unchanged.
+- **Outcomes and log tokens.** `dind-volume-prune-completed` (with the
+  before-sample ratios and the parsed numeric reclaimed size only) and
+  `dind-volume-prune-after` (the first fresh sample after the prune, waiting
+  up to 60s), `dind-volume-prune-refused` (nothing submitted), `-conflict`
+  (the daemon reports a prune already running), `-rejected` (any other daemon
+  error response), `-unknown` and `-deferred`. `rejected` and `unknown` carry
+  the note "outcome not proven; no reclamation or preservation claimed": a
+  prune can return after partial removal, and a lost response or timeout proves
+  nothing. An `unknown` or `rejected` outcome is never reported as success.
+- **Engine race contract.** Verified against the Moby source at the pinned
+  commit `3ce5872b7950c63ba2ffbc5123101019ff3e6682` (the `daemon/volume/service`
+  `store.go`, `service.go` and `convert.go`). Reference acquisition (`Create`,
+  `Get`) and removal share a per-name lock, and removal rechecks references
+  under it, so a volume referenced by a running or stopped container survives
+  and a create that records its reference first prevents removal. A second
+  concurrent prune gets an Engine Conflict ("a prune operation is already
+  running"), which serializes the leg against any other prune. The prune
+  selects only local-driver volumes with the anonymous label and no options, so
+  anonymous volumes created with local-driver options are excluded. If the prune
+  wins the lock first, a later create by that name fails or gets a replacement
+  empty volume. **An accepted-but-not-yet-visible create is not itself a
+  reference**: until `Create`/`Get` records it under the name lock, the prune may
+  remove the volume. That possible loss before reference acquisition is the
+  owner-accepted scratch boundary (D7), not a claim of exclusion.
+- **Maintenance overlap.** The leg only reads the gate (never closes it) and
+  checks `heldBy("maintenance")` synchronously before each exec, so it never
+  starts a prune during maintenance's window. If maintenance fences while a leg
+  prune is already in flight, maintenance's own volume prune may get an Engine
+  Conflict and then follows the unchanged D8 path above: failed, skipped or
+  insufficient pruning proceeds toward recycle. The leg adds no maintenance
+  delay, readiness marking, cancellation or custody change.
+- **Proof boundary.** The real-DinD proof (`task test:dind-volume-prune`,
+  [e2e/dind-recycle/README.md](../e2e/dind-recycle/README.md)) ran against a
+  disposable daemon reporting Server 29.8.0, GitCommit `3ce5872` (the pinned Moby
+  commit above) and MinAPIVersion 1.40. It shows the pinned request path
+  `POST /v1.42/volumes/prune`, the fail-closed too-old probe, and the
+  named/running/stopped/never-started/options/removal-first outcomes. It is
+  sequential: it does not exercise a create racing the prune, and this record does
+  not claim byte-level identity of the four cited source files with that build.
+  Hosted behavior under real pressure is unrun and remains maintainer-owned
+  acceptance after deploy.
+- **Not claimed.** This is not complete Docker-operation exclusion, and it does
+  not solve #1860 (pod-epoch writer exclusion) or #3387 (attempt-scoped Docker
+  ownership). ADR-3153 source-PVC and writer-exclusion boundaries are unchanged:
+  the leg touches no PVC, source tree, `/data/runner` content or hold.
+
 ### D9 — Fresh bounded observation and replacement readiness
 
 Before destructive transitions and replacement readiness, maintenance
@@ -154,8 +250,8 @@ No new kind/SDK production E2E or paused-recycled-resumed result is claimed.
 
 ## Consequences
 
-- `dind-data` has a gauge and two reclaim paths: the original bounded cache prune and the stricter terminal-only maintenance path. Maintenance may delete the entire DinD PVC, while preserving `/nix`, `/data`, worker UUID and join Secret; Deployment replacement keeps `/data/runner` (ADR-3153).
-- **Residual: in the non-rootless posture, node root (an accepted residual of `prds/done/89-optional-nonrootless-dind.md`) can write the meter emptyDir's node-side backing directory, so it can, in principle, forge the meter's sample.** Mount-namespace separation only keeps the daemon's own mount namespace, and any container it runs, from reaching that file directly; it does not bound node root itself. What bounds the damage is the reader's strict validation (D2), D4's frozen allowlist, and D5's idle/custody gate together: a forged sample cannot bypass the strict maintenance gate; it can affect maintenance intent as well as the original cache-prune sequence. This is not a guarantee that forged pressure cannot cause scratch loss once the gate is satisfied.
+- `dind-data` has a gauge and three reclaim paths: the original bounded cache prune, the stricter terminal-only maintenance path, and (#3891, AI-synced 2026-11-04) the pressure-only anonymous-volume leg that runs on busy or custody-held workers (D8, "Exception — #3891"). Maintenance may delete the entire DinD PVC, while preserving `/nix`, `/data`, worker UUID and join Secret; Deployment replacement keeps `/data/runner` (ADR-3153).
+- **Residual: in the non-rootless posture, node root (an accepted residual of `prds/done/89-optional-nonrootless-dind.md`) can write the meter emptyDir's node-side backing directory, so it can, in principle, forge the meter's sample.** Mount-namespace separation only keeps the daemon's own mount namespace, and any container it runs, from reaching that file directly; it does not bound node root itself. What bounds the damage is the reader's strict validation (D2), D4's frozen allowlist, and D5's idle/custody gate together: a forged sample cannot bypass the strict maintenance gate; it can affect maintenance intent as well as the original cache-prune sequence. This is not a guarantee that forged pressure cannot cause scratch loss once the gate is satisfied. The #3891 leg is the exception to that gate: a forged sample can trigger an anonymous-volume prune without it, bounded to about one prune per ~90s under forged oscillation and one per hour after an `unknown` outcome (D2), with no privilege gained.
 - **Residual: docker compose has no equivalent meter or automatic prune.** A compose docker worker's `dinddata` volume is reclaimed only by the existing manual path (`docker compose down -v`, or `docker volume rm`).
 - **Residual: a filesystem reporting zero total inodes yields no valid sample** — btrfs commonly reports `files=0` this way — since the reader's statfs-relation check requires `files > 0`; the gauge and the prune both silently degrade to "no sample" there (no sample, no prune, no gauge), not a crash or a false trigger.
 - **Destructive default on upgrade**: #1760 adds automated DinD-only recycling for eligible persistent hosted Docker workers. Named volumes are not preserved (`/data/runner` is kept since ADR-3153); store deliverables in git/checkpoints/capture. Operators must explicitly opt out before stop with `UZI_WORKER_DISK_RECYCLE_ENABLED=false`; a stop already started finishes safely even if disabled.

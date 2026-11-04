@@ -412,7 +412,16 @@ work while letting this worker's own parked runs and pinned plan checkers
 finish; maintenance fencing still closes claims. It then fences claims and
 requires fresh custody clearance and zero local activity before gated
 anonymous-volume pruning or stop. No timer, forced park, or force-roll
-override bypasses this DinD gate. Legacy recycle (plain nix/data; Docker Nix-only) associated with
+override bypasses this DinD gate. The one exception is a separate
+pressure-only anonymous-volume prune (#3891): after two fresh samples at or above
+85% of bytes or inodes it runs `docker volume prune -f` on a busy or custody-held
+persistent Docker worker without closing claims or waiting for idle, terminal
+runs or custody. It is not recycle, touches no PVC, and is enabled by the same
+default-on flag, so already-enabled workers get it once the fixed worker deploys;
+`workers.diskRecycleEnabled: false` opts out of it, but also of PVC recycle and
+the cache prune, and rolls non-ephemeral Docker worker pods. See
+[Pressure-only anonymous-volume prune](./worker-docker.md#pressure-only-anonymous-volume-prune).
+Legacy recycle (plain nix/data; Docker Nix-only) associated with
 spec-hash/generation drift also waits indefinitely for idle. Only independent
 nondrifted pressure/nix-size maintenance retains the compatible deadline; global
 ForceRoll can bypass its busy deferral, while custody-held data remains protected.
