@@ -933,10 +933,9 @@ export interface RootContext {
   liveAttempts: number;
   attemptRoots: number;
   workerRoots: number;
-  /** Attempts whose recordedRootPids() threw (their roots were treated as none). */
+  /** Attempts whose recordedRootPids() threw (their roots were treated as none). The error text
+   *  is never kept: it is not redacted, only the count and the per-attempt marker are. */
   rootReadErrors: number;
-  /** The first such error, sanitized. */
-  firstRootReadError?: string;
   /** Per other live attempt (first {@link ROOT_CONTEXT_MAX_ATTEMPTS}): its run and how many roots it
    *  supplied, or "error" when they could not be read. */
   attempts: Array<{ runId: string; roots: number | "error" }>;
@@ -946,6 +945,9 @@ const ROOT_CONTEXT_MAX_ATTEMPTS = 8;
 
 const TRACE_MAX_ANCESTORS = 16;
 const TRACE_MAX_CANDIDATES = 20;
+/** Traced entries per scan pass: the rest stay listed without a trace, so many unreadable
+ *  processes cannot crowd the verdict out of the helper's bounded stdout. */
+const TRACE_MAX_PER_SCAN = 4;
 
 interface KillCandidate extends QuiesceProcess {
   /** Internal identity captured during classification; never included in ProcessQuiescence. */
@@ -1095,6 +1097,7 @@ export function scanOnce(
   };
   const liveMarkers = new Set(req.liveMarkers);
   const roots = indexRoots(req.liveRoots);
+  let traced = 0;
 
   for (const pid of pids) {
     if (excluded.has(pid)) continue;
@@ -1149,8 +1152,14 @@ export function scanOnce(
       ) {
         result.kill.push({ ...entry, reason: "unreadable_no_other_claim", startTime: facts.startTime });
       } else {
-        // issue #3915: say which identities were checked and how each missed a recorded root.
-        result.unverified.push({ ...entry, attribution: traceAttribution(pid, facts, table, roots) });
+        // issue #3915: say which identities were checked and how each missed a recorded root,
+        // for the first few such entries of this pass only.
+        if (traced < TRACE_MAX_PER_SCAN) {
+          traced += 1;
+          result.unverified.push({ ...entry, attribution: traceAttribution(pid, facts, table, roots) });
+        } else {
+          result.unverified.push(entry);
+        }
       }
       continue;
     }
@@ -2577,15 +2586,13 @@ export function collectLiveRoots(
   workerRoots: readonly RecordedRoot[],
 ): { roots: RecordedRoot[]; context: RootContext } {
   let rootReadErrors = 0;
-  let firstRootReadError: string | undefined;
   const attempts: RootContext["attempts"] = [];
   const attemptRoots = others.flatMap((a) => {
     let roots: RecordedRoot[] | undefined;
     try {
       roots = a.recordedRootPids();
-    } catch (err) {
+    } catch {
       rootReadErrors += 1;
-      firstRootReadError ??= errMessageOf(err);
     }
     if (attempts.length < ROOT_CONTEXT_MAX_ATTEMPTS) {
       attempts.push({ runId: sanitizeForLog(a.runId, 64), roots: roots === undefined ? "error" : roots.length });
@@ -2599,7 +2606,6 @@ export function collectLiveRoots(
       attemptRoots: attemptRoots.length,
       workerRoots: workerRoots.length,
       rootReadErrors,
-      ...(firstRootReadError !== undefined ? { firstRootReadError: sanitizeForLog(firstRootReadError, 200) } : {}),
       attempts,
     },
   };
@@ -2770,10 +2776,6 @@ export function describeProcesses(q: ProcessQuiescence | undefined): Array<Recor
   }));
 }
 
-function errMessageOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
 /** issue #3915: log fields for the other-attempt roots a non-quiescent scan was given. */
 export function describeRootContext(q: ProcessQuiescence | undefined): Record<string, unknown> | undefined {
   const c = q?.rootContext;
@@ -2783,7 +2785,6 @@ export function describeRootContext(q: ProcessQuiescence | undefined): Record<st
     attempt_roots: c.attemptRoots,
     worker_roots: c.workerRoots,
     root_read_errors: c.rootReadErrors,
-    ...(c.firstRootReadError ? { first_root_read_error: sanitizeForLog(c.firstRootReadError, 200) } : {}),
     attempts: c.attempts.map((a) => ({ run_id: a.runId, roots: a.roots })),
   };
 }

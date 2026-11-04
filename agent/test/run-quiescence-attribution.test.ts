@@ -96,6 +96,16 @@ describe("issue #3915: attribution trace on an unattributed unreadable process",
     assert.ok(t.candidates.length <= 20);
   });
 
+  it("traces at most four entries per scan; the rest stay listed and unverified", () => {
+    const procs: Record<number, P> = {};
+    for (let pid = 200; pid < 210; pid++) procs[pid] = {};
+    const res = scanOnce(req(), table(procs), SELF);
+    assert.equal(res.unverified.length, 10);
+    assert.deepEqual(res.kill, []);
+    assert.equal(res.unverified.filter((p) => p.attribution).length, 4);
+    assert.ok(res.unverified.every((p) => p.reason === "unreadable_unattributed"));
+  });
+
   it("reaches the log fields, and a helper-supplied trace is rebuilt from validated fields only", () => {
     const t = scanOnce(req(), table({ 62: {} }), SELF).unverified[0]!.attribution!;
     const fields = describeProcesses({ state: "unverified", processes: [{ pid: 62, uid: RUNNER, comm: "x", cwd: "unreadable", reason: "unreadable_unattributed", attribution: t }], killed: [], detail: "d" });
@@ -113,23 +123,24 @@ describe("issue #3915: attribution trace on an unattributed unreadable process",
 });
 
 describe("issue #3915: root context of a quiescence scan", () => {
-  it("counts peer roots per attempt and names a root read that threw", () => {
+  it("counts peer roots per attempt and marks a root read that threw, without its text", () => {
     const { roots, context } = collectLiveRoots(
       [
         { runId: "run-a", recordedRootPids: () => [{ pid: 60, startTime: START }] },
-        { runId: "run-b", recordedRootPids: () => { throw new Error("lane gone"); } },
+        { runId: "run-b", recordedRootPids: () => { throw new Error("token=secret-value"); } },
       ],
       [{ pid: 70, startTime: START }],
     );
     assert.deepEqual(roots, [{ pid: 60, startTime: START }, { pid: 70, startTime: START }]);
     assert.deepEqual(context, {
-      liveAttempts: 2, attemptRoots: 1, workerRoots: 1, rootReadErrors: 1, firstRootReadError: "lane gone",
+      liveAttempts: 2, attemptRoots: 1, workerRoots: 1, rootReadErrors: 1,
       attempts: [{ runId: "run-a", roots: 1 }, { runId: "run-b", roots: "error" }],
     });
     assert.deepEqual(describeRootContext({ state: "unverified", processes: [], killed: [], detail: "", rootContext: context }), {
-      live_attempts: 2, attempt_roots: 1, worker_roots: 1, root_read_errors: 1, first_root_read_error: "lane gone",
+      live_attempts: 2, attempt_roots: 1, worker_roots: 1, root_read_errors: 1,
       attempts: [{ run_id: "run-a", roots: 1 }, { run_id: "run-b", roots: "error" }],
     });
+    assert.equal(JSON.stringify(context).includes("secret"), false, "exception text never reaches the context");
     assert.equal(describeRootContext(undefined), undefined);
   });
 });
