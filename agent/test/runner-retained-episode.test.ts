@@ -593,25 +593,47 @@ it("retained recovery credential switch during successor adoption keeps both clo
 it("retained recovery credential switch during discovery keeps unknown custody", async () => {
   await retainedSwitchRegression("discovery", false);
 });
+
+/** Test-owned bound on a fixture's signal wait: far above the 50 ms / 1 s verification deadlines,
+ *  far below the 120 s Node cap. It records its own expiry and settles the waiter without touching
+ *  the observed signal; each case asserts on the record outside production's catch. */
+const SIGNAL_WATCHDOG_MS = 10_000;
+type SignalWait = { signal?: AbortSignal; watchdogFired: boolean };
+function awaitSignalOrWatchdog(record: SignalWait, signal: AbortSignal | undefined): Promise<"aborted" | "watchdog" | "missing"> {
+  record.signal = signal;
+  if (!signal) return Promise.resolve("missing");
+  if (signal.aborted) return Promise.resolve("aborted");
+  return new Promise(resolve => {
+    const onAbort = () => { clearTimeout(timer); resolve("aborted"); };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      record.watchdogFired = true;
+      resolve("watchdog");
+    }, SIGNAL_WATCHDOG_MS);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+function assertRecoveryDeadline(signal: AbortSignal, what: string): void {
+  assert.ok(signal.reason instanceof Error && signal.reason.message === "recovery deadline exhausted",
+    `${what} aborted by its own recovery deadline, not another signal: ${String(signal.reason)}`);
+}
 it("retained recovery credential switch completes bounded ownership verification on deadline", async () => {
   await retainedSwitchRegression("ownership", false, { deadline: true });
 });
 it("retained recovery credential switch aborts drain at its operation deadline", async t => {
   let drains = 0;
-  let drainSignal: AbortSignal | undefined;
+  const drainWait: SignalWait = { watchdogFired: false };
   t.mock.method(MessageBatcher.prototype, "close", async (signal?: AbortSignal) => {
     drains++;
-    drainSignal = signal;
     // Missing propagation must fail promptly instead of hanging the regression.
-    if (!signal) return;
-    await new Promise<void>(resolve => {
-      if (signal.aborted) resolve();
-      else signal.addEventListener("abort", () => resolve(), { once: true });
-    });
+    await awaitSignalOrWatchdog(drainWait, signal);
   });
   await retainedSwitchRegression("ownership", false, { drainDeadline: true });
+  const drainSignal = drainWait.signal;
   assert.ok(drainSignal, "drain receives the independent operation signal");
+  assert.equal(drainWait.watchdogFired, false, "drain ended before the test watchdog");
   assert.equal(drainSignal.aborted, true, "drain settled only after deadline abort");
+  assertRecoveryDeadline(drainSignal, "drain");
   assert.equal(drains, 1, "outer cleanup joins the bounded drain rather than draining again");
 });
 for (const proofTerminal of ["shutdown", "fence", "cancel"] as const) {
@@ -641,9 +663,14 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
   let models = 0, captures = 0, releases = 0, injected = false, proofInterrupted = false;
   let flight: any;
   const log = recordingLogger();
+  const ownershipWait: SignalWait = { watchdogFired: false };
   const r = runnerWith(factory(async () => { models++; throw new Error("must not resume model"); }),
     fakeGitlab().gitlab, "fixture-journal-key", log.logger, {
       recoveryRetryMs: 1,
+      // The verification allowance is resolved at construction; trip()'s later
+      // codexBoundaryDeadlineMs assignment does not reach it.
+      ...(options.deadline ? { retainedSwitchVerificationMs: 50 } : {}),
+      ...(options.drainDeadline ? { retainedSwitchVerificationMs: 1_000 } : {}),
       ...(options.quiesceRequests ? { quiesceRun: (req: import("../src/run-quiescence.js").QuiesceRunRequest) => {
         options.quiesceRequests!.push(req);
         return quiesceRunAttempt(req);
@@ -659,14 +686,11 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
     if (injected && (options.deadline || options.proofTerminal) && !proofInterrupted) {
       proofInterrupted = true;
       if (options.deadline) {
-        assert.ok(args[1], "verification passes its independent bounded signal");
-        return new Promise<Awaited<ReturnType<typeof owner>>>((_resolve, reject) => {
-          const signal = args[1] instanceof AbortSignal ? args[1] : args[1]?.signal;
-          assert.ok(signal);
-          const aborted = () => reject(signal.reason);
-          if (signal.aborted) aborted();
-          else signal.addEventListener("abort", aborted, { once: true });
-        });
+        // Assertions inside this override would be swallowed by production's verification
+        // catch: record the signal and assert on it after execute() returns.
+        const signal = args[1] instanceof AbortSignal ? args[1] : args[1]?.signal;
+        const settled = await awaitSignalOrWatchdog(ownershipWait, signal);
+        throw settled === "aborted" ? signal!.reason : new Error(`fixture ownership wait ended: ${settled}`);
       }
       if (options.proofTerminal === "shutdown") (r as any).shuttingDownGlobal = true;
       if (options.proofTerminal === "fence") flight.steering.claimFence = () => ({ kind: "superseded" });
@@ -699,6 +723,7 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
         }
       };
     }
+    // Kept for the other boundaries; the verification deadline comes from the constructor option.
     if (options.deadline) (r as any).codexBoundaryDeadlineMs = 50;
     if (options.drainDeadline) (r as any).codexBoundaryDeadlineMs = 1_000;
     if (options.cancelOnly) {
@@ -774,6 +799,13 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
       [[verified ? "credential_switch" : "credential_switch_failed", 2]]);
   assert.equal(api.states.some(s => s.body.status === "failed"), options.terminal === "cancel");
   if (options.deadline || options.proofTerminal) assert.equal(proofInterrupted, true, "verification await was interrupted");
+  if (options.deadline) {
+    const signal = ownershipWait.signal;
+    assert.ok(signal, "verification passes its independent bounded signal");
+    assert.equal(ownershipWait.watchdogFired, false, "verification ended before the test watchdog");
+    assert.equal(signal.aborted, true, "verification settled only after deadline abort");
+    assertRecoveryDeadline(signal, "verification");
+  }
   if (!options.terminal && !options.mismatch && !options.deadline && !options.drainDeadline && !options.proofTerminal && !options.interruption) {
     const disposition = log.lines.find(line => (line as { msg: string }).msg ===
       "retained credential switch stopped; all local work and custody retained") as { confirmed: boolean } | undefined;
