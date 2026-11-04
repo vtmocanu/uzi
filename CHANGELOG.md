@@ -63,6 +63,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Runs and CLI show grouped owner cross-check history ([#3811](https://github.com/vtmocanu/uzi/pull/3811), [#3843](https://github.com/vtmocanu/uzi/pull/3843)).**
   Browse retained Plan and Code attempts in Active and Past, with independent execution, verdict and effect evidence, owner-scoped preferences, filters and explicit older-history continuation. Older loaded attempts outside a refreshed window are labelled as last-observed evidence.
 
+- **Plan checkers can verify claims about your own answers and revise feedback ([#3841](https://github.com/vtmocanu/uzi/pull/3841), [#3869](https://github.com/vtmocanu/uzi/pull/3869)).**
+  Each new plan check round freezes a bounded snapshot of the owner's answers and revise feedback, with questions shown as lead/worker-authored; it needs workers advertising `cross_check_owner_steering_v1`, so until one rolls in the check waits and then falls back to the human plan gate.
+
 ### Changed
 
 - **Routine dependency updates ([#3817](https://github.com/vtmocanu/uzi/pull/3817)).**
@@ -177,6 +180,18 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Run judge retains middle and delegation evidence with honest coverage within bounded input ([#3807](https://github.com/vtmocanu/uzi/pull/3807), [#3828](https://github.com/vtmocanu/uzi/pull/3828)).**
   Separately budgeted evidence and event-aware samples expose omissions and uncertain outcomes without treating activity counts or recorded claims as proof. Ordinary tool activity no longer displaces delegation correlation from pending slots; ordinary-history loss alone preserves available delegation outcomes while limiting cross-kind reuse detection to retained ordinary keys. Orphan floods cannot evict open dispatches; unknown orphan coverage losses, including admission drops, keep retained result-before-start pairs provisional.
+
+- **A Claude run's Go build work directory is now removed when the run parks ([#3870](https://github.com/vtmocanu/uzi/pull/3870), [#3887](https://github.com/vtmocanu/uzi/pull/3887)).**
+  Claude runs get a per-claim `GOTMPDIR` under the run HOME that is removed at process-ended parks, the periodic reclaim and re-claim of older generations; general `TMPDIR`, caches and Codex runs are unchanged.
+
+- **Recovery retries can resume the recorded publication candidate ([#3781](https://github.com/vtmocanu/uzi/pull/3781), [#3866](https://github.com/vtmocanu/uzi/pull/3866)).**
+  Verified marker-free recovery wrappers preserve custody while execution resumes from their authenticated content source, avoiding false model-required holds; legacy wrappers without the required provenance may still need manual recovery and delivery.
+
+- **A retained recovery no longer seeds a fresh attempt onto a volume it would push past the hard disk threshold ([#3865](https://github.com/vtmocanu/uzi/pull/3865), [#3882](https://github.com/vtmocanu/uzi/pull/3882)).**
+  The worker checks current and projected usage of the successor volume after the floor check and refuses inside the already-reserved recovery iteration; once those iterations are exhausted it ends as the existing retained-recovery park, never a counted disk park; the projection is an estimate, not a quota.
+
+- **Let report-only runs finish after an owner partial decision ([#3863](https://github.com/vtmocanu/uzi/pull/3863), [#3867](https://github.com/vtmocanu/uzi/pull/3867)).**
+  When the owner keeps some milestones and defers the rest, a report-only run now completes with the reduced-scope outcome once the kept milestones are done, instead of never completing.
 
 ## [0.86.0] - 2026-11-01
 
