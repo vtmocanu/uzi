@@ -70,30 +70,6 @@ it("a current MaintenanceBudget with less time left ends the publish before the 
   assert.ok(elapsed >= 200 && elapsed < 2_000, `ended after ${elapsed} ms, expected about 300`);
 });
 
-it("undici's own headers timeout does not cut a publish the allowance still covers", async (t) => {
-  // undici runs these timeouts on its coarse fast timers (about 1 s resolution), so the answer is
-  // held well past the scaled 200 ms timeout.
-  const url = await ackAfter(t, 2_500);
-  // Load Node's fetch implementation so the global dispatcher slot is filled, then stand a 200 ms
-  // headers/body-timeout Agent of the same class in for undici's 300 s defaults (time-scaled).
-  await fetch(`${url}/warm`, { method: "POST", body: "x" }).then(r => r.text());
-  const slot = Symbol.for("undici.globalDispatcher.2");
-  const g = globalThis as unknown as Record<symbol, { constructor: new (o: object) => { close(): Promise<void> } }>;
-  const original = g[slot];
-  assert.ok(original, "the global dispatcher slot is filled after a fetch");
-  const scaled = new original.constructor({ headersTimeout: 200, bodyTimeout: 200 });
-  g[slot] = scaled as unknown as typeof original;
-  t.after(async () => { g[slot] = original; await scaled.close(); });
-
-  // Control: a plain fetch on the scaled default is cut at its headers timeout.
-  await assert.rejects(fetch(url, { method: "POST", body: "pack" }),
-    (e: { cause?: { code?: string } }) => e.cause?.code === "UND_ERR_HEADERS_TIMEOUT");
-
-  const client = new WorkerClient(url, "test", "test", nullLogger(), { httpTimeoutMs: 100, checkpointPublishTimeoutMs: 6_000 });
-  const res = await client.publishCheckpoint("run-1", TIP, pack());
-  assert.deepEqual(res, { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/branch" } });
-});
-
 it("the worker allowance matches the committed budget fixture and exceeds the api write deadline", () => {
   const fixture = JSON.parse(fs.readFileSync(
     new URL("../../fixtures/checkpoint-publish-budget.json", import.meta.url), "utf8")) as

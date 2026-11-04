@@ -135,7 +135,11 @@ aborts are not retried.
 480 s, not `WORKER_HTTP_TIMEOUT`) is created once before the first attempt and shared by
 all three; a retry never renews it, so it bounds the whole logical publish even for a
 caller with no outer signal, and an earlier caller or maintenance deadline still wins.
-undici's own 300 s headers/body timeouts are raised to the allowance for that request. When the
+undici's own 300 s headers/body timeouts are raised to the allowance for that request using an
+owned dispatcher from the pinned undici package, passed to Node 26's native fetch and destroyed
+after the acknowledgement or any failure. Node's default TLS trust and startup environment-proxy
+opt-in (`NODE_USE_ENV_PROXY`, `NODE_OPTIONS`, CLI flags) are preserved. Runtime
+`http.setGlobalProxyFromEnv()` overrides are not tracked; the worker has no such caller. When the
 allowance expires (its owned timer fired while the caller's signal did not), the failure is
 classified `timeout` from that state, not from the error's shape.
 

@@ -13,6 +13,7 @@ import { decodeCompletionPending, type CompletionPending } from "./completion-pe
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
+import { checkpointPublishDispatcher } from "./checkpoint-publish-transport.js";
 import type { ReadableStreamReadResult } from "node:stream/web";
 import { MaintenanceResources } from "./recovery-maintenance.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
@@ -349,10 +350,10 @@ export interface InputReceipt {
   reason?: string;
 }
 
-/** Error carrying the server's HTTP status + (truncated) body for retry logic. */
 /** Issue #2545 step A: the per-request timeout of the held-publication upload, and of no other route.
  *  The api's write deadline for the route is 120 s upload + 150 s service + 30 s answer grace = 300 s;
- *  30 s of margin lets an answer written at the server's deadline still arrive. */
+ *  30 s of signal margin lets an answer written at the server's deadline still arrive. This route
+ *  still uses native fetch's 300 s transport defaults; raising those needs a separate follow-up. */
 export const HELD_PUBLICATION_TIMEOUT_MS = 330_000;
 
 /** The logical-operation allowance of one checkpoint publish (POST .../runs/{id}/publish), and of no
@@ -382,28 +383,6 @@ export const HELD_PUBLICATION_TIMEOUT_MS = 330_000;
  *  A MaintenanceBudget (600 s default) becomes current only once a cancellation was observed for the
  *  attempt (observeCancellation), so rows 1-4 normally run without one. */
 export const CHECKPOINT_PUBLISH_TIMEOUT_MS = 480_000;
-
-/** undici's process-wide dispatcher slot: the versioned key Node's bundled fetch reads its default
- *  dispatcher from (and npm undici's setGlobalDispatcher writes). */
-const UNDICI_GLOBAL_DISPATCHER = Symbol.for("undici.globalDispatcher.2");
-type UndiciDispatch = (opts: Record<string, unknown>, handler: unknown) => boolean;
-
-/** The dispatcher one checkpoint publish runs on. Node's bundled fetch (undici) ends a request whose
- *  response headers take longer than headersTimeout, or whose stream sits idle longer than it, and
- *  both default to 300 s whatever the request signal says; the api may hold a valid /publish answer
- *  longer than that (fixtures/checkpoint-publish-budget.json). This returns the CURRENT global
- *  dispatcher composed with per-request headersTimeout and bodyTimeout of `timeoutMs` (same
- *  connection pool, TLS and proxy settings), so the request signal stays the bound. It returns
- *  undefined, and fetch keeps its default, when the slot is empty or not composable; the slot is
- *  filled once Node has loaded its fetch implementation, which a worker's registration does before
- *  any publish. */
-function checkpointPublishDispatcher(timeoutMs: number): unknown {
-  const base = (globalThis as Record<symbol, unknown>)[UNDICI_GLOBAL_DISPATCHER] as
-    { compose?: (interceptor: (dispatch: UndiciDispatch) => UndiciDispatch) => unknown } | undefined;
-  if (typeof base?.compose !== "function") return undefined;
-  return base.compose(dispatch => (opts, handler) =>
-    dispatch({ ...opts, headersTimeout: timeoutMs, bodyTimeout: timeoutMs }, handler));
-}
 
 /** The held-publication feature string, advertised by the worker and by the api's protocol_features. */
 export const HELD_PUBLICATION_FEATURE = "recovery_held_publication_v1";
@@ -3193,23 +3172,29 @@ export class WorkerClient {
       signal,
     };
     const dispatcher = checkpointPublishDispatcher(this.checkpointPublishTimeoutMs);
-    if (dispatcher) Object.assign(init, { dispatcher });
-    const res = await maintenanceFetch(fetch, this.baseUrl + path, init);
-    if (res.status < 200 || res.status >= 300) {
-      // Discard remote content without exposing it or changing the HTTP outcome.
-      if (ownedResponses.has(res)) await discardResponse(res);
-      else if (MaintenanceBudget.current()) void res.body?.cancel().catch(() => undefined);
-      else await res.body?.cancel().catch(() => undefined);
-      MaintenanceBudget.current()?.check();
-      return { ok: false, httpStatus: res.status };
+    Object.assign(init, { dispatcher });
+    try {
+      const res = await maintenanceFetch(fetch, this.baseUrl + path, init);
+      if (res.status < 200 || res.status >= 300) {
+        // Discard remote content without exposing it or changing the HTTP outcome.
+        if (ownedResponses.has(res)) await discardResponse(res);
+        else if (MaintenanceBudget.current()) void res.body?.cancel().catch(() => undefined);
+        else await res.body?.cancel().catch(() => undefined);
+        MaintenanceBudget.current()?.check();
+        return { ok: false, httpStatus: res.status };
+      }
+      // Bounded by streamed bytes: an overflow, a read failure or an abort throws, so the caller
+      // records the publish as ambiguous instead of reading an unbounded acknowledgment.
+      const text = await readBoundedText(res, CHECKPOINT_PUBLISH_ACK_MAX_BYTES, true, signal);
+      // A 2xx with no body cannot confirm the publish landed; treat it as a non-confirming
+      // outcome carrying the 2xx code rather than fabricating a body.
+      if (!text) return { ok: false, httpStatus: res.status };
+      return { ok: true, body: JSON.parse(text) as PublishResponse };
+    } finally {
+      // Destroy rather than graceful-close: failed/aborted uploads and partially read ACKs must
+      // not keep a pool alive or delay a caller's cancellation waiting for an idle connection.
+      await dispatcher.destroy();
     }
-    // Bounded by streamed bytes: an overflow, a read failure or an abort throws, so the caller
-    // records the publish as ambiguous instead of reading an unbounded acknowledgment.
-    const text = await readBoundedText(res, CHECKPOINT_PUBLISH_ACK_MAX_BYTES, true, signal);
-    // A 2xx with no body cannot confirm the publish landed; treat it as a non-confirming
-    // outcome carrying the 2xx code rather than fabricating a body.
-    if (!text) return { ok: false, httpStatus: res.status };
-    return { ok: true, body: JSON.parse(text) as PublishResponse };
   }
 
   /**
