@@ -170,7 +170,12 @@ describe("measureRetainedSeedFootprint", () => {
     return clone;
   }
 
-  const cache = (): GitCache => new GitCache(makeScratchRoot("uzi-seed-data-"), nullLogger(), undefined, testGitCacheOptions());
+  const scratch = (prefix: string): string => {
+    const r = makeScratchRoot(prefix);
+    roots.push(r);
+    return r;
+  };
+  const cache = (): GitCache => new GitCache(scratch("uzi-seed-data-"), nullLogger(), undefined, testGitCacheOptions());
   const far = (): number => Date.now() + 60_000;
 
   it("leaves .git/objects out unless the successor is self-contained", async () => {
@@ -212,7 +217,7 @@ describe("measureRetainedSeedFootprint", () => {
     const g = cache();
     const late = await g.measureRetainedSeedFootprint(tree(), { includeGitObjects: true, deadline: 0 });
     assert.equal(late.complete, false);
-    const missing = await g.measureRetainedSeedFootprint(path.join(makeScratchRoot("uzi-seed-none-"), "absent"), {
+    const missing = await g.measureRetainedSeedFootprint(path.join(scratch("uzi-seed-none-"), "absent"), {
       includeGitObjects: true,
       deadline: far(),
     });
