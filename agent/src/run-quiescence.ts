@@ -896,7 +896,56 @@ export interface QuiesceProcess {
   comm: string;
   cwd: string;
   reason: string;
+  /** issue #3915: why an `unreadable_unattributed` process matched no recorded root. Diagnostic
+   *  only: it never changes a kill or unverified decision. */
+  attribution?: AttributionTrace;
 }
+
+/** How one attribution candidate (the process itself, its group, session or an ancestor) compared
+ *  with the recorded roots of other live attempts. `start_mismatch`: the pid is recorded but its
+ *  current start time is not; `start_unreadable`: the pid is recorded but its start time cannot be
+ *  read now; `not_recorded`: no recorded root has that pid. */
+export type AttributionMatch = "matched" | "start_mismatch" | "start_unreadable" | "not_recorded";
+
+export interface AttributionCandidate {
+  pid: number;
+  role: "self" | "pgid" | "sid" | "ancestor";
+  match: AttributionMatch;
+}
+
+/** issue #3915: the identities an unattributed process was checked by, bounded and numeric apart
+ *  from sanitized comms. Never carries argv, environment or cwd content. */
+export interface AttributionTrace {
+  startTime?: number;
+  ppid?: number;
+  pgid?: number;
+  sid?: number;
+  /** Up to {@link TRACE_MAX_ANCESTORS} ancestors, nearest first. */
+  ancestors: Array<{ pid: number; comm?: string; startTime?: number }>;
+  /** Up to {@link TRACE_MAX_CANDIDATES} candidates, in check order. */
+  candidates: AttributionCandidate[];
+  /** How many recorded roots the scan compared against. */
+  rootsCompared: number;
+}
+
+/** issue #3915: what the caller supplied as other live attempts' roots, for the refusal log. */
+export interface RootContext {
+  liveAttempts: number;
+  attemptRoots: number;
+  workerRoots: number;
+  /** Attempts whose recordedRootPids() threw (their roots were treated as none). */
+  rootReadErrors: number;
+  /** The first such error, sanitized. */
+  firstRootReadError?: string;
+  /** Per other live attempt (first {@link ROOT_CONTEXT_MAX_ATTEMPTS}): its run and how many roots it
+   *  supplied, or "error" when they could not be read. */
+  attempts: Array<{ runId: string; roots: number | "error" }>;
+}
+
+const ROOT_CONTEXT_MAX_ATTEMPTS = 8;
+
+const TRACE_MAX_ANCESTORS = 16;
+const TRACE_MAX_CANDIDATES = 20;
 
 interface KillCandidate extends QuiesceProcess {
   /** Internal identity captured during classification; never included in ProcessQuiescence. */
@@ -965,6 +1014,45 @@ function attributedToOtherLive(pid: number, table: ProcTable, roots: RootIndex):
   }
   for (const a of ancestorsOf(pid, table)) candidates.add(a);
   return [...candidates].some((c) => isRecordedRoot(c, table, roots));
+}
+
+/** issue #3915: how a candidate compares with the recorded roots (see {@link AttributionMatch}). */
+function rootMatch(candidate: number, table: ProcTable, roots: RootIndex): AttributionMatch {
+  const recorded = roots.get(candidate);
+  if (recorded === undefined) return "not_recorded";
+  const r = tryRead(() => table.readStat(candidate));
+  const startTime = r.ok ? parseStat(r.value)?.startTime : undefined;
+  if (startTime === undefined) return "start_unreadable";
+  return recorded.has(startTime) ? "matched" : "start_mismatch";
+}
+
+/** issue #3915: the bounded identity trace of an unreadable process that
+ *  {@link attributedToOtherLive} could not attribute. Reads only world-readable stat files. */
+function traceAttribution(pid: number, facts: StatFacts | undefined, table: ProcTable, roots: RootIndex): AttributionTrace {
+  const ancestors = ancestorsOf(pid, table).slice(0, TRACE_MAX_ANCESTORS).map((a) => {
+    const r = tryRead(() => table.readStat(a));
+    const f = r.ok ? parseStat(r.value) : undefined;
+    return { pid: a, ...(f ? { comm: f.comm } : {}), ...(f?.startTime !== undefined ? { startTime: f.startTime } : {}) };
+  });
+  const ordered: Array<{ pid: number; role: AttributionCandidate["role"] }> = [{ pid, role: "self" }];
+  if (facts) ordered.push({ pid: facts.pgid, role: "pgid" }, { pid: facts.sid, role: "sid" });
+  for (const a of ancestors) ordered.push({ pid: a.pid, role: "ancestor" });
+  const seen = new Set<number>();
+  const candidates: AttributionCandidate[] = [];
+  for (const c of ordered) {
+    if (seen.has(c.pid) || candidates.length >= TRACE_MAX_CANDIDATES) continue;
+    seen.add(c.pid);
+    candidates.push({ ...c, match: rootMatch(c.pid, table, roots) });
+  }
+  let rootsCompared = 0;
+  for (const times of roots.values()) rootsCompared += times.size;
+  return {
+    ...(facts?.startTime !== undefined ? { startTime: facts.startTime } : {}),
+    ...(facts ? { ppid: facts.ppid, pgid: facts.pgid, sid: facts.sid } : {}),
+    ancestors,
+    candidates,
+    rootsCompared,
+  };
 }
 
 /** One pass over the process table. Pure apart from the reads; signals nothing. */
@@ -1061,7 +1149,8 @@ export function scanOnce(
       ) {
         result.kill.push({ ...entry, reason: "unreadable_no_other_claim", startTime: facts.startTime });
       } else {
-        result.unverified.push(entry);
+        // issue #3915: say which identities were checked and how each missed a recorded root.
+        result.unverified.push({ ...entry, attribution: traceAttribution(pid, facts, table, roots) });
       }
       continue;
     }
@@ -1279,6 +1368,9 @@ export interface ProcessQuiescence {
   /** Pids SIGKILLed during the reap. */
   killed: number[];
   detail: string;
+  /** issue #3915: the other-attempt roots the scan was given. Set by {@link quiesceRunAttempt} on
+   *  the worker side, never by the helper. */
+  rootContext?: RootContext;
 }
 
 const REAP_DEADLINE_MS = 5_000;
@@ -1729,16 +1821,49 @@ function isProcessQuiescence(v: unknown): v is ProcessQuiescence {
 function sanitizeVerdict(v: ProcessQuiescence): ProcessQuiescence {
   return {
     state: v.state,
-    processes: v.processes.map((p) => ({
-      pid: p.pid,
-      uid: Number.isInteger(p.uid) ? p.uid : -1,
-      comm: sanitizeForLog(String(p.comm), 64),
-      cwd: sanitizeForLog(String(p.cwd)),
-      reason: sanitizeForLog(String(p.reason), 64),
-    })),
+    processes: v.processes.map((p) => {
+      const attribution = sanitizeAttributionTrace(p.attribution);
+      return {
+        pid: p.pid,
+        uid: Number.isInteger(p.uid) ? p.uid : -1,
+        comm: sanitizeForLog(String(p.comm), 64),
+        cwd: sanitizeForLog(String(p.cwd)),
+        reason: sanitizeForLog(String(p.reason), 64),
+        ...(attribution ? { attribution } : {}),
+      };
+    }),
     killed: v.killed,
     detail: sanitizeForLog(v.detail),
   };
+}
+
+const TRACE_ROLES = new Set(["self", "pgid", "sid", "ancestor"]);
+const TRACE_MATCHES = new Set(["matched", "start_mismatch", "start_unreadable", "not_recorded"]);
+
+/** issue #3915: a helper-supplied {@link AttributionTrace} rebuilt from validated, bounded fields
+ *  only (it crossed a uid boundary); anything malformed is dropped, never trusted. */
+export function sanitizeAttributionTrace(v: unknown): AttributionTrace | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const o = v as Record<string, unknown>;
+  const int = (x: unknown): number | undefined => (Number.isSafeInteger(x) && (x as number) >= 0 ? (x as number) : undefined);
+  if (!Array.isArray(o.ancestors) || !Array.isArray(o.candidates) || int(o.rootsCompared) === undefined) return undefined;
+  const ancestors = o.ancestors.slice(0, TRACE_MAX_ANCESTORS).flatMap((a) => {
+    if (typeof a !== "object" || a === null) return [];
+    const r = a as Record<string, unknown>;
+    const pid = int(r.pid);
+    if (pid === undefined) return [];
+    const startTime = int(r.startTime);
+    return [{ pid, ...(typeof r.comm === "string" ? { comm: sanitizeForLog(r.comm, 64) } : {}), ...(startTime !== undefined ? { startTime } : {}) }];
+  });
+  const candidates = o.candidates.slice(0, TRACE_MAX_CANDIDATES).flatMap((c) => {
+    if (typeof c !== "object" || c === null) return [];
+    const r = c as Record<string, unknown>;
+    const pid = int(r.pid);
+    if (pid === undefined || !TRACE_ROLES.has(r.role as string) || !TRACE_MATCHES.has(r.match as string)) return [];
+    return [{ pid, role: r.role as AttributionCandidate["role"], match: r.match as AttributionMatch }];
+  });
+  const optional = (k: "startTime" | "ppid" | "pgid" | "sid") => (int(o[k]) !== undefined ? { [k]: int(o[k]) } : {});
+  return { ...optional("startTime"), ...optional("ppid"), ...optional("pgid"), ...optional("sid"), ancestors, candidates, rootsCompared: int(o.rootsCompared)! };
 }
 
 /**
@@ -2441,9 +2566,49 @@ function reapScopedRunProcesses(
   });
 }
 
+/**
+ * Other live attempts' recorded roots (Claude CLI groups, Codex provider supervisors) plus every
+ * long-lived runner-uid root this worker launched and recorded itself. An attempt whose roots
+ * cannot be read contributes none, as before; issue #3915 counts it in the returned context so a
+ * refusal log shows whether the scan was missing a peer's roots.
+ */
+export function collectLiveRoots(
+  others: readonly Pick<RunAttempt, "runId" | "recordedRootPids">[],
+  workerRoots: readonly RecordedRoot[],
+): { roots: RecordedRoot[]; context: RootContext } {
+  let rootReadErrors = 0;
+  let firstRootReadError: string | undefined;
+  const attempts: RootContext["attempts"] = [];
+  const attemptRoots = others.flatMap((a) => {
+    let roots: RecordedRoot[] | undefined;
+    try {
+      roots = a.recordedRootPids();
+    } catch (err) {
+      rootReadErrors += 1;
+      firstRootReadError ??= errMessageOf(err);
+    }
+    if (attempts.length < ROOT_CONTEXT_MAX_ATTEMPTS) {
+      attempts.push({ runId: sanitizeForLog(a.runId, 64), roots: roots === undefined ? "error" : roots.length });
+    }
+    return roots ?? [];
+  });
+  return {
+    roots: [...attemptRoots, ...workerRoots],
+    context: {
+      liveAttempts: others.length,
+      attemptRoots: attemptRoots.length,
+      workerRoots: workerRoots.length,
+      rootReadErrors,
+      ...(firstRootReadError !== undefined ? { firstRootReadError: sanitizeForLog(firstRootReadError, 200) } : {}),
+      attempts,
+    },
+  };
+}
+
 /** The process reap (unless skipped), then the Docker teardown. Never throws. */
 export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRunDeps = {}): Promise<QuiesceRunOutcome> {
   let processResult: ProcessQuiescence | undefined;
+  let rootContext: RootContext | undefined;
   const producerWorkLimits = req.producerWorkLimits === undefined ? deps.reap?.producerWorkLimits : req.producerWorkLimits;
   try {
     validateProducerWorkLimits(producerWorkLimits, req.mode, req.workerWide);
@@ -2456,6 +2621,8 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
   const reapOptions = { ...deps.reap, producerWorkLimits };
   if (req.processes) {
     const others = req.registry.others(req.attempt?.marker);
+    const collected = collectLiveRoots(others, workerRunnerRootPids());
+    rootContext = collected.context;
     const scan: ScanRequest = {
       mode: req.mode,
       targetUid: deps.targetUid ?? defaultTargetUid(),
@@ -2466,18 +2633,7 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       mayKillUnreadableUnattributed:
         req.workerWide !== true && uidSplitActive() && req.otherClaimInFlight === false && others.length === 0,
       ...(req.workerWide === true ? { workerWide: true } : {}),
-      // Other live attempts' recorded roots (Claude CLI groups, Codex provider supervisors) plus
-      // every long-lived runner-uid root this worker launched and recorded itself.
-      liveRoots: [
-        ...others.flatMap((a) => {
-          try {
-            return a.recordedRootPids();
-          } catch {
-            return [];
-          }
-        }),
-        ...workerRunnerRootPids(),
-      ],
+      liveRoots: collected.roots,
       workerNonce: workerSpawnNonce(),
     };
     if (uidSplitActive() && hasReaperCaptureScope()) {
@@ -2501,6 +2657,7 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
   if (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) {
     processResult = { state: "unverified", processes: [], killed: processResult?.killed ?? [], detail: "maintenance deadline exhausted" };
   }
+  if (processResult && processResult.state !== "quiescent" && rootContext) processResult = { ...processResult, rootContext };
   return { process: processResult, docker };
 }
 
@@ -2608,5 +2765,25 @@ export function describeProcesses(q: ProcessQuiescence | undefined): Array<Recor
     reason: sanitizeForLog(p.reason, 64),
     // issue #1783 M2: say plainly which entries are the operator's to identify and kill.
     ...(p.reason === "unreadable_unattributed" ? { attribution: "could not be attributed" } : {}),
+    // issue #3915: which identities were checked against which recorded roots, and how they missed.
+    ...(p.attribution ? { attribution_trace: p.attribution } : {}),
   }));
+}
+
+function errMessageOf(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** issue #3915: log fields for the other-attempt roots a non-quiescent scan was given. */
+export function describeRootContext(q: ProcessQuiescence | undefined): Record<string, unknown> | undefined {
+  const c = q?.rootContext;
+  if (!c) return undefined;
+  return {
+    live_attempts: c.liveAttempts,
+    attempt_roots: c.attemptRoots,
+    worker_roots: c.workerRoots,
+    root_read_errors: c.rootReadErrors,
+    ...(c.firstRootReadError ? { first_root_read_error: sanitizeForLog(c.firstRootReadError, 200) } : {}),
+    attempts: c.attempts.map((a) => ({ run_id: a.runId, roots: a.roots })),
+  };
 }
