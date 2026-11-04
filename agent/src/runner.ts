@@ -16607,13 +16607,14 @@ export class RunRunner {
   }
 
 
-  /** issue #3885 — the retained-source channel's `resolveLocalRecord` port: read-only classification of a
-   *  run's guarded local recovery records. Delegates to the recovery coordinator, which owns all of it. */
+  /** issue #3885 — the retained-source channel's local-records port: read-only classification of a
+   *  run's guarded local recovery records (cases A1 and A2). Delegates to the recovery coordinator, which owns all of it. */
   describeLocalRecords(runId: string, opts: OperatorRequestSignals): Promise<DescribeLocalRecordsResult> {
     return this.recovery.describeLocalRecords(runId, opts);
   }
 
-  /** issue #3885 — operator resolution of one guarded local record generation (case A1). */
+  /** issue #3885 — the retained-source channel's resolve-local-record port: operator resolution of one guarded
+   *  local record generation (case A1 cleanup, or case A2 replay of the saved FINAL then cleanup). */
   resolveLocalRecord(input: OperatorRequestSignals & { runId: string; generation: number; confirm: string }):
     Promise<ResolveLocalRecordResult> {
     return this.recovery.resolveLocalRecord(input);

@@ -749,8 +749,8 @@ interface OperatorReplayScope {
   readonly beforeFirstMutation: () => void;
   /** The first named refusal the finalizer reported (later ones never replace it). */
   refusal?: string;
-  /** An error that escaped the finalizer, with whether the POST had been sent. */
-  failure?: { error: unknown; posted: boolean };
+  /** An error that a source-boundary wrapper swallowed inside the finalizer. */
+  failure?: { error: unknown };
 }
 const OPERATOR_MAX_JSON = 64;
 const OPERATOR_MAX_NAMES = 256;
@@ -2133,7 +2133,7 @@ export class RecoveryCoordinator {
         }, reconcile, closureMint);
       } catch (err) {
         // A source-boundary wrapper may turn an escaping error into "retained"; the replay keeps the cause.
-        if (replay) replay.failure ??= { error: err, posted: replay.posted };
+        if (replay) replay.failure ??= { error: err };
         throw err;
       }
     });
@@ -6074,14 +6074,18 @@ export class RecoveryCoordinator {
   }
 
   /**
-   * Operator resolution of ONE guarded local record generation whose FINAL acknowledgement is already
-   * persisted (case A1). Bound by `confirm`, the digest {@link describeLocalRecords} printed. The cleanup is the
-   * existing forgetGenerationWithinCycle boundary, unchanged; this adds the evidence that must hold first.
+   * Operator resolution of ONE guarded local record generation. Bound by `confirm`, the digest
+   * {@link describeLocalRecords} printed. Case A1: the FINAL acknowledgement is already persisted, and the
+   * existing forgetGenerationWithinCycle boundary retires it under the evidence that must hold first. Case A2:
+   * the saved FINAL's closed hold carries a matching receipt but the local ACK never landed; the existing
+   * finalizer replays it (one release POST), and the ACK it persists makes the generation case A1.
    *
-   * Lock order: A (bounded wait) -> C (`skip`) -> J (inside forget) -> B (inside cleanup). The client's
-   * requestSignal is checked before each pre-destruction step and, just before the first mutation, by the
-   * `beforeFirstMutation` callback (an aborted client there ends the request with nothing touched). After it,
-   * only the deadline and shutdown can interrupt, and they end the request `partial`.
+   * Lock order, A1: A (bounded wait) -> C (`skip`) -> J (inside forget) -> B (inside cleanup).
+   * A2: A -> C -> J pre-check (released) -> inventory source boundary -> finalizer J/B -> release POST -> ACK
+   * -> forget J, B. The client's requestSignal is checked before each pre-destruction step and, just before the
+   * first mutation (A1: the cleanup; A2: the release POST), by the `beforeFirstMutation` callback (an aborted
+   * client there ends the request with nothing touched). After it, only the deadline and shutdown can
+   * interrupt, and they end the request `partial`.
    */
   async resolveLocalRecord(input: OperatorRequestSignals & { runId: string; generation: number; confirm: string }):
     Promise<ResolveLocalRecordResult> {

@@ -239,9 +239,29 @@ test("describe: a discarded hold, or a receipt that does not match, is Case B an
     assert.deepEqual(await w.resolve("a".repeat(64)), { kind: "refused", reason: "case_b_pending_owner_review" });
     w.exact = released(w, { final_receipt: { kind: "settled", coverage_digest: "b".repeat(64) } });
     assert.equal(await w.classification(), "case_b_pending_owner_review");
+    assert.deepEqual(await w.resolve("a".repeat(64)), { kind: "refused", reason: "case_b_pending_owner_review" });
     assert.equal(w.refs(), refs);
     assert.deepEqual(await inventory(w.root), before);
   }
+});
+
+test("describe and resolve: a matching receipt with different release evidence is Case B, with nothing touched", async () => {
+  const w = await world("saved-final");
+  const request = w.f.record.finalRequest!;
+  w.f.record = await patch(w.coordinator, w.f.record, { finalRequest: { ...request, evidence: "operator_evidence" } });
+  w.exact = released(w);
+  assert.equal(w.exact?.release_evidence, "operator_evidence");
+  assert.equal(await w.classification(), "case_a_replay", "the same evidence is resolvable");
+  w.exact = released(w, { release_evidence: "some_other_evidence" });
+  assert.deepEqual(w.exact?.final_receipt, w.f.record.finalRequest!.disposition, "the receipt itself matches");
+  assert.equal(await w.classification(), "case_b_pending_owner_review");
+  w.e.state.allowFinal = true;
+  const before = await inventory(w.root);
+  const refs = w.refs();
+  assert.deepEqual(await w.resolve("a".repeat(64)), { kind: "refused", reason: "case_b_pending_owner_review" });
+  assert.equal(w.refs(), refs);
+  assert.deepEqual(await inventory(w.root), before);
+  assert.equal(w.e.calls.final, 0, "no release POST");
 });
 
 test("describe: missing binding, foreign bare, missing or open exact evidence and non-terminal runs", async () => {
@@ -714,7 +734,28 @@ test("A2 pre-POST disconnect and shutdown at the last proof leave every byte and
   await assertByteNeutral(down, downBytes, downRefs);
 });
 
-test("A2 refuses a pre-POST error without writing anything (replay_failed_before_post)", async () => {
+test("A2 client that leaves after the last pre-POST proof, at the final checkpoint, is client_disconnected with no POST and no write", async () => {
+  const w = await replayWorld();
+  const digest = await w.digest();
+  const bytes = await inventory(w.root);
+  const refs = w.refs();
+  // The finalizer asks restrictionsAllowCapturedC once as an early gate and once more as its last step
+  // before the beforeFirstMutation checkpoint: the client leaves exactly after the second answer, so only
+  // that checkpoint can notice (nothing is awaited between them and the POST).
+  const original = w.coordinator["restrictionsAllowCapturedC"].bind(w.coordinator);
+  let asked = 0;
+  Object.assign(w.coordinator, { restrictionsAllowCapturedC: async (...a: Parameters<typeof original>) => {
+    const allowed = await original(...a);
+    if (++asked === 2) w.request.abort();
+    return allowed;
+  } });
+  assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "client_disconnected" });
+  assert.equal(asked, 2, "the abort landed on the last proof before the POST");
+  await assertByteNeutral(w, bytes, refs);
+  assert.equal(w.cleanupArgs.length, 0, "the cleanup is never reached");
+});
+
+test("A2 refuses an unmet pre-POST precondition without writing anything (replay_precondition_unmet)", async () => {
   const w = await replayWorld();
   const digest = await w.digest();
   const bytes = await inventory(w.root);
