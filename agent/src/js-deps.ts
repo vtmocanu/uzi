@@ -67,12 +67,15 @@
 //          WRITE LOCATION, NOT CLAIMED CLOSED: the `--config.virtual-store-dir`
 //          pin keeps the package files in the clone, but a repo
 //          `.npmrc` / workspace `store-dir=<abs>` still makes the install write pnpm's
-//          store index (and any fetched package content) at that path, outside the clone
-//          (measured on 10.34.9). The default store lives under the scrubbed HOME; a relative
-//          in-clone store pin would close it but moves every pnpm repo's store into the clone,
-//          away from the store later `pnpm` commands in the run use by default, so it is
-//          deferred rather than folded in here (issue #3906 review). `cache-dir` / `state-dir` showed no writes in an
-//          offline `file:`-only install, which does not exercise them.
+//          store index (and any package content pnpm imports: content-addressed files, not a
+//          repo-chosen layout) at that path, outside the clone (measured on 10.34.9). The
+//          default store is under the scrubbed HOME only when HOME and the clone share a
+//          filesystem; otherwise pnpm picks `<clone mount point>/.pnpm-store` (read in pnpm's
+//          source, not measured here). A relative in-clone store pin would close the escape
+//          but moves every pnpm repo's store into the clone, so a later plain `pnpm install`
+//          in a non-TTY shell aborts on the store mismatch (measured); it is deferred rather
+//          than folded in here (issue #3906 review). `cache-dir` / `state-dir` showed no
+//          writes in an offline `file:`-only install, which does not exercise them.
 //   npm   no equivalent found. Measured: a `packageManager: "npm@9.0.0"` field caused no
 //          handoff (offline, exit 0), and the auditor separately measured that a repo
 //          `.npmrc` with `ignore-scripts=false` does not override the CLI flag.
@@ -200,7 +203,11 @@ interface InstallSpec {
 //          a repo `.npmrc` `virtual-store-dir=<abs>` or the workspace-yaml `virtualStoreDir`
 //          made the install write repo-authored package files at that path OUTSIDE the
 //          clone, rc=0; with the pin the same settings left nothing outside. The value is
-//          pnpm's own default, so a normal repo installs identically. An absolute
+//          pnpm's own default, so a repo that does not set the key installs identically. A
+//          repo that sets its OWN virtual store (even inside the clone) gets this one
+//          instead, and a later plain `pnpm install` in a non-TTY shell then aborts with
+//          ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY (measured; `CI=true` or removing
+//          node_modules recovers): an accepted cost of closing the escape. An absolute
 //          `modules-dir` showed no escape of its own once the virtual store was pinned: pnpm
 //          resolved it under the project dir).
 //   yarn — `--ignore-scripts` covers lifecycle scripts on yarn CLASSIC (1.x), which is

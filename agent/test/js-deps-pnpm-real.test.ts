@@ -1,11 +1,12 @@
 // Issue #3906: the REAL pnpm, driven through the worker's real js-deps install path.
 //
 // Nothing here mocks pnpm. Each protection (`--ignore-scripts`, `--ignore-pnpmfile`,
-// `--config.manage-package-manager-versions=false`) is proven twice: a PROTECTED run
-// (through startDepsInstall, the provisioning seam the executor uses) must be ok with the
-// repo-authored code NOT executed, and a POSITIVE CONTROL in a fresh copy of the same
-// fixture drops exactly that one flag and must show the repo-authored code DOES execute
-// (or the handoff fail). A protected run alone is not proof: a fixture whose hook can
+// `--config.manage-package-manager-versions=false`, `--config.virtual-store-dir=
+// node_modules/.pnpm`) is proven twice: a PROTECTED run (through startDepsInstall, the
+// provisioning seam the executor uses) must be ok with the vector NOT taken, and a
+// POSITIVE CONTROL in a fresh copy of the same fixture drops exactly that one flag and
+// must show the vector live: the repo-authored code DOES execute, the handoff fails, or
+// (virtual store) package files land outside the clone. A protected run alone is not proof: a fixture whose hook can
 // never fire passes it vacuously.
 //
 // The test also runs inside the worker image build (`UZI_PNPM_IMAGE_PROOF=1`, as the

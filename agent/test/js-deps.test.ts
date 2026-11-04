@@ -173,7 +173,7 @@ describe("installJsDeps: every measured repo-code-execution path is suppressed",
     assert.equal(results[0]!.detail, "YARN_IGNORE_PATH=1 yarn install --frozen-lockfile --ignore-scripts ok");
   });
 
-  it("pnpm carries --ignore-pnpmfile and disables packageManager version handoff", async () => {
+  it("pnpm carries --ignore-pnpmfile, disables packageManager version handoff and pins the virtual store", async () => {
     const root = mkClone({ "package.json": PKG, "pnpm-lock.yaml": "" });
     const { calls, exec } = recorder();
     await installJsDeps(root, {}, { exec });

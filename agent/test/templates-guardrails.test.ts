@@ -782,6 +782,14 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       const installAt = run.indexOf("npm install --global");
       assert.ok(integrityAt !== -1 && installAt !== -1, `${name}/Dockerfile pnpm RUN must have both the integrity check and the global install`);
       assert.ok(integrityAt < installAt, `${name}/Dockerfile pnpm RUN must verify the tarball integrity BEFORE installing it`);
+      assert.ok(!/\bset\s+\+[a-z]*e/.test(run), `${name}/Dockerfile pnpm RUN must not turn errexit back off`);
+      assert.match(
+        run,
+        /(?:^|;)\s*node -e '[^']*process\.argv\[2\][^']*' pnpm-/,
+        `${name}/Dockerfile pnpm integrity check must be its own statement (not inside an if/!/subshell that swallows a mismatch)`,
+      );
+      assert.ok(!/\b(?:if|then|else|elif|fi)\b|(?:^|;)\s*!/.test(run.replace(/'[^']*'/g, "''")),
+        `${name}/Dockerfile pnpm RUN must not branch around a failed step`);
       assert.ok(run.includes(`test "$(pnpm --version)" = ${version}`), `${name}/Dockerfile must assert the baked pnpm version`);
       assert.ok(run.includes('test "$(command -v pnpm)" = /usr/local/bin/pnpm'), `${name}/Dockerfile must assert pnpm resolves to /usr/local/bin/pnpm`);
       assert.deepEqual(
