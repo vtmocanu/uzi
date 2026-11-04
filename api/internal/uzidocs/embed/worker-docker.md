@@ -187,10 +187,13 @@ maintenance; compose keeps its manual cleanup path.
 **Manual fallback.** Delete the worker and reprovision it (the
 [Workers page](./hosted-workers.md), or `uzi worker rm <worker-id>` +
 re-provision): this tears down the pod and its `dind-data` PVC and re-creates
-it empty. That's a heavier lever than the automatic `/nix`/`/data` recycle
-([ADR-837](../adr/0837-worker-disk-lifecycle.md)), which reclaims those two
-volumes by deleting and re-creating the PVCs in place, without deleting the
-worker itself. A compose worker has no meter or automatic prune (`dind-meter`
+it empty. Worker removal also destroys the data PVC and run clones; it is
+not the supported settled-tree cleanup procedure for a full data volume.
+Automatic Docker pressure recycle preserves `/data` and selects Nix only
+when the latest pressure causes explicitly include `nix`
+([ADR-837](../adr/0837-worker-disk-lifecycle.md)); data-only pressure yields
+to eligible DinD maintenance. Nix size drift is independent and unchanged.
+A compose worker has no meter or automatic prune (`dind-meter`
 is a hosted-only sidecar); reclaim its `dinddata` volume the same way as
 `agentnix` — see [Worker setup](./worker-setup.md#resource-stats-and-sizing).
 
@@ -205,15 +208,26 @@ per-pod `emptyDir`.
 - **Pod replacement keeps clones.** Eviction, a reschedule, a roll or a
   deleted pod no longer loses a run's clone or its uncommitted edits on a
   worker that runs this layout. A reschedule to another node also depends on
-  the data StorageClass supporting reattach, which has not been verified. Deleting or recycling the `/data` volume
-  itself still deletes it, as on a non-Docker worker: the automatic
-  `/nix`+`/data` recycle of a worker that holds no recovery custody, and
-  removal of an ephemeral worker. A DinD-only maintenance recycle keeps
+  the data StorageClass supporting reattach, which has not been verified.
+  Manual data-PVC deletion and ephemeral-worker teardown still physically
+  delete clones. Since #3852, automatic pressure recycle preserves Docker
+  `/data` regardless of custody or layout, including under ForceRoll or an
+  elapsed deadline. **Deploy the fixed controller:** old controllers can
+  still delete data. A DinD-only maintenance recycle keeps
   `/data/runner`. Scratch under `TMPDIR` (`/data/runner/.tmp`) is excluded
   from these durability guarantees.
 - **The data volume now holds more.** Clones and daemon-owned bytes count
   against the volume's existing pressure thresholds; there is no Docker-specific
-  threshold, and the volume sizes are unchanged.
+  threshold, and the volume sizes are unchanged. A full Docker data PVC can
+  leave capacity degraded. Existing run park-and-trim and supported manual
+  settled-tree cleanup remain the reclaim paths; see
+  [Run recovery](./run-recovery.md). PRD #3431 M1b settlement/deletion is not
+  started and #3329's genuine-idle reclaim roll remains deferred; no new
+  reclaim authority is granted. Data-pressure deferral neither requests nor
+  clears drains: existing pressure drains persist until pressure clears,
+  and the worker stays out of roll coverage. Independent Nix pressure can
+  still deadline-interrupt a busy pod; that separate owner question remains
+  outside #3852.
 - **Rootless dind cannot write into run checkouts.** A
   rootless dind container runs as host uid 1000 (typically a 100000+ subuid
   range for a non-root container user; the range depends on the image and is

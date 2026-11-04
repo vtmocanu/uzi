@@ -106,7 +106,7 @@ func TestCustodyLimitCrossConsumerAgreementLiveDB(t *testing.T) {
 				if err := f.pool.QueryRow(ctx, `SELECT COALESCE(health_reason,'') FROM runs WHERE id=$1`, fresh).Scan(&reason); err != nil {
 					t.Fatal(err)
 				}
-				if got := strings.Contains(reason, "too much unpublished work"); got != atLimit {
+				if got := strings.Contains(reason, "recovery custody capacity is full"); got != atLimit {
 					t.Errorf("pill custody reason = %v (reason %q), want %v", got, reason, atLimit)
 				}
 

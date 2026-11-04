@@ -561,7 +561,7 @@ export function queuedBlockerPrecedesCodexAdmission(run: { status: string; healt
   return run.status === "queued" && [
     "handoff setup has not finished",
     "your vault is locked, so this run can't start",
-    "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs",
+    "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity",
     "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
     "your Codex account is unavailable (quarantined or being re-linked), so this run can't start",
   ].includes(run.health_reason ?? "");

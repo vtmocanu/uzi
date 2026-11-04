@@ -399,6 +399,39 @@ func splitLeadRegions(t *testing.T, body string) (plan, bullet string) {
 	return plan, bullet
 }
 
+// TestLeadPlanCrashClaimGuidance pins each clause separately in the pre-submit
+// region; a missing clause must not hide the other missing clauses.
+func TestLeadPlanCrashClaimGuidance(t *testing.T) {
+	lead, ok := BuiltinByName("lead")
+	if !ok {
+		t.Fatal("lead builtin missing")
+	}
+	plan, _ := splitLeadRegions(t, flatten(string(Render(lead))))
+	for _, c := range []struct {
+		name   string
+		phrase string
+	}{
+		{"claim_scope", "For every atomic, durable, or crash-recoverable claim, state the exact property and failure model."},
+		{"atomic_readers", "Atomic means readers never observe partial state."},
+		{"process_crash", "State whether durability is across a process crash or across storage or power loss."},
+		{"crash_recovery", "Specify the state recovered after a crash."},
+		{"mechanism_and_ordering", "Cite the file:line of each existing mechanism you rely on, specify each new mechanism you introduce and how it will be verified, and state the required ordering for each claimed property and failure model."},
+		{"rename_not_durability", "An atomic rename provides atomic replacement, not storage durability."},
+		{"file_and_directory_sync", "For filesystem durability across storage or power loss, sync the file and the directory containing each new or renamed entry in the required order."},
+		{"database_commit", "For database durability, identify the transaction commit guarantees and configuration relied on."},
+		{"recovery_rediscovery", "For crash recovery, explain recovery ordering and how recovery rediscovers the required state at each crash point."},
+		{"read_back_insufficient", "Read-back alone does not prove durability."},
+		{"process_test_not_storage_proof", "A process-crash test is not proof of storage-crash survival."},
+		{"narrow_unsupported_claim", "If the mechanism or evidence does not support the claimed failure model, narrow the claim."},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if !strings.Contains(plan, c.phrase) {
+				t.Errorf("pre-submit planning region missing crash-claim guidance: %q", c.phrase)
+			}
+		})
+	}
+}
+
 // TestLeadPlanCritiquePhrases pins the plan-time half of the lead's dispatch
 // contract (issue #197): before `submit_plan` the plan must cite the code it
 // asserts, and the wave that produces those citations reads the plan text

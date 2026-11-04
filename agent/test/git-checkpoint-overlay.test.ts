@@ -899,3 +899,220 @@ describe("checkpoint chain over a prior overlay tip (issue #2733)", () => {
     assert.notStrictEqual(base, n2);
   });
 });
+
+// issue #2753 — a park publishes a `wip(park):` marker M (parent R) to the checkpoint ref; resume
+// restores M uncommitted, so the recommit N has parent R, not M. The #2733 chain refuses because M is
+// not a wrapper. A marker is tolerated in P's exclusive history only for the server-confirmed tip.
+describe("checkpoint chain over a confirmed park marker (issue #2753)", () => {
+  const branch = "agent/issue-2753";
+  const checkpointRef = `refs/uzi-checkpoints/${branch}`;
+  const V2 = "name: ci\non: push\njobs: {}\n# v2\n";
+  const MARKER_SUBJECT = `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved (test)`;
+
+  interface Scene {
+    fx: Fixture;
+    git: GitCache;
+    bare: string;
+    clone: string;
+    /** R: the real tip the park happened on. */
+    r: string;
+    /** M: the published park marker (parent R). */
+    m: string;
+    /** N: the recommit (parent R), tracked as the current real tip. */
+    n: string;
+  }
+
+  function track(sc: Pick<Scene, "git" | "bare" | "clone">): Promise<void> {
+    return fixtureFetchTracking(sc.git, sc.bare, sc.clone, branch, "run-A").then(() => undefined);
+  }
+
+  /** Commit R, park-mark it as M (published as the confirmed checkpoint tip), then the agent
+   *  resumes (M restored uncommitted) and recommits N with parent R. */
+  async function markerScene(files?: Record<string, string>): Promise<Scene> {
+    const fx = mk(files);
+    const git = worker(fx, "A");
+    const bare = await git.ensureClone(fx.originPath);
+    const seed = await git.createOrAttachRunnerClone(bare, 2753, noProofReseed, "run-A");
+    const r = commit(seed.path, "M1.txt");
+    fs.writeFileSync(path.join(seed.path, "wip.txt"), "parked work\n");
+    gitIn(seed.path, ["add", "wip.txt"]);
+    gitIn(seed.path, [...IDENT, "commit", "-m", MARKER_SUBJECT]);
+    const m = gitIn(seed.path, ["rev-parse", "HEAD"]);
+    const sc = { fx, git, bare, clone: seed.path, r, m, n: "" };
+    await track(sc);
+    const parked = await git.checkpointPack(bare, branch);
+    assert.ok(parked);
+    assert.strictEqual(parked.tipOid, m, "scene: the marker is the published tip");
+    publishPackToOrigin(fx, await drain(parked.pack), m, checkpointRef);
+    gitIn(seed.path, ["reset", "--hard", r]);
+    sc.n = commit(seed.path, "M2.txt");
+    await track(sc);
+    return sc;
+  }
+
+  function rawCommit(bare: string, tree: string, parents: string[], subject: string): string {
+    const args = [...IDENT, "commit-tree", tree];
+    for (const p of parents) args.push("-p", p);
+    return gitIn(bare, [...args, "-m", subject]);
+  }
+
+  const chainPack = (
+    sc: Scene,
+    chainFrom: readonly (string | undefined)[],
+    options: { markerTrustedTip?: string; chainWorkflowSwap?: boolean } = {},
+  ) => sc.git.checkpointPack(
+    sc.bare, branch, undefined, undefined, undefined, undefined, undefined, chainFrom, options,
+  );
+
+  async function adopt(sc: Scene, tip: string) {
+    const gitB = worker(sc.fx, "B");
+    const bareB = await gitB.ensureClone(sc.fx.originPath);
+    return gitB.createOrAttachRunnerClone(bareB, 2753, noProofReseed, "run-B", true, tip);
+  }
+
+  it("chains N over the confirmed raw marker M: parents [M, N], descends M, adoption peels to N", async () => {
+    const sc = await markerScene();
+    const packed = await chainPack(sc, [undefined, sc.m], { markerTrustedTip: sc.m });
+    assert.ok(packed);
+    const c = packed.tipOid;
+    assert.notStrictEqual(c, sc.n);
+    assert.deepStrictEqual(parentsOf(sc.bare, c), [sc.m, sc.n]);
+    assert.doesNotThrow(() => gitIn(sc.bare, ["merge-base", "--is-ancestor", sc.m, c]), "strict descendant of M");
+    assert.strictEqual(gitIn(sc.bare, ["rev-parse", `${c}^{tree}`]), gitIn(sc.bare, ["rev-parse", `${sc.n}^{tree}`]));
+    // The parked content stays reachable through the side parent M, not lost when N omits it.
+    assert.strictEqual(gitIn(sc.bare, ["show", `${c}^1:wip.txt`]), "parked work");
+    publishPackToOrigin(sc.fx, await drain(packed.pack), c, checkpointRef);
+    const rc = await adopt(sc, c);
+    assert.strictEqual(rc.seededFrom, "checkpoint");
+    assert.strictEqual(rc.baseCommit, sc.n, "adopting C=[M, N] peels to N");
+    assert.strictEqual(gitIn(rc.path, ["rev-parse", "HEAD"]), sc.n);
+  });
+
+  it("chains over a park overlay O whose last parent is the marker M (O ^N = {O, M})", async () => {
+    const fx = mk();
+    const git = worker(fx, "A");
+    const bare = await git.ensureClone(fx.originPath);
+    const seed = await git.createOrAttachRunnerClone(bare, 2753, noProofReseed, "run-A");
+    const r = commit(seed.path, "M1.txt");
+    fs.writeFileSync(path.join(seed.path, "wip.txt"), "parked work\n");
+    gitIn(seed.path, ["add", "wip.txt"]);
+    gitIn(seed.path, [...IDENT, "commit", "-m", MARKER_SUBJECT]);
+    const m = gitIn(seed.path, ["rev-parse", "HEAD"]);
+    advanceOriginWorkflow(fx, V2);
+    const base = { git, bare, clone: seed.path };
+    await track(base);
+    const parked = await git.checkpointPack(bare, branch, ctx());
+    assert.ok(parked);
+    const o = parked.tipOid;
+    assert.ok(subjectOf(bare, o).startsWith(OVERLAY_COMMIT_PREFIX), "scene: a park overlay was built");
+    assert.strictEqual(parentsOf(bare, o).pop(), m, "scene: the overlay's last parent is the marker");
+    publishPackToOrigin(fx, await drain(parked.pack), o, checkpointRef);
+    gitIn(seed.path, ["reset", "--hard", r]);
+    const n = commit(seed.path, "M2.txt");
+    await track(base);
+    const sc: Scene = { fx, ...base, r, m, n };
+    const packed = await chainPack(sc, [undefined, o], { markerTrustedTip: o });
+    assert.ok(packed);
+    assert.deepStrictEqual(parentsOf(bare, packed.tipOid), [o, n]);
+    assert.strictEqual(wfTreeOf(bare, packed.tipOid), wfTreeOf(bare, o), "the overlay's workflow subtree");
+  });
+
+  it("refuses a marker with two parents", async () => {
+    const sc = await markerScene();
+    const mainTip = gitIn(sc.bare, ["rev-parse", "refs/remotes/origin/main"]);
+    const two = rawCommit(sc.bare, gitIn(sc.bare, ["rev-parse", `${sc.m}^{tree}`]), [sc.r, mainTip], MARKER_SUBJECT);
+    const packed = await chainPack(sc, [undefined, two], { markerTrustedTip: two });
+    assert.ok(packed);
+    assert.strictEqual(packed.tipOid, sc.n, "raw tip shipped");
+  });
+
+  it("refuses a marker whose parent is not an ancestor of N", async () => {
+    const sc = await markerScene();
+    const mainTip = gitIn(sc.bare, ["rev-parse", "refs/remotes/origin/main"]);
+    const side = rawCommit(sc.bare, gitIn(sc.bare, ["rev-parse", `${sc.r}^{tree}`]), [mainTip], "side work");
+    const stray = rawCommit(sc.bare, gitIn(sc.bare, ["rev-parse", `${sc.m}^{tree}`]), [side], MARKER_SUBJECT);
+    const packed = await chainPack(sc, [undefined, stray], { markerTrustedTip: stray });
+    assert.ok(packed);
+    assert.strictEqual(packed.tipOid, sc.n, "raw tip shipped");
+  });
+
+  it("refuses a marker stacked on another marker (outer parent not an ancestor of N)", async () => {
+    const sc = await markerScene();
+    const tree = gitIn(sc.bare, ["rev-parse", `${sc.m}^{tree}`]);
+    const inner = rawCommit(sc.bare, tree, [sc.r], MARKER_SUBJECT);
+    const outer = rawCommit(sc.bare, tree, [inner], MARKER_SUBJECT);
+    const packed = await chainPack(sc, [undefined, outer], { markerTrustedTip: outer });
+    assert.ok(packed);
+    assert.strictEqual(packed.tipOid, sc.n, "raw tip shipped");
+  });
+
+  it("refuses a marker whose parent is the real tip (nothing recommitted)", async () => {
+    const sc = await markerScene();
+    const over = rawCommit(sc.bare, gitIn(sc.bare, ["rev-parse", `${sc.m}^{tree}`]), [sc.n], MARKER_SUBJECT);
+    const packed = await chainPack(sc, [undefined, over], { markerTrustedTip: over });
+    assert.ok(packed);
+    assert.strictEqual(packed.tipOid, sc.n, "raw tip shipped");
+  });
+
+  it("never chains over a marker passed only as the attempted tip, or when the trusted tip differs", async () => {
+    const sc = await markerScene();
+    const control = await chainPack(sc, [sc.m, undefined], { markerTrustedTip: sc.m });
+    assert.ok(control);
+    assert.deepStrictEqual(parentsOf(sc.bare, control.tipOid), [sc.m, sc.n], "control: trusted marker chains");
+    await drain(control.pack);
+    for (const [label, trusted] of [["no trusted tip", undefined], ["another trusted tip", sc.r]] as const) {
+      const packed = await chainPack(sc, [sc.m, undefined], { markerTrustedTip: trusted });
+      assert.ok(packed);
+      assert.strictEqual(packed.tipOid, sc.n, `${label}: raw tip shipped`);
+    }
+  });
+
+  it("adoption: C=[M, M2] with M2 a marker over R restores M2 uncommitted at R and drops M from history", async () => {
+    const sc = await markerScene();
+    // The agent is parked again: M2 (parent R) replaces N.
+    gitIn(sc.clone, ["reset", "--hard", sc.r]);
+    fs.writeFileSync(path.join(sc.clone, "wip2.txt"), "second parked work\n");
+    gitIn(sc.clone, ["add", "wip2.txt"]);
+    gitIn(sc.clone, [...IDENT, "commit", "-m", MARKER_SUBJECT]);
+    const m2 = gitIn(sc.clone, ["rev-parse", "HEAD"]);
+    await track(sc);
+    const packed = await chainPack(sc, [undefined, sc.m], { markerTrustedTip: sc.m });
+    assert.ok(packed);
+    const c = packed.tipOid;
+    assert.deepStrictEqual(parentsOf(sc.bare, c), [sc.m, m2]);
+    publishPackToOrigin(sc.fx, await drain(packed.pack), c, checkpointRef);
+    const rc = await adopt(sc, c);
+    assert.strictEqual(rc.seededFrom, "checkpoint");
+    assert.strictEqual(gitIn(rc.path, ["rev-parse", "HEAD"]), sc.r, "HEAD is the marker's parent");
+    assert.strictEqual(fs.readFileSync(path.join(rc.path, "wip2.txt"), "utf8"), "second parked work\n");
+    assert.match(gitIn(rc.path, ["status", "--porcelain"]), /wip2\.txt/, "M2's content is uncommitted");
+    assert.throws(() => gitIn(rc.path, ["merge-base", "--is-ancestor", sc.m, "HEAD"]), "M is not an ancestor of HEAD");
+    assert.strictEqual(fs.existsSync(path.join(rc.path, "wip.txt")), false, "M's content is not restored");
+  });
+
+  it("non-GitHub (no workflow swap): the chain tree equals N's tree and GATE 3 is skipped", async () => {
+    const sc = await markerScene();
+    const packed = await chainPack(sc, [undefined, sc.m], { markerTrustedTip: sc.m, chainWorkflowSwap: false });
+    assert.ok(packed);
+    assert.deepStrictEqual(parentsOf(sc.bare, packed.tipOid), [sc.m, sc.n]);
+    assert.strictEqual(
+      gitIn(sc.bare, ["rev-parse", `${packed.tipOid}^{tree}`]), gitIn(sc.bare, ["rev-parse", `${sc.n}^{tree}`]),
+    );
+    await drain(packed.pack);
+
+    // A branch that edits .github/workflows still chains (GitHub's GATE 3 would refuse it).
+    gitIn(sc.clone, ["reset", "--hard", sc.r]);
+    const edit = commit(sc.clone, WF, "name: ci\n# branch edit\n");
+    await track(sc);
+    const swap = await chainPack(sc, [undefined, sc.m], { markerTrustedTip: sc.m });
+    assert.ok(swap);
+    assert.strictEqual(swap.tipOid, edit, "GitHub swap keeps GATE 3: raw tip");
+    await drain(swap.pack);
+    const plain = await chainPack(sc, [undefined, sc.m], { markerTrustedTip: sc.m, chainWorkflowSwap: false });
+    assert.ok(plain);
+    assert.deepStrictEqual(parentsOf(sc.bare, plain.tipOid), [sc.m, edit]);
+    assert.strictEqual(
+      gitIn(sc.bare, ["rev-parse", `${plain.tipOid}^{tree}`]), gitIn(sc.bare, ["rev-parse", `${edit}^{tree}`]),
+    );
+  });
+});

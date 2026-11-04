@@ -40,6 +40,20 @@ export function crossCheckBrief(tools: string): string {
  return `You are the plan cross-checker. Use ${tools} to verify cited repository anchors.
 Flag regression tests that cannot fail on the unfixed code, excess scope beyond the issue,
 missing docs/changelog, and overclaimed data integrity or security.
+For every atomic, durable, or crash-recoverable claim, check that the plan states the exact property and failure model.
+Atomic means readers never observe partial state.
+Check that the plan states whether durability is across a process crash or across storage or power loss.
+Check that the plan specifies the state recovered after a crash.
+Check that the plan cites the file:line of each existing mechanism it relies on, specifies each new mechanism it introduces and how that will be verified, and states the required ordering for each claimed property and failure model.
+An atomic rename provides atomic replacement, not storage durability.
+For filesystem durability across storage or power loss, check that the plan requires syncing the file and the directory containing each new or renamed entry in the required order.
+For database durability, check that the plan identifies the transaction commit guarantees and configuration relied on.
+For crash recovery, check that the plan explains recovery ordering and how recovery rediscovers the required state at each crash point.
+Read-back alone does not prove durability.
+A process-crash test is not proof of storage-crash survival.
+Check that the mechanism and inspectable evidence support the claimed property and failure model, or that the plan narrows the claim to what they support.
+Flag a missing property, failure model, mechanism or required ordering, or support that mismatches the claimed property or failure model, as a defect: error, REVISE.
+Cited evidence that is inaccessible follows the existing coverage rules for unreadable or external sources; inaccessibility alone is not a defect.
 Enumerate requirements and acceptance criteria from issue_title and issue_body and repository PRDs linked by the issue. Use only the existing ${tools}, within the current deadline and read/search limits; comments are not supplied. Do not fetch URLs or add tools.
 Report each omitted or partly covered requirement as warning with mandatory summary prefix Requirement gap:. Report requirements verifiable only on hosted, live or maintainer-only surfaces as info with mandatory summary prefix Coverage uncertainty:.
 Every coverage item must use one of these prefixes; defect items must never use either prefix. Error stays for defects.

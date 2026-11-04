@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { JudgeEvidenceReducer } from "../src/judge-evidence.js";
 import type { JudgeEvidence, JudgeFetchMeta } from "../src/judge-evidence.js";
 import type { WorkerRunMessage } from "../src/protocol.js";
+import { formatChildTurnBudget } from "../src/codex/child-budget.js";
 
 function fixture() {
   let seq = 0;
@@ -401,6 +402,82 @@ test("only exact recorded interruption strings qualify; no historical timeout or
   assert.equal(e.counts.confirmed.failed, 1);
   assert.match(e.sections.ledger, /deadline=unknown cause=unknown/);
   assert.doesNotMatch(e.sections.ledger, /timeout|budget/);
+});
+
+const EXPIRY = 'cause="reported budget expiry; termination unconfirmed"';
+const boundTimeout = (label: string) =>
+  "child_timeout: the delegated child exceeded its " + label + " turn budget; interrupt requested, partial work may remain";
+const MISSING = Symbol("missing is_error");
+function timeoutLedger(content: unknown, is_error: unknown = true) {
+  const f = fixture();
+  f.start("t");
+  if (is_error === MISSING) f.send("tool_result", { tool_use_id: "t", content });
+  else f.end("t", content, is_error);
+  return f.reducer.render();
+}
+
+test("an exact persisted child-budget expiry is a reported cause on a failed outcome (#3838)", () => {
+  for (const label of ["15-minute", "50 ms", "45-second", "60000 ms", "1000 ms", "unknown", "very long"]) {
+    const e = timeoutLedger(boundTimeout(label));
+    assert.match(e.sections.ledger, /outcome=failed /, label);
+    assert.ok(e.sections.ledger.endsWith("deadline=unknown " + EXPIRY), label);
+    assert.ok(e.sections.prose.includes(boundTimeout(label)), label);
+    assert.equal(e.counts.confirmed.failed, 1, label);
+    assert.equal(e.counts.confirmed.interrupted, 0, label);
+    bounded(e);
+  }
+});
+
+test("every formatChildTurnBudget label is recognized; the reducer infers no budget (#3838)", () => {
+  assert.equal(formatChildTurnBudget(59999.5), "60000 ms");
+  assert.equal(formatChildTurnBudget(999.5), "1000 ms");
+  for (const ms of [50, 999.5, 1000, 45000, 59999.5, 60000, 900000, 0, -1, NaN, 1e12, 9999 * 60000, 99999 * 1000 + 1,
+    1, 999_999_999, 61_000, 99_999_000, 9999 * 60000 + 1000]) {
+    const label = formatChildTurnBudget(ms);
+    const e = timeoutLedger(boundTimeout(label));
+    assert.ok(e.sections.ledger.endsWith("deadline=unknown " + EXPIRY), ms + " -> " + label);
+  }
+});
+
+test("malformed, other and unrecorded child diagnostics keep an unknown cause and raw text (#3838)", () => {
+  const failed = [
+    ...["0-minute", "0001-second", "000 ms", "60-second", "120-second", "10000-minute", "1000000000 ms", "-5 ms", "",
+      "15-minute\n", "15\n-minute", "\r15-minute", "15-minute\r", "50 ms\nx", "15 minute", "15-Minute", " 15-minute"]
+      .map(boundTimeout),
+    "child_aborted: the delegated child was cancelled by the parent turn or run",
+    "child_timeout: the 15-minute child turn budget expired before the child started",
+    "child_timeout: the 15-minute child turn budget expired while the child was starting",
+    "the child_timeout happened after a long timeout",
+    "note: " + boundTimeout("15-minute"),
+    boundTimeout("15-minute") + ".",
+    boundTimeout("15-minute") + "\n",
+    "child_timeout: the delegated child exceeded its " + "9".repeat(80) + " ms turn budget; interrupt requested, partial work may remain",
+    JSON.stringify({ role: "coder", text: boundTimeout("15-minute") }),
+  ];
+  for (const content of failed) {
+    const e = timeoutLedger(content);
+    assert.match(e.sections.ledger, /outcome=failed .*deadline=unknown cause=unknown$/, JSON.stringify(content));
+    assert.equal(e.counts.confirmed.failed, 1, JSON.stringify(content));
+    // Raw evidence survives (the prose JSON-escapes control characters).
+    assert.ok(e.sections.prose.includes(JSON.stringify(content).slice(1, 40)), JSON.stringify(content));
+  }
+  for (const [content, is_error] of [
+    [[{ type: "text", text: boundTimeout("15-minute") }], true],
+    [boundTimeout("15-minute"), false],
+    [boundTimeout("15-minute"), MISSING],
+    [boundTimeout("15-minute"), "true"],
+    [JSON.stringify({ role: "coder", text: boundTimeout("15-minute") }), false],
+  ] as const) {
+    const e = timeoutLedger(content, is_error);
+    assert.match(e.sections.ledger, /cause=unknown$/, JSON.stringify([content, is_error]));
+    assert.doesNotMatch(e.sections.ledger, /reported budget expiry/);
+  }
+  // An ambiguous identity never surfaces a cause.
+  const f = fixture();
+  f.start("dup"); f.start("dup"); f.end("dup", boundTimeout("15-minute"), true);
+  const e = f.reducer.render();
+  assert.match(e.sections.ledger, /ambiguous/);
+  assert.doesNotMatch(e.sections.ledger, /reported budget expiry/);
 });
 
 test("persisted-event intervals require valid ordered timestamps", () => {

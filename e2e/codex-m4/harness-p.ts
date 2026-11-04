@@ -29,6 +29,7 @@ import { deadline, message } from "../codex-m0/harness.mjs";
 import { FakeProvider, type ResponseItem, type ResponsesBody } from "./fake-provider.js";
 import { resolveCodexBin, parseLock, resolveArch, assertBinaryVersion } from "./provision.js";
 import { buildProviderLaunchPlan } from "./provider-launch-plan.js";
+import { cleanupP } from "./p-cleanup.js";
 import {
   loadPackagedLauncher,
   loadPackagedBroker,
@@ -186,6 +187,20 @@ function makeDirectCodexSpawn(codexBin: string, expectUid: number, envSink: { en
     const emitter = new EventEmitter();
     let disposing = false;
     let exited = false;
+    const ownedPid = child.pid;
+    let killDelivered = false;
+    let disposalFinished = false;
+    let realClose: [number | null, NodeJS.Signals | null] | undefined;
+    const forwardClose = (): void => {
+      if (realClose && disposalFinished) {
+        emitter.emit("close", ...realClose);
+        realClose = undefined;
+      }
+    };
+    child.once("close", (code, signal) => {
+      realClose = [code, signal];
+      forwardClose();
+    });
 
     const writeEvidence = (frame: Record<string, unknown>): void => {
       evidence.write(`${JSON.stringify(frame)}\n`);
@@ -195,7 +210,7 @@ function makeDirectCodexSpawn(codexBin: string, expectUid: number, envSink: { en
       writeEvidence({
         event: "started",
         supervisorPid: child.pid,
-        childPid: child.pid,
+        childPid: ownedPid,
         subreaper: true,
         nondumpable: true,
         uid: expectUid,
@@ -230,13 +245,28 @@ function makeDirectCodexSpawn(codexBin: string, expectUid: number, envSink: { en
         } else if (frame.op === "dispose") {
           disposing = true;
           const finish = (): void => {
-            writeEvidence({ event: "dispose", id: frame.id, state: "drained", authority: "ECHILD+__WALL" });
+            // Only the exact owned child's observed exit can complete this report.
+            writeEvidence({
+              event: "dispose", id: frame.id, state: "drained", authority: "ECHILD+__WALL",
+              killed: killDelivered ? [ownedPid] : [],
+              reaped: exited && ownedPid !== undefined ? [ownedPid] : [],
+            });
+            evidence.end();
+            disposalFinished = true;
+            // Synthetic supervisor success is separate from the real child's exit/signal.
             emitter.emit("exit", 0, null);
+            // PassThrough data parsing is synchronous: the final response is consumed first.
+            forwardClose();
           };
           if (exited) finish();
           else {
             child.once("exit", finish);
-            child.kill("SIGKILL");
+            try {
+              killDelivered = child.kill("SIGKILL");
+              if (!killDelivered) emitter.emit("error", new Error("owned child SIGKILL was not delivered"));
+            } catch (error) {
+              emitter.emit("error", error);
+            }
           }
         }
         nl = controlBuf.indexOf("\n");
@@ -303,37 +333,39 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
   const model = opts.model ?? "gpt-6-astra";
   const origin = opts.origin ?? "root";
 
-  let priming = opts.lifecycle === "resume";
-  const provider = await FakeProvider.start({ credential: opts.credential,
-    respond: (body, p) => priming ? [message("saved root control") as ResponseItem] : opts.respond(body, p) });
-  const scratch = path.resolve(__dirname, "../../.uzi/scratch");
-  mkdirSync(scratch, { recursive: true });
-  const base = realpathSync(mkdtempSync(path.join(scratch, "codex-m4-p-")));
-  const ownedDataRoot = path.join(base, "root");
-  const cwd = path.join(base, "cwd");
-  mkdirSync(cwd, { recursive: true, mode: 0o700 });
-
-  const registry = new mods.ExecutionRegistry(mods.newLocalExecutionEpoch(1));
-  const brokerOpts: CodexCallbackBrokerOptions = {
-    registry,
-    spawnCommand: opts.spawnCommand,
-    fileop: opts.fileop,
-    worktreePath: cwd,
-    grants: opts.grants,
-    delegate: opts.delegate
-      ?? (async () => ({ ok: false, code: "child_denied", message: "delegation is not exercised by this P case" })),
-    allowedRoles: opts.allowedRoles ?? new Set<string>(),
-    screenPolicy: opts.screenPolicy ?? {},
-  };
-  const broker = new mods.CodexCallbackBroker(brokerOpts);
-
-  const envSink: { env?: NodeJS.ProcessEnv } = {};
-  const callbacks: ObservedCallback[] = [];
-  const rawNotes: CodexNotification[] = [];
+  let provider: FakeProvider | undefined;
+  let base: string | undefined;
   let handle: Awaited<ReturnType<ProtocolModules["launchCodexRoot"]>> | undefined;
   let transport: ReturnType<ProtocolModules["createCodexTransport"]> | undefined;
-
+  let primaryFailure: { error: unknown } | undefined;
   try {
+    let priming = opts.lifecycle === "resume";
+    provider = await FakeProvider.start({ credential: opts.credential,
+      respond: (body, p) => priming ? [message("saved root control") as ResponseItem] : opts.respond(body, p) });
+    const scratch = path.resolve(__dirname, "../../.uzi/scratch");
+    mkdirSync(scratch, { recursive: true });
+    base = realpathSync(mkdtempSync(path.join(scratch, "codex-m4-p-")));
+    const ownedDataRoot = path.join(base, "root");
+    const cwd = path.join(base, "cwd");
+    mkdirSync(cwd, { recursive: true, mode: 0o700 });
+
+    const registry = new mods.ExecutionRegistry(mods.newLocalExecutionEpoch(1));
+    const brokerOpts: CodexCallbackBrokerOptions = {
+      registry,
+      spawnCommand: opts.spawnCommand,
+      fileop: opts.fileop,
+      worktreePath: cwd,
+      grants: opts.grants,
+      delegate: opts.delegate
+        ?? (async () => ({ ok: false, code: "child_denied", message: "delegation is not exercised by this P case" })),
+      allowedRoles: opts.allowedRoles ?? new Set<string>(),
+      screenPolicy: opts.screenPolicy ?? {},
+    };
+    const broker = new mods.CodexCallbackBroker(brokerOpts);
+
+    const envSink: { env?: NodeJS.ProcessEnv } = {};
+    const callbacks: ObservedCallback[] = [];
+    const rawNotes: CodexNotification[] = [];
     const launchPlan = buildProviderLaunchPlan(mods, {
       executableBin: resolved.codexBin,
       provider: { name: "openai", baseUrl: provider.baseUrl, envKey: "FAKE_PROVIDER_API_KEY" },
@@ -450,22 +482,10 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       binaryEvidence,
       notes: rawNotes,
     };
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
-    try {
-      await transport?.close();
-    } catch {
-      /* best effort */
-    }
-    try {
-      if (handle !== undefined) await handle.dispose();
-    } catch {
-      /* best effort — the shim SIGKILLs the codex child on dispose */
-    }
-    try {
-      await provider.close();
-    } catch {
-      /* best effort */
-    }
-    rmSync(base, { recursive: true, force: true });
+    await cleanupP({ transport, handle, provider, base }, primaryFailure);
   }
 }
