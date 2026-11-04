@@ -392,6 +392,9 @@ export interface RecoveryBundleProducer {
   readInventoryCloneHeadsUnderLock?: GitCache["readInventoryCloneHeadsUnderLock"];
   enumerateOwedUnderLock?: GitCache["enumerateOwedUnderLock"];
   cleanupRecoveryGeneration?: GitCache["cleanupRecoveryGeneration"];
+  /** Operator local-record resolution (issue #3885): read-only source identity and the pending-deletion proof. */
+  recoveryRefSnapshot?: GitCache["recoveryRefSnapshot"];
+  assertRecoveryBareClear?: GitCache["assertRecoveryBareClear"];
   /** issue #3404 M2 U5: restart retirement reads the completing journal's fence and removes the paired skills dir. */
   readCompletionSourceFence?: GitCache["readCompletionSourceFence"];
   removeCompletionSkillsDir?: GitCache["removeCompletionSkillsDir"];
@@ -669,7 +672,83 @@ interface DurableRetirementPlan {
   expected: { runId: string; clonePath: string; attemptId?: string };
 }
 
+/** What {@link RecoveryCoordinator.forgetGenerationWithinCycle} did, one name per exit. Only `forgotten` means
+ * the generation's refs, bundles and records were removed; every other value retained them (or, for
+ * `legacy_removed`, took the legacy exact-release branch). `operator_refused` and `not_guarded` exist only
+ * for the operator path. */
+export type ForgetOutcome =
+  | "forgotten" | "legacy_removed" | "no_records" | "cleanup_pending" | "cleanup_unavailable" | "source_protected"
+  | "ack_incomplete" | "bare_mismatch" | "bundle_path_unknown" | "pending_generation_report" | "cleanup_retained"
+  | "not_guarded" | "operator_refused";
+
+/** The operator's client left (or its request was otherwise cancelled) before the first mutation: nothing was
+ * touched. Thrown by the `beforeFirstMutation` callback and by every pre-destruction checkpoint. */
+export class OperatorCancelledBeforeMutation extends Error {
+  constructor() { super("operator request ended before any mutation"); this.name = "OperatorCancelledBeforeMutation"; }
+}
+
+/** The three signals every operator request carries. `requestSignal` follows the client connection and is
+ * consulted only before the destructive boundary; `shutdownSignal` and the wall-clock `deadlineAt` bound the rest. */
+export interface OperatorRequestSignals { requestSignal: AbortSignal; shutdownSignal: AbortSignal; deadlineAt: number }
+
+/** One generation of one run, as {@link RecoveryCoordinator.describeLocalRecords} classifies it. `classification`
+ * is `case_a_ack` or `case_a_replay` (then `digest`, `holdId` and `repoId` are present and the generation can be
+ * confirmed) or the named blocker. */
+export interface LocalRecordGeneration {
+  generation: number;
+  classification: string;
+  digest?: string;
+  holdId?: string;
+  repoId?: string;
+  captureIds: string[];
+}
+export type DescribeLocalRecordsResult =
+  | { kind: "described"; runId: string; generations: LocalRecordGeneration[]; blockers: string[] }
+  | { kind: "refused"; reason: string };
+/** `retired`: refs, bundles and records of the generation are gone. `refused`: nothing was touched. `partial`:
+ * the destructive boundary was crossed and the outcome is not known to be complete; re-describe. */
+export type ResolveLocalRecordResult =
+  | { kind: "retired"; generation: number; remaining: number }
+  | { kind: "refused"; reason: string }
+  | { kind: "partial"; reason: string };
+
+/** The single bounded read of a run's recovery directory an operator request classifies from. */
+export type OperatorJournal =
+  | { kind: "ok"; records: RecoveryRecord[]; names: string[]; unbound: string[] }
+  | { kind: "inventory_incomplete" | "record_unverified" };
+interface OperatorForget {
+  budget: { signal: AbortSignal; deadline: number };
+  /** Awaited under the journal lock with the one bounded read; a returned string is a named refusal. */
+  expect: (journal: OperatorJournal) => Promise<string | undefined>;
+  /** Called once, immediately before the first actual mutation. May throw {@link OperatorCancelledBeforeMutation}. */
+  beforeFirstMutation: () => void;
+}
+interface OperatorIO extends OperatorRequestSignals {
+  readonly budget: MaintenanceBudget;
+  readonly journal: { signal: AbortSignal; deadline: number };
+}
+interface OperatorObserved { settlementNames: string[]; terminal: boolean; holds: "unknown" | ReadonlySet<number> }
+type OperatorVerdict =
+  | { ok: false; classification: string }
+  | { ok: true; case: "case_a_ack" | "case_a_replay"; digest: string; anchor: RecoveryRecord; bare: string;
+      holdId: string; repoId: string; captureIds: string[] };
+const OPERATOR_MAX_JSON = 64;
+const OPERATOR_MAX_NAMES = 256;
+const OPERATOR_RECORD_MAX_BYTES = 1024 * 1024;
+const OPERATOR_RPC_MS = 10_000;
+const OPERATOR_AUTHORITY_WAIT_MS = 30_000;
+const OPERATOR_RUN_ID = /^[a-zA-Z0-9_-]{1,128}(?![\s\S])/;
+const OPERATOR_TERMINAL_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "cancelled"]);
+/** The closed-hold observation carries exactly the receipt this saved FINAL request would have produced. */
+function receiptMatches(observed: RecoveryExactHold, request: NonNullable<RecoveryRecord["finalRequest"]>): boolean {
+  return observed.state === "released" && !!observed.final_receipt &&
+    canonicalJson(observed.final_receipt) === canonicalJson(request.disposition) &&
+    (request.evidence === undefined || request.evidence === observed.release_evidence);
+}
+
 export interface RecoveryCoordinatorOptions {
+  /** Test seam (never set in production): awaited inside the journal lock of an operator resolution, before its expectation. */
+  onForgetJournalLockedForTest?: () => void | Promise<void>;
   /** issue #3404 M2: opens (or borrows) the authority transaction A. Every capture cycle that can
    *  reach a hooked Git effect is entered inside it, so A is taken BEFORE the cycle lock C, the
    *  source reservation S, the journal lock J and the bare lock B (order A -> C -> S -> J -> B).
@@ -1210,6 +1289,7 @@ const recoveryJournalLocks = new RunDiskLocks();
  */
 export class RecoveryCoordinator {
   private readonly authority: AuthorityScope | undefined;
+  private readonly onForgetJournalLockedForTest: RecoveryCoordinatorOptions["onForgetJournalLockedForTest"];
   private readonly withInventorySourceBoundary: RecoveryCoordinatorOptions["withInventorySourceBoundary"];
   private readonly withCompletionSourceBoundary: RecoveryCoordinatorOptions["withCompletionSourceBoundary"];
   private readonly onCompletionSourceForgotten: RecoveryCoordinatorOptions["onCompletionSourceForgotten"];
@@ -1418,6 +1498,7 @@ export class RecoveryCoordinator {
 
   constructor(opts: RecoveryCoordinatorOptions) {
     this.authority = opts.authority;
+    this.onForgetJournalLockedForTest = opts.onForgetJournalLockedForTest;
     this.withTerminalSourceBoundary = opts.withTerminalSourceBoundary;
     this.writerExclusion = opts.writerExclusion;
     this.terminalSettlementConfirmed = opts.terminalSettlementConfirmed;
@@ -5450,51 +5531,73 @@ export class RecoveryCoordinator {
    * step, excluding delayed journal writers. One pass, no internal retries; failure keeps the
    * covering ACK and the bounded boot/live passes retry it independently of upload eligibility. */
   private async forgetGenerationWithinCycle(runId: string, generation: number, isExecuting = this.isExecuting,
-    signal?: AbortSignal): Promise<void> {
+    signal?: AbortSignal, operator?: OperatorForget): Promise<ForgetOutcome> {
     // Issue #2625: claims are built under the journal lock and submitted after it, as in forgetCompletedGeneration.
     let claims: PendingRedundancyClaim[] = [];
     const budget = this.startRedundancyBudget(signal);
-    await this.withJournalLock(runId, async () => {
-      // Keep legacy exact-release cleanup (including opaque sibling retention) unchanged.
-      // Classify under the journal lock and generation cycle so a new guarded writer cannot
-      // slip between classification and removal. Guarded cleanup checks the complete inventory.
-      if (!(await this.guardedGeneration({ runId, generation }))) {
-        await this.removeGenerationRecordsUnlocked(runId, generation, "rmdir_if_empty");
-        return;
+    let crossed = false;
+    // The operator's destructive-boundary callback fires once, immediately before the first actual
+    // mutation (cleanupRecoveryGeneration reports it from inside; the unlinks below cover the case
+    // where no ref or metadata file was removed). Without an operator it is a no-op.
+    const boundary = (): void => {
+      if (!operator || crossed) return;
+      operator.beforeFirstMutation();
+      crossed = true;
+    };
+    const outcome = await this.withJournalLock(runId, async (): Promise<ForgetOutcome> => {
+      let records: RecoveryRecord[];
+      if (operator) {
+        // One bounded, authenticated read under this J; listRecords/guardedGeneration are never used.
+        await this.onForgetJournalLockedForTest?.();
+        const journal = await this.operatorJournal(runId, operator.budget);
+        const refusal = await operator.expect(journal);
+        if (refusal !== undefined || journal.kind !== "ok") return "operator_refused";
+        records = journal.records;
+        if (!records.some(r => r.generation === generation && r.inventoryGuarded === true)) return "not_guarded";
+      } else {
+        // Keep legacy exact-release cleanup (including opaque sibling retention) unchanged.
+        // Classify under the journal lock and generation cycle so a new guarded writer cannot
+        // slip between classification and removal. Guarded cleanup checks the complete inventory.
+        if (!(await this.guardedGeneration({ runId, generation }))) {
+          await this.removeGenerationRecordsUnlocked(runId, generation, "rmdir_if_empty");
+          return "legacy_removed";
+        }
+        records = await this.checkedRecords(runId);
       }
-      const records = await this.checkedRecords(runId);
       const selected = records.filter(r => r.generation === generation);
-      if (!selected.length) return;
+      if (!selected.length) return "no_records";
       const state = await this.cleanupStateOf(records, generation);
       if (state === "legacy") {
         await this.removeGenerationRecordsUnlocked(runId, generation, "rmdir_if_empty");
-        return;
+        return "legacy_removed";
       }
-      if (state !== "acknowledged" || !this.git.cleanupRecoveryGeneration) return;
+      if (state !== "acknowledged") return "cleanup_pending";
+      if (!this.git.cleanupRecoveryGeneration) return "cleanup_unavailable";
       const ack = selected.find(r => r.inventoryGuarded && r.finalAcknowledged && r.finalRequest && r.coverageDigest)!;
       const open = (): boolean => residueQuarantine() === undefined && !this.isExecuting(runId) && !isExecuting(runId);
-      if (!open() || !ack.coverageContext || !ack.bareDir) return;
+      if (!open()) return "source_protected";
+      if (!ack.coverageContext || !ack.bareDir) return "ack_incomplete";
       const bare = await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(ack.bareDir!));
-      if (bare !== ack.coverageContext.barePath) return;
+      if (bare !== ack.coverageContext.barePath) return "bare_mismatch";
       const bundles = new Set<string>();
       // Positive ownership is the canonical capture filename, not an arbitrary MAC-covered path.
       // Validate every path before changing refs; an unknown journal path retains all authority.
       for (const record of selected) {
         if ((record.bareDir && record.bareDir !== ack.bareDir) ||
             (record.recoveryPinBareDir && record.recoveryPinBareDir !== ack.bareDir) ||
-            (record.coverageContext && record.coverageContext!.barePath !== bare)) return;
+            (record.coverageContext && record.coverageContext!.barePath !== bare)) return "bare_mismatch";
         const canonical = path.resolve(this.bundlePath(record));
-        if (record.bundlePath && path.resolve(record.bundlePath) !== canonical) return;
-        if (path.dirname(canonical) !== path.resolve(this.runDir(runId))) return;
+        if (record.bundlePath && path.resolve(record.bundlePath) !== canonical) return "bundle_path_unknown";
+        if (path.dirname(canonical) !== path.resolve(this.runDir(runId))) return "bundle_path_unknown";
         try {
           const st = await fs.lstat(canonical);
-          if (!st.isFile() || st.isSymbolicLink()) return;
+          if (!st.isFile() || st.isSymbolicLink()) return "bundle_path_unknown";
         } catch (err) { MaintenanceBudget.current()?.check();
           if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         }
         bundles.add(canonical);
       }
-      if (!open()) return;
+      if (!open()) return "source_protected";
       // The uploaded byte identity is already authenticated. Retirement needs the ACK
       // journal and pinned Git objects for ancestry, but never reads the local bundle.
       // Release those bytes on FINAL's existing schedule even if the report cannot retire.
@@ -5504,24 +5607,31 @@ export class RecoveryCoordinator {
           this.log.debug("recovery cleanup deferred: pending report", { run_id: runId, generation });
         }
         for (const bundle of bundles) {
-          if (!open()) return;
+          if (!open()) return "source_protected";
+          boundary();
           try { await ownedRecoveryIO(() => fs.unlink(bundle)); }
           catch (err) { MaintenanceBudget.current()?.check(); if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
         }
-        return;
+        return "pending_generation_report";
       }
       const cleanupOpen = (): boolean => open() && !this.pendingGenerationReport?.(runId, generation);
       this.pendingReportLogged.delete(ack.captureId);
       claims = await this.buildRedundancyClaims(selected, generation, bare, budget);
-      const result = await ownedRecoveryIO(() => this.git.cleanupRecoveryGeneration!(bare, ack.coverageContext!,
-        ack.originalRoots ?? [], selected.filter(r => r.coverageDigest).map(r => ({
-          fingerprint: r.coverageDigest!, sha: r.sourceSha,
-          coveredHeads: [...new Set([r.originalSourceSha!, r.inventoryCurrentSha!, ...(r.originalRoots ?? []).map(root => root.sha)])],
-        })), [...new Set(selected.flatMap(r => [r.sourceSha, r.originalSourceSha].filter((s): s is string => !!s)))],
-        ack.sourceSha, cleanupOpen));
-      if (result !== "removed") return;
+      const coveragePins = selected.filter(r => r.coverageDigest).map(r => ({
+        fingerprint: r.coverageDigest!, sha: r.sourceSha,
+        coveredHeads: [...new Set([r.originalSourceSha!, r.inventoryCurrentSha!, ...(r.originalRoots ?? []).map(root => root.sha)])],
+      }));
+      const sources = [...new Set(selected.flatMap(r => [r.sourceSha, r.originalSourceSha].filter((s): s is string => !!s)))];
+      // Existing callers keep the exact original argument list; only the operator names the boundary.
+      const result = await ownedRecoveryIO(() => operator
+        ? this.git.cleanupRecoveryGeneration!(bare, ack.coverageContext!, ack.originalRoots ?? [], coveragePins, sources,
+          ack.sourceSha, cleanupOpen, "archive", boundary)
+        : this.git.cleanupRecoveryGeneration!(bare, ack.coverageContext!, ack.originalRoots ?? [], coveragePins, sources,
+          ack.sourceSha, cleanupOpen));
+      if (result !== "removed") return "cleanup_retained";
       const unlink = async (file: string): Promise<void> => {
         if (!cleanupOpen()) throw new Error("recovery cleanup source protection changed");
+        boundary();
         try { await ownedRecoveryIO(() => fs.unlink(file)); }
         catch (err) { MaintenanceBudget.current()?.check(); if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
       };
@@ -5535,8 +5645,393 @@ export class RecoveryCoordinator {
       const witness = this.completionCleanupWitnesses.get(`${runId}:${generation}`);
       if (witness) witness.fullyForgotten = true;
       this.onCompletionGenerationForgotten?.(runId, generation);
+      return "forgotten";
     });
     await this.submitRedundancyClaims(claims, budget);
+    return outcome;
+  }
+
+  // ── operator: inspection and resolution of guarded local records (issue #3885) ──────────────────────
+
+  /** One ambient MaintenanceBudget per operator request, linked ONLY to the request's wall-clock deadline
+   * and the worker shutdown signal. The client's requestSignal is deliberately never a parent of it (or of
+   * any signal that survives the destructive boundary): a disconnect is honoured by explicit checkpoints
+   * before the boundary and is invisible afterwards. */
+  private async withOperatorBudget<T>(sig: OperatorRequestSignals, fn: (io: OperatorIO) => Promise<T>): Promise<T> {
+    const budget = new MaintenanceBudget(Math.max(0, sig.deadlineAt - Date.now()));
+    try {
+      return await MaintenanceBudget.runOwned(sig.shutdownSignal, () => MaintenanceBudget.run(budget, () => fn({
+        requestSignal: sig.requestSignal, shutdownSignal: sig.shutdownSignal, deadlineAt: sig.deadlineAt, budget,
+        // Wall-clock journal budget, computed once: checkJournalMetadata compares Date.now().
+        journal: { signal: budget.signal, deadline: Date.now() + budget.remainingMs() },
+      })));
+    } finally { budget.dispose(); }
+  }
+
+  /** Pre-destruction checkpoint: deadline/shutdown (the budget) and then the client. */
+  private operatorCheckpoint(io: OperatorIO): void {
+    io.budget.check();
+    if (io.requestSignal.aborted) throw new OperatorCancelledBeforeMutation();
+  }
+
+  /** One pre-destruction RPC under its own signal: the client, shutdown and a per-call timeout. */
+  private async operatorRpc<T>(io: OperatorIO, call: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    this.operatorCheckpoint(io);
+    const perCall = AbortSignal.any([io.requestSignal, io.shutdownSignal,
+      AbortSignal.timeout(Math.max(1, Math.ceil(Math.min(OPERATOR_RPC_MS, io.budget.remainingMs()))))]);
+    try { return await io.budget.raceIO(call, undefined, perCall); }
+    catch (err) {
+      if (io.requestSignal.aborted && !io.shutdownSignal.aborted && !io.budget.signal.aborted) throw new OperatorCancelledBeforeMutation();
+      throw err;
+    }
+  }
+
+  private operatorLiveGate(runId: string): string | undefined {
+    if (residueQuarantine() !== undefined) return "worker_quarantined";
+    if (this.isExecuting(runId)) return "executing";
+    return undefined;
+  }
+
+  /** One bounded, authenticated pass over the run's recovery directory. The caller holds this run's journal
+   * lock. More than {@link OPERATOR_MAX_JSON} records or {@link OPERATOR_MAX_NAMES} entries, a record above
+   * 1 MiB, a changed directory or an interrupted read is `inventory_incomplete`; a record that fails its MAC
+   * (for example one written under another worker token) is `record_unverified`. Non-record entries that are
+   * not a known record's canonical bundle are reported as `unbound`, never trusted. */
+  private async operatorJournal(runId: string, budget: { signal: AbortSignal; deadline: number }): Promise<OperatorJournal> {
+    try {
+      this.checkJournalMetadata(budget);
+      const dir = await this.checkedRecordDirectory(runId, budget);
+      if (!dir) return { kind: "ok", records: [], names: [], unbound: [] };
+      const before = await fs.lstat(dir);
+      const names: string[] = [];
+      let json = 0;
+      for await (const name of this.journalNames(dir, budget, true)) {
+        if (names.length >= OPERATOR_MAX_NAMES || (name.endsWith(".json") && ++json > OPERATOR_MAX_JSON)) {
+          return { kind: "inventory_incomplete" };
+        }
+        names.push(name);
+      }
+      names.sort();
+      const records: RecoveryRecord[] = [];
+      for (const name of names) {
+        if (!name.endsWith(".json")) continue;
+        this.checkJournalMetadata(budget);
+        const file = path.join(dir, name);
+        const st = await fs.lstat(file);
+        if (!st.isFile()) return { kind: "record_unverified" };
+        if (st.size > OPERATOR_RECORD_MAX_BYTES) return { kind: "inventory_incomplete" };
+        const result = await this.readRecordResult(file, true, budget, true);
+        this.checkJournalMetadata(budget);
+        if (result.kind === "absent") return { kind: "inventory_incomplete" };
+        if (result.kind !== "ok" || result.record.runId !== runId || name !== result.record.captureId + ".json") {
+          return { kind: "record_unverified" };
+        }
+        records.push(result.record);
+      }
+      const known = new Set(records.map(record => record.captureId));
+      const unbound = names.filter(name => !name.endsWith(".json") &&
+        !(name.endsWith(".bundle") && known.has(name.slice(0, -".bundle".length))))
+        .map(name => name.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 96));
+      this.checkJournalMetadata(budget);
+      const after = await fs.lstat(dir);
+      this.checkJournalMetadata(budget);
+      if (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs ||
+          before.ctimeMs !== after.ctimeMs) return { kind: "inventory_incomplete" };
+      return { kind: "ok", records, names, unbound };
+    } catch (err) {
+      // A spent deadline or shutdown is the caller's to classify; any other failed read proves nothing.
+      if (budget.signal.aborted) throw err;
+      return { kind: "inventory_incomplete" };
+    }
+  }
+
+  /** Entry names of `recovery-settlement/<run>`, bounded. Any entry is the settlement-root evidence the
+   * operator path does not resolve. */
+  private async operatorSettlementNames(runId: string, io: OperatorIO): Promise<string[]> {
+    const dir = path.join(path.dirname(this.recoveryRoot), "recovery-settlement", runId);
+    let handle: Awaited<ReturnType<typeof fs.opendir>>;
+    try { handle = await ownedRecoveryIO(() => fs.opendir(dir)); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw err;
+    }
+    const names: string[] = [];
+    try {
+      for (;;) {
+        this.checkJournalMetadata(io.journal);
+        const entry = await handle.read();
+        if (!entry) break;
+        names.push(entry.name);
+        if (names.length > OPERATOR_MAX_NAMES) break;
+      }
+    } finally { await handle.close(); }
+    return names.sort();
+  }
+
+  /** Everything the classification reads outside the journal: settlement-root entries, terminal protection and
+   * ONE strict hold inventory for the run. */
+  private async operatorObserve(io: OperatorIO, runId: string): Promise<OperatorObserved> {
+    this.operatorCheckpoint(io);
+    const settlementNames = await this.operatorSettlementNames(runId, io);
+    this.operatorCheckpoint(io);
+    const terminal = this.terminalRecordProtection ? await ownedRecoveryIO(() => this.terminalRecordProtection!(runId)) : false;
+    let holds: OperatorObserved["holds"] = "unknown";
+    try {
+      if (this.client.hasFeature?.("recovery_inventory_v1")) {
+        const response = await this.operatorRpc(io, signal => this.client.listRecoveryHolds(runId, signal));
+        if (response?.run_id === runId && Array.isArray(response.holds) &&
+            response.holds.every(h => typeof h === "object" && h !== null && Number.isSafeInteger(h.generation))) {
+          holds = new Set(response.holds.map(h => h.generation));
+        }
+      }
+    } catch (err) {
+      if (err instanceof OperatorCancelledBeforeMutation || io.shutdownSignal.aborted || io.budget.signal.aborted) throw err;
+      holds = "unknown";
+    }
+    return { settlementNames, terminal, holds };
+  }
+
+  /** The ONE classification shared by describe and resolve (so a digest described is the digest accepted).
+   * First failing check wins; a resolvable generation carries its digest. */
+  private async operatorAssess(io: OperatorIO, runId: string, generation: number,
+    journal: Extract<OperatorJournal, { kind: "ok" }>, observed: OperatorObserved): Promise<OperatorVerdict> {
+    const no = (classification: string): OperatorVerdict => ({ ok: false, classification });
+    const selected = journal.records.filter(r => r.generation === generation);
+    if (!selected.length) return no("not_found");
+    if (journal.unbound.length) return no("unbound_artifact:" + journal.unbound[0]);
+    if (observed.settlementNames.length) return no("settlement_record_unsupported");
+    if (observed.terminal) return no("terminal_protection");
+    const guarded = selected.filter(r => r.inventoryGuarded === true);
+    if (!guarded.length) return no("not_guarded");
+    if (selected.some(r => classifyRecoveryOrigin(r.captureId) !== "ordinary")) return no("non_ordinary_origin");
+    if (selected.some(r => r.completionReceipt !== undefined || r.completionSource !== undefined)) return no("completion_receipt_generation");
+    const state = await this.cleanupStateOf(journal.records, generation);
+    const ackRecord = guarded.find(r => r.finalAcknowledged === true && r.finalRequest && r.coverageDigest);
+    let kind: "case_a_ack" | "case_a_replay";
+    let anchor: RecoveryRecord;
+    if (state === "acknowledged") {
+      kind = "case_a_ack";
+      anchor = ackRecord!;
+    } else if (!ackRecord && guarded.some(r => r.finalAcknowledged === true)) {
+      return no("final_ack_unknown");
+    } else if (ackRecord) {
+      return no("cleanup_pending");
+    } else {
+      const saved = guarded.filter(r => r.finalRequest && r.coverageDigest);
+      if (saved.length !== 1) return no("cleanup_pending");
+      anchor = saved[0]!;
+      if (anchor.reason === "final_retry_refused" || anchor.reason === "credential_rejected") return no("replay_refused_persisted");
+      const settled = anchor.holdSettlement;
+      if (settled !== undefined && !receiptMatches(settled, anchor.finalRequest!)) return no("case_b_pending_owner_review");
+      kind = "case_a_replay";
+    }
+    const binding = anchor.exactHoldBinding;
+    if (!binding || !anchor.serverCaptureId) return no("binding_missing");
+    if (selected.some(r => r.exactHoldBinding && canonicalJson(r.exactHoldBinding) !== canonicalJson(binding))) return no("binding_inconsistent");
+    const context = anchor.coverageContext;
+    if (!context || context.runId !== runId || context.generation !== generation || !anchor.bareDir) return no("bare_mismatch");
+    const bare = await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(anchor.bareDir!));
+    if (!bare || bare !== context.barePath) return no("bare_mismatch");
+    if (observed.holds === "unknown") return no("holds_unknown");
+    if (observed.holds.has(generation)) return no("hold_open");
+    if (this.pendingGenerationReport?.(runId, generation)) return no("pending_generation_report");
+    if (!this.client.getExactRecoveryHold) return no("exact_evidence_unavailable");
+    if (io.budget.signal.aborted || io.budget.remainingMs() <= 0) return no("evidence_deadline");
+    let exact: RecoveryExactHold | undefined;
+    try { exact = await this.operatorRpc(io, signal => this.client.getExactRecoveryHold!(runId, generation, binding, signal)); }
+    catch (err) {
+      if (err instanceof OperatorCancelledBeforeMutation || io.shutdownSignal.aborted) throw err;
+      return no(io.budget.signal.aborted ? "evidence_deadline" : "exact_evidence_unavailable");
+    }
+    if (!exact || exact.run_id !== runId || exact.generation !== generation || exact.hold_id !== binding.holdId ||
+        exact.repo_id !== binding.repoId || exact.inventory_guarded !== true) return no("exact_evidence_unavailable");
+    if (exact.state === "open") return no("hold_open");
+    if (exact.state !== "released" && exact.state !== "discarded") return no("exact_evidence_unavailable");
+    if (!OPERATOR_TERMINAL_STATUSES.has(exact.run_status)) return no("run_state_not_terminal");
+    if (exact.state !== "released" || !receiptMatches(exact, anchor.finalRequest!)) return no("case_b_pending_owner_review");
+    if (!this.git.recoveryRefSnapshot) return no("source_identity_unavailable");
+    let snapshot: { devIno: string; refs: string[] };
+    try { snapshot = await ownedRecoveryIO(() => this.git.recoveryRefSnapshot!(bare, runId, generation)); }
+    catch { io.budget.check(); return no("source_identity_unavailable"); }
+    // For the replay case the ACK the resolution itself will persist is normalised away, so the digest
+    // described before the replay equals the one re-checked after it.
+    const contents = selected.slice().sort((a, b) => a.captureId < b.captureId ? -1 : a.captureId > b.captureId ? 1 : 0)
+      .map(r => {
+        const { finalAcknowledged: _ack, ...unacknowledged } = r;
+        return createHash("sha256").update(canonicalJson(kind === "case_a_replay" && r === anchor ? unacknowledged : r)).digest("hex");
+      });
+    const digest = createHash("sha256").update(canonicalJson([
+      "retained-local-record-v1", runId, generation, kind, binding.holdId, binding.repoId, anchor.serverCaptureId,
+      { hold_id: exact.hold_id, repo_id: exact.repo_id, state: exact.state, release_evidence: exact.release_evidence ?? null,
+        final_receipt: exact.final_receipt ?? null, run_status: exact.run_status },
+      snapshot.devIno, bare, snapshot.refs, journal.names, observed.settlementNames, contents,
+    ])).digest("hex");
+    return { ok: true, case: kind, digest, anchor, bare, holdId: binding.holdId, repoId: binding.repoId,
+      captureIds: selected.map(r => r.captureId).sort() };
+  }
+
+  /** Read-only: classify every local record generation of one run. One bounded journal read under J (then
+   * released), one strict holds read and at most one exact read per candidate generation outside J. */
+  async describeLocalRecords(runId: string, sig: OperatorRequestSignals): Promise<DescribeLocalRecordsResult> {
+    if (!this.enabled) return { kind: "refused", reason: "recovery_disabled" };
+    if (!OPERATOR_RUN_ID.test(runId)) return { kind: "refused", reason: "invalid_request" };
+    try {
+      return await this.withOperatorBudget(sig, async (io): Promise<DescribeLocalRecordsResult> => {
+        this.operatorCheckpoint(io);
+        const journal = await this.withJournalLock(runId, () => this.operatorJournal(runId, io.journal));
+        if (journal.kind !== "ok") return { kind: "described", runId, generations: [], blockers: [journal.kind] };
+        const blockers: string[] = [];
+        if (journal.records.some(r => !Number.isSafeInteger(r.generation))) blockers.push("generation_missing");
+        const generations = [...new Set(journal.records.map(r => r.generation).filter((g): g is number => Number.isSafeInteger(g)))]
+          .sort((a, b) => a - b);
+        const views: LocalRecordGeneration[] = [];
+        if (!generations.length) return { kind: "described", runId, generations: views, blockers };
+        const observed = await this.operatorObserve(io, runId);
+        for (const generation of generations) {
+          // Cooperative stop: the client leaving or shutdown ends the loop; a spent budget marks the rest.
+          if (io.requestSignal.aborted) throw new OperatorCancelledBeforeMutation();
+          io.shutdownSignal.throwIfAborted();
+          const captureIds = journal.records.filter(r => r.generation === generation).map(r => r.captureId).sort();
+          if (io.budget.signal.aborted || io.budget.remainingMs() <= 0) {
+            views.push({ generation, classification: "evidence_deadline", captureIds });
+            continue;
+          }
+          const verdict = await this.operatorAssess(io, runId, generation, journal, observed);
+          views.push(verdict.ok
+            ? { generation, classification: verdict.case, digest: verdict.digest, holdId: verdict.holdId, repoId: verdict.repoId,
+              captureIds: verdict.captureIds }
+            : { generation, classification: verdict.classification, captureIds });
+        }
+        return { kind: "described", runId, generations: views, blockers };
+      });
+    } catch (err) {
+      return this.operatorFailure(err, sig) ?? { kind: "refused", reason: "operator_failed" };
+    }
+  }
+
+  /** Map an escaped error to a named refusal by the signals, never by message text. */
+  private operatorFailure(err: unknown, sig: OperatorRequestSignals): { kind: "refused"; reason: string } | undefined {
+    if (err instanceof OperatorCancelledBeforeMutation) return { kind: "refused", reason: "client_disconnected" };
+    if (sig.shutdownSignal.aborted) return { kind: "refused", reason: "shutting_down" };
+    if (Date.now() >= sig.deadlineAt) return { kind: "refused", reason: "deadline_exhausted" };
+    if (sig.requestSignal.aborted) return { kind: "refused", reason: "client_disconnected" };
+    this.log.warn("recovery: operator local-record request failed", { error: errText(err) });
+    return undefined;
+  }
+
+  /**
+   * Operator resolution of ONE guarded local record generation whose FINAL acknowledgement is already
+   * persisted (case A1). Bound by `confirm`, the digest {@link describeLocalRecords} printed. The cleanup is the
+   * existing forgetGenerationWithinCycle boundary, unchanged; this adds the evidence that must hold first.
+   *
+   * Lock order: A (bounded wait) -> C (`skip`) -> J (inside forget) -> B (inside cleanup). The client's
+   * requestSignal is checked before each pre-destruction step and, just before the first mutation, by the
+   * `beforeFirstMutation` callback (an aborted client there ends the request with nothing touched). After it,
+   * only the deadline and shutdown can interrupt, and they end the request `partial`.
+   */
+  async resolveLocalRecord(input: OperatorRequestSignals & { runId: string; generation: number; confirm: string }):
+    Promise<ResolveLocalRecordResult> {
+    const refused = (reason: string): ResolveLocalRecordResult => ({ kind: "refused", reason });
+    if (!this.enabled) return refused("recovery_disabled");
+    const { runId, generation, confirm } = input;
+    if (!OPERATOR_RUN_ID.test(runId) || !Number.isSafeInteger(generation) || generation <= 0 ||
+        typeof confirm !== "string" || !/^[0-9a-f]{64}$/.test(confirm)) return refused("invalid_request");
+    let crossed = false;
+    try {
+      return await this.withOperatorBudget(input, async (io): Promise<ResolveLocalRecordResult> => {
+        this.operatorCheckpoint(io);
+        let entered = false;
+        const body = async (): Promise<ResolveLocalRecordResult> => {
+          entered = true;
+          // The cycle key of a guarded generation, computed without any journal listing.
+          const cycle = await runCaptureCycle(path.resolve(this.runDir(runId), `generation-${generation}`), "skip",
+            () => this.operatorResolveInCycle(io, runId, generation, confirm, () => { crossed = true; }));
+          return cycle.ran ? cycle.value : refused("cycle_busy");
+        };
+        if (!this.authority) return body();
+        try {
+          return await this.authority.withTransaction(body, {
+            signal: AbortSignal.any([io.requestSignal, io.shutdownSignal]),
+            timeoutMs: Math.max(1, Math.ceil(Math.min(OPERATOR_AUTHORITY_WAIT_MS, io.budget.remainingMs()))),
+          });
+        } catch (err) {
+          // Only the acquisition of A is a busy signal; a failure once the transaction ran is not.
+          if (!entered) {
+            if (err instanceof AuthorityLockBusy) return refused("authority_busy");
+            if (io.shutdownSignal.aborted) return refused("shutting_down");
+            if (io.requestSignal.aborted) return refused("client_disconnected");
+          }
+          throw err;
+        }
+      });
+    } catch (err) {
+      const named = this.operatorFailure(err, input);
+      if (crossed) return { kind: "partial", reason: named && named.reason !== "client_disconnected" ? named.reason : "cleanup_failed" };
+      return named ?? refused("cleanup_failed");
+    }
+  }
+
+  private async operatorResolveInCycle(io: OperatorIO, runId: string, generation: number, confirm: string,
+    markCrossed: () => void): Promise<ResolveLocalRecordResult> {
+    const refused = (reason: string): ResolveLocalRecordResult => ({ kind: "refused", reason });
+    // Pre-checks outside J, each preceded by an explicit client checkpoint.
+    this.operatorCheckpoint(io);
+    const live = this.operatorLiveGate(runId);
+    if (live) return refused(live);
+    this.operatorCheckpoint(io);
+    const journal = await this.withJournalLock(runId, () => this.operatorJournal(runId, io.journal));
+    if (journal.kind !== "ok") return refused(journal.kind);
+    this.operatorCheckpoint(io);
+    const observed = await this.operatorObserve(io, runId);
+    this.operatorCheckpoint(io);
+    const verdict = await this.operatorAssess(io, runId, generation, journal, observed);
+    if (!verdict.ok) return refused(verdict.classification);
+    if (verdict.digest !== confirm) return refused("descriptor_changed");
+    if (verdict.case === "case_a_replay") return refused("replay_not_implemented_yet");
+    this.operatorCheckpoint(io);
+    let refusal: string | undefined;
+    // Under J, with the single bounded read forget just made: everything again, freshly observed.
+    const expect = async (fresh: OperatorJournal): Promise<string | undefined> => {
+      const reason = await (async (): Promise<string | undefined> => {
+        if (fresh.kind !== "ok") return fresh.kind;
+        this.operatorCheckpoint(io);
+        const stillLive = this.operatorLiveGate(runId);
+        if (stillLive) return stillLive;
+        const again = await this.operatorObserve(io, runId);
+        this.operatorCheckpoint(io);
+        const second = await this.operatorAssess(io, runId, generation, fresh, again);
+        if (!second.ok) return second.classification;
+        if (second.case !== "case_a_ack") return "replay_not_implemented_yet";
+        if (second.digest !== confirm) return "descriptor_changed";
+        if (!this.git.assertRecoveryBareClear) return "source_identity_unavailable";
+        this.operatorCheckpoint(io);
+        try { await ownedRecoveryIO(() => this.git.assertRecoveryBareClear!(second.bare)); }
+        catch { io.budget.check(); return "bare_mutation_unresolved"; }
+        this.operatorCheckpoint(io);
+        return undefined;
+      })();
+      refusal = reason;
+      return reason;
+    };
+    let crossed = false;
+    const outcome = await this.forgetGenerationWithinCycle(runId, generation, this.isExecuting, undefined, {
+      budget: io.journal, expect,
+      beforeFirstMutation: () => {
+        // The last client checkpoint: after this returns requestSignal is never consulted again.
+        if (io.requestSignal.aborted) throw new OperatorCancelledBeforeMutation();
+        crossed = true;
+        markCrossed();
+      },
+    });
+    if (outcome === "operator_refused") return refused(refusal ?? "operator_refused");
+    if (outcome === "forgotten") return { kind: "retired", generation, remaining: await this.operatorRemaining(runId) };
+    return crossed ? { kind: "partial", reason: outcome } : refused(outcome);
+  }
+
+  /** Best effort: how many record files the run directory still holds. */
+  private async operatorRemaining(runId: string): Promise<number> {
+    try { return (await fs.readdir(this.runDir(runId))).filter(name => name.endsWith(".json")).length; }
+    catch { return 0; }
   }
 
   /**

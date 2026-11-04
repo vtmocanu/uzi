@@ -21043,7 +21043,8 @@ try {
     roots: Array<{ sha: string; contexts: OwedCandidate["contexts"] }>,
     coveragePins: Array<{ fingerprint: string; sha: string; coveredHeads?: string[] }>, recoverySources: string[],
     coveringSha: string, canDelete: () => boolean = () => true,
-    authority: "archive" | "completion" | "completion-check" = "archive"): Promise<"removed" | "retained" | "verified"> {
+    authority: "archive" | "completion" | "completion-check" = "archive",
+    beforeFirstMutation?: () => void): Promise<"removed" | "retained" | "verified"> {
     await this.validateOwedContext(barePath, context.branch, context);
     if (!Number.isSafeInteger(context.generation) || context.generation <= 0) return "retained";
     await this.assertOwedBare(barePath);
@@ -21110,8 +21111,17 @@ try {
         assertResidueQuarantineOpen("git");
         if (!canDelete()) throw new Error("recovery cleanup source protection changed");
       };
+      // The operator's boundary callback: once, immediately before the first mutation of any kind
+      // (the first ref deletion's beginBare, or the first metadata file removal when no ref is deleted).
+      let boundaryCrossed = false;
+      const boundary = (): void => {
+        if (boundaryCrossed) return;
+        boundaryCrossed = true;
+        beforeFirstMutation?.();
+      };
       const deleteRef = async (ref: string, sha: string): Promise<void> => {
         open();
+        boundary();
         const settlement = await this.beginBare(barePath, "recovery-cleanup-delete-ref", [ref]);
         // A known exit or a proven spawn failure settles; a timeout, kill or ambiguous rejection stays unsettled.
         await this.deleteRefSettled(barePath, ref, sha, settlement, "recovery cleanup ref deletion mismatch");
@@ -21125,6 +21135,7 @@ try {
       }
       for (const record of exact) {
         open();
+        boundary();
         const name = `candidate-${record.runId}-${record.sha}-${record.contextName.slice(8, -5)}.json`;
         await this.removeOwedFile(barePath, name, true);
       }
@@ -21141,10 +21152,33 @@ try {
             item.startsWith(legacyFlatTrackingOwnerKey(c.branch) + "\n"));
         if (consumed) continue;
         open();
+        boundary();
         await this.removeOwedFile(barePath, name, true);
       }
       return "removed";
     });
+  }
+
+  /** Read-only source identity of one recovery generation for the operator's local-record binding: the
+   *  bare directory's dev:ino plus the sorted "refname sha" lines of the run's owed pins, the generation's
+   *  coverage pins and recovery pin, and the run's recovery-episode pins, read under the bare lock. */
+  async recoveryRefSnapshot(barePath: string, runId: string, generation: number): Promise<{ devIno: string; refs: string[] }> {
+    if (typeof runId !== "string" || !OWED_RUN_ID.test(runId) || !Number.isSafeInteger(generation) || generation <= 0) {
+      throw new Error("invalid recovery ref snapshot identity");
+    }
+    await this.assertOwedBare(barePath);
+    return this.withLock(barePath, async () => {
+      const st = await fs.lstat(barePath);
+      const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
+        `refs/uzi-owed/${runId}/`, `refs/uzi-coverage/${runId}/${generation}/`, recoveryPinRef(runId, generation),
+        `refs/uzi-recovery-episode/${runId}/`]);
+      return { devIno: `${st.dev}:${st.ino}`, refs: out.split("\n").filter(Boolean).sort() };
+    });
+  }
+
+  /** The operator's pre-mutation proof that no shared-bare deletion is pending (see assertBareClear). */
+  async assertRecoveryBareClear(barePath: string): Promise<void> {
+    await this.assertBareClear(barePath, "operator-local-record-resolve");
   }
 
   /** Only a server-confirmed full commit and positive ancestry proof release an owed pin. */
