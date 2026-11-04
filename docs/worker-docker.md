@@ -149,7 +149,7 @@ busy and custody-held workers alike.
   prune. The leg is single-flight, with one prune exec per attempt and no
   retry at another API version.
 - **Backoff.** 1 hour, re-armed early when both bytes and inodes are below 75%.
-  After an `unknown` outcome the full hour always applies.
+  After an `unknown` outcome the full hour always applies (backoff state is kept in the worker process, so a worker restart re-arms the leg).
 - **What it does not do.** It never closes the claim gate and never waits for
   idle, terminal runs or custody; claims, parked resumes and model commands
   continue. It defers (`dind-volume-prune-deferred`) only while DinD
