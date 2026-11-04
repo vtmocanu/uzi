@@ -7925,9 +7925,7 @@ export class RunRunner {
     }
     const pause = flight.steering.getPauseMode();
     if (pause === "now" || pause === "milestone") throw new PauseNowSignal();
-    if (flight.cancel.signal.aborted) {
-      throw flight.cancel.signal.reason;
-    }
+    if (flight.cancel.signal.aborted) throw flight.cancel.signal.reason;
   }
 
   /** The mid-run disk park's final-proof interruption check (issue #3916). The park already ends the
@@ -7940,7 +7938,7 @@ export class RunRunner {
       flight.preserveSession = false;
       throw new StaleClaimError();
     }
-    return !!(this.shuttingDownGlobal || flight.active?.shuttingDown || flight.steering.isCancelled());
+    return !!(flight.active?.shuttingDown || flight.steering.isCancelled());
   }
 
   private async deferTerminalExecutionForDisk(
@@ -8015,7 +8013,10 @@ export class RunRunner {
     } catch (error) {
       if (midRunDiskPark) {
         // Unproven: the proof loop's mid-run check routes a shutdown or cancel; only a fence throws.
+        // A held scope's own interruption (expired scope, aborted signal, refusal) takes the held
+        // region's path, as on the terminal arm; the disk stop's PauseNowSignal is not one.
         this.midRunDiskProofStopped(flight);
+        if (held && !(error instanceof PauseNowSignal) && canonicalRecoveryInterruption(error)) throw error;
         return false;
       }
       this.terminalDiskInterruption(flight);

@@ -332,6 +332,29 @@ describe("RunRunner - issue #3916: a mid-run disk park bounds its unverified cap
     assert.ok(fs.existsSync(d.clone), "the clone is kept");
   });
 
+  it("a final quiescence proof that throws a plain error fails worker_residue_blocked and never escapes", async (t) => {
+    let proofs = 0;
+    const d = await drive(t, {
+      tweak: (runner) => {
+        failFetch(runner);
+        const quiesce = runner.quiesceRun.bind(runner);
+        runner.quiesceRun = (flight: unknown, executor: unknown, opts: { site: string }) => {
+          if (opts.site !== "terminal_disk:after_runner_git") return quiesce(flight, executor, opts);
+          proofs++;
+          return Promise.reject(new Error("stub: proof probe failed"));
+        };
+      },
+    });
+    if (!d) return;
+    assert.strictEqual(d.outcome, "done", "the error did not escape execute()");
+    assert.strictEqual(proofs, 5, "every bounded proof attempt threw");
+    assert.deepStrictEqual(d.parks, [], "an unproven quiescence never parks");
+    assert.strictEqual(d.failed.length, 1);
+    assert.strictEqual(d.failed[0]!.fail_origin, "worker_residue_blocked");
+    assert.ok(String(d.failed[0]!.failure_reason).includes("final quiescence unproven"), "the existing reason text");
+    assert.ok(fs.existsSync(d.clone), "the clone is kept");
+  });
+
   it("a persistent incomplete settlement fails worker_residue_blocked after five blocked attempts without any capture", async (t) => {
     let settlements = 0;
     let captureWork = 0;
