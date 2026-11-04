@@ -67,6 +67,7 @@ import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBu
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
 import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
+import { BROWSER_DISCOVERY_ENV } from "../browser-env.js";
 import type { SdkAttemptEnv } from "../sdk-env.js";
 import { goConcurrencyEnv } from "../go-concurrency.js";
 import { randomUUID } from "node:crypto";
@@ -286,7 +287,7 @@ const COMMAND_ENV_PATH = "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:
  *  identity pins these, and sdk-env.ts's PROTECTED_ENV_KEYS deliberately OMITS
  *  PATH/TMPDIR/LANG, so relying on it alone would leave those open) with a MIRROR of that
  *  module-private PROTECTED_ENV_KEYS set (the OAuth credential + the two ANTHROPIC_* keys +
- *  the browser flag), plus Docker endpoint/configuration keys owned by trusted startup wiring.
+ *  the browser flag and the two browser discovery paths), plus Docker endpoint/configuration keys owned by trusted startup wiring.
  *  So a hostile/malformed `toolEnv` can neither breach the command
  *  boundary NOR reintroduce a credential-adjacent key. PATH is additionally handled
  *  specially in {@link buildCommandEnv} (fixed prefix, provisioned value appended). */
@@ -313,6 +314,9 @@ const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "AGENT_BROWSER_ARGS",
+  // Issue #3907: the browser discovery keys (sdk-env.ts protects them too; set only by
+  // buildCommandEnv's browserDiscovery flag, never by a provisioned toolEnv).
+  ...Object.keys(BROWSER_DISCOVERY_ENV),
   "UZI_SQLC_DIR",
   // issue #1783: the run-attempt marker and worker spawn mark sdk-env.ts protects too.
   "UZI_RUN_ATTEMPT",
@@ -3592,6 +3596,9 @@ export class CodexExecutor implements Executor {
           this.deps.commandTmpdir ?? "/tmp",
           provisioned.toolEnv,
           this.opts.dockerWiring?.dockerHost,
+          // Issue #3907: every model command runs under `commandSandbox` (makeDefaultSpawnCommand);
+          // only the fileop root is forced to "required" for cross_check, and it runs no browser.
+          commandSandbox === "off",
         ),
         await canonicalCheckoutPath(worktreePath),
       );
@@ -7592,11 +7599,18 @@ export function commandSandboxArgv(
  *     PROTECTED_ENV_KEYS member — {@link COMMAND_ENV_PROTECTED_KEYS} unions both, because
  *     PROTECTED_ENV_KEYS alone omits PATH/TMPDIR/LANG. `commandEffectSpec` later overrides
  *     HOME/TMPDIR to the per-command private tmp, so those stay boundary-safe regardless.
+ *   - issue #3907: when `browserDiscovery` is true, AGENT_BROWSER_EXECUTABLE_PATH and
+ *     CHROME_PATH (the uzi-chromium wrapper) are set after the fold. The caller passes true
+ *     only when the worker's command sandbox mode is `off`. Under `required` discovery is
+ *     not advertised: Chromium was observed failing under the enforced Landlock policy
+ *     (/proc and /sys are not granted). Under `best-effort` it is not advertised either:
+ *     whether Landlock applies depends on the kernel at command time, which this builder
+ *     cannot know, so Chromium might run where best-effort ends up unconfined.
  *   - issue #1716: a `toolEnv` entry can NEVER inject git config (GIT_CONFIG_COUNT,
  *     GIT_CONFIG_KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS); run() adds the worker's own
  *     trust afterwards ({@link withCommandGitTrust}).
  */
-export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>, dockerHost?: string): NodeJS.ProcessEnv {
+export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>, dockerHost?: string, browserDiscovery = false): NodeJS.ProcessEnv {
   const provisionedPath = toolEnv.PATH;
   const env: NodeJS.ProcessEnv = {
     // The fixed boundary dirs come first; a provisioned PATH is appended (never prepended,
@@ -7617,6 +7631,7 @@ export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>,
   // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
   Object.assign(env, goConcurrencyEnv());
   if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
+  if (browserDiscovery) Object.assign(env, BROWSER_DISCOVERY_ENV);
   return env;
 }
 

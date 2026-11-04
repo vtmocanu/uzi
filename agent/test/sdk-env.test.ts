@@ -57,10 +57,28 @@ describe("buildSdkEnv", () => {
 
     // Exactly the core keys (+ TMPDIR, the 5-bis per-uid scratch dir, when the ambient
     // env has one) — no other WORKER env is spread in. TMPDIR is not a secret.
-    const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
+    const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS",
+      "AGENT_BROWSER_EXECUTABLE_PATH", "CHROME_PATH"]);
     if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
     if (process.env.UZI_SQLC_DIR) expected.add("UZI_SQLC_DIR");
     assert.deepStrictEqual(new Set(Object.keys(env)), expected);
+  });
+
+  it("issue #3907: browser discovery points at the uzi-chromium wrapper and adds no Puppeteer/CHROME_BIN key", () => {
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
+    assert.strictEqual(env.AGENT_BROWSER_EXECUTABLE_PATH, "/usr/local/bin/uzi-chromium");
+    assert.strictEqual(env.CHROME_PATH, "/usr/local/bin/uzi-chromium");
+    assert.ok(!("PUPPETEER_EXECUTABLE_PATH" in env));
+    assert.ok(!("CHROME_BIN" in env));
+  });
+
+  it("issue #3907: a hostile toolEnv cannot replace the browser discovery paths", () => {
+    const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR, {
+      AGENT_BROWSER_EXECUTABLE_PATH: "/evil/chromium",
+      CHROME_PATH: "/evil/chrome",
+    });
+    assert.strictEqual(env.AGENT_BROWSER_EXECUTABLE_PATH, "/usr/local/bin/uzi-chromium");
+    assert.strictEqual(env.CHROME_PATH, "/usr/local/bin/uzi-chromium");
   });
 
   it("uses a nonempty runner pin ahead of the ambient PATH", () => {

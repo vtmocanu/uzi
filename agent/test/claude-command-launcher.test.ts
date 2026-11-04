@@ -441,6 +441,12 @@ describe("guardedCommandEnv", () => {
     }
   });
 
+  it("issue #3907: a cliEnv built by buildSdkEnv keeps the browser discovery paths in the guarded command env", () => {
+    const out = guardedCommandEnv(buildSdkEnv("oauth", "/home/runner", { CHROME_PATH: "/evil/chrome" }));
+    assert.equal(out.AGENT_BROWSER_EXECUTABLE_PATH, "/usr/local/bin/uzi-chromium");
+    assert.equal(out.CHROME_PATH, "/usr/local/bin/uzi-chromium");
+  });
+
   it("covers every variable the SDK spawn treats as a provider credential", () => {
     const env = Object.fromEntries(PROVIDER_CREDENTIAL_VARS.map((k) => [k, "secret"]));
     assert.deepEqual(guardedCommandEnv({ ...env, KEEP: "1" }), { KEEP: "1" });
