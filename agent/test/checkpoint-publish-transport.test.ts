@@ -163,8 +163,12 @@ if (process.env.UZI_PUBLISH_TRANSPORT_CHILD) {
     proxy.on("request", (req, res) => {
       connects++;
       const target = new URL(req.url!);
-      assert.equal(Number(target.port), (plain.address() as net.AddressInfo).port);
-      const upstream = http.request(target, { method: req.method, headers: req.headers }, response => {
+      const plainPort = (plain.address() as net.AddressInfo).port;
+      assert.equal(target.hostname, "127.0.0.1");
+      assert.equal(Number(target.port), plainPort);
+      // Forward only to the fixture's own server: host and port are fixed, the request supplies the path.
+      const upstream = http.request({ host: "127.0.0.1", port: plainPort, path: target.pathname + target.search,
+        method: req.method, headers: req.headers }, response => {
         res.writeHead(response.statusCode!, response.headers);
         response.pipe(res);
       });
