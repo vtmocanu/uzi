@@ -225,14 +225,17 @@ func TestHeldSeamCancelReportSiblingIsolationLiveDB(t *testing.T) {
 	env.exec(`UPDATE runs SET status = 'claimed', claimed_at = now() WHERE id = $1`, sibClaimed)
 	setRunGeneration(t, env, sibClaimed, 3)
 	sibs := []uuid.UUID{sibRunning, sibClaimed}
-	before := map[uuid.UUID]heldSeamRunRow{}
-	for _, s := range sibs {
-		before[s] = heldSeamRead(t, env, s)
-	}
 
 	// A foreign user cannot cancel the sibling.
 	if _, err := svc.SubmitInputWithOptions(env.ctx, a.userID, sibRunning, "cancel", "", nil, SubmitInputOptions{}); !errors.Is(err, ErrRunNotFound) {
 		t.Fatalf("foreign cancel err = %v, want ErrRunNotFound", err)
+	}
+
+	before := map[uuid.UUID]heldSeamRunRow{}
+	for _, s := range sibs {
+		// A real pending row makes a settlement escaping the target run observable.
+		env.exec(`INSERT INTO run_user_inputs (run_id, kind, body) VALUES ($1, 'cancel', '')`, s)
+		before[s] = heldSeamRead(t, env, s)
 	}
 
 	heldSeamCancelViaPoller(t, env, svc, a.userID, mine, "mine only")
@@ -246,8 +249,8 @@ func TestHeldSeamCancelReportSiblingIsolationLiveDB(t *testing.T) {
 		if after := heldSeamRead(t, env, s); after != before[s] {
 			t.Fatalf("sibling %s changed: before %+v after %+v", s, before[s], after)
 		}
-		if total, _ := heldSeamCancelInputs(t, env, s); total != 0 {
-			t.Fatalf("sibling %s has %d cancel inputs, want 0", s, total)
+		if total, unapplied := heldSeamCancelInputs(t, env, s); total != 1 || unapplied != 1 {
+			t.Fatalf("sibling %s cancel inputs total/unapplied = %d/%d, want 1/1", s, total, unapplied)
 		}
 	}
 }
