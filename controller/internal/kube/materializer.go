@@ -1160,11 +1160,12 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 // and no mounted token). A strategic-merge or apply-based patch would close it if
 // this ever needs to be true in general.
 //
-// The nodeSelector is the one map this patch does make convergent, because operators
-// are expected to change it (workers.nodeSelector): liveSelector is the observed
-// template's, and every key of it the desired template dropped is sent as null.
+// The nodeSelector and tolerations are the scheduling fields this patch does make
+// convergent, because operators are expected to change them (workers.nodeSelector,
+// workers.tolerations); see templateForMergePatch. liveSelector is the observed
+// template's selector.
 func patchFor(dep *appsv1.Deployment, liveSelector map[string]string) ([]byte, error) {
-	tmpl, err := templateWithSelectorDeletes(dep.Spec.Template, liveSelector)
+	tmpl, err := templateForMergePatch(dep.Spec.Template, liveSelector)
 	if err != nil {
 		return nil, err
 	}
@@ -1188,22 +1189,14 @@ func patchFor(dep *appsv1.Deployment, liveSelector map[string]string) ([]byte, e
 	return raw, nil
 }
 
-// templateWithSelectorDeletes returns tmpl as the generic JSON a merge patch sends,
-// with spec.nodeSelector set to tmpl's selector plus a null for each live key it
-// lacks. With nothing to delete it is tmpl unchanged.
-func templateWithSelectorDeletes(tmpl corev1.PodTemplateSpec, live map[string]string) (any, error) {
-	sel := map[string]any{}
-	for k := range live {
-		if _, keep := tmpl.Spec.NodeSelector[k]; !keep {
-			sel[k] = nil
-		}
-	}
-	if len(sel) == 0 {
-		return tmpl, nil
-	}
-	for k, v := range tmpl.Spec.NodeSelector {
-		sel[k] = v
-	}
+// templateForMergePatch returns tmpl as the generic JSON a merge patch sends, made
+// convergent for the two scheduling fields operators are expected to change:
+//   - spec.nodeSelector is tmpl's selector plus a null for each live key it lacks;
+//   - spec.tolerations is always present, as null when tmpl has none. A list is
+//     replaced wholesale by a merge patch, but an omitted (omitempty) one is left
+//     alone, so without the null a cleared workers.tolerations would never reach an
+//     existing worker. A null on a template that has no tolerations is a no-op.
+func templateForMergePatch(tmpl corev1.PodTemplateSpec, live map[string]string) (any, error) {
 	raw, err := json.Marshal(tmpl)
 	if err != nil {
 		return nil, fmt.Errorf("marshal pod template: %w", err)
@@ -1215,6 +1208,21 @@ func templateWithSelectorDeletes(tmpl corev1.PodTemplateSpec, live map[string]st
 	spec, ok := generic["spec"].(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("pod template has no spec object")
+	}
+	if len(tmpl.Spec.Tolerations) == 0 {
+		spec["tolerations"] = nil
+	}
+	sel := map[string]any{}
+	for k := range live {
+		if _, keep := tmpl.Spec.NodeSelector[k]; !keep {
+			sel[k] = nil
+		}
+	}
+	if len(sel) == 0 {
+		return generic, nil
+	}
+	for k, v := range tmpl.Spec.NodeSelector {
+		sel[k] = v
 	}
 	spec["nodeSelector"] = sel
 	return generic, nil
