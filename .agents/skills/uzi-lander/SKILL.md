@@ -681,8 +681,10 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
 ## Waiting, uniformly
 
 Every long wait uses a bundled poller with an owned continuation, not merely a
-background process. Claude Code's native background task and OpenCode's background
-shell can notify on exit; verify actual STARTED coverage and retain a private log.
+background process. Claude Code's native background task (the Bash tool's
+`run_in_background`, never a `&`/`nohup` inside a foreground call, which never
+notifies) and OpenCode's background shell can notify on exit; verify actual STARTED
+coverage and retain a private log.
 A Codex managed exec ID alone is not a verified wake subscription.
 
 Load session-peers' completion guidance. Use its bounded owner-only `watch start`
