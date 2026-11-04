@@ -221,8 +221,9 @@ api:
       # fetch spiked 742 MB and OOM-killed this pod). 1Gi is headroom for a few
       # CONCURRENT publishes (single-publish already fits under 512Mi post-shallow-fix).
       # /publish now has a concurrency cap (4 process-wide, 2 per worker;
-      # api/internal/workersvc/checkpoint_publish_slot.go). The 1Gi limit is kept because
-      # the cap's worst case (four near-maximal packs at once) still needs it.
+      # api/internal/workersvc/checkpoint_publish_slot.go). It bounds the worst case without
+      # fitting it: four concurrent publishes already sit at about this limit before pack
+      # bytes, so the limit stays at 1Gi.
       memory: 1Gi
   # The api Service. Named "api" (see uzi.apiServiceName) so the web nginx
   # `proxy_pass http://api:8080` resolves it — same-origin, no CORS.

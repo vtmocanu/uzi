@@ -8,13 +8,13 @@ import (
 
 const (
 	// checkpointPublishMaxConcurrent caps the live checkpoint publishes (POST /publish) in flight
-	// process-wide. Worst case per publish is about 64 MiB of buffered pack (io.ReadAll under
-	// maxPackBytes) plus the roughly 194 MB RSS spike of the push broker documented beside the api
-	// memory limit in deploy/chart/values.yaml. Four concurrent is about 1 GB on top of the
-	// roughly 280Mi steady state, which can exceed the 1Gi limit only when all four carry
-	// near-maximal packs at once; typical checkpoint packs are far smaller. The cap makes that
-	// worst case bounded where it was previously unbounded. Held publication has its own cap
-	// (heldPublishMaxConcurrent).
+	// process-wide. Each buffers up to 64 MiB of pack (io.ReadAll under maxPackBytes), and the push
+	// broker adds a spike of roughly 194 MB RSS per publish (measured on this repo; it scales with the
+	// target repo's shallow base snapshot, not with pack size; see the api memory limit in
+	// deploy/chart/values.yaml). Four concurrent publishes therefore sit at about the 1Gi limit on top
+	// of the roughly 280Mi steady state before counting pack bytes; larger packs, larger repos or
+	// concurrent held publications (heldPublishMaxConcurrent) can exceed it. The cap bounds that worst
+	// case where it was previously unbounded; it does not fit it under the limit.
 	checkpointPublishMaxConcurrent = 4
 
 	// checkpointPublishMaxPerWorker is the share one worker (store.Worker.ID) may hold, so one
@@ -23,7 +23,10 @@ const (
 	// synchronous, including the detached retention tail inside PublishAttested, which outlives
 	// the worker's abort but not the server request. That is enough for the default single-run
 	// worker. A multi-run worker exceeding it gets a 429, which the worker retries within its
-	// allowance.
+	// allowance. Keying on the worker (not the owner, whose id every hosted worker of a run carries)
+	// gives up fairness between owners: one owner with two busy workers can hold all four
+	// process-wide slots, and other owners then get 429s bounded only by the global cap and their
+	// retry.
 	checkpointPublishMaxPerWorker = 2
 )
 
