@@ -128,39 +128,20 @@ else
   fails=$((fails + 1))
 fi
 
-# Issue #2378: execute the step-managed CI database's actual pg_isready command
-# against the same socket-only init/final-TCP distinction. Extract exactly one
-# probe from the workflow, dropping only the `if docker exec ci-pg` wrapper.
-# No Docker startup or wall-clock wait.
-if ! readiness_cmd="$(awk '
-  /^[[:space:]]*if docker exec ci-pg pg_isready .*; then[[:space:]]*$/ {
-    cmd = $0
-    sub(/^[[:space:]]*if docker exec ci-pg /, "", cmd)
-    sub(/; then[[:space:]]*$/, "", cmd)
-    print cmd; n++
-  }
-  END { if (n != 1) exit 1 }
-' "$HERE/../.github/workflows/ci.yml")"; then
-  printf 'FAIL: expected exactly one CI Postgres readiness probe in the workflow\n' >&2
-  exit 1
-fi
-cat > "$FAKEBIN2/pg_isready" <<'STUB'
-#!/bin/sh
-printf '%s\n' "$*" >> "$PROBE_LOG"
-if [ "$PG_STAGE" = final ]; then exit 0; fi
-case " $* " in *" -h 127.0.0.1 "*) exit 1 ;; *) exit 0 ;; esac
-STUB
-chmod +x "$FAKEBIN2/pg_isready"
-init_rc=0
-PATH="$FAKEBIN2:$PATH" PG_STAGE=init PROBE_LOG="$TMP/ci-probe.log" \
-  sh -c "$readiness_cmd" || init_rc=$?
-final_rc=0
-PATH="$FAKEBIN2:$PATH" PG_STAGE=final PROBE_LOG="$TMP/ci-probe.log" \
-  sh -c "$readiness_cmd" || final_rc=$?
-if [ "$init_rc" -ne 0 ] && [ "$final_rc" -eq 0 ] && [ -s "$TMP/ci-probe.log" ]; then
-  printf 'PASS: CI readiness probe rejects socket-only initdb and accepts the final server\n'
+# Issue #2378 (reshaped by #2561): CI no longer starts its own step-managed database
+# for the LiveDB sweep. The single CI execution runs this script, so readiness lives
+# only here and the #2304 case above is the behavioral proof for CI too. Pin both
+# halves of that: the workflow carries no inline Postgres readiness probe or database
+# container of its own (a second, untested probe would be a second place for the
+# socket-versus-TCP bug), and this script's probes all use TCP (`-h 127.0.0.1`).
+ci_probes="$(grep -v '^[[:space:]]*#' "$HERE/../.github/workflows/ci.yml" | grep -cE 'pg_isready|docker run|--name ci-pg' || true)"
+script_probes="$(grep -c 'pg_isready' "$SCRIPT" || true)"
+script_tcp_probes="$(grep -c 'pg_isready -h 127.0.0.1 ' "$SCRIPT" || true)"
+if [ "$ci_probes" -eq 0 ] && [ "$script_probes" -ge 1 ] && [ "$script_probes" -eq "$script_tcp_probes" ]; then
+  printf 'PASS: readiness is owned by run-store-it.sh alone (no inline CI probe; every script probe is TCP)\n'
 else
-  printf 'FAIL: CI readiness probe accepted initdb or rejected the final server (#2378)\n'
+  printf 'FAIL: CI carries %s inline Postgres probe/container line(s) (want 0); script probes %s, TCP %s (#2561)\n' \
+    "$ci_probes" "$script_probes" "$script_tcp_probes"
   fails=$((fails + 1))
 fi
 
