@@ -215,12 +215,13 @@ browser_rc=0
 browser_checker_rc=0
 browser_name="$NAME-browser"
 browser_volume="$NAME-nix"
-owned_request volume "$browser_volume"
-if browser_receipt=$(phase browser-volume timeout --kill-after=5s 5s docker volume create \
+# Each journal append must succeed BEFORE its resource exists: cleanup removes only journaled names.
+if owned_request volume "$browser_volume" \
+   && browser_receipt=$(phase browser-volume timeout --kill-after=5s 5s docker volume create \
      --label "io.uzi.worker-uid.invocation=$TOKEN" "$browser_volume") \
    && [ "$browser_receipt" = "$browser_volume" ] \
-   && phase browser-volume-owner python3 "$REPO/e2e/worker-uid/bounded.py" verify-volume "$REPORT_DIR" "$TOKEN" "$browser_volume"; then
-  owned_request container "$browser_name"
+   && phase browser-volume-owner python3 "$REPO/e2e/worker-uid/bounded.py" verify-volume "$REPORT_DIR" "$TOKEN" "$browser_volume" \
+   && owned_request container "$browser_name"; then
   phase browser-proof capture "$REPORT_DIR/browser-results.xml" 600 \
     timeout --kill-after=5s 595s docker run --pull never --network none \
     --label "io.uzi.worker-uid.invocation=$TOKEN" --name "$browser_name" --cap-drop ALL \

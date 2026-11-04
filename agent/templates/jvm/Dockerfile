@@ -301,7 +301,8 @@ RUN command -v agent-browser \
     && [ ! -e "$HOME/.agent-browser" ] && [ ! -e /tmp/uzi-ab-home ] \
     && [ ! -e /tmp/uzi-chromium-wrap-home ] \
     && [ ! -e "$HOME/.uzi-chromium" ] && [ ! -e "$HOME/.uzi-agent-browser" ] \
-    && ! ls -d /tmp/uzi-agent-browser.* /tmp/uzi-chromium.* >/dev/null 2>&1
+    && ! ls -d /tmp/uzi-agent-browser.* >/dev/null 2>&1 \
+    && ! ls -d /tmp/uzi-chromium.* >/dev/null 2>&1
 
 # BUG 1 (issue #114) store-perm normalization — MIRRORED from templates/base (jvm is NOT
 # `FROM base`; keep in lockstep). MUST run AFTER the build guard above, not after the earlier

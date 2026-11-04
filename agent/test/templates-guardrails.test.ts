@@ -637,7 +637,7 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       );
       assert.match(
         text,
-        /! ls -d \/tmp\/uzi-agent-browser\.\* \/tmp\/uzi-chromium\.\* >\/dev\/null 2>&1/,
+        /! ls -d \/tmp\/uzi-agent-browser\.\* >\/dev\/null 2>&1 \\\n\s+&& ! ls -d \/tmp\/uzi-chromium\.\* >\/dev\/null 2>&1/,
         `${name}/Dockerfile build guard must assert no per-invocation fallback dir was baked into /tmp (issue #3907)`,
       );
       assert.ok(
