@@ -81,6 +81,7 @@ import type { LeftReason, RunProcessReap } from "./run-procs.js";
 import {
   LiveAttemptRegistry,
   describeProcesses,
+  describeRootContext,
   mintAttemptId,
   newRunAttempt,
   quiesceRunAttempt,
@@ -13218,6 +13219,7 @@ export class RunRunner {
           flight.runLog.warn("attempt seed: unattributable unreadable runner-uid process(es); seeding the fresh path, no retention deletion this seed", {
             site: "attempt_seed",
             processes: describeProcesses(proof.outcome.process),
+            root_context: describeRootContext(proof.outcome.process),
           });
           return;
         }
@@ -13391,6 +13393,7 @@ export class RunRunner {
       state: verdict.state,
       detail: sanitizeForLog(verdict.detail),
       processes: describeProcesses(verdict),
+      root_context: describeRootContext(verdict),
     });
     throw new RunResidueBlockedError(verdict.detail, { preClone: "worker_wide" });
   }
@@ -17045,6 +17048,7 @@ export class RunRunner {
           state: outcome.process?.state,
           detail: sanitizeForLog(outcome.process?.detail ?? ""),
           processes: describeProcesses(outcome.process),
+          root_context: describeRootContext(outcome.process),
         });
       } else if (outcome.process && outcome.process.killed.length > 0) {
         flight.runLog.info("run quiescence reaped residual processes", {
