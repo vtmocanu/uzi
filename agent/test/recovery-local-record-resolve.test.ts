@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, test } from "node:test";
 import { AuthorityLockBusy } from "../src/authority-lock.js";
 import { GitCache } from "../src/git.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { RecoveryCoordinator, type RecoveryRecord } from "../src/recovery.js";
 import type { RecoveryExactHold } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
@@ -29,6 +31,7 @@ async function world(variant: Variant = "acknowledged", opts: { bind?: boolean }
   const cache = new GitCache(path.join(root, "data"), nullLogger());
   producer.recoveryRefSnapshot = cache.recoveryRefSnapshot.bind(cache);
   producer.assertRecoveryBareClear = cache.assertRecoveryBareClear.bind(cache);
+  producer.verifyRecoveryCoverage = cache.verifyRecoveryCoverage.bind(cache);
   e.state.open = false;
   if (opts.bind !== false) f.record = await patch(coordinator, f.record, { exactHoldBinding: binding });
   const runId = f.context.runId;
@@ -213,14 +216,11 @@ test("shutdown ends a request with a named refusal", async () => {
 
 // ── describe classifications ─────────────────────────────────────────────────────────────────
 
-test("describe: saved FINAL without ACK is case_a_replay with a digest, and resolve defers it", async () => {
+test("describe: saved FINAL without ACK is case_a_replay with a digest", async () => {
   const w = await world("saved-final");
   const described = await w.describe();
   assert.equal(described.kind === "described" && described.generations[0]?.classification, "case_a_replay");
-  const digest = await w.digest();
-  const before = await inventory(w.root);
-  assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "replay_not_implemented_yet" });
-  assert.deepEqual(await inventory(w.root), before);
+  assert.match(await w.digest(), /^[0-9a-f]{64}$/);
 });
 
 test("describe: a replay refused persistently is replay_refused_persisted", async () => {
@@ -589,4 +589,403 @@ test("a producer-origin record in the generation is non_ordinary_origin; an ACK 
   const noCoverage = await world();
   await rewrite(noCoverage, { coverageDigest: undefined });
   assert.equal(await noCoverage.classification(), "record_unverified");
+});
+
+// ── A2: operator exact replay of a saved FINAL whose closed hold carries a matching receipt ──────────
+
+/** A saved-FINAL world whose release call is recorded together with the bytes present when it was sent. */
+async function replayWorld(opts: { settlement?: boolean } = {}) {
+  const w = await world("saved-final");
+  w.e.state.allowFinal = true;
+  if (opts.settlement) await patch(w.coordinator, w.f.record, { holdSettlement: w.exact as RecoveryExactHold });
+  const posts: Array<{ args: unknown[]; bytes: Awaited<ReturnType<typeof inventory>>; refs: string; objects: string }> = [];
+  const release = w.client.releaseRecoveryCustody.bind(w.client);
+  w.client.releaseRecoveryCustody = async (...args: Parameters<typeof release>) => {
+    posts.push({ args, bytes: await inventory(w.root), refs: w.refs(), objects: git(w.bare, "count-objects", "-v") });
+    return release(...args);
+  };
+  const calls = { retain: 0, reconcile: 0, existingWrites: 0, recordWrites: 0, status: 0 };
+  const count = (name: string, key: keyof typeof calls) => {
+    const original = (w.coordinator as unknown as Record<string, (...a: unknown[]) => unknown>)[name]!.bind(w.coordinator);
+    Object.assign(w.coordinator, { [name]: (...a: unknown[]) => { calls[key]++; return original(...a); } });
+  };
+  count("retainFinal", "retain");
+  count("reconcileInventory", "reconcile");
+  count("writeExistingRecord", "existingWrites");
+  count("writeRecordUnlocked", "recordWrites");
+  const status = w.client.getRecoveryCaptureStatus.bind(w.client);
+  w.client.getRecoveryCaptureStatus = async (...a: Parameters<typeof status>) => { calls.status++; return status(...a); };
+  /** What the record file looks like at the moment the cleanup runs (J is held, so read the file directly). */
+  const atCleanup: { acknowledged?: boolean; settled?: boolean } = {};
+  w.cleanup(() => undefined);
+  const fakeCleanup = w.producer.cleanupRecoveryGeneration!;
+  w.producer.cleanupRecoveryGeneration = async (...args: Parameters<typeof fakeCleanup>) => {
+    const raw = await fs.readFile(w.coordinator["recordPath"](w.f.record), "utf8");
+    atCleanup.acknowledged = raw.includes('"finalAcknowledged":true');
+    atCleanup.settled = raw.includes('"holdSettlement"');
+    return fakeCleanup(...args);
+  };
+  return Object.assign(w, { posts, calls, atCleanup });
+}
+type ReplayWorld = Awaited<ReturnType<typeof replayWorld>>;
+
+/** Nothing the replay's pre-POST proofs read may change a byte or a ref. */
+async function assertByteNeutral(w: ReplayWorld, bytes: Awaited<ReturnType<typeof inventory>>, refs: string) {
+  assert.deepEqual(await inventory(w.root), bytes, "every byte unchanged");
+  assert.equal(w.refs(), refs, "every ref unchanged");
+  assert.equal(w.posts.length, 0, "no release POST");
+  assert.equal(w.calls.retain + w.calls.reconcile + w.calls.existingWrites + w.calls.recordWrites, 0, "no write path ran");
+}
+
+for (const settlement of [false, true]) {
+  test(`A2 (${settlement ? "persisted matching settlement" : "no settlement"}): one canonical POST, the ACK, then the cleanup; nothing else is written`, async () => {
+    const w = await replayWorld({ settlement });
+    const request = w.f.record.finalRequest!;
+    const digest = await w.digest();
+    const bytes = await inventory(w.root);
+    const refs = w.refs();
+    const objects = git(w.bare, "count-objects", "-v");
+    assert.deepEqual(await w.resolve(digest), { kind: "retired", generation: 7, remaining: 0 });
+    assert.equal(w.posts[0]!.objects, objects, "no git object is created before the POST");
+    assert.equal(w.posts.length, 1, "exactly one release POST");
+    assert.equal(w.posts[0]!.args[2], request.evidence);
+    assert.deepEqual(w.posts[0]!.args[3], request.disposition, "the body is the saved request, canonically");
+    assert.deepEqual(w.posts[0]!.bytes, bytes, "record bytes and all journal entries unchanged up to the POST");
+    assert.equal(w.posts[0]!.refs, refs);
+    assert.equal(w.atCleanup.acknowledged, true, "the ACK was persisted before the cleanup");
+    assert.equal(w.atCleanup.settled, settlement, "a settlement is neither created nor lost");
+    assert.equal(w.calls.recordWrites, 1, "the ACK is the only record write");
+    assert.equal(w.calls.existingWrites + w.calls.retain + w.calls.reconcile, 0);
+    assert.equal(w.e.calls.reserve + w.e.calls.upload + w.e.calls.produce + w.e.calls.held, 0);
+    assert.equal(w.cleanupArgs.length, 1);
+    assert.deepEqual(await w.coordinator.inspect(w.runId), []);
+  });
+}
+
+test("A2 with the real cleanup retires the generation's refs and bundle", async () => {
+  const w = await replayWorld();
+  const digest = await w.digest();
+  w.producer.cleanupRecoveryGeneration = (...args) => w.cache.cleanupRecoveryGeneration(...args);
+  const bundle = w.f.record.bundlePath!;
+  assert.deepEqual(await w.resolve(digest), { kind: "retired", generation: 7, remaining: 0 });
+  assert.equal(w.posts.length, 1);
+  await assert.rejects(fs.stat(bundle), { code: "ENOENT" });
+  assert.deepEqual(await w.coordinator.inspect(w.runId), []);
+  assert.doesNotMatch(w.refs(), new RegExp(`refs/uzi-coverage/${w.runId}/7/`));
+});
+
+test("A2 refuses a source boundary that retains the source, byte-neutrally and with no diagnostics write", async () => {
+  const w = await replayWorld();
+  const digest = await w.digest();
+  const bytes = await inventory(w.root);
+  const refs = w.refs();
+  w.e.state.boundary = false;
+  assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "source_boundary_retained" });
+  await assertByteNeutral(w, bytes, refs);
+  // The same refusal when the boundary wrapper swallows an error thrown from inside the finalizer.
+  const swallowed = await replayWorld();
+  const swallowedDigest = await swallowed.digest();
+  Object.assign(swallowed.coordinator, { withInventorySourceBoundary: async (_context: unknown, action: (prove: () => Promise<boolean>) => Promise<void>) => {
+    try { await action(async () => true); return "passed"; } catch { return "retained"; }
+  } });
+  swallowed.producer.readRemediationRestrictionFacts = (async () => {
+    swallowed.request.abort();
+    return { blocked: false, enrolled: false, fingerprint: "f", roots: [], flaggedOIDs: [] };
+  }) as never;
+  assert.deepEqual(await swallowed.resolve(swallowedDigest), { kind: "refused", reason: "client_disconnected" });
+});
+
+test("A2 pre-POST disconnect and shutdown at the last proof leave every byte and call retainFinal never", async () => {
+  const facts = (hook: () => void) => async () => { hook(); return { blocked: false, enrolled: false, fingerprint: "f", roots: [], flaggedOIDs: [] }; };
+  const gone = await replayWorld();
+  const goneDigest = await gone.digest();
+  const goneBytes = await inventory(gone.root);
+  const goneRefs = gone.refs();
+  gone.producer.readRemediationRestrictionFacts = facts(() => gone.request.abort()) as never;
+  assert.deepEqual(await gone.resolve(goneDigest), { kind: "refused", reason: "client_disconnected" });
+  await assertByteNeutral(gone, goneBytes, goneRefs);
+
+  const down = await replayWorld();
+  const downDigest = await down.digest();
+  const downBytes = await inventory(down.root);
+  const downRefs = down.refs();
+  down.producer.readRemediationRestrictionFacts = facts(() => down.shutdown.abort()) as never;
+  assert.deepEqual(await down.resolve(downDigest), { kind: "refused", reason: "shutting_down" });
+  await assertByteNeutral(down, downBytes, downRefs);
+});
+
+test("A2 refuses a pre-POST error without writing anything (replay_failed_before_post)", async () => {
+  const w = await replayWorld();
+  const digest = await w.digest();
+  const bytes = await inventory(w.root);
+  const refs = w.refs();
+  w.producer.readRemediationRestrictionFacts = (async () => { throw new Error("fixture facts failure"); }) as never;
+  // restrictionsAllowCapturedC treats an unreadable fact as a held record: a named precondition, no write.
+  assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "replay_precondition_unmet:restrictions" });
+  await assertByteNeutral(w, bytes, refs);
+  const thrown = await replayWorld();
+  const thrownDigest = await thrown.digest();
+  thrown.client.getRecoveryCaptureStatus = async () => { throw new Error("fixture status failure"); };
+  assert.deepEqual(await thrown.resolve(thrownDigest), { kind: "refused", reason: "replay_precondition_unmet:capture_status" });
+  assert.equal(thrown.posts.length, 0);
+  assert.equal(thrown.calls.retain + thrown.calls.reconcile, 0);
+});
+
+test("A2 refuses when the exact observation drifts from the confirmed one (descriptor_changed), without writing", async () => {
+  const w = await replayWorld();
+  const digest = await w.digest();
+  const bytes = await inventory(w.root);
+  const refs = w.refs();
+  // The first reads (pre-check and under J) agree; the finalizer's own read sees a changed claim generation.
+  let reads = 0;
+  const original = async (): Promise<RecoveryExactHold> => w.exact as RecoveryExactHold;
+  w.client.getExactRecoveryHold = async () => {
+    reads++;
+    const exact = await original();
+    return reads >= 3 ? { ...exact, current_claim_generation: exact.current_claim_generation + 1 } : exact;
+  };
+  assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "descriptor_changed" });
+  await assertByteNeutral(w, bytes, refs);
+});
+
+test("A2 hold closed by a different observation: an open or unreadable hold in the finalizer is a named refusal with no retainFinal", async () => {
+  for (const [reason, answer] of [["hold_open", (e: RecoveryExactHold): RecoveryExactHold =>
+    ({ ...e, state: "open", live_worker_id: "w", live_run_id: e.run_id, release_evidence: undefined, final_receipt: undefined })],
+  ["holds_unknown", (e: RecoveryExactHold): RecoveryExactHold => ({ ...e, hold_id: "31050000-0000-4000-8000-0000000000ff" })]] as const) {
+    const w = await replayWorld();
+    const digest = await w.digest();
+    const bytes = await inventory(w.root);
+    const refs = w.refs();
+    let reads = 0;
+    const original = async (): Promise<RecoveryExactHold> => w.exact as RecoveryExactHold;
+    w.client.getExactRecoveryHold = async () => {
+      reads++;
+      const exact = await original();
+      return reads >= 3 ? answer(exact) : exact;
+    };
+    assert.deepEqual(await w.resolve(digest), { kind: "refused", reason });
+    await assertByteNeutral(w, bytes, refs);
+  }
+});
+
+test("A2 refuses a missing saved FINAL (no_saved_final) and never mints one", async () => {
+  const w = await replayWorld();
+  const uploaded = await world("uploaded");
+  const scope = (verified: RecoveryExactHold) => {
+    const budget = new MaintenanceBudget(60_000);
+    const io = { requestSignal: new AbortController().signal, shutdownSignal: new AbortController().signal, deadlineAt: Date.now() + 60_000,
+      budget, journal: { signal: budget.signal, deadline: Date.now() + 60_000 } };
+    return { budget, scope: { io, verified, posted: false, beforeFirstMutation: () => undefined } as { refusal?: string; posted: boolean } };
+  };
+  void w;
+  const { budget, scope: s } = scope(released(uploaded) ?? closed(uploaded.f));
+  const bytes = await inventory(uploaded.root);
+  const outcome = await MaintenanceBudget.run(budget, () => uploaded.coordinator["operatorReplay"].run(s as never,
+    () => uploaded.coordinator["finalizeInventory"](uploaded.f.record, false, "deny")));
+  budget.dispose();
+  assert.equal(outcome, undefined);
+  assert.equal(s.refusal, "no_saved_final");
+  assert.deepEqual(await inventory(uploaded.root), bytes);
+  assert.equal(uploaded.e.calls.final, 0);
+});
+
+test("A2 after the POST: an unexpected answer is replay_ack_mismatch with no reconcile and no write", async () => {
+  const w = await replayWorld();
+  const digest = await w.digest();
+  w.client.releaseRecoveryCustody = async () => ({ run_id: w.runId, generation: 7, released: true, holds_released: 0 });
+  const before = await w.record();
+  assert.deepEqual(await w.resolve(digest), { kind: "partial", reason: "replay_ack_mismatch" });
+  assert.equal(w.calls.reconcile + w.calls.retain + w.calls.existingWrites + w.calls.recordWrites, 0);
+  assert.deepEqual(await w.record(), before, "the record is unchanged");
+  assert.equal((await w.describe()).kind, "described");
+});
+
+test("A2 after the POST: a failed release keeps the existing retainFinal write and never reconciles", async () => {
+  const w = await replayWorld();
+  const digest = await w.digest();
+  w.client.releaseRecoveryCustody = async () => { throw new Error("fixture release transport failure"); };
+  const result = await w.resolve(digest);
+  assert.deepEqual(result, { kind: "partial", reason: "replay_failed:final_retry_unknown" });
+  assert.equal(w.calls.reconcile, 0);
+  assert.equal(w.calls.retain, 1);
+  assert.equal((await w.record()).finalAcknowledged, undefined);
+});
+
+test("A2 reports an acknowledged cleanup that the boundary refuses", async () => {
+  const w = await replayWorld();
+  const digest = await w.digest();
+  w.producer.cleanupRecoveryGeneration = async () => "retained";
+  assert.deepEqual(await w.resolve(digest), { kind: "partial", reason: "acknowledged_cleanup_refused:cleanup_retained" });
+  const after = await w.record();
+  assert.equal(after.finalAcknowledged, true);
+  assert.equal(await w.classification(), "case_a_ack", "re-describing the same generation now offers the A1 path");
+});
+
+test("A2 crash point 2: POST sent, ACK not written, then the identical replay is offered and a second replay retires", async () => {
+  const w = await replayWorld();
+  const digest = await w.digest();
+  const bytes = await inventory(w.root);
+  // The ACK write is prevented (a crash between the POST and the journal write).
+  const write = w.coordinator["writeRecordUnlocked"].bind(w.coordinator);
+  w.coordinator["writeRecordUnlocked"] = async () => { throw new Error("fixture crash before the ACK write"); };
+  const first = await w.resolve(digest);
+  assert.equal(first.kind, "partial");
+  assert.equal(w.posts.length, 1);
+  w.coordinator["writeRecordUnlocked"] = write;
+  assert.deepEqual(await inventory(w.root), bytes, "the record is byte-identical after the crash");
+  assert.equal(await w.classification(), "case_a_replay");
+  assert.equal(await w.digest(), digest, "the same digest is offered again");
+  assert.deepEqual(await w.resolve(digest), { kind: "retired", generation: 7, remaining: 0 });
+  assert.equal(w.posts.length, 2, "the replay sends the same request once more");
+  assert.deepEqual(JSON.stringify(w.posts[1]!.args.slice(2, 4)), JSON.stringify(w.posts[0]!.args.slice(2, 4)));
+});
+
+test("outside the operator scope the autonomous live pass still persists the settlement, retains the FINAL and reconciles", async () => {
+  // A closed hold observed by the autonomous path is written to the journal (the operator replay never does that).
+  const settled = await world("saved-final");
+  const record = await settled.record();
+  assert.equal(record.holdSettlement, undefined);
+  assert.equal(await settled.coordinator.heldOperationState(record), "settled");
+  assert.equal((await settled.record()).holdSettlement?.state, "released");
+
+  // A refused FINAL release is retained and reconciled by the autonomous finalizer.
+  const w = await replayWorld();
+  w.client.releaseRecoveryCustody = async () => { throw new Error("fixture release transport failure"); };
+  const record2 = await w.record();
+  await w.coordinator["finalizeInventory"](record2, true, "deny");
+  assert.equal(w.calls.retain, 1, "retainFinal ran");
+  assert.ok(w.calls.reconcile >= 1, "reconcileInventory ran");
+});
+
+// ── A2, held_publication disposition ─────────────────────────────────────────────────────────────
+
+async function heldReplayWorld() {
+  const w = await replayWorld();
+  const disposition = { kind: "held_publication" as const, publication_id: "31050000-0000-4000-8000-0000000000a1",
+    source_sha: w.f.record.sourceSha, coverage_digest: w.f.record.coverageDigest! };
+  await patch(w.coordinator, w.f.record, { finalRequest: { disposition } });
+  w.f.record = await w.record();
+  w.exact = { ...closed(w.f), state: "released", run_status: "failed", release_evidence: undefined, final_receipt: disposition };
+  for (const key of Object.keys(w.calls) as Array<keyof typeof w.calls>) w.calls[key] = 0;
+  return Object.assign(w, { disposition });
+}
+
+test("A2 (held_publication): one canonical POST, the ACK, then the cleanup; no fallback, retain or reconcile", async () => {
+  const w = await heldReplayWorld();
+  assert.equal(await w.classification(), "case_a_replay");
+  const digest = await w.digest();
+  const bytes = await inventory(w.root);
+  assert.deepEqual(await w.resolve(digest), { kind: "retired", generation: 7, remaining: 0 });
+  assert.equal(w.posts.length, 1);
+  assert.deepEqual(w.posts[0]!.args[3], w.disposition);
+  assert.deepEqual(w.posts[0]!.bytes, bytes);
+  assert.equal(w.atCleanup.acknowledged, true);
+  assert.equal(w.atCleanup.settled, false);
+  assert.equal(w.calls.retain + w.calls.reconcile + w.calls.existingWrites, 0);
+  assert.equal(w.e.calls.held, 0);
+});
+
+test("A2 (held_publication): a retained answer needing the archive fallback is refused without clearing the request", async () => {
+  const w = await heldReplayWorld();
+  const digest = await w.digest();
+  w.client.releaseRecoveryCustody = async () => ({ run_id: w.runId, generation: 7, released: false, holds_released: 0,
+    retained: true, reason: "held_publication_ref_missing" }) as never;
+  const result = await w.resolve(digest);
+  assert.equal(result.kind, "partial");
+  assert.match(result.kind === "partial" ? result.reason : "", /^(held_fallback_required:|replay_ack_mismatch)/);
+  assert.equal((await w.record()).finalRequest?.disposition.kind, "held_publication", "the held request is not cleared");
+  assert.equal(w.calls.existingWrites + w.calls.reconcile, 0);
+});
+
+test("A2 (held_publication): a pre-POST disconnect writes nothing", async () => {
+  const w = await heldReplayWorld();
+  const digest = await w.digest();
+  const bytes = await inventory(w.root);
+  const refs = w.refs();
+  w.producer.readRemediationRestrictionFacts = (async () => {
+    w.request.abort();
+    return { blocked: false, enrolled: false, fingerprint: "f", roots: [], flaggedOIDs: [] };
+  }) as never;
+  assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "client_disconnected" });
+  await assertByteNeutral(w, bytes, refs);
+});
+
+/** The verifier inputs exactly as frozenCoverageProven derives them from the saved record. */
+async function verifyInputs(w: ReplayWorld) {
+  const rec = await w.record();
+  const roots = [...new Set([...(rec.originalRoots ?? []).map(c => c.sha), rec.originalSourceSha!])].sort();
+  const pin = `refs/uzi-coverage/${w.runId}/7/${rec.coverageDigest}`;
+  const reused = rec.sourceSha === rec.inventoryCurrentSha;
+  const verify = (over: { roots?: string[]; sha?: string; fingerprint?: string; reuse?: boolean } = {}) =>
+    w.cache.verifyRecoveryCoverage(w.bare, w.f.context, over.roots ?? roots, rec.inventoryCurrentSha!,
+      { sha: over.sha ?? rec.sourceSha, fingerprint: over.fingerprint ?? rec.coverageDigest! },
+      (over.reuse ?? reused) ? { reuseCoveredCurrent: "required" } : {});
+  return { rec, roots, pin, verify };
+}
+
+test("verifyRecoveryCoverage accepts the built coverage and writes no ref or object", async () => {
+  const w = await replayWorld();
+  const { verify } = await verifyInputs(w);
+  const refs = w.refs(), objects = git(w.bare, "count-objects", "-v");
+  assert.equal(await verify(), true);
+  assert.equal(w.refs(), refs, "no ref written");
+  assert.equal(git(w.bare, "count-objects", "-v"), objects, "no object written");
+});
+
+test("verifyRecoveryCoverage refuses a wrong fingerprint, a moved or missing pin, a wrong expected sha and a missing root", async () => {
+  const w = await replayWorld();
+  const { rec, roots, pin, verify } = await verifyInputs(w);
+  assert.equal(await verify({ fingerprint: "f".repeat(64) }), false, "fingerprint mismatch");
+  assert.equal(await verify({ sha: rec.inventoryCurrentSha === rec.sourceSha ? w.f.head : rec.inventoryCurrentSha! }), false,
+    "expected sha differs from the pin");
+  await assert.rejects(verify({ roots: [] }), /original roots/);
+  const original = git(w.bare, "rev-parse", pin);
+  git(w.bare, "update-ref", pin, w.f.attempts[1]!);
+  assert.equal(await verify(), false, "pin moved to another commit");
+  git(w.bare, "update-ref", "-d", pin);
+  assert.equal(await verify(), false, "pin missing");
+  git(w.bare, "update-ref", pin, original);
+  assert.equal(await verify(), true);
+  assert.ok(roots.length > 0);
+});
+
+test("verifyRecoveryCoverage refuses a root that is not an ancestor of the expected source", async () => {
+  const w = await replayWorld();
+  const { rec, roots, verify } = await verifyInputs(w);
+  const tree = git(w.bare, "rev-parse", `${rec.inventoryCurrentSha}^{tree}`);
+  const stray = git(w.bare, "commit-tree", tree, "-m", "stray root");
+  const widened = [...roots, stray].sort();
+  const fingerprint = createHash("sha256").update(JSON.stringify({ roots: widened, currentSha: rec.inventoryCurrentSha, tree })).digest("hex");
+  // The pin and fingerprint are honest for the widened roots, yet the recorded source never descended from the stray root.
+  git(w.bare, "update-ref", `refs/uzi-coverage/${w.runId}/7/${fingerprint}`, rec.sourceSha);
+  assert.equal(await verify({ roots: widened, fingerprint }), false);
+});
+
+test("verifyRecoveryCoverage refuses while a bare mutation is pending", async () => {
+  const w = await replayWorld();
+  const { verify } = await verifyInputs(w);
+  Object.assign(w.cache, { authority: { assertBareClear: async () => { throw new Error("pending bare mutation"); } } });
+  await assert.rejects(verify(), /pending bare mutation/);
+});
+
+test("A2 refuses a coverage pin moved to another commit, byte-neutrally", async () => {
+  const w = await replayWorld();
+  const { pin } = await verifyInputs(w);
+  git(w.bare, "update-ref", pin, w.f.attempts[1]!);
+  const digest = await w.digest();
+  const bytes = await inventory(w.root);
+  const refs = w.refs();
+  assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "replay_precondition_unmet:frozen_coverage" });
+  await assertByteNeutral(w, bytes, refs);
+});
+
+test("A2 never rebuilds the coverage: a missing coverage pin is a named refusal and the bare is not written", async () => {
+  const w = await replayWorld();
+  const pin = w.refs().split("\n").find(line => line.startsWith(`refs/uzi-coverage/${w.runId}/7/`))!.split(" ")[0]!;
+  git(w.bare, "update-ref", "-d", pin);
+  const digest = await w.digest();
+  const bytes = await inventory(w.root);
+  const refs = w.refs();
+  assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "replay_precondition_unmet:frozen_coverage" });
+  await assertByteNeutral(w, bytes, refs);
 });

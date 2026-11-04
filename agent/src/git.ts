@@ -21296,6 +21296,54 @@ try {
   }
 
   /**
+   * Read-only counterpart of {@link buildRecoveryCoverage} for the operator replay, which writes nothing
+   * before its POST. It performs every check the build performs (context validation, root and tree
+   * availability, fingerprint, reuse eligibility, ancestry of every root and the current source, tree
+   * equality, the pending-deletion proof, the coverage pin) but never creates an object, ref or owed
+   * context. The build's deterministic aggregate-sha equality is replaced by structural equality on the
+   * recorded `expected.sha`: the recomputed fingerprint, root and current-source ancestry, the tree and
+   * the pin `refs/uzi-coverage/<run>/<generation>/<fingerprint>` resolving to that sha. Returns false on
+   * any mismatch; throws only where the build throws for unavailability.
+   */
+  async verifyRecoveryCoverage(barePath: string, context: PositiveOwedCandidateContext, originalShas: string[],
+    currentSha: string, expected: { sha: string; fingerprint: string },
+    opts: { reuseCoveredCurrent?: "if-covered" | "required" } = {}): Promise<boolean> {
+    context = this.snapshotOwedOptions({ context }).context as PositiveOwedCandidateContext;
+    if (!Number.isSafeInteger(context.generation) || context.generation <= 0 ||
+        "legacy" in context || "origin" in context) throw new Error("recovery coverage requires positive claim context");
+    await this.validateOwedContext(barePath, context.branch, context);
+    return this.withLock(barePath, async () => {
+      const roots = [...new Set(originalShas)].sort();
+      if (!roots.length) throw new Error("recovery coverage needs original roots");
+      await this.requireOwedCommit(barePath, currentSha);
+      for (const root of roots) await this.requireOwedCommit(barePath, root);
+      await this.requireOwedCommit(barePath, expected.sha);
+      const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${currentSha}^{tree}`])).trim();
+      if (!OWED_OID.test(tree) || (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", tree])).trim() !== "tree") {
+        throw new Error("recovery current tree unavailable");
+      }
+      const fingerprint = createHash("sha256").update(JSON.stringify({ roots, currentSha, tree })).digest("hex");
+      if (fingerprint !== expected.fingerprint) return false;
+      let reuseCurrent = (opts.reuseCoveredCurrent === "if-covered" || opts.reuseCoveredCurrent === "required") &&
+        await this.reusableRecoveryCoverage(barePath, currentSha, tree);
+      if (reuseCurrent) for (const root of roots) {
+        const relation = await this.ancestry(barePath, root, currentSha);
+        if (relation === "unknown") throw new Error("recovery coverage ancestry proof unavailable");
+        if (relation !== "ancestor") { reuseCurrent = false; break; }
+      }
+      if (opts.reuseCoveredCurrent === "required" && !reuseCurrent) return false;
+      if (reuseCurrent && expected.sha !== currentSha) return false;
+      for (const root of [...roots, currentSha]) {
+        if (await this.ancestry(barePath, root, expected.sha) !== "ancestor") return false;
+      }
+      if ((await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${expected.sha}^{tree}`])).trim() !== tree) return false;
+      await this.assertBareClear(barePath, "recovery-coverage-ref");
+      const coverageRef = `refs/uzi-coverage/${context.runId}/${context.generation}/${fingerprint}`;
+      return await this.checkedRefSha(barePath, coverageRef) === expected.sha;
+    });
+  }
+
+  /**
    * Unlocked bounded commit read shared by {@link readRecoveryCoverageClaim} and the marker-wrapper
    * check in {@link prepareRecoverySuccessor}; the caller holds the bare lock. `git cat-file` output is
    * decoded as UTF-8 by the exec plumbing, so a body that does not survive the round trip back to its
