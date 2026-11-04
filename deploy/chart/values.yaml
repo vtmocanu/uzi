@@ -673,8 +673,8 @@ workers:
   # pools but keep the busy-drift deferral, so a busy one is not replaced mid-run.
   nodeSelector:
     kubernetes.io/arch: amd64
-  # Tolerations for every hosted worker pod, all three tiers, as a list of standard
-  # Kubernetes toleration objects. Use it to run workers on tainted, dedicated nodes:
+  # Tolerations for every hosted worker pod, all three tiers, as a list of Kubernetes
+  # toleration objects using operator Equal or Exists (Lt/Gt are refused). Use it to run workers on tainted, dedicated nodes:
   #
   #   tolerations:
   #     - {key: uzi, operator: Equal, value: "true", effect: NoSchedule}

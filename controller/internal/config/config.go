@@ -819,7 +819,7 @@ func parseNodeSelector(raw string) (map[string]string, error) {
 }
 
 // parseTolerations reads UZI_WORKER_TOLERATIONS, a JSON array of tolerations, and
-// applies the API server's toleration rules at boot: a Deployment carrying a toleration
+// applies the API server's toleration rules (Equal/Exists only) at boot: a Deployment carrying a toleration
 // the API server rejects would otherwise surface only as workers that never appear.
 // Unknown fields are refused so a misspelt key (e.g. "efect") fails loudly instead of
 // widening the toleration to every effect.
@@ -848,7 +848,8 @@ func parseTolerations(raw string) ([]corev1.Toleration, error) {
 	return tols, nil
 }
 
-// validateToleration mirrors the API server's per-toleration validation.
+// validateToleration applies the API server's per-toleration rules to the supported
+// subset: operators Equal and Exists. The feature-gated Lt and Gt are refused.
 func validateToleration(t corev1.Toleration) error {
 	if t.Key != "" {
 		if errs := validation.IsQualifiedName(t.Key); len(errs) > 0 {

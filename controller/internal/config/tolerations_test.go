@@ -52,6 +52,7 @@ func TestLoadRejectsBadWorkerTolerations(t *testing.T) {
 		`[{"key":"uzi","efect":"NoSchedule"}]`,
 		`[{"key":"bad key!","operator":"Exists"}]`,
 		`[{"key":"uzi","operator":"In"}]`,
+		`[{"key":"uzi","operator":"Gt","value":"5"}]`,
 		`[{"key":"uzi","operator":"Exists","value":"true"}]`,
 		`[{"value":"true"}]`,
 		`[{"key":"uzi","value":"not a label value"}]`,
