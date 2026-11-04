@@ -175,7 +175,29 @@ fixtures.each_with_index do |files, index|
   safe = files.count { |status, path| statuses.split('|').include?(status) && File.fnmatch(pattern.sub(/\/\*\*$/, '/**/*'), path, flags) }
   assert.call(classify.call(files.length.to_s, safe.to_s, files.length.to_s), index < 2 ? 'skip_components=1' : 'skip_components=0', "path/status fixture #{index}")
 end
-assert.call(jobs.fetch('test-api-store-it').fetch('steps').any? { |step| step.fetch('run', '').include?('../scripts/livedb-skip-guard.sh livedb.log') }, true, 'LiveDB proof retained')
+# One LiveDB execution backs both required contexts: the producer carries the canonical
+# recipe (the sweep with its livedb-skip-guard, then the combined proofs); test-api-store-it
+# only aggregates the producer's result.
+producer = jobs.fetch('test-codex-refresh-lostreply-e2e')
+assert.call(producer.fetch('steps').any? { |step| step['run'] == 'task test:codex-refresh-lostreply-e2e' }, true, 'single LiveDB execution runs the canonical recipe')
+assert.call(File.read(File.join(root, 'e2e/run-store-it.sh')).include?('"$ROOT/scripts/livedb-skip-guard.sh" "$LOG"'), true, 'LiveDB proof retained in the recipe')
+assert.call(jobs.values.flat_map { |j| j.fetch('steps', []).map { |s| s['run'].to_s } }.grep(/livedb-skip-guard|-run 'LiveDB\$'|run-store-it/), [], 'no workflow step carries a second LiveDB sweep')
+aggregator = jobs.fetch('test-api-store-it')
+assert.call(Array(aggregator['needs']).sort, %w[changes test-codex-refresh-lostreply-e2e], 'store-it context waits for the single execution')
+assert.call(aggregator['if'], producer['if'], 'both contexts share one skip predicate')
+assert.call(producer.fetch('timeout-minutes'), 75, 'producer headroom for one full sweep')
+agg_run = aggregator.fetch('steps').first.fetch('run')
+assert.call(aggregator.fetch('steps').first.fetch('env'), {'PRODUCER_RESULT' => "${{ needs['test-codex-refresh-lostreply-e2e'].result }}"}, 'aggregator reads the producer result')
+{'success' => true, 'failure' => false, 'cancelled' => false, 'skipped' => false, '' => false}.each do |result, ok|
+  _, _, status = Open3.capture3({'PRODUCER_RESULT' => result}, 'bash', '-e', '-c', agg_run)
+  assert.call(status.success?, ok, "store-it context for producer result #{result.inspect}")
+end
+# Producer failure/cancellation must still run the aggregator (so its context is red,
+# not skipped); a producer skipped with the aggregator running is red via the check above.
+%w[failure cancelled skipped].each do |result|
+  assert.call(run_job.call('test-api-store-it', 'needs.test-codex-refresh-lostreply-e2e.result' => result), false, 'safe PR skips both contexts together')
+  assert.call(run_job.call('test-api-store-it', 'needs.test-codex-refresh-lostreply-e2e.result' => result, 'needs.changes.outputs.skip_components' => '0'), true, "aggregator runs after producer #{result}")
+end
 brew_workflow = YAML.safe_load(File.read(File.join(root, '.github/workflows/brew.yml')))
 assert.call(brew_workflow['concurrency'], nil, 'publication proof runs without the tap lock')
 brew = brew_workflow.fetch('jobs')

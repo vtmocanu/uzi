@@ -521,6 +521,8 @@ custody beyond the noncredential blocked-proof cap. These are not substitutes fo
 target. A maintainer-only follow-up must wire it into `.github/workflows/ci.yml` with the Node
 and agent prerequisites; workflow wiring is outside this change.
 
+Note (2026-11-04): CI runs the dedicated target once, in `test-codex-refresh-lostreply-e2e`, on a Postgres pinned by digest. That single execution is also the LiveDB sweep behind the required `test-api-store-it` context, which now only requires the producer's success (the former duplicate sweep is gone). The sweep-then-combined-proof order on the same database, and this acceptance contract, are unchanged.
+
 The dedicated target, including LiveDB, remains required acceptance before merge. If Docker is
 actually unavailable, record blocked/not run rather than passed and leave acceptance required
 for the maintainer. An executed red result blocks merge. This is an enforcement requirement,
