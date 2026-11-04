@@ -35,6 +35,15 @@ function gitIn(dir: string, args: string[]): string {
   return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", env: GIT_ENV, stdio: ["pipe", "pipe", "pipe"] }).trim();
 }
 
+/** Written by the shim only once its whole stderr flood was accepted (i.e. drained). */
+function ackPath(): string {
+  return path.join(shimDir, "flood-written");
+}
+
+function assertFloodDrained(): void {
+  assert.ok(fs.existsSync(ackPath()), `the shim's full ${FLOOD_BYTES}-byte stderr write did not complete`);
+}
+
 function realGit(): string {
   return execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
 }
@@ -58,7 +67,9 @@ for a in "$@"; do
 done
 case "$sub" in
   bundle|pack-objects)
-    head -c ${FLOOD_BYTES} /dev/zero | tr '\\0' e >&2
+    # The ack is written only after all ${FLOOD_BYTES} bytes reached stderr: a collector that
+    # closed the pipe early would SIGPIPE tr and leave no ack.
+    if head -c ${FLOOD_BYTES} /dev/zero | tr '\\0' e >&2; then : > '${ackPath()}'; fi
     exit 3 ;;
 esac
 exec "$real" "$@"
@@ -117,6 +128,7 @@ describe("streaming git producers cap retained stderr", () => {
         60_000,
       );
       assertCappedFlood(err instanceof Error ? err.message : String(err));
+      assertFloodDrained();
     } finally {
       removeShim();
     }
@@ -140,6 +152,7 @@ describe("streaming git producers cap retained stderr", () => {
       );
       assert.ok(err instanceof RunnerCloneImportError, `unexpected error type: ${String(err)}`);
       assertCappedFlood(err.message);
+      assertFloodDrained();
     } finally {
       removeShim();
     }

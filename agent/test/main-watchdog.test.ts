@@ -26,7 +26,9 @@ function run(file: string, args: string[] = []): Child {
   let carry = "";
   const child: Child = {
     proc, lines, stdout: "",
-    exited: new Promise((resolve) => proc.on("exit", (code) => resolve(code))),
+    // "close", not "exit": close fires only after stdout and stderr have both ended, so
+    // assertions on captured output never race the last chunks.
+    exited: new Promise((resolve) => proc.on("close", (code) => resolve(code))),
     waitFor(pred, what, ms = 20_000) {
       const seen = lines.find(pred);
       if (seen !== undefined) return Promise.resolve(seen);
