@@ -111,7 +111,7 @@ func TestHealthOwnerHoldDisabledAndPrecedence(t *testing.T) {
 					r.EgressProfileID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
 					want = reasonWaitingIsolatedLane
 				}
-				if age < th.queued {
+				if age < th.queued && block != "custody" {
 					want = ""
 				}
 				flag, reason := svc.healthTargetFor(context.Background(), t0, r, th)

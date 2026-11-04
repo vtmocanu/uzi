@@ -611,7 +611,7 @@ func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Querie
 		return false, err
 	}
 	pending := s.validatePendingAll(locked, snap)
-	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{}, pending.ids)
+	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, pending.ids)
 	if err != nil {
 		return false, err
 	}

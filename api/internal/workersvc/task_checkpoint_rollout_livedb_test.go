@@ -400,7 +400,7 @@ func rolloutRecoveryTx(t *testing.T, f *custodyContinuationFixture, ids []uuid.U
 	for i, id := range ids {
 		entries[i] = validatedEntry{runID: id}
 	}
-	locks, err := captureWorkerRecoveryLocks(f.env.ctx, q, f.workerID, entries, validatedFinalizeResume{})
+	locks, err := captureWorkerRecoveryLocks(f.env.ctx, q, f.workerID, entries)
 	if err != nil {
 		t.Fatal(err)
 	}

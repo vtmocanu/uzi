@@ -1082,7 +1082,7 @@ func TestHealthQueuedRepoNotDockerAllowedEarly(t *testing.T) {
 		lockedVault  bool
 		capGap       bool
 		wantReason   string // "" = healthOK
-		wantNoLadder bool   // priority/caps/custody/owner lookups all zero
+		wantNoLadder bool   // only the required custody lookup, not the discarded fleet tail
 	}{
 		{name: "regression non-admin", online: 1, wantReason: reasonRepoNotDockerAllowedMember},
 		{name: "admin owner", online: 1, owner: store.User{IsAdmin: true}, wantReason: reasonRepoNotDockerAllowedAdmin},
@@ -1142,12 +1142,19 @@ func TestHealthQueuedRepoNotDockerAllowedEarly(t *testing.T) {
 					t.Fatalf("got %q/%q, want waiting_worker/%q", w.Health, w.HealthReason.String, tc.wantReason)
 				}
 			}
+			wantCustody := 1
+			if tc.queued == -1 || tc.lockedVault {
+				wantCustody = 0
+			}
+			if len(fs.custodyRunCalls) != wantCustody {
+				t.Fatalf("custody prefix reads=%d want=%d, including the gated Docker path", len(fs.custodyRunCalls), wantCustody)
+			}
 			if tc.wantNoLadder {
-				if n := len(fs.priorityCalls) + len(fs.capsCalls) + len(fs.custodyRunCalls) + len(fs.ownerCalls); n != 0 {
-					t.Fatalf("issued %d ladder lookups (priority %d, caps %d, custody %d, owner %d), want 0",
-						n, len(fs.priorityCalls), len(fs.capsCalls), len(fs.custodyRunCalls), len(fs.ownerCalls))
+				if len(fs.custodyRunCalls) != wantCustody || len(fs.ownerCalls) != 0 || len(fs.priorityCalls) != 0 || len(fs.capsCalls) != 0 {
+					t.Fatalf("custody=%d owner=%d priority=%d caps=%d, want %d/0/0/0", len(fs.custodyRunCalls), len(fs.ownerCalls), len(fs.priorityCalls), len(fs.capsCalls), wantCustody)
 				}
 			}
+
 		})
 	}
 }
