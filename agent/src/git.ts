@@ -2434,6 +2434,9 @@ type EpochDiscardProofState = Omit<EpochDiscardProofOptions, "decision">;
 
 /** Internal content-proof mode; epoch inspection alone never selects it. */
 class AutomaticCompletenessUnknown extends Error {}
+// A fully observed, explicitly forbidden source setting is a settled keep;
+// it is not an incomplete observation of an admitted object store.
+class AutomaticContentRefusal extends Error {}
 
 interface AutomaticPreservation {
   checkLive: () => void;
@@ -11029,6 +11032,8 @@ export class GitCache {
         this.automaticCollection(parsed.stdout, "\0");
         for (const row of parsed.stdout.split("\0")) {
           const [key, value] = row.split("\n");
+          if (root === source && (key?.startsWith("include.") || key?.startsWith("includeif.")))
+            throw new AutomaticContentRefusal("source config indirection is not eligible");
           if (key === "extensions.compatobjectformat" || key === "extensions.objectformat" && value !== "sha1" ||
               key === "extensions.refstorage" || key === "extensions.worktreeconfig" ||
               key === "core.worktree" || key?.startsWith("include.") || key?.startsWith("includeif."))
@@ -11230,7 +11235,7 @@ export class GitCache {
         }
       };
     } catch (error) {
-      if (error instanceof AutomaticCompletenessUnknown) throw error;
+      if (error instanceof AutomaticCompletenessUnknown || error instanceof AutomaticContentRefusal) throw error;
       throw new AutomaticCompletenessUnknown("object completeness unavailable", { cause: error });
     }
   }
