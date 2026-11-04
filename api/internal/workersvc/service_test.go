@@ -339,7 +339,8 @@ type fakeStore struct {
 	sweptClaimed []store.SweepClaimedNeverStartedRow
 	// Issue #3859: the claimed-never-started charge pass and the registration evidence write.
 	chargedClaimed     []store.ChargeClaimedNeverStartedContinuationsRow
-	chargeArg          *store.ChargeClaimedNeverStartedContinuationsParams
+	cohortArg          *store.SweepClaimedNeverStartedCohortParams
+	unwitnessedClaimed []store.ParkUnwitnessedContinuationsRow
 	chargeErr          error
 	evidenceArgs       []store.RecordRunRegistrationEvidenceParams
 	evidenceRows       int64
@@ -1416,19 +1417,15 @@ func (f *fakeStore) MarkStaleWorkersOffline(_ context.Context, cutoff pgtype.Tim
 	f.callOrder = append(f.callOrder, "mark_stale")
 	return 0, nil
 }
-func (f *fakeStore) ChargeClaimedNeverStartedContinuations(_ context.Context, arg store.ChargeClaimedNeverStartedContinuationsParams) ([]store.ChargeClaimedNeverStartedContinuationsRow, error) {
-	f.chargeArg = &arg
-	f.callOrder = append(f.callOrder, "charge_claimed_never_started")
-	return f.chargedClaimed, f.chargeErr
+func (f *fakeStore) SweepClaimedNeverStartedCohort(_ context.Context, arg store.SweepClaimedNeverStartedCohortParams) (store.SweepClaimedNeverStartedCohortResult, error) {
+	f.cohortArg = &arg
+	f.claimCutoff = arg.Cutoff
+	f.callOrder = append(f.callOrder, "claimed_never_started")
+	return store.SweepClaimedNeverStartedCohortResult{Charged: f.chargedClaimed, Unwitnessed: f.unwitnessedClaimed, Reset: f.sweptClaimed}, f.chargeErr
 }
 func (f *fakeStore) RecordRunRegistrationEvidence(_ context.Context, arg store.RecordRunRegistrationEvidenceParams) (int64, error) {
 	f.evidenceArgs = append(f.evidenceArgs, arg)
 	return f.evidenceRows, f.evidenceErr
-}
-func (f *fakeStore) SweepClaimedNeverStarted(_ context.Context, cutoff pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error) {
-	f.claimCutoff = cutoff
-	f.callOrder = append(f.callOrder, "claimed_never_started")
-	return f.sweptClaimed, nil
 }
 func (f *fakeStore) SweepTaskNeverDispatched(_ context.Context, arg store.SweepTaskNeverDispatchedParams) ([]store.SweepTaskNeverDispatchedRow, error) {
 	f.taskDispatchCutoff = arg.Cutoff
@@ -4255,7 +4252,7 @@ func TestSweepComputesCutoffsAndOrder(t *testing.T) {
 	// BEFORE both stale_fail_over_cap and stale_requeue (D5), so a dead worker's out-of-time run parks
 	// (preserving its work) instead of being failed over cap or requeued. issue #1367: the
 	// undispatched-handoff reaper runs right after claimed_never_started, before the wall-park passes.
-	want := []string{"mark_stale", "charge_claimed_never_started", "claimed_never_started", "task_never_dispatched", "wall_park_request", "stamp_budget_exhausted", "wall_park", "stale_fail_over_cap", "stale_requeue"}
+	want := []string{"mark_stale", "claimed_never_started", "task_never_dispatched", "wall_park_request", "stamp_budget_exhausted", "wall_park", "stale_fail_over_cap", "stale_requeue"}
 	if strings.Join(fs.callOrder, ",") != strings.Join(want, ",") {
 		t.Fatalf("sweep order = %v, want %v", fs.callOrder, want)
 	}

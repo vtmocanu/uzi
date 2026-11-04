@@ -17,46 +17,52 @@ import (
 // validation. The SQL itself is proved by claimed_never_started_charge_livedb_test.go.
 
 func TestSweepChargesClaimedNeverStartedContinuations(t *testing.T) {
-	charged, exhausted := uuid.New(), uuid.New()
-	fs := &fakeStore{chargedClaimed: []store.ChargeClaimedNeverStartedContinuationsRow{
-		{ID: charged, UserID: uuid.New(), Status: "queued"},
-		{ID: exhausted, UserID: uuid.New(), Status: "recovery_wait"},
-	}}
+	charged, exhausted, unwitnessed := uuid.New(), uuid.New(), uuid.New()
+	fs := &fakeStore{
+		chargedClaimed: []store.ChargeClaimedNeverStartedContinuationsRow{
+			{ID: charged, UserID: uuid.New(), Status: "queued"},
+			{ID: exhausted, UserID: uuid.New(), Status: "recovery_wait"},
+		},
+		unwitnessedClaimed: []store.ParkUnwitnessedContinuationsRow{{ID: unwitnessed, UserID: uuid.New(), Status: "recovery_wait"}},
+	}
 	svc := New(fs, newBox(t), testParams())
 	spy := &stateSpy{}
 	svc.SetBroadcaster(spy)
-	svc.now = func() time.Time { return time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC) }
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
 
 	res, err := svc.Sweep(context.Background())
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if res.ClaimedCharged != 1 || res.ClaimedExhausted != 1 || res.ClaimedReset != 0 {
-		t.Fatalf("result = %+v, want one charge, one exhaustion and no uncharged reset", res)
+	if res.ClaimedCharged != 1 || res.ClaimedExhausted != 1 || res.ClaimedUnwitnessed != 1 || res.ClaimedReset != 0 {
+		t.Fatalf("result = %+v, want one charge, one exhaustion, one unwitnessed park and no uncharged reset", res)
 	}
-	if fs.chargeArg == nil || int(fs.chargeArg.MaxRequeues) != testParams().RunMaxRequeues {
-		t.Fatalf("charge args = %+v, want MaxRequeues %d", fs.chargeArg, testParams().RunMaxRequeues)
+	if fs.cohortArg == nil || int(fs.cohortArg.MaxRequeues) != testParams().RunMaxRequeues {
+		t.Fatalf("cohort args = %+v, want MaxRequeues %d", fs.cohortArg, testParams().RunMaxRequeues)
 	}
-	// The SAME cutoff as the uncharged sweep, so the two statements partition one candidate set.
-	if !fs.chargeArg.Cutoff.Time.Equal(fs.claimCutoff.Time) || !fs.claimCutoff.Valid {
-		t.Fatalf("charge cutoff %v differs from the sweep cutoff %v", fs.chargeArg.Cutoff, fs.claimCutoff)
+	// One cohort, one grace cutoff; the witness window is twice the grace, no new knob.
+	grace := testParams().ClaimGrace
+	if !fs.cohortArg.Cutoff.Time.Equal(now.Add(-grace)) || !fs.cohortArg.WitnessCutoff.Time.Equal(now.Add(-2*grace)) ||
+		fs.cohortArg.WitnessWindowSeconds != (2*grace).Seconds() {
+		t.Fatalf("cohort cutoffs = %+v, want grace %v and a 2x witness window", fs.cohortArg, grace)
 	}
-	for id, want := range map[uuid.UUID]string{charged: "queued", exhausted: "recovery_wait"} {
+	for id, want := range map[uuid.UUID]string{charged: "queued", exhausted: "recovery_wait", unwitnessed: "recovery_wait"} {
 		if got, ok := spy.statusFor(id); !ok || got != want {
 			t.Fatalf("publish for %s = (%q, %v), want (%q, true)", id, got, ok, want)
 		}
 	}
 }
 
-func TestSweepChargeFailureStopsBeforeTheUnchargedReset(t *testing.T) {
+func TestSweepClaimedNeverStartedCohortFailureStopsTheSweep(t *testing.T) {
 	fs := &fakeStore{chargeErr: errors.New("boom")}
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.Sweep(context.Background()); err == nil {
-		t.Fatal("Sweep succeeded although the charge pass failed")
+		t.Fatal("Sweep succeeded although the claimed-never-started cohort failed")
 	}
 	for _, call := range fs.callOrder {
-		if call == "claimed_never_started" {
-			t.Fatalf("the uncharged reset ran after a failed charge pass: %v", fs.callOrder)
+		if call == "task_never_dispatched" {
+			t.Fatalf("a later pass ran after the failed cohort: %v", fs.callOrder)
 		}
 	}
 }

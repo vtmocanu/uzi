@@ -66,16 +66,20 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		}
 	}
 
-	// Issue #3859: a retained-custody continuation whose flight provably departed without ever
-	// reporting running is charged (and at the cap parked) BEFORE the uncharged reset below,
-	// which excludes exactly these runs. No judge: neither disposition is a failure.
-	charged, err := s.q.ChargeClaimedNeverStartedContinuations(ctx, store.ChargeClaimedNeverStartedContinuationsParams{
-		Cutoff: claimCutoff, MaxRequeues: max,
+	// Issue #3859: the claimed-never-started passes run as ONE transaction (workers, then runs,
+	// then cross_checks): a retained-custody continuation whose flight provably departed is
+	// charged (at the cap parked), one still inside its bounded witness window is deferred, one
+	// past it is parked unwitnessed, and everything else is reset uncharged as before. No judge:
+	// none of these dispositions is a failure.
+	witnessWindow := 2 * s.p.ClaimGrace
+	cohort, err := s.q.SweepClaimedNeverStartedCohort(ctx, store.SweepClaimedNeverStartedCohortParams{
+		Cutoff: claimCutoff, WitnessCutoff: pgconv.Time(now.Add(-witnessWindow)),
+		WitnessWindowSeconds: witnessWindow.Seconds(), MaxRequeues: max,
 	})
 	if err != nil {
-		return res, fmt.Errorf("charge claimed-never-started continuations: %w", err)
+		return res, fmt.Errorf("sweep claimed-never-started: %w", err)
 	}
-	for _, r := range charged {
+	for _, r := range cohort.Charged {
 		if r.Status == "recovery_wait" {
 			res.ClaimedExhausted++
 		} else {
@@ -84,13 +88,13 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		s.publishSwept(r.ID, r.Status)
 		s.persistFail.evict(r.ID)
 	}
-
-	claimed, err := s.q.SweepClaimedNeverStarted(ctx, claimCutoff)
-	if err != nil {
-		return res, fmt.Errorf("sweep claimed-never-started: %w", err)
+	res.ClaimedUnwitnessed = int64(len(cohort.Unwitnessed))
+	for _, r := range cohort.Unwitnessed {
+		s.publishSwept(r.ID, r.Status)
+		s.persistFail.evict(r.ID)
 	}
-	res.ClaimedReset = int64(len(claimed))
-	for _, r := range claimed {
+	res.ClaimedReset = int64(len(cohort.Reset))
+	for _, r := range cohort.Reset {
 		s.publishSwept(r.ID, r.Status)
 		// A fresh attempt starts with no evidence against it (PRD #108 M5). See the
 		// requeue loop below for the argument; this reset is the same event.

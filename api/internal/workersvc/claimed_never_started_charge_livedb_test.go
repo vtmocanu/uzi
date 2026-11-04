@@ -258,8 +258,10 @@ func TestClaimedNeverStartedChargeShortLivedLoopLiveDB(t *testing.T) {
 			}
 		case gen <= max+1:
 			f.assertQueued(t, run, int32(gen-1), "charged")
-			if r := f.run(t, run); string(r.CodexCapHash) != string(capBefore) || r.CodexClaimEpoch != epochBefore {
-				t.Fatalf("gen %d: charged arm touched the codex capability", gen)
+			// The charged arm revokes the Codex capability like FrozenRequeue: the flight that held
+			// it is gone, so a stale capability must not stay replayable.
+			if r := f.run(t, run); r.CodexCapHash != nil || r.CodexClaimEpoch != epochBefore+1 {
+				t.Fatalf("gen %d: charged arm cap=%v epoch=%d, want the capability revoked and epoch %d", gen, r.CodexCapHash, r.CodexClaimEpoch, epochBefore+1)
 			}
 			if sw.ClaimedCharged < 1 {
 				t.Fatalf("gen %d sweep = %+v, want a charge", gen, sw)
@@ -584,11 +586,9 @@ func TestClaimedNeverStartedChargePreClaimSnapshotLiveDB(t *testing.T) {
 				t.Fatalf("a pre-claim snapshot stamped %+v", d)
 			}
 			f.sweep(t)
-			r := f.run(t, run)
-			if r.Status == "recovery_wait" || r.RequeueCount != max || r.ClaimReleasedAt.Valid || string(r.CodexCapHash) != string(capBefore) {
-				t.Fatalf("status=%s count=%d released=%v cap kept=%v, want no charge, no park, claim and capability kept",
-					r.Status, r.RequeueCount, r.ClaimReleasedAt.Valid, string(r.CodexCapHash) == string(capBefore))
-			}
+			// Presence under the current registration, no stamp, window long passed: the bounded
+			// witness wait ends in the unwitnessed park, never a charge and never an exhaustion park.
+			f.assertUnwitnessedPark(t, run, max, "pre-claim snapshot")
 		})
 	}
 }
@@ -629,19 +629,19 @@ func TestClaimedNeverStartedChargeFailClosedControlsLiveDB(t *testing.T) {
 		return f, id, capHash
 	}
 	t.Run("the flight is listed", func(t *testing.T) {
-		f, id, capHash := run(t)
+		f, id, _ := run(t)
 		f.heartbeat(t, f.next(), f.nonce, ActiveRunEntry{RunID: id.String(), ClaimGeneration: 2, Phase: "running"})
 		f.sweep(t)
-		f.assertFailClosed(t, id, max, capHash, "listed")
+		f.assertUnwitnessedPark(t, id, max, "listed")
 	})
 	t.Run("no snapshot ever applied", func(t *testing.T) {
-		f, id, capHash := run(t)
+		f, id, _ := run(t)
 		f.evidenceReport(t, id, 2, f.nonce, f.next())
 		f.sweep(t)
-		f.assertFailClosed(t, id, max, capHash, "evidence only")
+		f.assertUnwitnessedPark(t, id, max, "evidence only")
 	})
 	t.Run("only rejected snapshots", func(t *testing.T) {
-		f, id, capHash := run(t)
+		f, id, _ := run(t)
 		f.evidenceReport(t, id, 2, f.nonce, f.next())
 		accepted := f.acceptedEpoch(t)
 		f.heartbeat(t, f.next()+100, "wrong-nonce") // rejected: another incarnation
@@ -654,15 +654,15 @@ func TestClaimedNeverStartedChargeFailClosedControlsLiveDB(t *testing.T) {
 			t.Fatalf("a rejected snapshot stamped %+v", d)
 		}
 		f.sweep(t)
-		f.assertFailClosed(t, id, max, capHash, "rejected snapshots")
+		f.assertUnwitnessedPark(t, id, max, "rejected snapshots")
 	})
 	t.Run("snapshot-less heartbeats", func(t *testing.T) {
-		f, id, capHash := run(t)
+		f, id, _ := run(t)
 		f.evidenceReport(t, id, 2, f.nonce, f.next())
 		f.plainHeartbeat(t)
 		f.plainHeartbeat(t)
 		f.sweep(t)
-		f.assertFailClosed(t, id, max, capHash, "snapshot-less heartbeats")
+		f.assertUnwitnessedPark(t, id, max, "snapshot-less heartbeats")
 	})
 	t.Run("unwitnessed: no evidence and never listed", func(t *testing.T) {
 		f, id, capHash := run(t)
@@ -833,7 +833,7 @@ func TestClaimedNeverStartedChargeProtectionsLiveDB(t *testing.T) {
 					t.Fatalf("charge touched a protected run")
 				}
 			}
-			if _, err := f.env.q.SweepClaimedNeverStarted(f.env.ctx, pgconv.Time(time.Now().Add(-time.Minute))); err != nil {
+			if _, err := f.env.q.SweepClaimedNeverStarted(f.env.ctx, store.SweepClaimedNeverStartedParams{Cutoff: pgconv.Time(time.Now().Add(-time.Minute))}); err != nil {
 				t.Fatalf("SweepClaimedNeverStarted: %v", err)
 			}
 			if r := f.run(t, run); r.Status != "claimed" || r.RequeueCount != max || r.ClaimReleasedAt.Valid {

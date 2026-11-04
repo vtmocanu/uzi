@@ -1046,24 +1046,9 @@ func (q *Queries) FrozenRequeueWorkerRuns(ctx context.Context, arg FrozenRequeue
 }
 
 const lockClaimedNeverStartedContinuations = `-- name: LockClaimedNeverStartedContinuations :many
-WITH locked_workers AS MATERIALIZED (
-    SELECT workers.id FROM workers
-    WHERE workers.id IN (SELECT DISTINCT claimed.worker_id FROM runs claimed
-                         WHERE claimed.status = 'claimed' AND claimed.claimed_at < $1
-                           AND claimed.worker_id IS NOT NULL)
-    ORDER BY workers.id
-    FOR UPDATE
-), worker_lock_set AS MATERIALIZED (
-    SELECT COALESCE(array_agg(id), ARRAY[]::uuid[])::uuid[] AS ids FROM locked_workers
-)
 SELECT runs.id FROM runs
-CROSS JOIN worker_lock_set locks
 WHERE runs.status = 'claimed' AND runs.claimed_at < $1
-  AND runs.kind <> 'cross_check'
-  AND runs.worker_id = ANY(locks.ids)
-  AND runs.claim_released_at IS NULL
-  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
-  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+  AND runs.worker_id = ANY($2::uuid[])
   AND (runs.kind = 'chat'
        OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
                        WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
@@ -1071,6 +1056,10 @@ WHERE runs.status = 'claimed' AND runs.claimed_at < $1
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  AND runs.kind <> 'cross_check'
+  AND runs.claim_released_at IS NULL
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
   AND runs.snapshot_departed_generation = runs.claim_generation
   AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.snapshot_register_nonce IS NOT NULL AND runs.snapshot_departed_nonce = w.snapshot_register_nonce AND runs.snapshot_departed_epoch <= w.snapshot_epoch)
@@ -1079,11 +1068,45 @@ ORDER BY runs.id
 FOR UPDATE OF runs
 `
 
-// Lock workers (id order) then qualifying runs (id order), like LockFailRunsOfStaleWorkersOverCap.
-// Leads are the only candidates (a cross_check run never opens a hold, so it cannot satisfy the
-// predicate); the separate writer rechecks everything on a fresh snapshot.
-func (q *Queries) LockClaimedNeverStartedContinuations(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, lockClaimedNeverStartedContinuations, cutoff)
+type LockClaimedNeverStartedContinuationsParams struct {
+	Cutoff          pgtype.Timestamptz `json:"cutoff"`
+	LockedWorkerIds []uuid.UUID        `json:"locked_worker_ids"`
+}
+
+// Charge selection on a fresh snapshot, runs locked in id order; the writer rechecks everything.
+func (q *Queries) LockClaimedNeverStartedContinuations(ctx context.Context, arg LockClaimedNeverStartedContinuationsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockClaimedNeverStartedContinuations, arg.Cutoff, arg.LockedWorkerIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockClaimedNeverStartedWorkers = `-- name: LockClaimedNeverStartedWorkers :many
+SELECT workers.id FROM workers
+WHERE workers.id IN (SELECT DISTINCT claimed.worker_id FROM runs claimed
+                     WHERE claimed.status = 'claimed' AND claimed.claimed_at < $1
+                       AND claimed.worker_id IS NOT NULL)
+ORDER BY workers.id
+FOR UPDATE
+`
+
+// Step 1 of the claimed-never-started cohort: lock (id order) the workers that own a claimed run
+// older than the cutoff, BEFORE any run row, so the lock order is workers, runs, cross_checks.
+func (q *Queries) LockClaimedNeverStartedWorkers(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockClaimedNeverStartedWorkers, cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -1855,6 +1878,58 @@ func (q *Queries) LockFrozenWorkerSnapshotRuns(ctx context.Context, arg LockFroz
 	return items, nil
 }
 
+const lockUnwitnessedContinuations = `-- name: LockUnwitnessedContinuations :many
+SELECT runs.id FROM runs
+WHERE runs.status = 'claimed' AND runs.claimed_at < $1
+  AND runs.worker_id = ANY($2::uuid[])
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  AND runs.kind <> 'cross_check'
+  AND runs.claim_released_at IS NULL
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+  AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+  AND runs.snapshot_departed_generation IS DISTINCT FROM runs.claim_generation
+  AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.status = 'online'
+              AND ((runs.registration_evidence_generation = runs.claim_generation AND runs.registration_evidence_nonce = w.snapshot_register_nonce AND runs.registration_evidence_epoch >= w.snapshot_epoch)
+                   OR EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation AND NOT a.terminal_pending)))
+  AND runs.claimed_at < $3::timestamptz
+ORDER BY runs.id
+FOR UPDATE OF runs
+`
+
+type LockUnwitnessedContinuationsParams struct {
+	Cutoff          pgtype.Timestamptz `json:"cutoff"`
+	LockedWorkerIds []uuid.UUID        `json:"locked_worker_ids"`
+	WitnessCutoff   pgtype.Timestamptz `json:"witness_cutoff"`
+}
+
+// Unwitnessed-park selection (window passed), runs locked in id order; the writer rechecks.
+func (q *Queries) LockUnwitnessedContinuations(ctx context.Context, arg LockUnwitnessedContinuationsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockUnwitnessedContinuations, arg.Cutoff, arg.LockedWorkerIds, arg.WitnessCutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const recordRunRegistrationEvidence = `-- name: RecordRunRegistrationEvidence :execrows
 
 UPDATE runs SET registration_evidence_generation = $1,
@@ -2099,17 +2174,10 @@ UPDATE runs SET
         THEN runs.released_worker_id ELSE runs.worker_id END,
     released_worker_nonce = CASE WHEN (runs.requeue_count - runs.requeue_episode_baseline) < $1
         THEN runs.released_worker_nonce ELSE (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id) END,
-    codex_cap_hash = CASE WHEN (runs.requeue_count - runs.requeue_episode_baseline) < $1
-        THEN runs.codex_cap_hash ELSE NULL END,
-    codex_claim_epoch = CASE WHEN (runs.requeue_count - runs.requeue_episode_baseline) < $1
-        THEN runs.codex_claim_epoch ELSE runs.codex_claim_epoch + 1 END,
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     updated_at = now()
 WHERE runs.id = ANY($3::uuid[])
   AND runs.status = 'claimed' AND runs.claimed_at < $4
-  AND runs.kind <> 'cross_check'
-  AND runs.claim_released_at IS NULL
-  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
-  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND (runs.kind = 'chat'
        OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
                        WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
@@ -2117,6 +2185,10 @@ WHERE runs.id = ANY($3::uuid[])
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  AND runs.kind <> 'cross_check'
+  AND runs.claim_released_at IS NULL
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
   AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
   AND runs.snapshot_departed_generation = runs.claim_generation
   AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.snapshot_register_nonce IS NOT NULL AND runs.snapshot_departed_nonce = w.snapshot_register_nonce AND runs.snapshot_departed_epoch <= w.snapshot_epoch)
@@ -2138,11 +2210,16 @@ type chargeClaimedNeverStartedContinuationsLockedRow struct {
 }
 
 // Issue #3859. Charged arm: the run goes back to queued exactly as SweepClaimedNeverStarted
-// would, but with requeue_count + 1 (claim NOT released; worker, capability and epoch kept).
-// Exhausted arm (episode budget spent): recovery_wait / worker_requeue_exhausted with the
-// classifier evidence and the claim released, mirroring the park leg of
-// FrozenFailRunsMissingFromSnapshot with NO budget banking. Never failed: the classifier's park
-// flag is ignored. Holds and worker_id are untouched.
+// would, but with requeue_count + 1, the claim NOT released and worker_id kept, and the Codex
+// claim capability REVOKED (hash cleared, epoch bumped) like FrozenRequeue: the flight that held
+// it is gone, so a stale capability must never be replayable. Exhausted arm (episode budget
+// spent): recovery_wait / worker_requeue_exhausted with the classifier evidence and the claim
+// released, mirroring the park leg of FrozenFailRunsMissingFromSnapshot with NO budget banking.
+// Never failed: the classifier's park flag is ignored. Holds and worker_id are untouched.
+// Only leads are targeted (the predicate excludes cross_check runs); on a release the lead-exit
+// trigger (00312, settle_exited_plan_cross_check) settles and cancels a pending plan checker
+// inside this same UPDATE, so no checker row is written here and the later reset pass finds the
+// checker already terminal.
 func (q *Queries) chargeClaimedNeverStartedContinuationsLocked(ctx context.Context, arg chargeClaimedNeverStartedContinuationsLockedParams) ([]chargeClaimedNeverStartedContinuationsLockedRow, error) {
 	rows, err := q.db.Query(ctx, chargeClaimedNeverStartedContinuationsLocked,
 		arg.MaxRequeues,
@@ -3112,6 +3189,99 @@ func (q *Queries) frozenFailWorkerRunsOverCapLocked(ctx context.Context, arg fro
 	for rows.Next() {
 		var i frozenFailWorkerRunsOverCapLockedRow
 		if err := rows.Scan(&i.ID, &i.Status); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const parkUnwitnessedContinuationsLocked = `-- name: parkUnwitnessedContinuationsLocked :many
+UPDATE runs SET
+    status = 'recovery_wait', status_since = now(),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    plan_cross_check_gate_reason = NULL, failure_reason = NULL, fail_origin = NULL,
+    milestones_in_progress = NULL, milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    recovery_wait_cause = 'retained_continuation_unwitnessed',
+    worker_recovery_evidence = ($1::jsonb->runs.id::text->'evidence') || jsonb_build_object(
+        'presence', CASE WHEN runs.registration_evidence_generation = runs.claim_generation
+                              AND runs.registration_evidence_nonce = (SELECT w.snapshot_register_nonce FROM workers w WHERE w.id = runs.worker_id)
+                              AND runs.registration_evidence_epoch >= (SELECT w.snapshot_epoch FROM workers w WHERE w.id = runs.worker_id)
+                         THEN 'p1' ELSE 'p2' END,
+        'registration_evidence_epoch', runs.registration_evidence_epoch,
+        'worker_snapshot_epoch', (SELECT w.snapshot_epoch FROM workers w WHERE w.id = runs.worker_id),
+        'deadline', runs.claimed_at + make_interval(secs => $2::float8)),
+    recovery_retry_not_before = NULL, stale_requeue_generation = NULL,
+    claim_released_at = now(), released_worker_id = runs.worker_id,
+    released_worker_nonce = (SELECT snapshot_register_nonce FROM workers WHERE id = runs.worker_id),
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
+    updated_at = now()
+WHERE runs.id = ANY($3::uuid[])
+  AND runs.status = 'claimed' AND runs.claimed_at < $4
+  AND (runs.kind = 'chat'
+       OR (NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                       WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                         AND a.terminal_pending_until > now()
+                         AND a.claim_generation = runs.claim_generation)
+           AND NOT EXISTS (SELECT 1 FROM workers w
+                           WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  AND runs.kind <> 'cross_check'
+  AND runs.claim_released_at IS NULL
+  AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+  AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+  AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+  AND runs.snapshot_departed_generation IS DISTINCT FROM runs.claim_generation
+  AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.status = 'online'
+              AND ((runs.registration_evidence_generation = runs.claim_generation AND runs.registration_evidence_nonce = w.snapshot_register_nonce AND runs.registration_evidence_epoch >= w.snapshot_epoch)
+                   OR EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation AND NOT a.terminal_pending)))
+  AND runs.claimed_at < $5::timestamptz
+RETURNING runs.id, runs.user_id, runs.status
+`
+
+type parkUnwitnessedContinuationsLockedParams struct {
+	ExhaustionEvidence   []byte             `json:"exhaustion_evidence"`
+	WitnessWindowSeconds float64            `json:"witness_window_seconds"`
+	LockedRunIds         []uuid.UUID        `json:"locked_run_ids"`
+	Cutoff               pgtype.Timestamptz `json:"cutoff"`
+	WitnessCutoff        pgtype.Timestamptz `json:"witness_cutoff"`
+}
+
+type parkUnwitnessedContinuationsLockedRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Status string    `json:"status"`
+}
+
+// Issue #3859, bounded witness wait. The window has passed (claimed_at < @witness_cutoff) and the
+// run still has presence under the worker's current registration but no departure stamp: the
+// flight cannot be shown to have departed, so charging would be a guess and resetting would loop.
+// Park it for the owner at recovery_wait / retained_continuation_unwitnessed with the claim
+// released and the Codex capability revoked. NOT a charge (requeue_count unchanged), NOT a
+// departure stamp; holds, sources and journals are untouched. The classifier's park flag is
+// ignored (never failed). The observation is stored next to the historic evidence snapshot.
+// Only leads are targeted; the lead-exit trigger (00312) settles a pending plan checker inside
+// this UPDATE, exactly as for the charge writer's release arm.
+func (q *Queries) parkUnwitnessedContinuationsLocked(ctx context.Context, arg parkUnwitnessedContinuationsLockedParams) ([]parkUnwitnessedContinuationsLockedRow, error) {
+	rows, err := q.db.Query(ctx, parkUnwitnessedContinuationsLocked,
+		arg.ExhaustionEvidence,
+		arg.WitnessWindowSeconds,
+		arg.LockedRunIds,
+		arg.Cutoff,
+		arg.WitnessCutoff,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []parkUnwitnessedContinuationsLockedRow{}
+	for rows.Next() {
+		var i parkUnwitnessedContinuationsLockedRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.Status); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

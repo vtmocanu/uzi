@@ -706,7 +706,7 @@ func TestSweepClaimedNeverStartedCodexPreservationLiveDB(t *testing.T) {
 		t.Fatalf("GetRunByID(plain before): %v", err)
 	}
 
-	if _, err := q.SweepClaimedNeverStarted(ctx, cutoff); err != nil {
+	if _, err := q.SweepClaimedNeverStarted(ctx, store.SweepClaimedNeverStartedParams{Cutoff: cutoff}); err != nil {
 		t.Fatalf("SweepClaimedNeverStarted: %v", err)
 	}
 
@@ -778,7 +778,8 @@ func TestSweepClaimedNeverStartedCodexPreservationLiveDB(t *testing.T) {
 
 	// Issue #3859: a retained-custody continuation whose flight provably departed is charged by
 	// ChargeClaimedNeverStartedContinuations BEFORE the uncharged sweep above would see it. The
-	// charged arm keeps the capability and epoch exactly as the sweep does; the exhausted park
+	// charged arm revokes the capability and bumps the epoch like FrozenRequeue (the departed
+	// flight's capability must not stay replayable) but keeps the claim; the exhausted park
 	// revokes the capability, bumps the epoch and releases the claim.
 	nonce := "departed-" + uuid.NewString()
 	mustExec(ctx, t, pool, `UPDATE workers SET snapshot_register_nonce = $2, snapshot_epoch = 5 WHERE id = $1`, worker, nonce)
@@ -790,7 +791,7 @@ func TestSweepClaimedNeverStartedCodexPreservationLiveDB(t *testing.T) {
 		wantEpoch  int64
 		released   bool
 	}{
-		{"charged", 0, "queued", "live-cap", 9, false},
+		{"charged", 0, "queued", "", 10, false},
 		{"parked", 1, "recovery_wait", "", 10, true},
 	} {
 		run := insertCodexRun(ctx, t, pool, user, repo, worker, int64(303+i), "claimed", "continuation-"+tc.name)

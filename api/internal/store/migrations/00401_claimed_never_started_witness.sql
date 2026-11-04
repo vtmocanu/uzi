@@ -19,6 +19,29 @@ ALTER TABLE runs
     ADD COLUMN snapshot_departed_nonce text,
     ADD COLUMN snapshot_departed_epoch bigint;
 
+-- The unwitnessed park (retained_continuation_unwitnessed) records its observation next to the
+-- historic exhaustion snapshot, so the evidence check admits four optional keys.
+ALTER TABLE runs DROP CONSTRAINT runs_worker_recovery_evidence_check;
+ALTER TABLE runs ADD CONSTRAINT runs_worker_recovery_evidence_check CHECK (
+    worker_recovery_evidence IS NULL OR (
+        jsonb_typeof(worker_recovery_evidence) = 'object'
+        AND worker_recovery_evidence ?& ARRAY['checkpoint_tip','available_capture','publication_uncertain','capture_uncertain','custody_uncertain','unknown','recorded_at']
+        AND worker_recovery_evidence - ARRAY['checkpoint_tip','available_capture','publication_uncertain','capture_uncertain','custody_uncertain','unknown','recorded_at','presence','registration_evidence_epoch','worker_snapshot_epoch','deadline'] = '{}'::jsonb
+        AND (worker_recovery_evidence->'checkpoint_tip' = 'null'::jsonb OR
+             (jsonb_typeof(worker_recovery_evidence->'checkpoint_tip') = 'string'
+              AND worker_recovery_evidence->>'checkpoint_tip' ~ '^[0-9a-f]{40}$'))
+        AND jsonb_typeof(worker_recovery_evidence->'available_capture') = 'boolean'
+        AND jsonb_typeof(worker_recovery_evidence->'publication_uncertain') = 'boolean'
+        AND jsonb_typeof(worker_recovery_evidence->'capture_uncertain') = 'boolean'
+        AND jsonb_typeof(worker_recovery_evidence->'custody_uncertain') = 'boolean'
+        AND jsonb_typeof(worker_recovery_evidence->'unknown') = 'boolean'
+        AND jsonb_typeof(worker_recovery_evidence->'recorded_at') = 'string'
+        AND length(worker_recovery_evidence->>'recorded_at') BETWEEN 20 AND 40
+        AND (NOT worker_recovery_evidence ? 'presence' OR worker_recovery_evidence->>'presence' IN ('p1', 'p2'))
+        AND pg_column_size(worker_recovery_evidence) <= 1024
+    )
+);
+
 -- New recovery cause: a retained continuation whose first running report was refused and whose
 -- worker flight departed without a witness (parked for the owner; no automatic retry).
 ALTER TABLE runs DROP CONSTRAINT runs_recovery_wait_cause_check;
@@ -47,6 +70,28 @@ $$;
 -- +goose StatementEnd
 
 -- +goose Down
+-- The extra observation keys are not representable by the prior check: drop them first.
+UPDATE runs SET worker_recovery_evidence = worker_recovery_evidence - ARRAY['presence','registration_evidence_epoch','worker_snapshot_epoch','deadline']
+WHERE worker_recovery_evidence ? 'presence';
+ALTER TABLE runs DROP CONSTRAINT runs_worker_recovery_evidence_check;
+ALTER TABLE runs ADD CONSTRAINT runs_worker_recovery_evidence_check CHECK (
+    worker_recovery_evidence IS NULL OR (
+        jsonb_typeof(worker_recovery_evidence) = 'object'
+        AND worker_recovery_evidence ?& ARRAY['checkpoint_tip','available_capture','publication_uncertain','capture_uncertain','custody_uncertain','unknown','recorded_at']
+        AND worker_recovery_evidence - ARRAY['checkpoint_tip','available_capture','publication_uncertain','capture_uncertain','custody_uncertain','unknown','recorded_at'] = '{}'::jsonb
+        AND (worker_recovery_evidence->'checkpoint_tip' = 'null'::jsonb OR
+             (jsonb_typeof(worker_recovery_evidence->'checkpoint_tip') = 'string'
+              AND worker_recovery_evidence->>'checkpoint_tip' ~ '^[0-9a-f]{40}$'))
+        AND jsonb_typeof(worker_recovery_evidence->'available_capture') = 'boolean'
+        AND jsonb_typeof(worker_recovery_evidence->'publication_uncertain') = 'boolean'
+        AND jsonb_typeof(worker_recovery_evidence->'capture_uncertain') = 'boolean'
+        AND jsonb_typeof(worker_recovery_evidence->'custody_uncertain') = 'boolean'
+        AND jsonb_typeof(worker_recovery_evidence->'unknown') = 'boolean'
+        AND jsonb_typeof(worker_recovery_evidence->'recorded_at') = 'string'
+        AND length(worker_recovery_evidence->>'recorded_at') BETWEEN 20 AND 40
+        AND pg_column_size(worker_recovery_evidence) <= 1024
+    )
+);
 -- Non-terminal reversal: a run parked at the new cause moves to retained_recovery_exhausted
 -- with no retry stamp, the owner-held park the pre-00401 code already understands (Resume or
 -- Cancel). The run, its claim and its custody hold are untouched, so no work is failed or lost.

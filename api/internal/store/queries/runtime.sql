@@ -5632,10 +5632,29 @@ WITH candidates AS MATERIALIZED (
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-  AND NOT (EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+  -- Issue #3859: a charge-eligible continuation is the charge pass's, never an uncharged reset;
+  -- and a continuation still inside the bounded witness window with presence under the worker's
+  -- current registration is DEFERRED. COALESCE makes a NULL witness never exclude (a NULL
+  -- departure stamp would otherwise turn the exclusion NULL and strand the run). A NULL
+  -- @witness_cutoff disables the deferral.
+  AND NOT COALESCE((runs.kind <> 'cross_check'
+      AND runs.claim_released_at IS NULL
+      AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+      AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
       AND runs.snapshot_departed_generation = runs.claim_generation
       AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.snapshot_register_nonce IS NOT NULL AND runs.snapshot_departed_nonce = w.snapshot_register_nonce AND runs.snapshot_departed_epoch <= w.snapshot_epoch)
-      AND NOT EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation))
+      AND NOT EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation)), false)
+  AND NOT COALESCE((runs.kind <> 'cross_check'
+      AND runs.claim_released_at IS NULL
+      AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+      AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+      AND runs.snapshot_departed_generation IS DISTINCT FROM runs.claim_generation
+      AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.status = 'online'
+                  AND ((runs.registration_evidence_generation = runs.claim_generation AND runs.registration_evidence_nonce = w.snapshot_register_nonce AND runs.registration_evidence_epoch >= w.snapshot_epoch)
+                       OR EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation AND NOT a.terminal_pending)))
+      AND runs.claimed_at >= @witness_cutoff::timestamptz), false)
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -5714,6 +5733,25 @@ WHERE runs.status = 'claimed' AND runs.claimed_at < @cutoff
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  -- Issue #3859: the same two exclusions, rechecked against the locked row.
+  AND NOT COALESCE((runs.kind <> 'cross_check'
+      AND runs.claim_released_at IS NULL
+      AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+      AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+      AND runs.snapshot_departed_generation = runs.claim_generation
+      AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.snapshot_register_nonce IS NOT NULL AND runs.snapshot_departed_nonce = w.snapshot_register_nonce AND runs.snapshot_departed_epoch <= w.snapshot_epoch)
+      AND NOT EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation)), false)
+  AND NOT COALESCE((runs.kind <> 'cross_check'
+      AND runs.claim_released_at IS NULL
+      AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+      AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+      AND runs.snapshot_departed_generation IS DISTINCT FROM runs.claim_generation
+      AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.status = 'online'
+                  AND ((runs.registration_evidence_generation = runs.claim_generation AND runs.registration_evidence_nonce = w.snapshot_register_nonce AND runs.registration_evidence_epoch >= w.snapshot_epoch)
+                       OR EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation AND NOT a.terminal_pending)))
+      AND runs.claimed_at >= @witness_cutoff::timestamptz), false)
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
       SELECT 1 FROM locked_checks cc

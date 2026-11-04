@@ -112,7 +112,7 @@ func outageTerminalWriters() []terminalWriter {
 		}
 	}
 	fireClaimedNeverStarted := func(t *testing.T, env codexTestEnv, workerID, runID uuid.UUID) {
-		if _, err := env.q.SweepClaimedNeverStarted(env.ctx, pgconv.Time(time.Now().Add(-5*time.Minute))); err != nil {
+		if _, err := env.q.SweepClaimedNeverStarted(env.ctx, store.SweepClaimedNeverStartedParams{Cutoff: pgconv.Time(time.Now().Add(-5 * time.Minute))}); err != nil {
 			t.Fatalf("SweepClaimedNeverStarted: %v", err)
 		}
 	}
