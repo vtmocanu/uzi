@@ -93,8 +93,9 @@ default token** to keep everything on one account.
 **Auto-select from the pool** picks a pooled token the same way an auto worker
 does: the token whose weekly allowance resets soonest by default, or the one
 with the most rate-limit headroom under `UZI_AUTOSELECT_ORDER=headroom_first`
-(see [How it chooses](./anthropic-token.md#how-it-chooses)). Under the default
-the in-flight penalty only breaks exact weekly-reset ties, so several
+(see [How it chooses](./anthropic-token.md#how-it-chooses)). Under the default,
+for picks above the headroom floor, the in-flight penalty only breaks
+exact weekly-reset ties, so several
 retrospectives at once concentrate on that one token until it nears the
 headroom floor, which can mean more mid-run limit pauses and resumes. It
 differs from a worker in one

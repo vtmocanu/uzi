@@ -322,8 +322,9 @@ run never changes account after it is created.
 - **The order** follows `UZI_AUTOSELECT_ORDER`: by default the account whose
   weekly window resets soonest among those with enough headroom, or the most
   headroom under `headroom_first` (see
-  [How it chooses](codex-credentials.md#how-it-chooses)). Under the default the
-  in-flight penalty only breaks exact weekly-reset ties, so a burst of runs
+  [How it chooses](codex-credentials.md#how-it-chooses)). Under the default, for
+  picks above the headroom floor, the in-flight penalty only breaks
+  exact weekly-reset ties, so a burst of runs
   concentrates on the soonest-expiring account until it nears the headroom
   floor, which can mean more mid-run limit pauses and resumes.
 - **The score** is 100 minus the fullest window of the account's main `codex`

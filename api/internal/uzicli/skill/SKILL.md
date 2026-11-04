@@ -367,7 +367,8 @@ uzi version
   creation, the pooled login picked by the operator's order (default: soonest weekly reset,
   where, for picks above the headroom floor, the in-flight penalty only breaks exact
   weekly-reset ties, so a burst of runs can concentrate on one login just above that
-  floor, meaning more mid-run limit pauses and resumes). Pool logins with `uzi token pool <label> --kind codex --on`; with
+  floor, meaning more mid-run limit pauses and resumes). Pool logins with
+  `uzi token pool <label> --kind codex --on`; with
   nothing pooled, auto falls back to the default.
   `uzi settings get` shows it as `Codex account mode:`; `uzi run get` explains the pick on
   the `CODEX_ALIAS` row. When `auto` cannot bind any pooled login the run start is refused

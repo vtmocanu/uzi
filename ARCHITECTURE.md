@@ -620,8 +620,9 @@ releasing the claim; see
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
 — and `auto` ranks the owner's opted-in tokens, by default the soonest weekly
 reset among those with enough headroom (`UZI_AUTOSELECT_ORDER=reset_first`; the
-previous most-headroom order is `headroom_first`; under `reset_first` the
-in-flight penalty only breaks exact weekly-reset ties, so a burst can
+previous most-headroom order is `headroom_first`; under `reset_first`, for
+picks above the headroom floor, the in-flight penalty only breaks
+exact weekly-reset ties, so a burst can
 concentrate on one token just above the floor, see
 [ADR-3844](adr/3844-reset-first-pool-order.md)), in `api/internal/autoselect`,
 fed by the same gauge the meters render. The
