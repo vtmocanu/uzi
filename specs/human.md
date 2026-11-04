@@ -1177,6 +1177,7 @@ Tracked as GitHub issue vtmocanu/uzi#1390; PRD at `prds/done/1390-outage-requeue
 - A worker that has genuinely died still has its runs re-queued after the stale window, and failed only after a second window. [user, #1390]
 - Each worker reports which runs it is executing and in which phase, visible in `uzi worker list` / `uzi admin workers`. [user, #1390]
 - A valid current-worker snapshot that omits an owned, unreleased running or approval/input/follow-up execution past the missing-status fence recovers it under the existing episode budget; listed gates and workers without snapshots are untouched. A previously authorized owner cancel completes before requeue or exhausted disposition, without a second cancel. Pending-outcome protections and genuine-loss Codex capability revocation remain. See ADR-1390's #3001 amendment. (AI-synced 2026-10-15, #3001)
+- An accepted owner cancel is observed through a read-only ownership signal at the two retained-recovery predecessor refusals before capture or execution; only current-generation ownership and positively clean local outcome evidence permit cancellation, with custody kept. Unknown evidence retains the stop. The new API settles cancel inputs atomically with the terminal transition; an old API can leave an inert unapplied input on the terminal run during a mixed rollout. (AI-synced 2026-11-04, #3860)
 
 ## Feature #1393 — A finished run's outcome survives an api outage
 

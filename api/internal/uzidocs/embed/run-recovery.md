@@ -143,6 +143,27 @@ the memory guard, the existing flow runs and the run fails as
 ("held by an earlier flight's unended source use") and retries until the requeue
 cap, then ends in `worker_requeue_exhausted` or `failed` per the existing
 exhaustion rule; this is new with #3638, not as before.
+
+At the two retained-predecessor refusals inside retained recovery (before capture
+or model execution), a worker can observe an already accepted owner **Cancel**
+through one read-only ownership request, bounded to 10 seconds. It honours the
+request only for its current, unreleased `claimed` or `running` generation and
+with positively clean local outcome evidence, rechecked after the request.
+Pending outcomes at any generation, incomplete outbox coverage, unresolved
+execution tails, other holds, or unknown evidence keep the retained stop. The
+probe never reads or consumes steering inputs. This does not apply to the
+fresh-seed canonical held-source refusal or to stops after execution.
+
+A qualifying cancellation uses the normal worker terminal-report path and keeps
+the retained source and custody holds; it grants no source cleanup permission.
+The new API applies the pending cancel inputs in the same transaction as that
+terminal transition. During a mixed-version rollout, an old API can accept the
+terminal report without applying the cancel input: that row remains inert on
+the terminal run. An old API's ownership response omits the new signal, so the
+worker keeps the retained stop instead of cancelling. A timeout or failed probe
+also leaves the cancel pending. Unrelated pending worker outcomes still require
+the existing explicit-discard confirmation.
+
 On a continuation whose record carries a settlement (not on the re-park path),
 the fresh worker logs `predecessor cooperative settlement verified` or
 `unverified` for diagnosis only; neither releases custody. A new run of the same
@@ -169,7 +190,8 @@ journal that changes under the call re-admits at most twice per claim, and the
 third is the same stop. The stop leaves the claim's own custody hold open, so at
 the cap the run parks `recovery_wait` with `worker_requeue_exhausted` for an owner
 Resume or Cancel. Every claim on this path opens its own custody hold and the stop leaves it open, so at
-the default cap of 3 this stop loop accrues at most 1 + `RUN_MAX_REQUEUES` (4) open holds per exhaustion episode, below the default
+the default cap of 3, when the server accepted the initial `running` report,
+this stop loop accrues at most 1 + `RUN_MAX_REQUEUES` (4) open holds per exhaustion episode, below the default
 `custody_hold_limit` of 8; those holds share the owner's admission count with the
 owner's other runs, so several exhausted runs can hold the owner's new claims
 queued until those holds are discarded or released (Resume and Cancel leave them open). A retained-sources journal
@@ -182,6 +204,11 @@ permanently failing preflight, or a valid fenced source with retained sources
 stays retained until exhaustion, then owner-held. See
 [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md) for the lock
 order and outcomes.
+
+The requeue-budget bound does not cover a claim whose initial `running` report
+was not applied: claimed-never-started resets can repeat without charging that
+budget and accumulate more holds (tracked in
+[issue #3859](https://github.com/vtmocanu/uzi/issues/3859)).
 
 Workers built before this change reject the new `memoryPark` journal record and
 fail closed on it: they refuse to attach, recover or discard that source. Roll
@@ -2234,6 +2261,16 @@ The disposition follows what the worker can see:
 - Otherwise it is `local_discard`, which loses every byte not already in a capture,
   published checkpoint or the tracking ref and clears that plain journal, so a later
   resume seeds fresh.
+
+The same read-only ownership probe returns `cancellation_requested` alongside
+the run status, `claim_generation` and `claim_released`. It is true only when
+`stop_kind` is `cancelled` and at least one unapplied cancel input remains
+deliverable (neither superseded nor covered by a milestone-reconciliation cutoff).
+A NULL stop kind yields false. Reading the probe neither consumes nor applies
+inputs; an absent signal from an older API is unknown, never cancellation
+authority. The retained-recovery refusal uses this positive signal together with
+its local outcome-safety checks, independently of the lifecycle evidence needed
+for source discard.
 
 The probe is scoped to the worker: once the run's `worker_id` moves off this worker (a
 requeue after a released claim, or a claim elsewhere) it reads 404, so the leftover is
