@@ -27,10 +27,16 @@ import { ExecutionRegistry, newLocalExecutionEpoch } from "../../agent/src/codex
 import type { RunContext } from "../../agent/src/executor.js";
 import type { Logger } from "../../agent/src/log.js";
 import { provisionRunTools } from "../../agent/src/provision-run.js";
-import { COMMAND_UID, RUNNER_UID, WORKER_UID, runnerCommand, runnerTmpdir } from "../../agent/src/runner-uid.js";
+import { COMMAND_UID, RUNNER_UID, WORKER_UID, runnerCommand, runnerTmpdir, uidSplitActive } from "../../agent/src/runner-uid.js";
 import { buildSdkEnv } from "../../agent/src/sdk-env.js";
 import { WorkerMemoryCommands } from "../../agent/src/worker-memory-commands.js";
 import { workerSpawnEnv } from "../../agent/src/worker-spawn-mark.js";
+
+// The worker process runs with umask 002 under the uid split (agent/src/main.ts, right after the
+// worker lock): the per-run dirs it creates, such as /data/provision/<run>, must be group-writable
+// for the runner uid that executes devbox in them. This proof process stands in for the worker, so
+// it sets the same umask under the same condition; it grants nothing the production worker lacks.
+if (uidSplitActive()) process.umask(0o002);
 
 type ProofId = "preflight" | "toolchain" | "forgeFake" | "claudePrivate" | "claudeShared" | "codexBroker";
 const PROOFS = JSON.parse(fs.readFileSync(new URL("./proofs.json", import.meta.url), "utf8")) as { leaves: Record<ProofId, string> };
