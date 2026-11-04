@@ -178,6 +178,26 @@ describe("uzi-chromium wrapper (issue #3907)", () => {
     }
   });
 
+  it("falls back to TMPDIR when HOME is writable but an existing .uzi-chromium is not", async (tc) => {
+    if (process.getuid!() === 0) {
+      tc.skip("root can write a 0555 dir");
+      return;
+    }
+    const home = newHome();
+    const stale = path.join(home, ".uzi-chromium");
+    fs.mkdirSync(stale);
+    fs.chmodSync(stale, 0o555);
+    const t = path.join(tmp, "fallback-stale");
+    fs.mkdirSync(t);
+    try {
+      const r = await run(["about:blank"], { HOME: home, TMPDIR: t });
+      assert.equal(r.code, 0, r.stderr);
+      assert.match(seen().cfg, new RegExp(`^${t}/uzi-chromium\\.[^/]+/config$`));
+    } finally {
+      fs.chmodSync(stale, 0o755);
+    }
+  });
+
   it("lets caller-set XDG_CONFIG_HOME, XDG_CACHE_HOME and FONTCONFIG_FILE win", async () => {
     await run(["about:blank"], { HOME: newHome(), XDG_CONFIG_HOME: "/c/cfg", XDG_CACHE_HOME: "/c/cache", FONTCONFIG_FILE: "/c/fonts.conf" });
     const s = seen();

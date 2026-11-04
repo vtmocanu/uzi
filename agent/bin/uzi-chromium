@@ -33,7 +33,8 @@ export FONTCONFIG_FILE
 
 base=""
 if [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
-  if mkdir -p "$HOME/.uzi-chromium" 2>/dev/null; then
+  # An existing base this uid cannot write (a foreign leftover) falls through to mktemp.
+  if mkdir -p "$HOME/.uzi-chromium" 2>/dev/null && [ -w "$HOME/.uzi-chromium" ]; then
     base="$HOME/.uzi-chromium"
   fi
 fi

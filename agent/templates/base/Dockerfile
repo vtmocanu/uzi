@@ -350,11 +350,12 @@ COPY --chmod=0755 agent/bin/uzi-chromium /usr/local/bin/uzi-chromium
 RUN command -v agent-browser \
     && command -v chromium \
     && [ -x /app/node_modules/.bin/agent-browser ] \
-    && timeout 30 agent-browser --version >/dev/null \
+    && mkdir -p /tmp/uzi-ab-home \
+    && HOME=/tmp/uzi-ab-home timeout 30 agent-browser --version >/dev/null \
     && mkdir -p /tmp/uzi-ab-fake-glibc \
     && printf '#!/bin/sh\necho "ldd (GNU libc) 2.42"\n' > /tmp/uzi-ab-fake-glibc/ldd \
     && chmod 0755 /tmp/uzi-ab-fake-glibc/ldd \
-    && PATH="/tmp/uzi-ab-fake-glibc:$PATH" timeout 30 agent-browser --version >/dev/null \
+    && HOME=/tmp/uzi-ab-home PATH="/tmp/uzi-ab-fake-glibc:$PATH" timeout 30 agent-browser --version >/dev/null \
     && timeout 90 "$AGENT_BROWSER_EXECUTABLE_PATH" \
         --headless --no-sandbox --disable-dev-shm-usage \
         --user-data-dir=/tmp/uzi-chromium-buildcheck --dump-dom about:blank >/dev/null \
@@ -375,7 +376,8 @@ RUN command -v agent-browser \
     && rm -rf /tmp/uzi-chromium-buildcheck /tmp/uzi-ab-fake-glibc /tmp/uzi-ab-home /tmp/uzi-chromium-wrap-home \
     && [ ! -e "$HOME/.agent-browser" ] && [ ! -e /tmp/uzi-ab-home ] \
     && [ ! -e /tmp/uzi-chromium-wrap-home ] \
-    && [ ! -e "$HOME/.uzi-chromium" ] && [ ! -e "$HOME/.uzi-agent-browser" ]
+    && [ ! -e "$HOME/.uzi-chromium" ] && [ ! -e "$HOME/.uzi-agent-browser" ] \
+    && ! ls -d /tmp/uzi-agent-browser.* /tmp/uzi-chromium.* >/dev/null 2>&1
 
 # BUG 1 (issue #114) store-perm normalization — MUST run AFTER the build guard above, not
 # after the earlier `chown -R worker:runner /nix`. Root cause: the guard's `--dump-dom`

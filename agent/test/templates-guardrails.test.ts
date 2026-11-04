@@ -619,6 +619,27 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         /\[ ! -e \/tmp\/uzi-chromium-wrap-home \][\s\S]*\[ ! -e "\$HOME\/\.uzi-chromium" \][\s\S]*\[ ! -e "\$HOME\/\.uzi-agent-browser" \]/,
         `${name}/Dockerfile build guard must assert no wrapper/shim state was baked (issue #3907)`,
       );
+      // Every guard agent-browser call (the --version pair included) runs under the throwaway
+      // HOME: the shim creates its run-private XDG dirs under a writable HOME on every call, so
+      // a call under the image HOME would bake /home/worker/.uzi-agent-browser as root.
+      for (const m of text.matchAll(/^.*timeout \d+ agent-browser\b.*$/gm)) {
+        const start = text.lastIndexOf("&&", m.index);
+        assert.match(
+          text.slice(start, m.index! + m[0].length),
+          /HOME=\/tmp\/uzi-ab-home\b/,
+          `${name}/Dockerfile build guard must run every agent-browser call under the throwaway HOME: ${m[0].trim()}`,
+        );
+      }
+      assert.match(
+        text,
+        /mkdir -p \/tmp\/uzi-ab-home \\\n\s+&& HOME=\/tmp\/uzi-ab-home timeout \d+ agent-browser --version/,
+        `${name}/Dockerfile build guard must create the throwaway HOME before the first agent-browser call (issue #3907)`,
+      );
+      assert.match(
+        text,
+        /! ls -d \/tmp\/uzi-agent-browser\.\* \/tmp\/uzi-chromium\.\* >\/dev\/null 2>&1/,
+        `${name}/Dockerfile build guard must assert no per-invocation fallback dir was baked into /tmp (issue #3907)`,
+      );
       assert.ok(
         text.indexOf("chmod -R a+rX /nix") > text.search(/timeout \d+ \/usr\/local\/bin\/uzi-chromium\b/),
         `${name}/Dockerfile must run the /nix store-perm chmod AFTER the wrapper launch in the build guard (issue #3907)`,

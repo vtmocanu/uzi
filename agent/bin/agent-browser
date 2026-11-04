@@ -101,17 +101,20 @@ if [ -z "${XDG_CONFIG_HOME:-}" ] || [ -z "${XDG_CACHE_HOME:-}" ]; then
   ab_base=""
   if [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
     ab_base="$HOME/.uzi-agent-browser"
-    mkdir -p "$ab_base" 2>/dev/null || ab_base=""
+    # An existing base this uid cannot write (a foreign leftover) is not usable either.
+    { mkdir -p "$ab_base" 2>/dev/null && [ -w "$ab_base" ]; } || ab_base=""
   fi
   if [ -z "$ab_base" ]; then
     ab_base=$(mktemp -d "${TMPDIR:-/tmp}/uzi-agent-browser.XXXXXX" 2>/dev/null || true)
   fi
-  : "${ab_base:=${TMPDIR:-/tmp}/uzi-agent-browser.$$}"
-  : "${XDG_CONFIG_HOME:=$ab_base/config}"
-  : "${XDG_CACHE_HOME:=$ab_base/cache}"
+  # No predictable fallback: if mktemp failed too, leave the XDG vars as they were.
+  if [ -n "$ab_base" ]; then
+    : "${XDG_CONFIG_HOME:=$ab_base/config}"
+    : "${XDG_CACHE_HOME:=$ab_base/cache}"
+  fi
 fi
-export XDG_CONFIG_HOME XDG_CACHE_HOME
-mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" 2>/dev/null || true
+if [ -n "${XDG_CONFIG_HOME:-}" ]; then export XDG_CONFIG_HOME; mkdir -p "$XDG_CONFIG_HOME" 2>/dev/null || true; fi
+if [ -n "${XDG_CACHE_HOME:-}" ]; then export XDG_CACHE_HOME; mkdir -p "$XDG_CACHE_HOME" 2>/dev/null || true; fi
 
 # A browser is reachable if the prebaked executable resolves, OR a chrome/chromium is on
 # PATH (auto-discovery), OR the invocation explicitly names a browser/endpoint — never

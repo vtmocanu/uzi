@@ -159,7 +159,7 @@ describe("agent-browser crash-close shim (PRD #87 M1)", () => {
     writeExec(recorder, `#!/bin/sh\n: > "${capture}"\nfor a in "$@"; do printf '%s\\n' "$a" >> "${capture}"; done\nexit 0\n`);
   });
 
-  it("defaults XDG_CONFIG_HOME/XDG_CACHE_HOME to a UID-SCOPED writable dir under TMPDIR and creates them (crashpad rc=133 fix)", async () => {
+  it("defaults XDG_CONFIG_HOME/XDG_CACHE_HOME to a run-private writable dir under HOME and creates them (crashpad rc=133 fix)", async () => {
     // Chromium 150 traps rc=133 at the crashpad handler (BEFORE the SUID check, so --no-sandbox
     // can't help) when it can't create its crashpad DB under a non-writable $HOME/.config — the
     // image bakes /home/worker/.config root-owned, not writable by uid 10001. The shim points
@@ -255,6 +255,26 @@ describe("agent-browser crash-close shim (PRD #87 M1)", () => {
       assert.ok(!fs.existsSync(path.join(ro, ".uzi-agent-browser")));
     } finally {
       fs.chmodSync(ro, 0o755);
+    }
+  });
+
+  it("a writable HOME with an existing unwritable .uzi-agent-browser falls back to a per-invocation dir", async (t) => {
+    if (process.getuid!() === 0) {
+      t.skip("root can write a 0555 dir");
+      return;
+    }
+    const home = path.join(tmp, "stale-home");
+    fs.mkdirSync(home);
+    const stale = path.join(home, ".uzi-agent-browser");
+    fs.mkdirSync(stale);
+    fs.chmodSync(stale, 0o555);
+    const tdir = path.join(tmp, "xdg-fallback-stale");
+    fs.mkdirSync(tdir);
+    try {
+      const a = await xdgFor({ HOME: home, TMPDIR: tdir }, "s1");
+      assert.match(a.cfg, new RegExp(`^${tdir}/uzi-agent-browser\\.[^/]+/config$`));
+    } finally {
+      fs.chmodSync(stale, 0o755);
     }
   });
 
