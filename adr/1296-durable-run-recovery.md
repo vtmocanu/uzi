@@ -13,13 +13,14 @@ cleanup guard must not silently break.
 ## Amendment 2026-11-04 — operator local-record resolution (#3885)
 
 A worker-local operator command can now retire guarded local recovery records,
-but only for Case A: the closed hold carries the matching FINAL receipt, or the
-FINAL ACK is already saved. The binding, lock order, retention exclusions and
+but only for Case A: the exact closed hold was released with a receipt matching the saved
+FINAL request, with or without the FINAL ACK already saved (an ACK with a
+discarded hold is refused). The binding, lock order, retention exclusions and
 failure model are in the
 [ADR-2417 amendment](2417-guarded-local-retention.md#amendment-2026-11-04--operator-resolution-of-guarded-local-records-3885).
 The owner-disposition surface (D6) is unchanged, and no new server authority is
 added. Case B (a discarded hold, or a release without this record's matching
-receipt) remains owner-pending and is refused `case_b_pending_owner_review`;
+receipt) remains owner-pending and is refused (typically `case_b_pending_owner_review`);
 its proposed contract is recorded in that ADR and is not accepted.
 
 ## Amendment 2026-10-30 — same-issue witness policy

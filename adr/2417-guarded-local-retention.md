@@ -22,7 +22,9 @@ on the retained-source channel (`local-records`, `resolve-local-record`) in
 
 **Case A only.**
 
-- **A1**: the FINAL ACK is already persisted. The existing
+- **A1**: the FINAL ACK is already persisted and the exact closed hold was
+  released with a receipt matching the saved FINAL request (an ACK with a
+  discarded hold is refused). The existing
   `forgetGenerationWithinCycle` cleanup runs on operator request.
 - **A2**: the saved immutable FINAL's exact closed hold was released with a
   receipt matching that request, but the local ACK never landed. The existing
@@ -59,7 +61,7 @@ generations or runs are untouched.
 **Failure model.** Abrupt process kill only. This is verified by real `SIGKILL`
 of a child worker process at six points (before the POST, after the POST before
 the ACK write, after the ACK temp write before its rename, after the ACK rename
-before cleanup, after the first shared-bare deletion, and after the bundle
+before cleanup, after the first shared-bare deletion was registered (before it ran), and after the bundle
 unlinks before the record deletes), each followed by a fresh process that
 rediscovers the state (`agent/test/recovery-local-record-restart.test.ts`).
 Behaviour under storage or power loss is unspecified: record writes are
@@ -70,7 +72,9 @@ between operations. Owned filesystem I/O and child processes are awaited, so
 locks and the closed claim gate can outlast the deadline and the client's
 120 s idle timeout. The client then reports the outcome unknown and exits
 non-zero. The server still logs and records the final result after the client
-has left (`inspect` lists it in `lastDiscards` with attempt `local-record`).
+has left (`inspect` lists it in `lastDiscards` with attempt `local-record`, except
+admission refusals `shutting_down`, `busy` and `no_claim_gate`, which return
+before the remember step; the list is in-process and bounded).
 The claim gate reopens only once the owned work has settled. The operator
 re-inspects before retrying; the digest changes after any mutation. The 5 s
 channel close/shutdown wait neither establishes settlement nor releases
@@ -79,7 +83,7 @@ ownership.
 ## Proposed (not accepted) — Case B local-record disposition (#3885)
 
 Not accepted and not implemented. Today a generation in Case B refuses
-`case_b_pending_owner_review`, and issue #3885 stays open for it. This section
+(typically `case_b_pending_owner_review`; the first failing check wins), and issue #3885 stays open for it. This section
 records the contract a later owner ruling would have to meet.
 
 Case B is a guarded record whose closed hold is discarded, or was released

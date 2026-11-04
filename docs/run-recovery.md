@@ -2221,7 +2221,7 @@ unknown measurement does not mean zero.
 | Disposition | Meaning and next step |
 |---|---|
 | `owner_hold_discard <hold-id>` | A server hold still owns the source. Use `uzi run discard <run-id> --hold <hold-id> --yes`. |
-| `resolve_local_record` | A local recovery, settlement or terminal record still protects the source. A guarded recovery record whose closed hold carries the matching FINAL receipt, or whose FINAL ACK is already saved, can be resolved with the [local-record commands](#resolving-guarded-local-records) below. A discarded hold, a release without the matching receipt (Case B), settlement and terminal records, and unbound files remain blocked and need owner handling ([#3885](https://github.com/vtmocanu/uzi/issues/3885) stays open for Case B). An empty open-hold list never makes deletion safe. |
+| `resolve_local_record` | A local recovery, settlement or terminal record still protects the source. A guarded recovery record whose closed hold was released with a receipt matching the saved FINAL request (whether or not its FINAL ACK is already saved) can be resolved with the [local-record commands](#resolving-guarded-local-records) below. A discarded hold (even with an ACK saved), a release without the matching receipt (Case B), settlement and terminal records, and unbound files remain blocked and need owner handling ([#3885](https://github.com/vtmocanu/uzi/issues/3885) stays open for Case B). An empty open-hold list never makes deletion safe. |
 | `local_discard` / `local_protected_discard` | Nothing else holds the source; it may be discarded with the command below (protected for episode or protected sources). |
 | `refused` | Named consumers still use the source. The output lists them. |
 
@@ -2357,7 +2357,8 @@ above (Compose, single-UID or split-UID), with the subcommand and flags changed:
 ```
 
 1. `local-records` prints one classification per generation. `case_a_ack` means the
-   FINAL acknowledgement is already saved. `case_a_replay` means the saved FINAL's
+   FINAL acknowledgement is already saved and the closed hold was released with the
+   matching receipt. `case_a_replay` means the saved FINAL's
    closed hold carries a matching receipt but the local acknowledgement never landed.
    Both come with a `digest`. Any other value is a named blocker (below), and run-level
    blockers (`inventory_incomplete`, `record_unverified`, `generation_missing`) appear in `blockers`.
@@ -2370,7 +2371,9 @@ above (Compose, single-UID or split-UID), with the subcommand and flags changed:
    as above. Resolution retires only that generation's local recovery refs, bundles and records;
    it does not discard the retained source.
 
-Resolve outcomes appear in inspect's `lastDiscards` with attempt `local-record`.
+Outcomes that reach the remember step appear in inspect's `lastDiscards` with attempt
+`local-record`. Admission refusals (`shutting_down`, `busy`, `no_claim_gate`) return before it
+and are not recorded, and the list is in-process and bounded, so it does not survive a worker restart.
 
 **Outcomes.** `retired` (the generation's records are gone; `remaining` counts the
 record files left for the run), `refused` (nothing was touched) and `partial` (the point of
@@ -2391,6 +2394,11 @@ request runs to completion or to its deadline.
 | Server evidence | `holds_unknown`, `hold_open`, `pending_generation_report`, `exact_evidence_unavailable`, `evidence_deadline`, `run_state_not_terminal`, `case_b_pending_owner_review` |
 | Source proof and replay | `source_identity_unavailable`, `bare_mutation_unresolved`, `replay_failed_before_post`, `replay_precondition_unmet:<reason>`, `replay_failed`, `internal_error` |
 
+The table is not exhaustive. Other replay and cleanup reasons can appear, for example
+`source_boundary_retained`, `no_saved_final`, `replay_ack_mismatch`, `replay_failed:<reason>`,
+`held_fallback_required:<why>`, and cleanup outcomes such as `cleanup_retained` and
+`source_protected`. Re-run `local-records` or `inspect` before retrying.
+
 An unbound `*.tmp` file or orphan bundle in the run's record directory is retained and
 refuses the whole run's generations as `unbound_artifact:<name>`; a
 crash between a record's temp write and its rename leaves exactly such a file. Resolution
@@ -2408,9 +2416,11 @@ for inspect even though the client left. The claim gate reopens only once that w
 settled. Re-inspect before retrying: the digest changes after any mutation, so a stale
 `--confirm` is refused with `descriptor_changed`.
 
-**What this does not do.** It handles Case A only (the closed hold carries this
-record's own receipt, or its ACK is saved). A discarded hold, or custody released
-without this record's matching ACK or receipt, is refused `case_b_pending_owner_review`;
+**What this does not do.** It handles Case A only (the closed hold was released with a
+receipt matching this record's saved FINAL request, with or without the ACK already saved).
+A discarded hold, or custody released without this record's matching receipt, is refused
+(typically `case_b_pending_owner_review`; the first failing check wins, so an earlier
+blocker such as `cleanup_pending`, `binding_missing` or `holds_unknown` can be reported instead);
 no supported resolver exists for it, and it is [proposed, not accepted](../adr/2417-guarded-local-retention.md#proposed-not-accepted--case-b-local-record-disposition-3885).
 The tested failure model is an abrupt process kill; storage or power-loss behaviour is
 unspecified (record writes are rename-atomic, not fsynced).
