@@ -661,7 +661,7 @@ validation is deferred). Feedback's `observed_total_bytes` stays the raw
 `memory.current` and can exceed the working set that triggered.
 The `worker_memory_pressure` feed event also carries an optional
 `memory_diagnostics` object with the decision metric, thresholds and
-memory.stat breakdown, including `active_file`, `file_dirty` and
+`memory.stat` breakdown, including `active_file`, `file_dirty` and
 `file_writeback`. These are diagnostics only: the metric is unchanged and the
 guard still does not use dirty/writeback. See
 [ADR-2396](../adr/2396-worker-memory-guard.md).
