@@ -257,6 +257,7 @@ describe("RunRunner - issue #3916: a disk-park capture acquires A despite the ab
     assert.strictEqual(d.outcome, "done", "the park completed under the deadline instead of retrying an unverified capture");
     // Verified, non-degraded and tracking-advanced come first: with the root fix reverted and the bound
     // kept, the run still parks (degraded), so these are the assertions that must go red.
+    assert.ok(d.captures.length >= 1, "a capture ran");
     assert.strictEqual((d.captures[0] as { verified: boolean }).verified, true, "the capture verified");
     assert.strictEqual(trackingSha(IID), d.headBeforeStop, "the tracking ref equals the pre-stop clone HEAD");
     assert.strictEqual(degradedFeed(d), false, "the feed carries no degraded capture notice");

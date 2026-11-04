@@ -8012,9 +8012,9 @@ export class RunRunner {
         ? true : process.platform === "linux" && proof.outcome.process?.state === "quiescent");
     } catch (error) {
       if (midRunDiskPark) {
-        // Unproven: the proof loop's mid-run check routes a shutdown or cancel; only a fence throws.
-        // A held capture rethrows canonical interruptions (its expired scope, aborted signal or refusal
-        // among them) to the held region, as the terminal arm does; the disk stop's PauseNowSignal is not one.
+        // Unproven: the proof loop's mid-run check routes a shutdown or cancel. A fence throws; so does a
+        // held capture's canonical interruption (its expired scope, aborted signal or refusal among them),
+        // which goes to the held region. Unlike the terminal arm, the disk stop's PauseNowSignal never does.
         this.midRunDiskProofStopped(flight);
         if (held && !(error instanceof PauseNowSignal) && canonicalRecoveryInterruption(error)) throw error;
         return false;
