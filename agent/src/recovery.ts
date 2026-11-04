@@ -6040,7 +6040,17 @@ export class RecoveryCoordinator {
         const generations = [...new Set(journal.records.map(r => r.generation).filter((g): g is number => Number.isSafeInteger(g)))]
           .sort((a, b) => a - b);
         const views: LocalRecordGeneration[] = [];
-        if (!generations.length) return { kind: "described", runId, generations: views, blockers };
+        // Retained artifacts are visible at run level even when no record generation exists to classify.
+        if (journal.unbound.length) blockers.push("unbound_artifact:" + journal.unbound[0]);
+        if (!generations.length) {
+          this.operatorCheckpoint(io);
+          if ((await this.operatorSettlementNames(runId, io)).length) blockers.push("settlement_record_unsupported");
+          this.operatorCheckpoint(io);
+          if (this.terminalRecordProtection && await ownedRecoveryIO(() => this.terminalRecordProtection!(runId))) {
+            blockers.push("terminal_protection");
+          }
+          return { kind: "described", runId, generations: views, blockers };
+        }
         const observed = await this.operatorObserve(io, runId);
         for (const generation of generations) {
           // Cooperative stop: the client leaving or shutdown ends the loop; a spent budget marks the rest.

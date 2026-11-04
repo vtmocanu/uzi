@@ -6,6 +6,7 @@ import path from "node:path";
 import { formatAttemptId } from "../../src/attempt-path.js";
 import { DindPruneGate } from "../../src/dind-prune.js";
 import { GitCache, type OwedCandidate, type PositiveOwedCandidateContext } from "../../src/git.js";
+import type { Logger } from "../../src/log.js";
 import { RetainedSourceServer } from "../../src/ops/retained-source-server.js";
 import type { RecoveryExactHold, RecoveryHoldsResponse, RunOwnershipResponse } from "../../src/protocol.js";
 import type { RecoveryCoordinator, RecoveryRecord } from "../../src/recovery.js";
@@ -119,6 +120,10 @@ export interface WorldOptions {
   sharedOwedPin: boolean;
   /** Install the unrelated run: a guarded generation, its pins, a retained source and (optionally) the shared pin. */
   otherRun: boolean;
+  /** The channel server's logger (default: silent). Only the server uses it. */
+  serverLog?: Logger;
+  /** Test-scoped overrides of the channel server's cooperative deadline and shutdown wait. */
+  serverTimeouts?: { resolveDeadlineMs?: number; shutdownSettleMs?: number };
 }
 
 export interface Episode { branch: string; key: string; tip: string; sourcePath: string; successorPath: string }
@@ -279,7 +284,8 @@ export async function createWorld(opts: WorldOptions): Promise<World> {
   for (const g of gens.values()) g.open = false;
   const gate = new DindPruneGate();
   const server = new RetainedSourceServer({
-    dataDir: dir, git, gate, runner, log: nullLogger(), isIdle: () => true,
+    dataDir: dir, git, gate, runner, log: opts.serverLog ?? nullLogger(), isIdle: () => true,
+    ...opts.serverTimeouts,
     client: {
       listRecoveryHolds: runId => client.listRecoveryHolds(runId),
       getRunOwnership: runId => client.getRunOwnership(runId),

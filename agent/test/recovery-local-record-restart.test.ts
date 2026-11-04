@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import fsSync from "node:fs";
+import http from "node:http";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
-import { environment, fixture, git, inventory, patch, binding } from "./fixtures/recovery-bindingless-compat.js";
+import { binding, closed, environment, fixture, git, inventory, patch, type Fixture } from "./fixtures/recovery-bindingless-compat.js";
 import type { ChildSpec, KillAt, ServerState } from "./fixtures/recovery-local-record-restart-child.js";
 
 // issue #3885 M2 U3: the approved failure model is an abrupt worker-process kill (no handler, no finally, no
@@ -16,7 +17,10 @@ import type { ChildSpec, KillAt, ServerState } from "./fixtures/recovery-local-r
 
 const roots: string[] = [];
 const children = new Set<ChildProcess>();
+const apis = new Set<http.Server>();
 afterEach(async () => {
+  for (const api of apis) await new Promise<void>(resolve => { api.close(() => resolve()); api.closeAllConnections(); });
+  apis.clear();
   for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   children.clear();
   for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
@@ -31,6 +35,47 @@ const CHILD = path.resolve(import.meta.dirname, "fixtures/recovery-local-record-
 type Described = { kind: string; generations?: Array<{ generation: number; classification: string; digest?: string }>; blockers?: string[] };
 type Resolved = { kind: string; reason?: string; generation?: number; remaining?: number };
 interface ChildOutcome { described?: Described; resolved?: Resolved; exit: { code: number | null; signal: NodeJS.Signals | null }; stderr: string }
+
+/**
+ * The fake worker API the real WorkerClient in the child talks to (real HTTP on 127.0.0.1). It serves only what the
+ * resolution needs: register, the exact-hold read (the closed hold released under the saved FINAL's receipt) and the
+ * release POST. The release models api/internal/recovery/final_inventory.go: an identical released request is answered
+ * with the same ack, a different one is a conflict. Its state is a JSON file, so a fresh child meets earlier POSTs and
+ * the parent reads them without asking the server.
+ */
+async function startApi(f: Fixture, stateFile: string): Promise<string> {
+  const request = f.record.finalRequest!;
+  const hold = { ...closed(f), state: "released", run_status: "failed", release_evidence: request.evidence ?? "archive",
+    final_receipt: request.disposition };
+  const read = (): ServerState => { try { return JSON.parse(fsSync.readFileSync(stateFile, "utf8")) as ServerState; } catch { return { posts: [] }; } };
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      const reply = (status: number, body: unknown): void => { res.writeHead(status, { "Content-Type": "application/json" }); res.end(JSON.stringify(body)); };
+      const url = new URL(req.url!, "http://127.0.0.1");
+      if (req.method === "POST" && url.pathname.endsWith("/register")) {
+        return reply(200, { worker_id: hold.original_worker_id, protocol_features: ["recovery_inventory_v1"] });
+      }
+      if (req.method === "GET" && url.pathname.endsWith("/recovery-holds")) return reply(200, { run_id: f.context.runId, holds: [], exact_hold: hold });
+      if (req.method === "POST" && url.pathname.endsWith("/archives/release")) {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { generation: number; release_evidence?: unknown; final_disposition?: unknown };
+        const entry = { evidence: body.release_evidence, disposition: body.final_disposition };
+        const state = read();
+        const first = state.posts[0];
+        if (first && JSON.stringify(first) !== JSON.stringify(entry)) return reply(409, { error: "conflicting release disposition" });
+        state.posts.push(entry);
+        fsSync.writeFileSync(stateFile + ".tmp", JSON.stringify(state));
+        fsSync.renameSync(stateFile + ".tmp", stateFile);
+        return reply(200, { run_id: f.context.runId, generation: body.generation, released: true, holds_released: 1 });
+      }
+      reply(404, { error: `unexpected ${req.method} ${url.pathname}` });
+    });
+  });
+  apis.add(server);
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+}
 
 /** A temp data directory with a real bare, one guarded saved-FINAL generation and an unrelated run beside it. */
 async function seed() {
@@ -54,7 +99,8 @@ async function seed() {
   await fs.mkdir(ctl);
   const server = path.join(ctl, "server.json");
   await fs.writeFile(server, JSON.stringify({ posts: [] } satisfies ServerState));
-  return { f, root, bare, runId: f.context.runId, ctl, server, counter: { n: 0 } };
+  const apiUrl = await startApi(f, server);
+  return { f, root, bare, runId: f.context.runId, ctl, server, apiUrl, counter: { n: 0 } };
 }
 type World = Awaited<ReturnType<typeof seed>>;
 
@@ -112,7 +158,7 @@ async function runChild(w: World, action: ChildSpec["action"], killAt?: KillAt):
   const tag = `${action}-${killAt ?? "run"}-${++w.counter.n}`;
   const spec: ChildSpec = { root: w.root, runId: w.runId, generation: 7, context: w.f.context, head: w.f.head,
     attempts: w.f.attempts, action, ...(killAt ? { killAt } : {}),
-    marker: path.join(w.ctl, `${tag}.marker`), result: path.join(w.ctl, `${tag}.result.json`), server: w.server };
+    marker: path.join(w.ctl, `${tag}.marker`), result: path.join(w.ctl, `${tag}.result.json`), apiUrl: w.apiUrl };
   const specFile = path.join(w.ctl, `${tag}.spec.json`);
   await fs.writeFile(specFile, JSON.stringify(spec));
   const child = spawn(process.execPath, ["--import", "tsx", "--import", "./test/setup/hermetic-proc.ts", CHILD, specFile], {

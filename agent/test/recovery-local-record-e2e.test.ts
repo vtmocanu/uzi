@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { afterEach, test } from "node:test";
 import { setQuiescenceViewForTests } from "../src/run-quiescence.js";
 import { makeFakeProcRoot, plantInScope } from "./fake-proc.js";
+import { recordingLogger } from "./helpers.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
 import {
   EPISODE_ATTEMPT, EPISODE_GENERATION, OTHER_RUN, RUN, allRefs, createWorld, gitIn, treeDigest, type GenInfo, type World,
@@ -21,8 +23,10 @@ type Json = Record<string, any>;
 
 const worlds: World[] = [];
 const scratch: string[] = [];
+const cleanups: Array<() => void> = [];
 afterEach(async () => {
   restoreHermeticView();
+  for (const undo of cleanups.splice(0)) undo();
   for (const w of worlds.splice(0)) await w.stop();
   for (const d of scratch.splice(0)) fs.rmSync(d, { recursive: true, force: true });
 });
@@ -44,20 +48,26 @@ function send(sock: string, req: unknown): Promise<Json> {
   });
 }
 
-/** The real .mjs client (async spawn: the server lives in this process, so the event loop must stay free). */
-function operator(w: World, args: string[]): Promise<{ code: number | null; json: Json; stderr: string }> {
+/** The real .mjs client, output unparsed (async spawn: the server lives in this process, so the event loop must stay free). */
+function operatorRaw(w: World, args: string[], extraEnv: Record<string, string> = {}):
+  Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const env = { ...process.env };
+    const env = { ...process.env, ...extraEnv };
     delete env.NODE_TEST_CONTEXT;
     const child = spawn(process.execPath, [CLIENT_MJS, ...args, "--socket", w.sock], { env, stdio: ["ignore", "pipe", "pipe"] });
     let out = "", err = "";
     child.stdout.on("data", c => { out += c; });
     child.stderr.on("data", c => { err += c; });
     child.on("error", reject);
-    child.on("close", code => {
-      try { resolve({ code, json: JSON.parse(out) as Json, stderr: err }); } catch (e) { reject(new Error(`client output ${out} / ${err}: ${e}`)); }
-    });
+    child.on("close", code => resolve({ code, stdout: out, stderr: err }));
   });
+}
+
+async function operator(w: World, args: string[]): Promise<{ code: number | null; json: Json; stderr: string }> {
+  const r = await operatorRaw(w, args);
+  try { return { code: r.code, json: JSON.parse(r.stdout) as Json, stderr: r.stderr }; } catch (e) {
+    throw new Error(`client output ${r.stdout} / ${r.stderr}: ${e}`);
+  }
 }
 
 const inspectEpisode = async (w: World): Promise<Json> => {
@@ -174,6 +184,173 @@ test("a multi-generation run: local-records names each case, A1 then A2 retire, 
     "Case B keeps its pins");
   assert.ok(allRefs(w.bare).some(l => l.startsWith(`refs/uzi-coverage/${OTHER_RUN}/3/`)), "the other run keeps its pins");
   assert.ok(allRefs(w.bare).some(l => l.startsWith(`refs/uzi-owed/${RUN}/${w.episode.tip} `)), "the episode's owed pin is intact");
+});
+
+// ─── cooperative deadline and shutdown through the REAL coordinator ─────────────────────────────────────────────────
+
+interface Delay { reached: Promise<void>; release: () => void; restore: () => void }
+/** Wraps the `fs.promises.unlink` the coordinator's cleanup uses: the FIRST unlink of one of `files` signals `reached` and
+ *  then waits for `release()`; every other path passes straight through. Restored by `restore()` and, as a backstop, afterEach. */
+function delayFirstUnlinkOf(files: string[]): Delay {
+  const original = fsp.unlink;
+  const targets = new Set(files);
+  let hit = false;
+  let reachedResolve!: () => void;
+  let releaseResolve!: () => void;
+  const reached = new Promise<void>(r => { reachedResolve = r; });
+  const released = new Promise<void>(r => { releaseResolve = r; });
+  (fsp as { unlink: typeof fsp.unlink }).unlink = async (p: Parameters<typeof fsp.unlink>[0]) => {
+    if (!hit && typeof p === "string" && targets.has(p)) {
+      hit = true;
+      reachedResolve();
+      await released;
+    }
+    return original.call(fsp, p);
+  };
+  const restore = (): void => { (fsp as { unlink: typeof fsp.unlink }).unlink = original; releaseResolve(); };
+  cleanups.push(restore);
+  return { reached, release: releaseResolve, restore };
+}
+
+async function within<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([p, new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error(`timed out waiting for ${what}`)), ms); })]);
+  } finally { clearTimeout(timer); }
+}
+async function until(cond: () => boolean, ms: number, what: string): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await new Promise(r => setTimeout(r, 20));
+  }
+}
+const finishedLines = (lines: unknown[]): Json[] =>
+  (lines as Json[]).filter(l => l.msg === "retained-source: local record resolution finished");
+
+const DEADLINE_MS = 4000;
+const CLIENT_IDLE_MS = 1500;
+
+test("a resolution that outlasts the server deadline and the client idle timeout: unknown to the client, finished in the log, gate closed until the delayed unlink settles", async () => {
+  const { logger, lines } = recordingLogger();
+  const w = await world({ gens: [{ generation: 7, kind: "ack" }, { generation: 9, kind: "caseB" }], sharedOwedPin: false, otherRun: true,
+    serverLog: logger, serverTimeouts: { resolveDeadlineMs: DEADLINE_MS } });
+  const [a1, b] = [w.gens.get(7)!, w.gens.get(9)!];
+  const described = await localRecords(w);
+  const digest0 = digestOf(described, 7);
+  const a1Files = filesOf(w, a1);
+  const a1Refs = refsOwnedBy(w, a1);
+  assert.ok(a1Files.length >= 2 && a1Refs.length >= 2);
+  const caseB = filesOf(w, b).map(f => [f, treeDigest(f)] as const);
+  const otherRecords = treeDigest(recoveryDir(w, OTHER_RUN));
+  const otherSource = treeDigest(w.other!.clonePath);
+  const refs0 = allRefs(w.bare);
+
+  const delay = delayFirstUnlinkOf(a1Files);
+  const t0 = Date.now();
+  const client = operatorRaw(w, ["resolve-local-record", "--run", RUN, "--generation", "7", "--confirm", digest0],
+    { UZI_RETAINED_SOURCE_IDLE_TIMEOUT_MS: String(CLIENT_IDLE_MS) });
+  try {
+    await within(delay.reached, 30_000, "the delayed unlink");
+
+    // While the unlink is pending: gate closed, a second resolution refused busy, the generation partly present.
+    assert.equal(w.gate.heldBy("retained_ops"), true);
+    assert.equal(w.gate.tryEnterClaim(), false, "claims are refused");
+    const second = await send(w.sock, { op: "resolve-local-record", run: RUN, generation: 9, confirm: "a".repeat(64) });
+    assert.deepEqual(second.result, { kind: "refused", reason: "busy" });
+    assert.deepEqual(refsOwnedBy(w, a1), [], "the refs went before the file removal");
+    for (const f of a1Files) assert.equal(fs.existsSync(f), true, "no file is removed yet: " + f);
+
+    // (1) The client gives up first, with the unknown-outcome message and no result.
+    const out = await within(client, 30_000, "the client to time out");
+    assert.equal(out.code, 1, out.stderr);
+    assert.equal(out.stdout, "");
+    assert.match(out.stderr, /outcome is unknown/);
+    assert.ok(Date.now() - t0 < DEADLINE_MS, "the client's idle timeout fired before the server deadline");
+
+    // Let the server's deadline pass too; still nothing is logged and the gate stays closed (the operation is owned).
+    await new Promise(r => setTimeout(r, Math.max(0, t0 + DEADLINE_MS + 300 - Date.now())));
+    assert.equal(finishedLines(lines).length, 0, "not finished while the operation is pending");
+    assert.equal(w.gate.heldBy("retained_ops"), true, "a spent deadline does not reopen the gate");
+    assert.equal(w.gate.tryEnterClaim(), false);
+
+    // (3)/(2) The operation settles: only then does the gate reopen, and the server logs the completion.
+    delay.release();
+    await until(() => finishedLines(lines).length === 1, 30_000, "the finished log line");
+    const fin = finishedLines(lines)[0]!;
+    assert.equal(fin.run_id, RUN);
+    assert.equal(fin.generation, 7);
+    assert.equal(fin.outcome, "partial", JSON.stringify(fin));
+    assert.equal(fin.reason, "deadline_exhausted", JSON.stringify(fin));
+    await until(() => !w.gate.heldBy("retained_ops"), 10_000, "the gate to reopen");
+    assert.equal(w.gate.tryEnterClaim(), true);
+    w.gate.exitClaim();
+  } finally { delay.restore(); }
+
+  // (4) A fresh view shows the post-mutation state: the bundle is gone, the descriptor changed, and inspect remembers the outcome.
+  assert.equal(fs.existsSync(a1Files.find(f => f.endsWith(".bundle"))!), false);
+  const fresh = await localRecords(w);
+  const g7 = (fresh.result.generations as Json[]).find(g => g.generation === 7);
+  assert.ok(g7, "the partly removed generation is still described: " + JSON.stringify(fresh));
+  assert.notEqual(g7.digest, digest0, "the digest moved with the removed bundle");
+  assert.equal((await inspectEpisode(w)).disposition.kind, "resolve_local_record");
+  const last = (await send(w.sock, { op: "inspect", run: RUN, generation: EPISODE_GENERATION, attempt: EPISODE_ATTEMPT })).lastDiscards as Json[];
+  assert.ok(last.some(d => d.generation === 7 && d.outcome === "partial" && d.reason === "deadline_exhausted"), JSON.stringify(last));
+
+  // The stale digest is refused; the fresh one completes the retirement under a new deadline.
+  const stale = await resolve(w, 7, digest0);
+  assert.deepEqual(stale.json.result, { kind: "refused", reason: "descriptor_changed" });
+  const done = await resolve(w, 7, g7.digest);
+  assert.equal(done.code, 0, done.stderr + JSON.stringify(done.json));
+  assert.equal(done.json.result.kind, "retired", JSON.stringify(done.json));
+  for (const f of a1Files) assert.equal(fs.existsSync(f), false, f);
+  sameLines(allRefs(w.bare), without(refs0, a1Refs), "refs after the retirement");
+  for (const [f, d] of caseB) sameLines(treeDigest(f), d, "Case B " + path.basename(f));
+  sameLines(treeDigest(recoveryDir(w, OTHER_RUN)), otherRecords, "the other run's records");
+  sameLines(treeDigest(w.other!.clonePath), otherSource, "the other run's retained source");
+});
+
+test("close() during a delayed unlink does not reopen the claim gate before the operation settles", async () => {
+  const { logger, lines } = recordingLogger();
+  const w = await world({ gens: [{ generation: 7, kind: "ack" }, { generation: 9, kind: "caseB" }], sharedOwedPin: false, otherRun: true,
+    serverLog: logger, serverTimeouts: { shutdownSettleMs: 250 } });
+  const digest0 = digestOf(await localRecords(w), 7);
+  const a1Files = filesOf(w, w.gens.get(7)!);
+  const caseB = filesOf(w, w.gens.get(9)!).map(f => [f, treeDigest(f)] as const);
+  const otherRecords = treeDigest(recoveryDir(w, OTHER_RUN));
+
+  const delay = delayFirstUnlinkOf(a1Files);
+  const client = operatorRaw(w, ["resolve-local-record", "--run", RUN, "--generation", "7", "--confirm", digest0]);
+  try {
+    await within(delay.reached, 30_000, "the delayed unlink");
+    assert.equal(w.gate.heldBy("retained_ops"), true);
+
+    // close() returns after its bounded settle wait, but neither settles the operation nor reopens the gate.
+    const t = Date.now();
+    await within(w.server.close(), 10_000, "close()");
+    assert.ok(Date.now() - t >= 200, "close() waited for the in-flight operation (bounded)");
+    assert.equal(w.gate.heldBy("retained_ops"), true, "close() did not reopen the gate");
+    assert.equal(w.gate.tryEnterClaim(), false);
+    assert.equal(finishedLines(lines).length, 0);
+    for (const f of a1Files) assert.equal(fs.existsSync(f), true, f);
+    const gone = await within(client, 30_000, "the client to see the connection close");
+    assert.notEqual(gone.code, 0);
+    assert.equal(gone.stdout, "");
+
+    delay.release();
+    await until(() => finishedLines(lines).length === 1, 30_000, "the finished log line");
+    const fin = finishedLines(lines)[0]!;
+    assert.equal(fin.generation, 7);
+    assert.notEqual(fin.outcome, "retired", "the shutdown ended the resolution early: " + JSON.stringify(fin));
+    await until(() => !w.gate.heldBy("retained_ops"), 10_000, "the gate to reopen after settlement");
+  } finally { delay.restore(); }
+
+  // The unlink that was pending completed (the work is owned); nothing unrelated moved.
+  assert.equal(fs.existsSync(a1Files.find(f => f.endsWith(".bundle"))!), false);
+  const left = (await w.coordinator.inspect(RUN)).filter(r => r.generation === 7 || r.generation === 9);
+  assert.ok(left.some(r => r.generation === 9));
+  for (const [f, d] of caseB) sameLines(treeDigest(f), d, "Case B " + path.basename(f));
+  sameLines(treeDigest(recoveryDir(w, OTHER_RUN)), otherRecords, "the other run's records");
 });
 
 /** Resolve every generation of the run through the operator verbs (a fresh digest each time: the listing changes). */

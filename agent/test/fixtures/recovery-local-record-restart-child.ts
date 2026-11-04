@@ -3,28 +3,28 @@
 // Run as `node --import tsx --import ./test/setup/hermetic-proc.ts <this file> <spec.json>` from agent/. It builds
 // the production shape of the operator path over a data directory the parent seeded: a real AuthorityRuntime (the
 // worker lifetime lock W is taken for real), a real GitCache bound to its hooks with `authorityRequired`, and a
-// RecoveryCoordinator whose only fakes are the API client and the physical source boundary. The "server" is a
-// JSON file the parent and every child share, so a release POST is observable to the parent and to a later,
-// fresh process. At the named seam the child writes a marker file and blocks forever; the parent kills it with a
+// RecoveryCoordinator whose only fakes are the physical source boundary and the coordinator's own client slot, which
+// carries the REAL WorkerClient (registered, then speaking HTTP to the fake worker API the parent hosts on 127.0.0.1;
+// the parent persists that API's state in a JSON file, so a later, fresh process meets the earlier POSTs). At the named seam the child writes a marker file and blocks forever; the parent kills it with a
 // real SIGKILL (no handler, no finally, no atexit runs).
 import fsSync from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { acquireWorkerLifetime } from "../../src/authority-lock.js";
 import { AuthorityRuntime } from "../../src/authority-runtime.js";
+import { WorkerClient } from "../../src/client.js";
 import { GitCache } from "../../src/git.js";
-import type { RecoveryExactHold } from "../../src/protocol.js";
 import type { RecoveryRecord } from "../../src/recovery.js";
 import { testLockOptions } from "../authority-test-support.js";
 import { nullLogger } from "../helpers.js";
-import { closed, environment, type Fixture } from "./recovery-bindingless-compat.js";
+import { environment, type Fixture } from "./recovery-bindingless-compat.js";
 
 export const CHILD_AUTHORITY_TOKEN = "restart-child-authority-token";
 
 /** Every point at which the child can be told to stop forever. */
 export type KillAt =
   | "pre-post"            // inside the inventory source boundary, before the release POST leaves the process
-  | "post-before-ack"     // the server recorded and answered the POST; the ACK write has not started
+  | "post-before-ack"     // the server recorded and answered the POST, the real client returned it; the ACK write has not started
   | "ack-tmp-written"     // the ACK temp file is on disk; the rename has not run
   | "ack-renamed"         // the ACK is durable; no cleanup has started
   | "after-begin-bare"    // the first shared-bare deletion is registered with the authority; the ref is untouched
@@ -41,24 +41,17 @@ export interface ChildSpec {
   killAt?: KillAt;
   marker: string;
   result: string;
-  server: string;
+  /** Base URL of the fake worker API the parent hosts (http://127.0.0.1:<port>). */
+  apiUrl: string;
 }
 
-/** The fake server state both processes read and append to. */
+/** The fake worker API's persisted state (the parent owns the file; the child never touches it). */
 export interface ServerState { posts: Array<{ evidence: unknown; disposition: unknown }> }
 
 const spec = JSON.parse(fsSync.readFileSync(process.argv[2]!, "utf8")) as ChildSpec;
 // A child that outlives its parent for any reason ends itself.
 setTimeout(() => process.exit(97), 150_000);
 
-function readServer(): ServerState {
-  try { return JSON.parse(fsSync.readFileSync(spec.server, "utf8")) as ServerState; } catch { return { posts: [] }; }
-}
-function writeServer(state: ServerState): void {
-  const tmp = spec.server + ".tmp";
-  fsSync.writeFileSync(tmp, JSON.stringify(state));
-  fsSync.renameSync(tmp, spec.server);
-}
 function writeResult(value: unknown): void {
   const tmp = spec.result + ".tmp";
   fsSync.writeFileSync(tmp, JSON.stringify(value));
@@ -92,33 +85,21 @@ Object.assign(coordinator, { authority });
 e.state.open = false;
 f.record = (await coordinator.inspect(spec.runId))[0]!;
 
-// The closed hold carries the receipt equal to the saved FINAL request (the case-A evidence), from the start.
-client.getExactRecoveryHold = async (): Promise<RecoveryExactHold | undefined> => {
-  const request = (await coordinator.inspect(spec.runId))[0]?.finalRequest;
-  if (!request) return undefined;
-  return { ...closed(f), state: "released", run_status: "failed", release_evidence: request.evidence,
-    final_receipt: request.disposition };
-};
-// The real API treats an identical released disposition as a replay (api/internal/recovery/final_inventory.go):
-// the same request is answered with the same ack; a different one is refused.
-client.releaseRecoveryCustody = async (...args: unknown[]) => {
+// The REAL WorkerClient, registered against the parent's HTTP fake: the exact-hold read and the release POST are its
+// own request construction, validation and response handling. The parent's API models the real replay rule
+// (api/internal/recovery/final_inventory.go): an identical released request is answered with the same ack, a different one
+// is refused with a conflict.
+const real = new WorkerClient(spec.apiUrl, "restart-child-api-token", "test", nullLogger());
+await real.register("worker", undefined, 1, undefined, ["recovery_held_publication_v2"], undefined, 0);
+client.getExactRecoveryHold = (...args: Parameters<WorkerClient["getExactRecoveryHold"]>) => real.getExactRecoveryHold(...args);
+client.releaseRecoveryCustody = async (...args: Parameters<WorkerClient["releaseRecoveryCustody"]>) => {
   if (at("pre-post")) await block("pre-post");
-  const entry = { evidence: args[2], disposition: args[3] };
-  const state = readServer();
-  const first = state.posts[0];
-  if (first && JSON.stringify(first) !== JSON.stringify(entry)) throw new Error("fixture server: conflicting release disposition");
-  state.posts.push(entry);
-  writeServer(state);
-  return { run_id: spec.runId, generation: spec.generation, released: true, holds_released: 1 };
+  const ack = await real.releaseRecoveryCustody(...args);
+  // The HTTP response has been received and decoded by the client; the coordinator has not yet persisted the ACK.
+  if (at("post-before-ack")) await block("post-before-ack");
+  return ack;
 };
 
-if (at("post-before-ack")) {
-  const write = coordinator["writeRecordUnlocked"].bind(coordinator);
-  Object.assign(coordinator, { writeRecordUnlocked: async (record: RecoveryRecord) => {
-    if (record.finalAcknowledged === true) await block("post-before-ack");
-    return write(record);
-  } });
-}
 if (at("after-begin-bare")) {
   const begin = cache["beginBare"].bind(cache);
   Object.assign(cache, { beginBare: async (...args: Parameters<typeof begin>) => {

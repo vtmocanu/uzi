@@ -6,6 +6,7 @@ import { afterEach, test } from "node:test";
 import { AuthorityLockBusy } from "../src/authority-lock.js";
 import { GitCache } from "../src/git.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import { latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { RecoveryCoordinator, type RecoveryRecord } from "../src/recovery.js";
 import type { RecoveryExactHold } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
@@ -1029,4 +1030,97 @@ test("A2 never rebuilds the coverage: a missing coverage pin is a named refusal 
   const refs = w.refs();
   assert.deepEqual(await w.resolve(digest), { kind: "refused", reason: "replay_precondition_unmet:frozen_coverage" });
   await assertByteNeutral(w, bytes, refs);
+});
+
+// ── run-level blockers: retained artifacts stay visible without any record generation ─────────────
+
+const latch = () => latchResidueQuarantine({ cause: "fixture", site: "test" }, nullLogger());
+
+/** Remove every journal entry of the run so only what the test adds remains. */
+async function emptyJournal(w: World) {
+  const dir = w.coordinator["runDir"](w.runId) as string;
+  for (const name of await fs.readdir(dir)) await fs.rm(path.join(dir, name), { recursive: true, force: true });
+  return dir;
+}
+
+async function describedBlockers(w: World, blocker: string) {
+  const bytes = await inventory(w.root);
+  const refs = w.refs();
+  const d = await w.describe();
+  assert.deepEqual(d, { kind: "described", runId: w.runId, generations: [], blockers: [blocker] });
+  assert.deepEqual(await inventory(w.root), bytes, "describe wrote nothing");
+  assert.equal(w.refs(), refs);
+}
+
+test("describe reports an orphan bundle, an orphan temp file, a settlement-only run and terminal protection with no generation", async () => {
+  const bundle = await world();
+  const dir = await emptyJournal(bundle);
+  await fs.writeFile(path.join(dir, "orphan-capture.bundle"), "x");
+  await describedBlockers(bundle, "unbound_artifact:orphan-capture.bundle");
+
+  const tmp = await world();
+  await fs.writeFile(path.join(await emptyJournal(tmp), "partial.tmp"), "x");
+  await describedBlockers(tmp, "unbound_artifact:partial.tmp");
+
+  const settlement = await world();
+  await emptyJournal(settlement);
+  const sdir = path.join(settlement.root, "data", "recovery-settlement", settlement.runId);
+  await fs.mkdir(sdir, { recursive: true });
+  await fs.writeFile(path.join(sdir, "x.json"), "{}");
+  await describedBlockers(settlement, "settlement_record_unsupported");
+
+  const terminal = await world();
+  await emptyJournal(terminal);
+  Object.assign(terminal.coordinator, { terminalRecordProtection: async () => true });
+  await describedBlockers(terminal, "terminal_protection");
+});
+
+test("an orphan artifact next to a record is also a run-level blocker, and resolve still refuses it", async () => {
+  const w = await world();
+  await fs.writeFile(path.join(w.coordinator["runDir"](w.runId) as string, "stray.tmp"), "x");
+  const d = await w.describe();
+  assert.equal(d.kind === "described" && d.blockers.join(","), "unbound_artifact:stray.tmp");
+  assert.equal(await w.classification(), "unbound_artifact:stray.tmp");
+});
+
+// ── refusal controls: an unreadable record and the residue quarantine ───────────────────────────────
+
+test("an unreadable record is a run-level blocker for describe and a byte-neutral refusal for resolve", async () => {
+  const unreadable = () => { throw new Error("fixture read failure"); };
+  const w = await world();
+  await refused(w, "inventory_incomplete", () => { Object.assign(w.coordinator, { readRecordResult: unreadable }); });
+  const d = await w.describe();
+  assert.deepEqual(d, { kind: "described", runId: w.runId, generations: [], blockers: ["inventory_incomplete"] });
+
+  const a2 = await replayWorld();
+  const digest = await a2.digest();
+  const bytes = await inventory(a2.root);
+  const refs = a2.refs();
+  Object.assign(a2.coordinator, { readRecordResult: unreadable });
+  assert.deepEqual(await a2.resolve(digest), { kind: "refused", reason: "inventory_incomplete" });
+  await assertByteNeutral(a2, bytes, refs);
+});
+
+test("a residue quarantine refuses before the pre-check and again between the pre-check and the forget expectation", async () => {
+  const before = await world();
+  await refused(before, "worker_quarantined", () => { latch(); });
+  resetResidueQuarantineForTests();
+  const duringJ = await world();
+  await refused(duringJ, "worker_quarantined", () => {
+    Object.assign(duringJ.coordinator, { onForgetJournalLockedForTest: () => { latch(); } });
+  });
+  for (const ref of duringJ.e.refs) assert.match(duringJ.refs(), new RegExp(ref), "nothing was deleted");
+  resetResidueQuarantineForTests();
+});
+
+test("A2 refuses a residue quarantine latched before the POST: zero POSTs, record bytes unchanged", async () => {
+  resetResidueQuarantineForTests();
+  const early = await replayWorld();
+  const digest = await early.digest();
+  const bytes = await inventory(early.root);
+  const refs = early.refs();
+  latch();
+  assert.deepEqual(await early.resolve(digest), { kind: "refused", reason: "worker_quarantined" });
+  await assertByteNeutral(early, bytes, refs);
+  resetResidueQuarantineForTests();
 });
