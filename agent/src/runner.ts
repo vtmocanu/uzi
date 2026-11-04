@@ -24280,12 +24280,14 @@ export class RunRunner {
       memory_episode: memory.claim.memory_episode!, memory_policy: memory.claim.memory_policy!,
       memory_intervention_count: memory.spent, flight, lifecycleRevision: ++memory.lifecycleRevision,
     }, {
-      prepareFeedback: (captured, result) => {
+      prepareFeedback: (captured, result, diagnostics) => {
         if (captured.flight !== flight || result.claim_generation !== flight.claimGeneration) return;
         if (memory.feedback.has(result.intervention_id)) return;
         memory.feedback.set(result.intervention_id, { context: captured, result });
+        // Diagnostics ride the status feed only; the stored/model-visible result is unchanged.
         if (!flight.owedFeedClosed) flight.batcher.emit({ kind: "status", payload: {
           event: "worker_memory_pressure", ...result,
+          ...(diagnostics !== undefined ? { memory_diagnostics: diagnostics } : {}),
         } });
         else this.retainWorkerMemoryCustody(flight);
       },
