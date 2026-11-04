@@ -70,7 +70,7 @@ Deployment. New persistent **M** workers allocate 25Gi of `/data`, and **L** and
 are converged **upward** to these sizes by the controller when the claim's StorageClass allows volume
 expansion; it never shrinks, deletes or recreates a volume. An accepted
 expansion grows the claim's request first. The filesystem can stay pending until the
-driver finishes the resize online; otherwise it stays pending until the next independently authorized idle roll (for example an image or spec change rolled while idle, or an operator-initiated idle restart per [the supported procedure](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes)) remounts the volume. Expansion itself never triggers a roll;
+driver finishes the resize online; otherwise it stays pending until the next independently authorized idle roll (for example an image or spec change rolled while idle, or an operator-initiated idle restart per [the supported procedure](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#remounting-a-pending-expansion-at-an-idle-restart)) remounts the volume. Expansion itself never triggers a roll;
 the controller never forces a restart, and logs `pvc-resize-pending` meanwhile. Without expansion
 support or the controller's read-only StorageClass access, the volume keeps its capacity and
 operators can [expand it in place](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes).

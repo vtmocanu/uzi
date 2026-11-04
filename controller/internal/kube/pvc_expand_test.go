@@ -879,7 +879,17 @@ func TestExpandIdleRollForOwnReasonsKeepsClaims(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.client.ClearActions()
-	_ = f.tick()
+	if err := f.tick(); err != nil {
+		t.Fatalf("reconcile: %v\n%s", err, f.logs)
+	}
+	// The roll must actually have happened: a Deployment template patch that
+	// replaced the stale spec hash.
+	if got := templatePatches(f.client); len(got) != 1 || got[0] != deploymentName(f.w.ID) {
+		t.Fatalf("want exactly one Deployment template patch, got %v\n%s", got, f.logs)
+	}
+	if h := podTemplateOf(t, f.client, f.ns).Spec.Template.Annotations[AnnotationSpecHash]; h == "old-release-hash" || h == "" {
+		t.Fatalf("spec hash not replaced by the roll: %q", h)
+	}
 	for _, m := range mutations(f.client) {
 		if strings.HasPrefix(m, "delete persistentvolumeclaims") || strings.HasPrefix(m, "create persistentvolumeclaims") {
 			t.Fatalf("roll touched a claim: %s", m)
@@ -962,6 +972,279 @@ func TestExpandSecondResizeOfSameClaimLogsAgain(t *testing.T) {
 	needle := "pvc-resize-pending worker=w1 pvc=" + dataPVCName("w1")
 	if n := strings.Count(f.logs.String(), needle); n != 2 {
 		t.Fatalf("want 2 resize-pending lines for the data claim, got %d:\n%s", n, f.logs)
+	}
+}
+
+var pvcGVR = schema.GroupVersionResource{Version: "v1", Resource: "persistentvolumeclaims"}
+
+// raceDataPatch makes the FIRST PVC patch for claim `name` race with a concurrent
+// writer. The writer mutates the fake tracker's stored object after the controller
+// took its snapshot (no clientset action is recorded for it), then the patch is
+// evaluated against the changed stored object.
+//
+// The fake tracker applies a merge patch without checking metadata.uid or
+// metadata.resourceVersion, so this reactor mimics the apiserver's precondition
+// handling itself: a non-empty uid that differs from the stored one is refused 422
+// (Invalid), a non-empty resourceVersion that differs is refused 409 (Conflict), and an
+// empty value is no precondition. On success it falls through to the default reactor,
+// which applies the merge patch to the stored object. This is simulated evidence, not
+// a real-apiserver verification.
+func raceDataPatch(f *expandFx, name string, concurrent func(t *testing.T, tr k8stesting.ObjectTracker, cur *corev1.PersistentVolumeClaim)) {
+	raced := false
+	f.client.PrependReactor("patch", "persistentvolumeclaims", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		pa := a.(k8stesting.PatchAction)
+		tr := f.client.Tracker()
+		if !raced && pa.GetName() == name {
+			raced = true
+			obj, err := tr.Get(pvcGVR, pa.GetNamespace(), name)
+			if err != nil {
+				f.t.Fatal(err)
+			}
+			concurrent(f.t, tr, obj.(*corev1.PersistentVolumeClaim).DeepCopy())
+		}
+		obj, err := tr.Get(pvcGVR, pa.GetNamespace(), pa.GetName())
+		if err != nil {
+			return true, nil, err
+		}
+		stored := obj.(*corev1.PersistentVolumeClaim)
+		var body struct {
+			Metadata struct {
+				UID             types.UID `json:"uid"`
+				ResourceVersion string    `json:"resourceVersion"`
+			} `json:"metadata"`
+		}
+		if err := json.Unmarshal(pa.GetPatch(), &body); err != nil {
+			return true, nil, err
+		}
+		if body.Metadata.UID != "" && body.Metadata.UID != stored.UID {
+			return true, nil, apierrors.NewInvalid(schema.GroupKind{Kind: "PersistentVolumeClaim"}, pa.GetName(), nil)
+		}
+		if body.Metadata.ResourceVersion != "" && body.Metadata.ResourceVersion != stored.ResourceVersion {
+			return true, nil, apierrors.NewConflict(pvcGVR.GroupResource(), pa.GetName(), fmt.Errorf("resourceVersion precondition"))
+		}
+		return false, nil, nil
+	})
+}
+
+func assertNoClaimOrPodLifecycle(t *testing.T, f *expandFx) {
+	t.Helper()
+	for _, m := range mutations(f.client) {
+		if !strings.HasPrefix(m, "patch persistentvolumeclaims/") {
+			t.Fatalf("unexpected mutation %q (all: %v)", m, mutations(f.client))
+		}
+	}
+	if len(f.cord.calls)+len(f.cord.clearCalls) != 0 {
+		t.Fatal("cordoner called")
+	}
+}
+
+func dataPatches(f *expandFx) int {
+	n := 0
+	names, _ := pvcPatches(f.client)
+	for _, name := range names {
+		if strings.HasPrefix(name, dataPVCName(f.w.ID)+"@") {
+			n++
+		}
+	}
+	return n
+}
+
+// Concurrent manual growth: between the snapshot and the patch an operator grows /data
+// to 60Gi (new resourceVersion). The fenced patch is refused 409, the newer allocation
+// survives untouched, and the next ordinary tick sees requested >= desired and leaves
+// it alone.
+func TestExpandRacesManualGrowthLeavesNewerAllocation(t *testing.T) {
+	f := newExpandFx(t, expandOpt{expand: boolp(true)})
+	data, dind := dataPVCName(f.w.ID), dindDataPVCName(f.w.ID)
+	uid := f.claim(data).UID
+	raceDataPatch(f, data, func(t *testing.T, tr k8stesting.ObjectTracker, cur *corev1.PersistentVolumeClaim) {
+		cur.Spec.Resources.Requests[corev1.ResourceStorage] = resource.MustParse("60Gi")
+		cur.ResourceVersion = "8"
+		if err := tr.Update(pvcGVR, cur, cur.Namespace); err != nil {
+			t.Fatal(err)
+		}
+	})
+	f.client.ClearActions()
+	f.mustTick()
+	if !strings.Contains(f.logs.String(), "pvc-expand-failed worker=w1 pvc="+data+" reason=conflict") {
+		t.Fatalf("no conflict logged:\n%s", f.logs)
+	}
+	got := f.claim(data)
+	if f.request(data) != "60Gi" || got.UID != uid || got.ResourceVersion != "8" {
+		t.Fatalf("newer allocation disturbed: request=%s uid=%s rv=%s", f.request(data), got.UID, got.ResourceVersion)
+	}
+	if f.request(dind) != "50Gi" {
+		t.Fatalf("sibling claim must still converge: %s", f.request(dind))
+	}
+	assertNoClaimOrPodLifecycle(t, f)
+	f.client.ClearActions()
+	f.mustTick()
+	if n := dataPatches(f); n != 0 {
+		t.Fatalf("next tick patched the grown claim %d times", n)
+	}
+	if f.request(data) != "60Gi" || f.claim(data).UID != uid {
+		t.Fatal("grown claim changed on the next tick")
+	}
+}
+
+// Concurrent replacement: the claim is deleted and recreated (new UID) after the
+// snapshot. The fenced patch is refused 422 and the replacement is untouched; the next
+// tick fences on the replacement's own identity when it is Bound, and does nothing while
+// it is still Pending.
+func TestExpandRacesClaimReplacementNeverTouchesReplacement(t *testing.T) {
+	for _, bound := range []bool{true, false} {
+		t.Run(fmt.Sprintf("bound=%v", bound), func(t *testing.T) {
+			f := newExpandFx(t, expandOpt{expand: boolp(true)})
+			data := dataPVCName(f.w.ID)
+			raceDataPatch(f, data, func(t *testing.T, tr k8stesting.ObjectTracker, cur *corev1.PersistentVolumeClaim) {
+				if err := tr.Delete(pvcGVR, cur.Namespace, cur.Name); err != nil {
+					t.Fatal(err)
+				}
+				cur.UID, cur.ResourceVersion = "uid-replaced", "9"
+				if !bound {
+					cur.Status.Phase = corev1.ClaimPending
+					cur.Status.Capacity = nil
+				}
+				if err := tr.Create(pvcGVR, cur, cur.Namespace); err != nil {
+					t.Fatal(err)
+				}
+			})
+			f.client.ClearActions()
+			f.mustTick()
+			if !strings.Contains(f.logs.String(), "pvc-expand-failed worker=w1 pvc="+data+" reason=invalid") {
+				t.Fatalf("no invalid logged:\n%s", f.logs)
+			}
+			if got := f.claim(data); got.UID != "uid-replaced" || f.request(data) != "25Gi" || got.ResourceVersion != "9" {
+				t.Fatalf("replacement disturbed: uid=%s request=%s rv=%s", got.UID, f.request(data), got.ResourceVersion)
+			}
+			assertNoClaimOrPodLifecycle(t, f)
+			f.client.ClearActions()
+			f.mustTick()
+			names, bodies := pvcPatches(f.client)
+			var dataBodies []string
+			for i, n := range names {
+				if strings.HasPrefix(n, data+"@") {
+					dataBodies = append(dataBodies, bodies[i])
+				}
+			}
+			if bound {
+				if len(dataBodies) != 1 || dataBodies[0] != expectPatchBody("uid-replaced", "9", "50Gi") {
+					t.Fatalf("want one patch fenced on the replacement's identity, got %v", dataBodies)
+				}
+				if f.request(data) != "50Gi" || f.claim(data).UID != "uid-replaced" {
+					t.Fatalf("replacement not converged: %s %s", f.request(data), f.claim(data).UID)
+				}
+			} else {
+				if len(dataBodies) != 0 {
+					t.Fatalf("pending replacement patched: %v", dataBodies)
+				}
+				if f.request(data) != "25Gi" {
+					t.Fatalf("pending replacement changed: %s", f.request(data))
+				}
+			}
+			for _, m := range mutations(f.client) {
+				if !strings.HasPrefix(m, "patch persistentvolumeclaims/") {
+					t.Fatalf("unexpected mutation %q", m)
+				}
+			}
+		})
+	}
+}
+
+// A manual 60Gi request above the 50Gi target whose capacity has not caught up is
+// pending: no patch (never a shrink), and the pending state is reported.
+func TestExpandManualGrowthWithPendingCapacityIsNeverPatched(t *testing.T) {
+	f := newExpandFx(t, expandOpt{expand: boolp(true), dataReq: "60Gi", dindReq: "60Gi", claimFn: func(_ string, p *corev1.PersistentVolumeClaim) {
+		p.Status.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("50Gi")}
+	}})
+	f.client.ClearActions()
+	f.mustTick()
+	if names, _ := pvcPatches(f.client); len(names) != 0 {
+		t.Fatalf("patched a claim already requested above target: %v", names)
+	}
+	if got := mutations(f.client); len(got) != 0 {
+		t.Fatalf("mutations: %v", got)
+	}
+	for _, n := range []string{dataPVCName("w1"), dindDataPVCName("w1")} {
+		if f.request(n) != "60Gi" {
+			t.Fatalf("%s request changed: %s", n, f.request(n))
+		}
+		if !strings.Contains(f.logs.String(), "pvc-resize-pending worker=w1 pvc="+n+" reason=capacity-below-request") {
+			t.Fatalf("no pending report for %s:\n%s", n, f.logs)
+		}
+	}
+}
+
+// Busy and custody-held workers are never rolled or cordoned for a resize: a claim
+// at target with FileSystemResizePending is only reported, once across ticks.
+func TestExpandPendingResizeOnBusyAndCustodyHeldWorkersOnlyReports(t *testing.T) {
+	for name, fn := range map[string]func(*protocol.DesiredWorker){
+		"busy":    func(w *protocol.DesiredWorker) { w.Busy = true },
+		"custody": func(w *protocol.DesiredWorker) { w.CustodyHeld = true },
+		"both":    func(w *protocol.DesiredWorker) { w.Busy, w.CustodyHeld = true, true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newExpandFx(t, expandOpt{expand: boolp(true), dataReq: "50Gi", dindReq: "50Gi", workerFn: fn, claimFn: func(_ string, p *corev1.PersistentVolumeClaim) {
+				p.Status.Conditions = []corev1.PersistentVolumeClaimCondition{{Type: corev1.PersistentVolumeClaimFileSystemResizePending, Status: corev1.ConditionTrue}}
+			}})
+			dataUID, dindUID := f.claim(dataPVCName("w1")).UID, f.claim(dindDataPVCName("w1")).UID
+			depBefore := podTemplateOf(t, f.client, f.ns)
+			f.client.ClearActions()
+			f.mustTick()
+			f.mustTick()
+			f.mustTick()
+			if got := mutations(f.client); len(got) != 0 {
+				t.Fatalf("mutations while a resize is pending: %v", got)
+			}
+			if len(f.cord.calls)+len(f.cord.clearCalls) != 0 {
+				t.Fatal("cordoner called")
+			}
+			depAfter := podTemplateOf(t, f.client, f.ns)
+			if !reflect.DeepEqual(depBefore.Spec, depAfter.Spec) || !reflect.DeepEqual(depBefore.Annotations, depAfter.Annotations) {
+				t.Fatal("deployment changed")
+			}
+			if f.claim(dataPVCName("w1")).UID != dataUID || f.claim(dindDataPVCName("w1")).UID != dindUID {
+				t.Fatal("claim UID changed")
+			}
+			for _, n := range []string{dataPVCName("w1"), dindDataPVCName("w1")} {
+				needle := "pvc-resize-pending worker=w1 pvc=" + n + " reason=condition-FileSystemResizePending"
+				if c := strings.Count(f.logs.String(), needle); c != 1 {
+					t.Fatalf("%s reported %d times over 3 ticks, want 1:\n%s", n, c, f.logs)
+				}
+			}
+		})
+	}
+}
+
+// Control: an ABSENT dind claim is created by the existing create path at the
+// render size; expansion issues no patch and no delete.
+func TestExpandAbsentClaimIsCreatedNotExpanded(t *testing.T) {
+	f := newExpandFx(t, expandOpt{expand: boolp(true), dataReq: "50Gi"})
+	dind := dindDataPVCName(f.w.ID)
+	if err := f.client.CoreV1().PersistentVolumeClaims(f.ns).Delete(context.Background(), dind, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	f.client.ClearActions()
+	f.mustTick()
+	var created []string
+	for _, a := range f.client.Actions() {
+		if a.GetResource().Resource != "persistentvolumeclaims" {
+			continue
+		}
+		switch a.GetVerb() {
+		case "create":
+			p := a.(k8stesting.CreateAction).GetObject().(*corev1.PersistentVolumeClaim)
+			q := p.Spec.Resources.Requests[corev1.ResourceStorage]
+			created = append(created, p.Name+"="+q.String())
+		case "patch", "delete":
+			t.Fatalf("unexpected PVC %s (all: %v)", a.GetVerb(), mutations(f.client))
+		}
+	}
+	if len(created) != 1 || created[0] != dind+"=50Gi" {
+		t.Fatalf("want one create of %s at 50Gi, got %v\n%s", dind, created, f.logs)
+	}
+	if strings.Contains(f.logs.String(), "pvc-expand") {
+		t.Fatalf("expansion engaged on an absent claim:\n%s", f.logs)
 	}
 }
 

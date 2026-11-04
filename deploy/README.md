@@ -597,7 +597,7 @@ retried on later ticks), `pvc-expand-skipped` (for example `class-not-expandable
 `class-lookup-forbidden`, `no-storage-class`), `pvc-expand-failed` (for example
 `reason=forbidden` when the namespace quota is exhausted) and `pvc-resize-pending` /
 `pvc-resize-failed`. The filesystem finishes online on a driver that supports it;
-otherwise it stays pending until the next independently authorized idle roll (for example an image or spec change rolled while idle, or an operator-initiated idle restart: wait for the worker to be idle and follow the normal controlled pod roll, retaining its data PVC) remounts the volume. Expansion itself never triggers a roll.
+otherwise it stays pending until the next independently authorized idle roll (for example an image or spec change rolled while idle, or an operator-initiated idle restart, see [Remounting a pending expansion at an idle restart](#remounting-a-pending-expansion-at-an-idle-restart)) remounts the volume. Expansion itself never triggers a roll.
 The controller never forces a restart. With `workers.storageClassRead.create=false`, custom
 RBAC or an older chart the class lookup is refused and expansion fails closed
 (`class-lookup-forbidden`). The manual procedure below remains for operators and edge cases.
@@ -665,6 +665,67 @@ retained work. Do not delete or recreate a custody-held data volume.
 The larger volume adds headroom; it does not bound build-cache growth. Existing
 cache-cap and disk-pressure safeguards remain enabled. Long-run acceptance for
 #2013 still requires a post-release measurement.
+
+#### Remounting a pending expansion at an idle restart
+
+A manual cordon alone does not remount anything: it changes no pod template, so it
+creates no drift and no roll. There is also no owner restart action in uzi. When the
+driver cannot finish online and no image or spec change is due, the one remaining way to
+remount is for a cluster operator (with `kubectl` access to the worker namespace) to
+delete the worker's current pod while the worker is idle. This is manual, outside
+controller protection, and unverified on a live cluster. Replace `<ns>`, `<claim>`,
+`<worker-id>` and `<pod-name>`; a worker's pod is `uzi-hw-<worker-id>-*`.
+
+1. **Confirm a remount is needed.** The request is above the capacity and the
+   filesystem resize is waiting on the node:
+
+   ```sh
+   kubectl get pvc -n <ns> <claim> \
+     -o jsonpath='{.spec.resources.requests.storage}{" "}{.status.capacity.storage}{" "}{.metadata.uid}{"\n"}'
+   kubectl get pvc -n <ns> <claim> \
+     -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'
+   ```
+
+   Proceed only if the request exceeds `status.capacity` and `FileSystemResizePending=True`
+   is listed (controller log: `pvc-resize-pending`). If a `Resizing` or `*Error`
+   condition shows, or the controller logs `pvc-resize-failed`, stop: a restart will not
+   fix it. Record the claim UID(s) (the `/data` claim and, for Docker workers, the DinD
+   claim).
+2. **Stop new intake.** The worker's owner cordons it
+   ([manual cordon](../docs/hosted-workers.md#pause-new-work-with-a-manual-cordon)),
+   from the Workers page or `uzi worker cordon <worker-id> -m 'pvc remount'`. Cordon
+   needs a persistent worker and an owner; an admin cannot cordon another owner's worker.
+   Cordon does not cancel assigned runs.
+3. **Wait until the worker is idle, and stop if it is custody-held.**
+   - No assigned nonterminal run: `uzi worker list` shows no run in `RUN SLOTS` and no
+     pending outcomes in `RUNS`; the worker detail lists any assigned blockers
+     ([which runs block an upgrade](../docs/hosted-workers.md#see-which-assigned-runs-block-an-upgrade)).
+     Queued, paused and every wait or gate count as assigned.
+   - Not custody-held: `uzi run recovery` lists no open hold whose `WORKER` is this
+     worker. If one is open, **do not proceed**: deleting the pod puts the unpublished
+     committed work it protects at risk. Resolve it first ([Run recovery](../docs/run-recovery.md)).
+   - No DinD or pressure maintenance in flight: a worker showing `(draining)` that
+     you did not cordon is under a roll or maintenance fence. Wait for it to clear; do
+     not delete into it.
+4. **Restart only the pod.** Manual pod deletion is outside the controller's busy-run
+   protection, which is why steps 2 and 3 are mandatory.
+
+   ```sh
+   kubectl get pod -n <ns> -l uzi.dev/hosted-worker-id=<worker-id>
+   kubectl delete pod -n <ns> <pod-name>
+   ```
+
+   Delete only that pod: never the Deployment and never a PVC. The Deployment (strategy
+   `Recreate`) starts a replacement that mounts the same claims, and the kubelet
+   finishes the filesystem resize on mount.
+5. **Verify.** Re-run the two `kubectl get pvc` commands: each claim UID is unchanged,
+   `status.capacity` equals the request, `FileSystemResizePending` is gone. Check the
+   pod is `Ready` (`kubectl get pod -n <ns> -l uzi.dev/hosted-worker-id=<worker-id>`)
+   and the controller no longer logs `pvc-resize-pending` for the claim. Where exec is
+   permitted, `df -h /data` in the `worker` container (and the DinD data root in the
+   `dind` container, via `kubectl exec -c`) should show the new size.
+6. **Uncordon:** `uzi worker uncordon <worker-id>` (or the Workers page). This removes
+   only your manual hold; any automatic drain, maintenance or custody fence still applies.
 
 ### Cross-check capacity
 

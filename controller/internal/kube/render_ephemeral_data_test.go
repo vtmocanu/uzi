@@ -285,26 +285,42 @@ func TestRunBoundDataDefaultFitsTheIsolatedLane(t *testing.T) {
 	if len(preset.SizeNames()) == 0 || len(preset.TemplateNames()) == 0 {
 		t.Fatal("empty preset table would make the lane checks vacuous")
 	}
-	for _, template := range preset.TemplateNames() {
-		for _, size := range preset.SizeNames() {
-			w := protocol.DesiredWorker{ID: "isolated-fleet", Template: template, Size: size, Isolated: true, Ephemeral: true}
-			claims := pvcSizes(t, laneTestConfig(), w, testSpec(t, template, size))
-			if len(claims) != 2 {
-				t.Fatalf("isolated worker rendered %d claims, want data and nix", len(claims))
-			}
-			var perWorker resource.Quantity
-			for name, q := range claims {
-				if q.Cmp(max) > 0 {
-					t.Errorf("isolated %s/%s claim %s = %s exceeds ceiling %s", template, size, name, q.String(), max.String())
+	// Isolated + Docker is refused by Placement, but the renderer must still never
+	// emit a DinD claim for it, so both shapes are rendered; "30Gi" is the
+	// EphemeralDataSize override path.
+	for _, override := range []string{"", "30Gi"} {
+		wantData := resource.MustParse(ephemeralDataDefaultSize)
+		if override != "" {
+			wantData = resource.MustParse(override)
+		}
+		for _, docker := range []bool{false, true} {
+			for _, template := range preset.TemplateNames() {
+				for _, size := range preset.SizeNames() {
+					cfg := laneTestConfig()
+					cfg.EphemeralDataSize = override
+					w := protocol.DesiredWorker{ID: "isolated-fleet", Template: template, Size: size, Isolated: true, Ephemeral: true, Docker: docker}
+					claims := pvcSizes(t, cfg, w, testSpec(t, template, size))
+					if _, ok := claims[dindDataPVCName(w.ID)]; ok || len(claims) != 2 {
+						t.Fatalf("isolated docker=%v %s/%s rendered claims %v, want data and nix only (no dind-data)", docker, template, size, claims)
+					}
+					if got := claims[dataPVCName(w.ID)]; got.Cmp(wantData) != 0 {
+						t.Errorf("isolated docker=%v override=%q %s/%s /data = %s, want %s", docker, override, template, size, got.String(), wantData.String())
+					}
+					var perWorker resource.Quantity
+					for name, q := range claims {
+						if q.Cmp(max) > 0 {
+							t.Errorf("isolated %s/%s claim %s = %s exceeds ceiling %s", template, size, name, q.String(), max.String())
+						}
+						perWorker.Add(q)
+					}
+					var fleet resource.Quantity
+					for range count {
+						fleet.Add(perWorker)
+					}
+					if fleet.Cmp(quota) > 0 {
+						t.Errorf("isolated %s/%s (override %q) fleet of %d requests %s, quota %s", template, size, override, count, fleet.String(), quota.String())
+					}
 				}
-				perWorker.Add(q)
-			}
-			var fleet resource.Quantity
-			for range count {
-				fleet.Add(perWorker)
-			}
-			if fleet.Cmp(quota) > 0 {
-				t.Errorf("isolated %s/%s fleet requests %s, quota %s", template, size, fleet.String(), quota.String())
 			}
 		}
 	}
