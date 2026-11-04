@@ -99,7 +99,9 @@ phase worker-env-proof python3 "$BOUNDED" capture "$REPORT_DIR" "$TOKEN" "$REPOR
   --entrypoint /usr/local/sbin/uzi-entrypoint "$IMAGE_ID" \
   /usr/local/bin/node --import /app/node_modules/tsx/dist/loader.mjs \
   --import /app/uzi-worker-uid-proof/agent/test/setup/hermetic-proc.ts \
-  --test --test-concurrency=1 --test-timeout=350000 --test-reporter=junit \
+  --test --test-concurrency=1 --test-timeout=350000 \
+  --test-reporter=junit --test-reporter-destination=stdout \
+  --test-reporter=spec --test-reporter-destination=stderr \
   /app/uzi-worker-uid-proof/e2e/worker-env/worker-env-real.test.mts
 rc=$?
 set -e

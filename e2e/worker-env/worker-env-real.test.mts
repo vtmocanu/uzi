@@ -110,7 +110,7 @@ function tail(text: string, lines = 40): string { return text.split("\n").slice(
  * command's own TMPDIR, so the wrapper also exercises that layout.
  */
 function evidenceCommand(command: string, evidence: string): string {
-  return `out="$(mktemp)"; ${command} >"$out" 2>&1; rc=$?; grep -E ${quote(evidence)} "$out" | tail -n 5; echo '--- tail'; tail -n 80 "$out"; echo "worker-env-rc=$rc"; rm -f "$out"; exit $rc`;
+  return `out="$(mktemp)"; ${command} >"$out" 2>&1; rc=$?; grep -E -- ${quote(evidence)} "$out" | tail -n 5; echo '--- tail'; tail -n 80 "$out"; echo "worker-env-rc=$rc"; rm -f "$out"; exit $rc`;
 }
 
 // ---------------------------------------------------------------------------------------------

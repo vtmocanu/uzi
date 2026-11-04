@@ -123,7 +123,11 @@ class RunShTest(unittest.TestCase):
         # Both containers run the inspected image by immutable id, never the mutable tag.
         self.assertEqual(proof[proof.index("--entrypoint") + 2], IMAGE_ID)
         self.assertEqual(seed[seed.index("--entrypoint") + 2], IMAGE_ID)
-        self.assertIn("--test-reporter=junit", proof)
+        # JUnit stays alone on stdout (the checker input); a spec reporter on stderr carries the
+        # captured diagnostics of passing leaves into the job log.
+        i = proof.index("--test-reporter=junit")
+        self.assertEqual(proof[i:i + 4], ["--test-reporter=junit", "--test-reporter-destination=stdout",
+                                          "--test-reporter=spec", "--test-reporter-destination=stderr"])
         self.assertEqual(proof[-1], "/app/uzi-worker-uid-proof/e2e/worker-env/worker-env-real.test.mts")
         mounts = [proof[i + 1] for i, a in enumerate(proof) if a == "--mount"]
         self.assertIn(f"type=bind,src={REPO},dst=/src,readonly", mounts)
