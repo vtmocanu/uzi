@@ -17600,7 +17600,7 @@ try {
    */
   private async streamBundleWithCap(barePath: string, args: string[], outPath: string, maxBytes: number): Promise<void> {
     const stopSignals = this.boundaryStopSignals();
-    const { child, stdout, exited, cancel } = await this.spawnGit(barePath, args, undefined, { timeoutMs: GIT_TIMEOUT_MS, stdoutCategory: "artifactBytes" });
+    const { child, stdout, exited, cancel } = await this.spawnGit(barePath, args, undefined, { timeoutMs: GIT_TIMEOUT_MS, stdoutCategory: "artifactBytes", stderrMaxBytes: 64 * 1024 });
     let seen = 0;
     const counter = new Transform({
       transform(chunk: Buffer, _enc, cb) {
@@ -17748,7 +17748,7 @@ try {
     const started = Date.now();
     let producer: Awaited<ReturnType<GitCache["spawnGit"]>>;
     try {
-      producer = await this.spawnGit(barePath, ["pack-objects", "--revs", "--stdout", "-q"], revs, { stdoutCategory: "artifactBytes" });
+      producer = await this.spawnGit(barePath, ["pack-objects", "--revs", "--stdout", "-q"], revs, { stdoutCategory: "artifactBytes", stderrMaxBytes: 64 * 1024 });
     } catch (err) {
       throw fail(`pack-objects could not start: ${gitErrorMessage(err)}`);
     }
