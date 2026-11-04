@@ -1156,7 +1156,9 @@ WITH claimant AS MATERIALIZED (
       -- is below @custody_hold_limit (and at least one). Without the bound a claimed run that never
       -- reports running is swept back to queued by SweepClaimedNeverStarted (no requeue_count
       -- bump, no hold release), reclaims under the exemption, opens another generation hold,
-      -- and loops forever; the owner cap used to stop that loop. Once a single run holds
+      -- and loops forever; the owner cap used to stop that loop. Issue #3859 charges a
+      -- WITNESSED departure of such a continuation (SweepClaimedNeverStartedCohort), so this
+      -- bound remains the backstop for unwitnessed ones (e.g. older agents). Once a single run holds
       -- @custody_hold_limit open holds of its own, it faces the owner cap like new work. The
       -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
       -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim

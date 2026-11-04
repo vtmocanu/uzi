@@ -95,8 +95,8 @@ func (p *unwitnessedParkFixture) holdStates(t *testing.T) string {
 	return s
 }
 
-// custodySnapshot is every server-side custody table for the run, serialised in a stable order:
-// holds, captures, capture chunks and prerequisite closures. A Cancel must leave it byte for byte
+// custodySnapshot serialises the run's custody holds, captures, capture chunks and prerequisite
+// closures in a stable order (not run_held_publications or run_fetch_reservations). A Cancel must leave it byte for byte
 // unchanged (no release, discard or deletion).
 func (p *unwitnessedParkFixture) custodySnapshot(t *testing.T) string {
 	t.Helper()
