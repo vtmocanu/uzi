@@ -265,6 +265,10 @@ describe("real pnpm through js-deps (issue #3906)", { skip: skipReason }, () => 
         },
       },
       {
+        label: "pnpmfile=hook.cjs in .npmrc",
+        fixture: (m) => ({ npmrc: "registry=http://127.0.0.1:9/\npnpmfile=hook.cjs\n", files: { "hook.cjs": markerWriter(m) } }),
+      },
+      {
         label: "ignorePnpmfile: false in pnpm-workspace.yaml with .pnpmfile.cjs",
         fixture: (m) => ({ files: { "pnpm-workspace.yaml": "ignorePnpmfile: false\n", ".pnpmfile.cjs": markerWriter(m) } }),
       },

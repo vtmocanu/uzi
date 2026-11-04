@@ -764,6 +764,13 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
       const run = installs[0]!;
       const version = /\bnpm pack --silent pnpm@(\d+\.\d+\.\d+)(?!\S)/.exec(run)?.[1];
       assert.ok(version, `${name}/Dockerfile must pin an exact pnpm semver`);
+      // The REVIEWED pin (issue #3906): bumping it is a deliberate edit here too, with the
+      // js-deps.ts flag audit re-done (pnpm 11 dropped managePackageManagerVersions).
+      assert.equal(version, "10.34.9", `${name}/Dockerfile must pin the reviewed pnpm version`);
+      assert.ok(
+        run.includes('"sha512-9JtajqD97bRLs8DB1ldQkqU8KVDZW3rRXfEfF5dId6LeOgHAfpNOmyjOcW5RwJqUlixzBtCb4uHksYqMh2L9Mg=="'),
+        `${name}/Dockerfile must verify the reviewed pnpm 10.34.9 tarball integrity`,
+      );
       const v = version.replaceAll(".", "\\.");
       assert.match(run, /sha512-[A-Za-z0-9+/]{86}==/, `${name}/Dockerfile must pin the tarball's sha512 integrity`);
       assert.match(
