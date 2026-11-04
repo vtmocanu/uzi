@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -17,6 +18,165 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+// Install exactly the delivered lead rows used by the routing regression. Global
+// defaults are disabled for this user so the test does not depend on the roster.
+func setRoutingLeadTemplate(f crossCheckContentionFixture, model any, nullFirst bool) {
+	f.env.exec(`INSERT INTO agent_template_allocations(template_id,user_id,enabled)
+    SELECT id,$1,false FROM agent_templates WHERE true
+    ON CONFLICT (template_id,(COALESCE(user_id,'00000000-0000-0000-0000-000000000000'::uuid)))
+    DO UPDATE SET enabled=false`, f.userID)
+	id := uuid.New()
+	f.env.exec(`INSERT INTO agent_templates(id,name,description,prompt_body,scope,user_id,codex_model)
+    VALUES($1,'ORCHESTRATOR','d','b','user',$2,$3)`, id, f.userID, model)
+	f.env.exec("INSERT INTO agent_template_allocations(template_id,user_id,enabled) VALUES($1,$2,true)", id, f.userID)
+	if nullFirst {
+		id = uuid.New()
+		f.env.exec(`INSERT INTO agent_templates(id,name,description,prompt_body,scope,user_id)
+        VALUES($1,'LEAD','d','b','user',$2)`, id, f.userID)
+		f.env.exec("INSERT INTO agent_template_allocations(template_id,user_id,enabled) VALUES($1,$2,true)", id, f.userID)
+	}
+}
+
+func assertTemplateEphemeralRouting(t *testing.T, f crossCheckContentionFixture, allowed bool) {
+	t.Helper()
+	e := checkerPlacementEnv(t, f)
+	f.env.exec("UPDATE users SET ephemeral_workers_enabled=true WHERE id=$1", f.userID)
+	f.env.exec("UPDATE workers SET max_concurrent_runs=1 WHERE id=$1", f.workerID)
+	f.env.exec("UPDATE runs SET status_since=now()-interval '5 minutes' WHERE id=$1", f.runID)
+	check := func(saturated bool) {
+		t.Helper()
+		now := time.Now()
+		u, err := e.q.ListUnplaceableQueuedRunsForEphemeral(e.ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
+			CrossCheckEvaluatedAt: pgtype.Timestamptz{Time: now, Valid: true}, CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+			CodexCuratedModels: codexCuratedModelsSlice(), DockerRepoAllowlist: []uuid.UUID{},
+			EphemeralLease: pgtype.Interval{Valid: true}, MaxPerUser: 1000, MaxRows: 10000,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		unplaceable := false
+		for _, r := range u {
+			unplaceable = unplaceable || r.ID == f.runID
+		}
+		s, err := e.q.ListSaturationQueuedRunsForEphemeral(e.ctx, store.ListSaturationQueuedRunsForEphemeralParams{
+			CrossCheckEvaluatedAt: pgtype.Timestamptz{Time: now, Valid: true}, CrossCheckAffinityCutoff: pgtype.Timestamptz{Time: now.Add(-2 * time.Minute), Valid: true},
+			CodexCuratedModels: codexCuratedModelsSlice(), DockerRepoAllowlist: []uuid.UUID{},
+			EphemeralLease: pgtype.Interval{Valid: true}, SaturationDelay: pgtype.Interval{Valid: true}, MaxPerUser: 1000, MaxRows: 10000,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		foundSaturated := false
+		for _, r := range s {
+			foundSaturated = foundSaturated || r.ID == f.runID
+		}
+		if unplaceable != !allowed || foundSaturated != saturated {
+			t.Errorf("ephemeral unplaceable/saturated=%v/%v, want %v/%v", unplaceable, foundSaturated, !allowed, saturated)
+		}
+	}
+	check(false)
+	busy := e.seedActiveRunOwnedBy(t, f.workerID)
+	check(allowed)
+	f.env.exec("UPDATE runs SET status='completed' WHERE id=$1", busy)
+}
+
+func TestLeadTemplateRoutingLiveDB(t *testing.T) {
+	for _, stage := range []string{"plan", "code"} {
+		for _, tc := range []struct {
+			name                  string
+			template, lane, pin   any
+			customCap, customRoot bool
+			nullFirst, disabled   bool
+		}{
+			{"template-luna-incapable", "gpt-6-luna", nil, nil, false, true, false, false},
+			{"template-luna-capable", "gpt-6-luna", nil, nil, true, true, false, false},
+			{"curated-template", "gpt-6-astra", nil, nil, false, false, false, false},
+			{"null-template", nil, nil, nil, false, false, false, false},
+			{"invalid-template", "not-a-role-model", nil, nil, false, false, false, false},
+			{"noncanonical-template", " gpt-6-luna ", nil, nil, false, false, false, false},
+			{"lane-outranks-template", "gpt-6-luna", "gpt-6-sol", nil, false, false, false, false},
+			{"checker-pin-outranks-template", "gpt-6-luna", nil, "gpt-6-astra", false, false, false, false},
+			{"first-null-does-not-skip", "gpt-6-luna", nil, nil, false, false, true, false},
+			{"disabled-template", "gpt-6-luna", nil, nil, false, false, false, true},
+		} {
+			t.Run(stage+"/"+tc.name, func(t *testing.T) {
+				var f crossCheckContentionFixture
+				if stage == "code" {
+					f = codeFixture(t)
+					cc, err := f.svc.SubmitCodeCrossCheck(f.env.ctx, wkrRow(t, f.env, f.workerID), f.lead, 1, strings.Repeat("a", 40), strings.Repeat("b", 40))
+					if err != nil || !cc.CheckerRunID.Valid {
+						t.Fatalf("submit routing code checker: %+v %v", cc, err)
+					}
+					f.runID = uuid.UUID(cc.CheckerRunID.Bytes)
+				} else {
+					f = newCrossCheckContentionFixture(t)
+				}
+				setRoutingLeadTemplate(f, tc.template, tc.nullFirst)
+				if tc.disabled {
+					f.env.exec("UPDATE agent_template_allocations SET enabled=false WHERE user_id=$1", f.userID)
+				}
+				f.env.exec("UPDATE users SET default_codex_model=$2 WHERE id=$1", f.userID, tc.lane)
+				f.env.exec("INSERT INTO user_cross_check_pins(user_id,stage,harness,model) VALUES($1,$2,'codex',$3)", f.userID, stage, tc.pin)
+				caps := checkerPinCaps(true, tc.customCap)
+				if stage == "code" {
+					caps = append(caps, capability.CrossCheckCodeV1, capability.CrossCheckLaneV1)
+				}
+				f.env.exec("UPDATE workers SET protocol_capabilities=$2,last_heartbeat_at=now() WHERE id=$1", f.workerID, caps)
+				e := checkerPlacementEnv(t, f)
+				if h := e.healthRowFor(t, f.runID); h.CodexCustomRoot != tc.customRoot {
+					t.Errorf("health custom root=%v, want %v", h.CodexCustomRoot, tc.customRoot)
+				}
+				allowed := !tc.customRoot || tc.customCap
+				wantCount := int64(0)
+				if allowed {
+					wantCount = 1
+				}
+				if n := e.claimableForRun(t, f.runID); n != wantCount {
+					t.Errorf("claimable workers=%d, want %d", n, wantCount)
+				}
+				if stage == "plan" {
+					assertTemplateEphemeralRouting(t, f, allowed)
+				}
+				params := e.claimParams(f.workerID, caps, false)
+				if stage == "code" {
+					params.Lane = "cross_check"
+				}
+				r, err := e.q.ClaimRun(e.ctx, params)
+				if allowed {
+					if err != nil || r.ID != f.runID {
+						t.Fatalf("eligible worker did not claim checker: id=%v err=%v", r.ID, err)
+					}
+				} else if !errors.Is(err, pgx.ErrNoRows) || mustRun(t, f.env, f.runID).Status != "queued" {
+					t.Fatalf("incapable worker claimed template-derived root: id=%v err=%v", r.ID, err)
+				}
+			})
+		}
+	}
+}
+
+func TestLeadTemplateSpreadPeerRoutingLiveDB(t *testing.T) {
+	for _, custom := range []bool{false, true} {
+		t.Run(fmt.Sprintf("peer-custom-capability=%v", custom), func(t *testing.T) {
+			f := newCrossCheckContentionFixture(t)
+			setRoutingLeadTemplate(f, "gpt-6-luna", false)
+			f.env.exec("UPDATE users SET default_codex_model=NULL WHERE id=$1", f.userID)
+			caps := checkerPinCaps(true, true)
+			f.env.exec("UPDATE workers SET protocol_capabilities=$2,max_concurrent_runs=2,last_heartbeat_at=now() WHERE id=$1", f.workerID, caps)
+			e := checkerPlacementEnv(t, f)
+			e.seedActiveRunOwnedBy(t, f.workerID)
+			e.seedSpreadWorker(t, checkerPinCaps(true, custom), 2)
+			r, err := e.q.ClaimRun(e.ctx, e.claimParams(f.workerID, caps, false))
+			if custom {
+				if !errors.Is(err, pgx.ErrNoRows) || mustRun(t, f.env, f.runID).Status != "queued" {
+					t.Fatalf("claimant did not defer to capable idle peer: id=%v err=%v", r.ID, err)
+				}
+			} else if err != nil || r.ID != f.runID {
+				t.Fatalf("claimant deferred to incapable template-root peer: id=%v err=%v", r.ID, err)
+			}
+		})
+	}
+}
 
 func TestLeadTemplateSelectionLiveDB(t *testing.T) {
 	if os.Getenv("UZI_TEST_DATABASE_URL") == "" {
