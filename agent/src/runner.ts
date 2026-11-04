@@ -3731,6 +3731,20 @@ export class RunRunner {
     return { signal: this.retainedLifecycleSignal(flight), timeoutMs: Math.max(1, Math.min(boundaryMs, budget)) };
   }
 
+  /** The wait for A of a non-held capture taken while the run is parked for a disk stop (issue #3916).
+   *  The disk stop aborts the run's own lifecycle with its PauseNowSignal and never rearms it, so the
+   *  park capture must not wait on that signal (authorityWait would reject at once). A real cancel, a
+   *  claim fence, a receipt failure and shutdown still abort terminalLifecycleSignal / shutdownSignal.
+   *  Like authorityWait, the wait bounds acquisition of A only. Undefined outside disk mode. */
+  private diskParkCaptureWait(flight: RunFlight, boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait | undefined {
+    if (flight.steering.getPauseMode() !== "disk") return undefined;
+    const budget = MaintenanceBudget.current()?.remainingMs() ?? Infinity;
+    return {
+      signal: AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]),
+      timeoutMs: Math.max(1, Math.min(boundaryMs, budget)),
+    };
+  }
+
   /** The wait for A at an authorized cancellation/park cleanup: shutdown and the current independent
    *  maintenance budget only. The flight's cancel/lifecycle signals are deliberately absent: they are
    *  usually already aborted when a cancellation, park or early-terminal cleanup runs, and a flight that is
@@ -22758,7 +22772,9 @@ export class RunRunner {
     }
     const captureDeadline = Math.min(opts.episode?.deadlineAt ?? Infinity,
       opts.heldCapture?.deadlineAt ?? Infinity, opts.heldAuthenticated?.deadlineAt ?? Infinity);
-    await this.bootstrapRemediationRestrictions(flight, undefined, undefined, opts.signal, captureDeadline);
+    const diskWait = (opts.heldCapture ?? opts.heldAuthenticated) ? undefined : this.diskParkCaptureWait(flight);
+    const bodySignal = opts.signal ?? diskWait?.signal;
+    await this.bootstrapRemediationRestrictions(flight, undefined, undefined, bodySignal, captureDeadline);
     // issue #1783 (auditor M2): prove the clone quiescent BEFORE the capture (its wip marker, the
     // fetch-back and the credentialed overlay + publish). On survivors/unverified NOTHING runs:
     // the result is unverified and `residueBlocked`, which each caller treats as its
@@ -22822,7 +22838,7 @@ export class RunRunner {
       await opts.beforeMutation?.();
       const held = opts.heldCapture ?? opts.heldAuthenticated;
       await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
-        held ? { signal: held.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, held.deadlineAt - Date.now())) } : undefined);
+        held ? { signal: held.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, held.deadlineAt - Date.now())) } : diskWait);
       await opts.beforeMutation?.();
     } catch (e) {
       if (opts.beforeMutation) throw e;
@@ -22896,14 +22912,14 @@ export class RunRunner {
     // the publish: a terminal run is never resumed from a checkpoint.
     if (opts.credentialFree) {
       if (opts.publish === false) return { verified, published: false, capturedHead };
-      const freePublished = await this.publishCheckpointBestEffort(flight, barePath, branch, undefined, opts.signal);
+      const freePublished = await this.publishCheckpointBestEffort(flight, barePath, branch, undefined, bodySignal);
       return { verified, published: freePublished, capturedHead };
     }
     let published = false;
     try {
       const publish = async (permit?: BoundaryPermit) => {
         const overlay = await this.buildCheckpointOverlay(claim, flight, barePath);
-        published = await this.publishCheckpointBestEffort(flight, barePath, branch, overlay, opts.signal ?? permit?.signal);
+        published = await this.publishCheckpointBestEffort(flight, barePath, branch, overlay, bodySignal ?? permit?.signal);
       };
       if (opts.heldAuthenticated) {
         this.assertHeldAuthenticatedCapture(flight, opts.heldAuthenticated);
