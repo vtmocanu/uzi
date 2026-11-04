@@ -117,8 +117,7 @@ func (c *cleanupFix) forgeHas(ref string) (string, bool) {
 	return tip, ok
 }
 
-// hostSource stands in for the host clock a fixture used to read: the service clock base and,
-// for DinD, the worker's observation. Nominal, it is time.Now. lagging() is the adverse
+// hostSource stands in for the host clock a fixture used to read as its service clock. Nominal, it is time.Now. lagging() is the adverse
 // ordering of #3883, deterministic: once the flow records a database stamp it read back, the
 // host reads exactly one Postgres tick (1µs) before it, whatever the real clock offset or the
 // elapsed time.
@@ -162,25 +161,36 @@ func eachHost(t *testing.T, flow func(t *testing.T, src *hostSource)) {
 	t.Run("db_ahead_of_host", func(t *testing.T) { flow(t, laggingHost()) })
 }
 
-// foreignDue counts other users' rows a sweep at the service clock could select: a superset of
-// the three lanes, so a zero means this fixture's rows are the only ones the pass can change.
+// heldDueSQL selects the rows a sweep at $1 can list, as the three lane queries in
+// store/queries/held_publication.sql (ListHeldPublicationsDueExpiry, ...DueOrphan, ...DueReconcile)
+// do, with $2 the reconcile grace in seconds. Exact rather than a wide superset: earlier LiveDB
+// packages on the same database leave rows no lane can select, which must not switch the strict
+// global-count checks below off.
+const heldDueSQL = `((p.state = 'acknowledged' AND p.expires_at <= $1
+		AND COALESCE(p.next_attempt_at, '-infinity'::timestamptz) <= $1)
+	OR (p.state = 'created' AND COALESCE(p.next_attempt_at, '-infinity'::timestamptz) <= $1
+		AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = p.run_id AND h.state = 'open')
+		AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.final_publication_id = p.id))
+	OR (p.state IN ('invoked', 'create_unknown', 'delete_unknown')
+		AND COALESCE(p.next_attempt_at, p.create_invoked_at + make_interval(secs => $2::float8), p.created_at) <= $1))`
+
+// foreignDue counts other users' rows the next pass at the service clock can select; zero means
+// this fixture's rows are the only ones the pass can change.
 func (c *cleanupFix) foreignDue() int {
 	c.t.Helper()
 	var n int
-	if err := c.e.pool.QueryRow(c.e.ctx, `SELECT count(*) FROM run_held_publications WHERE user_id <> $1
-		AND (state IN ('invoked','create_unknown','created','delete_unknown') OR (state='acknowledged' AND expires_at <= $2))`,
-		c.e.userID, c.svc.now()).Scan(&n); err != nil {
+	if err := c.e.pool.QueryRow(c.e.ctx, `SELECT count(*) FROM run_held_publications p WHERE p.user_id <> $3 AND `+heldDueSQL,
+		c.svc.now(), heldReconcileGrace.Seconds(), c.e.userID).Scan(&n); err != nil {
 		c.t.Fatalf("count foreign due rows: %v", err)
 	}
 	return n
 }
 
-// dueRunIDs lists, for diagnostics, the runs whose rows are lane-eligible at the service clock.
+// dueRunIDs lists, for diagnostics, the runs with a row the pass can select at the service clock.
 func (c *cleanupFix) dueRunIDs() []string {
 	c.t.Helper()
-	rows, err := c.e.pool.Query(c.e.ctx, `SELECT run_id::text FROM run_held_publications
-		WHERE state IN ('invoked','create_unknown','created','delete_unknown') OR (state='acknowledged' AND expires_at <= $1)
-		ORDER BY run_id LIMIT 20`, c.svc.now())
+	rows, err := c.e.pool.Query(c.e.ctx, `SELECT p.run_id::text FROM run_held_publications p WHERE `+heldDueSQL+`
+		ORDER BY p.run_id LIMIT 20`, c.svc.now(), heldReconcileGrace.Seconds())
 	if err != nil {
 		c.t.Fatalf("list due runs: %v", err)
 	}
@@ -266,6 +276,8 @@ func ownerExpireFix(t *testing.T, src *hostSource) (*cleanupFix, time.Time) {
 
 func ownerExpiryFlow(t *testing.T, src *hostSource) {
 	c, expiry := ownerExpireFix(t, src)
+	// In db_ahead_of_host the host clock reads just before the expiry, so this line is what makes
+	// the row due there; keep that subtest, it is the regression for dropping this line.
 	// The expiry is stamped by the database clock; the cleanup clock is taken from it, so the
 	// row is due whatever the host clock reads (#3883).
 	c.svc.SetClock(func() time.Time { return expiry })
