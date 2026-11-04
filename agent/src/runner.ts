@@ -2354,6 +2354,10 @@ type ClaimCheckpointEvidence = Readonly<{ tip?: string; attestedSource?: string;
 
 interface RunFlight {
   registrationToken?: symbol;
+  /** Issue #3859: the latest built snapshot epoch captured when this flight registered; the client
+   *  turns it into the registration_evidence of the flight's first `running` report, which clears
+   *  it. Captured once at registration, never re-read from the registry at send time. */
+  registrationEpoch?: number;
   /** Irrevocable local selection, independent of delivery ACK or source cleanup proof. */
   policyHold?: { readonly outcomeId: string; body?: Readonly<import("./protocol.js").PolicyHoldRequest> };
   policyAdmission?: boolean;
@@ -5163,6 +5167,9 @@ export class RunRunner {
     // pre-clone — is a requeue, so it stops being listed there too). Idempotent per run id.
     const registration = this.snapshotRegistry?.add(runId, claim.claim_generation ?? 0);
     flight.registrationToken = registration;
+    // Issue #3859: capture the registration epoch ONCE, synchronously after add(), and never re-read
+    // it at send time (a later read could name a snapshot that already listed this run).
+    if (this.snapshotRegistry) flight.registrationEpoch = this.snapshotRegistry.latestBuiltEpoch();
     // Repository task roots only; other lanes retain their existing policy.
     if (claim.secrets.codex?.auth_mode === "subscription") {
       flight.operationScope = acquireCodexOperationScope(this.client, runId, flight.claimGeneration,
@@ -12641,12 +12648,20 @@ export class RunRunner {
         if (checked && stamped.claim_generation !== flight.claimGeneration)
           throw new Error("plan cross-check: state generation changed");
         const diskSeq = body.status !== undefined ? this.diskGovernor?.statusRequested(runId, body.status) : undefined;
+        // Issue #3859: the registration witness rides the flight's FIRST `running` report only (the
+        // phaseClone one, before any retained refusal). It is consumed here, before the send, so a
+        // later iteration/progress `running` report never repeats it and a failed send is not replayed.
+        let witnessEpoch: number | undefined;
+        if (!checked && body.status === "running" && flight.registrationEpoch !== undefined) {
+          witnessEpoch = flight.registrationEpoch;
+          flight.registrationEpoch = undefined;
+        }
         const transport = () => checked === "semantic"
           ? this.client.reportSemanticPlanGateState(runId, stamped, signal)
           : checked ? this.client.reportPlanCrossCheckGateState(runId, stamped, signal)
           : body === flight.iterationCancellationReport
             ? this.client.reportState(runId, stamped, signal, { iterationCancellation: true })
-            : this.client.reportState(runId, stamped, signal);
+            : this.client.reportState(runId, stamped, signal, witnessEpoch === undefined ? undefined : { registrationEpoch: witnessEpoch });
         // Preservation expiry cannot prevent the honest terminal report. FINAL stays budgeted.
         const sending = body.status === "failed" || body.status === "completed"
           ? MaintenanceBudget.withoutAttempt(transport) : transport();
@@ -13644,7 +13659,10 @@ export class RunRunner {
     };
     const reseed = this.canonicalReseedOptions(flight);
     // A SourceUseHeldRefusal (an earlier flight's unended source use of the canonical path) is nonterminal:
-    // custody retained, no terminal report, no model work; the requeue cap bounds it.
+    // custody retained, no terminal report, no model work. The bound is server-side: the `running` report that
+    // preceded this refusal carried registration evidence, so the next snapshot that omits the run stamps a
+    // witnessed departure, which is charged against RUN_MAX_REQUEUES (the claimed-never-started charge) and parks
+    // at worker_requeue_exhausted (ADR-1751 D2a as amended).
     const stopOnHeldSource = (err: SourceUseHeldRefusal): never => {
       this.retainedLifecycleGuard(flight);
       flight.runLog.warn("clone path held by an earlier flight's unended source use; stopping claim for retry", {
@@ -26068,8 +26086,9 @@ export class RunRunner {
             this.retainedLifecycleGuard(flight);
             if (error instanceof SourceUseHeldRefusal) {
               // An earlier flight of this process still holds the path with no confirmed end (held_unended). That is
-              // not a preservation failure: stop nonterminal with custody retained and no report; the existing
-              // missing-flight requeue cap bounds it.
+              // not a preservation failure: stop nonterminal with custody retained and no report. The server's
+              // claimed-never-started charge bounds it: the witnessed departure of this retained continuation is
+              // charged against RUN_MAX_REQUEUES and parks at worker_requeue_exhausted (ADR-1751 D2a as amended).
               flight.runLog.warn("retained predecessor held by an earlier flight's unended source use; stopping claim for retry", {
                 error: errMessage(error), claim_generation: flight.claimGeneration });
               throw new RetainedRecoveryStop({ cause: error });

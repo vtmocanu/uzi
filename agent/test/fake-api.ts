@@ -320,6 +320,9 @@ export class FakeApi {
   unauthorized = 0;
   stateAttempts = 0;
   readonly states: Array<{ runId: string; body: StateRequest }> = [];
+  /** Issue #3859: every /state body as it arrived on the wire, including reports the fake then
+   *  refuses (which `states` omits because the real server persists nothing for a refusal). */
+  readonly stateWire: Array<{ runId: string; body: StateRequest }> = [];
   // PRD #1247 M5b: a GLOBAL, ordered log of the mutating requests as they land, so a test can pin
   // RELATIVE ORDER across the two endpoints the single `states`/`messageBatches` arrays cannot show
   // (e.g. that a message batch DRAINED before the credential_switch state report). Each accepted
@@ -1932,6 +1935,7 @@ export class FakeApi {
     json: Record<string, unknown>,
   ): Promise<void> {
     this.stateAttempts++;
+    this.stateWire.push({ runId, body: structuredClone(json) as unknown as StateRequest });
     if (this.strictDecodeStateRemaining > 0) {
       this.strictDecodeStateRemaining--;
       // The exact 400 shape httpx.DecodeJSON (DisallowUnknownFields) produces for an unknown field.
