@@ -1,6 +1,6 @@
 # ADR-1751: A run resuming its own custody is exempt from custody-count admission
 
-**Status**: Accepted (issue #1751, amends PRD #1296 D2/D4); admission accounting amended by [ADR-2445](2445-custody-admission-accounting.md)
+**Status**: Accepted (issue #1751, amends PRD #1296 D2/D4); admission accounting amended by [ADR-2445](2445-custody-admission-accounting.md); D2a's uncharged reset qualified by the [2026-11-04 amendment](#amendment-2026-11-04--witnessed-continuation-departures-are-charged-3859)
 **Date**: 2026-09-26
 **Deciders**: Vlad Mocanu (maintainer approval of the admission-policy change) + agent team
 
@@ -56,3 +56,17 @@ The owner hold count can exceed the limit (by design, for continuations), and #1
 ## Amendment 2026-10-20 — the limit is configurable (#3150)
 
 The limit this ADR names as the constant `workersvc.custodyHoldLimit` (8) is now the admin setting `custody_hold_limit`, default 8, 1 to 1000. The "1 to 7 ... at 8" rule above is the default-8 case: a previously claimed queued run bypasses owner admission while it has 1 through limit-1 of its own open holds and loses that exemption at the limit. The rationale, the three-predicate bound and the remedies are unchanged. See the [ADR-2445 amendment](2445-custody-admission-accounting.md#amendment-2026-10-20--configurable-custody-admission-limit-3150).
+
+## Amendment 2026-11-04 — witnessed continuation departures are charged (#3859)
+
+D2a's "without a requeue charge" no longer holds for every claimed-never-started run. A retained continuation (a claimed run with an owner-scoped `open` hold of an earlier generation) whose first running report is refused could otherwise loop: uncharged reset, exempt reclaim, another generation hold, until the per-run bound, with no requeue accounting and no owner signal. Migration 00401 and the claimed-never-started sweep now split that cohort, in one transaction locking workers, then runs, then cross-checks.
+
+- **Departure witness.** An accepted heartbeat or claim snapshot (never the register snapshot) that omits the run at its current generation stamps a departure, but only after an earlier witnessed listing: a prior snapshot row for the run at that generation, or registration evidence that the worker's first running report records (written even when the guard refuses the report; feature `run_registration_evidence_v1`). The stamp is bound to claim generation, register nonce and snapshot epoch; the sweep accepts it only for the worker's current nonce, an epoch not above the accepted one, and no active-snapshot row at that generation.
+- **Charged arm.** A witnessed continuation past the claim grace is requeued with `requeue_count + 1`, worker affinity and the claim kept, and the Codex claim capability revoked. Once the episode's `RUN_MAX_REQUEUES` budget is spent it parks at `recovery_wait` / `worker_requeue_exhausted` with the classifier's evidence and the claim released; it is never failed, and the existing owner Resume/Cancel applies.
+- **Bounded witness wait.** A continuation with presence under the worker's current registration (registration evidence at the current nonce and accepted epoch, or a non-pending active-snapshot row at its generation, on an online worker) and no departure stamp has its reset deferred until `claimed_at + 2 × ClaimGrace`. Past that it parks at the new server-only cause `recovery_wait` / `retained_continuation_unwitnessed`: claim released, Codex capability revoked, custody, sources and journals untouched, no retry timer, `requeue_count` unchanged. The evidence records which presence held, the epochs and the deadline. Only owner Resume (a new episode on the same worker) or Cancel leaves it; [ADR-2445](2445-custody-admission-accounting.md) D2's attention exception protects its custody. Migration 00401 Down refuses while any run is parked there.
+- **Everything else** (fresh runs, runs with no earlier-generation open hold, cross-check children, Codex policy holds) keeps D2a's uncharged reset.
+- **D2a stays the backstop.** The per-run custody bound still stops the loop where neither arm can act: a worker predating registration evidence that never lists the run, a re-registration between refusals (the nonce no longer matches), and a custody limit below the requeue budget. The run then waits `queued` at the custody-limit reason.
+
+**Why.** Serves the specs/human.md Feature #3859 requirement: repeated refusal of a retained continuation reaches a bounded, truthful nonterminal outcome without fabricating departure or discarding custody.
+
+**Rejected.** Deferring for as long as presence holds: an unbounded wait with no owner signal. Charging or parking as departed without a witness: it would label a departure the server never observed.
