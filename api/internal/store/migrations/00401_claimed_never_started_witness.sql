@@ -74,6 +74,28 @@ SET LOCAL lock_timeout = '5s';
 -- Serialise against live run writers while the Down rewrites rows and narrows the CHECKs; a held
 -- lock fails the rollback after 5s rather than queueing every runs writer behind it.
 LOCK TABLE runs IN ACCESS EXCLUSIVE MODE;
+-- A live unwitnessed park has no pre-00401 equivalent: relabelling it as another cause would
+-- fabricate a classification the run never earned. Refuse the rollback while any run is still
+-- parked there (checked under the lock above) so the owner decides first.
+-- +goose StatementBegin
+DO $$
+DECLARE
+    n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM runs
+    WHERE status = 'recovery_wait' AND recovery_wait_cause = 'retained_continuation_unwitnessed';
+    IF n > 0 THEN
+        RAISE EXCEPTION 'refusing to roll back 00401: % run(s) are parked in recovery_wait at retained_continuation_unwitnessed; Resume or Cancel those runs first so no parked run is relabelled', n;
+    END IF;
+END
+$$;
+-- +goose StatementEnd
+-- Terminal rows (an owner Cancel leaves the cause set) carry a cause the prior CHECK rejects and
+-- that no longer describes a live wait: clear it. Nothing is relabelled; the run, its claim and
+-- its custody holds are untouched.
+UPDATE runs SET recovery_wait_cause = NULL
+WHERE recovery_wait_cause = 'retained_continuation_unwitnessed'
+  AND status IN ('completed', 'failed', 'cancelled');
 -- The extra observation keys are not representable by the prior check: drop them first.
 UPDATE runs SET worker_recovery_evidence = worker_recovery_evidence - ARRAY['presence','registration_evidence_epoch','worker_snapshot_epoch','deadline']
 WHERE worker_recovery_evidence ? 'presence';
@@ -96,11 +118,6 @@ ALTER TABLE runs ADD CONSTRAINT runs_worker_recovery_evidence_check CHECK (
         AND pg_column_size(worker_recovery_evidence) <= 1024
     )
 );
--- Non-terminal reversal: a run parked at the new cause moves to retained_recovery_exhausted
--- with no retry stamp, the owner-held park the pre-00401 code already understands (Resume or
--- Cancel). The run, its claim and its custody hold are untouched, so no work is failed or lost.
-UPDATE runs SET recovery_wait_cause='retained_recovery_exhausted', recovery_retry_not_before=NULL
-WHERE recovery_wait_cause='retained_continuation_unwitnessed';
 ALTER TABLE runs DROP CONSTRAINT runs_recovery_wait_cause_check;
 ALTER TABLE runs ADD CONSTRAINT runs_recovery_wait_cause_check CHECK (
     recovery_wait_cause IS NULL OR recovery_wait_cause IN (
