@@ -48,7 +48,7 @@ $$;
 
 -- +goose Down
 -- Non-terminal reversal: a run parked at the new cause moves to retained_recovery_exhausted
--- with no retry stamp, the owner-held park the pre-00399 code already understands (Resume or
+-- with no retry stamp, the owner-held park the pre-00401 code already understands (Resume or
 -- Cancel). The run, its claim and its custody hold are untouched, so no work is failed or lost.
 UPDATE runs SET recovery_wait_cause='retained_recovery_exhausted', recovery_retry_not_before=NULL
 WHERE recovery_wait_cause='retained_continuation_unwitnessed';

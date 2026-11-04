@@ -2,10 +2,10 @@ package store_test
 
 import "testing"
 
-// TestClaimedNeverStartedWitnessRollbackLiveDB runs 00399's Down inside a rolled-back
+// TestClaimedNeverStartedWitnessRollbackLiveDB runs 00401's Down inside a rolled-back
 // transaction: a run parked at retained_continuation_unwitnessed moves to the owner-held
 // retained_recovery_exhausted park (still recovery_wait, custody and claim fields untouched),
-// the pre-00399 CHECK and fn_custody_attention are restored, and the witness columns go away.
+// the pre-00401 CHECK and fn_custody_attention are restored, and the witness columns go away.
 func TestClaimedNeverStartedWitnessRollbackLiveDB(t *testing.T) {
 	f := newAdmissionFixture(t, 1)
 	tx, err := f.pool.Begin(f.ctx)
@@ -31,7 +31,7 @@ func TestClaimedNeverStartedWitnessRollbackLiveDB(t *testing.T) {
 	if got := attention("retained_continuation_unwitnessed"); got != "source_only" {
 		t.Fatalf("Up attention = %s, want source_only", got)
 	}
-	for _, stmt := range migrationDownStatements(t, "00399_claimed_never_started_witness.sql") {
+	for _, stmt := range migrationDownStatements(t, "00401_claimed_never_started_witness.sql") {
 		exec(stmt)
 	}
 	var ok bool
