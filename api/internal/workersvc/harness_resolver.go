@@ -671,7 +671,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		return store.Run{}, resolvedHarness{}, err
 	}
 	// The shared lock also covers an automatic decision (an unset default), whatever the overflow toggle.
-	lockEligible := origin.eligible(policy) && (policy.HarnessOverflowEnabled || res.DefaultUnset)
+	lockEligible := origin.eligible(policy) && policy.HarnessOverflowEnabled // LO2 MUTANT: automatic path lock removed
 	if lockEligible {
 		if s.codexSelectHook != nil {
 			s.codexSelectHook(ctx)
