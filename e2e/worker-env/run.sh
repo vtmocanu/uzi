@@ -74,7 +74,7 @@ phase nix-volume-owner python3 "$BOUNDED" verify-volume "$REPORT_DIR" "$TOKEN" "
 owned_request container "$NAME-seed"
 phase nix-seed timeout --kill-after=5s 115s docker run --pull never --network none \
   --label "$LABEL" --name "$NAME-seed" --user 0:0 --cap-drop ALL --security-opt no-new-privileges \
-  --mount "type=volume,src=$VOLUME,dst=/nix" --entrypoint /bin/true "$IMAGE"
+  --mount "type=volume,src=$VOLUME,dst=/nix" --entrypoint /bin/true "$IMAGE_ID"
 
 # The proof container: the production capability set of the root-start worker proof, the seeded
 # real /nix, a tmpfs /data (state only; the store is on the volume), default bridge network for the
@@ -96,7 +96,7 @@ phase worker-env-proof python3 "$BOUNDED" capture "$REPORT_DIR" "$TOKEN" "$REPOR
   --mount "type=bind,src=$REPO/agent/test,dst=/app/uzi-worker-uid-proof/agent/test,readonly" \
   --mount "type=bind,src=$REPO/agent/templates,dst=/app/uzi-worker-uid-proof/agent/templates,readonly" \
   --mount "type=bind,src=$REPO/controller/internal/kube/testdata/runner-shared-init.sh,dst=/app/uzi-worker-uid-proof/controller/internal/kube/testdata/runner-shared-init.sh,readonly" \
-  --entrypoint /usr/local/sbin/uzi-entrypoint "$IMAGE" \
+  --entrypoint /usr/local/sbin/uzi-entrypoint "$IMAGE_ID" \
   /usr/local/bin/node --import /app/node_modules/tsx/dist/loader.mjs \
   --import /app/uzi-worker-uid-proof/agent/test/setup/hermetic-proc.ts \
   --test --test-concurrency=1 --test-timeout=350000 --test-reporter=junit \

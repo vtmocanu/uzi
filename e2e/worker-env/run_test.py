@@ -120,6 +120,9 @@ class RunShTest(unittest.TestCase):
                          ["CHOWN", "DAC_OVERRIDE", "SETPCAP", "SETUID", "SETGID"])
         self.assertEqual(proof[proof.index("--security-opt") + 1], "no-new-privileges")
         self.assertEqual(proof[proof.index("--entrypoint") + 1], "/usr/local/sbin/uzi-entrypoint")
+        # Both containers run the inspected image by immutable id, never the mutable tag.
+        self.assertEqual(proof[proof.index("--entrypoint") + 2], IMAGE_ID)
+        self.assertEqual(seed[seed.index("--entrypoint") + 2], IMAGE_ID)
         self.assertIn("--test-reporter=junit", proof)
         self.assertEqual(proof[-1], "/app/uzi-worker-uid-proof/e2e/worker-env/worker-env-real.test.mts")
         mounts = [proof[i + 1] for i, a in enumerate(proof) if a == "--mount"]

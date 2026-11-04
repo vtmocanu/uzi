@@ -129,6 +129,7 @@ async function runViaClaudeLane(command: string, cliEnv: Record<string, string>,
   lane.beginTurn();
   const args = { command, timeout: timeoutMs };
   const id = `toolu_wenv_${String(++seq)}_${randomUUID().slice(0, 8)}`;
+  let confirmed = false;
   try {
     const hook = await lane.hook({
       hook_event_name: "PreToolUse", tool_name: GUARDED_COMMAND_TOOL, tool_input: args, tool_use_id: id,
@@ -138,10 +139,22 @@ async function runViaClaudeLane(command: string, cliEnv: Record<string, string>,
     const result = await lane.handle(args, { _meta: { [META]: id }, signal: undefined });
     const text = result.content.map((block) => ("text" in block ? block.text ?? "" : "")).join("");
     assert.deepEqual(trips, [], "the lane did not trip the turn");
+    // Successful output only counts once the lane confirms nothing of the command survives.
+    await confirmLaneClosed(lane);
+    confirmed = true;
     return text;
   } finally {
-    await lane.quiesce(15_000).catch(() => undefined);
+    // On a failure path cleanup is best effort; the original error is what surfaces.
+    if (!confirmed) await lane.quiesce(15_000).catch(() => undefined);
   }
+}
+
+type LaneClosure = Pick<ClaudeCommandLane, "quiesce" | "liveCount" | "poisoned">;
+/** Throws unless the lane quiesced without error, holds no live command and is not poisoned. */
+async function confirmLaneClosed(lane: LaneClosure): Promise<void> {
+  await lane.quiesce(15_000);
+  assert.equal(lane.liveCount, 0, "no guarded command is still live");
+  assert.equal(lane.poisoned, false, "the lane is not poisoned");
 }
 
 function assertGateRan(text: string, evidence: RegExp, what: string): void {
@@ -173,6 +186,13 @@ proof("preflight", 120_000, async () => {
   assert.ok(profile.startsWith("/nix/store/"), `the stable toolchain handle resolves into the store: ${profile}`);
   assert.equal(fs.readFileSync("/etc/uzi-toolchain-profile", "utf8").trim(), profile, "the image's toolchain marker matches the seeded store");
   assert.ok(fs.readdirSync("/nix/store").length > 50, "the seeded store holds the baked toolchain closure");
+
+  // Control: a failed or unconfirmed cleanup can never let a command result pass as proof.
+  const closed = { liveCount: 0, poisoned: false, quiesce: async () => {} };
+  await confirmLaneClosed(closed);
+  await assert.rejects(confirmLaneClosed({ ...closed, quiesce: async () => { throw new Error("cleanup unconfirmed"); } }), /cleanup unconfirmed/);
+  await assert.rejects(confirmLaneClosed({ ...closed, liveCount: 1 }), /still live/);
+  await assert.rejects(confirmLaneClosed({ ...closed, poisoned: true }), /poisoned/);
 
   // Sanitized env: nothing credential-shaped reaches the proof process, hence nothing it spawns.
   const risky = Object.keys(process.env).filter((key) => /TOKEN|SECRET|PASSW|API_?KEY|CREDENTIAL|^GH_|^GITHUB|^GITLAB|^ANTHROPIC|^OPENAI|^CLAUDE_CODE/i.test(key));

@@ -2923,6 +2923,20 @@ tasks:
       # PRD 1287 C1 / D7 point 5: M4 runs once after the complete local unit suite.
       - task: test:codex-m4
 
+  test:worker-env-harness:
+    desc: Docker-free worker execution-environment checker and run.sh regressions (#3894)
+    cmds:
+      - python3 -B e2e/worker-env/check_test.py
+      - python3 -B e2e/worker-env/run_test.py
+
+  test:agent:worker-env:
+    desc: agent - M0 preflight and M1 focused proofs in the worker's execution environment (needs the built worker image and network)
+    cmds:
+      - task: test:worker-env-harness
+      # This lane's CI job installs agent dependencies; gate:repo deliberately does not.
+      - cd agent && npx tsc --project ../e2e/worker-env/tsconfig.json
+      - bash e2e/worker-env/run.sh
+
   test:worker-uid-harness:
     desc: Docker-free worker UID report checker and shell wrapper regressions
     cmds:
@@ -2952,20 +2966,6 @@ tasks:
               --run-id "${WORKER_MEMORY_CALIBRATION_RUN_ID:?set an explicit local calibration run identity}" \
               --attempt "${WORKER_MEMORY_CALIBRATION_ATTEMPT:?set an explicit local calibration attempt}"
           fi
-
-  test:worker-env-harness:
-    desc: Docker-free worker execution-environment checker and run.sh regressions (#3894)
-    cmds:
-      - python3 -B e2e/worker-env/check_test.py
-      - python3 -B e2e/worker-env/run_test.py
-
-  test:agent:worker-env:
-    desc: agent - M0 preflight and M1 focused proofs in the worker's execution environment (needs the built worker image and network)
-    cmds:
-      - task: test:worker-env-harness
-      # This lane's CI job installs agent dependencies; gate:repo deliberately does not.
-      - cd agent && npx tsc --project ../e2e/worker-env/tsconfig.json
-      - bash e2e/worker-env/run.sh
 
   test:agent:shard:
     desc: agent unit-test shard for CI (exactly 1/2 or 2/2; no M4)
