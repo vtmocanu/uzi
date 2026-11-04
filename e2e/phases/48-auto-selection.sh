@@ -201,7 +201,7 @@ apipost "/api/runs/$AS_RUN3/inputs" '{"kind":"cancel","body":""}' >/dev/null || 
 wait_status "$AS_RUN3" cancelled
 
 # ── leave the stack exactly as this phase found it ──────────────────────────────
-# Keep the three fixture runs as history. Each cancellation must settle before the
+# Keep the four fixture runs as history. Each cancellation must settle before the
 # next leg changes eligibility or this teardown restores binding and deletes the
 # spare credential, so later phases inherit no executing auto-selection run.
 # 🔴 THIS IS NOT TIDINESS. The harness is one sequential stack, so anything left
