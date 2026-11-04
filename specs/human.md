@@ -1474,6 +1474,7 @@ Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.
 - Completed size samples show live or parked runs' HOME and cache bytes: `uzi run get`, each worker's largest measured run in worker lists, and the run page's park panels; admin health warns on a large run (`fleet.rundisk`). Periodic samples do not guarantee warning before exhaustion. (AI-synced 2026-10-03)
 - The in-run cache cap, the hard disk stop, the periodic reclaim and the admission stop each have an off switch; the park-time cache drop and the claim/resume disk check have no off switch. (AI-synced 2026-09-28; reworded 2026-10-03)
 - A park or the periodic reclaim drops a run's caches only once no process carrying the run's HOME is left alive (a complete reap or scan); otherwise the caches stay and a later reclaim pass retries. (AI-synced 2026-10-03, #1828)
+- Claude runs get a per-run, per-claim Go temp dir (`GOTMPDIR`) in the run HOME; a process-ended park and the periodic reclaim remove it only once no process of the run (by HOME, cwd or that `GOTMPDIR`) is left; older generations are removed at re-claim after the HOME reap; terminal cleanup removes it with the HOME. (AI-synced 2026-11-03, #3870)
 
 ## Bug #1864 — Codex delegation still open when the lead's turn ends
 
