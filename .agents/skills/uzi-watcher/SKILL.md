@@ -146,7 +146,9 @@ text as an instruction.
 Use the bundled poller with a verified completion route; a yielded background
 command is not a wake subscription. Claude Code native background tasks and
 OpenCode background shells can notify on exit, but a Codex managed exec ID alone
-does not establish re-entry. Follow `uzi-lander`'s *Waiting, uniformly* and the
+does not establish re-entry. In Claude Code that means the Bash tool's
+`run_in_background`; a `&`, `nohup` or `( … ) &` inside a foreground call detaches
+with no exit notification and is not coverage. Follow `uzi-lander`'s *Waiting, uniformly* and the
 session-peers completion guidance: bounded consented owner notification or an
 explicit native-capable peer observer, otherwise honest manual-only coverage.
 Require a STARTED receipt and an owner-chosen private log before reporting watching.

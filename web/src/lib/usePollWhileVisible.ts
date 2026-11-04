@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 
 // usePollWhileVisible runs `cb` every `intervalMs` while the tab is visible: it
 // skips a tick when `document.hidden`, and fires an immediate catch-up the moment
@@ -13,7 +13,9 @@ import { useEffect, useRef } from "react";
 // caller memoising `cb` with useCallback.
 export function usePollWhileVisible(cb: () => void | Promise<unknown>, intervalMs: number, scopeKey?: string): void {
   const cbRef = useRef(cb);
-  useEffect(() => {
+  // Visibility events may arrive after commit but before passive effects flush.
+  // Publish only committed callbacks, before that event can read the old closure.
+  useLayoutEffect(() => {
     cbRef.current = cb;
   }, [cb]);
 
