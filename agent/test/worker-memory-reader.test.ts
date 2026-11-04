@@ -209,3 +209,45 @@ test("production reads retry short reads within the aggregate allocation budget"
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+const DETAIL = ["active_file", "active_anon", "inactive_anon", "file", "file_dirty", "file_writeback", "file_mapped",
+  "kernel", "kernel_stack", "pagetables", "percpu", "sock", "slab", "slab_reclaimable"] as const;
+const CORE_STAT = "anon 600\nshmem 10\nslab_unreclaimable 20\nunevictable 30\ninactive_file 900\n";
+const CORE = { anon: 600, shmem: 10, slab_unreclaimable: 20, unevictable: 30, inactive_file: 900 };
+function detailOf(stat: string) {
+  const result = fixture({ "/fake/memory.stat": stat }).reader.sample();
+  assert.equal(result.available, true);
+  if (!result.available) throw new Error("unreachable");
+  assert.deepEqual(result.stat, CORE, "core stat is identical whatever the optional lines hold");
+  return result.statDetail!;
+}
+test("statDetail carries every optional field from the same memory.stat parse", () => {
+  const stat = CORE_STAT + DETAIL.map((key, i) => key + " " + (i + 1) * 100 + "\n").join("") + "workingset_refault 7\n";
+  const detail = detailOf(stat);
+  assert.deepEqual(detail, { ...Object.fromEntries(DETAIL.map((key, i) => [key, (i + 1) * 100])), missing: [], malformed: [] });
+  assert.equal(Object.isFrozen(detail), true);
+  assert.equal(Object.isFrozen(detail.missing), true);
+  assert.equal("workingset_refault" in detail, false, "unlisted keys stay skipped");
+});
+test("statDetail marks missing fields instead of filling zero", () => {
+  const detail = detailOf(CORE_STAT + "file 5\nslab 6\n");
+  assert.deepEqual(detail, { file: 5, slab: 6, missing: DETAIL.filter((key) => key !== "file" && key !== "slab"), malformed: [] });
+  assert.equal("kernel" in detail, false);
+});
+test("malformed or duplicate optional lines are only recorded and never invalidate the sample", () => {
+  const detail = detailOf(CORE_STAT + "file 5\nfile 6\nsock -1\nslab 1.5\npercpu 1 2\nkernel 9\nactive_file x\nfile_dirty 3\n");
+  assert.deepEqual(detail.malformed, ["active_file", "file", "percpu", "sock", "slab"].sort((a, b) => DETAIL.indexOf(a as never) - DETAIL.indexOf(b as never)));
+  assert.equal(detail.kernel, 9);
+  assert.equal(detail.file_dirty, 3);
+  assert.equal("file" in detail, false, "a duplicated value is dropped, not guessed");
+  assert.equal(detail.missing.includes("file"), false);
+  assert.equal(detail.missing.includes("sock"), false);
+  // A malformed required line still invalidates the sample.
+  unavailable({ "/fake/memory.stat": CORE_STAT + "anon 1\n" }, "malformed");
+});
+test("optional diagnostics add no reads and keep the ordered list and budget", () => {
+  const { reader, reads } = fixture({ "/fake/memory.stat": CORE_STAT + "file 5\n" });
+  assert.equal(reader.sample().available, true);
+  assert.deepEqual(reads.map((r) => r.file), Object.keys(files()));
+  assert.equal(reads[0]!.budget, 65536);
+});

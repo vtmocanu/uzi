@@ -8,7 +8,13 @@ type Settings = Extract<NonNullable<Config["memoryGuard"]>, { enabled: true }>;
 type Sample = ReturnType<WorkerMemoryReader["sample"]>;
 type Available = Extract<Sample, { available: true }>;
 type Intervention = Readonly<{ sequence: number }>;
-type Decision = { kind: "inhibited" | "idle" | "hard" | "early" | "rearmed"; highBytes?: number; quietBytes?: number };
+/** Why a hard/early proposal fired; diagnostic only, grants no authority. */
+type Evidence = Readonly<{ workingSetBytes: number } | {
+  previousSampleId: number; previousStartedAtMs: number; previousCompletedAtMs: number; previousWorkingSetBytes: number;
+  intervalMs: number; growthBytes: number; rateBytesPerMs: number; projectedBytes: number;
+  psiFullTotalPrevious: number; psiFullTotalCurrent: number; grownFields: readonly string[];
+}>;
+type Decision = { kind: "inhibited" | "idle" | "hard" | "early" | "rearmed"; highBytes?: number; quietBytes?: number; evidence?: Evidence };
 
 const STAT_FIELDS = ["anon", "shmem", "slab_unreclaimable", "unevictable"] as const;
 function natural(n: number): boolean { return Number.isSafeInteger(n) && n >= 0; }
@@ -41,6 +47,59 @@ function copyPressure(p: Pressure, freeze = false): Pressure {
   const out: Pressure = "unavailable" in p ? { unavailable: p.unavailable }
     : { some: freeze ? Object.freeze({ ...p.some }) : { ...p.some }, full: freeze ? Object.freeze({ ...p.full }) : { ...p.full } };
   return freeze ? Object.freeze(out) : out;
+}
+
+type StatDetail = NonNullable<Available["statDetail"]>;
+/** Frozen deep copy. An uncopyable statDetail is kept by reference, so the diagnostics build fails closed. */
+function copyDetail(d: StatDetail): StatDetail {
+  try { return Object.freeze({ ...d, missing: Object.freeze([...d.missing]), malformed: Object.freeze([...d.malformed]) }); }
+  catch { return d; }
+}
+/** Deep-frozen copy of an available sample (stat, pressure and statDetail included). */
+function snapshot(s: Available): Available {
+  return Object.freeze({ ...s, stat: Object.freeze({ ...s.stat }), pressure: copyPressure(s.pressure, true),
+    ...(s.statDetail ? { statDetail: copyDetail(s.statDetail) } : {}) });
+}
+type DecisionRecord = Readonly<{ kind: Decision["kind"]; highBytes?: number; quietBytes?: number; evidence?: Evidence }>;
+function decisionRecord(d: Decision): DecisionRecord {
+  return Object.freeze({ kind: d.kind,
+    ...(d.highBytes !== undefined ? { highBytes: d.highBytes } : {}),
+    ...(d.quietBytes !== undefined ? { quietBytes: d.quietBytes } : {}),
+    ...(d.evidence !== undefined ? { evidence: d.evidence } : {}) });
+}
+type Trigger = Readonly<{ sample: Available; decision: DecisionRecord }>;
+type Tree = Readonly<{ rssBytesApprox: number; startedAtMs: number; completedAtMs: number; candidates: number; failures: number }>;
+type Observed = Readonly<{ startedAtMs: number; completedAtMs: number; rows: readonly { rssBytes: number }[] }>;
+type Diag = Readonly<{ trigger?: Trigger; tree: Tree; cancel?: Observed }>;
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+}
+
+function section(s: Available, d: DecisionRecord): Record<string, unknown> {
+  const e = d.evidence as Record<string, unknown> | undefined;
+  const p = s.pressure;
+  const detail = s.statDetail;
+  return {
+    decision: d.kind, sample_id: s.sampleId, started_at_ms: s.startedAtMs, completed_at_ms: s.completedAtMs,
+    current_bytes: s.currentBytes, working_set_bytes: workingSetBytes(s), limit_bytes: s.limitBytes,
+    high_bytes: d.highBytes, quiet_bytes: d.quietBytes,
+    stat: { anon: s.stat.anon, shmem: s.stat.shmem, slab_unreclaimable: s.stat.slab_unreclaimable,
+      unevictable: s.stat.unevictable, inactive_file: s.stat.inactive_file },
+    stat_detail: detail ? { ...detail, missing: [...detail.missing], malformed: [...detail.malformed] } : { unavailable: "absent" },
+    psi: "unavailable" in p ? { unavailable: p.unavailable } : { some: { ...p.some }, full: { ...p.full } },
+    ...(e && "previousSampleId" in e ? { early: {
+      previous_sample_id: e.previousSampleId, previous_started_at_ms: e.previousStartedAtMs,
+      previous_completed_at_ms: e.previousCompletedAtMs, previous_working_set_bytes: e.previousWorkingSetBytes,
+      interval_ms: e.intervalMs, growth_bytes: e.growthBytes, rate_bytes_per_ms: e.rateBytesPerMs,
+      projected_bytes: e.projectedBytes, psi_full_total_previous: e.psiFullTotalPrevious,
+      psi_full_total_current: e.psiFullTotalCurrent, grown_fields: [...(e.grownFields as string[])],
+    } } : {}),
+  };
 }
 
 /** Pure working-set policy (memory.current minus inactive file). Early intervention
@@ -159,7 +218,7 @@ export class WorkerMemoryGuard {
     if (this.state.pendingIntervention) return { kind: "inhibited", ...thresholds };
     if (workingSet >= highBytes) {
       this.proposal = true;
-      return { kind: "hard", ...thresholds };
+      return { kind: "hard", ...thresholds, evidence: Object.freeze({ workingSetBytes: workingSet }) };
     }
     const currentPsi = realPressure(sample.pressure);
     const previousPsi = previous && realPressure(previous.pressure);
@@ -170,9 +229,17 @@ export class WorkerMemoryGuard {
       && STAT_FIELDS.some((field) => sample.stat[field] > previous.stat[field])) {
       const totalGrowth = Math.max(0, workingSet - workingSetBytes(previous));
       const rate = totalGrowth / (sample.completedAtMs - previous.completedAtMs);
-      if (workingSet + rate * this.config.responseBudgetMs >= highBytes) {
+      const projectedBytes = workingSet + rate * this.config.responseBudgetMs;
+      if (projectedBytes >= highBytes) {
         this.proposal = true;
-        return { kind: "early", ...thresholds };
+        return { kind: "early", ...thresholds, evidence: Object.freeze({
+          previousSampleId: previous.sampleId, previousStartedAtMs: previous.startedAtMs,
+          previousCompletedAtMs: previous.completedAtMs, previousWorkingSetBytes: workingSetBytes(previous),
+          intervalMs: sample.completedAtMs - previous.completedAtMs, growthBytes: totalGrowth,
+          rateBytesPerMs: rate, projectedBytes,
+          psiFullTotalPrevious: previousPsi.full.total, psiFullTotalCurrent: currentPsi.full.total,
+          grownFields: Object.freeze(STAT_FIELDS.filter((field) => sample.stat[field] > previous.stat[field])),
+        }) };
       }
     }
     return { kind: "idle", ...thresholds };
@@ -216,6 +283,7 @@ type Authority = Readonly<{
   entry: Entry;
   incarnation: MemoryIncarnation;
   sample: Available;
+  decision: DecisionRecord;
 }>;
 export type SampleWait = "sample" | "timeout" | "aborted";
 type Journal = Readonly<{ request: Readonly<MemoryReservationRequest>; status: "pending" | "ambiguous" | "admitted" | "denied"; outcome?: MemoryOutcome }>;
@@ -228,6 +296,7 @@ export class WorkerMemoryMonitor {
   private readonly guard: WorkerMemoryGuard;
   private readonly pressure: WorkerMemoryGuard;
   private latest: Available | undefined;
+  private latestDecision: DecisionRecord | undefined;
   private applicable = false;
   private closed = false;
   private pending: Promise<void> | undefined;
@@ -253,7 +322,7 @@ export class WorkerMemoryMonitor {
     report: (request: MemoryOutcomeRequest, signal: AbortSignal, remainingMs: number, context: Context) => Promise<MemoryReservation>;
     feedback: (result: WorkerMemoryPressureResult, context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
     preserve: (context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
-    prepareFeedback?: (context: Context, result: WorkerMemoryPressureResult) => void;
+    prepareFeedback?: (context: Context, result: WorkerMemoryPressureResult, diagnostics?: unknown) => void;
     preparePreservation?: (context: Context, result: WorkerMemoryPressureResult) => void;
     preservationBudgetMs?: (context: Context) => number;
     timer?: Timer;
@@ -354,9 +423,8 @@ export class WorkerMemoryMonitor {
     const now = this.ports.now();
     const pressure = this.pressure.evaluate(input, now);
     this.applicable = pressure.kind === "hard" || pressure.kind === "early";
-    this.latest = pressure.kind !== "inhibited" && input.available ? {
-      ...input, stat: { ...input.stat }, pressure: copyPressure(input.pressure),
-    } : undefined;
+    this.latest = pressure.kind !== "inhibited" && input.available ? snapshot(input) : undefined;
+    this.latestDecision = this.latest ? decisionRecord(pressure) : undefined;
     if (this.latest) markFresh();
     const decision = this.guard.evaluate(input, now);
     if (decision.kind === "rearmed" && this.held) {
@@ -367,7 +435,12 @@ export class WorkerMemoryMonitor {
     const entries = this.ports.commands.eligibleEntries();
     if (!entries?.length) return;
     const deadline = now + this.config.responseBudgetMs;
-    this.pending = this.intervene(entries, deadline).catch(() => {}).finally(() => { this.pending = undefined; });
+    // In-memory trigger copy for diagnostics only; the deadline and authority path are unchanged.
+    // A copy failure only drops the trigger record; it never suppresses the intervention.
+    let trigger: Trigger | undefined;
+    try { trigger = input.available ? Object.freeze({ sample: snapshot(input), decision: decisionRecord(decision) }) : undefined; }
+    catch { trigger = undefined; }
+    this.pending = this.intervene(entries, deadline, trigger).catch(() => {}).finally(() => { this.pending = undefined; });
   }
 
   run(): Promise<void> {
@@ -483,7 +556,30 @@ export class WorkerMemoryMonitor {
     void task.finally(() => this.reports.delete(task));
   }
 
-  private async finish(a: Authority, selected: Selection, outcome: MemoryOutcome, preserve: boolean): Promise<Readonly<{ result: WorkerMemoryPressureResult; preserved: boolean }>> {
+  /** memory_diagnostics v1 from in-memory records only: no IO, no port or reader calls. Missing values are marked, never zero. */
+  private diagnostics(a: Authority, diag: Diag | undefined): unknown {
+    if (!diag) throw new Error("no diagnostics");
+    const { trigger, tree, cancel } = diag;
+    const cfg = this.config;
+    return deepFreeze({
+      version: 1, metric: "working_set_v1", clock: "monotonic_ms",
+      settings: { reserve_bytes: cfg.reserveBytes, hysteresis_bytes: cfg.hysteresisBytes, sample_ms: cfg.sampleMs,
+        response_budget_ms: cfg.responseBudgetMs, rearm_ms: cfg.rearmMs, max_interventions: cfg.maxInterventions },
+      trigger: trigger ? section(trigger.sample, trigger.decision) : { unavailable: "absent" },
+      authority: section(a.sample, a.decision),
+      authority_same_as_trigger: trigger !== undefined && trigger.sample.sampleId === a.sample.sampleId,
+      tree: {
+        selected_rss_bytes_approx: tree.rssBytesApprox, selected_started_at_ms: tree.startedAtMs,
+        selected_completed_at_ms: tree.completedAtMs, candidates: tree.candidates, observation_failures: tree.failures,
+        cancel_check: cancel ? {
+          rss_bytes_approx: cancel.rows.reduce((sum, row) => sum + row.rssBytes, 0),
+          started_at_ms: cancel.startedAtMs, completed_at_ms: cancel.completedAtMs,
+        } : { unavailable: "not_observed" },
+      },
+    });
+  }
+
+  private async finish(a: Authority, selected: Selection, outcome: MemoryOutcome, preserve: boolean, diag?: Diag): Promise<Readonly<{ result: WorkerMemoryPressureResult; preserved: boolean }>> {
     const sample = a.sample;
     const result: WorkerMemoryPressureResult = Object.freeze({
       run_id: a.request.run_id, worker_id: a.request.worker_id, intervention_id: a.request.intervention_id,
@@ -498,7 +594,9 @@ export class WorkerMemoryMonitor {
     const preserveCapturedFlight = preserve;
     // Retain feed intent for every outcome before tool completion and bounded IO.
     // Captured settlement belongs to this flight even after cancellation authority retires.
-    try { this.ports.prepareFeedback?.(a.context, result); } catch {}
+    let diagnostics: unknown;
+    try { diagnostics = this.diagnostics(a, diag); } catch { diagnostics = Object.freeze({ version: 1, unavailable: "error" }); }
+    try { this.ports.prepareFeedback?.(a.context, result, diagnostics); } catch {}
     if (preserveCapturedFlight) {
       // The owner sets clone/session retention intent synchronously, before feedback
       // can unblock tool completion. memoryPark only retires local authority; it
@@ -530,7 +628,7 @@ export class WorkerMemoryMonitor {
     try { await this.bounded((signal, ms) => this.ports.preserve(a.context, signal, ms), this.ports.now() + budget); } catch {}
   }
 
-  private async intervene(entries: readonly Entry[], deadline: number): Promise<void> {
+  private async intervene(entries: readonly Entry[], deadline: number, trigger?: Trigger): Promise<void> {
     const commands = this.ports.commands;
     const captures = entries.map((entry) => ({ entry, phaseRevision: commands.phaseRevision(entry.context) }));
     const candidates = await Promise.all(captures.map(async ({ entry, phaseRevision }) => {
@@ -538,15 +636,19 @@ export class WorkerMemoryMonitor {
       catch { return undefined; }
     }));
     if (this.closed || !this.applicable) return;
-    const selected = commands.select(candidates.filter((value) => value !== undefined).filter(({ entry, phaseRevision }) => commands.phaseAdmits(entry.context, phaseRevision)), this.ports.now(), this.config.responseBudgetMs);
+    const observed = candidates.filter((value) => value !== undefined);
+    const selected = commands.select(observed.filter(({ entry, phaseRevision }) => commands.phaseAdmits(entry.context, phaseRevision)), this.ports.now(), this.config.responseBudgetMs);
     if (!selected) return;
     const entry = selected.entry;
     const incarnation = this.ports.incarnation();
-    if (!this.latest || !incarnation || incarnation.worker_id !== entry.context.worker_id || incarnation.register_nonce !== entry.context.register_nonce) return;
+    if (!this.latest || !this.latestDecision || !incarnation || incarnation.worker_id !== entry.context.worker_id || incarnation.register_nonce !== entry.context.register_nonce) return;
+    const tree: Tree = Object.freeze({
+      rssBytesApprox: selected.rssBytesApprox, startedAtMs: selected.observation.startedAtMs,
+      completedAtMs: selected.observation.completedAtMs, candidates: observed.length, failures: candidates.length - observed.length,
+    });
     const a: Authority = Object.freeze({
       context: entry.context, phaseRevision: selected.phaseRevision, entry, incarnation: Object.freeze({ ...incarnation }),
-      sample: Object.freeze({ ...this.latest, stat: Object.freeze({ ...this.latest.stat }),
-        pressure: copyPressure(this.latest.pressure, true) }),
+      sample: snapshot(this.latest), decision: this.latestDecision,
       request: Object.freeze({
         run_id: entry.context.run_id, worker_id: entry.context.worker_id, register_nonce: entry.context.register_nonce,
         claim_generation: entry.context.claim_generation, memory_episode: entry.context.memory_episode,
@@ -565,6 +667,7 @@ export class WorkerMemoryMonitor {
     let preserve = true;
     let awaiting = true;
     let cancelStarted = false;
+    let cancelObservation: Observed | undefined; // stays undefined when admission is denied or fails
     try {
       if (commands.remaining(a.context) === 0) throw new Error("memory allowance exhausted");
       const ack = await this.bounded((signal, ms) => {
@@ -579,6 +682,7 @@ export class WorkerMemoryMonitor {
       if (!ack.admitted || !ack.authorizing || commands.remaining(a.context) === undefined) throw new Error("memory admission denied");
       preserve = ack.allowance.remaining === 0;
       const observation = await this.bounded((signal, remainingMs) => entry.observe({ signal, remainingMs }), deadline);
+      cancelObservation = observation;
       const authorized = () => this.ports.now() < deadline && this.current(a)
         && commands.checkBeforeCancel(selected, observation, this.ports.now(), this.config.responseBudgetMs);
       if (!authorized()) throw new Error("stale memory authority");
@@ -604,7 +708,7 @@ export class WorkerMemoryMonitor {
     // Direct proof settles only an invoked cancellation, including command cleanup during either await.
     // It grants no new authority and cannot turn a no-signal attempt into a cancellation.
     if (cancelStarted && commands.hasConfirmedStop(entry)) outcome = "confirmed_drained";
-    const prepared = await this.finish(a, selected, outcome, preserve || outcome !== "confirmed_drained");
+    const prepared = await this.finish(a, selected, outcome, preserve || outcome !== "confirmed_drained", { trigger, tree, cancel: cancelObservation });
     const confirmed = await this.report(a, outcome, ticket);
     if (!confirmed && !prepared.preserved) {
       this.preparePreservation(a, prepared.result);

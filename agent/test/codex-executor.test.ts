@@ -988,8 +988,9 @@ describe("M3 actual runner memory Codex delivery", () => {
           m.payload.event === "worker_memory_pressure"), "persisted joined feedback");
         const feed = m2Runner.api.messages(f.claim.run_id).filter(m => m.payload.event === "worker_memory_pressure");
         assert.equal(feed.length, 1, "actual runner persists one joined feedback event");
-        const { event, ...feedback } = feed[0]!.payload;
+        const { event, memory_diagnostics: diagnostics, ...feedback } = feed[0]!.payload;
         assert.equal(event, "worker_memory_pressure");
+        assert.equal(rec(diagnostics).version, 1, "the status feed alone carries the diagnostics sibling");
         assert.deepEqual(feedback, original, "callback and feed contain the same structured pressure result");
         assert.equal(JSON.stringify(feed).includes("m3-original-registration"), false);
         assert.equal(modelDisposals, 1, "monitor disposes the enrolled fake command exactly once");

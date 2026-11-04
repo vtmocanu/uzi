@@ -3,6 +3,13 @@ import { performance } from "node:perf_hooks";
 
 type UnavailableReason = "absent" | "malformed" | "unlimited" | "unverified" | "oversized";
 type Psi = { avg10: number; avg60: number; avg300: number; total: number };
+const DETAIL_KEYS = [
+  "active_file", "active_anon", "inactive_anon", "file", "file_dirty", "file_writeback", "file_mapped",
+  "kernel", "kernel_stack", "pagetables", "percpu", "sock", "slab", "slab_reclaimable",
+] as const;
+type DetailKey = typeof DETAIL_KEYS[number];
+/** Optional memory.stat diagnostics from the same parse; defects only land in missing/malformed. */
+type StatDetail = Readonly<{ [K in DetailKey]?: number } & { missing: readonly string[]; malformed: readonly string[] }>;
 type Sample = {
   sampleId: number;
   startedAtMs: number;
@@ -12,6 +19,7 @@ type Sample = {
   currentBytes: number;
   limitBytes: number;
   stat: { anon: number; shmem: number; slab_unreclaimable: number; unevictable: number; inactive_file: number };
+  statDetail?: StatDetail;
   pressure: { some: Psi; full: Psi } | { unavailable: "absent" | "unsupported" };
 } | { available: false; reason: UnavailableReason });
 
@@ -44,22 +52,43 @@ function integer(raw: string): number {
   return value;
 }
 
-function stat(raw: string): Extract<Sample, { available: true }>["stat"] {
+function stat(raw: string): { core: Extract<Sample, { available: true }>["stat"]; detail: StatDetail } {
   const required = ["anon", "shmem", "slab_unreclaimable", "unevictable", "inactive_file"] as const;
   const fields = new Map<string, number>();
+  const extra = new Map<string, number>();
+  const malformed = new Set<string>();
   for (const line of raw.trim().split("\n")) {
     const parts = line.trim().split(/\s+/);
+    if (DETAIL_KEYS.some((key) => key === parts[0])) {
+      // Optional diagnostics never invalidate a core sample: any defect is only recorded.
+      const key = parts[0]!;
+      if (malformed.has(key)) continue;
+      try {
+        if (parts.length !== 2 || extra.has(key)) throw new Error("malformed");
+        extra.set(key, integer(parts[1]!));
+      } catch { extra.delete(key); malformed.add(key); }
+      continue;
+    }
     if (!required.some((key) => key === parts[0])) continue;
     if (parts.length !== 2 || parts[0] === undefined || parts[1] === undefined || fields.has(parts[0])) throw new Error("malformed");
     fields.set(parts[0], integer(parts[1]));
   }
   for (const key of required) if (!fields.has(key)) throw new Error("malformed");
+  const detail: { [K in DetailKey]?: number } = {};
+  for (const key of DETAIL_KEYS) if (extra.has(key)) detail[key] = extra.get(key)!;
   return {
-    anon: fields.get("anon")!,
-    shmem: fields.get("shmem")!,
-    slab_unreclaimable: fields.get("slab_unreclaimable")!,
-    unevictable: fields.get("unevictable")!,
-    inactive_file: fields.get("inactive_file")!,
+    core: {
+      anon: fields.get("anon")!,
+      shmem: fields.get("shmem")!,
+      slab_unreclaimable: fields.get("slab_unreclaimable")!,
+      unevictable: fields.get("unevictable")!,
+      inactive_file: fields.get("inactive_file")!,
+    },
+    detail: Object.freeze({
+      ...detail,
+      missing: Object.freeze(DETAIL_KEYS.filter((key) => !extra.has(key) && !malformed.has(key))),
+      malformed: Object.freeze(DETAIL_KEYS.filter((key) => malformed.has(key))),
+    }),
   };
 }
 
@@ -155,7 +184,7 @@ export class WorkerMemoryReader {
       }
       const limitBytes = integer(limit);
       if (limitBytes === 0) throw new Error("malformed");
-      const memoryStat = stat(read(`${root}/memory.stat`));
+      const { core: memoryStat, detail: statDetail } = stat(read(`${root}/memory.stat`));
       const failure: { code?: string } = {};
       let memoryPressure: Extract<Sample, { available: true }>["pressure"];
       try {
@@ -167,7 +196,7 @@ export class WorkerMemoryReader {
       }
       return {
         available: true, sampleId, startedAtMs, completedAtMs: now(),
-        currentBytes, limitBytes, stat: memoryStat, pressure: memoryPressure,
+        currentBytes, limitBytes, stat: memoryStat, statDetail, pressure: memoryPressure,
       };
     } catch {
       return { available: false, reason, sampleId, startedAtMs, completedAtMs: now() };
