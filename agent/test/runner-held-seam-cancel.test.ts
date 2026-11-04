@@ -10,6 +10,8 @@ import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { acquireWorkerLifetime, SourceUseHeldRefusal } from "../src/authority-lock.js";
 import { AuthorityRuntime } from "../src/authority-runtime.js";
 import { Outbox } from "../src/outbox.js";
+import { RecoveryCoordinator } from "../src/recovery.js";
+import { FakeRecoveryClient } from "./codex-reap-fixture.js";
 import { LiveAttemptRegistry, mintAttemptId, setQuiescenceViewForTests, type QuiesceRunOutcome, type QuiesceRunRequest } from "../src/run-quiescence.js";
 import { testLockOptions } from "./authority-test-support.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
@@ -127,6 +129,8 @@ interface RigOptions {
   /** Ownership answer once the seam is reached (default: running at the claim generation). */
   owner?: Partial<Pick<Owner, "status" | "generation" | "released">>;
   runnerOpts?: Record<string, unknown>;
+  /** Run with a token-keyed (enabled) recovery coordinator and an inventory-guarded claim. */
+  recoveryEnabled?: boolean;
 }
 
 interface Rig {
@@ -176,6 +180,13 @@ async function rig(t: TestContext, o: RigOptions): Promise<Rig> {
     await current.recordAdmissions(earlier, () => current!.bindSource(pred.clonePath));
     current.retireSink(earlier);
   }
+  const recovery = o.recoveryEnabled
+    ? new RecoveryCoordinator({
+      ...(current ? { authority: current } : {}),
+      client: new FakeRecoveryClient(), git: restartedGit, log: nullLogger(),
+      recoveryRoot: restartedGit.recoveryRoot, workerToken: TOKEN,
+    })
+    : undefined;
   const runner = new RunRunner(client, restartedGit, factory, logger, 20, undefined, {
     pollMs: 1_000, // the steering poll never beats the seam
     planApprovalTimeoutMs: 0,
@@ -187,6 +198,7 @@ async function rig(t: TestContext, o: RigOptions): Promise<Rig> {
     heldSeamCancelObserveMs: 2_000,
     ...(current ? { authority: current } : {}),
     ...(outbox ? { outbox } : {}),
+    ...(recovery ? { recovery } : {}),
     ...o.runnerOpts,
   } as ConstructorParameters<typeof RunRunner>[6]);
   const reserve = t.mock.method(restartedGit, "reserveRecoveryIteration");
@@ -226,7 +238,9 @@ async function rig(t: TestContext, o: RigOptions): Promise<Rig> {
     return orig(claim, flight);
   });
   r.seamCalls = () => seam.mock.callCount();
-  r.claim = (g = generation) => gitlabClaim(o.iid, { run_id: runId, claim_generation: g });
+  r.claim = (g = generation) => gitlabClaim(o.iid, {
+    run_id: runId, claim_generation: g, ...(o.recoveryEnabled ? { inventory_guarded: true } : {}),
+  });
   r.run = async (g = generation) => { api.setOwnershipStatus(runId, "running", g); await runner.execute(r.claim(g)); };
   r.gets = () => api.inputGets.get(runId) ?? 0;
   r.ownReads = () => api.ownershipRequests.filter(id => id === runId).length - (r.ownAtSeam ?? 0);
@@ -296,6 +310,30 @@ describe("issue #3860: owner cancel at a held-predecessor refusal", { skip: !HAS
     }
   }
 
+  it("recovery enabled with an inventory-guarded claim: the cancel report keeps custody (no reap, no settle, source kept)", async t => {
+    const r = await rig(t, {
+      site: "A", iid: 3855, cancel: true, outbox: "ok", recoveryEnabled: true,
+      pre: async (rg, f) => {
+        // A real clone's bare, as the retained-source seam holds it (0700 dirs, 0600 config).
+        const bare = await git.ensureClone(fx.originPath);
+        fs.chmodSync(path.dirname(bare), 0o700);
+        fs.chmodSync(bare, 0o700);
+        fs.chmodSync(path.join(bare, "config"), 0o600);
+        f.barePath = bare;
+        assert.equal((rg.runner as Priv).recovery.enabled, true, "fixture: recovery is enabled");
+      },
+    });
+    const reap = t.mock.method(r.runner as Priv, "reapRecoveryProviderForSettle");
+    const settle = t.mock.method(r.runner as Priv, "settleRecoveryGeneration");
+    const dispose = t.mock.method(r.runner as Priv, "disposeCredentialFreeOwnerCancel");
+    await r.run();
+    assertCancelledOnce(r);
+    assert.equal(r.flight.retainedLocalCustody, true, "custody is retained before the seam");
+    assert.equal(reap.mock.callCount(), 0, "no provider reap");
+    assert.equal(settle.mock.callCount(), 0, "the recovery generation is not settled");
+    assert.equal(dispose.mock.callCount(), 0, "no credential-free owner-cancel disposal");
+  });
+
   it("a cancel the server starts reporting while the read is in flight is honoured", async t => {
     const r = await rig(t, { site: "A", iid: 3862, outbox: "ok", requested: undefined });
     const release = r.holdOwnership();
@@ -333,6 +371,7 @@ describe("issue #3860: owner cancel at a held-predecessor refusal", { skip: !HAS
     const unsafe: Array<[string, Partial<RigOptions> & { setup?: (r: Rig, flight: Priv) => void | Promise<void> }]> = [
       ["pending terminal journal at the current generation", { outbox: "ok", setup: (r) => journalFailed(r.outbox!, r.runId, r.generation) as Promise<void> }],
       ["pending terminal journal at an earlier generation", { outbox: "ok", setup: (r) => journalFailed(r.outbox!, r.runId, r.generation - 1) as Promise<void> }],
+      ["pending finalize journal at an earlier generation", { outbox: "ok", setup: async (r) => { await r.outbox!.journalFinalize(r.runId, r.generation - 1); } }],
       ["outbox disabled", { outbox: "disabled" }],
       ["outbox absent", { outbox: "none" }],
       ["policy inventory coverage unavailable", { outbox: "ok", setup: r => { r.t.mock.method(r.outbox!, "policyInventoryCoverageAvailable", () => false); } }],
@@ -387,6 +426,7 @@ describe("issue #3860: owner cancel at a held-predecessor refusal", { skip: !HAS
     const mid: Array<[string, (r: Rig, f: Priv) => void | Promise<void>]> = [
       ["an earlier-generation terminal journal", (r) => journalFailed(r.outbox!, r.runId, r.generation - 1) as Promise<void>],
       ["a current-generation terminal journal", (r) => journalFailed(r.outbox!, r.runId, r.generation) as Promise<void>],
+      ["a pending finalize journal", async (r) => { await r.outbox!.journalFinalize(r.runId, r.generation - 1); }],
       ["a claim fence", (_r, f) => { (f.steering as Priv).fence = "fenced"; }],
       ["a worker shutdown", (_r, f) => { f.active = { shuttingDown: true }; }],
       ["a policy hold", (_r, f) => { f.policyHold = { outcomeId: "x" }; }],
