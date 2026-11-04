@@ -536,6 +536,8 @@ type RetainedSwitchOptions = {
   cancelOnly?: boolean;
   /** Collects every quiescence request the runner makes (the real proof still runs). */
   quiesceRequests?: import("../src/run-quiescence.js").QuiesceRunRequest[];
+  /** Case-specific signal assertions, run right after execute() and before the shared ones. */
+  afterExecute?: () => void;
 };
 
 for (const ack of ["lost", "statusless", "stale", "idempotent"] as const) {
@@ -628,12 +630,13 @@ it("retained recovery credential switch aborts drain at its operation deadline",
     // Missing propagation must fail promptly instead of hanging the regression.
     await awaitSignalOrWatchdog(drainWait, signal);
   });
-  await retainedSwitchRegression("ownership", false, { drainDeadline: true });
-  const drainSignal = drainWait.signal;
-  assert.ok(drainSignal, "drain receives the independent operation signal");
-  assert.equal(drainWait.watchdogFired, false, "drain ended before the test watchdog");
-  assert.equal(drainSignal.aborted, true, "drain settled only after deadline abort");
-  assertRecoveryDeadline(drainSignal, "drain");
+  await retainedSwitchRegression("ownership", false, { drainDeadline: true, afterExecute: () => {
+    const drainSignal = drainWait.signal;
+    assert.ok(drainSignal, "drain receives the independent operation signal");
+    assert.equal(drainWait.watchdogFired, false, "drain ended before the test watchdog");
+    assert.equal(drainSignal.aborted, true, "drain settled only after deadline abort");
+    assertRecoveryDeadline(drainSignal, "drain");
+  } });
   assert.equal(drains, 1, "outer cleanup joins the bounded drain rather than draining again");
 });
 for (const proofTerminal of ["shutdown", "fence", "cancel"] as const) {
@@ -788,6 +791,14 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
   };
   client.releaseRecoveryCustody = async () => { releases++; throw new Error("custody must remain"); };
   await r.execute(claim);
+  if (options.deadline) {
+    const signal = ownershipWait.signal;
+    assert.ok(signal, "verification passes its independent bounded signal");
+    assert.equal(ownershipWait.watchdogFired, false, "verification ended before the test watchdog");
+    assert.equal(signal.aborted, true, "verification settled only after deadline abort");
+    assertRecoveryDeadline(signal, "verification");
+  }
+  options.afterExecute?.();
   assert.equal(injected, true, "actual retained recovery await received the switch");
   if (options.interruption !== "execution") assert.ok(flight.cancel.signal.reason instanceof CredentialSwitchSignal);
   assert.equal(models, 0);
@@ -799,13 +810,6 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
       [[verified ? "credential_switch" : "credential_switch_failed", 2]]);
   assert.equal(api.states.some(s => s.body.status === "failed"), options.terminal === "cancel");
   if (options.deadline || options.proofTerminal) assert.equal(proofInterrupted, true, "verification await was interrupted");
-  if (options.deadline) {
-    const signal = ownershipWait.signal;
-    assert.ok(signal, "verification passes its independent bounded signal");
-    assert.equal(ownershipWait.watchdogFired, false, "verification ended before the test watchdog");
-    assert.equal(signal.aborted, true, "verification settled only after deadline abort");
-    assertRecoveryDeadline(signal, "verification");
-  }
   if (!options.terminal && !options.mismatch && !options.deadline && !options.drainDeadline && !options.proofTerminal && !options.interruption) {
     const disposition = log.lines.find(line => (line as { msg: string }).msg ===
       "retained credential switch stopped; all local work and custody retained") as { confirmed: boolean } | undefined;
