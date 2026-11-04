@@ -2049,7 +2049,6 @@ type Service struct {
 	heldListFn         func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
 	prerequisite       *prerequisiteRuntime
 	heldSlots          chan struct{}
-	checkpointPublish  *checkpointPublishSlots
 	heldBeforeSendHook func()
 	heldOutcomeHook    func() error
 	// heldDeleteFn is the held cleanup's CAS delete (default pushbroker.Delete); heldCleanupHook,
@@ -2405,7 +2404,6 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		heldListFn:           pushbroker.ListRefTips,
 		heldDeleteFn:         pushbroker.Delete,
 		heldSlots:            make(chan struct{}, heldPublishMaxConcurrent),
-		checkpointPublish:    newCheckpointPublishSlots(),
 		prerequisite:         newPrerequisiteRuntime(),
 		createRefFn:          pushbroker.CreateRef,
 		listRefTipsFn:        pushbroker.ListRefTips,

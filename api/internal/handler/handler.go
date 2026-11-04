@@ -1289,11 +1289,15 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// NON-FORCED to refs/uzi-checkpoints/<checkpoint-key>. Inherits RequireWorker; feeds
 		// BOTH the plain and TLS listeners from this one mount.
 		//
-		// Concurrency: no per-user limiter; WorkerRunPublish takes a slot from
-		// workersvc.AcquireCheckpointPublishSlot (process-wide + per-worker cap, 429 when
-		// busy) because each request buffers up to maxPackBytes and holds its connection
-		// for the extended deadlines in worker_publish_deadline.go. The inflation-work cap
-		// and per-publish timeout in pushbroker bound the work inside a request.
+		// TODO(PRD#122 M8): rate-limit /publish. Deliberately unlimited today: the
+		// primary DoS (a pack forcing ~GiBs of uncancellable inflation) is closed at the
+		// source by pushbroker's cumulative inflation-work cap + per-publish wall-clock
+		// timeout, so each request is now cheap and bounded and the amplification is
+		// gone. A per-worker limiter would be pure defense-in-depth but is invasive here
+		// — it means a new *mw.Limiter threaded through Routes/WorkerRoutes/
+		// mountWorkerRoutes, new config knobs, and updating the pinned route-table +
+		// limiter-argument-order tests — so it is left as a follow-up rather than folded
+		// into this hardening pass.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/publish", h.WorkerRunPublish)
 
 		// Held-work publication, step A (issue #2545): the worker of a FAILED run uploads one pack
