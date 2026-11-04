@@ -133,8 +133,9 @@ fi
 # only here and the #2304 case above is the behavioral proof for CI too. Pin both
 # halves of that: the workflow carries no inline Postgres readiness probe or database
 # container of its own (a second, untested probe would be a second place for the
-# socket-versus-TCP bug), and this script's probes all use TCP (`-h 127.0.0.1`).
-ci_probes="$(grep -v '^[[:space:]]*#' "$HERE/../.github/workflows/ci.yml" | grep -cE 'pg_isready|docker run|--name ci-pg' || true)"
+# socket-versus-TCP bug), and this script's probes all use TCP (`-h 127.0.0.1`). Only database
+# containers count: unrelated `docker run` lines elsewhere in the workflow are fine.
+ci_probes="$(grep -v '^[[:space:]]*#' "$HERE/../.github/workflows/ci.yml" | grep -cE 'pg_isready|--name ci-pg|docker run[^#]*(postgres|PG_IMAGE)' || true)"
 script_probes="$(grep -c 'pg_isready' "$SCRIPT" || true)"
 script_tcp_probes="$(grep -c 'pg_isready -h 127.0.0.1 ' "$SCRIPT" || true)"
 if [ "$ci_probes" -eq 0 ] && [ "$script_probes" -ge 1 ] && [ "$script_probes" -eq "$script_tcp_probes" ]; then
