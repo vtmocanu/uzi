@@ -29,9 +29,11 @@ comes from: the Claude model picker reads `Default · lead template` (the
 `lead` template's model) and the Codex model picker reads
 `Default · gpt-6.1-sol (built-in)`. The harness picker's empty option reads
 `Default · automatic`: uzi picks your only usable harness, or, when both are
-usable, chooses per run by weekly limits (the harness whose weekly allowance
+usable, chooses by weekly limits for eligible new issue runs (started
+manually, by autopilot or by a schedule, with no model pin, Anthropic
+credential override or Plan/Code cross-check; other runs keep Claude when both are usable). It picks the harness whose weekly allowance
 resets soonest, falling back to Claude when usage is unknown; see [How the
-automatic default picks a harness](./rate-limits.md#how-the-automatic-default-picks-a-harness)).
+automatic default picks a harness](./rate-limits.md#how-the-automatic-default-picks-a-harness).
 Schedules and the start-run form still say **Use my default** for
 the harness.
 

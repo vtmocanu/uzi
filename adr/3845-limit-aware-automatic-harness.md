@@ -43,6 +43,10 @@ applies only to an explicit default (below).
 - **Side states.**
   - Unknown: no fresh reading (unmeasured, stale, poller off), a Codex API-key
     default, Codex `pool_stale`, or a quarantined or re-login Codex default.
+    A capacity hold takes precedence over a stale or absent reading: with a
+    weekly-reserve threshold set, a reserve Unknown verdict holds the account,
+    and a held account is depleted, not unknown (`claudeBlocked` in
+    `usage_reserve.go`; Codex `CapacityExcluded`).
   - Depleted: capacity-held (including a weekly-reserve hold, and a reserve
     Unknown verdict while a threshold is set), measured below the auto-select
     headroom floor (`UZI_AUTOSELECT_MIN_HEADROOM`), or Codex `pool_exhausted`.
@@ -69,9 +73,12 @@ applies only to an explicit default (below).
   (`errHarnessOverflowRequiresTx`); a database or selector error fails
   creation rather than falling back.
 - **Fence semantics.** The Codex pick is re-checked after the run INSERT
-  (`fenceCreationPick`, `recheckAutomaticDecision`). A Codex pick that no
-  longer holds counts as an unknown Codex side and the decision is
-  recomputed with the earlier Claude side. If the recomputed decision would
+  (`fenceCreationPick`, `recheckAutomaticDecision`). A default-account pick
+  that no longer holds counts as an unknown Codex side. A pool pick that
+  fails is first re-selected from the pool (`fenceCodexPoolAlias`) and the
+  replacement is scored normally; the side is unknown only when no pool alias
+  remains (`errCodexPoolUnavailable`), and any other error fails creation. The
+  decision is recomputed with the earlier Claude side. If the recomputed decision would
   choose a different harness, creation refuses (`errHarnessOverflowFence`) and
   the transaction rolls back. If Codex degrades but Claude stays chosen, the
   recomputed decision is stored.

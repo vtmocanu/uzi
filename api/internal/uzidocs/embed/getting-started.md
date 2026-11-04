@@ -35,7 +35,10 @@ instead? Connect a [Codex credential](./codex-credentials.md) rather than
 an Anthropic token; uzi picks the harness for your runs from whichever
 credential(s) you hold. Hold both, and you choose the default harness
 yourself from **Settings → Run defaults** (or leave it automatic, so uzi
-chooses per run by weekly limits) — see [Harness and worker
+chooses by weekly limits for eligible new issue runs: manual, autopilot or
+schedule, with no model pin, Anthropic credential override or Plan/Code
+cross-check; other runs keep Claude when both are usable, see [the
+rules](./rate-limits.md#how-the-automatic-default-picks-a-harness)) — see [Harness and worker
 models](./worker-model.md#harness-and-worker-models).
 
 ## 5. Run an agent

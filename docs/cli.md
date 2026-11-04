@@ -285,8 +285,10 @@ A few worth knowing:
   --harness claude|codex` request a specific harness outright; omitting the
   flag leaves the server's own resolution in charge (your effective default,
   or whichever harness you have a usable credential for; with both usable and
-  no default, [chosen by weekly limits](./rate-limits.md#how-the-automatic-default-picks-a-harness),
-  and with an explicit default, [optional overflow](#harness-overflow) for
+  no default, eligible new issue runs (manual, autopilot or schedule; no model
+  pin, Anthropic credential override or Plan/Code cross-check) are
+  [chosen by weekly limits](./rate-limits.md#how-the-automatic-default-picks-a-harness)
+  and other runs keep Claude; with an explicit default, [optional overflow](#harness-overflow) for
   eligible new issue runs). `schedule edit
   --harness ""` clears a schedule's pin back to per-fire resolution; leaving
   the flag unset on edit leaves the stored pin unchanged. The resolved
@@ -3221,7 +3223,8 @@ The command writes `PUT /api/me/harness-overflow` with
 single boolean field. Other arguments are usage errors (exit 2). Human
 output reads `Harness overflow: on (new runs, at creation)` or
 `Harness overflow: off (new runs, at creation)`. The command reads your
-settings back after the write; with the default harness automatic it prints
+settings back after the write (human output only; `--json` returns the single
+boolean without the read-back); with the default harness automatic it prints
 `Harness overflow: on (inactive: default harness is automatic)` (or `off`
 likewise), and if the read-back fails it prints
 `Harness overflow: on (saved; default harness could not be read)` and
@@ -3255,7 +3258,7 @@ two rows are the weekly resets, `pref reset:` and `other reset:`, or
 `claude reset:` and `codex reset:` for an `auto_*` reason (whose score,
 measured and held rows are likewise labelled `claude` and `codex` instead of
 `preferred`/`pref` and `other`). A reset reads `MM-DD HH:MMZ` in UTC with the
-year omitted (it is the year of the run's creation), or `unknown`. The TUI detail rail has **HARNESS at creation**, fitted as a whole block
+year omitted (the reset falls within about a week after the run's creation), or `unknown`. The TUI detail rail has **HARNESS at creation**, fitted as a whole block
 when space permits. The web run page shows the same stored explanation.
 These are owner-only readings, independent of live usage and claim-time
 credential metadata. Legacy or unavailable decisions read `not recorded`.

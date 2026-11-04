@@ -397,8 +397,8 @@ It applies to the same new issue runs that overflow considers: started
 manually, by autopilot or by a schedule, with no explicit harness (including
 an issue harness label), no run/schedule model pin, no Anthropic credential
 override, and neither the Plan nor the Code cross-check enabled. Any other
-creation with an unset default keeps Claude and records the reason
-`excluded`.
+creation with an unset default keeps the usual resolution (an explicit
+harness, else your only usable harness, else Claude) and records `excluded`.
 
 uzi compares one account per harness, read from stored usage:
 
@@ -412,7 +412,10 @@ Each side is **unknown**, **depleted** or **qualified**:
 
 - **Unknown:** no fresh reading (unmeasured, stale or the usage poller off), a
   Codex API-key default, a Codex pool pick reported as
-  `pool_stale`, or a quarantined or re-login Codex default.
+  `pool_stale`, or a quarantined or re-login Codex default. A capacity hold
+  takes precedence over a stale or absent reading: with a weekly-reserve
+  threshold set, a reserve "Unknown" verdict holds the account, and a held
+  account is depleted, not unknown, even if its reading is stale or absent.
 - **Depleted:** capacity-held (including a weekly-reserve hold, and a reserve
   verdict of unknown while a threshold is set), measured below the
   auto-select headroom floor (`UZI_AUTOSELECT_MIN_HEADROOM`), or a Codex pool
@@ -434,8 +437,14 @@ parked or resumed run never changes harness. Creation takes the same
 per-user credential lock overflow does, now for every eligible creation with an
 unset default, so a credential change you make at that moment can briefly wait
 for a creation in flight. If the Codex account changes state between the pick
-and the commit and that would change the chosen harness, creation is refused
-instead of starting on a different harness than was decided.
+and the fence and that would change the chosen harness, creation is refused
+instead of starting on a different harness than was decided. A refresher
+quarantine or re-login written after the fence is not caught (the existing
+refresher-after-fence window). A pool pick that no longer holds at the fence
+is first re-selected from the pool and the replacement is scored normally; the
+Codex side is unknown only when no pool alias remains, and any other error
+fails creation. A default-account pick that no longer holds counts as an
+unknown Codex side.
 
 The owner sees the stored decision as `harness_decision` (reasons
 `auto_soonest_reset`, `auto_only_qualified`, `auto_fallback`): for these rows
