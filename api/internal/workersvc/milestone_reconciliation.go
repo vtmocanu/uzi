@@ -197,6 +197,8 @@ func reconciliationSnapshot(r store.Run) ([]byte, error) {
 	} {
 		snapshot[key] = json.RawMessage(jsonOrNull(raw))
 	}
+	delete(snapshot, "agent_source_requested")
+	delete(snapshot, "agent_source_requested_basis")
 	return json.Marshal(snapshot)
 }
 
@@ -462,6 +464,7 @@ func (s *Service) reconcileMilestoneApproval(ctx context.Context, owner uuid.UUI
 			return SubmitInputResult{}, err
 		}
 	}
+	sel = materializeRequestedSelection(run, sel)
 	var selectionJSON []byte
 	if sel != nil {
 		roster, err := lockedService.rosterFor(ctx, run, sel.Source, nil)

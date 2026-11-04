@@ -4241,7 +4241,7 @@ export class CodexExecutor implements Executor {
       // gate), before any implement turn. An invalid selection forces `own` and a repo selection
       // with no detected roster degrades to `own` (resolveAgentSelection owns both rules), so a
       // malformed verdict can never activate attacker-authored repo agents.
-      const resolvedSelection = resolveAgentSelection(approvedSelection, (ctx.repoAgents?.length ?? 0) > 0);
+      const resolvedSelection = resolveAgentSelection(approvedSelection, (ctx.repoAgents?.length ?? 0) > 0, ctx.requestedAgentSource);
       if (resolvedSelection.note) {
         ctx.emit({ kind: "status", agent: "worker", payload: { text: resolvedSelection.note } });
       }

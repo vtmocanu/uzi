@@ -111,6 +111,8 @@
   "repo_agents": null,
   "agent_source": null,
   "agent_exclusions": null,
+  "agent_source_requested": null,
+  "agent_source_requested_basis": null,
   "own_agents": null,
   "anthropic_secret_id": null,
   "anthropic_secret_label": null,

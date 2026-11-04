@@ -1020,6 +1020,7 @@ type Repo struct {
 	CodeCrossCheckGuidance            pgtype.Text        `json:"code_cross_check_guidance"`
 	CrossCheckRepoInstructionsEnabled bool               `json:"cross_check_repo_instructions_enabled"`
 	IgnoredInferredCapabilities       []string           `json:"ignored_inferred_capabilities"`
+	AgentSourceDefault                pgtype.Text        `json:"agent_source_default"`
 }
 
 type RepoToolProfile struct {
@@ -1265,6 +1266,8 @@ type Run struct {
 	HarnessOtherMeasured        pgtype.Float8      `json:"harness_other_measured"`
 	HarnessPreferredHeld        pgtype.Bool        `json:"harness_preferred_held"`
 	HarnessOtherHeld            pgtype.Bool        `json:"harness_other_held"`
+	AgentSourceRequested        pgtype.Text        `json:"agent_source_requested"`
+	AgentSourceRequestedBasis   pgtype.Text        `json:"agent_source_requested_basis"`
 }
 
 type RunCompletionAttempt struct {

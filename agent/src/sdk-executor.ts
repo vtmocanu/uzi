@@ -2876,7 +2876,7 @@ export class SdkExecutor implements Executor {
       // repo": an ABSENT selection resolves to repo when a roster was detected, which
       // is what a gate-less run and an older server both get (see further up).
       const repoAvailable = (ctx.repoAgents?.length ?? 0) > 0;
-      const resolved = resolveAgentSelection(approvedSelection, repoAvailable);
+      const resolved = resolveAgentSelection(approvedSelection, repoAvailable, ctx.requestedAgentSource);
       if (resolved.note)
         ctx.emit({
           kind: "status",

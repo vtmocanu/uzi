@@ -12,6 +12,7 @@ import {
   preferForgeUrl,
   isTerminalRun,
   type Repo,
+  type AgentSource,
   type Run,
   type Worker,
 } from "../lib/api";
@@ -3649,6 +3650,7 @@ export function AgentRosterSummary({ run }: { run: Run }) {
   // missing roster, so it keeps its definitive copy.
   const repoRosterPending =
     run.plan_source === "seeded" && run.agent_source === "repo" && roster.length === 0;
+  const request = agentSourceRequestLine(run);
   return (
     <Card className="space-y-2 p-4">
       <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">
@@ -3683,6 +3685,17 @@ export function AgentRosterSummary({ run }: { run: Run }) {
         </div>
       )}
       {excluded.size > 0 && <p className="text-xs text-faint">Excluded: {[...excluded].join(", ")}</p>}
+      {request && <p className="text-xs text-faint">{request}</p>}
     </Card>
   );
+}
+
+const AGENT_SOURCE_RUN_LABELS: Record<AgentSource, string> = { own: "my templates", repo: "repo agents" };
+
+function agentSourceRequestLine(run: Pick<Run, "agent_source" | "agent_source_requested" | "agent_source_requested_basis">): string | null {
+  const requested = run.agent_source_requested;
+  if (!requested || !run.agent_source) return null;
+  const basis = run.agent_source_requested_basis === "repo_default" ? "repo default" : "this run";
+  const outcome = run.agent_source === requested ? "as requested" : "changed at approval";
+  return `Requested: ${AGENT_SOURCE_RUN_LABELS[requested]} (${basis}) · Implemented with: ${AGENT_SOURCE_RUN_LABELS[run.agent_source]} (${outcome})`;
 }

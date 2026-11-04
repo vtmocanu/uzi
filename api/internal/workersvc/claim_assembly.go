@@ -897,7 +897,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// Ships with PlanApproved, deliberately adjacent: the two halves of one human
 		// verdict, and propagating the approval without the exclusions is what silently
 		// gives a user back a subagent they excluded. See ClaimPayload.AgentSelection.
-		AgentSelection: persistedSelection(run),
+		AgentSelection:       persistedSelection(run),
+		RequestedAgentSource: textPtr(run.AgentSourceRequested),
 		// PRD #122 M1: the frozen milestone list, decoded above. omitempty keeps a
 		// milestone-less run's claim byte-identical to today's.
 		Milestones:          milestones,

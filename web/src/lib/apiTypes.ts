@@ -643,6 +643,7 @@ export interface Repo {
   // skills from the repo's own .claude/skills/ (skills only, never hooks/
   // settings/commands). Default false.
   repo_skills_enabled: boolean;
+  agent_source_default?: AgentSource | null;
   // Repo-instructions opt-in (PRD #246): when true, the lead reads the repo's
   // root CLAUDE.md as nonce-fenced, advisory, lead-only context. It is the second
   // capability behind the "Trusted repo" affordance, independently revocable from
@@ -3582,6 +3583,8 @@ export interface Run {
   agent_source: AgentSource | null;
   /** PRD #37: the names excluded from the chosen source. null before a selection. */
   agent_exclusions: string[] | null;
+  agent_source_requested?: AgentSource | null;
+  agent_source_requested_basis?: AgentSourceRequestedBasis | null;
   /** PRD #37 M4-fix: the owner's OWN-source subagent roster (name + description) —
    *  exactly the allocation-resolved templates the worker runs for source="own",
    *  lead already stripped. The plan gate's "My agent templates" card is built from
@@ -5218,6 +5221,7 @@ export interface SteerInput {
 // own agent folder (.claude/agents/ or .codex/agents/), or the user's uzi templates. The lead orchestrator is
 // always uzi's builtin and is never selectable.
 export type AgentSource = "repo" | "own";
+export type AgentSourceRequestedBasis = "explicit" | "repo_default";
 
 // RepoAgent is one agent the worker detected in the cloned repo's .claude/agents/
 // or .codex/agents/

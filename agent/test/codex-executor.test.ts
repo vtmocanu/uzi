@@ -137,6 +137,7 @@ import { CommandDeadlineError } from "../src/codex/broker.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
 import { renderCodexRun } from "../src/codex/render.js";
 import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } from "../src/plan-missing.js";
+import { REQUESTED_SOURCE_TABLE, NO_ROSTER_NOTE, caseLabel } from "./requested-agent-source-table.js";
 
 /** Issue #1718: every implement prompt now ends with the roster line; makeCtx has no agents. */
 const NO_SUBAGENTS_BLOCK = "\n\nNo subagents are available; do the work yourself.";
@@ -19278,6 +19279,42 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
 
   it("absent selection at the gate resolves to the repo roster when one was detected", async () => {
     const { admitted, result } = await gated({ status: "absent" }, { repoAgents: [repoReviewer] }, ["repo-reviewer", "coder"]);
+    assert.deepEqual(admitted, { "repo-reviewer": true, coder: false });
+    assert.equal(result.agentSelection?.source, "repo");
+  });
+
+  it("PRD #3914: an absent approval at the gate follows the requested own source over a detected roster", async () => {
+    const { admitted, result } = await gated({ status: "absent" }, { repoAgents: [repoReviewer], requestedAgentSource: "own" }, ["coder", "repo-reviewer"]);
+    assert.deepEqual(admitted, { coder: true, "repo-reviewer": false });
+    assert.equal(result.agentSelection?.source, "own");
+  });
+
+  it("PRD #3914: a pre-approved run with no selection follows the requested source", async () => {
+    const own = await preApproved({ repoAgents: [repoReviewer], requestedAgentSource: "own" }, ["coder", "repo-reviewer"]);
+    assert.deepEqual(own.admitted, { coder: true, "repo-reviewer": false });
+    assert.deepEqual(own.result.agentSelection, { source: "own", agents: ["coder", "tester"] });
+    const repo = await preApproved({ repoAgents: [repoReviewer], requestedAgentSource: "repo" }, ["repo-reviewer", "coder"]);
+    assert.deepEqual(repo.admitted, { "repo-reviewer": true, coder: false });
+    assert.deepEqual(repo.result.agentSelection, { source: "repo", agents: ["repo-reviewer"] });
+  });
+
+  for (const c of REQUESTED_SOURCE_TABLE) {
+    it(`PRD #3914 shared call-site table, pre-approved: ${caseLabel(c)}`, async () => {
+      const { result, emitted } = await preApproved({ repoAgents: c.roster ? [repoReviewer] : [], requestedAgentSource: c.requested }, []);
+      assert.equal(result.agentSelection?.source, c.want);
+      assert.equal(statuses(emitted).includes(NO_ROSTER_NOTE), c.note);
+    });
+  }
+
+  it("PRD #3914: a requested repo source with no roster degrades to own with the no-roster note", async () => {
+    const { admitted, result, emitted } = await preApproved({ requestedAgentSource: "repo" }, ["coder"]);
+    assert.deepEqual(admitted, { coder: true });
+    assert.equal(result.agentSelection?.source, "own");
+    assert.ok(statuses(emitted).includes("this clone has no repo agent roster; using your own agent templates"));
+  });
+
+  it("PRD #3914: an explicit gate selection wins over the requested source", async () => {
+    const { admitted, result } = await gated(okSel("repo"), { repoAgents: [repoReviewer], requestedAgentSource: "own" }, ["repo-reviewer", "coder"]);
     assert.deepEqual(admitted, { "repo-reviewer": true, coder: false });
     assert.equal(result.agentSelection?.source, "repo");
   });

@@ -1223,6 +1223,34 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
   });
 });
 
+describe("AgentRosterSummary — requested agent source (PRD #3914)", () => {
+  it.each([
+    ["own", "own", "repo_default", "Requested: my templates (repo default) · Implemented with: my templates (as requested)"],
+    ["repo", "own", "explicit", "Requested: repo agents (this run) · Implemented with: my templates (changed at approval)"],
+    ["repo", "repo", "repo_default", "Requested: repo agents (repo default) · Implemented with: repo agents (as requested)"],
+  ] as const)("requested %s, implemented %s (%s)", (requested, implemented, basis, line) => {
+    render(
+      <AgentRosterSummary
+        run={run({
+          status: "running",
+          agent_source: implemented,
+          agent_source_requested: requested,
+          agent_source_requested_basis: basis,
+          own_agents: [agent("coder")],
+          repo_agents: [{ name: "site-plan-check", description: "d" }],
+        })}
+      />,
+    );
+    expect(screen.getByText(line)).toBeTruthy();
+  });
+
+  it("an unset run shows no requested line", () => {
+    render(<AgentRosterSummary run={run({ status: "running", agent_source: "repo", repo_agents: [agent("coder")] })} />);
+    expect(screen.queryByText(/Requested:/)).toBeNull();
+    expect(screen.queryByText(/Implemented with:/)).toBeNull();
+  });
+});
+
 describe("AgentRosterSummary — repo agent folder", () => {
   it("names .codex/agents/ for a repo-source run whose roster was read from it", () => {
     render(

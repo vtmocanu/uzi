@@ -53,6 +53,7 @@ import { RequestError } from "../src/client.js";
 import { REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
 import { leadRequestCaseAgents, makeClaim, nonexistentWorktreeFactory, nullLogger, recordingLogger } from "./helpers.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
+import { REQUESTED_SOURCE_TABLE, NO_ROSTER_NOTE, caseLabel } from "./requested-agent-source-table.js";
 
 // A worktree path that is UNIQUE PER PROCESS AND PER CALL, and that deliberately
 // never exists. Both halves matter. Non-existence is the point of these fixtures --
@@ -1051,6 +1052,41 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
       plan.agents!["fact-checker"]!.mcpServers?.includes("forge"),
       `fact-checker must keep its forge mcpServers on the plan turn: ${JSON.stringify(plan.agents!["fact-checker"]!.mcpServers)}`,
     );
+  });
+
+  it("PRD #3914: an absent approval follows the run's requested source", async () => {
+    const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const own = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "own" }, absent);
+    assert.deepStrictEqual(Object.keys(own.turns[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.strictEqual(own.result.agentSelection!.source, "own");
+    const repo = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "repo" }, absent);
+    assert.deepStrictEqual(Object.keys(repo.turns[1]!.options.agents ?? {}).sort(), ["auditor", "coder"]);
+    assert.strictEqual(repo.result.agentSelection!.source, "repo");
+    const unset = await runWith({ repoAgents: [repoCoder, repoAuditor] }, absent);
+    assert.deepStrictEqual(Object.keys(unset.turns[1]!.options.agents ?? {}).sort(), ["auditor", "coder"]);
+  });
+
+  for (const c of REQUESTED_SOURCE_TABLE) {
+    it(`PRD #3914 shared call-site table at the gate: ${caseLabel(c)}`, async () => {
+      const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+      const { probe, result } = await runWith({ repoAgents: c.roster ? [repoCoder, repoAuditor] : [], requestedAgentSource: c.requested }, absent);
+      assert.strictEqual(result.agentSelection!.source, c.want);
+      assert.strictEqual(probe.emits.some((m) => String(m.payload.text ?? "") === NO_ROSTER_NOTE), c.note);
+    });
+  }
+
+  it("PRD #3914: a requested repo source with no roster degrades to own with the no-roster note", async () => {
+    const absent: PlanVerdict = { kind: "approve", selection: { status: "absent" } };
+    const { turns, probe, result } = await runWith({ requestedAgentSource: "repo" }, absent);
+    assert.deepStrictEqual(Object.keys(turns[1]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
+    assert.strictEqual(result.agentSelection!.source, "own");
+    assert.ok(probe.emits.some((m) => String(m.payload.text ?? "").includes("this clone has no repo agent roster")));
+  });
+
+  it("PRD #3914: an explicit gate selection wins over the requested source", async () => {
+    const { turns, result } = await runWith({ repoAgents: [repoCoder, repoAuditor], requestedAgentSource: "own" }, approveWith("repo"));
+    assert.deepStrictEqual(Object.keys(turns[1]!.options.agents ?? {}).sort(), ["auditor", "coder"]);
+    assert.strictEqual(result.agentSelection!.source, "repo");
   });
 
   it("a malformed selection resolves to own, never the repo source", async () => {
@@ -4924,6 +4960,19 @@ describe("SdkExecutor — pre-approved resume skips the planning turn and the ga
     });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder"]);
+  });
+
+  it("PRD #3914: a pre-approved resume with no persisted selection follows the requested source", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({
+      ...preApproved,
+      agents: [lead, coder, reviewer],
+      repoAgents: [repoCoder, repoAuditor],
+      approvedSelection: undefined,
+      requestedAgentSource: "own",
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(Object.keys(turns[0]!.options.agents ?? {}).sort(), ["coder", "reviewer"]);
   });
 
   it("falls back to the absent-default when the claim carried no selection", async () => {

@@ -15392,6 +15392,7 @@ export class RunRunner {
       // selection whether or not this particular resume skips the gate, and the
       // executor only reads it on the path that has no verdict to supply one.
       approvedSelection: claim.agent_selection,
+      requestedAgentSource: claim.requested_agent_source ?? null,
       signal: cancel.signal,
       terminalLifecycleSignal: steering.terminalLifecycleSignal(),
       lifecycleSignal: () => steering.lifecycleSignal(),
@@ -15874,6 +15875,7 @@ export class RunRunner {
           } : undefined,
           gatedPresentation ? { ...gatedPresentation, milestones: presentedMilestones ?? [],
             claimGeneration: flight.claimGeneration } : undefined,
+          claim.requested_agent_source,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
@@ -26864,6 +26866,7 @@ export class RunRunner {
     semanticPark?: SemanticPark,
     onSemanticPresented?: (ack: StateAck) => Promise<void>,
     presentedCanonical?: Extract<PlanVerdict, { approval: "cross_check" }>["canonical"],
+    requestedSource?: AgentSource | null,
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -26902,6 +26905,7 @@ export class RunRunner {
       const selection = resolveAgentSelection(
         { status: "absent" },
         repoAgents.length > 0,
+        requestedSource,
       ).selection;
       // Make this report self-contained (F1): carry the roster alongside the selection
       // so both validate + persist atomically, even if the fire-and-forget running

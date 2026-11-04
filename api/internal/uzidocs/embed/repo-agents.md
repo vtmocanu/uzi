@@ -39,6 +39,47 @@ roster is detected the message shows two approve buttons — **Approve · repo a
 and **Approve · my templates** — so you pick the source without leaving Slack.
 Per-agent exclusions are a web-only refinement; use "Open in uzi" for those.
 
+## Set a default for your runs on a repo
+
+Each repo you connect has a **Default agents for my runs on this repo** setting,
+in the repo's **Trusted repo** settings on the Repos page:
+
+- **uzi templates**: your runs on this repo use your own templates.
+- **repo agents**: your runs on this repo use the repo's roster when one is
+  detected, and fall back to your templates (with the usual "no repo agent
+  roster" note) when it is not.
+- **not set (today's behaviour)**: the defaults described above apply.
+
+The setting is yours alone. It changes only the runs you create on your own
+connection to that repo; a teammate connected to the same project keeps their
+own setting. An admin can clear it or set **uzi templates** on any repo, but only
+the repo's owner can choose **repo agents**.
+
+uzi freezes the setting onto each issue run when the run is created, whether you
+start it from the board, the CLI, chat, a schedule or autopilot. Changing the
+setting later does not change runs already queued or running. Other run kinds
+(CI fix, MR rework, self-improvement, prompt, task and job runs) are not affected.
+
+A frozen default decides the implementation agents when nothing else does:
+
+- an approval that carries no agent choice (for example `uzi run approve` with
+  no `--agent-source`, or an external dispatcher using the API) implements with
+  the default, and the run records it;
+- an autopilot run implements with the default;
+- an explicit choice at the plan gate (web, Slack, or `--agent-source`) still
+  wins, and the run page then shows it as "changed at approval".
+
+Planning is not yet affected: the plan turn still uses your own templates. A
+run that carries a default is claimed only by a worker new enough to honour it;
+while every online worker is older, the run stays queued and its health reason
+names the missing worker version (`agent_source_request_v1`).
+
+The run page's **Agents used** card shows the request and the outcome, for
+example "Requested: my templates (repo default) · Implemented with: my
+templates (as requested)". `uzi run get` shows the same facts as the
+`AGENTS_REQUESTED` and `IMPLEMENTED_WITH` rows, and `uzi repo list` shows each
+repo's setting (`agent_source_default` in `--json`).
+
 ## Repo agents on Codex runs
 
 On a Codex run the agent selection applies the same way: implementation

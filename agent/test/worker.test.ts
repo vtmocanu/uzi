@@ -1046,6 +1046,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "cross_check_owner_steering_v1",
     "completion_semantic_publication_v1",
     "ci_config_guard_v1",
+    "agent_source_request_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];
   // A client whose register() captures the protocol-capabilities argument (5th param) so a
