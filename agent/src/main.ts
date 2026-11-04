@@ -34,6 +34,7 @@ import { stubJobQueryFn } from "./job-runner-stub.js";
 import { Worker } from "./worker.js";
 import { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
+import { createDindVolumePrune } from "./dind-volume-prune.js";
 import { RetainedSourceServer } from "./ops/retained-source-server.js";
 import { DindMaintenanceController } from "./dind-maintenance.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
@@ -891,10 +892,14 @@ async function main(): Promise<void> {
   // UZI_DIND_PRUNE_ENABLED=true. Server maintenance shares its gate even when cache prune is off. Its idle
   // probe reads the worker's own active sets, hence the late-bound `worker` reference: the
   // probe is called from the controller loops, which the worker itself starts.
+  // issue #3891: the pressure-only anonymous-volume leg rides on the same enablement
+  // predicate and runs inside the controller's loop; it only reads the gate and needs no
+  // idle probe or custody (it runs on busy and custody-held workers by design).
   const dindPrune = createDindPrune(config, {
     gate: dindGate,
     isIdle: () => worker?.isIdle() ?? false,
     log,
+    volumeLeg: createDindVolumePrune(config, { gate: dindGate, log }),
   });
   if (dindPrune) log.info("dind prune enabled", { docker_host_wired: true });
   const dindMaintenance = config.dockerWiring.dockerHost !== undefined
