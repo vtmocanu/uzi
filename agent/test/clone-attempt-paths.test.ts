@@ -14,7 +14,7 @@ import { execFileSync } from "node:child_process";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
 import { CapturePathMismatchError, GitCache, type AttemptSeedOptions, type RecoveryJournalEntry } from "../src/git.js";
 import { LimitReachedError } from "../src/limit.js";
-import { RunRunner, failOriginForReason, type ExecutorFactory } from "../src/runner.js";
+import { RunRunner, StaleClaimError, failOriginForReason, type ExecutorFactory } from "../src/runner.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { RUN_REGISTRATION_EVIDENCE_FEATURE } from "../src/protocol.js";
 import { CodexSessionStore } from "../src/codex/session-state.js";
@@ -2012,44 +2012,84 @@ describe("issue #3404 M2 U3: a retained predecessor is admitted before its captu
     assert.ok((bodies[0]!.registration_evidence?.registration_epoch ?? -1) >= preClaimEpoch);
   });
 
-  it("issue #3859: a live flight whose claim the server released stops nonterminally with its source retained and leaves the registry", async () => {
+  it("issue #3859: a live flight whose claim the server released stops nonterminally with its own source retained and leaves the registry", async () => {
     const iid = 2909;
     const runId = randomUUID();
     const pred = await seedPredecessor(iid, runId, { attempt: true });
-    const before = treeHash(pred.clonePath);
     const { current } = await runtimes();
-    // An earlier flight's source use of the path is unended: its tails are not joined.
+    // The predecessor's source use ended, so the claim is admitted and the flight binds ITS OWN source.
     const earlier = new Set<string>();
     await current.recordAdmissions(earlier, () => current.bindSource(pred.clonePath));
     current.retireSink(earlier);
-    const epoch = (await slotOf(current, pred.clonePath))?.epoch;
+    assert.equal((await current.endSourceUse([pred.clonePath], { sink: earlier })).ended.length, 1);
     const registry = await evidenceWorld();
-    const journal = readJournal(iid);
-    const ledger = readLedger(iid);
-    const accounting = configGetAll(`uzi-recoveryowner.${runId}.record`);
-    const { factory, started } = transientFactory();
-    const { calls, quiesceRun } = recorded(fastQuiesce);
-    const { runner } = restartedWorker(factory, { quiesceRun, authority: current, activeRuns: registry });
-    api.setOwnershipStatus(runId, "running", 2);
-    // The server released this claim: its next state report is answered stale_claim.
-    api.failStateWhen(runId, (b) => b.status === "running", { httpStatus: 409, disposition: "stale_claim" });
+    // The harness has no awaited mid-flight report an executor can trigger (the roster and session-id
+    // reports are fire-and-forget), so the executor throws the StaleClaimError that the reportState
+    // closure throws on a stale_claim ack. From then on every process proof is unverified, so this
+    // flight's source-capable tails are not positively joined.
+    let stale = false;
+    let started = 0;
+    let before: { path: string; journal: ReturnType<typeof readJournal>; ledger: Map<string, LedgerEntry>; accounting: string[] } | undefined;
+    const factory: ExecutorFactory = (id) => ({
+      homeDir: path.join(homeDir, id),
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          started++;
+          before = { path: ctx.worktreePath, journal: readJournal(iid), ledger: readLedger(iid), accounting: configGetAll(`uzi-recoveryowner.${runId}.record`) };
+          stale = true;
+          throw new StaleClaimError();
+        },
+      },
+    });
+    const quiesceRun = async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => stale
+      ? { process: { state: "unverified", processes: [], killed: [], detail: "scripted unverified" }, docker: { state: "docker_unconfirmed", removed: [], detail: "" } }
+      : fastQuiesce(req);
+    const { logger, lines } = recordingLogger();
+    const { runner } = restartedWorker(factory, { quiesceRun, authority: current, activeRuns: registry }, logger);
+    api.setOwnershipStatus(runId, "running", 6);
     const preClaimEpoch = registry.build().snapshot_epoch;
-    await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 2 }));
-    assertWitness(registry, runId, 2, preClaimEpoch);
-    // (1) the retained source stays: files intact, slot still the earlier flight's active epoch.
-    assert.equal(treeHash(pred.clonePath), before);
-    assert.equal(fs.readFileSync(path.join(pred.clonePath, "ONLY_COPY.txt"), "utf8"), "must survive recovery\n");
-    const slot = await slotOf(current, pred.clonePath);
-    assert.equal(slot?.state, "active", "the source slot is not ended while its tails are unjoined");
-    assert.equal(slot?.epoch, epoch);
-    // (2) nonterminal stop: no terminal or park report, no model work, no capture proof.
+    await runner.execute(gitlabClaim(iid, { run_id: runId, claim_generation: 6 }));
+    assert.ok(before, "the flight bound its own source and reached the executor");
+    assert.notEqual(path.resolve(before.path), path.resolve(pred.clonePath), "the flight's own source is not the predecessor's");
+    // (1) source retained: this flight's clone stays on disk and its slot is not ended while the tails are unjoined.
+    assert.equal(fs.existsSync(before.path), true);
+    const slot = await slotOf(current, before.path);
+    assert.equal(slot?.state, "active", "the flight's own source slot is not ended while its tails are unjoined");
+    assert.ok(lines.some((l) => (l as { msg?: string }).msg?.includes("not positively joined")), "the unjoined-tails early return ran");
+    assert.ok(lines.some((l) => (l as { msg?: string }).msg === "run claim superseded server-side (stale_claim); stopping this flight"), "the stale_claim stop ran");
+    // (2) nonterminal stop: no terminal or park report, no further model work.
     assert.deepEqual(nonTerminalReports(runId), []);
-    assert.equal(started(), 0);
-    assert.deepEqual(calls, []);
-    // (4) custody unchanged.
-    assert.deepEqual(readJournal(iid), journal);
-    assert.deepEqual(readLedger(iid), ledger);
-    assert.deepEqual(configGetAll(`uzi-recoveryowner.${runId}.record`), accounting);
+    assert.equal(started, 1);
+    // (3) registry exit: the witness was sent and the next built snapshot omits the flight.
+    assertWitness(registry, runId, 6, preClaimEpoch, true);
+    // (4) custody unchanged by the stop.
+    assert.deepEqual(readJournal(iid), before.journal);
+    assert.deepEqual(readLedger(iid), before.ledger);
+    assert.deepEqual(configGetAll(`uzi-recoveryowner.${runId}.record`), before.accounting);
+  });
+
+  it("issue #3859: the registration epoch is captured once at registration, not re-read from a snapshot built before the first running report", async (t) => {
+    const iid = 2910;
+    const runId = randomUUID();
+    const registry = await evidenceWorld();
+    const add = registry.add.bind(registry);
+    let epochAtAdd: number | undefined;
+    let builtBetween: number | undefined;
+    t.mock.method(registry, "add", (...args: Parameters<ActiveRunRegistry["add"]>) => {
+      const token = add(...args);
+      // The flight captures the epoch synchronously after add() returns; a snapshot built right after
+      // that (before the first running report is sent) must not move the witness.
+      epochAtAdd = registry.latestBuiltEpoch();
+      queueMicrotask(() => { builtBetween = registry.build().snapshot_epoch; });
+      return token;
+    });
+    const { factory } = transientFactory();
+    api.setOwnershipStatus(runId, "running", 3);
+    await wired(factory, { activeRuns: registry }).execute(gitlabClaim(iid, { run_id: runId, claim_generation: 3 }));
+    assert.ok(epochAtAdd !== undefined && builtBetween !== undefined, "a snapshot was built between registration and the first report");
+    assert.ok(epochAtAdd < builtBetween, "the in-between snapshot has a later epoch");
+    const first = runningWire(runId, 3)[0];
+    assert.equal(first?.registration_evidence?.registration_epoch, epochAtAdd, "the witness names the epoch captured at registration");
   });
 
   it("a predecessor whose previous use ended is admitted with a fresh epoch before the first proof", async () => {

@@ -2777,14 +2777,15 @@ export class WorkerClient {
     try {
       if (outbound.registration_evidence !== undefined) {
         // Issue #3859. Ordering with the older claim_generation fallback: the evidence strip comes
-        // FIRST (it is the newer field) and is TERMINAL for the fallback chain, the same shape as
-        // the provider_progress_turns arm above. Attempt 1 carries evidence and claim_generation;
-        // on the exact strict-decode 400 attempt 2 is the identical body with ONLY
-        // registration_evidence removed (claim_generation and every other field intact), and a
-        // refusal of attempt 2 propagates: no third body, no generation strip. The budget is the
-        // generation fallback's two sends, i.e. the evidence resend is the only extra one, and
-        // an api that advertised this feature decodes claim_generation. A transient failure is
-        // retried inside reportStateVariant with the SAME variant, never with evidence stripped.
+        // FIRST (it is the newer field). Attempt 1 carries evidence and claim_generation; on the
+        // exact strict-decode 400 attempt 2 is the identical body with ONLY registration_evidence
+        // removed (claim_generation and every other field intact). If attempt 2 itself gets the
+        // strict-decode 400 (a stale advertised feature set against an api that decodes neither
+        // field), the evidence-free body continues into the pre-existing claim_generation
+        // fallback exactly as before this feature: one more send with claim_generation stripped.
+        // Evidence is never re-attached and there is no second evidence-stripping resend, so the
+        // worst case is three sends. A transient failure is retried inside reportStateVariant
+        // with the SAME variant, never with evidence stripped.
         try {
           ack = await sendWith(outbound)(true);
         } catch (err) {
@@ -2795,7 +2796,13 @@ export class WorkerClient {
           delete stripped.registration_evidence;
           this.registrationEvidenceDropped = true;
           this.log.warn("registration evidence rejected by an api that cannot decode it; re-sent without it and stopped sending it for this registration", { run_id: runId });
-          ack = await sendWith(stripped)(true);
+          try {
+            ack = await sendWith(stripped)(true);
+          } catch (err2) {
+            if (!isStrictDecodeError(err2)) throw err2;
+            if (!this.hasCredentialSwitchCapability) this.clearFeatures();
+            ack = await sendWith(stripped)(false);
+          }
         }
       } else if (outbound.capability_inference_evidence !== undefined && this.hasFeature(CAPABILITY_INFERENCE_EVIDENCE_FEATURE)) {
         // Advisory rollback is resolved before the legacy generation fallback.

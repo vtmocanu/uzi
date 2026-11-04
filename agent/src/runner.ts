@@ -13659,10 +13659,11 @@ export class RunRunner {
     };
     const reseed = this.canonicalReseedOptions(flight);
     // A SourceUseHeldRefusal (an earlier flight's unended source use of the canonical path) is nonterminal:
-    // custody retained, no terminal report, no model work. The bound is server-side: the `running` report that
-    // preceded this refusal carried registration evidence, so the next snapshot that omits the run stamps a
-    // witnessed departure, which is charged against RUN_MAX_REQUEUES (the claimed-never-started charge) and parks
-    // at worker_requeue_exhausted (ADR-1751 D2a as amended).
+    // custody retained, no terminal report, no model work. The bound is server-side and conditional: only when the
+    // api supports registration evidence (run_registration_evidence_v1), the feature was negotiated and not dropped,
+    // did the preceding `running` report carry it, so the next snapshot that omits the run stamps a witnessed
+    // departure charged against RUN_MAX_REQUEUES (the claimed-never-started charge), parking at
+    // worker_requeue_exhausted. Otherwise the existing per-run custody bound (ADR-1751 D2a) is what stops the loop.
     const stopOnHeldSource = (err: SourceUseHeldRefusal): never => {
       this.retainedLifecycleGuard(flight);
       flight.runLog.warn("clone path held by an earlier flight's unended source use; stopping claim for retry", {
@@ -26087,8 +26088,10 @@ export class RunRunner {
             if (error instanceof SourceUseHeldRefusal) {
               // An earlier flight of this process still holds the path with no confirmed end (held_unended). That is
               // not a preservation failure: stop nonterminal with custody retained and no report. The server's
-              // claimed-never-started charge bounds it: the witnessed departure of this retained continuation is
-              // charged against RUN_MAX_REQUEUES and parks at worker_requeue_exhausted (ADR-1751 D2a as amended).
+              // claimed-never-started charge bounds it only when the api supports registration evidence
+              // (run_registration_evidence_v1) and it was negotiated and not dropped: then the witnessed departure
+              // of this retained continuation is charged against RUN_MAX_REQUEUES and parks at
+              // worker_requeue_exhausted. Otherwise the existing per-run custody bound (ADR-1751 D2a) stops it.
               flight.runLog.warn("retained predecessor held by an earlier flight's unended source use; stopping claim for retry", {
                 error: errMessage(error), claim_generation: flight.claimGeneration });
               throw new RetainedRecoveryStop({ cause: error });

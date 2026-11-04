@@ -17,7 +17,7 @@ const ok = JSON.stringify({ run: { id: "r1", status: "running" } });
 
 type Reply = "strict" | "ok" | { status: number; body: string } | "lost";
 
-async function make(replies: Reply[], opts: { features?: string[]; nonce?: string | null } = {}) {
+async function make(replies: Reply[], opts: { features?: string[]; nonce?: string | null; onReply?: () => void } = {}) {
   const wires: string[] = [];
   let registrations = 0;
   const transport: typeof fetch = async (url, init) => {
@@ -32,6 +32,7 @@ async function make(replies: Reply[], opts: { features?: string[]; nonce?: strin
     wires.push(String(init?.body));
     const reply = replies.shift();
     assert.ok(reply, "unexpected additional request");
+    opts.onReply?.();
     if (reply === "lost") throw new TypeError("lost ACK");
     if (reply === "ok") return new Response(ok);
     if (reply === "strict") return new Response('{"error":"invalid request body"}', { status: 400 });
@@ -120,12 +121,20 @@ describe("registration evidence on the running report", () => {
       assert.deepEqual(parsed(wires)[3], fixture);
     });
 
-    it("a second 400 on the resend is not retried a third time", async () => {
+    it("an api rejecting both evidence and claim_generation still applies the report via the pre-existing generation fallback", async () => {
       const { c, wires } = await make(["strict", "strict", "ok"]);
+      const ack = await c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH });
+      assert.equal(ack.applied, true);
+      const bodies = parsed(wires);
+      assert.deepEqual(bodies, [fixture, { status: "running", claim_generation: GEN }, { status: "running" }]);
+    });
+
+    it("a third strict 400 propagates: no further evidence-stripping resend and evidence is never re-attached", async () => {
+      const { c, wires } = await make(["strict", "strict", "strict", "ok"]);
       await assert.rejects(c.reportState("r1", { status: "running", claim_generation: GEN }, undefined, { registrationEpoch: EPOCH }));
-      assert.equal(wires.length, 2);
+      assert.equal(wires.length, 3);
       assert.equal("registration_evidence" in parsed(wires)[1]!, false);
-      assert.equal(parsed(wires)[1]!.claim_generation, GEN, "the generation strip never runs after the evidence strip");
+      assert.equal("registration_evidence" in parsed(wires)[2]!, false);
     });
 
     for (const [name, reply] of [
@@ -160,11 +169,11 @@ describe("registration evidence on the running report", () => {
 
     it("an abort after the strict refusal sends no resend", async () => {
       const abort = new AbortController();
-      const { c, wires } = await make([{ status: 400, body: '{"error":"invalid request body"}' }]);
-      const sent = c.reportState("r1", { status: "running", claim_generation: GEN }, abort.signal, { registrationEpoch: EPOCH });
-      abort.abort(new Error("cancelled"));
-      await assert.rejects(sent);
-      assert.ok(wires.length <= 1);
+      // Abort inside the fake transport as the first 400 is delivered, so the refusal was
+      // certainly sent and the abort lands before any resend.
+      const { c, wires } = await make(["strict", "ok", "ok"], { onReply: () => abort.abort(new Error("cancelled")) });
+      await assert.rejects(c.reportState("r1", { status: "running", claim_generation: GEN }, abort.signal, { registrationEpoch: EPOCH }));
+      assert.equal(wires.length, 1);
     });
   });
 });
