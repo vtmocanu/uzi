@@ -95,7 +95,11 @@ is unchanged**, not universally terminal-gated.
 
 Within the strict gate, an optional server API >=1.42 check permits exactly
 `docker volume prune -f` (unreferenced anonymous volumes only). Skip/failure
-or insufficient reclaim does not block recycling. UID-bound foreground
+or insufficient reclaim does not block recycling. (AI-synced 2026-11-04, #3891:
+this strict gate stays mandatory for maintenance and PVC recycle; the only
+carve-out is a separate pressure-only anonymous-volume leg that runs the same
+frozen prune on a busy or custody-held non-ephemeral worker without closing
+claims; see ADR-1759 D8, "Exception — #3891".) UID-bound foreground
 Deployment deletion must be followed by observation that it and old pods,
 including Terminating pods, are gone before the UID-bound DinD PVC delete.
 Replacement binding, pod readiness, fresh registration heartbeat and
@@ -108,7 +112,13 @@ replacement no longer loses the run workdir (amended by ADR-3153: `/data/runner`
 Secret survive. Deliverables use git/checkpoints/capture, with no
 preservation inventory or migration. Set
 `UZI_WORKER_DISK_RECYCLE_ENABLED=false` before stop to opt out; a started
-safe operation finishes even if disabled. With simultaneous eligible Nix and DinD pressure,
+safe operation finishes even if disabled. (AI-synced 2026-11-04, #3891: the
+same default-on flag also enables the pressure-only anonymous-volume prune leg
+on already-enabled persistent Docker workers once the fixed worker deploys.
+The opt-out `workers.diskRecycleEnabled: false` is not leg-only: it also
+disables PVC recycle and the cache prune, and flipping it rolls non-ephemeral
+Docker worker pods. The leg touches no PVC, so the ADR-3153 source-PVC and
+writer-exclusion boundaries are unchanged.) With simultaneous eligible Nix and DinD pressure,
 Nix-only recycle runs first with pending DinD intent, then DinD on a later tick
 before another legacy recycle. Data-only pressure yields to DinD maintenance;
 requested data+DinD maintenance advances instead of waiting for a forbidden data

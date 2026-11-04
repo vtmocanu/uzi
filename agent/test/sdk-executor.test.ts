@@ -28,6 +28,7 @@ import type { JsDepsResult } from "../src/js-deps.js";
 import { mrCompletionBlock } from "../src/runner.js";
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
+import { guardedCommandEnv } from "../src/claude-command/env.js";
 import { detectRepoAgents } from "../src/repoagents.js";
 import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import {
@@ -332,6 +333,30 @@ afterEach(() => {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
+});
+
+describe("issue #3870: managed Go work dir reaches the lead CLI env", () => {
+  const launchEnv = async (overrides: Partial<RunContext>) => {
+    const { queryFn, turns } = fakeTurns([[assistantText("model output"), signalDone(), resultSuccess()]]);
+    const { ctx } = makeCtx({ seeded: true, planApproved: true, approvedPlan: "# Approved", config: { max_iterations: 1 }, ...overrides });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx).catch(() => undefined);
+    assert.ok(turns.length > 0, "precondition: the SDK was queried");
+    return turns[0]!.options;
+  };
+
+  it("sets GOTMPDIR from ctx.managedGoWorkDir, keeps it through guardedCommandEnv, and gives subagents no env override", async () => {
+    const options = await launchEnv({ managedGoWorkDir: "/home/run/.uzi-go-work/g7" });
+    assert.equal(options.env?.GOTMPDIR, "/home/run/.uzi-go-work/g7");
+    assert.equal(guardedCommandEnv(options.env!).GOTMPDIR, "/home/run/.uzi-go-work/g7");
+    for (const [name, def] of Object.entries(options.agents ?? {})) {
+      assert.equal(Object.hasOwn(def as object, "env"), false, `subagent ${name} must inherit, not override, the env`);
+    }
+  });
+
+  it("launches without GOTMPDIR when the ctx carries no managed dir", async () => {
+    const options = await launchEnv({});
+    assert.equal(Object.hasOwn(options.env ?? {}, "GOTMPDIR"), false);
+  });
 });
 
 describe("settled model recovery notification", () => {
@@ -4727,6 +4752,26 @@ describe("SdkExecutor JS dependency provisioning (PRD #121 M2)", () => {
     for (const secret of [FAKE_JOIN_TOKEN, FAKE_PAT, OAUTH]) {
       assert.ok(!blob.includes(secret), "a worker credential leaked into the install env");
     }
+  });
+
+  it("issue #3870: the install env carries GOTMPDIR from ctx.managedGoWorkDir, and none without it", async () => {
+    const goWork = path.join(homeDir, ".uzi-go-work", "g1");
+    const seen: Array<NodeJS.ProcessEnv> = [];
+    for (const managedGoWorkDir of [goWork, undefined]) {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const installDeps: SdkExecutorOptions["installDeps"] = async (_root, env) => {
+        seen.push(env);
+        return { results: [], truncated: false };
+      };
+      const probe = makeCtx(managedGoWorkDir ? { managedGoWorkDir } : {});
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, installDeps }).run(probe.ctx);
+    }
+    assert.equal(seen.length, 2);
+    assert.strictEqual(seen[0]!.GOTMPDIR, goWork);
+    assert.strictEqual(seen[1]!.GOTMPDIR, undefined);
   });
 
   it("says so plainly when the repo has no JS dependencies to install", async () => {

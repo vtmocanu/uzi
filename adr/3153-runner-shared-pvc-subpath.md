@@ -162,6 +162,7 @@ The issue made "rootless isolation is preserved" a merge condition. The maintain
 - Kubelet eviction, drain and manual pod delete cannot be guarded against the layout migration (D7).
 - Rootless dind containers cannot write into a run's checkout through `docker run -v` bind sources by default; that predates #3153 in both modes. Single-uid additionally loses rootless-container writes at the `/data/runner` root and `TMPDIR` root, accepted as a documented regression by owner decision 2026-10-21 (Permissions).
 - Retained clones persist; automatic retention deletion stays off (#1858).
+- **Go scratch (#3870).** A Claude run's run HOME and Go's internal `$WORK`, now under the run HOME at `.uzi-go-work/g<N>`, are not visible to dind. A container that needs a build artifact must have it staged in the worktree or the shared `TMPDIR`. The new process-ended-park removal of that scratch is not new Docker-data or `runner-shared` reclaim authority; general `TMPDIR` and `DOCKER_HOST` are unchanged. See the [ADR-1809 amendment](1809-per-run-cache-bounds.md#amendment-3870-park-only-go-scratch).
 
 ## Not verified (live acceptance, maintainer-owned)
 

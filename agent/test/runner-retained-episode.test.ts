@@ -1304,6 +1304,7 @@ it("retained dirty work resumes locally on a fresh unwired path and resets only 
     assert.notEqual(ctx.worktreePath, clone.path);
     assert.match(ctx.worktreePath, /\.attempt-.*-g2-/);
     assert.equal(ctx.sessionId, undefined);
+    assert.ok(process.platform !== "linux" || ctx.managedGoWorkDir?.endsWith("/.uzi-go-work/g2"), `leaf: ${ctx.managedGoWorkDir}`);
     assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "only local dirty work\n");
     const journal = readJournal(bare, clone.branch);
     assert.equal(journal.recovery.attempts, 1);

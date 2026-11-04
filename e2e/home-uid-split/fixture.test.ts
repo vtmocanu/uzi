@@ -226,6 +226,64 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     await rmtree.rmHomeTree(home);
   });
 
+  // Issue #3870 M1: the managed Go work leaf. The worker prepares `.uzi-go-work/g<N>` (2770, group
+  // runner); `go build` as runner then fills it with 0700 `go-build*` trees the worker cannot even list,
+  // and the park-only removal of that one leaf must still succeed while the parent, a newer generation
+  // and the HOME's other files stay.
+  it("a prepared Go work leaf, filled by runner with 0700 trees, is removed alone by rmHomeSubtree (#3870)", async () => {
+    const gowork = await load<typeof import("../../agent/src/go-work.js")>("go-work.ts");
+    const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000003870");
+    await fs.mkdir(home);
+    await fs.chmod(home, 0o2775);
+    asRunner(`set -e; umask 002; echo '{}' > "$1/.claude.json"`, home);
+
+    const g3 = await gowork.prepareManagedGoWork(home, 3, silentLog as never);
+    const g4 = await gowork.prepareManagedGoWork(home, 4, silentLog as never);
+    assert.deepEqual(g3, { dir: path.join(home, ".uzi-go-work", "g3") });
+    assert.ok("dir" in g4);
+    const parentStat = await fs.lstat(path.join(home, ".uzi-go-work"));
+    assert.equal(parentStat.mode & 0o7777, 0o2770, "the parent is 2770 under the split");
+    assert.equal(parentStat.gid, runnerUid.RUNNER_UID, "the parent is group runner");
+
+    asRunner(
+      `set -e
+       umask 077
+       mkdir -p "$1/.uzi-go-work/g3/go-build123/b001"
+       echo o > "$1/.uzi-go-work/g3/go-build123/b001/a.o"
+       echo k > "$1/.uzi-go-work/g4/keep"
+       chmod 0700 "$1/.uzi-go-work/g3/go-build123/b001" "$1/.uzi-go-work/g3/go-build123"`,
+      home,
+    );
+
+    assert.equal(await rmtree.rmHomeSubtree(home, ".uzi-go-work/g3"), "removed");
+    assert.equal(await rmtree.rmHomeSubtree(home, ".uzi-go-work/g3"), "absent");
+    assert.equal(await exists(path.join(home, ".uzi-go-work", "g3")), false, "the leaf is gone");
+    assert.equal(await exists(path.join(home, ".uzi-go-work")), true, "the parent stays");
+    asRunner(`set -e; test -f "$1/.uzi-go-work/g4/keep"; test -f "$1/.claude.json"`, home);
+    await rmtree.rmHomeTree(home);
+  });
+
+  // Issue #3870: a runner-owned `.uzi-go-work` is a parent the worker must refuse, never repair.
+  it("a runner-owned Go work parent is refused by prepareManagedGoWork and left unrepaired (#3870)", async () => {
+    const gowork = await load<typeof import("../../agent/src/go-work.js")>("go-work.ts");
+    const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000003871");
+    await fs.mkdir(home);
+    await fs.chmod(home, 0o2775);
+    asRunner(`set -e; mkdir "$1/.uzi-go-work"; chmod 2770 "$1/.uzi-go-work"`, home);
+    const parent = path.join(home, ".uzi-go-work");
+    const before = await fs.lstat(parent);
+
+    const r = await gowork.prepareManagedGoWork(home, 5, silentLog as never);
+    assert.deepEqual(r, { skipped: true, reason: "parent_refused" });
+
+    const after = await fs.lstat(parent);
+    assert.equal(after.uid, before.uid, "no chown");
+    assert.equal(after.gid, before.gid, "no chown");
+    assert.equal(after.mode & 0o7777, before.mode & 0o7777, "no chmod repair");
+    asRunner(`set -e; test -z "$(ls -A "$1/.uzi-go-work")"`, home);
+    await rmtree.rmHomeTree(home);
+  });
+
   it("the startup reclaim removes only API-confirmed-terminal HOMEs", async () => {
     const terminal = await makeLeakedHome("00000000-0000-4000-8000-00000000000a", 0o2770);
     const running = await makeLeakedHome("00000000-0000-4000-8000-00000000000b", 0o2770);

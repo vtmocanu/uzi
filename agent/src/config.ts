@@ -291,7 +291,10 @@ export interface Config {
    * prune when its DinD data root is under pressure (UZI_DIND_PRUNE_ENABLED, rendered
    * by the controller as "true"/"false"). ONLY the exact string "true" enables it;
    * anything else, unset included, is off. The prune also needs a wired dockerHost
-   * (see dind-prune.ts `createDindPrune`).
+   * (see dind-prune.ts `createDindPrune`). The same flag and predicate also enable issue
+   * #3891's pressure-only anonymous-volume leg (dind-volume-prune.ts
+   * `createDindVolumePrune`), which unlike the cache prune also runs on a busy or
+   * custody-held worker.
    */
   dindPruneEnabled: boolean;
   /**

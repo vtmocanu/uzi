@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
 import { rmTreePinned } from "./rmtree.js";
+import { isGoWorkClean, removeGoWorkLeaves, type GoWorkRemoval } from "./go-work.js";
 import { dropRunCaches, isNoop, type DropRunCachesOptions, type RunCacheDropResult } from "./run-caches.js";
 import { isLiveModelPassHome } from "./model-pass.js";
 import { HELPER_SLACK_MS, scanRunProcesses } from "./run-procs.js";
@@ -142,6 +143,12 @@ export interface DiskReclaimDeps {
    * the runner's quiesceRun fold (runner.ts), which is skipped off Linux too.
    */
   processesClear?: (home: string, budgetMs: number) => Promise<boolean>;
+  /**
+   * issue #3870: remove a parked run's managed Go work leaves, called only after `processesClear`
+   * proved no process is attributed to the HOME. Default: `removeGoWorkLeaves` selecting all leaves
+   * (never the `.uzi-go-work` parent), bounded by `deadlineMs`. Never throws.
+   */
+  dropGoScratch?: (home: string, log: Logger, opts: { deadlineMs: number }) => Promise<GoWorkRemoval>;
   now?: () => number;
   modelPassMinAgeMs?: number;
   maxEntries?: number;
@@ -188,6 +195,10 @@ export interface DiskReclaimSummary {
    * unproven, or because the pass deadline left no time for the check.
    */
   cachesKeptLiveProcesses: number;
+  /** A parked run whose managed Go work leaves (`.uzi-go-work/g*`) were removed by this pass (at least one). */
+  goScratchRemoved: number;
+  /** A parked run whose Go work scratch was not left clean (refused, failed, truncated or out of time): retried next pass. */
+  goScratchRetained: number;
   skippedLive: number;
   /**
    * A listed run whose directories are none of them a real directory owned by the worker:
@@ -458,6 +469,10 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
   const removeTree = deps.removeTree ?? ((parent: string, name: string, deadline: number) => rmTreePinned(parent, name, { deadline }));
   const dropCaches = deps.dropCaches ?? dropRunCaches;
   const processesClear = deps.processesClear ?? defaultProcessesClear;
+  const dropGoScratch =
+    deps.dropGoScratch ??
+    ((home: string, l: Logger, o: { deadlineMs: number }) =>
+      removeGoWorkLeaves(home, l, { select: { kind: "all" }, deadline: Date.now() + o.deadlineMs, reason: "disk_reclaim_parked" }));
   const memo = deps.cachesDropped;
   const isModelPassLive = deps.isModelPassLive ?? isLiveModelPassHome;
   const now = deps.now ?? Date.now;
@@ -480,6 +495,8 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     cachesDropped: 0,
     cachesAlreadyClear: 0,
     cachesKeptLiveProcesses: 0,
+    goScratchRemoved: 0,
+    goScratchRetained: 0,
     skippedLive: 0,
     skippedNotOwned: 0,
     skippedStatusUnknown: 0,
@@ -673,10 +690,22 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
           message: "disk reclaim dropped a parked run's caches",
           quietNoop: true,
         });
-        if (r.failed.length > 0 || r.skipped.length > 0) summary.failed += 1;
-        else memo?.add(runId);
+        const cachesClean = r.failed.length === 0 && r.skipped.length === 0;
+        if (!cachesClean) summary.failed += 1;
         if (r.dropped.length > 0) summary.cachesDropped += 1;
         else if (isNoop(r)) summary.cachesAlreadyClear += 1;
+        // issue #3870: the managed Go work leaves of a parked run, under the same proof that no
+        // process is attributed to the HOME. A scratch that is not clean counts as retained (not
+        // as `failed`: it is disposable) and keeps the run out of the memo so the next pass retries.
+        const scratchBudget = Math.min(RECLAIM_DROP_DEADLINE_MS, passDeadline - now());
+        let scratchClean = false;
+        if (scratchBudget > 0) {
+          const g = await dropGoScratch(dirs.home as string, log, { deadlineMs: scratchBudget });
+          scratchClean = isGoWorkClean(g);
+          if (g.removed.length > 0) summary.goScratchRemoved += 1;
+        }
+        if (!scratchClean) summary.goScratchRetained += 1;
+        if (cachesClean && scratchClean) memo?.add(runId);
         return;
       }
       memo?.forget(runId);
@@ -774,6 +803,8 @@ export async function runDiskReclaimPass(deps: DiskReclaimDeps): Promise<DiskRec
     caches_dropped: summary.cachesDropped,
     caches_already_clear: summary.cachesAlreadyClear,
     caches_kept_live_processes: summary.cachesKeptLiveProcesses,
+    go_scratch_removed: summary.goScratchRemoved,
+    go_scratch_retained: summary.goScratchRetained,
     skipped_live: summary.skippedLive,
     skipped_not_owned: summary.skippedNotOwned,
     skipped_status_unknown: summary.skippedStatusUnknown,

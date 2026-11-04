@@ -8,7 +8,8 @@
 //    used entries first, run-caches.ts trimRunCaches) only at a proven quiet point: between turns
 //    AND with no process of the run alive, never judged from file mtimes. "Alive" is the executor's
 //    probe: its CLI process groups, plus every process attributed to the run by environment
-//    (`HOME=<run HOME>`) or working directory (run-procs.ts), since the CLI runs each Bash command
+//    (`HOME=<run HOME>` or a `GOTMPDIR` inside the run's managed Go work leaf) or working directory
+//    (run-procs.ts), since the CLI runs each Bash command
 //    detached, outside its groups; an unknown answer is alive. A run that stays over the cap is
 //    parked preventively (see {@link SOFT_PARK_RULE}).
 //  - the HARD layer, the per-tick pressure action. {@link DiskGovernor.observe} runs on every stats
@@ -121,6 +122,11 @@ export function hardStopThreshold(apiThreshold: number | undefined, margin: numb
   const threshold = apiThreshold ?? DEFAULT_DISK_PRESSURE_THRESHOLD;
   const hard = threshold - margin;
   return hard > 0 ? hard : threshold;
+}
+
+/** Whether a used fraction is at the hard layer's stop point: at or over `threshold`, not just over. */
+export function atHardStopPressure(usedFraction: number, threshold: number): boolean {
+  return usedFraction >= threshold;
 }
 
 /** What the governor needs from the rest of the worker; every I/O is a seam for tests. */
@@ -409,6 +415,12 @@ export class DiskGovernor {
     return "continue";
   }
 
+  /** The hard layer's stop threshold right now: the api's threshold (latest heartbeat) minus the
+   *  configured margin. The one expression {@link observe} judges pressure against. */
+  effectiveHardThreshold(): number {
+    return hardStopThreshold(this.opts.thresholdOf(), this.opts.config.hardMargin);
+  }
+
   /**
    * The HARD layer, on every stats tick: the data volume's used fraction (undefined = unknown,
    * never acts). At or over {@link hardStopThreshold}, and with no earlier stop still in flight,
@@ -432,8 +444,8 @@ export class DiskGovernor {
     }
     if (usedFraction === undefined) return;
     if (sampledAtMs < Math.max(this.lastStopEndedAt, this.lastReclaimEndedAt)) return;
-    const threshold = hardStopThreshold(this.opts.thresholdOf(), this.opts.config.hardMargin);
-    if (usedFraction < threshold) {
+    const threshold = this.effectiveHardThreshold();
+    if (!atHardStopPressure(usedFraction, threshold)) {
       this.warnedNothingToStop = false;
       this.lastSelectionAt = Number.NEGATIVE_INFINITY;
       for (const r of this.runs.values()) r.inPlaceSkipped = false;

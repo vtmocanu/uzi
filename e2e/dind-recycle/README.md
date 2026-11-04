@@ -16,12 +16,37 @@ no host socket mount, and no published ports. All fixture and prune commands use
 Images are pulled on cache misses without passing credentials into DinD.
 The inner Alpine image is pinned to the repository's existing digest.
 
-After one server API version check, the test runs exactly `docker volume prune -f`.
-It proves that an unreferenced anonymous volume disappears while an unreferenced
-named volume and anonymous volumes referenced by running and stopped containers
-survive. Anonymous IDs, labels, pre-prune existence, and holder states are checked.
+The inner `dockerd` runs with `--debug`, so `docker logs` of the owned container
+records every request path. The test prints the inner server's Version, GitCommit,
+APIVersion and MinAPIVersion and the client APIVersion (so the engine build can be
+compared with the sources the design cites), then makes one server API check
+(>= 1.42).
 
-Docker calls have individual timeouts within a 360-second test deadline.
+The prune runs exactly as the worker's volume leg does: `docker volume prune -f`
+with `DOCKER_API_VERSION=1.42` in an otherwise empty client environment. Before it,
+a fail-closed probe runs the same command with one minor below the daemon minimum
+(1.39 against minimum 1.40). It must exit non-zero with the daemon's "too old"
+error, remove nothing (every fixture volume stays), and leave no volumes/prune
+request in the daemon log other than the rejected one, so there is no retry at
+another version. After the real prune the log must show `POST /v1.42/volumes/prune`
+and no other volumes/prune request path.
+
+Assertions: an orphan anonymous volume created immediately before the prune is
+removed (no age delay), as is the earlier orphan. Retained: the named volume;
+anonymous volumes of a running and a stopped container; a never-started
+`docker create -v` holder's volume (reference first); and an anonymous volume with
+local-driver options (`--mount ...volume-opt=type=tmpfs`, container removed without
+`-v`, asserted anonymous-labelled before and after) because the engine excludes it.
+An unrelated volume-less running container and the stopped container keep their
+state. Removal first: after the prune, `run -v <removed-orphan-id>:/fixture` finds
+`/fixture/proof` absent and the re-created volume has no anonymous label.
+
+This test is sequential. Real concurrency (a create or start racing the prune)
+rests on the cited engine source contract (reference acquisition and removal share
+the per-name volume lock, and removal rechecks references under it), not on this
+test; an accepted-but-not-yet-visible create is not a reference.
+
+Docker calls have individual timeouts within a 600-second test deadline.
 Readiness has at most 30 probes. Cleanup has separate 10/30-second caps, verifies
 the ownership label, and removes only the exact `dind-prune-test-<random>`
 container with `docker rm -fv`, including its anonymous DinD root.
