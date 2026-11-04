@@ -161,7 +161,7 @@ function parseRequest(line: string): Request | string {
     if (typeof o.confirm !== "string" || !CONFIRM_RE.test(o.confirm)) return "invalid_request";
     return { op: "resolve-local-record", run: o.run, generation: g, confirm: o.confirm };
   }
-  const allowed =["op", "run", "generation", "attempt", "confirm", "protected"];
+  const allowed = ["op", "run", "generation", "attempt", "confirm", "protected"];
   if (Object.keys(o).some((k) => !allowed.includes(k))) return "invalid_request";
   const any = o.run !== undefined || o.generation !== undefined || o.attempt !== undefined;
   let selector: RetainedSourceSelector | undefined;
@@ -405,7 +405,15 @@ export class RetainedSourceServer {
     this.busy = true;
     const run = (async () => {
       try {
-        const out = await this.resolveSequence(req, gate, clientGone, requestSignal);
+        let out: { ok: boolean; op: "resolve-local-record"; result: ResolveLocalRecordResult };
+        try {
+          out = await this.resolveSequence(req, gate, clientGone, requestSignal);
+        } catch (err) {
+          // Anything thrown outside the runner call (gate, idle probe, sleep): the outcome is unknown, so it
+          // is remembered and logged like every other outcome. resolveSequence's finally reopened the gate.
+          this.deps.log.warn("retained-source: local record resolution ended with an error; re-describe before retrying", { error: errMessage(err) });
+          out = { ok: false, op: "resolve-local-record", result: { kind: "partial", reason: "internal_error" } };
+        }
         const result = out.result;
         const sel = { runId: req.run, generation: req.generation, attempt: "local-record" };
         this.remember(sel, result.kind, result.kind === "refused" || result.kind === "partial" ? result.reason : undefined);

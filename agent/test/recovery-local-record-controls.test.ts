@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, mock, test } from "node:test";
 import { WorkerClient } from "../src/client.js";
@@ -30,8 +31,7 @@ const CAP = "recovery_held_publication_v2";
 
 /** A real coordinator over a real Git fixture; the API client is a fake except where a test installs the real one. */
 async function world(variant: Variant = "saved-final") {
-  await fs.mkdir(path.resolve("../.uzi/scratch"), { recursive: true });
-  const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/local-controls-"));
+  const root = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "uzi-local-controls-"));
   roots.push(root);
   const f = await fixture(root, variant);
   const bare = f.context.barePath;

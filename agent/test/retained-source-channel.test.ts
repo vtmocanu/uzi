@@ -1383,6 +1383,54 @@ describe("resolve-local-record: admission", () => {
     assert.equal(rig.resolveCalls.length, 0);
   });
 
+  it("shutdown during the drain refuses with shutting_down, reopens the gate and skips the runner", async () => {
+    const rig = await rigOf();
+    assert.ok(rig.gate.tryEnterClaim());
+    const pending = send(rig.sock, resolveReq()).catch(() => ({ closed: true }) as Json);
+    await until(() => rig.gate.heldBy("retained_ops"), "gate closed");
+    await rig.abort();
+    await pending;
+    assert.equal(rig.gate.heldBy("retained_ops"), false);
+    assert.equal(rig.resolveCalls.length, 0);
+    rig.gate.exitClaim();
+  });
+
+  it("a throw outside the runner call is partial/internal_error, remembered, logged, and reopens the gate", async () => {
+    const { logger, lines } = recordingLogger();
+    const rig = await rigOf({ log: logger, idle: () => { throw new Error("idle probe exploded"); } });
+    const r = await send(rig.sock, resolveReq());
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.op, "resolve-local-record");
+    assert.deepEqual(r.result, { kind: "partial", reason: "internal_error" });
+    assert.equal(rig.resolveCalls.length, 0);
+    assert.equal(rig.gate.heldBy("retained_ops"), false);
+    const done = lines.find((l) => (l as Json).msg === "retained-source: local record resolution finished") as Json | undefined;
+    assert.ok(done, "the outcome was logged");
+    assert.equal(done.outcome, "partial");
+    assert.equal(done.reason, "internal_error");
+    const after = await send(rig.sock, { op: "inspect" });
+    assert.equal(after.lastDiscards[0].attempt, "local-record");
+    assert.equal(after.lastDiscards[0].outcome, "partial");
+    assert.equal(after.lastDiscards[0].reason, "internal_error");
+  });
+
+  it("a runner throw is partial/internal_error, remembered, logged, and reopens the gate", async () => {
+    const { logger, lines } = recordingLogger();
+    const rig = await rigOf({ log: logger, resolveLocalRecord: async () => { throw new Error("coordinator exploded"); } });
+    const r = await send(rig.sock, resolveReq());
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.deepEqual(r.result, { kind: "partial", reason: "internal_error" });
+    assert.equal(rig.resolveCalls.length, 1);
+    assert.equal(rig.gate.heldBy("retained_ops"), false);
+    const done = lines.find((l) => (l as Json).msg === "retained-source: local record resolution finished") as Json | undefined;
+    assert.ok(done, "the outcome was logged");
+    assert.equal(done.outcome, "partial");
+    assert.equal(done.reason, "internal_error");
+    const after = await send(rig.sock, { op: "inspect" });
+    assert.equal(after.lastDiscards[0].outcome, "partial");
+    assert.equal(after.lastDiscards[0].reason, "internal_error");
+  });
+
   it("a client that left before the call gets client_disconnected and the runner is never called", async () => {
     const rig = await rigOf();
     assert.ok(rig.gate.tryEnterClaim());
@@ -1492,18 +1540,31 @@ describe("resolve-local-record: a deadline is cooperative and owned work is awai
   it("a client that times out gets the unknown-outcome message while the server keeps the gate and finishes the work", async () => {
     const release = deferred<{ kind: "retired"; generation: number; remaining: number }>();
     const { logger, lines } = recordingLogger();
-    const rig = await rigOf({ log: logger, server: { resolveDeadlineMs: 5 }, resolveLocalRecord: () => release.promise });
+    let settled = false;
+    const preView = { kind: "described" as const, runId: "run-lr", generations: [{ generation: 1, classification: "case_a_ack", digest: DIGEST, captureIds: [] }], blockers: [] };
+    const postView = { kind: "described" as const, runId: "run-lr", generations: [], blockers: [] };
+    const rig = await rigOf({
+      log: logger, server: { resolveDeadlineMs: 5 },
+      resolveLocalRecord: async () => { const r = await release.promise; settled = true; return r; },
+      describeLocalRecords: async () => (settled ? postView : preView),
+    });
 
+    const requestStart = Date.now();
     const client = await within(10_000, "the client", runClient(
       ["resolve-local-record", "--run", "run-lr", "--generation", "1", "--confirm", DIGEST, "--socket", rig.sock],
       { UZI_RETAINED_SOURCE_IDLE_TIMEOUT_MS: "300" },
     ));
+    const clientReturned = Date.now();
     assert.equal(client.code, 1);
     assert.equal(client.stderr.trim(), UNKNOWN_OUTCOME);
     assert.equal(client.stdout, "");
 
-    // The runner's tiny deadline has long passed, yet the operation is still owned: gate closed, busy.
-    assert.equal(rig.resolveCalls[0]!.deadlineAt - Date.now() < 1000, true);
+    // The runner got exactly the seam-configured bound (5 ms) relative to when the request was admitted.
+    const deadlineAt = rig.resolveCalls[0]!.deadlineAt;
+    assert.ok(deadlineAt >= requestStart + 5 && deadlineAt <= clientReturned + 5, `deadlineAt ${deadlineAt} vs [${requestStart + 5}, ${clientReturned + 5}]`);
+    // The deadline has long passed, yet the operation is still owned: gate closed, busy; the record is still there.
+    const pre = await send(rig.sock, { op: "local-records", run: "run-lr" });
+    assert.deepEqual(pre.result, preView);
     assert.equal(rig.gate.heldBy("retained_ops"), true);
     assert.equal(rig.events.includes("gate_opened:retained_ops"), false);
     const second = await send(rig.sock, resolveReq({ generation: 2 }));
@@ -1525,10 +1586,11 @@ describe("resolve-local-record: a deadline is cooperative and owned work is awai
     assert.equal(after.lastDiscards[0].attempt, "local-record");
     assert.equal(after.lastDiscards[0].outcome, "retired");
 
-    // The follow-up view reaches the runner; the fake now reports the post-mutation state.
+    // The follow-up view reaches the runner and shows the post-mutation state (the generation is gone).
     const view = await send(rig.sock, { op: "local-records", run: "run-lr" });
     assert.equal(view.ok, true);
-    assert.equal(rig.describeCalls.length, 1);
+    assert.deepEqual(view.result, postView);
+    assert.equal(rig.describeCalls.length, 2);
   });
 
   it("close() returns within its settle bound but neither reopens the gate nor clears ownership of a running resolve", async () => {

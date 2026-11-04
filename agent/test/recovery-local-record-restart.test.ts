@@ -25,7 +25,8 @@ afterEach(async () => {
 const SEAM_WAIT_MS = 40_000;
 const CHILD_WALL_MS = 100_000;
 const LEGACY_RUN = "31050000-0000-4000-8000-0000000000bb";
-const CHILD = path.resolve("test/fixtures/recovery-local-record-restart-child.ts");
+const AGENT_DIR = path.resolve(import.meta.dirname, "..");
+const CHILD = path.resolve(import.meta.dirname, "fixtures/recovery-local-record-restart-child.ts");
 
 type Described = { kind: string; generations?: Array<{ generation: number; classification: string; digest?: string }>; blockers?: string[] };
 type Resolved = { kind: string; reason?: string; generation?: number; remaining?: number };
@@ -115,7 +116,7 @@ async function runChild(w: World, action: ChildSpec["action"], killAt?: KillAt):
   const specFile = path.join(w.ctl, `${tag}.spec.json`);
   await fs.writeFile(specFile, JSON.stringify(spec));
   const child = spawn(process.execPath, ["--import", "tsx", "--import", "./test/setup/hermetic-proc.ts", CHILD, specFile], {
-    cwd: path.resolve("."), stdio: ["ignore", "ignore", "pipe"],
+    cwd: AGENT_DIR, stdio: ["ignore", "ignore", "pipe"],
     env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
   });
   children.add(child);

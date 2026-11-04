@@ -708,7 +708,8 @@ export type DescribeLocalRecordsResult =
   | { kind: "described"; runId: string; generations: LocalRecordGeneration[]; blockers: string[] }
   | { kind: "refused"; reason: string };
 /** `retired`: refs, bundles and records of the generation are gone. `refused`: nothing was touched. `partial`:
- * the destructive boundary was crossed and the outcome is not known to be complete; re-describe. */
+ * the destructive boundary was crossed and the outcome is not known to be complete, or (from the operator
+ * channel) the outcome is unknown; re-describe before retrying. */
 export type ResolveLocalRecordResult =
   | { kind: "retired"; generation: number; remaining: number }
   | { kind: "refused"; reason: string }
