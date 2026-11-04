@@ -166,9 +166,14 @@ Two consequences are worth stating plainly:
 
 - **Internal review becomes repo-authored.** When a run uses repo agents, its
   `reviewer`/`auditor` are the repo's, so their "looks good" is unverified. The
-  lead is told to treat their output as input to double-check, not as a sign-off,
-  and the merge request records that the run used repo agents so the human
-  reviewer knows.
+  lead refuses a bare "approved" or "LGTM". It inspects the evidence a repo agent
+  ties to the current revision (commit, commands and their results, file:line)
+  and spot-checks it. It does not re-run a valid gate or redo an investigation
+  only because a repo agent did it; it re-runs on missing or stale evidence,
+  changed code, a contradiction or a concrete concern. A different repo agent can
+  still review independently, but an agent checking its own work is not an
+  independent review. The merge request records that the run used repo agents so
+  the human reviewer knows.
 - **A repo agent that can run commands can reach your token.** A repo `coder`
   that declares the `Bash` tool (most do) runs shell inside the worker, where
   your Anthropic token lives — so it could send that token out, or run up cost by

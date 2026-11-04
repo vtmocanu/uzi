@@ -19259,6 +19259,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.ok(rootInstructions(rig.epochs[0]!.transport).includes("OWN LEAD BODY"));
     const [implText] = turnInputs(rig.epochs[1]!.transport);
     assert.ok(implText!.includes(PASSAGE), "the implement turn carries the untrusted-review passage");
+    assert.ok(implText!.includes("Do not re-run a valid gate or redo an investigation"), "the implement turn carries the evidence-audit rule (#3912)");
     assert.ok(implText!.includes("Available subagents to delegate to: repo-reviewer (can edit files)."), "and the selected names only");
     assert.ok(!implText!.includes("repo-tester"));
     assert.ok(rootInstructions(rig.epochs[1]!.transport).includes(PASSAGE), "the resumed thread's developer instructions carry the passage");
@@ -19270,6 +19271,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     const [implText] = turnInputs(rig.epochs[1]!.transport);
     assert.ok(implText!.includes("Available subagents to delegate to: coder (can edit files), tester (can edit files)."));
     assert.ok(!implText!.includes(PASSAGE));
+    assert.ok(!implText!.includes("Do not re-run a valid gate"), "own source: no evidence-audit rule (#3912)");
     assert.ok(!rootInstructions(rig.epochs[1]!.transport).includes(PASSAGE));
   });
 
