@@ -15,7 +15,7 @@ import { isUtf8 } from "node:buffer";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { finished, pipeline } from "node:stream/promises";
-import { crc32, deflateSync } from "node:zlib";
+import { crc32, deflateSync, inflateSync } from "node:zlib";
 import { PassThrough, Readable, Transform, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { RUN_KINDS, type RunKind } from "./protocol.js";
@@ -2433,10 +2433,14 @@ export interface EpochDiscardProofOptions {
 type EpochDiscardProofState = Omit<EpochDiscardProofOptions, "decision">;
 
 /** Internal content-proof mode; epoch inspection alone never selects it. */
+class AutomaticCompletenessUnknown extends Error {}
+
 interface AutomaticPreservation {
   checkLive: () => void;
   roots: readonly string[];
   owedBytes?: number;
+  finalStoreCheck?: () => Promise<void>;
+  objectCoverage?: (head: string) => Promise<boolean>;
 }
 
 export interface RetainedDiscardOptions {
@@ -3104,6 +3108,7 @@ export class GitCache {
   private readonly epochDiscardProofs = new WeakMap<EpochDiscardProof, EpochDiscardProofState>();
   // Native options never enter boundary, capture, SDK or run request objects.
   private readonly epochNative = new AsyncLocalStorage<EpochDiscardProofState & {
+    allowedIndices?: Set<string>;
     configMutation?: readonly string[];
     beforeLaunch?: () => Promise<void>;
   }>();
@@ -3122,7 +3127,7 @@ export class GitCache {
     if (this.boundaryProcesses.getStore() || this.epochNative.getStore())
       throw new Error("epoch native process scope overlap");
     this.checkEpochDiscardLive(state);
-    return this.epochNative.run({ ...state }, action);
+    return this.epochNative.run({ ...state, allowedIndices: new Set() }, action);
   }
 
   private epochNativePaths(): string[] {
@@ -3197,6 +3202,15 @@ export class GitCache {
       sub === "rev-list" && tail[0] === "--objects" && tail[1] === "-n" && tail[2] === "1" &&
         tail.slice(3).filter(v => v !== "--not").every(v => /^[0-9a-f]{40}$/.test(v)) && tail.includes("--not")
     );
+    admitted ||= (cwd === state.paths[0] && identity === "command" ||
+      cwd === state.barePath && identity === "worker_pat") &&
+      exact("cat-file", "--batch-all-objects", "--batch-check=%(objectname)");
+    admitted ||= cwd === state.barePath && identity === "worker_pat" &&
+      sub === "verify-pack" && tail.length === 2 && tail[0] === "--" &&
+      state.allowedIndices?.has(tail[1]!) === true;
+    admitted ||= cwd === state.barePath && identity === "worker_pat" &&
+      sub === "rev-list" && tail[0] === "--objects" && tail[1] === "--no-object-names" &&
+      tail.length >= 3 && tail.length <= 130 && tail.slice(2).every(v => SHA40_RE.test(v));
     admitted ||= cwd === state.barePath && identity !== "command" &&
       shape === JSON.stringify(this.epochNative.getStore()?.configMutation);
     if (!admitted) return refuse();
@@ -3216,6 +3230,15 @@ export class GitCache {
     this.checkEpochDiscardLive(state);
     signal?.throwIfAborted();
     options = { ...options, env: this.preflightEpochNative(command, args, options.env, identity) };
+    const wrappedGit = runnerCommand(GIT_BIN, []);
+    if (command === GIT_BIN || command === wrappedGit.command && wrappedGit.args.every((arg, i) => args[i] === arg)) {
+      args = [...args];
+      const gitPosition = command === GIT_BIN ? 0 : runnerCommand(GIT_BIN, []).args.length;
+      const position = gitPosition + (args[gitPosition] === "-C" ? 2 : 0);
+      args.splice(position, 0, "-c", "core.multiPackIndex=false", "-c", "core.commitGraph=false",
+        "-c", "pack.writeReverseIndex=false", "-c", "pack.readReverseIndex=false",
+        "-c", "pack.threads=1", "-c", "index.threads=1");
+    }
     if (args.includes("config") && !args.includes("--no-includes")) {
       args = [...args]; args.splice(args.indexOf("config") + 1, 0, "--no-includes");
     }
@@ -10862,6 +10885,7 @@ export class GitCache {
           await read(() => fs.realpath(cwd)) !== cwd ||
           await read(() => fs.realpath(path.join(cwd, ".git"))) !== path.join(cwd, ".git") ||
           !await standalone()) return false;
+      automatic.objectCoverage = await this.automaticObserveStores(epoch.barePath, cwd, automatic);
       // Resolve the trusted default using the existing lookup, but reject its HEAD-only fallback.
       const db = await read(() => this.defaultBranchName(epoch.barePath));
       if (!db || !(await read(() => this.isPlainBranchName(epoch.barePath, db)))) return false;
@@ -10881,16 +10905,334 @@ export class GitCache {
         this.epochRetained.getStore()!.maxMetadataRecords)) return false;
       const head = await read(() => this.worktreeHead(cwd));
       if (!head || !SHA40_RE.test(head)) return false;
-      if (!(await this.worktreeCleanHardened(cwd, automatic)) ||
-          !(await this.localRefsReachableFrom(epoch.barePath, cwd, head, automatic))) return false;
+      if (!(await this.localRefsReachableFrom(epoch.barePath, cwd, head, automatic)) ||
+          !(await this.worktreeCleanHardened(cwd, automatic))) return false;
       if (await read(() => this.worktreeHead(cwd)) !== head || await root() !== rootSha ||
           JSON.stringify(await owedRoots()) !== JSON.stringify(owed)) return false;
       const after = await read(() => this.clonePresence(cwd));
-      return after.presence === "present" && after.devIno === presence.devIno && await standalone() &&
+      const unchanged = after.presence === "present" && after.devIno === presence.devIno && await standalone() &&
         await read(() => this.realCloneDir(cwd)) &&
         await read(() => fs.realpath(cwd)) === cwd &&
         await read(() => fs.realpath(path.join(cwd, ".git"))) === path.join(cwd, ".git");
-    } catch { return false; }
+      await automatic.finalStoreCheck?.();
+      return unchanged;
+    } catch (error) {
+      if (error instanceof AutomaticCompletenessUnknown) throw error;
+      return false;
+    }
+  }
+
+  /** Read-only physical inventory. Every loop is capped by the existing epoch limits;
+   * one failure aborts the observation and no later native sibling is launched. */
+  private async automaticObjectCoverage(barePath: string, cwd: string, head: string,
+    automatic: AutomaticPreservation): Promise<boolean> {
+    const coverage = automatic.objectCoverage ?? await this.automaticObserveStores(barePath, cwd, automatic);
+    return coverage(head);
+  }
+
+  private async automaticObserveStores(barePath: string, cwd: string,
+    automatic: AutomaticPreservation): Promise<(head: string) => Promise<boolean>> {
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    const unknown = (message: string): never => { throw new AutomaticCompletenessUnknown(message); };
+    const limits = this.epochRetained.getStore()!;
+    const native = this.epochNative.getStore()!;
+    const source = path.join(cwd, ".git", "objects"), bare = path.join(barePath, "objects");
+    const same = (a: Set<string>, b: Set<string>) => a.size === b.size && [...a].every(id => b.has(id));
+    const signature = (st: import("node:fs").BigIntStats) =>
+      [st.dev, st.ino, st.mode, st.nlink, st.uid, st.gid, st.size, st.mtimeNs, st.ctimeNs].join(":");
+    const snapshot = async () => {
+      let entries = 0, bytes = 0, occurrences = 0, edges = 0;
+      const rows = new Map<string, string>();
+      const stores = new Map<string, { ids: Set<string>; alternates: string[] }>();
+      const pairs = new Set<string>();
+      const charge = (n: number) => { if ((bytes += n) > limits.maxMetadataBytes) unknown("object metadata byte limit"); };
+      const stat = async (p: string, optional = false) => {
+        try {
+          const st = await read(() => fs.lstat(p, { bigint: true }));
+          if (st.isSymbolicLink() || await read(() => fs.realpath(p)) !== p) unknown("noncanonical object path");
+          rows.set(p, signature(st)); charge(Buffer.byteLength(p) + 128);
+          return st;
+        } catch (error) {
+          if (optional && (error as NodeJS.ErrnoException).code === "ENOENT") {
+            rows.set(p, "absent"); charge(Buffer.byteLength(p)); return undefined;
+          }
+          throw error;
+        }
+      };
+      const directory = async (p: string) => {
+        const st = await stat(p);
+        if (!st?.isDirectory()) unknown("object directory type");
+        let handle: import("node:fs").Dir | undefined;
+        const names: string[] = [];
+        try {
+          await read(async () => { handle = await fs.opendir(p, { bufferSize: 1 }); });
+          for (;;) {
+            const entry = await read(() => handle!.read());
+            if (!entry) break;
+            if (++entries > limits.maxDirectoryEntries) unknown("object directory entry limit");
+            MaintenanceResources.consumeIfActive("adminEntries", 1);
+            charge(Buffer.byteLength(entry.name)); names.push(entry.name);
+          }
+        } finally { if (handle) await this.automaticPreservationClose(automatic, () => handle!.close()); }
+        rows.set(p + "/", JSON.stringify(names.sort()));
+        return names;
+      };
+      const file = async (p: string, length?: number) => {
+        const st = await stat(p);
+        // Observation does not mutate the inode. Participating writers are excluded
+        // through aliases by the epoch contract; fingerprints never replace that exclusion.
+        // Mutation-specific hardlink guards elsewhere remain unchanged.
+        if (!st?.isFile()) unknown("object file type");
+        const n = length ?? Number(st!.size);
+        if (!Number.isSafeInteger(n) || n < 0 || st!.size < BigInt(n)) unknown("object file size");
+        charge(n);
+        let handle: import("node:fs/promises").FileHandle | undefined;
+        try {
+          await read(async () => { handle = await fs.open(p, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); });
+          if (signature(await read(() => handle!.stat({ bigint: true }))) !== signature(st!)) unknown("object file replaced");
+          const buf = Buffer.alloc(n);
+          let offset = 0;
+          // At most n nonempty reads; EOF before n is incomplete.
+          while (offset < n) {
+            const result = await read(() => handle!.read(buf, offset, n - offset, offset));
+            if (!result.bytesRead) unknown("short object metadata");
+            MaintenanceResources.consumeIfActive("metadataBytes", result.bytesRead);
+            offset += result.bytesRead;
+          }
+          if (signature(await read(() => handle!.stat({ bigint: true }))) !== signature(st!)) unknown("object file changed");
+          return buf;
+        } finally { if (handle) await this.automaticPreservationClose(automatic, () => handle!.close()); }
+      };
+      const add = (ids: Set<string>, id: string) => {
+        if (++occurrences > Math.min(MAX_LOCAL_REF_SHAS, limits.maxMetadataRecords)) unknown("physical object occurrence limit");
+        ids.add(id);
+      };
+      const visit = async (root: string): Promise<void> => {
+        if (stores.has(root)) return;
+        if (stores.size >= limits.maxMetadataRecords) unknown("object store limit");
+        // EX covers managed stores only. Fingerprints alone do not exclude outside writers.
+        const managedBare = path.dirname(path.dirname(root)) === path.resolve(this.reposRoot) && path.basename(root) === "objects";
+        if (root !== source && root !== bare && !managedBare) unknown("alternate writer exclusion unavailable");
+        for (const parent of [path.dirname(path.dirname(root)), path.dirname(root)]) {
+          if (!(await stat(parent))?.isDirectory()) unknown("object ancestor type");
+        }
+        if (managedBare) {
+          const owner = await stat(path.dirname(root));
+          if (owner!.uid !== BigInt(process.getuid!()) || (owner!.mode & 0o022n) !== 0n) unknown("unowned alternate store");
+        }
+        const config = path.join(path.dirname(root), "config");
+        const configBytes = await file(config);
+        rows.set(config + ":bytes", configBytes.toString("hex"));
+        const parsed = await read(() => this.execScoped("git",
+          ["config", "--file", "-", "--no-includes", "--null", "--list"],
+          { env: gitEnv(), input: configBytes, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER }));
+        this.automaticCollection(parsed.stdout, "\0");
+        for (const row of parsed.stdout.split("\0")) {
+          const [key, value] = row.split("\n");
+          if (key === "extensions.compatobjectformat" || key === "extensions.objectformat" && value !== "sha1" ||
+              key === "extensions.refstorage" || key === "extensions.worktreeconfig" ||
+              key === "core.worktree" || key?.startsWith("include.") || key?.startsWith("includeif."))
+            unknown("object format or config indirection unsupported");
+        }
+        for (const name of ["commondir", "shallow", "info/grafts", "refs/replace"]) {
+          if (await stat(path.join(path.dirname(root), name), true)) unknown("unsupported object topology");
+        }
+        const store = { ids: new Set<string>(), alternates: [] as string[] };
+        stores.set(root, store);
+        const names = await directory(root);
+        for (const name of names) {
+          const p = path.join(root, name);
+          if (/^[0-9a-f]{2}$/.test(name)) {
+            for (const leaf of await directory(p)) {
+              if (!/^[0-9a-f]{38}$/.test(leaf) || !(await stat(path.join(p, leaf)))?.isFile()) unknown("unsupported loose object");
+              const compressed = await file(path.join(p, leaf));
+              const remaining = limits.maxMetadataBytes - bytes;
+              if (remaining <= 0) unknown("loose output byte limit");
+              automatic.checkLive(); this.checkRecoveryInterruption();
+              // Node returns the zlib result envelope for info:true; its declarations expose only Buffer.
+              const inflated = inflateSync(compressed, { maxOutputLength: remaining, info: true }) as unknown as
+                { buffer: Buffer; engine: { bytesWritten: number } };
+              automatic.checkLive(); this.checkRecoveryInterruption();
+              MaintenanceResources.consumeIfActive("metadataBytes", inflated.buffer.length);
+              charge(inflated.buffer.length);
+              if (inflated.engine.bytesWritten !== compressed.length) unknown("trailing loose input");
+              const nul = inflated.buffer.indexOf(0);
+              const header = inflated.buffer.subarray(0, nul).toString("latin1");
+              if (nul < 0 || !/^(blob|tree|commit|tag) (0|[1-9][0-9]*)$/.test(header) ||
+                  !Number.isSafeInteger(Number(header.slice(header.indexOf(" ") + 1))) ||
+                  Number(header.slice(header.indexOf(" ") + 1)) !== inflated.buffer.length - nul - 1 ||
+                  createHash("sha1").update(inflated.buffer).digest("hex") !== name + leaf)
+                unknown("invalid loose object");
+              automatic.checkLive(); this.checkRecoveryInterruption();
+              add(store.ids, name + leaf);
+            }
+          } else if (name === "pack") {
+            const members = await directory(p);
+            for (const member of members) {
+              const full = path.join(p, member);
+              if (member === "multi-pack-index.d") {
+                for (const child of await directory(full)) {
+                  if (child !== "multi-pack-index-chain" && !/^multi-pack-index-[0-9a-f]{40}\.(midx|rev|bitmap)$/.test(child)) unknown("unsupported incremental MIDX");
+                  if (!(await stat(path.join(full, child)))?.isFile()) unknown("MIDX type");
+                }
+                continue;
+              }
+              if (member === "multi-pack-index" || /^multi-pack-index-[0-9a-f]{40}\.(rev|bitmap)$/.test(member)) {
+                if (!(await stat(full))?.isFile()) unknown("MIDX type"); continue;
+              }
+              const match = /^(pack-[0-9a-f]{40})\.(pack|idx|keep|promisor|rev|bitmap|mtimes)$/.exec(member);
+              if (!match || !(await stat(full))?.isFile()) unknown("unsupported pack entry");
+              if (!members.includes(match![1] + ".pack") || !members.includes(match![1] + ".idx")) unknown("incomplete pack pair");
+              if (match![2] !== "idx") continue;
+              const idx = await file(full);
+              const v2 = idx.length >= 8 && idx.readUInt32BE(0) === 0xff744f63;
+              if (v2 && idx.readUInt32BE(4) !== 2) unknown("unsupported pack index version");
+              const base = v2 ? 8 : 0;
+              if (idx.length < base + 1024 + 40) unknown("short pack index");
+              let previous = 0;
+              for (let i = 0; i < 256; i++) {
+                const count = idx.readUInt32BE(base + 4 * i);
+                if (count < previous || count > limits.maxMetadataRecords) unknown("pack fanout limit or order");
+                previous = count;
+              }
+              const count = previous, table = base + 1024;
+              let large = 0;
+              if (v2) {
+                if (idx.length < table + 28 * count + 40) unknown("short v2 index tables");
+                const slots = new Set<number>();
+                for (let i = 0; i < count; i++) {
+                  const off = idx.readUInt32BE(table + 24 * count + 4 * i);
+                  if (off >= 0x80000000) { large++; slots.add(off - 0x80000000); }
+                }
+                if (slots.size !== large || [...slots].some(slot => slot >= large)) unknown("invalid large offset table");
+              }
+              if (idx.length !== table + (v2 ? 28 : 24) * count + 8 * large + 40) unknown("pack index size");
+              let last = "";
+              const fanout = Array<number>(256).fill(0);
+              for (let i = 0; i < count; i++) {
+                const offset = table + (v2 ? 20 * i : 24 * i + 4);
+                const id = idx.subarray(offset, offset + 20).toString("hex");
+                if (id <= last) unknown("pack OID table order");
+                last = id; fanout[idx[offset]!]!++; add(store.ids, id);
+              }
+              let total = 0;
+              for (let i = 0; i < 256; i++) if ((total += fanout[i]!) !== idx.readUInt32BE(base + 4 * i)) unknown("pack fanout mismatch");
+              const header = await file(path.join(p, match![1] + ".pack"), 12);
+              if (header.toString("ascii", 0, 4) !== "PACK" || ![2, 3].includes(header.readUInt32BE(4)) || header.readUInt32BE(8) !== count) unknown("pack header mismatch");
+              pairs.add(full);
+            }
+          } else if (name === "info") {
+            const members = await directory(p);
+            for (const member of members) {
+              const full = path.join(p, member);
+              if (member === "commit-graphs") {
+                for (const child of await directory(full)) {
+                  if (child !== "commit-graph-chain" && !/^graph-[0-9a-f]{40}\.graph$/.test(child)) unknown("unsupported commit graph entry");
+                  if (!(await stat(path.join(full, child)))?.isFile()) unknown("commit graph type");
+                }
+              } else if (["commit-graph", "packs"].includes(member)) {
+                if (!(await stat(full))?.isFile()) unknown("object info type");
+              } else if (member === "alternates") {
+                const data = await file(full);
+                if (!isUtf8(data)) unknown("alternate encoding");
+                rows.set(full + ":bytes", data.toString("hex"));
+                const text = data.toString("utf8");
+                if (text && !text.endsWith("\n")) unknown("unterminated alternates");
+                for (const line of text ? text.slice(0, -1).split("\n") : []) {
+                  if (++edges > limits.maxMetadataRecords || !/^[!-~]+$/.test(line) || /["\\]/.test(line)) unknown("unsupported alternate syntax");
+                  store.alternates.push(path.resolve(root, line));
+                }
+              } else unknown("unsupported object info entry");
+            }
+            for (const absent of ["alternates", "http-alternates", "commit-graph", "commit-graphs"])
+              if (!members.includes(absent)) await stat(path.join(p, absent), true);
+          } else unknown("unsupported object root entry");
+        }
+        for (const absent of ["pack", "info"]) if (!names.includes(absent)) await stat(path.join(root, absent), true);
+        for (const alternate of store.alternates) await visit(alternate);
+      };
+      await visit(source); await visit(bare);
+      const expected = (root: string) => {
+        const seen = new Set<string>(), ids = new Set<string>();
+        const walk = (p: string) => {
+          if (seen.has(p)) return;
+          seen.add(p);
+          for (const id of stores.get(p)!.ids) ids.add(id);
+          for (const alt of stores.get(p)!.alternates) walk(alt);
+        };
+        walk(root); return ids;
+      };
+      return { fingerprint: JSON.stringify([...rows].sort(([a], [b]) => a.localeCompare(b))),
+        source: expected(source), bare: expected(bare), pairs };
+    };
+    try {
+      const initial = await snapshot();
+      for (const runner of [true, false]) {
+        const args = ["config", "--local", "--no-includes", "--null", "--list"];
+        const config = await read(() => runner ? this.runGitAsRunner(cwd, args,
+          { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } })
+          : this.runGitWithEnv(barePath, args, NO_REPLACE_ENV));
+        this.automaticCollection(config, "\0");
+        for (const row of config.split("\0")) {
+          const [key, value] = row.split("\n");
+          if (key === "extensions.compatobjectformat" || key === "extensions.objectformat" && value !== "sha1" ||
+              key?.startsWith("include.") || key?.startsWith("includeif.")) unknown("object format or config indirection unsupported");
+        }
+      }
+      for (const idx of initial.pairs) {
+        native.allowedIndices!.add(idx);
+        try { await read(() => this.runGitWithEnv(barePath, ["verify-pack", "--", idx], NO_REPLACE_ENV)); }
+        finally { native.allowedIndices!.delete(idx); }
+      }
+      automatic.finalStoreCheck = async () => {
+        if ((await snapshot()).fingerprint !== initial.fingerprint) unknown("object topology changed");
+      };
+      return async (head: string) => {
+        try {
+          const parse = (out: string) => {
+            this.automaticCollection(out, "\n");
+            if (out && !out.endsWith("\n")) unknown("unterminated object inventory");
+            const ids = new Set<string>();
+            for (const id of out ? out.slice(0, -1).split("\n") : []) {
+              if (!SHA40_RE.test(id) || ids.has(id)) unknown("invalid object inventory");
+              ids.add(id);
+            }
+            return ids;
+          };
+          const inventory = async (runner: boolean) => parse(await read(() => runner
+            ? this.runGitAsRunner(cwd, ["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
+              { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } })
+            : this.runGitWithEnv(barePath, ["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"], NO_REPLACE_ENV)));
+          const refs = () => read(() => this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"],
+            { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
+          const closure = async () => parse(await read(() => this.runGitWithEnv(barePath,
+            ["rev-list", "--objects", "--no-object-names", ...automatic.roots], NO_REPLACE_ENV)));
+          const sourceIds = await inventory(true), bareIds = await inventory(false);
+          if (!same(sourceIds, initial.source) || !same(bareIds, initial.bare)) unknown("physical and native inventory disagree");
+          const out = await refs();
+          this.automaticCollection(out, "\n");
+          if (out && !out.endsWith("\n")) unknown("unterminated refs");
+          const required = new Set(sourceIds); required.add(head);
+          let stash = false;
+          for (const line of out ? out.slice(0, -1).split("\n") : []) {
+            const match = /^([0-9a-f]{40}) (refs\/[^\s]+)$/.exec(line);
+            if (!match) unknown("invalid refs");
+            stash ||= match![2] === "refs/stash"; required.add(match![1]!);
+          }
+          const held = await closure();
+          if (!same(sourceIds, await inventory(true)) || !same(bareIds, await inventory(false)) ||
+              !same(held, await closure()) || out !== await refs()) unknown("object observations changed");
+          await automatic.finalStoreCheck!();
+          return !stash && [...required].every(id => held.has(id));
+        } catch (error) {
+          if (error instanceof AutomaticCompletenessUnknown) throw error;
+          throw new AutomaticCompletenessUnknown("object coverage unavailable", { cause: error });
+        }
+      };
+    } catch (error) {
+      if (error instanceof AutomaticCompletenessUnknown) throw error;
+      throw new AutomaticCompletenessUnknown("object completeness unavailable", { cause: error });
+    }
   }
 
   /**
@@ -10930,6 +11272,10 @@ export class GitCache {
         throw err;
       });
       if (wt.length > 0) return false;
+      if (automatic && automatic.roots.length === 0) return false;
+      if (automatic?.roots.length) {
+        return await this.automaticObjectCoverage(barePath, cwd, head, automatic);
+      }
       const refs = () => read(() => this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
       const out = await refs();
       if (automatic) this.automaticCollection(out, "\n");
@@ -10955,6 +11301,7 @@ export class GitCache {
       if (automatic && await refs() !== out) return false;
       return true;
     } catch (err) {
+      if (err instanceof AutomaticCompletenessUnknown) throw err;
       this.log.debug("stopped source local refs could not be proven held", { cwd, error: gitErrorMessage(err) });
       return false;
     }
@@ -20699,11 +21046,15 @@ try {
     const env = { ...gitEnv(), ...extraEnv };
     this.log.debug("git (env)", { cwd, args });
     try {
-      const { stdout } = await this.execScoped("git", withDir(cwd, [...args]), {
+      const quietVerify = this.epochNative.getStore() !== undefined && args.length === 3 &&
+        args[0] === "verify-pack" && args[1] === "--";
+      const { stdout, stderr } = await this.execScoped("git", withDir(cwd, [...args]), {
         env,
         timeout: GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
       });
+      if (quietVerify && (stdout !== "" || stderr !== ""))
+        throw new AutomaticCompletenessUnknown("quiet pack verification emitted output");
       return stdout;
     } catch (err) {
       if (err instanceof RunResidueBlockedError) throw err;
@@ -21452,8 +21803,9 @@ try {
     return false;
   }
 
-  /** Canonical caches do not borrow object stores. Git 2.56 initializes alternates
-   * even for metadata probes, so refuse controls without opening or following them. */
+  /** Ordinary canonical-cache callers refuse alternate controls without following
+   * them. An explicit automatic reader requires an already completed store observation;
+   * this does not authorize deletion or change the ordinary caller contract. */
   private async assertCanonicalAlternatesAbsent(barePath: string, automatic?: AutomaticPreservation): Promise<void> {
     for (const name of ["alternates", "http-alternates"]) {
       try {
@@ -21461,6 +21813,12 @@ try {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
+      }
+      if (automatic) {
+        if (name !== "alternates" || !automatic.objectCoverage || !automatic.finalStoreCheck)
+          throw new AutomaticCompletenessUnknown("bare alternate precondition not established");
+        await automatic.finalStoreCheck();
+        continue;
       }
       throw new Error("maintenance_source_layout_unsupported");
     }

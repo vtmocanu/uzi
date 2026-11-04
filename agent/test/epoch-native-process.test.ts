@@ -65,12 +65,23 @@ function fixture(deleteLaunch = false, identity: Identity = "worker_pat") {
     spawn: ((_command: string, _args: string[], options: { detached: boolean; stdio: unknown; env: NodeJS.ProcessEnv }) => {
       assert.equal(options.detached, true);
       assert.deepEqual(options.stdio, ["pipe", "pipe", "pipe", 42]);
-      if (deleteLaunch) assert.deepEqual(options.env, { PATH: "/usr/bin:/bin" });
+      if (deleteLaunch) {
+        assert.deepEqual(options.env, { PATH: "/usr/bin:/bin" });
+        const expected = runnerCommand("/bin/rm", ["-rf", "--", target], true);
+        assert.equal(_command, expected.command);
+        assert.deepEqual(_args, expected.args);
+      }
       else {
         assert.equal(options.env.TMPDIR, identity === "command" ? process.env.UZI_RUNNER_TMPDIR ?? process.env.TMPDIR : process.env.TMPDIR);
         assert.equal(options.env.PATH, "/usr/bin:/bin");
         assert.equal(options.env.GIT_OPTIONAL_LOCKS, "0");
         assert.equal(options.env.GIT_CONFIG_GLOBAL, "/dev/null");
+        for (const pin of ["core.multiPackIndex=false", "core.commitGraph=false", "pack.writeReverseIndex=false",
+          "pack.readReverseIndex=false", "pack.threads=1", "index.threads=1"]) {
+          const at = _args.indexOf(pin);
+          assert.ok(at > 0);
+          assert.equal(_args[at - 1], "-c");
+        }
       }
       assert.equal(pending, deleteLaunch ? 2 : 1);
       launch();
@@ -122,6 +133,52 @@ it("native runner preflight preserves its validated TMPDIR independently of work
     else process.env.UZI_RUNNER_TMPDIR = old;
   }
 });
+it("admits only source/bare inventories and bounded worker trusted closure command forms", async () => {
+  const f = fixture();
+  const internal = f.git as unknown as {
+    preflightEpochNative(command: string, args: string[], env: NodeJS.ProcessEnv, identity: Identity): NodeJS.ProcessEnv;
+  };
+  const bare = path.join(process.env.TMPDIR!, "bare");
+  const sha = "a".repeat(40);
+  const inventory = ["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"];
+  const closure = ["rev-list", "--objects", "--no-object-names", sha];
+  await f.internal.withEpochNativeReads(f.proof, async () => {
+    const idx = path.join(bare, "objects/pack/pack-" + sha + ".idx");
+    const verify = ["-C", bare, "verify-pack", "--", idx];
+    assert.throws(() => internal.preflightEpochNative("/usr/bin/git", verify, {}, "worker_pat"), /unaudited/);
+    const context = f.git["epochNative"].getStore()!;
+    context.allowedIndices!.add(idx);
+    internal.preflightEpochNative("/usr/bin/git", verify, {}, "worker_pat");
+    assert.throws(() => internal.preflightEpochNative("/usr/bin/git",
+      ["-C", bare, "verify-pack", "--stat-only", "--", idx], {}, "worker_pat"), /unaudited/);
+    context.allowedIndices!.delete(idx);
+    assert.throws(() => internal.preflightEpochNative("/usr/bin/git", verify, {}, "worker_pat"), /unaudited/);
+    for (const [cwd, args, identity] of [
+      [f.target, inventory, "command"], [bare, inventory, "worker_pat"], [bare, closure, "worker_pat"],
+      [bare, [...closure, ...Array<string>(127).fill(sha)], "worker_pat"],
+    ] as [string, string[], Identity][]) {
+      const env = internal.preflightEpochNative("/usr/bin/git", ["-C", cwd, ...args], {}, identity);
+      assert.equal(env.GIT_NO_LAZY_FETCH, "1");
+      assert.equal(env.GIT_NO_REPLACE_OBJECTS, "1");
+    }
+    for (const [cwd, args, identity] of [
+      [f.target, inventory, "worker_pat"],
+      [bare, inventory, "command"], [f.target, closure, "command"],
+      [bare, closure, "command"], [f.target, closure, "worker_pat"],
+      [f.target, [...inventory, "--filters"], "command"],
+      [f.target, [...inventory, "--textconv"], "command"],
+      [f.target, ["cat-file", "--batch-check=%(objectname)"], "command"],
+      [bare, [...closure, "--all"], "worker_pat"],
+      [bare, closure.slice(0, -1), "worker_pat"],
+      [bare, [...closure, ...Array<string>(128).fill(sha)], "worker_pat"],
+      [bare, [...closure.slice(0, -1), "A".repeat(40)], "worker_pat"],
+      [bare, [...closure.slice(0, -1), sha + "0"], "worker_pat"],
+    ] as [string, string[], Identity][])
+      assert.throws(() => internal.preflightEpochNative("/usr/bin/git", ["-C", cwd, ...args], {}, identity), /unaudited/);
+  });
+  assert.equal(f.inherited(), 0);
+});
+
 it("exit starts group cleanup before close; success waits for descendant absence and IO", async () => {
   const f = fixture();
   let done = false;
@@ -411,3 +468,20 @@ it("unconfirmed group signaling never settles on a later close", async () => {
   assert.equal(f.pending(), 1);
   assert.equal(f.stopped(), true);
 });
+
+for (const stream of ["stdout", "stderr"] as const) {
+  it("quiet verify-pack rejects nonempty " + stream + " after joined exit zero", async () => {
+    const f = fixture();
+    const bare = path.join(process.env.TMPDIR!, "bare");
+    const idx = path.join(bare, "objects/pack/pack-" + "a".repeat(40) + ".idx");
+    const result = f.internal.withEpochNativeReads(f.proof, async () => {
+      f.git["epochNative"].getStore()!.allowedIndices!.add(idx);
+      return f.git["runGitWithEnv"](bare, ["verify-pack", "--", idx], {});
+    });
+    await f.launched;
+    f.child[stream].write("unexpected diagnostic");
+    f.gone(); f.exit(); f.close();
+    await assert.rejects(result, /quiet pack verification emitted output/);
+    f.scope.assertSettled();
+  });
+}
