@@ -1,14 +1,79 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
+
+var explicitClaude = "claude"
+
+// settingsReadFailsClient fails only the settings read that follows the overflow write.
+type settingsReadFailsClient struct{ *uzicli.FakeClient }
+
+func (settingsReadFailsClient) GetMySettings(context.Context) (apitypes.UserSettingsDTO, error) {
+	return apitypes.UserSettingsDTO{}, uzicli.Exitf(uzicli.ExitAuth, "settings read refused")
+}
+
+func TestSettingsHarnessOverflowCommandAutomaticDefault(t *testing.T) {
+	for _, tc := range []struct{ arg, want string }{
+		{"on", "Harness overflow: on (inactive: default harness is automatic)"},
+		{"off", "Harness overflow: off (inactive: default harness is automatic)"},
+	} {
+		fc := &uzicli.FakeClient{}
+		out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "harness-overflow", tc.arg)
+		if code != 0 || !strings.Contains(out, tc.want) {
+			t.Fatalf("%s: code=%d out=%q stderr=%s", tc.arg, code, out, stderr)
+		}
+	}
+	// JSON stays the stored value only, with no read of the default.
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "settings", "harness-overflow", "on", "--json")
+	var got map[string]bool
+	if err := json.Unmarshal([]byte(out), &got); err != nil || code != 0 || len(got) != 1 || !got["harness_overflow_enabled"] {
+		t.Fatalf("code=%d out=%q err=%v", code, out, err)
+	}
+}
+
+func TestSettingsHarnessOverflowCommandReadFailure(t *testing.T) {
+	fc := settingsReadFailsClient{&uzicli.FakeClient{}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "harness-overflow", "on")
+	if code != uzicli.ExitAuth || !strings.Contains(stderr, "settings read refused") ||
+		!strings.Contains(out, "Harness overflow: on (new runs, at creation)") {
+		t.Fatalf("code=%d out=%q stderr=%s", code, out, stderr)
+	}
+	if fc.HarnessOverflowCalls != 1 {
+		t.Fatalf("write calls=%d", fc.HarnessOverflowCalls)
+	}
+}
+
+func TestSettingsGetDefaultHarnessLine(t *testing.T) {
+	codex := "codex"
+	for _, tc := range []struct {
+		def  *string
+		want []string
+	}{
+		{nil, []string{"Default harness: automatic (chosen per run by weekly limits)", "Harness overflow: on (inactive: default harness is automatic)"}},
+		{&explicitClaude, []string{"Default harness: claude", "Harness overflow: on (new runs, at creation)"}},
+		{&codex, []string{"Default harness: codex", "Harness overflow: on (new runs, at creation)"}},
+	} {
+		fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{HarnessOverflowEnabled: true, DefaultHarness: tc.def}}
+		out, _, code := runCLI(t, fakeEnv(fc), "settings", "get")
+		if code != 0 {
+			t.Fatalf("code=%d out=%s", code, out)
+		}
+		for _, w := range tc.want {
+			if !strings.Contains(out, w) {
+				t.Errorf("missing %q in %s", w, out)
+			}
+		}
+	}
+}
 
 func TestSettingsHarnessOverflowCommand(t *testing.T) {
 	for _, tc := range []struct {
@@ -16,7 +81,7 @@ func TestSettingsHarnessOverflowCommand(t *testing.T) {
 		enabled bool
 	}{{"on", true}, {"off", false}} {
 		for _, jsonOutput := range []bool{false, true} {
-			fc := &uzicli.FakeClient{}
+			fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{DefaultHarness: &explicitClaude}}
 			args := []string{"settings", "harness-overflow", tc.arg}
 			if jsonOutput {
 				args = append(args, "--json")
@@ -79,6 +144,7 @@ func TestSettingsGetHarnessOverflow(t *testing.T) {
 
 func TestRunGetHarnessDecision(t *testing.T) {
 	zero, hundred, measured := 0.0, 100.0, 37.5
+	resetA := time.Date(2026, 11, 9, 4, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name     string
 		decision *apitypes.HarnessDecisionDTO
@@ -86,9 +152,12 @@ func TestRunGetHarnessDecision(t *testing.T) {
 	}{
 		{"legacy", nil, []string{"at creation: not recorded"}},
 		{"unknown", &apitypes.HarnessDecisionDTO{Preferred: "claude", Chosen: "claude", Reason: "preferred"},
-			[]string{"preferred: claude", "chosen: claude", "reason: preferred", "preferred score: unknown", "other score: unknown", "pref measured: unknown", "other measured: unknown", "preferred held: false", "other held: false"}},
+			[]string{"preferred: claude", "chosen: claude", "reason: preferred", "preferred score: unknown", "other score: unknown", "pref measured: unknown", "other measured: unknown", "preferred held: false", "other held: false", "pref reset: unknown", "other reset: unknown"}},
+		{"automatic soonest reset", &apitypes.HarnessDecisionDTO{Preferred: "claude", Chosen: "codex", Reason: "auto_soonest_reset", PreferredScore: &zero, OtherScore: &hundred, PreferredMeasured: &measured, OtherMeasured: &zero,
+			PreferredWeeklyResetAt: &resetA},
+			[]string{"preferred: claude", "chosen: codex", "reason: auto_soonest_reset", "claude score: 0%", "codex score: 100%", "claude measured: 37.5%", "codex measured: 0%", "claude held: false", "codex held: false", "claude reset: 11-09 04:00Z", "codex reset: unknown"}},
 		{"zero and held", &apitypes.HarnessDecisionDTO{Preferred: "codex", Chosen: "claude", Reason: "overflow", PreferredScore: &zero, OtherScore: &hundred, PreferredMeasured: &measured, OtherMeasured: &zero, PreferredHeld: true},
-			[]string{"preferred: codex", "chosen: claude", "reason: overflow", "preferred score: 0%", "other score: 100%", "pref measured: 37.5%", "other measured: 0%", "preferred held: true", "other held: false"}},
+			[]string{"preferred: codex", "chosen: claude", "reason: overflow", "preferred score: 0%", "other score: 100%", "pref measured: 37.5%", "other measured: 0%", "preferred held: true", "other held: false", "pref reset: unknown", "other reset: unknown"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := apitypes.RunDTO{ID: "snapshot", Harness: "claude", Status: "completed", HarnessDecision: tc.decision}

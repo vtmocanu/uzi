@@ -3,7 +3,7 @@ package main
 import "strings"
 
 // railHarnessDecision is a stored snapshot, fitted whole with its separator.
-// Recorded decisions have ten rows; legacy decisions have two. Content is
+// Recorded decisions have twelve rows; legacy decisions have two. Content is
 // width-clamped after Plain so wide glyphs cannot wrap.
 func (m tuiModel) railHarnessDecision(usedRows int) string {
 	lines := []string{"HARNESS at creation"}

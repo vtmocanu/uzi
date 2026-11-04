@@ -32,8 +32,8 @@ func TestRailHarnessDecisionSnapshotAndBudget(t *testing.T) {
 			Preferred: "codex", Chosen: "claude", Reason: "overflow",
 			PreferredScore: &zero, OtherScore: &hundred, PreferredMeasured: &measured, OtherMeasured: &zero, PreferredHeld: true,
 		}}, nil)
-	want := "HARNESS at creation\npreferred: codex\nchosen: claude\nreason: overflow\npreferred score: 0%\nother score: 100%\npref measured: 37.5%\nother measured: 0%\npreferred held: true\nother held: false"
-	const rows = 10
+	want := "HARNESS at creation\npreferred: codex\nchosen: claude\nreason: overflow\npreferred score: 0%\nother score: 100%\npref measured: 37.5%\nother measured: 0%\npreferred held: true\nother held: false\npref reset: unknown\nother reset: unknown"
+	const rows = 12
 	used := m.transcriptViewport() - 1 - rows
 	before := m.railHarnessDecision(used)
 	if got := stripANSI(before); got != want {
@@ -123,7 +123,7 @@ func TestRailHarnessDecisionProtectsFoldBudget(t *testing.T) {
 		legacy.detail.run.HarnessDecision = nil
 		if m.railAutoFolded(now) && !legacy.railAutoFolded(now) {
 			rail := stripANSI(m.renderLaneRail())
-			if strings.Contains(rail, "other held: false") {
+			if strings.Contains(rail, "other reset: unknown") {
 				found = true
 				break
 			}
@@ -150,7 +150,7 @@ func TestRailHarnessDecisionConsumesMeterBudget(t *testing.T) {
 		without := stripANSI(legacy.renderLaneRail())
 		if strings.Contains(with, "HARNESS at creation") && !strings.Contains(with, "ACCOUNTS") && strings.Contains(without, "ACCOUNTS") {
 			found = true
-			if !strings.Contains(with, "other held: false") {
+			if !strings.Contains(with, "other reset: unknown") {
 				t.Fatalf("partial historical block: %q", with)
 			}
 			if len(strings.Split(with, "\n")) > m.transcriptViewport() {
