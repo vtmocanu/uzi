@@ -3240,7 +3240,7 @@ export class GitCache {
       const position = gitPosition + (args[gitPosition] === "-C" ? 2 : 0);
       args.splice(position, 0, "-c", "core.multiPackIndex=false", "-c", "core.commitGraph=false",
         "-c", "pack.writeReverseIndex=false", "-c", "pack.readReverseIndex=false",
-        "-c", "pack.threads=1", "-c", "index.threads=1",
+        "-c", "pack.useBitmaps=false", "-c", "pack.threads=1", "-c", "index.threads=1",
         "-c", `core.deltaBaseCacheLimit=${this.epochRetained.getStore()?.maxMetadataBytes ?? 8 * 1024 * 1024}`);
     }
     if (args.includes("config") && !args.includes("--no-includes")) {
