@@ -184,7 +184,7 @@ The gap common to every posture is the lack of an identity the successor can ver
 
 - `prds/3431-pod-epoch-reclaim.md:11`, "It does not exclude every historical writer: an older pod's process may survive its termination and still write after a later evidenced epoch. The owner accepted that residual on 2026-10-24." [I]
 - It was accepted for **deleting settled trees**, where a stray write does bounded damage. Nothing records it as accepted for **attribution and journal writes in a live bare**, which a restore would trust. Search: `git grep -n '2026-10-24' -- prds adr specs docs ':!prds/3831-bare-writer-exclusion.md'` gives 121 lines; filtering them with `grep -i -E 'survivor|historical writer|older.pod'` leaves five: `prds/3430-pod-epoch-lock-shadow.md:142`, `:450` and `prds/3431-pod-epoch-reclaim.md:11`, all about the epoch proof for reclaim, plus `prds/done/1232-completion-interlock-integration.md:5` and `:175`, where "survivor" means a mutation-test survivor and is unrelated. A prose search can miss a differently worded acceptance. A reuse of the epoch proof must not inherit the residual silently.
-- **Owner question (for Gate A; section 9, Q2).** Does the 2026-10-24 older-pod-survivor residual extend to restore attribution in a live bare, or must restore close it (for example by refusing whenever more than one epoch separates the writer of the saved pin from the restorer)?
+- **Owner question (for Gate A; section 9, Q2).** Does the 2026-10-24 older-pod-survivor residual extend to restore attribution in a live bare, or must restore close it? Refusing whenever more than one epoch separates the writer of the saved pin from the restorer does not close it; Q2 (9.1) concludes that the real choice is between accepting the residual and refusing restore on every lane.
 
 ### 4.4 #3031 maintenance exclusion
 
@@ -200,7 +200,7 @@ The gap common to every posture is the lack of an identity the successor can ver
   - `adr/1783-run-quiescence-and-attempt-clone-paths.md:1336-1337`, "Docker accepted-but-invisible creates (#1860) and unregistered or sibling writers are unchanged".
   - `specs/human.md:1414`, "Docker accepted-but-invisible creates (#1860), unregistered/sibling writers, Claude terminal proof, per-attempt cgroups (#1862) and reclaim/custody (#1858, #2746) remain open".
 
-**Reuse verdict.** The epoch proof can be reused at most for a restore that runs inside the startup EX window of a fresh pod on the DinD lane, before admission, and only if the owner extends the 2026-10-24 older-pod-survivor residual to restore attribution (4.3); otherwise not at all. It never covers (a), (b) or (d), nor a later restore in (c). Anything else needs new evidence, which sections 5 and 6 design.
+**Reuse verdict.** The epoch proof can be reused at most for a restore that runs inside the startup EX window of a fresh pod on the DinD lane, before admission, and only if the owner extends the 2026-10-24 older-pod-survivor residual to restore attribution (4.3); otherwise not at all. It never covers (a), (b) or (d), nor, as shipped, a later restore in (c); section 6 adds a persisted record for this. Anything else needs new evidence, which sections 5 and 6 design.
 
 This record's findings bear on restore admission only; they do not change the #3404 completion-source rule in `specs/human.md:1414` (see the owner question at the end of 2.4).
 
@@ -215,9 +215,9 @@ The options are taken from smallest to largest. A larger option is considered on
 
 ### 5.1 (ii) Reuse #3031's bounded writer exclusion (no new state)
 
-- **Proves.** Inside the worker's own PID namespace, no other process exists while the producer's boundary is held. The worker is idle behind its closed claim gate (4.4). [I]
+- **Proves.** Inside the worker's own PID namespace, no process outside an admitted set exists while the producer's boundary is held. The scan admits the worker, its ancestors, the subtrees the producer slot recorded, zombies and a bootstrap set, and refuses on every other process and, when Docker is wired, on any running container (`adr/1197-transient-recovery-park.md:145-150`, "That scan admits only the worker, its ancestors, the subtrees" ... "When Docker is wired, any running container refuses."). The worker is idle behind its closed claim gate (4.4). [I]
 - **Postures.** None for an older writer. An older writer lives in another PID namespace: an earlier container, possibly surviving, or another pod. A worker-local scan cannot see it (4.4, inferred). In (a0) in a container, the scan can at most observe that no orphan is visible in the successor's own namespace.
-- **Invariant.** Neither branch. It offers PID absence from one or a few scans. The issue lists "PID absence", "a single observation" and "repeated empty snapshots" as non-evidence. Its hold ends with the producer's boundary, not with restore's later authoritative use.
+- **Invariant.** Neither branch. It offers PID absence from one or a few scans. The issue body's Gate A section names "Repeated empty snapshots, PID absence" as not replacement authority and says "temporary inability at one observation is insufficient" (quoted in full in 6(a)). Its hold ends with the producer's boundary, not with restore's later authoritative use.
 - **Persisted state.** None.
 - **Legacy.** Blind to every writer outside its namespace, of any build.
 - **Cost.** Reuse only. The producer is disabled: `agent/src/recovery.ts:127`, `export const TERMINAL_ORIGIN_ADMISSION_ENABLED: boolean = false;`. [S]
@@ -233,7 +233,7 @@ The options are taken from smallest to largest. A larger option is considered on
 - **Invariant.** Branch 1 for X's processes, subject to the older-pod survivor residual (4.3). As shipped it is unusable at claim time:
   - Only the consumption is stored, never the evidence (4.2).
   - The EX under which the fact was established ends before admission (`prds/3430-pod-epoch-lock-shadow.md:179`, "Once that pass has settled, S closes EX and takes SH (bounded) with admission still closed, and only then opens admission."). [I]
-  - The design must not treat that EX hold as a boundary. The issue lists it as non-evidence.
+  - The design must not treat that EX hold as a boundary. The approved plan lists an epoch hold that ends before admission as non-evidence (6(a)).
 - **Persisted state.** As shipped, only the volume-global consumption ledger (4.2).
 - **Legacy.** Build-independent: the evidence is kubelet-reported pod status, so X's processes are covered whatever build X ran. This is **inferred** from where the evidence comes from.
 - **Cost.** Reuse only.
@@ -252,7 +252,7 @@ The options are taken from smallest to largest. A larger option is considered on
 1. **Namespace inode reuse.** The kernel's proc inode allocator hands freed namespace inode numbers out again, so a number is unique only among live namespaces. This is **inferred** from kernel behaviour; the kernel source was not read here.
    - **Equal inode, same boot.** "Same namespace" and "reused after death" cannot be told apart, so S must refuse. The (a0) same-container respawn looks exactly like this: same pod UID, same boot ID, same inode, and P's orphans share S's namespace. Refusal is the right outcome there.
    - **Different inode, same boot.** This proves a different namespace. It does not by itself prove that namespace is dead.
-   - **Proposed strengthening.** Also record PID 1's start time as seen inside the namespace (clock ticks since boot). A PID namespace has one init for its whole life, so the pair (inode, init start) names one namespace instance within a boot. An equal inode with a different init start then proves the earlier namespace was freed, because a number is reused only after its namespace is gone. That PID 1's start time is readable inside the container is **inferred** and owed (8.2).
+   - **Proposed strengthening (future (b) only, 6(g)).** Also record PID 1's start time as seen inside the namespace (clock ticks since boot). That a PID namespace has one init for its whole life, and that a namespace inode number is reused only after its namespace is gone, are both **inferred** from kernel behaviour and owed (8.2). If they hold, the pair (inode, init start) names one namespace instance within a boot, and an equal inode with a later init start shows the earlier namespace was freed. Two namespaces whose inits start in the same clock tick and share a reused inode cannot be told apart, so an equal pair must refuse. That PID 1's start time is readable inside the container is also **inferred** and owed (8.2). The interim contract (6(f)) does not use these fields.
 2. **W proves release, not death.** W is a kernel lock on Node's own open file description: `agent/src/authority-lock.ts:12`; `:351`, "Strong references keep the descriptors (and so the kernel locks) alive until exit."; `:364`, "The returned capability has no release." [S]
    - S holding W proves only that no compatible process on this kernel still holds it. That implies P's Node process exited on this kernel.
    - It says nothing about P's git children (2.2), about a process on another kernel, or about a stamp-less build, which never takes W.
@@ -263,16 +263,16 @@ The options are taken from smallest to largest. A larger option is considered on
 
    These containers do reach the predecessor's source clones (section 7).
 4. **Runner-uid processes in single-uid mode.** P's runner-uid processes live in P's container PID namespace and die with it, so as older writers they are covered by the same teardown.
-   - Single-uid adds check 3's subPath swap. Through it, a DinD-started container that survives a worker restart can reach the bare.
-   - On the hosted lane the default is single-uid, because uid-split is opt-in: `controller/internal/kube/render.go:573-575`, "UIDSplit opts into the Codex uid-split worker profile (PRD #1493 M1). When true the" / "worker + seed-nix containers start as root ...". [S]
+   - Single-uid adds check 3's subPath swap. Through it, a DinD-started container can reach the bare, but only one started after a later dind restart, because kubelet re-resolves the subPath at container start (`render_dind.go:63-65`, "kubelet re-resolves the subPath on every container start," / "so in single-uid mode the worker uid, which owns /data, can swap the entry and make" / "a later dind restart mount more of the volume."). [S]
+   - On the hosted lane the default is single-uid, because uid-split is opt-in: `controller/internal/kube/render.go:573-575`, "UIDSplit opts into the Codex uid-split worker profile (PRD #1493 M1). When true the" / "worker + seed-nix containers start as root ..."; the controller default is off (`controller/internal/config/config.go:198-199`, "WorkerUIDSplit opts the fleet into the Codex uid-split worker profile" / "(UZI_WORKER_UID_SPLIT, default false)."). [S]
    - So requiring uid-split refuses the default hosted fleet (Q6).
 5. **Permanently unable, or a held boundary?** Once a PID namespace is gone, its processes are dead and cannot return. That is branch 1, with no held boundary. It holds only where the namespace's end is shown by evidence, not by inference.
    - In-pod restart ordering carries the dead-shim residual: `prds/1860-pod-epoch-writer-exclusion.md:231`, "On this path no shim reaps init, and if `runc delete --force` failed, init may still be alive." [I]
    - Pod evidence closes that residual for pod replacement only, by refusing exit codes 137 and 255.
-   - An OOM-killed worker container also exits 137, so that rule cannot be reused unchanged for in-pod restarts (Q4).
+   - An OOM-killed worker container is expected to report exit 137 too (**inferred** from SIGKILL's exit status; not measured, owed in 8.2), so that rule cannot be reused unchanged for in-pod restarts (Q4).
 6. **The legacy rule is not computable.** "Every stamp since the bare was last touched by a stamp-less build" needs the time of the last stamp-less write. A stamp-less build leaves no trace, so a rollback followed by a roll-forward is invisible in the stamp set. **This part fails.**
    - Teardown evidence, however, is build-independent. A legacy process in an earlier container of S's pod, or in the evidenced predecessor pod X, is dead whatever it ran.
-   - A legacy process cannot share S's container instance, because one container instance runs one image.
+   - A legacy process cannot share S's container instance through the image, because one container instance runs one image. A different binary exec'd or copied into the live container (by an operator or a runner-uid process) can, and is the operator residual of Q8.
    - **The rule becomes:** a missing record for P refuses. Every other older writer is covered only by build-independent teardown, never by enumerating stamps.
 7. **A different boot ID.**
    - **Within one pod UID,** it means the node rebooted, because a pod stays on one node for its life. This is **inferred** from Kubernetes scheduling semantics. Every process of the earlier boot is then dead.
@@ -282,12 +282,12 @@ The options are taken from smallest to largest. A larger option is considered on
    - The stamp design is two write-once records plus one evaluator at a single admission point.
    - (iv) enrolls and joins every one of the 23 restore-relevant UNCOVERED rows and the 3 GATED rows in 2.3 (counted on this file with `grep -c -E '\| UNCOVERED \| yes \|$'` and `grep -c -E '\| GATED, not enrolled \| yes \|$'`, which anchor on the row end so this sentence does not match itself). Each of them leaves a blocking record when its parent crashes (5.5).
 
-**Verdict on the hypothesis: holds in part; adopted with three corrections.**
+**Verdict on the hypothesis: holds in part; adopted with three corrections and one narrowing.**
 1. W is dropped as death evidence.
-2. The stamp only locates P and detects a same-namespace predecessor. Death comes from container-instance ordering (same pod) or from persisted pod-terminal evidence (the predecessor pod).
-3. The uncomputable "since the last stamp-less write" rule is replaced by two rules: P's record must exist, and every other older writer is covered by build-independent teardown.
+2. The stamp only locates P (its pod UID). Death comes from persisted pod-terminal evidence for the predecessor pod X.
+3. The uncomputable "since the last stamp-less write" rule is replaced by two rules: P's record must exist, and every other older writer is covered by build-independent teardown evidence.
 
-The identity is also strengthened with the init start time. Any posture outside a uid-split hosted Docker lane refuses.
+**Narrowing.** Container-instance ordering inside one pod is not evidence today: an earlier instance of S's own pod may have died on the dead-shim path (check 5) with a delayed git child, and kubelet keeps only the last termination of each container (6(g)). So the interim contract admits only the worker incarnation that wrote S's pod record (the first worker instance of pod S) restoring over a P that ran in X. The in-pod restart (b) and the boot-ID fallback (b′) are NOT ELIGIBLE; the namespace identity fields (inode, init start, boot ID) move to the future-(b) path in 6(g). Any posture outside a uid-split hosted Docker lane refuses.
 
 ### 5.4 (iii) Isolating restore mutations from old writers
 
@@ -297,11 +297,12 @@ The identity is also strengthened with the init start time. Any posture outside 
 - **Postures.** None gained.
 - **Invariant.** Not met.
   - Stale `uzi-recovery.<branch>.*` writes still land on the predecessor's journal keys that restore reads: `agent/src/git.ts:8691`, `await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), value]);`.
-  - #3644's contracts bind to state that lives in the bare: the episode pin and `restoreTip` (`git.ts:9145`); the retained source clone, whose objects resolve through the bare (`git.ts:4006`, `["clone", "--shared", "--no-checkout", "--", barePath, clonePath]`); the per-source fence in the bare journal (`specs/human.md:1414`); and publication, which pushes from the bare. [S]
-  - Copying that state out at admission is "a single observation" of state that a live writer may be part-way through changing, for example a `memoryPark` draft (2.3) or a hand-made `config.lock` before rename (`git.ts:11822`, `await fs.rename(lockPath, cfgPath);`).
+  - #3644's contracts are reported to bind to state that lives in the bare [M] (the #3644 branches are off-tree, section 1). The shipped state they would read is in the bare [S]: the episode pin (`git.ts:9145`, `await this.runGit(barePath, ["update-ref", "--no-deref", \`refs/uzi-recovery-episode/${journal.runId}/${tip}\`, tip]);`) and `restoreTip` (`git.ts:9157`, `await this.writeRecovery(barePath, branch, { ...journal, restoreTip: tip,`); and the retained source clone, whose objects resolve through the bare (`git.ts:4006`, `["clone", "--shared", "--no-checkout", "--", barePath, clonePath]`). The spec places the per-source fence in the bare journal (`specs/human.md:1414`, a spec statement, not source).
+  - Copying that state out at admission is one observation of state that a live writer may be part-way through changing, for example a `memoryPark` draft (2.3) or a hand-made `config.lock` before rename (`git.ts:11822`, `await fs.rename(lockPath, cfgPath);`).
 - **Persisted state.** A second store holding copies of the journal, pins and objects.
 - **Legacy.** Legacy writers still write the predecessor's keys.
-- **Cost.** Every #3644 read and the publication path would have to be re-homed. Large.
+- **Crash window.** A crash mid copy-out leaves a partial private copy that must be discarded, while the predecessor's keys stay writable throughout; the option adds a window and closes none.
+- **Cost.** Every #3644 read and any path that reads the bare's recovery state would have to be re-homed. Large.
 - **Verdict. Reject**, and not needed as a component. Under the chosen design no older writer is alive, so successor attribution can stay in the bare under #3644's contract.
 
 ### 5.5 (iv) Durable pre-launch enrollment of every relevant bare writer (largest)
@@ -314,6 +315,7 @@ The identity is also strengthened with the init start time. Any posture outside 
   - A crash or OOM is exactly when restore is wanted, so (iv) alone turns the target case into a permanent block.
 - **Persisted state.** A pending record per write. Each slot write already costs a head-shard write, so four barriers in all (`completion-authority.ts:38-41`, "each slot write costs two extra barriers (a" / "file fsync and a directory fsync) on top of the slot's own two."). [S] These records would sit on paths that write the journal many times per run.
 - **Legacy.** Recording only new writers leaves every stable-release writer and every writer before cc125a82 unrecorded. A legacy rule is still needed, and that rule is (i′)'s evidence.
+- **Crash window.** Every enrolled write gains a window between its `running` record and joined settlement; a parent crash there leaves a record that blocks the bare until orphan death is proved, which (iv) cannot supply.
 - **Moving parts.** 23 restore-relevant UNCOVERED rows, 3 GATED rows, joined settlement for unknown exits, and recovery of every crash window.
 - **Verdict. Reject**, both standalone and as a component. Once (i′) holds, (iv) adds blocking and no protection.
 
@@ -327,11 +329,11 @@ Why each alternative falls short:
 - (iv) cannot release a dead parent's record and does not reach legacy writers.
 
 **Chosen: (i′)**, which is (i) plus the corrected hypothesis. It has three parts:
-- a per-process boundary record;
-- a per-pod record that persists the attested predecessor-terminal fact;
+- a per-process boundary record (incarnation and pod UID);
+- a per-pod record that persists the attested predecessor-terminal fact and names the worker incarnation that wrote it;
 - a finite posture predicate.
 
-It is the smallest combination that closes the in-pod restart (b) and predecessor-pod (c) cases. Every other posture refuses.
+It is the smallest combination that closes the predecessor-pod case (c), for the first worker instance of the new pod. The in-pod restart (b) and the boot-ID fallback (b′) are NOT ELIGIBLE in this interim contract (5.3, narrowing); 6(g) keeps their analysis as the path to future eligibility. Every other posture refuses.
 
 ## 6. Chosen contract (PROPOSED, not approved)
 
@@ -341,19 +343,21 @@ This section is a proposed contract for owner approval. No implementation is aut
 
 The invariant, verbatim from the issue (issue #3831 body, Gate A section): "Before successor mutation starts, every relevant older writer must be permanently unable to commit stale writes, or a continuously held exclusion/isolation boundary must prevent those writes throughout the protected operation and its subsequent authoritative use."
 
-- **Branch taken: the first ("permanently unable").** Every relevant older writer ran in a PID namespace that is shown to be gone. That namespace belonged to one of:
-  - an earlier instance of S's worker container;
-  - an earlier boot of S's node;
-  - the evidenced terminal predecessor pod X.
+- **Branch taken: the first ("permanently unable"), for one case only.** The successor S is the worker incarnation that wrote S's pod record, that is the first worker instance of pod S that consumed the epoch, and P ran in the evidenced terminal predecessor pod X. Then:
+  - P's processes, and those of X's other containers, ran in PID namespaces of X, whose terminal evidence comes from #3430/#3431 (4.1). That evidence certifies the final instance of each X container: `prds/3430-pod-epoch-lock-shadow.md:245`, every status entry "`state.terminated` with reason `Completed` or `Error`, a non-empty `containerID`, and an exit code that is ≥ 0 and not 137 or 255". For an earlier instance inside X it certifies only the kubelet ordering (`prds/1860-pod-epoch-writer-exclusion.md:195`, kubelet "re-reads the runtime and fails if any container still runs" before writing the terminal status) plus the per-container `restartCount` the handoff carries (`prds/3430-pod-epoch-lock-shadow.md:269`, "X's UID, with per-container `containerID`, exit code and `restartCount`;"). An earlier X instance that died on the dead-shim path is not excluded by the allowlist [I]. E11 (6(f)) closes this: X's evidence must report `restartCount` 0 for every X container that can write the data volume, so no earlier instance of those containers ran inside X.
+  - No earlier worker instance of pod S reached admission, because consumption precedes admission on every path (`prds/3430-pod-epoch-lock-shadow.md:452`, "Consume the one-shot before admission on every path.") [I] and S is the consuming instance. That an instance of pod S which exited before consuming wrote nothing to the bare is an assumption Gate B verifies (8.1).
+  - **Remaining older-writer exposure.** With E11, P is X's only worker instance. Two exposures remain, both already named:
+    - X's last instance of each container: covered by the allowlist's refusal of exit 137 and 255 (`prds/3430-pod-epoch-lock-shadow.md:245`), which on the paths #1860 read rejects the dead-shim exit (`prds/1860-pod-epoch-writer-exclusion.md:231`, "on the paths read, the dead shim reports only 137 or 255"); a path not read stays the #1860 dead-shim residual.
+    - Pods older than X: the 2026-10-24 older-pod-survivor residual (4.3, Q2).
 
-  The processes of a dead namespace cannot write again. No held boundary is relied on.
+  The processes of a dead namespace cannot write again. No held boundary is relied on. The in-pod restart (b) and boot-ID fallback (b′) are not taken: nothing today shows that every earlier container instance of S's pod, or of S's boot, is gone (6(g)).
 - **W.** W stays held for the process lifetime under its existing #3404 contract:
   - owner: the worker process;
   - binding: `<dataDir>/.uzi-authority/worker.lock`;
   - release: only at process exit.
 
   This design uses W only so that its own record writes are uncontended. W is not evidence about older writers.
-- **Non-evidence.** The issue lists these [M]: "a single observation", "repeated empty snapshots", "PID absence", "a released worker lock", "a timer", "`config.lock`", and "an epoch EX hold that ends before admission".
+- **Non-evidence.** The issue body's Gate A section states: "Repeated empty snapshots, PID absence, a released worker lock, a timer, or `config.lock` alone are not replacement authority." and "An unresolved writer blocks admission; temporary inability at one observation is insufficient." The approved plan adds an epoch EX hold that ends before admission, which §4.1 shows ends before admission (`prds/3430-pod-epoch-lock-shadow.md:179`, "Once that pass has settled, S closes EX and takes SH (bounded) with admission still closed, and only then opens admission.").
   - The predicate consumes none of them.
   - It reads only two kinds of input: identities that each process recorded about itself, and the pod-terminal fact persisted from attested evidence.
   - It does not read EX ownership. X's terminal status stays true after EX closes.
@@ -362,9 +366,9 @@ The invariant, verbatim from the issue (issue #3831 body, Gate A section): "Befo
 
 **Startup, once per worker process:**
 1. Acquire W: `agent/src/main.ts:433`, `installWorkerLifetime(await acquireWorkerLifetime(config.dataDir, { signal: controller.signal }));`. [S]
-2. Read the process's identity: boot ID; own PID-namespace device and inode; PID 1's start time; `UZI_POD_UID`; `UZI_EPOCH_LOCK`; `UZI_UID_SPLIT`; and the declared runtime. Any field that cannot be read is recorded as `unknown`.
+2. Read the process's identity: `PROCESS_INCARNATION` and `UZI_POD_UID`. If the pod UID cannot be read, write no record (restore stays disabled for this process). The posture inputs of E1 are read from S's own environment at restore admission, not recorded; the namespace identity fields belong to the future-(b) path (6(g)).
 3. Write the boundary record durably (6(d)). This happens before `ensureRunnerTmpdir` (`main.ts:439`, `const runnerTmp = ensureRunnerTmpdir({ dataDir: config.dataDir });`), before the GitCache exists, and before any registration or claim. [S] If the write fails, the process continues with restore disabled for itself. Its successors find no record, so they refuse.
-4. On the epoch lane only: after an attested (not shadow) fresh epoch verdict, and before admission opens, write the pod record once for this pod UID (6(d)).
+4. On the epoch lane only: after an attested (not shadow) fresh epoch verdict, and before admission opens, write the pod record once for this pod UID, naming this process's incarnation as its writer (6(d)). Only the instance that consumed the epoch fresh can do this, so the writer is the first worker instance of pod S. At base no such verdict exists: `agent/src/main.ts:1074-1075`, `if (epochBootstrap && epochOwnership && epochConsumption) {` / `const result = await runPodEpochShadow({`, runs a report-only pass (`agent/src/pod-epoch-reclaim.ts:112`, "Read-only, first-process shadow pass."), whose `authority` result is not consumed as authority before #3431 (`:58-59`, `... Deletion` / `* authority (M1b) requires BOTH verdict "eligible" AND authority "attested". */`). [S] So no pod record, and no E3 pass, exists until #3431 ships attested authority (8.3).
 5. Admission opens. Bare writers may now spawn.
 
 **Restore admission**, per claim of a run whose source slot is foreign-active and carries a saved pin (the #3644 entry):
@@ -377,7 +381,12 @@ The invariant, verbatim from the issue (issue #3831 body, Gate A section): "Befo
 7. Close A. Write the attribution into the bare (#3644), syncing the bare's `config` and then the bare directory (`agent/src/git.ts:7776-7779`).
 8. Later authoritative reads: no re-check of older writers is needed (branch 1). The existing checks of S's own ownership continue.
 
-**Race ordering.** Steps 2 to 6 run in one A transaction. W excludes any concurrent compatible worker, and every older writer is already dead. No TOCTOU window remains against either.
+**Race ordering.** Steps 2 to 6 run in one A transaction. W excludes any concurrent compatible worker. The older writers the contract covers (the processes of X, and any earlier pod-S instance, which never reached admission) are dead or never wrote; older pods are the 4.3 residual, and earlier instances inside X are refused by E11. No TOCTOU window remains against the covered writers.
+
+**Crash windows of restore admission.**
+- **Before step 6.** Nothing was written; the slot is still P's, and the next eligible successor re-evaluates from scratch.
+- **Between the durable slot takeover (step 6) and the bare attribution write (step 7).** The slot is owned by S with P as its basis, while the bare journal still carries P's attribution. S is now a dead incarnation. A later instance in pod S refuses (it is not the pod-record writer, E3). The first worker of the next pod sees a slot owned by S, whose pod is that worker's X, and so may be eligible over S. #3644 must read the slot-versus-journal mismatch fail-closed, or complete the attribution from the slot's recorded basis; Gate B tests this window (8.1).
+- **During step 7.** A crash part-way through the bare write can leave `config.lock` or a partial attribution; that is #3644's to read fail-closed (6(c)).
 
 **Effect on the observed refusal: none in Gate A.** `admitSourceUse` and `preservation_failed` are unchanged (section 1).
 
@@ -394,26 +403,28 @@ The invariant, verbatim from the issue (issue #3831 body, Gate A section): "Befo
 - **Pod record.** For a pod whose first worker obtained an attested fresh epoch proof, a write-once record naming the terminal predecessor X is durable before that pod's admission opens.
 
 **Failure model.**
-- **Covered:**
-  - process crash at any instruction (SIGKILL, OOM);
-  - storage or power loss, on supported storage (ext4 or xfs; `agent/src/authority-lock.ts:170`, `export async function requireSupportedStorage(`) whose fsync is honoured. [S]
+- **Covered:** process crash at any instruction (SIGKILL, OOM).
+- **Covered by design; evidence owed (8.2, #3430 storage audit):** storage or power loss, on supported storage (ext4 or xfs; `agent/src/authority-lock.ts:170`, `export async function requireSupportedStorage(`) whose fsync is honoured. [S for the storage gate; the fsync behaviour is owed]
+- **A lost pod record is permanent for the pod's life.** The epoch ledger has already consumed the pod UID (4.2), so no later instance of the pod can write the record again and E3 can never pass in that pod. This fails safe: restore refuses until the next pod.
 - **Not covered:** restoring an old copy of the store. This is out of scope, as it is for slots: `agent/src/completion-authority.ts:68`, "or a full reset), is NOT detected and is out of scope." [S]
 
 **Records** (proposed names and contents):
 
 | Record | Path | Content | Write |
 |---|---|---|---|
-| boundary | `<dataDir>/.uzi-authority/boundaries/<sha256(incarnation)>.json` | version, incarnation, boot ID, PID-namespace dev and inode, PID 1 start time, pod UID, epoch-lock, uid-split and declared-runtime flags, build version; MAC'd under the store key | `writeDurable`, `completion-authority.ts:378-401` |
-| pod | `<dataDir>/.uzi-authority/pods/<sha256(podUid)>.json` | version, S's pod UID, predecessor X, digest of the attested evidence, writer incarnation; MAC'd | same |
+| boundary | `<dataDir>/.uzi-authority/boundaries/<sha256(incarnation)>.json` | version, incarnation, pod UID; MAC'd under the store key | `writeDurable`, `completion-authority.ts:378-401`, plus a caller read-back |
+| pod | `<dataDir>/.uzi-authority/pods/<sha256(podUid)>.json` | version, S's pod UID, predecessor X, digest of the attested evidence, X's name and `restartCount` for each container in the E11 set, writer incarnation; MAC'd | same |
 
 Both records are write-once. If the file already exists with different content, the write refuses; an existing record is never rewritten.
 
+**Why only these fields.** The interim predicate needs P's pod UID (to compare with X), S's incarnation and pod UID (to match the pod record's writer and pod), X's per-container `restartCount` for the E11 set (copied from the attested evidence when the pod record is written), and nothing else. Posture flags are read from S's environment at admission. The boot ID, PID-namespace inode and PID 1 start time serve only a future (b) or (b′) and need not land now: a P record without them simply cannot qualify for a future (b), which refuses (fail-safe), at the cost of one more non-restorable restart after that later upgrade (6(g)).
+
 **Write and sync order** (`completion-authority.ts:30`, "Writes are tmp(O_EXCL|O_NOFOLLOW) -> file fsync -> rename -> directory fsync -> read back."). [S]
-1. If `boundaries/` or `pods/` is missing, create it, then fsync `.uzi-authority`. Precedent: `ensurePrivateDir`, `completion-authority.ts:453-463`, `if (created) {` ... `try { await ops.syncDir(handle); }`. [S]
+1. Ensure `boundaries/` or `pods/` exists, then fsync `.uzi-authority` **unconditionally**, whether or not this process created the directory. The precedent, `ensurePrivateDir` (`completion-authority.ts:453-463`), fsyncs the parent only when it created the directory (`:459`, `if (created) {`), so a creator that crashed between `mkdir` and that fsync would leave an entry a later process never makes durable. The proposed ordering therefore does not rely on that helper's conditional fsync.
 2. Create the tmp file with `O_EXCL`, write it, fsync it.
 3. Rename it into place.
-4. fsync the containing directory.
-5. Read the record back.
+4. fsync the containing directory (`boundaries/` or `pods/`).
+5. Read the record back. `writeDurable` (`:378-401`) covers steps 2 to 4 and does no read-back itself; its callers do (`:437-439`, `if (await readRegular(path.join(dir, \`${shard}.json\`), ...) !== content) {`, and `:956-958`, `if (back !== content) throw new AuthorityRefusal("authority slot did not read back");`). The new record writers must do the same. [S]
 
 This is the same file-then-directory order as `git.ts:7776-7779`: `const config = await fs.open(path.join(barePath, "config"), ...`, then `try { await sync(config, "config"); } ...`, then `const dir = await fs.open(barePath, ... O_DIRECTORY ...`, then `try { await sync(dir, "directory"); } ...`. [S] Admission (startup step 5) opens only after the read-back succeeds.
 
@@ -426,7 +437,7 @@ This is the same file-then-directory order as `git.ts:7776-7779`: `const config 
 | after the rename, before the directory fsync | record visible | the rename may be lost | either way, the process had not yet passed the barrier and wrote nothing |
 | after the directory fsync and read-back | durable | durable | the first bare or slot write may follow |
 
-So a slot that names P can exist only after P's record was durable. If a record is lost later, the result is absence, and absence refuses. No crash point produces a record that certifies more than it should.
+With the unconditional fsync of step 1, a slot that names P can exist only after P's record was durable, on storage whose fsync is honoured (owed, 8.2). The guarantee that does not depend on that is weaker and sufficient: if a record is missing for any reason, the result is absence, and absence refuses (fail-safe). No crash point produces a record that certifies more than it should.
 
 **Recovery ordering and rediscovery.**
 - Startup does no replay, repair or rewrite.
@@ -434,15 +445,15 @@ So a slot that names P can exist only after P's record was durable. If a record 
 - A startup sweep may remove stale tmp names, limited to this design's directories. This is fail-safe, because a tmp file is never read.
 
 **Verification (Gate B, 8.1).**
-- Fault injection through the `AuthorityFsOps` hooks (`completion-authority.ts:99-108`) asserts the order file sync, rename, directory sync, read-back, and that admission waits for all four.
+- Fault injection through the `AuthorityFsOps` hooks asserts the order file sync, rename, directory sync, and that admission waits for them. The seam has only those three members (`completion-authority.ts:99-103`, `syncFile(handle: fsp.FileHandle): Promise<void>;` / `syncDir(handle: fsp.FileHandle): Promise<void>;` / `rename(from: string, to: string): Promise<void>;`), so it cannot observe the read-back or the unconditional parent fsync's place before the first record write; asserting those needs a test-visible read or a new seam, which Gate B adds.
 - A process-crash test at each crash point shows that the successor refuses.
 - Neither read-back nor a process-crash test proves survival of storage loss. That rests on ext4 and xfs fsync semantics plus the operator storage audit, which is owed (8.2).
 
 ### 6(e) Versions and rollback
 
 - **Older writers** leave no boundary record. They are the stable releases (v0.85.2 and earlier), builds before cc125a82, and W-era builds without this record.
-  - As P, they refuse. So the first restart after an upgrade is never restorable (Q10).
-  - As other older writers, they are covered only by build-independent teardown: earlier container instances of S's pod, and pod X. Older pods remain the 4.3 residual.
+  - As P, they refuse. So the first pod replacement after an upgrade is never restorable (Q10).
+  - As other older writers, they are covered only by build-independent evidence: pod X's terminal evidence, and the fact that no earlier instance of pod S reached admission (6(a)). Earlier instances inside X are refused by E11; older pods remain the 4.3 residual.
 - **Older readers.** Builds without the gate have no restore.
   - The proposed directories sit beside `enrollment.json`, `heads/` and `slots/`.
   - The current store lists `.uzi-authority` only to remove stale head staging directories, so it ignores the new entries. See `completion-authority.ts:482-483`, `for (const name of await fsp.readdir(init.dir)) {` / `if (STALE_HEADS_TMP.test(name)) ...`, with `:474`, `const STALE_HEADS_TMP = /^\.heads\.[0-9a-f-]{36}\.tmp$/;`. [S]
@@ -462,25 +473,23 @@ So a slot that names P can exist only after P's record was durable. If a record 
 
 E1. **Posture.** All of:
 - `UZI_EPOCH_LOCK=1` (`agent/src/main.ts:380`, `const epochEnabled = process.env.UZI_EPOCH_LOCK === "1";`) and `UZI_DATA_DIR=/data`;
-- a declared runtime in {containerd-runc, crio-crun} (4.1);
+- a declared runtime in {containerd-runc, crio-crun} (`agent/src/pod-epoch-bootstrap.ts:1`, `type Runtime = "containerd-runc" | "crio-crun";`, read at `:31`, `const runtime: Runtime | undefined = declared === "containerd-runc" || declared === "crio-crun" ? declared : undefined;`) [S];
 - supported storage;
 - uid-split active (`agent/src/runner-uid.ts:72-73`, `export function uidSplitActive(env: NodeJS.ProcessEnv = process.env): boolean {` / `return env.UZI_UID_SPLIT === "1";`). [S]
 
-E2. **S's boundary record** exists, its MAC verifies, its version is known, its incarnation equals `PROCESS_INCARNATION`, and no field is `unknown`.
+E2. **S's boundary record** exists, its MAC verifies, its version is known, its incarnation equals `PROCESS_INCARNATION`, and its pod UID equals `UZI_POD_UID`.
 
-E3. **S's pod record** exists for S's pod UID and its MAC verifies. It names X from an attested fresh evaluation under EX with `current == S` and `previous == X` (`prds/3430-pod-epoch-lock-shadow.md:179`). [I]
+E3. **S's pod record, written by S.** It exists for S's pod UID and its MAC verifies. It names X from an attested fresh evaluation under EX with `current == S` and `previous == X` (`prds/3430-pod-epoch-lock-shadow.md:179`) [I]. Its writer incarnation equals S's `PROCESS_INCARNATION` and S's boundary record's incarnation, and its pod UID equals S's boundary record's pod UID. So S is the first worker instance of pod S; any later instance of the pod (after a container restart) fails E3. E3 cannot pass at base: the pod record needs an attested, non-shadow epoch verdict, which only #3431 delivers (6(b) startup step 4; 8.3).
 
-E4. **P's record.** P is the owner of the foreign-active source slot being restored, and P ≠ S. P's boundary record exists, its MAC verifies, its version is known, and no field is `unknown`.
+E4. **P's record.** P is the owner of the foreign-active source slot being restored, and P ≠ S. P's boundary record exists, its MAC verifies, and its version is known.
 
-E5. **Exactly one of:**
-- **(b), in-pod restart.** All of:
-  - P.pod = S.pod and P.boot = S.boot;
-  - (P.pidns, P.initStart) ≠ (S.pidns, S.initStart), and P.initStart < S.initStart;
-  - termination evidence for P's container instance excludes the dead-shim path. No such evidence source exists today (Q4).
-- **(b′), node reboot.** P.pod = S.pod and P.boot ≠ S.boot.
-- **(c), predecessor pod.** P.pod = X from E3.
+E5. **(c), predecessor pod: P.pod = X from E3.** This is the only eligible case.
+- **(b), in-pod restart: NOT ELIGIBLE.**
+- **(b′), boot-ID fallback (P.pod = S.pod, P.boot ≠ S.boot): NOT ELIGIBLE.**
 
-E6. **Anything else refuses.** If P.pod is neither S.pod nor X, refuse.
+Both stay so until Q4 is decided AND an evidence source exists that covers every earlier container instance in the pod or boot (6(g)).
+
+E6. **Anything else refuses.** If P.pod is not X (including P.pod = S.pod), refuse.
 
 E7. **`assertBareClear` passes** for the run's bound bare, inside the same A transaction as E1 to E6 and the takeover write.
 
@@ -490,11 +499,23 @@ E9. **Accepted residuals.** The owner has accepted Q2 (older-pod survivors), Q7 
 
 E10. **Scope.** The predicate reads only the run's bound bare and its slots. An unrelated or unknown bare never refuses an ordinary pin or capture (8.1, tripwire).
 
-**Supported postures** (both only under E1, and only once the 8.2 evidence for that posture exists):
-- (b) worker-container restart on the hosted Docker lane;
-- (c) restore over the immediately preceding pod on that lane.
+E11. **No earlier instance inside X of a data-volume writer.** S's pod record carries, from X's attested evidence, the `restartCount` of every X container in the set below, and each is 0. A set member absent from the evidence or the record, an absent, non-integer or nonzero `restartCount`, or a pod record without the counts refuses. With E5 (P.pod = X), this makes P X's only worker instance.
+- **The set: X containers that mount the `data` PVC read-write beyond the `runner-shared` subPath.** As rendered for the E1 posture (`controller/internal/kube/render.go`):
+  - `worker`: the whole PVC, read-write (`render.go:1271`, `{Name: "data", MountPath: dataMountPath},`);
+  - `seed-nix` (regular init): the whole PVC at the seed path (`render.go:1266`, `{Name: "data", MountPath: dataSeedMountPath},`);
+  - `runner-init` (regular init, DinD lane): the whole PVC (`render.go:1349`, `VolumeMounts:    []corev1.VolumeMount{{Name: dataVolume, MountPath: dataSeedMountPath}},`).
+
+  The two init containers are included because they hold the whole volume read-write, not because they were shown to write the bare; requiring 0 for them is fail-safe. Search behind the set: `grep -rn 'Name: *dataVolume\|Name: *"data"\|runnerWorkdirMount()' controller/internal --include=*.go | grep -v _test` finds these three mounts, the PVC volume itself (`render.go:1293`), and the `runner-shared` subPath mount (`render_dind.go:82`) used by `dind` (`:301`) and the worker (`render.go:1386`).
+- **`dind` is excluded; its restarts do not bear on the bare.** Its only `data` mount is the subPath: `render_dind.go:80-82`, "It is the ONLY data mount dind may have." / `return corev1.VolumeMount{Name: dataVolume, MountPath: dindWorkdirDir, SubPath: dindWorkdirSubPath}`, with `:301`, `mounts := []corev1.VolumeMount{runnerWorkdirMount()}`; its other volume is the separate DinD claim (`:360`, `mounts = append(mounts, corev1.VolumeMount{Name: dindDataVolume, MountPath: dataDir})`). That subPath is `/data/runner`, while the bare lives under `path.join(dataDir, "repos")` (`agent/src/git.ts:3226`). The one way a later `dind` instance could mount more of the volume is the single-uid subPath swap (`render_dind.go:63-66`), and E1 requires uid-split, under which "no untrusted identity can write /data" (`:66`); 3.2 (b) and 5.3 check 3 reach the same verdict. So no `dind` instance, earlier or last, and no container its daemon started, reaches the bare through a mount. What remains is a rootful daemon's device-level reach, which is Q7 under E9. `dind` restarts do matter for the predecessor's source clone under `/data/runner`; that is Q3 (section 7), not this condition.
+- **`dind-init` and `dind-meter` are excluded: neither mounts `data`.** `render_dind.go:483-484`, `VolumeMounts: []corev1.VolumeMount{` / `{Name: dindSocketVolume, MountPath: dindSocketDir},`; `:602-604`, `{Name: dindDataVolume, MountPath: dindMeterDataDir, ReadOnly: true},` / `{Name: dindMeterVolume, MountPath: dindMeterDir},`.
+- **The evidence already carries the field; no format extension is needed.** Controller: `controller/internal/kube/pod_epoch_evidence.go:24`, ``RestartCount int32  `json:"restartCount"` ``, validated non-negative at `:165`; filled from kubelet status for containers and init containers alike (`pod_epoch_session.go:412`, `out = append(out, PodEpochContainer{Name: c.Name, ContainerID: c.ContainerID, ExitCode: t.ExitCode, RestartCount: c.RestartCount})`, called for `p.Spec.Containers` at `:416` and `p.Spec.InitContainers` at `:420`). Agent: `agent/src/pod-epoch-evidence.ts:4`, `name: string; containerID: string; exitCode: number; restartCount: number;`; the key is required (`:105`, `shape(e, ["name", "containerID", "exitCode", "restartCount"]);`) and must be an integer in [0, 2^31−1] (`:108-109`). [S] Gate B adds only the copy into the pod record (6(d)) and the set check (8.1).
+- **Inferred.** That a kubelet `restartCount` of 0 means no earlier instance of that container ran in the pod is **inferred** from the Kubernetes pod-status API, not read in kubelet source; it is owed (8.2).
+
+**Supported posture** (only under E1, and only once the 8.2 evidence for it exists and #3431 ships attested authority):
+- (c) restore by the first worker instance of a new pod over the immediately preceding pod on the hosted Docker lane.
 
 **Refused:**
+- (b) worker-container restart and (b′) boot-ID fallback, until 6(g) is met;
 - (a0), every case;
 - (a) compose (Q5);
 - (d) kube-native (Q6);
@@ -503,6 +524,22 @@ E10. **Scope.** The predicate reads only the run's bound bare and its slots. An 
 - an undeclared runtime or unsupported storage;
 - non-container `npm start`;
 - anything not listed.
+
+### 6(g) Path to future eligibility of (b) and (b′) (NOT ELIGIBLE now)
+
+The earlier draft admitted these two cases; review showed both unsafe. The analysis stays here as the route to eligibility.
+
+**The earlier conditions.**
+- (b): P.pod = S.pod and P.boot = S.boot; (P.pidns, P.initStart) ≠ (S.pidns, S.initStart) and P.initStart < S.initStart; termination evidence for P's container instance excludes the dead-shim path.
+- (b′): P.pod = S.pod and P.boot ≠ S.boot.
+
+**Why they fail.** Both examine only P, not the instances between P and S, nor S's own earlier instances. Scenario: S0 writes the pod record (X terminal); S0 dies on the dead-shim path (`prds/1860-pod-epoch-writer-exclusion.md:231`, "On this path no shim reaps init, and if `runc delete --force` failed, init may still be alive.") with a delayed git child; kubelet starts S1 in the same pod; S1 restores over P in X. E3 would pass on S0's record and E7 cannot see the orphan. The same holds for (b) with any instance between P and S, and for (b′) with an earlier instance on S's boot.
+
+**What eligibility needs.**
+1. Q4 decided.
+2. An evidence source that covers every earlier container instance in the pod (for (b)) or on S's boot (for (b′)): termination evidence bound to each instance's container ID and restart count. Pod status alone is not enough, because kubelet keeps only the last termination of each container (`lastState`); that it keeps no longer history is **inferred** from the Kubernetes pod-status API and owed (8.2).
+3. The identity fields recorded per process, in a new boundary-record version: boot ID, own PID-namespace device and inode, and PID 1's start time. Their kernel properties are inferred and owed (5.3 check 1): one init per namespace for its life, inode reuse only after the namespace is gone, and the same-tick case, where an equal (inode, init start) pair must refuse. Records of the interim version lack them and so never qualify (fail-safe).
+4. For #3644's same-source takeover, Q3's answer on DinD-started containers (section 7).
 
 ## 7. Predecessor-source writers (owner question)
 
@@ -523,7 +560,7 @@ These containers survive a worker-container restart (3.2 (b), inferred).
 - (b) is refused for same-source takeover until the DinD containers started by P's runs are shown to be gone. A DinD-side inventory, or a sidecar restart bound to the worker restart, could supply that proof.
 - Same-source takeover is limited to (c).
 
-This record does not decide it.
+Under the interim contract only (c) is eligible anyway (6(f)), so for now Q3 bears on (c), where the cover of X's sidecar is inferred, and on any future (b) (6(g)). This record does not decide it.
 
 ## 8. Gate B obligations and owed evidence
 
@@ -531,29 +568,36 @@ Every item in this section is **pending, not delivered by Gate A**.
 
 ### 8.1 Implementation obligations (pending, not delivered by Gate A)
 
-**Watch-fail regressions on real child and write seams.** Each one fails on the pre-change tree and passes after it. Each joins every process it owns. No proof is sleep-only.
-- **Posture refusal.** While a killed worker's PID namespace stays alive (a child of the killed worker held in it), admission refuses without qualifying evidence.
-- **Posture teardown.** Real PID-namespace teardown kills a delayed writer before successor admission. Run this in a Linux namespace lane or container lane:
-  1. Block a writer before its `git config` write.
-  2. Kill the namespace's init.
-  3. Attempt successor admission.
-  4. Show that the writer never completes.
+**Watch-fail regressions on real child and write seams.** Every path refuses today, so a refusal regression cannot fail on the pre-change tree. Instead, each watch-fail case runs the restore admission path with one E-condition mutated to pass (an unsafe variant of the predicate) and observes the stale write or the missing refusal; the real predicate then refuses. Each joins every process it owns. No proof is sleep-only.
+- **Second instance in the same pod (the S0/S1 case).** S0 writes the pod record (X terminal) and holds a delayed git child blocked before its `git config` write on the bound bare; S0 is killed while that child stays alive in S0's PID namespace; S1 starts in the same pod and attempts restore over P in X. The real predicate refuses at E3 (S1 is not the pod-record writer). The unsafe variant, with E3's writer check removed, admits S1, and releasing the child shows its stale write landing after S1's attribution.
+- **Posture refusal.** While a killed worker's PID namespace stays alive (a child of the killed worker held in it), admission refuses without qualifying evidence; the unsafe variant with E1 or E5 forced true admits.
+- **Mutated E-conditions.** For each of E1 to E8, one unsafe variant with that condition forced true, each showing the stale write or the missing refusal it guards.
+- **Earlier instance inside X (E11).** X's evidence reports `restartCount` 1 for `worker`: an earlier X worker instance holds a delayed git child blocked before its `git config` write on the bound bare, and P is X's last worker instance. The real predicate refuses at E11. The unsafe variant, with E11 removed, admits S, and releasing the child shows its stale write landing after S's attribution. Controls: `restartCount` 0 for the whole set admits (all other conditions passing); a nonzero count on `seed-nix` or `runner-init` refuses; a nonzero count on `dind`, `dind-init` or `dind-meter` alone does not refuse; a set member missing from the evidence, or a pod record without the counts, refuses.
+- **E11 set pinned to the render (differential test).** E11's container-name set is a second statement of the render's mounts, so a controller render test enumerates every container and init container of a rendered E1-posture pod whose `VolumeMounts` name `data` without `ReadOnly` and without the `runner-shared` subPath, and asserts that list equals E11's set. Cases it must discriminate, each asserted exercised: a whole-PVC mount (`worker`), a whole-PVC init mount (`seed-nix`, `runner-init`), the subPath-only mount (`dind`), and a container with no `data` mount (`dind-init`, `dind-meter`).
 - **Enrollment or isolation variant**, only if the owner chooses (iii) or (iv) instead:
   1. Delay an attribution writer before its config write.
   2. Kill its worker.
   3. Attempt admission.
   4. Release the writer.
 
+**Posture and evidence check (not a product regression).** Real PID-namespace teardown kills a delayed writer before a successor starts. It checks the kernel behaviour the design relies on, not product code. It runs in a mandatory Linux PID-namespace lane:
+1. Block a writer before its `git config` write.
+2. Kill the namespace's init.
+3. Start the successor.
+4. Show that the writer never completes.
+
 **Controls.**
 - a normally joined writer;
 - an enrolled unresolved footprint, which refuses;
 - an unregistered legacy writer as P with no record, which refuses;
 - restart and replay: the record is never rewritten;
-- failed evidence: an `unknown` field, a bad MAC or a missing pod record refuses;
+- failed evidence: a missing pod UID, a bad MAC, an unknown version or a missing pod record refuses;
 - the rollback boundary (6(e)).
 
 **Other obligations.**
-- **Record crash windows.** Cover every row of the 6(d) table through `AuthorityFsOps` injection, with a successor refusal at each.
+- **Record crash windows.** Cover every row of the 6(d) table through `AuthorityFsOps` injection (file sync, directory sync, rename only), with a successor refusal at each. The read-back and the unconditional parent fsync need a test-visible read or a new seam (6(d)).
+- **Restore crash windows.** Cover the window between the durable slot takeover and the bare attribution write (6(b)), showing #3644's fail-closed read.
+- **Pre-consumption writes.** Show that a pod-S instance which exits before epoch consumption has spawned no bare writer (6(a)).
 - **Preservation.** The predecessor's bytes, source epoch, fence, pins, journals and custody stay byte-identical across every refusal.
 - **Discard policy.** The #3644 verified-merge discard policy stays unchanged.
 - **Records.**
@@ -561,11 +605,11 @@ Every item in this section is **pending, not delivered by Gate A**.
   - Recovery-guidance updates in `docs/run-recovery.md` for the new refusal reasons.
 - **Tripwire.** `agent/test/recovery-coordinator.test.ts:507`, `` it(`an unrelated unknown bare does not suppress an ordinary ${boundary} (#3831 tripwire)`, async t => { ``, pins that an unrelated unknown bare does not suppress an ordinary pin or capture. The unknown bare is a symlink to a missing repository, at `:530-531`. [S] Gate B keeps it green by keeping the refusal selective and bound to the run's bare (E10): the predicate runs only at restore admission, for the run's bound bare, and never on the ordinary pin or capture path.
 - **E2E sweep** of states, reasons and ordering through `e2e/phases`, `e2e/lib.sh` and `e2e/forge-fake`.
-  - A sweep for agent kills and recovery holds matched three phases: `e2e/phases/45-bounded-concurrency.sh`, `e2e/phases/52-api-outage-outbox.sh` and `e2e/phases/73-forge-unreachable-park.sh`. The sweep used `grep -l -E 'preservation_failed|foreign-active|kill -s (KILL|SIGKILL) agent|restoreTip|recovery_wait'`.
+  - A sweep for agent kills and recovery holds matched three phases: `e2e/phases/45-bounded-concurrency.sh`, `e2e/phases/52-api-outage-outbox.sh` and `e2e/phases/73-forge-unreachable-park.sh`. The sweep used `grep -l -E 'preservation_failed|foreign-active|kill -s (KILL|SIGKILL) agent|restoreTip|recovery_wait'`. Only phases 45 and 52 restart the agent. Phase 73 matched on `recovery_wait` alone and does not apply: `e2e/phases/73-forge-unreachable-park.sh:39`, "the agent is never restarted; the api sees the healthy forge for every claim + snapshot."
   - Every affected phase left unrun is named, with its reason.
   - Under 6(f) these compose phases refuse restore (Q5).
   - Nightly phases 45 and 52, with phase 52 cases 7 and 8 (#3833), are the combined #3644 acceptance signal [M].
-- **Timing.** Measure the startup cost of the record write (one file fsync and one or two directory fsyncs) and of admission evaluation. The design adds no wait or poll. Any wait that a later revision adds must state its failure-duration tradeoff.
+- **Timing.** Measure the startup cost of the record write (one file fsync and two directory fsyncs) and of admission evaluation. The design adds no wait or poll. Any wait that a later revision adds must state its failure-duration tradeoff.
 - **Landing obligation.** `full agent suite: exact-head PR CI`.
 - **Workflows.** No workflow edits in an agent-dispatched implementation.
 
@@ -574,9 +618,11 @@ Every item in this section is **pending, not delivered by Gate A**.
 | Evidence | Actor | Steps |
 |---|---|---|
 | Runtime and storage compliance | operator | Following the #3430 storage audit, attest the declared runtime on each hosted lane. Also attest that the data storage honours fsync and either enforces attach exclusivity or is node-local. |
-| DinD across an in-pod worker restart | operator with maintainer | On the hosted Docker lane, start a long-running container from a run and restart the worker container. Record whether the sidecar and that container survive, and what each mounts: compare `docker inspect` mounts with `render_dind.go:80-82`. |
-| No surviving git PID after an OOM or in-pod restart | operator | On containerd-runc and on CRI-O-crun, OOM-kill the worker while a delayed git child runs. Show from a host-side PID-namespace listing that the child is gone before the successor starts. Record the reported exit code and reason, for Q4. |
-| Identity readability | maintainer | On each runtime, confirm that the worker can read the PID-namespace inode, PID 1's start time and the boot ID. Measure how often a restart reuses the old inode. |
+| Earlier instances inside X (E11) | maintainer with operator | Confirm from kubelet source, or live on each declared runtime, that a container's `restartCount` of 0 means no earlier instance of it ran in the pod (including across a kubelet restart). Record how often real replacements report a nonzero count for `worker`, `seed-nix` or `runner-init`, which is how often E11 refuses. |
+| Future (b) only (6(g)): per-instance termination evidence | maintainer with operator | Find or design a source that binds termination evidence to each container instance (container ID and restart count), and confirm live that pod status keeps only the last termination. |
+| Future (b) only: DinD across an in-pod worker restart | operator with maintainer | On the hosted Docker lane, start a long-running container from a run and restart the worker container. Record whether the sidecar and that container survive, and what each mounts: compare `docker inspect` mounts with `render_dind.go:80-82`. |
+| Future (b) only: no surviving git PID after an OOM or in-pod restart | operator | On containerd-runc and on CRI-O-crun, OOM-kill the worker while a delayed git child runs. Show from a host-side PID-namespace listing that the child is gone before the successor starts. Record the reported exit code and reason, for Q4. |
+| Future (b) only: identity readability | maintainer | On each runtime, confirm that the worker can read the PID-namespace inode, PID 1's start time and the boot ID. Measure how often a restart reuses the old inode, and confirm the kernel properties 5.3 check 1 infers. |
 | Kube-native behaviour | operator | Repeat the restart test on the kube-native lane, to inform Q6. |
 | Force delete, node loss, cross-node RWO detach | operator | Record what evidence, if any, the controller delivers. The expected outcome is "ineligible", confirmed live. Cross-node detach is inferred in #1860 and is owed. |
 | #3644 partial M2 | maintainer | Disclose 6d859c55 and d1d34264, and have them independently reviewed against 6(b) and 6(e) before any reuse [M]. |
@@ -586,10 +632,10 @@ Every item in this section is **pending, not delivered by Gate A**.
 - **#3644**: the consumer. It owns the source, pin, attribution, publication and fence contracts.
 - **#3404**: W, slots and the completion fence (Q1).
 - **#3031**: rejected as evidence (5.1).
-- **#1860, #3430, #3431**: the epoch evidence, reused here as the persisted pod-terminal fact.
+- **#1860, #3430, #3431**: the epoch evidence, reused here as the persisted pod-terminal fact. E3 cannot pass, and Gate B cannot enable (c), until #3431 ships an attested, non-shadow epoch verdict; at base only the report-only `runPodEpochShadow` runs (6(b) startup step 4).
 - **#3621**: #3431's live acceptance.
 - **#3709, #3710**: the compose and plain-hosted exclusion proofs (Q5, Q6).
-- **#3213**: an overlap named by the maintainer. `git grep -n '#3213' -- prds adr docs specs` finds nothing in this clone [M].
+- **#3213**: an overlap named by the maintainer. `git grep -n '#3213' -- prds adr docs specs ':!prds/3831-bare-writer-exclusion.md'` finds nothing in this clone [M].
 - **#3833**: phase 52 cases 7 and 8.
 
 Gate B re-reads `prds/3430-pod-epoch-lock-shadow.md` and `prds/3431-pod-epoch-reclaim.md` at its own base (4.5). It serializes behind the in-flight runs eb39666b (#3859) and c13948f0 (#3885) [M].
@@ -602,15 +648,15 @@ Gate B re-reads `prds/3430-pod-epoch-lock-shadow.md` and `prds/3431-pod-epoch-re
 2. **Q2 (from 4.3).** Does the 2026-10-24 older-pod-survivor residual extend to restore attribution in a live bare?
    - Refusing whenever more than one epoch separates P from S does not close this residual: an older pod's survivor could write the bare whoever P is.
    - So the real choice is between accepting the residual and refusing restore on every lane.
-3. **Q3 (from section 7).** Must the proof cover writers into the predecessor's source clone for #3644's same-source takeover? If so, how are DinD-started containers handled in (b)?
-4. **Q4.** The in-pod restart (b) inherits the dead-shim residual, and an OOM-killed worker container exits 137. Choose one:
+3. **Q3 (from section 7).** Must the proof cover writers into the predecessor's source clone for #3644's same-source takeover? If so, how are DinD-started containers handled in a future (b)?
+4. **Q4.** The in-pod restart (b) inherits the dead-shim residual, and an OOM-killed worker container is expected to exit 137 too (inferred, owed). (b) and (b′) are NOT ELIGIBLE in the interim contract, and stay so until this is decided AND an evidence source covers every earlier container instance in the pod or boot (6(g)). Choose one:
    - accept the residual for in-pod restarts; or
-   - require new controller evidence of each restart's termination status (for example reason `OOMKilled`) before (b) is eligible.
+   - require new controller evidence of each instance's termination status (bound to container ID and restart count; for example reason `OOMKilled`) before (b) is eligible.
 5. **Q5.** Compose has no evidence that the containers before the current one are gone. Choose one:
    - accept Docker's stop-before-recreate ordering (inferred) as a residual, and add a verified compose container-instance identity; or
    - refuse compose. Phases 45 and 52 then cannot be the restore acceptance signal.
 6. **Q6.** Confirm that the kube-native lane and every single-uid start refuse.
-   - Single-uid is the hosted default (`render.go:573-575`), so the default hosted fleet would refuse.
+   - Single-uid is the hosted default (`render.go:573-575`; `controller/internal/config/config.go:198-199`, `UZI_WORKER_UID_SPLIT`, default false), so the default hosted fleet would refuse.
    - The alternative is to accept ADR-3153's single-uid subPath residual for restore.
 7. **Q7.** Should a rootful DinD daemon's device-level reach (`adr/3153-runner-shared-pvc-subpath.md:59`, "It does not bound a rootful daemon's device-level reach") be accepted as a restore residual, or should rootful DinD postures refuse?
 8. **Q8.** Should these be accepted as operator residuals?
@@ -618,15 +664,17 @@ Gate B re-reads `prds/3430-pod-epoch-lock-shadow.md` and `prds/3431-pod-epoch-re
    - an operator's git;
    - an out-of-band pod running another build.
 9. **Q9.** There is one boundary record per worker start. Should records that no slot names be pruned (fail-safe, because absence refuses), or should they stay unbounded?
-10. **Q10.** Confirm that the first restart after upgrading to the gated build stays non-restorable, because P has no record.
+10. **Q10.** Confirm that the first pod replacement after upgrading to the gated build stays non-restorable, because P has no record.
 
 ### 9.2 Decision Log
 
 | Date | Decision (PROPOSED, not approved) | Why | Rejected alternative |
 |---|---|---|---|
-| 2026-11-04 | Take branch 1 ("permanently unable") via build-independent PID-namespace teardown evidence; rely on no held boundary. | A dead namespace's processes cannot return. The issue's non-evidence list excludes every held signal available today. | A held boundary: EX ends before admission, and W is per-process and listed as non-evidence. |
-| 2026-11-04 | Adopt (i′): a write-once boundary record per worker process, a write-once pod record persisting the attested predecessor-terminal fact, and the E1 to E10 predicate. | The smallest design covering (b) and (c): two records and one evaluator. | (ii) offers only non-evidence. (iii) leaves the predecessor's keys writable. (iv) blocks on every crash and misses legacy writers. |
-| 2026-11-04 | The boundary-stamp hypothesis (5.3) is adopted in part, with three changes. W is dropped as death evidence. The "since the last stamp-less write" rule is replaced by "P's record must exist" plus teardown evidence. The identity is strengthened with PID 1's start time. | W proves release on one kernel only. A stamp-less build leaves no trace. Namespace inode numbers are reused. | The hypothesis as stated. |
-| 2026-11-04 | Supported postures: the hosted Docker lane with uid-split, where P ran in an earlier container instance of S's pod or in X. Everything else refuses until the owed evidence and the owner answers exist. | Only these postures have a defined evidence chain. | Refusing every posture with no route forward. |
-| 2026-11-04 | Store both records in `.uzi-authority`, written in the store's order: tmp, fsync, rename, directory fsync, read-back. Absence or any failure refuses. | Reuses an audited durable-write path, and every failure mode refuses. | Records in the bare's config, which the writers in question can change. |
+| 2026-11-04 | Take branch 1 ("permanently unable") via build-independent pod-terminal evidence for X, for the first worker instance of the new pod only; rely on no held boundary. | A dead namespace's processes cannot return. The non-evidence named by the issue body and the approved plan excludes every held signal available today. | A held boundary: EX ends before admission, and W is per-process and named as non-evidence. |
+| 2026-11-04 | Adopt (i′): a write-once boundary record per worker process (incarnation, pod UID), a write-once pod record persisting the attested predecessor-terminal fact and naming its writer incarnation, and the E1 to E11 predicate. | The smallest design covering (c): two records and one evaluator. | (ii) offers only non-evidence. (iii) leaves the predecessor's keys writable. (iv) blocks on every crash and misses legacy writers. |
+| 2026-11-04 | The boundary-stamp hypothesis (5.3) is adopted in part, with three changes. W is dropped as death evidence. The "since the last stamp-less write" rule is replaced by "P's record must exist" plus teardown evidence. The namespace identity fields (inode, PID 1 start time, boot ID) move to the future-(b) path (6(g)). | W proves release on one kernel only. A stamp-less build leaves no trace. The interim contract does not read the identity fields, and records without them only refuse a future (b). | The hypothesis as stated. |
+| 2026-11-04 | Narrowing after review: the in-pod restart (b) and the boot-ID fallback (b′) are NOT ELIGIBLE until Q4 is decided and an evidence source covers every earlier container instance in the pod or boot. | Both examined only P: an earlier instance of S's own pod (S0, dead-shim path, delayed git child) could still write while S1 restores (6(g)). | Admitting (b) and (b′) on P's identity alone. |
+| 2026-11-04 | (proposed) Close the former open question Q11 in the contract: E11 requires X's evidence to report `restartCount` 0 for `worker`, `seed-nix` and `runner-init`, the X containers that mount the `data` PVC read-write beyond the `runner-shared` subPath; anything else, including an absent count, refuses. `dind` is excluded. | X's evidence certifies only the last instance of each container (`prds/3430-pod-epoch-lock-shadow.md:245`), so an earlier X worker instance that died on the dead-shim path with a delayed git child was the same hole the S0/S1 narrowing closed for pod S. The #3430 evidence already carries per-container `restartCount` (`pod_epoch_evidence.go:24`, `pod-epoch-evidence.ts:105`). `dind` mounts only `/data/runner`, which under uid-split cannot reach the bare (6(f) E11). | Leaving it as an owner question to accept as a residual alongside Q2: an in-pod survivor of X is not an older-pod survivor, and the evidence to refuse it already exists. |
+| 2026-11-04 | Supported posture: the hosted Docker lane with uid-split, where S wrote its pod's record and P ran in X. Everything else refuses until the owed evidence, #3431's attested authority and the owner answers exist. | Only this posture has a defined evidence chain. | Refusing every posture with no route forward. |
+| 2026-11-04 | Store both records in `.uzi-authority`, written in the store's order: unconditional parent fsync, tmp, fsync, rename, directory fsync, caller read-back. Absence or any failure refuses. | Reuses an audited durable-write path, and every failure mode refuses. | Records in the bare's config, which the writers in question can change. |
 | 2026-11-04 | Gate A changes no behaviour. Restore stays disabled; `admitSourceUse` and `preservation_failed` are unchanged. | Design-only scope. | Shipping any part before owner approval. |
