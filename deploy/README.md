@@ -597,7 +597,7 @@ retried on later ticks), `pvc-expand-skipped` (for example `class-not-expandable
 `class-lookup-forbidden`, `no-storage-class`), `pvc-expand-failed` (for example
 `reason=forbidden` when the namespace quota is exhausted) and `pvc-resize-pending` /
 `pvc-resize-failed`. The filesystem finishes online on a driver that supports it;
-otherwise it stays pending until the worker's next normal idle roll remounts the volume.
+otherwise it stays pending until the next independently authorized idle roll (for example an image or spec change rolled while idle, or an operator-initiated idle restart per the supported procedure) remounts the volume. Expansion itself never triggers a roll.
 The controller never forces a restart. With `workers.storageClassRead.create=false`, custom
 RBAC or an older chart the class lookup is refused and expansion fails closed
 (`class-lookup-forbidden`). The manual procedure below remains for operators and edge cases.
@@ -614,10 +614,11 @@ cover 20 restricted workers at `20 x (50 + 20) = 1400Gi` and 10 Docker workers a
 10 Docker workers. The isolated lane needs 600Gi for ten run-bound workers
 (`10 x (40 + 20)`), with a PVC ceiling of at least 40Gi. Its chart guard also checks
 run-bound data overrides. Allow budget for existing claims and their requested growth: a
-Docker quota override kept at 900Gi refuses the 50Gi DinD growth, logged as
-`pvc-expand-failed reason=forbidden`. The per-claim `limitRange.maxPVCStorage` ceiling rests
-on the controller's boot check and the chart guards; Kubernetes' LimitRanger may not
-re-validate a PVC update, which has not been verified on a live cluster.
+Docker quota kept at 900Gi can refuse the growth once the tier's claims reach the quota
+(a full 10-worker `l` fleet needs 1200Gi); the refusal is logged as `pvc-expand-failed reason=forbidden`.
+A request above the namespace LimitRange `maxPVCStorage` is expected to be refused at admission on
+update (logged `pvc-expand-failed reason=forbidden`); this has not been verified on a live cluster.
+The controller's boot check and the chart guards keep targets within the ceiling.
 
 The `l-highmem` worker size (#3383) requests 24Gi and is limited to 32Gi of memory.
 Before using it, raise any per-cluster override of `limitRange.max.memory` on all
