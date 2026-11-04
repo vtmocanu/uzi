@@ -1,6 +1,6 @@
 # PRD #3831: Prove bare-writer exclusion before enabling saved-pin restore (Gate A design record)
 
-**Status**: Draft, Gate A, awaiting maintainer review. Design only: no implementation is authorized by this record. M1 (sections 1 to 4: scope, writer inventory, per-posture verdicts, epoch-evidence reuse) is written; sections 5 to 9 are pending M2. Every cite is `file:line` at base 7b0478c3 with the quoted line.
+**Status**: Draft, Gate A, awaiting maintainer review. Design only: no implementation is authorized by this record. M1 (sections 1 to 4: scope, writer inventory, per-posture verdicts, epoch-evidence reuse) and M2 (sections 5 to 9: design comparison, the PROPOSED contract, predecessor-source writers, Gate B obligations, owner questions and Decision Log) are written. Section 6 is a proposal for owner approval, not an approved contract. Every cite is `file:line` at base 7b0478c3 with the quoted line.
 
 **Evidence classes** used throughout, kept apart:
 
@@ -125,7 +125,7 @@ Writers outside the worker binary are not in the table and are invisible to ever
 
 **Conclusion.** `assertBareClear` cannot exclude an older unenrolled writer. It proves only that no compatible process left a covered ref delete `running`. A stable-release binary, an orphan git child of a dead worker, an operator's git and, on a single-uid start, a runner-uid tool process all write the bare's journal, attribution keys and refs without any record that the check could see. Any exclusion that restore relies on must therefore come from process-lifetime teardown, not from bare records.
 
-**Scope of this finding against the spec.** `specs/human.md:1414` treats "a per-source fence in the completing bare journal" as part of the durable authority that releases a #3404 completion source, and that fence's writer, `installCompletionSourceFence`, is UNCOVERED in 2.3. This record's finding bears on restore admission only. It does not itself change the #3404 rule, which stays the owner's decision. **Owner question:** does an unenrolled writer of the completion fence also weaken the #3404 release rule, and if so, is that tracked under #3404 rather than here?
+**Scope of this finding against the spec.** `specs/human.md:1414` treats "a per-source fence in the completing bare journal" as part of the durable authority that releases a #3404 completion source, and that fence's writer, `installCompletionSourceFence`, is UNCOVERED in 2.3. This record's finding bears on restore admission only. It does not itself change the #3404 rule, which stays the owner's decision. **Owner question (section 9, Q1):** does an unenrolled writer of the completion fence also weaken the #3404 release rule, and if so, is that tracked under #3404 rather than here?
 
 ## 3. Per-posture verdicts
 
@@ -184,7 +184,7 @@ The gap common to every posture is the lack of an identity the successor can ver
 
 - `prds/3431-pod-epoch-reclaim.md:11`, "It does not exclude every historical writer: an older pod's process may survive its termination and still write after a later evidenced epoch. The owner accepted that residual on 2026-10-24." [I]
 - It was accepted for **deleting settled trees**, where a stray write does bounded damage. Nothing records it as accepted for **attribution and journal writes in a live bare**, which a restore would trust. Search: `git grep -n '2026-10-24' -- prds adr specs docs ':!prds/3831-bare-writer-exclusion.md'` gives 121 lines; filtering them with `grep -i -E 'survivor|historical writer|older.pod'` leaves five: `prds/3430-pod-epoch-lock-shadow.md:142`, `:450` and `prds/3431-pod-epoch-reclaim.md:11`, all about the epoch proof for reclaim, plus `prds/done/1232-completion-interlock-integration.md:5` and `:175`, where "survivor" means a mutation-test survivor and is unrelated. A prose search can miss a differently worded acceptance. A reuse of the epoch proof must not inherit the residual silently.
-- **Owner question (for Gate A).** Does the 2026-10-24 older-pod-survivor residual extend to restore attribution in a live bare, or must restore close it (for example by refusing whenever more than one epoch separates the writer of the saved pin from the restorer)?
+- **Owner question (for Gate A; section 9, Q2).** Does the 2026-10-24 older-pod-survivor residual extend to restore attribution in a live bare, or must restore close it (for example by refusing whenever more than one epoch separates the writer of the saved pin from the restorer)?
 
 ### 4.4 #3031 maintenance exclusion
 
@@ -200,26 +200,433 @@ The gap common to every posture is the lack of an identity the successor can ver
   - `adr/1783-run-quiescence-and-attempt-clone-paths.md:1336-1337`, "Docker accepted-but-invisible creates (#1860) and unregistered or sibling writers are unchanged".
   - `specs/human.md:1414`, "Docker accepted-but-invisible creates (#1860), unregistered/sibling writers, Claude terminal proof, per-attempt cgroups (#1862) and reclaim/custody (#1858, #2746) remain open".
 
-**Reuse verdict.** The epoch proof can be reused at most for a restore that runs inside the startup EX window of a fresh pod on the DinD lane, before admission, and only if the owner extends the 2026-10-24 older-pod-survivor residual to restore attribution (4.3); otherwise not at all. It never covers (a), (b) or (d), nor a later restore in (c). Anything else needs new evidence, which M2 designs.
+**Reuse verdict.** The epoch proof can be reused at most for a restore that runs inside the startup EX window of a fresh pod on the DinD lane, before admission, and only if the owner extends the 2026-10-24 older-pod-survivor residual to restore attribution (4.3); otherwise not at all. It never covers (a), (b) or (d), nor a later restore in (c). Anything else needs new evidence, which sections 5 and 6 design.
 
 This record's findings bear on restore admission only; they do not change the #3404 completion-source rule in `specs/human.md:1414` (see the owner question at the end of 2.4).
 
-## 5. Candidate exclusion designs
+## 5. Smallest-design comparison
 
-Pending M2.
+**Bar.** Each option is judged against:
+- the 6(a) invariant;
+- the postures of section 3;
+- legacy writers. Every stable-release binary and every build before cc125a82 writes the bare with no W and no record (2.4). A build without this design's new record also leaves no trace of itself.
 
-## 6. Recommendation
+The options are taken from smallest to largest. A larger option is considered only after each smaller one is shown to fail, or to hold only in part. By size the order is (ii), (i), the boundary-stamp variant of (i), (iii), (iv).
 
-Pending M2.
+### 5.1 (ii) Reuse #3031's bounded writer exclusion (no new state)
 
-## 7. Owed evidence and acceptance
+- **Proves.** Inside the worker's own PID namespace, no other process exists while the producer's boundary is held. The worker is idle behind its closed claim gate (4.4). [I]
+- **Postures.** None for an older writer. An older writer lives in another PID namespace: an earlier container, possibly surviving, or another pod. A worker-local scan cannot see it (4.4, inferred). In (a0) in a container, the scan can at most observe that no orphan is visible in the successor's own namespace.
+- **Invariant.** Neither branch. It offers PID absence from one or a few scans. The issue lists "PID absence", "a single observation" and "repeated empty snapshots" as non-evidence. Its hold ends with the producer's boundary, not with restore's later authoritative use.
+- **Persisted state.** None.
+- **Legacy.** Blind to every writer outside its namespace, of any build.
+- **Cost.** Reuse only. The producer is disabled: `agent/src/recovery.ts:127`, `export const TERMINAL_ORIGIN_ADMISSION_ENABLED: boolean = false;`. [S]
+- **Verdict. Reject**, not a component.
 
-Pending M2.
+### 5.2 (i) Recorded incarnation boundary plus posture predicate, reusing #3430/#3431 as shipped
 
-## 8. Open questions for the owner
+- **Proves.** At a fresh pod's first worker start, before admission: the immediate predecessor pod X is terminal, with every container exited under the allowlist; no pod lies between; no concurrent participant holds SH (4.1). [I] A terminal pod never runs again, so "X is terminal" is a permanent fact, not a held boundary.
+- **Postures.**
+  - (c): only the first worker, only before admission (4.1).
+  - (b): nothing. The pod UID is unchanged and the epoch never reopens (`prds/1860-pod-epoch-writer-exclusion.md:43`, "A worker container restart, an interrupted reclaim or any uncertainty never reopens it."). [I]
+  - (a), (a0), (d): no evidence is rendered (3.2).
+- **Invariant.** Branch 1 for X's processes, subject to the older-pod survivor residual (4.3). As shipped it is unusable at claim time:
+  - Only the consumption is stored, never the evidence (4.2).
+  - The EX under which the fact was established ends before admission (`prds/3430-pod-epoch-lock-shadow.md:179`, "Once that pass has settled, S closes EX and takes SH (bounded) with admission still closed, and only then opens admission."). [I]
+  - The design must not treat that EX hold as a boundary. The issue lists it as non-evidence.
+- **Persisted state.** As shipped, only the volume-global consumption ledger (4.2).
+- **Legacy.** Build-independent: the evidence is kubelet-reported pod status, so X's processes are covered whatever build X ran. This is **inferred** from where the evidence comes from.
+- **Cost.** Reuse only.
+- **Verdict. Holds in part. Component.** The pod-terminal fact is reused (section 6) once it is persisted and attributed (5.3). On its own, (i) covers neither (b) nor any restore after admission.
 
-Pending M2.
+### 5.3 A per-process boundary stamp (variant of (i)), tested
 
-## 9. Decision Log
+**The hypothesis as given:**
+- Each worker process records a durable stamp once at startup, under W, before any bare writer can spawn.
+- The stamp binds `PROCESS_INCARNATION` to the process's PID-namespace inode, boot ID and container or pod identity.
+- At restore admission, consider every stamp recorded since a stamp-less build last touched the bare. The successor S requires each stamp to be either its own, or to name a namespace that is provably gone. A namespace is gone if it has a different boot ID, or if it differs from S's namespace and its node process is dead (S holds W) in a supported container posture.
+- A bare written by a stamp-less build is ineligible. A non-container posture refuses.
 
-Pending M2.
+**Checks.**
+
+1. **Namespace inode reuse.** The kernel's proc inode allocator hands freed namespace inode numbers out again, so a number is unique only among live namespaces. This is **inferred** from kernel behaviour; the kernel source was not read here.
+   - **Equal inode, same boot.** "Same namespace" and "reused after death" cannot be told apart, so S must refuse. The (a0) same-container respawn looks exactly like this: same pod UID, same boot ID, same inode, and P's orphans share S's namespace. Refusal is the right outcome there.
+   - **Different inode, same boot.** This proves a different namespace. It does not by itself prove that namespace is dead.
+   - **Proposed strengthening.** Also record PID 1's start time as seen inside the namespace (clock ticks since boot). A PID namespace has one init for its whole life, so the pair (inode, init start) names one namespace instance within a boot. An equal inode with a different init start then proves the earlier namespace was freed, because a number is reused only after its namespace is gone. That PID 1's start time is readable inside the container is **inferred** and owed (8.2).
+2. **W proves release, not death.** W is a kernel lock on Node's own open file description: `agent/src/authority-lock.ts:12`; `:351`, "Strong references keep the descriptors (and so the kernel locks) alive until exit."; `:364`, "The returned capability has no release." [S]
+   - S holding W proves only that no compatible process on this kernel still holds it. That implies P's Node process exited on this kernel.
+   - It says nothing about P's git children (2.2), about a process on another kernel, or about a stamp-less build, which never takes W.
+   - The issue lists "a released worker lock" as non-evidence. **This part fails.** The death argument must instead come from namespace teardown: container-instance ordering within one pod, and pod-terminal evidence across pods.
+3. **DinD-started containers.** Containers started by the inner dockerd are outside the worker's PID namespace and survive a worker-container restart (3.2 (b), inferred). No stamp names them and the teardown argument does not reach them. As rendered they cannot reach the bare (`controller/internal/kube/render_dind.go:80-82`). The two residuals from 3.2 (b) remain:
+   - **The single-uid subPath swap.** It is closed under uid-split (`render_dind.go:65-66`, "That uid already holds all of /data;" / "under uid-split no untrusted identity can write /data."). [S]
+   - **A rootful daemon's device-level reach.** This needs owner acceptance (Q7).
+
+   These containers do reach the predecessor's source clones (section 7).
+4. **Runner-uid processes in single-uid mode.** P's runner-uid processes live in P's container PID namespace and die with it, so as older writers they are covered by the same teardown.
+   - Single-uid adds check 3's subPath swap. Through it, a DinD-started container that survives a worker restart can reach the bare.
+   - On the hosted lane the default is single-uid, because uid-split is opt-in: `controller/internal/kube/render.go:573-575`, "UIDSplit opts into the Codex uid-split worker profile (PRD #1493 M1). When true the" / "worker + seed-nix containers start as root ...". [S]
+   - So requiring uid-split refuses the default hosted fleet (Q6).
+5. **Permanently unable, or a held boundary?** Once a PID namespace is gone, its processes are dead and cannot return. That is branch 1, with no held boundary. It holds only where the namespace's end is shown by evidence, not by inference.
+   - In-pod restart ordering carries the dead-shim residual: `prds/1860-pod-epoch-writer-exclusion.md:231`, "On this path no shim reaps init, and if `runc delete --force` failed, init may still be alive." [I]
+   - Pod evidence closes that residual for pod replacement only, by refusing exit codes 137 and 255.
+   - An OOM-killed worker container also exits 137, so that rule cannot be reused unchanged for in-pod restarts (Q4).
+6. **The legacy rule is not computable.** "Every stamp since the bare was last touched by a stamp-less build" needs the time of the last stamp-less write. A stamp-less build leaves no trace, so a rollback followed by a roll-forward is invisible in the stamp set. **This part fails.**
+   - Teardown evidence, however, is build-independent. A legacy process in an earlier container of S's pod, or in the evidenced predecessor pod X, is dead whatever it ran.
+   - A legacy process cannot share S's container instance, because one container instance runs one image.
+   - **The rule becomes:** a missing record for P refuses. Every other older writer is covered only by build-independent teardown, never by enumerating stamps.
+7. **A different boot ID.**
+   - **Within one pod UID,** it means the node rebooted, because a pod stays on one node for its life. This is **inferred** from Kubernetes scheduling semantics. Every process of the earlier boot is then dead.
+   - **Across pod UIDs,** it proves nothing: it may be another node, still running. That is the cross-node RWO residual (`prds/1860-pod-epoch-writer-exclusion.md:248`, "Cross-node reuse waits for detach ... *inferred*, not traced to the end."). [I]
+   - Across pods, only pod-terminal evidence counts.
+8. **Is it smaller than (iv)?** Yes.
+   - The stamp design is two write-once records plus one evaluator at a single admission point.
+   - (iv) enrolls and joins every one of the 23 restore-relevant UNCOVERED rows and the 3 GATED rows in 2.3 (counted on this file with `grep -c -E '\| UNCOVERED \| yes \|$'` and `grep -c -E '\| GATED, not enrolled \| yes \|$'`, which anchor on the row end so this sentence does not match itself). Each of them leaves a blocking record when its parent crashes (5.5).
+
+**Verdict on the hypothesis: holds in part; adopted with three corrections.**
+1. W is dropped as death evidence.
+2. The stamp only locates P and detects a same-namespace predecessor. Death comes from container-instance ordering (same pod) or from persisted pod-terminal evidence (the predecessor pod).
+3. The uncomputable "since the last stamp-less write" rule is replaced by two rules: P's record must exist, and every other older writer is covered by build-independent teardown.
+
+The identity is also strengthened with the init start time. Any posture outside a uid-split hosted Docker lane refuses.
+
+### 5.4 (iii) Isolating restore mutations from old writers
+
+- **Proves.** Only that the successor's own new writes land where an older writer cannot reach. Two such places exist:
+  - The authority store: 0700, MAC'd, outside the bare, and unknown to builds before cc125a82 (`agent/src/completion-authority.ts:25-29`). [S]
+  - A successor-private bare.
+- **Postures.** None gained.
+- **Invariant.** Not met.
+  - Stale `uzi-recovery.<branch>.*` writes still land on the predecessor's journal keys that restore reads: `agent/src/git.ts:8691`, `await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), value]);`.
+  - #3644's contracts bind to state that lives in the bare: the episode pin and `restoreTip` (`git.ts:9145`); the retained source clone, whose objects resolve through the bare (`git.ts:4006`, `["clone", "--shared", "--no-checkout", "--", barePath, clonePath]`); the per-source fence in the bare journal (`specs/human.md:1414`); and publication, which pushes from the bare. [S]
+  - Copying that state out at admission is "a single observation" of state that a live writer may be part-way through changing, for example a `memoryPark` draft (2.3) or a hand-made `config.lock` before rename (`git.ts:11822`, `await fs.rename(lockPath, cfgPath);`).
+- **Persisted state.** A second store holding copies of the journal, pins and objects.
+- **Legacy.** Legacy writers still write the predecessor's keys.
+- **Cost.** Every #3644 read and the publication path would have to be re-homed. Large.
+- **Verdict. Reject**, and not needed as a component. Under the chosen design no older writer is alive, so successor attribution can stay in the bare under #3644's contract.
+
+### 5.5 (iv) Durable pre-launch enrollment of every relevant bare writer (largest)
+
+- **Proves.** Every enrolled write either settled after a joined child, or left a `running` record that `assertBareClear` sees (`agent/src/authority-runtime.ts:1056-1057`). [S]
+- **Postures.** All, but only for compatible builds.
+- **Invariant.** Neither branch on its own.
+  - A dead parent's `running` record cannot be released without proof that its orphan is dead. That proof is exactly what (i′) supplies.
+  - Without that proof the record blocks indefinitely: `adr/1783-run-quiescence-and-attempt-clone-paths.md:1318-1320`, "No process scan, PID absence or empty lock holder clears it." [I]
+  - A crash or OOM is exactly when restore is wanted, so (iv) alone turns the target case into a permanent block.
+- **Persisted state.** A pending record per write. Each slot write already costs a head-shard write, so four barriers in all (`completion-authority.ts:38-41`, "each slot write costs two extra barriers (a" / "file fsync and a directory fsync) on top of the slot's own two."). [S] These records would sit on paths that write the journal many times per run.
+- **Legacy.** Recording only new writers leaves every stable-release writer and every writer before cc125a82 unrecorded. A legacy rule is still needed, and that rule is (i′)'s evidence.
+- **Moving parts.** 23 restore-relevant UNCOVERED rows, 3 GATED rows, joined settlement for unknown exits, and recovery of every crash window.
+- **Verdict. Reject**, both standalone and as a component. Once (i′) holds, (iv) adds blocking and no protection.
+
+### 5.6 Selection
+
+Why each alternative falls short:
+- (ii) offers only non-evidence.
+- (i) as shipped covers one posture, and only at startup.
+- The hypothesis as stated fails on W and on the legacy rule.
+- (iii) leaves the predecessor's keys writable.
+- (iv) cannot release a dead parent's record and does not reach legacy writers.
+
+**Chosen: (i′)**, which is (i) plus the corrected hypothesis. It has three parts:
+- a per-process boundary record;
+- a per-pod record that persists the attested predecessor-terminal fact;
+- a finite posture predicate.
+
+It is the smallest combination that closes the in-pod restart (b) and predecessor-pod (c) cases. Every other posture refuses.
+
+## 6. Chosen contract (PROPOSED, not approved)
+
+This section is a proposed contract for owner approval. No implementation is authorized.
+
+### 6(a) Invariant and branch
+
+The invariant, verbatim from the issue (issue #3831 body, Gate A section): "Before successor mutation starts, every relevant older writer must be permanently unable to commit stale writes, or a continuously held exclusion/isolation boundary must prevent those writes throughout the protected operation and its subsequent authoritative use."
+
+- **Branch taken: the first ("permanently unable").** Every relevant older writer ran in a PID namespace that is shown to be gone. That namespace belonged to one of:
+  - an earlier instance of S's worker container;
+  - an earlier boot of S's node;
+  - the evidenced terminal predecessor pod X.
+
+  The processes of a dead namespace cannot write again. No held boundary is relied on.
+- **W.** W stays held for the process lifetime under its existing #3404 contract:
+  - owner: the worker process;
+  - binding: `<dataDir>/.uzi-authority/worker.lock`;
+  - release: only at process exit.
+
+  This design uses W only so that its own record writes are uncontended. W is not evidence about older writers.
+- **Non-evidence.** The issue lists these [M]: "a single observation", "repeated empty snapshots", "PID absence", "a released worker lock", "a timer", "`config.lock`", and "an epoch EX hold that ends before admission".
+  - The predicate consumes none of them.
+  - It reads only two kinds of input: identities that each process recorded about itself, and the pod-terminal fact persisted from attested evidence.
+  - It does not read EX ownership. X's terminal status stays true after EX closes.
+
+### 6(b) Admission point and race ordering
+
+**Startup, once per worker process:**
+1. Acquire W: `agent/src/main.ts:433`, `installWorkerLifetime(await acquireWorkerLifetime(config.dataDir, { signal: controller.signal }));`. [S]
+2. Read the process's identity: boot ID; own PID-namespace device and inode; PID 1's start time; `UZI_POD_UID`; `UZI_EPOCH_LOCK`; `UZI_UID_SPLIT`; and the declared runtime. Any field that cannot be read is recorded as `unknown`.
+3. Write the boundary record durably (6(d)). This happens before `ensureRunnerTmpdir` (`main.ts:439`, `const runnerTmp = ensureRunnerTmpdir({ dataDir: config.dataDir });`), before the GitCache exists, and before any registration or claim. [S] If the write fails, the process continues with restore disabled for itself. Its successors find no record, so they refuse.
+4. On the epoch lane only: after an attested (not shadow) fresh epoch verdict, and before admission opens, write the pod record once for this pod UID (6(d)).
+5. Admission opens. Bare writers may now spawn.
+
+**Restore admission**, per claim of a run whose source slot is foreign-active and carries a saved pin (the #3644 entry):
+1. Open an authority transaction A.
+2. Load the slot and let P = `owner.worker`. If P is S, the existing path applies.
+3. Evaluate the 6(f) predicate. Any false, missing, undecodable or unknown input means retain and stop: today's refusal (section 1), and nothing is written.
+4. Run `assertBareClear` on the run's bound bare, inside the same A: `agent/src/authority-runtime.ts:1045`, `async #assertBareClear(bare: string, op: string): Promise<void> {`; refusal at `:1056-1057`. [S] A `running` record refuses.
+5. Refuse on any other unresolved footprint, or any other foreign-active slot, over the bound bare or source. P's own source slot, the one being taken over, is the only exception.
+6. Make the first successor mutation, still inside A: #3644's takeover write of the source slot. It records P, and a digest of P's boundary record, as its basis.
+7. Close A. Write the attribution into the bare (#3644), syncing the bare's `config` and then the bare directory (`agent/src/git.ts:7776-7779`).
+8. Later authoritative reads: no re-check of older writers is needed (branch 1). The existing checks of S's own ownership continue.
+
+**Race ordering.** Steps 2 to 6 run in one A transaction. W excludes any concurrent compatible worker, and every older writer is already dead. No TOCTOU window remains against either.
+
+**Effect on the observed refusal: none in Gate A.** `admitSourceUse` and `preservation_failed` are unchanged (section 1).
+
+### 6(c) No force-clear
+
+- Existing unresolved footprints, `running` records and foreign-active slots are never cleared, rewritten or reclassified to make the predicate pass.
+- A bare that fails the predicate keeps its source and pins until a guarded operator discard: `specs/human.md:1414`, "There is no TTL, size cap, disk-pressure reclaim or generic force-clear; retained bytes are unbounded." [S]
+- The predecessor's partial state, such as a `memoryPark` draft or a leftover `config.lock`, is #3644's to read fail-closed. This design proves only that no older process can still add to it.
+
+### 6(d) Durability and crash recovery
+
+**Persisted properties.**
+- **Boundary record.** For every incarnation of this build that could write the bare, a write-once authenticated boundary record is durable on the data volume before that incarnation's first bare write or slot write.
+- **Pod record.** For a pod whose first worker obtained an attested fresh epoch proof, a write-once record naming the terminal predecessor X is durable before that pod's admission opens.
+
+**Failure model.**
+- **Covered:**
+  - process crash at any instruction (SIGKILL, OOM);
+  - storage or power loss, on supported storage (ext4 or xfs; `agent/src/authority-lock.ts:170`, `export async function requireSupportedStorage(`) whose fsync is honoured. [S]
+- **Not covered:** restoring an old copy of the store. This is out of scope, as it is for slots: `agent/src/completion-authority.ts:68`, "or a full reset), is NOT detected and is out of scope." [S]
+
+**Records** (proposed names and contents):
+
+| Record | Path | Content | Write |
+|---|---|---|---|
+| boundary | `<dataDir>/.uzi-authority/boundaries/<sha256(incarnation)>.json` | version, incarnation, boot ID, PID-namespace dev and inode, PID 1 start time, pod UID, epoch-lock, uid-split and declared-runtime flags, build version; MAC'd under the store key | `writeDurable`, `completion-authority.ts:378-401` |
+| pod | `<dataDir>/.uzi-authority/pods/<sha256(podUid)>.json` | version, S's pod UID, predecessor X, digest of the attested evidence, writer incarnation; MAC'd | same |
+
+Both records are write-once. If the file already exists with different content, the write refuses; an existing record is never rewritten.
+
+**Write and sync order** (`completion-authority.ts:30`, "Writes are tmp(O_EXCL|O_NOFOLLOW) -> file fsync -> rename -> directory fsync -> read back."). [S]
+1. If `boundaries/` or `pods/` is missing, create it, then fsync `.uzi-authority`. Precedent: `ensurePrivateDir`, `completion-authority.ts:453-463`, `if (created) {` ... `try { await ops.syncDir(handle); }`. [S]
+2. Create the tmp file with `O_EXCL`, write it, fsync it.
+3. Rename it into place.
+4. fsync the containing directory.
+5. Read the record back.
+
+This is the same file-then-directory order as `git.ts:7776-7779`: `const config = await fs.open(path.join(barePath, "config"), ...`, then `try { await sync(config, "config"); } ...`, then `const dir = await fs.open(barePath, ... O_DIRECTORY ...`, then `try { await sync(dir, "directory"); } ...`. [S] Admission (startup step 5) opens only after the read-back succeeds.
+
+**State recovered at each crash point.** The table is for the boundary record. The pod record behaves the same, with "pod admission" in place of "first write".
+
+| Crash point | Process crash | Storage or power loss | Outcome |
+|---|---|---|---|
+| before or during directory creation | no record | the directory may be lost | no record; the process had written nothing to the bare |
+| after the tmp fsync, before the rename | stale `.<name>.<uuid>.tmp`, no record | same | no record; nothing written; the tmp file is never read |
+| after the rename, before the directory fsync | record visible | the rename may be lost | either way, the process had not yet passed the barrier and wrote nothing |
+| after the directory fsync and read-back | durable | durable | the first bare or slot write may follow |
+
+So a slot that names P can exist only after P's record was durable. If a record is lost later, the result is absence, and absence refuses. No crash point produces a record that certifies more than it should.
+
+**Recovery ordering and rediscovery.**
+- Startup does no replay, repair or rewrite.
+- The records are inert evidence, read by key at admission: P comes from the slot owner, and the pod record from S's pod UID.
+- A startup sweep may remove stale tmp names, limited to this design's directories. This is fail-safe, because a tmp file is never read.
+
+**Verification (Gate B, 8.1).**
+- Fault injection through the `AuthorityFsOps` hooks (`completion-authority.ts:99-108`) asserts the order file sync, rename, directory sync, read-back, and that admission waits for all four.
+- A process-crash test at each crash point shows that the successor refuses.
+- Neither read-back nor a process-crash test proves survival of storage loss. That rests on ext4 and xfs fsync semantics plus the operator storage audit, which is owed (8.2).
+
+### 6(e) Versions and rollback
+
+- **Older writers** leave no boundary record. They are the stable releases (v0.85.2 and earlier), builds before cc125a82, and W-era builds without this record.
+  - As P, they refuse. So the first restart after an upgrade is never restorable (Q10).
+  - As other older writers, they are covered only by build-independent teardown: earlier container instances of S's pod, and pod X. Older pods remain the 4.3 residual.
+- **Older readers.** Builds without the gate have no restore.
+  - The proposed directories sit beside `enrollment.json`, `heads/` and `slots/`.
+  - The current store lists `.uzi-authority` only to remove stale head staging directories, so it ignores the new entries. See `completion-authority.ts:482-483`, `for (const name of await fsp.readdir(init.dir)) {` / `if (STALE_HEADS_TMP.test(name)) ...`, with `:474`, `const STALE_HEADS_TMP = /^\.heads\.[0-9a-f-]{36}\.tmp$/;`. [S]
+  - Gate B re-verifies this for every W-era release still deployable.
+- **Mixed versions.**
+  - W excludes concurrent compatible workers on one data directory.
+  - Overlapping pods run one image: `prds/3430-pod-epoch-lock-shadow.md:187`, "Pods that overlap on one volume come from the same ReplicaSet, so they run the same image." [I]
+  - An out-of-band pod running another build is an operator residual (Q8).
+- **Rollback to a build without the gate.** Safe. That build has no restore, ignores the records and leaves them in place. After a roll-forward, the rollback-era incarnations have no record and refuse as P.
+- **Undecodable or new metadata.** A record with an unknown version, a bad MAC (for example after a worker-token change) or unknown fields is preserved, never rewritten or deleted. The reader refuses eligibility.
+- **Unsupported rollback is refused.**
+  - A build whose predicate version is older than a record's refuses that record.
+  - The attribution journal that restore writes must carry a fence that older workers refuse: `specs/human.md:1414`, "Older workers refuse to attach, recover or discard a journal carrying the fence (accepted rollback fence)." That is #3644's contract, and Gate B checks it.
+- **No silent downgrade and no force-clear.** A missing or failed record never widens eligibility.
+
+### 6(f) Eligibility predicate (every condition must hold)
+
+E1. **Posture.** All of:
+- `UZI_EPOCH_LOCK=1` (`agent/src/main.ts:380`, `const epochEnabled = process.env.UZI_EPOCH_LOCK === "1";`) and `UZI_DATA_DIR=/data`;
+- a declared runtime in {containerd-runc, crio-crun} (4.1);
+- supported storage;
+- uid-split active (`agent/src/runner-uid.ts:72-73`, `export function uidSplitActive(env: NodeJS.ProcessEnv = process.env): boolean {` / `return env.UZI_UID_SPLIT === "1";`). [S]
+
+E2. **S's boundary record** exists, its MAC verifies, its version is known, its incarnation equals `PROCESS_INCARNATION`, and no field is `unknown`.
+
+E3. **S's pod record** exists for S's pod UID and its MAC verifies. It names X from an attested fresh evaluation under EX with `current == S` and `previous == X` (`prds/3430-pod-epoch-lock-shadow.md:179`). [I]
+
+E4. **P's record.** P is the owner of the foreign-active source slot being restored, and P ≠ S. P's boundary record exists, its MAC verifies, its version is known, and no field is `unknown`.
+
+E5. **Exactly one of:**
+- **(b), in-pod restart.** All of:
+  - P.pod = S.pod and P.boot = S.boot;
+  - (P.pidns, P.initStart) ≠ (S.pidns, S.initStart), and P.initStart < S.initStart;
+  - termination evidence for P's container instance excludes the dead-shim path. No such evidence source exists today (Q4).
+- **(b′), node reboot.** P.pod = S.pod and P.boot ≠ S.boot.
+- **(c), predecessor pod.** P.pod = X from E3.
+
+E6. **Anything else refuses.** If P.pod is neither S.pod nor X, refuse.
+
+E7. **`assertBareClear` passes** for the run's bound bare, inside the same A transaction as E1 to E6 and the takeover write.
+
+E8. **No other blocker.** No other foreign-active slot or unresolved footprint touches the bound bare or source (6(c)).
+
+E9. **Accepted residuals.** The owner has accepted Q2 (older-pod survivors), Q7 (DinD device reach) and Q8 (operator-started processes) for restore. Otherwise refuse.
+
+E10. **Scope.** The predicate reads only the run's bound bare and its slots. An unrelated or unknown bare never refuses an ordinary pin or capture (8.1, tripwire).
+
+**Supported postures** (both only under E1, and only once the 8.2 evidence for that posture exists):
+- (b) worker-container restart on the hosted Docker lane;
+- (c) restore over the immediately preceding pod on that lane.
+
+**Refused:**
+- (a0), every case;
+- (a) compose (Q5);
+- (d) kube-native (Q6);
+- the isolated lane;
+- any single-uid start (Q6);
+- an undeclared runtime or unsupported storage;
+- non-container `npm start`;
+- anything not listed.
+
+## 7. Predecessor-source writers (owner question)
+
+Section 6 covers writers of the bare. #3644's parked same-source takeover would also trust the predecessor's source clone under `<dataDir>/runner`, and that clone has a writer the bare does not.
+
+**The extra writer.** Containers started by the inner dockerd mount the runner root:
+- `controller/internal/kube/render_dind.go:53-55`, "The path is the agent's runner-clone root: git.ts sets runnerRoot =" / "<UZI_DATA_DIR>/runner and the run's SDK cwd is a clone under it, so the docker bind" / "source is /data/runner/... COUPLED to agent/src/git.ts; if that root moves, this";
+- `:72`, `dindWorkdirSubPath = "runner-shared"`. [S]
+
+These containers survive a worker-container restart (3.2 (b), inferred).
+
+**Per posture:**
+- **(b).** A container started by P's run can still write P's source clone after S starts, whatever S proves about the bare.
+- **(c).** X's DinD sidecar ended with pod X, so its containers are covered by X's terminal evidence (inferred).
+- **Both.** Runner-uid processes in P's container die with its namespace.
+
+**Owner question (section 9, Q3).** For #3644's same-source takeover, must the proof also cover writers into the predecessor's source clone? If yes, there are two candidate routes:
+- (b) is refused for same-source takeover until the DinD containers started by P's runs are shown to be gone. A DinD-side inventory, or a sidecar restart bound to the worker restart, could supply that proof.
+- Same-source takeover is limited to (c).
+
+This record does not decide it.
+
+## 8. Gate B obligations and owed evidence
+
+Every item in this section is **pending, not delivered by Gate A**.
+
+### 8.1 Implementation obligations (pending, not delivered by Gate A)
+
+**Watch-fail regressions on real child and write seams.** Each one fails on the pre-change tree and passes after it. Each joins every process it owns. No proof is sleep-only.
+- **Posture refusal.** While a killed worker's PID namespace stays alive (a child of the killed worker held in it), admission refuses without qualifying evidence.
+- **Posture teardown.** Real PID-namespace teardown kills a delayed writer before successor admission. Run this in a Linux namespace lane or container lane:
+  1. Block a writer before its `git config` write.
+  2. Kill the namespace's init.
+  3. Attempt successor admission.
+  4. Show that the writer never completes.
+- **Enrollment or isolation variant**, only if the owner chooses (iii) or (iv) instead:
+  1. Delay an attribution writer before its config write.
+  2. Kill its worker.
+  3. Attempt admission.
+  4. Release the writer.
+
+**Controls.**
+- a normally joined writer;
+- an enrolled unresolved footprint, which refuses;
+- an unregistered legacy writer as P with no record, which refuses;
+- restart and replay: the record is never rewritten;
+- failed evidence: an `unknown` field, a bad MAC or a missing pod record refuses;
+- the rollback boundary (6(e)).
+
+**Other obligations.**
+- **Record crash windows.** Cover every row of the 6(d) table through `AuthorityFsOps` injection, with a successor refusal at each.
+- **Preservation.** The predecessor's bytes, source epoch, fence, pins, journals and custody stay byte-identical across every refusal.
+- **Discard policy.** The #3644 verified-merge discard policy stays unchanged.
+- **Records.**
+  - An ADR-1783 amendment recording the branch, the predicate, the residuals and the rollback rules.
+  - Recovery-guidance updates in `docs/run-recovery.md` for the new refusal reasons.
+- **Tripwire.** `agent/test/recovery-coordinator.test.ts:507`, `` it(`an unrelated unknown bare does not suppress an ordinary ${boundary} (#3831 tripwire)`, async t => { ``, pins that an unrelated unknown bare does not suppress an ordinary pin or capture. The unknown bare is a symlink to a missing repository, at `:530-531`. [S] Gate B keeps it green by keeping the refusal selective and bound to the run's bare (E10): the predicate runs only at restore admission, for the run's bound bare, and never on the ordinary pin or capture path.
+- **E2E sweep** of states, reasons and ordering through `e2e/phases`, `e2e/lib.sh` and `e2e/forge-fake`.
+  - A sweep for agent kills and recovery holds matched three phases: `e2e/phases/45-bounded-concurrency.sh`, `e2e/phases/52-api-outage-outbox.sh` and `e2e/phases/73-forge-unreachable-park.sh`. The sweep used `grep -l -E 'preservation_failed|foreign-active|kill -s (KILL|SIGKILL) agent|restoreTip|recovery_wait'`.
+  - Every affected phase left unrun is named, with its reason.
+  - Under 6(f) these compose phases refuse restore (Q5).
+  - Nightly phases 45 and 52, with phase 52 cases 7 and 8 (#3833), are the combined #3644 acceptance signal [M].
+- **Timing.** Measure the startup cost of the record write (one file fsync and one or two directory fsyncs) and of admission evaluation. The design adds no wait or poll. Any wait that a later revision adds must state its failure-duration tradeoff.
+- **Landing obligation.** `full agent suite: exact-head PR CI`.
+- **Workflows.** No workflow edits in an agent-dispatched implementation.
+
+### 8.2 Owed hosted and live evidence (pending, not delivered by Gate A)
+
+| Evidence | Actor | Steps |
+|---|---|---|
+| Runtime and storage compliance | operator | Following the #3430 storage audit, attest the declared runtime on each hosted lane. Also attest that the data storage honours fsync and either enforces attach exclusivity or is node-local. |
+| DinD across an in-pod worker restart | operator with maintainer | On the hosted Docker lane, start a long-running container from a run and restart the worker container. Record whether the sidecar and that container survive, and what each mounts: compare `docker inspect` mounts with `render_dind.go:80-82`. |
+| No surviving git PID after an OOM or in-pod restart | operator | On containerd-runc and on CRI-O-crun, OOM-kill the worker while a delayed git child runs. Show from a host-side PID-namespace listing that the child is gone before the successor starts. Record the reported exit code and reason, for Q4. |
+| Identity readability | maintainer | On each runtime, confirm that the worker can read the PID-namespace inode, PID 1's start time and the boot ID. Measure how often a restart reuses the old inode. |
+| Kube-native behaviour | operator | Repeat the restart test on the kube-native lane, to inform Q6. |
+| Force delete, node loss, cross-node RWO detach | operator | Record what evidence, if any, the controller delivers. The expected outcome is "ineligible", confirmed live. Cross-node detach is inferred in #1860 and is owed. |
+| #3644 partial M2 | maintainer | Disclose 6d859c55 and d1d34264, and have them independently reviewed against 6(b) and 6(e) before any reuse [M]. |
+
+### 8.3 Issue overlap and sequencing
+
+- **#3644**: the consumer. It owns the source, pin, attribution, publication and fence contracts.
+- **#3404**: W, slots and the completion fence (Q1).
+- **#3031**: rejected as evidence (5.1).
+- **#1860, #3430, #3431**: the epoch evidence, reused here as the persisted pod-terminal fact.
+- **#3621**: #3431's live acceptance.
+- **#3709, #3710**: the compose and plain-hosted exclusion proofs (Q5, Q6).
+- **#3213**: an overlap named by the maintainer. `git grep -n '#3213' -- prds adr docs specs` finds nothing in this clone [M].
+- **#3833**: phase 52 cases 7 and 8.
+
+Gate B re-reads `prds/3430-pod-epoch-lock-shadow.md` and `prds/3431-pod-epoch-reclaim.md` at its own base (4.5). It serializes behind the in-flight runs eb39666b (#3859) and c13948f0 (#3885) [M].
+
+## 9. Open owner questions and Decision Log
+
+### 9.1 Owner questions
+
+1. **Q1 (from 2.4).** Does an unenrolled writer of the completion fence also weaken the #3404 release rule? If so, is that tracked under #3404?
+2. **Q2 (from 4.3).** Does the 2026-10-24 older-pod-survivor residual extend to restore attribution in a live bare?
+   - Refusing whenever more than one epoch separates P from S does not close this residual: an older pod's survivor could write the bare whoever P is.
+   - So the real choice is between accepting the residual and refusing restore on every lane.
+3. **Q3 (from section 7).** Must the proof cover writers into the predecessor's source clone for #3644's same-source takeover? If so, how are DinD-started containers handled in (b)?
+4. **Q4.** The in-pod restart (b) inherits the dead-shim residual, and an OOM-killed worker container exits 137. Choose one:
+   - accept the residual for in-pod restarts; or
+   - require new controller evidence of each restart's termination status (for example reason `OOMKilled`) before (b) is eligible.
+5. **Q5.** Compose has no evidence that the containers before the current one are gone. Choose one:
+   - accept Docker's stop-before-recreate ordering (inferred) as a residual, and add a verified compose container-instance identity; or
+   - refuse compose. Phases 45 and 52 then cannot be the restore acceptance signal.
+6. **Q6.** Confirm that the kube-native lane and every single-uid start refuse.
+   - Single-uid is the hosted default (`render.go:573-575`), so the default hosted fleet would refuse.
+   - The alternative is to accept ADR-3153's single-uid subPath residual for restore.
+7. **Q7.** Should a rootful DinD daemon's device-level reach (`adr/3153-runner-shared-pvc-subpath.md:59`, "It does not bound a rootful daemon's device-level reach") be accepted as a restore residual, or should rootful DinD postures refuse?
+8. **Q8.** Should these be accepted as operator residuals?
+   - a worker started by hand inside a live worker container, by exec or in a nested PID namespace;
+   - an operator's git;
+   - an out-of-band pod running another build.
+9. **Q9.** There is one boundary record per worker start. Should records that no slot names be pruned (fail-safe, because absence refuses), or should they stay unbounded?
+10. **Q10.** Confirm that the first restart after upgrading to the gated build stays non-restorable, because P has no record.
+
+### 9.2 Decision Log
+
+| Date | Decision (PROPOSED, not approved) | Why | Rejected alternative |
+|---|---|---|---|
+| 2026-11-04 | Take branch 1 ("permanently unable") via build-independent PID-namespace teardown evidence; rely on no held boundary. | A dead namespace's processes cannot return. The issue's non-evidence list excludes every held signal available today. | A held boundary: EX ends before admission, and W is per-process and listed as non-evidence. |
+| 2026-11-04 | Adopt (i′): a write-once boundary record per worker process, a write-once pod record persisting the attested predecessor-terminal fact, and the E1 to E10 predicate. | The smallest design covering (b) and (c): two records and one evaluator. | (ii) offers only non-evidence. (iii) leaves the predecessor's keys writable. (iv) blocks on every crash and misses legacy writers. |
+| 2026-11-04 | The boundary-stamp hypothesis (5.3) is adopted in part, with three changes. W is dropped as death evidence. The "since the last stamp-less write" rule is replaced by "P's record must exist" plus teardown evidence. The identity is strengthened with PID 1's start time. | W proves release on one kernel only. A stamp-less build leaves no trace. Namespace inode numbers are reused. | The hypothesis as stated. |
+| 2026-11-04 | Supported postures: the hosted Docker lane with uid-split, where P ran in an earlier container instance of S's pod or in X. Everything else refuses until the owed evidence and the owner answers exist. | Only these postures have a defined evidence chain. | Refusing every posture with no route forward. |
+| 2026-11-04 | Store both records in `.uzi-authority`, written in the store's order: tmp, fsync, rename, directory fsync, read-back. Absence or any failure refuses. | Reuses an audited durable-write path, and every failure mode refuses. | Records in the bare's config, which the writers in question can change. |
+| 2026-11-04 | Gate A changes no behaviour. Restore stays disabled; `admitSourceUse` and `preservation_failed` are unchanged. | Design-only scope. | Shipping any part before owner approval. |
