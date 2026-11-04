@@ -7967,7 +7967,8 @@ describe("RunView stored harness decision placement", () => {
       run: run({ status: "queued", harness: "codex", anthropic_secret_label: null, codex_secret_label: null,
         harness_decision: { preferred: "claude", chosen: "codex", reason: "overflow",
           preferred_score: 0, other_score: 60, preferred_measured: null, other_measured: 60,
-          preferred_held: true, other_held: false } }),
+          preferred_held: true, other_held: false,
+          preferred_weekly_reset_at: null, other_weekly_reset_at: null } }),
       messages: [], connected: true, error: "", submit: vi.fn(), refreshRun: vi.fn(), inputs: [], canSteer: false,
     } as unknown as ReturnType<typeof useRunStream>);
     mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });

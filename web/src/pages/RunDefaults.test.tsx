@@ -485,7 +485,7 @@ describe("Run defaults — judge model per harness (PRD #3245)", () => {
     mockApi.getMySettings.mockResolvedValue(judgeSettings());
     renderPage();
     await screen.findByLabelText("Claude judge model");
-    const harnessHelp = screen.getByText(/to let uzi choose your only usable/).textContent ?? "";
+    const harnessHelp = screen.getByText(/to let uzi use your only usable/).textContent ?? "";
     expect(harnessHelp).toContain("Default · automatic");
     expect(harnessHelp).not.toContain("Use my default");
     const harnessOptions = Array.from((screen.getByLabelText("Default harness") as HTMLSelectElement).options).map((o) => o.text);
@@ -1468,10 +1468,50 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     expect(screen.getByLabelText("Codex model")).toBeTruthy();
     expect(within(laneOf("Codex")).getByText("gpt-6.1-sol", { selector: "code" })).toBeTruthy();
     expect(screen.getByLabelText("Codex effort")).toBeTruthy();
-    // Inherit with both usable resolves to Claude (D11), so the badge is on the
-    // Anthropic lane and NOT on the Codex lane (paired positive/negative).
+    // Automatic with both usable is chosen per run by weekly limits: no lane is marked
+    // as the default, and the dedicated badge reads as such.
+    expect(screen.getByText("Chosen per run by weekly limits")).toBeTruthy();
+    expect(within(laneOf("Anthropic")).queryByText("Default harness")).toBeNull();
+    expect(within(laneOf("Codex")).queryByText("Default harness")).toBeNull();
+  });
+
+  it("both usable: the help text and retention copy say the harness is chosen per run by weekly limits", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings());
+    const { container } = render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    await screen.findByLabelText("Default harness");
+    const text = container.textContent ?? "";
+    expect(text).toContain("when both are usable it chooses per run by weekly limits");
+    expect(text).not.toContain("Claude when both are usable");
+  });
+
+  it("explicit default keeps the lane badge and drops the per-run badge", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings({ default_harness: "claude" }));
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    await screen.findByLabelText("Default harness");
     expect(within(laneOf("Anthropic")).getByText("Default harness")).toBeTruthy();
     expect(within(laneOf("Codex")).queryByText("Default harness")).toBeNull();
+    expect(screen.queryByText("Chosen per run by weekly limits")).toBeNull();
+  });
+
+  it("disables the overflow toggle with an explanation under Default · automatic and enables it under an explicit default", async () => {
+    const overflowSwitch = () => screen.getByRole("switch", { name: /Overflow to the other harness/ });
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken, codexKey] });
+    mockApi.getMySettings.mockResolvedValue(settings());
+    const view = render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    await screen.findByLabelText("Default harness");
+    expect(overflowSwitch().getAttribute("aria-disabled")).toBe("true");
+    expect(screen.getByText(/Overflow applies only when the default harness is Claude or Codex/)).toBeTruthy();
+    view.unmount();
+    mockApi.getMySettings.mockResolvedValue(settings({ default_harness: "codex" }));
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    await screen.findByLabelText("Default harness");
+    expect(overflowSwitch().getAttribute("aria-disabled")).not.toBe("true");
+    expect(screen.queryByText(/Overflow applies only when the default harness is Claude or Codex/)).toBeNull();
   });
 
   it("both usable: the badge moves to the Codex lane when Codex is selected", async () => {
@@ -1484,9 +1524,13 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
       </MemoryRouter>,
     );
     const selector = (await screen.findByLabelText("Default harness")) as HTMLSelectElement;
-    // Before: badge on Anthropic (positive control that the badge exists to move).
+    // Before: automatic, so the per-run badge shows and no lane is marked.
+    expect(screen.getByText("Chosen per run by weekly limits")).toBeTruthy();
+    expect(within(laneOf("Anthropic")).queryByText("Default harness")).toBeNull();
+    fireEvent.change(selector, { target: { value: "claude" } });
     expect(within(laneOf("Anthropic")).getByText("Default harness")).toBeTruthy();
     fireEvent.change(selector, { target: { value: "codex" } });
+    expect(screen.queryByText("Chosen per run by weekly limits")).toBeNull();
     // After: badge is on Codex and gone from Anthropic. Fails if the badge is pinned
     // to a static lane instead of following the effective harness.
     expect(within(laneOf("Codex")).getByText("Default harness")).toBeTruthy();
@@ -2263,7 +2307,7 @@ describe("harness overflow autosave", () => {
   it("saves on and explicitly off, hydrates on reload, and keeps model saves independent", async () => {
     let stored = false;
     const initial = (await mockApi.getMySettings()).settings;
-    mockApi.getMySettings.mockImplementation(async () => ({ settings: { ...initial, harness_overflow_enabled: stored } }));
+    mockApi.getMySettings.mockImplementation(async () => ({ settings: { ...initial, default_harness: "claude" as const, harness_overflow_enabled: stored } }));
     mockApi.setHarnessOverflow.mockImplementation(async enabled => {
       stored = enabled;
       return { harness_overflow_enabled: enabled };
@@ -2290,7 +2334,7 @@ describe("harness overflow autosave", () => {
 
   it.each([false, true])("retains saved %s on error and allows retry", async saved => {
     const initial = (await mockApi.getMySettings()).settings;
-    mockApi.getMySettings.mockResolvedValue({ settings: { ...initial, harness_overflow_enabled: saved } });
+    mockApi.getMySettings.mockResolvedValue({ settings: { ...initial, default_harness: "claude" as const, harness_overflow_enabled: saved } });
     mockApi.setHarnessOverflow.mockRejectedValueOnce(new ApiError(500, "overflow save failed"));
     renderPage();
     await waitFor(() => expect(checked()).toBe(saved));
@@ -2307,7 +2351,8 @@ describe("harness overflow autosave", () => {
   it.each([true, false])("merges only overflow while an independent settings save completes (overflow first: %s)", async overflowFirst => {
     let finishOverflow!: (value: { harness_overflow_enabled: boolean }) => void;
     let finishSettings!: (value: { settings: UserSettings }) => void;
-    const initial = (await mockApi.getMySettings()).settings;
+    const initial = { ...(await mockApi.getMySettings()).settings, default_harness: "claude" as const };
+    mockApi.getMySettings.mockResolvedValue({ settings: initial });
     mockApi.setHarnessOverflow.mockReturnValueOnce(new Promise(resolve => { finishOverflow = resolve; }));
     mockApi.putMySettings.mockReturnValueOnce(new Promise(resolve => { finishSettings = resolve; }));
     renderPage();

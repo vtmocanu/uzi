@@ -6,8 +6,8 @@
 //
 // The server is authoritative (D3): the web only hides/explains controls and shapes
 // request bodies. An "inherit" selection sends nothing and lets the server's D11
-// resolver pick (the sole usable harness, the user's default, or Claude when both are
-// usable and no default is set).
+// resolver pick (the sole usable harness, the user's default, or, when both are
+// usable and no default is set, a per-run choice by weekly limits that falls back to Claude).
 
 import type { Harness } from "./api";
 
