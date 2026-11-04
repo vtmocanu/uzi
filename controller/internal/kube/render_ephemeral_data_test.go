@@ -103,7 +103,7 @@ func TestPersistentWorkerDataPVCStaysThePresetsEvenWithAnOverride(t *testing.T) 
 
 // The controller's run-bound /data default must fit BOTH tiers' chart ceilings, read
 // out of values.yaml — the same cross-toolchain tie as
-// TestDinDDataDefaultFitsTheChartsLimitRangeMax. A run-bound worker lands in either
+// TestDinDDataPresetsFitTheChartsDockerLimitRangeMax. A run-bound worker lands in either
 // tier, so the default must fit each.
 func TestEphemeralDataDefaultFitsTheChartsLimitRangeMax(t *testing.T) {
 	restricted, docker := chartMaxPVCStorages(t)
@@ -169,6 +169,24 @@ func TestShippedPVCDefaultsFitEachTiersStorageQuota(t *testing.T) {
 		if len(largest) != wantClaims {
 			t.Fatalf("%s tier: %d distinct claims rendered, want %d; the sum below would be wrong",
 				tier.name, len(largest), wantClaims)
+		}
+		if tier.docker {
+			// The docker tier's dind term must be the largest per-preset default, or the
+			// fleet sum below would understate the worst case (issue #3890).
+			wantDinD := resource.Quantity{}
+			for _, size := range preset.SizeNames() {
+				spec, err := resolver.Resolve("base", size)
+				if err != nil {
+					t.Fatalf("resolve base/%q: %v", size, err)
+				}
+				if spec.Size.DinDDataSize.Cmp(wantDinD) > 0 {
+					wantDinD = spec.Size.DinDDataSize.DeepCopy()
+				}
+			}
+			if got := largest[dindDataPVCName("fleet")]; got.Cmp(wantDinD) != 0 {
+				t.Fatalf("docker tier: largest rendered dind-data claim = %s, want the largest preset default %s",
+					got.String(), wantDinD.String())
+			}
 		}
 		perWorker := resource.Quantity{}
 		for _, q := range largest {

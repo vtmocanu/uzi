@@ -498,10 +498,11 @@ type RenderConfig struct {
 	MaxPVCStorage       string
 	DockerMaxPVCStorage string
 	// DinDDataSize overrides the DinD daemon's data-root PVC size (issue #224 M-a).
-	// Empty ⇒ dindDataDefaultSize ("20Gi"). A quantity string, validated at the
-	// controller's boot so the render side can MustParse it. Docker-only, so it never
-	// touches a plain worker's spec/hash. See dindDataDefaultSize for the 20Gi
-	// admission ceiling and the no-GC residual.
+	// Empty ⇒ the preset table's per-size default (preset.Size.DinDDataSize, issue
+	// #3890); a non-empty value is a cluster-wide override that wins over every preset.
+	// A quantity string, validated at the controller's boot so the render side can
+	// MustParse it. Docker-only and PVC-only: it never touches a pod template or spec
+	// hash. See dindDataSize for the admission ceiling and the no-GC residual.
 	DinDDataSize string
 	// EphemeralDataSize is the /data PVC size for a RUN-BOUND worker
 	// (protocol.DesiredWorker.Ephemeral, issue #1815; UZI_WORKER_EPHEMERAL_DATA_SIZE).
@@ -716,12 +717,12 @@ func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *cor
 //
 // The third is issue #224 M-a: the daemon's image + build cache, moved off the pod's
 // ephemeral storage so a runaway pull produces ENOSPC in the daemon instead of a
-// kubelet eviction that destroys the run's working tree. Flat, and rendered ONLY
-// when w.Docker — a plain worker's object set is unchanged, which is the same
+// kubelet eviction that destroys the run's working tree. Per-preset (the cluster
+// override wins), and rendered ONLY when w.Docker — a plain worker's object set is unchanged, which is the same
 // property the docker branch of podTemplate preserves for its spec hash.
 //
-// Never patched. PVC specs are near-immutable and a size change is delete +
-// reprovision.
+// Creation size only here; existing claims are converged upward by the materializer
+// (issue #3890), never shrunk or recreated.
 func RenderPVCs(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) []*corev1.PersistentVolumeClaim {
 	ns := cfg.namespaceFor(w)
 	pvcs := []*corev1.PersistentVolumeClaim{
@@ -729,7 +730,7 @@ func RenderPVCs(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) []
 		renderPVC(cfg, ns, w.ID, nixPVCName(w.ID), spec.NixSize),
 	}
 	if withDinD(w) {
-		pvcs = append(pvcs, renderPVC(cfg, ns, w.ID, dindDataPVCName(w.ID), cfg.dindDataSize()))
+		pvcs = append(pvcs, renderPVC(cfg, ns, w.ID, dindDataPVCName(w.ID), cfg.dindDataSize(spec)))
 	}
 	return pvcs
 }

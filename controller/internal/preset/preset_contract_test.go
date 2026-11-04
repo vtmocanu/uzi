@@ -212,6 +212,7 @@ func TestNixSizeIsFlatAcrossEveryPresetAndTemplate(t *testing.T) {
 // understanding before someone "unifies" it. Three things claim a PVC per worker:
 //
 //	dindDataSize  chart value      -> guarded in deploy/chart/templates/worker-invariants.yaml
+//	              (and Size.DinDDataSize, per preset, in the kube package)
 //	nixSize       Go constant      -> guarded HERE
 //	Size.DataSize Go constant      -> guarded HERE
 //
@@ -254,8 +255,8 @@ func TestNixSizeIsFlatAcrossEveryPresetAndTemplate(t *testing.T) {
 // and sees what the cluster actually configured.
 //
 // This test is HALF of its layer, not all of it: it covers nixSize and each preset's
-// DataSize, and TestDinDDataDefaultFitsTheChartsLimitRangeMax covers the third Go
-// constant, dindDataDefaultSize. Both read maxPVCStorage out of values.yaml under the
+// DataSize, and TestDinDDataPresetsFitTheChartsDockerLimitRangeMax (kube package)
+// covers the third, each preset's Size.DinDDataSize. Both read maxPVCStorage out of values.yaml under the
 // same parse-and-Fatal contract, so neither carries a hardcoded ceiling.
 //
 // *** This paragraph replaced one that said an operator-lowered ceiling "remains ungated

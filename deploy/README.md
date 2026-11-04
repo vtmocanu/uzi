@@ -588,9 +588,10 @@ Before upgrading, raise any per-cluster overrides of both worker tiers'
 `limitRange.maxPVCStorage` to at least 50Gi. The controller refuses to start if a
 configured ceiling cannot admit the largest preset. Recalculate each tier's
 `quota.requestsStorage` for its worker count, maximum data size, 20Gi `/nix`, and
-the effective Docker `dindDataSize`. Defaults cover 20 restricted workers at
-`20 x (50 + 20) = 1400Gi` and 10 Docker workers at
-`10 x (50 + 20 + 20) = 900Gi`. For example, a 30Gi DinD override needs 1000Gi for
+the effective Docker DinD size (per-preset 20Gi for `s`/`m`, 50Gi for `l`/`l-highmem`
+when `dindDataSize` is empty; an explicit value overrides every preset). Defaults
+cover 20 restricted workers at `20 x (50 + 20) = 1400Gi` and 10 Docker workers at
+`10 x (50 + 20 + 50) = 1200Gi`. For example, a 30Gi DinD override needs 1000Gi for
 10 Docker workers. The isolated lane needs 600Gi for ten run-bound workers
 (`10 x (40 + 20)`), with a PVC ceiling of at least 40Gi. Its chart guard also checks
 run-bound data overrides. Allow budget for existing claims and their requested growth.

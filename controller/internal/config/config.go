@@ -316,7 +316,7 @@ type Config struct {
 	WorkerDockerMaxPVCStorage string
 	// WorkerDinDDataSize overrides the size of the DinD daemon's data-root PVC (issue
 	// #224 M-a — it was an emptyDir on node ephemeral storage, which is what got
-	// workers evicted). Empty ⇒ the render side's built-in default (20Gi). Optional
+	// workers evicted). Empty ⇒ the preset table's per-size default (s/m 20Gi, l/l-highmem 50Gi, issue #3890); a set value is a cluster-wide override that wins at every preset. Optional
 	// even when the docker tier is on, and validated as a k8s Quantity when set, so a
 	// typo fails at boot rather than at admission. Note the worker namespaces'
 	// LimitRange caps a PVC at maxPVCStorage (50Gi by default on both worker tiers), so a larger value here is
