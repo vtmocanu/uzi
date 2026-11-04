@@ -383,6 +383,28 @@ export const HELD_PUBLICATION_TIMEOUT_MS = 330_000;
  *  attempt (observeCancellation), so rows 1-4 normally run without one. */
 export const CHECKPOINT_PUBLISH_TIMEOUT_MS = 480_000;
 
+/** undici's process-wide dispatcher slot: the versioned key Node's bundled fetch reads its default
+ *  dispatcher from (and npm undici's setGlobalDispatcher writes). */
+const UNDICI_GLOBAL_DISPATCHER = Symbol.for("undici.globalDispatcher.2");
+type UndiciDispatch = (opts: Record<string, unknown>, handler: unknown) => boolean;
+
+/** The dispatcher one checkpoint publish runs on. Node's bundled fetch (undici) ends a request whose
+ *  response headers take longer than headersTimeout, or whose stream sits idle longer than it, and
+ *  both default to 300 s whatever the request signal says; the api may hold a valid /publish answer
+ *  longer than that (fixtures/checkpoint-publish-budget.json). This returns the CURRENT global
+ *  dispatcher composed with per-request headersTimeout and bodyTimeout of `timeoutMs` (same
+ *  connection pool, TLS and proxy settings), so the request signal stays the bound. It returns
+ *  undefined, and fetch keeps its default, when the slot is empty or not composable; the slot is
+ *  filled once Node has loaded its fetch implementation, which a worker's registration does before
+ *  any publish. */
+function checkpointPublishDispatcher(timeoutMs: number): unknown {
+  const base = (globalThis as Record<symbol, unknown>)[UNDICI_GLOBAL_DISPATCHER] as
+    { compose?: (interceptor: (dispatch: UndiciDispatch) => UndiciDispatch) => unknown } | undefined;
+  if (typeof base?.compose !== "function") return undefined;
+  return base.compose(dispatch => (opts, handler) =>
+    dispatch({ ...opts, headersTimeout: timeoutMs, bodyTimeout: timeoutMs }, handler));
+}
+
 /** The held-publication feature string, advertised by the worker and by the api's protocol_features. */
 export const HELD_PUBLICATION_FEATURE = "recovery_held_publication_v1";
 
@@ -3133,7 +3155,9 @@ export class WorkerClient {
    * THROWS (a `ResponseBodyOverflowError` for overflow), which leaves the publish outcome
    * ambiguous for the caller. The bearer/version header assembly mirrors fetchRaw; the request
    * is bounded by {@link CHECKPOINT_PUBLISH_TIMEOUT_MS} (not httpTimeoutMs, which is too short for
-   * a real pack), or earlier by the caller's boundary signal or a current MaintenanceBudget. The caller
+   * a real pack), or earlier by the caller's boundary signal or a current MaintenanceBudget, and
+   * undici's own 300 s headers/body timeouts are raised to that allowance for this request
+   * ({@link checkpointPublishDispatcher}). The caller
    * retries an explicit 5xx (250 ms, 1 s backoff) up to three requests, all inside one shared
    * allowance of this size. An abort is just another best-effort miss (it throws, caught by the
    * caller's warn-and-swallow).
@@ -3168,6 +3192,8 @@ export class WorkerClient {
       duplex: "half",
       signal,
     };
+    const dispatcher = checkpointPublishDispatcher(this.checkpointPublishTimeoutMs);
+    if (dispatcher) Object.assign(init, { dispatcher });
     const res = await maintenanceFetch(fetch, this.baseUrl + path, init);
     if (res.status < 200 || res.status >= 300) {
       // Discard remote content without exposing it or changing the HTTP outcome.
