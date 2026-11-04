@@ -2090,8 +2090,11 @@ function checkpointErrorDiagnostic(
   error: unknown,
   phase: "packing" | "publish_request",
   redactText: ((text: string) => string) | undefined,
+  /** A class the caller established from its own state (the publish allowance it owns expired);
+   *  it wins over the codes, and the bounded walk still collects the messages. */
+  knownClass?: "timeout",
 ): { key: string; text: string; error?: string; cause?: string } {
-  let causeClass = "unknown";
+  let causeClass: string = knownClass ?? "unknown";
   let root: string | undefined;
   const parts: string[] = [];
   const seen = new Set<unknown>();
@@ -19432,6 +19435,8 @@ export class RunRunner {
     let producer: CheckpointPackProducer | undefined;
     let retried = false;
     let producerExit: number | undefined;
+    /** The owned timer of this logical publish's shared allowance (set before the first attempt). */
+    let allowanceTimer: AbortSignal | undefined;
     const observeProducer = () => {
       producerExit = undefined;
       void producer!.exited.then(code => { producerExit = code; });
@@ -19505,7 +19510,8 @@ export class RunRunner {
       // request allowance, created once here and never renewed by a retry; any failed guard,
       // transport exception or abort stops this logical operation.
       const allowanceMs = this.client.checkpointPublishTimeoutMs ?? CHECKPOINT_PUBLISH_TIMEOUT_MS;
-      const allowance = AbortSignal.any([AbortSignal.timeout(allowanceMs), ...(signal ? [signal] : [])]);
+      allowanceTimer = AbortSignal.timeout(allowanceMs);
+      const allowance = AbortSignal.any([allowanceTimer, ...(signal ? [signal] : [])]);
       for (let attempt = 1; attempt <= 3; attempt++) {
         allowance.throwIfAborted();
         onStep?.("checkpoint_upload");
@@ -19594,7 +19600,11 @@ export class RunRunner {
       if (e instanceof CheckpointSoftDeadlineError) throw e;
       // issue #1597 M1: a deadline/permit abort is an expected bounded stop, not a publish fault —
       // runLog only, never the feed (the shutdown sink names it as `timeout` itself).
-      if (signal?.aborted || isAbortLikeError(e)) {
+      // The allowance this method owns expired while the caller's own signal did not: whatever shape
+      // the rejection takes (fetch rejects with the timer's TimeoutError DOMException, which carries
+      // no recognized code), it is a publish timeout, not an unknown fault or a caller abort.
+      const allowanceExpired = allowanceTimer?.aborted === true && !signal?.aborted;
+      if (!allowanceExpired && (signal?.aborted || isAbortLikeError(e))) {
         flight.runLog.info("checkpoint publish aborted", {
           run_id: flight.runId,
           phase: packedTip === undefined ? "packing" : "publish_request",
@@ -19613,7 +19623,7 @@ export class RunRunner {
       // issue #1597 M1: the feed line carries the CLASS only — a thrown message can embed remote
       // text or a credentialed URL; the runLog keeps it for operators.
       const phase = packedTip === undefined ? "packing" : "publish_request";
-      const diagnostic = checkpointErrorDiagnostic(e, phase, flight.redactText);
+      const diagnostic = checkpointErrorDiagnostic(e, phase, flight.redactText, allowanceExpired ? "timeout" : undefined);
       this.reportPublishOutcome(flight, diagnostic.key, diagnostic.text, {
         phase,
         tip_produced: packedTip !== undefined,

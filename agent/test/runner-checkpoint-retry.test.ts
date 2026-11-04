@@ -39,6 +39,8 @@ function start(opts: {
   allowanceMs?: number;
   /** Opt in: the fake publish hangs after draining the pack until the signal it was handed aborts. */
   hangUntilAbort?: boolean;
+  /** Opt in: the fake publish throws this after draining the pack. */
+  throwError?: unknown;
 } = {}) {
   const abort = new AbortController();
   const git = new GitCache("/unused", nullLogger());
@@ -117,6 +119,7 @@ function start(opts: {
     for await (const chunk of pack) body += chunk;
     bytes.push(body);
     if (opts.throws) throw new Error("transport failed");
+    if (opts.throwError !== undefined) throw opts.throwError;
     if (opts.hangUntilAbort) {
       await new Promise<void>((_resolve, reject) => {
         if (signal?.aborted) return reject(signal.reason);
@@ -181,15 +184,17 @@ it("persistent 500 is exactly three requests and one exhausted diagnostic", asyn
 });
 
 it("three 5xx attempts share one allowance that expiry during the second backoff ends", async () => {
-  // 300 ms allowance, backoffs 100/250 ms: attempt 1 at ~0, attempt 2 at ~100 (200 ms margin before
-  // expiry), expiry at 300 during the second backoff (ends ~350). Retries must not renew the
-  // allowance, so attempt 3 is never sent.
-  const r = await exercise({ allowanceMs: 300, backoffMs: [100, 250] });
+  // 1200 ms allowance, backoffs 800/800 ms, each margin 400 ms: attempt 2 is sent at ~800 (400 before
+  // the expiry), and the expiry at 1200 lands inside the second backoff, 400 before attempt 3 would
+  // be sent at ~1600 (an allowance renewed at attempt 2 would last until ~2000). Retries must not
+  // renew it: one signal serves both attempts and attempt 3 is never sent.
+  const r = await exercise({ allowanceMs: 1_200, backoffMs: [800, 800] });
   assert.equal(r.requests, 2);
   assert.equal(r.attemptSignals.length, 2);
   assert.equal(r.attemptSignals[0], r.attemptSignals[1], "one allowance signal serves every attempt");
   assert.deepEqual(r.outcome, { published: false, reason: "error" });
   assert.equal(r.producers, 2, "no third producer is created after the allowance expired");
+  assert.match(JSON.stringify(r.feed), /phase=publish_request, cause=timeout/);
 });
 
 it("an unexpired allowance leaves the three-attempt behaviour unchanged", async () => {
@@ -225,8 +230,17 @@ it("the allowance itself aborts an in-flight attempt when the caller never abort
   assert.equal(h.attemptSignals.length, 1);
   assert.equal(h.attemptSignals[0]?.aborted, true);
   assert.equal(h.requests, 1);
-  assert.equal((result as { published: boolean }).published, false);
+  assert.deepEqual(result, { published: false, reason: "error" });
   assert.equal(h.flight.lastCheckpointRefTip, "OLD");
+  // The fake rejects with the allowance's own reason (fetch's shape: a TimeoutError DOMException
+  // with no recognized code); the expiry of the owned allowance makes it a timeout, not unknown.
+  assert.match(JSON.stringify(h.feed), /phase=publish_request, cause=timeout/);
+});
+
+it("a TimeoutError shape the owned allowance did not cause stays unknown", async () => {
+  const h = start({ allowanceMs: 60_000, throwError: new DOMException("The operation was aborted due to timeout", "TimeoutError") });
+  assert.deepEqual(await h.done, { published: false, reason: "error" });
+  assert.match(JSON.stringify(h.feed), /phase=publish_request, cause=unknown/);
 });
 
 for (const response of [{ ok: false, httpStatus: 400 }, { ok: false, httpStatus: 200 },
