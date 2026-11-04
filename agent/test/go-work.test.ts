@@ -342,10 +342,11 @@ describe("removeGoWorkLeaves", () => {
     const a = await run({ kind: "all" });
     assert.strictEqual(a.r.parent, "absent");
     assert.ok(isGoWorkClean(a.r));
-    home = path.join(home, "no-such-home");
-    const b = await run({ kind: "all" });
-    assert.strictEqual(b.r.parent, "absent");
-    assert.ok(isGoWorkClean(b.r));
+    // A local path, not a reassignment of `home`: afterEach must still remove the real scratch root.
+    const b = await removeGoWorkLeaves(path.join(home, "no-such-home"), recordingLogger().logger,
+      { select: { kind: "all" }, deadline: far(), reason: "test" });
+    assert.strictEqual(b.parent, "absent");
+    assert.ok(isGoWorkClean(b));
   });
 
   it("a deadline already passed stops the enumeration, removes nothing and is not clean", async (t) => {
