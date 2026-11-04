@@ -1554,15 +1554,44 @@ test("tree diagnostics count every enrolled candidate and every unavailable or r
   });
   extra(20, async () => ({ available: false, complete: false, startedAtMs: 0, completedAtMs: 0, rows: [] }));
   extra(30, async () => { throw new Error("observe failed"); });
+  extra(40, async () => ({ available: true, complete: false, startedAtMs: 0, completedAtMs: 0, rows: [{ pid: 40, startTime: "10", rssBytes: 7 }] }));
   f.monitor.tick();
   await until(() => f.requests.length === 1);
   f.reservation.resolve(f.ack());
   await f.monitor.settle();
   const d = norm(diagnostics);
-  assert.equal(d.tree.candidates, 3, "all three enrolled trees are candidates");
-  assert.equal(d.tree.observation_failures, 2, "one unavailable plus one rejected observation");
+  assert.equal(d.tree.candidates, 4, "all four enrolled trees are candidates");
+  assert.equal(d.tree.observation_failures, 3, "one unavailable, one incomplete and one rejected observation");
   assert.equal(d.tree.selected_rss_bytes_approx, 100, "the valid tree is still the selected one");
   assert.equal(f.signals(), 1, "the intervention cancelled the valid tree only");
+  await f.monitor.stop();
+});
+
+test("a throwing observation getter on a phase-filtered candidate leaves the failure count unknown and never aborts the intervention", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  // A second run's context: holding its phase during observe makes its candidate stale, so
+  // phaseAdmits filters it out before select() and only the new failure count reads it.
+  const other = f.commands.begin({ ...f.input, run_id: "55555555-5555-4555-8555-555555555555",
+    memory_policy: { version: 1, max_interventions: 2 } });
+  f.commands.register(other, {
+    source: "codex-model-command", toolId: "tool-throwing", attemptId: "attempt",
+    root: { pid: 50, startTime: "10" }, command: "inert fixture",
+    observe: async () => {
+      f.commands.holdPhase(other);
+      return { get available(): boolean { throw new Error("getter boom"); }, complete: true, startedAtMs: 0, completedAtMs: 0, rows: [] } as TreeObservation;
+    },
+    cancel: async () => {}, drain: async () => ({ confirmed: true }),
+  });
+  f.monitor.tick();
+  await until(() => f.requests.length === 1);
+  f.reservation.resolve(f.ack());
+  await f.monitor.settle();
+  const d = norm(diagnostics);
+  assert.equal(d.tree.candidates, 2, "both enrolled trees were candidates");
+  assert.deepEqual(d.tree.observation_failures, { unavailable: "error" });
+  assert.equal(d.tree.selected_rss_bytes_approx, 100, "the valid tree is still the selected one");
+  assert.equal(f.signals(), 1, "the valid tree was reserved and cancelled");
   await f.monitor.stop();
 });
 

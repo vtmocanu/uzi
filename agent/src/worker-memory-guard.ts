@@ -69,7 +69,7 @@ function decisionRecord(d: Decision): DecisionRecord {
     ...(d.evidence !== undefined ? { evidence: d.evidence } : {}) });
 }
 type Trigger = Readonly<{ sample: Available; decision: DecisionRecord }>;
-type Tree = Readonly<{ rssBytesApprox: number; startedAtMs: number; completedAtMs: number; candidates: number; failures: number }>;
+type Tree = Readonly<{ rssBytesApprox: number; startedAtMs: number; completedAtMs: number; candidates: number; failures: number | undefined }>;
 type Observed = Readonly<{ startedAtMs: number; completedAtMs: number; rows: readonly { rssBytes: number }[] }>;
 type Diag = Readonly<{ trigger?: Trigger; tree: Tree; cancel?: Observed }>;
 
@@ -571,7 +571,7 @@ export class WorkerMemoryMonitor {
       authority_same_as_trigger: trigger !== undefined && trigger.sample.sampleId === a.sample.sampleId,
       tree: {
         selected_rss_bytes_approx: tree.rssBytesApprox, selected_started_at_ms: tree.startedAtMs,
-        selected_completed_at_ms: tree.completedAtMs, candidates: tree.candidates, observation_failures: tree.failures,
+        selected_completed_at_ms: tree.completedAtMs, candidates: tree.candidates, observation_failures: tree.failures ?? { unavailable: "error" },
         cancel_check: cancel ? {
           rss_bytes_approx: cancel.rows.reduce((sum, row) => sum + row.rssBytes, 0),
           started_at_ms: cancel.startedAtMs, completed_at_ms: cancel.completedAtMs,
@@ -647,7 +647,11 @@ export class WorkerMemoryMonitor {
       rssBytesApprox: selected.rssBytesApprox, startedAtMs: selected.observation.startedAtMs,
       completedAtMs: selected.observation.completedAtMs, candidates: candidates.length,
       // Rejected/timed-out observations and adapter responses without complete evidence both count as failures.
-      failures: candidates.length - observed.filter(({ observation }) => observation?.available === true && observation.complete === true).length,
+      // Diagnostic only: a throwing observation leaves the count unknown and never aborts the intervention.
+      failures: (() => {
+        try { return candidates.length - observed.filter(({ observation }) => observation?.available === true && observation.complete === true).length; }
+        catch { return undefined; }
+      })(),
     });
     const a: Authority = Object.freeze({
       context: entry.context, phaseRevision: selected.phaseRevision, entry, incarnation: Object.freeze({ ...incarnation }),
