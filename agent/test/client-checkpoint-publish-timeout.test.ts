@@ -67,7 +67,7 @@ it("a current MaintenanceBudget with less time left ends the publish before the 
   const started = performance.now();
   await assert.rejects(MaintenanceBudget.run(budget, () => client.publishCheckpoint("run-1", TIP, pack())));
   const elapsed = performance.now() - started;
-  assert.ok(elapsed < 2_000, `ended after ${elapsed} ms, expected about 300`);
+  assert.ok(elapsed >= 200 && elapsed < 2_000, `ended after ${elapsed} ms, expected about 300`);
 });
 
 it("undici's own headers timeout does not cut a publish the allowance still covers", async (t) => {
