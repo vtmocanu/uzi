@@ -34,8 +34,9 @@ func harnessDecisionLines(d *apitypes.HarnessDecisionDTO) []string {
 	}
 }
 
-// harnessDecisionTime is "MM-DD HH:MMZ" (UTC): the TUI rail is 26 columns wide, and a
-// weekly reset is always within the next week, so the year is implied.
+// harnessDecisionTime is "MM-DD HH:MMZ" (UTC): the TUI rail is 26 columns wide. A recorded
+// weekly reset is a future reset at the run's creation, so it falls within about a week of
+// the run's creation time, which dates the omitted year.
 func harnessDecisionTime(t *time.Time) string {
 	if t == nil {
 		return "unknown"

@@ -12,10 +12,10 @@ func newSettingsHarnessOverflowCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Set cross-harness overflow for new runs",
 		Long: "Overflow to the other harness when my default is near its limits. Applies only with an\n" +
 			"explicit Claude or Codex default harness and is inactive when the default is automatic.\n" +
-			"Applies at creation\n" +
-			"to implicit issue runs started manually, by autopilot or by a schedule, when both\n" +
-			"harnesses are usable. Explicit harnesses, model pins, Anthropic credential overrides\n" +
-			"and either cross-check setting prevent overflow. Existing runs never switch.",
+			"Applies at creation to implicit issue runs started manually, by autopilot or by a\n" +
+			"schedule, when both harnesses are usable. Explicit harnesses, model pins, Anthropic\n" +
+			"credential overrides and either cross-check setting prevent overflow. Existing runs\n" +
+			"never switch.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if args[0] != "on" && args[0] != "off" {
@@ -38,14 +38,23 @@ func newSettingsHarnessOverflowCmd(env Env, gf *globalFlags) *cobra.Command {
 			// still reports the stored value and surfaces the error.
 			settings, readErr := c.GetMySettings(cmd.Context())
 			if readErr != nil {
-				explicit := ""
-				p.Println(harnessOverflowLine(stored, &explicit))
+				p.Println(harnessOverflowStoredLine(stored))
 				return readErr
 			}
 			p.Println(harnessOverflowLine(stored, settings.DefaultHarness))
 			return nil
 		},
 	}
+}
+
+// harnessOverflowStoredLine reports a saved value whose effect could not be read back: the
+// write succeeded, but whether overflow is active depends on the unread default harness.
+func harnessOverflowStoredLine(enabled bool) string {
+	state := "off"
+	if enabled {
+		state = "on"
+	}
+	return "Harness overflow: " + state + " (saved; default harness could not be read)"
 }
 
 // harnessOverflowLine renders the overflow switch; a nil default harness means

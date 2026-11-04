@@ -121,16 +121,17 @@ func (d *harnessCreationDecision) applyAutomatic(claude, codex autoSide, now tim
 	d.ClaudeSide, d.CodexSide, d.decidedAt = claude, codex, now
 	d.Chosen, d.Reason = chooseAutomaticHarness(claude, codex, now)
 	d.PreferredEvidence, d.OtherEvidence = claude.evidence(), codex.evidence()
-	d.PreferredWeeklyReset, d.OtherWeeklyReset = claude.recordedReset(), codex.recordedReset()
+	d.PreferredWeeklyReset, d.OtherWeeklyReset = claude.recordedReset(now), codex.recordedReset(now)
 }
 
-// recordedReset is the weekly reset the decision record stores: none for an unknown side,
-// whose reading (stale, unmeasured) did not take part in the comparison.
-func (s autoSide) recordedReset() *time.Time {
+// recordedReset is the weekly reset the decision record stores: the known future reset the
+// comparison used (autoselect.FutureWeeklyReset), and none for an unknown side, whose stale
+// or unmeasured reading did not decide anything.
+func (s autoSide) recordedReset(now time.Time) *time.Time {
 	if s.State == autoUnknown {
 		return nil
 	}
-	return s.WeeklyReset
+	return autoselect.FutureWeeklyReset(s.WeeklyReset, now)
 }
 
 func floatOf(v float64) pgtype.Float8 { return pgtype.Float8{Float64: v, Valid: true} }

@@ -246,6 +246,13 @@ func TestAutomaticDecisionRecordsResetOnlyForKnownSides(t *testing.T) {
 	if d.OtherWeeklyReset == nil || !d.OtherWeeklyReset.Equal(known) {
 		t.Fatalf("qualified Codex side reset = %v, want %v", d.OtherWeeklyReset, known)
 	}
+	// A known side whose reset already passed carried no reset into the comparison.
+	past := now.Add(-time.Hour)
+	d = &harnessCreationDecision{}
+	d.applyAutomatic(qualifiedSide(50, &past), qualifiedSide(50, &known), now)
+	if d.PreferredWeeklyReset != nil {
+		t.Fatalf("past Claude reset recorded: %v", d.PreferredWeeklyReset)
+	}
 }
 
 func TestClearsInheritOverride(t *testing.T) {

@@ -44,7 +44,7 @@ func TestSettingsHarnessOverflowCommandReadFailure(t *testing.T) {
 	fc := settingsReadFailsClient{&uzicli.FakeClient{}}
 	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "harness-overflow", "on")
 	if code != uzicli.ExitAuth || !strings.Contains(stderr, "settings read refused") ||
-		!strings.Contains(out, "Harness overflow: on (new runs, at creation)") {
+		!strings.Contains(out, "Harness overflow: on (saved; default harness could not be read)") {
 		t.Fatalf("code=%d out=%q stderr=%s", code, out, stderr)
 	}
 	if fc.HarnessOverflowCalls != 1 {
