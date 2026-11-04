@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"runtime"
 	"strings"
@@ -217,17 +218,83 @@ func TestWorkerRunPublishOverBudgetCancelsService(t *testing.T) {
 	})
 }
 
-// 3: the deadline extension does not leak to a sibling route on the same server.
+// 2b: the write deadline covers the detached tail beyond the context budget. A service that ignores
+// its context and returns success after the scaled publishContextBudget (and past a write deadline
+// of upload + context budget + grace) but inside the scaled publishServiceBound must still have its
+// answer delivered.
+func TestWorkerRunPublishWriteDeadlineCoversDetachedTail(t *testing.T) {
+	eachProto(t, func(t *testing.T, http2 bool) {
+		base := scalePublishBudgets(t, 100)
+		stub := &publishStub{}
+		// Past upload + context + grace (what a write deadline without the service bound would be),
+		// before upload + service bound + grace. Captured before the stub runs: the cleanup restores the vars.
+		sleep := publishUploadBudget + publishContextBudget + publishResponseGrace + (publishServiceBound-publishContextBudget)/4
+		if sleep <= publishUploadBudget+publishContextBudget+publishResponseGrace || sleep >= publishServiceBound {
+			t.Fatalf("scaled sleep %v is outside the window the test needs", sleep)
+		}
+		stub.fn = func(_ context.Context, _ pushbroker.Options) (pushbroker.Result, error) {
+			time.Sleep(sleep) // ignores ctx cancellation
+			return pushbroker.Result{Ref: "refs/uzi-checkpoints/agent/issue-42"}, nil
+		}
+		pt := publishTransportServer(t, http2, base, stub)
+		start := time.Now()
+		resp, err := pt.post(t, "/publish", strings.NewReader("pack"))
+		if err != nil {
+			t.Fatalf("the answer did not arrive after %v: %v", time.Since(start), err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		wantProto(t, resp, pt)
+		wantPublished(t, resp, time.Since(start))
+		if elapsed := time.Since(start); elapsed <= publishUploadBudget+publishContextBudget+publishResponseGrace {
+			t.Fatalf("answer after %v did not cross upload+context+grace: the test proves nothing", elapsed)
+		}
+	})
+}
+
+// 3: the deadline extension does not leak to a sibling route. On ONE connection (HTTP/1.1
+// keep-alive; the single HTTP/2 connection) a /publish that completes is followed by a sibling
+// request whose handler runs past the base WriteTimeout: it must still be cut off at the base
+// deadline, not delivered under the deadline the /publish request extended.
 func TestWorkerRunPublishSiblingKeepsBaseTimeouts(t *testing.T) {
 	eachProto(t, func(t *testing.T, http2 bool) {
 		base := scalePublishBudgets(t, 100)
 		pt := publishTransportServer(t, http2, base, &publishStub{})
-		resp, err := pt.post(t, "/sibling", strings.NewReader("x"))
+		if !http2 {
+			pt.client = &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{}}
+			t.Cleanup(pt.client.CloseIdleConnections)
+		}
+		var reused atomic.Bool
+		trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { reused.Store(info.Reused) }}
+		do := func(path string, body string) (*http.Response, error) {
+			req, err := http.NewRequest(http.MethodPost, pt.srv.URL+"/api/worker/runs/"+uuid.NewString()+path, strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-Uzi-Checkpoint-Tip", validTip)
+			return pt.client.Do(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
+		}
+
+		resp, err := do("/publish", "pack")
+		if err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+		wantProto(t, resp, pt)
+		wantPublished(t, resp, 0)
+		_ = resp.Body.Close()
+		if reused.Load() {
+			t.Fatal("the first request reported a reused connection")
+		}
+
+		start := time.Now()
+		resp, err = do("/sibling", "x")
+		if !reused.Load() {
+			t.Fatal("the sibling did not share the publish's connection: the test proves nothing")
+		}
 		if err == nil {
 			body, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 			if string(body) == "late" {
-				t.Fatal("the sibling route outlived the base timeouts: the deadline extension leaked beyond its route")
+				t.Fatalf("the sibling route was answered after %v, past the base timeout %v: the deadline extension leaked beyond its route", time.Since(start), base)
 			}
 		}
 	})

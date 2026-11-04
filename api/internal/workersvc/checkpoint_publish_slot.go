@@ -8,7 +8,8 @@ import (
 
 const (
 	// checkpointPublishMaxConcurrent caps the live checkpoint publishes (POST /publish) in flight
-	// process-wide. Each buffers up to 64 MiB of pack (io.ReadAll under maxPackBytes), and the push
+	// process-wide. Each buffers up to 64 MiB of pack (io.ReadAll under maxPackBytes; its growth can
+	// briefly hold more than 64 MiB per request while the old and new backing arrays coexist), and the push
 	// broker adds a spike of roughly 194 MB RSS per publish (measured on this repo; it scales with the
 	// target repo's shallow base snapshot, not with pack size; see the api memory limit in
 	// deploy/chart/values.yaml). Four concurrent publishes therefore sit at about the 1Gi limit on top

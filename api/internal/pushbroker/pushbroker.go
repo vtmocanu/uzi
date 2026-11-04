@@ -222,8 +222,8 @@ const maxCreateRefDuration = 30 * time.Second
 // WorkerRunPublish overrides by extending its own deadlines to cover the upload plus
 // workersvc.PublishServiceBound plus a response grace; a worst-case pack can force tens
 // of seconds of otherwise-uncancellable CPU, and this makes any one publish
-// cancellable and time-bounded regardless of pack contents or a slow forge. Generous for a legitimate checkpoint push, tight enough that a single
-// request can never run unbounded.
+// cancellable and time-bounded regardless of pack contents or a slow forge. Generous for a
+// legitimate checkpoint push, tight enough that a single request can never run unbounded.
 const maxPublishDuration = 60 * time.Second
 
 // MaxPublishDuration exports maxPublishDuration for the retention timing relations in workersvc

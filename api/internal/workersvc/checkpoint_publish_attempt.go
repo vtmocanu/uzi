@@ -99,13 +99,13 @@ const (
 	// deadline on the route): a live-routed push is sent within livePublishPrePushBudget of the
 	// routing and the broker stops waiting on it pushbroker.MaxPublishDuration later.
 	PublishContextBudget = livePublishPrePushBudget + pushbroker.MaxPublishDuration + publishContextSlack
-	// publishTailBookkeepingWindows is the most detached bookkeeping windows (each a fresh
-	// retentionRecordTimeout, retentionBookkeepingCtx) one request path can run in sequence once
-	// the request context is done: pushOnce's readiness mark (MarkCheckpointPublishAttemptReady)
-	// followed by publishOutcome's attempt clear (clearPublishAttempt). The other windows on that
-	// path are exclusive with these: a definite refusal clears the row in pushOnce but then
-	// neither marks it ready nor retries, an observe or budget refusal clears once and returns,
-	// and a failed re-admission after a supersession clears the prepared row once. The windows in
+	// publishTailBookkeepingWindows is the number of detached bookkeeping windows (each a fresh
+	// retentionRecordTimeout, retentionBookkeepingCtx) the service bound allows for the request path
+	// after the request context is done. The window that can actually follow the expiry is the
+	// single clearPreparedAttempt in pushOnce, run after recordAttempt fails on the dead context: a
+	// push itself ends by pushbroker.MaxPublishDuration, inside PublishContextBudget, so pushOnce's
+	// readiness mark and publishOutcome's attempt clear are not reached after the context expires.
+	// N=2 is a conservative over-count of that one window, kept as headroom. The windows in
 	// checkpoint_publish_live.go and deferPublishAttempt belong to the sweeper, not this route.
 	publishTailBookkeepingWindows = 2
 	// PublishServiceBound bounds PublishAttested from entry to return. After PublishContextBudget
@@ -128,12 +128,10 @@ const (
 )
 
 // Compile-time: PublishContextBudget exceeds livePublishPrePushBudget + pushbroker.MaxPublishDuration
-// (a negative constant does not convert to uint), and PublishServiceBound exceeds the context
-// budget by at least one whole detached retention operation.
-const (
-	_ = uint(PublishContextBudget - livePublishPrePushBudget - pushbroker.MaxPublishDuration - 1)
-	_ = uint(PublishServiceBound - PublishContextBudget - retentionOpTimeout - 1)
-)
+// (a negative constant does not convert to uint). The service bound's relation to the context
+// budget is by construction (PublishServiceBound is that budget plus the tail terms), so it has no
+// check of its own.
+const _ = uint(PublishContextBudget - livePublishPrePushBudget - pushbroker.MaxPublishDuration - 1)
 
 // errPushRefused is a push Publish refused to send (the live pre-push budget elapsed, or the
 // attempt record or the push's compare-and-set base could not be written or read). Publish answers it with the benign not_descendant skip:

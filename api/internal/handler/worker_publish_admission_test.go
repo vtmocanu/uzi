@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
@@ -191,6 +192,55 @@ func TestWorkerRunPublishAdmissionPerWorkerShare(t *testing.T) {
 	rig.router.ServeHTTP(rec, publishAdmissionReq(workerA, strings.NewReader("pack")))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("after release: status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+}
+
+// A worker naming a run it does not hold gets PublishAttested's not-owned answer (404) from the
+// pre-body ownership gate: no body read, no slot taken (the worker's whole share and every
+// process-wide slot stay acquirable afterwards), and the publisher never runs.
+func TestWorkerRunPublishUnownedRunTakesNoSlotAndReadsNoBody(t *testing.T) {
+	stub := &publishStub{}
+	h := newPublishHandler(t, &publishStore{ownedErr: pgx.ErrNoRows}, newBox(t), func(string) bool { return true }, stub.publish)
+	workerID := uuid.New()
+	body := &recordingBody{r: strings.NewReader("pack")}
+	for i := 0; i < 8; i++ { // more attempts than the per-worker share and the global cap together
+		runID := uuid.New()
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", runID.String())
+		req := httptest.NewRequest(http.MethodPost, "/api/worker/x", body)
+		req.Header.Set("X-Uzi-Checkpoint-Tip", validTip)
+		ctx := mw.ContextWithWorker(req.Context(), store.Worker{ID: workerID, UserID: uuid.New()})
+		req = req.WithContext(context.WithValue(ctx, chi.RouteCtxKey, rctx))
+		rec := httptest.NewRecorder()
+		h.WorkerRunPublish(rec, req)
+		if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "run not found for this worker") {
+			t.Fatalf("attempt %d: status = %d body %q, want the not-owned 404", i, rec.Code, rec.Body.String())
+		}
+	}
+	if n := body.reads.Load(); n != 0 {
+		t.Fatalf("the unowned requests' body was read %d times", n)
+	}
+	if n := stub.calls.Load(); n != 0 {
+		t.Fatalf("the publisher ran %d times for an unowned run", n)
+	}
+	// The worker's full share is still available, and so is the rest of the process-wide cap.
+	var releases []func()
+	for i := 0; i < 2; i++ {
+		rel, ok := h.wsvc.AcquireCheckpointPublishSlot(workerID)
+		if !ok {
+			t.Fatalf("acquire %d for the worker was refused: an unowned request held a slot", i)
+		}
+		releases = append(releases, rel)
+	}
+	for i := 0; i < 2; i++ {
+		rel, ok := h.wsvc.AcquireCheckpointPublishSlot(uuid.New())
+		if !ok {
+			t.Fatalf("acquire %d for another worker was refused: the process-wide cap was consumed", i)
+		}
+		releases = append(releases, rel)
+	}
+	for _, rel := range releases {
+		rel()
 	}
 }
 

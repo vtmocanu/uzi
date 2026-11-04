@@ -2405,7 +2405,10 @@ func (h *Handler) WorkerListMemory(w http.ResponseWriter, r *http.Request) {
 // This is a best-effort durability path: a 500 is ignored by the worker, and the
 // benign "origin moved / unsupported" outcomes are 200 skips, not errors.
 //
-// Admission is capped: after the header and query validation the request takes a slot from
+// A read-only ownership gate (workersvc.CheckPublishOwnership) runs first, so a worker naming a run
+// it does not hold gets the same 404 as PublishAttested's not-owned path without taking a slot.
+//
+// Admission is capped: after the header and query validation and that gate the request takes a slot from
 // workersvc.AcquireCheckpointPublishSlot (process-wide cap plus a per-worker share, keyed on the
 // worker id), BEFORE the body read, and holds it for the whole service call. No slot is a 429
 // with reason "busy" and Retry-After: 5, with the body unread and the publisher not called.
@@ -2425,8 +2428,9 @@ func (h *Handler) WorkerListMemory(w http.ResponseWriter, r *http.Request) {
 //
 // and the write deadline is upload + service + grace. The vars (worker_publish_deadline.go) are
 // named so a test can scale them, keeping the ratio. No other wrapper deadline is added: the
-// service's own bounds are the argument, and cutting the context shorter would cancel in-flight
-// retention bookkeeping.
+// service's own bounds are the argument, and cutting the context shorter would cut the
+// request-context persist and track writes of the publish. (The detached retention bookkeeping
+// runs on retentionBookkeepingCtx, which is WithoutCancel, and is not affected.)
 func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
@@ -2464,6 +2468,24 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		claimGeneration = &generation
+	}
+	// Ownership gate before admission (the WorkerRunHeldPublication HeldPublishGate precedent): a
+	// worker naming a run it does not hold takes no slot, extends no deadline and has no body read.
+	// It answers exactly as PublishAttested's not-owned path below. It is a TOCTOU pre-check;
+	// PublishAttested's own ownership and claim-generation checks stay authoritative.
+	if err := h.wsvc.CheckPublishOwnership(r.Context(), wkr, runID); err != nil {
+		if errors.Is(err, workersvc.ErrRunNotOwned) {
+			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			return
+		}
+		slog.Error("worker run publish",
+			"run_id", runID.String(),
+			"worker_id", wkr.ID.String(),
+			"reason", "internal",
+			"error", err,
+		)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
 	}
 	// Admission before the body read: a refused request buffers nothing and holds no deadline
 	// extension. The slot is held for the whole service call (the defer).
