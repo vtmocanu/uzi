@@ -15,7 +15,11 @@ for (;;) {
   }
 }
 fs.writeSync(2, "unblocked\n");
-// Give the timers and the watchdog thread a chance to observe the resumed heartbeat.
-await new Promise<void>((resolve) => setTimeout(resolve, 400));
+// Stay alive until the parent has observed the resumed line and sends a second byte
+// (bounded fallback so a lost byte cannot hang the fixture).
+await new Promise<void>((resolve) => {
+  const fallback = setTimeout(resolve, 15_000);
+  process.stdin.once("data", () => { clearTimeout(fallback); resolve(); });
+});
 await watchdog.stop();
 process.exit(0);

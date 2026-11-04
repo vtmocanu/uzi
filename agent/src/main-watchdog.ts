@@ -71,6 +71,7 @@ export function startMainWatchdog(opts: MainWatchdogOptions = {}): MainWatchdog 
     w.on("error", () => { fail("error"); });
     w.on("exit", (code) => {
       exited = true;
+      // Accepted race: a thread that exits on its own after stop() set `stopping` but before this event is not logged (an "error" event still is).
       if (!stopping) fail("exit", code);
     });
     w.unref();

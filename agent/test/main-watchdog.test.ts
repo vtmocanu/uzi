@@ -72,6 +72,8 @@ async function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<
 test("defaults and thread isolation settings", () => {
   assert.equal(MAIN_WATCHDOG_DEFAULTS.reportIntervalMs, 15_000);
   assert.equal(MAIN_WATCHDOG_DEFAULTS.stallMs, 30_000);
+  assert.equal(MAIN_WATCHDOG_DEFAULTS.beatMs, 1000);
+  assert.equal(MAIN_WATCHDOG_DEFAULTS.pollMs, 1000);
   const src = fs.readFileSync(path.join(agent, "src/main-watchdog.ts"), "utf8");
   assert.match(src, /execArgv: \[\]/);
   assert.match(src, /main-watchdog-thread\.mjs/);
@@ -94,8 +96,11 @@ test("a blocked main thread is reported as stalled before the block ends, then r
   assert.equal(resumed.level, "warn");
   assert.deepEqual(Object.keys(resumed).sort(), ["level", "msg", "rss_bytes", "stalled_ms", "ts"]);
   assert.equal(typeof resumed.stalled_ms, "number");
+  child.proc.stdin!.write("y");
   assert.equal(await withTimeout(child.exited, 10_000, "block fixture exit"), 0);
   assert.equal(child.lines.filter(msgIs("worker main thread stalled")).length, 1);
+  // A normal stop() must not be reported as the thread dying.
+  assert.equal(child.lines.filter(msgIs("worker main watchdog unavailable")).length, 0, JSON.stringify(child.lines));
 });
 
 test("periodic lines carry exactly ts, level, msg, rss_bytes, heartbeat_age_ms", async (t) => {
@@ -107,6 +112,8 @@ test("periodic lines carry exactly ts, level, msg, rss_bytes, heartbeat_age_ms",
   assert.equal(parsed.level, "info");
   assert.ok(Number.isInteger(parsed.heartbeat_age_ms));
   child.proc.stdin!.write("x");
+  await child.waitFor((l) => l === "unblocked", "unblocked marker");
+  child.proc.stdin!.write("y");
   await withTimeout(child.exited, 10_000, "block fixture exit");
 });
 
@@ -114,12 +121,15 @@ test("the watchdog does not keep the process alive without stop()", async (t) =>
   const child = run("main-watchdog-unref.ts");
   t.after(() => { child.proc.kill("SIGKILL"); });
   assert.equal(await withTimeout(child.exited, 15_000, "unref fixture exit"), 0);
+  assert.equal(child.lines.filter(msgIs("worker main watchdog unavailable")).length, 0, JSON.stringify(child.lines));
 });
 
 for (const [mode, label] of [["throw", "thread throws at load"], ["missing", "thread file is missing"], ["sync", "constructor throws synchronously"]] as const) {
   test(`failure isolation: ${label}`, async (t) => {
     const child = run("main-watchdog-failing.ts", [mode]);
     t.after(() => { child.proc.kill("SIGKILL"); });
+    await child.waitFor(msgIs("worker main watchdog unavailable"), "unavailable line");
+    child.proc.stdin!.write("y");
     assert.equal(await withTimeout(child.exited, 20_000, "failing fixture exit"), 0);
     assert.match(child.stdout, /^done$/m);
     const unavailable = child.lines.filter(msgIs("worker main watchdog unavailable"));

@@ -560,6 +560,7 @@ class BoundaryStepTracker {
     const active = this.active;
     if (!active) return;
     this.active = undefined;
+    if (this.enterLog) return;
     const elapsed = this.now() - active.startedAt;
     const fields: Record<string, unknown> = { step: active.step, durationMs: Number.isFinite(elapsed) ? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, elapsed)) : 0,
       ...(this.sink ? { sink: this.sink } : {}) };
