@@ -128,10 +128,16 @@ branch push and merge request publication remain separate and can succeed.
 [Issue #296](https://github.com/vtmocanu/uzi/issues/296) adds retries for explicit numeric
 HTTP 500–599 within one logical checkpoint publish: at most three HTTP requests total,
 with 250ms then 1000ms backoffs. Any supplied caller deadline or abort signal is shared
-across attempts; each HTTP request retains its own client timeout. Some callers supply
-no outer signal, so the first request's timeout does not bound the total operation. The
-`CHECKPOINT_INTERVAL` gate (default `20m`) still measures logical operations. HTTP 4xx,
-nonconfirming 2xx, skips, local errors, transport throws and aborts are not retried.
+across attempts. The `CHECKPOINT_INTERVAL` gate (default `20m`) still measures logical
+operations. HTTP 4xx other than 429, nonconfirming 2xx, skips, local errors, transport
+throws and aborts are not retried.
+(amended 2026-11-04, #3847) One request allowance (`CHECKPOINT_PUBLISH_TIMEOUT_MS`,
+480 s, not `WORKER_HTTP_TIMEOUT`) is created once before the first attempt and shared by
+all three; a retry never renews it, so it bounds the whole logical publish even for a
+caller with no outer signal, and an earlier caller or maintenance deadline still wins. An
+HTTP 429 (the api's `/publish` concurrency cap answering `busy`, before it reads the
+body) is retried in the same three-request loop after a fixed 5 s backoff inside that
+allowance, and logs on the same retry line as a 5xx.
 
 The replay factory captures the original source, candidate, literal floor and optional
 `defaultBlobSha`, including its absence. These remain immutable for the logical
