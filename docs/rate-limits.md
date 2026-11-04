@@ -319,6 +319,10 @@ who turned on [Codex account auto-selection](codex-credentials.md#letting-uzi-pi
 and pooled at least one login. Nothing here applies in the default mode, and a
 run never changes account after it is created.
 
+- **The order** follows `UZI_AUTOSELECT_ORDER`: by default the account whose
+  weekly window resets soonest among those with enough headroom, or the most
+  headroom under `headroom_first` (see
+  [Letting uzi pick the account](codex-credentials.md#how-it-chooses)).
 - **The score** is 100 minus the fullest window of the account's main `codex`
   bucket; additional feature buckets are ignored. A reading that is stale, from
   before a reset, from a meter that is not `fresh`, or unreadable because your
@@ -385,7 +389,9 @@ and a receiver advantage **>= 15 percentage points**. Unknown comparison
 evidence keeps the preferred harness.
 
 - **Codex:** evidence comes from the selected account, rechecked at the
-  credential fence, using its main `codex` bucket. It is not the best
+  credential fence, using its main `codex` bucket. The account comes from the
+  Codex selector, so which one is compared follows `UZI_AUTOSELECT_ORDER`
+  (by default the soonest weekly reset, not the most headroom). It is not the best
   hypothetical account outside that selection. A Codex receiver must be
   structurally usable, unheld, and selected as `auto` or `best_of_pool`,
   or be a healthy `default` account. `pool_empty`, `pool_stale` and

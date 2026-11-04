@@ -3155,7 +3155,7 @@ uzi token pool work-codex --kind codex --on
 `uzi settings codex-mode default|auto` sets how a new Codex run chooses its
 login (`PUT /api/me/codex-account-mode`, which accepts a `uzc_` Bearer token).
 `default` binds your default Codex login. `auto` picks, at run creation, the
-pooled Codex login with the most limit headroom; you opt logins into the pool
+pooled Codex login whose weekly allowance resets soonest (the operator's `UZI_AUTOSELECT_ORDER`, default `reset_first`); you opt logins into the pool
 per login with `uzi token pool <label> --kind codex --on` (the pool is empty
 until you do, and `auto` then falls back to your default). Logins are created
 unpooled. `--kind` is required only when the label is held by both an Anthropic
@@ -3174,7 +3174,7 @@ a run created before auto-selection:
 |---|---|
 | `default` | `work-codex — default` |
 | `pool_empty` | `work-codex — default (auto mode, but no login is pooled)` |
-| `auto` | `work-codex — auto (most limit headroom)` |
+| `auto` | `work-codex — auto (picked from pool)` |
 | `best_of_pool` | `work-codex — auto (best of pool; every login was under the headroom floor)` |
 | `pool_stale` | `work-codex — auto (no usage reading yet; first pooled login)` |
 | `pool_exhausted` | `work-codex — auto (every login at capacity; soonest to release)` |

@@ -90,8 +90,10 @@ this picker, the same as any other Codex run. Everything else — issue runs,
 autopilot, CI-fix, chat — is unaffected by this setting. Leave it on **your
 default token** to keep everything on one account.
 
-**Auto-select from the pool** picks whichever pooled token has the most
-rate-limit headroom, same as an auto worker. It differs from a worker in one
+**Auto-select from the pool** picks a pooled token the same way an auto worker
+does: the token whose weekly allowance resets soonest by default, or the one
+with the most rate-limit headroom under `UZI_AUTOSELECT_ORDER=headroom_first`
+(see [How it chooses](./anthropic-token.md#how-it-chooses)). It differs from a worker in one
 deliberate way: a worker with an empty pool *holds* the run, waiting for a
 token to be pooled, but the judge lane never holds a retrospective — with an
 empty pool it spends your default token instead, so finished runs never pile
