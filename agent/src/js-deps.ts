@@ -17,7 +17,9 @@
 // self-improve.ts before touching any of that: the worker holds the decrypted forge PAT
 // + the user's Anthropic token and its own env carries the join token, none of which may
 // ever reach repo-authored install code. This module widens WHICH dirs get installed; it
-// widens nothing about who runs the install or what it can see.
+// widens nothing about who runs the install or what it can see. (pnpm's
+// repo-configurable virtual store location is pinned into the clone; see the
+// pnpm entry below for what is and is not pinned.)
 //
 // ─── Repo-authored code execution: a REDUCTION, not a close ───────────────────
 //
@@ -62,6 +64,15 @@
 //          dependency's hook is suppressed by `--ignore-pnpmfile` IN THE CASES THE IMAGE PROOF
 //          EXERCISES; that is not a claim that no fetched config dependency can ever lead to
 //          code execution.
+//          WRITE LOCATION, NOT CLAIMED CLOSED: the `--config.virtual-store-dir`
+//          pin keeps the package files in the clone, but a repo
+//          `.npmrc` / workspace `store-dir=<abs>` still makes the install write pnpm's
+//          store index (and any fetched package content) at that path, outside the clone
+//          (measured on 10.34.9). The default store lives under the scrubbed HOME; a relative
+//          in-clone store pin would close it but moves every pnpm repo's store into the clone,
+//          away from the store later `pnpm` commands in the run use by default, so it is
+//          deferred rather than folded in here (issue #3906 review). `cache-dir` / `state-dir` showed no writes in an
+//          offline `file:`-only install, which does not exercise them.
 //   npm   no equivalent found. Measured: a `packageManager: "npm@9.0.0"` field caused no
 //          handoff (offline, exit 0), and the auditor separately measured that a repo
 //          `.npmrc` with `ignore-scripts=false` does not override the CLI flag.
@@ -184,7 +195,14 @@ interface InstallSpec {
 //   pnpm — `--ignore-scripts` (lifecycle) + `--ignore-pnpmfile` (a repo `.pnpmfile.cjs`,
 //          which runs DESPITE --ignore-scripts) + `--config.manage-package-manager-
 //          versions=false` (stops pnpm fetching and running the pnpm build a repo names
-//          in `packageManager`).
+//          in `packageManager`) + `--config.virtual-store-dir=node_modules/.pnpm` (pins
+//          pnpm's repo-configurable virtual store back into the clone: measured on 10.34.9,
+//          a repo `.npmrc` `virtual-store-dir=<abs>` or the workspace-yaml `virtualStoreDir`
+//          made the install write repo-authored package files at that path OUTSIDE the
+//          clone, rc=0; with the pin the same settings left nothing outside. The value is
+//          pnpm's own default, so a normal repo installs identically. An absolute
+//          `modules-dir` showed no escape of its own once the virtual store was pinned: pnpm
+//          resolved it under the project dir).
 //   yarn — `--ignore-scripts` covers lifecycle scripts on yarn CLASSIC (1.x), which is
 //          also the only line that accepts `--frozen-lockfile`. It does NOT cover
 //          `yarnPath`, so the env overlay carries `YARN_IGNORE_PATH=1`.
@@ -211,6 +229,7 @@ const INSTALL_COMMANDS: Record<JsPackageManager, InstallSpec> = {
       "--ignore-scripts",
       "--ignore-pnpmfile",
       "--config.manage-package-manager-versions=false",
+      "--config.virtual-store-dir=node_modules/.pnpm",
     ],
   },
   // THE SPLIT BELOW IS DELIBERATE: `--ignore-scripts` is ARGV, `YARN_IGNORE_PATH` is the

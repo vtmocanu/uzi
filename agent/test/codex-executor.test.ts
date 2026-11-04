@@ -26343,7 +26343,7 @@ describe("#2852 default installer binding", () => {
         else process.env.UZI_SQLC_DIR = sqlcDir;
         for (const [manager, lockfile, args] of [
           ["npm", "package-lock.json", ["ci", "--ignore-scripts"]],
-          ["pnpm", "pnpm-lock.yaml", ["install", "--frozen-lockfile", "--ignore-scripts", "--ignore-pnpmfile", "--config.manage-package-manager-versions=false"]],
+          ["pnpm", "pnpm-lock.yaml", ["install", "--frozen-lockfile", "--ignore-scripts", "--ignore-pnpmfile", "--config.manage-package-manager-versions=false", "--config.virtual-store-dir=node_modules/.pnpm"]],
           ["yarn", "yarn.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
           ["bun", "bun.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
         ] as const) {

@@ -75,6 +75,7 @@ describe("installJsDeps: the installer is chosen by the lockfile", () => {
         "--ignore-scripts",
         "--ignore-pnpmfile",
         "--config.manage-package-manager-versions=false",
+        "--config.virtual-store-dir=node_modules/.pnpm",
       ],
     },
     {
@@ -183,6 +184,10 @@ describe("installJsDeps: every measured repo-code-execution path is suppressed",
     assert.ok(
       calls[0]!.args.includes("--config.manage-package-manager-versions=false"),
       "without this pnpm fetches and RUNS the pnpm build the repo names in packageManager",
+    );
+    assert.ok(
+      calls[0]!.args.includes("--config.virtual-store-dir=node_modules/.pnpm"),
+      "without this a repo .npmrc virtual-store-dir=<abs> makes the install write repo-authored files outside the clone",
     );
   });
 

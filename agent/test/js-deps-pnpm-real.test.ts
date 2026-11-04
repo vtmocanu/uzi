@@ -38,6 +38,7 @@ const PIN = "10.34.9";
 const FLAG_SCRIPTS = "--ignore-scripts";
 const FLAG_PNPMFILE = "--ignore-pnpmfile";
 const FLAG_MANAGE = "--config.manage-package-manager-versions=false";
+const FLAG_VSTORE = "--config.virtual-store-dir=node_modules/.pnpm";
 
 const imageProof = process.env.UZI_PNPM_IMAGE_PROOF === "1";
 
@@ -446,5 +447,38 @@ describe("real pnpm through js-deps (issue #3906)", { skip: skipReason }, () => 
       assert.equal(tarballGets().length, 1, `expected the plugin tarball fetch, saw: ${requests.join(", ")}`);
       assert.equal(fs.existsSync(marker), true, "control plugin hook did not run: the fixture proves nothing");
     });
+  });
+
+  describe("(f) repo-chosen write locations outside the clone", () => {
+    // Each variant points a pnpm location setting at an absolute path in the test tmp root.
+    // PROTECTED: ok, dep resolves inside the clone, nothing exists at the path. CONTROL: the
+    // pin dropped writes there (the vector is live in this fixture).
+    const variants: { label: string; flag: string; npmrcKey: string; yamlKey: string }[] = [
+      { label: "virtual-store-dir", flag: FLAG_VSTORE, npmrcKey: "virtual-store-dir", yamlKey: "virtualStoreDir" },
+    ];
+    for (const v of variants) {
+      for (const source of [".npmrc", "pnpm-workspace.yaml"]) {
+        const build = () => {
+          const target = path.join(mkdir("escape"), "x");
+          const root =
+            source === ".npmrc"
+              ? mkFixture({ npmrc: `registry=http://127.0.0.1:9/\n${v.npmrcKey}=${target}\n` })
+              : mkFixture({ files: { "pnpm-workspace.yaml": `${v.yamlKey}: ${target}\n` } });
+          return { root, target };
+        };
+        it(`${v.label} in ${source}: protected run writes nothing outside the clone`, async () => {
+          const f = build();
+          assertPnpmResult(await protectedRun(f.root), true);
+          assert.equal(fs.existsSync(f.target), false, `something was written at ${f.target}`);
+          const required = execFileSync(process.execPath, ["-p", 'require("dep")'], { cwd: f.root, encoding: "utf8" }).trim();
+          assert.equal(required, "dep-installed");
+        });
+        it(`${v.label} in ${source}: control without ${v.flag} writes there`, async () => {
+          const f = build();
+          await controlRun(f.root, v.flag);
+          assert.equal(fs.existsSync(f.target), true, "control wrote nothing outside: the fixture proves nothing");
+        });
+      }
+    }
   });
 });

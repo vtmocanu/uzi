@@ -776,6 +776,12 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         new RegExp(`npm install --global --ignore-scripts [^;]*\\./pnpm-${v}\\.tgz`),
         `${name}/Dockerfile must install the verified tarball globally with --ignore-scripts`,
       );
+      assert.match(run, /^set -eu;/, `${name}/Dockerfile pnpm RUN must start with set -eu so any failed step aborts the build`);
+      assert.ok(!run.includes("||"), `${name}/Dockerfile pnpm RUN must not use || (it would swallow a failed integrity check or install)`);
+      const integrityAt = run.indexOf("process.argv[2]");
+      const installAt = run.indexOf("npm install --global");
+      assert.ok(integrityAt !== -1 && installAt !== -1, `${name}/Dockerfile pnpm RUN must have both the integrity check and the global install`);
+      assert.ok(integrityAt < installAt, `${name}/Dockerfile pnpm RUN must verify the tarball integrity BEFORE installing it`);
       assert.ok(run.includes(`test "$(pnpm --version)" = ${version}`), `${name}/Dockerfile must assert the baked pnpm version`);
       assert.ok(run.includes('test "$(command -v pnpm)" = /usr/local/bin/pnpm'), `${name}/Dockerfile must assert pnpm resolves to /usr/local/bin/pnpm`);
       assert.deepEqual(
