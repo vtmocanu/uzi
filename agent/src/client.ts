@@ -353,7 +353,9 @@ export interface InputReceipt {
 /** Issue #2545 step A: the per-request timeout of the held-publication upload, and of no other route.
  *  The api's write deadline for the route is 120 s upload + 150 s service + 30 s answer grace = 300 s;
  *  30 s of signal margin lets an answer written at the server's deadline still arrive. This route
- *  still uses native fetch's 300 s transport defaults; raising those needs a separate follow-up. */
+ *  keeps native fetch's 300 s defaults: HTTP/1.1 re-arms its header wait at upload completion,
+ *  and HTTP/2 uses an inactivity timer refreshed by upload writes. The post-upload service (150 s),
+ *  detached outcome write (10 s) and answer grace (30 s) fit below that timeout. */
 export const HELD_PUBLICATION_TIMEOUT_MS = 330_000;
 
 /** The logical-operation allowance of one checkpoint publish (POST .../runs/{id}/publish), and of no
