@@ -1544,6 +1544,28 @@ test("authority differs from trigger when the latest sample advances during the 
   await f.monitor.stop();
 });
 
+test("tree diagnostics count every enrolled candidate and every unavailable or rejected observation as a failure", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  const extra = (pid: number, observe: () => Promise<TreeObservation>) => f.commands.register(f.context, {
+    source: "codex-model-command", toolId: `tool-${pid}`, attemptId: "attempt",
+    root: { pid, startTime: "10" }, command: "inert fixture", observe,
+    cancel: async () => {}, drain: async () => ({ confirmed: true }),
+  });
+  extra(20, async () => ({ available: false, complete: false, startedAtMs: 0, completedAtMs: 0, rows: [] }));
+  extra(30, async () => { throw new Error("observe failed"); });
+  f.monitor.tick();
+  await until(() => f.requests.length === 1);
+  f.reservation.resolve(f.ack());
+  await f.monitor.settle();
+  const d = norm(diagnostics);
+  assert.equal(d.tree.candidates, 3, "all three enrolled trees are candidates");
+  assert.equal(d.tree.observation_failures, 2, "one unavailable plus one rejected observation");
+  assert.equal(d.tree.selected_rss_bytes_approx, 100, "the valid tree is still the selected one");
+  assert.equal(f.signals(), 1, "the intervention cancelled the valid tree only");
+  await f.monitor.stop();
+});
+
 test("a denied admission never observed the tree again: cancel_check is not_observed", async () => {
   let diagnostics: unknown;
   const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });

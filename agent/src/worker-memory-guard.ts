@@ -645,7 +645,9 @@ export class WorkerMemoryMonitor {
     if (!this.latest || !this.latestDecision || !incarnation || incarnation.worker_id !== entry.context.worker_id || incarnation.register_nonce !== entry.context.register_nonce) return;
     const tree: Tree = Object.freeze({
       rssBytesApprox: selected.rssBytesApprox, startedAtMs: selected.observation.startedAtMs,
-      completedAtMs: selected.observation.completedAtMs, candidates: observed.length, failures: candidates.length - observed.length,
+      completedAtMs: selected.observation.completedAtMs, candidates: candidates.length,
+      // Rejected/timed-out observations and adapter responses without complete evidence both count as failures.
+      failures: candidates.length - observed.filter(({ observation }) => observation?.available === true && observation.complete === true).length,
     });
     const a: Authority = Object.freeze({
       context: entry.context, phaseRevision: selected.phaseRevision, entry, incarnation: Object.freeze({ ...incarnation }),
