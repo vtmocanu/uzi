@@ -1,8 +1,9 @@
 // Managed Go work dir for a Claude run (issue #3870): `<runHome>/.uzi-go-work/g<claimGeneration>`.
 //
-// The launch points `GOTMPDIR` at one generation's leaf so Go's temporary build trees (`go-build*`,
-// `go-link-*`) live in a place the worker can find and remove as a unit when the run parks, instead of
-// in `/tmp` or the build cache. This module is only the primitives: preparing a leaf, removing leaves,
+// The launch points `GOTMPDIR` at one generation's leaf so Go's build work directory (`$WORK`,
+// `go-build*`) lives in a place the worker can find and remove as a unit when the run parks, instead of
+// in the shared TMPDIR. (An external link's `go-link-*` directory still uses TMPDIR: GOTMPDIR does not
+// move it.) This module is only the primitives: preparing a leaf, removing leaves,
 // and the leaf-name grammar. Launch wiring and park routing live elsewhere.
 //
 // Boundary, stated plainly. `.uzi-go-work` is a disposable scratch root, NOT cross-run isolation. A run

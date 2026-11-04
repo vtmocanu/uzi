@@ -15034,10 +15034,12 @@ export class RunRunner {
     const semanticPlanning = claim.semantic_planning === undefined ? undefined : parseSemanticEnrollment(claim.semantic_planning);
     const semanticGate = semanticPlanning ? new SemanticPlanningGate(this.client, runId, flight.claimGeneration,
       steering.lifecycleSignal(), this.semanticCoverageTestTransport) : undefined;
-    // issue #3870: the managed Go work leaf for a Claude flight on Linux (Codex executors set
-    // `safety` and never get one). Only an ordinary root-creation failure falls back to launching
-    // without GOTMPDIR; this block wraps nothing else.
-    if (!flight.executor.safety && flight.runHome && process.platform === "linux") {
+    // issue #3870: the managed Go work leaf for a Claude flight on Linux. A Codex executor's `safety`
+    // is only populated inside run(), so it is excluded here by the signals known before launch
+    // (`claim.secrets.codex`, `sandboxesCommands`), as isCodexCapture does. Only an ordinary
+    // root-creation failure falls back to launching without GOTMPDIR; this block wraps nothing else.
+    if (!flight.executor.safety && flight.executor.sandboxesCommands !== true && !claim.secrets.codex &&
+      flight.runHome && process.platform === "linux") {
       let homeReady = true;
       try {
         await fs.mkdir(flight.runHome, { recursive: true });

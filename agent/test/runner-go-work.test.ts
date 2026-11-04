@@ -227,6 +227,63 @@ describe("RunRunner: managed Go work dir (issue #3870 M2)", { skip: process.plat
       }).execute(claim);
       assert.equal(fs.readFileSync(seen, "utf8"), path.join(home, ".uzi-go-work", "g4"));
     }));
+
+  // Codex controls: a Codex executor's `safety` is only populated inside run(), so the launch gate must
+  // exclude it by the signals known beforehand (`sandboxesCommands`, `claim.secrets.codex`).
+  const CODEX_CREDENTIAL = {
+    auth_mode: "subscription",
+    access_token: "fixture-codex-access-token-3870",
+    capability: "fixture-codex-capability-3870",
+    generation: 3,
+    chatgpt_account_id: "verified-account",
+    chatgpt_plan_type: null,
+  } as const;
+
+  async function codexControl(iid: number, homeRoot: string, opts: { sandboxes: boolean; codexSecret: boolean }): Promise<{ ctxDir: string | undefined; seenRun: boolean; leafExisted: boolean; home: string }> {
+    const { gitlab } = fakeGitlab();
+    let home = "";
+    let ctxDir: string | undefined = "unset";
+    let seenRun = false;
+    let leafExisted = true;
+    const factory: ExecutorFactory = (id) => {
+      home = path.join(homeRoot, id);
+      const stub = new StubExecutor(nullLogger());
+      return {
+        homeDir: home,
+        executor: {
+          ...(opts.sandboxes ? { sandboxesCommands: true } : {}),
+          run: (ctx: RunContext): Promise<ExecutorResult> => {
+            seenRun = true;
+            ctxDir = ctx.managedGoWorkDir;
+            leafExisted = fs.existsSync(path.join(home, ".uzi-go-work"));
+            return stub.run(ctx);
+          },
+        },
+      };
+    };
+    simulateCommittedWork();
+    const runId = lastRunId(iid);
+    const base = gitlabClaim(iid, { run_id: runId, claim_generation: 2 });
+    const claim = opts.codexSecret ? { ...base, secrets: { ...base.secrets, codex: CODEX_CREDENTIAL } } : base;
+    await runnerWith(factory, gitlab, undefined, nullLogger()).execute(claim);
+    return { ctxDir, seenRun, leafExisted, home };
+  }
+
+  it("(h) an executor that sandboxes its commands gets no managed Go work leaf", () =>
+    withRoot(async (homeRoot) => {
+      const r = await codexControl(3890, homeRoot, { sandboxes: true, codexSecret: false });
+      assert.ok(r.seenRun, "precondition: the executor ran");
+      assert.equal(r.ctxDir, undefined);
+      assert.equal(r.leafExisted, false, "no .uzi-go-work was created in the run HOME");
+    }));
+
+  it("(i) a claim carrying secrets.codex gets no managed Go work leaf", () =>
+    withRoot(async (homeRoot) => {
+      const r = await codexControl(3891, homeRoot, { sandboxes: false, codexSecret: true });
+      assert.ok(r.seenRun, "precondition: the executor ran");
+      assert.equal(r.ctxDir, undefined);
+      assert.equal(r.leafExisted, false, "no .uzi-go-work was created in the run HOME");
+    }));
 });
 
 // Issue #3870 M3 (D5): park routing. A park that ENDED the run's process removes every managed Go work

@@ -299,8 +299,9 @@ dependency install (Bash commands and subagents inherit it). The general
 Docker-in-Docker, so stage anything a container needs in the worktree or the
 shared `TMPDIR`. `go build -work` directories can be inspected while the run
 is live, but they may disappear at a process-ended park, at a re-claim (older
-generations) or at terminal cleanup. The directory is removed only once no
-process of the run (by HOME, cwd or that `GOTMPDIR`) is left; if the worker
+generations) or at terminal cleanup. A park, the periodic reclaim or a
+re-claim removes it only once no process of the run (by HOME, cwd or that
+`GOTMPDIR`) is left; terminal cleanup removes it with the HOME. If the worker
 cannot create it, the run launches without `GOTMPDIR`. It is not capped and
 does not count toward cache bytes, only toward the run HOME's size. Old
 shared `go-build*` residue in `TMPDIR` is not collected. See the
