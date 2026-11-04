@@ -248,7 +248,7 @@ export function killRunnerGroup(pid: number | undefined): boolean {
  * both when the group is already gone (ESRCH) and when the signal failed, so a caller that
  * needs the group gone must confirm absence independently.
  */
-export function killRunnerGroupOnly(pgid: number): boolean {
+export function killRunnerGroupOnly(pgid: number, fixedHelper = false): boolean {
   if (pgid <= 0) return false;
   if (!uidSplitActive()) {
     // Single-uid: signal the group directly (same uid, permitted).
@@ -259,7 +259,8 @@ export function killRunnerGroupOnly(pgid: number): boolean {
       return false;
     }
   }
-  // Split: reap as `runner` via setpriv. `kill -KILL -<pgid>` targets the process group.
-  const r = spawnSync(SETPRIV, [...setprivRunnerArgs(), "kill", "-KILL", `-${pgid}`], { env: workerSpawnEnv(), stdio: "ignore" });
+  // Split: reap as `runner` via setpriv. The fixed helper receives only group-signal
+  // argv and no EX descriptor; this graph has no tree/ref/config write operation.
+  const r = spawnSync(SETPRIV, [...setprivRunnerArgs(), fixedHelper ? "/bin/kill" : "kill", "-KILL", `-${pgid}`], { env: fixedHelper ? { PATH: "/usr/bin:/bin", LC_ALL: "C" } : workerSpawnEnv(), stdio: "ignore", ...(fixedHelper ? { timeout: 1_000 } : {}) });
   return r.status === 0;
 }

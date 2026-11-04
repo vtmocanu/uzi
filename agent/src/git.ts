@@ -27,7 +27,8 @@ import { CheckpointChildStartupTimeoutError } from "./harness.js";
 import type { CredentialFreeCaptureContext } from "./harness.js";
 import type { CommandSandboxMode } from "./config.js";
 import { validateCaptureGitRequest } from "./credential-free-capture.js";
-import { RUNNER_UID, WORKER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
+import { processGroupAlive } from "./tick-spawner.js";
+import { RUNNER_UID, WORKER_UID, killRunnerGroupOnly, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
@@ -3095,6 +3096,284 @@ export class GitCache {
 
   private readonly epochRetained = new AsyncLocalStorage<Required<EpochRetainedLimits>>();
   private readonly epochDiscardProofs = new WeakMap<EpochDiscardProof, EpochDiscardProofState>();
+  // Native options never enter boundary, capture, SDK or run request objects.
+  private readonly epochNative = new AsyncLocalStorage<EpochDiscardProofState>();
+  private epochNativeTestDependencies?: {
+    spawn: typeof spawn;
+    alive: typeof processGroupAlive;
+    kill: (pid: number, identity: BoundaryProcessRequest["identity"]) => void;
+    joinMs: number;
+  };
+
+  /** The validated automatic discard branch owns this bounded native read scope. */
+  private withEpochNativeReads<T>(proof: EpochDiscardProof, action: () => Promise<T>): Promise<T> {
+    const state = this.epochDiscardProofs.get(proof);
+    if (!state) throw new Error("unregistered epoch discard proof");
+    if (this.boundaryProcesses.getStore() || this.epochNative.getStore())
+      throw new Error("epoch native process scope overlap");
+    this.checkEpochDiscardLive(state);
+    return this.epochNative.run(state, action);
+  }
+
+  private epochNativePaths(): string[] {
+    return this.epochNative.getStore()!.paths.flatMap(p =>
+      [p, path.join(path.dirname(p), `.uzi-skills-${path.basename(p)}`)]);
+  }
+
+  /** Admit only the read graph used before the unavailable guard, never a transport
+   * or a configurable wrapper. Config writes remain outside this read foundation. */
+  private preflightEpochNative(command: string, args: string[], env: NodeJS.ProcessEnv,
+    identity: BoundaryProcessRequest["identity"]): NodeJS.ProcessEnv {
+    const refuse = (): never => { throw new Error("epoch native executable chain unaudited"); };
+    const unwrap = (wrapped: { command: string; args: string[] }): string[] | undefined =>
+      command === wrapped.command && wrapped.args.every((arg, i) => args[i] === arg)
+        ? args.slice(wrapped.args.length) : undefined;
+    const git = command === GIT_BIN ? args : unwrap(runnerCommand(GIT_BIN, []));
+    const rm = unwrap(runnerCommand(RETENTION_RM_BIN, [], true));
+    if (rm?.length === 3 && rm[0] === "-rf" && rm[1] === "--" &&
+        this.epochNativePaths().includes(rm[2]!) && identity === "command" &&
+        Object.entries(env).every(([k, v]) => v === undefined || k === "PATH" && v === "/usr/bin:/bin")) return env;
+    if (!git) return refuse();
+    // Accept only values the existing credential-free builders actually emit.
+    // No credential pair, config override, loader variable or caller-selected path
+    // is admitted. The automatic replacement below then pins HOME/PATH and disables global/system config.
+    const base = gitEnv();
+    const allowed = new Map<string, Set<string | undefined>>();
+    const variants = [base, workerSpawnEnv(base), unmarkedSpawnEnv(base),
+      { ...base, PATH: runnerPath(), TMPDIR: runnerTmpdir() ?? base.TMPDIR }];
+    for (const variant of variants) for (const [key, value] of Object.entries(variant)) {
+      if (!allowed.has(key)) allowed.set(key, new Set());
+      allowed.get(key)!.add(value);
+    }
+    for (const [key, value] of Object.entries({ GIT_NO_REPLACE_OBJECTS: "1", GIT_OPTIONAL_LOCKS: "0",
+      GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL, GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null" })) {
+      allowed.set(key, new Set([value]));
+    }
+    if (Object.entries(env).some(([key, value]) => value !== undefined && !allowed.get(key)?.has(value)))
+      throw new Error("epoch native environment unaudited");
+    const state = this.epochNative.getStore()!;
+    let rest = [...git];
+    let cwd: string | undefined;
+    if (rest[0] === "-C") { cwd = rest[1]; rest = rest.slice(2); }
+    if (cwd !== undefined && cwd !== (identity === "command" ? state.paths[0] : state.barePath)) return refuse();
+    const pins = new Set(["core.fsmonitor=false", "core.excludesFile=/dev/null", `core.worktree=${state.paths[0]}`,
+      "core.trustctime=true", "core.checkStat=default", "core.fileMode=true", "core.ignoreCase=false",
+      "status.showUntrackedFiles=all", "core.untrackedCache=false"]);
+    while (rest[0] === "--no-replace-objects" || rest[0] === "--no-optional-locks" || rest[0] === "-c") {
+      if (rest[0] === "-c") { if (!pins.has(rest[1]!)) return refuse(); rest = rest.slice(2); }
+      else rest = rest.slice(1);
+    }
+    const shape = JSON.stringify(rest);
+    const operand = (v: string) => /^(HEAD|refs\/[A-Za-z0-9_./-]+|[0-9a-f]{40})(\^\{commit\})?$/.test(v);
+    const exact = (...v: string[]) => shape === JSON.stringify(v);
+    const [sub, ...tail] = rest;
+    let admitted = exact("version") || exact("--version") ||
+      exact("config", "--file", "-", "--no-includes", "--null", "--list");
+    if (cwd) admitted ||= (
+      sub === "config" && [
+        ["--local", "--null", "--list"], ["--local", "--no-includes", "--null", "--list"],
+        ["--local", "--no-includes", "--name-only", "--list"], ["--null", "--list"],
+      ].some(v => JSON.stringify(v) === JSON.stringify(tail)) ||
+      sub === "rev-parse" && (exact(sub, "--is-bare-repository") || exact(sub, "--is-shallow-repository") ||
+        tail.length >= 2 && tail.slice(0, -1).every(v => ["--verify", "--quiet"].includes(v)) && operand(tail.at(-1)!)) ||
+      sub === "for-each-ref" && tail.length >= 1 && tail.length <= 2 &&
+        ["--format=%(refname)", "--format=%(refname) %(objectname)", "--format=%(objectname) %(refname)"].includes(tail[0]!) &&
+        (tail.length === 1 || operand(tail[1]!)) ||
+      sub === "symbolic-ref" && exact(sub, "refs/remotes/origin/HEAD") ||
+      sub === "check-ref-format" && tail.length === 1 && operand(tail[0]!) ||
+      sub === "cat-file" && tail.length === 2 && tail[0] === "-t" && /^[0-9a-f]{40}$/.test(tail[1]!) ||
+      sub === "ls-files" && (exact(sub, "--stage", "-z") || exact(sub, "-v", "-z")) ||
+      sub === "status" && exact(sub, "--porcelain", "--ignore-submodules=none") ||
+      sub === "rev-list" && tail[0] === "--objects" && tail[1] === "-n" && tail[2] === "1" &&
+        tail.slice(3).filter(v => v !== "--not").every(v => /^[0-9a-f]{40}$/.test(v)) && tail.includes("--not")
+    );
+    if (!admitted) return refuse();
+    return { ...base, PATH: "/usr/bin:/bin", HOME: "/", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL, GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1",
+      GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null" };
+  }
+
+  private async execEpochNative(
+    command: string, args: string[],
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer; bytes?: true },
+    identity: BoundaryProcessRequest["identity"], signal?: AbortSignal,
+  ): Promise<{ stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer }> {
+    const state = this.epochNative.getStore()!;
+    if (this.boundaryProcesses.getStore()) throw new Error("epoch native process scope overlap");
+    this.checkEpochDiscardLive(state);
+    signal?.throwIfAborted();
+    options = { ...options, env: this.preflightEpochNative(command, args, options.env, identity) };
+    if (args.includes("config") && !args.includes("--no-includes")) args = [...args, "--no-includes"];
+    if (args.includes("status")) args = args.map(v => v === "--ignore-submodules=none" ? "--ignore-submodules=all" : v);
+    if ((command === "/bin/setpriv" && identity !== "command") ||
+        (uidSplitActive() && identity === "command" && command !== "/bin/setpriv"))
+      throw new Error("epoch native group identity mismatch");
+    assertNoCredentialedGitWhileQuarantined(options.env);
+    MaintenanceResources.consumeIfActive("launches", 1);
+    const ticket = state.scope.beginMutation();
+    const deps = this.epochNativeTestDependencies;
+    let child: ChildProcess;
+    try {
+      const stdio = state.scope.inheritStdio(["pipe", "pipe", "pipe"]);
+      child = (deps?.spawn ?? spawn)(command, args, {
+        env: options.env, cwd: options.cwd, detached: true, stdio,
+      });
+    } catch (error) { state.scope.stop(); throw error; }
+    const pid = child.pid;
+    const alive = () => {
+      if (!Number.isSafeInteger(pid) || pid! <= 0) throw new Error("epoch process group unknown");
+      return deps ? deps.alive(pid!, identity) : processGroupAlive(pid!, identity, true);
+    };
+    const kill = () => {
+      if (deps) { deps.kill(pid!, identity); return; }
+      if (identity === "command") {
+        if (!killRunnerGroupOnly(pid!, true) && alive()) throw new Error("epoch group signal unconfirmed");
+        return;
+      }
+      try { process.kill(-pid!, "SIGKILL"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    };
+    const chunks = { stdout: [] as Buffer[], stderr: [] as Buffer[] };
+    const cap = options.maxBuffer ?? 1024 * 1024;
+    let failure: unknown, cleanup: Promise<void> | undefined;
+    let direct = false, closed = false, ioJoined = false;
+    let code: number | null = null;
+    const joinMs = deps?.joinMs ?? 1_000;
+    // One bounded cleanup per launch; failure does not settle sibling tickets.
+    const startCleanup = () => cleanup ??= (async () => {
+      const until = Date.now() + joinMs;
+      try {
+        // Normal exit permits one bounded grace; errors cancel immediately. Only
+        // positive group absence plus direct and IO joins can settle this ticket.
+        const grace = Date.now() + (failure ? 0 : joinMs);
+        while (alive() && Date.now() < grace && !failure)
+          await new Promise<void>(resolve => setTimeout(resolve, 10));
+        if (alive()) kill();
+        const joinedUntil = Math.max(until, Date.now() + joinMs);
+        for (;;) {
+          if (direct && closed && ioJoined && !alive()) return;
+          if (Date.now() >= joinedUntil) throw new Error("epoch native group or IO join unconfirmed");
+          await new Promise<void>(resolve => setTimeout(resolve, 10));
+        }
+      } catch (error) { state.scope.stop(); throw error; }
+    })();
+    let notifyCleanup!: () => void;
+    const cleanupStarted = new Promise<void>(resolve => { notifyCleanup = resolve; });
+    const clean = () => { void startCleanup().catch(() => undefined); notifyCleanup(); };
+    const fail = (error: unknown) => { failure ??= error; clean(); };
+    const io: Promise<unknown>[] = [];
+    for (const name of ["stdout", "stderr"] as const) {
+      const source = child[name];
+      if (!source) { state.scope.stop(); fail(new Error("epoch native output missing")); continue; }
+      const joinedSource = finished(source);
+      void joinedSource.catch(() => undefined);
+      io.push(joinedSource);
+      const output = this.meteredGitOutput(source, "metadataBytes",
+        () => fail(new Error("epoch native output cancelled")));
+      if (output !== source) {
+        const joinedOutput = finished(output);
+        void joinedOutput.catch(() => undefined);
+        io.push(joinedOutput);
+      }
+      let bytes = 0;
+      output.on("data", (value: Buffer | string) => {
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        if (failure) return;
+        if (chunk.length > cap - bytes) {
+          fail(this.retainedCause(Object.assign(new Error("git subprocess maxBuffer exceeded"),
+            { outputExceeded: true, outputStream: name, code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }), "metadata_byte_cap"));
+        } else { chunks[name].push(chunk); bytes += chunk.length; }
+      });
+      output.on("error", fail);
+    }
+    // stdin EPIPE remains an ordinary child outcome; child close joins its handle.
+    if (!child.stdin) { state.scope.stop(); fail(new Error("epoch native input missing")); }
+    else {
+      child.stdin.on("error", () => undefined);
+      try { child.stdin.end(options.input); }
+      catch (error) { state.scope.stop(); fail(error); }
+    }
+    void Promise.all(io).then(() => { ioJoined = io.length >= 2; }, fail);
+    child.once("exit", value => { direct = true; code = value; clean(); });
+    child.once("error", error => { direct = true; fail(error); });
+    child.once("close", () => { closed = true; });
+    const abortSignal = AbortSignal.any([state.signal, ...(signal ? [signal] : [])]);
+    const abort = () => fail(abortSignal.reason ?? new Error(GIT_OUTPUT_ABORT_MESSAGE));
+    abortSignal.addEventListener("abort", abort, { once: true });
+    const timeout = Math.max(1, Math.min(options.timeout ?? Infinity, state.deadline - Date.now()));
+    const timer = setTimeout(() => fail(Object.assign(new Error("git subprocess timed out"), { killed: true })), timeout);
+    if (abortSignal.aborted) abort();
+    try {
+      await cleanupStarted;
+      await cleanup;
+      if (state.scope.stopped()) throw new Error("epoch native scope stopped");
+      ticket.settle();
+      const stdoutBytes = Buffer.concat(chunks.stdout);
+      const stderrBytes = Buffer.concat(chunks.stderr);
+      const result = { stdout: stdoutBytes.toString(), stderr: stderrBytes.toString(),
+        ...(options.bytes ? { stdoutBytes, stderrBytes } : {}) };
+      if (failure || code !== 0) throw Object.assign(
+        failure instanceof Error ? failure : new Error(result.stderr || "git subprocess failed"),
+        result, { ...(failure && typeof failure === "object" && "code" in failure ? {} : { code }),
+          epochProcessJoined: true, ...(child.signalCode ? { signal: child.signalCode } : {}) });
+      this.checkRecoveryInterruption();
+      MaintenanceResources.checkIfActive();
+      return result;
+    } finally {
+      clearTimeout(timer);
+      abortSignal.removeEventListener("abort", abort);
+    }
+  }
+
+  private async runEpochRunnerUidDelete(target: string): Promise<void> {
+    const state = this.epochNative.getStore()!;
+    this.checkEpochDiscardLive(state);
+    if (this.boundaryProcesses.getStore() || !this.epochNativePaths().includes(target))
+      throw new Error("epoch native delete scope refused");
+    const ticket = state.scope.beginMutation();
+    const key = path.resolve(target);
+    this.unsettledDeletes.set(key, (this.unsettledDeletes.get(key) ?? 0) + 1);
+    let settlement: AuthoritySettlement | undefined;
+    let joined = true, settlingSuccess = false;
+    try {
+      settlement = await this.beginDestructive([target], "runner-uid-delete");
+      if (this.retentionDeleteSeam) throw new Error("epoch native legacy delete seam refused");
+      if (uidSplitActive()) {
+        joined = false;
+        const wrapped = runnerCommand(RETENTION_RM_BIN, ["-rf", "--", target], true);
+        try {
+          await this.execEpochNative(wrapped.command, wrapped.args,
+            { env: { PATH: "/usr/bin:/bin" }, cwd: "/", timeout: RETENTION_RM_TIMEOUT_MS }, "command");
+          joined = true;
+        } catch (error) {
+          joined = (error as { epochProcessJoined?: boolean }).epochProcessJoined === true;
+          throw error;
+        }
+      } else {
+        // fs.rm is independently awaited; a rejected operation is a joined refusal.
+        this.checkEpochDiscardLive(state);
+        try { await fs.rm(target, { recursive: true, force: true }); }
+        finally { joined = true; }
+      }
+      try { this.checkEpochDiscardLive(state); }
+      catch (error) { state.scope.stop(); throw error; }
+      settlingSuccess = true;
+      await settlement?.settle({ ok: true });
+    } catch (error) {
+      if (settlingSuccess) { state.scope.stop(); throw error; }
+      if (!joined || state.scope.stopped()) { state.scope.stop(); throw error; }
+      try { await settlement?.settle({ ok: false, residue: [target] }); }
+      catch { state.scope.stop(); throw error; }
+      throw error;
+    } finally {
+      if (joined && !state.scope.stopped()) {
+        const pending = (this.unsettledDeletes.get(key) ?? 1) - 1;
+        if (pending) this.unsettledDeletes.set(key, pending);
+        else this.unsettledDeletes.delete(key);
+        ticket.settle();
+      }
+    }
+  }
 
   /**
    * Registers a copied, immutable binding for the worker coordinator. Raw journal bytes stay
@@ -3476,6 +3755,7 @@ export class GitCache {
     action: () => Promise<T>,
     hooks: { beforeLockRelease?: (key: string) => Promise<void>; softSignal?: AbortSignal; softDeadlineAt?: number; now?: () => number } = {},
   ): Promise<T> {
+    if (this.epochNative.getStore()) throw new Error("epoch native process scope overlap");
     if (this.boundaryProcesses.getStore()?.capture) throw new Error("capture spawner cannot be replaced");
     return this.boundaryProcesses.run(
       { spawn: spawner, signal, ...hooks },
@@ -3485,6 +3765,7 @@ export class GitCache {
 
   /** Bind the opaque safety context privately. The runner supplies no command spawner. */
   withCredentialFreeCapture<T>(context: CredentialFreeCaptureContext, action: () => Promise<T>): Promise<T> {
+    if (this.epochNative.getStore()) throw new Error("epoch native process scope overlap");
     if (this.boundaryProcesses.getStore()) throw new Error("capture scope cannot overlay a process scope");
     const base = gitEnv();
     // Enumerate only worker-owned, fixed decorations used by the capture readers.
@@ -4897,6 +5178,7 @@ export class GitCache {
    *  {@link freeCanonicalClonePath}): runner-uid under the split, in-process single-uid. */
   private async runRunnerUidDelete(target: string): Promise<void> {
     if (this.boundaryProcesses.getStore()?.capture) throw new Error("capture cannot run an unsupervised delete");
+    if (this.epochNative.getStore()) return this.runEpochRunnerUidDelete(target);
     const split = this.retentionDeleteSeam?.split ?? uidSplitActive();
     // issue #3404 M2: registered BEFORE the first byte can go; a refusal deletes nothing.
     const settlement = await this.beginDestructive([target], "runner-uid-delete");
@@ -10645,7 +10927,7 @@ export class GitCache {
           if (err.code === "ENOENT") return undefined;
           throw err;
         });
-        if (st === undefined) continue;
+        if (st === undefined) { if (automatic) return false; continue; }
         if (!st.isDirectory() || st.isSymbolicLink()) return false;
         if (automatic) {
           if (!(await this.automaticDirectoryEmpty(gitlink, automatic, false))) return false;
@@ -11530,7 +11812,7 @@ export class GitCache {
           opts.lifecycle?.state !== "terminal") return refused("epoch_authority_refused");
       try {
         return await this.epochRetained.run(this.epochLimits(), () => this.withRecoveryOperation(
-          epoch.signal, epoch.deadline, () => this.withLock(epoch.barePath, async () => {
+          epoch.signal, epoch.deadline, () => this.withEpochNativeReads(proof!, () => this.withLock(epoch.barePath, async () => {
             this.checkEpochDiscardLive(epoch);
             const g = await this.gatherRetainedUnderLock(epoch.barePath);
             this.checkEpochDiscardLive(epoch);
@@ -11556,7 +11838,7 @@ export class GitCache {
             // Serial integration guard: native descendant joining and durable retirement must
             // land before worker epoch authority can enter the existing disposal algorithm.
             return refused("epoch_discard_unavailable");
-          })));
+          }))));
       } catch {
         return refused("stale_epoch_proof");
       }
@@ -19708,6 +19990,11 @@ try {
     const operationSignal = operationSignals.length ? AbortSignal.any(operationSignals) : undefined;
     if (recovery) options = { ...options, timeout: Math.min(options.timeout ?? Infinity, this.recoveryRemaining(recovery)) };
     const { input, bytes: wantBytes, ...execOptions } = options;
+    if (this.epochNative.getStore()) {
+      const result = await this.execEpochNative(command === "git" ? GIT_BIN : command, args, options, identity, operationSignal);
+      this.checkEpochMetadata(args, result.stdout);
+      return result;
+    }
     if (!boundary) {
       // issue #2213: the second quarantine check, keyed on the credential itself, synchronously
       // before the child is created (nothing awaits between this and execFileAsync).
@@ -20513,7 +20800,7 @@ try {
     // cap-less uid would fail (and would try to cross identities twice).
     const wrapped = this.boundaryProcesses.getStore()
       ? { command: GIT_BIN, args: withDir(cwd, args) }
-      : runnerCommand("git", withDir(cwd, args));
+      : runnerCommand(this.epochNative.getStore() ? GIT_BIN : "git", withDir(cwd, args));
     return { env, wrapped };
   }
 
