@@ -18,7 +18,9 @@ import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from 
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, input, installHarness } from "./runner-harness.js";
 
 // issue #3860: a claim that stops at a held-predecessor refusal must still honour an owner cancel
-// that is already persisted, but only when no other outcome of the run can be racing it.
+// that the server reports as requested (ownership `cancellation_requested`), but only when no other
+// outcome of the run can be racing it. The seam is read-only: it never reads the inputs (an older api
+// consumes them on read), so an api that does not serve the field leaves the cancel pending.
 
 installHarness();
 
@@ -103,7 +105,13 @@ async function runtime(): Promise<AuthorityRuntime> {
 
 type Priv = any;
 
-interface Owner { status: string; generation: number | undefined; released: boolean; armed: boolean }
+interface Owner {
+  status: string; generation: number | undefined; released: boolean; armed: boolean;
+  /** Served as `cancellation_requested` once the seam is reached; undefined omits the field (an older api). */
+  requested: unknown;
+  /** When set, the ownership answer waits for it, holding the seam's read in flight. */
+  gate: Promise<void> | undefined;
+}
 
 interface RigOptions {
   site: "A" | "B";
@@ -112,8 +120,10 @@ interface RigOptions {
   outbox?: "ok" | "none" | "disabled";
   /** Called inside the seam, after the observable pre-state is captured and before the helper runs. */
   pre?: (rig: Rig, flight: Priv, claim: Priv) => void | Promise<void>;
-  /** Queue an owner cancel row before the claim. */
+  /** An owner cancel is persisted: a pending cancel row, and the server reports it as requested. */
   cancel?: boolean;
+  /** Override what the server serves as `cancellation_requested` (default: true with `cancel`, else omitted). */
+  requested?: unknown;
   /** Ownership answer once the seam is reached (default: running at the claim generation). */
   owner?: Partial<Pick<Owner, "status" | "generation" | "released">>;
   runnerOpts?: Record<string, unknown>;
@@ -133,6 +143,9 @@ interface Rig {
   lines: unknown[];
   seamCalls: () => number;
   getsAtSeam: number | undefined;
+  ownAtSeam: number | undefined;
+  /** Ownership reads the seam itself issued (after it was reached). */
+  ownReads: () => number;
   flight: Priv | undefined;
   reserve: { mock: { callCount(): number } };
   current: AuthorityRuntime | undefined;
@@ -141,6 +154,8 @@ interface Rig {
   run: (generation?: number) => Promise<void>;
   gets: () => number;
   failed: () => Array<{ runId: string; body: Record<string, unknown> }>;
+  /** Hold the seam's ownership read in flight until the returned release is called. */
+  holdOwnership: () => () => void;
 }
 
 async function rig(t: TestContext, o: RigOptions): Promise<Rig> {
@@ -180,15 +195,19 @@ async function rig(t: TestContext, o: RigOptions): Promise<Rig> {
       throw new SourceUseHeldRefusal("held_unended (fixture)");
     });
   }
-  const owner: Owner = { status: "running", generation, released: false, armed: false };
+  const owner: Owner = { status: "running", generation, released: false, armed: false, requested: "requested" in o ? o.requested : (o.cancel ? true : undefined), gate: undefined };
   api.ownershipWire.set(runId, res => {
     const armed = owner.armed;
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      status: armed ? owner.status : "running",
-      claim_released: armed ? owner.released : false,
-      ...(armed ? (owner.generation !== undefined ? { claim_generation: owner.generation } : {}) : { claim_generation: generation }),
-    }));
+    const answer = (): void => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        status: armed ? owner.status : "running",
+        claim_released: armed ? owner.released : false,
+        ...(armed ? (owner.generation !== undefined ? { claim_generation: owner.generation } : {}) : { claim_generation: generation }),
+        ...(armed && owner.requested !== undefined ? { cancellation_requested: owner.requested } : {}),
+      }));
+    };
+    if (armed && owner.gate) void owner.gate.then(answer); else answer();
   });
   if (o.owner) Object.assign(owner, o.owner);
   const r = { t, runner, runId, iid: o.iid, generation, pred, before, started, outbox, owner, lines, getsAtSeam: undefined,
@@ -198,7 +217,9 @@ async function rig(t: TestContext, o: RigOptions): Promise<Rig> {
     r.flight = flight;
     owner.armed = true;
     // The cancel lands after steering's first read, so only the seam can observe it.
+    // The cancel row is persisted but only the ownership field can surface it to the seam.
     if (o.cancel) api.setInputs(runId, [input("cancel")]);
+    r.ownAtSeam = api.ownershipRequests.filter(id => id === runId).length;
     if (outbox && o.outbox === "disabled") (outbox as Priv).disabled = true;
     await o.pre?.(r, flight, claim);
     r.getsAtSeam = r.gets();
@@ -208,6 +229,12 @@ async function rig(t: TestContext, o: RigOptions): Promise<Rig> {
   r.claim = (g = generation) => gitlabClaim(o.iid, { run_id: runId, claim_generation: g });
   r.run = async (g = generation) => { api.setOwnershipStatus(runId, "running", g); await runner.execute(r.claim(g)); };
   r.gets = () => api.inputGets.get(runId) ?? 0;
+  r.ownReads = () => api.ownershipRequests.filter(id => id === runId).length - (r.ownAtSeam ?? 0);
+  r.holdOwnership = () => {
+    let release!: () => void;
+    owner.gate = new Promise<void>(resolve => { release = resolve; });
+    return release;
+  };
   r.failed = () => api.states.filter(s => s.runId === runId && s.body.status === "failed") as unknown as Array<{ runId: string; body: Record<string, unknown> }>;
   return r;
 }
@@ -222,6 +249,7 @@ function assertPlainStop(r: Rig, why: string): void {
   assert.equal(r.started(), 0, `${why}: no executor`);
   assert.equal(r.failed().length, 0, `${why}: no failed report`);
   assert.equal(r.flight.steering.isCancelled(), false, `${why}: cancel not committed`);
+  assert.equal(r.gets(), r.getsAtSeam, `${why}: the seam never reads inputs`);
   assert.equal(treeHash(r.pred.clonePath), r.before, `${why}: custody and clone untouched`);
 }
 
@@ -237,6 +265,7 @@ function assertCancelledOnce(r: Rig, generation = r.generation): void {
   assert.equal(failed.length, 1, "exactly one failed report");
   assert.deepEqual(journaledGenerations(r), [generation], "the one terminal outcome is journaled at the claim generation");
   assert.equal(r.started(), 0, "no executor started");
+  assert.equal(r.gets(), r.getsAtSeam, "the seam never reads inputs");
   assert.equal(treeHash(r.pred.clonePath), r.before, "custody and the clone are retained untouched");
   assert.equal(r.flight.steering.isCancelled(), true);
 }
@@ -267,22 +296,37 @@ describe("issue #3860: owner cancel at a held-predecessor refusal", { skip: !HAS
     }
   }
 
-  it("a cancel inserted while the read is in flight is honoured", async t => {
-    const r = await rig(t, { site: "A", iid: 3862, outbox: "ok" });
-    const hold = api.holdNextInputGet(r.runId, 1);
+  it("a cancel the server starts reporting while the read is in flight is honoured", async t => {
+    const r = await rig(t, { site: "A", iid: 3862, outbox: "ok", requested: undefined });
+    const release = r.holdOwnership();
     const done = r.run();
-    await hold.entered;
+    while (r.flight === undefined || r.ownReads() < 1) await new Promise(res => setTimeout(res, 5));
     api.setInputs(r.runId, [input("cancel")]);
-    hold.release();
+    r.owner.requested = true;
+    release();
     await done;
     assertCancelledOnce(r);
   });
 
-  it("no cancel row: a plain stop, one read, no report", async t => {
-    const r = await rig(t, { site: "A", iid: 3863, outbox: "ok" });
+  it("an api that does not serve the field (older pod): a plain stop, zero input reads, the cancel stays pending", async t => {
+    const r = await rig(t, { site: "A", iid: 3863, outbox: "ok", cancel: true, requested: undefined });
     await r.run();
-    assertPlainStop(r, "no cancel");
-    assert.equal(r.gets() - r.getsAtSeam!, 1, "exactly one read, no retry");
+    assertPlainStop(r, "field absent");
+    assert.equal(r.ownReads() >= 1, true, "the seam asked the server");
+    assert.equal(api.pendingInputRows(r.runId).some(row => row.kind === "cancel"), true, "the persisted cancel was not consumed");
+  });
+
+  it("the field false: a plain stop", async t => {
+    const r = await rig(t, { site: "A", iid: 3864, outbox: "ok", requested: false });
+    await r.run();
+    assertPlainStop(r, "field false");
+  });
+
+  it("exactly one bounded ownership read at the seam, no retry", async t => {
+    const r = await rig(t, { site: "A", iid: 3865, outbox: "ok", requested: false });
+    await r.run();
+    assertPlainStop(r, "one read");
+    assert.equal(r.ownReads(), 1);
   });
 
   describe("unsafe before the read: no input read at all", () => {
@@ -306,7 +350,7 @@ describe("issue #3860: owner cancel at a held-predecessor refusal", { skip: !HAS
         });
         await r.run();
         assertPlainStop(r, name);
-        assert.equal(r.gets(), r.getsAtSeam, "no input GET after the seam");
+        assert.equal(r.ownReads(), 0, "no ownership read at all");
       });
     }
   });
@@ -325,56 +369,43 @@ describe("issue #3860: owner cancel at a held-predecessor refusal", { skip: !HAS
     const m = (r.runner as Priv).executionTails as Map<string, Promise<void>>;
     if (original) m.set(r.runId, original);
     assertPlainStop(r, "tail replaced");
-    assert.equal(r.gets(), r.getsAtSeam);
+    assert.equal(r.ownReads(), 0, "no ownership read at all");
   });
 
-  describe("a conflicting outcome appears while the read is in flight", () => {
-    it("an earlier-generation terminal journal installed during the delayed read", async t => {
-      const r = await rig(t, { site: "A", iid: 3900, cancel: true, outbox: "ok" });
-      const hold = api.holdNextInputGet(r.runId, 1);
-      const done = r.run();
-      await hold.entered;
-      await journalFailed(r.outbox!, r.runId, r.generation - 1);
-      hold.release();
-      await done;
-      assertPlainStop(r, "journal during the read");
+  it("this flight's own execution tail is registered: the cancel is honoured", async t => {
+    let seen: { registered: unknown; own: unknown } | undefined;
+    const r = await rig(t, {
+      site: "A", iid: 3892, cancel: true, outbox: "ok",
+      pre: (rg, f) => { seen = { registered: (rg.runner as Priv).executionTails.get(rg.runId), own: f.executionTail }; },
     });
+    await r.run();
+    assert.ok(seen?.own !== undefined && seen.registered === seen.own, "fixture: the registered tail is this flight's");
+    assertCancelledOnce(r);
+  });
 
-    it("an earlier-generation terminal journal installed during the ownership check", async t => {
-      const r = await rig(t, { site: "A", iid: 3901, cancel: true, outbox: "ok" });
-      let installed: Promise<unknown> | undefined;
-      const wire = api.ownershipWire.get(r.runId)!;
-      api.ownershipWire.set(r.runId, res => {
-        if (r.getsAtSeam !== undefined && installed === undefined) {
-          installed = journalFailed(r.outbox!, r.runId, r.generation - 1);
-          void installed.then(() => wire(res));
-          return;
-        }
-        wire(res);
+  describe("the safety set fails while the read is in flight", () => {
+    const mid: Array<[string, (r: Rig, f: Priv) => void | Promise<void>]> = [
+      ["an earlier-generation terminal journal", (r) => journalFailed(r.outbox!, r.runId, r.generation - 1) as Promise<void>],
+      ["a current-generation terminal journal", (r) => journalFailed(r.outbox!, r.runId, r.generation) as Promise<void>],
+      ["a claim fence", (_r, f) => { (f.steering as Priv).fence = "fenced"; }],
+      ["a worker shutdown", (_r, f) => { f.active = { shuttingDown: true }; }],
+      ["a policy hold", (_r, f) => { f.policyHold = { outcomeId: "x" }; }],
+      ["a pending policy outcome", r => { r.t.mock.method(r.outbox!, "hasPendingPolicyOutcome", async () => true); }],
+      ["a completion send attempt", (_r, f) => { f.completionSendAttempted = true; }],
+      ["the terminal lifecycle ending", (_r, f) => { (f.steering as Priv).terminalLifecycle.abort(); }],
+    ];
+    for (const [name, mutate] of mid) {
+      it(name, async t => {
+        const r = await rig(t, { site: "A", iid: 3900 + mid.findIndex(m => m[0] === name), cancel: true, outbox: "ok" });
+        const release = r.holdOwnership();
+        const done = r.run();
+        while (r.flight === undefined || r.ownReads() < 1) await new Promise(res => setTimeout(res, 5));
+        await mutate(r, r.flight);
+        release();
+        await done;
+        assertPlainStop(r, name);
       });
-      await r.run();
-      assert.ok(installed, "the ownership check ran after the read");
-      assertPlainStop(r, "journal during the ownership check");
-    });
-
-    it("legacy mode: a conflict during the read withholds the cancel but routes the rest", async t => {
-      const r = await rig(t, { site: "A", iid: 3903, outbox: "ok" });
-      const routed: string[] = [];
-      const hold = api.holdNextInputGet(r.runId, 1);
-      const done = r.run();
-      await hold.entered;
-      // An older api consumes on read: the rows are gone from the server once this read is answered.
-      api.legacyConsumeOnRead = true;
-      api.setInputs(r.runId, [input("cancel"), { id: 2, kind: "follow_up", body: "carry on" }]);
-      const steering = r.flight.steering as Priv;
-      const route = steering.route.bind(steering);
-      t.mock.method(steering, "route", (...a: unknown[]) => { routed.push(String(a[0])); return route(...a); });
-      await journalFailed(r.outbox!, r.runId, r.generation - 1);
-      hold.release();
-      await done;
-      assertPlainStop(r, "legacy conflict");
-      assert.deepEqual(routed, ["follow_up"], "the cancel row is withheld, the other row is routed");
-    });
+    }
   });
 
   it("a fully joined predecessor: the next generation's claim reaches the refusal and is cancelled once", async t => {
@@ -382,6 +413,8 @@ describe("issue #3860: owner cancel at a held-predecessor refusal", { skip: !HAS
     await r.run(2);
     assertPlainStop(r, "first execution");
     api.setInputs(r.runId, [input("cancel")]);
+    r.owner.generation = 3;
+    r.owner.requested = true;
     await r.run(3);
     const failed = r.failed();
     assert.equal(failed.length, 1);
@@ -444,11 +477,11 @@ describe("issue #3860: owner cancel at a held-predecessor refusal", { skip: !HAS
 
   it("a read that outlives its bound ends in a plain stop", async t => {
     const r = await rig(t, { site: "A", iid: 3940, cancel: true, outbox: "ok", runnerOpts: { heldSeamCancelObserveMs: 50 } });
-    const hold = api.holdNextInputGet(r.runId, 1);
+    const release = r.holdOwnership();
     const started = Date.now();
     await r.run();
     assert.ok(Date.now() - started < 10_000, "bounded");
-    hold.release();
+    release();
     assertPlainStop(r, "timeout");
   });
 
@@ -457,15 +490,40 @@ describe("issue #3860: owner cancel at a held-predecessor refusal", { skip: !HAS
     const freshRunId = randomUUID();
     t.mock.method(r.runner as Priv, "runnerCloneForClaim", async () => {
       api.setInputs(freshRunId, [input("cancel")]);
+      api.cancellationRequested.set(freshRunId, true);
       throw new SourceUseHeldRefusal("held_unended (fixture, fresh seed)");
     });
     api.setOwnershipStatus(freshRunId, "running", 2);
     await r.runner.execute(gitlabClaim(3951, { run_id: freshRunId, claim_generation: 2 }));
     assert.equal(r.seamCalls(), 0, "the seam helper is not invoked");
     assert.equal(r.started(), 0);
+    assert.equal(api.ownershipRequests.includes(freshRunId), false, "no ownership cancel read for the fresh claim");
     assert.equal(api.states.some(s => s.runId === freshRunId && s.body.status === "failed"), false, "no failed report");
     assert.ok(r.lines.some(l => String((l as { msg?: string }).msg).includes("clone path held by an earlier flight")),
       "the claim stopped through stopOnHeldSource");
+  });
+
+  it("a claim with no held predecessor: the ordinary live-poller cancel still works, without the seam", async t => {
+    const { gitlab } = fakeGitlab();
+    const waiter: ExecutorFactory = runId => ({
+      homeDir: path.join(homeDir, runId),
+      executor: {
+        run: (ctx: RunContext) => new Promise<ExecutorResult>((_resolve, reject) => {
+          const onAbort = (): void => reject(new Error("run cancelled"));
+          if (ctx.signal?.aborted) return onAbort();
+          ctx.signal?.addEventListener("abort", onAbort, { once: true });
+        }),
+      },
+    });
+    const runner = new RunRunner(client, git, waiter, nullLogger(), 20, undefined, { pollMs: 50, gitlab });
+    const seam = t.mock.method(runner as Priv, "observeCancelAtHeldSeam");
+    const claim = gitlabClaim(3970);
+    api.setInputs(claim.run_id, [input("cancel")]);
+    await runner.execute(claim);
+    const failed = api.states.find(s => s.runId === claim.run_id && s.body.status === "failed");
+    assert.ok(failed, "the cancelled run reports failed");
+    assert.match(String(failed!.body.failure_reason ?? ""), /run cancelled/);
+    assert.equal(seam.mock.callCount(), 0, "the held-predecessor seam is not involved");
   });
 
   describe("heldSeamSyncSafe", () => {

@@ -269,6 +269,10 @@ export class FakeApi {
   /** Per-run wire fixtures; absent entries preserve the legacy incomplete ownership DTO. */
   readonly completionHoldWire = new Map<string, (res: http.ServerResponse) => void>();
   readonly ownershipWire = new Map<string, (res: http.ServerResponse) => void>();
+  /** Issue #3860: per-run `cancellation_requested` served on the default ownership bodies. An absent
+   *  entry (the default) omits the field, as an older api does. Tests serving their own
+   *  {@link ownershipWire} read this map themselves. */
+  readonly cancellationRequested = new Map<string, unknown>();
   readonly committedHoldOwnership = new Map<string, unknown>();
   guardedQuestionStatus: string | undefined;
   workerPauseRefused = false;
@@ -922,6 +926,12 @@ export class FakeApi {
   /** Issue #1604: the run's input rows as the server holds them (applied or not). */
   inputRows(runId: string): UserInput[] {
     return [...(this.inputsByRun.get(runId) ?? [])];
+  }
+
+  /** Issue #3860: input rows the server still holds as pending (not yet applied/consumed). */
+  pendingInputRows(runId: string): UserInput[] {
+    const applied = this.appliedByRun.get(runId) ?? new Set<number>();
+    return (this.inputsByRun.get(runId) ?? []).filter(r => !applied.has(r.id));
   }
 
   isAcked(runId: string, id: number): boolean {
@@ -1631,13 +1641,15 @@ export class FakeApi {
         return send(res, 200, this.committedHoldOwnership.get(runId));
       if (this.parkRunOwnership) return send(res, 200, this.parkRunOwnership);
       const o = this.ownershipByRun.get(runId);
+      const cr = this.cancellationRequested.has(runId) ? { cancellation_requested: this.cancellationRequested.get(runId) } : {};
       if (this.planRevisionRetries && (!o || o.httpStatus === 200)) return send(res, 200, {
         status: o?.status ?? this.lastRecordedStatus.get(runId) ?? "running",
         claim_generation: o?.generation ?? this.receiptGeneration.get(runId),
         gate_revision: this.gateByRun.get(runId)?.revision ?? 0,
         claim_released: false,
+        ...cr,
       });
-      if (!o) return send(res, 200, { status: "running" });
+      if (!o) return send(res, 200, { status: "running", ...cr });
       if (o.httpStatus !== 200)
         return send(res, o.httpStatus, { error: "run not found for this worker" });
       // PRD #1391 Run B M4: claim_generation is additive on the probe body; include it only when the
@@ -1646,6 +1658,7 @@ export class FakeApi {
       if (o.generation !== undefined) body.claim_generation = o.generation;
       if (o.inventoryGuarded !== undefined) body.inventory_guarded = o.inventoryGuarded;
       if (o.holdReason !== undefined) body.hold_reason = o.holdReason;
+      Object.assign(body, cr);
       return send(res, 200, body);
     }
 

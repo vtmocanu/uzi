@@ -24852,29 +24852,23 @@ export class RunRunner {
   }
 
   /** At a held-predecessor refusal the flight stops before steering's first poll can route an
-   *  already-persisted owner cancel. Read it once (bounded, no retry) and, only when every
-   *  outcome-safety condition still holds at the commit instant, convert the stop into a
-   *  cancellation (RetainedRecoveryCancelled); otherwise return and let the caller throw today's stop. */
+   *  already-persisted owner cancel. Ask the server once (bounded, no retry, one read-only ownership
+   *  probe) whether a cancel is requested for this claim and, only when every outcome-safety condition
+   *  still holds at the commit instant, convert the stop into a cancellation (RetainedRecoveryCancelled);
+   *  otherwise return and let the caller throw today's stop. */
   private async observeCancelAtHeldSeam(claim: ClaimResponse, flight: RunFlight): Promise<void> {
     if (claim.run_id !== flight.runId) return;
-    let legacyRows: import("./protocol.js").UserInput[] | undefined;
-    const withhold = (): void => {
-      if (legacyRows === undefined) return;
-      try { flight.steering.routeLegacyRows(legacyRows, { withholdCancel: true }); } catch { /* best effort */ }
-    };
     let cause: unknown;
     try {
       if (!this.heldSeamSyncSafe(flight) || !await this.heldSeamPolicySafe(flight)) return;
       const signal = AbortSignal.any([AbortSignal.timeout(this.heldSeamCancelObserveMs), ...this.retainedLifecycleSignals(flight)]);
-      const result = await flight.steering.readPendingCancellation(signal, ["running", "claimed"]);
-      legacyRows = result.legacyRows;
-      if (result.kind === "cancel") {
+      const result = await flight.steering.readCancellationRequested(signal, ["running", "claimed"]);
+      if (result === "cancel") {
         if (await this.heldSeamPolicySafe(flight)) {
           // One synchronous block: no await between the last safety check and the commit.
           if (this.heldSeamSyncSafe(flight)) {
             flight.steering.markCancelled();
             cause = new Error("owner cancel observed at held-predecessor refusal");
-            if (legacyRows) flight.steering.routeLegacyRows(legacyRows, { withholdCancel: false });
             this.observeCancellation(flight);
             flight.runLog.info("retained predecessor held; owner cancel observed at the refusal, reporting cancellation",
               { claim_generation: flight.claimGeneration });
@@ -24886,7 +24880,6 @@ export class RunRunner {
         { claim_generation: flight.claimGeneration });
     }
     if (cause !== undefined) throw new RetainedRecoveryCancelled({ cause });
-    withhold();
   }
 
   /** One bounded, credential-free verification pass over EXISTING evidence. Every outcome
