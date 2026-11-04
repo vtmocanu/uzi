@@ -9913,6 +9913,14 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(env.TMPDIR, "/private/tmp");
   });
 
+  it("issue #3870: the Codex command env adds no GOTMPDIR of its own (a provisioned one passes as before)", () => {
+    for (const tool of [{}, { PATH: "/provisioned/go/bin" }] as Array<Record<string, string>>) {
+      assert.equal(Object.hasOwn(buildCommandEnv("/private/tmp", tool), "GOTMPDIR"), false);
+      assert.equal(Object.hasOwn(buildCommandEnv("/private/tmp", tool, "unix:///run/dind/docker.sock"), "GOTMPDIR"), false);
+    }
+    assert.equal(buildCommandEnv("/private/tmp", { GOTMPDIR: "/provisioned/tmp" }).GOTMPDIR, "/provisioned/tmp");
+  });
+
   it("issue #3382: applies the configured Go concurrency after the toolEnv fold, and adds no key when unset", () => {
     const tool = { PATH: "/provisioned/go/bin", GOFLAGS: "-toolexec=evil", GOMAXPROCS: "99" };
     try {

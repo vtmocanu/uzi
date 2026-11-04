@@ -747,6 +747,13 @@ Coverage alone never justifies REVISE or BLOCK. Defects take priority within
 the 20-item cap; spare slots hold coverage, with overflow summarized literally
 as `N coverage notes omitted`. Coverage and its count do not displace defects.
 
+Each new plan round also stores one immutable, bounded snapshot of the run
+owner's own answers and revise feedback in the child table
+`cross_check_owner_steering`, written with the round row and delivered
+identically on every claim (header `X-Uzi-Owner-Steering: v1`). Only such
+plan-stage children require `cross_check_owner_steering_v1`; see the
+[#3841 amendment](adr/2149-cross-check.md#amendment-2026-11-03--3841-owner-steering-in-plan-checker-input).
+
 The worker passes every approving item (including noncoverage warning/info)
 and the complete bounded summary, including summary-only findings, to both
 executors' implementation prompts through the shared nonce fence. Absent/null

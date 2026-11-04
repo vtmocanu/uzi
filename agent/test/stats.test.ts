@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { dataVolumeUsedFraction, StatsCollector, type StatfsSample, type StatsCollectorOptions } from "../src/stats.js";
+import { dataVolumeStatsFromStatfs, dataVolumeUsedFraction, StatsCollector, type StatfsSample, type StatsCollectorOptions } from "../src/stats.js";
 import { readDindMeterSample } from "../src/dind-meter.js";
 
 // Unit tests over fixture cgroup v2 trees (PRD #49 M1). Each test writes a throwaway
@@ -219,6 +219,60 @@ describe("StatsCollector — disk sampling (PRD #837 M1)", () => {
     assert.strictEqual(s.disk_nix_total_bytes, 4_096_000, "nix total = blocks×bsize");
     assert.strictEqual(s.disk_data_bytes, 2_048_000, "data used = (blocks−bfree)×bsize");
     assert.strictEqual(s.disk_data_total_bytes, 8_192_000, "data total = blocks×bsize");
+  });
+
+  it("dataVolumeStatsFromStatfs equals the heartbeat's data-volume fields for the same statfs (issue #3865)", () => {
+    const cases: StatfsSample[] = [
+      { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400, files: 1000, ffree: 400 },
+      { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400, files: 0, ffree: 0 },
+      { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400 },
+      { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400, files: 10, ffree: 11 },
+      { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400, files: 10, ffree: -1 },
+      { bsize: 4096, blocks: 2000, bfree: 1500, bavail: 1400, files: Number.NaN, ffree: 1 },
+      { bsize: 4096, blocks: 2000, bfree: 2500, bavail: 1400, files: 10, ffree: 1 },
+      { bsize: Number.NaN, blocks: 2000, bfree: 1500, bavail: 1400, files: 10, ffree: 1 },
+    ];
+    // Fixed literals for the first (fully valid) sample: used = (blocks - bfree) x bsize, inodes = files - ffree.
+    const fixed = {
+      disk_data_bytes: 2_048_000, disk_data_total_bytes: 8_192_000, disk_data_inodes: 600, disk_data_total_inodes: 1000,
+    };
+    assert.deepStrictEqual(dataVolumeStatsFromStatfs(cases[0]!), fixed);
+    const fixedCollected = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs: () => cases[0]!, dataDir: "/data" }).collect();
+    assert.ok(fixedCollected);
+    assert.strictEqual(fixedCollected.disk_data_bytes, fixed.disk_data_bytes);
+    assert.strictEqual(fixedCollected.disk_data_total_bytes, fixed.disk_data_total_bytes);
+    assert.strictEqual(fixedCollected.disk_data_inodes, fixed.disk_data_inodes);
+    assert.strictEqual(fixedCollected.disk_data_total_inodes, fixed.disk_data_total_inodes);
+    // Invalid byte pair, valid inode pair: the pure derivation keeps the inode pair (admission uses
+    // it), the heartbeat emits NOTHING for the data volume (server contract unchanged).
+    const badBytes = cases[7]!;
+    assert.deepStrictEqual(dataVolumeStatsFromStatfs(badBytes), { disk_data_inodes: 9, disk_data_total_inodes: 10 });
+    const badCollected = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs: () => badBytes, dataDir: "/data" }).collect();
+    assert.ok(badCollected);
+    assert.strictEqual(badCollected.disk_data_bytes, undefined);
+    assert.strictEqual(badCollected.disk_data_total_bytes, undefined);
+    assert.strictEqual(badCollected.disk_data_inodes, undefined);
+    assert.strictEqual(badCollected.disk_data_total_inodes, undefined);
+    const nanBlocks: StatfsSample = { bsize: 4096, blocks: Number.NaN, bfree: 0, bavail: 0, files: 1000, ffree: 50 };
+    assert.deepStrictEqual(dataVolumeStatsFromStatfs(nanBlocks), { disk_data_inodes: 950, disk_data_total_inodes: 1000 });
+    for (const raw of cases.slice(0, 7)) {
+      const c = new StatsCollector({ ...base(), now: () => 0n, cpuCount: () => 8, statfs: () => raw, dataDir: "/data" });
+      const s = c.collect();
+      assert.ok(s);
+      const heartbeat = {
+        ...(s.disk_data_bytes !== undefined ? { disk_data_bytes: s.disk_data_bytes } : {}),
+        ...(s.disk_data_total_bytes !== undefined ? { disk_data_total_bytes: s.disk_data_total_bytes } : {}),
+        ...(s.disk_data_inodes !== undefined ? { disk_data_inodes: s.disk_data_inodes } : {}),
+        ...(s.disk_data_total_inodes !== undefined ? { disk_data_total_inodes: s.disk_data_total_inodes } : {}),
+      };
+      if (raw.bfree > raw.blocks) {
+        // Negative used bytes: invalid byte pair, so the heartbeat is empty though the inode pair is valid.
+        assert.deepStrictEqual(heartbeat, {}, JSON.stringify(raw));
+        assert.deepStrictEqual(dataVolumeStatsFromStatfs(raw), { disk_data_inodes: 9, disk_data_total_inodes: 10 });
+        continue;
+      }
+      assert.deepStrictEqual(dataVolumeStatsFromStatfs(raw), heartbeat, JSON.stringify(raw));
+    }
   });
 
   it("targets the injected dataDir, not a hardcoded /data, and the fixed /nix constant", () => {

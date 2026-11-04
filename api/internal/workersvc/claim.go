@@ -44,7 +44,10 @@ type ClaimPayload struct {
 	MemoryInterventionCount int32                `json:"memory_intervention_count"`
 	MemoryPolicy            *MemoryPolicy        `json:"memory_policy"`
 	CrossCheck              *ClaimPlanCrossCheck `json:"cross_check,omitempty"`
-	RunID                   string               `json:"run_id"`
+	// CrossCheckOwnerSteering (issue #3841) is the frozen owner-steering snapshot of a plan-stage
+	// checker child, delivered unchanged on every claim; nil (omitted) for every other claim.
+	CrossCheckOwnerSteering *ClaimOwnerSteering `json:"cross_check_owner_steering,omitempty"`
+	RunID                   string              `json:"run_id"`
 	// Kind is the run kind (one of the runkind values; PRD #6). The worker branches on it: an
 	// issue run works IssueIID's card; a ci_fix run diagnoses + fixes Pipeline.
 	Kind string `json:"kind"`

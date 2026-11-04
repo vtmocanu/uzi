@@ -1494,6 +1494,13 @@ export interface ClaimJob {
  * path consumes it, so it is declared below.
  */
 /** Server-stored, bounded plan candidate for one live read-only child claim. */
+export interface ClaimOwnerSteering {
+  /** Canonical v1 snapshot JSON text. */
+  snapshot: string;
+  /** Lowercase hex sha256 of `snapshot`. */
+  digest: string;
+}
+
 export interface ClaimPlanCrossCheck {
   candidate_identity_version?: "semantic_v1";
   semantic_candidate?: ReturnType<typeof import("./semantic-plan.js").parseSemanticCandidate>;
@@ -1641,6 +1648,8 @@ export interface ClaimResponse extends ClaimMemoryState {
   /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */
   inventory_guarded?: boolean;
   cross_check?: ClaimPlanCrossCheck | ClaimCodeCrossCheck;
+  /** Frozen owner steering for a plan cross-check (issue #3841); decoded by decodeOwnerSteering. */
+  cross_check_owner_steering?: ClaimOwnerSteering;
   run_id: string;
   /** Run kind (PRD #6). "issue": work issue_iid's card. "ci_fix": diagnose + fix
    *  the failed `pipeline`. Absent on older servers ⇒ treat as "issue". */

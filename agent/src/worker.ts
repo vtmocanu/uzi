@@ -1031,6 +1031,9 @@ export class Worker {
           // UNCONDITIONALLY: the api makes each a hard claim clause of its semantic runs only,
           // so structural/legacy claims are unaffected.
           "cross_check_semantic_plan_v1",
+          // Issue #3841: this image reads the frozen owner-steering sibling of a plan cross-check
+          // claim. Advertised UNCONDITIONALLY; the api sends it only to a worker advertising it.
+          "cross_check_owner_steering_v1",
           "completion_semantic_publication_v1",
           // Default-branch CI repair (issue #2865): this image enforces claim.config.ci_config_guard
           // at the early check and immediately before every final push. Advertised UNCONDITIONALLY:

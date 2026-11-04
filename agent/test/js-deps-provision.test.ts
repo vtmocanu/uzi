@@ -80,6 +80,22 @@ describe("harness-neutral JS dependency provisioning", () => {
     });
   }
 
+  for (const [label, goWork] of [["given", "/fixture/run-home/.uzi-go-work/g4"], ["absent", undefined]] as const) {
+    it(`issue #3870: the install env ${label === "given" ? "carries" : "has no"} GOTMPDIR (${label})`, async () => {
+      const p = probe();
+      let seen: NodeJS.ProcessEnv | undefined;
+      const install: typeof installJsDeps = (_root, env) => {
+        seen = env;
+        return Promise.resolve({ results: [], truncated: false });
+      };
+      await startDepsInstall(p.ctx, p.logger, "/fixture/run-home", { PATH: "/fixture/tools/bin" },
+        new AbortController().signal, install, goWork);
+      assert.ok(seen);
+      if (goWork === undefined) assert.equal(Object.hasOwn(seen, "GOTMPDIR"), false);
+      else assert.equal(seen.GOTMPDIR, goWork);
+    });
+  }
+
   for (const synchronous of [true, false]) {
     it(`normalizes ${synchronous ? "synchronous throws" : "rejections"} before a delayed join`, async () => {
       const p = probe();

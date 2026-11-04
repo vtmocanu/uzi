@@ -213,26 +213,17 @@ export class StatsCollector {
     inodes = false,
   ): void {
     try {
-      const { bsize, blocks, bfree, files, ffree } = this.statfs(path);
-      const total = blocks * bsize;
-      const used = (blocks - bfree) * bsize;
-      if (!Number.isFinite(total) || !Number.isFinite(used) || total < 0 || used < 0) return;
+      const derived = dataVolumeStatsFromStatfs(this.statfs(path));
+      const used = derived.disk_data_bytes;
+      const total = derived.disk_data_total_bytes;
+      // The byte pair gates everything: an invalid byte pair emits nothing, even a valid inode pair.
+      if (used === undefined || total === undefined) return;
       stats[usedKey] = used;
       stats[totalKey] = total;
-      // PRD #1809 D8: the data volume's inode pair from the same statfs, both or neither. A
-      // filesystem without inode accounting reports files 0 (and a bytes-only fake none): omitted.
-      if (
-        inodes &&
-        typeof files === "number" &&
-        typeof ffree === "number" &&
-        Number.isFinite(files) &&
-        Number.isFinite(ffree) &&
-        files > 0 &&
-        ffree >= 0 &&
-        ffree <= files
-      ) {
-        stats.disk_data_inodes = files - ffree;
-        stats.disk_data_total_inodes = files;
+      // PRD #1809 D8: the data volume's inode pair from the same statfs, both or neither.
+      if (inodes && derived.disk_data_inodes !== undefined && derived.disk_data_total_inodes !== undefined) {
+        stats.disk_data_inodes = derived.disk_data_inodes;
+        stats.disk_data_total_inodes = derived.disk_data_total_inodes;
       }
     } catch {
       // Missing mount (dev/compose has no /nix) or a malformed statfs → omit the pair.
@@ -359,13 +350,49 @@ export class StatsCollector {
 }
 
 /**
+ * One statfs sample as data-volume fields: the byte pair (used = (blocks - bfree) x bsize, total =
+ * blocks x bsize; both finite and non-negative, else both omitted) and the inode pair
+ * (files - ffree, files; valid when `files` > 0, 0 <= `ffree` <= `files`, finite; both or neither)
+ * are derived independently, so an invalid byte pair no longer drops a valid inode pair. A
+ * filesystem without inode accounting reports `files` 0 and a bytes-only fake none: the inode pair
+ * is then omitted. The retained-seed admission reads the full result; {@link StatsCollector}'s
+ * heartbeat still emits nothing for the data volume unless the byte pair is valid (the server
+ * contract is unchanged), so admission can be stricter than the heartbeat-driven governor.
+ */
+export function dataVolumeStatsFromStatfs(
+  raw: StatfsSample,
+): Pick<WorkerStats, "disk_data_bytes" | "disk_data_total_bytes" | "disk_data_inodes" | "disk_data_total_inodes"> {
+  const { bsize, blocks, bfree, files, ffree } = raw;
+  const total = blocks * bsize;
+  const used = (blocks - bfree) * bsize;
+  const out: ReturnType<typeof dataVolumeStatsFromStatfs> = {};
+  if (Number.isFinite(total) && Number.isFinite(used) && total >= 0 && used >= 0) {
+    out.disk_data_bytes = used;
+    out.disk_data_total_bytes = total;
+  }
+  if (
+    typeof files === "number" &&
+    typeof ffree === "number" &&
+    Number.isFinite(files) &&
+    Number.isFinite(ffree) &&
+    files > 0 &&
+    ffree >= 0 &&
+    ffree <= files
+  ) {
+    out.disk_data_inodes = files - ffree;
+    out.disk_data_total_inodes = files;
+  }
+  return out;
+}
+
+/**
  * PRD #1809 D5: the maximum valid byte or inode used fraction from one
  * {@link StatsCollector} heartbeat sample. Each complete pair must have finite,
  * non-negative usage and a finite positive total; its fraction is clamped to one.
  * Missing or invalid inode accounting falls back to bytes, and vice versa.
  * Undefined means neither pair is usable: "unknown", never "empty".
  */
-export function dataVolumeUsedFraction(stats: WorkerStats | undefined): number | undefined {
+export function dataVolumeUsedFraction(stats: Partial<WorkerStats> | undefined): number | undefined {
   let pressure: number | undefined;
   for (const [used, total] of [
     [stats?.disk_data_bytes, stats?.disk_data_total_bytes],

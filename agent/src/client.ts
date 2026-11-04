@@ -134,7 +134,7 @@ export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model
   | "checker_unavailable" | "confinement_failed" | "timed_out" | "superseded"
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
   | "approved_not_stored" | "revisions_exhausted";
-import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
+import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeOwnerSteering, OWNER_STEERING_HEADER, OWNER_STEERING_WIRE_MAX_BYTES, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
 
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -2154,9 +2154,18 @@ export class WorkerClient {
       }
       // Dedicated requests are bounded even without a marker; unmarked ordinary
       // claims are read under CLAIM_RESPONSE_MAX_BYTES.
+      // Owner steering (issue #3841): only the exact value v1, on a cross-check claim, grants the
+      // read the steering field's own wire allowance on top of the existing cap.
+      const steeringHeader = res.headers.get(OWNER_STEERING_HEADER);
+      if (steeringHeader !== null && steeringHeader !== "v1") {
+        if (ownedResponses.has(res)) await discardResponse(res);
+        else await res.body?.cancel();
+        throw new Error("unknown owner steering marker");
+      }
+      const steeringAllowance = steeringHeader === "v1" && (dedicated || marker === "cross_check") ? OWNER_STEERING_WIRE_MAX_BYTES : 0;
       const claim = (dedicated || marker === "cross_check" || res.headers.has("X-Uzi-Candidate-Identity-Version")
         ? JSON.parse(await readCrossCheckText(res, 2 * 1024 * 1024, deadline,
-          dedicated || marker === "cross_check" ? "claim" : undefined))
+          dedicated || marker === "cross_check" ? "claim" : undefined, steeringAllowance))
         : JSON.parse(await readBoundedText(res, CLAIM_RESPONSE_MAX_BYTES, true, deadline))) as ClaimResponse;
       if (isRecord(claim) && (!Number.isSafeInteger(claim.worker_recovery_episode) ||
           (claim.worker_recovery_episode as number) < 0)) delete claim.worker_recovery_episode;
@@ -2192,6 +2201,13 @@ export class WorkerClient {
       if (claim?.kind === "cross_check" && claim.cross_check !== undefined) {
         claim.cross_check = decodeCrossCheckClaim(claim.cross_check);
       }
+      // The header and the field must agree, and the field is a plan cross-check claim's alone.
+      const hasSteeringField = isRecord(claim) && claim.cross_check_owner_steering !== undefined;
+      if ((steeringHeader !== null) !== hasSteeringField ||
+          (hasSteeringField && (claim.kind !== "cross_check" || steeringAllowance === 0))) {
+        throw new Error("owner steering header and field disagree");
+      }
+      if (hasSteeringField) claim.cross_check_owner_steering = decodeOwnerSteering(claim.cross_check_owner_steering, claim.cross_check?.stage);
       // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
       // same check as the bind / lookup / ack responses). The warning carries the run id only,
       // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
@@ -5377,14 +5393,14 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
 /** The server marker grants a bounded transport budget only. The complete
  * semantic candidate and its enclosing digest must still validate after reading. */
 async function readCrossCheckText(res: Response, maxBytes: number, signal?: AbortSignal,
-  semanticContext?: { generation: number; round: number } | "claim"): Promise<string> {
+  semanticContext?: { generation: number; round: number } | "claim", allowanceBytes = 0): Promise<string> {
   const marker = res.headers.get("X-Uzi-Candidate-Identity-Version");
   if (marker !== null && (marker !== "semantic_v1" || !semanticContext)) {
     if (ownedResponses.has(res)) await discardResponse(res);
     else void res.body?.cancel().catch(() => undefined);
     throw new Error("invalid cross-check candidate identity marker");
   }
-  const raw = await readBoundedBytes(res, marker === "semantic_v1" ? SEMANTIC_ENVELOPE_MAX_BYTES : maxBytes, true, signal);
+  const raw = await readBoundedBytes(res, (marker === "semantic_v1" ? SEMANTIC_ENVELOPE_MAX_BYTES : maxBytes) + allowanceBytes, true, signal);
   const text = new TextDecoder().decode(raw);
   if (semanticContext) {
     const wire: unknown = text ? JSON.parse(text) : undefined;

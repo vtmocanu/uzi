@@ -278,6 +278,14 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			}
 			return store.Run{}, e
 		}
+		// Issue #3841: freeze the owner's steering in this same transaction. Any failure aborts the
+		// round; the retry paths above return the prior round and never write.
+		if e := freezeOwnerSteering(ctx, txq, leadID, existing.ID); e != nil {
+			if errors.Is(e, ErrCrossCheckRefused) {
+				return store.Run{}, e
+			}
+			return store.Run{}, fmt.Errorf("freeze owner steering: %w", e)
+		}
 		return child, nil
 	})
 	if errors.Is(err, errRetry) {
