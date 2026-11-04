@@ -453,7 +453,10 @@ it("accepts a bounded managed alternate closure and fingerprints bypassed metada
   fs.mkdirSync(graphs);
   fs.writeFileSync(path.join(graphs, "commit-graph-chain"), "bypassed chain");
   fs.writeFileSync(path.join(graphs, "graph-" + "a".repeat(40) + ".graph"), "bypassed graph");
-  for (const cwd of [clonePath, bare]) {
+  // The clone's `.git/config` admits only the keys uzi writes (strict allowlist in the automatic
+  // worktree proof), so these object-store tuning keys can only be planted in the bare here; the
+  // clone side is covered by epoch-worktree-proof.test.ts, where any such key is a settled keep.
+  for (const cwd of [bare]) {
     for (const key of ["core.multiPackIndex", "core.commitGraph", "pack.readReverseIndex", "pack.writeReverseIndex"])
       command(cwd, "config", key, "true");
     command(cwd, "config", "pack.threads", "32");

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
@@ -702,7 +703,21 @@ func (s *Service) ListHoldsForWorkerRun(ctx context.Context, wkr store.Worker, r
 			CaptureState:        r.CaptureState,
 		})
 	}
-	return apitypes.RecoveryHoldsResponse{RunID: runID.String(), Holds: holds}, nil
+	resp := apitypes.RecoveryHoldsResponse{RunID: runID.String(), Holds: holds}
+	if slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryRunOpenHoldsV1) {
+		// Issue #3431: the run-wide count is additive. An unknown or foreign run (ErrNoRows) or
+		// any read error omits the field and leaves the worker-scoped list untouched; it never
+		// reports 0 as a stand-in for unknown.
+		row, err := s.store.CountOpenHoldsForOwnedRun(ctx, store.CountOpenHoldsForOwnedRunParams{RunID: runID, UserID: wkr.UserID})
+		switch {
+		case err == nil:
+			resp.OpenHoldsAllWorkers = &apitypes.RecoveryRunOpenHolds{RunID: row.RunID.String(), Count: row.OpenHolds}
+		case errors.Is(err, pgx.ErrNoRows):
+		default:
+			slog.Warn("recovery holds: run-wide open-hold count failed", "run", runID, "error", err)
+		}
+	}
+	return resp, nil
 }
 
 // Release settles the caller worker's custody hold for the EXACT generation it completed
