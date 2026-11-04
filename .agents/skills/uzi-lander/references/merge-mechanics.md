@@ -119,7 +119,10 @@ has a completed run for the target SHA.)*
 
 On red, read each failed job and classify: **code / conflict / missing-file** → fix on a
 branch, PR, merge, re-watch (never push code to `main`); **flaky** (passes on isolated
-re-run; `gh run rerun <run-id> --failed`) → file an issue, do not chase; **infra / can't-fix**
+re-run; `gh run rerun <run-id> --failed`) → file an issue, do not chase. Rerun only while
+that SHA is still the `main` head: a rerun of an older SHA joins the `ci-refs/heads/main`
+concurrency group and cancels the head's run, and the next push cancels the rerun. Otherwise
+watch the current head's run, which covers your change; **infra / can't-fix**
 → report and stop. Green = done. This is the local session fixing CI, NOT uzi's `ci_autofix`
 (which only touches pre-merge `agent/*` branches). The watcher prints two commands per
 failed job. Its `gh api --allow-escape-sequences repos/O/R/actions/jobs/JOB/logs` command
