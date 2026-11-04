@@ -1,0 +1,9 @@
+diff --git a/agent/src/checkpoint-publish-transport.ts b/agent/src/checkpoint-publish-transport.ts
+index 0a8292982..690e23ade 100644
+--- a/agent/src/checkpoint-publish-transport.ts
++++ b/agent/src/checkpoint-publish-transport.ts
+@@ -42,3 +42,3 @@ const envProxyEnabled = (() => {
+ export function checkpointPublishDispatcher(timeoutMs: number): Dispatcher {
+-  const options = { headersTimeout: timeoutMs, bodyTimeout: timeoutMs };
++  const options = { bodyTimeout: timeoutMs };
+   const owned = envProxyEnabled ? new EnvHttpProxyAgent() : new Agent();

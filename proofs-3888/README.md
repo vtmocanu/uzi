@@ -22,6 +22,15 @@ is green only if the named tests ran and passed with no failure or skip in the l
 | agent-caller-abort-not-propagated (b) | agent-caller-abort-not-propagated | runner.ts: caller signal dropped from the allowance | "caller abort ended the retry promptly" |
 | agent-timeout-not-from-allowance-state (c) | agent-timeout-not-from-allowance-state | runner.ts: knownClass "timeout" from allowance state | "did not match the regular expression /phase=publish_request, cause=timeout/" |
 | agent-no-stream-reset-class (d) | agent-no-stream-reset-class | runner.ts: ERR_HTTP2_STREAM_ERROR case | runner-checkpoint-diagnostics: stream_reset tests |
-| agent-no-undici-dispatch-timeouts (e) | agent-no-undici-dispatch-timeouts | checkpoint-publish-transport.ts: per-dispatch headersTimeout/bodyTimeout | transport test: "Missing expected rejection" |
-| agent-dispatcher-not-attached (e2) | agent-dispatcher-not-attached | client.ts: dispatcher passed to fetch | transport test: pool ownership/cleanup assertions |
+| agent-no-undici-headers-timeout (e1) | agent-no-undici-headers-timeout | checkpoint-publish-transport.ts: headersTimeout only (bodyTimeout kept) | transport-probe "a stalled response header is cut by headersTimeout" fails (UND_ERR_HEADERS_TIMEOUT expected) while the body probe still passes; transport test native-fetch 1.1/2.0 subtests: "Missing expected rejection" |
+| agent-no-undici-body-timeout (e2) | agent-no-undici-body-timeout | checkpoint-publish-transport.ts: bodyTimeout only (headersTimeout kept) | transport-probe "a stalled response body is cut by bodyTimeout" fails (UND_ERR_BODY_TIMEOUT expected) while the header probe still passes |
+| agent-dispatcher-not-attached (e3) | agent-dispatcher-not-attached | client.ts: dispatcher passed to fetch | transport test: pool ownership/cleanup assertions |
 | agent-client-uses-http-timeout (f) | agent-client-uses-http-timeout | client.ts: allowance falls back to httpTimeoutMs | client-checkpoint-publish-timeout: "ended after .* ms, expected about 400" |
+
+Verdict rules (`run.sh`): each named failing test needs its OWN FAIL line and its OWN evidence (go: the lines
+printed under its `=== RUN`; node: its TAP block) matching that entry's regex, with a real assertion
+(go: no panic or timeout; node: failureType testCodeFailure or subtestsFailed, never a cancellation or timeout).
+Handler legs name the `/http1` and `/http2` subtests (and the BodyReadErrorMapping cases) explicitly, so a
+parent failure on one protocol cannot stand in for both. Agent legs run `npm run typecheck` after the patch is
+applied, so a mutant that breaks the production typecheck fails its leg. `proofs-3888/transport-probe.test.ts`
+is a CI-only probe with one test per undici timeout. Full per-leg logs are uploaded as `proof-log-<leg>` artifacts.
