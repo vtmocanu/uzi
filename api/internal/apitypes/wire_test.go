@@ -1428,6 +1428,7 @@ func TestRecoveryWorkerRPCTags(t *testing.T) {
 		"hold_id", "generation", "has_available_capture", "inventory_guarded", "capture_state")
 	// holds is NOT omitempty (present-as-null on the zero value; the service normalizes to []).
 	assertTags(t, "RecoveryHoldsResponse", RecoveryHoldsResponse{}, "run_id", "holds")
+	assertTags(t, "RecoveryHoldsResponse(full)", RecoveryHoldsResponse{OpenHoldsAllWorkers: &RecoveryRunOpenHolds{}}, "run_id", "holds", "open_holds_all_workers")
 	// Issue #1582 M1: the predecessor-settle request carries candidate SHAs only (never an
 	// ancestry verdict), every field always on the wire.
 	assertTags(t, "RecoverySettleRequest", RecoverySettleRequest{},
