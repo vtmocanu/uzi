@@ -3482,7 +3482,7 @@ export class RunRunner {
   private readonly owedAnnouncedByRun = new Map<string, OwedAnnounced>();
   /** Whole-execution ownership, including factory setup, batcher close and every
    * finally cleanup. A promoted claim can arrive before an old park ACK returns. */
-  private readonly inventoryReservations = new Set<string>();
+  private readonly inventoryReservations = new Map<string, Promise<void>>();
   /** issue #2969: live predecessor boundary grants by their opaque token (see registerPredecessorBoundary). */
   private readonly predecessorBoundaryGrants = new WeakMap<object, PredecessorBoundaryGrant>();
   private readonly commandSettlements = new WeakMap<Executor, { confirmed: boolean; failed: boolean }>();
@@ -4332,7 +4332,7 @@ export class RunRunner {
     let release!: () => void;
     const tail = new Promise<void>(resolve => { release = resolve; });
     this.executionTails.set(runId, tail);
-    this.inventoryReservations.add(runId);
+    this.inventoryReservations.set(runId, tail);
     try {
       const state: { sourceIdentity?: string } = {};
       const prove = (): Promise<boolean> => this.proveInventorySources(context, refuse, state);
@@ -4344,7 +4344,7 @@ export class RunRunner {
       this.log.warn("recovery: physical source retained", { run_id: runId, error: errMessage(err) });
       return "retained";
     } finally {
-      this.inventoryReservations.delete(runId);
+      if (this.inventoryReservations.get(runId) === tail) this.inventoryReservations.delete(runId);
       if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
       release();
     }
@@ -4682,7 +4682,7 @@ export class RunRunner {
     let release!: () => void;
     const tail = new Promise<void>(resolve => { release = resolve; });
     this.executionTails.set(ctx.runId, tail);
-    this.inventoryReservations.add(ctx.runId);
+    this.inventoryReservations.set(ctx.runId, tail);
     const open = (): boolean => proof() && this.executionTails.get(ctx.runId) === tail && residueQuarantine() === undefined &&
       !this.liveAttempts.isLivePath(source.clonePath);
     // issue #3404 M2 U5: the paired skills dir is a separate footprint from the clone and, on a resume, the clone is
@@ -4761,7 +4761,7 @@ export class RunRunner {
       this.log.warn("recovery: completion source retained", { run_id: ctx.runId, error: errMessage(err) });
       return retain(err instanceof CapturePathMismatchError || isCompletionSourceFenceError(err) ? "identity_changed" : "error");
     } finally {
-      this.inventoryReservations.delete(ctx.runId);
+      if (this.inventoryReservations.get(ctx.runId) === tail) this.inventoryReservations.delete(ctx.runId);
       if (this.executionTails.get(ctx.runId) === tail) this.executionTails.delete(ctx.runId);
       release();
     }
@@ -4801,7 +4801,7 @@ export class RunRunner {
     let release!: () => void;
     const tail = new Promise<void>(resolve => { release = resolve; });
     this.executionTails.set(runId, tail);
-    this.inventoryReservations.add(runId);
+    this.inventoryReservations.set(runId, tail);
     let boundaryActive = true;
     let settlementUncertain = false;
     const open = (): boolean => boundaryActive && !settlementUncertain && !this.shutdownSignal.signal.aborted && !signal?.aborted &&
@@ -4838,7 +4838,7 @@ export class RunRunner {
       } catch {
         settlementUncertain = true;
         // The unresolved execution tail denies ordinary cleanup/recovery too.
-        this.inventoryReservations.delete(runId);
+        if (this.inventoryReservations.get(runId) === tail) this.inventoryReservations.delete(runId);
         this.log.warn("maintenance WIP source retained", { diagnostic: "maintenance_wip_settlement_unconfirmed" });
         throw new Error("maintenance_wip_settlement_unconfirmed");
       }
@@ -5042,7 +5042,7 @@ export class RunRunner {
         try { if (captureTask) await captureTask; }
         finally { if (transferTask) await transferTask; }
       } finally {
-        this.inventoryReservations.delete(runId);
+        if (this.inventoryReservations.get(runId) === tail) this.inventoryReservations.delete(runId);
         if (!settlementUncertain) {
           if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
           release();
@@ -7207,17 +7207,26 @@ export class RunRunner {
    * release never deletes that duplicate's replacement tail. */
   private async withReportSourceReservation(runId: string,
     action: (eligible: () => boolean) => Promise<void>): Promise<void> {
+    await this.withSourceReservation(runId, action);
+  }
+
+  /** Trusted callers acquire A before this reservation, and B only inside action. */
+  async withSourceReservation<T>(runId: string,
+    action: (eligible: () => boolean) => Promise<T>): Promise<T | undefined> {
     if (this.executionTails.has(runId) || this.activeRuns.has(runId) || this.snapshotRegistry?.has(runId)) return;
     let release!: () => void;
     const tail = new Promise<void>(resolve => { release = resolve; });
     this.executionTails.set(runId, tail);
-    this.inventoryReservations.add(runId);
-    const eligible = () => this.executionTails.get(runId) === tail &&
-      !this.activeRuns.has(runId) && !this.snapshotRegistry?.has(runId) &&
-      residueQuarantine() === undefined;
-    try { await action(eligible); }
+    this.inventoryReservations.set(runId, tail);
+    let revoked = false;
+    const eligible = () => {
+      revoked ||= this.executionTails.get(runId) !== tail || this.inventoryReservations.get(runId) !== tail ||
+        this.activeRuns.has(runId) || !!this.snapshotRegistry?.has(runId) || residueQuarantine() !== undefined;
+      return !revoked;
+    };
+    try { return await action(eligible); }
     finally {
-      this.inventoryReservations.delete(runId);
+      if (this.inventoryReservations.get(runId) === tail) this.inventoryReservations.delete(runId);
       if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
       release();
     }

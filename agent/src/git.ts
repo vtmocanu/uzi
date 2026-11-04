@@ -9,7 +9,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
-import { constants as fsConstants, createReadStream, createWriteStream, type Stats } from "node:fs";
+import { lstatSync, constants as fsConstants, createReadStream, createWriteStream, type Stats } from "node:fs";
 import os from "node:os";
 import { isUtf8 } from "node:buffer";
 import path from "node:path";
@@ -2324,7 +2324,7 @@ export interface RetainedSourceEvidence {
   localRecords: RetainedLocalRecord[];
   holds: { state: "read" | "unknown" | "not_read"; ids: string[] };
   disposition: RetainedDisposition | undefined;
-  /** Epoch inspections only: the disposition under the strict-plain basis. Defined only when the caller's lifecycle verdict is `terminal`, zero open holds are required for `local_discard` (an open or unknown hold yields another disposition), and a `live` ledger attempt is named solely by an active journal whose raw text equals `JSON.stringify` of its parse (any key order; duplicates and whitespace variants are rejected), with no other non-retired ledger entry on the same clone key. Never set for operator inspection. */
+  /** Epoch inspections only: the disposition under the strict-plain basis. Defined only when the caller's lifecycle verdict is `terminal`, zero open holds are required for `local_discard` (an open or unknown hold yields another disposition), and either a fully validated retired attempt has an exactly valued empty journal and absent footprint (metadata barriers only), or a `live` ledger attempt is named solely by an active journal whose raw text equals `JSON.stringify` of its parse (any key order; duplicates and whitespace variants are rejected), with no other non-retired ledger entry on the same clone key. Never set for operator inspection. */
   epochSettlement?: { basis: "strict_plain"; disposition: RetainedDisposition };
   /** Epoch inspections only, report-only: a marker-less canonical source under a plain active journal
    *  (`journalState: "plain"`, `markerState: "none"`) whose journal, read in the same lock-held snapshot as
@@ -2420,9 +2420,12 @@ export interface EpochDiscardProofOptions {
   readonly barePath: string;
   readonly paths: readonly string[];
   readonly confirm: string;
-  readonly expectedRawJournal: string;
+  /** Exact strict journal, or [] / [""] for an inactive ledger with no live journal. */
+  readonly expectedRawJournal: string | readonly string[];
   /** Throws when the caller's reservation, epoch or source binding is no longer live. */
   readonly checkLive: () => void;
+  /** Trusted epoch-entry and GET-only daemon observation; denial throws. */
+  readonly beforeEffect: () => Promise<void>;
   readonly signal: AbortSignal;
   readonly deadline: number;
 }
@@ -2433,6 +2436,7 @@ type EpochDiscardProofState = Omit<EpochDiscardProofOptions, "decision">;
 interface AutomaticPreservation {
   checkLive: () => void;
   roots: readonly string[];
+  owedBytes?: number;
 }
 
 export interface RetainedDiscardOptions {
@@ -2962,6 +2966,8 @@ interface GatheredRecord {
   markerState: RetainedSourceEvidence["markerState"];
   /** Epoch gathers only: see {@link RetainedSourceEvidence.epochJournalExtraFields}. */
   epochJournalExtraFields?: true;
+  /** Rebuilt under B in epoch gathers only; never projected or accepted as proof. */
+  epochRetiredEmptyJournal?: true;
   markerRaw: string | undefined;
   ledgerRaw: string | undefined;
   digest: string;
@@ -3097,7 +3103,11 @@ export class GitCache {
   private readonly epochRetained = new AsyncLocalStorage<Required<EpochRetainedLimits>>();
   private readonly epochDiscardProofs = new WeakMap<EpochDiscardProof, EpochDiscardProofState>();
   // Native options never enter boundary, capture, SDK or run request objects.
-  private readonly epochNative = new AsyncLocalStorage<EpochDiscardProofState>();
+  private readonly epochNative = new AsyncLocalStorage<EpochDiscardProofState & {
+    configMutation?: readonly string[];
+    beforeLaunch?: () => Promise<void>;
+  }>();
+  private epochSettlementFault?: (step: string) => Promise<void>;
   private epochNativeTestDependencies?: {
     spawn: typeof spawn;
     alive: typeof processGroupAlive;
@@ -3112,7 +3122,7 @@ export class GitCache {
     if (this.boundaryProcesses.getStore() || this.epochNative.getStore())
       throw new Error("epoch native process scope overlap");
     this.checkEpochDiscardLive(state);
-    return this.epochNative.run(state, action);
+    return this.epochNative.run({ ...state }, action);
   }
 
   private epochNativePaths(): string[] {
@@ -3120,8 +3130,8 @@ export class GitCache {
       [p, path.join(path.dirname(p), `.uzi-skills-${path.basename(p)}`)]);
   }
 
-  /** Admit only the read graph used before the unavailable guard, never a transport
-   * or a configurable wrapper. Config writes remain outside this read foundation. */
+  /** Read graph plus an exact core-minted config mutation in the current async context.
+   * Transports and configurable wrappers never enter this scope. */
   private preflightEpochNative(command: string, args: string[], env: NodeJS.ProcessEnv,
     identity: BoundaryProcessRequest["identity"]): NodeJS.ProcessEnv {
     const refuse = (): never => { throw new Error("epoch native executable chain unaudited"); };
@@ -3187,8 +3197,11 @@ export class GitCache {
       sub === "rev-list" && tail[0] === "--objects" && tail[1] === "-n" && tail[2] === "1" &&
         tail.slice(3).filter(v => v !== "--not").every(v => /^[0-9a-f]{40}$/.test(v)) && tail.includes("--not")
     );
+    admitted ||= cwd === state.barePath && identity !== "command" &&
+      shape === JSON.stringify(this.epochNative.getStore()?.configMutation);
     if (!admitted) return refuse();
-    return { ...base, PATH: "/usr/bin:/bin", HOME: "/", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
+    return { ...base, TMPDIR: identity === "command" ? runnerTmpdir() ?? base.TMPDIR : base.TMPDIR,
+      PATH: "/usr/bin:/bin", HOME: "/", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
       GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL, GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1",
       GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null" };
   }
@@ -3203,11 +3216,19 @@ export class GitCache {
     this.checkEpochDiscardLive(state);
     signal?.throwIfAborted();
     options = { ...options, env: this.preflightEpochNative(command, args, options.env, identity) };
-    if (args.includes("config") && !args.includes("--no-includes")) args = [...args, "--no-includes"];
+    if (args.includes("config") && !args.includes("--no-includes")) {
+      args = [...args]; args.splice(args.indexOf("config") + 1, 0, "--no-includes");
+    }
     if (args.includes("status")) args = args.map(v => v === "--ignore-submodules=none" ? "--ignore-submodules=all" : v);
     if ((command === "/bin/setpriv" && identity !== "command") ||
         (uidSplitActive() && identity === "command" && command !== "/bin/setpriv"))
       throw new Error("epoch native group identity mismatch");
+    if (state.configMutation && args.includes("config") && !args.includes("--list") || args.includes("-rf")) {
+      await this.epochObservation(state, state.beforeEffect);
+      this.checkEpochDiscardLive(state);
+      await state.beforeLaunch?.();
+      this.checkEpochDiscardLive(state);
+    }
     assertNoCredentialedGitWhileQuarantined(options.env);
     MaintenanceResources.consumeIfActive("launches", 1);
     const ticket = state.scope.beginMutation();
@@ -3351,6 +3372,9 @@ export class GitCache {
         }
       } else {
         // fs.rm is independently awaited; a rejected operation is a joined refusal.
+        await this.epochObservation(state, state.beforeEffect);
+        this.checkEpochDiscardLive(state);
+        await state.beforeLaunch?.();
         this.checkEpochDiscardLive(state);
         try { await fs.rm(target, { recursive: true, force: true }); }
         finally { joined = true; }
@@ -3364,6 +3388,8 @@ export class GitCache {
       if (!joined || state.scope.stopped()) { state.scope.stop(); throw error; }
       try { await settlement?.settle({ ok: false, residue: [target] }); }
       catch { state.scope.stop(); throw error; }
+      if (undeletableCode(error) !== undefined)
+        throw Object.assign(error as object, { epochDeleteJoined: true });
       throw error;
     } finally {
       if (joined && !state.scope.stopped()) {
@@ -3391,27 +3417,31 @@ export class GitCache {
         !Array.isArray(input.paths) || input.paths.length !== 1 ||
         input.paths.some(p => typeof p !== "string" || !path.isAbsolute(p) || path.resolve(p) !== p) ||
         typeof input.confirm !== "string" || !/^[0-9a-f]{64}$/.test(input.confirm) ||
-        typeof input.expectedRawJournal !== "string" ||
-        Buffer.byteLength(input.expectedRawJournal) > STOPPED_MARKER_MAX_BYTES ||
-        typeof input.checkLive !== "function" || !(input.signal instanceof AbortSignal) ||
+        !(typeof input.expectedRawJournal === "string" || Array.isArray(input.expectedRawJournal) &&
+          (input.expectedRawJournal.length === 0 || input.expectedRawJournal.length === 1 && input.expectedRawJournal[0] === "")) ||
+        Buffer.byteLength(JSON.stringify(input.expectedRawJournal)) > STOPPED_MARKER_MAX_BYTES ||
+        typeof input.checkLive !== "function" || typeof input.beforeEffect !== "function" || !(input.signal instanceof AbortSignal) ||
         !Number.isFinite(input.deadline) || input.deadline <= Date.now()) return invalid();
     const scope = input.scope;
     if (!scope || ["assertExclusive", "beginMutation", "inheritStdio", "stop", "stopped", "assertSettled", "finish"]
       .some(name => typeof scope[name as keyof PodEpochReclaimScope] !== "function")) return invalid();
-    let raw: unknown;
-    try { raw = JSON.parse(input.expectedRawJournal); } catch { return invalid(); }
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return invalid();
-    const journal = raw as Record<string, unknown>;
+    if (typeof input.expectedRawJournal === "string") {
+      let raw: unknown;
+      try { raw = JSON.parse(input.expectedRawJournal); } catch { return invalid(); }
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return invalid();
+      const journal = raw as Record<string, unknown>;
+      const attempt = input.selector.attempt;
+      const keys = attempt === "canonical" ? ["clonePath", "runId"] : ["attemptId", "clonePath", "runId"];
+      if (JSON.stringify(Object.keys(journal).sort()) !== JSON.stringify(keys) ||
+          journal.runId !== input.selector.runId || journal.clonePath !== input.paths[0] ||
+          (attempt !== "canonical" && journal.attemptId !== attempt) ||
+          JSON.stringify(journal) !== input.expectedRawJournal) return invalid();
+    } else if (input.selector.attempt === "canonical") return invalid();
     const attempt = input.selector.attempt;
-    const keys = attempt === "canonical" ? ["clonePath", "runId"] : ["attemptId", "clonePath", "runId"];
-    if (JSON.stringify(Object.keys(journal).sort()) !== JSON.stringify(keys) ||
-        journal.runId !== input.selector.runId || journal.clonePath !== input.paths[0] ||
-        (attempt !== "canonical" && journal.attemptId !== attempt) ||
-        JSON.stringify(journal) !== input.expectedRawJournal) return invalid();
     const state: EpochDiscardProofState = Object.freeze({
       selector: Object.freeze({ runId: input.selector.runId, generation: input.selector.generation, attempt }),
       barePath: input.barePath, paths: Object.freeze([...input.paths]), confirm: input.confirm,
-      expectedRawJournal: input.expectedRawJournal, scope, checkLive: input.checkLive,
+      expectedRawJournal: typeof input.expectedRawJournal === "string" ? input.expectedRawJournal : Object.freeze([...input.expectedRawJournal]), scope, checkLive: input.checkLive, beforeEffect: input.beforeEffect,
       signal: input.signal, deadline: input.deadline,
     });
     this.checkEpochDiscardLive(state);
@@ -3420,6 +3450,26 @@ export class GitCache {
     const proof = Object.freeze({}) as EpochDiscardProof;
     this.epochDiscardProofs.set(proof, state);
     return proof;
+  }
+
+  /** One deadline-bounded deny-only observation; a timed-out callback grants no later effect. */
+  private async epochObservation<T>(state: EpochDiscardProofState, observe: () => Promise<T>): Promise<T> {
+    this.checkEpochDiscardLive(state);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abort!: () => void;
+    const denied = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(state.signal.reason ?? new Error("epoch observation aborted"));
+      state.signal.addEventListener("abort", abort, { once: true });
+      timer = setTimeout(() => reject(new Error("epoch observation deadline")), Math.max(1, state.deadline - Date.now()));
+    });
+    try {
+      const result = await Promise.race([Promise.resolve().then(observe), denied]);
+      this.checkEpochDiscardLive(state);
+      return result;
+    } finally {
+      clearTimeout(timer);
+      state.signal.removeEventListener("abort", abort);
+    }
   }
 
   private checkEpochDiscardLive(state: EpochDiscardProofState): void {
@@ -8358,14 +8408,33 @@ export class GitCache {
 
   /** fsync `<bare>/config`, fsync the bare directory, then require the journal's raw value to read back as exactly `want`. */
   private async syncJournalAndReadBack(barePath: string, branch: string, want: string | undefined, opts: MemoryParkDurability): Promise<void> {
+    await this.syncConfigAndVerify(barePath, async () => {
+      const read = () => this.readRecoveryCaptureRaw(barePath, branch);
+      const back = opts.readback ? await opts.readback(read) : await read();
+      if (back !== want) throw new Error("memory park read-back differs");
+    }, opts);
+  }
+
+  private async syncConfigAndVerify(barePath: string, verify: () => Promise<void>, opts: MemoryParkDurability = {},
+    step: (name: string) => Promise<void> = async () => {}): Promise<void> {
     const sync = opts.sync ?? (async (h: { sync(): Promise<void> }) => { await h.sync(); });
-    const config = await fs.open(path.join(barePath, "config"), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    try { await sync(config, "config"); } finally { await config.close(); }
-    const dir = await fs.open(barePath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
-    try { await sync(dir, "directory"); } finally { await dir.close(); }
-    const read = () => this.readRecoveryCaptureRaw(barePath, branch);
-    const back = opts.readback ? await opts.readback(read) : await read();
-    if (back !== want) throw new Error("memory park read-back differs");
+    for (const kind of ["config", "directory"] as const) {
+      await step(kind + ":before-open");
+      const handle = await fs.open(kind === "config" ? path.join(barePath, "config") : barePath,
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | (kind === "directory" ? fsConstants.O_DIRECTORY : 0));
+      try {
+        await step(kind + ":after-open");
+        await step(kind + ":before-sync");
+        await sync(handle, kind);
+        await step(kind + ":after-sync");
+      } finally {
+        // A fault before close still joins the close; no opened descriptor is abandoned.
+        try { await step(kind + ":before-close"); }
+        finally { await handle.close(); }
+      }
+      await step(kind + ":after-close");
+    }
+    await verify();
   }
 
   /**
@@ -10701,12 +10770,29 @@ export class GitCache {
   /** Join each read before observing revocation; never launch a sibling after failure. */
   private async automaticPreservationRead<T>(automatic: AutomaticPreservation | undefined, action: () => Promise<T>): Promise<T> {
     if (!automatic) return action();
+    this.checkReportProof();
     this.checkRecoveryInterruption();
     automatic.checkLive();
     try { return await action(); }
     finally {
+      this.checkReportProof();
       this.checkRecoveryInterruption();
       automatic.checkLive();
+    }
+  }
+
+  /** Revocation never skips a close; its uncancellable work is always joined. */
+  private async automaticPreservationClose(automatic: AutomaticPreservation | undefined, close: () => Promise<void>): Promise<void> {
+    if (!automatic) return close();
+    const check = () => {
+      this.checkReportProof();
+      this.checkRecoveryInterruption();
+      automatic.checkLive();
+    };
+    try { check(); }
+    finally {
+      try { await close(); }
+      finally { check(); }
     }
   }
 
@@ -10750,7 +10836,7 @@ export class GitCache {
     } catch { return false; }
   }
 
-  /** Default history only: other runs' refs, loose objects and reflogs prove no publication. */
+  /** Default history and validated own-run owed roots; arbitrary refs prove no preservation. */
   private async automaticContentPreserved(epoch: EpochDiscardProofState): Promise<boolean> {
     const automatic: AutomaticPreservation = { roots: [], checkLive: () => this.checkEpochDiscardLive(epoch) };
     const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
@@ -10763,6 +10849,10 @@ export class GitCache {
       const skillsPresence = await read(() => this.clonePresence(skills));
       if (skillsPresence.presence === "unsafe" ||
           skillsPresence.presence === "present" && await read(() => fs.realpath(skills)) !== skills) return false;
+      for (const ancestor of [path.resolve(this.runnerRoot), path.dirname(cwd)]) {
+        const st = await read(() => fs.lstat(ancestor));
+        if (!st.isDirectory() || st.isSymbolicLink() || await read(() => fs.realpath(ancestor)) !== ancestor) return false;
+      }
       if (presence.presence === "missing") return true;
       if (presence.presence !== "present" || !(await read(() => this.realCloneDir(cwd))) ||
           await read(() => fs.realpath(cwd)) !== cwd ||
@@ -10771,20 +10861,25 @@ export class GitCache {
       const db = await read(() => this.defaultBranchName(epoch.barePath));
       if (!db || !(await read(() => this.isPlainBranchName(epoch.barePath, db)))) return false;
       let rootRef: string | undefined;
-      for (const ref of [`refs/remotes/origin/${db}`, `refs/heads/${db}`]) {
+      for (const ref of db ? [`refs/remotes/origin/${db}`, `refs/heads/${db}`] : []) {
         if (await read(() => this.refExists(epoch.barePath, ref))) { rootRef = ref; break; }
       }
-      if (!rootRef) return false;
-      const root = async () => (await read(() => this.runGitWithEnv(epoch.barePath,
-        ["rev-parse", "--verify", `${rootRef}^{commit}`], NO_REPLACE_ENV))).trim();
+      const root = async () => rootRef ? (await read(() => this.runGitWithEnv(epoch.barePath,
+        ["rev-parse", "--verify", `${rootRef}^{commit}`], NO_REPLACE_ENV))).trim() : undefined;
       const rootSha = await root();
-      if (!SHA40_RE.test(rootSha)) return false;
-      automatic.roots = [rootSha];
+      if (rootSha !== undefined && !SHA40_RE.test(rootSha)) return false;
+      const owedRoots = async () => (await this.enumerateOwedUnderLock(epoch.barePath,
+        epoch.selector.runId, undefined, automatic)).map(candidate => candidate.sha);
+      const owed = await owedRoots();
+      automatic.roots = [...new Set([...(rootSha ? [rootSha] : []), ...owed])];
+      if (!automatic.roots.length || automatic.roots.length > Math.min(128,
+        this.epochRetained.getStore()!.maxMetadataRecords)) return false;
       const head = await read(() => this.worktreeHead(cwd));
       if (!head || !SHA40_RE.test(head)) return false;
       if (!(await this.worktreeCleanHardened(cwd, automatic)) ||
           !(await this.localRefsReachableFrom(epoch.barePath, cwd, head, automatic))) return false;
-      if (await read(() => this.worktreeHead(cwd)) !== head || await root() !== rootSha) return false;
+      if (await read(() => this.worktreeHead(cwd)) !== head || await root() !== rootSha ||
+          JSON.stringify(await owedRoots()) !== JSON.stringify(owed)) return false;
       const after = await read(() => this.clonePresence(cwd));
       return after.presence === "present" && after.devIno === presence.devIno &&
         await read(() => this.realCloneDir(cwd)) &&
@@ -10832,6 +10927,7 @@ export class GitCache {
       if (wt.length > 0) return false;
       const refs = () => read(() => this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
       const out = await refs();
+      if (automatic) this.automaticCollection(out, "\n");
       const shas = new Set<string>();
       for (const line of out.split("\n")) {
         if (line === "") continue;
@@ -10873,7 +10969,8 @@ export class GitCache {
    * the ignore rules of the tree's `.gitignore` files and of `.git/info/exclude`, which define the
    * scope the WIP capture's `git add -A` honours too, so an ignored file is outside both. Any
    * such flag, any status entry, or any failed read is `false`. Submodules: `status` runs with
-   * `--ignore-submodules=none`, and a `.git/modules` store or a populated (non-empty or non-directory)
+   * `--ignore-submodules=none` in legacy mode; automatic mode suppresses helpers with `all`
+   * and explicitly refuses populated gitlinks. A `.git/modules` store or a populated (non-empty or non-directory)
    * gitlink path is `false`, since the parent proof cannot cover a submodule's own files, commits and refs.
    */
   private async worktreeCleanHardened(cwd: string, automatic?: AutomaticPreservation): Promise<boolean> {
@@ -10908,7 +11005,8 @@ export class GitCache {
         if (/^[+-]?(0x[0-9a-f]+|[0-9]+)[kmg]?$/.test(v) && !/^[+-]?(0x)?0+[kmg]?$/.test(v)) return false;
       }
       // Submodules: `.gitmodules` / config `ignore = all` would hide a dirty or newer submodule from
-      // `status`, so it runs with `--ignore-submodules=none`. The parent proof still says nothing about
+      // `status`. Legacy uses `--ignore-submodules=none`; automatic native reads use `all`
+      // to suppress helpers, with the explicit gitlink refusals below. The parent proof says nothing about
       // a populated submodule's own files, commits or refs, so any trace of one is not provable: a
       // `.git/modules` store, or an index gitlink (mode 160000) whose worktree path holds anything but
       // nothing or an empty real directory (an uninitialized submodule).
@@ -10993,16 +11091,29 @@ export class GitCache {
     const ledger = new Map<string, AttemptLedgerEntry & { branch: string }>();
     const ledgerRaw = new Map<string, string>();
     const ledgerPaths = new Map<string, Set<string>>();
+    const rawLedger: Array<[string, string]> = [];
+    const rawJournals = new Map<string, Array<string | null>>();
     const active = new Map<string, { raw: string; journal: RecoveryJournalEntry | undefined }>();
     const descriptorRaw = new Map<string, string>();
     const bareProblems: string[] = [];
     for (const item of list) {
       const nl = item.indexOf("\n");
-      if (nl < 0) continue;
-      const k = item.slice(0, nl);
-      const v = item.slice(nl + 1);
+      const k = nl < 0 ? item : item.slice(0, nl);
+      const v = nl < 0 ? "" : item.slice(nl + 1);
+      const journalKey = /^uzi-recovery\.(.+)\.clone$/.exec(k);
+      if (journalKey) {
+        const values = rawJournals.get(journalKey[1]!) ?? [];
+        values.push(nl < 0 ? null : v);
+        rawJournals.set(journalKey[1]!, values);
+      }
+      if (nl < 0) {
+        if (this.epochRetained.getStore() && /^uzi-attempts\.(.+)\.entry$/.test(k))
+          throw new Error("unreadable epoch attempt ledger");
+        continue;
+      }
       let m = /^uzi-attempts\.(.+)\.entry$/.exec(k);
       if (m) {
+        rawLedger.push([m[1]!, v]);
         const e = parseAttemptLedgerEntry(v);
         if (!e && this.epochRetained.getStore()) throw new Error("unreadable epoch attempt ledger");
         if (e) {
@@ -11167,7 +11278,7 @@ export class GitCache {
 
     // Attempt sources: the ledger's last value per attempt id, not owned by a protected record.
     for (const e of ledger.values()) {
-      if (e.state === "retired" || owned.has(e.clonePath)) continue;
+      if (owned.has(e.clonePath) || e.state === "retired" && !this.epochRetained.getStore()) continue;
       const parsed = parseAttemptPath(e.clonePath, runnerRoot);
       const problems = runProblems(e.runId);
       const key = parsed?.key ?? "";
@@ -11181,13 +11292,24 @@ export class GitCache {
       const a = active.get(e.branch);
       const plainNames = a?.journal !== undefined && !a.journal.recovery && !a.journal.retainedSources?.length &&
         sameRecoverySource(a.journal, { runId: e.runId, clonePath: e.clonePath, attemptId: e.attemptId });
-      records.push({
+      const record: GatheredRecord = {
         kind: "attempt", runId: e.runId, branch: e.branch, key, parts: [p], journal: undefined,
         activeRaw: a?.raw, descriptorRaw: undefined, descriptorSnapshot: undefined,
         journalState: plainNames ? "plain" : "none", markerState: "none", markerRaw: undefined,
         ledgerRaw: ledgerRaw.get(e.attemptId), problems, namers,
         digest: sha256Hex(["retained-source-v1", "attempt", ledgerRaw.get(e.attemptId) ?? "", p.devIno].join("\n")),
-      });
+      };
+      if (e.state === "retired") {
+        if (p.presence !== "missing" ||
+            (await this.clonePresence(path.join(path.dirname(e.clonePath), `.uzi-skills-${path.basename(e.clonePath)}`))).presence !== "missing") continue;
+        if (this.exactRetiredEmptyJournal(record, rawLedger, rawJournals.get(e.branch)) &&
+            await this.epochMissingFootprint(record)) {
+          await this.runGit(barePath, ["check-ref-format", `refs/heads/${record.branch}`]);
+          record.epochRetiredEmptyJournal = true;
+        }
+        else if (!this.exactPlainAttemptJournal({ barePath, ledger, records }, record, "retired")) continue;
+      }
+      records.push(record);
     }
     // A path the ledger names under two attempt ids is shared evidence: flag every record on it.
     for (const r of records) {
@@ -11267,8 +11389,12 @@ export class GitCache {
    * hold rules (open or unknown holds never yield `local_discard`).
    */
   private strictPlainJournal(g: GatheredBare, rec: GatheredRecord): boolean {
+    return this.exactPlainAttemptJournal(g, rec, "live");
+  }
+
+  private exactPlainAttemptJournal(g: GatheredBare, rec: GatheredRecord, state: "live" | "retired"): boolean {
     const part = rec.parts[0]!;
-    if (part.ledgerState !== "live" || part.attemptId === undefined || typeof rec.activeRaw !== "string") return false;
+    if (part.ledgerState !== state || part.attemptId === undefined || typeof rec.activeRaw !== "string") return false;
     let parsed: unknown;
     try {
       parsed = JSON.parse(rec.activeRaw);
@@ -11287,6 +11413,50 @@ export class GitCache {
     const keyOf = cloneKeyOf(part.clonePath).cloneKey;
     for (const e of g.ledger.values()) {
       if (e.attemptId !== part.attemptId && e.state !== "retired" && cloneKeyOf(e.clonePath).cloneKey === keyOf) return false;
+    }
+    return true;
+  }
+
+  /** At most the path depth plus two leaves, charged to the epoch read budget; no retry.
+   * Missing ancestors and symlinks cannot prove an absent footprint. */
+  private async epochMissingFootprint(rec: GatheredRecord): Promise<boolean> {
+    const clone = rec.parts[0]!.clonePath;
+    const parent = path.dirname(clone);
+    const root = path.parse(parent).root;
+    let current = root;
+    for (const component of parent.slice(root.length).split(path.sep).filter(Boolean)) {
+      current = path.join(current, component);
+      if ((await this.clonePresence(current)).presence !== "present") return false;
+    }
+    for (const target of [clone, path.join(parent, `.uzi-skills-${path.basename(clone)}`)]) {
+      if ((await this.clonePresence(target)).presence !== "missing") return false;
+    }
+    return true;
+  }
+
+  /** Narrow metadata-only retry evidence, from the complete ordered raw snapshot under B.
+   * One pass over the bounded snapshot; any ambiguity refuses the whole pair. */
+  private exactRetiredEmptyJournal(rec: GatheredRecord, snapshot: Array<[string, string]>, journal: readonly (string | null)[] | undefined): boolean {
+    const p = rec.parts[0]!;
+    if (!this.epochRetained.getStore() || rec.kind !== "attempt" || rec.problems.length ||
+        p.ledgerState !== "retired" || !p.attemptId || p.generation === null ||
+        journal?.length !== 1 || journal[0] !== "" || rec.namers.get(p.clonePath)?.length) return false;
+    const key = cloneKeyOf(p.clonePath).cloneKey;
+    const own: Array<[string, AttemptLedgerEntry]> = [];
+    const latest = new Map<string, AttemptLedgerEntry>();
+    for (const [branch, raw] of snapshot) {
+      const e = parseAttemptLedgerEntry(raw);
+      if (!e || raw !== attemptLedgerValue(e)) return false;
+      if (e.attemptId === p.attemptId) {
+        if (branch !== rec.branch || e.runId !== rec.runId || e.clonePath !== p.clonePath) return false;
+        own.push([raw, e]);
+      } else if (e.clonePath === p.clonePath) return false;
+      latest.set(e.attemptId, e);
+    }
+    const retired = own.filter(([, e]) => e.state === "retired");
+    if (retired.length !== 1 || retired[0] !== own.at(-1)) return false;
+    for (const e of latest.values()) {
+      if (e.attemptId !== p.attemptId && e.state !== "retired" && cloneKeyOf(e.clonePath).cloneKey === key) return false;
     }
     return true;
   }
@@ -11434,12 +11604,18 @@ export class GitCache {
       if (bl.length > 0) return { kind: "refused", consumers: bl };
       return rec.kind === "protected" ? { kind: "local_protected_discard" } : { kind: "local_discard" };
     };
-    const disposition = decide(uniq);
+    const disposition = rec.epochRetiredEmptyJournal ? undefined : decide(uniq);
     let epochSettlement: RetainedSourceEvidence["epochSettlement"];
     if (this.epochRetained.getStore() && rec.kind === "attempt" && ctx.lifecycle?.state === "terminal" &&
-        ownLedgerLive !== undefined && !pinConsumers && this.strictPlainJournal(g, rec)) {
+        !pinConsumers && (ownLedgerLive !== undefined && this.strictPlainJournal(g, rec) ||
+          rec.parts[0]!.ledgerState === "retired" && this.exactPlainAttemptJournal(g, rec, "retired"))) {
       const discounted = new Set([ownLedgerLive, ownNamed]);
       const settled = decide(uniq.filter((b) => !discounted.has(b)));
+      if (settled !== undefined) epochSettlement = { basis: "strict_plain", disposition: settled };
+    }
+    if (rec.epochRetiredEmptyJournal && ctx.lifecycle?.state === "terminal" &&
+        holds?.state === "read" && open.length === 0 && !pinConsumers) {
+      const settled = decide(uniq);
       if (settled !== undefined) epochSettlement = { basis: "strict_plain", disposition: settled };
     }
     return { blockers: uniq, consumers, localRecords, live, holdsView, disposition, epochSettlement };
@@ -11810,38 +11986,6 @@ export class GitCache {
       try { this.checkEpochDiscardLive(epoch); } catch { return refused("stale_epoch_proof"); }
       if (opts.holds?.state !== "read" || !Array.isArray(opts.holds.holds) || opts.holds.holds.length !== 0 ||
           opts.lifecycle?.state !== "terminal") return refused("epoch_authority_refused");
-      try {
-        return await this.epochRetained.run(this.epochLimits(), () => this.withRecoveryOperation(
-          epoch.signal, epoch.deadline, () => this.withEpochNativeReads(proof!, () => this.withLock(epoch.barePath, async () => {
-            this.checkEpochDiscardLive(epoch);
-            const g = await this.gatherRetainedUnderLock(epoch.barePath);
-            this.checkEpochDiscardLive(epoch);
-            const matches = g.records.filter(rec => this.matchesRetainedSelector(rec, epoch.selector));
-            if (matches.length !== 1) return refused(matches.length ? "ambiguous" : "not_found");
-            const rec = matches[0]!;
-            if (rec.digest !== epoch.confirm) return refused("descriptor_changed");
-            if (rec.activeRaw !== epoch.expectedRawJournal) return refused("epoch_journal_changed");
-            if (rec.parts.length !== epoch.paths.length ||
-                rec.parts.some((part, i) => part.clonePath !== epoch.paths[i])) return refused("invalid_epoch_proof");
-            if (rec.kind === "protected" || rec.markerState !== "none") return refused("wrong_discard_kind");
-            const ev = await this.evaluateRetained(g, rec, {
-              holds: opts.holds, lifecycle: opts.lifecycle, isLivePath: opts.isLivePath,
-            });
-            const disposition = rec.kind === "attempt" ? ev.epochSettlement?.disposition : ev.disposition;
-            if (disposition?.kind !== "local_discard") return refused("epoch_source_refused", ev.blockers, disposition);
-            this.checkEpochDiscardLive(epoch);
-            if (!(await this.automaticContentPreserved(epoch))) {
-              this.checkEpochDiscardLive(epoch);
-              return refused("epoch_content_unproven");
-            }
-            this.checkEpochDiscardLive(epoch);
-            // Serial integration guard: native descendant joining and durable retirement must
-            // land before worker epoch authority can enter the existing disposal algorithm.
-            return refused("epoch_discard_unavailable");
-          }))));
-      } catch {
-        return refused("stale_epoch_proof");
-      }
     }
     if (!/^[A-Za-z0-9_-]{1,160}$/.test(sel.runId) || !/^[0-9a-f]{64}$/.test(opts.confirm) ||
         (sel.generation !== "none" && (!Number.isSafeInteger(sel.generation) || sel.generation < 0)) ||
@@ -11852,153 +11996,359 @@ export class GitCache {
     }
     const outcomes: Array<{ clonePath: string; outcome: RetainedSourceOutcome }> = [];
     let metadata: "retired" | "kept" = "kept";
+    let epochWork: ReturnType<PodEpochReclaimScope["beginMutation"]> | undefined;
     const wantKinds = mode === "protected" ? ["protected"] : ["attempt", "canonical"];
-    try {
-      return await this.withRecoveryOperation(opts.signal ?? new AbortController().signal,
-        Date.now() + (opts.deadlineMs ?? RETAINED_OP_DEADLINE_MS), async () => {
-          // Locate the bare. With `opts.barePath` (what inspect reports) the destructive section
-          // below is the ONLY bare-lock entry; without it each candidate bare is gathered under its
-          // own short lock first, released before that section.
-          let bare = opts.barePath;
-          if (bare === undefined) {
-            const matches: string[] = [];
-            for (const candidate of await this.retainedBares()) {
-              const g = await this.withLock(candidate, () => this.gatherRetainedUnderLock(candidate)).catch(() => undefined);
-              if (g?.records.some((r) => wantKinds.includes(r.kind) && this.matchesRetainedSelector(r, sel))) matches.push(candidate);
+    // An exact empty-journal proof may name a metadata repair. If its binding
+    // disappears before B, do not downgrade uncertainty to a settled not-found.
+    const emptyJournalProof = epoch !== undefined && Array.isArray(epoch.expectedRawJournal) &&
+      epoch.expectedRawJournal.length === 1 && epoch.expectedRawJournal[0] === "";
+    const pairMismatch = (message: string): never => {
+      epochWork ??= epoch!.scope.beginMutation();
+      throw new Error(message);
+    };
+    const execute = async (): Promise<RetainedDiscardResult> => {
+      try {
+        const signal = epoch ? AbortSignal.any([epoch.signal, ...(opts.signal ? [opts.signal] : [])])
+          : opts.signal ?? new AbortController().signal;
+        const deadline = epoch ? Math.min(epoch.deadline, opts.deadlineMs === undefined ? Infinity : Date.now() + opts.deadlineMs)
+          : Date.now() + (opts.deadlineMs ?? RETAINED_OP_DEADLINE_MS);
+        return await this.withRecoveryOperation(signal, deadline, async () => {
+            // Locate the bare. With `opts.barePath` (what inspect reports) the destructive section
+            // below is the ONLY bare-lock entry; without it each candidate bare is gathered under its
+            // own short lock first, released before that section.
+            let bare = opts.barePath;
+            if (bare === undefined) {
+              const matches: string[] = [];
+              for (const candidate of await this.retainedBares()) {
+                const g = await this.withLock(candidate, () => this.gatherRetainedUnderLock(candidate)).catch(() => undefined);
+                if (g?.records.some((r) => wantKinds.includes(r.kind) && this.matchesRetainedSelector(r, sel))) matches.push(candidate);
+              }
+              if (matches.length === 0) return refused("not_found");
+              if (matches.length > 1) return refused("ambiguous", ["multiple_bares"]);
+              bare = matches[0]!;
             }
-            if (matches.length === 0) return refused("not_found");
-            if (matches.length > 1) return refused("ambiguous", ["multiple_bares"]);
-            bare = matches[0]!;
-          }
-          const lockedBare = bare;
-          return this.withLock(lockedBare, async () => {
-            const bare = lockedBare;
-            const g = await this.gatherRetainedUnderLock(bare);
-            const candidates = g.records.filter((r) => this.matchesRetainedSelector(r, sel));
-            if (candidates.length !== 1) return refused(candidates.length === 0 ? "not_found" : "ambiguous");
-            const rec = candidates[0]!;
-            if (!wantKinds.includes(rec.kind)) return refused("wrong_discard_kind", [rec.kind]);
-            if (rec.digest !== opts.confirm) return refused("descriptor_changed");
-            const ev = await this.evaluateRetained(g, rec, {
-              holds: opts.holds, ...(opts.lifecycle ? { lifecycle: opts.lifecycle } : {}), isLivePath: opts.isLivePath,
-            });
-            const want = mode === "protected" ? "local_protected_discard" : "local_discard";
-            if (ev.disposition?.kind !== want) {
-              return refused(ev.disposition?.kind ?? "refused",
-                ev.disposition?.kind === "refused" ? ev.disposition.consumers : ev.blockers, ev.disposition);
-            }
-            // The existing protected-source checks, then the exclusivity ones (evaluateRetained).
-            let snapshot: { descriptor: string | undefined; active: string | undefined } | undefined;
-            if (rec.kind === "protected") {
-              const journal = rec.journal!;
-              const expected = recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
-                ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }) });
-              const missingSome = rec.parts.some((p) => p.presence === "missing");
-              await this.checkedRecovery(bare, rec.branch, rec.key, expected, missingSome, rec.descriptorRaw === undefined ? undefined : journal);
-              await this.attributedRecovery(bare, rec.branch, rec.key, expected, rec.descriptorRaw === undefined ? undefined : journal);
-              await this.protectedRecoveries(bare, rec.runId);
-              snapshot = { descriptor: rec.descriptorSnapshot, active: rec.activeRaw };
-            }
-            for (const p of rec.parts) outcomes.push({ clonePath: p.clonePath, outcome: "retained" });
-            const paths = rec.parts.flatMap((p) => [p.clonePath, path.join(path.dirname(p.clonePath), `.uzi-skills-${path.basename(p.clonePath)}`)]);
-            if (!(await opts.quiesce(paths))) return refused("not_quiescent", ["writers_not_proven_gone"]);
-            // A latch that landed during the caller's quiescence, or at any later point, keeps the
-            // remaining sources and every record: nothing further is deleted or retired.
-            const stopped = (): RetainedDiscardResult => ({ kind: "unknown", sources: outcomes, metadata });
-            if (residueQuarantine() !== undefined) return stopped();
-            // issue #3404 M2 U5: the operator-discard takeover of the authority slots comes LAST, after every refusal
-            // above (protected-source checks, quiescence, latch) and immediately before the first delete. A refused
-            // discard therefore rewrites no durable authority, and a crashed worker's foreign `active` epoch keeps
-            // guarding a source this discard never touched. A refusal here (a running pending record, ...) deletes nothing.
-            try { for (const p of rec.parts) await this.admitSource(p.clonePath, "discard"); }
-            catch { return refused("source_use_refused", ["authority"]); }
-            for (const [i, p] of rec.parts.entries()) {
+            const lockedBare = bare;
+            return this.withLock(lockedBare, async () => {
+              const bare = lockedBare;
+              const g = await this.gatherRetainedUnderLock(bare);
+              const candidates = g.records.filter((r) => this.matchesRetainedSelector(r, sel));
+              if (candidates.length !== 1) {
+                if (emptyJournalProof) pairMismatch("epoch pair disappeared or became ambiguous");
+                return refused(candidates.length === 0 ? "not_found" : "ambiguous");
+              }
+              const rec = candidates[0]!;
+              if (!wantKinds.includes(rec.kind)) {
+                if (emptyJournalProof) pairMismatch("epoch pair owner changed");
+                return refused("wrong_discard_kind", [rec.kind]);
+              }
+              if (rec.digest !== opts.confirm) {
+                if (emptyJournalProof) pairMismatch("epoch pair descriptor changed");
+                return refused("descriptor_changed");
+              }
+              if (epoch) {
+                this.checkEpochDiscardLive(epoch);
+                if (rec.kind === "protected" || rec.markerState !== "none") {
+                  if (emptyJournalProof) pairMismatch("epoch pair protection changed");
+                  return refused("wrong_discard_kind");
+                }
+                if (rec.parts.length !== epoch.paths.length || rec.parts.some((p, i) => p.clonePath !== epoch.paths[i])) {
+                  if (emptyJournalProof) pairMismatch("epoch pair footprint binding changed");
+                  return refused("invalid_epoch_proof");
+                }
+                const wantJournal = typeof epoch.expectedRawJournal === "string" ? [epoch.expectedRawJournal] : epoch.expectedRawJournal;
+                if (JSON.stringify(await this.epochJournalVector(bare, rec.branch)) !== JSON.stringify(wantJournal)) {
+                  if (emptyJournalProof) pairMismatch("epoch pair journal changed");
+                  return refused("epoch_journal_changed");
+                }
+              }
+              const ev = await this.evaluateRetained(g, rec, {
+                holds: opts.holds, ...(opts.lifecycle ? { lifecycle: opts.lifecycle } : {}), isLivePath: opts.isLivePath,
+              });
+              const want = mode === "protected" ? "local_protected_discard" : "local_discard";
+              const disposition = epoch ? ev.epochSettlement?.disposition ?? ev.disposition : ev.disposition;
+              if (disposition?.kind !== want) {
+                return refused(epoch ? "epoch_source_refused" : ev.disposition?.kind ?? "refused",
+                  ev.disposition?.kind === "refused" ? ev.disposition.consumers : ev.blockers, ev.disposition);
+              }
+              const epochParent = epoch ? await fs.lstat(path.dirname(epoch.paths[0]!)).catch(() => undefined) : undefined;
+              if (epoch && !epochParent) {
+                if (rec.epochRetiredEmptyJournal) pairMismatch("epoch pair parent disappeared");
+                return refused("epoch_parent_unproven");
+              }
+              if (epochParent && (!epochParent.isDirectory() || epochParent.isSymbolicLink())) {
+                if (rec.epochRetiredEmptyJournal) pairMismatch("epoch pair parent became unsafe");
+                return refused("epoch_parent_unsafe");
+              }
+              if (epoch && !await this.automaticContentPreserved(epoch)) {
+                try { this.checkEpochDiscardLive(epoch); } catch { return refused("stale_epoch_proof"); }
+                if (rec.epochRetiredEmptyJournal) pairMismatch("epoch pair footprint changed");
+                return refused("epoch_content_unproven");
+              }
+              const epochSnapshot = epoch ? await this.readAllAttemptLedgerRaw(bare) : undefined;
+              if (epochSnapshot && (!this.epochRetirementAttribution(rec, epochSnapshot) ||
+                  rec.epochRetiredEmptyJournal && !this.exactRetiredEmptyJournal(rec, epochSnapshot, await this.epochJournalVector(bare, rec.branch)))) {
+                if (emptyJournalProof) pairMismatch("epoch pair ledger changed");
+                return refused("epoch_ledger_conflict");
+              }
+              // The existing protected-source checks, then the exclusivity ones (evaluateRetained).
+              let snapshot: { descriptor: string | undefined; active: string | undefined } | undefined;
+              if (rec.kind === "protected") {
+                const journal = rec.journal!;
+                const expected = recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
+                  ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }) });
+                const missingSome = rec.parts.some((p) => p.presence === "missing");
+                await this.checkedRecovery(bare, rec.branch, rec.key, expected, missingSome, rec.descriptorRaw === undefined ? undefined : journal);
+                await this.attributedRecovery(bare, rec.branch, rec.key, expected, rec.descriptorRaw === undefined ? undefined : journal);
+                await this.protectedRecoveries(bare, rec.runId);
+                snapshot = { descriptor: rec.descriptorSnapshot, active: rec.activeRaw };
+              }
+              for (const p of rec.parts) outcomes.push({ clonePath: p.clonePath, outcome: "retained" });
+              const paths = rec.parts.flatMap((p) => [p.clonePath, path.join(path.dirname(p.clonePath), `.uzi-skills-${path.basename(p.clonePath)}`)]);
+              if (!(epoch ? await this.epochObservation(epoch, () => opts.quiesce(paths)) : await opts.quiesce(paths))) return refused("not_quiescent", ["writers_not_proven_gone"]);
+              // A latch that landed during the caller's quiescence, or at any later point, keeps the
+              // remaining sources and every record: nothing further is deleted or retired.
+              const stopped = (): RetainedDiscardResult => {
+                epoch?.scope.stop();
+                return { kind: "unknown", sources: outcomes, metadata };
+              };
+              if (residueQuarantine() !== undefined) return stopped();
+              // issue #3404 M2 U5: the operator-discard takeover of the authority slots comes LAST, after every refusal
+              // above (protected-source checks, quiescence, latch) and immediately before the first delete. A refused
+              // discard therefore rewrites no durable authority, and a crashed worker's foreign `active` epoch keeps
+              // guarding a source this discard never touched. A refusal here (a running pending record, ...) deletes nothing.
+              try { for (const p of rec.parts) await this.admitSource(p.clonePath, "discard"); }
+              catch { return refused("source_use_refused", ["authority"]); }
+              if (epoch) {
+                this.checkEpochDiscardLive(epoch);
+                const parent = path.dirname(epoch.paths[0]!);
+                const bound = epochParent!;
+                if (!bound.isDirectory() || bound.isSymbolicLink()) throw new Error("epoch parent unsafe");
+                const context = this.epochNative.getStore()!;
+                context.beforeLaunch = async () => {
+                  const want = typeof epoch.expectedRawJournal === "string" ? [epoch.expectedRawJournal] : epoch.expectedRawJournal;
+                  if (JSON.stringify(await this.epochJournalVector(bare, rec.branch)) !== JSON.stringify(want))
+                    throw new Error("epoch journal changed before launch");
+                  this.checkEpochDiscardLive(epoch);
+                  const current = lstatSync(parent);
+                  if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== bound.dev || current.ino !== bound.ino)
+                    throw new Error("epoch parent changed before launch");
+                };
+                epochWork = epoch.scope.beginMutation();
+              }
+              for (const [i, p] of rec.parts.entries()) {
+                if (epoch) this.checkEpochDiscardLive(epoch);
+                if (epoch && p.ledgerState === "retired") { outcomes[i]!.outcome = "missing"; continue; }
+                this.checkRecoveryInterruption();
+                if (residueQuarantine() !== undefined) return stopped();
+                const parent = path.dirname(p.clonePath);
+                const base = path.basename(p.clonePath);
+                const skills = `.uzi-skills-${base}`;
+                try {
+                  // The skills sibling first (see deleteRetainedArtifact): a failed clone delete then
+                  // orphans nothing.
+                  if (!(await this.deleteRetainedArtifact(parent, path.join(parent, skills), (n) => n === skills, epoch ? { strictValidation: true } : {}))) {
+                    outcomes[i]!.outcome = "retained";
+                    continue;
+                  }
+                  // A latch that landed during the skills delete keeps the clone itself.
+                  if (residueQuarantine() !== undefined) return stopped();
+                  if (!(await this.deleteRetainedArtifact(parent, p.clonePath, (n) => n === base, epoch ? { strictValidation: true } : {}))) {
+                    outcomes[i]!.outcome = "retained";
+                    continue;
+                  }
+                } catch (err) {
+                  if (epoch) {
+                    if ((err as { epochDeleteJoined?: boolean }).epochDeleteJoined === true &&
+                        !epoch.scope.stopped() && this.unsettledDeletes.size === 0) {
+                      outcomes[i]!.outcome = "retained";
+                      continue;
+                    }
+                    throw err;
+                  }
+                  outcomes[i]!.outcome = "unknown";
+                  this.log.warn("retained source delete could not be settled; it and its records are kept", { clone: p.clonePath, error: gitErrorMessage(err) });
+                  break;
+                }
+                const after = await this.clonePresence(p.clonePath);
+                outcomes[i]!.outcome = after.presence !== "missing" ? "unknown" : p.presence === "missing" ? "missing" : "removed";
+              }
+              if (!outcomes.every((o) => o.outcome === "removed" || o.outcome === "missing")) {
+                if (epoch) {
+                  this.checkEpochDiscardLive(epoch);
+                  if (outcomes.some(o => o.outcome === "unknown") || this.unsettledDeletes.size ||
+                      epoch.scope.pendingMutations !== 1) return stopped();
+                  epochWork!.settle();
+                }
+                return { kind: "incomplete", sources: outcomes, metadata };
+              }
               this.checkRecoveryInterruption();
               if (residueQuarantine() !== undefined) return stopped();
-              const parent = path.dirname(p.clonePath);
-              const base = path.basename(p.clonePath);
-              const skills = `.uzi-skills-${base}`;
-              try {
-                // The skills sibling first (see deleteRetainedArtifact): a failed clone delete then
-                // orphans nothing.
-                if (!(await this.deleteRetainedArtifact(parent, path.join(parent, skills), (n) => n === skills))) {
-                  outcomes[i]!.outcome = "retained";
-                  continue;
-                }
-                // A latch that landed during the skills delete keeps the clone itself.
-                if (residueQuarantine() !== undefined) return stopped();
-                if (!(await this.deleteRetainedArtifact(parent, p.clonePath, (n) => n === base))) {
-                  outcomes[i]!.outcome = "retained";
-                  continue;
-                }
-              } catch (err) {
-                outcomes[i]!.outcome = "unknown";
-                this.log.warn("retained source delete could not be settled; it and its records are kept", { clone: p.clonePath, error: gitErrorMessage(err) });
-                break;
+              if (epoch) {
+                await this.settleEpochMetadata(epoch, rec, epochSnapshot!, () => {
+                  this.checkEpochDiscardLive(epoch);
+                  if (epoch.paths.some(p => opts.isLivePath(p))) throw new Error("epoch source became live");
+                });
+                epochWork!.settle();
+                metadata = "retired";
+                return { kind: "done", sources: outcomes, metadata };
               }
-              const after = await this.clonePresence(p.clonePath);
-              outcomes[i]!.outcome = after.presence !== "missing" ? "unknown" : p.presence === "missing" ? "missing" : "removed";
-            }
-            if (!outcomes.every((o) => o.outcome === "removed" || o.outcome === "missing")) {
-              return { kind: "incomplete", sources: outcomes, metadata };
-            }
-            this.checkRecoveryInterruption();
-            if (residueQuarantine() !== undefined) return stopped();
-            // Every path is gone; retire the metadata inside the same critical section.
-            if (rec.kind === "protected") {
-              const journal = rec.journal!;
-              await this.discardRetainedRecoveryUnderLock(bare, rec.branch, rec.key,
-                recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
-                  ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }) }), snapshot);
-            } else if (rec.kind === "canonical") {
-              // Only a journal that names exactly this source (bound) is cleared, and only while its
-              // raw is unchanged; a detached marker never touches a successor's journal.
-              if (rec.markerState === "bound" && (await this.readRecoveryCaptureRaw(bare, rec.branch)) === rec.activeRaw) {
-                await this.runGit(bare, ["config", "--local", recoveryCaptureKey(rec.branch), ""]);
-              } else if (rec.markerState === "none") {
-                // A plain-journal source: clear the journal only while its raw is unchanged AND it
-                // still names exactly this (runId, clonePath) plain canonical source.
-                const raw = await this.readRecoveryCaptureRaw(bare, rec.branch);
-                if (raw !== undefined && raw === rec.activeRaw) {
-                  let still = false;
-                  try {
-                    const j = parseRecoveryJournal(raw);
-                    still = j.attemptId === undefined && !j.recovery && !j.retainedSources?.length &&
-                      sameRecoverySource(j, { runId: rec.runId, clonePath: rec.parts[0]!.clonePath });
-                  } catch {
-                    still = false;
+              // Every path is gone; retire the metadata inside the same critical section.
+              if (rec.kind === "protected") {
+                const journal = rec.journal!;
+                await this.discardRetainedRecoveryUnderLock(bare, rec.branch, rec.key,
+                  recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
+                    ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }) }), snapshot);
+              } else if (rec.kind === "canonical") {
+                // Only a journal that names exactly this source (bound) is cleared, and only while its
+                // raw is unchanged; a detached marker never touches a successor's journal.
+                if (rec.markerState === "bound" && (await this.readRecoveryCaptureRaw(bare, rec.branch)) === rec.activeRaw) {
+                  await this.runGit(bare, ["config", "--local", recoveryCaptureKey(rec.branch), ""]);
+                } else if (rec.markerState === "none") {
+                  // A plain-journal source: clear the journal only while its raw is unchanged AND it
+                  // still names exactly this (runId, clonePath) plain canonical source.
+                  const raw = await this.readRecoveryCaptureRaw(bare, rec.branch);
+                  if (raw !== undefined && raw === rec.activeRaw) {
+                    let still = false;
+                    try {
+                      const j = parseRecoveryJournal(raw);
+                      still = j.attemptId === undefined && !j.recovery && !j.retainedSources?.length &&
+                        sameRecoverySource(j, { runId: rec.runId, clonePath: rec.parts[0]!.clonePath });
+                    } catch {
+                      still = false;
+                    }
+                    if (still) await this.runGit(bare, ["config", "--local", recoveryCaptureKey(rec.branch), ""]);
                   }
-                  if (still) await this.runGit(bare, ["config", "--local", recoveryCaptureKey(rec.branch), ""]);
                 }
               }
-            }
-            for (const p of rec.parts) {
-              if (p.attemptId !== undefined && p.ledgerState !== "none" && p.ledgerState !== "retired") {
-                await this.appendAttemptLedger(bare, g.ledger.get(p.attemptId)?.branch ?? rec.branch,
-                  { attemptId: p.attemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
-              }
-            }
-            if (rec.kind === "canonical" && rec.markerState !== "none") {
-              const target = rec.parts[0]!.clonePath;
-              // The exact marker value, or one whose PARSED path is exactly this source's; a malformed
-              // value is never matched by text (a path that is a prefix of another is not a match).
-              await this.removeStoppedMarkers(bare, rec.runId, (raw) => {
-                if (raw === rec.markerRaw) return true;
-                try {
-                  return (JSON.parse(raw) as { clonePath?: unknown } | null)?.clonePath === target;
-                } catch {
-                  return false;
+              for (const p of rec.parts) {
+                if (p.attemptId !== undefined && p.ledgerState !== "none" && p.ledgerState !== "retired") {
+                  await this.appendAttemptLedger(bare, g.ledger.get(p.attemptId)?.branch ?? rec.branch,
+                    { attemptId: p.attemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
                 }
-              });
-            }
-            metadata = "retired";
-            return { kind: "done", sources: outcomes, metadata };
+              }
+              if (rec.kind === "canonical" && rec.markerState !== "none") {
+                const target = rec.parts[0]!.clonePath;
+                // The exact marker value, or one whose PARSED path is exactly this source's; a malformed
+                // value is never matched by text (a path that is a prefix of another is not a match).
+                await this.removeStoppedMarkers(bare, rec.runId, (raw) => {
+                  if (raw === rec.markerRaw) return true;
+                  try {
+                    return (JSON.parse(raw) as { clonePath?: unknown } | null)?.clonePath === target;
+                  } catch {
+                    return false;
+                  }
+                });
+              }
+              metadata = "retired";
+              return { kind: "done", sources: outcomes, metadata };
+            });
           });
-        });
-    } catch (err) {
-      this.log.warn("retained source discard was interrupted; whatever is not proven gone stays", { error: gitErrorMessage(err) });
-      return { kind: "unknown", sources: outcomes.map((o) => (o.outcome === "removed" || o.outcome === "missing" ? o : { ...o, outcome: o.outcome === "unknown" ? "unknown" : "retained" })), metadata };
+      } catch (err) {
+        epoch?.scope.stop();
+        this.log.warn("retained source discard was interrupted; whatever is not proven gone stays", { error: gitErrorMessage(err) });
+        return { kind: "unknown", sources: outcomes.map((o) => (o.outcome === "removed" || o.outcome === "missing" ? o : { ...o, outcome: o.outcome === "unknown" ? "unknown" : "retained" })), metadata };
+      }
+    };
+    if (!epoch) return execute();
+    return this.epochRetained.run(this.epochLimits(), () => this.withEpochNativeReads(proof!, execute));
+  }
+
+  /** Exact valued/valueless journal vector; unlike readRecoveryCaptureRaw this preserves empty keys. */
+  private async epochJournalVector(bare: string, branch: string): Promise<Array<string | null>> {
+    const key = recoveryCaptureKey(branch);
+    const values: Array<string | null> = [];
+    for (const item of (await this.runGit(bare, ["config", "--local", "--null", "--list"])).split("\0")) {
+      const nl = item.indexOf("\n");
+      if ((nl < 0 ? item : item.slice(0, nl)) === key) values.push(nl < 0 ? null : item.slice(nl + 1));
     }
+    return values;
+  }
+
+  private epochRetirementAttribution(rec: GatheredRecord, snapshot: Array<[string, string]>): boolean {
+    const p = rec.parts[0]!;
+    if (!p.attemptId) return rec.kind === "canonical";
+    const canonical = attemptLedgerValue({ attemptId: p.attemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
+    const own = snapshot.filter(([, raw]) => parseAttemptLedgerEntry(raw)?.attemptId === p.attemptId);
+    const last = own.at(-1);
+    if (!last || last[0] !== rec.branch || !sameRecoverySource(parseAttemptLedgerEntry(last[1])!,
+      { runId: rec.runId, clonePath: p.clonePath, attemptId: p.attemptId })) return false;
+    const retired = own.filter(([, raw]) => parseAttemptLedgerEntry(raw)?.state === "retired");
+    return retired.length === 0 || retired.length === 1 && retired[0] === last && last[1] === canonical;
+  }
+
+  /** One bounded metadata transaction under B. A failed await leaves the EX ticket pending. */
+  private async settleEpochMetadata(epoch: EpochDiscardProofState, rec: GatheredRecord,
+    snapshot: Array<[string, string]>, checkSource: () => void): Promise<void> {
+    const ticket = epoch.scope.beginMutation();
+    const step = async (name: string) => { await this.epochSettlementFault?.(name); this.checkEpochDiscardLive(epoch); };
+    const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    const journal = typeof epoch.expectedRawJournal === "string" ? [epoch.expectedRawJournal] : [...epoch.expectedRawJournal];
+    const expected = [...snapshot];
+    const p = rec.parts[0]!;
+    const mutate = async (args: string[]) => {
+      this.checkEpochDiscardLive(epoch);
+      const context = this.epochNative.getStore()!;
+      await this.epochNative.run({ ...context, configMutation: args }, () => this.runGit(epoch.barePath, args));
+    };
+    const verify = async (want: readonly (string | null)[]) => {
+      await step("rawverify");
+      if (rec.epochRetiredEmptyJournal) {
+        checkSource();
+        if (!await this.epochMissingFootprint(rec)) throw new Error("epoch pair footprint changed");
+        const fresh = await this.gatherRetainedUnderLock(epoch.barePath);
+        const matches = fresh.records.filter(r => this.matchesRetainedSelector(r, epoch.selector));
+        if (matches.length !== 1 || !matches[0]!.epochRetiredEmptyJournal || matches[0]!.digest !== rec.digest)
+          throw new Error("epoch pair attribution changed");
+      }
+      if (!equal(await this.readAllAttemptLedgerRaw(epoch.barePath), expected) ||
+          !equal(await this.epochJournalVector(epoch.barePath, rec.branch), want)) throw new Error("epoch metadata raw mismatch");
+    };
+    const barrier = async (boundary: string, want: readonly (string | null)[]) => {
+      await step(boundary + ":before");
+      await this.syncConfigAndVerify(epoch.barePath, async () => {
+        await step(boundary + ":before-rawverify");
+        await verify(want);
+        await step(boundary + ":after-rawverify");
+      }, {}, name => step(boundary + ":" + name));
+      await step(boundary + ":after");
+    };
+    try {
+      await verify(journal);
+      if (p.attemptId !== undefined) {
+        const value = attemptLedgerValue({ attemptId: p.attemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
+        const entries = snapshot.filter(([, raw]) => parseAttemptLedgerEntry(raw)?.attemptId === p.attemptId);
+        const last = entries.at(-1);
+        const retired = entries.filter(([, raw]) => parseAttemptLedgerEntry(raw)?.state === "retired");
+        if (retired.length && (retired.length !== 1 || last?.[0] !== rec.branch || last[1] !== value || retired[0] !== last))
+          throw new Error("conflicting epoch retired evidence");
+        if (!retired.length) {
+          if (!last || last[0] !== rec.branch || !sameRecoverySource(parseAttemptLedgerEntry(last[1])!,
+            { runId: rec.runId, clonePath: p.clonePath, attemptId: p.attemptId })) throw new Error("epoch ledger attribution changed");
+          await step("before-retiredappend");
+          await mutate(["config", "--local", "--add", attemptLedgerKey(rec.branch), value]);
+          let index = expected.length;
+          for (let i = expected.length - 1; i >= 0; i--) if (expected[i]![0] === rec.branch) { index = i + 1; break; }
+          expected.splice(index, 0, [rec.branch, value]);
+          await step("after-retiredappend");
+        }
+      }
+      await barrier("retired", journal);
+      this.checkEpochDiscardLive(epoch);
+      checkSource();
+      for (const target of [p.clonePath, path.join(path.dirname(p.clonePath), `.uzi-skills-${path.basename(p.clonePath)}`)]) {
+        if ((await this.clonePresence(target)).presence !== "missing") throw new Error("epoch footprint reappeared");
+      }
+      await verify(journal);
+      if (typeof epoch.expectedRawJournal === "string") {
+        await step("before-clear");
+        await mutate(["config", "--local", recoveryCaptureKey(rec.branch), ""]);
+        await step("after-clear");
+        await barrier("clear", [""]);
+      }
+      if (rec.epochRetiredEmptyJournal) await barrier("clear", [""]);
+      this.checkEpochDiscardLive(epoch);
+      ticket.settle();
+    } catch (error) { epoch.scope.stop(); throw error; }
   }
 
   /** Read only worker-journaled/ledger-owned heads. Ref files are size-bounded;
@@ -21086,10 +21436,10 @@ try {
 
   /** Canonical caches do not borrow object stores. Git 2.56 initializes alternates
    * even for metadata probes, so refuse controls without opening or following them. */
-  private async assertCanonicalAlternatesAbsent(barePath: string): Promise<void> {
+  private async assertCanonicalAlternatesAbsent(barePath: string, automatic?: AutomaticPreservation): Promise<void> {
     for (const name of ["alternates", "http-alternates"]) {
       try {
-        await this.retainedIO(() => fs.lstat(path.join(barePath, "objects", "info", name)));
+        await this.automaticPreservationRead(automatic, () => this.retainedIO(() => fs.lstat(path.join(barePath, "objects", "info", name))));
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
@@ -21099,19 +21449,19 @@ try {
   }
 
   /** Worker-only directories are the ownership root; runner-provided Git config is not. */
-  private async assertOwedBare(barePath: string, readOptions?: BoundedReadOptions): Promise<void> {
+  private async assertOwedBare(barePath: string, readOptions?: BoundedReadOptions, automatic?: AutomaticPreservation): Promise<void> {
     const root = path.resolve(this.reposRoot);
     if (typeof barePath !== "string" || path.dirname(barePath) !== root || path.resolve(barePath) !== barePath) {
       throw new Error("owed candidates require a known worker bare path");
     }
     for (const dir of [root, barePath]) {
-      const st = await this.retainedIO(() => fs.lstat(dir));
+      const st = await this.automaticPreservationRead(automatic, () => this.retainedIO(() => fs.lstat(dir)));
       if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() ||
           (st.mode & 0o002) !== 0 ||
           ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() ||
             (uidSplitActive() && st.gid === RUNNER_UID)))) throw new Error("unsafe worker bare directory");
     }
-    await this.assertCanonicalAlternatesAbsent(barePath);
+    await this.assertCanonicalAlternatesAbsent(barePath, automatic);
     const args = ["rev-parse", "--is-bare-repository"];
     const read = readOptions ? await this.readBare(barePath, args, readOptions) : undefined;
     if (read?.truncated || (read ? read.text : await this.runGit(barePath, args)).trim() !== "true") {
@@ -21301,7 +21651,7 @@ try {
   }
 
   private async validateOwedContext(barePath: string, branch: string, c: StoredOwedContext,
-    historical = false, stored = false): Promise<void> {
+    historical = false, stored = false, automatic?: AutomaticPreservation): Promise<void> {
     const raw = c as unknown as Record<string, unknown>;
     const isHistorical = raw?.origin === "historical";
     const expectedKeys = isHistorical
@@ -21324,10 +21674,10 @@ try {
           !c.defaultIdentity.ref.startsWith("refs/") || typeof c.defaultIdentity.sha !== "string" || !OWED_OID.test(c.defaultIdentity.sha)))) {
       throw new Error("invalid owed candidate context");
     }
-    await this.assertOwedBare(barePath);
-    if (!(await this.isPlainBranchName(barePath, branch))) throw new Error("invalid owed branch");
+    await this.automaticPreservationRead(automatic, () => this.assertOwedBare(barePath, undefined, automatic));
+    if (!(await this.automaticPreservationRead(automatic, () => this.isPlainBranchName(barePath, branch)))) throw new Error("invalid owed branch");
     if (c.defaultIdentity) {
-      await this.runGit(barePath, ["check-ref-format", c.defaultIdentity.ref]);
+      await this.automaticPreservationRead(automatic, () => this.runGit(barePath, ["check-ref-format", c.defaultIdentity!.ref]));
       if (!stored) {
         const name = this.contextName(c);
         const record = await this.readOwedFile(barePath, name);
@@ -21385,10 +21735,15 @@ try {
   }
 
   /** ENOENT alone means absent. Bounded regular-file no-follow read, worker ownership required. */
-  private async readOwedFile(barePath: string, name: string, directoryName: LocalMetadataDirectory = "uzi-owed"): Promise<unknown | undefined> {
+  private async readOwedFile(barePath: string, name: string, directoryName: LocalMetadataDirectory = "uzi-owed",
+    automatic?: AutomaticPreservation): Promise<unknown | undefined> {
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    const cap = automatic ? Math.min(65536, this.epochRetained.getStore()!.maxMetadataBytes -
+      (automatic.owedBytes ?? 0)) : 65536;
+    if (cap < 1) throw new Error("automatic owed byte limit");
     const dir = this.owedDirectory(barePath, directoryName);
     try {
-      const st = await fs.lstat(dir);
+      const st = await read(() => fs.lstat(dir));
       if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) {
         throw new Error("unsafe owed metadata directory");
       }
@@ -21396,39 +21751,45 @@ try {
       if ((cause as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw cause;
     }
-    let file: import("node:fs/promises").FileHandle;
+    let file: import("node:fs/promises").FileHandle | undefined;
     try {
-      file = await fs.open(path.join(dir, name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
-    } catch (cause) {
-      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-      throw cause;
-    }
-    try {
-      const st = await file.stat();
-      if (!st.isFile() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0 || st.size > 65536) {
+      try {
+        await read(async () => { file = await fs.open(path.join(dir, name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK); });
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw cause;
+      }
+      const opened = file!;
+      const st = await read(() => opened.stat());
+      if (!st.isFile() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0 || st.size > cap) {
         throw new Error("unsafe owed metadata file");
       }
-      const before = await file.stat({ bigint: true });
-      const buf = Buffer.alloc(65537);
+      const before = await read(() => opened.stat({ bigint: true }));
+      const buf = Buffer.alloc(cap + 1);
       let length = 0;
       // At most cap+1 nonempty reads; only complete EOF permits JSON parsing.
       while (length < buf.length) {
         this.checkReportProof();
-        const { bytesRead } = await file.read(buf, length, buf.length - length, null);
+        const { bytesRead } = await read(() => opened.read(buf, length, buf.length - length, null));
         if (!bytesRead) break;
         MaintenanceResources.consumeIfActive("metadataBytes", bytesRead);
         length += bytesRead;
+        if (automatic) {
+          automatic.owedBytes = (automatic.owedBytes ?? 0) + bytesRead;
+          if (automatic.owedBytes > this.epochRetained.getStore()!.maxMetadataBytes)
+            throw new Error("automatic owed byte limit");
+        }
         const budget = this.reportProofs.getStore();
         if (budget && (budget.owedBytes += bytesRead) > 32 * 1024 * 1024) throw new Error("owed byte budget");
       }
-      if (length > 65536) throw new Error("oversized owed metadata");
-      const after = await file.stat({ bigint: true });
-      const named = await fs.lstat(path.join(dir, name), { bigint: true });
+      if (length > cap) throw new Error("oversized owed metadata");
+      const after = await read(() => opened.stat({ bigint: true }));
+      const named = await read(() => fs.lstat(path.join(dir, name), { bigint: true }));
       if (before.dev !== named.dev || before.ino !== named.ino || named.isSymbolicLink() ||
           before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ||
           before.mtimeNs !== named.mtimeNs || before.ctimeNs !== named.ctimeNs) throw new Error("owed metadata changed");
       return JSON.parse(buf.toString("utf8", 0, length)) as unknown;
-    } finally { await file.close(); }
+    } finally { if (file) await this.automaticPreservationClose(automatic, () => file!.close()); }
   }
 
   /** Temp is exclusive/no-follow, synced before rename; rename and directory sync precede readback. */
@@ -21486,7 +21847,7 @@ try {
     await this.writeOwedFile(c.barePath, name, record);
   }
 
-  private async parseOwedContext(barePath: string, value: unknown): Promise<StoredOwedContext> {
+  private async parseOwedContext(barePath: string, value: unknown, automatic?: AutomaticPreservation): Promise<StoredOwedContext> {
     const v = value as StoredOwedContext & { version?: unknown };
     const keys = v && Object.keys(v).sort().join(",");
     const expected = v && "origin" in v
@@ -21499,7 +21860,7 @@ try {
       throw new Error("invalid owed context record");
     }
     const { version: _version, ...c } = v;
-    await this.validateOwedContext(barePath, c.branch, c, true, true);
+    await this.validateOwedContext(barePath, c.branch, c, true, true, automatic);
     return c;
   }
 
@@ -21868,30 +22229,39 @@ try {
     return this.withLock(barePath, () => this.enumerateOwedUnderLock(barePath, runId));
   }
 
-  private async owedMetadataNames(barePath: string): Promise<string[]> {
+  private async owedMetadataNames(barePath: string, automatic?: AutomaticPreservation): Promise<string[]> {
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
     const dir = this.owedDirectory(barePath);
+    let observed = false;
     try {
-      const st = await fs.lstat(dir);
+      const st = await read(() => fs.lstat(dir));
       if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) {
         throw new Error("unsafe owed discovery directory");
       }
+      observed = true;
       const names: string[] = [];
-      if (this.epochRetained.getStore() || this.reportProofs.getStore() || MaintenanceResources.active()) {
-        const directory = await fs.opendir(dir);
+      if (automatic || this.epochRetained.getStore() || this.reportProofs.getStore() || MaintenanceResources.active()) {
+        let directory: import("node:fs").Dir | undefined;
         try {
+          await read(async () => { directory = await fs.opendir(dir, automatic ? { bufferSize: 1 } : undefined); });
+          const opened = directory!;
           for (;;) {
             this.checkReportProof();
             this.checkRecoveryInterruption();
             MaintenanceResources.checkIfActive();
-            const entry = await this.retainedIO(() => directory.read());
+            const entry = await read(() => this.retainedIO(() => opened.read()));
             if (!entry) break;
             MaintenanceResources.consumeIfActive("adminEntries", 1);
             MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(entry.name));
-            if (names.length >= 1024) throw new Error("owed entry budget");
+            if (automatic) {
+              automatic.owedBytes = (automatic.owedBytes ?? 0) + Buffer.byteLength(entry.name);
+              if (automatic.owedBytes > this.epochRetained.getStore()!.maxMetadataBytes) throw new Error("automatic owed byte limit");
+            }
+            if (names.length >= (automatic ? Math.min(1024, this.epochRetained.getStore()!.maxMetadataRecords) : 1024)) throw new Error("owed entry budget");
             names.push(entry.name);
           }
-        } finally { await directory.close(); }
-        const after = await fs.lstat(dir);
+        } finally { if (directory) await this.automaticPreservationClose(automatic, () => directory!.close()); }
+        const after = await read(() => fs.lstat(dir));
         if (st.dev !== after.dev || st.ino !== after.ino || st.mtimeMs !== after.mtimeMs ||
             st.ctimeMs !== after.ctimeMs) throw new Error("owed directory changed");
       } else names.push(...await fs.readdir(dir));
@@ -21901,7 +22271,7 @@ try {
       }
       return names.sort();
     } catch (cause) {
-      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT" && (!automatic || !observed)) return [];
       throw cause;
     }
   }
@@ -21909,17 +22279,17 @@ try {
   /** Read and validate EVERY owed context and candidate file once. Callers that enumerate several
    *  runs of one bare (boot/live discovery) share one result instead of rereading per run or per
    *  context. Any unreadable or malformed entry throws: nothing here ever skips a bad file. */
-  private async readOwedMetadataUnderLock(barePath: string): Promise<OwedMetadata> {
-    const names = await this.owedMetadataNames(barePath);
+  private async readOwedMetadataUnderLock(barePath: string, automatic?: AutomaticPreservation): Promise<OwedMetadata> {
+    const names = await this.owedMetadataNames(barePath, automatic);
     const contexts = new Map<string, StoredOwedContext>();
     const records: OwedMetadata["records"] = [];
     for (const name of names.filter((n) => n.startsWith("context-"))) {
-      const c = await this.parseOwedContext(barePath, await this.readOwedFile(barePath, name));
+      const c = await this.parseOwedContext(barePath, await this.readOwedFile(barePath, name, "uzi-owed", automatic), automatic);
       if (name !== this.contextName(c)) throw new Error("owed context filename mismatch");
       contexts.set(name, c);
     }
     for (const name of names.filter((n) => n.startsWith("candidate-"))) {
-      const v = await this.readOwedFile(barePath, name) as { version: number; runId: string; context: string; sha: string };
+      const v = await this.readOwedFile(barePath, name, "uzi-owed", automatic) as { version: number; runId: string; context: string; sha: string };
       if (!v || v.version !== 1 || Object.keys(v).sort().join(",") !== "context,runId,sha,version" ||
           typeof v.runId !== "string" || !OWED_RUN_ID.test(v.runId) || typeof v.sha !== "string" || !OWED_OID.test(v.sha) ||
           typeof v.context !== "string" || !/^context-[0-9a-f]{64}\.json$/.test(v.context) ||
@@ -21931,17 +22301,18 @@ try {
     return { names, contexts, records };
   }
 
-  async enumerateOwedUnderLock(barePath: string, runId: string, metadata?: OwedMetadata): Promise<OwedCandidate[]> {
-    const loaded = metadata ?? await this.readOwedMetadataUnderLock(barePath);
+  async enumerateOwedUnderLock(barePath: string, runId: string, metadata?: OwedMetadata, automatic?: AutomaticPreservation): Promise<OwedCandidate[]> {
+    const loaded = metadata ?? await this.readOwedMetadataUnderLock(barePath, automatic);
     const records = loaded.records.filter((r) => r.runId === runId);
-    const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${runId}/`]);
+    const out = await this.automaticPreservationRead(automatic, () => this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${runId}/`]));
+    if (automatic) this.automaticCollection(out, "\n");
     const result: OwedCandidate[] = [];
     MaintenanceResources.consumeMetadataEntriesIfActive(out, "\n");
     for (const line of out.trim().split("\n").filter(Boolean)) {
       const m = /^refs\/uzi-owed\/([^/]+)\/([0-9a-f]{40}) ([0-9a-f]{40})$/.exec(line);
       if (!m || m[1] !== runId || m[2] !== m[3]) throw new Error("malformed owed pin");
       const sha = m[2]!;
-      await this.requireOwedCommit(barePath, sha);
+      await this.automaticPreservationRead(automatic, () => this.requireOwedCommit(barePath, sha));
       const producing = records.filter((r) => r.sha === sha).map((r) => r.c).sort((a, b) =>
         a.generation === null ? (b.generation === null ? this.contextName(a).localeCompare(this.contextName(b)) : -1)
           : b.generation === null ? 1 : a.generation - b.generation || this.contextName(a).localeCompare(this.contextName(b)));

@@ -67,13 +67,20 @@ beforeEach(async () => {
     finish() { this.assertSettled(); },
   };
   options = { selector, confirm: inspection.sources[0]!.descriptor, holds, lifecycle, barePath: bare,
-    isLivePath: () => false, quiesce: async () => { throw new Error("no effect permitted yet"); } };
+    isLivePath: () => false, quiesce: async () => true };
   input = { decision: { eligible: true, attested: true }, scope, selector, barePath: bare,
     paths: [clonePath], confirm: options.confirm, expectedRawJournal: raw,
-    checkLive: () => { if (!live) throw new Error("reservation expired"); },
+    beforeEffect: async () => {}, checkLive: () => { if (!live) throw new Error("reservation expired"); },
     signal: new AbortController().signal, deadline: Date.now() + 30_000 };
 });
 afterEach(() => fx?.cleanup());
+
+async function success(proof: EpochDiscardProof, over: Partial<RetainedDiscardOptions> = {}): Promise<void> {
+  assert.equal((await git.discardStoppedSource({ ...options, epochProof: proof, ...over })).kind, "done");
+  assert.equal(fs.existsSync(clonePath), false);
+  assert.equal(journal(), "");
+  git.assertEpochDiscardSettled(proof);
+}
 
 async function refusal(proof: EpochDiscardProof, reason: string, over: Partial<RetainedDiscardOptions> = {}): Promise<void> {
   assert.deepEqual(await git.discardStoppedSource({ ...options, epochProof: proof, ...over }),
@@ -92,6 +99,7 @@ function bareOnlyCommit(): string {
 async function contentRefusal(reason = "epoch_content_unproven"): Promise<void> {
   const ledger = gitIn(["config", "--get-all", `uzi-attempts.${BRANCH}.entry`]);
   const proof = git.createEpochDiscardProof(input);
+  if (reason === "eligible") { await success(proof); return; }
   await refusal(proof, reason);
   git.assertEpochDiscardSettled(proof);
   assert.ok(nativeLaunches > 0, "validated production branch used the native read scope");
@@ -157,16 +165,16 @@ describe("legacy coverage keeps its directory and reachability semantics", () =>
 });
 
 describe("automatic content preservation through registered authority", () => {
-  it("accepts a clean published tree and published side refs only up to the effects guard", async () => {
+  it("accepts a clean published tree and published side refs through durable retirement", async () => {
     cloneGit("branch", "published-side", "HEAD");
-    await contentRefusal("epoch_discard_unavailable");
+    await contentRefusal("eligible");
   });
   it("keeps generated nonempty skills eligible for the existing footprint checks", async () => {
     const skills = path.join(path.dirname(clonePath), ".uzi-skills-" + path.basename(clonePath));
     fs.mkdirSync(skills);
     fs.writeFileSync(path.join(skills, "generated.md"), "generated skill");
-    await contentRefusal("epoch_discard_unavailable");
-    assert.equal(fs.readFileSync(path.join(skills, "generated.md"), "utf8"), "generated skill");
+    await contentRefusal("eligible");
+    assert.equal(fs.existsSync(skills), false);
   });
   it("leaves an attributed skills sibling for the discard core when the clone is missing", async () => {
     const skills = path.join(path.dirname(clonePath), ".uzi-skills-" + path.basename(clonePath));
@@ -179,10 +187,8 @@ describe("automatic content preservation through registered authority", () => {
     });
     const confirm = inspection.sources[0]!.descriptor;
     const proof = git.createEpochDiscardProof({ ...input, confirm });
-    assert.deepEqual(await git.discardStoppedSource({ ...options, confirm, epochProof: proof }),
-      { kind: "refused", reason: "epoch_discard_unavailable", consumers: [] });
-    assert.equal(journal(), raw);
-    assert.equal(fs.readFileSync(path.join(skills, "generated.md"), "utf8"), "generated skill");
+    await success(proof, { confirm });
+    assert.equal(fs.existsSync(skills), false);
   });
   for (const shape of ["file", "symlink"] as const) {
     it(`refuses an unsafe skills sibling: ${shape}`, async () => {
@@ -226,7 +232,7 @@ describe("automatic content preservation through registered authority", () => {
       if (state === "populated") for (let i = 0; i < 2000; i++) fs.writeFileSync(path.join(dir, String(i)), "");
       if (state === "symlink") fs.symlinkSync(path.join(clonePath, ".git", "objects"), dir);
       if (state === "file") fs.writeFileSync(dir, "");
-      await contentRefusal(state === "absent" || state === "empty" ? "epoch_discard_unavailable" : "epoch_content_unproven");
+      await contentRefusal(state === "absent" || state === "empty" ? "eligible" : "epoch_content_unproven");
     });
   }
   for (const state of ["missing", "empty", "populated", "symlink", "file"] as const) {
@@ -237,7 +243,7 @@ describe("automatic content preservation through registered authority", () => {
       if (state === "symlink") fs.symlinkSync(path.join(clonePath, ".git"), dir);
       if (state === "file") fs.writeFileSync(dir, "private");
       // An absent tracked gitlink is a deletion in Git status; the directory probe itself skips it.
-      await contentRefusal(state === "empty" ? "epoch_discard_unavailable" : "epoch_content_unproven");
+      await contentRefusal(state === "empty" ? "eligible" : "epoch_content_unproven");
     });
   }
 
@@ -284,15 +290,14 @@ describe("automatic content preservation through registered authority", () => {
   });
 });
 
-describe("worker epoch discard registration (automatic effects remain disabled)", () => {
-  it("keeps raw bytes outside the frozen opaque proof and refuses effects after fresh real-Git checks", async () => {
+describe("worker epoch discard registration", () => {
+  it("keeps raw bytes outside the frozen opaque proof and settles effects after fresh real-Git checks", async () => {
     const proof = git.createEpochDiscardProof(input);
     assert.equal(Object.isFrozen(proof), true);
     assert.equal(JSON.stringify(proof), "{}");
     assert.deepEqual(Reflect.ownKeys(proof), []);
     git.assertEpochDiscardSettled(proof);
-    await refusal(proof, "epoch_discard_unavailable");
-    assert.equal(journal(), raw);
+    await success(proof);
   });
 
   it("rejects JSON, copies and capabilities from a different cache", async () => {
@@ -311,8 +316,8 @@ describe("worker epoch discard registration (automatic effects remain disabled)"
     const original = { ...options.selector };
     (input.selector as { runId: string }).runId = "changed";
     (input.paths as string[])[0] = clonePath + "-changed";
-    await refusal(proof, "epoch_discard_unavailable", { selector: original });
     await refusal(proof, "invalid_epoch_proof");
+    await success(proof, { selector: original });
   });
 
   it("rejects mismatched selector, digest, bare and protected disposal", async () => {
@@ -418,7 +423,7 @@ describe("worker epoch discard registration (automatic effects remain disabled)"
     assert.equal(journal(), raw);
   });
 
-  it("can bind strict-live metadata with an already absent tree without performing retirement", async () => {
+  it("can bind strict-live metadata with an already absent tree and performs durable retirement", async () => {
     fs.rmSync(clonePath, { recursive: true });
     const inspection = await git.inspectRetainedSources({
       selector: options.selector, barePath: bare, holds: options.holds, lifecycle: options.lifecycle,
@@ -428,11 +433,9 @@ describe("worker epoch discard registration (automatic effects remain disabled)"
     assert.equal(source.presence, "missing");
     assert.equal(source.epochSettlement?.disposition.kind, "local_discard");
     const proof = git.createEpochDiscardProof({ ...input, confirm: source.descriptor });
-    assert.deepEqual(await git.discardStoppedSource({ ...options, confirm: source.descriptor, epochProof: proof }),
-      { kind: "refused", reason: "epoch_discard_unavailable", consumers: [] });
-    assert.equal(journal(), raw);
+    await success(proof, { confirm: source.descriptor });
     const entries = gitIn(["config", "--get-all", `uzi-attempts.${BRANCH}.entry`]).split("\n");
-    assert.equal(JSON.parse(entries.at(-1)!).state, "live");
+    assert.equal(JSON.parse(entries.at(-1)!).state, "retired");
   });
 
   it("preserves ordinary operator refusal of a live attempt named by its own journal", async () => {
@@ -442,4 +445,36 @@ describe("worker epoch discard registration (automatic effects remain disabled)"
     assert.equal(journal(), raw);
     assert.ok(fs.existsSync(clonePath));
   });
+});
+
+for (const cancellation of ["abort", "deadline"] as const) it(`epoch ${cancellation} interrupts a queued bare lock before its holder releases`, async t => {
+  const locks = git as unknown as { withLock<T>(key: string, action: () => Promise<T>): Promise<T> };
+  let enter!: () => void;
+  let unblock!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const release = new Promise<void>(resolve => { unblock = resolve; });
+  let released = false;
+  const holder = locks.withLock(bare, async () => { enter(); await release; released = true; });
+  await entered;
+  const controller = new AbortController();
+  const proof = git.createEpochDiscardProof({ ...input, signal: controller.signal,
+    deadline: cancellation === "deadline" ? Date.now() + 100 : input.deadline });
+  let queued = false;
+  const original = locks.withLock.bind(git);
+  t.mock.method(locks, "withLock", <T>(key: string, action: () => Promise<T>) => {
+    const result = original(key, action);
+    queued = true;
+    if (cancellation === "abort") controller.abort(new Error("queued epoch cancelled"));
+    return result;
+  });
+  const discard = git.discardStoppedSource({ ...options, epochProof: proof });
+  const watchdog = AbortSignal.timeout(2000);
+  try {
+    const result = await Promise.race([discard, new Promise<never>((_, reject) => {
+      watchdog.addEventListener("abort", () => reject(new Error("queued epoch did not return promptly")), { once: true });
+    })]);
+    assert.equal(queued, true); assert.equal(released, false);
+    assert.equal(result.kind, "unknown"); assert.equal(stopped, true);
+    assert.equal(journal(), raw); assert.ok(fs.existsSync(clonePath));
+  } finally { unblock(); await holder; await discard; }
 });
