@@ -60,6 +60,21 @@ func (e overflowEvidence) comparison() pgtype.Float8 {
 	return e.Measured
 }
 
+// Automatic-default decision reasons (#3845). auto_fallback always keeps Claude.
+const (
+	harnessReasonAutoSoonestReset  = "auto_soonest_reset"
+	harnessReasonAutoOnlyQualified = "auto_only_qualified"
+	harnessReasonAutoFallback      = "auto_fallback"
+)
+
+// harnessDecisionReasons is the closed reason vocabulary of runs.harness_decision_reason. It
+// must equal the set in the runs_harness_decision_shape CHECK; harness_decision_vocab_test.go
+// guards that against the newest migration defining the constraint.
+var harnessDecisionReasons = []string{
+	"off", "preferred", "overflow", "unknown_usage", "excluded",
+	harnessReasonAutoSoonestReset, harnessReasonAutoOnlyQualified, harnessReasonAutoFallback,
+}
+
 func overflowReason(enabled, eligible bool, preferred, other overflowEvidence) string {
 	if !enabled {
 		return "off"
