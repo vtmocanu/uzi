@@ -24,6 +24,7 @@ let scope: PodEpochReclaimScope;
 let pending: number;
 let stopped: boolean;
 let live: boolean;
+let nativeLaunches: number;
 
 function gitIn(args: string[]): string {
   return execFileSync("git", ["-C", bare, ...args], { env: ENV, encoding: "utf8" }).trim();
@@ -49,8 +50,8 @@ beforeEach(async () => {
   const inspection = await git.inspectRetainedSources({ selector, barePath: bare, holds, lifecycle, epoch: true, isLivePath: () => false });
   assert.equal(inspection.partial, false);
   assert.equal(inspection.sources[0]?.epochSettlement?.disposition.kind, "local_discard");
-  pending = 0; stopped = false; live = true;
-  // A scope contract double; native descriptor inheritance is deliberately not exercised here.
+  pending = 0; stopped = false; live = true; nativeLaunches = 0;
+  // Contract double counts real Git participation; descriptor ownership is tested separately.
   scope = {
     assertExclusive() { if (stopped) throw new Error("stopped"); },
     get pendingMutations() { return pending; },
@@ -59,7 +60,7 @@ beforeEach(async () => {
       let settled = false;
       return { settle() { if (!settled) { settled = true; pending--; } } };
     },
-    inheritStdio() { throw new Error("no native launch in registration tests"); },
+    inheritStdio(stdio = ["pipe", "pipe", "pipe"]) { nativeLaunches++; return [...stdio]; },
     stop() { stopped = true; },
     stopped() { return stopped; },
     assertSettled() { if (stopped || pending) throw new Error("unsettled"); },
@@ -93,6 +94,7 @@ async function contentRefusal(reason = "epoch_content_unproven"): Promise<void> 
   const proof = git.createEpochDiscardProof(input);
   await refusal(proof, reason);
   git.assertEpochDiscardSettled(proof);
+  assert.ok(nativeLaunches > 0, "validated production branch used the native read scope");
   assert.equal(journal(), raw);
   assert.equal(gitIn(["config", "--get-all", `uzi-attempts.${BRANCH}.entry`]), ledger);
 }
