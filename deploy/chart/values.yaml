@@ -454,6 +454,15 @@ workers:
   # uzi. The identity + Role were created together in M3 so the boundary is one
   # reviewable unit; M6's Deployment below is what runs under it.
   controllerServiceAccountName: uzi-controller
+  # The controller's one ClusterRole (issue #3890): `get` on storage.k8s.io
+  # storageclasses and nothing else, bound to the controller ServiceAccount. Size-only
+  # PVC expansion reads the claim's StorageClass to see allowVolumeExpansion, and a
+  # StorageClass is cluster-scoped, so a namespaced Role cannot authorize it. This is an
+  # owner-authorized exception to the otherwise namespace-only RBAC. Set create to false
+  # (for example where a cluster admin owns RBAC) and expansion fails closed: the
+  # controller logs class-lookup-forbidden and leaves every existing claim untouched.
+  storageClassRead:
+    create: true
 
   # --- the controller Deployment (M6) -------------------------------------------
   #
@@ -808,10 +817,12 @@ workers:
   # larger value (the empty/default path included), and the controller's boot check
   # (kube.ValidatePVCCeilings) refuses to start against the live ceilings.
   #
-  # CHANGING IT NEVER RESIZES AN EXISTING PVC: PVCs here are never patched (a size
-  # change is delete + reprovision). Run-bound workers are short-lived, so the new size
-  # arrives with the next one provisioned. Empty falls back to the controller's
-  # built-in 40Gi.
+  # CHANGING IT RAISES AN EXISTING PVC, NEVER LOWERS IT: the controller converges an
+  # existing claim UPWARD to this size on StorageClasses that allow expansion (issue
+  # #3890), and never shrinks, deletes or recreates one. A smaller value therefore
+  # leaves existing claims as they are, and run-bound workers are short-lived anyway, so
+  # a smaller size arrives with the next one provisioned. Empty falls back to the
+  # controller's built-in 40Gi.
   ephemeralWorkerDataSize: 40Gi
   # Ephemeral worker lease (PRD #2006 -> the api's UZI_EPHEMERAL_LEASE). When an ephemeral
   # worker finishes its bound run it is NOT torn down at once: it stays idle for this long
@@ -1174,8 +1185,8 @@ workers:
     # per-preset defaults.
     #
     # Existing claims are converged UPWARD non-destructively by the controller on
-    # StorageClasses that allow expansion (issue #3890); a claim is never shrunk or
-    # recreated. The pod's spec hash covers the claim's NAME and never its size, so a
+    # StorageClasses that allow expansion (issue #3890; it reads the class through
+    # workers.storageClassRead); a claim is never shrunk or recreated. The pod's spec hash covers the claim's NAME and never its size, so a
     # size change rolls no pod.
     #
     # THE CACHE PERSISTS ACROSS ROLLS AND NOTHING GC's IT beyond the worker's gated

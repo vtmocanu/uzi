@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -120,6 +121,10 @@ type Materializer struct {
 	// recycle is the disk self-heal toggle + cooldown (PRD #837 M4). See RecyclePolicy.
 	recycle RecyclePolicy
 	log     *slog.Logger
+	// claimLog dedups the pvc-expand-* / pvc-resize-* log tokens (issue #3890); see
+	// claimEvent. Process-local and best-effort: a restart merely re-logs once.
+	claimLogMu sync.Mutex
+	claimLog   map[string]string
 	// now is the clock seam for roll-health's age arm (PRD #113 M3). A bare
 	// time.Now() at the comparison site would make stuckAge testable only by
 	// sleeping for ten minutes. Defaulted in New; overridden directly by tests,
@@ -361,7 +366,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		switch p.Name {
 		case dataPVCName(id):
 			o.HasDataPVC = true // exists-in-ANY-state (gates the create, UNCHANGED)
-			if !terminating {   // a LIVE data PVC: liveness proxy + mint time for the M4 recycle
+			dataClaim := claimObservationOf(ns, id, p)
+			o.DataClaim = &dataClaim // any state, Terminating included (issue #3890)
+			if !terminating {        // a LIVE data PVC: liveness proxy + mint time for the M4 recycle
 				o.DataPVCLive = true
 				t := p.CreationTimestamp.Time
 				o.DataPVCCreatedAt = &t
@@ -384,6 +391,8 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			// simply never taken for one.
 			o.HasDinDDataPVC = true
 			o.DinDPVCUID = string(p.UID)
+			dindClaim := claimObservationOf(ns, id, p)
+			o.DinDClaim = &dindClaim // any state, Terminating included (issue #3890)
 			if !terminating {
 				o.DinDPVCLive = true
 				o.DinDPVCPhase = string(p.Status.Phase)
@@ -628,6 +637,7 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 	errs = append(errs, tick.errors...)
 	ctx = context.WithValue(ctx, rollTickKey{}, tick)
 	m.logLayoutMigrationHeld(desired, observedByID, tick)
+	m.reportClaimStates(desired, observedByID, tick)
 	uncertain := tick.uncertain
 
 	// Pass 2: create / roll the renderable workers. A failure here is collected and
@@ -986,9 +996,11 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		}
 	}
 
-	// The PVCs. Same create/AlreadyExists shape as the Deployment below, and never
-	// patched: PVC specs are near-immutable, so a size change is delete + reprovision,
-	// not a live edit.
+	// The PVCs. Same create/AlreadyExists shape as the Deployment below. A create
+	// carries the render size only; an existing /data or DinD claim whose request is
+	// below the render size is converged UPWARD afterwards by expandClaims (issue
+	// #3890), never shrunk, deleted or recreated. A /nix size change stays the M3
+	// delete + reprovision above.
 	//
 	// Gate the create on the observed flag (issue #114 BUG 3), exactly as the Deployment
 	// does with obs.HasDeployment. An UNCONDITIONAL create every ~10s tick charged the
@@ -1028,6 +1040,13 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		if err == nil && pvc.Name == dindDataPVCName(w.ID) {
 			m.recordEpochMint(ctx, w.ID, created)
 		}
+	}
+
+	// Size-only PVC expansion (issue #3890): never touches the Deployment, the pod
+	// template or any roll state, and never returns an error that would abort this
+	// reconcile.
+	if legacy {
+		m.expandClaims(ctx, w, obs, ns, spec)
 	}
 
 	// The Deployment.

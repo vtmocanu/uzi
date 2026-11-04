@@ -26,7 +26,9 @@ kind: Role
 metadata:
   name: {{ include "uzi.fullname" . }}-controller
   # A Role, in the WORKER namespace — never a ClusterRole. The controller's reach is
-  # exactly one namespace, and that namespace holds nothing but hosted workers.
+  # exactly one namespace, and that namespace holds nothing but hosted workers. The one
+  # owner-authorized exception (issue #3890) is the get-only StorageClass ClusterRole
+  # at the end of this file, which exists because a StorageClass is cluster-scoped.
   namespace: {{ .Values.workers.namespace }}
   labels:
     {{- include "uzi.labels" . | nindent 4 }}
@@ -296,6 +298,50 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: {{ include "uzi.fullname" . }}-controller-isolated
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.workers.controllerServiceAccountName }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if .Values.workers.storageClassRead.create }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "uzi.fullname" . }}-controller-storageclass-read
+  # The ONE ClusterRole the controller holds, an owner-authorized exception (issue
+  # #3890) to the "never a ClusterRole" rule above. Size-only PVC expansion must know
+  # whether a claim's StorageClass sets allowVolumeExpansion before it patches the
+  # claim, and a StorageClass is CLUSTER-scoped: a namespaced Role cannot authorize
+  # reading one, so no Role in the worker namespace could carry this rule.
+  #
+  # `get` and nothing else: no list, no watch and no create/update/patch/delete. The
+  # controller looks a class up by the name already on the claim, so it never needs to
+  # enumerate classes. It reads no Secret and no node, and every PVC rule stays in the
+  # worker-namespace Roles above.
+  #
+  # Disabling it (workers.storageClassRead.create=false) makes expansion FAIL CLOSED:
+  # the lookup is refused, the controller logs class-lookup-forbidden and leaves every
+  # claim untouched, and creation, recycling and rolls are unaffected.
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "uzi.fullname" . }}-controller-storageclass-read
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "uzi.fullname" . }}-controller-storageclass-read
 subjects:
   - kind: ServiceAccount
     name: {{ .Values.workers.controllerServiceAccountName }}

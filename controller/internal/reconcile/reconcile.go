@@ -34,6 +34,30 @@ type Poller interface {
 	Poll(ctx context.Context) (protocol.PollResponse, error)
 }
 
+// ClaimObservation is one observed worker PVC's identity, request and resize
+// status (issue #3890). It is an internal type: the controller reads it to converge
+// a claim's request upward and to report resize progress; it never crosses the wire.
+type ClaimObservation struct {
+	Name, Namespace, UID, ResourceVersion string
+	// WorkerID is the id from the claim's ownership stamp (the uzi.dev label).
+	WorkerID    string
+	Phase       string
+	Terminating bool
+	// Requested is spec.resources.requests[storage].
+	Requested resource.Quantity
+	// Capacity is status.capacity[storage]; nil while absent (not yet provisioned).
+	Capacity         *resource.Quantity
+	StorageClassName *string
+	// ResizeConditions lists the status condition types whose status is True, for
+	// example FileSystemResizePending, Resizing, ControllerResizeError or NodeResizeError.
+	ResizeConditions []string
+	// AllocatedResourceStatuses is status.allocatedResourceStatuses keyed by resource name.
+	AllocatedResourceStatuses map[string]string
+	// RollAnnotation is the uzi.dev/image-roll annotation value on the claim.
+	RollAnnotation        string
+	RollAnnotationPresent bool
+}
+
 // ObservedWorker is one hosted worker's state as it currently exists in the
 // cluster, read from its DEPLOYMENT — never from its Secret.
 //
@@ -89,9 +113,15 @@ type ObservedWorker struct {
 	DinDPVCLive               bool
 	DinDPVCPhase              string
 	DinDPVCCreatedAt          *time.Time
-	PodsKnown                 bool
-	WorkerPodCount            int
-	ReadyPodUID               string
+	// DataClaim / DinDClaim are the observed /data and DinD data-root claims, recorded
+	// for any state including Terminating (issue #3890). Internal to the controller:
+	// the materializer's size-only PVC expansion reads them, and nothing here is sent
+	// on the wire. nil when no such claim was observed.
+	DataClaim      *ClaimObservation
+	DinDClaim      *ClaimObservation
+	PodsKnown      bool
+	WorkerPodCount int
+	ReadyPodUID    string
 	// NixPVCSize is the observed /nix PVC's requested storage (spec.resources.requests[storage]),
 	// recorded ONLY from a LIVE (deletionTimestamp == nil) nix PVC. nil means "no live nix PVC
 	// observed" — the PVC is absent OR Terminating. M3's size-drift arm compares it against the
