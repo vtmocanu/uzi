@@ -69,8 +69,8 @@
 //          `.npmrc` / workspace `store-dir=<abs>` still makes the install write pnpm's
 //          store index (and any package content pnpm imports: content-addressed files, not a
 //          repo-chosen layout) at that path, outside the clone (measured on 10.34.9). The
-//          default store is under the scrubbed HOME only when HOME and the clone share a
-//          filesystem; otherwise pnpm picks `<clone mount point>/.pnpm-store` (read in pnpm's
+//          default store is under pnpm's home dir (the scrubbed HOME unless XDG_DATA_HOME /
+//          PNPM_HOME is set) only when that dir and the clone share a filesystem; otherwise pnpm picks `<clone mount point>/.pnpm-store` (read in pnpm's
 //          source, not measured here). A relative in-clone store pin would close the escape
 //          but moves every pnpm repo's store into the clone, so a later plain `pnpm install`
 //          in a non-TTY shell aborts on the store mismatch (measured); it is deferred rather
