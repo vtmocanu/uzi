@@ -77,6 +77,9 @@ type Store interface {
 	DiscardCaptureForOwner(ctx context.Context, arg store.DiscardCaptureForOwnerParams) (int64, error)
 	// PRD #1349 M1 (D3): the worker-facing post-clone hold inventory read.
 	ListCustodyHoldsForWorkerRun(ctx context.Context, arg store.ListCustodyHoldsForWorkerRunParams) ([]store.ListCustodyHoldsForWorkerRunRow, error)
+	// Issue #3431: the run-wide open-hold count, authorized on runs.user_id (pgx.ErrNoRows when
+	// the run is unknown or foreign).
+	CountOpenHoldsForOwnedRun(ctx context.Context, arg store.CountOpenHoldsForOwnedRunParams) (store.CountOpenHoldsForOwnedRunRow, error)
 	// PRD #1349 M5 (D6/D7): the owner-facing hold list + aggregate reads. ListHoldsForOwner
 	// maps these to the RecoveryCustodyHoldsDTO and derives each hold's server-side Attention.
 	ListCustodyHoldsForOwner(ctx context.Context, arg store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error)

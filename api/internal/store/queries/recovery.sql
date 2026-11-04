@@ -637,6 +637,16 @@ WHERE h.run_id = @run_id
   AND h.state = 'open'
 ORDER BY h.created_at ASC;
 
+-- name: CountOpenHoldsForOwnedRun :one
+-- Issue #3431: the run-wide count of open custody holds (every worker, every generation) for a
+-- run the caller's owner owns. Authorized on runs.user_id; the count deliberately carries no
+-- hold-level user filter. pgx.ErrNoRows when the run is unknown or foreign.
+SELECT r.id AS run_id,
+       (SELECT count(*) FROM recovery_custody_holds h
+         WHERE h.run_id = r.id AND h.state = 'open')::bigint AS open_holds
+FROM runs r
+WHERE r.id = @run_id AND r.user_id = @user_id;
+
 -- name: ListCustodyHoldsForOwner :many
 -- PRD #1349 M1 (D7): the owner-scoped, bounded hold list the web Workers surface and the
 -- `uzi run recovery` CLI render (M5/M6). OWNER-scoped by @user_id, with OPTIONAL run/worker/

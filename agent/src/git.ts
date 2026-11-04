@@ -44,6 +44,7 @@ import {
   parseAttemptPath,
   parseRetainedArtifactName,
 } from "./attempt-path.js";
+import { GitIndexError, indexUnchanged, readBoundedIndex, statSignature, type BoundedIndex } from "./git-index.js";
 import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
 import { parseSourceFence, serializeSourceFence, type CompletionSourceFence } from "./completion-source.js";
 import type { GitAuthorityHooks, AuthoritySettlement } from "./git-authority-hooks.js";
@@ -1327,6 +1328,54 @@ const PROOF_READ_ENV: NodeJS.ProcessEnv = {
 };
 /** Read-only `status` of a kept clone: GIT_OPTIONAL_LOCKS=0 stops git rewriting the clone's .git/index stat cache. */
 const READ_ONLY_STATUS = { env: { ...NO_REPLACE_ENV, GIT_OPTIONAL_LOCKS: "0" } as NodeJS.ProcessEnv };
+/** The empty tree. `--attr-source` set to it makes Git read gitattributes from no tree at all, so
+ *  neither the worktree's nor the index's `.gitattributes` (nor `attr.tree`) can select a filter. */
+const EPOCH_EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/** Config overrides carried by every clone-side native read of the automatic worktree proof
+ *  (`core.worktree=<clone>` is added per launch). They outrank every config file the clone's
+ *  agent can write. Shared by the launcher and by `preflightEpochNative`'s admission, so the two
+ *  cannot drift. */
+const EPOCH_CLONE_READ_PINS: readonly string[] = [
+  "core.fsmonitor=false", "core.excludesFile=/dev/null", "core.trustctime=true", "core.checkStat=default",
+  "core.fileMode=true", "core.ignoreCase=false", "core.untrackedCache=false", "core.attributesFile=/dev/null",
+  "core.autocrlf=false", "core.eol=lf", "core.safecrlf=false", "core.symlinks=true", "core.sparseCheckout=false",
+  "index.sparse=false", "core.splitIndex=false", "core.preloadIndex=false", "core.bigFileThreshold=1m",
+];
+/**
+ * The only keys the automatic worktree proof admits in a runner clone's `.git/config`. This is
+ * exactly what uzi writes into a seeded clone (verified by dumping a clone made by
+ * `runnerCloneForBranch`): `git clone` itself writes `core.repositoryformatversion`, `core.filemode`,
+ * `core.bare`, `core.logallrefupdates`, `remote.origin.url`, `remote.origin.fetch` (unset again by
+ * the seed, "issue #363") and `branch.<default>.remote|merge`; `disableAutoMaintenance` writes
+ * `maintenance.auto`, `gc.auto` and `core.fsmonitor`; the clone's committer identity writes
+ * `user.name`, `user.email` and `commit.gpgsign`. Anything else (filters, hooks, includes,
+ * attributes, worktree, extensions, sparse, split index, ...) is a keep, not a thing to override.
+ * The recovery-journal keys (`uzi-recovery.*` and the like) live in the BARE, never in a clone.
+ */
+const EPOCH_CLONE_CONFIG_KEYS: ReadonlySet<string> = new Set([
+  "core.repositoryformatversion", "core.filemode", "core.bare", "core.logallrefupdates", "core.fsmonitor",
+  "maintenance.auto", "gc.auto", "remote.origin.url", "remote.origin.fetch", "user.name", "user.email",
+  "commit.gpgsign",
+]);
+/** Levels of non-ignored untracked directories the automatic proof will expand (each is one `check-ignore`). */
+const EPOCH_UNTRACKED_EXPANSION_DEPTH = 32;
+const EPOCH_CLONE_CONFIG_KEY_PATTERNS: readonly RegExp[] = [/^branch\..+\.(?:remote|merge)$/];
+/** Values that must be exact where the key is admitted (git lowercases section and variable names). */
+const EPOCH_CLONE_CONFIG_EXACT_VALUES: ReadonlyMap<string, string> = new Map([
+  ["core.repositoryformatversion", "0"], ["core.bare", "false"], ["core.fsmonitor", "false"],
+]);
+/** Does one `config --null --list` row claim case-folding in any form git reads as true (true/yes/on,
+ *  any non-zero integer with an optional k/m/g suffix, or a bare key)? Such a clone is not provable:
+ *  it could hide a tracked `readme` behind an untracked `README`. */
+function configClaimsCaseFolding(entry: string): boolean {
+  const nl = entry.indexOf("\n");
+  const key = (nl === -1 ? entry : entry.slice(0, nl)).toLowerCase();
+  if (key !== "core.ignorecase") return false;
+  if (nl === -1) return true; // a bare key is boolean true
+  const v = entry.slice(nl + 1).trim().toLowerCase();
+  if (v === "true" || v === "yes" || v === "on") return true;
+  return /^[+-]?(0x[0-9a-f]+|[0-9]+)[kmg]?$/.test(v) && !/^[+-]?(0x)?0+[kmg]?$/.test(v);
+}
 /** Bounds for the stopped-source ref proof: shas per rev-list argv, and refs beyond which coverage is not claimed. */
 const LOCAL_REF_REVLIST_CHUNK = 500;
 const MAX_LOCAL_REF_SHAS = 20000;
@@ -3174,10 +3223,9 @@ export class GitCache {
     let cwd: string | undefined;
     if (rest[0] === "-C") { cwd = rest[1]; rest = rest.slice(2); }
     if (cwd !== undefined && cwd !== (identity === "command" ? state.paths[0] : state.barePath)) return refuse();
-    const pins = new Set(["core.fsmonitor=false", "core.excludesFile=/dev/null", `core.worktree=${state.paths[0]}`,
-      "core.trustctime=true", "core.checkStat=default", "core.fileMode=true", "core.ignoreCase=false",
-      "status.showUntrackedFiles=all", "core.untrackedCache=false"]);
-    while (rest[0] === "--no-replace-objects" || rest[0] === "--no-optional-locks" || rest[0] === "-c") {
+    const pins = new Set([...EPOCH_CLONE_READ_PINS, `core.worktree=${state.paths[0]}`]);
+    while (rest[0] === "--no-replace-objects" || rest[0] === "--no-optional-locks" || rest[0] === "-c" ||
+        rest[0] === `--attr-source=${EPOCH_EMPTY_TREE_OID}`) {
       if (rest[0] === "-c") { if (!pins.has(rest[1]!)) return refuse(); rest = rest.slice(2); }
       else rest = rest.slice(1);
     }
@@ -3200,8 +3248,12 @@ export class GitCache {
       sub === "symbolic-ref" && exact(sub, "refs/remotes/origin/HEAD") ||
       sub === "check-ref-format" && tail.length === 1 && operand(tail[0]!) ||
       sub === "cat-file" && tail.length === 2 && tail[0] === "-t" && /^[0-9a-f]{40}$/.test(tail[1]!) ||
-      sub === "ls-files" && (exact(sub, "--stage", "-z") || exact(sub, "-v", "-z")) ||
-      sub === "status" && exact(sub, "--porcelain", "--ignore-submodules=none") ||
+      // The automatic worktree proof's three content reads. Untracked listing takes no exclude
+      // option (it must not read any ignore file); `status` never lists untracked files and never
+      // detects renames (rename detection reads blobs).
+      sub === "ls-files" && exact(sub, "--others", "--directory", "-z") ||
+      sub === "check-ignore" && exact(sub, "--no-index", "--stdin", "-z") ||
+      sub === "status" && exact(sub, "--porcelain", "-uno", "--no-renames", "--ignore-submodules=none") ||
       sub === "rev-list" && tail[0] === "--objects" && tail[1] === "-n" && tail[2] === "1" &&
         tail.slice(3).filter(v => v !== "--not").every(v => /^[0-9a-f]{40}$/.test(v)) && tail.includes("--not")
     );
@@ -3220,12 +3272,16 @@ export class GitCache {
     return { ...base, TMPDIR: identity === "command" ? runnerTmpdir() ?? base.TMPDIR : base.TMPDIR,
       PATH: "/usr/bin:/bin", HOME: "/", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
       GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL, GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1",
-      GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null" };
+      GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null",
+      // No system gitattributes; with --attr-source and core.attributesFile pinned, no attribute
+      // source remains that could name a clean filter.
+      GIT_ATTR_NOSYSTEM: "1" };
   }
 
   private async execEpochNative(
     command: string, args: string[],
-    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer; bytes?: true },
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer;
+      bytes?: true; encoding?: "latin1" },
     identity: BoundaryProcessRequest["identity"], signal?: AbortSignal,
   ): Promise<{ stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer }> {
     const state = this.epochNative.getStore()!;
@@ -3358,7 +3414,7 @@ export class GitCache {
       ticket.settle();
       const stdoutBytes = Buffer.concat(chunks.stdout);
       const stderrBytes = Buffer.concat(chunks.stderr);
-      const result = { stdout: stdoutBytes.toString(), stderr: stderrBytes.toString(),
+      const result = { stdout: stdoutBytes.toString(options.encoding), stderr: stderrBytes.toString(),
         ...(options.bytes ? { stdoutBytes, stderrBytes } : {}) };
       if (failure || code !== 0) throw Object.assign(
         failure instanceof Error ? failure : new Error(result.stderr || "git subprocess failed"),
@@ -11292,7 +11348,10 @@ export class GitCache {
         this.automaticCollection(config, "\0");
         for (const row of config.split("\0")) {
           const [key, value] = row.split("\n");
+          // refstorage (reftable) and partialclone (promisor objects fetched lazily) change where refs
+          // and objects live, which the physical-store observation below cannot account for.
           if (key === "extensions.compatobjectformat" || key === "extensions.objectformat" && value !== "sha1" ||
+              key === "extensions.refstorage" || key === "extensions.partialclone" ||
               key?.startsWith("include.") || key?.startsWith("includeif.")) unknown("object format or config indirection unsupported");
         }
       }
@@ -11438,12 +11497,16 @@ export class GitCache {
    * the ignore rules of the tree's `.gitignore` files and of `.git/info/exclude`, which define the
    * scope the WIP capture's `git add -A` honours too, so an ignored file is outside both. Any
    * such flag, any status entry, or any failed read is `false`. Submodules: `status` runs with
-   * `--ignore-submodules=none` in legacy mode; automatic mode suppresses helpers with `all`
-   * and explicitly refuses populated gitlinks. A `.git/modules` store or a populated (non-empty or non-directory)
+   * `--ignore-submodules=none`. A `.git/modules` store or a populated (non-empty or non-directory)
    * gitlink path is `false`, since the parent proof cannot cover a submodule's own files, commits and refs.
+   *
+   * This is the LEGACY proof. With `automatic` it delegates to {@link worktreeProvenCleanAutomatic},
+   * which does not run `status` over anything it has not first bounded and typed itself; the
+   * code below never sees `automatic`.
    */
   private async worktreeCleanHardened(cwd: string, automatic?: AutomaticPreservation): Promise<boolean> {
-    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    if (automatic) return this.worktreeProvenCleanAutomatic(cwd, automatic);
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(undefined, action);
     const hardened = [
       "-c", "core.excludesFile=/dev/null", "-c", `core.worktree=${cwd}`, "-c", "core.trustctime=true",
       "-c", "core.checkStat=default", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
@@ -11464,18 +11527,9 @@ export class GitCache {
       // `core.ignoreCase=false` override above makes status case-sensitive; this refusal is the
       // second, independent defense: a clone that claims case-folding in any form git reads as true
       // (true/yes/on, any non-zero integer with an optional k/m/g suffix, or a bare key) is not provable.
-      for (const e of entries) {
-        const nl = e.indexOf("\n");
-        const key = (nl === -1 ? e : e.slice(0, nl)).toLowerCase();
-        if (key !== "core.ignorecase") continue;
-        if (nl === -1) return false; // a bare key is boolean true
-        const v = e.slice(nl + 1).trim().toLowerCase();
-        if (v === "true" || v === "yes" || v === "on") return false;
-        if (/^[+-]?(0x[0-9a-f]+|[0-9]+)[kmg]?$/.test(v) && !/^[+-]?(0x)?0+[kmg]?$/.test(v)) return false;
-      }
+      if (entries.some(configClaimsCaseFolding)) return false;
       // Submodules: `.gitmodules` / config `ignore = all` would hide a dirty or newer submodule from
-      // `status`. Legacy uses `--ignore-submodules=none`; automatic native reads use `all`
-      // to suppress helpers, with the explicit gitlink refusals below. The parent proof says nothing about
+      // `status`. The parent proof says nothing about
       // a populated submodule's own files, commits or refs, so any trace of one is not provable: a
       // `.git/modules` store, or an index gitlink (mode 160000) whose worktree path holds anything but
       // nothing or an empty real directory (an uninitialized submodule).
@@ -11484,32 +11538,7 @@ export class GitCache {
         throw err;
       });
       if (modules) return false;
-      // Automatic mode: `status` hashes any tracked file whose stat differs from the index (git also
-      // compares a truncated 32-bit size), so no unbounded file or index may reach a Git read. Charge
-      // the index and then every tracked regular file's lstat size to one per-observation budget
-      // (the epoch metadata byte limit) before ls-files/status run; over budget is an unknown keep.
-      let budget = automatic ? this.epochRetained.getStore()!.maxMetadataBytes : Infinity;
-      const chargeBytes = (n: number) => {
-        if ((budget -= n) < 0) throw new AutomaticCompletenessUnknown("tracked content byte limit");
-      };
-      if (automatic) {
-        const index = await read(() => fs.lstat(path.join(cwd, ".git", "index")));
-        if (!index.isFile()) return false;
-        chargeBytes(index.size);
-      }
       const staged = await read(() => this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
-      if (automatic) {
-        this.automaticCollection(staged, "\0");
-        for (const entry of staged.split("\0")) {
-          const m = /^(\d{6}) [0-9a-f]+ [0-3]\t([\s\S]+)$/.exec(entry);
-          if (!m || m[1] === "160000") continue;
-          const st = await read(() => fs.lstat(path.join(cwd, m[2]!))).catch((err: NodeJS.ErrnoException) => {
-            if (err.code === "ENOENT") return undefined; // a missing tracked file is a status entry, never a hash
-            throw err;
-          });
-          if (st?.isFile()) chargeBytes(st.size);
-        }
-      }
       for (const entry of staged.split("\0")) {
         const m = /^160000 [0-9a-f]+ [0-3]\t([\s\S]+)$/.exec(entry);
         if (!m) continue;
@@ -11518,17 +11547,13 @@ export class GitCache {
           if (err.code === "ENOENT") return undefined;
           throw err;
         });
-        if (st === undefined) { if (automatic) return false; continue; }
+        if (st === undefined) continue;
         if (!st.isDirectory() || st.isSymbolicLink()) return false;
-        if (automatic) {
-          if (!(await this.automaticDirectoryEmpty(gitlink, automatic, false))) return false;
-        } else if ((await fs.readdir(gitlink)).length > 0) return false;
+        if ((await fs.readdir(gitlink)).length > 0) return false;
       }
       const status = await read(() => this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], { env: { ...READ_ONLY_STATUS.env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
-      if (automatic) this.automaticCollection(status, "\n");
       if (status.split("\n").some((l) => l.length > 0)) return false;
       const flags = await read(() => this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
-      if (automatic) this.automaticCollection(flags, "\0");
       for (const entry of flags.split("\0")) {
         if (entry.length === 0) continue;
         // `H` is a normal entry; a lowercase tag is assume-unchanged and `S`/`s` is skip-worktree.
@@ -11537,6 +11562,288 @@ export class GitCache {
       return true;
     } catch (err) {
       this.log.debug("stopped source status could not be proven clean", { cwd, error: gitErrorMessage(err) });
+      return false;
+    }
+  }
+
+  /**
+   * The automatic epoch worktree proof: is the clone's tracked and untracked non-ignored state
+   * provably empty, without letting Git be the first reader of anything unbounded or hostile?
+   *
+   * Git's own `status` hashes any stat-dirty or racily-clean tracked file, runs clean filters named
+   * by attributes, reads ignore files and `.gitattributes`, detects renames by reading blobs and
+   * follows a split index, `commondir` and the clone's config. So everything that can steer or
+   * enlarge that work is bounded and typed here in Node FIRST, on raw-byte paths, and a failure
+   * keeps the source before any Git command runs:
+   *  0. `.git` is a real directory with no `commondir`, `info/attributes`, `info/sparse-checkout`,
+   *     `modules`, `reftable` or `sharedindex.*`; `.git/config`, `info/exclude` and `packed-refs`
+   *     are regular files (charged);
+   *  1. `.git/index` is read once through a bounded descriptor and parsed ({@link readBoundedIndex}:
+   *     SHA-1, version 2/3, no link/sdir/UNTR/FSMN extension, no assume-valid, skip-worktree,
+   *     intent-to-add, staged or odd-mode entry);
+   *  2. every tracked path (and each of its directories) is lstat'd by raw bytes and must have
+   *     the type its mode names; regular sizes and link lengths are charged to the worktree-content
+   *     counter; a gitlink keeps the empty-directory rule; each tracked directory is listed under a
+   *     cumulative entry cap;
+   * and only then Git runs, every launch carrying the attribute/config pins and
+   * `GIT_ATTR_NOSYSTEM`: a version check, the clone's config (strict key allowlist), the untracked
+   * listing (no exclude option; an untracked `.gitignore`, `.gitattributes` or `.gitmodules` is a
+   * keep), `check-ignore` of that listing (the ignored set must equal it), and `status -uno
+   * --no-renames`. Finally the index and every recorded path are re-read: a change is a keep.
+   *
+   * Three counters stay distinct so their limits can be set independently later: `metadataBytes`
+   * (config, index, exclude, packed-refs and every Git output; limit `maxMetadataBytes`),
+   * `pathRecords` (index entries, directory entries, untracked records; each limited to
+   * `maxMetadataRecords`) and `worktreeContentBytes` (tracked regular sizes and link lengths;
+   * limit currently `maxMetadataBytes`).
+   *
+   * Outcome: every failure here, an exceeded bound included, returns `false`. An exceeded bound is
+   * thrown internally as {@link AutomaticCompletenessUnknown} and a hostile or unsupported source
+   * as {@link AutomaticContentRefusal}, but this method's catch converts both to `false`, so the
+   * discard core records `epoch_content_unproven` (a settled keep that does not stop the epoch
+   * scope). Only the object-store observation lets AutomaticCompletenessUnknown escape to the
+   * discard's `unknown` outcome.
+   */
+  private async worktreeProvenCleanAutomatic(cwd: string, automatic: AutomaticPreservation): Promise<boolean> {
+    const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
+    const limits = this.epochRetained.getStore();
+    if (!limits || !this.epochNative.getStore()) throw new Error("automatic worktree proof outside the epoch native scope");
+    const refusal = (why: string) => new AutomaticContentRefusal(why);
+    const unknown = (why: string) => new AutomaticCompletenessUnknown(why);
+    const counters = { metadataBytes: 0, worktreeContentBytes: 0,
+      pathRecords: { index: 0, directory: 0, untracked: 0 } };
+    const chargeMetadata = (n: number, what: string) => {
+      if ((counters.metadataBytes += n) > limits.maxMetadataBytes) throw unknown(`${what}: metadata byte limit`);
+    };
+    const chargeContent = (n: number, what: string) => {
+      if ((counters.worktreeContentBytes += n) > limits.maxMetadataBytes) throw unknown(`${what}: tracked content byte limit`);
+    };
+    const chargeRecords = (kind: keyof typeof counters.pathRecords, n: number, what: string) => {
+      if ((counters.pathRecords[kind] += n) > limits.maxMetadataRecords) throw unknown(`${what}: path record limit`);
+    };
+    // Every path whose lstat signature is re-checked at the end, keyed by a unique label.
+    const fixed = new Map<string, { target: string | Buffer; signature: string }>();
+    const remember = (key: string, target: string | Buffer, st: import("node:fs").BigIntStats) =>
+      fixed.set(key, { target, signature: statSignature(st) });
+    const lstatPath = (p: string | Buffer) => read(() => fs.lstat(p, { bigint: true }));
+    const absent = async (p: string): Promise<boolean> => {
+      try { await lstatPath(p); return false; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return true; throw error; }
+    };
+    // Entry names stay raw bytes (`encoding: "buffer"`); every entry is charged before it is visited.
+    const listDirectory = async (dir: string | Buffer, visit?: (name: Buffer) => void): Promise<void> => {
+      const handle = await read(() => fs.opendir(dir, { encoding: "buffer" as BufferEncoding }));
+      try {
+        for (;;) {
+          const entry = await read(() => handle.read());
+          if (entry === null) break;
+          chargeRecords("directory", 1, "directory entry");
+          visit?.(entry.name as unknown as Buffer);
+        }
+      } finally { await handle.close(); }
+    };
+    const steersGit = (name: string) => name === ".gitignore" || name === ".gitattributes" || name === ".gitmodules";
+    try {
+      // 0. Shape of `.git`.
+      const gitDir = path.join(cwd, ".git");
+      if (!(await lstatPath(gitDir)).isDirectory()) throw refusal(".git is not a real directory");
+      const infoDir = path.join(gitDir, "info");
+      let info: import("node:fs").BigIntStats | undefined;
+      try { info = await lstatPath(infoDir); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      if (info && !info.isDirectory()) throw refusal(".git/info is not a real directory");
+      for (const rel of ["commondir", "modules", "reftable", ...(info ? ["info/attributes", "info/sparse-checkout"] : [])]) {
+        if (!(await absent(path.join(gitDir, rel)))) throw refusal(`.git/${rel} is present`);
+      }
+      await listDirectory(gitDir, name => {
+        if (name.toString("latin1").startsWith("sharedindex.")) throw refusal("split index shared file is present");
+      });
+      const regular = async (file: string, required: boolean, what: string) => {
+        let st: import("node:fs").BigIntStats;
+        try { st = await lstatPath(file); }
+        catch (error) { if (!required && (error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+        if (!st.isFile()) throw refusal(`${what} is not a regular file`);
+        chargeMetadata(Number(st.size), what);
+        remember("f:" + file, file, st);
+      };
+      await regular(path.join(gitDir, "config"), true, ".git/config");
+      await regular(path.join(infoDir, "exclude"), false, ".git/info/exclude");
+      await regular(path.join(gitDir, "packed-refs"), false, ".git/packed-refs");
+
+      // 1. The index, parsed by us before Git reads it.
+      const indexPath = path.join(gitDir, "index");
+      let index: BoundedIndex;
+      try {
+        index = await readBoundedIndex(indexPath, { maxBytes: limits.maxMetadataBytes - counters.metadataBytes,
+          maxEntries: limits.maxMetadataRecords, step: read });
+      } catch (error) {
+        if (error instanceof GitIndexError) throw error.kind === "limit" ? unknown(`index: ${error.message}`) : refusal(`index: ${error.message}`);
+        throw error;
+      }
+      chargeMetadata(index.size, ".git/index");
+      chargeRecords("index", index.entries.length, "index entry");
+
+      // 2. Typed lstat of every tracked path by raw bytes, before any Git command.
+      const slash = Buffer.from("/");
+      const root = Buffer.from(cwd);
+      const absolute = (rel: Buffer) => rel.length ? Buffer.concat([root, slash, rel]) : root;
+      const directories = new Map<string, Buffer>([["", Buffer.alloc(0)]]);
+      for (const entry of index.entries) {
+        // A path longer than PATH_MAX cannot exist; refusing it first keeps prefix building bounded.
+        if (root.length + 1 + entry.path.length >= 4096) throw refusal("tracked path exceeds PATH_MAX");
+        for (let at = entry.path.indexOf(0x2f); at >= 0; at = entry.path.indexOf(0x2f, at + 1)) {
+          const key = entry.path.toString("latin1", 0, at);
+          if (directories.has(key)) continue;
+          chargeRecords("directory", 1, "tracked directory");
+          directories.set(key, Buffer.from(entry.path.subarray(0, at)));
+        }
+      }
+      // A parent is always shorter than its children, so this lstats every ancestor first and a
+      // symlinked ancestor is refused before any path beneath it is resolved.
+      const ordered = [...directories].sort(([a], [b]) => a.length - b.length);
+      for (const [key, rel] of ordered) {
+        const st = await lstatPath(absolute(rel));
+        if (!st.isDirectory()) throw refusal("tracked directory is not a real directory");
+        remember("d:" + key, absolute(rel), st);
+      }
+      const gitlinks: Buffer[] = [];
+      for (const entry of index.entries) {
+        const st = await lstatPath(absolute(entry.path));
+        const key = "p:" + entry.path.toString("latin1");
+        if (entry.mode === 0o160000) {
+          if (!st.isDirectory()) throw refusal("gitlink path is not a real directory");
+          gitlinks.push(entry.path);
+        } else if (entry.mode === 0o120000) {
+          if (!st.isSymbolicLink()) throw refusal("tracked symlink is not a symlink");
+          chargeContent(Number(st.size), "tracked symlink");
+        } else {
+          if (!st.isFile()) throw refusal("tracked file is not a regular file");
+          chargeContent(Number(st.size), "tracked file");
+        }
+        remember(key, absolute(entry.path), st);
+      }
+      // Every entry of every tracked directory is listed here, whatever its type, so a file Git
+      // would read as an ignore, attributes or submodules file is seen even when `ls-files` omits
+      // it (a FIFO, say). Only a tracked, already typed path may carry one of those names.
+      const tracked = new Set(index.entries.map(entry => entry.path.toString("latin1")));
+      for (const [key, rel] of ordered) {
+        await listDirectory(absolute(rel), name => {
+          const text = name.toString("latin1");
+          if (steersGit(text) && !tracked.has(key === "" ? text : `${key}/${text}`))
+            throw refusal("untracked entry steers Git");
+        });
+      }
+      for (const rel of gitlinks) {
+        // The Buffer to string round trip must be exact: a lossy name could name another directory.
+        const text = rel.toString("utf8");
+        if (!Buffer.from(text).equals(rel)) throw refusal("gitlink path is not UTF-8");
+        if (!(await this.automaticDirectoryEmpty(path.join(cwd, text), automatic, false))) throw refusal("populated gitlink");
+      }
+
+      // From here Git runs. Every launch carries the attribute source and config pins.
+      const version = await read(() => this.execScoped("git", ["version"], { env: gitEnv(), timeout: 10_000 }));
+      const parts = /^git version (\d+)\.(\d+)/.exec(version.stdout);
+      if (!parts || Number(parts[1]) < 2 || Number(parts[1]) === 2 && Number(parts[2]) < 40)
+        throw unknown("git lacks --attr-source");
+      const pins = [`--attr-source=${EPOCH_EMPTY_TREE_OID}`,
+        ...EPOCH_CLONE_READ_PINS.flatMap(pin => ["-c", pin]), "-c", `core.worktree=${cwd}`];
+      const git = (args: string[], env: NodeJS.ProcessEnv, extra: { input?: Buffer; encoding?: "latin1" } = {}) =>
+        read(() => this.runGitAsRunner(cwd, [...pins, ...args],
+          { env: { ...env, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL }, ...extra }));
+
+      // Strict allowlist of the keys uzi itself writes into `.git/config`; a value Git would parse
+      // some other way (an include, a filter, a hooks path, an extension) is a keep, never something
+      // to override. `--local` lists the file alone: the launch environment's own command-line pins
+      // (safe.directory, core.hooksPath, ...) are not the clone's content, and an include or
+      // `config.worktree` can only matter through keys that the allowlist already refuses.
+      const config = await git(["config", "--local", "--null", "--list"], NO_REPLACE_ENV);
+      chargeMetadata(Buffer.byteLength(config), "config output");
+      this.automaticCollection(config, "\0");
+      for (const row of config.split("\0")) {
+        if (row === "") continue;
+        if (configClaimsCaseFolding(row)) throw refusal("clone claims case-folding");
+        const nl = row.indexOf("\n");
+        const key = nl === -1 ? row : row.slice(0, nl);
+        const value = nl === -1 ? undefined : row.slice(nl + 1);
+        if (!EPOCH_CLONE_CONFIG_KEYS.has(key) && !EPOCH_CLONE_CONFIG_KEY_PATTERNS.some(re => re.test(key)))
+          throw refusal(`clone config key ${sanitizeForLog(key, 64)} is not admitted`);
+        const exact = EPOCH_CLONE_CONFIG_EXACT_VALUES.get(key);
+        if (exact !== undefined && value !== exact) throw refusal(`clone config ${key} has an unadmitted value`);
+      }
+
+      // Untracked entries: listed without any exclude option, so no ignore file is read here. A
+      // collapsed untracked directory is one record. A record that is not itself ignored (a clone
+      // always has `.uzi/`, whose only content is the ignored `scratch`) is expanded one level at a
+      // time by listing its entries in Node, so what `check-ignore` is asked about is exactly what
+      // is on disk and every entry name is known before Git may read an ignore file for it.
+      const listing = await git(["ls-files", "--others", "--directory", "-z"], NO_REPLACE_ENV, { encoding: "latin1" });
+      chargeMetadata(listing.length, "untracked listing");
+      if (listing !== "" && !listing.endsWith("\0")) throw refusal("unterminated untracked listing");
+      let frontier = (listing === "" ? [] : listing.slice(0, -1).split("\0"))
+        .map(record => ({ name: record.endsWith("/") ? record.slice(0, -1) : record, directory: record.endsWith("/") }));
+      for (let depth = 0; frontier.length; depth++) {
+        if (depth > EPOCH_UNTRACKED_EXPANSION_DEPTH) throw unknown("untracked expansion depth limit");
+        chargeRecords("untracked", frontier.length, "untracked record");
+        for (const { name } of frontier) {
+          // These files steer Git (ignore rules, attributes, submodules); they are never trusted
+          // untracked. A leading ':' would be parsed by check-ignore as pathspec magic.
+          if (name === "" || name.startsWith(":") || steersGit(name.slice(name.lastIndexOf("/") + 1)))
+            throw refusal("untracked entry steers Git or is not addressable");
+        }
+        // The bare name (not `name/`) matches directory-only patterns by lstat yet never reads an
+        // ignore file inside that directory itself.
+        const input = Buffer.from(frontier.map(f => f.name).join("\0") + "\0", "latin1");
+        chargeMetadata(input.length, "check-ignore input");
+        let ignored: string;
+        try {
+          ignored = await git(["check-ignore", "--no-index", "--stdin", "-z"], NO_REPLACE_ENV, { input, encoding: "latin1" });
+        } catch (error) {
+          // Exit status 1 is "nothing ignored": every record stays, which the code below decides.
+          if ((error as { code?: unknown }).code !== 1) throw error;
+          ignored = "";
+        }
+        chargeMetadata(ignored.length, "check-ignore output");
+        if (ignored !== "" && !ignored.endsWith("\0")) throw refusal("unterminated check-ignore output");
+        const matched = new Set(ignored === "" ? [] : ignored.slice(0, -1).split("\0"));
+        const next: typeof frontier = [];
+        for (const { name, directory } of frontier) {
+          if (matched.has(name)) continue;
+          // A file that is not ignored is untracked content. A directory that is not ignored is
+          // clean only if everything inside it is ignored (or it is empty, which Git never lists).
+          if (!directory) throw refusal("an untracked file is not ignored");
+          const dir = Buffer.from(name, "latin1");
+          const before = await lstatPath(absolute(dir));
+          if (!before.isDirectory()) throw refusal("untracked directory changed type");
+          remember("u:" + name, absolute(dir), before);
+          const handle = await read(() => fs.opendir(absolute(dir), { encoding: "buffer" as BufferEncoding }));
+          try {
+            for (;;) {
+              const entry = await read(() => handle.read());
+              if (entry === null) break;
+              chargeRecords("untracked", 1, "untracked directory entry");
+              const child = Buffer.concat([dir, slash, entry.name as unknown as Buffer]);
+              const st = await lstatPath(absolute(child));
+              next.push({ name: child.toString("latin1"), directory: st.isDirectory() });
+            }
+          } finally { await handle.close(); }
+        }
+        frontier = next;
+      }
+
+      const status = await git(["status", "--porcelain", "-uno", "--no-renames", "--ignore-submodules=none"],
+        READ_ONLY_STATUS.env);
+      chargeMetadata(Buffer.byteLength(status), "status output");
+      this.automaticCollection(status, "\n");
+      if (status.split("\n").some(line => line.length > 0)) throw refusal("worktree differs from the index");
+
+      // Nothing we proved may have moved while Git ran.
+      if (!(await indexUnchanged(indexPath, index, read))) throw unknown("index changed during the proof");
+      for (const { target, signature } of fixed.values()) {
+        if (statSignature(await lstatPath(target)) !== signature) throw unknown("worktree changed during the proof");
+      }
+      return true;
+    } catch (err) {
+      this.log.debug("stopped source worktree could not be proven clean", { cwd, error: gitErrorMessage(err) });
       return false;
     }
   }
@@ -20831,7 +21138,8 @@ try {
   private async execScoped(
     command: string,
     args: string[],
-    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer; bytes?: true },
+    options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number; cwd?: string; input?: string | Buffer;
+      bytes?: true; encoding?: "latin1" },
     identity: BoundaryProcessRequest["identity"] = "worker_pat",
   ): Promise<{ stdout: string; stderr: string; stdoutBytes?: Buffer; stderrBytes?: Buffer }> {
     const boundary = this.boundaryProcesses.getStore();
@@ -21037,7 +21345,7 @@ try {
     if (settled[1].status === "rejected") throw this.boundaryAbortError(settled[1].reason) ?? settled[1].reason;
     stdout = settled[0].value;
     stderr = settled[1].value;
-    const out = Buffer.concat(stdout.chunks).toString();
+    const out = Buffer.concat(stdout.chunks).toString(options.encoding);
     const err = Buffer.concat(stderr.chunks).toString();
     if (stdout.oversized || stderr.oversized || terminal.code !== 0) {
       const failure = new Error(
@@ -21585,7 +21893,7 @@ try {
    * benign keys (e.g. GIT_NO_REPLACE_OBJECTS) and never GIT_CONFIG_* or any other
    * security-relevant key.
    */
-  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv; input?: string } = {}): Promise<string> {
+  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv; input?: string | Buffer; encoding?: "latin1" } = {}): Promise<string> {
     const { env, wrapped } = this.runnerGitInvocation(cwd, args, opts.env);
     this.log.debug("git (runner uid)", { cwd, args });
     try {
@@ -21594,6 +21902,7 @@ try {
         timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
         ...(opts.input !== undefined ? { input: opts.input } : {}),
+        ...(opts.encoding !== undefined ? { encoding: opts.encoding } : {}),
       }, "command");
       return stdout;
     } catch (err) {

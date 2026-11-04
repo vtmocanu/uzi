@@ -1,0 +1,215 @@
+import { createHash } from "node:crypto";
+import { constants } from "node:fs";
+import fs from "node:fs/promises";
+
+/**
+ * Bounded, read-only parser for a Git index file (`.git/index`), used by the automatic epoch
+ * worktree proof so that nothing Git does is the first reader of a hostile index. It admits the
+ * plain SHA-1 formats the runner clones use and REFUSES everything else rather than interpreting
+ * it: version 4 (prefix-compressed names), split indexes (`link`), sparse directories (`sdir`),
+ * the untracked cache (`UNTR`), fsmonitor (`FSMN`) and every unknown extension. Per entry it also
+ * refuses the flags that hide a worktree difference from `git status` (assume-valid,
+ * skip-worktree, intent-to-add), any merge stage, and any mode other than a regular file,
+ * executable, symlink or gitlink. Paths stay raw bytes: Git paths need not be UTF-8.
+ */
+
+/** A refusal (`refused`: the index is not one we interpret) or an exceeded bound (`limit`). */
+export class GitIndexError extends Error {
+  constructor(readonly kind: "refused" | "limit", message: string) { super(message); }
+}
+
+export interface GitIndexEntry {
+  path: Buffer;
+  /** Full st_mode as stored (for example 0o100644). */
+  mode: number;
+  /** Lowercase hex object id. */
+  sha: string;
+  stage: number;
+  assumeValid: boolean;
+  skipWorktree: boolean;
+  intentToAdd: boolean;
+}
+
+export interface ParsedGitIndex {
+  version: 2 | 3;
+  entries: GitIndexEntry[];
+  /** The verified SHA-1 trailer. */
+  trailer: Buffer;
+  extensions: string[];
+}
+
+export interface GitIndexLimits {
+  /** Largest entry count the caller will walk. */
+  maxEntries: number;
+}
+
+const HEADER_BYTES = 12;
+const TRAILER_BYTES = 20;
+const FIXED_ENTRY_BYTES = 62;
+const NAME_SATURATED = 0xfff;
+const FLAG_ASSUME_VALID = 0x8000;
+const FLAG_EXTENDED = 0x4000;
+const EXT_SKIP_WORKTREE = 0x4000;
+const EXT_INTENT_TO_ADD = 0x2000;
+/** Extensions that carry only derived caches; any other signature changes what Git would read. */
+const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set(["TREE", "REUC", "EOIE", "IEOT"]);
+const ALLOWED_MODES: ReadonlySet<number> = new Set([0o100644, 0o100755, 0o120000, 0o160000]);
+
+const refused = (message: string): never => { throw new GitIndexError("refused", message); };
+const limit = (message: string): never => { throw new GitIndexError("limit", message); };
+
+/** A tracked path Git could resolve outside the worktree or into its own metadata is refused. */
+function checkTrackedPath(name: Buffer): void {
+  if (name.length === 0 || name[0] === 0x2f || name[name.length - 1] === 0x2f) refused("unsafe tracked path");
+  let start = 0;
+  for (let i = 0; i <= name.length; i++) {
+    if (i !== name.length && name[i] !== 0x2f) continue;
+    const part = name.subarray(start, i);
+    start = i + 1;
+    if (part.length === 0 || part.equals(Buffer.from(".")) || part.equals(Buffer.from("..")) ||
+        part.toString("latin1").toLowerCase() === ".git") refused("unsafe tracked path component");
+  }
+}
+
+/**
+ * Parse and verify one index image. `strict` (the default) applies the full refusal policy.
+ * `inspect` keeps the structural checks but reports per-entry flags, stages and modes instead of
+ * refusing them; it exists so a differential test can compare the parser with `git ls-files`.
+ */
+export function parseGitIndex(buf: Buffer, limits: GitIndexLimits, policy: "strict" | "inspect" = "strict"): ParsedGitIndex {
+  const strict = policy === "strict";
+  if (buf.length < HEADER_BYTES + TRAILER_BYTES) refused("index is too short");
+  if (buf.toString("latin1", 0, 4) !== "DIRC") refused("index signature");
+  const version = buf.readUInt32BE(4);
+  if (version !== 2 && version !== 3) refused("unsupported index version");
+  const count = buf.readUInt32BE(8);
+  if (count > limits.maxEntries) limit("index entry limit");
+  const end = buf.length - TRAILER_BYTES;
+  const trailer = Buffer.from(buf.subarray(end));
+  // An all-zero trailer means "unchecked" to Git; it proves nothing about the content.
+  if (trailer.every(b => b === 0)) refused("index checksum absent");
+  if (!createHash("sha1").update(buf.subarray(0, end)).digest().equals(trailer)) refused("index checksum mismatch");
+
+  const entries: GitIndexEntry[] = [];
+  let p = HEADER_BYTES;
+  let previous: Buffer | undefined;
+  for (let i = 0; i < count; i++) {
+    if (p + FIXED_ENTRY_BYTES > end) refused("truncated index entry");
+    const mode = buf.readUInt32BE(p + 24);
+    const flags = buf.readUInt16BE(p + 60);
+    let nameOffset = p + FIXED_ENTRY_BYTES;
+    let extended = 0;
+    if (flags & FLAG_EXTENDED) {
+      if (version < 3 || nameOffset + 2 > end) refused("extended index entry");
+      extended = buf.readUInt16BE(nameOffset);
+      nameOffset += 2;
+    }
+    let nameLength = flags & NAME_SATURATED;
+    if (nameLength === NAME_SATURATED) {
+      const nul = buf.indexOf(0, nameOffset);
+      if (nul < 0 || nul >= end) refused("unterminated index path");
+      nameLength = nul - nameOffset;
+    } else if (nameOffset + nameLength >= end || buf[nameOffset + nameLength] !== 0) {
+      refused("index path length");
+    }
+    const name = Buffer.from(buf.subarray(nameOffset, nameOffset + nameLength));
+    if (name.includes(0)) refused("index path contains NUL");
+    const size = (nameOffset + nameLength + 8 - p) & ~7;
+    if (p + size > end) refused("index entry padding");
+    const entry: GitIndexEntry = {
+      path: name, mode, sha: buf.toString("hex", p + 40, p + 60), stage: (flags >> 12) & 3,
+      assumeValid: (flags & FLAG_ASSUME_VALID) !== 0,
+      skipWorktree: (extended & EXT_SKIP_WORKTREE) !== 0, intentToAdd: (extended & EXT_INTENT_TO_ADD) !== 0,
+    };
+    if (strict) {
+      if (entry.assumeValid) refused("assume-valid entry");
+      if (extended !== 0) refused("extended entry flags");
+      if (entry.stage !== 0) refused("unmerged entry");
+      if (!ALLOWED_MODES.has(mode)) refused("unsupported entry mode");
+      checkTrackedPath(name);
+      if (previous && Buffer.compare(previous, name) >= 0) refused("index entries are not strictly sorted");
+    }
+    previous = name;
+    entries.push(entry);
+    p += size;
+  }
+
+  const extensions: string[] = [];
+  while (p < end) {
+    if (p + 8 > end) refused("truncated index extension");
+    const signature = buf.toString("latin1", p, p + 4);
+    const length = buf.readUInt32BE(p + 4);
+    if (length > end - p - 8) refused("index extension length");
+    if (!ALLOWED_EXTENSIONS.has(signature)) {
+      refused(`unsupported index extension ${/^[A-Za-z]{4}$/.test(signature) ? signature : "(non-alphabetic)"}`);
+    }
+    extensions.push(signature);
+    p += 8 + length;
+  }
+  return { version: version as 2 | 3, entries, trailer, extensions };
+}
+
+/** Identity and size of a file as lstat saw it; any difference later means the file changed. */
+export function statSignature(st: import("node:fs").BigIntStats): string {
+  return [st.dev, st.ino, st.mode, st.size, st.mtimeNs, st.ctimeNs].join(":");
+}
+
+export interface BoundedIndex extends ParsedGitIndex {
+  /** {@link statSignature} of the file that was read. */
+  signature: string;
+  /** Bytes read; the caller charges them to its metadata budget. */
+  size: number;
+}
+
+type Step = <T>(action: () => Promise<T>) => Promise<T>;
+const direct: Step = action => action();
+
+/**
+ * lstat a regular file, refuse it above `maxBytes`, read exactly its size through one descriptor
+ * (opened non-blocking and without following links, so a swapped-in FIFO or link cannot hang or
+ * redirect the read), verify the descriptor still names the lstat'd file and that nothing was
+ * appended, then parse it. `step` wraps every awaited filesystem call (liveness checks).
+ */
+export async function readBoundedIndex(file: string,
+  options: GitIndexLimits & { maxBytes: number; step?: Step }): Promise<BoundedIndex> {
+  const step = options.step ?? direct;
+  const before = await step(() => fs.lstat(file, { bigint: true }));
+  if (!before.isFile()) refused("index is not a regular file");
+  if (before.size > BigInt(Math.max(0, options.maxBytes))) limit("index byte limit");
+  const size = Number(before.size);
+  const handle = await step(() => fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK));
+  try {
+    const opened = await step(() => handle.stat({ bigint: true }));
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size)
+      refused("index changed while opening");
+    const buf = Buffer.allocUnsafe(size);
+    let read = 0;
+    while (read < size) {
+      const { bytesRead } = await step(() => handle.read(buf, read, size - read, read));
+      if (bytesRead === 0) refused("index truncated while reading");
+      read += bytesRead;
+    }
+    if ((await step(() => handle.read(Buffer.alloc(1), 0, 1, size))).bytesRead !== 0) refused("index grew while reading");
+    const after = await step(() => handle.stat({ bigint: true }));
+    if (statSignature(after) !== statSignature(opened)) refused("index changed while reading");
+    return { ...parseGitIndex(buf, options), signature: statSignature(before), size };
+  } finally {
+    await handle.close();
+  }
+}
+
+/** True only when the file still has the read signature and the same verified trailer. */
+export async function indexUnchanged(file: string, original: BoundedIndex, step: Step = direct): Promise<boolean> {
+  const st = await step(() => fs.lstat(file, { bigint: true }));
+  if (!st.isFile() || statSignature(st) !== original.signature) return false;
+  const handle = await step(() => fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK));
+  try {
+    const opened = await step(() => handle.stat({ bigint: true }));
+    if (!opened.isFile() || statSignature(opened) !== original.signature) return false;
+    const tail = Buffer.alloc(TRAILER_BYTES);
+    const { bytesRead } = await step(() => handle.read(tail, 0, TRAILER_BYTES, original.size - TRAILER_BYTES));
+    return bytesRead === TRAILER_BYTES && tail.equals(original.trailer);
+  } finally {
+    await handle.close();
+  }
+}
