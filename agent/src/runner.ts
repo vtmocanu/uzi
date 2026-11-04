@@ -127,7 +127,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
+import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type RecoveryCoordinatorOptions, type OperatorRequestSignals, type DescribeLocalRecordsResult, type ResolveLocalRecordResult } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
@@ -16632,6 +16632,19 @@ export class RunRunner {
     return result;
   }
 
+
+  /** issue #3885 — the retained-source channel's local-records port: read-only classification of a
+   *  run's guarded local recovery records (cases A1 and A2). Delegates to the recovery coordinator, which owns all of it. */
+  describeLocalRecords(runId: string, opts: OperatorRequestSignals): Promise<DescribeLocalRecordsResult> {
+    return this.recovery.describeLocalRecords(runId, opts);
+  }
+
+  /** issue #3885 — the retained-source channel's resolve-local-record port: operator resolution of one guarded
+   *  local record generation (case A1 cleanup, or case A2 replay of the saved FINAL then cleanup). */
+  resolveLocalRecord(input: OperatorRequestSignals & { runId: string; generation: number; confirm: string }):
+    Promise<ResolveLocalRecordResult> {
+    return this.recovery.resolveLocalRecord(input);
+  }
 
   /**
    * PRD #218 M1 — trigger the graceful worker shutdown. SYNCHRONOUS and does NO git:

@@ -21096,7 +21096,8 @@ try {
     roots: Array<{ sha: string; contexts: OwedCandidate["contexts"] }>,
     coveragePins: Array<{ fingerprint: string; sha: string; coveredHeads?: string[] }>, recoverySources: string[],
     coveringSha: string, canDelete: () => boolean = () => true,
-    authority: "archive" | "completion" | "completion-check" = "archive"): Promise<"removed" | "retained" | "verified"> {
+    authority: "archive" | "completion" | "completion-check" = "archive",
+    beforeFirstMutation?: () => void): Promise<"removed" | "retained" | "verified"> {
     await this.validateOwedContext(barePath, context.branch, context);
     if (!Number.isSafeInteger(context.generation) || context.generation <= 0) return "retained";
     await this.assertOwedBare(barePath);
@@ -21163,8 +21164,17 @@ try {
         assertResidueQuarantineOpen("git");
         if (!canDelete()) throw new Error("recovery cleanup source protection changed");
       };
+      // The operator's boundary callback: once, immediately before the first mutation of any kind
+      // (the first ref deletion's beginBare, or the first metadata file removal when no ref is deleted).
+      let boundaryCrossed = false;
+      const boundary = (): void => {
+        if (boundaryCrossed) return;
+        boundaryCrossed = true;
+        beforeFirstMutation?.();
+      };
       const deleteRef = async (ref: string, sha: string): Promise<void> => {
         open();
+        boundary();
         const settlement = await this.beginBare(barePath, "recovery-cleanup-delete-ref", [ref]);
         // A known exit or a proven spawn failure settles; a timeout, kill or ambiguous rejection stays unsettled.
         await this.deleteRefSettled(barePath, ref, sha, settlement, "recovery cleanup ref deletion mismatch");
@@ -21178,6 +21188,7 @@ try {
       }
       for (const record of exact) {
         open();
+        boundary();
         const name = `candidate-${record.runId}-${record.sha}-${record.contextName.slice(8, -5)}.json`;
         await this.removeOwedFile(barePath, name, true);
       }
@@ -21194,10 +21205,33 @@ try {
             item.startsWith(legacyFlatTrackingOwnerKey(c.branch) + "\n"));
         if (consumed) continue;
         open();
+        boundary();
         await this.removeOwedFile(barePath, name, true);
       }
       return "removed";
     });
+  }
+
+  /** Read-only source identity of one recovery generation for the operator's local-record binding: the
+   *  bare directory's dev:ino plus the sorted "refname sha" lines of the run's owed pins, the generation's
+   *  coverage pins and recovery pin, and the run's recovery-episode pins, read under the bare lock. */
+  async recoveryRefSnapshot(barePath: string, runId: string, generation: number): Promise<{ devIno: string; refs: string[] }> {
+    if (typeof runId !== "string" || !OWED_RUN_ID.test(runId) || !Number.isSafeInteger(generation) || generation <= 0) {
+      throw new Error("invalid recovery ref snapshot identity");
+    }
+    await this.assertOwedBare(barePath);
+    return this.withLock(barePath, async () => {
+      const st = await fs.lstat(barePath);
+      const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
+        `refs/uzi-owed/${runId}/`, `refs/uzi-coverage/${runId}/${generation}/`, recoveryPinRef(runId, generation),
+        `refs/uzi-recovery-episode/${runId}/`]);
+      return { devIno: `${st.dev}:${st.ino}`, refs: out.split("\n").filter(Boolean).sort() };
+    });
+  }
+
+  /** The operator's pre-mutation proof that no shared-bare deletion is pending (see assertBareClear). */
+  async assertRecoveryBareClear(barePath: string): Promise<void> {
+    await this.assertBareClear(barePath, "operator-local-record-resolve");
   }
 
   /** Only a server-confirmed full commit and positive ancestry proof release an owed pin. */
@@ -21311,6 +21345,54 @@ try {
       await this.runGit(barePath, ["update-ref", coverageRef, sha]);
       if (await this.checkedRefSha(barePath, coverageRef) !== sha) throw new Error("recovery coverage pin mismatch");
       return { sha, coverageRef, fingerprint, originalShas: roots, currentSha };
+    });
+  }
+
+  /**
+   * Read-only counterpart of {@link buildRecoveryCoverage} for the operator replay, which writes nothing
+   * before its POST. It performs every check the build performs (context validation, root and tree
+   * availability, fingerprint, reuse eligibility, ancestry of every root and the current source, tree
+   * equality, the pending-deletion proof, the coverage pin) but never creates an object, ref or owed
+   * context. The build's deterministic aggregate-sha equality is replaced by structural equality on the
+   * recorded `expected.sha`: the recomputed fingerprint, root and current-source ancestry, the tree and
+   * the pin `refs/uzi-coverage/<run>/<generation>/<fingerprint>` resolving to that sha. Returns false on
+   * any mismatch; throws only where the build throws for unavailability.
+   */
+  async verifyRecoveryCoverage(barePath: string, context: PositiveOwedCandidateContext, originalShas: string[],
+    currentSha: string, expected: { sha: string; fingerprint: string },
+    opts: { reuseCoveredCurrent?: "if-covered" | "required" } = {}): Promise<boolean> {
+    context = this.snapshotOwedOptions({ context }).context as PositiveOwedCandidateContext;
+    if (!Number.isSafeInteger(context.generation) || context.generation <= 0 ||
+        "legacy" in context || "origin" in context) throw new Error("recovery coverage requires positive claim context");
+    await this.validateOwedContext(barePath, context.branch, context);
+    return this.withLock(barePath, async () => {
+      const roots = [...new Set(originalShas)].sort();
+      if (!roots.length) throw new Error("recovery coverage needs original roots");
+      await this.requireOwedCommit(barePath, currentSha);
+      for (const root of roots) await this.requireOwedCommit(barePath, root);
+      await this.requireOwedCommit(barePath, expected.sha);
+      const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${currentSha}^{tree}`])).trim();
+      if (!OWED_OID.test(tree) || (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", tree])).trim() !== "tree") {
+        throw new Error("recovery current tree unavailable");
+      }
+      const fingerprint = createHash("sha256").update(JSON.stringify({ roots, currentSha, tree })).digest("hex");
+      if (fingerprint !== expected.fingerprint) return false;
+      let reuseCurrent = (opts.reuseCoveredCurrent === "if-covered" || opts.reuseCoveredCurrent === "required") &&
+        await this.reusableRecoveryCoverage(barePath, currentSha, tree);
+      if (reuseCurrent) for (const root of roots) {
+        const relation = await this.ancestry(barePath, root, currentSha);
+        if (relation === "unknown") throw new Error("recovery coverage ancestry proof unavailable");
+        if (relation !== "ancestor") { reuseCurrent = false; break; }
+      }
+      if (opts.reuseCoveredCurrent === "required" && !reuseCurrent) return false;
+      if (reuseCurrent && expected.sha !== currentSha) return false;
+      for (const root of [...roots, currentSha]) {
+        if (await this.ancestry(barePath, root, expected.sha) !== "ancestor") return false;
+      }
+      if ((await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${expected.sha}^{tree}`])).trim() !== tree) return false;
+      await this.assertBareClear(barePath, "recovery-coverage-ref");
+      const coverageRef = `refs/uzi-coverage/${context.runId}/${context.generation}/${fingerprint}`;
+      return await this.checkedRefSha(barePath, coverageRef) === expected.sha;
     });
   }
 
