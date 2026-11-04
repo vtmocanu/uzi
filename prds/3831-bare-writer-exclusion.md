@@ -413,7 +413,8 @@ Per claim of a run whose source slot is foreign-active and carries a saved pin (
 - **Older writers** write no record. As P they refuse (Q10): the first restart after rollout is not restorable, a cost disclosed in the recovery docs and release notes (8.1).
 - **Older readers** ignore `boundaries/` and `pods/` (5.2).
 - **Mixed versions.** W excludes a concurrent compatible worker on one data directory; overlapping pods run one image (`prds/3430-pod-epoch-lock-shadow.md:187`, "Pods that overlap on one volume come from the same ReplicaSet, so they run the same image.") [I]; an out-of-band build is Q8.
-- **Rollback to a pre-gate build** is safe: no restore, records ignored and left in place. After a roll-forward, rollback-era incarnations have no record and refuse as P.
+- **Record-only rollback** (no restore has run on the data volume) to a pre-gate build is safe: no restore, records ignored and left in place. After a roll-forward, rollback-era incarnations have no record and refuse as P.
+- **Rollback after a restore** is not established by the records alone: ignoring `boundaries/` and `pods/` says nothing about how an older build attaches to, recovers or discards S's successor slot and bare attribution, whose representation is #3644's and off-tree. #3644 obligation, verified by Gate B (8.1): restored attribution carries a fence that every pre-gate reader refuses, as for the completion fence (`specs/human.md:1421`, "Older workers refuse to attach, recover or discard a journal carrying the fence (accepted rollback fence)."). An older reader that cannot decode the successor slot or attribution refuses; nothing is silently downgraded or force-cleared, and P's retained state stays untouched. Until that fence exists and is tested, rollback below the restore-enabling release after any restore is unsupported and documented as such.
 - **Undecodable, new-version or bad-MAC records** (for example after a worker-token change) are preserved, never rewritten or deleted, and refuse. No silent downgrade: a missing or failed record never widens eligibility.
 - **Growth (Q9).** No pruning in this contract; Gate B measures record growth per process start.
 
@@ -454,6 +455,8 @@ Every item is **pending, not delivered by Gate A**.
 - **S's own record stale** (identity re-read differs) refuses at R1. Unsafe: trusts the stored record without re-reading.
 - **Undeclared, mismatched or sandboxed runtime** refuses at R6. Unsafe: runtime check removed.
 - **Unrelated unknown bare** never refuses an ordinary pin or capture (R9, the tripwire). Unsafe: predicate scans every bare.
+
+- **Rollback after restore.** After a restore, a pre-gate build refuses to attach, recover or discard S's successor slot and attribution (the 6(f) rollback fence). Unsafe: attribution without the fence, which the older build then acts on.
 
 **Controls.** A normally joined writer; an enrolled unresolved footprint (refuses); a legacy writer as P (no record, refuses); restart and replay (records never rewritten); failed evidence (bad MAC, unknown version, hidden procfs, non-zero time offset); the rollback boundary (6(f)); cancellation; positive ordinary recovery (capture and pin unaffected); every 6(e) crash point, including the root-entry window, through the new link, unlink and read-back seams; preservation of P's bytes, source epoch, fence, pins, journals and custody across every refusal. Every owned process is joined; no proof is sleep-only.
 
