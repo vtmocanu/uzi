@@ -691,7 +691,19 @@ controller protection, and unverified on a live cluster. Replace `<ns>`, `<claim
    condition shows, or the controller logs `pvc-resize-failed`, stop: a restart will not
    fix it. Record the claim UID(s) (the `/data` claim and, for Docker workers, the DinD
    claim).
-2. **Stop new intake.** The worker's owner cordons it
+2. **Check for an existing fence, then stop new intake.** Do this check first: once you
+   cordon, your own hold masks any roll or maintenance fence in the worker's status.
+   Read the worker before cordoning:
+
+   ```sh
+   uzi worker get <worker-id> --json
+   ```
+
+   Proceed only if `effective_cordoned` is `false` and `draining_since` is `null`.
+   `effective_cordoned: true` with both `manual_cordoned_at` and `draining_since` null
+   is an intake fence (the table shows `· intake fenced`); a set `draining_since` with
+   no cordon of yours is an automatic drain or roll. Wait for either to clear and
+   re-read; do not delete into them. Then the worker's owner cordons it
    ([manual cordon](../docs/hosted-workers.md#pause-new-work-with-a-manual-cordon)),
    from the Workers page or `uzi worker cordon <worker-id> -m 'pvc remount'`. Cordon
    needs a persistent worker and an owner; an admin cannot cordon another owner's worker.
@@ -701,12 +713,16 @@ controller protection, and unverified on a live cluster. Replace `<ns>`, `<claim
      pending outcomes in `RUNS`; the worker detail lists any assigned blockers
      ([which runs block an upgrade](../docs/hosted-workers.md#see-which-assigned-runs-block-an-upgrade)).
      Queued, paused and every wait or gate count as assigned.
-   - Not custody-held: `uzi run recovery` lists no open hold whose `WORKER` is this
-     worker. If one is open, **do not proceed**: deleting the pod puts the unpublished
-     committed work it protects at risk. Resolve it first ([Run recovery](../docs/run-recovery.md)).
-   - No DinD or pressure maintenance in flight: a worker showing `(draining)` that
-     you did not cordon is under a roll or maintenance fence. Wait for it to clear; do
-     not delete into it.
+   - Not custody-held: `uzi worker get <worker-id> --json` shows
+     `retaining_unpublished_work: false`. It is `true` for any open custody hold, not
+     only your own. If it is `true`, **do not proceed**: deleting the pod puts the
+     unpublished committed work it protects at risk. Resolve it first
+     ([Run recovery](../docs/run-recovery.md)); `uzi run recovery` lists your own holds
+     for detail but is not the authority.
+   - No roll or maintenance fence appeared since step 2: re-read the same JSON. Your
+     cordon is expected to show `manual_cordoned_at` set; a fence that began after it
+     cannot be told apart in the status cell, so the step-2 check is the gate. If
+     `uzi worker list` shows `(draining)` the worker still has active runs; wait.
 4. **Restart only the pod.** Manual pod deletion is outside the controller's busy-run
    protection, which is why steps 2 and 3 are mandatory.
 
@@ -722,8 +738,10 @@ controller protection, and unverified on a live cluster. Replace `<ns>`, `<claim
    `status.capacity` equals the request, `FileSystemResizePending` is gone. Check the
    pod is `Ready` (`kubectl get pod -n <ns> -l uzi.dev/hosted-worker-id=<worker-id>`)
    and the controller no longer logs `pvc-resize-pending` for the claim. Where exec is
-   permitted, `df -h /data` in the `worker` container (and the DinD data root in the
-   `dind` container, via `kubectl exec -c`) should show the new size.
+   permitted, `df -h /data` in the `worker` container (and, in the `dind` container via
+   `kubectl exec -c dind`, `df -h /var/lib/docker` for a non-rootless daemon or
+   `df -h /home/rootless/.local/share/docker` for the rootless default) should show
+   the new size.
 6. **Uncordon:** `uzi worker uncordon <worker-id>` (or the Workers page). This removes
    only your manual hold; any automatic drain, maintenance or custody fence still applies.
 

@@ -984,11 +984,14 @@ var pvcGVR = schema.GroupVersionResource{Version: "v1", Resource: "persistentvol
 //
 // The fake tracker applies a merge patch without checking metadata.uid or
 // metadata.resourceVersion, so this reactor mimics the apiserver's precondition
-// handling itself: a non-empty uid that differs from the stored one is refused 422
-// (Invalid), a non-empty resourceVersion that differs is refused 409 (Conflict), and an
-// empty value is no precondition. On success it falls through to the default reactor,
-// which applies the merge patch to the stored object. This is simulated evidence, not
-// a real-apiserver verification.
+// ordering itself: resourceVersion is checked first (a non-empty mismatch is refused
+// 409 Conflict, as registry Store.Update does before validation), then uid (a non-empty
+// mismatch is refused 422 Invalid); an empty value is no precondition. When both
+// match it does NOT handle the patch: it falls through to the next reactor in the
+// chain, the strict uid/resourceVersion patch reactor installed by enforcingClient in
+// roll_fake_test.go, which refuses any mismatch (including an empty value) with 409 and
+// otherwise applies the merge patch and bumps the stored resourceVersion. This is
+// simulated evidence, not a real-apiserver verification.
 func raceDataPatch(f *expandFx, name string, concurrent func(t *testing.T, tr k8stesting.ObjectTracker, cur *corev1.PersistentVolumeClaim)) {
 	raced := false
 	f.client.PrependReactor("patch", "persistentvolumeclaims", func(a k8stesting.Action) (bool, runtime.Object, error) {
@@ -1016,11 +1019,11 @@ func raceDataPatch(f *expandFx, name string, concurrent func(t *testing.T, tr k8
 		if err := json.Unmarshal(pa.GetPatch(), &body); err != nil {
 			return true, nil, err
 		}
-		if body.Metadata.UID != "" && body.Metadata.UID != stored.UID {
-			return true, nil, apierrors.NewInvalid(schema.GroupKind{Kind: "PersistentVolumeClaim"}, pa.GetName(), nil)
-		}
 		if body.Metadata.ResourceVersion != "" && body.Metadata.ResourceVersion != stored.ResourceVersion {
 			return true, nil, apierrors.NewConflict(pvcGVR.GroupResource(), pa.GetName(), fmt.Errorf("resourceVersion precondition"))
+		}
+		if body.Metadata.UID != "" && body.Metadata.UID != stored.UID {
+			return true, nil, apierrors.NewInvalid(schema.GroupKind{Kind: "PersistentVolumeClaim"}, pa.GetName(), nil)
 		}
 		return false, nil, nil
 	})
@@ -1088,9 +1091,11 @@ func TestExpandRacesManualGrowthLeavesNewerAllocation(t *testing.T) {
 }
 
 // Concurrent replacement: the claim is deleted and recreated (new UID) after the
-// snapshot. The fenced patch is refused 422 and the replacement is untouched; the next
-// tick fences on the replacement's own identity when it is Bound, and does nothing while
-// it is still Pending.
+// snapshot. A recreated claim always has a new resourceVersion, and the apiserver checks
+// resourceVersion before the immutable-uid validation, so the fenced patch is refused
+// 409 (logged reason=conflict) and the replacement is untouched; the next tick fences on
+// the replacement's own identity when it is Bound, and does nothing while it is still
+// Pending.
 func TestExpandRacesClaimReplacementNeverTouchesReplacement(t *testing.T) {
 	for _, bound := range []bool{true, false} {
 		t.Run(fmt.Sprintf("bound=%v", bound), func(t *testing.T) {
@@ -1111,8 +1116,8 @@ func TestExpandRacesClaimReplacementNeverTouchesReplacement(t *testing.T) {
 			})
 			f.client.ClearActions()
 			f.mustTick()
-			if !strings.Contains(f.logs.String(), "pvc-expand-failed worker=w1 pvc="+data+" reason=invalid") {
-				t.Fatalf("no invalid logged:\n%s", f.logs)
+			if !strings.Contains(f.logs.String(), "pvc-expand-failed worker=w1 pvc="+data+" reason=conflict") {
+				t.Fatalf("no conflict logged:\n%s", f.logs)
 			}
 			if got := f.claim(data); got.UID != "uid-replaced" || f.request(data) != "25Gi" || got.ResourceVersion != "9" {
 				t.Fatalf("replacement disturbed: uid=%s request=%s rv=%s", got.UID, f.request(data), got.ResourceVersion)
@@ -1176,8 +1181,10 @@ func TestExpandManualGrowthWithPendingCapacityIsNeverPatched(t *testing.T) {
 }
 
 // Busy and custody-held workers are never rolled or cordoned for a resize: a claim
-// at target with FileSystemResizePending is only reported, once across ticks.
-func TestExpandPendingResizeOnBusyAndCustodyHeldWorkersOnlyReports(t *testing.T) {
+// at target with FileSystemResizePending is only reported, once across ticks. The gate
+// here is the dedup count: claims are already at target, so no expansion or roll path
+// is exercised.
+func TestExpandPendingResizeOnBusyAndCustodyHeldWorkersReportsOnce(t *testing.T) {
 	for name, fn := range map[string]func(*protocol.DesiredWorker){
 		"busy":    func(w *protocol.DesiredWorker) { w.Busy = true },
 		"custody": func(w *protocol.DesiredWorker) { w.CustodyHeld = true },
