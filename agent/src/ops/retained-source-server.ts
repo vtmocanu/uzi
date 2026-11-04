@@ -33,6 +33,7 @@ import type {
   GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedInspectResult, RetainedLifecycleSnapshot, RetainedSourceSelector,
 } from "../git.js";
 import type { Logger } from "../log.js";
+import type { DescribeLocalRecordsResult, OperatorRequestSignals, ResolveLocalRecordResult } from "../recovery.js";
 import type { RecoveryHoldsResponse, RunOwnershipResponse } from "../protocol.js";
 import { RUN_TERMINAL_STATUSES } from "../recovery-settlement.js";
 import { errMessage, sleep as realSleep } from "../util.js";
@@ -47,6 +48,9 @@ export const RETAINED_SOURCE_SOCKET_RELATIVE = "ops/retained-source.sock";
 const SOCKET_PATH_MAX_BYTES = 107;
 const RUN_ID_RE = /^[A-Za-z0-9_-]{1,160}$/;
 const CONFIRM_RE = /^[0-9a-f]{64}$/;
+/** The coordinator's OPERATOR_RUN_ID shape (recovery.ts). */
+const OPERATOR_RUN_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+const RESOLVE_DEADLINE_MS = 60_000;
 const DRAIN_BUDGET_MS = 5_000;
 /** The discard waits at most this long for the authority transaction: the claim gate is closed meanwhile. */
 const DISCARD_AUTHORITY_WAIT_MS = 30_000;
@@ -71,6 +75,13 @@ export interface RetainedSourceRunnerPort {
       isLivePath: (clonePath: string) => boolean;
     }) => Promise<T>,
   ): Promise<{ entered: false } | { entered: true; value: T }>;
+  /** issue #3885: the read-only local-record view of a run (the coordinator takes its own locks). */
+  describeLocalRecords(runId: string, opts: OperatorRequestSignals): Promise<DescribeLocalRecordsResult>;
+  /** issue #3885: operator resolution of one guarded local record generation. The coordinator takes
+   *  authority A itself, so the channel must call it outside any authority transaction. */
+  resolveLocalRecord(
+    input: OperatorRequestSignals & { runId: string; generation: number; confirm: string },
+  ): Promise<ResolveLocalRecordResult>;
 }
 
 export interface RetainedSourceServerDeps {
@@ -104,10 +115,16 @@ export interface RetainedSourceServerDeps {
   requestDeadlineMs?: number;
   /** GitCache's destructive deadline override (default: GitCache's 30 s). */
   deadlineMs?: number;
+  /** issue #3885: the cooperative deadline handed to resolve-local-record (default 60 s). Test seam. */
+  resolveDeadlineMs?: number;
+  /** How long close() waits for an in-flight operation (default 5 s). Test seam. */
+  shutdownSettleMs?: number;
 }
 
 type Request =
   | { op: "inspect"; selector: RetainedSourceSelector | undefined }
+  | { op: "local-records"; run: string }
+  | { op: "resolve-local-record"; run: string; generation: number; confirm: string }
   | { op: "discard"; selector: RetainedSourceSelector; confirm: string; protectedSource: boolean };
 
 interface LastDisposition {
@@ -133,7 +150,18 @@ function parseRequest(line: string): Request | string {
   }
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return "invalid_request";
   const o = raw as Record<string, unknown>;
-  const allowed = ["op", "run", "generation", "attempt", "confirm", "protected"];
+  // issue #3885: the local-record ops take a bare run id (no attempt), so they branch off first.
+  if (o.op === "local-records" || o.op === "resolve-local-record") {
+    const keys = o.op === "local-records" ? ["op", "run"] : ["op", "run", "generation", "confirm"];
+    if (Object.keys(o).length !== keys.length || Object.keys(o).some((k) => !keys.includes(k))) return "invalid_request";
+    if (typeof o.run !== "string" || !OPERATOR_RUN_ID_RE.test(o.run)) return "invalid_request";
+    if (o.op === "local-records") return { op: "local-records", run: o.run };
+    const g = o.generation;
+    if (!(typeof g === "number" && Number.isSafeInteger(g) && g > 0)) return "invalid_request";
+    if (typeof o.confirm !== "string" || !CONFIRM_RE.test(o.confirm)) return "invalid_request";
+    return { op: "resolve-local-record", run: o.run, generation: g, confirm: o.confirm };
+  }
+  const allowed =["op", "run", "generation", "attempt", "confirm", "protected"];
   if (Object.keys(o).some((k) => !allowed.includes(k))) return "invalid_request";
   const any = o.run !== undefined || o.generation !== undefined || o.attempt !== undefined;
   let selector: RetainedSourceSelector | undefined;
@@ -234,8 +262,12 @@ export class RetainedSourceServer {
     const server = this.server;
     this.server = undefined;
     if (server) await new Promise<void>((resolve) => { server.close(() => resolve()); for (const c of this.connections) c.destroy(); });
+    // Contract (issue #3885): an operation's deadline is cooperative and the work it owns is awaited;
+    // the claim gate stays closed and busy/inflight stay set until that work settles. This bounded wait
+    // neither establishes settlement nor releases ownership: it only stops close() from hanging, and
+    // it deliberately never reopens the gate or clears busy/inflight for a still-running request.
     const inflight = this.inflight;
-    if (inflight) await Promise.race([inflight.catch(() => undefined), realSleep(SHUTDOWN_SETTLE_MS)]);
+    if (inflight) await Promise.race([inflight.catch(() => undefined), realSleep(this.deps.shutdownSettleMs ?? SHUTDOWN_SETTLE_MS)]);
     const sock = this.socketPath;
     this.socketPath = undefined;
     if (sock) {
@@ -299,7 +331,9 @@ export class RetainedSourceServer {
   private onConnection(conn: Socket): void {
     this.connections.add(conn);
     let gone = false;
-    conn.on("close", () => { gone = true; this.connections.delete(conn); });
+    // issue #3885: aborted when the client leaves; the local-record ops observe it cooperatively.
+    const clientAbort = new AbortController();
+    conn.on("close", () => { gone = true; this.connections.delete(conn); clientAbort.abort(); });
     conn.on("error", () => undefined);
     conn.setTimeout(this.deps.requestReadTimeoutMs ?? REQUEST_READ_TIMEOUT_MS, () => conn.destroy());
     const deadline = setTimeout(() => conn.destroy(), this.deps.requestDeadlineMs ?? REQUEST_DEADLINE_MS);
@@ -330,16 +364,100 @@ export class RetainedSourceServer {
         reply({ ok: false, error: parsed });
         return;
       }
-      void this.handle(parsed, () => gone).then(reply, (err) => {
+      void this.handle(parsed, () => gone, clientAbort.signal).then(reply, (err) => {
         this.deps.log.warn("retained-source request failed", { error: errMessage(err) });
         reply({ ok: false, error: "internal_error" });
       });
     });
   }
 
-  private async handle(req: Request, clientGone: () => boolean): Promise<Record<string, unknown> & { sources?: unknown[] }> {
+  private async handle(
+    req: Request, clientGone: () => boolean, requestSignal: AbortSignal,
+  ): Promise<Record<string, unknown> & { sources?: unknown[] }> {
     if (req.op === "inspect") return this.inspect(req.selector);
+    if (req.op === "local-records") return this.localRecords(req.run, requestSignal);
+    if (req.op === "resolve-local-record") return this.resolveLocalRecord(req, clientGone, requestSignal);
     return this.discard(req, clientGone);
+  }
+
+  // ─── local records (issue #3885) ────────────────────────────────────────────────────────
+
+  /** Read-only: the claim gate stays open, like inspect. */
+  private async localRecords(runId: string, requestSignal: AbortSignal): Promise<Record<string, unknown>> {
+    const result = await this.deps.runner.describeLocalRecords(runId, {
+      requestSignal, shutdownSignal: this.shutdown.signal, deadlineAt: (this.deps.now ?? Date.now)() + (this.deps.resolveDeadlineMs ?? RESOLVE_DEADLINE_MS),
+    });
+    return { ok: result.kind === "described", op: "local-records", result };
+  }
+
+  private resolveRefusal(reason: string): { ok: false; op: "resolve-local-record"; result: ResolveLocalRecordResult } {
+    return { ok: false, op: "resolve-local-record", result: { kind: "refused", reason } };
+  }
+
+  private async resolveLocalRecord(
+    req: Extract<Request, { op: "resolve-local-record" }>, clientGone: () => boolean, requestSignal: AbortSignal,
+  ): Promise<Record<string, unknown>> {
+    // Same admission as discard, in the same order. `busy` is set before any await.
+    if (this.closing) return this.resolveRefusal("shutting_down");
+    if (this.busy) return this.resolveRefusal("busy");
+    const gate = this.deps.gate;
+    if (!gate) return this.resolveRefusal("no_claim_gate");
+    this.busy = true;
+    const run = (async () => {
+      try {
+        const out = await this.resolveSequence(req, gate, clientGone, requestSignal);
+        const result = out.result;
+        const sel = { runId: req.run, generation: req.generation, attempt: "local-record" };
+        this.remember(sel, result.kind, result.kind === "refused" || result.kind === "partial" ? result.reason : undefined);
+        // Logged even when the client already left: the operator reads the outcome from the log or inspect.
+        this.deps.log.info("retained-source: local record resolution finished", {
+          run_id: req.run, generation: req.generation, outcome: result.kind,
+          ...(result.kind === "refused" || result.kind === "partial" ? { reason: result.reason } : {}),
+        });
+        return out;
+      } finally {
+        this.busy = false;
+        void this.reportRetained();
+      }
+    })();
+    this.inflight = run;
+    return run;
+  }
+
+  private async resolveSequence(
+    req: Extract<Request, { op: "resolve-local-record" }>, gate: DindPruneGate, clientGone: () => boolean, requestSignal: AbortSignal,
+  ): Promise<{ ok: boolean; op: "resolve-local-record"; result: ResolveLocalRecordResult }> {
+    const now = this.deps.now ?? Date.now;
+    const sleep = this.deps.sleep ?? ((ms: number) => realSleep(ms));
+    if (gate.heldBy("terminal_maintenance")) return this.resolveRefusal("worker_not_idle");
+    gate.close("retained_ops");
+    // The gate reopens only after the coordinator call returned (settled), never on a deadline or a
+    // client disconnect: the coordinator's own deadline is cooperative and it owns the work until then.
+    try {
+      const started = now();
+      while (gate.inFlightClaims() > 0) {
+        if (this.closing) return this.resolveRefusal("shutting_down");
+        if (now() - started >= (this.deps.drainBudgetMs ?? DRAIN_BUDGET_MS)) return this.resolveRefusal("claims_not_drained");
+        await sleep(this.deps.drainPollMs ?? DRAIN_POLL_MS);
+      }
+      if (!this.deps.isIdle()) return this.resolveRefusal("worker_not_idle");
+      if (clientGone()) return this.resolveRefusal("client_disconnected");
+      let result: ResolveLocalRecordResult;
+      try {
+        // Called directly: the coordinator takes authority A itself, so no outer withTransaction here
+        // (it would make the coordinator borrow it), and no withRetainedSourceBoundary.
+        result = await this.deps.runner.resolveLocalRecord({
+          runId: req.run, generation: req.generation, confirm: req.confirm,
+          requestSignal, shutdownSignal: this.shutdown.signal, deadlineAt: now() + (this.deps.resolveDeadlineMs ?? RESOLVE_DEADLINE_MS),
+        });
+      } catch (err) {
+        this.deps.log.warn("retained-source: local record resolution ended with an error; re-describe before retrying", { error: errMessage(err) });
+        result = { kind: "partial", reason: "internal_error" };
+      }
+      return { ok: result.kind === "retired", op: "resolve-local-record", result };
+    } finally {
+      gate.open("retained_ops");
+    }
   }
 
   // ─── inspect ────────────────────────────────────────────────────────────────────────────

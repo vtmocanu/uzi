@@ -4,11 +4,12 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { DindPruneGate } from "../src/dind-prune.js";
 import { GitCache } from "../src/git.js";
-import { RetainedSourceServer, type RetainedSourceServerDeps } from "../src/ops/retained-source-server.js";
+import { RetainedSourceServer, type RetainedSourceRunnerPort, type RetainedSourceServerDeps } from "../src/ops/retained-source-server.js";
+import type { OperatorRequestSignals } from "../src/recovery.js";
 import type { RecoveryHoldsResponse, ClaimResponse, RunOwnershipResponse } from "../src/protocol.js";
 import type { QuiesceRunOutcome, QuiesceRunRequest } from "../src/run-quiescence.js";
 import { RunRunner } from "../src/runner.js";
@@ -148,6 +149,9 @@ interface RigOptions {
   noGate?: boolean;
   /** Extra RunRunner options (e.g. a Docker endpoint). */
   runnerOpts?: Record<string, unknown>;
+  /** issue #3885: the coordinator ports (default: fakes returning a `described` view / a `retired` result). */
+  describeLocalRecords?: RetainedSourceRunnerPort["describeLocalRecords"];
+  resolveLocalRecord?: RetainedSourceRunnerPort["resolveLocalRecord"];
 }
 
 interface Rig {
@@ -163,6 +167,8 @@ interface Rig {
   quiesceRequests: QuiesceRunRequest[];
   holdsCalls: string[];
   ownershipCalls: string[];
+  describeCalls: Array<{ runId: string; opts: OperatorRequestSignals }>;
+  resolveCalls: Array<Parameters<RetainedSourceRunnerPort["resolveLocalRecord"]>[0]>;
 }
 
 function shortDir(prefix = "rso-"): string {
@@ -194,6 +200,8 @@ async function makeRig(o: RigOptions = {}): Promise<Rig> {
   const quiesceRequests: QuiesceRunRequest[] = [];
   const holdsCalls: string[] = [];
   const ownershipCalls: string[] = [];
+  const describeCalls: Rig["describeCalls"] = [];
+  const resolveCalls: Rig["resolveCalls"] = [];
   const runner = new RunRunner({} as unknown as WorkerClient, git, () => ({ executor: {} as never }), nullLogger(), 20, undefined, {
     pollMs: 5,
     quiesceRun: async (req) => {
@@ -222,7 +230,19 @@ async function makeRig(o: RigOptions = {}): Promise<Rig> {
       events.push(r.entered ? "reservation_released" : "reservation_refused");
       return r;
     },
-  };
+    describeLocalRecords: async (runId: string, opts: OperatorRequestSignals) => {
+      describeCalls.push({ runId, opts });
+      events.push("describe_local_records");
+      return o.describeLocalRecords
+        ? o.describeLocalRecords(runId, opts)
+        : { kind: "described" as const, runId, generations: [], blockers: [] };
+    },
+    resolveLocalRecord: async (input: Parameters<RetainedSourceRunnerPort["resolveLocalRecord"]>[0]) => {
+      resolveCalls.push(input);
+      events.push("resolve_local_record");
+      return o.resolveLocalRecord ? o.resolveLocalRecord(input) : { kind: "retired" as const, generation: input.generation, remaining: 0 };
+    },
+  } satisfies RetainedSourceRunnerPort;
   const dataDir = o.dataDir ?? shortDir();
   const server = new RetainedSourceServer({
     dataDir, git, gate: o.noGate ? undefined : gate, runner: port, log: o.log ?? nullLogger(),
@@ -246,6 +266,7 @@ async function makeRig(o: RigOptions = {}): Promise<Rig> {
   await server.ready;
   return {
     server, gate, runner, events, sock: server.path, dataDir, idle, served, quiesceRequests, holdsCalls, ownershipCalls,
+    describeCalls, resolveCalls,
     abort: async () => { ac.abort(); await served; },
   };
 }
@@ -1231,5 +1252,303 @@ describe("the wire", () => {
     assert.equal(r.ok, true);
     assert.equal(r.truncated, true);
     assert.ok(r.omitted > 0 && r.sources.length + r.omitted === 64);
+  });
+});
+
+// ─── local records (issue #3885 M2) ──────────────────────────────────────────────────────────
+
+const CLIENT_MJS = path.resolve(import.meta.dirname, "..", "src", "ops", "retained-source.mjs");
+const DIGEST = "ab".repeat(32);
+const UNKNOWN_OUTCOME = "retained-source: timed out waiting for the worker; the resolution outcome is unknown: re-inspect (local-records / inspect) before retrying";
+
+/** The real .mjs client against the rig's socket (async: the server lives in this process). */
+function runClient(args: string[], env: Record<string, string> = {}): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const e = { ...childEnv(), ...env };
+    const child = spawn(process.execPath, [CLIENT_MJS, ...args], { env: e, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+const resolveReq = (over: Record<string, unknown> = {}) => ({ op: "resolve-local-record", run: "run-lr", generation: 1, confirm: DIGEST, ...over });
+
+describe("local-records and resolve-local-record: request parsing", () => {
+  it("refuses malformed requests as invalid_request and never reaches the runner", async () => {
+    const rig = await rigOf();
+    const long = "r".repeat(129);
+    const bad: unknown[] = [
+      { op: "local-records" },
+      { op: "local-records", run: "run-lr", extra: 1 },
+      { op: "local-records", run: "run-lr", attempt: "canonical" },
+      { op: "local-records", run: long },
+      { op: "local-records", run: "bad run!" },
+      { op: "local-records", run: "a/b" },
+      { op: "resolve-local-record", run: "run-lr", generation: 1 },
+      { op: "resolve-local-record", run: "run-lr", confirm: DIGEST },
+      resolveReq({ extra: true }),
+      resolveReq({ attempt: "canonical" }),
+      resolveReq({ generation: 0 }),
+      resolveReq({ generation: -1 }),
+      resolveReq({ generation: 1.5 }),
+      resolveReq({ generation: "1" }),
+      resolveReq({ generation: Number.MAX_SAFE_INTEGER + 2 }),
+      resolveReq({ confirm: "AB".repeat(32) }),
+      resolveReq({ confirm: "ab".repeat(31) }),
+      resolveReq({ confirm: 5 }),
+      resolveReq({ run: long }),
+      resolveReq({ run: "bad run!" }),
+    ];
+    for (const req of bad) {
+      const r = await send(rig.sock, req);
+      assert.equal(r.ok, false, JSON.stringify(req));
+      assert.equal(r.error, "invalid_request", JSON.stringify(req));
+    }
+    assert.equal(rig.describeCalls.length + rig.resolveCalls.length, 0);
+    assert.equal(rig.events.some((e) => e.startsWith("gate_")), false);
+  });
+
+  it("accepts local-records without an attempt, with the longest allowed run id", async () => {
+    const rig = await rigOf();
+    const r = await send(rig.sock, { op: "local-records", run: "A".repeat(128) });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(rig.describeCalls[0]!.runId, "A".repeat(128));
+  });
+});
+
+describe("local-records", () => {
+  it("is read-only: the gate is never closed, and the runner gets the request and shutdown signals and a deadline", async () => {
+    const view = { kind: "described" as const, runId: "run-lr", generations: [{ generation: 1, classification: "case_a_ack", digest: DIGEST, captureIds: [] }], blockers: [] };
+    const rig = await rigOf({ describeLocalRecords: async () => view });
+    const before = Date.now();
+    const r = await send(rig.sock, { op: "local-records", run: "run-lr" });
+    assert.equal(r.ok, true);
+    assert.equal(r.op, "local-records");
+    assert.deepEqual(r.result, view);
+    assert.equal(rig.events.some((e) => e.startsWith("gate_")), false, "the claim gate was untouched");
+    const c = rig.describeCalls[0]!;
+    assert.ok(c.opts.requestSignal instanceof AbortSignal && c.opts.shutdownSignal instanceof AbortSignal);
+    assert.equal(c.opts.requestSignal.aborted, false);
+    assert.ok(c.opts.deadlineAt >= before + 59_000 && c.opts.deadlineAt <= Date.now() + 61_000, `deadlineAt ${c.opts.deadlineAt}`);
+  });
+
+  it("a refused view is ok:false", async () => {
+    const rig = await rigOf({ describeLocalRecords: async () => ({ kind: "refused", reason: "inventory_incomplete" }) });
+    const r = await send(rig.sock, { op: "local-records", run: "run-lr" });
+    assert.equal(r.ok, false);
+    assert.deepEqual(r.result, { kind: "refused", reason: "inventory_incomplete" });
+  });
+});
+
+describe("resolve-local-record: admission", () => {
+  const refusedWith = (r: Json, reason: string) => {
+    assert.equal(r.ok, false, JSON.stringify(r));
+    assert.equal(r.op, "resolve-local-record");
+    assert.deepEqual(r.result, { kind: "refused", reason });
+  };
+
+  it("no claim gate refuses and never calls the runner", async () => {
+    const rig = await rigOf({ noGate: true });
+    refusedWith(await send(rig.sock, resolveReq()), "no_claim_gate");
+    assert.equal(rig.resolveCalls.length, 0);
+  });
+
+  it("a held terminal_maintenance owner refuses worker_not_idle without closing the gate", async () => {
+    const rig = await rigOf();
+    rig.gate.close("terminal_maintenance");
+    refusedWith(await send(rig.sock, resolveReq()), "worker_not_idle");
+    assert.equal(rig.events.includes("gate_closed:retained_ops"), false);
+    assert.equal(rig.resolveCalls.length, 0);
+  });
+
+  it("claims that never drain refuse claims_not_drained, reopen the gate and skip the runner", async () => {
+    let t = 0;
+    const rig = await rigOf({ server: { now: () => t, sleep: async (ms) => { t += ms; } } });
+    assert.ok(rig.gate.tryEnterClaim());
+    refusedWith(await send(rig.sock, resolveReq()), "claims_not_drained");
+    assert.equal(rig.gate.heldBy("retained_ops"), false);
+    assert.equal(rig.resolveCalls.length, 0);
+    rig.gate.exitClaim();
+  });
+
+  it("a worker that is not idle refuses worker_not_idle, reopens the gate and skips the runner", async () => {
+    const rig = await rigOf();
+    rig.idle.value = false;
+    refusedWith(await send(rig.sock, resolveReq()), "worker_not_idle");
+    assert.equal(rig.gate.heldBy("retained_ops"), false);
+    assert.deepEqual(rig.events.filter((e) => e.startsWith("gate_")), ["gate_closed:retained_ops", "gate_opened:retained_ops"]);
+    assert.equal(rig.resolveCalls.length, 0);
+  });
+
+  it("a client that left before the call gets client_disconnected and the runner is never called", async () => {
+    const rig = await rigOf();
+    assert.ok(rig.gate.tryEnterClaim());
+    const conn = await sendDetached(rig.sock, resolveReq());
+    await until(() => rig.gate.heldBy("retained_ops"), "the resolve is waiting on the drain");
+    conn.destroy();
+    await until(() => rig.server.activeConnections === 0, "the server saw the disconnect");
+    rig.gate.exitClaim();
+    await until(() => !rig.gate.heldBy("retained_ops"), "the abandoned request ended");
+    assert.equal(rig.resolveCalls.length, 0);
+    assert.deepEqual(rig.events.filter((e) => e.startsWith("gate_")), ["gate_closed:retained_ops", "gate_opened:retained_ops"]);
+    const after = await send(rig.sock, { op: "inspect" });
+    assert.equal(after.lastDiscards[0].outcome, "refused");
+    assert.equal(after.lastDiscards[0].reason, "client_disconnected");
+  });
+
+  it("a second concurrent resolve is busy while the first holds the gate; the first still completes", async () => {
+    const release = deferred<{ kind: "retired"; generation: number; remaining: number }>();
+    const rig = await rigOf({ resolveLocalRecord: () => release.promise });
+    const first = send(rig.sock, resolveReq());
+    await until(() => rig.resolveCalls.length === 1, "the first resolve reached the runner");
+    refusedWith(await send(rig.sock, resolveReq({ generation: 2 })), "busy");
+    assert.equal(rig.resolveCalls.length, 1);
+    assert.equal(rig.gate.heldBy("retained_ops"), true, "the busy refusal did not touch the gate");
+    release.resolve({ kind: "retired", generation: 1, remaining: 0 });
+    const r = await within(5000, "the first resolve", first);
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(rig.gate.heldBy("retained_ops"), false);
+  });
+
+  it("calls the runner directly: no authority transaction, no retained-source boundary; the gate wraps the call", async () => {
+    let withTransactionCalls = 0;
+    const authority = { withTransaction: async <T,>(fn: () => Promise<T>) => { withTransactionCalls++; return fn(); } };
+    const rig = await rigOf({ server: { authority: authority as never } });
+    const r = await send(rig.sock, resolveReq({ generation: 3 }));
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.deepEqual(r.result, { kind: "retired", generation: 3, remaining: 0 });
+    assert.equal(withTransactionCalls, 0);
+    assert.equal(rig.events.includes("reservation_installed"), false);
+    const c = rig.resolveCalls[0]!;
+    assert.equal(c.runId, "run-lr");
+    assert.equal(c.generation, 3);
+    assert.equal(c.confirm, DIGEST);
+    assert.ok(c.requestSignal instanceof AbortSignal && c.shutdownSignal instanceof AbortSignal && typeof c.deadlineAt === "number");
+    const gateEvents = rig.events.filter((e) => e.startsWith("gate_") || e === "resolve_local_record");
+    assert.deepEqual(gateEvents, ["gate_closed:retained_ops", "resolve_local_record", "gate_opened:retained_ops"]);
+  });
+});
+
+describe("resolve-local-record: signals", () => {
+  it("the request signal aborts when the client disconnects mid-request; the work still settles and reopens the gate", async () => {
+    const release = deferred<{ kind: "retired"; generation: number; remaining: number }>();
+    const rig = await rigOf({ resolveLocalRecord: () => release.promise });
+    const conn = await sendDetached(rig.sock, resolveReq());
+    await until(() => rig.resolveCalls.length === 1, "the runner was called");
+    const sig = rig.resolveCalls[0]!.requestSignal;
+    assert.equal(sig.aborted, false);
+    conn.destroy();
+    await until(() => sig.aborted, "the request signal aborted on disconnect");
+    assert.equal(rig.gate.heldBy("retained_ops"), true, "a disconnect does not release ownership");
+    release.resolve({ kind: "retired", generation: 1, remaining: 0 });
+    await until(() => !rig.gate.heldBy("retained_ops"), "the gate reopened after settlement");
+  });
+
+  it("local-records observes the same disconnect signal", async () => {
+    const release = deferred<DescribeResult>();
+    const rig = await rigOf({ describeLocalRecords: () => release.promise });
+    const conn = await sendDetached(rig.sock, { op: "local-records", run: "run-lr" });
+    await until(() => rig.describeCalls.length === 1, "the runner was called");
+    const sig = rig.describeCalls[0]!.opts.requestSignal;
+    conn.destroy();
+    await until(() => sig.aborted, "the request signal aborted");
+    release.resolve({ kind: "described", runId: "run-lr", generations: [], blockers: [] });
+  });
+});
+type DescribeResult = Awaited<ReturnType<RetainedSourceRunnerPort["describeLocalRecords"]>>;
+
+describe("resolve-local-record: exit semantics through the real client", () => {
+  const cases: Array<[string, Awaited<ReturnType<RetainedSourceRunnerPort["resolveLocalRecord"]>>, number]> = [
+    ["retired", { kind: "retired", generation: 1, remaining: 0 }, 0],
+    ["partial", { kind: "partial", reason: "bundle_delete_failed" }, 1],
+    ["refused", { kind: "refused", reason: "descriptor_changed" }, 1],
+  ];
+  for (const [name, result, code] of cases) {
+    it(`${name} exits ${code}`, async () => {
+      const rig = await rigOf({ resolveLocalRecord: async () => result });
+      const r = await runClient(["resolve-local-record", "--run", "run-lr", "--generation", "1", "--confirm", DIGEST, "--socket", rig.sock]);
+      assert.equal(r.code, code, r.stderr);
+      const body = JSON.parse(r.stdout) as Json;
+      assert.equal(body.ok, code === 0);
+      assert.deepEqual(body.result, result);
+    });
+  }
+
+  it("local-records exits 0 on a described view and 1 on a refused one", async () => {
+    const ok = await rigOf();
+    const r1 = await runClient(["local-records", "--run", "run-lr", "--socket", ok.sock]);
+    assert.equal(r1.code, 0, r1.stderr);
+    assert.equal((JSON.parse(r1.stdout) as Json).op, "local-records");
+    const bad = await rigOf({ describeLocalRecords: async () => ({ kind: "refused", reason: "x" }) });
+    const r2 = await runClient(["local-records", "--run", "run-lr", "--socket", bad.sock]);
+    assert.equal(r2.code, 1);
+  });
+});
+
+describe("resolve-local-record: a deadline is cooperative and owned work is awaited", () => {
+  it("a client that times out gets the unknown-outcome message while the server keeps the gate and finishes the work", async () => {
+    const release = deferred<{ kind: "retired"; generation: number; remaining: number }>();
+    const { logger, lines } = recordingLogger();
+    const rig = await rigOf({ log: logger, server: { resolveDeadlineMs: 5 }, resolveLocalRecord: () => release.promise });
+
+    const client = await within(10_000, "the client", runClient(
+      ["resolve-local-record", "--run", "run-lr", "--generation", "1", "--confirm", DIGEST, "--socket", rig.sock],
+      { UZI_RETAINED_SOURCE_IDLE_TIMEOUT_MS: "300" },
+    ));
+    assert.equal(client.code, 1);
+    assert.equal(client.stderr.trim(), UNKNOWN_OUTCOME);
+    assert.equal(client.stdout, "");
+
+    // The runner's tiny deadline has long passed, yet the operation is still owned: gate closed, busy.
+    assert.equal(rig.resolveCalls[0]!.deadlineAt - Date.now() < 1000, true);
+    assert.equal(rig.gate.heldBy("retained_ops"), true);
+    assert.equal(rig.events.includes("gate_opened:retained_ops"), false);
+    const second = await send(rig.sock, resolveReq({ generation: 2 }));
+    assert.deepEqual(second.result, { kind: "refused", reason: "busy" });
+    assert.equal(rig.resolveCalls.length, 1);
+    assert.equal(rig.gate.heldBy("retained_ops"), true);
+
+    release.resolve({ kind: "retired", generation: 1, remaining: 0 });
+    await until(() => !rig.gate.heldBy("retained_ops"), "the gate reopened once the work settled");
+    const done = lines.find((l) => (l as Json).msg === "retained-source: local record resolution finished") as Json | undefined;
+    assert.ok(done, "the completion was logged although the client had left");
+    assert.equal(done.run_id, "run-lr");
+    assert.equal(done.generation, 1);
+    assert.equal(done.outcome, "retired");
+
+    const after = await send(rig.sock, { op: "inspect" });
+    assert.equal(after.lastDiscards[0].runId, "run-lr");
+    assert.equal(after.lastDiscards[0].generation, 1);
+    assert.equal(after.lastDiscards[0].attempt, "local-record");
+    assert.equal(after.lastDiscards[0].outcome, "retired");
+
+    // The follow-up view reaches the runner; the fake now reports the post-mutation state.
+    const view = await send(rig.sock, { op: "local-records", run: "run-lr" });
+    assert.equal(view.ok, true);
+    assert.equal(rig.describeCalls.length, 1);
+  });
+
+  it("close() returns within its settle bound but neither reopens the gate nor clears ownership of a running resolve", async () => {
+    const release = deferred<{ kind: "retired"; generation: number; remaining: number }>();
+    const { logger, lines } = recordingLogger();
+    const rig = await rigOf({ log: logger, server: { shutdownSettleMs: 30 }, resolveLocalRecord: () => release.promise });
+    const conn = await sendDetached(rig.sock, resolveReq());
+    await until(() => rig.resolveCalls.length === 1, "the runner was called");
+    const shutdownSignal = rig.resolveCalls[0]!.shutdownSignal;
+    assert.equal(shutdownSignal.aborted, false);
+
+    await within(5000, "close()", rig.server.close());
+    assert.equal(shutdownSignal.aborted, true, "shutdown was signalled to the owned work");
+    assert.equal(rig.gate.heldBy("retained_ops"), true, "close() did not reopen the gate for a still-running request");
+    assert.equal(rig.events.includes("gate_opened:retained_ops"), false);
+    assert.equal(lines.some((l) => (l as Json).msg === "retained-source: local record resolution finished"), false);
+    conn.destroy();
+
+    release.resolve({ kind: "retired", generation: 1, remaining: 0 });
+    await until(() => !rig.gate.heldBy("retained_ops"), "the gate reopened after the work settled");
+    await until(() => lines.some((l) => (l as Json).msg === "retained-source: local record resolution finished"), "completion logged");
   });
 });
