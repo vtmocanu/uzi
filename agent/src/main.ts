@@ -6,6 +6,7 @@ import { acquireWorkerLifetime } from "./authority-lock.js";
 import { installWorkerLifetime, requireWorkerLifetime } from "./completion-authority.js";
 import { AuthorityRuntime } from "./authority-runtime.js";
 import { createLogger, type Logger } from "./log.js";
+import { startMainWatchdog } from "./main-watchdog.js";
 import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBootstrap, snapshotMaintenanceBootstrap, terminalMaintenanceProof } from "./run-quiescence.js";
 import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { WorkerClient, RequestError } from "./client.js";
@@ -363,6 +364,16 @@ async function main(): Promise<void> {
   // #3031 E1: the FIRST statement, after the static import graph and before any app spawn or
   // claim. It pins the exact tsx esbuild child (or none); nothing is ever enrolled later.
   recordMaintenanceBootstrap(snapshotMaintenanceBootstrap());
+  // #3896: observe-only main-thread watchdog; failure-isolated, never throws.
+  const watchdog = startMainWatchdog();
+  try {
+    await mainBody();
+  } finally {
+    await watchdog.stop();
+  }
+}
+
+async function mainBody(): Promise<void> {
   // Register cancellation before bounded lock waits, config/token reads or any
   // protected startup access. Runtime shutdown hooks are installed once built.
   const controller = new AbortController();
