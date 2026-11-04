@@ -3735,7 +3735,9 @@ export class RunRunner {
    *  The disk stop aborts the run's own lifecycle with its PauseNowSignal and never rearms it, so the
    *  park capture must not wait on that signal (authorityWait would reject at once). A real cancel, a
    *  claim fence, a receipt failure and shutdown still abort terminalLifecycleSignal / shutdownSignal.
-   *  Like authorityWait, the wait bounds acquisition of A only. Undefined outside disk mode. */
+   *  As a wait it bounds acquisition of A only (the fetch-back transport runs without A); the capture
+   *  body also uses its signal for the remediation bootstrap and the checkpoint publish, which it can
+   *  abort. Undefined outside disk mode. */
   private diskParkCaptureWait(flight: RunFlight, boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait | undefined {
     if (flight.steering.getPauseMode() !== "disk") return undefined;
     const budget = MaintenanceBudget.current()?.remainingMs() ?? Infinity;
