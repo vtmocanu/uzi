@@ -51,8 +51,12 @@
 #
 #  M4 (launch config, the actual M0 fix): the worker hands the SDK a SPARSE, allowlisted env
 #  — agent/src/sdk-env.ts REPLACES the subprocess environment entirely — so the AGENT_BROWSER_*
-#  / FONTCONFIG_FILE ENV baked in the Dockerfile do NOT reach the agent's Bash tool. This
-#  shim, which DOES run on the agent PATH, re-establishes them as DEFAULTS (respecting any
+#  / FONTCONFIG_FILE ENV baked in the Dockerfile do NOT reach the agent's Bash tool by
+#  themselves. Since issue #3907 the Claude-lane command env, and the Codex command env when the
+#  worker's command sandbox mode is `off`, carry AGENT_BROWSER_EXECUTABLE_PATH (and CHROME_PATH)
+#  pointing at the uzi-chromium wrapper (agent/bin/uzi-chromium); the `:=`
+#  defaults below yield to it, so agent-browser launches Chromium through the wrapper. This
+#  shim, which DOES run on the agent PATH, still re-establishes the rest as DEFAULTS (respecting any
 #  value the caller already set) right before exec, so agent-browser launches the prebaked
 #  Chromium with --no-sandbox (mandatory under the PRD #51 hardening: unprivileged uid +
 #  cap_drop: ALL + no-new-privileges make Chromium's setuid sandbox impossible) and
@@ -60,7 +64,8 @@
 #  fonts (FONTCONFIG_FILE), and auto-closes an idle daemon so a wedged daemon can't silently
 #  no-op corrected launch options (M0 secondary). Delivering these via the shim scopes them
 #  to the agent-browser process (and its Chromium child) rather than widening the
-#  deliberately-minimal agent env, and needs no change to sdk-env.ts.
+#  deliberately-minimal agent env (sdk-env.ts carries only AGENT_BROWSER_ARGS and, since
+#  issue #3907, the two discovery paths).
 set -eu
 
 # The baked npm JS launcher — since issue #1082 the FALLBACK exec target, behind the direct
@@ -81,29 +86,51 @@ export AGENT_BROWSER_EXECUTABLE_PATH AGENT_BROWSER_ARGS AGENT_BROWSER_IDLE_TIMEO
 # rc=133 (SIGTRAP) at the crashpad handler — BEFORE the SUID check, so --no-sandbox does NOT
 # fix it — when it cannot create its crashpad DB: the image bakes $HOME/.config
 # (/home/worker/.config) root:worker 0755, which the non-root runner uid (10001) cannot write.
-# Point the XDG base dirs at a guaranteed-writable location under TMPDIR (the runner's own 0700
-# tmp under the uid split, else /tmp) so the launch is robust to WHATEVER $HOME agent-browser
+# Point the XDG base dirs at a guaranteed-writable, run-private location (under a writable $HOME,
+# else a fresh mktemp dir under TMPDIR — see below) so the launch is robust to WHATEVER $HOME agent-browser
 # inherits — this closes the crash even for a direct/non-SDK/compose invocation that keeps the
 # image HOME, not only the SDK path where sdk-env.ts happens to repoint HOME to a writable dir.
 # Only-if-unset so an explicit caller value wins; the mkdir is best-effort (dir may pre-exist
 # or TMPDIR may be read-only — chromium still self-creates under a writable XDG root).
 #
-# UID-SCOPE the base dir (issue #114 BUG 2a): the fail-closed build guard runs this shim as
-# ROOT (uid 0) at image-build time, so an un-scoped `${TMPDIR:-/tmp}/uzi-agent-browser` would be
-# created root:root and BAKED into the image; the runtime runner (uid 10001) then cannot write
-# it and chromium's crashpad DB creation fails. Keying the dir on `$(id -u)` gives build (0) and
-# runtime (10001) disjoint paths, so the baked root-owned dir is never the one the runner uses.
-: "${XDG_CONFIG_HOME:=${TMPDIR:-/tmp}/uzi-agent-browser-$(id -u)/config}"
-: "${XDG_CACHE_HOME:=${TMPDIR:-/tmp}/uzi-agent-browser-$(id -u)/cache}"
-export XDG_CONFIG_HOME XDG_CACHE_HOME
-mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" 2>/dev/null || true
+# RUN-PRIVATE base dir (issues #114 BUG 2a, #3907): the fail-closed build guard runs this shim
+# as ROOT at image-build time, so a fixed shared path such as `${TMPDIR:-/tmp}/uzi-agent-browser`
+# would be created root:root and BAKED into the image; the runtime runner (uid 10001) then
+# cannot write it and chromium's crashpad DB creation fails. The base is therefore under a
+# writable $HOME (the build guard runs with a throwaway HOME, so nothing root-owned is baked),
+# else a per-invocation mktemp dir that is never shared between invocations, runs or uids.
+if [ -z "${XDG_CONFIG_HOME:-}" ] || [ -z "${XDG_CACHE_HOME:-}" ]; then
+  ab_base=""
+  if [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
+    ab_base="$HOME/.uzi-agent-browser"
+    # An existing base this uid cannot write (a foreign leftover) is not usable either.
+    { mkdir -p "$ab_base" 2>/dev/null && [ -w "$ab_base" ]; } || ab_base=""
+  fi
+  if [ -z "$ab_base" ]; then
+    ab_base=$(mktemp -d "${TMPDIR:-/tmp}/uzi-agent-browser.XXXXXX" 2>/dev/null || true)
+  fi
+  # No predictable fallback: if mktemp failed too, leave the XDG vars as they were.
+  if [ -n "$ab_base" ]; then
+    : "${XDG_CONFIG_HOME:=$ab_base/config}"
+    : "${XDG_CACHE_HOME:=$ab_base/cache}"
+  fi
+fi
+if [ -n "${XDG_CONFIG_HOME:-}" ]; then export XDG_CONFIG_HOME; mkdir -p "$XDG_CONFIG_HOME" 2>/dev/null || true; fi
+if [ -n "${XDG_CACHE_HOME:-}" ]; then export XDG_CACHE_HOME; mkdir -p "$XDG_CACHE_HOME" 2>/dev/null || true; fi
 
 # A browser is reachable if the prebaked executable resolves, OR a chrome/chromium is on
 # PATH (auto-discovery), OR the invocation explicitly names a browser/endpoint — never
 # shadow a valid remote (--cdp) or explicit (--executable-path/--provider/--engine) call.
+# When the executable is the uzi-chromium wrapper (issue #3907) it is only as good as the
+# Chromium it wraps, so that target must be executable too; otherwise the M1 clean exit
+# (0 + message) still applies. AGENT_BROWSER_SHIM_WRAPPER and UZI_CHROMIUM_WRAPPER_TARGET
+# are seams set ONLY by the unit tests.
 browser_reachable() {
   if [ -x "${AGENT_BROWSER_EXECUTABLE_PATH}" ]; then
-    return 0
+    if [ "${AGENT_BROWSER_EXECUTABLE_PATH}" != "${AGENT_BROWSER_SHIM_WRAPPER:-/usr/local/bin/uzi-chromium}" ] \
+      || [ -x "${UZI_CHROMIUM_WRAPPER_TARGET:-/opt/uzi-toolchain/bin/chromium}" ]; then
+      return 0
+    fi
   fi
   for b in chromium chromium-browser google-chrome google-chrome-stable chrome; do
     if command -v "$b" >/dev/null 2>&1; then

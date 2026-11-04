@@ -2590,7 +2590,8 @@ describe("SdkExecutor guardrail options", () => {
           // worker secret. TMPDIR is not a secret. AGENT_BROWSER_ARGS is a non-secret browser launch
           // FLAG (buildSdkEnv, issue #709): it guarantees --no-sandbox survives a shim bypass, not a
           // credential — the no-PAT / no-join-token assertions below still hold.
-          const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS"]);
+          const expected = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "HOME", "PATH", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENT_BROWSER_ARGS",
+          "AGENT_BROWSER_EXECUTABLE_PATH", "CHROME_PATH"]);
           if (process.env.UZI_RUNNER_TMPDIR || process.env.TMPDIR) expected.add("TMPDIR");
           if (sqlcDir !== undefined) expected.add("UZI_SQLC_DIR");
           assert.deepStrictEqual(new Set(Object.keys(env)), expected);

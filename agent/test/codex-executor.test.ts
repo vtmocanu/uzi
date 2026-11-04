@@ -9968,6 +9968,39 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(env.AGENT_BROWSER_ARGS, undefined);
   });
 
+  it("issue #3907: browserDiscovery=true sets both discovery paths after a hostile toolEnv fold", () => {
+    const env = buildCommandEnv("/private/tmp", {
+      AGENT_BROWSER_EXECUTABLE_PATH: "/evil/chromium",
+      CHROME_PATH: "/evil/chrome",
+    }, undefined, true);
+    assert.equal(env.AGENT_BROWSER_EXECUTABLE_PATH, "/usr/local/bin/uzi-chromium");
+    assert.equal(env.CHROME_PATH, "/usr/local/bin/uzi-chromium");
+    assert.ok(!("PUPPETEER_EXECUTABLE_PATH" in buildCommandEnv("/private/tmp", {}, undefined, true)));
+  });
+
+  it("issue #3907: browserDiscovery false or omitted advertises neither path, even when toolEnv supplies them", () => {
+    const tool = { AGENT_BROWSER_EXECUTABLE_PATH: "/evil/chromium", CHROME_PATH: "/evil/chrome" };
+    for (const env of [buildCommandEnv("/private/tmp", tool), buildCommandEnv("/private/tmp", tool, undefined, false)]) {
+      assert.ok(!("AGENT_BROWSER_EXECUTABLE_PATH" in env));
+      assert.ok(!("CHROME_PATH" in env));
+    }
+  });
+
+  for (const [label, mode, present] of [
+    ["off", "off", true], ["required", "required", false], ["best-effort", "best-effort", false], ["omitted", undefined, false],
+  ] as const) {
+    it(`issue #3907: run() with commandSandbox ${label} ${present ? "advertises" : "does not advertise"} browser discovery`, async () => {
+      const rig = makeRig();
+      rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider,
+        (mode === undefined ? {} : { commandSandbox: mode }) as never);
+      await withTimeout(exec.run(makeCtx().ctx), 3000, "browser discovery run");
+      const env = rig.fileopSpawns[0]!.env;
+      assert.equal(env.AGENT_BROWSER_EXECUTABLE_PATH, present ? "/usr/local/bin/uzi-chromium" : undefined);
+      assert.equal(env.CHROME_PATH, present ? "/usr/local/bin/uzi-chromium" : undefined);
+    });
+  }
+
   it("run() folds the injected provisionRunTools toolEnv into the command identity and never inherits process.env", async () => {
     const rig = makeRig();
     rig.deps = {
