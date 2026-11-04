@@ -272,8 +272,16 @@ func TestClaimedNeverStartedRefusalLoopBoundedLiveDB(t *testing.T) {
 		if err := json.Unmarshal(raw, &body); err != nil {
 			t.Fatalf("fixture is not JSON: %v", err)
 		}
+		// Substitute VALUES only: the nested keys stay the fixture's, so a rename there reddens
+		// the strict decode below.
 		body["claim_generation"] = gen
-		body["registration_evidence"] = map[string]any{"register_nonce": f.nonce, "claim_generation": gen, "registration_epoch": epoch}
+		ev, ok := body["registration_evidence"].(map[string]any)
+		if !ok {
+			t.Fatalf("fixture registration_evidence is not an object: %T", body["registration_evidence"])
+		}
+		ev["register_nonce"] = f.nonce
+		ev["claim_generation"] = gen
+		ev["registration_epoch"] = epoch
 		wire, err := json.Marshal(body)
 		if err != nil {
 			t.Fatal(err)
@@ -283,6 +291,9 @@ func TestClaimedNeverStartedRefusalLoopBoundedLiveDB(t *testing.T) {
 		var req StateRequest
 		if err := dec.Decode(&req); err != nil {
 			t.Fatalf("the fixture body does not decode into StateRequest: %v", err)
+		}
+		if got := req.RegistrationEvidence; got == nil || got.RegisterNonce != f.nonce || got.ClaimGeneration != gen || got.RegistrationEpoch == nil || *got.RegistrationEpoch != epoch {
+			t.Fatalf("decoded registration_evidence = %+v, want nonce=%q generation=%d epoch=%d", got, f.nonce, gen, epoch)
 		}
 		res, err := f.svc.SetStateReportWithReconciliation(f.env.ctx, f.wkr, run, req)
 		if err != nil {
