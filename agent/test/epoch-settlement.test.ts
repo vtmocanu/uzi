@@ -87,6 +87,7 @@ async function refresh() {
   const inspection = await git.inspectRetainedSources({ selector: options.selector, barePath: bare,
     holds: options.holds, lifecycle: options.lifecycle, epoch: true, isLivePath: () => false });
   assert.equal(inspection.partial, false);
+  assert.equal(inspection.sources.length, 1, "fresh epoch must rediscover the exact source");
   options.confirm = inspection.sources[0]!.descriptor;
   input = { ...input, confirm: options.confirm };
 }
@@ -475,3 +476,22 @@ for (const boundary of ["retired", "clear"] as const) {
     assert.equal(journal(), boundary === "retired" ? raw : "");
   });
 }
+
+for (const repair of [false, true]) for (const point of ["clear:before-rawverify", "clear:after-rawverify", "clear:after"]) {
+  for (const leaf of ["clone", "skills"]) it(`keeps reappeared ${leaf} UNKNOWN at ${point}: repair=${repair}`, async () => {
+    if (repair) { await emptyPair(); await refresh(); }
+    const target = leaf === "clone" ? clonePath : path.join(path.dirname(clonePath), `.uzi-skills-${path.basename(clonePath)}`);
+    fault(point, async () => { fs.mkdirSync(target); fs.writeFileSync(path.join(target, "keep"), "retained"); });
+    assert.equal((await discard()).kind, "unknown");
+    assert.equal(fs.readFileSync(path.join(target, "keep"), "utf8"), "retained");
+    assert.equal(scope.stopped(), true); assert.ok(scope.pendingMutations > 0);
+    assert.equal(journal(), ""); assert.equal(ledger().length, 2);
+  });
+}
+for (const point of ["clear:before-rawverify", "clear:after"]) it(`keeps replaced parent UNKNOWN at ${point}`, async () => {
+  const parent = path.dirname(clonePath);
+  fault(point, async () => { fs.renameSync(parent, parent + "-old"); fs.mkdirSync(parent); });
+  assert.equal((await discard()).kind, "unknown");
+  assert.equal(scope.stopped(), true); assert.ok(scope.pendingMutations > 0);
+  assert.equal(journal(), "");
+});

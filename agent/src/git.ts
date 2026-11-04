@@ -10842,6 +10842,10 @@ export class GitCache {
     const read = <T>(action: () => Promise<T>) => this.automaticPreservationRead(automatic, action);
     const cwd = epoch.paths[0]!;
     const skills = path.join(path.dirname(cwd), `.uzi-skills-${path.basename(cwd)}`);
+    const standalone = async () => {
+      try { await read(() => fs.lstat(path.join(cwd, ".git", "commondir"))); return false; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return true; throw error; }
+    };
     try {
       const presence = await read(() => this.clonePresence(cwd));
       // Skills are generated, attributed footprint, not another Git worktree. Their
@@ -10856,7 +10860,8 @@ export class GitCache {
       if (presence.presence === "missing") return true;
       if (presence.presence !== "present" || !(await read(() => this.realCloneDir(cwd))) ||
           await read(() => fs.realpath(cwd)) !== cwd ||
-          await read(() => fs.realpath(path.join(cwd, ".git"))) !== path.join(cwd, ".git")) return false;
+          await read(() => fs.realpath(path.join(cwd, ".git"))) !== path.join(cwd, ".git") ||
+          !await standalone()) return false;
       // Resolve the trusted default using the existing lookup, but reject its HEAD-only fallback.
       const db = await read(() => this.defaultBranchName(epoch.barePath));
       if (!db || !(await read(() => this.isPlainBranchName(epoch.barePath, db)))) return false;
@@ -10881,7 +10886,7 @@ export class GitCache {
       if (await read(() => this.worktreeHead(cwd)) !== head || await root() !== rootSha ||
           JSON.stringify(await owedRoots()) !== JSON.stringify(owed)) return false;
       const after = await read(() => this.clonePresence(cwd));
-      return after.presence === "present" && after.devIno === presence.devIno &&
+      return after.presence === "present" && after.devIno === presence.devIno && await standalone() &&
         await read(() => this.realCloneDir(cwd)) &&
         await read(() => fs.realpath(cwd)) === cwd &&
         await read(() => fs.realpath(path.join(cwd, ".git"))) === path.join(cwd, ".git");
@@ -12187,6 +12192,15 @@ export class GitCache {
                 await this.settleEpochMetadata(epoch, rec, epochSnapshot!, () => {
                   this.checkEpochDiscardLive(epoch);
                   if (epoch.paths.some(p => opts.isLivePath(p))) throw new Error("epoch source became live");
+                  const current = lstatSync(path.dirname(epoch.paths[0]!));
+                  if (!current.isDirectory() || current.isSymbolicLink() ||
+                      current.dev !== epochParent!.dev || current.ino !== epochParent!.ino)
+                    throw new Error("epoch settled parent identity changed");
+                  for (const target of paths) {
+                    try { lstatSync(target); }
+                    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+                    throw new Error("epoch settled footprint reappeared");
+                  }
                 });
                 epochWork!.settle();
                 metadata = "retired";
@@ -12292,6 +12306,7 @@ export class GitCache {
     };
     const verify = async (want: readonly (string | null)[]) => {
       await step("rawverify");
+      checkSource();
       if (rec.epochRetiredEmptyJournal) {
         checkSource();
         if (!await this.epochMissingFootprint(rec)) throw new Error("epoch pair footprint changed");
@@ -12302,6 +12317,7 @@ export class GitCache {
       }
       if (!equal(await this.readAllAttemptLedgerRaw(epoch.barePath), expected) ||
           !equal(await this.epochJournalVector(epoch.barePath, rec.branch), want)) throw new Error("epoch metadata raw mismatch");
+      checkSource();
     };
     const barrier = async (boundary: string, want: readonly (string | null)[]) => {
       await step(boundary + ":before");
@@ -12346,7 +12362,9 @@ export class GitCache {
         await barrier("clear", [""]);
       }
       if (rec.epochRetiredEmptyJournal) await barrier("clear", [""]);
+      await verify(typeof epoch.expectedRawJournal === "string" ? [""] : journal);
       this.checkEpochDiscardLive(epoch);
+      checkSource();
       ticket.settle();
     } catch (error) { epoch.scope.stop(); throw error; }
   }

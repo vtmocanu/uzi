@@ -211,3 +211,24 @@ describe("automatic approved content roots", () => {
     });
   }
 });
+
+it("refuses unpublished local refs and objects hidden by a common-directory redirect", async () => {
+  const sha = command(clonePath, "-c", "user.name=fixture", "-c", "user.email=fixture@example.test",
+    "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "unpublished source");
+  command(clonePath, "update-ref", "refs/private/side", sha);
+  assert.equal(await covered(), false);
+  const gitdir = path.join(clonePath, ".git");
+  const common = path.join(fx.dataDir, "alternate-common");
+  fs.cpSync(gitdir, common, { recursive: true });
+  command(common, "--git-dir=.", "update-ref", "-d", "refs/private/side");
+  const objectPath = path.join("objects", sha.slice(0, 2), sha.slice(2));
+  fs.unlinkSync(path.join(common, objectPath));
+  fs.writeFileSync(path.join(gitdir, "commondir"), common + "\n");
+  assert.equal(fs.readFileSync(path.join(gitdir, "refs/private/side"), "utf8").trim(), sha);
+  assert.equal(fs.existsSync(path.join(gitdir, objectPath)), true);
+  const before = fs.readFileSync(path.join(bare, "config"));
+  assert.equal(await covered(), false, "automatic coverage must refuse hidden local metadata");
+  assert.equal((await git.discardStoppedSource({ ...options, epochProof: git.createEpochDiscardProof(input) })).kind, "refused");
+  assert.deepEqual(fs.readFileSync(path.join(bare, "config")), before);
+  assert.equal(fs.existsSync(path.join(gitdir, objectPath)), true);
+});
