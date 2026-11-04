@@ -90,8 +90,9 @@ import type {
 import { CodexAdviceHarness } from "../src/codex/codex-advice-harness.js";
 import { makeRedactor, makeTextRedactor } from "../src/redact.js";
 import { MessageBatcher } from "../src/batcher.js";
+import { JudgeEvidenceReducer, type JudgeEvidence } from "../src/judge-evidence.js";
 import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
-import type { OutgoingMessage } from "../src/protocol.js";
+import type { OutgoingMessage, WorkerRunMessage } from "../src/protocol.js";
 import { createCodexTransport, CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import { REASON_COMPLETION_STALL } from "../src/completion-attempt.js";
 import { PlanRejectedError, PlanRevisionReplacedError, type RunContext, type EmittedMessage, type Executor, type WallParkOutcome, type SecretRemediationDecision } from "../src/executor.js";
@@ -6192,6 +6193,192 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
     assert.equal(text.agent, "coder");
     assert.equal(text.agentInstance, uses[0]!.payload.id);
     assert.ok(!emitted.some((m) => m.agent === "tester"), "nothing is attributed to agent_type's role");
+  });
+
+  describe("judge evidence provenance from the executor feed (#3838)", () => {
+    /** The persisted feed as the worker writes it: every emitted frame goes through a real
+     *  MessageBatcher (sanitizePayload + the real redactors over an unrelated configured secret),
+     *  and the posted OutgoingMessages are stamped with created_at as the API would. */
+    function persistedFeed(): {
+      emit: (m: EmittedMessage) => void;
+      judge: () => Promise<{ feed: WorkerRunMessage[]; evidence: JudgeEvidence }>;
+    } {
+      const posted: OutgoingMessage[] = [];
+      const client = {
+        async postMessages(_runId: string, msgs: OutgoingMessage[]): Promise<void> {
+          posted.push(...msgs);
+        },
+      } as unknown as WorkerClient;
+      const secrets = ["unrelated-configured-secret-value-0123"];
+      const batcher = new MessageBatcher(client, "run-1", 0, 5, noopLog, makeRedactor(secrets), makeTextRedactor(secrets));
+      return {
+        emit: (m) => batcher.emit(m),
+        judge: async () => {
+          await batcher.close();
+          const base = Date.UTC(2026, 10, 3, 12, 0, 0, 0);
+          const feed: WorkerRunMessage[] = posted.slice().sort((a, b) => a.seq - b.seq).map((o) => ({
+            seq: o.seq,
+            kind: o.kind,
+            agent: o.agent ?? null,
+            agent_instance: o.agent_instance ?? null,
+            agent_label: o.agent_label ?? null,
+            payload: o.payload,
+            created_at: new Date(base + o.seq * 1000).toISOString(),
+          }));
+          const reducer = new JudgeEvidenceReducer();
+          for (const m of feed) reducer.accept(m);
+          return { feed, evidence: reducer.render() };
+        },
+      };
+    }
+
+    const completionsIn = (feed: WorkerRunMessage[]): WorkerRunMessage[] =>
+      feed.filter((m) => m.kind === "tool_result" && m.agent === "lead" && !m.agent_instance);
+
+    function oneLedgerRow(evidence: JudgeEvidence): string {
+      const rows = evidence.sections.ledger.split("\n").filter((r) => r.length > 0);
+      assert.equal(rows.length, 1, "exactly one ledger row");
+      return rows[0]!;
+    }
+
+    it("(a) a bound child timeout persists the exact worker text and the judge records a reported budget expiry", async () => {
+      const rig = makeRig({ responder: delegationResponder(() => undefined) });
+      rig.deps = { ...rig.deps, childTurnDeadlineMs: 50 };
+      rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] hangs", prompt: "p" }));
+      const sink = persistedFeed();
+      const { ctx } = makeCtx({ agents, emit: sink.emit });
+      const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      await finishRoot(rig, [1]);
+      await withTimeout(runP, 3000, "timed-out-child run");
+      const { feed, evidence } = await sink.judge();
+
+      const dispatches = feed.filter((m) => m.kind === "tool_use" && m.payload?.["name"] === "Agent");
+      assert.equal(dispatches.length, 1);
+      const completions = feed.filter((m) => m.kind === "tool_result" && m.payload?.["tool_use_id"] === dispatches[0]!.payload?.["id"]);
+      assert.equal(completions.length, 1, "exactly one persisted completion for the dispatch");
+      assert.equal(completions[0]!.payload?.["is_error"], true);
+      assert.equal(
+        completions[0]!.payload?.["content"],
+        "child_timeout: the delegated child exceeded its 50 ms turn budget; interrupt requested, partial work may remain",
+      );
+      const row = oneLedgerRow(evidence);
+      assert.match(row, /outcome=failed /);
+      assert.match(row, /deadline=unknown cause="reported budget expiry; termination unconfirmed"$/);
+      assert.equal(evidence.counts.confirmed.failed, 1);
+      assert.equal(evidence.counts.confirmed.interrupted, 0);
+    });
+
+    it("(b1) a parent abort with a wedged child persists only the stop sentinel; the parent reply differs from the feed", async () => {
+      let releaseBash!: () => void;
+      const bashGate = new Promise<void>((r) => {
+        releaseBash = r;
+      });
+      const controller = new AbortController();
+      const rig = makeRig({
+        responder: delegationResponder((t, th, tn) => {
+          t.push(toolCall(11, "uzi_bash", { command: "sleep forever" }, th, tn, "cc-wedge"));
+        }),
+      });
+      rig.deps = {
+        ...rig.deps,
+        spawnCommand: async (argv, cmdOpts) => {
+          rig.spawnCommandCalls.push({ argv, opts: cmdOpts });
+          await bashGate;
+          return { code: 0, stdout: "late", stderr: "" };
+        },
+      };
+      rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] wedge", prompt: "p" }));
+      const sink = persistedFeed();
+      const { ctx, emitted } = makeCtx({ agents, signal: controller.signal, emit: (m) => { emitted.push(m); sink.emit(m); } });
+      const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      await waitFor(() => rig.spawnCommandCalls.some((s) => JSON.stringify(s.argv).includes("sleep forever")), "wedged child effect");
+      await waitFor(() => agentUses(emitted).length === 1, "the dispatch frame");
+      controller.abort();
+      await assert.rejects(withTimeout(runP, 3000, "abort during delegation"), /run cancelled/);
+      releaseBash();
+      for (let i = 0; i < 10; i += 1) await tick();
+      const { feed, evidence } = await sink.judge();
+
+      const completions = completionsIn(feed);
+      assert.equal(completions.length, 1, "exactly one persisted completion");
+      assert.equal(completions[0]!.payload?.["is_error"], true);
+      assert.equal(completions[0]!.payload?.["content"], "delegation stopped by the run; child settlement not confirmed");
+      assert.ok(!JSON.stringify(feed).includes("child_aborted"), "the persisted feed never carries the parent-reply text");
+      const reply = JSON.stringify(rec(rec(rig.transport.responses.find((x) => x.requestId === 1)?.response).result));
+      assert.match(reply, /child_aborted:/, "the parent reply does differ from the feed");
+      const row = oneLedgerRow(evidence);
+      assert.match(row, /outcome=interrupted /);
+      assert.match(row, /cause="run stopped; settlement unconfirmed"$/);
+      assert.equal(evidence.counts.confirmed.interrupted, 1);
+      assert.equal(evidence.counts.confirmed.failed, 0);
+    });
+
+    it("(b2) a parent abort with a child that acknowledges the interrupt promptly still persists only the stop sentinel", async () => {
+      const controller = new AbortController();
+      const base = delegationResponder(() => undefined);
+      const rig = makeRig({
+        responder: (c) => {
+          if (c.method === "turn/interrupt" && rec(c.params).threadId === "th-child-1") {
+            // The responsive child: it acknowledges the interrupt and settles its turn at once.
+            c.transport.push(turnCompleted("interrupted", "th-child-1", "tn-th-child-1"));
+            return {};
+          }
+          return base(c);
+        },
+      });
+      rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] mid-turn", prompt: "p" }));
+      const sink = persistedFeed();
+      const { ctx, emitted } = makeCtx({ agents, signal: controller.signal, emit: (m) => { emitted.push(m); sink.emit(m); } });
+      const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      await waitFor(() => rig.transport.requests.filter((r) => r.method === "turn/start").length === 2, "child turn/start");
+      await waitFor(() => agentUses(emitted).length === 1, "the dispatch frame");
+      controller.abort();
+      await assert.rejects(withTimeout(runP, 3000, "abort during responsive delegation"), /run cancelled/);
+      for (let i = 0; i < 10; i += 1) await tick();
+      assert.ok(
+        rig.transport.requests.some((r) => r.method === "turn/interrupt" && rec(r.params).threadId === "th-child-1"),
+        "the child interrupt was actually requested and acknowledged",
+      );
+      const { feed, evidence } = await sink.judge();
+
+      const completions = completionsIn(feed);
+      assert.equal(completions.length, 1, "exactly one persisted completion");
+      assert.equal(completions[0]!.payload?.["is_error"], true);
+      assert.equal(completions[0]!.payload?.["content"], "delegation stopped by the run; child settlement not confirmed");
+      assert.ok(!JSON.stringify(feed).includes("child_aborted"));
+      const row = oneLedgerRow(evidence);
+      assert.match(row, /outcome=interrupted /);
+      assert.match(row, /cause="run stopped; settlement unconfirmed"$/);
+      assert.equal(evidence.counts.confirmed.interrupted, 1);
+    });
+
+    it("(c) an ordinary failed child turn persists a failure the judge records with no recognized cause", async () => {
+      const rig = makeRig({
+        responder: delegationResponder((t, th, tn) => {
+          t.push(agentMessage("child tried", th)).push({
+            kind: "turn_completed", method: "turn/completed", threadId: th, turnId: tn, status: "failed",
+            params: { threadId: th, turn: { id: tn, status: "failed",
+              error: { codexErrorInfo: "serverOverloaded", message: "private provider diagnostic" } } },
+          });
+        }),
+      });
+      rig.transport.push(threadStarted()).push(spawn(1, "c-root", { subagent_type: "coder", description: "[m1] fails", prompt: "p" }));
+      const sink = persistedFeed();
+      const { ctx } = makeCtx({ agents, emit: sink.emit });
+      const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      await finishRoot(rig, [1]);
+      await withTimeout(runP, 3000, "failed-child run");
+      const { feed, evidence } = await sink.judge();
+
+      const completions = completionsIn(feed);
+      assert.equal(completions.length, 1);
+      assert.equal(completions[0]!.payload?.["is_error"], true);
+      assert.ok(String(completions[0]!.payload?.["content"]).includes("the delegated child turn failed (transport)"));
+      const row = oneLedgerRow(evidence);
+      assert.match(row, /outcome=failed /);
+      assert.match(row, /deadline=unknown cause=unknown$/);
+      assert.equal(evidence.counts.confirmed.failed, 1);
+    });
   });
 });
 

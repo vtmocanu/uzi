@@ -86,11 +86,16 @@ it("paused archive FINAL root drift retains the successor report", {
   assert.notEqual(f.successorAdmission.clone, f.predecessorClone, "fresh admitted physical successor");
   assert.equal(f.successorAdmission.stage, "ready-for-model");
   assert.ok(f.successorAdmission.attemptId);
-  assert.equal(f.successorAdmission.restoreTip, f.successorAdmission.head);
+  assert.notEqual(f.successorAdmission.restoreTip, f.successorAdmission.head,
+    "verified marker-free wrapper stays the restore envelope, not execution HEAD");
+  assert.equal(f.successorAdmission.head, prior.inventoryCurrentSha, "execution starts at verified source S");
+  assert.equal(f.successorAdmission.restoreSource, f.successorAdmission.head);
+  assert.equal(f.successorAdmission.adoptedSource, f.successorAdmission.restoreTip, "capture attribution retains W");
+  assert.equal(f.successorAdmission.adoptedContentSource, f.successorAdmission.head);
   assert.equal(await git.recoveryAttemptMode(fx.originPath, "issue-2652"), true);
   const records = await f.coordinator.inspect(f.claim.run_id);
   const admission = records.find(r => r.generation === 2 && r.coverageDigest &&
-    r.sourceSha === f.successorAdmission!.head)!;
+    r.sourceSha === f.successorAdmission!.restoreTip)!;
   assert.ok(admission, "real predecessor capture provenance");
   assert.notEqual(admission.state, "uploaded", "transient reserve ambiguity grants no uploaded authority");
   assert.equal(admission.finalRequest, undefined);

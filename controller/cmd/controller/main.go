@@ -163,9 +163,9 @@ func main() {
 	// force-roll may interrupt runs and lose all capacity, without bypassing custody
 	// or independent DinD guards (#3103).
 	// The RecyclePolicy carries M4's disk self-heal toggle + cooldown (PRD #837): a
-	// worker reporting disk pressure has its /nix and /data volumes recycled (teardown +
-	// reprovision), unless self-heal is disabled or the worker was just recycled within
-	// the cooldown.
+	// plain worker reporting pressure can recycle /nix and /data. Docker pressure
+	// recycles only explicitly pressured /nix, always retaining /data (#3852).
+	// Disabled self-heal or a recent recycle defers eligible volume recycling.
 	materializer := kube.New(kubeClient, materializerCfg, resolver, client,
 		kube.DrainPolicy{Deadline: cfg.DrainDeadline, ForceRoll: cfg.ForceRoll},
 		kube.RecyclePolicy{Enabled: cfg.WorkerDiskRecycleEnabled, Cooldown: cfg.WorkerDiskRecycleCooldown},

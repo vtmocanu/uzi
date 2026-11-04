@@ -2506,7 +2506,7 @@ func runStatusCellAt(r apitypes.RunListItemDTO, now time.Time) string {
 	}
 	if reason := runQueueReason(r.RunDTO); reason != "" {
 		s += " (" + reason + ")"
-	} else if reason := strOr(r.HealthReason, ""); r.Status == "queued" && (reason == "your Codex account is unavailable (quarantined or being re-linked), so this run can't start" || (admission != "" && reason != "" && !apitypes.IsCodexAdmissionReason(reason))) {
+	} else if reason := strOr(r.HealthReason, ""); r.Status == "queued" && (reason == "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity" || reason == "your Codex account is unavailable (quarantined or being re-linked), so this run can't start" || (admission != "" && reason != "" && !apitypes.IsCodexAdmissionReason(reason))) {
 		// The API keeps higher-priority queued blockers in HealthReason. Retain
 		// them after maintenance and before the independent admission details.
 		s += " (" + reason + ")"

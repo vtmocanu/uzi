@@ -674,6 +674,12 @@ interface CheckpointPackOptions {
   signal?: AbortSignal;
   deadline?: number;
   restrictionIdentity?: RemediationRestrictionIdentity;
+  /** issue #2753: the server-confirmed checkpoint ref tip. Only a `chainFrom` candidate equal to it
+   *  may have `wip(park):` markers in its exclusive history (see buildCheckpointChain). */
+  markerTrustedTip?: string;
+  /** issue #2753: false on non-GitHub forges: the chain skips GATE 3 and takes realTip's own tree
+   *  instead of swapping in P's `.github/workflows` subtree. Absent/true: today's GitHub behaviour. */
+  chainWorkflowSwap?: boolean;
 }
 
 /** Copy only the identity fields before any await, including waiting for B. */
@@ -2604,10 +2610,11 @@ export interface RunnerClone {
   /** issue #1783 M2: the attempt id when the clone was seeded at an ATTEMPT path (a
    *  Docker-wired or recovery-enabled worker); absent for a canonical-path seed. */
   attemptId?: string;
-  /** issue #3194: the raw adopted source the clone was cut from — the base AFTER the structural
-   *  overlay peel and BEFORE the `wip(park)` unwrap, so a recovered marker is its own identity and
-   *  covers the staged tree the executor receives. The `--require-base` guard compares this, not
-   *  `baseCommit`. */
+  /** issue #3194: the raw adopted source after structural overlay peeling and before the
+   *  `wip(park)` unwrap; a recovered marker retains its identity for the staged content. For an
+   *  ordinary verified recovery wrapper W, this retains W for capture attribution even though
+   *  execution HEAD is the authenticated journaled source S. The `--require-base` guard compares
+   *  `adoptedContentSource` when present, otherwise this field, rather than `baseCommit`. */
   adoptedSource: string;
   /** issue #3194: the content source a recovery-coverage wrapper verifiably stands for (the
    *  episode journal's restoreSource), set only on a verified recovery adoption. When present the
@@ -5118,7 +5125,7 @@ export class GitCache {
           ];
           treeEqualChain =
             SHA40_RE.test(wrapperTree) && wrapperTree === tipTree &&
-            (await this.verifyWrapperOnlyHistory(barePath, overlaySha, realTip, 1));
+            (await this.verifyWrapperOnlyHistory(barePath, overlaySha, realTip, 1, { allowParkMarkers: true }));
         }
         const isOverlayStructure =
           treeEqualChain ||
@@ -9272,15 +9279,16 @@ export class GitCache {
 
   /**
    * issue #3239: decide what a retained-recovery successor may adopt when the episode restore tip is a
-   * recovery-coverage wrapper that may carry a `wip(park):` marker. Returns undefined for the
-   * unchanged ordinary ancestor-only shapes (or when the tip itself is a marker),
-   * which keep the plain adoption of the tip. Otherwise the wrapper must be provably the worker's own
+   * recovery-coverage wrapper that may carry a `wip(park):` marker. Ordinary marker-free,
+   * ancestor-only shapes adopt the journaled source only after full provenance verification;
+   * definite ineligibility keeps plain tip adoption. A tip that is itself a marker also returns
+   * undefined. Otherwise the wrapper must be provably the worker's own
    * coverage of the journaled source. Divergent leaves need independently verified remediation
    * evidence. The successor adopts the SOURCE (a marker is then peeled by
-   * the seed's `reset --soft`, so neither marker nor wrapper enters history); any failed proof throws
-   * `successor recovery verification failed`, before a ledger entry or clone exists.
+   * the seed's `reset --soft`, so neither marker nor wrapper enters history). Outside the ordinary
+   * fallback, failed proof throws `successor recovery verification failed` before ledger or clone effects.
    *
-   * Fail closed: once the tip is a coverage commit (or the source is a marker), any inability to verify
+   * Fail closed: once the tip is a coverage commit (or the source is a marker), any inability to read
    * refuses: an unreadable tip, more than 8 aggregates, or more than MAX_OWED_CANDIDATES_PER_RUN + 2
    * leaves, or ANY failed read. Only a non-tip commit for which {@link readBoundedCommit} RETURNS
    * undefined (over 64 KiB, or a body that does not survive the UTF-8 round trip) is demoted to a leaf
@@ -9309,52 +9317,60 @@ export class GitCache {
       if (relation === "unknown") return fail("wrapper_lineage_ancestry");
       if (relation === "divergent") { divergent = true; excludedRoots.add(leaf); }
     }
-    if (!srcMarker && markerLeaves.size === 0 && !divergent && !remediation) return undefined;
-    if (lookalike) return fail("wrapper_lookalike");
-
-    // Markers and divergent marker-free wrappers require the same full provenance proof.
-    if (!aggregates.length) return fail("wrapper_aggregate_missing");
-    const fp = aggregates[0]!.fp;
-    if (aggregates.some(a => a.fp !== fp)) return fail("wrapper_fingerprint_mismatch");
-    // The source (and a marker leaf) is read by plumbing, not readBoundedCommit: a clean source may be
-    // oversized or non-UTF-8 and must still be comparable.
-    if (!OWED_OID.test(src)) return fail("wrapper_source_oid");
+    const ordinary = !srcMarker && markerLeaves.size === 0 && !divergent && !remediation;
     const sha1Of = async (rev: string, reason: string): Promise<string> => {
       const out = await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-parse", "--verify", rev]);
       return OWED_OID.test(out) ? out : fail(reason);
     };
-    const srcTree = await sha1Of(`${src}^{tree}`, "wrapper_source_tree");
-    const identity = (kind: string) => `${kind} ${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
-    for (const a of aggregates) {
-      if (a.tree !== srcTree) return fail("wrapper_tree");
-      if (a.author !== identity("author")) return fail("wrapper_author");
-      if (a.committer !== identity("committer")) return fail("wrapper_committer");
-    }
     const sortedLeaves = [...leaves].sort();
-    if (!leaves.has(src)) return fail("wrapper_source_leaf");
-    // The roots are the leaves, with or without the current source (the producer passes both forms).
-    const fingerprints = [sortedLeaves, sortedLeaves.filter(l => l !== src)].filter(r => r.length > 0)
-      .map(roots => createHash("sha256").update(JSON.stringify({ roots, currentSha: src, tree: srcTree })).digest("hex"));
-    if (!fingerprints.includes(fp)) return fail("wrapper_fingerprint");
-    // Provenance: only the worker's own pin of this very wrapper, for this run, proves it is genuine.
-    let pins: string;
-    try {
-      pins = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
-        `refs/uzi-coverage/${journal.runId}/`]);
-    } catch (error) {
+    // Share the bounded proof without converting read failures into ordinary fallback.
+    const provenance = await (async (): Promise<{ verified: true; srcTree: string } | { verified: false; reason: string }> => {
+      if (lookalike) return { verified: false, reason: "wrapper_lookalike" };
+
+      if (!aggregates.length) return { verified: false, reason: "wrapper_aggregate_missing" };
+      const fp = aggregates[0]!.fp;
+      if (aggregates.some(a => a.fp !== fp)) return { verified: false, reason: "wrapper_fingerprint_mismatch" };
+      // The source (and a marker leaf) is read by plumbing, not readBoundedCommit: a clean source may be
+      // oversized or non-UTF-8 and must still be comparable.
+      if (!OWED_OID.test(src)) return fail("wrapper_source_oid");
+      const srcTree = await sha1Of(`${src}^{tree}`, "wrapper_source_tree");
+      const identity = (kind: string) => `${kind} ${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
+      for (const a of aggregates) {
+        if (a.tree !== srcTree) return { verified: false, reason: "wrapper_tree" };
+        if (a.author !== identity("author")) return { verified: false, reason: "wrapper_author" };
+        if (a.committer !== identity("committer")) return { verified: false, reason: "wrapper_committer" };
+      }
+      if (!leaves.has(src)) return { verified: false, reason: "wrapper_source_leaf" };
+      // The roots are the leaves, with or without the current source (the producer passes both forms).
+      const fingerprints = [sortedLeaves, sortedLeaves.filter(l => l !== src)].filter(r => r.length > 0)
+        .map(roots => createHash("sha256").update(JSON.stringify({ roots, currentSha: src, tree: srcTree })).digest("hex"));
+      if (!fingerprints.includes(fp)) return { verified: false, reason: "wrapper_fingerprint" };
+      // Provenance: only the worker's own pin of this very wrapper, for this run, proves it is genuine.
+      let pins: string;
       try {
-        if (!this.boundaryProcesses.getStore()?.signal.aborted && !isCheckpointBoundaryFailure(error) &&
-            !(error instanceof CheckpointChildStartupTimeoutError) && !isAbortLike(error)) {
-          annotateRetainedSuccessorError(error, "wrapper_pin_read");
-        }
-      } catch { /* Diagnostics must not replace the original failure. */ }
-      throw error;
+        pins = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
+          `refs/uzi-coverage/${journal.runId}/`]);
+      } catch (error) {
+        try {
+          if (!this.boundaryProcesses.getStore()?.signal.aborted && !isCheckpointBoundaryFailure(error) &&
+              !(error instanceof CheckpointChildStartupTimeoutError) && !isAbortLike(error)) {
+            annotateRetainedSuccessorError(error, "wrapper_pin_read");
+          }
+        } catch { /* Diagnostics must not replace the original failure. */ }
+        throw error;
+      }
+      const pinned = pins.split("\n").some(line => {
+        const [ref, oid] = line.split(" ");
+        return oid === tip && ref !== undefined && ref.startsWith(`refs/uzi-coverage/${journal.runId}/`) && new RegExp(`^refs/uzi-coverage/[^/]+/[^/]+/${fp}$`).test(ref);
+      });
+      if (!pinned) return { verified: false, reason: "wrapper_pin" };
+      return { verified: true, srcTree };
+    })();
+    if (!provenance.verified) {
+      if (ordinary) return undefined;
+      return fail(provenance.reason);
     }
-    const pinned = pins.split("\n").some(line => {
-      const [ref, oid] = line.split(" ");
-      return oid === tip && ref !== undefined && new RegExp(`^refs/uzi-coverage/[^/]+/[^/]+/${fp}$`).test(ref);
-    });
-    if (!pinned) return fail("wrapper_pin");
+    const { srcTree } = provenance;
     // Leaves: the source, history of the source, or a marker this attempt's lineage proves superseded.
     const lineage = new Set(journal.peeledMarkers ?? []);
     const accepted: string[] = [];
@@ -9617,7 +9633,11 @@ export class GitCache {
           throw new Error("recovery handoff readback mismatch");
       }
       // issue #3194: hand the guard the content source this wrapper verifiably stands for.
-      return { ...seeded, attemptId, ...(recovery.restoreSource ? { adoptedContentSource: recovery.restoreSource } : {}) };
+      return { ...seeded, attemptId,
+        // Ordinary verified wrappers keep capture attribution while execution starts at the source.
+        ...(wrapped && !marker && !remediation && wrapped.peeledMarkers.length === 0 && wrapped.excludedRoots.length === 0
+          ? { adoptedSource: tip } : {}),
+        ...(recovery.restoreSource ? { adoptedContentSource: recovery.restoreSource } : {}) };
     });
   }
 
@@ -12125,7 +12145,8 @@ export class GitCache {
         await this.scratchPublicationPreflight(barePath, branch, wanted);
       }
       if (wanted === tipSha && chainFrom) {
-        const chain = await this.buildCheckpointChain(barePath, branch, tipSha, chainFrom, onStep);
+        const chain = await this.buildCheckpointChain(barePath, branch, tipSha, chainFrom, onStep,
+          options.markerTrustedTip, options.chainWorkflowSwap !== false);
         if (chain) {
           wanted = chain;
           onStep?.("scratch_preflight");
@@ -12178,7 +12199,8 @@ export class GitCache {
     // on workflows): chain the raw tip over the prior checkpoint tip when that is what keeps it a
     // strict descendant of the remote ref. The floor and the #1964 hold below judge the chain.
     if (wantRev === realTip && chainFrom) {
-      const chain = await this.buildCheckpointChain(barePath, branch, realTip, chainFrom, onStep);
+      const chain = await this.buildCheckpointChain(barePath, branch, realTip, chainFrom, onStep,
+        options.markerTrustedTip, options.chainWorkflowSwap !== false);
       if (chain) {
         wantRev = chain;
         onStep?.("scratch_preflight");
@@ -13093,9 +13115,21 @@ export class GitCache {
    *  - GATE 3 (as in the overlay): the branch must not itself modify a workflow file.
    *  - {@link verifyWrapperOnlyHistory}(P, realTip): everything P adds beyond realTip is a verified
    *    workflow-only wrapper, so the pack carries no new non-workflow content beyond realTip's own
-   *    history. That is not "nothing unscanned": P's workflow blobs come from the default branch,
+   *    history. That is not "nothing unscanned": P's workflow subtree comes from P itself (a
+   *    default-branch overlay, or the confirmed marker's own tree, which may include the WIP's
+   *    workflow edits; that subtree is already on the remote and the adoption peel discards it),
    *    and unenrolled park/shutdown sinks retain their unscanned-history residual. Enrolled
    *    sources additionally require the caller's fresh source/candidate/floor guards.
+   *  - issue #2753: `wip(park):` markers are accepted in P's exclusive history only when P is the
+   *    confirmed checkpoint tip (`markerTrustedTip`): its bytes are already on the remote checkpoint
+   *    ref, since park/pause sinks publish unscanned by design and the tick scan covers only
+   *    realTip^floors. So the pack carries no non-workflow content beyond realTip's history except
+   *    already-published marker trees. Each marker must have one parent that is a strict ancestor
+   *    of realTip (a park followed by a recommit whose parent is that ancestor, not the marker). An
+   *    attempted (unconfirmed) candidate never gets the marker leg. The marker stays reachable
+   *    through the chain's side parent P, so WIP omitted from N is not lost.
+   *  - `workflowSwap` false (non-GitHub forges): GATE 3 is skipped and the chain takes realTip's own
+   *    tree (workflowSource = realTip), so the chain tree equals N's tree.
    * When lastParent(P) === realTip nothing is new since P: P itself is returned (a re-declare).
    * The chain tree MAY equal realTip's tree (the branch caught up with main's workflows): it is
    * still emitted so the ref keeps advancing. The structural check is not provenance: ADR-1036's
@@ -13107,14 +13141,20 @@ export class GitCache {
     realTip: string,
     chainFrom: readonly (string | undefined)[],
     onStep?: (step: BoundaryStep) => void,
+    markerTrustedTip?: string,
+    workflowSwap = true,
   ): Promise<string | null> {
     if (!SHA40_RE.test(realTip)) return null;
     try {
       onStep?.("checkpoint_overlay");
       // GATE 3 is candidate-independent: the branch must not itself modify a workflow file.
-      const changed = await this.changedFiles(barePath, realTip);
-      if (changed === null) return null;
-      if (changed.some((file) => file.startsWith(".github/workflows/"))) return null;
+      // It guards the workflow-subtree swap only; a non-swapping chain (non-GitHub forge) takes
+      // realTip's own tree, so there is nothing to guard.
+      if (workflowSwap) {
+        const changed = await this.changedFiles(barePath, realTip);
+        if (changed === null) return null;
+        if (changed.some((file) => file.startsWith(".github/workflows/"))) return null;
+      }
       // First candidate that is not already contained in realTip AND verifies as a wrapper-only
       // history over it. A raw tip that shipped ambiguously (the attempted tip) becomes an ancestor
       // of the next raw tip, and chaining from it would be a no-op the broker refuses
@@ -13125,7 +13165,9 @@ export class GitCache {
         if (!cand || !SHA40_RE.test(cand) || cand === realTip) continue;
         if ((await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${cand}^{commit}`])) !== cand) continue;
         if (await this.isAncestor(barePath, cand, realTip)) continue;
-        if (!(await this.verifyWrapperOnlyHistory(barePath, cand, realTip))) continue;
+        // Park markers are tolerated only for the server-confirmed tip, never an attempted one.
+        if (!(await this.verifyWrapperOnlyHistory(barePath, cand, realTip, 0,
+          { allowParkMarkers: markerTrustedTip !== undefined && cand === markerTrustedTip }))) continue;
         prev = cand;
         break;
       }
@@ -13137,7 +13179,7 @@ export class GitCache {
       const chain = await this.synthesizeWorkflowWrapper(
         barePath,
         realTip,
-        prev,
+        workflowSwap ? prev : realTip,
         [prev, realTip],
         `${OVERLAY_COMMIT_PREFIX} chain .github/workflows from checkpoint ${prev.slice(0, 12)} (realTip ${realTip.slice(0, 12)})`,
         true,
@@ -13185,6 +13227,9 @@ export class GitCache {
     /** Extra wrappers allowed over the bound: the adoption peel verifies a chain commit that sits
      *  one above the MAX-wrapper history it was built over, so it passes 1. */
     headroom = 0,
+    /** issue #2753: opt-in. Also accept a `wip(park):` marker whose single parent is a strict
+     *  ancestor of `excludeTip` (the recommit that followed the park). Default: wrappers only. */
+    opts: { allowParkMarkers?: boolean } = {},
   ): Promise<boolean> {
     try {
       if (!SHA40_RE.test(tip) || !SHA40_RE.test(excludeTip)) return false;
@@ -13208,6 +13253,16 @@ export class GitCache {
         if (!SHA40_RE.test(oid)) return false;
         const parents = parentField === "" ? [] : parentField.split(" ");
         if (parents.some((p) => !SHA40_RE.test(p))) return false;
+        if (opts.allowParkMarkers === true && subject.startsWith(WIP_PARK_COMMIT_PREFIX)) {
+          // issue #2753: a park marker M (parent R) published to the checkpoint ref; the recommit
+          // N has parent R, not M. Accept M only as a one-parent commit whose parent is a strict
+          // ancestor of excludeTip (R !== N, R reachable from N).
+          if (parents.length !== 1) return false;
+          const markerParent = parents[0]!;
+          if (markerParent === excludeTip) return false;
+          if (!(await this.isAncestor(barePath, markerParent, excludeTip))) return false;
+          continue;
+        }
         if (!subject.startsWith(OVERLAY_COMMIT_PREFIX) || parents.length < 1) return false;
         // A missing last parent makes `diff-tree` below fail, which answers false.
         const last = parents[parents.length - 1]!;
@@ -18033,8 +18088,26 @@ try {
     const refStatus = await this.tryGitExit(barePath, ["show-ref", "--verify", "--quiet", ref]);
     if (refStatus === 1) return false; // Proven absence, not an unreadable ref or failed command.
     if (refStatus !== 0) return true;
-    const tip = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
+    let tip = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
     if (!tip) return true;
+    // issue #2753: a chain over a confirmed park marker (`ckpt(overlay):` C with parents [M, ...,
+    // L], L the real tip) is peeled to L when L is a park marker and C verifiably adds only
+    // workflow-subtree swaps / already-published markers over L. Anything unverifiable keeps the
+    // tip as is (the guard then blocks).
+    if (SHA40_RE.test(tip) && (await this.isOverlayMarker(barePath, tip))) {
+      const parents = (await this.tryGitStdout(barePath, ["rev-list", "--parents", "-n", "1", tip]))
+        .trim().split(/\s+/).filter(Boolean).slice(1);
+      const last = parents[parents.length - 1];
+      // A park marker has exactly one parent; a merge-shaped look-alike is not peeled.
+      const lastParents = last !== undefined && SHA40_RE.test(last)
+        ? (await this.tryGitStdout(barePath, ["rev-list", "--parents", "-n", "1", last])).trim().split(/\s+/).filter(Boolean).length - 1
+        : 0;
+      if (parents.length >= 2 && last !== undefined && SHA40_RE.test(last) && lastParents === 1 &&
+          (await this.isWipParkMarker(barePath, last)) &&
+          (await this.verifyWrapperOnlyHistory(barePath, tip, last, 1, { allowParkMarkers: true }))) {
+        tip = last;
+      }
+    }
     if (!(await this.isWipParkMarker(barePath, tip)))
       return !(await this.checkpointHasOnlyBoundaryTrees(barePath, branch, tip));
     // 3) The tip IS a `wip(park):` marker. The committed work (if any) is its parent and
@@ -21105,8 +21178,8 @@ try {
     });
   }
 
-  /** Coverage shape is not provenance. Only the resolver's bounded marker-free
-   * branch is pin-independent, so marker involvement must keep legacy wrapping. */
+  /** Coverage shape is not adoption provenance. This bounded marker-free reuse check remains
+   * pin-independent after cleanup; marker involvement must keep legacy wrapping. */
   private async reusableRecoveryCoverage(barePath: string, currentSha: string, tree: string): Promise<boolean> {
     const commit = await this.readBoundedCommit(barePath, currentSha, 64 * 1024);
     const identity = (kind: string) => `${kind} ${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;

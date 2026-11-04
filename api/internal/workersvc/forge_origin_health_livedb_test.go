@@ -64,7 +64,7 @@ func TestForgeOriginHealthAdmissionLiveDB(t *testing.T) {
 				t.Fatalf("cooled counts: %+v", counts)
 			}
 			reason := svc.queuedReasonWithEligibility(e.ctx, at, e.healthRowFor(t, id),
-				healthThresholds{custodyLimit: testCustodyLimit, custodyLimitOK: true}, false,
+				healthThresholds{custodyLimit: testCustodyLimit, custodyLimitOK: true},
 				&healthEligibilityResult{counts: counts})
 			if reason != reasonForgeOriginWait {
 				t.Fatalf("cooldown-only reason: %q", reason)

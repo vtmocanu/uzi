@@ -18,6 +18,45 @@ func queuedCustodyRun() store.ListActiveRunsForHealthRow {
 	return r
 }
 
+func TestHealthYoungQueuedCustody(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		disabled    bool
+		maintenance bool
+		exempt      bool
+		want        string
+	}{
+		{"capacity surfaces immediately", false, false, false, reasonCustodyLimit},
+		{"disabled stays quiet", true, false, false, ""},
+		{"maintenance outranks custody", false, true, false, ""},
+		{"continuation exempt", false, false, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := queuedCustodyRun()
+			r.StatusSince = ago(time.Second)
+			r.IntakePauseHeld = tc.maintenance
+			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, custodyHolds: int64(testCustodyLimit), custodyExempt: tc.exempt}
+			svc := healthSvc(fs, defaultHealthSettings())
+			th := thWithLimit(testCustodyLimit)
+			th.queued = 10 * time.Minute
+			if tc.disabled {
+				th.queued = 0
+			}
+			_, reason := svc.healthTargetFor(context.Background(), t0, r, th)
+			if reason != tc.want {
+				t.Fatalf("reason=%q want=%q", reason, tc.want)
+			}
+			wantReads := 1
+			if tc.disabled || tc.maintenance {
+				wantReads = 0
+			}
+			if len(fs.custodyCalls) != wantReads {
+				t.Fatalf("custody reads=%d want=%d", len(fs.custodyCalls), wantReads)
+			}
+		})
+	}
+}
+
 func TestHealthCustodyLimitComesFromSetting(t *testing.T) {
 	for _, tc := range []struct {
 		name        string

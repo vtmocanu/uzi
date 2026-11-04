@@ -564,7 +564,7 @@ func TestCheckpointCoordinatesReadoptionLiveDB(t *testing.T) {
 				}
 				count := 0
 				if frozen {
-					locks, lockErr := captureWorkerRecoveryLocks(env.ctx, q, f.workerID, []validatedEntry{{runID: run.ID}}, validatedFinalizeResume{})
+					locks, lockErr := captureWorkerRecoveryLocks(env.ctx, q, f.workerID, []validatedEntry{{runID: run.ID}})
 					if lockErr != nil {
 						t.Fatal(lockErr)
 					}

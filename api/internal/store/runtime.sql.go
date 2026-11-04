@@ -10865,6 +10865,42 @@ func (q *Queries) ListGaveUpColumnMoves(ctx context.Context, arg ListGaveUpColum
 	return items, nil
 }
 
+const listHealthCustodyCandidateOwners = `-- name: ListHealthCustodyCandidateOwners :many
+SELECT h.user_id
+FROM recovery_custody_holds h
+WHERE h.user_id = ANY($1::uuid[]) AND h.state = 'open'
+GROUP BY h.user_id
+HAVING count(*) >= $2::int AND $2::int > 0
+`
+
+type ListHealthCustodyCandidateOwnersParams struct {
+	OwnerIds         []uuid.UUID `json:"owner_ids"`
+	CustodyHoldLimit int32       `json:"custody_hold_limit"`
+}
+
+// Raw open holds bound the discounted admission count from above. This is only
+// a health-pass prefilter, never claim or reconciliation authority. Owners at the
+// bound still need the exact per-run admission and continuation-exemption read.
+func (q *Queries) ListHealthCustodyCandidateOwners(ctx context.Context, arg ListHealthCustodyCandidateOwnersParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listHealthCustodyCandidateOwners, arg.OwnerIds, arg.CustodyHoldLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var user_id uuid.UUID
+		if err := rows.Scan(&user_id); err != nil {
+			return nil, err
+		}
+		items = append(items, user_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listInputReceiptRows = `-- name: ListInputReceiptRows :many
 SELECT id, kind, body, created_at, consumed_at, consumed_claim_generation, consumed_worker_id, applied_at,
        disposition, gate_binding, gate_revision

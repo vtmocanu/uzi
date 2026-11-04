@@ -1131,6 +1131,37 @@ describe("GitCache.hasCommittedCheckpoint (#2967 floor-tree recovery coverage)",
     assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true);
   });
 
+  it("#2753 allows a chain C=[M, M2] of two marker-only parks over the floor, blocks C=[M, N] with real N", async () => {
+    const f = await coverageFixture();
+    const subject = `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved`;
+    const chainSubject = "ckpt(overlay): chain .github/workflows from checkpoint (test)";
+    // Parked WIP changes the tree, so a marker's tree is not the floor's tree.
+    const wipTree = gitIn(f.bare, ["mktree"]);
+    assert.notEqual(wipTree, f.tree);
+    const m = mkCommit(f.bare, wipTree, [f.floor], subject);
+    const m2 = mkCommit(f.bare, wipTree, [f.floor], `${subject} again`);
+    const c = mkCommit(f.bare, wipTree, [m, m2], chainSubject);
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, c]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), false,
+      "marker-only chain over the floor is not committed work");
+    const n = mkCommit(f.bare, wipTree, [f.floor], "real committed work");
+    const cn = mkCommit(f.bare, wipTree, [m, n], chainSubject);
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, cn]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true,
+      "a chain whose real tip is committed work still blocks");
+    // The peel's history check: a real side parent is committed work, so no peel.
+    const cx = mkCommit(f.bare, wipTree, [n, m2], chainSubject);
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, cx]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true,
+      "a chain with a real committed side parent still blocks");
+    // A merge-shaped look-alike marker as the peeled tip is not a park marker.
+    const forged = mkCommit(f.bare, wipTree, [f.floor, n], `${subject} forged`);
+    const cf = mkCommit(f.bare, wipTree, [m, forged], chainSubject);
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, cf]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true,
+      "a two-parent marker under a chain still blocks");
+  });
+
   it("#2967 still allows an absent checkpoint without a confirmed publication", async () => {
     const f = await coverageFixture();
     assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), false);

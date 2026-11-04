@@ -188,17 +188,16 @@ func TestDinDActualClientRefusalPreservesLegacy(t *testing.T) {
 			if err = m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 				t.Fatal(err)
 			}
-			deleted := 0
-			for _, a := range client.Actions() {
-				if a.GetVerb() == "delete" {
-					deleted++
-					if a.GetResource().Resource == "persistentvolumeclaims" && a.(k8stesting.DeleteAction).GetName() == dindDataPVCName(w.ID) {
-						t.Fatal("legacy destroyed DinD")
-					}
+			// #3852: a refused DinD request does not authorize a legacy recycle
+			// when only the daemon reported pressure.
+			deleted := deletedSet(client)
+			for _, name := range []string{"deployments/" + dep.Name,
+				"persistentvolumeclaims/" + nixPVCName(w.ID),
+				"persistentvolumeclaims/" + dataPVCName(w.ID),
+				"persistentvolumeclaims/" + dindDataPVCName(w.ID)} {
+				if deleted[name] {
+					t.Fatalf("refused DinD request deleted %s", name)
 				}
-			}
-			if deleted != 3 {
-				t.Fatalf("legacy boolean changed: %d deletions", deleted)
 			}
 		})
 	}

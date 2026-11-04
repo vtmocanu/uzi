@@ -267,7 +267,12 @@ Read the resulting assessment with these limits in mind:
 - **Time and causes:** intervals come from persisted-message timestamps,
   not measured execution time. Historical budgets and causes remain unknown
   when absent. A deadline-shaped interval is a hypothesis, not a confirmed
-  timeout.
+  timeout. An exact recorded Codex child-budget-expiry completion is labelled
+  a reported expiry, not a confirmed termination; its outcome stays failed and
+  its deadline unknown. The existing run-stopped, open-at-turn-end and
+  provider-stream-failure completions keep their recorded interruption causes;
+  other diagnostics, including `child_aborted:` and pre-start timeout text,
+  keep an unknown cause.
 - **Tool activity:** lead/child/unknown counts, including lead activity after
   the last observed dispatch, are signals, not effort percentages,
   productivity, source ownership or test-success evidence. There is no

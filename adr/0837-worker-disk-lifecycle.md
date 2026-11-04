@@ -9,7 +9,9 @@
 
 ## Decision (summary)
 
-A worker now reports its `/nix` and `/data` filesystem usage on the existing heartbeat (mirroring the PRD #49 CPU/memory plumbing), the web renders it as a Disk bar beside CPU/Memory, and the controller gained **two new drift arms** that both resolve to the same mechanism: delete the Deployment and the target PVC(s), then let the existing create-gate re-mint them at the current size. One arm fires when a worker's observed `/nix` PVC is smaller than the current `preset.nixSize` constant (the direct root-cause fix for the incident this PRD documents); the other fires when the api derives sustained disk pressure (>=90% used, debounced, fresh) and flags it on the controller poll wire. Both arms drain a busy worker first, exclude ephemeral (run-bound, PRD #529) workers, and share one `recycleWorkerVolumes` helper and an explicit multi-phase state machine that only recreates the Deployment once the target PVC is observed **live** at the desired size — never over a PVC still `Terminating`.
+A worker now reports its `/nix` and `/data` filesystem usage on the existing heartbeat (mirroring the PRD #49 CPU/memory plumbing), the web renders it as a Disk bar beside CPU/Memory, and the controller gained **two new drift arms** that both resolve to the same mechanism: delete the Deployment and the target PVC(s), then let the existing create-gate re-mint them at the current size. One arm fires when a worker's observed `/nix` PVC is smaller than the current `preset.nixSize` constant (the direct root-cause fix for the incident this PRD documents); the other fires for eligible sustained disk pressure (>=90% used, debounced, fresh) flagged by the api on the controller poll wire, subject to D9's Docker cause selection. Both arms drain a busy worker first, exclude ephemeral (run-bound, PRD #529) workers, and share one `recycleWorkerVolumes` helper and an explicit multi-phase state machine that only recreates the Deployment once the target PVC is observed **live** at the desired size — never over a PVC still `Terminating`.
+
+Since #3852, Docker-capable workers preserve `/data` during automatic pressure recycle regardless of runner layout or recovery custody. Explicit `nix` pressure permits Nix-only recycle; pressure without `nix` defers. Plain hosted workers retain the legacy nix/data policy (revisit #3710). D9 records the deployment boundary and capacity trade-off.
 
 ## Context
 
@@ -27,7 +29,7 @@ There is no autoscaler, no `WorkerSet`, no desired-replica owner in this system:
 
 ### D3 — The api derives `disk_pressure`; the controller only actuates
 
-The controller has minimal RBAC — no pod exec, no metrics-server access — and its only view of a worker is the poll response. So the disk signal has to ride the poll wire as a boolean, exactly like `busy` and `draining_since` already do. Putting the threshold (`UZI_DISK_PRESSURE_THRESHOLD`, default `0.90`) in the api, next to the `stats_disk_*` columns it derives from, keeps the comparison in one place and keeps the wire a single field (`DesiredWorker.DiskPressure`, deliberately **not** `omitempty` — it must serialize even `false`, so the golden `controller_poll_wire.json` proves the round-trip rather than the zero-value default). The controller's job stays pure lifecycle: it never computes a threshold, it only reacts to the flag.
+The controller has minimal RBAC — no pod exec, no metrics-server access — and its only view of a worker is the poll response. So the disk signal has to ride the poll wire as a boolean, exactly like `busy` and `draining_since` already do. Putting the threshold (`UZI_DISK_PRESSURE_THRESHOLD`, default `0.90`) in the api, next to the `stats_disk_*` columns it derives from, keeps the comparison in one place. The original wire used a single field (`DesiredWorker.DiskPressure`, deliberately **not** `omitempty` — it must serialize even `false`, so the golden `controller_poll_wire.json` proves the round-trip rather than the zero-value default). Current per-volume causes also travel in `DiskPressureVolumes`; D9 records the Docker Nix-only selection. The controller's job stays pure lifecycle: it never computes a threshold, it only reacts to the flag.
 
 ### D4 — The multi-phase recycle state machine, the Terminating-PVC observe fix, and the await-gone gate
 
@@ -44,7 +46,7 @@ The fix has two parts, both load-bearing:
 
 The reconcile loop is stateless, so rather than persist "last recycled", the pressure arm's thrash guard reads the target PVC's own `creationTimestamp` (the controller already lists PVCs) and skips a recycle within `UZI_WORKER_DISK_RECYCLE_COOLDOWN` (default `1h`) of it, emitting the fixed, test-asserted log token `disk-recycle-skipped-cooldown worker=<id>`. A worker back at pressure within the cooldown is not a bug to suppress quietly — it is a **capacity** signal: the worker's actual working set exceeds `nixSize`, and the fix is an operator raising the preset size, not another recycle.
 
-**Intended interaction worth naming explicitly**: after an M3 size-drift recycle re-mints `/nix` at the current `nixSize`, the fresh PVC's `creationTimestamp` puts the worker inside the M4 cooldown window, so a disk-pressure recycle on `/data` that would otherwise fire right afterward instead defers for the cooldown. This is intended, not a bug interaction to fix — a worker that was just intervened on is exactly the case the capacity signal is for, and deferring avoids stacking two teardowns back to back on the same worker.
+**Intended interaction worth naming explicitly**: after an M3 size-drift recycle re-mints `/nix` at the current `nixSize`, the fresh PVC's `creationTimestamp` puts the worker inside the M4 cooldown window, so an otherwise eligible pressure recycle right afterward instead defers for the cooldown. This still applies to plain nix/data and Docker Nix-only recycle; Docker data-only pressure defers independently of cooldown (#3852). This is intended, not a bug interaction to fix — a worker that was just intervened on is exactly the case the capacity signal is for, and deferring avoids stacking two teardowns back to back on the same worker.
 
 ### D6 — No auto-rollback on a stranded worker; this is detection, not prevention
 
@@ -54,7 +56,7 @@ The multi-phase machine deletes the old PVC **before** the new one is re-minted.
 
 ### D7 — Both recycle arms exclude ephemeral workers and share one helper
 
-`DesiredWorker.Ephemeral` (new wire field, both `controller/internal/protocol/protocol.go` and `api/internal/hostedsvc/protocol.go`) marks a run-bound throwaway worker (PRD #529): auto-provisioned for one run, torn down when it ends. Recycling one is pointless (it is about to be deleted anyway) and force-recycling it past the drain deadline would wipe its run's workspace mid-run. Both the size-drift arm and the pressure arm check `!Ephemeral` before recycling. They also call the same `recycleWorkerVolumes(worker, obs, ns, volumes)` helper and reuse the PRD #422 busy-guard/cordon/`DrainDeadline`/`ForceRoll` machinery verbatim for the drain-first step — deliberately one mechanism with a `{nix}` vs `{nix, data}` volume-set parameter, not two parallel implementations that could drift.
+`DesiredWorker.Ephemeral` (new wire field, both `controller/internal/protocol/protocol.go` and `api/internal/hostedsvc/protocol.go`) marks a run-bound throwaway worker (PRD #529): auto-provisioned for one run, torn down when it ends. Recycling one is pointless (it is about to be deleted anyway) and force-recycling it past the drain deadline would wipe its run's workspace mid-run. Both the size-drift arm and the pressure arm check `!Ephemeral` before recycling. They also call the same `recycleWorkerVolumes(worker, obs, ns, volumes)` helper and reuse the PRD #422 busy-guard/cordon/`DrainDeadline`/`ForceRoll` machinery verbatim for the drain-first step — one mechanism with a selected volume set. Size drift selects `{nix}`; pressure selects `{nix, data}` on plain workers and `{nix}` on Docker workers with explicit Nix pressure (#3852).
 
 ### D8 — The 90% actuation threshold and the 85% UI danger tone are intentionally different
 
@@ -63,6 +65,14 @@ The multi-phase machine deletes the old PVC **before** the new one is re-minted.
 ### D9 — Recycle defaults ON, over recorded reviewer dissent
 
 `UZI_WORKER_DISK_RECYCLE_ENABLED` defaults `true`, gating both drift arms with a single master toggle. **The risk/correctness and testability review waves unanimously recommended default-OFF, plus splitting observe (ship the `DiskPressure` wire flag) from actuate (the recycle arm) as separate rollout phases**, so pressure could be observed in production before any automated teardown was trusted against real hosted-worker data. The user chose default-ON with one toggle and no observe/actuate split, judging that self-healing the exact incident this PRD documents is the point, and that the guards already specified are sufficient. The dissent is recorded here deliberately rather than dropped. The mitigation is that every safety guard matters *more* precisely because the default is ON: freshness (only a fresh heartbeat can hold pressure true), a >=2-consecutive-heartbeat debounce (`stats_disk_pressure_streak`, so a single spike never fires it), reset-on-action (`RegisterWorker` zeroes the streak unconditionally on every fresh pod incarnation — a rolled/restarted worker cannot inherit a stale streak), the PVC-age cooldown (D5), drain-before-recycle (D7), and the ephemeral exclusion (D7) are all retained precisely because there is no staged rollout to fall back on.
+
+**Owner amendment 2026-11-03 (#3852):** the default remains `true`, but Docker `/data` is durable independently of custody or runner layout. `pressureRecycleEligible` in `controller/internal/kube/maintenance.go` is shared by pressure execution and `legacyRecycleDue`: enabled, non-ephemeral, non-custody Docker workers with `DiskPressure` need the exact `nix` entry in the latest `DiskPressureVolumes` to select Nix-only recycle. Data-only, data+DinD, DinD-only, nil/empty, unknown or stale migration/registration flags without `nix` select no legacy pressure volumes. `Reconcile` emits `disk-recycle-skipped-docker-data worker=<id>` before image admission, DinD handling or cooldown. `recycleWorkerVolumes` strips Docker Data before busy handling and returns if no volumes remain; ForceRoll and deadlines cannot override that floor. Nix size drift is independent and unchanged. Nix pressure can still interrupt a busy pod after the independent maintenance deadline; whether to change that is an unresolved owner question outside #3852.
+
+Deferral neither requests nor clears a drain. Existing `pressure_recycle` drains, including an old controller's drain or a mixed Nix/data Nix-recycle drain, persist while pressure remains: `releasePressureHold` requires `!DiskPressure`, and the server's pressure uncordon requires the pressure streak to drop. In `controller/internal/kube/roll_pacing.go`, `servingEligible`, `oldIncarnation`, `incarnationComplete` and `releaseRollHold` retain their pressure fences, so a data-full worker does not count as roll coverage.
+
+**Protection starts when the fixed controller is deployed.** An old controller can still delete Docker data; an API or worker upgrade alone does not supply this floor. A full Docker data PVC now degrades capacity instead of triggering automatic data loss. Reclaim relies on existing run park-and-trim and supported manual settled-tree cleanup (see [run recovery](../docs/run-recovery.md)); protected sources still require their supported custody procedure. [PRD #3431](../prds/3431-pod-epoch-reclaim.md) M1b settlement/deletion is not started, and #3329's later genuine-idle reclaim roll is deferred. This amendment grants no new reclaim authority.
+
+The toggle also gates DinD maintenance and pruning: disabling cancels requested/ready maintenance with `recycle_disabled`; a safe operation already stopping finishes. Changing the rendered Docker prune flag rolls non-ephemeral Docker worker pods. The historical default-ON dissent above remains recorded.
 
 ## Known gap
 
@@ -94,13 +104,15 @@ with no rollback. DinD cooldown reads its own PVC creation time.
 
 **Default-on upgrade warning:** the DinD PVC recycle loses containers,
 named/anonymous volumes, networks, images and build cache, and Deployment
-replacement no longer loses the run workdir (amended by ADR-3153: `/data/runner` is a data-PVC subPath; a data-PVC recycle still removes it). Nix/data PVCs, worker UUID and join
+replacement no longer loses the run workdir (amended by ADR-3153: `/data/runner` is a data-PVC subPath; ephemeral teardown or manual data-PVC deletion still removes it; #3852 excludes Docker data from automatic pressure recycle). Nix/data PVCs, worker UUID and join
 Secret survive. Deliverables use git/checkpoints/capture, with no
 preservation inventory or migration. Set
 `UZI_WORKER_DISK_RECYCLE_ENABLED=false` before stop to opt out; a started
-safe operation finishes even if disabled. Simultaneous pressure runs
-legacy first with pending DinD intent, then DinD on a later tick before
-another legacy recycle; legacy cooldown does not delay DinD. See
+safe operation finishes even if disabled. With simultaneous eligible Nix and DinD pressure,
+Nix-only recycle runs first with pending DinD intent, then DinD on a later tick
+before another legacy recycle. Data-only pressure yields to DinD maintenance;
+requested data+DinD maintenance advances instead of waiting for a forbidden data
+recycle. Legacy cooldown does not delay DinD. See
 [ADR-1759 D7-D9](1759-dind-data-metering-and-prune.md#d7--dind-is-scratch-readiness-is-terminal-only-not-executor-idle)
 for capability, ephemeral/compose, observation-limit and RBAC boundaries.
 Real-cluster validation is maintainer post-release work and has not run.
@@ -108,6 +120,6 @@ Real-cluster validation is maintainer post-release work and has not run.
 ## Consequences
 
 - Disk joins CPU/memory as a first-class worker metric. The gauges display usage; derived pressure also drives lifecycle maintenance and worker-local disk admission/reclaim. The legacy `disk_pressure` boolean is nix/data-only; separate DinD pressure and maintenance fences have the boundaries documented above.
-- A hosted worker's `/nix`/`/data` volumes are no longer a one-way ratchet toward full — both an undersized-PVC drift and a genuinely full volume now self-heal without an operator manually deleting and reprovisioning the worker.
+- Undersized Nix PVCs and eligible Nix pressure retain automatic recycle. Plain hosted pressure can still delete nix/data; Docker data pressure preserves the PVC and can leave capacity degraded until supported reclaim succeeds (D9).
 - The await-gone gate and the Terminating-PVC observe fix are the two properties that make any *future* delete-and-remint drift arm on this codebase safe; a new arm that skips either reintroduces the quota-churn and doomed-Deployment failure modes this ADR exists to avoid.
 - The default-ON decision (D9) means an operator who wants to observe before trusting automated teardown must explicitly set `UZI_WORKER_DISK_RECYCLE_ENABLED=false` rather than relying on a shipped-off default.

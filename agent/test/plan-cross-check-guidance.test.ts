@@ -77,6 +77,42 @@ for (const c of fixtures) test(`plan checker instructions decide ${c.name}: ${c.
   assert.match(trusted(revision), /Cross-check dispositions/);
 });
 
+// Checker-facing property clauses mirror TestLeadPlanCrashClaimGuidance; the final
+// cases pin the checker's defect-versus-coverage handling. Each clause and tool
+// family gets its own independently run case.
+const crashClaimClauses = [
+  ["claim_scope", "For every atomic, durable, or crash-recoverable claim, check that the plan states the exact property and failure model."],
+  ["atomic_readers", "Atomic means readers never observe partial state."],
+  ["process_crash", "Check that the plan states whether durability is across a process crash or across storage or power loss."],
+  ["crash_recovery", "Check that the plan specifies the state recovered after a crash."],
+  ["mechanism_and_ordering", "Check that the plan cites the file:line of each existing mechanism it relies on, specifies each new mechanism it introduces and how that will be verified, and states the required ordering for each claimed property and failure model."],
+  ["rename_not_durability", "An atomic rename provides atomic replacement, not storage durability."],
+  ["file_and_directory_sync", "For filesystem durability across storage or power loss, check that the plan requires syncing the file and the directory containing each new or renamed entry in the required order."],
+  ["database_commit", "For database durability, check that the plan identifies the transaction commit guarantees and configuration relied on."],
+  ["recovery_rediscovery", "For crash recovery, check that the plan explains recovery ordering and how recovery rediscovers the required state at each crash point."],
+  ["read_back_insufficient", "Read-back alone does not prove durability."],
+  ["process_test_not_storage_proof", "A process-crash test is not proof of storage-crash survival."],
+  ["check_supported_claim", "Check that the mechanism and inspectable evidence support the claimed property and failure model, or that the plan narrows the claim to what they support."],
+  ["missing_or_mismatching_support_revise", "Flag a missing property, failure model, mechanism or required ordering, or support that mismatches the claimed property or failure model, as a defect: error, REVISE."],
+  ["inaccessible_evidence_coverage", "Cited evidence that is inaccessible follows the existing coverage rules for unreadable or external sources; inaccessibility alone is not a defect."],
+] as const;
+for (const tools of ["Read and Search", "Read, Grep and Glob"]) {
+  for (const [name, phrase] of crashClaimClauses) {
+    test(`plan checker crash-claim guidance ${tools}: ${name}`, () => {
+      const brief = trusted(crossCheckBrief(tools));
+      const startBoundary = "missing docs/changelog, and overclaimed data integrity or security.";
+      const endBoundary = "Enumerate requirements and acceptance criteria from issue_title";
+      const start = brief.indexOf(startBoundary);
+      assert.ok(start >= 0, "crash-claim start boundary missing");
+      const end = brief.indexOf(endBoundary, start + startBoundary.length);
+      assert.ok(end > start + startBoundary.length, "crash-claim end boundary missing or out of order");
+      const region = brief.slice(start + startBoundary.length, end);
+      assert.ok(region.includes(phrase),
+        `trusted plan instruction missing: ${phrase}`);
+    });
+  }
+}
+
 const revisionRules: (keyof typeof rules)[] = [
   "effects", "rejectBypass", "scratch", "goChildren", "reliedEffects", "noNameProof", "sensitiveEffects",
   "coverageDisposition", "latestItems", "olderOptional", "declines", "unverified", "noPrecedence", "completePlan", "addressed", "heading",

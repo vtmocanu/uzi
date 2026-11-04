@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // maxCustodyHoldLimit is the explicit ceiling of custody_hold_limit. It fits SQL int4 by a
@@ -48,6 +50,24 @@ func (c *Cache) CustodyHoldLimit(ctx context.Context) (int32, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%w: %w", ErrCustodyHoldLimitUnavailable, err)
 	}
+	return c.custodyHoldLimitFromSnapshot(m)
+}
+
+// CustodyHoldLimitFromRows resolves authoritative transaction rows with the same
+// ENV > DB > default precedence as CustodyHoldLimit. The caller must read rows
+// after acquiring shared settings admission; this method never consults the cache.
+func (c *Cache) CustodyHoldLimitFromRows(rows []store.AppSetting) (int32, error) {
+	if c == nil {
+		return 0, fmt.Errorf("%w: no settings cache", ErrCustodyHoldLimitUnavailable)
+	}
+	m := make(map[string]string, len(rows))
+	for _, row := range rows {
+		m[row.Key] = row.Value
+	}
+	return c.custodyHoldLimitFromSnapshot(m)
+}
+
+func (c *Cache) custodyHoldLimitFromSnapshot(m map[string]string) (int32, error) {
 	v := strings.TrimSpace(c.effective(KeyCustodyHoldLimit, m))
 	if verr := validateCustodyHoldLimit(v); verr != nil {
 		return 0, fmt.Errorf("%w: stored value %s", ErrCustodyHoldLimitUnavailable, verr)

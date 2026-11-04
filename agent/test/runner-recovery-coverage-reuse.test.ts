@@ -9,6 +9,7 @@ import { after, afterEach, before, describe, test } from "node:test";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { GitCache, formatRetainedRecoveryDiagnostic, type PositiveOwedCandidateContext } from "../src/git.js";
 import { RunRunner } from "../src/runner.js";
+import type { RecoveryRecord } from "../src/recovery.js";
 import { StubExecutor } from "../src/executor.js";
 import { WorkerClient } from "../src/client.js";
 import { nullLogger, noProofReseed, makeClaim, testGitCacheOptions } from "./helpers.js";
@@ -28,6 +29,11 @@ function command(dir: string, ...args: string[]) {
 for (const legacy of [false, true]) describe(legacy ? "legacy ninth-wrapper owner Resume" : "repeated clean provider-outage recovery", { concurrency: false }, () => {
   let execute: () => Promise<any>, cleanup: () => Promise<void>, enableReuse: () => void;
   let claim: ReturnType<typeof makeClaim>, bare: string, physicalHead: string;
+  let assertPublished: () => void;
+  const captures: Array<Readonly<{ record: string; wrapper: string; current: string | undefined; roots: readonly string[] }>> = [];
+  const lifecycle: string[] = [];
+  let uploads = 0, preparations = 0, prepared = 0;
+  let observingRetained = false;
   let models = 0, healthy = false;
   let activeRunner: RunRunner | undefined, activeExecution: Promise<void> | undefined;
   const reports: any[] = [], diagnostics: any[] = [], captureSources: string[] = [];
@@ -89,22 +95,112 @@ for (const legacy of [false, true]) describe(legacy ? "legacy ninth-wrapper owne
     let oldProducer = legacy;
     git.buildRecoveryCoverage = (...args) => build(args[0], args[1], args[2], args[3], oldProducer ? {} : args[4]);
     enableReuse = () => { oldProducer = false; };
+    const freeze = coord.freezeInventory.bind(coord);
+    coord.freezeInventory = async (...args) => {
+      const record = await freeze(...args);
+      if (record && observingRetained) {
+        const roots = Object.freeze([...new Set([
+          ...record.originalRoots!.map(root => root.sha), record.originalSourceSha!,
+        ])].sort());
+        captures.push(Object.freeze({
+          record: JSON.stringify(record), wrapper: record.sourceSha, current: record.inventoryCurrentSha, roots,
+        }));
+        lifecycle.push("freeze");
+        assert.ok(roots.length > 0, "the actual frozen inventory has retained roots");
+        for (const root of roots) command(bare, "merge-base", "--is-ancestor", root, record.sourceSha);
+        if (!legacy) {
+          assert.equal(record.inventoryCurrentSha, originalHead);
+          assert.notEqual(record.sourceSha, originalHead, "the actual capture W is distinct from S");
+          assert.deepEqual(roots, captures[0]!.roots, "no-progress captures keep the same root set");
+        }
+      }
+      return record;
+    };
+    const capture = coord.captureAndUpload.bind(coord);
+    coord.captureAndUpload = async (...args) => {
+      if (!observingRetained) return capture(...args);
+      const frozen = captures.at(-1);
+      assert.ok(frozen);
+      const frozenRecord: RecoveryRecord = JSON.parse(frozen.record);
+      assert.deepEqual(args[0].record, frozenRecord, "upload receives the actual immutable freeze snapshot");
+      assert.equal(args[0].record.sourceSha, frozen.wrapper);
+      assert.equal(args[0].record.inventoryCurrentSha, frozen.current);
+      const before = archive.uploadCalls.length;
+      const outcome = await capture(...args);
+      const uploaded = archive.uploadCalls.length - before;
+      assert.equal(uploaded, 1, "each actual capture uploads one bundle");
+      assert.equal(outcome.state, "uploaded");
+      uploads += uploaded;
+      lifecycle.push("upload");
+      return outcome;
+    };
+    assertPublished = () => {
+      const published = command(fx.originPath, "rev-parse", `refs/heads/${clone.branch}`);
+      assert.notEqual(published, originalHead, "the ordinary finalizer publishes new real work");
+      assert.equal(command(fx.originPath, "show", `${published}:RETAINED.txt`), "work before outage");
+      assert.equal(command(fx.originPath, "show", `${published}:HEALTHY.txt`), "work after recovery");
+      command(fx.originPath, "merge-base", "--is-ancestor", originalHead, published);
+      if (!legacy) {
+        const ancestors = new Set(command(fx.originPath, "rev-list", published).split("\n"));
+        for (const { wrapper } of captures) assert.equal(ancestors.has(wrapper), false, "published ancestry excludes observed recovery envelopes");
+        assert.equal(command(fx.originPath, "log", "--format=%s", published).split("\n")
+          .some(subject => subject.startsWith("uzi recovery coverage ")), false);
+      }
+      // Publication can independently release owed pins; preservation is checked at preparation.
+      for (const { wrapper, roots } of captures) {
+        command(bare, "cat-file", "-e", `${wrapper}^{commit}`);
+        for (const root of roots) command(bare, "merge-base", "--is-ancestor", root, wrapper);
+      }
+    };
     const prepare = git.prepareRecoverySuccessor.bind(git);
     git.prepareRecoverySuccessor = async (...args) => {
-      try { return await prepare(...args); }
+      const refs = command(bare, "for-each-ref", "--format=%(refname) %(objectname)");
+      const candidates = structuredClone(await git.enumerateOwedCandidates(bare, claim.run_id));
+      const inventory = structuredClone(await coord.inspect(claim.run_id));
+      const sourceHead = command(args[3].clonePath, "rev-parse", "HEAD");
+      preparations++;
+      try {
+        const successor = await prepare(...args);
+        prepared++;
+        lifecycle.push("prepare");
+        if (!legacy) {
+          assert.equal(command(successor.path, "rev-parse", "HEAD"), originalHead);
+          assert.equal(command(successor.path, "write-tree"), tree);
+          assert.equal(command(successor.path, "status", "--porcelain"), "");
+          assert.equal(successor.adoptedContentSource, originalHead);
+          assert.equal(command(successor.path, "log", "--format=%s").split("\n")
+            .some(subject => subject.startsWith("uzi recovery coverage ")), false);
+        }
+        return successor;
+      }
       catch (error) { diagnostics.push(formatRetainedRecoveryDiagnostic(error, s => s)); throw error; }
+      finally {
+        assert.equal(command(bare, "for-each-ref", "--format=%(refname) %(objectname)"), refs, "preparation preserves every ref");
+        assert.deepEqual(await git.enumerateOwedCandidates(bare, claim.run_id), candidates, "preparation preserves owed candidates");
+        assert.deepEqual(await coord.inspect(claim.run_id), inventory, "preparation preserves archive custody");
+        assert.ok(fs.existsSync(args[3].clonePath), "the retained source path survives preparation");
+        assert.equal(command(args[3].clonePath, "rev-parse", "HEAD"), sourceHead);
+      }
     };
     const record = git.recordRecoveryCapture.bind(git);
     git.recordRecoveryCapture = async (...args) => {
       if (args[6]) captureSources.push(args[6]);
-      return record(...args);
+      const result = await record(...args);
+      lifecycle.push("record");
+      assert.equal(args[5], captures.at(-1)!.wrapper, "record the actual uploaded capture W");
+      assert.equal(args[6], captures.at(-1)!.current, "record its actual frozen current source");
+      if (!legacy) assert.equal(args[6], originalHead);
+      return result;
     };
     execute = async () => {
-      const before = models, offset = reports.length;
+      const before = models, offset = reports.length, eventOffset = lifecycle.length;
+      const capturesBefore = captures.length, uploadsBefore = uploads, preparationsBefore = preparations, preparedBefore = prepared;
+      observingRetained = true;
       api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation, true);
       const log = nullLogger();
       const runner = new RunRunner(client, git, runId => ({
         homeDir: path.join(home, runId), executor: { run: async ctx => {
+          observingRetained = false;
           models++;
           assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "RETAINED.txt"), "utf8"), "work before outage\n");
           command(ctx.worktreePath, "merge-base", "--is-ancestor", originalHead, "HEAD");
@@ -112,6 +208,7 @@ for (const legacy of [false, true]) describe(legacy ? "legacy ninth-wrapper owne
             assert.equal(command(ctx.worktreePath, "status", "--porcelain"), "", "no progress leaves no WIP to capture");
             throw new TransientRecoveryError("simulated provider outage", { providerOrigin: true });
           }
+          commitInTree(ctx.worktreePath, "HEALTHY.txt", "work after recovery\n");
           await ctx.onModelTurnSettled?.(1);
           return new StubExecutor(log).run(ctx);
         } },
@@ -131,7 +228,20 @@ for (const legacy of [false, true]) describe(legacy ? "legacy ninth-wrapper owne
         assert.equal(subjects.some(s => s.startsWith("wip(park):")), false);
         if (!legacy) assert.equal(subjects.filter(s => s.startsWith("uzi recovery coverage ")).length, 1);
       }
-      return { last, states, entries: models - before };
+      const events = lifecycle.slice(eventOffset);
+      const count = captures.length - capturesBefore;
+      assert.equal(uploads - uploadsBefore, count);
+      assert.equal(captureSources.length, captures.length);
+      assert.equal(preparations - preparationsBefore, count);
+      if (!legacy) {
+        assert.equal(prepared - preparedBefore, count);
+        assert.deepEqual(events, Array.from({ length: count }, () => ["freeze", "upload", "record", "prepare"]).flat());
+        if (last?.recovery_cause === "retained_recovery_exhausted") {
+          assert.equal(count, 0, "budget exhaustion alone does not count as another capture");
+          assert.equal(models, before);
+        }
+      }
+      return { last, states, entries: models - before, captures: count, uploads: uploads - uploadsBefore };
     };
   });
   afterEach(async () => {
@@ -145,7 +255,7 @@ for (const legacy of [false, true]) describe(legacy ? "legacy ninth-wrapper owne
     for (let generation = 1; generation <= 11; generation++) test(`generation ${generation} remains adoptable without progress`, async t => {
       claim.claim_generation = generation;
       const result = await execute();
-      t.diagnostic(JSON.stringify({ generation, models, cause: result.last?.recovery_cause }));
+      t.diagnostic(JSON.stringify({ generation, models, cause: result.last?.recovery_cause, captures: result.captures, uploads: result.uploads }));
       assert.equal(result.last?.status, "recovery_wait");
       assert.notEqual(result.last?.recovery_cause, "retained_recovery_adoption_failed");
       if (result.last?.recovery_cause === "retained_recovery_exhausted") claim.worker_recovery_episode!++;
@@ -163,6 +273,8 @@ for (const legacy of [false, true]) describe(legacy ? "legacy ninth-wrapper owne
       assert.equal(result.last?.status, "completed", JSON.stringify(reports));
       assert.equal(reports.some(r => r.status === "failed"), false);
       assert.deepEqual(diagnostics, []);
+      assertPublished();
+      assert.ok(captures.length >= 9, "the bounded proof observes actual repeated captures");
     });
   } else {
     test("genuine old production aggregates establish the ninth-wrapper adoption hold", async () => {
@@ -183,6 +295,9 @@ for (const legacy of [false, true]) describe(legacy ? "legacy ninth-wrapper owne
       const owner = JSON.parse(command(bare, "config", `uzi-recoveryowner.${claim.run_id}.record`));
       assert.equal(owner.consumed, 1);
       assert.equal(diagnostics.length, 1, "the fixed Resume adds no verifier refusal");
+      assert.equal(preparations, 2);
+      assert.equal(prepared, 1);
+      assertPublished();
     });
   }
 });

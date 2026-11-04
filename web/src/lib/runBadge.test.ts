@@ -1583,7 +1583,7 @@ describe("Codex admission read-time projection", () => {
   it.each([
     "handoff setup has not finished",
     "your vault is locked, so this run can't start",
-    "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs",
+    "recovery custody capacity is full; retained holds still protect your work; resolve or discard a retained hold to free capacity",
     "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings",
   ])("preserves the higher-priority queued blocker %s", (reason) => {
     const text = codexAdmissionText(held, NOW);

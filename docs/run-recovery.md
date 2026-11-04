@@ -2207,7 +2207,7 @@ unknown measurement does not mean zero.
 | Disposition | Meaning and next step |
 |---|---|
 | `owner_hold_discard <hold-id>` | A server hold still owns the source. Use `uzi run discard <run-id> --hold <hold-id> --yes`. |
-| `resolve_local_record` | A local recovery, settlement or terminal record still holds the source. Resolve it through its existing path; this command adds no new resolution. |
+| `resolve_local_record` | A local recovery, settlement or terminal record still protects the source. Guarded recovery records with closed server holds remain blocked, with no supported resolver yet ([follow-up #3885](https://github.com/vtmocanu/uzi/issues/3885)). Owner handling is required; an empty open-hold list does not make deletion safe. |
 | `local_discard` / `local_protected_discard` | Nothing else holds the source; it may be discarded with the command below (protected for episode or protected sources). |
 | `refused` | Named consumers still use the source. The output lists them. |
 
@@ -2226,7 +2226,8 @@ aggregate inspect reads no lifecycle and shows `run_state:not_read`, with no blo
 The disposition follows what the worker can see:
 
 - An open server hold gives `owner_hold_discard` (the refusal for an actively parked
-  run), a local record gives `resolve_local_record`, and a live flight refuses.
+  run), a local record gives `resolve_local_record` and keeps the source blocked,
+  and a live flight refuses.
 - A status the probe cannot establish (a 404, an error, a timeout or a malformed body)
   refuses with the blocker `run_state_unknown`; any other status refuses with
   `run_state_not_terminal`. Nothing is deleted.
@@ -2239,7 +2240,8 @@ requeue after a released claim, or a claim elsewhere) it reads 404, so the lefto
 refused. It stays kept, its bytes retained. An open hold of this worker on the run
 gives `owner_hold_discard` (the owner's server-side hold discard) even when the
 lifecycle read is unknown, and a cross-worker predecessor's hold can stay open; a local
-record gives `resolve_local_record`. With neither, the lifecycle read decides. Its only
+record gives `resolve_local_record` and keeps the source blocked. With neither, the
+lifecycle read decides. Its only
 automatic reclaim is a later run of that branch's terminal-orphan handling on this
 worker, which moves the clone to `<dataDir>/runner-quarantine/` (retained, never deleted
 automatically; automatic retention deletion is disabled) and frees

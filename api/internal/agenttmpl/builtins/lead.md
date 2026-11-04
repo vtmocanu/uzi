@@ -103,7 +103,21 @@ every reader, writer and surface of that data listed with its handling. A reused
 symbol needs its callers, guards and import constraints read. A claim that a test or
 CI lane will prove something needs that lane's trigger. Cite the evidence or narrow
 the claim, and treat work an in-flight PRD or branch owns as someone else's until
-you have checked it.
+you have checked it. For every atomic, durable, or crash-recoverable claim, state the
+exact property and failure model. Atomic means readers never observe partial state.
+State whether durability is across a process crash or across storage or power loss.
+Specify the state recovered after a crash. Cite the file:line of each existing
+mechanism you rely on, specify each new mechanism you introduce and how it will be
+verified, and state the required ordering for each claimed property and failure
+model. An atomic
+rename provides atomic replacement, not storage durability. For filesystem
+durability across storage or power loss, sync the file and the directory containing
+each new or renamed entry in the required order. For database durability, identify
+the transaction commit guarantees and configuration relied on. For crash recovery, explain recovery
+ordering and how recovery rediscovers the required state at each crash point.
+Read-back alone does not prove durability. A process-crash test is not proof of
+storage-crash survival. If the mechanism or evidence does not support the
+claimed failure model, narrow the claim.
 
 Dispatch independent subagents in parallel in a single turn:
 

@@ -3023,6 +3023,256 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
   });
 });
 
+// issue #2753: a park publishes a `wip(park):` marker M (parent R) to the checkpoint ref. The resume
+// adopts M, restores its work UNCOMMITTED and soft-resets to R, so the agent's recommit N has parent R,
+// not M, and a raw N was refused `not_descendant` forever. A confirmed marker is now chained over:
+// C = [M, N]. Every publish below goes through the broker-ancestry fake (brokerPublish).
+describe("issue #2753 checkpoints advance after a marker-restored resume", () => {
+  const workflow = ".github/workflows/ci.yml";
+  const progress = { completed: ["m1"], in_progress: [] };
+  const MARKER_SUBJECT = "wip(park): interrupted work auto-saved (test)";
+  const parentsIn = (dir: string, sha: string): string[] =>
+    gitIn(dir, ["rev-list", "--parents", "-n", "1", sha]).split(" ").slice(1);
+  type Forge = "gitlab" | "github";
+  const claimFor = (forge: Forge, iid: number, overrides: Record<string, unknown> = {}) => {
+    const claim = gitlabClaim(iid, overrides);
+    if (forge === "github") claim.repo = { ...claim.repo!, url: "https://github.com/org/repo", forge_type: "github" };
+    return claim;
+  };
+  /** True when `ancestor` is reachable from `descendant`, proven non-vacuous: both objects exist in `dir`. */
+  const reaches = (dir: string, ancestor: string, descendant: string): boolean => {
+    gitIn(dir, ["cat-file", "-e", `${ancestor}^{commit}`]);
+    gitIn(dir, ["cat-file", "-e", `${descendant}^{commit}`]);
+    return isAncestorIn(dir, ancestor, descendant);
+  };
+
+  interface Seed { r: string; m: string; o?: string; tip: string; ref: string; tmp: string }
+
+  /** Origin's main tip is R. A scratch clone commits the parked work (wip.txt) as a `wip(park):` marker
+   *  M with parent R and publishes it to the origin's checkpoint ref. With `overlay`, origin main then
+   *  advances its workflow file and a `ckpt(overlay):` O (parent M, workflows-only diff vs M) is
+   *  published instead, as a park on a branch behind main on workflows does. */
+  function seedMarker(iid: number, overlay: boolean): Seed {
+    const ref = `refs/uzi-checkpoints/agent/issue-${iid}`;
+    const tmp = scratchDir("2753");
+    const clone = path.join(tmp, "seed");
+    execFileSync("git", ["clone", "-q", fx.originPath, clone], { env: GIT_ENV });
+    const r = gitIn(clone, ["rev-parse", "HEAD"]);
+    fs.writeFileSync(path.join(clone, "wip.txt"), "parked work\n");
+    gitIn(clone, ["add", "-A"]);
+    gitIn(clone, [...IDENT, "commit", "-m", MARKER_SUBJECT]);
+    const m = gitIn(clone, ["rev-parse", "HEAD"]);
+    let tip = m;
+    let o: string | undefined;
+    if (overlay) {
+      commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid}\n`);
+      gitIn(clone, ["fetch", "-q", "origin", "main"]);
+      gitIn(clone, ["checkout", "-q", "FETCH_HEAD", "--", ".github/workflows"]);
+      gitIn(clone, [...IDENT, "commit", "-m", "ckpt(overlay): swap workflows to the default (test)"]);
+      o = gitIn(clone, ["rev-parse", "HEAD"]);
+      tip = o;
+      assert.deepEqual(gitIn(clone, ["diff", "--name-only", m, o]).split("\n"), [workflow], "scene: workflows-only diff vs M");
+      assert.equal(parentsIn(clone, o).at(-1), m, "scene: O's last parent is M");
+    }
+    gitIn(clone, ["push", "-q", "origin", `${tip}:${ref}`]);
+    assert.equal(refOr(fx.originPath, ref), tip, "scene: the checkpoint ref holds the confirmed tip");
+    return { r, m, ...(o ? { o } : {}), tip, ref, tmp };
+  }
+
+  const resumed = (forge: Forge, iid: number, tip: string) =>
+    claimFor(forge, iid, { run_id: `27530000-0000-4000-8000-${String(iid).padStart(12, "0")}`, session_id: "sess-a", checkpoint_tip: tip });
+
+  /** In-turn proof that the resume restored M's work uncommitted on HEAD == R. */
+  function assertRestored(ctx: RunContext, g: GitCache, seed: Seed): void {
+    assert.equal(gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]), seed.r, "HEAD is R, the marker's parent");
+    assert.match(gitIn(ctx.worktreePath, ["status", "--porcelain"]), /wip\.txt/, "M's work is uncommitted");
+    assert.equal(reaches(g.barePathFor(fx.originPath), seed.m, gitIn(ctx.worktreePath, ["rev-parse", "HEAD"])), false,
+      "M is not an ancestor of the worktree HEAD");
+  }
+
+  for (const forge of ["gitlab", "github"] as const) {
+    for (const boundary of ["tick", "iteration"] as const) {
+      for (const shape of forge === "github" ? ["marker", "overlay"] as const : ["marker"] as const) {
+        it(`${forge}/${boundary}: a recommit after a marker-restored resume (${shape} tip) advances the ref over [tip, N]`, async () => {
+          const iid = 2753_100 + (forge === "github" ? 20 : 0) + (boundary === "tick" ? 0 : 10) + (shape === "overlay" ? 5 : 0);
+          commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+          const seed = seedMarker(iid, shape === "overlay");
+          const g = mkGit(fx.dataDir);
+          const ctl = control();
+          const { github } = fakeGitHub();
+          const broker = brokerPublish(fx.originPath, seed.ref, undefined, () => seed.tip);
+          const pub = stubPublish(broker.impl);
+          try {
+            await mkRunner(g, turn(async (ctx) => {
+              assertRestored(ctx, g, seed);
+              const n = commitIn(ctx.worktreePath, "n.txt", "recommitted work\n");
+              ctl.advance(INTERVAL_MS + 1);
+              if (boundary === "tick") assert.equal(await ctl.fire(), "published", "the tick publish must land");
+              else await ctx.checkpoint!({ reap: false, progress });
+              assert.equal(pub.count(), 1, "exactly one publish request");
+              const chain = pub.tips[0]!;
+              assert.deepEqual(parentsIn(fx.originPath, chain), [seed.tip, n], "chain parents are [confirmed tip, N]");
+              assert.equal(refOr(fx.originPath, seed.ref), chain, "the ref advanced to the chain");
+              const body = (broker.answers[0]!.answer as { body?: { published?: boolean; skipped?: string } }).body;
+              assert.deepEqual([body?.published, body?.skipped], [true, undefined], "published, not not_descendant");
+              assert.equal(reaches(fx.originPath, seed.m, chain), true, "the parked work stays reachable through the chain");
+              const head = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
+              assert.equal(head, n, "the agent's branch HEAD is N");
+              assert.equal(reaches(g.barePathFor(fx.originPath), seed.m, head), false, "M is still not an ancestor of HEAD");
+            }), ctl, { github }).execute(resumed(forge, iid, seed.tip));
+            if (turnErrors.length > 0) throw turnErrors[0];
+          } finally {
+            pub.restore();
+            fs.rmSync(seed.tmp, { recursive: true, force: true });
+          }
+        });
+      }
+    }
+  }
+
+  // Control: nothing was recommitted (HEAD == R), so there is no new work to publish; the ref must
+  // stay at M and the restored files stay uncommitted. Holds before and after the fix.
+  it("no recommit: a tick with HEAD == R does not advance the ref and leaves the restored work uncommitted", async () => {
+    const iid = 2753_190;
+    const seed = seedMarker(iid, false);
+    const g = mkGit(fx.dataDir);
+    const ctl = control();
+    const broker = brokerPublish(fx.originPath, seed.ref, undefined, () => seed.tip);
+    const pub = stubPublish(broker.impl);
+    try {
+      await mkRunner(g, turn(async (ctx) => {
+        assertRestored(ctx, g, seed);
+        ctl.advance(INTERVAL_MS + 1);
+        await ctl.fire();
+        assert.equal(refOr(fx.originPath, seed.ref), seed.m, "the ref stays at M");
+        assert.equal(broker.answers.filter((a) => (a.answer as { body?: { published?: boolean } }).body?.published === true).length, 0,
+          "no publish landed");
+        assertRestored(ctx, g, seed);
+      }), ctl).execute(resumed("gitlab", iid, seed.tip));
+      if (turnErrors.length > 0) throw turnErrors[0];
+    } finally {
+      pub.restore();
+      fs.rmSync(seed.tmp, { recursive: true, force: true });
+    }
+  });
+
+  // Unlanded marker: the ref sits at the confirmed M; the agent's own (locally created) marker commit
+  // Mx ships on a tick and its ACK is dropped (never indexed by the broker), so the attempted tip is
+  // the unlanded chain over M and Mx, while confirmed stays M. Approach: a hand-made `wip(park):`
+  // commit on the run branch published by the real tick path (the real owner pause sink is driven by
+  // the test after this loop). The next publish after Mx is undone must chain over M, never the
+  // unlanded tip.
+  for (const forge of ["gitlab", "github"] as const) {
+    it(`${forge}: a chain after a dropped-ACK unlanded marker is based on the confirmed M and never ships its blob`, async () => {
+      const iid = 2753_200 + (forge === "github" ? 10 : 0);
+      commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+      const seed = seedMarker(iid, false);
+      const g = mkGit(fx.dataDir);
+      const ctl = control();
+      const { github } = fakeGitHub();
+      const broker = brokerPublish(fx.originPath, seed.ref, (call) => (call <= 2 ? "dropped" : undefined), () => seed.tip);
+      const pub = stubPublish(broker.impl);
+      try {
+        await mkRunner(g, turn(async (ctx) => {
+          assertRestored(ctx, g, seed);
+          const w = ctx.worktreePath;
+          const unlanded = `unlanded unique work ${iid}\n`;
+          fs.writeFileSync(path.join(w, "unlanded.txt"), unlanded);
+          const blob = gitIn(w, ["hash-object", "unlanded.txt"]);
+          gitIn(w, ["add", "-A"]);
+          gitIn(w, [...IDENT, "commit", "-m", MARKER_SUBJECT]);
+          ctl.advance(INTERVAL_MS + 1);
+          assert.notEqual(await ctl.fire(), "published", "the marker's ACK is dropped");
+          assert.equal(pub.count(), 3, "three dropped requests");
+          assert.equal(refOr(fx.originPath, seed.ref), seed.m, "the ref is still the confirmed M");
+          const unlandedTip = pub.tips[0]!;
+          // Undo the marker (as a resume does) and recommit without the unlanded file.
+          gitIn(w, ["reset", "-q", "--soft", seed.r]);
+          gitIn(w, ["rm", "-q", "-f", "--cached", "unlanded.txt"]);
+          fs.rmSync(path.join(w, "unlanded.txt"));
+          const n2 = commitIn(w, "n2.txt", "second recommit\n");
+          ctl.advance(INTERVAL_MS + 1);
+          assert.equal(await ctl.fire(), "published", "the next tick lands");
+          assert.equal(pub.count(), 4);
+          const chain = pub.tips[3]!;
+          assert.notEqual(chain, unlandedTip);
+          assert.deepEqual(parentsIn(fx.originPath, chain), [seed.m, n2], "first parent is the confirmed M, never the unlanded tip");
+          assert.equal(refOr(fx.originPath, seed.ref), chain);
+          assert.throws(() => gitIn(fx.originPath, ["cat-file", "-e", blob]), "the unlanded marker's blob is not in the origin");
+          assert.throws(() => gitIn(fx.originPath, ["cat-file", "-e", `${unlandedTip}^{commit}`]), "the unlanded tip is not in the origin");
+        }), ctl, { github }).execute(resumed(forge, iid, seed.tip));
+        if (turnErrors.length > 0) throw turnErrors[0];
+      } finally {
+        pub.restore();
+        fs.rmSync(seed.tmp, { recursive: true, force: true });
+      }
+    });
+  }
+
+  // The REAL owner pause sink: the ref sits at the confirmed M, the work is restored uncommitted, the
+  // agent holds a uniquely-content file, and an owner `pause --now` (ctx.parkForPause) builds a new
+  // pause marker whose publish the broker DROPS (HTTP 500, nothing lands). The run reports
+  // pause_failed and keeps running; a later TICK (fake clock) after the agent commits N2 must chain
+  // over the confirmed M and never ship the unlanded pause marker's blob.
+  for (const forge of ["gitlab", "github"] as const) {
+    it(`${forge}: a dropped-ACK pause marker followed by a tick chains over the confirmed M and never ships the marker blob`, async () => {
+      const iid = 2753_400 + (forge === "github" ? 10 : 0);
+      commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+      const seed = seedMarker(iid, false);
+      const g = mkGit(fx.dataDir);
+      const ctl = control();
+      const { github } = fakeGitHub();
+      let dropping = false;
+      const broker = brokerPublish(fx.originPath, seed.ref, () => (dropping ? "dropped" : undefined), () => seed.tip);
+      const pub = stubPublish(broker.impl);
+      const claim = resumed(forge, iid, seed.tip);
+      try {
+        await mkRunner(g, turn(async (ctx) => {
+          assertRestored(ctx, g, seed);
+          const w = ctx.worktreePath;
+          fs.writeFileSync(path.join(w, "pause-unique.txt"), `pause marker unique work ${iid}\n`);
+          const blob = gitIn(w, ["hash-object", "pause-unique.txt"]);
+          dropping = true;
+          const parked = await ctx.parkForPause!({ completedCount: 1, total: 2 });
+          dropping = false;
+          assert.equal(parked, false, "the dropped pause publish does not park: the run keeps running");
+          const droppedCalls = pub.count();
+          assert.ok(droppedCalls >= 1, "the pause marker was offered to the broker");
+          assert.equal(broker.answers.every((a) => (a.answer as { ok?: boolean }).ok === false), true, "every pause request was dropped");
+          assert.equal(refOr(fx.originPath, seed.ref), seed.m, "the ref is still the confirmed M");
+          const pauseTips = pub.tips.slice();
+          assert.throws(() => gitIn(fx.originPath, ["cat-file", "-e", blob]), "the pause marker blob is not in the origin yet");
+
+          // The agent keeps working: commit N2 (without the pause-only file) and let a tick fire.
+          // (commitIn stages everything, so drop the pause-only file first: N2 must not carry its blob.)
+          fs.rmSync(path.join(w, "pause-unique.txt"));
+          const n2 = commitIn(w, "n2.txt", "work after the failed pause\n");
+          ctl.advance(INTERVAL_MS + 1);
+          assert.equal(await ctl.fire(), "published", "the tick publish lands");
+          assert.equal(pub.count(), droppedCalls + 1, "exactly one more request: the tick's");
+          const chain = pub.tips.at(-1)!;
+          assert.equal(pauseTips.includes(chain), false, "the tick chain is not the unlanded pause chain");
+          assert.deepEqual(parentsIn(fx.originPath, chain), [seed.m, n2], "first parent is the confirmed M, never the unlanded pause marker");
+          assert.equal(refOr(fx.originPath, seed.ref), chain, "the ref advanced to the chain");
+          const body = (broker.answers.at(-1)!.answer as { body?: { published?: boolean; skipped?: string } }).body;
+          assert.deepEqual([body?.published, body?.skipped], [true, undefined], "the broker answered published");
+          assert.throws(() => gitIn(fx.originPath, ["cat-file", "-e", blob]), "the pause marker's unique blob never reached the origin");
+          for (const t of pauseTips) {
+            assert.throws(() => gitIn(fx.originPath, ["cat-file", "-e", `${t}^{commit}`]), "no unlanded pause commit reached the origin");
+          }
+        }), ctl, { github }).execute(claim);
+        if (turnErrors.length > 0) throw turnErrors[0];
+        const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+        assert.ok(statuses.includes("pause_failed"), `pause_failed reported, got ${JSON.stringify(statuses)}`);
+        assert.ok(!statuses.includes("paused"), `never paused, got ${JSON.stringify(statuses)}`);
+      } finally {
+        pub.restore();
+        fs.rmSync(seed.tmp, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 describe("mid-turn checkpoint round 3 (issue #1597 M2)", () => {
   it("(r3 5) commits gitleaks does not count (pure mv, --allow-empty, chmod, binary-only, empty file, whole-file delete) do not wedge the scan", async (t) => {
     await eachScanner(t, async (bin, label) => {

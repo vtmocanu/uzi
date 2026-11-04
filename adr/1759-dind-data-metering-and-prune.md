@@ -108,8 +108,14 @@ readiness **before** completing the operation and opening the fence.
 Failed binding stays fenced with no rollback.
 
 Cooldown reads the DinD PVC's own creation timestamp. With simultaneous
-legacy and DinD pressure, persist DinD intent, run legacy recycling first,
-then continue DinD on a later tick before another legacy recycle. The
+legacy and DinD pressure, persist DinD intent and run any permitted legacy
+recycle first, then continue DinD on a later tick before another legacy recycle.
+**Amendment 2026-11-03 (#3852):** after the fixed controller deploys, Docker
+legacy pressure recycling requires an explicit `nix` cause and recycles nix only.
+Data-only or missing/non-nix causes defer before cooldown without adding or
+clearing a drain, so a requested DinD operation can proceed. Docker data is
+protected independently of custody and layout; plain hosted behavior remains
+unchanged pending #3710. The
 legacy cooldown allows immediate eligible DinD maintenance. Disabling
 `UZI_WORKER_DISK_RECYCLE_ENABLED` opts out before stop; a started stop/rebuild
 finishes safely even if disabled. See

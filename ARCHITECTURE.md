@@ -1372,7 +1372,7 @@ chain in the diagram above, with no intervening `running`.
   default, so the [pushbroker](adr/0122-checkpoint-push-broker.md) pushes it as a
   fast-forward and adoption peels it back to the real tip. Tick and iteration
   checkpoints chain over a prior overlay (when its history verifies as
-  bounded, wrapper-only) rather than being refused `not_descendant` (#2733). GitHub-only. See
+  bounded, wrapper-only) rather than being refused `not_descendant` (#2733). Chaining runs on every forge and also tolerates a server-confirmed restored `wip(park):` marker (#2753); overlays stay GitHub-only. See
   [ADR-1036](adr/1036-checkpoint-workflow-overlay.md).
 
 - **queued → claimed**: `POST /api/worker/runs/claim` atomically claims an eligible
@@ -2868,10 +2868,14 @@ The controller observes the old Deployment and pods gone before deleting only
 DinD is scratch, including named volumes; this DinD maintenance recycle loses
 DinD state only. Since #3153 the run working directory `/data/runner` is the
 `runner-shared` subPath of the `data` PVC, so a replacement keeps it, while a
-legacy `{nix, data}` recycle deletes it (and any Docker-lane clones) as on the
-plain lane. DinD never uses ForceRoll or the drain deadline. Simultaneous pressure
-runs legacy first, DinD on a later tick; legacy busy deadlines now apply only to
-independent nondrifted maintenance, while global ForceRoll retains custody guards.
+data-PVC deletion still removes it. After the fixed #3852 controller deploys,
+Docker pressure recycling preserves `/data` independently of custody and layout:
+only an explicit `nix` cause permits Nix-only recycle. Other causes defer with
+`disk-recycle-skipped-docker-data`; plain hosted workers retain legacy nix/data
+recycling pending #3710. DinD never uses ForceRoll or the drain deadline. With
+simultaneous pressure, permitted nix recycling runs first; Docker data deferral
+lets DinD maintenance proceed. Independent nondrifted nix maintenance retains
+its busy deadline and ForceRoll behavior; Docker data remains protected.
 A custody-held Docker worker whose pod still has the old layout (an emptyDir at
 `/data/runner`) is held on it, ForceRoll included, until custody releases. Persistent drifted workers
 may receive a migration drain after ordinary admission planning, using the

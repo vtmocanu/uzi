@@ -750,7 +750,7 @@ Limitations: lineage does not survive a retired clone (an earlier marker still o
 
 ## Amendment 2026-10-29: reuse covered marker-free recovery sources
 
-Repeated provider retries without model progress must not nest another recovery wrapper merely because a clean successor adopted the preceding aggregate as its HEAD. New guarded inventories may reuse that current aggregate when its bounded commit shape and worker identity match and every original root is positively ancestral to it. The shared bounded wrapper walk must establish the exact marker-free case in which successor adoption does not consult provenance pins. A coverage-looking header is shape, not provenance; marker involvement, divergent roots or unproven eligibility never gain reuse authority. This reuse amendment leaves the original successor verifier, including its eight-aggregate bound, unchanged. The separate [2026-11-02 source-selection amendment](#amendment-2026-11-02--durable-remediation-source-selection) permits proven divergent adoption; it does not widen marker-free reuse.
+Repeated provider retries without model progress must not nest another recovery wrapper merely because a successor retained the preceding aggregate as its physical HEAD. New guarded inventories may reuse that current aggregate when its bounded commit shape and worker identity match and every original root is positively ancestral to it. This bounded marker-free reuse proof does not consult provenance pins; it supplies no successor source-selection authority. A coverage-looking header is shape, not provenance; marker involvement, divergent roots or unproven eligibility never gain reuse authority. The [2026-11-03 amendment](#amendment-2026-11-03--ordinary-marker-free-source-selection-3781) separately requires authenticated provenance to select the journaled content source for execution, retaining the eight-aggregate bound. The [2026-11-02 source-selection amendment](#amendment-2026-11-02--durable-remediation-source-selection) permits proven divergent adoption; it does not widen marker-free reuse.
 
 Reuse preserves the current tree and all frozen roots, recomputes the inventory fingerprint, and writes a separate ref in the existing run/generation/fingerprint namespace. It does not share ref ownership across generations or release any source, archive or custody. Eligibility depends on immutable objects and ancestry, not on whether an earlier generation's coverage pin survives cleanup. A new inventory fingerprint need not equal the reused commit's embedded fingerprint, so the optional archive-redundancy reader may return no claim. Full frozen-source proof and ordinary archive FINAL do not depend on that optimization.
 
@@ -825,8 +825,11 @@ the 2026-11-01 C2 release amendment remain separate contracts.
 The refusal also applies beyond enrolled remediation: missing or unverified
 `restoreSource`, or divergent marker-free coverage without verified
 source-selection evidence, refuses before successor clone creation, retaining
-work, pins and custody. Source-bound ordinary ancestor-only adoption is
-unchanged. Source-less legacy coverage could previously seed C and then require
+work, pins and custody. Source-bound ordinary ancestor-only adoption now selects
+the authenticated journaled source under the full proof in the
+[2026-11-03 amendment](#amendment-2026-11-03--ordinary-marker-free-source-selection-3781);
+definite ordinary ineligibility alone retains the pre-existing tip fallback.
+Source-less legacy coverage could previously seed C and then require
 a base hold; the current refusal occurs before successor creation when source
 binding is absent. Equal trees or leaf dominance cannot supply authenticated S,
 and no legacy exception grants new authority. The existing feature-gated,
@@ -985,3 +988,103 @@ passing proof. The sanitized trace establishes neither adopt nor release
 authority. #3583 independently owns its historical publication investigation
 and any release of rewritten roots; this change neither diagnoses it nor depends
 on publishing those roots.
+
+## Amendment 2026-11-03 — ordinary marker-free source selection (#3781)
+
+### Execution source and custody envelope
+
+For general ordinary marker-free recovery, successor preparation selects the
+content source S instead of executing the coverage wrapper W only after
+authenticating the current run/clone/attempt and captured episode journal,
+including its exact `restoreTip = W` and `restoreSource = S` binding and episode
+pin. Neither equal trees nor a dominant leaf establishes that binding.
+
+The complete bounded wrapper graph must verify: at most eight aggregates and
+66 leaves, exact coverage messages, worker author and committer identities at
+2000-01-01 UTC, every aggregate tree equal to S's tree, one common embedded
+fingerprint that recomputes from the complete leaf set and S (with or without
+S among the fingerprint's roots), S itself present as a leaf, and every other
+leaf positively ancestral to S. The original embedded fingerprint must name a
+`refs/uzi-coverage/<runId>/<generation>/<fingerprint>` ref pointing to exact W.
+A later reuse pin with a different inventory fingerprint does not substitute
+for that original provenance pin. Nested aggregates with the same fingerprint
+can qualify; mixed fingerprints cannot establish this proof.
+
+These checks run under the existing bare-lock/handoff boundary. Independent
+source ownership, attempt/episode, reservation, object-closure, quiescence and
+source-use admission checks still apply, including the final HEAD/tree recheck.
+
+On success, execution HEAD and index tree are exactly S, with no unstaged
+diff. Raw `RunnerClone.adoptedSource` can still be W for capture attribution;
+`adoptedContentSource` is S. The frozen coverage envelope, original roots,
+source mapping, generation context, coverage and episode refs, predecessor
+clone and archive custody remain intact. Source selection releases nothing.
+The aggregate's custody role does not make it execution history.
+
+A definite negative provenance result permits keeping W only in the
+pre-existing ordinary branch: no marker source or marker leaf, no divergent
+leaf and no remediation enrollment. For example, a positively observed missing
+original coverage pin or mismatched fingerprints can make that branch
+ineligible for the S peel. This is not a new fallback for errors. Missing or
+unverified source binding, missing objects, failed reads, unknown ancestry,
+walk-bound exhaustion, marker verification failures and remediation refusals
+still refuse before successor ledger or clone effects. The #3239 divergent
+marker/lineage rules and the separately authenticated remediation exception
+remain unchanged.
+
+The 2026-10-29 aggregate reuse proof is deliberately separate: bounded,
+pin-independent reuse may preserve physical W even when W lacks authority to
+select S. It preserves the frozen inventory and writes its own generation pin;
+it cannot mint provenance or replace the original embedded-fingerprint pin.
+Owed roots are settled separately by later `reconcileOwedCandidates` against
+confirmed published ancestry. Selecting S, retaining bytes or preparing a
+successor does not itself settle them.
+
+### Publication and restriction boundaries
+
+For publication-only recovery, S must equal the exact recorded candidate C,
+not merely have the same tree or contain C. Authenticated W may cover C without
+becoming C or adding its parents to execution history. ACK-lost reconciliation
+continues to reconcile the existing publication intent and candidate under its
+own proofs; this amendment grants no new publication, release, FINAL or ACK
+authority. Existing publication floors and committed work remain protected;
+genuine progress beyond C still requires the existing model-required hold.
+
+The #3816 fresh restriction-facts, lifecycle and denial-revision checks remain in force. Durable
+negative evidence is read afresh and rechecked across awaited work and locked
+writes; a changed restriction fingerprint, blocked or unavailable evidence
+cannot be replaced by an earlier positive observation. Capture restrictions
+still apply to the actual captured envelope (called C in the 2026-11-02
+remediation amendment), not the clean execution source. Source selection does
+not bypass denial, restrictions, prerequisite proof or custody reconciliation.
+There is no database, journal schema, protocol feature or accounting change.
+
+### Observed lifecycle and upgrade limits
+
+Controlled real lifecycle fixtures exercise both producer/consumer orders:
+original aggregate production with the new consumer, and new reuse production
+with controlled original source selection. They perform actual immutable
+freeze, upload, capture-journal recording and successor preparation. They are
+not live deployment evidence. With eligible source selection, the Claude and
+Codex publication fixtures repark on another MR-create outage and complete
+after explicit owner Resume without model/helper/session execution; stable
+roots reuse the same W and execution remains exact C.
+
+The observed legacy boundary is narrower than universal upgrade repair. When
+original selection first executes W and holds, a subsequent authenticated W/W
+recapture can initially peel to C on owner Resume while the original matching
+pin survives. Authenticated source carry-forward requires the newly captured
+source to equal the previous restore tip exactly; a same-tree object cannot
+supply that mapping. A second MR-create park leaves unpublished W as an owed root;
+the next envelope can then mix embedded fingerprints and retain W through the
+ordinary fallback, preserving the model-required hold. In the sibling fixture,
+lawful generation cleanup removes the original pin while a later reuse pin
+survives. Fresh GitCache/coordinator consumers after restart retain W and the
+hold; that later pin does not restore original provenance authority.
+
+These retained cases require manual export, recovery and delivery under the
+existing safety and custody rules. No automatic upgrade repair, source discard
+or release is promised. Old wrapper history and floors are preserved; an
+already overbound graph is not bypassed. #3583's historical publication
+investigation and #1324's separate maintainer acceptance remain unresolved
+and outside this fix.

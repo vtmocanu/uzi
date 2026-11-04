@@ -1636,11 +1636,8 @@ func TestDiskPressureRecyclesBothVolumes(t *testing.T) {
 	assertNoSecretReads(t, client)
 }
 
-// Issue #1759: a DOCKER worker under disk pressure (recycle on, not ephemeral, not
-// custody-held, outside the cooldown) has its /nix and /data recycled exactly like a plain
-// one, and its dind-data claim is LEFT IN PLACE. The dind data root is reclaimed only by
-// the worker's gated prune; the pressure recycle never deletes it. This pins the existing
-// recycleVolumes{Nix, Data} behaviour, it does not change it.
+// #3852: aggregate Docker pressure without explicit nix pressure preserves all
+// claims. DinD reclamation remains owned by its separately fenced lifecycle.
 func TestDiskPressureRecycleOfADockerWorkerKeepsTheDinDDataPVC(t *testing.T) {
 	ctx := context.Background()
 	cfg := dockerTestConfig()
@@ -1671,13 +1668,13 @@ func TestDiskPressureRecycleOfADockerWorkerKeepsTheDinDDataPVC(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	del := deletedSet(client)
-	for _, want := range []string{"deployments/uzi-hw-d1", "persistentvolumeclaims/uzi-hw-d1-nix", "persistentvolumeclaims/uzi-hw-d1-data"} {
-		if !del[want] {
-			t.Errorf("the disk-pressure recycle must delete %s; got %v", want, keysOf(del))
+	for _, name := range []string{"deployments/uzi-hw-d1", "persistentvolumeclaims/uzi-hw-d1-nix", "persistentvolumeclaims/uzi-hw-d1-data"} {
+		if del[name] {
+			t.Errorf("#3852: aggregate Docker pressure deleted %s", name)
 		}
 	}
 	if del["persistentvolumeclaims/uzi-hw-d1-dind-data"] {
-		t.Errorf("the disk-pressure recycle deleted the dind-data PVC; it must recycle only nix + data. deletes: %v", keysOf(del))
+		t.Errorf("the disk-pressure recycle deleted the dind-data PVC; it must preserve all claims without nix pressure. deletes: %v", keysOf(del))
 	}
 	if _, err := client.CoreV1().PersistentVolumeClaims(ns).Get(ctx, "uzi-hw-d1-dind-data", metav1.GetOptions{}); err != nil {
 		t.Errorf("the dind-data PVC must still exist after the recycle: %v", err)

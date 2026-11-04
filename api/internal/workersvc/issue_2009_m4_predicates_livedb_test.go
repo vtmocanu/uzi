@@ -35,7 +35,7 @@ func TestIssue2009M4IdentitySQLWorkerContextLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	locks, err := captureWorkerRecoveryLocks(e.ctx, qtx, owner, nil, validatedFinalizeResume{}, []uuid.UUID{run})
+	locks, err := captureWorkerRecoveryLocks(e.ctx, qtx, owner, nil, []uuid.UUID{run})
 	if err != nil {
 		t.Fatal(err)
 	}

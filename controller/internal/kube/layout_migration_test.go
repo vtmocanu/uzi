@@ -1095,7 +1095,7 @@ func TestLayoutMigrationDinDMaintenanceStopNeverStopsCustodyHeldOldLayoutWorker(
 // pins the generic custody skip on a pod-less worker; this adds the old-layout pod case,
 // where the recycle would also replace the pod holding custody-held run state. Nothing
 // is deleted or patched and the custody deferral token is logged; the non-custody twin
-// is the positive control that the arm otherwise fires.
+// is the positive control that explicit nix pressure still starts a nix-only recycle (#3852).
 func TestLayoutMigrationDiskPressureRecycleSkipsCustodyHeldOldLayoutWorker(t *testing.T) {
 	for _, c := range []struct {
 		name    string
@@ -1105,6 +1105,8 @@ func TestLayoutMigrationDiskPressureRecycleSkipsCustodyHeldOldLayoutWorker(t *te
 			f := lmSetup(t, "old", false, "20Gi")
 			w := lmWorker(c.custody)
 			w.DiskPressure = true
+			// #3852: Docker pressure needs an explicit nix cause; /data survives.
+			w.DiskPressureVolumes = []string{"nix"}
 			// Not drifted: isolate the disk-pressure arm from the template-drift arm.
 			if _, err := f.client.AppsV1().Deployments(lmNS()).Update(context.Background(), currentDeployment(t, f, w), metav1.UpdateOptions{}); err != nil {
 				t.Fatal(err)
@@ -1121,8 +1123,13 @@ func TestLayoutMigrationDiskPressureRecycleSkipsCustodyHeldOldLayoutWorker(t *te
 				}
 				return
 			}
-			if len(del) == 0 {
-				t.Fatal("positive control failed: a non-custody worker under disk pressure was not recycled")
+			// The old pod is still observed, so the helper first removes only
+			// the Deployment and waits for pod absence before any nix PVC delete.
+			if !del["deployments/"+deploymentName(w.ID)] ||
+				del["persistentvolumeclaims/"+nixPVCName(w.ID)] ||
+				del["persistentvolumeclaims/"+dataPVCName(w.ID)] ||
+				del["persistentvolumeclaims/"+dindDataPVCName(w.ID)] {
+				t.Fatalf("positive control must start a nix-only recycle: %v", keysOf(del))
 			}
 		})
 	}

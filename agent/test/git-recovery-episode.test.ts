@@ -1973,7 +1973,9 @@ test("issue #3194 shape 5: a multi-batch coverage aggregate (more than 32 roots)
   await cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, coverage.sha, tip);
   assert.equal(journal().recovery.restoreSource, tip, "the multi-round aggregate records its source");
   const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2));
-  assert.equal(successor.adoptedSource, coverage.sha, "sanity: the clone was cut from the aggregate");
+  assert.equal(successor.adoptedSource, coverage.sha, "capture attribution remains the aggregate");
+  assert.equal(successor.adoptedContentSource, tip);
+  assert.equal(git(successor.path, ["rev-parse", "HEAD"]), tip, "execution starts at the verified source");
   assert.equal(await guardOn(successor, planned, tip), "attested");
 });
 

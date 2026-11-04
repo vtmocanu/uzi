@@ -51,14 +51,17 @@ func (tx *recoveryHookTx) Query(ctx context.Context, sql string, args ...any) (p
 		}
 		return &recoveryHookRows{Rows: rows, ctx: ctx, hook: tx.hook}, nil
 	}
-	tx.hook.after.Add(1)
+	if !strings.HasPrefix(sql, "-- name: ListAppSettings ") {
+		tx.hook.after.Add(1)
+	}
 	return tx.Tx.Query(ctx, sql, args...)
 }
 func (tx *recoveryHookTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	// Worker liveness/nonce writes and the transaction's own isolation setting (Service.beginReadCommitted)
-	// are prerequisites, not snapshot/FK writes.
+	// The exact shared settings guard, liveness/nonce writes and isolation setting
+	// precede parent capture. None is a snapshot/child FK effect.
+	settingsGuard := sql == "SELECT pg_advisory_xact_lock_shared($1)" && len(args) == 1 && args[0] == store.SettingsMutationLockKey
 	if !strings.Contains(sql, "HeartbeatWorker") && !strings.Contains(sql, "RegisterWorker") &&
-		!strings.HasPrefix(sql, "SET TRANSACTION ISOLATION LEVEL") {
+		!strings.HasPrefix(sql, "SET TRANSACTION ISOLATION LEVEL") && !settingsGuard {
 		tx.hook.after.Add(1)
 	}
 	return tx.Tx.Exec(ctx, sql, args...)
@@ -197,7 +200,9 @@ func TestWorkerRecoveryFreezeDriftLiveDB(t *testing.T) {
 			defer func() {
 				cancel()
 				if !joined {
-					<-result
+					if err := <-result; err != nil {
+						t.Logf("recovery cleanup: %v", err)
+					}
 				}
 			}()
 			go func() { _, e := svc.Heartbeat(ctx, worker, nil, nil, snap); result <- e }()
@@ -314,7 +319,9 @@ func TestWorkerRecoveryCrossedServicesLiveDB(t *testing.T) {
 				defer func() {
 					cancel()
 					for i := 0; i < started; i++ {
-						<-results
+						if err := <-results; err != nil {
+							t.Logf("recovery cleanup: %v", err)
+						}
 					}
 				}()
 				call := func(s *Service, w store.Worker, snap *ActiveSnapshot) {
@@ -393,5 +400,33 @@ func TestWorkerRecoveryCrossedServicesLiveDB(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+type recoveryHookNoopTx struct{ pgx.Tx }
+
+func (recoveryHookNoopTx) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+func TestRecoveryHookSettingsPrerequisite(t *testing.T) {
+	h := &recoveryTxHook{}
+	tx := &recoveryHookTx{Tx: recoveryHookNoopTx{}, hook: h}
+	if _, err := tx.Exec(context.Background(), "SELECT pg_advisory_xact_lock_shared($1)", store.SettingsMutationLockKey); err != nil {
+		t.Fatal(err)
+	}
+	if h.after.Load() != 0 {
+		t.Fatal("shared settings prefix is not a child effect")
+	}
+	if _, err := tx.Exec(context.Background(), "SELECT pg_advisory_xact_lock_shared($1)", store.SettingsMutationLockKey+1); err != nil {
+		t.Fatal(err)
+	}
+	if h.after.Load() != 1 {
+		t.Fatal("unrelated lock was ignored")
+	}
+	if _, err := tx.Exec(context.Background(), "UPDATE worker_active_runs SET phase='running'"); err != nil {
+		t.Fatal(err)
+	}
+	if h.after.Load() != 2 {
+		t.Fatal("snapshot effect was ignored")
 	}
 }

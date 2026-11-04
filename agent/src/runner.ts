@@ -2652,9 +2652,10 @@ interface RunFlight {
    *  clears it. In-memory only — NOT seeded from the claim: `claim.checkpoint_tip` is a
    *  server-confirmed anchor, and a resume self-heals via `lastCheckpointRefTip`. */
   lastAttemptedCheckpointRefTip: string | undefined;
-  /** issue #2733: the run's repo is on GitHub, the only forge with checkpoint workflow overlays and
-   *  so the only one whose raw tick/iteration publishes are chained over a prior overlay tip
-   *  (`checkpointPack`'s `chainFrom`). Optional: absent ⇒ no chaining. */
+  /** issue #2733/#2753: swap the workflow subtree (GitHub). The run's repo is on GitHub, the only
+   *  forge with checkpoint workflow overlays; its chain swaps P's `.github/workflows` subtree in
+   *  (`checkpointPack`'s `chainWorkflowSwap`). Chaining itself runs on every forge; absent/false
+   *  ⇒ the chain takes realTip's own tree and skips the workflow gate. */
   checkpointChainForge?: boolean;
   /** Guarded default-branch CI repair runs (claim.config.ci_config_guard): the protected-path globs
    *  every checkpoint and held publication is checked against, over the exact candidate SHA, before
@@ -19482,11 +19483,14 @@ export class RunRunner {
         // overlay does not wedge later tick/iteration publishes with `not_descendant`. The list is
         // ordered [attempted, confirmed]: the first candidate that is not already contained in the
         // raw tip and verifies as wrapper-only is used. (The reap overlay's own base still uses
-        // `attempted ?? confirmed`, unchanged #1086 behaviour.) GitHub only, like the overlay.
-        flight.checkpointChainForge === true
-          ? [flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip]
-          : undefined,
-        { defaultBranch: flight.checkpointDefaultBranch, signal, restrictionIdentity: identity }));
+        // `attempted ?? confirmed`, unchanged #1086 behaviour.) issue #2753: chaining runs on every
+        // forge (a park marker leaves the same not_descendant wedge anywhere); only GitHub swaps the
+        // workflow subtree (checkpointChainForge), other forges chain over realTip's own tree. Park
+        // markers are tolerated only for the confirmed tip (markerTrustedTip).
+        [flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip],
+        { defaultBranch: flight.checkpointDefaultBranch, signal, restrictionIdentity: identity,
+          markerTrustedTip: flight.lastCheckpointRefTip,
+          chainWorkflowSwap: flight.checkpointChainForge === true }));
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };

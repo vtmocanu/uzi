@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -6,19 +7,19 @@ import path from "node:path";
 import { afterEach, it } from "node:test";
 import assert from "node:assert/strict";
 import { StubExecutor, type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
-import { GitCache } from "../src/git.js";
+import { GitCache, type RecoveryJournalEntry } from "../src/git.js";
 import { Outbox } from "../src/outbox.js";
-import { RunRunner } from "../src/runner.js";
+import { RunRunner, type ExecutorFactory, type RunnerOptions } from "../src/runner.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import type { SummaryRunner } from "../src/summary-runner.js";
 import type { Logger } from "../src/log.js";
 import type { PublicationRecord } from "../src/publication-intent.js";
-import { api, client, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, worktreeDirFor } from "./runner-harness.js";
+import { TOKEN, api, client, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, worktreeDirFor } from "./runner-harness.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { FakeCodexExecutor, codexRig } from "./runner-codex-sinks-fixture.js";
-import { RecoveryCoordinator } from "../src/recovery.js";
+import { RecoveryCoordinator, type RecoveryRecord } from "../src/recovery.js";
 import { FakeRecoveryClient } from "./codex-reap-fixture.js";
-import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 
 // Issue #1324 M5: the publication-only resume. A claim that carries an active `publication_resume` finishes the
 // recorded publication with ZERO model calls, through RunRunner with a real Outbox, a real git origin and the
@@ -51,10 +52,15 @@ async function mkOutbox(): Promise<Outbox> {
 }
 
 /** A second worker: its own data dir and bare, so it holds nothing the first one did. */
-function mkPeerGit(): GitCache {
+async function mkPeerGit(): Promise<GitCache> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runner-publication-peer-"));
   roots.push(dir);
-  return new GitCache(dir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+  const peer = new GitCache(dir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+  const bare = await peer.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700);
+  fs.chmodSync(bare, 0o700);
+  fs.chmodSync(path.join(bare, "config"), 0o600);
+  return peer;
 }
 
 const claimFor = (iid: number, over: Record<string, unknown> = {}) =>
@@ -62,8 +68,8 @@ const claimFor = (iid: number, over: Record<string, unknown> = {}) =>
 const githubClaim = (iid: number, over: Record<string, unknown> = {}) =>
   claimFor(iid, { repo: { id: REPO_ID, url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" }, ...over });
 
-type Counts = { run: number; settle: number; summary: number; resume: number; handoff: number };
-const counts = (): Counts => ({ run: 0, settle: 0, summary: 0, resume: 0, handoff: 0 });
+type Counts = { run: number; settle: number; summary: number; resume: number; handoff: number; helper: number };
+const counts = (): Counts => ({ run: 0, settle: 0, summary: 0, resume: 0, handoff: 0, helper: 0 });
 
 /** An executor any model work trips: run() and closeAndSettlePlanSummary() throw and are counted. */
 function tripwireExecutor(c: Counts): Executor {
@@ -77,16 +83,44 @@ function tripwireExecutor(c: Counts): Executor {
 /** A SummaryRunner any use trips. */
 function tripwireSummary(c: Counts): SummaryRunner {
   const trip = (): never => { c.summary++; throw new Error("tripwire: the SummaryRunner was used"); };
-  return { deliverySummaryDeadline: trip, generateDeliverySummary: trip } as unknown as SummaryRunner;
+  return { deliverySummaryDeadline: trip, generateDeliverySummary: trip, generateIntentSummary: trip, generatePlanSummary: trip } as unknown as SummaryRunner;
 }
 
-type BuildOptions = { c?: Counts; phases?: boolean; extra?: Record<string, unknown>; log?: Logger; gitCache?: GitCache };
+/** Both harnesses must reject even an advisory model admission. */
+function tripwireAdvice(c: Counts): NonNullable<RunnerOptions["nowSummary"]> {
+  const trip = (): never => { c.helper++; throw new Error("tripwire: advisory model was entered"); };
+  return { homeRoot: path.join(fx.dataDir, "advice-home"), queryFn: trip, codexAdviceHarnessFactory: async () => trip() };
+}
+
+class PublicationArchive extends FakeRecoveryClient {
+  hasFeature(name: string): boolean { return client.hasFeature(name); }
+  getRunOwnership: typeof client.getRunOwnership = (...args) => client.getRunOwnership(...args);
+  override async reserveRecoveryCapture(_runId: string, req: Parameters<FakeRecoveryClient["reserveRecoveryCapture"]>[1]) {
+    this.reserveCalls.push(req);
+    return { capture_id: randomUUID(), state: "preparing" as const };
+  }
+}
+
+type BuildOptions = { c?: Counts; phases?: boolean; extra?: Record<string, unknown>; log?: Logger; gitCache?: GitCache; archive?: PublicationArchive; makeExecutor?: ExecutorFactory };
 function build(executor: Executor, forge: { gitlab?: unknown; github?: unknown }, outbox: Outbox, opts: BuildOptions = {}): RunRunner {
-  const r = new RunRunner(client, opts.gitCache ?? git, () => ({ executor }), opts.log ?? nullLogger(), 20, undefined, {
+  const gitCache = opts.gitCache ?? git;
+  const log = opts.log ?? nullLogger();
+  type InventoryBoundary = NonNullable<ConstructorParameters<typeof RecoveryCoordinator>[0]["withInventorySourceBoundary"]>;
+  let r: RunRunner;
+  const recovery = new RecoveryCoordinator({
+    client: opts.archive ?? new PublicationArchive(), git: gitCache, log, recoveryRoot: gitCache.recoveryRoot, workerToken: TOKEN,
+    withInventorySourceBoundary: (...args) => (r as unknown as { withInventorySourceBoundary: InventoryBoundary }).withInventorySourceBoundary(...args),
+  });
+  r = new RunRunner(client, gitCache, opts.makeExecutor ?? (() => ({ executor })), log, 20, TOKEN, {
+    recovery,
     pollMs: 5, planApprovalTimeoutMs: 0, prDescriptionHeadLagMs: 0, recoveryRetryMs: 5,
     checkpointTestHooks: { retryBackoffMs: [0, 0] },
     ...(forge.gitlab ? { gitlab: forge.gitlab as never } : {}), ...(forge.github ? { github: forge.github as never } : {}),
-    outbox, ...(opts.c ? { summaryRunner: tripwireSummary(opts.c) } : {}), ...opts.extra,
+    outbox, ...(opts.c ? {
+      summaryRunner: tripwireSummary(opts.c),
+      nowSummary: tripwireAdvice(opts.c),
+      checkRunner: async () => { opts.c!.helper++; throw new Error("tripwire: checkRunner was entered"); },
+    } : {}), ...opts.extra,
   });
   const seams = r as unknown as Record<string, unknown>;
   seams["forgeRetrySleep"] = async () => {};
@@ -200,11 +234,33 @@ async function enrolAndPark(iid: number, outbox: Outbox, opts: { github?: boolea
 /** The resumed claim: a later generation carrying the active enrollment. */
 const resumeClaim = (claim: ClaimResponse, intent: WireIntent, over: Record<string, unknown> = {}, seqs = { enrollment_seq: 1, candidate_seq: 1 }): ClaimResponse => {
   // The retained-source path asks the api who owns the run: this claim's generation, running.
-  api.setOwnershipStatus(claim.run_id, "running", GEN + 1);
-  return { ...claim, claim_generation: GEN + 1, publication_resume: { ...seqs, intent }, ...over } as ClaimResponse;
+  const resumed = { ...claim, claim_generation: claim.claim_generation! + 1, publication_resume: { ...seqs, intent }, ...over } as ClaimResponse;
+  api.setOwnershipStatus(resumed.run_id, "running", resumed.claim_generation, resumed.inventory_guarded);
+  return resumed;
 };
 
 const reset = (): void => { api.publicationIntentRequests.length = 0; };
+
+it("each installed model and session tripwire has a positive control", async () => {
+  const c = counts();
+  const executor = tripwireExecutor(c);
+  await assert.rejects(executor.run({} as RunContext), /tripwire: executor.run/);
+  await assert.rejects(Reflect.apply(executor.closeAndSettlePlanSummary!, executor, []), /tripwire: closeAndSettlePlanSummary/);
+  const summary = tripwireSummary(c);
+  assert.throws(() => Reflect.apply(summary.deliverySummaryDeadline, summary, []), /tripwire: the SummaryRunner/);
+  assert.throws(() => Reflect.apply(summary.generateDeliverySummary, summary, []), /tripwire: the SummaryRunner/);
+  assert.throws(() => Reflect.apply(summary.generateIntentSummary, summary, []), /tripwire: the SummaryRunner/);
+  assert.throws(() => Reflect.apply(summary.generatePlanSummary, summary, []), /tripwire: the SummaryRunner/);
+  const advice = tripwireAdvice(c);
+  assert.throws(() => Reflect.apply(advice.queryFn, undefined, []), /tripwire: advisory model/);
+  await assert.rejects(Reflect.apply(advice.codexAdviceHarnessFactory!, undefined, []), /tripwire: advisory model/);
+  const r = build(executor, {}, await mkOutbox(), { c });
+  const phases = r as unknown as { phaseResume: () => Promise<void>; phasePreflightHandoff: () => Promise<void>; checkRunner: () => Promise<void> };
+  await assert.rejects(phases.phaseResume(), /tripwire: phaseResume/);
+  await assert.rejects(phases.phasePreflightHandoff(), /tripwire: phasePreflightHandoff/);
+  await assert.rejects(phases.checkRunner(), /tripwire: checkRunner/);
+  assert.deepEqual(c, { run: 1, settle: 1, summary: 4, resume: 1, handoff: 1, helper: 3 });
+});
 
 // ── the zero-model tripwire ───────────────────────────────────────────────────────────────────────────
 
@@ -245,7 +301,7 @@ it("cold handoff: a peer with no local record and the checkpoint mirror publishe
     const workerBare = git.barePathFor(fx.originPath);
     gitIn(fx.originPath, ["fetch", "-q", workerBare, `${first.last.candidate}:refs/uzi-checkpoints/agent/issue-${iid}`]);
     reset();
-    const peer = mkPeerGit();
+    const peer = await mkPeerGit();
     const c = counts();
     const forge = fakeGitlab();
     const resumed = resumeClaim(first.claim, first.last, {
@@ -258,15 +314,420 @@ it("cold handoff: a peer with no local record and the checkpoint mirror publishe
     const executor = harness === "codex"
       ? Object.assign(new FakeCodexExecutor(rig.safety, async () => { c.run++; throw new Error("tripwire: executor.run was called"); }, rig.settle, rig.capture), { sandboxesCommands: true })
       : tripwireExecutor(c);
-    await build(executor, { gitlab: forge.gitlab }, await mkOutbox(), { c, gitCache: peer }).execute(resumed);
+    const diagnostic = recordingLogger();
+    await build(executor, { gitlab: forge.gitlab }, await mkOutbox(), { c, gitCache: peer, log: diagnostic.logger }).execute(resumed);
 
     assert.deepEqual(c, counts(), `${harness}: no model work`);
     assert.equal(api.publicationIntentRequests.length, 0, `${harness}: the server's intent is adopted, never re-enrolled`);
-    assert.equal(completed(first.claim.run_id).length, 1, `${harness}: ${JSON.stringify(states(first.claim.run_id).map(s => s.status))}`);
+    assert.equal(completed(first.claim.run_id).length, 1, `${harness}: ${JSON.stringify({ states: states(first.claim.run_id), log: diagnostic.lines })}`);
     assert.equal(failed(first.claim.run_id).length, 0);
     assert.equal(originBranch(iid), first.last.candidate, `${harness}: the mirrored candidate is what landed`);
   }
 });
+
+for (const [harness, oldProducer] of [["claude", false], ["codex", false], ["claude", true]] as const) {
+  it(`guarded retained reclaim after a landed push completes model-free through the ${harness} facade${oldProducer ? " with an old producer and new consumer" : ""}`, async (t) => {
+    const iid = harness === "claude" ? 5401 : 5402;
+    const outbox = await mkOutbox();
+    const { claim, last } = await enrolAndPark(iid, outbox, { at: "mr_create" });
+    assert.equal(originBranch(iid), last.candidate);
+    assert.deepEqual(parks(claim.run_id).map(p => [p.recovery_phase, p.publication_step]), [["publication", "mr_create"]]);
+    reset();
+    client.protocolFeatures = [...FEATURES, "recovery_inventory_v1"];
+    let resumed = resumeClaim(claim, last, {
+      inventory_guarded: true, worker_recovery_episode: 0, worker_recovery_owner_episode: 0,
+      ...(harness === "codex" ? { secrets: { forge_pat: "fixture-forge-pat-000000", codex: CODEX } } : {}),
+    });
+    api.setOwnershipStatus(claim.run_id, "running", resumed.claim_generation, true);
+    let legacyProduced = 0;
+    if (oldProducer) {
+      const coverage = git.buildRecoveryCoverage.bind(git);
+      t.mock.method(git, "buildRecoveryCoverage", async (...args: Parameters<typeof coverage>) => {
+        assert.equal(args[1].runId, claim.run_id, "old producer is restricted to this fixture");
+        assert.equal(args[3], last.candidate, "the producer wraps only the known clean C");
+        legacyProduced++;
+        return coverage(args[0], args[1], args[2], args[3], {});
+      });
+    }
+    const archive = new PublicationArchive();
+    assert.ok(resumed.claim_generation !== undefined);
+    archive.holds = [{ hold_id: randomUUID(), generation: resumed.claim_generation, inventory_guarded: true, has_available_capture: false }];
+    t.mock.method(client, "listRecoveryHolds", archive.listRecoveryHolds.bind(archive));
+    const bare = git.barePathFor(fx.originPath);
+    fs.chmodSync(path.dirname(bare), 0o700);
+    fs.chmodSync(bare, 0o700);
+    // Readiness's real UID supervisor is covered by retained-permissions-fixture.
+    // This suite exercises the safety facade and real Git capture/adoption without that host binary.
+    if (harness === "codex") t.mock.method(git, "normalizeRetainedSourceObjects", async () => {});
+    const c = counts();
+    let constructions = 0;
+    const makeExecutor: ExecutorFactory = () => {
+      constructions++;
+      if (harness === "claude") return { executor: tripwireExecutor(c) };
+      // Each construction owns a fresh safety registry: capture disposes the predecessor.
+      const rig = codexRig({ authMode: "api_key" });
+      return { executor: Object.assign(new FakeCodexExecutor(rig.safety, async () => {
+        c.run++; throw new Error("tripwire: executor.run was called");
+      }, rig.settle, rig.capture), { sandboxesCommands: true }) };
+    };
+    let forgeDown = true;
+    const forge = fakeGitlab({ head: last.candidate, intercept: req => forgeDown && req.method === "POST"
+      ? { status: 503, text: async () => "down" } : undefined });
+    const diagnostics: unknown[] = [];
+    const log = nullLogger();
+    log.child = () => log;
+    log.warn = (message, fields) => { diagnostics.push({ message, fields }); };
+    log.error = log.warn;
+    const r = build(tripwireExecutor(c), { gitlab: forge.gitlab }, outbox, { c, archive, makeExecutor, log });
+    const recovery = (r as unknown as { recovery: RecoveryCoordinator }).recovery;
+    assert.equal(recovery.enabled, true, "guarded publication recovery is enabled");
+    const events: string[] = [];
+    const observations = new Map<number, { events: string[]; wrapper?: string; source?: string; head?: string; tree?: string }>();
+    const observe = (event: string): void => {
+      events.push(event);
+      observations.get(resumed.claim_generation!)!.events.push(event);
+    };
+    let wrapper: string | undefined;
+    let source: string | undefined;
+    let frozen: RecoveryRecord | undefined;
+    let initialHead: string | undefined;
+    let initialTree: string | undefined;
+    const freeze = recovery.freezeInventory.bind(recovery);
+    t.mock.method(recovery, "freezeInventory", async (...args: Parameters<typeof freeze>) => {
+      const record = await freeze(...args);
+      if (record && args[0].context.generation === resumed.claim_generation) {
+        observe("freeze");
+        observations.get(resumed.claim_generation!)!.wrapper = record.sourceSha;
+        observations.get(resumed.claim_generation!)!.source = record.inventoryCurrentSha;
+        wrapper = record.sourceSha;
+        source = record.inventoryCurrentSha;
+        frozen = record;
+      }
+      return record;
+    });
+    const capture = recovery.captureAndUpload.bind(recovery);
+    t.mock.method(recovery, "captureAndUpload", async (...args: Parameters<typeof capture>) => {
+      const uploadsBefore = archive.uploadCalls.length;
+      const outcome = await capture(...args);
+      if (args[0].record.generation === resumed.claim_generation) {
+        assert.ok(archive.uploadCalls.length > uploadsBefore, "each claim really uploads its frozen capture");
+        observe("capture");
+      }
+      return outcome;
+    });
+    const recordCapture = git.recordRecoveryCapture.bind(git);
+    t.mock.method(git, "recordRecoveryCapture", async (...args: Parameters<typeof recordCapture>) => {
+      const result = await recordCapture(...args);
+      observe("record");
+      assert.equal(args[5], wrapper, "the authenticated coverage wrapper W is recorded");
+      assert.equal(args[6], source, "the captured content source S is recorded");
+      return result;
+    });
+    let prepared = false;
+    const prepare = git.prepareRecoverySuccessor.bind(git);
+    t.mock.method(git, "prepareRecoverySuccessor", async (...args: Parameters<typeof prepare>) => {
+      const pins = gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+      const before = await recovery.inspect(claim.run_id);
+      assert.ok(frozen && wrapper && source);
+      const tree = gitIn(bare, ["rev-parse", `${source}^{tree}`]);
+      const roots = [...new Set([...frozen.originalRoots!.map(root => root.sha), frozen.originalSourceSha!])].sort();
+      const fingerprint = createHash("sha256").update(JSON.stringify({ roots, currentSha: source, tree })).digest("hex");
+      assert.equal(frozen.coverageDigest, fingerprint);
+      assert.equal(gitIn(bare, ["rev-parse", `${wrapper}^{tree}`]), tree);
+      assert.deepEqual(gitIn(bare, ["rev-list", "--parents", "-n", "1", wrapper]).split(" ").slice(1).sort(),
+        [...new Set([...roots, source])].sort());
+      const object = gitIn(bare, ["cat-file", "-p", wrapper]);
+      assert.ok(object.includes("author uzi-agent <uzi-agent@uzi.local> 946684800 +0000\n"));
+      assert.ok(object.includes("committer uzi-agent <uzi-agent@uzi.local> 946684800 +0000\n"));
+      assert.equal(gitIn(bare, ["log", "-1", "--format=%s", wrapper]), `uzi recovery coverage ${fingerprint} round 0 batch 0`);
+      assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-coverage/${claim.run_id}/${resumed.claim_generation}/${fingerprint}`]), wrapper);
+      const successor = await prepare(...args);
+      observe("prepare");
+      prepared = true;
+      // Observe before publication and cleanup can legitimately retire custody.
+      // Record execution identity without interrupting the baseline publication hold.
+      initialHead = gitIn(successor.path, ["rev-parse", "HEAD"]);
+      initialTree = gitIn(successor.path, ["write-tree"]);
+      Object.assign(observations.get(resumed.claim_generation!)!, { head: initialHead, tree: initialTree });
+      assert.equal(successor.adoptedSource, wrapper);
+      assert.equal(successor.adoptedContentSource, source);
+      assert.notEqual(wrapper, source, "coverage W and source S remain distinct");
+      assert.equal(source, last.candidate, "S resolves exactly to C");
+      assert.ok(pins.includes(wrapper!));
+      assert.ok(pins.includes(source!));
+      assert.equal(gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]), pins, "all pins survive preparation");
+      assert.deepEqual(await recovery.inspect(claim.run_id), before, "all archive custody survives preparation");
+      assert.ok(before.some(record => record.inventoryGuarded && record.generation === resumed.claim_generation));
+      assert.equal(archive.releaseCalls.length, 0, "prepare releases no custody");
+      assert.ok(fs.existsSync(args[3].clonePath), "the predecessor survives preparation");
+      assert.equal(originBranch(iid), last.candidate);
+      return successor;
+    });
+    observations.set(resumed.claim_generation!, { events: [] });
+    await r.execute(resumed);
+    assert.equal(completed(claim.run_id).length, 0, "the gen5 MR outage really parks again");
+    assert.deepEqual(parks(claim.run_id).map(p => [p.claim_generation, p.recovery_phase, p.publication_step]),
+      [[GEN, "publication", "mr_create"], [GEN + 1, "publication", "mr_create"]]);
+    assert.deepEqual(c, counts(), "the first resume is model-free");
+    assert.equal(originBranch(iid), last.candidate);
+    assert.equal(api.ownerResume(claim.run_id, GEN + 2), "resumed");
+    resumed = resumeClaim(resumed, last);
+    assert.equal(resumed.claim_generation, GEN + 2);
+    api.setOwnershipStatus(claim.run_id, "running", resumed.claim_generation, true);
+    archive.holds.push({ hold_id: randomUUID(), generation: resumed.claim_generation!, inventory_guarded: true, has_available_capture: false });
+    observations.set(resumed.claim_generation!, { events: [] });
+    forgeDown = false;
+    await r.execute(resumed);
+    for (const generation of [GEN + 1, GEN + 2]) {
+      const observation = observations.get(generation)!;
+      assert.deepEqual(observation.events, ["freeze", "capture", "record", "prepare"], `actual lifecycle at gen${generation}`);
+      assert.equal(observation.source, last.candidate);
+      assert.equal(observation.head, last.candidate, "no wrapper enters execution history");
+      assert.equal(observation.tree, gitIn(bare, ["rev-parse", `${last.candidate}^{tree}`]));
+    }
+    assert.equal(observations.get(GEN + 1)!.wrapper, observations.get(GEN + 2)!.wrapper, "unchanged roots produce the same W without nesting");
+    assert.equal(api.publicationIntentRequests.length, 0, "both resumes adopt the enrollment");
+    if (oldProducer) assert.ok(legacyProduced >= 2, "both captures use the controlled original producer");
+    assert.equal(prepared, true, `actual successor preparation ran: ${JSON.stringify({ states: states(claim.run_id), diagnostics, events })}`);
+    assert.deepEqual(events.slice(0, 4), ["freeze", "capture", "record", "prepare"]);
+    assert.ok(archive.uploadCalls.length > 0, "guarded capture uploads even with C already remote");
+    assert.ok(constructions >= (harness === "codex" ? 2 : 1), "executor construction is permitted without invoking the model");
+    assert.deepEqual(c, counts());
+    assert.equal(originBranch(iid), last.candidate, "the remote stays exactly at C");
+    assert.equal(failed(claim.run_id).length, 0);
+    assert.equal(parks(claim.run_id).filter(p => p.publication_hold_reason).length, 0, JSON.stringify(states(claim.run_id)));
+    assert.equal(initialHead, last.candidate, "initial successor HEAD is C");
+    assert.equal(initialTree, gitIn(bare, ["rev-parse", `${last.candidate}^{tree}`]));
+    assert.equal(completed(claim.run_id).length, 1, JSON.stringify(states(claim.run_id)));
+  });
+}
+
+for (const cleanupOriginalPin of [false, true]) {
+  it(cleanupOriginalPin
+    ? "legacy held W/C retains W after lawful original-pin cleanup and cache restart"
+    : "legacy held W/C resumes through authenticated C, then retains the mixed-fingerprint owed-W boundary", async (t) => {
+    const iid = 5404;
+    const outbox = await mkOutbox();
+    const { claim, last } = await enrolAndPark(iid, outbox, { at: "mr_create" });
+    reset();
+    client.protocolFeatures = [...FEATURES, "recovery_inventory_v1"];
+    let resumed = resumeClaim(claim, last, {
+      inventory_guarded: true, worker_recovery_episode: 0, worker_recovery_owner_episode: 0,
+    });
+    const archive = new PublicationArchive();
+    t.mock.method(client, "listRecoveryHolds", archive.listRecoveryHolds.bind(archive));
+    const bare = git.barePathFor(fx.originPath);
+    fs.chmodSync(path.dirname(bare), 0o700);
+    fs.chmodSync(bare, 0o700);
+    const c = counts();
+    const diagnostics: Array<{ reason?: unknown; detail?: unknown }> = [];
+    const log = nullLogger();
+    log.child = () => log;
+    log.warn = (_message, fields) => { if (fields) diagnostics.push(fields); };
+    const forge = fakeGitlab({ head: last.candidate, intercept: req => req.method === "POST"
+      ? { status: 503, text: async () => "down" } : undefined });
+    const r = build(tripwireExecutor(c), { gitlab: forge.gitlab }, outbox, { c, archive, log });
+    const recovery = (r as unknown as { recovery: RecoveryCoordinator }).recovery;
+    assert.equal(recovery.enabled, true, "legacy recovery uses authenticated captures");
+    const seam = git as unknown as {
+      resolveMarkerWrapperAdoption(bare: string, journal: RecoveryJournalEntry, tip: string, source?: string):
+        Promise<{ seedTip: string; expectedHead: string; expectedTree: string; peeledMarkers: string[]; excludedRoots: string[] } | undefined>;
+      readRecoveryCapture(bare: string, branch: string): Promise<RecoveryJournalEntry | undefined>;
+    };
+    const resolver = seam.resolveMarkerWrapperAdoption.bind(git);
+    let originalSelection = true;
+    let suppressed = 0;
+    let originalWrapper: string | undefined;
+    const events = new Map<number, string[]>();
+    const captures = new Map<number, { wrapper: string; source: string }>();
+    const frozenRecords = new Map<number, RecoveryRecord>();
+    const heads = new Map<number, string>();
+    const event = (name: string): void => { events.get(resumed.claim_generation!)!.push(name); };
+    t.mock.method(seam, "resolveMarkerWrapperAdoption", async (...args: Parameters<typeof resolver>) => {
+      const eligible = await resolver(...args);
+      if (originalSelection) {
+        assert.equal(args[1].runId, claim.run_id);
+        assert.equal(args[3], last.candidate);
+        assert.ok(eligible, "the real resolver verifies this ordinary fixture first");
+        assert.equal(eligible.expectedHead, last.candidate);
+        assert.deepEqual(eligible.peeledMarkers, []);
+        assert.deepEqual(eligible.excludedRoots, []);
+        assert.equal(args[1].remediationRecovery, undefined);
+        originalWrapper = args[2];
+        suppressed++;
+        return undefined;
+      }
+      return eligible;
+    });
+    const freeze = recovery.freezeInventory.bind(recovery);
+    t.mock.method(recovery, "freezeInventory", async (...args: Parameters<typeof freeze>) => {
+      const record = await freeze(...args);
+      assert.ok(record);
+      event("freeze");
+      captures.set(resumed.claim_generation!, { wrapper: record.sourceSha, source: record.inventoryCurrentSha! });
+      frozenRecords.set(resumed.claim_generation!, record);
+      return record;
+    });
+    const upload = recovery.captureAndUpload.bind(recovery);
+    t.mock.method(recovery, "captureAndUpload", async (...args: Parameters<typeof upload>) => {
+      const uploadsBefore = archive.uploadCalls.length;
+      const result = await upload(...args);
+      assert.ok(archive.uploadCalls.length > uploadsBefore);
+      event("upload");
+      return result;
+    });
+    const record = git.recordRecoveryCapture.bind(git);
+    t.mock.method(git, "recordRecoveryCapture", async (...args: Parameters<typeof record>) => {
+      const result = await record(...args);
+      event("record");
+      const observed = captures.get(resumed.claim_generation!)!;
+      assert.equal(args[5], observed.wrapper);
+      assert.equal(args[6], observed.source);
+      const journal = await seam.readRecoveryCapture(bare, args[1]);
+      assert.equal(journal?.recovery?.restoreTip, observed.wrapper);
+      assert.equal(journal?.recovery?.restoreSource, last.candidate, "W/W recording preserves the authenticated mapping to C");
+      return result;
+    });
+    const prepare = git.prepareRecoverySuccessor.bind(git);
+    t.mock.method(git, "prepareRecoverySuccessor", async (...args: Parameters<typeof prepare>) => {
+      const pins = gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+      const custody = await recovery.inspect(claim.run_id);
+      const successor = await prepare(...args);
+      event("prepare");
+      heads.set(resumed.claim_generation!, gitIn(successor.path, ["rev-parse", "HEAD"]));
+      assert.equal(successor.adoptedSource, captures.get(resumed.claim_generation!)!.wrapper);
+      assert.equal(successor.adoptedContentSource, last.candidate);
+      assert.equal(gitIn(successor.path, ["write-tree"]), gitIn(bare, ["rev-parse", `${last.candidate}^{tree}`]));
+      assert.equal(gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]), pins);
+      assert.deepEqual(await recovery.inspect(claim.run_id), custody);
+      assert.equal(archive.releaseCalls.length, 0);
+      assert.equal(originBranch(iid), last.candidate);
+      return successor;
+    });
+    const execute = async (): Promise<void> => {
+      diagnostics.length = 0;
+      archive.holds.push({ hold_id: randomUUID(), generation: resumed.claim_generation!, inventory_guarded: true, has_available_capture: false });
+      events.set(resumed.claim_generation!, []);
+      await r.execute(resumed);
+      assert.deepEqual(events.get(resumed.claim_generation!), ["freeze", "upload", "record", "prepare"]);
+      assert.deepEqual(c, counts());
+      assert.equal(failed(claim.run_id).length, 0);
+      assert.equal(completed(claim.run_id).length, 0);
+      assert.equal(originBranch(iid), last.candidate);
+      assert.equal(api.publicationIntentRequests.length, 0);
+      assert.equal(archive.releaseCalls.length, 0);
+    };
+    const assertHold = (generation: number): void => {
+      assert.deepEqual(parks(claim.run_id).filter(p => p.claim_generation === generation).map(p => p.publication_hold_reason),
+        ["publication_model_required"]);
+      assert.ok(diagnostics.some(d => d.reason === "publication_model_required" &&
+        d.detail === "the workspace holds work beyond the recorded candidate"));
+    };
+    await execute();
+    assert.equal(suppressed, 1);
+    assert.ok(originalWrapper);
+    assert.equal(heads.get(GEN + 1), originalWrapper, "real preparation seeds W under original selection");
+    assertHold(GEN + 1);
+    originalSelection = cleanupOriginalPin; // The cleanup variant first retains W at gen6 under original selection.
+    assert.equal(api.ownerResume(claim.run_id, GEN + 2), "resumed");
+    resumed = resumeClaim(resumed, last);
+    api.setOwnershipStatus(claim.run_id, "running", resumed.claim_generation, true);
+    await execute();
+    assert.deepEqual(captures.get(GEN + 2), { wrapper: originalWrapper, source: originalWrapper }, "physical W is reused");
+    if (cleanupOriginalPin) {
+      assert.equal(heads.get(GEN + 2), originalWrapper);
+      assertHold(GEN + 2);
+      const first = frozenRecords.get(GEN + 1)!;
+      const later = frozenRecords.get(GEN + 2)!;
+      assert.ok(first.coverageContext && first.coverageDigest && later.coverageDigest);
+      assert.notEqual(first.coverageDigest, later.coverageDigest, "the reused W has a new generation fingerprint");
+      const originalPin = `refs/uzi-coverage/${claim.run_id}/${GEN + 1}/${first.coverageDigest}`;
+      const laterPin = `refs/uzi-coverage/${claim.run_id}/${GEN + 2}/${later.coverageDigest}`;
+      assert.equal(await git.cleanupRecoveryGeneration(bare, first.coverageContext,
+        await git.enumerateOwedCandidates(bare, claim.run_id),
+        [{ fingerprint: first.coverageDigest, sha: originalWrapper, coveredHeads: [last.candidate] }],
+        [last.candidate, originalWrapper], originalWrapper), "removed");
+      assert.equal(gitIn(bare, ["for-each-ref", "--format=%(objectname)", originalPin]), "");
+      assert.equal(gitIn(bare, ["rev-parse", laterPin]), originalWrapper);
+      originalSelection = false;
+      assert.equal(api.ownerResume(claim.run_id, GEN + 3), "resumed");
+      resumed = resumeClaim(resumed, last);
+      api.setOwnershipStatus(claim.run_id, "running", resumed.claim_generation, true);
+      archive.holds.push({ hold_id: randomUUID(), generation: resumed.claim_generation!, inventory_guarded: true, has_available_capture: false });
+      const restarted = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+      const runner = build(tripwireExecutor(c), { gitlab: forge.gitlab }, outbox, { c, archive, log, gitCache: restarted });
+      const restartedRecovery = (runner as unknown as { recovery: RecoveryCoordinator }).recovery;
+      assert.equal(restartedRecovery.enabled, true, "restart retains enabled authenticated recovery");
+      const restartEvents: string[] = [];
+      const restartFreeze = restartedRecovery.freezeInventory.bind(restartedRecovery);
+      t.mock.method(restartedRecovery, "freezeInventory", async (...args: Parameters<typeof restartFreeze>) => {
+        const captured = await restartFreeze(...args);
+        assert.ok(captured);
+        assert.equal(captured.sourceSha, originalWrapper);
+        assert.equal(captured.inventoryCurrentSha, originalWrapper);
+        restartEvents.push("freeze");
+        return captured;
+      });
+      const restartUpload = restartedRecovery.captureAndUpload.bind(restartedRecovery);
+      t.mock.method(restartedRecovery, "captureAndUpload", async (...args: Parameters<typeof restartUpload>) => {
+        const uploadsBefore = archive.uploadCalls.length;
+        const result = await restartUpload(...args);
+        assert.ok(archive.uploadCalls.length > uploadsBefore);
+        restartEvents.push("upload");
+        return result;
+      });
+      const restartRecord = restarted.recordRecoveryCapture.bind(restarted);
+      t.mock.method(restarted, "recordRecoveryCapture", async (...args: Parameters<typeof restartRecord>) => {
+        assert.equal(args[5], originalWrapper);
+        assert.equal(args[6], originalWrapper);
+        const result = await restartRecord(...args);
+        restartEvents.push("record");
+        return result;
+      });
+      const restartPrepare = restarted.prepareRecoverySuccessor.bind(restarted);
+      t.mock.method(restarted, "prepareRecoverySuccessor", async (...args: Parameters<typeof restartPrepare>) => {
+        const pins = gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]);
+        const custody = await restartedRecovery.inspect(claim.run_id);
+        const successor = await restartPrepare(...args);
+        assert.equal(gitIn(bare, ["for-each-ref", "--format=%(refname) %(objectname)"]), pins);
+        assert.deepEqual(await restartedRecovery.inspect(claim.run_id), custody);
+        restartEvents.push("prepare");
+        assert.equal(successor.adoptedContentSource, last.candidate);
+        assert.equal(gitIn(successor.path, ["rev-parse", "HEAD"]), originalWrapper, "missing embedded pin refuses the C peel");
+        return successor;
+      });
+      diagnostics.length = 0;
+      await runner.execute(resumed);
+      assert.deepEqual(restartEvents, ["freeze", "upload", "record", "prepare"]);
+      assertHold(GEN + 3);
+      assert.deepEqual(c, counts());
+      assert.equal(originBranch(iid), last.candidate);
+      assert.equal(completed(claim.run_id).length, 0);
+      assert.equal(failed(claim.run_id).length, 0);
+      assert.equal(archive.releaseCalls.length, 0);
+      assert.equal(api.publicationIntentRequests.length, 0);
+      assert.ok((await restarted.enumerateOwedCandidates(bare, claim.run_id)).some(root => root.sha === originalWrapper));
+      return;
+    }
+    assert.equal(heads.get(GEN + 2), last.candidate, "the original matching pin permits the C peel");
+    assert.deepEqual(parks(claim.run_id).filter(p => p.claim_generation === GEN + 2).map(p => p.publication_step), ["mr_create"]);
+    assert.ok((await git.enumerateOwedCandidates(bare, claim.run_id)).some(root => root.sha === originalWrapper),
+      "C publication has not settled the unpublished owed W");
+    assert.equal(api.ownerResume(claim.run_id, GEN + 3), "resumed");
+    resumed = resumeClaim(resumed, last);
+    api.setOwnershipStatus(claim.run_id, "running", resumed.claim_generation, true);
+    await execute();
+    const nested = captures.get(GEN + 3)!;
+    assert.equal(nested.source, last.candidate);
+    assert.notEqual(nested.wrapper, originalWrapper);
+    assert.equal(heads.get(GEN + 3), nested.wrapper, "mixed fingerprints retain the documented ordinary fallback");
+    assert.notEqual(gitIn(bare, ["log", "-1", "--format=%s", nested.wrapper]),
+      gitIn(bare, ["log", "-1", "--format=%s", originalWrapper]));
+    assertHold(GEN + 3);
+    assert.ok(gitIn(bare, ["for-each-ref", "--format=%(objectname)", `refs/uzi-coverage/${claim.run_id}/`]).split("\n").includes(originalWrapper));
+    assert.ok((await git.enumerateOwedCandidates(bare, claim.run_id)).some(root => root.sha === originalWrapper));
+  });
+}
 
 // ── the handoff source proof ─────────────────────────────────────────────────────────────────────────
 
@@ -291,7 +752,7 @@ it("handoff (a): the finalization pin names the recorded original head H, not th
   reset();
   const c = counts();
   const r = build(tripwireExecutor(c), { github: fakeGitHub().github }, outbox, {
-    c, extra: { recovery: new RecoveryCoordinator({ client: new FakeRecoveryClient(), git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: "publication-resume-worker-fixture" }) },
+    c, extra: { recovery: new RecoveryCoordinator({ client: new FakeRecoveryClient(), git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: TOKEN }) },
   });
   const rec = (r as unknown as { recovery: { pin: (input: { sourceSha: string; finalizationPin?: boolean; attemptedHeadSha?: string }) => Promise<unknown> } }).recovery;
   const real = rec.pin.bind(rec);
@@ -371,6 +832,27 @@ it("holds publication_model_required when the restored workspace holds work beyo
   assert.equal(failed(claim.run_id).length, 0);
 });
 
+it("holds publication_model_required for an empty commit after C, even with the same tree", async () => {
+  const outbox = await mkOutbox();
+  const { claim, last } = await enrolAndPark(5403, outbox);
+  reset();
+  const clone = worktreeDirFor(5403);
+  gitIn(clone, [...IDENT, "commit", "--allow-empty", "-m", "empty work after C"]);
+  const later = gitIn(clone, ["rev-parse", "HEAD"]);
+  assert.notEqual(later, last.candidate);
+  assert.equal(gitIn(clone, ["rev-parse", "HEAD^{tree}"]), gitIn(clone, ["rev-parse", `${last.candidate}^{tree}`]));
+  const c = counts();
+  const archive = new PublicationArchive();
+  const forge = fakeGitlab();
+  await build(tripwireExecutor(c), { gitlab: forge.gitlab }, outbox, { c, archive }).execute(resumeClaim(claim, last));
+  assert.deepEqual(c, counts());
+  assert.deepEqual(parks(claim.run_id).filter(p => p.publication_hold_reason).map(p => p.publication_hold_reason), ["publication_model_required"]);
+  assert.equal(originBranch(5403), undefined);
+  assert.equal(forge.calls.length, 0);
+  assert.equal(failed(claim.run_id).length, 0);
+  assert.equal(archive.releaseCalls.length, 0);
+});
+
 it("holds publication_source_unavailable when the restored workspace is not the candidate (a peer with no checkpoint evidence)", async () => {
   const first = await enrolAndPark(5314, await mkOutbox(), { handoff: true });
   assert.equal(parks(first.claim.run_id)[0]!.handoff_checkpoint_tip, first.last.candidate, "the park offered the candidate as the handoff tip");
@@ -379,7 +861,7 @@ it("holds publication_source_unavailable when the restored workspace is not the 
   reset();
   const c = counts();
   // No checkpoint_tip and no session: the peer seeds from the default branch, so its clone is not at C.
-  await build(tripwireExecutor(c), { gitlab: fakeGitlab().gitlab }, await mkOutbox(), { c, gitCache: mkPeerGit() })
+  await build(tripwireExecutor(c), { gitlab: fakeGitlab().gitlab }, await mkOutbox(), { c, gitCache: await mkPeerGit() })
     .execute(resumeClaim(first.claim, first.last));
   assert.deepEqual(c, counts());
   assert.equal(originBranch(5314), undefined);
@@ -422,10 +904,18 @@ it("server ahead: the api's newer candidate is adopted, never the older local on
   assert.equal(api.publicationIntentRequests.length, 0, "nothing was sent: the api's state was adopted as is");
 });
 
-it("local ahead: a candidate advance whose ACK was lost is sent again and used once ACKed", async () => {
+it("local ahead: a candidate advance whose ACK was lost is sent again and used once ACKed", async (t) => {
   const outbox = await mkOutbox();
   const first = await enrolAndPark(5321, outbox, { github: true, transformed: true });
   reset();
+  let preparations = 0;
+  const prepare = git.prepareRecoverySuccessor.bind(git);
+  t.mock.method(git, "prepareRecoverySuccessor", async (...args: Parameters<typeof prepare>) => {
+    const successor = await prepare(...args);
+    preparations++;
+    assert.equal(successor.adoptedContentSource, first.last.candidate, "retained recovery restores the locally advanced C");
+    return successor;
+  });
   const resent: Array<{ enrollment_seq?: unknown; candidate_seq?: unknown; claim_generation?: unknown }> = [];
   api.publicationIntentWire = (req) => {
     resent.push({ enrollment_seq: req.body.enrollment_seq, candidate_seq: req.body.candidate_seq, claim_generation: req.body.claim_generation });
@@ -436,6 +926,7 @@ it("local ahead: a candidate advance whose ACK was lost is sent again and used o
   await build(tripwireExecutor(c), { github: fakeGitHub().github }, outbox, { c })
     .execute(resumeClaim(first.claim, first.intents[0]!, {}, { enrollment_seq: 1, candidate_seq: 1 }));
   assert.deepEqual(c, counts());
+  assert.equal(preparations, 1, "ACK-lost local advance exercises actual retained recovery");
   assert.deepEqual(resent, [{ enrollment_seq: 1, candidate_seq: 2, claim_generation: GEN + 1 }], "the local advance was re-sent once, fenced by the live generation");
   assert.equal(completed(first.claim.run_id).length, 1, JSON.stringify(states(first.claim.run_id).map(s => s.status)));
   assert.equal(originBranch(5321), first.last.candidate, "the local (newer) candidate landed once the api acknowledged it");
@@ -542,7 +1033,7 @@ it("a well-formed hold reaches the api exactly as shaped", async () => {
   });
 });
 
-async function heldFlight(iid: number, answer?: { httpStatus: number; reason: string }): Promise<{ claim: ClaimResponse; outbox: Outbox }> {
+async function heldFlight(iid: number, answer?: { httpStatus: number; reason: string }, archive = new PublicationArchive()): Promise<{ claim: ClaimResponse; outbox: Outbox }> {
   const outbox = await mkOutbox();
   const { claim, last } = await enrolAndPark(iid, outbox);
   reset();
@@ -550,7 +1041,7 @@ async function heldFlight(iid: number, answer?: { httpStatus: number; reason: st
     api.answerStateOnce(claim.run_id, (b) => b.publication_hold_reason !== undefined, { httpStatus: answer.httpStatus, runStatus: "running", gateRevision: 0, reason: answer.reason });
   }
   const c = counts();
-  await build(tripwireExecutor(c), { gitlab: fakeGitlab().gitlab }, outbox, { c })
+  await build(tripwireExecutor(c), { gitlab: fakeGitlab().gitlab }, outbox, { c, archive })
     .execute(resumeClaim(claim, { ...last, original_head: "e".repeat(40) }, {}));
   assert.deepEqual(c, counts());
   return { claim, outbox };
@@ -575,10 +1066,12 @@ for (const reason of ["publication_not_enrolled", "publication_enrolled"]) {
     const released: unknown[] = [];
     const realRelease = client.releaseRecoveryCustody.bind(client);
     client.releaseRecoveryCustody = async (...a: Parameters<typeof client.releaseRecoveryCustody>) => { released.push(a); return realRelease(...a); };
-    const { claim, outbox } = await heldFlight(5332 + (reason === "publication_enrolled" ? 1 : 0), { httpStatus: 409, reason });
+    const archive = new PublicationArchive();
+    const { claim, outbox } = await heldFlight(5332 + (reason === "publication_enrolled" ? 1 : 0), { httpStatus: 409, reason }, archive);
     assert.equal(failed(claim.run_id).length, 0);
     assert.equal(completed(claim.run_id).length, 0);
     assert.equal(released.length, 0, "no source release");
+    assert.equal(archive.releaseCalls.length, 0, "the injected archive also retains custody");
     assert.equal((await outbox.loadPublicationRecord(claim.run_id, GEN)).kind, "ok");
   });
 }
@@ -769,7 +1262,12 @@ it("a failed capture on the re-park is retried until it is verified; the park is
   const seam = r as unknown as { captureRecoveryRestorePoint: (...a: unknown[]) => Promise<unknown> };
   const real = seam.captureRecoveryRestorePoint.bind(r);
   let attempts = 0;
+  let publicationEntered = false;
+  const phases = r as unknown as { phasePublicationOnly: (...args: unknown[]) => Promise<unknown> };
+  const publication = phases.phasePublicationOnly.bind(r);
+  phases.phasePublicationOnly = async (...args) => { publicationEntered = true; return publication(...args); };
   seam.captureRecoveryRestorePoint = async (...a) => {
+    if (!publicationEntered) return real(...a);
     attempts++;
     if (attempts <= 2) return { verified: false, published: false };
     return real(...a);
