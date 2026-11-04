@@ -939,6 +939,32 @@ func TestExpandSecondUpsizeOfSameClaimLogsAgain(t *testing.T) {
 	}
 }
 
+func TestExpandSecondResizeOfSameClaimLogsAgain(t *testing.T) {
+	f := newExpandFx(t, expandOpt{expand: boolp(true), dataReq: "50Gi", dindReq: "50Gi"})
+	setPending := func(on bool) {
+		t.Helper()
+		p := f.claim(dataPVCName(f.w.ID))
+		p.Status.Conditions = nil
+		if on {
+			p.Status.Conditions = []corev1.PersistentVolumeClaimCondition{{Type: corev1.PersistentVolumeClaimFileSystemResizePending, Status: corev1.ConditionTrue}}
+		}
+		if _, err := f.client.CoreV1().PersistentVolumeClaims(f.ns).UpdateStatus(context.Background(), p, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setPending(true)
+	f.mustTick() // resize pending: logged once
+	f.mustTick() // identical state: deduped
+	setPending(false)
+	f.mustTick() // resize finished: the reporter forgets the pending line
+	setPending(true)
+	f.mustTick() // a later resize of the same claim is reported again
+	needle := "pvc-resize-pending worker=w1 pvc=" + dataPVCName("w1")
+	if n := strings.Count(f.logs.String(), needle); n != 2 {
+		t.Fatalf("want 2 resize-pending lines for the data claim, got %d:\n%s", n, f.logs)
+	}
+}
+
 func TestExpandDropsDedupStateForUnobservedClaims(t *testing.T) {
 	f := newExpandFx(t, expandOpt{expand: boolp(true)})
 	gone := f.ns + "/" + dindDataPVCName("gone") + "#expand"

@@ -470,6 +470,26 @@ and the residuals in
 [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md)). Disk pressure never
 authorizes bypassing recovery custody or writer exclusion.
 
+## DinD data volume size and expansion
+
+A hosted Docker worker's `dind-data` PVC defaults per worker size: **20Gi** for `s` and
+`m`, **50Gi** for `l` and `l-highmem`. Setting the chart value `workers.docker.dindDataSize`
+(`UZI_WORKER_DIND_DATA_SIZE`) overrides every size, including a retained `20Gi`, an explicit
+`30Gi`, or a value kept by `helm upgrade --reuse-values`: an explicit `30Gi` does not become
+`50Gi`. The chart default is empty; clear the value to use the per-size defaults.
+
+The controller grows an existing `dind-data` (and `/data`) claim to the current size when its
+StorageClass allows volume expansion and the controller can read that class
+(`workers.storageClassRead.create`, on by default). It never shrinks, deletes or recreates the
+claim and rolls no pod. It waits while the worker has a roll in flight or an unadmitted pacing
+entry, or while DinD maintenance is active, and logs `pvc-expand-deferred` with the reason.
+Accepted growth raises the request first; the filesystem can stay pending until the driver
+finishes online or the next normal idle roll remounts it (`pvc-resize-pending`). The default
+Docker-tier storage quota is 1200Gi for ten workers; an override kept at 900Gi lets old claims
+stand but refuses the growth with `pvc-expand-failed reason=forbidden`. Design and the full log
+token list: [ADR-3890](../adr/3890-worker-pvc-expansion.md); operator procedure:
+[deploy/README.md](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes).
+
 ## Cost
 
 A docker sidecar budgets roughly **1-2 GiB memory and 1 CPU** on top of the

@@ -576,7 +576,7 @@ Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8
   - Per-size RAM raised: `s` 2–4Gi, `m` 4–8Gi, `l` 8–12Gi — each request lifted above that size's measured per-run peak (all still Burstable). Stops kubelet node-memory-pressure eviction of workers that sat over their request, incl. mid-run. [user, #1341]
   - `l` RAM raised again to request **14Gi** / limit **20Gi** (#2127): a persistent `l` worker running two concurrent runs was OOMKilled twice at 12Gi while both runs were in whole-program Go analyzer gates; owner-selected sizing, not a measured capacity guarantee; reduced node placement capacity accepted. `m` likewise raised to request **8Gi** / limit **12Gi** (a single run's `deadcode` hit 7.3-7.5 GiB at the old 8Gi limit and was OOMKilled twice). [user, #2127] (AI-synced 2026-10-07)
   - Hosted worker pods now carry a default `priorityClassName` (a modest cluster-scoped PriorityClass, value 1000, `globalDefault: false`), so under node memory pressure other lower-priority pods are evicted before ours. `preemptionPolicy: PreemptLowerPriority` (owner's choice): a worker that cannot be scheduled for lack of room also preempts lower-priority pods to get placed. Operators can set `Never` to drop that scheduling-time preemption. [user, #1341]
-- Persistent hosted `l` workers request 50Gi of data on both worker tiers; `m` remains 25Gi and run-bound data uses an independent 40Gi default across both worker tiers and the isolated lane. Default PVC ceilings and storage quotas admit the full configured fleet. Existing data PVCs retain their capacity and may be expanded by an operator without recreation when storage supports it. [user, #2013] (AI-synced 2026-10-14)
+- Persistent hosted `l` workers request 50Gi of data on both worker tiers; `m` remains 25Gi and run-bound data uses an independent 40Gi default across both worker tiers and the isolated lane. Default PVC ceilings and storage quotas admit the full configured fleet. Existing data PVCs retain their capacity and may be expanded by an operator without recreation when storage supports it. [user, #2013] (AI-synced 2026-10-14) Superseded in part: the controller now converges existing data (and DinD) claims upward to the render size where the claim's StorageClass allows expansion, never shrinking or recreating them; operators may still expand manually. [user 2026-11-04, #3890] (AI-synced 2026-11-04, #3890)
 - New ephemeral hosted workers default to `m`, configurable through chart `workers.ephemeralDefaultSize` (`s`, `m`, `l`, `l-highmem`, invalid values refuse rendering); non-chart API defaults and invalid-value fallback use `m`. The persistent picker stays at `l`; existing workers keep their stored sizes. `m` matches the pre-#2127 `l`: 1/4 CPU, 8Gi/12Gi memory, 25Gi persistent data. Ephemeral data now defaults to 40Gi (#2013); existing persistent `m` PVCs retain capacity until operator expansion or reprovisioning. [user, #2412, #2013] (AI-synced 2026-10-14) (AI-synced 2026-10-24, #3383 `l-highmem`)
   - `l-highmem` (#3383) is 1/4 CPU, 24Gi/32Gi memory, 50Gi data, with LimitRange memory max 32Gi on all worker tiers and quotas unchanged. (AI-synced 2026-10-24)
 - Three sizes stay, and the picker displays what each size buys. [user 2026-07-17]
@@ -867,6 +867,18 @@ for the whole of #201; this milestone (M4a) is the drift signal only.
 Every other decision on this feature is the team's and lives in `specs/ai.md`
 §476-§478.
 
+## Feature #3890 — Per-preset DinD data size and non-destructive PVC expansion
+
+Tracked as GitHub issue vtmocanu/uzi#3890; design record in `adr/3890-worker-pvc-expansion.md`. (AI-synced 2026-11-04, #3890)
+
+- Docker-tier DinD data claims default per preset: `s`/`m` 20Gi, `l`/`l-highmem` 50Gi. [user 2026-11-04]
+- An explicit `workers.docker.dindDataSize` (`UZI_WORKER_DIND_DATA_SIZE`) wins at every preset, including a retained 20Gi, an explicit 30Gi or a `--reuse-values` value; the chart default is now empty. [user 2026-11-04]
+- The controller converges an existing `/data` or DinD claim's request upward (monotonic, request-only, fenced by claim uid and resourceVersion) where the StorageClass allows expansion; it never shrinks, deletes, recreates or recycles a claim, and never forces a restart. A pod template carries no sizes, so nothing rolls. [user 2026-11-04]
+- Reading StorageClasses needs one narrow get-only ClusterRole, an owner-authorized exception to the chart's namespace-only RBAC; without it (`workers.storageClassRead.create=false`) expansion fails closed. [user 2026-11-04]
+- Pending and deferred expansion is reported in controller logs only (`pvc-expand-*`, `pvc-resize-*`); no API or wire change. The filesystem may stay pending until an online-capable driver finishes or the next idle roll remounts it. [user 2026-11-04]
+- The default Docker-tier storage quota is 1200Gi (`10 x (50 + 20 + 50)`). [user 2026-11-04]
+- Maintainer hosted acceptance (request, capacity and filesystem readings, claim uids, sentinel file, online and idle-remount paths, denied cases) is pending, not verified.
+
 ## Feature #224 — Worker pods declare no ephemeral-storage request
 
 Tracked as GitLab issue vtmocanu/uzi#224; PRD at `prds/done/224-worker-ephemeral-storage.md`.
@@ -889,6 +901,7 @@ Tracked as GitLab issue vtmocanu/uzi#224; PRD at `prds/done/224-worker-ephemeral
 - Build the boot-time PVC-ceiling check now. [user 2026-08-04]
 - The PVC resize path is dropped; the one legacy worker gets
   delete-and-reprovision. [user 2026-08-04]
+  - Superseded for `/data` and DinD data claims by #3890: existing requests now converge upward non-destructively (see Feature #3890). Delete-and-reprovision remains for `/nix` size drift. [user 2026-11-04] (AI-synced 2026-11-04, #3890)
 - The imagefs / image-accumulation defect is FILED, not fixed — issue #225.
   [user 2026-08-04]
 

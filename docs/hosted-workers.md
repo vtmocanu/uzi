@@ -67,9 +67,13 @@ at least 24Gi allocatable plus its sidecars, and a fleet of them can hit the
 worker namespace's shared quota, which shows as a failed replica on the worker's
 Deployment. New persistent **M** workers allocate 25Gi of `/data`, and **L** and
 **L-HIGHMEM** workers allocate 50Gi. Ephemeral data uses its independent 40Gi default. Existing data volumes
-keep their current capacity: the controller does not resize existing PVCs.
-Operators can [expand them in place](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes)
-on a StorageClass that supports volume expansion.
+are converged **upward** to these sizes by the controller when the claim's StorageClass allows volume
+expansion; it never shrinks, deletes or recreates a volume. An accepted
+expansion grows the claim's request first. The filesystem can stay pending until the
+driver finishes the resize online or the worker's next normal idle roll remounts the volume;
+the controller never forces a restart, and logs `pvc-resize-pending` meanwhile. Without expansion
+support or the controller's read-only StorageClass access, the volume keeps its capacity and
+operators can [expand it in place](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes).
 Existing workers keep their stored size and are not switched to another size; existing **M** workers receive the
 1-CPU request and 4-CPU limit when the controller next rolls their pod spec.
 Operators set `workers.ephemeralDefaultSize` in the chart (`s`, `m`, `l`, or `l-highmem`);

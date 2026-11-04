@@ -578,11 +578,30 @@ nothing else by design.
 
 ### Expanding existing worker data volumes
 
-New persistent L workers request 50Gi of `/data` (#2013). Existing PVCs keep their
-capacity; the controller creates missing claims but does not resize existing
-`/data` claims or revert an operator's expansion. M remains 25Gi, and run-bound
-workers use `workers.ephemeralWorkerDataSize` (40Gi by default). Expand an existing
-run-bound data PVC to 40Gi using the same procedure while retaining its contents.
+New persistent L workers request 50Gi of `/data` (#2013), and Docker workers' DinD
+data claims default per size (`s`/`m` 20Gi, `l`/`l-highmem` 50Gi; #3890). The controller
+converges an **existing** `/data` or DinD claim's request **upward** to the rendered size
+on its own, when the claim's StorageClass has `allowVolumeExpansion: true` and the
+controller can read the class (`workers.storageClassRead.create`, default `true`). It
+patches `spec.resources.requests.storage` only, fenced on the claim's uid and
+resourceVersion; it never shrinks, deletes, recreates or recycles a claim, never reverts
+an operator's larger expansion, and rolls no pod (sizes are not in the pod template). M
+remains 25Gi, and run-bound workers use `workers.ephemeralWorkerDataSize` (40Gi by
+default). An explicit `workers.docker.dindDataSize` is a cluster-wide override that wins at
+every size (a retained `20Gi`, an explicit `30Gi` or a `--reuse-values` value does not
+become `50Gi`); clear it to adopt the per-size defaults.
+
+An accepted patch grows the request, not the filesystem. Watch the controller logs for
+`pvc-expand-requested`, `pvc-expand-deferred` (a roll, maintenance or reservation fence;
+retried on later ticks), `pvc-expand-skipped` (for example `class-not-expandable`,
+`class-lookup-forbidden`, `no-storage-class`), `pvc-expand-failed` (for example
+`reason=forbidden` when the namespace quota is exhausted) and `pvc-resize-pending` /
+`pvc-resize-failed`. The filesystem finishes online on a driver that supports it;
+otherwise it stays pending until the worker's next normal idle roll remounts the volume.
+The controller never forces a restart. With `workers.storageClassRead.create=false`, custom
+RBAC or an older chart the class lookup is refused and expansion fails closed
+(`class-lookup-forbidden`). The manual procedure below remains for operators and edge cases.
+See [ADR-3890](../adr/3890-worker-pvc-expansion.md).
 
 Before upgrading, raise any per-cluster overrides of both worker tiers'
 `limitRange.maxPVCStorage` to at least 50Gi. The controller refuses to start if a
@@ -594,7 +613,11 @@ cover 20 restricted workers at `20 x (50 + 20) = 1400Gi` and 10 Docker workers a
 `10 x (50 + 20 + 50) = 1200Gi`. For example, a 30Gi DinD override needs 1000Gi for
 10 Docker workers. The isolated lane needs 600Gi for ten run-bound workers
 (`10 x (40 + 20)`), with a PVC ceiling of at least 40Gi. Its chart guard also checks
-run-bound data overrides. Allow budget for existing claims and their requested growth.
+run-bound data overrides. Allow budget for existing claims and their requested growth: a
+Docker quota override kept at 900Gi refuses the 50Gi DinD growth, logged as
+`pvc-expand-failed reason=forbidden`. The per-claim `limitRange.maxPVCStorage` ceiling rests
+on the controller's boot check and the chart guards; Kubernetes' LimitRanger may not
+re-validate a PVC update, which has not been verified on a live cluster.
 
 The `l-highmem` worker size (#3383) requests 24Gi and is limited to 32Gi of memory.
 Before using it, raise any per-cluster override of `limitRange.max.memory` on all
@@ -735,6 +758,7 @@ which takes uzi down. It fails closed, but the blast radius is the whole product
 | `workers.drainDeadline` | `"24h"` | Compatible Go duration (`"1h"`, `"30m"`), with unchanged positive-only parsing; exposed as `UZI_WORKER_DRAIN_DEADLINE`. Now bounds only independent **nondrifted** pressure/nix-size maintenance, which can interrupt busy runs. After the fixed #3852 controller deploys, Docker maintenance preserves /data even under ForceRoll; only plain hosted pressure recycle can delete it unless custody-held. No elapsed timer permits busy spec-hash/generation replacement or associated recycle, even with no pacing entry/plain drain; shortening this value no longer forces image upgrades. No new knob. |
 | `workers.forceRoll` | `false` | **Global** emergency bypass of pacing, holds, incarnation proof and busy deferral for drifted workers, plus busy deferral for independent maintenance. May interrupt runs and lose all capacity; neither targeted nor a recovery guarantee. Docker data and custody-held plain data remain protected, and independent DinD readiness/identity/pod-absence guards remain authoritative; DinD has no deadline or ForceRoll bypass. No automatic rollback. Restore `false` after the emergency. |
 | `workers.storageClass` | `""` (cluster default) | `standard` on dev-cluster. |
+| `workers.storageClassRead.create` | `true` | Renders the controller's one ClusterRole, `<fullname>-controller-storageclass-read` (`get` on `storageclasses`, nothing else), and its ClusterRoleBinding (#3890). Size-only PVC expansion reads the claim's StorageClass for `allowVolumeExpansion`, and a StorageClass is cluster-scoped, so a namespaced Role cannot grant it: an owner-authorized exception to the chart's namespace-only RBAC. `false` (or custom RBAC) makes expansion fail closed with `class-lookup-forbidden`; creation, recycling and rolls are unaffected. |
 | `workers.nodeSelector` | `kubernetes.io/arch: amd64` | Rendered onto every hosted worker pod (plain, docker, isolated), next to the docker tier's soft anti-affinity. The default exists because the published agent images are amd64 only. With your own arm64-capable `workers.image.repository`, override it or clear it with `nodeSelector: null` (`{}` does not clear it: Helm merges it into the default). Changing it re-hashes every worker's pod template: persistent workers roll through the normal paced drain, while run-bound workers are outside pacing but keep the busy-drift deferral. |
 
 ### Deploying paced hosted rolls (#1470)
