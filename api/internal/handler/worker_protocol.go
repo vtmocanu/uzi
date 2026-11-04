@@ -2407,10 +2407,12 @@ func (h *Handler) WorkerListMemory(w http.ResponseWriter, r *http.Request) {
 //
 // The base listeners time a request out after 15 s, too short for an upload followed by a forge
 // push, so this route extends its own deadlines through http.NewResponseController (the
-// WorkerRunHeldPublication precedent), after the header and query validation:
+// WorkerRunHeldPublication precedent). Every budget is measured from start, captured on handler
+// entry (before the header and query validation); the deadlines themselves are set once that
+// validation has passed:
 //
-//	upload    60 s  read deadline: the body read (a stalled upload is a 408 and never reaches
-//	                the publisher)
+//	upload    60 s  read deadline start+upload: the body read (a stalled upload is a 408 and never
+//	                reaches the publisher)
 //	context  workersvc.PublishContextBudget  the one context handed to PublishAttested: a
 //	                live-routed push is sent within its pre-push budget and the broker waits on
 //	                it for its own ceiling
@@ -2418,12 +2420,13 @@ func (h *Handler) WorkerListMemory(w http.ResponseWriter, r *http.Request) {
 //	                budget plus the detached retention work that can still run after it expires
 //	grace     15 s  writing the answer
 //
-// and the write deadline is upload + service + grace. The vars (worker_publish_deadline.go) are
+// and the write deadline is start + upload + service + grace. The vars (worker_publish_deadline.go) are
 // named so a test can scale them, keeping the ratio. No other wrapper deadline is added: the
 // service's own bounds are the argument, and cutting the context shorter would cut the
 // request-context persist and track writes of the publish. (The detached retention bookkeeping
 // runs on retentionBookkeepingCtx, which is WithoutCancel, and is not affected.)
 func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
@@ -2464,7 +2467,6 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 	// Raw octet-stream body, NOT JSON: httpx.DecodeJSON is JSON+1 MiB only. Cap with
 	// MaxBytesReader so an over-cap pack is a truthful 413 (a split/too-large signal),
 	// not a silently truncated — and thus malformed — pack.
-	start := time.Now()
 	rc := http.NewResponseController(w)
 	_ = rc.SetReadDeadline(start.Add(publishUploadBudget))
 	_ = rc.SetWriteDeadline(start.Add(publishUploadBudget + publishServiceBound + publishResponseGrace))
