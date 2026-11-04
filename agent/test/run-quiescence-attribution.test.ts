@@ -106,6 +106,26 @@ describe("issue #3915: attribution trace on an unattributed unreadable process",
     assert.ok(res.unverified.every((p) => p.reason === "unreadable_unattributed"));
   });
 
+  it("builds traces from the scan's own stat pass, with no extra procfs reads", () => {
+    const procs: Record<number, P> = {};
+    // Four unreadable leaves, each under a 20-deep readable chain.
+    for (let leaf = 0; leaf < 4; leaf++) {
+      const base = 1000 + leaf * 100;
+      for (let i = 0; i < 20; i++) procs[base + i] = { ppid: i === 0 ? 1 : base + i - 1, readable: true };
+      procs[base + 20] = { ppid: base + 19 };
+    }
+    const t = table(procs);
+    let statReads = 0;
+    const counting: ProcTable = { ...t, readStat: (pid) => { statReads += 1; return t.readStat(pid); } };
+    const res = scanOnce(req(), counting, SELF);
+    assert.equal(res.unverified.filter((p) => p.attribution).length, 4);
+    assert.equal(res.unverified[0]?.attribution?.ancestors.length, 16);
+    const pids = Object.keys(procs).length;
+    // One stat per pid in the first pass, plus at most the pre-existing per-entry reads
+    // (ancestry, group and session checks happen only when roots exist; here there are none).
+    assert.ok(statReads <= pids + 4 * 2, `stat reads ${statReads} for ${pids} pids`);
+  });
+
   it("reaches the log fields, and a helper-supplied trace is rebuilt from validated fields only", () => {
     const t = scanOnce(req(), table({ 62: {} }), SELF).unverified[0]!.attribution!;
     const fields = describeProcesses({ state: "unverified", processes: [{ pid: 62, uid: RUNNER, comm: "x", cwd: "unreadable", reason: "unreadable_unattributed", attribution: t }], killed: [], detail: "d" });

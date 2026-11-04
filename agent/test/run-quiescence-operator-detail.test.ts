@@ -93,7 +93,15 @@ describe("issue #1783 M2: an unattributed unreadable process is named in the ver
     assert.equal(r.state, "unverified");
     assert.equal(r.detail, `runner-uid pid ${PID} "ssh-agent" could not be attributed (env/cwd unreadable)`);
     assert.deepEqual(describeProcesses(r), [
-      { pid: PID, uid: ME, comm: "ssh-agent", cwd: "/", reason: "unreadable_unattributed", attribution: "could not be attributed" },
+      {
+        pid: PID, uid: ME, comm: "ssh-agent", cwd: "/", reason: "unreadable_unattributed", attribution: "could not be attributed",
+        // issue #3915: which identities were checked against which recorded roots.
+        attribution_trace: {
+          startTime: 1000, ppid: 1, pgid: PID, sid: PID, ancestors: [{ pid: 1 }],
+          candidates: [{ pid: PID, role: "self", match: "not_recorded" }, { pid: 1, role: "ancestor", match: "not_recorded" }],
+          rootsCompared: 0,
+        },
+      },
     ]);
   });
 

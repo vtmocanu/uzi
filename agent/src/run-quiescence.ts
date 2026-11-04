@@ -1018,24 +1018,36 @@ function attributedToOtherLive(pid: number, table: ProcTable, roots: RootIndex):
   return [...candidates].some((c) => isRecordedRoot(c, table, roots));
 }
 
-/** issue #3915: how a candidate compares with the recorded roots (see {@link AttributionMatch}). */
-function rootMatch(candidate: number, table: ProcTable, roots: RootIndex): AttributionMatch {
+/** issue #3915: the stat facts the scan's first pass already read for every pid. The trace
+ *  reads nothing else, so it never spends procfs budget the proof itself needs. */
+interface StatSnapshot {
+  parentOf: ReadonlyMap<number, number>;
+  startTimeOf: ReadonlyMap<number, number>;
+  commOf: ReadonlyMap<number, string>;
+}
+
+/** issue #3915: how a candidate compares with the recorded roots (see {@link AttributionMatch}),
+ *  judged on the scan's snapshot rather than a fresh read. */
+function rootMatch(candidate: number, snap: StatSnapshot, roots: RootIndex): AttributionMatch {
   const recorded = roots.get(candidate);
   if (recorded === undefined) return "not_recorded";
-  const r = tryRead(() => table.readStat(candidate));
-  const startTime = r.ok ? parseStat(r.value)?.startTime : undefined;
+  const startTime = snap.startTimeOf.get(candidate);
   if (startTime === undefined) return "start_unreadable";
   return recorded.has(startTime) ? "matched" : "start_mismatch";
 }
 
 /** issue #3915: the bounded identity trace of an unreadable process that
- *  {@link attributedToOtherLive} could not attribute. Reads only world-readable stat files. */
-function traceAttribution(pid: number, facts: StatFacts | undefined, table: ProcTable, roots: RootIndex): AttributionTrace {
-  const ancestors = ancestorsOf(pid, table).slice(0, TRACE_MAX_ANCESTORS).map((a) => {
-    const r = tryRead(() => table.readStat(a));
-    const f = r.ok ? parseStat(r.value) : undefined;
-    return { pid: a, ...(f ? { comm: f.comm } : {}), ...(f?.startTime !== undefined ? { startTime: f.startTime } : {}) };
-  });
+ *  {@link attributedToOtherLive} could not attribute, built only from facts already read. */
+function traceAttribution(pid: number, facts: StatFacts | undefined, snap: StatSnapshot, roots: RootIndex): AttributionTrace {
+  const ancestors: AttributionTrace["ancestors"] = [];
+  let cur = snap.parentOf.get(pid);
+  while (cur !== undefined && cur > 0 && ancestors.length < TRACE_MAX_ANCESTORS && !ancestors.some((a) => a.pid === cur)) {
+    const comm = snap.commOf.get(cur);
+    const startTime = snap.startTimeOf.get(cur);
+    ancestors.push({ pid: cur, ...(comm !== undefined ? { comm } : {}), ...(startTime !== undefined ? { startTime } : {}) });
+    if (cur === 1) break;
+    cur = snap.parentOf.get(cur);
+  }
   const ordered: Array<{ pid: number; role: AttributionCandidate["role"] }> = [{ pid, role: "self" }];
   if (facts) ordered.push({ pid: facts.pgid, role: "pgid" }, { pid: facts.sid, role: "sid" });
   for (const a of ancestors) ordered.push({ pid: a.pid, role: "ancestor" });
@@ -1044,7 +1056,7 @@ function traceAttribution(pid: number, facts: StatFacts | undefined, table: Proc
   for (const c of ordered) {
     if (seen.has(c.pid) || candidates.length >= TRACE_MAX_CANDIDATES) continue;
     seen.add(c.pid);
-    candidates.push({ ...c, match: rootMatch(c.pid, table, roots) });
+    candidates.push({ ...c, match: rootMatch(c.pid, snap, roots) });
   }
   let rootsCompared = 0;
   for (const times of roots.values()) rootsCompared += times.size;
@@ -1077,14 +1089,17 @@ export function scanOnce(
   const excluded = new Set<number>([selfPid, ...ancestorsOf(selfPid, table)]);
   const parentOf = new Map<number, number>();
   const startTimeOf = new Map<number, number>();
+  const commOf = new Map<number, string>();
   for (const pid of pids) {
     const r = tryRead(() => table.readStat(pid));
     const facts = r.ok ? parseStat(r.value) : undefined;
     if (facts) {
       parentOf.set(pid, facts.ppid);
+      commOf.set(pid, facts.comm);
       if (facts.startTime !== undefined) startTimeOf.set(pid, facts.startTime);
     }
   }
+  const snapshot: StatSnapshot = { parentOf, startTimeOf, commOf };
   const isDescendant = (pid: number): boolean | undefined => {
     let cur = parentOf.get(pid);
     for (let depth = 0; depth < 256; depth++) {
@@ -1156,7 +1171,7 @@ export function scanOnce(
         // for the first few such entries of this pass only.
         if (traced < TRACE_MAX_PER_SCAN) {
           traced += 1;
-          result.unverified.push({ ...entry, attribution: traceAttribution(pid, facts, table, roots) });
+          result.unverified.push({ ...entry, attribution: traceAttribution(pid, facts, snapshot, roots) });
         } else {
           result.unverified.push(entry);
         }
