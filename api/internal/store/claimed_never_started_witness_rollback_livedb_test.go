@@ -27,7 +27,11 @@ func TestClaimedNeverStartedWitnessRollbackLiveDB(t *testing.T) {
 		}
 		return got
 	}
-	exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='retained_continuation_unwitnessed', recovery_retry_not_before=NULL WHERE id=$1", f.runs[0])
+	exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='retained_continuation_unwitnessed', recovery_retry_not_before=now()+interval '1 hour' WHERE id=$1", f.runs[0])
+	var claimBefore string
+	if err := tx.QueryRow(f.ctx, "SELECT concat_ws('|', worker_id, claim_generation, claim_released_at, released_worker_id) FROM runs WHERE id=$1", f.runs[0]).Scan(&claimBefore); err != nil {
+		t.Fatal(err)
+	}
 	if got := attention("retained_continuation_unwitnessed"); got != "source_only" {
 		t.Fatalf("Up attention = %s, want source_only", got)
 	}
@@ -38,6 +42,10 @@ func TestClaimedNeverStartedWitnessRollbackLiveDB(t *testing.T) {
 	if err := tx.QueryRow(f.ctx, "SELECT status='recovery_wait' AND recovery_wait_cause='retained_recovery_exhausted' AND recovery_retry_not_before IS NULL AND finished_at IS NULL AND fail_origin IS NULL FROM runs WHERE id=$1", f.runs[0]).Scan(&ok); err != nil || !ok {
 		t.Fatalf("Down did not move the run to the non-terminal owner-held park: ok=%v err=%v", ok, err)
 	}
+	var claimAfter string
+	if err := tx.QueryRow(f.ctx, "SELECT concat_ws('|', worker_id, claim_generation, claim_released_at, released_worker_id) FROM runs WHERE id=$1", f.runs[0]).Scan(&claimAfter); err != nil || claimAfter != claimBefore {
+		t.Fatalf("Down changed claim fields: before=%q after=%q err=%v", claimBefore, claimAfter, err)
+	}
 	if got := attention("retained_continuation_unwitnessed"); got != "archive_ready" {
 		t.Fatalf("Down attention for the new cause = %s, want archive_ready (function restored)", got)
 	}
@@ -47,7 +55,7 @@ func TestClaimedNeverStartedWitnessRollbackLiveDB(t *testing.T) {
 	}
 	exec("ROLLBACK TO SAVEPOINT narrow")
 	var cols int
-	if err := tx.QueryRow(f.ctx, "SELECT count(*) FROM information_schema.columns WHERE table_name='runs' AND column_name IN ('registration_evidence_generation','snapshot_departed_epoch')").Scan(&cols); err != nil || cols != 0 {
+	if err := tx.QueryRow(f.ctx, "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='runs' AND column_name IN ('registration_evidence_generation','registration_evidence_nonce','registration_evidence_epoch','snapshot_departed_generation','snapshot_departed_nonce','snapshot_departed_epoch')").Scan(&cols); err != nil || cols != 0 {
 		t.Fatalf("witness columns after Down = %d (%v), want 0", cols, err)
 	}
 }
