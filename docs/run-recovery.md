@@ -143,6 +143,27 @@ the memory guard, the existing flow runs and the run fails as
 ("held by an earlier flight's unended source use") and retries until the requeue
 cap, then ends in `worker_requeue_exhausted` or `failed` per the existing
 exhaustion rule; this is new with #3638, not as before.
+
+At the two retained-predecessor refusals inside retained recovery (before capture
+or model execution), a worker can observe an already accepted owner **Cancel**
+through one read-only ownership request, bounded to 10 seconds. It honours the
+request only for its current, unreleased `claimed` or `running` generation and
+with positively clean local outcome evidence, rechecked after the request.
+Pending outcomes at any generation, incomplete outbox coverage, unresolved
+execution tails, other holds, or unknown evidence keep the retained stop. The
+probe never reads or consumes steering inputs. This does not apply to the
+fresh-seed canonical held-source refusal or to stops after execution.
+
+A qualifying cancellation uses the normal worker terminal-report path and keeps
+the retained source and custody holds; it grants no source cleanup permission.
+The new API applies the pending cancel inputs in the same transaction as that
+terminal transition. During a mixed-version rollout, an old API can accept the
+terminal report without applying the cancel input: that row remains inert on
+the terminal run. An old API's ownership response omits the new signal, so the
+worker keeps the retained stop instead of cancelling. A timeout or failed probe
+also leaves the cancel pending. Unrelated pending worker outcomes still require
+the existing explicit-discard confirmation.
+
 On a continuation whose record carries a settlement (not on the re-park path),
 the fresh worker logs `predecessor cooperative settlement verified` or
 `unverified` for diagnosis only; neither releases custody. A new run of the same
@@ -169,7 +190,8 @@ journal that changes under the call re-admits at most twice per claim, and the
 third is the same stop. The stop leaves the claim's own custody hold open, so at
 the cap the run parks `recovery_wait` with `worker_requeue_exhausted` for an owner
 Resume or Cancel. Every claim on this path opens its own custody hold and the stop leaves it open, so at
-the default cap of 3 this stop loop accrues at most 1 + `RUN_MAX_REQUEUES` (4) open holds per exhaustion episode, below the default
+the default cap of 3, when the server accepted the initial `running` report,
+this stop loop accrues at most 1 + `RUN_MAX_REQUEUES` (4) open holds per exhaustion episode, below the default
 `custody_hold_limit` of 8; those holds share the owner's admission count with the
 owner's other runs, so several exhausted runs can hold the owner's new claims
 queued until those holds are discarded or released (Resume and Cancel leave them open). A retained-sources journal
@@ -182,6 +204,11 @@ permanently failing preflight, or a valid fenced source with retained sources
 stays retained until exhaustion, then owner-held. See
 [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md) for the lock
 order and outcomes.
+
+The requeue-budget bound does not cover a claim whose initial `running` report
+was not applied: claimed-never-started resets can repeat without charging that
+budget and accumulate more holds (tracked in
+[issue #3859](https://github.com/vtmocanu/uzi/issues/3859)).
 
 Workers built before this change reject the new `memoryPark` journal record and
 fail closed on it: they refuse to attach, recover or discard that source. Roll
@@ -2221,7 +2248,7 @@ unknown measurement does not mean zero.
 | Disposition | Meaning and next step |
 |---|---|
 | `owner_hold_discard <hold-id>` | A server hold still owns the source. Use `uzi run discard <run-id> --hold <hold-id> --yes`. |
-| `resolve_local_record` | A local recovery, settlement or terminal record still protects the source. Guarded recovery records with closed server holds remain blocked, with no supported resolver yet ([follow-up #3885](https://github.com/vtmocanu/uzi/issues/3885)). Owner handling is required; an empty open-hold list does not make deletion safe. |
+| `resolve_local_record` | A local recovery, settlement or terminal record still protects the source. A guarded recovery record whose closed hold was released with a receipt matching the saved FINAL request (whether or not its FINAL ACK is already saved) can be resolved with the [local-record commands](#resolving-guarded-local-records) below. A discarded hold (even with an ACK saved), a release without the matching receipt (Case B), settlement and terminal records, and unbound files remain blocked and need owner handling ([#3885](https://github.com/vtmocanu/uzi/issues/3885) stays open for Case B). An empty open-hold list never makes deletion safe. |
 | `local_discard` / `local_protected_discard` | Nothing else holds the source; it may be discarded with the command below (protected for episode or protected sources). |
 | `refused` | Named consumers still use the source. The output lists them. |
 
@@ -2248,6 +2275,16 @@ The disposition follows what the worker can see:
 - Otherwise it is `local_discard`, which loses every byte not already in a capture,
   published checkpoint or the tracking ref and clears that plain journal, so a later
   resume seeds fresh.
+
+The same read-only ownership probe returns `cancellation_requested` alongside
+the run status, `claim_generation` and `claim_released`. It is true only when
+`stop_kind` is `cancelled` and at least one unapplied cancel input remains
+deliverable (neither superseded nor covered by a milestone-reconciliation cutoff).
+A NULL stop kind yields false. Reading the probe neither consumes nor applies
+inputs; an absent signal from an older API is unknown, never cancellation
+authority. The retained-recovery refusal uses this positive signal together with
+its local outcome-safety checks, independently of the lifecycle evidence needed
+for source discard.
 
 The probe is scoped to the worker: once the run's `worker_id` moves off this worker (a
 requeue after a released claim, or a claim elsewhere) it reads 404, so the leftover is
@@ -2335,6 +2372,95 @@ remains.
 > namespace from `UZI_WORKER_NS` (which lists namespaces, not pods) unless you have verified
 > that namespace holds no source a tracked run needs: excluding it hides those sources from
 > the search, so their work is no longer backed up and the backup could read green without it.
+
+#### Resolving guarded local records
+
+When inspect reports `resolve_local_record` for a guarded recovery record, two more
+commands on the same channel classify and retire it. Use the same invocation form as
+above (Compose, single-UID or split-UID), with the subcommand and flags changed:
+
+```sh
+# 1. Classify every local-record generation of the run (read-only)
+/usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
+  local-records --run <run-id>
+
+# 2. Retire one generation, confirming the digest step 1 printed
+/usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
+  resolve-local-record --run <run-id> --generation <n> --confirm <digest>
+
+# 3. Re-inspect the source
+/usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
+  inspect --run <run-id> --generation <n> --attempt <attempt-id|canonical>
+```
+
+1. `local-records` prints one classification per generation. `case_a_ack` means the
+   FINAL acknowledgement is already saved and the closed hold was released with the
+   matching receipt. `case_a_replay` means the saved FINAL's
+   closed hold carries a matching receipt but the local acknowledgement never landed.
+   Both come with a `digest`. Any other value is a named blocker (below), and run-level
+   blockers (`inventory_incomplete`, `record_unverified`, `generation_missing`) appear in `blockers`.
+2. `resolve-local-record` recomputes the digest under the journal lock and refuses
+   `descriptor_changed` if anything drifted. For `case_a_ack` it runs the existing
+   local cleanup. For `case_a_replay` it first sends **one** release replay of the
+   identical saved request (no replacement request, no new decision, no new upload), then
+   the acknowledgement that makes the generation `case_a_ack`, then the same cleanup.
+3. When inspect then reports `local_protected_discard`, finish with `discard … --protected`
+   as above. Resolution retires only that generation's local recovery refs, bundles and records;
+   it does not discard the retained source.
+
+Outcomes that reach the remember step appear in inspect's `lastDiscards` with attempt
+`local-record`. Admission refusals (`shutting_down`, `busy`, `no_claim_gate`) return before it
+and are not recorded, and the list is in-process and bounded, so it does not survive a worker restart.
+
+**Outcomes.** `retired` (the generation's records are gone; `remaining` counts the
+record files left for the run), `refused` (nothing was touched) and `partial` (the point of
+no return was crossed and the end state is not known to be complete, for example a
+deadline, shutdown or `acknowledged_cleanup_refused:<reason>` after the replay's
+acknowledgement). After `partial`, run `local-records` again before doing anything else.
+A client that disconnects before the first mutation (the cleanup, or the replay's
+release POST) ends the request `client_disconnected` with nothing touched; afterwards the
+request runs to completion or to its deadline.
+
+**Refusals and blockers.**
+
+| Group | Names |
+|---|---|
+| Channel admission | `busy`, `shutting_down`, `no_claim_gate`, `claims_not_drained`, `worker_not_idle`, `client_disconnected` |
+| Request and coordinator | `invalid_request`, `recovery_disabled`, `authority_busy`, `cycle_busy`, `executing`, `worker_quarantined`, `deadline_exhausted`, `descriptor_changed`, `cleanup_failed` |
+| Journal and records | `not_found`, `inventory_incomplete`, `record_unverified`, `unbound_artifact:<name>`, `settlement_record_unsupported`, `terminal_protection`, `not_guarded`, `non_ordinary_origin`, `completion_receipt_generation`, `cleanup_pending`, `final_ack_unknown`, `replay_refused_persisted`, `binding_missing`, `binding_inconsistent`, `bare_mismatch` |
+| Server evidence | `holds_unknown`, `hold_open`, `pending_generation_report`, `exact_evidence_unavailable`, `evidence_deadline`, `run_state_not_terminal`, `case_b_pending_owner_review` |
+| Source proof and replay | `source_identity_unavailable`, `bare_mutation_unresolved`, `replay_failed_before_post`, `replay_precondition_unmet:<reason>`, `replay_failed`, `internal_error` |
+
+The table is not exhaustive. Other replay and cleanup reasons can appear, for example
+`source_boundary_retained`, `no_saved_final`, `replay_ack_mismatch`, `replay_failed:<reason>`,
+`held_fallback_required:<why>`, and cleanup outcomes such as `cleanup_retained` and
+`source_protected`. Re-run `local-records` or `inspect` before retrying.
+
+An unbound `*.tmp` file or orphan bundle in the run's record directory is retained and
+refuses the whole run's generations as `unbound_artifact:<name>`; a
+crash between a record's temp write and its rename leaves exactly such a file. Resolution
+deletes only artifacts bound to the retired authenticated generation, and never the pins
+of other generations or runs.
+
+**Timeout and unknown outcome.** The request deadline (60 s) is cooperative: it is
+checked between operations, and owned filesystem work and child processes are awaited.
+The worker's locks and the closed claim gate can therefore outlast both the deadline
+and the client's 120 s idle timeout. The client then prints `timed out waiting for the
+worker; the resolution outcome is unknown: re-inspect (local-records / inspect) before
+retrying` and exits non-zero. The worker still finishes, logs
+`retained-source: local record resolution finished` with the outcome, and remembers it
+for inspect even though the client left. The claim gate reopens only once that work has
+settled. Re-inspect before retrying: the digest changes after any mutation, so a stale
+`--confirm` is refused with `descriptor_changed`.
+
+**What this does not do.** It handles Case A only (the closed hold was released with a
+receipt matching this record's saved FINAL request, with or without the ACK already saved).
+A discarded hold, or custody released without this record's matching receipt, is refused
+(typically `case_b_pending_owner_review`; the first failing check wins, so an earlier
+blocker such as `cleanup_pending`, `binding_missing` or `holds_unknown` can be reported instead);
+no supported resolver exists for it, and it is [proposed, not accepted](../adr/2417-guarded-local-retention.md#proposed-not-accepted-case-b-local-record-disposition-3885).
+The tested failure model is an abrupt process kill; storage or power-loss behaviour is
+unspecified (record writes are rename-atomic, not fsynced).
 
 What the channel does not promise:
 

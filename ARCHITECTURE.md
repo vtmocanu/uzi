@@ -180,9 +180,10 @@ The endpoints that call out to the forge on a user's behalf (`.../verify`, `.../
 ## Agent templates
 
 An agent template (`agent_templates` table) is the definition of one role an
-agent can play: name, description, an optional model override, an optional
-tools allowlist, and a prompt body. It is not itself an agent; it is the
-recipe a later release renders into a running one.
+agent can play: name, description, optional per-harness model pins (`model`
+for Claude, `codex_model` for Codex), an optional tools allowlist, and a prompt
+body. It is not itself an agent; it is the recipe a later release renders into
+a running one.
 
 - **`builtins/` is the single source of truth.** Twelve builtin roles, the
   `lead` orchestrator (`model: opus`) plus eleven subagents (`coder`, `reviewer`,
@@ -197,16 +198,37 @@ recipe a later release renders into a running one.
   releases add or upgrade builtins without a non-re-runnable SQL seed; a boot warning is logged if
   a non-builtin row already occupies a builtin's name.
 - **The `lead` is the main thread, not a subagent.** The worker
-  (`agent/src/agents.ts`) partitions templates by name (`LEAD_NAME_RE`, matching
-  `lead`/`orchestrator`) and routes the matched template's `prompt_body`/`model`
-  into the run's main SDK thread rather than an invokable subagent. Main-thread
-  model precedence: the owner's per-user default (`users.default_model`) → the
-  `lead` template's `model` → the SDK/account default. A subagent's own `model`
-  wins for it when set, else inherits the resolved main-thread model. See
-  [docs/worker-model.md](docs/worker-model.md). The same claim carries the owner's
+  (`agent/src/agents.ts`) selects the first delivered own template matching
+  `lead`/`orchestrator` case-insensitively and routes its body and delivered
+  harness pin into the main thread. Every own lead-shaped template is withheld
+  from subagents; repo templates, including `lead`, remain ordinary subagents.
+  Both harnesses use this rule. Run models follow the frozen schedule pin,
+  the owner's per-harness lane, the selected lead's harness pin, then the
+  SDK/account default for Claude or `gpt-6.1-sol` for Codex.
+  A subagent's delivered pin wins when set;
+  otherwise it follows the resolved main-thread model, subject to the schedule's
+  subagent override. See [docs/worker-model.md](docs/worker-model.md). The same
+  claim carries the owner's
   per-user **reasoning effort** (`users.default_effort`, PRD #617): set, it applies
   to the SDK top-level effort for the main thread and its subagents; unset, the SDK
   default (`high`) applies. See [docs/worker-effort.md](docs/worker-effort.md).
+- **Per-harness pins (PRD #3249).** The template API validates `model` as
+  a Claude pin (custom IDs allowed except Codex role IDs) and `codex_model`
+  against `agenttmpl.CodexRoleModels`, including `gpt-6-luna`. Null or blank
+  clears a pin; an update omitting `codex_model` preserves its stored value
+  before both the customized decision and the write. The migration moves
+  recognized stored Codex role IDs from `model` to `codex_model`. Claim assembly
+  projects the pin for the run's frozen `run.Harness` into the existing wire
+  `model` field, independent of the user's current default or original harness
+  preference. `agenttmpl.PinForHarness` filters again at delivery: Claude drops
+  Codex role IDs, Codex accepts only role IDs, and an empty result omits the pin.
+  Both pins participate in builtin content comparison and customization; a
+  changed pin stops pristine refresh until Reset restores shipped content,
+  including the empty Codex pin. The Claude Markdown renderer remains
+  Claude-only and does not emit `codex_model`. Updated workers use the lead's
+  Codex pin through the shared lead resolver; older workers ignore that root
+  fallback. See [PRD #3249](prds/3249-per-harness-template-pins.md) for the
+  rollout boundaries and pending hosted acceptance.
 - **Scopes + per-user ownership (PRD #18).** Each template has a `scope`
   (`builtin`/`global`/`user`) and, for user scope, a `user_id`, mirroring skills.
   Builtin and global are visible to everyone and admin-managed; a `user` template
@@ -217,8 +239,9 @@ recipe a later release renders into a running one.
   ties to `scope='builtin'`. Two partial-unique name indexes (shared names unique
   across builtin+global; per-user names unique) let a user own a name colliding
   with a shared one; `lead`/`orchestrator` are reserved so no API-created template
-  can take a lead name, the invariant behind the worker's "a claim never carries
-  two lead-matching templates" pin.
+  can take a lead name. Synced or legacy rows can still deliver multiple
+  lead-shaped names, so the worker selects the first and withholds every such
+  name from the own subagent roster.
 - **Allocation + claim filtering (PRD #18).** `agent_template_allocations` decides
   which templates ride each run: a global-default layer (admin, `user_id NULL`,
   always enabled) plus a per-user `enabled` overlay. Every builtin/global gets an
@@ -511,7 +534,9 @@ durable design decisions and
 [docs/rate-limits.md](docs/rate-limits.md#codex-account-limits) for
 user-facing behavior. For users who opt in (`codex_account_mode = auto`), these
 readings also pick the Codex account at run creation only, never afterwards; see
-the [ADR-1106 amendment](adr/1106-codex-harness.md#amendment-codex-account-auto-selection-at-run-creation-3719-2026-10-31).
+the [ADR-1106 amendment](adr/1106-codex-harness.md#amendment-codex-account-auto-selection-at-run-creation-3719-2026-10-31);
+the default order is the soonest weekly reset, see
+[ADR-3844](adr/3844-reset-first-pool-order.md).
 
 A separate survivor path can retry an original non-rejection refresh error once
 when its durable receipt authorizes reuse. Admission consumes the retry under
@@ -616,8 +641,14 @@ releasing the claim; see
 [adr/1247-per-run-token-selection.md](adr/1247-per-run-token-selection.md).
 
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
-— and `auto` ranks the owner's opted-in tokens by rate-limit headroom
-(`api/internal/autoselect`, fed by the same gauge the meters render). The
+— and `auto` ranks the owner's opted-in tokens, by default the soonest weekly
+reset among those with enough headroom (`UZI_AUTOSELECT_ORDER=reset_first`; the
+previous most-headroom order is `headroom_first`; under `reset_first`, for
+picks above the headroom floor, the in-flight penalty only breaks
+exact weekly-reset ties, so a burst can
+concentrate on one token just above the floor, see
+[ADR-3844](adr/3844-reset-first-pool-order.md)), in `api/internal/autoselect`,
+fed by the same gauge the meters render. The
 ranker is **pure**: the store query ends at `[]autoselect.Candidate` and
 everything after it is arithmetic over already-fetched rows with an injected
 clock, which is what keeps the ranking testable without a database. It sits
@@ -881,8 +912,12 @@ authenticated pinned-model rejection at checker startup settles
 `plan cross-check: checker unavailable` and forces the lead's human gate.
 Other startup failures retain #2149 handling, including model errors with
 worker defaults or effort-only pins. Both pin cells are active; the Claude cell
-applies to the Claude checker of a Codex lead, and at Default follows the
-user's Claude worker default. A pinned Claude model rejected by the SDK
+applies to the Claude checker of a Codex lead. At Default, both checker stages
+follow the checker family's model lane, then the first delivered lead's pin for
+that family, then the Claude SDK default or Codex's `gpt-6.1-sol`. Template
+fallbacks retain `worker default` model provenance. Checker effort stays
+independent: an explicit effort pin wins, otherwise `high` with
+`cross-check default` provenance. A pinned Claude model rejected by the SDK
 (`model_not_found`) is checker unavailable.
 See [PRD #2151](prds/done/2151-cross-check-model-pins.md) for the account-check
 decision and validation limits, and
@@ -1879,10 +1914,17 @@ chain in the diagram above, with no intervening `running`.
 - **Cancel/reject with no live poller** (a `queued` run, or one whose worker
   has gone stale) is transitioned straight to `cancelled`/`failed`
   server-side rather than waiting on a `GET /api/worker/runs/:id/inputs` poll
-  that would never arrive. **Accepted residual:** a live-run cancel (the
-  worker is actively polling) still ends as `failed` with reason "run
-  cancelled" — the worker protocol has no settable `cancelled` state, only
-  the server-side no-poller path yields a true `cancelled`.
+  that would never arrive. A live worker reports `failed` after observing the
+  cancel; the API uses its persisted `stop_kind='cancelled'` to transition the
+  run to `cancelled` with no failure origin. At the two retained-predecessor
+  refusal sites before capture or execution, the worker can instead read the
+  positive `cancellation_requested` signal from the existing ownership probe,
+  without consuming inputs. It rechecks local pending-outcome and execution-tail
+  safety before reporting through the same cancellation path, keeping source
+  custody. The new API settles pending cancel inputs atomically with that
+  terminal transition; an old pod in a mixed rollout can leave an inert unapplied
+  cancel row on the terminal run. Unknown evidence or an old API without the
+  signal retains the stop. See [run recovery](docs/run-recovery.md).
 - The full message history (`run_messages`, gapless per-run `seq`) and any
   captured plan/session id survive every transition above, so a resumed run
   continues exactly where it left off — see Live message stream, below.

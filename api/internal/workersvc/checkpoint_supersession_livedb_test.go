@@ -1079,3 +1079,101 @@ func TestRetentionFenceSeesLockReleasedWithoutKillLiveDB(t *testing.T) {
 		t.Fatalf("the lock is held after the operation")
 	}
 }
+
+// newTwoOldRunsFix is supersedeFix with a SECOND older failed run on the same issue and branch,
+// each with an open hold and a retained record at retentionTestTip. The second run's terminal
+// transition is the later one, so ListActiveCheckpointRetentionsForBranch and
+// ListCheckpointRetentionsForBranch (newest first) list it before f.oldRun.
+func newTwoOldRunsFix(t *testing.T) (f *supersedeFix, newer uuid.UUID) {
+	t.Helper()
+	f = newSupersedeFixWith(t, func(f *supersedeFix) {
+		f.e.exec(t, `UPDATE runs SET status = 'failed', finished_at = now() WHERE id = $1`, f.oldRun)
+		worker := f.e.seedWorker(t, nil)
+		newer = uuid.New()
+		f.e.exec(t, `INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, kind, status, worker_id)
+		             VALUES ($1, $2, $3, $4, 't', 'd', 'issue', 'running', $5)`, newer, f.e.userID, f.e.repoID, f.iid, worker)
+		f.e.exec(t, `UPDATE runs SET checkpoint_tip = $2, checkpoint_tip_at = now(), claim_generation = 1 WHERE id = $1`, newer, retentionTestTip)
+		mhOpenHold(t, f.e, newer, 1, worker)
+		f.e.exec(t, `UPDATE runs SET status = 'failed', finished_at = now() WHERE id = $1`, newer)
+	})
+	for _, id := range []uuid.UUID{f.oldRun, newer} {
+		r, err := f.e.q.GetCheckpointRetention(f.e.ctx, id)
+		if err != nil || r.State != retentionRetained || r.Ref != f.branchRef {
+			t.Fatalf("setup: record of %s = %+v (err %v), want retained at the branch ref", id, r, err)
+		}
+	}
+	return f, newer
+}
+
+// TestSupersessionClaimStopsAtPublishDeadlineLiveDB: the publish's context ends while the first of
+// two older records is being superseded (the detached operation runs on to completion and frees
+// the branch ref). claimCheckpointSlot must not start the second supersession, and the publish
+// answers not_descendant. Without the loop's ctx check the second record would be driven too.
+func TestSupersessionClaimStopsAtPublishDeadlineLiveDB(t *testing.T) {
+	f, newer := newTwoOldRunsFix(t)
+	ctx, cancel := context.WithCancel(f.e.ctx)
+	defer cancel()
+	var once sync.Once
+	f.forge.beforeCreate = func(string) { once.Do(cancel) }
+
+	res, err := f.svc1.Publish(ctx, store.Worker{ID: f.newWorker, UserID: f.e.userID}, f.newRun, supersedeNewTip, []byte("pack"))
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if res.Published || res.Skipped != "not_descendant" {
+		t.Fatalf("Publish = %+v, want the not_descendant skip", res)
+	}
+	if ctx.Err() == nil {
+		t.Fatalf("the hook never cancelled the publish context")
+	}
+	// The first operation was detached from the cancelled context and ran to its end.
+	if tip, ok := f.forge.ref(pushbroker.RecoveryRefPrefix + newer.String()); !ok || tip != retentionTestTip {
+		t.Fatalf("the newer record's recovery ref = %q (present %v), want its supersession completed", tip, ok)
+	}
+	// The second record was never started.
+	if _, creates := f.forge.calls(); creates != 1 {
+		t.Fatalf("create calls = %d, want 1: the second supersession started after the deadline", creates)
+	}
+	r := f.row(t)
+	if r.State != retentionRetained || r.RecoveryRef.Valid || r.Ref != f.branchRef {
+		t.Fatalf("the older record = {state %q ref %q recovery %v}, want it untouched (retained)", r.State, r.Ref, r.RecoveryRef)
+	}
+	if pubs, _ := f.forge.calls(); pubs != 0 {
+		t.Fatalf("publish calls = %d, want 0: no push after the deadline", pubs)
+	}
+}
+
+// TestSupersessionFallbackStopsAtPublishDeadlineLiveDB: freeCheckpointSlot lists two records; the
+// first is acquired but does not free the slot (its recovery ref exists at another tip, so the
+// create is refused and recorded as a failure) and the context ends during it. The second must
+// never be superseded and the answer is false. Without the loop's ctx check the second record
+// would be superseded and free the ref.
+func TestSupersessionFallbackStopsAtPublishDeadlineLiveDB(t *testing.T) {
+	f, newer := newTwoOldRunsFix(t)
+	f.forge.set(pushbroker.RecoveryRefPrefix+newer.String(), supersedeOtherTip)
+	ctx, cancel := context.WithCancel(f.e.ctx)
+	defer cancel()
+	var once sync.Once
+	f.forge.beforeCreate = func(string) { once.Do(cancel) }
+	run, err := f.e.q.GetRunByID(f.e.ctx, f.newRun)
+	if err != nil {
+		t.Fatalf("GetRunByID: %v", err)
+	}
+
+	if f.svc1.freeCheckpointSlot(ctx, run, f.branch) {
+		t.Fatalf("freeCheckpointSlot = true, want false once the context ended")
+	}
+	if ctx.Err() == nil {
+		t.Fatalf("the hook never cancelled the context")
+	}
+	if _, creates := f.forge.calls(); creates != 1 {
+		t.Fatalf("create calls = %d, want 1: the second record was superseded after the deadline", creates)
+	}
+	r := f.row(t)
+	if r.State != retentionRetained || r.RecoveryRef.Valid {
+		t.Fatalf("the older record = {state %q recovery %v}, want untouched (retained)", r.State, r.RecoveryRef)
+	}
+	if tip, _ := f.forge.ref(f.branchRef); tip != retentionTestTip {
+		t.Fatalf("branch ref = %q, want it still at %s (nothing freed it)", tip, retentionTestTip)
+	}
+}

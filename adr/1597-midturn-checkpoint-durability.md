@@ -84,6 +84,7 @@ recognized exact code wins: ENOTFOUND/EAI_AGAIN → `dns`, ECONNREFUSED →
 `connection_refused`, ECONNRESET → `connection_reset`, ETIMEDOUT or
 UND_ERR_CONNECT_TIMEOUT/UND_ERR_HEADERS_TIMEOUT/UND_ERR_BODY_TIMEOUT → `timeout`,
 UND_ERR_SOCKET/UND_ERR_CLOSED/ECONNABORTED → `connection_closed`,
+ERR_HTTP2_STREAM_ERROR → `stream_reset`,
 EHOSTUNREACH/ENETUNREACH/EHOSTDOWN/ENETDOWN → `network_unreachable`, and
 CERT_HAS_EXPIRED/UNABLE_TO_VERIFY_LEAF_SIGNATURE/DEPTH_ZERO_SELF_SIGNED_CERT/
 SELF_SIGNED_CERT_IN_CHAIN/UNABLE_TO_GET_ISSUER_CERT_LOCALLY/ERR_TLS_CERT_ALTNAME_INVALID
@@ -91,7 +92,13 @@ SELF_SIGNED_CERT_IN_CHAIN/UNABLE_TO_GET_ISSUER_CERT_LOCALLY/ERR_TLS_CERT_ALTNAME
 `connection_closed` does not say which side closed (UND_ERR_CLOSED can be a local client
 close). EPIPE is deliberately excluded: it mostly comes from local pack-objects/gitleaks
 pipes, and the `packing` phase is local. Everything else is `unknown`; messages and
-aggregate collections do not classify errors. The label set stays fixed.
+aggregate collections do not classify errors. The label set is closed and bounded; it
+changes only by an exact-code amendment such as the dated one below.
+(amended 2026-11-04, #3847) `stream_reset` is an HTTP/2 stream reset by the peer (Node
+code ERR_HTTP2_STREAM_ERROR, "Stream closed with error code NGHTTP2_INTERNAL_ERROR"),
+for example the api's write-timeout reset of a slow `/publish` response. Before the
+amendment such errors were `unknown`. Like `connection_closed`, it does not say which
+side's deadline expired.
 Boundary failures, typed refusals and aborts retain their earlier precedence, including
 fail-closed propagation from hostile boundary/name getters.
 
@@ -121,10 +128,20 @@ branch push and merge request publication remain separate and can succeed.
 [Issue #296](https://github.com/vtmocanu/uzi/issues/296) adds retries for explicit numeric
 HTTP 500–599 within one logical checkpoint publish: at most three HTTP requests total,
 with 250ms then 1000ms backoffs. Any supplied caller deadline or abort signal is shared
-across attempts; each HTTP request retains its own client timeout. Some callers supply
-no outer signal, so the first request's timeout does not bound the total operation. The
-`CHECKPOINT_INTERVAL` gate (default `20m`) still measures logical operations. HTTP 4xx,
-nonconfirming 2xx, skips, local errors, transport throws and aborts are not retried.
+across attempts. The `CHECKPOINT_INTERVAL` gate (default `20m`) still measures logical
+operations. HTTP 4xx, nonconfirming 2xx, skips, local errors, transport throws and
+aborts are not retried.
+(amended 2026-11-04, #3847) One request allowance (`CHECKPOINT_PUBLISH_TIMEOUT_MS`,
+480 s, not `WORKER_HTTP_TIMEOUT`) is created once before the first attempt and shared by
+all three; a retry never renews it, so it bounds the whole logical publish even for a
+caller with no outer signal, and an earlier caller or maintenance deadline still wins.
+undici's own 300 s headers/body timeouts are raised to the allowance for that request using an
+owned dispatcher from the pinned undici package, passed to Node 26's native fetch and destroyed
+after the acknowledgement or any failure. Node's default TLS trust and startup environment-proxy
+opt-in (`NODE_USE_ENV_PROXY`, `NODE_OPTIONS`, CLI flags) are preserved. Runtime
+`http.setGlobalProxyFromEnv()` overrides are not tracked; the worker has no such caller. When the
+allowance expires (its owned timer fired while the caller's signal did not), the failure is
+classified `timeout` from that state, not from the error's shape.
 
 The replay factory captures the original source, candidate, literal floor and optional
 `defaultBlobSha`, including its absence. These remain immutable for the logical

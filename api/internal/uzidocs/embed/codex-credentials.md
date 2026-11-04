@@ -311,16 +311,36 @@ login, uzi never spends your default unless it is pooled too.
   the main `codex` bucket of its [usage meter](#usage-meters); extra feature
   buckets are ignored. The score is unknown when the reading is stale, from
   before a reset, when the meter is not fresh, or when your vault is locked.
-  Ranking then works as for Claude tokens: the account with the most headroom
-  wins, accounts within the tie band are decided by whichever resets soonest,
-  and the account key breaks any remaining tie. The headroom floor, tie band
-  and in-flight penalty (`UZI_AUTOSELECT_MIN_HEADROOM`,
-  `UZI_AUTOSELECT_HEADROOM_TIE_PCT`, `UZI_AUTOSELECT_INFLIGHT_PENALTY`, see
+  Ranking then works as for Claude tokens. By default
+  (`UZI_AUTOSELECT_ORDER=reset_first`) the account whose **weekly window resets
+  soonest** wins among those with at least the minimum headroom, so allowance
+  that would expire first is spent first; headroom (less the in-flight nudge)
+  and then the account key break ties. The weekly window is the main `codex`
+  bucket window that reports a duration of exactly 7 days, in either position
+  (the sooner of the two if both do); an account with no known upcoming weekly
+  reset sorts after every account that has one. The 5-hour window, when
+  reported, still counts toward headroom and the floor and still decides when a
+  limit-paused run resumes. If every measurable account is under the floor
+  (`best_of_pool`), or the operator set `UZI_AUTOSELECT_ORDER=headroom_first`,
+  the account with the most headroom wins, accounts within the tie band are
+  decided by whichever resets soonest, and the account key breaks any
+  remaining tie. The headroom floor, tie band, in-flight penalty and order
+  (`UZI_AUTOSELECT_MIN_HEADROOM`, `UZI_AUTOSELECT_HEADROOM_TIE_PCT`,
+  `UZI_AUTOSELECT_INFLIGHT_PENALTY`, `UZI_AUTOSELECT_ORDER`, see
   [Configuration](configuration.md)) are shared with Claude; how old a Codex
-  reading may be follows the Codex poll interval instead.
+  reading may be follows the Codex poll interval instead. The tie band is
+  ignored for `auto` picks under `reset_first`. See
+  [ADR-3844](../adr/3844-reset-first-pool-order.md).
 - **Spreading runs.** Every unfinished Codex run on an account, a queued one
   included and whichever saved login it uses, counts slightly against that
-  account, so a burst of runs does not pile onto one subscription.
+  account. Under `reset_first`, for picks above the headroom floor, that nudge
+  only breaks exact weekly-reset ties,
+  so reset-first deliberately concentrates runs on the soonest-expiring
+  account until it falls under the floor, and a burst of runs created inside
+  one poll interval (such as a sweep firing several issues) all lands on the
+  soonest-expiring account, even when it sits just above the floor, which can
+  mean more mid-run limit pauses and resumes. Set
+  `UZI_AUTOSELECT_ORDER=headroom_first` to spread runs across accounts instead.
 
 ### What it records
 
@@ -332,7 +352,7 @@ run created before auto-selection reads `not recorded`.
 |---|---|
 | `default` | Mode is `default`: your default login. |
 | `pool_empty` | Mode is `auto` but no login is pooled: your default login. |
-| `auto` | Picked by headroom, with at least the minimum headroom to spare. |
+| `auto` | Picked with at least the minimum headroom to spare: the soonest weekly reset by default, the most headroom under `headroom_first`. |
 | `best_of_pool` | Every measurable account was under the headroom floor; the emptiest was picked. |
 | `pool_stale` | No pooled account had a usable reading; the first by account key was picked. |
 | `pool_exhausted` | Every usable account was held back (limit reached, wait or reserve); the one releasing soonest was picked. |

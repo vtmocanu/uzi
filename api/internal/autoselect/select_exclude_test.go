@@ -23,11 +23,11 @@ func TestSelectExcludeDropsTheCandidate(t *testing.T) {
 	cands := []Candidate{dead, alt}
 
 	// Baseline: with nothing excluded the dead token wins.
-	if got := Select(cands, uuid.Nil, testPolicy(), now); !got.Picked || got.SecretID != id(1) {
+	if got := Select(cands, uuid.Nil, headroomFirstPolicy(), now); !got.Picked || got.SecretID != id(1) {
 		t.Fatalf("baseline picked %v (reason %q), want the 90-headroom token %v", got.SecretID, got.Reason, id(1))
 	}
 
-	got := Select(cands, id(1), testPolicy(), now)
+	got := Select(cands, id(1), headroomFirstPolicy(), now)
 	if !got.Picked || got.SecretID != id(2) {
 		t.Fatalf("with %v excluded, picked %v (reason %q), want the surviving token %v",
 			id(1), got.SecretID, got.Reason, id(2))
@@ -52,7 +52,7 @@ func TestSelectExcludeDropsTheCandidate(t *testing.T) {
 // pooled is set" invariant in Select.
 func TestSelectExcludeTheSoleCandidateYieldsPoolEmpty(t *testing.T) {
 	only := cand(1, 90, at(time.Hour)) // fresh, eligible, and about to be excluded
-	got := Select([]Candidate{only}, id(1), testPolicy(), now)
+	got := Select([]Candidate{only}, id(1), headroomFirstPolicy(), now)
 	if got.Picked {
 		t.Fatalf("excluding the only pooled token still picked %v", got.SecretID)
 	}
@@ -68,13 +68,13 @@ func TestSelectExcludeTheSoleCandidateYieldsPoolEmpty(t *testing.T) {
 // behaviour" property the PRD calls for, plus the non-present / non-eligible case.
 func TestSelectExcludeNilAndAbsentAreNoOps(t *testing.T) {
 	cands := []Candidate{cand(1, 90, at(time.Hour)), cand(2, 80, at(time.Hour))}
-	base := Select(cands, uuid.Nil, testPolicy(), now)
+	base := Select(cands, uuid.Nil, headroomFirstPolicy(), now)
 	if !base.Picked || base.SecretID != id(1) {
 		t.Fatalf("baseline picked %v, want %v", base.SecretID, id(1))
 	}
 
 	// An id that matches no candidate at all.
-	if got := Select(cands, id(200), testPolicy(), now); got != base {
+	if got := Select(cands, id(200), headroomFirstPolicy(), now); got != base {
 		t.Fatalf("excluding an absent id changed the outcome: %+v != %+v", got, base)
 	}
 
@@ -83,8 +83,8 @@ func TestSelectExcludeNilAndAbsentAreNoOps(t *testing.T) {
 	unpooled := cand(3, 99, at(time.Minute))
 	unpooled.AutoEligible = false
 	withUnpooled := append([]Candidate{unpooled}, cands...)
-	a := Select(withUnpooled, uuid.Nil, testPolicy(), now)
-	if b := Select(withUnpooled, id(3), testPolicy(), now); a != b {
+	a := Select(withUnpooled, uuid.Nil, headroomFirstPolicy(), now)
+	if b := Select(withUnpooled, id(3), headroomFirstPolicy(), now); a != b {
 		t.Fatalf("excluding a non-eligible id changed the outcome: %+v != %+v", b, a)
 	}
 	if a.SecretID != id(1) {
@@ -113,10 +113,10 @@ func TestSelectBumpingSyncedAtWouldRepickTheDeadToken(t *testing.T) {
 
 	// WITH synced_at bumped: the dead row is fresh.
 	freshDead := cand(1, 0, at(time.Hour)) // headroom 0; cand() leaves SyncedAt fresh (-1m)
-	if e := Classify(freshDead, testPolicy(), now); !e.Measured {
+	if e := Classify(freshDead, headroomFirstPolicy(), now); !e.Measured {
 		t.Fatalf("the freshened dead token is not Measured (%+v); the fixture is wrong", e)
 	}
-	got := Select([]Candidate{freshDead, stale}, uuid.Nil, testPolicy(), now)
+	got := Select([]Candidate{freshDead, stale}, uuid.Nil, headroomFirstPolicy(), now)
 	if !got.Picked || got.SecretID != id(1) || got.Reason != ReasonBestOfPool {
 		t.Fatalf("with synced_at bumped, picked %v (reason %q), want the DEAD token %v at "+
 			"best_of_pool — this is exactly why M1 must NOT bump synced_at (D3)",
@@ -127,7 +127,7 @@ func TestSelectBumpingSyncedAtWouldRepickTheDeadToken(t *testing.T) {
 	// alone. No longer Measured, so it leaves the ranking set and nothing is picked.
 	staleDead := freshDead
 	staleDead.SyncedAt = at(-99 * time.Hour)
-	got = Select([]Candidate{staleDead, stale}, uuid.Nil, testPolicy(), now)
+	got = Select([]Candidate{staleDead, stale}, uuid.Nil, headroomFirstPolicy(), now)
 	if got.Picked {
 		t.Fatalf("with synced_at left stale, the dead token was still picked (%v, reason %q); "+
 			"leaving synced_at alone is what keeps it out of the ranking", got.SecretID, got.Reason)

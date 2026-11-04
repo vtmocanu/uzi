@@ -1705,6 +1705,13 @@ func (f *fakeStore) CancelRunByWorker(_ context.Context, arg store.CancelRunByWo
 	return 1, nil
 }
 
+// CancelRunByWorkerSettlingCancel (issue #3860) is the settling variant SetState's
+// stop_kind='cancelled' arm uses. It records into the same cancelledByWorker slot with the
+// same rows semantics, so the tests that assert the cancelled arm keep their meaning.
+func (f *fakeStore) CancelRunByWorkerSettlingCancel(ctx context.Context, arg store.CancelRunByWorkerSettlingCancelParams) (int64, error) {
+	return f.CancelRunByWorker(ctx, store.CancelRunByWorkerParams(arg))
+}
+
 // SupersedeRunByWorker records a live-worker branch_moved supersession and its
 // server-composed reason. Returns 1 (applied) like the CancelRunByWorker fake.
 func (f *fakeStore) SupersedeRunByWorker(_ context.Context, arg store.SupersedeRunByWorkerParams) (int64, error) {
@@ -1972,7 +1979,7 @@ func TestClaimAssemblesPayloadWithDecryptedSecrets(t *testing.T) {
 	fs := &fakeStore{
 		claimRun: store.Run{
 			ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 4, Valid: true}, IssueTitle: "Do the thing",
-			IssueDescription: "see prds/4.md", Status: "claimed",
+			IssueDescription: "see prds/4.md", Status: "claimed", Harness: "claude",
 			LastSeq: 7, IterationCount: 2, RequeueCount: 1,
 			SessionID: pgconv.TextOrNull("sess-abc"), Branch: pgconv.TextOrNull(branch),
 		},
@@ -2301,7 +2308,7 @@ func scheduleModelStore(t *testing.T, runModel, userDefault pgtype.Text) *fakeSt
 	return &fakeStore{
 		claimRun: store.Run{
 			ID: uuid.New(), IssueIid: pgtype.Int8{Int64: 30, Valid: true}, Status: "claimed",
-			Model: runModel,
+			Model: runModel, Harness: "claude",
 		},
 		claimCtx: store.GetRunClaimContextRow{
 			RepoWebUrl: "https://gitlab.example.com/g/p", RepoPath: "g/p",
@@ -6175,6 +6182,42 @@ func TestSaveMemoryNormalizesBasisAtWrite(t *testing.T) {
 				}
 			} else if fs.memInsertParams.Basis.String != tc.want {
 				t.Errorf("basis %q stored as %q, want %q", tc.in, fs.memInsertParams.Basis.String, tc.want)
+			}
+		})
+	}
+}
+
+func TestAgentsFromTemplatesHarnessPins(t *testing.T) {
+	rows := []store.AgentTemplate{
+		{Name: "legacy", Model: pgconv.TextOrNull("gpt-6-sol")},
+		{Name: "sonnet-only", Model: pgconv.TextOrNull("sonnet")},
+		{Name: "codex-only", CodexModel: pgconv.TextOrNull("gpt-6-luna")},
+		{Name: "dual", Model: pgconv.TextOrNull("custom-claude"), CodexModel: pgconv.TextOrNull("gpt-6-sol")},
+		{Name: "lead", Model: pgconv.TextOrNull("opus"), CodexModel: pgconv.TextOrNull("gpt-6.1-sol")},
+	}
+	for _, tc := range []struct {
+		harness string
+		want    []string
+	}{
+		{"claude", []string{"", "sonnet", "", "custom-claude", "opus"}},
+		{"codex", []string{"", "", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"}},
+	} {
+		t.Run(tc.harness, func(t *testing.T) {
+			agents := agentsFromTemplates(rows, nil, tc.harness)
+			if len(agents) != len(rows) {
+				t.Fatalf("agents=%d", len(agents))
+			}
+			for i, agent := range agents {
+				got := ""
+				if agent.Model != nil {
+					got = *agent.Model
+				}
+				if got != tc.want[i] {
+					t.Errorf("%s model=%q, want %q", agent.Name, got, tc.want[i])
+				}
+				if tc.want[i] == "" && agent.Model != nil {
+					t.Errorf("%s must omit model", agent.Name)
+				}
 			}
 		})
 	}

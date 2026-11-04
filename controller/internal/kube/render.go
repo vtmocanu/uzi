@@ -544,6 +544,10 @@ type RenderConfig struct {
 	// (json omitempty), so an install that clears it hashes exactly as before this
 	// field existed. Changing it re-hashes the template and rolls every worker.
 	NodeSelector map[string]string
+	// Tolerations are rendered onto every worker pod, all three tiers. Nil renders no
+	// tolerations key (json omitempty), so an install without them hashes exactly as
+	// before this field existed. Changing them re-hashes the template and rolls.
+	Tolerations []corev1.Toleration
 	// MaxConcurrentRuns is the per-worker slot cap rendered into the pod's
 	// WORKER_MAX_CONCURRENT_RUNS. Zero (a RenderConfig{} built in a test, or a caller
 	// that never set it) renders "1", so the default stays 1 everywhere; see config.go,
@@ -1448,6 +1452,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			ServiceAccountName:           cfg.ServiceAccountName,
 			PriorityClassName:            cfg.PriorityClassName,
 			NodeSelector:                 cfg.NodeSelector,
+			Tolerations:                  cfg.Tolerations,
 			AutomountServiceAccountToken: &automount,
 			// Soft anti-affinity for docker workers ONLY (nil for a plain worker, so its
 			// spec/hash is untouched). Keeps the pod off nodes running the crown-jewel

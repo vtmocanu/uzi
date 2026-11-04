@@ -1,5 +1,6 @@
 import type { AgentSourceApplyResult, AgentSourceView, HealthCheck } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
+import { CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { mockAgentSource } from "../data";
 import { delay, mockScenario, requireSession } from "./shared";
 
@@ -103,6 +104,12 @@ function deriveAgentSourceStatus(): AgentSourceView["status"] {
 function agentSourceView(): AgentSourceView {
   const clone = structuredClone(agentSource);
   clone.status = deriveAgentSourceStatus();
+  for (const role of clone.staged?.roles ?? []) {
+    const model = role.model?.trim() ?? "";
+    const isCodex = CODEX_ROLE_MODELS.includes(model);
+    role.claude_model = isCodex ? "" : model;
+    role.codex_model = isCodex ? model : "";
+  }
   return clone;
 }
 

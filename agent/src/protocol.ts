@@ -3431,6 +3431,9 @@ export interface RunOwnershipResponse {
    *  ack) can still quote when it resumes. An RFC3339 string when the run is parked with a
    *  stamp; NULL means automatic forge retries exhausted; waiting for owner Resume or Cancel. An absent stamp retains historical backoff copy. */
   recovery_retry_not_before?: string | null;
+  /** Issue #3860: true only when the server sees `stop_kind = 'cancelled'` plus a deliverable pending
+   *  cancel input on the same row. A value absent from an older api means unknown, never a cancel. */
+  cancellation_requested?: boolean;
 }
 
 /** PRD #1391 Run B M3 (D3): one missing seq range in a run's message trace, as the message-gaps

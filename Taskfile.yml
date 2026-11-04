@@ -506,6 +506,14 @@ tasks:
   gate:api:
     desc: api - fmt-check, vet, build, lint, deadcode, test
     cmds:
+      - task: check:api
+      - task: test:api
+
+  # The in-run API boundary on this repo (AGENTS.md "Run economy"): everything in
+  # gate:api except the full test:api, which exact-head PR CI runs.
+  check:api:
+    desc: api - fmt-check, vet, build, sqlc-drift, lint, deadcode
+    cmds:
       # fmt-check FIRST, deliberately. Measured 2026-08-02, go1.26.5 darwin/arm64,
       # warm build cache: `task fmt-check:api` 0.11-0.13s over three runs against
       # 48.7s for this whole gate, so a coder learns about a misformat in the first
@@ -541,7 +549,6 @@ tasks:
       # loads and type-checks packages, and on a tree that does not compile it
       # exits 1 with a load error rather than a build error.)
       - task: deadcode:api
-      - task: test:api
 
   gate:controller:
     desc: controller - fmt-check, vet, build, lint, deadcode, test
@@ -557,6 +564,15 @@ tasks:
 
   gate:web:
     desc: web - deps-check, lint, deadcode, check-docs, check-changelog, check-styles, typecheck, test, test-browser
+    cmds:
+      - task: check:web
+      - task: test:web
+      - task: test:web-browser
+
+  # The in-run web boundary on this repo (AGENTS.md "Run economy"): everything in
+  # gate:web except the full test:web and test:web-browser, which exact-head PR CI runs.
+  check:web:
+    desc: web - deps-check, lint, deadcode, check-docs, check-changelog, check-styles, typecheck
     cmds:
       # 🔴 deps-check FIRST, AND IT DELIBERATELY BREAKS THE CHEAPEST-FIRST ORDER THE
       # REST OF THIS TARGET ARGUES FOR (PRD #103 M5 MR-C). oxlint is ~0.06s and this
@@ -648,8 +664,6 @@ tasks:
       - task: check-changelog:web
       - task: check-styles:web
       - task: typecheck:web
-      - task: test:web
-      - task: test:web-browser
 
   gate:agent:
     desc: agent - deps-check, lint, deadcode, typecheck, test
@@ -1674,7 +1688,7 @@ tasks:
       - ./scripts/assert-drain-knobs-render.sh
 
   render:node-selector-check:
-    desc: assert the controller Deployment renders workers.nodeSelector (default, override, null, {}) and refuses a non-map value
+    desc: assert the controller Deployment renders workers.nodeSelector (default, override, null, {}) and workers.tolerations, and refuses malformed values
     cmds:
       # Not in gate:repo (the lint job lacks helm); CI's helm-chart job runs it. Offline +
       # non-vacuous, see the script header.
@@ -2200,8 +2214,8 @@ tasks:
       #   GOMEMLIMIT=2GiB    14.53 GB   452 s
       #
       # On that worker, among the GOMEMLIMIT rows, 12GiB gave most of the observed
-      # reduction for the smallest observed time increase. Runner results are
-      # unmeasured until CI.
+      # reduction for the smallest observed time increase.
+      # Subsequent CI measurements and the swap mitigation are recorded in #3433 and #3762.
       #
       # The value is fixed on purpose: `env GOMEMLIMIT=...` overrides an inherited
       # GOMEMLIMIT, so the limit is identical locally and in CI (GOGC and hardware

@@ -1,7 +1,9 @@
 #!/bin/sh
 # Assert the controller Deployment renders workers.nodeSelector into
 # UZI_WORKER_NODE_SELECTOR as documented, and refuses a value that is neither a map
-# nor null.
+# nor null. Also asserts workers.tolerations renders into UZI_WORKER_TOLERATIONS
+# (absent by default and when empty or null) and refuses a value that is neither a
+# list nor null.
 #
 # usage: scripts/assert-worker-node-selector-render.sh [chart-dir]
 #   e.g. scripts/assert-worker-node-selector-render.sh deploy/chart
@@ -113,6 +115,61 @@ for bad in false 0 '""' '[]' '"kubernetes.io/arch=amd64"'; do
     echo "OK (malformed $bad): render refused"
   else
     echo "FAIL (malformed $bad): render failed, but not with the nodeSelector guard:" >&2
+    cat "$WORK/err" >&2
+    fail=1
+  fi
+done
+
+# --- workers.tolerations -> UZI_WORKER_TOLERATIONS ---------------------------------
+
+tolerations_value() {
+  awk '
+    /- name: UZI_WORKER_TOLERATIONS$/ { hit = 1; next }
+    hit && /value:/ { sub(/^[[:space:]]*value:[[:space:]]*/, ""); print; exit }
+  ' "$WORK/out"
+}
+
+# expect_no_tolerations <case> [helm args...]
+expect_no_tolerations() {
+  _case="$1"; shift
+  render "$@" || { echo "BROKEN (tolerations $_case): helm template failed:" >&2; cat "$WORK/err" >&2; exit 2; }
+  require_controller "tolerations $_case"
+  if [ -n "$(tolerations_value)" ]; then
+    echo "FAIL (tolerations $_case): UZI_WORKER_TOLERATIONS rendered '$(tolerations_value)'; want none" >&2
+    fail=1
+  else
+    echo "OK (tolerations $_case): no UZI_WORKER_TOLERATIONS"
+  fi
+}
+
+expect_no_tolerations "default"
+expect_no_tolerations "[]" --set-json 'workers.tolerations=[]'
+expect_no_tolerations "null" --set-json 'workers.tolerations=null'
+
+TOL_WANT='"[{\"effect\":\"NoSchedule\",\"key\":\"uzi\",\"operator\":\"Equal\",\"value\":\"true\"}]"'
+render --set-json 'workers.tolerations=[{"key":"uzi","operator":"Equal","value":"true","effect":"NoSchedule"}]' \
+  || { echo "BROKEN (tolerations set): helm template failed:" >&2; cat "$WORK/err" >&2; exit 2; }
+require_controller "tolerations set"
+if [ "$(tolerations_value)" = "$TOL_WANT" ]; then
+  echo "OK (tolerations set): UZI_WORKER_TOLERATIONS = $(tolerations_value)"
+else
+  echo "FAIL (tolerations set): UZI_WORKER_TOLERATIONS = '$(tolerations_value)', want $TOL_WANT" >&2
+  fail=1
+fi
+# Setting tolerations must not disturb the nodeSelector default.
+if [ "$(selector_value)" != "$AMD64" ]; then
+  echo "FAIL (tolerations set): UZI_WORKER_NODE_SELECTOR = '$(selector_value)', want $AMD64" >&2
+  fail=1
+fi
+
+for bad in false 0 '""' '{}' '{"key":"uzi"}'; do
+  if render --set-json "workers.tolerations=$bad"; then
+    echo "FAIL (tolerations malformed $bad): rendered instead of refusing" >&2
+    fail=1
+  elif grep -q "workers.tolerations must be a list" "$WORK/err"; then
+    echo "OK (tolerations malformed $bad): render refused"
+  else
+    echo "FAIL (tolerations malformed $bad): render failed, but not with the tolerations guard:" >&2
     cat "$WORK/err" >&2
     fail=1
   fi

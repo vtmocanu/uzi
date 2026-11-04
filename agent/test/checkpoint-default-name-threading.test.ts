@@ -145,8 +145,10 @@ for (const expireOnRetry of [false, true]) {
     // Replay keeps its 60-second caller clock with the default local admission bound.
     const { git, runner, flight } = fixture("server");
     const client = runner["client"];
-    const signal = new AbortController().signal;
+    const caller = new AbortController();
+    const signal = caller.signal;
     const deadlines: number[] = [], remaining: number[] = [];
+    const attemptSignals: Array<AbortSignal | undefined> = [];
     Object.assign(git, {
       // The replay uses real pack admission over synthetic, unenrolled metadata.
       remediationRestrictionFactsUnderLock: async (bare: string, branch: string, runId: string) => {
@@ -168,7 +170,10 @@ for (const expireOnRetry of [false, true]) {
       },
     });
     client.publishCheckpoint = async (_run, _tip, stream, actualSignal) => {
-      assert.equal(actualSignal, signal);
+      // #3847: each attempt gets the runner's one shared allowance signal, derived from (not
+      // identical to) the caller's. Recorded here, asserted below: a throw inside this fake would
+      // be swallowed by the runner's catch.
+      attemptSignals.push(actualSignal);
       for await (const _chunk of stream) { /* drain each replay */ }
       requests++;
       if (requests === 1) {
@@ -184,6 +189,12 @@ for (const expireOnRetry of [false, true]) {
     assert.equal(requests, expireOnRetry ? 1 : 2);
     assert.deepEqual(deadlines, expireOnRetry ? [61_000] : [61_000, 61_000]);
     assert.deepEqual(remaining, expireOnRetry ? [60_000] : [60_000, 1_000]);
+    assert.equal(attemptSignals.length, requests);
+    assert.notEqual(attemptSignals[0], signal, "publish uses the derived allowance, not the bare caller signal");
+    assert.ok(attemptSignals.every(s => s === attemptSignals[0]), "one allowance signal serves every attempt");
+    assert.equal(attemptSignals[0]?.aborted, false);
+    caller.abort();
+    assert.equal(attemptSignals[0]?.aborted, true, "the attempt signal follows the caller's signal");
   });
 }
 

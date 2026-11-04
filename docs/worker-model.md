@@ -78,16 +78,24 @@ reads that harness's model lane:
    [schedule](./scheduling.md) that pins one compatible with the run's
    harness.
 2. Your **worker model** for that harness, if set.
-3. The harness fallback: the `lead` template's `model` (`opus` by default)
-   for Claude, or `gpt-6.1-sol` for Codex.
+3. The harness fallback: the `lead` template's Claude pin (`opus` by default)
+   for Claude, or its Codex pin, else `gpt-6.1-sol`, for Codex.
 4. Whatever the underlying SDK/your account defaults to.
+
+The lead's Codex fallback requires a worker from this release. Older Codex
+workers fall through to the built-in provider model (`gpt-6.1-sol`) when no
+schedule or worker-model setting takes precedence. Roll out the API first,
+then the hosted worker; hosted validation of this behavior remains pending.
+The pickers' existing **Default · …** labels above are unchanged pending
+separate UI work.
 
 An incompatible frozen schedule or legacy model (e.g. a Claude alias pinned
 on a run that resolves to Codex) falls back to your lane for that harness,
-with a visible fallback note on the run. A subagent with its own `model`
-override uses that pin unless the schedule applies its model to all agents.
-Your worker-model setting does not override a subagent pin. **Chat always
-uses your Claude lane**, whichever harness is your default.
+with a visible fallback note on the run. A subagent with its own Claude
+(`model`) or Codex (`codex_model`) pin uses the pin for the run's harness
+unless the schedule applies its model to all agents. Your worker-model
+setting does not override a subagent pin. **Chat always uses your Claude
+lane**, whichever harness is your default.
 
 ## Claude model guard and recovery
 
@@ -205,7 +213,7 @@ for how to read the effort side.
 
 These rows are attested by the worker and are for display only. They never
 feed billing, authorization or scheduling, and they describe the lead agent:
-a subagent with its own `model` pin may differ.
+a subagent with its own Claude or Codex pin may differ.
 
 Before a worker claims the run, nothing is resolved yet, so the chip reads
 `lead: model and effort resolve at claim`, or, for a schedule-pinned model,
@@ -253,10 +261,11 @@ Where to see it:
 ## Current Codex worker baseline
 
 The current Codex worker uses runtime 0.164.0 and defaults to `gpt-6.1-sol`
-when no worker-model override is set. Explicit model preferences remain
-unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
-keep separate overrides, and each can instead be set to **Runtime default**,
-which sends no effort level. See [Reasoning effort](worker-effort.md).
+when no schedule model, worker-model override or lead Codex pin is set.
+Explicit model preferences remain unchanged. Both harnesses inherit medium
+reasoning effort; Claude and Codex keep separate overrides, and each can
+instead be set to **Runtime default**, which sends no effort level. See
+[Reasoning effort](worker-effort.md).
 
 Every Codex claim requires `codex_runtime_v2`, so an older worker cannot
 silently use the old model/catalog or ignore the requested effort. Codex runs

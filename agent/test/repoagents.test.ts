@@ -14,12 +14,14 @@ import {
   REPO_AGENT_MAX_DESCRIPTION_LEN,
   describeRepoAgentNote,
   detectRepoAgents,
+  filterRepoAgentModel,
   repoAgentSummaries,
   repoAgentsDir,
   type RepoAgentNoteReason,
 } from "../src/repoagents.js";
-import { assembleAgents } from "../src/agents.js";
+import { assembleAgents, subagentsFromTemplates } from "../src/agents.js";
 import {
+  type AgentTemplate,
   AGENT_EXCLUSIONS_MAX,
   encodeAgentSelection,
   parseAgentSelection,
@@ -57,6 +59,35 @@ const CODER = [
   "Implement the requested change.",
   "",
 ].join("\n");
+
+describe("filterRepoAgentModel", () => {
+  const roleModels = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"];
+  const claudeModels = ["opus", "sonnet", "haiku", "claude-opus-4-8", "customClaude", "vgpt-6-sol", "gpt-6-solv"];
+  for (const harness of ["claude", "codex"] as const) {
+    it(`${harness}: projects all role ids and Claude aliases/custom ids without mutating input`, () => {
+      for (const model of [...roleModels, ...claudeModels]) {
+        const template: AgentTemplate = Object.freeze({
+          name: "coder", description: "Works.", prompt_body: "Implement.", model, tools: ["Read"],
+        });
+        const expectedModel = (harness === "codex" ? roleModels : claudeModels).includes(model) ? model : undefined;
+        const result = filterRepoAgentModel(template, harness);
+        assert.equal(result.model, expectedModel, `${harness}: ${model}`);
+        assert.equal(Object.hasOwn(result, "model"), expectedModel !== undefined);
+        assert.deepEqual(result.tools, ["Read"]);
+        assert.equal(result.prompt_body, "Implement.");
+        assert.equal(template.model, model);
+        assert.notEqual(result, template);
+      }
+    });
+
+    it(`${harness}: preserves empty, explicitly undefined and absent pins`, () => {
+      for (const pin of [{}, { model: undefined }, { model: "" }]) {
+        const template: AgentTemplate = Object.freeze({ name: "coder", description: "Works.", prompt_body: "Implement.", ...pin });
+        assert.deepEqual(filterRepoAgentModel(template, harness), template);
+      }
+    });
+  }
+});
 
 describe("detectRepoAgents", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("detectRepoAgents") }, () => {
   it("returns nothing when the repo has no .claude/agents", async () => {
@@ -296,6 +327,39 @@ describe("detectRepoAgents", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" :
     assert.equal(agents.find((a) => a.name === "spaced")!.model, undefined);
     assert.deepEqual(reasons(notes), ["model_ignored"]);
     assert.equal(notes[0]!.name, "spaced");
+  });
+
+  it("regression (c): Markdown Codex pins never reach Claude SDK definitions", async () => {
+    const roleModels = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"];
+    for (const [i, model] of roleModels.entries()) {
+      writeAgent(`role-${i}.md`, `---\nname: role-${i}\ndescription: Codex role.\nmodel: ${model}\n---\n\nRole body.\n`);
+    }
+    writeAgent("lead.md", "---\nname: lead\ndescription: Repo lead.\nmodel: gpt-6-sol\n---\n\nRepo lead body.\n");
+    writeAgent("alias.md", CODER);
+    writeAgent("custom.md", "---\nname: custom\ndescription: Custom Claude.\nmodel: vgpt-6-sol\n---\n\nCustom body.\n");
+
+    const claude = await detectRepoAgents(clone, "claude");
+    const claudeDefinitions = subagentsFromTemplates(claude.agents, new Set());
+    assert.equal(claude.folder, ".claude/agents");
+    assert.deepEqual(claude.notes, []);
+    for (const name of ["lead", ...roleModels.map((_, i) => `role-${i}`)]) {
+      assert.ok(claudeDefinitions[name], `${name} remains an ordinary subagent`);
+      assert.equal(Object.hasOwn(claudeDefinitions[name]!, "model"), false, `${name}: Codex pin must not reach Claude SDK`);
+    }
+    assert.equal(claudeDefinitions.coder!.model, "opus");
+    assert.equal(claudeDefinitions.custom!.model, "vgpt-6-sol");
+
+    // No native Codex folder: the same Markdown roster is delivered as fallback.
+    const codex = await detectRepoAgents(clone, "codex");
+    assert.equal(codex.folder, ".claude/agents");
+    assert.deepEqual(codex.notes, [], "opposite-family pins are silently omitted");
+    for (const [i, model] of roleModels.entries()) {
+      assert.equal(codex.agents.find((a) => a.name === `role-${i}`)!.model, model);
+    }
+    assert.equal(codex.agents.find((a) => a.name === "lead")!.model, "gpt-6-sol");
+    for (const name of ["coder", "custom"]) {
+      assert.equal(Object.hasOwn(codex.agents.find((a) => a.name === name)!, "model"), false);
+    }
   });
 
   it("keeps a repo file named `lead` as a subagent candidate (never filtered here)", async () => {

@@ -1313,6 +1313,7 @@ usage-limit park or an admission wait keeps the account it froze. What is added
 is an **opt-in, creation-time choice** among accounts the user consented to.
 The user contract is
 [Letting uzi pick the account](../docs/codex-credentials.md#letting-uzi-pick-the-account).
+Ranking reuse was later revised by [ADR-3844](3844-reset-first-pool-order.md): the default order is now `reset_first` (soonest weekly reset), with `headroom_first` as the previous ranking.
 
 - **Consent is two-part and per user.** `users.codex_account_mode` is `default`
   (the prior behavior for everyone) or `auto`, and each `codex_auth` alias

@@ -115,7 +115,7 @@ export interface User {
   judge_anthropic_secret_label: string | null;
   // Which bind mode this user's RETROSPECTIVES use (PRD #1140): default / pinned /
   // auto. The EFFECTIVE mode (a pinned binding whose token was deleted reports
-  // default). auto spreads retrospectives across the user's pooled tokens.
+  // default). auto picks retrospectives' token from the user's pool.
   judge_anthropic_bind_mode: BindMode;
   created_at: string;
   last_login: string | null;
@@ -388,13 +388,14 @@ export interface SlackLink {
 }
 
 // AgentTemplate is a stored agent definition. tools is null when the template
-// inherits all tools; model is null when it inherits the model. scope/user_id
+// inherits all tools; model/codex_model are the nullable Claude/Codex pins. scope/user_id
 // carry the M6 ownership model; is_builtin is retained (== scope 'builtin').
 export interface AgentTemplate {
   id: string;
   name: string;
   description: string;
   model: string | null;
+  codex_model: string | null;
   tools: string[] | null;
   prompt_body: string;
   is_builtin: boolean;
@@ -402,7 +403,7 @@ export interface AgentTemplate {
   user_id: string | null;
   updated_by: string | null;
   // differs_from_builtin is computed server-side per request (issue #201 M4a):
-  // whether this row's four mutable columns still match the definition the
+  // whether this row's five mutable columns still match the definition the
   // running release ships under the same name. It is false for anything that has
   // no shipped counterpart — a global row, a user row that merely shares a
   // builtin's name, and a builtin this release no longer ships.
@@ -438,6 +439,7 @@ export interface BuiltinDefinition {
   name: string;
   description: string;
   model: string | null;
+  codex_model: string | null;
   tools: string[] | null;
   prompt_body: string;
 }
@@ -450,6 +452,8 @@ export interface AgentTemplateInput {
   name?: string;
   description: string;
   model: string | null;
+  // Omitted on PUT preserves the stored pin; null or blank clears it.
+  codex_model?: string | null;
   tools: string[] | null;
   prompt_body: string;
   scope?: "global" | "user";
@@ -1372,7 +1376,11 @@ export interface AgentSourceStagedRole {
   ok: boolean;
   reason?: string;
   description?: string;
+  // Raw source model remains optional for compatibility with older staged JSON.
   model?: string;
+  // Review pins are always present; empty means Default for that harness.
+  claude_model: string;
+  codex_model: string;
   tools?: string[];
   prompt_body?: string;
   // True when the displayed `prompt_body` differs from the raw applied body because
@@ -2751,7 +2759,7 @@ export interface Worker {
   anthropic_secret_label: string | null;
   /** How this worker's run-lane claims choose a credential (PRD #111 M3):
    *  "default" (the owner's default), "pinned" (the id above), or "auto" (uzi picks
-   *  per claim from the owner's opted-in pool, preferring the most headroom).
+   *  per claim from the owner's opted-in pool, by the server's auto-select order).
    *
    *  🔴 It is the EFFECTIVE mode, not the stored column. Deleting a pinned token
    *  nulls the worker's id server-side and leaves the stored mode alone, so the

@@ -159,7 +159,7 @@ pass "no forge write + no token spend for the follow_up path (MR count unchanged
 #
 # Terminal status is `cancelled`, NOT `failed` (PRD #503 M1, landed in #521): a cancel
 # consumed by a LIVE worker is reported as `failed`, but SetState's failed arm routes off
-# the run's already-stamped stop_kind='cancelled' to CancelRunByWorker — status
+# the run's already-stamped stop_kind='cancelled' to CancelRunByWorkerSettlingCancel: status
 # 'cancelled', fail_origin NULL, never judged — so an operator cancellation is no longer
 # misclassified as an agent failure. The server-side no-poller path (CancelRunServerSide,
 # used by the queued-run cancel phase above) converges on the SAME 'cancelled' status, so
@@ -168,9 +168,11 @@ pass "no forge write + no token spend for the follow_up path (MR count unchanged
 # stop_kind keeps this non-vacuous: it is the server-stamped deliberate-stop signal
 # (PRD #33), so 'cancelled' proves the run ended because of THIS cancel, not a coincidental
 # failure (which would surface as status 'failed', caught by wait_status). The reason text
-# moved too: CancelRunByWorker touches neither failure_reason nor stop_reason, and this
+# moved too: the worker cancel transition preserves stop_reason, and this
 # cancel carries an empty body (no operator -m message), so there is no reason string to
 # assert — the old failure_reason="run cancelled" check would now be vacuously empty.
+# The new API also applies pending cancel inputs atomically with the terminal transition
+# (#3860); the follow_up below remains readable and is not settled as a cancel.
 apipost "/api/runs/$RUN_S/inputs" '{"kind":"cancel","body":""}' >/dev/null
 wait_status "$RUN_S" cancelled
 [ "$(apiget "/api/runs/$RUN_S" | jq -r '.run.stop_kind // empty')" = "cancelled" ] \

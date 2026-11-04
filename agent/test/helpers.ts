@@ -13,7 +13,17 @@ import type { CanonicalReseedOptions, GitCacheOptions } from "../src/git.js";
 import type { Logger } from "../src/log.js";
 import type { WorkerClient } from "../src/client.js";
 import { ChatSteering, SteeringChannel } from "../src/steering.js";
-import type { ClaimResponse, UserInput } from "../src/protocol.js";
+import type { AgentTemplate, ClaimResponse, UserInput } from "../src/protocol.js";
+
+/** Preserve the delivered roster order and names; a null fixture pin means no model key. */
+export function leadRequestCaseAgents(c: {
+  id: string; templateModel?: string; agents?: Array<{ name: string; model?: string | null }>;
+}): AgentTemplate[] {
+  return (c.agents ?? [{ name: "lead", model: c.templateModel }]).map((t, i) => ({
+    name: t.name, description: `fixture ${c.id} ${i}`, prompt_body: `OWNER ${c.id} BODY ${i}`,
+    ...(t.model != null ? { model: t.model } : {}),
+  }));
+}
 
 /** issue #1783 M3 (N5): the canonical-reseed options for suites whose subject is not the canonical
  *  free. The git layer requires them on every entry point (there is no unproven plain-`fs.rm`

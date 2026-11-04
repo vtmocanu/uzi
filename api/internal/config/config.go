@@ -267,9 +267,11 @@ type Config struct {
 	// 100 is not satisfiable by any reading, so it is clamped with a warning rather
 	// than left to silently disable auto-selection entirely.
 	AutoselectMinHeadroom int
-	// AutoselectHeadroomTiePct is M4's clustering tolerance T: tokens within this
-	// many points of the emptiest are treated as tied and broken by soonest reset.
-	// Default 5. 0 means "only an exact tie counts", which is a coherent policy.
+	// AutoselectHeadroomTiePct is M4's clustering tolerance T: under headroom_first,
+	// tokens within this many points of the emptiest are treated as tied and broken by
+	// soonest reset. Default 5. 0 means "only an exact tie counts", which is a coherent
+	// policy. Under reset_first (#3844) it is ignored for ReasonAuto picks, which rank
+	// by weekly reset; best_of_pool still clusters with it under either order.
 	AutoselectHeadroomTiePct int
 	// AutoselectMaxStaleness bounds how old a gauge reading may be and still steer a
 	// choice — steering on numbers Anthropic has since moved past is worse than not
@@ -287,8 +289,17 @@ type Config struct {
 	// AutoselectInflightPenalty is M4's herd control: points subtracted from a
 	// token's ranking headroom per run currently spending it, so several claims
 	// inside one poll interval do not all pile onto the same emptiest credential.
-	// Default 3. 0 disables the bias, leaving pure headroom ranking.
+	// Default 3. 0 disables the bias. Under reset_first (#3844) a ReasonAuto pick uses
+	// it only to break exact weekly-reset ties; under headroom_first, and for
+	// best_of_pool under either order, it shifts the headroom ranking.
 	AutoselectInflightPenalty int
+	// AutoselectOrder is how the eligible set is ranked (UZI_AUTOSELECT_ORDER, #3844):
+	// "reset_first" (default) picks the soonest weekly reset among tokens at or above
+	// the floor, because the weekly window is the one Claude and Codex subscriptions
+	// always report; "headroom_first" is the earlier most-headroom ranking. Under
+	// reset_first HeadroomTiePct is ignored for those picks (best_of_pool keeps the
+	// headroom ranking). An unknown value falls back to reset_first with a boot warning.
+	AutoselectOrder autoselect.Order
 	// UsageProbe enables the ~1-token Messages header probe fallback (PRD #53 D2).
 	// Default true; false makes users the free usage endpoint refuses show
 	// `unavailable` rather than spend a token. A security/spend control, so a
@@ -1078,6 +1089,15 @@ func Load() (Config, error) {
 	// 0 — nothing is ever fresh — which is the correct answer for a gauge nothing
 	// updates, and matches what rateLimitStale already reports for the same case.
 	cfg.AutoselectMaxStaleness = parseNonNegDuration("UZI_AUTOSELECT_MAX_STALENESS", 3*cfg.UsagePollInterval)
+	// Ordering (#3844). A typo falls back to the default with a boot warning rather than
+	// failing startup, the same shape as UZI_EPHEMERAL_DEFAULT_SIZE.
+	cfg.AutoselectOrder = autoselect.Order(strings.TrimSpace(getenv("UZI_AUTOSELECT_ORDER", string(autoselect.OrderResetFirst))))
+	if cfg.AutoselectOrder != autoselect.OrderResetFirst && cfg.AutoselectOrder != autoselect.OrderHeadroomFirst {
+		slog.Warn("UZI_AUTOSELECT_ORDER is not a known order; falling back to \"reset_first\"",
+			"configured", string(cfg.AutoselectOrder),
+			"valid", []string{string(autoselect.OrderResetFirst), string(autoselect.OrderHeadroomFirst)})
+		cfg.AutoselectOrder = autoselect.OrderResetFirst
+	}
 
 	usageProbe, err := parseBool("UZI_USAGE_PROBE", true)
 	if err != nil {
@@ -1539,7 +1559,7 @@ func (c Config) OIDCEnabled() bool { return c.OIDCIssuerURL != "" }
 // (fetcher_control.go), so nothing could serve a profile-bound run anyway.
 func (c Config) IsolatedLaneEnabled() bool { return len(c.FetcherTokenSHA256) != 0 }
 
-// AutoselectPolicy assembles the four UZI_AUTOSELECT_* knobs into the pure ranker's
+// AutoselectPolicy assembles the UZI_AUTOSELECT_* knobs into the pure ranker's
 // Policy (PRD #111 D6).
 //
 // 🔴 IT IS A METHOD SO THERE CAN ONLY BE ONE. The policy is read in two places that
@@ -1555,6 +1575,7 @@ func (c Config) AutoselectPolicy() autoselect.Policy {
 		HeadroomTiePct:  c.AutoselectHeadroomTiePct,
 		MaxStaleness:    c.AutoselectMaxStaleness,
 		InflightPenalty: c.AutoselectInflightPenalty,
+		Order:           c.AutoselectOrder,
 	}
 }
 

@@ -137,6 +137,34 @@ describe("the documented invocation", { skip: ENV_SKIP }, () => {
     assert.deepEqual(JSON.parse(requests[0]!), { op: "discard", run: RUN_ID, generation: 2, attempt: ATTEMPT, confirm: digest, protected: true });
   });
 
+  it("sends the local-records and resolve-local-record requests (issue #3885)", async () => {
+    const { sock, requests } = await fixtureServer(() => '{"ok":true}\n');
+    const digest = "ab".repeat(32);
+    const a = documented(["local-records", "--run", "run-1", "--socket", sock]);
+    assert.equal((await run(a.command, a.args, process.env)).code, 0);
+    const b = documented(["resolve-local-record", "--run", "run-1", "--generation", "3", "--confirm", digest, "--socket", sock]);
+    assert.equal((await run(b.command, b.args, process.env)).code, 0);
+    assert.deepEqual(requests.map((l) => JSON.parse(l)), [
+      { op: "local-records", run: "run-1" },
+      { op: "resolve-local-record", run: "run-1", generation: 3, confirm: digest },
+    ]);
+  });
+
+  it("rejects malformed local-record command lines with exit 2 and no connection", async () => {
+    const { sock, requests } = await fixtureServer(() => '{"ok":true}\n');
+    const digest = "ab".repeat(32);
+    for (const bad of [
+      ["local-records"], ["local-records", "--run", "r", "--generation", "1"], ["local-records", "--run", "r", "--attempt", "canonical"],
+      ["resolve-local-record", "--run", "r", "--generation", "1"], ["resolve-local-record", "--run", "r", "--confirm", digest],
+      ["resolve-local-record", "--run", "r", "--generation", "0", "--confirm", digest],
+      ["resolve-local-record", "--run", "r", "--generation", "none", "--confirm", digest],
+    ]) {
+      const { command, args } = documented([...bad, "--socket", sock]);
+      assert.equal((await run(command, args, process.env)).code, 2, JSON.stringify(bad));
+    }
+    assert.equal(requests.length, 0);
+  });
+
   it("exits non-zero on a refusal, an unknown outcome, a malformed answer and an unreachable socket", async () => {
     const sel = ["--run", RUN_ID, "--generation", "1", "--attempt", ATTEMPT, "--confirm", "cd".repeat(32)];
     for (const body of [

@@ -102,6 +102,22 @@ type StagedRole struct {
 	Notes       []string `json:"notes,omitempty"`
 }
 
+// normalizeRawDefinition classifies a source's single raw model exactly once.
+// Call only at raw conversion seams; normalized definitions already have two pins.
+func normalizeRawDefinition(raw agenttmpl.Definition) agenttmpl.Definition {
+	raw.Model, raw.CodexModel = agenttmpl.SplitModelPin(raw.Model)
+	return raw
+}
+
+// Definition converts a raw staged role into the two-pin definition used by apply
+// and approval DTOs. It does not change the staged snapshot or its raw Model.
+func (r StagedRole) Definition() agenttmpl.Definition {
+	return normalizeRawDefinition(agenttmpl.Definition{
+		Name: r.Name, Description: r.Description, Model: r.Model,
+		Tools: r.Tools, PromptBody: r.PromptBody,
+	})
+}
+
 // DiffEntry is one per-name classification in the staged snapshot's diff array.
 type DiffEntry struct {
 	Name   string `json:"name"`
@@ -248,7 +264,11 @@ func (r *Reconciler) Reconcile(ctx context.Context) (Result, error) {
 		r.recordStatus(ctx, statusError, "", msg, 0, 0, 0)
 		return Result{Status: statusError, Message: msg}, nil
 	}
-	diff := computeDiff(set.Roles, current)
+	defs := make([]agenttmpl.Definition, 0, len(set.Roles))
+	for _, raw := range set.Roles {
+		defs = append(defs, normalizeRawDefinition(raw))
+	}
+	diff := computeDiff(defs, current)
 
 	rolesJSON, err := json.Marshal(stagedRoles)
 	if err != nil {
@@ -403,6 +423,9 @@ func rowToDefinition(t store.AgentTemplate) agenttmpl.Definition {
 	}
 	if t.Model.Valid {
 		d.Model = t.Model.String
+	}
+	if t.CodexModel.Valid {
+		d.CodexModel = t.CodexModel.String
 	}
 	return d
 }
