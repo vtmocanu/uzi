@@ -44,7 +44,9 @@ describe("stored harness decision", () => {
   it("explains an automatic soonest-reset choice and labels the evidence rows Claude and Codex", () => {
     render(<RunHarnessDecision run={{ harness_decision: auto }} />);
     const region = screen.getByRole("region", { name: "Harness decision at creation time" });
-    expect(region.textContent).toContain("chosen per run by weekly limits: Codex's weekly allowance resets sooner than Claude's");
+    expect(region.textContent).toContain("Chosen per run by weekly limits: Codex's weekly allowance resets sooner than Claude's");
+    expect(region.textContent).toContain("automatic (Default · automatic), chosen codex. Reason: auto_soonest_reset");
+    expect(region.textContent).not.toContain("preferred claude");
     expect(region.textContent).toContain("Claude comparison score: 70%; measured headroom: 70%; capacity hold: no; weekly reset: 2026-11-09 10:00 UTC");
     expect(region.textContent).toContain("Codex comparison score: 80%; measured headroom: 80%; capacity hold: no; weekly reset: 2026-11-06 08:30 UTC");
     expect(region.textContent).not.toContain("Preferred comparison score");
@@ -52,11 +54,31 @@ describe("stored harness decision", () => {
     expect(region.textContent).toContain("Stored when this run was created, not live usage");
   });
   it.each([
-    ["auto_only_qualified", "only Codex had enough headroom"],
-    ["auto_fallback", "Claude used: usage was unknown"],
-  ])("explains %s in plain language", (reason, text) => {
-    render(<RunHarnessDecision run={{ harness_decision: { ...auto, reason } }} />);
+    ["auto_only_qualified", "codex", "only Codex had enough headroom"],
+    ["auto_fallback", "claude", "Claude used: usage was unknown"],
+  ])("explains %s in plain language", (reason, chosen, text) => {
+    render(<RunHarnessDecision run={{ harness_decision: { ...auto, reason, chosen } }} />);
     expect(screen.getByRole("region", { name: "Harness decision at creation time" }).textContent).toContain(text);
+  });
+  it.each([
+    ["both resets missing", null, null],
+    ["equal resets", "2026-11-06T08:30:00Z", "2026-11-06T08:30:00Z"],
+    ["only the other side known", "2026-11-06T08:30:00Z", null],
+    ["the chosen side resetting later", "2026-11-10T08:30:00Z", "2026-11-06T08:30:00Z"],
+  ])("uses neutral wording, not 'resets sooner', for %s", (_name, codexReset, claudeReset) => {
+    render(<RunHarnessDecision run={{ harness_decision: {
+      ...auto, chosen: "codex", preferred_weekly_reset_at: claudeReset, other_weekly_reset_at: codexReset,
+    } }} />);
+    const text = screen.getByRole("region", { name: "Harness decision at creation time" }).textContent ?? "";
+    expect(text).toContain("Both accounts had headroom; Codex chosen (no earlier known weekly reset, so more headroom, then Claude, decides)");
+    expect(text).not.toContain("resets sooner");
+  });
+  it("says resets sooner when Claude is chosen with a strictly earlier known reset", () => {
+    render(<RunHarnessDecision run={{ harness_decision: {
+      ...auto, chosen: "claude", preferred_weekly_reset_at: "2026-11-05T08:30:00Z", other_weekly_reset_at: "2026-11-06T08:30:00Z",
+    } }} />);
+    expect(screen.getByRole("region", { name: "Harness decision at creation time" }).textContent)
+      .toContain("Claude's weekly allowance resets sooner than Codex's");
   });
   it("shows unknown weekly resets for rows created before they were recorded", () => {
     render(<RunHarnessDecision run={{ harness_decision: { ...auto, preferred_weekly_reset_at: null, other_weekly_reset_at: null } }} />);

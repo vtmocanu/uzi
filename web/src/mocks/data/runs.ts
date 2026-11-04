@@ -90,15 +90,7 @@ const LEAD_CONFIG_CODEX_OBSERVED: RunLeadConfig = {
 
 export const mockRuns: Run[] = [
   {
-    // Automatic default with both accounts qualified: Claude's weekly allowance resets sooner.
-    harness_decision: {
-      preferred: "claude", chosen: "claude", reason: "auto_soonest_reset",
-      preferred_score: 80, other_score: 70,
-      preferred_measured: 80, other_measured: 70,
-      preferred_held: false, other_held: false,
-      preferred_weekly_reset_at: minsAhead(2 * 24 * 60),
-      other_weekly_reset_at: minsAhead(5 * 24 * 60),
-    },
+    harness_decision: null,
     // run-queued is parked in the queue, not yet claimed by a worker: it renders
     // the "queued" status badge (PRD #21 SC3 — violet under mission, gray under
     // ember) on issue 26's board card and in the runs list.
@@ -540,7 +532,15 @@ export const mockRuns: Run[] = [
     updated_at: minsAgo(1),
   },
   {
-    harness_decision: null,
+    // Automatic default with both accounts qualified: Claude's weekly allowance resets sooner.
+    harness_decision: {
+      preferred: "claude", chosen: "claude", reason: "auto_soonest_reset",
+      preferred_score: 80, other_score: 70,
+      preferred_measured: 80, other_measured: 70,
+      preferred_held: false, other_held: false,
+      preferred_weekly_reset_at: minsAhead(2 * 24 * 60),
+      other_weekly_reset_at: minsAhead(5 * 24 * 60),
+    },
     id: LIVE_RUN_ID,
     repo_id: "repo-uzi",
     issue_iid: 24,

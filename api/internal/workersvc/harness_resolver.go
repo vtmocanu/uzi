@@ -110,7 +110,8 @@ var (
 //  2. otherwise a usable user default is used (a set-but-unusable default falls through,
 //     it is not an error);
 //  3. otherwise the sole harness that has a usable credential is used;
-//  4. otherwise (both usable, no usable default) Claude is chosen;
+//  4. otherwise (both usable, no usable default) Claude is chosen (the usage-free answer;
+//     an eligible automatic creation may choose by weekly limits, see harness_automatic.go);
 //  5. otherwise (neither usable) errNoUsableCredential.
 func resolveHarness(in resolveHarnessInput) (Harness, error) {
 	// (1) Explicit selection is authoritative and terminal — used if usable, else a
@@ -137,7 +138,7 @@ func resolveHarness(in resolveHarnessInput) (Harness, error) {
 	case in.avail.codexUsable && !in.avail.claudeUsable:
 		return HarnessCodex, nil // (3) sole Codex
 	case in.avail.claudeUsable && in.avail.codexUsable:
-		return HarnessClaude, nil // (4) both usable, no usable default → Claude
+		return HarnessClaude, nil // (4) both usable, no usable default → Claude (usage-free answer; eligible automatic creation may choose by weekly limits, harness_automatic.go)
 	default:
 		return "", errNoUsableCredential // (5) neither usable
 	}

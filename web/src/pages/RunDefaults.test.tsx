@@ -1505,13 +1505,26 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     const view = render(<MemoryRouter><RunDefaults /></MemoryRouter>);
     await screen.findByLabelText("Default harness");
     expect(overflowSwitch().getAttribute("aria-disabled")).toBe("true");
-    expect(screen.getByText(/Overflow applies only when the default harness is Claude or Codex/)).toBeTruthy();
+    const explanation = screen.getByText(/Overflow applies only when a Claude or Codex default harness is saved/);
+    expect(explanation.textContent).toContain("With Default · automatic, uzi already picks by weekly limits.");
+    expect(overflowSwitch().getAttribute("aria-describedby")?.split(" ")).toContain(explanation.id);
+    fireEvent.click(overflowSwitch());
+    expect(mockApi.setHarnessOverflow).not.toHaveBeenCalled();
     view.unmount();
     mockApi.getMySettings.mockResolvedValue(settings({ default_harness: "codex" }));
     render(<MemoryRouter><RunDefaults /></MemoryRouter>);
     await screen.findByLabelText("Default harness");
     expect(overflowSwitch().getAttribute("aria-disabled")).not.toBe("true");
-    expect(screen.queryByText(/Overflow applies only when the default harness is Claude or Codex/)).toBeNull();
+    expect(screen.queryByText(/Overflow applies only when a Claude or Codex default harness is saved/)).toBeNull();
+  });
+
+  it("with one usable harness and Default · automatic, the overflow note makes no weekly-limits claim", async () => {
+    mockAuth(baseUser);
+    mockApi.listSecrets.mockResolvedValue({ secrets: [anthropicToken] });
+    mockApi.getMySettings.mockResolvedValue(settings());
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    const note = await screen.findByText(/Overflow applies only when a Claude or Codex default harness is saved/);
+    expect(note.textContent).not.toContain("weekly limits");
   });
 
   it("both usable: the badge moves to the Codex lane when Codex is selected", async () => {

@@ -59,7 +59,7 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 // settingsDefaultHarnessLine renders the per-user default harness; nil is automatic.
 func settingsDefaultHarnessLine(h *string) string {
 	if h == nil {
-		return "Default harness: automatic (chosen per run by weekly limits)"
+		return "Default harness: automatic (chosen per run by weekly limits when both harnesses are usable)"
 	}
 	return "Default harness: " + cellText(*h)
 }

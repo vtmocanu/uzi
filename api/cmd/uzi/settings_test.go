@@ -27,7 +27,7 @@ func TestSettingsGetTableAndJSON(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 8 || lines[3] != "Now summary: on (default)" || lines[4] != "Weekly usage reserve: off" || lines[5] != "Codex account mode: default" || lines[6] != "Default harness: automatic (chosen per run by weekly limits)" || lines[7] != "Harness overflow: off (inactive: default harness is automatic)" {
+	if len(lines) != 8 || lines[3] != "Now summary: on (default)" || lines[4] != "Weekly usage reserve: off" || lines[5] != "Codex account mode: default" || lines[6] != "Default harness: automatic (chosen per run by weekly limits when both harnesses are usable)" || lines[7] != "Harness overflow: off (inactive: default harness is automatic)" {
 		t.Fatalf("expected header, two cells, the Now summary, reserve, Codex mode, default harness and harness overflow lines: %s", out)
 	}
 	want := []string{

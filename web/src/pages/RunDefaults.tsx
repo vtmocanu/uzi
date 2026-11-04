@@ -1196,8 +1196,8 @@ export function RunDefaults() {
               </label>
               {overflowNeedsExplicitDefault && (
                 <p id="harness-overflow-automatic" className="text-xs text-faint">
-                  Overflow applies only when the default harness is Claude or Codex; with
-                  Default · automatic, uzi already picks by weekly limits.
+                  Overflow applies only when a Claude or Codex default harness is saved.
+                  {showHarnessSelector && " With Default · automatic, uzi already picks by weekly limits."}
                 </p>
               )}
               <p id="harness-overflow-scope" className="text-xs text-faint">

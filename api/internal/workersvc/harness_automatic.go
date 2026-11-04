@@ -124,8 +124,8 @@ func (d *harnessCreationDecision) applyAutomatic(claude, codex autoSide, now tim
 	d.PreferredWeeklyReset, d.OtherWeeklyReset = claude.recordedReset(now), codex.recordedReset(now)
 }
 
-// recordedReset is the weekly reset the decision record stores: the known future reset the
-// comparison used (autoselect.FutureWeeklyReset), and none for an unknown side, whose stale
+// recordedReset is the weekly reset the decision record stores: the side's known future
+// weekly reset (autoselect.FutureWeeklyReset), and none for an unknown side, whose stale
 // or unmeasured reading did not decide anything.
 func (s autoSide) recordedReset(now time.Time) *time.Time {
 	if s.State == autoUnknown {

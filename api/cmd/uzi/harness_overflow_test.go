@@ -58,7 +58,7 @@ func TestSettingsGetDefaultHarnessLine(t *testing.T) {
 		def  *string
 		want []string
 	}{
-		{nil, []string{"Default harness: automatic (chosen per run by weekly limits)", "Harness overflow: on (inactive: default harness is automatic)"}},
+		{nil, []string{"Default harness: automatic (chosen per run by weekly limits when both harnesses are usable)", "Harness overflow: on (inactive: default harness is automatic)"}},
 		{&explicitClaude, []string{"Default harness: claude", "Harness overflow: on (new runs, at creation)"}},
 		{&codex, []string{"Default harness: codex", "Harness overflow: on (new runs, at creation)"}},
 	} {

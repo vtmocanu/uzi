@@ -638,9 +638,9 @@ describe("IssueView Start gate (PRD #764)", () => {
   });
 
   // Positive control: a both-usable user with the harness picker left on inherit (the
-  // untouched default) also still sees the Anthropic picker — inherit can resolve to
-  // Claude when both are usable and no default is set (the weekly-limit choice falls
-  // back to Claude), so hiding it here would be wrong.
+  // untouched default) also still sees the Anthropic picker. The usage-free resolver
+  // answer for inherit with both usable is Claude; creation of an eligible implicit issue
+  // run may pick by weekly limits instead (#3845), so hiding it here would be wrong.
   it("still shows the Anthropic token picker for a both-usable user on the untouched inherit default", async () => {
     setAuth();
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });

@@ -62,8 +62,9 @@ export function bothHarnessesUsable(claudeUsable: boolean, codexUsable: boolean)
 // though the run WILL resolve to Codex under D11 — and an Anthropic token/credential
 // override control left visible for that user 422s the moment it is used (D5: a Codex
 // run cannot carry an Anthropic override). Gate on the EFFECTIVE harness instead, which
-// mirrors resolveHarness's (harness_resolver.go) explicit → usable-default → availability
-// order exactly:
+// follows resolveHarness's (harness_resolver.go) usage-free explicit → usable-default →
+// availability order. Creation of an eligible implicit issue run may instead pick by weekly
+// limits (#3845); that choice needs usage data this gate does not have:
 //
 //   - an explicit "codex" pick is authoritative regardless of usability facts;
 //   - an explicit "claude" pick is likewise authoritative (never hidden);
@@ -73,7 +74,8 @@ export function bothHarnessesUsable(claudeUsable: boolean, codexUsable: boolean)
 //     default resolves to Claude even when Codex is also usable;
 //   - otherwise "inherit" falls through to availability — Codex only when it is the
 //     SOLE usable harness (D11 rule 3); both-usable-with-no-usable-default and
-//     sole-Claude both resolve to Claude (D11 rules 3/4).
+//     sole-Claude both resolve to Claude (D11 rules 3/4) in this usage-free answer; an
+//     eligible automatic creation with both usable may choose Codex by weekly limits (#3845).
 //
 // Used by every NOT-YET-CREATED start-dialog Anthropic TokenPicker gate (IssueView's
 // start dialog, Board/IssueCard's per-card picker, ScheduleModal's per-schedule picker),
