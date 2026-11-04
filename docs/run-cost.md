@@ -99,9 +99,11 @@ geographic routing ([usage-report semantics](https://platform.claude.com/docs/en
 The marker stays unpriced on geo-capable models because it cannot rule out a
 routing premium. Other non-standard geographies remain unpriced. Haiku 5.5
 bills each request by prompt length (input, cache reads and cache writes):
-the table carries only its rates for prompts up to 100,000 tokens, so an
-entry whose prompt tokens total more than that stays unpriced, because uzi
-cannot tell which of its requests crossed the threshold.
+the table carries only its rates for prompts up to 100,000 tokens, not the
+higher ones above that. A single call over the threshold therefore stays
+unpriced. So does a summary or Now entry whose prompt tokens total more than
+100,000, since it can sum several calls and uzi cannot tell which of them
+crossed the threshold.
 Existing unreported summary/Now rows are not backfilled.
 
 The legacy `subscription` status means **no cost estimate was recorded**.
