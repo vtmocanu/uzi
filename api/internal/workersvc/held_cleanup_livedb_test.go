@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -116,6 +117,97 @@ func (c *cleanupFix) forgeHas(ref string) (string, bool) {
 	return tip, ok
 }
 
+// hostSource stands in for the host clock a fixture used to read: the service clock base and,
+// for DinD, the worker's observation. Nominal, it is time.Now. lagging() is the adverse
+// ordering of #3883, deterministic: once the flow records a database stamp it read back, the
+// host reads exactly one Postgres tick (1µs) before it, whatever the real clock offset or the
+// elapsed time.
+type hostSource struct {
+	mu   sync.Mutex
+	lag  bool
+	last time.Time
+	has  bool
+}
+
+func nominalHost() *hostSource { return &hostSource{} }
+func laggingHost() *hostSource { return &hostSource{lag: true} }
+
+func (h *hostSource) now() time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.lag && h.has {
+		return h.last.Add(-time.Microsecond)
+	}
+	return time.Now()
+}
+
+// record notes a database stamp the flow just read back. In the lagging source the host then
+// reads just before it, and the relation is asserted so the adverse ordering is established,
+// not assumed.
+func (h *hostSource) record(t *testing.T, stamp time.Time) {
+	t.Helper()
+	h.mu.Lock()
+	if h.lag && (!h.has || stamp.After(h.last)) {
+		h.last, h.has = stamp, true
+	}
+	h.mu.Unlock()
+	if h.lag && !h.now().Before(stamp) {
+		t.Fatalf("lagging host %s is not before the database stamp %s", h.now(), stamp)
+	}
+}
+
+// eachHost runs a flow with the nominal host clock and with a host just behind the database.
+func eachHost(t *testing.T, flow func(t *testing.T, src *hostSource)) {
+	t.Run("host_clock", func(t *testing.T) { flow(t, nominalHost()) })
+	t.Run("db_ahead_of_host", func(t *testing.T) { flow(t, laggingHost()) })
+}
+
+// foreignDue counts other users' rows a sweep at the service clock could select: a superset of
+// the three lanes, so a zero means this fixture's rows are the only ones the pass can change.
+func (c *cleanupFix) foreignDue() int {
+	c.t.Helper()
+	var n int
+	if err := c.e.pool.QueryRow(c.e.ctx, `SELECT count(*) FROM run_held_publications WHERE user_id <> $1
+		AND (state IN ('invoked','create_unknown','created','delete_unknown') OR (state='acknowledged' AND expires_at <= $2))`,
+		c.e.userID, c.svc.now()).Scan(&n); err != nil {
+		c.t.Fatalf("count foreign due rows: %v", err)
+	}
+	return n
+}
+
+// dueRunIDs lists, for diagnostics, the runs whose rows are lane-eligible at the service clock.
+func (c *cleanupFix) dueRunIDs() []string {
+	c.t.Helper()
+	rows, err := c.e.pool.Query(c.e.ctx, `SELECT run_id::text FROM run_held_publications
+		WHERE state IN ('invoked','create_unknown','created','delete_unknown') OR (state='acknowledged' AND expires_at <= $1)
+		ORDER BY run_id LIMIT 20`, c.svc.now())
+	if err != nil {
+		c.t.Fatalf("list due runs: %v", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		c.t.Fatalf("list due runs: %v", err)
+	}
+	return ids
+}
+
+// sweepWant runs one pass. Its count is global (the production sweep is deliberately
+// unscoped), so it is checked strictly only when no other user's row was due before the pass;
+// otherwise it is diagnostics, and callers gate on this fixture's own row, deletes and ref.
+func (c *cleanupFix) sweepWant(want int64) int64 {
+	c.t.Helper()
+	foreign := c.foreignDue()
+	n := c.sweep()
+	if n != want {
+		if foreign == 0 {
+			c.t.Fatalf("sweep touched %d rows, want %d (fixture deletes=%d, no foreign row was due before the pass; due runs now: %v)",
+				n, want, c.deleteCount(), c.dueRunIDs())
+		}
+		c.t.Logf("sweep touched %d rows globally, %d for this fixture expected; %d foreign rows were due before the pass", n, want, foreign)
+	}
+	return n
+}
+
 func (c *cleanupFix) wantState(want string) store.RunHeldPublication {
 	c.t.Helper()
 	r := c.mustRow()
@@ -153,32 +245,108 @@ func TestHeldCleanupExpiryDeletesLiveDB(t *testing.T) {
 // Owner expiry only moves expires_at, and the expiry lane then deletes; the cleanup runs with the
 // publication switch off too (the switch gates only new step A and B work).
 func TestHeldCleanupOwnerExpiryAndSwitchOffLiveDB(t *testing.T) {
+	eachHost(t, ownerExpiryFlow)
+}
+
+// ownerExpireFix owner-expires an acknowledged publication of a fresh fixture whose service
+// clock is the given host, and returns it with the database-stamped expiry.
+func ownerExpireFix(t *testing.T, src *hostSource) (*cleanupFix, time.Time) {
+	t.Helper()
 	c := newCleanupFix(t)
+	c.svc.SetClock(src.now)
 	c.created()
 	c.acknowledge(c.mustRow())
 	rows, err := c.e.q.OwnerExpireHeldPublications(c.e.ctx, store.OwnerExpireHeldPublicationsParams{RunID: c.run, UserID: c.e.userID})
-	if err != nil || len(rows) != 1 || !rows[0].OwnerExpiredAt.Valid {
+	if err != nil || len(rows) != 1 || !rows[0].OwnerExpiredAt.Valid || !rows[0].ExpiresAt.Valid {
 		t.Fatalf("owner expire = %v, %v", rows, err)
 	}
+	src.record(t, rows[0].ExpiresAt.Time)
+	return c, rows[0].ExpiresAt.Time
+}
+
+func ownerExpiryFlow(t *testing.T, src *hostSource) {
+	c, expiry := ownerExpireFix(t, src)
+	// The expiry is stamped by the database clock; the cleanup clock is taken from it, so the
+	// row is due whatever the host clock reads (#3883).
+	c.svc.SetClock(func() time.Time { return expiry })
 	c.svc.p.HeldPublication = false
-	if n := c.sweep(); n != 1 {
-		t.Fatalf("sweep touched %d rows, want 1", n)
-	}
+	c.sweepWant(1)
 	c.wantState("deleted")
+	if c.deleteCount() != 1 || c.deletes[0].ExpectedOldTip != heldTestTip || c.deletes[0].Ref != c.ref() {
+		t.Fatalf("delete options = %+v: want one CAS on the recorded tip", c.deletes)
+	}
+	if _, ok := c.forgeHas(c.ref()); ok {
+		t.Fatal("the ref is still on the forge")
+	}
+}
+
+// The expiry boundary is inclusive and exact: a service clock one Postgres tick before the
+// returned expiry deletes nothing, the expiry itself deletes.
+func TestHeldCleanupOwnerExpiryClockBoundaryLiveDB(t *testing.T) {
+	c, expiry := ownerExpireFix(t, nominalHost())
+	c.svc.SetClock(func() time.Time { return expiry.Add(-time.Microsecond) })
+	c.sweepWant(0)
+	if c.deleteCount() != 0 {
+		t.Fatalf("deleted before the expiry: deletes=%d", c.deleteCount())
+	}
+	c.wantState("acknowledged")
+	if _, ok := c.forgeHas(c.ref()); !ok {
+		t.Fatal("the ref is gone before the expiry")
+	}
+	c.svc.SetClock(func() time.Time { return expiry })
+	c.sweepWant(1)
+	c.wantState("deleted")
+	if _, ok := c.forgeHas(c.ref()); ok || c.deleteCount() != 1 {
+		t.Fatalf("at the expiry: ref present=%v deletes=%d", ok, c.deleteCount())
+	}
+}
+
+// A fixture that ends with a due row (as a failed owner-expiry assertion leaves it) cannot
+// contaminate a later fixture's global sweep: its cleanup neutralises the row.
+func TestHeldCleanupFixtureRowsCannotLeakLiveDB(t *testing.T) {
+	var leaked uuid.UUID
+	t.Run("leaves_due_row", func(t *testing.T) {
+		c := newCleanupFix(t)
+		c.acknowledge(c.created())
+		c.expireNow()
+		leaked = c.e.userID
+	})
+	t.Run("later_fixture", func(t *testing.T) {
+		c := newCleanupFix(t)
+		if n := liveHeldRows(c.e.ctx, t, c.e, leaked); n != 0 {
+			t.Fatalf("the earlier fixture left %d publication rows in a cleanup lane", n)
+		}
+		openHoldFlow(t, c)
+	})
 }
 
 // Never a delete while ANY hold of the run is open, whatever its generation; the row is deferred
 // (not blocking), and deleted once the hold closes. A stale listing (the hold opened after the
 // row was listed) is caught by the re-check under the lock.
 func TestHeldCleanupNeverDeletesWithOpenHoldLiveDB(t *testing.T) {
-	c := newCleanupFix(t)
+	openHoldFlow(t, newCleanupFix(t))
+}
+
+func openHoldFlow(t *testing.T, c *cleanupFix) {
+	t.Helper()
 	pub := c.created()
 	c.acknowledge(pub)
 	c.expireNow()
 	later := c.openLaterHold()
 
-	if n := c.sweep(); n != 0 || c.deleteCount() != 0 {
-		t.Fatalf("a ref was deleted while a generation-2 hold is open: n=%d deletes=%d", n, c.deleteCount())
+	foreign := c.foreignDue()
+	n := c.sweep()
+	if c.deleteCount() != 0 {
+		t.Fatalf("a ref was deleted while a generation-2 hold is open: fixture deletes=%d (global sweep changed %d rows)", c.deleteCount(), n)
+	}
+	if _, ok := c.forgeHas(c.ref()); !ok {
+		t.Fatalf("the fixture ref is gone while a generation-2 hold is open (global sweep changed %d rows)", n)
+	}
+	if n != 0 {
+		if foreign == 0 {
+			t.Fatalf("the global sweep changed %d rows with no fixture delete and no foreign row due before the pass; due runs now: %v", n, c.dueRunIDs())
+		}
+		t.Logf("the global sweep changed %d rows, none of them this fixture's; %d foreign rows were due before the pass", n, foreign)
 	}
 	row := c.wantState("acknowledged")
 	if !row.NextAttemptAt.Valid || !row.NextAttemptAt.Time.After(time.Now()) {
@@ -193,10 +361,11 @@ func TestHeldCleanupNeverDeletesWithOpenHoldLiveDB(t *testing.T) {
 	c.rawHold(`UPDATE recovery_custody_holds SET state='released',live_worker_id=NULL,live_run_id=NULL,
 		release_evidence='publication',released_at=now() WHERE id=$1`, later)
 	c.e.exec(t, `UPDATE run_held_publications SET next_attempt_at=NULL WHERE run_id=$1`, c.run)
-	if n := c.sweep(); n != 1 {
-		t.Fatalf("sweep after the hold closed touched %d rows, want 1", n)
-	}
+	c.sweepWant(1)
 	c.wantState("deleted")
+	if _, ok := c.forgeHas(c.ref()); ok || c.deleteCount() != 1 {
+		t.Fatalf("after the hold closed: ref present=%v fixture deletes=%d", ok, c.deleteCount())
+	}
 }
 
 // The orphan lane deletes a created, never-acknowledged ref only after the run's hold closed, and
