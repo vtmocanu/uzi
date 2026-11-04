@@ -2350,6 +2350,8 @@ const RETAINED_OP_DEADLINE_MS = 30_000;
 const RETAINED_MEASURE_MAX_ENTRIES = 100_000;
 const RETAINED_MEASURE_MAX_PENDING = 10_000;
 const RETAINED_MEASURE_MAX_DEPTH = 256;
+/** The entry cap for a retained-seed footprint estimate: room for a typical `node_modules` tree. */
+const RETAINED_SEED_MEASURE_MAX_ENTRIES = 400_000;
 
 /** Overrides of the measurement caps (tests inject small ones). */
 export interface RetainedMeasureCaps {
@@ -10813,13 +10815,20 @@ export class GitCache {
       (p.attemptId ?? "canonical") === sel.attempt);
   }
 
-  /** Sum of allocated bytes under `root` by an lstat walk that never follows a symlink. Stops at the
+  /** Sum of allocated bytes under `root` by an lstat walk that never follows a symlink. `entries` is
+   *  the entries read: the root plus every directory entry read, including vanished and cap-overflow
+   *  entries (so it errs high; 0 when the root is unreadable).
+   *  `skip` gets a directory's path relative to `root` (posix-joined) and, when true, omits its
+   *  contents (the directory itself is still counted). Stops at the
    *  deadline of the injected clock, or at a cap on the entries visited, the pending-directory stack
    *  or the directory depth (the tree is runner-written and hostile), and then reports
-   *  `complete: false`, never a total of zero and never a total claimed complete. */
+   *  `complete: false`, never a total of zero and never a total claimed complete.
+   *  `partialOnIoError` (default off): a directory read or close error carrying a string `code` returns
+   *  the partial total with `complete: false` instead of throwing; an interruption still propagates. */
   private async measureAllocated(
     root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {}, causes: PartialCauses = {},
-  ): Promise<{ bytes: number; complete: boolean }> {
+    skip?: (rel: string) => boolean, partialOnIoError = false,
+  ): Promise<{ bytes: number; entries: number; complete: boolean }> {
     const filesystem = async <T>(action: () => Promise<T>): Promise<T> => {
       try { return await action(); }
       catch (error) { countPartialCause(causes, "measurement_filesystem_error"); throw error; }
@@ -10833,26 +10842,34 @@ export class GitCache {
       bytes += (await this.retainedIO(() => filesystem(() => fs.lstat(root)))).blocks * 512;
     } catch {
       this.checkRecoveryInterruption();
-      return { bytes: 0, complete: false };
+      return { bytes: 0, entries: 0, complete: false };
     }
-    const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+    const stack: Array<{ dir: string; depth: number; rel: string }> = [{ dir: root, depth: 0, rel: "" }];
     while (stack.length > 0) {
-      const { dir, depth } = stack.pop()!;
+      const { dir, depth, rel } = stack.pop()!;
       let handle;
       try {
         this.checkRecoveryInterruption();
         handle = await filesystem(() => fs.opendir(dir));
       } catch {
         this.checkRecoveryInterruption();
-        return { bytes, complete: false };
+        return { bytes, entries: visited + 1, complete: false };
       }
-      try {
+      type Walk = { bytes: number; entries: number; complete: boolean };
+      const walk = async (): Promise<Walk | undefined> => {
         this.checkRecoveryInterruption();
         for (;;) {
-          if (now() >= deadline) { countPartialCause(causes, "measurement_deadline"); return { bytes, complete: false }; }
-          const ent = await this.retainedIO(() => filesystem(() => handle.read()));
+          if (now() >= deadline) { countPartialCause(causes, "measurement_deadline"); return { bytes, entries: visited + 1, complete: false }; }
+          let ent;
+          try { ent = await this.retainedIO(() => filesystem(() => handle.read())); }
+          catch (err) {
+            if (!partialOnIoError) throw err;
+            this.checkRecoveryInterruption();
+            if (typeof (err as NodeJS.ErrnoException | undefined)?.code !== "string") throw err;
+            return { bytes, entries: visited + 1, complete: false };
+          }
           if (!ent) break;
-          if (++visited > maxEntries) { countPartialCause(causes, "measurement_entry_cap"); return { bytes, complete: false }; }
+          if (++visited > maxEntries) { countPartialCause(causes, "measurement_entry_cap"); return { bytes, entries: visited + 1, complete: false }; }
           const p = path.join(dir, ent.name);
           let st: Stats;
           try {
@@ -10868,22 +10885,58 @@ export class GitCache {
           } catch (err) {
             this.checkRecoveryInterruption();
             if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
-            return { bytes, complete: false };
+            return { bytes, entries: visited + 1, complete: false };
           }
           bytes += st.blocks * 512;
-          if (st.isDirectory() && !st.isSymbolicLink()) {
+          const childRel = rel === "" ? ent.name : `${rel}/${ent.name}`;
+          // A skipped directory is lstat-counted above but never descended into.
+          if (st.isDirectory() && !st.isSymbolicLink() && !skip?.(childRel)) {
             if (depth + 1 > maxDepth || stack.length >= maxPending) {
               countPartialCause(causes, depth + 1 > maxDepth ? "measurement_depth_cap" : "measurement_pending_cap");
-              return { bytes, complete: false };
+              return { bytes, entries: visited + 1, complete: false };
             }
-            stack.push({ dir: p, depth: depth + 1 });
+            stack.push({ dir: p, depth: depth + 1, rel: childRel });
           }
         }
-      } finally {
-        await filesystem(() => handle.close());
+        return undefined;
+      };
+      let outcome: Walk | undefined;
+      let bodyFailed = false;
+      let bodyError: unknown;
+      try { outcome = await walk(); } catch (err) { bodyFailed = true; bodyError = err; }
+      try { await filesystem(() => handle.close()); }
+      catch (err) {
+        // Without partialOnIoError the close error wins, as before. With it, a recovery interruption
+        // always surfaces first (even when the walk already failed, so a coded close error cannot mask
+        // it); then a failed walk rethrows the close error, and only a coded close error after a clean
+        // walk keeps the bytes already measured.
+        if (!partialOnIoError) throw err;
+        this.checkRecoveryInterruption();
+        if (bodyFailed) throw err;
+        if (typeof (err as NodeJS.ErrnoException | undefined)?.code !== "string") throw err;
+        return { bytes, entries: visited + 1, complete: false };
       }
+      if (bodyFailed) throw bodyError;
+      if (outcome) return outcome;
     }
-    return { bytes, complete: true };
+    return { bytes, entries: visited + 1, complete: true };
+  }
+
+  /**
+   * issue #3865 — a bounded, lstat-only estimate of what seeding a successor from the predecessor
+   * clone at `clonePath` will occupy: allocated bytes and inodes, `.git/objects` omitted unless
+   * `includeGitObjects` (a shared-clone successor borrows the bare's objects). `complete: false`
+   * means a cap, the deadline or a filesystem error cut the walk, so the numbers are lower
+   * bounds. Run it inside the caller's recovery operation: an interruption it raises propagates.
+   */
+  async measureRetainedSeedFootprint(
+    clonePath: string,
+    opts: { includeGitObjects: boolean; deadline: number; now?: () => number; caps?: RetainedMeasureCaps },
+  ): Promise<{ bytes: number; inodes: number; complete: boolean }> {
+    const caps = { ...opts.caps, maxEntries: opts.caps?.maxEntries ?? RETAINED_SEED_MEASURE_MAX_ENTRIES };
+    const skip = opts.includeGitObjects ? undefined : (rel: string) => rel === ".git/objects";
+    const m = await this.measureAllocated(clonePath, opts.now ?? Date.now, opts.deadline, caps, {}, skip, true);
+    return { bytes: m.bytes, inodes: m.entries, complete: m.complete };
   }
 
   /**

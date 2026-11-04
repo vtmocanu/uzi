@@ -510,3 +510,4 @@ Every case keeps the source. What a later run sees depends on where the failure 
   answer; no test evidence on a real Docker host shows a container is actually gone.
 - Operator procedure: `docs/run-recovery.md`, "When a run is stopped by a stale or fenced
   claim" and "Retained sources with no open hold (worker-local inspect and discard)".
+- **Go scratch (#3870).** A Claude run's managed Go work leaf (`<run HOME>/.uzi-go-work/g<N>`) lives inside the run HOME, so terminal HOME cleanup removes the Go-work root with the HOME. This adds no retention gate and changes no source or custody rule here; the leaf is disposable scratch, not a retained source. See the [ADR-1809 amendment](1809-per-run-cache-bounds.md#amendment-3870-park-only-go-scratch).

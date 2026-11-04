@@ -325,7 +325,8 @@ describe("runner owns evidence claim lifetime", () => {
       homeDir: f.home,
       executor: {
         async run(ctx) {
-          await fs.mkdir(f.home);
+          // Recursive like SdkExecutor: the runner may already have created the home (issue #3870).
+          await fs.mkdir(f.home, { recursive: true });
           reader = await ctx.prepareCIEvidence!();
           entered.resolve();
           await proceed.promise;

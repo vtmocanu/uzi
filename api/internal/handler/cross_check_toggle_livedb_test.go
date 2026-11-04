@@ -19,13 +19,16 @@ import (
 func TestSetCrossCheckWarnsPerCheckerDirectionLiveDB(t *testing.T) {
 	const codexWarning = "No online worker can run Codex plan cross-checks; enable ephemeral workers or upgrade a worker."
 	const claudeWarning = "No online worker can run Claude plan cross-checks for Codex-lead runs; enable ephemeral workers or upgrade a worker."
+	const steeringWarning = "No online worker supports owner-steering plan cross-checks (cross_check_owner_steering_v1); plan checks wait until a worker rolls to a release with it, and fall back to the human plan gate at their deadline."
+	steer := capability.CrossCheckOwnerSteeringV1
 	for _, tc := range []struct {
 		name    string
 		workers [][]string
 		want    string
 	}{
-		{"a worker covers both directions", [][]string{{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CrossCheckCodexLeadV1}}, ""},
-		{"two workers cover one direction each", [][]string{{capability.CrossCheckV1, capability.CodexHarnessV1}, {capability.CrossCheckV1, capability.CrossCheckCodexLeadV1}}, ""},
+		{"a worker covers both directions", [][]string{{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CrossCheckCodexLeadV1, steer}}, ""},
+		{"two workers cover one direction each", [][]string{{capability.CrossCheckV1, capability.CodexHarnessV1, steer}, {capability.CrossCheckV1, capability.CrossCheckCodexLeadV1}}, ""},
+		{"both directions covered but no owner-steering worker (issue #3841)", [][]string{{capability.CrossCheckV1, capability.CodexHarnessV1, capability.CrossCheckCodexLeadV1}}, steeringWarning},
 		{"only a worker released before the Claude checker", [][]string{{capability.CrossCheckV1, capability.CodexHarnessV1}}, claudeWarning},
 		{"no Codex-capable worker", [][]string{{capability.CrossCheckV1, capability.CrossCheckCodexLeadV1}}, codexWarning},
 		{"no cross-check worker at all", [][]string{{capability.CodexHarnessV1, capability.CrossCheckCodexLeadV1}}, codexWarning},

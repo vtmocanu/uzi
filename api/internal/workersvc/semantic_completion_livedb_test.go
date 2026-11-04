@@ -1,8 +1,11 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"slices"
 	"sync/atomic"
 	"testing"
 
@@ -198,5 +201,65 @@ func TestSemanticCompletionPendingPermitLiveDB(t *testing.T) {
 	pending, err := CompletionPending(run)
 	if err != nil || pending.Criteria[0].Status != "unverified" {
 		t.Fatalf("completion verified pending: %+v %v", pending, err)
+	}
+}
+
+// TestSemanticReportOnlyOwnerPartialDeliveryLiveDB: after a real owner partial decision on a
+// semantic contract (keep m1, defer m2), a headless report-only completion of m1 is delivered.
+func TestSemanticReportOnlyOwnerPartialDeliveryLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	id := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, nil, false)
+	fixture := semanticCompletionFixture(t, false)
+	e.exec(t, "UPDATE runs SET completion_contract=$2 WHERE id=$1", id, fixture.CompletionContract)
+	e.parkCompletionBlocked(t, id)
+	if _, err := svc.DecideCompletion(e.ctx, e.userID, id, CompletionDecisionInput{
+		Decision: "partial", Keep: []string{"m1"}, Reason: "ship m1 only; defer m2", ContractRevision: 1,
+	}); err != nil {
+		t.Fatalf("DecideCompletion partial: %v", err)
+	}
+	e.exec(t, "UPDATE runs SET status='running', worker_id=$2, milestones_completed='[\"m1\"]', claim_generation=1 WHERE id=$1", id, wid)
+	w := store.Worker{ID: wid, UserID: e.userID}
+
+	mixed := reportOnlyRequest()
+	mixed.Head, mixed.Branch = strPtr("h"), strPtr("b")
+	before := reportOnlySnapshot(t, e, id)
+	if _, ok, err := svc.SetState(e.ctx, w, id, mixed); ok || !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("mixed request: applied=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(before, reportOnlySnapshot(t, e, id)) {
+		t.Fatal("mixed refusal mutated run")
+	}
+	stale := reportOnlyRequest()
+	two := int64(2)
+	stale.ClaimGeneration = &two
+	if _, ok, err := svc.SetState(e.ctx, w, id, stale); ok || !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("stale generation: applied=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(before, reportOnlySnapshot(t, e, id)) {
+		t.Fatal("stale refusal mutated run")
+	}
+
+	req := reportOnlyRequest()
+	run, applied, err := svc.SetState(e.ctx, w, id, req)
+	if err != nil || !applied || run.Status != "completed" {
+		t.Fatalf("semantic owner partial delivery: applied=%v status=%s err=%v", applied, run.Status, err)
+	}
+	var stopKind string
+	var done []byte
+	if err := e.pool.QueryRow(e.ctx, "SELECT stop_kind, milestones_completed FROM runs WHERE id=$1", id).Scan(&stopKind, &done); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	if err := json.Unmarshal(done, &ids); err != nil || !slices.Equal(ids, []string{"m1"}) || stopKind != "scope_reduced" {
+		t.Fatalf("stop_kind=%q milestones_completed=%s err=%v", stopKind, done, err)
+	}
+	before = reportOnlySnapshot(t, e, id)
+	if _, applied, err = svc.SetState(e.ctx, w, id, req); err != nil || !applied {
+		t.Fatalf("identical retry: %v %v", applied, err)
+	}
+	if !bytes.Equal(before, reportOnlySnapshot(t, e, id)) {
+		t.Fatal("identical retry changed row")
 	}
 }

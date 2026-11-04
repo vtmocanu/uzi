@@ -747,6 +747,13 @@ Coverage alone never justifies REVISE or BLOCK. Defects take priority within
 the 20-item cap; spare slots hold coverage, with overflow summarized literally
 as `N coverage notes omitted`. Coverage and its count do not displace defects.
 
+Each new plan round also stores one immutable, bounded snapshot of the run
+owner's own answers and revise feedback in the child table
+`cross_check_owner_steering`, written with the round row and delivered
+identically on every claim (header `X-Uzi-Owner-Steering: v1`). Only such
+plan-stage children require `cross_check_owner_steering_v1`; see the
+[#3841 amendment](adr/2149-cross-check.md#amendment-2026-11-03--3841-owner-steering-in-plan-checker-input).
+
 The worker passes every approving item (including noncoverage warning/info)
 and the complete bounded summary, including summary-only findings, to both
 executors' implementation prompts through the shared nonce fence. Absent/null
@@ -2863,6 +2870,14 @@ pressure. All non-terminal worker-owned runs, including parks and approval waits
 block it. Requested maintenance drains unrelated run, chat and cross-check
 claims while owned runs and pinned plan checkers may finish; only an atomic terminal-only claim fence, drained local activity and fresh
 custody clearance permit gated anonymous-volume prune and stop authorization.
+One narrow exception (#3891): a separate worker-side pressure-only leg runs
+exactly `docker volume prune -f` (server API >=1.42, request pinned to 1.42 in
+its own child env) on a busy or custody-held non-ephemeral worker after two
+fresh samples at or above 85%, without closing the claim gate or waiting for
+idle, terminal runs or custody; it defers only while maintenance holds its
+fence and touches no PVC. It rides the same default-on flag. See ADR-1759 D8,
+"Exception — #3891", in
+[adr/1759-dind-data-metering-and-prune.md](adr/1759-dind-data-metering-and-prune.md).
 The controller observes the old Deployment and pods gone before deleting only
 `dind-data`, then publishes replacement readiness before reopening claims.
 DinD is scratch, including named volumes; this DinD maintenance recycle loses

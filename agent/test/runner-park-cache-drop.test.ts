@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -430,6 +431,106 @@ describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () 
       assert.strictEqual(fs.existsSync(home), false, "a terminal run's HOME is removed as before");
     } finally {
       forceRm(homeRoot);
+    }
+  });
+});
+
+// REAL-GO BEHAVIORAL TEST (issue #3870 M3). Self-contained on purpose: it imports no module that only
+// exists with the fix and names every path as a string, so this block can be copied unchanged to a base
+// export, where it must fail on WORK placement/retention (Go's temp tree lands in the TMPDIR fixture and
+// survives the park), not on a missing import.
+describe("RunRunner: real `go build -work` temp tree on a usage-limit park (issue #3870)", () => {
+  const goOnPath = ((): boolean => {
+    try {
+      execFileSync("go", ["version"], { stdio: "ignore", timeout: 30_000 });
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+  it("the Go work tree lives under <runHome>/.uzi-go-work/g<gen> and is gone after the park", async (t) => {
+    if (process.platform !== "linux") return t.skip("Linux only: the park drop and process proof are Linux semantics");
+    if (!goOnPath) return t.skip("go is not on PATH");
+    if (!fs.existsSync("/proc/self/fd")) return t.skip("no fd dir on this host: the park removal refuses here by design");
+    const { gitlab } = fakeGitlab();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3870-realgo-"));
+    const homeRoot = path.join(root, "homes");
+    const tmpFixture = path.join(root, "tmp");
+    const fixture = path.join(root, "fx");
+    fs.mkdirSync(homeRoot);
+    fs.mkdirSync(tmpFixture);
+    fs.mkdirSync(path.join(fixture, "p"), { recursive: true });
+    fs.writeFileSync(path.join(fixture, "go.mod"), "module example.com/fx\n\ngo 1.21\n");
+    fs.writeFileSync(path.join(fixture, "p", "p.go"), "package p\n\nfunc F() int { return 1 }\n");
+    const priorTmp = process.env.UZI_RUNNER_TMPDIR;
+    process.env.UZI_RUNNER_TMPDIR = tmpFixture;
+    const started = Date.now();
+    try {
+      const generation = 4;
+      const runId = "38700000-0000-4000-8000-000000009999";
+      let home = "";
+      let work = "";
+      let workExistedAfterBuild = false;
+      const queryFn: SdkQueryFn = (params) => {
+        if (work === "") {
+          // What the real CLI would have persisted for the session before the park.
+          fs.mkdirSync(path.join(home, ".claude", "projects", "-data-runner-clone"), { recursive: true });
+          fs.writeFileSync(path.join(home, ".claude", "projects", "-data-runner-clone", "sess-3870.jsonl"), TRANSCRIPT);
+          fs.writeFileSync(path.join(home, ".claude.json"), "{}\n");
+          // The env is exactly what the real executor handed the CLI, with nothing added.
+          const res = spawnSync("go", ["build", "-work", "./p"], {
+            cwd: fixture,
+            env: params.options.env as NodeJS.ProcessEnv,
+            encoding: "utf8",
+            timeout: 90_000,
+          });
+          assert.equal(res.status, 0, `go build failed: ${res.stderr}`);
+          const m = /^WORK=(.+)$/m.exec(res.stderr);
+          assert.ok(m, `go build -work printed no WORK=: ${res.stderr}`);
+          work = m![1]!.trim();
+          workExistedAfterBuild = fs.existsSync(work);
+        }
+        return (async function* () {
+          for await (const _ of params.prompt) {
+            /* drain */
+          }
+          yield {
+            type: "rate_limit_event",
+            session_id: "sess-3870",
+            rate_limit_info: { status: "rejected", resetsAt: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" },
+          } as never;
+          yield { type: "result", subtype: "success", is_error: false, num_turns: 0, session_id: "sess-3870" } as never;
+        })();
+      };
+      const factory: ExecutorFactory = (id) => {
+        home = path.join(homeRoot, id);
+        const sdk = new SdkExecutor(nullLogger(), home, { queryFn, emptyTurnBackoffBaseMs: 0, emptyTurnMaxRetries: 0 });
+        return { homeDir: home, executor: { run: (ctx: RunContext) => sdk.run(ctx) } };
+      };
+      await runnerWith(factory, gitlab).execute(gitlabClaim(3870, { run_id: runId, claim_generation: generation, wait_on_limit: true }));
+      assert.ok(api.states.some((s) => s.runId === runId && s.body.status === "limit_wait"), "precondition: the run parked at limit_wait");
+      assert.ok(work !== "", "precondition: go build -work ran inside the fake query");
+      assert.ok(workExistedAfterBuild, "WORK existed right after the build");
+      assert.ok(
+        work.startsWith(path.join(home, ".uzi-go-work", `g${generation}`) + path.sep),
+        `WORK ${work} is under <runHome>/.uzi-go-work/g${generation}`,
+      );
+      assert.equal(fs.existsSync(work), false, "the Go work tree is gone after the park");
+      assert.ok(fs.existsSync(path.join(home, ".uzi-go-work")), "the scratch parent stays");
+      assert.deepEqual(fs.readdirSync(tmpFixture), [], "Go left nothing in the TMPDIR fixture");
+      assert.equal(fs.existsSync(path.join(home, ".cache", "go-build")), false, "the Go build cache was dropped");
+      assert.equal(
+        fs.readFileSync(path.join(home, ".claude", "projects", "-data-runner-clone", "sess-3870.jsonl"), "utf8"),
+        TRANSCRIPT,
+        "the transcript is kept",
+      );
+      assert.ok(fs.existsSync(path.join(home, ".claude.json")), ".claude.json is kept");
+    } finally {
+      if (priorTmp === undefined) delete process.env.UZI_RUNNER_TMPDIR;
+      else process.env.UZI_RUNNER_TMPDIR = priorTmp;
+      forceRm(root);
+      console.log(`# real-go test took ${Date.now() - started} ms`);
     }
   });
 });

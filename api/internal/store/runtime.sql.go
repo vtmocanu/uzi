@@ -1193,6 +1193,8 @@ WITH claimant AS MATERIALIZED (
            OR 'cross_check_codex_lead_v1' = ANY($28::text[]))
       AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
            OR 'cross_check_semantic_plan_v1' = ANY($28::text[]))
+      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc JOIN cross_check_owner_steering s ON s.cross_check_id = pc.id WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+           OR 'cross_check_owner_steering_v1' = ANY($28::text[]))
       AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
            OR 'completion_semantic_publication_v1' = ANY($28::text[]))
       AND (r.kind <> 'cross_check' OR EXISTS (
@@ -1457,6 +1459,8 @@ WITH claimant AS MATERIALIZED (
            OR 'cross_check_codex_lead_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
            OR 'cross_check_semantic_plan_v1' = ANY(p.protocol_capabilities))
+      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc JOIN cross_check_owner_steering s ON s.cross_check_id = pc.id WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+           OR 'cross_check_owner_steering_v1' = ANY(p.protocol_capabilities))
       AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
            OR 'completion_semantic_publication_v1' = ANY(p.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
@@ -2689,6 +2693,8 @@ WHERE run.id = $9
            OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = run.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
            OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc JOIN cross_check_owner_steering s ON s.cross_check_id = pc.id WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
+           OR 'cross_check_owner_steering_v1' = ANY(w.protocol_capabilities))
       AND (run.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = run.id)
            OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (run.kind <> 'cross_check' OR EXISTS (
@@ -3522,6 +3528,45 @@ func (q *Queries) CreateApprovePlanInput(ctx context.Context, arg CreateApproveP
 		arg.ExpectedGateRevision,
 		arg.ContractSource,
 	)
+	var i RunUserInput
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.Kind,
+		&i.Body,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+		&i.QuestionID,
+		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
+		&i.GateBinding,
+		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
+	)
+	return i, err
+}
+
+const createCompletionDecisionInput = `-- name: CreateCompletionDecisionInput :one
+INSERT INTO run_user_inputs (run_id, kind, body, question_id)
+VALUES ($1, 'completion_decision', $2, $3)
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported
+`
+
+type CreateCompletionDecisionInputParams struct {
+	RunID      uuid.UUID   `json:"run_id"`
+	Body       pgtype.Text `json:"body"`
+	QuestionID pgtype.Text `json:"question_id"`
+}
+
+// Issue #3841: the completion_decision AUDIT row for an owner completion-continue that was
+// delivered as an ANSWER. It carries that answer's question_id so SnapshotOwnerSteering can
+// recognise the answer as completion guidance rather than plan steering. Every other
+// completion_decision write keeps using CreateRunInput (no question_id).
+func (q *Queries) CreateCompletionDecisionInput(ctx context.Context, arg CreateCompletionDecisionInputParams) (RunUserInput, error) {
+	row := q.db.QueryRow(ctx, createCompletionDecisionInput, arg.RunID, arg.Body, arg.QuestionID)
 	var i RunUserInput
 	err := row.Scan(
 		&i.ID,
@@ -7850,7 +7895,25 @@ SELECT
      AND w.status = 'online'
      AND fn_worker_accepts_new_intake(w)
      AND NOT w.ephemeral AND NOT w.isolated_lane
-     AND 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))::bigint AS plan_checker_capable
+     AND 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))::bigint AS plan_checker_capable,
+  -- Issue #3841: a plan-stage checker child whose round froze an owner-steering snapshot needs a
+  -- worker advertising cross_check_owner_steering_v1 (the same clause ClaimRun carries); the capable
+  -- count requires the semantic capability as well when the child is semantic plan-checker enrolled.
+  EXISTS (SELECT 1 FROM cross_checks pc
+            JOIN cross_check_owner_steering s ON s.cross_check_id = pc.id
+           WHERE pc.checker_run_id = $1 AND pc.stage = 'plan') AS owner_steering_enrolled,
+  (SELECT count(*) FROM workers w WHERE w.user_id = $2
+     AND w.status = 'online'
+     AND fn_worker_accepts_new_intake(w)
+     AND NOT w.ephemeral AND NOT w.isolated_lane
+     AND 'cross_check_owner_steering_v1' = ANY(w.protocol_capabilities)
+     -- a semantic-enrolled plan checker also needs the semantic capability (the plan_checker_enrolled
+     -- predicate above), so a split fleet is not counted as able to claim the child
+     AND (NOT EXISTS (SELECT 1 FROM runs c
+                        JOIN semantic_planning sp ON sp.run_id = c.target_run_id
+                        JOIN cross_checks pc ON pc.checker_run_id = c.id AND pc.stage = 'plan'
+                       WHERE c.id = $1 AND c.kind = 'cross_check')
+          OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities)))::bigint AS owner_steering_capable
 `
 
 type GetRunSemanticHealthParams struct {
@@ -7859,10 +7922,12 @@ type GetRunSemanticHealthParams struct {
 }
 
 type GetRunSemanticHealthRow struct {
-	LeadEnrolled        bool  `json:"lead_enrolled"`
-	PlanCheckerEnrolled bool  `json:"plan_checker_enrolled"`
-	PublicationCapable  int64 `json:"publication_capable"`
-	PlanCheckerCapable  int64 `json:"plan_checker_capable"`
+	LeadEnrolled          bool  `json:"lead_enrolled"`
+	PlanCheckerEnrolled   bool  `json:"plan_checker_enrolled"`
+	PublicationCapable    int64 `json:"publication_capable"`
+	PlanCheckerCapable    int64 `json:"plan_checker_capable"`
+	OwnerSteeringEnrolled bool  `json:"owner_steering_enrolled"`
+	OwnerSteeringCapable  int64 `json:"owner_steering_capable"`
 }
 
 // PRD #1230: the queued-reason inputs for a semantic-enrolled run. lead_enrolled marks a lead
@@ -7879,6 +7944,8 @@ func (q *Queries) GetRunSemanticHealth(ctx context.Context, arg GetRunSemanticHe
 		&i.PlanCheckerEnrolled,
 		&i.PublicationCapable,
 		&i.PlanCheckerCapable,
+		&i.OwnerSteeringEnrolled,
+		&i.OwnerSteeringCapable,
 	)
 	return i, err
 }
@@ -12588,6 +12655,8 @@ WHERE r.status = 'queued'
              OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
              OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc JOIN cross_check_owner_steering s ON s.cross_check_id = pc.id WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+             OR 'cross_check_owner_steering_v1' = ANY(w.protocol_capabilities))
         AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
              OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
@@ -12670,6 +12739,8 @@ WHERE r.status = 'queued'
              OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
              OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc JOIN cross_check_owner_steering s ON s.cross_check_id = pc.id WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+             OR 'cross_check_owner_steering_v1' = ANY(w.protocol_capabilities))
         AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
              OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
@@ -12972,6 +13043,8 @@ WHERE r.status = 'queued'
              OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
              OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc JOIN cross_check_owner_steering s ON s.cross_check_id = pc.id WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+             OR 'cross_check_owner_steering_v1' = ANY(w.protocol_capabilities))
         AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
              OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
