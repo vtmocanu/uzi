@@ -1,0 +1,845 @@
+import { afterEach, beforeEach, it } from "node:test";
+import type { TestContext } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
+import { formatAttemptId } from "../src/attempt-path.js";
+import { GitCache, type EpochDiscardProofOptions } from "../src/git.js";
+import { GitIndexError, parseGitIndex, readBoundedIndex } from "../src/git-index.js";
+import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
+
+// The automatic epoch worktree proof (issue #3431): every hostile or oversized input must be
+// refused before Git can read, hash or execute anything for it. Each refusal below therefore
+// asserts BOTH the verdict and that the hostile input was never reached: no clone-side Git launch
+// at all (a launch is the only thing that could read an ignore or attributes file, hash a tracked
+// file or run a filter), or none of the later stages.
+
+const RUN = "run-worktree-proof";
+const BRANCH = "agent/issue-3431";
+const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const PINS = [
+  "core.fsmonitor=false", "core.excludesFile=/dev/null", "core.trustctime=true", "core.checkStat=default",
+  "core.fileMode=true", "core.ignoreCase=false", "core.untrackedCache=false", "core.attributesFile=/dev/null",
+  "core.autocrlf=false", "core.eol=lf", "core.safecrlf=false", "core.symlinks=true", "core.sparseCheckout=false",
+  "index.sparse=false", "core.splitIndex=false", "core.preloadIndex=false", "core.bigFileThreshold=1m",
+];
+let fx: Fixture;
+let git: GitCache;
+let bare: string;
+let clonePath: string;
+let input: EpochDiscardProofOptions;
+let live: boolean;
+const cleanup: string[] = [];
+
+function command(cwd: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", cwd, ...args], { env: ENV, encoding: "utf8", stdio: "pipe" }).trim();
+}
+function commitAll(message: string): void {
+  command(clonePath, "add", "-A");
+  command(clonePath, "-c", "user.name=t", "-c", "user.email=t@example.test", "commit", "-qm", message);
+}
+function scratchDir(prefix: string): string {
+  const dir = fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), prefix));
+  cleanup.push(dir);
+  return dir;
+}
+const inClone = (...parts: string[]) => path.join(clonePath, ...parts);
+function sparse(file: string | Buffer, bytes: number, head = "x"): void {
+  fs.writeFileSync(file, head);
+  fs.truncateSync(file, bytes);
+}
+function mkfifo(file: string): void { execFileSync("mkfifo", [file]); }
+
+beforeEach(async () => {
+  fx = makeFixture({ "dir/inner.txt": "inner\n", "dir/other.txt": "other\n" });
+  git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  bare = await git.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700);
+  fs.chmodSync(bare, 0o700);
+  const attempt = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0000000000000001");
+  const clone = await git.runnerCloneForBranch(bare, BRANCH, "issue-3431", noProofReseed, RUN, false, undefined,
+    { attemptId: attempt, isLive: () => false, beforeSeed: async () => {} });
+  clonePath = clone.path;
+  await git.markRecoveryCapture(bare, clonePath, BRANCH, RUN, attempt);
+  const raw = command(bare, "config", "--local", `uzi-recovery.${BRANCH}.clone`);
+  const selector = { runId: RUN, generation: 1, attempt };
+  const holds = { state: "read" as const, holds: [] };
+  const lifecycle = { state: "terminal" as const, status: "completed" as const };
+  const inspection = await git.inspectRetainedSources({ selector, barePath: bare, holds, lifecycle, epoch: true, isLivePath: () => false });
+  assert.equal(inspection.partial, false);
+  live = true;
+  let pending = 0, stopped = false;
+  const scope: PodEpochReclaimScope = {
+    assertExclusive() { if (stopped) throw new Error("stopped"); },
+    get pendingMutations() { return pending; },
+    beginMutation() {
+      pending++;
+      let settled = false;
+      return { settle() { if (!settled) { settled = true; pending--; } } };
+    },
+    inheritStdio(stdio = ["pipe", "pipe", "pipe"]) { return [...stdio]; },
+    stop() { stopped = true; },
+    stopped() { return stopped; },
+    assertSettled() { if (stopped || pending) throw new Error("unsettled"); },
+    finish() { this.assertSettled(); },
+  };
+  input = { decision: { eligible: true, attested: true }, scope, selector, barePath: bare,
+    paths: [clonePath], confirm: inspection.sources[0]!.descriptor, expectedRawJournal: raw,
+    beforeEffect: async () => {}, checkLive: () => { if (!live) throw new Error("reservation expired"); },
+    signal: new AbortController().signal, deadline: Date.now() + 30_000 };
+});
+afterEach(() => {
+  fx?.cleanup();
+  for (const dir of cleanup.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+type Limits = { maxMetadataRecords?: number; maxMetadataBytes?: number };
+/** The worktree stage alone, under its production native/limit scopes. */
+async function prove(limits: Limits = {}): Promise<boolean> {
+  const proof = git.createEpochDiscardProof(input);
+  return git["epochRetained"].run(git["epochLimits"](limits), () =>
+    git["withEpochNativeReads"](proof, () => git["worktreeCleanHardened"](clonePath, { roots: [], checkLive: () => {} })));
+}
+/** The whole automatic content proof (object stores included). */
+async function observation(limits: Limits = {}): Promise<boolean> {
+  const proof = git.createEpochDiscardProof(input);
+  const state = git["epochDiscardProofs"].get(proof)!;
+  return git["epochRetained"].run(git["epochLimits"](limits), () =>
+    git["withEpochNativeReads"](proof, () => git["automaticContentPreserved"](state)));
+}
+
+interface Launch { command: string; args: string[]; sub: string }
+function subcommand(args: string[]): string {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "-C" || args[i] === "-c") { i++; continue; }
+    if (!args[i]!.startsWith("-")) return args[i]!;
+  }
+  return "";
+}
+/** Records every native launch (argv before the launcher's own pins) and its audited environment. */
+function recordLaunches(t: TestContext) {
+  const launches: Launch[] = [], envs: NodeJS.ProcessEnv[] = [];
+  const exec = git["execEpochNative"].bind(git);
+  t.mock.method(git as unknown as { execEpochNative: typeof exec }, "execEpochNative", async (...a: Parameters<typeof exec>) => {
+    launches.push({ command: a[0], args: [...a[1]], sub: subcommand(a[1]) });
+    return exec(...a);
+  });
+  const preflight = git["preflightEpochNative"].bind(git);
+  t.mock.method(git as unknown as { preflightEpochNative: typeof preflight }, "preflightEpochNative",
+    (...a: Parameters<typeof preflight>) => { const env = preflight(...a); envs.push(env); return env; });
+  return { launches, envs, count: (sub: string) => launches.filter(l => l.sub === sub).length };
+}
+type Recorder = ReturnType<typeof recordLaunches>;
+function assertNoGit(rec: Recorder): void {
+  assert.deepEqual(rec.launches.map(l => l.sub), [], "no Git launch may precede this refusal");
+}
+function assertNoContentRead(rec: Recorder): void {
+  for (const sub of ["ls-files", "check-ignore", "status"]) assert.equal(rec.count(sub), 0, `${sub} must not run`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Positives.
+
+it("proves a clean clone, with each Git read pinned and in order", async t => {
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), true);
+  // `.uzi` is untracked and not itself ignored; its only entry, `scratch`, is: a second question.
+  assert.deepEqual(rec.launches.map(l => l.sub), ["version", "config", "ls-files", "check-ignore", "check-ignore", "status"]);
+  const tail = rec.launches.slice(1);
+  for (const [i, launch] of tail.entries()) {
+    const env = rec.envs[i + 1]!;
+    assert.deepEqual(launch.args.slice(0, 2), ["-C", clonePath]);
+    assert.ok(launch.args.includes(`--attr-source=${EMPTY_TREE}`), `${launch.sub} lacks --attr-source`);
+    for (const pin of [...PINS, `core.worktree=${clonePath}`]) {
+      const at = launch.args.indexOf(pin);
+      assert.ok(at > 0 && launch.args[at - 1] === "-c", `${launch.sub} lacks -c ${pin}`);
+    }
+    assert.equal(env.GIT_ATTR_NOSYSTEM, "1");
+    assert.equal(env.HOME, "/");
+    assert.equal(env.GIT_CONFIG_GLOBAL, "/dev/null");
+    assert.equal(env.GIT_CONFIG_SYSTEM, "/dev/null");
+    assert.equal(env.GIT_OPTIONAL_LOCKS, "0");
+    assert.equal(env.GIT_NO_REPLACE_OBJECTS, "1");
+  }
+  const status = tail.find(l => l.sub === "status")!;
+  assert.deepEqual(status.args.slice(status.args.indexOf("status")),
+    ["status", "--porcelain", "-uno", "--no-renames", "--ignore-submodules=none"]);
+  const files = tail.find(l => l.sub === "ls-files")!;
+  assert.deepEqual(files.args.slice(files.args.indexOf("ls-files")), ["ls-files", "--others", "--directory", "-z"]);
+  const ignore = tail.find(l => l.sub === "check-ignore")!;
+  assert.deepEqual(ignore.args.slice(ignore.args.indexOf("check-ignore")), ["check-ignore", "--no-index", "--stdin", "-z"]);
+});
+
+it("keeps an ignored node_modules directory eligible without reading anything inside it", async t => {
+  fs.appendFileSync(inClone(".git", "info", "exclude"), "node_modules/\n*.log\n");
+  fs.mkdirSync(inClone("node_modules", "pkg"), { recursive: true });
+  sparse(inClone("node_modules", "pkg", "big.bin"), 200 * 1024 * 1024);
+  // Hostile files inside an ignored directory: never listed, never read.
+  sparse(inClone("node_modules", "pkg", ".gitignore"), 99 * 1024 * 1024, "*\n");
+  sparse(inClone("node_modules", "pkg", ".gitattributes"), 99 * 1024 * 1024, "* filter=x\n");
+  fs.writeFileSync(inClone("dir", "debug.log"), "ignored\n");
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), true);
+  assert.equal(rec.count("status"), 1);
+});
+
+it("still proves a racily-clean tracked file under budget, and sees a same-size edit", async t => {
+  const tracked = inClone("dir", "inner.txt");
+  const future = new Date(Date.now() + 3600_000);
+  fs.utimesSync(tracked, future, future);
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), true);
+  assert.equal(rec.count("status"), 1);
+  fs.writeFileSync(tracked, "INNER\n");
+  fs.utimesSync(tracked, future, future);
+  assert.equal(await prove(), false);
+});
+
+it("accepts a tracked executable, symlink and an empty gitlink, and keeps a populated gitlink", async t => {
+  fs.writeFileSync(inClone("run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+  fs.symlinkSync("dir/inner.txt", inClone("link"));
+  fs.mkdirSync(inClone("sub"));
+  command(clonePath, "update-index", "--add", "--cacheinfo", `160000,${command(clonePath, "rev-parse", "HEAD")},sub`);
+  commitAll("shapes");
+  assert.equal(await prove(), true);
+  fs.writeFileSync(inClone("sub", "populated"), "x");
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoContentRead(rec);
+});
+
+it("proves the whole automatic content proof on a clean clone and refuses a planted shared index", async () => {
+  assert.equal(await observation(), true);
+  sparse(inClone(".git", "sharedindex." + "a".repeat(40)), 81 * 1024 * 1024);
+  assert.equal(await observation(), false);
+});
+
+it("leaves the legacy proof on its own path: it still reads status and refuses an untracked file", async () => {
+  assert.equal(await git["worktreeCleanHardened"](clonePath), true);
+  fs.writeFileSync(inClone("untracked.txt"), "u");
+  assert.equal(await git["worktreeCleanHardened"](clonePath), false);
+});
+
+// ---------------------------------------------------------------------------------------------
+// H1-H4: the bypasses of the old "charge before status" proof.
+
+it("H1: a tracked non-UTF-8 path over budget is charged by its raw bytes and refused before status", async t => {
+  const name = Buffer.concat([Buffer.from(clonePath + "/"), Buffer.from([0x62, 0xff, 0x2e, 0x62, 0x69, 0x6e])]);
+  // Control: the same path with a small file is provable, so the refusal below is the charge.
+  fs.writeFileSync(name, "small");
+  commitAll("non-utf8 path");
+  assert.equal(await prove(), true);
+  sparse(name, 1024 * 1024);
+  const future = new Date(Date.now() + 3600_000);
+  fs.utimesSync(name, future, future);
+  const rec = recordLaunches(t);
+  assert.equal(await prove({ maxMetadataBytes: 65536 }), false);
+  assertNoGit(rec);
+});
+
+it("H2: a split index is refused before any Git command, by file name and by extension", async t => {
+  command(clonePath, "update-index", "--split-index");
+  assert.ok(fs.readdirSync(inClone(".git")).some(n => n.startsWith("sharedindex.")));
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+it("H2: an 81 MB uncharged shared-index file is refused without being read", async t => {
+  sparse(inClone(".git", "sharedindex." + "b".repeat(40)), 81 * 1024 * 1024);
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+it("H3: untracked self-ignored .gitignore files (5 x 99 MiB) are refused before any Git read", async t => {
+  const big = 99 * 1024 * 1024;
+  sparse(inClone(".gitignore"), big, ".gitignore\n");
+  sparse(inClone("dir", ".gitignore"), big, ".gitignore\n");
+  for (const name of ["a", "b", "c"]) {
+    fs.mkdirSync(inClone("dir", name));
+    sparse(inClone("dir", name, ".gitignore"), big, ".gitignore\n");
+  }
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+it("H3: a self-ignoring file inside an untracked directory is never read; its name is seen first", async t => {
+  fs.mkdirSync(inClone("u"));
+  fs.writeFileSync(inClone("u", "file"), "x");
+  sparse(inClone("u", ".gitignore"), 99 * 1024 * 1024, "*\n");
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assert.equal(rec.count("check-ignore"), 1, "only the top-level question may be asked");
+  assert.equal(rec.count("status"), 0);
+});
+
+it("H3: an untracked .gitignore FIFO (invisible to ls-files) is refused without a check-ignore", async t => {
+  mkfifo(inClone(".gitignore"));
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+for (const [name, file] of [[".gitattributes", ".gitattributes"], [".gitmodules", "dir/.gitmodules"], [".gitattributes", "dir/.gitattributes"]] as const) {
+  it(`H4: an untracked ${file} is refused before any Git read`, async t => {
+    sparse(inClone(file), 99 * 1024 * 1024, `* filter=x\n# ${name}\n`);
+    const rec = recordLaunches(t);
+    assert.equal(await prove(), false);
+    assertNoGit(rec);
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// P1/P4/P6/P7 and the attribute channels.
+
+function filterRun(t: TestContext, channel: "worktree" | "tracked" | "attr.tree" | "info" | "config" | "home") {
+  const dir = scratchDir("wt-filter-");
+  const marker = path.join(dir, "marker");
+  const home = path.join(dir, "home");
+  const attributes = path.join(dir, "attributes");
+  fs.writeFileSync(inClone("tracked.txt"), "tracked\n");
+  commitAll("tracked");
+  const rec = recordLaunches(t);
+  return (async () => {
+    // The real status launch of a pristine clone supplies the exact argv and environment.
+    assert.equal(await prove(), true);
+    const at = rec.launches.findIndex(l => l.sub === "status");
+    const launch = rec.launches[at]!, env = { ...rec.envs[at]! };
+    const rule = "tracked.txt filter=x\n";
+    if (channel === "worktree") fs.writeFileSync(inClone(".gitattributes"), rule);
+    if (channel === "tracked") { fs.writeFileSync(inClone(".gitattributes"), rule); commitAll("attributes"); }
+    if (channel === "attr.tree") {
+      fs.writeFileSync(inClone(".gitattributes"), rule); commitAll("attributes");
+      command(clonePath, "rm", "--cached", "-q", ".gitattributes"); fs.rmSync(inClone(".gitattributes"));
+      command(clonePath, "config", "attr.tree", "HEAD");
+    }
+    if (channel === "info") fs.writeFileSync(inClone(".git", "info", "attributes"), rule);
+    if (channel === "config") { fs.writeFileSync(attributes, rule); command(clonePath, "config", "core.attributesFile", attributes); }
+    if (channel === "home") {
+      fs.mkdirSync(path.join(home, ".config", "git"), { recursive: true });
+      fs.writeFileSync(path.join(home, ".config", "git", "attributes"), rule);
+    }
+    command(clonePath, "config", "filter.x.clean", `sh -c 'echo ran > ${marker}; cat'`);
+    const future = new Date(Date.now() + 7200_000);
+    fs.utimesSync(inClone("tracked.txt"), future, future);
+    const homeEnv = channel === "home" ? { HOME: home } : {};
+    const launched = rec.launches.length;
+    // Control: an unpinned status really runs the filter through this channel.
+    spawnSync("/usr/bin/git", ["-C", clonePath, "status", "--porcelain"],
+      { env: { ...ENV, GIT_OPTIONAL_LOCKS: "0", ...homeEnv } });
+    const naive = fs.existsSync(marker);
+    fs.rmSync(marker, { force: true });
+    if (channel === "info") {
+      // No pin reaches `.git/info/attributes`; the shape gate refuses its presence instead.
+      assert.equal(await prove(), false);
+      assert.equal(rec.launches.length, launched, "refused before any launch");
+      return { naive, pinned: fs.existsSync(marker) };
+    }
+    const result = spawnSync(launch.command, launch.args, { env: { ...env, ...homeEnv } });
+    assert.equal(result.status, 0, String(result.stderr));
+    return { naive, pinned: fs.existsSync(marker) };
+  })();
+}
+for (const channel of ["worktree", "tracked", "attr.tree", "info", "config", "home"] as const) {
+  it(`P1: the status launch never runs an attribute filter named through ${channel}`, async t => {
+    const { naive, pinned } = await filterRun(t, channel);
+    assert.equal(naive, true, "control: the channel selects the filter for an unpinned status");
+    assert.equal(pinned, false, "the proof's own status launch must not run it");
+  });
+}
+
+it("P1: a filter or attribute configuration in the clone is refused before status can run it", async t => {
+  const marker = path.join(scratchDir("wt-filter-"), "marker");
+  fs.writeFileSync(inClone("tracked.txt"), "tracked\n");
+  commitAll("tracked");
+  fs.writeFileSync(inClone(".gitattributes"), "tracked.txt filter=x\n");
+  commitAll("attributes");
+  command(clonePath, "config", "filter.x.clean", `sh -c 'echo ran > ${marker}; cat'`);
+  const future = new Date(Date.now() + 3600_000);
+  fs.utimesSync(inClone("tracked.txt"), future, future);
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assert.equal(rec.count("status"), 0);
+  assert.equal(fs.existsSync(marker), false);
+});
+
+it("P4: status never detects renames and lists no untracked files", async t => {
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), true);
+  const status = rec.launches.find(l => l.sub === "status")!;
+  assert.ok(status.args.includes("--no-renames"));
+  assert.ok(status.args.includes("-uno"));
+});
+
+it("P6: a FIFO at a tracked .gitignore is refused by its type before any launch", async t => {
+  fs.writeFileSync(inClone(".gitignore"), "*.log\n");
+  commitAll("ignore");
+  fs.rmSync(inClone(".gitignore"));
+  mkfifo(inClone(".gitignore"));
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+it("P6: a FIFO at .git/info/exclude is refused before any launch", async t => {
+  fs.rmSync(inClone(".git", "info", "exclude"));
+  mkfifo(inClone(".git", "info", "exclude"));
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+it("P6: a FIFO at .git/config or .git/index is refused before any launch", async t => {
+  for (const name of ["config", "index"]) {
+    const file = inClone(".git", name), moved = file + ".moved";
+    fs.renameSync(file, moved);
+    mkfifo(file);
+    const rec = recordLaunches(t);
+    assert.equal(await prove(), false);
+    assertNoGit(rec);
+    fs.rmSync(file);
+    fs.renameSync(moved, file);
+    t.mock.restoreAll();
+  }
+});
+
+it("P7: .git/commondir, a gitfile and a symlinked .git are refused before any launch", async t => {
+  const rec = recordLaunches(t);
+  fs.writeFileSync(inClone(".git", "commondir"), "../../elsewhere\n");
+  assert.equal(await prove(), false);
+  fs.rmSync(inClone(".git", "commondir"));
+  const real = inClone(".git"), moved = inClone(".git-real");
+  fs.renameSync(real, moved);
+  fs.writeFileSync(real, `gitdir: ${moved}\n`);
+  assert.equal(await prove(), false);
+  fs.rmSync(real);
+  fs.symlinkSync(moved, real);
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+  fs.rmSync(real);
+  fs.renameSync(moved, real);
+  assert.equal(await prove(), true);
+});
+
+it("refuses each other .git entry the proof cannot account for, before any launch", async t => {
+  const rec = recordLaunches(t);
+  for (const plant of ["info/attributes", "info/sparse-checkout", "modules", "reftable"]) {
+    const file = inClone(".git", plant);
+    fs.writeFileSync(file, "x");
+    assert.equal(await prove(), false, plant);
+    fs.rmSync(file);
+  }
+  assertNoGit(rec);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Config allowlist.
+
+for (const [key, value] of [
+  ["filter.x.clean", "cat"], ["core.attributesFile", "/dev/null"], ["include.path", "x"], ["includeIf.gitdir:/.path", "x"],
+  ["core.hooksPath", "/tmp"], ["extensions.worktreeConfig", "true"], ["core.sparseCheckout", "true"],
+  ["status.renames", "true"], ["diff.renames", "true"], ["core.worktree", "/tmp"], ["core.ignoreCase", "true"],
+  ["core.untrackedCache", "true"], ["core.fsmonitor", "true"], ["core.bare", "true"], ["attr.tree", "HEAD"],
+  ["core.repositoryformatversion", "1"], ["index.sparse", "true"], ["core.splitIndex", "true"],
+  ["core.autocrlf", "true"], ["safe.directory", "*"], ["extensions.refstorage", "reftable"],
+  ["extensions.partialclone", "origin"],
+] as const) {
+  it(`config: ${key} is not an admitted clone key`, async t => {
+    command(clonePath, "config", "--local", key, value);
+    const rec = recordLaunches(t);
+    assert.equal(await prove(), false);
+    assertNoContentRead(rec);
+  });
+}
+it("config: the keys uzi writes are admitted, and any branch tracking key", async () => {
+  command(clonePath, "config", "--local", "branch.agent/issue-1.remote", "origin");
+  command(clonePath, "config", "--local", "branch.agent/issue-1.merge", "refs/heads/agent/issue-1");
+  command(clonePath, "config", "--local", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*");
+  assert.equal(await prove(), true);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Bounds, typing and the final re-check.
+
+it("a missing tracked path or a non-directory ancestor is refused before any launch", async t => {
+  const rec = recordLaunches(t);
+  fs.rmSync(inClone("dir", "other.txt"));
+  assert.equal(await prove(), false);
+  fs.writeFileSync(inClone("dir", "other.txt"), "other\n");
+  fs.rmSync(inClone("dir"), { recursive: true });
+  fs.symlinkSync(os.tmpdir(), inClone("dir"));
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+it("a tracked file replaced by a symlink or a directory of the wrong type is refused before any launch", async t => {
+  const rec = recordLaunches(t);
+  fs.rmSync(inClone("README.md"));
+  fs.symlinkSync("dir/inner.txt", inClone("README.md"));
+  assert.equal(await prove(), false);
+  fs.rmSync(inClone("README.md"));
+  fs.mkdirSync(inClone("README.md"));
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+it("charges the index to the metadata budget at its exact size before any launch", async t => {
+  const sizes = [["config"], ["info", "exclude"], ["packed-refs"], ["index"]].map(p => fs.statSync(inClone(".git", ...p)).size);
+  const rec = recordLaunches(t);
+  const charged = sizes.reduce((a, b) => a + b, 0);
+  assert.equal(await prove({ maxMetadataBytes: charged - 1 }), false);
+  assertNoGit(rec);
+  assert.equal(await prove({ maxMetadataBytes: charged + 8192 }), true);
+});
+
+it("charges a tracked symlink's target length to the worktree-content counter", async t => {
+  for (const name of ["l1", "l2"]) fs.symlinkSync("x".repeat(3000), inClone(name));
+  commitAll("links");
+  assert.equal(await prove(), true);
+  const rec = recordLaunches(t);
+  assert.equal(await prove({ maxMetadataBytes: 4096 }), false);
+  assertNoGit(rec);
+});
+
+it("caps cumulative tracked-directory entries before any launch", async t => {
+  for (let i = 0; i < 50; i++) fs.writeFileSync(inClone("dir", `ignored-${i}.tmp`), "x");
+  const rec = recordLaunches(t);
+  assert.equal(await prove({ maxMetadataRecords: 20 }), false);
+  assertNoGit(rec);
+});
+
+it("caps index entries at the record limit before any launch", async t => {
+  const rec = recordLaunches(t);
+  assert.equal(await prove({ maxMetadataRecords: 2 }), false);
+  assertNoGit(rec);
+});
+
+it("refuses an untracked non-ignored file or directory content and accepts ignored ones", async t => {
+  fs.mkdirSync(inClone("fresh", "nested"), { recursive: true });
+  fs.writeFileSync(inClone("fresh", "nested", "file"), "x");
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assert.equal(rec.count("status"), 0);
+  fs.rmSync(inClone("fresh"), { recursive: true });
+  fs.writeFileSync(inClone("loose.txt"), "x");
+  assert.equal(await prove(), false);
+  fs.appendFileSync(inClone(".git", "info", "exclude"), "loose.txt\n");
+  assert.equal(await prove(), true);
+});
+
+it("refuses a pathspec-magic looking untracked name instead of letting check-ignore reinterpret it", async t => {
+  fs.appendFileSync(inClone(".git", "info", "exclude"), "*\n");
+  fs.writeFileSync(inClone(":(top)x"), "x");
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assert.equal(rec.count("check-ignore"), 0);
+});
+
+it("a Git older than 2.40 cannot supply --attr-source, so no clone read runs", async t => {
+  const execScoped = git["execScoped"].bind(git);
+  t.mock.method(git as unknown as { execScoped: typeof execScoped }, "execScoped",
+    async (...a: Parameters<typeof execScoped>) => a[1].length === 1 && a[1][0] === "version"
+      ? { stdout: "git version 2.39.5\n", stderr: "" } : execScoped(...a));
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), false);
+  assertNoContentRead(rec);
+  assert.equal(rec.count("config"), 0);
+});
+
+it("a tracked file that grows while Git runs is an unknown keep", async t => {
+  const exec = git["execEpochNative"].bind(git);
+  t.mock.method(git as unknown as { execEpochNative: typeof exec }, "execEpochNative", async (...a: Parameters<typeof exec>) => {
+    const result = await exec(...a);
+    if (subcommand(a[1]) === "status") fs.appendFileSync(inClone("dir", "inner.txt"), "grown");
+    return result;
+  });
+  assert.equal(await prove(), false);
+});
+
+it("an index that changes while Git runs is an unknown keep", async t => {
+  const exec = git["execEpochNative"].bind(git);
+  t.mock.method(git as unknown as { execEpochNative: typeof exec }, "execEpochNative", async (...a: Parameters<typeof exec>) => {
+    const result = await exec(...a);
+    if (subcommand(a[1]) === "status") {
+      const index = inClone(".git", "index");
+      const bytes = fs.readFileSync(index);
+      bytes.writeUInt8(bytes.readUInt8(bytes.length - 1) ^ 1, bytes.length - 1);
+      fs.writeFileSync(index, bytes);
+    }
+    return result;
+  });
+  assert.equal(await prove(), false);
+});
+
+it("admits exactly the new argv shapes and no old or widened ones", async t => {
+  const rec = recordLaunches(t);
+  assert.equal(await prove(), true);
+  const find = (sub: string) => rec.launches.find(l => l.sub === sub)!.args;
+  const internal = git as unknown as {
+    preflightEpochNative(command: string, args: string[], env: NodeJS.ProcessEnv, identity: "command" | "worker_pat"): NodeJS.ProcessEnv;
+  };
+  const tail = (args: string[], sub: string) => args.slice(0, args.indexOf(sub));
+  const shape = (sub: string, ...rest: string[]) => [...tail(find(sub), sub), sub, ...rest];
+  const proof = git.createEpochDiscardProof(input);
+  await git["withEpochNativeReads"](proof, async () => {
+    const admit = (args: string[]) => internal.preflightEpochNative("/usr/bin/git", args, {}, "command");
+    const refuse = (args: string[]) => assert.throws(() => admit(args), /unaudited/);
+    admit(shape("status", "--porcelain", "-uno", "--no-renames", "--ignore-submodules=none"));
+    admit(shape("ls-files", "--others", "--directory", "-z"));
+    admit(shape("check-ignore", "--no-index", "--stdin", "-z"));
+    refuse(shape("status", "--porcelain", "--ignore-submodules=none"));
+    refuse(shape("status", "--porcelain", "-uall", "--no-renames", "--ignore-submodules=none"));
+    refuse(shape("status", "--porcelain", "-uno", "--ignore-submodules=none"));
+    refuse(shape("ls-files", "--stage", "-z"));
+    refuse(shape("ls-files", "-v", "-z"));
+    refuse(shape("ls-files", "--others", "-z"));
+    refuse(shape("ls-files", "--others", "--directory", "--exclude-standard", "-z"));
+    refuse(shape("check-ignore", "--stdin", "-z"));
+    refuse(shape("check-ignore", "--no-index", "--stdin", "-z", "-v"));
+    refuse([...find("status").slice(0, 2), "-c", "core.hooksPath=/tmp", ...find("status").slice(2)]);
+    refuse([...find("status").slice(0, 2), "-c", "status.showUntrackedFiles=all", ...find("status").slice(2)]);
+    refuse(find("status").map(v => v.startsWith("--attr-source=") ? "--attr-source=" + "a".repeat(40) : v));
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Index parser: fixtures, refusals and a differential against `git ls-files`.
+
+const sha1 = (data: Buffer) => createHash("sha1").update(data).digest();
+function reseal(body: Buffer): Buffer { return Buffer.concat([body, sha1(body)]); }
+function body(index: Buffer): Buffer { return Buffer.from(index.subarray(0, index.length - 20)); }
+function withExtension(index: Buffer, signature: string, data = Buffer.alloc(0)): Buffer {
+  const header = Buffer.alloc(8);
+  header.write(signature, 0, "latin1"); header.writeUInt32BE(data.length, 4);
+  return reseal(Buffer.concat([body(index), header, data]));
+}
+function patched(index: Buffer, edit: (b: Buffer) => void): Buffer {
+  const copy = body(index);
+  edit(copy);
+  return reseal(copy);
+}
+function indexInfo(repo: string, rows: { mode: string; sha: string; stage?: number; path: Buffer }[]): void {
+  const stdin = Buffer.concat(rows.map(r => Buffer.concat([Buffer.from(`${r.mode} ${r.sha} ${r.stage ?? 0}\t`), r.path, Buffer.from([0])])));
+  execFileSync("git", ["-C", repo, "update-index", "--add", "-z", "--index-info"], { env: ENV, input: stdin });
+}
+function newRepo(): string {
+  const repo = scratchDir("wt-index-");
+  execFileSync("git", ["init", "-q", repo], { env: ENV });
+  return repo;
+}
+function blob(repo: string, text: string): string {
+  return execFileSync("git", ["-C", repo, "hash-object", "-w", "--stdin"], { env: ENV, input: text, encoding: "utf8" }).trim();
+}
+const readIndex = (repo: string) => fs.readFileSync(path.join(repo, ".git", "index"));
+const pathOfLength = (n: number): Buffer => {
+  const parts: string[] = [];
+  let used = 0;
+  while (n - used > 201) { parts.push("d".repeat(200)); used += 201; }
+  parts.push("f".repeat(n - used));
+  return Buffer.from(parts.join("/"));
+};
+
+function plainRepo(): { repo: string; index: Buffer } {
+  const repo = newRepo();
+  const sha = blob(repo, "x");
+  indexInfo(repo, [
+    { mode: "100644", sha, path: Buffer.from("a") },
+    { mode: "100644", sha, path: Buffer.from("dir/b") },
+    { mode: "100755", sha, path: Buffer.from("x.sh") },
+    { mode: "120000", sha, path: Buffer.from("ln") },
+    { mode: "160000", sha: "1".repeat(40), path: Buffer.from("sub") },
+    { mode: "100644", sha, path: Buffer.from([0x66, 0xff, 0x6f]) },
+    { mode: "100644", sha, path: Buffer.from([0xe2, 0x82]) },
+    ...[4094, 4095, 4096, 5000].map(n => ({ mode: "100644", sha, path: pathOfLength(n) })),
+  ]);
+  return { repo, index: readIndex(repo) };
+}
+function gitView(repo: string) {
+  const stage = execFileSync("git", ["-C", repo, "ls-files", "--stage", "-z"], { env: ENV }).toString("latin1")
+    .split("\0").filter(Boolean).map(row => {
+      const m = /^(\d{6}) ([0-9a-f]{40}) (\d)\t([\s\S]*)$/.exec(row)!;
+      return { mode: parseInt(m[1]!, 8), sha: m[2]!, stage: Number(m[3]), path: Buffer.from(m[4]!, "latin1") };
+    });
+  const tags = execFileSync("git", ["-C", repo, "ls-files", "-v", "-z"], { env: ENV }).toString("latin1")
+    .split("\0").filter(Boolean).map(row => ({ tag: row[0]!, path: Buffer.from(row.slice(2), "latin1") }));
+  return { stage, tags };
+}
+function expectTag(e: { assumeValid: boolean; skipWorktree: boolean; stage: number }): string {
+  if (e.stage !== 0) return "M";
+  if (e.assumeValid) return e.skipWorktree ? "s" : "h";
+  return e.skipWorktree ? "S" : "H";
+}
+
+it("index parser agrees with git ls-files --stage and -v on a v2 index (modes, raw paths, long paths)", () => {
+  const { repo, index } = plainRepo();
+  assert.equal(index.readUInt32BE(4), 2);
+  const parsed = parseGitIndex(index, { maxEntries: 100 });
+  const view = gitView(repo);
+  assert.equal(parsed.entries.length, view.stage.length);
+  parsed.entries.forEach((e, i) => {
+    assert.deepEqual({ mode: e.mode, sha: e.sha, stage: e.stage }, { mode: view.stage[i]!.mode, sha: view.stage[i]!.sha, stage: view.stage[i]!.stage });
+    assert.ok(e.path.equals(view.stage[i]!.path), `path ${i}`);
+    assert.ok(e.path.equals(view.tags[i]!.path));
+    assert.equal(expectTag(e), view.tags[i]!.tag);
+  });
+  assert.ok(parsed.entries.some(e => e.path.length >= 4095), "long (saturated name length) paths are covered");
+  assert.ok(parsed.entries.some(e => e.path.equals(Buffer.from([0x66, 0xff, 0x6f]))));
+  assert.deepEqual(parsed.extensions.filter(s => s !== "TREE" && s !== "REUC"), []);
+});
+
+it("index parser agrees with git on a v3 index (assume-valid, skip-worktree, intent-to-add, stages)", () => {
+  const repo = newRepo();
+  const sha = blob(repo, "x");
+  indexInfo(repo, [
+    { mode: "100644", sha, path: Buffer.from("assumed") },
+    { mode: "100644", sha, path: Buffer.from("normal") },
+    { mode: "100644", sha, path: Buffer.from("skipped") },
+    { mode: "100644", sha, stage: 1, path: Buffer.from("conflict") },
+    { mode: "100644", sha, stage: 2, path: Buffer.from("conflict") },
+    { mode: "100644", sha, stage: 3, path: Buffer.from("conflict") },
+  ]);
+  fs.writeFileSync(path.join(repo, "added"), "later");
+  command(repo, "add", "-N", "added");
+  command(repo, "update-index", "--assume-unchanged", "assumed");
+  command(repo, "update-index", "--skip-worktree", "skipped");
+  const index = readIndex(repo);
+  assert.equal(index.readUInt32BE(4), 3);
+  const parsed = parseGitIndex(index, { maxEntries: 100 }, "inspect");
+  const view = gitView(repo);
+  assert.equal(parsed.entries.length, view.stage.length);
+  parsed.entries.forEach((e, i) => {
+    assert.deepEqual({ mode: e.mode, sha: e.sha, stage: e.stage }, { mode: view.stage[i]!.mode, sha: view.stage[i]!.sha, stage: view.stage[i]!.stage });
+    assert.ok(e.path.equals(view.tags[i]!.path));
+    assert.equal(expectTag(e), view.tags[i]!.tag, e.path.toString());
+  });
+  const by = (name: string) => parsed.entries.find(e => e.path.toString() === name)!;
+  assert.equal(by("assumed").assumeValid, true);
+  assert.equal(by("skipped").skipWorktree, true);
+  assert.equal(by("added").intentToAdd, true);
+  assert.equal(by("normal").assumeValid || by("normal").skipWorktree || by("normal").intentToAdd, false);
+  assert.throws(() => parseGitIndex(index, { maxEntries: 100 }), /./);
+});
+
+it("index parser refuses each hostile shape in strict mode and names the reason", () => {
+  const { index } = plainRepo();
+  parseGitIndex(index, { maxEntries: 100 });
+  const refused = (data: Buffer, pattern: RegExp, kind: "refused" | "limit" = "refused", max = 100) => {
+    assert.throws(() => parseGitIndex(data, { maxEntries: max }), error => {
+      assert.ok(error instanceof GitIndexError);
+      assert.equal(error.kind, kind);
+      assert.match(error.message, pattern);
+      return true;
+    });
+  };
+  refused(patched(index, b => b.writeUInt32BE(4, 4)), /version/);
+  refused(patched(index, b => b.writeUInt32BE(1, 4)), /version/);
+  refused(patched(index, b => b.write("XXXX", 0, "latin1")), /signature/);
+  refused(index.subarray(0, 20), /short/);
+  refused(index.subarray(0, index.length - 30), /checksum|truncated/);
+  refused(Buffer.concat([index.subarray(0, index.length - 20), Buffer.alloc(20)]), /checksum absent/);
+  refused(Buffer.concat([index.subarray(0, 40), Buffer.from([index[40]! ^ 1]), index.subarray(41)]), /checksum mismatch/);
+  refused(index, /entry limit/, "limit", 3);
+  refused(patched(index, b => b.writeUInt32BE(b.readUInt32BE(8) + 1, 8)), /truncated|extension|padding/);
+  refused(patched(index, b => b.writeUInt32BE(0o100600, 12 + 24)), /mode/);
+  refused(patched(index, b => b.writeUInt32BE(0o040000, 12 + 24)), /mode/);
+  refused(patched(index, b => b.writeUInt16BE(b.readUInt16BE(12 + 60) | 0x8000, 12 + 60)), /assume-valid/);
+  refused(patched(index, b => b.writeUInt16BE(b.readUInt16BE(12 + 60) | 0x1000, 12 + 60)), /unmerged/);
+  refused(patched(index, b => b.writeUInt16BE(b.readUInt16BE(12 + 60) | 0x4000, 12 + 60)), /extended|truncated/);
+  for (const signature of ["link", "sdir", "UNTR", "FSMN", "ZZZZ", "tree", "ÿÿÿÿ"])
+    refused(withExtension(index, signature, Buffer.from("data")), /unsupported index extension/);
+  refused(reseal(Buffer.concat([body(index), Buffer.from("TREE"), Buffer.from([0, 0, 1, 0])])), /extension length/);
+  refused(reseal(Buffer.concat([body(index), Buffer.from("TRE")])), /truncated index extension/);
+  parseGitIndex(withExtension(withExtension(index, "EOIE", Buffer.alloc(24)), "IEOT", Buffer.alloc(12)), { maxEntries: 100 });
+  parseGitIndex(withExtension(withExtension(index, "TREE", Buffer.alloc(3)), "REUC"), { maxEntries: 100 });
+});
+
+it("index parser refuses unsafe tracked paths and unsorted entries", () => {
+  const one = newRepo();
+  indexInfo(one, [{ mode: "100644", sha: blob(one, "x"), path: Buffer.from("aa") }]);
+  const single = readIndex(one);
+  for (const text of ["..", "/a", "a/"])
+    assert.throws(() => parseGitIndex(patched(single, b => b.write(text, 12 + 62, "latin1")), { maxEntries: 4 }), /unsafe/);
+  const two = newRepo();
+  const sha = blob(two, "x");
+  indexInfo(two, [{ mode: "100644", sha, path: Buffer.from("a") }, { mode: "100644", sha, path: Buffer.from("b") }]);
+  const swapped = patched(readIndex(two), b => { b.write("b", 12 + 62, "latin1"); b.write("a", 12 + 64 + 62, "latin1"); });
+  assert.throws(() => parseGitIndex(swapped, { maxEntries: 4 }), /sorted/);
+  assert.equal(parseGitIndex(swapped, { maxEntries: 4 }, "inspect").entries.length, 2);
+  // Git itself refuses to add these names, so patch same-length valid ones.
+  const tail = newRepo();
+  indexInfo(tail, [{ mode: "100644", sha: blob(tail, "x"), path: Buffer.from("a/bbbb") }]);
+  const shape = readIndex(tail);
+  for (const text of ["a/.git", "a/.GIT", "a/./b", "a/../", "a//bb"])
+    assert.throws(() => parseGitIndex(patched(shape, b => b.write(text, 12 + 62, "latin1")), { maxEntries: 4 }), /unsafe/, text);
+  assert.equal(parseGitIndex(patched(shape, b => b.write("a/.git", 12 + 62, "latin1")), { maxEntries: 4 }, "inspect").entries.length, 1);
+});
+
+it("readBoundedIndex reads one regular file within its byte bound and refuses links and FIFOs without blocking", async () => {
+  const { index } = plainRepo();
+  const dir = scratchDir("wt-read-");
+  const file = path.join(dir, "index");
+  fs.writeFileSync(file, index);
+  const read = await readBoundedIndex(file, { maxBytes: index.length, maxEntries: 100 });
+  assert.equal(read.size, index.length);
+  assert.equal(read.entries.length, 11);
+  assert.match(read.signature, /^\d+:\d+:\d+:\d+:\d+:\d+$/);
+  await assert.rejects(readBoundedIndex(file, { maxBytes: index.length - 1, maxEntries: 100 }),
+    error => error instanceof GitIndexError && error.kind === "limit");
+  fs.symlinkSync(file, path.join(dir, "link"));
+  await assert.rejects(readBoundedIndex(path.join(dir, "link"), { maxBytes: 1 << 20, maxEntries: 100 }),
+    error => error instanceof GitIndexError && error.kind === "refused");
+  mkfifo(path.join(dir, "fifo"));
+  await assert.rejects(readBoundedIndex(path.join(dir, "fifo"), { maxBytes: 1 << 20, maxEntries: 100 }),
+    error => error instanceof GitIndexError && error.kind === "refused");
+});
+
+// Hostile index shapes reaching the proof itself: verdict plus no Git launch at all.
+const HOSTILE: [string, (index: Buffer) => Buffer][] = [
+  ["a version 4 index", index => patched(index, b => b.writeUInt32BE(4, 4))],
+  ["a link extension", index => withExtension(index, "link", Buffer.alloc(20))],
+  ["an sdir extension", index => withExtension(index, "sdir")],
+  ["an UNTR extension", index => withExtension(index, "UNTR", Buffer.alloc(8))],
+  ["an FSMN extension", index => withExtension(index, "FSMN", Buffer.alloc(8))],
+  ["an unknown extension", index => withExtension(index, "ABCD")],
+  ["an odd entry mode", index => patched(index, b => b.writeUInt32BE(0o100600, 12 + 24))],
+  ["an assume-valid entry", index => patched(index, b => b.writeUInt16BE(b.readUInt16BE(12 + 60) | 0x8000, 12 + 60))],
+  ["a staged entry", index => patched(index, b => b.writeUInt16BE(b.readUInt16BE(12 + 60) | 0x1000, 12 + 60))],
+  ["a zero checksum", index => Buffer.concat([index.subarray(0, index.length - 20), Buffer.alloc(20)])],
+  ["a bad checksum", index => Buffer.concat([index.subarray(0, 40), Buffer.from([index[40]! ^ 1]), index.subarray(41)])],
+  ["a truncated file", index => index.subarray(0, index.length - 9)],
+];
+for (const [name, mutate] of HOSTILE) {
+  it(`index: ${name} is refused before any Git launch`, async t => {
+    const file = inClone(".git", "index");
+    fs.writeFileSync(file, mutate(fs.readFileSync(file)));
+    const rec = recordLaunches(t);
+    assert.equal(await prove(), false);
+    assertNoGit(rec);
+  });
+}
+it("index: assume-valid, skip-worktree and intent-to-add entries made by Git are refused before any launch", async t => {
+  const rec = recordLaunches(t);
+  command(clonePath, "update-index", "--assume-unchanged", "README.md");
+  assert.equal(await prove(), false);
+  command(clonePath, "update-index", "--no-assume-unchanged", "README.md");
+  command(clonePath, "update-index", "--skip-worktree", "README.md");
+  assert.equal(await prove(), false);
+  command(clonePath, "update-index", "--no-skip-worktree", "README.md");
+  fs.writeFileSync(inClone("intent.txt"), "later");
+  command(clonePath, "add", "-N", "intent.txt");
+  assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+it("index: the TREE cache extension Git writes is accepted", async () => {
+  const file = inClone(".git", "index");
+  assert.ok(parseGitIndex(fs.readFileSync(file), { maxEntries: 100 }).extensions.includes("TREE"));
+  assert.equal(await prove(), true);
+});
