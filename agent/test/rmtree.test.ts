@@ -542,6 +542,89 @@ describe("rmHomeSubtree (PRD #1809)", () => {
     }
   });
 
+  describe("park scratch leaf .uzi-go-work/g<N>", () => {
+    it("removes one leaf with a nested 0700 go-build-like tree, keeping siblings, other leaves and caches", async (t) => {
+      if (noProcFd) return t.skip(NO_PROC_FD);
+      const home = await mktmp();
+      try {
+        await seedHome(home);
+        const nested = path.join(home, ".uzi-go-work", "g3", "go-build123", "b001");
+        await fs.mkdir(nested, { recursive: true });
+        await fs.writeFile(path.join(nested, "a.o"), "o\n");
+        await fs.chmod(nested, 0o700);
+        await fs.mkdir(path.join(home, ".uzi-go-work", "g4"), { recursive: true });
+        await fs.writeFile(path.join(home, ".uzi-go-work", "g4", "file"), "keep\n");
+        assert.strictEqual(await rmHomeSubtree(home, ".uzi-go-work/g3"), "removed");
+        assert.strictEqual(await exists(path.join(home, ".uzi-go-work", "g3")), false);
+        assert.ok(await exists(path.join(home, ".uzi-go-work", "g4", "file")), "another generation stays");
+        assert.ok(await exists(path.join(home, ".cache", "go-build", "0a", "obj")), "caches stay");
+        await assertSiblingsKept(home);
+        assert.strictEqual(await rmHomeSubtree(home, ".uzi-go-work/g3"), "absent");
+      } finally {
+        await forceCleanup(home);
+      }
+    });
+
+    it("refuses every other spelling before any pass runs", async () => {
+      const home = await mktmp();
+      try {
+        const calls: string[] = [];
+        const passes = [recording(calls, "pass")];
+        for (const rel of [
+          ".uzi-go-work",
+          ".uzi-go-work/g0",
+          ".uzi-go-work/g01",
+          ".uzi-go-work/g1/x",
+          ".uzi-go-work/../x",
+          ".uzi-go-work/-g1",
+          ".uzi-go-workX/g1",
+          ".uzi-go-work/g1/",
+          ".uzi-go-work/g12345678901234567",
+          ".uzi-go-work/g9007199254740993",
+        ]) {
+          await assert.rejects(rmHomeSubtree(home, rel, { wrappers: passes }), /not a listed cache subtree/, rel);
+        }
+        assert.deepStrictEqual(calls, []);
+      } finally {
+        await forceCleanup(home);
+      }
+    });
+
+    it("refuses a symlink leaf and never touches its target", async (t) => {
+      if (noProcFd) return t.skip(NO_PROC_FD);
+      const home = await mktmp();
+      const outside = await mktmp();
+      try {
+        await fs.writeFile(path.join(outside, "precious"), "keep\n");
+        await fs.mkdir(path.join(home, ".uzi-go-work"));
+        await fs.symlink(outside, path.join(home, ".uzi-go-work", "g3"), "dir");
+        await assert.rejects(rmHomeSubtree(home, ".uzi-go-work/g3"), { code: "ELOOP", message: /refusing/ });
+        assert.ok(await exists(path.join(outside, "precious")));
+      } finally {
+        await forceCleanup(home);
+        await forceCleanup(outside);
+      }
+    });
+
+    it("a delayed helper for g3 cannot touch a g4 created after it pinned g3", async (t) => {
+      if (noProcFd) return t.skip(NO_PROC_FD);
+      const home = await mktmp();
+      try {
+        await fs.mkdir(path.join(home, ".uzi-go-work", "g3", "go-build1"), { recursive: true });
+        await fs.writeFile(path.join(home, ".uzi-go-work", "g3", "go-build1", "x"), "x\n");
+        const out = await removeWithSwap(home, ".uzi-go-work/g3", async () => {
+          await fs.mkdir(path.join(home, ".uzi-go-work", "g4"));
+          await fs.writeFile(path.join(home, ".uzi-go-work", "g4", "file"), "keep\n");
+        });
+        assert.deepStrictEqual(out, { v: "removed" });
+        assert.strictEqual(await exists(path.join(home, ".uzi-go-work", "g3")), false);
+        assert.ok(await exists(path.join(home, ".uzi-go-work", "g4", "file")), "the newer generation is intact");
+      } finally {
+        await forceCleanup(home);
+      }
+    });
+  });
+
   /**
    * B1 (TOCTOU). A live `runner`/`runner-cmd` process, e.g. another run's, can rename a
    * component of the chain and plant a symlink AFTER the walk verified it. The script's

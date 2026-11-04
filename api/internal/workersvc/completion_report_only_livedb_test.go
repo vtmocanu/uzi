@@ -21,6 +21,9 @@ func TestReportOnlyDeliveryMatrixLiveDB(t *testing.T) {
 		"naked criteria", "bare empty criteria", "SQLNULL contract", "missing criteria", "missing findings", "null findings", "zero revision", "zero contract revision", "null criteria", "missing audit", "nonempty findings", "wrong criterion",
 		"wrong title", "bad profile", "bad version", "missing revision", "revision mismatch",
 		"bad accepted", "bad scope", "waived undeclared", "deferred undeclared", "deferred completed",
+		"deferred in-scope undeclared", "deferred mismatching generation", "deferred missing generation",
+		"deferred invalid declaration with progress", "deferred invalid declaration without progress",
+		"full progress invalid declaration",
 		"corrupt completed", "null completed", "foreign completed", "duplicate completed",
 		"missing generation", "matching zero generation", "mismatching generation", "released", "foreign owner",
 		"stored branch", "stored MR IID", "stored MR URL", "stored final head", "legacy headless", "legacy capped headless",
@@ -129,15 +132,41 @@ func TestReportOnlyDeliveryMatrixLiveDB(t *testing.T) {
 					cr := c.Criteria[1]
 					c.Accepted = []acceptedEntry{{ID: cr.ID, MilestoneID: cr.MilestoneID, Text: cr.Text, Reason: "owner", Revision: 1}}
 				})
-			case "deferred undeclared", "deferred completed":
-				if name == "deferred undeclared" {
-					e.exec(t, "UPDATE runs SET milestones_completed='[\"m1\"]' WHERE id=$1", id)
-				} else {
+			case "deferred undeclared", "deferred completed", "deferred in-scope undeclared",
+				"deferred mismatching generation", "deferred missing generation",
+				"deferred invalid declaration with progress", "deferred invalid declaration without progress":
+				switch name {
+				case "deferred completed":
 					want = true
+				case "deferred undeclared":
+					e.exec(t, "UPDATE runs SET milestones_completed='[\"m1\"]' WHERE id=$1", id)
+					want = true
+				case "deferred in-scope undeclared", "deferred invalid declaration without progress":
+					e.exec(t, "UPDATE runs SET milestones_completed='[]' WHERE id=$1", id)
+				default:
+					e.exec(t, "UPDATE runs SET milestones_completed='[\"m1\"]' WHERE id=$1", id)
+				}
+				switch name {
+				case "deferred mismatching generation":
+					two := int64(2)
+					req.ClaimGeneration = &two
+				case "deferred missing generation":
+					req.ClaimGeneration = nil
+				case "deferred invalid declaration with progress":
+					want = true
+					declared := []string{"m1", "foreign"}
+					req.MilestonesCompleted = &declared
+				case "deferred invalid declaration without progress":
+					declared := []string{"m1", "foreign"}
+					req.MilestonesCompleted = &declared
 				}
 				contract(func(c *completionContract) {
 					c.Scope = &scopeBlock{In: []string{"m1"}, Out: []deferredEntry{{MilestoneID: "m2", Reason: "later", Revision: 1}}}
 				})
+			case "full progress invalid declaration":
+				declared := []string{"m1", "foreign"}
+				req.MilestonesCompleted = &declared
+				want = true
 			case "corrupt completed":
 				assertReportOnlyFixtureConstraint(t, e, id, "UPDATE runs SET milestones_completed='{}' WHERE id=$1")
 				return
@@ -195,9 +224,9 @@ func TestReportOnlyDeliveryMatrixLiveDB(t *testing.T) {
 			}
 			var wantErr error
 			switch name {
-			case "missing generation":
+			case "missing generation", "deferred missing generation":
 				wantErr = ErrMissingClaimGeneration
-			case "matching zero generation", "mismatching generation", "released":
+			case "matching zero generation", "mismatching generation", "deferred mismatching generation", "released":
 				wantErr = ErrStaleClaim
 			case "foreign owner":
 				wantErr = ErrRunNotOwned
@@ -213,8 +242,19 @@ func TestReportOnlyDeliveryMatrixLiveDB(t *testing.T) {
 			if !want && !bytes.Equal(before, reportOnlySnapshot(t, e, id)) {
 				t.Fatal("refusal mutated run")
 			}
-			if want && name == "deferred completed" && run.StopKind.String != "scope_reduced" {
+			if want && (name == "deferred completed" || name == "deferred undeclared" || name == "deferred invalid declaration with progress") &&
+				run.StopKind.String != "scope_reduced" {
 				t.Fatalf("completed owner-deferred contract lost disposition: %v", run.StopKind)
+			}
+			if want && (name == "deferred undeclared" || name == "deferred invalid declaration with progress") {
+				var ids []byte
+				if err := e.pool.QueryRow(e.ctx, "SELECT milestones_completed FROM runs WHERE id=$1", id).Scan(&ids); err != nil {
+					t.Fatal(err)
+				}
+				var done []string
+				if err := json.Unmarshal(ids, &done); err != nil || !slices.Equal(done, []string{"m1"}) {
+					t.Fatalf("persisted milestones_completed=%s err=%v want [m1]", ids, err)
+				}
 			}
 			if want && name == "final declaration union" {
 				var ids []byte
@@ -466,5 +506,79 @@ func TestReportOnlyCappedMixedKindsLiveDB(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// TestReportOnlyOwnerPartialDeliveryLiveDB drives a real owner partial decision (keep m1, defer
+// m2) and then a headless report-only completion of the reduced scope.
+func TestReportOnlyOwnerPartialDeliveryLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	id := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, nil, false)
+	e.parkCompletionBlocked(t, id)
+	if _, err := svc.DecideCompletion(e.ctx, e.userID, id, CompletionDecisionInput{
+		Decision: "partial", Keep: []string{"m1"}, Reason: "ship m1 only; defer m2", ContractRevision: 1,
+	}); err != nil {
+		t.Fatalf("DecideCompletion partial: %v", err)
+	}
+	e.exec(t, "UPDATE runs SET status='running', worker_id=$2, milestones_completed='[\"m1\"]', claim_generation=1 WHERE id=$1", id, wid)
+	w := store.Worker{ID: wid}
+
+	// A mixed request on the deferred contract is refused without mutation.
+	mixed := reportOnlyRequest()
+	mixed.Head = strPtr("h")
+	mixed.Branch = strPtr("b")
+	before := reportOnlySnapshot(t, e, id)
+	if _, ok, err := svc.SetState(e.ctx, w, id, mixed); ok || !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("mixed request: applied=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(before, reportOnlySnapshot(t, e, id)) {
+		t.Fatal("mixed refusal mutated run")
+	}
+
+	req := reportOnlyRequest()
+	run, applied, err := svc.SetState(e.ctx, w, id, req)
+	if err != nil || !applied || run.Status != "completed" {
+		t.Fatalf("owner partial delivery: applied=%v status=%s err=%v", applied, run.Status, err)
+	}
+	var report, stopKind string
+	var reportOnly, publicationAbsent bool
+	var done []byte
+	var permits int
+	if err := e.pool.QueryRow(e.ctx, "SELECT report_md, report_only, stop_kind, milestones_completed, branch IS NULL AND mr_iid IS NULL AND mr_web_url IS NULL AND completion_final_head IS NULL FROM runs WHERE id=$1", id).
+		Scan(&report, &reportOnly, &stopKind, &done, &publicationAbsent); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.pool.QueryRow(e.ctx, "SELECT count(*) FROM run_completion_permits WHERE run_id=$1", id).Scan(&permits); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	if err := json.Unmarshal(done, &ids); err != nil || !slices.Equal(ids, []string{"m1"}) {
+		t.Fatalf("milestones_completed=%s err=%v", done, err)
+	}
+	if report != "Findings" || !reportOnly || stopKind != "scope_reduced" || !publicationAbsent || permits != 0 {
+		t.Fatalf("report=%q report_only=%v stop_kind=%q publicationAbsent=%v permits=%d", report, reportOnly, stopKind, publicationAbsent, permits)
+	}
+
+	before = reportOnlySnapshot(t, e, id)
+	if _, applied, err = svc.SetState(e.ctx, w, id, req); err != nil || !applied {
+		t.Fatalf("identical retry: %v %v", applied, err)
+	}
+	if !bytes.Equal(before, reportOnlySnapshot(t, e, id)) {
+		t.Fatal("identical retry changed row")
+	}
+	changed := req
+	changed.ReportMd = strPtr("Changed")
+	if _, applied, err = svc.SetState(e.ctx, w, id, changed); err != nil || applied {
+		t.Fatalf("changed retry: %v %v", applied, err)
+	}
+	gen := int64(1)
+	mrRetry := StateRequest{State: "completed", Branch: strPtr("b"), Head: strPtr("h"), ClaimGeneration: &gen}
+	if _, applied, err = svc.SetState(e.ctx, w, id, mrRetry); err != nil || applied {
+		t.Fatalf("MR retry: %v %v", applied, err)
+	}
+	if !bytes.Equal(before, reportOnlySnapshot(t, e, id)) {
+		t.Fatal("refused retry mutated row")
 	}
 }

@@ -180,12 +180,14 @@ import {
   type TerminalOutboxDeps,
 } from "./terminal-resolve.js";
 import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
+import { prepareManagedGoWork, removeGoWorkLeaves, type GoWorkFsOps } from "./go-work.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { dropRunCaches } from "./run-caches.js";
 import type { RunDiskLocks } from "./run-disk-locks.js";
 import type { CachesDroppedMemo } from "./disk-reclaim.js";
 import { DataVolumeFullError, type DataVolumeGuard } from "./disk-full.js";
 import { DiskParkSignal, type DiskGovernor } from "./cache-cap.js";
+import { decideRetainedSeedAdmission, type RetainedSeedAdmission, type RetainedSeedEstimate } from "./retained-seed-admission.js";
 import {
   SteeringChannel,
   PauseNowSignal,
@@ -1271,6 +1273,16 @@ class RetainedRecoveryStop extends Error {
 }
 
 class RetainedRecoveryCancelled extends RetainedRecoveryStop {}
+
+/** issue #3865: a retained successor seed refused for data-volume capacity. An ordinary retryable
+ *  failure of the reserved iteration: it is never an adoption failure, a disk park or a stop. */
+class RetainedSeedCapacityShortfall extends Error {
+  constructor() { super("retained successor seed deferred: data volume capacity"); }
+}
+
+const RETAINED_EXHAUSTED_FEATURE = "recovery_cause_retained_recovery_exhausted";
+/** Wall-clock budget of one predecessor footprint measurement (the retained inspection budget). */
+const RETAINED_SEED_MEASURE_BUDGET_MS = 5_000;
 
 /** issue #3645: thrown by {@link RunRunner.reclaimTerminalOrphan} when the terminal owner's journal changed or was
  *  retired under it, so the claimant's admission must be re-read (see the phaseClone loop). It carries no effect:
@@ -2453,6 +2465,9 @@ interface RunFlight {
   retainedDiscoveryRetries?: number;
   ciEvidence?: PreparedCIEvidence;
   readonly runHome: string | undefined;
+  /** Issue #3870: this claim's managed Go work leaf (`<runHome>/.uzi-go-work/g<gen>`), set in
+   *  phasePreflightHandoff for a Claude flight only; undefined when none was prepared. */
+  managedGoWorkDir?: string;
   readonly runScopedSecrets: string[];
   readonly runLog: Logger;
   readonly redact: ReturnType<typeof makeRedactor>;
@@ -2933,6 +2948,8 @@ export interface RunnerOptions {
   semanticCoverageTestTransport?: BoundedCoverageTestTransport;
   /** Test-only teardown seams; production uses the pinned walk with one 120 s deadline. */
   teardownTestDeps?: TeardownTestDeps;
+  /** Test-only: inject a syscall failure into the managed Go work dir creation (issue #3870). */
+  goWorkTestDeps?: { fsOps?: GoWorkFsOps };
   queueTerminalRejectionReconciliation?: (runId: string, generation: number) => void;
   /** How often the steering channel polls /inputs (default 3s). */
   pollMs?: number;
@@ -3176,6 +3193,8 @@ export class RunRunner {
   private readonly dataVolume: DataVolumeGuard | undefined;
   /** PRD #1809 D4 — see RunnerOptions.diskGovernor. */
   private readonly diskGovernor: DiskGovernor | undefined;
+  /** issue #3865: the configured governor even when disabled; read only for `effectiveHardThreshold()`. */
+  private readonly diskThresholdSource: DiskGovernor | undefined;
   private readonly detect: (
     worktreePath: string,
     harness: RepoAgentHarness,
@@ -3192,6 +3211,7 @@ export class RunRunner {
   private readonly checkpointTickIntervalMs: number;
   /** Issue #1831: test-only teardown seams; production always uses pinned removal. */
   private readonly teardownTestDeps: TeardownTestDeps | undefined;
+  private readonly goWorkTestDeps: { fsOps?: GoWorkFsOps } | undefined;
   /** issue #1597 M2: test-only seams (undefined in production). */
   private readonly checkpointTestHooks: CheckpointTestHooks | undefined;
   private readonly planCrossCheckTiming: PlanCrossCheckTiming | undefined;
@@ -3452,6 +3472,7 @@ export class RunRunner {
     this.cachesDropped = opts.cachesDropped;
     this.dataVolume = opts.dataVolume;
     this.diskGovernor = opts.diskGovernor?.enabled ? opts.diskGovernor : undefined;
+    this.diskThresholdSource = opts.diskGovernor;
     this.dataVolumeReclaimWaitMs =
       opts.dataVolumeReclaimWaitMs && opts.dataVolumeReclaimWaitMs > 0
         ? opts.dataVolumeReclaimWaitMs
@@ -3463,6 +3484,7 @@ export class RunRunner {
     this.afterPublicationEnrolled = opts.afterPublicationEnrolled;
     this.semanticCoverageTestTransport = opts.semanticCoverageTestTransport;
     this.teardownTestDeps = opts.teardownTestDeps;
+    this.goWorkTestDeps = opts.goWorkTestDeps;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
     const holdBudget = opts.completionHoldReconcileTimeoutMs === undefined
@@ -6583,6 +6605,16 @@ export class RunRunner {
               () => dropRunCaches(runHome, runLog, flight.cachesDroppedEarly ? { quietNoop: true } : {}))
               .catch(() => undefined);
             if (!result || result.failed.length || result.skipped.length) flight.sourceJoinFailed = true;
+            // issue #3870: the reap is complete, so no process can still write the managed Go work
+            // leaves; remove them all (the `.uzi-go-work` parent stays). The result is deliberately
+            // NOT folded into sourceJoinFailed: that flag governs source join/custody, and this
+            // scratch is disposable (the D7 disk reclaim retries a parked run's leftovers). It runs
+            // whatever the cache drop returned. removeGoWorkLeaves never throws.
+            await this.runCancellationMaintenance(flight, () => removeGoWorkLeaves(runHome, runLog, {
+              select: { kind: "all" },
+              deadline: Date.now() + Math.min(60_000, flight.cancellationBudget?.remainingMs() ?? 60_000),
+              reason: "process_ended_park",
+            })).catch(() => undefined);
           } else { flight.sourceJoinFailed = true; parkReapIncomplete = true; }
         } else { flight.sourceJoinFailed = true; parkReapIncomplete = true; }
       }
@@ -8114,6 +8146,95 @@ export class RunRunner {
     const wait = await this.awaitDataVolumeReclaim(guard, flight, "preflight", recoverySignal);
     if (wait === "cancelled") throw new DataVolumeFullError("preflight");
     if (guard.preflight() === "data_volume_full") throw new DataVolumeFullError("preflight");
+  }
+
+  /** Whether the retained successor is seeded self-contained (no shared objects with the bare). */
+  private retainedSuccessorSelfContained(claim: ClaimResponse, flight: RunFlight): boolean {
+    return flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true ||
+      claim.plan_cross_check_gated === true;
+  }
+
+  /**
+   * issue #3865 — capacity admission for a retained successor seed, inside the iteration the caller
+   * already reserved. Refuses (throws {@link RetainedSeedCapacityShortfall}) when the successor's
+   * volume is already at the governor's effective hard threshold, or when the predecessor's measured
+   * footprint would not stay strictly below it. A refusal creates no successor, requests no disk park
+   * and releases no custody: it spends the reserved iteration like any retryable failure, so the third
+   * one ends as the existing `budget_exhausted` blocker and `retained_recovery_exhausted` park. Runs
+   * only against an api that has both causes, with a data-volume guard and a governor configuration;
+   * an unattributable or other-volume destination, or an unreadable sample, admits as before.
+   */
+  private async admitRetainedSeedCapacity(
+    claim: ClaimResponse, flight: RunFlight, bare: string, key: string, source: RecoveryJournalEntry,
+    iteration: { attempts: number; deadline: number }, signal: AbortSignal,
+  ): Promise<void> {
+    const guard = this.dataVolume;
+    const governor = this.diskThresholdSource;
+    if (!guard || !governor || !this.dataVolumeParkable(claim)) return;
+    const features = this.client.protocolFeatures;
+    if (!features.includes(DATA_VOLUME_FULL_FEATURE) || !features.includes(RETAINED_EXHAUSTED_FEATURE)) return;
+    const threshold = governor.effectiveHardThreshold();
+    if (!Number.isFinite(threshold)) return;
+    const destination = pathDirname(this.git.runnerClonePath(bare, key));
+    const selfContained = this.retainedSuccessorSelfContained(claim, flight);
+    // One assessment: sample, bail on current pressure before measuring, else measure the
+    // predecessor and judge a FRESH sample so writes during the measurement count.
+    const assess = async (): Promise<Exclude<RetainedSeedAdmission, { kind: "unknown" }> | undefined> => {
+      const first = await guard.attributedStatfs(destination);
+      if (first.kind !== "sample") {
+        flight.runLog.debug("retained seed capacity check skipped: destination volume not attributable", {
+          run_id: flight.runId, outcome: first.kind });
+        return undefined;
+      }
+      const early = decideRetainedSeedAdmission({ raw: first.raw, threshold, estimate: undefined });
+      if (early.kind === "unknown") return undefined;
+      if (early.kind === "refuse_current") return early;
+      let estimate: RetainedSeedEstimate | undefined;
+      try {
+        estimate = await this.git.measureRetainedSeedFootprint(source.clonePath, {
+          includeGitObjects: selfContained,
+          deadline: Math.min(iteration.deadline, Date.now() + RETAINED_SEED_MEASURE_BUDGET_MS),
+        });
+      } catch (error) {
+        // An interruption or an expired iteration propagates; only a filesystem failure (an error
+        // with a string `code`, e.g. ENOENT/EACCES/EMFILE/EIO) falls back to the estimate.
+        signal.throwIfAborted();
+        this.retainedLifecycleGuard(flight);
+        if (Date.now() >= iteration.deadline) throw error;
+        if (typeof (error as { code?: unknown } | null)?.code !== "string") throw error;
+        flight.runLog.warn("retained seed footprint measurement failed; using the fallback estimate",
+          formatRetainedRecoveryDiagnostic(error, flight.redactText));
+        estimate = undefined;
+      }
+      const second = await guard.attributedStatfs(destination);
+      if (second.kind !== "sample") return undefined;
+      const decision = decideRetainedSeedAdmission({ raw: second.raw, threshold, estimate });
+      return decision.kind === "unknown" ? undefined : decision;
+    };
+    let decision = await assess();
+    if (!decision || decision.kind === "admit") return;
+    const wait = await this.awaitDataVolumeReclaim(guard, flight, "retained_seed_admission", signal);
+    if (wait !== "cancelled") {
+      decision = await assess();
+      if (!decision || decision.kind === "admit") return;
+    }
+    const pct = (value: number): string => `${(value * 100).toFixed(1)}%`;
+    const projected = decision.kind === "refuse_projected" ? decision.projected : undefined;
+    flight.runLog.warn("retained successor seed refused for data volume capacity; reserved iteration retained", {
+      run_id: flight.runId,
+      used_fraction: decision.current,
+      projected_fraction: projected,
+      hard_threshold: threshold,
+      estimate_complete: decision.kind === "refuse_projected" ? decision.estimateComplete : undefined,
+      iteration: iteration.attempts,
+      decision: decision.kind,
+    });
+    flight.batcher.emit({ kind: "status", agent: "worker", payload: {
+      text: `retained recovery deferred: data volume at ${pct(decision.current)}` +
+        `${projected === undefined ? "" : `, projected ${pct(projected)}`} (hard threshold ${pct(threshold)}); ` +
+        "not seeding a fresh attempt this iteration; predecessor work and custody retained",
+    } });
+    throw new RetainedSeedCapacityShortfall();
   }
 
   /**
@@ -10071,6 +10192,7 @@ export class RunRunner {
         process.env,
         runHome ?? os.tmpdir(),
         result.toolEnv,
+        runHome ? flight.managedGoWorkDir : undefined,
       );
       // Issue #1830: the governor's in-place drop keeps `.npm/_cacache` while this install runs.
       flight.jsDepsInstalling = true;
@@ -13458,6 +13580,15 @@ export class RunRunner {
         });
         throw new RunResidueBlockedError(cause.detail, { preClone: "home_reap" });
       }
+      // issue #3870: with the reap complete, no older attempt's process can still write its Go work
+      // leaf, so remove the leaves of earlier generations. Only logged; never fails the claim.
+      if (Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0) {
+        await removeGoWorkLeaves(flight.runHome, runLog, {
+          select: { kind: "olderThan", generation: flight.claimGeneration },
+          deadline: Date.now() + 30_000,
+          reason: "claim_older_generations",
+        });
+      }
     }
     // issue #2213: the HOME reap above cannot see a survivor nothing ties to this run, and it skips
     // a run's first claim and every Codex run. The worker-wide check runs on EVERY claim.
@@ -15006,8 +15137,31 @@ export class RunRunner {
     const semanticPlanning = claim.semantic_planning === undefined ? undefined : parseSemanticEnrollment(claim.semantic_planning);
     const semanticGate = semanticPlanning ? new SemanticPlanningGate(this.client, runId, flight.claimGeneration,
       steering.lifecycleSignal(), this.semanticCoverageTestTransport) : undefined;
+    // issue #3870: the managed Go work leaf for a Claude flight on Linux. A Codex executor's `safety`
+    // is only populated inside run(), so it is excluded here by the signals known before launch
+    // (`claim.secrets.codex`, `sandboxesCommands`), as isCodexCapture does. Only an ordinary
+    // root-creation failure falls back to launching without GOTMPDIR; this block wraps nothing else.
+    if (!flight.executor.safety && flight.executor.sandboxesCommands !== true && !claim.secrets.codex &&
+      flight.runHome && process.platform === "linux") {
+      let homeReady = true;
+      try {
+        await fs.mkdir(flight.runHome, { recursive: true });
+      } catch (err) {
+        homeReady = false;
+        runLog.warn("managed Go work dir unavailable; launching without GOTMPDIR", {
+          reason: "home_unavailable",
+          generation: Number.isFinite(flight.claimGeneration) ? flight.claimGeneration : null,
+          ...(typeof (err as NodeJS.ErrnoException)?.code === "string" ? { code: sanitizeForLog((err as NodeJS.ErrnoException).code!, 32) } : {}),
+        });
+      }
+      if (homeReady) {
+        const prepared = await prepareManagedGoWork(flight.runHome, flight.claimGeneration, runLog, this.goWorkTestDeps?.fsOps);
+        if ("dir" in prepared) flight.managedGoWorkDir = prepared.dir;
+      }
+    }
     const ctx: RunContext = {
       semanticPlanning,
+      managedGoWorkDir: flight.managedGoWorkDir,
       ...(claim.kind === "prompt" && claim.config?.ci_config_guard === true && claim.ci_repair != null ? {
         prepareCIEvidence: async () => {
           if (!flight.runHome) throw new Error("CI evidence requires a prepared run home");
@@ -20980,6 +21134,13 @@ export class RunRunner {
       if (mayDrop && flight.runHome && !executor.safety) {
         await dropRunCaches(flight.runHome, runLog, { message: "run caches dropped before the disk park's capture" });
         flight.cachesDroppedEarly = true;
+        // issue #3870: the same complete reap makes the managed Go work leaves safe to remove
+        // before the capture; never throws, and its result does not gate the park.
+        await removeGoWorkLeaves(flight.runHome, runLog, {
+          select: { kind: "all" },
+          deadline: Date.now() + 60_000,
+          reason: "disk_park_pre_capture",
+        });
       }
     }
     // Track independent writes, including true -> true, across capture and terminal disposal.
@@ -25722,7 +25883,7 @@ export class RunRunner {
             await this.git.blockRecoveryEpisode(bare, branch, key, expectedSource, blocker, episode ?? null,
               () => this.retainedLifecycleGuard(flight));
             this.retainedLifecycleGuard(flight);
-            if ((this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_exhausted") ||
+            if ((this.client?.protocolFeatures?.includes(RETAINED_EXHAUSTED_FEATURE) ||
                 this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_adoption_failed")) &&
                 Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0) {
               const snapshot = await this.git.terminalRetainedSnapshot(bare, branch, key, expectedSource);
@@ -25800,7 +25961,7 @@ export class RunRunner {
       }
       if (persistence === "" && persisted?.recovery?.stage === "blocked" && persisted.recovery.blocker === "budget_exhausted" &&
           Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 &&
-          this.client?.protocolFeatures?.includes("recovery_cause_retained_recovery_exhausted")) {
+          this.client?.protocolFeatures?.includes(RETAINED_EXHAUSTED_FEATURE)) {
         if (await this.parkRetainedRecoveryExhausted(flight)) throw new RetainedRecoveryStop();
       }
       await this.reportGenericFailure(claim, flight,
@@ -25952,6 +26113,8 @@ export class RunRunner {
           // Retained forge/disk failures are charged to this reservation, never to a park.
           await this.preflightDataVolume(claim, flight, signal);
           await check();
+          await this.admitRetainedSeedCapacity(claim, flight, bare, key, source, iteration, signal);
+          await check();
           await this.checkWorkerResidueBeforeFetch(claim.run_id, "retained_recovery", flight.runLog);
           await check();
           await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username,
@@ -26076,7 +26239,7 @@ export class RunRunner {
                 iteration.attempts, attemptId, {
                   checkpointWriteUnresolved: flight.checkpointClaimEvidence.writeUnresolved,
                   checkpointKey: flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : undefined),
-                  selfContained: flight.executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.plan_cross_check_gated === true,
+                  selfContained: this.retainedSuccessorSelfContained(claim, flight),
                   admitRemediationSource: async input => {
                     this.retainedLifecycleGuard(flight);
                     assertOldFacts(input.flaggedOIDs);
@@ -26228,7 +26391,7 @@ export class RunRunner {
           if (ownershipError instanceof RetainedRecoveryStop || ownershipError instanceof CredentialSwitchSignal) throw ownershipError;
         }
         if (Date.now() >= iteration.deadline) { blocker = "budget_exhausted"; await fail(); }
-        if (blocker === "adoption_failed") await fail();
+        if (blocker === "adoption_failed" && !(error instanceof RetainedSeedCapacityShortfall)) await fail();
         if (iteration.attempts >= 3 || Date.now() >= iteration.deadline) {
           blocker = "budget_exhausted";
           await fail();

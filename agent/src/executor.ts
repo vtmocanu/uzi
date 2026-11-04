@@ -185,6 +185,11 @@ export interface RunContext {
   runId: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;
+  /** Issue #3870, Claude run flight only (the runner sets it; Codex never does): the managed Go
+   *  work dir `<runHome>/.uzi-go-work/g<gen>`. It becomes GOTMPDIR for the lead CLI and the
+   *  pre-plan JS-deps install, and is inherited by Bash, subagents and the guarded command lane.
+   *  Absent when the runner could not prepare one (launch proceeds without GOTMPDIR). */
+  managedGoWorkDir?: string;
   /** PRD #3244: the claim's single lead-config reporter, constructed by the runner only. Executors
    *  call `enterPhase` before a lead turn; absent for stub/test executors and non-lead lanes. */
   leadConfig?: import("./lead-config-report.js").LeadConfigReporter;

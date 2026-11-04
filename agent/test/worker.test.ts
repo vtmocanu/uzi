@@ -1043,6 +1043,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "cross_check_codex_lead_v1",
     "cross_check_gated_v1",
     "cross_check_semantic_plan_v1",
+    "cross_check_owner_steering_v1",
     "completion_semantic_publication_v1",
     "ci_config_guard_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),

@@ -623,7 +623,8 @@ describe("U2 real runner checked gate", () => {
       const session = path.join(root, "session");
       const { exec, verdicts } = checkedExec(async (ctx) => {
         clone = ctx.worktreePath;
-        fs.mkdirSync(session);
+        // Recursive like SdkExecutor: the runner may already have created the home (issue #3870).
+        fs.mkdirSync(session, { recursive: true });
         fs.writeFileSync(path.join(session, "transcript"), "resume");
         fs.mkdirSync(skillsPluginDir(clone), { recursive: true });
         fs.writeFileSync(path.join(skillsPluginDir(clone), "marker"), "resume");

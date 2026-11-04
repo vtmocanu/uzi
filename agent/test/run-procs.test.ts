@@ -289,6 +289,70 @@ describe("run process attribution (PRD #1809 D4)", () => {
     }
   });
 
+  describe("managed Go work dir (GOTMPDIR) attribution", () => {
+    it("a process that reset HOME but carries GOTMPDIR inside the run's leaf (or below it) is attributed", async () => {
+      const leaf = `${runHome}/.uzi-go-work/g2`;
+      fake(4601, { env: ["HOME=/elsewhere", `GOTMPDIR=${leaf}`], cwd: "/tmp" });
+      fake(4602, { env: ["HOME=/elsewhere", `GOTMPDIR=${leaf}/go-build123`], cwd: "/tmp" });
+      fake(4603, { env: [`GOTMPDIR=${leaf}`, "HOME=/elsewhere"], cwd: "/tmp" }); // entry first in environ
+      const r = await scan();
+      assert.deepStrictEqual(r.pids.sort(), [4601, 4602, 4603]);
+      assert.strictEqual(r.complete, true);
+    });
+
+    it("lookalikes and other runs' GOTMPDIR values are not attributed", async () => {
+      const other = path.join(root, "agent-home", "run-b");
+      const cases: string[][] = [
+        [`GOTMPDIR=${runHome}/.uzi-go-work/g2x`],
+        [`GOTMPDIR=${runHome}/.uzi-go-work/gfoo`],
+        [`GOTMPDIR=${runHome}/.uzi-go-work/g0`],
+        [`GOTMPDIR=${runHome}/.uzi-go-work/g02`],
+        [`GOTMPDIR=${runHome}/.uzi-go-workX/g2`],
+        [`XGOTMPDIR=${runHome}/.uzi-go-work/g2`],
+        [`GOTMPDIR=${other}/.uzi-go-work/g2`],
+        [`GOTMPDIR=${runHome}/.uzi-go-work`],
+        [`GOTMPDIR=${runHome}/.uzi-go-work/`],
+        [`GOTMPDIR=${runHome}/.uzi-go-work-x/g1`],
+        [`GOTMPDIR=${runHome}/g1/x`],
+        [`GOTMPDIR=${runHome}/.uzi-go-work/g9007199254740993`], // above MAX_SAFE_INTEGER
+        [`GOTMPDIR=${runHome}/.uzi-go-work/g9999999999999999`],
+      ];
+      cases.forEach((env, i) => fake(4700 + i, { env: ["HOME=/elsewhere", ...env], cwd: "/tmp" }));
+      const r = await scan();
+      assert.deepStrictEqual(r.pids, []);
+      assert.strictEqual(r.complete, true);
+    });
+
+    it("the largest safe-integer generation is still attributed", async () => {
+      fake(4650, { env: ["HOME=/elsewhere", `GOTMPDIR=${runHome}/.uzi-go-work/g9007199254740991`], cwd: "/tmp" });
+      const r = await scan();
+      assert.deepStrictEqual(r.pids, [4650]);
+    });
+
+    it("the reap does not kill a process whose GOTMPDIR generation is not a safe integer", async () => {
+      const cs = [spawn("sleep", ["30"], { detached: true, stdio: "ignore" }), spawn("sleep", ["30"], { detached: true, stdio: "ignore" })];
+      children.push(...cs);
+      fake(cs[0]!.pid!, { env: ["HOME=/elsewhere", `GOTMPDIR=${runHome}/.uzi-go-work/g9007199254740993`], cwd: "/tmp" });
+      fake(cs[1]!.pid!, { env: ["HOME=/elsewhere", `GOTMPDIR=${runHome}/.uzi-go-work/g9999999999999999/go-build1`], cwd: "/tmp" });
+      const r = await reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 1 });
+      assert.deepStrictEqual(r.killed, []);
+      for (const c of cs) {
+        assert.strictEqual(c.exitCode, null);
+        assert.strictEqual(c.signalCode, null);
+      }
+    });
+
+    it("the reap SIGKILLs a GOTMPDIR-attributed process", async () => {
+      const c = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+      children.push(c);
+      const exited = new Promise<NodeJS.Signals | null>((resolve) => c.once("exit", (_code, sig) => resolve(sig)));
+      fake(c.pid!, { env: ["HOME=/elsewhere", `GOTMPDIR=${runHome}/.uzi-go-work/g2/go-build123`], cwd: "/tmp" });
+      const r = await reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 1 });
+      assert.deepStrictEqual(r.killed, [c.pid]);
+      assert.strictEqual(await exited, "SIGKILL");
+    });
+  });
+
   it("the reap does not kill a pid whose start time changed between the round and the kill (pid reuse, N-c)", async () => {
     const c = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
     children.push(c);

@@ -446,4 +446,24 @@ describe("reclaimStrandedRunHomes (PRD #108 M6)", () => {
     // And the directory it asked about is the one named by that run id.
     for (const id of asked) assert.ok(await fsp.stat(path.join(root, id)));
   });
+
+  it("removes a terminal HOME holding a managed Go work leaf (issue #3870) and skips a parked one", async () => {
+    const seedLeaf = (dir: string): string => {
+      const leaf = path.join(dir, ".uzi-go-work", "g3", "go-build1");
+      fs.mkdirSync(leaf, { recursive: true });
+      fs.writeFileSync(path.join(leaf, "x.o"), "obj");
+      fs.utimesSync(dir, OLD, OLD);
+      return path.join(dir, ".uzi-go-work", "g3", "go-build1", "x.o");
+    };
+    const terminal = makeHome(RUN_A);
+    const parked = makeHome(RUN_B);
+    seedLeaf(terminal);
+    const parkedLeaf = seedLeaf(parked);
+
+    const summary = await reclaimStrandedRunHomes(root, statuses({ [RUN_A]: "completed", [RUN_B]: "limit_wait" }), nullLogger());
+
+    assert.strictEqual(fs.existsSync(terminal), false, "the terminal HOME goes whole, the Go work parent included");
+    assert.ok(fs.existsSync(parkedLeaf), "a parked run's HOME is not this sweep's to touch");
+    assert.strictEqual(summary.removed, 1);
+  });
 });

@@ -357,6 +357,13 @@ type CrossCheck struct {
 	Coverage                []byte             `json:"coverage"`
 }
 
+type CrossCheckOwnerSteering struct {
+	CrossCheckID uuid.UUID          `json:"cross_check_id"`
+	Snapshot     string             `json:"snapshot"`
+	Digest       []byte             `json:"digest"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
 type CustodyEpisodeNotice struct {
 	UserID     uuid.UUID          `json:"user_id"`
 	NotifiedAt pgtype.Timestamptz `json:"notified_at"`

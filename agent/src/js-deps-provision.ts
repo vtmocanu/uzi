@@ -21,6 +21,7 @@ export function startDepsInstall(
   toolEnv: Record<string, string> | undefined,
   signal: AbortSignal,
   installDeps: typeof installJsDeps = installJsDeps,
+  goWorkDir?: string,
 ): Promise<JsDepsInstall> {
   ctx.emit({
     kind: "status",
@@ -42,7 +43,7 @@ export function startDepsInstall(
   try {
     return installDeps(
       ctx.worktreePath,
-      buildCheckEnv(process.env, homeDir, toolEnv),
+      buildCheckEnv(process.env, homeDir, toolEnv, goWorkDir),
       { signal },
     ).catch(failed);
   } catch (err: unknown) {

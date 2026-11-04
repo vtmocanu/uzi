@@ -1286,6 +1286,9 @@ type Store interface {
 	// (PRD #88 M1). The question id is a column, not a JSON field, because
 	// SetRunRunning's resume guard compares it in SQL.
 	CreateRunAnswerInput(ctx context.Context, arg store.CreateRunAnswerInputParams) (store.RunUserInput, error)
+	// CreateCompletionDecisionInput writes the completion_decision audit row that links an
+	// owner completion-continue ANSWER by question_id (issue #3841).
+	CreateCompletionDecisionInput(ctx context.Context, arg store.CreateCompletionDecisionInputParams) (store.RunUserInput, error)
 	ConsumeRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ConsumeRunInputsRow, error)
 	ListReplayRunInputs(ctx context.Context, runID uuid.UUID) ([]store.ListReplayRunInputsRow, error)
 	// ListConsumedFollowUpInputsForRun reads the run's already-consumed follow_up inputs,
@@ -4144,8 +4147,8 @@ type StateRequest struct {
 	MrIID                     *int64  `json:"mr_iid"`
 	// Head is the EXACT source-branch tip H a `completed` report is being made against
 	// (PRD #1226 M2, D5). It is required for permit-backed INTERLOCKED completion.
-	// A headless, uncapped report-only issue completion instead validates full frozen
-	// structural delivery and a positive live claim generation under the run lock.
+	// A headless, uncapped report-only issue completion instead validates delivery of every
+	// frozen milestone not owner-deferred and a positive live claim generation under the run lock.
 	// SetState routes interlocked completion through completeRunWithPermitLease, which
 	// consumes the permit for publication completion issued for
 	// (run, contract_revision, Head) and writes `completed` in one transaction. A completed
@@ -5458,7 +5461,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		}
 		// PRD #1226 M2 (D4): INTERLOCKED completion runs through completeRunWithPermitLease.
 		// Headless, uncapped report-only issue completion may bypass a permit only after
-		// locked validation of full frozen structural delivery, a positive live claim
+		// locked validation of every non-deferred frozen milestone's delivery, a positive live claim
 		// generation, and absence of stored publication fields. Other completions are
 		// permit-gated: the transaction consumes the permit issued
 		// for the exact (run, contract_revision, head) and writes `completed` atomically, with a
