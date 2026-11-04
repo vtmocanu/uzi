@@ -55,8 +55,9 @@ func (s *Service) SyncPipelines(ctx context.Context, repoID uuid.UUID, forgeProj
 	// keep accumulates every watched ref that should survive the reconcile eviction:
 	// a ref freshly resolved to a pipeline, or one whose fetch failed (preserve its
 	// stale row). Refs that returned ErrNoPipeline are deliberately omitted so they
-	// age out of the cache.
-	var keep []string
+	// age out of the cache. Never nil: pgx encodes a nil slice as SQL NULL, and
+	// `ref <> ALL(NULL)` deletes nothing, so an empty keep-set must be '{}' to evict.
+	keep := make([]string, 0)
 
 	// 1. Default branch. Branch pipelines only: an MR-only project's default branch
 	//    honestly shows "no CI" (documented, not fabricated) because its pipelines
