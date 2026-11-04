@@ -595,7 +595,9 @@ pass and re-checks before refusing. If the volume stays full, the iterations end
 in the existing retained-recovery park, whose automatic retries stop for owner
 Resume once the retained-park allowance is spent. The
 projection is an estimate and applies only when the API supports both the disk
-and retained-recovery park causes.
+and retained-recovery park causes. The check has no off switch: setting
+`UZI_DISK_HARD_STOP_ENABLED=false` disables the hard governor's stops but not
+this admission check, which uses the same effective hard threshold either way.
 
 A verified thin bundle within the cap, with its needed prerequisites locally
 available and verified, permits local adoption and model execution even
