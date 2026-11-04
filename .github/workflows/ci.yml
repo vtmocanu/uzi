@@ -1009,7 +1009,7 @@ jobs:
         # ubuntu-latest runner provides, the same unpinned-reader reasoning as
         # lint-actions-embedded.sh.
         run: task render:openshift-check
-      - name: Render and assert workers.nodeSelector
+      - name: Render and assert workers.nodeSelector and workers.tolerations
         # Offline (strips the CNPG subchart); default, override, null, {} and malformed values.
         run: task render:node-selector-check
       - name: Docker-tier fail-guards
