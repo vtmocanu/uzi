@@ -17,6 +17,11 @@ import { nullLogger } from "./helpers.js";
 const fixtureUrl = new URL("./fixtures/checkpoint-publish-h2-reset.json", import.meta.url);
 
 if (process.env.UZI_H2_RESET_CHILD === "1") {
+  // A worker has always used fetch (registration) before it publishes, so the publish runs on its
+  // composed dispatcher (client.ts checkpointPublishDispatcher). Constructing a Headers loads Node's
+  // fetch implementation, which fills the global dispatcher slot, without a request to the server.
+  new Headers();
+  assert.ok((globalThis as Record<symbol, unknown>)[Symbol.for("undici.globalDispatcher.2")], "global dispatcher slot filled");
   const client = new WorkerClient(process.env.UZI_H2_RESET_URL!, "test", "test", nullLogger());
   const pack = Readable.from((async function* () { for (let i = 0; i < 4; i++) yield Buffer.alloc(64 * 1024, 1); })());
   const chain: Array<{ constructor: string; code: string | null; message: string }> = [];
