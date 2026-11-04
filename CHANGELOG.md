@@ -60,7 +60,13 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **The agent worker images (`agent-base`, `agent-jvm`) are published for `linux/arm64` as well as `linux/amd64`.**
   Each tag is now a multi-arch index, built natively per architecture and signed as an index and per architecture. The chart still pins workers to amd64 nodes by default (`workers.nodeSelector`) until its worker pin names a multi-arch release.
 
+- **Runs and CLI show grouped owner cross-check history ([#3811](https://github.com/vtmocanu/uzi/pull/3811), [#3843](https://github.com/vtmocanu/uzi/pull/3843)).**
+  Browse retained Plan and Code attempts in Active and Past, with independent execution, verdict and effect evidence, owner-scoped preferences, filters and explicit older-history continuation. Older loaded attempts outside a refreshed window are labelled as last-observed evidence.
+
 ### Changed
+
+- **Routine dependency updates ([#3817](https://github.com/vtmocanu/uzi/pull/3817)).**
+  Dependency manifest and image bumps that carry no entry of their own.
 
 - **Demo mode hides instance branding ([#3757](https://github.com/vtmocanu/uzi/pull/3757)).**
   Screenshots use the stock uzi identity, tab title and favicon base, with POWERED BY and optional license credits hidden; toggling demo mode off restores real branding without changing server settings.
@@ -79,6 +85,18 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Runs get clearer planning and guardrail guidance ([#296](https://github.com/vtmocanu/uzi/pull/296), [#3759](https://github.com/vtmocanu/uzi/pull/3759)).**
   The lead prompt now asks leads to check scope and verification costs before freezing a plan, and mass-signal denials explain supported file input for falsely flagged literal heredoc prose; command screening is unchanged.
+
+- **Builtin reviewer and tester agents reuse another validator's verified result instead of re-running the same full test file or gate (vtmocanu/skills#156) ([#3848](https://github.com/vtmocanu/uzi/pull/3848)).**
+  Synced to skills v0.49.0 (reviewer v24, tester v21). An agent reuses a result only after it has read the log and exit status and checked that the revision, working-tree state, command, scope and environment match. Missing, stale, unverifiable or suspected-flaky results still run, and independent review, distinct-hypothesis, mutation and targeted repeats are kept. Release upgrades preserve edited and source-synced builtin templates. Reset on the agent page restores the definition shipped in this release.
+
+- **Incomplete run process scans record their cause ([#2953](https://github.com/vtmocanu/uzi/pull/2953), [#3835](https://github.com/vtmocanu/uzi/pull/3835)).**
+  The worker's run process scan and reap results now carry fixed-vocabulary reasons naming which existing condition made them incomplete, shown in the real-procfs test failures; when a scan is incomplete is unchanged.
+
+- **Judge retrospectives name a reported Codex child-budget expiry ([#3838](https://github.com/vtmocanu/uzi/pull/3838), [#3862](https://github.com/vtmocanu/uzi/pull/3862)).**
+  An exact recorded child turn-budget expiry stays a failed delegation, now labelled as reported expiry rather than an unknown cause, without claiming the child was terminated.
+
+- **Code cross-check PR sections group verification caveats apart from graded findings ([#3832](https://github.com/vtmocanu/uzi/pull/3832), [#3839](https://github.com/vtmocanu/uzi/pull/3839)).**
+  Findings titled `Coverage uncertainty:` render after the graded ones with separate counts and a non-certification note, and the 4 KiB budget drops caveats before graded lines with counted omission lines; the Code repair prompt also says one dispositions call may list several finding IDs, one entry each, while stored findings and per-ID dispositions are unchanged.
 
 ### Fixed
 
@@ -123,6 +141,42 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Partial shadow inventory names bounded cap, API and filesystem causes ([#3775](https://github.com/vtmocanu/uzi/pull/3775), [#3810](https://github.com/vtmocanu/uzi/pull/3810)).**
   Sparse diagnostic counters explain observed partial work without changing reclaim candidates or authority.
+
+- **Keep Codex sandbox builds compatible with the updated system-call library ([#3700](https://github.com/vtmocanu/uzi/pull/3700), [#3842](https://github.com/vtmocanu/uzi/pull/3842)).**
+  Upgrade the supervisor to `golang.org/x/sys` v0.49.0 while preserving its Landlock filesystem rights and fail-closed confinement checks.
+
+- **Live runs wait for publication enrollment reconciliation after an uncertain ACK ([#3833](https://github.com/vtmocanu/uzi/pull/3833), [#3846](https://github.com/vtmocanu/uzi/pull/3846)).**
+  The original flight retries its durable intent after fresh running, same-generation, unreleased ownership proof; queued claims wait for re-adoption within the existing deadline.
+
+- **Clean remediated recovery can continue while excluded history remains retained ([#3747](https://github.com/vtmocanu/uzi/pull/3747), [#3816](https://github.com/vtmocanu/uzi/pull/3816)).**
+  Attempt-bound worker proof selects the clean source without authorizing publication or release of excluded history. Coverage without a verified source, or divergent history without remediation proof, now refuses adoption before a successor starts; local work, pins and custody remain retained.
+
+- **Checker execution failures retain safe diagnostics ([#3812](https://github.com/vtmocanu/uzi/pull/3812), [#3826](https://github.com/vtmocanu/uzi/pull/3826)).**
+  Plan and Code checker traces and human uzi run logs show fixed failure explanations without raw provider output or exception details; failures after trace closure remain safe unknown worker warnings without backfilling traces.
+
+- **Checkpoints keep advancing after a resume restores a park marker, so `pause --now` succeeds ([#2753](https://github.com/vtmocanu/uzi/pull/2753), [#3861](https://github.com/vtmocanu/uzi/pull/3861)).**
+  Raw tick, iteration, park and pause publishes now chain over the prior checkpoint tip on every forge, tolerating `wip(park):` markers in its history only when the server confirmed that tip; WIP not recommitted survives only on the chain's side parent.
+
+- **Tracking preservation refusals identify the reason in the run feed ([#296](https://github.com/vtmocanu/uzi/pull/296), [#3830](https://github.com/vtmocanu/uzi/pull/3830)).**
+  Bounded worker diagnostics direct users to inspect retained-work status with uzi run recovery while preserving fail-closed retention and publication checks.
+
+- **Hosted Docker workers preserve data under disk pressure ([#3852](https://github.com/vtmocanu/uzi/pull/3852), [#3864](https://github.com/vtmocanu/uzi/pull/3864)).**
+  The fixed controller defers data-only pressure and permits Nix-only recycle while keeping DinD maintenance available; a full data volume can still degrade capacity until supported reclaim frees space.
+
+- **Plan review requires evidence for data integrity claims ([#3840](https://github.com/vtmocanu/uzi/pull/3840), [#3850](https://github.com/vtmocanu/uzi/pull/3850)).**
+  Plan review requires a property-specific failure model and mechanism evidence for atomicity, durability and crash recovery, distinguishing missing mechanism defects from unreadable cited evidence.
+
+- **Forge operation contracts use built-in TypeScript stripping ([#3823](https://github.com/vtmocanu/uzi/pull/3823), [#3857](https://github.com/vtmocanu/uzi/pull/3857)).**
+  Erasable forge error constructors preserve their runtime properties while the npm-free contract loader probes strip support and rejects unsupported syntax loudly.
+
+- **Custody-blocked queued continuations retain work at retry exhaustion ([#3644](https://github.com/vtmocanu/uzi/pull/3644), [#3836](https://github.com/vtmocanu/uzi/pull/3836)).**
+  Exhausted continuations enter the existing recovery wait while preserving custody and counters; recoverable settings read failures make the new optional reconciliation skip classification while heartbeat and registration can still commit, and custody blockers remain visible ahead of Codex admission.
+
+- **Codex P conformance tests validate child cleanup ([#3849](https://github.com/vtmocanu/uzi/pull/3849)).**
+  Direct-process shims report observed kill and exit evidence, forward channel closure, and fail tests on unconfirmed disposal after completing resource cleanup.
+
+- **Run judge retains middle and delegation evidence with honest coverage within bounded input ([#3807](https://github.com/vtmocanu/uzi/pull/3807), [#3828](https://github.com/vtmocanu/uzi/pull/3828)).**
+  Separately budgeted evidence and event-aware samples expose omissions and uncertain outcomes without treating activity counts or recorded claims as proof. Ordinary tool activity no longer displaces delegation correlation from pending slots; ordinary-history loss alone preserves available delegation outcomes while limiting cross-kind reuse detection to retained ordinary keys. Orphan floods cannot evict open dispatches; unknown orphan coverage losses, including admission drops, keep retained result-before-start pairs provisional.
 
 ## [0.86.0] - 2026-11-01
 
