@@ -30,7 +30,10 @@ interface Run {
 // have the real /app/node_modules/agent-browser/bin). Tests of the pick itself override it.
 function runShim(args: string[], env: Record<string, string>): Promise<Run> {
   return new Promise((resolve) => {
-    execFile("/bin/sh", [shim, ...args], { env: { AGENT_BROWSER_SHIM_NATIVE_DIR: emptyBin, ...env } }, (err, stdout, stderr) => {
+    // HOME/TMPDIR default to dirs inside the test's tmp so the shim's run-private XDG dirs never
+    // litter the host's real HOME or /tmp; tests of the dir choice override them.
+    const base = { AGENT_BROWSER_SHIM_NATIVE_DIR: emptyBin, HOME: shimHome, TMPDIR: tmp };
+    execFile("/bin/sh", [shim, ...args], { env: { ...base, ...env } }, (err, stdout, stderr) => {
       const code = err && typeof (err as { code?: unknown }).code === "number" ? (err as { code: number }).code : err ? 1 : 0;
       resolve({ code, stdout, stderr });
     });
@@ -39,6 +42,7 @@ function runShim(args: string[], env: Record<string, string>): Promise<Run> {
 
 let tmp: string;
 let emptyBin: string;
+let shimHome: string; // default writable HOME for runShim
 let stubExec: string; // a stand-in "chromium" executable (target of AGENT_BROWSER_EXECUTABLE_PATH)
 let recorder: string; // records the argv it was exec'd with, then exits 0 (the real-CLI stand-in)
 let capture: string; // where the recorder writes its captured argv
@@ -52,6 +56,8 @@ before(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-abshim-"));
   emptyBin = path.join(tmp, "empty-bin");
   fs.mkdirSync(emptyBin);
+  shimHome = path.join(tmp, "default-home");
+  fs.mkdirSync(shimHome);
 
   stubExec = path.join(tmp, "chromium-stub");
   writeExec(stubExec, "#!/bin/sh\nexit 0\n");
@@ -162,30 +168,128 @@ describe("agent-browser crash-close shim (PRD #87 M1)", () => {
     // WITHOUT leaking a host browser, since AGENT_BROWSER_EXECUTABLE_PATH short-circuits the
     // PATH probe before any chromium on /usr/bin could match.
     //
-    // Issue #114 BUG 2a: the default dir is UID-SCOPED (`uzi-agent-browser-$(id -u)`) so the
-    // root (uid 0) build-guard invocation and the runtime uid never collide on one baked
-    // root-owned dir. The shim runs here under the TEST process uid, so that is the expected
-    // scope suffix.
-    const xdgTmp = path.join(tmp, "xdg-tmpdir");
-    fs.mkdirSync(xdgTmp);
+    // Issues #114 BUG 2a / #3907: the default base is RUN-PRIVATE — under a writable $HOME
+    // (`$HOME/.uzi-agent-browser`), else a per-invocation mktemp dir — never a fixed shared
+    // path, so the root build-guard invocation (throwaway HOME) and the runtime uid never
+    // collide on one baked root-owned dir.
+    const home = path.join(tmp, "xdg-home");
+    fs.mkdirSync(home);
     const envDump = path.join(tmp, "xdg-dump");
     writeExec(recorder, `#!/bin/sh\n{ echo "CFG=$XDG_CONFIG_HOME"; echo "CACHE=$XDG_CACHE_HOME"; } > "${envDump}"\nexit 0\n`);
     const res = await runShim(["open", "about:blank"], {
       PATH: `${emptyBin}:/usr/bin:/bin`,
-      TMPDIR: xdgTmp,
+      HOME: home,
       AGENT_BROWSER_EXECUTABLE_PATH: stubExec,
       AGENT_BROWSER_SHIM_TARGET: recorder,
     });
     assert.equal(res.code, 0);
     const dump = fs.readFileSync(envDump, "utf8");
-    const uid = process.getuid!();
-    const cfg = path.join(xdgTmp, `uzi-agent-browser-${uid}`, "config");
-    const cache = path.join(xdgTmp, `uzi-agent-browser-${uid}`, "cache");
-    assert.ok(dump.includes(`CFG=${cfg}`), `XDG_CONFIG_HOME must default under a uid-scoped dir in TMPDIR; got: ${dump}`);
-    assert.ok(dump.includes(`CACHE=${cache}`), `XDG_CACHE_HOME must default under a uid-scoped dir in TMPDIR; got: ${dump}`);
+    const cfg = path.join(home, ".uzi-agent-browser", "config");
+    const cache = path.join(home, ".uzi-agent-browser", "cache");
+    assert.ok(dump.includes(`CFG=${cfg}\n`), `XDG_CONFIG_HOME must default under HOME/.uzi-agent-browser; got: ${dump}`);
+    assert.ok(dump.includes(`CACHE=${cache}\n`), `XDG_CACHE_HOME must default under HOME/.uzi-agent-browser; got: ${dump}`);
     assert.ok(fs.existsSync(cfg), "the config dir must be created (best-effort mkdir)");
     assert.ok(fs.existsSync(cache), "the cache dir must be created (best-effort mkdir)");
     writeExec(recorder, `#!/bin/sh\n: > "${capture}"\nfor a in "$@"; do printf '%s\\n' "$a" >> "${capture}"; done\nexit 0\n`);
+  });
+
+  async function xdgFor(env: Record<string, string>, tag: string): Promise<{ cfg: string; cache: string }> {
+    const envDump = path.join(tmp, `xdg-dump-${tag}`);
+    writeExec(recorder, `#!/bin/sh\n{ echo "CFG=$XDG_CONFIG_HOME"; echo "CACHE=$XDG_CACHE_HOME"; } > "${envDump}"\nexit 0\n`);
+    const res = await runShim(["open", "about:blank"], {
+      PATH: `${emptyBin}:/usr/bin:/bin`,
+      AGENT_BROWSER_EXECUTABLE_PATH: stubExec,
+      AGENT_BROWSER_SHIM_TARGET: recorder,
+      ...env,
+    });
+    assert.equal(res.code, 0);
+    const dump = fs.readFileSync(envDump, "utf8");
+    const cfg = /^CFG=(.*)$/m.exec(dump)?.[1] ?? "";
+    const cache = /^CACHE=(.*)$/m.exec(dump)?.[1] ?? "";
+    writeExec(recorder, `#!/bin/sh\n: > "${capture}"\nfor a in "$@"; do printf '%s\\n' "$a" >> "${capture}"; done\nexit 0\n`);
+    return { cfg, cache };
+  }
+
+  it("two different HOMEs get disjoint XDG dirs, each under its own HOME/.uzi-agent-browser", async () => {
+    const h1 = path.join(tmp, "home-a");
+    const h2 = path.join(tmp, "home-b");
+    fs.mkdirSync(h1);
+    fs.mkdirSync(h2);
+    const a = await xdgFor({ HOME: h1 }, "ha");
+    const b = await xdgFor({ HOME: h2 }, "hb");
+    assert.equal(a.cfg, path.join(h1, ".uzi-agent-browser", "config"));
+    assert.equal(a.cache, path.join(h1, ".uzi-agent-browser", "cache"));
+    assert.equal(b.cfg, path.join(h2, ".uzi-agent-browser", "config"));
+    assert.equal(b.cache, path.join(h2, ".uzi-agent-browser", "cache"));
+    assert.notEqual(a.cfg, b.cfg);
+  });
+
+  it("an unset HOME falls back to a per-invocation dir under TMPDIR (distinct across runs)", async () => {
+    const t = path.join(tmp, "xdg-fallback-tmp");
+    fs.mkdirSync(t);
+    const a = await xdgFor({ HOME: "", TMPDIR: t }, "u1");
+    const b = await xdgFor({ HOME: "", TMPDIR: t }, "u2");
+    for (const r of [a, b]) {
+      assert.match(r.cfg, new RegExp(`^${t}/uzi-agent-browser\\.[^/]+/config$`));
+      assert.match(r.cache, new RegExp(`^${t}/uzi-agent-browser\\.[^/]+/cache$`));
+      assert.ok(fs.existsSync(r.cfg), "fallback config dir must be created");
+    }
+    assert.notEqual(a.cfg, b.cfg, "the fallback must not be shared between invocations");
+  });
+
+  it("an unwritable HOME falls back to a per-invocation dir under TMPDIR (distinct across runs)", async (t) => {
+    if (process.getuid!() === 0) {
+      t.skip("root can write a 0555 dir");
+      return;
+    }
+    const ro = path.join(tmp, "ro-home");
+    fs.mkdirSync(ro);
+    fs.chmodSync(ro, 0o555);
+    const tdir = path.join(tmp, "xdg-fallback-tmp2");
+    fs.mkdirSync(tdir);
+    try {
+      const a = await xdgFor({ HOME: ro, TMPDIR: tdir }, "r1");
+      const b = await xdgFor({ HOME: ro, TMPDIR: tdir }, "r2");
+      assert.match(a.cfg, new RegExp(`^${tdir}/uzi-agent-browser\\.[^/]+/config$`));
+      assert.notEqual(a.cfg, b.cfg);
+      assert.ok(!fs.existsSync(path.join(ro, ".uzi-agent-browser")));
+    } finally {
+      fs.chmodSync(ro, 0o755);
+    }
+  });
+
+  describe("uzi-chromium wrapper as the executable (issue #3907)", () => {
+    const wrapperStub = () => path.join(tmp, "wrapper-stub");
+    const clearCapture = () => fs.rmSync(capture, { force: true });
+
+    it("exits 0 with the no-browser message when the wrapper's Chromium target is missing, never exec'ing the CLI", async () => {
+      writeExec(wrapperStub(), "#!/bin/sh\nexit 0\n");
+      clearCapture();
+      const res = await runShim(["open", "example.com"], {
+        PATH: emptyBin,
+        AGENT_BROWSER_EXECUTABLE_PATH: wrapperStub(),
+        AGENT_BROWSER_SHIM_WRAPPER: wrapperStub(),
+        UZI_CHROMIUM_WRAPPER_TARGET: path.join(tmp, "no-such-chromium"),
+        AGENT_BROWSER_SHIM_TARGET: recorder,
+      });
+      assert.equal(res.code, 0);
+      assert.match(res.stderr, /no browser in this runtime — skipping browser validation/);
+      assert.ok(!fs.existsSync(capture), "must not exec the real CLI when the wrapped Chromium is absent");
+    });
+
+    it("execs the CLI when the wrapper's Chromium target is present", async () => {
+      writeExec(wrapperStub(), "#!/bin/sh\nexit 0\n");
+      clearCapture();
+      const res = await runShim(["snapshot"], {
+        PATH: emptyBin,
+        AGENT_BROWSER_EXECUTABLE_PATH: wrapperStub(),
+        AGENT_BROWSER_SHIM_WRAPPER: wrapperStub(),
+        UZI_CHROMIUM_WRAPPER_TARGET: stubExec,
+        AGENT_BROWSER_SHIM_TARGET: recorder,
+      });
+      assert.equal(res.code, 0);
+      assert.deepEqual(captured(), ["snapshot"]);
+    });
   });
 
   it("respects an explicit XDG_CONFIG_HOME/XDG_CACHE_HOME (defaults never clobber intent)", async () => {

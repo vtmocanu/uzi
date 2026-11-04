@@ -1,0 +1,60 @@
+#!/bin/sh
+# Issue #3907 (PRD #87) — launch wrapper for the prebaked Chromium. Baked at
+# /usr/local/bin/uzi-chromium in BOTH worker templates. Anything that launches a browser
+# through CHROME_PATH / AGENT_BROWSER_EXECUTABLE_PATH (agent-browser, Playwright/Puppeteer
+# style tools, a hand-written script) can point at this file instead of the raw
+# /opt/uzi-toolchain/bin/chromium and get a launch that works in the hardened worker:
+#
+#  - --no-sandbox is MANDATORY under the PRD #51 hardening (unprivileged uid + cap_drop: ALL
+#    + no-new-privileges make Chromium's setuid sandbox impossible), and
+#    --disable-dev-shm-usage is needed because compose sets no shm_size (64MB /dev/shm).
+#    A caller that execs the raw binary without them hits the raw SUID abort.
+#  - Chromium needs WRITABLE config/cache dirs (crashpad traps rc=133 without them, even
+#    with --no-sandbox), so XDG_CONFIG_HOME / XDG_CACHE_HOME default to a run-private dir.
+#  - A profile (--user-data-dir) is created per invocation unless the caller passes one, so
+#    two launches never share (and lock-fight over) a profile, and nothing is shared across
+#    runs or uids. The base dir is under a writable $HOME, else a per-invocation mktemp dir;
+#    never a fixed shared path such as /tmp/<name>-<uid>.
+#
+# Argument order handed to Chromium: the two mandatory flags, then the injected profile
+# (only when the caller gave no --user-data-dir), then the caller's args verbatim.
+set -eu
+
+# Test-only seam (like AGENT_BROWSER_SHIM_TARGET in agent-browser); production images never
+# set it, so the target is the baked toolchain handle (#92).
+TARGET="${UZI_CHROMIUM_WRAPPER_TARGET:-/opt/uzi-toolchain/bin/chromium}"
+if [ ! -x "$TARGET" ]; then
+  echo "uzi-chromium: baked Chromium not found at $TARGET" >&2
+  exit 127
+fi
+
+: "${FONTCONFIG_FILE:=/etc/fonts/fonts.conf}"
+export FONTCONFIG_FILE
+
+base=""
+if [ -n "${HOME:-}" ] && [ -d "$HOME" ] && [ -w "$HOME" ]; then
+  if mkdir -p "$HOME/.uzi-chromium" 2>/dev/null; then
+    base="$HOME/.uzi-chromium"
+  fi
+fi
+if [ -z "$base" ]; then
+  base=$(mktemp -d "${TMPDIR:-/tmp}/uzi-chromium.XXXXXX")
+fi
+
+: "${XDG_CONFIG_HOME:=$base/config}"
+: "${XDG_CACHE_HOME:=$base/cache}"
+export XDG_CONFIG_HOME XDG_CACHE_HOME
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" 2>/dev/null || true
+
+has_profile=0
+for a in "$@"; do
+  case "$a" in
+    --user-data-dir|--user-data-dir=*) has_profile=1 ;;
+  esac
+done
+
+if [ "$has_profile" -eq 0 ]; then
+  profile=$(mktemp -d "$base/profile.XXXXXX")
+  exec "$TARGET" --no-sandbox --disable-dev-shm-usage "--user-data-dir=$profile" "$@"
+fi
+exec "$TARGET" --no-sandbox --disable-dev-shm-usage "$@"

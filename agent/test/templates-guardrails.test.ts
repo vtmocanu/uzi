@@ -596,6 +596,34 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         `${name}/Dockerfile build guard must assert no root-owned agent-browser state was baked under HOME (issue #1082)`,
       );
 
+      // Issue #3907: the uzi-chromium wrapper is baked, launched by the guard (fail-closed,
+      // under a throwaway HOME) and driven end to end by agent-browser through the wrapper,
+      // all BEFORE the /nix store-perm normalization (the guard runs as root).
+      assert.match(
+        text,
+        /COPY --chmod=0755 agent\/bin\/uzi-chromium \/usr\/local\/bin\/uzi-chromium/,
+        `${name}/Dockerfile must bake the uzi-chromium wrapper onto PATH (issue #3907)`,
+      );
+      assert.match(
+        text,
+        /HOME=\/tmp\/uzi-chromium-wrap-home \\\n\s+timeout \d+ \/usr\/local\/bin\/uzi-chromium\b[^\n]*--dump-dom/,
+        `${name}/Dockerfile build guard must launch the wrapper headless (--dump-dom) under a throwaway HOME, exit-bounded (issue #3907)`,
+      );
+      assert.match(
+        text,
+        /AGENT_BROWSER_EXECUTABLE_PATH=\/usr\/local\/bin\/uzi-chromium \\\n\s+AGENT_BROWSER_IDLE_TIMEOUT_MS=\d+ \\\n\s+timeout \d+ agent-browser --session \S+ open about:blank/,
+        `${name}/Dockerfile build guard must open about:blank via agent-browser THROUGH the wrapper (issue #3907)`,
+      );
+      assert.match(
+        text,
+        /\[ ! -e \/tmp\/uzi-chromium-wrap-home \][\s\S]*\[ ! -e "\$HOME\/\.uzi-chromium" \][\s\S]*\[ ! -e "\$HOME\/\.uzi-agent-browser" \]/,
+        `${name}/Dockerfile build guard must assert no wrapper/shim state was baked (issue #3907)`,
+      );
+      assert.ok(
+        text.indexOf("chmod -R a+rX /nix") > text.search(/timeout \d+ \/usr\/local\/bin\/uzi-chromium\b/),
+        `${name}/Dockerfile must run the /nix store-perm chmod AFTER the wrapper launch in the build guard (issue #3907)`,
+      );
+
       // BUG 1 (issue #114): the build guard launches chromium AS ROOT, which creates its
       // bundled `libexec/chromium/extensions` dir root:root 0700 inside the read-only nix
       // store — AFTER `chown -R worker:runner /nix` — and the non-root (uid 10001) seed-nix

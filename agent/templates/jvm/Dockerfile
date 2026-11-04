@@ -228,8 +228,10 @@ RUN if command -v fc-cache >/dev/null 2>&1; then fc-cache -f || true; fi
 # never a raw /nix/store path), --no-sandbox (mandatory under PRD #51 hardening) +
 # --disable-dev-shm-usage (64MB /dev/shm), and an idle timeout so a wedged daemon self-closes.
 # The SDK hands the agent a SPARSE env (sdk-env.ts REPLACES it), so these baked vars do NOT
-# reach the agent's Bash tool alone — the shim below re-establishes them; kept here for the
-# worker/build context, the build guard, and the documented contract. MIRRORED from base.
+# reach the agent's Bash tool alone — the shim below re-establishes them. Since issue #3907 the
+# agent command env additionally carries AGENT_BROWSER_EXECUTABLE_PATH / CHROME_PATH pointing
+# at the /usr/local/bin/uzi-chromium wrapper; the image ENV below keeps the RAW toolchain path
+# for the worker/build context and the build guard. MIRRORED from base.
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/opt/uzi-toolchain/bin/chromium
 ENV AGENT_BROWSER_ARGS="--no-sandbox,--disable-dev-shm-usage"
 ENV AGENT_BROWSER_IDLE_TIMEOUT_MS=60000
@@ -247,6 +249,12 @@ ENV AGENT_BROWSER_IDLE_TIMEOUT_MS=60000
 # by agent/templates/entrypoint.sh exporting UZI_RUNNER_PATH = the untouched image PATH on
 # BOTH branches — see the shim header for the full account. MIRRORED from base.
 COPY --chmod=0755 agent/bin/agent-browser /usr/local/bin/agent-browser
+
+# Issue #3907: launch wrapper for the prebaked Chromium. The agent command env points
+# AGENT_BROWSER_EXECUTABLE_PATH / CHROME_PATH at it (not at the raw toolchain binary) so any
+# browser launch gets --no-sandbox, --disable-dev-shm-usage, a writable run-private XDG dir
+# and a per-invocation profile. Root-owned 0755. MIRRORED in the other template.
+COPY --chmod=0755 agent/bin/uzi-chromium /usr/local/bin/uzi-chromium
 
 # Fail-closed BUILD guard: the image FAILS to build if agent-browser does not resolve, the
 # baked CLI is missing OR cannot RUN, OR an exit-bounded headless Chromium launch fails. The
@@ -274,13 +282,24 @@ RUN command -v agent-browser \
     && timeout 90 "$AGENT_BROWSER_EXECUTABLE_PATH" \
         --headless --no-sandbox --disable-dev-shm-usage \
         --user-data-dir=/tmp/uzi-chromium-buildcheck --dump-dom about:blank >/dev/null \
+    && mkdir -p /tmp/uzi-chromium-wrap-home \
+    && HOME=/tmp/uzi-chromium-wrap-home \
+        timeout 90 /usr/local/bin/uzi-chromium --headless --dump-dom about:blank >/dev/null \
     && HOME=/tmp/uzi-ab-home AGENT_BROWSER_IDLE_TIMEOUT_MS=2000 \
         timeout 90 agent-browser --session uzi-buildcheck open about:blank >/dev/null \
     && HOME=/tmp/uzi-ab-home AGENT_BROWSER_IDLE_TIMEOUT_MS=2000 \
         timeout 30 agent-browser --session uzi-buildcheck close >/dev/null \
+    && HOME=/tmp/uzi-ab-home AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/uzi-chromium \
+        AGENT_BROWSER_IDLE_TIMEOUT_MS=2000 \
+        timeout 90 agent-browser --session uzi-buildcheck-wrap open about:blank >/dev/null \
+    && HOME=/tmp/uzi-ab-home AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/uzi-chromium \
+        AGENT_BROWSER_IDLE_TIMEOUT_MS=2000 \
+        timeout 30 agent-browser --session uzi-buildcheck-wrap close >/dev/null \
     && sleep 4 \
-    && rm -rf /tmp/uzi-chromium-buildcheck /tmp/uzi-ab-fake-glibc /tmp/uzi-agent-browser-0 /tmp/uzi-ab-home \
-    && [ ! -e "$HOME/.agent-browser" ] && [ ! -e /tmp/uzi-ab-home ]
+    && rm -rf /tmp/uzi-chromium-buildcheck /tmp/uzi-ab-fake-glibc /tmp/uzi-ab-home /tmp/uzi-chromium-wrap-home \
+    && [ ! -e "$HOME/.agent-browser" ] && [ ! -e /tmp/uzi-ab-home ] \
+    && [ ! -e /tmp/uzi-chromium-wrap-home ] \
+    && [ ! -e "$HOME/.uzi-chromium" ] && [ ! -e "$HOME/.uzi-agent-browser" ]
 
 # BUG 1 (issue #114) store-perm normalization — MIRRORED from templates/base (jvm is NOT
 # `FROM base`; keep in lockstep). MUST run AFTER the build guard above, not after the earlier
