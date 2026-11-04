@@ -65,9 +65,9 @@ week is further away, because its allowance carries on.
 - **Concentration.** `reset_first` deliberately concentrates work on the
   soonest-expiring token until it falls under the floor. The in-flight penalty
   only breaks exact weekly-reset ties for `auto` picks, so a burst of claims
-  inside one poll interval (for example a sweep firing several issues) lands on
-  the one soonest-expiring token, which ends up just above the floor. Expect more mid-run usage-limit parks and
-  resumes than under `headroom_first`.
+  inside one poll interval (for example a sweep firing several issues) all lands
+  on the soonest-expiring token, even when it sits just above the floor. Expect
+  more mid-run usage-limit parks and resumes than under `headroom_first`.
 - **Knob semantics.** For `auto` picks under `reset_first`,
   `UZI_AUTOSELECT_HEADROOM_TIE_PCT` is ignored and
   `UZI_AUTOSELECT_INFLIGHT_PENALTY` only breaks exact reset ties. Both keep
