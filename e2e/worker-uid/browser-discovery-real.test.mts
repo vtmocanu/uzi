@@ -33,6 +33,35 @@ import { WorkerMemoryCommands } from "../../agent/src/worker-memory-commands.js"
 // the Claude case clears it to scan the real procfs and puts it back afterwards.
 import { restoreHermeticView } from "../../agent/test/setup/hermetic-proc.js";
 
+// Independent scan of the REAL procfs (no hermetic view): a live process whose real uid is the given
+// uid and whose comm or argv[0] basename looks like a browser. Polled up to settleMs before failing.
+const BROWSER_NAME = /chrom|agent-browser|crashpad/i;
+function browserProcesses(uid: number): string[] {
+  const found: string[] = [];
+  for (const entry of fs.readdirSync("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const status = fs.readFileSync(`/proc/${entry}/status`, "utf8");
+      const real = /^Uid:\s+(\d+)/m.exec(status);
+      if (!real || Number(real[1]) !== uid) continue;
+      if (/^State:\s+Z/m.test(status)) continue; // a zombie is not a live process
+      const comm = fs.readFileSync(`/proc/${entry}/comm`, "utf8").trim();
+      const argv0 = path.basename(fs.readFileSync(`/proc/${entry}/cmdline`, "utf8").split("\0")[0] ?? "");
+      if (BROWSER_NAME.test(comm) || BROWSER_NAME.test(argv0)) found.push(`${entry}:${comm}:${argv0}`);
+    } catch { /* the process exited while being read */ }
+  }
+  return found;
+}
+async function assertNoBrowserProcesses(uid: number, settleMs = 5000): Promise<void> {
+  const deadline = Date.now() + settleMs;
+  let found = browserProcesses(uid);
+  while (found.length > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    found = browserProcesses(uid);
+  }
+  assert.deepEqual(found, [], `browser processes still live for uid ${String(uid)} (independent procfs scan)`);
+}
+
 // Required inventory must reject a skipped run: only the production worker with the split
 // runner identity, the image supervisor and the unmasked /nix can supply this evidence.
 const INIT_SKIP = process.platform !== "linux" || process.getuid?.() !== 10001 ||
@@ -132,7 +161,7 @@ async function modelCall(lane: ClaudeCommandLane, cwd: string, command: string) 
 }
 
 describe("real browser discovery under the worker identities", { skip: INIT_SKIP }, () => {
-  it("launches Chromium and agent-browser from the exported discovery paths in the Claude lane and leaves no browser process behind", { timeout: 240_000 }, async () => {
+  it("launches Chromium and agent-browser from the exported discovery paths in the Claude lane and leaves no browser process behind", { timeout: 200_000 }, async () => {
     // A worker-owned 0777 run dir, created the way claude-command-real creates its rigs; the
     // runner uid writes the HOME state and the screenshots into it.
     const dir = fs.mkdtempSync(path.join("/tmp", "uzi-browser-real-"));
@@ -216,6 +245,8 @@ describe("real browser discovery under the worker identities", { skip: INIT_SKIP
           errors.push(new Error(`browser processes survived the lane: ${JSON.stringify(own.process)}`));
         }
       } catch (error) { errors.push(error); } finally { restoreHermeticView(); }
+      // Independent of the helpers above: scan the real procfs for any live runner-uid browser.
+      try { await assertNoBrowserProcesses(10002); } catch (error) { errors.push(error); }
     }
     try {
       // The runner made the HOME state and the shots; remove them as the runner, then the dir.
@@ -225,7 +256,7 @@ describe("real browser discovery under the worker identities", { skip: INIT_SKIP
     if (errors.length > 0) throw errors.length === 1 ? errors[0] : new AggregateError(errors, "browser lane proof and cleanup failures");
   });
 
-  it("launches Chromium from the exported discovery paths in an off-mode Codex command and closes the registry cleanly", { timeout: 180_000 }, async () => {
+  it("launches Chromium from the exported discovery paths in an off-mode Codex command and closes the registry cleanly", { timeout: 150_000 }, async () => {
     // The production fixture for real worker-uid clone dirs: a worker-owned, runner-group 3775 root
     // that it removes again as each real uid.
     const { runnerTeardownFixture } = await import("../../agent/test/runner-teardown-fixtures.js");
@@ -271,6 +302,8 @@ describe("real browser discovery under the worker identities", { skip: INIT_SKIP
           errors.push(new Error(`terminal disposal was not accepted: ${JSON.stringify(disposed)}`));
         }
       } catch (error) { errors.push(error); }
+      // Independent real-procfs scan for any live command-uid browser after the close sequence.
+      try { await assertNoBrowserProcesses(10003); } catch (error) { errors.push(error); }
       if (errors.length > 0) throw errors.length === 1 ? errors[0] : new AggregateError(errors, "codex lane proof and cleanup failures");
     });
   });

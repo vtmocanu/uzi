@@ -206,8 +206,11 @@ fi
 # exact name), cleanup verifies its label, and the container is journaled after it so the container
 # is removed first. Otherwise the same posture as worker-proof: root-started through the real
 # entrypoint, the same five capabilities and no others, no-new-privileges, no network.
-# Deadline: 420s capture / 415s watchdog covers populating /nix on first mount plus two tests
-# (each at most 240s and 180s by its own timeout, in practice a few Chromium launches).
+# Deadline: 600s capture / 595s watchdog. On first mount Docker copies the image's /nix into the volume
+# (measured 138 s for a 4.1 GB, 181,971-entry store on one host, with a du/find) and the entrypoint
+# then runs a recursive chown over the copied store on first boot (estimated 150-250 s for both). The two
+# leaves' own timeouts (200 s and 150 s) sum to 350 s, so 595 s holds up to 245 s of copy-up plus chown
+# with both leaves running to their full timeouts.
 browser_rc=0
 browser_checker_rc=0
 browser_name="$NAME-browser"
@@ -218,8 +221,8 @@ if browser_receipt=$(phase browser-volume timeout --kill-after=5s 5s docker volu
    && [ "$browser_receipt" = "$browser_volume" ] \
    && phase browser-volume-owner python3 "$REPO/e2e/worker-uid/bounded.py" verify-volume "$REPORT_DIR" "$TOKEN" "$browser_volume"; then
   owned_request container "$browser_name"
-  phase browser-proof capture "$REPORT_DIR/browser-results.xml" 420 \
-    timeout --kill-after=5s 415s docker run --pull never --network none \
+  phase browser-proof capture "$REPORT_DIR/browser-results.xml" 600 \
+    timeout --kill-after=5s 595s docker run --pull never --network none \
     --label "io.uzi.worker-uid.invocation=$TOKEN" --name "$browser_name" --cap-drop ALL \
     --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
     --security-opt no-new-privileges --tmpfs /data --mount "type=volume,src=$browser_volume,dst=/nix" --workdir /proof \
@@ -231,7 +234,7 @@ if browser_receipt=$(phase browser-volume timeout --kill-after=5s 5s docker volu
     --mount "type=bind,src=$REPO/agent/templates,dst=/app/uzi-worker-uid-proof/agent/templates,readonly" \
     --entrypoint /usr/local/sbin/uzi-entrypoint "$IMAGE" \
     /usr/local/bin/node --import /app/node_modules/tsx/dist/loader.mjs --import /app/uzi-worker-uid-proof/e2e/worker-uid/image-layout.mjs --import /app/uzi-worker-uid-proof/agent/test/setup/hermetic-proc.ts \
-    --test --test-concurrency=1 --test-timeout=240000 --test-reporter=junit \
+    --test --test-concurrency=1 --test-timeout=200000 --test-reporter=junit \
     --test-name-pattern "$BROWSER_PATTERN" \
     /app/uzi-worker-uid-proof/e2e/worker-uid/browser-discovery-real.test.mts || browser_rc=$?
   python3 e2e/worker-uid/check.py "$REPORT_DIR/browser-expected.json" "$REPORT_DIR/browser-results.xml" || browser_checker_rc=$?

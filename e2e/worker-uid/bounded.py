@@ -12,6 +12,12 @@ import time
 REPORT_BYTES = 8 * 1024 * 1024
 METADATA_BYTES = 64 * 1024
 LABEL = "io.uzi.worker-uid.invocation"
+# Issue #3907: the browser lane's named /nix volume is populated from the image's /nix (a 4.1 GB,
+# ~182,000-entry store measured on a dev host), and `docker volume rm` of that populated volume took
+# 8.8 s there. Only the volume removal gets this larger per-call bound; inspect and container/image
+# removals keep min(10, remaining). The overall cleanup deadline is extended by the same amount.
+VOLUME_RM_SECONDS = 120
+CLEANUP_BASE_SECONDS = 29
 
 
 def signal_group(proc, sig):
@@ -127,7 +133,8 @@ def owned(kind, name, token, directory, seconds=10, expected=None):
 
 
 def cleanup(directory, token):
-    deadline = time.monotonic() + 29  # Reserve one second for scheduling and process reaping.
+    # Reserve one second for scheduling and process reaping; one volume removal may use VOLUME_RM_SECONDS.
+    deadline = time.monotonic() + CLEANUP_BASE_SECONDS + VOLUME_RM_SECONDS
     failures = []
     journal = directory / "attempted"
     # Only requests recorded before creation are inspected, including lost ACKs.
@@ -150,7 +157,7 @@ def cleanup(directory, token):
                 raise ValueError("cleanup deadline exhausted")
             args = (["image", "rm", "--no-prune", handle] if kind == "image" else
                     ["volume", "rm", handle] if kind == "volume" else ["rm", "-f", "--volumes", handle])
-            docker(args, directory, min(10, remaining))
+            docker(args, directory, min(VOLUME_RM_SECONDS if kind == "volume" else 10, remaining))
         except (OSError, ValueError, KeyError, TypeError) as exc:
             failures.append(str(exc))
     if failures:

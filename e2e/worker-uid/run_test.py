@@ -20,7 +20,9 @@ SCRATCH = HARNESS.parents[1] / ".uzi/scratch"
 # on a stuck token script, check_test.py, inventory.mjs/pattern.mjs or check.py call: those carry no
 # deadline of their own and the timeout stub does not enforce seconds. Only the docker calls are
 # bounded by run.sh's own phase deadlines, which the tests assert.
-RUN_SH_LIMIT = 20
+# Issue #3907: the browser-proof phase adds a container + volume per invocation; a lane took ~9-11 s
+# under host load 6 on 4 cores (vs ~8 s before), and three subtests tripped a 20 s guard there.
+RUN_SH_LIMIT = 40
 # Test-only: when WUID_LANE_TIMING names a file, each run.sh wall time is recorded and the max and
 # p95 are written there at the end of the module. Off by default.
 LANE_TIMES = []
@@ -158,6 +160,27 @@ class ToolImageTest(unittest.TestCase):
                     else:
                         bounded.cleanup(directory, token)
                         self.assertEqual(docker.call_args.args[0], ["image", "rm", "--no-prune", image_id])
+
+
+    def test_volume_removal_gets_the_larger_bound_only(self):
+        token = "1" * 32
+        container, image = "c" * 64, "sha256:" + "b" * 64
+        cases = [("volume", "wuid-nix", ["volume", "rm", "wuid-nix"], bounded.VOLUME_RM_SECONDS),
+                 ("container", container, ["rm", "-f", "--volumes", container], 10),
+                 ("image", image, ["image", "rm", "--no-prune", image], 10)]
+        for kind, name, rm_args, bound in cases:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                directory = Path(directory)
+                (directory / "attempted").write_text(f"{kind} {name}\n")
+                with mock.patch.object(bounded, "owned", return_value=name), \
+                     mock.patch.object(bounded, "docker", return_value=b"") as docker:
+                    bounded.cleanup(directory, token)
+                self.assertEqual(docker.call_args.args[0], rm_args)
+                # remaining is nearly the whole extended deadline, so the call's own bound is what shows.
+                self.assertEqual(docker.call_args.args[2], bound)
+
+    def test_cleanup_deadline_covers_a_volume_removal(self):
+        self.assertGreaterEqual(bounded.CLEANUP_BASE_SECONDS + bounded.VOLUME_RM_SECONDS, 29 + 120)
 
 
 class CaptureTest(unittest.TestCase):
@@ -347,9 +370,11 @@ operation = args[3]
 if operation == "run":
     name = args[args.index("--name") + 1]
     if name.endswith("-provision"): assert 0 < seconds <= 5, args
-    else: assert seconds == (415 if name.endswith(("-shared", "-browser")) else 115 if name.endswith("-command") else 65 if "-single-" in name else 7), args
+    else: assert seconds == (415 if name.endswith("-shared") else 595 if name.endswith("-browser") else 115 if name.endswith("-command") else 65 if "-single-" in name else 7), args
 elif operation == "build":
     assert (0 < seconds < 20) if "--builder" in args else seconds == 60, args
+elif operation == "volume" and args[4] == "rm":
+    assert seconds == 115, args  # bounded.VOLUME_RM_SECONDS (120) less the five-second kill grace
 else:
     assert 0 < seconds <= 5, args
 import signal
@@ -359,7 +384,7 @@ rc = proc.wait(timeout=5)
 key = "TIMEOUT_RC" if operation == "run" and seconds == 7 else (
     "COMMAND_TIMEOUT_RC" if operation == "run" and seconds == 115 else (
     ("BROWSER_TIMEOUT_RC" if name.endswith("-browser") else "SHARED_TIMEOUT_RC")
-    if operation == "run" and seconds == 415 else ""))
+    if operation == "run" and seconds in (415, 595) else ""))
 if operation == "run" and seconds == 65:
     cfg = json.loads(os.environ["SINGLE"]).get(args[args.index("--name") + 1].rsplit("-", 1)[1], {})
     if cfg.get("timeout"):
@@ -626,7 +651,7 @@ sys.exit(rc)
             "--import", "/app/uzi-worker-uid-proof/e2e/worker-uid/image-layout.mjs",
             "--import", "/app/uzi-worker-uid-proof/agent/test/setup/hermetic-proc.ts",
         ])
-        self.assertIn("--test-timeout=240000", call)
+        self.assertIn("--test-timeout=200000", call)
         self.assertIn("--test-reporter=junit", call)
         self.assertEqual(call[call.index("--test-name-pattern") + 1], "^browser leaf$")
         self.assertEqual(call[-1], "/app/uzi-worker-uid-proof/e2e/worker-uid/browser-discovery-real.test.mts")

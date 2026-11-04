@@ -229,12 +229,24 @@ rendered:
   `AGENT_BROWSER_SOCKET_DIR` is set.
 - Codex lane (no claim about agent-browser): the production `makeDefaultSpawnCommand` over the real
   `launchCodexEffectRoot`, with `buildCommandEnv(..., browserDiscovery = true)` and sandbox mode `off`, runs a
-  shell command as uid 10003 in a runner-group 2770 clone dir made by `runnerTeardownFixture`. The test closes the
+  shell command as uid 10003 in a runner-group 2770 worktree that the test makes inside the 3775 root made by `runnerTeardownFixture`. The test closes the
   registry the supported way (`quiesceChildren`, `reapProcesses` must be `observed_empty`, `disposeTools` must be
   accepted by `acceptsTerminalDisposal` and the registry must not be poisoned).
 
-The container gets a 415-second watchdog plus five-second kill grace (420 seconds): populating `/nix` on first
-mount plus a few real Chromium launches, with each leaf bounded by its own timeout (240 and 180 seconds).
+The container gets a 595-second watchdog plus five-second kill grace (600 seconds). On first mount Docker
+copies the image's `/nix` into the named volume (measured 138 seconds for a 4.1 GB, 181,971-entry store on one
+host, including a du/find), and the entrypoint runs a recursive `chown` over the copied store on first boot
+(estimated 150 to 250 seconds together). The leaves' own timeouts are 200 and 150 seconds (350 seconds), so the
+watchdog holds up to 245 seconds of copy-up plus chown with both leaves running to their full timeouts.
+Both leaves also scan the real procfs after their cleanup checks for any live process of the runner (10002) or
+command (10003) uid whose `comm` or `argv[0]` basename matches `chrom`, `agent-browser` or `crashpad`, polling
+up to five seconds before failing.
+
+Cleanup of the multi-GB `<name>-nix` volume is bounded separately: `bounded.py` gives only the `volume rm` call
+`VOLUME_RM_SECONDS` (120 seconds; removal measured 8.8 seconds for that store) and extends the overall cleanup
+deadline by the same amount; container and image removals keep their 10-second bound. A hard kill (SIGKILL) of
+`run.sh` skips the cleanup trap and can leave the browser container and that volume behind: the `attempted`
+journal under the report directory names them, so remove them by exact name (never a prefix or glob sweep).
 
 `task test:worker-uid-harness` runs the Docker-free checker, shell wrapper and
 required-check regression tests. The wrapper tests stub Node inventory/pattern,
