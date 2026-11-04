@@ -21,6 +21,10 @@ ORDER BY scope, name;
 -- and maps an unauthorized user-scope row to 404 so existence never leaks.
 SELECT * FROM agent_templates WHERE id = $1;
 
+-- name: GetAgentTemplateForUpdate :one
+-- Lock the current row before merging omitted pins and deciding customized.
+SELECT * FROM agent_templates WHERE id = $1 FOR UPDATE;
+
 -- name: GetAgentTemplateForViewer :one
 -- Single-template read with the same visibility rule as ListAgentTemplatesForViewer.
 SELECT * FROM agent_templates
@@ -40,8 +44,8 @@ SELECT * FROM agent_templates WHERE name = $1 AND scope <> 'user';
 -- Create a global (admin) or user (owner) template. scope='builtin' is never
 -- created here (is_builtin stays false, kept in lockstep by the builtin_scope_ck);
 -- builtins are seeded only by the startup reconciler (InsertBuiltinAgentTemplate).
-INSERT INTO agent_templates (name, description, model, tools, prompt_body, scope, user_id, updated_by)
-VALUES (@name, @description, @model, @tools, @prompt_body, @scope, @user_id, @updated_by)
+INSERT INTO agent_templates (name, description, model, codex_model, tools, prompt_body, scope, user_id, updated_by)
+VALUES (@name, @description, @model, @codex_model, @tools, @prompt_body, @scope, @user_id, @updated_by)
 RETURNING *;
 
 -- name: UpdateAgentTemplate :one
@@ -58,6 +62,7 @@ RETURNING *;
 UPDATE agent_templates
 SET description = @description,
     model = @model,
+    codex_model = @codex_model,
     tools = @tools,
     prompt_body = @prompt_body,
     updated_by = @updated_by,
@@ -86,6 +91,7 @@ RETURNING *;
 UPDATE agent_templates
 SET description = @description,
     model = @model,
+    codex_model = @codex_model,
     tools = @tools,
     prompt_body = @prompt_body,
     updated_by = @updated_by,
@@ -113,8 +119,8 @@ DELETE FROM agent_templates WHERE id = @id AND is_builtin = false;
 -- marks it as owned by the shipped default (PRD #602 M1), so RefreshPristineBuiltin
 -- can keep tracking it; without it a freshly-seeded builtin would have NULL origin
 -- and violate agent_templates_origin_ck.
-INSERT INTO agent_templates (name, description, model, tools, prompt_body, is_builtin, scope, origin)
-VALUES (@name, @description, @model, @tools, @prompt_body, true, 'builtin', 'embedded')
+INSERT INTO agent_templates (name, description, model, codex_model, tools, prompt_body, is_builtin, scope, origin)
+VALUES (@name, @description, @model, @codex_model, @tools, @prompt_body, true, 'builtin', 'embedded')
 ON CONFLICT (name) WHERE scope <> 'user' DO NOTHING;
 
 -- name: ApplySyncedOverrideBuiltin :one
@@ -127,6 +133,7 @@ ON CONFLICT (name) WHERE scope <> 'user' DO NOTHING;
 UPDATE agent_templates
 SET description = @description,
     model = @model,
+    codex_model = @codex_model,
     tools = @tools,
     prompt_body = @prompt_body,
     origin = 'synced',
@@ -142,8 +149,8 @@ RETURNING *;
 -- scope='global'). is_builtin stays false to satisfy builtin_scope_ck. The caller
 -- seeds a default allocation (SeedSharedTemplateAllocationByName) right after so the
 -- role actually reaches a claim — table presence alone does not run it.
-INSERT INTO agent_templates (name, description, model, tools, prompt_body, is_builtin, scope, origin, updated_by)
-VALUES (@name, @description, @model, @tools, @prompt_body, false, 'global', 'synced', @updated_by)
+INSERT INTO agent_templates (name, description, model, codex_model, tools, prompt_body, is_builtin, scope, origin, updated_by)
+VALUES (@name, @description, @model, @codex_model, @tools, @prompt_body, false, 'global', 'synced', @updated_by)
 RETURNING *;
 
 -- name: UpdateSyncedGlobalTemplate :one
@@ -155,6 +162,7 @@ RETURNING *;
 UPDATE agent_templates
 SET description = @description,
     model = @model,
+    codex_model = @codex_model,
     tools = @tools,
     prompt_body = @prompt_body,
     updated_by = @updated_by,
@@ -187,9 +195,10 @@ DELETE FROM agent_templates WHERE name = @name AND scope = 'global' AND origin =
 UPDATE agent_templates
 SET description = @description,
     model = @model,
+    codex_model = @codex_model,
     tools = @tools,
     prompt_body = @prompt_body,
     updated_at = now()
 WHERE name = @name AND scope = 'builtin' AND customized = false AND origin = 'embedded'
-  AND (description, model, tools, prompt_body)
-      IS DISTINCT FROM (@description, @model, @tools, @prompt_body);
+  AND (description, model, codex_model, tools, prompt_body)
+      IS DISTINCT FROM (@description, @model, @codex_model, @tools, @prompt_body);

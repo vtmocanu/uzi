@@ -10,8 +10,8 @@ import (
 	"strings"
 )
 
-// Definition is the render-time shape of an agent template: exactly the fields
-// that determine the subagent Markdown. It is intentionally independent of the
+// Definition is the content of an agent template, including per-harness pins.
+// Render emits its Claude Markdown representation. It is independent of the
 // store row so Render carries no pgtype/uuid baggage.
 type Definition struct {
 	Name string
@@ -24,6 +24,8 @@ type Definition struct {
 	// Model is the model alias or full ID. Empty means inherit — the rendered
 	// frontmatter omits the model line.
 	Model string
+	// CodexModel is the Codex pin; Claude Markdown deliberately omits it.
+	CodexModel string
 	// Tools is the allowlist. Empty means inherit all — the rendered
 	// frontmatter omits the tools line.
 	Tools []string

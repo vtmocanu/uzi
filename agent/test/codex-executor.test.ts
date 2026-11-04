@@ -68,7 +68,7 @@ import { resolveRunKind } from "../src/run-kind.js";
 import { GitCache, assertCaptureLaunch } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
-import { makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
+import { leadRequestCaseAgents, makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
 import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
@@ -28737,6 +28737,77 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
     return {};
   };
   const waitForRows = (posts: unknown[], n: number) => waitFor(() => posts.length >= n, `${n} lead-config rows`);
+
+  it("every codex request_case of the shared matrix is what the executor actually sends and reports", async () => {
+    const contract = JSON.parse(readFileSync(
+      new URL("../../fixtures/lead-config/contract.json", import.meta.url), "utf8",
+    )) as { request_cases: Array<{
+      id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig;
+      templateModel?: string; agents?: Array<{ name: string; model?: string | null }>;
+      providerDefaultModel?: string; expect: import("../src/lead-config-report.js").LeadRequest;
+    }> };
+    const cases = contract.request_cases.filter((c) => c.harness === "codex");
+    assert.equal(cases.length, 16, "all Codex request cases loaded");
+    const visited: string[] = [];
+    const phases = new Set<string>();
+    for (const c of cases) {
+      const { posts, reporter } = reporterRig(c.config);
+      const fields = reported(c.expect.model!, c.expect.effort ?? "medium");
+      const planEpoch: Responder = (call) => {
+        if (call.method === "thread/start" || call.method === "thread/resume") {
+          return { thread: { id: "th-plan" } };
+        }
+        if (call.method === "turn/start") {
+          call.transport.push(threadStarted("th-plan"))
+            .push(toolCall(1, "submit_plan", { plan_md: "PLAN" }, "th-plan", "tn-plan", "c-plan"))
+            .push(turnCompleted("completed", "th-plan", "tn-plan"));
+          return { turn: { id: "tn-plan" } };
+        }
+        return {};
+      };
+      const planPhase = c.phase === "plan";
+      const rig = makeMultiEpochRig(planPhase ? [
+        reporting(planEpoch, fields),
+        reporting(resumedEpochResponder("th-plan", "tn-impl", doneFrames), fields),
+      ] : [reporting(resumedEpochResponder("th-1", "tn-1", doneFrames), fields)]);
+      const { ctx } = makeCtx({
+        agents: leadRequestCaseAgents(c), config: c.config, leadConfig: reporter,
+        ...(planPhase ? {
+          planApproved: false, approvedPlan: undefined, gatePlan: async () => approve,
+        } : {}),
+      });
+      await withTimeout(makeExecutor(
+        rig, bindingOf(SUBSCRIPTION), noopLog, undefined,
+        { ...provider, model: c.providerDefaultModel! },
+      ).run(ctx), 5000, `${c.id}: shared request case`);
+      const phaseEpochs = planPhase ? rig.epochs.slice(0, 1) : rig.epochs;
+      const turns = phaseEpochs.flatMap((e) => e.transport.requests.filter((r) => r.method === "turn/start"));
+      assert.ok(turns.length > 0, `${c.id}: ${c.phase} turn sent`);
+      for (const t of turns) {
+        assert.equal(rec(t.params).model, c.expect.model, `${c.id}: sent model`);
+        assert.equal(rec(t.params).effort, c.expect.effort, `${c.id}: sent effort`);
+      }
+      const phasePosts = posts.filter((p) => p.phase === c.phase);
+      if (leadConfigActive(c.config)) {
+        assert.ok(phasePosts.length > 0, `${c.id}: requested report posted`);
+        for (const p of phasePosts) {
+          assert.deepEqual(
+            [p.requested_model, p.requested_model_source, p.requested_effort, p.requested_effort_mode, p.requested_effort_source],
+            [c.expect.model ?? null, c.expect.modelSource, c.expect.effort ?? null, c.expect.effortMode, c.expect.effortSource],
+            `${c.id}: requested report`,
+          );
+        }
+      } else {
+        assert.equal(reporter.enabled, false, c.id);
+        assert.equal(posts.length, 0, `${c.id}: old claims stay inactive`);
+      }
+      phases.add(c.phase);
+      visited.push(c.id);
+    }
+    assert.deepEqual(visited, cases.map((c) => c.id));
+    assert.equal(visited.length, 16);
+    assert.deepEqual([...phases].sort(), ["implement", "plan"]);
+  });
 
   it("a pre-approved run records the requested row, then the runtime row, matching what was sent", async () => {
     const { posts, reporter, rows } = reporterRig(ACTIVE);

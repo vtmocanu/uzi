@@ -126,10 +126,12 @@ func (h *Handler) crossCheckPinSettings(ctx context.Context, userID uuid.UUID) (
 		}
 		resolved := agenttmpl.ResolveCrossCheck(row.Harness, model, effort,
 			textPtrValue(workerModel.Valid, workerModel.String),
-			textPtrValue(row.TemplateModel.Valid, row.TemplateModel.String))
+			textPtrValue(row.TemplateModel.Valid, row.TemplateModel.String),
+			textPtrValue(row.TemplateCodexModel.Valid, row.TemplateCodexModel.String))
 		workerDefault := agenttmpl.ResolveCrossCheck(row.Harness, nil, nil,
 			textPtrValue(workerModel.Valid, workerModel.String),
-			textPtrValue(row.TemplateModel.Valid, row.TemplateModel.String))
+			textPtrValue(row.TemplateModel.Valid, row.TemplateModel.String),
+			textPtrValue(row.TemplateCodexModel.Valid, row.TemplateCodexModel.String))
 		cells = append(cells, crossCheckPinDTO{Stage: row.Stage, Harness: row.Harness, WorkerDefaultModel: workerDefault.Model,
 			Model: model, Effort: effort, ResolvedModel: resolved.Model, ResolvedEffort: resolved.Effort,
 			ModelSource: resolved.ModelSource, EffortSource: resolved.EffortSource, Active: true})

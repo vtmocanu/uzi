@@ -15,12 +15,13 @@ import (
 const getCrossCheckPinSnapshot = `-- name: GetCrossCheckPinSnapshot :one
 SELECT cc.stage, cc.checker_harness, p.model, p.effort,
     u.default_claude_model, u.default_codex_model, u.default_effort, u.default_codex_effort,
-    template.model AS template_model
+    template.model AS template_model,
+    template.codex_model AS template_codex_model
 FROM cross_checks cc JOIN runs child ON child.id = cc.checker_run_id
 JOIN users u ON u.id = child.user_id
 LEFT JOIN user_cross_check_pins p ON p.user_id = child.user_id AND p.stage = cc.stage AND p.harness = cc.checker_harness
 LEFT JOIN LATERAL (
-    SELECT t.model FROM agent_templates t
+    SELECT t.model, t.codex_model FROM agent_templates t
     LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = u.id
     LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
     WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = u.id))
@@ -53,6 +54,7 @@ type GetCrossCheckPinSnapshotRow struct {
 	DefaultEffort      pgtype.Text `json:"default_effort"`
 	DefaultCodexEffort pgtype.Text `json:"default_codex_effort"`
 	TemplateModel      pgtype.Text `json:"template_model"`
+	TemplateCodexModel pgtype.Text `json:"template_codex_model"`
 }
 
 // Returns BOTH families' worker-default lanes so the caller picks the CHECKER's family
@@ -79,6 +81,7 @@ func (q *Queries) GetCrossCheckPinSnapshot(ctx context.Context, arg GetCrossChec
 		&i.DefaultEffort,
 		&i.DefaultCodexEffort,
 		&i.TemplateModel,
+		&i.TemplateCodexModel,
 	)
 	return i, err
 }
@@ -86,11 +89,12 @@ func (q *Queries) GetCrossCheckPinSnapshot(ctx context.Context, arg GetCrossChec
 const listUserCrossCheckPins = `-- name: ListUserCrossCheckPins :many
 SELECT cells.stage, cells.harness, p.model, p.effort,
     u.default_claude_model, u.default_codex_model, u.default_effort, u.default_codex_effort,
-    template.model AS template_model
+    template.model AS template_model,
+    template.codex_model AS template_codex_model
 FROM users u CROSS JOIN (SELECT 'plan'::text AS stage, 'claude'::text AS harness UNION ALL SELECT 'plan', 'codex' UNION ALL SELECT 'code', 'claude' UNION ALL SELECT 'code', 'codex') cells
 LEFT JOIN user_cross_check_pins p ON p.user_id = u.id AND p.stage = cells.stage AND p.harness = cells.harness
 LEFT JOIN LATERAL (
-    SELECT t.model FROM agent_templates t
+    SELECT t.model, t.codex_model FROM agent_templates t
     LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = u.id
     LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
     WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = u.id))
@@ -114,6 +118,7 @@ type ListUserCrossCheckPinsRow struct {
 	DefaultEffort      pgtype.Text `json:"default_effort"`
 	DefaultCodexEffort pgtype.Text `json:"default_codex_effort"`
 	TemplateModel      pgtype.Text `json:"template_model"`
+	TemplateCodexModel pgtype.Text `json:"template_codex_model"`
 }
 
 // Read all four stage-local cells, pins and worker defaults in one statement snapshot.
@@ -136,6 +141,7 @@ func (q *Queries) ListUserCrossCheckPins(ctx context.Context, userID uuid.UUID) 
 			&i.DefaultEffort,
 			&i.DefaultCodexEffort,
 			&i.TemplateModel,
+			&i.TemplateCodexModel,
 		); err != nil {
 			return nil, err
 		}

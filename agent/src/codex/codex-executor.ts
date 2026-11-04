@@ -143,7 +143,7 @@ import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
 import { resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
-import { selectSubagentTemplates } from "../agents.js";
+import { ownSubagentTemplates, selectLeadTemplate, selectSubagentTemplates } from "../agents.js";
 import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
 import type { CommandSandboxMode } from "../config.js";
 
@@ -6503,13 +6503,14 @@ export class CodexExecutor implements Executor {
   }
 
   /** PRD #3244: the lead's requested model/effort for a phase, from the one worker resolver. Pure in
-   *  (ctx.config, provider model), so the request built per turn and the row reported at the phase
+   *  (ctx.config, owner roster, provider model), so the request built per turn and the row reported at the phase
    *  entry cannot differ. */
   private leadRequestFor(ctx: RunContext, phase: "plan" | "implement"): LeadRequest {
     return resolveLeadRequest({
       harness: "codex",
       phase,
       config: ctx.config,
+      templateModel: selectLeadTemplate(ctx.agents ?? [])?.model ?? undefined,
       providerDefaultModel: this.opts.provider.model,
     });
   }
@@ -6524,27 +6525,20 @@ export class CodexExecutor implements Executor {
     repoInstructions?: string,
     ownerCompletionRecheck = false,
   ): RunTurnRequest {
-    let leadBody: string | undefined;
+    const leadBody = selectLeadTemplate(ctx.agents ?? [])?.prompt_body;
     const agents: Record<string, HarnessAgent> = {};
     let repoSourced = false;
     if (phase === "plan") {
       // The plan phase is deliberately independent of the selection: it runs before the human
       // approves one, with the owner's roster, exactly as before issue #1718.
-      for (const t of ctx.agents ?? []) {
-        // The lead is the ROOT thread, not a subagent — its body seeds the lead system
-        // prompt; every other template is a delegation target.
-        if (t.name === "lead") {
-          leadBody = t.prompt_body;
-          continue;
-        }
+      for (const t of ownSubagentTemplates(ctx.agents ?? [])) {
         agents[t.name] = toHarnessAgent(t);
       }
     } else {
       if (!selection) throw new TrustedExecutionRefusal("codex implement request built without a resolved agent selection");
       repoSourced = selection.source === "repo";
-      // The lead body is ALWAYS the owner's `lead` template (uzi's builtin) under either source;
-      // a repo file named `lead` is only ever a subagent (selectSubagentTemplates).
-      leadBody = (ctx.agents ?? []).find((t) => t.name === "lead")?.prompt_body;
+      // The root body always comes from the selected owner lead. Every repo template,
+      // including lead-shaped names, stays a subagent (selectSubagentTemplates).
       const repoSkills = repoSourced ? (ctx.skills ?? []).map((s) => s.name) : undefined;
       for (const t of implementTemplates(ctx, selection)) agents[t.name] = toHarnessAgent(t, repoSkills);
       // Every implement request, including replacement and continuation prompts,
@@ -6608,7 +6602,7 @@ export class CodexExecutor implements Executor {
       signal,
       // Honor the SERVER-RESOLVED per-run/schedule model (owner default or PRD #300 schedule
       // freeze) that the api already harness-validated against the closed Codex set and shipped on
-      // the claim; fall back to the fixed provider default when the claim carries none. render.ts's
+      // the claim; otherwise use the selected valid owner pin, then the provider default. render.ts's
       // resolveModel re-validates request.model downstream and codex-harness.ts's
       // `rendered.lead.model ?? this.provider.model` supplies the same default for an out-of-set value.
       model: leadRequest.model!,

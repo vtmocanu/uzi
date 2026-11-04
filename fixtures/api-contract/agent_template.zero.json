@@ -3,6 +3,7 @@
   "name": "",
   "description": "",
   "model": null,
+  "codex_model": null,
   "tools": null,
   "prompt_body": "",
   "is_builtin": false,

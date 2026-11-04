@@ -151,22 +151,22 @@ function AgentSourceStagedReview({
               )}
               {isOpen && role && (
                 <div className="border-t border-edge px-3 py-2">
-                  {(role.description || role.model || (role.tools && role.tools.length > 0)) && (
-                    <dl className="mb-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
-                      {role.description && (
-                        <>
-                          <dt className="text-faint">Description</dt>
-                          <dd className="text-muted">{role.description}</dd>
-                        </>
-                      )}
-                      <dt className="text-faint">Model</dt>
-                      <dd className="text-muted">{role.model || templateModelDefaultLabel(role.name)}</dd>
-                      <dt className="text-faint">Tools</dt>
-                      <dd className="font-mono text-muted">
-                        {role.tools && role.tools.length > 0 ? role.tools.join(", ") : "inherit all"}
-                      </dd>
-                    </dl>
-                  )}
+                  <dl className="mb-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+                    {role.description && (
+                      <>
+                        <dt className="text-faint">Description</dt>
+                        <dd className="text-muted">{role.description}</dd>
+                      </>
+                    )}
+                    <dt className="text-faint">Claude model</dt>
+                    <dd className="text-muted">{role.claude_model || templateModelDefaultLabel(role.name, "claude")}</dd>
+                    <dt className="text-faint">Codex model</dt>
+                    <dd className="text-muted">{role.codex_model || templateModelDefaultLabel(role.name, "codex")}</dd>
+                    <dt className="text-faint">Tools</dt>
+                    <dd className="font-mono text-muted">
+                      {role.tools && role.tools.length > 0 ? role.tools.join(", ") : "inherit all"}
+                    </dd>
+                  </dl>
                   {/* prompt_body is ALREADY server-sanitized (termsafe.SanitizeTTY) — a
                       plain text node, never dangerouslySetInnerHTML. */}
                   <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-lg border border-edge bg-ink console p-3 text-xs text-muted">

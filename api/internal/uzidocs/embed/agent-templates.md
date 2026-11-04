@@ -7,8 +7,8 @@ audience: user
 # Agent templates
 
 An agent template defines one role an agent can play: a name, a
-one-sentence description, an optional model override, an optional tools
-allowlist, and a system prompt body. Manage them from **Agents**.
+one-sentence description, an optional model pin for each harness, an optional
+tools allowlist, and a system prompt body. Manage them from **Agents**.
 
 ## Scopes
 
@@ -34,10 +34,10 @@ source's `api/internal/agenttmpl/library/manifest.json`), so their generic role
 text is the same as in a plain Claude Code agent team. uzi adds its runtime
 rules and, for `fact-checker`, its forge tools on top (both explained below):
 
-| Name | Model | What it does |
+| Name | Claude pin | What it does |
 |---|---|---|
 | `lead` | `opus` | Plans the task, delegates, and drives the run through the approval gate. |
-| `coder` | `opus` | Implements features, fixes bugs, refactors code. |
+| `coder` | `sonnet` | Implements features, fixes bugs, refactors code. |
 | `reviewer` | `opus` | Reviews code changes for correctness, style, and edge cases. |
 | `auditor` | `opus` | Audits code for security vulnerabilities and unsafe patterns. |
 | `tester` | `opus` | Validates changes against representative real-world inputs, authoring and extending tests as part of the implementation phase. |
@@ -49,18 +49,73 @@ rules and, for `fact-checker`, its forge tools on top (both explained below):
 | `web-ux` | `opus` | Validates web interfaces in a real browser (agent-browser), reviewing UX, accessibility, and visual consistency; reports findings only. |
 | `ux-designer` | `opus` | Sets opinionated visual and information-architecture direction, then builds and browser-validates the frontend/UI; owns the design layer and defers backend logic to the coder. |
 
-A template with no model set shows a **Default · …** label naming where its
-model comes from: `Default · SDK/account default (built-in)` for the `lead`
-(or orchestrator) and `Default · lead's model` for subagents. This appears in
-the list, the detail page, the editor, the builtin diff and the agent-source
-review. In the `lead` editor, a note says a user's worker model (**Settings →
-Run defaults**) overrides the template's model for their own runs.
+The table lists the shipped Claude pins; shipped builtin Codex pins are empty.
+The lead is the orchestrator: the main agent thread. Both harnesses select
+the first delivered own template whose name is exactly `lead` or
+`orchestrator`, case-insensitively, preserving delivered order. All own
+templates with either name are withheld from the subagent roster, including
+later matches. Repo-sourced templates, including a repo `lead`, remain
+ordinary subagents; they do not replace the root.
 
-The `lead` is the orchestrator: the main agent thread. It runs on `opus`
-by default unless you set a personal override in
-[Worker model](./worker-model.md). Editing a template's prompt only tunes
-its persona and workflow; the primary-directive guardrails (never touch
-`main`, no `git push`, the plan gate) are enforced by the worker regardless.
+For run model settings, see [Worker model](./worker-model.md). Editing a
+template's prompt only tunes its persona and workflow; the primary-directive
+guardrails (never touch `main`, no `git push`, the plan gate) are enforced by
+the worker regardless.
+
+The list and detail page name both harnesses, for example **Claude: sonnet ·
+Codex: gpt-6-sol**. Empty pins use the same honest **Default · …** labels in the
+editor, builtin diff and agent-source review:
+
+- Subagents: **Default · lead's model** for either harness.
+- Lead (or orchestrator), Claude: **Default · SDK/account default (built-in)**.
+- Lead (or orchestrator), Codex: **Default · built-in (gpt-6.1-sol)**.
+
+Your worker model (**Settings → Run defaults**) takes precedence over the
+matching lead-template pin for your runs.
+
+## Model pins
+
+A template stores two independent pins: `model` is the **Claude pin**, and
+`codex_model` is the **Codex pin**. A run receives the pin for its own harness.
+For a subagent, an empty pin follows the model the run resolved for the lead.
+The schedule's model takes precedence over your worker-model lane, then the
+selected lead template's pin for the run's harness. An empty lead pin falls
+back to the SDK/account default for Claude or `gpt-6.1-sol` for Codex. The
+shipped lead has a Claude pin of `opus` and an empty Codex pin.
+
+A subagent's own pin for the run's harness takes precedence over following
+the resolved root unless the schedule's **Apply model also to agents** is
+set; then subagents follow the resolved root too. The lead's Codex fallback
+needs a worker from this release; older Codex workers use the built-in
+provider model when no higher-priority setting applies. See
+[Model precedence](./worker-model.md#model-precedence) for rollout and the
+pending hosted validation.
+
+Save-time rules apply to builtin, global and personal templates:
+
+- The Claude pin accepts aliases such as `opus` and `sonnet` and custom model
+  IDs, except the five supported Codex role IDs below. Model IDs must satisfy
+  the shared syntax rules (at most 100 bytes, no control or format characters).
+- The Codex pin accepts `gpt-5.6-sol`, `gpt-6-astra`, `gpt-6-luna`,
+  `gpt-6-sol` and `gpt-6.1-sol`. Other IDs, including custom Codex IDs and
+  Claude aliases, are rejected.
+- JSON `null` or a blank string clears a pin. Omitting `codex_model` on create
+  leaves it empty; omitting it on update preserves the stored Codex pin.
+  Invalid pins return HTTP 400 naming `model` or `codex_model`.
+
+For example, a template with `model: sonnet` and `codex_model: gpt-6-sol`
+delivers `sonnet` on a Claude run and `gpt-6-sol` on a Codex run. Claim delivery
+also filters stored values by harness, so a misplaced Codex role ID in the
+Claude column is omitted rather than sent to Claude.
+
+On upgrade, the migration moves recognized Codex role IDs already stored in
+`model` into `codex_model` and clears `model`. Surrounding whitespace is trimmed
+when recognizing those IDs; other stored model values are left unchanged.
+
+Use **Claude model** and **Codex model** to edit the pins independently.
+Claude's **Other (custom model ID)…** option accepts custom IDs; Codex offers
+only the five role IDs above. The editor warns and blocks Save for a pin in
+the wrong family. See the [approved PRD](../prds/3249-per-harness-template-pins.md).
 
 The builtin `fact-checker` also gets six `mcp__forge__*` read tools, so it
 alone can read the run's own forge (issues, merge requests, pipelines, label
@@ -153,11 +208,14 @@ with a `shadowed` badge). Delete and recreate it under a different name to use i
 
 1. Open **Agents**, click **New agent** (or a template's name to edit).
 2. Pick the scope (admins only — yours is always **Mine**), then set the
-   name (kebab-case, immutable after creation), description, and prompt
-   body; optionally override the model or restrict its tools.
-3. The detail page shows a live preview of the rendered Markdown.
+   name (kebab-case, immutable after creation), description, and prompt body.
+3. Optionally set **Claude model** and **Codex model**, or restrict tools.
+   Leave either harness on **Default** so a subagent follows the lead on that
+   harness. **Apply model also to agents** on a schedule overrides these pins.
+4. The live Markdown preview exports the Claude definition, including its
+   Claude pin. The Codex pin is saved separately.
 
-![Editing an agent template, with the rendered Markdown preview alongside](img/agent-templates-editor.png)
+![Creating an agent template with both harness pins and the Claude Markdown preview](img/agent-templates-editor.png)
 
 Never paste a credential into a description or prompt: uzi rejects anything
 that looks like a real Anthropic token. Credentials belong in
@@ -182,16 +240,18 @@ role library a uzi version ships is the release commit pinned as `upstream_sha` 
 **Reset** it, so customizations remain durable across upgrades.
 
 Editing a builtin marks it customized and opts it out of that automatic
-tracking until it is reset. Saving it with exactly the shipped description,
-model, tools and body is not an edit: the template stays pristine and keeps
-tracking shipped changes. **Reset to default** returns a builtin to pristine: it re-applies
-the shipped body *and* re-enables tracking, so the template picks up future
-shipped changes on boot again.
+tracking until it is reset. Changing either model pin counts as a customization:
+setting a Codex pin also stops shipped prompt refreshes until **Reset**.
+Saving it with exactly the shipped description, both model pins, tools and body
+is not an edit: the template stays pristine and keeps tracking shipped changes.
+**Reset to default** returns a builtin to pristine: it re-applies the shipped
+content, including the Claude pin and the empty Codex pin, and re-enables
+tracking, so the template picks up future shipped changes on boot again.
 
 A **differs from shipped** badge on the Agents list and on a builtin's
 detail page tells you when a **customized** builtin's stored description,
-model, tools, or prompt body no longer matches what this uzi version ships for
-it. (A pristine builtin refreshes on boot, so it already matches and carries
+Claude pin, Codex pin, tools, or prompt body no longer matches what this uzi
+version ships for it. (A pristine builtin refreshes on boot, so it already matches and carries
 no badge.) Open the template before resetting: the editor shows exactly what's
 different, so you're not resetting blind.
 
