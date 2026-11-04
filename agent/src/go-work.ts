@@ -296,7 +296,8 @@ async function removeInto(home: string, opts: GoWorkRemovalOptions, result: GoWo
     let seen = 0;
     try {
       for await (const ent of dir) {
-        if (seen >= maxEntries) {
+        // An expired deadline stops the enumeration too (incomplete, so not clean).
+        if (seen >= maxEntries || Date.now() >= opts.deadline) {
           result.truncated = true;
           break;
         }

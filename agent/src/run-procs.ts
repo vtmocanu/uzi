@@ -235,7 +235,7 @@ function hasGotmpdir(buf) {
         const rest = v.slice(gotmpRoot.length);
         const slash = rest.indexOf("/");
         const leaf = slash === -1 ? rest : rest.slice(0, slash);
-        if (/^g[1-9][0-9]{0,15}$/.test(leaf)) return true;
+        if (/^g[1-9][0-9]{0,15}$/.test(leaf) && Number.isSafeInteger(Number(leaf.slice(1)))) return true;
       }
     }
     i += 1;

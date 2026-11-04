@@ -263,6 +263,27 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     await rmtree.rmHomeTree(home);
   });
 
+  // Issue #3870: a runner-owned `.uzi-go-work` is a parent the worker must refuse, never repair.
+  it("a runner-owned Go work parent is refused by prepareManagedGoWork and left unrepaired (#3870)", async () => {
+    const gowork = await load<typeof import("../../agent/src/go-work.js")>("go-work.ts");
+    const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000003871");
+    await fs.mkdir(home);
+    await fs.chmod(home, 0o2775);
+    asRunner(`set -e; mkdir "$1/.uzi-go-work"; chmod 2770 "$1/.uzi-go-work"`, home);
+    const parent = path.join(home, ".uzi-go-work");
+    const before = await fs.lstat(parent);
+
+    const r = await gowork.prepareManagedGoWork(home, 5, silentLog as never);
+    assert.deepEqual(r, { skipped: true, reason: "parent_refused" });
+
+    const after = await fs.lstat(parent);
+    assert.equal(after.uid, before.uid, "no chown");
+    assert.equal(after.gid, before.gid, "no chown");
+    assert.equal(after.mode & 0o7777, before.mode & 0o7777, "no chmod repair");
+    asRunner(`set -e; test -z "$(ls -A "$1/.uzi-go-work")"`, home);
+    await rmtree.rmHomeTree(home);
+  });
+
   it("the startup reclaim removes only API-confirmed-terminal HOMEs", async () => {
     const terminal = await makeLeakedHome("00000000-0000-4000-8000-00000000000a", 0o2770);
     const running = await makeLeakedHome("00000000-0000-4000-8000-00000000000b", 0o2770);

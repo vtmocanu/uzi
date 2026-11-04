@@ -348,14 +348,51 @@ describe("removeGoWorkLeaves", () => {
     assert.ok(isGoWorkClean(b.r));
   });
 
-  it("a deadline already passed skips every selected leaf and is not clean", async (t) => {
+  it("a deadline already passed stops the enumeration, removes nothing and is not clean", async (t) => {
     if (noProcFd) return t.skip(NO_PROC_FD);
     await prepareParent();
     await seedLeaves([1, 2]);
     const { r } = await run({ kind: "all" }, { deadline: Date.now() - 1 });
-    assert.deepStrictEqual(r, { parent: "ok", removed: [], absent: [], failed: [], skipped: ["g1", "g2"], truncated: false });
+    assert.deepStrictEqual(r.removed, []);
+    assert.strictEqual(r.truncated, true);
     assert.strictEqual(isGoWorkClean(r), false);
-    assert.ok(existsSync(path.join(parentDir(), "g1")), "nothing removed");
+    assert.deepStrictEqual((await fs.readdir(parentDir())).sort(), ["g1", "g2"], "nothing removed");
+  });
+
+  it("a deadline that expires during the enumeration is truncated, not clean, and removes nothing past it", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    await prepareParent();
+    await seedLeaves([1, 2, 3]);
+    const deadline = Date.now() + 150;
+    const { r } = await run(
+      { kind: "all" },
+      {
+        deadline,
+        opendir: async () => ({
+          async *[Symbol.asyncIterator]() {
+            yield { name: "g1" };
+            while (Date.now() < deadline) await new Promise((res) => setTimeout(res, 20));
+            yield { name: "g2" };
+            yield { name: "g3" };
+          },
+          close: async () => undefined,
+        }),
+      },
+    );
+    assert.strictEqual(r.truncated, true);
+    assert.strictEqual(isGoWorkClean(r), false);
+    assert.ok(!r.removed.includes("g2") && !r.removed.includes("g3"), "nothing enumerated after expiry is removed");
+    assert.ok(existsSync(path.join(parentDir(), "g2")) && existsSync(path.join(parentDir(), "g3")));
+  });
+
+  it("an expired deadline with an empty parent or an absent parent stays clean", async (t) => {
+    if (noProcFd) return t.skip(NO_PROC_FD);
+    const absent = await run({ kind: "all" }, { deadline: Date.now() - 1 });
+    assert.ok(isGoWorkClean(absent.r));
+    await prepareParent();
+    const empty = await run({ kind: "all" }, { deadline: Date.now() - 1 });
+    assert.strictEqual(empty.r.truncated, false);
+    assert.ok(isGoWorkClean(empty.r));
   });
 
   it("a symlink parent is refused, not clean, and its target is untouched", async (t) => {

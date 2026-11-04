@@ -314,11 +314,32 @@ describe("run process attribution (PRD #1809 D4)", () => {
         [`GOTMPDIR=${runHome}/.uzi-go-work/`],
         [`GOTMPDIR=${runHome}/.uzi-go-work-x/g1`],
         [`GOTMPDIR=${runHome}/g1/x`],
+        [`GOTMPDIR=${runHome}/.uzi-go-work/g9007199254740993`], // above MAX_SAFE_INTEGER
+        [`GOTMPDIR=${runHome}/.uzi-go-work/g9999999999999999`],
       ];
       cases.forEach((env, i) => fake(4700 + i, { env: ["HOME=/elsewhere", ...env], cwd: "/tmp" }));
       const r = await scan();
       assert.deepStrictEqual(r.pids, []);
       assert.strictEqual(r.complete, true);
+    });
+
+    it("the largest safe-integer generation is still attributed", async () => {
+      fake(4650, { env: ["HOME=/elsewhere", `GOTMPDIR=${runHome}/.uzi-go-work/g9007199254740991`], cwd: "/tmp" });
+      const r = await scan();
+      assert.deepStrictEqual(r.pids, [4650]);
+    });
+
+    it("the reap does not kill a process whose GOTMPDIR generation is not a safe integer", async () => {
+      const cs = [spawn("sleep", ["30"], { detached: true, stdio: "ignore" }), spawn("sleep", ["30"], { detached: true, stdio: "ignore" })];
+      children.push(...cs);
+      fake(cs[0]!.pid!, { env: ["HOME=/elsewhere", `GOTMPDIR=${runHome}/.uzi-go-work/g9007199254740993`], cwd: "/tmp" });
+      fake(cs[1]!.pid!, { env: ["HOME=/elsewhere", `GOTMPDIR=${runHome}/.uzi-go-work/g9999999999999999/go-build1`], cwd: "/tmp" });
+      const r = await reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 1 });
+      assert.deepStrictEqual(r.killed, []);
+      for (const c of cs) {
+        assert.strictEqual(c.exitCode, null);
+        assert.strictEqual(c.signalCode, null);
+      }
     });
 
     it("the reap SIGKILLs a GOTMPDIR-attributed process", async () => {
