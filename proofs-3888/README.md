@@ -34,3 +34,9 @@ Handler legs name the `/http1` and `/http2` subtests (and the BodyReadErrorMappi
 parent failure on one protocol cannot stand in for both. Agent legs run `npm run typecheck` after the patch is
 applied, so a mutant that breaks the production typecheck fails its leg. `proofs-3888/transport-probe.test.ts`
 is a CI-only probe with one test per undici timeout. Full per-leg logs are uploaded as `proof-log-<leg>` artifacts.
+
+`proofs-3888/verdict.sh` holds the verdict logic and `proofs-3888/run_parser_test.sh` feeds it synthetic logs as the
+first step of every leg: a skipped or TODO sibling, a late Go panic, fatal error or test timeout anywhere in the log,
+and a cancellation each fail the verdict, while a normal expected-failure log still passes. A TAP `# SKIP` or `# TODO`
+directive never counts as a pass (PASS_NAMES and candidate mode), and a Go log holding any `panic:`, `fatal error:` or
+`test timed out after` credits no failure.
