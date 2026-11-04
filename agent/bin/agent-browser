@@ -52,8 +52,9 @@
 #  M4 (launch config, the actual M0 fix): the worker hands the SDK a SPARSE, allowlisted env
 #  — agent/src/sdk-env.ts REPLACES the subprocess environment entirely — so the AGENT_BROWSER_*
 #  / FONTCONFIG_FILE ENV baked in the Dockerfile do NOT reach the agent's Bash tool by
-#  themselves. Since issue #3907 the agent command env does carry AGENT_BROWSER_EXECUTABLE_PATH
-#  (and CHROME_PATH) pointing at the uzi-chromium wrapper (agent/bin/uzi-chromium); the `:=`
+#  themselves. Since issue #3907 the Claude-lane command env, and the Codex command env when the
+#  worker's command sandbox mode is `off`, carry AGENT_BROWSER_EXECUTABLE_PATH (and CHROME_PATH)
+#  pointing at the uzi-chromium wrapper (agent/bin/uzi-chromium); the `:=`
 #  defaults below yield to it, so agent-browser launches Chromium through the wrapper. This
 #  shim, which DOES run on the agent PATH, still re-establishes the rest as DEFAULTS (respecting any
 #  value the caller already set) right before exec, so agent-browser launches the prebaked
@@ -63,7 +64,8 @@
 #  fonts (FONTCONFIG_FILE), and auto-closes an idle daemon so a wedged daemon can't silently
 #  no-op corrected launch options (M0 secondary). Delivering these via the shim scopes them
 #  to the agent-browser process (and its Chromium child) rather than widening the
-#  deliberately-minimal agent env, and needs no change to sdk-env.ts.
+#  deliberately-minimal agent env (sdk-env.ts carries only AGENT_BROWSER_ARGS and, since
+#  issue #3907, the two discovery paths).
 set -eu
 
 # The baked npm JS launcher — since issue #1082 the FALLBACK exec target, behind the direct

@@ -229,7 +229,7 @@ RUN if command -v fc-cache >/dev/null 2>&1; then fc-cache -f || true; fi
 # --disable-dev-shm-usage (64MB /dev/shm), and an idle timeout so a wedged daemon self-closes.
 # The SDK hands the agent a SPARSE env (sdk-env.ts REPLACES it), so these baked vars do NOT
 # reach the agent's Bash tool alone — the shim below re-establishes them. Since issue #3907 the
-# agent command env additionally carries AGENT_BROWSER_EXECUTABLE_PATH / CHROME_PATH pointing
+# Claude-lane command env (and the Codex one under commandSandbox off) also carries AGENT_BROWSER_EXECUTABLE_PATH / CHROME_PATH pointing
 # at the /usr/local/bin/uzi-chromium wrapper; the image ENV below keeps the RAW toolchain path
 # for the worker/build context and the build guard. MIRRORED from base.
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/opt/uzi-toolchain/bin/chromium
@@ -250,7 +250,7 @@ ENV AGENT_BROWSER_IDLE_TIMEOUT_MS=60000
 # BOTH branches — see the shim header for the full account. MIRRORED from base.
 COPY --chmod=0755 agent/bin/agent-browser /usr/local/bin/agent-browser
 
-# Issue #3907: launch wrapper for the prebaked Chromium. The agent command env points
+# Issue #3907: launch wrapper for the prebaked Chromium. The Claude-lane command env (and the Codex one under commandSandbox off) points
 # AGENT_BROWSER_EXECUTABLE_PATH / CHROME_PATH at it (not at the raw toolchain binary) so any
 # browser launch gets --no-sandbox, --disable-dev-shm-usage, a writable run-private XDG dir
 # and a per-invocation profile. Root-owned 0755. MIRRORED in the other template.

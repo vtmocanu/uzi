@@ -42,7 +42,7 @@ afterEach(() => {
 });
 
 describe("buildSdkEnv", () => {
-  it("contains only the OAuth token, HOME, PATH, AGENT_BROWSER_ARGS, TMPDIR (plus explicitly-unset ANTHROPIC_*)", () => {
+  it("contains only the OAuth token, HOME, PATH, AGENT_BROWSER_ARGS, the browser discovery paths, TMPDIR (plus explicitly-unset ANTHROPIC_*)", () => {
     const env = buildSdkEnv(FAKE_OAUTH, HOME_DIR);
 
     assert.strictEqual(env.CLAUDE_CODE_OAUTH_TOKEN, FAKE_OAUTH);

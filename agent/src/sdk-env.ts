@@ -41,7 +41,8 @@ const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   "AGENT_BROWSER_ARGS",
   // Issue #3907: the browser discovery paths (AGENT_BROWSER_EXECUTABLE_PATH, CHROME_PATH),
   // worker-set to the uzi-chromium wrapper after the fold below; a provisioned var can
-  // never redirect discovery to an unwrapped Chromium.
+  // never redirect discovery to an unwrapped Chromium. Defence in depth: the post-fold
+  // assignment alone already wins; this keeps the guarantee if that ever becomes conditional.
   ...Object.keys(BROWSER_DISCOVERY_ENV),
   // Non-secret, worker-owned path to the immutable verified sqlc archive cache.
   "UZI_SQLC_DIR",

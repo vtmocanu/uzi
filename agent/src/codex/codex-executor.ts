@@ -7603,9 +7603,9 @@ export function commandSandboxArgv(
  *     CHROME_PATH (the uzi-chromium wrapper) are set after the fold. The caller passes true
  *     only when the worker's command sandbox mode is `off`. Under `required` discovery is
  *     not advertised: Chromium was observed failing under the enforced Landlock policy
- *     (/proc and /sys are not granted). Under `best-effort` it is not advertised either:
- *     whether Landlock applies depends on the kernel at command time, which this builder
- *     cannot know, so Chromium might run where best-effort ends up unconfined.
+ *     (/proc and /sys are not granted). Under `best-effort` it is not advertised either, by
+ *     design, even on a Landlock-less (degraded, unconfined) kernel where Chromium might run:
+ *     discovery is advertised only for the mode whose launch the worker-uid proof covers.
  *   - issue #1716: a `toolEnv` entry can NEVER inject git config (GIT_CONFIG_COUNT,
  *     GIT_CONFIG_KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS); run() adds the worker's own
  *     trust afterwards ({@link withCommandGitTrust}).
