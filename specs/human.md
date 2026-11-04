@@ -480,7 +480,9 @@ Tracked as GitLab issue vtmocanu/uzi#46; PRD at `prds/done/46-run-judge-self-imp
   so a person needs to be able to see it. [user 2026-07-25]
 - A dedicated `cost_efficiency` judge recommendation category: surface quality-first
   cost-efficiency findings — recommend cost cuts only where they don't reduce
-  correctness, verification depth, or code quality. [user 2026-08-15]
+  correctness, verification depth, or code quality. [user 2026-08-15] It also covers
+  wall-clock time (the same outcome in less elapsed time, under the same quality
+  safeguards), and the UI labels it "Efficiency". (AI-synced 2026-11-04)
 - `cost_efficiency` is triage-only: it does NOT feed the self-improvement job.
   [user 2026-08-15]
 - **Judge and Findings share one triage row and one vocabulary** (File issue · Mark done · Dismiss ▾ at equal weight; the open state is "To triage" everywhere; filed is "Filed #N"); Findings shows each coordinate's evidence and the runs it was seen in, counted tabs, multi-select with undo, and a filed finding becomes Done when its issue closes on the forge; a person can also mark a finding done (from To triage, Filed or Dismissed) with the judge's disposition semantics, and Undo exposes Filed or To triage. [user 2026-09-07] (AI-synced 2026-09-26)
