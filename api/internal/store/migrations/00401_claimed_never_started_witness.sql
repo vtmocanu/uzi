@@ -90,15 +90,16 @@ BEGIN
 END
 $$;
 -- +goose StatementEnd
--- Terminal rows (an owner Cancel leaves the cause set) carry a cause the prior CHECK rejects and
--- that no longer describes a live wait: clear it. Nothing is relabelled; the run, its claim and
--- its custody holds are untouched.
+-- Any row still carrying the cause (an owner Cancel or a later terminal write leaves it set; the
+-- guard above leaves no live recovery_wait park, and no CHECK ties the cause to a status) holds a
+-- value the prior CHECK rejects and that no longer describes a live wait: clear it. Nothing is
+-- relabelled; the run, its claim and its custody holds are untouched.
 UPDATE runs SET recovery_wait_cause = NULL
-WHERE recovery_wait_cause = 'retained_continuation_unwitnessed'
-  AND status IN ('completed', 'failed', 'cancelled');
--- The extra observation keys are not representable by the prior check: drop them first.
+WHERE recovery_wait_cause = 'retained_continuation_unwitnessed';
+-- The extra observation keys are not representable by the prior check: drop them first, on a row
+-- carrying any one of the four (not only presence).
 UPDATE runs SET worker_recovery_evidence = worker_recovery_evidence - ARRAY['presence','registration_evidence_epoch','worker_snapshot_epoch','deadline']
-WHERE worker_recovery_evidence ? 'presence';
+WHERE worker_recovery_evidence ?| ARRAY['presence','registration_evidence_epoch','worker_snapshot_epoch','deadline'];
 ALTER TABLE runs DROP CONSTRAINT runs_worker_recovery_evidence_check;
 ALTER TABLE runs ADD CONSTRAINT runs_worker_recovery_evidence_check CHECK (
     worker_recovery_evidence IS NULL OR (

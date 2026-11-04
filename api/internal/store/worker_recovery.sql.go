@@ -1100,11 +1100,16 @@ WHERE workers.id IN (SELECT DISTINCT claimed.worker_id FROM runs claimed
                      WHERE claimed.status = 'claimed' AND claimed.claimed_at < $1
                        AND claimed.worker_id IS NOT NULL)
 ORDER BY workers.id
-FOR UPDATE
+FOR NO KEY UPDATE
 `
 
 // Step 1 of the claimed-never-started cohort: lock (id order) the workers that own a claimed run
 // older than the cutoff, BEFORE any run row, so the lock order is workers, runs, cross_checks.
+// FOR NO KEY UPDATE, not FOR UPDATE: it still conflicts with FOR UPDATE / FOR NO KEY UPDATE (snapshot
+// apply, register, claim and the other worker-lost sweeps stay serialised) but not with the FOR KEY
+// SHARE that a runs UPDATE takes on its worker via the runs.worker_id FK. A running report holding a
+// run row lock and updating it a second time would otherwise deadlock (40P01) against this cohort
+// waiting on that run.
 func (q *Queries) LockClaimedNeverStartedWorkers(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, lockClaimedNeverStartedWorkers, cutoff)
 	if err != nil {

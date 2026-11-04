@@ -35,8 +35,14 @@ func migration00401DownSQL(t *testing.T) string {
 // leaves the run cancelled and its custody hold untouched, restores the pre-00401 CHECK and
 // fn_custody_attention, and drops the witness columns. Every Down runs in a rolled-back tx.
 func TestClaimedNeverStartedWitnessRollbackLiveDB(t *testing.T) {
-	f := newAdmissionFixture(t, 1)
+	f := newAdmissionFixture(t, 2)
 	run := f.runs[0]
+	// A second row carrying observation keys but NOT presence: the Down must strip it too, or the
+	// narrowed CHECK rejects it.
+	partial := f.runs[1]
+	f.exec(`UPDATE runs SET worker_recovery_evidence = jsonb_build_object('checkpoint_tip', NULL, 'available_capture', false,
+ 'publication_uncertain', false, 'capture_uncertain', false, 'custody_uncertain', false, 'unknown', false,
+ 'recorded_at', '2026-11-04T10:00:00Z', 'worker_snapshot_epoch', 3, 'deadline', '2026-11-04T11:00:00Z') WHERE id=$1`, partial)
 	f.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='retained_continuation_unwitnessed', recovery_retry_not_before=now()+interval '1 hour', claim_generation=2 WHERE id=$1", run)
 	down := migration00401DownSQL(t)
 
@@ -138,8 +144,10 @@ func TestClaimedNeverStartedWitnessRollbackLiveDB(t *testing.T) {
 		t.Fatalf("rows relabelled retained_recovery_exhausted = %d (%v), want 0", exhausted, err)
 	}
 	var evKeys bool
-	if err := tx.QueryRow(f.ctx, "SELECT worker_recovery_evidence ?| ARRAY['presence','registration_evidence_epoch','worker_snapshot_epoch','deadline'] FROM runs WHERE id=$1", run).Scan(&evKeys); err != nil || evKeys {
-		t.Fatalf("observation keys survived the Down: %v (%v)", evKeys, err)
+	for name, id := range map[string]any{"presence row": run, "row without presence": partial} {
+		if err := tx.QueryRow(f.ctx, "SELECT worker_recovery_evidence ?| ARRAY['presence','registration_evidence_epoch','worker_snapshot_epoch','deadline'] FROM runs WHERE id=$1", id).Scan(&evKeys); err != nil || evKeys {
+			t.Fatalf("%s: observation keys survived the Down: %v (%v)", name, evKeys, err)
+		}
 	}
 	if got := attention("retained_continuation_unwitnessed"); got != "archive_ready" {
 		t.Fatalf("Down attention for the new cause = %s, want archive_ready (function restored)", got)
