@@ -75,8 +75,9 @@ type Order string
 const (
 	// OrderResetFirst picks the soonest WEEKLY reset among eligible tokens, so
 	// weekly allowance that is about to expire unused gets spent first. It is the
-	// default because Claude and Codex pools now report only a weekly window, which
-	// makes "most headroom" a poor proxy for "most wasted if left alone".
+	// default because the weekly window is the one Claude and Codex subscriptions
+	// always report (often the only one), which makes "most headroom" a poor proxy
+	// for "most wasted if left alone".
 	OrderResetFirst Order = "reset_first"
 	// OrderHeadroomFirst is the pre-#3844 ranking (most headroom, then the
 	// reset tie-break within HeadroomTiePct), kept as an escape hatch.
@@ -88,8 +89,10 @@ const (
 // future refinement, not a gap.
 type Policy struct {
 	// Order selects the ranking. Any value other than OrderHeadroomFirst, including
-	// the zero value, means OrderResetFirst. Under reset_first HeadroomTiePct is
-	// ignored and InflightPenalty only breaks exact weekly-reset ties.
+	// the zero value, means OrderResetFirst. Under reset_first, for ReasonAuto picks,
+	// HeadroomTiePct is ignored and InflightPenalty only breaks exact weekly-reset
+	// ties; a best_of_pool pick keeps the headroom ranking (tie band and penalty) under
+	// either order.
 	Order Order
 	// MinHeadroom is the floor, in percentage POINTS, below which a token is not
 	// picked by preference. The gauge is a SMALLINT 0..100, so the unit is points

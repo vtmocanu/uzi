@@ -270,7 +270,8 @@ type Config struct {
 	// AutoselectHeadroomTiePct is M4's clustering tolerance T: under headroom_first,
 	// tokens within this many points of the emptiest are treated as tied and broken by
 	// soonest reset. Default 5. 0 means "only an exact tie counts", which is a coherent
-	// policy. Ignored under reset_first (#3844), which ranks by weekly reset instead.
+	// policy. Under reset_first (#3844) it is ignored for ReasonAuto picks, which rank
+	// by weekly reset; best_of_pool still clusters with it under either order.
 	AutoselectHeadroomTiePct int
 	// AutoselectMaxStaleness bounds how old a gauge reading may be and still steer a
 	// choice — steering on numbers Anthropic has since moved past is worse than not
@@ -288,14 +289,16 @@ type Config struct {
 	// AutoselectInflightPenalty is M4's herd control: points subtracted from a
 	// token's ranking headroom per run currently spending it, so several claims
 	// inside one poll interval do not all pile onto the same emptiest credential.
-	// Default 3. 0 disables the bias. Under reset_first (#3844) it only breaks exact
-	// weekly-reset ties; under headroom_first it shifts the headroom ranking.
+	// Default 3. 0 disables the bias. Under reset_first (#3844) a ReasonAuto pick uses
+	// it only to break exact weekly-reset ties; under headroom_first, and for
+	// best_of_pool under either order, it shifts the headroom ranking.
 	AutoselectInflightPenalty int
 	// AutoselectOrder is how the eligible set is ranked (UZI_AUTOSELECT_ORDER, #3844):
-	// "reset_first" (default) picks the soonest weekly reset, because Claude and Codex
-	// pools now report only a weekly window; "headroom_first" is the earlier
-	// most-headroom ranking. Under reset_first HeadroomTiePct is ignored. An unknown
-	// value falls back to reset_first with a boot warning.
+	// "reset_first" (default) picks the soonest weekly reset among tokens at or above
+	// the floor, because the weekly window is the one Claude and Codex subscriptions
+	// always report; "headroom_first" is the earlier most-headroom ranking. Under
+	// reset_first HeadroomTiePct is ignored for those picks (best_of_pool keeps the
+	// headroom ranking). An unknown value falls back to reset_first with a boot warning.
 	AutoselectOrder autoselect.Order
 	// UsageProbe enables the ~1-token Messages header probe fallback (PRD #53 D2).
 	// Default true; false makes users the free usage endpoint refuses show

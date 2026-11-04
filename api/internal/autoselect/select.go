@@ -122,7 +122,8 @@ func (r Reason) FellBackFromAuto() bool {
 // min(100-five, 100-seven) — what the eligibility gate tested and what M5 renders
 // as "N% headroom", because that is the number the user's own meters show. Ranked
 // is the same value after the in-flight penalty — what decided the pick under
-// headroom_first (under reset_first it only breaks exact weekly-reset ties), and
+// headroom_first and for best_of_pool (a reset_first ReasonAuto pick uses it only to
+// break exact weekly-reset ties), and
 // diagnostics only. Rendering Ranked would show a percentage that appears
 // nowhere else in the product, and moves when somebody else's run starts. It has no
 // production reader and is kept because TestSelectGateReadsRawHeadroomNotRank asserts
