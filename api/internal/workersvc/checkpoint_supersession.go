@@ -82,6 +82,12 @@ func (s *Service) claimCheckpointSlot(ctx context.Context, run store.Run, branch
 		if r.NextAttemptAt.Valid && r.NextAttemptAt.Time.After(now) {
 			return "not_descendant"
 		}
+		// Stops the iterations after the one that observed the cancellation (the publish route's
+		// context budget expired): it is not an atomic barrier. An operation already started runs
+		// to its own bound (supersedeRetainedCheckpoint detaches from ctx).
+		if ctx.Err() != nil {
+			return "not_descendant"
+		}
 		freed, acquired, err := s.supersedeRetainedCheckpoint(ctx, r.RunID)
 		if err != nil {
 			slog.Warn("checkpoint retention: supersede", "run", r.RunID, "for_run", run.ID, "error", secretscrub.Scrub(err.Error()))
@@ -118,6 +124,12 @@ func (s *Service) freeCheckpointSlot(ctx context.Context, run store.Run, branch 
 		return false
 	}
 	for _, r := range rows {
+		// Stops the iterations after the one that observed the cancellation (the publish route's
+		// context budget expired): it is not an atomic barrier. An operation already started runs
+		// to its own bound (supersedeRetainedCheckpoint detaches from ctx).
+		if ctx.Err() != nil {
+			return false
+		}
 		freed, acquired, err := s.supersedeRetainedCheckpoint(ctx, r.RunID)
 		if err != nil {
 			slog.Warn("checkpoint retention: supersede", "run", r.RunID, "for_run", run.ID, "error", secretscrub.Scrub(err.Error()))

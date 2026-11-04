@@ -1,0 +1,4 @@
+{
+  "api_write_deadline_ms": 455000,
+  "worker_allowance_ms": 480000
+}

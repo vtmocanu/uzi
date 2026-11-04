@@ -6888,6 +6888,11 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 // inside the same successful checkpoint-tip write (set-only; a nil never clears a stored value).
 // An attestation is accepted only on a request stamped with the claim generation it was admitted
 // at, so a value is only ever bound to this run's current worker and generation.
+//
+// A publish is not one bounded push: the live path can run up to two pushes (the second after a
+// supersession) and detached retention work that outlives ctx. PublishServiceBound is the bound
+// on the whole call when ctx carries PublishContextBudget; the claim and free loops stop starting
+// supersessions once ctx is done.
 func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, attestedSource *string, pack []byte, generation *int64) (PublishResult, error) {
 	// PRD #1810 D2 (residual 2): the publish is routed on the status read below, and a
 	// live-routed push must be SENT within livePublishPrePushBudget of that routing. The clock

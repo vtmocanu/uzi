@@ -794,6 +794,7 @@ Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/done/218-park-resume-work
   as durable. [user, #1597] (AI-synced 2026-09-24)
 - When the checkpoint is not published, the shutdown feed must name a bounded
   reason class. [user, #1597] (AI-synced 2026-09-24)
+- A checkpoint publish must not be cut off by the api's 15 s listener timeouts or the worker's generic `WORKER_HTTP_TIMEOUT`, which is not raised. The api's `/publish` route extends its own read and write deadlines; other routes keep 15 s. The worker gives publish a request allowance of its own; earlier caller and boundary deadlines still win. An HTTP/2 stream reset is diagnosed by its error code as a known class, not `unknown`. [user, #3847] (AI-synced 2026-11-04)
 - The actual typed graceful-shutdown durability sink may perform one logical bounded
   credential release/refresh while execution remains aborted; reconciliation, proof,
   capture, publication and unwind share the original absolute grace's remaining time,

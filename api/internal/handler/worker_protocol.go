@@ -2409,7 +2409,29 @@ func (h *Handler) WorkerListMemory(w http.ResponseWriter, r *http.Request) {
 //
 // This is a best-effort durability path: a 500 is ignored by the worker, and the
 // benign "origin moved / unsupported" outcomes are 200 skips, not errors.
+//
+// The base listeners time a request out after 15 s, too short for an upload followed by a forge
+// push, so this route extends its own deadlines through http.NewResponseController (the
+// WorkerRunHeldPublication precedent). Every budget is measured from start, captured on handler
+// entry (before the header and query validation); the deadlines themselves are set once that
+// validation has passed:
+//
+//	upload    60 s  read deadline start+upload: the body read (a stalled upload is a 408 and never
+//	                reaches the publisher)
+//	context  workersvc.PublishContextBudget  the one context handed to PublishAttested: a
+//	                live-routed push is sent within its pre-push budget and the broker waits on
+//	                it for its own ceiling
+//	service  workersvc.PublishServiceBound  PublishAttested from entry to return: the context
+//	                budget plus the detached retention work that can still run after it expires
+//	grace     15 s  writing the answer
+//
+// and the write deadline is start + upload + service + grace. The vars (worker_publish_deadline.go) are
+// named so a test can scale them, keeping the ratio. No other wrapper deadline is added: the
+// service's own bounds are the argument, and cutting the context shorter would cut the
+// request-context persist and track writes of the publish. (The detached retention bookkeeping
+// runs on retentionBookkeepingCtx, which is WithoutCancel, and is not affected.)
 func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
@@ -2450,17 +2472,26 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 	// Raw octet-stream body, NOT JSON: httpx.DecodeJSON is JSON+1 MiB only. Cap with
 	// MaxBytesReader so an over-cap pack is a truthful 413 (a split/too-large signal),
 	// not a silently truncated — and thus malformed — pack.
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(start.Add(publishUploadBudget))
+	_ = rc.SetWriteDeadline(start.Add(publishUploadBudget + publishServiceBound + publishResponseGrace))
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxPackBytes))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
+		switch {
+		case errors.As(err, &tooLarge):
 			httpx.Error(w, http.StatusRequestEntityTooLarge, "checkpoint pack too large")
-			return
+		case isUploadTimeout(err):
+			// An incomplete upload never reaches the publisher.
+			httpx.Error(w, http.StatusRequestTimeout, "checkpoint pack upload timed out")
+		default:
+			httpx.Error(w, http.StatusBadRequest, "could not read checkpoint pack")
 		}
-		httpx.Error(w, http.StatusBadRequest, "could not read checkpoint pack")
 		return
 	}
-	res, err := h.wsvc.PublishAttested(r.Context(), wkr, runID, tip, attestedSource, body, claimGeneration)
+	ctx, cancel := context.WithTimeout(r.Context(), publishContextBudget)
+	defer cancel()
+	res, err := h.wsvc.PublishAttested(ctx, wkr, runID, tip, attestedSource, body, claimGeneration)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrMissingClaimGeneration) || errors.Is(err, workersvc.ErrStaleClaim) {
 			httpx.ErrorReason(w, http.StatusConflict, "checkpoint publish claim is stale", "stale_claim")
