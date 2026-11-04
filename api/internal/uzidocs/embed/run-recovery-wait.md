@@ -404,6 +404,44 @@ Resume. Downgrading workers during pending recovery is unsupported: older
 workers may drop its durable recovery fields. See
 [Recovering unpublished work](./run-recovery.md#retained-source-failure-and-local-proof).
 
+### Unwitnessed continuation hold
+
+A retained continuation is a run with an open custody hold from an earlier claim
+generation. When the server refuses its `running` report (for example because an
+earlier flight's source use was never ended) the run stays `claimed`. The
+claimed-never-started sweep used to reset it to `queued` uncharged, and each new
+claim opened another custody hold until the owner reached the admission limit
+(issue #3859). Such a run is now disposed in one sweep transaction:
+
+- A worker that advertises `run_registration_evidence_v1` sends registration
+  evidence (register nonce, claim generation, snapshot epoch) on the flight's
+  first `running` report. The next accepted active snapshot that omits the run
+  stamps a **departure**.
+- A witnessed departure is **charged** against `RUN_MAX_REQUEUES` (default 3)
+  and requeued. At the episode cap the run parks at `recovery_wait` /
+  `worker_requeue_exhausted` for owner Resume or Cancel; it is never failed.
+- If the worker shows presence but no departure is witnessed within 2x the
+  claim grace (claim grace is 5 minutes, so 10 minutes) of the claim, the run
+  parks at `recovery_wait` / `retained_continuation_unwitnessed`. This cause is
+  server-only: the claim is released, local work and custody are kept, and
+  there is **no automatic retry**.
+- Everything else keeps the uncharged reset: first-generation claims,
+  non-continuations and workers without the evidence capability.
+
+For `retained_continuation_unwitnessed`, read `uzi run recovery <id>` and export
+an available archive, then choose `uzi run resume <id>` or `uzi run cancel <id>`.
+Timers, token changes and credential changes do not release the hold. Default
+CLI wait, log follow and the watcher stop for the owner decision; the web run
+page shows "unwitnessed continuation hold" with Resume and Cancel.
+
+Boundaries. Old agents (no evidence) and workers that re-register between
+refusals are not witnessed; they remain bounded only by the per-run custody
+bound (`custody_hold_limit`, default 8, ADR-1751 D2a), which can still block the
+owner. If `custody_hold_limit` is below the requeue budget the run stays
+`queued` with health `custody_limit` instead of parking. Migration 00401's Down
+refuses while any run is parked at this cause (Resume or Cancel it first) and
+clears the cause on other rows.
+
 ## If it never recovers
 
 Empty-turn and resumed-gate recovery have no lifetime park cap. Typed provider
@@ -1073,6 +1111,8 @@ historical-evidence rules above remain in force.
   hold; see [Retained recovery exhausted](#retained-recovery-exhausted).
   `retained_recovery_adoption_failed` instead requires owner Resume or Cancel,
   with no automatic retry; see [Retained recovery adoption failed](#retained-recovery-adoption-failed).
+  `retained_continuation_unwitnessed` is likewise owner Resume or Cancel with no
+  automatic retry; see [Unwitnessed continuation hold](#unwitnessed-continuation-hold).
 - `limit_wait`: a usage-limit window must reset. See
   [Paused on a usage limit](run-limit-wait.md).
 - `pool_wait`: no token is available in the selected pool. It needs an
