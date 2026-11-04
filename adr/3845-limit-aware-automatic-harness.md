@@ -132,7 +132,8 @@ creation, estimating per-run cost, and chat runs.
   the recorded reason.
 - **Reading the record.** Automatic rows label the sides by harness, not role:
   `uzi run get` prints `claude`/`codex` labels for `auto_*` reasons and the
-  weekly resets as `MM-DD HH:MMZ` (UTC, year omitted).
+  weekly resets as RFC3339 UTC timestamps; the TUI rail shows them as
+  `MM-DD HH:MMZ` (UTC, year omitted) to fit its width.
 
 User contracts: [Worker model](../docs/worker-model.md#harness-and-worker-models),
 [rate limits](../docs/rate-limits.md#how-the-automatic-default-picks-a-harness)

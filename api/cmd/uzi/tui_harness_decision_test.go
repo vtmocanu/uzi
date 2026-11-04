@@ -23,6 +23,43 @@ func harnessDecisionScene(dark bool, now time.Time) tuiModel {
 			PreferredScore: &zero, OtherScore: &hundred, PreferredMeasured: &measured, OtherMeasured: &zero, PreferredHeld: true}}, nil)
 }
 
+// harnessDecisionAutoScene is the automatic counterpart: both resets recorded.
+func harnessDecisionAutoScene(dark bool, now time.Time) tuiModel {
+	m := uxModel(&uzicli.FakeClient{}, detailRunID, dark)
+	m.height = 50
+	return applyDetail(m, apitypes.RunDTO{ID: detailRunID, Kind: "issue", Harness: "codex", Status: "completed", Health: "ok",
+		IssueTitle: "Automatic harness choice at creation", StartedAt: tp(now.Add(-time.Minute)),
+		HarnessDecision: autoSoonestResetDecision()}, nil)
+}
+
+func autoSoonestResetDecision() *apitypes.HarnessDecisionDTO {
+	cs, xs, cm, xm := 80.0, 90.0, 80.0, 90.0
+	claudeReset := time.Date(2026, 11, 9, 4, 0, 0, 0, time.UTC)
+	codexReset := time.Date(2026, 11, 7, 15, 30, 0, 0, time.UTC)
+	return &apitypes.HarnessDecisionDTO{Preferred: "claude", Chosen: "codex", Reason: "auto_soonest_reset",
+		PreferredScore: &cs, OtherScore: &xs, PreferredMeasured: &cm, OtherMeasured: &xm,
+		PreferredWeeklyResetAt: &claudeReset, OtherWeeklyResetAt: &codexReset}
+}
+
+func TestRailHarnessDecisionAutomaticSnapshot(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "auto")
+	m.width, m.height = 100, 60
+	m = applyDetail(m, apitypes.RunDTO{ID: "auto", Status: "completed", Harness: "codex", HarnessDecision: autoSoonestResetDecision()}, nil)
+	want := "HARNESS at creation\npreferred: claude\nchosen: codex\nreason: auto_soonest_reset\nclaude score: 80%\ncodex score: 90%\nclaude measured: 80%\ncodex measured: 90%\nclaude held: false\ncodex held: false\nclaude reset: 11-09 04:00Z\ncodex reset: 11-07 15:30Z"
+	got := stripANSI(m.railHarnessDecision(0))
+	if got != want {
+		t.Fatalf("snapshot:\n%q\nwant:\n%q", got, want)
+	}
+	if strings.Contains(got, "\u2026") {
+		t.Fatalf("truncated: %q", got)
+	}
+	for _, row := range strings.Split(got, "\n") {
+		if visualWidth(row) > m.railWidth() {
+			t.Fatalf("row exceeds width %d: %q", m.railWidth(), row)
+		}
+	}
+}
+
 func TestRailHarnessDecisionSnapshotAndBudget(t *testing.T) {
 	zero, hundred, measured := 0.0, 100.0, 37.5
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "snapshot")

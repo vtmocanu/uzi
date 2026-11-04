@@ -3258,9 +3258,9 @@ accounts, Claude aggregation and capacity holds.
 two rows are the weekly resets, `pref reset:` and `other reset:`, or
 `claude reset:` and `codex reset:` for an `auto_*` reason (whose score,
 measured and held rows are likewise labelled `claude` and `codex` instead of
-`preferred`/`pref` and `other`). A reset reads `MM-DD HH:MMZ` in UTC with the
-year omitted (the reset falls within about a week after the run's creation), or `unknown`. The TUI detail rail has **HARNESS at creation**, fitted as a whole block
-when space permits. The web run page shows the same stored explanation.
+`preferred`/`pref` and `other`). A reset reads as an RFC3339 UTC timestamp, or `unknown`. The TUI detail rail has **HARNESS at creation**, fitted as a whole block
+when space permits; to fit the rail it shows a reset as `MM-DD HH:MMZ` UTC with the
+year omitted (the reset falls within about a week after the run's creation). The web run page shows the same stored explanation.
 These are owner-only readings, independent of live usage and claim-time
 credential metadata. Legacy or unavailable decisions read `not recorded`.
 

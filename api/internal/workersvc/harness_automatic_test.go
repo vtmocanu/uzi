@@ -140,7 +140,8 @@ func TestClaudeAutoSide(t *testing.T) {
 		{"rejected pooled token is not pooled", []autoselect.Candidate{func() autoselect.Candidate { c := cand(a, true, 5, nil); c.Rejected = true; return c }(), cand(def, false, 40, autoTestTime(time.Hour))}, none, autoQualified, false, autoTestTime(time.Hour), 60},
 		{"unpooled default measured", []autoselect.Candidate{cand(def, false, 40, autoTestTime(time.Hour))}, none, autoQualified, false, autoTestTime(time.Hour), 60},
 		{"unpooled default below floor", []autoselect.Candidate{cand(def, false, 95, nil)}, none, autoDepleted, false, nil, 5},
-		{"unpooled default reserve-held", []autoselect.Candidate{cand(def, false, 5, nil)}, only(def), autoDepleted, true, nil, 0},
+		{"unpooled default reserve-held keeps reading and reset", []autoselect.Candidate{cand(def, false, 40, autoTestTime(time.Hour))}, only(def), autoDepleted, true, autoTestTime(time.Hour), 60},
+		{"unpooled default reserve-held stale", []autoselect.Candidate{staleDefault}, only(def), autoDepleted, true, nil, 0},
 		{"reserve-unknown hold on unmeasured default", []autoselect.Candidate{unmeasuredDefault}, only(def), autoDepleted, true, nil, 0},
 		{"unpooled default stale", []autoselect.Candidate{staleDefault}, none, autoUnknown, false, nil, 0},
 		{"unpooled default unmeasured", []autoselect.Candidate{unmeasuredDefault}, none, autoUnknown, false, nil, 0},
@@ -157,6 +158,12 @@ func TestClaudeAutoSide(t *testing.T) {
 			}
 			if (got.WeeklyReset == nil) != (tt.reset == nil) || (tt.reset != nil && !got.WeeklyReset.Equal(*tt.reset)) {
 				t.Fatalf("weekly reset=%v want %v", got.WeeklyReset, tt.reset)
+			}
+			if tt.state == autoDepleted && tt.held && tt.head == 0 && got.Measured.Valid {
+				t.Fatalf("held side without a fresh reading carries Measured=%v", got.Measured)
+			}
+			if tt.head != 0 && tt.held && (!got.Measured.Valid || got.Measured.Float64 != tt.head) {
+				t.Fatalf("held measured=%v want %v", got.Measured, tt.head)
 			}
 			if tt.head != 0 && (!got.Headroom.Valid || got.Headroom.Float64 != tt.head) {
 				t.Fatalf("headroom=%v want %v", got.Headroom, tt.head)
@@ -215,6 +222,28 @@ func TestCodexSideFromCandidate(t *testing.T) {
 				t.Fatalf("weekly reset=%v", got.WeeklyReset)
 			}
 		})
+	}
+}
+
+// An API-key default has no usage reading: codexAutoSideDB returns unknown with no pick for it,
+// so the decision is auto_fallback to Claude. The DB-backed reads stay with the LiveDB tests.
+func TestCodexChoiceReadsUsage(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		choice codexCredentialChoice
+		want   bool
+	}{
+		{"api-key default", codexCredentialChoice{AuthMode: codexAuthModeAPIKey, Select: codexChoiceDefault}, false},
+		{"subscription default", codexCredentialChoice{AuthMode: codexAuthModeSubscription, Select: codexChoiceDefault}, true},
+		{"pool", codexCredentialChoice{Select: codexChoicePool}, true},
+	} {
+		if got := codexChoiceReadsUsage(tt.choice); got != tt.want {
+			t.Fatalf("%s: got %t want %t", tt.name, got, tt.want)
+		}
+	}
+	h, reason := chooseAutomaticHarness(qualifiedSide(90, autoTestTime(time.Hour)), autoSide{State: autoUnknown}, autoTestNow)
+	if h != HarnessClaude || reason != harnessReasonAutoFallback {
+		t.Fatalf("claude qualified, codex unknown: %s/%s", h, reason)
 	}
 }
 
@@ -340,20 +369,37 @@ func TestEvaluateCreationOverflowDefaultUnsetExcluded(t *testing.T) {
 	pin := HarnessClaude
 	svc := &Service{}
 	origin := harnessCreationOrigin{Kind: "issue", TriggerSource: "manual"}
+	model := "opus"
+	both := resolvedHarness{Harness: HarnessClaude, DefaultUnset: true, BothUsable: true}
 	for _, toggle := range []bool{false, true} {
 		policy := store.GetHarnessCreationPolicyRow{HarnessOverflowEnabled: toggle}
+		withPlan, withCode := policy, policy
+		withPlan.PlanCrossCheckEnabled = true
+		withCode.CodeCrossCheckEnabled = true
 		for _, tt := range []struct {
 			name     string
 			res      resolvedHarness
 			explicit *Harness
 			origin   harnessCreationOrigin
+			policy   *store.GetHarnessCreationPolicyRow
 		}{
-			{"one harness usable", resolvedHarness{Harness: HarnessClaude, DefaultUnset: true}, nil, origin},
-			{"explicit harness", resolvedHarness{Harness: HarnessClaude, DefaultUnset: true, BothUsable: true}, &pin, origin},
-			{"ineligible origin", resolvedHarness{Harness: HarnessClaude, DefaultUnset: true, BothUsable: true}, nil, harnessCreationOrigin{Kind: "task", TriggerSource: "manual"}},
+			{"model pin", both, nil, harnessCreationOrigin{Kind: "issue", TriggerSource: "manual", Model: &model}, nil},
+			{"anthropic override", both, nil, harnessCreationOrigin{Kind: "issue", TriggerSource: "manual", AnthropicOverride: true}, nil},
+			{"plan cross-check", both, nil, origin, &withPlan},
+			{"code cross-check", both, nil, origin, &withCode},
+			{"api trigger", both, nil, harnessCreationOrigin{Kind: "issue", TriggerSource: "api"}, nil},
+			{"chat trigger", both, nil, harnessCreationOrigin{Kind: "issue", TriggerSource: "chat"}, nil},
+			{"empty trigger", both, nil, harnessCreationOrigin{Kind: "issue"}, nil},
+			{"one harness usable", resolvedHarness{Harness: HarnessClaude, DefaultUnset: true}, nil, origin, nil},
+			{"explicit harness", resolvedHarness{Harness: HarnessClaude, DefaultUnset: true, BothUsable: true}, &pin, origin, nil},
+			{"ineligible origin", resolvedHarness{Harness: HarnessClaude, DefaultUnset: true, BothUsable: true}, nil, harnessCreationOrigin{Kind: "task", TriggerSource: "manual"}, nil},
 		} {
 			t.Run(tt.name, func(t *testing.T) {
-				got, pick, err := svc.evaluateCreationOverflow(context.Background(), nil, uuid.New(), tt.explicit, tt.res, policy, tt.origin)
+				p := policy
+				if tt.policy != nil {
+					p = *tt.policy
+				}
+				got, pick, err := svc.evaluateCreationOverflow(context.Background(), nil, uuid.New(), tt.explicit, tt.res, p, tt.origin)
 				if err != nil || pick != nil {
 					t.Fatalf("err=%v pick=%v", err, pick)
 				}

@@ -7,7 +7,7 @@ import "strings"
 // width-clamped after Plain so wide glyphs cannot wrap.
 func (m tuiModel) railHarnessDecision(usedRows int) string {
 	lines := []string{"HARNESS at creation"}
-	for _, line := range harnessDecisionLines(m.detail.run.HarnessDecision) {
+	for _, line := range railHarnessDecisionLines(m.detail.run.HarnessDecision) {
 		lines = append(lines, clampVisual(m.renderer.Plain(line, m.railWidth()), m.railWidth()))
 	}
 	if len(lines) > m.transcriptViewport()-usedRows-1 {

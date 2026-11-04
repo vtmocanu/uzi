@@ -8,8 +8,18 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
-// harnessDecisionLines describes only persisted evidence, never current account meters.
+// harnessDecisionLines is the human CLI form (uzi run get): it describes only persisted
+// evidence, never current account meters, and renders resets as RFC3339 UTC.
 func harnessDecisionLines(d *apitypes.HarnessDecisionDTO) []string {
+	return harnessDecisionLinesWith(d, harnessDecisionTime)
+}
+
+// railHarnessDecisionLines is the TUI rail form: identical rows, compact reset times.
+func railHarnessDecisionLines(d *apitypes.HarnessDecisionDTO) []string {
+	return harnessDecisionLinesWith(d, harnessDecisionRailTime)
+}
+
+func harnessDecisionLinesWith(d *apitypes.HarnessDecisionDTO, fmtTime func(*time.Time) string) []string {
 	if d == nil {
 		return []string{"not recorded"}
 	}
@@ -29,15 +39,24 @@ func harnessDecisionLines(d *apitypes.HarnessDecisionDTO) []string {
 		other + " measured: " + harnessDecisionNumber(d.OtherMeasured),
 		pref + " held: " + strconv.FormatBool(d.PreferredHeld),
 		other + " held: " + strconv.FormatBool(d.OtherHeld),
-		prefMeasured + " reset: " + harnessDecisionTime(d.PreferredWeeklyResetAt),
-		other + " reset: " + harnessDecisionTime(d.OtherWeeklyResetAt),
+		prefMeasured + " reset: " + fmtTime(d.PreferredWeeklyResetAt),
+		other + " reset: " + fmtTime(d.OtherWeeklyResetAt),
 	}
 }
 
-// harnessDecisionTime is "MM-DD HH:MMZ" (UTC): the TUI rail is 26 columns wide. A recorded
-// weekly reset is a future reset at the run's creation, so it falls within about a week of
-// the run's creation time, which dates the omitted year.
+// harnessDecisionTime is the CLI reset form: RFC3339 in UTC, or "unknown".
 func harnessDecisionTime(t *time.Time) string {
+	if t == nil {
+		return "unknown"
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// harnessDecisionRailTime is "MM-DD HH:MMZ" (UTC). The TUI rail is only 26 columns wide and a
+// full RFC3339 stamp after "claude reset: " would be clipped. The year is omitted: a recorded
+// weekly reset is a future reset at the run's creation, so it falls within about a week of the
+// run's creation time, which dates it.
+func harnessDecisionRailTime(t *time.Time) string {
 	if t == nil {
 		return "unknown"
 	}

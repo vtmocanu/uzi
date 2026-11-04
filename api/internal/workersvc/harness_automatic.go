@@ -204,21 +204,25 @@ func claudeAutoSide(cands []autoselect.Candidate, defaultID uuid.UUID, blocked f
 		if c.SecretID != defaultID || defaultID == uuid.Nil || c.Rejected {
 			continue
 		}
-		if blocked(c.SecretID) {
-			return autoSide{State: autoDepleted, Held: true}
-		}
 		c.AutoEligible = true
 		e := autoselect.Classify(c, p, now)
 		side := autoSide{State: autoUnknown, WeeklyReset: c.WeeklyResetsAt}
+		measured := e.Status == autoselect.StatusEligible || e.Status == autoselect.StatusBelowThreshold
+		if measured {
+			side.Headroom, side.Measured = floatOf(float64(e.Headroom)), floatOf(float64(e.Headroom))
+		}
+		// A capacity hold wins over the reading: the side is depleted and held, but a fresh
+		// measurement and the weekly reset stay as evidence.
+		if blocked(c.SecretID) {
+			side.State, side.Held = autoDepleted, true
+			return side
+		}
 		switch e.Status {
 		case autoselect.StatusEligible:
 			side.State = autoQualified
 		case autoselect.StatusBelowThreshold:
 			side.State = autoDepleted
-		default:
-			return side
 		}
-		side.Headroom, side.Measured = floatOf(float64(e.Headroom)), floatOf(float64(e.Headroom))
 		return side
 	}
 	return autoSide{State: autoUnknown}
@@ -276,6 +280,9 @@ func (s *Service) codexAutoSideDB(ctx context.Context, q *store.Queries, userID 
 		return unknown, nil
 	}
 	choice := *other.Codex
+	if !codexChoiceReadsUsage(choice) {
+		return unknown, nil
+	}
 	floor := s.p.Autoselect.MinHeadroom
 	switch {
 	case choice.Select == codexChoicePool:
@@ -310,6 +317,13 @@ func (s *Service) codexAutoSideDB(ctx context.Context, q *store.Queries, userID 
 		return codexAutoEval{side: codexSideFromCandidate(picked.Reason, picked.Candidate, floor), pick: &picked, choice: &choice}, nil
 	}
 	return unknown, nil
+}
+
+// codexChoiceReadsUsage reports whether an automatic evaluation can measure the choice: a
+// pooled alias or a default subscription account. An API-key default has no usage reading and
+// is unknown with no pick.
+func codexChoiceReadsUsage(choice codexCredentialChoice) bool {
+	return choice.Select == codexChoicePool || choice.AuthMode == codexAuthModeSubscription
 }
 
 // evaluateAutomaticHarness decides an automatic creation. It returns the Codex pick it made

@@ -155,7 +155,7 @@ func TestRunGetHarnessDecision(t *testing.T) {
 			[]string{"preferred: claude", "chosen: claude", "reason: preferred", "preferred score: unknown", "other score: unknown", "pref measured: unknown", "other measured: unknown", "preferred held: false", "other held: false", "pref reset: unknown", "other reset: unknown"}},
 		{"automatic soonest reset", &apitypes.HarnessDecisionDTO{Preferred: "claude", Chosen: "codex", Reason: "auto_soonest_reset", PreferredScore: &zero, OtherScore: &hundred, PreferredMeasured: &measured, OtherMeasured: &zero,
 			PreferredWeeklyResetAt: &resetA},
-			[]string{"preferred: claude", "chosen: codex", "reason: auto_soonest_reset", "claude score: 0%", "codex score: 100%", "claude measured: 37.5%", "codex measured: 0%", "claude held: false", "codex held: false", "claude reset: 11-09 04:00Z", "codex reset: unknown"}},
+			[]string{"preferred: claude", "chosen: codex", "reason: auto_soonest_reset", "claude score: 0%", "codex score: 100%", "claude measured: 37.5%", "codex measured: 0%", "claude held: false", "codex held: false", "claude reset: 2026-11-09T04:00:00Z", "codex reset: unknown"}},
 		{"zero and held", &apitypes.HarnessDecisionDTO{Preferred: "codex", Chosen: "claude", Reason: "overflow", PreferredScore: &zero, OtherScore: &hundred, PreferredMeasured: &measured, OtherMeasured: &zero, PreferredHeld: true},
 			[]string{"preferred: codex", "chosen: claude", "reason: overflow", "preferred score: 0%", "other score: 100%", "pref measured: 37.5%", "other measured: 0%", "preferred held: true", "other held: false", "pref reset: unknown", "other reset: unknown"}},
 	} {
