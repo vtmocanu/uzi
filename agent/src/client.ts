@@ -3134,9 +3134,9 @@ export class WorkerClient {
    * ambiguous for the caller. The bearer/version header assembly mirrors fetchRaw; the request
    * is bounded by {@link CHECKPOINT_PUBLISH_TIMEOUT_MS} (not httpTimeoutMs, which is too short for
    * a real pack), or earlier by the caller's boundary signal or a current MaintenanceBudget. The caller
-   * retries an explicit 5xx (250 ms, 1 s backoff) and a 429 "busy" (5 s backoff) up to three requests,
-   * all inside one shared allowance of this size. An abort
-   * is just another best-effort miss (it throws, caught by the caller's warn-and-swallow).
+   * retries an explicit 5xx (250 ms, 1 s backoff) up to three requests, all inside one shared
+   * allowance of this size. An abort is just another best-effort miss (it throws, caught by the
+   * caller's warn-and-swallow).
    */
   async publishCheckpoint(
     runId: string,

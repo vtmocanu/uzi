@@ -27,7 +27,7 @@ function ackStream(bytes: Uint8Array): RealAck {
 }
 
 function start(opts: {
-  responses?: unknown[]; abort?: "backoff" | "backoff429" | "ownership" | "guard";
+  responses?: unknown[]; abort?: "backoff" | "ownership" | "guard";
   refusal?: "ownership" | "scratch" | "remediation"; exit?: number; throws?: boolean; packThrows?: boolean;
   /** Omit for the production 250 ms then 1000 ms backoff; the default skips real waiting. */
   backoffMs?: readonly [number, number] | "production";
@@ -50,8 +50,7 @@ function start(opts: {
   const client = new WorkerClient("http://unused", "test", "test", nullLogger(),
     opts.allowanceMs === undefined ? {} : { checkpointPublishTimeoutMs: opts.allowanceMs });
   const backoff = opts.backoffMs ?? (opts.abort === "backoff" ? [60_000, 60_000] as const : [0, 0] as const);
-  const hooks = backoff === "production" ? undefined
-    : { retryBackoffMs: backoff, retry429BackoffMs: opts.abort === "backoff429" ? 60_000 : 0 };
+  const hooks = backoff === "production" ? undefined : { retryBackoffMs: backoff };
   const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch: "branch" }) } }), nullLogger(), 1,
     undefined, { checkpointTestHooks: hooks });
   const seam = runner as unknown as {
@@ -124,7 +123,7 @@ function start(opts: {
         signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
       });
     }
-    if (opts.abort === "backoff" || opts.abort === "backoff429") setTimeout(() => abort.abort(), 10);
+    if (opts.abort === "backoff") setTimeout(() => abort.abort(), 10);
     return (opts.responses?.[requests - 1] ?? FAIL) as Awaited<ReturnType<typeof client.publishCheckpoint>>;
   };
   const feed: unknown[] = [];
@@ -228,31 +227,6 @@ it("the allowance itself aborts an in-flight attempt when the caller never abort
   assert.equal(h.requests, 1);
   assert.equal((result as { published: boolean }).published, false);
   assert.equal(h.flight.lastCheckpointRefTip, "OLD");
-});
-
-const BUSY = { ok: false, httpStatus: 429 };
-it("429 then ACK retries on the same allowance with a replayed pack and publishes", async () => {
-  const r = await exercise({ responses: [BUSY, ACK] });
-  assert.deepEqual(r.outcome, { published: true });
-  assert.equal(r.requests, 2);
-  assert.deepEqual(r.bytes, ["exact-pack", "exact-pack"]);
-  assert.equal(r.attemptSignals[0], r.attemptSignals[1]);
-  assert.equal(r.flight.lastCheckpointRefTip, TIP);
-  assert.equal(r.flight.lastAttemptedCheckpointRefTip, undefined);
-});
-it("three 429s are three requests then a rejected outcome with an HTTP 429 feed line", async () => {
-  const r = await exercise({ responses: [BUSY, BUSY, BUSY] });
-  assert.equal(r.requests, 3);
-  assert.deepEqual(r.outcome, { published: false, reason: "rejected", httpStatus: 429 });
-  assert.match(JSON.stringify(r.feed), /HTTP 429/);
-});
-it("caller abort during a 429 backoff ends promptly with no further request", async () => {
-  const started = Date.now();
-  const r = await exercise({ abort: "backoff429", responses: [BUSY, BUSY, BUSY] });
-  assert.ok(Date.now() - started < 30_000, "caller abort ended the 429 backoff promptly");
-  assert.equal(r.requests, 1);
-  assert.equal(r.producers, 1);
-  assert.deepEqual(r.outcome, { published: false, reason: "aborted" });
 });
 
 for (const response of [{ ok: false, httpStatus: 400 }, { ok: false, httpStatus: 200 },

@@ -2882,8 +2882,6 @@ export interface CheckpointTestHooks {
   absoluteNow?: () => number;
   /** Test-only backoff before the second and third checkpoint publish request; production is 250 ms then 1000 ms. */
   retryBackoffMs?: readonly [number, number];
-  /** Test-only backoff after an HTTP 429 (publish concurrency cap busy); production is 5000 ms. */
-  retry429BackoffMs?: number;
   /** Test-only expiry control; omit deadlineAt for signal-driven expiry. Production keeps its real 10s budget. */
   armSoftDeadline?: (fire: () => void, ms: number) => { deadlineAt?: number; cancel: () => void };
   /** Awaited just before a tick's git-busy probe (a test can hold a tick in its pre-scope phase). */
@@ -19503,28 +19501,19 @@ export class RunRunner {
       observeProducer();
       packedTip = packed.tipOid;
       let res;
-      // Only an explicit 5xx or a 429 (the api's publish concurrency cap answering "busy") is
-      // retriable. Three requests share the caller's deadline AND one request allowance, created
-      // once here and never renewed by a retry; any failed guard, transport exception or abort
-      // stops this logical operation. A 429 waits a fixed 5 s (the api's Retry-After) instead of the
-      // 5xx schedule, inside that same allowance, and replays the pack exactly like a 5xx retry.
+      // Only an explicit 5xx is retriable. Three requests share the caller's deadline AND one
+      // request allowance, created once here and never renewed by a retry; any failed guard,
+      // transport exception or abort stops this logical operation.
       const allowanceMs = this.client.checkpointPublishTimeoutMs ?? CHECKPOINT_PUBLISH_TIMEOUT_MS;
       const allowance = AbortSignal.any([AbortSignal.timeout(allowanceMs), ...(signal ? [signal] : [])]);
       for (let attempt = 1; attempt <= 3; attempt++) {
         allowance.throwIfAborted();
         onStep?.("checkpoint_upload");
         res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, producer!.pack, allowance, flight.claimGeneration, attestedSource);
-        const busy = !res.ok && res.httpStatus === 429;
-        if (res.ok || typeof res.httpStatus !== "number" || (!busy && (res.httpStatus < 500 || res.httpStatus > 599)) || attempt === 3) break;
-        // The api answers 429 with reason "busy" and Retry-After 5 before it reads the body or calls
-        // the publisher, but the client discards that reason and surfaces only the status. Recording
-        // the tip as attempted, like a 5xx, is the conservative choice while the reason is unseen:
-        // chaining from an extra tip is bounded and self-clearing, while omitting it could not be
-        // proven safe.
+        if (res.ok || typeof res.httpStatus !== "number" || res.httpStatus < 500 || res.httpStatus > 599 || attempt === 3) break;
         flight.lastAttemptedCheckpointRefTip = packed.tipOid;
         const [firstBackoffMs, secondBackoffMs] = this.checkpointTestHooks?.retryBackoffMs ?? [250, 1_000];
-        const backoffMs = busy ? this.checkpointTestHooks?.retry429BackoffMs ?? 5_000
-          : attempt === 1 ? firstBackoffMs : secondBackoffMs;
+        const backoffMs = attempt === 1 ? firstBackoffMs : secondBackoffMs;
         flight.runLog.warn("checkpoint publish retry", { run_id: flight.runId, attempt, backoff_ms: backoffMs, http_status: res.httpStatus });
         await abandon(true);
         await sleep(backoffMs, allowance);
