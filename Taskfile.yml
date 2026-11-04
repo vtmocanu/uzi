@@ -2188,8 +2188,8 @@ tasks:
       #   GOMEMLIMIT=2GiB    14.53 GB   452 s
       #
       # On that worker, among the GOMEMLIMIT rows, 12GiB gave most of the observed
-      # reduction for the smallest observed time increase. Runner results are
-      # unmeasured until CI.
+      # reduction for the smallest observed time increase.
+      # Subsequent CI measurements and the swap mitigation are recorded in #3433 and #3762.
       #
       # The value is fixed on purpose: `env GOMEMLIMIT=...` overrides an inherited
       # GOMEMLIMIT, so the limit is identical locally and in CI (GOGC and hardware
