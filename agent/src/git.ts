@@ -19,6 +19,7 @@ import { PassThrough, Readable, Transform, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { RUN_KINDS, type RunKind } from "./protocol.js";
 import type { Logger } from "./log.js";
+import type { RepoAgentRevisionReader, RepoAgentTreeEntry } from "./repoagents.js";
 import type { PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
 import { CheckpointChildStartupTimeoutError } from "./harness.js";
@@ -6081,6 +6082,41 @@ export class GitCache {
   async revParse(barePath: string, rev: string): Promise<string | null> {
     const sha = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", rev])).trim();
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  }
+
+  async defaultBranchCommit(barePath: string): Promise<string | undefined> {
+    return this.defaultBranchSha(barePath);
+  }
+
+  async ensureCommitPresent(barePath: string, commit: string, repoUrl: string, pat?: string, username?: string): Promise<boolean> {
+    if (!SHA40_RE.test(commit)) return false;
+    const present = async (): Promise<boolean> => (await this.revParse(barePath, `${commit}^{commit}`)) === commit;
+    if (await present()) return true;
+    try {
+      await this.withLock(barePath, () =>
+        this.runGit(barePath, ["fetch", "--no-tags", "--no-write-fetch-head", "origin", commit], pat, httpScopeForUrl(repoUrl), username));
+    } catch (err) {
+      if (err instanceof RunResidueBlockedError || isAbortLike(err)) throw err;
+      this.log.warn("could not fetch a pinned commit", { commit, error: gitErrorMessage(err) });
+    }
+    return present();
+  }
+
+  revisionTreeReader(barePath: string, commit: string): RepoAgentRevisionReader {
+    if (!SHA40_RE.test(commit)) throw new Error("revision tree reader needs a full commit id");
+    const lsTree = async (args: string[]): Promise<RepoAgentTreeEntry[]> =>
+      parseLsTree(await this.runGit(barePath, ["--no-replace-objects", "ls-tree", "-z", "-l", ...args]));
+    return {
+      entry: async (repoPath) => (await lsTree([commit, "--", repoPath])).find((e) => e.name === repoPath),
+      list: async (treeOid) => {
+        if (!SHA40_RE.test(treeOid)) throw new Error("invalid tree id");
+        return lsTree([treeOid]);
+      },
+      blob: async (oid) => {
+        if (!SHA40_RE.test(oid)) throw new Error("invalid blob id");
+        return this.runGit(barePath, ["--no-replace-objects", "cat-file", "blob", oid]);
+      },
+    };
   }
 
   /** PRD #1416 M3 — point the worker-side tracking ref `refs/uzi-runner/<branch>` at `sha`
@@ -23033,6 +23069,19 @@ async function indexEntries(bytes) {
   }
 });
 `;
+
+const LS_TREE_ENTRY_RE = /^([0-7]{6}) ([a-z]+) ([0-9a-f]{40}) +(-|[0-9]+)\t([^]*)$/;
+
+function parseLsTree(out: string): RepoAgentTreeEntry[] {
+  const entries: RepoAgentTreeEntry[] = [];
+  for (const record of out.split("\0")) {
+    if (record === "") continue;
+    const m = LS_TREE_ENTRY_RE.exec(record);
+    if (!m) throw new Error("unparseable ls-tree entry");
+    entries.push({ mode: m[1]!, type: m[2]!, oid: m[3]!, size: m[4] === "-" ? undefined : Number(m[4]), name: m[5]! });
+  }
+  return entries;
+}
 
 function withDir(cwd: string | undefined, args: string[]): string[] {
   return cwd ? ["-C", cwd, ...args] : args;

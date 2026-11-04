@@ -1223,6 +1223,29 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
   });
 });
 
+describe("AgentRosterSummary — roster revision (issue #3913)", () => {
+  it("shows the default-branch revision the repo agents were read at", () => {
+    const commit = "0123456789abcdef0123456789abcdef01234567";
+    render(
+      <AgentRosterSummary
+        run={run({
+          status: "running",
+          agent_source: "repo",
+          repo_agents: [{ name: "reviewer", description: "rev" }],
+          repo_agent_source_commit: commit,
+        })}
+      />,
+    );
+    expect(screen.getByText(/read at default-branch revision/i)).toBeTruthy();
+    expect(screen.getByText("0123456789ab").getAttribute("title")).toBe(commit);
+  });
+
+  it("shows no revision line when none was recorded", () => {
+    render(<AgentRosterSummary run={run({ status: "running", agent_source: "repo", repo_agents: [] })} />);
+    expect(screen.queryByText(/read at default-branch revision/i)).toBeNull();
+  });
+});
+
 describe("AgentRosterSummary — repo agent folder", () => {
   it("names .codex/agents/ for a repo-source run whose roster was read from it", () => {
     render(

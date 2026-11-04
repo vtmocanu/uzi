@@ -1909,6 +1909,7 @@ export interface ClaimResponse extends ClaimMemoryState {
    *  (PRD #209 M4 Open Question 3, `--require-base`). Meaningful only alongside
    *  planned_base_commit. Absent on an older server ⇒ false, i.e. warn-and-implement. */
   require_base_match?: boolean;
+  repo_agent_source_commit?: string | null;
   /** The run's PERSISTED subagent selection (`runs.agent_source` /
    *  `agent_exclusions`), replayed on every claim (PRD #35).
    *
@@ -2320,6 +2321,10 @@ export interface CompletionPermitResponse {
 /** issue #3194: the `hold_reason` of the `--require-base` base-attestation hold (POST
  *  /api/worker/runs/:id/base-attestation-hold). Mirrors workersvc.HoldReasonBaseAttestationMissing. */
 export const BASE_ATTESTATION_HOLD_REASON = "base_attestation_missing";
+
+export const REPO_AGENT_SOURCE_HOLD_REASON = "repo_agent_source_unavailable";
+
+export const REPO_AGENT_SOURCE_FEATURE = "repo_agent_source_v1";
 
 /** issue #3194: what a base-attestation hold request established. `held` is the server's positive
  *  ACK for this flight's generation; `stale` is a fence refusal (the claim moved on); `unknown`
@@ -2955,6 +2960,7 @@ export interface StateRequest {
    *  means "detected nothing" (the gate's repo card goes inert), while an absent
    *  field/NULL column means "pre-feature run". */
   repo_agents?: RepoAgentSummary[];
+  repo_agent_source_commit?: string;
   /** The selection an AUTOPILOT run resolved for itself (PRD #37 Decision 6):
    *  repo agents when detected, else the owner's templates, with no exclusions.
    *  Human-gated runs persist their selection through the `approve_plan` input

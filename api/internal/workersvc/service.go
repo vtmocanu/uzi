@@ -324,7 +324,8 @@ var (
 	// ErrInvalidSelection covers both PRD #37 payloads: a worker-reported repo
 	// agent roster that breaks a cap, and a browser-submitted agent selection that
 	// names an agent the run does not have. Both map to 400.
-	ErrInvalidSelection = errors.New("invalid agent selection")
+	ErrInvalidSelection        = errors.New("invalid agent selection")
+	ErrRepoAgentSourceConflict = errors.New("the run already records a different repo-agent source revision")
 	// ErrCapabilityUnmet is the sentinel for the PRD #84 M4 4c approval gate: a plan being
 	// approved requires capabilities its OWNING worker cannot satisfy, so the approve is
 	// blocked → 409. It is carried by a *CapabilityUnmetError, which names the unmet set for
@@ -959,6 +960,7 @@ type Store interface {
 	// carries no attestation: running -> paused with hold_reason='base_attestation_missing',
 	// fenced to this worker's live claim generation. An owner-only exit; nothing automatic leaves it.
 	SetRunBaseAttestationHold(ctx context.Context, arg store.SetRunBaseAttestationHoldParams) (store.Run, error)
+	SetRunRepoAgentSourceHold(ctx context.Context, arg store.SetRunRepoAgentSourceHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
 	// PRD #1732 D14: the credential_disabled park writer (exact undelivered claim), and the
 	// promoter's two keyset worklists (one owner's held runs; owners with any held run).
@@ -4212,7 +4214,8 @@ type StateRequest struct {
 	// nothing about the roster; `[]` = detection ran and found none; non-empty = the
 	// detected agents. Only `running` carries it; it is re-validated below, never
 	// trusted from the worker.
-	RepoAgents *[]RepoAgent `json:"repo_agents"`
+	RepoAgents            *[]RepoAgent `json:"repo_agents"`
+	RepoAgentSourceCommit *string      `json:"repo_agent_source_commit"`
 	// PlanChangedFiles is the `git status --porcelain` line list the worker computed
 	// (as the RUNNER uid) at the plan gate. Tri-state pointer with repo_agents
 	// semantics: absent (nil) = a pre-#212 worker says nothing (COALESCE preserves);
@@ -6087,6 +6090,14 @@ func (s *Service) runningStateParams(ctx context.Context, run store.Run, req Sta
 		}
 	}
 
+	if req.RepoAgentSourceCommit != nil {
+		commit, err := repoAgentSourceCommitParam(run, *req.RepoAgentSourceCommit)
+		if err != nil {
+			return p, err
+		}
+		p.RepoAgentSourceCommit = commit
+	}
+
 	if req.RepoAgents != nil {
 		if err := validateRepoAgents(*req.RepoAgents); err != nil {
 			return p, err
@@ -6121,6 +6132,20 @@ func (s *Service) runningStateParams(ctx context.Context, run store.Run, req Sta
 	p.AgentExclusions = exclusions
 	return p, nil
 }
+
+func repoAgentSourceCommitParam(run store.Run, reported string) (pgtype.Text, error) {
+	if !repoAgentSourceCommitRE.MatchString(reported) {
+		return pgtype.Text{}, fmt.Errorf("%w: repo_agent_source_commit must be a full lowercase commit id", ErrInvalidState)
+	}
+	if run.RepoAgentSourceCommit.Valid && run.RepoAgentSourceCommit.String != reported {
+		slog.Warn("workersvc: refused a different repo-agent source revision",
+			"run_id", run.ID, "stored", run.RepoAgentSourceCommit.String, "reported", reported)
+		return pgtype.Text{}, ErrRepoAgentSourceConflict
+	}
+	return pgconv.TextOrNull(reported), nil
+}
+
+var repoAgentSourceCommitRE = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // rosterFor resolves the selectable subagent names of a source for one run:
 //   - "repo": the detected roster — `reported` when this very request carries it,

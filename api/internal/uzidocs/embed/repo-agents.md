@@ -108,18 +108,37 @@ deferral tools stay denied.
 Out of scope: the `[agents]` table in `.codex/config.toml`, and other tools'
 agent folders, are not read.
 
-### How uzi keeps the read inside the clone
+### Which revision is read
 
-Detection is hardened against a repo that tries to point it elsewhere. uzi
-walks the folder's path components without following symlinks: a symlink
-anywhere in them means the folder is not read, and it still counts as present,
-so there is no fallback to the other folder. Each file is opened without
-following symlinks, and before any byte is read the opened file's real path must
-sit directly inside the agents folder; a file that fails this check is skipped.
-The size check and read use that same open handle. The check relies on Linux
-`/proc`, so on a platform without it nothing is read. As supporting context,
-detection runs during preflight, after the clone or resume and before the
-executor starts, in a clone owned by the runner.
+uzi never reads the agent folders from the run's working tree. On a run's
+first claim the worker fetches the repo, resolves the default branch's current
+commit, reads `.claude/agents/` and `.codex/agents/` from git objects at that
+commit, and reports the commit together with the roster before any agent turn
+starts. The server records the commit once per run and refuses a later report
+that names a different one.
+
+Every later claim of the same run (a resume, a requeue, a restart on another
+worker) reads the agent folders at the recorded commit. Edits a run makes to its
+own agent files, and agent files already on the branch an `mr_rework` or
+`ci_fix` run starts from, therefore never change the roster that run uses. The
+run view shows the revision under **Agents used**.
+
+Agent files stay writable: a run can still change them as part of its task. The
+change reaches runs whose first claim comes after it is merged into the default
+branch.
+
+The read follows the same rules as the folder layout above: a symlink for
+`.claude`, `.codex` or either `agents` folder means that folder is not read (it
+still counts as present, so there is no fallback to the other folder), symlinks
+and submodules inside the folder are skipped, and the same caps apply.
+
+If the worker cannot read the recorded commit (for example, it is missing from
+the worker's repository cache and fetching it fails), the agent does not start.
+The run is held as **repo agents unreadable** (`hold_reason`
+`repo_agent_source_unavailable`); resume it once the repository can be fetched,
+or cancel it. A worker that predates the recorded revision does not claim such a
+run. When the API is older than the worker, nothing is recorded and each claim
+reads the agent folders at the default branch's commit at that time.
 
 ## What is loaded, and what is never
 

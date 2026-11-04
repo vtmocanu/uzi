@@ -752,9 +752,10 @@ type RunDTO struct {
 	// The names and descriptions here are REPO-SUPPLIED text. The gate panel
 	// renders them as plain JSX, never through <Markdown>: an attacker-authored
 	// description must not put a clickable link inside an approval dialog.
-	RepoAgents      []RepoAgent `json:"repo_agents"`
-	AgentSource     *string     `json:"agent_source"`
-	AgentExclusions []string    `json:"agent_exclusions"`
+	RepoAgents            []RepoAgent `json:"repo_agents"`
+	RepoAgentSourceCommit *string     `json:"repo_agent_source_commit"`
+	AgentSource           *string     `json:"agent_source"`
+	AgentExclusions       []string    `json:"agent_exclusions"`
 	// OwnAgents is the OWN-source subagent roster (name + description) the run's
 	// owner would run: exactly what ListClaimAgentTemplates delivers to a claim,
 	// minus the lead. It is the single source of truth the plan-gate "My agent

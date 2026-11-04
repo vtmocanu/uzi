@@ -424,6 +424,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	} else {
 		dto.RepoAgents = agents
 	}
+	dto.RepoAgentSourceCommit = textPtrValue(r.RepoAgentSourceCommit.Valid, r.RepoAgentSourceCommit.String)
 	if excl, err := workersvc.DecodeExclusions(r.AgentExclusions); err != nil {
 		slog.Error("decode run agent exclusions", "run_id", r.ID, "error", err)
 	} else {

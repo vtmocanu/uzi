@@ -3683,6 +3683,14 @@ export function AgentRosterSummary({ run }: { run: Run }) {
         </div>
       )}
       {excluded.size > 0 && <p className="text-xs text-faint">Excluded: {[...excluded].join(", ")}</p>}
+      {run.repo_agent_source_commit && (
+        <p className="text-xs text-faint">
+          Repo agents read at default-branch revision{" "}
+          <code title={run.repo_agent_source_commit} className="font-mono">
+            {run.repo_agent_source_commit.slice(0, 12)}
+          </code>
+        </p>
+      )}
     </Card>
   );
 }

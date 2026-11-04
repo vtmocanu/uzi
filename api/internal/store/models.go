@@ -1267,6 +1267,7 @@ type Run struct {
 	HarnessOtherHeld              pgtype.Bool        `json:"harness_other_held"`
 	HarnessPreferredWeeklyResetAt pgtype.Timestamptz `json:"harness_preferred_weekly_reset_at"`
 	HarnessOtherWeeklyResetAt     pgtype.Timestamptz `json:"harness_other_weekly_reset_at"`
+	RepoAgentSourceCommit         pgtype.Text        `json:"repo_agent_source_commit"`
 }
 
 type RunCompletionAttempt struct {

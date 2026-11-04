@@ -220,7 +220,7 @@ var runDTOKeys = []string{
 	"claim_generation",
 	"finished_at", "created_at", "updated_at",
 	// issue #1727: when the run entered its current status; null only defensively.
-	"status_since", "repo_agents", "agent_source",
+	"status_since", "repo_agents", "repo_agent_source_commit", "agent_source",
 	"agent_exclusions", "own_agents",
 	// PRD #111 M1: which Anthropic credential the claim spent. The label is a
 	// snapshot and outlives the id, so both keys are always on the wire.
