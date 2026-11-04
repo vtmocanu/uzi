@@ -20,8 +20,18 @@ another skill already documents.
 
 ## Step 1 — grab all open recommendations
 
-Via uzi-cli: `uzi review backlog --bucket todo --json`, and read the per-category
-open counts. The category set is a closed enum printed by
+Read both views via uzi-cli:
+
+- **All users** (ranking): `uzi admin review backlog --bucket todo --json`, the
+  factory-wide aggregate (needs an `admin_ro` token). Groups carry
+  `user_count`, `run_count`, `open_count` and per-occurrence `judged_at`, with
+  attribution hidden. Use it for category counts and impact ranking, so a
+  pattern other users hit is not missed. Without admin access, say so and
+  continue on your own view.
+- **Your runs** (settling): `uzi review backlog --bucket todo --json`. It has
+  the run and recommendation ids that `show`, `resolve` and `dismiss` need.
+
+The category set is a closed enum printed by
 `uzi review backlog --category --help`; today it is `enable_tool`,
 `install_worker_tool`, `adjust_template`, `improve_agent`, `add_agent`,
 `improve_uzi`, `cost_efficiency`. Re-read the help rather than trusting this list.
@@ -48,8 +58,9 @@ Then:
 
 1. **Bundle by disposition, not by arrival order:**
    - **Quick wins** — small, mechanical, low-risk, one-file fixes.
-   - **High impact** — behavioral or recurring; use `seen in N runs` as the
-     impact signal, so a rec raised by many runs outranks a one-run rec.
+   - **High impact** — behavioral or recurring; rank by the all-users
+     `run_count` and `user_count`, and by recent `judged_at`, so a rec many runs
+     or users still hit outranks a one-run rec.
    - **Cluster by root cause, not by target.** Targets are free text, so one
      missing rule surfaces as many one-run groups with different names; count
      the cluster, not the group.
@@ -148,6 +159,10 @@ disposition via uzi-cli — never before the user confirms, and never silently:
   every run the rec appears in at once).
 - False positive → `uzi review dismiss --category C --target T --reason not-an-issue`.
 - Valid but skipped / already covered → `… --reason wont-do`.
+- These verbs settle only your own runs' occurrences. When the all-users group
+  has more open than your view (`open_count` differs), the rest belong to other
+  users: the CLI cannot settle them (the admin aggregate is read-only); tell
+  the user to use the web All users judge view.
 
 Triage spends no token and writes nothing to the forge; it is instant and
 reversible with `uzi review undo {run-id} {rec-id}` (the resolve/dismiss output
