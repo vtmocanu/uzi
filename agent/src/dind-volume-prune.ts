@@ -21,7 +21,8 @@
 // leg prune is already in flight, the Engine's single-prune guard may make one of the two
 // fail with a conflict; maintenance then follows its existing failed-prune path unchanged.
 //
-// Outcomes (the prune exec only is classified; every outcome consumes the 1h backoff):
+// Outcomes (the prune exec only is classified; every outcome consumes the backoff, re-armed
+// by a <75% sample or after 1h, except `unknown`, which always waits the full hour):
 //   refused   nothing was submitted (spawn failure, version query failed/malformed/< 1.42).
 //   unknown   submitted but the result is unknown (timeout kill, abort after spawn, stdout
 //             overflow, a non-zero exit with no daemon error). No reclamation OR preservation

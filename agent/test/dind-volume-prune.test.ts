@@ -249,6 +249,11 @@ describe("attempt", () => {
     ["daemon too old", { code: 1 }, "Error response from daemon: client version 1.42 is too old. Minimum supported API version is 1.50", "rejected"],
     ["daemon too new", { code: 1 }, "Error response from daemon: client version 1.42 is too new. Maximum supported API version is 1.41", "rejected"],
     ["prune conflict", { code: 1 }, "Error response from daemon: a prune operation is already running", "conflict"],
+    // Precedence: a killed/aborted/overflowed client stays unknown even when its partial
+    // stderr already carries daemon text, so the full hour is not cut short by a re-arm.
+    ["timeout kill after daemon text", { killed: true, signal: "SIGKILL", code: null }, "Command failed\nError response from daemon: boom", "unknown"],
+    ["abort after daemon text", { code: "ABORT_ERR", name: "AbortError" }, "Error response from daemon: a prune operation is already running", "unknown"],
+    ["overflow after daemon text", { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }, "Error response from daemon: boom", "unknown"],
   ];
   for (const [name, fields, message, expected] of failures) {
     it(`prune failure: ${name} -> ${expected}, exactly one prune exec, no retry, backoff consumed`, async () => {
