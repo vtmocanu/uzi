@@ -1,0 +1,8 @@
+diff --git a/api/internal/handler/worker_protocol.go b/api/internal/handler/worker_protocol.go
+index 3be17cf40..5d7f08057 100644
+--- a/api/internal/handler/worker_protocol.go
++++ b/api/internal/handler/worker_protocol.go
+@@ -2470,3 +2470,2 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
+ 	rc := http.NewResponseController(w)
+-	_ = rc.SetReadDeadline(start.Add(publishUploadBudget))
+ 	_ = rc.SetWriteDeadline(start.Add(publishUploadBudget + publishServiceBound + publishResponseGrace))

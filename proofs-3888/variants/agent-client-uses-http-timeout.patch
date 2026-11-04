@@ -1,0 +1,9 @@
+diff --git a/agent/src/client.ts b/agent/src/client.ts
+index 3940950e0..9763d232c 100644
+--- a/agent/src/client.ts
++++ b/agent/src/client.ts
+@@ -1764,3 +1764,3 @@ export class WorkerClient {
+     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
+-    this.checkpointPublishTimeoutValue = opts.checkpointPublishTimeoutMs ?? CHECKPOINT_PUBLISH_TIMEOUT_MS;
++    this.checkpointPublishTimeoutValue = this.httpTimeoutMs;
+     this.codexHTTPTimeoutMs = opts.codexHTTPTimeoutMs ?? 8_000;

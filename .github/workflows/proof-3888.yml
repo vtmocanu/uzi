@@ -1,0 +1,327 @@
+# CI-only regression/mutation proofs for PR #3888 (Refs #3847). THIS BRANCH IS NEVER MERGED.
+# Each matrix leg applies one variant patch (proofs-3888/variants/*.patch, a revert of ONE production seam
+# of the candidate) and runs only the named tests through proofs-3888/run.sh, which INVERTS the verdict for
+# an unfixed variant: the leg is green only if the named tests ran and failed with the expected text.
+# Candidate legs are green only if the same tests ran and passed. See proofs-3888/README.md.
+name: proof-3888
+
+"on":
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    # This workflow is meaningful on its own branch only.
+    if: github.event_name == 'workflow_dispatch' || github.head_ref == 'ci-only/3847-proofs'
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UZI_CI_PG_IMAGE: mirror.gcr.io/library/postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e
+      UZI_TEST_DATABASE_URL: postgres://uzi:uzi-ci@localhost:5432/uzi?sslmode=disable
+    strategy:
+      fail-fast: false
+      # The account has a 20 concurrent job cap shared with ci.yml; keep this workflow to a small slice of it.
+      max-parallel: 5
+      matrix:
+        include:
+          - name: handler-candidate
+            kind: "go"
+            mode: "pass"
+            patch: ""
+            go_pkg: "./internal/handler"
+            go_run: "^TestWorkerRunPublish(SlowServiceOutlivesBaseTimeout|OverBudgetCancelsService|WriteDeadlineCoversDetachedTail|StalledUploadTimesOut|CombinedTrickleAndSlowService|BodyReadErrorMapping)$"
+            go_flags: "-race -count=1"
+            names: "TestWorkerRunPublishSlowServiceOutlivesBaseTimeout;TestWorkerRunPublishOverBudgetCancelsService;TestWorkerRunPublishWriteDeadlineCoversDetachedTail;TestWorkerRunPublishStalledUploadTimesOut;TestWorkerRunPublishCombinedTrickleAndSlowService;TestWorkerRunPublishBodyReadErrorMapping"
+            msg_re: ""
+            pass_names: ""
+            pass_count: ""
+            node_files: ""
+            pg: false
+          - name: handler-unfixed-all
+            kind: "go"
+            mode: "fail"
+            patch: "handler-unfixed-all.patch"
+            go_pkg: "./internal/handler"
+            go_run: "^TestWorkerRunPublish(SlowServiceOutlivesBaseTimeout|OverBudgetCancelsService|WriteDeadlineCoversDetachedTail|StalledUploadTimesOut|CombinedTrickleAndSlowService|BodyReadErrorMapping)$"
+            go_flags: "-race -count=1"
+            names: "TestWorkerRunPublishSlowServiceOutlivesBaseTimeout;TestWorkerRunPublishOverBudgetCancelsService;TestWorkerRunPublishWriteDeadlineCoversDetachedTail;TestWorkerRunPublishStalledUploadTimesOut;TestWorkerRunPublishCombinedTrickleAndSlowService;TestWorkerRunPublishBodyReadErrorMapping"
+            msg_re: "the answer did not arrive|no answer after|want 408"
+            pass_names: ""
+            pass_count: ""
+            node_files: ""
+            pg: false
+          - name: handler-no-write-deadline
+            kind: "go"
+            mode: "fail"
+            patch: "handler-no-write-deadline.patch"
+            go_pkg: "./internal/handler"
+            go_run: "^TestWorkerRunPublish(SlowServiceOutlivesBaseTimeout|OverBudgetCancelsService|WriteDeadlineCoversDetachedTail|StalledUploadTimesOut|CombinedTrickleAndSlowService|BodyReadErrorMapping)$"
+            go_flags: "-race -count=1"
+            names: "TestWorkerRunPublishSlowServiceOutlivesBaseTimeout;TestWorkerRunPublishOverBudgetCancelsService;TestWorkerRunPublishWriteDeadlineCoversDetachedTail;TestWorkerRunPublishCombinedTrickleAndSlowService"
+            msg_re: "the answer did not arrive|no answer after"
+            pass_names: ""
+            pass_count: ""
+            node_files: ""
+            pg: false
+          - name: handler-no-read-deadline
+            kind: "go"
+            mode: "fail"
+            patch: "handler-no-read-deadline.patch"
+            go_pkg: "./internal/handler"
+            go_run: "^TestWorkerRunPublish(SlowServiceOutlivesBaseTimeout|OverBudgetCancelsService|WriteDeadlineCoversDetachedTail|StalledUploadTimesOut|CombinedTrickleAndSlowService|BodyReadErrorMapping)$"
+            go_flags: "-race -count=1"
+            names: "TestWorkerRunPublishCombinedTrickleAndSlowService"
+            msg_re: "status 408 body"
+            pass_names: ""
+            pass_count: ""
+            node_files: ""
+            pg: false
+          - name: handler-no-ctx-budget
+            kind: "go"
+            mode: "fail"
+            patch: "handler-no-ctx-budget.patch"
+            go_pkg: "./internal/handler"
+            go_run: "^TestWorkerRunPublish(SlowServiceOutlivesBaseTimeout|OverBudgetCancelsService|WriteDeadlineCoversDetachedTail|StalledUploadTimesOut|CombinedTrickleAndSlowService|BodyReadErrorMapping)$"
+            go_flags: "-race -count=1"
+            names: "TestWorkerRunPublishOverBudgetCancelsService"
+            msg_re: "no answer after"
+            pass_names: ""
+            pass_count: ""
+            node_files: ""
+            pg: false
+          - name: handler-no-408-mapping
+            kind: "go"
+            mode: "fail"
+            patch: "handler-no-408-mapping.patch"
+            go_pkg: "./internal/handler"
+            go_run: "^TestWorkerRunPublish(SlowServiceOutlivesBaseTimeout|OverBudgetCancelsService|WriteDeadlineCoversDetachedTail|StalledUploadTimesOut|CombinedTrickleAndSlowService|BodyReadErrorMapping)$"
+            go_flags: "-race -count=1"
+            names: "TestWorkerRunPublishStalledUploadTimesOut;TestWorkerRunPublishBodyReadErrorMapping"
+            msg_re: "want 408"
+            pass_names: ""
+            pass_count: ""
+            node_files: ""
+            pg: false
+          - name: livedb-candidate
+            kind: "go"
+            mode: "pass"
+            patch: ""
+            go_pkg: "./internal/workersvc"
+            go_run: "^(TestSupersessionClaimStopsAtPublishDeadlineLiveDB|TestSupersessionFallbackStopsAtPublishDeadlineLiveDB)$"
+            go_flags: "-race -count=1"
+            names: "TestSupersessionClaimStopsAtPublishDeadlineLiveDB;TestSupersessionFallbackStopsAtPublishDeadlineLiveDB"
+            msg_re: ""
+            pass_names: ""
+            pass_count: ""
+            node_files: ""
+            pg: true
+          - name: livedb-no-claim-loop-guard
+            kind: "go"
+            mode: "fail"
+            patch: "livedb-no-claim-loop-guard.patch"
+            go_pkg: "./internal/workersvc"
+            go_run: "^(TestSupersessionClaimStopsAtPublishDeadlineLiveDB|TestSupersessionFallbackStopsAtPublishDeadlineLiveDB)$"
+            go_flags: "-race -count=1"
+            names: "TestSupersessionClaimStopsAtPublishDeadlineLiveDB"
+            msg_re: "the second supersession started after the deadline|want the not_descendant skip|untouched"
+            pass_names: "TestSupersessionFallbackStopsAtPublishDeadlineLiveDB"
+            pass_count: ""
+            node_files: ""
+            pg: true
+          - name: livedb-no-fallback-loop-guard
+            kind: "go"
+            mode: "fail"
+            patch: "livedb-no-fallback-loop-guard.patch"
+            go_pkg: "./internal/workersvc"
+            go_run: "^(TestSupersessionClaimStopsAtPublishDeadlineLiveDB|TestSupersessionFallbackStopsAtPublishDeadlineLiveDB)$"
+            go_flags: "-race -count=1"
+            names: "TestSupersessionFallbackStopsAtPublishDeadlineLiveDB"
+            msg_re: "the second record was superseded after the deadline|want false once the context ended|untouched|nothing freed it"
+            pass_names: "TestSupersessionClaimStopsAtPublishDeadlineLiveDB"
+            pass_count: ""
+            node_files: ""
+            pg: true
+          - name: stability-combined-x50
+            kind: "go"
+            mode: "pass"
+            patch: ""
+            go_pkg: "./internal/handler"
+            go_run: "^TestWorkerRunPublishCombinedTrickleAndSlowService$"
+            go_flags: "-race -count=50"
+            names: "TestWorkerRunPublishCombinedTrickleAndSlowService/http1;TestWorkerRunPublishCombinedTrickleAndSlowService/http2"
+            msg_re: ""
+            pass_names: ""
+            pass_count: "50"
+            node_files: ""
+            pg: false
+          - name: agent-candidate
+            kind: "node"
+            mode: "pass"
+            patch: ""
+            go_pkg: ""
+            go_run: ""
+            go_flags: ""
+            names: "three 5xx attempts share one allowance that expiry during the second backoff ends;an unexpired allowance leaves the three-attempt behaviour unchanged;HTTP retry uses GitCache replay with original deadline: expired=false;abort during backoff creates no next producer or upload;the allowance itself aborts an in-flight attempt when the caller never aborts;nested fetch ERR_HTTP2_STREAM_ERROR yields only the fixed label and key, without retries;classifies the recorded HTTP/2 stream reset chain as stream_reset;checkpoint transport uses native fetch on h1/h2, owns its pools, and honours TLS and proxy opt-in;fresh native-fetch 1.1: header/body limits and cleanup;fresh native-fetch 2.0: header/body limits and cleanup;HTTP proxy forwarding preserves both transport limits;a publish slower than httpTimeoutMs succeeds inside the checkpoint allowance;a client built without the option uses the production allowance, not httpTimeoutMs;the allowance still ends a publish that outlasts it"
+            msg_re: ""
+            pass_names: ""
+            pass_count: ""
+            node_files: "test/runner-checkpoint-retry.test.ts test/checkpoint-default-name-threading.test.ts test/runner-park-checkpoint.test.ts test/client-checkpoint-publish-timeout.test.ts test/checkpoint-publish-h2-reset.test.ts test/checkpoint-publish-transport.test.ts test/runner-checkpoint-diagnostics.test.ts"
+            pg: false
+          - name: agent-allowance-renewed-per-attempt
+            kind: "node"
+            mode: "fail"
+            patch: "agent-allowance-renewed-per-attempt.patch"
+            go_pkg: ""
+            go_run: ""
+            go_flags: ""
+            names: "three 5xx attempts share one allowance that expiry during the second backoff ends;an unexpired allowance leaves the three-attempt behaviour unchanged;HTTP retry uses GitCache replay with original deadline: expired=false"
+            msg_re: "one allowance signal serves every attempt|reference-equal|Expected values to be strictly equal"
+            pass_names: ""
+            pass_count: ""
+            node_files: "test/runner-checkpoint-retry.test.ts test/checkpoint-default-name-threading.test.ts"
+            pg: false
+          - name: agent-caller-abort-not-propagated
+            kind: "node"
+            mode: "fail"
+            patch: "agent-caller-abort-not-propagated.patch"
+            go_pkg: ""
+            go_run: ""
+            go_flags: ""
+            names: "abort during backoff creates no next producer or upload;HTTP retry uses GitCache replay with original deadline: expired=false"
+            msg_re: "caller abort ended the retry promptly|follows the caller's signal|follows the original permit signal"
+            pass_names: ""
+            pass_count: ""
+            node_files: "test/runner-checkpoint-retry.test.ts test/checkpoint-default-name-threading.test.ts test/runner-park-checkpoint.test.ts"
+            pg: false
+          - name: agent-timeout-not-from-allowance-state
+            kind: "node"
+            mode: "fail"
+            patch: "agent-timeout-not-from-allowance-state.patch"
+            go_pkg: ""
+            go_run: ""
+            go_flags: ""
+            names: "three 5xx attempts share one allowance that expiry during the second backoff ends;the allowance itself aborts an in-flight attempt when the caller never aborts"
+            msg_re: "did not match the regular expression /phase=publish_request, cause=timeout/"
+            pass_names: ""
+            pass_count: ""
+            node_files: "test/runner-checkpoint-retry.test.ts"
+            pg: false
+          - name: agent-no-stream-reset-class
+            kind: "node"
+            mode: "fail"
+            patch: "agent-no-stream-reset-class.patch"
+            go_pkg: ""
+            go_run: ""
+            go_flags: ""
+            names: "nested fetch ERR_HTTP2_STREAM_ERROR yields only the fixed label and key, without retries;classifies the recorded HTTP/2 stream reset chain as stream_reset"
+            msg_re: "stream_reset"
+            pass_names: ""
+            pass_count: ""
+            node_files: "test/runner-checkpoint-diagnostics.test.ts"
+            pg: false
+          - name: agent-no-undici-dispatch-timeouts
+            kind: "node"
+            mode: "fail"
+            patch: "agent-no-undici-dispatch-timeouts.patch"
+            go_pkg: ""
+            go_run: ""
+            go_flags: ""
+            names: "checkpoint transport uses native fetch on h1/h2, owns its pools, and honours TLS and proxy opt-in;fresh native-fetch 1.1: header/body limits and cleanup;fresh native-fetch 2.0: header/body limits and cleanup;HTTP proxy forwarding preserves both transport limits"
+            msg_re: "Missing expected rejection"
+            pass_names: ""
+            pass_count: ""
+            node_files: "test/checkpoint-publish-transport.test.ts"
+            pg: false
+          - name: agent-dispatcher-not-attached
+            kind: "node"
+            mode: "fail"
+            patch: "agent-dispatcher-not-attached.patch"
+            go_pkg: ""
+            go_run: ""
+            go_flags: ""
+            names: "checkpoint transport uses native fetch on h1/h2, owns its pools, and honours TLS and proxy opt-in;fresh native-fetch 1.1: header/body limits and cleanup;fresh native-fetch 2.0: header/body limits and cleanup"
+            msg_re: "actual: 0"
+            pass_names: ""
+            pass_count: ""
+            node_files: "test/checkpoint-publish-transport.test.ts"
+            pg: false
+          - name: agent-client-uses-http-timeout
+            kind: "node"
+            mode: "fail"
+            patch: "agent-client-uses-http-timeout.patch"
+            go_pkg: ""
+            go_run: ""
+            go_flags: ""
+            names: "a publish slower than httpTimeoutMs succeeds inside the checkpoint allowance;a client built without the option uses the production allowance, not httpTimeoutMs;the allowance still ends a publish that outlasts it"
+            msg_re: "ended after .* ms, expected about 400|Expected values to be strictly equal"
+            pass_names: ""
+            pass_count: ""
+            node_files: "test/client-checkpoint-publish-timeout.test.ts"
+            pg: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      - name: Start pinned Postgres (mirror first, Docker Hub fallback)
+        if: matrix.pg == 'true'
+        run: |
+          ref=$(./scripts/docker-pull-fallback.sh --print-ref "${UZI_CI_PG_IMAGE#mirror.gcr.io/}")
+          docker run -d --pull=never --name ci-pg -p 127.0.0.1:5432:5432 \
+            -e POSTGRES_USER=uzi -e POSTGRES_DB=uzi -e POSTGRES_PASSWORD=uzi-ci "$ref"
+          for ((attempt=1; attempt<=10; attempt++)); do
+            if docker exec ci-pg pg_isready -h 127.0.0.1 -U uzi -d uzi; then
+              exit 0
+            fi
+            sleep 5
+          done
+          docker logs ci-pg
+          echo "Postgres did not become ready after 10 checks" >&2
+          exit 1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        if: matrix.kind == 'go' || matrix.kind == 'node'
+        with:
+          go-version: "1.27"
+          check-latest: true
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7
+        if: matrix.kind == 'node'
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+      - uses: ./.github/actions/setup-task
+        if: matrix.kind == 'node'
+      - name: Install gitleaks (shared Taskfile pin; the agent tests shell out to it)
+        if: matrix.kind == 'node'
+        env:
+          GOBIN: ${{ runner.temp }}/gitleaks-bin
+        run: |
+          task install:gitleaks
+          printf '%s\n' "$GOBIN" >> "$GITHUB_PATH"
+      - name: npm ci
+        if: matrix.kind == 'node'
+        working-directory: agent
+        run: npm ci
+      - name: Download Go modules
+        if: matrix.kind == 'go'
+        working-directory: api
+        run: go mod download
+      - name: Proof (${{ matrix.mode }}) ${{ matrix.name }}
+        env:
+          KIND: ${{ matrix.kind }}
+          MODE: ${{ matrix.mode }}
+          PATCH: ${{ matrix.patch }}
+          GO_PKG: ${{ matrix.go_pkg }}
+          GO_RUN: ${{ matrix.go_run }}
+          GO_FLAGS: ${{ matrix.go_flags }}
+          NAMES: ${{ matrix.names }}
+          MSG_RE: ${{ matrix.msg_re }}
+          PASS_NAMES: ${{ matrix.pass_names }}
+          PASS_COUNT: ${{ matrix.pass_count }}
+          NODE_FILES: ${{ matrix.node_files }}
+        run: ./proofs-3888/run.sh

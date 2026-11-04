@@ -1,0 +1,9 @@
+diff --git a/agent/src/runner.ts b/agent/src/runner.ts
+index 8f615470f..8971e6adf 100644
+--- a/agent/src/runner.ts
++++ b/agent/src/runner.ts
+@@ -19513,3 +19513,3 @@ export class RunRunner {
+       allowanceTimer = AbortSignal.timeout(allowanceMs);
+-      const allowance = AbortSignal.any([allowanceTimer, ...(signal ? [signal] : [])]);
++      const allowance = AbortSignal.any([allowanceTimer]);
+       for (let attempt = 1; attempt <= 3; attempt++) {

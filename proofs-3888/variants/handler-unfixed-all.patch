@@ -1,0 +1,23 @@
+diff --git a/api/internal/handler/worker_protocol.go b/api/internal/handler/worker_protocol.go
+index 3be17cf40..e2f7a3488 100644
+--- a/api/internal/handler/worker_protocol.go
++++ b/api/internal/handler/worker_protocol.go
+@@ -2470,4 +2470,3 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
+ 	rc := http.NewResponseController(w)
+-	_ = rc.SetReadDeadline(start.Add(publishUploadBudget))
+-	_ = rc.SetWriteDeadline(start.Add(publishUploadBudget + publishServiceBound + publishResponseGrace))
++	_, _ = rc, start
+ 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxPackBytes))
+@@ -2478,5 +2477,2 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
+ 			httpx.Error(w, http.StatusRequestEntityTooLarge, "checkpoint pack too large")
+-		case isUploadTimeout(err):
+-			// An incomplete upload never reaches the publisher.
+-			httpx.Error(w, http.StatusRequestTimeout, "checkpoint pack upload timed out")
+ 		default:
+@@ -2486,5 +2482,3 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
+ 	}
+-	ctx, cancel := context.WithTimeout(r.Context(), publishContextBudget)
+-	defer cancel()
+-	res, err := h.wsvc.PublishAttested(ctx, wkr, runID, tip, attestedSource, body, claimGeneration)
++	res, err := h.wsvc.PublishAttested(r.Context(), wkr, runID, tip, attestedSource, body, claimGeneration)
+ 	if err != nil {

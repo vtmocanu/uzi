@@ -1,0 +1,9 @@
+diff --git a/agent/src/runner.ts b/agent/src/runner.ts
+index 8f615470f..4cb086d7d 100644
+--- a/agent/src/runner.ts
++++ b/agent/src/runner.ts
+@@ -19625,3 +19625,3 @@ export class RunRunner {
+       const phase = packedTip === undefined ? "packing" : "publish_request";
+-      const diagnostic = checkpointErrorDiagnostic(e, phase, flight.redactText, allowanceExpired ? "timeout" : undefined);
++      const diagnostic = checkpointErrorDiagnostic(e, phase, flight.redactText);
+       this.reportPublishOutcome(flight, diagnostic.key, diagnostic.text, {

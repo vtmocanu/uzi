@@ -1,0 +1,9 @@
+diff --git a/agent/src/checkpoint-publish-transport.ts b/agent/src/checkpoint-publish-transport.ts
+index 0a8292982..7079cb9d2 100644
+--- a/agent/src/checkpoint-publish-transport.ts
++++ b/agent/src/checkpoint-publish-transport.ts
+@@ -46,3 +46,3 @@ export function checkpointPublishDispatcher(timeoutMs: number): Dispatcher {
+   // constructor timeout defaults. The composed dispatcher owns the same lifecycle.
+-  return owned.compose(dispatch => (opts, handler) => dispatch({ ...opts, ...options }, handler));
++  return owned.compose(dispatch => (opts, handler) => dispatch(opts, handler));
+ }

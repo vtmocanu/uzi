@@ -1,0 +1,8 @@
+diff --git a/agent/src/runner.ts b/agent/src/runner.ts
+index 8f615470f..955c866d1 100644
+--- a/agent/src/runner.ts
++++ b/agent/src/runner.ts
+@@ -2115,3 +2115,2 @@ function checkpointErrorDiagnostic(
+         // deadline) as this code, one cause below the fetch TypeError; undici has no code of its own.
+-        case "ERR_HTTP2_STREAM_ERROR": causeClass = "stream_reset"; break;
+         case "EHOSTUNREACH": case "ENETUNREACH": case "EHOSTDOWN": case "ENETDOWN": causeClass = "network_unreachable"; break;

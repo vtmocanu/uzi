@@ -1,0 +1,8 @@
+diff --git a/api/internal/handler/worker_protocol.go b/api/internal/handler/worker_protocol.go
+index 3be17cf40..61932122f 100644
+--- a/api/internal/handler/worker_protocol.go
++++ b/api/internal/handler/worker_protocol.go
+@@ -2471,3 +2471,2 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
+ 	_ = rc.SetReadDeadline(start.Add(publishUploadBudget))
+-	_ = rc.SetWriteDeadline(start.Add(publishUploadBudget + publishServiceBound + publishResponseGrace))
+ 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxPackBytes))

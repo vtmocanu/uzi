@@ -1,0 +1,13 @@
+diff --git a/agent/src/runner.ts b/agent/src/runner.ts
+index 8f615470f..a19d65f26 100644
+--- a/agent/src/runner.ts
++++ b/agent/src/runner.ts
+@@ -19512,5 +19512,6 @@ export class RunRunner {
+       const allowanceMs = this.client.checkpointPublishTimeoutMs ?? CHECKPOINT_PUBLISH_TIMEOUT_MS;
+-      allowanceTimer = AbortSignal.timeout(allowanceMs);
+-      const allowance = AbortSignal.any([allowanceTimer, ...(signal ? [signal] : [])]);
++      let allowance!: AbortSignal;
+       for (let attempt = 1; attempt <= 3; attempt++) {
++        allowanceTimer = AbortSignal.timeout(allowanceMs);
++        allowance = AbortSignal.any([allowanceTimer, ...(signal ? [signal] : [])]);
+         allowance.throwIfAborted();

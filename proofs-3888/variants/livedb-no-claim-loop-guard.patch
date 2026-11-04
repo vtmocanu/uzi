@@ -1,0 +1,13 @@
+diff --git a/api/internal/workersvc/checkpoint_supersession.go b/api/internal/workersvc/checkpoint_supersession.go
+index 13f095ac5..b0af42d28 100644
+--- a/api/internal/workersvc/checkpoint_supersession.go
++++ b/api/internal/workersvc/checkpoint_supersession.go
+@@ -84,8 +84,2 @@ func (s *Service) claimCheckpointSlot(ctx context.Context, run store.Run, branch
+ 		}
+-		// Stops the iterations after the one that observed the cancellation (the publish route's
+-		// context budget expired): it is not an atomic barrier. An operation already started runs
+-		// to its own bound (supersedeRetainedCheckpoint detaches from ctx).
+-		if ctx.Err() != nil {
+-			return "not_descendant"
+-		}
+ 		freed, acquired, err := s.supersedeRetainedCheckpoint(ctx, r.RunID)

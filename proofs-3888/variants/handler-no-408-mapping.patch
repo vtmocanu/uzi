@@ -1,0 +1,10 @@
+diff --git a/api/internal/handler/worker_protocol.go b/api/internal/handler/worker_protocol.go
+index 3be17cf40..e78c29f0e 100644
+--- a/api/internal/handler/worker_protocol.go
++++ b/api/internal/handler/worker_protocol.go
+@@ -2478,5 +2478,2 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
+ 			httpx.Error(w, http.StatusRequestEntityTooLarge, "checkpoint pack too large")
+-		case isUploadTimeout(err):
+-			// An incomplete upload never reaches the publisher.
+-			httpx.Error(w, http.StatusRequestTimeout, "checkpoint pack upload timed out")
+ 		default:

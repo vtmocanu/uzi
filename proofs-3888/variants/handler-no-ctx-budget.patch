@@ -1,0 +1,11 @@
+diff --git a/api/internal/handler/worker_protocol.go b/api/internal/handler/worker_protocol.go
+index 3be17cf40..1aa2fb0b3 100644
+--- a/api/internal/handler/worker_protocol.go
++++ b/api/internal/handler/worker_protocol.go
+@@ -2486,5 +2486,3 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
+ 	}
+-	ctx, cancel := context.WithTimeout(r.Context(), publishContextBudget)
+-	defer cancel()
+-	res, err := h.wsvc.PublishAttested(ctx, wkr, runID, tip, attestedSource, body, claimGeneration)
++	res, err := h.wsvc.PublishAttested(r.Context(), wkr, runID, tip, attestedSource, body, claimGeneration)
+ 	if err != nil {
