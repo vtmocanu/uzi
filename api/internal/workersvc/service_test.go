@@ -621,6 +621,9 @@ type fakeStore struct {
 	// was called with (the reconciler).
 	openCustodyHolds           int64
 	countCustodyWorkerParams   *store.CountOpenCustodyHoldsForWorkerParams
+	listCustodyWorkerParams    *store.ListOpenCustodyHoldsForWorkerParams
+	listCustodyRows            []store.ListOpenCustodyHoldsForWorkerRow
+	listCustodyErr             error
 	releasableHolds            []store.ListReleasableCustodyHoldsRow
 	releaseCustodyRows         int64
 	releasedCustodyRuns        []uuid.UUID
@@ -1853,6 +1856,10 @@ func (f *fakeStore) DeleteEphemeralWorkerForRun(_ context.Context, arg store.Del
 func (f *fakeStore) CountOpenCustodyHoldsForWorker(_ context.Context, arg store.CountOpenCustodyHoldsForWorkerParams) (int64, error) {
 	f.countCustodyWorkerParams = &arg
 	return f.openCustodyHolds, nil
+}
+func (f *fakeStore) ListOpenCustodyHoldsForWorker(_ context.Context, arg store.ListOpenCustodyHoldsForWorkerParams) ([]store.ListOpenCustodyHoldsForWorkerRow, error) {
+	f.listCustodyWorkerParams = &arg
+	return f.listCustodyRows, f.listCustodyErr
 }
 func (f *fakeStore) GetCustodyAdmissionForRun(_ context.Context, _ store.GetCustodyAdmissionForRunParams) (store.GetCustodyAdmissionForRunRow, error) {
 	return store.GetCustodyAdmissionForRunRow{OpenHolds: f.openCustodyHolds, AdmissionCountedHolds: f.openCustodyHolds}, nil
@@ -5281,6 +5288,54 @@ func TestDeleteWorkerRejectedWhileHoldingCustody(t *testing.T) {
 		fs.countCustodyWorkerParams.UserID != user ||
 		fs.countCustodyWorkerParams.WorkerID != wkrID {
 		t.Fatalf("custody guard params = %+v, want worker %s scoped to user %s", fs.countCustodyWorkerParams, wkrID, user)
+	}
+}
+
+func TestDeleteWorkerCustodyErrorCarriesHoldList(t *testing.T) {
+	// #3921: the refusal names the blocking holds; Holds stays the authoritative total even
+	// when the (capped) list is shorter.
+	rows := []store.ListOpenCustodyHoldsForWorkerRow{
+		{ID: uuid.New(), RunID: uuid.New(), Generation: 3, RunKind: "issue", RunTitle: "Fix the thing"},
+		{ID: uuid.New(), RunID: uuid.New(), Generation: 1},
+	}
+	fs := &fakeStore{openCustodyHolds: 14, listCustodyRows: rows, deleteWorkerRows: 1}
+	svc := New(fs, newBox(t), testParams())
+	user, wkrID := uuid.New(), uuid.New()
+	err := svc.DeleteWorker(context.Background(), user, wkrID)
+	var ce *WorkerHasCustodyError
+	if !errors.As(err, &ce) {
+		t.Fatalf("err = %v, want *WorkerHasCustodyError", err)
+	}
+	if ce.Holds != 14 {
+		t.Fatalf("Holds = %d, want the count 14", ce.Holds)
+	}
+	if len(ce.List) != 2 || ce.List[0] != rows[0] || ce.List[1] != rows[1] {
+		t.Fatalf("List = %+v, want %+v", ce.List, rows)
+	}
+	if fs.listCustodyWorkerParams == nil || fs.listCustodyWorkerParams.UserID != user || fs.listCustodyWorkerParams.WorkerID != wkrID {
+		t.Fatalf("list params = %+v, want worker %s scoped to user %s", fs.listCustodyWorkerParams, wkrID, user)
+	}
+	if fs.deleteWorkerParams != nil {
+		t.Fatal("no delete should be issued while the worker holds custody")
+	}
+}
+
+func TestDeleteWorkerCustodyListErrorIsReturned(t *testing.T) {
+	// #3921: a listing failure is returned as-is (the handler maps it to 500), mirroring the
+	// active-runs listing; it must not be swallowed into a bare custody refusal.
+	boom := errors.New("list boom")
+	fs := &fakeStore{openCustodyHolds: 2, listCustodyErr: boom, deleteWorkerRows: 1}
+	svc := New(fs, newBox(t), testParams())
+	err := svc.DeleteWorker(context.Background(), uuid.New(), uuid.New())
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the list error", err)
+	}
+	var ce *WorkerHasCustodyError
+	if errors.As(err, &ce) {
+		t.Fatalf("err = %v, must not be a *WorkerHasCustodyError", err)
+	}
+	if fs.deleteWorkerParams != nil {
+		t.Fatal("no delete should be issued after a list error")
 	}
 }
 

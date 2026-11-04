@@ -246,6 +246,94 @@ func TestDeleteWorkerCustodyGuardOwnerScopedLiveDB(t *testing.T) {
 	}
 }
 
+// TestDeleteWorkerCustodyListsLiveHolderHoldsLiveDB pins #3921 against a real Postgres: the
+// custody refusal names the holds whose LIVE holder is the worker (the same predicate as the
+// count), with the run's kind and title, owner-scoped and capped at 10 with Holds the total.
+func TestDeleteWorkerCustodyListsLiveHolderHoldsLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+
+	w := e.seedWorker(t, nil) // the worker under test
+	x := e.seedWorker(t, nil) // another worker: holds a hold ORIGINALLY from w
+
+	seedRun := func(title string) uuid.UUID {
+		id := uuid.New()
+		iid := *e.nextIID
+		*e.nextIID++
+		e.exec(t, `INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, title)
+		           VALUES ($1, $2, $3, 'issue', $4, 'fallback-issue-title', 'd', 'failed', $5)`,
+			id, e.userID, e.repoID, iid, title)
+		return id
+	}
+	run := seedRun("Fix the flaky upload")
+	otherRun := seedRun("Belongs to X")
+
+	// (ii) a hold live on W, on a run with a real title.
+	live := mhOpenHold(t, e, run, 1, w)
+
+	// (i) a hold ORIGINALLY from W but now live on X: it blocks X, not W.
+	moved := uuid.New()
+	e.exec(t, `INSERT INTO recovery_custody_holds
+	             (id, user_id, repo_id, run_id, generation, state,
+	              original_worker_id, original_worker_identity, live_worker_id, live_run_id)
+	           VALUES ($1, $2, $3, $4, 1, 'open', $5, 'ident', $6, $4)`,
+		moved, e.userID, e.repoID, otherRun, w, x)
+
+	// (iii) a FOREIGN owner's open hold naming W as live holder: never listed or counted for
+	// the true owner. (user_id / repo_id carry no FK on the hold table.)
+	foreign := uuid.New()
+	e.exec(t, `INSERT INTO recovery_custody_holds
+	             (id, user_id, repo_id, run_id, generation, state,
+	              original_worker_id, original_worker_identity, live_worker_id)
+	           VALUES ($1, $2, NULL, $3, 1, 'open', $4, 'ident', $5)`,
+		foreign, uuid.New(), uuid.New(), uuid.New(), w)
+
+	custodyErr := func(worker uuid.UUID) *WorkerHasCustodyError {
+		t.Helper()
+		err := svc.DeleteWorker(e.ctx, e.userID, worker)
+		var ce *WorkerHasCustodyError
+		if !errors.As(err, &ce) {
+			t.Fatalf("DeleteWorker(%s) err = %v, want *WorkerHasCustodyError", worker, err)
+		}
+		return ce
+	}
+
+	ce := custodyErr(w)
+	if ce.Holds != 1 || len(ce.List) != 1 {
+		t.Fatalf("W: Holds=%d List=%+v, want exactly the one live hold (moved and foreign holds excluded)", ce.Holds, ce.List)
+	}
+	if got := ce.List[0]; got.ID != live || got.RunID != run || got.Generation != 1 ||
+		got.RunKind != "issue" || got.RunTitle != "Fix the flaky upload" {
+		t.Fatalf("W: List[0] = %+v, want hold %s on run %s with kind issue and its title", got, live, run)
+	}
+
+	cx := custodyErr(x)
+	if cx.Holds != 1 || len(cx.List) != 1 || cx.List[0].ID != moved || cx.List[0].RunTitle != "Belongs to X" {
+		t.Fatalf("X: Holds=%d List=%+v, want the moved hold %s", cx.Holds, cx.List, moved)
+	}
+
+	// (iv) more than the cap live on W: the list is capped at 10, oldest first, and Holds is
+	// the full total.
+	for g := int64(2); g <= 12; g++ {
+		mhOpenHold(t, e, run, g, w)
+	}
+	ce = custodyErr(w)
+	if ce.Holds != 12 {
+		t.Fatalf("W: Holds = %d, want the total 12", ce.Holds)
+	}
+	if len(ce.List) != 10 {
+		t.Fatalf("W: len(List) = %d, want the cap 10", len(ce.List))
+	}
+	if ce.List[0].ID != live {
+		t.Fatalf("W: List[0] = %s, want the oldest hold %s first", ce.List[0].ID, live)
+	}
+	for _, r := range ce.List {
+		if r.ID == foreign || r.ID == moved {
+			t.Fatalf("W: List carries hold %s that does not name W as live holder for this owner", r.ID)
+		}
+	}
+}
+
 // TestSetStateCompletedSameWorkerMultiGenReleasesOnlyCurrentLiveDB is the D1/D2 CORE regression
 // (PRD #1349 M4) — the case the pre-M4 generation-blind completion release got WRONG. ONE worker
 // W holds TWO open holds on a run: an uncaptured generation-1 hold plus a generation-2 hold from
