@@ -150,15 +150,14 @@ like a harmless cleanup and would each risk retrying a guardrail rejection. The
 permanent-first ordering and the fail-closed default are both asserted directly
 by the discriminating test cases above, not just documented in a comment.
 
-## Amendment (2026-11-04, #3929): bare `(failed)` remote rejection is transient
+## Amendment (2026-11-04, #3929): bare `(failed)` remote rejection is classified transient
 
 **Observed.** GitHub refused the finalize branch push of a run for #3916 with
 only git's bare ref-status line, `! [remote rejected] <src> -> <dst> (failed)`,
 and no other diagnostic. GitHub does not document the reason. Because
 `remote rejected` is in `PERMANENT_PATTERNS` (D9 above), the run failed at
-once. Whether that refusal was transient is unproven (a maintainer pushed
-the same content later without issue); this amendment treats the shape as
-transient by decision, not because its cause is known.
+once. Whether that refusal was transient is unproven; this amendment treats
+the shape as transient by decision, not because its cause is known.
 
 **Decision.** `classifyGitStderrText` (`agent/src/git.ts`, called by
 `classifyGitStderr`) now classifies a push as transient when, and only when,
@@ -211,9 +210,10 @@ That is deliberate fail-closed behaviour.
 `(failed)` (stock git prints it for a proc-receive hook's reasonless
 refusal), it is retried needlessly. A run that is not enrolled pays about 31 s
 of backoff plus per-attempt push and proof time. An enrolled run retries
-publication without a model until the configurable hold threshold
-(`RUN_PROVIDER_PARK_MAX_DURATION`, default 24h; `0` disables) is evaluated
-at a later park, so that duration is not a hard bound.
+publication without a model until a publication park at or past the
+configurable hold threshold (`RUN_PROVIDER_PARK_MAX_DURATION`, default 24h;
+`0` disables); the threshold is checked only at park time, so it is not a
+hard duration bound.
 
 **Scope.** Worker-only; older workers keep the old behaviour, and there is no
 API or schema change. Out of scope: checkpoint publication through the api push

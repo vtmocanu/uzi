@@ -258,7 +258,7 @@ it("a permanent MR create rejection (401) is not retried and not typed", async t
   assert.doesNotMatch(failedReason(claim.run_id), /publication_forge_unreachable/);
 });
 
-// #3929: GitHub's bare `(failed)` remote rejection (no stated reason) is a transient ref-update hiccup and
+// #3929: GitHub's bare `(failed)` remote rejection (no stated reason; cause unproven) is classified transient and
 // retries on the schedule; every rejection that states a reason keeps failing fast. The controls below
 // must behave identically before and after the change.
 const FAKE_SHA = "0123456789abcdef0123456789abcdef01234567";

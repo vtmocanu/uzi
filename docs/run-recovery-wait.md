@@ -516,8 +516,9 @@ other reason, a `[rejected]` line, authentication, protected-branch or hook
 refusals, workflow scope and push protection stay permanent. A deterministic
 refusal that prints only `(failed)` is therefore retried too: a run that is not
 enrolled pays about 31 s of backoff before failing, and an enrolled run retries
-until the hold threshold (`RUN_PROVIDER_PARK_MAX_DURATION`) is evaluated at a
-later park, so that duration is not a hard bound. See
+until a publication park at or past the hold threshold
+(`RUN_PROVIDER_PARK_MAX_DURATION`); the threshold is checked only at park
+time, so it is not a hard duration bound. See
 [ADR-284](../adr/0284-forge-push-retry-classifier.md).
 
 ### Write-ahead publication intent

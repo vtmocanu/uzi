@@ -450,7 +450,7 @@ it("a non-enrolled run keeps the existing typed failure for the same outage", as
   assert.match(String(failed(claim.run_id)[0]?.failure_reason), /publication_forge_unreachable: push/);
 });
 
-// #3929: GitHub's bare ` ! [remote rejected] <sha> -> <branch> (failed)` is a transient ref-update hiccup.
+// #3929: GitHub's bare ` ! [remote rejected] <sha> -> <branch> (failed)` is classified transient (cause unproven).
 const BARE_FAILED_STDERR =
   "To https://github.com/org/repo.git\n ! [remote rejected] 0123456789abcdef0123456789abcdef01234567 -> agent/issue-5113 (failed)\n" +
   "error: failed to push some refs to 'https://github.com/org/repo.git'\n";
