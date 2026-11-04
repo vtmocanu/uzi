@@ -190,6 +190,16 @@ RUN GOFLAGS=-buildvcs=false GOBIN=/usr/local/bin go install github.com/zricethez
 RUN n=0; until npm install --global --ignore-scripts yarn@1.22.22; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "yarn install: giving up after $n attempts" >&2; exit 1; }; echo "yarn install failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
  && test "$(yarn --version)" = 1.22.22
 
+# pnpm 10.34.9 for pnpm-lock.yaml repos, integrity-checked, scripts off, no Corepack.
+# MIRRORED from templates/base, which explains the 10.x pin and every assertion.
+RUN set -eu; d="$(mktemp -d)"; cd "$d"; \
+    n=0; until npm pack --silent pnpm@10.34.9 >/dev/null; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "pnpm pack: giving up after $n attempts" >&2; exit 1; }; echo "pnpm pack failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done; \
+    node -e 'const c=require("node:crypto"),f=require("node:fs");const h="sha512-"+c.createHash("sha512").update(f.readFileSync(process.argv[1])).digest("base64");if(h!==process.argv[2]){console.error("pnpm tarball integrity mismatch: got "+h);process.exit(1)}' pnpm-10.34.9.tgz "sha512-9JtajqD97bRLs8DB1ldQkqU8KVDZW3rRXfEfF5dId6LeOgHAfpNOmyjOcW5RwJqUlixzBtCb4uHksYqMh2L9Mg=="; \
+    npm install --global --ignore-scripts --no-audit --no-fund ./pnpm-10.34.9.tgz; \
+    cd /; rm -rf "$d"; \
+    test "$(pnpm --version)" = 10.34.9; \
+    test "$(command -v pnpm)" = /usr/local/bin/pnpm
+
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.
 # The build context is the REPO ROOT (PRD #39 Decision 5), so the worker's own
@@ -439,7 +449,11 @@ RUN mkdir -p /usr/share/uzi-git-nohooks && chmod 0555 /usr/share/uzi-git-nohooks
 
 # Prove the final toolchain as the command uid, without network. Keeping this in
 # the release build avoids exporting/loading the multi-GB image just for a probe.
+# Issue #3906: EXECUTE the baked pnpm through the worker's real js-deps install path,
+# offline (loopback only), proving --ignore-scripts / --ignore-pnpmfile / the
+# packageManager-handoff flag hold, each with a flag-removal control. MIRRORED in both templates.
 USER runner
+RUN --network=none set -eu; cd /app; UZI_PNPM_IMAGE_PROOF=1 node --import tsx --test --test-timeout=120000 /opt/uzi-src/agent/test/js-deps-pnpm-real.test.ts
 RUN --network=none set -eu; cd /opt/uzi-src; \
     which -a go; test "$(which -a go | wc -l)" -eq 1; \
     go version; \

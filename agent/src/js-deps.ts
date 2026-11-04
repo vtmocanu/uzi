@@ -46,7 +46,23 @@
 //          `GET https://registry.npmjs.org/pnpm` and failed; with
 //          `--config.manage-package-manager-versions=false` it ran the installed pnpm and
 //          exited 0. CLOSED by that flag.
-//   npm    no equivalent found. Measured: a `packageManager: "npm@9.0.0"` field caused no
+//          Re-measured on the BAKED pnpm 10.34.9 (issue #3906), and now re-proven on every
+//          image build by `agent/test/js-deps-pnpm-real.test.ts` (offline, runner uid, each
+//          case paired with a flag-removal control that must show the vector live): root
+//          lifecycle scripts, also with workspace `ignoreScripts: false`; `.pnpmfile.cjs`,
+//          workspace `pnpmfile:`, `.npmrc` `global-pnpmfile=` and workspace
+//          `ignorePnpmfile: false`; `packageManager` handoff, also with workspace
+//          `managePackageManagerVersions: true`; and a `configDependencies` `pnpm-plugin-*`
+//          hook served by a loopback registry. The flag pins to pnpm 10: pnpm 11 removed
+//          `managePackageManagerVersions` (replaced by `pmOnFail`), so a pnpm 11 bump must
+//          re-audit that control first.
+//          EGRESS, NOT CLAIMED CLOSED: a repo `.npmrc` `registry=` or `configDependencies`
+//          can make this pre-approval install fetch content from a host the repo chooses and
+//          write it to disk (npm's `registry=` has the same class). A fetched config
+//          dependency's hook is suppressed by `--ignore-pnpmfile` IN THE CASES THE IMAGE PROOF
+//          EXERCISES; that is not a claim that no fetched config dependency can ever lead to
+//          code execution.
+//   npm   no equivalent found. Measured: a `packageManager: "npm@9.0.0"` field caused no
 //          handoff (offline, exit 0), and the auditor separately measured that a repo
 //          `.npmrc` with `ignore-scripts=false` does not override the CLI flag.
 //   bun    no handoff observed (a `packageManager: "bun@1.0.0"` field caused none,
@@ -71,13 +87,15 @@
 // Probed on the then-pinned base (`agent/templates/base/Dockerfile` → `node:24-alpine`,
 // re-checked 2026-09-29):
 // npm ✓ and yarn 1.22.22 ✓ are present (yarn came with that image; since the Node 26 base, both
-// templates install yarn@1.22.22 explicitly and assert its version at build time); **pnpm and bun are NOT**, and neither the
-// Dockerfile's `apk add` nor `devbox-global/devbox.json` supplies them. So on a stock
-// worker a pnpm or bun repo ENOENTs into an honest skip, and this module's headline
-// generalization delivers nothing there today. They become reachable when a run's
-// toolchain provisions them (tier-1 `tool_packages`, or the repo's own devbox under
+// templates install yarn@1.22.22 explicitly and assert its version at build time). Since
+// issue #3906 both templates also bake **pnpm 10.34.9** (integrity-checked tarball, lifecycle
+// scripts off, version and path asserted at build time, NO Corepack shims, plus the
+// release-stage execution proof above). **bun is NOT** baked: neither the Dockerfile's
+// `apk add` nor `devbox-global/devbox.json` supplies it, so on a stock worker a bun repo
+// ENOENTs into an honest skip. bun (or a different pnpm) becomes reachable when a run's
+// toolchain provisions it (tier-1 `tool_packages`, or the repo's own devbox under
 // `repo_devbox_opt_in`), since `buildCheckEnv` puts `toolEnv.PATH` first — which is
-// exactly why their flags are wired now rather than later.
+// exactly why its flags are wired already.
 
 import { spawn } from "node:child_process";
 import { constants as fsConstants, existsSync } from "node:fs";
