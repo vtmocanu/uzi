@@ -232,6 +232,22 @@ func TestAutoSideEvidence(t *testing.T) {
 	}
 }
 
+// An unknown side's reading did not take part in the comparison, so the decision record
+// stores no weekly reset for it even when the stale reading carried one.
+func TestAutomaticDecisionRecordsResetOnlyForKnownSides(t *testing.T) {
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	stale := now.Add(24 * time.Hour)
+	known := now.Add(48 * time.Hour)
+	d := &harnessCreationDecision{}
+	d.applyAutomatic(autoSide{State: autoUnknown, WeeklyReset: &stale}, qualifiedSide(50, &known), now)
+	if d.PreferredWeeklyReset != nil {
+		t.Fatalf("unknown Claude side recorded reset %v", d.PreferredWeeklyReset)
+	}
+	if d.OtherWeeklyReset == nil || !d.OtherWeeklyReset.Equal(known) {
+		t.Fatalf("qualified Codex side reset = %v, want %v", d.OtherWeeklyReset, known)
+	}
+}
+
 func TestClearsInheritOverride(t *testing.T) {
 	tests := []struct {
 		reason  string
