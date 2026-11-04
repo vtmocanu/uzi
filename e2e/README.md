@@ -268,7 +268,7 @@ headers, not the rows.
 | 45 | bounded-concurrency | gitlab | no | PRD #42 bounded-concurrency scenario (stub-only) |
 | 46 | run-health | gitlab | no | PRD #47: run-health detection (stall / loop / in-flight suppression) |
 | 47 | rate-limit-meters | gitlab | no | PRD #53/#104: per-token rate-limit meters (seeded gauge row -> /me) |
-| 48 | auto-selection | gitlab | no | PRD #111 M6: an auto worker picks the emptiest pooled token, and degrades safely |
+| 48 | auto-selection | gitlab | no | PRD #111 M6 / #3844: an auto worker picks an eligible pooled token (soonest weekly reset), and degrades safely |
 | 49 | docker-sidecar | gitlab | no | PRD #83 M2: rootless DinD sidecar + Decision-3 efficacy |
 | 50 | worker-token-binding | gitlab | no | PRD #104: a worker's Anthropic binding reaches the claim payload; a rebind lands on the next claim |
 | 51 | auto-stop-poison | gitlab | no | PRD #108 M5: auto-stop kills a run whose messages can't be saved (direct-to-API poison) |

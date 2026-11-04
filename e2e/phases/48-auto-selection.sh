@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # phase:    auto-selection
-# title:    PRD #111 M6: an auto worker picks the emptiest pooled token, and degrades safely
+# title:    PRD #111 M6 / #3844: an auto worker picks an eligible pooled token (soonest weekly reset), and degrades safely
 # critical: no
 # lane:     gitlab
 # executor: any
@@ -8,7 +8,7 @@
 # provides: -
 # handoff:  -
 # mutates:  worker anthropic_bind_mode(auto); secret auto_eligible pool flags; anthropic_rate_limits gauge rows; a spare anthropic_token
-# restores: worker bind mode->default; spare token deleted; default gauge->55/12; pool left empty
+# restores: worker bind mode->default; spare token deleted; default gauge->55/12, 7-day reset +3d; pool left empty
 # ---------------------------------------------------------------------------
 # PRD #111 M6: auto-selection, end to end through the REAL claim path.
 #
@@ -32,7 +32,7 @@
 # The default itself — poll interval 0 => max staleness 0 — is a pure function of the
 # environment and is pinned exactly in config's own unit test, which is where an
 # arithmetic default belongs.
-say "PRD #111 M6: an auto worker picks the emptiest pooled token, and degrades safely"
+say "PRD #111 M6 / #3844: an auto worker picks an eligible pooled token (soonest weekly reset), and degrades safely"
 
 AS_ADMIN_ID="$ADMIN_ID"
 AS_DEFAULT_SECRET="$ADMIN_SECRET_ID"
@@ -54,15 +54,20 @@ done
 # The DEFAULT is nearly exhausted; the SPARE is nearly empty. The point of the fixture
 # is that the two answers DIFFER: a selector that ignored the gauge, or that just
 # returned the owner default, produces the default token here and is caught.
-as_gauge() {  # as_gauge SECRET_ID FIVE_PCT SEVEN_PCT SYNCED_SQL
+# The optional 5th argument is the 7-day reset as SQL (default +3 days). The ON CONFLICT
+# arm writes it too, so a case that moves a reset (#3844's reset-first case) actually
+# lands it on the row phase 47 seeded instead of keeping that phase's value.
+as_gauge() {  # as_gauge SECRET_ID FIVE_PCT SEVEN_PCT SYNCED_SQL [SEVEN_RESET_SQL]
+  local seven_reset="${5:-now() + interval '3 days'}"
   [ "$(db_psql "INSERT INTO anthropic_rate_limits
              (user_secret_id, user_id, five_hour_pct, five_hour_resets_at,
               seven_day_pct, seven_day_resets_at, source, synced_at, enablement_rev)
            SELECT s.id, s.user_id, $2, now() + interval '1 hour',
-                  $3, now() + interval '3 days', 'usage_endpoint', $4, s.enablement_rev
+                  $3, $seven_reset, 'usage_endpoint', $4, s.enablement_rev
            FROM user_secrets s WHERE s.id = '$1' AND s.user_id = '$AS_ADMIN_ID'
            ON CONFLICT (user_secret_id) DO UPDATE SET
              five_hour_pct = $2, seven_day_pct = $3, synced_at = $4,
+             seven_day_resets_at = EXCLUDED.seven_day_resets_at,
              enablement_rev = EXCLUDED.enablement_rev
            RETURNING user_secret_id")" = "$1" ] \
     || fail "could not seed auto-selection gauge for token $1 at its current revision (missing secret or seed failed)"
@@ -88,7 +93,10 @@ as_run_credential() {  # as_run_credential RUN_ID -> "<label>|<reason>|<headroom
   apiget "/api/runs/$1" | jq -r '.run | "\(.anthropic_secret_label)|\(.anthropic_select_reason)|\(.anthropic_headroom_pct)"'
 }
 
-# ── (a) the happy path: the EMPTIER token wins, and the run says so ──────────────
+# ── (a) the happy path: the only token above the floor wins, and the run says so ──
+# The default's 8 points of headroom are under UZI_AUTOSELECT_MIN_HEADROOM (15), so the
+# spare is the only ELIGIBLE token. That holds under either UZI_AUTOSELECT_ORDER; the
+# ordering itself is case (a2)'s job.
 AS_IID="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E autoselect","description":"implements prds/111-auto-select-anthropic-token.md"}' | jq -r '.card.iid')"
 AS_RUN="$(create_run "$REPO_ID" "$AS_IID")" || fail "auto-selection run-create failed (non-transient; see stderr)"
@@ -96,9 +104,34 @@ wait_status "$AS_RUN" awaiting_approval
 AS_GOT="$(as_run_credential "$AS_RUN")"
 [ "$AS_GOT" = "spare-key|auto|95" ] || fail \
   "auto run recorded '$AS_GOT', want 'spare-key|auto|95'. The default token has 8 points of headroom and the spare 95, so a selector that ignored the gauge, or that fell through to the owner default, lands on 'default' here"
-pass "an auto worker spent the emptiest pooled token (spare-key, auto, 95% headroom)"
+pass "an auto worker skipped the below-floor default and spent the eligible pooled token (spare-key, auto, 95% headroom)"
 apipost "/api/runs/$AS_RUN/inputs" '{"kind":"cancel","body":""}' >/dev/null || fail "could not cancel auto-selection run $AS_RUN"
 wait_status "$AS_RUN" cancelled
+
+# ── (a2) #3844: the SOONEST weekly reset wins over more headroom ───────────────────
+# Both tokens are now above the floor: the default has 40 points of headroom and a 7-day
+# reset in 1 day, the spare 95 points and a reset in 3 days. reset_first (the shipped
+# default) spends the allowance that expires first, so the DEFAULT wins despite having
+# less headroom. A headroom-first ranker lands on spare-key here and is caught.
+AS_DEFAULT_LABEL="$(apiget /api/me/secrets \
+  | jq -r --arg s "$AS_DEFAULT_SECRET" '[.secrets[] | select(.id == $s)][0].label')"
+[ -n "$AS_DEFAULT_LABEL" ] && [ "$AS_DEFAULT_LABEL" != null ] \
+  || fail "could not read the default Anthropic token's label for the reset-first case"
+as_gauge "$AS_DEFAULT_SECRET" 60 60 "now()" "now() + interval '1 day'"   # headroom 40, resets first
+as_gauge "$AS_SPARE_SECRET"    5  5 "now()" "now() + interval '3 days'"  # headroom 95, resets later
+AS_IID_RF="$(apipost "/api/repos/$REPO_ID/issues" \
+  '{"title":"E2E autoselect reset-first","description":"implements prds/111-auto-select-anthropic-token.md"}' | jq -r '.card.iid')"
+AS_RUN_RF="$(create_run "$REPO_ID" "$AS_IID_RF")" || fail "reset-first run-create failed (non-transient; see stderr)"
+wait_status "$AS_RUN_RF" awaiting_approval
+AS_GOT_RF="$(as_run_credential "$AS_RUN_RF")"
+[ "$AS_GOT_RF" = "$AS_DEFAULT_LABEL|auto|40" ] || fail \
+  "reset-first run recorded '$AS_GOT_RF', want '$AS_DEFAULT_LABEL|auto|40'. Both tokens clear the floor; the default's week resets in 1 day and the spare's in 3, so reset_first must spend the default (40% headroom) even though the spare has 95"
+pass "#3844: an auto worker spent the pooled token whose weekly limit resets soonest ($AS_DEFAULT_LABEL, auto, 40% headroom) over the emptier one"
+apipost "/api/runs/$AS_RUN_RF/inputs" '{"kind":"cancel","body":""}' >/dev/null || fail "could not cancel reset-first run $AS_RUN_RF"
+wait_status "$AS_RUN_RF" cancelled
+# Put the default back to the state the later cases were written against (headroom 8,
+# reset +3 days).
+as_gauge "$AS_DEFAULT_SECRET" 92 40 "now()" "now() + interval '3 days'"
 
 # ── (b) #754: a stale pool FLOORS onto the best pooled token, NEVER the out-of-pool default ─
 # Pre-#754 an auto run whose every reading had aged out fell back to the owner DEFAULT and
@@ -202,4 +235,4 @@ apiget /api/me/secrets \
 # And the default's gauge goes back to the 55/12 the rate-limit phase seeded, so a
 # later reader of /api/me/rate-limits sees what that phase established rather than what
 # this one needed.
-as_gauge "$AS_DEFAULT_SECRET" 55 12 "now()"
+as_gauge "$AS_DEFAULT_SECRET" 55 12 "now()" "now() + interval '3 days'"
