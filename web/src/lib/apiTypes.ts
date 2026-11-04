@@ -2751,7 +2751,7 @@ export interface Worker {
   anthropic_secret_label: string | null;
   /** How this worker's run-lane claims choose a credential (PRD #111 M3):
    *  "default" (the owner's default), "pinned" (the id above), or "auto" (uzi picks
-   *  per claim from the owner's opted-in pool, preferring the most headroom).
+   *  per claim from the owner's opted-in pool, by the server's auto-select order).
    *
    *  🔴 It is the EFFECTIVE mode, not the stored column. Deleting a pinned token
    *  nulls the worker's id server-side and leaves the stored mode alone, so the

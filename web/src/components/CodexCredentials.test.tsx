@@ -620,7 +620,7 @@ describe("Codex account mode picker", () => {
     renderCard([secret()], noop, { accountMode: "default" });
     const group = screen.getByRole("group", { name: "Which login a new Codex run uses" });
     expect((within(group).getByRole("radio", { name: /Use the default/ }) as HTMLInputElement).checked).toBe(true);
-    expect((within(group).getByRole("radio", { name: /Pick by headroom/ }) as HTMLInputElement).checked).toBe(false);
+    expect((within(group).getByRole("radio", { name: /Pick from pool/ }) as HTMLInputElement).checked).toBe(false);
   });
 
   it("switches to auto through the API and reports the saved mode", async () => {
@@ -628,11 +628,11 @@ describe("Codex account mode picker", () => {
     const onAccountModeChange = vi.fn();
     const onNotice = vi.fn();
     renderCard([secret()], noop, { accountMode: "default", onAccountModeChange, onNotice });
-    fireEvent.click(screen.getByRole("radio", { name: /Pick by headroom/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Pick from pool/ }));
     await waitFor(() => expect(onAccountModeChange).toHaveBeenCalledWith("auto"));
     expect(mockApi.setCodexAccountMode).toHaveBeenCalledWith("auto");
     expect(onNotice).toHaveBeenLastCalledWith(
-      "New Codex runs now pick the pooled login with the most limit headroom.",
+      "New Codex runs now pick a login from your pool.",
     );
   });
 
@@ -642,7 +642,7 @@ describe("Codex account mode picker", () => {
     let resolve!: (v: { codex_account_mode: "default" | "auto" }) => void;
     mockApi.setCodexAccountMode.mockReturnValue(new Promise((r) => (resolve = r)));
     renderCard([secret()], noop, { accountMode: "default" });
-    const auto = screen.getByRole("radio", { name: /Pick by headroom/ }) as HTMLInputElement;
+    const auto = screen.getByRole("radio", { name: /Pick from pool/ }) as HTMLInputElement;
     fireEvent.click(auto);
     await waitFor(() => expect(mockApi.setCodexAccountMode).toHaveBeenCalledTimes(1));
     expect(auto.matches(":disabled")).toBe(false);
@@ -699,6 +699,6 @@ describe("Codex account mode picker", () => {
 
   it("says the pool is idle in default mode", () => {
     renderCard([secret({ codex_status: "linked", auto_eligible: true })], noop, { accountMode: "default" });
-    expect(screen.getByText("1 login is in the pool. The pool is used only when uzi picks by headroom.")).toBeTruthy();
+    expect(screen.getByText("1 login is in the pool. The pool is used only when "Pick from pool" is selected.")).toBeTruthy();
   });
 });
