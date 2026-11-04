@@ -753,6 +753,55 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         `${name}/Dockerfile must NOT put the supervisor on PATH (resolve it by absolute path only)`,
       );
     });
+
+    // Issue #3906: pnpm is baked from an integrity-pinned tarball (never corepack, never an
+    // unpinned `npm i -g pnpm`) so a repo's pnpm-lock.yaml can be installed by js-deps, and
+    // the release stage EXECUTES it through the real install path before the image ships.
+    it(`${name}: bakes an integrity-pinned pnpm and proves it through js-deps in the release stage (issue #3906)`, () => {
+      const runs = dockerfileLogicalRuns(text);
+      const installs = runs.filter((r) => /\bnpm pack --silent pnpm@/.test(r));
+      assert.equal(installs.length, 1, `${name}/Dockerfile must have exactly one pnpm install RUN`);
+      const run = installs[0]!;
+      const version = /\bnpm pack --silent pnpm@(\d+\.\d+\.\d+)(?!\S)/.exec(run)?.[1];
+      assert.ok(version, `${name}/Dockerfile must pin an exact pnpm semver`);
+      const v = version.replaceAll(".", "\\.");
+      assert.match(run, /sha512-[A-Za-z0-9+/]{86}==/, `${name}/Dockerfile must pin the tarball's sha512 integrity`);
+      assert.match(
+        run,
+        new RegExp(`pnpm-${v}\\.tgz "sha512-[A-Za-z0-9+/]{86}=="`),
+        `${name}/Dockerfile must verify pnpm-${version}.tgz against the pinned integrity`,
+      );
+      assert.match(
+        run,
+        new RegExp(`npm install --global --ignore-scripts [^;]*\\./pnpm-${v}\\.tgz`),
+        `${name}/Dockerfile must install the verified tarball globally with --ignore-scripts`,
+      );
+      assert.ok(run.includes(`test "$(pnpm --version)" = ${version}`), `${name}/Dockerfile must assert the baked pnpm version`);
+      assert.ok(run.includes('test "$(command -v pnpm)" = /usr/local/bin/pnpm'), `${name}/Dockerfile must assert pnpm resolves to /usr/local/bin/pnpm`);
+      assert.deepEqual(
+        runs.filter((r) => /\bcorepack\b/i.test(r)),
+        [],
+        `${name}/Dockerfile must not use corepack (it would fetch a repo-declared manager)`,
+      );
+      assert.doesNotMatch(
+        text.split("\n").filter((l) => !l.trim().startsWith("#")).join("\n"),
+        /\bcorepack\b/i,
+        `${name}/Dockerfile must not mention corepack outside comments`,
+      );
+
+      const release = text.split(/^FROM runtime AS release[ \t]*$/m)[1];
+      assert.ok(release, `${name}/Dockerfile must have a release stage`);
+      const lines = release.split("\n");
+      const userRunner = lines.findIndex((l) => /^USER runner[ \t]*$/.test(l));
+      assert.notEqual(userRunner, -1, `${name}/Dockerfile release stage must drop to the runner uid for its proofs`);
+      assert.equal(
+        lines[userRunner + 1],
+        "RUN --network=none set -eu; cd /app; UZI_PNPM_IMAGE_PROOF=1 node --import tsx --test --test-timeout=120000 /opt/uzi-src/agent/test/js-deps-pnpm-real.test.ts",
+        `${name}/Dockerfile must run the real-pnpm js-deps proof immediately after USER runner, offline, from /app (where tsx resolves)`,
+      );
+      const goProof = lines.findIndex((l) => /^RUN --network=none set -eu; cd \/opt\/uzi-src; \\$/.test(l));
+      assert.ok(goProof > userRunner + 1, `${name}/Dockerfile must run the pnpm proof before the go toolchain proof`);
+    });
   }
 
   // The supervisor build/install line is security-load-bearing (static, root-owned 0555)
@@ -776,6 +825,28 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         first.lines,
         `${t.name} and ${first.name} supervisor build/install lines have drifted — keep them byte-identical (one trust anchor, every template)`,
       );
+    }
+  });
+
+  // Issue #3906: jvm is NOT `FROM base`, so the pnpm pin is mirrored; a drift would ship two
+  // different pnpm trust anchors (version or integrity) in sibling images.
+  it("the pnpm install RUN is byte-identical across templates (version and integrity pinned once)", () => {
+    const perTemplate = dockerfiles.map(({ name, text }) => {
+      const runs = dockerfileLogicalRuns(text).filter((r) => /\bnpm pack --silent pnpm@/.test(r));
+      assert.equal(runs.length, 1, `${name}/Dockerfile must have exactly one pnpm install RUN`);
+      return {
+        name,
+        run: runs[0]!,
+        version: /pnpm@(\d+\.\d+\.\d+)/.exec(runs[0]!)?.[1],
+        integrity: /sha512-[A-Za-z0-9+/]{86}==/.exec(runs[0]!)?.[0],
+      };
+    });
+    const first = perTemplate[0]!;
+    assert.ok(first.version && first.integrity, `${first.name}/Dockerfile must pin a version and integrity`);
+    for (const t of perTemplate.slice(1)) {
+      assert.equal(t.version, first.version, `${t.name} and ${first.name} pnpm versions have drifted`);
+      assert.equal(t.integrity, first.integrity, `${t.name} and ${first.name} pnpm integrity pins have drifted`);
+      assert.strictEqual(t.run, first.run, `${t.name} and ${first.name} pnpm install RUN lines have drifted`);
     }
   });
 });
