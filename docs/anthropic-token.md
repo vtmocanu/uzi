@@ -201,8 +201,8 @@ fallback applies under either order.
 **Cost:** reset-first deliberately concentrates work on the soonest-expiring
 token until it falls under the floor, instead of spreading it. Each run
 already in flight on a token counts slightly against it
-(`UZI_AUTOSELECT_INFLIGHT_PENALTY`), but under reset-first that only breaks
-exact reset ties. A burst of claims inside one polling interval, such as a
+(`UZI_AUTOSELECT_INFLIGHT_PENALTY`), but under reset-first, for picks above
+the floor, that only breaks exact reset ties. A burst of claims inside one polling interval, such as a
 sweep firing several issues, therefore lands on one token that may sit just
 above the floor, which can mean more mid-run usage-limit pauses and resumes. If
 you prefer to spread work, set `UZI_AUTOSELECT_ORDER=headroom_first`: the

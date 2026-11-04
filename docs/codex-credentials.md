@@ -333,13 +333,14 @@ login, uzi never spends your default unless it is pooled too.
   [ADR-3844](../adr/3844-reset-first-pool-order.md).
 - **Spreading runs.** Every unfinished Codex run on an account, a queued one
   included and whichever saved login it uses, counts slightly against that
-  account. Under `reset_first` that nudge only breaks exact weekly-reset ties,
+  account. Under `reset_first`, for picks above the headroom floor, that nudge
+  only breaks exact weekly-reset ties,
   so reset-first deliberately concentrates runs on the soonest-expiring
   account until it falls under the floor, and a burst of runs created inside
   one poll interval (such as a sweep firing several issues) all lands on the
   soonest-expiring account, even when it sits just above the floor, which can
-  mean more mid-run limit pauses and resumes. Set `UZI_AUTOSELECT_ORDER=headroom_first` to spread runs across
-  accounts instead.
+  mean more mid-run limit pauses and resumes. Set
+  `UZI_AUTOSELECT_ORDER=headroom_first` to spread runs across accounts instead.
 
 ### What it records
 
