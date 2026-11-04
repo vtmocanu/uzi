@@ -1301,7 +1301,16 @@ describe("judge model context fences", () => {
         "pairings mean observed exact associations within available collision coverage, not globally unique",
         "executions or correctness. After ordinary identity loss, ordinary cross-kind reuse detection covers",
         "only retained FIFO keys.", "unknown signal/ordinary/delegation class",
-        "dropped admissions and lost collision coverage", "Start-then-result confirmations are observed associations only."]) assert.ok(system.includes(rule), rule);
+        "dropped admissions and lost collision coverage", "Start-then-result confirmations are observed associations only.",
+        // Wall-clock efficiency: the category covers time, and the attribution limits ride with it.
+        "or less wall-clock time, WITHOUT reducing correctness", "recommend bypassing a required check or replacing it with a narrower check",
+        "cite the observed start and end timestamps", "Missing timestamps mean unknown elapsed time",
+        "Do not sum overlapping intervals", "limits, owner waits and parked intervals separately",
+        "intervals are unknown, not idle time",
+        "command lane is not itself evidence of orchestration waste",
+        "preserve the single gate owner and independent hypothesis/mutation proofs",
+        "improve_uzi when the remedy requires changing the factory runtime",
+        "Do not duplicate one proposed remedy across both"]) assert.ok(system.includes(rule), rule);
       const coverage = promptBlock(prompt, "untrusted_trace").body;
       assert.ok(coverage.includes("Confirmed means observed exact associations within available collision coverage, not globally unique executions or correctness."));
       assert.ok(coverage.includes("After ordinary identity loss, ordinary cross-kind reuse detection covers only retained FIFO keys."));

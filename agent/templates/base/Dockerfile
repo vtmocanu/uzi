@@ -247,6 +247,25 @@ RUN GOFLAGS=-buildvcs=false GOBIN=/usr/local/bin go install github.com/zricethez
 RUN n=0; until npm install --global --ignore-scripts yarn@1.22.22; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "yarn install: giving up after $n attempts" >&2; exit 1; }; echo "yarn install failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
  && test "$(yarn --version)" = 1.22.22
 
+# pnpm for repos with a pnpm-lock.yaml (agent/src/js-deps.ts, issue #3906). Pinned to the
+# 10.x line on purpose: pnpm 11 removed `managePackageManagerVersions` (replaced by
+# `pmOnFail`), and js-deps.ts's audited `--config.manage-package-manager-versions=false` is
+# what stops pnpm fetching and running the pnpm version a repo declares. A pnpm 11 pin needs
+# that control re-audited first. NO Corepack: its shims pick and download the
+# repo-declared manager BEFORE pnpm ever sees the protective flags. The tarball is fetched
+# with `npm pack`, its sha512 checked against the registry integrity recorded when the pin
+# was reviewed, then installed from the local file with lifecycle scripts off; version and
+# path are asserted so a drift fails the BUILD. The release stage below EXECUTES the baked
+# pnpm through js-deps (agent/test/js-deps-pnpm-real.test.ts) offline as the runner uid.
+# MIRRORED in templates/jvm (jvm is NOT `FROM base`) — keep in lockstep.
+RUN set -eu; d="$(mktemp -d)"; cd "$d"; \
+    n=0; until npm pack --silent pnpm@10.34.9 >/dev/null; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "pnpm pack: giving up after $n attempts" >&2; exit 1; }; echo "pnpm pack failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done; \
+    node -e 'const c=require("node:crypto"),f=require("node:fs");const h="sha512-"+c.createHash("sha512").update(f.readFileSync(process.argv[1])).digest("base64");if(h!==process.argv[2]){console.error("pnpm tarball integrity mismatch: got "+h);process.exit(1)}' pnpm-10.34.9.tgz "sha512-9JtajqD97bRLs8DB1ldQkqU8KVDZW3rRXfEfF5dId6LeOgHAfpNOmyjOcW5RwJqUlixzBtCb4uHksYqMh2L9Mg=="; \
+    npm install --global --ignore-scripts --no-audit --no-fund ./pnpm-10.34.9.tgz; \
+    cd /; rm -rf "$d"; \
+    test "$(pnpm --version)" = 10.34.9; \
+    test "$(command -v pnpm)" = /usr/local/bin/pnpm
+
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.
 # The build context is the REPO ROOT (PRD #39 Decision 5), so the worker's own
@@ -559,7 +578,15 @@ RUN mkdir -p /usr/share/uzi-git-nohooks && chmod 0555 /usr/share/uzi-git-nohooks
 
 # Prove the final toolchain as the command uid, without network. Keeping this in
 # the release build avoids exporting/loading the multi-GB image just for a probe.
+# Issue #3906: EXECUTE the baked pnpm through the worker's real js-deps install path,
+# offline (loopback only), proving --ignore-scripts / --ignore-pnpmfile / the
+# packageManager-handoff flag / the virtual-store and per-run store pins hold, each with
+# a flag-removal control. UZI_PNPM_XFS_DIR=/dev/shm (the tmpfs every build container has,
+# a second filesystem) lets the test prove the private store still imports across
+# filesystems; UZI_PNPM_XFS_REQUIRED=1 fails the build if that tmpfs is unusable.
+# MIRRORED in both templates.
 USER runner
+RUN --network=none set -eu; cd /app; UZI_PNPM_IMAGE_PROOF=1 UZI_PNPM_XFS_DIR=/dev/shm UZI_PNPM_XFS_REQUIRED=1 node --import tsx --test --test-timeout=120000 /opt/uzi-src/agent/test/js-deps-pnpm-real.test.ts
 RUN --network=none set -eu; cd /opt/uzi-src; \
     which -a go; test "$(which -a go | wc -l)" -eq 1; \
     go version; \

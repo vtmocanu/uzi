@@ -23,7 +23,7 @@ describe("judge display helpers (PRD #46 M4)", () => {
     expect(recommendationLabel("install_worker_tool")).toBe("Install a worker tool");
     expect(recommendationLabel("improve_uzi")).toBe("Improve uzi");
     expect(recommendationLabel("add_agent")).toBe("Add a missing agent");
-    expect(recommendationLabel("cost_efficiency")).toBe("Cost efficiency");
+    expect(recommendationLabel("cost_efficiency")).toBe("Efficiency");
   });
 
   it("humanizes an unknown category rather than showing a raw enum", () => {
