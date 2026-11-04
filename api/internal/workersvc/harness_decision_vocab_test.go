@@ -9,49 +9,58 @@ import (
 	"testing"
 )
 
+var (
+	harnessShapeAddRE   = regexp.MustCompile(`(?i)add\s+constraint\s+runs_harness_decision_shape\b`)
+	harnessReasonListRE = regexp.MustCompile(`(?i)harness_decision_reason\s+(not\s+)?in\s*\(([^)]*)\)`)
+	quotedReasonRE      = regexp.MustCompile(`'([a-z_]+)'`)
+)
+
 // TestHarnessDecisionReasonsMatchCheck guards the Go reason vocabulary against the
 // runs_harness_decision_shape CHECK (#3845). It discovers the newest migration whose Up section
 // adds that constraint, so a landing-time renumber does not stale it, and parses the reason
-// lists instead of restating them.
+// lists instead of restating them. Each list is compared on its own: a reason dropped from the
+// shape list alone must fail even though the auto_* clauses still name it.
 func TestHarnessDecisionReasonsMatchCheck(t *testing.T) {
 	path, body := latestHarnessDecisionShapeMigration(t, "../store/migrations")
-	lists := regexp.MustCompile(`harness_decision_reason\s+IN\s*\(([^)]*)\)`).FindAllStringSubmatch(body, -1)
-	if len(lists) == 0 {
-		t.Fatalf("no harness_decision_reason IN (...) list in %s; the guard is reading the wrong thing", path)
+	lists := harnessReasonListRE.FindAllStringSubmatch(body, -1)
+	if len(lists) != 3 {
+		t.Fatalf("%s: want exactly 3 harness_decision_reason lists (shape IN, reset IN, preferred NOT IN), got %d", path, len(lists))
 	}
-	quoted := regexp.MustCompile(`'([a-z_]+)'`)
-	seen := map[string]bool{}
-	for _, l := range lists {
-		for _, m := range quoted.FindAllStringSubmatch(l[1], -1) {
-			seen[m[1]] = true
+	auto := []string{harnessReasonAutoSoonestReset, harnessReasonAutoOnlyQualified, harnessReasonAutoFallback}
+	for i, want := range []struct {
+		not    bool
+		values []string
+	}{
+		{false, harnessDecisionReasons}, // the shape's closed reason set
+		{false, auto},                   // only auto_* decisions carry weekly resets
+		{true, auto},                    // auto_* decisions record harness_preferred = 'claude'
+	} {
+		if got := lists[i][1] != ""; got != want.not {
+			t.Fatalf("%s: list %d NOT = %v, want %v", path, i, got, want.not)
 		}
-	}
-	fromSQL := make([]string, 0, len(seen))
-	for v := range seen {
-		fromSQL = append(fromSQL, v)
-	}
-	fromGo := append([]string(nil), harnessDecisionReasons...)
-	sort.Strings(fromSQL)
-	sort.Strings(fromGo)
-	if strings.Join(fromSQL, ",") != strings.Join(fromGo, ",") {
-		t.Fatalf("harness decision vocabulary drifted.\n  Go:  %v\n  SQL: %v (%s)", fromGo, fromSQL, path)
-	}
-	// The reset-carrying clause must name exactly the automatic reasons.
-	auto := lists[len(lists)-1][1]
-	var autoSQL []string
-	for _, m := range quoted.FindAllStringSubmatch(auto, -1) {
-		autoSQL = append(autoSQL, m[1])
-	}
-	sort.Strings(autoSQL)
-	wantAuto := []string{harnessReasonAutoFallback, harnessReasonAutoOnlyQualified, harnessReasonAutoSoonestReset}
-	sort.Strings(wantAuto)
-	if strings.Join(autoSQL, ",") != strings.Join(wantAuto, ",") {
-		t.Fatalf("weekly-reset clause reasons = %v, want %v (%s)", autoSQL, wantAuto, path)
+		if got, w := sortedQuoted(lists[i][2]), sortedCopy(want.values); strings.Join(got, ",") != strings.Join(w, ",") {
+			t.Fatalf("harness decision vocabulary drifted in list %d of %s.\n  Go:  %v\n  SQL: %v", i, path, w, got)
+		}
 	}
 }
 
+func sortedQuoted(s string) []string {
+	var out []string
+	for _, m := range quotedReasonRE.FindAllStringSubmatch(s, -1) {
+		out = append(out, m[1])
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedCopy(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
+}
+
 // latestHarnessDecisionShapeMigration returns the highest-numbered migration whose Up section
-// adds runs_harness_decision_shape, and that Up section.
+// adds runs_harness_decision_shape, and that Up section with SQL line comments stripped.
 func latestHarnessDecisionShapeMigration(t *testing.T, dir string) (string, string) {
 	t.Helper()
 	files, err := filepath.Glob(filepath.Join(dir, "*.sql"))
@@ -72,7 +81,14 @@ func latestHarnessDecisionShapeMigration(t *testing.T, dir string) (string, stri
 		if i := strings.Index(up, "-- +goose Down"); i >= 0 {
 			up = up[:i]
 		}
-		if !strings.Contains(up, "ADD CONSTRAINT runs_harness_decision_shape") {
+		lines := strings.Split(up, "\n")
+		for i, l := range lines {
+			if j := strings.Index(l, "--"); j >= 0 {
+				lines[i] = l[:j]
+			}
+		}
+		up = strings.Join(lines, "\n")
+		if !harnessShapeAddRE.MatchString(up) {
 			continue
 		}
 		if num > bestNum {

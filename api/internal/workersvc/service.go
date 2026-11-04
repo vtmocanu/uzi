@@ -8012,7 +8012,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		effOverride := credOverride
 		requestOverride := rawOverride
 		if requestOverride != nil && requestOverride.Mode == CredentialOverrideModeInherit &&
-			resolved.Decision != nil && resolved.Decision.Reason == "overflow" {
+			resolved.Decision != nil && resolved.Decision.Reason == harnessReasonOverflow {
 			// Inherit carries no Anthropic assignment. Normalize it only for
 			// this new creation-time decision; the shared validator retains
 			// its existing Codex refusal for explicit/default/off paths.

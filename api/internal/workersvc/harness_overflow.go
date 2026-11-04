@@ -60,8 +60,15 @@ func (e overflowEvidence) comparison() pgtype.Float8 {
 	return e.Measured
 }
 
-// Automatic-default decision reasons (#3845). auto_fallback always keeps Claude.
+// Harness creation decision reasons. The overflow reasons apply to an explicit default; the
+// auto_* reasons (#3845) to an unset ("Default · automatic") default, where auto_fallback
+// always keeps Claude.
 const (
+	harnessReasonOff               = "off"
+	harnessReasonPreferred         = "preferred"
+	harnessReasonOverflow          = "overflow"
+	harnessReasonUnknownUsage      = "unknown_usage"
+	harnessReasonExcluded          = "excluded"
 	harnessReasonAutoSoonestReset  = "auto_soonest_reset"
 	harnessReasonAutoOnlyQualified = "auto_only_qualified"
 	harnessReasonAutoFallback      = "auto_fallback"
@@ -71,26 +78,26 @@ const (
 // must equal the set in the runs_harness_decision_shape CHECK; harness_decision_vocab_test.go
 // guards that against the newest migration defining the constraint.
 var harnessDecisionReasons = []string{
-	"off", "preferred", "overflow", "unknown_usage", "excluded",
+	harnessReasonOff, harnessReasonPreferred, harnessReasonOverflow, harnessReasonUnknownUsage, harnessReasonExcluded,
 	harnessReasonAutoSoonestReset, harnessReasonAutoOnlyQualified, harnessReasonAutoFallback,
 }
 
 func overflowReason(enabled, eligible bool, preferred, other overflowEvidence) string {
 	if !enabled {
-		return "off"
+		return harnessReasonOff
 	}
 	if !eligible {
-		return "excluded"
+		return harnessReasonExcluded
 	}
 	p, o := preferred.comparison(), other.comparison()
 	if !p.Valid || !o.Valid {
-		return "unknown_usage"
+		return harnessReasonUnknownUsage
 	}
 	if other.Destination && !other.Held && p.Float64 < overflowPreferredBelow &&
 		o.Float64 >= overflowOtherAtLeast && o.Float64-p.Float64 >= overflowAdvantageAtLeast {
-		return "overflow"
+		return harnessReasonOverflow
 	}
-	return "preferred"
+	return harnessReasonPreferred
 }
 
 type harnessCreationDecision struct {
@@ -101,7 +108,7 @@ type harnessCreationDecision struct {
 }
 
 func (d *harnessCreationDecision) chosen() Harness {
-	if d.Reason != "overflow" {
+	if d.Reason != harnessReasonOverflow {
 		return d.Preferred
 	}
 	if d.Preferred == HarnessClaude {
@@ -235,7 +242,7 @@ func (s *Service) evaluateCreationOverflow(ctx context.Context, q *store.Queries
 	other, err := s.resolveRunHarnessQ(ctx, userID, &otherHarness, q)
 	if err != nil {
 		if errors.Is(err, errNoCredentialForHarness) || errors.Is(err, errNoUsableCredential) || errors.Is(err, errCodexPoolUnavailable) {
-			d.Reason = "excluded"
+			d.Reason = harnessReasonExcluded
 			return res, nil, nil
 		}
 		return res, nil, err
@@ -265,7 +272,7 @@ func (s *Service) evaluateCreationOverflow(ctx context.Context, q *store.Queries
 		if !codexPoolRowStructural(r) && res.Harness == HarnessClaude {
 			// The legacy default resolver still regards this linked account as
 			// usable. An unavailable destination must not fail the Claude run.
-			d.Reason = "excluded"
+			d.Reason = harnessReasonExcluded
 			return res, nil, nil
 		}
 		cs, e := s.scoreCodexCandidates(ctx, q, userID, []store.ListCodexPoolAliasesRow{r}, s.selectionNow())

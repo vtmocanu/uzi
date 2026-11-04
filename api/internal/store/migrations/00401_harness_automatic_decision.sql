@@ -3,7 +3,8 @@
 -- Issue #3845: "Default · automatic" harness choice by soonest weekly reset. Automatic
 -- decisions record harness_preferred = 'claude' (the usage-free resolver answer) and map the
 -- preferred_* columns to Claude and other_* to Codex; the two new columns carry the compared
--- accounts' weekly resets (NULL when unknown). Only auto_* decisions may carry a reset.
+-- accounts' weekly resets (NULL when unknown). Only auto_* decisions may carry a reset, and an
+-- auto_* decision must record harness_preferred = 'claude' so the column mapping holds.
 --
 -- The CHECK is replaced NOT VALID so the add is lock-cheap; 00402 validates it under a
 -- SHARE UPDATE EXCLUSIVE lock (the 00224/00225 two-step). Every existing row satisfies the new
@@ -29,6 +30,9 @@ ALTER TABLE runs
         AND
         (harness_decision_reason IN ('auto_soonest_reset', 'auto_only_qualified', 'auto_fallback')
          OR (harness_preferred_weekly_reset_at IS NULL AND harness_other_weekly_reset_at IS NULL))
+        AND
+        (harness_decision_reason NOT IN ('auto_soonest_reset', 'auto_only_qualified', 'auto_fallback')
+         OR harness_preferred = 'claude')
     ) NOT VALID;
 
 -- +goose Down
