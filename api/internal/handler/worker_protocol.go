@@ -2406,8 +2406,8 @@ func (h *Handler) WorkerListMemory(w http.ResponseWriter, r *http.Request) {
 // benign "origin moved / unsupported" outcomes are 200 skips, not errors.
 //
 // Admission is capped: after the header and query validation the request takes a slot from
-// workersvc.AcquireCheckpointPublishSlot (process-wide cap plus a per-owner share, keyed on the
-// worker's user), BEFORE the body read, and holds it for the whole service call. No slot is a 429
+// workersvc.AcquireCheckpointPublishSlot (process-wide cap plus a per-worker share, keyed on the
+// worker id), BEFORE the body read, and holds it for the whole service call. No slot is a 429
 // with reason "busy" and Retry-After: 5, with the body unread and the publisher not called.
 //
 // The base listeners time a request out after 15 s, too short for an upload followed by a forge
@@ -2467,7 +2467,7 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 	}
 	// Admission before the body read: a refused request buffers nothing and holds no deadline
 	// extension. The slot is held for the whole service call (the defer).
-	release, ok := h.wsvc.AcquireCheckpointPublishSlot(wkr.UserID)
+	release, ok := h.wsvc.AcquireCheckpointPublishSlot(wkr.ID)
 	if !ok {
 		w.Header().Set("Retry-After", "5")
 		httpx.ErrorReason(w, http.StatusTooManyRequests, "checkpoint publish uploads are busy", "busy")

@@ -1290,7 +1290,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// BOTH the plain and TLS listeners from this one mount.
 		//
 		// Concurrency: no per-user limiter; WorkerRunPublish takes a slot from
-		// workersvc.AcquireCheckpointPublishSlot (process-wide + per-owner cap, 429 when
+		// workersvc.AcquireCheckpointPublishSlot (process-wide + per-worker cap, 429 when
 		// busy) because each request buffers up to maxPackBytes and holds its connection
 		// for the extended deadlines in worker_publish_deadline.go. The inflation-work cap
 		// and per-publish timeout in pushbroker bound the work inside a request.

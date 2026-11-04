@@ -50,7 +50,7 @@ func (b *recordingBody) Read(p []byte) (int, error) {
 }
 
 // publishAdmissionRig is the real WorkerRunPublish behind a router whose stand-in worker middleware
-// takes the owner from the X-Test-Owner header. The stubbed broker blocks until released.
+// takes the worker id from the X-Test-Worker header. The stubbed broker blocks until released.
 type publishAdmissionRig struct {
 	router  http.Handler
 	stub    *publishStub
@@ -84,8 +84,8 @@ func newPublishAdmissionRig(t *testing.T) *publishAdmissionRig {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			owner := uuid.MustParse(req.Header.Get("X-Test-Owner"))
-			next.ServeHTTP(w, req.WithContext(mw.ContextWithWorker(req.Context(), store.Worker{ID: uuid.New(), UserID: owner})))
+			id := uuid.MustParse(req.Header.Get("X-Test-Worker"))
+			next.ServeHTTP(w, req.WithContext(mw.ContextWithWorker(req.Context(), store.Worker{ID: id, UserID: uuid.New()})))
 		})
 	})
 	r.Post("/api/worker/runs/{id}/publish", h.WorkerRunPublish)
@@ -105,21 +105,21 @@ func (rig *publishAdmissionRig) release() {
 	}
 }
 
-func publishAdmissionReq(owner uuid.UUID, body io.Reader) *http.Request {
+func publishAdmissionReq(worker uuid.UUID, body io.Reader) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/"+uuid.NewString()+"/publish", body)
-	req.Header.Set("X-Test-Owner", owner.String())
+	req.Header.Set("X-Test-Worker", worker.String())
 	req.Header.Set("X-Uzi-Checkpoint-Tip", validTip)
 	return req
 }
 
 // start sends a request in the background and delivers its recorder when it finishes.
-func (rig *publishAdmissionRig) start(owner uuid.UUID) <-chan *httptest.ResponseRecorder {
+func (rig *publishAdmissionRig) start(worker uuid.UUID) <-chan *httptest.ResponseRecorder {
 	done := make(chan *httptest.ResponseRecorder, 1)
 	rig.wg.Add(1)
 	go func() {
 		defer rig.wg.Done()
 		rec := httptest.NewRecorder()
-		rig.router.ServeHTTP(rec, publishAdmissionReq(owner, strings.NewReader("pack")))
+		rig.router.ServeHTTP(rec, publishAdmissionReq(worker, strings.NewReader("pack")))
 		done <- rec
 	}()
 	return done
@@ -147,19 +147,19 @@ func waitRecorder(t *testing.T, ch <-chan *httptest.ResponseRecorder) *httptest.
 	}
 }
 
-// An owner at its share is refused with 429 busy before its body is read or the publisher runs; a
-// second owner is still served; after a release the first owner is served again.
-func TestWorkerRunPublishAdmissionPerOwnerShare(t *testing.T) {
+// A worker at its share is refused with 429 busy before its body is read or the publisher runs; a
+// second worker is still served; after a release the first worker is served again.
+func TestWorkerRunPublishAdmissionPerWorkerShare(t *testing.T) {
 	rig := newPublishAdmissionRig(t)
-	ownerA, ownerB := uuid.New(), uuid.New()
+	workerA, workerB := uuid.New(), uuid.New()
 
-	held := []<-chan *httptest.ResponseRecorder{rig.start(ownerA), rig.start(ownerA)}
+	held := []<-chan *httptest.ResponseRecorder{rig.start(workerA), rig.start(workerA)}
 	rig.waitEntered(t, 2)
 
-	// Owner A's third request: refused, body untouched, publisher not called.
+	// Worker A's third request: refused, body untouched, publisher not called.
 	body := &recordingBody{r: strings.NewReader("pack")}
 	rec := httptest.NewRecorder()
-	rig.router.ServeHTTP(rec, publishAdmissionReq(ownerA, body))
+	rig.router.ServeHTTP(rec, publishAdmissionReq(workerA, body))
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429, body %q", rec.Code, rec.Body.String())
 	}
@@ -176,11 +176,11 @@ func TestWorkerRunPublishAdmissionPerOwnerShare(t *testing.T) {
 		t.Fatalf("publisher calls = %d, want 2 (the refused request must not reach it)", n)
 	}
 
-	// Owner B is unaffected: the global cap still has room.
-	bDone := rig.start(ownerB)
+	// Worker B is unaffected: the global cap still has room.
+	bDone := rig.start(workerB)
 	rig.waitEntered(t, 1)
 
-	// Let everything finish; owner A is admitted again.
+	// Let everything finish; worker A is admitted again.
 	rig.release()
 	for _, ch := range append(held, bDone) {
 		if rec := waitRecorder(t, ch); rec.Code != http.StatusOK {
@@ -188,13 +188,13 @@ func TestWorkerRunPublishAdmissionPerOwnerShare(t *testing.T) {
 		}
 	}
 	rec = httptest.NewRecorder()
-	rig.router.ServeHTTP(rec, publishAdmissionReq(ownerA, strings.NewReader("pack")))
+	rig.router.ServeHTTP(rec, publishAdmissionReq(workerA, strings.NewReader("pack")))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("after release: status = %d, want 200, body %q", rec.Code, rec.Body.String())
 	}
 }
 
-// Four in-flight publishes from distinct owners exhaust the global cap: a fifth owner gets 429.
+// Four in-flight publishes from distinct workers exhaust the global cap: a fifth worker gets 429.
 func TestWorkerRunPublishAdmissionGlobalCap(t *testing.T) {
 	rig := newPublishAdmissionRig(t)
 	var held []<-chan *httptest.ResponseRecorder
