@@ -4,6 +4,98 @@
 **Date**: 2026-10-07
 **Issue**: [vtmocanu/uzi#2417](https://github.com/vtmocanu/uzi/issues/2417)
 
+## Amendment 2026-11-04 — operator resolution of guarded local records (#3885)
+
+**Status**: Accepted for Case A. Case B is proposed, not accepted and not
+implemented (next section).
+
+A worker-local operator command now retires a guarded local recovery
+generation whose closed hold is backed by this record's own receipt or
+acknowledgement. It adds no replacement request, no second release decision, no
+new upload, no new endpoint, schema, privilege or authority. The autonomous
+FINAL ACK and completion-receipt paths are unchanged. The surface is two new ops
+on the retained-source channel (`local-records`, `resolve-local-record`) in
+`agent/src/ops/retained-source-server.ts`, served by
+`RecoveryCoordinator.describeLocalRecords` and `resolveLocalRecord` in
+`agent/src/recovery.ts`. Operator steps are in
+[Recovery docs](../docs/run-recovery.md).
+
+**Case A only.**
+
+- **A1**: the FINAL ACK is already persisted. The existing
+  `forgetGenerationWithinCycle` cleanup runs on operator request.
+- **A2**: the saved immutable FINAL's exact closed hold was released with a
+  receipt matching that request, but the local ACK never landed. The existing
+  finalizer replays the identical request once. The ACK it persists makes the
+  generation A1, and the same cleanup then runs.
+
+**Binding.** Describe prints, and resolve must be given, a digest over the run,
+generation, case, hold and repo ids, `serverCaptureId`, the exact closed-hold
+observation (state, release evidence, receipt, run status), the bare
+repository's `dev:ino` and refs, the record-directory names, the settlement
+names and a hash of each record's content. Resolve recomputes it under the
+journal lock and refuses `descriptor_changed` on any drift. The closed-hold
+observation is a fresh read through the existing original-worker-scoped
+exact-hold API. Missing evidence is a named refusal (`exact_evidence_unavailable`,
+`holds_unknown`, `evidence_deadline`) that grants nothing.
+
+**Order.**
+
+- A1: channel claim gate, authority A, capture cycle C, journal J, bare B.
+- A2: gate, A, C, a J pre-check (released), the inventory source boundary
+  (execution tail, reservation, source-identity and process-quiescence proofs),
+  the finalizer, the release POST, the ACK, then forget (J, B).
+
+Client cancellation is honoured only before the first mutation (the A1 cleanup,
+or the A2 POST). Afterwards only the deadline and worker shutdown can interrupt,
+and they end the request `partial`.
+
+**Retention exclusions.** An unbound `*.tmp` file or orphan bundle in the run's
+record directory refuses as `unbound_artifact:<name>` and is retained.
+Terminal protection and any settlement-root entry refuse. Cleanup deletes only
+artifacts bound to the retired authenticated generation; pins of other
+generations or runs are untouched.
+
+**Failure model.** Abrupt process kill only. This is verified by real `SIGKILL`
+of a child worker process at six points (before the POST, after the POST before
+the ACK write, after the ACK temp write before its rename, after the ACK rename
+before cleanup, after the first shared-bare deletion, and after the bundle
+unlinks before the record deletes), each followed by a fresh process that
+rediscovers the state (`agent/test/recovery-local-record-restart.test.ts`).
+Behaviour under storage or power loss is unspecified: record writes are
+rename-atomic, not fsynced.
+
+**Cooperative deadline contract.** The 60 s request deadline is checked only
+between operations. Owned filesystem I/O and child processes are awaited, so
+locks and the closed claim gate can outlast the deadline and the client's
+120 s idle timeout. The client then reports the outcome unknown and exits
+non-zero. The server still logs and records the final result after the client
+has left (`inspect` lists it in `lastDiscards` with attempt `local-record`).
+The claim gate reopens only once the owned work has settled. The operator
+re-inspects before retrying; the digest changes after any mutation. The 5 s
+channel close/shutdown wait neither establishes settlement nor releases
+ownership.
+
+## Proposed (not accepted) — Case B local-record disposition (#3885)
+
+Not accepted and not implemented. Today a generation in Case B refuses
+`case_b_pending_owner_review`, and issue #3885 stays open for it. This section
+records the contract a later owner ruling would have to meet.
+
+Case B is a guarded record whose closed hold is discarded, or was released
+without this record's matching ACK or receipt. Neither is preservation proof for
+this record. A later disposition would require all of:
+
+- an explicit owner-confirmed disposition bound to the exact
+  owner, repository, run, generation and original worker, and to the inspected
+  record and source descriptor;
+- fresh authoritative exact closed-hold and terminal-lifecycle evidence;
+- the existing source, consumer and process reproof before any deletion.
+
+It would never synthesize `finalAcknowledged`, never convert abandonment into
+archive evidence, and never treat a closed observation as automatic deletion
+authority. Pins stay, and terminal protection stays.
+
 ## Amendment 2026-10-29 — C1b pins do not authorize local retirement (#3591)
 
 [ADR-3591](3591-prerequisite-closure.md) adds API prerequisite pin retention
