@@ -165,15 +165,16 @@ all of these hold:
 
 1. at least one ref-status line is `! [remote rejected] <src> -> <dst> (failed)`
    with the reason exactly `failed`;
-2. every line that mentions `remote rejected` is such a line;
-3. there is no `[rejected]` line;
-4. after removing only whole git framing lines in anchored complete formats
-   (`To <url>`, those ref-status lines, `error: failed to push some refs to
-   '<url>'` with nothing after it, and empty `remote:` lines), the remainder
-   matches no permanent pattern, no push-protection (`GH013`) or
-   workflow-scope marker, no `refusing to allow` line (GitHub's workflow-scope
-   refusal backticks the scope name, so the literal marker alone misses it), no
-   `remote: error:` / `remote: fatal:` line and no `GHnnn` code.
+2. every line is a whole git framing line in an anchored complete format:
+   `To <url>`, such a ref-status line, `error: failed to push some refs to
+   '<url>'` with nothing after it, or an empty (or empty `remote:`) line.
+
+Any other line keeps today's classification, so another `remote rejected`
+reason, a `[rejected]` line and every `remote:` diagnostic (a stated reason,
+marked or not: `GHnnn`, `remote: error:`, GitHub's backticked workflow-scope
+refusal, or free text such as a repository-policy notice) stay permanent.
+This is narrower than enumerating refusal markers: a reason the classifier has
+never seen cannot turn a deterministic refusal transient.
 
 `/remote rejected/i` **stays** in `PERMANENT_PATTERNS`; the exception is a
 narrow, format-based pre-check, with no forge identity in the classifier.
@@ -192,11 +193,11 @@ not enrolled fails terminally with that reason. A transient push refusal never
 enters the `base_align` merge/rebase fallback. No guardrail is weakened: the
 push stays non-forced and the full proof runs on each attempt.
 
-**Framing lines only.** The framing lines are removed because they carry the
-branch name and URL, and `\b40[134]\b` would otherwise match a branch such as
-`agent/issue-404`. Text inside a line is never masked, and GitHub's PR-hint
-lines are not removed, so a hint that carries `404` keeps the push permanent.
-That is deliberate fail-closed behaviour.
+**Framing lines only.** The framing lines are matched whole because they carry
+the branch name and URL, and `\b40[134]\b` would otherwise match a branch such
+as `agent/issue-404`. Text inside a line is never masked, and GitHub's PR-hint
+lines are not framing, so any hint keeps the push permanent. That is deliberate
+fail-closed behaviour.
 
 **Rejected alternatives.**
 

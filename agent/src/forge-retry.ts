@@ -119,11 +119,6 @@ const TRANSIENT_PATTERNS: RegExp[] = [
   /could not connect to server/i,
 ];
 
-/** True when `text` hits any PERMANENT pattern; the single source of truth shared with git.ts's push-stderr classifier. */
-export function matchesPermanentForgePattern(text: string): boolean {
-  return PERMANENT_PATTERNS.some((re) => re.test(text));
-}
-
 /**
  * Classify a forge/git error as "transient" (retry) or "permanent" (fail fast).
  *
@@ -148,7 +143,9 @@ export function classifyForgeError(err: unknown): "transient" | "permanent" {
     return "permanent";
   }
   const msg = err instanceof Error ? err.message : String(err);
-  if (matchesPermanentForgePattern(msg)) return "permanent";
+  for (const re of PERMANENT_PATTERNS) {
+    if (re.test(msg)) return "permanent";
+  }
   for (const re of TRANSIENT_PATTERNS) {
     if (re.test(msg)) return "transient";
   }

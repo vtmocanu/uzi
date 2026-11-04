@@ -35,17 +35,19 @@ describe("classifyGitStderrText", () => {
     ["failed to update ref", full("agent/issue-7", "failed to update ref")],
     ["bare (failed) plus GH006", full("agent/issue-7", "failed", "remote: error: GH006: Protected branch update failed for refs/heads/agent/issue-7.\n")],
     ["bare (failed) plus GH001", full("agent/issue-7", "failed", "remote: error: GH001: Large files detected.\n")],
-    // Each case below is caught by exactly one guard in classifyGitStderrText and by no permanent pattern.
-    ["bare (failed) plus an unknown GH code (GHnnn guard alone)", full("agent/issue-7", "failed", "remote: GH999: odd\n")],
-    ["bare (failed) plus remote: error: (error-prefix guard alone)", full("agent/issue-7", "failed", "remote: error: weird thing\n")],
-    ["bare (failed) plus remote: fatal: (fatal-prefix guard alone)", full("agent/issue-7", "failed", "remote: fatal: weird thing\n")],
-    ["bare (failed) plus a push protection notice (push-protection guard alone)", full("agent/issue-7", "failed", "remote: push protection notice\n")],
-    ["bare (failed) plus a workflow scope notice (workflow-scope guard alone)", full("agent/issue-7", "failed", "remote: update refused without workflow scope\n")],
-    // GitHub's own workflow-scope wording backticks the scope name, so isWorkflowScopeRejection's
-    // literal "workflow scope" misses it; a separate remote: line beside a bare (failed) must stay permanent.
+    // Each case below hits no permanent pattern: only the framing-only rule keeps it permanent.
+    ["bare (failed) plus an unknown GH code", full("agent/issue-7", "failed", "remote: GH999: odd\n")],
+    ["bare (failed) plus remote: error:", full("agent/issue-7", "failed", "remote: error: weird thing\n")],
+    ["bare (failed) plus remote: fatal:", full("agent/issue-7", "failed", "remote: fatal: weird thing\n")],
+    ["bare (failed) plus a push protection notice", full("agent/issue-7", "failed", "remote: push protection notice\n")],
+    ["bare (failed) plus a workflow scope notice", full("agent/issue-7", "failed", "remote: update refused without workflow scope\n")],
+    // GitHub's own workflow-scope wording backticks the scope name, so the literal "workflow scope"
+    // marker misses it; a separate remote: line beside a bare (failed) must stay permanent.
     ["bare (failed) plus GitHub's backticked workflow-scope refusal line", full("agent/issue-7", "failed",
       "remote: refusing to allow a Personal Access Token to create or update workflow `.github/workflows/ci.yml` without `workflow` scope\n")],
-    ["bare (failed) plus a refusing-to-allow line (refusal guard alone)", full("agent/issue-7", "failed", "remote: refusing to allow this update\n")],
+    ["bare (failed) plus a refusing-to-allow line", full("agent/issue-7", "failed", "remote: refusing to allow this update\n")],
+    ["bare (failed) plus an unmarked remote: policy line", full("agent/issue-7", "failed", "remote: Push blocked by repository policy\n")],
+    ["bare (failed) plus a non-remote line", full("agent/issue-7", "failed", "hint: something odd\n")],
     ["one (failed) and one hook-declined status", `To ${URL}\n${status("a")}${status("b", "pre-receive hook declined")}${trailer()}`],
     ["[rejected] fetch first", `To ${URL}\n ! [rejected]        main -> main (fetch first)\n${trailer()}`],
     ["empty stderr", ""],

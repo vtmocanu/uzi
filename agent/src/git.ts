@@ -28,7 +28,7 @@ import { validateCaptureGitRequest } from "./credential-free-capture.js";
 import { RUNNER_UID, WORKER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
-import { classifyForgeError, matchesPermanentForgePattern, withForgeRetry } from "./forge-retry.js";
+import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import {
   ATTEMPT_ID_RE,
@@ -497,37 +497,19 @@ const PUSH_FRAMING_LINES: RegExp[] = [
 /**
  * Classify push stderr text (#3929, ADR-0284 amendment). GitHub was observed refusing a push with a
  * bare ` ! [remote rejected] <sha> -> <branch> (failed)` and no stated reason (cause undocumented and
- * unproven); the permanent `remote rejected` pattern would fail that fast. By decision, that exact shape is
- * transient only when every `remote rejected` line is the bare `(failed)` shape and nothing else in the
- * text states a reason: any `remote rejected` line that states a reason, any `[rejected]` line, a pattern hit in the text left after dropping the
- * whole framing lines (`To <url>`, the bare status line, `error: failed to push some refs`, empty
- * `remote:`), a `refusing to allow` line (GitHub's backticked workflow-scope wording), a
- * `remote: error|fatal:` line, or a `GHnnn` token keeps today's classification. Framing
- * lines carry the branch and URL, so they are removed whole before matching (`agent/issue-404` must
- * not decide); nothing inside any other line is masked.
+ * unproven); the permanent `remote rejected` pattern would fail that fast. By decision, that shape is
+ * transient only when at least one bare `(failed)` status line is present and every line is a whole git
+ * framing line (`To <url>`, the bare status line, `error: failed to push some refs`, empty `remote:`).
+ * Any other line, a `remote:` diagnostic included, may state a reason and keeps today's classification.
+ * Framing lines carry the branch and URL, so they are matched whole (`agent/issue-404` must not decide);
+ * nothing inside any other line is masked.
  */
 export function classifyGitStderrText(stderr: string): "transient" | "permanent" {
   if (!stderr.trim()) return "permanent";
   const lines = stderr.split(/\r?\n|\r/);
-  const remoteRejected = lines.filter((l) => /remote rejected/i.test(l));
-  if (
-    remoteRejected.length > 0 &&
-    remoteRejected.every((l) => BARE_REMOTE_REJECTED_FAILED.test(l)) &&
-    !lines.some((l) => /\[rejected\]/i.test(l))
-  ) {
-    const rest = lines.filter((l) => !PUSH_FRAMING_LINES.some((re) => re.test(l))).join("\n");
-    if (
-      !matchesPermanentForgePattern(rest) &&
-      !isPushProtectionRejection(rest) &&
-      !isWorkflowScopeRejection(rest) &&
-      // GitHub's workflow-scope refusal backticks the scope (`workflow` scope), which the literal
-      // "workflow scope" match above misses; any "refusing to allow" line is a stated refusal.
-      !/refusing to allow/i.test(rest) &&
-      !/^remote:\s*(error|fatal):/im.test(rest) &&
-      !/\bGH\d{3}\b/.test(rest)
-    ) {
-      return "transient";
-    }
+  // Every other line, any other `remote rejected` reason or a `[rejected]` line included, is not framing.
+  if (lines.some((l) => BARE_REMOTE_REJECTED_FAILED.test(l)) && lines.every((l) => PUSH_FRAMING_LINES.some((re) => re.test(l)))) {
+    return "transient";
   }
   return classifyForgeError(new Error(stderr));
 }
