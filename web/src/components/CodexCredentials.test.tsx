@@ -699,6 +699,6 @@ describe("Codex account mode picker", () => {
 
   it("says the pool is idle in default mode", () => {
     renderCard([secret({ codex_status: "linked", auto_eligible: true })], noop, { accountMode: "default" });
-    expect(screen.getByText("1 login is in the pool. The pool is used only when "Pick from pool" is selected.")).toBeTruthy();
+    expect(screen.getByText('1 login is in the pool. The pool is used only when "Pick from pool" is selected.')).toBeTruthy();
   });
 });
