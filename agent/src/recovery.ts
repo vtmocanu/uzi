@@ -5980,7 +5980,9 @@ export class RecoveryCoordinator {
       kind = "case_a_replay";
     }
     const binding = anchor.exactHoldBinding;
-    if (!binding || !anchor.serverCaptureId) return no("binding_missing");
+    const disposition = anchor.finalRequest!.disposition;
+    if (!binding || (disposition.kind === "archive" &&
+        (!anchor.serverCaptureId || disposition.capture_id !== anchor.serverCaptureId))) return no("binding_missing");
     if (selected.some(r => r.exactHoldBinding && canonicalJson(r.exactHoldBinding) !== canonicalJson(binding))) return no("binding_inconsistent");
     const context = anchor.coverageContext;
     if (!context || context.runId !== runId || context.generation !== generation || !anchor.bareDir) return no("bare_mismatch");
@@ -6016,7 +6018,9 @@ export class RecoveryCoordinator {
         return createHash("sha256").update(canonicalJson(digestKind === "case_a_replay" && r === anchor ? unacknowledged : r)).digest("hex");
       });
     const digest = createHash("sha256").update(canonicalJson([
-      "retained-local-record-v1", runId, generation, digestKind, binding.holdId, binding.repoId, anchor.serverCaptureId,
+      // An archive-free FINAL binds the absence explicitly. Its own disposition/receipt identity is
+      // covered below and in the authenticated record content; no archive id is manufactured.
+      "retained-local-record-v1", runId, generation, digestKind, binding.holdId, binding.repoId, anchor.serverCaptureId ?? null,
       { hold_id: exact.hold_id, repo_id: exact.repo_id, state: exact.state, release_evidence: exact.release_evidence ?? null,
         final_receipt: exact.final_receipt ?? null, run_status: exact.run_status },
       snapshot.devIno, bare, snapshot.refs, journal.names, observed.settlementNames, contents,

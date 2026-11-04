@@ -615,8 +615,8 @@ test("a producer-origin record in the generation is non_ordinary_origin; an ACK 
 // ── A2: operator exact replay of a saved FINAL whose closed hold carries a matching receipt ──────────
 
 /** A saved-FINAL world whose release call is recorded together with the bytes present when it was sent. */
-async function replayWorld(opts: { settlement?: boolean } = {}) {
-  const w = await world("saved-final");
+async function replayWorld(opts: { settlement?: boolean; variant?: Variant } = {}) {
+  const w = await world(opts.variant ?? "saved-final");
   w.e.state.allowFinal = true;
   if (opts.settlement) await patch(w.coordinator, w.f.record, { holdSettlement: w.exact as RecoveryExactHold });
   const posts: Array<{ args: unknown[]; bytes: Awaited<ReturnType<typeof inventory>>; refs: string; objects: string }> = [];
@@ -899,13 +899,142 @@ test("outside the operator scope the autonomous live pass still persists the set
   assert.ok(w.calls.reconcile >= 1, "reconcileInventory ran");
 });
 
+/** Start with the real pinned producer, never archive reservation/upload. Save the FINAL through the
+ * existing settled freeze or held-publication producer; optionally let its original ACK land. */
+async function archiveFreeWorld(kind: "settled" | "held_publication", acknowledged: boolean) {
+  const w = await replayWorld({ variant: "pinned" });
+  w.e.state.open = true;
+  w.e.state.allowFinal = acknowledged;
+  w.exact = { ...closed(w.f), state: "open", live_worker_id: closed(w.f).original_worker_id,
+    live_run_id: w.runId, release_evidence: undefined };
+  const cleanup = w.producer.cleanupRecoveryGeneration;
+  // Keep an acknowledged fixture available for the operator, rather than the autonomous cleanup.
+  delete w.producer.cleanupRecoveryGeneration;
+  if (kind === "settled") {
+    // Remove the initial nonempty pinned inventory and its coverage pin from fixture setup.
+    // The new empty inventory below is produced by freezeInventory itself.
+    await fs.unlink(w.coordinator["recordPath"](w.f.record));
+    git(w.bare, "update-ref", "-d", `refs/uzi-coverage/${w.runId}/7/${w.f.record.coverageDigest}`);
+    w.producer.enumerateOwedCandidates = async () => [];
+    const record = await w.coordinator.freezeInventory({ context: w.f.context, currentSha: w.f.head,
+      defaultBranch: "main", locallyQuiescent: true, settledEvidence: "forge_no_output", repoId: binding.repoId });
+    assert.ok(record);
+    w.f.record = record;
+    await w.coordinator["finalizeInventory"](record, false, "deny");
+  } else {
+    await w.coordinator["releaseHeldWithinCycle"](w.f.record,
+      "31050000-0000-4000-8000-0000000000a1");
+  }
+  assert.ok(cleanup);
+  w.producer.cleanupRecoveryGeneration = cleanup;
+  w.f.record = await w.record();
+  assert.equal(w.f.record.inventoryGuarded, true);
+  assert.equal(w.f.record.finalRequest?.disposition.kind, kind);
+  assert.equal(w.f.record.finalAcknowledged === true, acknowledged);
+  assert.equal(w.f.record.serverCaptureId, undefined, "the producer never reserved an archive capture");
+  assert.equal(w.f.record.bundlePath, undefined, "no archive bundle was produced");
+  assert.equal(w.e.calls.produce + w.e.calls.reserve + w.e.calls.upload, 0);
+  w.e.state.open = false;
+  w.e.state.allowFinal = true;
+  w.exact = released(w);
+  assert.ok(w.exact);
+  for (const key of Object.keys(w.calls) as Array<keyof typeof w.calls>) w.calls[key] = 0;
+  for (const key of Object.keys(w.e.calls) as Array<keyof typeof w.e.calls>) w.e.calls[key] = 0;
+  w.posts.length = 0;
+  w.cleanupArgs.length = 0;
+  w.producer.cleanupRecoveryGeneration = async (...args) => {
+    w.cleanupArgs.push(args.length);
+    const raw = await fs.readFile(w.coordinator["recordPath"](w.f.record), "utf8");
+    w.atCleanup.acknowledged = raw.includes('"finalAcknowledged":true');
+    w.atCleanup.settled = raw.includes('"holdSettlement"');
+    return w.cache.cleanupRecoveryGeneration(...args);
+  };
+  return w;
+}
+
+for (const kind of ["settled", "held_publication"] as const) {
+  for (const acknowledged of [false, true]) {
+    test(`archive-free Case A ${kind} ${acknowledged ? "A1" : "A2"}: matching receipt retires without archive authority`, async () => {
+      const w = await archiveFreeWorld(kind, acknowledged);
+      const request = w.f.record.finalRequest!;
+      assert.equal(await w.classification(), acknowledged ? "case_a_ack" : "case_a_replay");
+      const confirm = await w.digest();
+      const bytes = await inventory(w.root);
+      const refs = w.refs();
+      assert.equal(await w.digest(), confirm, "the archive-free digest is stable");
+      assert.deepEqual(await w.resolve(confirm), { kind: "retired", generation: 7, remaining: 0 });
+      assert.equal(w.posts.length, acknowledged ? 0 : 1);
+      if (!acknowledged) {
+        assert.equal(w.posts[0]!.args[2], request.evidence);
+        assert.deepEqual(w.posts[0]!.args[3], request.disposition, "one identical saved FINAL replay");
+        assert.deepEqual(w.posts[0]!.bytes, bytes, "no record change before POST");
+        assert.equal(w.posts[0]!.refs, refs);
+        assert.equal(w.calls.recordWrites, 1, "only the replay ACK is persisted");
+      } else assert.equal(w.calls.recordWrites, 0);
+      assert.equal(w.atCleanup.acknowledged, true);
+      assert.equal(w.cleanupArgs.length, 1);
+      assert.equal(w.calls.retain + w.calls.reconcile + w.calls.existingWrites, 0);
+      assert.equal(w.e.calls.reserve + w.e.calls.upload + w.e.calls.produce + w.e.calls.held, 0);
+      assert.deepEqual(await w.coordinator.inspect(w.runId), []);
+      assert.doesNotMatch(w.refs(), new RegExp(`refs/uzi-coverage/${w.runId}/7/`));
+      for (const ref of w.e.refs.filter(ref => refs.includes(ref + " "))) {
+        assert.match(w.refs(), new RegExp(ref), "the real cleanup keeps unrelated fixture refs");
+      }
+    });
+  }
+}
+
+for (const kind of ["settled", "held_publication"] as const) {
+  const mismatches = kind === "settled" ? ["digest", "evidence"] : ["publication", "source", "digest"];
+  for (const acknowledged of [false, true]) {
+    for (const mismatch of mismatches) {
+      test(`archive-free ${kind} ${acknowledged ? "A1" : "A2"}: a mismatched ${mismatch} refuses without mutation`, async () => {
+        const w = await archiveFreeWorld(kind, acknowledged);
+        const confirm = await w.digest();
+        assert.ok(w.exact && w.exact !== "throw" && w.exact.final_receipt);
+        if (mismatch === "evidence") w.exact = { ...w.exact, release_evidence: "publication" };
+        else {
+          const receipt = w.exact.final_receipt;
+          const field = mismatch === "publication" ? { publication_id: "31050000-0000-4000-8000-0000000000a2" }
+            : mismatch === "source" ? { source_sha: "f".repeat(40) } : { coverage_digest: "b".repeat(64) };
+          w.exact = { ...w.exact, final_receipt: { ...receipt, ...field } };
+        }
+        const bytes = await inventory(w.root);
+        const refs = w.refs();
+        assert.equal(await w.classification(), "case_b_pending_owner_review");
+        assert.deepEqual(await w.resolve(confirm), { kind: "refused", reason: "case_b_pending_owner_review" });
+        await assertByteNeutral(w, bytes, refs);
+        assert.equal(w.cleanupArgs.length, 0);
+        assert.equal(w.e.calls.reserve + w.e.calls.upload + w.e.calls.produce + w.e.calls.held, 0);
+      });
+    }
+  }
+}
+
+for (const serverCaptureId of [undefined, "31050000-0000-4000-8000-0000000000a2"]) {
+  test(`archive FINAL still refuses a ${serverCaptureId ? "wrong" : "missing"} archive capture identity`, async () => {
+    const w = await world("saved-final");
+    const confirm = await w.digest();
+    await patch(w.coordinator, w.f.record, { serverCaptureId });
+    const bytes = await inventory(w.root);
+    const refs = w.refs();
+    const described = await w.describe();
+    assert.equal(described.kind, "described");
+    assert.deepEqual(described.kind === "described" && described.blockers, ["record_unverified"]);
+    assert.deepEqual(await w.resolve(confirm), { kind: "refused", reason: "record_unverified" });
+    assert.deepEqual(await inventory(w.root), bytes);
+    assert.equal(w.refs(), refs);
+    assert.equal(w.e.calls.final + w.e.calls.reserve + w.e.calls.upload + w.e.calls.produce + w.e.calls.held, 0);
+  });
+}
+
 // ── A2, held_publication disposition ─────────────────────────────────────────────────────────────
 
 async function heldReplayWorld() {
   const w = await replayWorld();
   const disposition = { kind: "held_publication" as const, publication_id: "31050000-0000-4000-8000-0000000000a1",
     source_sha: w.f.record.sourceSha, coverage_digest: w.f.record.coverageDigest! };
-  await patch(w.coordinator, w.f.record, { finalRequest: { disposition } });
+  await patch(w.coordinator, w.f.record, { finalRequest: { disposition }, serverCaptureId: undefined });
   w.f.record = await w.record();
   w.exact = { ...closed(w.f), state: "released", run_status: "failed", release_evidence: undefined, final_receipt: disposition };
   for (const key of Object.keys(w.calls) as Array<keyof typeof w.calls>) w.calls[key] = 0;
