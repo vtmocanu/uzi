@@ -692,7 +692,8 @@ controller protection, and unverified on a live cluster. Replace `<ns>`, `<claim
    fix it. Record the claim UID(s) (the `/data` claim and, for Docker workers, the DinD
    claim).
 2. **Check for an existing fence, then stop new intake.** Do this check first: once you
-   cordon, your own hold masks any roll or maintenance fence in the worker's status.
+   cordon, your own hold makes `effective_cordoned` true and so masks a maintenance-only
+   intake fence (a roll or automatic drain stays visible as `draining_since`).
    Read the worker before cordoning:
 
    ```sh
@@ -703,7 +704,9 @@ controller protection, and unverified on a live cluster. Replace `<ns>`, `<claim
    `effective_cordoned: true` with both `manual_cordoned_at` and `draining_since` null
    is an intake fence (the table shows `· intake fenced`); a set `draining_since` with
    no cordon of yours is an automatic drain or roll. Wait for either to clear and
-   re-read; do not delete into them. Then the worker's owner cordons it
+   re-read; do not delete into them. If `manual_cordoned_at` is set by your own earlier,
+   interrupted attempt, uncordon (`uzi worker uncordon <worker-id>`), re-read, and only
+   then continue. Then the worker's owner cordons it
    ([manual cordon](../docs/hosted-workers.md#pause-new-work-with-a-manual-cordon)),
    from the Workers page or `uzi worker cordon <worker-id> -m 'pvc remount'`. Cordon
    needs a persistent worker and an owner; an admin cannot cordon another owner's worker.
@@ -719,10 +722,13 @@ controller protection, and unverified on a live cluster. Replace `<ns>`, `<claim
      unpublished committed work it protects at risk. Resolve it first
      ([Run recovery](../docs/run-recovery.md)); `uzi run recovery` lists your own holds
      for detail but is not the authority.
-   - No roll or maintenance fence appeared since step 2: re-read the same JSON. Your
-     cordon is expected to show `manual_cordoned_at` set; a fence that began after it
-     cannot be told apart in the status cell, so the step-2 check is the gate. If
-     `uzi worker list` shows `(draining)` the worker still has active runs; wait.
+   - No roll or drain started since step 2: re-read the same JSON immediately before
+     step 4 and require `draining_since` to be `null` (your own cordon shows only
+     `manual_cordoned_at`). A roll, automatic drain or pressure recycle sets
+     `draining_since` even on a manually cordoned worker; if it is set, do not delete
+     the pod — uncordon and let the controller finish. Only a maintenance-only intake
+     fence that began after your cordon cannot be seen here, because your cordon already
+     makes `effective_cordoned` true; the step-2 check is the gate for that case.
 4. **Restart only the pod.** Manual pod deletion is outside the controller's busy-run
    protection, which is why steps 2 and 3 are mandatory.
 
