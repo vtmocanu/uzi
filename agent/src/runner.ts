@@ -7904,7 +7904,10 @@ export class RunRunner {
   }
 
   /** Recheck higher-priority interruptions throughout the terminal-failure policy. */
-  private terminalDiskInterruption(flight: RunFlight): void {
+  /** `midRunDiskPark` is the mid-run disk park's own capture loop (issue #3916): the disk stop already
+   *  aborted the flight's cancel controller with its PauseNowSignal for good, so that one reason is the
+   *  park's own pause there and is not an interruption. Every other check is unchanged. */
+  private terminalDiskInterruption(flight: RunFlight, midRunDiskPark = false): void {
     if (flight.steering.claimFence() !== undefined) {
       // The clears below only drop the session keep. issue #1786: the StaleClaimError (or the claim-fence
       // arm, which a set fence reaches first) re-latches preserveRecoveryClone through
@@ -7925,7 +7928,11 @@ export class RunRunner {
     }
     const pause = flight.steering.getPauseMode();
     if (pause === "now" || pause === "milestone") throw new PauseNowSignal();
-    if (flight.cancel.signal.aborted) throw flight.cancel.signal.reason;
+    if (flight.cancel.signal.aborted) {
+      const reason: unknown = flight.cancel.signal.reason;
+      if (midRunDiskPark && reason instanceof PauseNowSignal && pause === "disk") return;
+      throw reason;
+    }
   }
 
   private async deferTerminalExecutionForDisk(
@@ -7980,7 +7987,7 @@ export class RunRunner {
   /** An empty supervised sink proves Codex drain even when recovery custody is disabled.
    * Claude/stub require an affirmative Linux process proof. No git mutation runs here. */
   private async terminalDiskQuiescence(flight: RunFlight,
-    held?: HeldAuthenticatedCapture | HeldFreeCapture): Promise<boolean> {
+    held?: HeldAuthenticatedCapture | HeldFreeCapture, midRunDiskPark = false): Promise<boolean> {
     try {
       if (held) {
         if ("permit" in held) this.assertHeldAuthenticatedCapture(flight, held);
@@ -7998,7 +8005,10 @@ export class RunRunner {
       return !proof.blocked && (flight.executor.safety && !flight.predecessorCapture
         ? true : process.platform === "linux" && proof.outcome.process?.state === "quiescent");
     } catch (error) {
-      this.terminalDiskInterruption(flight);
+      this.terminalDiskInterruption(flight, midRunDiskPark);
+      // The mid-run park's own disk-stop pause is not an interruption of its proof: unproven, so the
+      // bounded proof loop retries or fails closed.
+      if (midRunDiskPark && error instanceof PauseNowSignal && flight.steering.getPauseMode() === "disk") return false;
       if (canonicalRecoveryInterruption(error)) throw error;
       return false;
     }
@@ -21353,6 +21363,11 @@ export class RunRunner {
       return false;
     };
     let propagating = false;
+    // Issue #3916: any disk-cause park (terminal-disk, counted or preventive) keeps its custody and bounds
+    // its unverified captures; a credential deferral that arrives mid-loop leaves the bound.
+    const diskPark = opts.terminalDisk === true || disk !== undefined;
+    const midRunDisk = !opts.terminalDisk && disk !== undefined;
+    const diskBounded = (): boolean => !credentialDeferred && diskPark;
     try {
       for (;;) {
         if (opts.terminalDisk) this.terminalDiskInterruption(flight);
@@ -21599,7 +21614,7 @@ export class RunRunner {
               // its own boundary. Neither step acquires a credential-free capture callback.
               const settlement = await this.settleForCredentialCapture(executor, undefined, "capture", "authenticated");
               if (settlement.kind !== "observed_empty") {
-                if (!opts.terminalDisk) {
+                if (!opts.terminalDisk && !diskBounded()) {
                   runLog.warn("credential recovery park: the execution did not settle; retaining work and retrying", {
                     run_id: flight.runId,
                     errors: settlement.errors.map((e) => e.category),
@@ -21651,10 +21666,11 @@ export class RunRunner {
             });
           }
           blockedCaptures = blockedDetail === undefined ? 0 : blockedCaptures + 1;
-          if (opts.terminalDisk) {
-            this.terminalDiskInterruption(flight);
-            if (!capture && blockedDetail === undefined) unverifiedCaptures++;
-          }
+          if (opts.terminalDisk) this.terminalDiskInterruption(flight);
+          // Issue #3916: a mid-run disk park (counted or preventive) bounds its unverified captures like the
+          // terminal-disk one. Its interruption checks stay below: the disk stop's own PauseNowSignal would
+          // trip terminalDiskInterruption here, so only the bound's proof loop uses the parameterised form.
+          if ((opts.terminalDisk || diskBounded()) && !capture && blockedDetail === undefined) unverifiedCaptures++;
           // Cancellation/shutdown may have arrived during local git or publish. Either takes
           // precedence over the blocked bound below: the loop's top routes a shutdown to the
           // retained posture and a cancel to the cancel report, never to worker_residue_blocked.
@@ -21668,7 +21684,7 @@ export class RunRunner {
             // the retained posture.
             flight.preserveRecoveryClone = true;
             flight.preserveSession = true;
-            await failCapture(quarantinedCapture, { keepCustody: credentialDeferred || opts.terminalDisk });
+            await failCapture(quarantinedCapture, { keepCustody: credentialDeferred || diskPark });
             return false;
           }
           if (!credentialDeferred && blockedDetail !== undefined && blockedCaptures >= RECOVERY_CAPTURE_BLOCKED_ATTEMPTS) {
@@ -21687,18 +21703,18 @@ export class RunRunner {
               attempts: blockedCaptures,
               detail: sanitizeForLog(blockedDetail),
             });
-            await failCapture(new RunResidueBlockedError(blockedDetail), { keepCustody: credentialDeferred || opts.terminalDisk });
+            await failCapture(new RunResidueBlockedError(blockedDetail), { keepCustody: credentialDeferred || diskPark });
             return false;
           }
-          if (!credentialDeferred && opts.terminalDisk && !capture && unverifiedCaptures >= COMPLETION_HOLD_CAPTURE_ATTEMPTS) {
+          if (diskBounded() && !capture && unverifiedCaptures >= COMPLETION_HOLD_CAPTURE_ATTEMPTS) {
             // Captures never restart after this disposition, including lost/statusless park ACKs.
             // Up to four blocked calls can precede each of three nonblocked failures (15 total).
             // Final proof is separately bounded to five calls and performs no capture/git mutation.
             let quiescent = false;
             for (let proof = 0; proof < RECOVERY_CAPTURE_BLOCKED_ATTEMPTS; proof++) {
-              this.terminalDiskInterruption(flight);
-              quiescent = await this.terminalDiskQuiescence(flight, opts.heldAuthenticated ?? opts.heldCapture);
-              this.terminalDiskInterruption(flight);
+              this.terminalDiskInterruption(flight, midRunDisk);
+              quiescent = await this.terminalDiskQuiescence(flight, opts.heldAuthenticated ?? opts.heldCapture, midRunDisk);
+              this.terminalDiskInterruption(flight, midRunDisk);
               if (quiescent) break;
               if (proof + 1 < RECOVERY_CAPTURE_BLOCKED_ATTEMPTS) await retryWait();
             }
