@@ -146,10 +146,11 @@ is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
 
 The script has since grown past that one query: it sweeps **every `*LiveDB` test in
 the seven packages that carry one**, `store`, `handler`, `forgesvc`, `schedsvc`,
-`workersvc`, `recovery` and `poller`, serially (`-p 1`, one shared database). CI's `test-api-store-it` job runs
-the same list. A `*LiveDB` test in a package neither list names runs nowhere and still
-prints `ok`, so a new live-DB test in an eighth package must add that package to both
-the script and `.github/workflows/ci.yml` in the same commit.
+`workersvc`, `recovery` and `poller`, serially (`-p 1`, one shared database). CI runs this script once, in
+`test-codex-refresh-lostreply-e2e`, and `test-api-store-it` is a thin context that
+requires that run to have succeeded. A `*LiveDB` test in a package the script's list
+does not name runs nowhere and still prints `ok`, so a new live-DB test in an eighth
+package must add that package to `PKGS` in the script.
 
 The script runs each package in a separate Go invocation against the same DSN,
 appending to one log for the aggregate and per-package guards. Each invocation has
