@@ -67,8 +67,8 @@ func FromRateLimitRow(row store.ListRateLimitsForUserRow) autoselect.Candidate {
 		t := row.SevenDayResetsAt.Time
 		c.SevenResetsAt = &t
 		// The seven-day window is the weekly window Claude always reports, so its reset
-		// is the reset_first ranking key (#3844). A separate copy keeps it from aliasing
-		// SevenResetsAt, which is the binding-window reset.
+		// is the reset_first ranking key (#3844). A separate copy keeps the two fields
+		// independent pointers.
 		w := row.SevenDayResetsAt.Time
 		c.WeeklyResetsAt = &w
 	}

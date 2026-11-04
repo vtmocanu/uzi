@@ -238,7 +238,9 @@ func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outco
 		// In-flight bias (herd control). The gauge lags the poll interval, so several
 		// claims inside one interval read the SAME headroom and would pile onto the
 		// same emptiest token. Subtracting per concurrent run breaks that tie toward
-		// spreading. It may go negative; that is fine, the anchor is relative.
+		// spreading under headroom_first and best_of_pool; a reset_first auto pick uses
+		// rank only to break exact weekly-reset ties (resetFirstLess). It may go
+		// negative; that is fine, the anchor is relative.
 		measured = append(measured, scored{c: c, e: e, rank: e.Headroom - p.InflightPenalty*c.InFlight})
 		if e.Status == StatusEligible {
 			anyEligible = true

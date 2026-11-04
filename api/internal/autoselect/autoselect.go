@@ -57,10 +57,10 @@ type Candidate struct {
 	SevenResetsAt *time.Time
 	SyncedAt      *time.Time // NOT NULL in the table, nullable through the LEFT JOIN
 	// WeeklyResetsAt is the reset of the WEEKLY window, used ONLY as the reset_first
-	// ranking key (#3844). It is distinct from FiveResetsAt/SevenResetsAt, which stay
-	// the BINDING-window resets that headroom_first's tie-break reads: the weekly
-	// reset is the one that is always reported, even when a 5-hour window is also
-	// present and binding. nil means no known weekly reset.
+	// ranking key (#3844). headroom_first's tie-break never reads it: it derives the
+	// BINDING-window reset from FiveResetsAt/SevenResetsAt (resetKey), and the Codex
+	// adapter fills both of those with its binding reset, so the weekly key needs a
+	// field of its own. nil means no known weekly reset.
 	WeeklyResetsAt *time.Time
 	// InFlight is the count of runs currently spending this credential. Populated
 	// only by M4's ranking query and used only by the ranker's in-flight bias — it

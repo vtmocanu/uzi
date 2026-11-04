@@ -23,7 +23,8 @@ week is further away, because its allowance carries on.
 - **A new server setting `UZI_AUTOSELECT_ORDER`**: `reset_first` (default) or
   `headroom_first`. `api/internal/config/config.go` trims the value and, when it
   is not a known order, logs a boot warning and falls back to `reset_first`. It
-  is not a Helm chart value.
+  has no dedicated Helm chart value; on Helm it is set like any other API env
+  var, under `api.config`.
 - **`reset_first` ranks only the `auto` set.** In
   `api/internal/autoselect/select.go`, `if reason == ReasonAuto && p.Order != OrderHeadroomFirst {`
   picks from the candidates that are measurable, not capacity-held and at or
@@ -65,7 +66,7 @@ week is further away, because its allowance carries on.
   soonest-expiring token until it falls under the floor. The in-flight penalty
   only breaks exact weekly-reset ties for `auto` picks, so a burst of claims
   inside one poll interval (for example a sweep firing several issues) lands on
-  one token just above the floor. Expect more mid-run usage-limit parks and
+  the one soonest-expiring token, which ends up just above the floor. Expect more mid-run usage-limit parks and
   resumes than under `headroom_first`.
 - **Knob semantics.** For `auto` picks under `reset_first`,
   `UZI_AUTOSELECT_HEADROOM_TIE_PCT` is ignored and

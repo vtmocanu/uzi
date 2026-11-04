@@ -93,7 +93,11 @@ default token** to keep everything on one account.
 **Auto-select from the pool** picks a pooled token the same way an auto worker
 does: the token whose weekly allowance resets soonest by default, or the one
 with the most rate-limit headroom under `UZI_AUTOSELECT_ORDER=headroom_first`
-(see [How it chooses](./anthropic-token.md#how-it-chooses)). It differs from a worker in one
+(see [How it chooses](./anthropic-token.md#how-it-chooses)). Under the default
+the in-flight penalty only breaks exact weekly-reset ties, so several
+retrospectives at once concentrate on that one token until it nears the
+headroom floor, which can mean more mid-run limit pauses and resumes. It
+differs from a worker in one
 deliberate way: a worker with an empty pool *holds* the run, waiting for a
 token to be pooled, but the judge lane never holds a retrospective — with an
 empty pool it spends your default token instead, so finished runs never pile
