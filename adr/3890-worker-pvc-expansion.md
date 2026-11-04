@@ -1,6 +1,6 @@
 # ADR-3890: Persistent worker data and DinD claims converge upward, size-only and non-destructively
 
-**Status**: Accepted (issue #3890, implemented on the #3890 branch; maintainer hosted acceptance pending)
+**Status**: Accepted (issue #3890, implemented in issue #3890; maintainer hosted acceptance pending)
 **Date**: 2026-11-04
 **Deciders**: maintainer (owner decision 2026-11-04) and the agent team (issue #3890 milestones and review waves)
 **Related**: #2013 (`l` data 50Gi), #224 (DinD data PVC), #3383 (`l-highmem`), #3852 (DinD maintenance fences), #3153 (runner-shared subPath), #3103; [ADR-837](0837-worker-disk-lifecycle.md) (delete-and-remint recycle, where PVC sizes never changed in place), [ADR-1759](1759-dind-data-metering-and-prune.md) (the DinD data volume), [ADR-3153](3153-runner-shared-pvc-subpath.md) (the `data` PVC also carries `/data/runner`), [ADR-1484](1484-in-app-health-boundary.md) (no cluster-scope API reach), [ADR-2240](2240-hosted-worker-default-size.md) (preset sizes)

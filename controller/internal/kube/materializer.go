@@ -717,7 +717,7 @@ type recycleVolumes struct {
 // recycleWorkerVolumes stops a worker and tears selected PVC(s) down so the
 // next tick reprovisions them in place — a delete + recreate, NOT a live PVC resize
 // (the only in-place size change is expandClaims' upward data/DinD request patch,
-// issue #3890; nix drift still recycles here). It keeps the Secret, the worker row/uuid, and any
+// issue #3890; nix drift and pressure recycle still come through here). It keeps the Secret, the worker row/uuid, and any
 // PVC not named in vols.
 //
 // It implements PHASES 0-2 only. The reprovision itself (phase 3, the PVC-create gate)

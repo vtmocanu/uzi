@@ -481,10 +481,11 @@ A hosted Docker worker's `dind-data` PVC defaults per worker size: **20Gi** for 
 The controller grows an existing `dind-data` (and `/data`) claim to the current size when its
 StorageClass allows volume expansion and the controller can read that class
 (`workers.storageClassRead.create`, on by default). It never shrinks, deletes or recreates the
-claim and rolls no pod. It waits while a roll is active in the worker's coverage pool (not only its own), during active DinD
-maintenance, while the roll state is uncertain, and (data volume only) while a roll reservation is held, and logs `pvc-expand-deferred` with the reason.
+claim and rolls no pod. It waits while the worker's roll entry is not admitted (a roll active anywhere in its coverage pool,
+or missing roll evidence), during active DinD maintenance, while the roll state is uncertain, (data volume
+only) while a roll reservation is held, or when the claim's identity changed, and logs `pvc-expand-deferred` with the reason.
 Accepted growth raises the request first; the filesystem can stay pending until the driver
-finishes online; otherwise it stays pending (`pvc-resize-pending`) until the next independently authorized idle roll remounts it (for example an image or spec change rolled while idle, or an operator-initiated idle restart per the supported procedure). Expansion never triggers a roll. The default
+finishes online; otherwise it stays pending (`pvc-resize-pending`) until the next independently authorized idle roll remounts it (for example an image or spec change rolled while idle, or an operator-initiated idle restart per [the supported procedure](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes)). Expansion never triggers a roll. The default
 Docker-tier storage quota is 1200Gi for ten workers; a quota kept at 900Gi can refuse the growth once the tier's
 claims reach the quota (a full 10-worker `l` fleet needs 1200Gi); the refusal is logged as `pvc-expand-failed reason=forbidden`. Design and the full log
 token list: [ADR-3890](../adr/3890-worker-pvc-expansion.md); operator procedure:

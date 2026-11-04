@@ -597,7 +597,7 @@ retried on later ticks), `pvc-expand-skipped` (for example `class-not-expandable
 `class-lookup-forbidden`, `no-storage-class`), `pvc-expand-failed` (for example
 `reason=forbidden` when the namespace quota is exhausted) and `pvc-resize-pending` /
 `pvc-resize-failed`. The filesystem finishes online on a driver that supports it;
-otherwise it stays pending until the next independently authorized idle roll (for example an image or spec change rolled while idle, or an operator-initiated idle restart per the supported procedure) remounts the volume. Expansion itself never triggers a roll.
+otherwise it stays pending until the next independently authorized idle roll (for example an image or spec change rolled while idle, or an operator-initiated idle restart: wait for the worker to be idle and follow the normal controlled pod roll, retaining its data PVC) remounts the volume. Expansion itself never triggers a roll.
 The controller never forces a restart. With `workers.storageClassRead.create=false`, custom
 RBAC or an older chart the class lookup is refused and expansion fails closed
 (`class-lookup-forbidden`). The manual procedure below remains for operators and edge cases.
