@@ -63,7 +63,7 @@ describe("stored harness decision", () => {
   it.each([
     ["both resets missing", null, null],
     ["equal resets", "2026-11-06T08:30:00Z", "2026-11-06T08:30:00Z"],
-    ["only the other side known", "2026-11-06T08:30:00Z", null],
+    ["only the losing side known", null, "2026-11-06T08:30:00Z"],
     ["the chosen side resetting later", "2026-11-10T08:30:00Z", "2026-11-06T08:30:00Z"],
   ])("uses neutral wording, not 'resets sooner', for %s", (_name, codexReset, claudeReset) => {
     render(<RunHarnessDecision run={{ harness_decision: {
@@ -72,6 +72,14 @@ describe("stored harness decision", () => {
     const text = screen.getByRole("region", { name: "Harness decision at creation time" }).textContent ?? "";
     expect(text).toContain("Both accounts had headroom; Codex chosen (no earlier known weekly reset, so more headroom, then Claude, decides)");
     expect(text).not.toContain("resets sooner");
+  });
+  it("says only the chosen side had a known reset when the other side's is missing", () => {
+    render(<RunHarnessDecision run={{ harness_decision: {
+      ...auto, chosen: "codex", preferred_weekly_reset_at: null, other_weekly_reset_at: "2026-11-06T08:30:00Z",
+    } }} />);
+    const text = screen.getByRole("region", { name: "Harness decision at creation time" }).textContent ?? "";
+    expect(text).toContain("Chosen per run by weekly limits: only Codex had a known upcoming weekly reset");
+    expect(text).not.toContain("more headroom");
   });
   it("says resets sooner when Claude is chosen with a strictly earlier known reset", () => {
     render(<RunHarnessDecision run={{ harness_decision: {

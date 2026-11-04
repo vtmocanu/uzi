@@ -13,6 +13,10 @@ function autoReasonText(decision: HarnessDecision): string | null {
       const loserReset = chosen === "codex" ? decision.preferred_weekly_reset_at : decision.other_weekly_reset_at;
       const winnerTime = winnerReset ? Date.parse(winnerReset) : Number.NaN;
       const loserTime = loserReset ? Date.parse(loserReset) : Number.NaN;
+      // The server ranks a known future reset above a missing one, then the earlier reset.
+      if (Number.isFinite(winnerTime) && Number.isNaN(loserTime)) {
+        return `Chosen per run by weekly limits: only ${winner} had a known upcoming weekly reset`;
+      }
       if (winnerTime < loserTime) {
         return `Chosen per run by weekly limits: ${winner}'s weekly allowance resets sooner than ${loser}'s`;
       }
