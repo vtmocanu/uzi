@@ -1698,6 +1698,42 @@ export class SteeringChannel {
         owner.claim_released === false) this.markCancelled();
   }
 
+  /** One bounded, NON-COMMITTING input read for the held-predecessor seam. It never calls
+   * markCancelled and never routes: the caller commits only after its own safety re-check.
+   * `cancel` means a cancel row was read and ownership is positively this running/claimed
+   * generation; `unknown` means nothing can be concluded. In legacy mode (no receipts) the server
+   * already consumed the rows, so they are returned for the caller to route via routeLegacyRows. */
+  async readPendingCancellation(
+    signal: AbortSignal, acceptedStatuses: readonly string[],
+  ): Promise<{ kind: "cancel" | "none" | "unknown"; legacyRows?: UserInput[] }> {
+    const blocked = (): boolean => this.fence !== undefined || this.terminalLifecycle.signal.aborted;
+    if (!Number.isSafeInteger(this.claimGeneration) || this.claimGeneration <= 0 || blocked()) return { kind: "unknown" };
+    const reply = await this.client.getInputs(this.runId, this.claimGeneration, signal, 64 * 1024);
+    signal.throwIfAborted();
+    if (blocked() || reply.staleObservation || reply.terminalCancelled || !validBatch(reply.inputs)) return { kind: "unknown" };
+    const legacy = reply.receipts ? undefined : reply.inputs;
+    if (!reply.inputs.some(input => input.kind === "cancel")) return legacy ? { kind: "none", legacyRows: legacy } : { kind: "none" };
+    const owner = await this.client.getRunOwnership(this.runId, signal);
+    signal.throwIfAborted();
+    const confirmed = !blocked() && acceptedStatuses.includes(owner.status) &&
+      owner.claim_generation === this.claimGeneration && owner.claim_released === false;
+    const kind = confirmed ? "cancel" : "unknown";
+    return legacy ? { kind, legacyRows: legacy } : { kind };
+  }
+
+  /** Route rows a legacy-mode readPendingCancellation returned, with the normal dedupe. With
+   * `withholdCancel` a cancel row is dropped (not recorded as routed): the caller could not commit it. */
+  routeLegacyRows(rows: UserInput[], opts: { withholdCancel: boolean }): void {
+    let withheld = false;
+    for (const input of rows) {
+      if (this.routedIds.has(input.id)) continue;
+      if (opts.withholdCancel && input.kind === "cancel") { withheld = true; continue; }
+      this.routedIds.add(input.id);
+      this.route(input.kind, input.body ?? undefined, input.id, false, input.created_at, parseGateBinding(input));
+    }
+    if (withheld) this.log.warn("steering: a cancel input was read but not committed; it is not replayed", { run_id: this.runId });
+  }
+
   /** Register the re-armable pause-now interrupt (see pauseNowInterrupt, PRD #1190 rework N2).
    *  Last-wins; the runner wires it to the executor's per-run trip so a `now` pause drops the
    *  current turn even after the shared abort controller has been spent by an earlier `now`. */
