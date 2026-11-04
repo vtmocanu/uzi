@@ -57,6 +57,9 @@ type publishTransport struct {
 	srv    *httptest.Server
 	client *http.Client
 	proto  int
+	// entered is when the latest request reached the router (UnixNano), after its headers were
+	// read and so no earlier than the server began reading it: a lower bound for the handler's start.
+	entered atomic.Int64
 }
 
 // publishTransportServer serves WorkerRunPublish on a chi router (worker injected like the real
@@ -71,9 +74,11 @@ func publishTransportServer(t *testing.T, http2 bool, base time.Duration, stub *
 	}
 	st := &publishStore{ownedRun: issueRun(42), claim: issueClaimRow(sealed)}
 	h := newPublishHandler(t, st, box, func(u string) bool { return u == "https://gitlab.example.com" }, stub.publish)
+	pt := &publishTransport{}
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			pt.entered.Store(time.Now().UnixNano())
 			next.ServeHTTP(w, req.WithContext(mw.ContextWithWorker(req.Context(), store.Worker{ID: uuid.New(), UserID: uuid.New()})))
 		})
 	})
@@ -86,7 +91,7 @@ func publishTransportServer(t *testing.T, http2 bool, base time.Duration, stub *
 	srv := httptest.NewUnstartedServer(r)
 	srv.Config.ReadHeaderTimeout = 10 * time.Second / (15 * time.Second / base)
 	srv.Config.ReadTimeout, srv.Config.WriteTimeout = base, base
-	pt := &publishTransport{srv: srv}
+	pt.srv = srv
 	if http2 {
 		srv.EnableHTTP2 = true
 		srv.StartTLS()
@@ -333,15 +338,20 @@ func TestWorkerRunPublishStalledUploadTimesOut(t *testing.T) {
 	})
 }
 
-// 5: the combined worst case: a body trickled through most of the upload budget, then a service
-// call that outlives the upload deadline and the base timeouts. The read deadline passes while the
-// service runs; the context must stay live and the answer still fit the write deadline.
+// 5: the combined worst case: a body trickled past the base listener deadline to EOF, then a
+// service call that outlives the upload deadline and the base timeouts. The read deadline passes
+// while the service runs; the context must stay live and the answer still fit the write deadline.
+// The writes land at absolute offsets from t0 (no accumulated scheduler drift) and EOF comes at
+// about half the upload budget, so the read deadline keeps about half the budget as headroom.
 func TestWorkerRunPublishCombinedTrickleAndSlowService(t *testing.T) {
 	eachProto(t, func(t *testing.T, http2 bool) {
-		base := scalePublishBudgets(t, 100)
+		base := scalePublishBudgets(t, 100) // base 150 ms; upload 600 ms, EOF at about 300 ms
 		stub := &publishStub{}
-		upload := publishUploadBudget
+		upload := publishUploadBudget // captured before the stub and goroutine: the cleanup restores the var
+		var eofAt, returnedAt atomic.Int64
 		stub.fn = func(ctx context.Context, o pushbroker.Options) (pushbroker.Result, error) {
+			eofAt.Store(time.Now().UnixNano()) // the handler calls the publisher only after the body read hit EOF
+			defer func() { returnedAt.Store(time.Now().UnixNano()) }()
 			time.Sleep(upload) // past the upload deadline, inside the context budget
 			if err := ctx.Err(); err != nil {
 				t.Errorf("service context ended during the slow call: %v", err)
@@ -354,25 +364,38 @@ func TestWorkerRunPublishCombinedTrickleAndSlowService(t *testing.T) {
 		}
 		pt := publishTransportServer(t, http2, base, stub)
 		pr, pw := io.Pipe()
-		step := upload * 8 / 10 / 10 // captured before the goroutine
+		const writes = 10
+		step := upload / 2 / (writes - 1) // last write, then EOF, at t0 + upload/2
+		t0 := time.Now()
 		go func() {
 			defer func() { _ = pw.Close() }()
-			for i := 0; i < 10; i++ {
+			for i := 0; i < writes; i++ {
+				time.Sleep(time.Until(t0.Add(time.Duration(i) * step)))
 				_, _ = pw.Write([]byte("x"))
-				time.Sleep(step)
 			}
 		}()
-		start := time.Now()
 		resp, err := pt.post(t, "/publish", pr)
 		if err != nil {
-			t.Fatalf("the answer did not arrive after %v: %v", time.Since(start), err)
+			t.Fatalf("the answer did not arrive after %v: %v", time.Since(t0), err)
 		}
 		defer func() { _ = resp.Body.Close() }()
 		wantProto(t, resp, pt)
-		elapsed := time.Since(start)
+		elapsed := time.Since(t0)
 		wantPublished(t, resp, elapsed)
 		if elapsed <= upload {
 			t.Fatalf("test did not cross the upload budget (%v <= %v): it proves nothing", elapsed, upload)
+		}
+		entered := time.Unix(0, pt.entered.Load())
+		// (i) the body read outlived the base listener read deadline (measured from no later than
+		// the server began reading the request), so only the extended read deadline let it finish.
+		if read := time.Unix(0, eofAt.Load()).Sub(entered); read <= base {
+			t.Fatalf("body EOF %v after the request reached the router, not past the base deadline %v: the test proves nothing", read, base)
+		}
+		// (ii) the successful service call returned past the upload (read) deadline: the handler set
+		// that deadline at start+upload with start before EOF, and the service ran at least upload
+		// after EOF.
+		if svc := time.Unix(0, returnedAt.Load()).Sub(time.Unix(0, eofAt.Load())); svc < upload {
+			t.Fatalf("service ran %v after EOF, less than the upload budget %v: it may not have crossed the read deadline", svc, upload)
 		}
 	})
 }
