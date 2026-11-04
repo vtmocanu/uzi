@@ -37,6 +37,8 @@ function start(opts: {
   deferredExit?: boolean;
   /** Opt in: a short per-logical-publish allowance, read by the runner from the client. */
   allowanceMs?: number;
+  /** Opt in: the fake publish hangs after draining the pack until the signal it was handed aborts. */
+  hangUntilAbort?: boolean;
 } = {}) {
   const abort = new AbortController();
   const git = new GitCache("/unused", nullLogger());
@@ -116,6 +118,12 @@ function start(opts: {
     for await (const chunk of pack) body += chunk;
     bytes.push(body);
     if (opts.throws) throw new Error("transport failed");
+    if (opts.hangUntilAbort) {
+      await new Promise<void>((_resolve, reject) => {
+        if (signal?.aborted) return reject(signal.reason);
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }
     if (opts.abort === "backoff" || opts.abort === "backoff429") setTimeout(() => abort.abort(), 10);
     return (opts.responses?.[requests - 1] ?? FAIL) as Awaited<ReturnType<typeof client.publishCheckpoint>>;
   };
@@ -201,6 +209,25 @@ it("production backoff is 250 ms then 1000 ms when no test hook is set", async (
 it("the test hook replaces the backoff the retry log reports", async () => {
   const r = await exercise({ backoffMs: [3, 5] });
   assert.deepEqual(r.retryLogs, [{ attempt: 1, backoff_ms: 3 }, { attempt: 2, backoff_ms: 5 }]);
+});
+
+it("the allowance itself aborts an in-flight attempt when the caller never aborts", async () => {
+  // The caller's signal in this harness never fires, so only the runner's own allowance signal can
+  // end the hung attempt. Passing the caller signal through instead would leave it hanging.
+  const started = Date.now();
+  const h = start({ allowanceMs: 150, hangUntilAbort: true });
+  let timer: NodeJS.Timeout | undefined;
+  const limit = new Promise<"hung">(resolve => { timer = setTimeout(() => resolve("hung"), 5_000); });
+  const result = await Promise.race([h.done, limit]);
+  clearTimeout(timer);
+  if (result === "hung") h.flight.cancel.abort(); // release the hung fake before failing
+  assert.notEqual(result, "hung", "the in-flight attempt was not aborted by the allowance");
+  assert.ok(Date.now() - started < 4_000, "ended near the 150 ms allowance");
+  assert.equal(h.attemptSignals.length, 1);
+  assert.equal(h.attemptSignals[0]?.aborted, true);
+  assert.equal(h.requests, 1);
+  assert.equal((result as { published: boolean }).published, false);
+  assert.equal(h.flight.lastCheckpointRefTip, "OLD");
 });
 
 const BUSY = { ok: false, httpStatus: 429 };

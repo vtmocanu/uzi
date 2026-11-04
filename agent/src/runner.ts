@@ -19516,9 +19516,11 @@ export class RunRunner {
         res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, producer!.pack, allowance, flight.claimGeneration, attestedSource);
         const busy = !res.ok && res.httpStatus === 429;
         if (res.ok || typeof res.httpStatus !== "number" || (!busy && (res.httpStatus < 500 || res.httpStatus > 599)) || attempt === 3) break;
-        // The api does not say WHY it answered 429 (the client surfaces only the status), so a 429 is
-        // recorded as attempted like a 5xx: chaining from an extra tip is bounded and self-clearing,
-        // while omitting it could not be proven safe.
+        // The api answers 429 with reason "busy" and Retry-After 5 before it reads the body or calls
+        // the publisher, but the client discards that reason and surfaces only the status. Recording
+        // the tip as attempted, like a 5xx, is the conservative choice while the reason is unseen:
+        // chaining from an extra tip is bounded and self-clearing, while omitting it could not be
+        // proven safe.
         flight.lastAttemptedCheckpointRefTip = packed.tipOid;
         const [firstBackoffMs, secondBackoffMs] = this.checkpointTestHooks?.retryBackoffMs ?? [250, 1_000];
         const backoffMs = busy ? this.checkpointTestHooks?.retry429BackoffMs ?? 5_000

@@ -33,6 +33,14 @@ it("a publish slower than httpTimeoutMs succeeds inside the checkpoint allowance
   assert.deepEqual(res, { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/branch" } });
 });
 
+it("a client built without the option uses the production allowance, not httpTimeoutMs", async (t) => {
+  const url = await ackAfter(t, 600);
+  const client = new WorkerClient(url, "test", "test", nullLogger(), { httpTimeoutMs: 200 });
+  assert.equal(client.checkpointPublishTimeoutMs, CHECKPOINT_PUBLISH_TIMEOUT_MS);
+  const res = await client.publishCheckpoint("run-1", TIP, pack());
+  assert.deepEqual(res, { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/branch" } });
+});
+
 it("the allowance still ends a publish that outlasts it", async (t) => {
   const url = await ackAfter(t, 3_000);
   const client = new WorkerClient(url, "test", "test", nullLogger(), { httpTimeoutMs: 200, checkpointPublishTimeoutMs: 400 });
