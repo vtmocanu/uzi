@@ -383,10 +383,80 @@ only saved Codex credential is an API key — sees no accounts at all here: no
 row, no placeholder meter, on any surface. That's the empty-set shape, not a
 status of its own.
 
+## How the automatic default picks a harness
+
+When your default harness is **Default · automatic** and you hold a usable
+credential for both Claude and Codex, uzi chooses the harness for each new run
+by weekly limits: the side whose weekly allowance resets soonest, so
+allowance about to expire unused is spent first (the same objective
+`UZI_AUTOSELECT_ORDER=reset_first` applies within one provider's pool). This
+needs no setting beyond the automatic default; the overflow toggle is
+irrelevant.
+
+It applies to the same new issue runs that overflow considers: started
+manually, by autopilot or by a schedule, with no explicit harness (including
+an issue harness label), no run/schedule model pin, no Anthropic credential
+override, and neither the Plan nor the Code cross-check enabled. Any other
+creation with an unset default keeps Claude and records the reason
+`excluded`.
+
+uzi compares one account per harness, read from stored usage:
+
+- **Codex:** the account the run would be frozen to: the pool pick when your
+  Codex account mode is `auto` with a pool, otherwise your default account.
+- **Claude:** the token auto-select would pick from the pool (after the
+  weekly-reserve filter) when any token is pooled, otherwise your default
+  token.
+
+Each side is **unknown**, **depleted** or **qualified**:
+
+- **Unknown:** no fresh reading (unmeasured, stale or the usage poller off), a
+  Codex API-key default, a Codex pool pick reported as
+  `pool_stale`, or a quarantined or re-login Codex default.
+- **Depleted:** capacity-held (including a weekly-reserve hold, and a reserve
+  verdict of unknown while a threshold is set), measured below the
+  auto-select headroom floor (`UZI_AUTOSELECT_MIN_HEADROOM`), or a Codex pool
+  with nothing left (`pool_exhausted`). If every pooled Claude token is held,
+  Claude is depleted; uzi does not fall back to your default token.
+- **Qualified:** fresh, measured and at or above the floor.
+
+The choice:
+
+| Sides | Chosen | Reason |
+|---|---|---|
+| Either side unknown | Claude | `auto_fallback` |
+| Both qualified | The side with the soonest known future weekly reset; a missing reset loses; on an exact tie, more headroom, then Claude | `auto_soonest_reset` |
+| Exactly one qualified | That side | `auto_only_qualified` |
+| Both depleted | Claude | `auto_fallback` |
+
+The choice is made once at creation and frozen with the run. A running,
+parked or resumed run never changes harness. Creation takes the same
+per-user credential lock overflow does, now for every eligible creation with an
+unset default, so a credential change you make at that moment can briefly wait
+for a creation in flight. If the Codex account changes state between the pick
+and the commit and that would change the chosen harness, creation is refused
+instead of starting on a different harness than was decided.
+
+The owner sees the stored decision as `harness_decision` (reasons
+`auto_soonest_reset`, `auto_only_qualified`, `auto_fallback`): for these rows
+`preferred` is `claude`, the `preferred_*` fields describe Claude and the
+`other_*` fields describe Codex, plus each side's weekly reset when known. See
+[the CLI reference](./cli.md#harness-overflow). Rows created before the resets
+were recorded show them as unknown.
+
+**This is a prediction, not a reservation.** The comparison picks the harness,
+not a credential. Only a run claimed by a worker bound in auto-select mode
+re-applies the Claude ranking when it is claimed. A worker bound to a pinned
+or default token spends that token, so the account compared at creation may
+not be the one that is spent and the objective can be missed. The decision is
+also not a cost estimate for the run.
+
 ## How overflow compares headroom
 
 [Harness overflow](./worker-model.md#overflow-to-the-other-harness) is a separate,
-per-user opt-in, off by default. For an eligible new implicit issue run,
+per-user opt-in, off by default, and applies only when your default harness is
+an explicit Claude or Codex (with an automatic default, see above). For an
+eligible new implicit issue run,
 uzi compares the preferred harness with the other usable harness at creation.
 Overflow requires a preferred score **< 20%**, a receiver score **>= 30%**,
 and a receiver advantage **>= 15 percentage points**. Unknown comparison
