@@ -1601,7 +1601,7 @@ type Params struct {
 	// reads. That sharing is the point and not a convenience: the settings page and
 	// the selector classify the same token against the same thresholds, so they
 	// cannot disagree about whether it is eligible. Two Params-side literals mapping
-	// the four knobs independently would each be internally consistent and would drift
+	// the UZI_AUTOSELECT_* knobs independently would each be internally consistent and would drift
 	// with nothing going red (D21).
 	//
 	// The ZERO VALUE is a coherent, deliberate policy rather than a hole: MaxStaleness

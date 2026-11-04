@@ -267,9 +267,10 @@ type Config struct {
 	// 100 is not satisfiable by any reading, so it is clamped with a warning rather
 	// than left to silently disable auto-selection entirely.
 	AutoselectMinHeadroom int
-	// AutoselectHeadroomTiePct is M4's clustering tolerance T: tokens within this
-	// many points of the emptiest are treated as tied and broken by soonest reset.
-	// Default 5. 0 means "only an exact tie counts", which is a coherent policy.
+	// AutoselectHeadroomTiePct is M4's clustering tolerance T: under headroom_first,
+	// tokens within this many points of the emptiest are treated as tied and broken by
+	// soonest reset. Default 5. 0 means "only an exact tie counts", which is a coherent
+	// policy. Ignored under reset_first (#3844), which ranks by weekly reset instead.
 	AutoselectHeadroomTiePct int
 	// AutoselectMaxStaleness bounds how old a gauge reading may be and still steer a
 	// choice — steering on numbers Anthropic has since moved past is worse than not
@@ -287,7 +288,8 @@ type Config struct {
 	// AutoselectInflightPenalty is M4's herd control: points subtracted from a
 	// token's ranking headroom per run currently spending it, so several claims
 	// inside one poll interval do not all pile onto the same emptiest credential.
-	// Default 3. 0 disables the bias, leaving pure headroom ranking.
+	// Default 3. 0 disables the bias. Under reset_first (#3844) it only breaks exact
+	// weekly-reset ties; under headroom_first it shifts the headroom ranking.
 	AutoselectInflightPenalty int
 	// AutoselectOrder is how the eligible set is ranked (UZI_AUTOSELECT_ORDER, #3844):
 	// "reset_first" (default) picks the soonest weekly reset, because Claude and Codex
