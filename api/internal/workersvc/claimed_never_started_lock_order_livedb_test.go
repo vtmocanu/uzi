@@ -56,7 +56,9 @@ func TestClaimedNeverStartedCohortRunningReportLockOrderLiveDB(t *testing.T) {
 	defer func() {
 		_ = a.Rollback(context.Background())
 		if !joined {
-			_ = <-done
+			if err := <-done; err != nil {
+				t.Logf("cohort sweep after an early exit: %v", err)
+			}
 		}
 	}()
 
