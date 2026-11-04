@@ -3240,7 +3240,8 @@ export class GitCache {
       const position = gitPosition + (args[gitPosition] === "-C" ? 2 : 0);
       args.splice(position, 0, "-c", "core.multiPackIndex=false", "-c", "core.commitGraph=false",
         "-c", "pack.writeReverseIndex=false", "-c", "pack.readReverseIndex=false",
-        "-c", "pack.threads=1", "-c", "index.threads=1");
+        "-c", "pack.threads=1", "-c", "index.threads=1",
+        "-c", `core.deltaBaseCacheLimit=${this.epochRetained.getStore()?.maxMetadataBytes ?? 8 * 1024 * 1024}`);
     }
     if (args.includes("config") && !args.includes("--no-includes")) {
       args = [...args]; args.splice(args.indexOf("config") + 1, 0, "--no-includes");
@@ -11114,16 +11115,124 @@ export class GitCache {
               if (idx.length !== table + (v2 ? 28 : 24) * count + 8 * large + 40) unknown("pack index size");
               let last = "";
               const fanout = Array<number>(256).fill(0);
+              const offsets = new Map<string, number>();
               for (let i = 0; i < count; i++) {
                 const offset = table + (v2 ? 20 * i : 24 * i + 4);
                 const id = idx.subarray(offset, offset + 20).toString("hex");
                 if (id <= last) unknown("pack OID table order");
                 last = id; fanout[idx[offset]!]!++; add(store.ids, id);
+                const rawOffset = idx.readUInt32BE(v2 ? table + 24 * count + 4 * i : table + 24 * i);
+                const physical = v2 && rawOffset >= 0x80000000
+                  ? idx.readBigUInt64BE(table + 28 * count + 8 * (rawOffset - 0x80000000))
+                  : BigInt(rawOffset);
+                if (physical > BigInt(Number.MAX_SAFE_INTEGER)) unknown("pack offset overflow");
+                offsets.set(id, Number(physical));
               }
               let total = 0;
               for (let i = 0; i < 256; i++) if ((total += fanout[i]!) !== idx.readUInt32BE(base + 4 * i)) unknown("pack fanout mismatch");
-              const header = await file(path.join(p, match![1] + ".pack"), 12);
-              if (header.toString("ascii", 0, 4) !== "PACK" || ![2, 3].includes(header.readUInt32BE(4)) || header.readUInt32BE(8) !== count) unknown("pack header mismatch");
+              const pack = await file(path.join(p, match![1] + ".pack"));
+              if (pack.length < 32 || pack.toString("ascii", 0, 4) !== "PACK" ||
+                  ![2, 3].includes(pack.readUInt32BE(4)) || pack.readUInt32BE(8) !== count) unknown("pack header mismatch");
+              const starts = [...offsets.values()].sort((a, b) => a - b);
+              if (new Set(starts).size !== count || (count ? starts[0] !== 12 : pack.length !== 32) ||
+                  starts.some(start => start < 12 || start >= pack.length - 20)) unknown("invalid pack offsets");
+              type Record = { logical: number; baseLength?: number; base?: number; state: number };
+              const records = new Map<number, Record>();
+              const contentCharge = (n: number) => {
+                charge(n); MaintenanceResources.consumeIfActive("metadataBytes", n);
+              };
+              // Each span and instruction is bounded by the shared observation
+              // budget. A failure aborts before any pair verifier.
+              for (let i = 0; i < starts.length; i++) {
+                automatic.checkLive(); this.checkRecoveryInterruption();
+                const start = starts[i]!, end = starts[i + 1] ?? pack.length - 20;
+                let pos = start;
+                const byte = () => { if (pos >= end) unknown("truncated pack record"); return pack[pos++]!; };
+                let b = byte(), size = b & 15, scale = 16;
+                const type = (b >> 4) & 7;
+                while (b & 128) {
+                  if (!Number.isSafeInteger(scale)) unknown("pack entry size integer overflow");
+                  b = byte(); size += (b & 127) * scale;
+                  if (!Number.isSafeInteger(size) || size > limits.maxMetadataBytes) unknown("pack entry size limit");
+                  scale *= 128;
+                }
+                if (![1, 2, 3, 4, 6, 7].includes(type)) unknown("unsupported pack record type");
+                let baseOffset: number | undefined;
+                if (type === 6) {
+                  b = byte(); let distance = b & 127;
+                  while (b & 128) {
+                    b = byte(); distance = (distance + 1) * 128 + (b & 127);
+                    if (!Number.isSafeInteger(distance) || distance > start) unknown("OFS offset overflow");
+                  }
+                  baseOffset = start - distance;
+                  if (!distance || !records.has(baseOffset)) unknown("OFS base is not an earlier record");
+                } else if (type === 7) {
+                  if (end - pos < 20) unknown("truncated REF base");
+                  baseOffset = offsets.get(pack.subarray(pos, pos + 20).toString("hex")); pos += 20;
+                  if (baseOffset === undefined) unknown("missing same-pack REF base");
+                }
+                const remaining = limits.maxMetadataBytes - bytes;
+                if (remaining <= 0 || size > remaining) unknown("pack inflated byte limit");
+                const inflated = inflateSync(pack.subarray(pos, end), { maxOutputLength: remaining, info: true }) as unknown as
+                  { buffer: Buffer; engine: { bytesWritten: number } };
+                automatic.checkLive(); this.checkRecoveryInterruption();
+                contentCharge(inflated.buffer.length);
+                if (inflated.engine.bytesWritten !== end - pos || inflated.buffer.length !== size) unknown("pack compressed span or size");
+                const record: Record = { logical: size, base: baseOffset, state: 0 };
+                if (type === 6 || type === 7) {
+                  const program = inflated.buffer; let cursor = 0;
+                  // Git's patch_delta requires DELTA_SIZE_MIN=4, before reading headers.
+                  if (program.length < 4) unknown("short delta program");
+                  const next = () => { if (cursor >= program.length) unknown("truncated delta instruction"); return program[cursor++]!; };
+                  const integer = () => {
+                    let value = 0, factor = 1, part: number;
+                    do {
+                      part = next(); value += (part & 127) * factor;
+                      if (!Number.isSafeInteger(value) || !Number.isSafeInteger(factor)) unknown("delta integer overflow");
+                      factor *= 128;
+                    } while (part & 128);
+                    return value;
+                  };
+                  record.baseLength = integer(); record.logical = integer();
+                  if (record.logical > limits.maxMetadataBytes - bytes) unknown("delta logical byte limit");
+                  let generated = 0;
+                  while (cursor < program.length) {
+                    automatic.checkLive(); this.checkRecoveryInterruption();
+                    const opcode = next(); let length = 0;
+                    if (opcode & 128) {
+                      let offset = 0;
+                      for (let j = 0; j < 4; j++) if (opcode & (1 << j)) offset += next() * 2 ** (8 * j);
+                      for (let j = 0; j < 3; j++) if (opcode & (1 << (j + 4))) length += next() * 2 ** (8 * j);
+                      if (!length) length = 65536;
+                      if (offset > record.baseLength || length > record.baseLength - offset) unknown("delta copy outside base");
+                    } else {
+                      length = opcode;
+                      if (!length || length > program.length - cursor) unknown("invalid delta insert");
+                      cursor += length;
+                    }
+                    if (length > record.logical - generated) unknown("delta generated size mismatch");
+                    contentCharge(length); generated += length;
+                  }
+                  if (generated !== record.logical) unknown("delta generated size mismatch");
+                }
+                records.set(start, record);
+              }
+              // The functional graph visits each record at most twice. IDX lookup
+              // is unverified here, so reject cycles before Git collision reads.
+              for (const start of starts) {
+                const stack: Record[] = [];
+                let current = records.get(start);
+                while (current && current.state !== 2) {
+                  automatic.checkLive(); this.checkRecoveryInterruption();
+                  if (current.state === 1) unknown("cyclic pack delta graph");
+                  current.state = 1; stack.push(current);
+                  if (current.base === undefined) break;
+                  const target = records.get(current.base);
+                  if (!target || current.baseLength !== target.logical) unknown("delta base length mismatch");
+                  current = target;
+                }
+                for (const record of stack) record.state = 2;
+              }
               pairs.add(full);
             }
           } else if (name === "info") {
