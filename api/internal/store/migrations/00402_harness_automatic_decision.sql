@@ -6,7 +6,7 @@
 -- accounts' weekly resets (NULL when unknown). Only auto_* decisions may carry a reset, and an
 -- auto_* decision must record harness_preferred = 'claude' so the column mapping holds.
 --
--- The CHECK is replaced NOT VALID so the add is lock-cheap; 00402 validates it under a
+-- The CHECK is replaced NOT VALID so the add is lock-cheap; 00403 validates it under a
 -- SHARE UPDATE EXCLUSIVE lock (the 00224/00225 two-step). Every existing row satisfies the new
 -- body by construction: the reason set only grows and the new columns are NULL.
 SET LOCAL lock_timeout = '5s';
@@ -40,7 +40,7 @@ ALTER TABLE runs
 -- Best-effort and DATA-DEPENDENT, as 00224's Down: the re-added 00398 CHECK is validated, so it
 -- FAILS once any row holds an auto_* reason, and dropping the two columns loses their data.
 -- Goose downs are not run in this deployment (store.Migrate only ever goes up); drain first if
--- you must. Goose runs 00402's Down first.
+-- you must. Goose runs 00403's Down first.
 ALTER TABLE runs
     DROP CONSTRAINT runs_harness_decision_shape,
     DROP COLUMN harness_preferred_weekly_reset_at,

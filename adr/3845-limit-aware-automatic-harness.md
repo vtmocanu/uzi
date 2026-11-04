@@ -89,7 +89,7 @@ applies only to an explicit default (below).
   keeps the shared validator's Codex refusal.
 - **Decision record.** The existing `runs` decision columns and the owner-only
   `harness_decision` DTO field carry it
-  ([migrations 00401 and 00402](../api/internal/store/migrations/00401_harness_automatic_decision.sql)).
+  ([migrations 00402 and 00403](../api/internal/store/migrations/00402_harness_automatic_decision.sql)).
   - For automatic rows `preferred` is `claude`; the `preferred_*` fields
     describe Claude and the `other_*` fields describe Codex.
   - New nullable `preferred_weekly_reset_at` and `other_weekly_reset_at`: null
