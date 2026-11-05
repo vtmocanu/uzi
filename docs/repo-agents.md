@@ -149,11 +149,12 @@ record-once rule, so the claim after an owner resume reads the same commit even
 if the default branch has moved since. Resume the run once the repository can
 be fetched, or cancel it.
 
-Only a worker that reports the `repo_agent_source_v1` protocol capability
-claims a run that reads repo agents, its first claim included. Judge, job,
-cross-check, task-review and isolated-fetch runs do not read repo agents and
-are exempt. While no such worker is online, a queued run's health reason names
-the capability.
+A run that reads repo agents is marked when it is created
+(`repo_agent_source_required`). Only a worker that reports the
+`repo_agent_source_v1` protocol capability claims a marked run or a run with a
+recorded revision, its first claim included. Judge, job, cross-check,
+task-review and chat runs do not read repo agents and are not marked. While no
+such worker is online, a queued run's health reason names the capability.
 
 When the API is older than the worker, nothing is recorded: each claim reads
 the agent folders at the configured default branch's commit at that time, and

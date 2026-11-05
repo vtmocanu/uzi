@@ -61,10 +61,12 @@ func TestCreateRunOverrideFirstClaimSpendsPinnedTokenLiveDB(t *testing.T) {
 
 	// The worker is BOUND (pinned) to A; the run's first claim must still spend the
 	// create-pinned B — the run override outranks the worker binding (D2).
+	env.exec(`UPDATE workers SET protocol_capabilities = array_append(protocol_capabilities, 'repo_agent_source_v1') WHERE id = $1`, workerID)
 	wkr := store.Worker{
 		ID: workerID, UserID: userID, Name: "worker-bound-to-a", Status: "online",
-		AnthropicBindMode: BindModePinned,
-		AnthropicSecretID: pgconv.UUID(tokenA),
+		ProtocolCapabilities: []string{"repo_agent_source_v1"},
+		AnthropicBindMode:    BindModePinned,
+		AnthropicSecretID:    pgconv.UUID(tokenA),
 	}
 	payload, err := svc.Claim(env.ctx, wkr, nil)
 	if err != nil {

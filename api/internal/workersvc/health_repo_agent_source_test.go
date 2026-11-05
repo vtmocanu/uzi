@@ -59,3 +59,13 @@ func TestHealthQueuedUnpinnedRunSkipsRepoAgentSourceLookup(t *testing.T) {
 		t.Fatalf("issued %d repo agent source lookups for an unpinned run", len(fs.calls))
 	}
 }
+
+func TestHealthQueuedStampedUnpinnedRunWithoutCapableWorkerNamesCapability(t *testing.T) {
+	fs, svc, r := repoAgentSourceHealth(false, 0)
+	r.RepoAgentSourceRequired = true
+	fs.active = []store.ListActiveRunsForHealthRow{r}
+	svc.detectRunHealth(context.Background(), t0)
+	if w := lastWrite(t, fs.healthFakeStore, r.ID); w.HealthReason.String != reasonNoRepoAgentSourceCapableWorker {
+		t.Fatalf("reason = %q, want %q", w.HealthReason.String, reasonNoRepoAgentSourceCapableWorker)
+	}
+}

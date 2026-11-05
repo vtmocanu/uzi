@@ -3,6 +3,7 @@ package workersvc
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -120,7 +121,7 @@ func TestRepoAgentSourceHoldPinsRevisionAcrossResumeLiveDB(t *testing.T) {
 	f := newCRFix(t)
 	ctx := f.env.ctx
 	run := f.startPlainPromptRun(t)
-	w := f.guardWorker(t, 0, capability.RepoAgentSourceV1)
+	w := f.protocolWorker(t, 0, capability.RepoAgentSourceV1)
 	first := f.acceptClaim(t, w, run, "first claim")
 	if first.RepoAgentSourceCommit != nil {
 		t.Fatalf("first claim carries repo_agent_source_commit %q", *first.RepoAgentSourceCommit)
@@ -161,20 +162,155 @@ func TestRepoAgentSourceClaimGateLiveDB(t *testing.T) {
 	run := f.startGuardedRun(t, "rs", 391)
 	f.env.exec(`UPDATE runs SET repo_agent_source_commit = $2 WHERE id = $1`, run, repoAgentSourceFirst)
 
-	old := f.guardWorker(t, 0, capability.CIConfigGuardV1, capability.CompletionInterlockV1)
+	old := f.protocolWorker(t, 0, capability.CIConfigGuardV1, capability.CompletionInterlockV1)
 	f.refuseClaim(t, old, run, "worker without repo_agent_source_v1")
 
-	capable := f.guardWorker(t, 0, capability.CIConfigGuardV1, capability.RepoAgentSourceV1)
+	capable := f.protocolWorker(t, 0, capability.CIConfigGuardV1, capability.RepoAgentSourceV1)
 	p := f.acceptClaim(t, capable, run, "worker with repo_agent_source_v1")
 	if p.RepoAgentSourceCommit == nil || *p.RepoAgentSourceCommit != repoAgentSourceFirst {
 		t.Fatalf("claim repo_agent_source_commit = %v, want %s", p.RepoAgentSourceCommit, repoAgentSourceFirst)
 	}
+}
 
-	g := newCRFix(t)
-	unpinned := g.startGuardedRun(t, "ru", 392)
-	older := g.guardWorker(t, 0, capability.CIConfigGuardV1, capability.CompletionInterlockV1)
-	q := g.acceptClaim(t, older, unpinned, "an unpinned run stays claimable by an older worker")
-	if q.RepoAgentSourceCommit != nil {
-		t.Fatalf("unpinned claim carries repo_agent_source_commit %q", *q.RepoAgentSourceCommit)
+func TestRepoAgentSourceStampedUnpinnedClaimGateLiveDB(t *testing.T) {
+	f := newCRFix(t)
+	run := f.startPlainPromptRun(t)
+	stored, err := f.env.q.GetRunByID(f.env.ctx, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.RepoAgentSourceRequired || stored.RepoAgentSourceCommit.Valid {
+		t.Fatalf("a new prompt run: required=%v revision=%v, want stamped and unpinned", stored.RepoAgentSourceRequired, stored.RepoAgentSourceCommit)
+	}
+
+	old := f.protocolWorker(t, 0, capability.CompletionInterlockV1, capability.CIConfigGuardV1, capability.CodexHarnessV1,
+		capability.CodexRuntimeV2, capability.RecoveryArchiveV1, capability.CrossCheckV1, capability.JobRunnerV1)
+	eligibility, err := f.svc.WorkerEligibilityForHealth(f.env.ctx, time.Now(), run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eligibility.Claimable != 0 {
+		t.Fatalf("claimable workers = %d with only a worker lacking repo_agent_source_v1 online, want 0", eligibility.Claimable)
+	}
+	f.refuseClaim(t, old, run, "a stamped unpinned first claim by a worker without repo_agent_source_v1")
+
+	health, err := f.env.q.ListActiveRunsForHealth(f.env.ctx, codexCuratedModelsSlice())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range health {
+		if r.ID == run {
+			found = r.RepoAgentSourceRequired
+		}
+	}
+	if !found {
+		t.Fatal("ListActiveRunsForHealth must list the queued run with repo_agent_source_required")
+	}
+
+	capable := f.protocolWorker(t, 0, capability.RepoAgentSourceV1)
+	if eligibility, err = f.svc.WorkerEligibilityForHealth(f.env.ctx, time.Now(), run); err != nil {
+		t.Fatal(err)
+	}
+	if eligibility.Claimable != 1 {
+		t.Fatalf("claimable workers = %d after a repo_agent_source_v1 worker came online, want 1", eligibility.Claimable)
+	}
+	p := f.acceptClaim(t, capable, run, "a stamped unpinned first claim by a worker with repo_agent_source_v1")
+	if p.RepoAgentSourceCommit != nil {
+		t.Fatalf("unpinned claim carries repo_agent_source_commit %q", *p.RepoAgentSourceCommit)
+	}
+}
+
+func TestRepoAgentSourceUnstampedLegacyRunClaimableLiveDB(t *testing.T) {
+	f := newCRFix(t)
+	run := f.startPlainPromptRun(t)
+	f.env.exec(`UPDATE runs SET repo_agent_source_required = false WHERE id = $1`, run)
+	old := f.protocolWorker(t, 0, capability.CompletionInterlockV1)
+	p := f.acceptClaim(t, old, run, "an unstamped legacy run by a worker without repo_agent_source_v1")
+	if p.RepoAgentSourceCommit != nil {
+		t.Fatalf("legacy claim carries repo_agent_source_commit %q", *p.RepoAgentSourceCommit)
+	}
+}
+
+func TestRepoAgentSourcePeerDeferralLiveDB(t *testing.T) {
+	f := newCRFix(t)
+	capable := f.protocolWorker(t, 4, capability.CIConfigGuardV1, capability.RepoAgentSourceV1)
+	f.protocolWorker(t, 4, capability.CIConfigGuardV1)
+	busy := uuid.New()
+	f.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id)
+	            VALUES ($1, $2, $3, 'issue', 773, 't', 'd', 'running', $4)`, busy, f.user, f.repo, capable.ID)
+	run := f.startGuardedRun(t, "k", 100)
+	f.acceptClaim(t, capable, run, "busy capable worker with an idle peer lacking repo_agent_source_v1")
+}
+
+func TestRepoAgentSourcePlacementMirrorsLiveDB(t *testing.T) {
+	f := newCRFix(t)
+	ctx := f.env.ctx
+	f.env.exec(`UPDATE users SET ephemeral_workers_enabled = true WHERE id = $1`, f.user)
+	run := f.startGuardedRun(t, "k", 100)
+	f.env.exec(`UPDATE runs SET status_since = now() - interval '1 hour' WHERE id = $1`, run)
+
+	cutoff := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
+	listed := func(rows []uuid.UUID) bool {
+		for _, id := range rows {
+			if id == run {
+				return true
+			}
+		}
+		return false
+	}
+	gap := func() bool {
+		t.Helper()
+		rows, err := f.env.q.ListUnplaceableQueuedRunsForEphemeral(ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
+			CrossCheckEvaluatedAt: cutoff, CrossCheckAffinityCutoff: cutoff, BackgroundGraceCutoff: cutoff,
+			CodexCuratedModels: codexCuratedModelsSlice(), DockerRepoAllowlist: []uuid.UUID{}, EphemeralLease: pgtype.Interval{Valid: true},
+			MaxPerUser: 1000, MaxRows: 10000,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := make([]uuid.UUID, 0, len(rows))
+		for _, r := range rows {
+			ids = append(ids, r.ID)
+		}
+		return listed(ids)
+	}
+	saturated := func() bool {
+		t.Helper()
+		rows, err := f.env.q.ListSaturationQueuedRunsForEphemeral(ctx, store.ListSaturationQueuedRunsForEphemeralParams{
+			CrossCheckEvaluatedAt: cutoff, CrossCheckAffinityCutoff: cutoff, BackgroundGraceCutoff: cutoff,
+			CodexCuratedModels: codexCuratedModelsSlice(), DockerRepoAllowlist: []uuid.UUID{}, EphemeralLease: pgtype.Interval{Valid: true},
+			SaturationDelay: pgtype.Interval{Valid: true}, MaxPerUser: 1000, MaxRows: 10000,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := make([]uuid.UUID, 0, len(rows))
+		for _, r := range rows {
+			ids = append(ids, r.ID)
+		}
+		return listed(ids)
+	}
+
+	f.protocolWorker(t, 0, capability.CIConfigGuardV1)
+	if !gap() {
+		t.Fatal("with only workers lacking repo_agent_source_v1 online the run must be a capability-gap candidate")
+	}
+	if saturated() {
+		t.Fatal("with only workers lacking repo_agent_source_v1 online the run is a gap, not slot saturation")
+	}
+
+	capable := f.protocolWorker(t, 1, capability.CIConfigGuardV1, capability.RepoAgentSourceV1)
+	if gap() || saturated() {
+		t.Fatal("a capable worker with room is online: neither a gap nor saturation")
+	}
+
+	f.env.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, worker_id)
+	            VALUES ($1, $2, $3, 'issue', 774, 't', 'd', 'running', $4)`, uuid.New(), f.user, f.repo, capable.ID)
+	if gap() {
+		t.Fatal("a capable worker is online: not a capability gap")
+	}
+	if !saturated() {
+		t.Fatal("the capable worker is full and the other cannot serve the run: it must be listed as saturated")
 	}
 }
