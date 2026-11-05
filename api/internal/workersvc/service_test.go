@@ -2597,6 +2597,8 @@ func TestClaimSummaryModelBuiltinWhenNothingSet(t *testing.T) {
 func TestClaimSummaryModelUserReadErrorFallsBackToInstance(t *testing.T) {
 	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
 	fs.summaryModelErr = errors.New("db down")
+	// A row value alongside the error must not be read: the user tier counts as unset.
+	fs.summaryModel = pgtype.Text{String: "opus", Valid: true}
 	svc := newOffModeService(fs, newBox(t), testParams())
 	svc.SetSettings(fakeSettings{summaryModel: "sonnet"})
 	payload, err := svc.Claim(context.Background(), worker(), nil)
@@ -2605,6 +2607,34 @@ func TestClaimSummaryModelUserReadErrorFallsBackToInstance(t *testing.T) {
 	}
 	if payload.SummaryModel == nil || *payload.SummaryModel != "sonnet" {
 		t.Fatalf("user-row error should resolve the instance tier; got %+v", payload.SummaryModel)
+	}
+}
+
+// PRD #3248 D12: an instance-tier read error logs and counts as unset, so the claim
+// still resolves (user value, else the built-in) and never fails.
+func TestClaimSummaryModelInstanceReadErrorFallsBack(t *testing.T) {
+	cases := []struct {
+		name string
+		user pgtype.Text
+		want string
+	}{
+		{"no user value resolves the built-in", pgtype.Text{}, "haiku"},
+		{"user value still wins", pgtype.Text{String: "opus", Valid: true}, "opus"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+			fs.summaryModel = tc.user
+			svc := newOffModeService(fs, newBox(t), testParams())
+			svc.SetSettings(fakeSettings{summaryModel: "sonnet", summaryModelErr: errors.New("cache down")})
+			payload, err := svc.Claim(context.Background(), worker(), nil)
+			if err != nil {
+				t.Fatalf("an instance read error must not fail the claim: %v", err)
+			}
+			if payload.SummaryModel == nil || *payload.SummaryModel != tc.want {
+				t.Fatalf("SummaryModel = %v, want %q", payload.SummaryModel, tc.want)
+			}
+		})
 	}
 }
 

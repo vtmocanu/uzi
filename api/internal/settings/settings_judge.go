@@ -53,18 +53,6 @@ func (c *Cache) JudgeDailyBudget(ctx context.Context) (int, error) {
 	return c.intSetting(ctx, KeyJudgeDailyBudget)
 }
 
-// validateModelAlias is the format gate for the judge model setting (PRD #46): a
-// non-empty model alias / id, checked with the shared PRD #17 rules (single token,
-// no control chars, length-capped). Blank is rejected here (unlike the per-user
-// inherit case) — the judge always needs a concrete model.
-func validateModelAlias(value string) error {
-	if strings.TrimSpace(value) == "" {
-		return errors.New("must not be empty")
-	}
-	_, err := agenttmpl.ValidateModel(value)
-	return err
-}
-
 // validateCodexJudgeModel is the write-time gate for the instance Codex judge
 // model (PRD #3245): blank (or whitespace-only) is the explicit reset to the
 // built-in; otherwise the trimmed value must be a curated Codex id.

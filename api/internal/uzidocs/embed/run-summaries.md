@@ -105,16 +105,19 @@ harness**, resolving in this order:
 
 A blank or whitespace-only value counts as unset at every step. A value that
 is not valid for the run's harness is skipped and resolution falls through to
-the next step. The Claude lane rejects Codex role models, and the Codex lane
-accepts only the curated Codex role models, so neither harness is ever handed
-the other's model. If a Codex run's resolved model is somehow not a Codex role
+the next step. The Claude lane rejects the Codex role models, and the Codex lane
+accepts only the Codex role models, so a Claude run is never handed a Codex
+role model and a Codex run never gets a Claude model. If a Codex run's resolved model is somehow not a Codex role
 model, the agent uses the built-in **`gpt-6-luna`** instead.
 
 Codex intent and plan summaries run at **low** effort. From **Settings → Run
-defaults → Run summaries**, the **Summary model** picker sets your own Claude
-value; leave it on **Default · instance default** to use the instance value.
-The Codex value is stored as `codex_summary_model` and shown beside the judge
-models by [`uzi settings get`](./cli.md#plan-cross-check-settings). See
+defaults → Run summaries**, the **Claude summary model** picker sets your own
+Claude value and the **Codex summary model** picker your own Codex value; each
+picker shows only for a harness you can run. Leave a picker on its **Default**
+option (it names the model and where it comes from, for example
+`Default · haiku (built-in)`) to inherit; the line under it shows the model in
+effect. [`uzi settings get`](./cli.md#plan-cross-check-settings) prints both
+lanes as `summary` rows. See
 [Admin settings](./admin-settings.md#run-summaries) for the instance-wide
 Claude setting.
 
