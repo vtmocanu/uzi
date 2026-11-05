@@ -107,7 +107,8 @@ import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
-import { detectRepoAgents } from "../src/repoagents.js";
+import { detectRepoAgents, filterRepoAgentModel } from "../src/repoagents.js";
+import { parseCodexAgentFile } from "../src/repoagents-codex.js";
 import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, COMPLETION_CONTRACT_GUIDANCE, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND, SUBAGENT_SAFETY_APPEND } from "../src/prompt.js";
 import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 
@@ -19122,6 +19123,35 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.equal(starts.length, 2, "root and selected child started");
     return rec(starts[1]!.params).model;
   };
+  it("TOML model pin reaches delegated Codex child", async () => {
+    for (const pin of ['model = "gpt-6-luna"', "", 'model = ""']) {
+      for (const override of [false, true]) {
+        const parsed = parseCodexAgentFile(
+          'name = "toml-child"\ndescription = "Works."\ndeveloper_instructions = "Implement."\n' + pin,
+          "file",
+        );
+        assert.equal(parsed.ok, true);
+        if (!parsed.ok) return;
+        const template = filterRepoAgentModel(parsed.template, "codex");
+        const { rig, admitted, result } = await preApproved({
+          repoAgents: [template], approvedSelection: { source: "repo", exclusions: [] },
+          config: { default_model: "gpt-6-astra", default_effort: "medium", override_subagent_model: override },
+        }, ["toml-child"]);
+        assert.deepEqual(admitted, { "toml-child": true });
+        assert.equal(result.branch, "agent/issue-42");
+        const expected = override || pin !== 'model = "gpt-6-luna"' ? "gpt-6-astra" : "gpt-6-luna";
+        assert.equal(childModel(rig.transport), expected);
+        const starts = rig.transport.requests.filter((r) => r.method === "thread/start");
+        assert.equal(rec(starts[0]!.params).model, "gpt-6-astra");
+        const childId = rec(rig.transport.requests.filter((r) => r.method === "turn/start")[1]!.params).threadId;
+        assert.equal(childId, "th-child-1");
+        const turns = rig.transport.requests.filter((r) => r.method === "turn/start");
+        assert.equal(rec(turns[1]!.params).effort, "medium");
+        assert.equal(rec(turns[0]!.params).effort, "medium");
+      }
+    }
+  });
+
   const renderedModels = (ctx: RunContext, source?: "own" | "repo") => {
     const rig = makeRig();
     const request = makeExecutor(rig, bindingOf(SUBSCRIPTION))["buildRunRequest"](
@@ -19325,7 +19355,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
       await fs.mkdir(path.join(clone, ".codex", "agents"), { recursive: true });
       await fs.writeFile(
         path.join(clone, ".codex", "agents", "t.toml"),
-        'name = "toml-agent"\ndescription = "From toml."\ndeveloper_instructions = "TOML BODY"\nmodel = "gpt-5"\n',
+        'name = "toml-agent"\ndescription = "From toml."\ndeveloper_instructions = "TOML BODY"\nmodel = "gpt-6-luna"\n',
       );
       const detected = await detectRepoAgents(clone, "codex");
       assert.deepEqual(detected.agents.map((a) => a.name), ["toml-agent"]);
