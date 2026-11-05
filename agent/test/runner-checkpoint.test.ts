@@ -6,7 +6,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { type Executor } from "../src/executor.js";
 import type { Logger } from "../src/log.js";
-import type { OwedCandidateContext } from "../src/git.js";
+import { WIP_PARK_COMMIT_PREFIX, type OwedCandidateContext } from "../src/git.js";
 import { ScratchPublicationError, type ScratchPublicationKind, type ScratchPublicationStep } from "../src/git.js";
 import type { PublishResult } from "../src/protocol.js";
 import { followSuccessfulPush } from "./publication-fixture.js";
@@ -1814,5 +1814,458 @@ describe("RunRunner — milestones_agents transport (PRD #1224 M1)", () => {
     assert.deepStrictEqual(report!.milestones_agents, AGENTS);
     assert.deepStrictEqual(report!.milestones_completed, ["m1"]);
     assert.deepStrictEqual(report!.milestones_in_progress, ["m2", "m3"]);
+  });
+});
+
+// #3944: the claim fetch mirrors origin's refs/uzi-checkpoints/* into the worker bare and never
+// prunes it, so a cancelled predecessor's work can outlive its custody on origin. A report-only
+// run whose own (lost-ack) publish was content-free must not be failed by that stale mirror, while
+// anything that could hold work (a present ref, a failed probe, an unreadable proof, a substantive
+// attempted tip, a non-issue run) keeps blocking.
+describe("RunRunner — report_only orphan guard vs a stale local checkpoint mirror (#3944)", () => {
+  const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+  const ORPHAN_REASON = /published committed work to a checkpoint ref/;
+  let indexSeq = 0;
+
+  function g(dir: string, args: string[]): string {
+    return execFileSync("git", ["-C", dir, ...IDENT, ...args], { env: ENV, encoding: "utf8" }).trim();
+  }
+
+  /** A commit in the fixture origin built with plumbing, so no branch or checkout is touched. */
+  function originCommit(parent: string, file: string, content: string, subject: string): string {
+    const idx = path.join(fx.originPath, ".git", `tmp-index-3944-${indexSeq++}`);
+    const env = { ...ENV, GIT_INDEX_FILE: idx };
+    execFileSync("git", ["-C", fx.originPath, "read-tree", parent], { env });
+    const blob = execFileSync("git", ["-C", fx.originPath, "hash-object", "-w", "--stdin"],
+      { env: ENV, input: content, encoding: "utf8" }).trim();
+    execFileSync("git", ["-C", fx.originPath, "update-index", "--add", "--cacheinfo", `100644,${blob},${file}`], { env });
+    const tree = execFileSync("git", ["-C", fx.originPath, "write-tree"], { env, encoding: "utf8" }).trim();
+    fs.rmSync(idx, { force: true });
+    return g(fx.originPath, ["commit-tree", tree, "-p", parent, "-m", subject]);
+  }
+
+  /** A cancelled predecessor's work-bearing checkpoint on origin (three commits above the initial
+   *  commit) that is NOT an ancestor of main, which then moves on. */
+  function seedPredecessor(n: number, ref = `refs/uzi-checkpoints/agent/issue-${n}`): { tip: string; base: string; ref: string } {
+    const base = g(fx.originPath, ["rev-parse", "refs/heads/main"]);
+    let tip = base;
+    for (const i of [1, 2, 3]) tip = originCommit(tip, `predecessor-${i}.txt`, `predecessor work ${i}\n`, `predecessor milestone ${i}`);
+    g(fx.originPath, ["update-ref", ref, tip]);
+    fs.writeFileSync(path.join(fx.originPath, "main-advance.txt"), "main moved on\n");
+    g(fx.originPath, ["add", "main-advance.txt"]);
+    g(fx.originPath, ["commit", "-m", "main advances"]);
+    return { tip, base, ref };
+  }
+
+  /** Every refs/uzi-* ref (checkpoints, held, recovery, runner, incoming...) with its object. */
+  function snap(repo: string): string {
+    return g(repo, ["for-each-ref", "--format=%(refname) %(objectname)"])
+      .split("\n").filter((line) => line.startsWith("refs/uzi-")).join("\n");
+  }
+
+  function rmObject(bare: string, oid: string): void {
+    fs.unlinkSync(path.join(bare, "objects", oid.slice(0, 2), oid.slice(2)));
+  }
+
+  interface DriveOpts {
+    n: number;
+    kind?: "prompt";
+    /** Run ctx.checkpoint with a publish whose ack is lost (default true). */
+    checkpoint?: boolean;
+    reportOnly?: boolean;
+    /** Replace the default content-free coverage commit. */
+    commit?: (dir: string, bare: string) => void;
+    /** Runs inside the executor right after the checkpoint (or the commit when none). */
+    inExecutor?: (bare: string, dir: string) => void;
+    /** Runs inside the executor before the commit and checkpoint. */
+    beforeWork?: (bare: string, dir: string) => void;
+    delivery?: boolean;
+    /** Return an operator scope-capped zero slice instead of a report_only result. */
+    scopeCapped?: boolean;
+    /** Runs after the claim is built and before it executes. */
+    prepare?: (claim: { run_id: string }) => void;
+    /** The checkpoint publish is acknowledged (confirmed) instead of losing its ack. */
+    confirmedPublish?: boolean;
+  }
+
+  async function drive(opts: DriveOpts) {
+    api.setRegisterProtocolFeatures(["refresh_publication_context_v1"]);
+    await client.register("checkpoint");
+    const forge = fakeGitlab();
+    if (opts.delivery) followSuccessfulPush(git, forge.pr);
+    const claim = gitlabClaim(opts.n, { claim_generation: 7, ...(opts.kind ? { kind: opts.kind } : {}) });
+    opts.prepare?.(claim);
+    const bare = git.barePathFor(fx.originPath);
+    const events: string[] = [];
+    const snapshots: { bare: string; origin: string } = { bare: "", origin: "" };
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events, { throws: opts.confirmedPublish !== true });
+    const exec: Executor = {
+      run: async (ctx) => {
+        opts.beforeWork?.(bare, ctx.worktreePath);
+        (opts.commit ?? ((dir: string) => {
+          g(dir, ["commit", "--allow-empty", "-m", "uzi recovery coverage fixture round 0 batch 0"]);
+        }))(ctx.worktreePath, bare);
+        if (opts.checkpoint !== false) await ctx.checkpoint!({ reap: true });
+        opts.inExecutor?.(bare, ctx.worktreePath);
+        snapshots.bare = snap(bare);
+        snapshots.origin = snap(fx.originPath);
+        if (opts.scopeCapped) {
+          return { branch: ctx.branch, scopeCapped: { completedCount: 0, total: 3 }, summary: "scope capped zero slice" };
+        }
+        return opts.reportOnly === false
+          ? { branch: ctx.branch }
+          : { branch: ctx.branch, reportOnly: true, summary: "stale mirror report" };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try {
+      await runner(exec, forge.gitlab).execute(claim);
+    } finally {
+      restorePublish();
+      restoreFetch();
+    }
+    const states = api.states.filter((s) => s.runId === claim.run_id);
+    return {
+      claim, bare, events, snapshots, calls: forge.calls,
+      completed: states.find((s) => s.body.status === "completed")?.body,
+      failed: states.find((s) => s.body.status === "failed")?.body,
+      after: { bare: snap(bare), origin: snap(fx.originPath) },
+    };
+  }
+
+  /** The run completed report-only, opened no MR and made no call besides state reports. */
+  function assertReportOnlyCompletion(res: Awaited<ReturnType<typeof drive>>): void {
+    assert.equal(res.failed, undefined, `no failure expected, got ${JSON.stringify(res.failed)}`);
+    assert.ok(res.completed, "the run completed");
+    assert.equal(res.completed.report_only, true);
+    assert.equal(res.calls.length, 0, "no MR is opened");
+    assert.ok(api.requestLog.every((entry) => entry === "messages" || entry.startsWith("state:")),
+      `no custody, settle or discard request: ${JSON.stringify(api.requestLog)}`);
+  }
+
+  /** Fail-closed by an earlier guard (a broken object store fails the run before the orphan guard). */
+  function assertRefused(res: Awaited<ReturnType<typeof drive>>): void {
+    assert.ok(res.failed, "the run failed closed");
+    assert.equal(res.completed, undefined);
+    assert.equal(res.calls.length, 0, "no MR is opened");
+  }
+
+  function assertOrphanFailure(res: Awaited<ReturnType<typeof drive>>): void {
+    assert.ok(res.failed, "the run failed to avoid orphaning the checkpoint");
+    assert.match(res.failed.failure_reason ?? "", ORPHAN_REASON);
+    assert.equal(res.completed, undefined);
+    assert.equal(res.calls.length, 0, "no MR is opened");
+  }
+
+  it("r1 (incident) completes report-only when the stale mirror's origin ref is gone and the attempted tip is content-free", async () => {
+    const pred = seedPredecessor(39441);
+    const res = await drive({
+      n: 39441,
+      inExecutor: () => g(fx.originPath, ["update-ref", "-d", pred.ref]),
+    });
+    assert.ok(res.events.includes("publish"), "the checkpoint publish was attempted (and its ack lost)");
+    assert.equal(g(res.bare, ["rev-parse", pred.ref]), pred.tip, "the worker mirror still names the predecessor tip");
+    assertReportOnlyCompletion(res);
+    assert.ok(res.snapshots.bare.includes(`${pred.ref} ${pred.tip}`), "the snapshot is not vacuous");
+    assert.equal(res.after.bare, res.snapshots.bare, "the bare's checkpoint, held, recovery and runner refs are untouched");
+    assert.equal(res.after.origin, res.snapshots.origin, "origin's refs are untouched");
+  });
+
+  it("r1c hands the claim's credentials and clone url to the origin probe", async () => {
+    const pred = seedPredecessor(39461);
+    const target = git as unknown as { originCheckpointRefState: (...a: unknown[]) => Promise<unknown> };
+    const original = target.originCheckpointRefState.bind(git);
+    const seen: unknown[][] = [];
+    target.originCheckpointRefState = (...args: unknown[]) => {
+      seen.push(args);
+      return original(...args);
+    };
+    const res = await drive({
+      n: 39461,
+      prepare: (claim) => {
+        const secrets = (claim as unknown as { secrets: Record<string, string> }).secrets;
+        secrets.forge_pat = "fixture-pat-value";
+        secrets.forge_username = "fixture-user-value";
+      },
+      inExecutor: () => g(fx.originPath, ["update-ref", "-d", pred.ref]),
+    });
+    assertReportOnlyCompletion(res);
+    assert.equal(seen.length, 1, "the origin probe ran once");
+    assert.equal(seen[0]![1], pred.ref);
+    assert.deepEqual(seen[0]![2], {
+      pat: "fixture-pat-value",
+      repoUrl: fx.originPath,
+      username: "fixture-user-value",
+    });
+  });
+
+  it("r1d scope-capped zero slice completes (scope_capped) when the stale mirror is absent on origin", async () => {
+    const pred = seedPredecessor(39462);
+    const res = await drive({
+      n: 39462,
+      scopeCapped: true,
+      inExecutor: () => g(fx.originPath, ["update-ref", "-d", pred.ref]),
+    });
+    assert.equal(res.failed, undefined, `no failure expected, got ${JSON.stringify(res.failed)}`);
+    assert.ok(res.completed, "the run completed");
+    assert.equal(res.completed.report_only, true);
+    assert.equal(res.completed.scope_capped, true);
+    assert.equal(res.calls.length, 0, "no MR is opened");
+  });
+
+  it("r1e scope-capped zero slice does not take the no-MR completion over a content-bearing lost-ack attempted tip", async () => {
+    const res = await drive({
+      n: 39463,
+      scopeCapped: true,
+      delivery: true,
+      commit: (dir) => {
+        commitInClone(dir, "HIDDEN.txt");
+        g(dir, ["revert", "--no-edit", "HEAD"]);
+      },
+    });
+    assert.ok(res.events.includes("publish"));
+    // Falls through to the normal push + (partial) MR delivery, not the no-MR zero-slice completion.
+    assert.equal(res.failed, undefined);
+    assert.ok(res.completed, "the run completes through delivery");
+    assert.notEqual(res.completed.report_only, true, "not the MR-less scope-capped report-only completion");
+    assert.equal(res.calls.filter((c) => c.method === "POST").length, 1, "exactly one MR opened");
+  });
+
+  it("r1s keeps the predecessor tip under origin's recovery ref untouched while completing", async () => {
+    const pred = seedPredecessor(39442);
+    const recovery = "refs/uzi-recovery/predecessor-run";
+    const res = await drive({
+      n: 39442,
+      inExecutor: () => {
+        g(fx.originPath, ["update-ref", "-d", pred.ref]);
+        g(fx.originPath, ["update-ref", recovery, pred.tip]);
+      },
+    });
+    assertReportOnlyCompletion(res);
+    assert.equal(g(fx.originPath, ["rev-parse", recovery]), pred.tip);
+    assert.equal(res.after.origin, res.snapshots.origin);
+    assert.equal(res.after.bare, res.snapshots.bare);
+  });
+
+  it("r2 still fails (#299) when the predecessor ref is still on origin; refs are preserved", async () => {
+    const pred = seedPredecessor(39443);
+    const res = await drive({ n: 39443 });
+    assertOrphanFailure(res);
+    assert.equal(g(fx.originPath, ["rev-parse", pred.ref]), pred.tip);
+    assert.equal(g(res.bare, ["rev-parse", pred.ref]), pred.tip);
+    assert.equal(res.after.bare, res.snapshots.bare);
+    assert.equal(res.after.origin, res.snapshots.origin);
+  });
+
+  it("r3 delivers a lost-ack content-bearing attempted tip non-closing (#3360) although no mirror exists", async () => {
+    const res = await drive({
+      n: 39444,
+      delivery: true,
+      commit: (dir) => {
+        commitInClone(dir, "LOST_ACK.txt");
+      },
+    });
+    assert.ok(res.events.includes("publish"));
+    assert.equal(res.failed, undefined);
+    assert.ok(res.completed, "the run completes through delivery");
+    assert.notEqual(res.completed.report_only, true, "delivered as an MR, not a report-only completion");
+    assert.equal(res.calls.filter((c) => c.method === "POST").length, 1, "exactly one MR opened");
+    assert.equal(res.completed.source_publication?.non_closing, true);
+  });
+
+  it("r4 fails (#299) when the origin probe fails", async () => {
+    seedPredecessor(39445);
+    const res = await drive({
+      n: 39445,
+      inExecutor: (bare) => {
+        g(fx.originPath, ["update-ref", "-d", "refs/uzi-checkpoints/agent/issue-39445"]);
+        g(bare, ["config", "remote.origin.url", path.join(fx.dataDir, "no-such-origin")]);
+      },
+    });
+    assertOrphanFailure(res);
+  });
+
+  it("r4b fails (#299) when the origin probe answers unknown", async () => {
+    seedPredecessor(39446);
+    (git as unknown as { originCheckpointRefState: () => Promise<string> }).originCheckpointRefState = async () => "unknown";
+    const res = await drive({
+      n: 39446,
+      inExecutor: () => g(fx.originPath, ["update-ref", "-d", "refs/uzi-checkpoints/agent/issue-39446"]),
+    });
+    assertOrphanFailure(res);
+  });
+
+  it("r5a fails (#299, empty candidate) when an attempted tip hides content behind an equal tip tree", async () => {
+    const res = await drive({
+      n: 39447,
+      commit: (dir) => {
+        commitInClone(dir, "HIDDEN.txt");
+        g(dir, ["revert", "--no-edit", "HEAD"]);
+      },
+    });
+    assertOrphanFailure(res);
+  });
+
+  it("r5b fails (#299, empty candidate) when the attempted tip is a two-parent wip(park) look-alike over substantive history", async () => {
+    const res = await drive({
+      n: 39448,
+      commit: (dir) => {
+        const base = g(dir, ["rev-parse", "HEAD"]);
+        commitInClone(dir, "SIDE.txt");
+        const side = g(dir, ["rev-parse", "HEAD"]);
+        const lookAlike = g(dir, ["commit-tree", `${base}^{tree}`, "-p", base, "-p", side, "-m", `${WIP_PARK_COMMIT_PREFIX} forged`]);
+        g(dir, ["reset", "--hard", lookAlike]);
+      },
+    });
+    assertOrphanFailure(res);
+  });
+
+  it("r5c fails (#299) when the attempted tip is unreadable", async () => {
+    const res = await drive({
+      n: 39449,
+      // The publish reports a tip the bare does not hold, as a lost ack of an unverifiable push would.
+      beforeWork: () => {
+        const real = git.checkpointPack.bind(git);
+        (git as unknown as { checkpointPack: unknown }).checkpointPack = async (...args: Parameters<typeof real>) => {
+          const packed = await real(...args);
+          return packed && { ...packed, tipOid: "a".repeat(40) };
+        };
+      },
+    });
+    assertOrphanFailure(res);
+  });
+
+  it("r6a fails (#299) with every recovery, held and mirror ref byte-identical when the predecessor publish lands before the probe", async () => {
+    const pred = seedPredecessor(39450);
+    g(fx.originPath, ["update-ref", "refs/uzi-held/predecessor-run/1", pred.tip]);
+    g(fx.originPath, ["update-ref", "refs/uzi-recovery/predecessor-run", pred.tip]);
+    const res = await drive({
+      n: 39450,
+      inExecutor: (bare) => {
+        g(bare, ["update-ref", "refs/uzi-held/predecessor-run/1", pred.tip]);
+        g(bare, ["update-ref", "refs/uzi-recovery/predecessor-run", pred.tip]);
+      },
+    });
+    assertOrphanFailure(res);
+    assert.equal(res.after.bare, res.snapshots.bare);
+    assert.equal(res.after.origin, res.snapshots.origin);
+    assert.match(res.after.bare, /refs\/uzi-held\/predecessor-run\/1/);
+    assert.match(res.after.origin, /refs\/uzi-recovery\/predecessor-run/);
+  });
+
+  it("r6b completes when the predecessor publish lands AFTER the probe, leaving every ref as it was (origin gains only the late tip)", async () => {
+    const pred = seedPredecessor(39451);
+    const late = originCommit(pred.tip, "late.txt", "late predecessor work\n", "late predecessor milestone");
+    g(fx.originPath, ["update-ref", "refs/uzi-held/predecessor-run/1", pred.tip]);
+    g(fx.originPath, ["update-ref", "refs/uzi-recovery/predecessor-run", pred.tip]);
+    const target = git as unknown as { originCheckpointRefState: (...a: unknown[]) => Promise<unknown> };
+    const original = target.originCheckpointRefState.bind(git);
+    let probes = 0;
+    target.originCheckpointRefState = async (...args: unknown[]) => {
+      const state = await original(...args);
+      probes++;
+      g(fx.originPath, ["update-ref", pred.ref, late]);
+      return state;
+    };
+    const res = await drive({
+      n: 39451,
+      inExecutor: (bare) => {
+        g(fx.originPath, ["update-ref", "-d", pred.ref]);
+        g(bare, ["update-ref", "refs/uzi-held/predecessor-run/1", pred.tip]);
+        g(bare, ["update-ref", "refs/uzi-recovery/predecessor-run", pred.tip]);
+      },
+    });
+    assert.equal(probes, 1, "the origin probe ran exactly once");
+    assertReportOnlyCompletion(res);
+    assert.equal(res.after.bare, res.snapshots.bare, "no local ref changed after the discount");
+    assert.equal(g(fx.originPath, ["rev-parse", pred.ref]), late, "origin's checkpoint ref is the late tip");
+    const lines = (text: string) => text.split("\n").filter((line) => !line.startsWith(`${pred.ref} `));
+    assert.deepEqual(lines(snap(fx.originPath)),
+      lines(res.snapshots.origin), "every other origin ref equals the pre-finalize snapshot");
+  });
+
+  it("r7 still fails a zero-diff prompt run (prompt-kind orphan guard) over a substantive stale mirror absent from origin", async () => {
+    // A prompt run's checkpoint key is its own branch (uzi/prompt-<run id>), so the stale mirror is
+    // the run's own earlier publication, e.g. before a resume.
+    let pred!: ReturnType<typeof seedPredecessor>;
+    const res = await drive({
+      n: 39452,
+      kind: "prompt",
+      reportOnly: false,
+      prepare: (claim) => {
+        pred = seedPredecessor(39452, `refs/uzi-checkpoints/uzi/prompt-${claim.run_id}`);
+      },
+      inExecutor: () => g(fx.originPath, ["update-ref", "-d", pred.ref]),
+    });
+    assert.equal(g(res.bare, ["rev-parse", pred.ref]), pred.tip, "the substantive mirror is present");
+    assertOrphanFailure(res);
+  });
+
+  for (const withCheckpoint of [true, false]) {
+    const label = withCheckpoint ? "a content-free attempted tip" : "no publish at all";
+    for (const kind of ["tip", "boundary", "outside-tree", "shallow"] as const) {
+      it(`r8 ${kind === "tip" ? "is refused (fails before the guard, at fetch-back)" : "fails (#299)"} over an unreadable mirror proof (${kind}) with ${label}, origin ref absent`, async () => {
+        const pred = seedPredecessor(39460);
+        const res = await drive({
+          n: 39460,
+          checkpoint: withCheckpoint,
+          inExecutor: (bare) => {
+            g(fx.originPath, ["update-ref", "-d", pred.ref]);
+            if (kind === "tip") rmObject(bare, pred.tip);
+            else if (kind === "boundary") rmObject(bare, g(bare, ["rev-parse", `${pred.base}^{tree}`]));
+            else if (kind === "outside-tree") rmObject(bare, g(bare, ["rev-parse", `${pred.tip}^{tree}`]));
+            else fs.writeFileSync(path.join(bare, "shallow"), `${pred.base}\n`);
+          },
+        });
+        // A missing tip object breaks the later fetch-back before the orphan guard speaks.
+        if (kind === "tip") assertRefused(res);
+        else assertOrphanFailure(res);
+      });
+    }
+  }
+
+  it("r8c a shallow bare is unprovable for a marker-shaped predecessor tip over substantive history (#299), origin ref absent", async () => {
+    // The mirrored tip is a wip(park) marker over work-bearing history. Were the shallow check not
+    // first, the marker path would read the shallow ancestry as carries_work and discount it.
+    const pred = seedPredecessor(39464);
+    const marker = originCommit(pred.tip, "parked.txt", "parked\n", `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved`);
+    g(fx.originPath, ["update-ref", pred.ref, marker]);
+    const res = await drive({
+      n: 39464,
+      checkpoint: false, // no attempted tip: only the mirror leg may speak
+      inExecutor: (bare) => {
+        g(fx.originPath, ["update-ref", "-d", pred.ref]);
+        assert.equal(g(bare, ["rev-parse", pred.ref]), marker, "the mirror holds the marker-shaped tip");
+        fs.writeFileSync(path.join(bare, "shallow"), `${pred.base}\n`);
+      },
+    });
+    assertOrphanFailure(res);
+  });
+
+  it("r9 refuses (#299) a confirmed publication whose tip is unknown, though the confirmed tip is otherwise content-free", async () => {
+    // Control: the same confirmed content-free publish completes report-only when the runner's
+    // confirmedPublication carries its real tip.
+    const control = await drive({ n: 39465, confirmedPublish: true });
+    assertReportOnlyCompletion(control);
+
+    const original = git.hasCommittedCheckpoint.bind(git);
+    const seen: Array<{ tip: string | undefined } | undefined> = [];
+    (git as unknown as { hasCommittedCheckpoint: unknown }).hasCommittedCheckpoint = (
+      ...args: Parameters<typeof original>
+    ) => {
+      const confirmed = args[2];
+      seen.push(confirmed && { tip: confirmed.tip });
+      // Model a confirmed publication whose tip the runner no longer knows.
+      return original(args[0], args[1], confirmed && { tip: undefined }, args[3], args[4]);
+    };
+    try {
+      const res = await drive({ n: 39466, confirmedPublish: true });
+      assert.ok(seen.length >= 1 && seen.every((c) => c !== undefined && typeof c.tip === "string"),
+        "the runner passed a confirmedPublication carrying a tip on every guard call");
+      assertOrphanFailure(res);
+    } finally {
+      (git as unknown as { hasCommittedCheckpoint: unknown }).hasCommittedCheckpoint = original;
+    }
   });
 });
