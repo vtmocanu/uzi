@@ -45,29 +45,35 @@ function trackingSha(iid: number): string | null {
 }
 
 interface Drive {
-  tweak?: (runner: Any) => void;
-  /** Called before the n-th (1-based) capture attempt, with the flight. */
-  onCapture?: (n: number, flight: Any, runner: Any) => void | Promise<void>;
+  /** Called before the n-th (1-based) capture attempt. `defer` registers teardown work (run in finally). */
+  /** Called after the n-th capture attempt returned or threw. */
+  afterCapture?: (n: number, runner: Any) => void;
+  onCapture?: (n: number, flight: Any, runner: Any, rt: AuthorityRuntime, defer: (fn: () => void) => void) => void | Promise<void>;
 }
 
 async function drive(o: Drive = {}) {
   const lifetime = await acquireWorkerLifetime(fs.realpathSync(fx.dataDir), testLockOptions());
   const rt = new AuthorityRuntime({ lifetime, workerToken: TOKEN, timeoutMs: 5000 });
   const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3953-"));
+  const cleanups: Array<() => void> = [];
   let clone = "";
   let headBeforeSwitch = "";
+  let trackingBefore: string | null = null;
+  let executorRuns = 0;
   const factory: ExecutorFactory = (id) => {
     const home = path.join(homeRoot, id);
     return {
       homeDir: home,
       executor: {
         run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          executorRuns++;
           fs.mkdirSync(home, { recursive: true });
           clone = ctx.worktreePath;
           fs.writeFileSync(path.join(clone, "WORK.txt"), "committed before the switch\n");
           gitOut(clone, ["add", "WORK.txt"]);
           gitOut(clone, [...IDENT, "commit", "-m", "work"]);
           headBeforeSwitch = gitOut(clone, ["rev-parse", "HEAD"]);
+          trackingBefore = trackingSha(IID);
           api.requestCredentialSwitch(claim.run_id, GENERATION);
           await new Promise<void>((resolve) => {
             if (ctx.signal?.aborted) return resolve();
@@ -98,11 +104,13 @@ async function drive(o: Drive = {}) {
   Object.assign(runner, { attemptPaths: true });
   const claim = gitlabClaim(IID, { claim_generation: GENERATION });
   api.overrideStateStatus(claim.run_id, "queued"); // a release requeues the run
-  // Every authority acquisition: was its wait signal already aborted when it was requested?
+  // The capture's OWN authority acquisitions: was the wait signal already aborted when it was requested?
+  // Only acquisitions made while captureRecoveryRestorePoint is running count.
   const acquisitions: boolean[] = [];
+  let inCapture = false;
   const withTransaction = rt.withTransaction.bind(rt) as Any;
   (rt as Any).withTransaction = (fn: unknown, wait?: { signal?: AbortSignal }) => {
-    acquisitions.push(wait?.signal?.aborted === true);
+    if (inCapture) acquisitions.push(wait?.signal?.aborted === true);
     return withTransaction(fn, wait);
   };
   let calls = 0;
@@ -112,10 +120,10 @@ async function drive(o: Drive = {}) {
   inner.captureRecoveryRestorePoint = async (...a: unknown[]) => {
     flightSeen = a[1];
     calls++;
-    await o.onCapture?.(calls, a[1], runner);
-    return capture(...a);
+    await o.onCapture?.(calls, a[1], runner, rt, (fn) => cleanups.push(fn));
+    inCapture = true;
+    try { return await capture(...a); } finally { inCapture = false; o.afterCapture?.(calls, runner); }
   };
-  o.tweak?.(runner);
   let timer: NodeJS.Timeout | undefined;
   let outcome: "done" | "timeout";
   try {
@@ -127,28 +135,29 @@ async function drive(o: Drive = {}) {
     outcome = await Promise.race([done.then(() => "done" as const), guard]);
   } finally {
     clearTimeout(timer);
+    for (const fn of cleanups) fn();
     runner.shutdown();
     fs.rmSync(homeRoot, { recursive: true, force: true });
   }
   const runId = claim.run_id;
   const statuses = api.states.filter((s) => s.runId === runId).map((s) => s.body.status);
   return {
-    runId, outcome, clone, headBeforeSwitch, statuses, acquisitions, captureCalls: () => calls, flight: flightSeen,
+    runId, outcome, clone, headBeforeSwitch, trackingBefore, statuses, acquisitions, executorRuns,
+    captureCalls: () => calls, flight: flightSeen,
     failed: api.states.filter((s) => s.runId === runId && s.body.status === "failed").map((s) => s.body),
   };
 }
 
-const failFetch = (runner: Any): void => {
-  runner.fetchTracking = async () => { throw new Error("persistent fetch-back failure"); };
-};
-const onSecond = (act: (flight: Any, runner: Any) => void | Promise<void>) =>
-  async (n: number, flight: Any, runner: Any) => { if (n === 2) await act(flight, runner); };
+const onFirst = (act: (flight: Any, runner: Any, rt: AuthorityRuntime, defer: (fn: () => void) => void) => void | Promise<void>) =>
+  async (n: number, flight: Any, runner: Any, rt: AuthorityRuntime, defer: (fn: () => void) => void) => {
+    if (n === 1) await act(flight, runner, rt, defer);
+  };
 
 describe("RunRunner - issue #3953: a credential-switch capture acquires A despite the switch's own abort", () => {
   it("verifies the tracking ref and releases the run, never waiting on an aborted signal", async () => {
     const d = await drive();
     assert.strictEqual(d.outcome, "done", "the switch completed under the deadline");
-    assert.ok(d.acquisitions.length >= 1, "the capture consulted the authority wait");
+    assert.ok(d.acquisitions.length >= 1, "the capture itself consulted the authority wait");
     assert.deepStrictEqual(d.acquisitions.filter((aborted) => aborted), [], "no wait signal was aborted at acquisition");
     assert.strictEqual(trackingSha(IID), d.headBeforeSwitch, "the tracking ref equals the pre-switch clone HEAD");
     assert.ok(d.statuses.includes("credential_switch"), "the release reported credential_switch");
@@ -157,39 +166,71 @@ describe("RunRunner - issue #3953: a credential-switch capture acquires A despit
   });
 });
 
-describe("RunRunner - issue #3953: precedence while a credential-switch capture retries", () => {
-  it("a real cancel delivered during the retries is observed through the capture wait and stops the release", async () => {
-    let waitAborted: boolean | undefined;
+// The fetch-back is NOT stubbed below: each stop must reach the capture's real authority acquisition through
+// the credential-switch capture wait, so a wait that ignored the stop would verify and release.
+// The switch loop still reports credential_switch_failed after such a stop; that give-up report is
+// pre-existing loop behaviour and is not asserted here. What matters is that nothing was verified,
+// published or released, and the run did not continue (one executor turn, then a terminal end).
+describe("RunRunner - issue #3953: every stop reaches the capture's own authority wait", () => {
+  const assertStopped = (d: Awaited<ReturnType<typeof drive>>, expectAborted: boolean) => {
+    assert.strictEqual(d.outcome, "done", `execute() resolved under the deadline (statuses ${d.statuses.join(",")}; captures ${d.captureCalls()}; acquisitions ${d.acquisitions.join(",")})`);
+    assert.ok(d.acquisitions.length >= 1, "the capture itself consulted the authority wait");
+    if (expectAborted) assert.ok(d.acquisitions.every((aborted) => aborted), "every capture acquisition saw an aborted signal");
+    assert.strictEqual(trackingSha(IID), d.trackingBefore, "the tracking ref did not advance: nothing was verified");
+    assert.notStrictEqual(trackingSha(IID), d.headBeforeSwitch, "the tracking ref does not cover the pre-switch HEAD");
+    assert.ok(!d.statuses.includes("credential_switch"), "no release was reported");
+    assert.ok(!d.statuses.includes("completed"), "the run did not complete");
+    assert.strictEqual(d.executorRuns, 1, "no further executor turn after the capture");
+  };
+
+  it("a real cancel stops the capture", async () => {
     const d = await drive({
-      tweak: failFetch,
-      onCapture: onSecond(async (flight, runner) => {
-        const wait = runner.credentialSwitchCaptureWait(flight);
-        // The cancel input routed through the steering channel, as the poller would route it.
+      onCapture: onFirst((flight) => {
         flight.steering.route("cancel", null, 991, false, undefined);
         assert.strictEqual(flight.steering.isCancelled(), true, "the cancel input was routed");
-        waitAborted = wait.signal.aborted;
       }),
     });
-    assert.strictEqual(d.outcome, "done");
-    assert.strictEqual(waitAborted, true, "terminalLifecycleSignal observed the cancel");
-    assert.ok(!d.statuses.includes("credential_switch"), "no release was reported");
+    assertStopped(d, true);
   });
 
-  it("a claim fence during the retries stops the run with no release and no failure", async () => {
-    const d = await drive({
-      tweak: failFetch,
-      onCapture: onSecond((flight) => flight.steering.endFencedFlight("stale")),
-    });
-    assert.strictEqual(d.outcome, "done");
-    assert.ok(!d.statuses.includes("credential_switch"), "a fenced claim never releases");
-    assert.deepStrictEqual(d.failed, [], "and never fails the run");
+  it("a claim fence stops the capture", async () => {
+    const d = await drive({ onCapture: onFirst((flight) => flight.steering.endFencedFlight("stale")) });
+    assertStopped(d, true);
+    assert.deepStrictEqual(d.failed, [], "a fenced claim never fails the run");
   });
 
-  it("a worker shutdown during the retries releases nothing and reports no failure", async () => {
-    const d = await drive({ tweak: failFetch, onCapture: onSecond((_flight, runner) => runner.shutdown()) });
-    assert.strictEqual(d.outcome, "done");
-    assert.ok(!d.statuses.includes("credential_switch"), "a shutdown never reports a release");
+  it("an input-receipt failure stops the capture", async () => {
+    const d = await drive({ onCapture: onFirst((flight) => flight.steering.failReceipts(new Error("receipt gave up"))) });
+    assertStopped(d, true);
+  });
+
+  it("a worker shutdown stops the capture", async () => {
+    const d = await drive({ onCapture: onFirst((_flight, runner) => runner.shutdown()) });
+    assertStopped(d, true);
     assert.deepStrictEqual(d.failed, [], "a shutdown never reports a failure");
+  });
+
+  it("an expired boundary deadline stops the capture while another holder owns A", async () => {
+    let releaseHold: () => void = () => {};
+    const d = await drive({
+      // The bound is three attempts, all expiring. Once the last has failed, free A (so the give-up and the
+      // shutdown cleanup are not themselves starved of it) and end the otherwise idle run.
+      afterCapture: (n, runner) => { if (n === 3) { releaseHold(); runner.shutdown(); } },
+      onCapture: onFirst(async (_flight, runner, rt, defer) => {
+        runner.codexBoundaryDeadlineMs = 300;
+        let entered!: () => void;
+        const inside = new Promise<void>((r) => (entered = r));
+        let release!: () => void;
+        const hold = new Promise<void>((r) => (release = r));
+        const holder = rt.withTransaction(async () => { entered(); await hold; });
+        releaseHold = release; // released after the last attempt, or in teardown; never on a timer
+        defer(release);
+        defer(() => { holder.catch(() => undefined); });
+        await inside;
+      }),
+    });
+    // The wait signal never aborts here: the bounded acquisition itself expires.
+    assertStopped(d, false);
   });
 });
 
