@@ -38,7 +38,7 @@ describe("CapacityRail", () => {
 
   it("carries the advertised-capacity note and never promises a run", () => {
     const { container } = mount(fleet());
-    expect(screen.getByText(/Open means advertised spare slots/)).toBeTruthy();
+    expect(screen.getByText("Open slots are advertised spare capacity; admission still decides claims.")).toBeTruthy();
     expect(container.textContent).not.toMatch(/available|guaranteed|will run/i);
   });
 
@@ -55,8 +55,7 @@ describe("CapacityRail", () => {
     const { container } = mount(fleet());
     const pill = screen.getByText("draining");
     expect(pill.className).toContain("bg-neutral-surface");
-    expect(container.textContent).toContain("Takes no new runs.");
-    expect(container.textContent).toContain("Rolls to v0.86.1 once fully idle");
+    expect(container.textContent).toContain("Takes no new runs. Rolls to v0.86.1 once fully idle.");
   });
 
   it("shows no roll note for a manual cordon alone, but still says it takes no new runs", () => {
@@ -71,9 +70,16 @@ describe("CapacityRail", () => {
     expect(container.textContent).toContain("1 run over advertised caps");
   });
 
+  it("draws one cell per slot, by kind, up to twelve slots", () => {
+    const { container } = mount(fleet());
+    const count = (k: string) => container.querySelectorAll(`[data-slot="${k}"]`).length;
+    expect([count("in-use"), count("closed"), count("open")]).toEqual([3, 1, 0]);
+  });
+
   it("draws proportional segments past twelve slots", () => {
     const { container } = mount([aWorker({ active_runs: 5, max_concurrent_runs: 20 })]);
-    expect(container.querySelectorAll('[aria-hidden="true"][style], [aria-hidden="true"] > [style]').length).toBeGreaterThan(0);
+    const width = (k: string) => (container.querySelector(`[data-slot="${k}"]`) as HTMLElement).style.width;
+    expect([width("in-use"), width("closed"), width("open")]).toEqual(["25%", "0%", "75%"]);
   });
 
   it("sanitizes a hostile worker name", () => {

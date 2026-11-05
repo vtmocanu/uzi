@@ -97,7 +97,7 @@ export function OverviewNext() {
       <HealthPlatformLine isAdmin={isAdmin} runs={ownRuns} workers={data?.workers ?? []} />
 
       {/* Runs on the left, the right-hand rail beside it; the rail stacks below at narrow widths. */}
-      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
+      <div className="grid items-start gap-6 xl:grid-cols-[minmax(0,1fr)_22.5rem]">
         <div className="min-w-0">
           <OverviewRunsWidget
             ownRuns={ownRuns}

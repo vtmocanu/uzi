@@ -169,7 +169,7 @@ describe("OverviewNext capacity rail", () => {
   });
 
   it("sits beside the runs widget on desktop", async () => {
-    await page.viewport(1280, 900);
+    await page.viewport(1440, 900);
     mountPreview();
     await screen.findByText("Capacity");
     await document.fonts.ready;

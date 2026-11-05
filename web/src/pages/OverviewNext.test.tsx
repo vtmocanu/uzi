@@ -226,6 +226,14 @@ describe("Capacity rail", () => {
       workers: [
         aWorker({ id: "w1", name: "statless-worker", active_runs: 1, max_concurrent_runs: 2 }),
         aWorker({ id: "w2", name: "gone-worker", status: "offline" }),
+        // Stats-bearing (hasStats) so WorkerLoadCard would render if it were still mounted.
+        aWorker({
+          id: "w3",
+          name: "loaded-worker",
+          stats_cpu_pct: 10,
+          stats_mem_bytes: 1024,
+          stats_source: "cgroup",
+        }),
       ],
     });
     await mount();
