@@ -43,7 +43,8 @@ ALTER TABLE runs ADD CONSTRAINT runs_worker_recovery_evidence_check CHECK (
 );
 
 -- New recovery cause: a retained continuation whose first running report was refused and whose
--- worker flight departed without a witness (parked for the owner; no automatic retry).
+-- departure is still unproven after the presence window; the flight may still be live (parked
+-- for the owner; no automatic retry).
 ALTER TABLE runs DROP CONSTRAINT runs_recovery_wait_cause_check;
 ALTER TABLE runs ADD CONSTRAINT runs_recovery_wait_cause_check CHECK (
     recovery_wait_cause IS NULL OR recovery_wait_cause IN (
