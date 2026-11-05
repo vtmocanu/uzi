@@ -2489,7 +2489,7 @@ export interface EpochDiscardProofOptions {
   readonly barePath: string;
   readonly paths: readonly string[];
   readonly confirm: string;
-  /** Exact strict journal, or [] / [""] for an inactive ledger with no live journal. */
+  /** Exact strict three-key journal, or `[""]` for the explicit empty-journal repair. `[]` is refused. */
   readonly expectedRawJournal: string | readonly string[];
   /** Throws when the caller's reservation, epoch or source binding is no longer live. */
   readonly checkLive: () => void;
@@ -3555,14 +3555,16 @@ export class GitCache {
         !input.selector || typeof input.selector.runId !== "string" ||
         !/^[A-Za-z0-9_-]{1,160}$/.test(input.selector.runId) || typeof input.selector.attempt !== "string" ||
         (input.selector.generation !== "none" && (!Number.isSafeInteger(input.selector.generation) || input.selector.generation < 0)) ||
-        (input.selector.attempt !== "canonical" && !ATTEMPT_ID_RE.test(input.selector.attempt)) ||
+        // An epoch proof names one attempt; the canonical selector is never an epoch proof issuer.
+        !ATTEMPT_ID_RE.test(input.selector.attempt) ||
         typeof input.barePath !== "string" || !path.isAbsolute(input.barePath) ||
         path.resolve(input.barePath) !== input.barePath ||
         !Array.isArray(input.paths) || input.paths.length !== 1 ||
         input.paths.some(p => typeof p !== "string" || !path.isAbsolute(p) || path.resolve(p) !== p) ||
         typeof input.confirm !== "string" || !/^[0-9a-f]{64}$/.test(input.confirm) ||
+        // The exact strict journal, or the explicit empty-journal repair `[""]`; an absent journal (`[]`) is refused.
         !(typeof input.expectedRawJournal === "string" || Array.isArray(input.expectedRawJournal) &&
-          (input.expectedRawJournal.length === 0 || input.expectedRawJournal.length === 1 && input.expectedRawJournal[0] === "")) ||
+          input.expectedRawJournal.length === 1 && input.expectedRawJournal[0] === "") ||
         Buffer.byteLength(JSON.stringify(input.expectedRawJournal)) > STOPPED_MARKER_MAX_BYTES ||
         typeof input.checkLive !== "function" || typeof input.beforeEffect !== "function" || !(input.signal instanceof AbortSignal) ||
         !Number.isFinite(input.deadline) || input.deadline <= Date.now()) return invalid();
@@ -3575,12 +3577,10 @@ export class GitCache {
       if (!raw || typeof raw !== "object" || Array.isArray(raw)) return invalid();
       const journal = raw as Record<string, unknown>;
       const attempt = input.selector.attempt;
-      const keys = attempt === "canonical" ? ["clonePath", "runId"] : ["attemptId", "clonePath", "runId"];
-      if (JSON.stringify(Object.keys(journal).sort()) !== JSON.stringify(keys) ||
+      if (JSON.stringify(Object.keys(journal).sort()) !== JSON.stringify(["attemptId", "clonePath", "runId"]) ||
           journal.runId !== input.selector.runId || journal.clonePath !== input.paths[0] ||
-          (attempt !== "canonical" && journal.attemptId !== attempt) ||
-          JSON.stringify(journal) !== input.expectedRawJournal) return invalid();
-    } else if (input.selector.attempt === "canonical") return invalid();
+          journal.attemptId !== attempt || JSON.stringify(journal) !== input.expectedRawJournal) return invalid();
+    }
     const attempt = input.selector.attempt;
     const state: EpochDiscardProofState = Object.freeze({
       selector: Object.freeze({ runId: input.selector.runId, generation: input.selector.generation, attempt }),

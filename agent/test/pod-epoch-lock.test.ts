@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
+import { createInterface } from "node:readline";
 import { test } from "node:test";
 import { createPodEpoch, restoreEpochRuntimeTmpdir } from "../src/pod-epoch-lock.js";
 
@@ -601,6 +602,154 @@ test("two-process kernel fd lifetime (BusyBox adapter is not the util-linux imag
   overlapping.close();
   held.close();
   assert.equal(await contender(), 0);
+});
+
+// Real two-process lifetime of the reclaim scope's lock. No flock is mocked: the
+// holder is a separate Node process running the image template against the real
+// kernel, and every peer probe is a fresh util-linux flock on the same file.
+const reclaimTemplate = fileURLToPath(new URL("../templates/pod-epoch-init.cjs", import.meta.url));
+// Descendant that reports what its fd 3 is, then idles. SIGUSR2 closes fd 3 only.
+const descendant = `
+  const fs = require('node:fs');
+  const lockFds = fs.readdirSync('/proc/self/fd').filter((fd) => {
+    try { return fs.readlinkSync('/proc/self/fd/' + fd).endsWith('/.uzi-epoch.lock'); }
+    catch { return false; }
+  });
+  process.on('SIGUSR2', () => fs.closeSync(3));
+  setInterval(() => {}, 1000);
+  console.log(JSON.stringify({ lockFds }));
+`;
+const reclaimParent = `
+  const fs = require('node:fs');
+  const { spawn } = require('node:child_process');
+  const { createInterface } = require('node:readline');
+  const { createRuntime } = require(process.argv[1]);
+  const [root, mode, program] = process.argv.slice(2);
+  const io = { ...fs, statfsSync: (...a) => ({ ...fs.statfsSync(...a), type: 0xef53 }) };
+  const say = (value) => console.log(JSON.stringify(value));
+  (async () => {
+    const runtime = createRuntime({ root, io, uid: process.getuid(), gid: process.getgid() });
+    const held = await runtime.acquire({ firstMode: 'exclusive' });
+    if (held.mode !== 'exclusive') throw new Error('proof requires actual EX');
+    let scope, ticket, stdio = ['ignore', 'pipe', 'ignore'];
+    if (mode === 'inherit') {
+      scope = held.beginReclaim();
+      ticket = scope.beginMutation();
+      stdio = scope.inheritStdio(stdio);
+    }
+    const child = spawn(process.execPath, ['-e', program], { stdio });
+    const [line] = await require('node:events').once(createInterface({ input: child.stdout }), 'line');
+    child.stdout.destroy();
+    child.unref();
+    say({ pid: child.pid, ...JSON.parse(line) });
+    for await (const command of createInterface({ input: process.stdin })) {
+      if (command === 'release') {
+        if (scope) { ticket.settle(); scope.finish(); }
+        held.close();
+        say({ released: true });
+      } else if (command === 'exit') process.exit(0);
+    }
+  })().catch((error) => { console.error(String(error)); process.exit(1); });
+`;
+
+function peerProbe(root: string): number | null {
+  const fd = fs.openSync(path.join(root, epochName), "r");
+  try {
+    const result = spawnSync("/usr/bin/flock", ["-x", "-n", "-E", "200", "3"],
+      { stdio: ["ignore", "ignore", "ignore", fd], timeout: 5000 });
+    assert.equal(result.error, undefined);
+    return result.status;
+  } finally { fs.closeSync(fd); }
+}
+async function eventually(root: string, expected: number, label: string) {
+  for (let i = 0; i < 100; i++) {
+    if (peerProbe(root) === expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(peerProbe(root), expected, label);
+}
+async function reclaimHolder(t: { after(fn: () => void): void }, mode: "inherit" | "ordinary") {
+  assert.equal(process.platform, "linux", "kernel lock proof requires Linux; never skip");
+  assert.ok(utilLinux, "kernel lock proof requires util-linux flock at /usr/bin/flock; never skip");
+  const f = fixture(t);
+  await f.runtime.seed(S);
+  const parent = spawn(process.execPath, ["-e", reclaimParent, reclaimTemplate, f.root, mode, descendant],
+    { stdio: ["pipe", "pipe", "pipe"] });
+  let stderr = "";
+  parent.stderr.on("data", (chunk) => { stderr += chunk; });
+  const closed = once(parent, "close");
+  const lines = createInterface({ input: parent.stdout })[Symbol.asyncIterator]();
+  let pid: number | undefined;
+  t.after(() => {
+    parent.kill("SIGKILL");
+    if (pid !== undefined) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+  });
+  const next = async () => {
+    const timer = setTimeout(() => parent.kill("SIGKILL"), 15000);
+    try {
+      const line = await lines.next();
+      assert.equal(line.done, false, "holder exited early: " + stderr);
+      return JSON.parse(line.value);
+    } finally { clearTimeout(timer); }
+  };
+  const ready = await next();
+  pid = ready.pid;
+  return { f, parent, closed, ready, next,
+    descendant: (signal: NodeJS.Signals) => process.kill(pid!, signal),
+    alive: () => { try { process.kill(pid!, 0); return true; } catch { return false; } } };
+}
+
+test("reclaim-scope descendant keeps EX after the parent releases its own descriptor, until it exits", { timeout: 60000 }, async (t) => {
+  const h = await reclaimHolder(t, "inherit");
+  assert.deepEqual(h.ready.lockFds, ["3"], "descendant holds the epoch lock file as fd 3");
+  assert.equal(peerProbe(h.f.root), 200, "parent and descendant hold EX");
+  h.parent.stdin.write("release\n");
+  assert.deepEqual(await h.next(), { released: true });
+  assert.equal(peerProbe(h.f.root), 200, "parent closed its fd; descendant alone still excludes a peer");
+  h.descendant("SIGTERM");
+  await eventually(h.f.root, 0, "descendant exit releases the last holder");
+  h.parent.stdin.write("exit\n");
+  await h.closed;
+});
+
+test("parent SIGKILL leaves the lock with the mutating descendant until it exits", { timeout: 60000 }, async (t) => {
+  const h = await reclaimHolder(t, "inherit");
+  assert.deepEqual(h.ready.lockFds, ["3"], "descendant holds the epoch lock file as fd 3");
+  assert.equal(peerProbe(h.f.root), 200);
+  h.parent.kill("SIGKILL");
+  const [, signal] = await h.closed;
+  assert.equal(signal, "SIGKILL");
+  assert.ok(h.alive(), "descendant outlived its parent");
+  assert.equal(peerProbe(h.f.root), 200, "dead parent's lock is still held through the inherited description");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(peerProbe(h.f.root), 200, "no delayed release while the descendant lives");
+  h.descendant("SIGTERM");
+  await eventually(h.f.root, 0, "descendant exit releases after parent death");
+});
+
+test("closing the descriptor releases only when no holder remains", { timeout: 60000 }, async (t) => {
+  const h = await reclaimHolder(t, "inherit");
+  assert.deepEqual(h.ready.lockFds, ["3"], "descendant holds the epoch lock file as fd 3");
+  h.descendant("SIGUSR2"); // descendant closes its own fd 3 while the parent holds
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.ok(h.alive(), "descendant is still running after closing its descriptor");
+  assert.equal(peerProbe(h.f.root), 200, "parent still holds the open description");
+  h.parent.stdin.write("release\n");
+  assert.deepEqual(await h.next(), { released: true });
+  await eventually(h.f.root, 0, "last close releases while the descendant is still alive");
+  assert.ok(h.alive());
+  h.parent.stdin.write("exit\n");
+  await h.closed;
+});
+
+test("an ordinary spawn without inheritStdio never holds the lock", { timeout: 60000 }, async (t) => {
+  const h = await reclaimHolder(t, "ordinary");
+  assert.deepEqual(h.ready.lockFds, [], "default-stdio child holds no epoch lock descriptor");
+  assert.equal(peerProbe(h.f.root), 200, "parent alone holds EX");
+  h.parent.stdin.write("exit\n");
+  await h.closed;
+  assert.ok(h.alive(), "ordinary child outlives the parent");
+  assert.equal(peerProbe(h.f.root), 0, "peer acquires although the ordinary child is still running");
 });
 
 test("record corruption defers authority without repairing history or skipping SH", async (t) => {

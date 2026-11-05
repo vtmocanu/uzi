@@ -7,6 +7,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
 import { createCaptureContext, GitCache, type EpochDiscardProof } from "../src/git.js";
+import { formatAttemptId } from "../src/attempt-path.js";
 import { runnerCommand } from "../src/runner-uid.js";
 import { MaintenanceResources } from "../src/recovery-maintenance.js";
 import { nullLogger } from "./helpers.js";
@@ -48,11 +49,13 @@ function fixture(deleteLaunch = false, identity: Identity = "worker_pat") {
   };
   const controller = new AbortController();
   const target = path.join(process.env.TMPDIR!, "source");
+  // An epoch proof names one attempt: the canonical selector is refused by the constructor.
+  const attempt = formatAttemptId(new Date("2026-01-01T00:00:00Z"), 1, "0000000000000001");
   const proof = git.createEpochDiscardProof({
     decision: { eligible: true, attested: true }, scope,
-    selector: { runId: "epoch-native", generation: "none", attempt: "canonical" },
+    selector: { runId: "epoch-native", generation: "none", attempt },
     barePath: path.join(process.env.TMPDIR!, "bare"), paths: [target], confirm: "a".repeat(64),
-    expectedRawJournal: JSON.stringify({ clonePath: target, runId: "epoch-native" }),
+    expectedRawJournal: JSON.stringify({ attemptId: attempt, clonePath: target, runId: "epoch-native" }),
     beforeEffect: async () => {}, checkLive() {}, signal: controller.signal, deadline: Date.now() + 10_000,
   });
   const child = Object.assign(new EventEmitter(), {
