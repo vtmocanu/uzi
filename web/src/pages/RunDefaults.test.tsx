@@ -672,6 +672,8 @@ describe("Run defaults — summary model per harness (PRD #3248)", () => {
     mockApi.getMySettings.mockResolvedValue(summarySettings());
     renderPage();
     await screen.findByLabelText("Claude summary model");
+    const card = screen.getByText("Run summaries").closest("div")!;
+    expect(card.textContent).toMatch(/on the same harness the run uses, with your own credential\s+for that harness/);
     expect(screen.queryByText(/your own Anthropic token(?!s)/)).toBeNull();
   });
 
