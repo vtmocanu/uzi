@@ -8,10 +8,11 @@ export const GET_ISSUE_HELP = "Read one forge issue by its number (iid). The run
 export const REPORT_MD_STORED_MAX_BYTES = 8 * 1024;
 
 /** signal_done `summary` description, shared by the Claude and Codex tool schemas. Names only
- *  the final message for long detail: every run kind and both harnesses have one. */
+ *  the final message for long detail (every run kind and both harnesses have one) and no
+ *  parameter that a schema offers only conditionally (report_only, decisions_memo). */
 export const SIGNAL_DONE_SUMMARY_DESCRIPTION =
-  "A short plain-text summary of the outcome, a few sentences. On a report_only completion it is stored " +
-  `as the report, and the server keeps only its first ${REPORT_MD_STORED_MAX_BYTES / 1024} KiB ` +
+  "A short plain-text summary of the outcome, a few sentences. When the run completes as report-only, this " +
+  `summary is stored as the report and the server keeps only about its first ${REPORT_MD_STORED_MAX_BYTES / 1024} KiB ` +
   `(${REPORT_MD_STORED_MAX_BYTES} bytes of UTF-8) after scrubbing; anything longer is cut off. Put long logs, ` +
   "gate output and detailed findings in your final message rather than here; a very long summary also makes " +
   "the tool call harder to encode as valid JSON.";

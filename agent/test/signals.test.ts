@@ -491,10 +491,11 @@ describe("buildSignalMcpServer prd_done_path schema gate (PRD #72 M4)", () => {
     ]) {
       const description = (doneToolShape(server)["summary"] as { description?: string }).description ?? "";
       assert.equal(description, SIGNAL_DONE_SUMMARY_DESCRIPTION);
-      for (const needle of ["report_only", "8 KiB", "8192", "final message"]) assert.ok(description.includes(needle), needle);
-      // Only the final message exists on every run kind and harness; never point at the
-      // worker's 32768 transport clamp or a conditional field.
-      for (const absent of ["One-line", "32768", "decisions_memo", "pr_summary"]) assert.ok(!description.includes(absent), absent);
+      for (const needle of ["report-only", "8 KiB", "8192", "final message"]) assert.ok(description.includes(needle), needle);
+      // Long detail goes to the final message, which every run kind and harness has. Never the
+      // worker's 32768 transport clamp, and never a parameter offered only on some runs
+      // (report_only and decisions_memo are gated); pr_summary is meant for PR-opening runs.
+      for (const absent of ["One-line", "32768", "report_only", "decisions_memo", "pr_summary"]) assert.ok(!description.includes(absent), absent);
     }
   });
 

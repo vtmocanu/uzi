@@ -78,12 +78,13 @@ describe("#3360 report_only dynamic schema", () => {
 });
 
 describe("signal_done summary dynamic schema (#3/#14 self-improve)", () => {
-  it("carries the shared stored-report-limit description and names no absent property", () => {
+  it("carries the shared stored-report-limit description, which names no conditionally offered parameter", () => {
     const spec = buildCodexDynamicTools(grants(["signal_done"])).find(s => s.name === "signal_done")!;
     const props = spec.inputSchema.properties as Record<string, Record<string, unknown>>;
     assert.deepEqual(props["summary"], { type: "string", description: SIGNAL_DONE_SUMMARY_DESCRIPTION });
     assert.ok(!("decisions_memo" in props), "the Codex signal_done schema has no decisions_memo");
-    for (const absent of ["decisions_memo", "pr_summary"]) assert.ok(!SIGNAL_DONE_SUMMARY_DESCRIPTION.includes(absent), absent);
+    // report_only is gated on Claude's schema and decisions_memo is absent here, so the shared copy names neither.
+    for (const absent of ["report_only", "decisions_memo"]) assert.ok(!SIGNAL_DONE_SUMMARY_DESCRIPTION.includes(absent), absent);
   });
 });
 
