@@ -772,6 +772,13 @@ jobs:
           WORKER_UID_IMAGE: wuid-2134-base:ci
           WORKER_UID_SKIP_BUILD: "1"
         run: task test:agent:worker-uid
+      # #3894 PR1: the same image, run the way a worker run executes (real Nix store, provisioned
+      # tools, guarded command lanes). Runs after every existing proof, which stay unchanged. No
+      # secret is passed: the container gets no host env and the checkout kept no credentials.
+      - name: Worker execution-environment proofs
+        env:
+          WORKER_ENV_IMAGE: wuid-2134-base:ci
+        run: task test:agent:worker-env
 
   # The ruleset requires this EXACT check name. A failed, skipped or canceled
   # matrix leg must yield a FAILED check, not a skipped green dependency.
@@ -1085,6 +1092,18 @@ jobs:
               - 'Taskfile.yml'
               - 'e2e/worker-uid/**'
               - '.github/workflows/ci.yml'
+              # #3894: inputs of the worker-env proofs beyond agent/** (provisioning, command
+              # env and guard code, devbox pins and the gate fixtures live under agent/** or here).
+              - 'e2e/worker-env/**'
+              - 'e2e/forge-fake/**'
+              - 'scripts/ci-safe-paths*'
+              - 'scripts/check-worker-toolchain.py'
+              - 'devbox.json'
+              - 'controller/internal/kube/testdata/runner-shared-init.sh'
+              - '.agents/skills/uzi-release/scripts/**'
+              - 'api/go.mod'
+              - 'api/go.sum'
+              - 'api/internal/forge/**'
             web_nginx:
               - 'web/nginx.conf'
               - 'web/nginx.mock.conf'
