@@ -3,8 +3,9 @@
 // implement, from the issue + PRD) and a "plan" summary + deltas (what the proposed
 // plan will do and how it diverges from the original ask). Unlike the Judge it is NOT a
 // run kind: it runs INLINE inside a normal, in-flight eligible run (Decision 1), on the
-// claim's harness: Codex uses the injected isolated advice factory with private
-// model/effort pins and refresh denied; absent Codex uses the legacy Anthropic token
+// claim's harness: Codex uses the injected isolated advice factory with the claim's
+// validated Codex summary model (else the built-in), a fixed effort pin and refresh
+// denied; absent Codex uses the legacy Anthropic token
 // and model. It reuses the read-only model pass's timeout, usage and abort mechanics,
 // and extractJsonObject for plan/deltas JSON, without the JudgeRunner's lifecycle.
 //
