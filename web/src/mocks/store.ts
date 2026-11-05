@@ -7,6 +7,7 @@
 import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, VaultMode, WsEvent } from "../lib/api";
 import { seedUnifiedProgress } from "./data/unifiedProgress";
 import { mockGatedCheckedMessages } from "./data/planCrossCheckGated";
+import { overviewNextOtherRunOwners, overviewNextRuns } from "./data/overviewNext";
 import { deriveMockProgress, foreignCooldownRun } from "./runProgress";
 import { mockScenario } from "./mockScenario";
 import {
@@ -28,6 +29,7 @@ import {
   mockLimitWaitMessages,
   mockLiveMessages,
   mockLiveTokensMessages,
+  mockOtherRunOwners,
   mockOtherUserRuns,
   mockProposals,
   mockRuns,
@@ -96,6 +98,13 @@ function seed(): MockState {
   for (const r of mockOtherUserRuns) runs.set(r.id, seedRun(r));
   // PRD #1908: repo-less job runs (queued + completed with a hostile result).
   for (const r of mockJobRuns) runs.set(r.id, seedRun(r));
+  // ?mock=overview-next (PRD #3878): more other-user runs (attributed through the owner
+  // column, so they stay out of the caller-scoped listRuns) and a duplicate-MR own run.
+  // Seeded only under the scenario so no other mock test or scenario changes.
+  if (mockScenario() === "overview-next") {
+    Object.assign(mockOtherRunOwners, overviewNextOtherRunOwners);
+    for (const r of overviewNextRuns) runs.set(r.id, seedRun(r));
+  }
   const messages = new Map<string, RunMessage[]>();
   messages.set("run-crew", mockCrewMessages.map((m) => ({ ...m })));
   messages.set("run-lanes", mockLaneMessages.map((m) => ({ ...m })));
@@ -166,6 +175,8 @@ function seed(): MockState {
   // empty log (a queued run has no transcript yet) — both open without a 404.
   messages.set("run-mira-embed", mockBusyMessages.map((m) => ({ ...m })));
   messages.set("run-andrei-queued", []);
+  // ?mock=overview-next runs open without a 404 (empty logs).
+  for (const r of overviewNextRuns) if (runs.has(r.id)) messages.set(r.id, []);
   // Job runs: empty logs, so both open without a 404 (their deliverable is the result panel).
   for (const r of mockJobRuns) messages.set(r.id, []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));
@@ -201,6 +212,21 @@ function seed(): MockState {
       r.health_reason = id === "run-stalled" ? "near timeout" : "waiting for account cooldown";
       if (id === "run-stalled") r.deadline_at = new Date(Date.now() + 60_000).toISOString();
       r.progress = deriveMockProgress(r);
+    }
+  }
+  // ?mock=overview-calm (PRD #3878): the viewer has active runs but nothing needs a decision,
+  // so the Overview preview's decision card stays hidden. Drop every own run that could list
+  // as one: a plan/question wait, a parked run, or a finished run with a pull request. (The
+  // mock graph cannot import lib/overview, so mockApi.overviewCalm.test.ts checks the result
+  // against overviewDecisions.)
+  if (mockScenario() === "overview-calm") {
+    const decisionStatus = new Set<string>([
+      "awaiting_approval", "awaiting_input", "awaiting_followup",
+      "paused", "limit_wait", "pool_wait", "recovery_wait",
+    ]);
+    for (const r of runs.values()) {
+      if (r.id in mockOtherRunOwners) continue;
+      if (decisionStatus.has(r.status) || r.mr_iid != null) runs.delete(r.id);
     }
   }
   const proposals = new Map<string, IssueProposal>();

@@ -69,7 +69,8 @@ const recoveryCauseCodexAccountUnavailable = "codex_account_unavailable"
 // and is never written on the worker's word: the server re-derives it under lock.
 // Together these sets partition runs_recovery_wait_cause_check.
 var serverRecoveryWaitCauses = map[string]bool{
-	"worker_requeue_exhausted": true,
+	"worker_requeue_exhausted":          true,
+	"retained_continuation_unwitnessed": true,
 }
 
 // parkForgeUnreachable is SetState's forge pre-clone park transaction (PRD #1392 M1, D2/D3/D4).

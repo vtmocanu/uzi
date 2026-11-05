@@ -2380,6 +2380,10 @@ type ClaimCheckpointEvidence = Readonly<{ tip?: string; attestedSource?: string;
 
 interface RunFlight {
   registrationToken?: symbol;
+  /** Issue #3859: the latest built snapshot epoch captured when this flight registered; the client
+   *  turns it into the registration_evidence of the flight's first `running` report, which clears
+   *  it. Captured once at registration, never re-read from the registry at send time. */
+  registrationEpoch?: number;
   /** Irrevocable local selection, independent of delivery ACK or source cleanup proof. */
   policyHold?: { readonly outcomeId: string; body?: Readonly<import("./protocol.js").PolicyHoldRequest> };
   policyAdmission?: boolean;
@@ -5211,6 +5215,9 @@ export class RunRunner {
     // pre-clone — is a requeue, so it stops being listed there too). Idempotent per run id.
     const registration = this.snapshotRegistry?.add(runId, claim.claim_generation ?? 0);
     flight.registrationToken = registration;
+    // Issue #3859: capture the registration epoch ONCE, synchronously after add(), and never re-read
+    // it at send time (a later read could name a snapshot that already listed this run).
+    if (this.snapshotRegistry) flight.registrationEpoch = this.snapshotRegistry.latestBuiltEpoch();
     // Repository task roots only; other lanes retain their existing policy.
     if (claim.secrets.codex?.auth_mode === "subscription") {
       flight.operationScope = acquireCodexOperationScope(this.client, runId, flight.claimGeneration,
@@ -9749,6 +9756,26 @@ export class RunRunner {
         run_id: runId,
       });
     };
+    // #3944: the one orphan-guard probe shared by the three report-only sites below. It also
+    // proves a publish whose ack was lost (the attempted tip), and for an ISSUE run only lets
+    // hasCommittedCheckpoint discount a provably work-bearing but stale LOCAL mirror when origin
+    // answers that the checkpoint ref is gone (the claim fetch never prunes the mirror).
+    const hasPublishedCheckpoint = (): Promise<boolean> =>
+      this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
+        landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
+        flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch),
+        {
+          attemptedTip: flight.lastAttemptedCheckpointRefTip,
+          ...(resolveRunKind(claim.kind) === "issue"
+            ? {
+              originProbe: {
+                pat: claim.secrets.forge_pat,
+                repoUrl: claim.repo.clone_url,
+                username: claim.secrets.forge_username,
+              },
+            }
+            : {}),
+        });
     if (result.reportOnly) {
       // #299/#2967: report-only opens no MR to supersede a published checkpoint.
       // Check the prior/cross-worker mirrored ref AND this worker's exact confirmed
@@ -9756,10 +9783,7 @@ export class RunRunner {
       // carries no content; retained commits with differing trees still block.
       // Missing evidence for a confirmed publication blocks. The prior-worker
       // marker-only park exception remains in hasCommittedCheckpoint.
-      const publishedCheckpoint =
-        await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
-          landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
-          flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch));
+      const publishedCheckpoint = await hasPublishedCheckpoint();
       if (publishedCheckpoint) {
         if (resolveRunKind(claim.kind) !== "issue") {
           await failReportOnlyOrphan();
@@ -10077,10 +10101,7 @@ export class RunRunner {
         // which (PRD #759) ignores a marker-only `wip(park):` checkpoint while a real
         // committed milestone still blocks.
         if (result.scopeCapped) {
-          const publishedCheckpoint =
-            await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
-              landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
-              flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch));
+          const publishedCheckpoint = await hasPublishedCheckpoint();
           if (!publishedCheckpoint) {
             // Bind a zero slice to its committed base in the runner-owned clone, without pushing.
             let cappedHead: string | undefined;
@@ -10159,10 +10180,7 @@ export class RunRunner {
         // mirrored and exact confirmed-published tips. Only positively proven
         // published-boundary coverage (or the existing mirrored park-marker exception)
         // carries no committed content; unknown confirmed publication still blocks.
-        const publishedCheckpoint =
-          await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
-            landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
-            flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch));
+        const publishedCheckpoint = await hasPublishedCheckpoint();
         if (publishedCheckpoint) {
           batcher.emit({
             kind: "status",
@@ -12712,12 +12730,20 @@ export class RunRunner {
         if (checked && stamped.claim_generation !== flight.claimGeneration)
           throw new Error("plan cross-check: state generation changed");
         const diskSeq = body.status !== undefined ? this.diskGovernor?.statusRequested(runId, body.status) : undefined;
+        // Issue #3859: the registration witness rides the flight's FIRST `running` report only (the
+        // phaseClone one, before any retained refusal). It is consumed here, before the send, so a
+        // later iteration/progress `running` report never repeats it and a failed send is not replayed.
+        let witnessEpoch: number | undefined;
+        if (!checked && body.status === "running" && flight.registrationEpoch !== undefined) {
+          witnessEpoch = flight.registrationEpoch;
+          flight.registrationEpoch = undefined;
+        }
         const transport = () => checked === "semantic"
           ? this.client.reportSemanticPlanGateState(runId, stamped, signal)
           : checked ? this.client.reportPlanCrossCheckGateState(runId, stamped, signal)
           : body === flight.iterationCancellationReport
             ? this.client.reportState(runId, stamped, signal, { iterationCancellation: true })
-            : this.client.reportState(runId, stamped, signal);
+            : this.client.reportState(runId, stamped, signal, witnessEpoch === undefined ? undefined : { registrationEpoch: witnessEpoch });
         // Preservation expiry cannot prevent the honest terminal report. FINAL stays budgeted.
         const sending = body.status === "failed" || body.status === "completed"
           ? MaintenanceBudget.withoutAttempt(transport) : transport();
@@ -13725,7 +13751,11 @@ export class RunRunner {
     };
     const reseed = this.canonicalReseedOptions(flight);
     // A SourceUseHeldRefusal (an earlier flight's unended source use of the canonical path) is nonterminal:
-    // custody retained, no terminal report, no model work; the requeue cap bounds it.
+    // custody retained, no terminal report, no model work. The bound is server-side and conditional: only when the
+    // api supports registration evidence (run_registration_evidence_v1), the feature was negotiated and not dropped,
+    // did the preceding `running` report carry it, so the next snapshot that omits the run stamps a witnessed
+    // departure charged against RUN_MAX_REQUEUES (the claimed-never-started charge), parking at
+    // worker_requeue_exhausted. Otherwise the existing per-run custody bound (ADR-1751 D2a) is what stops the loop.
     const stopOnHeldSource = (err: SourceUseHeldRefusal): never => {
       this.retainedLifecycleGuard(flight);
       flight.runLog.warn("clone path held by an earlier flight's unended source use; stopping claim for retry", {
@@ -26371,8 +26401,12 @@ export class RunRunner {
             this.retainedLifecycleGuard(flight);
             if (error instanceof SourceUseHeldRefusal) {
               // An earlier flight of this process still holds the path with no confirmed end (held_unended). That is
-              // not a preservation failure: stop nonterminal with custody retained and no report; the existing
-              // missing-flight requeue cap bounds it.
+              // not a preservation failure: stop nonterminal with custody retained and no report unless an owner
+              // cancel is observed at this seam (#3860, observeCancelAtHeldSeam below). The server's
+              // claimed-never-started charge bounds it only when the api supports registration evidence
+              // (run_registration_evidence_v1) and it was negotiated and not dropped: then the witnessed departure
+              // of this retained continuation is charged against RUN_MAX_REQUEUES and parks at
+              // worker_requeue_exhausted. Otherwise the existing per-run custody bound (ADR-1751 D2a) stops it.
               flight.runLog.warn("retained predecessor held by an earlier flight's unended source use; stopping claim for retry", {
                 error: errMessage(error), claim_generation: flight.claimGeneration });
               await this.observeCancelAtHeldSeam(claim, flight);

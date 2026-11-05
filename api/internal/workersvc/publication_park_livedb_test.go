@@ -564,7 +564,7 @@ func TestPublicationSweepHoldsUnservableRunLiveDB(t *testing.T) {
 func TestPublicationClaimedNeverStartedKeepsIntentLiveDB(t *testing.T) {
 	f := newPublicationParkFixture(t, time.Hour)
 	f.env.exec(`UPDATE runs SET status='claimed', claimed_at=now()-interval '1 hour' WHERE id=$1`, f.runID)
-	rows, err := f.env.q.SweepClaimedNeverStarted(f.env.ctx, pgtype.Timestamptz{Time: time.Now(), Valid: true})
+	rows, err := f.env.q.SweepClaimedNeverStarted(f.env.ctx, store.SweepClaimedNeverStartedParams{Cutoff: pgtype.Timestamptz{Time: time.Now(), Valid: true}})
 	if err != nil {
 		t.Fatal(err)
 	}

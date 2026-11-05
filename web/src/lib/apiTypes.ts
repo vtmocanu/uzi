@@ -3765,6 +3765,10 @@ export interface Run {
    *  "retained_recovery_adoption_failed" means integrity checks refused adoption of retained
    *  work: always owner-held with local work and custody preserved, no automatic retry.
    *  Only the owner can Resume or Cancel, through the existing owner authorization.
+   *  "retained_continuation_unwitnessed" (issue #3859) means a retained-custody continuation's
+   *  claimed worker flight was never witnessed starting or departing within a bounded window;
+   *  the claim was released, local work and custody are kept, and only the owner can Resume or
+   *  Cancel. Owner-held with no automatic retry, and not an integrity refusal.
    *  "empty_turn" remains reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
@@ -3813,7 +3817,8 @@ export interface Run {
    *  recovery-parked. For forge_unreachable and retained_recovery_exhausted, explicit null means owner-held;
    *  a valid timestamp means timed retry (including when already due). Missing or invalid
    *  timing is unknown. For retained_recovery_adoption_failed this is always null and must
-   *  never produce a retry countdown, even if a malformed response supplies a timestamp.
+   *  never produce a retry countdown, even if a malformed response supplies a timestamp;
+   *  the same holds for retained_continuation_unwitnessed.
    *  ISO-8601 string, like every other timestamp on this type. */
   recovery_retry_not_before?: string | null;
   /** PRD #1392 M1: how many times this run has forge-parked in its lifetime — the

@@ -1678,8 +1678,8 @@ chain in the diagram above, with no intervening `running`.
   one per run backing a healthy current claim without an owner decision;
   total custody remains protected. After discarded/released precedence, an OPEN
   hold at `recovery_wait` for `worker_requeue_exhausted`,
-  `worker_memory_pressure`, `retained_recovery_exhausted`, or
-  `retained_recovery_adoption_failed` reports
+  `worker_memory_pressure`, `retained_recovery_exhausted`,
+  `retained_recovery_adoption_failed`, or `retained_continuation_unwitnessed` reports
   `needs_action` after failed latest capture,
   otherwise `source_only`, before available unguarded archives or capture
   progress. Retained-recovery exhaustion keeps this conservative protection
@@ -1891,7 +1891,12 @@ chain in the diagram above, with no intervening `running`.
   never rewritten, and the paired `run_user_inputs` row is audit-only.
 - **Sweeper** (a goroutine beside the forge poller) enforces what workers
   can't be trusted to self-report: a claimed-but-never-started run older than
-  5 minutes is re-queued; a running run older than `RUN_TIMEOUT` (default 6h)
+  5 minutes is re-queued uncharged, except a retained continuation (open custody
+  hold of an earlier generation): a witnessed flight departure is charged against
+  `RUN_MAX_REQUEUES` (parking at `worker_requeue_exhausted` at the cap), and
+  presence without a departure within 2x the claim grace parks it at
+  `recovery_wait` / `retained_continuation_unwitnessed` (owner Resume or Cancel;
+  issue #3859, [docs/run-recovery-wait.md](docs/run-recovery-wait.md#unwitnessed-continuation-hold)); a running run older than `RUN_TIMEOUT` (default 6h)
   **parks** — non-terminal `paused`, `hold_reason='budget_exhausted'` — and asks
   its owner to extend or stop it, never failed for the clock alone (PRD #1497,
   see the **running → paused (wall park)** entry above); a worker whose

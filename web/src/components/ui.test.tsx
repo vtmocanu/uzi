@@ -416,6 +416,12 @@ it.each([null, undefined, "invalid", "2099-01-01T00:00:00Z", "2020-01-01T00:00:0
   expect(container.querySelector(".text-warn")).toBeTruthy();
   expect(container.querySelector(".animate-pulse")).toBeNull();
 });
+it.each([null, undefined, "invalid", "2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z"])("StatusPill renders unwitnessed continuation hold regardless of timing %s", (stamp) => {
+  const { container } = render(<StatusPill status="recovery_wait" recovery_wait_cause="retained_continuation_unwitnessed" recovery_retry_not_before={stamp} />);
+  expect(container.textContent).toBe("unwitnessed continuation hold");
+  expect(container.querySelector(".text-warn")).toBeTruthy();
+  expect(container.querySelector(".animate-pulse")).toBeNull();
+});
 
 it.each([
   [null, "Codex idle stall needs decision"],

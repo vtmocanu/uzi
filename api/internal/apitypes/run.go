@@ -919,6 +919,9 @@ type RunDTO struct {
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
 	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
 	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
+	// "retained_continuation_unwitnessed" is a claimed-never-started park whose retained custody
+	// continuation was never witnessed starting: the claim is released, retained work and custody
+	// are preserved, and only the owner can Resume or Cancel, without automatic retry.
 	// "empty_turn" remains reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
@@ -978,6 +981,7 @@ type RunDTO struct {
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
 	// or retained_recovery_exhausted park. An omitted key in a partial client read means
 	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
+	// retained_continuation_unwitnessed is likewise always owner-held.
 	// retained_recovery_adoption_failed is always owner-held, even if a malformed
 	// response supplies a retry timestamp; the cause never schedules a timer.
 	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`
@@ -1811,6 +1815,9 @@ type RunSummaryItemDTO struct {
 	// "retained_recovery_exhausted" can be timed or owner-held; see RecoveryRetryNotBefore.
 	// "retained_recovery_adoption_failed" is an integrity refusal: retained local work and
 	// custody are preserved, and only the owner can Resume or Cancel, without automatic retry.
+	// "retained_continuation_unwitnessed" is a claimed-never-started park whose retained custody
+	// continuation was never witnessed starting: the claim is released, retained work and custody
+	// are preserved, and only the owner can Resume or Cancel, without automatic retry.
 	// "empty_turn" remains reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
@@ -1870,6 +1877,7 @@ type RunSummaryItemDTO struct {
 	// Null means no scheduled recovery retry, including an owner-held codex_idle_stall
 	// or retained_recovery_exhausted park. An omitted key in a partial client read means
 	// timing is unknown; consult RecoveryRetryNotBeforePresent before inferring a hold.
+	// retained_continuation_unwitnessed is likewise always owner-held.
 	// retained_recovery_adoption_failed is always owner-held, even if a malformed
 	// response supplies a retry timestamp; the cause never schedules a timer.
 	RecoveryRetryNotBefore *time.Time `json:"recovery_retry_not_before"`

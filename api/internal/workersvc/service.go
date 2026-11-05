@@ -426,8 +426,14 @@ func (e *CapabilityUnmetError) Unwrap() error { return ErrCapabilityUnmet }
 // delete (PRD #1296 M4, D3), so the handler/CLI (M4b) can name how many captures a
 // forced discard would destroy. It unwraps to ErrWorkerHasCustody, so the handler both
 // matches the sentinel (→ 409) and surfaces the specific count via err.Error(). Same
-// shape as CapabilityUnmetError.
-type WorkerHasCustodyError struct{ Holds int64 }
+// shape as CapabilityUnmetError. List (#3921) names up to 10 of the blocking holds, oldest
+// first, so the operator can find the runs to recover or discard; it may be shorter than
+// Holds (cap, or holds released between the count and the listing) and Holds stays the
+// authoritative total. Error() is unchanged.
+type WorkerHasCustodyError struct {
+	Holds int64
+	List  []store.ListOpenCustodyHoldsForWorkerRow
+}
 
 func (e *WorkerHasCustodyError) Error() string {
 	return fmt.Sprintf("%s (%d custody hold(s) still open)", ErrWorkerHasCustody.Error(), e.Holds)
@@ -724,6 +730,9 @@ type Store interface {
 	// CountOpenCustodyHoldsForWorker backs the DeleteWorker custody guard.
 	ListReleasableCustodyHolds(ctx context.Context) ([]store.ListReleasableCustodyHoldsRow, error)
 	CountOpenCustodyHoldsForWorker(ctx context.Context, arg store.CountOpenCustodyHoldsForWorkerParams) (int64, error)
+	// ListOpenCustodyHoldsForWorker names (capped) the holds that count covers, for the
+	// DeleteWorker 409 body (#3921).
+	ListOpenCustodyHoldsForWorker(ctx context.Context, arg store.ListOpenCustodyHoldsForWorkerParams) ([]store.ListOpenCustodyHoldsForWorkerRow, error)
 	// Run judge (PRD #46 M3): terminal-funnel enqueue, judge-run-scoped trace/review
 	// authz, the command-not-found scan input, and the review upsert.
 	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
@@ -1064,7 +1073,13 @@ type Store interface {
 	UpdateRunLastSeq(ctx context.Context, arg store.UpdateRunLastSeqParams) (int64, error)
 
 	// Sweeper + register-time orphan recovery.
-	SweepClaimedNeverStarted(ctx context.Context, cutoff pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error)
+	// SweepClaimedNeverStartedCohort (issue #3859) runs the claimed-never-started passes in ONE
+	// transaction: charge (or park at the cap) a witnessed retained-custody departure, park an
+	// unwitnessed continuation whose witness window passed, then reset the rest uncharged.
+	SweepClaimedNeverStartedCohort(ctx context.Context, arg store.SweepClaimedNeverStartedCohortParams) (store.SweepClaimedNeverStartedCohortResult, error)
+	// RecordRunRegistrationEvidence (issue #3859) stores the worker's registration witness from
+	// its first running report. It runs BEFORE SetRunRunning and does not depend on that write.
+	RecordRunRegistrationEvidence(ctx context.Context, arg store.RecordRunRegistrationEvidenceParams) (int64, error)
 	// SweepTaskNeverDispatched terminalizes a kind='task' (handoff) run left queued with
 	// dispatched_at NULL past the dispatch grace window (issue #1367): the CLI never landed
 	// its push/dispatch, so ClaimRun never offers it and no other sweep touches it. Server-
@@ -4088,6 +4103,13 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
+	// RegistrationEvidence (issue #3859, feature run_registration_evidence_v1) is the worker's own
+	// (claim_generation, register_nonce, registration epoch) on a `running` report. It is recorded
+	// BEFORE the status write and independently of whether that write applies, so a report a
+	// SetRunRunning guard refuses still leaves the witness that lets the sweep tell a departed
+	// flight from a slow one. Valid only on `running`; httpx.DecodeJSON rejects unknown fields, so
+	// the field MUST exist here or a new worker's report 400s.
+	RegistrationEvidence       *RegistrationEvidence           `json:"registration_evidence,omitempty"`
 	SourcePublication          *SourcePublicationReport        `json:"source_publication,omitempty"`
 	RegisterNonce              string                          `json:"register_nonce,omitempty"`
 	MemoryEpisode              *int64                          `json:"memory_episode,omitempty"`
@@ -7578,10 +7600,11 @@ func (s *Service) WorkerProjectionForOwner(ctx context.Context, userID, workerID
 // and a preauthorized recovery upload may still need that token to authenticate — the
 // last authenticated retry path must survive until custody is released or explicitly
 // discarded. The error carries the count so M4b's CLI confirmation can name the
-// affected captures. This guard is placed BEFORE the delete so the token row is never
-// cascaded away while an upload could still need it. (The M1 live_worker_id
-// ON DELETE RESTRICT FK is the fail-closed backstop; this guard turns it into a clean,
-// enumerated 409 instead of a raw constraint 500.)
+// affected captures, and (#3921) lists up to 10 of the blocking holds. This guard is
+// placed BEFORE the delete so the token row is never cascaded away while an upload
+// could still need it. (The M1 live_worker_id ON DELETE RESTRICT FK is the fail-closed
+// backstop; this guard turns it into a clean, enumerated 409 instead of a raw
+// constraint 500.)
 func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) error {
 	active, err := s.q.CountWorkerNonTerminalRuns(ctx, store.CountWorkerNonTerminalRunsParams{
 		WorkerID: pgconv.UUID(workerID), UserID: userID,
@@ -7610,7 +7633,16 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 		return err
 	}
 	if holds > 0 {
-		return &WorkerHasCustodyError{Holds: holds}
+		// #3921: name the blocking holds (same predicate as the count, capped). A listing
+		// failure is returned as-is (500), mirroring the active-runs listing above.
+		list, err := s.q.ListOpenCustodyHoldsForWorker(ctx, store.ListOpenCustodyHoldsForWorkerParams{
+			WorkerID: workerID,
+			UserID:   userID,
+		})
+		if err != nil {
+			return err
+		}
+		return &WorkerHasCustodyError{Holds: holds, List: list}
 	}
 	n, err := s.q.DeleteWorkerForUser(ctx, store.DeleteWorkerForUserParams{ID: workerID, UserID: userID})
 	if err != nil {
@@ -8560,6 +8592,14 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 type SweepResult struct {
 	WorkersOffline int64
 	ClaimedReset   int64
+	// ClaimedCharged and ClaimedExhausted (issue #3859) count claimed-never-started
+	// continuations the charge pass requeued with requeue_count + 1, and parked at
+	// recovery_wait/worker_requeue_exhausted once the episode budget was spent.
+	ClaimedCharged   int64
+	ClaimedExhausted int64
+	// ClaimedUnwitnessed counts continuations parked at recovery_wait /
+	// retained_continuation_unwitnessed after their witness window passed (issue #3859).
+	ClaimedUnwitnessed int64
 	// TaskUndispatchedFailed is the number of kind='task' (handoff) runs this pass
 	// terminalized because they sat queued with dispatched_at NULL past DispatchGrace —
 	// the CLI never landed their push/dispatch (issue #1367). Normally 0: a handoff is

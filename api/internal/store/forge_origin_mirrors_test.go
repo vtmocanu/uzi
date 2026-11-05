@@ -279,7 +279,7 @@ func TestForgeOriginPlacementNeverStartedCleanupLiveDB(t *testing.T) {
 				}
 			} else {
 				mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET updated_at=now()-interval '1 hour',status_since=now()-interval '1 hour',claimed_at=now()-interval '1 hour' WHERE id=$1", run)
-				rows, err := fx.q.SweepClaimedNeverStarted(fx.ctx, pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true})
+				rows, err := fx.q.SweepClaimedNeverStarted(fx.ctx, store.SweepClaimedNeverStartedParams{Cutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true}})
 				if err != nil {
 					t.Fatal(err)
 				}

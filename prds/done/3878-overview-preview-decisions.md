@@ -1,6 +1,6 @@
 # PRD #3878: Overview preview, decisions first
 
-**Status**: Draft, parked (`Later`). Child of epic #3873. Blocked by: none.
+**Status**: Done (2026-11-05, uzi run on branch `agent/issue-3878`). Child of epic #3873. Blocked by: none.
 
 **Design brief**: `prds/3873-overview-redesign.md` (model-fidelity rules, data readiness, reuse map, constraints, mock contract). This PRD wins where it is more specific.
 
@@ -29,7 +29,7 @@ Acceptance examples:
 
 ## Out of scope
 
-The issue-work line (#3879), the capacity rail and Held work (#3880), the usage recomposition (#3881), the command menu and the header Search button (#3875), promotion to `/dashboard` (#3877), the provider split (#3876). Banners stay in the shell slot on every page except this one.
+The issue-work line (#3879), the capacity rail and Held work (#3880), the usage recomposition (#3881), the command menu and the header Search button (#3875), promotion to `/dashboard` (#3877), the provider split (#3876). Banners stay in the shell on every page, this one included; here the page header renders above them (see the Decision Log).
 
 ## Modules and seams
 
@@ -38,7 +38,7 @@ The issue-work line (#3879), the capacity rail and Held work (#3880), the usage 
 - **`openPrs(runs)`** (pure, shared with #3879): the viewer's completed issue runs with `mr_iid != null` and `mr_state === "opened"`, deduplicated by `(repo_id, mr_iid)`.
 - **`overviewDecisions(ownRuns)`** (pure, `web/src/lib`): ordered decision items from the viewer's own runs only (the `listRuns` rows, never the admin rows): plan reviews (`awaiting_approval` without `is_revising`), questions and follow-ups, parks whose `parkDisposition` is `owner`, and `openPrs`. #3880 adds a second input, the holds aggregate.
 - **`overviewCounts(runs)`** (pure): executing, queued and parked counts that bucket on the **raw** status, as today's `activeRunBuckets` does (`Dashboard.tsx:42`), with an account cooldown counted as waiting; feeding it effective statuses would drop runs. For an admin the row set is the viewer's own runs plus the admin rows whose `owner_email` differs from the viewer's, merged by run id.
-- **`AppBanners`**: the stack now inline in `AppShell` (`web/src/components/AppShell.tsx:1403` to `:1418`) extracted unchanged into one component. The shell renders it on every route except `/overview/next`; the new page renders it under its header. Invariant: exactly one stack per page, same order, same self-gating.
+- **`AppBanners`**: the stack now inline in `AppShell` (`web/src/components/AppShell.tsx:1403` to `:1418`) extracted unchanged into one component. The shell keeps one instance at a fixed position on every route, `/overview/next` included, and the preview portals its header into a slot above it (`PageHeaderSlot`), so the stack appears under the header there without remounting. Invariant: exactly one stack per page, same order, same self-gating.
 - **Runs widget**: extract today's Overview Recent-runs row (`Dashboard.tsx`) into one shared row component with an optional owner field (masked with `maskEmail` in demo mode) and use it on both pages. Not `RunRow` from the Runs page (`web/src/pages/RunsList.tsx:285`): it adds duration, tokens, cost and Expedite, and its "now" line lacks the Overview's held-status check, so a parked run would show a stale, pulsing activity line. The owner split copies `RunsList.tsx:664`. Yours lists the viewer's active runs only (today's Recent runs also shows finished ones); its empty state reads "No active runs. Start one from a board card."
 - Untrusted text (issue titles, question text, agent activity) goes through `stripUnsafeChars`; demo mode masks names, emails and repo paths as today.
 
@@ -46,7 +46,7 @@ The issue-work line (#3879), the capacity rail and Held work (#3880), the usage 
 
 - Unit tests for `overviewDecisions` and `overviewCounts`, one per brief rule (revising, stalled, weekly-reserve pause, owner-action park, PR sourcing, own-only for admins). Follow the style of `web/src/lib/runBadge.test.ts`.
 - Page tests (Vitest + Testing Library) in the style of `web/src/pages/Dashboard.test.tsx`: admin vs non-admin (assert `adminListRuns` is never called for a non-admin, and never by `Dashboard`), an admin-fetch failure that keeps the personal sections and shows the unavailable note, the self-hiding card, the calm sentence.
-- An `AppShell` test that the banner stack is absent from the shell on `/overview/next` and present on another route, and a page test that it renders under the header.
+- An `AppShell` test that the shell renders the banner stack once on every route, under the portalled header on `/overview/next` and above the content elsewhere, including the locked-vault banner, and that banner state survives navigation.
 - A mock-mode scenario seeded like the design mock (decisions, own and other users' runs, banners) so screenshots compare like for like: `web/src/mocks/mockScenario.ts` only reads the `?mock=` name, so the seeding goes in `web/src/mocks/mockApi/` and `web/src/mocks/data/`; add it to the known-scenario list in `docs/dev-conventions.md` and run `task docs:sync`.
 - A test that the owner email is masked in demo mode, asserting on the rendered attribute where it reaches `title=` (`.claude/rules/web.md`, untrusted values in attributes).
 - A browser test at 400 px width (`*.browser.test.tsx`) for layout and no horizontal scroll.
@@ -77,7 +77,29 @@ The Runs widget replaces Recent runs on the preview: Yours first, Other users (a
 
 Acceptance: admin and non-admin tests; mock parity for the widget.
 
+## Delivered
+
+All three milestones landed on one branch, each reviewed (reviewer + tester as gate owner; auditor on M2; web-ux for parity) with in-run `task check:web`, the focused Vitest files, `npm run build`, `task scan:secrets` and `task sast:semgrep` green. Full `test:web`, `test:web-browser`, `gate:repo` and the `build-web-mock` CI job are left to exact-head PR CI.
+
+- **M1** (`e459be7a`): `useOverviewData` (Dashboard sends exactly its old requests; `adminListRuns` only for admins on the preview), `AppBanners` with a shell header slot, `/overview/next` with greeting, status sentence and admin health chip, carried-over sections with Dashboard's inputs, links both ways, the `overview-next` mock scenario. Existing `Dashboard` and `AppShell` tests unchanged and green; new tests show the banner snooze and dismissal surviving navigation (red against a remounting design).
+- **M2** (`d717bf36`): `parkDisposition` (fail-closed), `openPrs`, `overviewDecisions`, the Needs your decision card and the sentence's decision clause. Tests per rule, a server pin over `ListMaintenanceHeldRuns` including its `recovery_retry_not_before IS NULL` predicate, and Review PR href tests (red against an unguarded href).
+- **M3** (`af31d480`, review fixes `1f59dc10`, `3b8799ae`): the Runs widget (Yours, Other users (admin) with masked owner, the unavailable note), "waits on owner" on other users' rows, the `overview-calm` mock scenario, a 400 px browser test, and admin-poll robustness (one request at a time; a request hung past a 30 s deadline is abandoned, not aborted, and only the latest request's response is applied; reset on revoke).
+- **Mock parity**: side-by-side screenshots, app left and mock right, desktop and 400 px, Ember and Dawn, plus the calm state: [desktop Ember](../mockups/3878/side-by-side-desktop-ember.png), [desktop Dawn](../mockups/3878/side-by-side-desktop-dawn.png), [400 px Ember](../mockups/3878/side-by-side-mobile-ember.png), [400 px Dawn](../mockups/3878/side-by-side-mobile-dawn.png), calm state at [desktop Ember](../mockups/3878/side-by-side-calm-desktop-ember.png), [desktop Dawn](../mockups/3878/side-by-side-calm-desktop-dawn.png), [400 px Ember](../mockups/3878/side-by-side-calm-mobile-ember.png) and [400 px Dawn](../mockups/3878/side-by-side-calm-mobile-dawn.png), [other users' runs](../mockups/3878/detail-next-desktop-ember-others.png).
+
+### Mock deviations
+
+- Needs your decision is a one-column list without kind icons or detail lines (summary rows carry no plan or question text), with one Review PR row per PR (this PRD's text) rather than the mock's grouped "Review PRs" row, and no row cap; ages read "waiting 14m" / "waiting 3d".
+- Runs rows keep today's anatomy (this PRD's text), so they carry no action buttons or harness label; group headings are sentence case. At 400 px that anatomy keeps its badges on the title line, so long progress text can squeeze a title (the mock wraps badges under the row); the row is today's Dashboard row unchanged.
+- The header greets with the full display name, the sentence counts are not bold, and it carries a "Back to the current Overview" link; the Search button is #3875.
+- `CustodyBoardAlert` and `HealthPlatformLine` sit right under Needs your decision; worker load and usage at the bottom.
+
 ## Decision Log
+
+- **Banners under the header via a shell header slot, not by moving the stack** (2026-11-05): the shell keeps one `AppBanners` at a fixed position on every route and the preview portals its header into a slot above it, so a banner never remounts and its local state (danger snooze, attention dismissals) survives navigation (`specs/human.md` health attention entry). Rejected: rendering the stack inside the page and omitting it from the shell there, which reset that state on every visit. This supersedes the wording that the shell leaves the stack out on `/overview/next` in Out of scope, Modules and seams (`AppBanners`) and Testing decisions (the AppShell test): the stack stays in the shell on every page, and on this page the header sits above it.
+- **`parkDisposition` fails closed** (owner review, 2026-11-05): a plain `recovery_wait` or `provider_outage` is automatic only with a parseable `recovery_retry_not_before`; a null, absent or invalid stamp, and every `*_unknown`, is an owner action, although the server's held-runs readout tags those `progressing`. The divergence is listed in the server pin test.
+- **Status sentence counts**: decisions exclude PR items; pull requests count deduplicated open PRs, so an open PR is never counted twice.
+- **Review PR uses the Runs page's HTTPS guard** (`preferForgeUrl` with the reconstructed URL), falling back to the run page.
+- **Other users' waiting runs read "waits on owner"** through an optional `RunProgressCell` subject; every other caller keeps "waits on you".
 
 - **Preview route, not a per-user setting** (brief option B): no migration, nothing persisted, reversible; #3877 promotes or drops it. Rejected: a layout preference now (option C), which doubles maintenance before the trial says it is wanted.
 - **Prefactor the data loading first**: two Overviews reading one hook cannot drift in what they fetch or how they poll. Rejected: copying `Dashboard`'s effects into the new page.

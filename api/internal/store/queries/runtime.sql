@@ -1196,7 +1196,9 @@ WITH checker_template_pins AS MATERIALIZED (
       -- is below @custody_hold_limit (and at least one). Without the bound a claimed run that never
       -- reports running is swept back to queued by SweepClaimedNeverStarted (no requeue_count
       -- bump, no hold release), reclaims under the exemption, opens another generation hold,
-      -- and loops forever; the owner cap used to stop that loop. Once a single run holds
+      -- and loops forever; the owner cap used to stop that loop. Issue #3859 charges a
+      -- WITNESSED departure of such a continuation (SweepClaimedNeverStartedCohort), so this
+      -- bound remains the backstop for unwitnessed ones (e.g. older agents). Once a single run holds
       -- @custody_hold_limit open holds of its own, it faces the owner cap like new work. The
       -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
       -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
@@ -3786,6 +3788,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
   AND runs.recovery_retry_not_before <= @now
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -3839,6 +3842,7 @@ WHERE runs.status = 'recovery_wait' AND runs.recovery_wait_cause IS DISTINCT FRO
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
   AND runs.recovery_retry_not_before <= @now
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -3896,6 +3900,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted'
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -3955,6 +3960,7 @@ WHERE runs.id = @id AND runs.user_id = @user_id AND runs.status = 'recovery_wait
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_requeue_exhausted'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'worker_memory_pressure'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed'
+  AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed'
   AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted'
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -5749,6 +5755,33 @@ WITH candidates AS MATERIALIZED (
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  -- Issue #3859: a charge-eligible continuation is the charge pass's, never an uncharged reset;
+  -- and a continuation still inside the bounded witness window with presence under the worker's
+  -- current registration is DEFERRED. COALESCE makes a NULL witness never exclude (a NULL
+  -- departure stamp would otherwise turn the exclusion NULL and strand the run). A NULL
+  -- @witness_cutoff disables the deferral. A pending server-stamped stop (stop_kind set) is in
+  -- neither exclusion: the charge and unwitnessed-park arms skip it, so it keeps this uncharged
+  -- reset and the reclaimed flight observes the stop.
+  AND NOT COALESCE((runs.kind <> 'cross_check'
+      AND COALESCE(runs.stop_kind, '') = ''
+      AND runs.claim_released_at IS NULL
+      AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+      AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+      AND runs.snapshot_departed_generation = runs.claim_generation
+      AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.snapshot_register_nonce IS NOT NULL AND runs.snapshot_departed_nonce = w.snapshot_register_nonce AND runs.snapshot_departed_epoch <= w.snapshot_epoch)
+      AND NOT EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation)), false)
+  AND NOT COALESCE((runs.kind <> 'cross_check'
+      AND COALESCE(runs.stop_kind, '') = ''
+      AND runs.claim_released_at IS NULL
+      AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+      AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+      AND runs.snapshot_departed_generation IS DISTINCT FROM runs.claim_generation
+      AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.status = 'online'
+                  AND ((runs.registration_evidence_generation = runs.claim_generation AND runs.registration_evidence_nonce = w.snapshot_register_nonce AND runs.registration_evidence_epoch >= w.snapshot_epoch)
+                       OR EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation AND NOT a.terminal_pending)))
+      AND runs.claimed_at >= @witness_cutoff::timestamptz), false)
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
     FROM candidates
@@ -5827,6 +5860,27 @@ WHERE runs.status = 'claimed' AND runs.claimed_at < @cutoff
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
+  -- Issue #3859: the same two exclusions, rechecked against the locked row.
+  AND NOT COALESCE((runs.kind <> 'cross_check'
+      AND COALESCE(runs.stop_kind, '') = ''
+      AND runs.claim_released_at IS NULL
+      AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+      AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+      AND runs.snapshot_departed_generation = runs.claim_generation
+      AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.snapshot_register_nonce IS NOT NULL AND runs.snapshot_departed_nonce = w.snapshot_register_nonce AND runs.snapshot_departed_epoch <= w.snapshot_epoch)
+      AND NOT EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation)), false)
+  AND NOT COALESCE((runs.kind <> 'cross_check'
+      AND COALESCE(runs.stop_kind, '') = ''
+      AND runs.claim_released_at IS NULL
+      AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
+      AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.run_id = runs.id AND h.user_id = runs.user_id AND h.state = 'open' AND h.generation < runs.claim_generation)
+      AND runs.snapshot_departed_generation IS DISTINCT FROM runs.claim_generation
+      AND EXISTS (SELECT 1 FROM workers w WHERE w.id = runs.worker_id AND w.status = 'online'
+                  AND ((runs.registration_evidence_generation = runs.claim_generation AND runs.registration_evidence_nonce = w.snapshot_register_nonce AND runs.registration_evidence_epoch >= w.snapshot_epoch)
+                       OR EXISTS (SELECT 1 FROM worker_active_runs a WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.claim_generation = runs.claim_generation AND NOT a.terminal_pending)))
+      AND runs.claimed_at >= @witness_cutoff::timestamptz), false)
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
       SELECT 1 FROM locked_checks cc
@@ -12391,6 +12445,23 @@ WHERE lead.id = @lead_run_id AND lead.worker_id = @worker_id
   AND lead.claim_released_at IS NULL
   AND cc.stage = 'plan' AND cc.round = @round;
 
+-- name: LockPlanCrossCheckLeadWorkerForVerdict :one
+-- Issue #3859: take the lead's worker row (FOR KEY SHARE, what the foreign-key re-check would take
+-- later) BEFORE the lead and check locks, so a verdict follows the lock order the sweeps and the
+-- snapshot apply use: workers, runs, cross_checks. The verdict transaction updates the lead row
+-- twice (BankPlanCrossCheckWait, then UpdateRunLastSeq); the second update re-checks runs.worker_id
+-- against workers because the old tuple was written by the same transaction, which would
+-- otherwise queue it behind a sweep that holds the worker FOR UPDATE while that sweep waits for
+-- the lead lock this transaction already holds. The worker id is stable within a claim
+-- generation; the locking statement below still fences the generation.
+SELECT w.id FROM workers w
+WHERE w.id = (SELECT lead.worker_id FROM runs lead
+              JOIN cross_checks cc ON cc.lead_run_id = lead.id
+              WHERE cc.checker_run_id = @child_id AND cc.stage = 'plan'
+                AND lead.claim_generation = cc.lead_claim_generation
+              LIMIT 1)
+FOR KEY SHARE OF w;
+
 -- name: LockPlanCrossCheckLeadForVerdict :one
 SELECT lead.* FROM runs lead
 JOIN cross_checks cc ON cc.lead_run_id = lead.id
@@ -12530,7 +12601,7 @@ WHERE lead.id = @lead_run_id AND cc.stage = 'plan'
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id
-  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
@@ -12579,7 +12650,9 @@ UPDATE runs SET
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
                ELSE 0 END,
     -- Retained recovery preserves affinity even though its execution claim is released.
-    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted' AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed' THEN NULL ELSE runs.worker_id END,
+    -- retained_continuation_unwitnessed keeps it too: the retained source it parks over lives on
+    -- that worker's disk, so the resumed run must requeue back to the same worker.
+    worker_id = CASE WHEN runs.claim_released_at IS NOT NULL AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_exhausted' AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_recovery_adoption_failed' AND runs.recovery_wait_cause IS DISTINCT FROM 'retained_continuation_unwitnessed' THEN NULL ELSE runs.worker_id END,
     hold_reason = NULL,
     hold_captured_head = NULL,
     worker_recovery_episode = runs.worker_recovery_episode + 1,
@@ -12590,7 +12663,7 @@ UPDATE runs SET
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at            = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
-  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
+  AND runs.status = 'recovery_wait' AND runs.recovery_wait_cause IN ('worker_requeue_exhausted', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
   -- Honor the wall sweep's chat/judge/interactive exemptions; timed runs still need remaining budget.
   -- Extending does not itself release this hold; checker parent/deadline guards below still apply.
   AND (runs.kind IN ('chat', 'judge') OR runs.interactive OR runs.started_at IS NULL

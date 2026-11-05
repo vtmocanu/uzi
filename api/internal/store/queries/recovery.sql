@@ -157,7 +157,7 @@ WHERE target.id = @id AND target.state = 'open' AND NOT target.inventory_guarded
   AND NOT EXISTS (
       SELECT 1 FROM locked_run r
       WHERE r.status = 'recovery_wait'
-        AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')
+        AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')
   );
 
 -- name: DiscardCaptureForOwner :one
@@ -280,7 +280,7 @@ WHERE h.state = 'open' AND NOT h.inventory_guarded
   AND NOT EXISTS (SELECT 1 FROM runs r
                     WHERE r.id = h.run_id
                       AND r.status = 'recovery_wait'
-                      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed'))
+                      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed'))
   AND (
       EXISTS (SELECT 1 FROM runs r
                 WHERE r.id = h.run_id
@@ -305,6 +305,22 @@ ORDER BY h.created_at ASC;
 -- through to the 404 (ErrWorkerNotFound) path.
 SELECT count(*) FROM recovery_custody_holds
 WHERE live_worker_id = @worker_id::uuid AND user_id = @user_id AND state = 'open';
+
+-- name: ListOpenCustodyHoldsForWorker :many
+-- #3921: names the holds CountOpenCustodyHoldsForWorker counts, for the DeleteWorker 409
+-- body. The predicate is byte-identical to the count's (live holder, owner-scoped, open),
+-- so the listing and the total cannot disagree about which holds block the delete. Capped at
+-- 10, oldest first (the #3390 ListWorkerNonTerminalRuns precedent); the caller's total comes
+-- from the count. recovery_custody_holds.run_id has no FK to runs, so the join is LEFT and
+-- owner-scoped: a missing run yields empty kind/title instead of dropping the hold.
+SELECT h.id, h.run_id, h.generation,
+       COALESCE(r.kind, '')::text AS run_kind,
+       COALESCE(r.title, r.issue_title, '')::text AS run_title
+FROM recovery_custody_holds h
+LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+WHERE h.live_worker_id = @worker_id::uuid AND h.user_id = @user_id AND h.state = 'open'
+ORDER BY h.created_at, h.id
+LIMIT 10;
 
 -- ════════════════════════════════════════════════════════════════════════════════════════
 -- PRD #1349 M1: the ADDITIVE exact-generation and owner-disposition store contract. These
@@ -377,7 +393,7 @@ WHERE run_id = @run_id
   AND live_worker_id = @worker_id::uuid
   AND state = 'open' AND NOT inventory_guarded
   AND NOT EXISTS (SELECT 1 FROM locked_run r WHERE r.status = 'recovery_wait'
-      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed'));
+      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed'));
 
 -- name: GetCustodyHoldForSettle :one
 -- Issue #1582 M1: the exact hold the predecessor-settle endpoint names, scoped to its run so a
@@ -994,7 +1010,7 @@ WHERE h.id = @id AND h.run_id = @run_id AND h.user_id = @user_id
       (r.status IN ('completed', 'failed', 'cancelled') OR r.claim_released_at IS NOT NULL)))
     AND NOT (r.status = 'recovery_wait' AND r.recovery_wait_cause IS NOT NULL
       AND r.recovery_wait_cause IN ('worker_requeue_exhausted',
-      'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed')))
+      'worker_memory_pressure', 'retained_recovery_exhausted', 'retained_recovery_adoption_failed', 'retained_continuation_unwitnessed')))
   AND EXISTS (SELECT 1 FROM recovery_captures c WHERE c.id = @final_capture_id::uuid
     AND c.hold_id = h.id AND c.run_id = h.run_id AND c.user_id = h.user_id
     AND c.original_worker_id = h.original_worker_id AND c.source_sha = @final_source_sha::text
