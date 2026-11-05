@@ -1014,7 +1014,9 @@ export const runsApi = {
     if (run.status !== "paused" && run.status !== "pool_wait" && !memoryHeld && !forgeHeld && !diskHeld)
       throw new ApiError(409, `run is ${run.status}`);
     const iterationHeld = run.status === "paused" && run.hold_reason === "iteration_budget_exhausted";
-    if (iterationHeld || diskHeld) {
+    const diskWallLimited = diskHeld && run.kind !== "chat" && run.kind !== "judge" &&
+      run.interactive !== true && run.started_at != null;
+    if (iterationHeld || diskWallLimited) {
       const total = run.budget_total_seconds ??
         (run.budget_wall_seconds ?? 6 * 3600) + (run.budget_extension_seconds ?? 0) + (run.budget_finalize_seconds ?? 0);
       if (run.budget_used_seconds != null && total - run.budget_used_seconds <= 0)

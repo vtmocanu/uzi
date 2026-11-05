@@ -34,6 +34,7 @@ beforeEach(() => {
     checkpoint_contains_latest: false,
     checkpoint_tip_at: "2026-11-05T10:00:00Z",
     preserved_patch: "diff --git a/example b/example",
+    started_at: "2026-11-05T10:00:00Z",
     budget_wall_seconds: 3600,
     budget_total_seconds: 5400,
     budget_extension_seconds: 1200,
@@ -198,6 +199,24 @@ it.each([
     status: 409, message: expect.stringContaining("out of time; extend it to resume"),
   });
   expect(getRun(id)).toEqual(before);
+});
+
+it.each([
+  ["chat", { kind: "chat" as const }],
+  ["judge", { kind: "judge" as const }],
+  ["interactive task", { kind: "task" as const, interactive: true }],
+  ["not started", { started_at: null }],
+])("preserves the API wall exemption for %s disk holds", async (_name, exemption) => {
+  patchRun(id, {
+    budget_total_seconds: null, budget_wall_seconds: 3600,
+    budget_extension_seconds: 0, budget_finalize_seconds: 0, budget_used_seconds: 3600,
+    ...exemption,
+  });
+  const { run } = await settleMockApi(mockApi.resumeRun(id));
+  expect(run).toMatchObject({
+    status: "queued", disk_park_count: 5, budget_used_seconds: 3600,
+    budget_extension_seconds: 0, budget_finalize_seconds: 0, ...exemption,
+  });
 });
 
 it("uses the existing extension and finalize budget when the total is unavailable", async () => {
