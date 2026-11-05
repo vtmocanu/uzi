@@ -3756,6 +3756,19 @@ export class RunRunner {
    *  abort. Undefined outside disk mode. */
   private diskParkCaptureWait(flight: RunFlight, boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait | undefined {
     if (flight.steering.getPauseMode() !== "disk") return undefined;
+    return this.terminalLifecycleCaptureWait(flight, boundaryMs);
+  }
+
+  /** The wait for A of a non-held capture taken for a credential switch (issue #3953). The switch aborts
+   *  both the run's cancel signal and its lifecycle with its own "run released for a credential switch"
+   *  signal, so authorityWait would reject the fetch-back on the switch's own abort and the capture would
+   *  never verify. terminalLifecycleSignal is not aborted by a switch; a real cancel, a claim fence, a
+   *  receipt failure and shutdown still abort it. Same acquisition-only bound as diskParkCaptureWait. */
+  private credentialSwitchCaptureWait(flight: RunFlight, boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait {
+    return this.terminalLifecycleCaptureWait(flight, boundaryMs);
+  }
+
+  private terminalLifecycleCaptureWait(flight: RunFlight, boundaryMs: number): AuthorityWait {
     const budget = MaintenanceBudget.current()?.remainingMs() ?? Infinity;
     return {
       signal: AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]),
@@ -22886,8 +22899,9 @@ export class RunRunner {
     }
     const captureDeadline = Math.min(opts.episode?.deadlineAt ?? Infinity,
       opts.heldCapture?.deadlineAt ?? Infinity, opts.heldAuthenticated?.deadlineAt ?? Infinity);
-    const diskWait = (opts.heldCapture ?? opts.heldAuthenticated) ? undefined : this.diskParkCaptureWait(flight);
-    const bodySignal = opts.signal ?? diskWait?.signal;
+    const captureWait = (opts.heldCapture ?? opts.heldAuthenticated) ? undefined
+      : this.diskParkCaptureWait(flight) ?? (site === "credential_switch" ? this.credentialSwitchCaptureWait(flight) : undefined);
+    const bodySignal = opts.signal ?? captureWait?.signal;
     await this.bootstrapRemediationRestrictions(flight, undefined, undefined, bodySignal, captureDeadline);
     // issue #1783 (auditor M2): prove the clone quiescent BEFORE the capture (its wip marker, the
     // fetch-back and the credentialed overlay + publish). On survivors/unverified NOTHING runs:
@@ -22952,7 +22966,7 @@ export class RunRunner {
       await opts.beforeMutation?.();
       const held = opts.heldCapture ?? opts.heldAuthenticated;
       await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
-        held ? { signal: held.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, held.deadlineAt - Date.now())) } : diskWait);
+        held ? { signal: held.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, held.deadlineAt - Date.now())) } : captureWait);
       await opts.beforeMutation?.();
     } catch (e) {
       if (opts.beforeMutation) throw e;
