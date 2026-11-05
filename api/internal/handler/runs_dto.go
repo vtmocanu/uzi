@@ -939,8 +939,17 @@ func harnessDecisionForViewer(r store.Run, viewer store.User) *apitypes.HarnessD
 		}
 		return &v.Float64
 	}
+	nullableTime := func(v pgtype.Timestamptz) *time.Time {
+		if !v.Valid {
+			return nil
+		}
+		t := v.Time.UTC()
+		return &t
+	}
 	return &apitypes.HarnessDecisionDTO{
-		Preferred: r.HarnessPreferred.String, Chosen: r.Harness, Reason: r.HarnessDecisionReason.String,
+		PreferredWeeklyResetAt: nullableTime(r.HarnessPreferredWeeklyResetAt),
+		OtherWeeklyResetAt:     nullableTime(r.HarnessOtherWeeklyResetAt),
+		Preferred:              r.HarnessPreferred.String, Chosen: r.Harness, Reason: r.HarnessDecisionReason.String,
 		PreferredScore: nullableFloat(r.HarnessPreferredScore), OtherScore: nullableFloat(r.HarnessOtherScore),
 		PreferredMeasured: nullableFloat(r.HarnessPreferredMeasured), OtherMeasured: nullableFloat(r.HarnessOtherMeasured),
 		PreferredHeld: r.HarnessPreferredHeld.Bool, OtherHeld: r.HarnessOtherHeld.Bool,

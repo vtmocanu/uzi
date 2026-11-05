@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -26,7 +27,9 @@ func TestHarnessDecisionSharedBoardAbsent(t *testing.T) {
 
 func TestHarnessDecisionGetRun(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
-	for _, state := range []string{"legacy", "unknown", "zero"} {
+	autoPreferredReset := time.Date(2026, 11, 9, 4, 0, 0, 0, time.UTC)
+	autoOtherReset := time.Date(2026, 11, 7, 15, 30, 0, 0, time.UTC)
+	for _, state := range []string{"legacy", "unknown", "zero", "auto"} {
 		t.Run(state, func(t *testing.T) {
 			run := store.Run{ID: uuid.New(), UserID: owner.ID, Status: "queued", Harness: "codex"}
 			if state != "legacy" {
@@ -41,6 +44,11 @@ func TestHarnessDecisionGetRun(t *testing.T) {
 				run.HarnessOtherScore = pgtype.Float8{Valid: true}
 				run.HarnessPreferredMeasured = pgtype.Float8{Valid: true}
 				run.HarnessOtherMeasured = pgtype.Float8{Valid: true}
+			}
+			if state == "auto" {
+				run.HarnessDecisionReason = txt("auto_soonest_reset")
+				run.HarnessPreferredWeeklyResetAt = pgtype.Timestamptz{Time: autoPreferredReset, Valid: true}
+				run.HarnessOtherWeeklyResetAt = pgtype.Timestamptz{Time: autoOtherReset, Valid: true}
 			}
 			h := newRunsHandler(t, &runsStore{ownerID: owner.ID, run: run})
 			for _, viewer := range []store.User{owner, {ID: uuid.New(), IsAdmin: true}} {
@@ -64,6 +72,14 @@ func TestHarnessDecisionGetRun(t *testing.T) {
 				}
 				if d == nil || d.Preferred != "claude" || d.Chosen != "codex" || d.Reason != run.HarnessDecisionReason.String || d.PreferredHeld || d.OtherHeld {
 					t.Fatalf("decision=%+v", d)
+				}
+				if state == "auto" {
+					if d.PreferredWeeklyResetAt == nil || !d.PreferredWeeklyResetAt.Equal(autoPreferredReset) ||
+						d.OtherWeeklyResetAt == nil || !d.OtherWeeklyResetAt.Equal(autoOtherReset) {
+						t.Fatalf("weekly resets not projected: %+v", d)
+					}
+				} else if d.PreferredWeeklyResetAt != nil || d.OtherWeeklyResetAt != nil {
+					t.Fatalf("unknown weekly reset became a value: %+v", d)
 				}
 				values := []*float64{d.PreferredScore, d.OtherScore, d.PreferredMeasured, d.OtherMeasured}
 				for _, value := range values {

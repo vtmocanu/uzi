@@ -215,6 +215,9 @@ type HarnessDecisionDTO struct {
 	OtherMeasured     *float64 `json:"other_measured"`
 	PreferredHeld     bool     `json:"preferred_held"`
 	OtherHeld         bool     `json:"other_held"`
+	// Weekly resets of the compared accounts; null when unknown or not recorded.
+	PreferredWeeklyResetAt *time.Time `json:"preferred_weekly_reset_at"`
+	OtherWeeklyResetAt     *time.Time `json:"other_weekly_reset_at"`
 }
 
 // CreatedIssueDTO is a confirmed issue created by this scheduled prompt run.

@@ -27,8 +27,8 @@ func TestSettingsGetTableAndJSON(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 7 || lines[3] != "Now summary: on (default)" || lines[4] != "Weekly usage reserve: off" || lines[5] != "Codex account mode: default" || lines[6] != "Harness overflow: off (new runs, at creation)" {
-		t.Fatalf("expected header, two cells, the Now summary, reserve, Codex mode and harness overflow lines: %s", out)
+	if len(lines) != 8 || lines[3] != "Now summary: on (default)" || lines[4] != "Weekly usage reserve: off" || lines[5] != "Codex account mode: default" || lines[6] != "Default harness: automatic (chosen per run by weekly limits when both harnesses are usable)" || lines[7] != "Harness overflow: off (inactive: default harness is automatic)" {
+		t.Fatalf("expected header, two cells, the Now summary, reserve, Codex mode, default harness and harness overflow lines: %s", out)
 	}
 	want := []string{
 		"plan claude active Default SDK/account default SDK/account default worker default Pin · high high pin",
@@ -74,7 +74,7 @@ func TestSettingsGetFourIndependentCells(t *testing.T) {
 		"code claude inactive Default SDK/account default SDK/account default worker default Pin · low low pin",
 		"code codex active Pin · code-only code-worker code-only pin Default medium worker default",
 	}
-	if len(lines) != 9 || lines[5] != "Now summary: on (default)" {
+	if len(lines) != 10 || lines[5] != "Now summary: on (default)" {
 		t.Fatalf("four cells: %s", out)
 	}
 	for i, row := range want {
@@ -99,7 +99,7 @@ func TestSettingsGetFourIndependentCells(t *testing.T) {
 	}
 	fc.Settings.CrossCheckPins = append(fc.Settings.CrossCheckPins, settings.CrossCheckPins[2:]...)
 	out, _, code = runCLI(t, fakeEnv(fc), "settings", "get")
-	if code != 0 || strings.Count(out, "\n") != 7 {
+	if code != 0 || strings.Count(out, "\n") != 8 {
 		t.Fatalf("input bound: %s", out)
 	}
 }
@@ -117,7 +117,7 @@ func TestSettingsGetClaudePinAndDefaultModel(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 7 {
+	if len(lines) != 8 {
 		t.Fatalf("expected two cells: %s", out)
 	}
 	for i, want := range []string{
@@ -145,7 +145,7 @@ func TestSettingsGetHostileTextAndBounds(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
-	if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Count(out, "\n") != 6 ||
+	if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Count(out, "\n") != 7 ||
 		len(out) > 3000 || !strings.Contains(out, "unknown") || strings.Contains(out, strings.Repeat("x", 201)) {
 		t.Fatalf("unsafe or unbounded output: %q", out)
 	}

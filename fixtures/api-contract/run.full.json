@@ -321,7 +321,9 @@
     "preferred_measured": 1.5,
     "other_measured": 1.5,
     "preferred_held": true,
-    "other_held": true
+    "other_held": true,
+    "preferred_weekly_reset_at": "2020-01-02T03:04:05Z",
+    "other_weekly_reset_at": "2020-01-02T03:04:05Z"
   },
   "has_prd_link": true,
   "title": "x",

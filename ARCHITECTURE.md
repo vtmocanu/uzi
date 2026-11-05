@@ -537,6 +537,13 @@ readings also pick the Codex account at run creation only, never afterwards; see
 the [ADR-1106 amendment](adr/1106-codex-harness.md#amendment-codex-account-auto-selection-at-run-creation-3719-2026-10-31);
 the default order is the soonest weekly reset, see
 [ADR-3844](adr/3844-reset-first-pool-order.md).
+The same objective picks the harness at creation for a user whose default
+harness is unset (**Default · automatic**) when both harnesses are usable: the
+side whose weekly allowance resets soonest wins, decided once under the shared
+secret-mutation lock and frozen with the run, with Claude as the fallback when
+either side's usage is unknown. The opt-in harness overflow then applies only to
+an explicit default; see
+[ADR-3845](adr/3845-limit-aware-automatic-harness.md).
 
 A separate survivor path can retry an original non-rejection refresh error once
 when its durable receipt authorizes reuse. Admission consumes the retry under

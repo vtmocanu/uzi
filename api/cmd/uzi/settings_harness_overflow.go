@@ -10,10 +10,12 @@ func newSettingsHarnessOverflowCmd(env Env, gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "harness-overflow on|off",
 		Short: "Set cross-harness overflow for new runs",
-		Long: "Overflow to the other harness when my default is near its limits. Applies at creation\n" +
-			"to implicit issue runs started manually, by autopilot or by a schedule, when both\n" +
-			"harnesses are usable. Explicit harnesses, model pins, Anthropic credential overrides\n" +
-			"and either cross-check setting prevent overflow. Existing runs never switch.",
+		Long: "Overflow to the other harness when my default is near its limits. Applies only with an\n" +
+			"explicit Claude or Codex default harness and is inactive when the default is automatic.\n" +
+			"Applies at creation to implicit issue runs started manually, by autopilot or by a\n" +
+			"schedule, when both harnesses are usable. Explicit harnesses, model pins, Anthropic\n" +
+			"credential overrides and either cross-check setting prevent overflow. Existing runs\n" +
+			"never switch.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if args[0] != "on" && args[0] != "off" {
@@ -31,15 +33,39 @@ func newSettingsHarnessOverflowCmd(env Env, gf *globalFlags) *cobra.Command {
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(map[string]bool{"harness_overflow_enabled": stored})
 			}
-			p.Println(harnessOverflowLine(stored))
+			// Overflow only acts with an explicit default harness, so read the
+			// default back to say whether the stored value is active. A failed read
+			// still reports the stored value and surfaces the error.
+			settings, readErr := c.GetMySettings(cmd.Context())
+			if readErr != nil {
+				p.Println(harnessOverflowStoredLine(stored))
+				return readErr
+			}
+			p.Println(harnessOverflowLine(stored, settings.DefaultHarness))
 			return nil
 		},
 	}
 }
 
-func harnessOverflowLine(enabled bool) string {
+// harnessOverflowStoredLine reports a saved value whose effect could not be read back: the
+// write succeeded, but whether overflow is active depends on the unread default harness.
+func harnessOverflowStoredLine(enabled bool) string {
+	state := "off"
 	if enabled {
-		return "Harness overflow: on (new runs, at creation)"
+		state = "on"
 	}
-	return "Harness overflow: off (new runs, at creation)"
+	return "Harness overflow: " + state + " (saved; default harness could not be read)"
+}
+
+// harnessOverflowLine renders the overflow switch; a nil default harness means
+// automatic, where overflow has no effect.
+func harnessOverflowLine(enabled bool, defaultHarness *string) string {
+	state := "off"
+	if enabled {
+		state = "on"
+	}
+	if defaultHarness == nil {
+		return "Harness overflow: " + state + " (inactive: default harness is automatic)"
+	}
+	return "Harness overflow: " + state + " (new runs, at creation)"
 }

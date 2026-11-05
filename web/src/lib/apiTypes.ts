@@ -3246,6 +3246,9 @@ export interface HarnessDecision {
   other_measured: number | null;
   preferred_held: boolean;
   other_held: boolean;
+  /** Weekly reset of the preferred (auto_*: Claude) / other (auto_*: Codex) account; null when unknown or pre-change rows. */
+  preferred_weekly_reset_at: string | null;
+  other_weekly_reset_at: string | null;
 }
 
 export interface Run {

@@ -40,21 +40,25 @@ UPDATE runs SET
     harness_preferred_measured = $5::double precision,
     harness_other_measured = $6::double precision,
     harness_preferred_held = $7::boolean,
-    harness_other_held = $8::boolean
-WHERE id = $9 AND user_id = $10 AND harness_decision_reason IS NULL
+    harness_other_held = $8::boolean,
+    harness_preferred_weekly_reset_at = $9::timestamptz,
+    harness_other_weekly_reset_at = $10::timestamptz
+WHERE id = $11 AND user_id = $12 AND harness_decision_reason IS NULL
 `
 
 type SetRunHarnessDecisionParams struct {
-	Preferred         string        `json:"preferred"`
-	Reason            string        `json:"reason"`
-	PreferredScore    pgtype.Float8 `json:"preferred_score"`
-	OtherScore        pgtype.Float8 `json:"other_score"`
-	PreferredMeasured pgtype.Float8 `json:"preferred_measured"`
-	OtherMeasured     pgtype.Float8 `json:"other_measured"`
-	PreferredHeld     bool          `json:"preferred_held"`
-	OtherHeld         bool          `json:"other_held"`
-	ID                uuid.UUID     `json:"id"`
-	UserID            uuid.UUID     `json:"user_id"`
+	Preferred              string             `json:"preferred"`
+	Reason                 string             `json:"reason"`
+	PreferredScore         pgtype.Float8      `json:"preferred_score"`
+	OtherScore             pgtype.Float8      `json:"other_score"`
+	PreferredMeasured      pgtype.Float8      `json:"preferred_measured"`
+	OtherMeasured          pgtype.Float8      `json:"other_measured"`
+	PreferredHeld          bool               `json:"preferred_held"`
+	OtherHeld              bool               `json:"other_held"`
+	PreferredWeeklyResetAt pgtype.Timestamptz `json:"preferred_weekly_reset_at"`
+	OtherWeeklyResetAt     pgtype.Timestamptz `json:"other_weekly_reset_at"`
+	ID                     uuid.UUID          `json:"id"`
+	UserID                 uuid.UUID          `json:"user_id"`
 }
 
 // Creation-only, write-once explanation. Chosen harness is runs.harness.
@@ -68,6 +72,8 @@ func (q *Queries) SetRunHarnessDecision(ctx context.Context, arg SetRunHarnessDe
 		arg.OtherMeasured,
 		arg.PreferredHeld,
 		arg.OtherHeld,
+		arg.PreferredWeeklyResetAt,
+		arg.OtherWeeklyResetAt,
 		arg.ID,
 		arg.UserID,
 	)

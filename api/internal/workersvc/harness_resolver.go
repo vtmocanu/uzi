@@ -110,7 +110,8 @@ var (
 //  2. otherwise a usable user default is used (a set-but-unusable default falls through,
 //     it is not an error);
 //  3. otherwise the sole harness that has a usable credential is used;
-//  4. otherwise (both usable, no usable default) Claude is chosen;
+//  4. otherwise (both usable, no usable default) Claude is chosen (the usage-free answer;
+//     an eligible automatic creation may choose by weekly limits, see harness_automatic.go);
 //  5. otherwise (neither usable) errNoUsableCredential.
 func resolveHarness(in resolveHarnessInput) (Harness, error) {
 	// (1) Explicit selection is authoritative and terminal — used if usable, else a
@@ -137,7 +138,7 @@ func resolveHarness(in resolveHarnessInput) (Harness, error) {
 	case in.avail.codexUsable && !in.avail.claudeUsable:
 		return HarnessCodex, nil // (3) sole Codex
 	case in.avail.claudeUsable && in.avail.codexUsable:
-		return HarnessClaude, nil // (4) both usable, no usable default → Claude
+		return HarnessClaude, nil // (4) both usable, no usable default → Claude (usage-free answer; eligible automatic creation may choose by weekly limits, harness_automatic.go)
 	default:
 		return "", errNoUsableCredential // (5) neither usable
 	}
@@ -183,6 +184,18 @@ type resolvedHarness struct {
 	Codex          *codexCredentialChoice
 	CreationPolicy *store.GetHarnessCreationPolicyRow
 	Decision       *harnessCreationDecision
+	// DefaultUnset is true when users.default_harness is NULL (the "Default · automatic" choice,
+	// #3845). It reads the raw column: userDefaultHarness's nil also maps an unknown value.
+	DefaultUnset bool
+	// BothUsable is true when both harnesses have a usable credential. The pure resolveHarness
+	// never reads either field, so every usage-independent reader is unchanged.
+	BothUsable bool
+}
+
+// automaticHarnessEligible reports whether creation picks the harness by soonest weekly reset
+// (#3845): an unset default, no explicit harness, both harnesses usable and an eligible origin.
+func automaticHarnessEligible(res resolvedHarness, explicit *Harness, origin harnessCreationOrigin, p store.GetHarnessCreationPolicyRow) bool {
+	return res.DefaultUnset && explicit == nil && res.BothUsable && origin.eligible(p)
 }
 
 // harnessResolverStore is the narrow C1-frozen read surface the store-backed resolver
@@ -266,10 +279,11 @@ func (s *Service) resolveRunHarnessQ(ctx context.Context, userID uuid.UUID, expl
 		return resolvedHarness{}, err
 	}
 
-	userDefault, err := s.userDefaultHarness(ctx, userID, q)
+	userDefault, defaultUnset, err := s.userDefaultHarness(ctx, userID, q)
 	if err != nil {
 		return resolvedHarness{}, err
 	}
+	bothUsable := claudeUsable && codexUsable
 
 	h, err := resolveHarness(resolveHarnessInput{
 		explicit:    explicit,
@@ -291,9 +305,9 @@ func (s *Service) resolveRunHarnessQ(ctx context.Context, userID uuid.UUID, expl
 			return resolvedHarness{}, errNoUsableCredential
 		}
 		choice := codexChoice
-		return resolvedHarness{Harness: HarnessCodex, Codex: &choice}, nil
+		return resolvedHarness{Harness: HarnessCodex, Codex: &choice, DefaultUnset: defaultUnset, BothUsable: bothUsable}, nil
 	}
-	return resolvedHarness{Harness: h}, nil
+	return resolvedHarness{Harness: h, DefaultUnset: defaultUnset, BothUsable: bothUsable}, nil
 }
 
 // explicitHarnessRefusal classifies an explicit harness's no-usable-credential refusal (PRD
@@ -403,26 +417,27 @@ func (s *Service) ResolveSettingsHarnessWithDefault(ctx context.Context, userID 
 
 // userDefaultHarness reads users.default_harness and maps it to a *Harness preference:
 // NULL (or any value outside the CHECK vocabulary, which cannot occur) is nil for "no
-// preference".
-func (s *Service) userDefaultHarness(ctx context.Context, userID uuid.UUID, q harnessResolverStore) (*Harness, error) {
+// preference". unset reports a NULL column alone.
+func (s *Service) userDefaultHarness(ctx context.Context, userID uuid.UUID, q harnessResolverStore) (pref *Harness, unset bool, err error) {
 	raw, err := q.GetUserDefaultHarness(ctx, userID)
 	if err != nil {
-		return nil, fmt.Errorf("harness resolve: read default harness: %w", err)
+		return nil, false, fmt.Errorf("harness resolve: read default harness: %w", err)
 	}
 	if !raw.Valid {
-		return nil, nil
+		return nil, true, nil
 	}
 	switch Harness(raw.String) {
 	case HarnessClaude:
 		h := HarnessClaude
-		return &h, nil
+		return &h, false, nil
 	case HarnessCodex:
 		h := HarnessCodex
-		return &h, nil
+		return &h, false, nil
 	default:
 		// The default_harness CHECK admits only claude/codex, so this is unreachable;
-		// treat an unexpected value as "no preference" rather than trusting it.
-		return nil, nil
+		// treat an unexpected value as "no preference" rather than trusting it. It is
+		// not "unset": only a NULL column is the automatic choice (#3845).
+		return nil, false, nil
 	}
 }
 
@@ -605,20 +620,22 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		origin = origins[0]
 	}
 	if s.txBeginner == nil {
-		if q, ok := s.q.(*store.Queries); ok && origin.Kind == "issue" {
-			policy, e := q.GetHarnessCreationPolicy(ctx, userID)
-			if e != nil {
-				return store.Run{}, resolvedHarness{}, e
-			}
-			if policy.HarnessOverflowEnabled && origin.eligible(policy) {
-				return store.Run{}, resolvedHarness{}, errHarnessOverflowRequiresTx
-			}
-		}
 		// No transaction available. Resolve via the ambient queries to learn the harness:
 		// Codex fails closed (it needs the atomic freeze); Claude keeps the cheap path.
 		res, err := s.resolveRunHarness(ctx, userID, explicit)
 		if err != nil {
 			return store.Run{}, resolvedHarness{}, err
+		}
+		// An overflow or automatic decision needs the shared lock and the fence, so it refuses
+		// rather than decide without them.
+		if q, ok := s.q.(*store.Queries); ok && origin.Kind == "issue" {
+			policy, e := q.GetHarnessCreationPolicy(ctx, userID)
+			if e != nil {
+				return store.Run{}, resolvedHarness{}, e
+			}
+			if (policy.HarnessOverflowEnabled && origin.eligible(policy)) || automaticHarnessEligible(res, explicit, origin, policy) {
+				return store.Run{}, resolvedHarness{}, errHarnessOverflowRequiresTx
+			}
 		}
 		if res.Harness == HarnessCodex {
 			return store.Run{}, resolvedHarness{}, errCodexCreateRequiresTx
@@ -653,8 +670,9 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	if err != nil {
 		return store.Run{}, resolvedHarness{}, err
 	}
-	overflowEligible := policy.HarnessOverflowEnabled && origin.eligible(policy)
-	if overflowEligible {
+	// The shared lock also covers an automatic decision (an unset default), whatever the overflow toggle.
+	lockEligible := origin.eligible(policy) && (policy.HarnessOverflowEnabled || res.DefaultUnset)
+	if lockEligible {
 		if s.codexSelectHook != nil {
 			s.codexSelectHook(ctx)
 		}
@@ -670,7 +688,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			return store.Run{}, resolvedHarness{}, err
 		}
 	}
-	res, overflowPick, err := s.evaluateCreationOverflow(ctx, qtx, userID, res, policy, origin)
+	res, decisionPick, err := s.evaluateCreationOverflow(ctx, qtx, userID, explicit, res, policy, origin)
 	if err != nil {
 		return store.Run{}, resolvedHarness{}, err
 	}
@@ -684,7 +702,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	// turned unusable.
 	var pick codexPoolPick
 	pooled := res.Harness == HarnessCodex && res.Codex != nil && res.Codex.Select == codexChoicePool
-	if pooled && overflowPick == nil {
+	if pooled && decisionPick == nil {
 		if s.codexSelectHook != nil {
 			s.codexSelectHook(ctx)
 		}
@@ -703,8 +721,8 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		res.Codex = &choice
 	}
 
-	if overflowPick != nil {
-		pick = *overflowPick
+	if decisionPick != nil {
+		pick = *decisionPick
 	}
 
 	run, err := insert(qtx, res)
@@ -712,36 +730,35 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		return store.Run{}, resolvedHarness{}, err
 	}
 
-	if overflowPick != nil {
+	if decisionPick != nil {
 		d := res.Decision
 		if s.codexSelectBeforeFenceHook != nil {
 			s.codexSelectBeforeFenceHook(ctx, pick.AliasID)
 		}
-		if pick.Reason == codexselect.Reason(codexChoiceDefault) || pick.Reason == codexselect.Reason(codexChoicePoolEmpty) {
-			row, e := qtx.LockCodexPoolAliasForSelection(ctx, store.LockCodexPoolAliasForSelectionParams{ID: pick.AliasID, UserID: userID})
-			if e != nil {
-				return store.Run{}, resolvedHarness{}, e
-			}
-			if row.Kind != store.KindCodexAuth || !row.Enabled || !row.Status.Valid || row.Status.String != codexStatusLinked ||
-				!row.ProviderAccountID.Valid || uuid.UUID(row.ProviderAccountID.Bytes) != pick.AccountID ||
-				((d.Preferred != HarnessCodex || pick.Candidate.Structural) && !codexPoolAccountUsable(row.CoordState, row.ReauthRequired)) {
-				return store.Run{}, resolvedHarness{}, errHarnessOverflowFence
-			}
-		} else {
-			pick, err = s.fenceCodexPoolAlias(ctx, qtx, userID, pick)
-			if err != nil {
+		fenced, fencedOK, ferr := s.fenceCreationPick(ctx, qtx, userID, d, pick)
+		if ferr != nil {
+			return store.Run{}, resolvedHarness{}, ferr
+		}
+		if isAutomaticReason(d.Reason) {
+			// A Codex state change at the fence maps the Codex side to unknown; a changed
+			// harness is refused so the rollback undoes the INSERT.
+			if err := s.recheckAutomaticDecision(d, res, fenced, fencedOK); err != nil {
 				return store.Run{}, resolvedHarness{}, err
 			}
-		}
-		ce := codexOverflowEvidence(pick.Candidate, pick.Reason, d.Preferred == HarnessClaude)
-		if d.Preferred == HarnessCodex {
-			d.PreferredEvidence = ce
 		} else {
-			d.OtherEvidence = ce
+			ce := codexOverflowEvidence(fenced.Candidate, fenced.Reason, d.Preferred == HarnessClaude)
+			if d.Preferred == HarnessCodex {
+				d.PreferredEvidence = ce
+			} else {
+				d.OtherEvidence = ce
+			}
+			d.Reason = overflowReason(true, true, d.PreferredEvidence, d.OtherEvidence)
+			if d.chosen() != res.Harness {
+				return store.Run{}, resolvedHarness{}, errHarnessOverflowFence
+			}
 		}
-		d.Reason = overflowReason(true, true, d.PreferredEvidence, d.OtherEvidence)
-		if d.chosen() != res.Harness {
-			return store.Run{}, resolvedHarness{}, errHarnessOverflowFence
+		if fencedOK {
+			pick = fenced
 		}
 		if res.Harness == HarnessCodex {
 			choice := *res.Codex
@@ -756,7 +773,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		if res.Codex == nil {
 			return store.Run{}, resolvedHarness{}, errNoUsableCredential
 		}
-		if pooled && overflowPick == nil {
+		if pooled && decisionPick == nil {
 			if s.codexSelectBeforeFenceHook != nil {
 				s.codexSelectBeforeFenceHook(ctx, pick.AliasID)
 			}
@@ -785,7 +802,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			return store.Run{}, resolvedHarness{}, ferr
 		}
 		reason := codexselect.Reason(res.Codex.Select)
-		if pooled || overflowPick != nil {
+		if pooled || decisionPick != nil {
 			if cerr := s.checkFrozenCodexAccount(ctx, qtx, userID, run.ID, pick); cerr != nil {
 				return store.Run{}, resolvedHarness{}, cerr
 			}

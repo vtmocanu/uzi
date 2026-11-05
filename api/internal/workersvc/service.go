@@ -8011,11 +8011,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// no second connection is taken while this closure holds the run-branch lock.
 		effOverride := credOverride
 		requestOverride := rawOverride
-		if requestOverride != nil && requestOverride.Mode == CredentialOverrideModeInherit &&
-			resolved.Decision != nil && resolved.Decision.Reason == "overflow" {
+		if requestOverride != nil && requestOverride.Mode == CredentialOverrideModeInherit && clearsInheritOverride(resolved) {
 			// Inherit carries no Anthropic assignment. Normalize it only for
-			// this new creation-time decision; the shared validator retains
-			// its existing Codex refusal for explicit/default/off paths.
+			// a creation-time overflow or an automatic decision that chose Codex;
+			// the shared validator retains its existing Codex refusal for
+			// explicit/default/off paths.
 			requestOverride = nil
 		}
 		if requestOverride != nil {
