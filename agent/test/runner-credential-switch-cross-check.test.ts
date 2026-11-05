@@ -3,7 +3,7 @@
 // reservation. It is serviced only after the reservation is verifiably released (S1 approve, S2
 // automatic revise, S3 applied human gate), and the checker's decision is stashed for the give-up
 // re-run. Driven through the real runner with the real SdkExecutor, as runner-plan-cross-check.test.ts.
-import { beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -34,6 +34,9 @@ beforeEach(() => {
   api.checkedTransport = true;
   api.usageHandler = () => ({ status: 200, body: {} });
 });
+// Prototype wrappers installed by watchSwitchDelivery are undone after every test.
+const restorers: (() => void)[] = [];
+afterEach(() => { while (restorers.length) restorers.pop()!(); });
 
 const PLAN = "# PLAN\n- local proposal";
 const NORMALIZED = "# PLAN\n- server normalized proposal";
@@ -60,7 +63,6 @@ function answer(runId: string, body: Record<string, unknown>, verdict = "approve
 }
 const canonical = (body: Record<string, unknown>) => ({
   candidate: { ...body, plan_md: NORMALIZED, milestones: [], required_capabilities: [], required_tools: [], size_class: "s" } });
-const tick = (ms = 5): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /** Terminal failure with `condition` in its reason, and no approval-bearing running report. */
 function failedWith(runId: string, condition: string) {
@@ -147,15 +149,30 @@ function observe(runId: string, tl: Timeline, opts: { prefix?: string; failAfter
   } };
 }
 
-/** The first inputs poll that carries `credential_switch {generation}` was returned to the worker. */
+/** Watch the switch reach the worker: `delivered` once an inputs poll carries it, `trips` counts the
+ *  steering channel's completed handling of a switch signal, and `latched()` is the hold's own latch. */
 function watchSwitchDelivery(generation = 1) {
   const getInputs = client.getInputs.bind(client);
-  const seen = { delivered: false };
+  const handles: { latched(): boolean }[] = [];
+  const seen = { delivered: false, trips: 0, latched: () => handles.some((h) => h.latched()) };
   client.getInputs = async (runId) => {
     const result = await getInputs(runId);
     if (result.credentialSwitch?.generation === generation) seen.delivered = true;
     return result;
   };
+  const proto = SteeringChannel.prototype as unknown as {
+    holdCredentialSwitch: () => { latched(): boolean }; maybeTripCredentialSwitch: (g: number) => void };
+  const hold = proto.holdCredentialSwitch;
+  const trip = proto.maybeTripCredentialSwitch;
+  proto.holdCredentialSwitch = function (this: unknown) {
+    const handle = hold.call(this);
+    handles.push(handle);
+    return handle;
+  };
+  proto.maybeTripCredentialSwitch = function (this: unknown, g: number) {
+    try { return trip.call(this, g); } finally { seen.trips++; }
+  };
+  restorers.push(() => { proto.holdCredentialSwitch = hold; proto.maybeTripCredentialSwitch = trip; });
   return seen;
 }
 
@@ -257,7 +274,7 @@ async function drive(o: DriveOpts) {
           api.requestCredentialSwitch(runId, 1);
           assert.ok(await until(() => switchSeen.delivered), "the worker polled the switch while the checker is pending");
           switchSeen.delivered = false;
-          await tick(30); // the steering channel consumed it (latched under the hold)
+          assert.ok(await until(() => switchSeen.latched()), "the hold latched the switch");
         } else api.armStateAckCredentialSwitchOnce(runId, 1, "awaiting_approval");
         await o.afterSwitch?.(c);
       }
@@ -342,7 +359,8 @@ function assertServicedAfterRelease(d: Driven): void {
     const at = ev.indexOf(`state:${status}`);
     if (at >= 0) assert.ok(at > capture, `${status} report only after capture: ${JSON.stringify(ev)}`);
   }
-  assert.equal(d.probe.reservations.installed, d.probe.reservations.released === 0 ? d.probe.reservations.installed : d.probe.reservations.installed);
+  assert.ok(d.probe.reservations.installed >= 1);
+  assert.equal(d.probe.reservations.released, d.probe.reservations.installed, "every installed reservation was released before service");
   assert.deepEqual(d.probe.refused, [], "no emit was refused by a reservation");
 }
 const switchReports = (runId: string) => statuses(runId).filter((s) => s.startsWith("credential_switch"));
@@ -559,7 +577,7 @@ describe("issue #3953 m3: S3 applied human gate", () => {
       try {
         assert.ok(await until(() => requested));
         assert.ok(await until(() => switchSeen.delivered), "the worker polled the switch while the gate ACK is held");
-        await tick(30); // latched under the hold
+        assert.ok(await until(() => switchSeen.latched()), "the hold latched the switch");
         held.release();
         await done;
       } finally { held.release(); probe.restore(); }
@@ -597,7 +615,7 @@ describe("issue #3953 m3: stash lifetime, ambiguous submit and pre-reserve switc
         tl.events.push("switch-requested");
         api.requestCredentialSwitch(runId, 2);
         assert.ok(await until(() => switchSeen.delivered), "the worker polled the switch during discovery");
-        await tick(30);
+        assert.ok(await until(() => switchSeen.trips > 0), "the channel tripped the switch (no hold is open yet)");
       }
       return { status: 200, body: { result: "no_row", round: 0, candidate_generation: 0,
         automatic_revision_limit: 0, automatic_rounds_enabled: false, next_round: 1, next_round_eligible: true, fallback_reason: "" } };
@@ -717,6 +735,8 @@ describe("issue #3953 m3: boundaries keep their dispositions; the latch is never
     assert.deepEqual(d.attempts, []);
     assert.equal(d.posts().length, 1);
     assert.deepEqual(d.tl.events.filter((e) => e === "capture"), []);
+    assert.equal(d.probe.reservations.installed, 1);
+    assert.equal(d.probe.reservations.released, 0, "the reservation is never released, so the latch is never serviced");
   });
 
   it("exhausted preparation ACKs keep their terminal disposition with a latched switch; assigned replay preserved, no switch report", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
@@ -777,18 +797,21 @@ describe("issue #3953 m3: boundaries keep their dispositions; the latch is never
   });
 });
 
-describe("issue #3953 m3: every trip entry reaches neither guard under an installed reservation", () => {
+describe("issue #3953 m3: every trip entry reaches neither guard (the state-ack entries prove ordering only)", () => {
   const invariant = "candidate transport invariant violated";
   const noInvariant = (runId: string) => {
     for (const s of everyState(runId))
       assert.ok(!s.failure_reason?.includes(invariant), `the invariant guard fired: ${s.failure_reason}`);
   };
+  // The state-ack entries ride the awaiting_approval ACK, which the runner handles after the applied-gate
+  // release; the ack therefore trips with no reservation installed. These two prove ordering only, not
+  // that a latch was held (a ack landing under an installed reservation is not reachable here).
   const entries: [string, DriveOpts][] = [
     ["inputs poll credentialSwitch, approve", { entry: "poll", verdicts: ["approve"], capture: "giveup" }],
     ["inputs poll credentialSwitch, automatic revise", { entry: "poll", verdicts: ["revise", "approve"], plans: [PLAN, PLAN2], capture: "giveup" }],
     ["inputs poll credentialSwitch, forced gate", { entry: "poll", verdicts: ["block"], capture: "giveup", rejectAfterGiveUp: true }],
-    ["state-ack switch (tripCredentialSwitch), forced gate", { entry: "ack", verdicts: ["block"], capture: "giveup", rejectAfterGiveUp: true }],
-    ["state-ack switch (tripCredentialSwitch), gated_pass", { entry: "ack", gated: true, verdicts: ["approve"], capture: "giveup", rejectAfterGiveUp: true }],
+    ["state-ack switch (tripCredentialSwitch), forced gate (ordering only)", { entry: "ack", verdicts: ["block"], capture: "giveup", rejectAfterGiveUp: true }],
+    ["state-ack switch (tripCredentialSwitch), gated_pass (ordering only)", { entry: "ack", gated: true, verdicts: ["approve"], capture: "giveup", rejectAfterGiveUp: true }],
   ];
   for (const [name, opts] of entries) {
     it(`${name}`, { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
@@ -963,7 +986,7 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
       events.push("switch-requested");
       api.requestCredentialSwitch(runId, 1);
       assert.ok(await until(() => switchSeen.delivered), "the worker polled the switch while the checker is pending");
-      await tick(30);
+      assert.ok(await until(() => switchSeen.latched()), "the hold latched the switch");
       const identity = server.compiled().candidate;
       return { status: 200, body: {
         result: "candidate", round, checker_run_id: child, candidate_digest: identity.digest, candidate_generation: 1,
@@ -1025,6 +1048,28 @@ describe("issue #3953 m3: semantic coverage forces a human gate after the checke
     assert.equal(verdict!.approval, undefined, "a human decided; the checker approve is evidence only");
     assert.ok(!everyState(c.run_id).some((s) => s.status === "running" && s.candidate_digest !== undefined),
       "the checker approve was never stored as an auto approval");
+  });
+
+  it("a stashed approve whose candidate digest differs from the re-run's compile fails closed", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
+    const c = semanticClaim();
+    const events: string[] = [];
+    const server = semanticRig(c, events);
+    server.force("incomplete");
+    const transport = await boundedTransport("claude", server.report, events);
+    // The give-up re-run compiles a candidate whose digest differs (same plan and milestones).
+    const compile = client.submitSemanticCandidate.bind(client);
+    let compiles = 0;
+    client.submitSemanticCandidate = async (id, gen, structural, ...rest) =>
+      compile(id, gen, ++compiles === 1 ? structural : { ...structural, size_class: structural.size_class === "l" ? "m" : "l" }, ...rest);
+    const verdicts: unknown[] = [];
+    await runner(semanticExec(c, verdicts), fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+      planCrossCheckTiming: timing, recoveryRetryMs: 1, planApprovalTimeoutMs: 4000 }).execute(c);
+    assert.ok(compiles >= 2, "the re-run compiled again");
+    failedWith(c.run_id, "stashed decision does not match");
+    assert.deepEqual(verdicts, []);
+    assert.equal(api.crossCheckRequests.filter((r) => r.method === "POST").length, 1);
+    assert.equal(events.filter((e) => e === "invoke").length, 0, "no coverage review runs on a mismatched adoption");
+    assert.equal(gates(c.run_id).length, 0);
   });
 
   it("an owner cancel during the re-run's coverage review still aborts it", { skip: LINUX_CAPTURE, timeout: 60_000 }, async () => {
