@@ -50,7 +50,7 @@ describe("overview-next mock scenario", () => {
     const fleet = (await api.listWorkers()).workers;
     const byId = new Map(fleet.map((w) => [w.id, w]));
     expect(byId.get("w-ov-rolling")).toMatchObject({ kind: "hosted", upgrade_status: "upgrading", upgrade_target: "v0.86.1-rc.2", active_runs: 1 });
-    expect(byId.get("w-ov-rolling")?.draining_since).not.toBeNull();
+    expect(byId.get("w-ov-rolling")?.draining_since).toEqual(expect.any(String));
     expect(byId.get("w-ov-cordoned")).toMatchObject({ effective_cordoned: true, active_runs: 0, max_concurrent_runs: 1 });
     expect(byId.get("w-ov-offline")?.status).toBe("offline");
     expect(byId.get("w-ov-nocap")?.max_concurrent_runs).toBeNull();
