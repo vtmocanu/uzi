@@ -21,7 +21,7 @@ func TestSummarySkippedStatusFenceLiveDB(t *testing.T) {
 	svc := New(env.q, env.box, testParams())
 
 	raw, err := json.Marshal(map[string]any{
-		"text":   "Plan summary skipped: the Codex credential could not be refreshed. The run continues.",
+		"text":   "Plan summary skipped: the run's Codex credential needed a refresh, which summaries may not do. The run continues.",
 		"event":  "summary_skipped",
 		"pass":   "plan",
 		"reason": "refresh_denied",

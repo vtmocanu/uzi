@@ -24433,6 +24433,25 @@ describe("2833 Codex inline summaries", () => {
     });
   }
 
+  it("M3 Codex intent skip note is suppressed for a superseded generation", async () => {
+    const { rig, intents } = summaryRig();
+    const { ctx, emitted } = makeCtx({ kind: "issue" });
+    const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+      summaryRunner: {
+        generateIntentSummary: async (i: IntentSummaryInput) => {
+          // A new leg replaces the intent flight (runLeg resets it); this flight is now stale.
+          (executor as unknown as { intentFlight: undefined }).intentFlight = undefined;
+          i.onSkip?.("vault_locked");
+          return null;
+        },
+        generatePlanSummary: async () => null,
+      },
+    });
+    await executor.run(ctx).catch(() => undefined);
+    assert.deepEqual(skipNotes(emitted), []);
+    assert.deepEqual(intents, []);
+  });
+
   function skipPlanRig(plans: string[], gatePlan: NonNullable<RunContext["gatePlan"]>) {
     const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
       t.push(toolCall(98, "submit_plan", { plan_md: "# Plan" }, th, tn, "plan")).push(turnCompleted("completed", th, tn)));
