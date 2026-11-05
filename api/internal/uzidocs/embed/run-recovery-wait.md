@@ -434,11 +434,19 @@ Timers, token changes and credential changes do not release the hold. Default
 CLI wait, log follow and the watcher stop for the owner decision; the web run
 page shows "unwitnessed continuation hold" with Resume and Cancel.
 
+Resume requeues the run on the same worker (its local sources stay there) and
+starts a new requeue episode. The worker registration that was released cannot
+claim it again: the run continues only after that worker re-registers (for
+example after its own restart) or on a different worker. A re-registration is
+not proof that the earlier source use ended. The worker still refuses a source
+that is in use, and a repeated refusal is bounded again in the new episode.
+Nothing restarts the worker for you.
+
 Boundaries. Old agents (no evidence) and workers that re-register between
 refusals are not witnessed; they remain bounded only by the per-run custody
 bound (`custody_hold_limit`, default 8, ADR-1751 D2a), which can still block the
 owner. If `custody_hold_limit` is below the requeue budget the run stays
-`queued` with health `custody_limit` instead of parking. Migration 00401's Down
+`queued` with health `custody_limit` instead of parking. Migration 00404's Down
 refuses while any run is parked at this cause (Resume or Cancel it first) and
 clears the cause on other rows.
 

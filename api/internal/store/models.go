@@ -1265,14 +1265,14 @@ type Run struct {
 	HarnessOtherMeasured           pgtype.Float8      `json:"harness_other_measured"`
 	HarnessPreferredHeld           pgtype.Bool        `json:"harness_preferred_held"`
 	HarnessOtherHeld               pgtype.Bool        `json:"harness_other_held"`
+	HarnessPreferredWeeklyResetAt  pgtype.Timestamptz `json:"harness_preferred_weekly_reset_at"`
+	HarnessOtherWeeklyResetAt      pgtype.Timestamptz `json:"harness_other_weekly_reset_at"`
 	RegistrationEvidenceGeneration pgtype.Int8        `json:"registration_evidence_generation"`
 	RegistrationEvidenceNonce      pgtype.Text        `json:"registration_evidence_nonce"`
 	RegistrationEvidenceEpoch      pgtype.Int8        `json:"registration_evidence_epoch"`
 	SnapshotDepartedGeneration     pgtype.Int8        `json:"snapshot_departed_generation"`
 	SnapshotDepartedNonce          pgtype.Text        `json:"snapshot_departed_nonce"`
 	SnapshotDepartedEpoch          pgtype.Int8        `json:"snapshot_departed_epoch"`
-	HarnessPreferredWeeklyResetAt  pgtype.Timestamptz `json:"harness_preferred_weekly_reset_at"`
-	HarnessOtherWeeklyResetAt      pgtype.Timestamptz `json:"harness_other_weekly_reset_at"`
 }
 
 type RunCompletionAttempt struct {

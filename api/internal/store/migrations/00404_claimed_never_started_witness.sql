@@ -74,7 +74,7 @@ SET LOCAL lock_timeout = '5s';
 -- Serialise against live run writers while the Down rewrites rows and narrows the CHECKs; a held
 -- lock fails the rollback after 5s rather than queueing every runs writer behind it.
 LOCK TABLE runs IN ACCESS EXCLUSIVE MODE;
--- A live unwitnessed park has no pre-00401 equivalent: relabelling it as another cause would
+-- A live unwitnessed park has no pre-00404 equivalent: relabelling it as another cause would
 -- fabricate a classification the run never earned. Refuse the rollback while any run is still
 -- parked there (checked under the lock above) so the owner decides first.
 -- +goose StatementBegin
@@ -85,7 +85,7 @@ BEGIN
     SELECT count(*) INTO n FROM runs
     WHERE status = 'recovery_wait' AND recovery_wait_cause = 'retained_continuation_unwitnessed';
     IF n > 0 THEN
-        RAISE EXCEPTION 'refusing to roll back 00401: % run(s) are parked in recovery_wait at retained_continuation_unwitnessed; Resume or Cancel those runs first so no parked run is relabelled', n;
+        RAISE EXCEPTION 'refusing to roll back 00404: % run(s) are parked in recovery_wait at retained_continuation_unwitnessed; Resume or Cancel those runs first so no parked run is relabelled', n;
     END IF;
 END
 $$;

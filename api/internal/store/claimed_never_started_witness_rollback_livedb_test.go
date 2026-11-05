@@ -12,27 +12,27 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// migration00401DownSQL returns the raw `-- +goose Down` block of 00401 as one script. The shared
+// migration00404DownSQL returns the raw `-- +goose Down` block of 00404 as one script. The shared
 // statement splitter cuts on every semicolon, which would shred the DO block's body, so this test
 // runs the exact shipped Down text in a single simple-protocol Exec.
-func migration00401DownSQL(t *testing.T) string {
+func migration00404DownSQL(t *testing.T) string {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("migrations", "00401_claimed_never_started_witness.sql"))
+	b, err := os.ReadFile(filepath.Join("migrations", "00404_claimed_never_started_witness.sql"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := string(b)
 	i := strings.Index(s, "-- +goose Down")
 	if i < 0 {
-		t.Fatal("00401 has no Down block")
+		t.Fatal("00404 has no Down block")
 	}
 	return s[i+len("-- +goose Down"):]
 }
 
-// TestClaimedNeverStartedWitnessRollbackLiveDB proves 00401's Down never relabels a run: a live
+// TestClaimedNeverStartedWitnessRollbackLiveDB proves 00404's Down never relabels a run: a live
 // recovery_wait/retained_continuation_unwitnessed park makes the Down fail with the row untouched,
 // and after a real owner cancel (CancelRunServerSide) the Down succeeds, clears the stale cause,
-// leaves the run cancelled and its custody hold untouched, restores the pre-00401 CHECK and
+// leaves the run cancelled and its custody hold untouched, restores the pre-00404 CHECK and
 // fn_custody_attention, and drops the witness columns. Every Down runs in a rolled-back tx.
 func TestClaimedNeverStartedWitnessRollbackLiveDB(t *testing.T) {
 	f := newAdmissionFixture(t, 2)
@@ -44,7 +44,7 @@ func TestClaimedNeverStartedWitnessRollbackLiveDB(t *testing.T) {
  'publication_uncertain', false, 'capture_uncertain', false, 'custody_uncertain', false, 'unknown', false,
  'recorded_at', '2026-11-04T10:00:00Z', 'worker_snapshot_epoch', 3, 'deadline', '2026-11-04T11:00:00Z') WHERE id=$1`, partial)
 	f.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='retained_continuation_unwitnessed', recovery_retry_not_before=now()+interval '1 hour', claim_generation=2 WHERE id=$1", run)
-	down := migration00401DownSQL(t)
+	down := migration00404DownSQL(t)
 
 	rowState := func(q interface {
 		QueryRow(context.Context, string, ...any) pgx.Row

@@ -26262,7 +26262,8 @@ export class RunRunner {
             this.retainedLifecycleGuard(flight);
             if (error instanceof SourceUseHeldRefusal) {
               // An earlier flight of this process still holds the path with no confirmed end (held_unended). That is
-              // not a preservation failure: stop nonterminal with custody retained and no report. The server's
+              // not a preservation failure: stop nonterminal with custody retained and no report unless an owner
+              // cancel is observed at this seam (#3860, observeCancelAtHeldSeam below). The server's
               // claimed-never-started charge bounds it only when the api supports registration evidence
               // (run_registration_evidence_v1) and it was negotiated and not dropped: then the witnessed departure
               // of this retained continuation is charged against RUN_MAX_REQUEUES and parks at
