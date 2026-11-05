@@ -49,7 +49,10 @@ function readUsageWindow(): UsageWindow {
   }
 }
 
-const NO_ADMIN_RUNS: AdminRunsState = { runs: null, failed: false, lastOkAt: null };
+// How long an admin run-list request may stay pending before it counts as failed.
+const ADMIN_RUNS_DEADLINE_MS = 30_000;
+
+const NO_ADMIN_RUNS: AdminRunsState ={ runs: null, failed: false, lastOkAt: null };
 
 export function useOverviewData(opts?: { includeAdminRuns?: boolean }) {
   const { user } = useAuth();
@@ -142,23 +145,40 @@ export function useOverviewData(opts?: { includeAdminRuns?: boolean }) {
   // At most one request is in flight: a tick that finds one pending skips, so a response
   // slower than the poll interval is still applied (never starved by newer requests) and
   // responses cannot arrive out of order.
-  const adminInFlightRef = useRef(false);
+  // The api client has no request timeout, so a request that never settles must not pin
+  // the marker forever: a tick that finds one older than ADMIN_RUNS_DEADLINE_MS counts it
+  // as failed and issues a new request. Only the latest issued id may write state or clear
+  // the marker, so the abandoned request settling later changes nothing.
+  const adminInFlightRef = useRef<{ id: number; startedAt: number } | null>(null);
+  const adminRequestIdRef = useRef(0);
   const fetchAdminRuns = useCallback(async () => {
-    if (adminInFlightRef.current) return;
-    adminInFlightRef.current = true;
+    const now = Date.now();
+    const pending = adminInFlightRef.current;
+    if (pending) {
+      if (now - pending.startedAt < ADMIN_RUNS_DEADLINE_MS) return;
+      if (pollAliveRef.current) setAdminRuns((prev) => ({ ...prev, failed: true }));
+    }
+    const id = ++adminRequestIdRef.current;
+    adminInFlightRef.current = { id, startedAt: now };
     try {
       const { runs } = await api.adminListRuns({ view: "summary" });
-      if (!pollAliveRef.current) return;
+      if (!pollAliveRef.current || adminInFlightRef.current?.id !== id) return;
       setAdminRuns({ runs, failed: false, lastOkAt: Date.now() });
     } catch {
-      if (!pollAliveRef.current) return;
+      if (!pollAliveRef.current || adminInFlightRef.current?.id !== id) return;
       setAdminRuns((prev) => ({ ...prev, failed: true }));
     } finally {
-      adminInFlightRef.current = false;
+      if (adminInFlightRef.current?.id === id) adminInFlightRef.current = null;
     }
   }, []);
   useEffect(() => {
-    if (!adminRunsEnabled) return;
+    if (!adminRunsEnabled) {
+      // Admin revoked (or never granted): drop any rows and orphan a pending request so a
+      // later re-grant starts empty instead of showing stale rows as live.
+      adminInFlightRef.current = null;
+      setAdminRuns(NO_ADMIN_RUNS);
+      return;
+    }
     void fetchAdminRuns();
   }, [adminRunsEnabled, fetchAdminRuns]);
 

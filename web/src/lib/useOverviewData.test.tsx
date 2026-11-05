@@ -119,6 +119,61 @@ describe("useOverviewData admin runs", () => {
     expect(result.current.adminRuns.failed).toBe(true);
   });
 
+  it("treats a request that never settles as failed, retries, and ignores the abandoned one", async () => {
+    let resolveFirst: (v: { runs: ReturnType<typeof rows> }) => void = () => {};
+    mockApi.adminListRuns.mockResolvedValueOnce({ runs: rows("a") });
+    const { result } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
+    await settle();
+    expect(ids(result.current.adminRuns.runs)).toEqual(["a"]);
+    const lastOkAt = result.current.adminRuns.lastOkAt;
+
+    mockApi.adminListRuns.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveFirst = resolve; }),
+    );
+    await settle(10_000); // tick issues the request that never settles
+    expect(mockApi.adminListRuns).toHaveBeenCalledTimes(2);
+    expect(result.current.adminRuns.failed).toBe(false);
+
+    mockApi.adminListRuns.mockResolvedValueOnce({ runs: rows("new") });
+    await settle(30_000); // the tick at exactly the deadline retries
+    expect(mockApi.adminListRuns.mock.calls.length).toBeGreaterThanOrEqual(3);
+    // The replacement request succeeded, so failed is cleared and its rows applied.
+    expect(ids(result.current.adminRuns.runs)).toEqual(["new"]);
+    expect(result.current.adminRuns.failed).toBe(false);
+
+    resolveFirst({ runs: rows("stale") });
+    await settle();
+    expect(ids(result.current.adminRuns.runs)).toEqual(["new"]);
+    expect(result.current.adminRuns.lastOkAt).not.toBe(lastOkAt);
+  });
+
+  it("flags failed with last good rows retained while the replacement is still pending", async () => {
+    mockApi.adminListRuns.mockResolvedValueOnce({ runs: rows("a") });
+    const { result } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
+    await settle();
+    const lastOkAt = result.current.adminRuns.lastOkAt;
+    mockApi.adminListRuns.mockImplementation(() => new Promise(() => {}));
+    await settle(10_000);
+    expect(result.current.adminRuns.failed).toBe(false);
+    const callsBefore = mockApi.adminListRuns.mock.calls.length;
+    await settle(30_000);
+    expect(result.current.adminRuns.failed).toBe(true);
+    expect(ids(result.current.adminRuns.runs)).toEqual(["a"]);
+    expect(result.current.adminRuns.lastOkAt).toBe(lastOkAt);
+    expect(mockApi.adminListRuns.mock.calls.length).toBeGreaterThan(callsBefore);
+  });
+
+  it("resets admin runs when admin access is revoked", async () => {
+    mockApi.adminListRuns.mockResolvedValueOnce({ runs: rows("a") });
+    const { result, rerender } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
+    await settle();
+    expect(ids(result.current.adminRuns.runs)).toEqual(["a"]);
+    vi.mocked(useAuth).mockReturnValue(authValue(aUser));
+    rerender();
+    await settle();
+    expect(result.current.adminRuns).toEqual({ runs: null, failed: false, lastOkAt: null });
+  });
+
   it("never calls the admin endpoint for a non-admin, even when asked", async () => {
     vi.mocked(useAuth).mockReturnValue(authValue(aUser));
     const { result } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
