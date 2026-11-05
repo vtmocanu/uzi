@@ -136,7 +136,7 @@ it("requires a new Resume for a subsequent NULL disk hold", async () => {
   await settleMockApi(mockApi.resumeRun(id));
   patchRun(id, {
     status: "recovery_wait", recovery_wait_cause: "data_volume_full",
-    recovery_retry_not_before: null, disk_park_count: 6,
+    recovery_retry_not_before: null, disk_park_count: 5,
   });
   const held = { ...getRun(id)! };
   const socket = new MockRunSocket(id);
@@ -145,7 +145,7 @@ it("requires a new Resume for a subsequent NULL disk hold", async () => {
     await vi.advanceTimersByTimeAsync(120_000);
     expect(getRun(id)).toEqual(held);
     const { run } = await settleMockApi(mockApi.resumeRun(id));
-    expect(run).toMatchObject({ status: "queued", disk_park_count: 6 });
+    expect(run).toMatchObject({ status: "queued", disk_park_count: 5 });
     await expect(mockApi.resumeRun(id)).rejects.toMatchObject({ status: 409 });
   } finally {
     socket.close();
