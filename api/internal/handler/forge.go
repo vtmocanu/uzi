@@ -210,7 +210,7 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 func (h *Handler) ForgeConfig(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"allowed_base_urls": h.cfg.ForgeAllowedBaseURLs,
-		"forge_types":       []string{string(forge.TypeGitLab), string(forge.TypeForgejo), string(forge.TypeGitHub)},
+		"forge_types":       forge.SupportedTypes(),
 	})
 }
 
@@ -239,14 +239,20 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	forgeType := strings.TrimSpace(req.ForgeType)
-	if forgeType == "" {
-		forgeType = string(forge.TypeGitLab)
-	}
-	if forgeType != string(forge.TypeGitLab) && forgeType != string(forge.TypeForgejo) && forgeType != string(forge.TypeGitHub) {
-		httpx.Error(w, http.StatusBadRequest, "unsupported forge type")
+	// The caller names the forge; the API never guesses it from the URL or a
+	// default (issue #3785), since a guessed driver verifies the token against
+	// the wrong forge.
+	rawType := strings.TrimSpace(req.ForgeType)
+	if rawType == "" {
+		httpx.Error(w, http.StatusBadRequest, "forge_type is required; supported values: "+forge.SupportedTypesList())
 		return
 	}
+	parsedType, ok := forge.ParseType(rawType)
+	if !ok {
+		httpx.Error(w, http.StatusBadRequest, "unsupported forge type; supported values: "+forge.SupportedTypesList())
+		return
+	}
+	forgeType := string(parsedType)
 	if strings.TrimSpace(req.Token) == "" {
 		httpx.Error(w, http.StatusBadRequest, "a bot token is required")
 		return
