@@ -148,7 +148,7 @@ D's own fixture facts go in a sibling file in C's directory, `fixtures/model-set
 
 ### 3. User column and API (`users.codex_summary_model`, `PUT/GET /api/me/settings`)
 
-- **Migration (next free number, currently 00404):** `ALTER TABLE users ADD COLUMN codex_summary_model text;` and a goose Down that drops it.
+- **Migration (drafted as 00404, landed as 00406):** `ALTER TABLE users ADD COLUMN codex_summary_model text;` and a goose Down that drops it.
   - Nullable, no default, no backfill: NULL means inherit, which resolves to today's behavior. A Codex run never read the Claude lane, so there is nothing to copy.
   - No CHECK constraint, as for `summary_model`.
 - **Queries:**

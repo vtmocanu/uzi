@@ -12,8 +12,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// TestUserSummaryModelLiveDB executes the queries migrations 00132 and 00404 add columns
-// for — GetUserSummaryModels, SetUserSummaryModel (PRD #362 M2) and SetUserCodexSummaryModel (migration 00404, PRD #3248) — against real
+// TestUserSummaryModelLiveDB executes the queries migrations 00132 and 00406 add columns
+// for — GetUserSummaryModels, SetUserSummaryModel (PRD #362 M2) and SetUserCodexSummaryModel (migration 00406, PRD #3248) — against real
 // Postgres. Per .claude/rules/go.md a green `sqlc generate` is not evidence a query
 // runs (sqlc's type deduction is not Postgres's), so the nullable-text round-trip
 // (pristine NULL, a set value, and clearing back to NULL) is only settled by the

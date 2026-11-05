@@ -7,9 +7,8 @@
 -- for that user's runs only; resolution is user-value-wins at issue-run claim
 -- assembly. Mirrors the per-user codex_judge_model column.
 --
--- NOTE (goose numbering): drafted as 00404 above the live head (00403); renumber
--- to the next free number above the live head at landing, per the CLAUDE.md
--- convention.
+-- NOTE (goose numbering): drafted as 00404, renumbered to 00406 at landing above
+-- the live head (00405), per the CLAUDE.md convention.
 ALTER TABLE users ADD COLUMN codex_summary_model text;
 
 -- +goose Down
