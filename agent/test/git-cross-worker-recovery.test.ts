@@ -1271,6 +1271,26 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
       "control: with the ref genuinely absent the same state is discounted");
   });
 
+  it("g16 a real dangling symref at the origin-branch floor is not proven absent: blocks, no probe", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    // for-each-ref skips a dangling symref silently (rc 0, no output, no warning), exactly like a
+    // missing ref; only the loose ref file betrays it.
+    const refFile = path.join(f.bare, "refs", "remotes", "origin", ...f.branch.split("/"));
+    fs.mkdirSync(path.dirname(refFile), { recursive: true });
+    fs.writeFileSync(refFile, "ref: refs/heads/no-such-branch\n");
+    const probe = spyProbe(f.git);
+    try {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true,
+        "a dangling symref branch floor must not be read as absent");
+      assert.equal(probe.calls, 0, "unprovable proof never consults the origin probe");
+    } finally {
+      fs.unlinkSync(refFile);
+    }
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false,
+      "control: with the ref genuinely absent the same state is discounted");
+  });
+
   it("g12 a discount writes no ref in the bare or on origin", async () => {
     const f = await fixture();
     f.mirror(f.work);

@@ -152,10 +152,10 @@ in the tip proof, including the overlay peel, ignores replace refs and `info/gra
 (`GIT_NO_REPLACE_OBJECTS`, `GIT_GRAFT_FILE=/dev/null`), so a replaced or grafted commit
 cannot make work look marker-only or content-free. The recovery floor itself (origin's
 branch if present, else the default branch) is chosen through the same view and
-error-aware: only a proven absence (a clean, empty, successful listing) falls through to
-the next candidate. A failed or incomplete ref read, or a corrupt or unreadable ref, which
-git otherwise reports like a missing one, makes the proof unprovable rather than silently
-falling back to a different floor. The confirmed publication leg keeps its logic; it now reads through the
+error-aware: only a proven absence (a clean, empty, successful listing, and no loose ref
+file at that exact path) falls through to the next candidate. A failed or incomplete ref
+read, or a corrupt, unreadable or dangling ref, which git otherwise reports like a missing
+one, makes the proof unprovable rather than silently falling back to a different floor. The confirmed publication leg keeps its logic; it now reads through the
 same replace- and graft-free view.
 
 **Issue-run fallback (#3360).** On issue runs only, when the lead declares `report_only`

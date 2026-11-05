@@ -18334,7 +18334,18 @@ try {
         // Any diagnostic (e.g. "warning: ignoring broken ref") means the ref's state is unknown.
         if (stderr.trim() !== "") return "unknown";
         // The pattern also matches refs below `ref/`; those cannot coexist with `ref` itself.
-        return stdout.split("\n").map(line => line.trim()).includes(ref) ? "present" : "absent";
+        if (stdout.split("\n").map(line => line.trim()).includes(ref)) return "present";
+        // A clean empty listing still hides a dangling symref (a loose ref file git skips
+        // silently), so absence also needs the exact loose-ref path to be missing, checked
+        // without following it. A directory there only holds child refs; any other entry or an
+        // unexpected read error leaves the state unknown.
+        try {
+          const entry = await fs.lstat(path.join(barePath, ...ref.split("/")));
+          return entry.isDirectory() ? "absent" : "unknown";
+        } catch (statErr) {
+          const code = (statErr as { code?: unknown }).code;
+          return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "unknown";
+        }
       } catch (err) {
         if (err instanceof RunResidueBlockedError) throw err;
         const abort = this.boundaryAbortError(err);
