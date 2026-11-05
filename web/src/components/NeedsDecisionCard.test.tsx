@@ -49,6 +49,16 @@ describe("NeedsDecisionCard", () => {
     expect(screen.getAllByText("waiting 14m")).toHaveLength(3);
   });
 
+  it("rolls long waits into hours and days", () => {
+    const at = (iso: string) => ({ ...item("plan"), since: iso });
+    mount([
+      { ...at("2026-06-07T12:20:00Z"), run: aRun({ id: "d" }) as RunSummaryItem },
+      { ...at("2026-07-05T07:20:00Z"), run: aRun({ id: "h" }) as RunSummaryItem },
+    ]);
+    expect(screen.getByText("waiting 28d")).toBeTruthy();
+    expect(screen.getByText("waiting 5h")).toBeTruthy();
+  });
+
   it("labels the cached PR state per forge", () => {
     mount([prItem({ id: "gh", forge_type: "github" }), prItem({ id: "gl", forge_type: "gitlab" }), prItem({ id: "fj", forge_type: "forgejo" })]);
     expect(screen.getAllByText("PR state as last seen by uzi")).toHaveLength(2);

@@ -190,7 +190,8 @@ describe("OverviewNext for an admin", () => {
     expect(within(screen.getByRole("list", { name: "Other users' runs" })).getByText("Theirs")).toBeTruthy();
     mockApi.adminListRuns.mockRejectedValueOnce(new Error("blip"));
     await settle(10_000);
-    expect(screen.getByText(/Other users' runs are unavailable \(last read/)).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+    expect(screen.getByRole("status").parentElement?.textContent).toMatch(/unavailable \(last read/);
     expect(screen.queryByText("Theirs")).toBeNull();
     expect(screen.getByText("Mine")).toBeTruthy();
   });

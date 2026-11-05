@@ -19,6 +19,16 @@ import { SectionTitle } from "./ui";
 const ACTION_CLASS =
   "inline-flex h-7 shrink-0 select-none items-center justify-center gap-1 rounded-lg border border-edge bg-raised px-2.5 text-xs font-medium text-fg transition-colors hover:border-edge-strong hover:bg-raised/70";
 
+// A compact decision age that rolls into days (activityAge stops at hours: "678h 0m").
+function decisionAge(since: string, now: number): string {
+  const ms = now - Date.parse(since);
+  if (Number.isFinite(ms) && ms >= 3_600_000) {
+    const h = Math.floor(ms / 3_600_000);
+    return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
+  }
+  return activityAge(since, now);
+}
+
 function summary(items: DecisionItem[]): string {
   const prs = items.filter((i) => i.kind === "pr").length;
   const decisions = items.length - prs;
@@ -32,7 +42,7 @@ function summary(items: DecisionItem[]): string {
 
 function DecisionRow({ item, now, demo }: { item: DecisionItem; now: number; demo: boolean }) {
   const { run } = item;
-  const age = activityAge(item.since, now);
+  const age = decisionAge(item.since, now);
   // The row's title describes its action link, so several "Review plan" links are told apart
   // without changing the link's name. The external link also points at a hidden new-tab note.
   const titleId = useId();

@@ -10,8 +10,9 @@ import type { AdminRunsState } from "../lib/useOverviewData";
 import { OverviewRunRow } from "./OverviewRunRow";
 import { Card, SectionTitle, Skeleton } from "./ui";
 
-function GroupHeading({ children }: { children: string }) {
-  return <h3 className="mt-3 text-xs font-medium text-muted">{children}</h3>;
+function GroupHeading({ children, admin }: { children: string; admin?: boolean }) {
+  // The admin group takes the brand role, like RunsList's "Factory status (admin)" title.
+  return <h3 className={`mt-3 text-xs font-medium ${admin ? "text-brand" : "text-muted"}`}>{children}</h3>;
 }
 
 export function OverviewRunsWidget({
@@ -53,7 +54,7 @@ export function OverviewRunsWidget({
         </div>
       ) : (
         <>
-          {isAdmin && <GroupHeading>Yours</GroupHeading>}
+          <GroupHeading>Yours</GroupHeading>
           {yours.length === 0 ? (
             <p className="mt-2 text-sm text-faint">No active runs. Start one from a board card.</p>
           ) : (
@@ -66,9 +67,10 @@ export function OverviewRunsWidget({
           {adminFailed ? (
             // The last good rows are not shown: stale rows must not read as live ones.
             <>
-              <GroupHeading>Other users (admin)</GroupHeading>
-              <p role="status" className="mt-2 text-sm text-faint">
-                Other users' runs are unavailable
+              <GroupHeading admin>Other users (admin)</GroupHeading>
+              {/* Only the static sentence is a live region: the ticking read time sits outside it. */}
+              <p className="mt-2 text-sm text-faint">
+                <span role="status">Other users' runs are unavailable</span>
                 {adminRuns?.lastOkAt != null &&
                   ` (last read ${formatAgo(new Date(adminRuns.lastOkAt).toISOString(), now)})`}
               </p>
@@ -77,7 +79,7 @@ export function OverviewRunsWidget({
             isAdmin &&
             others.length > 0 && (
               <>
-                <GroupHeading>Other users (admin)</GroupHeading>
+                <GroupHeading admin>Other users (admin)</GroupHeading>
                 <ul aria-label="Other users' runs" className="mt-1 divide-y divide-edge">
                   {others.map((r) => (
                     <OverviewRunRow key={r.id} run={r} now={now} demo={demo} owner={r.owner_email} />

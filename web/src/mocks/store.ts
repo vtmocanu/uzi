@@ -214,6 +214,21 @@ function seed(): MockState {
       r.progress = deriveMockProgress(r);
     }
   }
+  // ?mock=overview-calm (PRD #3878): the viewer has active runs but nothing needs a decision,
+  // so the Overview preview's decision card stays hidden. Drop every own run that could list
+  // as one: a plan/question wait, a parked run, or a finished run with a pull request. (The
+  // mock graph cannot import lib/overview, so mockApi.overviewCalm.test.ts checks the result
+  // against overviewDecisions.)
+  if (mockScenario() === "overview-calm") {
+    const decisionStatus = new Set<string>([
+      "awaiting_approval", "awaiting_input", "awaiting_followup",
+      "paused", "limit_wait", "pool_wait", "recovery_wait",
+    ]);
+    for (const r of runs.values()) {
+      if (r.id in mockOtherRunOwners) continue;
+      if (decisionStatus.has(r.status) || r.mr_iid != null) runs.delete(r.id);
+    }
+  }
   const proposals = new Map<string, IssueProposal>();
   for (const p of mockProposals) proposals.set(p.id, { ...p });
   const boards = new Map<string, Board>();

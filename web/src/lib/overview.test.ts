@@ -277,7 +277,7 @@ describe("overviewDecisions", () => {
     ]);
   });
 
-  it("keeps unparseable timestamps last, in input order, without a NaN comparator", () => {
+  it("orders unparseable timestamps deterministically: last, in input order", () => {
     const got = overviewDecisions([
       run({ id: "bad-1", status: "awaiting_approval", status_since: "garbage" }),
       run({ id: "bad-2", status: "awaiting_approval", status_since: "nope" }),

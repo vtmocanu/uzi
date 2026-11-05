@@ -29,6 +29,13 @@ describe("OverviewRunRow owner", () => {
     expect(owner.getAttribute("title")).toBe("mira.lopez@uzi.local");
   });
 
+  it("strips zero-width and bidi-override characters from the owner label and its title", () => {
+    row({ owner: "mi\u200bra@uz\u202ei.local", demo: false });
+    const owner = screen.getByText("mira@uzi.local");
+    expect(owner.textContent).not.toMatch(/[\u200b\u202e]/);
+    expect(owner.getAttribute("title")).toBe("mira@uzi.local");
+  });
+
   it("masks the owner email in the text and in the title attribute in demo mode", () => {
     row({ owner: "mira.lopez@uzi.local", demo: true });
     expect(document.body.textContent).not.toContain("mira.lopez");

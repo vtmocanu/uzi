@@ -2,7 +2,7 @@
 // PRD #3878: the admin run list's loading rules inside the shared Overview data hook.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, renderHook } from "@testing-library/react";
-import { api, type RunListItem, type RunSummaryItem } from "./api";
+import { api, type RunSummaryItem } from "./api";
 import { useAuth } from "../auth/AuthContext";
 import { useOverviewData } from "./useOverviewData";
 import { aRun, aUser, authValue, emptySelf } from "../pages/overviewFixtures";
@@ -57,17 +57,6 @@ async function settle(ms = 0) {
   });
 }
 
-// A request the test resolves or rejects by hand.
-function control() {
-  let resolve!: (v: { runs: RunListItem[] }) => void;
-  let reject!: (e: Error) => void;
-  const promise = new Promise<{ runs: RunListItem[] }>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
 const rows = (...ids: string[]) => ids.map((id) => aRun({ id, owner_email: "mira@uzi.local" }));
 const ids = (runs: RunSummaryItem[] | null) => (runs ?? []).map((r) => r.id);
 
@@ -88,38 +77,46 @@ describe("useOverviewData admin runs", () => {
     expect(result.current.adminRuns.lastOkAt).toBe(lastOkAt);
   });
 
-  it("ignores an older request that resolves after a newer one", async () => {
-    const first = control();
-    mockApi.adminListRuns.mockReturnValueOnce(first.promise);
-    mockApi.adminListRuns.mockResolvedValueOnce({ runs: rows("new") });
-    const { result } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
-    await settle();
-    // The mount request is still pending; the 10 s poll issues the newer one.
-    await settle(10_000);
-    expect(mockApi.adminListRuns).toHaveBeenCalledTimes(2);
-    expect(ids(result.current.adminRuns.runs)).toEqual(["new"]);
-
-    await act(async () => {
-      first.resolve({ runs: rows("stale") });
+  // A response slower than the 10 s poll must still be applied: one request at a time.
+  function slowAdminApi(failFrom = Infinity) {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let calls = 0;
+    mockApi.adminListRuns.mockImplementation(() => {
+      const n = ++calls;
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      return new Promise((resolve, reject) => {
+        setTimeout(() => {
+          inFlight--;
+          if (n >= failFrom) reject(new Error("slow failure"));
+          else resolve({ runs: rows(`r${n}`) });
+        }, 15_000);
+      });
     });
-    await settle();
-    expect(ids(result.current.adminRuns.runs)).toEqual(["new"]);
+    return { max: () => maxInFlight };
+  }
+
+  it("applies rows from responses slower than the poll, never overlapping requests", async () => {
+    const probe = slowAdminApi();
+    const { result } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
+    await settle(16_000);
+    expect(ids(result.current.adminRuns.runs)).toEqual(["r1"]);
+    await settle(45_000);
+    expect(probe.max()).toBe(1);
+    expect(ids(result.current.adminRuns.runs).length).toBe(1);
+    expect(result.current.adminRuns.runs?.[0].id).not.toBe("r1");
     expect(result.current.adminRuns.failed).toBe(false);
   });
 
-  it("ignores an older failure that arrives after a newer success", async () => {
-    const first = control();
-    mockApi.adminListRuns.mockReturnValueOnce(first.promise);
-    mockApi.adminListRuns.mockResolvedValueOnce({ runs: rows("new") });
+  it("flags a slow failing response failed and keeps the last good rows", async () => {
+    slowAdminApi(2);
     const { result } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
-    await settle();
-    await settle(10_000);
-    await act(async () => {
-      first.reject(new Error("late failure"));
-    });
-    await settle();
-    expect(ids(result.current.adminRuns.runs)).toEqual(["new"]);
-    expect(result.current.adminRuns.failed).toBe(false);
+    await settle(16_000);
+    expect(ids(result.current.adminRuns.runs)).toEqual(["r1"]);
+    await settle(30_000);
+    expect(ids(result.current.adminRuns.runs)).toEqual(["r1"]);
+    expect(result.current.adminRuns.failed).toBe(true);
   });
 
   it("never calls the admin endpoint for a non-admin, even when asked", async () => {

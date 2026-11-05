@@ -72,15 +72,22 @@ describe("OverviewRunsWidget", () => {
   it("lists another user's awaiting_approval run only in Other users, with no action", () => {
     mount({
       isAdmin: true,
-      adminRuns: good([theirs({ id: "t1", status: "awaiting_approval", issue_title: "Their plan" })]),
+      adminRuns: good([theirs({
+          id: "t1",
+          status: "awaiting_approval",
+          issue_title: "Their plan",
+          progress: { state: "waiting", pct: null, milestone_done: 0, milestone_total: 0, active_milestone_id: "", phase: "" },
+        })]),
     });
     const others = within(screen.getByRole("list", { name: "Other users' runs" }));
     expect(others.getByText("Their plan")).toBeTruthy();
-    expect(others.queryByRole("button")).toBeNull();
     expect(screen.queryByRole("link", { name: "Review plan" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Review plan" })).toBeNull();
-    // The only link in the row is the stretched run link.
-    expect(others.getAllByRole("link").map((a) => a.getAttribute("href"))).toContain("/runs/t1");
+    // The only link in the group is the stretched run overlay.
+    expect(others.getAllByRole("link").map((a) => a.getAttribute("href"))).toEqual(["/runs/t1"]);
+    // The row says the run waits on its owner, never on the viewer.
+    expect(others.getByText(/waits on owner/)).toBeTruthy();
+    expect(others.queryByText(/waits on you/)).toBeNull();
   });
 
   it("shows a non-admin only their own group", () => {
@@ -90,6 +97,7 @@ describe("OverviewRunsWidget", () => {
       adminRuns: good([theirs({ issue_title: "Theirs" })]),
     });
     expect(screen.getByText("Mine")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Yours" })).toBeTruthy();
     expect(screen.queryByText("Theirs")).toBeNull();
     expect(screen.queryByText(/Other users/)).toBeNull();
   });
@@ -111,8 +119,11 @@ describe("OverviewRunsWidget", () => {
       ownRuns: [run()],
       adminRuns: { runs: [theirs({ issue_title: "Stale row" })], failed: true, lastOkAt: NOW - 5 * 60_000 },
     });
-    expect(screen.getByText("Other users (admin)")).toBeTruthy();
-    expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable (last read 5m ago)");
+    const heading = screen.getByText("Other users (admin)");
+    expect(heading.className).toContain("text-brand");
+    // Only the static sentence is the live region; the ticking read time sits outside it.
+    expect(screen.getByRole("status").textContent).toBe("Other users' runs are unavailable");
+    expect(screen.getByRole("status").parentElement?.textContent).toBe("Other users' runs are unavailable (last read 5m ago)");
     expect(screen.queryByText("Stale row")).toBeNull();
     expect(screen.queryByRole("list", { name: "Other users' runs" })).toBeNull();
   });

@@ -196,7 +196,8 @@ export function overviewDecisions(ownRuns: ReadonlyArray<RunSummaryItem>): Decis
   const out: DecisionItem[] = [];
   const add = (kind: DecisionKind, runs: ReadonlyArray<RunSummaryItem>, sinceOf: (r: RunSummaryItem) => string) => {
     const items: DecisionItem[] = runs.map((run) => ({ kind, run, verb: DECISION_VERB[kind], since: sinceOf(run) }));
-    // An unparseable timestamp sorts last; two of them compare equal (Infinity - Infinity is NaN).
+    // Deterministic ordering for unparseable timestamps: they sort last and keep input order
+    // (the comparator below treats two of them as equal rather than subtracting Infinity).
     const t = (i: DecisionItem) => {
       const ms = Date.parse(i.since);
       return Number.isNaN(ms) ? Number.POSITIVE_INFINITY : ms;

@@ -714,6 +714,9 @@ scenarios are mutually exclusive by construction. Known values:
   wait). One of your own completed runs shares its open MR with `run-ci-halted`,
   so the pull-request list has a duplicate to collapse. Nothing is seeded
   outside the scenario. (PRD #3878.)
+- `overview-calm` — `/overview/next?mock=overview-calm`: you have active runs
+  but nothing waiting on a decision (no plan review, question, owner-action
+  park or open pull request), so the decision card stays hidden. (PRD #3878.)
 
 ### What keeps the mock build current
 

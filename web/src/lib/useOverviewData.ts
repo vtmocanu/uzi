@@ -139,19 +139,22 @@ export function useOverviewData(opts?: { includeAdminRuns?: boolean }) {
   // The admin list rides its own request on both the first load and the 10 s poll, caught
   // separately so its failure can never fail the personal load. A failure keeps the last
   // good rows and flags `failed`; the next success clears the flag and stamps the read time.
-  // Overlapping calls (mount, poll, visibility ticks) can resolve out of order: only the
-  // newest issued request may write, so a stale failure never marks fresh data failed and a
-  // stale success never overwrites newer rows.
-  const adminReqRef = useRef(0);
+  // At most one request is in flight: a tick that finds one pending skips, so a response
+  // slower than the poll interval is still applied (never starved by newer requests) and
+  // responses cannot arrive out of order.
+  const adminInFlightRef = useRef(false);
   const fetchAdminRuns = useCallback(async () => {
-    const id = ++adminReqRef.current;
+    if (adminInFlightRef.current) return;
+    adminInFlightRef.current = true;
     try {
       const { runs } = await api.adminListRuns({ view: "summary" });
-      if (!pollAliveRef.current || id !== adminReqRef.current) return;
+      if (!pollAliveRef.current) return;
       setAdminRuns({ runs, failed: false, lastOkAt: Date.now() });
     } catch {
-      if (!pollAliveRef.current || id !== adminReqRef.current) return;
+      if (!pollAliveRef.current) return;
       setAdminRuns((prev) => ({ ...prev, failed: true }));
+    } finally {
+      adminInFlightRef.current = false;
     }
   }, []);
   useEffect(() => {
