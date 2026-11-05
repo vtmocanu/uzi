@@ -34,6 +34,7 @@ import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheck
 import type { CodexAccountMode, CrossCheckPinDTO, EffortSettingCell, Harness } from "../../lib/apiTypes";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
+import { mockSummaryModelCells } from "./summaryModels";
 import { mockDefaultClaudeModel } from "./agents";
 import { workersApi } from "./workers";
 
@@ -90,6 +91,9 @@ const SEED_USER_SETTINGS: UserSettings = {
   // judge_models (mockJudgeModelCells) and edited on Run defaults.
   codex_judge_model: null,
   summary_model: null,
+  // PRD #3248: the Codex summary lane; null = inherit. Resolved per harness into
+  // summary_models (mockSummaryModelCells) and edited on Run defaults.
+  codex_summary_model: null,
   theme: null,
   // PRD #1167 "Lights on" m2: the four raw appearance overrides, all null = inherit
   // the instance defaults.
@@ -278,6 +282,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // Optional so a pre-#362 blob stays valid; absent reads as inherit.
     (u.now_summary_enabled === undefined || u.now_summary_enabled === null || typeof u.now_summary_enabled === "boolean") &&
     (u.summary_model === undefined || u.summary_model === null || typeof u.summary_model === "string") &&
+    // Optional so a pre-#3248 blob stays valid; absent reads as inherit.
+    (u.codex_summary_model === undefined || u.codex_summary_model === null || typeof u.codex_summary_model === "string") &&
     (u.theme === null || typeof u.theme === "string") &&
     // PRD #1167 "Lights on" m2: the four raw appearance overrides, each null-or-string
     // (the SEED provides them going forward; the v4 key bump discards any older blob).
@@ -573,6 +579,13 @@ function mySettingsResponse(): { settings: UserSettings } {
     { claude: userSettings.judge_model, codex: userSettings.codex_judge_model },
     { claude: appSettings.judge_model, codex: appSettings.codex_judge_model },
   );
+  // PRD #3248: both summary cells through the mock summary resolver (pinned by
+  // fixtures/model-settings/summary.json). The instance Codex tier is read only if the
+  // mock's admin settings carry it; otherwise it is unset.
+  const summary_models = mockSummaryModelCells(
+    { claude: userSettings.summary_model, codex: userSettings.codex_summary_model },
+    { claude: appSettings.summary_model, codex: (appSettings as { codex_summary_model?: string }).codex_summary_model },
+  );
   const effort_settings = [
     mockEffortCell("claude", userSettings.default_effort),
     mockEffortCell("codex", userSettings.default_codex_effort),
@@ -583,7 +596,7 @@ function mySettingsResponse(): { settings: UserSettings } {
   const reserve = me
     ? { weekly_reserve_pct: me.weekly_reserve_pct ?? null, weekly_reserve_pause_running: me.weekly_reserve_pause_running ?? true }
     : {};
-  return { settings: { ...userSettings, ...reserve, cross_check_pins, judge_models, effort_settings, default_model: projected ?? null } };
+  return { settings: { ...userSettings, ...reserve, cross_check_pins, judge_models, summary_models, effort_settings, default_model: projected ?? null } };
 }
 
 export let appSettings: AppSettings = loadedSettings.appSettings;
@@ -1484,7 +1497,20 @@ export const settingsApi = {
       if (trimmed !== "" && /\s/.test(trimmed)) {
         throw new ApiError(400, "summary_model must be a single token with no spaces");
       }
+      // The Claude-lane guard (PRD #3248), like judge_model above.
+      if (CODEX_ROLE_MODELS.includes(trimmed)) {
+        throw new ApiError(400, "summary_model: model is a Codex model id");
+      }
       next = { ...next, summary_model: trimmed === "" ? null : trimmed };
+    }
+    if (patch.codex_summary_model !== undefined) {
+      // PRD #3248: blank clears to inherit; otherwise a Codex role id only, mirroring the
+      // server's validateCodexSummaryModel.
+      const trimmed = patch.codex_summary_model?.trim() ?? "";
+      if (trimmed !== "" && !CODEX_ROLE_MODELS.includes(trimmed)) {
+        throw new ApiError(400, `codex_summary_model: "${trimmed}" is not a supported Codex model`);
+      }
+      next = { ...next, codex_summary_model: trimmed === "" ? null : trimmed };
     }
     if (patch.theme !== undefined) {
       const t = patch.theme?.trim() ?? "";

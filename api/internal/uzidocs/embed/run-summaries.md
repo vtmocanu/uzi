@@ -94,14 +94,35 @@ across devices.
 
 ## Which model it runs on
 
-For **Claude** intent and plan summaries, the instance default is **haiku**.
-From **Settings → Run defaults → Run summaries**, the **Summary model** picker
-lets you override that for your own Claude runs; leave it on **Default · instance default** to
-use the instance default. See
-[Admin settings](./admin-settings.md#run-summaries) for the instance-wide setting.
+The intent and plan summaries have **two model settings, one per harness**:
+the Claude lane (`summary_model`) and the Codex lane (`codex_summary_model`),
+each settable per user and per instance. A run reads only the lane of **its own
+harness**, resolving in this order:
 
-**Codex** intent and plan summaries use **gpt-6-luna** with **low** effort.
-They do not follow the Summary model setting and have no fallback model.
+1. your own value for that lane,
+2. the instance value for that lane (set by an admin),
+3. the built-in default: **`haiku`** for Claude, **`gpt-6-luna`** for Codex.
+
+A blank or whitespace-only value counts as unset at every step. A value that
+is not valid for the run's harness is skipped and resolution falls through to
+the next step. The Claude lane rejects Codex role models, and the Codex lane
+accepts only the curated Codex role models, so neither harness is ever handed
+the other's model. If a Codex run's resolved model is somehow not a Codex role
+model, the agent uses the built-in **`gpt-6-luna`** instead.
+
+Codex intent and plan summaries run at **low** effort. From **Settings → Run
+defaults → Run summaries**, the **Summary model** picker sets your own Claude
+value; leave it on **Default · instance default** to use the instance value.
+The Codex value is stored as `codex_summary_model` and shown beside the judge
+models by [`uzi settings get`](./cli.md#plan-cross-check-settings). See
+[Admin settings](./admin-settings.md#run-summaries) for the instance-wide
+Claude setting.
+
+**The Claude value also drives Claude PR descriptions.** A Claude run's PR
+description is written on the same resolved model (falling back to `haiku` when
+that value is not a valid Claude model). Codex PR descriptions do not follow
+either lane: they use a fixed Codex model.
+
 Codex summary calls use the existing run credential and are denied credential
 refresh; an expired credential makes the summary fail.
 The Now summary keeps its separate scheduler, switches and model selection.

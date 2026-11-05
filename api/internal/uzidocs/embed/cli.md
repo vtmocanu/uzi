@@ -3085,13 +3085,17 @@ for resolution, validation and capability requirements.
 
 After the cross-check table, the human output prints a **Model settings**
 table with the columns `SETTING  HARNESS  STORED  DEFAULT  RESOLVED  SOURCE`,
-with judge rows for `claude` and `codex` and two `effort` rows (one per
+with judge rows and run-summary rows (`summary`) for `claude` and `codex`, and two `effort` rows (one per
 harness) for your ordinary [reasoning effort](./worker-effort.md). `SOURCE` is
 `your choice`, `instance default` or `built-in`. `--json` carries the same
 cells as `judge_models` (ordered claude, codex: `harness`, `model`,
 `default_model`, `default_source`, `resolved_model`, `source`; read-only) and
-the stored Codex lane as `codex_judge_model`. See
-[Run judge](./judge.md#which-model-it-runs-on).
+the stored Codex lane as `codex_judge_model`. The `summary` rows are the
+intent/plan summary model for each harness; `--json` carries them as the
+read-only `summary_models` (same cell fields as `judge_models`) and the stored
+Codex lane as `codex_summary_model`. See
+[Run judge](./judge.md#which-model-it-runs-on) and
+[Run summaries](./run-summaries.md#which-model-it-runs-on).
 
 An effort row whose preference is **Runtime default** shows `runtime default`
 in `STORED` and in `RESOLVED` (Claude: `runtime default (value not reported)`),

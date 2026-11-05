@@ -271,6 +271,12 @@ export interface UserSettings {
    *  instance summary_model (which itself falls back to haiku). Written through
    *  PUT /me/settings alongside judge_model, validated by the same model rules. */
   summary_model: string | null;
+  /** Per-user Codex summary model (PRD #3248); null inherits the instance Codex summary
+   *  model, then the built-in. A Codex role id when set. Optional for older servers. */
+  codex_summary_model?: string | null;
+  /** Read-only resolved view of both summary lanes (PRD #3248), claude then codex.
+   *  Never sent on a PUT. Optional for older servers. */
+  summary_models?: ModelSettingCell[];
   theme: string | null;
   /** PRD #1167 "Lights on" (m2): the four RAW per-user appearance overrides, each
    *  null = inherit the instance default. appearance_mode is system|light|dark;
@@ -340,6 +346,8 @@ export interface UserSettingsPatch {
   codex_judge_model?: string | null;
   /** Per-user run-summary model (PRD #362 M2); present-null clears back to inherit. */
   summary_model?: string | null;
+  /** Per-user Codex summary model (PRD #3248); present-null clears back to inherit. */
+  codex_summary_model?: string | null;
   theme?: string | null;
   /** PRD #1167 "Lights on" (m2): tri-state appearance override fields — absent leaves
    *  the field unchanged, present-null clears it back to inherit, a value sets it
