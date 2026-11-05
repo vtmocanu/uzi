@@ -3144,7 +3144,8 @@ export class GitCache {
   }
 
   /** Local recovery clocks, including queued locks and actual child settlement. */
-  async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>, budget?: MaintenanceBudget): Promise<T> {
+  async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>, budget?: MaintenanceBudget,
+    opts?: { closureBudget?: { delivered: number; limit: number } }): Promise<T> {
     const parent = this.recoveryOperations.getStore();
     budget = parent?.budget ?? MaintenanceBudget.current() ?? budget;
     deadline = Math.min(deadline, parent?.deadline ?? Infinity);
@@ -3160,7 +3161,9 @@ export class GitCache {
       combined.throwIfAborted();
       budget?.check();
       return this.recoveryOperations.run({ signal: combined, deadline, budget,
-        closureBudget: parent?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes },
+        // An explicit closureBudget is used by identity (never copied): the caller shares one mutable decoded-byte
+        // account across several operations, independent of the ambient parent's.
+        closureBudget: opts?.closureBudget ?? parent?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes },
         closureCache: parent?.closureCache ?? { identities: new Map(), entries: 0 },
       }, async () => {
         const result = await action(combined);

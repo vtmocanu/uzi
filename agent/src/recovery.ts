@@ -335,6 +335,86 @@ export interface RecoveryOutcome {
   /** Set with `held: "fallback"` when the held FINAL was cleared without a server-stated reason (a bare
    *  downgrade 400 is indistinguishable from a body-read or proxy 400), so it never attests the fallback. */
   heldUnattested?: true;
+  /** Set only by an operation run under a {@link PredecessorOperation} scope when its integrity channel latched
+   *  (see {@link classifyPredecessorRefusal}); the first latched code wins. Absent otherwise. A thrown
+   *  {@link PredecessorAuthorityLost} carries no outcome: the caller stops on the throw itself. */
+  predecessor?: { integrityFailure?: string };
+}
+
+/** Byte/time accounting a predecessor operation fills in for its caller. Mutated in place, never journaled. */
+export interface PredecessorMeasurements {
+  /** Bytes whose upload completed. */
+  uploadedBytes: number;
+  /** Bytes charged against the allowance (charged at upload dispatch and never refunded, so a lost ACK still counts). */
+  chargedBytes: number;
+  uploadCount: number;
+  /** Journaled bundle bytes left unuploaded (allowance refusal or a failed upload). */
+  retainedUnuploadedBytes: number;
+  /** Bytes of a bundle that was already journaled when this operation found it. */
+  reusedBytes: number;
+}
+
+/**
+ * The in-memory authority a runner hands the coordinator to settle a LOWER generation's guarded hold while a later
+ * claim generation of the same run is executing. Never journaled, never serialized; it is honoured only for the
+ * single record it names (see {@link FrozenOperationOptions.predecessor}).
+ */
+export interface PredecessorOperation {
+  /** The executing (successor) claim generation. The operated record's generation must be strictly lower. */
+  claimGeneration: number;
+  /** The repo id the exact hold observation names (the claim's repo). */
+  repoId: string;
+  /** Opaque runner token handed back to the source boundary as {@link InventorySourceBoundaryContext.predecessor}. */
+  boundary: object;
+  /** Synchronous: is the runner's scope (exact tail, held scope, deadline) still valid? Read at every authority check. */
+  live: () => boolean;
+  /** Remaining bytes this operation may upload; mutated (charged) before each upload dispatch. */
+  uploadAllowance: { remaining: number };
+  measurements?: PredecessorMeasurements;
+}
+
+/** Thrown at an authority checkpoint once a predecessor scope's {@link PredecessorOperation.live} is false. The
+ *  caller must stop the whole predecessor pass: nothing was written or dispatched at the throwing checkpoint. */
+export class PredecessorAuthorityLost extends Error {
+  constructor() {
+    super("predecessor authority lost");
+    this.name = "PredecessorAuthorityLost";
+  }
+}
+
+/**
+ * How a refusal code recorded under a predecessor scope is classified. `integrity` latches
+ * {@link RecoveryOutcome.predecessor} (the runner then stops the pass and keeps custody); `ordinary` is a
+ * clean skip. A code absent from both lists is integrity.
+ */
+export const PREDECESSOR_REFUSAL_CLASSES: { readonly integrity: readonly string[]; readonly ordinary: readonly string[] } = {
+  integrity: ["bundle_header", "local_bytes_unverified", "frozen_coverage", "source_proof", "bundle_failed",
+    "bundle_file_missing", "incomplete_local_inputs", "local_bundle_mismatch", "capture_exception",
+    "record_unauthenticated", "record_removed", "inventory_snapshot_changed", "inventory_quiescence_breach"],
+  ordinary: ["coverage_context", "record_or_run_state", "restrictions", "bundle", "mint_denied", "capture_state",
+    "capture_status", "hold_not_open", "hold_settled", "oversized", "source_advanced", "predecessor_observation_refused",
+    "predecessor_upload_budget"],
+};
+
+export function classifyPredecessorRefusal(code: string): "integrity" | "ordinary" {
+  return PREDECESSOR_REFUSAL_CLASSES.ordinary.includes(code) ? "ordinary" : "integrity";
+}
+
+interface PredecessorScope {
+  readonly runId: string;
+  readonly generation: number;
+  readonly captureId: string;
+  readonly claimGeneration: number;
+  readonly repoId: string;
+  readonly boundary: object;
+  readonly live: () => boolean;
+  readonly allowance: { remaining: number };
+  readonly measurements?: PredecessorMeasurements;
+  integrityFailure?: string;
+  /** The denial {@link RecoveryCoordinator}'s mint check last reported inside this scope, for the refusal code. */
+  lastMintDenial?: string;
+  /** Set when the scope's operation returns or throws: a continuation that outlives it has no authority. */
+  ended: boolean;
 }
 
 /** The archive RPC subset {@link RecoveryCoordinator} needs — WorkerClient satisfies it
@@ -416,7 +496,8 @@ export interface RecoveryBundleProducer {
   }): Promise<RecoveryCoverageClaim | undefined>;
   /** Runs `action` under a local recovery clock: every git child and queued repo lock inside it
    *  is clipped to `deadline` and aborted with `signal` ({@link GitCache.withRecoveryOperation}). */
-  withRecoveryOperation?<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>): Promise<T>;
+  withRecoveryOperation?<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>,
+    budget?: MaintenanceBudget, opts?: { closureBudget?: { delivered: number; limit: number } }): Promise<T>;
   produceRecoveryBundle(
     barePath: string,
     opts: { sourceSha: string; outPath: string; forgeTip?: string; guardedDefaultBranch?: string; maxBytes?: number },
@@ -462,6 +543,8 @@ export interface FrozenOperationOptions {
   foreground?: boolean;
   terminal?: { status: "failed" | "cancelled" | "completed"; fail_origin?: string };
   prepare?: (record: RecoveryRecord) => Promise<{ pack: Buffer } | { reason: string }>;
+  /** In-memory only. Settles a lower generation's guarded hold under a successor's execution; see {@link PredecessorOperation}. */
+  predecessor?: PredecessorOperation;
 }
 
 export interface CaptureInput {
@@ -577,6 +660,9 @@ export interface InventorySourceBoundaryContext {
   generation: number;
   barePath: string;
   reportDiagnostic?: (diagnostic: InventorySourceDiagnostic) => unknown;
+  /** The opaque {@link PredecessorOperation.boundary} token, present only for a boundary entered under a predecessor
+   *  scope that names this run and generation. Selects the runner's predecessor boundary; absent for every other caller. */
+  predecessor?: object;
 }
 
 export function inventoryReadCause(inventory: unknown): InventoryReadCause {
@@ -1857,13 +1943,18 @@ export class RecoveryCoordinator {
    *  `inactiveInventory` always has; the field is a fixed code for the re-drive exit diagnostic. */
   private async inactiveInventoryDisqualifier(record: RecoveryRecord): Promise<InactiveField | undefined> {
     const generation = record.generation;
-    if (this.isExecuting(record.runId)) return "executing";
+    if (this.isExecuting(record.runId) && !this.predecessorExecutionExempt(record)) {
+      // Inside a predecessor scope that is no longer live this is lost authority, not an ordinary "the run executes".
+      this.assertPredecessorAuthority();
+      return "executing";
+    }
     if (!this.client.hasFeature?.("recovery_inventory_v1")) return "inventory_feature";
     if (!this.client.getRunOwnership) return "ownership_unsupported";
     if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation <= 0) return "generation";
     let own;
     try { own = await this.recoveryRPC(() => this.client.getRunOwnership!(record.runId, ...this.passSignalArgs())); }
     catch (err) { MaintenanceBudget.current()?.check();
+      this.rethrowPredecessorAuthority(err);
       if (!isRunOwnershipLost(err, record.runId)) return "ownership_lookup_failed";
       // A MAC-authenticated immutable FINAL may only replay; new work needs the exact open hold.
       return (!!(record.inventoryGuarded && record.finalRequest) || await this.openInventoryHold(record))
@@ -1963,7 +2054,7 @@ export class RecoveryCoordinator {
       return settlementIdentity(durable) === identity &&
         canonicalJson(durable.exactHoldBinding) === canonicalJson(binding) &&
         canonicalJson(durable.holdSettlement) === canonicalJson(settlement) ? "settled" : "unknown";
-    } catch { MaintenanceBudget.current()?.check(); return "unknown"; }
+    } catch (err) { MaintenanceBudget.current()?.check(); this.rethrowPredecessorAuthority(err); return "unknown"; }
   }
 
   /**
@@ -2072,9 +2163,13 @@ export class RecoveryCoordinator {
   }
 
   private async inventorySourceBoundary(
-    context: InventorySourceBoundaryContext,
+    ambient: InventorySourceBoundaryContext,
     action: (prove: () => Promise<boolean>) => Promise<void>,
   ): Promise<"passed" | "retained"> {
+    // Only a boundary for the scope's own run and generation carries the runner's predecessor token.
+    const scope = this.predecessorScope.getStore();
+    const context: InventorySourceBoundaryContext = scope && !scope.ended && ambient.runId === scope.runId &&
+      ambient.generation === scope.generation ? { ...ambient, predecessor: scope.boundary } : ambient;
     if (this.withInventorySourceBoundary) return this.withInventorySourceBoundary(context, action);
     // Only positive discovery of zero physical sources permits a callback-free producer.
     const refuse = inventorySourceReporter(context);
@@ -2430,6 +2525,7 @@ export class RecoveryCoordinator {
       if (ancestry === "unproven") {
         this.noteInventoryDiagnostic(record, "source_ancestry_unproven");
         if (replay) { this.operatorRefuse("replay_precondition_unmet:source_ancestry_unproven"); return false; }
+        this.predecessorNote(record.finalRequest ? "inventory_quiescence_breach" : "inventory_snapshot_changed");
         await this.writeExistingRecord(record, cur => ({ ...cur, reason: cur.finalRequest
           ? "inventory_quiescence_breach" : "inventory_snapshot_changed" }));
       }
@@ -2445,6 +2541,7 @@ export class RecoveryCoordinator {
         frozen.contexts.some(producer => canonicalJson(producer) === canonicalJson(context)))))) {
       this.noteInventoryDiagnostic(record, "root_context_uncovered");
       if (replay) { this.operatorRefuse("replay_precondition_unmet:root_context_uncovered"); return false; }
+      this.predecessorNote(record.finalRequest ? "inventory_quiescence_breach" : "inventory_snapshot_changed");
       await this.writeExistingRecord(record, cur => ({ ...cur, reason: cur.finalRequest
         ? "inventory_quiescence_breach" : "inventory_snapshot_changed" }));
       return false;
@@ -2513,7 +2610,14 @@ export class RecoveryCoordinator {
         // FINAL needs the transient grant and every mint requirement.
         if (record.prerequisiteShas.length === 0 || header.selfContained ||
             canonicalJson(header.prerequisiteShas) !== canonicalJson(record.prerequisiteShas)) return this.unmet("bundle_header");
-        if (record.finalRequest ? record.finalRequest.disposition.kind !== "archive" : !await this.closureMintAllowed(record, closureMint)) return this.unmet("bundle_header");
+        if (record.finalRequest) {
+          if (record.finalRequest.disposition.kind !== "archive") return this.unmet("bundle_header");
+        } else if (!await this.closureMintAllowed(record, closureMint)) {
+          // Outside a predecessor scope every denial keeps its single historical code; inside one the integrity-bearing
+          // causes are told apart from a plain absence of mint authority.
+          const scope = this.predecessorScope.getStore();
+          return this.unmet(scope ? scope.lastMintDenial ?? "mint_denied" : "bundle_header");
+        }
         thinArchive = true;
       } else return this.unmet("bundle_header");
     }
@@ -2542,6 +2646,8 @@ export class RecoveryCoordinator {
       const hold = await this.heldOperationState(record);
       if (hold !== "open") return this.heldStopped(record, hold);
       if (!(await this.openInventoryHold(record)) || !await prove() || residueQuarantine() !== undefined) return;
+      // The archive FINAL request is journaled only while the predecessor scope is still live.
+      this.assertPredecessorAuthority();
       record = await this.writeRestrictionCheckedRecord(record, cur => {
         // Refuse only a new archive mint. Saved requests retain their exact replay
         // identity, and held-publication mint sites keep their separate policy.
@@ -2559,6 +2665,7 @@ export class RecoveryCoordinator {
       const replay = this.operatorReplay.getStore();
       if (!this.client.hasFeature?.("recovery_inventory_v1") || !(await this.inactiveInventory(record))) return this.unmet("record_or_run_state");
       if (!await prove() || !await this.inactiveInventory(record)) return this.unmet("source_proof");
+      this.assertPredecessorAuthority();
       // issue #2213: synchronous check immediately before the release (nothing awaited in between).
       if (residueQuarantine() !== undefined) { this.operatorRefuse("worker_quarantined"); return quarantinedOutcome(record.captureId); }
       const hold = await this.heldOperationState(record);
@@ -2567,6 +2674,9 @@ export class RecoveryCoordinator {
       if (!await this.restrictionsAllowCapturedC(record)) return this.unmet("restrictions");
       // The operator's last client checkpoint and point of no return; nothing is awaited before the POST.
       if (replay) this.operatorBeforePost(replay);
+      // Immediately before the one release POST: a predecessor scope that is no longer live stops here, with the
+      // saved request untouched (recoveryRPC re-checks at dispatch, so nothing awaited can slip between).
+      this.assertPredecessorAuthority();
       const ack = await this.recoveryRPC(() => (MaintenanceBudget.current() ? this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition, MaintenanceBudget.current()!.signal) : this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition)));
       if (ack.run_id !== record.runId || ack.generation !== record.generation || ack.released !== true ||
           ack.holds_released !== 1 || ack.retained) {
@@ -2592,6 +2702,7 @@ export class RecoveryCoordinator {
       if (!replay) await this.forgetGenerationWithinCycle(record.runId, record.generation!);
       return { state: "uploaded", captureId: record.captureId };
     } catch (err) { MaintenanceBudget.current()?.check();
+      this.rethrowPredecessorAuthority(err);
       const replay = this.operatorReplay.getStore();
       // Before the POST an operator replay writes and reconciles nothing: the error is the caller's.
       if (replay && !replay.posted) throw err;
@@ -2640,7 +2751,7 @@ export class RecoveryCoordinator {
       const after = await read();
       return !after.blocked && after.fingerprint === facts.fingerprint &&
         identity(await this.requireRecord(current)) === identity(current) && residueQuarantine() === undefined;
-    } catch { MaintenanceBudget.current()?.check(); return false; }
+    } catch (err) { MaintenanceBudget.current()?.check(); this.rethrowPredecessorAuthority(err); return false; }
   }
 
   /** Each excluded root must be divergent from actual captured C. One bounded pass
@@ -2700,15 +2811,35 @@ export class RecoveryCoordinator {
     });
   }
 
-  /** Mint requirements 1-4 for a NEW thin archive FINAL (5 and 6 follow the status read). */
+  /** Mint requirements 1-4 for a NEW thin archive FINAL (5 and 6 follow the status read). Inside a predecessor scope
+   *  the first denial is also left in the scope for the caller's refusal code. */
   private async closureMintAllowed(record: RecoveryRecord, closureMint: ClosureMint): Promise<boolean> {
+    const verdict = await this.closureMintVerdict(record, closureMint);
+    const scope = this.predecessorScope.getStore();
+    if (scope) scope.lastMintDenial = verdict;
+    return verdict === undefined;
+  }
+
+  /** The mint requirements above as a verdict: undefined when allowed,
+   *  else the first denial. The checks are exactly those of {@link verifiedLocalCapture} plus the identity match;
+   *  only the denial is named. `mint_denied` is an absent grant/feature/origin or no journaled bundle (ordinary);
+   *  the others say the journaled bytes or record could not be proven (integrity, see PREDECESSOR_REFUSAL_CLASSES). */
+  private async closureMintVerdict(record: RecoveryRecord, closureMint: ClosureMint):
+    Promise<"mint_denied" | "local_bytes_unverified" | "record_unauthenticated" | "record_removed" | undefined> {
     if (closureMint !== "grant" || !this.client.hasFeature?.(CLOSURE_FEATURE) ||
-        classifyRecoveryOrigin(record.captureId) !== "ordinary") return false;
+        classifyRecoveryOrigin(record.captureId) !== "ordinary") return "mint_denied";
     try {
-      const local = await this.verifiedLocalCapture(record, MaintenanceBudget.current()?.signal);
-      return local !== undefined && local.captureId === record.captureId && local.sourceSha === record.sourceSha &&
-        local.checksum === record.checksum && local.selfContained === false;
-    } catch { MaintenanceBudget.current()?.check(); return false; }
+      const latest = await this.readLatest(record);
+      if (latest.kind !== "ok") return latest.kind === "gone" ? "record_removed" : "record_unauthenticated";
+      const local = latest.record;
+      if (!hasJournaledBundle(local)) return "mint_denied";
+      if (!await verifyJournaledBytes(local, MaintenanceBudget.current()?.signal)) return "local_bytes_unverified";
+      const header = await readRecoveryBundleHeader(local.bundlePath, local.sourceSha);
+      if (header.selfContained !== local.selfContained ||
+          canonicalJson(header.prerequisiteShas) !== canonicalJson(local.prerequisiteShas)) return "local_bytes_unverified";
+      return local.captureId === record.captureId && local.sourceSha === record.sourceSha &&
+        local.checksum === record.checksum && local.selfContained === false ? undefined : "local_bytes_unverified";
+    } catch (err) { MaintenanceBudget.current()?.check(); this.rethrowPredecessorAuthority(err); return "local_bytes_unverified"; }
   }
 
   /** Grant 4: one feature snapshot naming the closure feature and neither held feature. */
@@ -2974,6 +3105,12 @@ export class RecoveryCoordinator {
         if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
       }
       if (!status || !replaceableInventoryStatus(status, record, this.now())) return unknown();
+      // A predecessor never discards a saved FINAL request: its release may already have been committed behind a lost
+      // ACK, and a replacement identity could not replay it. The request, capture id and bundle stay exactly as saved.
+      if (record.finalRequest && this.predecessorScope.getStore()) {
+        await this.retainFinal(record, "final_retry_unknown");
+        return unknown();
+      }
       if (!await this.openInventoryHold(record)) return;
       if (!this.newProductionAllowed(record)) return { state: record.state, captureId: record.captureId, held: "kept" };
       if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
@@ -2995,6 +3132,7 @@ export class RecoveryCoordinator {
         return next;
       });
     } catch (err) { MaintenanceBudget.current()?.check();
+      this.rethrowPredecessorAuthority(err);
       if (record.finalRequest) await this.retainFinal(record, "final_retry_unknown", err);
       else this.log.warn("recovery: capture reconciliation pending; custody retained", { run_id: record.runId, error: errText(err) });
       return unknown();
@@ -3086,15 +3224,35 @@ export class RecoveryCoordinator {
   /** Shared foreground/boot/live ordering, serialized once per frozen generation. */
   async operateFrozenInventory(input: CaptureInput, options: FrozenOperationOptions = {}): Promise<RecoveryOutcome> {
     if (!this.enabled || residueQuarantine() !== undefined) return quarantinedOutcome(input.record.captureId);
-    return this.withCancellationAttempt(input.record, () => this.inAuthority(async () =>
+    const run = () => this.withCancellationAttempt(input.record, () => this.inAuthority(async () =>
       runCaptureCycle(await this.cycleKey(input.record), "wait",
         () => this.frozenOperationCycle(input, options))), undefined, input.onCancellationObserved);
+    if (!options.predecessor) return run();
+    // A predecessor scope is entered only for a lower generation than the executing claim and never inside an
+    // operator replay; anything else is refused before any read, capture or write.
+    const predecessor = options.predecessor;
+    const generation = input.record.generation;
+    if (this.operatorReplay.getStore() || typeof generation !== "number" || !Number.isSafeInteger(generation) ||
+        !Number.isSafeInteger(predecessor.claimGeneration) || generation >= predecessor.claimGeneration) {
+      return { state: input.record.state, captureId: input.record.captureId, reason: "predecessor_observation_refused", held: "kept" };
+    }
+    const scope: PredecessorScope = {
+      runId: input.record.runId, generation, captureId: input.record.captureId,
+      claimGeneration: predecessor.claimGeneration, repoId: predecessor.repoId, boundary: predecessor.boundary,
+      live: predecessor.live, allowance: predecessor.uploadAllowance, measurements: predecessor.measurements, ended: false,
+    };
+    try {
+      const outcome = await this.predecessorScope.run(scope, run);
+      return scope.integrityFailure === undefined ? outcome : { ...outcome, predecessor: { integrityFailure: scope.integrityFailure } };
+    } finally { scope.ended = true; }
   }
 
   private async frozenOperationCycle(input: CaptureInput, options: FrozenOperationOptions = {}): Promise<RecoveryOutcome> {
     let record = await this.requireRecord(input.record);
     const outcome = (held: NonNullable<RecoveryOutcome["held"]>): RecoveryOutcome =>
       ({ state: record.state, captureId: record.captureId, held });
+    const predecessor = this.predecessorScope.getStore();
+    if (predecessor) return this.predecessorCycle(input, record, predecessor);
     if (record.finalAcknowledged) return outcome("acked");
     // Immutable FINAL and valid self-contained archives always precede new held work.
     const selfContainedArchive = record.state === "uploaded" && record.selfContained === true &&
@@ -3327,6 +3485,73 @@ export class RecoveryCoordinator {
     const fresh = await this.requireRecord(record);
     if (archived && !(fresh.state === "uploaded" && !fresh.finalRequest)) return archived;
     return this.captureCycle({ ...input, record: fresh }, "grant");
+  }
+
+  /**
+   * The predecessor branch of {@link frozenOperationCycle}: settle a LOWER generation's guarded hold while a later
+   * claim generation of the same run executes. It never reaches the ordinary grants 1, 3 or 4 nor any held path,
+   * never freezes (the journaled identity is the only identity), and refuses before any capture, bundle install,
+   * reserve, upload, record write or FINAL POST unless a fresh exact observation proves the hold is still the open
+   * guarded hold of a non-terminal run whose current claim generation is strictly above it.
+   *
+   * Two paths need no observation because they rest on immutable local evidence alone: replaying a saved archive
+   * FINAL request, and the FINAL of an already uploaded self-contained zero-prerequisite archive.
+   */
+  private async predecessorCycle(input: CaptureInput, record: RecoveryRecord, scope: PredecessorScope): Promise<RecoveryOutcome> {
+    const outcome = (held: NonNullable<RecoveryOutcome["held"]>): RecoveryOutcome =>
+      ({ state: record.state, captureId: record.captureId, held });
+    if (!record.inventoryGuarded || classifyRecoveryOrigin(record.captureId) !== "ordinary" || record.runId !== scope.runId ||
+        record.generation !== scope.generation || record.captureId !== scope.captureId) return outcome("kept");
+    if (record.finalAcknowledged) return outcome("acked");
+    if (record.heldCreateUncertain === true) return outcome("kept");
+    if (record.finalRequest && record.finalRequest.disposition.kind !== "archive") return outcome("kept");
+    const savedArchive = record.finalRequest?.disposition.kind === "archive";
+    // A closed hold is settled work: no capture, no new FINAL. The one exception is the lost-ACK replay of a saved
+    // archive request whose receipt the closed hold carries verbatim, which only recovers the ACK already committed.
+    if (record.holdSettlement && !(savedArchive && await this.finalHoldAllowsReplay(record, "settled"))) return outcome("settled");
+    const selfContainedArchive = !record.finalRequest && record.state === "uploaded" && record.selfContained === true &&
+      Array.isArray(record.prerequisiteShas) && record.prerequisiteShas.length === 0;
+    if (savedArchive || selfContainedArchive) {
+      this.assertPredecessorAuthority();
+      const final = await this.finalizeInventory(record, true, "deny");
+      const latest = await this.readLatest(record);
+      if (latest.kind === "gone") return final ?? outcome("acked");
+      if (latest.kind !== "ok") { this.predecessorNote("record_unauthenticated"); return outcome("kept"); }
+      record = latest.record;
+      return record.finalAcknowledged ? { ...final, state: record.state, captureId: record.captureId, held: "acked" }
+        : final ?? outcome("kept");
+    }
+    if (!await this.observePredecessorHold(record, scope, input.signal)) {
+      return { state: record.state, captureId: record.captureId, reason: "predecessor_observation_refused", held: "kept" };
+    }
+    this.assertPredecessorAuthority();
+    const result = await this.captureCycle({ ...input, record }, "grant");
+    // The FINAL path reports its ACK only through the journal; name it for the caller.
+    const latest = await this.readLatest(record);
+    return latest.kind === "ok" && latest.record.finalAcknowledged === true && !result.held ? { ...result, held: "acked" } : result;
+  }
+
+  /** Grant-2 evidence for a predecessor, read fresh and strictly: any deviation or failure is "not observed". */
+  private async observePredecessorHold(record: RecoveryRecord, scope: PredecessorScope, signal?: AbortSignal): Promise<boolean> {
+    try {
+      if (!this.predecessorLive(scope) || this.client.hasHeldPublicationV2?.() !== true || !this.client.getExactRecoveryHold ||
+          typeof scope.repoId !== "string" || !HELD_PUBLICATION_ID_RE.test(scope.repoId)) return false;
+      const generation = record.generation!;
+      const listed = await this.recoveryRPC(() => this.client.listRecoveryHolds(record.runId, ...this.passSignalArgs()));
+      if (!listed || listed.run_id !== record.runId || !Array.isArray(listed.holds)) return false;
+      const guarded = listed.holds.filter(h => h.generation === generation && h.inventory_guarded === true);
+      if (guarded.length !== 1) return false;
+      const holdId = guarded[0]!.hold_id;
+      if (typeof holdId !== "string" || !HELD_PUBLICATION_ID_RE.test(holdId)) return false;
+      const bound = record.exactHoldBinding;
+      if (bound && (bound.holdId !== holdId || bound.repoId !== scope.repoId)) return false;
+      const exact = await this.recoveryRPC(() => this.client.getExactRecoveryHold!(record.runId, generation,
+        { holdId, repoId: scope.repoId }, maintenanceSignal(signal)));
+      return !!exact && exact.run_id === record.runId && exact.generation === generation && exact.hold_id === holdId &&
+        exact.repo_id === scope.repoId && exact.inventory_guarded === true && exact.state === "open" &&
+        KNOWN_RUN_STATUSES.has(exact.run_status) && !OPERATOR_TERMINAL_STATUSES.has(exact.run_status) &&
+        Number.isSafeInteger(exact.current_claim_generation) && exact.current_claim_generation > generation;
+    } catch (err) { MaintenanceBudget.current()?.check(); this.rethrowPredecessorAuthority(err); return false; }
   }
 
   private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal, isExecuting = this.isExecuting,
@@ -3572,8 +3797,10 @@ export class RecoveryCoordinator {
     // present but unreadable keeps them (they may be the only copy) and nothing is written.
     const removed = async (err: RecordGoneError): Promise<RecoveryOutcome> => {
       if (!err.absent) {
+        this.predecessorNote("record_unauthenticated");
         return { state: "needs_action", captureId: record.captureId, reason: "record_unauthenticated" };
       }
+      this.predecessorNote("record_removed");
       await this.dropBundleFiles(record);
       return { state: "needs_action", captureId: record.captureId, reason: "record_removed" };
     };
@@ -3581,9 +3808,11 @@ export class RecoveryCoordinator {
       // The authoritative state is the journal's, never the caller's (possibly stale) copy.
       const latest = await this.readLatest(record);
       if (latest.kind === "gone") {
+        this.predecessorNote("record_removed");
         return { state: "needs_action", captureId: record.captureId, reason: "record_removed" };
       }
       if (latest.kind === "unauthenticated") {
+        this.predecessorNote("record_unauthenticated");
         return { state: "needs_action", captureId: record.captureId, reason: "record_unauthenticated" };
       }
       record = latest.record;
@@ -3644,6 +3873,8 @@ export class RecoveryCoordinator {
           return { state: "needs_action", captureId: record.captureId, reason: produced.reason };
         }
         record = produced.record;
+      } else if (this.predecessorScope.getStore()?.measurements) {
+        this.predecessorScope.getStore()!.measurements!.reusedBytes += record.byteSize ?? 0;
       }
       const outcome = await this.uploadJournaledBundle(record, input.signal, "capture");
       if (record.inventoryGuarded && outcome.state === "uploaded") {
@@ -3654,7 +3885,10 @@ export class RecoveryCoordinator {
       }
       return outcome;
     } catch (err) { MaintenanceBudget.current()?.check();
+      this.rethrowPredecessorAuthority(err);
       if (err instanceof RecordGoneError) return removed(err);
+      // An unexpected exception inside a predecessor capture is never read as an ordinary skip.
+      this.predecessorNote("capture_exception");
       this.log.warn("recovery: capture/upload failed; retaining source (needs_action)", {
         run_id: record.runId,
         capture_id: record.captureId,
@@ -3728,6 +3962,8 @@ export class RecoveryCoordinator {
         run_id: record.runId,
         error: errText(err),
       });
+      this.rethrowPredecessorAuthority(err);
+      this.predecessorNote("bundle_failed");
       await this.markFailure(record, "bundle_failed", true);
       return { kind: "needs_action", reason: "bundle_failed" };
     }
@@ -3775,6 +4011,8 @@ export class RecoveryCoordinator {
         if (hasJournaledBundle(cur)) return { kind: "bundled" as const, record: cur };
         if (!this.newProductionAllowed(cur)) return { kind: "source_advanced" as const };
         const header = cur.inventoryGuarded ? await readRecoveryBundleHeader(tmpPath, cur.sourceSha) : undefined;
+        // Before the bundle becomes journaled evidence: a predecessor that lost its authority installs nothing.
+        this.assertPredecessorAuthority();
         await ownedRecoveryIO(() => fs.rename(tmpPath, finalPath));
         const bundled: RecoveryRecord = {
           ...cur,
@@ -3825,10 +4063,12 @@ export class RecoveryCoordinator {
     // issue #2213: refuse before any journal write too (markFailure below), not just before the client call.
     if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
     if (!hasJournaledBundle(record)) {
+      this.predecessorNote("incomplete_local_inputs");
       return this.markFailure(record, "incomplete_local_inputs", swallow);
     }
     if (!(await fileExists(record.bundlePath))) {
       // The verified bundle is gone and we may not reproduce it without a forge PAT (D5).
+      this.predecessorNote("bundle_file_missing");
       return this.markFailure(record, "bundle_file_missing", swallow);
     }
     let current: RecoveryRecord = record;
@@ -3836,6 +4076,16 @@ export class RecoveryCoordinator {
     // issue #2213: synchronous check immediately before the first client call (the awaits above have
     // returned). Nothing is journaled: the record, its bundle and the pin stay exactly as they are.
     if (residueQuarantine() !== undefined) return quarantinedOutcome(current.captureId);
+    // A predecessor spends only its own upload allowance. An upload that cannot fit is refused before the reserve, so
+    // nothing is written, reserved or sent; the journaled bundle stays as local evidence.
+    const predecessor = this.predecessorScope.getStore();
+    const overAllowance = (): RecoveryOutcome | undefined => {
+      if (!predecessor || current.byteSize! <= predecessor.allowance.remaining) return undefined;
+      if (predecessor.measurements) predecessor.measurements.retainedUnuploadedBytes += current.byteSize!;
+      return { state: current.state, captureId: current.captureId, reason: "predecessor_upload_budget" };
+    };
+    const refusedByAllowance = overAllowance();
+    if (refusedByAllowance) return refusedByAllowance;
     if (!current.serverCaptureId) {
       // The authenticated reservation key survives lost ACKs; legacy journals use captureId.
       let reserved: RecoveryReserveResponse;
@@ -3858,6 +4108,7 @@ export class RecoveryCoordinator {
           ...(current.generation !== undefined ? { generation: current.generation } : {}),
         }, ...maintenanceSignalArgs()));
       } catch (err) { MaintenanceBudget.current()?.check();
+        this.rethrowPredecessorAuthority(err);
         return this.failUpload(current, err, signal, mode);
       }
       current = await this.writeExistingRecord(current, (cur) => ({ ...cur, serverCaptureId: reserved.capture_id }));
@@ -3879,6 +4130,14 @@ export class RecoveryCoordinator {
       if (hold !== "open") return this.heldStopped(current, hold);
     }
     if (residueQuarantine() !== undefined) return quarantinedOutcome(current.captureId);
+    if (predecessor) {
+      // Charged synchronously with the dispatch decision and never refunded: a lost answer still spent the bytes.
+      this.assertPredecessorAuthority();
+      const late = overAllowance();
+      if (late) return late;
+      predecessor.allowance.remaining -= current.byteSize!;
+      if (predecessor.measurements) predecessor.measurements.chargedBytes += current.byteSize!;
+    }
     let status: RecoveryCaptureStatusResponse;
     try {
       status = await this.recoveryRPC(() => this.client.uploadRecoveryBundle(
@@ -3889,7 +4148,13 @@ export class RecoveryCoordinator {
         maintenanceSignal(signal),
       ));
     } catch (err) { MaintenanceBudget.current()?.check();
+      this.rethrowPredecessorAuthority(err);
+      if (predecessor?.measurements) predecessor.measurements.retainedUnuploadedBytes += current.byteSize!;
       return this.failUpload(current, err, signal, mode);
+    }
+    if (predecessor?.measurements) {
+      predecessor.measurements.uploadedBytes += current.byteSize!;
+      predecessor.measurements.uploadCount++;
     }
     // A stream already in flight when cleanup ran cannot be recalled; this guarded write then
     // throws RecordGoneError instead of recreating the removed record.
@@ -3990,6 +4255,7 @@ export class RecoveryCoordinator {
       return { state: record.state, captureId: record.captureId, reason: "aborted" };
     }
     const cls = await classifyUploadFailure(err, record);
+    if (cls.kind === "permanent" && cls.reason === "local_bundle_mismatch") this.predecessorNote("local_bundle_mismatch");
     this.log.warn(
       mode === "sweep"
         ? "recovery: restart re-upload failed; retaining source (needs_action)"
@@ -4608,8 +4874,12 @@ export class RecoveryCoordinator {
     const passSignal = this.passSignal.getStore();
     const signal = passSignal ? maintenanceSignal(passSignal) : undefined;
     signal?.throwIfAborted();
+    // A predecessor scope dispatches only while live, and awaits its RPC to settlement: raceIO would let a late answer
+    // outlive the scope's held boundary. runResponseRPC still joins the response with the owning maintenance run.
+    const predecessor = this.predecessorScope.getStore();
+    if (predecessor) this.assertPredecessorAuthority();
     return MaintenanceBudget.runResponseRPC(async () => {
-      const value = await (budget && !passSignal ? budget.raceIO(async () => action()) : action());
+      const value = await (budget && !passSignal && !predecessor ? budget.raceIO(async () => action()) : action());
       signal?.throwIfAborted();
       MaintenanceBudget.current()?.check();
       this.checkSavedMetadata();
@@ -4633,7 +4903,44 @@ export class RecoveryCoordinator {
   private unmet<T = void>(check: string, value?: T): T {
     const scope = this.operatorReplay.getStore();
     if (scope) scope.refusal ??= "replay_precondition_unmet:" + check;
+    this.predecessorNote(check);
     return value as T;
+  }
+
+  /** The ambient predecessor scope (see {@link PredecessorOperation}); entered only by operateFrozenInventory. */
+  private readonly predecessorScope = new AsyncLocalStorage<PredecessorScope>();
+
+  /** Records `code` into the ambient predecessor scope's sticky integrity channel (first integrity code wins).
+   *  Ordinary codes and calls outside a scope change nothing. */
+  private predecessorNote(code: string): void {
+    const scope = this.predecessorScope.getStore();
+    if (scope && scope.integrityFailure === undefined && classifyPredecessorRefusal(code) === "integrity") scope.integrityFailure = code;
+  }
+
+  private predecessorLive(scope: PredecessorScope): boolean {
+    if (scope.ended) return false;
+    try { return scope.live() === true; } catch { return false; }
+  }
+
+  /** Synchronous authority checkpoint: a no-op outside a predecessor scope, otherwise throws
+   *  {@link PredecessorAuthorityLost} once the scope is no longer live. Nothing is awaited here. */
+  private assertPredecessorAuthority(): void {
+    const scope = this.predecessorScope.getStore();
+    if (scope && !this.predecessorLive(scope)) throw new PredecessorAuthorityLost();
+  }
+
+  /** The single exemption of the "executing" disqualifier: the scope names exactly this record, the record's
+   *  generation is strictly below the executing claim generation, and the scope is still live. */
+  private predecessorExecutionExempt(record: RecoveryRecord): boolean {
+    const scope = this.predecessorScope.getStore();
+    return !!scope && !this.operatorReplay.getStore() && scope.runId === record.runId &&
+      scope.generation === record.generation && scope.captureId === record.captureId &&
+      typeof record.generation === "number" && record.generation < scope.claimGeneration && this.predecessorLive(scope);
+  }
+
+  /** An error that must stop the whole predecessor pass can never be reclassified by a best-effort catch. */
+  private rethrowPredecessorAuthority(err: unknown): void {
+    if (err instanceof PredecessorAuthorityLost) throw err;
   }
 
   /** In an operator replay scope: records a specific named refusal (first one wins). */
@@ -6865,6 +7172,8 @@ export class RecoveryCoordinator {
 
   /** Atomic rename with a fresh MAC (0600 file, 0700 dir). The caller holds this run's journal lock. */
   private async writeRecordUnlocked(record: RecoveryRecord): Promise<void> {
+    // The chokepoint of every journal write by a mutator: a lost predecessor scope writes nothing.
+    this.assertPredecessorAuthority();
     this.invalidateCompletionCleanupWitness(record);
     if (!this.key) throw new Error("recovery: MAC key unavailable");
     const mac = this.computeMac(record);
@@ -7155,6 +7464,7 @@ export class RecoveryCoordinator {
       if (alreadyUploaded) return { state: "uploaded", captureId: record.captureId };
       return { state: "needs_action", captureId: record.captureId, reason };
     } catch (err) { MaintenanceBudget.current()?.check();
+      this.rethrowPredecessorAuthority(err);
       if (err instanceof RecordGoneError || !swallow) throw err;
       return { state: "needs_action", captureId: record.captureId, reason };
     }
