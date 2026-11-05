@@ -1,24 +1,52 @@
 import { useState, type FormEvent } from "react";
-import { api, type AppSettings, type SettingsResponse } from "../../lib/api";
+import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { ModelSelect } from "../../components/ModelSelect";
 import { modelFieldWarning } from "../../lib/agentTemplates";
+import { CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { Alert, Button, Card, Field, SectionTitle } from "../../components/ui";
 
+type SummaryKey = "summary_model" | "codex_summary_model";
+
+// pinnedModel is the instance's own pin for one summary lane: "" when it follows the
+// built-in (source "default"), else the stored value. The select's empty option is the
+// reset, so an unpinned instance shows Default selected, not the resolved model.
+function pinnedModel(key: SummaryKey, settings: AppSettings, sources: Record<string, SettingSource>): string {
+  return sources[key] === "default" ? "" : (settings[key] ?? "");
+}
+
+// defaultOptionLabel names the built-in the reset follows. With no defaults from the
+// server (an older API) it stays neutral rather than guessing a model.
+function defaultOptionLabel(builtin: string | undefined): string {
+  return builtin ? `Default · ${builtin} (built-in)` : "Default (built-in)";
+}
+
+const CUSTOM_EMPTY_MESSAGE = "Enter a model ID, or choose Default.";
+
 // SummarySettingsCard is the admin surface for the run-summary model (PRD #362
-// Decision 8): the cheap model the inline plain-English run-summary generator runs
-// on. It uses the curated Claude model picker with a custom-ID escape (no Default
-// option: the value is always a model). The value rides the ISSUE-run claim, not the
-// judge claim, and a per-user override wins where set. Saved independently through the same settings PUT.
+// Decision 8, PRD #3248): the cheap model the inline plain-English run-summary
+// generator runs on, one per harness (Claude | Codex). Each lane is an instance
+// default with a Default option that follows the built-in; a per-user choice under
+// Run defaults wins where set. The values ride the ISSUE-run claim. Saved
+// independently through the same settings PUT, sending only the changed keys.
 export function SummarySettingsCard({
   settings,
+  sources,
+  defaults,
   onSaved,
 }: {
   settings: AppSettings;
+  sources: Record<string, SettingSource>;
+  // The compiled-in defaults from the admin GET, for the "Default · <model> (built-in)" label.
+  defaults: Record<string, string>;
   onSaved: (resp: SettingsResponse) => void;
 }) {
-  const [model, setModel] = useState(settings.summary_model);
+  const pinned = pinnedModel("summary_model", settings, sources);
+  const [model, setModel] = useState(pinned);
   const [modelCustom, setModelCustom] = useState(false);
+  const codexPinned = pinnedModel("codex_summary_model", settings, sources);
+  const [codexModel, setCodexModel] = useState(codexPinned);
+  const [codexCustom, setCodexCustom] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -28,35 +56,48 @@ export function SummarySettingsCard({
   const savedNow = settings.now_summary_enabled !== "false";
   const [nowEnabled, setNowEnabled] = useState(savedNow);
 
-  const modelDirty = model !== settings.summary_model;
+  const modelDirty = model !== pinned;
+  const codexDirty = codexModel !== codexPinned;
   const nowDirty = nowEnabled !== savedNow;
-  const dirty = modelDirty || nowDirty;
+  const dirty = modelDirty || codexDirty || nowDirty;
 
-  // No Default option here (the value is never ""), so an empty custom box or a blank
-  // value is an error; a malformed ID is a warning. Either blocks saving a changed model.
-  const warning = modelFieldWarning(model);
-  const emptyError =
-    model.trim() !== ""
-      ? ""
-      : modelCustom
-        ? "Enter a model ID, or choose a listed model."
-        : "The summary model must not be empty.";
-  const modelInvalid = modelDirty && (warning !== "" || emptyError !== "");
+  // "Other (custom model ID)" with an empty box would otherwise send "" (the reset) while
+  // the picker still shows Other: refuse to save until the ID is filled or Default chosen.
+  const claudeCustomEmpty = modelCustom && model.trim() === "";
+  const codexCustomEmpty = codexCustom && codexModel.trim() === "";
+  const claudeWarning = modelFieldWarning(model);
+  const codexWarning = modelFieldWarning(codexModel);
+  // The Claude lane refuses a Codex role id (the server does too); a Codex id belongs in
+  // the Codex picker.
+  const claudeIsCodexId = CODEX_ROLE_MODELS.includes(model.trim());
+  // A malformed ID blocks only when it is the change being saved: an untouched stored
+  // value is never sent, so it must not lock the other controls.
+  const blocked =
+    claudeCustomEmpty ||
+    codexCustomEmpty ||
+    (modelDirty && (claudeWarning !== "" || claudeIsCodexId)) ||
+    (codexDirty && codexWarning !== "");
+  // A stored instance Claude value that is a Codex id is skipped by Claude summaries in
+  // favour of the built-in. Shown until the admin changes it.
+  const legacyCodexInClaude = !modelDirty && claudeIsCodexId;
 
   const save = async (e: FormEvent) => {
     e.preventDefault();
-    if (modelInvalid) return;
+    if (blocked) return;
     setError("");
     setNotice("");
     setBusy(true);
     try {
-      // Only the changed keys, so saving one control never rewrites the other.
+      // Only the changed keys, so saving one control never rewrites the others. "" is the
+      // reset to the built-in model.
       const resp = await api.updateSettings({
         ...(modelDirty ? { summary_model: model } : {}),
+        ...(codexDirty ? { codex_summary_model: codexModel } : {}),
         ...(nowDirty ? { now_summary_enabled: String(nowEnabled) } : {}),
       });
       onSaved(resp);
-      setModel(resp.settings.summary_model);
+      setModel(pinnedModel("summary_model", resp.settings, resp.sources));
+      setCodexModel(pinnedModel("codex_summary_model", resp.settings, resp.sources));
       setNowEnabled(resp.settings.now_summary_enabled !== "false");
       setNotice("Run summary settings saved.");
     } catch (err) {
@@ -73,9 +114,9 @@ export function SummarySettingsCard({
         <p className="mt-2 text-sm text-muted">
           Each run generates two short plain-English summaries — what it will implement, and what the
           proposed plan will do — on{" "}
-          <strong className="text-fg">the run owner&rsquo;s own Anthropic token</strong>. This sets the
-          instance-default model; a user can override it under their own Settings. Summaries are advisory
-          and never block a run.
+          <strong className="text-fg">the run owner&rsquo;s own credential for the run&rsquo;s harness</strong>{" "}
+          (Anthropic or Codex). These set the instance-default models; a user can override them under their
+          own Settings. Summaries are advisory and never block a run.
         </p>
       </div>
 
@@ -83,32 +124,73 @@ export function SummarySettingsCard({
       {notice && <Alert tone="success" message={notice} />}
 
       <form onSubmit={save} className="space-y-4">
-        <div className="space-y-1.5">
-          <Field label="Summary model" htmlFor="summary-model-admin">
-            <ModelSelect
-              id="summary-model-admin"
-              harness="claude"
-              defaultLabel={null}
-              value={model}
-              onChange={setModel}
-              onCustomModeChange={setModelCustom}
-              customAriaLabel="Custom summary model ID"
-              ariaDescribedBy="summary-model-admin-help"
-            />
-          </Field>
-          {warning && <Alert tone="warning" message={warning} />}
-          {emptyError && (
-            <p className="text-xs text-danger" role="alert">
-              {emptyError}
-            </p>
-          )}
-          <p id="summary-model-admin-help" className="text-xs text-faint">
-            The Claude model the run-summary generator runs on. Choose a listed model, or pick Other to enter
-            a custom model ID. The default is{" "}
-            <code className="rounded bg-raised px-1 py-0.5 text-fg">haiku</code> — fast and near-free, since
-            summaries are light and produced per run. Choose{" "}
+        <div className="space-y-2">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Field label="Claude summary model" htmlFor="summary-model-admin">
+                <ModelSelect
+                  id="summary-model-admin"
+                  harness="claude"
+                  value={model}
+                  onChange={setModel}
+                  onCustomModeChange={setModelCustom}
+                  defaultLabel={defaultOptionLabel(defaults.summary_model)}
+                  customAriaLabel="Custom Claude summary model ID"
+                  ariaDescribedBy="summary-model-admin-state"
+                />
+              </Field>
+              <p id="summary-model-admin-state" className="text-xs text-faint">
+                {model === "" ? "Follows the built-in model." : "Pinned. Choose Default to follow the built-in again."}
+              </p>
+              {legacyCodexInClaude && (
+                <p className="text-xs text-warn" role="status">
+                  Not a Claude model: Claude summaries use the built-in {defaults.summary_model ?? "model"}.
+                  Choose Default to clear it.
+                </p>
+              )}
+              {modelDirty && claudeIsCodexId && (
+                <p className="text-xs text-danger" role="alert">
+                  That is a Codex model. Choose it under Codex summary model instead.
+                </p>
+              )}
+              {claudeCustomEmpty && (
+                <p className="text-xs text-danger" role="alert">
+                  {CUSTOM_EMPTY_MESSAGE}
+                </p>
+              )}
+              {claudeWarning && <Alert tone="warning" message={claudeWarning} />}
+            </div>
+            <div className="space-y-1.5">
+              <Field label="Codex summary model" htmlFor="codex-summary-model-admin">
+                <ModelSelect
+                  id="codex-summary-model-admin"
+                  harness="codex"
+                  value={codexModel}
+                  onChange={setCodexModel}
+                  onCustomModeChange={setCodexCustom}
+                  defaultLabel={defaultOptionLabel(defaults.codex_summary_model)}
+                  customAriaLabel="Custom Codex summary model ID"
+                  ariaDescribedBy="codex-summary-model-admin-state"
+                />
+              </Field>
+              <p id="codex-summary-model-admin-state" className="text-xs text-faint">
+                {codexModel === "" ? "Follows the built-in model." : "Pinned. Choose Default to follow the built-in again."}
+              </p>
+              {codexCustomEmpty && (
+                <p className="text-xs text-danger" role="alert">
+                  {CUSTOM_EMPTY_MESSAGE}
+                </p>
+              )}
+              {codexWarning && <Alert tone="warning" message={codexWarning} />}
+            </div>
+          </div>
+          <p className="text-xs text-faint">
+            A summary runs on the harness of the run it describes, so each harness has its own summary model.
+            Default follows uzi&rsquo;s built-in model, including future changes to it. The built-ins are fast
+            and near-free, since summaries are light and produced per run; pin{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">sonnet</code> or{" "}
-            <code className="rounded bg-raised px-1 py-0.5 text-fg">opus</code> for richer summaries.
+            <code className="rounded bg-raised px-1 py-0.5 text-fg">opus</code> for Claude summaries for
+            richer output. A user&rsquo;s own choice under Settings &rarr; Run defaults wins over these.
           </p>
         </div>
 
@@ -129,7 +211,7 @@ export function SummarySettingsCard({
           </p>
         </div>
 
-        <Button type="submit" disabled={busy || !dirty || modelInvalid}>
+        <Button type="submit" disabled={busy || !dirty || blocked}>
           {busy ? "Saving…" : "Save run summary settings"}
         </Button>
       </form>

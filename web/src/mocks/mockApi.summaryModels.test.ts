@@ -37,7 +37,7 @@ describe("mock user settings: summary lanes (PRD #3248)", () => {
     const { settings } = await api.getMySettings();
     expect(settings.codex_summary_model).toBeNull();
     expect(settings.summary_models).toEqual([
-      { harness: "claude", model: null, default_model: "haiku", default_source: "instance_default", resolved_model: "haiku", source: "instance_default" },
+      { harness: "claude", model: null, default_model: "haiku", default_source: "builtin", resolved_model: "haiku", source: "builtin" },
       { harness: "codex", model: null, default_model: "gpt-6-luna", default_source: "builtin", resolved_model: "gpt-6-luna", source: "builtin" },
     ]);
   });

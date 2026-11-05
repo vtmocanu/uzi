@@ -1183,6 +1183,11 @@ export interface AppSettings {
   // generator runs on (haiku by default), served as a raw string like every other
   // setting. Mirrors judge_model's admin machinery but delivers on the issue-run claim.
   summary_model: string;
+  // codex_summary_model (PRD #3248) is the instance Codex-lane summary model: a Codex role
+  // id, or "" for the built-in (the admin GET reports the built-in with source "default").
+  // summary_model likewise accepts "" as the reset to the built-in haiku.
+  // Optional so an older server (and fixtures that predate it) stay valid.
+  codex_summary_model?: string;
   // Run-health detector keys (PRD #47, #1170). health_enabled is the text "true"/"false".
   // The *_seconds keys are integer seconds as strings; health_near_timeout_pct is a
   // percent of the run's wall-clock budget (0 to disable, else [50, 99]). The API serves

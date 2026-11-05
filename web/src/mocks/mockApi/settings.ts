@@ -34,7 +34,7 @@ import { checkerModelWarning, normalizeCheckerValue } from "../../lib/crossCheck
 import type { CodexAccountMode, CrossCheckPinDTO, EffortSettingCell, Harness } from "../../lib/apiTypes";
 import { CODEX_CURATED_MODELS, CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { MOCK_JUDGE_BUILTINS, mockJudgeModelCells, resolveMockJudgeModel } from "./judgeModels";
-import { mockSummaryModelCells } from "./summaryModels";
+import { MOCK_SUMMARY_BUILTINS, mockSummaryModelCells } from "./summaryModels";
 import { mockDefaultClaudeModel } from "./agents";
 import { workersApi } from "./workers";
 
@@ -172,8 +172,10 @@ const SEED_APP_SETTINGS: AppSettings = {
   // off getReleaseCheck and writes them back here through updateSettings.
   release_check_enabled: "true",
   release_check_banner_enabled: "true",
-  // PRD #362 Decision 8: the run-summary generator model, haiku by default.
-  summary_model: "haiku",
+  // PRD #362 Decision 8: the run-summary generator model. PRD #3248: "" = the built-in
+  // (haiku / gpt-6-luna), reported as source "default" like the judge keys.
+  summary_model: "",
+  codex_summary_model: "",
   health_enabled: "true",
   health_stall_seconds: "300",
   // issue #2046: a single open lead tool call flags a quiet run stalled after 20 minutes.
@@ -342,6 +344,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // Optional so a pre-#362 blob stays valid; a missing summary_model is filled
     // from the seed default ("haiku") on load.
     (a.summary_model === undefined || typeof a.summary_model === "string") &&
+    // PRD #3248: a blob that predates the Codex summary lane is filled from the seed.
+    (a.codex_summary_model === undefined || typeof a.codex_summary_model === "string") &&
     // PRD #2603: a blob that predates now_summary_enabled (undefined) is filled from the
     // seed ("true") on load; a malformed non-string is refused.
     (a.now_summary_enabled === undefined || typeof a.now_summary_enabled === "string") &&
@@ -584,7 +588,7 @@ function mySettingsResponse(): { settings: UserSettings } {
   // mock's admin settings carry it; otherwise it is unset.
   const summary_models = mockSummaryModelCells(
     { claude: userSettings.summary_model, codex: userSettings.codex_summary_model },
-    { claude: appSettings.summary_model, codex: (appSettings as { codex_summary_model?: string }).codex_summary_model },
+    { claude: appSettings.summary_model, codex: appSettings.codex_summary_model },
   );
   const effort_settings = [
     mockEffortCell("claude", userSettings.default_effort),
@@ -645,13 +649,28 @@ function settingsResponse(): SettingsResponse {
     effective.codex_judge_model = MOCK_JUDGE_BUILTINS.codex;
     sources.codex_judge_model = "default";
   }
+  // The summary keys follow the same reset contract (PRD #3248).
+  if (appSettings.summary_model.trim() === "") {
+    effective.summary_model = MOCK_SUMMARY_BUILTINS.claude;
+    sources.summary_model = "default";
+  }
+  if ((appSettings.codex_summary_model ?? "").trim() === "") {
+    effective.codex_summary_model = MOCK_SUMMARY_BUILTINS.codex;
+    sources.codex_summary_model = "default";
+  }
   // The demo has no real socket, so Slack is always "disabled" here.
   return {
     unprotected_users: state.vaultMode === "unprotected" ? 1 : 0,
     settings: effective,
     secrets: { ...slackSecrets },
     sources,
-    defaults: { ...SEED_APP_SETTINGS, judge_model: MOCK_JUDGE_BUILTINS.claude, codex_judge_model: MOCK_JUDGE_BUILTINS.codex },
+    defaults: {
+      ...SEED_APP_SETTINGS,
+      judge_model: MOCK_JUDGE_BUILTINS.claude,
+      codex_judge_model: MOCK_JUDGE_BUILTINS.codex,
+      summary_model: MOCK_SUMMARY_BUILTINS.claude,
+      codex_summary_model: MOCK_SUMMARY_BUILTINS.codex,
+    },
     slack_status: "disabled",
     oidc_status: oidcDemo().oidcStatus,
     oidc_provider_name: oidcDemo().providerName,
@@ -1035,10 +1054,26 @@ export const settingsApi = {
       }
       // summary_model (PRD #362) is a model alias: non-empty single token, mirroring
       // the server's PRD #17 ValidateModel rules.
+      // Trimmed at storage; "" is the reset to the built-in (PRD #3248), and a Codex role id
+      // is refused in the Claude lane like judge_model.
       if (key === "summary_model") {
-        if (value.trim() === "") throw new ApiError(400, `${key}: must not be empty`);
-        if (/\s/.test(value)) throw new ApiError(400, `${key}: must be a single token with no spaces`);
-        (nonSecret as Record<string, string>)[key] = value;
+        const trimmed = value.trim();
+        if (/\s/.test(trimmed)) throw new ApiError(400, `${key}: must be a single token with no spaces`);
+        if (CODEX_ROLE_MODELS.includes(trimmed)) throw new ApiError(400, `${key}: model is a Codex model id`);
+        nonSecret.summary_model = trimmed;
+        continue;
+      }
+      // codex_summary_model (PRD #3248): trimmed, "" resets to the built-in, otherwise any
+      // Codex role id; mirrors the server's validateCodexSummaryModel messages.
+      if (key === "codex_summary_model") {
+        const trimmed = value.trim();
+        if (KNOWN_CLAUDE_ALIASES.includes(trimmed)) {
+          throw new ApiError(400, "codex_summary_model: must be a Codex model; this is a Claude model alias");
+        }
+        if (trimmed !== "" && !CODEX_ROLE_MODELS.includes(trimmed)) {
+          throw new ApiError(400, "codex_summary_model: is not a Codex summary model");
+        }
+        nonSecret.codex_summary_model = trimmed;
         continue;
       }
       // public_base_url must be http(s) (PRD #25).

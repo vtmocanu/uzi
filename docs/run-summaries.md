@@ -76,10 +76,10 @@ from the intent and plan summaries above:
   the run moves, at most once every 5 minutes, and disappears when the run
   waits, parks or ends.
 - **It runs on the run's own harness credential.** Claude runs use `haiku`;
-  Codex runs use `gpt-6-luna`. It does not follow the **Summary model**
-  setting and does not use the delivery-summary model.
+  Codex runs use `gpt-6-luna`. It does not follow the summary model
+  settings and does not use the delivery-summary model.
 - **It is on by default, with its own switches**: a per-user setting and an
-  admin kill switch, separate from the Summary model setting.
+  admin kill switch, separate from the summary model settings.
 - **Its spend counts toward the run's usage.**
 
 It is advisory like the others: a failed, refused or slow call is skipped and
@@ -112,14 +112,16 @@ model, the agent uses the built-in **`gpt-6-luna`** instead.
 
 Codex intent and plan summaries run at **low** effort. From **Settings → Run
 defaults → Run summaries**, the **Claude summary model** picker sets your own
-Claude value and the **Codex summary model** picker your own Codex value; each
-picker shows only for a harness you can run. Leave a picker on its **Default**
+Claude value and the **Codex summary model** picker your own Codex value. The
+Codex picker shows only when you can run Codex, and the Claude picker shows
+unless Codex is the only harness you can use. Leave a picker on its **Default**
 option (it names the model and where it comes from, for example
 `Default · haiku (built-in)`) to inherit; the line under it shows the model in
 effect. [`uzi settings get`](./cli.md#plan-cross-check-settings) prints both
 lanes as `summary` rows. See
 [Admin settings](./admin-settings.md#run-summaries) for the instance-wide
-Claude setting.
+defaults of both lanes (the **Run summaries** card has a Claude and a Codex
+picker, each with a **Default** option that follows the built-in).
 
 **The Claude value also drives Claude PR descriptions.** A Claude run's PR
 description is written on the same resolved model (falling back to `haiku` when
