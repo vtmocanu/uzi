@@ -248,18 +248,11 @@ func TestRepoAgentSourcePlacementMirrorsLiveDB(t *testing.T) {
 	ctx := f.env.ctx
 	f.env.exec(`UPDATE users SET ephemeral_workers_enabled = true WHERE id = $1`, f.user)
 	run := f.startGuardedRun(t, "k", 100)
-	f.env.exec(`UPDATE runs SET status_since = now() - interval '1 hour' WHERE id = $1`, run)
+	plain := f.startPlainPromptRun(t)
+	f.env.exec(`UPDATE runs SET status_since = now() - interval '1 hour' WHERE id = ANY($1)`, []uuid.UUID{run, plain})
 
 	cutoff := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
-	listed := func(rows []uuid.UUID) bool {
-		for _, id := range rows {
-			if id == run {
-				return true
-			}
-		}
-		return false
-	}
-	gap := func() bool {
+	gapFor := func(target uuid.UUID) bool {
 		t.Helper()
 		rows, err := f.env.q.ListUnplaceableQueuedRunsForEphemeral(ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
 			CrossCheckEvaluatedAt: cutoff, CrossCheckAffinityCutoff: cutoff, BackgroundGraceCutoff: cutoff,
@@ -269,12 +262,14 @@ func TestRepoAgentSourcePlacementMirrorsLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ids := make([]uuid.UUID, 0, len(rows))
 		for _, r := range rows {
-			ids = append(ids, r.ID)
+			if r.ID == target {
+				return true
+			}
 		}
-		return listed(ids)
+		return false
 	}
+	gap := func() bool { return gapFor(run) }
 	saturated := func() bool {
 		t.Helper()
 		rows, err := f.env.q.ListSaturationQueuedRunsForEphemeral(ctx, store.ListSaturationQueuedRunsForEphemeralParams{
@@ -285,11 +280,12 @@ func TestRepoAgentSourcePlacementMirrorsLiveDB(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ids := make([]uuid.UUID, 0, len(rows))
 		for _, r := range rows {
-			ids = append(ids, r.ID)
+			if r.ID == run {
+				return true
+			}
 		}
-		return listed(ids)
+		return false
 	}
 
 	f.protocolWorker(t, 0, capability.CIConfigGuardV1)
@@ -299,9 +295,12 @@ func TestRepoAgentSourcePlacementMirrorsLiveDB(t *testing.T) {
 	if saturated() {
 		t.Fatal("with only workers lacking repo_agent_source_v1 online the run is a gap, not slot saturation")
 	}
+	if !gapFor(plain) {
+		t.Fatal("a stamped unpinned run with no other demand must be a capability-gap candidate when only workers lacking repo_agent_source_v1 are online")
+	}
 
 	capable := f.protocolWorker(t, 1, capability.CIConfigGuardV1, capability.RepoAgentSourceV1)
-	if gap() || saturated() {
+	if gap() || saturated() || gapFor(plain) {
 		t.Fatal("a capable worker with room is online: neither a gap nor saturation")
 	}
 

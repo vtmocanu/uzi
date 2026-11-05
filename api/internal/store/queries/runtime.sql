@@ -11290,7 +11290,7 @@ WHERE r.status = 'queued'
   -- the CODE exclusion above keeps known CODE children on their own worker.
   -- PRD #2865: a GUARDED run (ci_config_guard) is demand too: with no worker reporting
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
-  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
+  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
 
   AND NOT EXISTS (
       SELECT 1 FROM workers w
