@@ -204,7 +204,7 @@ func TestCancelRunByWorkerSettlingParityMutants(t *testing.T) {
 	}
 }
 
-func TestNormalizeCancelSQL(t *testing.T) {
+func TestCancelRunByWorkerSettlingNormalizeSQL(t *testing.T) {
 	norm := func(s string) string {
 		t.Helper()
 		got, err := normalizeCancelSQL(s)
