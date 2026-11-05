@@ -382,7 +382,7 @@ const (
 	// cache keeps the cached value.
 	DefaultCompletionInterlockRollout = "true"
 	DefaultHealthStallSeconds         = "300"  // 5m of silence (no tool in flight)
-	DefaultHealthToolCallSeconds      = "1200" // 20m: one lead tool call open this long on a quiet run
+	DefaultHealthToolCallSeconds      = "1200" // 20m: open lead tool call or silent delegation on a quiet run
 	DefaultHealthNearTimeoutPct       = "85"   // PRD #1170: flag at 85% of the run's wall-clock budget
 	DefaultHealthQueuedSeconds        = "600"  // 10m stuck queued
 	DefaultHealthApprovalSeconds      = "3600" // 1h idle awaiting approval
