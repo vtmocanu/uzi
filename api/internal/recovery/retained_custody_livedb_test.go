@@ -24,10 +24,16 @@ func TestRetainedCustodyV1ReleaseRunBeforeHoldLiveDB(t *testing.T) {
 }
 
 func testRetainedCustodyV1ReleaseRunBeforeHoldLiveDB(t *testing.T, cause string) {
-	for _, timed := range []bool{false, true} {
+	for _, timed := range retainedCustodyTimings(cause) {
 		t.Run(fmt.Sprintf("timed=%v", timed), func(t *testing.T) {
 			e := newInventoryEnv(t)
 			e.exec("UPDATE recovery_custody_holds SET inventory_guarded=false WHERE id=$1", e.hold)
+			var capture uuid.UUID
+			var body []byte
+			if cause == "data_volume_full" {
+				capture = e.reserve("disk-release-race")
+				body = e.upload(capture)
+			}
 			ctx, cancel := context.WithTimeout(e.ctx, 8*time.Second)
 			defer cancel()
 			tx, err := e.pool.Begin(ctx)
@@ -47,7 +53,7 @@ func testRetainedCustodyV1ReleaseRunBeforeHoldLiveDB(t *testing.T, cause string)
 			if err := tx.QueryRow(ctx, "SELECT id FROM recovery_custody_holds WHERE id=$1 FOR UPDATE NOWAIT", e.hold).Scan(&id); err != nil {
 				t.Fatalf("v1 release locked hold before run: %v", err)
 			}
-			if _, err := tx.Exec(ctx, "UPDATE runs SET status='recovery_wait', recovery_wait_cause=$3, recovery_retry_not_before=CASE WHEN $2::boolean THEN now()+interval '1 hour' END, claim_released_at=now() WHERE id=$1", e.run, timed, cause); err != nil {
+			if _, err := tx.Exec(ctx, "UPDATE runs SET status='recovery_wait', recovery_wait_cause=$3, recovery_retry_not_before=CASE WHEN $2::boolean THEN now()+interval '1 hour' END, claim_released_at=CASE WHEN $3::text <> 'data_volume_full' THEN now() END WHERE id=$1", e.run, timed, cause); err != nil {
 				t.Fatal(err)
 			}
 			if err := tx.Commit(ctx); err != nil {
@@ -60,6 +66,9 @@ func testRetainedCustodyV1ReleaseRunBeforeHoldLiveDB(t *testing.T, cause string)
 			var retained bool
 			if err := e.pool.QueryRow(e.ctx, "SELECT state='open' AND live_worker_id=$2 AND live_run_id=$3 AND released_at IS NULL FROM recovery_custody_holds WHERE id=$1", e.hold, e.w.ID, e.run).Scan(&retained); err != nil || !retained {
 				t.Fatalf("retained custody retained=%v err=%v", retained, err)
+			}
+			if cause == "data_volume_full" {
+				e.bytes(capture, body)
 			}
 		})
 	}
@@ -74,19 +83,27 @@ func TestRetainedCustodyWorkerFinalReleaseRefusedLiveDB(t *testing.T) {
 }
 
 func testRetainedCustodyWorkerFinalReleaseRefusedLiveDB(t *testing.T, cause string) {
-	for _, timed := range []bool{false, true} {
+	for _, timed := range retainedCustodyTimings(cause) {
 		t.Run(fmt.Sprintf("timed=%v", timed), func(t *testing.T) {
-			for _, kind := range []string{"archive", "settled"} {
+			kinds := []string{"archive", "settled"}
+			if cause == "data_volume_full" {
+				kinds = append(kinds, "archive older generation", "settled older generation")
+			}
+			for _, kind := range kinds {
 				t.Run(kind, func(t *testing.T) {
 					e := newInventoryEnv(t)
 					id := e.reserve("retained-final")
 					body := e.upload(id)
-					e.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause=$3, recovery_retry_not_before=CASE WHEN $2::boolean THEN now()+interval '1 hour' END, claim_released_at=now() WHERE id=$1", e.run, timed, cause)
+					e.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause=$3, recovery_retry_not_before=CASE WHEN $2::boolean THEN now()+interval '1 hour' END, claim_released_at=CASE WHEN $3::text <> 'data_volume_full' THEN now() END WHERE id=$1", e.run, timed, cause)
 					req := e.request(id)
-					if kind == "settled" {
+					if kind == "settled" || kind == "settled older generation" {
 						evidence := "forge_no_output"
 						req = apitypes.RecoveryReleaseRequest{Generation: &e.gen, ReleaseEvidence: &evidence,
 							FinalDisposition: &apitypes.RecoveryFinalDisposition{Kind: "settled", CoverageDigest: emptyInventoryDigest}}
+					}
+					if kind == "archive older generation" || kind == "settled older generation" {
+						// Keep the hold at G=1 while a newer run generation is held.
+						e.exec("UPDATE runs SET claim_generation=2 WHERE id=$1", e.run)
 					}
 					e.reject(e.w, req, ErrNotAuthorized)
 					var state string
@@ -116,13 +133,13 @@ func TestRetainedCustodyLegacyWorkerReleaseRefusedLiveDB(t *testing.T) {
 }
 
 func testRetainedCustodyLegacyWorkerReleaseRefusedLiveDB(t *testing.T, cause string) {
-	for _, timed := range []bool{false, true} {
+	for _, timed := range retainedCustodyTimings(cause) {
 		t.Run(fmt.Sprintf("timed=%v", timed), func(t *testing.T) {
 			e := newInventoryEnv(t)
 			e.exec("UPDATE recovery_custody_holds SET inventory_guarded=false WHERE id=$1", e.hold)
 			id := e.reserve("legacy-retained")
 			body := e.upload(id)
-			e.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause=$3, recovery_retry_not_before=CASE WHEN $2::boolean THEN now()+interval '1 hour' END, claim_released_at=now() WHERE id=$1", e.run, timed, cause)
+			e.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause=$3, recovery_retry_not_before=CASE WHEN $2::boolean THEN now()+interval '1 hour' END, claim_released_at=CASE WHEN $3::text <> 'data_volume_full' THEN now() END WHERE id=$1", e.run, timed, cause)
 			for _, generation := range []*int64{&e.gen, nil} {
 				ack, err := e.svc.Release(e.ctx, e.w, e.run, apitypes.RecoveryReleaseRequest{Generation: generation})
 				if err != nil || ack.Released || ack.HoldsReleased != 0 {
@@ -201,4 +218,24 @@ func TestRetainedCustodyQueuedProofBoundaryLiveDB(t *testing.T) {
 			e.release(e.request(capture))
 		})
 	}
+}
+
+// Disk custody protection applies only to an owner hold, not a finite retry park.
+func retainedCustodyTimings(cause string) []bool {
+	if cause == "data_volume_full" {
+		return []bool{false}
+	}
+	return []bool{false, true}
+}
+
+func TestDiskCustodyV1ReleaseRunBeforeHoldLiveDB(t *testing.T) {
+	testRetainedCustodyV1ReleaseRunBeforeHoldLiveDB(t, "data_volume_full")
+}
+
+func TestDiskCustodyWorkerFinalReleaseRefusedLiveDB(t *testing.T) {
+	testRetainedCustodyWorkerFinalReleaseRefusedLiveDB(t, "data_volume_full")
+}
+
+func TestDiskCustodyLegacyWorkerReleaseRefusedLiveDB(t *testing.T) {
+	testRetainedCustodyLegacyWorkerReleaseRefusedLiveDB(t, "data_volume_full")
 }

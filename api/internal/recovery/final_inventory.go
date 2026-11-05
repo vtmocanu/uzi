@@ -32,6 +32,7 @@ type finalRunFacts struct {
 	gen       int64
 	released  pgtype.Timestamptz
 	parkCause pgtype.Text
+	retry     pgtype.Timestamptz
 }
 
 // finalReplayMatches reports whether a released hold is the receipt of exactly this FINAL.
@@ -52,7 +53,7 @@ func finalInventoryEligible(hold store.RecoveryCustodyHold, workerID uuid.UUID, 
 	}
 	// Requeue exhaustion and memory pressure release the claim but leave custody an owner-only decision
 	// (Resume/Cancel); a worker's archive or settled proof must not end it implicitly.
-	if run.status == "recovery_wait" && run.parkCause.Valid && (run.parkCause.String == "worker_requeue_exhausted" || run.parkCause.String == "worker_memory_pressure" || run.parkCause.String == "retained_recovery_exhausted" || run.parkCause.String == "retained_recovery_adoption_failed") {
+	if run.status == "recovery_wait" && run.parkCause.Valid && (run.parkCause.String == "worker_requeue_exhausted" || run.parkCause.String == "worker_memory_pressure" || run.parkCause.String == "retained_recovery_exhausted" || run.parkCause.String == "retained_recovery_adoption_failed" || (run.parkCause.String == "data_volume_full" && !run.retry.Valid)) {
 		return false
 	}
 	// A forge_unreachable park is a pre-clone park of a generation that may have adopted nothing:
@@ -106,8 +107,9 @@ func (s *Service) releaseFinalInventory(ctx context.Context, wkr store.Worker, r
 	var worker pgtype.UUID
 	var released pgtype.Timestamptz
 	var parkCause pgtype.Text
-	err = tx.QueryRow(ctx, "SELECT status, claim_generation, worker_id, claim_released_at, recovery_wait_cause FROM runs WHERE id=$1 AND user_id=$2 FOR UPDATE",
-		runID, wkr.UserID).Scan(&status, &gen, &worker, &released, &parkCause)
+	var retry pgtype.Timestamptz
+	err = tx.QueryRow(ctx, "SELECT status, claim_generation, worker_id, claim_released_at, recovery_wait_cause, recovery_retry_not_before FROM runs WHERE id=$1 AND user_id=$2 FOR UPDATE",
+		runID, wkr.UserID).Scan(&status, &gen, &worker, &released, &parkCause, &retry)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
@@ -135,7 +137,7 @@ func (s *Service) releaseFinalInventory(ctx context.Context, wkr store.Worker, r
 		return apitypes.RecoveryReleaseResponse{}, ErrManifestConflict
 	}
 	forgeNoOutput := f.Kind == "settled" && *req.ReleaseEvidence == "forge_no_output"
-	if !finalInventoryEligible(hold, wkr.ID, finalRunFacts{status, gen, released, parkCause}, *req.Generation, forgeNoOutput) {
+	if !finalInventoryEligible(hold, wkr.ID, finalRunFacts{status, gen, released, parkCause, retry}, *req.Generation, forgeNoOutput) {
 		return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
 	}
 	evidence := "archive"
