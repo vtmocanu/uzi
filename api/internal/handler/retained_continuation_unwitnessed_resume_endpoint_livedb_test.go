@@ -3,13 +3,18 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // TestUnwitnessedParkResumeRouteLiveDB drives the owner's Resume through the REAL router (a uzc_
@@ -17,6 +22,10 @@ import (
 // direct-handler test beside it: a run parked at retained_continuation_unwitnessed is re-queued
 // with the worker-recovery episode advanced, worker affinity kept, the cause cleared and every
 // custody hold byte for byte untouched. A foreign owner's token gets a 404 and changes nothing.
+// After the Resume the released-incarnation fence holds: the same worker registration cannot
+// claim it, and the same worker after a re-registration (a fixture event here, not a claim that
+// the earlier source use ended) can. The repeated refusal bound in the new episode is driven
+// through the sweep in workersvc's TestUnwitnessedParkResumeClaimFenceLiveDB.
 func TestUnwitnessedParkResumeRouteLiveDB(t *testing.T) {
 	_, router, pool := cliLiveDB(t)
 	ctx := context.Background()
@@ -37,8 +46,8 @@ func TestUnwitnessedParkResumeRouteLiveDB(t *testing.T) {
 	otherTok := cliMintToken(t, pool, other, clitoken.ScopeUser)
 	repo := cliSeedOwnedRepo(t, pool, owner)
 	worker := uuid.New()
-	cliMustExec(t, pool, `INSERT INTO workers(id,user_id,name,token_hash,status,last_heartbeat_at)
- VALUES($1,$2,$3,$4,'online',now())`, worker, owner, worker.String(), worker[:])
+	cliMustExec(t, pool, `INSERT INTO workers(id,user_id,name,token_hash,status,last_heartbeat_at,snapshot_register_nonce,snapshot_epoch)
+ VALUES($1,$2,$3,$4,'online',now(),'parked',1)`, worker, owner, worker.String(), worker[:])
 	run := uuid.New()
 	cliMustExec(t, pool, `INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status,
  recovery_wait_cause,claim_generation,worker_id,claim_released_at,released_worker_id,released_worker_nonce,
@@ -109,5 +118,40 @@ func TestUnwitnessedParkResumeRouteLiveDB(t *testing.T) {
 	}
 	if got := holds(); got != holdsBefore {
 		t.Fatalf("Resume changed custody holds:\n%s\n%s", holdsBefore, got)
+	}
+	var relWorker uuid.UUID
+	var relNonce string
+	var baseline, count int64
+	if err := pool.QueryRow(ctx, `SELECT released_worker_id, released_worker_nonce, requeue_episode_baseline, requeue_count FROM runs WHERE id=$1`, run).
+		Scan(&relWorker, &relNonce, &baseline, &count); err != nil {
+		t.Fatal(err)
+	}
+	if relWorker != worker || relNonce != "parked" || baseline != count {
+		t.Fatalf("released pair = (%s, %q), baseline=%d count=%d; want (%s, \"parked\") and the episode re-baselined to the count",
+			relWorker, relNonce, baseline, count, worker)
+	}
+
+	q := store.New(pool)
+	claim := func() (store.Run, error) {
+		return q.ClaimRun(ctx, store.ClaimRunParams{
+			WorkerID: pgconv.UUID(worker), UserID: owner, CapabilityAware: true,
+			WorkerCaps: []string{}, WorkerProtocolCaps: []string{}, DockerRepoAllowlist: []uuid.UUID{},
+			CustodyHoldLimit: 10, SnapshotFreshCutoff: pgconv.Time(time.Now().Add(-time.Minute)),
+			RequestActiveIds: []uuid.UUID{}, RequestActiveGens: []int64{},
+			WorkerIdentity: "parked incarnation", BackgroundGraceCutoff: pgconv.Time(time.Now()),
+		})
+	}
+	resumed := read()
+	if _, err := claim(); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("the released incarnation claimed the resumed run (err=%v), want it fenced", err)
+	}
+	if got := read(); got != resumed || holds() != holdsBefore {
+		t.Fatalf("the fenced claim changed the run: %+v", got)
+	}
+	cliMustExec(t, pool, `UPDATE workers SET snapshot_register_nonce='re-registered', snapshot_epoch=2 WHERE id=$1`, worker)
+	claimed, err := claim()
+	if err != nil || claimed.ID != run || claimed.ClaimGeneration != resumed.generation+1 || claimed.ClaimReleasedAt.Valid {
+		t.Fatalf("re-registered claim = (%s gen %d released=%v, %v), want %s at generation %d with the claim held",
+			claimed.ID, claimed.ClaimGeneration, claimed.ClaimReleasedAt.Valid, err, run, resumed.generation+1)
 	}
 }
