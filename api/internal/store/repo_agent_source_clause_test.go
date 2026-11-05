@@ -1,8 +1,8 @@
 package store_test
 
 import (
+	"io/fs"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -19,15 +19,25 @@ var repoAgentSourceInsertExempt = map[string]string{
 }
 
 func TestRepoAgentSourceRequiredStampedOnEveryRunInsert(t *testing.T) {
-	files, err := filepath.Glob("queries/*.sql")
-	if err != nil || len(files) == 0 {
-		t.Fatalf("glob queries: %v (%d files)", err, len(files))
+	queries := os.DirFS("queries")
+	entries, err := fs.ReadDir(queries, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			files = append(files, e.Name())
+		}
+	}
+	if len(files) == 0 {
+		t.Fatal("no query files")
 	}
 	insert := regexp.MustCompile(`(?i)INSERT\s+INTO\s+runs\s*\(`)
 	seen := map[string]bool{}
 	stamped := 0
 	for _, f := range files {
-		raw, err := os.ReadFile(f)
+		raw, err := fs.ReadFile(queries, f)
 		if err != nil {
 			t.Fatal(err)
 		}
