@@ -209,15 +209,15 @@ The **Run summaries** card sets the instance default model for
 - **Claude summary model** is a picker of the curated Claude models (`opus`,
   `sonnet`, `haiku`, `fable`) plus **Other (custom model ID)**. A Codex model
   is refused here: choose it in the Codex picker.
-- **Codex summary model** is a picker of the Codex models plus **Other
-  (custom model ID)**. A Claude alias is refused here.
+- **Codex summary model** is a picker of the Codex role models (including
+  `gpt-6-luna`), with no custom ID. A Claude alias is refused here.
 - Each picker has a reset option, `Default · <model> (built-in)`, naming what
   it follows (`haiku` for Claude, `gpt-6-luna` for Codex). It is selected
   while the instance has not pinned a model, and choosing it and saving clears
   the pin so the lane follows the built-in again, including future changes to
   it. Saving sends only the lanes you changed.
-- An invalid ID (interior spaces, control or format characters, or too long) or
-  an empty custom ID is blocked before save, with a message beneath the
+- In the Claude picker, an invalid ID (interior spaces, control or format
+  characters, or too long) or an empty custom ID is blocked before save, with a message beneath the
   picker; an unchanged stored value does not block saving the other controls.
 
 Each user can override either lane for their own runs from **Settings → Run

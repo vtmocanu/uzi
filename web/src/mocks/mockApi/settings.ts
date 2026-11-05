@@ -342,7 +342,7 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.judge_cooldown_seconds === "string" &&
     typeof a.judge_daily_budget === "string" &&
     // Optional so a pre-#362 blob stays valid; a missing summary_model is filled
-    // from the seed default ("haiku") on load.
+    // from the seed ("", the built-in) on load.
     (a.summary_model === undefined || typeof a.summary_model === "string") &&
     // PRD #3248: a blob that predates the Codex summary lane is filled from the seed.
     (a.codex_summary_model === undefined || typeof a.codex_summary_model === "string") &&

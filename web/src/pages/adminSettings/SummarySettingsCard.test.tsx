@@ -3,6 +3,7 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { SummarySettingsCard } from "./SummarySettingsCard";
+import { CODEX_ROLE_MODELS } from "../../lib/codexModels";
 import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
 
 vi.mock("../../lib/api", async (importOriginal) => {
@@ -70,10 +71,16 @@ describe("SummarySettingsCard Claude | Codex pair (#3248)", () => {
     expect(codexPicker().value).toBe("gpt-6-astra");
   });
 
-  it("offers Codex role models in the Codex picker, not Claude aliases", () => {
+  it("offers exactly the Codex role models in the Codex picker, with no custom entry", () => {
     render(<Harness claude="" codex="" />);
-    expect(Array.from(codexPicker().options).map((o) => o.value)).toContain("gpt-6-astra");
-    expect(Array.from(codexPicker().options).map((o) => o.value)).not.toContain("sonnet");
+    const values = Array.from(codexPicker().options).map((o) => o.value).filter((v) => v !== "inherit");
+    expect(values).toEqual([...CODEX_ROLE_MODELS]);
+  });
+
+  it("selects a stored gpt-6-luna as itself, not as a custom ID", () => {
+    render(<Harness claude="" codex="gpt-6-luna" />);
+    expect(codexPicker().value).toBe("gpt-6-luna");
+    expect(screen.queryByRole("textbox", { name: "Custom Codex summary model ID" })).toBeNull();
   });
 
   it("sends only the changed Codex key", async () => {

@@ -165,6 +165,7 @@ export function SummarySettingsCard({
                 <ModelSelect
                   id="codex-summary-model-admin"
                   harness="codex"
+                  models={CODEX_ROLE_MODELS}
                   value={codexModel}
                   onChange={setCodexModel}
                   onCustomModeChange={setCodexCustom}
