@@ -711,7 +711,7 @@ func (s *Service) ListHoldsForWorkerRun(ctx context.Context, wkr store.Worker, r
 		row, err := s.store.CountOpenHoldsForOwnedRun(ctx, store.CountOpenHoldsForOwnedRunParams{RunID: runID, UserID: wkr.UserID})
 		switch {
 		case err == nil:
-			resp.OpenHoldsAllWorkers = &apitypes.RecoveryRunOpenHolds{RunID: row.RunID.String(), Count: row.OpenHolds}
+			resp.RunOpenHolds = &apitypes.RecoveryRunOpenHolds{RunID: row.RunID.String(), Count: row.OpenHolds}
 		case errors.Is(err, pgx.ErrNoRows):
 		default:
 			slog.Warn("recovery holds: run-wide open-hold count failed", "run", runID, "error", err)

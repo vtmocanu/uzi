@@ -58,7 +58,7 @@ func TestListHoldsForWorkerRunOpenHoldCount(t *testing.T) {
 	t.Run("capability off omits the field and never queries", func(t *testing.T) {
 		st := &openHoldsStore{list: []store.ListCustodyHoldsForWorkerRunRow{hold}, count: 9}
 		res, err := New(st, nil, nil, Limits{}, nil).ListHoldsForWorkerRun(context.Background(), wkr(capability.RecoveryBindinglessClosedV1), run)
-		if err != nil || res.OpenHoldsAllWorkers != nil || len(st.calls) != 0 {
+		if err != nil || res.RunOpenHolds != nil || len(st.calls) != 0 {
 			t.Fatalf("res=%+v err=%v count calls=%d", res, err, len(st.calls))
 		}
 		if got := marshal(res); got != baseline {
@@ -73,8 +73,8 @@ func TestListHoldsForWorkerRunOpenHoldCount(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res.OpenHoldsAllWorkers == nil || res.OpenHoldsAllWorkers.RunID != run.String() || res.OpenHoldsAllWorkers.Count != 5 {
-			t.Fatalf("count = %+v, want run %s count 5", res.OpenHoldsAllWorkers, run)
+		if res.RunOpenHolds == nil || res.RunOpenHolds.RunID != run.String() || res.RunOpenHolds.Count != 5 {
+			t.Fatalf("count = %+v, want run %s count 5", res.RunOpenHolds, run)
 		}
 		if len(res.Holds) != 1 || res.Holds[0].HoldID != hold.ID.String() {
 			t.Fatalf("holds = %+v", res.Holds)
@@ -82,7 +82,7 @@ func TestListHoldsForWorkerRunOpenHoldCount(t *testing.T) {
 		if len(st.calls) != 1 || st.calls[0].RunID != run || st.calls[0].UserID != w.UserID {
 			t.Fatalf("count params = %+v, want run %s user %s", st.calls, run, w.UserID)
 		}
-		want := `"open_holds_all_workers":{"run_id":"` + run.String() + `","count":5}`
+		want := `"run_open_holds":{"run_id":"` + run.String() + `","count":5}`
 		if got := marshal(res); got != baseline[:len(baseline)-1]+","+want+"}" {
 			t.Fatalf("body = %s", got)
 		}
@@ -91,7 +91,7 @@ func TestListHoldsForWorkerRunOpenHoldCount(t *testing.T) {
 	t.Run("a real zero is emitted", func(t *testing.T) {
 		st := &openHoldsStore{count: 0}
 		res, err := New(st, nil, nil, Limits{}, nil).ListHoldsForWorkerRun(context.Background(), wkr(capability.RecoveryRunOpenHoldsV1), run)
-		if err != nil || res.OpenHoldsAllWorkers == nil || res.OpenHoldsAllWorkers.Count != 0 {
+		if err != nil || res.RunOpenHolds == nil || res.RunOpenHolds.Count != 0 {
 			t.Fatalf("res=%+v err=%v", res, err)
 		}
 	})
@@ -100,7 +100,7 @@ func TestListHoldsForWorkerRunOpenHoldCount(t *testing.T) {
 		t.Run(name+" omits the field and keeps the list", func(t *testing.T) {
 			st := &openHoldsStore{list: []store.ListCustodyHoldsForWorkerRunRow{hold}, countErr: countErr}
 			res, err := New(st, nil, nil, Limits{}, nil).ListHoldsForWorkerRun(context.Background(), wkr(capability.RecoveryRunOpenHoldsV1), run)
-			if err != nil || res.OpenHoldsAllWorkers != nil || len(res.Holds) != 1 {
+			if err != nil || res.RunOpenHolds != nil || len(res.Holds) != 1 {
 				t.Fatalf("res=%+v err=%v", res, err)
 			}
 			if got := marshal(res); got != baseline {
