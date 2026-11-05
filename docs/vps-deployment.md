@@ -19,6 +19,8 @@ Step 3 adds two more services: Caddy, which serves HTTPS and passes the traffic 
 
 The stack comes from the [server Compose file](../deploy/compose/compose.yaml) of a release, with signed images of the same release. Its worker has no Docker inside; see [Worker setup](./worker-setup.md) for other workers.
 
+This tutorial connects a GitHub repository. For GitLab or Forgejo, the forge address in Step 2 and the connection in Step 7 differ: see the [GitLab](./gitlab-bot-setup.md) or [Forgejo](./forgejo-bot-setup.md) bot guide.
+
 Allow about 15 minutes once the prerequisites are ready. A script of these steps took about 3 minutes on a new 4 vCPU, 8 GB server, and the image download took 2 of them.
 
 New words such as forge, worker or plan gate are in the [Glossary](./glossary.md).
@@ -39,7 +41,7 @@ New words such as forge, worker or plan gate are in the [Glossary](./glossary.md
 
 **The accounts**
 
-7. A bot account on your forge, with its token, added to your repository. uzi works through this account, never through yours. Follow steps 1 to 4 of the [GitHub bot setup](./github-bot-setup.md). For GitLab or Forgejo, follow the [GitLab](./gitlab-bot-setup.md) or [Forgejo](./forgejo-bot-setup.md) guide.
+7. A GitHub bot account, with its token, added to your repository. uzi works through this account, never through yours. Follow steps 1 to 4 of the [GitHub bot setup](./github-bot-setup.md).
 8. A model login. For Codex, sign in with a login only for uzi, as in step 1 of [Codex credentials](./codex-credentials.md#1-sign-in-with-a-login-dedicated-to-uzi). A person must do this sign-in. For Claude, see [Anthropic token](./anthropic-token.md).
 
 **The backup**
@@ -63,7 +65,7 @@ UZI_VERSION=$(curl -fsS https://api.github.com/repos/vtmocanu/uzi/releases/lates
 echo "$UZI_VERSION"
 ```
 
-To install another release from [GitHub Releases](https://github.com/vtmocanu/uzi/releases), set its number by hand instead, for example `UZI_VERSION='0.86.1'`.
+To install another release from [GitHub Releases](https://github.com/vtmocanu/uzi/releases), set its number by hand instead: `UZI_VERSION='X.Y.Z'`, with `X.Y.Z` replaced by the number.
 
 Download the three files of that release. If `curl` stops with a 404 error, the release is older than the server Compose file: choose a newer one.
 
@@ -83,16 +85,18 @@ bash scripts/init-env.sh
 printf '\nUZI_VERSION=%s\n' "$UZI_VERSION" >> .env
 ```
 
-Check the signatures of the three images. Each image prints `ok`. Stop if one prints `FAILED`:
+Check the signatures of the three images. Each image prints `ok`. If one prints `FAILED`, the block ends with an error: stop, and do not continue the installation.
 
 ```sh
-for image in api web agent-base; do
-  cosign verify \
-    --certificate-identity "https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/v${UZI_VERSION}" \
-    --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-    "ghcr.io/vtmocanu/uzi/${image}:${UZI_VERSION}" > /dev/null || { echo "$image FAILED"; break; }
-  echo "$image ok"
-done
+(
+  for image in api web agent-base; do
+    cosign verify \
+      --certificate-identity "https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/v${UZI_VERSION}" \
+      --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+      "ghcr.io/vtmocanu/uzi/${image}:${UZI_VERSION}" > /dev/null || { echo "$image FAILED" >&2; exit 1; }
+    echo "$image ok"
+  done
+)
 ```
 
 See [Container signing](./container-signing.md) for what the signature proves.
@@ -116,8 +120,7 @@ UZI_PUBLIC_BASE_URL=https://your_domain
 UZI_SEED_EMAIL=you@example.com
 UZI_SEED_PASSWORD='replace-with-a-unique-admin-password'
 
-# The forge that uzi may connect to. Use https://gitlab.com or your own
-# GitLab or Forgejo URL for those forges.
+# The forge that uzi may connect to. This tutorial covers GitHub.
 FORGE_ALLOWED_BASE_URLS=https://github.com
 
 # --- Set these as shown ---
@@ -138,7 +141,7 @@ UZI_WORKER_TOKEN=
 
 ## Step 3 - Add Caddy and the backup to the stack
 
-Two small Compose files add HTTPS and a daily database dump to the stack.
+Two small Compose files add HTTPS and a daily database dump to the stack. Both pin their image by digest, as `compose.yaml` does for `postgres`, so a changed tag cannot change the image.
 
 Write `caddy.yaml`. Caddy takes your domain from `FRONTEND_ORIGIN` in `.env`, gets its certificate by itself and sends all traffic to `web`:
 
@@ -146,7 +149,7 @@ Write `caddy.yaml`. Caddy takes your domain from `FRONTEND_ORIGIN` in `.env`, ge
 cat > caddy.yaml <<'EOF'
 services:
   caddy:
-    image: caddy:2.10
+    image: caddy:2.10@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5da182adb
     restart: unless-stopped
     command: caddy reverse-proxy --from ${FRONTEND_ORIGIN} --to web:8080
     ports:
@@ -169,7 +172,7 @@ Write `backup.yaml`. It dumps the database 5 minutes after the start, then once 
 cat > backup.yaml <<'EOF'
 services:
   db-backup:
-    image: docker.io/nfrastack/db-backup:5.0.5
+    image: docker.io/nfrastack/db-backup:5.0.5@sha256:012122061dc0851030207f70b3d6187ba7d1ef60cc58180507d157b80646f5fb
     restart: unless-stopped
     environment:
       TIMEZONE: Etc/UTC
@@ -214,6 +217,8 @@ The API updates the database at each start. If a service fails, read its log, fo
 Steps 6 and 7 call the uzi API with your admin session. The `uzi` CLI cannot do these steps yet: [vtmocanu/uzi#3760](https://github.com/vtmocanu/uzi/issues/3760) asks for a setup command on the server for them.
 
 ```sh
+# New files are readable only by you: the session cookie here, auth.json in Step 7.
+umask 077
 URL=https://your_domain
 # Type the admin password. The terminal does not show it.
 read -rs UZI_PASSWORD
@@ -229,7 +234,7 @@ CSRF=$(awk '$6=="uzi_csrf"{print $7}' uzi-cookies)
 api() { curl -fsS -b uzi-cookies -H "Origin: $URL" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' "$@"; }
 ```
 
-You delete `uzi-cookies` at the end of Step 7.
+Run Steps 5 to 7 in the same shell, so that `umask`, `URL` and `api` stay set. You delete `uzi-cookies` at the end of Step 7.
 
 ## Step 6 - Start the worker
 
@@ -286,17 +291,26 @@ api "$URL/api/repos/$REPO/board" | grep -q 'Human Review' && echo 'board ready'
 Copy the `auth.json` that the Codex sign-in wrote into `/opt/uzi`, then store the login:
 
 ```sh
+chmod 600 auth.json
 jq '{token: ({access_token:.tokens.access_token, refresh_token:.tokens.refresh_token} | tojson), label:"uzi-codex", default:true}' auth.json \
   | api --data @- "$URL/api/me/secrets/codex_auth" > /dev/null
 ```
 
+uzi first stores the login as `staging`, then links it to the Codex account. Check that it prints `linked`. If it prints `staging`, wait a few seconds and run it again:
+
+```sh
+api "$URL/api/me/secrets" | jq -r '.secrets[] | select(.label=="uzi-codex") | .codex_status'
+```
+
 Delete `auth.json` and `uzi-cookies`.
 
-Your worker can now take an issue from this repository.
+When the login shows `linked`, your worker can take an issue from this repository.
 
 ## Step 8 - Back up uzi
 
 A backup needs two things together: a database dump and `.env`. A dump without the `UZI_SECRET_KEY` of its `.env` cannot give back the encrypted tokens.
+
+This backup leaves out the worker volume `agentdata`. It holds the clones of your repositories, the recovery bundles of runs, and run work that the worker has not pushed yet. A restore from these files loses that data. Work that a run pushed to the forge stays there.
 
 The `db-backup` service of Step 3 writes a dump each day. Make a first dump now, and check that a file appears:
 
@@ -310,8 +324,20 @@ Copy `/opt/uzi/backups`, `.env`, `compose.yaml`, `caddy.yaml` and `backup.yaml` 
 ## Upgrades
 
 1. Take a backup, as in Step 8.
-2. Download the files of the new release into a separate folder, with the commands of Step 1. Compare them with your files, and carry your own changes over. Never overwrite `.env`: add only the new entries that the release notes ask for.
-3. Set `UZI_VERSION` in `.env` to the new number, and check the signatures as in Step 1.
+2. Download the two files of the new release into a separate folder, and compare them with your files. Do not run `init-env.sh` here: it is for a new install only.
+
+   ```sh
+   mkdir -p ~/uzi-next && cd ~/uzi-next
+   UZI_VERSION='X.Y.Z'
+   BASE="https://raw.githubusercontent.com/vtmocanu/uzi/v${UZI_VERSION}"
+   curl -fsSLo compose.yaml "$BASE/deploy/compose/compose.yaml"
+   curl -fsSLo .env.example "$BASE/.env.example"
+   diff -u /opt/uzi/compose.yaml compose.yaml
+   diff -u /opt/uzi/.env.example .env.example
+   ```
+
+   Copy both files into `/opt/uzi`, and carry your own changes of `compose.yaml` over. Never overwrite `.env`: add only the new entries that the release notes ask for.
+3. In `/opt/uzi`, set `UZI_VERSION` in `.env` to the new number, and run the signature check of Step 1 in the same shell.
 4. Wait until the worker has no active run. Then pull and restart:
 
 ```sh

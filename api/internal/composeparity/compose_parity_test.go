@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -91,9 +93,49 @@ var restartServices = []string{"db", "api", "web", "agent"}
 func parity(root, server map[string]any) error {
 	expected := serverFromRoot(root)
 	if !reflect.DeepEqual(expected, server) {
-		return fmt.Errorf("server differs from exact root transformation\nwant: %#v\ngot:  %#v", expected, server)
+		return fmt.Errorf("server differs from exact root transformation at %s", firstDiff(expected, server, ""))
 	}
 	return nil
+}
+
+// firstDiff names the first path, in sorted key order, where got differs from
+// want, with both values. parity still decides by reflect.DeepEqual; this only
+// makes its failure readable.
+func firstDiff(want, got any, path string) string {
+	wantMap, wantIsMap := want.(map[string]any)
+	gotMap, gotIsMap := got.(map[string]any)
+	if wantIsMap && gotIsMap {
+		keys := make([]string, 0, len(wantMap)+len(gotMap))
+		for key := range wantMap {
+			keys = append(keys, key)
+		}
+		for key := range gotMap {
+			if _, ok := wantMap[key]; !ok {
+				keys = append(keys, key)
+			}
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if diff := firstDiff(wantMap[key], gotMap[key], path+"."+key); diff != "" {
+				return diff
+			}
+		}
+		return ""
+	}
+	wantList, wantIsList := want.([]any)
+	gotList, gotIsList := got.([]any)
+	if wantIsList && gotIsList && len(wantList) == len(gotList) {
+		for i := range wantList {
+			if diff := firstDiff(wantList[i], gotList[i], fmt.Sprintf("%s[%d]", path, i)); diff != "" {
+				return diff
+			}
+		}
+		return ""
+	}
+	if reflect.DeepEqual(want, got) {
+		return ""
+	}
+	return fmt.Sprintf("%s: want %#v, got %#v", strings.TrimPrefix(path, "."), want, got)
 }
 
 func at(doc map[string]any, path ...string) any {
@@ -239,6 +281,14 @@ func TestParityControls(t *testing.T) {
 			}
 		})
 	}
+	t.Run("failure names the differing path", func(t *testing.T) {
+		root, server := documents(t)
+		at(server, "services", "api", "environment").(map[string]any)["AUTH_TOKEN_TTL"] = "${AUTH_TOKEN_TTL:-1h}"
+		err := parity(root, server)
+		if err == nil || !strings.Contains(err.Error(), "at services.api.environment.AUTH_TOKEN_TTL: want ") {
+			t.Fatalf("parity error = %v, want the differing path", err)
+		}
+	})
 	t.Run("new root setting must propagate", func(t *testing.T) {
 		root, server := documents(t)
 		at(root, "services", "api", "environment").(map[string]any)["NEW_REQUIRED"] = "${NEW_REQUIRED:?required}"
