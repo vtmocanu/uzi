@@ -26,7 +26,8 @@ type ocBystanders struct {
 }
 
 // ocLeaseRun builds a retained continuation claimed at generation 2 past the witness window with
-// registration evidence, then a stop stamped directly, so only the lease can protect it.
+// registration evidence, then a stop stamped directly. The stop alone keeps it out of the charge
+// and park arms; the lease is what keeps it out of the uncharged reset.
 func (f *cncFixture) ocLeaseRun(t *testing.T) uuid.UUID {
 	t.Helper()
 	run := f.continuation(t)

@@ -426,9 +426,12 @@ claim opened another custody hold until the owner reached the admission limit
   server-only: the claim is released, local work and custody are kept, and
   there is **no automatic retry**.
 - Everything else keeps the uncharged reset: first-generation claims,
-  non-continuations and workers without the evidence capability. A run you
-  already cancelled while it was claimed also keeps the reset, so the reclaimed
-  worker sees that cancel; you do not need to cancel it again.
+  non-continuations and workers without the evidence capability. A run carrying
+  a pending stop (for example one you cancelled while it was claimed) also keeps
+  the reset, so the reclaimed worker can see that cancel. This is not a delivery
+  guarantee: if the worker cannot act on the cancel where it refuses the source,
+  the run stays bounded only by the per-run custody limit, and a cancel that
+  lands just after a sweep parked the run needs a second `uzi run cancel <id>`.
 
 For `retained_continuation_unwitnessed`, read `uzi run recovery <id>` and export
 an available archive, then choose `uzi run resume <id>` or `uzi run cancel <id>`.
@@ -439,7 +442,8 @@ page shows "unwitnessed continuation hold" with Resume and Cancel.
 Resume requeues the run on the same worker (its local sources stay there) and
 starts a new requeue episode. The worker registration that was released cannot
 claim it again: the run continues only after that worker re-registers (for
-example after its own restart) or on a different worker. A re-registration is
+example after its own restart) or on a different worker once the original
+worker's claim affinity lapses (or it goes stale). A re-registration is
 not proof that the earlier source use ended. The worker still refuses a source
 that is in use, and a repeated refusal is bounded again in the new episode.
 Nothing restarts the worker for you.
