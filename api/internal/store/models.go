@@ -1265,12 +1265,12 @@ type Run struct {
 	HarnessOtherMeasured             pgtype.Float8      `json:"harness_other_measured"`
 	HarnessPreferredHeld             pgtype.Bool        `json:"harness_preferred_held"`
 	HarnessOtherHeld                 pgtype.Bool        `json:"harness_other_held"`
+	HarnessPreferredWeeklyResetAt    pgtype.Timestamptz `json:"harness_preferred_weekly_reset_at"`
+	HarnessOtherWeeklyResetAt        pgtype.Timestamptz `json:"harness_other_weekly_reset_at"`
 	PolicyRequiredHead               pgtype.Text        `json:"policy_required_head"`
 	PolicyRecoveryVerifiedGeneration pgtype.Int8        `json:"policy_recovery_verified_generation"`
 	PolicyRecoveryVerifiedHead       pgtype.Text        `json:"policy_recovery_verified_head"`
 	PolicyHoldCause                  pgtype.Text        `json:"policy_hold_cause"`
-	HarnessPreferredWeeklyResetAt    pgtype.Timestamptz `json:"harness_preferred_weekly_reset_at"`
-	HarnessOtherWeeklyResetAt        pgtype.Timestamptz `json:"harness_other_weekly_reset_at"`
 }
 
 type RunCompletionAttempt struct {
