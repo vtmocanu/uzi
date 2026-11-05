@@ -2325,3 +2325,247 @@ describe("issue #3780 ownershipRepairAuthority", () => {
     assert.equal(shutdown.ownershipRepairAuthority(), false);
   });
 });
+
+// #3953: a counted hold latches a credential switch instead of tripping it; the last close with
+// service=true trips it synchronously.
+describe("SteeringChannel — credential switch hold (#3953)", () => {
+  const GEN = 7;
+  const fresh = (): SteeringChannel => new SteeringChannel(fakeClient([]), "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: GEN });
+  type Private = { failReceipts(err: Error): void; endFencedFlight(reason: string): void };
+  const settled = async (ready: () => boolean, ms = 1_000): Promise<boolean> => {
+    const end = Date.now() + ms;
+    while (!ready()) {
+      if (Date.now() > end) return false;
+      await tick(2);
+    }
+    return true;
+  };
+  const switchPending = (): RequestError =>
+    new RequestError("POST", "/inputs/applied", 409, JSON.stringify({ error: "conflict", reason: "switch_pending" }));
+  /** Receipt client over `rows`; APPLIED throws switch_pending while `state.refuse`. */
+  function refusingClient(rows: UserInput[]) {
+    const state = { refuse: true };
+    const applied = new Set<number>();
+    const appliedCalls: number[][] = [];
+    const acked: number[][] = [];
+    const pick = (ids: number[]) => rows.filter((r) => ids.includes(r.id));
+    const client = {
+      getInputs: async () => ({ receipts: true, inputs: rows.filter((r) => !applied.has(r.id)) }),
+      ackInputs: async (_run: string, ids: number[]) => { acked.push([...ids]); return { inputs: pick(ids), active: true }; },
+      applyInputs: async (_run: string, ids: number[]) => {
+        appliedCalls.push([...ids]);
+        if (state.refuse) throw switchPending();
+        for (const id of ids) applied.add(id);
+        return { inputs: pick(ids), active: true };
+      },
+    } as unknown as WorkerClient;
+    return { client, state, applied, appliedCalls, acked };
+  }
+
+  it("a latch aborts nothing and leaves the flight looking un-observed", () => {
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(fakeClient([]), "run-1", 1, nullLogger(), cancel, { claimGeneration: GEN });
+    let interrupts = 0;
+    ch.onCredentialSwitch(() => { interrupts++; });
+    const hold = ch.holdCredentialSwitch();
+    assert.equal(ch.credentialSwitchHeld(), true);
+    assert.equal(hold.latched(), false);
+    ch.tripCredentialSwitch(GEN);
+    assert.equal(hold.latched(), true);
+    assert.equal(ch.lifecycleSignal().aborted, false);
+    assert.equal(cancel.signal.aborted, false);
+    assert.equal(ch.checkpointAuthoritySignal().aborted, false);
+    assert.equal(ch.pendingCredentialSwitch(), undefined);
+    assert.equal(ch.ownershipRepairAuthority(), true);
+    assert.equal(interrupts, 0);
+    ch.tripCredentialSwitch(GEN + 1); // a stale generation never latches
+    hold.close({ service: false });
+    assert.equal(ch.credentialSwitchHeld(), false);
+  });
+
+  it("a stale generation does not latch", () => {
+    const ch = fresh();
+    const hold = ch.holdCredentialSwitch();
+    ch.tripCredentialSwitch(GEN + 1);
+    assert.equal(hold.latched(), false);
+    hold.close({ service: true });
+    assert.equal(ch.pendingCredentialSwitch(), undefined);
+  });
+
+  it("close({ service: true }) trips synchronously with every effect", async () => {
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(fakeClient([]), "run-1", 1, nullLogger(), cancel, { claimGeneration: GEN });
+    let interrupts = 0;
+    ch.onCredentialSwitch(() => { interrupts++; });
+    const parked = ch.awaitVerdict();
+    const rejected = assert.rejects(parked, (e) => e instanceof CredentialSwitchSignal);
+    const hold = ch.holdCredentialSwitch();
+    ch.tripCredentialSwitch(GEN);
+    hold.close({ service: true });
+    // Everything below is observed in the same tick as the close, before any await.
+    assert.equal(ch.pendingCredentialSwitch(), GEN);
+    assert.ok(ch.lifecycleSignal().reason instanceof CredentialSwitchSignal);
+    assert.ok(cancel.signal.reason instanceof CredentialSwitchSignal);
+    assert.equal(ch.checkpointAuthoritySignal().aborted, true);
+    assert.equal(interrupts, 1);
+    assert.equal(hold.latched(), false, "the latch was cleared by the service");
+    assert.equal(ch.credentialSwitchHeld(), false);
+    await rejected;
+  });
+
+  it("close without a latched generation services nothing", () => {
+    const ch = fresh();
+    const hold = ch.holdCredentialSwitch();
+    hold.close({ service: true });
+    assert.equal(ch.pendingCredentialSwitch(), undefined);
+    assert.equal(ch.checkpointAuthoritySignal().aborted, false);
+  });
+
+  it("nested holds: only the outermost close services, and a second close of a handle is a no-op", () => {
+    const ch = fresh();
+    const outer = ch.holdCredentialSwitch();
+    const inner = ch.holdCredentialSwitch();
+    ch.tripCredentialSwitch(GEN);
+    inner.close({ service: true });
+    assert.equal(ch.credentialSwitchHeld(), true);
+    assert.equal(ch.pendingCredentialSwitch(), undefined, "the inner close does not service");
+    inner.close({ service: true }); // idempotent: must not decrement the outer hold
+    assert.equal(ch.credentialSwitchHeld(), true);
+    assert.equal(ch.pendingCredentialSwitch(), undefined);
+    outer.close({ service: true });
+    assert.equal(ch.pendingCredentialSwitch(), GEN);
+    outer.close({ service: true });
+    assert.equal(ch.credentialSwitchHeld(), false);
+  });
+
+  it("close({ service: false }) discards the latch; the next trip is normal", () => {
+    const ch = fresh();
+    const hold = ch.holdCredentialSwitch();
+    ch.tripCredentialSwitch(GEN);
+    hold.close({ service: false });
+    assert.equal(ch.pendingCredentialSwitch(), undefined);
+    assert.equal(ch.checkpointAuthoritySignal().aborted, false);
+    ch.tripCredentialSwitch(GEN);
+    assert.equal(ch.pendingCredentialSwitch(), GEN);
+    assert.equal(ch.checkpointAuthoritySignal().aborted, true);
+  });
+
+  it("servicing inside a revision defer window aborts only shutdownStop and defers the switch", () => {
+    const ch = fresh();
+    ch.beginCredentialSwitchDefer();
+    const hold = ch.holdCredentialSwitch();
+    ch.tripCredentialSwitch(GEN);
+    hold.close({ service: true });
+    assert.equal(ch.pendingCredentialSwitch(), undefined);
+    assert.equal(ch.lifecycleSignal().aborted, false);
+    assert.equal(ch.checkpointAuthoritySignal().aborted, true);
+    ch.endCredentialSwitchDefer();
+    ch.tripCredentialSwitch(GEN); // a later poll
+    assert.equal(ch.pendingCredentialSwitch(), GEN);
+  });
+
+  it("cancel, fence, receipt failure, workerShutdown and disk stop behave as without a hold", () => {
+    const run = (act: (ch: SteeringChannel) => void) => {
+      const plain = fresh();
+      act(plain);
+      const held = fresh();
+      const hold = held.holdCredentialSwitch();
+      held.tripCredentialSwitch(GEN);
+      act(held);
+      assert.equal(held.ownershipRepairAuthority(), plain.ownershipRepairAuthority());
+      assert.equal(held.checkpointAuthoritySignal().aborted, plain.checkpointAuthoritySignal().aborted);
+      assert.equal(held.lifecycleSignal().aborted, plain.lifecycleSignal().aborted);
+      assert.equal(held.isCancelled(), plain.isCancelled());
+      assert.equal(held.pendingCredentialSwitch(), undefined);
+      hold.close({ service: false });
+      return held;
+    };
+    assert.equal(run((c) => c.markCancelled()).isCancelled(), true);
+    assert.equal(run((c) => (c as unknown as Private).endFencedFlight("stale")).claimFence(), "stale");
+    run((c) => (c as unknown as Private).failReceipts(new Error("receipt")));
+    run((c) => c.requestDiskStop());
+    const shut = run((c) => { c.workerShutdown(Date.now() + 1000); });
+    assert.equal(shut.workerShutdownCheckpoint()?.stopSignal.aborted, false, "workerShutdown acts as before observation");
+  });
+
+  it("a ready-lane switch_pending refusal under a hold latches, parks, settles and rejects nobody", async () => {
+    const { client, state, applied, appliedCalls } = refusingClient([{ id: 5, kind: "reject_plan", body: "late" }]);
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: GEN });
+    const hold = ch.holdCredentialSwitch();
+    ch.closeGate("approve");
+    ch.start();
+    assert.ok(await settled(() => appliedCalls.length >= 1));
+    await ch.awaitReceiptSettlement(); // resolves, never rejects
+    assert.equal(hold.latched(), true);
+    assert.equal(ch.pendingCredentialSwitch(), undefined);
+    assert.equal(ch.approveRefusedBySwitchPending(), false);
+    hold.close({ service: true });
+    assert.equal(ch.pendingCredentialSwitch(), GEN);
+    await tick(20);
+    assert.equal(appliedCalls.length, 1, "parked: not retried while the switch is pending");
+    state.refuse = false;
+    ch.rearmCredentialSwitch(); // give-up
+    assert.ok(await settled(() => applied.has(5)), "the ids are back in the ready lane");
+    await ch.stop();
+  });
+
+  it("the reviseBatch switch_pending branch under a hold latches, keeps its ids and rejects nobody", async () => {
+    const { client, state, applied, appliedCalls } = refusingClient([{ id: 6, kind: "revise_plan", body: "  " }]);
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: GEN });
+    const hold = ch.holdCredentialSwitch();
+    ch.closeGate("approve");
+    ch.start();
+    assert.ok(await settled(() => appliedCalls.length >= 1));
+    await ch.awaitReceiptSettlement();
+    assert.equal(hold.latched(), true);
+    assert.equal(ch.pendingCredentialSwitch(), undefined);
+    hold.close({ service: true });
+    assert.equal(ch.pendingCredentialSwitch(), GEN);
+    state.refuse = false;
+    ch.rearmCredentialSwitch();
+    assert.ok(await settled(() => applied.has(6)));
+    await ch.stop();
+  });
+
+  it("a held batch whose APPLIED is refused under a hold latches and settles; a give-up re-applies it", async () => {
+    const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+    const { client, state, applied, appliedCalls } = refusingClient([row]);
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: GEN });
+    const hold = ch.holdCredentialSwitch();
+    ch.start();
+    assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "followup", body: "seven" });
+    await ch.awaitReceiptSettlement(); // settled, not rejected
+    assert.ok(appliedCalls.length >= 1);
+    assert.equal(hold.latched(), true);
+    assert.equal(ch.pendingCredentialSwitch(), undefined);
+    assert.equal(applied.size, 0, "settling did not mark the input applied");
+    hold.close({ service: true });
+    assert.equal(ch.pendingCredentialSwitch(), GEN);
+    const calls = appliedCalls.length;
+    await tick(30);
+    assert.equal(appliedCalls.length, calls, "not re-applied while the switch is pending");
+    state.refuse = false;
+    ch.rearmCredentialSwitch();
+    assert.ok(await settled(() => applied.has(7)), "back in the ready lane after the give-up");
+    await ch.stop();
+  });
+
+  it("without a hold the receipt switch_pending paths are unchanged", async () => {
+    const row: UserInput = { id: 7, kind: "follow_up", body: "seven" };
+    const { client } = refusingClient([row]);
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: GEN });
+    ch.start();
+    assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "followup", body: "seven" });
+    await assert.rejects(ch.awaitReceiptSettlement(), (e: Error) => e.name === "CredentialSwitchSignal");
+    assert.equal(ch.pendingCredentialSwitch(), GEN);
+    await ch.stop();
+    const rc = refusingClient([{ id: 5, kind: "reject_plan", body: "late" }]);
+    const ready = new SteeringChannel(rc.client, "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: GEN });
+    ready.closeGate("approve");
+    ready.start();
+    assert.ok(await settled(() => rc.appliedCalls.length >= 1));
+    await ready.awaitReceiptSettlement();
+    assert.equal(ready.pendingCredentialSwitch(), undefined, "a non-urgent parked reject does not trip, as before");
+    await ready.stop();
+  });
+});
