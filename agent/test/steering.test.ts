@@ -2569,7 +2569,7 @@ describe("SteeringChannel — credential switch hold (#3953)", { timeout: 10_000
     await ch.stop();
   });
 
-  it("a taken approve refused under a hold is not urgent after close({ service: false })", async () => {
+  it("a taken approve parked under a hold is urgent at a later normal trip after close({ service: false })", async () => {
     const g = deferred();
     const { client, appliedCalls } = refusingClient([{ id: 5, kind: "approve_plan", body: null }], g.promise);
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: GEN });
@@ -2580,9 +2580,65 @@ describe("SteeringChannel — credential switch hold (#3953)", { timeout: 10_000
     g.release();
     await ch.awaitReceiptSettlement();
     hold.close({ service: false });
+    assert.equal(ch.approveRefusedBySwitchPending(), false, "not urgent before any trip");
     ch.tripCredentialSwitch(GEN); // a later normal trip
     assert.equal(ch.pendingCredentialSwitch(), GEN);
-    assert.equal(ch.approveRefusedBySwitchPending(), false, "the discarded hold left no urgency behind");
+    assert.equal(ch.approveRefusedBySwitchPending(), true, "the approve is still parked and unapplied, so it is urgent");
+    await ch.stop();
+  });
+
+  it("a hold opened while a switch is already pending leaves a taken approve's refusal urgent, as without a hold", async () => {
+    const probe = async (withHold: boolean) => {
+      const g1 = deferred();
+      const g2 = deferred();
+      let calls = 0;
+      const row: UserInput = { id: 5, kind: "approve_plan", body: null };
+      const client = {
+        getInputs: async () => ({ receipts: true, inputs: [row] }),
+        ackInputs: async () => ({ inputs: [row], active: true }),
+        applyInputs: async () => {
+          calls++;
+          if (calls === 1) { await g1.promise; throw new Error("api down"); } // transient: the lane retries
+          await g2.promise;
+          throw switchPending();
+        },
+      } as unknown as WorkerClient;
+      const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: GEN });
+      ch.start();
+      assert.equal((await ch.awaitGateEvent(0)).kind, "approve");
+      assert.ok(await settled(() => calls >= 1));
+      g1.release();
+      ch.tripCredentialSwitch(GEN); // the switch is pending before the retry
+      assert.equal(ch.pendingCredentialSwitch(), GEN);
+      const hold = withHold ? ch.holdCredentialSwitch() : undefined;
+      assert.ok(await settled(() => calls >= 2));
+      g2.release();
+      assert.ok(await settled(() => ch.approveRefusedBySwitchPending()), `urgent (hold=${withHold})`);
+      hold?.close({ service: true }); // harmless: nothing is latched
+      assert.equal(ch.pendingCredentialSwitch(), GEN);
+      assert.equal(ch.approveRefusedBySwitchPending(), true);
+      await ch.stop();
+    };
+    await probe(false);
+    await probe(true);
+  });
+
+  it("rearmCredentialSwitch clears the urgency a service set", async () => {
+    const g = deferred();
+    const { client, state, applied, appliedCalls } = refusingClient([{ id: 5, kind: "approve_plan", body: null }], g.promise);
+    const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { claimGeneration: GEN });
+    const hold = ch.holdCredentialSwitch();
+    ch.start();
+    assert.equal((await ch.awaitGateEvent(0)).kind, "approve");
+    assert.ok(await settled(() => appliedCalls.length >= 1));
+    g.release();
+    await ch.awaitReceiptSettlement();
+    hold.close({ service: true });
+    assert.equal(ch.approveRefusedBySwitchPending(), true);
+    state.refuse = false;
+    ch.rearmCredentialSwitch();
+    assert.equal(ch.approveRefusedBySwitchPending(), false);
+    assert.ok(await settled(() => applied.has(5)));
     await ch.stop();
   });
 
