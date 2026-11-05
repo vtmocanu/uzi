@@ -36,7 +36,7 @@ var autoNow = time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 func autoParams() Params {
 	p := testParams()
 	p.Autoselect = autoselect.Policy{
-		MinHeadroom: 15, HeadroomTiePct: 5, MaxStaleness: 15 * time.Minute, InflightPenalty: 3,
+		Order: autoselect.OrderHeadroomFirst, MinHeadroom: 15, HeadroomTiePct: 5, MaxStaleness: 15 * time.Minute, InflightPenalty: 3,
 	}
 	return p
 }

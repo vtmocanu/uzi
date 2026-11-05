@@ -454,6 +454,15 @@ workers:
   # uzi. The identity + Role were created together in M3 so the boundary is one
   # reviewable unit; M6's Deployment below is what runs under it.
   controllerServiceAccountName: uzi-controller
+  # The controller's one ClusterRole (issue #3890): `get` on storage.k8s.io
+  # storageclasses and nothing else, bound to the controller ServiceAccount. Size-only
+  # PVC expansion reads the claim's StorageClass to see allowVolumeExpansion, and a
+  # StorageClass is cluster-scoped, so a namespaced Role cannot authorize it. This is an
+  # owner-authorized exception to the otherwise namespace-only RBAC. Set create to false
+  # (for example where a cluster admin owns RBAC) and expansion fails closed: the
+  # controller logs class-lookup-forbidden and leaves every existing claim untouched.
+  storageClassRead:
+    create: true
 
   # --- the controller Deployment (M6) -------------------------------------------
   #
@@ -602,6 +611,9 @@ workers:
   #   Also gates the docker-tier DinD build-cache prune (issue #1759, ADR-1759): the
   #   same flag renders UZI_DIND_PRUNE_ENABLED into docker workers, so flipping it
   #   rolls non-ephemeral docker worker pods; it is not just a controller-side switch.
+  #   The same flag also enables the pressure-only anonymous-volume prune leg (issue
+  #   #3891) on busy or custody-held workers; false disables that leg too, along with
+  #   PVC recycle and the cache prune (it is not leg-only).
   diskRecycleEnabled: true
   # diskRecycleCooldown: the PVC-age thrash guard (Decision D6). A worker back at pressure
   #   within this window is a CAPACITY problem (working set exceeds nixSize) — it is
@@ -632,7 +644,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.86.1-rc.4"
+    tag: "0.86.1-rc.5"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -670,6 +682,19 @@ workers:
   # pools but keep the busy-drift deferral, so a busy one is not replaced mid-run.
   nodeSelector:
     kubernetes.io/arch: amd64
+  # Tolerations for every hosted worker pod, all three tiers, as a list of Kubernetes
+  # toleration objects using operator Equal or Exists (Lt/Gt are refused). Use it to run workers on tainted, dedicated nodes:
+  #
+  #   tolerations:
+  #     - {key: uzi, operator: Equal, value: "true", effect: NoSchedule}
+  #
+  # A toleration only PERMITS scheduling onto the tainted nodes; to also keep workers
+  # OFF every other node, label the dedicated nodes and add that label to nodeSelector
+  # above (keep the arch key). Empty (the default) renders no tolerations, so the
+  # worker pod template hashes exactly as before this value existed. Changing it rolls
+  # the workers the same way a nodeSelector change does. The controller validates the
+  # list at boot. The api, web and controller pods are not affected.
+  tolerations: []
   # A cluster-scoped PriorityClass for hosted worker pods (issue #1341). When enabled,
   # the chart creates the PriorityClass AND the controller stamps its name onto every
   # worker pod's priorityClassName, so a busy worker outranks lower-priority pods for
@@ -805,10 +830,12 @@ workers:
   # larger value (the empty/default path included), and the controller's boot check
   # (kube.ValidatePVCCeilings) refuses to start against the live ceilings.
   #
-  # CHANGING IT NEVER RESIZES AN EXISTING PVC: PVCs here are never patched (a size
-  # change is delete + reprovision). Run-bound workers are short-lived, so the new size
-  # arrives with the next one provisioned. Empty falls back to the controller's
-  # built-in 40Gi.
+  # CHANGING IT RAISES AN EXISTING PVC, NEVER LOWERS IT: the controller converges an
+  # existing claim UPWARD to this size on StorageClasses that allow expansion (issue
+  # #3890), and never shrinks, deletes or recreates one. A smaller value therefore
+  # leaves existing claims as they are, and run-bound workers are short-lived anyway, so
+  # a smaller size arrives with the next one provisioned. Empty falls back to the
+  # controller's built-in 40Gi.
   ephemeralWorkerDataSize: 40Gi
   # Ephemeral worker lease (PRD #2006 -> the api's UZI_EPHEMERAL_LEASE). When an ephemeral
   # worker finishes its bound run it is NOT torn down at once: it stays idle for this long
@@ -1064,14 +1091,16 @@ workers:
     # Keep requests aligned with the rendered fleet, including sidecar overrides,
     # or admission caps it below deployments
     # (issue #1341). ResourceQuotas are ceilings, not capacity reservations.
-    # STORAGE tracks three PVCs each: 10 x (50Gi data + 20Gi nix + 20Gi dind) =
-    # 900Gi, and 10 x 3 = 30 claims. Raising a quota provisions nothing until
-    # workers exist.
+    # STORAGE tracks three PVCs each: 10 x (50Gi data + 20Gi nix + 50Gi dind) =
+    # 1200Gi, and 10 x 3 = 30 claims. The dind term is the largest per-preset default
+    # (`l`/`l-highmem`, issue #3890). A run-bound docker worker's worst case is
+    # 40 + 20 + 50 = 110Gi, below the persistent 120Gi. Raising a quota provisions
+    # nothing until workers exist.
     quota:
       enabled: true
       requestsCPU: "14"
       requestsMemory: 144Gi
-      requestsStorage: 900Gi
+      requestsStorage: 1200Gi
       # BOTH CLAUSES OF WHAT THIS COMMENT USED TO SAY WERE FALSE, and issue #224 M-a
       # falsified the first of them a second time over. It read: "emptyDir dind data
       # roots land on node ephemeral storage; bound it so a runaway image pull cannot
@@ -1116,13 +1145,14 @@ workers:
         cpu: "4"
         memory: 32Gi
       # FOUR claimants sit at or under this ceiling: `l`'s DataSize (50Gi) exactly,
-      # dindDataSize below, nixSize and a run-bound worker's /data
-      # (20Gi nix/DinD; workers.ephemeralWorkerDataSize is 40Gi). Raising any of them
+      # the DinD data root (per-preset up to 50Gi, exactly at the ceiling for
+      # `l`/`l-highmem`, or workers.docker.dindDataSize when set), nixSize and a
+      # run-bound worker's /data (20Gi nix; workers.ephemeralWorkerDataSize is 40Gi). Raising any of them
       # past it without raising this makes that claim inadmissible, and nothing renders
       # red — the LimitRange rejects it at admission and the worker provisions and never
-      # appears. dindDataSize and ephemeralWorkerDataSize are guarded against this value
-      # in worker-invariants.yaml; the other two are Go constants a chart cannot read and
-      # are guarded by TestPresetPVCSizesFitTheChartsLimitRangeMax
+      # appears. dindDataSize (its per-preset maximum when empty) and ephemeralWorkerDataSize are
+      # guarded against this value in worker-invariants.yaml; nixSize and DataSize are Go
+      # constants a chart cannot read and are guarded by TestPresetPVCSizesFitTheChartsLimitRangeMax
       # (controller/internal/preset), which reads this value out of this file. The
       # run-bound /data replaces DataSize for that worker and 40Gi <= l's 50Gi, so this
       # tier's per-worker worst case (and quota.requestsStorage) is unchanged;
@@ -1160,18 +1190,23 @@ workers:
     # worker-invariants.yaml refuses to render the mismatched pair, so this is a
     # `helm install` error rather than a worker that provisions and never appears.
     #
-    # RAISING THIS ON A LIVE CLUSTER IS A NO-OP FOR EVERY EXISTING DOCKER WORKER, and
-    # that is by design rather than a bug to report. The pod's spec hash covers the
-    # claim's NAME and never its size, and PVCs here are never patched (a size change
-    # is delete + reprovision), so nothing rolls and nothing errors. New workers get
-    # the new size; existing ones keep theirs until they are reprovisioned.
+    # EMPTY (the shipped default) means the controller's PER-PRESET default: s and m
+    # claim 20Gi, l and l-highmem 50Gi (issue #3890). A non-empty value is a CLUSTER-WIDE
+    # OVERRIDE that wins over every preset until it is removed: a retained 20Gi, an
+    # explicit 30Gi, or a value kept by `helm upgrade --reuse-values` applies to every
+    # docker worker, so an explicit 30Gi does NOT become 50Gi. Clear it to adopt the
+    # per-preset defaults.
     #
-    # THE CACHE NOW PERSISTS ACROSS ROLLS AND NOTHING GC's IT — the same residual the
-    # controller documents for /nix. The emptyDir at least died with the pod; this
-    # only grows into a fixed volume. `docker system prune` is the remedy (an agent
-    # can run it); otherwise it is delete + reprovision, as everywhere else here.
-    # Empty falls back to the controller's built-in 20Gi.
-    dindDataSize: 20Gi
+    # Existing claims are converged UPWARD non-destructively by the controller on
+    # StorageClasses that allow expansion (issue #3890; it reads the class through
+    # workers.storageClassRead); a claim is never shrunk or recreated. The pod's
+    # spec hash covers the claim's NAME and never its size, so a size change rolls
+    # no pod.
+    #
+    # THE CACHE PERSISTS ACROSS ROLLS AND NOTHING GC's IT beyond the worker's gated
+    # `docker` prune, the same residual the controller documents for /nix. The
+    # emptyDir at least died with the pod; this only grows into a fixed volume.
+    dindDataSize: ""
     # The DOCKER worker container's requests.ephemeral-storage (issue #224 →
     # UZI_WORKER_DOCKER_EPHEMERAL_REQUEST). It REPLACES workers.ephemeralRequest for
     # this tier rather than adding to it; read that key's comment first, all of which

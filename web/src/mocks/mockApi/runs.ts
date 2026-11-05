@@ -102,7 +102,7 @@ function seedCustodyHolds(): RecoveryCustodyHold[] {
     // Worker B — jvm-worker: an actionable capture failure + a source-only hold.
     // Still at its branch checkpoint slot (PRD #1810); the long branch exercises phone wrapping.
     mk({ id: "hold-b2", run_id: "run-b2", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 2, attention: "needs_action", capture_state: "needs_action", checkpoint_ref: "refs/uzi-checkpoints/agent/issue-1810-retain-published-checkpoints-across-supersession", checkpoint_tip: "b41e7d09a2c3f58e61d4a7b90c2e5f3a1d8b6c47", checkpoint_state: "retained", counts_toward_admission: true, admission_reason: "decision_needed" }),
-    mk({ id: "hold-b1", run_id: "run-b1", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 1, attention: "source_only", counts_toward_admission: true, admission_reason: "decision_needed" }),
+    mk({ id: "hold-b1", run_id: "run-b1", worker_id: "wkr-jvm", worker_name: "jvm-worker", generation: 1, attention: "source_only", created_at: t(200), counts_toward_admission: true, admission_reason: "decision_needed" }),
     // Worker C — hostile name: a source-only decision + healthy protection.
     mk({ id: "hold-c2", run_id: "run-c2", worker_id: "wkr-ext", worker_name: HOSTILE_WORKER_NAME, generation: 2, attention: "active", counts_toward_admission: true, admission_reason: "earlier_generation" }),
     mk({ id: "hold-c1", run_id: "run-c1", worker_id: "wkr-ext", worker_name: HOSTILE_WORKER_NAME, generation: 1, attention: "source_only", counts_toward_admission: true, admission_reason: "decision_needed" }),

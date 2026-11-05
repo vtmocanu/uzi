@@ -2,7 +2,7 @@
 
 **Issue:** #3248
 **Sibling issues (children of #1703):** A #3255, B #3247, B2 #3251, C #3245, D #3248, E #3257, F #3254, G #3249, H #3244, I #3263, J1 #3256, J2 #3260, K #3261, L #3262, M #3259, N #3258, O #3264, P #3250, Q-spike #3246, Q-claude #3252, Q-codex #3253.  
-**Status:** Draft r3 2026-10-21 (child D of epic #1703). Source anchors checked against origin/main `522aab1ba`. Since r2's `587b66d74` no anchor below changed; #3234 added `testOwnedPassHomeRoot()` (`agent/test/teardown-fixtures.ts`), which new agent tests use. Consumes child C's final r2 names.
+**Status:** Draft r4 2026-11-05 (child D of epic #1703). Source anchors written against origin/main `522aab1ba` and rechecked at `3f0858ef5` (2026-11-05): every consumed child C seam is on main under the names below, and the summary, Codex runner, credential-error and Run defaults behavior still matches the baseline, although later commits touched the claim-assembly and Run defaults files, so re-read each anchor before editing it. The `ModelSelect` `models` prop has landed (`web/src/components/ModelSelect.tsx`): reuse it. #3234 added `testOwnedPassHomeRoot()` (`agent/test/teardown-fixtures.ts`), which new agent tests use. Consumes child C's final names.
 **Priority:** Normal.
 **Parent:** #1703. **Closes:** #1454. Child #3245 lands first (#3248 is blocked by #3245), and its PR says `Part of #1454`; this PR says `Closes #1454`. #3245 answers #1454's Judge question; this PRD answers its Summary question (option 2, one model per harness).
 **Blocked by:** child #3245. This PRD consumes #3245's shared seams by their exact names and defines no copies (see "Consumed from child #3245").
@@ -12,7 +12,7 @@
 - PRD #362 (`prds/done/362-run-summaries.md`) and PRD #1798 (`prds/done/1798-plain-english-pr-descriptions.md`, D13).
 - Children A, C, E, F, G, I, M, O.
 
-**Delivery:** one PRD, one gated implementation run, one PR; default harness, mr_rework=false. Three serial milestones. One additive migration, draft number 00349 (M1); main ends at 00346 at the pinned SHA, so assign the next free number at landing with `task migration:renumber`. The credential note needs no migration (module 6). The run needs Docker for the LiveDB store test. No implementation or validation writes under `.github/workflows/`.
+**Delivery:** one PRD, one gated implementation run, one PR; default harness, mr_rework=false. Three serial milestones. One additive migration (M1), numbered the next free number at implementation (currently 00404; main ends at 00403 at `3f0858ef5`); renumber at landing with `task migration:renumber` if main advances. The credential note needs no migration (module 6). The run needs Docker for the LiveDB store test. No implementation or validation writes under `.github/workflows/`.
 
 **Scope gate:** passes. The outcome is one capability. A user or admin chooses the model the Codex intent and plan summaries run on and sees the value in effect with its source. The run feed says when one of those summaries was skipped because the Codex credential could not be used. M3 (the note) is small and rides an existing path, so it stays in this PR.
 
@@ -148,7 +148,7 @@ D's own fixture facts go in a sibling file in C's directory, `fixtures/model-set
 
 ### 3. User column and API (`users.codex_summary_model`, `PUT/GET /api/me/settings`)
 
-- **Migration (draft 00349):** `ALTER TABLE users ADD COLUMN codex_summary_model text;` and a goose Down that drops it.
+- **Migration (next free number, currently 00404):** `ALTER TABLE users ADD COLUMN codex_summary_model text;` and a goose Down that drops it.
   - Nullable, no default, no backfill: NULL means inherit, which resolves to today's behavior. A Codex run never read the Claude lane, so there is nothing to copy.
   - No CHECK constraint, as for `summary_model`.
 - **Queries:**
@@ -218,7 +218,7 @@ The note is `ctx.emit({ kind: "status", agent: "worker", payload: { text, event:
 
 ### 7. Web interim controls
 
-- **`ModelSelect` `models` prop:** an optional closed `models` list override, curated options only, custom entry only with `allowCustom`. Omitted ⇒ today's harness lists, so every existing caller is unchanged. D adds it unless G landed it first, in which case D reuses G's.
+- **`ModelSelect` `models` prop:** an optional closed `models` list override, curated options only, custom entry only with `allowCustom`. Omitted ⇒ today's harness lists, so every existing caller is unchanged. It has landed on main: D reuses it.
 - **Run defaults "Run summaries" card:**
   - The Claude picker shows under `showClaudeLane`, the Codex picker under `showCodexLane`: the page's lane rules, which C's judge pair also uses. Behavior change: a Codex-only user no longer sees the ineffective Claude picker.
   - The Codex picker passes `models={CODEX_ROLE_MODELS}`.
@@ -280,12 +280,13 @@ The note is `ctx.emit({ kind: "status", agent: "worker", payload: { text, event:
 - **Web:**
   - `RunDefaults.test.tsx` ("per-user summary model" describe): a Codex-only user sees the Codex picker with exactly `CODEX_ROLE_MODELS`, no Claude alias and no custom entry, and does not see the Claude picker. This is the #1454 vocabulary regression, **watched red** (there is no Codex picker today).
   - Labels come from `modelSettingSourceLabel`, and Save sends `codex_summary_model`.
-  - `ModelSelect.test.tsx`: the `models` override, and an omitted prop leaves the lists unchanged.
+  - `ModelSelect.test.tsx`: the landed `models` override stays covered; add a case only if the summary pickers need behavior it lacks.
   - `AdminSettings.test.tsx`: `/summary model must not be empty/i` is repointed. The Default option sends `""`, and a `default` source selects it.
   - Run the retire-a-string sweep (`.claude/rules/web.md`) for "your own Anthropic token" on the summary card.
 - **CLI:** the Model settings table with summary rows (stored, default, unknown-source and two-cell-cap cases), using C's golden-style test.
 - **E2E:** `git grep -n -F -e summary_model -e gpt-6-luna -e summary_skipped -- e2e` is empty at the pinned SHA. Re-run it before the PR and record the result.
-- **Gates:** `task gate:api`, `task gate:agent`, `task gate:web`, `task gate:repo` (migration numbering and additivity, changelog fragment), `task check-docs:web` and `task docs:sync`.
+- **In-run checks** (the in-run boundary in `AGENTS.md` "Run economy"): `task check:api`, `task check:web` and `UZI_DEADCODE_AGENT_REQUIRED=1 task check:agent`, plus `go test -race -count=1` on the affected packages, the touched and directly affected Vitest and agent test files, and `task test:codex-m4` (Codex runtime is touched); the companion checks for changed files (`task check:migration-numbering`, `task check:migration-additive`, `task check:changelog-entry`, `task docs:sync` + `task check-docs:web`); `task scan:secrets` in-run, since M3 touches credential handling; each watched-red regression test recorded red, then green.
+- **Landing obligations** (not milestones): `full agent suite: exact-head PR CI`; full `test:api`, `test:web`, `test:web-browser`, `gate:repo`, `scan:secrets` and `sast:semgrep` green on the exact head.
 
 ## Milestones
 
@@ -296,10 +297,10 @@ Blocked by: child #3245 (PRD-level; all consumed seams must be on the base).
 - **Server:**
   - `ResolveSummaryModel` and the built-in constants; `fixtures/model-settings/summary.json`.
   - The settings key and validators, the `NormalizeForStorage` set, and `Cache.SummaryModel` / `SettingsReader.SummaryModel` removal.
-  - Migration 00349 (draft), the queries, and `sqlc generate`.
+  - The migration (next free number), the queries, and `sqlc generate`.
   - PUT/GET fields and `summary_models` cells; claim assembly per harness.
 - **Agent:** the leaf module and `runModel`.
-- **Web:** the `ModelSelect` `models` prop; the Run defaults pair with lane rules, labels and copy; the demo mock (user side); the contract fixtures.
+- **Web:** reuse the landed `ModelSelect` `models` prop; the Run defaults pair with lane rules, labels and copy; the demo mock (user side); the contract fixtures.
 - **CLI:** the summary rows in the Model settings table.
 - **Docs, specs, changelog:**
   - `docs/run-summaries.md` "Which model it runs on": both cells and their scope, including that the Claude cell drives Claude PR descriptions.
@@ -311,7 +312,7 @@ Blocked by: child #3245 (PRD-level; all consumed seams must be on the base).
   - The three watched-red tests (claim, agent, web vocabulary) are recorded red, then green.
   - The Claude agent tests are green.
   - With nothing configured, every Codex summary request is `gpt-6-luna`/`low`.
-  - All gates are green.
+  - The in-run checks are green.
 - **Safe alone:** the instance Codex key is settable only through the admin API, and it defaults to the built-in.
 
 ### M2: Instance defaults for both summary lanes on Admin → Instance, with reset
@@ -320,7 +321,7 @@ Blocked by: M1.
 
 - The `SummarySettingsCard` pair with reset options from `defaults`, the child A coordination clause, the mock admin side, and `AdminSettings.test.tsx` repointed.
 - `docs/admin-settings.md` "Run summaries", then `task docs:sync`; update the changelog fragment.
-- **Acceptance:** example 2 works end to end (the admin sets a value, the user label and CLI source follow, the admin resets including with whitespace, and the next claim follows). Gates green.
+- **Acceptance:** example 2 works end to end (the admin sets a value, the user label and CLI source follow, the admin resets including with whitespace, and the next claim follows). In-run checks green.
 
 ### M3: Visible credential-failure note for Codex intent and plan summaries
 
@@ -328,7 +329,7 @@ Blocked by: M1 (the same agent seams; serial in one PR).
 
 - The classification in `model-pass.ts`, `onSkip` in the summary runner, and the executor status emission with the two fixed texts.
 - `docs/run-summaries.md` "It's advisory" and "Which model it runs on": replace "an expired credential makes the summary fail" with the note, and say where it shows. Then `task docs:sync`, a specs entry, and an update to the changelog fragment.
-- **Acceptance:** example 4 passes as tests, and the credential-note regression is watched red, then green. Gates green.
+- **Acceptance:** example 4 passes as tests, and the credential-note regression is watched red, then green. In-run checks green.
 
 ## Risks
 
@@ -365,7 +366,7 @@ Blocked by: M1 (the same agent seams; serial in one PR).
   - No stored values are rewritten.
 - **Sibling overlap:**
   - Child A: the admin Summary field conversion (module 7 clause). Whichever lands second rebases.
-  - Child G: the `ModelSelect` `models` prop. The first lander adds it.
+  - Child G: the `ModelSelect` `models` prop has landed; D reuses it.
   - Children I and M carry both cells and render resolver output.
   - Child E can reuse the note pattern for its visible "Runs on" skip, and D3 leaves it room.
   - Child F (last) calls `ResolveSummaryModel` and drops its `not_configurable` Codex summary row.

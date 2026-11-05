@@ -331,6 +331,7 @@ async function fixture(options: {
   policy?: { version: 1; max_interventions: number };
   count?: number;
   report?: (request: import("../src/protocol.js").MemoryOutcomeRequest) => Promise<import("../src/protocol.js").MemoryReservation>;
+  sampleOf?: (id: number, time: number, usage: number) => Sample;
 } = {}) {
   const { WorkerMemoryMonitor } = await import("../src/worker-memory-guard.js");
   const { WorkerMemoryCommands } = await import("../src/worker-memory-commands.js");
@@ -381,7 +382,7 @@ async function fixture(options: {
   const monitor: Monitor = new WorkerMemoryMonitor({ ...settings, sampleMs: options.sampleMs ?? settings.sampleMs }, {
     commands, now: () => time, incarnation: () => incarnation,
     subscribeInvalidation: (callback) => { invalidate = callback; return () => {}; },
-    sample: () => { reads++; return sample(++id, time, usage); },
+    sample: () => { reads++; const n = ++id; return options.sampleOf ? options.sampleOf(n, time, usage) : sample(n, time, usage); },
     timer: (callback, ms) => { timerArgs.push(ms); const timer = { at: time + ms, callback }; timers.add(timer); return () => timers.delete(timer); },
     reserve: async (request, _signal, ms) => { budgets.push(ms); if (options.fractional) time += 0.25; requests.push(request); return options.holdNextReserve && requests.length > 1 ? nextReservation.promise : options.autoReserve ? ack(request) : reservation.promise; },
     report: async (request) => {
@@ -1442,3 +1443,255 @@ test("a disarmed guard rearms only inside evaluate after the ticket resolves and
     assert.equal(f.monitor.observation.pendingIntervention, false);
   } finally { await f.monitor.stop(); }
 });
+
+test("guard evidence: hard carries the working set, early carries the projection inputs, other kinds none", () => {
+  const hard = new WorkerMemoryGuard(settings).evaluate(sample(1, 0, 900, { stat: stat(100) }), 0);
+  assert.equal(hard.kind, "hard");
+  assert.deepEqual(hard.evidence, { workingSetBytes: 800 });
+  const guard = new WorkerMemoryGuard(settings);
+  const first = guard.evaluate(sample(1, 0, 700), 0);
+  assert.equal(first.kind, "idle");
+  assert.equal(first.evidence, undefined);
+  const early = guard.evaluate(sample(2, 100, 850, { stat: stat(100, 11), pressure: psi(3) }), 100);
+  assert.equal(early.kind, "early");
+  assert.deepEqual(early.evidence, {
+    previousSampleId: 1, previousStartedAtMs: 0, previousCompletedAtMs: 0, previousWorkingSetBytes: 700,
+    intervalMs: 100, growthBytes: 50, rateBytesPerMs: 0.5, projectedBytes: 800,
+    psiFullTotalPrevious: 0, psiFullTotalCurrent: 3, grownFields: ["anon"],
+  });
+  assert.equal(new WorkerMemoryGuard(settings).evaluate(sample(1, 0, 100), 0).evidence, undefined);
+});
+
+const detail = Object.freeze({ file: 5, slab: 6, missing: Object.freeze(["kernel"]), malformed: Object.freeze([]) });
+const withDetail = (n: number, time: number, usage: number): Sample => sample(n, time, usage, { statDetail: detail as Sample["statDetail"] });
+const norm = (value: unknown) => JSON.parse(JSON.stringify(value).replace(/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/g, "ID"));
+const pinnedStat = { anon: 10, shmem: 10, slab_unreclaimable: 10, unevictable: 10, inactive_file: 0 };
+const zeroPsi = { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 }, full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } };
+const pinnedSettings = { reserve_bytes: 200, hysteresis_bytes: 100, sample_ms: 100, response_budget_ms: 100, rearm_ms: 100, max_interventions: 2 };
+const pinnedDetail = { file: 5, slab: 6, missing: ["kernel"], malformed: [] };
+
+test("memory_diagnostics v1 snapshot for a hard intervention", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  const sampleReads = () => f.reads();
+  f.monitor.tick();
+  await until(() => f.requests.length === 1);
+  f.reservation.resolve(f.ack());
+  await f.monitor.settle();
+  const section = { decision: "hard", sample_id: 1, started_at_ms: 0, completed_at_ms: 0, current_bytes: 900, working_set_bytes: 900,
+    limit_bytes: 1000, high_bytes: 800, quiet_bytes: 700, stat: pinnedStat, stat_detail: pinnedDetail, psi: zeroPsi };
+  assert.deepEqual(norm(diagnostics), {
+    version: 1, metric: "working_set_v1", clock: "monotonic_ms", settings: pinnedSettings,
+    trigger: section, authority: section, authority_same_as_trigger: true,
+    tree: { selected_rss_bytes_approx: 100, selected_started_at_ms: 0, selected_completed_at_ms: 0, candidates: 1, observation_failures: 0,
+      cancel_check: { rss_bytes_approx: 100, started_at_ms: 0, completed_at_ms: 0 } },
+  });
+  assert.equal(Object.isFrozen(diagnostics), true);
+  assert.equal(sampleReads(), 1, "the monitor reads only through sample(), once per tick");
+  await f.monitor.stop();
+});
+
+test("memory_diagnostics v1 snapshot for an early intervention", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({
+    sampleOf: (n, time, usage) => n === 1 ? sample(n, time, usage) : sample(n, time, usage, { stat: stat(0, 11), pressure: psi(1) }),
+    prepareFeedback: (_c, _r, d) => { diagnostics = d; },
+  });
+  f.usage(700);
+  f.monitor.tick();
+  assert.equal(f.requests.length, 0);
+  f.advance(100); f.usage(750);
+  f.monitor.tick();
+  await until(() => f.requests.length === 1);
+  f.reservation.resolve(f.ack());
+  await f.monitor.settle();
+  const d = norm(diagnostics);
+  assert.equal(d.trigger.decision, "early");
+  assert.equal(d.trigger.sample_id, 2);
+  assert.deepEqual(d.trigger.stat_detail, { unavailable: "absent" });
+  assert.deepEqual(d.trigger.early, {
+    previous_sample_id: 1, previous_started_at_ms: 0, previous_completed_at_ms: 0, previous_working_set_bytes: 700,
+    interval_ms: 100, growth_bytes: 50, rate_bytes_per_ms: 0.5, projected_bytes: 800,
+    psi_full_total_previous: 0, psi_full_total_current: 1, grown_fields: ["anon"],
+  });
+  assert.deepEqual(d.authority, d.trigger);
+  assert.equal(d.authority_same_as_trigger, true);
+  assert.deepEqual(d.trigger.psi.full, { avg10: 0, avg60: 0, avg300: 0, total: 1 });
+  await f.monitor.stop();
+});
+
+test("authority differs from trigger when the latest sample advances during the tree observation", async () => {
+  let diagnostics: unknown;
+  const observed = barrier<TreeObservation>();
+  let observes = 0;
+  const tree: TreeObservation = { available: true, complete: true, startedAtMs: 0, completedAtMs: 0, rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] };
+  const f = await fixture({ sampleOf: withDetail, observe: async () => ++observes === 1 ? observed.promise : tree,
+    prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  f.monitor.tick();
+  await until(() => observes === 1);
+  f.advance(10);
+  f.monitor.tick();
+  observed.resolve(tree);
+  await until(() => f.requests.length === 1);
+  f.reservation.resolve(f.ack());
+  await f.monitor.settle();
+  const d = norm(diagnostics);
+  assert.equal(d.authority_same_as_trigger, false);
+  assert.equal(d.trigger.sample_id, 1);
+  assert.equal(d.authority.sample_id, 2);
+  assert.equal(d.authority.started_at_ms, 10);
+  assert.equal(d.trigger.started_at_ms, 0);
+  await f.monitor.stop();
+});
+
+test("tree diagnostics count every enrolled candidate and every unavailable or rejected observation as a failure", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  const extra = (pid: number, observe: () => Promise<TreeObservation>) => f.commands.register(f.context, {
+    source: "codex-model-command", toolId: `tool-${pid}`, attemptId: "attempt",
+    root: { pid, startTime: "10" }, command: "inert fixture", observe,
+    cancel: async () => {}, drain: async () => ({ confirmed: true }),
+  });
+  extra(20, async () => ({ available: false, complete: false, startedAtMs: 0, completedAtMs: 0, rows: [] }));
+  extra(30, async () => { throw new Error("observe failed"); });
+  extra(40, async () => ({ available: true, complete: false, startedAtMs: 0, completedAtMs: 0, rows: [{ pid: 40, startTime: "10", rssBytes: 7 }] }));
+  f.monitor.tick();
+  await until(() => f.requests.length === 1);
+  f.reservation.resolve(f.ack());
+  await f.monitor.settle();
+  const d = norm(diagnostics);
+  assert.equal(d.tree.candidates, 4, "all four enrolled trees are candidates");
+  assert.equal(d.tree.observation_failures, 3, "one unavailable, one incomplete and one rejected observation");
+  assert.equal(d.tree.selected_rss_bytes_approx, 100, "the valid tree is still the selected one");
+  assert.equal(f.signals(), 1, "the intervention cancelled the valid tree only");
+  await f.monitor.stop();
+});
+
+test("a throwing observation getter on a phase-filtered candidate leaves the failure count unknown and never aborts the intervention", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  // A second run's context: holding its phase during observe makes its candidate stale, so
+  // phaseAdmits filters it out before select() and only the new failure count reads it.
+  const other = f.commands.begin({ ...f.input, run_id: "55555555-5555-4555-8555-555555555555",
+    memory_policy: { version: 1, max_interventions: 2 } });
+  f.commands.register(other, {
+    source: "codex-model-command", toolId: "tool-throwing", attemptId: "attempt",
+    root: { pid: 50, startTime: "10" }, command: "inert fixture",
+    observe: async () => {
+      f.commands.holdPhase(other);
+      return { get available(): boolean { throw new Error("getter boom"); }, complete: true, startedAtMs: 0, completedAtMs: 0, rows: [] } as TreeObservation;
+    },
+    cancel: async () => {}, drain: async () => ({ confirmed: true }),
+  });
+  f.monitor.tick();
+  await until(() => f.requests.length === 1);
+  f.reservation.resolve(f.ack());
+  await f.monitor.settle();
+  const d = norm(diagnostics);
+  assert.equal(d.tree.candidates, 2, "both enrolled trees were candidates");
+  assert.deepEqual(d.tree.observation_failures, { unavailable: "error" });
+  assert.equal(d.tree.selected_rss_bytes_approx, 100, "the valid tree is still the selected one");
+  assert.equal(f.signals(), 1, "the valid tree was reserved and cancelled");
+  await f.monitor.stop();
+});
+
+test("a denied admission never observed the tree again: cancel_check is not_observed", async () => {
+  let diagnostics: unknown;
+  const f = await fixture({ sampleOf: withDetail, prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+  f.monitor.tick();
+  await until(() => f.requests.length === 1);
+  f.reservation.resolve({ ...f.ack(), admitted: false, authorizing: false, allowance: { limit: 2, used: 2, remaining: 0 } });
+  await f.monitor.settle();
+  assert.equal(f.signals(), 0);
+  const d = norm(diagnostics);
+  assert.deepEqual(d.tree.cancel_check, { unavailable: "not_observed" });
+  assert.equal(d.tree.selected_rss_bytes_approx, 100);
+  await f.monitor.stop();
+});
+
+test("a cancel-time observation rejected by checkBeforeCancel is reported as not_observed, never as zero or error", async () => {
+  const base = { available: true, complete: true, startedAtMs: 0, completedAtMs: 0 };
+  const rejected: Array<[string, unknown]> = [
+    ["empty rows", { ...base, rows: [] }],
+    ["non-array rows", { ...base, rows: "not-rows" }],
+  ];
+  for (const [label, bad] of rejected) {
+    let diagnostics: unknown;
+    let observes = 0;
+    const good: TreeObservation = { ...base, rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] };
+    const f = await fixture({ sampleOf: withDetail,
+      observe: async () => ++observes === 1 ? good : bad as TreeObservation,
+      prepareFeedback: (_c, _r, d) => { diagnostics = d; } });
+    f.monitor.tick();
+    await until(() => f.requests.length === 1);
+    f.reservation.resolve(f.ack());
+    await f.monitor.settle();
+    assert.equal(observes, 2, `${label}: the cancel-time observation ran`);
+    assert.equal(f.signals(), 0, `${label}: no signal was sent`);
+    const d = norm(diagnostics);
+    assert.notDeepEqual(d, { version: 1, unavailable: "error" }, `${label}: diagnostics did not collapse`);
+    assert.deepEqual(d.tree.cancel_check, { unavailable: "not_observed" }, label);
+    assert.equal(d.tree.selected_rss_bytes_approx, 100, label);
+    await f.monitor.stop();
+  }
+});
+
+type Variant = "control" | "diagnostics" | "throws";
+async function runBranch(branch: "a" | "b" | "c", variant: Variant) {
+  const order: string[] = [];
+  let diagnostics: unknown = "unset";
+  const toolResults: unknown[] = [];
+  const throwing = { get missing(): never { throw new Error("detail boom"); }, get malformed(): never { throw new Error("detail boom"); } };
+  const f = await fixture({
+    ...(branch === "b" ? { policy: { version: 1 as const, max_interventions: 1 } } : {}),
+    sampleOf: (n, time, usage) => sample(n, time, usage, { statDetail: (variant === "throws" ? throwing : detail) as Sample["statDetail"] }),
+    ...(variant === "control"
+      ? { prepareFeedback: () => { order.push("prepareFeedback"); } }
+      : { prepareFeedback: (_c: unknown, _r: unknown, d?: unknown) => { order.push("prepareFeedback"); diagnostics = d; } }),
+    preparePreservation: () => { order.push("preparePreservation"); },
+    feedback: async () => { order.push("feedback"); },
+    preserve: async () => { order.push("preserve"); },
+    report: async (request) => {
+      order.push("report");
+      if (branch === "c") throw new Error("never confirmed");
+      const reserved = f.requests.find((r) => r.intervention_id === request.intervention_id)!;
+      return { ...f.ack(reserved, Math.min(1, reserved.policy.max_interventions - 1)), authorizing: false, outcome: request.outcome };
+    },
+  });
+  const resolve = f.commands.resolveToolOutcome.bind(f.commands);
+  f.commands.resolveToolOutcome = (entry, result) => { order.push("resolveToolOutcome"); toolResults.push(result); return resolve(entry, result); };
+  f.monitor.tick();
+  await until(() => f.requests.length === 1);
+  f.reservation.resolve(f.ack(undefined, branch === "b" ? 0 : 1));
+  await f.monitor.settle();
+  const reads = f.reads();
+  await f.monitor.stop();
+  return { order, diagnostics, toolResults: norm(toolResults), requests: norm(f.requests), reports: norm(f.reports), feedback: norm(f.feedback), reads };
+}
+
+const ORDER = {
+  a: ["prepareFeedback", "resolveToolOutcome", "feedback", "report"],
+  b: ["prepareFeedback", "preparePreservation", "resolveToolOutcome", "feedback", "preserve", "report"],
+  c: ["prepareFeedback", "resolveToolOutcome", "feedback", "report", "report", "report", "preparePreservation", "preserve", "report"],
+};
+for (const branch of ["a", "b", "c"] as const) {
+  test("diagnostics never reorder finish/intervene or alter results and bodies: branch " + branch, async () => {
+    const control = await runBranch(branch, "control");
+    const withDiag = await runBranch(branch, "diagnostics");
+    const broken = await runBranch(branch, "throws");
+    assert.deepEqual(control.order, ORDER[branch]);
+    assert.deepEqual(withDiag.order, control.order);
+    assert.deepEqual(broken.order, control.order);
+    assert.equal((withDiag.diagnostics as { version: number }).version, 1);
+    assert.equal((withDiag.diagnostics as { unavailable?: string }).unavailable, undefined);
+    assert.deepEqual(broken.diagnostics, { version: 1, unavailable: "error" });
+    for (const run of [withDiag, broken]) {
+      assert.deepEqual(run.toolResults, control.toolResults);
+      assert.deepEqual(run.feedback, control.feedback);
+      assert.deepEqual(run.requests, control.requests);
+      assert.deepEqual(run.reports, control.reports);
+      assert.equal(JSON.stringify(run.toolResults).includes("memory_diagnostics"), false);
+      assert.equal(run.reads, 1, "only sample() is called by the monitor");
+    }
+  });
+}

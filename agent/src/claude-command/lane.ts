@@ -435,6 +435,9 @@ export class ClaudeCommandLane {
         onSpawned: (root, child) => {
           live.child = child;
           if (root.startTime !== undefined) this.roots.set(live.id, { pid: root.pid, startTime: root.startTime });
+          // issue #3915: an unrecorded supervisor exempts nothing, so a peer run's quiescence
+          // proof cannot attribute it. Say so where the pod log keeps it.
+          else this.opts.log.warn("guarded command supervisor root not recorded: start time unreadable", { pid: root.pid });
         },
       }, deadlineAt === undefined ? undefined : Math.max(1, Math.min(LAUNCH_STARTED_MS, deadlineAt - this.now())));
     } catch (error) {

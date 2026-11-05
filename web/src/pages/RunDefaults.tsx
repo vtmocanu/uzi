@@ -566,8 +566,13 @@ export function RunDefaults() {
     codexUsable,
     defaultHarness === "inherit" ? null : defaultHarness,
   );
-  const badgeOnClaude = showClaudeLane && !effectiveIsCodex;
-  const badgeOnCodex = showCodexLane && effectiveIsCodex;
+  // Automatic with both harnesses usable is chosen per run by weekly limits, so no
+  // single lane is "the default"; a pinned default or a sole usable harness keeps its badge.
+  const chosenPerRun = showHarnessSelector && defaultHarness === "inherit";
+  const badgeOnClaude = showClaudeLane && !effectiveIsCodex && !chosenPerRun;
+  const badgeOnCodex = showCodexLane && effectiveIsCodex && !chosenPerRun;
+  // Overflow only applies to an explicit saved default (the server ignores it when automatic).
+  const overflowNeedsExplicitDefault = savedHarness === "inherit";
 
   // Dirty state is independent per field, but Save resends BOTH model lanes together
   // with the harness. Compare each trimmed draft to its own saved snapshot.
@@ -644,7 +649,7 @@ export function RunDefaults() {
       ? "Codex is your default harness. Your Claude model stays saved for runs that explicitly use Claude."
       : defaultHarness === "claude"
         ? "Claude is your default harness. Your Codex model stays saved for runs that explicitly use Codex."
-        : "Harness selection is automatic. Both model choices stay saved; uzi uses your only usable harness, or Claude when both are usable.";
+        : "Harness selection is automatic. Both model choices stay saved; uzi uses your only usable harness, and when both are usable it chooses per run by weekly limits.";
 
   return (
     <SettingsShell description="How your runs behave: autopilot, usage limits, the judge, CI fixes, the model, and reasoning effort.">
@@ -1166,9 +1171,14 @@ export function RunDefaults() {
                 </Field>
                 <p className="text-xs text-faint">
                   Used when a run or schedule doesn't choose a harness explicitly. Leave it
-                  on <em>Default · automatic</em> to let uzi choose your only usable
-                  harness, or Claude when both are usable.
+                  on <em>Default · automatic</em> to let uzi use your only usable
+                  harness; when both are usable it chooses per run by weekly limits.
                 </p>
+                {chosenPerRun && (
+                  <Badge tone="brand" dot>
+                    Chosen per run by weekly limits
+                  </Badge>
+                )}
               </div>
             )}
 
@@ -1176,14 +1186,20 @@ export function RunDefaults() {
               <label className="flex items-center gap-3 text-sm text-fg">
                 <Toggle
                   checked={overflowEnabled}
-                  disabled={overflowBusy}
+                  disabled={overflowBusy || overflowNeedsExplicitDefault}
                   focusableWhenDisabled
                   onChange={enabled => void toggleOverflow(enabled)}
                   label="Overflow to the other harness when my default is near its limits"
-                  aria-describedby="harness-overflow-scope"
+                  aria-describedby={overflowNeedsExplicitDefault ? "harness-overflow-scope harness-overflow-automatic" : "harness-overflow-scope"}
                 />
                 Overflow to the other harness when my default is near its limits
               </label>
+              {overflowNeedsExplicitDefault && (
+                <p id="harness-overflow-automatic" className="text-xs text-faint">
+                  Overflow applies only when a Claude or Codex default harness is saved.
+                  {showHarnessSelector && " With Default · automatic, uzi already picks by weekly limits."}
+                </p>
+              )}
               <p id="harness-overflow-scope" className="text-xs text-faint">
                 Saves automatically. Applies only to new issue runs started manually, by autopilot
                 or by a schedule, when both harnesses are usable. Explicit harnesses, run model pins,

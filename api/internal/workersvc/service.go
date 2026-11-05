@@ -425,8 +425,14 @@ func (e *CapabilityUnmetError) Unwrap() error { return ErrCapabilityUnmet }
 // delete (PRD #1296 M4, D3), so the handler/CLI (M4b) can name how many captures a
 // forced discard would destroy. It unwraps to ErrWorkerHasCustody, so the handler both
 // matches the sentinel (→ 409) and surfaces the specific count via err.Error(). Same
-// shape as CapabilityUnmetError.
-type WorkerHasCustodyError struct{ Holds int64 }
+// shape as CapabilityUnmetError. List (#3921) names up to 10 of the blocking holds, oldest
+// first, so the operator can find the runs to recover or discard; it may be shorter than
+// Holds (cap, or holds released between the count and the listing) and Holds stays the
+// authoritative total. Error() is unchanged.
+type WorkerHasCustodyError struct {
+	Holds int64
+	List  []store.ListOpenCustodyHoldsForWorkerRow
+}
 
 func (e *WorkerHasCustodyError) Error() string {
 	return fmt.Sprintf("%s (%d custody hold(s) still open)", ErrWorkerHasCustody.Error(), e.Holds)
@@ -585,6 +591,9 @@ type Store interface {
 	ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff pgtype.Timestamptz) ([]store.ListActiveRunsAllRow, error)
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
 	GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error)
+	// GetRunOwnershipByWorker is RunOwnership's read: GetRunOwnedByWorker's row plus the
+	// held-seam cancellation_requested signal (issues #3860, #3937). Required, never optional.
+	GetRunOwnershipByWorker(ctx context.Context, arg store.GetRunOwnershipByWorkerParams) (store.GetRunOwnershipByWorkerRow, error)
 	// CountRunMessagesThrough counts the stored message seqs in [1..through] for a run, the
 	// terminal fence's contiguity probe (PRD #1391 Run B M3c, D3).
 	CountRunMessagesThrough(ctx context.Context, arg store.CountRunMessagesThroughParams) (int32, error)
@@ -720,6 +729,9 @@ type Store interface {
 	// CountOpenCustodyHoldsForWorker backs the DeleteWorker custody guard.
 	ListReleasableCustodyHolds(ctx context.Context) ([]store.ListReleasableCustodyHoldsRow, error)
 	CountOpenCustodyHoldsForWorker(ctx context.Context, arg store.CountOpenCustodyHoldsForWorkerParams) (int64, error)
+	// ListOpenCustodyHoldsForWorker names (capped) the holds that count covers, for the
+	// DeleteWorker 409 body (#3921).
+	ListOpenCustodyHoldsForWorker(ctx context.Context, arg store.ListOpenCustodyHoldsForWorkerParams) ([]store.ListOpenCustodyHoldsForWorkerRow, error)
 	// Run judge (PRD #46 M3): terminal-funnel enqueue, judge-run-scoped trace/review
 	// authz, the command-not-found scan input, and the review upsert.
 	GetUserByID(ctx context.Context, id uuid.UUID) (store.User, error)
@@ -1042,6 +1054,10 @@ type Store interface {
 	// converging with CancelRunServerSide — rather than being mis-classified as
 	// agent_failure. Worker-scoped because SetState holds a worker, not a user.
 	CancelRunByWorker(ctx context.Context, arg store.CancelRunByWorkerParams) (int64, error)
+	// CancelRunByWorkerSettlingCancel is CancelRunByWorker plus the settlement of the run's
+	// still-unapplied cancel inputs in the same statement (issue #3860). Only SetState's
+	// stop_kind='cancelled' arm uses it; the count is transitioned runs (0 or 1).
+	CancelRunByWorkerSettlingCancel(ctx context.Context, arg store.CancelRunByWorkerSettlingCancelParams) (int64, error)
 	// SupersedeRunByWorker is the live-worker terminal transition for an mr_rework or
 	// ci_fix run superseded by a concurrent branch advance: status 'cancelled',
 	// stop_kind='branch_moved', NULL failure fields, a server-composed stop_reason. Like
@@ -1607,7 +1623,7 @@ type Params struct {
 	// reads. That sharing is the point and not a convenience: the settings page and
 	// the selector classify the same token against the same thresholds, so they
 	// cannot disagree about whether it is eligible. Two Params-side literals mapping
-	// the four knobs independently would each be internally consistent and would drift
+	// the UZI_AUTOSELECT_* knobs independently would each be internally consistent and would drift
 	// with nothing going red (D21).
 	//
 	// The ZERO VALUE is a coherent, deliberate policy rather than a hole: MaxStaleness
@@ -5633,9 +5649,16 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 		case owned.StopKind.Valid && owned.StopKind.String == "cancelled":
 			// Route to a `cancelled` transition (status 'cancelled', fail_origin NULL),
 			// converging with the server-side CancelRunServerSide path. SetRunFailed is NOT
-			// called. rows drives the same applied/not-applied logic below (execrows, like
-			// SetRunFailed).
-			rows, err = q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
+			// called. rows (count of transitioned runs, 0 or 1) drives the same
+			// applied/not-applied logic below as SetRunFailed's row count.
+			// Issue #3860: the same statement settles the run's still-unapplied cancel
+			// inputs, so on this path the run never ends cancelled with a cancel row that was
+			// committed before the report still pending, and the row is never applied without
+			// the terminal transition (a declined transition leaves every input untouched). A
+			// cancel inserted concurrently with the report, or a report handled by an older
+			// api, can still leave an inert unapplied row on the terminal run. The stopped arm
+			// below keeps CancelRunByWorker and settles nothing.
+			rows, err = q.CancelRunByWorkerSettlingCancel(ctx, store.CancelRunByWorkerSettlingCancelParams{
 				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
 			})
 		case owned.StopKind.Valid && owned.StopKind.String == "stopped":
@@ -5646,7 +5669,7 @@ func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uu
 			// cancel win in steering and the worker threw REASON_CANCELLED. Either way it is a
 			// deliberate wind-down, not an agent bug, so it must NOT default to
 			// fail_origin='agent_failure' and must NOT be judged. Route to CancelRunByWorker
-			// exactly like the 'cancelled' arm: status 'cancelled', fail_origin NULL (CHECK-safe,
+			// (the 'cancelled' arm's transition without its #3860 input settlement): status 'cancelled', fail_origin NULL (CHECK-safe,
 			// no new vocabulary value), which Gate 0 of maybeEnqueueJudge excludes from judging.
 			rows, err = q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{
 				ID: runID, WorkerID: pgconv.UUID(wkr.ID),
@@ -6545,10 +6568,14 @@ func (s *Service) ListMemoryForRun(ctx context.Context, wkr store.Worker, runID 
 // forge pre-clone park (PRD #1392 M1, D10) uses the retry stamp to reconcile an unknown park
 // outcome after a transport failure — so a reconciled park can still quote its retry time. The
 // stamp is nil for a run that is not recovery-parked.
-func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, claimGeneration int64, holdReason *string, claimReleased bool, gateRevision int64, err error) {
-	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+//
+// cancellationRequested (issue #3860) is the read-only signal for the worker's held-seam
+// cancel: true only when the run is stamped stop_kind='cancelled' and a cancel input is still
+// deliverable (GetRunOwnershipByWorker, a required Store query).
+func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, claimGeneration int64, holdReason *string, claimReleased bool, gateRevision int64, cancellationRequested bool, err error) {
+	run, cancellationRequested, err := s.runOwnershipRead(ctx, runID, wkr)
 	if err != nil {
-		return "", nil, 0, nil, false, 0, err
+		return "", nil, 0, nil, false, 0, false, err
 	}
 	var retry *time.Time
 	if run.RecoveryRetryNotBefore.Valid {
@@ -6565,11 +6592,30 @@ func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid
 		reason := run.HoldReason.String
 		holdReason = WorkerVisibleHoldReason(&reason)
 	}
-	return run.Status, retry, run.ClaimGeneration, holdReason, run.ClaimReleasedAt.Valid, run.GateRevision, nil
+	return run.Status, retry, run.ClaimGeneration, holdReason, run.ClaimReleasedAt.Valid, run.GateRevision, cancellationRequested, nil
+}
+
+// runOwnershipRead is RunOwnership's read: the required GetRunOwnershipByWorker query (issue
+// #3937), whose row carries the run and its cancellation signal, under the shared Go-side
+// ownership verdict.
+func (s *Service) runOwnershipRead(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, bool, error) {
+	row, err := s.q.GetRunOwnershipByWorker(ctx, store.GetRunOwnershipByWorkerParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
+	run, err := ownedRunOrRefusal(runID, wkr, row.Run, err)
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	return run, row.CancellationRequested, nil
 }
 
 func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, error) {
 	run, err := s.q.GetRunOwnedByWorker(ctx, store.GetRunOwnedByWorkerParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
+	return ownedRunOrRefusal(runID, wkr, run, err)
+}
+
+// ownedRunOrRefusal is the Go-side ownership verdict shared by runOwnedByWorker and
+// runOwnershipRead: no row and the cross_check generation-0 / lane-mismatch refusals are all
+// ErrRunNotOwned.
+func ownedRunOrRefusal(runID uuid.UUID, wkr store.Worker, run store.Run, err error) (store.Run, error) {
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.Run{}, ErrRunNotOwned
@@ -6860,6 +6906,11 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 // inside the same successful checkpoint-tip write (set-only; a nil never clears a stored value).
 // An attestation is accepted only on a request stamped with the claim generation it was admitted
 // at, so a value is only ever bound to this run's current worker and generation.
+//
+// A publish is not one bounded push: the live path can run up to two pushes (the second after a
+// supersession) and detached retention work that outlives ctx. PublishServiceBound is the bound
+// on the whole call when ctx carries PublishContextBudget; the claim and free loops stop starting
+// supersessions once ctx is done.
 func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, attestedSource *string, pack []byte, generation *int64) (PublishResult, error) {
 	// PRD #1810 D2 (residual 2): the publish is routed on the status read below, and a
 	// live-routed push must be SENT within livePublishPrePushBudget of that routing. The clock
@@ -7524,10 +7575,11 @@ func (s *Service) WorkerProjectionForOwner(ctx context.Context, userID, workerID
 // and a preauthorized recovery upload may still need that token to authenticate — the
 // last authenticated retry path must survive until custody is released or explicitly
 // discarded. The error carries the count so M4b's CLI confirmation can name the
-// affected captures. This guard is placed BEFORE the delete so the token row is never
-// cascaded away while an upload could still need it. (The M1 live_worker_id
-// ON DELETE RESTRICT FK is the fail-closed backstop; this guard turns it into a clean,
-// enumerated 409 instead of a raw constraint 500.)
+// affected captures, and (#3921) lists up to 10 of the blocking holds. This guard is
+// placed BEFORE the delete so the token row is never cascaded away while an upload
+// could still need it. (The M1 live_worker_id ON DELETE RESTRICT FK is the fail-closed
+// backstop; this guard turns it into a clean, enumerated 409 instead of a raw
+// constraint 500.)
 func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) error {
 	active, err := s.q.CountWorkerNonTerminalRuns(ctx, store.CountWorkerNonTerminalRunsParams{
 		WorkerID: pgconv.UUID(workerID), UserID: userID,
@@ -7556,7 +7608,16 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 		return err
 	}
 	if holds > 0 {
-		return &WorkerHasCustodyError{Holds: holds}
+		// #3921: name the blocking holds (same predicate as the count, capped). A listing
+		// failure is returned as-is (500), mirroring the active-runs listing above.
+		list, err := s.q.ListOpenCustodyHoldsForWorker(ctx, store.ListOpenCustodyHoldsForWorkerParams{
+			WorkerID: workerID,
+			UserID:   userID,
+		})
+		if err != nil {
+			return err
+		}
+		return &WorkerHasCustodyError{Holds: holds, List: list}
 	}
 	n, err := s.q.DeleteWorkerForUser(ctx, store.DeleteWorkerForUserParams{ID: workerID, UserID: userID})
 	if err != nil {
@@ -7978,11 +8039,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// no second connection is taken while this closure holds the run-branch lock.
 		effOverride := credOverride
 		requestOverride := rawOverride
-		if requestOverride != nil && requestOverride.Mode == CredentialOverrideModeInherit &&
-			resolved.Decision != nil && resolved.Decision.Reason == "overflow" {
+		if requestOverride != nil && requestOverride.Mode == CredentialOverrideModeInherit && clearsInheritOverride(resolved) {
 			// Inherit carries no Anthropic assignment. Normalize it only for
-			// this new creation-time decision; the shared validator retains
-			// its existing Codex refusal for explicit/default/off paths.
+			// a creation-time overflow or an automatic decision that chose Codex;
+			// the shared validator retains its existing Codex refusal for
+			// explicit/default/off paths.
 			requestOverride = nil
 		}
 		if requestOverride != nil {

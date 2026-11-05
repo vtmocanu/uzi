@@ -79,6 +79,8 @@ persistent data volumes grow from 10Gi to 25Gi. Ephemeral data retains its
 separate 20Gi default. Existing persistent `m` data PVCs keep 10Gi until
 reprovisioned; the controller never patches an existing PVC's size.
 
+**Supersession note (#3890, 2026-11-04):** that last clause no longer holds. The controller now converges an existing `/data` claim's request upward to the preset size where the StorageClass permits expansion, and never shrinks or recreates it, so an existing `m` claim can reach 25Gi. See [ADR-3890](3890-worker-pvc-expansion.md).
+
 Compared with the `l` preset at this amendment, this saves 6Gi of memory
 reservation per ephemeral worker with the same CPU request and burst ceiling. The shipped CPU/storage
 quotas and LimitRange maxima at that point admitted `l`'s 1/4 CPU and 25Gi data.

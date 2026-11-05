@@ -74,6 +74,9 @@ type rollTick struct {
 	migrationFences   map[string]bool
 	migrationMultiple bool
 	pollDrained       map[string]bool
+	// storageClasses memoises this tick's StorageClass expandability lookups
+	// (issue #3890), reset with every Reconcile because the tick is rebuilt.
+	storageClasses map[string]string
 }
 type rollTickKey struct{}
 

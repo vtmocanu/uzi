@@ -12,12 +12,13 @@ import { LineDiff } from "./LineDiff";
 import type { AgentTemplateInput, BuiltinDefinition } from "../lib/api";
 import { Alert, Button, Field, Input, Select } from "./ui";
 import { ModelSelect } from "./ModelSelect";
+import { CODEX_ROLE_MODELS } from "../lib/codexModels";
 import {
   frontmatterFieldWarning,
   KNOWN_TOOLS,
   isLeadTemplateName,
   looseSecretWarning,
-  modelFieldWarning,
+  templateModelFieldWarning,
   templateModelDefaultLabel,
   renderSubagent,
   splitToolInput,
@@ -31,6 +32,7 @@ export interface EditorInitial {
   name: string;
   description: string;
   model: string | null;
+  codex_model?: string | null;
   tools: string[] | null;
   prompt_body: string;
 }
@@ -97,6 +99,7 @@ export const AgentTemplateEditor = forwardRef<
   const [scope, setScope] = useState<"global" | "user">("user");
   const [description, setDescription] = useState(initial.description);
   const [model, setModel] = useState(initial.model ?? "");
+  const [codexModel, setCodexModel] = useState(initial.codex_model ?? "");
   const [tools, setTools] = useState<string[]>(initial.tools ?? []);
   const [promptBody, setPromptBody] = useState(initial.prompt_body);
   const [toolDraft, setToolDraft] = useState("");
@@ -106,10 +109,11 @@ export const AgentTemplateEditor = forwardRef<
     [description, promptBody],
   );
   const unknown = useMemo(() => unknownTools(tools), [tools]);
-  const modelWarning = useMemo(() => modelFieldWarning(model), [model]);
+  const modelWarning = useMemo(() => templateModelFieldWarning(model, "claude"), [model]);
+  const codexModelWarning = useMemo(() => templateModelFieldWarning(codexModel, "codex"), [codexModel]);
   const injectionWarning = useMemo(
-    () => frontmatterFieldWarning({ description, model, tools }),
-    [description, model, tools],
+    () => frontmatterFieldWarning({ description, model: "", tools }),
+    [description, tools],
   );
 
   const preview = useMemo(
@@ -132,10 +136,11 @@ export const AgentTemplateEditor = forwardRef<
     () => ({
       description,
       model: model.trim() || null,
+      codex_model: codexModel.trim() || null,
       tools: tools.length ? tools : null,
       prompt_body: promptBody,
     }),
-    [description, model, tools, promptBody],
+    [description, model, codexModel, tools, promptBody],
   );
 
   useImperativeHandle(ref, () => ({ currentContent: () => currentContent }), [currentContent]);
@@ -161,12 +166,14 @@ export const AgentTemplateEditor = forwardRef<
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
+    if (busy || injectionWarning || modelWarning || codexModelWarning) return;
     onSubmit({
       ...(nameEditable ? { name: name.trim() } : {}),
       // A non-admin can only author a user template; scope rides only on create.
       ...(scopeEditable ? { scope: isAdmin ? scope : "user" } : {}),
       description: description.trim(),
       model: model.trim() || null,
+      codex_model: codexModel.trim() || null,
       tools: tools.length ? tools : null,
       prompt_body: promptBody,
     });
@@ -220,20 +227,45 @@ export const AgentTemplateEditor = forwardRef<
       </Field>
 
       <div className="space-y-2">
-        <Field label="Model" htmlFor="template-model">
-          <ModelSelect
-            id="template-model"
-            value={model}
-            onChange={setModel}
-            defaultLabel={templateModelDefaultLabel(name)}
-          />
-        </Field>
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div className="space-y-2">
+            <Field label="Claude model" htmlFor="template-model">
+              <ModelSelect
+                id="template-model"
+                harness="claude"
+                allowCustom
+                value={model}
+                onChange={setModel}
+                defaultLabel={templateModelDefaultLabel(name, "claude")}
+                ariaDescribedBy="template-model-help"
+              />
+            </Field>
+            {modelWarning && <Alert message={modelWarning} tone="warning" />}
+          </div>
+          <div className="space-y-2">
+            <Field label="Codex model" htmlFor="template-codex-model">
+              <ModelSelect
+                id="template-codex-model"
+                harness="codex"
+                models={CODEX_ROLE_MODELS}
+                allowCustom={false}
+                value={codexModel}
+                onChange={setCodexModel}
+                defaultLabel={templateModelDefaultLabel(name, "codex")}
+                ariaDescribedBy="template-model-help"
+              />
+            </Field>
+            {codexModelWarning && <Alert message={codexModelWarning} tone="warning" />}
+          </div>
+        </div>
+        <p id="template-model-help" className="text-xs text-muted">
+          Leave a harness on Default so this subagent uses whatever the lead runs on. A schedule with “Apply model also to agents” on overrides these pins.
+        </p>
         {isLeadTemplateName(name) && (
-          <p className="text-xs text-faint">
-            A user's worker model (Settings → Run defaults) overrides this for their own runs.
+          <p className="text-xs text-muted">
+            Each harness's Run defaults model takes precedence over its lead template pin.
           </p>
         )}
-        {modelWarning && <Alert message={modelWarning} tone="warning" />}
       </div>
 
       <div className="space-y-1.5">
@@ -321,7 +353,7 @@ export const AgentTemplateEditor = forwardRef<
         </pre>
       </div>
 
-      <Button type="submit" disabled={busy || !!injectionWarning}>
+      <Button type="submit" disabled={busy || !!injectionWarning || !!modelWarning || !!codexModelWarning}>
         {submitLabel}
       </Button>
     </form>
@@ -401,10 +433,18 @@ function BuiltinDiff({
       )}
 
       {changed.includes("model") && (
-        <DiffField label="Model">
+        <DiffField label="Claude model">
           <span className="text-ok">{shipped.model ?? templateModelDefaultLabel(shipped.name)}</span>
           <span className="text-faint"> → </span>
           <span className="text-danger">{current.model ?? templateModelDefaultLabel(shipped.name)}</span>
+        </DiffField>
+      )}
+
+      {changed.includes("codex model") && (
+        <DiffField label="Codex model">
+          <span className="text-ok">{shipped.codex_model || templateModelDefaultLabel(shipped.name, "codex")}</span>
+          <span className="text-faint"> → </span>
+          <span className="text-danger">{current.codex_model || templateModelDefaultLabel(shipped.name, "codex")}</span>
         </DiffField>
       )}
 

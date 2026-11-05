@@ -374,7 +374,7 @@ The precedence inside an issue fire is:
 
 | Fresh issue labels | Schedule harness pin | Result |
 |---|---|---|
-| No `harness::*` label | None | Existing automatic resolution (D11): usable user default, otherwise a usable harness, Claude if both. |
+| No `harness::*` label | None | Existing automatic resolution (D11): usable user default; otherwise your only usable harness; with both usable and no default, [chosen by weekly limits](./rate-limits.md#how-the-automatic-default-picks-a-harness) for an eligible run and Claude otherwise. |
 | No `harness::*` label | Claude or Codex | Use the stored pin, without cross-harness fallback. |
 | Exactly `harness::claude` or `harness::codex` | None | Explicitly select that harness, without credential fallback to the other. |
 | One recognized label | Matching pin | Use the pin. |

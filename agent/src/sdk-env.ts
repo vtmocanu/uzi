@@ -21,6 +21,7 @@
 // (resume). PATH is inherited so the bundled Claude Code CLI can find `git`,
 // `bash`, and coreutils.
 
+import { BROWSER_DISCOVERY_ENV } from "./browser-env.js";
 import { goConcurrencyEnv } from "./go-concurrency.js";
 import { runnerPath, runnerTmpdir } from "./runner-uid.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV } from "./worker-spawn-mark.js";
@@ -38,6 +39,11 @@ const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   // live conflict; protecting it keeps the --no-sandbox guarantee durable against
   // allowlist drift, so a provisioned var can never overwrite or drop it.
   "AGENT_BROWSER_ARGS",
+  // Issue #3907: the browser discovery paths (AGENT_BROWSER_EXECUTABLE_PATH, CHROME_PATH),
+  // worker-set to the uzi-chromium wrapper after the fold below; a provisioned var can
+  // never redirect discovery to an unwrapped Chromium. Defence in depth: the post-fold
+  // assignment alone already wins; this keeps the guarantee if that ever becomes conditional.
+  ...Object.keys(BROWSER_DISCOVERY_ENV),
   // Non-secret, worker-owned path to the immutable verified sqlc archive cache.
   "UZI_SQLC_DIR",
   // issue #1783 (R2/R4): the run-attempt marker and the worker spawn mark. The quiescence
@@ -129,10 +135,13 @@ export function buildSdkEnv(
     // environment (templates/base/Dockerfile:225), so whichever agent-browser binary
     // resolves (the real npm CLI by absolute path, a provisioned same-name binary, a
     // foreign runner-child PATH) inherits it. This is a DELIBERATE, SCOPED reversal of
-    // PRD #87 M4, which kept AGENT_BROWSER_* shim-only to keep the agent env minimal: only
-    // this key crosses the boundary because it is a non-secret launch FLAG (not a
+    // PRD #87 M4, which kept AGENT_BROWSER_* shim-only to keep the agent env minimal: this
+    // key crosses the boundary because it is a non-secret launch FLAG (not a
     // credential or a path into the worker) — the same reasoning that added DOCKER_HOST
-    // below. The other AGENT_BROWSER_* / FONTCONFIG / XDG vars STAY shim-only.
+    // below. Issue #3907 narrowed the rule: the two discovery paths
+    // (AGENT_BROWSER_EXECUTABLE_PATH, CHROME_PATH) also cross, set after the toolEnv fold
+    // to the uzi-chromium wrapper. FONTCONFIG / XDG / idle-timeout vars STAY in the
+    // shim and the wrapper.
     AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage",
   };
   // 5-bis: the agent's scratch on the runner's private 0700 TMPDIR under the split.
@@ -159,6 +168,9 @@ export function buildSdkEnv(
   // provision allowlist never emits it, so the fold above cannot carry it. Set it AFTER
   // the fold so a provisioned var can never clobber the worker's wired endpoint.
   if (dockerHost) env.DOCKER_HOST = dockerHost;
+  // Issue #3907: browser discovery points at the uzi-chromium wrapper, set AFTER the fold
+  // (and protected above) so a provisioned var can neither redirect nor drop it.
+  Object.assign(env, BROWSER_DISCOVERY_ENV);
   // issue #1783 (R2): the attempt marker, set AFTER the fold (and protected above) so a
   // provisioned var can neither forge nor clear it. Absent attempt ⇒ no key at all.
   if (attempt) {

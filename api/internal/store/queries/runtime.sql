@@ -962,6 +962,27 @@ ORDER BY w.created_at DESC;
 SELECT * FROM runs WHERE id = @id AND worker_id = @worker_id
   AND (kind <> 'cross_check' OR claim_generation > 0);
 
+-- name: GetRunOwnershipByWorker :one
+-- Issue #3860: GetRunOwnedByWorker plus a READ-ONLY signal for the worker's held-seam cancel.
+-- cancellation_requested is true only when the run carries the server-stamped
+-- stop_kind='cancelled' AND at least one cancel input is still deliverable, i.e. unapplied,
+-- not superseded and not covered by a milestone-reconciliation stop_cutoff (the same
+-- deliverability triple as ListReplayRunInputs). The COALESCE is mandatory: a NULL stop_kind
+-- would otherwise make the whole predicate NULL, and the field must be false, never NULL.
+-- Nothing is written, applied or consumed here.
+SELECT sqlc.embed(runs),
+       (COALESCE(runs.stop_kind = 'cancelled', false)
+        AND EXISTS (
+            SELECT 1 FROM run_user_inputs i
+            WHERE i.run_id = runs.id AND i.kind = 'cancel'
+              AND i.applied_at IS NULL AND i.disposition IS DISTINCT FROM 'superseded'
+              AND NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations a
+                              WHERE a.run_id = i.run_id AND i.id <= a.stop_cutoff)
+        ))::boolean AS cancellation_requested
+FROM runs
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0);
+
 -- name: GetRunOrphanIdentity :one
 -- Orphan-classification read (issue #1319): DISTINCT from GetRunOwnedByWorker. Scoped to
 -- the worker's OWNER (user) and the claimant's repo, NOT worker_id, so a terminal owner
@@ -1010,7 +1031,26 @@ FROM runs WHERE id = @id AND user_id = @user_id AND repo_id = @repo_id;
 -- statement is `UPDATE runs ... RETURNING *`, so the :one result is still store.Run — the
 -- hold is a side effect. target and hold share target's single snapshot/lock, so the hold's
 -- t.claim_generation + 1 equals the UPDATE's own increment.
-WITH claimant AS MATERIALIZED (
+-- Materialize the template value once per owner, not per checker row. Keeping
+-- the expensive selection out of the row-correlated predicate also avoids
+-- inflating health/placement plan cost into an earlier JIT threshold.
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT DISTINCT r.user_id FROM runs r
+        WHERE r.kind = 'cross_check' AND r.harness = 'codex'
+          AND r.status = 'queued' AND r.user_id = @user_id
+    ) owners
+), claimant AS MATERIALIZED (
     SELECT * FROM workers WHERE id = @worker_id FOR UPDATE
 ), target AS (
     SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id,
@@ -1302,9 +1342,12 @@ WITH claimant AS MATERIALIZED (
       -- PRD #1551 M4 (D6): the NON-BYPASSABLE custom-Codex-model claim clause, a SIBLING of the
       -- codex-harness clause directly above. A Codex run whose EFFECTIVE worker-root model is a
       -- CUSTOM (non-curated) id may be claimed ONLY by a worker whose protocol_capabilities contain
-      -- 'codex_custom_model_v1'. The effective root follows D4 precedence rendered in SQL: a frozen
-      -- r.model that is itself a curated id wins (curated ⇒ no new requirement), otherwise the
-      -- owner's default_codex_model lane. Task-review (review_target_run_id IS NOT NULL), judge and
+      -- 'codex_custom_model_v1'. Cross-check roots follow ResolveCrossCheck: checker model pin,
+      -- owner default_codex_model, then the first delivered lead template's valid Codex role pin.
+      -- A null/invalid template implies the curated fallback, so NULL is not custom here. Never
+      -- skip a first lead whose pin is NULL/invalid in favor of a later lead. Ordinary runs keep
+      -- D4 precedence: a frozen curated r.model wins, otherwise the owner's Codex default lane.
+      -- Task-review (review_target_run_id IS NOT NULL), judge and
       -- chat are EXEMPT — assembly reads no Codex lane for them — so the exemption is keyed on
       -- review_target_run_id/kind, NEVER on all of kind='task'. NULL-safe via COALESCE: a NULL
       -- r.model AND NULL lane make the effective root NULL, so the inner NOT(... = ANY ...) is NULL
@@ -1318,7 +1361,8 @@ WITH claimant AS MATERIALIZED (
               AND r.kind NOT IN ('judge', 'chat')
               AND r.review_target_run_id IS NULL
               AND COALESCE(
-                  NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
+                  NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
+                      (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
                              ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
                        = ANY(@codex_curated_models::text[])),
                   false)
@@ -1576,7 +1620,8 @@ WITH claimant AS MATERIALIZED (
                         AND r.kind NOT IN ('judge', 'chat')
                         AND r.review_target_run_id IS NULL
                         AND COALESCE(
-                            NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
+                            NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
+                                (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
                                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id) END)
                                  = ANY(@codex_curated_models::text[])),
                             false)
@@ -5358,6 +5403,75 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_che
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
   AND runs.id IN (SELECT run_id FROM eligible_candidates);
+
+-- name: CancelRunByWorkerSettlingCancel :one
+-- Issue #3860: CancelRunByWorker plus the settlement of the run's still-unapplied cancel
+-- inputs in the SAME statement, for SetState's stop_kind='cancelled' arm only. A held-seam
+-- cancel report must never leave the run cancelled with its cancel row pending, and the
+-- row must never be applied without the terminal transition: a declined transition (stale
+-- generation, already-terminal run) leaves every input untouched. Follows the precedent
+-- SetRunFailedPlanRejected: the `cancelled` CTE MUST stay in lockstep with CancelRunByWorker
+-- (candidates chain, every SET field and every WHERE guard copied from it). The result counts
+-- TRANSITIONED RUNS (0 or 1), never the settled inputs, so a run whose cancel row an older
+-- worker already APPLIED still reports 1.
+WITH candidates AS MATERIALIZED (
+    SELECT runs.id, runs.kind FROM runs
+    WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
+  AND runs.claim_released_at IS NULL
+  AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+), parent_mapping AS MATERIALIZED (
+    SELECT candidates.id AS run_id, parent.id AS parent_id
+    FROM candidates
+    LEFT JOIN cross_checks cc ON candidates.kind = 'cross_check'
+        AND cc.checker_run_id = candidates.id
+    LEFT JOIN runs parent ON parent.id = CASE WHEN candidates.kind = 'cross_check'
+        THEN cc.lead_run_id ELSE candidates.id END
+        AND parent.kind <> 'cross_check'
+), locked_parents AS MATERIALIZED (
+    SELECT lead.* FROM runs lead
+    WHERE lead.id IN (SELECT parent_id FROM parent_mapping)
+      AND lead.kind <> 'cross_check'
+    ORDER BY lead.id
+    FOR UPDATE OF lead
+), parent_lock_set AS MATERIALIZED (
+    -- Consume every selected parent lock before taking a checker lock.
+    SELECT array_agg(id) AS ids FROM locked_parents
+), eligible_candidates AS MATERIALIZED (
+    SELECT DISTINCT mapping.run_id
+    FROM parent_mapping mapping CROSS JOIN parent_lock_set locks
+    WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
+), cancelled AS (
+    UPDATE runs SET
+        plan_cross_check_gate_reason = NULL,
+        status             = 'cancelled',
+        status_since       = now(),
+        fail_origin        = NULL,
+        move_pending_since = CASE WHEN runs.issue_iid IS NOT NULL THEN now() END,
+        finished_at        = now(),
+        -- PRD #265 D4: "in progress" is meaningless on a terminal run; clear the snapshot.
+        milestones_in_progress = NULL,
+        milestones_agents = NULL,
+        -- PRD #1190 M1: a terminal run carries no pending pause (root-cause clear; see SetRunCompleted).
+        pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+        credential_switch_requested_at = NULL, credential_switch_generation = NULL, -- PRD #1247 D11 fix round: a terminal run settles a pending held switch (PRD #1190 pause-clear pattern) so the DTO never sticks at credential_switch:"requested" and PendingCredentialSwitchSignal (status-agnostic) can never signal a dead run
+        -- Exit contract (PRD #47 Decision 3): a terminal run carries no health flag.
+        health = 'ok', health_reason = NULL, health_since = NULL,
+        updated_at         = now()
+    WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
+      AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason = 'iteration_budget_exhausted', FALSE))
+      AND runs.claim_released_at IS NULL
+      AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+      AND runs.id IN (SELECT run_id FROM eligible_candidates)
+    RETURNING runs.id
+),
+settled AS (
+    UPDATE run_user_inputs SET applied_at = now(), consumed_at = COALESCE(consumed_at, now())
+    WHERE run_id IN (SELECT id FROM cancelled) AND kind = 'cancel' AND applied_at IS NULL
+      AND disposition IS DISTINCT FROM 'superseded'
+    RETURNING 1
+)
+SELECT count(*) FROM cancelled;
 
 -- name: SupersedeRunByWorker :execrows
 -- SetState allowlists mr_rework/ci_fix branch_moved reports and composes the bounded
@@ -10362,8 +10476,9 @@ WHERE id = @id;
 -- custom-Codex-model predicate onto each row, so the queued arm can surface a custom-Codex-capability
 -- reason for a run whose EFFECTIVE worker-root model is a CUSTOM (non-curated) id that no online
 -- worker advertising codex_custom_model_v1 can claim. The effective-root expression is written
--- IDENTICALLY to ClaimRun (a frozen curated runs.model wins, otherwise the owner's default_codex_model
--- lane; NULL-safe via COALESCE), and the exemption is keyed on review_target_run_id/kind (task-review,
+-- IDENTICALLY to ClaimRun (cross-check: checker pin, owner lane, first delivered valid Codex template
+-- pin; ordinary run: frozen curated runs.model, then owner lane; NULL-safe via COALESCE). The
+-- exemption is keyed on review_target_run_id/kind (task-review,
 -- judge and chat are exempt), NEVER on all of kind='task'. Cast ::boolean so sqlc types it as a usable
 -- bool (an expression is interface{} without the cast, per .claude/rules/go.md).
 -- PRD #1906 M5: egress_profile_id rides this read so the queued arm names the isolated lane for a
@@ -10385,6 +10500,23 @@ WHERE id = @id;
 -- owner row is gone (COALESCE keeps the scan target a plain string).
 -- #3000: owner_hold_pinnable projects ClaimRun's independent draining/maintenance
 -- hold; Go applies the inclusive updated_at + affinity ceiling and reuses the owner name.
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT DISTINCT r.user_id FROM runs r
+        WHERE r.kind = 'cross_check' AND r.harness = 'codex'
+          AND r.status IN ('queued', 'claimed', 'running', 'awaiting_approval')
+    ) owners
+)
 SELECT id, runs.user_id, status, auto_approve,
        admission.codex_admission_class, admission.codex_admission_eligible_at,
        cooldown.account_cooldown_class, cooldown.account_cooldown_eligible_at,
@@ -10419,7 +10551,8 @@ SELECT id, runs.user_id, status, auto_approve,
         AND runs.kind NOT IN ('judge', 'chat')
         AND runs.review_target_run_id IS NULL
         AND COALESCE(
-            NOT ((CASE WHEN runs.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id)) WHEN runs.model = ANY(@codex_curated_models::text[]) THEN runs.model
+            NOT ((CASE WHEN runs.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id),
+                (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = runs.user_id)) WHEN runs.model = ANY(@codex_curated_models::text[]) THEN runs.model
                        ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = runs.user_id) END)
                  = ANY(@codex_curated_models::text[])),
             false))::boolean AS codex_custom_root,
@@ -10609,7 +10742,22 @@ WHERE w.user_id = @user_id
 -- any worker's availability, and the health resolver reports it through its own queued-run reason
 -- (ListActiveRunsForHealth.reserve_hold_reason, read by healthTargetFor), so folding it in here
 -- would turn "weekly reserve" into a bogus "no worker can claim" reading.
-WITH candidates AS (
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT r.user_id FROM runs r
+        WHERE r.id = @run_id AND r.kind = 'cross_check' AND r.harness = 'codex'
+    ) owners
+), candidates AS (
 SELECT w.id,
        fn_forge_origin_eligible(w,run,@cross_check_evaluated_at::timestamptz)::boolean AS forge_eligible,
        EXISTS (SELECT 1 FROM authorized_forge_origins a JOIN forge_origin_cooldowns c
@@ -10755,7 +10903,8 @@ WHERE run.id = @run_id
           AND run.kind NOT IN ('judge', 'chat')
           AND run.review_target_run_id IS NULL
           AND COALESCE(
-              NOT ((CASE WHEN run.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = run.id WHERE pin.user_id = run.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id)) WHEN run.model = ANY(@codex_curated_models::text[]) THEN run.model
+              NOT ((CASE WHEN run.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = run.id WHERE pin.user_id = run.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id),
+                  (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = run.user_id)) WHEN run.model = ANY(@codex_curated_models::text[]) THEN run.model
                          ELSE (SELECT u.default_codex_model FROM users u WHERE u.id = run.user_id) END)
                    = ANY(@codex_curated_models::text[])),
               false)
@@ -11103,6 +11252,23 @@ WHERE w.user_id = @user_id
 --
 -- Effective run priority comes first, then created_at breaks equal-rank ties by age; LIMIT
 -- @max_rows bounds the work per tick.
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT DISTINCT r.user_id FROM runs r
+        JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
+        WHERE r.kind = 'cross_check' AND r.harness = 'codex' AND r.status = 'queued'
+    ) owners
+)
 SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
@@ -11206,7 +11372,8 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
+                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
+                                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
                                   = ANY(@codex_curated_models::text[])),
                              false)
@@ -11343,6 +11510,23 @@ LIMIT @max_rows;
 --
 -- Effective run priority comes first, then status_since (the debounce clock) breaks
 -- equal-rank ties by longest queue wait. LIMIT @max_rows bounds the work per tick.
+WITH checker_template_pins AS MATERIALIZED (
+    SELECT owners.user_id,
+           (SELECT CASE WHEN t.codex_model IN ('gpt-6-astra', 'gpt-5.6-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-6.1-sol') THEN t.codex_model END
+            FROM agent_templates t
+            LEFT JOIN agent_template_allocations uo ON uo.template_id = t.id AND uo.user_id = owners.user_id
+            LEFT JOIN agent_template_allocations g ON g.template_id = t.id AND g.user_id IS NULL
+            WHERE (t.scope IN ('builtin', 'global') OR (t.scope = 'user' AND t.user_id = owners.user_id))
+              AND CASE WHEN uo.template_id IS NOT NULL THEN uo.enabled ELSE COALESCE(g.enabled, false) END
+              AND NOT (t.scope = 'user' AND EXISTS (SELECT 1 FROM agent_templates s WHERE s.scope <> 'user' AND s.name = t.name))
+              AND lower(t.name) IN ('lead', 'orchestrator')
+            ORDER BY t.name LIMIT 1) AS codex_model
+    FROM (
+        SELECT DISTINCT r.user_id FROM runs r
+        JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
+        WHERE r.kind = 'cross_check' AND r.harness = 'codex' AND r.status = 'queued'
+    ) owners
+)
 SELECT r.id, r.user_id, r.required_capabilities, r.repo_id, r.kind, u.ephemeral_docker_enabled
 FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
@@ -11434,7 +11618,8 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
+                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
+                                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
                                   = ANY(@codex_curated_models::text[])),
                              false)
@@ -11518,7 +11703,8 @@ WHERE r.status = 'queued'
                          AND r.kind NOT IN ('judge', 'chat')
                          AND r.review_target_run_id IS NULL
                          AND COALESCE(
-                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
+                             NOT ((CASE WHEN r.kind = 'cross_check' THEN COALESCE((SELECT pin.model FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = r.id WHERE pin.user_id = r.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness), (SELECT u.default_codex_model FROM users u WHERE u.id = r.user_id),
+                                 (SELECT template.codex_model FROM checker_template_pins template WHERE template.user_id = r.user_id)) WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
                                         ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
                                   = ANY(@codex_curated_models::text[])),
                              false)

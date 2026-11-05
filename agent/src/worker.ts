@@ -118,6 +118,8 @@ export class Worker {
     // issue #1759 M3: the DinD prune controller, present only on a docker worker with
     // UZI_DIND_PRUNE_ENABLED=true (createDindPrune). Its gate pauses BOTH claim loops while
     // a prune holds it; the heartbeat feeds it the custody flag; run() starts its loop.
+    // Issue #3891: that loop also runs the optional anonymous-volume leg, which ignores
+    // idleness and custody and never holds the gate.
     private readonly dindPrune?: DindPruneController,
     // PRD #1809 D5/D7: the disk-pressure controller, present when UZI_DISK_RECLAIM or
     // UZI_DISK_ADMISSION is on. The heartbeat feeds it each data-volume sample, the run lane

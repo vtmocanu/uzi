@@ -90,8 +90,15 @@ this picker, the same as any other Codex run. Everything else — issue runs,
 autopilot, CI-fix, chat — is unaffected by this setting. Leave it on **your
 default token** to keep everything on one account.
 
-**Auto-select from the pool** picks whichever pooled token has the most
-rate-limit headroom, same as an auto worker. It differs from a worker in one
+**Auto-select from the pool** picks a pooled token the same way an auto worker
+does: the token whose weekly allowance resets soonest by default, or the one
+with the most rate-limit headroom under `UZI_AUTOSELECT_ORDER=headroom_first`
+(see [How it chooses](./anthropic-token.md#how-it-chooses)). Under the default,
+for picks above the headroom floor, the in-flight penalty only breaks
+exact weekly-reset ties, so several
+retrospectives at once concentrate on that one token until it nears the
+headroom floor, which can mean more mid-run limit pauses and resumes. It
+differs from a worker in one
 deliberate way: a worker with an empty pool *holds* the run, waiting for a
 token to be pooled, but the judge lane never holds a retrospective — with an
 empty pool it spends your default token instead, so finished runs never pile
@@ -201,10 +208,16 @@ places you see it.
 Recommendations use a fixed taxonomy: enable an existing tool or skill,
 install a missing worker tool, adjust an agent template or prompt, improve an
 existing agent (including a repo agent living in git), propose a missing
-agent for the repo, improve uzi itself, or flag a cost-efficiency improvement
-— a way the run could have reached the same outcome for fewer tokens, turns,
-or agents without weakening any check (quality and correctness come first, so
-a saving that would drop a real verification pass is never recommended). The
+agent for the repo, improve uzi itself, or flag an efficiency improvement
+(labelled "Efficiency", category `cost_efficiency`): a way the run could
+have reached the same outcome with fewer tokens, turns or agents, or less
+wall-clock time, without weakening any check (quality and correctness come
+first, so a saving that would drop a real verification pass is never
+recommended). Elapsed-time claims cite the trace's observed timestamps. Queue,
+limit, owner-wait and parked time is reported separately and is not attributed
+to agent inefficiency unless observed evidence shows an avoidable agent action
+caused or extended it. A remedy that needs a factory change (runtime, worker image,
+provisioning, CI) is filed under improve uzi instead. The
 improve-uzi category feeds the `self-improve` [default
 job](./scheduling.md#default-jobs), if you've enabled it on a repo.
 

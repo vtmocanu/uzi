@@ -56,6 +56,7 @@ type AgentTemplate struct {
 	UserID      pgtype.UUID        `json:"user_id"`
 	Customized  bool               `json:"customized"`
 	Origin      pgtype.Text        `json:"origin"`
+	CodexModel  pgtype.Text        `json:"codex_model"`
 }
 
 type AgentTemplateAllocation struct {
@@ -1270,6 +1271,8 @@ type Run struct {
 	SnapshotDepartedGeneration     pgtype.Int8        `json:"snapshot_departed_generation"`
 	SnapshotDepartedNonce          pgtype.Text        `json:"snapshot_departed_nonce"`
 	SnapshotDepartedEpoch          pgtype.Int8        `json:"snapshot_departed_epoch"`
+	HarnessPreferredWeeklyResetAt  pgtype.Timestamptz `json:"harness_preferred_weekly_reset_at"`
+	HarnessOtherWeeklyResetAt      pgtype.Timestamptz `json:"harness_other_weekly_reset_at"`
 }
 
 type RunCompletionAttempt struct {

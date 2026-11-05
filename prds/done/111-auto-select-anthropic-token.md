@@ -210,6 +210,7 @@ already-applied head makes every upgraded instance refuse to boot.
 
 ## Decision log
 
+- **2026-11-04 — superseded in part by [ADR-3844](../../adr/3844-reset-first-pool-order.md) (#3844):** D3 and D22 no longer decide the default order; `UZI_AUTOSELECT_ORDER=reset_first` ranks eligible tokens by soonest weekly reset, and D3/D22 now describe `headroom_first` and the `best_of_pool` ranking.
 - **D4 — Judge and self-improve lanes keep their explicit bindings.**
   `claimSecretID` routes `self_improve` to the judge binding and the judge lane
   forks to `assembleJudgeClaim` earlier; neither

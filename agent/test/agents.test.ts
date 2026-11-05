@@ -9,6 +9,8 @@ import {
   planTurnSubagents,
   selectSubagents,
   selectSubagentTemplates,
+  selectLeadTemplate,
+  ownSubagentTemplates,
   subagentsFromTemplates,
   subagentCanWrite,
   subagentWriteCapabilities,
@@ -200,13 +202,11 @@ describe("lead pin (PRD #18 Decision 8)", () => {
   }
 
   it("routes exactly one lead even if two lead-named templates are (wrongly) delivered", () => {
-    // Defense in depth: the server must never send this, but if it did, the first
-    // by array order becomes the lead and the rest are ordinary subagents — never
-    // two leads, never a crash. `orchestrator` also matches LEAD_NAME_RE.
+    // G4: first delivered lead wins; all later owner lead-shaped names are withheld.
     const orchestrator: AgentTemplate = { name: "orchestrator", description: "d", prompt_body: "p", tools: null, model: null };
     const { subagents, leadSystemPrompt } = assembleAgents([lead, orchestrator, coder]);
     assert.strictEqual(leadSystemPrompt, lead.prompt_body, "the first lead-matching template wins the main thread");
-    assert.ok("orchestrator" in subagents, "the second lead-matching template falls back to a subagent");
+    assert.ok(!("orchestrator" in subagents), "G4: later owner lead-shaped templates are withheld");
     assert.ok(!("lead" in subagents), "the routed lead is never also a subagent");
   });
 });
@@ -908,6 +908,42 @@ describe("uzi runtime facts reach every subagent through the append (PRD #1849)"
         }
       }
     }
+  });
+});
+
+describe("owner lead selection (shared fixture)", () => {
+  it("folds all ten cases through selection, SDK assembly and both template sources", () => {
+    const fixture = JSON.parse(readFileSync(join(import.meta.dirname, "..", "..", "fixtures",
+      "lead-template-selection", "cases.json"), "utf8")) as {
+      cases: Array<{ id: string; names: string[]; selected_index: number | null }>;
+    };
+    const visited = new Set<string>();
+    for (const c of fixture.cases) {
+      const templates: AgentTemplate[] = c.names.map((name, i) => ({
+        name, description: c.id, prompt_body: `owner body ${i}`, model: `pin-${i}`,
+      }));
+      const selected = c.selected_index === null ? undefined : templates[c.selected_index];
+      assert.equal(selectLeadTemplate(templates), selected, c.id);
+      const assembled = assembleAgents(templates);
+      assert.equal(assembled.leadSystemPrompt, selected?.prompt_body, c.id);
+      assert.equal(assembled.leadModel, selected?.model, c.id);
+      // Spell the reserved names here so this expectation is independent of the production regex.
+      const expected = templates.filter((t) => !["lead", "orchestrator"].includes(t.name.toLowerCase()));
+      assert.deepEqual(ownSubagentTemplates(templates), expected, c.id);
+      assert.deepEqual(Object.keys(assembled.subagents), expected.map((t) => t.name), c.id);
+      assert.deepEqual(selectSubagentTemplates("own", templates, [], []), expected, c.id);
+      assert.deepEqual(selectSubagentTemplates("repo", [], templates, []), templates, c.id);
+      assert.deepEqual(Object.keys(subagentsFromTemplates(templates, new Set())), c.names, c.id);
+      if (selected) {
+        const unpinned = templates.map((t) => t === selected ? { ...t, model: null } : t);
+        assert.equal(selectLeadTemplate(unpinned), unpinned[c.selected_index!], c.id);
+        assert.equal(assembleAgents(unpinned).leadSystemPrompt, selected.prompt_body, c.id);
+        assert.equal(assembleAgents(unpinned).leadModel, undefined, c.id);
+      }
+      visited.add(c.id);
+    }
+    assert.equal(fixture.cases.length, 10);
+    assert.equal(visited.size, 10, "all shared selection cases exercised");
   });
 });
 

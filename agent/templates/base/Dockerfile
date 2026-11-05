@@ -247,6 +247,25 @@ RUN GOFLAGS=-buildvcs=false GOBIN=/usr/local/bin go install github.com/zricethez
 RUN n=0; until npm install --global --ignore-scripts yarn@1.22.22; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "yarn install: giving up after $n attempts" >&2; exit 1; }; echo "yarn install failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done \
  && test "$(yarn --version)" = 1.22.22
 
+# pnpm for repos with a pnpm-lock.yaml (agent/src/js-deps.ts, issue #3906). Pinned to the
+# 10.x line on purpose: pnpm 11 removed `managePackageManagerVersions` (replaced by
+# `pmOnFail`), and js-deps.ts's audited `--config.manage-package-manager-versions=false` is
+# what stops pnpm fetching and running the pnpm version a repo declares. A pnpm 11 pin needs
+# that control re-audited first. NO Corepack: its shims pick and download the
+# repo-declared manager BEFORE pnpm ever sees the protective flags. The tarball is fetched
+# with `npm pack`, its sha512 checked against the registry integrity recorded when the pin
+# was reviewed, then installed from the local file with lifecycle scripts off; version and
+# path are asserted so a drift fails the BUILD. The release stage below EXECUTES the baked
+# pnpm through js-deps (agent/test/js-deps-pnpm-real.test.ts) offline as the runner uid.
+# MIRRORED in templates/jvm (jvm is NOT `FROM base`) — keep in lockstep.
+RUN set -eu; d="$(mktemp -d)"; cd "$d"; \
+    n=0; until npm pack --silent pnpm@10.34.9 >/dev/null; do n=$((n+1)); [ "$n" -ge 5 ] && { echo "pnpm pack: giving up after $n attempts" >&2; exit 1; }; echo "pnpm pack failed (attempt $n/5); retrying in $((n*3))s" >&2; sleep "$((n*3))"; done; \
+    node -e 'const c=require("node:crypto"),f=require("node:fs");const h="sha512-"+c.createHash("sha512").update(f.readFileSync(process.argv[1])).digest("base64");if(h!==process.argv[2]){console.error("pnpm tarball integrity mismatch: got "+h);process.exit(1)}' pnpm-10.34.9.tgz "sha512-9JtajqD97bRLs8DB1ldQkqU8KVDZW3rRXfEfF5dId6LeOgHAfpNOmyjOcW5RwJqUlixzBtCb4uHksYqMh2L9Mg=="; \
+    npm install --global --ignore-scripts --no-audit --no-fund ./pnpm-10.34.9.tgz; \
+    cd /; rm -rf "$d"; \
+    test "$(pnpm --version)" = 10.34.9; \
+    test "$(command -v pnpm)" = /usr/local/bin/pnpm
+
 # Install deps first for layer caching. Only runtime deps (tsx) are needed — the
 # worker runs its TypeScript directly via tsx, matching the bottega reference.
 # The build context is the REPO ROOT (PRD #39 Decision 5), so the worker's own
@@ -291,8 +310,10 @@ RUN if command -v fc-cache >/dev/null 2>&1; then fc-cache -f || true; fi
 # agent-browser 0.34.0 reads all three env vars (== --executable-path / --args / idle
 # timeout). NOTE: the SDK hands the agent a SPARSE env (agent/src/sdk-env.ts REPLACES the
 # subprocess env), so these baked vars do NOT reach the agent's Bash tool by themselves —
-# the shim below re-establishes them for the agent-browser process. They are kept here for
-# the worker/build context, the build guard, and as the documented contract. MIRRORED in jvm.
+# the shim below re-establishes them for the agent-browser process. Since issue #3907 the
+# Claude-lane command env (and the Codex one under commandSandbox off) also carries AGENT_BROWSER_EXECUTABLE_PATH / CHROME_PATH pointing
+# at the /usr/local/bin/uzi-chromium wrapper; the image ENV below keeps the RAW toolchain
+# path for the worker/build context and the build guard. MIRRORED in jvm.
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/opt/uzi-toolchain/bin/chromium
 ENV AGENT_BROWSER_ARGS="--no-sandbox,--disable-dev-shm-usage"
 ENV AGENT_BROWSER_IDLE_TIMEOUT_MS=60000
@@ -310,6 +331,12 @@ ENV AGENT_BROWSER_IDLE_TIMEOUT_MS=60000
 # #120. The invariant is held by agent/templates/entrypoint.sh exporting UZI_RUNNER_PATH =
 # the untouched image PATH on BOTH branches — see the shim header for the full account.
 COPY --chmod=0755 agent/bin/agent-browser /usr/local/bin/agent-browser
+
+# Issue #3907: launch wrapper for the prebaked Chromium. The Claude-lane command env (and the Codex one under commandSandbox off) points
+# AGENT_BROWSER_EXECUTABLE_PATH / CHROME_PATH at it (not at the raw toolchain binary) so any
+# browser launch gets --no-sandbox, --disable-dev-shm-usage, a writable run-private XDG dir
+# and a per-invocation profile. Root-owned 0755. MIRRORED in the other template.
+COPY --chmod=0755 agent/bin/uzi-chromium /usr/local/bin/uzi-chromium
 
 # Fail-closed BUILD guard: the image FAILS to build if agent-browser does not resolve, the
 # baked CLI is missing OR cannot RUN, OR an exit-bounded headless Chromium launch fails — so a
@@ -342,21 +369,35 @@ COPY --chmod=0755 agent/bin/agent-browser /usr/local/bin/agent-browser
 RUN command -v agent-browser \
     && command -v chromium \
     && [ -x /app/node_modules/.bin/agent-browser ] \
-    && timeout 30 agent-browser --version >/dev/null \
+    && mkdir -p /tmp/uzi-ab-home \
+    && HOME=/tmp/uzi-ab-home timeout 30 agent-browser --version >/dev/null \
     && mkdir -p /tmp/uzi-ab-fake-glibc \
     && printf '#!/bin/sh\necho "ldd (GNU libc) 2.42"\n' > /tmp/uzi-ab-fake-glibc/ldd \
     && chmod 0755 /tmp/uzi-ab-fake-glibc/ldd \
-    && PATH="/tmp/uzi-ab-fake-glibc:$PATH" timeout 30 agent-browser --version >/dev/null \
+    && HOME=/tmp/uzi-ab-home PATH="/tmp/uzi-ab-fake-glibc:$PATH" timeout 30 agent-browser --version >/dev/null \
     && timeout 90 "$AGENT_BROWSER_EXECUTABLE_PATH" \
         --headless --no-sandbox --disable-dev-shm-usage \
         --user-data-dir=/tmp/uzi-chromium-buildcheck --dump-dom about:blank >/dev/null \
+    && mkdir -p /tmp/uzi-chromium-wrap-home \
+    && HOME=/tmp/uzi-chromium-wrap-home \
+        timeout 90 /usr/local/bin/uzi-chromium --headless --dump-dom about:blank >/dev/null \
     && HOME=/tmp/uzi-ab-home AGENT_BROWSER_IDLE_TIMEOUT_MS=2000 \
         timeout 90 agent-browser --session uzi-buildcheck open about:blank >/dev/null \
     && HOME=/tmp/uzi-ab-home AGENT_BROWSER_IDLE_TIMEOUT_MS=2000 \
         timeout 30 agent-browser --session uzi-buildcheck close >/dev/null \
+    && HOME=/tmp/uzi-ab-home AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/uzi-chromium \
+        AGENT_BROWSER_IDLE_TIMEOUT_MS=2000 \
+        timeout 90 agent-browser --session uzi-buildcheck-wrap open about:blank >/dev/null \
+    && HOME=/tmp/uzi-ab-home AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/uzi-chromium \
+        AGENT_BROWSER_IDLE_TIMEOUT_MS=2000 \
+        timeout 30 agent-browser --session uzi-buildcheck-wrap close >/dev/null \
     && sleep 4 \
-    && rm -rf /tmp/uzi-chromium-buildcheck /tmp/uzi-ab-fake-glibc /tmp/uzi-agent-browser-0 /tmp/uzi-ab-home \
-    && [ ! -e "$HOME/.agent-browser" ] && [ ! -e /tmp/uzi-ab-home ]
+    && rm -rf /tmp/uzi-chromium-buildcheck /tmp/uzi-ab-fake-glibc /tmp/uzi-ab-home /tmp/uzi-chromium-wrap-home \
+    && [ ! -e "$HOME/.agent-browser" ] && [ ! -e /tmp/uzi-ab-home ] \
+    && [ ! -e /tmp/uzi-chromium-wrap-home ] \
+    && [ ! -e "$HOME/.uzi-chromium" ] && [ ! -e "$HOME/.uzi-agent-browser" ] \
+    && ! ls -d /tmp/uzi-agent-browser.* >/dev/null 2>&1 \
+    && ! ls -d /tmp/uzi-chromium.* >/dev/null 2>&1
 
 # BUG 1 (issue #114) store-perm normalization — MUST run AFTER the build guard above, not
 # after the earlier `chown -R worker:runner /nix`. Root cause: the guard's `--dump-dom`
@@ -537,7 +578,15 @@ RUN mkdir -p /usr/share/uzi-git-nohooks && chmod 0555 /usr/share/uzi-git-nohooks
 
 # Prove the final toolchain as the command uid, without network. Keeping this in
 # the release build avoids exporting/loading the multi-GB image just for a probe.
+# Issue #3906: EXECUTE the baked pnpm through the worker's real js-deps install path,
+# offline (loopback only), proving --ignore-scripts / --ignore-pnpmfile / the
+# packageManager-handoff flag / the virtual-store and per-run store pins hold, each with
+# a flag-removal control. UZI_PNPM_XFS_DIR=/dev/shm (the tmpfs every build container has,
+# a second filesystem) lets the test prove the private store still imports across
+# filesystems; UZI_PNPM_XFS_REQUIRED=1 fails the build if that tmpfs is unusable.
+# MIRRORED in both templates.
 USER runner
+RUN --network=none set -eu; cd /app; UZI_PNPM_IMAGE_PROOF=1 UZI_PNPM_XFS_DIR=/dev/shm UZI_PNPM_XFS_REQUIRED=1 node --import tsx --test --test-timeout=120000 /opt/uzi-src/agent/test/js-deps-pnpm-real.test.ts
 RUN --network=none set -eu; cd /opt/uzi-src; \
     which -a go; test "$(which -a go | wc -l)" -eq 1; \
     go version; \

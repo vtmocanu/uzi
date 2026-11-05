@@ -146,10 +146,11 @@ is `./e2e/run-e2e.sh` **and** `./e2e/run-store-it.sh`.
 
 The script has since grown past that one query: it sweeps **every `*LiveDB` test in
 the seven packages that carry one**, `store`, `handler`, `forgesvc`, `schedsvc`,
-`workersvc`, `recovery` and `poller`, serially (`-p 1`, one shared database). CI's `test-api-store-it` job runs
-the same list. A `*LiveDB` test in a package neither list names runs nowhere and still
-prints `ok`, so a new live-DB test in an eighth package must add that package to both
-the script and `.github/workflows/ci.yml` in the same commit.
+`workersvc`, `recovery` and `poller`, serially (`-p 1`, one shared database). CI runs this script once, in
+`test-codex-refresh-lostreply-e2e`, and `test-api-store-it` is a thin context that
+requires that run to have succeeded. A `*LiveDB` test in a package the script's list
+does not name runs nowhere and still prints `ok`, so a new live-DB test in an eighth
+package must add that package to `PKGS` in the script.
 
 The script runs each package in a separate Go invocation against the same DSN,
 appending to one log for the aggregate and per-package guards. Each invocation has
@@ -268,7 +269,7 @@ headers, not the rows.
 | 45 | bounded-concurrency | gitlab | no | PRD #42 bounded-concurrency scenario (stub-only) |
 | 46 | run-health | gitlab | no | PRD #47: run-health detection (stall / loop / in-flight suppression) |
 | 47 | rate-limit-meters | gitlab | no | PRD #53/#104: per-token rate-limit meters (seeded gauge row -> /me) |
-| 48 | auto-selection | gitlab | no | PRD #111 M6: an auto worker picks the emptiest pooled token, and degrades safely |
+| 48 | auto-selection | gitlab | no | PRD #111 M6 / #3844: an auto worker picks an eligible pooled token (soonest weekly reset), and degrades safely |
 | 49 | docker-sidecar | gitlab | no | PRD #83 M2: rootless DinD sidecar + Decision-3 efficacy |
 | 50 | worker-token-binding | gitlab | no | PRD #104: a worker's Anthropic binding reaches the claim payload; a rebind lands on the next claim |
 | 51 | auto-stop-poison | gitlab | no | PRD #108 M5: auto-stop kills a run whose messages can't be saved (direct-to-API poison) |

@@ -284,8 +284,13 @@ A few worth knowing:
   resolve one.** `run create --harness claude|codex` and `schedule create
   --harness claude|codex` request a specific harness outright; omitting the
   flag leaves the server's own resolution in charge (your effective default,
-  or whichever harness you have a usable credential for, with
-  [optional overflow](#harness-overflow) for eligible new issue runs). `schedule edit
+  or whichever harness you have a usable credential for; with both usable and
+  no default, eligible new issue runs (manual, autopilot or schedule; no
+  explicit harness or issue harness label, model pin, Anthropic credential
+  override or Plan/Code cross-check) are
+  [chosen by weekly limits](./rate-limits.md#how-the-automatic-default-picks-a-harness)
+  and other runs keep the usual resolution; with an explicit default, [optional overflow](#harness-overflow) for
+  eligible new issue runs). `schedule edit
   --harness ""` clears a schedule's pin back to per-fire resolution; leaving
   the flag unset on edit leaves the stored pin unchanged. The resolved
   harness shows as a `HARNESS` row on `uzi run get`; on `uzi run list` it's
@@ -464,6 +469,10 @@ A few worth knowing:
   `milestone_reconciliations_next_before_gate_revision`; omitted cursor means
   no further page. Server-shortened reasons or omitted oversized snapshots
   are marked `reason_truncated` / `details_omitted`.
+  Before and after snapshots carry a fixed set of reconciliation fields
+  (milestones, contract, gate and claim state), not the whole run, so plan and
+  issue text do not count against the size limit; oversized milestone or
+  contract values can still be omitted.
 - **`run stop <id>`** gracefully winds down a run. On an **interactive**
   task run (one created with `uzi handoff --interactive`; see [Interactive
   mode](./handoff.md#interactive-mode)) the current turn
@@ -3128,7 +3137,7 @@ on)` or `Weekly usage reserve: off`; `--json` returns
 `weekly_reserve_pct` (`null` = off) and `weekly_reserve_pause_running`.
 
 `uzi settings get` shows the same `Weekly usage reserve:` line after the
-`Now summary:` line, followed by Codex account mode and harness overflow;
+`Now summary:` line, followed by Codex account mode, the default harness and harness overflow;
 its `--json` carries both reserve fields.
 
 On a run the reserve touches, `uzi run get` shows:
@@ -3155,10 +3164,14 @@ uzi token pool work-codex --kind codex --on
 `uzi settings codex-mode default|auto` sets how a new Codex run chooses its
 login (`PUT /api/me/codex-account-mode`, which accepts a `uzc_` Bearer token).
 `default` binds your default Codex login. `auto` picks, at run creation, the
-pooled Codex login with the most limit headroom; you opt logins into the pool
-per login with `uzi token pool <label> --kind codex --on` (the pool is empty
-until you do, and `auto` then falls back to your default). Logins are created
-unpooled. `--kind` is required only when the label is held by both an Anthropic
+pooled Codex login whose weekly allowance resets soonest (the operator's
+`UZI_AUTOSELECT_ORDER`, default `reset_first`; under it, for picks above the
+headroom floor, the in-flight penalty only breaks exact weekly-reset ties, so a
+burst of runs can concentrate on one login just above that floor, meaning more
+mid-run limit pauses and resumes); you opt logins into the pool per login with
+`uzi token pool <label> --kind codex --on` (the pool is empty until you do, and
+`auto` then falls back to your default). Logins are created unpooled.
+`--kind` is required only when the label is held by both an Anthropic
 token and a Codex login: without it that is a usage error. Before Codex pooling
 existed, `uzi token pool <label>` silently picked the Anthropic token in that
 case, so a script that relied on it now needs `--kind anthropic`. An
@@ -3174,7 +3187,7 @@ a run created before auto-selection:
 |---|---|
 | `default` | `work-codex — default` |
 | `pool_empty` | `work-codex — default (auto mode, but no login is pooled)` |
-| `auto` | `work-codex — auto (most limit headroom)` |
+| `auto` | `work-codex — auto (picked from pool)` |
 | `best_of_pool` | `work-codex — auto (best of pool; every login was under the headroom floor)` |
 | `pool_stale` | `work-codex — auto (no usage reading yet; first pooled login)` |
 | `pool_exhausted` | `work-codex — auto (every login at capacity; soonest to release)` |
@@ -3214,15 +3227,28 @@ The command writes `PUT /api/me/harness-overflow` with
 `{"harness_overflow_enabled":true}` (or `false`); `--json` returns that
 single boolean field. Other arguments are usage errors (exit 2). Human
 output reads `Harness overflow: on (new runs, at creation)` or
-`Harness overflow: off (new runs, at creation)`. `uzi settings get` shows
-the same line after Codex account mode; its decoded settings JSON includes
-`harness_overflow_enabled`.
+`Harness overflow: off (new runs, at creation)`. The command reads your
+settings back after the write (human output only; `--json` returns the single
+boolean without the read-back); with the default harness automatic it prints
+`Harness overflow: on (inactive: default harness is automatic)` (or `off`
+likewise), and if the read-back fails it prints
+`Harness overflow: on (saved; default harness could not be read)` and
+reports the error. `uzi settings get` shows `Default harness: automatic
+(chosen per run by weekly limits when both harnesses are usable)` (or `Default harness: claude` / `codex`)
+after Codex account mode, then the same overflow line; its decoded settings
+JSON includes `harness_overflow_enabled`.
 
 Overflow applies at creation to new implicit issue runs started manually,
-by autopilot or by a schedule, with both harnesses usable. Explicit
+by autopilot or by a schedule, with both harnesses usable, and only when your
+default harness is an explicit Claude or Codex: with the default automatic it
+is inactive, because uzi then
+[chooses the harness by weekly limits](./rate-limits.md#how-the-automatic-default-picks-a-harness)
+(reasons `auto_soonest_reset`, `auto_only_qualified` and `auto_fallback`).
+Every creation with an unset default that does not take that automatic path
+records `excluded`. Explicit
 harnesses (including issue harness labels), run/schedule model pins,
 Anthropic credential overrides and either raw saved Plan or Code cross-check
-enable flag exclude it, even when a checker would be inactive for that
+enable flag exclude overflow, even when a checker would be inactive for that
 harness. Other run kinds and origins do not use overflow. A preferred score
 below 20%, an other-harness score of at least 30%, and an advantage of at
 least 15 percentage points are required; unknown comparisons keep the
@@ -3232,9 +3258,13 @@ never changes an existing run or resume. See
 [rate limits](./rate-limits.md#how-overflow-compares-headroom) for selected
 accounts, Claude aggregation and capacity holds.
 
-`uzi run get <id>` shows `HARNESS_PICK` rows headed `at creation:`;
-the TUI detail rail has **HARNESS at creation**, fitted as a whole block
-when space permits. The web run page shows the same stored explanation.
+`uzi run get <id>` shows `HARNESS_PICK` rows headed `at creation:`. The last
+two rows are the weekly resets, `pref reset:` and `other reset:`, or
+`claude reset:` and `codex reset:` for an `auto_*` reason (whose score,
+measured and held rows are likewise labelled `claude` and `codex` instead of
+`preferred`/`pref` and `other`). A reset reads as an RFC3339 UTC timestamp, or `unknown`. The TUI detail rail has **HARNESS at creation**, fitted as a whole block
+when space permits; to fit the rail it shows a reset as `MM-DD HH:MMZ` UTC with the
+year omitted (the reset falls within about a week after the run's creation). The web run page shows the same stored explanation.
 These are owner-only readings, independent of live usage and claim-time
 credential metadata. Legacy or unavailable decisions read `not recorded`.
 
@@ -3243,10 +3273,16 @@ In `uzi run get <id> --json`, `harness_decision` is an object with:
 | Field | Meaning |
 |---|---|
 | `preferred`, `chosen` | Preferred harness before overflow and the run's stored harness. |
-| `reason` | `off`, `excluded`, `unknown_usage`, `preferred` or `overflow`. |
+| `reason` | `off`, `excluded`, `unknown_usage`, `preferred` or `overflow`; for an unset default also `auto_soonest_reset`, `auto_only_qualified` or `auto_fallback`. |
 | `preferred_score`, `other_score` | Nullable comparison percentages used for the thresholds. |
 | `preferred_measured`, `other_measured` | Nullable measured headroom, kept separately from capacity holds. |
 | `preferred_held`, `other_held` | Capacity-hold flags; Claude preferred means the complete token set is held, Claude receiver means any token is held. |
+| `preferred_weekly_reset_at`, `other_weekly_reset_at` | Nullable RFC 3339 weekly resets of the compared accounts; `null` when unknown or already past at creation. Only `auto_*` reasons carry them. |
+
+For an `auto_*` reason `preferred` is always `claude`: the `preferred_*`
+fields describe Claude and the `other_*` fields describe Codex. A row created
+before the weekly-reset fields existed shows them as `null` (unknown); a row
+from before decisions were recorded reads `not recorded`.
 
 Unknown numeric evidence is `null`, distinct from a measured zero. A hold
 can make a preferred comparison zero with measured headroom still unknown.

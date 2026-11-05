@@ -97,7 +97,13 @@ standard Anthropic table. For Haiku 4.5's dated and undated model IDs,
 geographic routing ([usage-report semantics](https://platform.claude.com/docs/en/manage-claude/usage-cost-api#data-residency),
 [standard pricing for earlier models](https://platform.claude.com/docs/en/about-claude/pricing#data-residency-pricing)).
 The marker stays unpriced on geo-capable models because it cannot rule out a
-routing premium. Other non-standard geographies remain unpriced.
+routing premium. Other non-standard geographies remain unpriced. Haiku 5.5
+bills each request by prompt length (input, cache reads and cache writes):
+the table carries only its rates for prompts up to 100,000 tokens, not the
+higher ones above that. A single call over the threshold therefore stays
+unpriced. So does a summary or Now entry whose prompt tokens total more than
+100,000, since it can sum several calls and uzi cannot tell which of them
+crossed the threshold.
 Existing unreported summary/Now rows are not backfilled.
 
 The legacy `subscription` status means **no cost estimate was recorded**.
@@ -153,14 +159,15 @@ carries it as `usage_estimated_tail`). The design is in
 `adr/2014-run-usage-estimated-tail.md`.
 
 - **It is an estimate, with provenance.** The dollar figure is priced from
-  Anthropic's official standard pricing page as fetched on 2026-10-03 and
-  recorded as a version id (`anthropic-standard-2026-10-13`), shown beside the
+  Anthropic's official standard pricing page as fetched on 2026-11-04 and
+  recorded as a version id (`anthropic-standard-2026-11-04`), shown beside the
   figure and rendered as "~$X.XX estimated" ("<$0.01 estimated" under half a
   cent).
 - **Unpriced means unknown, never $0.** A model the table does not know, a
   non-standard service tier, speed or inference geo (Haiku 4.5's
-  `not_available` counts as standard, see above), or cache writes without a
-  consistent 5-minute/1-hour split leaves the cost unknown: the tokens are
+  `not_available` counts as standard, see above), cache writes without a
+  consistent 5-minute/1-hour split, or a Haiku 5.5 call whose prompt is over
+  100,000 tokens leaves the cost unknown: the tokens are
   still shown, and the cost reads "cost unknown". `uzi run get` then shows
   "cost unknown (unpriced)" with no price-table version, since no table was
   applied.

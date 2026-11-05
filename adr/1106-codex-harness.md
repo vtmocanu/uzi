@@ -1313,6 +1313,7 @@ usage-limit park or an admission wait keeps the account it froze. What is added
 is an **opt-in, creation-time choice** among accounts the user consented to.
 The user contract is
 [Letting uzi pick the account](../docs/codex-credentials.md#letting-uzi-pick-the-account).
+Ranking reuse was later revised by [ADR-3844](3844-reset-first-pool-order.md): the default order is now `reset_first` (soonest weekly reset), with `headroom_first` as the previous ranking.
 
 - **Consent is two-part and per user.** `users.codex_account_mode` is `default`
   (the prior behavior for everyone) or `auto`, and each `codex_auth` alias
@@ -1452,3 +1453,16 @@ Source map: [policy and evidence fold](../api/internal/workersvc/harness_overflo
 User contracts: [Worker model](../docs/worker-model.md#overflow-to-the-other-harness),
 [headroom comparison](../docs/rate-limits.md#how-overflow-compares-headroom)
 and [CLI](../docs/cli.md#harness-overflow).
+
+## Amendment: automatic default harness by weekly limits (#3845, 2026-11-04)
+
+The overflow amendment above now applies only when the user's default harness
+is an explicit Claude or Codex. With the default unset (**Default ·
+automatic**) the overflow toggle has no effect, because creation picks the
+harness itself by the soonest weekly reset when both are usable and the origin
+is overflow-eligible. Every other creation with an unset default records the
+reason `excluded` (it recorded `off` when overflow was off). The decision
+record gains two weekly-reset fields and the reasons `auto_soonest_reset`,
+`auto_only_qualified` and `auto_fallback`. The decision runs under the same
+shared secret-mutation lock and creation fence described above. See
+[ADR-3845](3845-limit-aware-automatic-harness.md).

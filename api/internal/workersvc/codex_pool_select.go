@@ -249,6 +249,11 @@ func (s *Service) scoreCodexCandidates(ctx context.Context, q *store.Queries, us
 			}
 		}
 		c.Score, c.ResetAt, c.ScoreKnown = codexselect.Score(reading, meterFresh, interval, now)
+		// reset_first ranks on the weekly reset, not the binding one (#3844); ResetAt
+		// above still drives release timing.
+		if reading.Present && reading.LastSuccessAt != nil {
+			c.WeeklyResetAt = usagereserve.CodexMainWeeklyReset(reading.Buckets, *reading.LastSuccessAt, now)
+		}
 
 		// Capacity. ReleaseAt is the latest known per-cause release time; any cause whose time
 		// is unknown makes the whole release unknown.

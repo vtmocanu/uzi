@@ -67,9 +67,13 @@ at least 24Gi allocatable plus its sidecars, and a fleet of them can hit the
 worker namespace's shared quota, which shows as a failed replica on the worker's
 Deployment. New persistent **M** workers allocate 25Gi of `/data`, and **L** and
 **L-HIGHMEM** workers allocate 50Gi. Ephemeral data uses its independent 40Gi default. Existing data volumes
-keep their current capacity: the controller does not resize existing PVCs.
-Operators can [expand them in place](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes)
-on a StorageClass that supports volume expansion.
+are converged **upward** to these sizes by the controller when the claim's StorageClass allows volume
+expansion; it never shrinks, deletes or recreates a volume. An accepted
+expansion grows the claim's request first. The filesystem can stay pending until the
+driver finishes the resize online; otherwise it stays pending until the next independently authorized idle roll (for example an image or spec change rolled while idle, or an operator-initiated idle restart per [the supported procedure](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#remounting-a-pending-expansion-at-an-idle-restart)) remounts the volume. Expansion itself never triggers a roll;
+the controller never forces a restart, and logs `pvc-resize-pending` meanwhile. Without expansion
+support or the controller's read-only StorageClass access, the volume keeps its capacity and
+operators can [expand it in place](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes).
 Existing workers keep their stored size and are not switched to another size; existing **M** workers receive the
 1-CPU request and 4-CPU limit when the controller next rolls their pod spec.
 Operators set `workers.ephemeralDefaultSize` in the chart (`s`, `m`, `l`, or `l-highmem`);
@@ -412,7 +416,16 @@ work while letting this worker's own parked runs and pinned plan checkers
 finish; maintenance fencing still closes claims. It then fences claims and
 requires fresh custody clearance and zero local activity before gated
 anonymous-volume pruning or stop. No timer, forced park, or force-roll
-override bypasses this DinD gate. Legacy recycle (plain nix/data; Docker Nix-only) associated with
+override bypasses this DinD gate. The one exception is a separate
+pressure-only anonymous-volume prune (#3891): after two fresh samples at or above
+85% of bytes or inodes it runs `docker volume prune -f` on a busy or custody-held
+persistent Docker worker without closing claims or waiting for idle, terminal
+runs or custody. It is not recycle, touches no PVC, and is enabled by the same
+default-on flag, so already-enabled workers get it once the fixed worker deploys;
+`workers.diskRecycleEnabled: false` opts out of it, but also of PVC recycle and
+the cache prune, and rolls non-ephemeral Docker worker pods. See
+[Pressure-only anonymous-volume prune](./worker-docker.md#pressure-only-anonymous-volume-prune).
+Legacy recycle (plain nix/data; Docker Nix-only) associated with
 spec-hash/generation drift also waits indefinitely for idle. Only independent
 nondrifted pressure/nix-size maintenance retains the compatible deadline; global
 ForceRoll can bypass its busy deferral, while custody-held data remains protected.

@@ -121,8 +121,8 @@
 
   IT IS WRITTEN AGAINST THE `max`, NOT AGAINST ONE CLAIMANT, so a future PVC gains
   coverage by being added to the list rather than by someone remembering this file
-  exists. The default sits under the ceiling today (dindDataSize 20Gi <=
-  maxPVCStorage 50Gi); `gt` and not `ge` because equal is a valid
+  exists. The per-preset default sits at or under the ceiling today (largest
+  preset dind default 50Gi <= maxPVCStorage 50Gi); `gt` and not `ge` because equal is a valid
   configuration.
 
   🔴 THE dindDataSize GUARD IS DOCKER-TIER ONLY; THE RUN-BOUND /data GUARD IS NOT
@@ -150,8 +150,8 @@
        overrides and the empty/default path included.
     2. `go test` — THREE tests, one per source of a Go constant, and the set is what
        makes this net exhaustive: TestPresetPVCSizesFitTheChartsLimitRangeMax covers
-       nixSize and each preset's DataSize, TestDinDDataDefaultFitsTheChartsLimitRangeMax
-       covers dindDataDefaultSize, and TestEphemeralDataDefaultFitsTheChartsLimitRangeMax
+       nixSize and each preset's DataSize, TestDinDDataPresetsFitTheChartsDockerLimitRangeMax
+       covers each preset's DinDDataSize, and TestEphemeralDataDefaultFitsTheChartsLimitRangeMax
        covers ephemeralDataDefaultSize (issue #1815). All read maxPVCStorage out of
        values.yaml under the same parse-and-Fatal contract, so none carries a hardcoded
        ceiling. They catch
@@ -243,24 +243,26 @@
 {{- /*
   THE UNSET PATH IS CHECKED TOO, and skipping it was a real hole (audit A18.2).
   An empty or absent dindDataSize does NOT mean "no claim" — it means the controller
-  falls back to its OWN compiled-in default and creates a 20Gi PVC anyway. Guarding
+  falls back to its OWN compiled-in per-preset default (s/m 20Gi, l/l-highmem
+  50Gi) and creates that PVC anyway. Guarding
   only the set value left that claim unchecked, so an empty string plus a lowered max
   rendered perfectly clean and produced exactly the failure this guard exists to stop.
   Measured: dindDataSize "" + maxPVCStorage 10Gi rendered with no env var at all.
 
-  The literal below MIRRORS dindDataDefaultSize in controller/internal/kube/render_dind.go
-  and the two must move together. It is a genuine cross-toolchain duplicate — Helm
-  cannot read a Go constant — so it is tied the same way every other one here is: that
-  constant's own comment names this file, and TestDinDDataDefaultFitsTheChartsLimitRangeMax
-  (controller/internal/kube) fails if the controller's default outgrows this max. That
-  test is the mechanical half; this literal is what makes the CHART side honest about
-  what will actually be claimed.
+  The literal below MIRRORS the MAXIMUM over the presets' DinDDataSize in
+  controller/internal/preset (the worst case an empty value can claim), and the two
+  must move together. It is a genuine cross-toolchain duplicate — Helm cannot read the
+  Go preset table — so it is tied by TestDinDDataChartLiteralIsTheMaxPresetDefault
+  (controller/internal/kube), which fails if the literal differs from that maximum, and
+  TestDinDDataPresetsFitTheChartsDockerLimitRangeMax, which fails if any preset outgrows
+  this max. Those tests are the mechanical half; this literal is what makes the CHART
+  side honest about what will actually be claimed.
 */ -}}
 {{- $dindSize := .Values.workers.docker.dindDataSize }}
 {{- $dindKey := "workers.docker.dindDataSize" }}
 {{- if not $dindSize }}
-{{- $dindSize = "20Gi" }}
-{{- $dindKey = "the controller's built-in dind data-root default (workers.docker.dindDataSize is unset, so the controller supplies 20Gi itself)" }}
+{{- $dindSize = "50Gi" }}
+{{- $dindKey = "the controller's per-preset dind data-root default (workers.docker.dindDataSize is unset, so the largest preset, l/l-highmem, claims 50Gi)" }}
 {{- end }}
 {{- /* name -> value, so the failure names the key an operator has to edit. */ -}}
 {{- $claimants := dict $dindKey $dindSize }}

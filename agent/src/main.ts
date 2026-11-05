@@ -6,6 +6,7 @@ import { acquireWorkerLifetime } from "./authority-lock.js";
 import { installWorkerLifetime, requireWorkerLifetime } from "./completion-authority.js";
 import { AuthorityRuntime } from "./authority-runtime.js";
 import { createLogger, type Logger } from "./log.js";
+import { startMainWatchdog } from "./main-watchdog.js";
 import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBootstrap, snapshotMaintenanceBootstrap, terminalMaintenanceProof } from "./run-quiescence.js";
 import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { WorkerClient, RequestError } from "./client.js";
@@ -34,6 +35,7 @@ import { stubJobQueryFn } from "./job-runner-stub.js";
 import { Worker } from "./worker.js";
 import { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
+import { createDindVolumePrune } from "./dind-volume-prune.js";
 import { RetainedSourceServer } from "./ops/retained-source-server.js";
 import { DindMaintenanceController } from "./dind-maintenance.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
@@ -363,6 +365,16 @@ async function main(): Promise<void> {
   // #3031 E1: the FIRST statement, after the static import graph and before any app spawn or
   // claim. It pins the exact tsx esbuild child (or none); nothing is ever enrolled later.
   recordMaintenanceBootstrap(snapshotMaintenanceBootstrap());
+  // #3896: observe-only main-thread watchdog; failure-isolated, never throws.
+  const watchdog = startMainWatchdog();
+  try {
+    await mainBody();
+  } finally {
+    await watchdog.stop();
+  }
+}
+
+async function mainBody(): Promise<void> {
   // Register cancellation before bounded lock waits, config/token reads or any
   // protected startup access. Runtime shutdown hooks are installed once built.
   const controller = new AbortController();
@@ -891,10 +903,14 @@ async function main(): Promise<void> {
   // UZI_DIND_PRUNE_ENABLED=true. Server maintenance shares its gate even when cache prune is off. Its idle
   // probe reads the worker's own active sets, hence the late-bound `worker` reference: the
   // probe is called from the controller loops, which the worker itself starts.
+  // issue #3891: the pressure-only anonymous-volume leg rides on the same enablement
+  // predicate and runs inside the controller's loop; it only reads the gate and needs no
+  // idle probe or custody (it runs on busy and custody-held workers by design).
   const dindPrune = createDindPrune(config, {
     gate: dindGate,
     isIdle: () => worker?.isIdle() ?? false,
     log,
+    volumeLeg: createDindVolumePrune(config, { gate: dindGate, log }),
   });
   if (dindPrune) log.info("dind prune enabled", { docker_host_wired: true });
   const dindMaintenance = config.dockerWiring.dockerHost !== undefined

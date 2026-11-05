@@ -364,8 +364,12 @@ uzi version
   `codex_account_mode`, and `harness_overflow_enabled`.
 - `uzi settings codex-mode default|auto` — choose how a NEW Codex run picks its login:
   `default` binds your default Codex login (today's behaviour), `auto` picks, at run
-  creation, the pooled login with the most limit headroom (pool logins with `uzi token
-  pool <label> --kind codex --on`; with nothing pooled, auto falls back to the default).
+  creation, the pooled login picked by the operator's order (default: soonest weekly reset,
+  where, for picks above the headroom floor, the in-flight penalty only breaks exact
+  weekly-reset ties, so a burst of runs can concentrate on one login just above that
+  floor, meaning more mid-run limit pauses and resumes). Pool logins with
+  `uzi token pool <label> --kind codex --on`; with
+  nothing pooled, auto falls back to the default.
   `uzi settings get` shows it as `Codex account mode:`; `uzi run get` explains the pick on
   the `CODEX_ALIAS` row. When `auto` cannot bind any pooled login the run start is refused
   with a 422 whose reason is `codex_pool_unavailable`.
@@ -1784,7 +1788,11 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   Anthropic credential a worker's runs spend. A **label** pins it to that token;
   **`--default`** uses your default one; **`--auto`** lets uzi pick per claim from
   the tokens you opted into the pool with `uzi token pool`, preferring the account
-  with the most rate-limit headroom (PRD #111). Exactly one of the three is
+  whose weekly allowance resets soonest, or the most headroom if the operator set
+  `UZI_AUTOSELECT_ORDER=headroom_first` (PRD #111, #3844). Under the default, for picks
+  above the headroom floor, the in-flight penalty only breaks exact weekly-reset
+  ties, so a burst of claims can concentrate on one token just above that floor,
+  meaning more mid-run limit pauses and resumes. Exactly one of the three is
   required. It takes effect on the worker's **next claim** — no restart, no new
   join token — and `worker list` shows `anthropic_bind_mode` alongside
   `anthropic_secret_label`. Rebinding is allowed from the CLI, unlike minting,

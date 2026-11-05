@@ -306,6 +306,22 @@ ORDER BY h.created_at ASC;
 SELECT count(*) FROM recovery_custody_holds
 WHERE live_worker_id = @worker_id::uuid AND user_id = @user_id AND state = 'open';
 
+-- name: ListOpenCustodyHoldsForWorker :many
+-- #3921: names the holds CountOpenCustodyHoldsForWorker counts, for the DeleteWorker 409
+-- body. The predicate is byte-identical to the count's (live holder, owner-scoped, open),
+-- so the listing and the total cannot disagree about which holds block the delete. Capped at
+-- 10, oldest first (the #3390 ListWorkerNonTerminalRuns precedent); the caller's total comes
+-- from the count. recovery_custody_holds.run_id has no FK to runs, so the join is LEFT and
+-- owner-scoped: a missing run yields empty kind/title instead of dropping the hold.
+SELECT h.id, h.run_id, h.generation,
+       COALESCE(r.kind, '')::text AS run_kind,
+       COALESCE(r.title, r.issue_title, '')::text AS run_title
+FROM recovery_custody_holds h
+LEFT JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+WHERE h.live_worker_id = @worker_id::uuid AND h.user_id = @user_id AND h.state = 'open'
+ORDER BY h.created_at, h.id
+LIMIT 10;
+
 -- ════════════════════════════════════════════════════════════════════════════════════════
 -- PRD #1349 M1: the ADDITIVE exact-generation and owner-disposition store contract. These
 -- queries are the COMPLETE store-query layer M2 (park capture/post-clone evidence), M4

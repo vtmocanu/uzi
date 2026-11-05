@@ -35,6 +35,12 @@ function start(opts: {
   realClient?: { body: Uint8Array };
   /** Opt in: `exited` stays pending until the returned `resolveExit` is called. */
   deferredExit?: boolean;
+  /** Opt in: a short per-logical-publish allowance, read by the runner from the client. */
+  allowanceMs?: number;
+  /** Opt in: the fake publish hangs after draining the pack until the signal it was handed aborts. */
+  hangUntilAbort?: boolean;
+  /** Opt in: the fake publish throws this after draining the pack. */
+  throwError?: unknown;
 } = {}) {
   const abort = new AbortController();
   const git = new GitCache("/unused", nullLogger());
@@ -43,7 +49,8 @@ function start(opts: {
     assert.deepEqual([bare, branch, exactRunId], ["bare", "branch", "retry"]);
     return publicationContext.restrictionFacts!;
   };
-  const client = new WorkerClient("http://unused", "test", "test", nullLogger());
+  const client = new WorkerClient("http://unused", "test", "test", nullLogger(),
+    opts.allowanceMs === undefined ? {} : { checkpointPublishTimeoutMs: opts.allowanceMs });
   const backoff = opts.backoffMs ?? (opts.abort === "backoff" ? [60_000, 60_000] as const : [0, 0] as const);
   const hooks = backoff === "production" ? undefined : { retryBackoffMs: backoff };
   const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch: "branch" }) } }), nullLogger(), 1,
@@ -55,6 +62,7 @@ function start(opts: {
   };
   let ownership = 0, guards = 0, requests = 0, producers = 0, cancels = 0;
   const streams: Readable[] = [];
+  const attemptSignals: Array<AbortSignal | undefined> = [];
   let resolveExit: (code: number) => void = () => undefined;
   const exited = opts.deferredExit
     ? new Promise<number>(resolve => { resolveExit = resolve; })
@@ -102,13 +110,22 @@ function start(opts: {
     }) as typeof fetch;
   } else client.publishCheckpoint = async (_run, tip, pack, signal) => {
     assert.equal(tip, TIP);
-    assert.equal(signal, abort.signal);
+    // The runner hands every attempt ONE derived allowance signal (never the caller's own), which
+    // follows the caller's abort.
+    attemptSignals.push(signal);
     requests++;
     streams.push(pack);
     let body = "";
     for await (const chunk of pack) body += chunk;
     bytes.push(body);
     if (opts.throws) throw new Error("transport failed");
+    if (opts.throwError !== undefined) throw opts.throwError;
+    if (opts.hangUntilAbort) {
+      await new Promise<void>((_resolve, reject) => {
+        if (signal?.aborted) return reject(signal.reason);
+        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }
     if (opts.abort === "backoff") setTimeout(() => abort.abort(), 10);
     return (opts.responses?.[requests - 1] ?? FAIL) as Awaited<ReturnType<typeof client.publishCheckpoint>>;
   };
@@ -127,7 +144,7 @@ function start(opts: {
       settled = true; globalThis.fetch = realFetch;
       assert.ok(publicationGuards.every(guard => typeof guard === "function"), "runner must supply every retry publication guard");
     });
-  return { done, flight, feed, streams, bytes, events, retryLogs, resolveExit,
+  return { done, flight, feed, streams, bytes, attemptSignals, events, retryLogs, resolveExit,
     get settled() { return settled; }, get ackCancelled() { return ack?.cancelled() ?? false; },
     get requests() { return requests; }, get producers() { return producers; }, get cancels() { return cancels; } };
 }
@@ -166,6 +183,26 @@ it("persistent 500 is exactly three requests and one exhausted diagnostic", asyn
   assert.equal(r.flight.lastAttemptedCheckpointRefTip, TIP);
 });
 
+it("three 5xx attempts share one allowance that expiry during the second backoff ends", async () => {
+  // 1200 ms allowance, backoffs 800/800 ms, each margin 400 ms: attempt 2 is sent at ~800 (400 before
+  // the expiry), and the expiry at 1200 lands inside the second backoff, 400 before attempt 3 would
+  // be sent at ~1600 (an allowance renewed at attempt 2 would last until ~2000). Retries must not
+  // renew it: one signal serves both attempts and attempt 3 is never sent.
+  const r = await exercise({ allowanceMs: 1_200, backoffMs: [800, 800] });
+  assert.equal(r.requests, 2);
+  assert.equal(r.attemptSignals.length, 2);
+  assert.equal(r.attemptSignals[0], r.attemptSignals[1], "one allowance signal serves every attempt");
+  assert.deepEqual(r.outcome, { published: false, reason: "error" });
+  assert.equal(r.producers, 2, "no third producer is created after the allowance expired");
+  assert.match(JSON.stringify(r.feed), /phase=publish_request, cause=timeout/);
+});
+
+it("an unexpired allowance leaves the three-attempt behaviour unchanged", async () => {
+  const r = await exercise({ allowanceMs: 60_000 });
+  assert.equal(r.requests, 3);
+  assert.equal(r.attemptSignals[0], r.attemptSignals[2]);
+});
+
 it("production backoff is 250 ms then 1000 ms when no test hook is set", async () => {
   const started = Date.now();
   const r = await exercise({ backoffMs: "production" });
@@ -178,6 +215,34 @@ it("the test hook replaces the backoff the retry log reports", async () => {
   assert.deepEqual(r.retryLogs, [{ attempt: 1, backoff_ms: 3 }, { attempt: 2, backoff_ms: 5 }]);
 });
 
+it("the allowance itself aborts an in-flight attempt when the caller never aborts", async () => {
+  // The caller's signal in this harness never fires, so only the runner's own allowance signal can
+  // end the hung attempt. Passing the caller signal through instead would leave it hanging.
+  const started = Date.now();
+  const h = start({ allowanceMs: 150, hangUntilAbort: true });
+  let timer: NodeJS.Timeout | undefined;
+  const limit = new Promise<"hung">(resolve => { timer = setTimeout(() => resolve("hung"), 5_000); });
+  const result = await Promise.race([h.done, limit]);
+  clearTimeout(timer);
+  if (result === "hung") h.flight.cancel.abort(); // release the hung fake before failing
+  assert.notEqual(result, "hung", "the in-flight attempt was not aborted by the allowance");
+  assert.ok(Date.now() - started < 4_000, "ended near the 150 ms allowance");
+  assert.equal(h.attemptSignals.length, 1);
+  assert.equal(h.attemptSignals[0]?.aborted, true);
+  assert.equal(h.requests, 1);
+  assert.deepEqual(result, { published: false, reason: "error" });
+  assert.equal(h.flight.lastCheckpointRefTip, "OLD");
+  // The fake rejects with the allowance's own reason (fetch's shape: a TimeoutError DOMException
+  // with no recognized code); the expiry of the owned allowance makes it a timeout, not unknown.
+  assert.match(JSON.stringify(h.feed), /phase=publish_request, cause=timeout/);
+});
+
+it("a TimeoutError shape the owned allowance did not cause stays unknown", async () => {
+  const h = start({ allowanceMs: 60_000, throwError: new DOMException("The operation was aborted due to timeout", "TimeoutError") });
+  assert.deepEqual(await h.done, { published: false, reason: "error" });
+  assert.match(JSON.stringify(h.feed), /phase=publish_request, cause=unknown/);
+});
+
 for (const response of [{ ok: false, httpStatus: 400 }, { ok: false, httpStatus: 200 },
   { ok: false, httpStatus: "500" }, { ok: true, body: { published: false, skipped: "not_descendant" } }]) {
   it("permanent or nonnumeric response never retries: " + JSON.stringify(response), async () => {
@@ -186,7 +251,12 @@ for (const response of [{ ok: false, httpStatus: 400 }, { ok: false, httpStatus:
 }
 for (const abort of ["backoff", "ownership", "guard"] as const) {
   it("abort during " + abort + " creates no next producer or upload", async () => {
+    const started = Date.now();
     const r = await exercise({ abort });
+    // The 60 s backoff is only ended early if the attempt signal follows the caller's abort.
+    assert.ok(Date.now() - started < 30_000, "caller abort ended the retry promptly");
+    assert.equal(r.attemptSignals.length, 1);
+    assert.equal(r.attemptSignals[0]?.aborted, true, "the attempt signal follows the caller's abort");
     assert.equal(r.requests, 1);
     assert.equal(r.producers, 1);
     assert.equal(r.cancels, 1);

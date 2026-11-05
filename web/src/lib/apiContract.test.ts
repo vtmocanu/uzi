@@ -2006,7 +2006,9 @@ describe("harness overflow shared DTO contract", () => {
       expect(Object.keys(decision).sort()).toEqual([
         "preferred", "chosen", "reason", "preferred_score", "other_score",
         "preferred_measured", "other_measured", "preferred_held", "other_held",
+        "preferred_weekly_reset_at", "other_weekly_reset_at",
       ].sort());
+      for (const key of ["preferred_weekly_reset_at", "other_weekly_reset_at"] as const) expect(typeof decision[key]).toBe("string");
       for (const key of ["preferred_score", "other_score", "preferred_measured", "other_measured"] as const) expect(typeof decision[key]).toBe("number");
       expect(typeof decision.preferred_held).toBe("boolean");
       expect(typeof decision.other_held).toBe("boolean");
@@ -2015,6 +2017,7 @@ describe("harness overflow shared DTO contract", () => {
       preferred: "claude", chosen: "claude", reason: "unknown_usage",
       preferred_score: null, other_score: null, preferred_measured: null, other_measured: null,
       preferred_held: false, other_held: false,
+      preferred_weekly_reset_at: null, other_weekly_reset_at: null,
     };
     expect(unknown.preferred_score).toBeNull();
   });

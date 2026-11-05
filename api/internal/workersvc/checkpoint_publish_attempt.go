@@ -86,6 +86,55 @@ const (
 // to uint).
 const _ = uint(checkpointSupersessionCooling - livePublishPrePushBudget - pushbroker.MaxPublishDuration - supersessionCoolingSlack - 1)
 
+// The budgets the /publish route (handler.WorkerRunPublish) sizes its own deadlines from. A publish
+// is NOT one bounded push: after the request context it was given expires, the synchronous tail
+// below can still run before PublishAttested returns, and the route's write deadline must outlast
+// all of it.
+const (
+	// publishContextSlack is the room the request context leaves over the pre-push budget plus the
+	// push's own ceiling for the pre-push reads and the post-push writes that use the request
+	// context.
+	publishContextSlack = 30 * time.Second
+	// PublishContextBudget is the context the handler hands PublishAttested (the only wrapper
+	// deadline on the route): a live-routed push is sent within livePublishPrePushBudget of the
+	// routing and the broker stops waiting on it pushbroker.MaxPublishDuration later.
+	PublishContextBudget = livePublishPrePushBudget + pushbroker.MaxPublishDuration + publishContextSlack
+	// publishTailBookkeepingWindows is the number of detached bookkeeping windows (each a fresh
+	// retentionRecordTimeout, retentionBookkeepingCtx) the service bound allows for the request path
+	// after the request context is done. At most one such window follows the expiry, by mutually
+	// exclusive paths: the clearPreparedAttempt in pushOnce, run after recordAttempt fails on the
+	// dead context; or publishOutcome's attempt clear, when the request-context tip persist and
+	// track writes succeed just before the expiry (a push itself ends by
+	// pushbroker.MaxPublishDuration, inside PublishContextBudget, so pushOnce's readiness mark is
+	// not reached after it). N=2 is a conservative over-count of that one window, kept as headroom.
+	// The windows in
+	// checkpoint_publish_live.go and deferPublishAttempt belong to the sweeper, not this route.
+	publishTailBookkeepingWindows = 2
+	// PublishServiceBound bounds PublishAttested from entry to return. After PublishContextBudget
+	// expires, what can still run synchronously is one detached retention operation the claim or
+	// free loop started before it saw the cancellation (the loops start no further one):
+	//
+	//   - retentionOpTimeout: the operation itself (withRetentionLock detaches from the context);
+	//   - retentionRecordTimeout: its in-operation bookkeeping, capped at the operation's deadline
+	//     plus one window (retentionBookkeepingCtx);
+	//   - 2 * retentionUnlockTimeout: the unlock (releaseRetentionLock) and, when the unlock fails,
+	//     the connection teardown (destroyRetentionConn), each on a fresh context;
+	//   - publishTailBookkeepingWindows * retentionRecordTimeout: the request-path bookkeeping that
+	//     follows.
+	//
+	// The terminal route's busy-lock retry (terminalPublishLockRetryBudget, 3 s) is not additive:
+	// it runs inside the request context and stops at its cancellation, and an operation it starts
+	// is the detached operation counted above.
+	PublishServiceBound = PublishContextBudget + retentionOpTimeout + retentionRecordTimeout +
+		2*retentionUnlockTimeout + publishTailBookkeepingWindows*retentionRecordTimeout
+)
+
+// Compile-time: PublishContextBudget exceeds livePublishPrePushBudget + pushbroker.MaxPublishDuration
+// (a negative constant does not convert to uint). The service bound's relation to the context
+// budget is by construction (PublishServiceBound is that budget plus the tail terms), so it has no
+// check of its own.
+const _ = uint(PublishContextBudget - livePublishPrePushBudget - pushbroker.MaxPublishDuration - 1)
+
 // errPushRefused is a push Publish refused to send (the live pre-push budget elapsed, or the
 // attempt record or the push's compare-and-set base could not be written or read). Publish answers it with the benign not_descendant skip:
 // no forge call was made, and the worker retries on its next tick.

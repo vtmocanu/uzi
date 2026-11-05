@@ -1,0 +1,15 @@
+{
+  "provenance": {
+    "recorded": "2026-11-03",
+    "node": "v26.12.1",
+    "bundled_undici": "8.12.2",
+    "client": "global fetch, POST, streamed Readable body, duplex half, no dispatcher (the WorkerClient.publishCheckpoint path)",
+    "server": "Go net/http over TLS with HTTP/2, WriteTimeout 1s, handler read the full 262144-byte body then slept 2s; the server closed the stream at its write deadline",
+    "note": "global fetch negotiated h2 by default; the same chain came out with an explicit undici Agent allowH2. The h1 server produced UND_ERR_SOCKET instead."
+  },
+  "chain": [
+    { "constructor": "TypeError", "code": null, "message": "fetch failed" },
+    { "constructor": "Error", "code": "ERR_HTTP2_STREAM_ERROR", "message": "Stream closed with error code NGHTTP2_INTERNAL_ERROR" }
+  ],
+  "expected_class": "stream_reset"
+}
