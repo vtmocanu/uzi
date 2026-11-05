@@ -414,6 +414,15 @@ after the automatic cap is reached.
   fail closed, starting nothing. With guidance it
   always proceeds, and your guidance is the trigger. The assessment shares the
   automatic watcher's 30 second deadline.
+- **A reviewer who just got access.** uzi stores a "not eligible" answer for
+  6 hours per repository, and an automatic rework does not ask the forge
+  again in that time. So when you give a reviewer access to the repository
+  after uzi found them not eligible, automatic reworks keep withholding their
+  comments for up to 6 hours. An on-demand rework does not wait: it asks the
+  forge again about every author with a stored "not eligible" answer, so a
+  reviewer who has access now is read at once. The same author limits and
+  deadlines apply, an author whose access still can't be verified stays
+  withheld, and the stored answers stay in place for automatic reworks.
 - **Guidance.** You can attach optional guidance to steer the pass — for
   example "focus on the migration thread; skip the naming nits." It
   rides the run like any other steering text.
