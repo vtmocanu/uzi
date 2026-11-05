@@ -203,7 +203,8 @@ describe("R1 coverage spans clone, bare and a bounded alternates closure", () =>
   it("refuses an http-alternates entry", async () => {
     assert.equal(await observation(), true);
     fs.writeFileSync(path.join(sourceObjects(), "info/http-alternates"), "http://127.0.0.1:1/objects\n");
-    await unknown({}, /unsupported object info entry/);
+    // The Node-only clone shape stage runs first and keeps the source: `objects/info` admits no such entry.
+    assert.equal(await observation(), false);
   });
   it("refuses an alternate outside the managed repositories", async () => {
     const outside = path.join(fx.dataDir, "outside.git");
@@ -321,7 +322,8 @@ describe("R4 acceleration metadata is bypassed", () => {
   function accelerate(): string[] {
     const files: string[] = [];
     for (const cwd of [clonePath, bare]) {
-      command(cwd, "repack", "-a", "-d", "-b");
+      // -n: no update-server-info, whose `.git/info/refs` the clone shape stage does not admit.
+      command(cwd, "repack", "-a", "-d", "-b", "-n");
       command(cwd, "commit-graph", "write", "--reachable");
       const pack = path.join(cwd === bare ? bareObjects() : sourceObjects(), "pack");
       for (const name of fs.readdirSync(pack)) if (/\.(bitmap|rev)$/.test(name)) files.push(path.join(pack, name));

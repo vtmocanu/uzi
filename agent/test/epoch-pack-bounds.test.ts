@@ -246,15 +246,16 @@ for (const damage of Object.keys(REASONS) as (keyof typeof REASONS)[]) {
     assert.equal(attempts(), 0);
   });
 }
-function statusSpy(t: TestContext): () => number {
-  const original = git["runGitAsRunner"].bind(git); let launches = 0;
-  t.mock.method(git as unknown as { runGitAsRunner: typeof original }, "runGitAsRunner", async (...args: Parameters<typeof original>) => {
-    if (args[1].includes("status")) launches++;
+/** Counts the worktree stage's Git reads (`ls-files`); the proof has no `status` launch since Node hashes tracked content. */
+function worktreeReadSpy(t: TestContext): () => number {
+  const original = git["execEpochNative"].bind(git); let launches = 0;
+  t.mock.method(git as unknown as { execEpochNative: typeof original }, "execEpochNative", async (...args: Parameters<typeof original>) => {
+    if (args[1].includes("ls-files")) launches++;
     return original(...args);
   });
   return () => launches;
 }
-it("keeps the source before any status when a tracked file exceeds the byte budget", async t => {
+it("keeps the source before any worktree Git read when a tracked file exceeds the byte budget", async t => {
   // Sparse and index-matched: no object is written, so object prechecks pass, yet an unbounded
   // `git status` would hash it because the mtime differs from the index.
   const tracked = path.join(clonePath, "base");
@@ -262,13 +263,13 @@ it("keeps the source before any status when a tracked file exceeds the byte budg
   command(clonePath, "update-index", "--info-only", "base");
   const future = new Date(Date.now() + 3600_000);
   fs.utimesSync(tracked, future, future);
-  const launches = statusSpy(t);
+  const launches = worktreeReadSpy(t);
   assert.equal(await observation({ maxMetadataBytes: 65536 }), false);
-  assert.equal(launches(), 0, "status must not run on an over-budget tracked file");
+  assert.equal(launches(), 0, "no worktree Git read may run on an over-budget tracked file");
   assert.equal(journal(), raw);
 });
-it("still proves a normal clean tree under the default budget, running status", async t => {
-  const launches = statusSpy(t);
+it("still proves a normal clean tree under the default budget, running its worktree Git read", async t => {
+  const launches = worktreeReadSpy(t);
   assert.equal(await observation(), true);
   assert.equal(launches(), 1);
 });

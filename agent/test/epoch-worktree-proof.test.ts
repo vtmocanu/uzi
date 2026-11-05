@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import type { PodEpochReclaimScope } from "../templates/pod-epoch-init.cjs";
 import { formatAttemptId } from "../src/attempt-path.js";
 import { GitCache, type EpochDiscardProofOptions } from "../src/git.js";
-import { GitIndexError, parseGitIndex, readBoundedIndex } from "../src/git-index.js";
+import { GitIndexError, indexUnchanged, parseGitIndex, readBoundedIndex } from "../src/git-index.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 
@@ -402,8 +402,9 @@ function filterRun(t: TestContext, channel: "worktree" | "tracked" | "attr.tree"
   commitAll("tracked");
   const rec = recordLaunches(t, true);
   return (async () => {
-    // The real status launch of a pristine clone supplies the exact argv and environment.
-    assert.equal(await observation(), true);
+    // The real launches of a pristine clone supply the exact argv and environment. The committed
+    // tracked file is unpublished, so only the worktree stage (not the whole observation) can pass.
+    assert.equal(await prove(), true);
     const { env, ...launch } = pinnedStatus(rec);
     const rule = "tracked.txt filter=x\n";
     if (channel === "worktree") fs.writeFileSync(inClone(".gitattributes"), rule);
@@ -431,7 +432,7 @@ function filterRun(t: TestContext, channel: "worktree" | "tracked" | "attr.tree"
     fs.rmSync(marker, { force: true });
     if (channel === "info") {
       // No pin reaches `.git/info/attributes`; the shape gate refuses its presence instead.
-      assert.equal(await observation(), false);
+      assert.equal(await prove(), false);
       assert.equal(rec.launches.length, launched, "refused before any launch");
       return { naive, pinned: fs.existsSync(marker) };
     }
@@ -1454,5 +1455,70 @@ it("F4: http-alternates, an unknown entry or a symlinked objects/info are refuse
   fs.rmSync(info, { recursive: true });
   fs.symlinkSync(os.tmpdir(), info);
   assert.equal(await prove(), false);
+  assertNoGit(rec);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Review rework guards: path bound for every index version, byte-exact re-read, launch pins, and
+// the Node-only clone shape stage ahead of every Git launch.
+
+it("index: a path over 4096 bytes is refused in a version 2 index, while 4096 is accepted", () => {
+  const repo = newRepo();
+  const sha = blob(repo, "x");
+  indexInfo(repo, [{ mode: "100644", sha, path: pathOfLength(4096) }]);
+  assert.equal(parseGitIndex(readIndex(repo), { maxEntries: 4 }).version, 2);
+  indexInfo(repo, [{ mode: "100644", sha, path: pathOfLength(4097) }]);
+  const index = readIndex(repo);
+  assert.equal(index.readUInt32BE(4), 2);
+  assert.throws(() => parseGitIndex(index, { maxEntries: 4 }), /exceeds PATH_MAX/);
+});
+
+it("indexUnchanged compares the bytes, not only the stat signature and the trailer", async () => {
+  const { index } = plainRepo();
+  const dir = scratchDir("wt-unchanged-");
+  const file = path.join(dir, "index");
+  fs.writeFileSync(file, index);
+  const read = await readBoundedIndex(file, { maxBytes: index.length, maxEntries: 100 });
+  assert.equal(await indexUnchanged(file, read), true);
+  // Same signature (the file is untouched) and same trailer, but the image that was parsed differs
+  // in a body byte: a trailer-only comparison would still say "unchanged".
+  const forged = Buffer.from(read.bytes);
+  forged[forged.length - 21]! ^= 1;
+  assert.deepEqual(forged.subarray(forged.length - 20), read.bytes.subarray(read.bytes.length - 20));
+  assert.equal(await indexUnchanged(file, { ...read, bytes: forged }), false);
+  // A rewrite with identical content still changes ctime, so the signature alone refuses it.
+  fs.writeFileSync(file, index);
+  assert.equal(await indexUnchanged(file, read), false);
+});
+
+it("every native launch carries its pins, and a launch missing one is refused", async t => {
+  const rec = recordLaunches(t, true);
+  assert.equal(await prove(), true);
+  const clone = rec.spawned.filter(l => l.args.includes("-C") && l.sub !== "version");
+  assert.ok(clone.length >= 4, "clone-side reads were launched");
+  const state = { paths: [clonePath], attrSource: true };
+  const require = (args: string[]) => git["requireEpochNativePins"](args, args.indexOf("-C"), state, false);
+  for (const launch of clone) {
+    assert.doesNotThrow(() => require(launch.args), launch.sub);
+    for (const pin of [...PINS, `core.worktree=${clonePath}`]) {
+      const at = launch.args.indexOf(pin);
+      assert.ok(at > 0 && launch.args[at - 1] === "-c", `${launch.sub} carries -c ${pin}`);
+      const without = launch.args.filter((_, i) => i !== at && i !== at - 1);
+      assert.throws(() => require(without), /lacks its pins/, `${launch.sub} without ${pin}`);
+    }
+    const attr = launch.args.find(arg => arg.startsWith("--attr-source="))!;
+    assert.throws(() => require(launch.args.filter(arg => arg !== attr)), /lacks its pins/, `${launch.sub} without --attr-source`);
+  }
+});
+
+it("a FIFO or oversized .git entry keeps the source before any Git launch of the whole content proof", async t => {
+  fs.mkdirSync(inClone(".git", "sequencer"));
+  mkfifo(inClone(".git", "sequencer", "todo"));
+  const rec = recordLaunches(t);
+  assert.equal(await observation(), false);
+  assertNoGit(rec);
+  fs.rmSync(inClone(".git", "sequencer"), { recursive: true });
+  sparse(inClone(".git", "packed-refs"), 4 * 1024 * 1024, "# pack-refs\n");
+  assert.equal(await observation({ maxMetadataBytes: 65536 }), false);
   assertNoGit(rec);
 });

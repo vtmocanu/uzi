@@ -186,14 +186,17 @@ it("rediscovers retired strict journal with absent footprint and repeats barrier
   assert.equal(oldScope.stopped(), true); assert.ok(oldScope.pendingMutations > 0);
   assert.equal((await discard()).kind, "done"); assert.equal(ledger().length, 2); assert.equal(journal(), "");
 });
-for (const snapshot of [[], [""]] as string[][]) it(`preserves authorized inactive raw journal shape ${JSON.stringify(snapshot)}`, async () => {
+it("preserves authorized inactive raw journal shape [\"\"] and refuses the absent-journal shape []", async () => {
   const entry = { ...JSON.parse(ledger()[0]!), state: "abandoned" };
   gitIn(["config", "--local", "--add", `uzi-attempts.${BRANCH}.entry`, JSON.stringify(entry)]);
-  if (snapshot.length) setJournal(""); else gitIn(["config", "--local", "--unset-all", `uzi-recovery.${BRANCH}.clone`]);
-  await refresh(); input = { ...input, expectedRawJournal: snapshot };
+  setJournal("");
+  await refresh();
+  // An absent journal is no longer admissible to the epoch proof constructor.
+  assert.throws(() => git.createEpochDiscardProof({ ...input, expectedRawJournal: [] }), /invalid epoch discard proof/);
+  input = { ...input, expectedRawJournal: [""] };
   assert.equal((await discard()).kind, "done");
   const list = execFileSync("git", ["-C", bare, "config", "--local", "--null", "--list"], { env: ENV, encoding: "utf8" });
-  assert.equal(list.includes(`uzi-recovery.${BRANCH}.clone\n\0`), snapshot.length === 1);
+  assert.equal(list.includes(`uzi-recovery.${BRANCH}.clone\n\0`), true);
 });
 for (const boundary of ["retired", "clear"]) {
   const points = ["before-rawverify", "after-rawverify", ...["config", "directory"].flatMap(kind =>
