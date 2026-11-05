@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"regexp"
@@ -64,6 +65,10 @@ func TestRepoAgentSourceRequiredStampedOnEveryRunInsert(t *testing.T) {
 				t.Errorf("%s (%s) inserts a run without setting repo_agent_source_required; stamp it or add it to the exempt list", name, f)
 				continue
 			}
+			if err := assertInsertsTrue(columns, block[loc[1]+end+1:], "repo_agent_source_required"); err != nil {
+				t.Errorf("%s (%s): %v", name, f, err)
+				continue
+			}
 			stamped++
 		}
 	}
@@ -75,6 +80,86 @@ func TestRepoAgentSourceRequiredStampedOnEveryRunInsert(t *testing.T) {
 	if stamped != 8 {
 		t.Errorf("%d run INSERTs set repo_agent_source_required, want 8", stamped)
 	}
+}
+
+// assertInsertsTrue checks that column is inserted as the literal true. rest is the
+// statement text after the INSERT column list: a VALUES tuple or an INSERT ... SELECT.
+func assertInsertsTrue(columnList, rest, column string) error {
+	var columns []string
+	for _, c := range strings.Split(columnList, ",") {
+		columns = append(columns, strings.TrimSpace(c))
+	}
+	index := -1
+	for i, c := range columns {
+		if c == column {
+			index = i
+		}
+	}
+	if index < 0 {
+		return fmt.Errorf("%s is not a listed column", column)
+	}
+	values, err := insertedValues(rest)
+	if err != nil {
+		return err
+	}
+	if len(values) != len(columns) {
+		return fmt.Errorf("%d inserted values for %d columns", len(values), len(columns))
+	}
+	if got := strings.TrimSpace(values[index]); !strings.EqualFold(got, "true") {
+		return fmt.Errorf("inserts %s = %q, want true", column, got)
+	}
+	return nil
+}
+
+// insertedValues splits the top-level value expressions of a VALUES tuple or of an
+// INSERT ... SELECT list, skipping string literals and -- comments.
+func insertedValues(rest string) ([]string, error) {
+	text := strings.TrimSpace(rest)
+	upper := strings.ToUpper(text)
+	var depth int
+	var start int
+	switch {
+	case strings.HasPrefix(upper, "VALUES"):
+		open := strings.Index(text, "(")
+		if open < 0 {
+			return nil, fmt.Errorf("VALUES without a tuple")
+		}
+		start, depth = open+1, 1
+	case strings.HasPrefix(upper, "SELECT"):
+		start, depth = len("SELECT"), 0
+	default:
+		return nil, fmt.Errorf("unrecognised INSERT body")
+	}
+	base := depth
+	var values []string
+	itemStart := start
+	stop := regexp.MustCompile(`(?i)^\s(FROM|WHERE|RETURNING|ON\s+CONFLICT)\b`)
+	for i := start; i < len(text); i++ {
+		switch c := text[i]; {
+		case c == '\'':
+			for i++; i < len(text) && text[i] != '\''; i++ {
+			}
+		case c == '-' && i+1 < len(text) && text[i+1] == '-':
+			for i < len(text) && text[i] != '\n' {
+				i++
+			}
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+			if depth < base {
+				return append(values, text[itemStart:i]), nil
+			}
+		case c == ',' && depth == base:
+			values = append(values, text[itemStart:i])
+			itemStart = i + 1
+		case c == ';' && depth == base:
+			return append(values, text[itemStart:i]), nil
+		case depth == base && base == 0 && stop.MatchString(text[i:]):
+			return append(values, text[itemStart:i]), nil
+		}
+	}
+	return nil, fmt.Errorf("unterminated INSERT body")
 }
 
 func TestRepoAgentSourceClaimClauseCountPinned(t *testing.T) {
