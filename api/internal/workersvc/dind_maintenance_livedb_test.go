@@ -340,6 +340,9 @@ func dindReplacementReadiness(t *testing.T, src *hostSource) {
 		!registered.LastHeartbeatAt.Time.Equal(registered.DindRegisterFloor.Time) {
 		t.Fatalf("registration lost fence/binding or stamped unequal heartbeat/floor: %+v", registered)
 	}
+	// Registration stamps the heartbeat at the database clock; advance to it so this refusal is the
+	// heartbeat-not-after-floor check alone, not a heartbeat in the clock's future.
+	clk.advanceTo(t, registered.LastHeartbeatAt.Time)
 	refuse("replacement registration without heartbeat", "recycling")
 	fresh, err := svc.Heartbeat(env.ctx, read(), nil, nil, nil)
 	if err != nil {
@@ -444,7 +447,10 @@ func TestDindMaintenanceOwnershipBeforeFenceLiveDB(t *testing.T) {
 				cancel()
 				_ = tx.Rollback(context.Background())
 				select {
-				case <-done:
+				case err := <-done:
+					if err != nil {
+						t.Logf("fence goroutine: %v", err)
+					}
 				case <-time.After(2 * time.Second):
 					t.Error("fence goroutine did not stop")
 				}
@@ -502,7 +508,10 @@ func TestDindMaintenanceFenceBeforeOwnershipLiveDB(t *testing.T) {
 			defer func() {
 				cancel()
 				select {
-				case <-fenceDone:
+				case err := <-fenceDone:
+					if err != nil {
+						t.Logf("fence goroutine: %v", err)
+					}
 				case <-time.After(2 * time.Second):
 					t.Error("fence goroutine did not stop")
 				}
