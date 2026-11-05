@@ -147,8 +147,11 @@ marker exception; otherwise the guard blocks and each site keeps its prior block
 scope-capped slice, the #299 failure for prompt runs and other kinds). The marker exception is hardened: zero parents count
 only on a positive, readable, non-shallow parent read; exactly one parent is checked by
 floor ancestry with `--no-replace-objects` (exit 1 means work, any other error blocks); two
-or more parents get no marker exception and take the all-parent proof. The confirmed
-publication leg is unchanged.
+or more parents get no marker exception and take the all-parent proof. Every object read
+in the tip proof, including the overlay peel, ignores replace refs and `info/grafts`
+(`GIT_NO_REPLACE_OBJECTS`, `GIT_GRAFT_FILE=/dev/null`), so a replaced or grafted commit
+cannot make work look marker-only or content-free. The confirmed publication leg keeps its
+logic; it now reads through the same replace- and graft-free view.
 
 **Issue-run fallback (#3360).** On issue runs only, when the lead declares `report_only`
 but `hasCommittedCheckpoint` cannot establish that the checkpoint is content-free (same proof as above,
