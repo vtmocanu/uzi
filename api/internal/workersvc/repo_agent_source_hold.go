@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -17,9 +18,12 @@ const (
 	RepoAgentSourceFeature               = "repo_agent_source_v1"
 )
 
-func (s *Service) SetRunRepoAgentSourceHold(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64) (store.Run, bool, error) {
+func (s *Service) SetRunRepoAgentSourceHold(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64, commit string) (store.Run, bool, error) {
 	if generation <= 0 {
 		return store.Run{}, false, fmt.Errorf("%w: positive claim_generation required", ErrInvalidState)
+	}
+	if commit != "" && !repoAgentSourceCommitRE.MatchString(commit) {
+		return store.Run{}, false, fmt.Errorf("%w: repo_agent_source_commit must be a full lowercase commit id", ErrInvalidState)
 	}
 	gen := generation
 	locked, _, tx, err := s.beginClaimMutation(ctx, wkr, runID, &gen)
@@ -30,9 +34,10 @@ func (s *Service) SetRunRepoAgentSourceHold(ctx context.Context, wkr store.Worke
 		defer func() { _ = tx.Rollback(ctx) }()
 	}
 	run, err := locked.q.SetRunRepoAgentSourceHold(ctx, store.SetRunRepoAgentSourceHoldParams{
-		ID:              runID,
-		WorkerID:        pgconv.UUID(wkr.ID),
-		ClaimGeneration: generation,
+		ID:                    runID,
+		WorkerID:              pgconv.UUID(wkr.ID),
+		ClaimGeneration:       generation,
+		RepoAgentSourceCommit: pgconv.TextOrNull(commit),
 	})
 	applied := err == nil
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -45,6 +50,10 @@ func (s *Service) SetRunRepoAgentSourceHold(ctx context.Context, wkr store.Worke
 			run.ClaimGeneration == generation && !run.ClaimReleasedAt.Valid
 	} else if err != nil {
 		return store.Run{}, false, err
+	}
+	if applied && commit != "" && run.RepoAgentSourceCommit.String != commit {
+		slog.Warn("workersvc: repo-agent source hold kept the stored revision",
+			"run_id", runID, "stored", run.RepoAgentSourceCommit.String, "reported", commit)
 	}
 	if tx != nil {
 		if err := tx.Commit(ctx); err != nil {

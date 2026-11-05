@@ -135,6 +135,9 @@ func TestWorkerRepoAgentSourceRevisionLiveDB(t *testing.T) {
 		if run["status"] != "paused" || run["hold_reason"] != workersvc.HoldReasonRepoAgentSourceUnavailable {
 			t.Fatalf("held run = %v/%v, want paused/%s", run["status"], run["hold_reason"], workersvc.HoldReasonRepoAgentSourceUnavailable)
 		}
+		if run["repo_agent_source_commit"] != trusted {
+			t.Fatalf("held run repo_agent_source_commit = %v, want the supplied %s", run["repo_agent_source_commit"], trusted)
+		}
 		post(t, path, `{"commit":"nope","claim_generation":3}`, http.StatusBadRequest)
 	})
 }

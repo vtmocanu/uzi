@@ -31,13 +31,15 @@ func (h *Handler) WorkerRunRepoAgentSourceHold(w http.ResponseWriter, r *http.Re
 		httpx.Error(w, http.StatusBadRequest, "positive claim_generation and an optional full commit id required")
 		return
 	}
-	run, applied, err := h.wsvc.SetRunRepoAgentSourceHold(r.Context(), wkr, runID, body.ClaimGeneration)
+	run, applied, err := h.wsvc.SetRunRepoAgentSourceHold(r.Context(), wkr, runID, body.ClaimGeneration, body.Commit)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
 			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on the repo agent source hold")
+		case errors.Is(err, workersvc.ErrInvalidState):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrStaleClaim):
 			httpx.ErrorReason(w, http.StatusConflict, "repo agent source hold claim is stale", "stale_claim")
 		default:

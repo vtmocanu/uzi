@@ -89,16 +89,16 @@ func TestRepoAgentSourceHoldLiveDB(t *testing.T) {
 	}
 
 	stale := seed(39132)
-	if run, applied, err := svc.SetRunRepoAgentSourceHold(env.ctx, wkr, stale, 2); err != nil || applied || run.Status != "running" {
+	if run, applied, err := svc.SetRunRepoAgentSourceHold(env.ctx, wkr, stale, 2, ""); err != nil || applied || run.Status != "running" {
 		t.Fatalf("stale generation = (%q, applied=%v, %v), want (running, false, nil)", run.Status, applied, err)
 	}
 
 	id := seed(39133)
-	run, applied, err := svc.SetRunRepoAgentSourceHold(env.ctx, wkr, id, 3)
+	run, applied, err := svc.SetRunRepoAgentSourceHold(env.ctx, wkr, id, 3, "")
 	if err != nil || !applied || run.Status != "paused" || run.HoldReason.String != HoldReasonRepoAgentSourceUnavailable {
 		t.Fatalf("hold = (%q, %q, applied=%v, %v), want paused/%s", run.Status, run.HoldReason.String, applied, err, HoldReasonRepoAgentSourceUnavailable)
 	}
-	if _, applied, err := svc.SetRunRepoAgentSourceHold(env.ctx, wkr, id, 3); err != nil || !applied {
+	if _, applied, err := svc.SetRunRepoAgentSourceHold(env.ctx, wkr, id, 3, ""); err != nil || !applied {
 		t.Fatalf("repeat = (applied=%v, %v), want applied", applied, err)
 	}
 	if _, err := env.q.ResumePausedRun(env.ctx, store.ResumePausedRunParams{ID: id, UserID: o.userID, GlobalTimeoutSeconds: 3600}); err != nil {
@@ -106,6 +106,53 @@ func TestRepoAgentSourceHoldLiveDB(t *testing.T) {
 	}
 	if s := statusOf(t, env, id); s != "queued" {
 		t.Fatalf("status after resume = %q, want queued", s)
+	}
+	if got, _ := repoAgentSourceOf(t, env, id); got.Valid {
+		t.Fatalf("a hold without a commit recorded revision %q", got.String)
+	}
+	malformed := seed(39134)
+	if _, _, err := svc.SetRunRepoAgentSourceHold(env.ctx, wkr, malformed, 3, "ABC"); !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("a malformed hold commit err = %v, want ErrInvalidState", err)
+	}
+}
+
+func TestRepoAgentSourceHoldPinsRevisionAcrossResumeLiveDB(t *testing.T) {
+	f := newCRFix(t)
+	ctx := f.env.ctx
+	run := f.startPlainPromptRun(t)
+	w := f.guardWorker(t, 0, capability.RepoAgentSourceV1)
+	first := f.acceptClaim(t, w, run, "first claim")
+	if first.RepoAgentSourceCommit != nil {
+		t.Fatalf("first claim carries repo_agent_source_commit %q", *first.RepoAgentSourceCommit)
+	}
+	gen := first.ClaimGeneration
+	if _, applied, err := f.svc.SetState(ctx, w, run, StateRequest{State: "running", ClaimGeneration: &gen}); err != nil || !applied {
+		t.Fatalf("running report = (applied=%v, %v), want applied", applied, err)
+	}
+
+	held, applied, err := f.svc.SetRunRepoAgentSourceHold(ctx, w, run, gen, repoAgentSourceFirst)
+	if err != nil || !applied || held.Status != "paused" || held.RepoAgentSourceCommit.String != repoAgentSourceFirst {
+		t.Fatalf("hold = (%q, %v, applied=%v, %v), want paused with %s", held.Status, held.RepoAgentSourceCommit, applied, err, repoAgentSourceFirst)
+	}
+	if _, err := f.env.q.ResumePausedRun(ctx, store.ResumePausedRunParams{ID: run, UserID: f.user, GlobalTimeoutSeconds: 3600}); err != nil {
+		t.Fatalf("owner resume err = %v", err)
+	}
+
+	resumed := f.acceptClaim(t, w, run, "claim after the owner resumed the hold")
+	if resumed.RepoAgentSourceCommit == nil || *resumed.RepoAgentSourceCommit != repoAgentSourceFirst {
+		t.Fatalf("resumed claim repo_agent_source_commit = %v, want the held revision %s", resumed.RepoAgentSourceCommit, repoAgentSourceFirst)
+	}
+	gen = resumed.ClaimGeneration
+	moved := repoAgentSourceSecond
+	if _, _, err := f.svc.SetState(ctx, w, run, StateRequest{State: "running", ClaimGeneration: &gen, RepoAgentSourceCommit: &moved}); !errors.Is(err, ErrRepoAgentSourceConflict) {
+		t.Fatalf("a report of the moved default branch err = %v, want ErrRepoAgentSourceConflict", err)
+	}
+	if _, applied, err := f.svc.SetState(ctx, w, run, StateRequest{State: "running", ClaimGeneration: &gen}); err != nil || !applied {
+		t.Fatalf("running report = (applied=%v, %v), want applied", applied, err)
+	}
+	again, applied, err := f.svc.SetRunRepoAgentSourceHold(ctx, w, run, gen, moved)
+	if err != nil || !applied || again.RepoAgentSourceCommit.String != repoAgentSourceFirst {
+		t.Fatalf("second hold = (%v, applied=%v, %v), want the first revision %s kept", again.RepoAgentSourceCommit, applied, err, repoAgentSourceFirst)
 	}
 }
 

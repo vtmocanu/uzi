@@ -4,6 +4,7 @@ UPDATE runs SET
     status_since       = now(),
     hold_reason        = 'repo_agent_source_unavailable',
     hold_captured_head = NULL,
+    repo_agent_source_commit = COALESCE(repo_agent_source_commit, sqlc.narg('repo_agent_source_commit')::text),
     open_question_id   = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at         = now()
