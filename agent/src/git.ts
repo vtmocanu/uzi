@@ -1379,6 +1379,8 @@ const EPOCH_GIT_DIR_FILES: ReadonlySet<string> = new Set([
 ]);
 /** A `.git/HEAD` or loose ref file is a line of at most this many bytes. */
 const EPOCH_REF_FILE_MAX_BYTES = 1024;
+/** A reflog file or FETCH_HEAD/ORIG_HEAD read for the object ids it names is at most this many bytes. */
+const EPOCH_NAMED_FILE_MAX_BYTES = 256 * 1024;
 /** Levels of non-ignored untracked directories the automatic proof will expand (each is one `check-ignore`). */
 const EPOCH_UNTRACKED_EXPANSION_DEPTH = 32;
 const EPOCH_CLONE_CONFIG_KEY_PATTERNS: readonly RegExp[] = [/^branch\..+\.(?:remote|merge)$/];
@@ -2525,6 +2527,8 @@ interface AutomaticPreservation {
 interface AutomaticCloneShape {
   ctx: ReturnType<GitCache["automaticProofContext"]>;
   index: BoundedIndex;
+  /** Object ids named by the clone's reflogs, ORIG_HEAD and FETCH_HEAD (zero ids excluded). */
+  namedIds: ReadonlySet<string>;
 }
 
 export interface RetainedDiscardOptions {
@@ -11462,9 +11466,13 @@ export class GitCache {
           const out = await refs();
           this.automaticCollection(out, "\n");
           if (out && !out.endsWith("\n")) unknown("unterminated refs");
-          // Only what the clone itself stores can be lost with it: objects that live in the shared
-          // bare or its alternates survive the clone's deletion, so they need no root.
+          // Required: the clone's own objects, HEAD, every ref value and every id its reflogs,
+          // ORIG_HEAD and FETCH_HEAD name (read in the shape stage). Each must be reachable from the
+          // trusted roots. An object that has left the clone's own store (repack -a -d -l, gc) can
+          // sit in a bare pack no ref reaches; a clone pointer naming it is then the last pointer
+          // to it, so merely existing in the bare or its alternates is not enough.
           const required = new Set(initial.own); required.add(head);
+          for (const id of automatic.shape?.namedIds ?? []) required.add(id);
           let stash = false;
           for (const line of out ? out.slice(0, -1).split("\n") : []) {
             const match = /^([0-9a-f]{40}) (refs\/[^\s]+)$/.exec(line);
@@ -11751,6 +11759,54 @@ export class GitCache {
         };
         await walkRefs(Buffer.from(path.join(gitDir, "refs")));
       }
+      // Reflogs and the pseudo-refs name objects only the clone may still hold (an ORIG_HEAD or a
+      // logged old tip whose commit has left the clone's own store). Every named id is collected
+      // here, in Node, and must later be reachable from the trusted roots; anything unparseable,
+      // oversized or not a regular file is a keep.
+      const namedIds = new Set<string>();
+      const readNamed = async (file: string | Buffer, what: string): Promise<string> => {
+        try {
+          const got = await readSmallRegularFile(file as string, Math.min(EPOCH_NAMED_FILE_MAX_BYTES,
+            limits.maxMetadataBytes - counters.metadataBytes), read);
+          chargeMetadata(got.bytes.length, what);
+          fixed.set("n:" + file.toString("latin1"), { target: file, signature: got.signature });
+          return got.bytes.toString("latin1");
+        } catch (error) {
+          if (error instanceof GitIndexError) throw refusal(`${what}: ${error.message}`);
+          throw error;
+        }
+      };
+      const nameIds = (text: string, what: string, pattern: RegExp) => {
+        if (text !== "" && !text.endsWith("\n")) throw refusal(`${what} is unterminated`);
+        for (const line of text === "" ? [] : text.slice(0, -1).split("\n")) {
+          const match = pattern.exec(line);
+          if (!match) throw refusal(`${what} holds an unparseable line`);
+          for (const id of match.slice(1)) if (!/^0{40}$/.test(id)) namedIds.add(id);
+        }
+      };
+      for (const pseudo of ["ORIG_HEAD", "FETCH_HEAD"]) {
+        if (!gitEntries.some(raw => raw.toString("latin1") === pseudo)) continue;
+        nameIds(await readNamed(path.join(gitDir, pseudo), `.git/${pseudo}`), `.git/${pseudo}`,
+          pseudo === "ORIG_HEAD" ? /^([0-9a-f]{40})$/ : /^([0-9a-f]{40})(?:[\t ].*)?$/);
+      }
+      if (gitEntries.some(raw => raw.toString("latin1") === "logs")) {
+        const walkLogs = async (dir: Buffer): Promise<void> => {
+          const names: Buffer[] = [];
+          await listDirectory(dir, name => names.push(Buffer.from(name)));
+          for (const name of names) {
+            const file = Buffer.concat([dir, Buffer.from("/"), name]);
+            if (file.length >= 4096) throw refusal("log path exceeds PATH_MAX");
+            const st = await lstatPath(file);
+            remember("l:" + file.toString("latin1"), file, st);
+            if (st.isDirectory()) { await walkLogs(file); continue; }
+            if (!st.isFile()) throw refusal("a log entry is not a regular file or real directory");
+            nameIds(await readNamed(file, "reflog file"), "reflog file", /^([0-9a-f]{40}) ([0-9a-f]{40}) /);
+          }
+        };
+        const logsRoot = path.join(gitDir, "logs");
+        remember("l:" + logsRoot, logsRoot, await lstatPath(logsRoot));
+        await walkLogs(Buffer.from(logsRoot));
+      }
       const infoDir = path.join(gitDir, "info");
       if (gitEntries.some(raw => raw.toString("latin1") === "info")) {
         // Only the clone's own exclude file: `attributes` and `sparse-checkout` steer Git.
@@ -11798,10 +11854,11 @@ export class GitCache {
       // typed only (every launch pins `core.commitGraph=false`, so Git never opens either). Any
       // other entry, `http-alternates` included, is a keep.
       const objectsInfo = path.join(gitDir, "objects", "info");
-      let infoStat: import("node:fs").BigIntStats | undefined;
-      try { infoStat = await lstatPath(objectsInfo); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      if (infoStat) try {
+      try {
+        let infoStat: import("node:fs").BigIntStats | undefined;
+        try { infoStat = await lstatPath(objectsInfo); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        if (infoStat) {
         if (!infoStat.isDirectory()) throw refusal(".git/objects/info is not a real directory");
         remember("d:" + objectsInfo, objectsInfo, infoStat);
         const names: string[] = [];
@@ -11818,10 +11875,14 @@ export class GitCache {
           if (!st.isDirectory()) throw refusal(".git/objects/info/commit-graphs is not a real directory");
           remember("d:" + file, file, st);
         }
+        }
       } catch (error) {
-        // Both a typed refusal and an exceeded bound leave the object store unaccounted for: UNKNOWN.
-        if (error instanceof AutomaticContentRefusal || error instanceof AutomaticCompletenessUnknown) {
-          const unknownInfo = new AutomaticCompletenessUnknown(error.message, { cause: error });
+        // A typed refusal, an exceeded bound and any non-ENOENT filesystem error (an unreadable
+        // directory, say) leave the object store unaccounted for: UNKNOWN.
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        const fsError = typeof code === "string" && /^E[A-Z0-9]+$/.test(code) && code !== "ENOENT";
+        if (fsError || error instanceof AutomaticContentRefusal || error instanceof AutomaticCompletenessUnknown) {
+          const unknownInfo = new AutomaticCompletenessUnknown((error as Error).message, { cause: error });
           OBJECT_INFO_UNKNOWN.add(unknownInfo);
           throw unknownInfo;
         }
@@ -11879,7 +11940,7 @@ export class GitCache {
       chargeMetadata(index.size, ".git/index");
       chargeRecords("index", index.entries.length, "index entry");
 
-      automatic.shape = { ctx, index };
+      automatic.shape = { ctx, index, namedIds };
       return true;
     } catch (err) {
       if (err instanceof AutomaticCompletenessUnknown && OBJECT_INFO_UNKNOWN.has(err)) throw err;

@@ -246,35 +246,40 @@ for (const damage of Object.keys(REASONS) as (keyof typeof REASONS)[]) {
     assert.equal(attempts(), 0);
   });
 }
-/** Counts the worktree stage's Git reads (`ls-files`); the proof has no `status` launch since Node hashes tracked content. */
+/** Counts every Git launch of the worktree stage (config, ls-tree, ls-files, check-ignore: each carries the `--attr-source` pin that the object-store launches lack); the proof has no `status` launch since Node hashes tracked content. */
 function worktreeReadSpy(t: TestContext): () => number {
   const original = git["execEpochNative"].bind(git); let launches = 0;
   t.mock.method(git as unknown as { execEpochNative: typeof original }, "execEpochNative", async (...args: Parameters<typeof original>) => {
-    if (args[1].includes("ls-files")) launches++;
+    if (args[1].some(arg => arg.startsWith("--attr-source="))) launches++;
     return original(...args);
   });
   return () => launches;
 }
 it("keeps the source before any worktree Git read when a sparse tracked file differs from its index entry", async t => {
-  // Sparse and index-matched by `--info-only`: no object is written, so object prechecks pass. The
-  // content no longer matches the entry, so the Node hash comparison refuses it before Git is asked
-  // anything. This pins the mismatch refusal only; the tracked-content BYTE BUDGET cannot be pinned
+  // Sparse and still carrying its original index entry: the content no longer matches the entry,
+  // so the Node hash comparison refuses it before the worktree stage asks Git anything. This pins the mismatch refusal only; the tracked-content BYTE BUDGET cannot be pinned
   // through the whole proof (a committed large file also exceeds the same budget in the object
   // observation first), so it is pinned in epoch-worktree-proof.test.ts ("F3: ...").
   const tracked = path.join(clonePath, "base");
   fs.truncateSync(tracked, 1024 * 1024);
-  command(clonePath, "update-index", "--info-only", "base");
   const future = new Date(Date.now() + 3600_000);
   fs.utimesSync(tracked, future, future);
   const launches = worktreeReadSpy(t);
+  const reasons: string[] = [];
+  const debug = git["log"].debug.bind(git["log"]);
+  t.mock.method(git["log"], "debug", (message: string, fields?: unknown) => {
+    reasons.push(`${message} ${JSON.stringify(fields)}`);
+    return debug(message, fields as never);
+  });
   assert.equal(await observation(), false);
+  assert.ok(reasons.some(r => /worktree differs from the index/.test(r)), `refused for the hash mismatch: ${reasons.join("|")}`);
   assert.equal(launches(), 0, "no worktree Git read may run on a tracked file that differs from the index");
   assert.equal(journal(), raw);
 });
 it("still proves a normal clean tree under the default budget, running its worktree Git read", async t => {
   const launches = worktreeReadSpy(t);
   assert.equal(await observation(), true);
-  assert.equal(launches(), 1);
+  assert.equal(launches(), 5, "config, ls-tree, ls-files and two check-ignore");
 });
 it("charges aggregate inflation across stores before verifying an earlier pair", async t => {
   // Leave room for fixture metadata: each object fits 256 KiB, their sum does not.
