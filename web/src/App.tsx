@@ -6,6 +6,7 @@ import { Landing } from "./pages/Landing";
 import { Login } from "./pages/Login";
 import { Register } from "./pages/Register";
 import { Dashboard } from "./pages/Dashboard";
+import { OverviewNext } from "./pages/OverviewNext";
 import { AdminUsers } from "./pages/AdminUsers";
 import { AdminRateLimits } from "./pages/AdminRateLimits";
 import { AdminSettings } from "./pages/AdminSettings";
@@ -95,6 +96,8 @@ export const APP_ROUTES: AppRoute[] = [
   { path: "/admin", element: <Navigate to="/admin/users" replace />, guard: "public" },
   // Authenticated app.
   { path: "/dashboard", element: <Dashboard />, guard: "protected" },
+  // The Overview preview (PRD #3878): linked from /dashboard and back; #3877 promotes or drops it.
+  { path: "/overview/next", element: <OverviewNext />, guard: "protected" },
   { path: "/settings", element: <Settings />, guard: "protected" },
   // Appearance (theme/mode/typeface) + demo mode, split out of the Account tab.
   { path: "/settings/appearance", element: <AppearanceSettings />, guard: "protected" },

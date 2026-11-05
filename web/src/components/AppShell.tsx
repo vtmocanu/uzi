@@ -15,14 +15,12 @@ import { presetAssetForSlug, presetForSlug } from "../lib/brandPresets";
 import { CountPill, cx, type CountPillTone } from "./ui";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail, maskName, maskRepoPath } from "../lib/demoMask";
-import { VaultBadge, VaultLockedBanner, VaultRequiredPrompt } from "./VaultControls";
-import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
-import { HealthDangerBanner } from "./HealthDangerBanner";
-import { HealthAttentionBanner } from "./HealthAttentionBanner";
+import { VaultBadge } from "./VaultControls";
+import { AppBanners } from "./AppBanners";
+import { PageHeaderSlotContext } from "./PageHeaderSlot";
 import { healthPipLabel } from "../lib/healthView";
 import { HealthStatusProvider, useHealthStatus } from "../lib/useAdminHealth";
 import { MaintenanceProvider } from "../lib/useMaintenance";
-import { MaintenanceBanner } from "./MaintenanceBanner";
 import { RateLimitAnnouncer } from "./RateLimitMeters";
 import { SidebarUsageLimits } from "./SidebarUsageLimits";
 import { useFavicon } from "../lib/useFavicon";
@@ -1117,6 +1115,9 @@ export function AppShell({ children }: { children: ReactNode }) {
     if (back) navigate(back, { replace: true });
   }, [authLoading, user, navigate]);
   const [mobileOpen, setMobileOpen] = useState(false);
+  // The node InShellHeader portals a page header into (PRD #3878); state, not a ref, so
+  // the page re-renders once the node exists.
+  const [headerSlot, setHeaderSlot] = useState<HTMLDivElement | null>(null);
   // Judge to-triage badge (PRD #98). Owned here — above the guest early return, so it
   // survives across routes and feeds both SidebarContent mounts — from
   // /me/judge/stats.todo — the ONE canonical to-triage number.
@@ -1400,22 +1401,15 @@ export function AppShell({ children }: { children: ReactNode }) {
 
       <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
         <div className={cx(!fullBleed && "mx-auto w-full max-w-[68rem]")}>
-          {/* Vault locked banner (PRD #32): app-wide so the user can unlock from
-              any page. Self-gates — renders nothing while unlocked. */}
-          <VaultRequiredPrompt />
-          <VaultLockedBanner />
-          {/* Maintenance mode (PRD #3454): app-wide, every signed-in user, info tone, self-gating
-              — renders nothing unless an admin has paused intake. */}
-          <MaintenanceBanner />
-          {/* Update escalation banner (PRD #836 M6): app-wide, admin-only, self-gating —
-              renders nothing unless the server says the instance is far behind and the
-              banner is enabled and not snoozed for the current release. */}
-          <UpdateEscalationBanner />
-          {/* App-wide instance-health danger banner (PRD #1484 M5): admin-only, danger-only,
-              self-gating, with a 1 h per-episode snooze. Reads the shared HealthStatusProvider,
-              so a non-admin never fetches the admin endpoint. */}
-          <HealthDangerBanner />
-          {user?.is_admin === true && <HealthAttentionBanner key={user.id} />}
+          {/* Header slot (PRD #3878): a page that wants its header above the banners (the
+              /overview/next preview) portals it here through InShellHeader. Empty on every
+              other page, where `empty:hidden` leaves it out of layout. Its position, like
+              the stack's, is fixed on every route, so neither remounts on navigation. */}
+          <div ref={setHeaderSlot} className="empty:hidden" />
+          {/* The app-wide banner stack (vault, maintenance, update escalation, health):
+              one instance on every route, in the same tree position, so the health banners
+              keep their snooze/dismiss state across navigation. */}
+          <AppBanners />
           {/* The publisher for the one canonical to-triage number (PRD #98): how the Judge
               page keeps the nav badge fresh after a dispose. */}
           {/* Findings' twin of the judge channel (PRD #1183 M4): the setter lets the Findings
@@ -1424,7 +1418,9 @@ export function AppShell({ children }: { children: ReactNode }) {
               provider so both channels wrap `children`. */}
           <JudgeTodoContext.Provider value={setJudgeTodo}>
             <FindingsOpenContext.Provider value={setFindingsOpen}>
-              <FindingsOpenValueContext.Provider value={findingsOpen}>{children}</FindingsOpenValueContext.Provider>
+              <FindingsOpenValueContext.Provider value={findingsOpen}>
+                <PageHeaderSlotContext.Provider value={headerSlot}>{children}</PageHeaderSlotContext.Provider>
+              </FindingsOpenValueContext.Provider>
             </FindingsOpenContext.Provider>
           </JudgeTodoContext.Provider>
         </div>
