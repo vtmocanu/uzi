@@ -199,8 +199,6 @@ function parseAnswerBody(
  * sdk-executor.ts, and `instanceof`-tested in runner.ts) so it crosses files and knip sees a
  * live consumer of the export.
  */
-/** The sticky pause mode (see SteeringChannel.getPauseMode): an owner `milestone`/`now` pause, the
- *  sweep's `wall` park (PRD #1497), the worker-local `disk` stop (PRD #1809 D4), or none. */
 /** A handle on a counted credential-switch hold (SteeringChannel.holdCredentialSwitch). */
 export interface CredentialSwitchHold {
   /** Whether a switch generation is latched on the channel. */
@@ -210,6 +208,8 @@ export interface CredentialSwitchHold {
   close(opts: { service: boolean }): void;
 }
 
+/** The sticky pause mode (see SteeringChannel.getPauseMode): an owner `milestone`/`now` pause, the
+ *  sweep's `wall` park (PRD #1497), the worker-local `disk` stop (PRD #1809 D4), or none. */
 export type PauseMode = "milestone" | "now" | "wall" | "disk" | null;
 
 export class PauseNowSignal extends Error {
@@ -752,11 +752,6 @@ export class SteeringChannel {
         const refused = new InputReceiptError(
           `the applied receipt for ${this.held.ids.length} routed operator input(s) was refused: ${errMessage(err)}`,
         );
-        // A pending switch: take the EXISTING credential-switch path, never a generic failure. The
-        // reports waiting now reject with a CredentialSwitchSignal (so the executor/runner enter the
-        // switch release, which never reports `failed`), the batch is dropped for the next claim to
-        // replay, and the switch is tripped as the GET's signal would. The failure is not sticky, so
-        // the release report, finding nothing pending, goes out.
         if (reason === "switch_pending" && this.switchHoldDepth > 0) {
           // Hold: latch, keep the batch unapplied (rearm returns it to the ready lane), reject nobody.
           for (const id of this.held.ids) if (!this.heldForSwitch.includes(id)) this.heldForSwitch.push(id);
@@ -764,6 +759,11 @@ export class SteeringChannel {
           this.releaseHeld();
           return;
         }
+        // A pending switch (no hold): take the EXISTING credential-switch path, never a generic
+        // failure. The reports waiting now reject with a CredentialSwitchSignal (so the
+        // executor/runner enter the switch release, which never reports `failed`), the batch is
+        // dropped for the next claim to replay, and the switch is tripped as the GET's signal would.
+        // The failure is not sticky, so the release report, finding nothing pending, goes out.
         if (reason === "switch_pending") {
           this.rejectHeld(new CredentialSwitchSignal());
           this.maybeTripCredentialSwitch(this.claimGeneration);
@@ -1148,9 +1148,11 @@ export class SteeringChannel {
         count,
       });
       this.parkReady(ids);
-      // During a hold nothing is urgent (no taken approve can exist): latch and settle. A taken
-      // approve that somehow exists keeps today's urgent path below.
-      if (this.switchHoldDepth > 0 && !ids.some((id) => this.takenApproveIds.has(id))) {
+      // During a hold: latch and settle, rejecting nobody.
+      if (this.switchHoldDepth > 0) {
+        // Never reject during a hold. A taken approve is recorded and becomes urgent only once the
+        // switch is actually pending (maybeTripCredentialSwitch).
+        if (ids.some((id) => this.takenApproveIds.has(id))) this.approveRefusedDuringHold = true;
         this.maybeTripCredentialSwitch(this.claimGeneration);
         this.settleWaiters();
       } else if (ids.some((id) => this.takenApproveIds.has(id))) {
@@ -1160,9 +1162,13 @@ export class SteeringChannel {
       } else this.settleWaiters();
       return "continue";
     }
-    if (reason === "switch_pending" && this.switchHoldDepth > 0 && !this.ready?.ids.some((id) => this.takenApproveIds.has(id))) {
-      // Hold: latch, park the ids, settle (non-urgent), reject nobody.
-      if (this.ready) this.parkReady([...this.ready.ids]);
+    if (reason === "switch_pending" && this.switchHoldDepth > 0) {
+      // Hold: latch, park the ids, settle, reject nobody. A taken approve is recorded and becomes
+      // urgent only once the switch is actually pending (maybeTripCredentialSwitch).
+      if (this.ready) {
+        if (this.ready.ids.some((id) => this.takenApproveIds.has(id))) this.approveRefusedDuringHold = true;
+        this.parkReady([...this.ready.ids]);
+      }
       this.maybeTripCredentialSwitch(this.claimGeneration);
       this.settleWaiters();
       return "stop";
@@ -1546,6 +1552,9 @@ export class SteeringChannel {
    *  rejected. Serviced synchronously by the last handle's close({ service: true }). */
   private switchHoldDepth = 0;
   private latchedSwitchGeneration: number | undefined;
+  /** A taken approve's APPLIED was refused during a hold: approveRefusedBySwitch is set only when
+   *  the switch is actually pending (maybeTripCredentialSwitch), never while it is merely latched. */
+  private approveRefusedDuringHold = false;
   /** Ids of a routed batch whose APPLIED a switch refused during a hold: kept unapplied (a release
    *  leaves them for the next claim) and returned to the ready lane by rearmCredentialSwitch. */
   private readonly heldForSwitch: number[] = [];
@@ -1793,19 +1802,22 @@ export class SteeringChannel {
     // Issue #1604: the claim stays active and the switch is cleared, so the plan-gate inputs a
     // pending switch refused are due their APPLIED again.
     this.approveRefusedBySwitch = false;
+    this.approveRefusedDuringHold = false;
     if (this.parkedReady.length > 0) this.markReady(this.parkedReady.splice(0));
     if (this.heldForSwitch.length > 0) this.markReady(this.heldForSwitch.splice(0));
   }
 
   /** Whether a switch hold (holdCredentialSwitch) is open on this channel. */
-  credentialSwitchHeld(): boolean {
+  credentialSwitchHoldOpen(): boolean {
     return this.switchHoldDepth > 0;
   }
 
   /** Open a counted hold: a matching credential switch is latched, not tripped, until the last
    *  handle closes. Close with `service: true` at a verified release (trips synchronously if a
    *  generation is latched), or `service: false` to discard the latch (the stamp rides every poll,
-   *  so a later poll trips normally). Each handle closes at most once. */
+   *  so a later poll trips normally). Each handle closes at most once.
+   *  Boundary: `service: false` leaves parked / heldForSwitch ids where they are; they wait for the
+   *  stamp's next poll trip (and a later give-up rearm) or for the next claim. */
   holdCredentialSwitch(): CredentialSwitchHold {
     this.switchHoldDepth++;
     let closed = false;
@@ -1818,6 +1830,7 @@ export class SteeringChannel {
         if (this.switchHoldDepth > 0) return;
         const generation = this.latchedSwitchGeneration;
         this.latchedSwitchGeneration = undefined;
+        if (!service) this.approveRefusedDuringHold = false;
         if (service && generation !== undefined) this.maybeTripCredentialSwitch(generation);
       },
     };
@@ -2520,6 +2533,11 @@ export class SteeringChannel {
     if (this.switchDeferDepth > 0) return;
     if (this.pendingSwitchGeneration !== undefined) return; // already tripped once — idempotent
     this.pendingSwitchGeneration = generation;
+    // A taken approve refused during a hold becomes urgent only now that the switch is pending.
+    if (this.approveRefusedDuringHold) {
+      this.approveRefusedDuringHold = false;
+      this.approveRefusedBySwitch = true;
+    }
     // Mid-turn: trip the shared controller (guarded on !aborted so we don't double-abort a
     // controller a cancel/pause already spent) and the re-armable interrupt, exactly like a `now`
     // pause. The abort reason is a CredentialSwitchSignal so the executor's cancel listener routes
