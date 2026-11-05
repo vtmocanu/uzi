@@ -1632,3 +1632,51 @@ it("F4: a staged addition that sorts after every HEAD entry is a keep even when 
   fs.rmSync(inClone("zz-copy.md"));
   assert.equal(await prove(), true, "control: without the addition the clone is provable");
 });
+
+// ---------------------------------------------------------------------------------------------
+// Reflogs and pseudo-refs name objects the clone alone may still point at; they must be reachable
+// from the trusted roots, and a hostile or oversized log is refused before any Git launch.
+
+function bareCommand(...args: string[]): string { return command(bare, ...args); }
+it("G1: a clone-authored commit repacked out of the clone into an unreachable bare pack, named only by ORIG_HEAD and the reflog, is a keep", async () => {
+  const prev = command(clonePath, "rev-parse", "HEAD");
+  fs.writeFileSync(inClone("authored.txt"), "clone-authored\n");
+  commitAll("clone-authored");
+  const x = command(clonePath, "rev-parse", "HEAD");
+  bareCommand("fetch", clonePath, `${x}:refs/uzi-audit/tmp`);
+  bareCommand("repack", "-a", "-d");
+  bareCommand("update-ref", "-d", "refs/uzi-audit/tmp");
+  command(clonePath, "reset", "--hard", prev);
+  command(clonePath, "-c", "repack.updateServerInfo=false", "repack", "-a", "-d", "-l");
+  command(clonePath, "prune-packed");
+  assert.equal(spawnSync("git", ["-C", clonePath, "cat-file", "-e", x], { env: ENV }).status, 0, "X is still readable through the alternate");
+  assert.equal(fs.readFileSync(inClone(".git", "ORIG_HEAD"), "utf8").trim(), x);
+  assert.equal(await observation(), false);
+});
+it("G1 control: a reflog and ORIG_HEAD naming only published commits still prove", async () => {
+  command(clonePath, "reset", "--hard", "HEAD");
+  fs.writeFileSync(inClone(".git", "ORIG_HEAD"), command(clonePath, "rev-parse", "HEAD") + "\n");
+  assert.ok(fs.readFileSync(inClone(".git", "logs", "HEAD"), "utf8").length > 0);
+  assert.equal(await observation(), true);
+});
+it("G1: an oversized or FIFO reflog, or an oversized ORIG_HEAD, keeps the source with no native launch", async t => {
+  const log = inClone(".git", "logs", "refs", "heads", "zzlog");
+  fs.mkdirSync(path.dirname(log), { recursive: true });
+  const rec = recordLaunches(t);
+  sparse(log, 300 * 1024);
+  assert.equal(await observation(), false, "oversized reflog");
+  fs.rmSync(log);
+  mkfifo(log);
+  const started = Date.now();
+  assert.equal(await observation(), false, "FIFO reflog");
+  assert.ok(Date.now() - started < 10_000, "must not wait on the FIFO");
+  fs.rmSync(log);
+  sparse(inClone(".git", "ORIG_HEAD"), 300 * 1024);
+  assert.equal(await observation(), false, "oversized ORIG_HEAD");
+  assertNoGit(rec);
+});
+it("G2: an unreadable .git/objects/info is UNKNOWN, not a settled keep", async () => {
+  const info = inClone(".git", "objects", "info");
+  fs.chmodSync(info, 0o000);
+  try { await proveUnknown(); } finally { fs.chmodSync(info, 0o700); }
+});
