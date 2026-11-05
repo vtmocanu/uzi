@@ -18236,27 +18236,38 @@ try {
       return "unprovable";
     }
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(startTip)) return "unprovable";
-    let tip = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${startTip}^{commit}`])).trim();
+    // Every read here uses original objects: a refs/replace entry must not make the subject say
+    // "marker" while the parent read (--no-replace-objects) sees the original commit.
+    let tip = (await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${startTip}^{commit}`])).trim();
     if (!tip) return "unprovable";
     // issue #2753: a chain over a confirmed park marker (`ckpt(overlay):` C with parents [M, ...,
     // L], L the real tip) is peeled to L when L is a park marker and C verifiably adds only
     // workflow-subtree swaps / already-published markers over L. Anything unverifiable keeps the
     // tip as is (the guard then blocks).
-    if (SHA40_RE.test(tip) && (await this.isOverlayMarker(barePath, tip))) {
-      const parents = (await this.tryGitStdout(barePath, ["rev-list", "--parents", "-n", "1", tip]))
+    if (SHA40_RE.test(tip) && (await this.isOverlayMarker(barePath, tip, { noReplace: true }))) {
+      const parents = (await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-list", "--parents", "-n", "1", tip]))
         .trim().split(/\s+/).filter(Boolean).slice(1);
       const last = parents[parents.length - 1];
       // A park marker has exactly one parent; a merge-shaped look-alike is not peeled.
       const lastParents = last !== undefined && SHA40_RE.test(last)
-        ? (await this.tryGitStdout(barePath, ["rev-list", "--parents", "-n", "1", last])).trim().split(/\s+/).filter(Boolean).length - 1
+        ? (await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-list", "--parents", "-n", "1", last])).trim().split(/\s+/).filter(Boolean).length - 1
         : 0;
-      if (parents.length >= 2 && last !== undefined && SHA40_RE.test(last) && lastParents === 1 &&
-          (await this.isWipParkMarker(barePath, last)) &&
+      // verifyWrapperOnlyHistory reads through refs/replace and cannot take the flag cleanly (it
+      // is shared with adoption), so the peel is refused whenever any replace ref exists or the
+      // listing fails; the tip then keeps its original-object proof below (which blocks).
+      let noReplaceRefs = false;
+      try {
+        noReplaceRefs = (await this.runGit(barePath, ["for-each-ref", "--count=1", "refs/replace/"])).trim() === "";
+      } catch (error) {
+        this.rethrowProofAbort(error);
+      }
+      if (noReplaceRefs && parents.length >= 2 && last !== undefined && SHA40_RE.test(last) && lastParents === 1 &&
+          (await this.isWipParkMarker(barePath, last, { noReplace: true })) &&
           (await this.verifyWrapperOnlyHistory(barePath, tip, last, 1, { allowParkMarkers: true }))) {
         tip = last;
       }
     }
-    if (!(await this.isWipParkMarker(barePath, tip))) return this.boundaryProof(barePath, branch, tip);
+    if (!(await this.isWipParkMarker(barePath, tip, { noReplace: true }))) return this.boundaryProof(barePath, branch, tip);
     // The tip IS a `wip(park):` marker. The committed work (if any) is its parent and below.
     let parents: string[];
     try {
@@ -18729,8 +18740,9 @@ try {
    *  (`log -1 --format=%s`, worker-uid — no working-tree touch, so no filter-driver
    *  fire, safe). Best-effort: any failure (a missing/broken commit) answers false, so a
    *  bad read never routes the reseed onto the reset-soft / cherry-pick recovery path. */
-  private async isWipParkMarker(barePath: string, sha: string): Promise<boolean> {
-    const subject = await this.tryGitStdout(barePath, ["log", "-1", "--format=%s", `${sha}^{commit}`]);
+  private async isWipParkMarker(barePath: string, sha: string, opts: { noReplace?: boolean } = {}): Promise<boolean> {
+    const subject = await this.tryGitStdout(barePath, [
+      ...(opts.noReplace ? ["--no-replace-objects"] : []), "log", "-1", "--format=%s", `${sha}^{commit}`]);
     return subject.startsWith(WIP_PARK_COMMIT_PREFIX);
   }
 
@@ -18739,8 +18751,9 @@ try {
    *  best-effort (any failure ⇒ false, so a bad read never routes adoption onto the overlay
    *  peel). Adoption peels an overlay by DISCARDING its swapped `.github/workflows` tree and
    *  re-pointing the base to its LAST parent (the real tip) — see runnerCloneForBranch. */
-  private async isOverlayMarker(barePath: string, sha: string): Promise<boolean> {
-    const subject = await this.tryGitStdout(barePath, ["log", "-1", "--format=%s", `${sha}^{commit}`]);
+  private async isOverlayMarker(barePath: string, sha: string, opts: { noReplace?: boolean } = {}): Promise<boolean> {
+    const subject = await this.tryGitStdout(barePath, [
+      ...(opts.noReplace ? ["--no-replace-objects"] : []), "log", "-1", "--format=%s", `${sha}^{commit}`]);
     return subject.startsWith(OVERLAY_COMMIT_PREFIX);
   }
 

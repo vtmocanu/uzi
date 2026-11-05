@@ -7,7 +7,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
-import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
+import { GitCache, OVERLAY_COMMIT_PREFIX, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
 import { TickSpawner } from "../src/tick-spawner.js";
 import { createHash } from "node:crypto";
 
@@ -1369,6 +1369,25 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
     assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true,
       "a replace ref on the floor must not turn parent work into marker-only");
   });
+
+  for (const [label, subject] of [
+    ["wip(park) marker", MARKER],
+    ["ckpt(overlay) wrapper", `${OVERLAY_COMMIT_PREFIX} look-alike`],
+  ] as const) {
+    it(`g13 a refs/replace commit with a ${label} subject must not hide a content-bearing attempted tip`, async () => {
+      const f = await fixture();
+      // Substantive commit over the floor; its replacement has the same parent but a marker subject.
+      const substantive = mkCommit(f.bare, f.workTree, [f.floor], "substantive attempted work");
+      const opts = { attemptedTip: substantive };
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, "control: no replace");
+      const lookAlike = mkCommit(f.bare, f.floorTree, [f.floor], subject);
+      gitIn(f.bare, ["replace", substantive, lookAlike]);
+      assert.ok(gitIn(f.bare, ["log", "-1", "--format=%s", substantive]).startsWith(subject.split(":")[0]!),
+        "sanity: a plain read honours the replacement");
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true,
+        "the replace ref must not make the substantive tip look like a content-free marker");
+    });
+  }
 
   it("g4 blocks a content-bearing attempted tip even with no mirror (and with a null key)", async () => {
     const f = await fixture();

@@ -1884,6 +1884,8 @@ describe("RunRunner — report_only orphan guard vs a stale local checkpoint mir
     scopeCapped?: boolean;
     /** Runs after the claim is built and before it executes. */
     prepare?: (claim: { run_id: string }) => void;
+    /** The checkpoint publish is acknowledged (confirmed) instead of losing its ack. */
+    confirmedPublish?: boolean;
   }
 
   async function drive(opts: DriveOpts) {
@@ -1897,7 +1899,7 @@ describe("RunRunner — report_only orphan guard vs a stale local checkpoint mir
     const events: string[] = [];
     const snapshots: { bare: string; origin: string } = { bare: "", origin: "" };
     const restoreFetch = spyFetch(events);
-    const restorePublish = spyPublish(events, { throws: true });
+    const restorePublish = spyPublish(events, { throws: opts.confirmedPublish !== true });
     const exec: Executor = {
       run: async (ctx) => {
         opts.beforeWork?.(bare, ctx.worktreePath);
@@ -2222,4 +2224,48 @@ describe("RunRunner — report_only orphan guard vs a stale local checkpoint mir
       });
     }
   }
+
+  it("r8c a shallow bare is unprovable for a marker-shaped predecessor tip over substantive history (#299), origin ref absent", async () => {
+    // The mirrored tip is a wip(park) marker over work-bearing history. Were the shallow check not
+    // first, the marker path would read the shallow ancestry as carries_work and discount it.
+    const pred = seedPredecessor(39464);
+    const marker = originCommit(pred.tip, "parked.txt", "parked\n", `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved`);
+    g(fx.originPath, ["update-ref", pred.ref, marker]);
+    const res = await drive({
+      n: 39464,
+      checkpoint: false, // no attempted tip: only the mirror leg may speak
+      inExecutor: (bare) => {
+        g(fx.originPath, ["update-ref", "-d", pred.ref]);
+        assert.equal(g(bare, ["rev-parse", pred.ref]), marker, "the mirror holds the marker-shaped tip");
+        fs.writeFileSync(path.join(bare, "shallow"), `${pred.base}\n`);
+      },
+    });
+    assertOrphanFailure(res);
+  });
+
+  it("r9 refuses (#299) a confirmed publication whose tip is unknown, though the confirmed tip is otherwise content-free", async () => {
+    // Control: the same confirmed content-free publish completes report-only when the runner's
+    // confirmedPublication carries its real tip.
+    const control = await drive({ n: 39465, confirmedPublish: true });
+    assertReportOnlyCompletion(control);
+
+    const original = git.hasCommittedCheckpoint.bind(git);
+    const seen: Array<{ tip: string | undefined } | undefined> = [];
+    (git as unknown as { hasCommittedCheckpoint: unknown }).hasCommittedCheckpoint = (
+      ...args: Parameters<typeof original>
+    ) => {
+      const confirmed = args[2];
+      seen.push(confirmed && { tip: confirmed.tip });
+      // Model a confirmed publication whose tip the runner no longer knows.
+      return original(args[0], args[1], confirmed && { tip: undefined }, args[3], args[4]);
+    };
+    try {
+      const res = await drive({ n: 39466, confirmedPublish: true });
+      assert.ok(seen.length >= 1 && seen.every((c) => c !== undefined && typeof c.tip === "string"),
+        "the runner passed a confirmedPublication carrying a tip on every guard call");
+      assertOrphanFailure(res);
+    } finally {
+      (git as unknown as { hasCommittedCheckpoint: unknown }).hasCommittedCheckpoint = original;
+    }
+  });
 });
