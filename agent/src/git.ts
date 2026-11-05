@@ -1369,7 +1369,9 @@ const EPOCH_CLONE_CONFIG_KEYS: ReadonlySet<string> = new Set([
  * `BISECT_*`, `AUTO_MERGE`, `shallow`, `commondir`, `modules`, `worktrees`, `sharedindex.*`,
  * `reftable`, ...) is an in-progress operation or state the proof cannot account for: a keep. Each
  * admitted entry is typed by lstat (a real directory or a regular file, never a FIFO or link) before
- * Git runs; the files are charged to the metadata budget.
+ * Git runs; the files are charged to the metadata budget. The contents of `refs/` are not listed
+ * here: the shape stage walks that tree itself (real directories, regular files of at most
+ * `EPOCH_REF_FILE_MAX_BYTES`, every entry charged), and `info` and `objects/info` are checked entry by entry.
  */
 const EPOCH_GIT_DIR_DIRECTORIES: ReadonlySet<string> = new Set(["branches", "hooks", "info", "logs", "objects", "refs"]);
 const EPOCH_GIT_DIR_FILES: ReadonlySet<string> = new Set([
@@ -2506,6 +2508,10 @@ class AutomaticCompletenessUnknown extends Error {}
 // A fully observed, explicitly forbidden source setting is a settled keep;
 // it is not an incomplete observation of an admitted object store.
 class AutomaticContentRefusal extends Error {}
+/** Unknown errors the shape stage raised for a source `objects/info` entry it cannot account for
+ *  (unreadable, over budget or indirect). The PRD keeps these UNKNOWN, not a settled keep, so
+ *  {@link GitCache.automaticCloneShape} rethrows them instead of returning false. */
+const OBJECT_INFO_UNKNOWN = new WeakSet<Error>();
 
 interface AutomaticPreservation {
   checkLive: () => void;
@@ -11402,7 +11408,7 @@ export class GitCache {
         walk(root); return ids;
       };
       return { fingerprint: JSON.stringify([...rows].sort(([a], [b]) => a.localeCompare(b))),
-        source: expected(source), bare: expected(bare), pairs };
+        source: expected(source), own: new Set(stores.get(source)!.ids), bare: expected(bare), pairs };
     };
     try {
       const initial = await snapshot();
@@ -11445,8 +11451,10 @@ export class GitCache {
             ? this.runGitAsRunner(cwd, ["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
               { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } })
             : this.runGitWithEnv(barePath, ["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"], NO_REPLACE_ENV)));
+          // Any stderr (a broken or ignored ref, say) means Git skipped something: unknown, never clean.
           const refs = () => read(() => this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"],
-            { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL } }));
+            { env: { ...NO_REPLACE_ENV, GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
+              onStderr: text => { if (text !== "") unknown("for-each-ref reported a problem"); } }));
           const closure = async () => parse(await read(() => this.runGitWithEnv(barePath,
             ["rev-list", "--objects", "--no-object-names", ...automatic.roots], NO_REPLACE_ENV)));
           const sourceIds = await inventory(true), bareIds = await inventory(false);
@@ -11454,7 +11462,9 @@ export class GitCache {
           const out = await refs();
           this.automaticCollection(out, "\n");
           if (out && !out.endsWith("\n")) unknown("unterminated refs");
-          const required = new Set(sourceIds); required.add(head);
+          // Only what the clone itself stores can be lost with it: objects that live in the shared
+          // bare or its alternates survive the clone's deletion, so they need no root.
+          const required = new Set(initial.own); required.add(head);
           let stash = false;
           for (const line of out ? out.slice(0, -1).split("\n") : []) {
             const match = /^([0-9a-f]{40}) (refs\/[^\s]+)$/.exec(line);
@@ -11721,6 +11731,26 @@ export class GitCache {
           } else await regular(file, true, label);
         }
       }
+      // `refs/` is read in full by Git (`for-each-ref`, `rev-parse`), so it is walked here first:
+      // every directory real, every entry charged as a record, every file a small regular file.
+      // A link, FIFO, socket or oversized ref is a keep, and each entry is re-checked at the end.
+      if (gitEntries.some(raw => raw.toString("latin1") === "refs")) {
+        const walkRefs = async (dir: Buffer): Promise<void> => {
+          const names: Buffer[] = [];
+          await listDirectory(dir, name => names.push(Buffer.from(name)));
+          for (const name of names) {
+            const file = Buffer.concat([dir, Buffer.from("/"), name]);
+            if (file.length >= 4096) throw refusal("ref path exceeds PATH_MAX");
+            const st = await lstatPath(file);
+            remember("r:" + file.toString("latin1"), file, st);
+            if (st.isDirectory()) { await walkRefs(file); continue; }
+            if (!st.isFile()) throw refusal("a ref entry is not a regular file or real directory");
+            if (st.size > BigInt(EPOCH_REF_FILE_MAX_BYTES)) throw refusal("a loose ref file is oversized");
+            chargeMetadata(Number(st.size), "loose ref file");
+          }
+        };
+        await walkRefs(Buffer.from(path.join(gitDir, "refs")));
+      }
       const infoDir = path.join(gitDir, "info");
       if (gitEntries.some(raw => raw.toString("latin1") === "info")) {
         // Only the clone's own exclude file: `attributes` and `sparse-checkout` steer Git.
@@ -11771,14 +11801,14 @@ export class GitCache {
       let infoStat: import("node:fs").BigIntStats | undefined;
       try { infoStat = await lstatPath(objectsInfo); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      if (infoStat) {
+      if (infoStat) try {
         if (!infoStat.isDirectory()) throw refusal(".git/objects/info is not a real directory");
         remember("d:" + objectsInfo, objectsInfo, infoStat);
         const names: string[] = [];
         await listDirectory(objectsInfo, name => {
           const text = name.toString("latin1");
           if (!["alternates", "packs", "commit-graph", "commit-graphs"].includes(text))
-            throw refusal(".git/objects/info holds an unadmitted entry");
+            throw refusal("unsupported object info entry");
           names.push(text);
         });
         for (const name of names) {
@@ -11788,6 +11818,14 @@ export class GitCache {
           if (!st.isDirectory()) throw refusal(".git/objects/info/commit-graphs is not a real directory");
           remember("d:" + file, file, st);
         }
+      } catch (error) {
+        // Both a typed refusal and an exceeded bound leave the object store unaccounted for: UNKNOWN.
+        if (error instanceof AutomaticContentRefusal || error instanceof AutomaticCompletenessUnknown) {
+          const unknownInfo = new AutomaticCompletenessUnknown(error.message, { cause: error });
+          OBJECT_INFO_UNKNOWN.add(unknownInfo);
+          throw unknownInfo;
+        }
+        throw error;
       }
 
       // HEAD names the one loose ref `ls-tree` resolves. Both it and that ref are
@@ -11844,6 +11882,7 @@ export class GitCache {
       automatic.shape = { ctx, index };
       return true;
     } catch (err) {
+      if (err instanceof AutomaticCompletenessUnknown && OBJECT_INFO_UNKNOWN.has(err)) throw err;
       this.log.debug("stopped source clone shape could not be proven", { cwd, error: gitErrorMessage(err) });
       return false;
     }
@@ -11857,12 +11896,19 @@ export class GitCache {
    * Git's own `status` hashes any stat-dirty or racily-clean tracked file, runs clean filters named
    * by attributes, reads ignore files and `.gitattributes`, detects renames by reading blobs and
    * follows a split index, `commondir` and the clone's config. So everything that can steer or
-   * enlarge that work is bounded and typed here in Node FIRST, on raw-byte paths, and a failure
-   * keeps the source before any Git command runs:
+   * enlarge that work is bounded and typed in Node FIRST, on raw-byte paths. The order of the whole
+   * automatic content proof ({@link automaticContentPreserved}) is: the Node-only shape stage
+   * ({@link automaticCloneShape}: items 0, 1 and 1b below, no Git launch), then `git version`, the
+   * object-store observation, ref reachability, and only then this stage (items 2 onward, whose
+   * tracked-path lstat, hashing and directory listing are also Node-only and precede its own first
+   * Git launch). A failure of the shape stage keeps the source before any Git launch of the proof;
+   * a failure here keeps it before this stage's own Git launches:
    *  0. `.git` is a real directory whose every top-level entry is on an allowlist (see
    *     `EPOCH_GIT_DIR_FILES`/`EPOCH_GIT_DIR_DIRECTORIES`; no `commondir`, `modules`, `reftable`,
    *     `sharedindex.*`, sequencer or merge/rebase state) and typed, `info` holds only `exclude`;
-   *     the files are regular and charged; `HEAD` is a small regular file naming a branch ref (or
+   *     the files are regular and charged; `refs/` is walked recursively (every directory real,
+   *     every entry charged as a record, every file a regular file of at most
+   *     `EPOCH_REF_FILE_MAX_BYTES`), because Git reads every loose ref; `HEAD` is a small regular file naming a branch ref (or
    *     an object id) and that loose ref, when present, a small regular file holding an object id;
    *  1. `.git/index` is read once through a bounded descriptor and parsed ({@link readBoundedIndex}:
    *     SHA-1, version 2, 3 or 4, no link/sdir/UNTR/FSMN extension, no assume-valid, skip-worktree,
@@ -11870,7 +11916,8 @@ export class GitCache {
    *  1b. `.git/config` is read in Node and refused if it names an include (Git opens include
    *     targets at startup); `.git/info/exclude` is read in Node and must hold only the worker-source
    *     baseline; `.git/objects/info` holds at most `alternates`, `packs` and `commit-graph` (typed
-   *     and charged) and a `commit-graphs` directory (typed only);
+   *     and charged) and a `commit-graphs` directory (typed only), any other `objects/info` entry
+   *     (`http-alternates` included) or an over-budget one being UNKNOWN, not a settled keep;
    *  2. every tracked path (and each of its directories) is lstat'd by raw bytes and must have
    *     the type its mode names; regular sizes and link lengths are charged to the worktree-content
    *     counter; every tracked regular file and symlink is hashed here as a Git blob (never more
@@ -11880,7 +11927,7 @@ export class GitCache {
    * and only then Git runs, every launch carrying the attribute/config pins and
    * `GIT_ATTR_NOSYSTEM`: a version check, the clone's config (strict key allowlist), the untracked
    * listing (no exclude option; an untracked `.gitignore`, `.gitattributes` or `.gitmodules` is a
-   * keep), `check-ignore` of that listing (the ignored set must equal it), and `ls-tree -r` of HEAD
+   * keep), a level-by-level `check-ignore` (each level asks about exactly the entries Node listed on disk; a non-ignored directory is expanded one level and asked about again, and a non-ignored file is a keep), and `ls-tree -r` of HEAD
    * compared exactly with the parsed index entries (the index-versus-HEAD half, which `status`
    * would answer from a forgeable cache-tree). There is no `status` launch. Finally the index and
    * every recorded path are re-read: a change is a keep.
@@ -11891,12 +11938,13 @@ export class GitCache {
    * `maxMetadataRecords`) and `worktreeContentBytes` (tracked regular sizes and link lengths;
    * limit currently `maxMetadataBytes`).
    *
-   * Outcome: every failure here, an exceeded bound included, returns `false`. An exceeded bound is
-   * thrown internally as {@link AutomaticCompletenessUnknown} and a hostile or unsupported source
+   * Outcome: every failure here, an exceeded bound included, returns `false`, except that the shape
+   * stage rethrows an {@link OBJECT_INFO_UNKNOWN} error for an `objects/info` entry it cannot
+   * account for. Any other exceeded bound is thrown internally as {@link AutomaticCompletenessUnknown} and a hostile or unsupported source
    * as {@link AutomaticContentRefusal}, but this method's catch converts both to `false`, so the
    * discard core records `epoch_content_unproven` (a settled keep that does not stop the epoch
-   * scope). Only the object-store observation lets AutomaticCompletenessUnknown escape to the
-   * discard's `unknown` outcome.
+   * scope). Only the object-store observation and that `objects/info` case let
+   * AutomaticCompletenessUnknown escape to the discard's `unknown` outcome.
    */
   private async worktreeProvenCleanAutomatic(cwd: string, automatic: AutomaticPreservation): Promise<boolean> {
     // The object-store observation (which sets both) must already have run: it is what makes the
@@ -22186,18 +22234,19 @@ try {
    * benign keys (e.g. GIT_NO_REPLACE_OBJECTS) and never GIT_CONFIG_* or any other
    * security-relevant key.
    */
-  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv; input?: string | Buffer; encoding?: "latin1" } = {}): Promise<string> {
+  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv; input?: string | Buffer; encoding?: "latin1"; onStderr?: (stderr: string) => void } = {}): Promise<string> {
     const { env, wrapped } = this.runnerGitInvocation(cwd, args, opts.env);
     this.log.debug("git (runner uid)", { cwd, args });
     try {
-      const { stdout } = await this.execScoped(wrapped.command, wrapped.args, {
+      const result = await this.execScoped(wrapped.command, wrapped.args, {
         env,
         timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
         ...(opts.input !== undefined ? { input: opts.input } : {}),
         ...(opts.encoding !== undefined ? { encoding: opts.encoding } : {}),
       }, "command");
-      return stdout;
+      opts.onStderr?.(result.stderr);
+      return result.stdout;
     } catch (err) {
       throw this.runnerGitFailure(err, args);
     }

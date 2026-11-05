@@ -255,17 +255,20 @@ function worktreeReadSpy(t: TestContext): () => number {
   });
   return () => launches;
 }
-it("keeps the source before any worktree Git read when a tracked file exceeds the byte budget", async t => {
-  // Sparse and index-matched: no object is written, so object prechecks pass, yet an unbounded
-  // `git status` would hash it because the mtime differs from the index.
+it("keeps the source before any worktree Git read when a sparse tracked file differs from its index entry", async t => {
+  // Sparse and index-matched by `--info-only`: no object is written, so object prechecks pass. The
+  // content no longer matches the entry, so the Node hash comparison refuses it before Git is asked
+  // anything. This pins the mismatch refusal only; the tracked-content BYTE BUDGET cannot be pinned
+  // through the whole proof (a committed large file also exceeds the same budget in the object
+  // observation first), so it is pinned in epoch-worktree-proof.test.ts ("F3: ...").
   const tracked = path.join(clonePath, "base");
   fs.truncateSync(tracked, 1024 * 1024);
   command(clonePath, "update-index", "--info-only", "base");
   const future = new Date(Date.now() + 3600_000);
   fs.utimesSync(tracked, future, future);
   const launches = worktreeReadSpy(t);
-  assert.equal(await observation({ maxMetadataBytes: 65536 }), false);
-  assert.equal(launches(), 0, "no worktree Git read may run on an over-budget tracked file");
+  assert.equal(await observation(), false);
+  assert.equal(launches(), 0, "no worktree Git read may run on a tracked file that differs from the index");
   assert.equal(journal(), raw);
 });
 it("still proves a normal clean tree under the default budget, running its worktree Git read", async t => {
