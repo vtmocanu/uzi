@@ -703,6 +703,38 @@ describe("Run defaults — summary model per harness (PRD #3248)", () => {
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ summary_model: "sonnet" }));
   });
 
+  it("out-of-order lane saves keep each lane's own cell: a late Claude response cannot restore a stale Codex cell", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token"), key("openai_api_key")] });
+    mockApi.getMySettings.mockResolvedValue(summarySettings());
+    const codexSaved = cells();
+    codexSaved[1] = { ...codexSaved[1], model: "gpt-6-luna", resolved_model: "gpt-6-luna" };
+    const claudeSaved = cells();
+    claudeSaved[0] = { ...claudeSaved[0], model: "sonnet", resolved_model: "sonnet", source: "user_default" };
+    let resolveClaude: (v: { settings: UserSettings }) => void = () => {};
+    let resolveCodex: (v: { settings: UserSettings }) => void = () => {};
+    mockApi.putMySettings.mockImplementation((patch: object) =>
+      new Promise((resolve) => {
+        if ("summary_model" in patch) resolveClaude = resolve as typeof resolveClaude;
+        else resolveCodex = resolve as typeof resolveCodex;
+      }));
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("Codex summary model"), { target: { value: "gpt-6-luna" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Codex summary model" }));
+    fireEvent.change(screen.getByLabelText("Claude summary model"), { target: { value: "sonnet" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save Claude summary model" }));
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledTimes(2));
+    resolveCodex(summarySettings({ codex_summary_model: "gpt-6-luna", summary_models: codexSaved }));
+    await waitFor(() =>
+      expect(document.getElementById("codex-summary-model-effect")?.textContent).toBe("In effect: gpt-6-luna · your choice"),
+    );
+    // The Claude save was issued before the Codex one landed, so its response carries the OLD Codex cell.
+    resolveClaude(summarySettings({ summary_model: "sonnet", summary_models: claudeSaved }));
+    await waitFor(() =>
+      expect(document.getElementById("summary-model-effect")?.textContent).toBe("In effect: sonnet · your choice"),
+    );
+    expect(document.getElementById("codex-summary-model-effect")?.textContent).toBe("In effect: gpt-6-luna · your choice");
+  });
+
   it.each(["gpt-6-astra", "gpt-6-luna"])("flags a stored Codex id (%s) in the Claude lane and blocks its Save", async (id) => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [key("anthropic_token")] });
     mockApi.getMySettings.mockResolvedValue(summarySettings({ summary_model: id }));

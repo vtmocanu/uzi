@@ -50,6 +50,22 @@ function modelInEffect(cell: ModelSettingCell): string {
   return `In effect: ${cell.resolved_model} \u00b7 ${modelSettingSourceLabel("model", cell.source)}`;
 }
 
+// The two summary lanes save independently, so a response may carry a stale sibling cell
+// when saves land out of order. Take only the saved lane's cell from the response and keep
+// the rest of the committed cells; a response without that cell (older server) leaves them be.
+function mergeSummaryCell(
+  current: ModelSettingCell[] | undefined,
+  fromResponse: ModelSettingCell[] | undefined,
+  harness: ModelSettingCell["harness"],
+): ModelSettingCell[] | undefined {
+  const saved = fromResponse?.find((c) => c.harness === harness);
+  if (!saved) return current;
+  if (!current) return fromResponse;
+  return current.some((c) => c.harness === harness)
+    ? current.map((c) => (c.harness === harness ? saved : c))
+    : [...current, saved];
+}
+
 const CUSTOM_EMPTY_MESSAGE = "Enter a model ID, or choose Default.";
 
 export function RunDefaults() {
@@ -492,7 +508,7 @@ export function RunDefaults() {
       setCommittedSettings(current => current && ({
         ...current,
         summary_model: settings.summary_model,
-        summary_models: settings.summary_models,
+        summary_models: mergeSummaryCell(current.summary_models, settings.summary_models, "claude"),
       }));
       const model = settings.summary_model ?? "";
       setSummaryModel(model);
@@ -518,7 +534,7 @@ export function RunDefaults() {
       setCommittedSettings(current => current && ({
         ...current,
         codex_summary_model: settings.codex_summary_model,
-        summary_models: settings.summary_models,
+        summary_models: mergeSummaryCell(current.summary_models, settings.summary_models, "codex"),
       }));
       const model = settings.codex_summary_model ?? "";
       setCodexSummaryModel(model);

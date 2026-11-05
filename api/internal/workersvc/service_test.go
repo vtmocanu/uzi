@@ -2592,6 +2592,20 @@ func TestClaimSummaryModelBuiltinWhenNothingSet(t *testing.T) {
 	}
 }
 
+// PRD #3248: a deployment with no settings reader wired tells the summary generator
+// nothing: the claim's SummaryModel stays nil rather than carrying the built-in.
+func TestClaimSummaryModelNilWhenSettingsUnwired(t *testing.T) {
+	fs := scheduleModelStore(t, pgtype.Text{}, pgtype.Text{})
+	fs.summaryModel = pgconv.TextOrNull("opus") // a stored user value must not leak through
+	payload, err := newOffModeService(fs, newBox(t), testParams()).Claim(context.Background(), worker(), nil)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if payload.SummaryModel != nil {
+		t.Fatalf("unwired settings should leave SummaryModel nil; got %q", *payload.SummaryModel)
+	}
+}
+
 // PRD #3248: a user-row read error logs and resolves as if the user tier were unset
 // (instance, then built-in); it never fails the claim.
 func TestClaimSummaryModelUserReadErrorFallsBackToInstance(t *testing.T) {

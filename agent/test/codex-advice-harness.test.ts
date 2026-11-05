@@ -1888,6 +1888,10 @@ describe("Codex summary skip reasons (#3248 M3)", () => {
         settled(r, ["vault_locked"]);
         assert.equal(r.releases, 1);
       });
+      it("a typed 409 vault_locked release reports vault_locked even when the timeout is inside the deadline slack", async () => {
+        const r = await drive(pass, { timeoutMs: 20, release: () => Promise.reject(conflict("vault_locked")) });
+        settled(r, ["vault_locked"]);
+      });
       it("a typed 409 codex_account_unavailable release reports account_unavailable", async () => {
         settled(await drive(pass, { release: () => Promise.reject(conflict("codex_account_unavailable")) }), ["account_unavailable"]);
       });

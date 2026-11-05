@@ -132,7 +132,9 @@ export class ModelPassCredentialError extends Error {
 }
 
 /** Slack (ms) under which a failure at the wall-clock deadline is still read as a timeout: the
- *  advice harness arms its own timer a moment after the pass's, so it can reject first. */
+ *  advice harness arms its own timer a moment after the pass's, so it can reject first. It
+ *  applies only to failures out of harness.run (terminal and throw paths), never to a
+ *  buildHarness rejection, which runs before that timer exists. */
 const DEADLINE_SLACK_MS = 25;
 
 /** Default bounded grace (ms) for the aborted SDK CLI to finish exiting before its
@@ -395,7 +397,7 @@ async function runCodexAdviceModelPass(
   });
   let refreshDenied = false;
   // Timeout and abort never classify: the pass's own abort covers its timer and the external
-  // signal; the deadline check covers the harness's own timer rejecting a moment first.
+  // signal; the deadline check covers the harness's own timer rejecting a moment first (harness.run only).
   const stopped = (): boolean => abort.signal.aborted || Date.now() >= deadlineAt - DEADLINE_SLACK_MS;
   const policy: AdviceResultPolicy = {
     onTerminal: (t, { isError }) => {
@@ -436,7 +438,9 @@ async function runCodexAdviceModelPass(
     try {
       harness = await codex.buildHarness(params);
     } catch (err) {
-      const reason = stopped() ? undefined : codexDeferralReason(err);
+      // Only an abort suppresses the typed deferral here: the harness timer is not armed until
+      // harness.run, so a build rejection is never a harness timeout and the slack must not hide it.
+      const reason = abort.signal.aborted ? undefined : codexDeferralReason(err);
       throw reason ? new ModelPassCredentialError(reason, errMessage(err), { cause: err }) : err;
     }
     try {
