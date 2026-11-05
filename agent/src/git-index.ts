@@ -63,8 +63,10 @@ const FLAG_ASSUME_VALID = 0x8000;
 const FLAG_EXTENDED = 0x4000;
 const EXT_SKIP_WORKTREE = 0x4000;
 const EXT_INTENT_TO_ADD = 0x2000;
-/** Extensions that carry only derived caches; any other signature changes what Git would read. */
-const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set(["TREE", "REUC"]);
+/** Extensions that carry only derived caches; any other signature changes what Git would read. REUC
+ *  (resolve-undo) is refused: it names conflict-side blobs Git keeps alive, so it can be a clone's only
+ *  pointer to work the epoch proof would otherwise not require. */
+const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set(["TREE"]);
 const ALLOWED_MODES: ReadonlySet<number> = new Set([0o100644, 0o100755, 0o120000, 0o160000]);
 
 /** A path longer than this cannot exist; it bounds every index path of every version and each rebuilt version 4 name. */
