@@ -2453,10 +2453,10 @@ WHERE runs.status = 'claimed' AND runs.claimed_at < @cutoff
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-  AND runs.kind <> 'cross_check'
   -- Issue #3859: a pending server-stamped stop (an owner cancel with a live poller) keeps the pre-#3859
   -- uncharged reset so the reclaimed flight observes it; neither a charge nor an unwitnessed park
   -- may release the claim and strand the stop undelivered.
+  AND runs.kind <> 'cross_check'
   AND COALESCE(runs.stop_kind, '') = ''
   AND runs.claim_released_at IS NULL
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
@@ -2532,10 +2532,10 @@ WHERE runs.id = ANY(@locked_run_ids::uuid[])
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-  AND runs.kind <> 'cross_check'
   -- Issue #3859: a pending server-stamped stop (an owner cancel with a live poller) keeps the pre-#3859
   -- uncharged reset so the reclaimed flight observes it; neither a charge nor an unwitnessed park
   -- may release the claim and strand the stop undelivered.
+  AND runs.kind <> 'cross_check'
   AND COALESCE(runs.stop_kind, '') = ''
   AND runs.claim_released_at IS NULL
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
@@ -2558,10 +2558,10 @@ WHERE runs.status = 'claimed' AND runs.claimed_at < @cutoff
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-  AND runs.kind <> 'cross_check'
   -- Issue #3859: a pending server-stamped stop (an owner cancel with a live poller) keeps the pre-#3859
   -- uncharged reset so the reclaimed flight observes it; neither a charge nor an unwitnessed park
   -- may release the claim and strand the stop undelivered.
+  AND runs.kind <> 'cross_check'
   AND COALESCE(runs.stop_kind, '') = ''
   AND runs.claim_released_at IS NULL
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
@@ -2615,10 +2615,10 @@ WHERE runs.id = ANY(@locked_run_ids::uuid[])
                          AND a.claim_generation = runs.claim_generation)
            AND NOT EXISTS (SELECT 1 FROM workers w
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
-  AND runs.kind <> 'cross_check'
   -- Issue #3859: a pending server-stamped stop (an owner cancel with a live poller) keeps the pre-#3859
   -- uncharged reset so the reclaimed flight observes it; neither a charge nor an unwitnessed park
   -- may release the claim and strand the stop undelivered.
+  AND runs.kind <> 'cross_check'
   AND COALESCE(runs.stop_kind, '') = ''
   AND runs.claim_released_at IS NULL
   AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'

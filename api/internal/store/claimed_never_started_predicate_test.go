@@ -15,8 +15,9 @@ import (
 // The constants are written here independently of the SQL and compared against it.
 const (
 	// eligibility: a custody continuation (open hold of an EARLIER generation), not
-	// policy-unresolved, not a cross_check, claim not released.
+	// policy-unresolved, not a cross_check, no pending server-stamped stop, claim not released.
 	cnsEligibility = `runs.kind <> 'cross_check'
+AND COALESCE(runs.stop_kind, '') = ''
 AND runs.claim_released_at IS NULL
 AND runs.hold_reason IS DISTINCT FROM 'codex_policy_hold'
 AND (runs.policy_outcome_id IS NULL OR runs.policy_resolved_at IS NOT NULL)
