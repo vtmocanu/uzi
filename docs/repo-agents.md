@@ -115,9 +115,11 @@ first claim the worker fetches the repo and resolves the repository's
 configured default branch from its remote-tracking ref after that fetch, never
 from another branch. It reads `.claude/agents/` and `.codex/agents/` from git
 objects at that commit and reports the commit together with the roster. No
-agent turn starts until the server confirms it recorded that commit. The server
-records the commit once per run and refuses a later report that names a
-different one.
+agent turn starts until the server confirms it recorded that commit. A
+`--require-base` run held because its kept work is not attested
+(`base_attestation_missing`) has the commit recorded the same way before the
+hold. The server records the commit once per run and refuses a later report
+that names a different one.
 
 Every later claim of the same run (a resume, a requeue, a restart on another
 worker) reads the agent folders at the recorded commit. Edits a run makes to its
@@ -137,8 +139,8 @@ and submodules inside the folder are skipped, and the same caps apply.
 The agent does not start, and the run is held as **repo agents unreadable**
 (`hold_reason` `repo_agent_source_unavailable`), when the worker:
 
-- cannot resolve the configured default branch (the repository has none, or the
-  branch is missing from the fetch);
+- cannot resolve the configured default branch (the repository has none, the
+  branch is missing from the fetch, or the repository has no commits yet);
 - cannot get the server's confirmation that it recorded the commit (the report
   failed, was refused, or its answer did not name the commit);
 - cannot read the agent folders at the commit, or the recorded commit is missing
