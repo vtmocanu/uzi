@@ -304,6 +304,7 @@ api:
     # UZI_SEED_PASSWORD: UZI_SEED_PASSWORD
     # UZI_SEED_NAME: UZI_SEED_NAME
     # UZI_SEED_FORGE_PAT: UZI_SEED_FORGE_PAT
+    # UZI_SEED_FORGE_TYPE: gitlab | forgejo | github (non-secret env; default gitlab)
     # UZI_SEED_ANTHROPIC_TOKEN: UZI_SEED_ANTHROPIC_TOKEN
     # Slack integration (PRD #25) — overlay tokens or one-time seeds:
     # SLACK_BOT_TOKEN: SLACK_BOT_TOKEN
