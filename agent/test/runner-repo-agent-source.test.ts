@@ -367,6 +367,24 @@ describe("repo-agent roster pinned to the default-branch revision (issue #3913)"
     });
   }
 
+  it("an empty repository with no default-branch commit holds the first claim before seeding", async () => {
+    await withFeature(() => withHoldSpy(async (requests) => {
+      const empty = fs.mkdtempSync(path.join(path.dirname(fx.dataDir), "empty-origin-"));
+      execFileSync("git", ["init", "-q", "-b", "main", empty], { env: hermeticGitEnv() });
+      let ran = false;
+      const claim = claimFor(HARNESSES[0]!, { issue_iid: 75, issue_title: "empty repository", claim_generation: 2 });
+      claim.repo = { ...claim.repo, clone_url: empty };
+      await newRunner({ run: async (ctx) => { ran = true; return { branch: ctx.branch }; } }).execute(claim);
+      assert.equal(ran, false, "the agent never started");
+      assert.deepEqual(requests, [{ runId: claim.run_id, commit: "", claimGeneration: 2 }]);
+      const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
+      assert.ok(!states.some((s) => s.status === "completed" || s.status === "failed"), JSON.stringify(states.map((s) => s.status)));
+      assert.deepEqual(reportedCommits(claim.run_id), []);
+      assert.ok(statusTexts(claim.run_id).some((t) => t.includes("could not be resolved") && t.includes("The agent did not start")),
+        statusTexts(claim.run_id).join("\n"));
+    }));
+  });
+
   it("without the api feature a failed roster report does not stop the run", async () => {
     const h = HARNESSES[0]!;
     commitOnOrigin({ [h.file]: h.content("Original review body") }, "ship the reviewer");

@@ -13702,6 +13702,11 @@ export class RunRunner {
       }
       throw err;
     }
+    const capturedSource = this.capturedRepoAgentSource(claim, flight.defaultBranchTip);
+    if ("unresolved" in capturedSource && !claim.repo_agent_source_commit && claim.publication_resume === undefined &&
+        this.client.protocolFeatures.includes(REPO_AGENT_SOURCE_FEATURE)) {
+      throw new RepoAgentSourceUnavailableError(capturedSource.unresolved, "");
+    }
     // issue #1783 M2: attempt-path mode mints this attempt's id BEFORE the seed: it names the
     // fresh attempt clone path, and the journal, the ledger and the attempt marker reuse it.
     // issue #1786: the mode read in discovery is stale by now (ensureClone ran since, and discovery
@@ -24193,6 +24198,15 @@ export class RunRunner {
     return name ? { name } : undefined;
   }
 
+  private capturedRepoAgentSource(claim: ClaimResponse, capturedTip: string | undefined): { commit: string } | { unresolved: string } {
+    const name = claim.repo.default_branch?.trim();
+    if (!name) return { unresolved: "the repository has no configured default branch to read repo agents from" };
+    if (!capturedTip) {
+      return { unresolved: `the default branch ${sanitizeForLog(name)} could not be resolved from this claim's fetch to read repo agents from` };
+    }
+    return { commit: capturedTip };
+  }
+
   private async confirmRepoAgentSourcePin(
     reportState: RunFlight["reportState"],
     body: Parameters<RunFlight["reportState"]>[0] & { repo_agent_source_commit: string },
@@ -24250,13 +24264,9 @@ export class RunRunner {
       }
       commit = pinned;
     } else {
-      const name = claim.repo.default_branch?.trim();
-      if (!name) return unavailable("the repository has no configured default branch to read repo agents from", "");
-      const resolved = capturedTip;
-      if (!resolved) {
-        return unavailable(`the default branch ${sanitizeForLog(name)} could not be resolved from this claim's fetch to read repo agents from`, "");
-      }
-      commit = resolved;
+      const source = this.capturedRepoAgentSource(claim, capturedTip);
+      if ("unresolved" in source) return unavailable(source.unresolved, "");
+      commit = source.commit;
     }
     let detected: DetectedRepoAgents;
     try {
