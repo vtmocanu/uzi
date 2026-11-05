@@ -1167,3 +1167,217 @@ describe("GitCache.hasCommittedCheckpoint (#2967 floor-tree recovery coverage)",
     assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), false);
   });
 });
+
+describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted tip, tri-state proof)", () => {
+  const MARKER = `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved`;
+  /** A tree no other object shares: deleting it breaks nothing else. */
+  function uniqueTree(bare: string, content: string): string {
+    const blob = execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"],
+      { env: GIT_ENV, input: content, encoding: "utf8" }).trim();
+    return execFileSync("git", ["-C", bare, "mktree"],
+      { env: GIT_ENV, input: `100644 blob ${blob}\tfile.txt\n`, encoding: "utf8" }).trim();
+  }
+
+  function rmObject(bare: string, oid: string): void {
+    fs.unlinkSync(path.join(bare, "objects", oid.slice(0, 2), oid.slice(2)));
+  }
+
+  /** Counts calls of the private origin probe without changing its behaviour. */
+  function spyProbe(git: GitCache): { calls: number } {
+    const counter = { calls: 0 };
+    const target = git as unknown as { originCheckpointRefState: (...args: unknown[]) => Promise<unknown> };
+    const original = target.originCheckpointRefState.bind(git);
+    target.originCheckpointRefState = (...args: unknown[]) => {
+      counter.calls++;
+      return original(...args);
+    };
+    return counter;
+  }
+
+  async function fixture() {
+    // origin/main has a parent so an OLDER boundary commit (olderFloor) exists below the floor.
+    advanceOriginMain("advanced.txt", "default branch advanced\n");
+    const git = worker("stale-mirror");
+    const bare = await git.ensureClone(fx.originPath);
+    const branch = "agent/issue-3944";
+    const ref = `refs/uzi-checkpoints/${branch}`;
+    const floor = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+    const olderFloor = gitIn(bare, ["rev-parse", `${floor}^`]);
+    const floorTree = gitIn(bare, ["rev-parse", `${floor}^{tree}`]);
+    const olderTree = gitIn(bare, ["rev-parse", `${olderFloor}^{tree}`]);
+    const workTree = uniqueTree(bare, "predecessor work\n");
+    const work = mkCommit(bare, workTree, [olderFloor], "predecessor work");
+    // The incident shape: a single commit carrying its parent's (the floor's) tree.
+    const contentFree = mkCommit(bare, floorTree, [floor], "uzi recovery coverage round 0 batch 0");
+    const mirror = (tip: string) => gitIn(bare, ["update-ref", ref, tip]);
+    const originRef = (tip: string) => gitIn(bare, ["push", fx.originPath, `${tip}:${ref}`]);
+    return { git, bare, branch, ref, floor, olderFloor, floorTree, olderTree, workTree, work, contentFree, mirror, originRef };
+  }
+
+  it("g1 discounts a provably work-bearing stale mirror only with the origin probe, and absent-on-origin", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true, "no opts: unchanged blocking");
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, {}), true,
+      "opts without a probe: unchanged blocking");
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false,
+      "provable work, origin answers absent: discounted");
+  });
+
+  it("g12 a discount writes no ref in the bare or on origin", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    const before = gitIn(f.bare, ["for-each-ref", "refs/"]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false);
+    assert.equal(gitIn(f.bare, ["for-each-ref", "refs/"]), before, "bare refs unchanged by the discount");
+    assert.equal(gitIn(f.bare, ["rev-parse", f.ref]), f.work, "the mirror still names the predecessor tip");
+    assert.equal(gitIn(fx.originPath, ["for-each-ref", "refs/uzi-checkpoints/"]), "", "origin gained no ref");
+  });
+
+  it("g2 blocks when the mirror ref is present on origin", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    f.originRef(f.work);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+  });
+
+  it("g3 blocks when the origin probe fails", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    const url = gitIn(f.bare, ["config", "--get", "remote.origin.url"]);
+    gitIn(f.bare, ["config", "remote.origin.url", path.join(fx.dataDir, "no-such-origin")]);
+    try {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+    } finally {
+      gitIn(f.bare, ["config", "remote.origin.url", url]);
+    }
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false,
+      "control: with the URL restored the same state is discounted");
+  });
+
+  it("g4 blocks a content-bearing attempted tip even with no mirror (and with a null key)", async () => {
+    const f = await fixture();
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { attemptedTip: f.work }), true);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: f.work }), true);
+  });
+
+  it("g5 the incident: content-free attempted tip plus a discounted stale mirror completes (false)", async () => {
+    const f = await fixture();
+    f.mirror(f.work);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch,
+      { attemptedTip: f.contentFree, originProbe: {} }), false);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch,
+      { attemptedTip: f.contentFree }), true, "without the probe the stale mirror still blocks");
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null,
+      { attemptedTip: f.contentFree }), false, "a null key ignores the mirror");
+  });
+
+  it("g6 blocks attempted tips that hide content behind an equal tip tree", async () => {
+    const f = await fixture();
+    const intermediate = mkCommit(f.bare, f.workTree, [f.floor], "intermediate work");
+    const chained = mkCommit(f.bare, f.floorTree, [intermediate], "tree restored on top");
+    const merged = mkCommit(f.bare, f.floorTree, [f.floor, intermediate], "retained merge parent");
+    for (const attemptedTip of [chained, merged]) {
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip }), true);
+    }
+  });
+
+  it("g7 blocks an unreadable attempted tip or boundary", async () => {
+    const f = await fixture();
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null,
+      { attemptedTip: "a".repeat(40) }), true);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null,
+      { attemptedTip: "not-a-sha" }), true);
+    rmObject(f.bare, f.floorTree);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null,
+      { attemptedTip: f.contentFree }), true, "an unreadable boundary tree is not content-free");
+  });
+
+  it("g8 marker parents: missing blocks both legs; genuine root and floor-parent markers pass; real parent blocks", async () => {
+    const f = await fixture();
+    const missing = mkCommit(f.bare, f.workTree, [f.floor], "soon deleted");
+    const dangling = mkCommit(f.bare, f.floorTree, [missing], MARKER);
+    rmObject(f.bare, missing);
+    f.mirror(dangling);
+    f.originRef(f.floor);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: dangling }), true);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+
+    const root = mkCommit(f.bare, f.floorTree, [], MARKER);
+    const onFloor = mkCommit(f.bare, f.workTree, [f.floor], MARKER);
+    for (const tip of [root, onFloor]) {
+      f.mirror(tip);
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { attemptedTip: tip }), false,
+        `marker ${tip === root ? "root" : "over the floor"} is content-free on both legs`);
+    }
+    const overWork = mkCommit(f.bare, f.floorTree, [f.work], MARKER);
+    f.mirror(overWork);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: overWork }), true);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true,
+      "origin still holds the ref: not discounted");
+    gitIn(fx.originPath, ["update-ref", "-d", f.ref]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), false,
+      "work below a marker is carries_work: discounted only because origin has no such ref");
+  });
+
+  it("g9 a two-parent wip(park) look-alike is not the marker exception, on both legs", async () => {
+    const f = await fixture();
+    const lookAlike = mkCommit(f.bare, f.floorTree, [f.floor, f.work], MARKER);
+    f.mirror(lookAlike);
+    f.originRef(lookAlike);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: lookAlike }), true);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true);
+  });
+
+  for (const kind of ["tip", "boundary", "marker-parent", "outside-tree"] as const) {
+    for (const attempted of ["unset", "content-free"] as const) {
+      it(`g10 unreadable mirror proof (${kind}, attempted ${attempted}) blocks with origin absent and never probes`, async () => {
+        const f = await fixture();
+        const spy = spyProbe(f.git);
+        let mirrorTip = f.work;
+        if (kind === "tip") {
+          f.mirror(f.work);
+          rmObject(f.bare, f.work);
+        } else if (kind === "boundary") {
+          rmObject(f.bare, f.olderTree);
+        } else if (kind === "marker-parent") {
+          const parent = mkCommit(f.bare, uniqueTree(f.bare, "parent work\n"), [f.olderFloor], "parent work");
+          mirrorTip = mkCommit(f.bare, f.floorTree, [parent], MARKER);
+          rmObject(f.bare, parent);
+        } else {
+          rmObject(f.bare, f.workTree);
+        }
+        if (kind !== "tip") f.mirror(mirrorTip);
+        const opts = {
+          originProbe: {},
+          ...(attempted === "content-free" ? { attemptedTip: f.contentFree } : {}),
+        };
+        assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, opts), true);
+        assert.equal(spy.calls, 0, "an unprovable mirror never reaches the origin probe");
+      });
+    }
+  }
+
+  it("g11 a shallow bare is unprovable on both legs and never probes", async () => {
+    const f = await fixture();
+    const spy = spyProbe(f.git);
+    const markerOnly = mkCommit(f.bare, f.floorTree, [f.floor], MARKER);
+    const overWork = mkCommit(f.bare, f.floorTree, [f.floor, f.work], MARKER);
+    const shallowFile = path.join(f.bare, "shallow");
+    fs.writeFileSync(shallowFile, `${f.floor}\n`);
+    try {
+      assert.equal(gitIn(f.bare, ["rev-parse", "--is-shallow-repository"]), "true", "precondition");
+      for (const tip of [markerOnly, overWork, f.contentFree]) {
+        f.mirror(tip);
+        assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: tip }), true);
+        assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, f.branch, { originProbe: {} }), true);
+      }
+      assert.equal(spy.calls, 0);
+    } finally {
+      fs.rmSync(shallowFile, { force: true });
+    }
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: f.contentFree }),
+      false, "control: the same tip is content-free once the repository is not shallow");
+  });
+});

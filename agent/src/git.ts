@@ -18150,28 +18150,92 @@ try {
     return (await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])) === 0;
   }
 
-  /** Report-only orphan guard (#299, #759, #2967). Check both the mirrored ref and,
-   *  when this worker published, its exact confirmed tip (the mirror can be stale).
+  /** Report-only orphan guard (#299, #759, #2967, #3944). Three legs, any of which blocks:
+   *  (i) `confirmedPublication`: this worker's exact confirmed tip (the mirror can be stale);
+   *  (ii) `opts.attemptedTip`: the tip of a publish whose ack was lost (it may have landed), so
+   *  it is proven the same way as a confirmed tip, a state other than `content_free` blocks;
+   *  (iii) the mirrored `refs/uzi-checkpoints/<checkpointKey>`.
    *  Recovery coverage is content-free only when EVERY commit outside the recovery
    *  floor's history matches a floor-reachable boundary parent's tree. The current
    *  floor can advance past the coverage base. Include all retained merge parents.
    *  Missing confirmed-publication evidence blocks; a genuinely absent ref without
-   *  publication does not. The existing marker-only park exception remains below. */
+   *  publication does not. The marker-only park exception is `checkpointTipState`.
+   *
+   *  #3944 stale-mirror discount: the mirror is filled by every claim fetch and never pruned, so
+   *  it can hold a cancelled predecessor's work that origin no longer has. When the mirror tip
+   *  PROVABLY carries work (`carries_work`: every read succeeded, so an unreadable or shallow
+   *  proof is never discounted) and the caller supplies `opts.originProbe` (issue runs only),
+   *  one `ls-remote` of that ref on origin decides: a successful empty answer (`absent`) means no
+   *  custodian is left to orphan, so the mirror leg does not block. `present` or `unknown`
+   *  (any error, odd output) keeps blocking. The probe never runs for `unprovable`, and nothing
+   *  here writes a ref. */
   async hasCommittedCheckpoint(
     barePath: string,
     branch: string,
     confirmedPublication?: { tip: string | undefined },
     checkpointKey: string | null = branch,
+    opts?: { attemptedTip?: string; originProbe?: { pat?: string; repoUrl?: string; username?: string } },
   ): Promise<boolean> {
     if (confirmedPublication && (!confirmedPublication.tip ||
         !(await this.checkpointHasOnlyBoundaryTrees(barePath, branch, confirmedPublication.tip)))) return true;
+    if (opts?.attemptedTip &&
+        (await this.checkpointTipState(barePath, branch, opts.attemptedTip)) !== "content_free") return true;
     if (checkpointKey === null) return false;
     const ref = `refs/uzi-checkpoints/${checkpointKey}`;
     const refStatus = await this.tryGitExit(barePath, ["show-ref", "--verify", "--quiet", ref]);
     if (refStatus === 1) return false; // Proven absence, not an unreadable ref or failed command.
     if (refStatus !== 0) return true;
-    let tip = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
+    const tip = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
     if (!tip) return true;
+    const state = await this.checkpointTipState(barePath, branch, tip);
+    if (state === "content_free") return false;
+    if (state === "unprovable" || !opts?.originProbe) return true;
+    return (await this.originCheckpointRefState(barePath, ref, opts.originProbe)) !== "absent";
+  }
+
+  /** Does `ref` exist on origin? `absent` only on a successful, empty `ls-remote`; `present` on
+   *  exactly one line naming `ref`; everything else (error, odd output) is `unknown`. Read-only. */
+  private async originCheckpointRefState(
+    barePath: string, ref: string, probe: { pat?: string; repoUrl?: string; username?: string },
+  ): Promise<"absent" | "present" | "unknown"> {
+    const scope = probe.repoUrl ? httpScopeForUrl(probe.repoUrl) : undefined;
+    try {
+      const listed = await this.runGit(barePath, ["ls-remote", "--refs", "--", "origin", ref],
+        probe.pat, scope, probe.username);
+      if (listed === "") return "absent";
+      const lines = listed.replace(/\n$/, "").split("\n");
+      const match = lines.length === 1 ? /^[0-9a-f]{40}\t([^\n]+)$/.exec(lines[0]!) : null;
+      return match && match[1] === ref ? "present" : "unknown";
+    } catch (cause) {
+      if (cause instanceof RunResidueBlockedError) throw cause;
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return "unknown";
+    }
+  }
+
+  /** Rethrow the errors that must propagate out of a proof (residue quarantine, boundary abort). */
+  private rethrowProofAbort(error: unknown): void {
+    if (error instanceof RunResidueBlockedError) throw error;
+    const abort = this.boundaryAbortError(error);
+    if (abort) throw abort;
+  }
+
+  /** What does the checkpoint commit `tip` carry beyond the recovery floor? `content_free` and
+   *  `carries_work` are positive proofs; every unreadable or unverifiable shape is `unprovable`.
+   *  Includes the issue #2753 overlay peel and the `wip(park):` marker exception (#771). */
+  private async checkpointTipState(
+    barePath: string, branch: string, startTip: string,
+  ): Promise<"content_free" | "carries_work" | "unprovable"> {
+    try {
+      if ((await this.runGit(barePath, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") return "unprovable";
+    } catch (error) {
+      this.rethrowProofAbort(error);
+      return "unprovable";
+    }
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(startTip)) return "unprovable";
+    let tip = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${startTip}^{commit}`])).trim();
+    if (!tip) return "unprovable";
     // issue #2753: a chain over a confirmed park marker (`ckpt(overlay):` C with parents [M, ...,
     // L], L the real tip) is peeled to L when L is a park marker and C verifiably adds only
     // workflow-subtree swaps / already-published markers over L. Anything unverifiable keeps the
@@ -18190,57 +18254,59 @@ try {
         tip = last;
       }
     }
-    if (!(await this.isWipParkMarker(barePath, tip)))
-      return !(await this.checkpointHasOnlyBoundaryTrees(barePath, branch, tip));
-    // 3) The tip IS a `wip(park):` marker. The committed work (if any) is its parent and
-    //    below. A root-commit marker (no readable parent) has nothing committed below to
-    //    orphan → false (mirrors the root-marker handling in runnerClone, git.ts ~585-591).
-    const parent = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${tip}^^{commit}`])).trim();
-    if (parent === "") return false;
-    // Compute the recovery floor similar to the way the reseed does (git.ts ~535): origin's
-    // branch if pushed, else the default branch. (Only "similar to": the reseed excludes a
-    // DISJOINT origin ref via originExists = raw existence AND non-disjoint, git.ts:475/484,
-    // whereas this helper uses raw refExists. That is acceptable here because a disjoint
-    // origin floor only pushes toward BLOCK — the safe direction: a disjoint parent is not an
-    // ancestor of it, so the committed-work test below returns true.)
-    //
-    // The parent is a marker-only checkpoint iff it is an ancestor-or-equal of the floor;
-    // anything else — the parent STRICTLY descends the floor, OR it DIVERGED from the floor
-    // (shared ancestor, neither contains the other; the "main advanced during a park" shape) —
-    // is committed work that a report-only completion would orphan, so it still blocks. This
-    // mirrors the reseed's diverged-WIP leg (git.ts:713), which uses the same
-    // isAncestor(markerParent, floor) discriminator to decide "no committed milestones live
-    // below the marker". isAncestor is TRUE at equality, so the parent == floor case is a
-    // marker-only checkpoint (allow); it also returns false on a missing/broken ref, which
-    // fails safe toward BLOCK here.
+    if (!(await this.isWipParkMarker(barePath, tip))) return this.boundaryProof(barePath, branch, tip);
+    // The tip IS a `wip(park):` marker. The committed work (if any) is its parent and below.
+    let parents: string[];
+    try {
+      const row = (await this.runGit(barePath, ["--no-replace-objects", "rev-list", "--parents", "-n", "1", tip]))
+        .trim().split(/\s+/);
+      if (row.length === 0 || row[0] !== tip || !row.every(oid => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oid)))
+        return "unprovable";
+      parents = row.slice(1);
+    } catch (error) {
+      this.rethrowProofAbort(error);
+      return "unprovable";
+    }
+    // A genuine root marker has nothing committed below it to orphan.
+    if (parents.length === 0) return "content_free";
+    // A merge-shaped look-alike is not a park marker: prove it like any other tip.
+    if (parents.length >= 2) return this.boundaryProof(barePath, branch, tip);
+    // Floor like the reseed's: origin's branch if pushed, else the default branch. (A disjoint
+    // origin floor only pushes toward BLOCK: a disjoint parent is not an ancestor of it.) The
+    // parent is marker-only iff it is an ancestor-or-equal of the floor; a parent that strictly
+    // descends the floor or DIVERGED from it is committed work a report-only completion would orphan.
     try {
       const floorRef = (await this.refExists(barePath, `refs/remotes/origin/${branch}`))
         ? `refs/remotes/origin/${branch}`
         : await this.defaultBranchRef(barePath);
-      // Committed work exists below the marker iff the marker's parent is NOT an
-      // ancestor-or-equal of the recovery floor:
-      //   parent strictly descends floor → isAncestor(parent,floor) false → block ✓
-      //   parent == floor                → isAncestor true (true at equality) → allow ✓
-      //   parent is an ancestor of floor → isAncestor true                    → allow ✓
-      //   parent and floor DIVERGED      → isAncestor(parent,floor) false → block ✓
-      return !(await this.isAncestor(barePath, parent, floorRef));
+      const status = await this.tryGitExit(barePath, ["merge-base", "--is-ancestor", parents[0]!, floorRef]);
+      return status === 0 ? "content_free" : status === 1 ? "carries_work" : "unprovable";
     } catch (err) {
-      // Fail-safe: the floor could not be resolved. Preserve the guard rather than risk
-      // orphaning committed work below the marker.
+      this.rethrowProofAbort(err);
+      // Fail-safe: the floor could not be resolved. Preserve the guard.
       this.log.warn("hasCommittedCheckpoint: could not resolve recovery floor — preserving guard", {
         branch,
         tip,
-        parent,
         error: err instanceof Error ? err.message : String(err),
       });
-      return true;
+      return "unprovable";
     }
   }
 
   /** Positive proof only: command failure, missing objects or truncated history block. */
   private async checkpointHasOnlyBoundaryTrees(barePath: string, branch: string, tip: string): Promise<boolean> {
+    return (await this.boundaryProof(barePath, branch, tip)) === "content_free";
+  }
+
+  /** `carries_work` only when every command succeeded, the repository is not shallow, the walk
+   *  parsed fully with at least one boundary whose tree reads, some outside tree matches no
+   *  boundary tree, and every such unmatched tree reads (`%T` prints the name of an unreadable
+   *  tree too). Anything else that is not `content_free` is `unprovable`. */
+  private async boundaryProof(
+    barePath: string, branch: string, tip: string,
+  ): Promise<"content_free" | "carries_work" | "unprovable"> {
     try {
-      if ((await this.runGit(barePath, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") return false;
+      if ((await this.runGit(barePath, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") return "unprovable";
       const floorRef = (await this.refExists(barePath, `refs/remotes/origin/${branch}`))
         ? `refs/remotes/origin/${branch}` : await this.defaultBranchRef(barePath);
       const floor = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${floorRef}^{commit}`])).trim();
@@ -18252,26 +18318,28 @@ try {
       // arbitrary published trees or today's newer floor tip. Walk every merge parent.
       const walk = (await this.runGit(barePath, ["--no-replace-objects", "log", "--boundary",
         "--format=%m %T", exactTip, "--not", floor, "--"])).trim();
-      if (walk === "") return true; // The tip is already reachable from the floor.
+      if (walk === "") return "content_free"; // The tip is already reachable from the floor.
       const boundaryTrees = new Set<string>();
       const outsideTrees: string[] = [];
       for (const line of walk.split("\n")) {
         const row = /^([>-]) ([0-9a-f]{40}|[0-9a-f]{64})$/.exec(line);
-        if (!row) return false;
+        if (!row) return "unprovable";
         if (row[1] === "-") boundaryTrees.add(row[2]!);
         else outsideTrees.push(row[2]!);
       }
-      if (boundaryTrees.size === 0) return false;
+      if (boundaryTrees.size === 0) return "unprovable";
       for (const boundaryTree of boundaryTrees) {
         if (boundaryTree !== tree)
           await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-e", `${boundaryTree}^{tree}`]);
       }
-      return outsideTrees.every(candidate => boundaryTrees.has(candidate));
+      const unmatched = new Set(outsideTrees.filter(candidate => !boundaryTrees.has(candidate)));
+      if (unmatched.size === 0) return "content_free";
+      for (const outsideTree of unmatched)
+        await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-e", `${outsideTree}^{tree}`]);
+      return "carries_work";
     } catch (error) {
-      if (error instanceof RunResidueBlockedError) throw error;
-      const abort = this.boundaryAbortError(error);
-      if (abort) throw abort;
-      return false;
+      this.rethrowProofAbort(error);
+      return "unprovable";
     }
   }
 
