@@ -5,7 +5,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth/AuthContext";
-import { api, type AdminUsage, type RunSummaryItem, type SelfUsage, type Worker } from "./api";
+import {
+  api,
+  type AdminUsage,
+  type RecoveryCustodyHolds,
+  type RunSummaryItem,
+  type SelfUsage,
+  type Worker,
+} from "./api";
 import { hasAnthropicToken } from "./hasToken";
 import { usePollWhileVisible } from "./usePollWhileVisible";
 import type { UsageWindow } from "../components/UsageCards";
@@ -54,7 +61,7 @@ const ADMIN_RUNS_DEADLINE_MS = 30_000;
 
 const NO_ADMIN_RUNS: AdminRunsState = { runs: null, failed: false, lastOkAt: null };
 
-export function useOverviewData(opts?: { includeAdminRuns?: boolean }) {
+export function useOverviewData(opts?: { includeAdminRuns?: boolean; includeRecoveryHolds?: boolean }) {
   const { user } = useAuth();
   const [data, setData] = useState<Overview | null>(null);
   const [adminRuns, setAdminRuns] = useState<AdminRunsState>(NO_ADMIN_RUNS);
@@ -193,6 +200,26 @@ export function useOverviewData(opts?: { includeAdminRuns?: boolean }) {
   }, [adminRunsEnabled, fetchAdminRuns]);
   usePollWhileVisible(pollAdmin, 10000);
 
+  // Held-work (custody) holds are opt-in per page and ride their own request and poll, never
+  // the personal Promise.all or `poll`: a hung runs/workers request must not stop holds, and a
+  // holds failure must not touch `data`. A failure keeps the last good value (null before any
+  // success). Without the opt-in no request is made, so Dashboard sends its historic requests.
+  const holdsEnabled = opts?.includeRecoveryHolds === true;
+  const [holds, setHolds] = useState<RecoveryCustodyHolds | null>(null);
+  const loadHolds = useCallback(async () => {
+    if (!holdsEnabled) return;
+    try {
+      const next = await api.getRecoveryHolds();
+      if (pollAliveRef.current) setHolds(next);
+    } catch {
+      // keep the last-good holds
+    }
+  }, [holdsEnabled]);
+  useEffect(() => {
+    void loadHolds();
+  }, [loadHolds]);
+  usePollWhileVisible(loadHolds, 10000);
+
   const poll = useCallback(async () => {
     try {
       const [{ runs }, { workers }] = await Promise.all([api.listRuns({ view: "summary" }), api.listWorkers()]);
@@ -227,5 +254,5 @@ export function useOverviewData(opts?: { includeAdminRuns?: boolean }) {
   }, [user?.is_admin]);
   usePollWhileVisible(pollUsage, 30_000);
 
-  return { data, usageWindow, changeUsageWindow, adminRuns };
+  return { data, usageWindow, changeUsageWindow, adminRuns, holds };
 }

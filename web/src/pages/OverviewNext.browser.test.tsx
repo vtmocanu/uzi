@@ -229,6 +229,58 @@ describe("OverviewNext capacity rail", () => {
   });
 });
 
+describe("OverviewNext held work card", () => {
+  function mountWithHolds() {
+    mockApi.getRecoveryHolds.mockResolvedValue({
+      aggregate: { open_holds: 11, admission_counted_holds: 8, custody_hold_limit: 8, decision_needed: 2, blocked_runs: 2 },
+      holds: [],
+    });
+    render(
+      <MemoryRouter initialEntries={["/overview/next"]}>
+        <main className="min-w-0 px-4 py-6 sm:px-6 lg:py-8">
+          <OverviewNext />
+        </main>
+      </MemoryRouter>,
+    );
+  }
+  const cardOf = (name: RegExp) => screen.getByRole("heading", { name, level: 2 }).closest("div.rounded-xl") as HTMLElement;
+
+  it("stacks below Capacity at 400px with no horizontal overflow", async () => {
+    await page.viewport(400, 900);
+    mountWithHolds();
+    await screen.findByText("Capacity");
+    await screen.findByText("custody slots used");
+    await document.fonts.ready;
+    expect(window.innerWidth).toBe(400);
+    const capacity = cardOf(/Capacity/).getBoundingClientRect();
+    const heldCard = cardOf(/Held work/);
+    const held = heldCard.getBoundingClientRect();
+    expect(held.left, "same column as Capacity").toBe(capacity.left);
+    expect(held.top, "below Capacity").toBeGreaterThanOrEqual(capacity.bottom);
+    expect(held.right).toBeLessThanOrEqual(window.innerWidth);
+    for (const el of heldCard.querySelectorAll<HTMLElement>("*")) {
+      expect.soft(el.getBoundingClientRect().right, `${el.tagName} ${el.textContent?.slice(0, 30)}`).toBeLessThanOrEqual(
+        held.right + 1,
+      );
+    }
+    expect(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(
+      window.innerWidth,
+    );
+  });
+
+  it("sits beside Capacity between lg and xl", async () => {
+    await page.viewport(1100, 900);
+    mountWithHolds();
+    await screen.findByText("Capacity");
+    await screen.findByText("custody slots used");
+    await document.fonts.ready;
+    const capacity = cardOf(/Capacity/).getBoundingClientRect();
+    const held = cardOf(/Held work/).getBoundingClientRect();
+    expect(held.left, "Held work to the right of Capacity").toBeGreaterThanOrEqual(capacity.right);
+    expect(held.right).toBeLessThanOrEqual(window.innerWidth);
+  });
+});
+
 // Every worker summary stays inside its box and its name keeps a readable width, however
 // many badges the worker shows.
 function expectRailSummariesFit(railCard: HTMLElement) {

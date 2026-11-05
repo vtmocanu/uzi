@@ -10,6 +10,7 @@ import { useDemoMode } from "../lib/demoMode";
 import { maskName } from "../lib/demoMask";
 import { useOverviewData } from "../lib/useOverviewData";
 import {
+  decisionCount,
   mergeOverviewRows,
   overviewCounts,
   overviewDecisions,
@@ -23,7 +24,7 @@ import { OnboardingChecklist } from "../components/OnboardingChecklist";
 import { NeedsDecisionCard } from "../components/NeedsDecisionCard";
 import { OverviewRunsWidget } from "../components/OverviewRunsWidget";
 import { CapacityRail } from "../components/CapacityRail";
-import { CustodyBoardAlert } from "../components/CustodyBoardAlert";
+import { HeldWorkCard } from "../components/HeldWorkCard";
 import { HealthPlatformLine } from "../components/HealthPlatformLine";
 import { HealthChip } from "../components/HealthChip";
 import { InShellHeader } from "../components/PageHeaderSlot";
@@ -32,16 +33,19 @@ import { PageHeader } from "../components/ui";
 export function OverviewNext() {
   const demo = useDemoMode();
   const { user } = useAuth();
-  const { data, usageWindow, changeUsageWindow, adminRuns } = useOverviewData({ includeAdminRuns: true });
+  const { data, usageWindow, changeUsageWindow, adminRuns, holds } = useOverviewData({
+    includeAdminRuns: true,
+    includeRecoveryHolds: true,
+  });
   const now = useNow(30_000);
 
   if (!user) return null;
 
   const isAdmin = user.is_admin === true;
-  // The viewer's OWN runs: what the custody alert, the platform line and (from M2) the
-  // decisions read. Never the admin rows, for an admin too.
+  // The viewer's OWN runs: what the Held work card, the platform line and the decisions
+  // read. Never the admin rows, for an admin too. Held work is the owner's own custody.
   const ownRuns = data?.runs ?? [];
-  const decisions = overviewDecisions(ownRuns);
+  const decisions = overviewDecisions(ownRuns, holds);
   // The counts follow the viewer's scope: own runs, or for an admin every user's runs
   // while the admin list is readable. An unreadable admin list falls back to the viewer's
   // own runs and the sentence says so.
@@ -52,7 +56,7 @@ export function OverviewNext() {
       : null;
   const sentence = data
     ? statusSentence({
-        decisions: decisions.filter((d) => d.kind !== "pr").length,
+        decisions: decisionCount(decisions),
         prs: decisions.filter((d) => d.kind === "pr").length,
         counts: overviewCounts(factoryRows ?? ownRuns),
         acrossFactory: factoryRows != null,
@@ -93,7 +97,6 @@ export function OverviewNext() {
       <NeedsDecisionCard items={decisions} now={now} demo={demo} />
 
       {/* Same inputs as Dashboard: the viewer's own runs, never the admin rows. */}
-      <CustodyBoardAlert recoveryWaitCount={ownRecoveryWaitCount(ownRuns)} />
       <HealthPlatformLine isAdmin={isAdmin} runs={ownRuns} workers={data?.workers ?? []} />
 
       {/* Runs on the left, the right-hand rail beside it; the rail stacks below at narrow widths. */}
@@ -109,7 +112,11 @@ export function OverviewNext() {
             loading={!data}
           />
         </div>
-        <div className="min-w-0 space-y-6">{data && <CapacityRail workers={data.workers} />}</div>
+        {/* Below xl the rail is full width: Capacity and Held work sit side by side from lg. */}
+        <div className="min-w-0 space-y-6 lg:grid lg:grid-cols-2 lg:items-start lg:gap-6 lg:space-y-0 xl:block xl:space-y-6">
+          {data && <CapacityRail workers={data.workers} />}
+          {data && <HeldWorkCard holds={holds} recoveryWaitCount={ownRecoveryWaitCount(ownRuns)} />}
+        </div>
       </div>
 
       {/* Factory usage is rendered only from the admin-gated response. */}

@@ -8,9 +8,10 @@ import { preferForgeUrl } from "../lib/api";
 import { maskRepoPath } from "../lib/demoMask";
 import { mrAbbrev } from "../lib/forgeNoun";
 import { mergeRequestUrl, projectWebUrlFromIssue } from "../lib/forgeUrls";
-import type { DecisionItem } from "../lib/overview";
+import { decisionCount, type DecisionItem, type HeldDecisionItem, type RunDecisionItem } from "../lib/overview";
 import { activityAge } from "../lib/runActivity";
 import { stripUnsafeChars } from "../lib/safeText";
+import { HELD_WORK_HREF } from "./HeldWorkCard";
 import { RunIssueRef } from "./RunIssueRef";
 import { SectionTitle } from "./ui";
 
@@ -31,7 +32,7 @@ function decisionAge(since: string, now: number): string {
 
 function summary(items: DecisionItem[]): string {
   const prs = items.filter((i) => i.kind === "pr").length;
-  const decisions = items.length - prs;
+  const decisions = decisionCount(items);
   return [
     decisions > 0 ? `${decisions} ${decisions === 1 ? "decision" : "decisions"}` : null,
     prs > 0 ? `${prs} PR ${prs === 1 ? "review" : "reviews"}` : null,
@@ -40,7 +41,40 @@ function summary(items: DecisionItem[]): string {
     .join(", ");
 }
 
-function DecisionRow({ item, now, demo }: { item: DecisionItem; now: number; demo: boolean }) {
+// The held-work decisions as one row. The title names the run only when the aggregate's single
+// decision is identified in the hold list; several decisions read as a count, and anything the
+// list cannot name stays generic.
+function HeldDecisionRow({ item, now }: { item: HeldDecisionItem; now: number }) {
+  const titleId = useId();
+  const age = item.since ? decisionAge(item.since, now) : "";
+  const shortId = item.runId ? stripUnsafeChars(item.runId).slice(0, 8) : "";
+  return (
+    <li className="flex items-center gap-3 py-2.5">
+      <div className="min-w-0 flex-1">
+        <p id={titleId} className="text-sm font-medium text-fg">
+          {item.count > 1 ? (
+            `${item.count} held-work holds need a decision`
+          ) : shortId ? (
+            <>
+              Held work from run <span className="font-mono">{shortId}</span> needs a decision
+            </>
+          ) : (
+            "Held work needs a decision"
+          )}
+        </p>
+        <p className="flex flex-wrap items-center gap-x-2 text-xs text-faint">
+          <span>Custody</span>
+          {age && <span>waiting {age}</span>}
+        </p>
+      </div>
+      <Link to={HELD_WORK_HREF} aria-describedby={titleId} className={ACTION_CLASS}>
+        {item.verb}
+      </Link>
+    </li>
+  );
+}
+
+function DecisionRow({ item, now, demo }: { item: RunDecisionItem; now: number; demo: boolean }) {
   const { run } = item;
   const age = decisionAge(item.since, now);
   // The row's title describes its action link, so several "Review plan" links are told apart
@@ -117,9 +151,13 @@ export function NeedsDecisionCard({ items, now, demo }: { items: DecisionItem[];
         <span className="text-xs text-faint">{summary(items)}</span>
       </div>
       <ul className="mt-2 divide-y divide-edge">
-        {items.map((item) => (
-          <DecisionRow key={`${item.kind}:${item.run.id}`} item={item} now={now} demo={demo} />
-        ))}
+        {items.map((item) =>
+          item.kind === "held" ? (
+            <HeldDecisionRow key="held" item={item} now={now} />
+          ) : (
+            <DecisionRow key={`${item.kind}:${item.run.id}`} item={item} now={now} demo={demo} />
+          ),
+        )}
       </ul>
     </section>
   );

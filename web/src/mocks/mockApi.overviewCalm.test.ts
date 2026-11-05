@@ -12,7 +12,9 @@ describe("overview-calm mock scenario", () => {
     const { mockApi } = await import("./mockApi");
     const runs = (await mockApi.listRuns({ view: "summary" })).runs;
     expect(runs.some((r) => r.status === "running")).toBe(true);
-    expect(overviewDecisions(runs)).toEqual([]);
+    const holds = await mockApi.getRecoveryHolds();
+    expect(holds.aggregate.open_holds).toBe(0);
+    expect(overviewDecisions(runs, holds)).toEqual([]);
   });
 
   it("does not change the default scenario", async () => {

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import type { RunSummaryItem } from "../lib/api";
-import type { DecisionItem } from "../lib/overview";
+import type { DecisionItem, HeldDecisionItem, RunDecisionItem } from "../lib/overview";
 import { NeedsDecisionCard } from "./NeedsDecisionCard";
 import { aRun } from "../pages/overviewFixtures";
 
@@ -12,8 +12,8 @@ afterEach(cleanup);
 const NOW = Date.parse("2026-07-05T12:20:00Z");
 const SINCE = "2026-07-05T12:06:00Z";
 
-function item(kind: DecisionItem["kind"], over: Partial<RunSummaryItem> = {}): DecisionItem {
-  const verb = { plan: "Review plan", question: "Answer", park: "Resume", pr: "Review PR" }[kind] as DecisionItem["verb"];
+function item(kind: RunDecisionItem["kind"], over: Partial<RunSummaryItem> = {}): RunDecisionItem {
+  const verb = { plan: "Review plan", question: "Answer", park: "Resume", pr: "Review PR" }[kind] as RunDecisionItem["verb"];
   return { kind, verb, since: SINCE, run: aRun({ id: `run-${kind}`, ...over }) as RunSummaryItem };
 }
 
@@ -50,7 +50,7 @@ describe("NeedsDecisionCard", () => {
   });
 
   it("rolls long waits into hours and days", () => {
-    const at = (iso: string) => ({ ...item("plan"), since: iso });
+    const at = (iso: string): RunDecisionItem => ({ ...item("plan"), since: iso });
     mount([
       { ...at("2026-06-07T12:20:00Z"), run: aRun({ id: "d" }) as RunSummaryItem },
       { ...at("2026-07-05T07:20:00Z"), run: aRun({ id: "h" }) as RunSummaryItem },
@@ -140,5 +140,55 @@ describe("NeedsDecisionCard", () => {
     cleanup();
     mount([item("plan", run)], false);
     expect(screen.getByText(/acme-corp\/secret-repo/)).toBeTruthy();
+  });
+
+  describe("held work row", () => {
+    const heldItem = (over: Partial<HeldDecisionItem> = {}): HeldDecisionItem => ({
+      kind: "held",
+      verb: "Review held work",
+      count: 1,
+      runId: "a83c51f0-6d2e-4b7a-9c14-0e5f8a1d3b27",
+      since: "2026-07-05T10:20:00Z",
+      ...over,
+    });
+
+    it("names a single decision's run by its short id, with the custody meta and age", () => {
+      mount([heldItem()]);
+      const title = screen.getByText(/Held work from run/);
+      expect(title.textContent).toBe("Held work from run a83c51f0 needs a decision");
+      expect(screen.getByText("a83c51f0").className).toContain("font-mono");
+      expect(screen.getByText("Custody")).toBeTruthy();
+      expect(screen.getByText("waiting 2h")).toBeTruthy();
+    });
+
+    it("reads as a count for several decisions and stays generic when the run is unknown", () => {
+      mount([heldItem({ count: 3, runId: null })]);
+      expect(screen.getByText("3 held-work holds need a decision")).toBeTruthy();
+      cleanup();
+      mount([heldItem({ runId: null, since: null })]);
+      expect(screen.getByText("Held work needs a decision")).toBeTruthy();
+      expect(screen.queryByText(/waiting/)).toBeNull();
+    });
+
+    it("links to the Workers held-work panel and is described by its title", () => {
+      mount([heldItem()]);
+      const a = screen.getByRole("link", { name: "Review held work" });
+      expect(a.getAttribute("href")).toBe("/workers?tab=workers#recovery-holds");
+      const described = (a.getAttribute("aria-describedby") ?? "")
+        .split(" ")
+        .map((id) => document.getElementById(id)?.textContent)
+        .join(" ");
+      expect(described).toBe("Held work from run a83c51f0 needs a decision");
+    });
+
+    it("strips unsafe characters from the run id", () => {
+      mount([heldItem({ runId: "ab\u200bcd\u202eef12345" })]);
+      expect(screen.getByText(/Held work from run/).textContent).toBe("Held work from run abcdef12 needs a decision");
+    });
+
+    it("counts the aggregate's decisions in the summary", () => {
+      mount([item("plan"), heldItem({ count: 2, runId: null }), prItem()]);
+      expect(screen.getByText("3 decisions, 1 PR review")).toBeTruthy();
+    });
   });
 });

@@ -2,7 +2,7 @@
 // PRD #3878: the admin run list's loading rules inside the shared Overview data hook.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, renderHook } from "@testing-library/react";
-import { api, type RunSummaryItem } from "./api";
+import { api, type RecoveryCustodyHolds, type RunSummaryItem } from "./api";
 import { useAuth } from "../auth/AuthContext";
 import { useOverviewData } from "./useOverviewData";
 import { aRun, aUser, authValue, emptySelf } from "../pages/overviewFixtures";
@@ -21,6 +21,7 @@ vi.mock("./api", async (importOriginal) => {
       getUsage: vi.fn(),
       getAdminUsage: vi.fn(),
       adminListRuns: vi.fn(),
+      getRecoveryHolds: vi.fn(),
     },
   };
 });
@@ -43,6 +44,7 @@ beforeEach(() => {
   mockApi.getUsage.mockResolvedValue(emptySelf());
   mockApi.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [], earliest_run: null });
   mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+  mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(1));
 });
 
 afterEach(() => {
@@ -50,6 +52,13 @@ afterEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
 });
+
+function holdsWith(open: number): RecoveryCustodyHolds {
+  return {
+    aggregate: { open_holds: open, admission_counted_holds: open, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0 },
+    holds: [],
+  };
+}
 
 async function settle(ms = 0) {
   await act(async () => {
@@ -266,5 +275,79 @@ describe("useOverviewData admin runs", () => {
     await settle(30_000);
     expect(mockApi.adminListRuns).not.toHaveBeenCalled();
     expect(result.current.adminRuns).toEqual({ runs: null, failed: false, lastOkAt: null });
+  });
+});
+
+describe("useOverviewData recovery holds", () => {
+  it("makes no holds request and returns null without the opt-in", async () => {
+    const { result } = renderHook(() => useOverviewData({ includeAdminRuns: true }));
+    await settle(30_000);
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
+    expect(result.current.holds).toBeNull();
+    const bare = renderHook(() => useOverviewData());
+    await settle(30_000);
+    expect(mockApi.getRecoveryHolds).not.toHaveBeenCalled();
+    expect(bare.result.current.holds).toBeNull();
+  });
+
+  it("loads holds once on mount and again each 10 s tick", async () => {
+    const { result } = renderHook(() => useOverviewData({ includeRecoveryHolds: true }));
+    await settle();
+    expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(1);
+    expect(result.current.holds?.aggregate.open_holds).toBe(1);
+    mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(4));
+    await settle(10_000);
+    expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(2);
+    expect(result.current.holds?.aggregate.open_holds).toBe(4);
+  });
+
+  it("loads holds even while the personal requests never settle", async () => {
+    mockApi.listRuns.mockImplementation(() => new Promise(() => {}));
+    const { result } = renderHook(() => useOverviewData({ includeRecoveryHolds: true }));
+    await settle();
+    expect(result.current.data).toBeNull();
+    expect(result.current.holds?.aggregate.open_holds).toBe(1);
+    mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(2));
+    await settle(10_000);
+    expect(result.current.holds?.aggregate.open_holds).toBe(2);
+  });
+
+  it("keeps the last good holds after a failed poll, and recovers on the next success", async () => {
+    const { result } = renderHook(() => useOverviewData({ includeRecoveryHolds: true }));
+    await settle();
+    mockApi.getRecoveryHolds.mockRejectedValueOnce(new Error("blip"));
+    await settle(10_000);
+    expect(mockApi.getRecoveryHolds).toHaveBeenCalledTimes(2);
+    expect(result.current.holds?.aggregate.open_holds).toBe(1);
+    mockApi.getRecoveryHolds.mockResolvedValue(holdsWith(3));
+    await settle(10_000);
+    expect(result.current.holds?.aggregate.open_holds).toBe(3);
+  });
+
+  it("stays null when the first load fails, without touching the personal data", async () => {
+    mockApi.getRecoveryHolds.mockRejectedValue(new Error("down"));
+    const { result } = renderHook(() => useOverviewData({ includeRecoveryHolds: true }));
+    await settle();
+    expect(result.current.holds).toBeNull();
+    expect(result.current.data).not.toBeNull();
+  });
+
+  it("does not let a hung holds request stop the runs poll", async () => {
+    mockApi.getRecoveryHolds.mockImplementation(() => new Promise(() => {}));
+    renderHook(() => useOverviewData({ includeRecoveryHolds: true }));
+    await settle();
+    await settle(10_000);
+    expect(mockApi.listRuns).toHaveBeenCalledTimes(2);
+  });
+
+  it("applies nothing after unmount", async () => {
+    let resolve: (v: RecoveryCustodyHolds) => void = () => {};
+    mockApi.getRecoveryHolds.mockImplementation(() => new Promise((res) => { resolve = res; }));
+    const { result, unmount } = renderHook(() => useOverviewData({ includeRecoveryHolds: true }));
+    await settle();
+    unmount();
+    resolve(holdsWith(5));
+    await settle();
+    expect(result.current.holds).toBeNull();
   });
 });

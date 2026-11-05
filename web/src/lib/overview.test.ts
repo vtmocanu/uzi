@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { RunStatus, RunSummaryItem } from "./api";
+import type { RecoveryCustodyHold, RecoveryCustodyHolds, RunStatus, RunSummaryItem } from "./api";
 import {
+  decisionCount,
   mergeOverviewRows,
   openPrs,
   overviewCounts,
@@ -246,6 +247,11 @@ describe("openPrs", () => {
 
 describe("overviewDecisions", () => {
   const at = (m: number) => `2026-07-05T12:${String(m).padStart(2, "0")}:00Z`;
+  // Run-only fixtures: narrow a decision to its run item.
+  const runOf = (d: ReturnType<typeof overviewDecisions>[number]) => {
+    if (d.kind === "held") throw new Error("unexpected held item");
+    return d.run;
+  };
 
   it("excludes revising plans, stalled running runs and the weekly-reserve pause; includes owner parks", () => {
     const got = overviewDecisions([
@@ -255,7 +261,7 @@ describe("overviewDecisions", () => {
       run({ id: "limit", status: "limit_wait" }),
       run({ id: "owner-park", status: "paused" }),
     ]);
-    expect(got.map((d) => [d.run.id, d.kind, d.verb])).toEqual([["owner-park", "park", "Resume"]]);
+    expect(got.map((d) => [runOf(d).id, d.kind, d.verb])).toEqual([["owner-park", "park", "Resume"]]);
   });
 
   it("orders by group then oldest first, with the verb per group", () => {
@@ -267,7 +273,7 @@ describe("overviewDecisions", () => {
       run({ id: "plan-new", status: "awaiting_approval", status_since: at(8) }),
       run({ id: "plan-old", status: "awaiting_approval", status_since: null, created_at: at(5) }),
     ]);
-    expect(got.map((d) => [d.run.id, d.verb, d.since])).toEqual([
+    expect(got.map((d) => [runOf(d).id, d.verb, d.since])).toEqual([
       ["plan-old", "Review plan", at(5)],
       ["plan-new", "Review plan", at(8)],
       ["q-old", "Answer", at(4)],
@@ -283,15 +289,15 @@ describe("overviewDecisions", () => {
       run({ id: "bad-2", status: "awaiting_approval", status_since: "nope" }),
       run({ id: "good", status: "awaiting_approval", status_since: at(5) }),
     ]);
-    expect(got.map((d) => d.run.id)).toEqual(["good", "bad-1", "bad-2"]);
+    expect(got.map((d) => runOf(d).id)).toEqual(["good", "bad-1", "bad-2"]);
   });
 });
 
 describe("statusSentence from decisions", () => {
-  const sentenceFor = (runs: RunSummaryItem[]) => {
-    const items = overviewDecisions(runs);
+  const sentenceFor = (runs: RunSummaryItem[], holds?: RecoveryCustodyHolds) => {
+    const items = overviewDecisions(runs, holds);
     return statusSentence({
-      decisions: items.filter((d) => d.kind !== "pr").length,
+      decisions: decisionCount(items),
       prs: items.filter((d) => d.kind === "pr").length,
       counts: { executing: 0, queued: 0, parked: 0 },
       acrossFactory: false,
@@ -313,5 +319,115 @@ describe("statusSentence from decisions", () => {
 
   it("counts two runs sharing one PR once", () => {
     expect(sentenceFor([pr("a"), pr("b")])).toMatch(/^1 pull request is waiting on you\./);
+  });
+
+  it("counts the aggregate's held-work decisions", () => {
+    const holds = heldHolds({ decision_needed: 2, open_holds: 2 }, [decisionHold("h1", "2026-07-05T10:01:00Z"), decisionHold("h2", "2026-07-05T10:02:00Z")]);
+    expect(sentenceFor([], holds)).toMatch(/^2 decisions are waiting on you\./);
+    expect(sentenceFor([plan], holds)).toMatch(/^3 decisions are waiting on you\./);
+  });
+});
+
+function decisionHold(runId: string, createdAt: string, over: Partial<RecoveryCustodyHold> = {}): RecoveryCustodyHold {
+  return {
+    id: `hold-${runId}`,
+    run_id: runId,
+    generation: 1,
+    state: "open",
+    attention: "source_only",
+    worker_id: "w",
+    inventory_guarded: false,
+    has_available_capture: false,
+    created_at: createdAt,
+    updated_at: createdAt,
+    ...over,
+  };
+}
+
+function heldHolds(
+  agg: Partial<RecoveryCustodyHolds["aggregate"]>,
+  holds: RecoveryCustodyHold[] = [],
+): RecoveryCustodyHolds {
+  return {
+    aggregate: { open_holds: 0, custody_hold_limit: 8, decision_needed: 0, blocked_runs: 0, ...agg },
+    holds,
+  };
+}
+
+describe("overviewDecisions held work", () => {
+  const T1 = "2026-07-05T10:00:00Z";
+  const T2 = "2026-07-05T11:00:00Z";
+  const held = (holds: RecoveryCustodyHolds) => overviewDecisions([], holds).filter((d) => d.kind === "held");
+
+  it("adds no row when the aggregate has no decision, even with blocked runs", () => {
+    expect(held(heldHolds({ open_holds: 3, decision_needed: 0, blocked_runs: 2 }))).toEqual([]);
+  });
+
+  it("adds no row when no hold is open, even if decision_needed is positive", () => {
+    expect(held(heldHolds({ open_holds: 0, decision_needed: 2 }, [decisionHold("a", T1)]))).toEqual([]);
+  });
+
+  it("adds no row without holds", () => {
+    expect(overviewDecisions([])).toEqual([]);
+    expect(overviewDecisions([], null)).toEqual([]);
+  });
+
+  it("collapses several decision holds into one row with the oldest age and no run", () => {
+    const got = held(heldHolds({ open_holds: 2, decision_needed: 2 }, [decisionHold("newer", T2), decisionHold("older", T1)]));
+    expect(got).toEqual([{ kind: "held", verb: "Review held work", count: 2, runId: null, since: T1 }]);
+  });
+
+  it("names the run of a single decision hold", () => {
+    const got = held(
+      heldHolds({ open_holds: 2, decision_needed: 1 }, [
+        decisionHold("only", T2),
+        decisionHold("healthy", T1, { attention: "active" }),
+      ]),
+    );
+    expect(got).toEqual([{ kind: "held", verb: "Review held work", count: 1, runId: "only", since: T2 }]);
+  });
+
+  it("stays generic when the aggregate says 1 but the list has no decision hold", () => {
+    const got = held(heldHolds({ open_holds: 1, decision_needed: 1 }, [decisionHold("x", T1, { attention: "active" })]));
+    expect(got).toEqual([{ kind: "held", verb: "Review held work", count: 1, runId: null, since: null }]);
+  });
+
+  it("ignores released holds when picking the row's run and age", () => {
+    const got = held(
+      heldHolds({ open_holds: 1, decision_needed: 1 }, [decisionHold("gone", T1, { state: "released" }), decisionHold("live", T2)]),
+    );
+    expect(got).toMatchObject([{ runId: "live", since: T2 }]);
+  });
+
+  it("sorts an unparseable created_at after a parseable one", () => {
+    const got = held(heldHolds({ open_holds: 2, decision_needed: 2 }, [decisionHold("bad", "garbage"), decisionHold("ok", T2)]));
+    expect(got).toMatchObject([{ since: T2 }]);
+  });
+
+  it("places the held row after park and before pr", () => {
+    const got = overviewDecisions(
+      [
+        run({ id: "pr", status: "completed", kind: "issue", mr_iid: 1, mr_state: "opened", created_at: T1, finished_at: T1 }),
+        run({ id: "park", status: "paused" }),
+        run({ id: "plan", status: "awaiting_approval" }),
+      ],
+      heldHolds({ open_holds: 1, decision_needed: 1 }, [decisionHold("h", T1)]),
+    );
+    expect(got.map((d) => d.kind)).toEqual(["plan", "park", "held", "pr"]);
+  });
+});
+
+describe("decisionCount", () => {
+  it("counts non-pr run items plus the held aggregate count, never open PRs", () => {
+    const items = overviewDecisions(
+      [
+        run({ id: "plan", status: "awaiting_approval" }),
+        run({ id: "q", status: "awaiting_input" }),
+        run({ id: "pr", status: "completed", kind: "issue", mr_iid: 1, mr_state: "opened", created_at: "2026-07-05T10:00:00Z" }),
+      ],
+      heldHolds({ open_holds: 2, decision_needed: 2 }, [decisionHold("a", "2026-07-05T10:00:00Z")]),
+    );
+    expect(decisionCount(items)).toBe(4);
+    expect(decisionCount([])).toBe(0);
   });
 });
