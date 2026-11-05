@@ -15,7 +15,7 @@ func newSettingsCodexModeCmd(env Env, gf *globalFlags) *cobra.Command {
 		Use:   "codex-mode default|auto",
 		Short: "Set how new Codex runs choose a login",
 		Long: "Set how a new Codex run chooses its login. default binds your default login, as\n" +
-			"before. auto picks, at run creation, the pooled login with the most limit headroom\n" +
+			"before. auto picks, at run creation, a pooled login with limit headroom to spare\n" +
 			"(pool a login with `uzi token pool <label> --kind codex --on`; the pool is empty\n" +
 			"until you opt logins in, and auto then falls back to your default).",
 		Args: cobra.ExactArgs(1),

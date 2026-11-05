@@ -61,8 +61,11 @@ func TestBuiltinsParseAndValid(t *testing.T) {
 		seen[def.Name] = true
 		// Validate the model against the shared, authoritative rule (no separate
 		// test-local copy that could drift from the server validator).
-		if _, err := ValidateModel(def.Model); err != nil {
+		if _, err := ValidateTemplatePin("claude", def.Model); err != nil {
 			t.Errorf("builtin %q has an invalid model %q: %v", def.Name, def.Model, err)
+		}
+		if def.CodexModel != "" {
+			t.Errorf("builtin %q has a Codex pin", def.Name)
 		}
 		// Whitespace hygiene on every frontmatter value. Asserted per field
 		// rather than over the raw file so the message names the offender.

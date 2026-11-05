@@ -8,6 +8,9 @@
 //   env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
 //     discard --run <uuid> --generation <n|none> --attempt <id|canonical> --confirm <digest> [--protected]
 //
+//   ... retained-source.mjs local-records --run <id>
+//   ... retained-source.mjs resolve-local-record --run <id> --generation <n> --confirm <digest>
+//
 // It connects to the worker's Unix socket, sends ONE NDJSON request line, prints the response line
 // and exits non-zero on a refusal, an unknown outcome or any error. It has no filesystem logic.
 //
@@ -22,17 +25,46 @@ const RESPONSE_MAX_BYTES = 65536;
 const SOCKET_RELATIVE = "ops/retained-source.sock";
 const DEFAULT_DATA_DIR = "/data";
 const IDLE_TIMEOUT_MS = 120000;
+// Test-only override of the idle timeout. Production runs this client under `env -i`, so the variable
+// is never set there and the default applies.
+const idleOverride = Number(process.env.UZI_RETAINED_SOURCE_IDLE_TIMEOUT_MS);
+const idleTimeoutMs = Number.isSafeInteger(idleOverride) && idleOverride > 0 ? idleOverride : IDLE_TIMEOUT_MS;
 
 function usage(message) {
   process.stderr.write(`${message}\n` +
     "usage: retained-source.mjs inspect [--run <id> --generation <n|none> --attempt <id|canonical>] [--socket <path>]\n" +
-    "       retained-source.mjs discard --run <id> --generation <n|none> --attempt <id|canonical> --confirm <digest> [--protected] [--socket <path>]\n");
+    "       retained-source.mjs discard --run <id> --generation <n|none> --attempt <id|canonical> --confirm <digest> [--protected] [--socket <path>]\n" +
+    "       retained-source.mjs local-records --run <id> [--socket <path>]\n" +
+    "       retained-source.mjs resolve-local-record --run <id> --generation <n> --confirm <digest> [--socket <path>]\n");
   process.exit(2);
+}
+
+function parseLocalRecordArgs(op, rest) {
+  const flags = {};
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    if (!["--run", "--generation", "--confirm", "--socket"].includes(arg)) usage(`unknown argument ${arg}`);
+    const value = rest[++i];
+    if (value === undefined || value.startsWith("--")) usage(`${arg} needs a value`);
+    flags[arg.slice(2)] = value;
+  }
+  if (flags.run === undefined) usage(`${op} needs --run`);
+  const request = { op, run: flags.run };
+  if (op === "resolve-local-record") {
+    if (flags.generation === undefined || flags.confirm === undefined) usage("resolve-local-record needs --generation and --confirm <digest from local-records>");
+    if (!/^[0-9]+$/.test(flags.generation) || !Number.isSafeInteger(Number(flags.generation)) || Number(flags.generation) < 1) usage("--generation must be a positive integer");
+    request.generation = Number(flags.generation);
+    request.confirm = flags.confirm;
+  } else if (flags.generation !== undefined || flags.confirm !== undefined) {
+    usage("--generation and --confirm apply to resolve-local-record only");
+  }
+  return { request, socket: flags.socket ?? path.join(DEFAULT_DATA_DIR, SOCKET_RELATIVE) };
 }
 
 function parseArgs(argv) {
   const [op, ...rest] = argv;
-  if (op !== "inspect" && op !== "discard") usage("the first argument must be inspect or discard");
+  if (op === "local-records" || op === "resolve-local-record") return parseLocalRecordArgs(op, rest);
+  if (op !== "inspect" && op !== "discard") usage("the first argument must be inspect, discard, local-records or resolve-local-record");
   const flags = { protected: false };
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
@@ -78,7 +110,9 @@ if (Buffer.byteLength(line) > REQUEST_MAX_BYTES) usage("the request is too large
 const chunks = [];
 let received = 0;
 const conn = net.createConnection(socketPath);
-conn.setTimeout(IDLE_TIMEOUT_MS, () => fail("timed out waiting for the worker"));
+conn.setTimeout(idleTimeoutMs, () => fail(request.op === "resolve-local-record"
+  ? "timed out waiting for the worker; the resolution outcome is unknown: re-inspect (local-records / inspect) before retrying"
+  : "timed out waiting for the worker"));
 conn.on("error", (err) => fail(`cannot reach the worker channel at ${socketPath}: ${err.code ?? err.message}`));
 conn.on("connect", () => conn.write(line));
 conn.on("data", (chunk) => {

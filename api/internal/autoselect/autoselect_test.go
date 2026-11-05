@@ -279,3 +279,13 @@ func TestClassifySevenDayOnly(t *testing.T) {
 		t.Fatalf("NULL 7-day status = %q, want unmeasured", got.Status)
 	}
 }
+
+// headroomFirstPolicy is testPolicy pinned to the pre-#3844 ordering. The Select
+// matrix (select_test.go, select_exclude_test.go, floor_test.go) was written for
+// headroom_first and runs under it, so those tests keep reproducing today's results
+// now that the default Order is reset_first.
+func headroomFirstPolicy() Policy {
+	p := testPolicy()
+	p.Order = OrderHeadroomFirst
+	return p
+}

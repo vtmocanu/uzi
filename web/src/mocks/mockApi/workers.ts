@@ -9,6 +9,10 @@ import { delay, mockScenario, requireSession } from "./shared";
 // unbinds workers pinned to a deleted token. Both reads are inside function bodies and no
 // module-level initializer crosses the modules, so the cycle cannot throw at import.
 import { secrets } from "./secrets";
+// runs ↔ workers is a second import cycle (runs → secrets → workers); deleteWorker reads
+// runsApi only inside its body, so no module-level initializer crosses the modules.
+import { runsApi } from "./runs";
+import { getRun } from "../store";
 
 export let workers: Worker[] = mockWorkers.map((w) => ({ ...w }));
 let workerCounter = 0;
@@ -20,8 +24,23 @@ type ManualState = Pick<Worker, "manual_cordoned_at" | "manual_cordoned_by" | "m
 };
 const manualStates = new Map<string, ManualState>();
 
+// The custody scenario's holds (runs.ts seedCustodyHolds) name worker "wkr-jvm", which is not
+// in the seeded fleet. List it, as a hosted worker, only under ?mock=custody so a hosted
+// Delete on it meets the 409 custody refusal; every other scenario keeps the fleet unchanged.
+function custodyHostedWorker(): Worker {
+  const base = mockWorkers.find((w) => w.id === "w-hosted-eu")!;
+  return { ...base, id: "wkr-jvm", name: "jvm-worker" };
+}
+
+// The custody worker is synthesised per listing rather than stored in `workers`, so a
+// successful delete (after its holds are resolved) is remembered here or it would reappear.
+let custodyWorkerDeleted = false;
+
 function ownerWorkers(): Worker[] {
-  return mockScenario() === "health-incident" ? incidentFleetWorkers() : workers;
+  const scenario = mockScenario();
+  if (scenario === "health-incident") return incidentFleetWorkers();
+  if (scenario === "custody") return custodyWorkerDeleted ? workers : [...workers, custodyHostedWorker()];
+  return workers;
 }
 
 function projectedWorker<T extends Worker>(w: T): T {
@@ -208,7 +227,30 @@ export const workersApi = {
     return delay({ worker: { ...w }, token });
   },
   deleteWorker: async (id: string) => {
+    // Mirrors the server's custody refusal. The live holder is approximated with the
+    // original worker (the owner listing's worker_id is the original worker), so open mock
+    // holds whose worker_id is this worker block the delete, oldest first, capped at 10.
+    const { holds } = await runsApi.getRecoveryHolds();
+    const blocking = holds
+      .filter((h) => h.state === "open" && h.worker_id === id)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+    if (blocking.length > 0) {
+      const msg = `this worker is retaining unpublished committed work for recovery in ${blocking.length} custody hold(s); recover it (uzi run export) or explicitly discard those recovery archives before removing it`;
+      throw new ApiError(409, msg, {
+        error: msg,
+        custody_holds: blocking.length,
+        blocking_holds: blocking.slice(0, 10).map((h) => ({
+          hold_id: h.id,
+          run_id: h.run_id,
+          generation: h.generation,
+          kind: getRun(h.run_id)?.kind ?? "",
+          title: getRun(h.run_id)?.title ?? "",
+        })),
+        blocking_holds_total: blocking.length,
+      });
+    }
     workers = workers.filter((w) => w.id !== id);
+    if (id === custodyHostedWorker().id) custodyWorkerDeleted = true;
     manualStates.delete(id);
     return delay(null);
   },

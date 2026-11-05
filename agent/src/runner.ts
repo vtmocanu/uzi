@@ -84,6 +84,7 @@ import type { LeftReason, RunProcessReap } from "./run-procs.js";
 import {
   LiveAttemptRegistry,
   describeProcesses,
+  describeRootContext,
   mintAttemptId,
   newRunAttempt,
   quiesceRunAttempt,
@@ -130,7 +131,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
+import { RecoveryCoordinator, canonicalJson, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, inventoryProcessDiagnostic, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type DurableCompletionRetirement, type HandoffRetirement, type RetainedBoundaryReason, type RecoveryRecord, type RecoveryCoordinatorOptions, type OperatorRequestSignals, type DescribeLocalRecordsResult, type ResolveLocalRecordResult } from "./recovery.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
@@ -3780,6 +3781,22 @@ export class RunRunner {
   private authorityWait(flight: RunFlight, boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait {
     const budget = MaintenanceBudget.current()?.remainingMs() ?? Infinity;
     return { signal: this.retainedLifecycleSignal(flight), timeoutMs: Math.max(1, Math.min(boundaryMs, budget)) };
+  }
+
+  /** The wait for A of a non-held capture taken while the run is parked for a disk stop (issue #3916).
+   *  The disk stop aborts the run's own lifecycle with its PauseNowSignal and never rearms it, so the
+   *  park capture must not wait on that signal (authorityWait would reject at once). A real cancel, a
+   *  claim fence, a receipt failure and shutdown still abort terminalLifecycleSignal / shutdownSignal.
+   *  As a wait it bounds acquisition of A only (the fetch-back transport runs without A); the capture
+   *  body also uses its signal for the remediation bootstrap and the checkpoint publish, which it can
+   *  abort. Undefined outside disk mode. */
+  private diskParkCaptureWait(flight: RunFlight, boundaryMs: number = this.codexBoundaryDeadlineMs): AuthorityWait | undefined {
+    if (flight.steering.getPauseMode() !== "disk") return undefined;
+    const budget = MaintenanceBudget.current()?.remainingMs() ?? Infinity;
+    return {
+      signal: AbortSignal.any([flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal]),
+      timeoutMs: Math.max(1, Math.min(boundaryMs, budget)),
+    };
   }
 
   /** The wait for A at an authorized cancellation/park cleanup: shutdown and the current independent
@@ -8004,6 +8021,19 @@ export class RunRunner {
     if (flight.cancel.signal.aborted) throw flight.cancel.signal.reason;
   }
 
+  /** The mid-run disk park's final-proof interruption check (issue #3916). The park already ends the
+   *  flight, so an owner pause or wall park stays pending server-side for the resume and the disk stop's
+   *  own PauseNowSignal is not an interruption. A claim fence throws StaleClaimError; a shutdown or a
+   *  cancel returns true so the capture loop's top routes it (retained posture / cancel report). */
+  private midRunDiskProofStopped(flight: RunFlight): boolean {
+    if (flight.steering.claimFence() !== undefined) {
+      flight.preserveRecoveryClone = false;
+      flight.preserveSession = false;
+      throw new StaleClaimError();
+    }
+    return !!(flight.active?.shuttingDown || flight.steering.isCancelled());
+  }
+
   private async deferTerminalExecutionForDisk(
     err: unknown, claim: ClaimResponse, flight: RunFlight,
   ): Promise<boolean> {
@@ -8056,7 +8086,7 @@ export class RunRunner {
   /** An empty supervised sink proves Codex drain even when recovery custody is disabled.
    * Claude/stub require an affirmative Linux process proof. No git mutation runs here. */
   private async terminalDiskQuiescence(flight: RunFlight,
-    held?: HeldAuthenticatedCapture | HeldFreeCapture): Promise<boolean> {
+    held?: HeldAuthenticatedCapture | HeldFreeCapture, midRunDiskPark = false): Promise<boolean> {
     try {
       if (held) {
         if ("permit" in held) this.assertHeldAuthenticatedCapture(flight, held);
@@ -8074,6 +8104,14 @@ export class RunRunner {
       return !proof.blocked && (flight.executor.safety && !flight.predecessorCapture
         ? true : process.platform === "linux" && proof.outcome.process?.state === "quiescent");
     } catch (error) {
+      if (midRunDiskPark) {
+        // Unproven: the proof loop's mid-run check routes a shutdown or cancel. A fence throws; so does a
+        // held capture's canonical interruption (its expired scope, aborted signal or refusal among them),
+        // which goes to the held region. Unlike the terminal arm, the disk stop's PauseNowSignal never does.
+        this.midRunDiskProofStopped(flight);
+        if (held && !(error instanceof PauseNowSignal) && canonicalRecoveryInterruption(error)) throw error;
+        return false;
+      }
       this.terminalDiskInterruption(flight);
       if (canonicalRecoveryInterruption(error)) throw error;
       return false;
@@ -9779,6 +9817,26 @@ export class RunRunner {
         run_id: runId,
       });
     };
+    // #3944: the one orphan-guard probe shared by the three report-only sites below. It also
+    // proves a publish whose ack was lost (the attempted tip), and for an ISSUE run only lets
+    // hasCommittedCheckpoint discount a provably work-bearing but stale LOCAL mirror when origin
+    // answers that the checkpoint ref is gone (the claim fetch never prunes the mirror).
+    const hasPublishedCheckpoint = (): Promise<boolean> =>
+      this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
+        landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
+        flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch),
+        {
+          attemptedTip: flight.lastAttemptedCheckpointRefTip,
+          ...(resolveRunKind(claim.kind) === "issue"
+            ? {
+              originProbe: {
+                pat: claim.secrets.forge_pat,
+                repoUrl: claim.repo.clone_url,
+                username: claim.secrets.forge_username,
+              },
+            }
+            : {}),
+        });
     if (result.reportOnly) {
       // #299/#2967: report-only opens no MR to supersede a published checkpoint.
       // Check the prior/cross-worker mirrored ref AND this worker's exact confirmed
@@ -9786,10 +9844,7 @@ export class RunRunner {
       // carries no content; retained commits with differing trees still block.
       // Missing evidence for a confirmed publication blocks. The prior-worker
       // marker-only park exception remains in hasCommittedCheckpoint.
-      const publishedCheckpoint =
-        await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
-          landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
-          flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch));
+      const publishedCheckpoint = await hasPublishedCheckpoint();
       if (publishedCheckpoint) {
         if (resolveRunKind(claim.kind) !== "issue") {
           await failReportOnlyOrphan();
@@ -10107,10 +10162,7 @@ export class RunRunner {
         // which (PRD #759) ignores a marker-only `wip(park):` checkpoint while a real
         // committed milestone still blocks.
         if (result.scopeCapped) {
-          const publishedCheckpoint =
-            await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
-              landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
-              flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch));
+          const publishedCheckpoint = await hasPublishedCheckpoint();
           if (!publishedCheckpoint) {
             // Bind a zero slice to its committed base in the runner-owned clone, without pushing.
             let cappedHead: string | undefined;
@@ -10189,10 +10241,7 @@ export class RunRunner {
         // mirrored and exact confirmed-published tips. Only positively proven
         // published-boundary coverage (or the existing mirrored park-marker exception)
         // carries no committed content; unknown confirmed publication still blocks.
-        const publishedCheckpoint =
-          await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
-            landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined,
-            flight.checkpointCoordinates?.checkpoint_key ?? (flight.runKind === "task" ? null : runnerClone.branch));
+        const publishedCheckpoint = await hasPublishedCheckpoint();
         if (publishedCheckpoint) {
           batcher.emit({
             kind: "status",
@@ -13266,6 +13315,7 @@ export class RunRunner {
           flight.runLog.warn("attempt seed: unattributable unreadable runner-uid process(es); seeding the fresh path, no retention deletion this seed", {
             site: "attempt_seed",
             processes: describeProcesses(proof.outcome.process),
+            root_context: describeRootContext(proof.outcome.process),
           });
           return;
         }
@@ -13439,6 +13489,7 @@ export class RunRunner {
       state: verdict.state,
       detail: sanitizeForLog(verdict.detail),
       processes: describeProcesses(verdict),
+      root_context: describeRootContext(verdict),
     });
     throw new RunResidueBlockedError(verdict.detail, { preClone: "worker_wide" });
   }
@@ -16785,6 +16836,19 @@ export class RunRunner {
   }
 
 
+  /** issue #3885 — the retained-source channel's local-records port: read-only classification of a
+   *  run's guarded local recovery records (cases A1 and A2). Delegates to the recovery coordinator, which owns all of it. */
+  describeLocalRecords(runId: string, opts: OperatorRequestSignals): Promise<DescribeLocalRecordsResult> {
+    return this.recovery.describeLocalRecords(runId, opts);
+  }
+
+  /** issue #3885 — the retained-source channel's resolve-local-record port: operator resolution of one guarded
+   *  local record generation (case A1 cleanup, or case A2 replay of the saved FINAL then cleanup). */
+  resolveLocalRecord(input: OperatorRequestSignals & { runId: string; generation: number; confirm: string }):
+    Promise<ResolveLocalRecordResult> {
+    return this.recovery.resolveLocalRecord(input);
+  }
+
   /**
    * PRD #218 M1 — trigger the graceful worker shutdown. SYNCHRONOUS and does NO git:
    * it only flips the global flag (so a run claimed during the drain aborts on
@@ -17147,6 +17211,7 @@ export class RunRunner {
           state: outcome.process?.state,
           detail: sanitizeForLog(outcome.process?.detail ?? ""),
           processes: describeProcesses(outcome.process),
+          root_context: describeRootContext(outcome.process),
         });
       } else if (outcome.process && outcome.process.killed.length > 0) {
         flight.runLog.info("run quiescence reaped residual processes", {
@@ -21135,15 +21200,24 @@ export class RunRunner {
 
   /**
    * #1197, verified 2026-09-08: keep the execution and steering poller active
-   * while retrying local capture, and report a promotable recovery_wait ONLY
-   * after current HEAD is verified in the worker-owned tracking ref. A failed
-   * park report is retried too: live worker heartbeats preclude stale requeue.
+   * while retrying local capture, and report a promotable recovery_wait after
+   * current HEAD is verified in the worker-owned tracking ref (the disk arm below
+   * is the one exception). A failed park report is retried too: live worker
+   * heartbeats preclude stale requeue.
    *
    * issue #1783 M3: the capture retry is BOUNDED for noncredential causes, including transient and disk parks. A capture skipped because its
    * quiescence proof blocked does not clear by waiting, so after
    * RECOVERY_CAPTURE_BLOCKED_ATTEMPTS consecutive blocked proofs the run fails with fail_origin
-   * `worker_residue_blocked` (the clone and session kept). Other unverified captures (a failed WIP
-   * commit, fetch-back or verify) still retry until an exit below.
+   * `worker_residue_blocked` (the clone and session kept). Outside a disk park, other unverified
+   * captures (a failed WIP commit, fetch-back or verify) still retry until an exit below.
+   *
+   * Issue #3916: a disk-cause park (terminal-disk, counted or preventive, not credential-deferred)
+   * also bounds those: after COMPLETION_HOLD_CAPTURE_ATTEMPTS nonblocked unverified captures it runs
+   * a separate, bounded quiescence proof that performs no capture or git mutation. An unproven proof
+   * fails with `worker_residue_blocked`, custody kept; a mid-run shutdown or cancel returns to the
+   * loop top. A proven proof parks degraded: the original clone, journal and session stay on this
+   * worker as local retention only, never reported as verified, published or the latest checkpoint,
+   * and captures do not restart after it.
    *
    * The worker-owned clone journal fences destructive reseeding after restart.
    * Shutdown retains an unverified clone and its session; cancellation and a
@@ -21512,6 +21586,11 @@ export class RunRunner {
       return false;
     };
     let propagating = false;
+    // Issue #3916: any disk-cause park (terminal-disk, counted or preventive) keeps its custody and bounds
+    // its unverified captures; a credential deferral that arrives mid-loop leaves the bound.
+    const diskPark = opts.terminalDisk === true || disk !== undefined;
+    const midRunDisk = !opts.terminalDisk && disk !== undefined;
+    const diskBounded = (): boolean => !credentialDeferred && diskPark;
     try {
       for (;;) {
         if (opts.terminalDisk) this.terminalDiskInterruption(flight);
@@ -21758,7 +21837,7 @@ export class RunRunner {
               // its own boundary. Neither step acquires a credential-free capture callback.
               const settlement = await this.settleForCredentialCapture(executor, undefined, "capture", "authenticated");
               if (settlement.kind !== "observed_empty") {
-                if (!opts.terminalDisk) {
+                if (!opts.terminalDisk && !diskBounded()) {
                   runLog.warn("credential recovery park: the execution did not settle; retaining work and retrying", {
                     run_id: flight.runId,
                     errors: settlement.errors.map((e) => e.category),
@@ -21810,10 +21889,11 @@ export class RunRunner {
             });
           }
           blockedCaptures = blockedDetail === undefined ? 0 : blockedCaptures + 1;
-          if (opts.terminalDisk) {
-            this.terminalDiskInterruption(flight);
-            if (!capture && blockedDetail === undefined) unverifiedCaptures++;
-          }
+          if (opts.terminalDisk) this.terminalDiskInterruption(flight);
+          // Issue #3916: a mid-run disk park (counted or preventive) bounds its unverified captures like the
+          // terminal-disk one. Its proof loop uses midRunDiskProofStopped, never terminalDiskInterruption:
+          // the disk stop's own PauseNowSignal and any pending owner pause are not interruptions of the park.
+          if ((opts.terminalDisk || diskBounded()) && !capture && blockedDetail === undefined) unverifiedCaptures++;
           // Cancellation/shutdown may have arrived during local git or publish. Either takes
           // precedence over the blocked bound below: the loop's top routes a shutdown to the
           // retained posture and a cancel to the cancel report, never to worker_residue_blocked.
@@ -21827,7 +21907,7 @@ export class RunRunner {
             // the retained posture.
             flight.preserveRecoveryClone = true;
             flight.preserveSession = true;
-            await failCapture(quarantinedCapture, { keepCustody: credentialDeferred || opts.terminalDisk });
+            await failCapture(quarantinedCapture, { keepCustody: credentialDeferred || diskPark });
             return false;
           }
           if (!credentialDeferred && blockedDetail !== undefined && blockedCaptures >= RECOVERY_CAPTURE_BLOCKED_ATTEMPTS) {
@@ -21846,21 +21926,29 @@ export class RunRunner {
               attempts: blockedCaptures,
               detail: sanitizeForLog(blockedDetail),
             });
-            await failCapture(new RunResidueBlockedError(blockedDetail), { keepCustody: credentialDeferred || opts.terminalDisk });
+            await failCapture(new RunResidueBlockedError(blockedDetail), { keepCustody: credentialDeferred || diskPark });
             return false;
           }
-          if (!credentialDeferred && opts.terminalDisk && !capture && unverifiedCaptures >= COMPLETION_HOLD_CAPTURE_ATTEMPTS) {
+          if (diskBounded() && !capture && unverifiedCaptures >= COMPLETION_HOLD_CAPTURE_ATTEMPTS) {
             // Captures never restart after this disposition, including lost/statusless park ACKs.
             // Up to four blocked calls can precede each of three nonblocked failures (15 total).
             // Final proof is separately bounded to five calls and performs no capture/git mutation.
             let quiescent = false;
+            let proofStopped = false;
+            const proofInterrupted = (): boolean => {
+              if (midRunDisk) return this.midRunDiskProofStopped(flight);
+              this.terminalDiskInterruption(flight);
+              return false;
+            };
             for (let proof = 0; proof < RECOVERY_CAPTURE_BLOCKED_ATTEMPTS; proof++) {
-              this.terminalDiskInterruption(flight);
-              quiescent = await this.terminalDiskQuiescence(flight, opts.heldAuthenticated ?? opts.heldCapture);
-              this.terminalDiskInterruption(flight);
+              if ((proofStopped = proofInterrupted())) break;
+              quiescent = await this.terminalDiskQuiescence(flight, opts.heldAuthenticated ?? opts.heldCapture, midRunDisk);
+              if ((proofStopped = proofInterrupted())) break;
               if (quiescent) break;
               if (proof + 1 < RECOVERY_CAPTURE_BLOCKED_ATTEMPTS) await retryWait();
             }
+            // Shutdown or cancel (mid-run arm only): the loop top routes it, never another capture.
+            if (proofStopped) continue;
             if (!quiescent) {
               await failCapture(
                 new RunResidueBlockedError("terminal disk capture: final quiescence unproven"), { keepCustody: true });
@@ -22931,7 +23019,9 @@ export class RunRunner {
     }
     const captureDeadline = Math.min(opts.episode?.deadlineAt ?? Infinity,
       opts.heldCapture?.deadlineAt ?? Infinity, opts.heldAuthenticated?.deadlineAt ?? Infinity);
-    await this.bootstrapRemediationRestrictions(flight, undefined, undefined, opts.signal, captureDeadline);
+    const diskWait = (opts.heldCapture ?? opts.heldAuthenticated) ? undefined : this.diskParkCaptureWait(flight);
+    const bodySignal = opts.signal ?? diskWait?.signal;
+    await this.bootstrapRemediationRestrictions(flight, undefined, undefined, bodySignal, captureDeadline);
     // issue #1783 (auditor M2): prove the clone quiescent BEFORE the capture (its wip marker, the
     // fetch-back and the credentialed overlay + publish). On survivors/unverified NOTHING runs:
     // the result is unverified and `residueBlocked`, which each caller treats as its
@@ -22995,7 +23085,7 @@ export class RunRunner {
       await opts.beforeMutation?.();
       const held = opts.heldCapture ?? opts.heldAuthenticated;
       await this.fetchTracking(flight, barePath, worktreePath, branch, {}, undefined,
-        held ? { signal: held.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, held.deadlineAt - Date.now())) } : undefined);
+        held ? { signal: held.signal, timeoutMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, held.deadlineAt - Date.now())) } : diskWait);
       await opts.beforeMutation?.();
     } catch (e) {
       if (opts.beforeMutation) throw e;
@@ -23069,14 +23159,14 @@ export class RunRunner {
     // the publish: a terminal run is never resumed from a checkpoint.
     if (opts.credentialFree) {
       if (opts.publish === false) return { verified, published: false, capturedHead };
-      const freePublished = await this.publishCheckpointBestEffort(flight, barePath, branch, undefined, opts.signal);
+      const freePublished = await this.publishCheckpointBestEffort(flight, barePath, branch, undefined, bodySignal);
       return { verified, published: freePublished, capturedHead };
     }
     let published = false;
     try {
       const publish = async (permit?: BoundaryPermit) => {
         const overlay = await this.buildCheckpointOverlay(claim, flight, barePath);
-        published = await this.publishCheckpointBestEffort(flight, barePath, branch, overlay, opts.signal ?? permit?.signal);
+        published = await this.publishCheckpointBestEffort(flight, barePath, branch, overlay, bodySignal ?? permit?.signal);
       };
       if (opts.heldAuthenticated) {
         this.assertHeldAuthenticatedCapture(flight, opts.heldAuthenticated);
@@ -24357,12 +24447,14 @@ export class RunRunner {
       memory_episode: memory.claim.memory_episode!, memory_policy: memory.claim.memory_policy!,
       memory_intervention_count: memory.spent, flight, lifecycleRevision: ++memory.lifecycleRevision,
     }, {
-      prepareFeedback: (captured, result) => {
+      prepareFeedback: (captured, result, diagnostics) => {
         if (captured.flight !== flight || result.claim_generation !== flight.claimGeneration) return;
         if (memory.feedback.has(result.intervention_id)) return;
         memory.feedback.set(result.intervention_id, { context: captured, result });
+        // Diagnostics ride the status feed only; the stored/model-visible result is unchanged.
         if (!flight.owedFeedClosed) flight.batcher.emit({ kind: "status", payload: {
           event: "worker_memory_pressure", ...result,
+          ...(diagnostics !== undefined ? { memory_diagnostics: diagnostics } : {}),
         } });
         else this.retainWorkerMemoryCustody(flight);
       },

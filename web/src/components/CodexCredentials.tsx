@@ -12,7 +12,7 @@ import { CredentialStorageHint } from "./VaultSettings";
 // saving — rotation is a re-paste (a "Replace value" form, not an edit-in-place).
 //
 // Issue #3719 added the Codex auto-selection pool: an account-mode picker ("use the
-// default" or "pick by headroom", chosen at run CREATION, not by a worker) and a per-login
+// default" or "pick from pool", chosen at run CREATION, not by a worker) and a per-login
 // pool checkbox on codex_auth rows only (an API key has no limit windows to rank on).
 //
 // What this card deliberately does NOT carry (no Codex analog — see PRD #1147): the
@@ -243,8 +243,8 @@ const MODE_OPTIONS: { value: CodexAccountMode; title: string; body: string }[] =
   },
   {
     value: "auto",
-    title: "Pick by headroom",
-    body: "When a run is created, uzi picks the pooled login with the most limit headroom.",
+    title: "Pick from pool",
+    body: "When a run is created, uzi picks a pooled login that still has limit headroom to spare.",
   },
 ];
 
@@ -301,7 +301,7 @@ function poolSummary(
   if (pooled > 0) {
     return {
       tone: "muted",
-      text: `${pooled === 1 ? "1 login is" : `${pooled} logins are`} in the pool. The pool is used only when uzi picks by headroom.`,
+      text: `${pooled === 1 ? "1 login is" : `${pooled} logins are`} in the pool. The pool is used only when "Pick from pool" is selected.`,
     };
   }
   return null;
@@ -958,7 +958,7 @@ export function CodexCredentials({
       onAccountModeChange?.(saved);
       onNotice(
         saved === "auto"
-          ? "New Codex runs now pick the pooled login with the most limit headroom."
+          ? "New Codex runs now pick a login from your pool."
           : "New Codex runs now use your default Codex credential.",
       );
     } catch (err) {

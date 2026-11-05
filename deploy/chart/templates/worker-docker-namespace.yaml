@@ -70,7 +70,7 @@ metadata:
   daemon's image/build cache, which since issue #224 M-a is a THIRD PVC per worker
   rather than an emptyDir — so this tier is budgeted separately from the restricted
   default's. Sized for the 10 workers `count/deployments.apps` advertises:
-  10 x (50Gi data + 20Gi nix + 20Gi dind) = 900Gi across 30 claims. CPU and memory
+  10 x (50Gi data + 20Gi nix + 50Gi dind) = 1200Gi across 30 claims. CPU and memory
   are budgeted on `l`; `l-highmem` is not fleet-budgeted and consumes more of the
   shared budget.
 

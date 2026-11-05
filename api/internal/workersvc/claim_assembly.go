@@ -928,7 +928,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			ForgePAT:            string(botPAT),
 			AnthropicOAuthToken: string(anthropic),
 		},
-		Agents:        agentsFromTemplates(templates, skills.perTemplate),
+		Agents:        agentsFromTemplates(templates, skills.perTemplate, run.Harness),
 		Skills:        skills.union,
 		SkillsDropped: skills.dropped,
 		Config: ClaimConfig{

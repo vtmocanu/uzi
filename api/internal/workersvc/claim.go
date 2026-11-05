@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -807,7 +808,7 @@ type CompletionScopeAccepted struct {
 // the jsonb tools allowlist (NULL/empty ⇒ inherit-all ⇒ nil) and attaching each
 // template's surviving skill names from perTemplateSkills (nil ⇒ empty list, so
 // the JSON carries `skills: []`, never null).
-func agentsFromTemplates(rows []store.AgentTemplate, perTemplateSkills map[string][]string) []ClaimAgent {
+func agentsFromTemplates(rows []store.AgentTemplate, perTemplateSkills map[string][]string, harness string) []ClaimAgent {
 	out := make([]ClaimAgent, 0, len(rows))
 	for _, t := range rows {
 		skills := perTemplateSkills[t.Name]
@@ -821,8 +822,14 @@ func agentsFromTemplates(rows []store.AgentTemplate, perTemplateSkills map[strin
 			Tools:       decodeTools(t.Tools),
 			Skills:      skills,
 		}
+		claudePin, codexPin := "", ""
 		if t.Model.Valid {
-			m := t.Model.String
+			claudePin = t.Model.String
+		}
+		if t.CodexModel.Valid {
+			codexPin = t.CodexModel.String
+		}
+		if m := agenttmpl.PinForHarness(harness, claudePin, codexPin); m != "" {
 			a.Model = &m
 		}
 		out = append(out, a)

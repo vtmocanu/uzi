@@ -67,6 +67,7 @@ type agentTemplateDTO struct {
 	Name        string   `json:"name"`
 	Description string   `json:"description"`
 	Model       *string  `json:"model"`
+	CodexModel  *string  `json:"codex_model"`
 	Tools       []string `json:"tools"`
 	PromptBody  string   `json:"prompt_body"`
 	IsBuiltin   bool     `json:"is_builtin"`
@@ -109,6 +110,9 @@ func templateDTO(t store.AgentTemplate) agentTemplateDTO {
 	if t.Model.Valid {
 		dto.Model = &t.Model.String
 	}
+	if t.CodexModel.Valid {
+		dto.CodexModel = &t.CodexModel.String
+	}
 	if t.UserID.Valid {
 		u := uuid.UUID(t.UserID.Bytes).String()
 		dto.UserID = &u
@@ -150,6 +154,9 @@ func templateToDefinition(t store.AgentTemplate) agenttmpl.Definition {
 	if t.Model.Valid {
 		d.Model = t.Model.String
 	}
+	if t.CodexModel.Valid {
+		d.CodexModel = t.CodexModel.String
+	}
 	return d
 }
 
@@ -166,6 +173,9 @@ func fieldsToDefinition(name string, f validatedFields) agenttmpl.Definition {
 	}
 	if f.model.Valid {
 		d.Model = f.model.String
+	}
+	if f.codexModel.Valid {
+		d.CodexModel = f.codexModel.String
 	}
 	return d
 }
@@ -239,6 +249,7 @@ type builtinDefinitionDTO struct {
 	Name        string   `json:"name"`
 	Description string   `json:"description"`
 	Model       *string  `json:"model"`
+	CodexModel  *string  `json:"codex_model"`
 	Tools       []string `json:"tools"`
 	PromptBody  string   `json:"prompt_body"`
 }
@@ -253,6 +264,10 @@ func builtinDefinitionView(def agenttmpl.Definition) builtinDefinitionDTO {
 	if def.Model != "" {
 		m := def.Model
 		dto.Model = &m
+	}
+	if def.CodexModel != "" {
+		m := def.CodexModel
+		dto.CodexModel = &m
 	}
 	return dto
 }
@@ -309,12 +324,13 @@ func writeBuiltinDefinition(w http.ResponseWriter, actor store.User, t store.Age
 // on create (both immutable afterwards); is_builtin, user_id and timestamps are
 // server-controlled and never accepted from the client.
 type templateWriteRequest struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Model       *string  `json:"model"`
-	Tools       []string `json:"tools"`
-	PromptBody  string   `json:"prompt_body"`
-	Scope       string   `json:"scope"`
+	Name        string              `json:"name"`
+	Description string              `json:"description"`
+	Model       *string             `json:"model"`
+	CodexModel  optionalTemplatePin `json:"codex_model"`
+	Tools       []string            `json:"tools"`
+	PromptBody  string              `json:"prompt_body"`
+	Scope       string              `json:"scope"`
 }
 
 // authorizeTemplateWrite decides whether actor may edit/delete t and, if not,
@@ -475,6 +491,7 @@ func (h *Handler) CreateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		Name:        name,
 		Description: fields.description,
 		Model:       fields.model,
+		CodexModel:  fields.codexModel,
 		Tools:       fields.tools,
 		PromptBody:  fields.promptBody,
 		Scope:       scope,
@@ -512,16 +529,43 @@ func (h *Handler) CreateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 // immutable and ignored if present. Authorization is scope-based (see
 // authorizeTemplateWrite): builtin/global admin-only, user owner-only.
 func (h *Handler) UpdateAgentTemplate(w http.ResponseWriter, r *http.Request) {
-	actor, t, ok := h.loadTemplateForWrite(w, r)
+	actor, ok := mw.UserFromContext(r.Context())
 	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, ok := httpx.PathUUID(w, r, "id", "template")
+	if !ok {
+		return
+	}
+	// Read the bounded body before acquiring a connection, but reveal decode
+	// errors only after the locked row lookup and write authorization.
+	var req templateWriteRequest
+	decodeErr := httpx.DecodeJSON(r, &req)
+	ctx := r.Context()
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		slog.Error("begin update template tx", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
+	qtx := h.q.WithTx(tx)
+	t, err := qtx.GetAgentTemplateForUpdate(ctx, id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "template not found")
+			return
+		}
+		slog.Error("lock agent template", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if status, ok := authorizeTemplateWrite(actor, t); !ok {
 		httpx.Error(w, status, templateWriteDenyMessage(status))
 		return
 	}
-	var req templateWriteRequest
-	if err := httpx.DecodeJSON(r, &req); err != nil {
+	if decodeErr != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -531,10 +575,13 @@ func (h *Handler) UpdateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	row, err := h.q.UpdateAgentTemplate(r.Context(), store.UpdateAgentTemplateParams{
+	fields = mergeOmittedTemplatePins(req, fields, t)
+
+	row, err := qtx.UpdateAgentTemplate(ctx, store.UpdateAgentTemplateParams{
 		ID:          t.ID,
 		Description: fields.description,
 		Model:       fields.model,
+		CodexModel:  fields.codexModel,
 		Tools:       fields.tools,
 		PromptBody:  fields.promptBody,
 		UpdatedBy:   pgconv.UUID(actor.ID),
@@ -542,6 +589,11 @@ func (h *Handler) UpdateAgentTemplate(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Error("update agent template", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		slog.Error("commit update template tx", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
@@ -611,6 +663,7 @@ func (h *Handler) ResetAgentTemplate(w http.ResponseWriter, r *http.Request) {
 		ID:          t.ID,
 		Description: def.Description,
 		Model:       model,
+		CodexModel:  pgtype.Text{String: def.CodexModel, Valid: def.CodexModel != ""},
 		Tools:       tools,
 		PromptBody:  def.PromptBody,
 		UpdatedBy:   pgconv.UUID(actor.ID),
@@ -689,6 +742,7 @@ func (h *Handler) loadTemplateForWrite(w http.ResponseWriter, r *http.Request) (
 type validatedFields struct {
 	description string
 	model       pgtype.Text
+	codexModel  pgtype.Text
 	tools       []byte
 	promptBody  string
 }
@@ -730,11 +784,15 @@ func validateTemplateFields(req templateWriteRequest) (validatedFields, error) {
 		return f, errors.New("prompt body must not be empty")
 	}
 
-	model, err := validateModel(req.Model)
+	model, err := validateTemplatePin("claude", "model", req.Model)
 	if err != nil {
 		return f, err
 	}
 	f.model = model
+	f.codexModel, err = validateTemplatePin("codex", "codex_model", req.CodexModel.Value)
+	if err != nil {
+		return f, err
+	}
 
 	// An empty (or absent) tools list normalizes to NULL = inherit all, so a
 	// direct-API empty array does not persist a `[]` that renders as inherit-all
@@ -765,8 +823,8 @@ func validateTemplateFields(req templateWriteRequest) (validatedFields, error) {
 }
 
 // validateModel is the thin HTTP-facing wrapper over agenttmpl.ValidateModel
-// (the single source of the Decision 4 rules), shared by the template write path
-// (validateTemplateFields) and the per-user default-model endpoint. It maps the
+// (the single source of the Decision 4 rules), used by the per-user
+// default-model endpoint. Templates use validateTemplatePin instead. It maps the
 // neutral (string, error) core onto the storage type: a nil pointer or a blank
 // value becomes NULL (inherit); a valid value becomes a set pgtype.Text.
 func validateModel(raw *string) (pgtype.Text, error) {

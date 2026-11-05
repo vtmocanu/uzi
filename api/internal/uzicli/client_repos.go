@@ -23,9 +23,18 @@ import (
 // It wraps the *ExitError (ExitConflict) via Unwrap so ExitCodeFor still resolves exit 5
 // for a caller that returns it straight to main, while errors.As reaches BOTH this type
 // (to read Holds) and the underlying *ExitError.
+//
+// BlockingHolds is the server's CAPPED listing of the holds that block the delete (always
+// non-nil, possibly empty); BlockingHoldsTotal is the authoritative count and can exceed
+// len(BlockingHolds). An older server omits the listing: BlockingHolds is then empty and
+// BlockingHoldsTotal falls back to Holds.
 type WorkerCustodyConflictError struct {
 	// Holds is the number of open custody holds the delete would have destroyed.
 	Holds int64
+	// BlockingHolds names the blocking holds (capped by the server; never nil).
+	BlockingHolds []WorkerBlockingHold
+	// BlockingHoldsTotal is the real number of blocking holds.
+	BlockingHoldsTotal int64
 	// Err is the shared 409 → ExitConflict error, whose message is the server's
 	// {"error": "..."} body verbatim.
 	Err *ExitError
@@ -33,6 +42,17 @@ type WorkerCustodyConflictError struct {
 
 func (e *WorkerCustodyConflictError) Error() string { return e.Err.Error() }
 func (e *WorkerCustodyConflictError) Unwrap() error { return e.Err }
+
+// WorkerBlockingHold is one open custody hold blocking a worker delete, as the server
+// names it in the custody 409. HoldID and RunID are the full ids that
+// `uzi run discard <run-id> --hold <hold-id>` needs; Title may be empty.
+type WorkerBlockingHold struct {
+	HoldID     string `json:"hold_id"`
+	RunID      string `json:"run_id"`
+	Generation int64  `json:"generation"`
+	Kind       string `json:"kind"`
+	Title      string `json:"title"`
+}
 
 // WorkerActiveRun is one run blocking a worker delete, as the server names it in the
 // active-runs 409 (#3390). IssueIID is nil for runs without an issue (chats).
@@ -114,9 +134,12 @@ func (c *HTTPClient) DeleteWorker(ctx context.Context, id string) error {
 	// server) falls through to the shared statusError → ExitConflict path unchanged.
 	if resp.StatusCode == http.StatusConflict {
 		if holds, ok := custodyHoldsFromBody(body); ok {
+			list, total := blockingHoldsFromBody(body, holds)
 			return &WorkerCustodyConflictError{
-				Holds: holds,
-				Err:   statusError(resp.StatusCode, body, resp.Header.Get("Retry-After")),
+				Holds:              holds,
+				BlockingHolds:      list,
+				BlockingHoldsTotal: total,
+				Err:                statusError(resp.StatusCode, body, resp.Header.Get("Retry-After")),
 			}
 		}
 		if runs, total, ok := activeRunsFromBody(body); ok {
@@ -142,6 +165,27 @@ func custodyHoldsFromBody(body []byte) (int64, bool) {
 		return 0, false
 	}
 	return *b.CustodyHolds, true
+}
+
+// blockingHoldsFromBody reads the `blocking_holds` listing and `blocking_holds_total`
+// from a custody-refusal body. The list is always non-nil; the total falls back to the
+// custody_holds count when the server omits it (an older server, or a list without a total).
+func blockingHoldsFromBody(body []byte, holds int64) ([]WorkerBlockingHold, int64) {
+	var b struct {
+		BlockingHolds []WorkerBlockingHold `json:"blocking_holds"`
+		Total         *int64               `json:"blocking_holds_total"`
+	}
+	if json.Unmarshal(body, &b) != nil {
+		return []WorkerBlockingHold{}, holds
+	}
+	list := b.BlockingHolds
+	if list == nil {
+		list = []WorkerBlockingHold{}
+	}
+	if b.Total == nil {
+		return list, holds
+	}
+	return list, *b.Total
 }
 
 // activeRunsFromBody reads the `active_runs` listing and `active_runs_total` from a

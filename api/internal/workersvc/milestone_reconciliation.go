@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -176,28 +177,83 @@ func ResetStateDigest(r store.Run) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// reconciliationSnapshot keeps JSONB definitions readable in the owner audit.
+// reconciliationSnapshotView is the fixed key set of a before/after audit
+// snapshot; no field is omitempty, so every key is always present (session_id
+// is read by reconciledClaimSession and must exist even when null).
+type reconciliationSnapshotView struct {
+	MilestonesFrozen     json.RawMessage `json:"milestones_frozen"`
+	MilestonesCandidate  json.RawMessage `json:"milestones_candidate"`
+	MilestonesCompleted  json.RawMessage `json:"milestones_completed"`
+	MilestonesInProgress json.RawMessage `json:"milestones_in_progress"`
+	MilestonesAgents     json.RawMessage `json:"milestones_agents"`
+	CompletionContract   json.RawMessage `json:"completion_contract"`
+	AgentExclusions      json.RawMessage `json:"agent_exclusions"`
+
+	ID          uuid.UUID          `json:"id"`
+	Kind        string             `json:"kind"`
+	Status      string             `json:"status"`
+	StatusSince pgtype.Timestamptz `json:"status_since"`
+	PlanSource  string             `json:"plan_source"`
+	SessionID   pgtype.Text        `json:"session_id"`
+
+	GateRevision                int64              `json:"gate_revision"`
+	GatePresentationID          pgtype.UUID        `json:"gate_presentation_id"`
+	GatePayloadDigest           []byte             `json:"gate_payload_digest"`
+	WorkerID                    pgtype.UUID        `json:"worker_id"`
+	ClaimGeneration             int64              `json:"claim_generation"`
+	ClaimReleasedAt             pgtype.Timestamptz `json:"claim_released_at"`
+	ContractRevision            pgtype.Int4        `json:"contract_revision"`
+	CompletionContractVersion   pgtype.Int4        `json:"completion_contract_version"`
+	ReviseCount                 int32              `json:"revise_count"`
+	CheckpointTip               pgtype.Text        `json:"checkpoint_tip"`
+	PauseRequestedAt            pgtype.Timestamptz `json:"pause_requested_at"`
+	CredentialSwitchRequestedAt pgtype.Timestamptz `json:"credential_switch_requested_at"`
+
+	ScopeCeiling         pgtype.Int4        `json:"scope_ceiling"`
+	StopKind             pgtype.Text        `json:"stop_kind"`
+	StopReason           pgtype.Text        `json:"stop_reason"`
+	AgentSource          pgtype.Text        `json:"agent_source"`
+	RequiredCapabilities []string           `json:"required_capabilities"`
+	BudgetPausedSeconds  int32              `json:"budget_paused_seconds"`
+	Health               string             `json:"health"`
+	HealthReason         pgtype.Text        `json:"health_reason"`
+	HealthSince          pgtype.Timestamptz `json:"health_since"`
+	CodexClaimEpoch      int64              `json:"codex_claim_epoch"`
+}
+
+// reconciliationSnapshot is a bounded projection of the reconciliation-relevant
+// run fields, so new runs columns and unrelated large fields (plan and issue
+// text) do not count against reconciliationSnapshotBytes. gate_presented_payload
+// is omitted: it embeds plan_md, is bound by gate_payload_digest, and its
+// milestones equal milestones_candidate. JSONB values are inlined, not base64.
 func reconciliationSnapshot(r store.Run) ([]byte, error) {
-	encoded, err := json.Marshal(r)
-	if err != nil {
-		return nil, err
-	}
-	var snapshot map[string]json.RawMessage
-	if err := json.Unmarshal(encoded, &snapshot); err != nil {
-		return nil, err
-	}
-	for key, raw := range map[string][]byte{
-		"milestones_frozen":      r.MilestonesFrozen,
-		"milestones_candidate":   r.MilestonesCandidate,
-		"milestones_completed":   r.MilestonesCompleted,
-		"milestones_in_progress": r.MilestonesInProgress,
-		"milestones_agents":      r.MilestonesAgents,
-		"completion_contract":    r.CompletionContract,
-		"gate_presented_payload": r.GatePresentedPayload,
-	} {
-		snapshot[key] = json.RawMessage(jsonOrNull(raw))
-	}
-	return json.Marshal(snapshot)
+	raw := func(b []byte) json.RawMessage { return json.RawMessage(jsonOrNull(b)) }
+	return json.Marshal(reconciliationSnapshotView{
+		MilestonesFrozen:     raw(r.MilestonesFrozen),
+		MilestonesCandidate:  raw(r.MilestonesCandidate),
+		MilestonesCompleted:  raw(r.MilestonesCompleted),
+		MilestonesInProgress: raw(r.MilestonesInProgress),
+		MilestonesAgents:     raw(r.MilestonesAgents),
+		CompletionContract:   raw(r.CompletionContract),
+		AgentExclusions:      raw(r.AgentExclusions),
+
+		ID: r.ID, Kind: r.Kind, Status: r.Status, StatusSince: r.StatusSince,
+		PlanSource: r.PlanSource, SessionID: r.SessionID,
+
+		GateRevision: r.GateRevision, GatePresentationID: r.GatePresentationID,
+		GatePayloadDigest: r.GatePayloadDigest, WorkerID: r.WorkerID,
+		ClaimGeneration: r.ClaimGeneration, ClaimReleasedAt: r.ClaimReleasedAt,
+		ContractRevision: r.ContractRevision, CompletionContractVersion: r.CompletionContractVersion,
+		ReviseCount: r.ReviseCount, CheckpointTip: r.CheckpointTip,
+		PauseRequestedAt:            r.PauseRequestedAt,
+		CredentialSwitchRequestedAt: r.CredentialSwitchRequestedAt,
+
+		ScopeCeiling: r.ScopeCeiling, StopKind: r.StopKind, StopReason: r.StopReason,
+		AgentSource: r.AgentSource, RequiredCapabilities: r.RequiredCapabilities,
+		BudgetPausedSeconds: r.BudgetPausedSeconds, Health: r.Health,
+		HealthReason: r.HealthReason, HealthSince: r.HealthSince,
+		CodexClaimEpoch: r.CodexClaimEpoch,
+	})
 }
 
 func jsonOrNull(b []byte) []byte {

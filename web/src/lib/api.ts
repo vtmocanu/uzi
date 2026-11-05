@@ -780,8 +780,8 @@ const realApi = {
       { auto_eligible: autoEligible },
     ),
   // How a new Codex run chooses its login (issue #3719): "default" always binds the default
-  // Codex credential; "auto" picks the pooled login with the most limit headroom at run
-  // creation. Read back through getMySettings().settings.codex_account_mode.
+  // Codex credential; "auto" picks a login from the pool (by the server's auto-select order)
+  // at run creation. Read back through getMySettings().settings.codex_account_mode.
   setCodexAccountMode: (mode: CodexAccountMode) =>
     request<{ codex_account_mode: CodexAccountMode }>("PUT", "/me/codex-account-mode", {
       codex_account_mode: mode,

@@ -56,6 +56,12 @@ type Candidate struct {
 	FiveResetsAt  *time.Time
 	SevenResetsAt *time.Time
 	SyncedAt      *time.Time // NOT NULL in the table, nullable through the LEFT JOIN
+	// WeeklyResetsAt is the reset of the WEEKLY window, used ONLY as the reset_first
+	// ranking key (#3844). headroom_first's tie-break never reads it: it derives the
+	// BINDING-window reset from FiveResetsAt/SevenResetsAt (resetKey), and the Codex
+	// adapter fills both of those with its binding reset, so the weekly key needs a
+	// field of its own. nil means no known weekly reset.
+	WeeklyResetsAt *time.Time
 	// InFlight is the count of runs currently spending this credential. Populated
 	// only by M4's ranking query and used only by the ranker's in-flight bias — it
 	// is deliberately NOT part of the gate, so the settings list may leave it 0
@@ -63,10 +69,31 @@ type Candidate struct {
 	InFlight int
 }
 
+// Order is how Select ranks the eligible set (#3844).
+type Order string
+
+const (
+	// OrderResetFirst picks the soonest WEEKLY reset among eligible tokens, so
+	// weekly allowance that is about to expire unused gets spent first. It is the
+	// default because the weekly window is the one Claude and Codex subscriptions
+	// always report (often the only one), which makes "most headroom" a poor proxy
+	// for "most wasted if left alone".
+	OrderResetFirst Order = "reset_first"
+	// OrderHeadroomFirst is the pre-#3844 ranking (most headroom, then the
+	// reset tie-break within HeadroomTiePct), kept as an escape hatch.
+	OrderHeadroomFirst Order = "headroom_first"
+)
+
 // Policy is the operator-set knobs (D6). They are server env rather than per-user
 // settings so one policy is testable and the UI stays simple; per-user tuning is a
 // future refinement, not a gap.
 type Policy struct {
+	// Order selects the ranking. Any value other than OrderHeadroomFirst, including
+	// the zero value, means OrderResetFirst. Under reset_first, for ReasonAuto picks,
+	// HeadroomTiePct is ignored and InflightPenalty only breaks exact weekly-reset
+	// ties; a best_of_pool pick keeps the headroom ranking (tie band and penalty) under
+	// either order.
+	Order Order
 	// MinHeadroom is the floor, in percentage POINTS, below which a token is not
 	// picked by preference. The gauge is a SMALLINT 0..100, so the unit is points
 	// throughout this package; there are no fractions anywhere.

@@ -209,13 +209,7 @@ func decodeStagedRoles(raw []byte) (defs []agenttmpl.Definition, skipped []Apply
 			})
 			continue
 		}
-		defs = append(defs, agenttmpl.Definition{
-			Name:        role.Name,
-			Description: role.Description,
-			Model:       role.Model,
-			Tools:       role.Tools,
-			PromptBody:  role.PromptBody,
-		})
+		defs = append(defs, role.Definition())
 	}
 	return defs, skipped, nil
 }
@@ -291,12 +285,12 @@ func executeApply(ctx context.Context, q applyQuerier, ops []plannedOp, actor pg
 		out := ApplyOutcome{Name: op.Name, Action: op.Action, Detail: op.Detail}
 		switch op.Action {
 		case ActionOverrideBuiltin:
-			model, tools, err := storeColumns(op.Def)
+			model, codexModel, tools, err := storeColumns(op.Def)
 			if err != nil {
 				return ApplyResult{}, fmt.Errorf("encode %q: %w", op.Name, err)
 			}
 			if _, err := q.ApplySyncedOverrideBuiltin(ctx, store.ApplySyncedOverrideBuiltinParams{
-				Description: op.Def.Description, Model: model, Tools: tools,
+				Description: op.Def.Description, Model: model, CodexModel: codexModel, Tools: tools,
 				PromptBody: op.Def.PromptBody, UpdatedBy: actor, ID: op.Row.ID,
 			}); err != nil {
 				return ApplyResult{}, fmt.Errorf("override builtin %q: %w", op.Name, err)
@@ -304,12 +298,12 @@ func executeApply(ctx context.Context, q applyQuerier, ops []plannedOp, actor pg
 			res.Applied++
 
 		case ActionAddGlobal:
-			model, tools, err := storeColumns(op.Def)
+			model, codexModel, tools, err := storeColumns(op.Def)
 			if err != nil {
 				return ApplyResult{}, fmt.Errorf("encode %q: %w", op.Name, err)
 			}
 			if _, err := q.InsertSyncedGlobalTemplate(ctx, store.InsertSyncedGlobalTemplateParams{
-				Name: op.Def.Name, Description: op.Def.Description, Model: model, Tools: tools,
+				Name: op.Def.Name, Description: op.Def.Description, Model: model, CodexModel: codexModel, Tools: tools,
 				PromptBody: op.Def.PromptBody, UpdatedBy: actor,
 			}); err != nil {
 				return ApplyResult{}, fmt.Errorf("insert global %q: %w", op.Name, err)
@@ -321,12 +315,12 @@ func executeApply(ctx context.Context, q applyQuerier, ops []plannedOp, actor pg
 			res.Applied++
 
 		case ActionUpdateGlobal:
-			model, tools, err := storeColumns(op.Def)
+			model, codexModel, tools, err := storeColumns(op.Def)
 			if err != nil {
 				return ApplyResult{}, fmt.Errorf("encode %q: %w", op.Name, err)
 			}
 			if _, err := q.UpdateSyncedGlobalTemplate(ctx, store.UpdateSyncedGlobalTemplateParams{
-				Description: op.Def.Description, Model: model, Tools: tools,
+				Description: op.Def.Description, Model: model, CodexModel: codexModel, Tools: tools,
 				PromptBody: op.Def.PromptBody, UpdatedBy: actor, Name: op.Def.Name,
 			}); err != nil {
 				return ApplyResult{}, fmt.Errorf("update global %q: %w", op.Name, err)
@@ -350,12 +344,12 @@ func executeApply(ctx context.Context, q applyQuerier, ops []plannedOp, actor pg
 				res.Outcomes = append(res.Outcomes, out)
 				continue
 			}
-			model, tools, err := storeColumns(def)
+			model, codexModel, tools, err := storeColumns(def)
 			if err != nil {
 				return ApplyResult{}, fmt.Errorf("encode embedded %q: %w", op.Name, err)
 			}
 			if _, err := q.ResetBuiltinAgentTemplate(ctx, store.ResetBuiltinAgentTemplateParams{
-				Description: def.Description, Model: model, Tools: tools,
+				Description: def.Description, Model: model, CodexModel: codexModel, Tools: tools,
 				PromptBody: def.PromptBody, UpdatedBy: actor, ID: op.Row.ID,
 			}); err != nil {
 				return ApplyResult{}, fmt.Errorf("reset builtin %q: %w", op.Name, err)
@@ -390,22 +384,26 @@ func (r *Reconciler) recordApplied(ctx context.Context, sha string, actor pgtype
 	r.settings.Invalidate()
 }
 
-// storeColumns converts a synced role's Definition into the model/tools column types
-// on write: Model an empty string → NULL pgtype.Text, and Tools a non-empty slice →
+// storeColumns converts a normalized Definition into both model columns and tools.
+// Empty pins become NULL pgtype.Text, and Tools a non-empty slice →
 // its jsonb encoding (an empty/nil slice → NULL = inherit-all). The agentsource-local
 // twin of the handler's storeColumns (that one is not importable here).
-func storeColumns(def agenttmpl.Definition) (pgtype.Text, []byte, error) {
+func storeColumns(def agenttmpl.Definition) (pgtype.Text, pgtype.Text, []byte, error) {
 	var model pgtype.Text
 	if def.Model != "" {
 		model = pgtype.Text{String: def.Model, Valid: true}
+	}
+	var codexModel pgtype.Text
+	if def.CodexModel != "" {
+		codexModel = pgtype.Text{String: def.CodexModel, Valid: true}
 	}
 	var tools []byte
 	if len(def.Tools) > 0 {
 		b, err := json.Marshal(def.Tools)
 		if err != nil {
-			return pgtype.Text{}, nil, err
+			return pgtype.Text{}, pgtype.Text{}, nil, err
 		}
 		tools = b
 	}
-	return model, tools, nil
+	return model, codexModel, tools, nil
 }

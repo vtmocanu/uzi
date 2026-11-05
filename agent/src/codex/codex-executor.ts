@@ -67,6 +67,7 @@ import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBu
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
 import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
+import { BROWSER_DISCOVERY_ENV } from "../browser-env.js";
 import type { SdkAttemptEnv } from "../sdk-env.js";
 import { goConcurrencyEnv } from "../go-concurrency.js";
 import { randomUUID } from "node:crypto";
@@ -143,7 +144,7 @@ import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
 import { resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
-import { selectSubagentTemplates } from "../agents.js";
+import { ownSubagentTemplates, selectLeadTemplate, selectSubagentTemplates } from "../agents.js";
 import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
 import type { CommandSandboxMode } from "../config.js";
 
@@ -287,7 +288,7 @@ const COMMAND_ENV_PATH = "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:
  *  identity pins these, and sdk-env.ts's PROTECTED_ENV_KEYS deliberately OMITS
  *  PATH/TMPDIR/LANG, so relying on it alone would leave those open) with a MIRROR of that
  *  module-private PROTECTED_ENV_KEYS set (the OAuth credential + the two ANTHROPIC_* keys +
- *  the browser flag), plus Docker endpoint/configuration keys owned by trusted startup wiring.
+ *  the browser flag and the two browser discovery paths), plus Docker endpoint/configuration keys owned by trusted startup wiring.
  *  So a hostile/malformed `toolEnv` can neither breach the command
  *  boundary NOR reintroduce a credential-adjacent key. PATH is additionally handled
  *  specially in {@link buildCommandEnv} (fixed prefix, provisioned value appended). */
@@ -314,6 +315,9 @@ const COMMAND_ENV_PROTECTED_KEYS: ReadonlySet<string> = new Set([
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "AGENT_BROWSER_ARGS",
+  // Issue #3907: the browser discovery keys (sdk-env.ts protects them too; set only by
+  // buildCommandEnv's browserDiscovery flag, never by a provisioned toolEnv).
+  ...Object.keys(BROWSER_DISCOVERY_ENV),
   "UZI_SQLC_DIR",
   // issue #1783: the run-attempt marker and worker spawn mark sdk-env.ts protects too.
   "UZI_RUN_ATTEMPT",
@@ -3593,6 +3597,9 @@ export class CodexExecutor implements Executor {
           this.deps.commandTmpdir ?? "/tmp",
           provisioned.toolEnv,
           this.opts.dockerWiring?.dockerHost,
+          // Issue #3907: every model command runs under `commandSandbox` (makeDefaultSpawnCommand);
+          // only the fileop root is forced to "required" for cross_check, and it runs no browser.
+          commandSandbox === "off",
         ),
         await canonicalCheckoutPath(worktreePath),
       );
@@ -6507,13 +6514,14 @@ export class CodexExecutor implements Executor {
   }
 
   /** PRD #3244: the lead's requested model/effort for a phase, from the one worker resolver. Pure in
-   *  (ctx.config, provider model), so the request built per turn and the row reported at the phase
+   *  (ctx.config, owner roster, provider model), so the request built per turn and the row reported at the phase
    *  entry cannot differ. */
   private leadRequestFor(ctx: RunContext, phase: "plan" | "implement"): LeadRequest {
     return resolveLeadRequest({
       harness: "codex",
       phase,
       config: ctx.config,
+      templateModel: selectLeadTemplate(ctx.agents ?? [])?.model ?? undefined,
       providerDefaultModel: this.opts.provider.model,
     });
   }
@@ -6528,27 +6536,20 @@ export class CodexExecutor implements Executor {
     repoInstructions?: string,
     ownerCompletionRecheck = false,
   ): RunTurnRequest {
-    let leadBody: string | undefined;
+    const leadBody = selectLeadTemplate(ctx.agents ?? [])?.prompt_body;
     const agents: Record<string, HarnessAgent> = {};
     let repoSourced = false;
     if (phase === "plan") {
       // The plan phase is deliberately independent of the selection: it runs before the human
       // approves one, with the owner's roster, exactly as before issue #1718.
-      for (const t of ctx.agents ?? []) {
-        // The lead is the ROOT thread, not a subagent — its body seeds the lead system
-        // prompt; every other template is a delegation target.
-        if (t.name === "lead") {
-          leadBody = t.prompt_body;
-          continue;
-        }
+      for (const t of ownSubagentTemplates(ctx.agents ?? [])) {
         agents[t.name] = toHarnessAgent(t);
       }
     } else {
       if (!selection) throw new TrustedExecutionRefusal("codex implement request built without a resolved agent selection");
       repoSourced = selection.source === "repo";
-      // The lead body is ALWAYS the owner's `lead` template (uzi's builtin) under either source;
-      // a repo file named `lead` is only ever a subagent (selectSubagentTemplates).
-      leadBody = (ctx.agents ?? []).find((t) => t.name === "lead")?.prompt_body;
+      // The root body always comes from the selected owner lead. Every repo template,
+      // including lead-shaped names, stays a subagent (selectSubagentTemplates).
       const repoSkills = repoSourced ? (ctx.skills ?? []).map((s) => s.name) : undefined;
       for (const t of implementTemplates(ctx, selection)) agents[t.name] = toHarnessAgent(t, repoSkills);
       // Every implement request, including replacement and continuation prompts,
@@ -6612,7 +6613,7 @@ export class CodexExecutor implements Executor {
       signal,
       // Honor the SERVER-RESOLVED per-run/schedule model (owner default or PRD #300 schedule
       // freeze) that the api already harness-validated against the closed Codex set and shipped on
-      // the claim; fall back to the fixed provider default when the claim carries none. render.ts's
+      // the claim; otherwise use the selected valid owner pin, then the provider default. render.ts's
       // resolveModel re-validates request.model downstream and codex-harness.ts's
       // `rendered.lead.model ?? this.provider.model` supplies the same default for an out-of-set value.
       model: leadRequest.model!,
@@ -7600,11 +7601,18 @@ export function commandSandboxArgv(
  *     PROTECTED_ENV_KEYS member — {@link COMMAND_ENV_PROTECTED_KEYS} unions both, because
  *     PROTECTED_ENV_KEYS alone omits PATH/TMPDIR/LANG. `commandEffectSpec` later overrides
  *     HOME/TMPDIR to the per-command private tmp, so those stay boundary-safe regardless.
+ *   - issue #3907: when `browserDiscovery` is true, AGENT_BROWSER_EXECUTABLE_PATH and
+ *     CHROME_PATH (the uzi-chromium wrapper) are set after the fold. The caller passes true
+ *     only when the worker's command sandbox mode is `off`. Under `required` discovery is
+ *     not advertised: Chromium was observed failing under the enforced Landlock policy
+ *     (/proc and /sys are not granted). Under `best-effort` it is not advertised either, by
+ *     design, even on a Landlock-less (degraded, unconfined) kernel where Chromium might run:
+ *     discovery is advertised only for the mode whose launch the worker-uid proof covers.
  *   - issue #1716: a `toolEnv` entry can NEVER inject git config (GIT_CONFIG_COUNT,
  *     GIT_CONFIG_KEY_n/VALUE_n, GIT_CONFIG_PARAMETERS); run() adds the worker's own
  *     trust afterwards ({@link withCommandGitTrust}).
  */
-export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>, dockerHost?: string): NodeJS.ProcessEnv {
+export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>, dockerHost?: string, browserDiscovery = false): NodeJS.ProcessEnv {
   const provisionedPath = toolEnv.PATH;
   const env: NodeJS.ProcessEnv = {
     // The fixed boundary dirs come first; a provisioned PATH is appended (never prepended,
@@ -7625,6 +7633,7 @@ export function buildCommandEnv(tmpdir: string, toolEnv: Record<string, string>,
   // Issue #3382: the worker's optional Go build concurrency defaults, applied after the fold.
   Object.assign(env, goConcurrencyEnv());
   if (dockerHost !== undefined) env.DOCKER_HOST = dockerHost;
+  if (browserDiscovery) Object.assign(env, BROWSER_DISCOVERY_ENV);
   return env;
 }
 

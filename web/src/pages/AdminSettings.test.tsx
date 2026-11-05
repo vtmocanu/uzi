@@ -163,11 +163,13 @@ const pendingAgentSource = (): import("../lib/api").AgentSourceView => ({
         name: "planner",
         ok: true,
         description: "Plans work.",
+        claude_model: "",
+        codex_model: "",
         prompt_body: "You are the planner.",
         // The raw body carried hidden control/bidi chars stripped for this preview.
         body_sanitized: true,
       },
-      { name: "broken-role", ok: false, reason: "invalid" },
+      { name: "broken-role", ok: false, reason: "invalid", claude_model: "", codex_model: "" },
     ],
     diff: [
       { name: "planner", action: "add", detail: "new synced-only role" },
@@ -1310,6 +1312,36 @@ describe("AdminSettings — agent source (PRD #602 M5)", () => {
     // A healthy sync shows the short SHA of the last sync (it also appears on the
     // staged snapshot, which shares the SHA — so at least one, not exactly one).
     expect(c.getAllByText("9f2c17a4e0").length).toBeGreaterThan(0);
+  });
+
+  it("reviews both harness pins, including default-only roles, before approval", async () => {
+    const source = pendingAgentSource();
+    source.staged!.roles = [
+      { name: "lead", ok: true, claude_model: "", codex_model: "", prompt_body: "lead body" },
+      { name: "coder", ok: true, claude_model: "", codex_model: "", prompt_body: "coder body" },
+      { name: "sol", ok: true, model: "gpt-6-sol", claude_model: "", codex_model: "gpt-6-sol", prompt_body: "sol body" },
+      { name: "luna", ok: true, model: "gpt-6-luna", claude_model: "", codex_model: "gpt-6-luna", prompt_body: "luna body" },
+      { name: "custom", ok: true, model: "us.anthropic.claude-custom:v1", claude_model: "us.anthropic.claude-custom:v1", codex_model: "", prompt_body: "custom body" },
+    ];
+    source.staged!.diff = source.staged!.roles.map(({ name }) => ({ name, action: "add" }));
+    source.staged!.counts = { staged: 5, changed: 5, failed: 0 };
+    mockApi.getAgentSource.mockResolvedValue({ agent_source: source });
+    renderPage();
+    await screen.findByLabelText("Repository URL");
+    const c = card();
+    c.getAllByRole("button", { name: "Show body" }).forEach((button) => fireEvent.click(button));
+    for (const role of source.staged!.roles) {
+      const row = within(c.getByText(role.name, { selector: "code" }).closest("li")!);
+      expect(row.getByText("Claude model").nextElementSibling?.textContent).toBe(
+        role.claude_model || (role.name === "lead" ? "Default · SDK/account default (built-in)" : "Default · lead's model"),
+      );
+      expect(row.getByText("Codex model").nextElementSibling?.textContent).toBe(
+        role.codex_model || (role.name === "lead" ? "Default · built-in (gpt-6.1-sol)" : "Default · lead's model"),
+      );
+      expect(row.queryByText("Model", { exact: true })).toBeNull();
+    }
+    expect(c.getByRole("button", { name: "Approve & apply" })).toBeTruthy();
+    expect(mockApi.applyAgentSource).not.toHaveBeenCalled();
   });
 
   it("saves the config through updateSettings with the agent_source_* keys, omitting an untyped credential", async () => {

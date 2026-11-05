@@ -68,7 +68,7 @@ import { resolveRunKind } from "../src/run-kind.js";
 import { GitCache, assertCaptureLaunch } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
-import { makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
+import { leadRequestCaseAgents, makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
 import { configureGoConcurrency } from "../src/go-concurrency.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
@@ -988,8 +988,9 @@ describe("M3 actual runner memory Codex delivery", () => {
           m.payload.event === "worker_memory_pressure"), "persisted joined feedback");
         const feed = m2Runner.api.messages(f.claim.run_id).filter(m => m.payload.event === "worker_memory_pressure");
         assert.equal(feed.length, 1, "actual runner persists one joined feedback event");
-        const { event, ...feedback } = feed[0]!.payload;
+        const { event, memory_diagnostics: diagnostics, ...feedback } = feed[0]!.payload;
         assert.equal(event, "worker_memory_pressure");
+        assert.equal(rec(diagnostics).version, 1, "the status feed alone carries the diagnostics sibling");
         assert.deepEqual(feedback, original, "callback and feed contain the same structured pressure result");
         assert.equal(JSON.stringify(feed).includes("m3-original-registration"), false);
         assert.equal(modelDisposals, 1, "monitor disposes the enrolled fake command exactly once");
@@ -9967,6 +9968,39 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(env.ANTHROPIC_AUTH_TOKEN, undefined);
     assert.equal(env.AGENT_BROWSER_ARGS, undefined);
   });
+
+  it("issue #3907: browserDiscovery=true sets both discovery paths after a hostile toolEnv fold", () => {
+    const env = buildCommandEnv("/private/tmp", {
+      AGENT_BROWSER_EXECUTABLE_PATH: "/evil/chromium",
+      CHROME_PATH: "/evil/chrome",
+    }, undefined, true);
+    assert.equal(env.AGENT_BROWSER_EXECUTABLE_PATH, "/usr/local/bin/uzi-chromium");
+    assert.equal(env.CHROME_PATH, "/usr/local/bin/uzi-chromium");
+    assert.ok(!("PUPPETEER_EXECUTABLE_PATH" in buildCommandEnv("/private/tmp", {}, undefined, true)));
+  });
+
+  it("issue #3907: browserDiscovery false or omitted advertises neither path, even when toolEnv supplies them", () => {
+    const tool = { AGENT_BROWSER_EXECUTABLE_PATH: "/evil/chromium", CHROME_PATH: "/evil/chrome" };
+    for (const env of [buildCommandEnv("/private/tmp", tool), buildCommandEnv("/private/tmp", tool, undefined, false)]) {
+      assert.ok(!("AGENT_BROWSER_EXECUTABLE_PATH" in env));
+      assert.ok(!("CHROME_PATH" in env));
+    }
+  });
+
+  for (const [label, mode, present] of [
+    ["off", "off", true], ["required", "required", false], ["best-effort", "best-effort", false], ["omitted", undefined, false],
+  ] as const) {
+    it(`issue #3907: run() with commandSandbox ${label} ${present ? "advertises" : "does not advertise"} browser discovery`, async () => {
+      const rig = makeRig();
+      rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider,
+        (mode === undefined ? {} : { commandSandbox: mode }) as never);
+      await withTimeout(exec.run(makeCtx().ctx), 3000, "browser discovery run");
+      const env = rig.fileopSpawns[0]!.env;
+      assert.equal(env.AGENT_BROWSER_EXECUTABLE_PATH, present ? "/usr/local/bin/uzi-chromium" : undefined);
+      assert.equal(env.CHROME_PATH, present ? "/usr/local/bin/uzi-chromium" : undefined);
+    });
+  }
 
   it("run() folds the injected provisionRunTools toolEnv into the command identity and never inherits process.env", async () => {
     const rig = makeRig();
@@ -19226,6 +19260,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.ok(rootInstructions(rig.epochs[0]!.transport).includes("OWN LEAD BODY"));
     const [implText] = turnInputs(rig.epochs[1]!.transport);
     assert.ok(implText!.includes(PASSAGE), "the implement turn carries the untrusted-review passage");
+    assert.ok(implText!.includes("Do not re-run a valid gate or redo an investigation"), "the implement turn carries the evidence-audit rule (#3912)");
     assert.ok(implText!.includes("Available subagents to delegate to: repo-reviewer (can edit files)."), "and the selected names only");
     assert.ok(!implText!.includes("repo-tester"));
     assert.ok(rootInstructions(rig.epochs[1]!.transport).includes(PASSAGE), "the resumed thread's developer instructions carry the passage");
@@ -19237,6 +19272,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     const [implText] = turnInputs(rig.epochs[1]!.transport);
     assert.ok(implText!.includes("Available subagents to delegate to: coder (can edit files), tester (can edit files)."));
     assert.ok(!implText!.includes(PASSAGE));
+    assert.ok(!implText!.includes("Do not re-run a valid gate"), "own source: no evidence-audit rule (#3912)");
     assert.ok(!rootInstructions(rig.epochs[1]!.transport).includes(PASSAGE));
   });
 
@@ -28737,6 +28773,77 @@ describe("CodexExecutor: lead-config reporting (PRD #3244)", () => {
     return {};
   };
   const waitForRows = (posts: unknown[], n: number) => waitFor(() => posts.length >= n, `${n} lead-config rows`);
+
+  it("every codex request_case of the shared matrix is what the executor actually sends and reports", async () => {
+    const contract = JSON.parse(readFileSync(
+      new URL("../../fixtures/lead-config/contract.json", import.meta.url), "utf8",
+    )) as { request_cases: Array<{
+      id: string; harness: string; phase: "plan" | "implement"; config: ClaimConfig;
+      templateModel?: string; agents?: Array<{ name: string; model?: string | null }>;
+      providerDefaultModel?: string; expect: import("../src/lead-config-report.js").LeadRequest;
+    }> };
+    const cases = contract.request_cases.filter((c) => c.harness === "codex");
+    assert.equal(cases.length, 16, "all Codex request cases loaded");
+    const visited: string[] = [];
+    const phases = new Set<string>();
+    for (const c of cases) {
+      const { posts, reporter } = reporterRig(c.config);
+      const fields = reported(c.expect.model!, c.expect.effort ?? "medium");
+      const planEpoch: Responder = (call) => {
+        if (call.method === "thread/start" || call.method === "thread/resume") {
+          return { thread: { id: "th-plan" } };
+        }
+        if (call.method === "turn/start") {
+          call.transport.push(threadStarted("th-plan"))
+            .push(toolCall(1, "submit_plan", { plan_md: "PLAN" }, "th-plan", "tn-plan", "c-plan"))
+            .push(turnCompleted("completed", "th-plan", "tn-plan"));
+          return { turn: { id: "tn-plan" } };
+        }
+        return {};
+      };
+      const planPhase = c.phase === "plan";
+      const rig = makeMultiEpochRig(planPhase ? [
+        reporting(planEpoch, fields),
+        reporting(resumedEpochResponder("th-plan", "tn-impl", doneFrames), fields),
+      ] : [reporting(resumedEpochResponder("th-1", "tn-1", doneFrames), fields)]);
+      const { ctx } = makeCtx({
+        agents: leadRequestCaseAgents(c), config: c.config, leadConfig: reporter,
+        ...(planPhase ? {
+          planApproved: false, approvedPlan: undefined, gatePlan: async () => approve,
+        } : {}),
+      });
+      await withTimeout(makeExecutor(
+        rig, bindingOf(SUBSCRIPTION), noopLog, undefined,
+        { ...provider, model: c.providerDefaultModel! },
+      ).run(ctx), 5000, `${c.id}: shared request case`);
+      const phaseEpochs = planPhase ? rig.epochs.slice(0, 1) : rig.epochs;
+      const turns = phaseEpochs.flatMap((e) => e.transport.requests.filter((r) => r.method === "turn/start"));
+      assert.ok(turns.length > 0, `${c.id}: ${c.phase} turn sent`);
+      for (const t of turns) {
+        assert.equal(rec(t.params).model, c.expect.model, `${c.id}: sent model`);
+        assert.equal(rec(t.params).effort, c.expect.effort, `${c.id}: sent effort`);
+      }
+      const phasePosts = posts.filter((p) => p.phase === c.phase);
+      if (leadConfigActive(c.config)) {
+        assert.ok(phasePosts.length > 0, `${c.id}: requested report posted`);
+        for (const p of phasePosts) {
+          assert.deepEqual(
+            [p.requested_model, p.requested_model_source, p.requested_effort, p.requested_effort_mode, p.requested_effort_source],
+            [c.expect.model ?? null, c.expect.modelSource, c.expect.effort ?? null, c.expect.effortMode, c.expect.effortSource],
+            `${c.id}: requested report`,
+          );
+        }
+      } else {
+        assert.equal(reporter.enabled, false, c.id);
+        assert.equal(posts.length, 0, `${c.id}: old claims stay inactive`);
+      }
+      phases.add(c.phase);
+      visited.push(c.id);
+    }
+    assert.deepEqual(visited, cases.map((c) => c.id));
+    assert.equal(visited.length, 16);
+    assert.deepEqual([...phases].sort(), ["implement", "plan"]);
+  });
 
   it("a pre-approved run records the requested row, then the runtime row, matching what was sent", async () => {
     const { posts, reporter, rows } = reporterRig(ACTIVE);

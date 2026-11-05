@@ -102,6 +102,7 @@ import path from "node:path";
 import { AGENT_NAME_MAX_LEN, AGENT_NAME_RE, type AgentTemplate, type RepoAgentSummary } from "./protocol.js";
 import { ASYNC_DEFERRAL_TOOLS, NESTED_AGENT_TOOL } from "./guardrails.js";
 import { isValidModel } from "./models.js";
+import { isCodexRoleModel } from "./codex/render.js";
 import { parseCodexAgentFile } from "./repoagents-codex.js";
 
 /** Tools a repo-authored subagent can never receive, whatever its frontmatter
@@ -220,6 +221,14 @@ export interface DetectedRepoAgents {
 
 export type RepoAgentFolder = NonNullable<RepoAgentSummary["folder"]>;
 export type RepoAgentHarness = "claude" | "codex";
+
+/** Project a raw Markdown model pin for delivery to one harness, silently
+ *  inheriting when the pin belongs to the other family. Parsing stays raw. */
+export function filterRepoAgentModel(template: AgentTemplate, harness: RepoAgentHarness): AgentTemplate {
+  const { model, ...rest } = template;
+  if (model && isCodexRoleModel(model) !== (harness === "codex")) return rest;
+  return { ...template };
+}
 
 /** The `.claude/agents` path inside the clone. Production detection walks both
  *  agent folders itself (see `detectRepoAgents`); this helper has no production
@@ -473,7 +482,11 @@ export async function detectRepoAgents(
     if (located.kind === "rejected") {
       return { agents: [], notes: [{ name: "", reason: "unsafe_path", folder: spec.folder }], folder: spec.folder };
     }
-    return loadFolder(spec, located.agentsReal, opts);
+    const detected = await loadFolder(spec, located.agentsReal, opts);
+    if (spec === CLAUDE_SPEC) {
+      detected.agents = detected.agents.map((template) => filterRepoAgentModel(template, harness));
+    }
+    return detected;
   }
   return none;
 }

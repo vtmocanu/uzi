@@ -7,6 +7,7 @@
 // failed, slow or refused report must not change what the run does.
 
 import type { LeadConfigPostOutcome } from "./client.js";
+import { isCodexRoleModel } from "./codex/render.js";
 import type { HarnessEffort } from "./harness.js";
 import type { Logger } from "./log.js";
 import type { ClaimConfig, LeadConfigReportBody, LeadEffortSource, LeadModelSource } from "./protocol.js";
@@ -22,8 +23,7 @@ export interface LeadRequestInput {
   /** Ignored in H; a later planning-phase child selects planning values by it. */
   phase: LeadPhase;
   config: ClaimConfig | null | undefined;
-  /** The lead template's delivered model. Claude passes assembleAgents' leadModel; Codex accepts it
-   *  but does not use it yet. */
+  /** The selected owner lead template's delivered model (assembleAgents' leadModel for Claude). */
   templateModel?: string;
   /** Codex: the provider's fixed default model. */
   providerDefaultModel?: string;
@@ -38,7 +38,7 @@ export interface LeadRequest {
 }
 
 /** The lead agent's requested model and effort for one phase. Claude: `default_model || template ||
- *  undefined` (an unset model leaves the SDK key off); Codex: `default_model ?? provider default`. */
+ *  undefined` (an unset model leaves the SDK key off); Codex: `default_model ?? valid template ?? provider default`. */
 export function resolveLeadRequest(input: LeadRequestInput): LeadRequest {
   const { config } = input;
   const claimSource = config?.default_model_source ?? "builtin";
@@ -49,8 +49,10 @@ export function resolveLeadRequest(input: LeadRequestInput): LeadRequest {
     model = claimModel || input.templateModel || undefined;
     modelSource = claimModel ? claimSource : input.templateModel ? "template" : "builtin";
   } else {
-    model = config?.default_model ?? input.providerDefaultModel;
-    modelSource = config?.default_model !== undefined ? claimSource : "builtin";
+    const templateModel = input.templateModel !== undefined && isCodexRoleModel(input.templateModel)
+      ? input.templateModel : undefined;
+    model = config?.default_model ?? templateModel ?? input.providerDefaultModel;
+    modelSource = config?.default_model != null ? claimSource : templateModel !== undefined ? "template" : "builtin";
   }
   const effort = config?.default_effort as HarnessEffort | undefined;
   return {

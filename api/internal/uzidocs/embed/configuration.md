@@ -305,7 +305,7 @@ The Plan cross-check row in Run defaults stores independent model and effort pin
 
 The cookie-only `PUT /api/me/settings` accepts at most four keyed cells. Omitted cells or fields remain unchanged; explicit `null` resets a field to Default. Duplicate cells, unknown stages/families or fields, malformed model IDs, family mismatch and invalid effort are rejected. Submitted pin cells are validated before their transaction, so a bad cell writes no pin cells. GET metadata fields are not writable. CLI set/reset, admin defaults and per-run overrides remain outside this release.
 
-A Claude checker (the Claude cell) always requires `cross_check_codex_lead_v1` on its worker, pinned or not. A pinned Claude model that the account cannot use (SDK `model_not_found`) fails the child as `checker_unavailable`. For a checker of either family with either pin non-null, placement requires `cross_check_pins_v1`. A custom resolved model independently requires `codex_custom_model_v1`; a curated pin does not require that custom capability even when the worker default is custom. Default resolving to a custom worker model does require it. Unpinned round-1 checks can still use older `cross_check_v1` workers; later rounds additionally require `cross_check_rounds_v1` on the same worker. Claim preflight repeats both capability checks before credentials; a post-placement mismatch requeues, with the verdict deadline still including queue time.
+A Claude checker (the Claude cell) always requires `cross_check_codex_lead_v1` on its worker, pinned or not. A pinned Claude model that the account cannot use (SDK `model_not_found`) fails the child as `checker_unavailable`. For a checker of either family with either pin non-null, placement requires `cross_check_pins_v1`. A custom resolved Codex model independently requires `codex_custom_model_v1`; a curated pin does not require that custom capability even when the worker default is custom. Default resolving to a non-curated Codex worker model or lead-template pin also requires it. Routing, health and hosted placement apply the same precedence: checker model pin, worker default, then the first delivered lead/orchestrator template's valid Codex pin. Unpinned round-1 checks can still use older `cross_check_v1` workers when the resolved model does not require the custom capability; later rounds additionally require `cross_check_rounds_v1` on the same worker. Claim preflight repeats both capability checks before credentials; a post-placement mismatch requeues, with the verdict deadline still including queue time.
 
 A claim-time snapshot freezes delivered values and independent provenance for the checker record. Hard pins do not substitute, clamp or retry on defaults. Local model syntax/family and effort checks happen before delivery; an intrinsically invalid stored pin fails visibly. There is no account-aware model-availability check in the API. Only recognized authenticated pinned-model rejection at checker startup maps to `checker_unavailable`, fails the child with `plan cross-check: checker unavailable` and forces a human gate. Other startup failures, including worker-default or effort-only model errors, retain the existing cross-check failure handling.
 
@@ -659,6 +659,12 @@ an OOM predictor: inactive file pages can be dirty, under writeback or slow to
 reclaim, so the subtraction can underestimate pressure (dirty/writeback
 validation is deferred). Feedback's `observed_total_bytes` stays the raw
 `memory.current` and can exceed the working set that triggered.
+The `worker_memory_pressure` feed event also carries an optional
+`memory_diagnostics` object with the decision metric, thresholds and
+`memory.stat` breakdown, including `active_file`, `file_dirty` and
+`file_writeback`. These are diagnostics only: the metric is unchanged and the
+guard still does not use dirty/writeback. See
+[ADR-2396](../adr/2396-worker-memory-guard.md).
 
 Cgroup memory PSI (`memory.pressure`) is optional. A read failing with exactly
 `ENOENT` or `ENOTSUP` marks PSI absent; any other error, or malformed or
@@ -913,7 +919,7 @@ toggle.
 ## Auto-selecting an Anthropic token (PRD #111)
 
 A worker can pick its Anthropic credential automatically from the pool its owner
-opted in, preferring the account with the most rate-limit headroom. These knobs are
+opted in, by default preferring the account whose weekly allowance resets soonest. These knobs are
 the operator's policy for that choice — one policy for the instance, not a per-user
 setting. All three integer values are **percentage points**, because the gauge they
 read is a 0–100 percentage.
@@ -925,10 +931,11 @@ have none) is measured on its 7-day window alone.
 
 | Var | Default | Notes |
 |---|---|---|
+| `UZI_AUTOSELECT_ORDER` | `reset_first` | How tokens (and pooled Codex accounts) with at least the minimum headroom are ranked. `reset_first`: the soonest weekly reset wins (Claude: the 7-day window; Codex: the main `codex` window reporting a 7-day duration); ties go to the higher in-flight-penalised headroom, then the lowest id; a candidate with no known future weekly reset sorts after every one with one. `headroom_first`: the previous ranking, most headroom first, near-ties (`UZI_AUTOSELECT_HEADROOM_TIE_PCT`) to the soonest reset of the binding window. An unknown value logs a boot warning and falls back to `reset_first`. When every measured token is under the floor (`best_of_pool`) the headroom ranking applies under either order. **Cost:** `reset_first` deliberately concentrates work on the soonest-expiring token until it falls under the floor, and a burst of claims inside one poll interval can land on a token just above the floor, giving more mid-run limit pauses and resumes; set `headroom_first` to spread work. No dedicated Helm chart value; on Helm set it under `api.config`. See [ADR-3844](../adr/3844-reset-first-pool-order.md). |
 | `UZI_AUTOSELECT_MIN_HEADROOM` | `15` | The floor below which a token is not picked by preference. `0` means no floor. A value above `100` is unsatisfiable (headroom never exceeds 100) and is clamped to `100` with a boot warning — left unclamped it would classify every token as below-threshold and auto-selection would look broken rather than mis-tuned. |
-| `UZI_AUTOSELECT_HEADROOM_TIE_PCT` | `5` | Tokens within this many points of the emptiest are treated as tied, and the tie is broken by whichever replenishes soonest. `0` means only an exact tie counts. |
+| `UZI_AUTOSELECT_HEADROOM_TIE_PCT` | `5` | Tokens within this many points of the emptiest are treated as tied, and the tie is broken by whichever replenishes soonest. `0` means only an exact tie counts. Used by `headroom_first` and by `best_of_pool` picks; ignored for `auto` picks under `reset_first`. |
 | `UZI_AUTOSELECT_MAX_STALENESS` | `3 × UZI_USAGE_POLL_INTERVAL` | How old a usage reading may be and still steer a choice — steering on numbers Anthropic has moved past is worse than not steering. The default **tracks** the poll interval and matches what the meters already call stale, so the two agree; overriding it re-opens that divergence. **With the poller disabled (`UZI_USAGE_POLL_INTERVAL=0`) this computes to `0`, nothing is ever fresh, and auto-selection degrades to the worker's ordinary binding** — the correct outcome for a gauge nothing updates. |
-| `UZI_AUTOSELECT_INFLIGHT_PENALTY` | `3` | Points subtracted from a token's ranking score per run currently spending it, so several claims inside one poll interval do not all pile onto the same emptiest credential. `0` disables the bias. |
+| `UZI_AUTOSELECT_INFLIGHT_PENALTY` | `3` | Points subtracted from a token's ranking score per run currently spending it, so several claims inside one poll interval do not all pile onto the same emptiest credential. `0` disables the bias. Under `reset_first`, for `auto` picks, it only breaks exact weekly-reset ties, so it no longer spreads a burst of claims; `headroom_first` and `best_of_pool` use it as before. |
 
 ## Job files and product skill sets (PRD #1909)
 

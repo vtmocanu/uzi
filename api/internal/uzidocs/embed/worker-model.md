@@ -17,7 +17,8 @@ Both settings live together in one **Settings → Run defaults** card:
 
 - A **default harness** picker, shown only when you have a usable credential
   for both Claude and Codex. It decides which harness a run uses when
-  nothing else names one, subject to the optional creation-time overflow below.
+  nothing else names one. With an explicit default it is subject to the
+  optional creation-time overflow below.
 - One **model lane per usable harness**: Anthropic and Codex side by side
   when both are usable, or a single lane when only one is. With no usable
   credential yet, the card still shows the Claude lane so you can
@@ -27,8 +28,15 @@ Each picker's empty option is a **Default · …** label naming where the value
 comes from: the Claude model picker reads `Default · lead template` (the
 `lead` template's model) and the Codex model picker reads
 `Default · gpt-6.1-sol (built-in)`. The harness picker's empty option reads
-`Default · automatic`: uzi picks your only usable harness, or Claude when both
-are usable. Schedules and the start-run form still say **Use my default** for
+`Default · automatic`: uzi picks your only usable harness, or, when both are
+usable, chooses by weekly limits for eligible new issue runs (started
+manually, by autopilot or by a schedule, with no explicit harness or issue
+harness label, model pin, Anthropic credential override or Plan/Code
+cross-check; other runs keep the usual resolution: an explicit harness, else
+Claude). It picks the harness whose weekly allowance
+resets soonest, falling back to Claude when usage is unknown; see [How the
+automatic default picks a harness](./rate-limits.md#how-the-automatic-default-picks-a-harness).
+Schedules and the start-run form still say **Use my default** for
 the harness.
 
 Switching the default harness never clears either model. Each lane is its
@@ -45,6 +53,10 @@ In **Settings → Run defaults**, turn on **Overflow to the other harness when m
 This per-user boolean is off by default and saves automatically, separately
 from **Save defaults**. The CLI equivalent is
 `uzi settings harness-overflow on|off`; `uzi settings get` reads it back.
+Overflow applies only when your default harness is an explicit Claude or
+Codex. With **Default · automatic** the toggle has no effect: the card
+disables it with an explanation, and the CLI prints `(inactive: default
+harness is automatic)`.
 
 Overflow applies at creation to **new issue runs** started manually, by
 autopilot or by a schedule, when both harnesses are usable and the harness
@@ -64,30 +76,41 @@ The harness and creation explanation are frozen atomically. Existing runs,
 including resumes and usage-limit parks, never switch harness through
 overflow. The owner's run page, `uzi run get <id>` (human and `--json`) and
 TUI detail rail show the stored preferred/chosen harness, reason, comparison
-scores, measured headroom and holds. This is creation-time evidence, not
+scores, measured headroom and holds (and, for an automatic choice, the weekly
+resets compared). This is creation-time evidence, not
 live usage; legacy or unavailable evidence reads **not recorded**.
 
 ## Model precedence
 
 For a given run, uzi resolves the harness first (an explicit run/schedule
 choice, then your default harness, then whichever harness you have a
-credential for, with eligible overflow applied at creation), and only then
+credential for; with an explicit default, eligible overflow is applied at
+creation, and with **Default · automatic** and both harnesses usable, the
+harness is chosen by weekly limits), and only then
 reads that harness's model lane:
 
 1. The **schedule's model**, if the run was started by a
    [schedule](./scheduling.md) that pins one compatible with the run's
    harness.
 2. Your **worker model** for that harness, if set.
-3. The harness fallback: the `lead` template's `model` (`opus` by default)
-   for Claude, or `gpt-6.1-sol` for Codex.
+3. The harness fallback: the `lead` template's Claude pin (`opus` by default)
+   for Claude, or its Codex pin, else `gpt-6.1-sol`, for Codex.
 4. Whatever the underlying SDK/your account defaults to.
+
+The lead's Codex fallback requires a worker from this release. Older Codex
+workers fall through to the built-in provider model (`gpt-6.1-sol`) when no
+schedule or worker-model setting takes precedence. Roll out the API first,
+then the hosted worker; hosted validation of this behavior remains pending.
+The pickers' existing **Default · …** labels above are unchanged pending
+separate UI work.
 
 An incompatible frozen schedule or legacy model (e.g. a Claude alias pinned
 on a run that resolves to Codex) falls back to your lane for that harness,
-with a visible fallback note on the run. A subagent with its own `model`
-override uses that pin unless the schedule applies its model to all agents.
-Your worker-model setting does not override a subagent pin. **Chat always
-uses your Claude lane**, whichever harness is your default.
+with a visible fallback note on the run. A subagent with its own Claude
+(`model`) or Codex (`codex_model`) pin uses the pin for the run's harness
+unless the schedule applies its model to all agents. Your worker-model
+setting does not override a subagent pin. **Chat always uses your Claude
+lane**, whichever harness is your default.
 
 ## Claude model guard and recovery
 
@@ -205,7 +228,7 @@ for how to read the effort side.
 
 These rows are attested by the worker and are for display only. They never
 feed billing, authorization or scheduling, and they describe the lead agent:
-a subagent with its own `model` pin may differ.
+a subagent with its own Claude or Codex pin may differ.
 
 Before a worker claims the run, nothing is resolved yet, so the chip reads
 `lead: model and effort resolve at claim`, or, for a schedule-pinned model,
@@ -253,10 +276,11 @@ Where to see it:
 ## Current Codex worker baseline
 
 The current Codex worker uses runtime 0.164.0 and defaults to `gpt-6.1-sol`
-when no worker-model override is set. Explicit model preferences remain
-unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
-keep separate overrides, and each can instead be set to **Runtime default**,
-which sends no effort level. See [Reasoning effort](worker-effort.md).
+when no schedule model, worker-model override or lead Codex pin is set.
+Explicit model preferences remain unchanged. Both harnesses inherit medium
+reasoning effort; Claude and Codex keep separate overrides, and each can
+instead be set to **Runtime default**, which sends no effort level. See
+[Reasoning effort](worker-effort.md).
 
 Every Codex claim requires `codex_runtime_v2`, so an older worker cannot
 silently use the old model/catalog or ignore the requested effort. Codex runs

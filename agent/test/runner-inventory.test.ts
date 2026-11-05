@@ -446,7 +446,11 @@ it("guarded credential-switch give-up keeps inventory open until normal completi
     for (const head of [h, h2]) assert.ok(roots.some(root => root.sha === head));
     assert.equal((await r.snapshotBootRecoveries()).some(record => !!record.coverageDigest), false);
     continued = true;
-    return { branch: ctx.branch, reportOnly: true, summary: "continued after switch" };
+    // A normal delivery, not reportOnly: this run committed work whose checkpoint publishes lost
+    // their ack, and since #3944 a report-only completion with a work-bearing attempted tip is
+    // refused (#3360 non-closing delivery) instead of orphaning it. The inventory assertions
+    // below only need the run to reach its normal terminal boundary.
+    return { branch: ctx.branch, summary: "continued after switch" };
   } }, gitlab, "journal-key", { checkpointIntervalMs: 1, recoveryRetryMs: 1 });
   await r.execute(claim);
   assert.ok(api.states.some(s => s.body.status === "completed"));

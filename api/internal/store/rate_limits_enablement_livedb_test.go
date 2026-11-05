@@ -213,7 +213,7 @@ func TestAutoSelectionIgnoresPreDisableReadingLiveDB(t *testing.T) {
 	if n := fencedUpsert(ctx, t, q, user, fresh, 0, 50); n != 1 {
 		t.Fatalf("fresh seed = %d rows", n)
 	}
-	policy := autoselect.Policy{MinHeadroom: 15, HeadroomTiePct: 5, MaxStaleness: 15 * time.Minute}
+	policy := autoselect.Policy{Order: autoselect.OrderHeadroomFirst, MinHeadroom: 15, HeadroomTiePct: 5, MaxStaleness: 15 * time.Minute}
 	pick := func() (autoselect.Outcome, map[uuid.UUID]autoselect.Status) {
 		rows, err := q.ListAutoSelectCandidates(ctx, user)
 		if err != nil {

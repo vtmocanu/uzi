@@ -56,6 +56,7 @@ type AgentTemplate struct {
 	UserID      pgtype.UUID        `json:"user_id"`
 	Customized  bool               `json:"customized"`
 	Origin      pgtype.Text        `json:"origin"`
+	CodexModel  pgtype.Text        `json:"codex_model"`
 }
 
 type AgentTemplateAllocation struct {
@@ -1268,6 +1269,8 @@ type Run struct {
 	PolicyRecoveryVerifiedGeneration pgtype.Int8        `json:"policy_recovery_verified_generation"`
 	PolicyRecoveryVerifiedHead       pgtype.Text        `json:"policy_recovery_verified_head"`
 	PolicyHoldCause                  pgtype.Text        `json:"policy_hold_cause"`
+	HarnessPreferredWeeklyResetAt    pgtype.Timestamptz `json:"harness_preferred_weekly_reset_at"`
+	HarnessOtherWeeklyResetAt        pgtype.Timestamptz `json:"harness_other_weekly_reset_at"`
 }
 
 type RunCompletionAttempt struct {

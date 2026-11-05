@@ -13,8 +13,9 @@ specialist roles it wants. When a run clones such a repo, uzi detects that
 roster and lets you run the repo's agents instead of your own
 [agent templates](./agent-templates.md) — chosen at the plan gate, per run.
 
-The `lead` orchestrator is always uzi's own builtin and is never replaceable;
-repo agents and your templates only ever supply the **subagents** it delegates to.
+The lead comes from your own selected lead template, never the repo roster.
+Repo agents only supply the **subagents** it delegates to; a repo agent named
+`lead` is still a subagent.
 
 ## Choose the agents at the plan gate
 
@@ -43,11 +44,14 @@ Per-agent exclusions are a web-only refinement; use "Open in uzi" for those.
 On a Codex run the agent selection applies the same way: implementation
 delegates to the roster you chose at the plan gate (by default the detected
 repo roster), honours your exclusions, and falls back to your own templates when
-the selection is invalid. Planning keeps your own templates. Two Codex-specific
-rules apply to each repo agent's frontmatter:
+the selection is invalid. Planning keeps your own templates. The model rule
+below applies to both harnesses; Codex also filters tools:
 
-- **`model:`** is honored only when it names a supported Codex model; otherwise
-  the run's model is used.
+- **Markdown `model:`** maps by vocabulary: a supported Codex role id is a
+  Codex pin; any other well-formed model id is a Claude pin, including custom
+  Claude ids. A run silently ignores the other harness's pin, so that subagent
+  follows the lead. For example, `gpt-6-sol` pins Codex only, while `opus` pins
+  Claude only. Codex role pins include `gpt-6-luna`.
 - **`tools:`** entries Codex does not recognise are dropped, never widened
   into something broader, so a repo
   agent can only end up with less authority than it declared.
@@ -83,7 +87,8 @@ Each TOML file becomes one subagent:
   the agent's prompt. The `name` and `description` rules match the Markdown
   agents.
 - **No tools, no model:** a TOML agent declares neither, so it runs with the
-  run's full default tool set, which can include `Bash`, and the run's model.
+  run's full default tool set, which can include `Bash`, and follows the lead's
+  model on either harness.
   `model`, `model_reasoning_effort`,
   `nickname_candidates`, `config_file`, `includes`, and any other key are ignored.
 - **Skipped, not run:** an otherwise valid file that declares `features`, `skills`,
@@ -122,7 +127,8 @@ uzi parses the agent files itself; it never points Claude Code at the repo's
 `.claude/` directory. (This section describes `.claude/agents/*.md` files;
 `.codex/agents/*.toml` files are covered under
 [Which folder is read](#which-folder-is-read).) Each file's `name`, `description`, `tools`, and `model`
-frontmatter is honored — including a `tools:` entry naming one of the
+frontmatter is honored, with model pins filtered for the run's harness as
+[described above](#repo-agents-on-codex-runs) — including a `tools:` entry naming one of the
 [forge read tools](./forge-read-tools.md) (`mcp__forge__*`), which a repo
 agent can grant itself the same way a template does. That surface is
 scoped to the run's own project regardless of which agent calls it. The
@@ -160,9 +166,14 @@ Two consequences are worth stating plainly:
 
 - **Internal review becomes repo-authored.** When a run uses repo agents, its
   `reviewer`/`auditor` are the repo's, so their "looks good" is unverified. The
-  lead is told to treat their output as input to double-check, not as a sign-off,
-  and the merge request records that the run used repo agents so the human
-  reviewer knows.
+  lead refuses a bare "approved" or "LGTM". It inspects the evidence a repo agent
+  ties to the current revision (commit, commands and their results, file:line)
+  and spot-checks it. It does not re-run a valid gate or redo an investigation
+  only because a repo agent did it; it re-runs on missing or stale evidence,
+  changed code, a contradiction or a concrete concern. A different repo agent can
+  still review independently, but an agent checking its own work is not an
+  independent review. The merge request records that the run used repo agents so
+  the human reviewer knows.
 - **A repo agent that can run commands can reach your token.** A repo `coder`
   that declares the `Bash` tool (most do) runs shell inside the worker, where
   your Anthropic token lives — so it could send that token out, or run up cost by

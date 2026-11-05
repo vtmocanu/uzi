@@ -3,6 +3,7 @@ package kube
 import (
 	"fmt"
 
+	"github.com/vtmocanu/uzi/controller/internal/preset"
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -15,7 +16,7 @@ import (
 // The docker sidecar's wiring (PRD #83 M3). The socket dir is a shared emptyDir
 // carrying ONLY the daemon socket; the data dir is the daemon's own root, on a
 // private PVC mounted into `dind` alone (issue #224 M-a — it was an emptyDir until
-// then; see dindDataDefaultSize).
+// then; see dindDataSize).
 const (
 	dindSocketDir  = "/run/dind"
 	dindSocketPath = dindSocketDir + "/docker.sock"
@@ -120,7 +121,7 @@ const (
 	dindDefaultLimitMemory   = "2Gi"
 )
 
-// dindDataDefaultSize is the DinD daemon's data-root PVC — the images + build cache
+// dindDataSize is the DinD daemon's data-root PVC size — the images + build cache
 // (issue #224 M-a). It was an emptyDir until then, and moving it off node ephemeral
 // storage is the whole point: an emptyDir's bytes are charged to the POD's
 // ephemeral-storage usage, so a runaway image pull made the worker the pod kubelet
@@ -128,44 +129,40 @@ const (
 // the daemon simply runs out of space: the docker step fails with ENOSPC, the pod
 // survives, and the tree survives with it. Backpressure instead of eviction.
 //
-// FLAT, and chart-overridable per cluster (UZI_WORKER_DIND_DATA_SIZE), for exactly
-// nixSize's reasons: the size tracks the user's repo images, not the worker's
-// CPU/RAM preset, so a per-size table here would be one repeated number.
+// The cluster override (cfg.DinDDataSize, from UZI_WORKER_DIND_DATA_SIZE / chart
+// workers.docker.dindDataSize) wins at every preset when set; otherwise the size
+// comes from the preset table (preset.Size.DinDDataSize: s/m 20Gi, l/l-highmem 50Gi,
+// issue #3890). Config validated any override string as a k8s quantity at boot, so
+// MustParse here is safe, the same contract dindResources relies on.
 //
-// 20Gi is the top of the chart's own documented dind band, and it must fit the ceiling:
-// the worker namespaces' LimitRange caps a PVC at maxPVCStorage (50Gi, set by `l`'s /data), and the
-// limitranger validates PVC creates, so a larger value is rejected at admission
-// rather than merely being expensive. Raising this means raising that too.
+// The result must fit the ceiling: the worker namespaces' LimitRange caps a PVC at
+// maxPVCStorage (50Gi, set by `l`'s /data), and the limitranger validates PVC creates,
+// so a larger value is rejected at admission rather than merely being expensive.
 //
-// THIS CONSTANT IS DUPLICATED IN deploy/chart/templates/worker-invariants.yaml, which
-// substitutes it when workers.docker.dindDataSize is unset — otherwise the guard there
-// would skip the default path entirely and a lowered maxPVCStorage would render clean
-// while every docker worker's third claim was rejected at admission (audit A18.2).
-// Helm cannot read a Go constant, so the two are tied by comment in both directions
-// plus TestDinDDataDefaultFitsTheChartsLimitRangeMax, which fails if this outgrows the
-// chart's ceiling. Move them together.
+// The largest per-preset value is DUPLICATED in deploy/chart/templates/worker-invariants.yaml,
+// which substitutes it (the maximum, "50Gi") when workers.docker.dindDataSize is unset;
+// otherwise the guard there would skip the default path entirely and a lowered
+// maxPVCStorage would render clean while a docker worker's third claim was rejected at
+// admission (audit A18.2). Helm cannot read the preset table, so the two are tied by
+// comment in both directions plus a Go test that compares the chart literal with the
+// maximum over the presets and the per-preset values with the chart's ceiling. Move
+// them together.
 //
 // RESIDUAL, narrowed by issue #1759: the cache PERSISTS across pod rolls, so a
-// long-lived docker worker's image cache grows into this fixed volume (the emptyDir
+// long-lived docker worker's image cache grows into this volume (the emptyDir
 // at least died with the pod). It was the identical residual nixSize carries for
 // /nix, with nothing garbage-collecting it. Since #1759 the dind-meter sidecar
 // (dindMeterContainer) samples this volume's statfs from the DinD side, and the
 // WORKER runs a gated, allowlisted `docker` prune against the daemon when the sample
-// crosses its threshold — gated on UZI_DIND_PRUNE_ENABLED, which podTemplate renders
+// crosses its threshold, gated on UZI_DIND_PRUNE_ENABLED, which podTemplate renders
 // true only when disk self-heal is on and the worker is not ephemeral. The disk-
 // pressure recycle (materializer.go) still deletes only /nix and /data, never this
-// claim, so the prune is the ONLY reclaim path short of delete + reprovision.
-const dindDataDefaultSize = "20Gi"
-
-// dindDataSize is the DinD data-root PVC size: the cluster's override when set,
-// dindDataDefaultSize otherwise. Config validated any override string as a k8s
-// quantity at boot, so MustParse here is safe — the same contract dindResources
-// relies on.
-func (cfg RenderConfig) dindDataSize() resource.Quantity {
+// claim, so the prune is the main reclaim path for the data inside it.
+func (cfg RenderConfig) dindDataSize(spec preset.Spec) resource.Quantity {
 	if cfg.DinDDataSize != "" {
 		return resource.MustParse(cfg.DinDDataSize)
 	}
-	return resource.MustParse(dindDataDefaultSize)
+	return spec.Size.DinDDataSize.DeepCopy()
 }
 
 // dindResources builds the DinD sidecar's requests+limits from cfg, falling back to the

@@ -18,7 +18,7 @@ import {
   SYNCED_BADGE_HINT,
   SYNCED_BADGE_LABEL,
   SYNCED_BADGE_TONE,
-  templateModelDefaultLabel,
+  templateModelsLabel,
 } from "../lib/agentTemplates";
 import { Alert, Badge, Button, Card } from "../components/ui";
 import {
@@ -322,7 +322,7 @@ function ReadOnlyView({ template }: { template: AgentTemplate }) {
         </div>
         <div>
           <dt className="text-faint">Model</dt>
-          <dd className="text-fg">{template.model ?? templateModelDefaultLabel(template.name)}</dd>
+          <dd className="text-fg">{templateModelsLabel(template)}</dd>
         </div>
         <div>
           <dt className="text-faint">Tools</dt>
