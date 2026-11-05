@@ -1325,11 +1325,12 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
     const onFloor = mkCommit(f.bare, f.workTree, [f.floor], MARKER);
     const opts = { attemptedTip: onFloor };
     assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), false, "control");
+    // The marker-path parents read goes through runGitWithEnv (original-object read env).
     const target = f.git as unknown as {
-      runGit: (...args: unknown[]) => Promise<string>;
+      runGitWithEnv: (...args: unknown[]) => Promise<string>;
       tryGitExit: (...args: unknown[]) => Promise<number | null>;
     };
-    const origRun = target.runGit.bind(f.git);
+    const origRun = target.runGitWithEnv.bind(f.git);
     const origExit = target.tryGitExit.bind(f.git);
     try {
       target.tryGitExit = (...args: unknown[]) => {
@@ -1339,7 +1340,7 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
       assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, "exit 128");
       target.tryGitExit = origExit;
       for (const behaviour of ["throw", "malformed"] as const) {
-        target.runGit = (...args: unknown[]) => {
+        target.runGitWithEnv = (...args: unknown[]) => {
           const argv = args[1] as string[];
           if (argv.includes("rev-list") && argv.includes("--no-replace-objects")) {
             return behaviour === "throw" ? Promise.reject(new Error("boom")) : Promise.resolve("garbage\n");
@@ -1349,7 +1350,7 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
         assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, behaviour);
       }
     } finally {
-      target.runGit = origRun;
+      target.runGitWithEnv = origRun;
       target.tryGitExit = origExit;
     }
   });
@@ -1372,7 +1373,9 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
 
   for (const [label, subject] of [
     ["wip(park) marker", MARKER],
-    ["ckpt(overlay) wrapper", `${OVERLAY_COMMIT_PREFIX} look-alike`],
+    // Single-parent replacement: this variant only covers the tip's own subject read; the overlay
+    // peel needs a two-parent tip and is covered by the "peel" tests below.
+    ["single-parent ckpt(overlay) look-alike (no peel reached)", `${OVERLAY_COMMIT_PREFIX} look-alike`],
   ] as const) {
     it(`g13 a refs/replace commit with a ${label} subject must not hide a content-bearing attempted tip`, async () => {
       const f = await fixture();
@@ -1388,6 +1391,89 @@ describe("GitCache.hasCommittedCheckpoint (#3944 stale local mirror, attempted t
         "the replace ref must not make the substantive tip look like a content-free marker");
     });
   }
+
+  /** Peel-shaped tip: overlay C with parents [M, L]; L a genuine single-parent wip(park) marker over
+   *  the under-floor commit, M a published marker over the same commit. `tipTree` is C's own tree. */
+  function peelShape(f: Awaited<ReturnType<typeof fixture>>, lTree: string, tipTree: string) {
+    // Distinct subjects: commit-tree is deterministic within a second, so equal inputs would give M === L.
+    const marker = mkCommit(f.bare, f.workTree, [f.olderFloor], `${MARKER} (published)`);
+    const last = mkCommit(f.bare, lTree, [f.olderFloor], MARKER);
+    const overlay = mkCommit(f.bare, tipTree, [marker, last], `${OVERLAY_COMMIT_PREFIX} transport`);
+    return { marker, last, overlay };
+  }
+
+  it("g13 peel: a wrapper-only overlay over a genuine park marker peels to content_free (control)", async () => {
+    const f = await fixture();
+    const p = peelShape(f, f.olderTree, f.olderTree);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: p.overlay }), false);
+    // And the peel is what decides it: the same overlay carrying real work in its own tree blocks.
+    const withWork = peelShape(f, f.olderTree, f.workTree);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: withWork.overlay }), true);
+  });
+
+  it("g13 peel: a replace ref that makes a work-bearing overlay look wrapper-only must not enable the peel", async () => {
+    const f = await fixture();
+    const real = peelShape(f, f.olderTree, f.workTree);
+    const opts = { attemptedTip: real.overlay };
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, "control: no replace");
+    // Same parents and subject, but L's tree: diff-tree L..C' is empty (merge-shaped), so the
+    // wrapper-only check passes if it reads the replacement.
+    const replacement = mkCommit(f.bare, f.olderTree, [real.marker, real.last], `${OVERLAY_COMMIT_PREFIX} transport`);
+    gitIn(f.bare, ["replace", real.overlay, replacement]);
+    assert.equal(gitIn(f.bare, ["rev-parse", `${real.overlay}^{tree}`]), f.olderTree, "sanity: a plain read honours the replacement");
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true,
+      "the replacement must not make the original overlay's work look like a workflow-only swap");
+  });
+
+  for (const [label, victim] of [["overlay tip", "overlay"], ["last parent", "last"]] as const) {
+    it(`g13 peel: a replaced ${label} subject must not defeat a genuine peel`, async () => {
+      const f = await fixture();
+      // L's tree carries the WIP (as real park markers do); only the peel makes this content-free.
+      const p = peelShape(f, f.workTree, f.workTree);
+      const opts = { attemptedTip: p.overlay };
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), false, "control: no replace");
+      const target = victim === "overlay" ? p.overlay : p.last;
+      const parents = victim === "overlay" ? [p.marker, p.last] : [f.olderFloor];
+      gitIn(f.bare, ["replace", target, mkCommit(f.bare, f.workTree, parents, "plain commit")]);
+      assert.equal(gitIn(f.bare, ["log", "-1", "--format=%s", target]), "plain commit", "sanity: a plain read honours the replacement");
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), false,
+        "original-object subjects decide the peel");
+    });
+  }
+
+  describe("info/grafts (N1)", () => {
+    function writeGrafts(bare: string, lines: string[]): void {
+      fs.mkdirSync(path.join(bare, "info"), { recursive: true });
+      fs.writeFileSync(path.join(bare, "info", "grafts"), `${lines.join("\n")}\n`);
+    }
+
+    it("g13 a graft re-parenting the floor onto the work must not turn a marker's work-bearing parent marker-only", async () => {
+      const f = await fixture();
+      const marker = mkCommit(f.bare, f.floorTree, [f.work], MARKER);
+      const opts = { attemptedTip: marker };
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true, "control: no graft");
+      writeGrafts(f.bare, [`${f.floor} ${f.olderFloor} ${f.work}`]);
+      assert.ok(gitIn(f.bare, ["rev-list", "-n", "1", "--parents", "refs/remotes/origin/main"]).split(" ").includes(f.work),
+        "sanity: a plain read honours the graft");
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, opts), true);
+    });
+
+    it("g13 a graft re-parenting the marker onto the floor must not hide the work below it", async () => {
+      const f = await fixture();
+      const marker = mkCommit(f.bare, f.floorTree, [f.work], MARKER);
+      writeGrafts(f.bare, [`${marker} ${f.floor}`]);
+      assert.equal(gitIn(f.bare, ["rev-parse", `${marker}^`]), f.floor, "sanity: a plain read honours the graft");
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: marker }), true);
+    });
+
+    it("g13 a graft re-parenting a content-bearing tip onto the floor must not make the boundary walk content-free", async () => {
+      const f = await fixture();
+      const chained = mkCommit(f.bare, f.floorTree, [f.work], "tree restored on top");
+      writeGrafts(f.bare, [`${chained} ${f.floor}`]);
+      assert.equal(gitIn(f.bare, ["rev-parse", `${chained}^`]), f.floor, "sanity: a plain read honours the graft");
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, undefined, null, { attemptedTip: chained }), true);
+    });
+  });
 
   it("g4 blocks a content-bearing attempted tip even with no mirror (and with a null key)", async () => {
     const f = await fixture();
