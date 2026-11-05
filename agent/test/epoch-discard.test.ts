@@ -232,7 +232,8 @@ describe("automatic content preservation through registered authority", () => {
       if (state === "populated") for (let i = 0; i < 2000; i++) fs.writeFileSync(path.join(dir, String(i)), "");
       if (state === "symlink") fs.symlinkSync(path.join(clonePath, ".git", "objects"), dir);
       if (state === "file") fs.writeFileSync(dir, "");
-      await contentRefusal(state === "absent" || state === "empty" ? "eligible" : "epoch_content_unproven");
+      // The clone shape stage admits no `.git/worktrees` entry by name, so even an empty directory is a keep.
+      await contentRefusal(state === "absent" ? "eligible" : "epoch_content_unproven");
     });
   }
   for (const state of ["missing", "empty", "populated", "symlink", "file"] as const) {
@@ -266,14 +267,16 @@ describe("automatic content preservation through registered authority", () => {
           };
         });
         await contentRefusal();
-        assert.equal(reads, fault === "open" || fault === "vanish" ? 0 : 1);
-        assert.equal(closes, fault === "open" || fault === "vanish" ? 0 : 1);
+        // `.git/worktrees` is refused by name in the Node-only shape stage, so it is never opened.
+        const unread = target === "worktrees" || fault === "open" || fault === "vanish";
+        assert.equal(reads, unread ? 0 : 1);
+        assert.equal(closes, unread ? 0 : 1);
       });
     }
   }
 
   it("revokes authority during a joined directory read", async t => {
-    const dir = path.join(clonePath, ".git", "worktrees");
+    const dir = seedGitlink();
     fs.mkdirSync(dir);
     const original = fsp.opendir.bind(fsp);
     let closed = false;
@@ -327,6 +330,21 @@ describe("worker epoch discard registration", () => {
     await refusal(proof, "invalid_epoch_proof", { selector: { ...options.selector, generation: 2 } });
     assert.deepEqual(await git.discardProtectedSource({ ...options, epochProof: proof }),
       { kind: "refused", reason: "invalid_epoch_proof", consumers: [] });
+  });
+
+  it("refuses a canonical selector even with a valid two-key plain journal", () => {
+    const canonical = { runId: RUN, generation: "none" as const, attempt: "canonical" };
+    const journal = JSON.stringify({ clonePath, runId: RUN });
+    assert.throws(() => git.createEpochDiscardProof({ ...input, selector: canonical, expectedRawJournal: journal }), /invalid epoch discard proof/);
+    assert.throws(() => git.createEpochDiscardProof({ ...input, selector: canonical, expectedRawJournal: [""] }), /invalid epoch discard proof/);
+  });
+
+  it("refuses an absent journal ([]) for an attempt selector and admits only the explicit [\"\"] repair", () => {
+    assert.throws(() => git.createEpochDiscardProof({ ...input, expectedRawJournal: [] }), /invalid epoch discard proof/);
+    assert.throws(() => git.createEpochDiscardProof({ ...input, expectedRawJournal: ["", ""] }), /invalid epoch discard proof/);
+    assert.throws(() => git.createEpochDiscardProof({ ...input, expectedRawJournal: ["x"] }), /invalid epoch discard proof/);
+    assert.doesNotThrow(() => git.createEpochDiscardProof({ ...input, expectedRawJournal: [""] }));
+    assert.doesNotThrow(() => git.createEpochDiscardProof(input));
   });
 
   it("rejects malformed decisions, scope contracts and noncanonical or extra-field journals", () => {
