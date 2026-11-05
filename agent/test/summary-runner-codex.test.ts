@@ -8,6 +8,9 @@ import type { CodexAdviceHarnessFactory } from "../src/codex/codex-executor.js";
 import type { AdviceRequest, AdviceResultPolicy, HarnessTerminal } from "../src/harness.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
+import { testOwnedPassHomeRoot } from "./teardown-fixtures.js";
+import { DEFAULT_CODEX_SUMMARY_MODEL } from "../src/codex/summary-model.js";
+import { isCodexRoleModel } from "../src/codex/render.js";
 
 const base = { token: "usable-claude", model: "sonnet", issueTitle: "Add reports", issueBody: "Report results", prdText: "PRD" };
 const bindings = [
@@ -140,3 +143,40 @@ for (const pass of ["intent", "plan"] as const) {
     }
   });
 }
+
+// Issue #3248: the Codex lane model is the claim's `model` when it is a Codex role model, else the built-in fallback.
+describe("Codex summary model selection (#3248)", () => {
+  const root = testOwnedPassHomeRoot();
+  for (const pass of ["intent", "plan"] as const) {
+    for (const [label, model, want] of [
+      ["absent", "", "gpt-6-luna"],
+      ["configured member", "gpt-6-astra", "gpt-6-astra"],
+      ["Claude lane value from an older server", "haiku", "gpt-6-luna"],
+      ["unknown id", "gpt-7-unknown", "gpt-6-luna"],
+    ] as const) {
+      it(`${pass}: ${label} model resolves to ${want} at effort low, refresh deny, no Claude`, async () => {
+        const seen: { model?: string; effort?: string; refresh?: string }[] = [];
+        let claudeCalls = 0;
+        const factory = (async (params) => ({ kind: "codex", run: async (req: AdviceRequest, policy: AdviceResultPolicy) => {
+          seen.push({ model: req.model, effort: req.effort, refresh: params.refresh });
+          policy.onTerminal(success, { isError: false, latest: undefined });
+          return { text: pass === "intent" ? "Adds reports." : JSON.stringify({ summary: "Adds reports.", deltas: [] }), end: { kind: "terminal", terminal: success } };
+        } })) as CodexAdviceHarnessFactory;
+        const queryFn = (() => { claudeCalls++; throw new Error("unexpected Claude"); }) as unknown as SdkQueryFn;
+        const r = new SummaryRunner(nullLogger(), { homeRoot: root, modelTimeoutMs: 1000, queryFn, codexAdviceHarnessFactory: factory });
+        const input: IntentSummaryInput = { ...base, model, claim: { run_id: "run-summary", secrets: { codex: bindings[0] } } };
+        assert.ok(pass === "intent" ? await r.generateIntentSummary(input) : await r.generatePlanSummary({ ...input, planMd: "# Plan" }));
+        assert.deepEqual(seen, [{ model: want, effort: "low", refresh: "deny" }]);
+        assert.equal(claudeCalls, 0);
+      });
+    }
+  }
+});
+
+describe("summary fixture pin (#3248)", () => {
+  it("the Codex fallback equals the fixture built-in and is a Codex role model", async () => {
+    const fx = JSON.parse(await fs.readFile(new URL("../../fixtures/model-settings/summary.json", import.meta.url), "utf8")) as { builtins: { codex: string } };
+    assert.equal(fx.builtins.codex, DEFAULT_CODEX_SUMMARY_MODEL);
+    assert.equal(isCodexRoleModel(DEFAULT_CODEX_SUMMARY_MODEL), true);
+  });
+});

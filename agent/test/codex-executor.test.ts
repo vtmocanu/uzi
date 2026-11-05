@@ -24495,6 +24495,63 @@ describe("2833 Codex inline summaries", () => {
       assert.deepEqual(intents, ["Intent."]);
     });
   }
+  it("3248 a configured summary model reaches a revised plan gate; the superseded flight reports no usage", async () => {
+    const planResponder: Responder = c => {
+      if (c.method === "thread/start") return { thread: { id: "th-plan" } };
+      if (c.method === "turn/start") {
+        const tn = `tn-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("th-plan"));
+        c.transport.push(toolCall(c.turnStartCount, "submit_plan", { plan_md: `plan-${c.turnStartCount}` }, "th-plan", tn, tn))
+          .push(turnCompleted("completed", "th-plan", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([planResponder, done]);
+    Object.assign(rig.client, { postIntentSummary: async () => {}, postPlanSummary: async () => {} });
+    const requests: { model?: string; effort?: string; prompt: string }[] = [];
+    let releaseFirst!: () => void;
+    const firstHeld = new Promise<void>(r => { releaseFirst = r; });
+    const terminal = { outcome: "success", subtype: "success", errors: [], metrics: { cost: { kind: "unreported" } } };
+    const runner = new SummaryRunner(noopLog, {
+      homeRoot: path.resolve("../.uzi/scratch"), modelTimeoutMs: 5000,
+      codexAdviceHarnessFactory: (async () => ({ kind: "codex", run: async (request: import("../src/harness.js").AdviceRequest) => {
+        requests.push(request);
+        if (/Intent/.test(request.prompt) && !/plan-/.test(request.prompt)) {
+          return { text: "Intent.", end: { kind: "terminal", terminal } };
+        }
+        const first = /plan-1/.test(request.prompt);
+        if (first) await firstHeld;
+        request.usageObserver?.({ [request.model!]: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } });
+        return { text: JSON.stringify({ summary: first ? "one" : "two", deltas: [] }), end: { kind: "terminal", terminal } };
+      } })) as unknown as import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory,
+    });
+    let gates = 0;
+    let firstFlight: Promise<void> | undefined;
+    const { ctx, emitted } = makeCtx({
+      planApproved: false, approvedPlan: undefined, summaryModel: "gpt-6-astra",
+      gatePlan: async (md, _milestones, awaiting) => {
+        gates++;
+        if (gates === 1) {
+          firstFlight = awaiting!(md);
+          await waitForSummary(() => requests.some(r => /plan-1/.test(r.prompt)), "first plan request");
+          return { kind: "revise", feedback: "revise", inputId: 5 };
+        }
+        const second = awaiting!(md);
+        await waitForSummary(() => emitted.some(m => m.kind === "summary_usage"), "replacement usage");
+        releaseFirst();
+        await firstFlight; await second;
+        return approve;
+      },
+    });
+    await makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, { summaryRunner: runner }).run(ctx);
+    const planRequests = requests.filter(r => /plan-/.test(r.prompt));
+    assert.equal(planRequests.length, 2);
+    assert.deepEqual(planRequests.map(r => [r.model, r.effort]), [["gpt-6-astra", "low"], ["gpt-6-astra", "low"]]);
+    const usages = emitted.filter(m => m.kind === "summary_usage" && (m.payload as { pass?: string }).pass === "plan");
+    assert.equal(usages.length, 1, "only the replacement flight reports usage");
+    assert.deepEqual(Object.keys(usages[0]!.payload.model_usage as object), ["gpt-6-astra"]);
+  });
   for (const overrides of [{ summaryIntentPresent: true }, { kind: "job" }, { kind: "chat" }] as Partial<RunContext>[]) {
     it(`2833 skips resumed/nonissue intent ${JSON.stringify(overrides)}`, async () => {
       const { rig, intents } = summaryRig();

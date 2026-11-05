@@ -26,6 +26,8 @@ import type { SdkQueryFn } from "./sdk-executor.js";
 import { selectCodexBinding } from "./codex/select.js"; // the pure, fail-closed claim-shape discriminator, NOT a Codex class construction
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only: the injected seam, never constructed here
 import { CODEX_PR_DESCRIPTION_MODEL } from "./codex/pr-description-model.js"; // leaf value import (no runtime dep on codex-executor)
+import { CODEX_SUMMARY_EFFORT, DEFAULT_CODEX_SUMMARY_MODEL } from "./codex/summary-model.js"; // leaf value import
+import { isCodexRoleModel } from "./codex/render.js";
 import type { DeliveryContext } from "./pr-description-context.js";
 import type { PrDescriptionDiagram } from "./protocol.js";
 import type { AdviceUsageSnapshot } from "./harness.js";
@@ -44,10 +46,6 @@ import type { Logger } from "./log.js";
 // summaryModelTimeoutMs, the one parser), or per-instance via the constructor for
 // deterministic tests.
 const SUMMARY_MODEL_TIMEOUT_MS = summaryModelTimeoutMs(process.env);
-
-// Issue #2833 M1: private intent/plan pins, independent of the delivery editor model.
-const CODEX_INTENT_PLAN_MODEL = "gpt-6-luna";
-const CODEX_INTENT_PLAN_EFFORT = "low";
 
 /** PRD #1798 M5: the Claude model the editor pass runs on when the claim carries no usable
  *  `summary_model`. The api resolves `summary_model` (user value, else the instance setting,
@@ -96,6 +94,8 @@ export interface IntentSummaryInput {
    *  With no Codex block, the legacy token/model inputs below are used unchanged. */
   claim?: { readonly run_id: string; readonly claim_generation?: number; readonly secrets: { readonly codex?: unknown } };
   token: string;
+  /** The resolved summary model. Claude lane: used as is. Codex lane (#3248): used when it is a
+   *  Codex role model, else the built-in fallback (an older server sends the Claude value). */
   model: string;
   issueTitle: string;
   issueBody: string;
@@ -432,9 +432,13 @@ export class SummaryRunner {
       let harness: Pick<ReadOnlyModelPassOpts, "token" | "model" | "effort" | "codex">;
       if (selection.kind === "codex") {
         if (!this.codexAdviceHarnessFactory) throw new Error("Codex claim but no Codex advice-harness factory is wired");
+        const configured = isCodexRoleModel(input.model);
+        if (!configured && input.model !== "") {
+          this.log.info("summary model is not a Codex role model; using the built-in Codex summary model", { pass });
+        }
         harness = {
-          model: CODEX_INTENT_PLAN_MODEL,
-          effort: CODEX_INTENT_PLAN_EFFORT,
+          model: configured ? input.model : DEFAULT_CODEX_SUMMARY_MODEL,
+          effort: CODEX_SUMMARY_EFFORT,
           codex: {
             runId: input.claim!.run_id,
             claimGeneration: input.claim!.claim_generation,
