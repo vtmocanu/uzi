@@ -142,6 +142,18 @@ describe("OverviewNext capacity rail", () => {
           stats_source: "cgroup",
         }),
         aWorker({ id: "w2", name: "quiet", status: "offline" }),
+        aWorker({
+          id: "w3",
+          name: "busy-worker",
+          status: "online",
+          draining_since: "2026-07-05T12:00:00Z",
+          manual_cordoned_at: "2026-07-05T12:00:00Z",
+          effective_cordoned: true,
+          active_runs: 2,
+          max_concurrent_runs: 4,
+          active_cross_checks: 1,
+          max_cross_check_slots: 2,
+        }),
       ],
     });
     render(
@@ -193,5 +205,31 @@ describe("OverviewNext capacity rail", () => {
       expect.soft(el.getBoundingClientRect().right, `${el.tagName}`).toBeLessThanOrEqual(rail.right + 1);
     }
     expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth);
+    expectRailSummariesFit(railCard);
+  });
+
+  it("keeps worker names readable and rows inside the rail at 320px", async () => {
+    await page.viewport(320, 800);
+    mountPreview();
+    await screen.findByText("Capacity");
+    await document.fonts.ready;
+    expect(window.innerWidth).toBe(320);
+    const railCard = screen.getByRole("heading", { name: /Capacity/ }).closest("div.rounded-xl") as HTMLElement;
+    expectRailSummariesFit(railCard);
   });
 });
+
+// Every worker summary stays inside its box and its name keeps a readable width, however
+// many badges the worker shows.
+function expectRailSummariesFit(railCard: HTMLElement) {
+  const summaries = railCard.querySelectorAll<HTMLElement>("li summary");
+  expect(summaries.length).toBe(3);
+  for (const s of summaries) {
+    expect.soft(s.scrollWidth, `summary ${s.textContent?.slice(0, 30)} overflow`).toBeLessThanOrEqual(s.clientWidth + 1);
+    const name = s.querySelector<HTMLElement>("[data-worker-name]") as HTMLElement;
+    expect.soft(name.getBoundingClientRect().width, `name ${name.textContent?.slice(0, 20)} width`).toBeGreaterThanOrEqual(80);
+  }
+  expect.soft(document.documentElement.scrollWidth, "document stays inside the viewport").toBeLessThanOrEqual(
+    document.documentElement.clientWidth,
+  );
+}

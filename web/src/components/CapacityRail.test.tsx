@@ -76,10 +76,25 @@ describe("CapacityRail", () => {
     expect([count("in-use"), count("closed"), count("open")]).toEqual([3, 1, 0]);
   });
 
-  it("draws proportional segments past twelve slots", () => {
+  it("orders cells in use, closed, open and styles closed as hatched and open as outlined", () => {
+    const { container } = mount([
+      aWorker({ id: "a", name: "alpha", active_runs: 1, max_concurrent_runs: 3 }),
+      aWorker({ id: "b", name: "bravo", active_runs: 0, max_concurrent_runs: 2, draining_since: "2026-07-05T12:00:00Z" }),
+    ]);
+    const cells = Array.from(container.querySelectorAll<HTMLElement>("[data-slot]"));
+    expect(cells.map((c) => c.dataset.slot)).toEqual(["in-use", "closed", "closed", "open", "open"]);
+    const closed = cells.find((c) => c.dataset.slot === "closed") as HTMLElement;
+    const open = cells.find((c) => c.dataset.slot === "open") as HTMLElement;
+    expect(closed.style.background).toContain("repeating-linear-gradient");
+    expect(closed.className).toContain("border-edge-strong");
+    expect(open.className).toContain("border-edge-strong");
+  });
+
+  it("draws proportional segments past twelve slots and skips a zero segment", () => {
     const { container } = mount([aWorker({ active_runs: 5, max_concurrent_runs: 20 })]);
     const width = (k: string) => (container.querySelector(`[data-slot="${k}"]`) as HTMLElement).style.width;
-    expect([width("in-use"), width("closed"), width("open")]).toEqual(["25%", "0%", "75%"]);
+    expect([width("in-use"), width("open")]).toEqual(["25%", "75%"]);
+    expect(container.querySelector('[data-slot="closed"]')).toBeNull();
   });
 
   it("sanitizes a hostile worker name", () => {

@@ -90,7 +90,7 @@ type CellKind = "in-use" | "closed" | "open";
 // without relying on colour contrast between two greys.
 const CELL_CLASS: Record<CellKind, string> = {
   "in-use": "bg-info",
-  closed: "",
+  closed: "border border-edge-strong",
   open: "border border-edge-strong",
 };
 const CELL_STYLE: Record<CellKind, CSSProperties | undefined> = {
@@ -135,7 +135,7 @@ function SlotBar({ slots }: { slots: CapacitySlots }) {
   ];
   return (
     <div aria-hidden="true" className="mt-2 flex h-3 w-full gap-px overflow-hidden rounded">
-      {segments.map(([k, n]) => (
+      {segments.filter(([, n]) => n > 0).map(([k, n]) => (
         <span key={k} data-slot={k} className={CELL_CLASS[k]} style={{ ...CELL_STYLE[k], width: pct(n) }} />
       ))}
     </div>
@@ -148,19 +148,17 @@ function WorkerRow({ worker: w }: { worker: Worker }) {
     <li className="py-2">
       <details className="group">
         <summary className="flex cursor-pointer list-none items-center gap-2 rounded-sm py-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/60 [&::-webkit-details-marker]:hidden">
-          <div className="flex min-w-0 flex-1 items-center gap-2">
-            <span className="shrink-0">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
+            <div className="flex flex-wrap items-center gap-2">
               <Badge tone={w.status === "online" ? "ok" : "neutral"} dot>
                 {w.status}
               </Badge>
-            </span>
-            <span className="shrink-0">
               <WorkerCordonBadge worker={w} />
-            </span>
-            <span className="shrink-0">
               <WorkerRunBadge worker={w} hideIdleCrossChecks />
+            </div>
+            <span data-worker-name className="min-w-[6rem] flex-1 truncate whitespace-nowrap text-sm font-medium text-fg">
+              {stripUnsafeChars(w.name)}
             </span>
-            <span className="min-w-0 flex-1 truncate whitespace-nowrap text-sm font-medium text-fg">{stripUnsafeChars(w.name)}</span>
           </div>
           <ChevronRightIcon className="h-4 w-4 shrink-0 text-faint transition-transform group-open:rotate-90" aria-hidden="true" />
         </summary>
